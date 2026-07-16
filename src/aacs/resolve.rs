@@ -156,7 +156,7 @@ pub fn resolve_keys_v2(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
 /// equivalent of path 2 — there's no host-side PK derivation against a
 /// Variant MKB.)
 pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
-    let uk_file = parse_unit_key_ro(ctx.unit_key_ro, AacsVersion::V20)?;
+    let uk_file = parse_title_keys(ctx.unit_key_ro, AacsVersion::V20)?;
     let hash_hex = disc_hash_hex(&uk_file.disc_hash);
     let bus_encryption = ctx
         .content_cert
@@ -280,8 +280,9 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
         .map(|cc| cc.bus_encryption)
         .unwrap_or(false);
 
-    // Parse Unit_Key_RO.inf at the version-appropriate stride.
-    let uk_file = parse_unit_key_ro(ctx.unit_key_ro, version)?;
+    // Parse the disc's title-key file (BD/UHD Unit_Key_RO.inf at the
+    // version-appropriate stride, or HD DVD VTKF000.AACS) → common UnitKeyFile.
+    let uk_file = parse_title_keys(ctx.unit_key_ro, version)?;
 
     let hash_hex = disc_hash_hex(&uk_file.disc_hash);
     let has_vid = *ctx.volume_id != [0u8; 16];

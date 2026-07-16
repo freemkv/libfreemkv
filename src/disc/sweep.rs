@@ -66,14 +66,6 @@ pub(super) enum WorkItem {
     /// tell them apart without parsing a flag.
     GapFill { pos: u64, len: u64 },
 
-    /// Post-read verify downgrade. The producer's `UnitVerifier` found that the
-    /// just-`Finished` clip unit at `[pos, pos+len)` is confidently undecryptable
-    /// (a silent bad read). The consumer re-records the range as `NonTrimmed` so
-    /// the patch pass re-reads it — the ISO bytes (ciphertext) already written by
-    /// the preceding `Good` are left in place for the patch to overwrite. FIFO
-    /// pipe ordering guarantees this arrives AFTER the `Good` that wrote them.
-    MarkBad { pos: u64, len: u64 },
-
     /// Producer wants the latest mapfile stats for the progress
     /// callback. Consumer responds on `prog_tx` with a fresh
     /// [`ProgressSnapshot`]. Best-effort: if the producer hasn't
@@ -180,12 +172,6 @@ impl Sink<WorkItem> for SweepSink {
                     self.file.write_all(&self.zero[..chunk])?;
                     filled += chunk as u64;
                 }
-                self.map.record(pos, len, SectorStatus::NonTrimmed)?;
-            }
-            WorkItem::MarkBad { pos, len } => {
-                // Verify downgrade: the ISO bytes are already written by the
-                // preceding Good; only the mapfile status changes so patch
-                // re-reads this range. No file write.
                 self.map.record(pos, len, SectorStatus::NonTrimmed)?;
             }
             WorkItem::StatsRequest => {

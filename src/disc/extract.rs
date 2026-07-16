@@ -288,63 +288,6 @@ impl Disc {
     }
 }
 
-/// True for the AACS-encrypted stream files (`.m2ts`, `.ssif`). Every other UDF
-/// file is clear (nav / playlists / filesystem) and needs no decrypt verify.
-fn is_aacs_clip(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".m2ts") || lower.ends_with(".ssif")
-}
-
-/// Enumerate the disc's AACS clip (`.m2ts`/`.ssif`) files as
-/// [`crate::disc::verify::ClipLayout`]s for the post-read verify gate: each
-/// clip's declared size plus its absolute disc extents in FILE order. Reads the
-/// UDF tree through `reader`.
-///
-/// FAIL-SAFE: any enumeration error (bad UDF read, name collision, …) yields an
-/// EMPTY list — the verify gate then covers nothing and the sweep behaves as
-/// today. Enumeration must never break a rip, so the error is logged, not
-/// propagated.
-pub(crate) fn clip_layouts(reader: &mut dyn SectorSource) -> Vec<crate::disc::verify::ClipLayout> {
-    let result = (|| -> Result<Vec<crate::disc::verify::ClipLayout>> {
-        let fs = udf::read_filesystem(reader)?;
-        let mut planned: Vec<PlannedFile> = Vec::new();
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        let mut seen_hosts: std::collections::HashMap<PathBuf, String> =
-            std::collections::HashMap::new();
-        plan_tree(
-            reader,
-            &fs,
-            &fs.root,
-            Path::new(""),
-            "",
-            true,
-            &mut planned,
-            &mut dirs,
-            &mut seen_hosts,
-        )?;
-        Ok(planned
-            .into_iter()
-            .filter(|pf| pf.inline.is_none() && is_aacs_clip(&pf.disc_name))
-            .map(|pf| crate::disc::verify::ClipLayout {
-                size: pf.size,
-                extents: pf.extents,
-                // Every AACS clip we enumerate today is BD-TS (`.m2ts`/`.ssif`).
-                // HD-DVD `.evo` (program stream) maps to `ContainerKind::Ps` here
-                // once `is_aacs_clip` recognises it — the one-line HD-DVD hook.
-                container: crate::disc::verify::ContainerKind::Ts,
-            })
-            .collect())
-    })();
-    result.unwrap_or_else(|e| {
-        tracing::warn!(
-            target: "freemkv::verify",
-            error = %e,
-            "clip enumeration failed; post-read verify disabled for this pass"
-        );
-        Vec::new()
-    })
-}
-
 /// A borrowing `SectorSource` wrapper. Lets the decrypting decorator "own" an
 /// inner source for its lifetime while the caller keeps the underlying
 /// `&mut dyn SectorSource` (the decorator is a `DecryptingSectorSource<S>`

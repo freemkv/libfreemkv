@@ -391,11 +391,11 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             let title = disc.titles[idx].clone();
             let format = disc.content_format;
             // ISO file: 8192-sector batch (16 MiB at 2048 B/sector) —
-            // sequential read from fast storage, no bad sectors. Measured
-            // optimum on the rip1 testbed; bumping to 16384 sectors (32 MiB)
-            // regressed (more cache pressure, longer per-batch latency starves
-            // the consumer between iterations). Physical drives keep smaller
-            // batches for adaptive error handling.
+            // sequential read from fast storage, no bad sectors. Empirically
+            // optimal; bumping to 16384 sectors (32 MiB) regressed (more cache
+            // pressure, longer per-batch latency starves the consumer between
+            // iterations). Physical drives keep smaller batches for adaptive
+            // error handling.
             const ISO_MUX_BATCH_SECTORS: u16 = 8192;
 
             // Pass `DecryptKeys::None` to the decrypt decorator when
@@ -621,7 +621,8 @@ fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
 /// - `fetch`: optional fresh-key-on-failure callback (see
 ///   [`crate::sector::KeyFetch`]). When a unit no held key decrypts, the
 ///   decrypt decorator hands that ciphertext to `fetch` and adds any key it
-///   returns. `None` keeps the prior behaviour (the unit is counted as loss).
+///   returns, then re-decrypts. `None` means no mid-stream key recovery — the
+///   unit's best-effort bytes pass through to the muxer as-is.
 // Eight reader/title/keys/tuning/callback params is inherent to the mux entry
 // point; grouping them into a struct would only move the same fields around.
 #[allow(clippy::too_many_arguments)]
@@ -647,19 +648,25 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     };
     // MUX path: read > decrypt > mux. The decrypt seam applies the CPS unit key and
     // passes the bytes to the muxer; a unit that decrypts to broken TS is the
-    // muxer's problem, not a decrypt failure, so the mux never conceals, re-fetches
-    // a key, or counts it as loss — it fails only when it genuinely can't decrypt
-    // (no key / misaligned unit). The `fetch` key-recovery seam is a rip/verify
-    // concern (Disc::sweep / Disc::patch), deliberately NOT installed on the mux:
-    // key recovery happens up front, and the mux never re-asks mid-stream.
+    // muxer's problem, not a decrypt failure, so the mux never conceals a unit or
+    // counts it as loss.
     let mut decrypting =
-        crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys)
-            .tolerate_decrypt_loss();
-    let _ = &fetch; // rip/verify key-recovery seam; the mux does not consume it
-    // Loss counter: the mux does not tally broken-TS units (the muxer handles them),
-    // so for a keyed disc this stays 0; it still surfaces via `lost_bytes()` for the
-    // abort gate, which now reflects only a genuine can't-decrypt.
-    let decrypt_loss = decrypting.decrypt_loss();
+        crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
+    // Install the fresh-key-on-failure callback (if the app supplied one). This is
+    // how multi-CPS is muxed: each CPS unit's key is fetched when the mux reaches a
+    // unit no held key opens — "get the key when we need it." It fires only on a
+    // genuine miss: now that key selection is accurate (`is_clean_ts`), a unit that
+    // decrypted correctly but has bad-encoded TS is NOT a miss, so this no longer
+    // storms the key source the way the old TS supermajority gate did.
+    if let Some(cb) = fetch {
+        decrypting = decrypting.with_key_fetch(cb);
+    }
+    // Loss-counter handle. The mux does NOT tally decrypt-quality misses: a
+    // broken-TS unit is the muxer's concern, and a missing key is an up-front
+    // resolve failure — indistinguishable from bad authoring at this seam, so
+    // counting it would false-abort a bad-encoded-but-decryptable disc. A genuine
+    // can't-decrypt surfaces as `Err`; `lost_bytes()` reflects physical read loss
+    // only (there is no decrypt-loss term to fold in).
 
     // Wrong-substream fix (Silence-of-the-Lambs): before the prefetcher takes
     // the reader, probe the feature head through the (plaintext) decrypting
@@ -685,10 +692,13 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     let (demux_thread, demux_rx) =
         super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, halt, ts, ps)
             .map_err(|e| -> io::Error { e.into() })?;
-    Ok(
-        PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track)
-            .with_decrypt_loss(decrypt_loss),
-    )
+    Ok(PipelinedPesStream::new(
+        demux_thread,
+        demux_rx,
+        title,
+        parsers,
+        pid_to_track,
+    ))
 }
 
 /// Assemble the M2TS file mux pipeline (read → demux → parse) for a

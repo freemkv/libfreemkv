@@ -232,8 +232,6 @@ struct Golden {
     bytes_unreadable: u64,
     /// `bytes_pending` (NonTrimmed) at end.
     bytes_pending: u64,
-    /// Did the pass exit via wedge-detection?
-    wedged_exit: bool,
     /// Sanity bound on trace length — patch makes a finite number of
     /// reads bounded by `MAX_SKIPS_PER_RANGE * range_sectors` plus
     /// retries. Asserted as an UPPER bound only (so any reduction in
@@ -319,7 +317,6 @@ fn profile_01_clean_all_recoverable() {
         bytes_good: capacity_sectors as u64 * 2048,
         bytes_unreadable: 0,
         bytes_pending: 0,
-        wedged_exit: false,
         max_reads: 8, // adaptive batch=32 reads finishes 16 sectors in 1 read; allow up to 8.
     };
     assert_eq!(stats.bytes_good, expected.bytes_good, "01_clean bytes_good");
@@ -796,29 +793,190 @@ fn profile_08_batch_fail_singles_ok() {
 
 // ─────────────────────────────────────────────────────────────────────────
 //
-// Suppressed for now: NOT_READY-then-recover, HARDWARE_ERROR (wedge),
-// ILLEGAL_REQUEST (wedge), and ABORTED_COMMAND profiles. Each would
-// trigger long real-time sleeps inside `handle_read_failure`:
+// Sense-family error paths in `Disc::patch`: NOT_READY-then-recover,
+// HARDWARE_ERROR, ILLEGAL_REQUEST, and ABORTED_COMMAND.
 //
-//   - NOT_READY (sense_key=0x02, asc=0x02/0x03/0x04): 15 s pause per
-//     occurrence (`patch_not_ready_pause`), and retries the same LBA
-//     in-place. Even one NOT_READY costs the test 15 s wall-time.
+// These drive `disc.patch(...)` DIRECTLY rather than through `run_profile`
+// (which drives `Disc::copy`, whose SWEEP path really sleeps on NOT_READY /
+// wedge cooldowns via `sleep_secs_or_halt`). The patch handler chain itself
+// uses an injectable deadline clock (`Instant::now` in production) and never
+// `thread::sleep`s, so these paths run at full speed with no wall-time cost —
+// the earlier "sleeps aren't injectable" suppression only ever applied to the
+// copy/sweep driver, not to patch.
 //
-//   - HARDWARE_ERROR / ILLEGAL_REQUEST: 30 s per occurrence
-//     (`WEDGE_FAMILY_COOLDOWN_SECS`), bounded by
-//     `WEDGE_ABORT_THRESHOLD=16` before wedged-exit. Worst case ~8
-//     minutes per profile.
-//
-// The sleeps are not injectable. Adding them would require either a
-// `now()` / `sleep()` trait injection (out of scope for the unification
-// task) or a "test mode" compile-time flag (architectural smell). The
-// behavioural contracts for those paths are captured in
-// `read_error.rs`'s in-module tests instead — they exercise the
-// classifier without invoking the patch loop's sleep side-effects.
-//
-// If the unification ever proceeds, the next step is to add a clock
-// injection point in `handle_read_failure` and extend this fixture
-// with the wedge/NOT_READY profiles too.
+// The load-bearing invariant asserted across every PERSISTENT failure sense is
+// the recovery contract: a patch pass NEVER promotes a sector to Unreadable
+// (the orchestrator does that only after the final pass) and NEVER silently
+// drops bytes — a still-bad sector stays NonTrimmed (pending), so
+// good + pending always conserves the total. Exact good/pending splits are
+// left loose so wedge-skip tuning can't spuriously fail these.
+
+/// Run a single-always-bad-sector (LBA 130, inside a NonTrimmed [128,192)
+/// range) patch pass with the given failure step and return the final map
+/// stats. 256-sector synthetic disc; everything outside the range is Finished.
+fn single_dead_sector_patch_stats(step: ScriptStep) -> libfreemkv::disc::mapfile::MapStats {
+    let capacity_sectors: u32 = 256;
+    let (mut reader, _trace) = ScriptedSectorReader::new(capacity_sectors);
+    reader.always(130, step);
+
+    let total_bytes = capacity_sectors as u64 * SECTOR_SIZE as u64;
+    let disc = synthetic_disc(capacity_sectors);
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let iso_path = tmp.path().to_path_buf();
+    drop(tmp);
+    let nontrimmed = [(128 * 2048, 64 * 2048)];
+    let finished = [
+        (0, 128 * 2048),
+        (192 * 2048, (capacity_sectors as u64 - 192) * 2048),
+    ];
+    prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
+
+    let opts = libfreemkv::disc::PatchOptions {
+        decrypt: false,
+        block_sectors: Some(32),
+        full_recovery: true,
+        reverse: true,
+        wedged_threshold: 50,
+        progress: None,
+        halt: None,
+        key_fetch: None,
+    };
+    disc.patch(&mut reader, &iso_path, &opts)
+        .expect("patch must not error on a per-sector failure sense");
+
+    let map_path = libfreemkv::disc::mapfile_path_for(&iso_path);
+    let stats = Mapfile::load(&map_path).unwrap().stats();
+    let _ = std::fs::remove_file(&iso_path);
+    let _ = std::fs::remove_file(&map_path);
+    stats
+}
+
+/// A persistent sense that never clears must obey the pass contract: nothing
+/// Unreadable, nothing lost (good + pending == total), and at least the dead
+/// sector left pending.
+fn assert_persistent_sense_contract(step: ScriptStep, label: &str) {
+    let stats = single_dead_sector_patch_stats(step);
+    let total = 256u64 * 2048;
+    assert_eq!(
+        stats.bytes_unreadable, 0,
+        "{label}: a patch pass must NEVER mark Unreadable"
+    );
+    assert_eq!(
+        stats.bytes_good + stats.bytes_pending,
+        total,
+        "{label}: conservation — no byte may be silently dropped"
+    );
+    assert!(
+        stats.bytes_pending >= 2048,
+        "{label}: the always-dead sector must remain pending (NonTrimmed)"
+    );
+}
+
+#[test]
+fn patch_persistent_hardware_error_conserves_and_never_unreadable() {
+    // HARDWARE_ERROR (sense_key=0x04) — wedge family.
+    assert_persistent_sense_contract(
+        ScriptStep::Err {
+            sense_key: 0x04,
+            asc: 0x11,
+            ascq: 0x00,
+        },
+        "HARDWARE_ERROR",
+    );
+}
+
+#[test]
+fn patch_persistent_illegal_request_conserves_and_never_unreadable() {
+    // ILLEGAL_REQUEST (sense_key=0x05) — wedge family.
+    assert_persistent_sense_contract(
+        ScriptStep::Err {
+            sense_key: 0x05,
+            asc: 0x21,
+            ascq: 0x00,
+        },
+        "ILLEGAL_REQUEST",
+    );
+}
+
+#[test]
+fn patch_persistent_aborted_command_conserves_and_never_unreadable() {
+    // ABORTED_COMMAND (sense_key=0x0B).
+    assert_persistent_sense_contract(
+        ScriptStep::Err {
+            sense_key: 0x0B,
+            asc: 0x00,
+            ascq: 0x00,
+        },
+        "ABORTED_COMMAND",
+    );
+}
+
+#[test]
+fn patch_not_ready_then_recovers_fully() {
+    // NOT_READY (sense_key=0x02, asc=0x04) that clears after two attempts must
+    // recover the sector in-pass — no residual loss, no Unreadable, no hang.
+    let capacity_sectors: u32 = 256;
+    let (mut reader, _trace) = ScriptedSectorReader::new(capacity_sectors);
+    reader.sequence(
+        130,
+        vec![
+            ScriptStep::Err {
+                sense_key: 0x02,
+                asc: 0x04,
+                ascq: 0x00,
+            },
+            ScriptStep::Err {
+                sense_key: 0x02,
+                asc: 0x04,
+                ascq: 0x00,
+            },
+            ScriptStep::Ok,
+        ],
+    );
+
+    let total_bytes = capacity_sectors as u64 * SECTOR_SIZE as u64;
+    let disc = synthetic_disc(capacity_sectors);
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let iso_path = tmp.path().to_path_buf();
+    drop(tmp);
+    let nontrimmed = [(128 * 2048, 64 * 2048)];
+    let finished = [
+        (0, 128 * 2048),
+        (192 * 2048, (capacity_sectors as u64 - 192) * 2048),
+    ];
+    prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
+
+    let opts = libfreemkv::disc::PatchOptions {
+        decrypt: false,
+        block_sectors: Some(32),
+        full_recovery: true,
+        reverse: true,
+        wedged_threshold: 50,
+        progress: None,
+        halt: None,
+        key_fetch: None,
+    };
+    disc.patch(&mut reader, &iso_path, &opts)
+        .expect("patch must not error on a transient NOT_READY");
+
+    let map_path = libfreemkv::disc::mapfile_path_for(&iso_path);
+    let stats = Mapfile::load(&map_path).unwrap().stats();
+    assert_eq!(
+        stats.bytes_unreadable, 0,
+        "NOT_READY recovery must not mark Unreadable"
+    );
+    assert_eq!(
+        stats.bytes_pending, 0,
+        "a NOT_READY that clears must leave nothing pending"
+    );
+    assert_eq!(
+        stats.bytes_good,
+        capacity_sectors as u64 * 2048,
+        "every sector recovers once NOT_READY clears"
+    );
+    let _ = std::fs::remove_file(&iso_path);
+    let _ = std::fs::remove_file(&map_path);
+}
 
 // ──────── Handler chain recovers re-readable sectors inside a bad block ────────
 //
@@ -826,9 +984,10 @@ fn profile_08_batch_fail_singles_ok() {
 // handler chain's linear pass narrows a failed batch to per-sector reads, so it
 // recovers EVERY re-readable sector and leaves ONLY the dead sector NonTrimmed —
 // strictly better than the old fast-capture path, which left the whole failed
-// 32-block untouched. (`fast_capture` is now inert: the chain supersedes it. The
-// breadth-first "fast on all ranges, then escalate" ORDERING it once provided is
-// a scheduling concern for the handler scheduler, tracked separately.)
+// 32-block untouched. (The old `fast_capture` knob was removed: the handler
+// chain supersedes it. The breadth-first "fast on all ranges, then escalate"
+// ORDERING it once provided is a scheduling concern for the handler scheduler,
+// tracked separately.)
 //
 // The load-bearing invariant is unchanged: NO data is dropped. A still-bad
 // sector becomes NonTrimmed (pending, retried by a later pass), NEVER Unreadable.
@@ -869,10 +1028,9 @@ fn handler_chain_recovers_readable_sectors_leaving_only_dead_pending() {
         progress: None,
         halt: None,
         key_fetch: None,
-        fast_capture: true,
     };
     disc.patch(&mut reader, &iso_path, &opts)
-        .expect("fast-capture patch must not error");
+        .expect("handler-chain patch must not error");
 
     let map_path = libfreemkv::disc::mapfile_path_for(&iso_path);
     let stats = Mapfile::load(&map_path).unwrap().stats();

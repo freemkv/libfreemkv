@@ -129,6 +129,10 @@ impl SectorSource for Box<dyn SectorSource> {
     fn set_speed(&mut self, kbs: u16) {
         (**self).set_speed(kbs)
     }
+
+    fn set_unit_base(&mut self, lba: u32) {
+        (**self).set_unit_base(lba)
+    }
 }
 
 impl SectorSource for &mut (dyn SectorSource + '_) {
@@ -160,6 +164,10 @@ impl SectorSource for &mut (dyn SectorSource + '_) {
     fn set_speed(&mut self, kbs: u16) {
         (**self).set_speed(kbs)
     }
+
+    fn set_unit_base(&mut self, lba: u32) {
+        (**self).set_unit_base(lba)
+    }
 }
 
 /// Write 2048-byte sectors to a disc image or composed sink.
@@ -181,7 +189,7 @@ pub trait SectorSink: Send {
 }
 
 pub use crate::io::file_sector_source::FileSectorSource;
-pub use decrypting::{DECRYPT_VERIFY_READ, DecryptingSectorSource, KeyFetch};
+pub use decrypting::{DecryptingSectorSource, KeyFetch};
 pub use file::FileSectorSink;
 pub use prefetched::PrefetchedSectorSource;
 
@@ -198,23 +206,33 @@ mod tests {
         capacity: u32,
         reads: Arc<Mutex<Vec<(u32, u16, bool)>>>,
         speeds: Arc<Mutex<Vec<u16>>>,
+        unit_bases: Arc<Mutex<Vec<u32>>>,
     }
 
-    /// A `Spy` under test plus the handles recording its reads and speed sets.
-    type SpyHarness = (Spy, Arc<Mutex<Vec<(u32, u16, bool)>>>, Arc<Mutex<Vec<u16>>>);
+    /// A `Spy` under test plus the handles recording its reads, speed sets,
+    /// and unit-base sets.
+    type SpyHarness = (
+        Spy,
+        Arc<Mutex<Vec<(u32, u16, bool)>>>,
+        Arc<Mutex<Vec<u16>>>,
+        Arc<Mutex<Vec<u32>>>,
+    );
 
     impl Spy {
         fn new(capacity: u32) -> SpyHarness {
             let reads = Arc::new(Mutex::new(Vec::new()));
             let speeds = Arc::new(Mutex::new(Vec::new()));
+            let unit_bases = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
                     capacity,
                     reads: reads.clone(),
                     speeds: speeds.clone(),
+                    unit_bases: unit_bases.clone(),
                 },
                 reads,
                 speeds,
+                unit_bases,
             )
         }
     }
@@ -238,6 +256,16 @@ mod tests {
         fn set_speed(&mut self, kbs: u16) {
             self.speeds.lock().unwrap().push(kbs);
         }
+        fn set_unit_base(&mut self, lba: u32) {
+            self.unit_bases.lock().unwrap().push(lba);
+        }
+    }
+
+    /// Call `set_unit_base` through a generic `S: SectorSource` bound — this is
+    /// the path that actually exercises the `Box<dyn>` / `&mut dyn` FORWARDING
+    /// impls (a direct call on a `dyn` value dispatches via the vtable instead).
+    fn set_unit_base_generic<S: SectorSource>(mut s: S, base: u32) {
+        s.set_unit_base(base);
     }
 
     /// The default `capacity_sectors` is 0 (unknown). Grounding: trait
@@ -286,7 +314,7 @@ mod tests {
     /// Box<dyn SectorSource>` forwarding bodies.
     #[test]
     fn boxed_dyn_forwards_all_methods() {
-        let (spy, reads, speeds) = Spy::new(777);
+        let (spy, reads, speeds, unit_bases) = Spy::new(777);
         let mut boxed: Box<dyn SectorSource> = Box::new(spy);
 
         assert_eq!(boxed.capacity_sectors(), 777, "capacity must forward");
@@ -308,24 +336,46 @@ mod tests {
             vec![5400],
             "set_speed must forward"
         );
+
+        // set_unit_base through the generic bound exercises the forwarding impl
+        // (a direct `boxed.set_unit_base()` would vtable-dispatch instead). A
+        // missing forwarding body would silently no-op and record nothing.
+        set_unit_base_generic(boxed, 64);
+        assert_eq!(
+            *unit_bases.lock().unwrap(),
+            vec![64],
+            "set_unit_base must forward through Box<dyn>"
+        );
     }
 
-    /// `&mut dyn SectorSource` must likewise forward all three methods.
+    /// `&mut dyn SectorSource` must likewise forward every method.
     /// Grounding: `impl SectorSource for &mut (dyn SectorSource + '_)`.
     #[test]
     fn mut_ref_dyn_forwards_all_methods() {
-        let (mut spy, reads, speeds) = Spy::new(123);
-        let r: &mut dyn SectorSource = &mut spy;
+        let (mut spy, reads, speeds, unit_bases) = Spy::new(123);
 
-        assert_eq!(r.capacity_sectors(), 123);
+        {
+            let r: &mut dyn SectorSource = &mut spy;
+            assert_eq!(r.capacity_sectors(), 123);
 
-        let mut buf = vec![0u8; 2 * 2048];
-        let n = r.read_sectors(7, 2, &mut buf, false).unwrap();
-        assert_eq!(n, 2 * 2048);
+            let mut buf = vec![0u8; 2 * 2048];
+            let n = r.read_sectors(7, 2, &mut buf, false).unwrap();
+            assert_eq!(n, 2 * 2048);
 
-        r.set_speed(8800);
+            r.set_speed(8800);
+        }
+
+        // Pass `&mut dyn` as a generic S so the forwarding impl's set_unit_base
+        // is the one under test, not the vtable path.
+        let r2: &mut dyn SectorSource = &mut spy;
+        set_unit_base_generic(r2, 128);
 
         assert_eq!(*reads.lock().unwrap(), vec![(7, 2, false)]);
         assert_eq!(*speeds.lock().unwrap(), vec![8800]);
+        assert_eq!(
+            *unit_bases.lock().unwrap(),
+            vec![128],
+            "set_unit_base must forward through &mut dyn"
+        );
     }
 }

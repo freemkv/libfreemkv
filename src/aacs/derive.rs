@@ -463,7 +463,7 @@ pub enum KeyCandidate {
 /// PURE DERIVATION — no unit sampling, no validation. `unit_keys` holds every
 /// CPS-unit key the disc's `Unit_Key_RO.inf` yields from the VUK (paired with
 /// its declared CPS-unit number); the caller runs
-/// [`super::content::unit_key_validates`] to find which one actually opens the
+/// `decrypt_unit` + `is_clean_ts` to find which one actually opens the
 /// disc. Rungs above the candidate are `None`.
 #[derive(Debug, Clone)]
 pub struct ResolvedChain {
@@ -487,7 +487,7 @@ pub struct ResolvedChain {
 ///
 /// PURE DERIVATION: no sampling, no validation, no position recovery. Validate
 /// `unit_keys` against a real encrypted unit with
-/// [`super::content::unit_key_validates`] to prove the candidate opens the disc.
+/// `decrypt_unit` + `is_clean_ts` to prove the candidate opens the disc.
 ///
 /// Returns `None` only when derivation itself cannot proceed: a PK its MKB
 /// rejects, a `Dk` the MKB can't process, a missing VID on a path that needs
@@ -505,7 +505,8 @@ pub fn resolve_candidate(
         let version = mkb_type(mkb)
             .map(|t| t.generation())
             .unwrap_or(AacsVersion::V10);
-        let ukf = parse_unit_key_ro(unit_key_ro, version)?;
+        // BD/UHD Unit_Key_RO.inf or HD DVD VTKF000.AACS — dispatched by magic.
+        let ukf = parse_title_keys(unit_key_ro, version)?;
         if ukf.encrypted_keys.is_empty() {
             return None;
         }

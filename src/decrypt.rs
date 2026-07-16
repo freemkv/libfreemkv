@@ -150,10 +150,15 @@ pub fn decrypt_threads() -> usize {
 pub enum DecryptKeys {
     /// No encryption on this disc.
     None,
-    /// AACS (Blu-ray / UHD). Unit keys + optional read data key.
+    /// AACS (Blu-ray / UHD / HD-DVD). Unit keys + optional read data key. The
+    /// `format` is the disc's content container (BD/UHD/FMTS = Transport Stream,
+    /// HD-DVD `.evo` = Program Stream); it travels with the keys because both are
+    /// resolved once per disc, and the key SELECTOR (`is_clean`) needs it to prove
+    /// a key structurally against the right container.
     Aacs {
         unit_keys: Vec<(u32, [u8; 16])>,
         read_data_key: Option<[u8; 16]>,
+        format: crate::disc::ContentFormat,
     },
     /// CSS (DVD). Title key for sector descrambling.
     Css { title_key: [u8; 5] },
@@ -206,7 +211,8 @@ pub fn decrypt_sectors(
 /// no TS sync, which would otherwise be mistaken for ciphertext). `base_lba` is
 /// the absolute LBA of `buf`'s first sector; aligned units are 3 sectors.
 ///
-/// `content_ranges` is sorted, merged, disjoint `[start_lba, end_lba)`.
+/// `content_ranges` is sorted, merged, disjoint `(start_lba, sector_count)`
+/// tuples (each covering `[start_lba, start_lba + sector_count)`).
 pub fn decrypt_sectors_in_content(
     buf: &mut [u8],
     keys: &mut DecryptKeys,
@@ -242,6 +248,7 @@ fn decrypt_sectors_impl(
         DecryptKeys::Aacs {
             unit_keys,
             read_data_key,
+            format,
         } => {
             // Validate that unit_key_idx is in-range before doing anything else.
             // This preserves the existing contract: an out-of-range explicit index
@@ -250,8 +257,13 @@ fn decrypt_sectors_impl(
                 return Err(crate::error::Error::DecryptFailed);
             }
 
-            // Strip CPS-unit IDs — the decrypt primitives only want the raw key bytes.
-            let raw_keys: Vec<[u8; 16]> = unit_keys.iter().map(|(_, k)| *k).collect();
+            // Container of this disc's content — the key SELECTOR (`is_clean`)
+            // checks the decrypted plaintext against the right structure (TS vs PS).
+            let format = *format;
+            // Index `unit_keys` directly for the raw key bytes (the `.1` of each
+            // `(cps_id, key)`); no per-call `Vec` of stripped keys — the decrypt
+            // closures only ever need `len()` / `[idx].1`, so collecting one would
+            // just be a heap alloc/free on every batch of the mux hot path.
             let rdk: Option<[u8; 16]> = *read_data_key;
             let unit_len = aacs::content::ALIGNED_UNIT_LEN;
             // AACS decrypts whole 6144-byte aligned units. The live mux path
@@ -295,7 +307,13 @@ fn decrypt_sectors_impl(
                     Some((base, ranges)) => lba_in_ranges(base.saturating_add(nfull * 3), ranges),
                     None => true,
                 };
-                if partial_in_content {
+                // TS-only: a scrambled trailing PARTIAL unit (< a full 6144-byte
+                // unit) can't be unit-decrypted, so fail loud. The heuristic is
+                // MPEG-TS sync density, which a PS (`.evo`) partial lacks entirely —
+                // running it on PS would false-trip `DecryptFailed`. HD-DVD partial-
+                // scramble detection is not yet wired (consistent with the UNVERIFIED
+                // PS path in `aacs_unit_encrypted`).
+                if partial_in_content && format == crate::disc::ContentFormat::BdTs {
                     let partial = &buf[buf.len() - partial_len..];
                     let packets = aacs::content::ts_packet_total(partial);
                     if packets > 0 && aacs::content::ts_sync_count(partial) <= packets / 2 {
@@ -336,12 +354,15 @@ fn decrypt_sectors_impl(
             // must happen first — it's a shared layer on top that is key-independent
             // across all CPS units on the disc.
             let decrypt_one = |chunk: &mut [u8]| {
-                // Gate on `aacs_unit_needs_decrypt` (CPI set AND TS syncs not yet
-                // restored): CPI alone isn't enough because the plaintext seed keeps
-                // the CPI bit set after decryption, so an already-decrypted unit would
-                // be decrypted a SECOND time (scrambling it) on any re-run of this
-                // pass. The intact-TS half makes it idempotent.
-                if chunk.len() != unit_len || !aacs::content::aacs_unit_needs_decrypt(chunk) {
+                // Gate on `aacs_unit_needs_decrypt` (encrypted-flag set AND structure
+                // not yet restored): the flag alone isn't enough because it lives in
+                // the plaintext header and survives decryption, so an already-decrypted
+                // unit would be decrypted a SECOND time (scrambling it) on any re-run of
+                // this pass. The structure-restored half makes it idempotent. This is
+                // ALSO the sole gate protecting the now-pure `decrypt_unit` from
+                // decrypting a clear unit.
+                if chunk.len() != unit_len || !aacs::content::aacs_unit_needs_decrypt(chunk, format)
+                {
                     return;
                 }
 
@@ -355,41 +376,67 @@ fn decrypt_sectors_impl(
                 // back to the full list skipping the hint.
                 let hint = last_key_idx.load(Ordering::Relaxed);
                 let try_order =
-                    std::iter::once(hint).chain((0..raw_keys.len()).filter(move |&i| i != hint));
+                    std::iter::once(hint).chain((0..unit_keys.len()).filter(move |&i| i != hint));
 
-                // DECRYPT the unit — apply a key, leave the plaintext. "Did a key
-                // produce clean TS?" is NOT "did we decrypt?": a correct key can
-                // decrypt content whose underlying encoding is broken (bad TS sync),
-                // which is a MUXER concern, never a decrypt verdict. Clean TS is used
-                // ONLY as a key-SELECTION hint on multi-CPS-unit discs — the first
-                // key that yields clean TS is the definite match. When none does we
-                // STILL decrypted (the cached-hint key is applied): keep those bytes
-                // and report the unit as UNVERIFIED. This function applies no policy;
-                // the caller decides what an unverified unit means (the mux passes it
-                // to the muxer; sweep/patch treat it as a read to recover or fail).
-                let mut applied: Option<Vec<u8>> = None;
+                // Compose the two SEGREGATED primitives explicitly. `decrypt_unit`
+                // is the decrypt (apply the key, leave the plaintext). `is_clean`
+                // is a SEPARATE structural question used here ONLY as a multi-CPS-unit
+                // key SELECTOR — the first key whose output is clean for the disc's
+                // container (`format`: TS or PS) is the match. "Did a key produce
+                // clean structure?" is NOT "did we decrypt?": a correct key can
+                // decrypt content whose encoding is broken (a muxer concern). When
+                // NO key yields clean structure we STILL decrypted (the cached-hint
+                // key is applied): keep those bytes and report the unit UNVERIFIED.
+                // This function applies no policy; the caller decides what unverified
+                // means (mux passes it to the muxer; sweep/patch recover or fail).
+
+                // Single-key fast path (the vast majority of titles): with no
+                // alternate key to fall back on there is nothing to try/rollback,
+                // so decrypt in place — no per-unit scratch alloc or copy-back.
+                // Clean → cache the hint; unclean → keep the applied bytes and
+                // tally unverified, exactly as the loop below would with one key.
+                if unit_keys.len() == 1 {
+                    aacs::content::decrypt_unit(chunk, &unit_keys[0].1);
+                    if aacs::content::is_clean(chunk, format) {
+                        last_key_idx.store(0, Ordering::Relaxed);
+                    } else {
+                        dropped_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
+                    }
+                    return;
+                }
+
+                // Trial each key against a STACK scratch (unit_len is always
+                // ALIGNED_UNIT_LEN and the guard above proved chunk.len() == unit_len)
+                // so a failing attempt doesn't clobber the bus-decrypted base in
+                // `chunk` that the next key retries on — with no per-key heap Vec.
+                // `chunk` is NOT mutated in this loop, so on total miss we simply
+                // re-apply the first key in place (decrypt_unit is pure), which
+                // reproduces the first attempt without stashing its bytes.
+                let mut scratch = [0u8; aacs::content::ALIGNED_UNIT_LEN];
+                let scratch = &mut scratch[..chunk.len()];
+                let mut first_idx: Option<usize> = None;
                 for idx in try_order {
-                    if let Some(key) = raw_keys.get(idx) {
-                        // Work on a per-key copy so a failing attempt doesn't
-                        // clobber the bus-decrypted base we'll retry on.
-                        let mut attempt: Vec<u8> = chunk.to_vec();
-                        if aacs::content::decrypt_unit(&mut attempt, key) {
-                            chunk.copy_from_slice(&attempt);
+                    if let Some((_, key)) = unit_keys.get(idx) {
+                        scratch.copy_from_slice(chunk);
+                        aacs::content::decrypt_unit(scratch, key);
+                        if aacs::content::is_clean(scratch, format) {
+                            chunk.copy_from_slice(scratch);
                             last_key_idx.store(idx, Ordering::Relaxed);
                             return;
                         }
-                        if applied.is_none() {
-                            applied = Some(attempt);
+                        if first_idx.is_none() {
+                            first_idx = Some(idx);
                         }
                     }
                 }
 
-                // No key yielded clean TS. Keep the applied-key plaintext (the pool is
-                // non-empty past the guard, so `applied` is always `Some`) and tally
-                // the unit as unverified. Never restore ciphertext; that is a caller
-                // concern, threaded through the recovery ciphertext, not this seam.
-                if let Some(decrypted) = applied {
-                    chunk.copy_from_slice(&decrypted);
+                // No key yielded clean structure. Keep the first-tried key's
+                // plaintext (the pool is non-empty past the guard, so `first_idx` is
+                // always `Some`) and tally the unit as unverified. Never restore
+                // ciphertext; that is a caller concern, threaded through the recovery
+                // ciphertext, not this seam.
+                if let Some(idx) = first_idx {
+                    aacs::content::decrypt_unit(chunk, &unit_keys[idx].1);
                 }
                 dropped_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
             };
@@ -427,11 +474,14 @@ fn decrypt_sectors_impl(
                 // back to the serial path rather than panic.
                 match decrypt_pool() {
                     Some(pool) => {
-                        let chunks: Vec<&mut [u8]> = buf.chunks_mut(unit_len).collect();
+                        // `par_chunks_mut` iterates the units in place — no
+                        // intermediate `Vec<&mut [u8]>` allocation per batch.
                         pool.install(|| {
-                            chunks.into_par_iter().enumerate().for_each(|(idx, chunk)| {
-                                process(idx, chunk);
-                            });
+                            buf.par_chunks_mut(unit_len)
+                                .enumerate()
+                                .for_each(|(idx, chunk)| {
+                                    process(idx, chunk);
+                                });
                         });
                     }
                     None => {
@@ -483,6 +533,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         // The unit sits at LBA 0..3; the content extents are elsewhere (100..110),
         // so this nav unit is OUTSIDE content and the gate skips it untouched.
@@ -554,6 +605,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let original = scrambled_region(aacs::content::ALIGNED_UNIT_LEN);
 
@@ -587,6 +639,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = scrambled_region(2 * aacs::content::ALIGNED_UNIT_LEN);
         // unit0 @ LBA 0 (clear/skip), unit1 @ LBA 3 (content). Content = [(3,3)].
@@ -605,6 +658,7 @@ mod tests {
         let mut keys_g = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut keys_u = keys_g.clone();
         let original = scrambled_region(aacs::content::ALIGNED_UNIT_LEN);
@@ -655,6 +709,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let original = scrambled_region(aacs::content::ALIGNED_UNIT_LEN);
         let mut buf = original.clone();
@@ -673,6 +728,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let original = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
         let mut buf = original.clone();
@@ -791,6 +847,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let u = aacs::content::ALIGNED_UNIT_LEN;
         let mut buf = vec![0u8; 3 * u];
@@ -808,6 +865,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = scrambled_region(2 * aacs::content::ALIGNED_UNIT_LEN);
         // unit0 @ LBA0 content, unit1 @ LBA3 out. Content = [(0,3)].
@@ -827,6 +885,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         // One full clear unit + a scrambled single-sector partial, all OUTSIDE
         // content → the partial must be tolerated (Ok), not DecryptFailed.
@@ -849,6 +908,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         // One full scrambled unit + a 2048-byte (single-sector) CLEAR tail.
         let unit = scrambled_region(aacs::content::ALIGNED_UNIT_LEN);
@@ -874,6 +934,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         // One full unit + a 4096-byte (two-sector) SCRAMBLED tail.
         let unit = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
@@ -896,6 +957,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf: Vec<u8> = Vec::new();
         assert!(decrypt_sectors(&mut buf, &mut keys, 0).is_ok());
@@ -909,6 +971,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN * 2);
         let snapshot = buf.clone();
@@ -950,6 +1013,7 @@ mod tests {
             DecryptKeys::Aacs {
                 unit_keys: vec![(0, [0; 16])],
                 read_data_key: None,
+                format: crate::disc::ContentFormat::BdTs,
             }
             .is_encrypted()
         );
@@ -1164,6 +1228,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
         let err = decrypt_sectors(&mut buf, &mut keys, 5)
@@ -1184,6 +1249,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
         let err = decrypt_sectors(&mut buf, &mut keys, 0).expect_err("empty unit_keys must error");
@@ -1265,6 +1331,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key0), (1, key1)], // two CPS units
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
 
         // Call with the default hint (idx 0) — the fix must fall back to key1.
@@ -1299,6 +1366,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = unit;
         decrypt_sectors(&mut buf, &mut keys, 0).expect("single-key disc must decrypt");
@@ -1340,6 +1408,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, wrong_key)],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = unit;
         let unverified =
@@ -1383,6 +1452,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let dropped = decrypt_sectors(&mut buf, &mut keys, 0).expect("partial decrypt is Ok");
 
@@ -1412,6 +1482,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = unit;
         let dropped = decrypt_sectors(&mut buf, &mut keys, 0).expect("clean decrypt");

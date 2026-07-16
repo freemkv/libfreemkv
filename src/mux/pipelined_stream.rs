@@ -56,14 +56,6 @@ pub struct PipelinedPesStream {
     /// `std::env::var_os` takes a process-wide lock, so the per-batch /
     /// per-poll reads it replaces were needless hot-path overhead.
     skip_parse: bool,
-    /// Cumulative bytes of scrambled AACS units the producer's decrypt step
-    /// could not decrypt — silent decrypt loss the demux drops without a sync.
-    /// Shared with the producer thread's [`DecryptingSectorSource`]
-    /// (`crate::sector::DecryptingSectorSource::decrypt_loss`). Surfaced through
-    /// [`Stream::lost_bytes`] so the file-backed mux abort gate sees a partial
-    /// decrypt failure instead of reporting a perfect rip. `None` for pipelines
-    /// with no AACS decrypt step (e.g. the M2TS byte-stream path).
-    decrypt_loss: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Count of dropped DVD navigation packets (private_stream_2, 0xBF). These
     /// are expected on every disc; instead of a per-packet WARN they're tallied
     /// and summarised once at EOF.
@@ -134,26 +126,11 @@ impl PipelinedPesStream {
             pending_frames: std::collections::VecDeque::new(),
             eof: false,
             skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
-            decrypt_loss: None,
             dropped_nav_packets: 0,
             resync,
             is_video,
             au_asm,
         }
-    }
-
-    /// Attach the producer's decrypt-loss counter so [`Stream::lost_bytes`]
-    /// reports bytes of scrambled AACS units that could not be decrypted (and
-    /// were therefore silently dropped downstream). Obtained from the
-    /// producer's `DecryptingSectorSource::decrypt_loss()` before it is moved
-    /// into the prefetch thread. The M2TS / no-decrypt pipelines leave this
-    /// unset.
-    pub(crate) fn with_decrypt_loss(
-        mut self,
-        loss: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    ) -> Self {
-        self.decrypt_loss = Some(loss);
-        self
     }
 
     /// Pull one batch of `PesPacket`s from the demux thread, run
@@ -464,17 +441,9 @@ impl Stream for PipelinedPesStream {
             .and_then(|(_, parser)| parser.codec_private())
     }
 
-    fn lost_bytes(&self) -> u64 {
-        // The file-backed highway has no read-error zero-fill term (resolve
-        // tracks read loss separately), but the producer's decrypt step can
-        // pass scrambled units through undecrypted — silent loss the demux
-        // drops. Surface that so the mux abort gate sees a partial AACS/CSS
-        // decrypt failure rather than reporting a perfect rip.
-        self.decrypt_loss
-            .as_ref()
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0)
-    }
+    // `lost_bytes` uses the trait default (0): the file-backed highway has no
+    // read-error zero-fill term (resolve/mapfile tracks physical read loss
+    // separately) and the decrypt path no longer reports a decrypt-loss term.
 }
 
 #[cfg(test)]
