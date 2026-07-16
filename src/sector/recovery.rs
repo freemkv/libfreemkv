@@ -135,6 +135,12 @@ fn aacs_fetch_step(
         return prev_dropped;
     }
     let unit_len = crate::aacs::content::ALIGNED_UNIT_LEN;
+    // Container of this disc's content — travels with the keys; drives the
+    // encrypted-flag / structure check below (TS vs PS).
+    let format = match &*keys {
+        DecryptKeys::Aacs { format, .. } => *format,
+        _ => crate::disc::ContentFormat::BdTs,
+    };
     // Gather up to MAX_FETCH_SAMPLES units the current pool did NOT open. Detect
     // them on the post-decrypt TARGET (a failed unit stays TS-destroyed; an opened
     // one is now clean TS and is skipped), but SAMPLE the matching on-disc
@@ -146,7 +152,7 @@ fn aacs_fetch_step(
         .chunks_exact(unit_len)
         .zip(ciphertext.chunks_exact(unit_len))
     {
-        if crate::aacs::content::aacs_unit_needs_decrypt(t) {
+        if crate::aacs::content::aacs_unit_needs_decrypt(t, format) {
             samples.push(c.to_vec());
             if samples.len() >= MAX_FETCH_SAMPLES {
                 break;
@@ -256,6 +262,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let cipher = buf.clone();
         let out = r(&mut buf, &cipher, &mut keys, &ctx(0, 6144));
@@ -279,6 +286,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let cipher = buf.clone();
         r(&mut buf, &cipher, &mut keys, &ctx(0, ALIGNED_UNIT_LEN));
@@ -304,6 +312,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = scrambled_unit(0x44);
         let cipher = buf.clone();
@@ -330,6 +339,7 @@ mod tests {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         // Distinct ciphertext each time so the dry-set never short-circuits; only
         // the internal call budget should stop the fetch. The closure self-limits,

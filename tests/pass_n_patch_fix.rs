@@ -27,21 +27,39 @@ fn decrypt_sectors_with_aacs_keys_works() {
 
     let unit_key: [u8; 16] = [0xAAu8; 16];
 
-    // Encrypt the unit using AACS algorithm
-    aacs::content::decrypt_unit(&mut unit, &unit_key); // decrypt_unit is idempotent on already-encrypted data
+    // Apply the key to the pattern to produce ciphertext-shaped bytes for the
+    // call below. (decrypt_unit is now PURE — it applies the key unconditionally,
+    // so it is NOT idempotent; never call it twice on the same unit.)
+    aacs::content::decrypt_unit(&mut unit, &unit_key);
+    // (byte 0 keeps its CPI bits set from above, so `decrypt_sectors` recognises
+    // this as encrypted content and actually applies the key.)
 
-    // Now we have encrypted data - create DecryptKeys with actual keys
-    let mut keys = DecryptKeys::Aacs {
+    let mut aacs_keys = DecryptKeys::Aacs {
         unit_keys: vec![(0u32, unit_key)],
         read_data_key: None,
+        format: libfreemkv::disc::ContentFormat::BdTs,
     };
+    let mut none_keys = DecryptKeys::None;
 
-    // decrypt_sectors should handle this without error
-    let result = libfreemkv::decrypt::decrypt_sectors(&mut unit, &mut keys, 0);
+    // The regression this guards is passing `DecryptKeys::None` where AACS keys
+    // were meant. Prove the two DIVERGE: AACS applies the key (bytes change), None
+    // leaves the unit byte-for-byte untouched. is_ok alone can't catch that —
+    // both variants return Ok.
+    let mut with_aacs = unit.clone();
+    let mut with_none = unit.clone();
+    libfreemkv::decrypt::decrypt_sectors(&mut with_aacs, &mut aacs_keys, 0)
+        .expect("AACS decrypt must not error");
+    libfreemkv::decrypt::decrypt_sectors(&mut with_none, &mut none_keys, 0)
+        .expect("None decrypt must not error");
 
-    assert!(
-        result.is_ok(),
-        "decrypt_sectors with AACS keys should not error"
+    assert_ne!(
+        with_aacs, unit,
+        "AACS keys must actually transform the unit"
+    );
+    assert_eq!(with_none, unit, "None keys must leave the unit untouched");
+    assert_ne!(
+        with_aacs, with_none,
+        "AACS decrypt must differ from the None no-op (the None-vs-Aacs regression)"
     );
 }
 
@@ -111,6 +129,7 @@ fn decrypt_keys_is_encrypted_variants() {
     let aacs = DecryptKeys::Aacs {
         unit_keys: vec![],
         read_data_key: None,
+        format: libfreemkv::disc::ContentFormat::BdTs,
     };
     assert!(aacs.is_encrypted());
 

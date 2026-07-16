@@ -405,9 +405,15 @@ pub(super) fn compute_initial_state(
         bad_ranges.reverse();
     }
     let work_total: u64 = bad_ranges.iter().map(|(_, sz)| *sz).sum();
+    // Fail SAFE when metadata is indeterminate: assume a regular file so a
+    // real `sync_all` failure is surfaced, not swallowed. `/dev/null` and pipes
+    // report success-with-non-file here (so they still correctly map to
+    // `false`); only a genuine metadata error (e.g. transient NFS ESTALE) hits
+    // the default, and for a data-integrity guard "surface the error" is the
+    // right side to err on.
     let is_regular = std::fs::metadata(path)
         .map(|m| m.file_type().is_file())
-        .unwrap_or(false);
+        .unwrap_or(true);
     Ok((
         map,
         initial_stats,
@@ -1247,7 +1253,24 @@ impl Disc {
     pub fn bytes_bad_in_title(&self, mapfile_path: &std::path::Path, title: &DiscTitle) -> u64 {
         let map = match mapfile::Mapfile::load(mapfile_path) {
             Ok(m) => m,
-            Err(_) => return 0,
+            // A MISSING mapfile is legitimate (no damage was ever tracked — e.g. a
+            // clean single-pass rip): 0 bad bytes is correct. Any OTHER load error
+            // (corrupt / unreadable mapfile) means we CANNOT know the damage — and
+            // a returned 0 reads to the caller as "clean." Logging alone is not
+            // fail-safe: the RETURN VALUE drives the loss/abort accounting, not the
+            // log. So fail safe by reporting the ENTIRE title as bad (its full
+            // in-extent byte count) — a corrupt damage record must surface as
+            // maximal loss, never as a clean rip.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(e) => {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    path = %mapfile_path.display(),
+                    error = %e,
+                    "bytes_bad_in_title: mapfile load failed; reporting whole title bad (fail-safe: cannot confirm clean)"
+                );
+                return bytes_bad_in_title(title, &[(0, u64::MAX)]);
+            }
         };
         let bad_ranges = map.ranges_with(&[
             mapfile::SectorStatus::NonTrimmed,
@@ -1299,33 +1322,13 @@ impl Disc {
         let bytes_good_before = initial_stats.bytes_good;
         let bytes_good_start = bytes_good_before;
 
-        // Post-read verify gate for the patch pass (ciphertext multipass only,
-        // `!opts.decrypt`). Built here from the raw reader's UDF enumeration;
-        // reused AFTER the recovery loop (`reverify_iso`) to re-check the units
-        // this pass touched by reading them WHOLE back from the patched ISO —
-        // patch re-reads only the bad sectors of a unit, so per-unit verify
-        // can't run live. Fail-safe `None` when disabled / non-AACS / no keys.
-        let mut verifier = if opts.decrypt {
-            None
-        } else {
-            let verify_keys = self.decrypt_keys();
-            let layouts = crate::disc::extract::clip_layouts(&mut *reader);
-            crate::disc::verify::UnitVerifier::new(&layouts, &verify_keys, opts.key_fetch.clone())
-        };
         // Decrypt-aware read — symmetric with `Disc::sweep`. A decrypting patch
-        // (`opts.decrypt`) decrypts in place (plaintext ISO). A NON-decrypting
-        // patch (the multipass / `--raw --multipass` path) resolves the keys and
-        // VERIFIES each unit on a scratch copy: a re-read that STILL won't decrypt
-        // fails the read (`DECRYPT_VERIFY_READ`) and stays NonTrimmed, so the
-        // retry loop keeps re-reading it "until it decrypts or retries exhaust"
-        // exactly as for a SCSI read error — and a unit that DOES decrypt on a
-        // fresh read (the drive returned different bytes) is recovered for free.
-        // With no usable AACS keys this degrades to a plain pass-through.
-        // Symmetric with `Disc::sweep`: the patch COPIES ciphertext (multipass /
-        // `--raw`) or decrypts IN PLACE (`opts.decrypt`). It does NOT decrypt-
-        // VERIFY — the disc-absolute read can't anchor to a clip's file-relative
-        // unit grid (see `Disc::sweep` + `Disc::verify_clips`). Re-reads recover
-        // bad sectors; the clip-anchored verify pass re-checks them afterward.
+        // (`opts.decrypt`) decrypts in place (plaintext ISO); a NON-decrypting
+        // patch (the multipass / `--raw --multipass` path) copies ciphertext
+        // verbatim (keys = `None` → pass-through). Bad sectors are found by
+        // PHYSICAL read success, not by decrypt structure: a re-read that returns
+        // good bytes recovers the range; a read that errors leaves it NonTrimmed
+        // for the next pass. (The old decrypt-VERIFY read gate was removed.)
         let keys = if opts.decrypt {
             self.decrypt_keys()
         } else {
@@ -1435,64 +1438,7 @@ impl Disc {
         // sink's summary. `close` failing on a regular-file sync_all is
         // surfaced here as `Error::IoError`, matching pre-split
         // behaviour.
-        let mut summary = pipe.finish()?;
-
-        // Scoped post-read re-verify (decrypt-fail == bad read). The consumer
-        // has flushed the ISO + mapfile; re-read each clip unit this pass touched
-        // WHOLE from the patched ISO and downgrade any that still won't decrypt
-        // to NonTrimmed, so the orchestrator's end-of-recovery promotion
-        // terminalizes it. Reuses the same verifier as the sweep. Fail-safe:
-        // disabled gate / unreadable ISO / load failure all leave the pass as-is.
-        if let Some(mut v) = verifier.take() {
-            if let Ok(mut m) = mapfile::Mapfile::load(&mapfile_path) {
-                // Only units whose every backing sector was actually READ
-                // (Finished) may be re-verified — we can't verify what wasn't read
-                // (a non-Finished sector is zero-filled because the read failed),
-                // and must not waste a key lookup on a known-bad block.
-                let finished = m.ranges_with(&[mapfile::SectorStatus::Finished]);
-                let is_finished = |lba: u32| -> bool {
-                    let p = lba as u64 * 2048;
-                    finished.iter().any(|&(s, sz)| p >= s && p < s + sz)
-                };
-                if let Ok(mut iso) = crate::io::file_sector_source::FileSectorSource::open(path) {
-                    let bad = v.reverify_iso(&mut iso, &bad_ranges, &is_finished);
-                    if !bad.is_empty() {
-                        let n: usize = bad.len();
-                        for (lba, cnt) in bad {
-                            if let Err(e) = m.record(
-                                lba as u64 * 2048,
-                                cnt as u64 * 2048,
-                                mapfile::SectorStatus::NonTrimmed,
-                            ) {
-                                tracing::warn!(
-                                    lba,
-                                    "reverify downgrade: mapfile record failed ({e}) — unit may stay mismarked as good"
-                                );
-                            }
-                        }
-                        if let Err(e) = m.flush() {
-                            tracing::warn!(
-                                "reverify downgrade: mapfile flush failed ({e}) — downgrade not persisted; a resume could mismark it good"
-                            );
-                        }
-                        // The re-verify ran AFTER `pipe.finish()` snapshotted
-                        // `summary.stats`, so those stats still count the just-
-                        // downgraded units as good. Refresh from the mapfile so
-                        // `build_outcome` reports the true post-downgrade picture
-                        // (bytes_good ↓, bytes_pending ↑) — otherwise the caller
-                        // over-reports recovery and can call an imperfect rip
-                        // "complete".
-                        summary.stats = m.stats();
-                        tracing::info!(
-                            target: "freemkv::verify",
-                            phase = "patch.reverify",
-                            downgraded_ranges = n,
-                            "post-read re-verify downgraded undecryptable units to NonTrimmed"
-                        );
-                    }
-                }
-            }
-        }
+        let summary = pipe.finish()?;
 
         let outcome = build_outcome(
             &state,

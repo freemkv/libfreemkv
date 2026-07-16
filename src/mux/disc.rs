@@ -108,11 +108,6 @@ pub struct DiscStream {
     /// inline `decrypt::decrypt_sectors` step. `DecryptKeys::None`
     /// (raw / unencrypted disc) makes the decorator a pass-through.
     reader: DecryptingSectorSource<Box<dyn SectorSource>>,
-    /// Shared decrypt-loss counter, cloned once at construction from
-    /// `reader.decrypt_loss()`. `lost_bytes()` loads it directly so the
-    /// per-frame hot path performs no per-call `Arc::clone` (matching the
-    /// `PipelinedPesStream` pattern).
-    decrypt_loss: std::sync::Arc<std::sync::atomic::AtomicU64>,
     title: DiscTitle,
     /// Mirror of the keys handed in at construction. The decorator
     /// owns the cryptographic state; this field is kept for
@@ -242,8 +237,7 @@ impl DiscStream {
         // concern, never conceal / re-fetch / count as loss (fail loud only on a
         // genuine can't-decrypt). DiscStream is a decode/mux stream (live-drive
         // single-pass / direct), never the ciphertext-preserving sweep.
-        let mut reader =
-            DecryptingSectorSource::new(reader, decrypt_keys.clone()).tolerate_decrypt_loss();
+        let mut reader = DecryptingSectorSource::new(reader, decrypt_keys.clone());
 
         // Wrong-substream fix (Silence-of-the-Lambs): re-route the title's
         // declared AC-3 audio onto the physically-correct `0x8x` sub-streams by
@@ -294,9 +288,6 @@ impl DiscStream {
         // the decorator is a pass-through). Reset the unit base the probe read
         // advanced so the first fill_extents read starts cleanly.
         reader.set_unit_base(0);
-        // Clone the shared loss counter once here so `lost_bytes()` never
-        // clones an Arc per frame on the mux hot path.
-        let decrypt_loss = reader.decrypt_loss();
 
         // B1 resync gates: one per stream, video flagged so the gate only
         // drop-to-keyframes video (audio/subtitle always admit). Computed before
@@ -312,7 +303,6 @@ impl DiscStream {
 
         Self {
             reader,
-            decrypt_loss,
             title,
             decrypt_keys,
             unit_align,
@@ -1004,14 +994,12 @@ impl crate::pes::Stream for DiscStream {
     }
 
     fn lost_bytes(&self) -> u64 {
-        // Read-error zero-fill loss (counted in fill_extents) PLUS decrypt-time
-        // loss — bytes of scrambled AACS units the decorator could not decrypt
-        // and passed through still encrypted (the TS assembler silently drops
-        // them). Both are real missing content the abort gate must see; without
-        // the decrypt term a partial key failure reports lost_bytes=0 and a rip
-        // missing segments passes even under abort_on_lost_secs=0.
+        // Read-error zero-fill loss (counted in fill_extents) — real missing
+        // content the abort gate must see. There is no decrypt-loss term: the
+        // decrypt path passes bad-encoded/undecryptable units through (a broken-TS
+        // unit is the muxer's concern, and a missing key is indistinguishable from
+        // bad authoring here), so only physical read loss is reported.
         self.lost_bytes
-            .saturating_add(self.decrypt_loss.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -1490,6 +1478,7 @@ mod tests {
         let keys = crate::decrypt::DecryptKeys::Aacs {
             unit_keys: vec![(0, [0u8; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         let mut stream = DiscStream::new(Box::new(reader), title, keys, 8, ContentFormat::BdTs);
         stream.skip_errors = true;

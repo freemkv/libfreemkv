@@ -1791,6 +1791,57 @@ mod tests {
     }
 
     #[test]
+    fn read_aacs_inputs_falls_through_to_hddvd_any_dir() {
+        // HD DVD keeps its AACS material under /ANY!/ (VTKF000.AACS title-key
+        // file + MKBROM.AACS), NOT /AACS/Unit_Key_RO.inf + /AACS/MKB_RO.inf. The
+        // role-based candidate lists must fall through to the /ANY!/ files with
+        // NO disc-type branch, so the online keyserver POST carries the HD DVD
+        // title-key file (magic "DVD_HD_V_TKF") as inf_b64 + MKBROM as mkb_b64 —
+        // the server then classifies the disc as HD DVD by that magic.
+        let any = DirEntry {
+            name: "ANY!".to_string(),
+            is_dir: true,
+            meta_lba: 0,
+            size: 0,
+            entries: vec![
+                file_entry("VTKF000.AACS", 5, 2048),
+                file_entry("MKBROM.AACS", 7, 2048),
+            ],
+        };
+        let root = DirEntry {
+            name: String::new(),
+            is_dir: true,
+            meta_lba: 0,
+            size: 0,
+            entries: vec![any], // deliberately NO /AACS/ dir
+        };
+        let mut reader = MapReader::new();
+        // VTKF000.AACS: one extent whose content opens with the HD DVD magic.
+        let mut vtkf = [0u8; 2048];
+        vtkf[..12].copy_from_slice(b"DVD_HD_V_TKF");
+        reader.put(5, build_efe_long(2048, &[(0, 2048, 10)]));
+        reader.put(10, vtkf);
+        // MKBROM.AACS: one extent with a type-0x10 AACS-1.0 (HD DVD) version record.
+        let mut mkb = [0u8; 2048];
+        mkb[..12].copy_from_slice(&[
+            0x10, 0x00, 0x00, 0x0C, 0x00, 0x04, 0x10, 0x03, 0x00, 0x00, 0x00, 0x03,
+        ]);
+        reader.put(7, build_efe_long(2048, &[(0, 2048, 50)]));
+        reader.put(50, mkb);
+
+        let fs = fs_with(0, 0, root);
+        let (inf, _mkb, _version) =
+            crate::disc::Disc::read_aacs_inputs_from_reader(&mut reader, &fs)
+                .expect("read_aacs_inputs must source the HD DVD /ANY!/ files");
+        assert_eq!(
+            &inf[..12],
+            b"DVD_HD_V_TKF",
+            "inf must be the HD DVD VTKF (its magic), sourced from /ANY!/ via the \
+             candidate fall-through — not /AACS/Unit_Key_RO.inf"
+        );
+    }
+
+    #[test]
     fn merge_ranges_saturates_near_u32_max() {
         // Adjacent ranges near u32::MAX must not panic (debug) or wrap.
         let ranges = [(u32::MAX - 1, 2), (u32::MAX, 5)];

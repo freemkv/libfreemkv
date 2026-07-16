@@ -785,23 +785,35 @@ fn block_ts(is_video: bool, prev: Option<i64>, pts_ticks: i64) -> i64 {
 
 /// Encode a Matroska track number as an EBML VINT into a stack buffer,
 /// returning the buffer and the used length. Track numbers are small (1-based,
-/// a handful of tracks), so 1 byte covers `< 0x80` and 2 bytes covers the rest;
-/// no heap allocation, called once per block on the mux hot path.
+/// a handful of tracks), so 1 byte covers `< 0x80`, 2 bytes covers `< 0x4000`,
+/// and 3 bytes covers `< 0x20_0000`; no heap allocation, called once per block
+/// on the mux hot path.
 ///
-/// The 2-byte form holds 14 payload bits (max 0x3FFF). The `debug_assert`
-/// guards the 0x4000 bound: at or above it, `(track_num >> 8)` is >= 0x40 and
-/// OR-ing the 0x40 length marker would clobber it, corrupting the track
-/// number. Not reachable today (track numbers are `i+1` over a few streams),
-/// so this documents the bound rather than handling 3-byte VINTs.
-fn track_vint(track_num: usize) -> ([u8; 2], usize) {
+/// Each width uses a marker bit that must NOT collide with the payload's top
+/// byte: the 1-byte marker is 0x80 (7 payload bits), the 2-byte marker 0x40
+/// (14 payload bits), the 3-byte marker 0x20 (21 payload bits). Handling all
+/// three in RELEASE (not just `debug_assert`) means an out-of-2-byte-range
+/// track number can never silently clobber the marker bit and corrupt the
+/// block. Real discs never approach even the 2-byte range; the 21-bit ceiling
+/// is an absurd upper bound kept as a `debug_assert`.
+fn track_vint(track_num: usize) -> ([u8; 3], usize) {
     if track_num < 0x80 {
-        ([(track_num as u8) | 0x80, 0], 1)
+        ([(track_num as u8) | 0x80, 0, 0], 1)
+    } else if track_num < 0x4000 {
+        ([0x40 | ((track_num >> 8) as u8), track_num as u8, 0], 2)
     } else {
         debug_assert!(
-            track_num < 0x4000,
-            "track number {track_num} exceeds the 14-bit 2-byte EBML VINT range"
+            track_num < 0x20_0000,
+            "track number {track_num} exceeds the 21-bit 3-byte EBML VINT range"
         );
-        ([0x40 | ((track_num >> 8) as u8), track_num as u8], 2)
+        (
+            [
+                0x20 | ((track_num >> 16) as u8),
+                (track_num >> 8) as u8,
+                track_num as u8,
+            ],
+            3,
+        )
     }
 }
 
@@ -3507,7 +3519,7 @@ mod tests {
     }
 
     #[test]
-    fn track_vint_encodes_one_and_two_byte_forms() {
+    fn track_vint_encodes_one_two_and_three_byte_forms() {
         // 1-byte form for track numbers < 0x80, high bit set.
         let (b, n) = track_vint(1);
         assert_eq!(&b[..n], &[0x81]);
@@ -3518,6 +3530,12 @@ mod tests {
         assert_eq!(&b[..n], &[0x40, 0x80]);
         let (b, n) = track_vint(0x3FFF);
         assert_eq!(&b[..n], &[0x7F, 0xFF]);
+        // 3-byte form at/above 0x4000, 0x20 length marker in the top byte —
+        // handled in RELEASE (no silent marker-bit clobber), not just debug.
+        let (b, n) = track_vint(0x4000);
+        assert_eq!(&b[..n], &[0x20, 0x40, 0x00]);
+        let (b, n) = track_vint(0x1F_FFFF);
+        assert_eq!(&b[..n], &[0x3F, 0xFF, 0xFF]);
     }
 
     // ============================================================

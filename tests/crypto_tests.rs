@@ -134,11 +134,7 @@ fn aacs_decrypt_unit_roundtrip() {
     assert!(aacs::content::ts_sync_destroyed(&plain));
 
     // Now decrypt
-    let result = aacs::content::decrypt_unit(&mut plain, &unit_key);
-    assert!(
-        result,
-        "decrypt_unit should return true on valid encrypted unit"
-    );
+    aacs::content::decrypt_unit(&mut plain, &unit_key);
     assert!(
         !aacs::content::ts_sync_destroyed(&plain),
         "decrypted unit should read as clear (TS syncs restored)"
@@ -298,13 +294,16 @@ fn aacs_ts_sync_destroyed_detection() {
     );
 }
 
-/// Test: aacs_decrypt_unit_unencrypted_passthrough
+/// Test: aacs_clear_unit_reports_not_encrypted
 ///
-/// A clear unit (TS syncs intact) should pass through decrypt_unit unchanged.
+/// `decrypt_unit` is now PURE (applies the key unconditionally). The "leave a
+/// clear unit untouched" policy lives at the caller's gate `aacs_unit_encrypted`:
+/// a CPI-clear unit reports not-encrypted, so the caller never hands it to
+/// decrypt_unit.
 #[test]
-fn aacs_decrypt_unit_unencrypted_passthrough() {
+fn aacs_clear_unit_reports_not_encrypted() {
     let mut unit = vec![0x42u8; aacs::content::ALIGNED_UNIT_LEN];
-    // Intact TS syncs every 192 bytes → not scrambled → passthrough.
+    // Intact TS syncs every 192 bytes → not scrambled.
     let mut off = 4;
     while off < aacs::content::ALIGNED_UNIT_LEN {
         unit[off] = 0x47;
@@ -312,13 +311,12 @@ fn aacs_decrypt_unit_unencrypted_passthrough() {
     }
     // CPI bits (byte 0) CLEAR → the authoritative gate reads this as plaintext.
     unit[0] &= 0x3F;
-    let original = unit.clone();
-    let key = [0xAA; 16];
 
     assert!(!aacs::content::ts_sync_destroyed(&unit));
-    let result = aacs::content::decrypt_unit(&mut unit, &key);
-    assert!(result, "clear unit should return true");
-    assert_eq!(unit, original, "clear unit should be unchanged");
+    assert!(
+        !aacs::content::aacs_unit_encrypted(&unit, libfreemkv::disc::ContentFormat::BdTs),
+        "CPI-clear unit reports not-encrypted; the caller never decrypts it"
+    );
 }
 
 // ── AACS cross-validation with independent AES implementation ──────────────
@@ -413,11 +411,7 @@ fn aacs_cross_validation_encrypt_then_decrypt() {
     );
 
     // -- Decrypt with the library --
-    let ok = aacs::content::decrypt_unit(&mut plaintext, &unit_key);
-    assert!(
-        ok,
-        "decrypt_unit returned false (TS sync verification failed)"
-    );
+    aacs::content::decrypt_unit(&mut plaintext, &unit_key);
 
     // Decryption clears no flag, so the unit round-trips byte-for-byte.
     assert_eq!(
@@ -458,44 +452,14 @@ fn aacs_cross_validation_alternate_key() {
         &mut plaintext[16..aacs::content::ALIGNED_UNIT_LEN],
     );
 
-    assert!(aacs::content::decrypt_unit(&mut plaintext, &unit_key));
+    aacs::content::decrypt_unit(&mut plaintext, &unit_key);
 
     // Decryption clears no flag, so the unit round-trips byte-for-byte.
     assert_eq!(&plaintext[..], &expected[..]);
 }
 
-/// Verify that `decrypt_bus` correctly reverses AES-CBC encryption applied
-/// per-sector to bytes 16..2048 (bus encryption layer).
-#[test]
-fn aacs_bus_decrypt_cross_validation() {
-    let read_data_key: [u8; 16] = [
-        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
-        0x00,
-    ];
-
-    let mut plaintext = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..aacs::content::ALIGNED_UNIT_LEN {
-        plaintext[i] = ((i * 3 + 17) & 0xFF) as u8;
-    }
-    let expected = plaintext.clone();
-
-    // Encrypt per-sector: AES-CBC encrypt bytes 16..2048 of each 2048-byte sector
-    for sector_start in (0..aacs::content::ALIGNED_UNIT_LEN).step_by(2048) {
-        ref_aes_cbc_encrypt(
-            &read_data_key,
-            &CROSS_AACS_IV,
-            &mut plaintext[sector_start + 16..sector_start + 2048],
-        );
-    }
-    assert_ne!(&plaintext[16..32], &expected[16..32]);
-
-    aacs::content::decrypt_bus(&mut plaintext, &read_data_key);
-    assert_eq!(
-        plaintext, expected,
-        "bus decrypt did not recover original plaintext"
-    );
-}
+// (`decrypt_bus` is a crate-internal layer — its cross-validation lives in-crate
+// in `aacs::content`'s unit tests, not here.)
 
 // ── CSS roundtrip test vectors ─────────────────────────────────────────────
 
@@ -663,6 +627,28 @@ fn css_stevenson_attack_validates_cracked_key() {
              This is expected: synthetic sectors lack the TAB1 output encoding \
              present in real CSS-encrypted DVD sectors."
         );
+        // Never let this test pass vacuously: when the attack can't converge on
+        // synthetic data, still assert always-true properties of the CSS keystream
+        // so a real regression is caught on every run — descramble_sector is
+        // DETERMINISTIC (same key/seed/data → same output) and NON-TRIVIAL (it
+        // actually transforms the payload, not a silent no-op).
+        for (key, seed) in candidates {
+            let mut base = vec![0x00u8; 2048];
+            base[0x14] = 0x30;
+            base[0x54..0x59].copy_from_slice(seed);
+            base[0x80..0x8A]
+                .copy_from_slice(&[0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21]);
+            let mut a = base.clone();
+            let mut b = base.clone();
+            css::lfsr::descramble_sector(key, &mut a);
+            css::lfsr::descramble_sector(key, &mut b);
+            assert_eq!(a, b, "descramble must be deterministic for key={key:02X?}");
+            assert_ne!(
+                &a[0x80..2048],
+                &base[0x80..2048],
+                "descramble must transform the payload for key={key:02X?}"
+            );
+        }
     }
 }
 
@@ -706,6 +692,20 @@ fn css_recover_title_key_with_exact_plaintext() {
             "recover_title_key returned None for key={:02X?} seed={:02X?}. \
              The LFSR0 recovery phase may not converge for this combination.",
             title_key, seed
+        );
+        // Never pass vacuously: when LFSR0 recovery can't converge on this
+        // synthetic sector, still assert always-true properties of the cipher so
+        // a real regression is caught on every run — descramble_sector is
+        // DETERMINISTIC and NON-TRIVIAL (actually transforms the payload).
+        let mut a = original.clone();
+        let mut b = original.clone();
+        css::lfsr::descramble_sector(&title_key, &mut a);
+        css::lfsr::descramble_sector(&title_key, &mut b);
+        assert_eq!(a, b, "descramble must be deterministic");
+        assert_ne!(
+            &a[0x80..2048],
+            &original[0x80..2048],
+            "descramble must transform the payload"
         );
     }
 }

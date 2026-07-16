@@ -7,7 +7,7 @@
 //! With [`crate::sector::PrefetchedSectorSource`] alone, read+decrypt
 //! already runs on a producer thread; the *consumer* (main) thread
 //! still serialises `ts_demuxer.feed` (M2TS parsing) with the codec
-//! parsers. Profiling on the rip1 testbed showed feed at ~37 % and
+//! parsers. Profiling showed feed at ~37 % and
 //! codec parse at ~44 % of consumer wall time — i.e. feed is heavy
 //! enough that pipelining it with parse pays for itself.
 //!

@@ -252,11 +252,14 @@ impl PrefetchedSectorSource {
                         };
                         if bytes <= buf.capacity() {
                             // Re-expose `bytes` without zero-filling pages that
-                            // `read_sectors` is about to overwrite. The enclosing
-                            // capacity guard makes the `set_len` provably sound even
-                            // if a recycled buffer ever comes back smaller than the
-                            // `vec![0u8; batch_bytes]` it was born with.
-                            debug_assert!(bytes <= buf.capacity(), "set_len exceeds capacity");
+                            // `read_sectors` is about to overwrite. Sound because the
+                            // enclosing `bytes <= capacity` guard bounds the length,
+                            // and every byte below `capacity` is physically
+                            // initialised: buffers are born `vec![0u8; batch_bytes]`
+                            // and only ever grown via `resize(_, 0)`, so a recycled
+                            // buffer that came back shorter (consumer `truncate`)
+                            // still has initialised backing storage under `set_len`,
+                            // which `read_sectors` then overwrites before any read.
                             unsafe { buf.set_len(bytes) };
                         } else {
                             buf.resize(bytes, 0);

@@ -241,11 +241,23 @@ impl EsWriter for AnnexBWriter {
 /// Delegates to the canonical hvcC/avcC → Annex-B converters in
 /// [`crate::mux::hevc`] — the single source of truth across all muxers.
 fn annexb_param_sets(codec: Codec, record: &[u8]) -> Vec<u8> {
-    match codec {
-        Codec::Hevc => hvcc_to_annex_b(record).unwrap_or_default(),
-        Codec::H264 => avcc_to_annex_b(record).unwrap_or_default(),
-        _ => Vec::new(),
-    }
+    let converted = match codec {
+        Codec::Hevc => hvcc_to_annex_b(record),
+        Codec::H264 => avcc_to_annex_b(record),
+        _ => return Vec::new(),
+    };
+    converted.unwrap_or_else(|| {
+        // A malformed hvcC/avcC record yields no parameter sets. Returning empty
+        // means keyframes ship WITHOUT in-band SPS/PPS — playable from the first
+        // keyframe but broken for seek-to-arbitrary-point and hardware decoders.
+        // Surface it rather than silently degrading the output.
+        tracing::warn!(
+            target: "mux",
+            ?codec,
+            "codec-private (hvcC/avcC) parse failed; keyframes will lack in-band SPS/PPS"
+        );
+        Vec::new()
+    })
 }
 
 /// PGS `.sup` writer: rebuilds the HDMV segment framing the parser stripped.

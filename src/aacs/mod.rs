@@ -40,10 +40,18 @@ pub mod types;
 pub mod variant;
 pub mod variant_select;
 
-/// On-disc UDF paths to the AACS key-input files (with their fallbacks).
-/// Centralised so every reader (`resolve_vid_only`, `read_aacs_inputs`,
-/// `read_mkb_content`, `read_aacs_version`) walks the exact same files — adding
-/// or changing a fallback in one place can then never silently diverge the
+/// On-disc UDF paths to the AACS key-input files.
+///
+/// BD and UHD keep their key material under `/AACS/…`; HD DVD keeps the
+/// equivalents under `/ANY!/…` with different names (`VTKF000.AACS` is the
+/// title-key file — magic `DVD_HD_V_TKF`; `MKBROM.AACS` is the MKB). The
+/// container difference is expressed here purely as DATA: each ROLE
+/// ([`UNIT_KEY_RO_PATHS`], [`MKB_PATHS`], [`CONTENT_CERT_PATHS`]) is an ordered
+/// candidate list, and every reader walks it with [`read_first`] taking the
+/// first that reads. No reader ever branches on disc type — a BD/UHD disc has
+/// the `/AACS/` files so those win; an HD DVD has neither, so it falls through
+/// to the `/ANY!/` entry. Centralised so `resolve_vid_only`, `read_aacs_inputs`,
+/// `read_mkb_content`, and `read_aacs_version` can never silently diverge the
 /// disc_hash / MKB / VID that another reader feeds a key service.
 pub const PATH_UNIT_KEY_RO: &str = "/AACS/Unit_Key_RO.inf";
 pub const PATH_UNIT_KEY_RO_DUPLICATE: &str = "/AACS/DUPLICATE/Unit_Key_RO.inf";
@@ -51,6 +59,46 @@ pub const PATH_MKB_RO: &str = "/AACS/MKB_RO.inf";
 pub const PATH_MKB_RW: &str = "/AACS/MKB_RW.inf";
 pub const PATH_CONTENT_CERT: &str = "/AACS/Content000.cer";
 pub const PATH_CONTENT_CERT_ALT: &str = "/AACS/Content001.cer";
+/// HD DVD title-key file (`/ANY!/`), forwarded as `inf_b64`; the key service
+/// recognises it by its `DVD_HD_V_TKF` magic.
+pub const PATH_VTKF_HDDVD: &str = "/ANY!/VTKF000.AACS";
+/// HD DVD Media Key Block (`/ANY!/`), forwarded as `mkb_b64`.
+pub const PATH_MKBROM_HDDVD: &str = "/ANY!/MKBROM.AACS";
+/// HD DVD content certificate (`/ANY!/`); byte 0 gives the AACS major (0x00 → V10).
+pub const PATH_CONTENT_CERT_HDDVD: &str = "/ANY!/CONTENT_CERT.AACS";
+
+/// Title-key / `Unit_Key_RO.inf` role, in resolution order (BD/UHD, then HD DVD).
+pub const UNIT_KEY_RO_PATHS: &[&str] = &[
+    PATH_UNIT_KEY_RO,
+    PATH_UNIT_KEY_RO_DUPLICATE,
+    PATH_VTKF_HDDVD,
+];
+/// MKB role, in resolution order (BD/UHD RO then RW, then HD DVD).
+pub const MKB_PATHS: &[&str] = &[PATH_MKB_RO, PATH_MKB_RW, PATH_MKBROM_HDDVD];
+/// Content-certificate role, in resolution order (BD/UHD, then HD DVD).
+pub const CONTENT_CERT_PATHS: &[&str] = &[
+    PATH_CONTENT_CERT,
+    PATH_CONTENT_CERT_ALT,
+    PATH_CONTENT_CERT_HDDVD,
+];
+
+/// Walk an AACS role's candidate paths and return the first that reads.
+///
+/// `read` performs the actual per-path read (full file or bounded prefix), so
+/// callers share the same first-present walk regardless of read style. Returns
+/// [`Error::AacsNoKeys`] if no candidate is present. This is the single place
+/// the `/AACS/` (BD/UHD) vs `/ANY!/` (HD DVD) layout difference is resolved.
+pub(crate) fn read_first<F>(candidates: &[&str], mut read: F) -> crate::error::Result<Vec<u8>>
+where
+    F: FnMut(&str) -> crate::error::Result<Vec<u8>>,
+{
+    for path in candidates {
+        if let Ok(buf) = read(path) {
+            return Ok(buf);
+        }
+    }
+    Err(crate::error::Error::AacsNoKeys)
+}
 
 // The module structure IS the public API — consumers import from the owning
 // module directly (e.g. `aacs::content::decrypt_unit`, `aacs::mkb::MkbType`,
@@ -61,7 +109,7 @@ pub const PATH_CONTENT_CERT_ALT: &str = "/AACS/Content001.cer";
 // content-decrypt entry points that downstream key-source crates import through
 // the `aacs::` path. These are the stable, load-bearing names; keeping them here
 // lets those crates track the module refactor without a lockstep re-pin.
-pub use content::{ALIGNED_UNIT_LEN, decrypt_unit_try_keys};
+pub use content::ALIGNED_UNIT_LEN;
 pub use derive::derive_vuk;
 pub use types::{DeviceKey, HostCert, MediaKey, ProcessingKey, UnitKey, Vid, Vuk};
 
