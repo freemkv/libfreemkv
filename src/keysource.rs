@@ -39,6 +39,48 @@ use crate::error::Error;
 /// value lives at the lower layer both share.
 pub const MIN_SAMPLE_UNITS: usize = 8;
 
+/// A set of encrypted content-unit samples PROVEN to carry at least
+/// [`MIN_SAMPLE_UNITS`] units — the online `/decode` request's proof-of-ownership.
+///
+/// "Parse, don't validate": the only constructor, [`DecodeSampleSet::new`], returns
+/// `None` for an under-sized slice, so an online key request simply *cannot be built*
+/// from too few samples. The runtime `len() < MIN_SAMPLE_UNITS` check that used to
+/// live at the request site (and was silently forgotten by an under-sampling caller,
+/// reading as "key service down") becomes a compile-time obligation: a request builder
+/// that takes `&DecodeSampleSet` can never receive an unchecked `Vec`.
+///
+/// The *count* enforced here is a runtime property of the disc (how many encrypted
+/// units it yields); the *requested* count is a caller-side compile-time constant that
+/// callers pin to `MIN_SAMPLE_UNITS` (see e.g. autorip's `SAMPLE_UNITS`). Together the
+/// two make under-sampling unrepresentable at the request boundary.
+#[derive(Debug, Clone)]
+pub struct DecodeSampleSet(Vec<Vec<u8>>);
+
+impl DecodeSampleSet {
+    /// Wrap `units` iff it carries at least [`MIN_SAMPLE_UNITS`] samples; `None`
+    /// otherwise (the caller then skips the online source rather than sending an
+    /// ambiguous request). This is the sole way to obtain a `DecodeSampleSet`.
+    pub fn new(units: Vec<Vec<u8>>) -> Option<Self> {
+        (units.len() >= MIN_SAMPLE_UNITS).then_some(Self(units))
+    }
+
+    /// The proven-sufficient samples. Guaranteed `>= MIN_SAMPLE_UNITS` in length.
+    pub fn units(&self) -> &[Vec<u8>] {
+        &self.0
+    }
+
+    /// Number of samples — always `>= MIN_SAMPLE_UNITS`.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always `false` (a `DecodeSampleSet` never holds fewer than `MIN_SAMPLE_UNITS`);
+    /// provided so the type satisfies the usual `len`/`is_empty` pairing.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
 /// The public AACS inputs a key source needs to look a disc up. Captured at
 /// scan; contains no secrets — only the disc identity and the on-disc AACS
 /// structures a source or key server may key on.
@@ -466,6 +508,46 @@ mod tests {
     use super::*;
     use crate::aacs::types::UnitKey;
     use std::sync::{Arc, Mutex};
+
+    fn units(n: usize) -> Vec<Vec<u8>> {
+        (0..n).map(|i| vec![i as u8; 4]).collect()
+    }
+
+    // ── DecodeSampleSet: the online request can't be built under-sized ─────────
+
+    /// Fewer than MIN_SAMPLE_UNITS → no set. Mutation: accepting a short slice
+    /// resurrects the exact autorip bug (a 4-sample request silently skipped /
+    /// read as "service down").
+    #[test]
+    fn decode_sample_set_rejects_under_min() {
+        for n in 0..MIN_SAMPLE_UNITS {
+            assert!(
+                DecodeSampleSet::new(units(n)).is_none(),
+                "{n} samples (< {MIN_SAMPLE_UNITS}) must not build a DecodeSampleSet"
+            );
+        }
+    }
+
+    /// Exactly the minimum, and above it, construct — and expose all samples.
+    #[test]
+    fn decode_sample_set_accepts_min_and_above() {
+        let exact = DecodeSampleSet::new(units(MIN_SAMPLE_UNITS)).expect("min builds");
+        assert_eq!(exact.len(), MIN_SAMPLE_UNITS);
+        assert_eq!(exact.units().len(), MIN_SAMPLE_UNITS);
+        assert!(!exact.is_empty());
+
+        let more = DecodeSampleSet::new(units(MIN_SAMPLE_UNITS + 5)).expect("above min builds");
+        assert_eq!(more.len(), MIN_SAMPLE_UNITS + 5);
+    }
+
+    /// The wrapped units round-trip byte-for-byte (the request carries exactly what
+    /// was gathered — no reordering/truncation).
+    #[test]
+    fn decode_sample_set_preserves_units() {
+        let raw = units(MIN_SAMPLE_UNITS);
+        let set = DecodeSampleSet::new(raw.clone()).unwrap();
+        assert_eq!(set.units(), raw.as_slice());
+    }
 
     // ── KeySource default-method behaviour ────────────────────────────────────
 
