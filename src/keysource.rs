@@ -23,6 +23,22 @@ use crate::aacs::types::{UnitKey, Vid};
 use crate::disc::Key;
 use crate::error::Error;
 
+/// Minimum encrypted-content unit samples a single online key request must carry.
+///
+/// The key service identifies a key by which of the submitted units it decrypts,
+/// so too few samples — especially on FMTS, where a segment interleaves several
+/// variants at the unit level — can return a key that matches an incidental unit
+/// rather than the one asked about (a false positive). This many distinct units
+/// make the request unambiguous.
+///
+/// Canonical here (the base crate) so BOTH consumers agree on one value: the
+/// online source in `freemkv-keysources` (which refuses to send an under-sampled
+/// request) re-exports it, and libfreemkv's own FMTS forensic query
+/// ([`crate::mux`]) sizes its per-segment batch by it. Layering forbids the
+/// reverse import (keysources depends on libfreemkv, not vice versa), so the
+/// value lives at the lower layer both share.
+pub const MIN_SAMPLE_UNITS: usize = 8;
+
 /// The public AACS inputs a key source needs to look a disc up. Captured at
 /// scan; contains no secrets — only the disc identity and the on-disc AACS
 /// structures a source or key server may key on.
