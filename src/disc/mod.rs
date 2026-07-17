@@ -2655,28 +2655,6 @@ impl Disc {
         self.ensure_decryptable_keys(raw, keys)
     }
 
-    /// Upfront FMTS (AACS 2.1) key gate, parallel to
-    /// [`ensure_title_decryptable`](Self::ensure_title_decryptable). A 2.1 disc
-    /// carries forensic variant segments that need segment (variant) keys the
-    /// unit-key path cannot provide. When
-    /// [`BYPASS_FMTS_KEY`](crate::aacs::segment::BYPASS_FMTS_KEY) is `false`,
-    /// their absence is a hard upfront failure ([`Error::FmtsKeyMissing`]) — the
-    /// same policy as a missing unit key, so a forensic-holed rip is refused, not
-    /// produced. When `true` (the default today) the segments are skipped as
-    /// expected loss and this passes. `raw` mode and non-FMTS discs always pass.
-    pub fn ensure_forensic_segments_decryptable(&self, raw: bool) -> Result<()> {
-        if raw || crate::aacs::segment::BYPASS_FMTS_KEY {
-            return Ok(());
-        }
-        // A 2.1 (FMTS) disc carries forensic variant segments with no segment-key
-        // source (none exists yet), so its variant segments cannot be opened.
-        // Refuse upfront rather than emit a forensic-holed rip.
-        if self.format == DiscFormat::Fmts {
-            return Err(Error::FmtsKeyMissing);
-        }
-        Ok(())
-    }
-
     /// Inject pre-resolved AACS unit keys into a scanned disc — the deferred-mux
     /// / resume path. The keys come from the mapfile's `# freemkv-uk:` header
     /// (persisted at sweep time when the disc was keyed), so the mux decrypts
@@ -5326,7 +5304,7 @@ mod tests {
 
     #[test]
     fn unit_key_validation_gates_on_real_ciphertext() {
-        use crate::aacs::content::{ALIGNED_UNIT_LEN, ts_sync_destroyed};
+        use crate::aacs::content::ALIGNED_UNIT_LEN;
 
         // No samples -> nothing to disprove against -> accept (sample-less paths
         // like resume / mapfile must be unaffected).
@@ -5345,7 +5323,10 @@ mod tests {
             clear[off] = 0x47;
             off += 192;
         }
-        assert!(!ts_sync_destroyed(&clear));
+        assert!(crate::aacs::content::is_clean(
+            &clear,
+            crate::disc::ContentFormat::BdTs
+        ));
         assert!(super::aligned_unit_keys_validate(
             &[(0, [0x11u8; 16])],
             None,
@@ -5357,7 +5338,7 @@ mod tests {
         let uk = [0x5au8; 16];
         let enc = encrypt_unit_for_test(&clear, &uk);
         assert!(
-            ts_sync_destroyed(&enc),
+            !crate::aacs::content::is_clean(&enc, crate::disc::ContentFormat::BdTs),
             "encrypted unit must read scrambled"
         );
 
@@ -5393,7 +5374,7 @@ mod tests {
         // CPS-unit-1 sectors then passed through as raw encrypted bytes into the
         // ISO/MKV with no error surfaced. The gate must now reject a key set
         // that leaves any scrambled sample uncovered.
-        use crate::aacs::content::{ALIGNED_UNIT_LEN, ts_sync_destroyed};
+        use crate::aacs::content::ALIGNED_UNIT_LEN;
 
         let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
         let mut off = 4;
@@ -5406,8 +5387,14 @@ mod tests {
         let uk1 = [0x22u8; 16];
         let sample0 = encrypt_unit_for_test(&clear, &uk0); // CPS unit 0 body
         let sample1 = encrypt_unit_for_test(&clear, &uk1); // CPS unit 1 body
-        assert!(ts_sync_destroyed(&sample0));
-        assert!(ts_sync_destroyed(&sample1));
+        assert!(!crate::aacs::content::is_clean(
+            &sample0,
+            crate::disc::ContentFormat::BdTs
+        ));
+        assert!(!crate::aacs::content::is_clean(
+            &sample1,
+            crate::disc::ContentFormat::BdTs
+        ));
 
         let samples = vec![sample0.clone(), sample1.clone()];
 

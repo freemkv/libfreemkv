@@ -79,6 +79,14 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// batches at highway speed, now that the mux installs a key-fetch for
     /// multi-CPS — reuses one allocation instead of alloc/free-ing every read.
     cipher_scratch: Vec<u8>,
+    /// Proactive AACS key map (see [`crate::decrypt::AacsKeyMap`]). When set, the
+    /// mux resolved one key per CPS unit / segment UP FRONT, so this read decrypts
+    /// each aligned unit with its MAPPED key and TRUSTS it — no per-unit
+    /// `is_clean` verdict, no reactive key-fetch, no key-server storm. `None`
+    /// keeps the legacy trial-and-recover path (sweep / patch, or a mux that did
+    /// not build a map). Mutually exclusive with `recovery` in practice: the mux
+    /// installs one or the other.
+    key_map: Option<Arc<crate::decrypt::AacsKeyMap>>,
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
@@ -99,7 +107,19 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             recovery: None,
             content_ranges: None,
             cipher_scratch: Vec::new(),
+            key_map: None,
         }
+    }
+
+    /// Install a proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap): the mux
+    /// resolved one key per CPS unit / segment up front, so every aligned unit is
+    /// decrypted with its MAPPED key and trusted — no per-unit `is_clean` check,
+    /// no reactive key-fetch. This is the storm-free mux path; it supersedes
+    /// [`with_key_fetch`](Self::with_key_fetch) (do not set both). AACS-only; a
+    /// CSS / clear disc ignores it.
+    pub fn with_key_map(mut self, map: Arc<crate::decrypt::AacsKeyMap>) -> Self {
+        self.key_map = Some(map);
+        self
     }
 
     /// Restrict decrypt to the disc's encrypted-content extents
@@ -221,6 +241,18 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         let n = self
             .inner
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
+
+        // PROACTIVE MAP PATH (the storm-free mux): when a key map is installed the
+        // mux resolved one key per CPS unit / segment up front, so decrypt each
+        // aligned unit with its MAPPED key and trust it — no per-unit `is_clean`
+        // verdict, no reactive key-fetch. A resolver gap surfaces loud from
+        // `decrypt_sectors_mapped` (DecryptFailed); authored-bad TS just passes
+        // through for the muxer to drop.
+        if let Some(map) = self.key_map.clone() {
+            crate::decrypt::decrypt_sectors_mapped(&mut buf[..n], &self.keys, lba, &map)?;
+            return Ok(n);
+        }
+
         // Decrypt the bytes just read IN PLACE. Scheme-agnostic (None / CSS / AACS).
         // With a content map installed the `*_in_content` entry skips units OUTSIDE
         // the encrypted extents (clear filesystem / nav pass through untouched); the
@@ -1156,7 +1188,7 @@ mod tests {
         // The recovered key decrypts the unit: it is now clean TS in `buf`.
         let unit0 = &buf[..crate::aacs::content::ALIGNED_UNIT_LEN];
         assert!(
-            !crate::aacs::content::ts_sync_destroyed(unit0),
+            crate::aacs::content::is_clean(unit0, crate::disc::ContentFormat::BdTs),
             "fetch supplied the key → the unit decrypts to clean TS"
         );
         let got = seen.lock().unwrap();
@@ -1166,12 +1198,97 @@ mod tests {
             "callback must be invoked once with the failing unit"
         );
         assert!(
-            crate::aacs::content::ts_sync_destroyed(&got[0]),
+            !crate::aacs::content::is_clean(&got[0], crate::disc::ContentFormat::BdTs),
             "the sample handed to the callback is the still-scrambled ciphertext"
         );
         assert_eq!(
             got[0], unit,
             "the exact on-disc unit is forwarded for fetch"
+        );
+    }
+
+    /// THE MUX-STORM REGRESSION. A unit the held key OPENS (>= the 4-packet proof
+    /// floor) but that carries many authored-bad packets (< half synced) must
+    /// NEVER be handed to the key-fetch closure — its key is already in hand. Only
+    /// a GENUINE miss (no held key opens it) is sampled. Before the min(E,4)
+    /// unification, the bad-encoded unit tripped the old >50% majority in
+    /// `aacs_unit_needs_decrypt`, so every batch re-sampled it to the key service
+    /// (the Jason Bourne / Stand By Me stall). This drives the REAL
+    /// `DecryptingSectorSource` recovery path, not a synthetic check.
+    #[test]
+    fn bad_encoded_opened_unit_is_never_sampled_to_the_key_service() {
+        use crate::aacs::content::ALIGNED_UNIT_LEN;
+        let held = [0x5au8; 16]; // opens the bad-encoded unit
+        let orphan = [0x77u8; 16]; // opens the genuine-miss unit (NOT held)
+        // Knock out packets 1..27 (26 authored-bad) → ~5 synced: >= the 4-packet
+        // floor (OPENED) yet < half (what the old >50% majority false-flagged).
+        let bad_pkts: Vec<usize> = (1..27).collect();
+        let bad_encoded = encrypt_aacs_unit_bad(&held, &bad_pkts);
+        let genuine_miss = encrypt_aacs_unit(&orphan);
+
+        // One 6-sector read spans both units: bad-encoded at [0,3), miss at [3,6).
+        struct TwoUnits {
+            a: Vec<u8>,
+            b: Vec<u8>,
+        }
+        impl SectorSource for TwoUnits {
+            fn capacity_sectors(&self) -> u32 {
+                6
+            }
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                _count: u16,
+                buf: &mut [u8],
+                _r: bool,
+            ) -> Result<usize> {
+                let n = crate::aacs::content::ALIGNED_UNIT_LEN;
+                buf[..n].copy_from_slice(&self.a);
+                buf[n..2 * n].copy_from_slice(&self.b);
+                Ok(2 * n)
+            }
+        }
+
+        let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = Arc::clone(&seen);
+        let fetch: super::KeyFetch = std::sync::Arc::new(move |samples: &[Vec<u8>]| {
+            seen_cb.lock().unwrap().extend_from_slice(samples);
+            Vec::new() // service has nothing for the orphan — forces the sampling path
+        });
+
+        let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(0u32, 6u32)]);
+        let mut dec = DecryptingSectorSource::new(
+            TwoUnits {
+                a: bad_encoded.clone(),
+                b: genuine_miss.clone(),
+            },
+            DecryptKeys::Aacs {
+                unit_keys: vec![(0, held)], // opens bad_encoded, NOT genuine_miss
+                read_data_key: None,
+                format: crate::disc::ContentFormat::BdTs,
+            },
+        )
+        .with_content_ranges(ranges)
+        .with_key_fetch(fetch);
+
+        let mut buf = vec![0u8; 6 * 2048];
+        let _ = dec.read_sectors(0, 6, &mut buf, false);
+
+        let got = seen.lock().unwrap();
+        assert!(
+            !got.is_empty(),
+            "the genuine orphan-key miss must trigger a fetch"
+        );
+        for s in got.iter() {
+            assert_ne!(
+                &s[..ALIGNED_UNIT_LEN.min(s.len())],
+                &bad_encoded[..],
+                "a bad-encoded unit the key OPENED must NEVER be sampled (the storm)"
+            );
+        }
+        assert!(
+            got.iter().any(|s| s.as_slice() == genuine_miss.as_slice()),
+            "only the genuine miss is sampled to the key service"
         );
     }
 
@@ -1257,7 +1374,7 @@ mod tests {
             "fetch fired for BOTH units — the dry result for A did not latch off B"
         );
         assert!(
-            !crate::aacs::content::ts_sync_destroyed(&buf2),
+            crate::aacs::content::is_clean(&buf2, crate::disc::ContentFormat::BdTs),
             "unit B is decrypted after its on-demand fetch"
         );
     }
@@ -1388,7 +1505,7 @@ mod tests {
             .expect("fetch recovers the orphan unit's key");
         assert_ne!(buf, unit, "the fetched key decrypts the unit in place");
         assert!(
-            !crate::aacs::content::ts_sync_destroyed(&buf),
+            crate::aacs::content::is_clean(&buf, crate::disc::ContentFormat::BdTs),
             "the recovered read is clean TS"
         );
         assert_eq!(*calls.lock().unwrap(), 1, "fetch called exactly once");

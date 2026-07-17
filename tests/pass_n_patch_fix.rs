@@ -108,16 +108,25 @@ fn aacs_encryption_flag_detection() {
         off += 192;
     }
     // Encryption is the scrambled body (TS syncs destroyed), NOT a flag bit.
-    assert!(!aacs::content::ts_sync_destroyed(&unit));
+    assert!(aacs::content::is_clean(
+        &unit,
+        libfreemkv::disc::ContentFormat::BdTs
+    ));
 
     // Flag bits on a synced unit do not make it look encrypted.
     unit[0] = 0xC0;
     unit[7] = 0xC0;
-    assert!(!aacs::content::ts_sync_destroyed(&unit));
+    assert!(aacs::content::is_clean(
+        &unit,
+        libfreemkv::disc::ContentFormat::BdTs
+    ));
 
     // Scrambled body (syncs gone) → encrypted.
     let scrambled = vec![0x99u8; aacs::content::ALIGNED_UNIT_LEN];
-    assert!(aacs::content::ts_sync_destroyed(&scrambled));
+    assert!(!aacs::content::is_clean(
+        &scrambled,
+        libfreemkv::disc::ContentFormat::BdTs
+    ));
 }
 
 /// Test: DecryptKeys::is_encrypted() correctly identifies encrypted state.
