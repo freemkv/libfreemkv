@@ -691,17 +691,37 @@ fn resolve_fmts_key_map(
     //    decrypt-and-check: the array position IS the index. The first readable
     //    segment whose batch yields the full set wins; a short (e.g. 1-key,
     //    base-UK-shaped) response means that batch wasn't forensic (a wrong
-    //    feature-title mapping), so try the next segment. ─────────────────────────
+    //    feature-title mapping), so try the next segment.
+    //
+    //    ANCHOR RULE: the query MUST sample an INDEX-1 segment. The key service only
+    //    returns the full set for the canonical anchor sample (a unit that decrypts
+    //    under the index-1 key); a batch from any other forensic index is rejected
+    //    (a base-UK-shaped miss). The `index == 1` filter guarantees every batch we
+    //    send is an anchor — and the forensic tag cycles 1..32 in file order, so
+    //    ~1-in-32 segments qualify (~25 across the feature), leaving ample read-fault
+    //    fallback within the `MAX_ANCHOR_ATTEMPTS` budget. ─────────────────────────
     const N_INDEX: usize = 32;
+    // Each forensic batch carries the server's minimum-samples count (the same
+    // disambiguation floor the online source enforces), drawn as even-phase units
+    // to land one clean variant half.
+    const BATCH_UNITS: usize = crate::keysource::MIN_SAMPLE_UNITS;
+    // Read-fault fallback budget: how many INDEX-1 (anchor) segments to attempt
+    // before giving up. Only matters when the leading anchor segments are
+    // unreadable; each attempt is one server round-trip, so it is bounded.
+    const MAX_ANCHOR_ATTEMPTS: usize = 16;
     let mut index_keys: Vec<[u8; 16]> = Vec::new();
-    for seg in segments.iter().take(16) {
+    for seg in segments
+        .iter()
+        .filter(|s| s.index == 1)
+        .take(MAX_ANCHOR_ATTEMPTS)
+    {
         let mut batch: Vec<Vec<u8>> = Vec::new();
-        for p in 0..8usize {
+        for p in 0..BATCH_UNITS {
             if let Some(c) = read_unit(reader, seg, p * 2) {
                 batch.push(c);
             }
         }
-        if batch.len() < 8 {
+        if batch.len() < BATCH_UNITS {
             continue; // read fault / short tail
         }
         let fresh = fetch(&batch);
