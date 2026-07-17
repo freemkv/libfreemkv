@@ -318,7 +318,28 @@ pub fn key_fetch(
     inputs: DiscInputs,
     make_sources: std::sync::Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>,
 ) -> crate::sector::KeyFetch {
+    // Memoize by the fingerprint of the sample batch. The resolved keys are
+    // disc-level (the same clip's index / CPS keys are identical for every title
+    // that references it), and this one closure is shared across every title's mux
+    // — so the first title resolves a given batch over the network and every later
+    // title (or repeated batch) is answered from the cache with no request. Empty
+    // replies are cached too: a key the service does not have for a batch will not
+    // appear on a re-ask, so re-hitting the network buys nothing.
+    let cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<[u8; 16]>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     std::sync::Arc::new(move |samples: &[Vec<u8>]| -> Vec<[u8; 16]> {
+        let fp = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            samples.len().hash(&mut h);
+            for s in samples {
+                s.hash(&mut h);
+            }
+            h.finish()
+        };
+        if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&fp) {
+            return hit.clone();
+        }
         let sources = make_sources();
         let mut di = inputs.clone();
         di.samples = samples.to_vec();
@@ -327,10 +348,15 @@ pub fn key_fetch(
         // derives unit keys from `enc_title_keys`, which a V10 disc parses at the
         // 48-byte stride — hardcoding the V20 stride here corrupted them.
         let ctx = DiscInputsCtx::new(&di);
-        fetch_unit_keys(&sources, &ctx)
+        let keys: Vec<[u8; 16]> = fetch_unit_keys(&sources, &ctx)
             .into_iter()
             .map(|u| u.key)
-            .collect()
+            .collect();
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(fp, keys.clone());
+        keys
     })
 }
 

@@ -131,12 +131,15 @@ fn aacs_decrypt_unit_roundtrip() {
     }
 
     // Verify it looks encrypted (body TS syncs scrambled)
-    assert!(aacs::content::ts_sync_destroyed(&plain));
+    assert!(!aacs::content::is_clean(
+        &plain,
+        libfreemkv::disc::ContentFormat::BdTs
+    ));
 
     // Now decrypt
     aacs::content::decrypt_unit(&mut plain, &unit_key);
     assert!(
-        !aacs::content::ts_sync_destroyed(&plain),
+        aacs::content::is_clean(&plain, libfreemkv::disc::ContentFormat::BdTs),
         "decrypted unit should read as clear (TS syncs restored)"
     );
 
@@ -254,9 +257,9 @@ fn aacs_vuk_derivation_roundtrip() {
     assert_eq!(vuk, vuk2, "derive_vuk not deterministic");
 }
 
-/// Test: aacs_ts_sync_destroyed detects scrambled units via the raw TS syncs.
+/// Test: `is_clean` distinguishes clean vs scrambled units via the TS proof floor.
 #[test]
-fn aacs_ts_sync_destroyed_detection() {
+fn aacs_is_clean_detection() {
     // A clear unit: TS sync (0x47) intact at every 192-byte packet → not
     // scrambled. (Flag bits play no role.)
     let mut clear = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
@@ -266,7 +269,7 @@ fn aacs_ts_sync_destroyed_detection() {
         off += 192;
     }
     assert!(
-        !aacs::content::ts_sync_destroyed(&clear),
+        aacs::content::is_clean(&clear, libfreemkv::disc::ContentFormat::BdTs),
         "clear unit (syncs intact) must not be scrambled"
     );
 
@@ -275,21 +278,21 @@ fn aacs_ts_sync_destroyed_detection() {
     flagged[0] = 0xC0; // copy-control bits
     flagged[7] = 0xC0; // TSC bits
     assert!(
-        !aacs::content::ts_sync_destroyed(&flagged),
+        aacs::content::is_clean(&flagged, libfreemkv::disc::ContentFormat::BdTs),
         "flag bits must not be read as encryption"
     );
 
     // A scrambled body (syncs destroyed) → scrambled.
     let scrambled = vec![0x99u8; aacs::content::ALIGNED_UNIT_LEN];
     assert!(
-        aacs::content::ts_sync_destroyed(&scrambled),
+        !aacs::content::is_clean(&scrambled, libfreemkv::disc::ContentFormat::BdTs),
         "unit with no intact TS syncs must read as scrambled"
     );
 
     // Too short
     let short = vec![0xFFu8; 100];
     assert!(
-        !aacs::content::ts_sync_destroyed(&short),
+        aacs::content::is_clean(&short, libfreemkv::disc::ContentFormat::BdTs),
         "short buffer should not be detected"
     );
 }
@@ -312,7 +315,10 @@ fn aacs_clear_unit_reports_not_encrypted() {
     // CPI bits (byte 0) CLEAR → the authoritative gate reads this as plaintext.
     unit[0] &= 0x3F;
 
-    assert!(!aacs::content::ts_sync_destroyed(&unit));
+    assert!(aacs::content::is_clean(
+        &unit,
+        libfreemkv::disc::ContentFormat::BdTs
+    ));
     assert!(
         !aacs::content::aacs_unit_encrypted(&unit, libfreemkv::disc::ContentFormat::BdTs),
         "CPI-clear unit reports not-encrypted; the caller never decrypts it"

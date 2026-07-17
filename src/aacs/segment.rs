@@ -1,40 +1,49 @@
 //! AACS 2.1 FMTS forensic segment map — `AACS/IndividualSegment.tbl`.
 //!
-//! An FMTS main feature interleaves N "variant" segments — the sequence-key /
-//! forensic-watermark mechanism. The same frames are authored as several
-//! slightly different variants; each variant is encrypted under its own SEGMENT
-//! key (from `SegmentKeyNNNNN.tbl`), NOT the CPS Unit Key. A player with the
-//! right device keys can decrypt exactly one variant per segment, and which one
-//! silently identifies the player (traitor tracing). Decrypting a variant
-//! segment with the Unit Key yields garbage — broken HEVC reference frames
-//! (empirically: `Could not find ref with POC …` on a plain unit-key rip).
+//! An FMTS main feature interleaves short forensic **segments** — the sequence-key
+//! / forensic-watermark mechanism. Each segment carries an **index** (1..32): a
+//! tag in `IndividualSegment.tbl` that selects which of the 32 forensic **index
+//! keys** decrypts that segment's units, in place of the ordinary CPS Unit Key.
 //!
-//! This table says WHERE the variant segments live so a decoder can decrypt
-//! them with segment keys and select one coherent variant instead of muxing
+//! Terminology (see the project AACS reference): the **index** here is NOT the
+//! AACS 2.1 *Media Key Variant* — that is the 65536-value device selector in the
+//! MKB that decides *which set* of index keys a device receives, a layer this
+//! module does not deal with. All the index keys belong to one variant, whose
+//! number is unknown and irrelevant to the segment map. Decrypting a segment with
+//! the Unit Key yields garbage — broken HEVC reference frames (empirically:
+//! `Could not find ref with POC …` on a plain unit-key rip).
+//!
+//! This table says WHERE the segments live and which index each carries, so a
+//! decoder can decrypt them with the matching index key instead of muxing
 //! unit-key garbage.
 //!
 //! Format (validated against a retail AACS 2.1 disc):
 //! ```text
 //!   header (8 bytes):  u32 type | u16 count | u16 record_size (= 16)
 //!   record[count] (16 bytes each):
-//!     u32 marker (= 0x01000000) | u16 variant | u16 flag (= 1)
+//!     u32 marker (= 0x01000000) | u16 index | u16 flag (= 1)
 //!     u32 start_spn | u32 end_spn        (source-packet numbers, inclusive)
 //! ```
-//! `variant` is the 1..32 forensic-variant tag, NOT a sequential segment id:
-//! measured on a retail 2.1 disc (Zombieland) it cycles 1,2,…,32,1,2,… across
-//! records in file order — 24 full cycles of 32 plus a final partial cycle of
-//! 24 = 792 records. Source-packet numbers are the 192-byte BDAV packet index:
-//! byte offset = `spn * 192`. Each segment is ~2560 packets (~480 KB), spread
-//! across the entire 54 GB feature (one roughly every 67 MB).
+//! `index` is the 1..32 forensic index tag, NOT a sequential segment id: measured
+//! on a retail 2.1 disc (Zombieland) it cycles 1,2,…,32,1,2,… across records in
+//! file order — 24 full cycles of 32 plus a final partial cycle of 24 = 792
+//! records. Source-packet numbers are the 192-byte BDAV packet index: byte offset
+//! = `spn * 192`. Each segment is ~2560 packets (~480 KB) = 80 aligned units,
+//! spread across the entire 54 GB feature (one roughly every 67 MB). Inside a
+//! segment the 80 units interleave in two stride-2 halves: applying the segment's
+//! index key decrypts ~40 of them to clean TS and garbles the other ~40 (a second
+//! interleaved half, unidentified), which the demux then drops — leaving one
+//! coherent stream. Confirmed by decoding a retail disc with a full set of 32
+//! index keys.
 
 /// Fixed size of one `IndividualSegment.tbl` record.
 pub const SEGMENT_RECORD_LEN: usize = 16;
 /// Bytes per BDAV source packet (188-byte TS + 4-byte arrival-time header).
 pub const SOURCE_PACKET_LEN: u64 = 192;
 
-/// Whether a 2.1 (FMTS) disc may rip WITHOUT segment (variant) keys.
+/// Whether a 2.1 (FMTS) disc may rip WITHOUT the forensic index keys.
 ///
-/// `true` (today): the forensic variant segments are skipped as expected loss
+/// `true` (today): the forensic segments are skipped as expected loss
 /// and the bulk of the title decodes with the unit key, so a 2.1 disc rips
 /// mostly-complete. A unit key (VUK) is still required, exactly as for any AACS
 /// disc. `false`: the absence of a segment-key source is a hard, UPFRONT failure
@@ -45,17 +54,17 @@ pub const SOURCE_PACKET_LEN: u64 = 192;
 /// refused. Hardcoded on purpose — not a user setting.
 ///
 /// [`Error::FmtsKeyMissing`]: crate::error::Error::FmtsKeyMissing
-pub const BYPASS_FMTS_KEY: bool = true;
+pub const BYPASS_FMTS_KEY: bool = false;
 
-/// One forensic variant segment: the inclusive source-packet range it occupies
-/// in the FMTS clip.
+/// One forensic segment: the inclusive source-packet range it occupies in the
+/// FMTS clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segment {
-    /// Forensic variant tag, 1..=32 (field@4 of the record). Cycles across the
-    /// table rather than counting up — it selects WHICH variant this range is,
-    /// which is what a variant-keyed decode routes on. (`0` is not used here;
-    /// the default/non-forensic content carries no segment record at all.)
-    pub variant: u16,
+    /// Forensic index tag, 1..=32 (field@4 of the record). Cycles across the
+    /// table rather than counting up — it selects WHICH of the 32 index keys
+    /// decrypts this range. (`0` is not used here; the default/non-forensic
+    /// content carries no segment record at all.)
+    pub index: u16,
     /// First source packet of the segment (inclusive).
     pub start_spn: u32,
     /// Last source packet of the segment (inclusive).
@@ -109,8 +118,8 @@ pub fn lba_byte_offset(lba: u32) -> u64 {
 /// unit's clip-relative byte offset.
 ///
 /// This is the routing decision behind a 2.1 decrypt-miss: a unit that
-/// overlaps a forensic segment must be opened with that segment's **variant
-/// key** (from `SegmentKeyNNNNN.tbl`), not the CPS Unit Key. Opening it with
+/// overlaps a forensic segment must be opened with that segment's **index key**
+/// (selected by the segment's `index`), not the CPS Unit Key. Opening it with
 /// the Unit Key is exactly what yields the broken-reference-frame garbage a
 /// plain unit-key rip produces. A unit outside every segment is ordinary
 /// content and a miss on it is a Unit-Key miss, so this returns `None` and the
@@ -118,16 +127,16 @@ pub fn lba_byte_offset(lba: u32) -> u64 {
 ///
 /// The unit is tested as a packet *span* (`[off/192, (off+6144-1)/192]`) so a
 /// unit that only partly overlaps a segment edge is still classified as
-/// variant; on the observed disc segments are unit-aligned, but the span test
+/// forensic; on the observed disc segments are unit-aligned, but the span test
 /// does not rely on that.
-pub fn variant_segment_for_unit(segments: &[Segment], unit_offset: u64) -> Option<&Segment> {
+pub fn segment_for_unit(segments: &[Segment], unit_offset: u64) -> Option<&Segment> {
     let unit_len = crate::aacs::content::ALIGNED_UNIT_LEN as u64;
     let first = (unit_offset / SOURCE_PACKET_LEN) as u32;
     let last = ((unit_offset + unit_len - 1) / SOURCE_PACKET_LEN) as u32;
     segments.iter().find(|s| s.overlaps_spn(first, last))
 }
 
-/// Parse `IndividualSegment.tbl` into its forensic variant segments, in table
+/// Parse `IndividualSegment.tbl` into its forensic segments, in table
 /// order. Returns `None` when the header is malformed, the record size is not
 /// [`SEGMENT_RECORD_LEN`], or the declared record count overruns the buffer —
 /// so a truncated / foreign table degrades to "no segment map" rather than
@@ -147,12 +156,12 @@ pub fn parse_individual_segments(tbl: &[u8]) -> Option<Vec<Segment>> {
     let mut segments = Vec::with_capacity(count);
     for i in 0..count {
         let o = 8 + i * record_size;
-        // o+4..o+8 = variant (u16, 1..32) + flag (u16); o+8..o+16 = start/end SPN.
-        let variant = u16::from_be_bytes([tbl[o + 4], tbl[o + 5]]);
+        // o+4..o+8 = index (u16, 1..32) + flag (u16); o+8..o+16 = start/end SPN.
+        let index = u16::from_be_bytes([tbl[o + 4], tbl[o + 5]]);
         let start_spn = u32::from_be_bytes([tbl[o + 8], tbl[o + 9], tbl[o + 10], tbl[o + 11]]);
         let end_spn = u32::from_be_bytes([tbl[o + 12], tbl[o + 13], tbl[o + 14], tbl[o + 15]]);
         segments.push(Segment {
-            variant,
+            index,
             start_spn,
             end_spn,
         });
@@ -160,12 +169,74 @@ pub fn parse_individual_segments(tbl: &[u8]) -> Option<Vec<Segment>> {
     Some(segments)
 }
 
+/// Map a clip-relative byte offset to the absolute LBA that holds it, by walking
+/// the title's extents (the `.fmts` clip's sectors in file order). Segment
+/// offsets in [`Segment`] are clip-relative source-packet numbers, so this is how
+/// a segment's `spn` range becomes disc LBAs. `None` if the offset is past the
+/// clip.
+pub fn clip_byte_to_lba(extents: &[crate::disc::Extent], clip_byte: u64) -> Option<u32> {
+    let mut cum = 0u64;
+    for e in extents {
+        let len = e.sector_count as u64 * crate::consts::SECTOR_BYTES as u64;
+        if clip_byte < cum + len {
+            let sector_in_ext = ((clip_byte - cum) / crate::consts::SECTOR_BYTES as u64) as u32;
+            return Some(e.start_lba.saturating_add(sector_in_ext));
+        }
+        cum += len;
+    }
+    None
+}
+
+/// Build the `[start_lba, end_lba) → key_idx` ranges for an FMTS forensic key map.
+///
+/// Each forensic segment's clip-relative source-packet span becomes an absolute
+/// LBA range tagged with the key its `index` selects (via `index_to_key_idx`,
+/// e.g. `|i| i as usize` when the pool is `[base, idx1, idx2, …]`). Applying that
+/// one key across the whole segment decodes the ~40 units of its interleave half
+/// to clean TS and garbles the other ~40 (the second interleaved half), which the
+/// demux then drops — yielding one coherent stream. Ranges outside every segment
+/// are left for the map's default (the ordinary Unit Key). A segment that straddles
+/// a UDF extent boundary is emitted as one range per whole-sector slice it covers.
+///
+/// The result feeds [`AacsKeyMap::from_ranges`](crate::decrypt::AacsKeyMap::from_ranges)
+/// with the Unit-Key index as the default — the same structure the CPS map uses,
+/// only finer-grained.
+pub fn fmts_key_ranges(
+    segments: &[Segment],
+    extents: &[crate::disc::Extent],
+    index_to_key_idx: &dyn Fn(u16) -> usize,
+) -> Vec<(u32, u32, usize)> {
+    let mut ranges = Vec::new();
+    for s in segments {
+        let start_byte = s.start_spn as u64 * SOURCE_PACKET_LEN;
+        let end_byte = (s.end_spn as u64 + 1) * SOURCE_PACKET_LEN; // exclusive
+        // A segment is unit-aligned and contiguous in clip bytes; map its first
+        // and last sector to LBAs. Segments are ~480 KB and extents are GB-sized,
+        // so a segment almost never crosses an extent boundary — but if the two
+        // ends land in different extents (non-contiguous LBAs), skip rather than
+        // emit a wrong span; the units there fall to the Unit Key (garble+drop),
+        // never a mis-decrypt.
+        let (Some(a), Some(b)) = (
+            clip_byte_to_lba(extents, start_byte),
+            clip_byte_to_lba(extents, end_byte - 1),
+        ) else {
+            continue;
+        };
+        if b >= a
+            && (b - a) as u64 == (end_byte - 1 - start_byte) / crate::consts::SECTOR_BYTES as u64
+        {
+            ranges.push((a, b + 1, index_to_key_idx(s.index)));
+        }
+    }
+    ranges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Build a table with the real on-disc layout: 8-byte header + N 16-byte
-    /// records. `recs` are `(variant, start_spn, end_spn)`.
+    /// records. `recs` are `(index, start_spn, end_spn)`.
     fn build_tbl(recs: &[(u16, u32, u32)]) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&0x0100_0000u32.to_be_bytes()); // type
@@ -182,10 +253,74 @@ mod tests {
     }
 
     #[test]
+    fn fmts_key_ranges_maps_segments_to_lba_by_index() {
+        use crate::disc::Extent;
+        // One big clip extent starting at LBA 1000. Clip byte B lives at
+        // LBA 1000 + B/2048.
+        let extents = vec![Extent {
+            start_lba: 1000,
+            sector_count: 1_000_000,
+        }];
+        // Two segments, indexes 5 and 7 (spn ranges as on a real disc).
+        let segs = vec![
+            Segment {
+                index: 5,
+                start_spn: 100,
+                end_spn: 199,
+            },
+            Segment {
+                index: 7,
+                start_spn: 10_000,
+                end_spn: 10_099,
+            },
+        ];
+        // Pool layout [base, idx1, idx2, …] → index N uses key slot N.
+        let ranges = fmts_key_ranges(&segs, &extents, &|v| v as usize);
+        assert_eq!(ranges.len(), 2, "one LBA range per segment");
+        // Segment 0: spn 100..=199 → clip bytes [19200, 38400) → sectors 9..=18
+        // → LBA 1009..1019, key index 5.
+        assert_eq!(ranges[0], (1009, 1019, 5));
+        // Segment 1: spn 10000..=10099 → bytes [1_920_000, 1_939_200) →
+        // sectors 937..=946 → LBA 1937..1947, key index 7.
+        assert_eq!(ranges[1], (1937, 1947, 7));
+
+        // The ranges drive an AacsKeyMap with the Unit Key (index 0) as default.
+        let map = crate::decrypt::AacsKeyMap::from_ranges(ranges, 0);
+        assert_eq!(map.key_idx_for(500), 0, "outside any segment → Unit Key");
+        assert_eq!(map.key_idx_for(1012), 5, "inside index-5 segment → key 5");
+        assert_eq!(map.key_idx_for(1940), 7, "inside index-7 segment → key 7");
+        assert_eq!(
+            map.key_idx_for(1019),
+            0,
+            "segment end is exclusive → Unit Key"
+        );
+    }
+
+    #[test]
+    fn clip_byte_to_lba_walks_extents() {
+        use crate::disc::Extent;
+        let extents = vec![
+            Extent {
+                start_lba: 100,
+                sector_count: 10,
+            }, // clip bytes [0, 20480)
+            Extent {
+                start_lba: 500,
+                sector_count: 10,
+            }, // clip bytes [20480, 40960)
+        ];
+        assert_eq!(clip_byte_to_lba(&extents, 0), Some(100));
+        assert_eq!(clip_byte_to_lba(&extents, 2048), Some(101));
+        assert_eq!(clip_byte_to_lba(&extents, 20480), Some(500)); // second extent
+        assert_eq!(clip_byte_to_lba(&extents, 22528), Some(501));
+        assert_eq!(clip_byte_to_lba(&extents, 40960), None); // past the clip
+    }
+
+    #[test]
     fn parses_real_disc_layout() {
         // First three records observed on retail 2.1 (Zombieland): the variant
         // field counts 1,2,3,… (it wraps at 32 further into the table — see
-        // `variant_field_cycles_one_to_thirty_two`), segments are 2560 packets.
+        // `index_field_cycles_one_to_thirty_two`), segments are 2560 packets.
         let tbl = build_tbl(&[
             (1, 343680, 346239),
             (2, 695616, 698175),
@@ -193,9 +328,9 @@ mod tests {
         ]);
         let segs = parse_individual_segments(&tbl).expect("parse");
         assert_eq!(segs.len(), 3);
-        assert_eq!(segs[0].variant, 1);
-        assert_eq!(segs[1].variant, 2);
-        assert_eq!(segs[2].variant, 3);
+        assert_eq!(segs[0].index, 1);
+        assert_eq!(segs[1].index, 2);
+        assert_eq!(segs[2].index, 3);
         assert_eq!(segs[0].start_spn, 343680);
         assert_eq!(segs[0].end_spn, 346239);
         assert_eq!(segs[0].packet_count(), 2560);
@@ -234,18 +369,18 @@ mod tests {
     }
 
     #[test]
-    fn unit_inside_segment_routes_to_variant() {
+    fn unit_inside_segment_routes_to_index() {
         // A real first-record segment: packets [343680, 346239].
         let segs = parse_individual_segments(&build_tbl(&[(1, 343680, 346239)])).unwrap();
         // A unit sitting squarely inside: start at packet 344000 → byte 344000*192.
         let off = 344000u64 * SOURCE_PACKET_LEN;
-        let hit = variant_segment_for_unit(&segs, off).expect("inside the segment");
-        assert_eq!(hit.variant, 1);
+        let hit = segment_for_unit(&segs, off).expect("inside the segment");
+        assert_eq!(hit.index, 1);
     }
 
     #[test]
-    fn variant_field_cycles_one_to_thirty_two() {
-        // Reality on Zombieland: field@4 is the variant, cycling 1..=32 in file
+    fn index_field_cycles_one_to_thirty_two() {
+        // Reality on Zombieland: field@4 is the index, cycling 1..=32 in file
         // order (NOT a sequential segment id). Reproduce one-and-a-bit cycles.
         let mut recs = Vec::new();
         let mut spn = 1000u32;
@@ -258,9 +393,9 @@ mod tests {
         }
         let segs = parse_individual_segments(&build_tbl(&recs)).unwrap();
         assert_eq!(segs.len(), 64);
-        assert_eq!(segs[31].variant, 32); // end of first cycle
-        assert_eq!(segs[32].variant, 1); // wraps, does not become 33
-        assert!(segs.iter().all(|s| (1..=32).contains(&s.variant)));
+        assert_eq!(segs[31].index, 32); // end of first cycle
+        assert_eq!(segs[32].index, 1); // wraps, does not become 33
+        assert!(segs.iter().all(|s| (1..=32).contains(&s.index)));
     }
 
     #[test]
@@ -268,29 +403,29 @@ mod tests {
         let segs = parse_individual_segments(&build_tbl(&[(1, 343680, 346239)])).unwrap();
         // A unit well before the segment is ordinary content → None (unit-key path).
         let off = 1000u64 * SOURCE_PACKET_LEN;
-        assert!(variant_segment_for_unit(&segs, off).is_none());
+        assert!(segment_for_unit(&segs, off).is_none());
     }
 
     #[test]
-    fn unit_straddling_a_segment_edge_counts_as_variant() {
+    fn unit_straddling_a_segment_edge_counts_as_forensic() {
         // Segment starts at packet 100. A unit that ENDS just inside it (its 32
-        // packets straddle the boundary) must still route to the variant key,
-        // because part of its ciphertext is variant-encrypted.
+        // packets straddle the boundary) must still route to the index key,
+        // because part of its ciphertext is forensic-encrypted.
         let segs = parse_individual_segments(&build_tbl(&[(7, 100, 200)])).unwrap();
         // Unit covering packets [80, 111]: overlaps [100,200] at the tail.
         let off = 80u64 * SOURCE_PACKET_LEN;
-        let hit = variant_segment_for_unit(&segs, off).expect("straddles the start edge");
-        assert_eq!(hit.variant, 7);
+        let hit = segment_for_unit(&segs, off).expect("straddles the start edge");
+        assert_eq!(hit.index, 7);
         // A unit ending exactly at packet 99 (offset s.t. last = 99) does NOT overlap.
         let before = 68u64 * SOURCE_PACKET_LEN; // [68, 99]
-        assert!(variant_segment_for_unit(&segs, before).is_none());
+        assert!(segment_for_unit(&segs, before).is_none());
     }
 
     #[test]
-    fn no_segments_never_routes_to_variant() {
+    fn no_segments_never_routes_to_index() {
         // The 1.0 / 2.0 case: no forensic map, so every miss is a unit-key miss.
-        assert!(variant_segment_for_unit(&[], lba_byte_offset(0)).is_none());
-        assert!(variant_segment_for_unit(&[], lba_byte_offset(9_999_999)).is_none());
+        assert!(segment_for_unit(&[], lba_byte_offset(0)).is_none());
+        assert!(segment_for_unit(&[], lba_byte_offset(9_999_999)).is_none());
     }
 
     #[test]
