@@ -1,6 +1,6 @@
 [package]
 name = "libfreemkv"
-version = "1.4.3"
+version = "1.4.4"
 edition = "2024"
 rust-version = "1.86"
 license = "MIT"
@@ -28,7 +28,7 @@ cbc = "0.1"
 # Interim path dep for local cross-repo dev; the release script re-pins this to
 # `{ git = ".../freemkv-unlock", tag = "vX.Y.Z" }` before tagging libfreemkv (so
 # the released tag resolves freemkv-unlock from git, not a sibling path).
-freemkv-unlock = { path = "../freemkv-unlock" }
+freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.4.4" }
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
