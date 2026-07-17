@@ -53,31 +53,6 @@ const TS_SYNC: u8 = 0x47;
 
 // ── Content decryption ──────────────────────────────────────────────────────
 
-/// True if a 6144-byte aligned unit's MPEG-TS sync structure is DESTROYED — it
-/// lacks the `0x47` sync bytes a clear BD-TS unit carries at offsets 4, 196,
-/// 388, … (one per 192-byte source packet).
-///
-/// This is a pure BYTE heuristic; on its own it does NOT mean "encrypted". A
-/// destroyed sync structure can be AACS ciphertext, uncorrected-ECC garbage, OR
-/// data that was never MPEG-TS at all (UDF filesystem / nav) — those are
-/// byte-indistinguishable. So this answers only *"does this unit look like valid
-/// clear TS, or not"*, nothing about encryption.
-///
-/// The "is this unit AACS-encrypted (and must decrypt)?" decision is COMPOSED by
-/// the caller, because it needs context this function lacks:
-/// `inside an m2ts content extent` AND `ts_sync_destroyed` AND `no key decrypts`
-/// (see [`crate::decrypt::decrypt_sectors_in_content`] and
-/// [`crate::Disc::encrypted_content_ranges`]). Inside known content this
-/// primitive separates an encrypted/garbled unit (destroyed) from a clear
-/// segment (intact); OUTSIDE content it is meaningless — feeding it filesystem
-/// bytes is what produced the first-2 GB false-positive this split fixes.
-///
-/// Flag-independent: it does NOT read the TP_extra copy-control bits (byte 0) or
-/// the TS scrambling-control bits (byte 7) — AACS sets neither reliably.
-pub fn ts_sync_destroyed(unit: &[u8]) -> bool {
-    unit.len() >= ALIGNED_UNIT_LEN && !ts_syncs_intact(unit)
-}
-
 /// HD-DVD `.evo` (MPEG-2 Program Stream) AACS-encrypted-unit flag offset & mask.
 ///
 /// BD/UHD/FMTS flag encryption with the Copy Permission Indicator in the top 2
@@ -144,12 +119,13 @@ pub fn aacs_unit_encrypted(unit: &[u8], format: crate::disc::ContentFormat) -> b
 ///
 /// Like the flag itself this is only meaningful at the clip-FILE-anchored boundary.
 pub fn aacs_unit_needs_decrypt(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
-    use crate::disc::ContentFormat;
-    aacs_unit_encrypted(unit, format)
-        && match format {
-            ContentFormat::BdTs => ts_sync_destroyed(unit),
-            ContentFormat::MpegPs => !is_clean_ps(unit),
-        }
+    // "Still needs the key applied" = flagged encrypted AND not yet structurally
+    // clean. There is ONE definition of clean — [`is_clean`] (the min(E,4) proof
+    // floor: E>4 needs any 4 synced, E<=4 needs all present). Never a second
+    // threshold: the old >50% majority false-flagged a bad-encoded-but-OPENED
+    // unit as still-scrambled, so the mux re-sampled it to the key service every
+    // batch (the storm) and could re-apply the key over already-clear bytes.
+    aacs_unit_encrypted(unit, format) && !is_clean(unit, format)
 }
 
 /// Minimum synced content packets that PROVE a key opened a unit. Four `0x47`
@@ -239,10 +215,6 @@ pub fn ts_packet_total(unit: &[u8]) -> usize {
     // `(len - 4) / BD_SOURCE_PACKET_BYTES + 1` over-counted by one for lengths of the
     // form `4 + k·192`.
     unit.len() / BD_SOURCE_PACKET_BYTES
-}
-
-fn ts_syncs_intact(unit: &[u8]) -> bool {
-    ts_sync_count(unit) > ts_packet_total(unit) / 2
 }
 
 /// The Program-Stream arm of [`is_clean`] (HD-DVD `.evo`): a pure structural
@@ -421,7 +393,10 @@ mod tests {
             unit[off] = TS_SYNC;
             off += BD_SOURCE_PACKET_BYTES;
         }
-        assert!(!ts_sync_destroyed(&unit));
+        assert!(crate::aacs::content::is_clean(
+            &unit,
+            crate::disc::ContentFormat::BdTs
+        ));
         assert!(
             !aacs_unit_encrypted(&unit, ts),
             "byte-0 CPI clear ⇒ not flagged encrypted"
@@ -448,54 +423,70 @@ mod tests {
     }
 
     #[test]
-    fn scramble_detection_at_16_32_boundary() {
-        // With 32 stride positions the majority threshold is
-        // total/2 = 16. A unit with EXACTLY half its syncs intact (16) must
-        // NOT be over-counted into the "scrambled" bucket by an inflated
-        // total: 16 > 16 is false → not-intact → scrambled. 17 intact → clear.
-        // The fix is that `total` is 32 (not 33), so the boundary sits cleanly
-        // at the real midpoint.
-        let set_syncs = |n: usize| {
-            let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
-            let mut off = 4;
+    fn is_clean_min4_proof_floor() {
+        // ONE rule: a unit is clean iff `synced >= min(E, 4)` over the ENCRYPTED
+        // (non-padding) packets — E>4 needs any 4, E<=4 needs all present. Build
+        // NON-ZERO payloads (real content, not padding) so every packet counts
+        // toward E; place `n` TS syncs among packets 1..31 (packet 0 is skipped).
+        let unit_with = |synced: usize| {
+            let mut unit: Vec<u8> = (0..ALIGNED_UNIT_LEN)
+                .map(|i| ((i * 7 + 1) as u8) | 1)
+                .collect();
+            // Scrub any accidental 0x47 at a sync position, then place exactly
+            // `synced` real syncs in packets 1.. (skip packet 0).
+            let mut off = BD_SOURCE_PACKET_BYTES + 4;
             let mut placed = 0;
-            while off < ALIGNED_UNIT_LEN && placed < n {
-                unit[off] = TS_SYNC;
-                off += BD_SOURCE_PACKET_BYTES;
+            while off < ALIGNED_UNIT_LEN {
+                unit[off] = if placed < synced { TS_SYNC } else { 0x46 };
                 placed += 1;
+                off += BD_SOURCE_PACKET_BYTES;
             }
             unit
         };
-
-        assert_eq!(ts_sync_count(&set_syncs(16)), 16);
-        assert_eq!(ts_sync_count(&set_syncs(17)), 17);
-
-        // Exactly half intact → classified scrambled (16 > 16 is false).
-        assert!(ts_sync_destroyed(&set_syncs(16)));
-        // One past half → classified clear.
-        assert!(!ts_sync_destroyed(&set_syncs(17)));
+        // E = 31 content packets (all non-zero) → threshold min(31,4) = 4.
+        assert!(
+            !crate::aacs::content::is_clean(&unit_with(3), crate::disc::ContentFormat::BdTs),
+            "3 synced of a well-populated unit is below the proof floor → not clean"
+        );
+        assert!(
+            crate::aacs::content::is_clean(&unit_with(4), crate::disc::ContentFormat::BdTs),
+            "4 synced proves the key opened it, even with many bad-encoded packets"
+        );
+        // The old >50% majority would have called `unit_with(4)` scrambled (4/31
+        // < half) — that false-flag was the mux key-server storm. min(E,4) fixes it.
     }
 
     #[test]
     fn scramble_detection_extremes() {
-        // Detection semantics for the clear-cut cases must be preserved:
-        // a fully-clear unit (all 32 syncs) is NOT scrambled; a unit with no
-        // syncs (fully scrambled body) IS scrambled.
+        // A fully-clear unit (every packet synced) is clean; a fully-scrambled
+        // unit (non-zero ciphertext, NO syncs) is not. (An all-zero buffer is
+        // empty padding — E==0 — which `is_clean` treats as clean, NOT scrambled.)
         let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
         let mut off = 4;
         while off < ALIGNED_UNIT_LEN {
             clear[off] = TS_SYNC;
             off += BD_SOURCE_PACKET_BYTES;
         }
-        assert_eq!(ts_sync_count(&clear), 32);
         assert!(
-            !ts_sync_destroyed(&clear),
-            "fully-clear unit → not scrambled"
+            crate::aacs::content::is_clean(&clear, crate::disc::ContentFormat::BdTs),
+            "fully-clear unit → clean"
         );
 
-        let scrambled = vec![0u8; ALIGNED_UNIT_LEN];
-        assert_eq!(ts_sync_count(&scrambled), 0);
-        assert!(ts_sync_destroyed(&scrambled), "no syncs → scrambled");
+        // Real scrambled ciphertext: non-zero everywhere, no 0x47 at any sync slot.
+        let mut scrambled: Vec<u8> = (0..ALIGNED_UNIT_LEN)
+            .map(|i| ((i * 13 + 3) as u8) | 1)
+            .collect();
+        let mut off = 4;
+        while off < ALIGNED_UNIT_LEN {
+            if scrambled[off] == TS_SYNC {
+                scrambled[off] = 0x46;
+            }
+            off += BD_SOURCE_PACKET_BYTES;
+        }
+        assert!(
+            !crate::aacs::content::is_clean(&scrambled, crate::disc::ContentFormat::BdTs),
+            "non-zero body with no syncs → scrambled"
+        );
     }
 
     #[test]
@@ -574,9 +565,15 @@ mod tests {
 
         // Now plain contains encrypted data. Decrypt it.
         let mut unit = plain;
-        assert!(ts_sync_destroyed(&unit));
+        assert!(!crate::aacs::content::is_clean(
+            &unit,
+            crate::disc::ContentFormat::BdTs
+        ));
         decrypt_unit(&mut unit, &unit_key);
-        assert!(!ts_sync_destroyed(&unit)); // decrypted: TS syncs restored
+        assert!(crate::aacs::content::is_clean(
+            &unit,
+            crate::disc::ContentFormat::BdTs
+        )); // decrypted: TS syncs restored
 
         // Verify TS sync bytes
         let mut count = 0;
@@ -1151,14 +1148,17 @@ mod tests {
         let mut unit = clear_unit();
         aacs_encrypt_unit(&mut unit, &unit_key);
         assert!(
-            ts_sync_destroyed(&unit),
+            !crate::aacs::content::is_clean(&unit, crate::disc::ContentFormat::BdTs),
             "encrypted unit must look scrambled"
         );
 
         decrypt_unit(&mut unit, &unit_key);
         // All 32 stride positions carry sync after decrypt.
         assert_eq!(ts_sync_count(&unit), ts_packet_total(&unit));
-        assert!(!ts_sync_destroyed(&unit));
+        assert!(crate::aacs::content::is_clean(
+            &unit,
+            crate::disc::ContentFormat::BdTs
+        ));
     }
 
     #[test]
@@ -1291,13 +1291,22 @@ mod tests {
         // The function guards on `len >= ALIGNED_UNIT_LEN` first; anything
         // shorter is reported NOT scrambled (so the decrypt gate skips it)
         // rather than indexing past the end.
-        assert!(!ts_sync_destroyed(&[]));
-        assert!(!ts_sync_destroyed(&vec![0u8; ALIGNED_UNIT_LEN - 1]));
+        assert!(crate::aacs::content::is_clean(
+            &[],
+            crate::disc::ContentFormat::BdTs
+        ));
+        assert!(crate::aacs::content::is_clean(
+            &vec![0u8; ALIGNED_UNIT_LEN - 1],
+            crate::disc::ContentFormat::BdTs
+        ));
         // A scrambled-looking buffer that is one byte short is still "not
         // scrambled" by the length guard.
         let mut almost = vec![0u8; ALIGNED_UNIT_LEN - 1];
         almost[4] = 0x00; // no syncs
-        assert!(!ts_sync_destroyed(&almost));
+        assert!(crate::aacs::content::is_clean(
+            &almost,
+            crate::disc::ContentFormat::BdTs
+        ));
     }
 
     #[test]

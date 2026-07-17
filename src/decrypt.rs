@@ -171,6 +171,183 @@ impl DecryptKeys {
     }
 }
 
+/// Proactive AACS key-selection map: which held unit key decrypts each LBA of a
+/// title's encrypted content, decided ONCE before mux from the disc's CPS-unit
+/// (and, later, FMTS segment) structure — never by trial-decrypt-and-check per
+/// unit at mux time.
+///
+/// This is the pivot that ends the mux "key-server storm": the old path decrypts
+/// a unit, checks whether the plaintext looks like clean MPEG-TS, and — because
+/// authored-bad content never reaches that bar — concludes "wrong key, fetch a
+/// fresh one" and re-asks the key service for units it already holds the correct
+/// key for. There is NO per-unit byte pattern that separates "correctly decrypted
+/// but authored-bad" from "still encrypted", so that check is unanswerable. The
+/// map removes the question: we resolve one key per CPS unit / segment up front
+/// (see `resolve_mux_key_map`), record which LBA ranges each covers, and at mux
+/// time simply "decrypt this LBA with key K" and trust it — bad TS is the muxer's
+/// concern, exactly as for a physically-read clear disc.
+///
+/// Ranges are `[start_lba, end_lba)` → index into the `Aacs { unit_keys }` pool,
+/// sorted and disjoint. `default_idx` covers any LBA no range claims — the
+/// single-CPS case is just an empty range list with `default_idx = 0`, so the
+/// common disc pays zero lookup cost and needs no structural walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AacsKeyMap {
+    ranges: Vec<(u32, u32, usize)>,
+    default_idx: usize,
+}
+
+impl AacsKeyMap {
+    /// The whole title is one CPS unit → one key (`idx`) everywhere. This is the
+    /// overwhelmingly common disc (incl. every single-CPS UHD); no LBA walk.
+    pub fn single(idx: usize) -> Self {
+        Self {
+            ranges: Vec::new(),
+            default_idx: idx,
+        }
+    }
+
+    /// Build from explicit `[start_lba, end_lba) → key_idx` ranges (multi-CPS /
+    /// FMTS). Ranges are sorted; `default_idx` answers any uncovered LBA.
+    pub fn from_ranges(mut ranges: Vec<(u32, u32, usize)>, default_idx: usize) -> Self {
+        ranges.sort_by_key(|&(start, _, _)| start);
+        Self {
+            ranges,
+            default_idx,
+        }
+    }
+
+    /// The unit-key index to decrypt the aligned unit at `lba` with. O(log n) —
+    /// the last range whose start is `<= lba` and whose end is `> lba`, else the
+    /// default. Cheap enough to call per aligned unit on the mux hot path.
+    pub fn key_idx_for(&self, lba: u32) -> usize {
+        if self.ranges.is_empty() {
+            return self.default_idx;
+        }
+        match self
+            .ranges
+            .binary_search_by(|&(start, _, _)| start.cmp(&lba))
+        {
+            Ok(i) => self.ranges[i].2,
+            Err(0) => self.default_idx,
+            Err(i) => {
+                let (start, end, idx) = self.ranges[i - 1];
+                if lba >= start && lba < end {
+                    idx
+                } else {
+                    self.default_idx
+                }
+            }
+        }
+    }
+
+    /// The `[start_lba, end_lba) → key_idx` ranges (sorted, disjoint). Empty for a
+    /// single-CPS map (everything uses [`default_idx`](Self::default_idx)).
+    pub fn ranges(&self) -> &[(u32, u32, usize)] {
+        &self.ranges
+    }
+
+    /// The key index for any LBA no explicit range claims (the single-CPS key).
+    pub fn default_idx(&self) -> usize {
+        self.default_idx
+    }
+
+    /// The distinct key indices this map can select — the CPS units / segments a
+    /// title actually reaches. Used by the resolver to know which keys to secure
+    /// up front.
+    pub fn key_indices(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.ranges.iter().map(|&(_, _, i)| i).collect();
+        v.push(self.default_idx);
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+}
+
+/// Decrypt a buffer of sectors in-place using a resolved [`AacsKeyMap`] — the
+/// mux's TRUSTED decrypt. `base_lba` is the absolute LBA of `buf`'s first sector;
+/// each aligned unit (3 sectors) is decrypted with the key the map assigns to its
+/// LBA. There is NO key trial and NO `is_clean` verdict: the map already decided
+/// the key from disc structure, so we apply it and move on — a unit that decrypts
+/// to authored-bad TS passes through for the muxer to drop, never re-fetched.
+///
+/// Only [`DecryptKeys::Aacs`] uses a map (CSS self-cracks per region inside
+/// [`decrypt_sectors`]; `None` is clear) — other variants are a no-op here so the
+/// decorator can dispatch uniformly. A map index outside the held pool is a
+/// fail-loud [`Error::DecryptFailed`]: the resolver's job is to guarantee every
+/// selectable index is present, so a gap here is a resolver bug, not silent loss.
+pub fn decrypt_sectors_mapped(
+    buf: &mut [u8],
+    keys: &DecryptKeys,
+    base_lba: u32,
+    map: &AacsKeyMap,
+) -> Result<(), crate::error::Error> {
+    let (unit_keys, rdk, format) = match keys {
+        DecryptKeys::Aacs {
+            unit_keys,
+            read_data_key,
+            format,
+        } => (unit_keys, *read_data_key, *format),
+        // Clear / CSS: the mapped path is AACS-only. Leave the buffer untouched;
+        // CSS descrambles via `decrypt_sectors` and `None` is already clear.
+        _ => return Ok(()),
+    };
+
+    let unit_len = aacs::content::ALIGNED_UNIT_LEN;
+    let unit_sectors = (unit_len / 2048) as u32;
+
+    // Validate every selectable index up front (fail loud) so the per-unit hot
+    // loop can index without bounds churn and a resolver gap never silently
+    // passes ciphertext through as "decrypted".
+    for idx in map.key_indices() {
+        if unit_keys.get(idx).is_none() {
+            return Err(crate::error::Error::DecryptFailed);
+        }
+    }
+
+    let decrypt_one = |idx_in_buf: usize, chunk: &mut [u8]| {
+        if chunk.len() != unit_len {
+            return; // trailing partial unit: clear tail on disc, leave as-is
+        }
+        // Gate on the authoritative encrypted flag ONLY (the CPI bits in the clear
+        // seed) — no `is_clean`. A clear unit (flag unset) is left untouched; an
+        // encrypted unit is decrypted with its MAPPED key and trusted.
+        if !aacs::content::aacs_unit_encrypted(chunk, format) {
+            return;
+        }
+        let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
+        let key_idx = map.key_idx_for(unit_lba);
+        // Bounds already proven above; index directly.
+        let key = &unit_keys[key_idx].1;
+        if let Some(ref rdk_key) = rdk {
+            aacs::content::decrypt_bus(chunk, rdk_key);
+        }
+        aacs::content::decrypt_unit(chunk, key);
+    };
+
+    let nthreads = decrypt_threads();
+    let nunits = buf.len() / unit_len;
+    if nthreads <= 1 || nunits < PARALLEL_MIN_UNITS {
+        for (i, chunk) in buf.chunks_mut(unit_len).enumerate() {
+            decrypt_one(i, chunk);
+        }
+    } else {
+        match decrypt_pool() {
+            Some(pool) => pool.install(|| {
+                buf.par_chunks_mut(unit_len)
+                    .enumerate()
+                    .for_each(|(i, chunk)| decrypt_one(i, chunk));
+            }),
+            None => {
+                for (i, chunk) in buf.chunks_mut(unit_len).enumerate() {
+                    decrypt_one(i, chunk);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Decrypt a buffer of sectors in-place.
 ///
 /// For AACS: processes in 6144-byte aligned units (3 sectors).
@@ -286,7 +463,7 @@ fn decrypt_sectors_impl(
             //     silent corruption. We fail loud (Error::DecryptFailed), matching
             //     the highway path's Error::ExtentNotUnitAligned policy.
             //
-            // Detection: ts_sync_destroyed() short-circuits to false for any
+            // Detection: !crate::aacs::content::is_clean(, crate::disc::ContentFormat::BdTs) short-circuits to false for any
             // buffer shorter than a full unit, so it cannot judge a partial. We
             // instead apply the same TS-sync-intactness test it uses internally
             // (ts_sync_count vs ts_packet_total) directly to the available
@@ -308,15 +485,13 @@ fn decrypt_sectors_impl(
                     None => true,
                 };
                 // TS-only: a scrambled trailing PARTIAL unit (< a full 6144-byte
-                // unit) can't be unit-decrypted, so fail loud. The heuristic is
-                // MPEG-TS sync density, which a PS (`.evo`) partial lacks entirely —
-                // running it on PS would false-trip `DecryptFailed`. HD-DVD partial-
-                // scramble detection is not yet wired (consistent with the UNVERIFIED
-                // PS path in `aacs_unit_encrypted`).
+                // unit) can't be unit-decrypted, so fail loud. Validity is the SAME
+                // `is_clean` proof floor used everywhere — a clear TS tail passes it,
+                // a scrambled one fails. PS (`.evo`) partials lack the TS structure,
+                // so this stays TS-only (HD-DVD partial-scramble is not yet wired).
                 if partial_in_content && format == crate::disc::ContentFormat::BdTs {
                     let partial = &buf[buf.len() - partial_len..];
-                    let packets = aacs::content::ts_packet_total(partial);
-                    if packets > 0 && aacs::content::ts_sync_count(partial) <= packets / 2 {
+                    if !aacs::content::is_clean(partial, format) {
                         return Err(crate::error::Error::DecryptFailed);
                     }
                 }
@@ -1324,7 +1499,7 @@ mod tests {
         let mut unit = clear_ts_unit();
         aacs_encrypt_unit_for_test(&mut unit, &key1);
         assert!(
-            aacs::content::ts_sync_destroyed(&unit),
+            !crate::aacs::content::is_clean(&unit, crate::disc::ContentFormat::BdTs),
             "encrypted unit must look scrambled before decrypt"
         );
 
@@ -1339,7 +1514,7 @@ mod tests {
         decrypt_sectors(&mut buf, &mut keys, 0).expect("multi-CPS decrypt must succeed");
 
         assert!(
-            !aacs::content::ts_sync_destroyed(&buf),
+            crate::aacs::content::is_clean(&buf, crate::disc::ContentFormat::BdTs),
             "unit encrypted under key1 must be fully decrypted (TS syncs restored)"
         );
         // Every sync position must carry 0x47.
@@ -1371,7 +1546,7 @@ mod tests {
         let mut buf = unit;
         decrypt_sectors(&mut buf, &mut keys, 0).expect("single-key disc must decrypt");
         assert!(
-            !aacs::content::ts_sync_destroyed(&buf),
+            crate::aacs::content::is_clean(&buf, crate::disc::ContentFormat::BdTs),
             "single-key disc: TS syncs must be restored"
         );
         assert_eq!(
@@ -1401,7 +1576,7 @@ mod tests {
         aacs_encrypt_unit_for_test(&mut unit, &real_key);
         let ciphertext = unit.clone();
         assert!(
-            aacs::content::ts_sync_destroyed(&unit),
+            !crate::aacs::content::is_clean(&unit, crate::disc::ContentFormat::BdTs),
             "encrypted unit must look scrambled going in"
         );
 
@@ -1462,7 +1637,10 @@ mod tests {
             "exactly one unit's worth of bytes must be reported unverified"
         );
         assert!(
-            !aacs::content::ts_sync_destroyed(&buf[..aacs::content::ALIGNED_UNIT_LEN]),
+            crate::aacs::content::is_clean(
+                &buf[..aacs::content::ALIGNED_UNIT_LEN],
+                crate::disc::ContentFormat::BdTs
+            ),
             "the decryptable unit must come out clear"
         );
         assert_ne!(

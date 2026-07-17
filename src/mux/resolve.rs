@@ -358,12 +358,11 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // case must NOT raise a false E7023.
             disc.ensure_title_decryptable(opts.raw, &keys, title_is_clear)
                 .map_err(|e| -> io::Error { e.into() })?;
-            // Upfront FMTS gate, parallel to the unit-key gate above. With
-            // BYPASS_FMTS_KEY this is a no-op and a 2.1 disc's forensic units are
-            // concealed as ordinary decrypt loss below; without it, a 2.1 disc
-            // lacking segment keys fails here rather than emitting a holed mux.
-            disc.ensure_forensic_segments_decryptable(opts.raw)
-                .map_err(|e| -> io::Error { e.into() })?;
+            // FMTS (AACS 2.1) forensic segments are sourced + fail-loud-checked
+            // downstream by `resolve_mux_key_map`/`resolve_fmts_key_map`, which hold
+            // the key-fetch closure and can actually attempt resolution. (An older
+            // upfront blanket-reject gate lived here; it predated the resolver and
+            // rejected every 2.1 disc before a source could be tried.)
             // Correct TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1)
             // by probing the first DECRYPTED access units of the chosen title.
             // A fresh reader avoids disturbing the mux reader below. Skipped in
@@ -600,6 +599,330 @@ fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
     (parsers, pid_to_track, ts, ps)
 }
 
+/// Resolve the proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap) for a title
+/// before muxing. It decides which held unit key decrypts each of the title's
+/// LBA ranges and secures any key the pool is missing through the app's
+/// configured source (`fetch`) up front, never reactively per unit at mux time.
+///
+/// This is what ends the key-server storm. The old mux decrypted a unit, checked
+/// whether the plaintext looked like clean MPEG-TS, and — because authored-bad
+/// content never reaches that bar — re-asked the key service for a key it already
+/// held. There is no per-unit byte pattern that separates "correctly decrypted
+/// but authored-bad" from "still encrypted", so that check is unanswerable. Here
+/// we answer the answerable question instead: which CPS unit does each LBA range
+/// belong to, decided by the disc's key structure (validated once against real
+/// ciphertext samples, where the `is_clean` proof IS sound). The mux then just
+/// decrypts each unit with its mapped key and trusts it.
+///
+/// Single-CPS (the overwhelming majority, incl. every single-key UHD) is the
+/// trivial map: one key everywhere, no sampling. Multi-CPS assigns each extent to
+/// the key that opens a real sample from it; a bad-content extent no sample can
+/// classify inherits its predecessor's key (contiguity). FMTS segment mapping
+/// layers onto the same structure.
+/// FMTS (AACS 2.1) branch of [`resolve_mux_key_map`]. Returns `Some(map)` when the
+/// disc carries `IndividualSegment.tbl` AND a key source is configured; `None`
+/// otherwise (not FMTS, or no source — the caller's base-Unit-Key path then
+/// applies, and the forensic units garble and are dropped by the demux).
+///
+/// The forensic segments each carry an **index** tag (1..32) selecting one of 32
+/// **index keys** the base Unit Key cannot open (see [`crate::aacs::segment`]).
+/// This resolves those keys up front from the configured source — sending, per
+/// index, a batch of same-index units the service maps to that index's key — adds
+/// them to the pool, and builds a per-segment LBA→key map. Applying a segment's
+/// key over its whole range decodes the ~40 units of that index's interleave half
+/// to clean TS and garbles the other ~40 (the alternate half), which the demux
+/// then drops, yielding one coherent stream. The base Unit Key covers everything
+/// outside a segment.
+fn resolve_fmts_key_map(
+    reader: &mut dyn SectorSource,
+    title: &DiscTitle,
+    keys: &mut crate::decrypt::DecryptKeys,
+    fetch: Option<&crate::sector::KeyFetch>,
+    _format: ContentFormat,
+) -> io::Result<Option<crate::decrypt::AacsKeyMap>> {
+    use crate::aacs::content::ALIGNED_UNIT_LEN;
+    use crate::aacs::segment::{clip_byte_to_lba, parse_individual_segments};
+
+    // Off by default: while `BYPASS_FMTS_KEY` is set, forensic decode is disabled —
+    // no segment table read, no key-service traffic — and the caller's base-Unit-Key
+    // path applies (the forensic units garble and the demux drops them, the shipped
+    // behaviour). Flip `BYPASS_FMTS_KEY` to false to activate forensic decode once
+    // the index-key resolution is validated end to end.
+    if crate::aacs::segment::BYPASS_FMTS_KEY {
+        return Ok(None);
+    }
+
+    // Load the segment map; absent → not an FMTS disc.
+    let Ok(udf) = crate::udf::read_filesystem(reader) else {
+        return Ok(None);
+    };
+    let Ok(tbl) = udf.read_file(reader, "/AACS/IndividualSegment.tbl") else {
+        return Ok(None);
+    };
+    let Some(segments) = parse_individual_segments(&tbl) else {
+        return Ok(None);
+    };
+    if segments.is_empty() {
+        return Ok(None);
+    }
+    // This IS an FMTS disc, so the forensic index keys are REQUIRED — exactly like
+    // a Unit Key. Without a configured key source we cannot obtain them, so we
+    // cannot produce a complete rip: fail loud rather than silently drop the
+    // forensic segments. (The caller may still choose `--raw`, which never reaches
+    // this path.)
+    let Some(fetch) = fetch else {
+        return Err(crate::error::Error::FmtsKeyMissing.into());
+    };
+    tracing::info!(target: "freemkv::keysource", segments = segments.len(), extents = title.extents.len(), "fmts: begin index-key resolution");
+
+    // Read aligned unit `index` of `seg`: clip byte `start_spn*192 + index*6144`.
+    let read_unit =
+        |reader: &mut dyn SectorSource, seg: &crate::aacs::segment::Segment, index: usize| {
+            let clip_byte = seg.start_spn as u64 * 192 + index as u64 * ALIGNED_UNIT_LEN as u64;
+            let lba = clip_byte_to_lba(&title.extents, clip_byte)?;
+            let mut c = vec![0u8; ALIGNED_UNIT_LEN];
+            reader.read_sectors(lba, 3, &mut c, false).ok()?;
+            Some(c)
+        };
+    // ── ONE forensic query. The key service returns ALL forensic index keys for the
+    //    disc in a single response, ORDERED by index (array element i = index i+1).
+    //    So send one clean single-variant batch (a segment's even-phase units) and
+    //    read the whole set back — no per-index probing, no phase measurement, no
+    //    decrypt-and-check: the array position IS the index. The first readable
+    //    segment whose batch yields the full set wins; a short (e.g. 1-key,
+    //    base-UK-shaped) response means that batch wasn't forensic (a wrong
+    //    feature-title mapping), so try the next segment. ─────────────────────────
+    const N_INDEX: usize = 32;
+    let mut index_keys: Vec<[u8; 16]> = Vec::new();
+    for seg in segments.iter().take(16) {
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        for p in 0..8usize {
+            if let Some(c) = read_unit(reader, seg, p * 2) {
+                batch.push(c);
+            }
+        }
+        if batch.len() < 8 {
+            continue; // read fault / short tail
+        }
+        let fresh = fetch(&batch);
+        if fresh.len() >= N_INDEX {
+            index_keys = fresh;
+            break;
+        }
+    }
+    tracing::info!(target: "freemkv::keysource", held = index_keys.len(), need = N_INDEX, "fmts: collection done");
+    // The full set is required. Anything short holes the rip — fail loud like a
+    // missing Unit Key rather than emit forensic-holed output.
+    if index_keys.len() < N_INDEX {
+        return Err(crate::error::Error::FmtsKeyMissing.into());
+    }
+
+    // Map array position → forensic index (element i = index i+1); add each key to
+    // the pool and remember its slot by tag. `base_idx` is the Unit Key (slot 0).
+    let base_idx = 0usize;
+    let mut tag_slot: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+    if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
+        for (i, k) in index_keys.iter().take(N_INDEX).enumerate() {
+            let tag = (i + 1) as u16;
+            let slot = match unit_keys.iter().position(|(_, h)| h == k) {
+                Some(s) => s,
+                None => {
+                    let s = unit_keys.len();
+                    // CPS-unit id is cosmetic for the mapped decrypt (it indexes by
+                    // slot); use a high, distinct number for the forensic keys.
+                    unit_keys.push((1000 + s as u32, *k));
+                    s
+                }
+            };
+            tag_slot.insert(tag, slot);
+        }
+    }
+
+    // ── Build the per-segment LBA ranges directly from the tag. Each segment is
+    //    decoded from its TAG half: the map routes the segment's whole span to its
+    //    tag's key; the tag key opens the tag half wherever it interleaves, and the
+    //    un-served version-B half — decrypted with that (for it, wrong) key —
+    //    garbles and the demux drops it, leaving one clean variant per span. No
+    //    re-read and no phase needed here: byte-5 `seg.index` selects the key. A
+    //    segment whose tag is somehow absent (cannot happen with all 32 held) or
+    //    that straddles an extent boundary is left unmapped and tallied. ─────────
+    let mut ranges: Vec<(u32, u32, usize)> = Vec::with_capacity(segments.len());
+    let mut unresolved = 0usize;
+    for seg in &segments {
+        let Some(&slot) = tag_slot.get(&seg.index) else {
+            unresolved += 1;
+            continue;
+        };
+        let start_byte = seg.start_spn as u64 * 192;
+        let end_byte = (seg.end_spn as u64 + 1) * 192;
+        let (Some(a), Some(b)) = (
+            clip_byte_to_lba(&title.extents, start_byte),
+            clip_byte_to_lba(&title.extents, end_byte - 1),
+        ) else {
+            unresolved += 1;
+            continue;
+        };
+        // Only emit a contiguous within-extent range (segments are ~480 KB; a rare
+        // extent-straddle is left unresolved rather than given a wrong span).
+        if b >= a && (b - a) as u64 == (end_byte - 1 - start_byte) / 2048 {
+            ranges.push((a, b + 1, slot));
+        } else {
+            unresolved += 1;
+        }
+    }
+    // Every forensic segment must map to an index key. Any that did not is a hole
+    // in the rip — with the full 32-key set in hand this should never happen, so
+    // treat it as a hard failure (a read fault or an unexpected on-disc layout)
+    // rather than silently emitting a segment the base Unit Key only garbles.
+    if unresolved != 0 {
+        return Err(crate::error::Error::FmtsKeyMissing.into());
+    }
+
+    Ok(Some(crate::decrypt::AacsKeyMap::from_ranges(
+        ranges, base_idx,
+    )))
+}
+
+pub fn resolve_mux_key_map(
+    reader: &mut dyn SectorSource,
+    title: &DiscTitle,
+    keys: &mut crate::decrypt::DecryptKeys,
+    fetch: Option<&crate::sector::KeyFetch>,
+    format: ContentFormat,
+) -> io::Result<crate::decrypt::AacsKeyMap> {
+    use crate::aacs::content::{
+        ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted, decrypt_unit, is_clean,
+    };
+
+    let pool_len = match keys {
+        crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => unit_keys.len(),
+        // CSS / clear: no AACS map (the decorator's map path is AACS-only).
+        _ => return Ok(crate::decrypt::AacsKeyMap::single(0)),
+    };
+
+    // Secure the disc's key up front from the configured source when the pool is
+    // empty (a genuine "no key yet" — e.g. keydb miss, online-only disc).
+    if pool_len == 0 {
+        if let Some(f) = fetch {
+            let samples = crate::keysource::read_encrypted_units(reader, title, 8);
+            if !samples.is_empty() {
+                let fresh = f(&samples);
+                if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
+                    for k in fresh {
+                        if !unit_keys.iter().any(|(_, h)| *h == k) {
+                            let i = unit_keys.len() as u32;
+                            unit_keys.push((i, k));
+                        }
+                    }
+                }
+            }
+        }
+        // If the pool is STILL empty, this AACS-encrypted title needs a Unit Key we
+        // could not obtain from any source. That is the same situation as any known
+        // key we don't hold — fail loud at resolve time rather than deferring an
+        // opaque decrypt error (or, worse, emitting ciphertext) at mux time.
+        let empty = matches!(
+            keys,
+            crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } if unit_keys.is_empty()
+        );
+        if empty {
+            return Err(crate::error::Error::DecryptFailed.into());
+        }
+        return Ok(crate::decrypt::AacsKeyMap::single(0));
+    }
+    // FMTS (AACS 2.1): if the disc carries `IndividualSegment.tbl`, the forensic
+    // segments need per-index keys the base Unit Key can't open. Resolve them up
+    // front from the configured source and build a per-segment map. Returns `None`
+    // when the disc is not FMTS, or no key source is configured (then the base UK
+    // path below applies and the forensic units garble → demux drops them).
+    if let Some(map) = resolve_fmts_key_map(reader, title, keys, fetch, format)? {
+        return Ok(map);
+    }
+    if pool_len == 1 {
+        // One CPS unit → one key everywhere. No structural walk, no sampling.
+        return Ok(crate::decrypt::AacsKeyMap::single(0));
+    }
+
+    // Multi-CPS: read a spread of real encrypted units from each extent and pick
+    // the held key that opens one (the `is_clean` proof is sound HERE — samples
+    // are guaranteed real content, not the authored-bad units that trip the mux).
+    let sample_units = |reader: &mut dyn SectorSource, start: u32, sectors: u32| -> Vec<Vec<u8>> {
+        let total_units = sectors / ALIGNED_UNIT_SECTORS;
+        let mut out = Vec::new();
+        if total_units == 0 {
+            return out;
+        }
+        const PROBES: u32 = 8;
+        for p in 1..=PROBES {
+            let unit = ((total_units as u64 * p as u64) / (PROBES as u64 + 1)) as u32;
+            if unit >= total_units {
+                continue;
+            }
+            let lba = start.saturating_add(unit.saturating_mul(ALIGNED_UNIT_SECTORS));
+            let mut buf = vec![0u8; ALIGNED_UNIT_LEN];
+            if reader
+                .read_sectors(lba, ALIGNED_UNIT_SECTORS as u16, &mut buf, false)
+                .is_ok()
+                && aacs_unit_encrypted(&buf, format)
+            {
+                out.push(buf);
+            }
+        }
+        out
+    };
+    let pick = |samples: &[Vec<u8>], pool: &[(u32, [u8; 16])]| -> Option<usize> {
+        for (i, (_, k)) in pool.iter().enumerate() {
+            if samples.iter().any(|s| {
+                let mut u = s.clone();
+                decrypt_unit(&mut u, k);
+                is_clean(&u, format)
+            }) {
+                return Some(i);
+            }
+        }
+        None
+    };
+
+    let mut ranges: Vec<(u32, u32, usize)> = Vec::with_capacity(title.extents.len());
+    let mut last_idx = 0usize;
+    for ext in &title.extents {
+        let samples = sample_units(reader, ext.start_lba, ext.sector_count);
+        // Snapshot the current pool for the pure `pick` closure.
+        let pool: Vec<(u32, [u8; 16])> = match keys {
+            crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => unit_keys.clone(),
+            _ => Vec::new(),
+        };
+        let mut idx = pick(&samples, &pool);
+        if idx.is_none() {
+            if let Some(f) = fetch {
+                if !samples.is_empty() {
+                    let fresh = f(&samples);
+                    if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
+                        for k in fresh {
+                            if !unit_keys.iter().any(|(_, h)| *h == k) {
+                                let i = unit_keys.len() as u32;
+                                unit_keys.push((i, k));
+                            }
+                        }
+                        idx = pick(&samples, unit_keys);
+                    }
+                }
+            }
+        }
+        // A bad-content extent no sample can classify inherits its predecessor's
+        // key (CPS boundaries are contiguous, so the neighbour is almost always
+        // right); this never storms and never mis-fails a decryptable disc.
+        let idx = idx.unwrap_or(last_idx);
+        last_idx = idx;
+        ranges.push((
+            ext.start_lba,
+            ext.start_lba.saturating_add(ext.sector_count),
+            idx,
+        ));
+    }
+    Ok(crate::decrypt::AacsKeyMap::from_ranges(ranges, 0))
+}
+
 /// Assemble the ISO mux pipeline (read+decrypt → demux → parse) for
 /// a `FileSectorSource`-backed reader. Returns the resulting
 /// `PipelinedPesStream`.
@@ -618,18 +941,16 @@ fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
 /// - `halt`: cooperative cancel token (not a timeout); when cancelled the
 ///   pipeline stops at the next boundary. `None` disables cancellation.
 /// - `event_fn`: optional progress/event callback invoked by the prefetcher.
-/// - `fetch`: optional fresh-key-on-failure callback (see
-///   [`crate::sector::KeyFetch`]). When a unit no held key decrypts, the
-///   decrypt decorator hands that ciphertext to `fetch` and adds any key it
-///   returns, then re-decrypts. `None` means no mid-stream key recovery — the
-///   unit's best-effort bytes pass through to the muxer as-is.
+/// - `fetch`: optional key source used UP FRONT by [`resolve_mux_key_map`] to
+///   secure any CPS-unit key the pool is missing. Not a per-unit mux-time
+///   callback: the map decides the key for every LBA before the read loop starts.
 // Eight reader/title/keys/tuning/callback params is inherent to the mux entry
 // point; grouping them into a struct would only move the same fields around.
 #[allow(clippy::too_many_arguments)]
 pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
-    reader: S,
+    mut reader: S,
     title: DiscTitle,
-    keys: crate::decrypt::DecryptKeys,
+    mut keys: crate::decrypt::DecryptKeys,
     batch_sectors: u16,
     format: ContentFormat,
     halt: Option<crate::halt::Halt>,
@@ -646,20 +967,23 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         crate::decrypt::DecryptKeys::Aacs { .. } => 3,
         _ => 1,
     };
-    // MUX path: read > decrypt > mux. The decrypt seam applies the CPS unit key and
-    // passes the bytes to the muxer; a unit that decrypts to broken TS is the
-    // muxer's problem, not a decrypt failure, so the mux never conceals a unit or
-    // counts it as loss.
+    // MUX path: read > decrypt > mux. Resolve the proactive AACS key map UP FRONT
+    // — one key per CPS unit / segment, secured from the configured source and
+    // recorded against the LBA ranges it covers. The mux then decrypts each unit
+    // with its KNOWN key and trusts it: no per-unit `is_clean` verdict, no reactive
+    // key-fetch, no key-server storm. A unit that decrypts to broken TS is the
+    // muxer's problem, exactly as before. AACS-only; CSS self-cracks per region.
+    let key_map =
+        match &keys {
+            crate::decrypt::DecryptKeys::Aacs { .. } => Some(std::sync::Arc::new(
+                resolve_mux_key_map(&mut reader, &title, &mut keys, fetch.as_ref(), format)?,
+            )),
+            _ => None,
+        };
     let mut decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
-    // Install the fresh-key-on-failure callback (if the app supplied one). This is
-    // how multi-CPS is muxed: each CPS unit's key is fetched when the mux reaches a
-    // unit no held key opens — "get the key when we need it." It fires only on a
-    // genuine miss: now that key selection is accurate (`is_clean_ts`), a unit that
-    // decrypted correctly but has bad-encoded TS is NOT a miss, so this no longer
-    // storms the key source the way the old TS supermajority gate did.
-    if let Some(cb) = fetch {
-        decrypting = decrypting.with_key_fetch(cb);
+    if let Some(map) = key_map {
+        decrypting = decrypting.with_key_map(map);
     }
     // Loss-counter handle. The mux does NOT tally decrypt-quality misses: a
     // broken-TS unit is the muxer's concern, and a missing key is an up-front

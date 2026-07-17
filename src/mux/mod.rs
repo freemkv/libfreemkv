@@ -117,6 +117,7 @@ pub use network::NetworkStream;
 pub use null::NullStream;
 pub use pipelined_stream::PipelinedPesStream;
 pub use resolve::build_iso_pipeline;
+pub use resolve::resolve_mux_key_map;
 pub use resolve::{InputOptions, StreamUrl, input, output, parse_url};
 pub use stdio::StdioStream;
 

@@ -187,7 +187,10 @@ pub use identity::DriveId;
 // don't touch `DecryptKeys` directly — `DiscStream::new(reader, title, keys, …)`
 // accepts whatever `Disc::decrypt_keys()` returned. `decrypt_sectors()` is
 // for callers that operate on raw sector buffers (e.g. ISO patching).
-pub use decrypt::{DecryptKeys, decrypt_sectors, decrypt_threads, set_decrypt_threads};
+pub use decrypt::{
+    AacsKeyMap, DecryptKeys, decrypt_sectors, decrypt_sectors_mapped, decrypt_threads,
+    set_decrypt_threads,
+};
 
 // ─── Disc structure ─────────────────────────────────────────────────────────
 //
@@ -248,6 +251,7 @@ pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
 // single decrypt-on-read decorator (AACS / CSS / none) — wrap any
 // `SectorSource` to get plaintext sectors out.
 pub use mux::build_iso_pipeline;
+pub use mux::resolve_mux_key_map;
 pub use scsi::{DriveInfo, ScsiSense, ScsiTransport, drive_has_disc, list_drives};
 pub use sector::{
     DecryptingSectorSource, FileSectorSink, FileSectorSource, KeyFetch, PrefetchedSectorSource,

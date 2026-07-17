@@ -29,6 +29,7 @@ pub mod content;
 pub mod crypto;
 pub mod derive;
 pub mod host_certs;
+pub mod index_select;
 pub mod inf;
 pub mod mkb;
 pub mod provider;
@@ -38,7 +39,6 @@ pub mod segment_key;
 pub mod trace;
 pub mod types;
 pub mod variant;
-pub mod variant_select;
 
 /// On-disc UDF paths to the AACS key-input files.
 ///
@@ -119,7 +119,7 @@ mod tests {
     //! Touching one representative item per module keeps these as a
     //! compile-time contract that the module paths stay stable.
 
-    use super::content::{ALIGNED_UNIT_LEN, ts_sync_destroyed};
+    use super::content::ALIGNED_UNIT_LEN;
     use super::inf::{disc_hash, disc_hash_hex};
     use super::mkb::{AacsVersion, mkb_content_len, walk_mkb};
     use super::variant::is_variant_mkb;
@@ -147,7 +147,10 @@ mod tests {
     fn public_helpers_are_callable_by_module_path() {
         // Touch a representative function from each module so a dropped/renamed
         // item fails to compile. Smoke calls, not behavioural assertions.
-        let _ = ts_sync_destroyed(&[0u8; ALIGNED_UNIT_LEN]);
+        let _ = !crate::aacs::content::is_clean(
+            &[0u8; ALIGNED_UNIT_LEN],
+            crate::disc::ContentFormat::BdTs,
+        );
         let _ = mkb_content_len(&[]);
         let _ = is_variant_mkb(&walk_mkb(&[]));
         let _ = disc_hash_hex(&disc_hash(b"x"));
