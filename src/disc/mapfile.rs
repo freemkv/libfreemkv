@@ -77,7 +77,7 @@ impl SectorStatus {
 
 /// One contiguous range of bytes with a status.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MapEntry {
+pub(crate) struct MapEntry {
     pub pos: u64,
     pub size: u64,
     pub status: SectorStatus,
@@ -498,7 +498,7 @@ impl Mapfile {
 
     /// All map entries, sorted ascending by `pos` and (after load)
     /// guaranteed disjoint and non-overflowing.
-    pub fn entries(&self) -> &[MapEntry] {
+    pub(crate) fn entries(&self) -> &[MapEntry] {
         &self.entries
     }
 

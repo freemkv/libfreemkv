@@ -336,7 +336,7 @@ fn frame_record(track_idx: usize, pts_ns: i64, keyframe: bool, data: &[u8]) -> V
 /// `track_number` is the 1-based MKV track number; `track` is the built
 /// [`crate::mux::mkv::MkvTrack`] whose fields map one-to-one onto the emitted
 /// elements (see `MkvMuxer::new`). No-op unless the diag target is on.
-pub fn dump_mkv_track(track_number: u64, track: &crate::mux::mkv::MkvTrack) {
+pub(crate) fn dump_mkv_track(track_number: u64, track: &crate::mux::mkv::MkvTrack) {
     if !diag_enabled() {
         return;
     }
