@@ -531,8 +531,7 @@ pub fn output(
         // `fvi://` writes the per-picture video index (`docs/FVI_FORMAT.md`).
         // The bare `output()` arm records the resolver path as the provenance
         // `source.path` and defaults the title index to 0 (the resolver carries
-        // no title-index context — the CLI follow-up passes the real medium /
-        // title via `FviSink::create_with_source`).
+        // no title-index context).
         StreamUrl::Fvi { ref path } => {
             validate_file_path(path, "fvi")?;
             Ok(Box::new(super::fvi_sink::FviSink::create(
