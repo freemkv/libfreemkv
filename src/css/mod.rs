@@ -29,7 +29,7 @@ use crate::sector::SectorSource;
 const CSS_LOCKED_BAIL: u32 = 64;
 
 /// CSS decryption state for a DVD title.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CssState {
     /// 5-byte CSS title key (from SCSI auth or the crack fallback).
     pub title_key: [u8; 5],
@@ -41,6 +41,18 @@ pub struct CssState {
     /// of unknown provenance (e.g. test fixtures) — treated as "applies
     /// everywhere" for backward compatibility.
     pub crack_span: Option<(u32, u32)>,
+}
+
+// Redacting `Debug`: `CssState` is reachable via the public `Disc.css` field, so
+// a `{:?}` on a `Disc` would otherwise print the raw CSS title key. Print only
+// the (non-secret) crack span. Guarded by `css_state_debug_is_redacted`.
+impl std::fmt::Debug for CssState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CssState")
+            .field("title_key", &"<redacted>")
+            .field("crack_span", &self.crack_span)
+            .finish()
+    }
 }
 
 /// Recover the CSS title key with no keys, by scanning scrambled sectors and
@@ -363,6 +375,23 @@ pub fn is_scrambled_pack(sector: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::error::{Error, Result};
+
+    /// `CssState` is reachable via the public `Disc.css` field, so a `{:?}` on a
+    /// `Disc` must not print the raw CSS title key. Sentinel byte 213 (0xD5);
+    /// `crack_span` is non-secret and none of its values are 213.
+    #[test]
+    fn css_state_debug_is_redacted() {
+        let s = CssState {
+            title_key: [0xD5; 5],
+            crack_span: Some((10, 20)),
+        };
+        let dbg = format!("{s:?}");
+        assert!(
+            !dbg.contains("213"),
+            "CssState Debug leaked the title key: {dbg}"
+        );
+        assert!(dbg.contains("redacted"), "CssState Debug missing marker: {dbg}");
+    }
 
     // ── is_scrambled ───────────────────────────────────────────────────────
 
