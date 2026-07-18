@@ -301,6 +301,89 @@ impl AacsKeyMap {
         v.dedup();
         v
     }
+
+    /// Build the FMTS **read plan**: the title's aligned units filtered down to
+    /// only the units this rip must actually read — every default / CPS unit,
+    /// plus, inside each forensic segment, ONLY our-phase ([`Phase::Even`] /
+    /// [`Phase::Odd`]) units. The alternate-phase units are a different device
+    /// group's variant: a licensed player never reads them, and neither do we.
+    /// They are omitted from the plan entirely, so they are never fetched,
+    /// decrypted, or handed to the demux — the demux therefore sees one gapless
+    /// our-variant stream, with no ciphertext to trip a concealed-gap resync (the
+    /// old behaviour that dropped good frames around every segment).
+    ///
+    /// `extents` are the title's clip extents (unit-aligned in the interior;
+    /// a shorter tail is ordinary content and always kept). `unit_sectors` is the
+    /// AACS aligned-unit size in sectors (3). Contiguous kept units coalesce into
+    /// as few extents as possible so the producer still issues large sequential
+    /// reads across default content; only inside a ~480 KB forensic segment do
+    /// reads become unit-granular (every other unit). A map with no forensic
+    /// (Even/Odd) range returns `extents` unchanged — the common disc is not
+    /// touched.
+    ///
+    /// The parity test is byte-identical to the decrypt hot loop
+    /// (`(unit_lba - range_start) / unit_sectors`), so a unit kept here is exactly
+    /// a unit [`decrypt_sectors_mapped`] would open, and vice-versa.
+    pub fn read_plan(
+        &self,
+        extents: &[crate::disc::Extent],
+        unit_sectors: u32,
+    ) -> Vec<crate::disc::Extent> {
+        // No forensic segment → read everything, unchanged (byte-for-byte).
+        if !self
+            .ranges
+            .iter()
+            .any(|&(_, _, _, p)| matches!(p, Phase::Even | Phase::Odd))
+        {
+            return extents.to_vec();
+        }
+        let us = unit_sectors.max(1);
+        let mut plan: Vec<crate::disc::Extent> = Vec::new();
+        // Append `sectors` at `lba`, coalescing with the previous extent when they
+        // are physically contiguous so default runs stay one big sequential read.
+        let mut push = |lba: u32, sectors: u32| {
+            if sectors == 0 {
+                return;
+            }
+            if let Some(last) = plan.last_mut() {
+                if last.start_lba.saturating_add(last.sector_count) == lba {
+                    last.sector_count += sectors;
+                    return;
+                }
+            }
+            plan.push(crate::disc::Extent {
+                start_lba: lba,
+                sector_count: sectors,
+            });
+        };
+        for e in extents {
+            let mut off = 0u32;
+            while off < e.sector_count {
+                let lba = e.start_lba.saturating_add(off);
+                let remaining = e.sector_count - off;
+                if remaining < us {
+                    // Extent tail shorter than a whole unit: ordinary content
+                    // (nothing follows to desync), always read.
+                    push(lba, remaining);
+                    break;
+                }
+                let (_, phase, range_start) = self.entry_for(lba);
+                let keep = match phase {
+                    Phase::All => true,
+                    Phase::Even | Phase::Odd => {
+                        let unit_ix = (lba - range_start) / us;
+                        let is_odd = unit_ix % 2 == 1;
+                        is_odd == matches!(phase, Phase::Odd)
+                    }
+                };
+                if keep {
+                    push(lba, us);
+                }
+                off += us;
+            }
+        }
+        plan
+    }
 }
 
 /// Decrypt a buffer of sectors in-place using a resolved [`AacsKeyMap`] — the
@@ -1554,6 +1637,98 @@ mod tests {
         assert_eq!(phased.entry_for(150), (3, Phase::Odd, 100));
         assert_eq!(phased.entry_for(250), (7, Phase::All, 0));
         assert_eq!(phased.key_idx_for(150), 3);
+    }
+
+    /// A map with no forensic (Even/Odd) range is the common disc: `read_plan`
+    /// returns the extents unchanged, so nothing but FMTS is affected.
+    #[test]
+    fn read_plan_non_forensic_is_unchanged() {
+        use crate::disc::Extent;
+        let us = (aacs::content::ALIGNED_UNIT_LEN / 2048) as u32; // 3
+        let ext = vec![
+            Extent {
+                start_lba: 1000,
+                sector_count: 300,
+            },
+            Extent {
+                start_lba: 5000,
+                sector_count: 60,
+            },
+        ];
+        // Single-CPS and multi-CPS (All) maps both leave the plan untouched.
+        assert_eq!(AacsKeyMap::single(0).read_plan(&ext, us), ext);
+        let multi = AacsKeyMap::from_ranges(vec![(1000, 1150, 2)], 0);
+        assert_eq!(multi.read_plan(&ext, us), ext);
+    }
+
+    /// FMTS: a forensic Even segment drops exactly its alternate (odd) units from
+    /// the read plan — they are never fetched — while default content on either
+    /// side stays one coalesced sequential run. The kept units are byte-identical
+    /// to the ones the decrypt hot loop opens.
+    #[test]
+    fn read_plan_forensic_reads_only_our_phase_units() {
+        use crate::disc::Extent;
+        let us = (aacs::content::ALIGNED_UNIT_LEN / 2048) as u32; // 3
+        // One extent, 100 units [1000, 1300). A 10-unit Even forensic segment at
+        // LBA [1030, 1060): kept even units are ix 0,2,4,6,8 → LBA 1030,1036,1042,
+        // 1048,1054; dropped odd units → 1033,1039,1045,1051,1057.
+        let ext = vec![Extent {
+            start_lba: 1000,
+            sector_count: 300,
+        }];
+        let map = AacsKeyMap::from_ranges_phased(vec![(1030, 1060, 5, Phase::Even)], 0);
+        let plan = map.read_plan(&ext, us);
+        let expected = vec![
+            Extent {
+                start_lba: 1000,
+                sector_count: 33,
+            }, // 1000..1030 default + the ix-0 even unit at 1030
+            Extent {
+                start_lba: 1036,
+                sector_count: 3,
+            },
+            Extent {
+                start_lba: 1042,
+                sector_count: 3,
+            },
+            Extent {
+                start_lba: 1048,
+                sector_count: 3,
+            },
+            Extent {
+                start_lba: 1054,
+                sector_count: 3,
+            },
+            Extent {
+                start_lba: 1060,
+                sector_count: 240,
+            }, // default resumes, coalesced to the extent end
+        ];
+        assert_eq!(plan, expected);
+        // Exactly the 5 odd units (15 sectors) are omitted; nothing else.
+        let kept: u32 = plan.iter().map(|e| e.sector_count).sum();
+        assert_eq!(
+            kept,
+            300 - 5 * us,
+            "only the alternate-phase units are dropped"
+        );
+        // Every kept LBA is one the decrypt loop would decrypt (All or our parity),
+        // and no dropped LBA is: the plan and the decrypt gate agree unit-for-unit.
+        for e in &plan {
+            let mut off = 0;
+            while off < e.sector_count {
+                let lba = e.start_lba + off;
+                let (_, phase, rs) = map.entry_for(lba);
+                if let Phase::Even | Phase::Odd = phase {
+                    let is_odd = ((lba - rs) / us) % 2 == 1;
+                    assert!(
+                        is_odd == matches!(phase, Phase::Odd),
+                        "plan kept an alternate-phase unit at LBA {lba}"
+                    );
+                }
+                off += us;
+            }
+        }
     }
 
     /// Phase::Even → only even-index units in the range are decrypted; the odd
