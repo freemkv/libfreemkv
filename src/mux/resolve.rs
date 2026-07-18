@@ -479,7 +479,7 @@ pub fn output(
                     IO_BUF_SIZE,
                     crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
                 ));
-            Ok(Box::new(MkvStream::create_at(writer, title, Some(path))?))
+            Ok(Box::new(MkvStream::create(writer, title, Some(path))?))
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
