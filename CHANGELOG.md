@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.4.5] — 2026-07-18
+
+### Fixed
+
+- **FMTS (AACS 2.1) forensic discs now mux to a clean, single-variant stream.** A
+  forensic segment interleaves the local device group's variant with a foreign
+  group's at the aligned-unit level. The mux decrypted only our half but left the
+  foreign half in the buffer as ciphertext, on the assumption that the demuxer
+  "drops untouched ciphertext cleanly." It does not — a foreign unit's bytes hit a
+  tracked PID at the 192-byte stride, mis-parse, and trip the demux's concealed-gap
+  keyframe resync, which discards good frames of ours around every segment (visible
+  playback glitches). `AacsKeyMap::read_plan` now turns the map into the title's
+  read plan: every default / CPS unit, plus inside a forensic segment **only our
+  phase's units**. The foreign half is never read, decrypted, or handed to the
+  demux. On a retail 4K UHD title this took concealed-gap resyncs from **349 → 0**
+  and recovered ~2 GB of previously-dropped frames. Wired into **both** mux paths —
+  the file-backed highway (`build_iso_pipeline`) and the inline live-drive
+  `DiscStream` (`with_key_map`) — so single- and multi-pass FMTS rips are both clean.
+
+### Changed
+
+- **Key-bearing types redact their `Debug` output.** Every type that carries key
+  material (device keys, processing keys, unit keys, media keys, VUKs, resolved
+  chains, CSS/AACS state, …) now prints a `<redacted>` marker instead of the bytes,
+  so no key can reach a log or panic message. Each is covered by a test asserting no
+  key byte appears.
+- **Hex parsing is centralized and case-insensitive.** A single set of canonical
+  `0x`/`0X`-tolerant hex→integer parsers replaces scattered ad-hoc parsing (this is
+  what silently dropped keydb device keys written with an uppercase `0X` prefix).
+- **Internal-only public surface narrowed to `pub(crate)`, and duplicate
+  `foo_with_X` methods collapsed to one** — no behavioral change, smaller API.
+
 ## [1.4.4] — 2026-07-17
 
 ### Fixed
