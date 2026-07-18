@@ -498,7 +498,10 @@ mod tests {
         };
         let dbg = format!("{rk:?}");
         assert!(!dbg.contains("213"), "ResolvedKeys leaked keys: {dbg}");
-        assert!(dbg.contains("redacted"), "ResolvedKeys missing marker: {dbg}");
+        assert!(
+            dbg.contains("redacted"),
+            "ResolvedKeys missing marker: {dbg}"
+        );
     }
 
     /// Audit #5: the `major` / `from_major` mapping is load-bearing for the

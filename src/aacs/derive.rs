@@ -595,7 +595,10 @@ mod resolve_candidate_tests {
             dk: None,
         };
         let dbg = format!("{c:?}");
-        assert!(!dbg.contains("213"), "ResolvedChain leaked unit keys: {dbg}");
+        assert!(
+            !dbg.contains("213"),
+            "ResolvedChain leaked unit keys: {dbg}"
+        );
         assert!(
             dbg.contains("unit_keys_len"),
             "ResolvedChain missing redaction: {dbg}"
