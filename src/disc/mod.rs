@@ -1363,7 +1363,6 @@ impl DiscTitle {
 // ─── Encryption ─────────────────────────────────────────────────────────────
 
 /// AACS decryption state for a disc.
-#[derive(Debug)]
 pub struct AacsState {
     /// AACS version (1 or 2)
     pub version: u8,
@@ -1392,6 +1391,28 @@ pub struct AacsState {
     /// Raw MKB bytes (`MKB_RO.inf`). Stashed at scan so an external resolver can
     /// walk it (device/processing key → media key). Empty when not captured.
     pub mkb: Vec<u8>,
+}
+
+// Redacting `Debug`: `AacsState` is crate-root re-exported and reachable via the
+// public `Disc.aacs` field; it carries VUK / unit keys / read-data (bus) key /
+// volume id / raw .inf + MKB. Print only non-secret shape; redact every
+// key/secret field. Guarded by `aacs_state_and_key_debug_are_redacted`.
+impl std::fmt::Debug for AacsState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AacsState")
+            .field("version", &self.version)
+            .field("bus_encryption", &self.bus_encryption)
+            .field("mkb_version", &self.mkb_version)
+            .field("disc_hash", &self.disc_hash)
+            .field("key_source", &self.key_source)
+            .field("vuk", &self.vuk.map(|_| "<redacted>"))
+            .field("unit_keys_len", &self.unit_keys.len())
+            .field("read_data_key", &self.read_data_key.map(|_| "<redacted>"))
+            .field("volume_id", &"<redacted>")
+            .field("uk_ro_len", &self.uk_ro.len())
+            .field("mkb_len", &self.mkb.len())
+            .finish()
+    }
 }
 
 /// How AACS keys were resolved. Variants are ordered root-of-trust →
@@ -2244,7 +2265,7 @@ impl Disc {
 /// point at one level of that chain; [`Disc::decrypt_with`] derives down from
 /// it to the per-CPS unit keys. New levels can be added without breaking
 /// callers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum Key {
     /// Device key(s) (AACS DK, positioned). libfreemkv walks the MKB
@@ -2271,6 +2292,22 @@ pub enum Key {
     /// at sweep; libfreemkv decrypts directly with no further derivation. This
     /// is the terminal level every other variant derives down into.
     Unit(Vec<(u32, [u8; 16])>),
+}
+
+// Redacting `Debug`: `Key` is crate-root re-exported and is the key-transport
+// type crossing `Disc::decrypt_with`; every variant carries raw key material.
+// Print only the variant name and count — never bytes. Guarded by
+// `aacs_state_and_key_debug_are_redacted`.
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Key::Device(v) => write!(f, "Key::Device(<{} redacted>)", v.len()),
+            Key::Processing(v) => write!(f, "Key::Processing(<{} redacted>)", v.len()),
+            Key::Media(v) => write!(f, "Key::Media(<{} redacted>)", v.len()),
+            Key::Volume(_) => f.write_str("Key::Volume(<redacted>)"),
+            Key::Unit(v) => write!(f, "Key::Unit(<{} redacted>)", v.len()),
+        }
+    }
 }
 
 /// True if `unit_keys` covers EVERY supplied scrambled content `sample` — the
@@ -4187,6 +4224,40 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `AacsState` (public via `Disc.aacs`) and `Key` (the key-transport enum)
+    /// must never print raw key bytes on `{:?}`. Sentinel 213 (0xD5); non-secret
+    /// fields below are not 213.
+    #[test]
+    fn aacs_state_and_key_debug_are_redacted() {
+        let st = AacsState {
+            version: 2,
+            bus_encryption: true,
+            mkb_version: Some(77),
+            disc_hash: "0xAA".into(),
+            key_source: KeyOrigin::ExternalUk,
+            vuk: Some([0xD5; 16]),
+            unit_keys: vec![(1, [0xD5; 16])],
+            read_data_key: Some([0xD5; 16]),
+            volume_id: [0xD5; 16],
+            uk_ro: vec![1, 2, 3],
+            mkb: vec![4, 5, 6],
+        };
+        let d = format!("{st:?}");
+        assert!(!d.contains("213"), "AacsState leaked key bytes: {d}");
+        assert!(d.contains("redacted"), "AacsState missing marker: {d}");
+
+        for k in [
+            Key::Unit(vec![(1, [0xD5; 16])]),
+            Key::Volume([0xD5; 16]),
+            Key::Processing(vec![[0xD5; 16]]),
+            Key::Media(vec![[0xD5; 16]]),
+        ] {
+            let d = format!("{k:?}");
+            assert!(!d.contains("213"), "Key leaked bytes: {d}");
+            assert!(d.contains("redacted"), "Key missing marker: {d}");
+        }
+    }
 
     // ── encrypted-content map (`merged_extents` core) ────────────────────────
 

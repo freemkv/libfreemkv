@@ -660,8 +660,14 @@ mod tests {
             cvalue_index: 2,
         };
         let dbg = format!("{m:?}");
-        assert!(!dbg.contains("213"), "ProcessingKeyMatch leaked kp/cvalue: {dbg}");
-        assert!(dbg.contains("redacted"), "ProcessingKeyMatch missing marker: {dbg}");
+        assert!(
+            !dbg.contains("213"),
+            "ProcessingKeyMatch leaked kp/cvalue: {dbg}"
+        );
+        assert!(
+            dbg.contains("redacted"),
+            "ProcessingKeyMatch missing marker: {dbg}"
+        );
     }
 
     #[test]
