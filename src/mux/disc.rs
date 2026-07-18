@@ -351,6 +351,27 @@ impl DiscStream {
         self
     }
 
+    /// Install a proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap) on the inline
+    /// live-drive path — the counterpart to what
+    /// [`build_iso_pipeline`](crate::mux::resolve::build_iso_pipeline) does for the
+    /// file-backed highway. The map is the title's read plan: it decides which unit
+    /// each LBA is and, for an FMTS forensic segment, which phase is ours. The
+    /// extent walk is rewritten to the read plan so **only our-phase units are read
+    /// off the drive** (the alternate device-group units are never fetched,
+    /// decrypted, or muxed), and the map is installed so each unit decrypts with its
+    /// mapped key. A non-forensic map returns the extents unchanged, so a plain
+    /// single/multi-CPS disc reads exactly as before.
+    pub fn with_key_map(mut self, map: std::sync::Arc<crate::decrypt::AacsKeyMap>) -> Self {
+        self.extents = map.read_plan(&self.extents, self.unit_align.max(1) as u32);
+        self.bytes_total_extents = self
+            .extents
+            .iter()
+            .map(|e| e.sector_count as u64 * 2048)
+            .sum();
+        self.reader.set_key_map(map);
+        self
+    }
+
     fn is_halted(&self) -> bool {
         self.halt
             .as_ref()
@@ -1116,6 +1137,44 @@ mod tests {
             stream.is_halted(),
             "with_halt token cancellation must be observed by is_halted()"
         );
+    }
+
+    /// `with_key_map` on the inline live-drive path applies the same FMTS read plan
+    /// the file-backed highway uses: within a forensic segment only our-phase units
+    /// survive the extent walk, so the alternate device-group units are never read.
+    #[test]
+    fn with_key_map_reads_only_our_phase_units() {
+        use crate::decrypt::{AacsKeyMap, DecryptKeys, Phase};
+        // AACS keys → unit_align = 3, so a unit is 3 sectors and the phase filter
+        // engages. Key contents are irrelevant to the read plan.
+        let aacs = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0u8; 16]), (1, [1u8; 16])],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        // 100 units (300 sectors). A 10-unit Even forensic segment at LBA [30,60):
+        // even units (30,36,42,48,54) are ours; odd (33,39,45,51,57) are dropped.
+        let map = AacsKeyMap::from_ranges_phased(vec![(30, 60, 1, Phase::Even)], 0);
+        let stream = DiscStream::new(
+            Box::new(ZeroReader { capacity: 300 }),
+            synthetic_title(300),
+            aacs,
+            8,
+            ContentFormat::BdTs,
+        )
+        .with_key_map(std::sync::Arc::new(map));
+        let total: u32 = stream.extents.iter().map(|e| e.sector_count).sum();
+        assert_eq!(
+            total,
+            300 - 5 * 3,
+            "exactly the 5 alternate-phase units (15 sectors) are dropped from the read walk"
+        );
+        assert!(
+            stream.extents.len() > 1,
+            "the forensic segment split the single extent into our-phase-only runs"
+        );
+        // The progress denominator tracks the reduced read set.
+        assert_eq!(stream.bytes_total_extents, total as u64 * 2048);
     }
 
     /// Recording `SectorSource`: logs every `(lba, count)` request and
