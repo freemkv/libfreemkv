@@ -115,7 +115,7 @@ pub struct DiscInputs {
     pub volume_label: Option<String>,
 }
 
-/// A lazy view of a disc's AACS material, handed to [`KeySource::get_uk`] so a
+/// A lazy view of a disc's AACS material, handed to [`KeySource::get_unit_keys`] so a
 /// source can drive the derivation chain without holding the disc reader.
 ///
 /// "Lazy" by contract: each accessor returns only what the source asks for, so a
@@ -233,10 +233,34 @@ impl ResolveCtx for DiscInputsCtx<'_> {
 /// ([`resolve_and_apply`]) tries each source in order and validates the returned
 /// keys against real ciphertext before committing them, so a wrong key from one
 /// source transparently falls through to the next.
+///
+/// Two explicit resolve operations, one per key kind — never one overloaded call
+/// whose meaning depends on how many keys came back:
+/// * [`get_unit_keys`](Self::get_unit_keys) — the disc's base per-CPS-unit Unit
+///   Keys (index space = CPS-unit number). The common path for every disc.
+/// * [`get_fmts_indexes`](Self::get_fmts_indexes) — the AACS 2.1 forensic index
+///   keys (index space = forensic index 1..N). Defaults to empty: a source with
+///   no forensic material opts out, and only an FMTS disc ever asks.
+///
+/// What each source must do to answer is the source's own business: a keydb keys
+/// on `disc_hash` and reads no samples; the online source submits the ctx's
+/// content samples (a base batch for `get_unit_keys`, an index-1 anchor batch for
+/// `get_fmts_indexes`) to the key service.
 pub trait KeySource {
-    /// Resolve this disc's terminal Unit Keys from this source. An empty `Vec`
-    /// is a genuine "no key here"; `Err` is a source failure.
-    fn get_uk(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error>;
+    /// Resolve this disc's base per-CPS-unit Unit Keys from this source. An empty
+    /// `Vec` is a genuine "no key here"; `Err` is a source failure.
+    fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error>;
+
+    /// Resolve this disc's AACS 2.1 forensic index keys — the per-index keys the
+    /// base Unit Key cannot open (see [`crate::aacs::segment`]) — ordered by
+    /// forensic index (element `i` carries `UnitKey.idx == i`, forensic index
+    /// `i + 1`). The source hands back the COMPLETE set it holds; the caller
+    /// trusts any non-empty result as all of them and never assumes a fixed count.
+    /// Defaults to empty: a source with no forensic material (a plain keydb, the
+    /// mapfile) opts out, and only an FMTS disc's mux ever calls this.
+    fn get_fmts_indexes(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+        Ok(Vec::new())
+    }
 
     /// The AACS host certificate(s) this source can supply for the live-drive
     /// SCSI mutual-auth handshake (the OEM/AACS baseline route). `mkb` is the
@@ -273,7 +297,7 @@ pub fn resolve_and_apply(
 /// [`crate::aacs::trace::ResolutionTrace`] recording, per source, what happened — for
 /// applications to render. ZERO English; the trace is typed enums only.
 ///
-/// One-shot per source: each source's [`KeySource::get_uk`] is called exactly
+/// One-shot per source: each source's [`KeySource::get_unit_keys`] is called exactly
 /// once with a [`DiscInputsCtx`] over `inputs`. Non-empty Unit Keys are mapped
 /// to terminal [`Key::Unit`]s and applied via [`crate::Disc::decrypt_with`],
 /// which validates them against `inputs.samples` and only mutates the disc on
@@ -301,7 +325,7 @@ pub fn resolve_and_apply_traced(
     for source in sources {
         // `who` is the source's own stable identifier — no enum to map back to.
         let who = source.label().to_string();
-        match source.get_uk(&ctx) {
+        match source.get_unit_keys(&ctx) {
             Ok(uks) if !uks.is_empty() => {
                 // Positional index → canonical CPS-unit number (position + 1).
                 let unit_keys: Vec<(u32, [u8; 16])> = uks
@@ -352,7 +376,7 @@ pub fn resolve_and_apply_traced(
 /// decorator re-decrypts with the returned keys, which is the validation.
 pub fn fetch_unit_keys(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
     for source in sources {
-        if let Ok(uks) = source.get_uk(ctx) {
+        if let Ok(uks) = source.get_unit_keys(ctx) {
             if !uks.is_empty() {
                 return uks;
             }
@@ -361,61 +385,92 @@ pub fn fetch_unit_keys(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> 
     Vec::new()
 }
 
-/// Build the read-time key-fetch closure from the disc's public AACS inputs and
-/// a way to (re)build the application's key sources. The decorator calls it with
-/// the still-scrambled unit ciphertext when no held key opens that unit; it runs
-/// [`fetch_unit_keys`] with those bytes as `samples` and returns any keys.
+/// The forensic counterpart to [`fetch_unit_keys`]: drive `sources` in order and
+/// return the first source's non-empty AACS 2.1 forensic index set. `ctx` carries
+/// the index-1 anchor batch (the mux, which owns disc geometry, gathers it and
+/// injects it as the ctx's samples); a source that needs no samples (a keydb
+/// keying on `disc_hash`) ignores them. Whatever the winning source returns —
+/// ≥ 1 key — is trusted as the COMPLETE ordered set; no fixed count is assumed.
+pub fn fetch_fmts_indexes(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
+    for source in sources {
+        if let Ok(uks) = source.get_fmts_indexes(ctx) {
+            if !uks.is_empty() {
+                return uks;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Build the read-time [`crate::sector::KeyFetch`] from the disc's public AACS
+/// inputs and a way to (re)build the application's key sources. The returned
+/// resolver has the two explicit operations the mux and recovery decorator call:
+/// [`unit_keys`](crate::sector::KeyFetch::unit_keys) drives [`fetch_unit_keys`]
+/// (base per-CPS-unit keys), [`fmts_indexes`](crate::sector::KeyFetch::fmts_indexes)
+/// drives [`fetch_fmts_indexes`] (the AACS 2.1 forensic set). Each is handed the
+/// caller's sample batch as the ctx's `samples`, so a source pulls whatever
+/// material it needs.
 ///
-/// One builder, used by every read path (sweep / patch / mux) and by every
-/// consumer (CLI, autorip) — neither application contains the fetch logic, only
-/// its key-source config. Returns a **shared, stateless** [`crate::sector::KeyFetch`]
-/// (`Arc<Fn>`): build it once, clone it into each read path. `make_sources` is
-/// invoked per fetch (the cold path, ~once per CPS unit) so the closure stays
+/// One builder, used by every read path (sweep / patch / mux) and every consumer
+/// (CLI, autorip) — neither application contains the fetch logic, only its
+/// key-source config. Cheap to clone; build once, clone into each read path.
+/// `make_sources` is invoked per fetch (the cold path) so the resolver stays
 /// `Send + Sync` without requiring `KeySource: Send`.
 pub fn key_fetch(
     inputs: DiscInputs,
     make_sources: std::sync::Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>,
 ) -> crate::sector::KeyFetch {
-    // Memoize by the fingerprint of the sample batch. The resolved keys are
-    // disc-level (the same clip's index / CPS keys are identical for every title
-    // that references it), and this one closure is shared across every title's mux
-    // — so the first title resolves a given batch over the network and every later
-    // title (or repeated batch) is answered from the cache with no request. Empty
-    // replies are cached too: a key the service does not have for a batch will not
-    // appear on a re-ask, so re-hitting the network buys nothing.
-    let cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<[u8; 16]>>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    std::sync::Arc::new(move |samples: &[Vec<u8>]| -> Vec<[u8; 16]> {
-        let fp = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            samples.len().hash(&mut h);
-            for s in samples {
-                s.hash(&mut h);
+    // One driver behind both operations: rebuild the sources, inject `samples`
+    // as the ctx's content samples, run `drive` (the per-kind fetch), map the
+    // resolved UnitKeys to raw keys. Memoized by the fingerprint of the sample
+    // batch: the resolved keys are disc-level (a clip's index / CPS keys are
+    // identical for every title that references it), so the first batch resolves
+    // over the network and every repeat is answered from the cache with no
+    // request. Empty replies are cached too — a key the service lacks for a batch
+    // won't appear on a re-ask, so re-hitting the network buys nothing. Each
+    // operation gets its OWN cache: a base batch and a forensic anchor never
+    // collide, and the same bytes could legitimately resolve differently per op.
+    // The per-kind driver: `fetch_unit_keys` or `fetch_fmts_indexes`.
+    type FetchDriver = fn(&[Box<dyn KeySource>], &dyn ResolveCtx) -> Vec<UnitKey>;
+    fn make_op(
+        inputs: DiscInputs,
+        make_sources: std::sync::Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>,
+        drive: FetchDriver,
+    ) -> crate::sector::KeyFetchFn {
+        let cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<[u8; 16]>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        std::sync::Arc::new(move |samples: &[Vec<u8>]| -> Vec<[u8; 16]> {
+            let fp = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                samples.len().hash(&mut h);
+                for s in samples {
+                    s.hash(&mut h);
+                }
+                h.finish()
+            };
+            if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&fp) {
+                return hit.clone();
             }
-            h.finish()
-        };
-        if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&fp) {
-            return hit.clone();
-        }
-        let sources = make_sources();
-        let mut di = inputs.clone();
-        di.samples = samples.to_vec();
-        // Parse Unit_Key_RO.inf at the disc's OWN stride (carried on `inputs`):
-        // an online /decode reply that returns a VUK (not a terminal UK) then
-        // derives unit keys from `enc_title_keys`, which a V10 disc parses at the
-        // 48-byte stride — hardcoding the V20 stride here corrupted them.
-        let ctx = DiscInputsCtx::new(&di);
-        let keys: Vec<[u8; 16]> = fetch_unit_keys(&sources, &ctx)
-            .into_iter()
-            .map(|u| u.key)
-            .collect();
-        cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(fp, keys.clone());
-        keys
-    })
+            let sources = make_sources();
+            let mut di = inputs.clone();
+            di.samples = samples.to_vec();
+            // Parse Unit_Key_RO.inf at the disc's OWN stride (carried on `inputs`):
+            // an online /decode reply that returns a VUK (not a terminal UK) then
+            // derives unit keys from `enc_title_keys`, which a V10 disc parses at
+            // the 48-byte stride — hardcoding the V20 stride here corrupted them.
+            let ctx = DiscInputsCtx::new(&di);
+            let keys: Vec<[u8; 16]> = drive(&sources, &ctx).into_iter().map(|u| u.key).collect();
+            cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(fp, keys.clone());
+            keys
+        })
+    }
+    let unit = make_op(inputs.clone(), make_sources.clone(), fetch_unit_keys);
+    let fmts = make_op(inputs, make_sources, fetch_fmts_indexes);
+    crate::sector::KeyFetch::new(unit, fmts)
 }
 
 /// Read up to `n` ENCRYPTED 6144-byte aligned units from `title`'s body, raw (no
@@ -560,7 +615,7 @@ mod tests {
     fn key_source_host_certs_defaults_to_empty() {
         struct MinimalSource;
         impl KeySource for MinimalSource {
-            fn get_uk(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+            fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
                 Ok(Vec::new())
             }
         }
@@ -617,7 +672,7 @@ mod tests {
     fn trace_who_is_the_source_label_verbatim() {
         struct LabeledSource(&'static str);
         impl KeySource for LabeledSource {
-            fn get_uk(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+            fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
                 Ok(Vec::new())
             }
             fn label(&self) -> &'static str {
@@ -674,19 +729,19 @@ mod tests {
 
     struct EmptySource;
     impl KeySource for EmptySource {
-        fn get_uk(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+        fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
             Ok(Vec::new())
         }
     }
     struct ErroringSource;
     impl KeySource for ErroringSource {
-        fn get_uk(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+        fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
             Err(Error::AacsNoKeys)
         }
     }
     struct HasKey([u8; 16]);
     impl KeySource for HasKey {
-        fn get_uk(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+        fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
             Ok(vec![UnitKey::new(0, self.0)])
         }
     }
@@ -729,7 +784,7 @@ mod tests {
             seen: Arc<Mutex<Vec<Vec<u8>>>>,
         }
         impl KeySource for Probe {
-            fn get_uk(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+            fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
                 if let Ok(s) = ctx.samples(8) {
                     self.seen.lock().unwrap().extend(s);
                 }
@@ -749,7 +804,7 @@ mod tests {
 
         let cb = key_fetch(empty_inputs(), make);
         let samples = vec![vec![0xEEu8; crate::aacs::content::ALIGNED_UNIT_LEN]];
-        let got = cb(&samples);
+        let got = cb.unit_keys(&samples);
         assert_eq!(
             got,
             vec![key],
@@ -761,6 +816,85 @@ mod tests {
             "the failing ciphertext sample is forwarded to the source"
         );
         assert_eq!(*builds.lock().unwrap(), 1, "make_sources invoked per fetch");
+    }
+
+    /// The two `KeyFetch` operations route to the two DISTINCT trait methods:
+    /// `unit_keys` drives `get_unit_keys`, `fmts_indexes` drives
+    /// `get_fmts_indexes`. A source that returns different keys per method proves
+    /// the seam no longer collapses "1 base key" and "the forensic set" into one
+    /// overloaded call — the operation, not the return length, decides which.
+    #[test]
+    fn key_fetch_routes_unit_and_fmts_to_distinct_source_methods() {
+        const BASE: [u8; 16] = [0xB0; 16];
+        const F1: [u8; 16] = [0xF1; 16];
+        const F2: [u8; 16] = [0xF2; 16];
+
+        struct TwoOp;
+        impl KeySource for TwoOp {
+            fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+                Ok(vec![UnitKey::new(0, BASE)])
+            }
+            fn get_fmts_indexes(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+                Ok(vec![UnitKey::new(0, F1), UnitKey::new(1, F2)])
+            }
+        }
+
+        let make: Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync> =
+            Arc::new(|| vec![Box::new(TwoOp) as Box<dyn KeySource>]);
+        let cb = key_fetch(empty_inputs(), make);
+        let samples = vec![vec![0x01u8; 4]];
+
+        assert_eq!(
+            cb.unit_keys(&samples),
+            vec![BASE],
+            "unit_keys resolves the base Unit Key via get_unit_keys"
+        );
+        assert_eq!(
+            cb.fmts_indexes(&samples),
+            vec![F1, F2],
+            "fmts_indexes resolves the forensic set (any length) via get_fmts_indexes"
+        );
+    }
+
+    /// `KeyFetch::unit_only` serves base keys but NEVER a forensic set — the
+    /// contract the sweep/patch recovery decorator relies on (it resolves CPS
+    /// units only). Its `fmts_indexes` is unconditionally empty.
+    #[test]
+    fn key_fetch_unit_only_never_serves_forensic() {
+        let f = crate::sector::KeyFetch::unit_only(std::sync::Arc::new(|_| vec![[0xAA; 16]]));
+        assert_eq!(f.unit_keys(&[vec![0u8; 4]]), vec![[0xAA; 16]]);
+        assert!(
+            f.fmts_indexes(&[vec![0u8; 4]]).is_empty(),
+            "unit_only resolver yields no forensic keys"
+        );
+    }
+
+    /// `get_fmts_indexes` defaults to empty, so a base-only source (a keydb) opts
+    /// out of the forensic path without implementing it. `fetch_fmts_indexes` then
+    /// falls through to the next source, exactly like the unit-key driver.
+    #[test]
+    fn fetch_fmts_indexes_skips_default_optout_source() {
+        struct BaseOnly; // uses the default (empty) get_fmts_indexes
+        impl KeySource for BaseOnly {
+            fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+                Ok(vec![UnitKey::new(0, [0x11; 16])])
+            }
+        }
+        struct Forensic;
+        impl KeySource for Forensic {
+            fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+                Ok(Vec::new())
+            }
+            fn get_fmts_indexes(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+                Ok(vec![UnitKey::new(0, [0x77; 16])])
+            }
+        }
+        let inputs = empty_inputs();
+        let ctx = DiscInputsCtx::new(&inputs);
+        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(BaseOnly), Box::new(Forensic)];
+        let got = fetch_fmts_indexes(&sources, &ctx);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, [0x77; 16], "the base-only source is skipped");
     }
 
     /// #4 regression: encrypted content NOT at the extent midpoint (a late-

@@ -638,19 +638,10 @@ fn resolve_fmts_key_map(
     title: &DiscTitle,
     keys: &mut crate::decrypt::DecryptKeys,
     fetch: Option<&crate::sector::KeyFetch>,
-    _format: ContentFormat,
+    format: ContentFormat,
 ) -> io::Result<Option<crate::decrypt::AacsKeyMap>> {
-    use crate::aacs::content::ALIGNED_UNIT_LEN;
+    use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_encrypted, decrypt_unit, is_clean};
     use crate::aacs::segment::{clip_byte_to_lba, parse_individual_segments};
-
-    // Off by default: while `BYPASS_FMTS_KEY` is set, forensic decode is disabled —
-    // no segment table read, no key-service traffic — and the caller's base-Unit-Key
-    // path applies (the forensic units garble and the demux drops them, the shipped
-    // behaviour). Flip `BYPASS_FMTS_KEY` to false to activate forensic decode once
-    // the index-key resolution is validated end to end.
-    if crate::aacs::segment::BYPASS_FMTS_KEY {
-        return Ok(None);
-    }
 
     // Load the segment map; absent → not an FMTS disc.
     let Ok(udf) = crate::udf::read_filesystem(reader) else {
@@ -684,56 +675,64 @@ fn resolve_fmts_key_map(
             reader.read_sectors(lba, 3, &mut c, false).ok()?;
             Some(c)
         };
-    // ── ONE forensic query. The key service returns ALL forensic index keys for the
-    //    disc in a single response, ORDERED by index (array element i = index i+1).
-    //    So send one clean single-variant batch (a segment's even-phase units) and
-    //    read the whole set back — no per-index probing, no phase measurement, no
-    //    decrypt-and-check: the array position IS the index. The first readable
-    //    segment whose batch yields the full set wins; a short (e.g. 1-key,
-    //    base-UK-shaped) response means that batch wasn't forensic (a wrong
-    //    feature-title mapping), so try the next segment.
+    // ── ANCHOR — fetch the whole 32-key set from ONE index-1 batch. The key
+    //    service returns ALL forensic index keys ordered (element i = index i+1)
+    //    only for a canonical INDEX-1 sample that decrypts under the index-1 key.
+    //    A forensic segment interleaves TWO variants at the aligned-unit level, so
+    //    index-1's real content is one PHASE (even or odd units) and the alternate
+    //    is a different variant that won't decrypt. We don't know the phase a
+    //    priori, so try PHASE A (even) then PHASE B (odd): whichever is index-1's
+    //    content comes back with the full set. Both phases failing (across the
+    //    read-fault fallback over index-1 segments) ⇒ this disc has no FMTS keys.
     //
-    //    ANCHOR RULE: the query MUST sample an INDEX-1 segment. The key service only
-    //    returns the full set for the canonical anchor sample (a unit that decrypts
-    //    under the index-1 key); a batch from any other forensic index is rejected
-    //    (a base-UK-shaped miss). The `index == 1` filter guarantees every batch we
-    //    send is an anchor — and the forensic tag cycles 1..32 in file order, so
-    //    ~1-in-32 segments qualify (~25 across the feature), leaving ample read-fault
-    //    fallback within the `MAX_ANCHOR_ATTEMPTS` budget. ─────────────────────────
-    const N_INDEX: usize = 32;
-    // Each forensic batch carries the server's minimum-samples count (the same
-    // disambiguation floor the online source enforces), drawn as even-phase units
-    // to land one clean variant half.
+    //    The set's SIZE is whatever the source returns (≥ 1) — never assumed. 32
+    //    is all we have seen, but a disc with a different forensic index count is
+    //    not ruled out, so the map is sized to the returned `len()`, not a const.
+    //    ─────────────────────────────────────────────────────────────────────────
+    // Batch size = the key service's minimum-samples floor (same as the online
+    // source), drawn from ONE phase to land a clean single-variant half.
     const BATCH_UNITS: usize = crate::keysource::MIN_SAMPLE_UNITS;
-    // Read-fault fallback budget: how many INDEX-1 (anchor) segments to attempt
-    // before giving up. Only matters when the leading anchor segments are
-    // unreadable; each attempt is one server round-trip, so it is bounded.
+    // Read-fault fallback: how many index-1 segments to attempt if the leading one
+    // is unreadable. The 2 phase requests happen per readable segment.
     const MAX_ANCHOR_ATTEMPTS: usize = 16;
+    // Even units = p*2; odd units = p*2 + 1.
+    let read_phase_batch = |reader: &mut dyn SectorSource,
+                            seg: &crate::aacs::segment::Segment,
+                            phase_off: usize|
+     -> Option<Vec<Vec<u8>>> {
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_UNITS);
+        for p in 0..BATCH_UNITS {
+            batch.push(read_unit(reader, seg, p * 2 + phase_off)?);
+        }
+        Some(batch)
+    };
     let mut index_keys: Vec<[u8; 16]> = Vec::new();
-    for seg in segments
+    'anchor: for seg in segments
         .iter()
         .filter(|s| s.index == 1)
         .take(MAX_ANCHOR_ATTEMPTS)
     {
-        let mut batch: Vec<Vec<u8>> = Vec::new();
-        for p in 0..BATCH_UNITS {
-            if let Some(c) = read_unit(reader, seg, p * 2) {
-                batch.push(c);
+        for phase_off in [0usize, 1usize] {
+            let Some(batch) = read_phase_batch(reader, seg, phase_off) else {
+                continue; // read fault on this phase — try the other / next segment
+            };
+            let fresh = fetch.fmts_indexes(&batch);
+            // Any non-empty reply is the source's COMPLETE ordered forensic set;
+            // trust it and stop. An empty reply = this phase/segment did not anchor.
+            if !fresh.is_empty() {
+                index_keys = fresh;
+                break 'anchor;
             }
         }
-        if batch.len() < BATCH_UNITS {
-            continue; // read fault / short tail
-        }
-        let fresh = fetch(&batch);
-        if fresh.len() >= N_INDEX {
-            index_keys = fresh;
-            break;
-        }
     }
-    tracing::info!(target: "freemkv::keysource", held = index_keys.len(), need = N_INDEX, "fmts: collection done");
-    // The full set is required. Anything short holes the rip — fail loud like a
-    // missing Unit Key rather than emit forensic-holed output.
-    if index_keys.len() < N_INDEX {
+    // The count is whatever the source returned — not a fixed 32. Sized here, used
+    // everywhere below.
+    let n_index = index_keys.len();
+    tracing::info!(target: "freemkv::keysource", held = n_index, "fmts: collection done");
+    // At least one forensic index key is required. None ⇒ no FMTS key for this
+    // disc from any source — fail loud like a missing Unit Key rather than emit
+    // forensic-holed output.
+    if index_keys.is_empty() {
         return Err(crate::error::Error::FmtsKeyMissing.into());
     }
 
@@ -742,7 +741,7 @@ fn resolve_fmts_key_map(
     let base_idx = 0usize;
     let mut tag_slot: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
     if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
-        for (i, k) in index_keys.iter().take(N_INDEX).enumerate() {
+        for (i, k) in index_keys.iter().enumerate() {
             let tag = (i + 1) as u16;
             let slot = match unit_keys.iter().position(|(_, h)| h == k) {
                 Some(s) => s,
@@ -758,21 +757,64 @@ fn resolve_fmts_key_map(
         }
     }
 
-    // ── Build the per-segment LBA ranges directly from the tag. Each segment is
-    //    decoded from its TAG half: the map routes the segment's whole span to its
-    //    tag's key; the tag key opens the tag half wherever it interleaves, and the
-    //    un-served version-B half — decrypted with that (for it, wrong) key —
-    //    garbles and the demux drops it, leaving one clean variant per span. No
-    //    re-read and no phase needed here: byte-5 `seg.index` selects the key. A
-    //    segment whose tag is somehow absent (cannot happen with all 32 held) or
-    //    that straddles an extent boundary is left unmapped and tallied. ─────────
-    let mut ranges: Vec<(u32, u32, usize)> = Vec::with_capacity(segments.len());
+    // ── PROBE each index's phase. A forensic segment interleaves two variants at
+    //    the aligned-unit level; only ONE parity is this index's real content (the
+    //    other is the alternate variant — a different key, garbles under ours). For
+    //    each index, read a representative tagged segment and count clean decrypts
+    //    of its EVEN vs ODD units under that index's key: the clean half is the
+    //    index's phase. This is the ONE place `is_clean` runs — "the map must be
+    //    right", verified here, once — so the mux decrypt can then trust the map.
+    //    Phase is per-index and shared by every segment carrying that index. ──────
+    let mut phase_of_index: std::collections::HashMap<u16, crate::decrypt::Phase> =
+        std::collections::HashMap::new();
+    for (i, k) in index_keys.iter().enumerate() {
+        let tag = (i + 1) as u16;
+        let Some(seg) = segments.iter().find(|s| s.index == tag) else {
+            continue; // no segment carries this index on this feature — skip
+        };
+        let (mut even, mut odd) = (0usize, 0usize);
+        for p in 0..BATCH_UNITS {
+            for (phase_off, counter) in [(0usize, &mut even), (1usize, &mut odd)] {
+                if let Some(mut c) = read_unit(reader, seg, p * 2 + phase_off) {
+                    if aacs_unit_encrypted(&c, format) {
+                        decrypt_unit(&mut c, k);
+                        if is_clean(&c, format) {
+                            *counter += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let phase = match even.cmp(&odd) {
+            std::cmp::Ordering::Greater => crate::decrypt::Phase::Even,
+            std::cmp::Ordering::Less => crate::decrypt::Phase::Odd,
+            std::cmp::Ordering::Equal => {
+                // Neither half decrypts clean under this index's key: the map would
+                // be wrong. Fail loud rather than emit a broken segment map.
+                tracing::warn!(target: "freemkv::keysource", index = tag, even, odd, "fmts: no clean phase under index key — refusing broken map");
+                return Err(crate::error::Error::FmtsKeyMissing.into());
+            }
+        };
+        phase_of_index.insert(tag, phase);
+    }
+
+    // ── Build the per-segment LBA ranges: each forensic segment → its tag's key
+    //    AND its index's phase. The mapped decrypt opens only that half and leaves
+    //    the alternate as ciphertext (the muxer drops untouched ciphertext) —
+    //    clean by construction, no garble. A segment straddling an extent boundary
+    //    is left unmapped and tallied (a hard failure below). ────────────────────
+    let mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)> =
+        Vec::with_capacity(segments.len());
     let mut unresolved = 0usize;
     for seg in &segments {
         let Some(&slot) = tag_slot.get(&seg.index) else {
             unresolved += 1;
             continue;
         };
+        let phase = phase_of_index
+            .get(&seg.index)
+            .copied()
+            .unwrap_or(crate::decrypt::Phase::All);
         let start_byte = seg.start_spn as u64 * 192;
         let end_byte = (seg.end_spn as u64 + 1) * 192;
         let (Some(a), Some(b)) = (
@@ -785,20 +827,19 @@ fn resolve_fmts_key_map(
         // Only emit a contiguous within-extent range (segments are ~480 KB; a rare
         // extent-straddle is left unresolved rather than given a wrong span).
         if b >= a && (b - a) as u64 == (end_byte - 1 - start_byte) / 2048 {
-            ranges.push((a, b + 1, slot));
+            ranges.push((a, b + 1, slot, phase));
         } else {
             unresolved += 1;
         }
     }
     // Every forensic segment must map to an index key. Any that did not is a hole
     // in the rip — with the full 32-key set in hand this should never happen, so
-    // treat it as a hard failure (a read fault or an unexpected on-disc layout)
-    // rather than silently emitting a segment the base Unit Key only garbles.
+    // treat it as a hard failure rather than silently emitting a garbled segment.
     if unresolved != 0 {
         return Err(crate::error::Error::FmtsKeyMissing.into());
     }
 
-    Ok(Some(crate::decrypt::AacsKeyMap::from_ranges(
+    Ok(Some(crate::decrypt::AacsKeyMap::from_ranges_phased(
         ranges, base_idx,
     )))
 }
@@ -826,7 +867,7 @@ pub fn resolve_mux_key_map(
         if let Some(f) = fetch {
             let samples = crate::keysource::read_encrypted_units(reader, title, 8);
             if !samples.is_empty() {
-                let fresh = f(&samples);
+                let fresh = f.unit_keys(&samples);
                 if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
                     for k in fresh {
                         if !unit_keys.iter().any(|(_, h)| *h == k) {
@@ -916,7 +957,7 @@ pub fn resolve_mux_key_map(
         if idx.is_none() {
             if let Some(f) = fetch {
                 if !samples.is_empty() {
-                    let fresh = f(&samples);
+                    let fresh = f.unit_keys(&samples);
                     if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
                         for k in fresh {
                             if !unit_keys.iter().any(|(_, h)| *h == k) {
