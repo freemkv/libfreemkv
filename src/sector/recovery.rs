@@ -170,7 +170,7 @@ fn aacs_fetch_step(
         return prev_dropped;
     }
     *calls += 1;
-    let fresh = (fetch)(&samples);
+    let fresh = fetch.unit_keys(&samples);
     // Add only keys we don't already hold (dedup by value).
     let mut added = 0usize;
     if let DecryptKeys::Aacs { unit_keys, .. } = keys {
@@ -276,11 +276,11 @@ mod tests {
         // decorator's integration tests); here we pin the seam's key-plumbing.
         let calls = Arc::new(AtomicUsize::new(0));
         let c2 = Arc::clone(&calls);
-        let fetch: KeyFetch = Arc::new(move |samples: &[Vec<u8>]| {
+        let fetch: KeyFetch = KeyFetch::unit_only(Arc::new(move |samples: &[Vec<u8>]| {
             c2.fetch_add(1, Ordering::SeqCst);
             assert!(!samples.is_empty(), "failing ciphertext is forwarded");
             vec![[0xAB; 16]]
-        });
+        }));
         let mut r = key_fetch(fetch);
         let mut buf = scrambled_unit(0x33);
         let mut keys = DecryptKeys::Aacs {
@@ -304,10 +304,10 @@ mod tests {
         // the SAME ciphertext must not call the fetch again.
         let calls = Arc::new(AtomicUsize::new(0));
         let c2 = Arc::clone(&calls);
-        let fetch: KeyFetch = Arc::new(move |_: &[Vec<u8>]| {
+        let fetch: KeyFetch = KeyFetch::unit_only(Arc::new(move |_: &[Vec<u8>]| {
             c2.fetch_add(1, Ordering::SeqCst);
             Vec::new() // never helps
-        });
+        }));
         let mut r = key_fetch(fetch);
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![],
@@ -331,10 +331,10 @@ mod tests {
     fn key_fetch_call_budget_bounds_fetches() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c2 = Arc::clone(&calls);
-        let fetch: KeyFetch = Arc::new(move |_: &[Vec<u8>]| {
+        let fetch: KeyFetch = KeyFetch::unit_only(Arc::new(move |_: &[Vec<u8>]| {
             c2.fetch_add(1, Ordering::SeqCst);
             Vec::new()
-        });
+        }));
         let mut r = key_fetch(fetch);
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![],

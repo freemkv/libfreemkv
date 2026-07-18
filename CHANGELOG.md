@@ -1,5 +1,47 @@
 # Changelog
 
+## [1.4.4] — 2026-07-17
+
+### Fixed
+
+- **Online key requests are no longer silently dropped on discs that yield few
+  sample units.** The online key source refuses any request carrying fewer than
+  `MIN_SAMPLE_UNITS` (8) encrypted-content samples — too few can match an
+  incidental unit rather than the one asked about (a false positive, most acute on
+  AACS 2.1 forensic-variant content). autorip gathered only 4, so every online
+  lookup was skipped before it ever reached the key service and surfaced to the
+  user as "key service down." autorip's sample count is now tied to
+  `MIN_SAMPLE_UNITS` with a **compile-time floor**, so it can never regress below
+  the minimum again.
+
+### Changed
+
+- **The online request is assembled from a proven-sufficient sample set.** New
+  `DecodeSampleSet` (`libfreemkv::keysource`) wraps the content-unit samples and
+  can only be constructed with at least `MIN_SAMPLE_UNITS` of them — so an online
+  key request cannot be built from too few samples. The minimum is validated once,
+  at construction, rather than by a runtime check a caller could forget.
+
+## [1.4.3] — 2026-07-17
+
+### Changed
+
+- **`MIN_SAMPLE_UNITS` moved to the base crate.** The minimum sample count an
+  online key request must carry now has a single definition in
+  `libfreemkv::keysource`; `freemkv-keysources` re-exports it, so the online source
+  and libfreemkv's own forensic query size their requests from one shared value.
+- **The online unit-key reply is parsed as a list.** A response carries either a
+  single Unit Key (ordinary disc) or the full ordered set (an AACS 2.1
+  forensic-variant disc); the client accepts both and maps array position to
+  forensic index.
+
+### Added
+
+- **Forensic-variant online query samples the anchor segment.** On an AACS 2.1
+  forensic-variant disc the online key query draws its sample from the first
+  forensic segment (index 1) — one canonical, deterministic sample — instead of an
+  arbitrary segment.
+
 ## [1.4.2] — 2026-07-15
 
 ### Fixed

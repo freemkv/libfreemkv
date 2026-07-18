@@ -976,7 +976,7 @@ mod tests {
     /// A minimal in-test KeySource that yields no keys but a fixed cert list.
     struct CertSource(Vec<aacs::types::HostCert>);
     impl crate::KeySource for CertSource {
-        fn get_uk(
+        fn get_unit_keys(
             &self,
             _ctx: &dyn crate::keysource::ResolveCtx,
         ) -> Result<Vec<crate::aacs::types::UnitKey>> {

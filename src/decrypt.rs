@@ -191,9 +191,23 @@ impl DecryptKeys {
 /// sorted and disjoint. `default_idx` covers any LBA no range claims — the
 /// single-CPS case is just an empty range list with `default_idx = 0`, so the
 /// common disc pays zero lookup cost and needs no structural walk.
+/// Which aligned units of a range a key decrypts. AACS 2.1 FMTS forensic segments
+/// interleave TWO variants at the unit level; `Even`/`Odd` selects the variant's
+/// half (parity of the unit's index within the segment) and the ALTERNATE half is
+/// left untouched (ciphertext) for the muxer to drop. Every non-forensic range —
+/// the base Unit Key, a multi-CPS unit — is `All` (decrypt every unit), so the
+/// common disc is byte-for-byte unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    All,
+    Even,
+    Odd,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AacsKeyMap {
-    ranges: Vec<(u32, u32, usize)>,
+    // (start_lba, end_lba, key_idx, phase)
+    ranges: Vec<(u32, u32, usize, Phase)>,
     default_idx: usize,
 }
 
@@ -207,43 +221,68 @@ impl AacsKeyMap {
         }
     }
 
-    /// Build from explicit `[start_lba, end_lba) → key_idx` ranges (multi-CPS /
-    /// FMTS). Ranges are sorted; `default_idx` answers any uncovered LBA.
-    pub fn from_ranges(mut ranges: Vec<(u32, u32, usize)>, default_idx: usize) -> Self {
-        ranges.sort_by_key(|&(start, _, _)| start);
+    /// Build from `[start_lba, end_lba) → key_idx` ranges that decrypt EVERY unit
+    /// (multi-CPS): each range is [`Phase::All`]. `default_idx` answers any
+    /// uncovered LBA. Byte-for-byte identical behaviour to before phases existed.
+    pub fn from_ranges(ranges: Vec<(u32, u32, usize)>, default_idx: usize) -> Self {
+        let phased = ranges
+            .into_iter()
+            .map(|(s, e, i)| (s, e, i, Phase::All))
+            .collect();
+        Self::from_ranges_phased(phased, default_idx)
+    }
+
+    /// Build a PHASE-AWARE map (FMTS): each range carries which unit-parity its key
+    /// opens ([`Phase::Even`]/[`Phase::Odd`] for a forensic segment, [`Phase::All`]
+    /// for base/CPS). Ranges are sorted; `default_idx` answers any uncovered LBA.
+    pub fn from_ranges_phased(
+        mut ranges: Vec<(u32, u32, usize, Phase)>,
+        default_idx: usize,
+    ) -> Self {
+        ranges.sort_by_key(|&(start, _, _, _)| start);
         Self {
             ranges,
             default_idx,
         }
     }
 
-    /// The unit-key index to decrypt the aligned unit at `lba` with. O(log n) —
-    /// the last range whose start is `<= lba` and whose end is `> lba`, else the
-    /// default. Cheap enough to call per aligned unit on the mux hot path.
-    pub fn key_idx_for(&self, lba: u32) -> usize {
+    /// The `(key_idx, phase, range_start_lba)` for the aligned unit at `lba`.
+    /// O(log n) — the last range whose start is `<= lba` and whose end is `> lba`,
+    /// else `(default_idx, All, 0)`. `range_start_lba` lets the mapped decrypt
+    /// compute a unit's parity WITHIN a forensic segment (for `Even`/`Odd`).
+    pub fn entry_for(&self, lba: u32) -> (usize, Phase, u32) {
         if self.ranges.is_empty() {
-            return self.default_idx;
+            return (self.default_idx, Phase::All, 0);
         }
         match self
             .ranges
-            .binary_search_by(|&(start, _, _)| start.cmp(&lba))
+            .binary_search_by(|&(start, _, _, _)| start.cmp(&lba))
         {
-            Ok(i) => self.ranges[i].2,
-            Err(0) => self.default_idx,
+            Ok(i) => {
+                let (start, _, idx, ph) = self.ranges[i];
+                (idx, ph, start)
+            }
+            Err(0) => (self.default_idx, Phase::All, 0),
             Err(i) => {
-                let (start, end, idx) = self.ranges[i - 1];
+                let (start, end, idx, ph) = self.ranges[i - 1];
                 if lba >= start && lba < end {
-                    idx
+                    (idx, ph, start)
                 } else {
-                    self.default_idx
+                    (self.default_idx, Phase::All, 0)
                 }
             }
         }
     }
 
-    /// The `[start_lba, end_lba) → key_idx` ranges (sorted, disjoint). Empty for a
-    /// single-CPS map (everything uses [`default_idx`](Self::default_idx)).
-    pub fn ranges(&self) -> &[(u32, u32, usize)] {
+    /// The unit-key index for the aligned unit at `lba` (phase-agnostic; see
+    /// [`entry_for`](Self::entry_for) for the phase). Cheap per-unit hot-path call.
+    pub fn key_idx_for(&self, lba: u32) -> usize {
+        self.entry_for(lba).0
+    }
+
+    /// The `[start_lba, end_lba) → (key_idx, phase)` ranges (sorted, disjoint).
+    /// Empty for a single-CPS map (everything uses [`default_idx`](Self::default_idx)).
+    pub fn ranges(&self) -> &[(u32, u32, usize, Phase)] {
         &self.ranges
     }
 
@@ -256,7 +295,7 @@ impl AacsKeyMap {
     /// title actually reaches. Used by the resolver to know which keys to secure
     /// up front.
     pub fn key_indices(&self) -> Vec<usize> {
-        let mut v: Vec<usize> = self.ranges.iter().map(|&(_, _, i)| i).collect();
+        let mut v: Vec<usize> = self.ranges.iter().map(|&(_, _, i, _)| i).collect();
         v.push(self.default_idx);
         v.sort_unstable();
         v.dedup();
@@ -305,24 +344,46 @@ pub fn decrypt_sectors_mapped(
         }
     }
 
+    // Cheap safety net for the "map must be right" model: with a correct
+    // phase-aware map, every CORRECT-PHASE forensic unit decrypts to clean TS, so
+    // this never fires in the happy path — but a map bug (wrong phase/key for a
+    // segment) surfaces as a loud DecryptFailed instead of silent corruption. Only
+    // forensic (Even/Odd) ranges are verified; base / multi-CPS (All) stays
+    // trust-only, so the common disc is byte-for-byte unchanged.
+    let verify_failed = std::sync::atomic::AtomicBool::new(false);
+
     let decrypt_one = |idx_in_buf: usize, chunk: &mut [u8]| {
         if chunk.len() != unit_len {
             return; // trailing partial unit: clear tail on disc, leave as-is
         }
-        // Gate on the authoritative encrypted flag ONLY (the CPI bits in the clear
-        // seed) — no `is_clean`. A clear unit (flag unset) is left untouched; an
-        // encrypted unit is decrypted with its MAPPED key and trusted.
+        let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
+        let (key_idx, phase, range_start) = map.entry_for(unit_lba);
+        // PHASE GATE (FMTS forensic segment): the segment interleaves two variants
+        // at the unit level. Decrypt ONLY our parity; leave the alternate half as
+        // ciphertext (the muxer drops untouched ciphertext cleanly — no garble).
+        if matches!(phase, Phase::Even | Phase::Odd) {
+            let unit_ix = (unit_lba - range_start) / unit_sectors;
+            let is_odd = unit_ix % 2 == 1;
+            if is_odd != matches!(phase, Phase::Odd) {
+                return; // alternate half — leave as-is
+            }
+        }
+        // Gate on the authoritative encrypted flag ONLY (CPI bits in the clear
+        // seed): a clear unit is left untouched; an encrypted unit is decrypted
+        // with its MAPPED key and trusted.
         if !aacs::content::aacs_unit_encrypted(chunk, format) {
             return;
         }
-        let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
-        let key_idx = map.key_idx_for(unit_lba);
         // Bounds already proven above; index directly.
         let key = &unit_keys[key_idx].1;
         if let Some(ref rdk_key) = rdk {
             aacs::content::decrypt_bus(chunk, rdk_key);
         }
         aacs::content::decrypt_unit(chunk, key);
+        // Correct-phase forensic verify (silent unless the map is wrong).
+        if matches!(phase, Phase::Even | Phase::Odd) && !aacs::content::is_clean(chunk, format) {
+            verify_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     };
 
     let nthreads = decrypt_threads();
@@ -344,6 +405,9 @@ pub fn decrypt_sectors_mapped(
                 }
             }
         }
+    }
+    if verify_failed.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crate::error::Error::DecryptFailed);
     }
     Ok(())
 }
@@ -1474,6 +1538,116 @@ mod tests {
             off += 192;
         }
         unit
+    }
+
+    // ── FMTS phase-aware map ──────────────────────────────────────────────────
+
+    /// `entry_for` returns (idx, phase, range_start); `from_ranges` is All,
+    /// `from_ranges_phased` carries the phase; uncovered → (default, All, 0).
+    #[test]
+    fn aacskeymap_phase_entry_for() {
+        let all = AacsKeyMap::from_ranges(vec![(100, 200, 3)], 0);
+        assert_eq!(all.entry_for(150), (3, Phase::All, 100));
+        assert_eq!(all.entry_for(50), (0, Phase::All, 0));
+
+        let phased = AacsKeyMap::from_ranges_phased(vec![(100, 200, 3, Phase::Odd)], 7);
+        assert_eq!(phased.entry_for(150), (3, Phase::Odd, 100));
+        assert_eq!(phased.entry_for(250), (7, Phase::All, 0));
+        assert_eq!(phased.key_idx_for(150), 3);
+    }
+
+    /// Phase::Even → only even-index units in the range are decrypted; the odd
+    /// (alternate variant) half is left BYTE-FOR-BYTE as ciphertext for the muxer.
+    #[test]
+    fn mapped_phase_even_decrypts_even_leaves_odd_ciphertext() {
+        use crate::disc::ContentFormat;
+        let key_a = [0xAAu8; 16];
+        let key_b = [0xBBu8; 16];
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let usz = (ul / 2048) as u32;
+        let mut buf = vec![0u8; 8 * ul];
+        let mut odd_cipher = Vec::new();
+        for i in 0..8 {
+            let mut u = clear_ts_unit();
+            aacs_encrypt_unit_for_test(&mut u, if i % 2 == 0 { &key_a } else { &key_b });
+            if i % 2 == 1 {
+                odd_cipher.push(u.clone());
+            }
+            buf[i * ul..(i + 1) * ul].copy_from_slice(&u);
+        }
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 8 * usz, 0, Phase::Even)], 0);
+        decrypt_sectors_mapped(&mut buf, &keys, 0, &map).expect("even phase decrypts clean");
+        for i in 0..8 {
+            let u = &buf[i * ul..(i + 1) * ul];
+            if i % 2 == 0 {
+                assert!(
+                    aacs::content::is_clean(u, ContentFormat::BdTs),
+                    "even unit {i} decrypted to clean TS"
+                );
+            } else {
+                assert_eq!(
+                    u,
+                    odd_cipher[i / 2].as_slice(),
+                    "odd unit {i} left as ciphertext"
+                );
+            }
+        }
+    }
+
+    /// The correct-phase safety `is_clean` fires loud: an even unit whose mapped
+    /// key is wrong does NOT come clean → `DecryptFailed` (not silent corruption).
+    #[test]
+    fn mapped_phase_verify_fails_loud_on_wrong_key() {
+        use crate::disc::ContentFormat;
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let usz = (ul / 2048) as u32;
+        let mut buf = vec![0u8; 2 * ul];
+        let mut u0 = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut u0, &[0xAAu8; 16]); // encrypted under A
+        buf[..ul].copy_from_slice(&u0);
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xCCu8; 16])], // map slot points at the WRONG key
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 2 * usz, 0, Phase::Even)], 0);
+        assert!(matches!(
+            decrypt_sectors_mapped(&mut buf, &keys, 0, &map),
+            Err(crate::error::Error::DecryptFailed)
+        ));
+    }
+
+    /// Phase::All (multi-CPS / base) decrypts EVERY unit and never runs the verify
+    /// — the common-disc path is byte-for-byte unchanged.
+    #[test]
+    fn mapped_all_phase_decrypts_every_unit() {
+        use crate::disc::ContentFormat;
+        let key = [0x11u8; 16];
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let mut buf = vec![0u8; 4 * ul];
+        for i in 0..4 {
+            let mut u = clear_ts_unit();
+            aacs_encrypt_unit_for_test(&mut u, &key);
+            buf[i * ul..(i + 1) * ul].copy_from_slice(&u);
+        }
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        decrypt_sectors_mapped(&mut buf, &keys, 0, &AacsKeyMap::single(0))
+            .expect("all-phase decrypts");
+        for i in 0..4 {
+            assert!(
+                aacs::content::is_clean(&buf[i * ul..(i + 1) * ul], ContentFormat::BdTs),
+                "unit {i} decrypted (All)"
+            );
+        }
     }
 
     /// A unit encrypted under unit_keys[1] (the second CPS unit) on a

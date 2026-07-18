@@ -28,14 +28,67 @@ use super::SectorSource;
 /// empty if the source can't help. Mirrors the DVD model (try the held key,
 /// then ask the key source for the failing data) generalised to AACS.
 ///
-/// The library performs NO key lookup or network I/O itself; this closure is
-/// the seam an application uses to call its key source (e.g. an online key
-/// service) with the exact ciphertext that failed. A **stateless, shared**
-/// `Arc<Fn>` — the decorator owns the only mutable state (its call-count cap and
-/// spent flag), so one closure is built once and cloned cheaply into every read
-/// path (sweep / patch / mux); no per-decorator factory is needed. `Send + Sync`
+/// The library performs NO key lookup or network I/O itself; this is the seam an
+/// application uses to call its key source (e.g. an online key service) with the
+/// exact ciphertext that failed.
+///
+/// TWO explicit operations, so the "one base key vs a whole forensic set"
+/// contract lives in the type instead of a caller guessing at the return length:
+///
+/// * [`unit_keys`](Self::unit_keys) — the base Unit Key(s) for a CPS unit, from
+///   real encrypted samples drawn from it. The non-forensic path: one key per CPS
+///   unit (the pool grows by whatever it returns). Used by the mux's base /
+///   multi-CPS map resolution AND by the sweep/patch recovery decorator.
+/// * [`fmts_indexes`](Self::fmts_indexes) — the disc's AACS 2.1 forensic index
+///   keys, from an index-1 single-phase anchor batch. The source hands back the
+///   COMPLETE set (ordered index 1..N); the caller sizes the forensic map to
+///   `len()` and never assumes a fixed N (32 is all we've seen, but the contract
+///   is "whatever the source returns, ≥ 1, is all of them").
+///
+/// A **stateless, shared** pair of `Arc<Fn>` — the decorator owns the only
+/// mutable state (its call-count cap and spent flag), so one `KeyFetch` is built
+/// once and cloned cheaply (two `Arc` bumps) into every read path. `Send + Sync`
 /// so it can ride the mux highway's producer thread.
-pub type KeyFetch = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Vec<[u8; 16]> + Send + Sync>;
+/// A closure resolving keys from encrypted-content samples — the shape of both
+/// [`KeyFetch`] operations. Named so the two constructors (and the struct fields)
+/// read clearly.
+pub type KeyFetchFn = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Vec<[u8; 16]> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct KeyFetch {
+    unit: KeyFetchFn,
+    fmts: KeyFetchFn,
+}
+
+impl KeyFetch {
+    /// Build a resolver from its two operations: `unit` resolves base Unit Keys
+    /// from a CPS unit's samples; `fmts` resolves the forensic index set from an
+    /// index-1 anchor batch.
+    pub fn new(unit: KeyFetchFn, fmts: KeyFetchFn) -> Self {
+        Self { unit, fmts }
+    }
+
+    /// A resolver that serves ONLY base Unit Keys; [`fmts_indexes`](Self::fmts_indexes)
+    /// is always empty. For read paths that never resolve forensic keys — the
+    /// sweep/patch recovery decorator, which handles CPS units only.
+    pub fn unit_only(unit: KeyFetchFn) -> Self {
+        Self::new(unit, std::sync::Arc::new(|_| Vec::new()))
+    }
+
+    /// Resolve the base Unit Key(s) for a CPS unit from `samples` (real encrypted
+    /// units drawn from it). Normally one key; the caller adds whatever it returns
+    /// to the pool.
+    pub fn unit_keys(&self, samples: &[Vec<u8>]) -> Vec<[u8; 16]> {
+        (self.unit)(samples)
+    }
+
+    /// Resolve the disc's AACS 2.1 forensic index keys from an index-1 single-
+    /// phase `anchor` batch. The source returns the COMPLETE ordered set (index i
+    /// = element i); the caller trusts any non-empty result as all of them.
+    pub fn fmts_indexes(&self, anchor: &[Vec<u8>]) -> Vec<[u8; 16]> {
+        (self.fmts)(anchor)
+    }
+}
 
 /// Decorator: read from `inner`, then run the configured
 /// AACS / CSS decrypt over the bytes that landed in `buf`.
@@ -1167,10 +1220,11 @@ mod tests {
         // Capture what the callback was handed, and how many times it fired.
         let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_cb = Arc::clone(&seen);
-        let fetch: super::KeyFetch = std::sync::Arc::new(move |samples: &[Vec<u8>]| {
-            seen_cb.lock().unwrap().extend_from_slice(samples);
-            vec![real_key]
-        });
+        let fetch: super::KeyFetch =
+            super::KeyFetch::unit_only(std::sync::Arc::new(move |samples: &[Vec<u8>]| {
+                seen_cb.lock().unwrap().extend_from_slice(samples);
+                vec![real_key]
+            }));
 
         let mut wrapped = DecryptingSectorSource::new(
             EncUnitSource { unit: unit.clone() },
@@ -1251,10 +1305,11 @@ mod tests {
 
         let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_cb = Arc::clone(&seen);
-        let fetch: super::KeyFetch = std::sync::Arc::new(move |samples: &[Vec<u8>]| {
-            seen_cb.lock().unwrap().extend_from_slice(samples);
-            Vec::new() // service has nothing for the orphan — forces the sampling path
-        });
+        let fetch: super::KeyFetch =
+            super::KeyFetch::unit_only(std::sync::Arc::new(move |samples: &[Vec<u8>]| {
+                seen_cb.lock().unwrap().extend_from_slice(samples);
+                Vec::new() // service has nothing for the orphan — forces the sampling path
+            }));
 
         let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(0u32, 6u32)]);
         let mut dec = DecryptingSectorSource::new(
@@ -1337,14 +1392,15 @@ mod tests {
         let unit_b_cb = unit_b.clone();
         let calls = Arc::new(Mutex::new(0usize));
         let calls_cb = Arc::clone(&calls);
-        let fetch: super::KeyFetch = std::sync::Arc::new(move |samples: &[Vec<u8>]| {
-            *calls_cb.lock().unwrap() += 1;
-            if samples.iter().any(|s| *s == unit_b_cb) {
-                vec![key_b]
-            } else {
-                vec![]
-            }
-        });
+        let fetch: super::KeyFetch =
+            super::KeyFetch::unit_only(std::sync::Arc::new(move |samples: &[Vec<u8>]| {
+                *calls_cb.lock().unwrap() += 1;
+                if samples.iter().any(|s| *s == unit_b_cb) {
+                    vec![key_b]
+                } else {
+                    vec![]
+                }
+            }));
 
         let mut wrapped = DecryptingSectorSource::new(
             AltSource {
@@ -1478,13 +1534,14 @@ mod tests {
 
         let calls = Arc::new(Mutex::new(0usize));
         let calls_cb = Arc::clone(&calls);
-        let fetch: super::KeyFetch = std::sync::Arc::new(move |samples: &[Vec<u8>]| {
-            *calls_cb.lock().unwrap() += 1;
-            // The closure is handed the still-scrambled on-disc ciphertext.
-            assert!(!samples.is_empty(), "fetch receives the failing units");
-            assert_eq!(samples[0].len(), crate::aacs::content::ALIGNED_UNIT_LEN);
-            vec![real_key]
-        });
+        let fetch: super::KeyFetch =
+            super::KeyFetch::unit_only(std::sync::Arc::new(move |samples: &[Vec<u8>]| {
+                *calls_cb.lock().unwrap() += 1;
+                // The closure is handed the still-scrambled on-disc ciphertext.
+                assert!(!samples.is_empty(), "fetch receives the failing units");
+                assert_eq!(samples[0].len(), crate::aacs::content::ALIGNED_UNIT_LEN);
+                vec![real_key]
+            }));
 
         let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(0u32, 6u32)]); // LBA 0..6 content
         let mut dec = DecryptingSectorSource::new(
@@ -1563,10 +1620,11 @@ mod tests {
         let unit = encrypt_aacs_unit(&real_key);
         let calls = Arc::new(Mutex::new(0usize));
         let calls_cb = Arc::clone(&calls);
-        let fetch: super::KeyFetch = std::sync::Arc::new(move |_: &[Vec<u8>]| {
-            *calls_cb.lock().unwrap() += 1;
-            vec![real_key]
-        });
+        let fetch: super::KeyFetch =
+            super::KeyFetch::unit_only(std::sync::Arc::new(move |_: &[Vec<u8>]| {
+                *calls_cb.lock().unwrap() += 1;
+                vec![real_key]
+            }));
         // Content lives far away; LBA 0 is "filesystem".
         let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(1002u32, 99u32)]);
         let mut dec = DecryptingSectorSource::new(
