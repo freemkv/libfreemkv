@@ -108,9 +108,10 @@ pub(crate) mod tsmux;
 #[allow(dead_code)]
 pub(crate) mod videomap;
 
-pub use demux_sink::{ChaptersFmt, DelayMode, DemuxOptions, DemuxSink, Naming};
+// `demux://` and `fvi://` sinks are constructed internally by `output()` via the
+// direct `super::demux_sink::` / `super::fvi_sink::` paths — no re-export needed,
+// and no consumer names these types, so they are not public API.
 pub use disc::DiscStream;
-pub use fvi_sink::FviSink;
 pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
 pub use network::NetworkStream;

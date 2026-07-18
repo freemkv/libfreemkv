@@ -31,6 +31,10 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Filename-naming strategy for the per-track files.
+// `allow(dead_code)`: the sink honours all variants, but only the `#[default]` is
+// constructed today (`output()` builds `DemuxOptions::default()`). The alternates
+// are a staged option surface awaiting the CLI `--naming` flag (not yet wired).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Naming {
     /// `<base> <track> <lang> <codec> [DELAY <n>ms].<ext>` — human-readable.
@@ -55,6 +59,9 @@ pub enum DelayMode {
 }
 
 /// Chapter export format.
+// `allow(dead_code)`: only the `#[default]` XML variant is constructed today (via
+// `DemuxOptions::default()`); OGM/Both await the CLI `--chapters` flag.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChaptersFmt {
     /// mkvmerge chapter XML.

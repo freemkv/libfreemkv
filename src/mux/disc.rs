@@ -139,14 +139,14 @@ pub struct DiscStream {
     // Adaptive batch sizer — preferred comes from the caller
     // (detect_max_batch_sectors), shrinks/grows based on read outcomes.
     adaptive: AdaptiveBatch,
-    pub errors: u64,
+    errors: u64,
     /// Cumulative bytes actually skipped (zero-filled) on read error.
     /// Distinct from `errors`, which counts skip *events*: one event can
     /// cover a whole AACS unit (`unit_align` sectors = 6144 bytes), so
     /// `errors * 2048` understates real loss by the alignment factor.
     /// Consumers estimating lost video time must scale by this, not by
     /// the event count.
-    pub lost_bytes: u64,
+    lost_bytes: u64,
     pub skip_errors: bool,
     /// When set and the token is cancelled, fill_extents returns Err(Halted)
     /// at the next retry boundary. Unlike skip_errors, this propagates the

@@ -683,7 +683,10 @@ fn range_chapter(lba: u32, title: &DiscTitle) -> (Option<u32>, Option<f64>) {
 /// This is the single place range→chapter/time annotation happens; autorip used
 /// to own it and read the mapfile to do so. Now the library computes it from
 /// its in-memory mapfile + title, and the client renders the result verbatim.
-pub fn locate_ranges(raw: &[(u64, u64)], title: &DiscTitle) -> crate::progress::LocatedProgress {
+pub(crate) fn locate_ranges(
+    raw: &[(u64, u64)],
+    title: &DiscTitle,
+) -> crate::progress::LocatedProgress {
     use crate::consts::{MILLIS_PER_SEC, SECTOR_BYTES_U64};
     use crate::progress::{LocatedProgress, LocatedRange};
     const MAX_LOCATED: usize = 50;
@@ -2424,7 +2427,7 @@ impl Disc {
     ///
     /// Empty when the disc has no parsed titles (CSS / unencrypted / unscanned);
     /// callers treat an empty map as "no content gate" and fall back accordingly.
-    pub fn encrypted_content_ranges(&self) -> Vec<(u32, u32)> {
+    pub(crate) fn encrypted_content_ranges(&self) -> Vec<(u32, u32)> {
         merged_extents(self.titles.iter().flat_map(|t| &t.extents))
     }
 
@@ -2432,7 +2435,7 @@ impl Disc {
     /// empty when this disc has no captured AACS state. Used to name the disc in
     /// a [`Error::NoDiscKey`] so the application can tell the user which disc to
     /// add to the keydb.
-    pub fn aacs_disc_hash(&self) -> String {
+    pub(crate) fn aacs_disc_hash(&self) -> String {
         self.aacs
             .as_ref()
             .map(|a| crate::hex::strip_hex_prefix(&a.disc_hash).to_string())
@@ -2699,7 +2702,7 @@ impl Disc {
     /// file-backed mux. Without this, a keyed disc swept without a keydb would
     /// recover its UK yet still report E8005 (no usable `decrypt_keys`) at
     /// remux. No-op for an unencrypted or CSS (DVD) disc.
-    pub fn inject_unit_keys(&mut self, keys: Vec<(u32, [u8; 16])>) {
+    pub(crate) fn inject_unit_keys(&mut self, keys: Vec<(u32, [u8; 16])>) {
         if let Some(aacs) = self.aacs.as_mut() {
             aacs.unit_keys = keys;
             aacs.key_source = KeyOrigin::ExternalUk;
