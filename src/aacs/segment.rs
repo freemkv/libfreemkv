@@ -41,21 +41,6 @@ pub const SEGMENT_RECORD_LEN: usize = 16;
 /// Bytes per BDAV source packet (188-byte TS + 4-byte arrival-time header).
 pub const SOURCE_PACKET_LEN: u64 = 192;
 
-/// Whether a 2.1 (FMTS) disc may rip WITHOUT the forensic index keys.
-///
-/// `true` (today): the forensic segments are skipped as expected loss
-/// and the bulk of the title decodes with the unit key, so a 2.1 disc rips
-/// mostly-complete. A unit key (VUK) is still required, exactly as for any AACS
-/// disc. `false`: the absence of a segment-key source is a hard, UPFRONT failure
-/// ([`Error::FmtsKeyMissing`]) — the same policy as a missing unit key, so a
-/// forensic-holed rip is refused rather than produced. No segment-key source
-/// exists yet, so `true` is the only value under which a 2.1 disc rips at all;
-/// flip to `false` once segment keys can be sourced and a partial rip should be
-/// refused. Hardcoded on purpose — not a user setting.
-///
-/// [`Error::FmtsKeyMissing`]: crate::error::Error::FmtsKeyMissing
-pub const BYPASS_FMTS_KEY: bool = false;
-
 /// One forensic segment: the inclusive source-packet range it occupies in the
 /// FMTS clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
