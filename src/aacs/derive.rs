@@ -465,7 +465,7 @@ pub enum KeyCandidate {
 /// its declared CPS-unit number); the caller runs
 /// `decrypt_unit` + `is_clean_ts` to find which one actually opens the
 /// disc. Rungs above the candidate are `None`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedChain {
     pub unit_keys: Vec<(u32, [u8; 16])>,
     pub vuk: Option<Vuk>,
@@ -473,6 +473,21 @@ pub struct ResolvedChain {
     pub pk: Option<ProcessingKey>,
     /// The positioned device key (for a `Dk` candidate).
     pub dk: Option<DeviceKey>,
+}
+
+// Redacting `Debug`: `unit_keys` holds raw title-key bytes, never printed. The
+// other rungs are `types` newtypes that self-redact. Guarded by
+// `resolved_chain_debug_is_redacted`.
+impl std::fmt::Debug for ResolvedChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedChain")
+            .field("unit_keys_len", &self.unit_keys.len())
+            .field("vuk", &self.vuk)
+            .field("mk", &self.mk)
+            .field("pk", &self.pk)
+            .field("dk", &self.dk)
+            .finish()
+    }
 }
 
 /// Derive the full AACS key chain from a candidate key of ANY ladder rung.
@@ -567,6 +582,25 @@ pub fn resolve_candidate(
 mod resolve_candidate_tests {
     use super::*;
     use crate::aacs::crypto::aes_ecb_encrypt;
+
+    /// `ResolvedChain.unit_keys` holds raw title-key bytes (the other rungs are
+    /// self-redacting `types` newtypes). `Debug` must not leak the title keys.
+    #[test]
+    fn resolved_chain_debug_is_redacted() {
+        let c = ResolvedChain {
+            unit_keys: vec![(1, [0xD5; 16])],
+            vuk: None,
+            mk: None,
+            pk: None,
+            dk: None,
+        };
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("213"), "ResolvedChain leaked unit keys: {dbg}");
+        assert!(
+            dbg.contains("unit_keys_len"),
+            "ResolvedChain missing redaction: {dbg}"
+        );
+    }
 
     /// Minimal AACS-1.0 (48-byte stride) `Unit_Key_RO.inf` with `n` encrypted
     /// unit keys — `parse_unit_key_ro` numbers CPS units 1..=n.
