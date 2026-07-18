@@ -1440,18 +1440,9 @@ pub enum KeyOrigin {
     ExternalUk,
 }
 
-impl KeyOrigin {
-    pub fn name(&self) -> &'static str {
-        match self {
-            KeyOrigin::DeviceKey => "MKB + device key",
-            KeyOrigin::ProcessingKey => "MKB + processing key",
-            KeyOrigin::KeyDbDerived => "KEYDB (derived)",
-            KeyOrigin::KeyDb => "KEYDB",
-            KeyOrigin::KeyDbUnitKeys => "KEYDB (unit keys)",
-            KeyOrigin::ExternalUk => "external UK",
-        }
-    }
-}
+// No `KeyOrigin::name()`: the library holds ZERO user-facing English (CLAUDE.md).
+// `KeyOrigin` is a typed enum; applications map its variants to display text
+// (see freemkv's `disc_info::key_origin_label`).
 
 // ─── Disc scanning ──────────────────────────────────────────────────────────
 
