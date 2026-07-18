@@ -66,12 +66,16 @@ impl std::fmt::Debug for CssState {
 /// extents and return the first sector that yields a key — no player keys, no
 /// disc-key crack. Works on a live drive (after bus-auth unlocks reads) and on
 /// disc images alike.
+/// This convenience form runs to completion (no cancellation) and returns just
+/// the key; callers needing an operator-Stop / watchdog cancel, or the three-way
+/// [`CrackOutcome`] (to distinguish "unencrypted" from "encrypted-but-uncracked"),
+/// use [`crack_key_outcome`], which takes a `halt` token.
 pub fn crack_key(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
     batch_sectors: u16,
 ) -> Option<CssState> {
-    crack_key_halt(reader, extents, batch_sectors, None)
+    crack_key_scan(reader, extents, batch_sectors, None, false).into_state()
 }
 
 /// Outcome of a CSS crack scan that distinguishes the THREE cases the bare
@@ -117,6 +121,12 @@ impl CrackOutcome {
 /// ScrambledUncracked) so callers can distinguish "genuinely unencrypted" from
 /// "encrypted but uncrackable" — the latter must become a hard error, never a
 /// silent fall-through to plaintext.
+///
+/// Takes an optional cooperative-cancellation token. "No silent hangs": the
+/// crack scans up to 50_000 sectors, which on a live drive hitting bad sectors
+/// can take a long time, so it polls `halt` once per batch (the same cadence
+/// sweep/patch use) and emits a `freemkv::heartbeat` beat ("css_crack") each
+/// batch so a stuck scan is visible in the log.
 pub fn crack_key_outcome(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
@@ -126,27 +136,10 @@ pub fn crack_key_outcome(
     crack_key_scan(reader, extents, batch_sectors, halt, true)
 }
 
-/// [`crack_key`] with an optional cooperative-cancellation token.
-///
-/// "No silent hangs": the crack scans up to 50_000 sectors, which on a live
-/// drive hitting bad sectors can take a long time. This variant polls `halt`
-/// once per batch (the same cadence sweep/patch use) so an operator Stop or a
-/// scan-level watchdog can interrupt the scan, and emits a
-/// `freemkv::heartbeat` beat ("css_crack") each batch so a stuck scan is
-/// visible in the log.
-pub fn crack_key_halt(
-    reader: &mut dyn SectorSource,
-    extents: &[Extent],
-    batch_sectors: u16,
-    halt: Option<&crate::halt::Halt>,
-) -> Option<CssState> {
-    crack_key_scan(reader, extents, batch_sectors, halt, false).into_state()
-}
-
 /// The crack scan, returning the full [`CrackOutcome`]. Tracks a
 /// `saw_scrambled` flag so a scrambled-but-uncracked disc is distinguished
-/// from a genuinely-unencrypted one (the [`crack_key`] / [`crack_key_halt`]
-/// `Option` wrappers collapse both to `None`).
+/// from a genuinely-unencrypted one (the [`crack_key`] `Option` wrapper
+/// collapses both to `None` via [`CrackOutcome::into_state`]).
 fn crack_key_scan(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
