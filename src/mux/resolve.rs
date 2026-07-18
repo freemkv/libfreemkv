@@ -1038,6 +1038,18 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
             )),
             _ => None,
         };
+    // The map IS the title's read plan: it says which CPS unit / forensic segment
+    // each LBA belongs to. Walk ONLY the units it marks as ours — every default /
+    // CPS unit, and inside an FMTS forensic segment only our-phase units. The
+    // alternate-phase units are a different device group's variant; a licensed
+    // player never reads them, and neither do we — they are never fetched,
+    // decrypted, or handed to the demux, so the demux sees one gapless our-variant
+    // stream (no ciphertext to trip a concealed-gap resync). A non-forensic map
+    // returns the extents unchanged, so the common disc reads exactly as before.
+    let extents = match &key_map {
+        Some(map) => map.read_plan(&extents, unit_align as u32),
+        None => extents,
+    };
     let mut decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
     if let Some(map) = key_map {

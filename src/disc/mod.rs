@@ -457,7 +457,7 @@ pub(crate) fn chapter_name(i: usize) -> String {
 }
 
 /// A contiguous range of sectors on disc.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Extent {
     pub start_lba: u32,
     pub sector_count: u32,
