@@ -390,7 +390,10 @@ mod tests {
             !dbg.contains("213"),
             "CssState Debug leaked the title key: {dbg}"
         );
-        assert!(dbg.contains("redacted"), "CssState Debug missing marker: {dbg}");
+        assert!(
+            dbg.contains("redacted"),
+            "CssState Debug missing marker: {dbg}"
+        );
     }
 
     // ── is_scrambled ───────────────────────────────────────────────────────

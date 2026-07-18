@@ -7,7 +7,6 @@ use crate::udf;
 
 /// Result of SCSI AACS handshake (ECDH authentication).
 /// Only available when scanning from a real drive, not ISO images.
-#[derive(Debug)]
 pub(super) struct HandshakeResult {
     pub volume_id: [u8; 16],
     pub read_data_key: Option<[u8; 16]>,
@@ -27,6 +26,19 @@ pub(super) struct HandshakeResult {
     /// a SUCCESSFUL unlock (VID present, `read_data_key: None`) paradoxically trips
     /// the gate and blocks ALL key resolution (incl. the online source).
     pub drive_unlocked: bool,
+}
+
+// Redacting `Debug`: `volume_id` and `read_data_key` (the AACS 2.0 bus key) are
+// secret; print only shape. Guarded by `handshake_result_debug_is_redacted`.
+impl std::fmt::Debug for HandshakeResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandshakeResult")
+            .field("volume_id", &"<redacted>")
+            .field("read_data_key", &self.read_data_key.map(|_| "<redacted>"))
+            .field("read_data_key_err", &self.read_data_key_err)
+            .field("drive_unlocked", &self.drive_unlocked)
+            .finish()
+    }
 }
 
 /// Single source of truth for "is AACS bus encryption gone for this scan?". The
@@ -427,6 +439,27 @@ mod tests {
     use crate::aacs;
     use crate::sector::SectorSource;
     use std::collections::HashMap;
+
+    /// `HandshakeResult` carries the Volume ID and the AACS 2.0 bus (read-data)
+    /// key; `Debug` must redact both. Sentinel 213 (0xD5).
+    #[test]
+    fn handshake_result_debug_is_redacted() {
+        let hs = HandshakeResult {
+            volume_id: [0xD5; 16],
+            read_data_key: Some([0xD5; 16]),
+            read_data_key_err: None,
+            drive_unlocked: false,
+        };
+        let d = format!("{hs:?}");
+        assert!(
+            !d.contains("213"),
+            "HandshakeResult leaked VID/bus key: {d}"
+        );
+        assert!(
+            d.contains("redacted"),
+            "HandshakeResult missing marker: {d}"
+        );
+    }
 
     // ---------------------------------------------------------------
     // In-memory disc + minimal UDF image with a single physical
