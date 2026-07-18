@@ -522,8 +522,10 @@ fn compose_xpl_titles(
             })
             .collect();
         titles.push(DiscTitle {
+            // Language-neutral identifier (no user-facing English in the library):
+            // matches the UDF `TITLE_*` volume-label style. Apps localize display.
             playlist: if t.name.is_empty() {
-                format!("Title {}", t.number)
+                format!("TITLE_{}", t.number)
             } else {
                 t.name.clone()
             },

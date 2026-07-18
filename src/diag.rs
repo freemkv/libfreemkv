@@ -530,7 +530,7 @@ fn dump_aacs(disc: &Disc) {
         a.bus_encryption,
         a.mkb_version,
         a.disc_hash,
-        a.key_source.name(),
+        a.key_source,
         a.vuk.is_some(),
         a.unit_keys.len(),
         a.uk_ro.len(),
