@@ -98,7 +98,7 @@ pub const VERSION_LABEL: &str = concat!(env!("FREEMKV_VERSION"), env!("GIT_SUFFI
 
 /// The muxing/writing-application string written into MKV output
 /// (`"freemkv <version> (g<hash>)"`).
-pub const MUX_APP: &str = concat!("freemkv ", env!("FREEMKV_VERSION"), env!("GIT_SUFFIX"));
+pub(crate) const MUX_APP: &str = concat!("freemkv ", env!("FREEMKV_VERSION"), env!("GIT_SUFFIX"));
 
 pub mod aacs;
 pub(crate) mod clpi;
