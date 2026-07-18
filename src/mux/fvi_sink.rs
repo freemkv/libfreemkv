@@ -157,31 +157,19 @@ impl FviSink {
     ///
     /// `source_path` / `source_title` record where the index was built from
     /// (the input URL path + the 0-based title index); they are carried into the
-    /// header's `source` object. The medium defaults to `file` — callers with a
-    /// known medium / playlist / volume use [`FviSink::create_with_source`].
+    /// header's `source` object. The remaining provenance (medium, playlist,
+    /// volume) takes its `SourceInfo` defaults — no caller needs to override them.
     pub fn create(
         path: &Path,
         title: &DiscTitle,
         source_path: String,
         source_title: usize,
     ) -> io::Result<Self> {
-        Self::create_with_source(
-            path,
-            title,
-            SourceInfo {
-                path: source_path,
-                title: source_title,
-                ..SourceInfo::default()
-            },
-        )
-    }
-
-    /// Create the sink with a fully-specified [`SourceInfo`] provenance root.
-    pub fn create_with_source(
-        path: &Path,
-        title: &DiscTitle,
-        source: SourceInfo,
-    ) -> io::Result<Self> {
+        let source = SourceInfo {
+            path: source_path,
+            title: source_title,
+            ..SourceInfo::default()
+        };
         let file = File::create(path)?;
 
         let video_track = title
