@@ -2435,7 +2435,7 @@ impl Disc {
     pub fn aacs_disc_hash(&self) -> String {
         self.aacs
             .as_ref()
-            .map(|a| a.disc_hash.trim_start_matches("0x").to_string())
+            .map(|a| crate::hex::strip_hex_prefix(&a.disc_hash).to_string())
             .unwrap_or_default()
     }
 
