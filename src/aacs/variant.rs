@@ -146,7 +146,7 @@ use super::derive::{calc_pk_from_dk, calc_v_mask};
 /// Outcome of a subset-difference walk against an MKB. Carries the
 /// processing key and the matching `uv` slot — both needed as inputs
 /// to the variant chain.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct ProcessingKeyMatch {
     /// Processing Key.
     pub kp: [u8; 16],
@@ -156,6 +156,20 @@ pub struct ProcessingKeyMatch {
     pub cvalue: [u8; 16],
     /// Index of the matching cvalue within the cvalues record.
     pub cvalue_index: usize,
+}
+
+// Redacting `Debug`: `kp` (a Processing Key) and `cvalue` are secret, never
+// printed. `uv` / `cvalue_index` are non-secret coordinates. Guarded by
+// `processing_key_match_debug_is_redacted`.
+impl std::fmt::Debug for ProcessingKeyMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessingKeyMatch")
+            .field("kp", &"<redacted>")
+            .field("uv", &self.uv)
+            .field("cvalue", &"<redacted>")
+            .field("cvalue_index", &self.cvalue_index)
+            .finish()
+    }
 }
 
 fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
@@ -634,6 +648,21 @@ mod tests {
     // imports, so pull them in directly for the tests below.
     use super::super::crypto::aesg3;
     use super::super::derive::calc_pk_from_dk;
+
+    /// `ProcessingKeyMatch` carries the Processing Key (`kp`) and `cvalue` raw;
+    /// `Debug` must redact both. Non-secret `uv`/`cvalue_index` are not 213.
+    #[test]
+    fn processing_key_match_debug_is_redacted() {
+        let m = ProcessingKeyMatch {
+            kp: [0xD5; 16],
+            uv: 1,
+            cvalue: [0xD5; 16],
+            cvalue_index: 2,
+        };
+        let dbg = format!("{m:?}");
+        assert!(!dbg.contains("213"), "ProcessingKeyMatch leaked kp/cvalue: {dbg}");
+        assert!(dbg.contains("redacted"), "ProcessingKeyMatch missing marker: {dbg}");
+    }
 
     #[test]
     fn calc_pk_from_dk_terminates_on_nonconvergent_mask() {
