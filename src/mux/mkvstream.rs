@@ -323,17 +323,14 @@ fn extract_mvc_params(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
 }
 
 impl MkvStream {
-    /// Create for writing PES frames → MKV container.
-    /// Codec privates come from title.codec_privates (populated by input stream).
-    pub fn create(writer: Box<dyn WriteSeek + Send>, title: &DiscTitle) -> io::Result<Self> {
-        Self::create_at(writer, title, None)
-    }
-
-    /// As [`create`](Self::create), but `output_path` (when known) enables the
-    /// `--log-level 3` opening-frame capture to `<output>.opening.bin`. A `None`
-    /// path (e.g. an in-memory / stdio sink) silently skips the side-file
-    /// capture; the per-track TrackEntry dump still fires.
-    pub fn create_at(
+    /// Create for writing PES frames → MKV container. Codec privates come from
+    /// `title.codec_privates` (populated by the input stream).
+    ///
+    /// `output_path` (when known) enables the `--log-level 3` opening-frame
+    /// capture to `<output>.opening.bin`; `None` (e.g. an in-memory / stdio sink)
+    /// silently skips the side-file capture — the per-track TrackEntry dump still
+    /// fires either way.
+    pub fn create(
         writer: Box<dyn WriteSeek + Send>,
         title: &DiscTitle,
         output_path: Option<&std::path::Path>,
@@ -1409,7 +1406,7 @@ mod tests {
             streams: vec![Stream::Video(dep)],
             ..DiscTitle::empty()
         };
-        let s = MkvStream::create(Box::new(Cursor::new(Vec::new())), &title)
+        let s = MkvStream::create(Box::new(Cursor::new(Vec::new())), &title, None)
             .expect("create must succeed, not panic");
         assert!(
             s.mvc.is_none(),

@@ -591,7 +591,7 @@ fn meta_all_stream_types() {
 fn mkvstream_write_finish() {
     let dt = sample_disc_title();
     let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> = Box::new(Cursor::new(Vec::new()));
-    let mut stream = MkvStream::create(writer, &dt).unwrap();
+    let mut stream = MkvStream::create(writer, &dt, None).unwrap();
 
     // Write some fake PES frames (they won't produce valid MKV content
     // since there is no real codec data, but it should not panic)
@@ -616,7 +616,7 @@ fn mkvstream_write_finish() {
 fn mkvstream_meta_sets_title() {
     let dt = sample_disc_title();
     let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> = Box::new(Cursor::new(Vec::new()));
-    let stream = MkvStream::create(writer, &dt).unwrap();
+    let stream = MkvStream::create(writer, &dt, None).unwrap();
 
     let info = PesStream::info(&stream);
     assert_eq!(info.playlist, "Test Movie");
@@ -656,7 +656,7 @@ fn mkvstream_roundtrip_bdts() {
     };
 
     let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> = Box::new(Cursor::new(Vec::new()));
-    let mut stream = MkvStream::create(writer, &dt).unwrap();
+    let mut stream = MkvStream::create(writer, &dt, None).unwrap();
 
     // Write PES frames targeting the audio track
     for i in 0..10u8 {
@@ -745,7 +745,7 @@ fn mkvstream_meta_preserves_all_streams() {
     };
 
     let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> = Box::new(Cursor::new(Vec::new()));
-    let stream = MkvStream::create(writer, &dt).unwrap();
+    let stream = MkvStream::create(writer, &dt, None).unwrap();
 
     let info = PesStream::info(&stream);
     assert_eq!(info.streams.len(), 5, "all 5 streams should be preserved");
@@ -856,7 +856,7 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
 
     let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> =
         Box::new(SharedWriter(output2.clone()));
-    let mut stream2 = MkvStream::create(writer, &dt).unwrap();
+    let mut stream2 = MkvStream::create(writer, &dt, None).unwrap();
 
     // Write the ES data (SPS+PPS+IDR) as a keyframe PES frame.
     let frame1 = libfreemkv::pes::PesFrame {
