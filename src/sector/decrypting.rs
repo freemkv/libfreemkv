@@ -175,6 +175,14 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         self
     }
 
+    /// `&mut` counterpart of [`with_key_map`](Self::with_key_map): install the
+    /// proactive map on an already-constructed source (the inline live-drive
+    /// [`DiscStream`](crate::mux::DiscStream) builds the decorator first, then
+    /// installs the map via its own `with_key_map`).
+    pub fn set_key_map(&mut self, map: Arc<crate::decrypt::AacsKeyMap>) {
+        self.key_map = Some(map);
+    }
+
     /// Restrict decrypt to the disc's encrypted-content extents
     /// (sorted/merged `(start_lba, sector_count)` — see
     /// [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)).
