@@ -13,7 +13,6 @@ use super::mkb::*;
 // ── Full VUK resolution chain ───────────────────────────────────────────────
 
 /// Result of resolving a disc's VUK.
-#[derive(Debug)]
 pub struct ResolvedKeys {
     /// Disc hash (SHA1 of Unit_Key_RO.inf)
     pub disc_hash: [u8; 20],
@@ -32,6 +31,23 @@ pub struct ResolvedKeys {
     /// Which resolution path succeeded (1=DK, 2=PK, 3=KEYDB derived,
     /// 4=KEYDB VUK, 5=KEYDB unit keys)
     pub key_source: u8,
+}
+
+// Redacting `Debug`: `vuk` and `unit_keys` are raw key bytes, never printed.
+// `disc_hash` is the public per-disc identifier (SHA-1 of the .inf), not secret.
+// Guarded by `resolved_keys_debug_is_redacted`.
+impl std::fmt::Debug for ResolvedKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedKeys")
+            .field("disc_hash", &self.disc_hash)
+            .field("vuk", &self.vuk.map(|_| "<redacted>"))
+            .field("unit_keys_len", &self.unit_keys.len())
+            .field("title_cps_unit", &self.title_cps_unit)
+            .field("version", &self.version)
+            .field("bus_encryption", &self.bus_encryption)
+            .field("key_source", &self.key_source)
+            .finish()
+    }
 }
 
 /// Inputs shared by every classical-path resolver. References only —
@@ -466,6 +482,24 @@ mod tests {
     use super::super::types::DiscEntry;
     use super::super::types::*;
     use super::*;
+
+    /// `ResolvedKeys` carries the disc's VUK and unit keys raw; `Debug` must not
+    /// leak them. Sentinel 213 (0xD5); non-secret fields are not 213.
+    #[test]
+    fn resolved_keys_debug_is_redacted() {
+        let rk = ResolvedKeys {
+            disc_hash: [0u8; 20],
+            vuk: Some([0xD5; 16]),
+            unit_keys: vec![(1, [0xD5; 16])],
+            title_cps_unit: vec![0],
+            version: AacsVersion::V21,
+            bus_encryption: true,
+            key_source: 1,
+        };
+        let dbg = format!("{rk:?}");
+        assert!(!dbg.contains("213"), "ResolvedKeys leaked keys: {dbg}");
+        assert!(dbg.contains("redacted"), "ResolvedKeys missing marker: {dbg}");
+    }
 
     /// Audit #5: the `major` / `from_major` mapping is load-bearing for the
     /// Unit_Key_RO stride, so pin it as a table. V10 ↔ BD; V20/V21 → UHD; any
