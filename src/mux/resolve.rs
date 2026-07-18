@@ -344,9 +344,7 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // unchanged (decrypt_keys_for_title short-circuits to decrypt_keys).
             let (keys, title_is_clear) =
                 match crate::io::file_sector_source::FileSectorSource::open(path) {
-                    Ok(mut crack_reader) => {
-                        disc.decrypt_keys_for_title_checked(idx, &mut crack_reader, 64)
-                    }
+                    Ok(mut crack_reader) => disc.decrypt_keys_for_title(idx, &mut crack_reader, 64),
                     Err(_) => (disc.decrypt_keys(), false),
                 };
             // Per-title decrypt gate (parallel to the disc-wide gate above): on

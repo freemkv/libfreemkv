@@ -2572,35 +2572,25 @@ impl Disc {
     ///
     /// `batch_sectors` sizes the crack's batched reads (file-safe value for
     /// an ISO; `detect_max_batch_sectors` for a live drive).
-    pub fn decrypt_keys_for_title(
-        &self,
-        idx: usize,
-        reader: &mut dyn SectorSource,
-        batch_sectors: u16,
-    ) -> crate::decrypt::DecryptKeys {
-        self.decrypt_keys_for_title_checked(idx, reader, batch_sectors)
-            .0
-    }
-
-    /// [`Self::decrypt_keys_for_title`] plus the per-title encryption verdict the
-    /// gate needs to AVOID A FALSE ERROR on a genuinely-clear extra title.
+    /// Also returns the per-title encryption verdict the gate needs to AVOID A
+    /// FALSE ERROR on a genuinely-clear extra title.
     ///
     /// On a multi-VTS CSS DVD that ALSO carries a clear, unencrypted stub title
     /// (a 0.5 s menu loop, an FBI-warning nav title) living in its own VTS, the
     /// re-crack over that stub's extents finds NO scrambled sector and recovers
-    /// no key. The bare `decrypt_keys_for_title` collapses that to
+    /// no key. Returning ONLY the keys would collapse that to
     /// `DecryptKeys::None`, indistinguishable from "scrambled but uncrackable",
     /// so [`Self::ensure_decryptable_keys`] (which fails whenever `css.is_some()`
-    /// and the key is `None`) wrongly raised `E7023` for a title that needs no
-    /// key at all. That is the false error the multi-title mux must never emit.
+    /// and the key is `None`) would wrongly raise `E7023` for a title that needs
+    /// no key at all — the false error the multi-title mux must never emit.
     ///
-    /// This variant runs the re-crack via [`crate::css::crack_key_outcome`] and
+    /// So the re-crack runs via [`crate::css::crack_key_outcome`] and ALSO
     /// returns `title_is_clear == true` when the title's own extents showed NO
     /// scrambling (`CrackOutcome::Unencrypted`) — the gate then treats that title
     /// as needing no key and passes it cleanly. A title that genuinely IS
     /// scrambled but uncrackable returns `(None, false)` and still hard-fails.
     /// The returned bool pairs with [`Self::ensure_title_decryptable`].
-    pub fn decrypt_keys_for_title_checked(
+    pub fn decrypt_keys_for_title(
         &self,
         idx: usize,
         reader: &mut dyn SectorSource,
@@ -2664,7 +2654,7 @@ impl Disc {
     }
 
     /// Per-title decrypt gate that honours the `title_is_clear` verdict from
-    /// [`Self::decrypt_keys_for_title_checked`].
+    /// [`Self::decrypt_keys_for_title`].
     ///
     /// Identical to [`Self::ensure_decryptable_keys`] EXCEPT it does not raise
     /// `E7023` when the chosen title proved genuinely clear (`title_is_clear`):
@@ -5134,8 +5124,8 @@ mod tests {
     // ── Fix 2/3: a genuinely-clear extra title on a CSS disc never E7023s ──────
 
     /// Reader that serves clear (unscrambled) sectors for one extent range and
-    /// CSS-locked errors elsewhere — enough to drive `decrypt_keys_for_title_
-    /// checked`'s per-title re-crack to `Unencrypted` for a clear stub.
+    /// CSS-locked errors elsewhere — enough to drive `decrypt_keys_for_title`'s
+    /// per-title re-crack to `Unencrypted` for a clear stub.
     struct ClearStubReader {
         clear_range: (u32, u32),
     }
@@ -5195,7 +5185,7 @@ mod tests {
         let mut reader = ClearStubReader {
             clear_range: (0, 100_000),
         };
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title_checked(stub_idx, &mut reader, 8);
+        let (keys, title_is_clear) = disc.decrypt_keys_for_title(stub_idx, &mut reader, 8);
         assert!(
             !keys.is_encrypted(),
             "a clear stub needs no key (got encrypted keys)"
@@ -5617,7 +5607,7 @@ mod tests {
         let mut src = RecordingSource {
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        match disc.decrypt_keys_for_title(0, &mut src, 16) {
+        match disc.decrypt_keys_for_title(0, &mut src, 16).0 {
             crate::decrypt::DecryptKeys::Css { title_key } => {
                 assert_eq!(title_key, [0xAB; 5], "same-VTS title reuses cracked key");
             }
@@ -5642,7 +5632,7 @@ mod tests {
         let mut src = RecordingSource {
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let keys = disc.decrypt_keys_for_title(1, &mut src, 16);
+        let keys = disc.decrypt_keys_for_title(1, &mut src, 16).0;
         assert!(
             matches!(keys, crate::decrypt::DecryptKeys::None),
             "a re-crack miss in a provably-different VTS must be a hard failure (None), \
