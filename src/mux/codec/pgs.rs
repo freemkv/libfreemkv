@@ -30,6 +30,32 @@ const MAX_PGS_PENDING_BYTES: usize = 4 * 1024 * 1024;
 // (video_w/h, frame_rate, comp_num, comp_state, palette_update,
 // palette_id_ref) = 13.
 const PCS_NUM_OBJECTS_OFFSET: usize = 13;
+// Offset of the first composition_object's flags byte within a PCS PES payload:
+// PCS header(13) + number_of_composition_objects(1) + object_id_ref(2) +
+// window_id_ref(1) = 17. `forced_on_flag` is bit 0x40 of that byte (HDMV PCS).
+const PCS_FIRST_OBJECT_FLAGS_OFFSET: usize = 17;
+const PCS_FORCED_ON_FLAG: u8 = 0x40;
+
+/// Whether an emitted PGS display-set frame is a FORCED subtitle — the
+/// `forced_on_flag` (0x40) on its first composition object. The frame data an
+/// emitted PGS block carries begins with the display PCS (segment type 0x16), so
+/// the flag is read directly from it. Returns `None` when the block is not a
+/// display PCS with a composition object (nothing to classify — a clear PCS, a
+/// non-PCS segment, or a truncated header).
+///
+/// The mux uses this to detect a *forced-narrative track* (every displayed
+/// subtitle forced) without relying on the disc's vendor label metadata, so
+/// forced subs are flagged `FlagForced` even on discs that carry no such blob.
+pub fn display_set_is_forced(frame_data: &[u8]) -> Option<bool> {
+    if frame_data.first() != Some(&SEGMENT_PCS) {
+        return None;
+    }
+    if *frame_data.get(PCS_NUM_OBJECTS_OFFSET)? == 0 {
+        return None; // clear PCS — no composition to classify
+    }
+    let flags = *frame_data.get(PCS_FIRST_OBJECT_FLAGS_OFFSET)?;
+    Some(flags & PCS_FORCED_ON_FLAG != 0)
+}
 
 /// Stateful parser that collapses PGS display/clear PCS pairs into
 /// duration-bearing Matroska frames. Implements [`CodecParser`].
@@ -221,6 +247,41 @@ impl CodecParser for PgsParser {
 mod tests {
     use super::*;
     use crate::mux::ts::PesPacket;
+
+    /// A PCS display-set block with one composition object; `forced` sets the
+    /// forced_on_flag (0x40) in its flags byte at offset 17.
+    fn pcs_display(forced: bool) -> Vec<u8> {
+        let mut d = vec![0u8; 18];
+        d[0] = SEGMENT_PCS;
+        d[PCS_NUM_OBJECTS_OFFSET] = 1;
+        d[PCS_FIRST_OBJECT_FLAGS_OFFSET] = if forced { PCS_FORCED_ON_FLAG } else { 0 };
+        d
+    }
+
+    #[test]
+    fn display_set_forced_flag_detection() {
+        assert_eq!(display_set_is_forced(&pcs_display(true)), Some(true));
+        assert_eq!(display_set_is_forced(&pcs_display(false)), Some(false));
+        // Other flag bits set but not forced_on_flag → still not forced.
+        let mut cropped = pcs_display(false);
+        cropped[PCS_FIRST_OBJECT_FLAGS_OFFSET] = 0x80; // object_cropped_flag only
+        assert_eq!(display_set_is_forced(&cropped), Some(false));
+    }
+
+    #[test]
+    fn display_set_forced_none_for_non_display() {
+        // Clear PCS (0 objects) → None.
+        let mut clear = pcs_display(false);
+        clear[PCS_NUM_OBJECTS_OFFSET] = 0;
+        assert_eq!(display_set_is_forced(&clear), None);
+        // Non-PCS segment → None.
+        let mut ods = pcs_display(true);
+        ods[0] = 0x15; // ODS
+        assert_eq!(display_set_is_forced(&ods), None);
+        // Truncated (no flags byte) → None, no panic.
+        assert_eq!(display_set_is_forced(&pcs_display(true)[..15]), None);
+        assert_eq!(display_set_is_forced(&[]), None);
+    }
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
         PesPacket {
