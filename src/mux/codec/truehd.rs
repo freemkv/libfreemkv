@@ -93,26 +93,43 @@ impl TrueHdParser {
     /// Returns `false` (not corrupt) when the AU is too short to judge or no
     /// major sync has established `num_substreams` yet — we never drop what we
     /// cannot verify. Verified against real ffmpeg TrueHD (3600/3600 AUs).
-    fn au_is_corrupt(&mut self, au: &[u8], is_major_sync: bool) -> bool {
+    fn au_check(&mut self, au: &[u8], is_major_sync: bool) -> AuCheck {
         let mut header_size = 4;
+        let mut format_info = None;
         if is_major_sync {
             let ms = &au[4..];
             let Some(mshdr) = mlp_major_sync_header_size(ms) else {
-                return false; // too short to hold a major-sync header — can't judge
+                // A major sync too short to hold its header can't be CRC-validated
+                // — NOT a safe resync/re-init point. Treat as unverifiable, not a
+                // clean major sync.
+                return AuCheck::Unverifiable;
             };
             if !mlp_major_sync_crc_ok(ms, mshdr) {
-                return true; // corrupt major-sync header
+                return AuCheck::Corrupt; // corrupt major-sync header
             }
             self.num_substreams = mlp_num_substreams(ms);
             header_size += mshdr;
+            // The rate nibble is only trustworthy once the major sync's CRC has
+            // validated (above), so capture format_info here and refine the PTS
+            // cadence from it ONLY on this validated path.
+            if au.len() >= 12 {
+                format_info = Some(u32::from_be_bytes([au[8], au[9], au[10], au[11]]));
+            }
         }
         let Some(nss) = self.num_substreams else {
-            return false; // no major sync seen yet — nothing to check against
+            return AuCheck::Unverifiable; // no major sync seen yet — can't check parity
         };
         let Some(shs) = mlp_substr_header_size(au, header_size, nss) else {
-            return false; // directory runs off the AU — can't judge
+            return AuCheck::Unverifiable; // directory runs off the AU — can't judge
         };
-        !mlp_parity_ok(au, header_size, shs)
+        if !mlp_parity_ok(au, header_size, shs) {
+            return AuCheck::Corrupt;
+        }
+        if is_major_sync {
+            AuCheck::ValidMajorSync { format_info }
+        } else {
+            AuCheck::Ok
+        }
     }
 
     /// Size (bytes) of the AC-3 frame at the buffer head.
@@ -167,6 +184,23 @@ fn ac3_boundary_corroborated(buf: &[u8], frame_bytes: usize) -> bool {
     // A plausible TrueHD AU header after? (non-zero 12-bit length, <= 32 KiB)
     let next_words = (((tail[0] as usize) << 8) | tail[1] as usize) & 0xFFF;
     next_words != 0 && next_words * 2 <= 32768
+}
+
+/// Decodability verdict for one TrueHD/MLP access unit.
+enum AuCheck {
+    /// Verified undecodable: a major-sync header whose CRC failed, or any AU
+    /// whose substream-directory parity failed. Feeds the poison verdict.
+    Corrupt,
+    /// A CRC-validated major sync — a safe re-init / resync point. `format_info`
+    /// (AU bytes 8..12, present when the AU is long enough) is trustworthy here,
+    /// so the caller refines the PTS cadence ONLY from this validated path.
+    ValidMajorSync { format_info: Option<u32> },
+    /// A valid (parity-OK) non-major-sync access unit.
+    Ok,
+    /// Cannot be judged — a major sync too short to hold/CRC its header, or a
+    /// stream head before any major sync established `num_substreams`. Never
+    /// dropped on its own, and never treated as a clean resync point.
+    Unverifiable,
 }
 
 /// Outcome of sizing the AC-3 frame at the TrueHD buffer head.
@@ -385,62 +419,92 @@ impl CodecParser for TrueHdParser {
                     & 0xFFFF_FFFE)
                     == 0xF872_6FBA;
 
-            // On a major sync the 32-bit `format_info` word (immediately after
-            // the 4-byte sync, i.e. AU bytes 8..12) carries the rate nibble.
-            // Refine the per-AU PTS increment to the actual rate family. The
-            // 48 kHz family resolves to the unchanged 833_333 default, so the
-            // common case stays byte-identical; only the 44.1 kHz family shifts.
-            if is_major_sync && unit_bytes >= 12 {
-                let format_info =
-                    u32::from_be_bytes([self.buf[8], self.buf[9], self.buf[10], self.buf[11]]);
-                self.au_duration_ns = truehd_au_duration_ns(format_info);
-            }
-
-            // Decodability gate. MLP/TrueHD state persists across AUs, so a
-            // corrupt AU is dropped FORWARD to the next major sync (the clean
-            // re-init point) rather than excised in place; the PTS clock advances
-            // across every dropped AU so the drop is a silence gap, never a shift.
+            // Decodability gate. MLP/TrueHD decode state persists across access
+            // units, so a corrupt AU is dropped FORWARD to the next VALIDATED
+            // major sync (the clean re-init point) rather than excised in place.
+            // The PTS clock advances across every dropped AU so a drop is a
+            // silence gap, never a shift.
             let au = self.buf[..unit_bytes].to_vec();
             let pts = self.next_pts_ns;
-            let corrupt = self.tally.is_poisoned() || self.au_is_corrupt(&au, is_major_sync);
-            let emit = if self.resync_pending {
-                // Only a valid major sync clears the resync and is emitted.
-                if is_major_sync && !corrupt {
-                    self.resync_pending = false;
-                    true
-                } else {
-                    false
-                }
-            } else if corrupt {
-                self.resync_pending = true;
-                false
-            } else {
-                true
-            };
+            let mut emit_keyframe: Option<bool> = None; // Some(is_keyframe) => emit
+            let mut drop_reason: Option<(&'static str, bool)> = None; // (reason, verified)
 
-            if emit {
+            if self.tally.is_poisoned() {
+                // Whole track already judged dead — collateral drop (does not
+                // re-feed the poison verdict).
+                drop_reason = Some(("track-poisoned", false));
+            } else {
+                match self.au_check(&au, is_major_sync) {
+                    AuCheck::ValidMajorSync { format_info } => {
+                        // The rate nibble is trustworthy only now that the major
+                        // sync's CRC has validated. Refine the per-AU PTS
+                        // increment (48 kHz family stays the 833_333 default).
+                        if let Some(fi) = format_info {
+                            self.au_duration_ns = truehd_au_duration_ns(fi);
+                        }
+                        // A validated major sync is the ONLY clean resync point.
+                        self.resync_pending = false;
+                        emit_keyframe = Some(true);
+                    }
+                    AuCheck::Corrupt => {
+                        if self.resync_pending {
+                            // Part of the current drop-forward run — collateral.
+                            drop_reason = Some(("resync", false));
+                        } else {
+                            // The trigger: one verified corruption that starts the
+                            // drop-forward. Only this counts toward poison.
+                            let r = if is_major_sync {
+                                "major-sync-crc"
+                            } else {
+                                "parity"
+                            };
+                            drop_reason = Some((r, true));
+                            self.resync_pending = true;
+                        }
+                    }
+                    AuCheck::Ok => {
+                        if self.resync_pending {
+                            // Decode state is invalid until the next validated
+                            // major sync, so even a parity-OK AU is undecodable
+                            // here — collateral drop.
+                            drop_reason = Some(("resync", false));
+                        } else {
+                            emit_keyframe = Some(false);
+                        }
+                    }
+                    AuCheck::Unverifiable => {
+                        if self.resync_pending {
+                            // Not a validated major sync — do NOT clear the resync
+                            // on it; keep dropping forward.
+                            drop_reason = Some(("resync", false));
+                        } else {
+                            // Head of stream / too-short AU: keep (never drop what
+                            // we cannot verify).
+                            emit_keyframe = Some(is_major_sync);
+                        }
+                    }
+                }
+            }
+
+            if let Some(keyframe) = emit_keyframe {
                 self.tally.record_kept();
                 frames.push(Frame {
                     discontinuity: false,
                     coding: None,
                     source: None,
                     pts_ns: pts,
-                    keyframe: is_major_sync,
+                    keyframe,
                     data: au,
                     duration_ns: None,
                 });
-            } else {
-                let reason = if self.tally.is_poisoned() {
-                    "track-poisoned"
-                } else if is_major_sync && corrupt {
-                    "major-sync-crc"
-                } else if corrupt {
-                    "parity"
+            } else if let Some((reason, verified)) = drop_reason {
+                if verified {
+                    self.tally
+                        .record_drop(pts, self.au_duration_ns, au.len(), reason);
                 } else {
-                    "resync"
-                };
-                self.tally
-                    .record_drop(pts, self.au_duration_ns, au.len(), reason);
+                    self.tally
+                        .record_collateral_drop(pts, self.au_duration_ns, au.len(), reason);
+                }
             }
             self.buf.drain(..unit_bytes);
             self.next_pts_ns += self.au_duration_ns;
@@ -745,6 +809,97 @@ mod tests {
             3 * AU_DURATION_NS,
             "resumed major sync keeps its true timeline (gap, not shift)"
         );
+    }
+
+    #[test]
+    fn transient_corruptions_do_not_poison_whole_track() {
+        // Regression (audit HIGH): TrueHD drop-forward must NOT amplify a couple
+        // of transient errors into a false whole-track poison. Two corruptions,
+        // each forcing a long collateral resync run past 200 total AUs, must
+        // leave the track un-poisoned and keep the good audio that follows.
+        let mut parser = TrueHdParser::new();
+        let mut data = valid_major_sync();
+        // Corruption #1 then a long run of normal AUs (all collateral-dropped
+        // while resyncing — no major sync to re-init on).
+        let mut bad1 = valid_normal_au();
+        bad1[2] ^= 0x01; // single-nibble parity break
+        data.extend_from_slice(&bad1);
+        for _ in 0..210 {
+            data.extend_from_slice(&valid_normal_au());
+        }
+        // A valid major sync resumes; the good AUs after it MUST be kept.
+        data.extend_from_slice(&valid_major_sync());
+        for _ in 0..5 {
+            data.extend_from_slice(&valid_normal_au());
+        }
+        let frames = parser.parse(&make_pes(data, Some(90000)));
+        assert!(
+            !parser.tally.is_poisoned(),
+            "two transient errors must not poison the track"
+        );
+        // MS1 + resumed MS2 + the 5 good AUs after it survive.
+        assert_eq!(
+            frames.len(),
+            7,
+            "post-resync good audio is kept, not poisoned away"
+        );
+        assert!(
+            parser.dropped_frames() > 200,
+            "the resync run was still counted for reporting"
+        );
+    }
+
+    #[test]
+    fn corrupt_major_sync_rate_nibble_does_not_shift_pts() {
+        // Regression (audit MED): a corrupt major sync whose rate nibble decodes
+        // to the 44.1 kHz family must NOT refine au_duration_ns — the rate is only
+        // trustworthy after the CRC validates. Otherwise the resumed 48 kHz audio
+        // is shifted (not gapped).
+        let mut parser = TrueHdParser::new();
+        let ms1 = valid_major_sync(); // 48 kHz
+        let mut ms_bad = valid_major_sync();
+        // Set the rate nibble (top nibble of format_info = au[8]) to 0x8 (44.1k).
+        // au[8] is CRC-covered, so this also breaks the major-sync CRC → corrupt.
+        ms_bad[8] = (ms_bad[8] & 0x0F) | 0x80;
+        let ms2 = valid_major_sync(); // 48 kHz
+        let mut data = ms1;
+        data.extend_from_slice(&ms_bad);
+        data.extend_from_slice(&ms2);
+        let frames = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(frames.len(), 2, "corrupt MS dropped; MS1 and MS2 survive");
+        assert_eq!(
+            frames[1].pts_ns - frames[0].pts_ns,
+            2 * AU_DURATION_NS,
+            "resumed audio keeps the 48 kHz cadence — the corrupt MS's 44.1k rate was ignored"
+        );
+    }
+
+    #[test]
+    fn too_short_major_sync_does_not_clear_resync() {
+        // Regression (audit LOW): while resyncing, a major sync too short to hold
+        // (and CRC-validate) its header must NOT be treated as a clean resync
+        // point — the runt is dropped and only a real validated major sync resumes.
+        let mut parser = TrueHdParser::new();
+        let ms1 = valid_major_sync();
+        let mut bad = valid_normal_au();
+        bad[2] ^= 0x01; // parity break → triggers resync
+        // An 8-byte "major sync": length=4 words, sync at bytes 4..8, too short
+        // to hold the 28-byte major-sync header.
+        let runt = vec![0x00, 0x04, 0x00, 0x00, 0xF8, 0x72, 0x6F, 0xBA];
+        let ms2 = valid_major_sync();
+        let mut data = ms1;
+        data.extend_from_slice(&bad);
+        data.extend_from_slice(&runt);
+        data.extend_from_slice(&ms2);
+        let frames = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(frames.len(), 2, "the runt major sync did not resume decode");
+        for f in &frames {
+            assert_eq!(
+                f.data.len(),
+                200,
+                "only the real 200-byte major syncs survive"
+            );
+        }
     }
 
     #[test]
