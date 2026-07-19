@@ -672,6 +672,14 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// (to patch in place) and the IFO-claimed count (to warn on disagreement);
     /// `corrected` flips once patched so we only act on the first frame.
     ac3_channel_fixups: std::collections::HashMap<usize, Ac3ChannelFixup>,
+    /// Deferred PGS forced-subtitle detection. A PGS subtitle track reserves a
+    /// 1-byte `FlagForced` value up-front; as its display sets are written, the
+    /// track is judged forced iff it displayed at least one subtitle and EVERY
+    /// display set carried the HDMV `forced_on_flag` (a dedicated forced/narrative
+    /// track). At `finish()` the reserved byte is promoted to 1 for such tracks —
+    /// so forced subs are flagged even on discs without vendor label metadata.
+    /// Only ever promotes (0→1); a scan/vendor forced flag is never demoted.
+    pgs_forced_fixups: std::collections::HashMap<usize, PgsForcedFixup>,
     /// `--log-level 3` opening-frame capture: the first ~100 coded frames per
     /// track are written (raw) to a `<output>.opening.bin` side file with a
     /// per-frame summary logged, so an opening-GOP / menu / mid-GOP-open issue is
@@ -690,6 +698,18 @@ struct Ac3ChannelFixup {
     claimed: u8,
     /// True once the first frame has been parsed and the value finalised.
     corrected: bool,
+}
+
+/// Deferred PGS forced-subtitle detection state for one PGS subtitle track.
+struct PgsForcedFixup {
+    /// Absolute file offset of the 1-byte `FlagForced` value in the Tracks element.
+    value_offset: u64,
+    /// Whether the track has displayed at least one subtitle (a display PCS).
+    has_display: bool,
+    /// Whether EVERY display set so far carried the forced_on_flag. Starts true;
+    /// cleared by the first non-forced display set. With `has_display`, a value of
+    /// true at `finish()` means the whole track is forced narrative.
+    all_forced: bool,
 }
 
 /// TimestampScale: nanoseconds per Matroska timestamp tick. 0.1 ms (100_000 ns).
@@ -917,6 +937,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let mut track_uids: Vec<u64> = Vec::with_capacity(tracks.len());
         let mut ac3_channel_fixups: std::collections::HashMap<usize, Ac3ChannelFixup> =
             std::collections::HashMap::new();
+        let mut pgs_forced_fixups: std::collections::HashMap<usize, PgsForcedFixup> =
+            std::collections::HashMap::new();
         // Per track: whether it emitted a conforming `mvcC` BlockAdditionMapping.
         // Filled below from the SAME built record that drives the CodecPrivate
         // mvcC extension, so the three MVC signals never diverge.
@@ -948,7 +970,25 @@ impl<W: Write + Seek> MkvMuxer<W> {
             if !track.is_default {
                 ebml::write_uint(&mut writer, ebml::FLAG_DEFAULT, 0)?;
             }
-            if track.is_forced {
+            if track.track_type == ebml::TRACK_TYPE_SUBTITLE && track.codec_id == ebml::CODEC_PGS {
+                // Reserve a 1-byte FlagForced (initial value = the scan/vendor
+                // flag) and record its offset, so PGS content can promote it to 1
+                // at finish() if the track proves to be forced narrative. Written
+                // explicitly (ID + size + value) so the value is a single,
+                // in-place-patchable byte — same idiom as the Channels fixup.
+                ebml::write_id(&mut writer, ebml::FLAG_FORCED)?;
+                ebml::write_size(&mut writer, 1)?;
+                let value_offset = writer.stream_position()?;
+                writer.write_all(&[track.is_forced as u8])?;
+                pgs_forced_fixups.insert(
+                    i,
+                    PgsForcedFixup {
+                        value_offset,
+                        has_display: false,
+                        all_forced: true,
+                    },
+                );
+            } else if track.is_forced {
                 ebml::write_uint(&mut writer, ebml::FLAG_FORCED, 1)?;
             }
 
@@ -1203,6 +1243,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             max_block_ticks: 0,
             last_video_keyframe_ticks: None,
             ac3_channel_fixups,
+            pgs_forced_fixups,
             opening_capture: None,
         })
     }
@@ -1514,6 +1555,17 @@ impl<W: Write + Seek> MkvMuxer<W> {
             }
         }
 
+        // Accumulate PGS forced-subtitle state: a display set marks the track as
+        // having shown a subtitle, and clears `all_forced` the moment a
+        // non-forced set appears. `finish()` promotes FlagForced only for a track
+        // that displayed subtitles and had every one forced.
+        if let Some(fixup) = self.pgs_forced_fixups.get_mut(&track_idx) {
+            if let Some(forced) = super::codec::pgs::display_set_is_forced(data) {
+                fixup.has_display = true;
+                fixup.all_forced &= forced;
+            }
+        }
+
         Ok(())
     }
 
@@ -1545,6 +1597,26 @@ impl<W: Write + Seek> MkvMuxer<W> {
         }
         // Close final cluster
         self.end_cluster()?;
+
+        // Promote FlagForced for PGS subtitle tracks that proved to be forced
+        // narrative (displayed subtitles, every one forced). In-place single-byte
+        // rewrite of the reserved value, then restore the append position for the
+        // Cues that follow. Only promotes (0→1); a track already forced from the
+        // scan/vendor flag stays forced.
+        let forced_offsets: Vec<u64> = self
+            .pgs_forced_fixups
+            .values()
+            .filter(|f| f.has_display && f.all_forced)
+            .map(|f| f.value_offset)
+            .collect();
+        if !forced_offsets.is_empty() {
+            let here = self.writer.stream_position()?;
+            for off in forced_offsets {
+                self.writer.seek(std::io::SeekFrom::Start(off))?;
+                self.writer.write_all(&[1u8])?;
+            }
+            self.writer.seek(std::io::SeekFrom::Start(here))?;
+        }
 
         // Write Cues
         let cues_start = self.writer.stream_position()?;
@@ -2600,11 +2672,120 @@ mod tests {
         let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
 
-        // FlagForced should NOT be written for non-forced tracks
-        assert!(
-            find_id(&data, ebml::FLAG_FORCED).is_none(),
-            "FlagForced element should not be present for non-forced subtitle"
+        // A PGS subtitle track now RESERVES a FlagForced element (so PGS content
+        // can promote it later), but for a non-forced track its value is 0. The
+        // value byte sits after the 2-byte ID (0x55AA) + 1-byte size.
+        let pos =
+            find_id(&data, ebml::FLAG_FORCED).expect("PGS subtitle reserves a FlagForced element");
+        assert_eq!(
+            data[pos + 3],
+            0,
+            "reserved FlagForced value must be 0 for a non-forced subtitle"
         );
+    }
+
+    /// A PGS display-set PES block (PCS) with one composition object, whose
+    /// forced_on_flag is set per `forced`.
+    #[cfg(test)]
+    fn pgs_display_set(forced: bool) -> Vec<u8> {
+        let mut pcs = vec![0u8; 18];
+        pcs[0] = 0x16; // segment type PCS
+        pcs[13] = 1; // number_of_composition_objects
+        pcs[17] = if forced { 0x40 } else { 0x00 }; // first object flags
+        pcs
+    }
+
+    #[test]
+    fn mkv_pgs_forced_promoted_when_all_display_sets_forced() {
+        // End-to-end: a PGS subtitle track whose every display set is forced is
+        // promoted to FlagForced=1 at finish(), even though the scan flag was
+        // false (no vendor metadata).
+        use crate::disc::SubtitleStream;
+        use std::sync::{Arc, Mutex};
+
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let sub = MkvTrack::subtitle(&SubtitleStream {
+            pid: 0x1200,
+            codec: Codec::Pgs,
+            language: "eng".into(),
+            forced: false,
+            qualifier: crate::disc::LabelQualifier::None,
+            codec_data: None,
+        });
+        let tracks = [make_video_track(), sub];
+        let mut muxer =
+            MkvMuxer::new(SharedWriter(shared.clone()), &tracks, None, 60.0, &[]).unwrap();
+        muxer
+            .write_frame(0, 0, true, &[0u8; 16], Some(40_000_000), None)
+            .unwrap(); // video keyframe opens a cluster
+        muxer
+            .write_frame(
+                1,
+                1_000_000,
+                true,
+                &pgs_display_set(true),
+                Some(2_000_000),
+                None,
+            )
+            .unwrap();
+        muxer.finish().unwrap();
+
+        let data = shared.lock().unwrap().clone().into_inner();
+        let pos = find_id(&data, ebml::FLAG_FORCED).expect("reserved FlagForced");
+        assert_eq!(
+            data[pos + 3],
+            1,
+            "all-forced PGS track promoted to FlagForced=1"
+        );
+    }
+
+    #[test]
+    fn mkv_pgs_not_promoted_when_a_display_set_is_not_forced() {
+        // A track with ANY non-forced display set is a full track, not forced
+        // narrative — FlagForced stays 0.
+        use crate::disc::SubtitleStream;
+        use std::sync::{Arc, Mutex};
+
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let sub = MkvTrack::subtitle(&SubtitleStream {
+            pid: 0x1200,
+            codec: Codec::Pgs,
+            language: "eng".into(),
+            forced: false,
+            qualifier: crate::disc::LabelQualifier::None,
+            codec_data: None,
+        });
+        let tracks = [make_video_track(), sub];
+        let mut muxer =
+            MkvMuxer::new(SharedWriter(shared.clone()), &tracks, None, 60.0, &[]).unwrap();
+        muxer
+            .write_frame(0, 0, true, &[0u8; 16], Some(40_000_000), None)
+            .unwrap();
+        muxer
+            .write_frame(
+                1,
+                1_000_000,
+                true,
+                &pgs_display_set(true),
+                Some(2_000_000),
+                None,
+            )
+            .unwrap();
+        muxer
+            .write_frame(
+                1,
+                3_000_000,
+                true,
+                &pgs_display_set(false),
+                Some(4_000_000),
+                None,
+            )
+            .unwrap(); // a normal (non-forced) subtitle → not a forced track
+        muxer.finish().unwrap();
+
+        let data = shared.lock().unwrap().clone().into_inner();
+        let pos = find_id(&data, ebml::FLAG_FORCED).expect("reserved FlagForced");
+        assert_eq!(data[pos + 3], 0, "mixed PGS track stays FlagForced=0");
     }
 
     // ============================================================
