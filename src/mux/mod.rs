@@ -116,6 +116,7 @@ pub(crate) mod videomap;
 pub use disc::DiscStream;
 pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
+pub use mp4::{Mp4FitReport, Mp4SkipReason, fit_report as mp4_fit_report};
 pub use network::NetworkStream;
 pub use null::NullStream;
 pub use pipelined_stream::PipelinedPesStream;
