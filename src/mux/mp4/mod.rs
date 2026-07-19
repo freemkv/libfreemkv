@@ -27,7 +27,9 @@ use std::io::{self, Seek, SeekFrom, Write};
 
 mod audio;
 mod boxes;
+mod read;
 use boxes::{bx, fullbox};
+pub use read::Mp4Reader;
 
 /// Nanoseconds per second — PTS is carried in ns, media timescales are Hz.
 const NS: i64 = 1_000_000_000;
