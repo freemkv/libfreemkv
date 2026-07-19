@@ -41,6 +41,11 @@ pub struct Ac3Parser {
     /// the running per-frame PTS at the point the partial tail was retained.
     /// Used by `flush()` to time the final buffered frame at EOS.
     flush_pts_ns: i64,
+    /// Keep/drop bookkeeping for the CRC decodability gate. A frame that fails
+    /// its native CRC is dropped rather than shipped as a decoder-choking glitch;
+    /// the running PTS is advanced across it (see the emit loop) so the drop is a
+    /// silence gap, never a shift of the following audio.
+    tally: super::dropgate::DropTally,
 }
 
 impl Default for Ac3Parser {
@@ -54,7 +59,98 @@ impl Ac3Parser {
         Self {
             buf: Vec::with_capacity(4096),
             flush_pts_ns: 0,
+            tally: super::dropgate::DropTally::new("ac3"),
         }
+    }
+
+    /// Access units dropped as undecodable so far — surfaced to the CLI/mux.
+    pub fn dropped_frames(&self) -> u64 {
+        self.tally.dropped_frames()
+    }
+
+    /// Total decoded duration (ns) of dropped access units.
+    pub fn dropped_duration_ns(&self) -> u64 {
+        self.tally.dropped_duration_ns()
+    }
+
+    /// Emit the final buffered frame at EOS, through the decodability gate.
+    /// During streaming a final frame may sit in `buf` with no following PES to
+    /// complete it; without this drain the last ~32 ms of audio is lost. Only a
+    /// fully-sized frame at a syncword is considered; a partial/garbage tail is
+    /// discarded, and a corrupt (CRC-failing) final frame is dropped.
+    fn flush_tail(&mut self) -> Vec<Frame> {
+        let buf = std::mem::take(&mut self.buf);
+        let Some(off) = find_ac3_sync(&buf) else {
+            return Vec::new();
+        };
+        let frame_all = &buf[off..];
+        if frame_all.len() < 6 {
+            return Vec::new();
+        }
+        let bsid = get_bsid(frame_all);
+        let frame_size = if bsid >= 11 {
+            eac3_frame_size(frame_all)
+        } else {
+            ac3_frame_size(frame_all)
+        };
+        if !(MIN_FRAME_BYTES..=8192).contains(&frame_size) || off + frame_size > buf.len() {
+            return Vec::new();
+        }
+        let frame = &buf[off..off + frame_size];
+        let duration_ns = frame_duration_ns(frame, bsid);
+        if let Some(reason) = ac3_drop_reason(&self.tally, frame, bsid) {
+            self.tally
+                .record_drop(self.flush_pts_ns, duration_ns as i64, frame.len(), reason);
+            return Vec::new();
+        }
+        self.tally.record_kept();
+        vec![Frame {
+            discontinuity: false,
+            coding: None,
+            source: None,
+            pts_ns: self.flush_pts_ns,
+            keyframe: true,
+            data: frame.to_vec(),
+            duration_ns: Some(duration_ns),
+        }]
+    }
+}
+
+use super::crc::crc16_ansi;
+
+/// Whether a fully-buffered (E-)AC-3 frame passes its native CRC. ffmpeg's
+/// decoder checks exactly this — `av_crc(AV_CRC_16_ANSI, 0, &buf[2],
+/// frame_size - 2) == 0` (ac3dec.c) — over the frame after the 2-byte syncword;
+/// the trailing crc word makes a clean frame's residue zero. A nonzero residue
+/// is a ~1-in-65536-certain sign of payload corruption, so we drop the frame
+/// (silence gap) rather than ship a glitch. `frame` must be exactly the frame
+/// bytes (syncword .. frame_size).
+fn frame_crc_ok(frame: &[u8]) -> bool {
+    // Need the syncword (2) plus at least one covered byte; the caller only
+    // invokes this on a fully-sized frame, so this is defensive.
+    if frame.len() < 4 {
+        return true;
+    }
+    crc16_ansi(&frame[2..]) == 0
+}
+
+/// Decodability verdict for a fully-sized (E-)AC-3 frame: `Some(reason)` when it
+/// must be dropped, `None` when it decodes. Drops (in order): a poisoned track
+/// (mostly-undecodable → drop the rest), a bitstream id ffmpeg's parser rejects
+/// (`bsid > 16` → `AC3_PARSE_ERROR_BSID`), or a failed native frame CRC.
+fn ac3_drop_reason(
+    tally: &super::dropgate::DropTally,
+    frame: &[u8],
+    bsid: u8,
+) -> Option<&'static str> {
+    if tally.is_poisoned() {
+        Some("track-poisoned")
+    } else if bsid > 16 {
+        Some("bsid")
+    } else if !frame_crc_ok(frame) {
+        Some("crc")
+    } else {
+        None
     }
 }
 
@@ -91,10 +187,12 @@ impl CodecParser for Ac3Parser {
         // in practice, so this is defense-in-depth.
         let base_pts_ns = pes.pts.map(pts_to_ns).unwrap_or(self.flush_pts_ns);
 
-        // Prepend leftover from previous PES
+        // Prepend leftover from previous PES, then take the whole buffer into a
+        // local so the emit loop can call `self.tally` (the bytes are no longer
+        // borrowed from `self`). The unconsumed tail is written back at the end.
         self.buf.extend_from_slice(&pes.data);
-
-        let data = &self.buf;
+        let buf = std::mem::take(&mut self.buf);
+        let data = &buf;
         let mut frames = Vec::new();
         let mut pos = 0;
         // Running PTS for the next frame to emit in this call.
@@ -134,15 +232,26 @@ impl CodecParser for Ac3Parser {
             }
 
             let duration_ns = frame_duration_ns(remaining, bsid);
-            frames.push(Frame {
-                discontinuity: false,
-                coding: None,
-                source: None,
-                pts_ns: frame_pts_ns,
-                keyframe: true,
-                data: data[start..start + frame_size].to_vec(),
-                duration_ns: Some(duration_ns),
-            });
+            let frame = &data[start..start + frame_size];
+            // Decodability gate: drop a frame ffmpeg's parser rejects (bsid > 16)
+            // or whose native CRC fails (payload corruption). `frame_pts_ns` is
+            // advanced BELOW whether or not the frame survives, so a drop is a
+            // silence gap and the following frames keep their true PTS.
+            if let Some(reason) = ac3_drop_reason(&self.tally, frame, bsid) {
+                self.tally
+                    .record_drop(frame_pts_ns, duration_ns as i64, frame.len(), reason);
+            } else {
+                self.tally.record_kept();
+                frames.push(Frame {
+                    discontinuity: false,
+                    coding: None,
+                    source: None,
+                    pts_ns: frame_pts_ns,
+                    keyframe: true,
+                    data: frame.to_vec(),
+                    duration_ns: Some(duration_ns),
+                });
+            }
             frame_pts_ns += duration_ns as i64;
             pos = start + frame_size;
         }
@@ -198,38 +307,10 @@ impl CodecParser for Ac3Parser {
     }
 
     fn flush(&mut self) -> Vec<Frame> {
-        // End of stream: emit a complete final frame still buffered. During
-        // streaming a final frame may sit in `buf` with no following PES to
-        // complete/confirm it; without this drain the last ~32 ms of audio is
-        // dropped at EOS (mirrors dts.rs::flush). Only a fully-sized frame at a
-        // syncword is emitted; a partial/garbage tail is discarded.
-        let buf = std::mem::take(&mut self.buf);
-        let Some(off) = find_ac3_sync(&buf) else {
-            return Vec::new();
-        };
-        let frame = &buf[off..];
-        if frame.len() < 6 {
-            return Vec::new();
-        }
-        let bsid = get_bsid(frame);
-        let frame_size = if bsid >= 11 {
-            eac3_frame_size(frame)
-        } else {
-            ac3_frame_size(frame)
-        };
-        if !(MIN_FRAME_BYTES..=8192).contains(&frame_size) || off + frame_size > buf.len() {
-            return Vec::new();
-        }
-        let duration_ns = frame_duration_ns(frame, bsid);
-        vec![Frame {
-            discontinuity: false,
-            coding: None,
-            source: None,
-            pts_ns: self.flush_pts_ns,
-            keyframe: true,
-            data: buf[off..off + frame_size].to_vec(),
-            duration_ns: Some(duration_ns),
-        }]
+        let out = self.flush_tail();
+        // Aggregate drop report at end-of-stream (warn-level, always visible).
+        self.tally.log_summary();
+        out
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
@@ -460,7 +541,22 @@ mod tests {
         frame[1] = 0x77;
         frame[4] = (fscod << 6) | frmsizecod;
         frame[5] = 0x08 << 3; // bsid = 8 (AC-3)
+        finalize_ac3_crc(&mut frame);
         frame
+    }
+
+    /// Set the trailing CRC word so the whole-frame residue over `[2..]` is zero
+    /// — i.e. the frame passes the decodability gate. Relies on the CRC-16/ANSI
+    /// residue property: appending `crc16([2..n-2])` (big-endian) zeroes the
+    /// register over `[2..n]`. Leaves the crc1 field (bytes 2-3) untouched.
+    fn finalize_ac3_crc(frame: &mut [u8]) {
+        let n = frame.len();
+        if n < 4 {
+            return;
+        }
+        let c = crc16_ansi(&frame[2..n - 2]);
+        frame[n - 2] = (c >> 8) as u8;
+        frame[n - 1] = (c & 0xFF) as u8;
     }
 
     #[test]
@@ -1090,27 +1186,33 @@ mod tests {
     // --- frame acceptance / rejection at the size boundaries ---
 
     #[test]
-    fn eac3_frame_at_min_frame_bytes_is_accepted() {
-        // The smallest acceptable (E-)AC-3 frame is MIN_FRAME_BYTES = 6.
-        // Build an E-AC-3 frame whose frmsiz sizes it to exactly 6 bytes
-        // (frmsiz=2). bsid >= 11 selects E-AC-3 sizing. The parser must emit it.
+    fn eac3_frame_at_min_frame_bytes_passes_sizing_then_crc_gate() {
+        // The smallest frame the SIZING layer accepts is MIN_FRAME_BYTES = 6
+        // (frmsiz=2). A synthetic all-zero 6-byte frame passes sizing (so it
+        // reaches the decodability gate — proven by it being COUNTED as a drop,
+        // not silently size-skipped) but fails the CRC gate and is dropped; the
+        // following real AC-3 frame (valid CRC) is emitted.
         let mut parser = Ac3Parser::new();
         // 0x0B 0x77 | byte2=0 byte3=2 (frmsiz=2 → 6 bytes) | byte4=0 | byte5 bsid
         let mut data = vec![0x0B, 0x77, 0x00, 0x02, 0x00, 16 << 3];
-        // pad to exactly 6 bytes (already 6). Then a trailing real AC-3 frame so
-        // the 6-byte frame isn't a tail that needs more data.
         data.truncate(6);
         data.extend_from_slice(&make_ac3_frame(0, 2));
         let f = parser.parse(&make_eac3_pes(data));
-        assert_eq!(f.len(), 2, "6-byte E-AC-3 frame accepted + following AC-3");
-        assert_eq!(f[0].data.len(), 6);
+        assert_eq!(f.len(), 1, "6-byte frame dropped (CRC), real AC-3 emitted");
+        assert_eq!(f[0].data.len(), 160, "the surviving frame is the real AC-3");
+        assert_eq!(
+            parser.dropped_frames(),
+            1,
+            "the 6-byte frame reached the gate"
+        );
     }
 
     #[test]
     fn eac3_max_frmsiz_frame_within_window_accepted() {
         // E-AC-3 frmsiz is an 11-bit field (3 bits of byte2 + 8 bits of byte3),
         // so its maximum value is 0x7FF = 2047 → (2048)*2 = 4096 bytes, which is
-        // inside the MIN_FRAME_BYTES..=8192 accept window and must be emitted.
+        // inside the MIN_FRAME_BYTES..=8192 accept window and, with a valid CRC,
+        // must be emitted.
         let mut parser = Ac3Parser::new();
         let mut frame = vec![0u8; 4096];
         frame[0] = 0x0B;
@@ -1118,6 +1220,7 @@ mod tests {
         frame[2] = 0x07; // frmsiz high
         frame[3] = 0xFF; // frmsiz low → 0x7FF = 2047 → 4096 bytes
         frame[5] = 16 << 3; // bsid 16 (E-AC-3)
+        finalize_ac3_crc(&mut frame); // pass the decodability gate
         let f = parser.parse(&make_eac3_pes(frame));
         assert_eq!(f.len(), 1, "4096-byte E-AC-3 frame within window accepted");
         assert_eq!(f[0].data.len(), 4096);
@@ -1294,6 +1397,96 @@ mod tests {
         let frame = make_ac3_frame(0, 2);
         // make_ac3_frame leaves byte 6 = 0 → acmod=0, lfeon=0 → 2 channels.
         assert_eq!(acmod_channels(&frame), Some(2));
+    }
+
+    // --- decodability (CRC) gate: keep clean frames, drop corrupt ones ---
+
+    /// A structurally-valid AC-3 frame with one payload byte corrupted so its
+    /// native CRC fails (header/size intact, so the framer delimits it normally).
+    fn make_corrupt_ac3_frame(fscod: u8, frmsizecod: u8) -> Vec<u8> {
+        let mut f = make_ac3_frame(fscod, frmsizecod);
+        f[20] ^= 0xFF; // flip a payload byte → CRC no longer zero
+        assert!(!frame_crc_ok(&f), "corruption must break the CRC");
+        f
+    }
+
+    #[test]
+    fn crc16_residue_zero_after_finalize_nonzero_after_corruption() {
+        // The CRC-16/ANSI residue property the gate relies on: a finalized frame
+        // has residue 0 over [2..]; flipping any covered byte makes it nonzero.
+        let good = make_ac3_frame(0, 2);
+        assert!(frame_crc_ok(&good));
+        let bad = make_corrupt_ac3_frame(0, 2);
+        assert!(!frame_crc_ok(&bad));
+    }
+
+    #[test]
+    fn crc_fail_frame_is_dropped_survivors_kept() {
+        // good / corrupt / good in one PES: the corrupt middle frame is dropped
+        // (CRC), the two clean frames are emitted, and the drop is counted.
+        let mut parser = Ac3Parser::new();
+        let mut data = make_ac3_frame(0, 2);
+        data.extend_from_slice(&make_corrupt_ac3_frame(0, 2));
+        data.extend_from_slice(&make_ac3_frame(0, 2));
+        let f = parser.parse(&make_eac3_pes(data));
+        // Only two of three survive; flush has nothing (all closed in-call).
+        assert_eq!(f.len(), 2, "corrupt frame dropped, two clean survive");
+        assert_eq!(parser.dropped_frames(), 1);
+        assert_eq!(
+            parser.dropped_duration_ns(),
+            32_000_000,
+            "one 32ms frame of silence"
+        );
+    }
+
+    #[test]
+    fn crc_drop_preserves_pts_sync_no_shift() {
+        // THE INVARIANT: dropping a corrupt frame must not shift the audio after
+        // it. good / corrupt / good in one PES — the corrupt frame is dropped but
+        // the trailing clean frame keeps the EXACT PTS it would have had with no
+        // drop (base + 2 frame durations): a silence gap, not a shift.
+        let mut parser = Ac3Parser::new();
+        let mut data = make_ac3_frame(0, 2); // f0
+        data.extend_from_slice(&make_corrupt_ac3_frame(0, 2)); // dropped
+        data.extend_from_slice(&make_ac3_frame(0, 2)); // f2
+        let f = parser.parse(&make_eac3_pes(data));
+        assert_eq!(f.len(), 2);
+        let base = pts_to_ns(90000);
+        let frame_dur = 32_000_000i64; // 1536 @ 48k
+        assert_eq!(f[0].pts_ns, base, "f0 at PES base");
+        assert_eq!(
+            f[1].pts_ns,
+            base + 2 * frame_dur,
+            "surviving frame keeps its true timeline (base + 2 frames) — gap, not shift"
+        );
+    }
+
+    #[test]
+    fn bsid_over_16_is_dropped() {
+        // ffmpeg's parser rejects bsid > 16 (AC3_PARSE_ERROR_BSID). A frame with
+        // bsid = 17 that still sizes must be dropped, not emitted.
+        let mut frame = vec![0u8; 128];
+        frame[0] = 0x0B;
+        frame[1] = 0x77;
+        frame[3] = 63; // frmsiz = 63 → (63+1)*2 = 128 bytes (E-AC-3 sizing)
+        frame[5] = 17 << 3; // bsid = 17 (> 16)
+        assert_eq!(get_bsid(&frame), 17);
+        let tally = super::super::dropgate::DropTally::new("ac3");
+        assert_eq!(ac3_drop_reason(&tally, &frame, 17), Some("bsid"));
+    }
+
+    #[test]
+    fn clean_stream_drops_nothing() {
+        // A stream of valid frames passes untouched — zero false positives.
+        let mut parser = Ac3Parser::new();
+        let mut data = Vec::new();
+        for _ in 0..5 {
+            data.extend_from_slice(&make_ac3_frame(0, 2));
+        }
+        let mut f = parser.parse(&make_eac3_pes(data));
+        f.extend(parser.flush());
+        assert_eq!(f.len(), 5);
+        assert_eq!(parser.dropped_frames(), 0);
     }
 
     // helper: PES with a generic pts for E-AC-3 tests
