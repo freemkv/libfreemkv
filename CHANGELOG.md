@@ -4,6 +4,12 @@
 
 ### Added
 
+- **MP4 input (`mp4://` as a source)** — a progressive-MP4 demuxer, the inverse
+  of the muxer: it rebuilds the title + per-sample index from `moov`/`stbl` and
+  streams samples back as PES frames, so `mp4://` now flows to **any** sink
+  (`mp4:// mkv://`, `mp4:// audio://`, `mp4:// json://`, …). Round-trip is
+  frame-exact (verified `iso:// mp4://` → `mp4:// mkv://` preserves every video
+  and audio packet). Progressive MP4 only; fragmented (`moof`) is future work.
 - **Native MP4 output (`mp4://`)** — a progressive ISO-BMFF muxer
   (`ftyp`+`mdat`+`moov`), so a disc goes straight to a play-everywhere `.mp4` in
   one decrypt pass, no ffmpeg round-trip. Carries HEVC / H.264 video (HDR10 colour
