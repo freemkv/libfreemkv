@@ -62,6 +62,7 @@ pub(crate) mod m2ts;
 /// to round-trip codec_privates that don't fit inside the underlying format).
 /// Exposed for integration tests that exercise the wire format directly.
 pub mod meta;
+pub(crate) mod meta_sink;
 
 // ── Sequential-sink muxers ──────────────────────────────────────────────────
 //
