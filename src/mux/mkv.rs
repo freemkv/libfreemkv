@@ -704,12 +704,9 @@ struct Ac3ChannelFixup {
 struct PgsForcedFixup {
     /// Absolute file offset of the 1-byte `FlagForced` value in the Tracks element.
     value_offset: u64,
-    /// Whether the track has displayed at least one subtitle (a display PCS).
-    has_display: bool,
-    /// Whether EVERY display set so far carried the forced_on_flag. Starts true;
-    /// cleared by the first non-forced display set. With `has_display`, a value of
-    /// true at `finish()` means the whole track is forced narrative.
-    all_forced: bool,
+    /// Shared forced-narrative classifier fed the track's display sets. The same
+    /// type drives the `info`-time forced probe, so both classify identically.
+    tracker: super::codec::pgs::ForcedTracker,
 }
 
 /// TimestampScale: nanoseconds per Matroska timestamp tick. 0.1 ms (100_000 ns).
@@ -984,8 +981,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     i,
                     PgsForcedFixup {
                         value_offset,
-                        has_display: false,
-                        all_forced: true,
+                        tracker: super::codec::pgs::ForcedTracker::new(),
                     },
                 );
             } else if track.is_forced {
@@ -1560,10 +1556,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // non-forced set appears. `finish()` promotes FlagForced only for a track
         // that displayed subtitles and had every one forced.
         if let Some(fixup) = self.pgs_forced_fixups.get_mut(&track_idx) {
-            if let Some(forced) = super::codec::pgs::display_set_is_forced(data) {
-                fixup.has_display = true;
-                fixup.all_forced &= forced;
-            }
+            fixup.tracker.observe(data);
         }
 
         Ok(())
@@ -1606,7 +1599,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let forced_offsets: Vec<u64> = self
             .pgs_forced_fixups
             .values()
-            .filter(|f| f.has_display && f.all_forced)
+            .filter(|f| f.tracker.is_forced())
             .map(|f| f.value_offset)
             .collect();
         if !forced_offsets.is_empty() {
