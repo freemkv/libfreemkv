@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Native MP4 output (`mp4://`)** — a progressive ISO-BMFF muxer
+  (`ftyp`+`mdat`+`moov`), so a disc goes straight to a play-everywhere `.mp4` in
+  one decrypt pass, no ffmpeg round-trip. Carries HEVC / H.264 video (HDR10 colour
+  via `colr`) and the Dolby audio family (AC-3 → `dac3`, E-AC-3 → `dec3`), with
+  correct sample tables and B-frame composition offsets. It's a **compatibility
+  export, not archival**: MP4 can't hold TrueHD, DTS-HD MA, or bitmap (PGS/VobSub)
+  subtitles, so those are **excluded with a loud, itemized report — never a silent
+  drop** (`mkv://` remains the keep-everything path). Verified byte-for-byte
+  equivalent to `ffmpeg -c copy`: frame-exact video and audio, identical colour and
+  duration, clean decode.
+
 - **Five extraction sinks — dissect a title, don't just rip it.** New write-only
   destinations that pull one facet of a title out on its own:
   - **`video://dir/`** — every video track to its own file, as a raw elementary
