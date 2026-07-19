@@ -88,6 +88,10 @@ pub struct DemuxOptions {
     pub export_chapters: bool,
     /// Selected track indices. `None` = all tracks.
     pub selection: Option<Vec<usize>>,
+    /// Restrict output to one track class. `None` = every class (plain
+    /// `demux://`). `Some(Audio)` is the `audio://` sink; `Some(Subtitle)` is
+    /// `sub://`. Filtered tracks are skipped entirely (no file written).
+    pub kind_filter: Option<TrackKind>,
 }
 
 impl Default for DemuxOptions {
@@ -99,13 +103,16 @@ impl Default for DemuxOptions {
             chapters_fmt: ChaptersFmt::default(),
             export_chapters: true,
             selection: None,
+            kind_filter: None,
         }
     }
 }
 
-/// Track class, used for delay attribution and naming.
+/// Track class, used for delay attribution and naming — and, via
+/// [`DemuxOptions::kind_filter`], to restrict a demux to one class (the
+/// `audio://` / `sub://` sinks are a `demux://` filtered to Audio / Subtitle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrackKind {
+pub enum TrackKind {
     Video,
     Audio,
     Subtitle,
@@ -658,6 +665,11 @@ impl DemuxSink {
                     (TrackKind::Subtitle, s.codec, s.pid, s.language.clone())
                 }
             };
+            // Kind filter: `audio://` / `sub://` keep only their class.
+            if opts.kind_filter.is_some_and(|k| k != kind) {
+                tracks.push(None);
+                continue;
+            }
             if kind == TrackKind::Video && ref_video_track.is_none() {
                 ref_video_track = Some(idx);
             }
@@ -874,12 +886,57 @@ mod tests {
         })
     }
 
+    fn subtitle_stream(codec: Codec, lang: &str) -> DiscStream {
+        DiscStream::Subtitle(crate::disc::SubtitleStream {
+            pid: 0x1200,
+            codec,
+            language: lang.to_string(),
+            forced: false,
+            qualifier: crate::disc::LabelQualifier::None,
+            codec_data: None,
+        })
+    }
+
     fn title_with(streams: Vec<DiscStream>, privates: Vec<Option<Vec<u8>>>) -> DiscTitle {
         let mut t = DiscTitle::empty();
         t.streams = streams;
         t.codec_privates = privates;
         t.content_format = ContentFormat::BdTs;
         t
+    }
+
+    /// `audio://` and `sub://` are `demux://` with a kind filter: only tracks of
+    /// the selected class get a file; every other track is skipped entirely.
+    #[test]
+    fn kind_filter_keeps_only_the_selected_class() {
+        let title = title_with(
+            vec![
+                video_stream(Codec::H264),
+                audio_stream(Codec::Ac3, "eng"),
+                subtitle_stream(Codec::Pgs, "eng"),
+            ],
+            vec![None, None, None],
+        );
+        let sub_opts = DemuxOptions {
+            kind_filter: Some(TrackKind::Subtitle),
+            export_chapters: false,
+            ..Default::default()
+        };
+        let sub = DemuxSink::create(&tempdir(), &title, &sub_opts).unwrap();
+        assert!(
+            sub.tracks[0].is_none() && sub.tracks[1].is_none() && sub.tracks[2].is_some(),
+            "sub:// keeps only the subtitle track"
+        );
+        let audio_opts = DemuxOptions {
+            kind_filter: Some(TrackKind::Audio),
+            export_chapters: false,
+            ..Default::default()
+        };
+        let audio = DemuxSink::create(&tempdir(), &title, &audio_opts).unwrap();
+        assert!(
+            audio.tracks[0].is_none() && audio.tracks[1].is_some() && audio.tracks[2].is_none(),
+            "audio:// keeps only the audio track"
+        );
     }
 
     // ── Annex-B reframing ────────────────────────────────────────────────────
