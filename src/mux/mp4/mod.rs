@@ -1,10 +1,13 @@
 //! Progressive MP4 (ISO-BMFF) muxer — `mp4://`.
 //!
-//! Writes `ftyp` + `mdat` + `moov` (moov-at-end): sample data streams straight
-//! into `mdat` as frames arrive, per-track sample tables accumulate in memory,
-//! and the `moov` index is written at `finish()` after seeking back to patch the
-//! `mdat` size. Unlike the fragmented `fmp4` sibling (DASH init+moof/mdat), this
-//! is a single self-contained file — the shape people mean by "an mp4".
+//! Writes `ftyp` + `moov` + `mdat` with **faststart on by default**: a
+//! `moov`-sized hole is reserved between `ftyp` and `mdat` at the start (so
+//! sample offsets are fixed and never rewritten), sample data streams into
+//! `mdat`, and at `finish()` the `moov` index is written into the reserved hole
+//! with a trailing `free` box for the slack. If the estimate is blown, it falls
+//! back to moov-at-end. Unlike the fragmented `fmp4` sibling (DASH init+moof/
+//! mdat), this is a single self-contained file — the shape people mean by "an
+//! mp4" — and moov-first means it streams over HTTP without a pre-fetch.
 //!
 //! ## Track model
 //!
@@ -33,6 +36,56 @@ pub use read::Mp4Reader;
 
 /// Nanoseconds per second — PTS is carried in ns, media timescales are Hz.
 const NS: i64 = 1_000_000_000;
+
+// ── faststart reserve sizing ─────────────────────────────────────────────────
+//
+// Faststart is on by default: reserve a `moov`-sized hole between `ftyp` and
+// `mdat`, then write `moov` into it at finish and pad the slack with a `free`
+// box. Because the hole precedes `mdat`, sample offsets are fixed from the start
+// — no rewrite, no offset patch. `moov` is dominated by the per-sample tables
+// (`stsz` 4 B + `co64` 8 B + `ctts`/`stts`/`stss` ~4 B, one-sample-per-chunk), so
+// its size scales with the total sample count.
+
+/// Estimated `moov` bytes per sample (calibrated against real discs; bias high).
+const BYTES_PER_SAMPLE: u64 = 16;
+/// Safety buffer added on top of the rounded estimate.
+const RESERVE_BUFFER: u64 = 4 << 20; // 4 MiB
+/// Floor for the reserve (covers short/unknown-duration titles).
+const RESERVE_FLOOR: u64 = 8 << 20; // 8 MiB
+/// Rounding granularity for the reserve.
+const RESERVE_GRAIN: u64 = 4 << 20; // 4 MiB
+
+fn round_up_grain(x: u64) -> u64 {
+    x.div_ceil(RESERVE_GRAIN) * RESERVE_GRAIN
+}
+
+/// Estimate the faststart hole: `round_up_4MB(bytes_per_sample × est_samples)`
+/// plus a 4 MiB buffer, floored at 8 MiB. `est_samples` comes from the title
+/// duration × each included track's frame rate.
+fn estimate_reserve(title: &DiscTitle, included: &[usize]) -> u64 {
+    let dur = title.duration_secs.max(1.0);
+    let mut est_samples = 0f64;
+    for &i in included {
+        match &title.streams[i] {
+            DiscStream::Video(v) => {
+                let (n, d) = v.frame_rate.as_fraction();
+                let fps = if n > 0 && d > 0 {
+                    n as f64 / d as f64
+                } else {
+                    24.0
+                };
+                est_samples += dur * fps;
+            }
+            DiscStream::Audio(a) => {
+                // ~1536 samples per (E-)AC-3 frame.
+                est_samples += dur * (a.sample_rate.hz() / 1536.0);
+            }
+            DiscStream::Subtitle(_) => {}
+        }
+    }
+    let est = (est_samples as u64).saturating_mul(BYTES_PER_SAMPLE);
+    round_up_grain(est).max(RESERVE_FLOOR) + RESERVE_BUFFER
+}
 
 /// One accumulated sample's bookkeeping (the mdat bytes are already on disk).
 struct Sample {
@@ -150,10 +203,15 @@ pub struct Mp4Sink<W: Write + Seek> {
     tracks: Vec<Track>,
     /// `title.streams` index → position in `tracks`, or `None` if excluded.
     route: Vec<Option<usize>>,
-    /// File offset of the `mdat` box header (for the 64-bit size patch).
+    /// File offset of the `mdat` box header (for the 64-bit size patch). With
+    /// faststart this is `ftyp_len + reserve` (the hole precedes `mdat`).
     mdat_start: u64,
     /// Running `mdat` payload size in bytes.
     mdat_payload: u64,
+    /// File offset where the reserved faststart hole begins (right after `ftyp`).
+    hole_start: u64,
+    /// Reserved hole size in bytes (`moov` + trailing `free` padding go here).
+    reserve: u64,
     finished: bool,
 }
 
@@ -222,8 +280,20 @@ impl<W: Write + Seek> Mp4Sink<W> {
         }
 
         let ftyp = build_ftyp(video_codec);
-        let mdat_start = ftyp.len() as u64;
         writer.write_all(&ftyp)?;
+        let hole_start = ftyp.len() as u64;
+
+        // Faststart: reserve a `moov`-sized hole (a `free` box) between `ftyp`
+        // and `mdat`. Only the 8-byte `free` header is written now; the body is
+        // left as a hole (sparse) and overwritten at finish() by moov + a smaller
+        // `free`. `mdat` therefore starts at a fixed offset, so co64 offsets are
+        // correct as written — no rewrite, no patch.
+        let reserve = estimate_reserve(title, &report.included);
+        writer.write_all(&(reserve as u32).to_be_bytes())?;
+        writer.write_all(b"free")?;
+
+        let mdat_start = hole_start + reserve;
+        writer.seek(SeekFrom::Start(mdat_start))?;
         // mdat with 64-bit largesize: size=1 signals "largesize follows"; the
         // 8-byte largesize placeholder is patched at finish() once known.
         writer.write_all(&1u32.to_be_bytes())?;
@@ -237,12 +307,14 @@ impl<W: Write + Seek> Mp4Sink<W> {
             route,
             mdat_start,
             mdat_payload: 0,
+            hole_start,
+            reserve,
             finished: false,
         })
     }
 
-    /// Assemble and write the `moov` box from every track's sample tables.
-    fn write_moov(&mut self) -> io::Result<()> {
+    /// Assemble the `moov` box from every track's sample tables.
+    fn build_moov(&self) -> Vec<u8> {
         // Movie timescale = 90 kHz; movie duration = the longest track (converted).
         let movie_ts = 90_000u32;
         let mut movie_dur = 0u64;
@@ -258,8 +330,7 @@ impl<W: Write + Seek> Mp4Sink<W> {
         for trak in traks {
             moov.extend_from_slice(&trak);
         }
-        let moov = bx(b"moov", &moov);
-        self.writer.write_all(&moov)
+        bx(b"moov", &moov)
     }
 }
 
@@ -310,8 +381,31 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
         let mdat_total = 16 + self.mdat_payload;
         self.writer.seek(SeekFrom::Start(self.mdat_start + 8))?;
         self.writer.write_all(&mdat_total.to_be_bytes())?;
+
+        let moov = self.build_moov();
+        let moov_len = moov.len() as u64;
+        let gap = self.reserve.checked_sub(moov_len);
+        // Faststart when moov fits the reserved hole with either an exact fill or
+        // room for a valid (≥8-byte) `free` box in the slack. Otherwise fall back
+        // to moov-at-end (rare — the +4 MiB buffer makes this near-impossible).
+        match gap {
+            Some(g) if g == 0 || g >= 8 => {
+                self.writer.seek(SeekFrom::Start(self.hole_start))?;
+                self.writer.write_all(&moov)?;
+                if g >= 8 {
+                    // Fill the slack with a `free` box (header only; body is the
+                    // existing hole, ignored by parsers).
+                    self.writer.write_all(&(g as u32).to_be_bytes())?;
+                    self.writer.write_all(b"free")?;
+                }
+            }
+            _ => {
+                // Fallback: moov-at-end. The reserved hole stays a `free` box.
+                self.writer.seek(SeekFrom::End(0))?;
+                self.writer.write_all(&moov)?;
+            }
+        }
         self.writer.seek(SeekFrom::End(0))?;
-        self.write_moov()?;
         self.writer.flush()
     }
 
@@ -935,7 +1029,12 @@ mod tests {
         let buf = s.writer.into_inner();
         let boxes = walk(&buf);
         let types: Vec<[u8; 4]> = boxes.iter().map(|(t, _, _)| *t).collect();
-        assert_eq!(types, vec![*b"ftyp", *b"mdat", *b"moov"]);
+        // Faststart layout: ftyp, moov, free (reserve slack), mdat — moov BEFORE mdat.
+        assert_eq!(
+            types,
+            vec![*b"ftyp", *b"moov", *b"free", *b"mdat"],
+            "faststart: moov precedes mdat"
+        );
         // moov must contain exactly two trak boxes.
         let (_, ms, msz) = *boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
         let moov = &buf[ms + 8..ms + msz];
@@ -960,6 +1059,27 @@ mod tests {
         // mdat = header + 800+400 video + two AC-3 frames.
         let (_, _, mdat_sz) = *boxes.iter().find(|(t, _, _)| t == b"mdat").unwrap();
         assert_eq!(mdat_sz, 16 + 800 + 400 + ac3_frame().len() * 2);
+    }
+
+    #[test]
+    fn reserve_rounds_to_4mb_plus_buffer() {
+        // round_up_4MB(x) + 4 MiB, floored at 8 MiB.
+        assert_eq!(round_up_grain(1), 4 << 20);
+        assert_eq!(round_up_grain(4 << 20), 4 << 20);
+        assert_eq!(round_up_grain((4 << 20) + 1), 8 << 20);
+        // A 2 hr feature, 24 fps video + one AC-3 track: ~173k + ~225k samples
+        // × 16 B ≈ 6.4 MB → round to 8 MB → +4 MB buffer = 12 MB (floor also 8+4).
+        let mut t = title(vec![hevc_video(), audio(Codec::Ac3, "eng")], vec![]);
+        t.duration_secs = 7200.0;
+        let r = estimate_reserve(&t, &[0, 1]);
+        assert!(
+            r % (4 << 20) == 0,
+            "reserve is 4 MiB-aligned + 4 MiB buffer"
+        );
+        assert!(
+            r >= 12 << 20 && r <= 20 << 20,
+            "≈12-16 MB for a 2h feature, got {r}"
+        );
     }
 
     #[test]
