@@ -159,6 +159,7 @@ mod tests {
         assert_eq!(parse_url("iso://f").scheme(), "iso");
         assert_eq!(parse_url("null://").scheme(), "null");
         assert_eq!(parse_url("demux://out/").scheme(), "demux");
+        assert_eq!(parse_url("video://out/").scheme(), "video");
         assert_eq!(parse_url("audio://out/").scheme(), "audio");
         assert_eq!(parse_url("sub://out/").scheme(), "sub");
         assert_eq!(parse_url("chapters://c.xml").scheme(), "chapters");
