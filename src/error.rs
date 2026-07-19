@@ -150,6 +150,14 @@ pub const E_NETWORK_ADDR_BLOCKED: u16 = 9022;
 /// frame dropped before the first keyframe) cannot report success.
 pub const E_MUX_EMPTY: u16 = 9023;
 pub const E_EXTENT_NOT_UNIT_ALIGNED: u16 = 9030;
+/// `mp4://` output but the title has no (primary) video track to carry.
+pub const E_MP4_NO_VIDEO_TRACK: u16 = 9048;
+/// `mp4://` video track uses a codec with no MP4 mapping / no config record
+/// available here (e.g. VC-1, or MPEG-2 without an avcC/hvcC-style record).
+pub const E_MP4_UNSUPPORTED_VIDEO_CODEC: u16 = 9049;
+/// `mp4://` video track is missing its codec-configuration record
+/// (`hvcC`/`avcC`), without which the sample entry can't be written.
+pub const E_MP4_MISSING_CODEC_PRIVATE: u16 = 9050;
 /// READ CAPACITY returned a short or overflowing transfer.
 pub const E_DISC_CAPACITY_MALFORMED: u16 = 9047;
 
@@ -420,6 +428,12 @@ pub enum Error {
     /// every frame dropped before the first keyframe — fails loudly. The
     /// `m2ts://` analogue of [`Error::MkvInvalid`]'s zero-frame guard.
     MuxEmpty,
+    /// `mp4://` target title has no primary video track to mux.
+    MuxNoVideoTrack,
+    /// `mp4://` video codec has no MP4 sample-entry mapping available here.
+    Mp4UnsupportedVideoCodec,
+    /// `mp4://` video track is missing its `hvcC`/`avcC` configuration record.
+    MuxMissingCodecPrivate,
     PesFrameTooLarge {
         size: usize,
     },
@@ -599,6 +613,9 @@ impl Error {
             Error::StreamUrlMissingPort { .. } => E_STREAM_URL_MISSING_PORT,
             Error::NetworkAddrBlocked { .. } => E_NETWORK_ADDR_BLOCKED,
             Error::MuxEmpty => E_MUX_EMPTY,
+            Error::MuxNoVideoTrack => E_MP4_NO_VIDEO_TRACK,
+            Error::Mp4UnsupportedVideoCodec => E_MP4_UNSUPPORTED_VIDEO_CODEC,
+            Error::MuxMissingCodecPrivate => E_MP4_MISSING_CODEC_PRIVATE,
             Error::PesFrameTooLarge { .. } => E_PES_FRAME_TOO_LARGE,
             Error::PesInvalidMagic => E_PES_INVALID_MAGIC,
             Error::PesTrackTooLarge { .. } => E_PES_TRACK_TOO_LARGE,
@@ -1236,6 +1253,9 @@ mod tests {
             E_STREAM_URL_MISSING_PORT,
             E_NETWORK_ADDR_BLOCKED,
             E_MUX_EMPTY,
+            E_MP4_NO_VIDEO_TRACK,
+            E_MP4_UNSUPPORTED_VIDEO_CODEC,
+            E_MP4_MISSING_CODEC_PRIVATE,
             E_PES_FRAME_TOO_LARGE,
             E_PES_INVALID_MAGIC,
             E_PES_TRACK_TOO_LARGE,
@@ -1323,6 +1343,12 @@ mod tests {
             (Error::PipelineConsumerGone, E_PIPELINE_CONSUMER_GONE),
             (Error::DiscCapacityOverflow, E_DISC_CAPACITY_OVERFLOW),
             (Error::MuxEmpty, E_MUX_EMPTY),
+            (Error::MuxNoVideoTrack, E_MP4_NO_VIDEO_TRACK),
+            (
+                Error::Mp4UnsupportedVideoCodec,
+                E_MP4_UNSUPPORTED_VIDEO_CODEC,
+            ),
+            (Error::MuxMissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),
             (Error::M2tsPacketMalformed, E_M2TS_PACKET_MALFORMED),
             (Error::ExtentNotUnitAligned, E_EXTENT_NOT_UNIT_ALIGNED),
             (Error::DiscCapacityMalformed, E_DISC_CAPACITY_MALFORMED),

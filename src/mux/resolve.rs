@@ -45,6 +45,10 @@ pub enum StreamUrl {
     M2ts { path: PathBuf },
     /// Matroska container file.
     Mkv { path: PathBuf },
+    /// Progressive MP4 (ISO-BMFF) mux output (`mp4://`). Like `mkv://` but writes
+    /// a single self-contained `.mp4` (ftyp+mdat+moov). Compatibility export —
+    /// carries only MP4-mappable codecs; see `mux::mp4`.
+    Mp4 { path: PathBuf },
     /// Network stream (host:port).
     Network { addr: String },
     /// Standard I/O (stdin/stdout).
@@ -98,6 +102,7 @@ impl StreamUrl {
             StreamUrl::Disc { .. } => "disc",
             StreamUrl::M2ts { .. } => "m2ts",
             StreamUrl::Mkv { .. } => "mkv",
+            StreamUrl::Mp4 { .. } => "mp4",
             StreamUrl::Network { .. } => "network",
             StreamUrl::Stdio => "stdio",
             StreamUrl::Iso { .. } => "iso",
@@ -121,6 +126,7 @@ impl StreamUrl {
             StreamUrl::Disc { device: None } => "",
             StreamUrl::M2ts { path }
             | StreamUrl::Mkv { path }
+            | StreamUrl::Mp4 { path }
             | StreamUrl::Iso { path }
             | StreamUrl::Dir { path }
             | StreamUrl::Demux { dir: path }
@@ -166,6 +172,11 @@ pub fn parse_url(url: &str) -> StreamUrl {
     }
     if let Some(rest) = url.strip_prefix("mkv://") {
         return StreamUrl::Mkv {
+            path: PathBuf::from(rest),
+        };
+    }
+    if let Some(rest) = url.strip_prefix("mp4://") {
+        return StreamUrl::Mp4 {
             path: PathBuf::from(rest),
         };
     }
@@ -502,6 +513,8 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         // PES source. Mirror `null://` → write-only.
         StreamUrl::Dir { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
+        // `mp4://` is an output-only mux sink for now (no MP4 demux source).
+        StreamUrl::Mp4 { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         // `demux://` is an output-only sink (per-track ES files); never a source.
         StreamUrl::Demux { .. }
         | StreamUrl::Video { .. }
@@ -539,6 +552,10 @@ pub fn output(
                     crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
                 ));
             Ok(Box::new(MkvStream::create(writer, title, Some(path))?))
+        }
+        StreamUrl::Mp4 { ref path } => {
+            validate_file_path(path, "mp4")?;
+            Ok(Box::new(super::mp4::Mp4Sink::create(path, title)?))
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
