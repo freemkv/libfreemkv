@@ -46,11 +46,10 @@ fn mpa_verdict(data: &[u8]) -> MpaVerdict {
     {
         return MpaVerdict::Invalid;
     }
-    // Free format (bitrate_index == 0): ff_mpa_decode_header returns 1, which the
-    // framing wrapper treats as failure. Reject for consistency.
-    if (h >> 12) & 0xf == 0 {
-        return MpaVerdict::Invalid;
-    }
+    // NOTE: bitrate_index == 0 (free format) is NOT rejected. It is a legal,
+    // decodable MPEG-audio mode (ffmpeg's ff_mpa_check_header accepts it and the
+    // decoder derives the frame size from the sync spacing). Dropping it would be
+    // a false positive on a clean stream, so it passes the gate.
     MpaVerdict::Valid
 }
 
@@ -188,12 +187,15 @@ mod tests {
     }
 
     #[test]
-    fn free_format_bitrate_zero_is_dropped() {
+    fn free_format_bitrate_zero_is_kept() {
+        // Free format (bitrate_index == 0) is legal and decodable — it must NOT
+        // be dropped (that would be a false positive on a clean stream).
         let mut p = MpegAudioParser::new();
         let mut frame = mp3_frame(400);
-        frame[2] = 0x00; // bitrate_index = 0000 (free format)
-        assert!(p.parse(&make_pes(frame, Some(0))).is_empty());
-        assert_eq!(p.dropped_frames(), 1);
+        frame[2] = 0x00; // bitrate_index = 0000 (free format); sync/layer/rate ok
+        let f = p.parse(&make_pes(frame, Some(0)));
+        assert_eq!(f.len(), 1, "free-format frame kept");
+        assert_eq!(p.dropped_frames(), 0);
     }
 
     #[test]
