@@ -1,11 +1,13 @@
 //! MP4 audio sample entries and codec-config boxes for the `mp4://` muxer.
 //!
-//! Covers the Dolby family that maps cleanly into MP4 and plays widely:
-//! **AC-3** (`ac-3` + `dac3`) and **E-AC-3 / Dolby Digital Plus** (`ec-3` +
-//! `dec3`, which also carries Atmos-in-DD+ JOC). The config boxes are derived
-//! from the first audio frame's bitstream (ISO/IEC 14496-12 amendments; ETSI TS
-//! 102 366 Annexes F/G). Codecs with no clean MP4 mapping (TrueHD, DTS family,
-//! LPCM, bitmap subtitles) are handled by the fit oracle in the sink, not here.
+//! Covers the codecs that map cleanly into MP4 and play widely: **AC-3**
+//! (`ac-3` + `dac3`), **E-AC-3 / Dolby Digital Plus** (`ec-3` + `dec3`, incl.
+//! Atmos-in-DD+ JOC), and **DTS / DTS-HD** (`dtsc`/`dtsh` + `ddts`, describing
+//! the core with whole access units passed through so an HD decoder finds the
+//! extension). Config boxes are derived from the first audio frame's bitstream
+//! (ISO/IEC 14496-12 amendments; ETSI TS 102 366 / 102 114). Codecs with no
+//! clean MP4 mapping (TrueHD, LPCM, bitmap subtitles) are excluded by the fit
+//! oracle in the sink.
 
 use super::boxes::bx;
 use crate::disc::Codec;
@@ -228,29 +230,188 @@ pub(super) fn audio_sample_entry(
     bx(fourcc, &e)
 }
 
-/// The MP4 fourcc + config box for a Dolby audio frame, or `None` if the codec
-/// has no MP4 mapping here. Together with [`audio_fits`] this is the fit oracle
-/// for audio: only what returns `Some` is muxable.
-pub(super) fn dolby_sample_entry(codec: Codec, first_frame: &[u8]) -> Option<Vec<u8>> {
-    let c = parse_dolby(first_frame)?;
-    let (fourcc, config): (&[u8; 4], Vec<u8>) = match codec {
-        Codec::Ac3 => (b"ac-3", dac3_box(&c)),
-        Codec::Ac3Plus => (b"ec-3", dec3_box(&c)),
-        _ => return None,
-    };
-    Some(audio_sample_entry(
-        fourcc,
-        c.channels,
-        c.sample_rate,
-        &config,
-    ))
+// ── DTS (dtsc/dtsh + ddts) ───────────────────────────────────────────────────
+
+/// DTS core `SFREQ` (4-bit) → sample rate (Hz). Reserved indices → 48 kHz.
+const DTS_SFREQ: [u32; 16] = [
+    48_000, 8_000, 16_000, 32_000, 48_000, 48_000, 11_025, 22_050, 44_100, 48_000, 48_000, 12_000,
+    24_000, 48_000, 96_000, 192_000,
+];
+/// DTS core base channel count per `AMODE` (0..=9); higher AMODEs are rare on disc.
+const DTS_AMODE_CH: [u8; 10] = [1, 2, 2, 2, 2, 3, 3, 4, 4, 5];
+
+/// Decoded DTS core parameters needed for the `ddts` box.
+struct DtsConfig {
+    sample_rate: u32,
+    channels: u16,
+    amode: u8,
+    lfe: bool,
+    core_size: u32,
+    /// Samples per frame ((NBLKS+1)·32).
+    frame_samples: u32,
+    /// Whether a DTS-HD extension substream follows the core.
+    has_extension: bool,
+    channel_layout: u16,
 }
 
-/// Fit oracle for an audio codec: does `mp4://` currently carry it? M2 covers
-/// the Dolby family (AC-3 / E-AC-3). TrueHD, DTS(-HD), LPCM, AAC are not yet
+/// Parse the DTS core header (ETSI TS 102 114 §5.3.1), starting at the
+/// 0x7FFE8001 big-endian core sync. Returns `None` if too short / no sync.
+fn parse_dts(frame: &[u8]) -> Option<DtsConfig> {
+    let start = (0..frame.len().saturating_sub(3)).find(|&i| {
+        frame[i] == 0x7F && frame[i + 1] == 0xFE && frame[i + 2] == 0x80 && frame[i + 3] == 0x01
+    })?;
+    let f = &frame[start..];
+    if f.len() < 11 {
+        return None;
+    }
+    // Bit fields after the 32-bit sync (MSB-first):
+    // FTYPE1 SHORT5 CPF1 NBLKS7 FSIZE14 AMODE6 SFREQ4 RATE5 ...
+    let nblks = (((f[4] & 0x01) as u32) << 6) | ((f[5] >> 2) as u32 & 0x3F);
+    let fsize = (((f[5] & 0x03) as u32) << 12) | ((f[6] as u32) << 4) | ((f[7] >> 4) as u32 & 0x0F);
+    let amode = (((f[7] & 0x0F) << 2) | ((f[8] >> 6) & 0x03)) as usize;
+    let sfreq = ((f[8] >> 2) & 0x0F) as usize;
+    // LFF is 2 bits at bit offset 85 → byte10 bits 2-1.
+    let lff = (f[10] >> 1) & 0x03;
+    let lfe = lff == 1 || lff == 2;
+
+    let sample_rate = DTS_SFREQ[sfreq];
+    let base_ch = DTS_AMODE_CH.get(amode).copied().unwrap_or(6);
+    let channels = base_ch as u16 + lfe as u16;
+    let channel_layout = dts_channel_layout(amode, lfe);
+    // DTS-HD extension substream sync (0x64582025) after the core frame.
+    let ext_sync = [0x64, 0x58, 0x20, 0x25];
+    let has_extension = f
+        .windows(4)
+        .skip((fsize as usize + 1).min(f.len()).saturating_sub(4))
+        .any(|w| w == ext_sync)
+        || f.windows(4).any(|w| w == ext_sync);
+
+    Some(DtsConfig {
+        sample_rate,
+        channels,
+        amode: amode as u8,
+        lfe,
+        core_size: fsize + 1,
+        frame_samples: (nblks + 1) * 32,
+        has_extension,
+        channel_layout,
+    })
+}
+
+/// `ddts` ChannelLayout (16-bit speaker mask) for the common core layouts.
+/// bit0=C, bit1=L/R, bit2=Ls/Rs, bit3=LFE.
+fn dts_channel_layout(amode: usize, lfe: bool) -> u16 {
+    let mut m = match amode {
+        0 => 0x0001,     // C (mono)
+        1..=4 => 0x0002, // L/R
+        5 => 0x0003,     // C + L/R
+        6 | 8 => 0x0006, // L/R + Ls/Rs (no centre)
+        _ => 0x0007,     // C + L/R + surround (amode 7, 9, …)
+    };
+    if lfe {
+        m |= 0x0008;
+    }
+    m
+}
+
+/// The `ddts` config box (ETSI TS 102 114 Annex; DTS-in-ISO registration).
+/// Describes the DTS core; whole access units (core + any extension) are passed
+/// through as samples, so a DTS-HD-aware decoder still finds the extension.
+fn ddts_box(c: &DtsConfig) -> Vec<u8> {
+    // avg/max bitrate: computed from the core frame size × frame rate (the core
+    // RATE field reads "open/variable" for lossless, so it's not usable directly).
+    let frames_per_sec = if c.frame_samples > 0 {
+        c.sample_rate as u64 / c.frame_samples as u64
+    } else {
+        0
+    };
+    let bitrate = (c.core_size as u64 * 8 * frames_per_sec) as u32;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&c.sample_rate.to_be_bytes()); // DTSSamplingFrequency
+    out.extend_from_slice(&bitrate.to_be_bytes()); // maxBitrate
+    out.extend_from_slice(&bitrate.to_be_bytes()); // avgBitrate
+    out.push(if c.has_extension { 24 } else { 16 }); // pcmSampleDepth
+    // Bit-packed tail (56 bits):
+    // FrameDuration2 StreamConstruction5 CoreLFEPresent1 CoreLayout6 CoreSize14
+    // StereoDownmix1 RepresentationType3 ChannelLayout16 MultiAssetFlag1
+    // LBRDurationMod1 ReservedBoxPresent1 Reserved5
+    let frame_duration = match c.frame_samples {
+        0..=512 => 0,
+        513..=1024 => 1,
+        1025..=2048 => 2,
+        _ => 3,
+    };
+    // StreamConstruction: 1 = DTS core present. Whole-AU passthrough means an
+    // HD decoder still parses the extension substreams from the stream itself.
+    let stream_construction = 1u128;
+    let mut v: u128 = 0;
+    let mut push = |val: u128, bits: u32| v = (v << bits) | (val & ((1u128 << bits) - 1));
+    push(frame_duration as u128, 2);
+    push(stream_construction, 5);
+    push(c.lfe as u128, 1);
+    push(c.amode as u128, 6);
+    push(c.core_size as u128, 14);
+    push(0, 1); // StereoDownmix
+    push(0, 3); // RepresentationType
+    push(c.channel_layout as u128, 16);
+    push(c.has_extension as u128, 1); // MultiAssetFlag
+    push(0, 1); // LBRDurationMod
+    push(0, 1); // ReservedBoxPresent
+    push(0, 5); // Reserved
+    // 56 bits → the low 7 bytes of the big-endian u128.
+    let b = v.to_be_bytes();
+    out.extend_from_slice(&b[9..16]);
+    bx(b"ddts", &out)
+}
+
+/// The MP4 fourcc + config box for an audio frame, or `None` if the codec has no
+/// MP4 mapping here. Together with [`audio_fits`] this is the fit oracle for
+/// audio: only what returns `Some` is muxable.
+pub(super) fn dolby_sample_entry(codec: Codec, first_frame: &[u8]) -> Option<Vec<u8>> {
+    match codec {
+        Codec::Ac3 => {
+            let c = parse_dolby(first_frame)?;
+            Some(audio_sample_entry(
+                b"ac-3",
+                c.channels,
+                c.sample_rate,
+                &dac3_box(&c),
+            ))
+        }
+        Codec::Ac3Plus => {
+            let c = parse_dolby(first_frame)?;
+            Some(audio_sample_entry(
+                b"ec-3",
+                c.channels,
+                c.sample_rate,
+                &dec3_box(&c),
+            ))
+        }
+        Codec::Dts | Codec::DtsHdMa | Codec::DtsHdHr => {
+            let c = parse_dts(first_frame)?;
+            // `dtsc` = DTS core; `dtsh` = DTS-HD (core + extension substreams).
+            let fourcc: &[u8; 4] = if c.has_extension { b"dtsh" } else { b"dtsc" };
+            Some(audio_sample_entry(
+                fourcc,
+                c.channels,
+                c.sample_rate,
+                &ddts_box(&c),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Fit oracle for an audio codec: does `mp4://` currently carry it? Covers the
+/// Dolby family (AC-3 / E-AC-3) and DTS (core / DTS-HD HRA / DTS-HD MA — the core
+/// is described, whole access units pass through). TrueHD, LPCM, AAC are not yet
 /// mapped and are skipped with a loud report (never silently dropped).
 pub(super) fn audio_fits(codec: Codec) -> bool {
-    matches!(codec, Codec::Ac3 | Codec::Ac3Plus)
+    matches!(
+        codec,
+        Codec::Ac3 | Codec::Ac3Plus | Codec::Dts | Codec::DtsHdMa | Codec::DtsHdHr
+    )
 }
 
 #[cfg(test)]
@@ -327,11 +488,39 @@ mod tests {
     }
 
     #[test]
-    fn fit_oracle_dolby_only() {
+    fn fit_oracle_covers_dolby_and_dts() {
         assert!(audio_fits(Codec::Ac3));
         assert!(audio_fits(Codec::Ac3Plus));
+        assert!(audio_fits(Codec::Dts));
+        assert!(audio_fits(Codec::DtsHdMa));
         assert!(!audio_fits(Codec::TrueHd));
-        assert!(!audio_fits(Codec::DtsHdMa));
         assert!(!audio_fits(Codec::Lpcm));
+    }
+
+    #[test]
+    fn dts_core_5_1_and_ddts() {
+        // Synthetic DTS core: SFREQ=13 (48k), AMODE=9 (5ch), LFF=1 (LFE) → 5.1.
+        let f = vec![
+            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x3C, 0x05, 0xF2, 0x77, 0x00, 0x02, 0x00,
+        ];
+        let c = parse_dts(&f).expect("dts core parsed");
+        assert_eq!(c.sample_rate, 48_000);
+        assert_eq!(c.amode, 9);
+        assert!(c.lfe);
+        assert_eq!(c.channels, 6, "5 core + LFE = 5.1");
+        assert_eq!(c.channel_layout, 0x000F, "C + L/R + Ls/Rs + LFE");
+        assert_eq!(c.core_size, 96);
+        assert_eq!(c.frame_samples, 512);
+
+        let ddts = ddts_box(&c);
+        assert_eq!(&ddts[4..8], b"ddts");
+        // DTSSamplingFrequency (first field) = 48000.
+        assert_eq!(
+            u32::from_be_bytes([ddts[8], ddts[9], ddts[10], ddts[11]]),
+            48_000
+        );
+        // Sample entry uses dtsc (no extension in this synthetic frame).
+        let e = dolby_sample_entry(Codec::DtsHdMa, &f).unwrap();
+        assert_eq!(&e[4..8], b"dtsc");
     }
 }
