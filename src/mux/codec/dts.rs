@@ -49,6 +49,12 @@ pub struct DtsParser {
     /// running cursor: previous emit + its duration). Only consulted when
     /// `front_pts` is unchanged from `last_front_pts`. `PTS_UNSET` = no base yet.
     next_pts_ns: i64,
+    /// Keep/drop bookkeeping for the decodability gate: counts, per-drop and
+    /// aggregate logging, and the whole-track poison fallback. A dropped AU is
+    /// NEVER emitted, but the PTS clock is still advanced across it (see
+    /// [`stamp_pts`] usage) so every SURVIVING AU keeps the exact timestamp it
+    /// would have had — a drop becomes a silence gap, never a shift.
+    tally: super::dropgate::DropTally,
 }
 
 impl Default for DtsParser {
@@ -65,6 +71,50 @@ impl DtsParser {
             pts_marks: std::collections::VecDeque::new(),
             last_front_pts: PTS_UNSET,
             next_pts_ns: PTS_UNSET,
+            tally: super::dropgate::DropTally::new("dts"),
+        }
+    }
+
+    /// Number of access units dropped as undecodable so far. The mux/CLI reads
+    /// this to surface the count ("dropped N damaged DTS frames").
+    pub fn dropped_frames(&self) -> u64 {
+        self.tally.dropped_frames()
+    }
+
+    /// Total decoded duration (ns) of all dropped access units — the length of
+    /// audio silence introduced by dropping undecodable frames.
+    pub fn dropped_duration_ns(&self) -> u64 {
+        self.tally.dropped_duration_ns()
+    }
+
+    /// Gate an assembled access unit through the decodability check and either
+    /// push it or drop it. `au_pts`/`dur_ns` are already stamped on the shared
+    /// PTS clock (which the caller advances whether or not the AU survives), so
+    /// a drop leaves the following audio on its true timeline — a gap, not a
+    /// shift. Every drop is logged (fail-loud, never silent).
+    fn emit_or_drop(&mut self, au: Vec<u8>, au_pts: i64, dur_ns: i64, out: &mut Vec<Frame>) {
+        let verdict = if self.tally.is_poisoned() {
+            Err(DropReason::TrackPoisoned)
+        } else {
+            core_header_drop_reason(&au).map_or(Ok(()), Err)
+        };
+        match verdict {
+            Ok(()) => {
+                self.tally.record_kept();
+                out.push(Frame {
+                    discontinuity: false,
+                    coding: None,
+                    source: None,
+                    pts_ns: au_pts,
+                    keyframe: true,
+                    data: au,
+                    duration_ns: Some(dur_ns as u64),
+                });
+            }
+            Err(reason) => {
+                self.tally
+                    .record_drop(au_pts, dur_ns, au.len(), reason.as_str());
+            }
         }
     }
 
@@ -332,16 +382,12 @@ impl CodecParser for DtsParser {
             // running clock (UHD one-AU-per-PES), but never allowed to collide
             // with the previous AU when several cores share ONE PES (DVD).
             let dur_ns = dts_core_duration_ns(&au) as i64;
+            // Advance the PTS clock for this AU BEFORE the decodability gate, so
+            // a dropped AU still advances the timeline exactly as an emitted one
+            // would: the following AU keeps its true PTS and the drop is a gap,
+            // never a shift. `emit_or_drop` decides whether to actually push it.
             let au_pts = self.stamp_pts(self.front_pts(), dur_ns);
-            frames.push(Frame {
-                discontinuity: false,
-                coding: None,
-                source: None,
-                pts_ns: au_pts,
-                keyframe: true,
-                data: au,
-                duration_ns: Some(dur_ns as u64),
-            });
+            self.emit_or_drop(au, au_pts, dur_ns, &mut frames);
             self.drain_front(au_end);
             // After draining, the marker covering the new front (if any) carries
             // the next AU's PTS; `pending_pts` is only the fallback when no
@@ -368,10 +414,23 @@ impl CodecParser for DtsParser {
     }
 
     fn flush(&mut self) -> Vec<Frame> {
-        // End of stream: emit the final access unit still buffered (the last
-        // core + its extension substreams, which had no following core sync to
-        // close it during streaming). Require a complete core frame; drop a
-        // bare partial sync tail.
+        let out = self.flush_tail();
+        // Aggregate drop report at end-of-stream (warn-level, always visible).
+        self.tally.log_summary();
+        out
+    }
+
+    fn codec_private(&self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+impl DtsParser {
+    /// Emit the final buffered access unit (the last core + its extension
+    /// substreams, which had no following core sync to close it during
+    /// streaming), gated through the decodability check. Require a complete core
+    /// frame; drop a bare partial sync tail.
+    fn flush_tail(&mut self) -> Vec<Frame> {
         if find_sync(&self.buf, &DTS_CORE_SYNC) != Some(0) || self.buf.len() < CORE_HEADER_MIN_BYTES
         {
             self.buf.clear();
@@ -390,19 +449,9 @@ impl CodecParser for DtsParser {
         let dur_ns = dts_core_duration_ns(&au) as i64;
         let pts_ns = self.stamp_pts(self.front_pts(), dur_ns);
         self.pts_marks.clear();
-        vec![Frame {
-            discontinuity: false,
-            coding: None,
-            source: None,
-            pts_ns,
-            keyframe: true,
-            data: au,
-            duration_ns: Some(dur_ns as u64),
-        }]
-    }
-
-    fn codec_private(&self) -> Option<Vec<u8>> {
-        None
+        let mut out = Vec::new();
+        self.emit_or_drop(au, pts_ns, dur_ns, &mut out);
+        out
     }
 }
 
@@ -624,6 +673,128 @@ fn dts_core_duration_ns(data: &[u8]) -> u64 {
     (samples * 1_000_000_000 + rate / 2) / rate
 }
 
+/// DCA core-header constants, mirrored from ffmpeg `libavcodec/dca_core.h`.
+/// `deficit_samples` must equal this (`DCA_PCMBLOCK_SAMPLES`); `npcmblocks`
+/// must be a multiple of `DCA_SUBBAND_SAMPLES`; `audio_mode` must be below
+/// `DCA_AMODE_COUNT`; `lfe_present == DCA_LFE_FLAG_INVALID` is rejected.
+const DTS_PCMBLOCK_SAMPLES: u32 = 32;
+const DTS_SUBBAND_SAMPLES: u32 = 8;
+const DTS_AMODE_COUNT: u32 = 10;
+const DTS_LFE_FLAG_INVALID: u32 = 3;
+
+/// `ff_dca_sample_rates[16]` — sample rate (Hz) per core `SFREQ` code; a `0`
+/// entry marks a reserved code that ffmpeg's parser rejects
+/// (`DCA_PARSE_ERROR_SAMPLE_RATE`). Valid entries are locked to the spec by
+/// `dts_core_sfreq_table_matches_the_dca_spec`; the reserved codes are
+/// {0, 4, 5, 9, 10}.
+const DTS_CORE_SR_VALID: [u32; 16] = [
+    0, 8_000, 16_000, 32_000, 0, 0, 11_025, 22_050, 44_100, 0, 0, 12_000, 24_000, 48_000, 96_000,
+    192_000,
+];
+
+/// `ff_dca_bits_per_sample[8]` — a `0` entry marks a reserved `PCMR` code that
+/// ffmpeg's parser rejects (`DCA_PARSE_ERROR_PCM_RES`); reserved codes are
+/// {4, 7}.
+const DTS_CORE_PCMR_BITS: [u8; 8] = [16, 16, 20, 20, 0, 24, 24, 0];
+
+/// Why an access unit was judged undecodable. Each core-header variant is the
+/// exact condition under which ffmpeg's `ff_dca_parse_core_frame_header` returns
+/// the matching `DCA_PARSE_ERROR_*`; `TrackPoisoned` is our whole-track drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropReason {
+    DeficitSamples,
+    PcmBlocks,
+    FrameSize,
+    Amode,
+    SampleRate,
+    ReservedBit,
+    LfeFlag,
+    PcmRes,
+    TrackPoisoned,
+}
+
+impl DropReason {
+    /// Short static label for the drop log (the shared tally logs `&str`).
+    fn as_str(&self) -> &'static str {
+        match self {
+            DropReason::DeficitSamples => "deficit-samples",
+            DropReason::PcmBlocks => "pcm-blocks",
+            DropReason::FrameSize => "frame-size",
+            DropReason::Amode => "audio-mode",
+            DropReason::SampleRate => "sample-rate",
+            DropReason::ReservedBit => "reserved-bit",
+            DropReason::LfeFlag => "lfe-flag",
+            DropReason::PcmRes => "pcm-resolution",
+            DropReason::TrackPoisoned => "track-poisoned",
+        }
+    }
+}
+
+/// Decodability gate: a faithful port of ffmpeg's `ff_dca_parse_core_frame_header`
+/// validity checks (libavcodec/dca.c). Returns `Some(reason)` when ffmpeg's own
+/// parser would reject this core frame's header — in which case the packet is
+/// undecodable ("Invalid data found") and dropping it loses nothing a decoder
+/// could have used. Returns `None` (keep) for a decodable header OR if the
+/// header can't be fully read (never false-drop on our own buffer underrun; the
+/// framer only emits AUs whose core is fully buffered and ≥ 96 bytes).
+///
+/// The 4-byte core sync is already validated by the framer, so this reads the
+/// header fields that follow it. ffmpeg's parser does NOT verify the CPF header
+/// CRC (it `skip_bits(16)` past it — dca.c) and the core decoder likewise skips
+/// the audio-header/side-info CRCs (dca_core.c), so no CRC check is mirrored
+/// here: doing so would drop frames ffmpeg decodes fine (false positives).
+fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
+    let mut r = BitReader::new(au.get(SYNCWORD_BYTES..)?);
+
+    let _ftype = r.read_bit()?;
+    let deficit_samples = r.read_bits(5)? + 1;
+    if deficit_samples != DTS_PCMBLOCK_SAMPLES {
+        return Some(DropReason::DeficitSamples);
+    }
+    let crc_present = r.read_bit()? == 1;
+    let npcmblocks = r.read_bits(7)? + 1;
+    if npcmblocks & (DTS_SUBBAND_SAMPLES - 1) != 0 {
+        return Some(DropReason::PcmBlocks);
+    }
+    let frame_size = r.read_bits(14)? + 1;
+    if frame_size < MIN_CORE_FRAME_BYTES as u32 {
+        return Some(DropReason::FrameSize);
+    }
+    let audio_mode = r.read_bits(6)?;
+    if audio_mode >= DTS_AMODE_COUNT {
+        return Some(DropReason::Amode);
+    }
+    let sr_code = r.read_bits(4)? as usize;
+    if DTS_CORE_SR_VALID[sr_code] == 0 {
+        return Some(DropReason::SampleRate);
+    }
+    let _br_code = r.read_bits(5)?;
+    if r.read_bit()? != 0 {
+        return Some(DropReason::ReservedBit);
+    }
+    // drc, ts, aux, hdcd (1 each) → ext_audio_type (3) → ext_present, aspf (1 each).
+    r.skip_bits(4)?;
+    r.skip_bits(3)?;
+    r.skip_bits(2)?;
+    let lfe_present = r.read_bits(2)?;
+    if lfe_present == DTS_LFE_FLAG_INVALID {
+        return Some(DropReason::LfeFlag);
+    }
+    let _predictor_history = r.read_bit()?;
+    if crc_present {
+        // ffmpeg only skips the 16-bit header CRC here — it is not verified.
+        r.skip_bits(16)?;
+    }
+    let _filter_perfect = r.read_bit()?;
+    let _encoder_rev = r.read_bits(4)?;
+    let _copy_hist = r.read_bits(2)?;
+    let pcmr_code = r.read_bits(3)? as usize;
+    if DTS_CORE_PCMR_BITS[pcmr_code] == 0 {
+        return Some(DropReason::PcmRes);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +815,11 @@ mod tests {
         let fsize = size - 1;
         let mut data = vec![0u8; size];
         data[0..4].copy_from_slice(&DTS_CORE_SYNC);
+        // byte4: FTYPE(0) SHORT(5) CPF(0) NBLKS-high(0). SHORT = 31 makes
+        // deficit_samples = 32 = DCA_PCMBLOCK_SAMPLES, which ffmpeg's parser
+        // (and our decodability gate) require of a real core frame. NBLKS high
+        // bit (byte4 bit0) stays 0 for NBLKS = 15.
+        data[4] = 31u8 << 2;
         // NBLKS = 15 → (15+1)*32 = 512 samples/frame (the DVD/UHD DTS-core norm).
         // NBLKS is byte4 bit0 + byte5 bits7-2; here byte4 bit0 = 0, byte5 = 15<<2.
         data[5] = (15u8 << 2) | ((fsize >> 12) & 0x03) as u8;
@@ -1551,6 +1727,249 @@ mod tests {
             f[0].data.len(),
             512,
             "sub-floor sync skipped, real 512 core is AU1"
+        );
+    }
+
+    /// A structurally-framed but UNDECODABLE core: a valid `make_dts_core`
+    /// whose reserved header bit is set. It still sizes and syncs correctly (so
+    /// the framer delimits it normally), but ffmpeg's `ff_dca_parse_core_frame_header`
+    /// — and our port — reject it (`DCA_PARSE_ERROR_RESERVED_BIT`). The reserved
+    /// bit is byte9 bit4 in the core header (after SYNC..RATE).
+    fn make_bad_dts_core(size: usize) -> Vec<u8> {
+        let mut d = make_dts_core(size);
+        assert!(
+            core_header_drop_reason(&d).is_none(),
+            "base core is decodable"
+        );
+        d[9] |= 0x10; // set the reserved bit
+        assert_eq!(
+            core_header_drop_reason(&d),
+            Some(DropReason::ReservedBit),
+            "reserved-bit core must be judged undecodable"
+        );
+        d
+    }
+
+    #[test]
+    fn valid_stream_drops_nothing() {
+        // A clean stream of decodable cores must pass the gate untouched — the
+        // detector is an exact ffmpeg-parity port, so zero false positives.
+        let mut parser = DtsParser::new();
+        let mut stream = Vec::new();
+        for _ in 0..5 {
+            stream.extend_from_slice(&make_dts_core(512));
+        }
+        let mut frames = parser.parse(&make_pes(stream, Some(90000)));
+        frames.extend(parser.flush());
+        assert_eq!(frames.len(), 5, "all five cores emitted");
+        assert_eq!(parser.dropped_frames(), 0, "nothing dropped");
+        assert_eq!(parser.dropped_duration_ns(), 0);
+    }
+
+    #[test]
+    fn undecodable_core_is_dropped_and_counted() {
+        // A single undecodable core between good ones is dropped; the survivors
+        // are emitted and the drop is counted.
+        let mut parser = DtsParser::new();
+        let mut stream = make_dts_core(512);
+        stream.extend_from_slice(&make_bad_dts_core(512));
+        stream.extend_from_slice(&make_dts_core(640));
+        let mut frames = parser.parse(&make_pes(stream, Some(90000)));
+        frames.extend(parser.flush());
+        assert_eq!(frames.len(), 2, "the bad core is dropped, two survive");
+        assert_eq!(frames[0].data.len(), 512);
+        assert_eq!(frames[1].data.len(), 640);
+        assert_eq!(parser.dropped_frames(), 1);
+        assert_eq!(
+            parser.dropped_duration_ns(),
+            DTS_CORE_DUR_NS as u64,
+            "one frame's worth of audio silence introduced"
+        );
+    }
+
+    #[test]
+    fn drop_preserves_av_sync_no_shift() {
+        // THE INVARIANT: dropping an undecodable AU must never shift the audio
+        // that follows. A good/bad/good run in ONE PES — the bad middle core is
+        // dropped, but the trailing good core must keep the EXACT PTS it would
+        // have had with no drop (base + 2 frame durations), so the drop is a
+        // silence gap, not a shift.
+        let mut parser = DtsParser::new();
+        let mut stream = make_dts_core(512); // c1: good
+        stream.extend_from_slice(&make_bad_dts_core(512)); // c2: undecodable
+        stream.extend_from_slice(&make_dts_core(640)); // c3: good
+        let mut frames = parser.parse(&make_pes(stream, Some(90000)));
+        frames.extend(parser.flush());
+
+        assert_eq!(frames.len(), 2, "c2 dropped; c1 and c3 survive");
+        let base = pts_to_ns(90000);
+        assert_eq!(frames[0].pts_ns, base, "c1 keeps the PES base PTS");
+        assert_eq!(
+            frames[1].pts_ns,
+            base + 2 * DTS_CORE_DUR_NS,
+            "c3 keeps its TRUE timeline (base + 2 frames) — the drop is a gap, not a shift"
+        );
+        // The gap between the survivors is exactly the dropped frame's duration
+        // beyond the normal one-frame spacing.
+        assert_eq!(
+            frames[1].pts_ns - frames[0].pts_ns,
+            2 * DTS_CORE_DUR_NS,
+            "surviving AUs are spaced by the real timeline including the dropped frame's slot"
+        );
+        assert_eq!(parser.dropped_frames(), 1);
+    }
+
+    #[test]
+    fn whole_track_poison_drops_remainder() {
+        // A track dominated by undecodable frames is judged too damaged to mux:
+        // once the >50% verdict fires (after the minimum sample count), the
+        // whole track — including any later good frames — is dropped.
+        let mut parser = DtsParser::new();
+        let mut stream = Vec::new();
+        // 300 AUs, ~2/3 undecodable → well over the 50% threshold and the
+        // 200-AU minimum.
+        for i in 0..300 {
+            if i % 3 == 0 {
+                stream.extend_from_slice(&make_dts_core(512));
+            } else {
+                stream.extend_from_slice(&make_bad_dts_core(512));
+            }
+        }
+        // A trailing burst of GOOD cores that must be dropped once poisoned.
+        for _ in 0..20 {
+            stream.extend_from_slice(&make_dts_core(512));
+        }
+        let mut frames = parser.parse(&make_pes(stream, Some(90000)));
+        frames.extend(parser.flush());
+        assert!(
+            parser.tally.is_poisoned(),
+            "track poisoned by >50% drop rate"
+        );
+        // Once poisoned, later good cores are dropped too, so the kept count
+        // (kept = emitted survivors) is far below the ~120 good cores present.
+        let kept = frames.len() as u64;
+        assert!(
+            kept < 120,
+            "post-poison good frames also dropped (kept={kept})"
+        );
+        assert!(parser.dropped_frames() > 150, "majority dropped");
+    }
+
+    #[test]
+    fn sr_validity_table_marks_reserved_codes() {
+        // The core-header sample-rate validity table must have ZERO (reject) at
+        // exactly the reserved SFREQ codes {0,4,5,9,10} and a real rate
+        // elsewhere — this is what mirrors ffmpeg's DCA_PARSE_ERROR_SAMPLE_RATE.
+        for code in 0..16usize {
+            let reserved = matches!(code, 0 | 4 | 5 | 9 | 10);
+            assert_eq!(
+                DTS_CORE_SR_VALID[code] == 0,
+                reserved,
+                "SFREQ code {code} reserved={reserved}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_core_header_error_class_is_detected() {
+        // Exercise each ffmpeg-parity rejection so the port stays faithful.
+        // Start from a decodable core and corrupt one field at a time.
+        let good = make_dts_core(512);
+        assert_eq!(core_header_drop_reason(&good), None);
+
+        // deficit_samples != 32: clear SHORT (byte4 bits6-2) → deficit = 1.
+        let mut d = good.clone();
+        d[4] &= !0x7C;
+        assert_eq!(
+            core_header_drop_reason(&d),
+            Some(DropReason::DeficitSamples)
+        );
+
+        // npcmblocks not a multiple of 8: NBLKS low bits (byte5 bits7-2) → 14
+        // (npcmblocks=15, 15 & 7 = 7 ≠ 0).
+        let mut d = good.clone();
+        d[5] = (d[5] & 0x03) | (14u8 << 2);
+        assert_eq!(core_header_drop_reason(&d), Some(DropReason::PcmBlocks));
+
+        // audio_mode >= 10: AMODE = byte7 bits3-0 (high 4) + byte8 bits7-6. Set
+        // AMODE high nibble to 0xF → audio_mode >= 60.
+        let mut d = good.clone();
+        d[7] |= 0x0F;
+        assert_eq!(core_header_drop_reason(&d), Some(DropReason::Amode));
+
+        // sample_rate reserved: SFREQ (byte8 bits5-2) = 0.
+        let mut d = good.clone();
+        d[8] &= !0x3C;
+        assert_eq!(core_header_drop_reason(&d), Some(DropReason::SampleRate));
+
+        // reserved bit set: byte9 bit4.
+        let mut d = good.clone();
+        d[9] |= 0x10;
+        assert_eq!(core_header_drop_reason(&d), Some(DropReason::ReservedBit));
+
+        // lfe_present == 3: LFE is byte10 bits2-1.
+        let mut d = good.clone();
+        d[10] |= 0x06;
+        assert_eq!(core_header_drop_reason(&d), Some(DropReason::LfeFlag));
+
+        // pcmr_code reserved (7): pcmr is byte11 bit0 + byte12 bits7-6 → set all
+        // three to 1 (code 7 → ff_dca_bits_per_sample[7] = 0).
+        let mut d = good.clone();
+        d[11] |= 0x01;
+        d[12] |= 0xC0;
+        assert_eq!(core_header_drop_reason(&d), Some(DropReason::PcmRes));
+    }
+
+    /// Real-data fixture (ignored). Re-parses a raw `.dts` elementary stream
+    /// through `DtsParser` and writes the emitted access units back out, so the
+    /// garbage-extension → core-only drop can be validated against an actual
+    /// damaged stream (e.g. the extracted Bourne DTS-HD MA track) end-to-end
+    /// with ffmpeg. Env: `DTS_IN` (input), `DTS_OUT` (output).
+    ///   cargo test --lib dts::tests::reparse_real_dts_file -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn reparse_real_dts_file() {
+        use std::io::Write;
+        let inp = std::env::var("DTS_IN").expect("DTS_IN");
+        let outp = std::env::var("DTS_OUT").expect("DTS_OUT");
+        let bytes = std::fs::read(&inp).expect("read DTS_IN");
+        let mut parser = DtsParser::new();
+        let mut out =
+            std::io::BufWriter::new(std::fs::File::create(&outp).expect("create DTS_OUT"));
+        let mut au_count = 0usize;
+        let mut out_bytes = 0usize;
+        // 90 kHz PTS advancing per chunk; arbitrary chunking is faithful because
+        // the framer resyncs on core sync and buffers across PES boundaries.
+        let mut pts: i64 = 90_000;
+        const CHUNK: usize = 64 * 1024;
+        for chunk in bytes.chunks(CHUNK) {
+            let pes = PesPacket {
+                source: None,
+                pid: 0x1100,
+                pts: Some(pts),
+                dts: None,
+                data: chunk.to_vec(),
+                discontinuity: false,
+            };
+            pts += 2_100; // ~one AU worth; value irrelevant to AU framing/bytes
+            for f in parser.parse(&pes) {
+                au_count += 1;
+                out_bytes += f.data.len();
+                out.write_all(&f.data).expect("write AU");
+            }
+        }
+        for f in parser.flush() {
+            au_count += 1;
+            out_bytes += f.data.len();
+            out.write_all(&f.data).expect("write AU");
+        }
+        out.flush().expect("flush");
+        eprintln!(
+            "REPARSE in={} bytes -> out={} bytes across {} AUs ({} bytes dropped)",
+            bytes.len(),
+            out_bytes,
+            au_count,
+            bytes.len().saturating_sub(out_bytes)
         );
     }
 }

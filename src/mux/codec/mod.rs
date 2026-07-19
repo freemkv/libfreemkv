@@ -9,12 +9,19 @@
 
 /// AC-3 / E-AC-3 (Dolby Digital / Digital Plus) elementary-stream parser.
 pub mod ac3;
+
+pub mod adts;
 /// Codec-agnostic per-picture coding carrier (`PictureInfo` + accessors).
 pub mod coding;
 /// DTS / DTS-HD elementary-stream parser.
+pub(crate) mod crc;
+pub(crate) mod dropgate;
+
 pub mod dts;
 /// DVD bitmap subtitle (VobSub) parser.
 pub mod dvdsub;
+
+pub mod flac;
 /// H.264 (AVC) Annex-B elementary-stream parser.
 pub mod h264;
 /// HEVC (H.265) Annex-B elementary-stream parser.
@@ -23,6 +30,8 @@ pub mod hevc;
 pub mod lpcm;
 /// MPEG-2 Video elementary-stream parser.
 pub mod mpeg2;
+
+pub mod mpegaudio;
 /// HDMV PGS (Presentation Graphics Stream) subtitle parser.
 pub mod pgs;
 /// Display-order PTS reconstruction for sparse-PTS program-stream video.
@@ -154,6 +163,26 @@ impl CodecParser for PassthroughParser {
     }
 }
 
+/// Drop-on-undecodable policy across codecs ("clean muxes always"):
+///
+/// - **Audio with independent access units** (DTS, AC-3/E-AC-3, …) gates each AU
+///   through a per-codec corruption check and drops the ones that fail, keeping
+///   A/V sync (a drop is a silence gap, never a shift) and logging every drop
+///   via the shared [`dropgate::DropTally`]. DTS uses ffmpeg's core-header parse;
+///   AC-3 uses its native frame CRC.
+/// - **LPCM is excluded on purpose**: raw PCM carries no framing or integrity
+///   data, so a corrupt sample is indistinguishable from a quiet one — there is
+///   nothing to detect, so nothing can be honestly dropped.
+/// - **Video is excluded on purpose**: H.264/HEVC/MPEG-2/VC-1 are inter-frame
+///   predicted, so dropping one frame corrupts every frame that references it
+///   until the next keyframe. Video instead resyncs at GOP/IDR boundaries (the
+///   ResyncGate) and lets the decoder conceal — a fundamentally different model
+///   than per-frame audio dropping.
+/// - TrueHD/MLP and the rare passthrough audio codecs (FLAC/MP2/AAC) do not yet
+///   gate: MLP carries inter-AU restart state so a safe drop must land on a
+///   major-sync boundary, and the passthrough codecs are essentially never seen
+///   on optical media.
+///
 /// Create the appropriate parser for a codec, with optional codec private data.
 ///
 /// For DvdSub, `codec_data` should be the pre-formatted VobSub .idx palette header.
@@ -177,6 +206,9 @@ pub fn parser_for_codec(
         Codec::Mpeg2 => Box::new(mpeg2::Mpeg2Parser::new()),
         Codec::Vc1 => Box::new(vc1::Vc1Parser::new().with_ps_reorder(is_dvd_ps)),
         Codec::Ac3 | Codec::Ac3Plus => Box::new(ac3::Ac3Parser::new()),
+        Codec::Flac => Box::new(flac::FlacParser::new()),
+        Codec::Mp2 | Codec::Mp3 => Box::new(mpegaudio::MpegAudioParser::new()),
+        Codec::Aac => Box::new(adts::AdtsParser::new()),
         Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => Box::new(dts::DtsParser::new()),
         Codec::TrueHd => Box::new(truehd::TrueHdParser::new()),
         Codec::Pgs => Box::new(pgs::PgsParser::new()),
@@ -200,9 +232,7 @@ pub fn parser_for_codec(
         // Remaining audio-only codecs (Aac, Mp2, Mp3, Flac, Opus) where PES =
         // frame: all-keyframe passthrough is correct. Subtitle/Unknown also land
         // here; keyframe flag is irrelevant for them.
-        Codec::Aac | Codec::Mp2 | Codec::Mp3 | Codec::Flac | Codec::Opus => {
-            Box::new(PassthroughParser::new(true))
-        }
+        Codec::Opus => Box::new(PassthroughParser::new(true)),
         Codec::Srt | Codec::Ssa | Codec::Unknown(_) => Box::new(PassthroughParser::new(true)),
     }
 }
