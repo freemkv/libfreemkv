@@ -6,19 +6,20 @@
 //! `mdat` size. Unlike the fragmented `fmp4` sibling (DASH init+moof/mdat), this
 //! is a single self-contained file — the shape people mean by "an mp4".
 //!
-//! ## Milestone 1 (this file): video track only
+//! ## Track model
 //!
-//! One video track (HEVC / H.264), passthrough NALs (the demux already hands us
-//! length-prefixed hvcC/avcC-form NALs — exactly MP4's framing, no reframing),
-//! full sample tables (`stts`/`stsz`/`stsc`/`co64`/`stss`/`ctts`), and a `colr`
-//! box for HDR10 signalling. Decode timestamps are derived (the pipeline carries
-//! presentation PTS only): the stream is constant-frame-rate on disc, so a
-//! constant decode duration + signed `ctts` composition offsets reproduces the
-//! B-frame reorder exactly. Audio tracks and the fit-oracle track selection land
-//! in Milestone 2.
+//! One video track (HEVC / H.264) plus every audio track whose codec has a clean
+//! MP4 mapping (AC-3 → `ac-3`/`dac3`, E-AC-3 → `ec-3`/`dec3`). This is the fit
+//! oracle: a codec MP4 can't carry (TrueHD, DTS, LPCM) or that has no sample
+//! entry here is **excluded, never silently dropped** — [`fit_report`] lets the
+//! CLI enumerate exactly what was left out and why. Video NALs pass through
+//! unchanged (the demux hands us length-prefixed hvcC/avcC framing — already
+//! MP4's form). Decode timestamps are derived (the pipeline carries presentation
+//! PTS only): video is constant-frame-rate on disc, so a constant decode
+//! duration + signed `ctts` reproduces the B-frame reorder exactly; audio has no
+//! reorder, so per-sample durations come straight from the PTS deltas.
 //!
-//! Reference: ISO/IEC 14496-12 (ISO base media file format), 14496-15 (NAL-unit
-//! structured video: `avcC`/`hvcC`).
+//! Reference: ISO/IEC 14496-12 (ISO base media file format), 14496-15 (avcC/hvcC).
 
 use crate::disc::{Codec, DiscTitle, Stream as DiscStream};
 use crate::pes::{PesFrame, Stream};
@@ -26,6 +27,7 @@ use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 
+mod audio;
 mod boxes;
 use boxes::{bx, fullbox};
 
@@ -40,8 +42,100 @@ struct Sample {
     size: u32,
     /// Presentation timestamp in nanoseconds (composition time).
     pts_ns: i64,
-    /// True for a sync sample (IDR / keyframe).
+    /// True for a sync sample (IDR / keyframe). Always true for audio.
     keyframe: bool,
+}
+
+/// Which media class a track carries (drives handler / header-box choice).
+#[derive(Clone, Copy, PartialEq)]
+enum Media {
+    Video,
+    Audio,
+}
+
+/// One output track: its identity, the inputs its sample entry needs, and its
+/// accumulated samples.
+struct Track {
+    media: Media,
+    /// 1-based MP4 track_ID.
+    track_id: u32,
+    codec: Codec,
+    /// Video: `hvcC`/`avcC`. Audio: unused (the sample entry is built from the
+    /// first frame's bitstream and cached in `audio_entry`).
+    codec_private: Vec<u8>,
+    width: u32,
+    height: u32,
+    colr: Option<(u16, u16, u16, bool)>,
+    language: [u8; 2],
+    /// Audio sample entry (`ac-3`/`ec-3` + config), built from the first frame.
+    audio_entry: Option<Vec<u8>>,
+    /// Audio media timescale (Hz), captured with `audio_entry`.
+    audio_timescale: u32,
+    samples: Vec<Sample>,
+}
+
+/// Why a stream was excluded from an `mp4://` mux (for the never-silent report).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mp4SkipReason {
+    /// A subtitle track — MP4 carries only text subs; disc subs are bitmap.
+    BitmapSubtitle,
+    /// An audio codec with no MP4 mapping here (TrueHD, DTS, LPCM, …).
+    UnmappableAudio,
+    /// A secondary/dependent video view (e.g. MVC 3D right eye).
+    SecondaryVideo,
+}
+
+/// The plan for an `mp4://` mux of `title`: which streams are carried and which
+/// are excluded (with the reason). The CLI prints the exclusions so a lossy
+/// export is never silent; the sink applies the same predicate.
+pub struct Mp4FitReport {
+    /// `title.streams` indices that will be muxed.
+    pub included: Vec<usize>,
+    /// Excluded `(stream index, reason)`.
+    pub skipped: Vec<(usize, Mp4SkipReason)>,
+}
+
+/// Compute the fit plan without opening a file. Video: the first primary
+/// HEVC/H.264 track. Audio: every AC-3 / E-AC-3 track. Everything else is
+/// skipped with a reason.
+pub fn fit_report(title: &DiscTitle) -> Mp4FitReport {
+    let mut included = Vec::new();
+    let mut skipped = Vec::new();
+    let mut have_video = false;
+    for (i, s) in title.streams.iter().enumerate() {
+        match s {
+            DiscStream::Video(v) => {
+                if v.is_mvc_dependent() {
+                    skipped.push((i, Mp4SkipReason::SecondaryVideo));
+                } else if !have_video && matches!(v.codec, Codec::Hevc | Codec::H264) {
+                    included.push(i);
+                    have_video = true;
+                } else {
+                    skipped.push((i, Mp4SkipReason::SecondaryVideo));
+                }
+            }
+            DiscStream::Audio(a) => {
+                if audio::audio_fits(a.codec) {
+                    included.push(i);
+                } else {
+                    skipped.push((i, Mp4SkipReason::UnmappableAudio));
+                }
+            }
+            DiscStream::Subtitle(_) => skipped.push((i, Mp4SkipReason::BitmapSubtitle)),
+        }
+    }
+    Mp4FitReport { included, skipped }
+}
+
+/// Pack an ISO 639-2 language ("eng") into the 15-bit mdhd form (bit 15 = 0,
+/// three 5-bit values of `char - 0x60`). Falls back to "und".
+fn pack_language(lang: &str) -> [u8; 2] {
+    let b = lang.as_bytes();
+    if b.len() != 3 || !b.iter().all(|c| c.is_ascii_lowercase()) {
+        return [0x55, 0xC4]; // 'und'
+    }
+    let v = (((b[0] - 0x60) as u16) << 10) | (((b[1] - 0x60) as u16) << 5) | ((b[2] - 0x60) as u16);
+    v.to_be_bytes()
 }
 
 /// Progressive MP4 sink. Owns the output `File` so it can seek back to patch the
@@ -49,52 +143,81 @@ struct Sample {
 pub struct Mp4Sink {
     file: File,
     title: DiscTitle,
-    /// Index into `title.streams` of the muxed video track.
-    video_track: usize,
-    codec: Codec,
-    /// `hvcC` / `avcC` decoder configuration record (from `codec_privates`).
-    codec_private: Vec<u8>,
-    width: u32,
-    height: u32,
+    tracks: Vec<Track>,
+    /// `title.streams` index → position in `tracks`, or `None` if excluded.
+    route: Vec<Option<usize>>,
     /// File offset of the `mdat` box header (for the 64-bit size patch).
     mdat_start: u64,
     /// Running `mdat` payload size in bytes.
     mdat_payload: u64,
-    samples: Vec<Sample>,
     finished: bool,
 }
 
 impl Mp4Sink {
-    /// Create the sink: pick the video track, open the file, and write `ftyp`
-    /// plus the `mdat` header (64-bit size, patched at `finish()`).
+    /// Create the sink: build the track plan (fit oracle), open the file, and
+    /// write `ftyp` plus the `mdat` header (64-bit size, patched at `finish()`).
     pub fn create(path: &Path, title: &DiscTitle) -> io::Result<Self> {
-        let (video_track, vs) = title
-            .streams
+        let report = fit_report(title);
+        let has_video = report
+            .included
             .iter()
-            .enumerate()
-            .find_map(|(i, s)| match s {
-                DiscStream::Video(v) if !v.is_mvc_dependent() => Some((i, v)),
-                _ => None,
-            })
-            .ok_or(crate::error::Error::MuxNoVideoTrack)?;
-
-        let codec = vs.codec;
-        if !matches!(codec, Codec::Hevc | Codec::H264) {
-            // M1 carries only the NAL-structured codecs whose codec_private is a
-            // ready hvcC/avcC. VC-1/MPEG-2 have no such record here (and VC-1 has
-            // no MP4 mapping at all) — fail loud rather than emit a broken track.
-            return Err(crate::error::Error::Mp4UnsupportedVideoCodec.into());
+            .any(|&i| matches!(title.streams[i], DiscStream::Video(_)));
+        if !has_video {
+            return Err(crate::error::Error::MuxNoVideoTrack.into());
         }
-        let codec_private = title
-            .codec_privates
-            .get(video_track)
-            .and_then(|c| c.clone())
-            .ok_or(crate::error::Error::MuxMissingCodecPrivate)?;
 
-        let (width, height) = vs.resolution.pixels();
+        let mut tracks = Vec::new();
+        let mut route = vec![None; title.streams.len()];
+        let mut next_id = 1u32;
+        let mut video_codec = Codec::Hevc;
+        for &i in &report.included {
+            let track_id = next_id;
+            next_id += 1;
+            route[i] = Some(tracks.len());
+            match &title.streams[i] {
+                DiscStream::Video(v) => {
+                    video_codec = v.codec;
+                    let cp = title
+                        .codec_privates
+                        .get(i)
+                        .and_then(|c| c.clone())
+                        .ok_or(crate::error::Error::MuxMissingCodecPrivate)?;
+                    let (w, h) = v.resolution.pixels();
+                    tracks.push(Track {
+                        media: Media::Video,
+                        track_id,
+                        codec: v.codec,
+                        codec_private: cp,
+                        width: w,
+                        height: h,
+                        colr: video_colr(&title.streams[i]),
+                        language: [0x55, 0xC4],
+                        audio_entry: None,
+                        audio_timescale: 0,
+                        samples: Vec::new(),
+                    });
+                }
+                DiscStream::Audio(a) => {
+                    tracks.push(Track {
+                        media: Media::Audio,
+                        track_id,
+                        codec: a.codec,
+                        codec_private: Vec::new(),
+                        width: 0,
+                        height: 0,
+                        colr: None,
+                        language: pack_language(&a.language),
+                        audio_entry: None,
+                        audio_timescale: a.sample_rate.hz() as u32,
+                        samples: Vec::new(),
+                    });
+                }
+                DiscStream::Subtitle(_) => unreachable!("fit_report never includes subtitles"),
+            }
+        }
 
         let mut file = File::create(path)?;
-        file.write_all(&build_ftyp(codec))?;
+        file.write_all(&build_ftyp(video_codec))?;
         let mdat_start = file.stream_position()?;
         // mdat with 64-bit largesize: size=1 signals "largesize follows"; the
         // 8-byte largesize placeholder is patched at finish() once known.
@@ -105,41 +228,31 @@ impl Mp4Sink {
         Ok(Self {
             file,
             title: title.clone(),
-            video_track,
-            codec,
-            codec_private,
-            width,
-            height,
+            tracks,
+            route,
             mdat_start,
             mdat_payload: 0,
-            samples: Vec::new(),
             finished: false,
         })
     }
 
-    /// Assemble and write the `moov` box from the accumulated sample tables.
+    /// Assemble and write the `moov` box from every track's sample tables.
     fn write_moov(&mut self) -> io::Result<()> {
-        let timing = Timing::derive(&self.samples);
-        let stbl = build_stbl(
-            self.codec,
-            &self.codec_private,
-            self.width,
-            self.height,
-            video_colr(&self.title.streams[self.video_track]),
-            &self.samples,
-            &timing,
-        );
-        let dur = timing.total_duration();
+        // Movie timescale = 90 kHz; movie duration = the longest track (converted).
+        let movie_ts = 90_000u32;
+        let mut movie_dur = 0u64;
+        let mut traks: Vec<Vec<u8>> = Vec::new();
+        for t in &self.tracks {
+            let (trak, secs) = build_trak(t);
+            traks.push(trak);
+            movie_dur = movie_dur.max((secs * movie_ts as f64) as u64);
+        }
+        let next_id = self.tracks.len() as u32 + 1;
 
-        let mut moov = Vec::new();
-        moov.extend_from_slice(&build_mvhd(timing.timescale, dur));
-        moov.extend_from_slice(&build_video_trak(
-            self.width,
-            self.height,
-            timing.timescale,
-            dur,
-            stbl,
-        ));
+        let mut moov = build_mvhd(movie_ts, movie_dur, next_id);
+        for trak in traks {
+            moov.extend_from_slice(&trak);
+        }
         let moov = bx(b"moov", &moov);
         self.file.write_all(&moov)
     }
@@ -151,18 +264,27 @@ impl Stream for Mp4Sink {
     }
 
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
-        // M1 is video-only: drop every non-video-track frame. (Audio tracks and
-        // the never-silent fit report arrive in M2.)
-        if frame.track != self.video_track {
-            return Ok(());
+        let Some(slot) = self.route.get(frame.track).copied().flatten() else {
+            return Ok(()); // excluded track (or out of range)
+        };
+        // Build the audio sample entry from the first frame of an audio track.
+        if self.tracks[slot].media == Media::Audio && self.tracks[slot].audio_entry.is_none() {
+            if let Some(entry) = audio::dolby_sample_entry(self.tracks[slot].codec, &frame.data) {
+                self.tracks[slot].audio_entry = Some(entry);
+            } else {
+                // Unparseable first frame — skip until one parses (avoids a
+                // track with samples but no sample entry).
+                return Ok(());
+            }
         }
+        let pts_ns = frame.pts;
         let offset = self.mdat_start + 16 + self.mdat_payload;
         self.file.write_all(&frame.data)?;
         self.mdat_payload += frame.data.len() as u64;
-        self.samples.push(Sample {
+        self.tracks[slot].samples.push(Sample {
             offset,
             size: frame.data.len() as u32,
-            pts_ns: frame.pts,
+            pts_ns,
             keyframe: frame.keyframe,
         });
         Ok(())
@@ -173,6 +295,12 @@ impl Stream for Mp4Sink {
             return Ok(());
         }
         self.finished = true;
+        // Drop tracks that never received a sample (e.g. an audio track whose
+        // frames never parsed) so moov carries no empty trak.
+        self.tracks.retain(|t| !t.samples.is_empty());
+        if self.tracks.is_empty() {
+            return Err(crate::error::Error::MuxEmpty.into());
+        }
         // Patch the mdat 64-bit largesize: header (16) + payload.
         let mdat_total = 16 + self.mdat_payload;
         self.file.seek(SeekFrom::Start(self.mdat_start + 8))?;
@@ -187,26 +315,66 @@ impl Stream for Mp4Sink {
     }
 }
 
-// ── timing derivation ────────────────────────────────────────────────────────
+// ── per-track box assembly ───────────────────────────────────────────────────
 
-/// Per-track decode timing derived from presentation PTS. The pipeline carries
-/// presentation timestamps only; MP4 needs a monotonic decode timeline plus a
-/// composition offset per sample. On disc the video is constant-frame-rate, so a
-/// constant decode duration reproduces decode order and `ctts[i] = CTS[i] - i·d`
-/// (signed) reproduces the B-frame reorder exactly.
-struct Timing {
-    /// Media timescale (Hz).
+/// Build a track's `trak` box and return `(bytes, duration_seconds)`.
+fn build_trak(t: &Track) -> (Vec<u8>, f64) {
+    match t.media {
+        Media::Video => build_video_trak_full(t),
+        Media::Audio => build_audio_trak_full(t),
+    }
+}
+
+fn build_video_trak_full(t: &Track) -> (Vec<u8>, f64) {
+    let timing = VideoTiming::derive(&t.samples);
+    let media_dur = timing.total_duration();
+    let secs = media_dur as f64 / timing.timescale as f64;
+
+    let stsd = build_visual_stsd(t.codec, &t.codec_private, t.width, t.height, t.colr);
+    let stbl = build_video_stbl(stsd, &t.samples, &timing);
+    let minf = build_minf(video_vmhd(), stbl);
+    let mdia = build_mdia(
+        t.language,
+        timing.timescale,
+        media_dur,
+        b"vide",
+        "VideoHandler",
+        minf,
+    );
+    let tkhd = build_tkhd(t.track_id, t.width, t.height, media_dur, false);
+    let mut body = tkhd;
+    body.extend_from_slice(&mdia);
+    (bx(b"trak", &body), secs)
+}
+
+fn build_audio_trak_full(t: &Track) -> (Vec<u8>, f64) {
+    let ts = t.audio_timescale.max(1);
+    let durs = audio_sample_durations(&t.samples, ts);
+    let media_dur: u64 = durs.iter().map(|&d| d as u64).sum();
+    let secs = media_dur as f64 / ts as f64;
+
+    let entry = t.audio_entry.clone().unwrap_or_default();
+    let stbl = build_audio_stbl(entry, &t.samples, &durs);
+    let minf = build_minf(audio_smhd(), stbl);
+    let mdia = build_mdia(t.language, ts, media_dur, b"soun", "SoundHandler", minf);
+    let tkhd = build_tkhd(t.track_id, 0, 0, media_dur, true);
+    let mut body = tkhd;
+    body.extend_from_slice(&mdia);
+    (bx(b"trak", &body), secs)
+}
+
+// ── timing ───────────────────────────────────────────────────────────────────
+
+/// Video decode timing: constant decode duration (CFR) + per-sample composition
+/// time, so `ctts[i] = CTS[i] − i·d` reproduces the B-frame reorder.
+struct VideoTiming {
     timescale: u32,
-    /// Constant per-sample decode duration in timescale ticks.
     sample_dur: u32,
-    /// Composition time of each sample in timescale ticks (CTS, ≥ 0, min = 0).
     cts: Vec<i64>,
 }
 
-impl Timing {
+impl VideoTiming {
     fn derive(samples: &[Sample]) -> Self {
-        // Median presentation delta → nearest standard frame rate, so the
-        // integer timescale divides evenly (zero long-run drift).
         let (timescale, sample_dur) = detect_rate(samples);
         let min_pts = samples.iter().map(|s| s.pts_ns).min().unwrap_or(0);
         let cts = samples
@@ -219,13 +387,9 @@ impl Timing {
             cts,
         }
     }
-
-    /// Track duration in timescale ticks: sum of the constant decode durations.
     fn total_duration(&self) -> u64 {
         self.cts.len() as u64 * self.sample_dur as u64
     }
-
-    /// Signed composition offset `ctts[i] = CTS[i] − DTS[i]`, `DTS[i] = i·d`.
     fn ctts(&self) -> Vec<i32> {
         self.cts
             .iter()
@@ -233,6 +397,22 @@ impl Timing {
             .map(|(i, &c)| (c - (i as i64 * self.sample_dur as i64)) as i32)
             .collect()
     }
+}
+
+/// Per-sample audio decode durations from PTS deltas (audio has no reorder, so
+/// composition == decode). The last sample repeats the previous duration.
+fn audio_sample_durations(samples: &[Sample], timescale: u32) -> Vec<u32> {
+    let ticks = |ns: i64| (ns as i128 * timescale as i128 / NS as i128) as i64;
+    let mut durs = Vec::with_capacity(samples.len());
+    for w in samples.windows(2) {
+        durs.push((ticks(w[1].pts_ns) - ticks(w[0].pts_ns)).max(0) as u32);
+    }
+    if let Some(&last) = durs.last() {
+        durs.push(last);
+    } else if !samples.is_empty() {
+        durs.push(timescale / 30); // single-sample fallback
+    }
+    durs
 }
 
 /// Standard frame rates as `(timescale, sample_duration)` — exact integer ratios
@@ -253,7 +433,7 @@ const STD_RATES: &[(u32, u32, f64)] = &[
 /// duration when nothing matches (non-standard / too few samples).
 fn detect_rate(samples: &[Sample]) -> (u32, u32) {
     if samples.len() < 2 {
-        return (90_000, 3_003); // ~29.97 placeholder; single-sample tracks are degenerate
+        return (90_000, 3_003);
     }
     let mut pts: Vec<i64> = samples.iter().map(|s| s.pts_ns).collect();
     pts.sort_unstable();
@@ -273,19 +453,17 @@ fn detect_rate(samples: &[Sample]) -> (u32, u32) {
             return (ts, dur);
         }
     }
-    // Non-standard: 90 kHz with a rounded per-sample duration.
     let dur = ((median as i128 * 90_000) / NS as i128).max(1) as u32;
     (90_000, dur)
 }
 
 // ── box builders ─────────────────────────────────────────────────────────────
 
-/// `ftyp` — major brand `isom`, compatible brands incl. the codec brand so
-/// players recognise the video format (`hvc1` for HEVC, `avc1` for H.264).
+/// `ftyp` — major brand `isom`, compatible brands incl. the codec brand.
 fn build_ftyp(codec: Codec) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(b"isom");
-    body.extend_from_slice(&0x200u32.to_be_bytes()); // minor_version
+    body.extend_from_slice(&0x200u32.to_be_bytes());
     body.extend_from_slice(b"isom");
     body.extend_from_slice(b"iso2");
     body.extend_from_slice(b"mp41");
@@ -297,8 +475,7 @@ fn build_ftyp(codec: Codec) -> Vec<u8> {
     bx(b"ftyp", &body)
 }
 
-fn build_mvhd(timescale: u32, duration: u64) -> Vec<u8> {
-    // Version 1 (64-bit times/duration).
+fn build_mvhd(timescale: u32, duration: u64, next_track_id: u32) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&0u64.to_be_bytes()); // creation_time
     body.extend_from_slice(&0u64.to_be_bytes()); // modification_time
@@ -306,44 +483,28 @@ fn build_mvhd(timescale: u32, duration: u64) -> Vec<u8> {
     body.extend_from_slice(&duration.to_be_bytes());
     body.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
     body.extend_from_slice(&0x0100u16.to_be_bytes()); // volume 1.0
-    body.extend_from_slice(&[0u8; 2]); // reserved
-    body.extend_from_slice(&[0u8; 8]); // reserved
+    body.extend_from_slice(&[0u8; 2]);
+    body.extend_from_slice(&[0u8; 8]);
     for v in [0x1_0000u32, 0, 0, 0, 0x1_0000, 0, 0, 0, 0x4000_0000] {
         body.extend_from_slice(&v.to_be_bytes());
     }
-    body.extend_from_slice(&[0u8; 24]); // pre_defined[6]
-    body.extend_from_slice(&2u32.to_be_bytes()); // next_track_ID
+    body.extend_from_slice(&[0u8; 24]);
+    body.extend_from_slice(&next_track_id.to_be_bytes());
     fullbox(b"mvhd", 1, 0, &body)
 }
 
-fn build_video_trak(
-    width: u32,
-    height: u32,
-    timescale: u32,
-    duration: u64,
-    stbl: Vec<u8>,
-) -> Vec<u8> {
-    let tkhd = build_tkhd(width, height, duration);
-    let mdia = build_mdia(timescale, duration, stbl);
+fn build_tkhd(track_id: u32, width: u32, height: u32, duration: u64, audio: bool) -> Vec<u8> {
     let mut body = Vec::new();
-    body.extend_from_slice(&tkhd);
-    body.extend_from_slice(&mdia);
-    bx(b"trak", &body)
-}
-
-fn build_tkhd(width: u32, height: u32, duration: u64) -> Vec<u8> {
-    // Version 1, flags 0x000007 (enabled | in_movie | in_preview).
-    let mut body = Vec::new();
-    body.extend_from_slice(&0u64.to_be_bytes()); // creation_time
-    body.extend_from_slice(&0u64.to_be_bytes()); // modification_time
-    body.extend_from_slice(&1u32.to_be_bytes()); // track_ID
+    body.extend_from_slice(&0u64.to_be_bytes()); // creation
+    body.extend_from_slice(&0u64.to_be_bytes()); // modification
+    body.extend_from_slice(&track_id.to_be_bytes());
     body.extend_from_slice(&[0u8; 4]); // reserved
     body.extend_from_slice(&duration.to_be_bytes());
     body.extend_from_slice(&[0u8; 8]); // reserved
     body.extend_from_slice(&0u16.to_be_bytes()); // layer
     body.extend_from_slice(&0u16.to_be_bytes()); // alternate_group
-    body.extend_from_slice(&0u16.to_be_bytes()); // volume (video = 0)
-    body.extend_from_slice(&[0u8; 2]); // reserved
+    body.extend_from_slice(&(if audio { 0x0100u16 } else { 0 }).to_be_bytes()); // volume
+    body.extend_from_slice(&[0u8; 2]);
     for v in [0x1_0000u32, 0, 0, 0, 0x1_0000, 0, 0, 0, 0x4000_0000] {
         body.extend_from_slice(&v.to_be_bytes());
     }
@@ -352,21 +513,27 @@ fn build_tkhd(width: u32, height: u32, duration: u64) -> Vec<u8> {
     fullbox(b"tkhd", 1, 0x07, &body)
 }
 
-fn build_mdia(timescale: u32, duration: u64, stbl: Vec<u8>) -> Vec<u8> {
+#[allow(clippy::too_many_arguments)]
+fn build_mdia(
+    language: [u8; 2],
+    timescale: u32,
+    duration: u64,
+    handler: &[u8; 4],
+    handler_name: &str,
+    minf: Vec<u8>,
+) -> Vec<u8> {
     let mut mdhd = Vec::new();
-    mdhd.extend_from_slice(&0u64.to_be_bytes()); // creation
-    mdhd.extend_from_slice(&0u64.to_be_bytes()); // modification
+    mdhd.extend_from_slice(&0u64.to_be_bytes());
+    mdhd.extend_from_slice(&0u64.to_be_bytes());
     mdhd.extend_from_slice(&timescale.to_be_bytes());
     mdhd.extend_from_slice(&duration.to_be_bytes());
-    mdhd.extend_from_slice(&[0x55, 0xC4]); // language 'und'
-    mdhd.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
+    mdhd.extend_from_slice(&language);
+    mdhd.extend_from_slice(&0u16.to_be_bytes());
     let mdhd = fullbox(b"mdhd", 1, 0, &mdhd);
 
-    let hdlr = build_hdlr(b"vide", "VideoHandler");
-    let minf = build_video_minf(stbl);
+    let hdlr = build_hdlr(handler, handler_name);
 
-    let mut body = Vec::new();
-    body.extend_from_slice(&mdhd);
+    let mut body = mdhd;
     body.extend_from_slice(&hdlr);
     body.extend_from_slice(&minf);
     bx(b"mdia", &body)
@@ -374,33 +541,40 @@ fn build_mdia(timescale: u32, duration: u64, stbl: Vec<u8>) -> Vec<u8> {
 
 fn build_hdlr(handler: &[u8; 4], name: &str) -> Vec<u8> {
     let mut body = Vec::new();
-    body.extend_from_slice(&0u32.to_be_bytes()); // pre_defined
+    body.extend_from_slice(&0u32.to_be_bytes());
     body.extend_from_slice(handler);
-    body.extend_from_slice(&[0u8; 12]); // reserved
+    body.extend_from_slice(&[0u8; 12]);
     body.extend_from_slice(name.as_bytes());
     body.push(0);
     fullbox(b"hdlr", 0, 0, &body)
 }
 
-fn build_video_minf(stbl: Vec<u8>) -> Vec<u8> {
-    // vmhd (version 0, flags 1).
+fn video_vmhd() -> Vec<u8> {
     let mut vmhd = Vec::new();
     vmhd.extend_from_slice(&0u16.to_be_bytes()); // graphicsmode
     vmhd.extend_from_slice(&[0u8; 6]); // opcolor
-    let vmhd = fullbox(b"vmhd", 0, 1, &vmhd);
-    let dinf = build_dinf();
+    fullbox(b"vmhd", 0, 1, &vmhd)
+}
 
-    let mut body = Vec::new();
-    body.extend_from_slice(&vmhd);
+fn audio_smhd() -> Vec<u8> {
+    let mut smhd = Vec::new();
+    smhd.extend_from_slice(&0u16.to_be_bytes()); // balance
+    smhd.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    fullbox(b"smhd", 0, 0, &smhd)
+}
+
+fn build_minf(header: Vec<u8>, stbl: Vec<u8>) -> Vec<u8> {
+    let dinf = build_dinf();
+    let mut body = header;
     body.extend_from_slice(&dinf);
     body.extend_from_slice(&stbl);
     bx(b"minf", &body)
 }
 
 fn build_dinf() -> Vec<u8> {
-    let url = fullbox(b"url ", 0, 1, &[]); // self-contained
+    let url = fullbox(b"url ", 0, 1, &[]);
     let mut dref = Vec::new();
-    dref.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+    dref.extend_from_slice(&1u32.to_be_bytes());
     dref.extend_from_slice(&url);
     let dref = fullbox(b"dref", 0, 0, &dref);
     bx(b"dinf", &dref)
@@ -420,11 +594,10 @@ fn video_colr(stream: &DiscStream) -> Option<(u16, u16, u16, bool)> {
             c.range == 2,
         ));
     }
-    // Fall back to the coarse colour-space enum → CICP code points.
     use crate::disc::ColorSpace::*;
     let cicp = match v.color_space {
         Bt709 => (1, 1, 1),
-        Bt2020 => (9, 16, 9), // BT.2020 NCL; transfer 16 = PQ (HDR10 default)
+        Bt2020 => (9, 16, 9),
         Bt470bg => (5, 6, 5),
         Smpte170m => (6, 6, 6),
         Unknown => return None,
@@ -432,28 +605,15 @@ fn video_colr(stream: &DiscStream) -> Option<(u16, u16, u16, bool)> {
     Some((cicp.0, cicp.1, cicp.2, false))
 }
 
-/// Build `stbl` — the sample table: sample entry (`hvc1`/`avc1` + config + colr),
-/// `stts`, `stss`, `ctts`, `stsc`, `stsz`, `co64`.
-#[allow(clippy::too_many_arguments)]
-fn build_stbl(
-    codec: Codec,
-    codec_private: &[u8],
-    width: u32,
-    height: u32,
-    colr: Option<(u16, u16, u16, bool)>,
-    samples: &[Sample],
-    timing: &Timing,
-) -> Vec<u8> {
-    let stsd = build_visual_stsd(codec, codec_private, width, height, colr);
-
-    // stts: one run of `count` samples, each with the constant decode duration.
+/// Video `stbl`: sample entry + `stts`(constant) + `stss` + `ctts` + `stsc` +
+/// `stsz` + `co64`.
+fn build_video_stbl(stsd: Vec<u8>, samples: &[Sample], timing: &VideoTiming) -> Vec<u8> {
     let mut stts = Vec::new();
-    stts.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+    stts.extend_from_slice(&1u32.to_be_bytes());
     stts.extend_from_slice(&(samples.len() as u32).to_be_bytes());
     stts.extend_from_slice(&timing.sample_dur.to_be_bytes());
     let stts = fullbox(b"stts", 0, 0, &stts);
 
-    // stss: 1-based sample numbers of the sync samples.
     let sync: Vec<u32> = samples
         .iter()
         .enumerate()
@@ -467,36 +627,12 @@ fn build_stbl(
     }
     let stss = fullbox(b"stss", 0, 0, &stss);
 
-    // ctts (version 1, signed offsets), coalesced into runs.
     let ctts = build_ctts(&timing.ctts());
+    let stsc = build_stsc();
+    let stsz = build_stsz(samples);
+    let co64 = build_co64(samples);
 
-    // stsc: one sample per chunk (offsets listed one-per-sample in co64).
-    let mut stsc = Vec::new();
-    stsc.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-    stsc.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
-    stsc.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk
-    stsc.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index
-    let stsc = fullbox(b"stsc", 0, 0, &stsc);
-
-    // stsz: per-sample sizes.
-    let mut stsz = Vec::new();
-    stsz.extend_from_slice(&0u32.to_be_bytes()); // sample_size 0 = per-sample
-    stsz.extend_from_slice(&(samples.len() as u32).to_be_bytes());
-    for s in samples {
-        stsz.extend_from_slice(&s.size.to_be_bytes());
-    }
-    let stsz = fullbox(b"stsz", 0, 0, &stsz);
-
-    // co64: 64-bit chunk (= per-sample) offsets — movies exceed 4 GiB.
-    let mut co64 = Vec::new();
-    co64.extend_from_slice(&(samples.len() as u32).to_be_bytes());
-    for s in samples {
-        co64.extend_from_slice(&s.offset.to_be_bytes());
-    }
-    let co64 = fullbox(b"co64", 0, 0, &co64);
-
-    let mut body = Vec::new();
-    body.extend_from_slice(&stsd);
+    let mut body = stsd;
     body.extend_from_slice(&stts);
     body.extend_from_slice(&stss);
     body.extend_from_slice(&ctts);
@@ -504,6 +640,72 @@ fn build_stbl(
     body.extend_from_slice(&stsz);
     body.extend_from_slice(&co64);
     bx(b"stbl", &body)
+}
+
+/// Audio `stbl`: sample entry + run-length `stts` (per-sample durations) +
+/// `stsc` + `stsz` + `co64`. No `stss` (every audio sample is a sync sample) and
+/// no `ctts` (no reorder).
+fn build_audio_stbl(sample_entry: Vec<u8>, samples: &[Sample], durs: &[u32]) -> Vec<u8> {
+    let mut stsd = Vec::new();
+    stsd.extend_from_slice(&1u32.to_be_bytes());
+    stsd.extend_from_slice(&sample_entry);
+    let stsd = fullbox(b"stsd", 0, 0, &stsd);
+
+    // Run-length coalesce equal consecutive durations.
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for &d in durs {
+        match runs.last_mut() {
+            Some((count, val)) if *val == d => *count += 1,
+            _ => runs.push((1, d)),
+        }
+    }
+    let mut stts = Vec::new();
+    stts.extend_from_slice(&(runs.len() as u32).to_be_bytes());
+    for (count, val) in &runs {
+        stts.extend_from_slice(&count.to_be_bytes());
+        stts.extend_from_slice(&val.to_be_bytes());
+    }
+    let stts = fullbox(b"stts", 0, 0, &stts);
+
+    let stsc = build_stsc();
+    let stsz = build_stsz(samples);
+    let co64 = build_co64(samples);
+
+    let mut body = stsd;
+    body.extend_from_slice(&stts);
+    body.extend_from_slice(&stsc);
+    body.extend_from_slice(&stsz);
+    body.extend_from_slice(&co64);
+    bx(b"stbl", &body)
+}
+
+/// `stsc`: one sample per chunk (offsets listed one-per-sample in `co64`).
+fn build_stsc() -> Vec<u8> {
+    let mut stsc = Vec::new();
+    stsc.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+    stsc.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
+    stsc.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk
+    stsc.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index
+    fullbox(b"stsc", 0, 0, &stsc)
+}
+
+fn build_stsz(samples: &[Sample]) -> Vec<u8> {
+    let mut stsz = Vec::new();
+    stsz.extend_from_slice(&0u32.to_be_bytes()); // per-sample sizes
+    stsz.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+    for s in samples {
+        stsz.extend_from_slice(&s.size.to_be_bytes());
+    }
+    fullbox(b"stsz", 0, 0, &stsz)
+}
+
+fn build_co64(samples: &[Sample]) -> Vec<u8> {
+    let mut co64 = Vec::new();
+    co64.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+    for s in samples {
+        co64.extend_from_slice(&s.offset.to_be_bytes());
+    }
+    fullbox(b"co64", 0, 0, &co64)
 }
 
 /// `ctts` version 1 (signed composition offsets), run-length coalesced.
@@ -519,13 +721,13 @@ fn build_ctts(offsets: &[i32]) -> Vec<u8> {
     body.extend_from_slice(&(runs.len() as u32).to_be_bytes());
     for (count, val) in &runs {
         body.extend_from_slice(&count.to_be_bytes());
-        body.extend_from_slice(&val.to_be_bytes()); // i32 BE
+        body.extend_from_slice(&val.to_be_bytes());
     }
     fullbox(b"ctts", 1, 0, &body)
 }
 
 /// Visual `stsd` with one `hvc1`/`avc1` sample entry carrying the config record
-/// (`hvcC`/`avcC`) and, when present, a `colr` box for colour/HDR signalling.
+/// (`hvcC`/`avcC`) and, when present, a `colr` box.
 fn build_visual_stsd(
     codec: Codec,
     codec_private: &[u8],
@@ -539,35 +741,34 @@ fn build_visual_stsd(
     };
 
     let mut entry = Vec::new();
-    entry.extend_from_slice(&[0u8; 6]); // reserved
+    entry.extend_from_slice(&[0u8; 6]);
     entry.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
     entry.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
     entry.extend_from_slice(&0u16.to_be_bytes()); // reserved
     entry.extend_from_slice(&[0u8; 12]); // pre_defined[3]
     entry.extend_from_slice(&(width as u16).to_be_bytes());
     entry.extend_from_slice(&(height as u16).to_be_bytes());
-    entry.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // horizresolution 72dpi
-    entry.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // vertresolution 72dpi
-    entry.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    entry.extend_from_slice(&0x0048_0000u32.to_be_bytes());
+    entry.extend_from_slice(&0x0048_0000u32.to_be_bytes());
+    entry.extend_from_slice(&0u32.to_be_bytes());
     entry.extend_from_slice(&1u16.to_be_bytes()); // frame_count
     entry.extend_from_slice(&[0u8; 32]); // compressorname
     entry.extend_from_slice(&0x0018u16.to_be_bytes()); // depth
-    entry.extend_from_slice(&0xFFFFu16.to_be_bytes()); // pre_defined = -1
-    // Config record (hvcC / avcC) is the codec_private verbatim.
+    entry.extend_from_slice(&0xFFFFu16.to_be_bytes());
     entry.extend_from_slice(&bx(cfg_type, codec_private));
     if let Some((p, t, m, full)) = colr {
-        let mut colr_body = Vec::new();
-        colr_body.extend_from_slice(b"nclx");
-        colr_body.extend_from_slice(&p.to_be_bytes());
-        colr_body.extend_from_slice(&t.to_be_bytes());
-        colr_body.extend_from_slice(&m.to_be_bytes());
-        colr_body.push(if full { 0x80 } else { 0x00 }); // full_range flag in MSB
-        entry.extend_from_slice(&bx(b"colr", &colr_body));
+        let mut c = Vec::new();
+        c.extend_from_slice(b"nclx");
+        c.extend_from_slice(&p.to_be_bytes());
+        c.extend_from_slice(&t.to_be_bytes());
+        c.extend_from_slice(&m.to_be_bytes());
+        c.push(if full { 0x80 } else { 0x00 });
+        entry.extend_from_slice(&bx(b"colr", &c));
     }
     let entry = bx(fourcc, &entry);
 
     let mut stsd = Vec::new();
-    stsd.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+    stsd.extend_from_slice(&1u32.to_be_bytes());
     stsd.extend_from_slice(&entry);
     fullbox(b"stsd", 0, 0, &stsd)
 }
@@ -576,13 +777,13 @@ fn build_visual_stsd(
 mod tests {
     use super::*;
     use crate::disc::{
-        Codec, ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream as DiscStream,
-        VideoStream,
+        AudioChannels, AudioStream, Codec, ColorSpace, DiscTitle, FrameRate, HdrFormat,
+        LabelPurpose, Resolution, SampleRate, Stream as DiscStream, SubtitleStream, VideoStream,
     };
+    use crate::labels::LabelQualifier;
 
-    fn video_title() -> DiscTitle {
-        let mut t = DiscTitle::empty();
-        t.streams = vec![DiscStream::Video(VideoStream {
+    fn hevc_video() -> DiscStream {
+        DiscStream::Video(VideoStream {
             pid: 0x1011,
             codec: Codec::Hevc,
             resolution: Resolution::R2160p,
@@ -593,34 +794,106 @@ mod tests {
             secondary: false,
             label: String::new(),
             measured_cicp: None,
-        })];
-        // A minimal but non-empty hvcC stand-in (opaque to the muxer — copied
-        // verbatim into the sample entry).
-        t.codec_privates = vec![Some(vec![0x01, 0x02, 0x03, 0x04])];
+        })
+    }
+
+    fn audio(codec: Codec, lang: &str) -> DiscStream {
+        DiscStream::Audio(AudioStream {
+            pid: 0x1100,
+            codec,
+            channels: AudioChannels::Surround51,
+            language: lang.into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        })
+    }
+
+    fn subtitle() -> DiscStream {
+        DiscStream::Subtitle(SubtitleStream {
+            pid: 0x1200,
+            codec: Codec::Pgs,
+            language: "eng".into(),
+            forced: false,
+            qualifier: LabelQualifier::None,
+            codec_data: None,
+        })
+    }
+
+    fn title(streams: Vec<DiscStream>, cps: Vec<Option<Vec<u8>>>) -> DiscTitle {
+        let mut t = DiscTitle::empty();
+        t.streams = streams;
+        t.codec_privates = cps;
         t
     }
 
-    fn frame(track: usize, pts_ns: i64, key: bool, len: usize) -> PesFrame {
+    #[test]
+    fn fit_report_includes_video_and_dolby_only() {
+        let t = title(
+            vec![
+                hevc_video(),
+                audio(Codec::TrueHd, "eng"),
+                audio(Codec::Ac3, "eng"),
+                audio(Codec::Ac3Plus, "fra"),
+                subtitle(),
+            ],
+            vec![Some(vec![1, 2, 3]), None, None, None, None],
+        );
+        let r = fit_report(&t);
+        assert_eq!(r.included, vec![0, 2, 3], "video + AC3 + EAC3");
+        // TrueHD (unmappable audio) and PGS (bitmap subtitle) are skipped.
+        assert!(r.skipped.contains(&(1, Mp4SkipReason::UnmappableAudio)));
+        assert!(r.skipped.contains(&(4, Mp4SkipReason::BitmapSubtitle)));
+    }
+
+    #[test]
+    fn no_video_track_is_an_error() {
+        let t = title(vec![audio(Codec::Ac3, "eng")], vec![None]);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fmkv_mp4_novid_{}.mp4", std::process::id()));
+        let err = match Mp4Sink::create(&path, &t) {
+            Ok(_) => panic!("expected no-video-track error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn frame(track: usize, pts_ns: i64, key: bool, data: Vec<u8>) -> PesFrame {
         PesFrame {
             track,
             pts: pts_ns,
             keyframe: key,
-            data: vec![0xAB; len],
+            data,
             duration_ns: None,
             source: None,
             coding: None,
         }
     }
 
-    /// Walk a flat box sequence, asserting each declared size tiles exactly.
+    // A minimal AC-3 5.1 frame the audio parser accepts.
+    fn ac3_frame() -> Vec<u8> {
+        vec![
+            0x0B,
+            0x77,
+            0x00,
+            0x00,
+            0b00_010110,
+            0b01000_000,
+            0b111_00_00_1,
+            0x00,
+            0xFF,
+            0xFF,
+        ]
+    }
+
     fn walk(buf: &[u8]) -> Vec<([u8; 4], usize, usize)> {
         let mut out = Vec::new();
         let mut pos = 0;
         while pos + 8 <= buf.len() {
             let size = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
-            let bt = [buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]];
             let size = if size == 1 {
-                // 64-bit largesize (mdat).
                 u64::from_be_bytes([
                     buf[pos + 8],
                     buf[pos + 9],
@@ -634,128 +907,68 @@ mod tests {
             } else {
                 size as usize
             };
-            assert!(size >= 8, "box {bt:?} size {size} < 8");
-            assert!(pos + size <= buf.len(), "box {bt:?} overruns buffer");
+            let bt = [buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]];
+            assert!(size >= 8 && pos + size <= buf.len(), "box {bt:?} bad size");
             out.push((bt, pos, size));
             pos += size;
         }
-        assert_eq!(pos, buf.len(), "top-level boxes did not tile exactly");
+        assert_eq!(pos, buf.len(), "top-level boxes tile exactly");
         out
     }
 
-    fn child<'a>(payload: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
-        let mut pos = 0;
-        while pos + 8 <= payload.len() {
-            let size = u32::from_be_bytes([
-                payload[pos],
-                payload[pos + 1],
-                payload[pos + 2],
-                payload[pos + 3],
-            ]) as usize;
-            let bt = [
-                payload[pos + 4],
-                payload[pos + 5],
-                payload[pos + 6],
-                payload[pos + 7],
-            ];
-            if size < 8 || pos + size > payload.len() {
-                return None;
-            }
-            if &bt == want {
-                return Some(&payload[pos..pos + size]);
-            }
-            pos += size;
-        }
-        None
-    }
-
-    fn mux_to_file(frames: &[PesFrame]) -> Vec<u8> {
+    #[test]
+    fn av_mux_has_two_traks_and_tiles() {
+        let t = title(
+            vec![hevc_video(), audio(Codec::Ac3, "eng")],
+            vec![Some(vec![1, 2, 3, 4]), None],
+        );
+        let dir = std::env::temp_dir();
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir();
         let path = dir.join(format!(
-            "freemkv_mp4_test_{}_{}.mp4",
+            "fmkv_mp4_av_{}_{}.mp4",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        let d = 41_708_333;
         {
-            let mut sink = Mp4Sink::create(&path, &video_title()).unwrap();
-            for f in frames {
-                sink.write(f).unwrap();
-            }
-            sink.finish().unwrap();
+            let mut s = Mp4Sink::create(&path, &t).unwrap();
+            // Two video frames (track 0) + two AC-3 frames (track 1).
+            s.write(&frame(0, 0, true, vec![0xAB; 800])).unwrap();
+            s.write(&frame(1, 0, true, ac3_frame())).unwrap();
+            s.write(&frame(0, d, false, vec![0xCD; 400])).unwrap();
+            s.write(&frame(1, 32_000_000, true, ac3_frame())).unwrap();
+            s.finish().unwrap();
         }
         let buf = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        buf
-    }
-
-    #[test]
-    fn top_level_is_ftyp_mdat_moov_and_tiles_exactly() {
-        // 3 frames: IDR, then two at increasing PTS (24000/1001 fps cadence).
-        let d = 41_708_333; // ~1/23.976 s in ns
-        let frames = [
-            frame(0, 0, true, 1000),
-            frame(0, d, false, 500),
-            frame(0, 2 * d, false, 400),
-        ];
-        let buf = mux_to_file(&frames);
         let boxes = walk(&buf);
         let types: Vec<[u8; 4]> = boxes.iter().map(|(t, _, _)| *t).collect();
         assert_eq!(types, vec![*b"ftyp", *b"mdat", *b"moov"]);
-    }
-
-    #[test]
-    fn mdat_carries_only_video_track_bytes() {
-        // Interleave an audio-track frame (track 1) that M1 must drop.
-        let d = 41_708_333;
-        let frames = [
-            frame(0, 0, true, 1000),
-            frame(1, 0, true, 9999), // audio — dropped in M1
-            frame(0, d, false, 500),
-        ];
-        let buf = mux_to_file(&frames);
-        let boxes = walk(&buf);
-        let (_, mdat_start, mdat_size) = *boxes.iter().find(|(t, _, _)| t == b"mdat").unwrap();
-        // mdat payload = 16-byte header + only the two video samples (1000 + 500).
-        assert_eq!(mdat_size, 16 + 1000 + 500);
-        let _ = mdat_start;
-    }
-
-    #[test]
-    fn stbl_tables_match_the_video_samples() {
-        let d = 41_708_333;
-        let frames = [
-            frame(0, 0, true, 1000),
-            frame(0, d, false, 500),
-            frame(0, 2 * d, false, 400),
-        ];
-        let buf = mux_to_file(&frames);
-        let boxes = walk(&buf);
+        // moov must contain exactly two trak boxes.
         let (_, ms, msz) = *boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
         let moov = &buf[ms + 8..ms + msz];
-        let trak = child(moov, b"trak").unwrap();
-        let mdia = child(&trak[8..], b"mdia").unwrap();
-        let minf = child(&mdia[8..], b"minf").unwrap();
-        let stbl = child(&minf[8..], b"stbl").unwrap();
-
-        // stsz sample_count == 3.
-        let stsz = child(&stbl[8..], b"stsz").unwrap();
-        let count = u32::from_be_bytes([stsz[16], stsz[17], stsz[18], stsz[19]]);
-        assert_eq!(count, 3, "three video samples");
-        // co64 has 3 offsets (per-sample chunks).
-        let co64 = child(&stbl[8..], b"co64").unwrap();
-        let co_count = u32::from_be_bytes([co64[12], co64[13], co64[14], co64[15]]);
-        assert_eq!(co_count, 3);
-        // stss: exactly one sync sample (the IDR at index 1).
-        let stss = child(&stbl[8..], b"stss").unwrap();
-        let sync_count = u32::from_be_bytes([stss[12], stss[13], stss[14], stss[15]]);
-        assert_eq!(sync_count, 1);
-        let first_sync = u32::from_be_bytes([stss[16], stss[17], stss[18], stss[19]]);
-        assert_eq!(first_sync, 1, "sync sample numbers are 1-based");
-        // hvc1 sample entry present under stsd.
-        let stsd = child(&stbl[8..], b"stsd").unwrap();
-        assert!(child(&stsd[16..], b"hvc1").is_some(), "hvc1 sample entry");
+        let trak_count = {
+            let mut n = 0;
+            let mut pos = 0;
+            while pos + 8 <= moov.len() {
+                let size =
+                    u32::from_be_bytes([moov[pos], moov[pos + 1], moov[pos + 2], moov[pos + 3]])
+                        as usize;
+                if &moov[pos + 4..pos + 8] == b"trak" {
+                    n += 1;
+                }
+                if size < 8 {
+                    break;
+                }
+                pos += size;
+            }
+            n
+        };
+        assert_eq!(trak_count, 2, "one video + one audio trak");
+        // mdat = header + 800+400 video + two AC-3 frames.
+        let (_, _, mdat_sz) = *boxes.iter().find(|(t, _, _)| t == b"mdat").unwrap();
+        assert_eq!(mdat_sz, 16 + 800 + 400 + ac3_frame().len() * 2);
     }
 
     #[test]

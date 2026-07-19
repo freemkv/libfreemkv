@@ -850,6 +850,11 @@ impl From<Error> for std::io::Error {
             // 9023 MuxEmpty: finish() reached with zero frames — the output
             // would be a header-only container. Treat as invalid output.
             E_MUX_EMPTY => std::io::ErrorKind::InvalidData,
+            // 9048-9050 mp4:// track/codec/config mismatches: the requested
+            // output can't hold this title's video — invalid output request.
+            E_MP4_NO_VIDEO_TRACK | E_MP4_UNSUPPORTED_VIDEO_CODEC | E_MP4_MISSING_CODEC_PRIVATE => {
+                std::io::ErrorKind::InvalidData
+            }
             // 9030 ExtentNotUnitAligned: a malformed/non-AACS-aligned
             // extent was handed to the prefetch producer.
             9030 => std::io::ErrorKind::InvalidInput,
