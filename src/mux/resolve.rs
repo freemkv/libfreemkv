@@ -513,8 +513,9 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         // PES source. Mirror `null://` → write-only.
         StreamUrl::Dir { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
-        // `mp4://` is an output-only mux sink for now (no MP4 demux source).
-        StreamUrl::Mp4 { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
+        // `mp4://` as a source: demux a progressive MP4 back into PES frames, so
+        // `mp4://` flows to every sink (mkv://, audio://, json://, …).
+        StreamUrl::Mp4 { ref path } => Ok(Box::new(super::mp4::Mp4Reader::open(path)?)),
         // `demux://` is an output-only sink (per-track ES files); never a source.
         StreamUrl::Demux { .. }
         | StreamUrl::Video { .. }
