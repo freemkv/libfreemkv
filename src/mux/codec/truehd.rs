@@ -12,6 +12,8 @@
 //! AC-3 frames (interleaved, same PID): start with sync word 0x0B77.
 //! We skip AC-3 frames and only emit TrueHD access units.
 
+use super::crc::crc16_mlp;
+use super::dropgate::DropTally;
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 use crate::mux::timeline::DISCONTINUITY_BACKSTEP_NS;
 
@@ -43,6 +45,18 @@ pub struct TrueHdParser {
     /// yet seen (head of stream) — preserving byte-identical timing for the
     /// common 48 kHz case.
     au_duration_ns: i64,
+    /// Keep/drop bookkeeping for the decodability gate.
+    tally: DropTally,
+    /// `num_substreams` from the most recent major sync — needed to size the
+    /// substream directory for the per-AU parity check. `None` until the first
+    /// major sync is seen (before which no AU can be parity-checked).
+    num_substreams: Option<u8>,
+    /// True while dropping forward to the next clean resync point. MLP/TrueHD
+    /// carries filter/predictor + restart state ACROSS access units, so a corrupt
+    /// AU cannot be excised in place — it poisons decoding until the next major
+    /// sync re-initialises state. On corruption we set this and drop every AU
+    /// until a major sync whose header CRC validates, which we then emit.
+    resync_pending: bool,
 }
 
 impl Default for TrueHdParser {
@@ -57,7 +71,48 @@ impl TrueHdParser {
             buf: Vec::with_capacity(32768),
             next_pts_ns: 0,
             au_duration_ns: AU_DURATION_NS,
+            tally: DropTally::new("truehd"),
+            num_substreams: None,
+            resync_pending: false,
         }
+    }
+
+    /// Access units dropped as undecodable so far.
+    pub fn dropped_frames(&self) -> u64 {
+        self.tally.dropped_frames()
+    }
+
+    /// Total decoded duration (ns) of dropped access units.
+    pub fn dropped_duration_ns(&self) -> u64 {
+        self.tally.dropped_duration_ns()
+    }
+
+    /// Decide whether an access unit is corrupt, updating `num_substreams` from a
+    /// valid major sync. Mirrors ffmpeg `read_access_unit`: a major sync with a
+    /// bad header CRC, or any AU whose header parity fails, is undecodable.
+    /// Returns `false` (not corrupt) when the AU is too short to judge or no
+    /// major sync has established `num_substreams` yet — we never drop what we
+    /// cannot verify. Verified against real ffmpeg TrueHD (3600/3600 AUs).
+    fn au_is_corrupt(&mut self, au: &[u8], is_major_sync: bool) -> bool {
+        let mut header_size = 4;
+        if is_major_sync {
+            let ms = &au[4..];
+            let Some(mshdr) = mlp_major_sync_header_size(ms) else {
+                return false; // too short to hold a major-sync header — can't judge
+            };
+            if !mlp_major_sync_crc_ok(ms, mshdr) {
+                return true; // corrupt major-sync header
+            }
+            self.num_substreams = mlp_num_substreams(ms);
+            header_size += mshdr;
+        }
+        let Some(nss) = self.num_substreams else {
+            return false; // no major sync seen yet — nothing to check against
+        };
+        let Some(shs) = mlp_substr_header_size(au, header_size, nss) else {
+            return false; // directory runs off the AU — can't judge
+        };
+        !mlp_parity_ok(au, header_size, shs)
     }
 
     /// Size (bytes) of the AC-3 frame at the buffer head.
@@ -122,6 +177,80 @@ enum Ac3Size {
     NeedMore,
     /// A complete `n`-byte AC-3 frame is buffered.
     Frame(usize),
+}
+
+// --- MLP/TrueHD access-unit integrity (mirrors ffmpeg mlpdec.c / mlp_parse.c) ---
+
+/// Major-sync header size in bytes: base 28, plus `2 + extensions*2` when the
+/// extension flag (major-sync byte 25, bit 0) is set (`extensions` = byte 26
+/// high nibble). `ms` is the major-sync header, i.e. AU bytes `[4..]`. `None`
+/// when the AU is too short to contain the full header.
+fn mlp_major_sync_header_size(ms: &[u8]) -> Option<usize> {
+    if ms.len() < 28 {
+        return None;
+    }
+    let mut size = 28;
+    if ms[25] & 1 != 0 {
+        size += 2 + ((ms[26] >> 4) as usize) * 2;
+    }
+    if ms.len() < size {
+        return None;
+    }
+    Some(size)
+}
+
+/// Validate the MLP/TrueHD major-sync header checksum (ffmpeg `ff_mlp_checksum16`,
+/// CRC-16 poly 0x002D). The stored trailer is the last 2 header bytes; because
+/// MLP's checksum is byte-reversed relative to a standard CRC, a standard CRC of
+/// the header body XOR the little-endian word before the trailer must equal the
+/// trailer read big-endian.
+fn mlp_major_sync_crc_ok(ms: &[u8], mshdr: usize) -> bool {
+    if mshdr < 4 || ms.len() < mshdr {
+        return false;
+    }
+    let crc = crc16_mlp(&ms[..mshdr - 4]) ^ u16::from_le_bytes([ms[mshdr - 4], ms[mshdr - 3]]);
+    crc == u16::from_be_bytes([ms[mshdr - 2], ms[mshdr - 1]])
+}
+
+/// `num_substreams` from a major-sync header: it sits at bit 128 (byte 16, top
+/// nibble) for both MLP (0xbb) and TrueHD (0xba) — the fields before it total
+/// the same 128 bits in either layout.
+fn mlp_num_substreams(ms: &[u8]) -> Option<u8> {
+    ms.get(16).map(|&b| b >> 4)
+}
+
+/// Size in bytes of the substream directory that follows the AU header: each of
+/// the `num_substreams` entries is 2 bytes, plus 2 more when its extraword flag
+/// (entry's top bit) is set. `None` if the directory runs past the AU.
+fn mlp_substr_header_size(au: &[u8], header_size: usize, num_substreams: u8) -> Option<usize> {
+    let mut off = header_size;
+    let mut shs = 0;
+    for _ in 0..num_substreams {
+        if off + 2 > au.len() {
+            return None;
+        }
+        let extraword = au[off] & 0x80 != 0;
+        shs += 2;
+        off += 2;
+        if extraword {
+            shs += 2;
+            off += 2;
+        }
+    }
+    Some(shs)
+}
+
+/// MLP/TrueHD AU-header parity check (ffmpeg `ff_mlp_calculate_parity`): the XOR
+/// of the 4-byte AU header with the substream directory, folded, must have its
+/// two nibbles XOR to 0xF.
+fn mlp_parity_ok(au: &[u8], header_size: usize, substr_header_size: usize) -> bool {
+    let end = header_size + substr_header_size;
+    if end > au.len() {
+        return false;
+    }
+    let xor_fold = |d: &[u8]| d.iter().fold(0u8, |a, &b| a ^ b);
+    let p = xor_fold(&au[0..4]) ^ xor_fold(&au[header_size..end]);
+    ((p >> 4) ^ p) & 0xF == 0xF
 }
 
 impl CodecParser for TrueHdParser {
@@ -267,15 +396,52 @@ impl CodecParser for TrueHdParser {
                 self.au_duration_ns = truehd_au_duration_ns(format_info);
             }
 
-            frames.push(Frame {
-                discontinuity: false,
-                coding: None,
-                source: None,
-                pts_ns: self.next_pts_ns,
-                keyframe: is_major_sync,
-                data: self.buf[..unit_bytes].to_vec(),
-                duration_ns: None,
-            });
+            // Decodability gate. MLP/TrueHD state persists across AUs, so a
+            // corrupt AU is dropped FORWARD to the next major sync (the clean
+            // re-init point) rather than excised in place; the PTS clock advances
+            // across every dropped AU so the drop is a silence gap, never a shift.
+            let au = self.buf[..unit_bytes].to_vec();
+            let pts = self.next_pts_ns;
+            let corrupt = self.tally.is_poisoned() || self.au_is_corrupt(&au, is_major_sync);
+            let emit = if self.resync_pending {
+                // Only a valid major sync clears the resync and is emitted.
+                if is_major_sync && !corrupt {
+                    self.resync_pending = false;
+                    true
+                } else {
+                    false
+                }
+            } else if corrupt {
+                self.resync_pending = true;
+                false
+            } else {
+                true
+            };
+
+            if emit {
+                self.tally.record_kept();
+                frames.push(Frame {
+                    discontinuity: false,
+                    coding: None,
+                    source: None,
+                    pts_ns: pts,
+                    keyframe: is_major_sync,
+                    data: au,
+                    duration_ns: None,
+                });
+            } else {
+                let reason = if self.tally.is_poisoned() {
+                    "track-poisoned"
+                } else if is_major_sync && corrupt {
+                    "major-sync-crc"
+                } else if corrupt {
+                    "parity"
+                } else {
+                    "resync"
+                };
+                self.tally
+                    .record_drop(pts, self.au_duration_ns, au.len(), reason);
+            }
             self.buf.drain(..unit_bytes);
             self.next_pts_ns += self.au_duration_ns;
         }
@@ -287,6 +453,11 @@ impl CodecParser for TrueHdParser {
         }
 
         frames
+    }
+
+    fn flush(&mut self) -> Vec<Frame> {
+        self.tally.log_summary();
+        Vec::new()
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
@@ -449,6 +620,145 @@ mod tests {
         data[0] = ((words >> 8) & 0x0F) as u8;
         data[1] = (words & 0xFF) as u8;
         data
+    }
+
+    /// Turn a synthetic major-sync AU (sync bytes already set at offset 4, any
+    /// `format_info` set) into one that passes the decodability gate: 1 substream,
+    /// a clean substream directory, a valid major-sync CRC-16, and a valid header
+    /// parity nibble. Mirrors what a real encoder writes (verified against real
+    /// ffmpeg TrueHD). The AU must be ≥ 36 bytes (4 AU header + 28 major-sync
+    /// header + 2 directory + slack), which every `make_truehd_unit(≥200)` is.
+    fn finalize_major_sync(au: &mut [u8]) {
+        const MSHDR: usize = 28; // no extension (byte 25 clear)
+        // num_substreams = 1 → major-sync byte 16 (AU[20]) top nibble.
+        au[20] = (au[20] & 0x0F) | 0x10;
+        // Substream directory entry at AU[4+MSHDR] = AU[32]: extraword flag clear.
+        au[32] &= 0x7F;
+        // Major-sync CRC over the header body, stored big-endian in the trailer.
+        let body_end = 4 + MSHDR - 4; // AU[4..28]
+        let crc = super::crc16_mlp(&au[4..body_end])
+            ^ u16::from_le_bytes([au[body_end], au[body_end + 1]]);
+        au[4 + MSHDR - 2] = (crc >> 8) as u8;
+        au[4 + MSHDR - 1] = (crc & 0xFF) as u8;
+        // Parity: choose the AU check nibble (AU[0] high bits) so the header +
+        // directory fold to 0xF. The length low nibble (AU[0] low bits) is kept.
+        let hi = au[0] & 0x0F;
+        let p0 = (hi ^ au[1] ^ au[2] ^ au[3]) ^ (au[32] ^ au[33]);
+        let c = ((p0 >> 4) ^ (p0 & 0x0F) ^ 0x0F) & 0x0F;
+        au[0] = (c << 4) | hi;
+    }
+
+    /// Give a synthetic NON-major-sync AU a valid header parity nibble (1
+    /// substream, directory at AU[4..6]), so it passes the gate once a preceding
+    /// major sync has established `num_substreams`.
+    fn finalize_normal_parity(au: &mut [u8]) {
+        au[4] &= 0x7F; // no extraword
+        let hi = au[0] & 0x0F;
+        let p0 = (hi ^ au[1] ^ au[2] ^ au[3]) ^ (au[4] ^ au[5]);
+        let c = ((p0 >> 4) ^ (p0 & 0x0F) ^ 0x0F) & 0x0F;
+        au[0] = (c << 4) | hi;
+    }
+
+    fn valid_major_sync() -> Vec<u8> {
+        let mut u = make_truehd_unit(200);
+        u[4..8].copy_from_slice(&0xF872_6FBAu32.to_be_bytes());
+        finalize_major_sync(&mut u);
+        u
+    }
+
+    fn valid_normal_au() -> Vec<u8> {
+        let mut u = make_truehd_unit(200);
+        finalize_normal_parity(&mut u);
+        u
+    }
+
+    #[test]
+    fn corrupt_major_sync_drops_forward_to_next_valid() {
+        // MLP state carries across AUs, so a corrupt AU is dropped FORWARD to the
+        // next valid major sync (the clean re-init point). Sequence: valid MS,
+        // corrupt MS (bad CRC), a normal AU, then a valid MS. Only the two valid
+        // major syncs survive; the corrupt MS and the intervening normal AU are
+        // dropped (the latter because decode state is poisoned until re-init).
+        let mut parser = TrueHdParser::new();
+        let ms1 = valid_major_sync();
+        let mut ms_bad = valid_major_sync();
+        ms_bad[10] ^= 0xFF; // corrupt a CRC-covered header byte
+        let normal = valid_normal_au(); // clean parity, but arrives mid-resync
+        let ms2 = valid_major_sync();
+
+        let mut data = ms1.clone();
+        data.extend_from_slice(&ms_bad);
+        data.extend_from_slice(&normal);
+        data.extend_from_slice(&ms2);
+        let mut frames = parser.parse(&make_pes(data, Some(90000)));
+        frames.extend(parser.flush());
+
+        assert_eq!(frames.len(), 2, "only the two valid major syncs survive");
+        assert!(frames[0].keyframe && frames[1].keyframe);
+        assert_eq!(
+            parser.dropped_frames(),
+            2,
+            "corrupt MS + poisoned normal AU"
+        );
+    }
+
+    #[test]
+    fn parity_failure_is_dropped() {
+        // A normal AU whose header parity is broken (after a major sync sets
+        // num_substreams) is undecodable → dropped.
+        let mut parser = TrueHdParser::new();
+        let ms1 = valid_major_sync();
+        let mut bad = valid_normal_au();
+        // A single-nibble flip: MLP's nibble-fold parity (like ffmpeg's) is blind
+        // to a full-byte flip, which changes both nibbles equally and cancels.
+        bad[2] ^= 0x01;
+        let ms2 = valid_major_sync();
+        let mut data = ms1;
+        data.extend_from_slice(&bad);
+        data.extend_from_slice(&ms2);
+        let mut frames = parser.parse(&make_pes(data, Some(90000)));
+        frames.extend(parser.flush());
+        assert_eq!(frames.len(), 2, "the parity-broken AU is dropped");
+        assert_eq!(parser.dropped_frames(), 1);
+    }
+
+    #[test]
+    fn drop_forward_preserves_av_sync_no_shift() {
+        // THE INVARIANT: the resumed major sync keeps the exact PTS it would have
+        // had with no drop — base + 3 AU durations (MS1, corrupt-MS, normal, MS2)
+        // — so the drop is a silence gap, never a shift.
+        let mut parser = TrueHdParser::new();
+        let ms1 = valid_major_sync();
+        let mut ms_bad = valid_major_sync();
+        ms_bad[10] ^= 0xFF;
+        let normal = valid_normal_au();
+        let ms2 = valid_major_sync();
+        let mut data = ms1;
+        data.extend_from_slice(&ms_bad);
+        data.extend_from_slice(&normal);
+        data.extend_from_slice(&ms2);
+        let mut frames = parser.parse(&make_pes(data, Some(90000)));
+        frames.extend(parser.flush());
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frames[1].pts_ns - frames[0].pts_ns,
+            3 * AU_DURATION_NS,
+            "resumed major sync keeps its true timeline (gap, not shift)"
+        );
+    }
+
+    #[test]
+    fn clean_truehd_stream_drops_nothing() {
+        // A run of valid AUs passes untouched — zero false positives (the CRC and
+        // parity are verified against real ffmpeg TrueHD output).
+        let mut parser = TrueHdParser::new();
+        let mut data = valid_major_sync();
+        for _ in 0..5 {
+            data.extend_from_slice(&valid_normal_au());
+        }
+        let frames = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(frames.len(), 6);
+        assert_eq!(parser.dropped_frames(), 0);
     }
 
     fn make_ac3_frame() -> Vec<u8> {
@@ -878,6 +1188,7 @@ mod tests {
         let mut parser = TrueHdParser::new();
         let mut unit = make_truehd_unit(200);
         unit[4..8].copy_from_slice(&0xF872_6FBAu32.to_be_bytes());
+        finalize_major_sync(&mut unit);
         let f = parser.parse(&make_pes(unit, Some(90000)));
         assert_eq!(f.len(), 1);
         assert!(f[0].keyframe, "major-sync AU must be flagged keyframe");
@@ -899,6 +1210,7 @@ mod tests {
         let mut parser = TrueHdParser::new();
         let mut unit = make_truehd_unit(200);
         unit[4..8].copy_from_slice(&0xF872_6FBBu32.to_be_bytes());
+        finalize_major_sync(&mut unit);
         let f = parser.parse(&make_pes(unit, Some(90000)));
         assert_eq!(f.len(), 1);
         assert!(f[0].keyframe, "major-sync variant 0xFB also a keyframe");
@@ -1101,8 +1413,11 @@ mod tests {
         let mut a1 = make_truehd_unit(200);
         a1[4..8].copy_from_slice(&0xF872_6FBAu32.to_be_bytes()); // major sync
         a1[8..12].copy_from_slice(&format_info_with(0x8).to_be_bytes()); // 44.1 k
+        finalize_major_sync(&mut a1);
+        let mut a2 = make_truehd_unit(200);
+        finalize_normal_parity(&mut a2);
         let mut data = a1;
-        data.extend_from_slice(&make_truehd_unit(200));
+        data.extend_from_slice(&a2);
         let frames = parser.parse(&make_pes(data, Some(90000)));
         assert_eq!(frames.len(), 2);
         assert_eq!(
@@ -1120,8 +1435,11 @@ mod tests {
         let mut a1 = make_truehd_unit(200);
         a1[4..8].copy_from_slice(&0xF872_6FBAu32.to_be_bytes());
         a1[8..12].copy_from_slice(&format_info_with(0x0).to_be_bytes()); // 48 k
+        finalize_major_sync(&mut a1);
+        let mut a2 = make_truehd_unit(200);
+        finalize_normal_parity(&mut a2);
         let mut data = a1;
-        data.extend_from_slice(&make_truehd_unit(200));
+        data.extend_from_slice(&a2);
         let frames = parser.parse(&make_pes(data, Some(90000)));
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[1].pts_ns - frames[0].pts_ns, 833_333);
