@@ -49,6 +49,30 @@
   track class is opened and written). `chapters://` and `json://` are **scan-only**
   — they read nothing of the elementary streams, so they return in seconds.
 
+- **Drop-on-undecodable audio — keep everything decodable, drop the frames that
+  aren't.** A damaged audio access unit is now dropped rather than muxed as a
+  decoder-choking glitch, and A/V sync is preserved: a drop becomes a silence
+  gap, never a shift of the following audio, and every drop is logged. Detection
+  is per-codec, each mirroring the format's own authoritative integrity check:
+  **DTS** (ffmpeg's core-header validity parse), **AC-3 / E-AC-3** (native frame
+  CRC-16), **FLAC** (whole-frame CRC-16), **MP2 / MP3** and **AAC-ADTS** (header
+  sanity — raw AAC passes through), and **TrueHD / MLP** (major-sync CRC-16 + AU
+  parity, verified against real ffmpeg output; because MLP state carries across
+  access units, a corrupt AU is dropped *forward* to the next major sync). LPCM
+  and video are excluded by design (no in-frame integrity data; inter-frame
+  prediction). A shared tally counts and logs drops and, for a track that is
+  mostly undecodable, drops the whole track. Detects only frames that are
+  *structurally* undecodable — corruption of the sample payload inside an
+  otherwise-valid frame (bad bit-allocation / XLL data) is source damage a
+  container remux cannot distinguish from good data.
+
+- **Forced subtitle detection from PGS content.** A PGS subtitle track is flagged
+  `FlagForced` when it displays subtitles and every one carries the HDMV
+  `forced_on_flag` — a dedicated forced/narrative track — read from the stream
+  itself rather than the disc's vendor label metadata, so it works on discs that
+  carry no such blob. `info -v` reports the same verdict (one shared classifier
+  drives both the muxer and the scan-time probe), so `info` and a rip agree.
+
 ### Changed
 
 - **`json://` emits the complete title model — lossless, not a summary.** Every
@@ -57,6 +81,18 @@
   display aspect, and measured CICP; audio carries channel layout (+ count), sample
   rate (+ Hz), language, and editorial purpose; subtitles carry the forced flag and
   qualifier. The clip list and chapter names are included too.
+
+### Fixed
+
+- **TrueHD: a couple of transient errors can no longer poison a whole track.**
+  A corrupt access unit drops forward to the next major sync, but only the
+  individually-verified corruption feeds the whole-track drop verdict now; the
+  resync run is collateral — so two scattered errors no longer discard an
+  otherwise-good multi-hour track. The per-AU PTS rate is refined only from a
+  CRC-validated major sync (a corrupt one can't shift the resumed audio), and the
+  resync clears only on a validated major sync.
+- **Free-format MPEG-audio** (`bitrate_index == 0`) is a legal, decodable mode and
+  is no longer dropped.
 
 ## [1.4.5] — 2026-07-18
 
