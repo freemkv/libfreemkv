@@ -23,9 +23,7 @@
 
 use crate::disc::{Codec, DiscTitle, Stream as DiscStream};
 use crate::pes::{PesFrame, Stream};
-use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::path::Path;
 
 mod audio;
 mod boxes;
@@ -138,10 +136,14 @@ fn pack_language(lang: &str) -> [u8; 2] {
     v.to_be_bytes()
 }
 
-/// Progressive MP4 sink. Owns the output `File` so it can seek back to patch the
-/// `mdat` size once all samples are written.
-pub struct Mp4Sink {
-    file: File,
+/// Progressive MP4 sink. Owns a seekable writer so it can seek back to patch the
+/// `mdat` size once all samples are written. The CLI wraps the output file in a
+/// bounded-cache `WritebackFile` (like the MKV muxer) so a UHD-scale mux to slow
+/// / network staging doesn't hit the dirty-page burst pathology; the `mdat` patch
+/// is an ordinary backpatch seek, which `WritebackFile` handles the same way it
+/// handles MKV cluster backpatching.
+pub struct Mp4Sink<W: Write + Seek> {
+    writer: W,
     title: DiscTitle,
     tracks: Vec<Track>,
     /// `title.streams` index → position in `tracks`, or `None` if excluded.
@@ -153,10 +155,11 @@ pub struct Mp4Sink {
     finished: bool,
 }
 
-impl Mp4Sink {
-    /// Create the sink: build the track plan (fit oracle), open the file, and
-    /// write `ftyp` plus the `mdat` header (64-bit size, patched at `finish()`).
-    pub fn create(path: &Path, title: &DiscTitle) -> io::Result<Self> {
+impl<W: Write + Seek> Mp4Sink<W> {
+    /// Create the sink over an already-opened seekable `writer`: build the track
+    /// plan (fit oracle) and write `ftyp` plus the `mdat` header (64-bit size,
+    /// patched at `finish()`).
+    pub fn create(mut writer: W, title: &DiscTitle) -> io::Result<Self> {
         let report = fit_report(title);
         let has_video = report
             .included
@@ -216,17 +219,17 @@ impl Mp4Sink {
             }
         }
 
-        let mut file = File::create(path)?;
-        file.write_all(&build_ftyp(video_codec))?;
-        let mdat_start = file.stream_position()?;
+        let ftyp = build_ftyp(video_codec);
+        let mdat_start = ftyp.len() as u64;
+        writer.write_all(&ftyp)?;
         // mdat with 64-bit largesize: size=1 signals "largesize follows"; the
         // 8-byte largesize placeholder is patched at finish() once known.
-        file.write_all(&1u32.to_be_bytes())?;
-        file.write_all(b"mdat")?;
-        file.write_all(&0u64.to_be_bytes())?;
+        writer.write_all(&1u32.to_be_bytes())?;
+        writer.write_all(b"mdat")?;
+        writer.write_all(&0u64.to_be_bytes())?;
 
         Ok(Self {
-            file,
+            writer,
             title: title.clone(),
             tracks,
             route,
@@ -254,11 +257,11 @@ impl Mp4Sink {
             moov.extend_from_slice(&trak);
         }
         let moov = bx(b"moov", &moov);
-        self.file.write_all(&moov)
+        self.writer.write_all(&moov)
     }
 }
 
-impl Stream for Mp4Sink {
+impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
     fn read(&mut self) -> io::Result<Option<PesFrame>> {
         Err(crate::error::Error::StreamWriteOnly.into())
     }
@@ -279,7 +282,7 @@ impl Stream for Mp4Sink {
         }
         let pts_ns = frame.pts;
         let offset = self.mdat_start + 16 + self.mdat_payload;
-        self.file.write_all(&frame.data)?;
+        self.writer.write_all(&frame.data)?;
         self.mdat_payload += frame.data.len() as u64;
         self.tracks[slot].samples.push(Sample {
             offset,
@@ -303,11 +306,11 @@ impl Stream for Mp4Sink {
         }
         // Patch the mdat 64-bit largesize: header (16) + payload.
         let mdat_total = 16 + self.mdat_payload;
-        self.file.seek(SeekFrom::Start(self.mdat_start + 8))?;
-        self.file.write_all(&mdat_total.to_be_bytes())?;
-        self.file.seek(SeekFrom::End(0))?;
+        self.writer.seek(SeekFrom::Start(self.mdat_start + 8))?;
+        self.writer.write_all(&mdat_total.to_be_bytes())?;
+        self.writer.seek(SeekFrom::End(0))?;
         self.write_moov()?;
-        self.file.flush()
+        self.writer.flush()
     }
 
     fn info(&self) -> &DiscTitle {
@@ -850,14 +853,11 @@ mod tests {
     #[test]
     fn no_video_track_is_an_error() {
         let t = title(vec![audio(Codec::Ac3, "eng")], vec![None]);
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("fmkv_mp4_novid_{}.mp4", std::process::id()));
-        let err = match Mp4Sink::create(&path, &t) {
+        let err = match Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t) {
             Ok(_) => panic!("expected no-video-track error"),
             Err(e) => e,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        let _ = std::fs::remove_file(&path);
     }
 
     fn frame(track: usize, pts_ns: i64, key: bool, data: Vec<u8>) -> PesFrame {
@@ -922,26 +922,15 @@ mod tests {
             vec![hevc_video(), audio(Codec::Ac3, "eng")],
             vec![Some(vec![1, 2, 3, 4]), None],
         );
-        let dir = std::env::temp_dir();
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let path = dir.join(format!(
-            "fmkv_mp4_av_{}_{}.mp4",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
         let d = 41_708_333;
-        {
-            let mut s = Mp4Sink::create(&path, &t).unwrap();
-            // Two video frames (track 0) + two AC-3 frames (track 1).
-            s.write(&frame(0, 0, true, vec![0xAB; 800])).unwrap();
-            s.write(&frame(1, 0, true, ac3_frame())).unwrap();
-            s.write(&frame(0, d, false, vec![0xCD; 400])).unwrap();
-            s.write(&frame(1, 32_000_000, true, ac3_frame())).unwrap();
-            s.finish().unwrap();
-        }
-        let buf = std::fs::read(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
+        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        // Two video frames (track 0) + two AC-3 frames (track 1).
+        s.write(&frame(0, 0, true, vec![0xAB; 800])).unwrap();
+        s.write(&frame(1, 0, true, ac3_frame())).unwrap();
+        s.write(&frame(0, d, false, vec![0xCD; 400])).unwrap();
+        s.write(&frame(1, 32_000_000, true, ac3_frame())).unwrap();
+        s.finish().unwrap();
+        let buf = s.writer.into_inner();
         let boxes = walk(&buf);
         let types: Vec<[u8; 4]> = boxes.iter().map(|(t, _, _)| *t).collect();
         assert_eq!(types, vec![*b"ftyp", *b"mdat", *b"moov"]);
