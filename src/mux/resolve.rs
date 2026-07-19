@@ -74,6 +74,15 @@ pub enum StreamUrl {
     /// that emits one JSON-Lines record per coded picture of the title's primary
     /// video track to a `.fvi` file (normative spec `docs/FVI_FORMAT.md`).
     Fvi { path: PathBuf },
+    /// Chapter-marker export (`chapters://`). A write-only sink that ignores the
+    /// PES stream and writes the title's chapter points to a single file, format
+    /// chosen by the output extension: `.xml` (Matroska, default), `.txt` (OGM),
+    /// `.vtt` (WebVTT).
+    Chapters { path: PathBuf },
+    /// Structured title/stream/chapter metadata (`json://`). A write-only sink
+    /// that ignores the PES stream and writes the selected title's model as one
+    /// JSON document — machine-readable `info` for one title.
+    Json { path: PathBuf },
     /// Unrecognized URL.
     Unknown { raw: String },
 }
@@ -94,6 +103,8 @@ impl StreamUrl {
             StreamUrl::Audio { .. } => "audio",
             StreamUrl::Sub { .. } => "sub",
             StreamUrl::Fvi { .. } => "fvi",
+            StreamUrl::Chapters { .. } => "chapters",
+            StreamUrl::Json { .. } => "json",
             StreamUrl::Unknown { .. } => "unknown",
         }
     }
@@ -110,7 +121,9 @@ impl StreamUrl {
             | StreamUrl::Demux { dir: path }
             | StreamUrl::Audio { dir: path }
             | StreamUrl::Sub { dir: path }
-            | StreamUrl::Fvi { path } => path.to_str().unwrap_or(""),
+            | StreamUrl::Fvi { path }
+            | StreamUrl::Chapters { path }
+            | StreamUrl::Json { path } => path.to_str().unwrap_or(""),
             StreamUrl::Network { addr } => addr,
             StreamUrl::Stdio | StreamUrl::Null => "",
             StreamUrl::Unknown { raw } => raw,
@@ -191,6 +204,16 @@ pub fn parse_url(url: &str) -> StreamUrl {
     if let Some(rest) = url.strip_prefix("sub://") {
         return StreamUrl::Sub {
             dir: PathBuf::from(rest),
+        };
+    }
+    if let Some(rest) = url.strip_prefix("chapters://") {
+        return StreamUrl::Chapters {
+            path: PathBuf::from(rest),
+        };
+    }
+    if let Some(rest) = url.strip_prefix("json://") {
+        return StreamUrl::Json {
+            path: PathBuf::from(rest),
         };
     }
     if let Some(rest) = url.strip_prefix("fvi://") {
@@ -469,9 +492,11 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         StreamUrl::Dir { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
         // `demux://` is an output-only sink (per-track ES files); never a source.
-        StreamUrl::Demux { .. } | StreamUrl::Audio { .. } | StreamUrl::Sub { .. } => {
-            Err(crate::error::Error::StreamWriteOnly.into())
-        }
+        StreamUrl::Demux { .. }
+        | StreamUrl::Audio { .. }
+        | StreamUrl::Sub { .. }
+        | StreamUrl::Chapters { .. }
+        | StreamUrl::Json { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         // `fvi://` is an output-only sink (per-picture video index); never a source.
         StreamUrl::Fvi { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Unknown { ref raw } => {
@@ -583,6 +608,18 @@ pub fn output(
                 path.to_string_lossy().into_owned(),
                 0,
             )?))
+        }
+        // `chapters://` and `json://` write the title metadata at construction and
+        // ignore the PES stream (see `meta_sink`).
+        StreamUrl::Chapters { ref path } => {
+            validate_file_path(path, "chapters")?;
+            Ok(Box::new(super::meta_sink::ChaptersSink::create(
+                path, title,
+            )?))
+        }
+        StreamUrl::Json { ref path } => {
+            validate_file_path(path, "json")?;
+            Ok(Box::new(super::meta_sink::JsonSink::create(path, title)?))
         }
         StreamUrl::Unknown { ref raw } => {
             Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
