@@ -10,6 +10,12 @@
   (`mp4:// mkv://`, `mp4:// audio://`, `mp4:// json://`, …). Round-trip is
   frame-exact (verified `iso:// mp4://` → `mp4:// mkv://` preserves every video
   and audio packet). Progressive MP4 only; fragmented (`moof`) is future work.
+- **MP4 output is faststart by default** — `moov` is written *before* `mdat`, so
+  the file plays over HTTP without pre-fetching the end. Done with zero extra I/O:
+  a `moov`-sized hole (`round_up_4MB(16 B/sample × est_samples) + 4 MB`) is
+  reserved up front, so sample offsets are fixed and `moov` is dropped into the
+  hole at finish with a `free` box for the slack (falls back to moov-at-end only
+  if the estimate is blown).
 - **Native MP4 output (`mp4://`)** — a progressive ISO-BMFF muxer
   (`ftyp`+`mdat`+`moov`), so a disc goes straight to a play-everywhere `.mp4` in
   one decrypt pass, no ffmpeg round-trip. Carries HEVC / H.264 video (HDR10 colour

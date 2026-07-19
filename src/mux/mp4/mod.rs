@@ -12,9 +12,10 @@
 //! ## Track model
 //!
 //! One video track (HEVC / H.264) plus every audio track whose codec has a clean
-//! MP4 mapping (AC-3 → `ac-3`/`dac3`, E-AC-3 → `ec-3`/`dec3`). This is the fit
-//! oracle: a codec MP4 can't carry (TrueHD, DTS, LPCM) or that has no sample
-//! entry here is **excluded, never silently dropped** — [`fit_report`] lets the
+//! MP4 mapping (AC-3 → `ac-3`/`dac3`, E-AC-3 → `ec-3`/`dec3`, DTS/DTS-HD →
+//! `dtsc`/`dtsh`/`ddts`). This is the fit oracle: a codec MP4 can't carry
+//! (TrueHD, LPCM) or that has no sample entry here is **excluded, never silently
+//! dropped** — [`fit_report`] lets the
 //! CLI enumerate exactly what was left out and why. Video NALs pass through
 //! unchanged (the demux hands us length-prefixed hvcC/avcC framing — already
 //! MP4's form). Decode timestamps are derived (the pipeline carries presentation
