@@ -90,6 +90,7 @@ pub(crate) mod hevc;
 pub(crate) mod m2ts_mux;
 pub(crate) mod mkv;
 pub(crate) mod mkvstream;
+pub(crate) mod mp4;
 pub(crate) mod network;
 pub(crate) mod null;
 pub(crate) mod ps;
@@ -154,6 +155,7 @@ mod tests {
         assert_eq!(parse_url("disc://").scheme(), "disc");
         assert_eq!(parse_url("m2ts://f").scheme(), "m2ts");
         assert_eq!(parse_url("mkv://f").scheme(), "mkv");
+        assert_eq!(parse_url("mp4://f").scheme(), "mp4");
         assert_eq!(parse_url("network://h:1").scheme(), "network");
         assert_eq!(parse_url("stdio://").scheme(), "stdio");
         assert_eq!(parse_url("iso://f").scheme(), "iso");
