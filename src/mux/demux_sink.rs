@@ -150,7 +150,7 @@ fn extension_for(codec: Codec) -> &'static str {
 }
 
 /// Short codec label for friendly filenames.
-fn codec_label(codec: Codec) -> &'static str {
+pub(crate) fn codec_label(codec: Codec) -> &'static str {
     match codec {
         Codec::Hevc => "HEVC",
         Codec::H264 => "AVC",
@@ -548,7 +548,7 @@ fn fmt_chapter_time_ns(time_secs: f64) -> String {
 }
 
 /// Serialize chapters as mkvmerge chapter XML.
-fn chapters_xml(chapters: &[Chapter]) -> String {
+pub(crate) fn chapters_xml(chapters: &[Chapter]) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     s.push_str("<!DOCTYPE Chapters SYSTEM \"matroskachapters.dtd\">\n");
@@ -578,7 +578,7 @@ fn chapters_xml(chapters: &[Chapter]) -> String {
 }
 
 /// Serialize chapters as OGM/simple chapter text.
-fn chapters_ogm(chapters: &[Chapter]) -> String {
+pub(crate) fn chapters_ogm(chapters: &[Chapter]) -> String {
     let mut s = String::new();
     for (i, c) in chapters.iter().enumerate() {
         let n = i + 1;
