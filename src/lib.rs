@@ -241,6 +241,7 @@ pub use mux::NullStream;
 pub use mux::StdioStream;
 pub use mux::WriteSeek;
 pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
+pub use mux::{Mp4FitReport, Mp4SkipReason, mp4_fit_report};
 
 // ─── Lower-level surfaces ───────────────────────────────────────────────────
 //
