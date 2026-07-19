@@ -555,7 +555,15 @@ pub fn output(
         }
         StreamUrl::Mp4 { ref path } => {
             validate_file_path(path, "mp4")?;
-            Ok(Box::new(super::mp4::Mp4Sink::create(path, title)?))
+            // Bounded-cache writeback (like mkv://) so a UHD-scale mux to slow /
+            // network-attached staging doesn't hit the dirty-page burst
+            // pathology; the mdat backpatch is an ordinary seek WritebackFile
+            // handles. BufWriter coalesces the many small moov box-header writes.
+            let writer = std::io::BufWriter::with_capacity(
+                IO_BUF_SIZE,
+                crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
+            );
+            Ok(Box::new(super::mp4::Mp4Sink::create(writer, title)?))
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
