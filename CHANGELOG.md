@@ -4,8 +4,12 @@
 
 ### Added
 
-- **Four extraction sinks — dissect a title, don't just rip it.** New write-only
+- **Five extraction sinks — dissect a title, don't just rip it.** New write-only
   destinations that pull one facet of a title out on its own:
+  - **`video://dir/`** — every video track to its own file, as a raw elementary
+    stream in the codec's native form (`.hevc`, `.h264`, `.vc1`, `.m2v`, `.obu`).
+    No audio, no subtitles. Completes the per-track-class trio with `audio://` /
+    `sub://`.
   - **`audio://dir/`** — every audio track to its own file in a directory, each in
     its native container (`.thd`, `.dts` / `.dtshd`, `.ac3`, `.eac3`, `.aac`,
     `.flac`). No video, no subtitles. BD/DVD LPCM has no container of its own and is

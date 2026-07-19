@@ -62,6 +62,10 @@ pub enum StreamUrl {
     /// chapters + delay metadata). Like `dir://` it targets a directory; the
     /// CLI constructs the `DemuxSink` with full options before the mux loop.
     Demux { dir: PathBuf },
+    /// Video-only per-track output directory (`video://`) — a `demux://`
+    /// restricted to video tracks (native elementary streams: `.hevc`, `.h264`,
+    /// `.vc1`, `.m2v`, …). One file per video track; no audio/subtitles.
+    Video { dir: PathBuf },
     /// Audio-only per-track output directory (`audio://`) — a `demux://`
     /// restricted to audio tracks (native containers: `.thd`, `.dts`, `.ac3`,
     /// `.eac3`, `.pcm`, …). One file per audio track; no video/subtitles.
@@ -100,6 +104,7 @@ impl StreamUrl {
             StreamUrl::Dir { .. } => "dir",
             StreamUrl::Null => "null",
             StreamUrl::Demux { .. } => "demux",
+            StreamUrl::Video { .. } => "video",
             StreamUrl::Audio { .. } => "audio",
             StreamUrl::Sub { .. } => "sub",
             StreamUrl::Fvi { .. } => "fvi",
@@ -119,6 +124,7 @@ impl StreamUrl {
             | StreamUrl::Iso { path }
             | StreamUrl::Dir { path }
             | StreamUrl::Demux { dir: path }
+            | StreamUrl::Video { dir: path }
             | StreamUrl::Audio { dir: path }
             | StreamUrl::Sub { dir: path }
             | StreamUrl::Fvi { path }
@@ -193,6 +199,11 @@ pub fn parse_url(url: &str) -> StreamUrl {
     }
     if let Some(rest) = url.strip_prefix("demux://") {
         return StreamUrl::Demux {
+            dir: PathBuf::from(rest),
+        };
+    }
+    if let Some(rest) = url.strip_prefix("video://") {
+        return StreamUrl::Video {
             dir: PathBuf::from(rest),
         };
     }
@@ -493,6 +504,7 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
         // `demux://` is an output-only sink (per-track ES files); never a source.
         StreamUrl::Demux { .. }
+        | StreamUrl::Video { .. }
         | StreamUrl::Audio { .. }
         | StreamUrl::Sub { .. }
         | StreamUrl::Chapters { .. }
@@ -575,11 +587,15 @@ pub fn output(
                 dir, title, &opts,
             )?))
         }
-        // `audio://` and `sub://` are `demux://` restricted to one track class —
-        // audio in native containers, or subtitles as `.sup`/`.idx+.sub`/`.srt`.
-        // No chapters sidecar (that's a `demux://` / `chapters://` concern).
-        StreamUrl::Audio { ref dir } | StreamUrl::Sub { ref dir } => {
+        // `video://`, `audio://`, and `sub://` are `demux://` restricted to one
+        // track class — video as native elementary streams, audio in native
+        // containers, or subtitles as `.sup`/`.idx+.sub`/`.srt`. No chapters
+        // sidecar (that's a `demux://` / `chapters://` concern).
+        StreamUrl::Video { ref dir }
+        | StreamUrl::Audio { ref dir }
+        | StreamUrl::Sub { ref dir } => {
             let (scheme, kind) = match parsed {
+                StreamUrl::Video { .. } => ("video", super::demux_sink::TrackKind::Video),
                 StreamUrl::Audio { .. } => ("audio", super::demux_sink::TrackKind::Audio),
                 _ => ("sub", super::demux_sink::TrackKind::Subtitle),
             };
