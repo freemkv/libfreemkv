@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.5.0] — UNRELEASED
+
+### Added
+
+- **Four extraction sinks — dissect a title, don't just rip it.** New write-only
+  destinations that pull one facet of a title out on its own:
+  - **`audio://dir/`** — every audio track to its own file in a directory, each in
+    its native container (`.thd`, `.dts` / `.dtshd`, `.ac3`, `.eac3`, `.aac`,
+    `.flac`). No video, no subtitles. BD/DVD LPCM has no container of its own and is
+    written as headerless big-endian `.pcm`.
+  - **`sub://dir/`** — every subtitle track to its own file: PGS as `.sup`, VobSub
+    as a paired `.idx` + `.sub`, text subtitles as `.srt`. No video, no audio.
+  - **`chapters://file`** — a title's chapter markers as a single sidecar, in the
+    format the output extension selects: `.xml` (Matroska), `.txt` / `.ogm` (OGM
+    simple), or `.vtt` (WebVTT).
+  - **`json://file`** — one title's complete structure as JSON.
+
+  `audio://` and `sub://` are the demux path with a **kind filter** (only their
+  track class is opened and written). `chapters://` and `json://` are **scan-only**
+  — they read nothing of the elementary streams, so they return in seconds.
+
+### Changed
+
+- **`json://` emits the complete title model — lossless, not a summary.** Every
+  field the scan resolved is serialized: video carries resolution (+ pixel
+  dimensions, interlaced flag), frame rate (+ exact fraction), HDR, colour space,
+  display aspect, and measured CICP; audio carries channel layout (+ count), sample
+  rate (+ Hz), language, and editorial purpose; subtitles carry the forced flag and
+  qualifier. The clip list and chapter names are included too.
+
 ## [1.4.5] — 2026-07-18
 
 ### Fixed
