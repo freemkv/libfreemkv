@@ -34,6 +34,13 @@ pub(crate) struct DropTally {
     codec: &'static str,
     kept: u64,
     dropped: u64,
+    /// AUs dropped because they were INDIVIDUALLY verified undecodable (a failed
+    /// CRC/header/parity check). Only these feed the whole-track poison verdict.
+    /// Distinct from `dropped`, which also counts *collateral* drops — AUs
+    /// discarded as a consequence of one corruption (TrueHD's resync-forward run,
+    /// or a poisoned track), which must NOT amplify a few real errors into a
+    /// false whole-track loss.
+    verified_dropped: u64,
     dropped_dur_ns: u64,
     poisoned: bool,
 }
@@ -44,6 +51,7 @@ impl DropTally {
             codec,
             kept: 0,
             dropped: 0,
+            verified_dropped: 0,
             dropped_dur_ns: 0,
             poisoned: false,
         }
@@ -71,9 +79,32 @@ impl DropTally {
         self.kept += 1;
     }
 
-    /// Record a dropped (undecodable) access unit and log it. `reason` is a
-    /// short static label for the specific corruption check that failed.
+    /// Record a dropped access unit that was INDIVIDUALLY verified undecodable
+    /// (a failed CRC/header/parity check). Counts toward the whole-track poison
+    /// verdict. `reason` is a short static label for the check that failed.
     pub(crate) fn record_drop(&mut self, pts_ns: i64, dur_ns: i64, bytes: usize, reason: &str) {
+        self.verified_dropped += 1;
+        self.record_drop_common(pts_ns, dur_ns, bytes, reason);
+        self.maybe_poison();
+    }
+
+    /// Record a COLLATERAL drop — an AU discarded as a consequence of another
+    /// corruption rather than being individually undecodable (TrueHD's
+    /// resync-forward run to the next major sync, or an already-poisoned track).
+    /// Counted and logged for the drop report, but deliberately does NOT feed the
+    /// poison verdict, so one corruption event can't amplify into a false
+    /// whole-track loss.
+    pub(crate) fn record_collateral_drop(
+        &mut self,
+        pts_ns: i64,
+        dur_ns: i64,
+        bytes: usize,
+        reason: &str,
+    ) {
+        self.record_drop_common(pts_ns, dur_ns, bytes, reason);
+    }
+
+    fn record_drop_common(&mut self, pts_ns: i64, dur_ns: i64, bytes: usize, reason: &str) {
         self.dropped += 1;
         self.dropped_dur_ns += dur_ns.max(0) as u64;
         tracing::debug!(
@@ -86,7 +117,6 @@ impl DropTally {
             bytes,
             reason
         );
-        self.maybe_poison();
     }
 
     /// Whole-track fallback: after enough AUs to judge, if more than half were
@@ -97,14 +127,17 @@ impl DropTally {
         if self.poisoned {
             return;
         }
+        // Judge on VERIFIED drops vs all AUs seen: a track is only poisoned when
+        // a majority of its access units are individually undecodable — not when
+        // a couple of corruption events forced long collateral resync runs.
         let total = self.kept + self.dropped;
-        if total >= TRACK_VERDICT_MIN_AUS && self.dropped * 2 > total {
+        if total >= TRACK_VERDICT_MIN_AUS && self.verified_dropped * 2 > total {
             self.poisoned = true;
             tracing::warn!(
                 target: "mux",
-                "{}: track too damaged to mux — {}/{} AUs undecodable (>50%); dropping the whole track",
+                "{}: track too damaged to mux — {}/{} AUs individually undecodable (>50%); dropping the whole track",
                 self.codec,
-                self.dropped,
+                self.verified_dropped,
                 total
             );
         }
