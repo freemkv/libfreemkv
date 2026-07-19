@@ -299,8 +299,8 @@ impl CodecParser for DtsParser {
             // flush is an extension-substream PES, carrying its own later
             // timestamp) must NOT become the next unit's PTS base.
             let mut forced = false;
-            let au_end = match next_core_boundary(&self.buf, core_size) {
-                NextCore::Found(end) => end,
+            let (au_end, ext_clean) = match next_core_boundary(&self.buf, core_size) {
+                NextCore::Found { end, ext_clean } => (end, ext_clean),
                 NextCore::NeedMore => break, // candidate sync needs more header
                 NextCore::None => {
                     // No next core sync buffered yet. The trailing extension
@@ -312,11 +312,20 @@ impl CodecParser for DtsParser {
                         break;
                     }
                     forced = true;
-                    self.buf.len()
+                    (self.buf.len(), true)
                 }
             };
 
-            let au: Vec<u8> = self.buf[..au_end].to_vec();
+            // Damaged source encoding: when the extension boundary was GARBAGE
+            // (not any DTS sync — `ext_clean == false`), the extension bytes for
+            // this AU are corrupt and would make the decoder cascade "DSYNC check
+            // failed" / "Read past end of XLL band data". Emit the clean DTS core
+            // ALONE (a decodable, lossy frame) and still drain past the garbage to
+            // the next core — a perfect mux drops the bad frame's corrupt part
+            // rather than shipping it. A recognized-but-unsizeable extension
+            // (`ext_clean == true`) is preserved in full (lossless).
+            let emit_end = if ext_clean { au_end } else { core_size };
+            let au: Vec<u8> = self.buf[..emit_end].to_vec();
             // The AU's own core PES PTS (the PES covering its first byte, even if
             // that PES preceded the one(s) carrying its extensions or the next
             // core), stamped monotonically: honored when it advances past the
@@ -407,7 +416,14 @@ fn find_sync(data: &[u8], pattern: &[u8; 4]) -> Option<usize> {
 /// Result of scanning for the next valid core sync that closes an access unit.
 enum NextCore {
     /// A valid next core sync was found; the access unit ends at this offset.
-    Found(usize),
+    /// `ext_clean` is `false` only when the byte at the extension boundary was
+    /// GARBAGE — neither a core sync nor a DTS-HD extension sync — meaning the
+    /// extension region is corrupt (damaged source encoding). The caller then
+    /// emits the clean DTS core alone and drops the garbage, instead of shipping
+    /// a corrupt AU that makes the decoder cascade DSYNC / "Read past end of XLL".
+    /// It stays `true` when the region is a real (if unsizeable) extension sync —
+    /// that path is load-bearing for valid streams and must NOT be dropped.
+    Found { end: usize, ext_clean: bool },
     /// A candidate core sync was found but its header isn't fully buffered yet,
     /// so its validity can't be decided — wait for more data.
     NeedMore,
@@ -492,8 +508,11 @@ fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
                     }
                     pos += sz; // skip the whole extension substream precisely
                 }
-                // Couldn't size it (truncated/garbage header) — heuristic fallback.
-                _ => return scan_for_next_core(buf, pos),
+                // A real extension sync we couldn't size (truncated header /
+                // unsupported sub-form) — heuristic fallback, but the region IS a
+                // recognized extension, so keep it (ext_clean = true). This path
+                // is load-bearing for valid streams.
+                _ => return scan_for_next_core(buf, pos, true),
             }
         } else if buf[pos..].starts_with(&DTS_CORE_SYNC) {
             // The bytes right after the precisely-skipped extensions are the next
@@ -503,13 +522,18 @@ fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
             }
             let sz = dts_core_frame_size(&buf[pos..]);
             if (MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&sz) {
-                return NextCore::Found(pos);
+                return NextCore::Found {
+                    end: pos,
+                    ext_clean: true,
+                };
             }
-            return scan_for_next_core(buf, pos); // implausible core here — fall back
+            return scan_for_next_core(buf, pos, true); // implausible core — recognized sync, keep
         } else {
-            // Neither a known extension nor a core sync at the precise boundary
-            // (padding / junk) — fall back to the heuristic scan.
-            return scan_for_next_core(buf, pos);
+            // GARBAGE at the extension boundary — neither a core sync nor a
+            // DTS-HD extension sync. This is damaged source encoding: the
+            // extension region is corrupt. Mark ext_clean = false so the caller
+            // emits the clean core alone and drops the garbage.
+            return scan_for_next_core(buf, pos, false);
         }
     }
 }
@@ -518,7 +542,7 @@ fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
 /// syncword whose decoded size is plausible. Used only when precise extension
 /// skipping can't proceed; a chance core syncword in extension payload usually
 /// decodes to an implausible size and is skipped.
-fn scan_for_next_core(buf: &[u8], from: usize) -> NextCore {
+fn scan_for_next_core(buf: &[u8], from: usize, ext_clean: bool) -> NextCore {
     let mut from = from;
     while let Some(rel) = find_sync(&buf[from..], &DTS_CORE_SYNC) {
         let pos = from + rel;
@@ -527,7 +551,10 @@ fn scan_for_next_core(buf: &[u8], from: usize) -> NextCore {
         }
         let sz = dts_core_frame_size(&buf[pos..]);
         if (MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&sz) {
-            return NextCore::Found(pos);
+            return NextCore::Found {
+                end: pos,
+                ext_clean,
+            };
         }
         from = pos + SYNCWORD_BYTES;
     }
@@ -676,9 +703,57 @@ mod tests {
         assert!(
             matches!(
                 next_core_boundary(&buf, core.len()),
-                NextCore::Found(end) if end == core.len() + exss.len()
+                NextCore::Found { end, .. } if end == core.len() + exss.len()
             ),
             "AU must end at the REAL next core (after the full EXSS), not the false sync inside it"
+        );
+    }
+
+    #[test]
+    fn garbage_extension_emits_core_only_but_valid_ext_is_kept() {
+        // Damaged source: a valid core, then GARBAGE (no core sync, no extension
+        // sync) where the extension belongs, then the next core. The framer must
+        // mark this boundary ext_clean=false and the parser must emit the clean
+        // 512-byte CORE alone (dropping the garbage), draining to the next core.
+        let core = make_dts_core(512);
+        let garbage = vec![0xE4, 0x3F, 0xE3, 0x90, 0xCC, 0x6C]; // real Bourne head bytes
+        let mut garbage = garbage;
+        garbage.extend(std::iter::repeat(0xAB).take(300));
+        let next = make_dts_core(512);
+        let mut buf = core.clone();
+        buf.extend_from_slice(&garbage);
+        buf.extend_from_slice(&next);
+        assert!(
+            matches!(
+                next_core_boundary(&buf, core.len()),
+                NextCore::Found { end, ext_clean: false } if end == core.len() + garbage.len()
+            ),
+            "garbage boundary must be flagged unclean"
+        );
+
+        let mut parser = DtsParser::new();
+        let mut frames = parser.parse(&make_pes(buf, Some(90000)));
+        frames.extend(parser.flush());
+        assert!(!frames.is_empty());
+        for f in &frames {
+            assert_eq!(f.data.len(), 512, "garbage-extension AU emits core only");
+            assert_eq!(&f.data[0..4], &DTS_CORE_SYNC);
+        }
+
+        // Contrast: a REAL extension sync (even if unsizeable) must be KEPT in
+        // full — ext_clean stays true, never downgraded to core-only.
+        let mut buf2 = make_dts_core(512);
+        buf2.extend_from_slice(&make_dts_ext(256));
+        buf2.extend_from_slice(&make_dts_core(512));
+        assert!(
+            matches!(
+                next_core_boundary(&buf2, 512),
+                NextCore::Found {
+                    ext_clean: true,
+                    ..
+                }
+            ),
+            "a recognized extension sync is preserved, not dropped"
         );
     }
 
