@@ -16,6 +16,7 @@ mod extract;
 mod hddvd;
 pub mod mapfile;
 mod patch;
+pub(crate) mod pgs_forced_probe;
 pub mod read_error;
 mod section_recover;
 mod sweep;
@@ -1491,6 +1492,13 @@ pub struct ScanOptions {
     /// 50_000 sectors on a live DVD) poll it and bail out cleanly so a
     /// scan-phase watchdog or operator Stop is never stuck behind a hang.
     pub halt: Option<crate::halt::Halt>,
+    /// Read the PGS subtitle streams during the scan to detect forced-narrative
+    /// tracks from their content (the `forced_on_flag`), matching what the mux
+    /// derives during a rip. OFF by default — it reads the clip's PGS content,
+    /// which is slow, so only callers that want authoritative forced flags in the
+    /// scanned title (e.g. `freemkv info`) opt in. The rip path leaves it off:
+    /// the muxer detects forced during muxing without a second read.
+    pub probe_forced_subtitles: bool,
 }
 
 /// Quick disc identification — name, format, capacity. No title/stream parsing.
@@ -1983,6 +1991,18 @@ impl Disc {
         // 4. Metadata + labels
         let meta_title = Self::read_meta_title(reader, &udf_fs);
         crate::labels::apply(reader, &udf_fs, &mut titles);
+
+        // Optional content-based forced-subtitle detection. `info` opts in so its
+        // forced flags match what the muxer derives during a rip (both use the
+        // one shared PGS classifier); the rip path leaves it off — the muxer
+        // detects forced while muxing, without a second read of the clip.
+        if _opts.probe_forced_subtitles {
+            for title in &mut titles {
+                if title.content_format == ContentFormat::BdTs {
+                    pgs_forced_probe::probe_and_set_forced(reader, title);
+                }
+            }
+        }
         crate::labels::fill_defaults(&mut titles);
 
         // 5. Format (AACS MKB generation → BD/UHD/FMTS; tree → HD-DVD/DVD) and

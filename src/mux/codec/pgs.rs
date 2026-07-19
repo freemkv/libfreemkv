@@ -57,6 +57,64 @@ pub fn display_set_is_forced(frame_data: &[u8]) -> Option<bool> {
     Some(flags & PCS_FORCED_ON_FLAG != 0)
 }
 
+/// Accumulates the "is this PGS subtitle track a forced-narrative track?" verdict
+/// from its display sets. A track is forced iff it displayed at least one subtitle
+/// and EVERY display set carried the forced_on_flag — a dedicated forced track,
+/// as opposed to a full track that merely has occasional forced signs.
+///
+/// This is the SINGLE classification used by both the MKV muxer (accumulating a
+/// track's frames during a rip) and the `info`-time forced probe (feeding the
+/// demuxed display sets), so both reach the identical verdict.
+#[derive(Debug, Clone)]
+pub struct ForcedTracker {
+    has_display: bool,
+    all_forced: bool,
+}
+
+impl Default for ForcedTracker {
+    fn default() -> Self {
+        Self {
+            has_display: false,
+            all_forced: true,
+        }
+    }
+}
+
+impl ForcedTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one emitted PGS block into the verdict. Non-display blocks (clear
+    /// PCS, other segments) are ignored.
+    pub fn observe(&mut self, frame_data: &[u8]) {
+        if let Some(forced) = display_set_is_forced(frame_data) {
+            self.has_display = true;
+            self.all_forced &= forced;
+        }
+    }
+
+    /// Whether the track has already shown a NON-forced subtitle — i.e. its
+    /// verdict is settled at "not forced" and further observation can be skipped
+    /// (the early-exit the probe uses to avoid reading the whole clip).
+    pub fn settled_not_forced(&self) -> bool {
+        self.has_display && !self.all_forced
+    }
+
+    /// Whether ANY display set was observed. When false the track's forced state
+    /// is unknown (no PGS content seen — e.g. an undecrypted/unread stream), so a
+    /// probe should leave any existing (vendor-derived) flag untouched rather
+    /// than assert "not forced".
+    pub fn observed(&self) -> bool {
+        self.has_display
+    }
+
+    /// Final verdict: forced iff it displayed subtitles and every one was forced.
+    pub fn is_forced(&self) -> bool {
+        self.has_display && self.all_forced
+    }
+}
+
 /// Stateful parser that collapses PGS display/clear PCS pairs into
 /// duration-bearing Matroska frames. Implements [`CodecParser`].
 pub struct PgsParser {
