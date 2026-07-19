@@ -62,6 +62,14 @@ pub enum StreamUrl {
     /// chapters + delay metadata). Like `dir://` it targets a directory; the
     /// CLI constructs the `DemuxSink` with full options before the mux loop.
     Demux { dir: PathBuf },
+    /// Audio-only per-track output directory (`audio://`) — a `demux://`
+    /// restricted to audio tracks (native containers: `.thd`, `.dts`, `.ac3`,
+    /// `.eac3`, `.pcm`, …). One file per audio track; no video/subtitles.
+    Audio { dir: PathBuf },
+    /// Subtitle-only per-track output directory (`sub://`) — a `demux://`
+    /// restricted to subtitle tracks (PGS `.sup`, VobSub `.idx`+`.sub`, text
+    /// `.srt`). One file per subtitle track.
+    Sub { dir: PathBuf },
     /// freemkv native per-picture video index (`fvi://`). A write-only PES sink
     /// that emits one JSON-Lines record per coded picture of the title's primary
     /// video track to a `.fvi` file (normative spec `docs/FVI_FORMAT.md`).
@@ -83,6 +91,8 @@ impl StreamUrl {
             StreamUrl::Dir { .. } => "dir",
             StreamUrl::Null => "null",
             StreamUrl::Demux { .. } => "demux",
+            StreamUrl::Audio { .. } => "audio",
+            StreamUrl::Sub { .. } => "sub",
             StreamUrl::Fvi { .. } => "fvi",
             StreamUrl::Unknown { .. } => "unknown",
         }
@@ -98,6 +108,8 @@ impl StreamUrl {
             | StreamUrl::Iso { path }
             | StreamUrl::Dir { path }
             | StreamUrl::Demux { dir: path }
+            | StreamUrl::Audio { dir: path }
+            | StreamUrl::Sub { dir: path }
             | StreamUrl::Fvi { path } => path.to_str().unwrap_or(""),
             StreamUrl::Network { addr } => addr,
             StreamUrl::Stdio | StreamUrl::Null => "",
@@ -168,6 +180,16 @@ pub fn parse_url(url: &str) -> StreamUrl {
     }
     if let Some(rest) = url.strip_prefix("demux://") {
         return StreamUrl::Demux {
+            dir: PathBuf::from(rest),
+        };
+    }
+    if let Some(rest) = url.strip_prefix("audio://") {
+        return StreamUrl::Audio {
+            dir: PathBuf::from(rest),
+        };
+    }
+    if let Some(rest) = url.strip_prefix("sub://") {
+        return StreamUrl::Sub {
             dir: PathBuf::from(rest),
         };
     }
@@ -447,7 +469,9 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         StreamUrl::Dir { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
         // `demux://` is an output-only sink (per-track ES files); never a source.
-        StreamUrl::Demux { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
+        StreamUrl::Demux { .. } | StreamUrl::Audio { .. } | StreamUrl::Sub { .. } => {
+            Err(crate::error::Error::StreamWriteOnly.into())
+        }
         // `fvi://` is an output-only sink (per-picture video index); never a source.
         StreamUrl::Fvi { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Unknown { ref raw } => {
@@ -519,6 +543,27 @@ pub fn output(
             // `base` from the title's playlist name when present (the default
             // "title" stem is only a last resort for an unnamed title).
             let mut opts = super::demux_sink::DemuxOptions::default();
+            if !title.playlist.is_empty() {
+                opts.base = title.playlist.clone();
+            }
+            Ok(Box::new(super::demux_sink::DemuxSink::create(
+                dir, title, &opts,
+            )?))
+        }
+        // `audio://` and `sub://` are `demux://` restricted to one track class —
+        // audio in native containers, or subtitles as `.sup`/`.idx+.sub`/`.srt`.
+        // No chapters sidecar (that's a `demux://` / `chapters://` concern).
+        StreamUrl::Audio { ref dir } | StreamUrl::Sub { ref dir } => {
+            let (scheme, kind) = match parsed {
+                StreamUrl::Audio { .. } => ("audio", super::demux_sink::TrackKind::Audio),
+                _ => ("sub", super::demux_sink::TrackKind::Subtitle),
+            };
+            validate_file_path(dir, scheme)?;
+            let mut opts = super::demux_sink::DemuxOptions {
+                kind_filter: Some(kind),
+                export_chapters: false,
+                ..Default::default()
+            };
             if !title.playlist.is_empty() {
                 opts.base = title.playlist.clone();
             }
