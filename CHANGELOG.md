@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.5.1] — UNRELEASED
+
+### Fixed
+
+- **A dirty disc can no longer "rip clean" but decode with errors.** freemkv now
+  asks the drive to *report* marginal reads instead of silently returning
+  best-effort data as success — on smudged/scratched media a drive can hand back
+  subtly-wrong bytes with a clean status, which used to slip through the rip and
+  surface only as playback/decode errors. A read the drive had to fight for is
+  now distrusted and re-read in the patch pass: a clean re-read wins, and a spot
+  that's genuinely unreadable becomes an honest gap rather than silently-wrong
+  data. Best-effort per drive, and it changes nothing on a clean disc.
+
 ## [1.5.0] — 2026-07-19
 
 ### Added
