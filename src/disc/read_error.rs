@@ -114,6 +114,12 @@ pub struct ReadCtx {
     /// good reads after the last error in the cluster." Used to count
     /// zone entries and to bound zone_reads accurately.
     pub in_damage_zone: bool,
+    /// Count of RECOVERED ERROR (marginal) reads the drive reported this pass
+    /// (surfaced by the PER=1 mode-select at drive-prep). Each is distrusted and
+    /// marked NonTrimmed for a Pass N re-read; the count is reported in the
+    /// pass summary so an operator can see how much of a "clean" rip was actually
+    /// marginal.
+    pub marginal_recovered: u64,
 }
 
 /// Coarse classification of a SCSI sense key for diagnostic logging.
@@ -187,6 +193,7 @@ impl ReadCtx {
             zones_entered: 0,
             jumps_taken: 0,
             in_damage_zone: false,
+            marginal_recovered: 0,
         }
     }
 
@@ -226,6 +233,7 @@ impl ReadCtx {
             zones_entered: 0,
             jumps_taken: 0,
             in_damage_zone: false,
+            marginal_recovered: 0,
         }
     }
 
@@ -283,6 +291,7 @@ impl ReadCtx {
             total_errors: self.total_errors,
             zones_entered: self.zones_entered,
             jumps_taken: self.jumps_taken,
+            marginal_recovered: self.marginal_recovered,
         }
     }
 }
@@ -296,6 +305,8 @@ pub struct PassSummary {
     pub total_errors: u64,
     pub zones_entered: u64,
     pub jumps_taken: u64,
+    /// RECOVERED ERROR (marginal) reads distrusted and re-queued for Pass N.
+    pub marginal_recovered: u64,
 }
 
 /// What the caller should do after a read failure. The caller owns the
@@ -639,6 +650,36 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         };
     }
 
+    // 4b. RECOVERED ERROR — the drive returned this sector but had to fight for
+    //    it (ECC worked hard / retried). We enable reporting of these via MODE
+    //    SELECT PER=1 at drive-prep precisely so they surface: on marginal/dirty
+    //    media the drive's best-effort correction can be silently WRONG (a rip
+    //    that "passed clean" but decoded with errors — the Bourne case). We
+    //    distrust it: mark THIS block NonTrimmed and let Pass N re-read it with
+    //    proper recovery (FUA cache-bypass) — a clean re-read wins, a persistent
+    //    marginal becomes an honest concealed gap.
+    //
+    //    Critically this is a per-block SkipBlock, NOT the damage-jump path: a
+    //    recovered error is a single marginal sector, not a clustered hard-damage
+    //    zone, so it must NOT trigger the 64 MB JumpAhead (which would nuke huge
+    //    swaths of good data on a lightly-smudged disc). It also does NOT touch
+    //    the damage window / multiplier — a recovered read is not damage-zone
+    //    signal. Returns before the fast-jump logic below.
+    if sense_key == scsi::SENSE_KEY_RECOVERED_ERROR {
+        ctx.marginal_recovered += 1;
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "recovered_error",
+            marginal_recovered = ctx.marginal_recovered,
+            asc = err.scsi_sense().map(|s| s.asc),
+            ascq = err.scsi_sense().map(|s| s.ascq),
+            "drive reported a recovered (marginal) read — distrusting; marking NonTrimmed for Pass N re-read"
+        );
+        return ReadAction::SkipBlock {
+            pause_secs: FAIL_PAUSE_SECS,
+        };
+    }
+
     // 5. Marginal media (MEDIUM_ERROR / ABORTED_COMMAND) on a multi-
     //    sector batch: the drive can often read the same sectors
     //    individually. Bisect into single-sector reads (gentler on the
@@ -801,6 +842,62 @@ mod tests {
                 ascq: 0x00,
             }),
         }
+    }
+
+    fn recovered_err() -> Error {
+        Error::DiscRead {
+            sector: 100,
+            status: Some(2),
+            sense: Some(ScsiSense {
+                sense_key: scsi::SENSE_KEY_RECOVERED_ERROR,
+                asc: 0x17,
+                ascq: 0x01,
+            }),
+        }
+    }
+
+    #[test]
+    fn recovered_error_skips_block_not_jump_pass_1() {
+        // A recovered (marginal) read on Pass 1 must NOT trigger the 64 MB
+        // damage-jump — that would nuke huge good regions on a lightly-smudged
+        // disc. It marks just this block NonTrimmed (SkipBlock) for a Pass N
+        // re-read, and is counted as marginal_recovered.
+        let mut ctx = ReadCtx::for_sweep(32);
+        let action = handle_read_error(&recovered_err(), &mut ctx);
+        assert!(
+            matches!(action, ReadAction::SkipBlock { .. }),
+            "recovered error must SkipBlock, not JumpAhead; got {action:?}"
+        );
+        assert_eq!(ctx.marginal_recovered, 1);
+        // It must not have inflated the damage-jump multiplier (not damage signal).
+        assert_eq!(ctx.jump_multiplier, 1);
+        assert_eq!(ctx.jumps_taken, 0);
+    }
+
+    #[test]
+    fn recovered_error_skips_block_pass_n_too() {
+        // Pass N sees the same: a recovered read is distrusted → SkipBlock (the
+        // outer patch loop re-reads the range with FUA).
+        let mut ctx = ReadCtx::for_patch(1);
+        let action = handle_read_error(&recovered_err(), &mut ctx);
+        assert!(
+            matches!(action, ReadAction::SkipBlock { .. }),
+            "got {action:?}"
+        );
+        assert_eq!(ctx.marginal_recovered, 1);
+    }
+
+    #[test]
+    fn many_recovered_errors_never_jump() {
+        // Even a run of recovered errors must never escalate to a damage-jump —
+        // they're marginal reads, not a hard-damage cluster.
+        let mut ctx = ReadCtx::for_sweep(32);
+        for _ in 0..40 {
+            let a = handle_read_error(&recovered_err(), &mut ctx);
+            assert!(matches!(a, ReadAction::SkipBlock { .. }), "got {a:?}");
+        }
+        assert_eq!(ctx.jumps_taken, 0, "recovered errors never jump");
+        assert_eq!(ctx.marginal_recovered, 40);
     }
 
     #[test]

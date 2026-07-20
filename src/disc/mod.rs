@@ -3893,6 +3893,7 @@ impl Disc {
             total_errors = pass_sum.total_errors,
             zones_entered = pass_sum.zones_entered,
             jumps_taken = pass_sum.jumps_taken,
+            marginal_recovered = pass_sum.marginal_recovered,
             bytes_good = stats.bytes_good,
             bytes_pending = stats.bytes_pending,
             copy_elapsed_ms = copy_t0.elapsed().as_millis() as u64,
