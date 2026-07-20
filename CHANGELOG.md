@@ -11,8 +11,15 @@
   `AAC!` instead of `ANY!`) or ship numbered title-key files (`VTKF090.AACS` /
   `VTKF100.AACS` rather than `VTKF000.AACS`) are now handled: the AACS directory
   is located by its contents and every title-key file in it is picked up. Blu-ray
-  and UHD are unaffected. (Selecting the correct title-key file when a disc
-  carries several variants still needs verification against an encrypted HD DVD.)
+  and UHD are unaffected.
+- **HD DVD multi-title decryption reads the right keys.** The HD DVD title-key
+  file (`VTKF*.AACS`) stores its keys in 36-byte records — per the AACS HD DVD
+  specification, and confirmed byte-exact on real discs. freemkv had been reading
+  them at a 32-byte stride, which lands the first key correctly but drifts off
+  every key after it, so only single-title discs decrypted. Discs with more than
+  one protected title now recover every title's key instead of only the first.
+  (Choosing the correct title-key file when a disc carries several playlists
+  still needs verification against an encrypted HD DVD.)
 - **A dirty disc can no longer "rip clean" but decode with errors.** freemkv now
   asks the drive to *report* marginal reads instead of silently returning
   best-effort data as success — on smudged/scratched media a drive can hand back
