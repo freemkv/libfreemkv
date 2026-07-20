@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- **HD DVD AACS key files are now found on every disc, not just the common
+  layout.** The AACS directory and title-key filename on HD DVD are chosen by
+  the authoring house, and freemkv previously assumed one fixed spelling
+  (`/ANY!/VTKF000.AACS`). Discs that name their AACS directory differently (e.g.
+  `AAC!` instead of `ANY!`) or ship numbered title-key files (`VTKF090.AACS` /
+  `VTKF100.AACS` rather than `VTKF000.AACS`) are now handled: the AACS directory
+  is located by its contents and every title-key file in it is picked up. Blu-ray
+  and UHD are unaffected. (Selecting the correct title-key file when a disc
+  carries several variants still needs verification against an encrypted HD DVD.)
 - **A dirty disc can no longer "rip clean" but decode with errors.** freemkv now
   asks the drive to *report* marginal reads instead of silently returning
   best-effort data as success — on smudged/scratched media a drive can hand back
