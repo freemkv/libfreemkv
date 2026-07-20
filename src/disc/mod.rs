@@ -1824,9 +1824,10 @@ impl Disc {
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
     ) -> Result<(Vec<u8>, Vec<u8>, u8)> {
-        let inf = crate::aacs::read_first(crate::aacs::UNIT_KEY_RO_PATHS, |p| {
-            udf_fs.read_file(reader, p)
-        })?;
+        let inf = crate::aacs::read_first(
+            &crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::UnitKey),
+            |p| udf_fs.read_file(reader, p),
+        )?;
         let mkb = Self::read_mkb_content(reader, udf_fs)?;
         let version = Self::read_aacs_version(reader, udf_fs);
         Ok((inf, mkb, version))
@@ -1844,9 +1845,10 @@ impl Disc {
     /// mis-strided title keys (silent wrong unit keys), so a missing cert must
     /// not quietly pick the V10 stride for a UHD disc.
     fn read_aacs_version(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> u8 {
-        match crate::aacs::read_first(crate::aacs::CONTENT_CERT_PATHS, |p| {
-            udf_fs.read_file(reader, p)
-        })
+        match crate::aacs::read_first(
+            &crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::ContentCert),
+            |p| udf_fs.read_file(reader, p),
+        )
         .ok()
         .as_deref()
         .and_then(crate::aacs::inf::parse_content_cert)
@@ -1880,9 +1882,10 @@ impl Disc {
         const MAX_BYTES: usize = 64 * 1024 * 1024;
         let mut want = START_BYTES;
         loop {
-            let buf = crate::aacs::read_first(crate::aacs::MKB_PATHS, |p| {
-                udf_fs.read_file_prefix(reader, p, want)
-            })?;
+            let buf = crate::aacs::read_first(
+                &crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::Mkb),
+                |p| udf_fs.read_file_prefix(reader, p, want),
+            )?;
             let n = crate::aacs::mkb::mkb_content_len(&buf);
             // `n` strictly inside `buf` => the record walk reached the padding
             // boundary (full content captured). `buf` shorter than `want` =>

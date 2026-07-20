@@ -324,13 +324,18 @@ impl Disc {
         use crate::aacs;
 
         let uk_ro_data =
-            aacs::read_first(aacs::UNIT_KEY_RO_PATHS, |p| udf_fs.read_file(reader, p))?;
+            aacs::read_first(&aacs::role_paths(udf_fs, aacs::AacsRole::UnitKey), |p| {
+                udf_fs.read_file(reader, p)
+            })?;
         let dh = aacs::inf::disc_hash(&uk_ro_data);
 
-        let cc = aacs::read_first(aacs::CONTENT_CERT_PATHS, |p| udf_fs.read_file(reader, p))
-            .ok()
-            .as_deref()
-            .and_then(aacs::inf::parse_content_cert);
+        let cc = aacs::read_first(
+            &aacs::role_paths(udf_fs, aacs::AacsRole::ContentCert),
+            |p| udf_fs.read_file(reader, p),
+        )
+        .ok()
+        .as_deref()
+        .and_then(aacs::inf::parse_content_cert);
         let bus_encryption = cc.as_ref().map(|c| c.bus_encryption).unwrap_or(false);
         // No-cert default = UHD (V20 stride), matching `read_aacs_version` so the
         // scanned `AacsState.version` and the out-of-band fetch agree. A wrong
