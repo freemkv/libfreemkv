@@ -4,6 +4,20 @@
 
 ### Fixed
 
+- **TrueHD audio is no longer silently dropped (and no longer sends decoders out
+  of memory).** The previous release added an MLP major-sync checksum gate to drop
+  genuinely-undecodable audio frames, but the checksum was computed with mismatched
+  byte order — the 16-bit CRC result was folded in one endianness and compared in
+  the other — so it never validated a real major sync. The parser then judged every
+  major sync corrupt and dropped every audio frame from the first one onward,
+  flushing the whole TrueHD track at the end of the file: de-interleaved from the
+  video, which sent players and integrity checkers into an unbounded memory spiral
+  ("decoder ran out of memory"). The checksum now matches the reference
+  implementation byte-exact (cross-verified against real 7.1/Atmos and 5.1 discs),
+  so major syncs validate and only genuinely-corrupt frames are dropped; as a
+  safety net, a major sync the parser still can't validate is kept rather than
+  allowed to drop an entire track. TrueHD titles produced after the checksum gate
+  landed need a re-rip.
 - **HD DVD AACS key files are now found on every disc, not just the common
   layout.** The AACS directory and title-key filename on HD DVD are chosen by
   the authoring house, and freemkv previously assumed one fixed spelling

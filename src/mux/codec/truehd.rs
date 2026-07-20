@@ -105,7 +105,25 @@ impl TrueHdParser {
                 return AuCheck::Unverifiable;
             };
             if !mlp_major_sync_crc_ok(ms, mshdr) {
-                return AuCheck::Corrupt; // corrupt major-sync header
+                // A failing major-sync checksum is only a TRUSTWORTHY corruption
+                // signal once we already hold a validated baseline (num_substreams
+                // captured from a PRIOR checksum-clean major sync). Before that — at
+                // stream head, when no major sync has validated yet — a checksum
+                // mismatch is far more likely a limitation of our own major-sync
+                // header-size parse than real corruption. Arming the drop-forward
+                // there is catastrophic: every following AU is collateral-dropped
+                // waiting for a "validated" major sync that (if our parse is the
+                // problem) NEVER comes, so the WHOLE TrueHD track is silently dropped
+                // — the AUs are physically emitted late (empty until the mux end),
+                // de-interleaving the track and sending decoders into an unbounded
+                // memory spiral. So until we have a baseline to protect, treat a
+                // checksum-failed major sync as UNVERIFIABLE (keep it) rather than
+                // Corrupt. Once a clean major sync HAS established the baseline, a
+                // later failure is a real re-sync trigger and still drops forward.
+                if self.num_substreams.is_some() {
+                    return AuCheck::Corrupt; // real corruption vs a proven baseline
+                }
+                return AuCheck::Unverifiable; // no baseline yet — keep, don't nuke the track
             }
             self.num_substreams = mlp_num_substreams(ms);
             header_size += mshdr;
@@ -242,8 +260,20 @@ fn mlp_major_sync_crc_ok(ms: &[u8], mshdr: usize) -> bool {
     if mshdr < 4 || ms.len() < mshdr {
         return false;
     }
-    let crc = crc16_mlp(&ms[..mshdr - 4]) ^ u16::from_le_bytes([ms[mshdr - 4], ms[mshdr - 3]]);
-    crc == u16::from_be_bytes([ms[mshdr - 2], ms[mshdr - 1]])
+    // ffmpeg `ff_mlp_checksum16(buf, buf_size)` (libavcodec/mlp.c):
+    //     av_crc(crc_2D, 0, buf, buf_size - 2) ^ AV_RL16(buf + buf_size - 2)
+    // is called with `buf_size = mshdr - 2` and its result compared to
+    // `AV_RL16(buf + mshdr - 2)` — i.e. the 16-bit checksum over `ms[..mshdr-4]`,
+    // XORed with the LITTLE-ENDIAN word just before the trailer, must equal the
+    // LITTLE-ENDIAN trailer word. `crc16_mlp` is the same crc_2D table (poly 0x2D,
+    // MSB-first) but yields its two bytes in the OPPOSITE order to libavutil's
+    // `av_crc`, so swap them back to match. (The previous code mixed endianness —
+    // little-endian XOR word but big-endian compare — so the checksum could never
+    // validate any real extended major sync, silently dropping the whole track;
+    // cross-verified byte-exact against real 7.1/Atmos and 5.1 discs.)
+    let checksum = crc16_mlp(&ms[..mshdr - 4]).swap_bytes()
+        ^ u16::from_le_bytes([ms[mshdr - 4], ms[mshdr - 3]]);
+    checksum == u16::from_le_bytes([ms[mshdr - 2], ms[mshdr - 1]])
 }
 
 /// `num_substreams` from a major-sync header: it sits at bit 128 (byte 16, top
@@ -698,12 +728,14 @@ mod tests {
         au[20] = (au[20] & 0x0F) | 0x10;
         // Substream directory entry at AU[4+MSHDR] = AU[32]: extraword flag clear.
         au[32] &= 0x7F;
-        // Major-sync CRC over the header body, stored big-endian in the trailer.
+        // Major-sync checksum, built EXACTLY as `mlp_major_sync_crc_ok` verifies it
+        // (ffmpeg `ff_mlp_checksum16`): swap_bytes(crc16_mlp(body)) ^ LE word before
+        // the trailer, stored little-endian in the trailer.
         let body_end = 4 + MSHDR - 4; // AU[4..28]
-        let crc = super::crc16_mlp(&au[4..body_end])
+        let crc = super::crc16_mlp(&au[4..body_end]).swap_bytes()
             ^ u16::from_le_bytes([au[body_end], au[body_end + 1]]);
-        au[4 + MSHDR - 2] = (crc >> 8) as u8;
-        au[4 + MSHDR - 1] = (crc & 0xFF) as u8;
+        au[4 + MSHDR - 2] = (crc & 0xFF) as u8;
+        au[4 + MSHDR - 1] = (crc >> 8) as u8;
         // Parity: choose the AU check nibble (AU[0] high bits) so the header +
         // directory fold to 0xF. The length low nibble (AU[0] low bits) is kept.
         let hi = au[0] & 0x0F;
@@ -764,6 +796,43 @@ mod tests {
             2,
             "corrupt MS + poisoned normal AU"
         );
+    }
+
+    #[test]
+    fn crc_failed_head_major_sync_is_kept_not_track_killed() {
+        // REGRESSION (every TrueHD title muxed after the checksum gate landed): a
+        // real-world major sync whose checksum our own header-size parse can't
+        // validate must NOT, at stream head — before ANY major sync has validated —
+        // arm the drop-forward. Doing so latched `resync_pending` on the very first
+        // AU and collateral-dropped EVERY following AU forever (no "validated" major
+        // sync ever came), silently dropping the entire TrueHD track: its AUs were
+        // emitted only at mux end, de-interleaving the track and spiralling decoders
+        // into unbounded memory ("decoder ran out of memory"). With no baseline to
+        // protect, a checksum-failed major sync is KEPT and the audio flows.
+        let mut parser = TrueHdParser::new();
+        let mut ms_bad = valid_major_sync();
+        ms_bad[10] ^= 0xFF; // break a checksum-covered header byte → checksum fails
+        let mut data = ms_bad;
+        for _ in 0..6 {
+            data.extend_from_slice(&valid_normal_au());
+        }
+        let mut frames = parser.parse(&make_pes(data, Some(90000)));
+        frames.extend(parser.flush());
+        assert_eq!(
+            frames.len(),
+            7,
+            "no baseline yet: the CRC-failed head major sync + all following AUs are \
+             kept, not dropped (got {})",
+            frames.len()
+        );
+        assert_eq!(
+            parser.dropped_frames(),
+            0,
+            "nothing dropped without a validated baseline to protect"
+        );
+        // And the invariant still holds ONCE a baseline exists: after a genuinely
+        // valid major sync, a later corrupt one IS dropped (see
+        // `corrupt_major_sync_drops_forward_to_next_valid`).
     }
 
     #[test]
