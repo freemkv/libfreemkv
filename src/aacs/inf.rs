@@ -161,33 +161,52 @@ pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFil
     })
 }
 
-/// HD DVD Video Title Key File (`VTKF000.AACS`) magic — "DVD HD Video TKF".
+/// HD DVD Video Title Key File (`VTKF%%%.AACS`) magic — "DVD_HD_V_TKF".
 pub const VTKF_MAGIC: &[u8; 12] = b"DVD_HD_V_TKF";
-/// Fixed header length before the first title-key entry.
+/// Fixed header length before the first Title Key Entry (AACS HD DVD Book,
+/// Table 3-8).
 const VTKF_HEADER_LEN: usize = 0x80;
-/// Each title-key entry: BE32 flag + 16-byte encrypted key + 12-byte 0xFF pad.
-const VTKF_ENTRY_LEN: usize = 0x20;
+/// Title Key Entry stride (Table 3-8): 1-byte `BIFO` + 3 reserved + 16-byte
+/// encrypted title key + 16-byte binding MAC = 36 bytes.
+const VTKF_ENTRY_LEN: usize = 0x24;
+/// Byte offset of the encrypted title key within an entry (after `BIFO` + 3
+/// reserved).
+const VTKF_KEY_OFF: usize = 4;
+/// Number of Title Key Entry slots in a VTKF (Table 3-8): a fixed 64.
+const VTKF_MAX_ENTRIES: usize = 64;
+/// `BIFO` bit 7 (`AV_FLG`): set = this slot carries an available title key.
+const VTKF_AV_FLG: u8 = 0x80;
 
-/// Parse an HD DVD `VTKF000.AACS` into the SAME [`UnitKeyFile`] a BD/UHD
+/// Parse an HD DVD `VTKF%%%.AACS` into the SAME [`UnitKeyFile`] a BD/UHD
 /// `Unit_Key_RO.inf` yields — so the shared AACS crypto (`derive_unit_keys` →
 /// `decrypt_unit_key(vuk, …)`) unwraps HD DVD title keys with no change. Only
 /// the on-disc CONTAINER differs between BD and HD DVD; the title-key unwrap is
 /// the identical AES-128 VUK step (`Kt = AES-128D(Kvu, Kte)`).
 ///
-/// Layout (grounded in real discs — Shaun of the Dead, Anchorman, Harry Potter):
+/// Layout — AACS "HD DVD and DVD Pre-recorded Book" Table 3-8, a fixed
+/// 2480-byte file, verified byte-exact against real discs (Freedom `VTKF090`,
+/// Dukes of Hazzard `VTKF000`):
 /// ```text
 ///   [0x00..0x0C] magic "DVD_HD_V_TKF"
-///   [0x0C..0x10] BE32 total file length
-///   [0x10..0x1C] associated playlist name ("VPLST000.XPL")
-///   [0x1C..0x80] reserved (zero)
-///   [0x80..]     32-byte entries: BE32 flag | 16-byte ENCRYPTED title key | 12-byte 0xFF pad
-///                flag bit 31 (0x8000_0000) set = present; a cleared flag ends the table
-///   [tail]       16-byte signature/MAC (never a key — the cleared-flag stop guards it)
+///   [0x0C..0x10] BE32 HD_VTKF_SIZE (2480)
+///   [0x10..0x1C] associated playlist name ("VPLST%%%.XPL")
+///   [0x1C..0x80] reserved
+///   [0x80..]     64 entries × 36 bytes:
+///                  BIFO (1) | reserved (3) | ENCRYPTED title key (16) | binding MAC (16)
+///                  BIFO bit 7 (AV_FLG) set = this slot holds a title key
+///                  (pre-recorded discs fill the binding MAC with 0xFF)
+///   [0x9A0..2480] 16-byte TKF MAC (CMAC keyed by Kvu — NOT a key)
 /// ```
-/// Entries number 1..=N as CPS units, matching `Unit_Key_RO`'s 1-based CPS
-/// numbering, so a title's CPS unit indexes this list identically. The
-/// title→CPS mapping itself is playlist-driven (`VPLST000.XPL`) and owned by the
-/// HD DVD enumerator, so `title_cps_unit` is left empty here.
+/// The slot index (1-based) is the CPS unit number, so an absent slot is
+/// SKIPPED (not a terminator) — collapsing gaps would renumber later keys and
+/// hand the wrong title key to CPS unit N+1. The title→CPS mapping is
+/// playlist-driven (`VPLST%%%.XPL`) and owned by the HD DVD enumerator, so
+/// `title_cps_unit` is left empty here.
+///
+/// The prior parser used a 32-byte stride (a 12-byte pad instead of the 16-byte
+/// binding MAC). That reads entry #1 correctly but drifts +4 bytes per entry
+/// after it, so it only decrypted single-CPS-unit discs; every multi-key VTKF
+/// (Freedom, Harry Potter) yielded garbage keys for CPS unit ≥2.
 pub fn parse_vtkf(data: &[u8]) -> Option<UnitKeyFile> {
     if data.len() < VTKF_HEADER_LEN || &data[..12] != VTKF_MAGIC {
         return None;
@@ -198,20 +217,19 @@ pub fn parse_vtkf(data: &[u8]) -> Option<UnitKeyFile> {
     let hash = disc_hash(data);
 
     let mut encrypted_keys = Vec::new();
-    let mut pos = VTKF_HEADER_LEN;
-    let mut cps: u32 = 1;
-    while pos + VTKF_ENTRY_LEN <= data.len() {
-        let flag = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-        // A cleared present-bit terminates the key table. The file's trailing
-        // 16-byte signature then follows and must NOT be read as a key.
-        if flag & 0x8000_0000 == 0 {
+    for n in 0..VTKF_MAX_ENTRIES {
+        let pos = VTKF_HEADER_LEN + n * VTKF_ENTRY_LEN;
+        if pos + VTKF_ENTRY_LEN > data.len() {
             break;
         }
+        // AV_FLG clear = empty slot: skip it, but keep the slot index as the CPS
+        // number (do NOT break — a gap must not renumber the keys that follow).
+        if data[pos] & VTKF_AV_FLG == 0 {
+            continue;
+        }
         let mut key = [0u8; 16];
-        key.copy_from_slice(&data[pos + 4..pos + 20]);
-        encrypted_keys.push((cps, key));
-        cps += 1;
-        pos += VTKF_ENTRY_LEN;
+        key.copy_from_slice(&data[pos + VTKF_KEY_OFF..pos + VTKF_KEY_OFF + 16]);
+        encrypted_keys.push((n as u32 + 1, key));
     }
     if encrypted_keys.is_empty() {
         return None;
@@ -369,47 +387,72 @@ pub fn parse_content_cert(data: &[u8]) -> Option<ContentCert> {
 mod vtkf_tests {
     use super::*;
 
-    /// Build a synthetic `VTKF000.AACS` matching the real on-disc layout
-    /// (Shaun of the Dead / Anchorman): magic, BE32 size, playlist name,
-    /// reserved to 0x80, then 32-byte present-flagged entries, a cleared-flag
-    /// terminator, and a 16-byte trailer.
+    /// Build a synthetic `VTKF%%%.AACS` matching the real on-disc layout (AACS
+    /// HD DVD Book Table 3-8, verified against Freedom `VTKF090` and Dukes
+    /// `VTKF000`): magic, BE32 size, playlist name, reserved to 0x80, then 64
+    /// entry slots of 36 bytes (the first `keys.len()` present with `AV_FLG`
+    /// set, the rest empty), a reserved gap, and the 16-byte trailing TKF MAC.
     fn synth_vtkf(keys: &[[u8; 16]]) -> Vec<u8> {
+        const FILE_LEN: usize = 2480;
         let mut v = Vec::new();
         v.extend_from_slice(VTKF_MAGIC); // 0x00
-        v.extend_from_slice(&0u32.to_be_bytes()); // 0x0C size (patched below)
-        v.extend_from_slice(b"VPLST000.XPL"); // 0x10
-        v.resize(0x80, 0); // reserve to first entry
-        for k in keys {
-            v.extend_from_slice(&0x8000_0000u32.to_be_bytes()); // present flag
-            v.extend_from_slice(k); // 16-byte encrypted title key
-            v.extend_from_slice(&[0xFFu8; 12]); // 0xFF pad → 32-byte entry
+        v.extend_from_slice(&(FILE_LEN as u32).to_be_bytes()); // 0x0C HD_VTKF_SIZE
+        v.extend_from_slice(b"VPLST000.XPL"); // 0x10 playlist name
+        v.resize(VTKF_HEADER_LEN, 0); // reserve to first entry (0x80)
+        for n in 0..VTKF_MAX_ENTRIES {
+            if let Some(k) = keys.get(n) {
+                v.push(VTKF_AV_FLG); // BIFO: AV_FLG set (present)
+                v.extend_from_slice(&[0, 0, 0]); // reserved
+                v.extend_from_slice(k); // 16-byte encrypted title key
+                v.extend_from_slice(&[0xFFu8; 16]); // binding MAC (0xFF, pre-recorded)
+            } else {
+                v.extend_from_slice(&[0u8; VTKF_ENTRY_LEN]); // empty slot (AV_FLG clear)
+            }
         }
-        // Cleared-flag terminator entry (must NOT be read as a key).
-        v.extend_from_slice(&[0u8; VTKF_ENTRY_LEN]);
-        // 16-byte trailing signature (must NOT be read as a key).
-        v.extend_from_slice(&[0xABu8; 16]);
-        let len = v.len() as u32;
-        v[0x0C..0x10].copy_from_slice(&len.to_be_bytes());
+        v.resize(FILE_LEN - 16, 0); // reserved gap before the trailer
+        v.extend_from_slice(&[0xABu8; 16]); // TKF MAC (must NOT be read as a key)
         v
     }
 
     #[test]
-    fn parse_vtkf_extracts_present_entries_and_stops_at_terminator() {
+    fn parse_vtkf_reads_present_entries_skips_empty_ignores_mac() {
         let k1 = [0x11u8; 16];
         let k2 = [0x22u8; 16];
         let k3 = [0x33u8; 16];
         let data = synth_vtkf(&[k1, k2, k3]);
 
         let ukf = parse_vtkf(&data).expect("valid VTKF must parse");
-        // Exactly the three present entries — the cleared-flag terminator and
-        // the 16-byte trailer are NOT mistaken for keys.
-        assert_eq!(ukf.encrypted_keys.len(), 3, "must stop at the cleared flag");
-        assert_eq!(ukf.encrypted_keys[0], (1, k1), "CPS units number 1..=N");
+        // Exactly the three present entries — the empty slots and the trailing
+        // 16-byte TKF MAC are NOT mistaken for keys. Critically, k2/k3 are read
+        // at the 36-byte stride (offsets 0xA4, 0xC8); the old 32-byte stride
+        // misread them from inside the previous entry's binding MAC.
+        assert_eq!(ukf.encrypted_keys.len(), 3);
+        assert_eq!(
+            ukf.encrypted_keys[0],
+            (1, k1),
+            "CPS units = 1-based slot index"
+        );
         assert_eq!(ukf.encrypted_keys[1], (2, k2));
         assert_eq!(ukf.encrypted_keys[2], (3, k3));
         assert_eq!(ukf.version, AacsVersion::V10, "HD DVD is AACS 1.0");
         // disc_hash is SHA1 of the whole file (the KEYDB lookup key).
         assert_eq!(ukf.disc_hash, disc_hash(&data));
+    }
+
+    #[test]
+    fn parse_vtkf_reads_a_full_64_entry_file() {
+        // Real discs (Freedom, Dukes) carry all 64 slots present. Every key must
+        // come back, none dropped and none drifted — the regression the 32-byte
+        // stride failed.
+        let keys: Vec<[u8; 16]> = (0..VTKF_MAX_ENTRIES).map(|n| [n as u8; 16]).collect();
+        let ukf = parse_vtkf(&synth_vtkf(&keys)).expect("64-entry VTKF");
+        assert_eq!(ukf.encrypted_keys.len(), 64);
+        assert_eq!(
+            ukf.encrypted_keys[63],
+            (64, [63u8; 16]),
+            "entry 64 at 0x{:x}",
+            VTKF_HEADER_LEN + 63 * VTKF_ENTRY_LEN
+        );
     }
 
     #[test]
