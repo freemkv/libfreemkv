@@ -1,98 +1,58 @@
 # Changelog
 
-## [1.5.0] — UNRELEASED
+## [1.5.0] — 2026-07-19
 
 ### Added
 
-- **MP4 input (`mp4://` as a source)** — a progressive-MP4 demuxer, the inverse
-  of the muxer: it rebuilds the title + per-sample index from `moov`/`stbl` and
-  streams samples back as PES frames, so `mp4://` now flows to **any** sink
-  (`mp4:// mkv://`, `mp4:// audio://`, `mp4:// json://`, …). Round-trip is
-  frame-exact (verified `iso:// mp4://` → `mp4:// mkv://` preserves every video
-  and audio packet). Progressive MP4 only; fragmented (`moof`) is future work.
-- **MP4 output is faststart by default** — `moov` is written *before* `mdat`, so
-  the file plays over HTTP without pre-fetching the end. Done with zero extra I/O:
-  a `moov`-sized hole (`round_up_4MB(16 B/sample × est_samples) + 4 MB`) is
-  reserved up front, so sample offsets are fixed and `moov` is dropped into the
-  hole at finish with a `free` box for the slack (falls back to moov-at-end only
-  if the estimate is blown).
-- **Native MP4 output (`mp4://`)** — a progressive ISO-BMFF muxer
-  (`ftyp`+`mdat`+`moov`), so a disc goes straight to a play-everywhere `.mp4` in
-  one decrypt pass, no ffmpeg round-trip. Carries HEVC / H.264 video (HDR10 colour
-  via `colr`) and the audio MP4 supports — AC-3 (`dac3`), E-AC-3 (`dec3`), and
-  DTS / DTS-HD (`dtsc`/`dtsh` + `ddts`) — with correct sample tables and B-frame
-  composition offsets. It's a **compatibility export, not archival**: MP4 can't
-  hold TrueHD, LPCM, or bitmap (PGS/VobSub) subtitles, so those are **excluded
-  with a loud, itemized report — never a silent drop** (`mkv://` remains the
-  keep-everything path). Verified byte-for-byte equivalent to `ffmpeg -c copy`:
-  frame-exact video and audio (incl. a real DTS-HD MA 7.1 track, layout-exact),
-  identical colour and duration, clean decode.
+- **MP4 as a source (`mp4://`)** — read a progressive `.mp4` back in and send it to
+  any sink (`mp4:// mkv://`, `mp4:// audio://`, `mp4:// json://`, …). The round-trip
+  is frame-exact.
+- **Native MP4 output (`mp4://`)** — a disc goes straight to a play-everywhere
+  `.mp4` in one decrypt pass, no ffmpeg. Carries HEVC / H.264 video (with HDR10) and
+  AC-3, E-AC-3, and DTS / DTS-HD audio, and is faststart by default so it plays over
+  HTTP without downloading the end first. It's a **compatibility export, not
+  archival**: MP4 can't hold TrueHD, LPCM, or bitmap (PGS / VobSub) subtitles, so
+  those are **excluded with a loud, itemized report — never a silent drop**
+  (`mkv://` stays the keep-everything path).
+- **Five extraction sinks — dissect a title, don't just rip it.** New destinations
+  that pull one part of a title out on its own:
+  - **`video://dir/`** — each video track to its own native elementary-stream file.
+  - **`audio://dir/`** — each audio track to its own file in its native container
+    (`.thd`, `.dts`, `.ac3`, `.eac3`, `.aac`, `.flac`; LPCM as `.pcm`).
+  - **`sub://dir/`** — each subtitle track to its own file (PGS `.sup`, VobSub
+    `.idx` + `.sub`, text `.srt`).
+  - **`chapters://file`** — a title's chapter markers as a sidecar (`.xml` / `.txt`
+    / `.ogm` / `.vtt`).
+  - **`json://file`** — a title's complete structure as JSON.
 
-- **Five extraction sinks — dissect a title, don't just rip it.** New write-only
-  destinations that pull one facet of a title out on its own:
-  - **`video://dir/`** — every video track to its own file, as a raw elementary
-    stream in the codec's native form (`.hevc`, `.h264`, `.vc1`, `.m2v`, `.obu`).
-    No audio, no subtitles. Completes the per-track-class trio with `audio://` /
-    `sub://`.
-  - **`audio://dir/`** — every audio track to its own file in a directory, each in
-    its native container (`.thd`, `.dts` / `.dtshd`, `.ac3`, `.eac3`, `.aac`,
-    `.flac`). No video, no subtitles. BD/DVD LPCM has no container of its own and is
-    written as headerless big-endian `.pcm`.
-  - **`sub://dir/`** — every subtitle track to its own file: PGS as `.sup`, VobSub
-    as a paired `.idx` + `.sub`, text subtitles as `.srt`. No video, no audio.
-  - **`chapters://file`** — a title's chapter markers as a single sidecar, in the
-    format the output extension selects: `.xml` (Matroska), `.txt` / `.ogm` (OGM
-    simple), or `.vtt` (WebVTT).
-  - **`json://file`** — one title's complete structure as JSON.
-
-  `audio://` and `sub://` are the demux path with a **kind filter** (only their
-  track class is opened and written). `chapters://` and `json://` are **scan-only**
-  — they read nothing of the elementary streams, so they return in seconds.
-
-- **Drop-on-undecodable audio — keep everything decodable, drop the frames that
-  aren't.** A damaged audio access unit is now dropped rather than muxed as a
-  decoder-choking glitch, and A/V sync is preserved: a drop becomes a silence
-  gap, never a shift of the following audio, and every drop is logged. Detection
-  is per-codec, each mirroring the format's own authoritative integrity check:
-  **DTS** (ffmpeg's core-header validity parse), **AC-3 / E-AC-3** (native frame
-  CRC-16), **FLAC** (whole-frame CRC-16), **MP2 / MP3** and **AAC-ADTS** (header
-  sanity — raw AAC passes through), and **TrueHD / MLP** (major-sync CRC-16 + AU
-  parity, verified against real ffmpeg output; because MLP state carries across
-  access units, a corrupt AU is dropped *forward* to the next major sync). LPCM
-  and video are excluded by design (no in-frame integrity data; inter-frame
-  prediction). A shared tally counts and logs drops and, for a track that is
-  mostly undecodable, drops the whole track. Detects only frames that are
-  *structurally* undecodable — corruption of the sample payload inside an
-  otherwise-valid frame (bad bit-allocation / XLL data) is source damage a
-  container remux cannot distinguish from good data.
-
-- **Forced subtitle detection from PGS content.** A PGS subtitle track is flagged
-  `FlagForced` when it displays subtitles and every one carries the HDMV
-  `forced_on_flag` — a dedicated forced/narrative track — read from the stream
-  itself rather than the disc's vendor label metadata, so it works on discs that
-  carry no such blob. `info -v` reports the same verdict (one shared classifier
-  drives both the muxer and the scan-time probe), so `info` and a rip agree.
+  `chapters://` and `json://` read nothing of the elementary streams, so they
+  return in seconds.
+- **Damaged audio frames are dropped instead of shipped as glitches.** When a
+  source disc has a corrupt audio frame, freemkv drops that frame rather than muxing
+  it as a decoder-choking glitch — keeping A/V in sync (a drop is a silence gap,
+  never a shift) and logging every drop. Works across DTS, AC-3 / E-AC-3, FLAC,
+  MP2 / MP3, AAC, and TrueHD, each using the format's own integrity check; a track
+  that is mostly undecodable is dropped whole. This catches structurally-broken
+  frames — corruption of the audio *data* inside an otherwise-valid frame is source
+  damage that can't be told from good data without decoding.
+- **Forced subtitles detected from the stream.** A PGS subtitle track is flagged
+  forced when its content is entirely forced/narrative subtitles, read from the
+  stream itself rather than the disc's metadata — so it works on discs that carry
+  none. `info -v` reports the same, so `info` and a rip agree.
 
 ### Changed
 
-- **`json://` emits the complete title model — lossless, not a summary.** Every
-  field the scan resolved is serialized: video carries resolution (+ pixel
-  dimensions, interlaced flag), frame rate (+ exact fraction), HDR, colour space,
-  display aspect, and measured CICP; audio carries channel layout (+ count), sample
-  rate (+ Hz), language, and editorial purpose; subtitles carry the forced flag and
-  qualifier. The clip list and chapter names are included too.
+- **`json://` emits the complete title model** — every field the scan resolved:
+  video resolution / frame rate / HDR / colour, audio channel layout / sample rate /
+  language / purpose, the subtitle forced flag, plus the clip list and chapter names.
 
 ### Fixed
 
-- **TrueHD: a couple of transient errors can no longer poison a whole track.**
-  A corrupt access unit drops forward to the next major sync, but only the
-  individually-verified corruption feeds the whole-track drop verdict now; the
-  resync run is collateral — so two scattered errors no longer discard an
-  otherwise-good multi-hour track. The per-AU PTS rate is refined only from a
-  CRC-validated major sync (a corrupt one can't shift the resumed audio), and the
-  resync clears only on a validated major sync.
-- **Free-format MPEG-audio** (`bitrate_index == 0`) is a legal, decodable mode and
-  is no longer dropped.
+- **TrueHD: a couple of transient errors no longer discard a whole track.** A
+  corrupt access unit is dropped forward to the next clean sync point, but a short
+  burst of damage no longer trips the whole-track drop, and a corrupt sync point can
+  no longer shift the audio that follows.
+- **Free-format MP2 / MP3** is a legal, decodable mode and is no longer dropped.
 
 ## [1.4.5] — 2026-07-18
 
