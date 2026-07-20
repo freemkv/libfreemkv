@@ -61,7 +61,27 @@ const SPIN_UP_SETTLE_SECS: u64 = 10;
 const SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
 const SCSI_GET_EVENT_STATUS: u8 = 0x4A;
 const SCSI_MODE_SENSE: u8 = 0x5A;
+const SCSI_MODE_SELECT: u8 = 0x55;
 const SCSI_REPORT_KEY: u8 = 0xA4;
+
+/// SBC/MMC Read-Write Error Recovery mode page (page code 0x01). We flip the
+/// `PER` bit to make the drive REPORT a recovered read (via CHECK CONDITION +
+/// sense key RECOVERED ERROR) instead of silently returning best-effort data as
+/// GOOD status. On marginal/dirty media that silent-GOOD data can be
+/// mis-corrected — a rip that "passed clean" but decoded with errors. With PER
+/// on, freemkv sees the marginal read and re-reads it in Pass N (a loud miss,
+/// never a silent commit). See `build_error_recovery_select_payload`.
+const MODE_PAGE_ERROR_RECOVERY: u8 = 0x01;
+/// Bit masks in the Read-Write Error Recovery flags byte (page byte 2).
+const ERP_FLAG_TB: u8 = 0x20; // Transfer Block: still deliver the recovered data
+const ERP_FLAG_PER: u8 = 0x04; // Post Error: report recovered errors
+const ERP_FLAG_DTE: u8 = 0x02; // Data Terminate on Error: MUST be off (we want the data)
+/// `Parameters Saveable` bit in a mode page's byte 0 — valid only on MODE SENSE;
+/// must be cleared before echoing the page back in a MODE SELECT.
+const MODE_PAGE_PS_BIT: u8 = 0x80;
+/// MODE SENSE(10) parameter header length (bytes), preceding any block
+/// descriptors and the mode pages.
+const MODE10_HEADER_LEN: usize = 8;
 
 /// Optical disc drive session -- open, identify, unlock, and read.
 pub struct Drive {
@@ -464,6 +484,12 @@ impl Drive {
         // wants max speed. Best-effort: a failure here must NOT fail the rip.
         if r.is_ok() {
             self.set_speed(crate::speed::DriveSpeed::Max.to_kbps());
+            // Ask the drive to REPORT recovered/marginal reads rather than
+            // silently commit best-effort data as GOOD (the dirty-disc
+            // "passed-clean-but-decodes-with-errors" trap). Best-effort: a drive
+            // that doesn't honor it just keeps its defaults — no regression, and
+            // on a clean disc it changes nothing.
+            self.enable_recovered_error_reporting();
         }
         tracing::info!(
             target: "freemkv::drive",
@@ -596,6 +622,53 @@ impl Drive {
             Some(buf[..end].to_vec())
         } else {
             None
+        }
+    }
+
+    /// Ask the drive to REPORT recovered/marginal reads instead of silently
+    /// returning best-effort data as GOOD status. MODE SENSE the Read-Write
+    /// Error Recovery page, flip `PER` (and `TB` on / `DTE` off so we still get
+    /// the data), and MODE SELECT it back — preserving the drive's own retry
+    /// count and other bits.
+    ///
+    /// Best-effort: a drive that doesn't support the page, or rejects the SELECT,
+    /// simply keeps its default behaviour — no regression, the rip proceeds. On a
+    /// clean disc this changes nothing (no recovered errors fire); it only
+    /// surfaces the marginal reads that a dirty disc would otherwise commit
+    /// silently. Returns whether the page was successfully written.
+    pub fn enable_recovered_error_reporting(&mut self) -> bool {
+        let Some(sense) = self.mode_sense_page(MODE_PAGE_ERROR_RECOVERY) else {
+            tracing::debug!(target: "freemkv::drive", "MODE SENSE error-recovery page unavailable; leaving drive defaults");
+            return false;
+        };
+        let Some(payload) = build_error_recovery_select_payload(&sense) else {
+            tracing::debug!(target: "freemkv::drive", "error-recovery page malformed/short; leaving drive defaults");
+            return false;
+        };
+        // MODE SELECT(10): PF=1 (page format), parameter list length = payload.
+        let len = payload.len() as u16;
+        let cdb = [
+            SCSI_MODE_SELECT,
+            0x10, // PF=1, SP=0 (don't persist across power cycles)
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            (len >> 8) as u8,
+            len as u8,
+            0x00,
+        ];
+        let mut buf = payload;
+        match self.checked_exec(&cdb, crate::scsi::DataDirection::ToDevice, &mut buf, 5_000) {
+            Ok(_) => {
+                tracing::info!(target: "freemkv::drive", phase = "error_recovery", "recovered-error reporting enabled (PER=1) — marginal reads will surface instead of committing silently");
+                true
+            }
+            Err(e) => {
+                tracing::debug!(target: "freemkv::drive", error = %e, "MODE SELECT error-recovery page rejected; leaving drive defaults");
+                false
+            }
         }
     }
 
@@ -1101,6 +1174,46 @@ fn select_drive_with_media(drives: impl Iterator<Item = Drive>) -> Option<Drive>
     fallback
 }
 
+/// Turn a MODE SENSE(10) Read-Write Error Recovery page response into the
+/// payload for a MODE SELECT(10) that enables recovered-error REPORTING —
+/// preserving every other bit (notably the drive's own read-retry count).
+///
+/// Pure so the bit-twiddling is unit-tested without a drive. Steps:
+/// - locate the page after the 8-byte header + block descriptors (bytes 6-7);
+/// - verify it is page 0x01 with a flags byte present;
+/// - in the flags byte: set `PER` (report) and `TB` (still deliver the data),
+///   clear `DTE` (don't terminate the transfer on the recovered error);
+/// - clear the page's `PS` bit (valid only on SENSE) and zero the header's
+///   mode-data-length field (reserved on SELECT).
+///
+/// Returns `None` (caller leaves the drive at its defaults) when the response is
+/// too short or isn't the error-recovery page — never panics on adversarial
+/// bytes.
+fn build_error_recovery_select_payload(sense: &[u8]) -> Option<Vec<u8>> {
+    if sense.len() < MODE10_HEADER_LEN {
+        return None;
+    }
+    let block_desc_len = u16::from_be_bytes([sense[6], sense[7]]) as usize;
+    let page_off = MODE10_HEADER_LEN.checked_add(block_desc_len)?;
+    // Need page byte 0 (code), byte 1 (length), byte 2 (flags).
+    if page_off.checked_add(3)? > sense.len() {
+        return None;
+    }
+    if sense[page_off] & 0x3F != MODE_PAGE_ERROR_RECOVERY {
+        return None;
+    }
+    let mut payload = sense.to_vec();
+    // Header: mode-data-length is reserved on SELECT — zero it.
+    payload[0] = 0;
+    payload[1] = 0;
+    // Page byte 0: clear PS (SENSE-only).
+    payload[page_off] &= !MODE_PAGE_PS_BIT;
+    // Flags byte: PER on, TB on, DTE off. Retry count (next byte) untouched.
+    payload[page_off + 2] |= ERP_FLAG_PER | ERP_FLAG_TB;
+    payload[page_off + 2] &= !ERP_FLAG_DTE;
+    Some(payload)
+}
+
 /// Decode a READ CAPACITY (10) response into a sector count.
 ///
 /// A short transfer (`bytes_transferred < 4`, which would leave the high
@@ -1275,6 +1388,84 @@ mod halt_tests {
 mod command_tests {
     use super::*;
     use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};
+
+    /// A minimal MODE SENSE(10) response carrying the Read-Write Error Recovery
+    /// page (0x01) with the given flags byte and retry count, no block
+    /// descriptors. `ps` sets the page's PS bit (SENSE-only), which the SELECT
+    /// payload must clear.
+    fn mode_sense_error_recovery(flags: u8, retry: u8, ps: bool) -> Vec<u8> {
+        let mut v = vec![0u8; MODE10_HEADER_LEN + 12];
+        // Header: nonzero mode-data-length (must be zeroed on SELECT); no block
+        // descriptors.
+        v[0] = 0x00;
+        v[1] = 0x22;
+        v[6] = 0x00;
+        v[7] = 0x00; // block descriptor length = 0
+        let po = MODE10_HEADER_LEN;
+        v[po] = MODE_PAGE_ERROR_RECOVERY | if ps { MODE_PAGE_PS_BIT } else { 0 };
+        v[po + 1] = 0x0A; // page length
+        v[po + 2] = flags; // error-recovery flags
+        v[po + 3] = retry; // read retry count
+        v
+    }
+
+    #[test]
+    fn error_recovery_payload_sets_per_tb_clears_dte_ps_preserves_retry() {
+        // Start with PER off, DTE on, PS on, a specific retry count. The SELECT
+        // payload must flip PER on, TB on, DTE off, clear PS, zero the header
+        // mode-data-length, and leave the retry count untouched.
+        let sense = mode_sense_error_recovery(ERP_FLAG_DTE, 0x2C, true);
+        let out = build_error_recovery_select_payload(&sense).expect("valid page");
+        let po = MODE10_HEADER_LEN;
+        assert_eq!(out[0], 0, "header mode-data-length zeroed for SELECT");
+        assert_eq!(out[1], 0);
+        assert_eq!(out[po] & MODE_PAGE_PS_BIT, 0, "PS cleared for SELECT");
+        assert_eq!(out[po] & 0x3F, MODE_PAGE_ERROR_RECOVERY, "still page 0x01");
+        assert_eq!(out[po + 2] & ERP_FLAG_PER, ERP_FLAG_PER, "PER set");
+        assert_eq!(
+            out[po + 2] & ERP_FLAG_TB,
+            ERP_FLAG_TB,
+            "TB set (still get data)"
+        );
+        assert_eq!(
+            out[po + 2] & ERP_FLAG_DTE,
+            0,
+            "DTE cleared (don't terminate)"
+        );
+        assert_eq!(out[po + 3], 0x2C, "read retry count preserved");
+    }
+
+    #[test]
+    fn error_recovery_payload_honors_block_descriptor_offset() {
+        // With an 8-byte block descriptor between header and page, the function
+        // must locate the page at header+desc, not a fixed offset.
+        let mut sense = vec![0u8; MODE10_HEADER_LEN + 8 + 12];
+        sense[7] = 8; // block descriptor length
+        let po = MODE10_HEADER_LEN + 8;
+        sense[po] = MODE_PAGE_ERROR_RECOVERY;
+        sense[po + 1] = 0x0A;
+        sense[po + 2] = 0x00;
+        let out = build_error_recovery_select_payload(&sense).expect("valid");
+        assert_eq!(
+            out[po + 2] & ERP_FLAG_PER,
+            ERP_FLAG_PER,
+            "PER set at the descriptor-offset page"
+        );
+    }
+
+    #[test]
+    fn error_recovery_payload_rejects_wrong_or_short_page() {
+        // Wrong page code → None (leave drive at defaults).
+        let mut wrong = mode_sense_error_recovery(0, 0, false);
+        wrong[MODE10_HEADER_LEN] = 0x08; // page 0x08 (caching), not 0x01
+        assert!(build_error_recovery_select_payload(&wrong).is_none());
+        // Too short to hold the header → None, no panic.
+        assert!(build_error_recovery_select_payload(&[0u8; 4]).is_none());
+        // Header claims a block descriptor that runs off the buffer → None.
+        let mut bad = mode_sense_error_recovery(0, 0, false);
+        bad[7] = 0xF0; // descriptor length way past the buffer
+        assert!(build_error_recovery_select_payload(&bad).is_none());
+    }
 
     /// Mock transport: returns a fixed data payload (copied into the
     /// caller's buffer, truncated to fit) on every `execute()`.
