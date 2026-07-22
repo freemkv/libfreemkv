@@ -409,11 +409,23 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // avoids disturbing the mux reader below. 64 sectors is a
             // file-safe batch for an ISO. AACS / single-VTS paths are
             // unchanged (decrypt_keys_for_title short-circuits to decrypt_keys).
-            let (keys, title_is_clear) =
-                match crate::io::file_sector_source::FileSectorSource::open(path) {
-                    Ok(mut crack_reader) => disc.decrypt_keys_for_title(idx, &mut crack_reader, 64),
-                    Err(_) => (disc.decrypt_keys(), false),
-                };
+            //
+            // Only a DVD needs this fresh reader (its per-title crack reads the
+            // title's sectors); AACS / unencrypted resolve their keys from
+            // `decrypt_keys()` with NO read, so we must not open — and fail on —
+            // a probe handle for them (v1.5.1 tolerated an open blip on non-DVDs).
+            // For a DVD the reader IS required, so a failed open is PROPAGATED as
+            // a real, loud, retryable I/O error — never guessed into a
+            // `title_is_clear` verdict: guessing `true` would mux a
+            // detection-miss scrambled DVD keyless (silent garbage); guessing
+            // `false` would falsely hard-fail an unencrypted DVD.
+            let (keys, title_is_clear) = if disc.format == crate::disc::DiscFormat::Dvd {
+                let mut crack_reader = crate::io::file_sector_source::FileSectorSource::open(path)
+                    .map_err(|e| -> io::Error { e.into() })?;
+                disc.decrypt_keys_for_title(idx, &mut crack_reader, 64)
+            } else {
+                (disc.decrypt_keys(), false)
+            };
             // Per-title decrypt gate (parallel to the disc-wide gate above): on
             // a multi-VTS CSS disc, the per-title re-crack may return `None` when
             // the chosen title's VTS could not be re-cracked. Muxing that would
