@@ -2486,8 +2486,19 @@ impl Disc {
                     // firmware didn't (stock or Renesas drive) AND AACS state was
                     // actually obtained.
                     "AACS" => self.aacs.is_some() && !ld_removed_bus,
-                    // The CSS handshake/crack succeeded → title keys recovered.
-                    "CSS" => self.css.is_some(),
+                    // The DVD read-unlock (CSS bus-auth) is issued during the scan
+                    // for EVERY DVD to clear the drive's scrambled-read barrier;
+                    // unlike the firmware/AACS arms above (whose success is already
+                    // captured in disc state), the bus-auth outcome is not tracked
+                    // separately, so this arm reports the MEDIUM — "the DVD
+                    // read-unlock path engaged" — rather than a per-rip success
+                    // bit. That is intentional: the CSS descramble is keyless and
+                    // handled at mux time, and a genuine bus-auth failure surfaces
+                    // downstream as a read/crack error, not here. (Formerly this
+                    // reported `self.css.is_some()` — "a crack recovered a key" —
+                    // which under-reported: an encrypted DVD that reads and muxes
+                    // fine showed "no".)
+                    "DVD" => self.format == DiscFormat::Dvd,
                     // A newly-registered unlocker with no runtime signal wired
                     // here yet: report `no` rather than guess.
                     _ => false,
@@ -2579,94 +2590,97 @@ impl Disc {
 
     /// Resolve decryption keys for muxing a *specific* title.
     ///
-    /// CSS title keys are per-VTS. The scan cracks one key (from the main
-    /// feature, title 0 for autorip). Applying it to a title that lives in
-    /// a *different* VTS would silently descramble with the wrong key
-    /// (garbage output). When the requested title's extents don't overlap
-    /// the span the cracked key came from, re-crack the key from this
-    /// title's own extents using `reader`. AACS / unencrypted / single-VTS
-    /// paths are identical to [`Self::decrypt_keys`].
+    /// For a **DVD** the CSS title key MUST be recovered before descrambling: a
+    /// scrambled sector without a Stevenson crib cannot self-crack, and CSS leaves
+    /// the pack/PES header clear, so a sector left un-descrambled would mux as a
+    /// structurally-valid but corrupt PES packet with no loss reported. Two ways
+    /// to get it:
     ///
-    /// `batch_sectors` sizes the crack's batched reads (file-safe value for
-    /// an ISO; `detect_max_batch_sectors` for a live drive).
-    /// Also returns the per-title encryption verdict the gate needs to AVOID A
-    /// FALSE ERROR on a genuinely-clear extra title.
+    /// - **Fast path** — the scan already cracked a key whose LBA span
+    ///   ([`crate::css::CssState::crack_span`]) covers this title's VTS: reuse it.
+    ///   No re-read, and on a live drive no second CSS bus-auth round-trip. CSS
+    ///   title keys are per-VTS, so an overlapping span is the same key.
+    /// - **Crack** — when up-front detection missed (`self.css == None`) or the
+    ///   title lives in a different VTS: crack the key from this title's OWN
+    ///   extents in a SINGLE scan, in natural PLAYBACK ORDER (never largest-cell-
+    ///   first, which starved the crack in a big cell's clear prefix — the 1.5.1
+    ///   bug). Playback order reaches the scrambled feature body after only the
+    ///   small clear front matter (logo / rating card) that precedes it. One
+    ///   scan = one CSS-locked early-bail, so a locked title is not re-hammered
+    ///   per cell against a live drive (hard rule #2); its 50k-sector budget is
+    ///   the same accepted bound the disc-wide scan uses.
     ///
-    /// On a multi-VTS CSS DVD that ALSO carries a clear, unencrypted stub title
-    /// (a 0.5 s menu loop, an FBI-warning nav title) living in its own VTS, the
-    /// re-crack over that stub's extents finds NO scrambled sector and recovers
-    /// no key. Returning ONLY the keys would collapse that to
-    /// `DecryptKeys::None`, indistinguishable from "scrambled but uncrackable",
-    /// so [`Self::ensure_decryptable_keys`] (which fails whenever `css.is_some()`
-    /// and the key is `None`) would wrongly raise `E7023` for a title that needs
-    /// no key at all — the false error the multi-title mux must never emit.
+    /// Crucially the crack path does NOT gate on `self.css`: a detection miss can
+    /// never route the mux into raw passthrough of scrambled sectors.
     ///
-    /// So the re-crack runs via [`crate::css::crack_key_outcome`] and ALSO
-    /// returns `title_is_clear == true` when the title's own extents showed NO
-    /// scrambling (`CrackOutcome::Unencrypted`) — the gate then treats that title
-    /// as needing no key and passes it cleanly. A title that genuinely IS
-    /// scrambled but uncrackable returns `(None, false)` and still hard-fails.
-    /// The returned bool pairs with [`Self::ensure_title_decryptable`].
+    /// Outcomes (`batch_sectors` sizes the crack's batched reads):
+    /// - `(Css{title_key}, false)` — descramble with the recovered/reused key.
+    /// - `(None, true)` — a genuinely-clear title needs no key; the gate passes it.
+    /// - `(None, false)` — scrambled but no key recoverable → hard failure via
+    ///   [`Self::ensure_title_decryptable`], never a silent garbage mux.
+    ///
+    /// Non-DVD schemes (AACS / FMTS / genuinely unencrypted) return
+    /// [`Self::decrypt_keys`] unchanged.
     pub fn decrypt_keys_for_title(
         &self,
         idx: usize,
         reader: &mut dyn SectorSource,
         batch_sectors: u16,
     ) -> (crate::decrypt::DecryptKeys, bool) {
-        let css = match self.css {
-            Some(ref c) => c,
-            None => return (self.decrypt_keys(), false),
-        };
-        let title = match self.titles.get(idx) {
-            Some(t) if !t.extents.is_empty() => t,
-            // No extents to crack from — fall back to the disc-wide key.
-            _ => return (self.decrypt_keys(), false),
-        };
-        // If the title overlaps the span the existing key was cracked from,
-        // it's the same VTS — the cracked key applies. `crack_span: None`
-        // (unknown provenance) is also treated as "applies".
-        let overlaps = match css.crack_span {
-            None => true,
-            Some((cs, ce)) => title.extents.iter().any(|e| {
-                let ts = e.start_lba;
-                let te = e.start_lba.saturating_add(e.sector_count);
-                ts < ce && cs < te
-            }),
-        };
-        if overlaps {
+        // Non-DVD (AACS / FMTS / genuinely unencrypted): disc-wide keys, unchanged.
+        if self.format != DiscFormat::Dvd {
             return (self.decrypt_keys(), false);
         }
-        // Different VTS: re-crack from this title's extents, largest first
-        // (the movie body is the biggest scrambled chunk — same heuristic
-        // the scan uses). The disc-wide key provably does NOT apply here
-        // (crack_span is Some and this title doesn't overlap it). Use
-        // `crack_key_outcome` (not the bare `crack_key`) so we can tell a
-        // genuinely-clear title (`Unencrypted` — no scrambled sector in its
-        // own extents) apart from a scrambled-but-uncrackable one:
-        //   - Cracked            → the title's own key.
-        //   - Unencrypted        → (None, title_is_clear=true): this extra title
-        //                          needs no key; the gate must NOT raise E7023.
-        //   - ScrambledUncracked → (None, false): genuinely encrypted but no key
-        //                          → a real hard failure, still surfaced.
-        // The disc-wide fallback is reserved for the unknown-provenance case
-        // (crack_span == None), already handled above via overlaps == true.
-        let mut extents = title.extents.clone();
-        extents.sort_by(|a, b| b.sector_count.cmp(&a.sector_count));
-        match crate::css::crack_key_outcome(reader, &extents, batch_sectors, None) {
+        let title = match self.titles.get(idx) {
+            Some(t) if !t.extents.is_empty() => t,
+            // No extents to crack from: nothing scrambled to worry about, so mark
+            // it clear (`true`). Returning `false` here would let the gate's DVD
+            // "None keys + not clear = scrambled-uncracked" rule wrongly hard-fail
+            // a genuinely-unencrypted DVD title that has no extents.
+            _ => return (self.decrypt_keys(), true),
+        };
+        // Fast path: reuse the scan's cracked key if its span covers this title's
+        // VTS. `crack_span: None` (unknown provenance) is treated as covering.
+        if let Some(css) = self.css.as_ref() {
+            let covers = match css.crack_span {
+                None => true,
+                Some((cs, ce)) => title
+                    .extents
+                    .iter()
+                    .any(|e| e.start_lba < ce && cs < e.start_lba.saturating_add(e.sector_count)),
+            };
+            if covers {
+                return (
+                    crate::decrypt::DecryptKeys::Css {
+                        title_key: css.title_key,
+                    },
+                    false,
+                );
+            }
+        }
+        // Detection miss or a different VTS: crack this title's key from its OWN
+        // extents in a SINGLE scan, in natural PLAYBACK ORDER (never largest-cell-
+        // first — that was the 1.5.1 garbage bug, where a big cell's clear prefix
+        // starved the crack). Playback order reaches the scrambled feature body
+        // after only the (small) clear front matter that precedes it on a real
+        // disc. This is ONE crack_key_outcome call, exactly like the disc-wide
+        // scan: its single CSS-locked early-bail runs at most once, so a locked/
+        // uncrackable title is NOT re-hammered per cell against the live drive
+        // (hard rule #2). The crack's 50k-sector budget bounds a fully-clear title,
+        // the same accepted bound the disc-wide scan uses.
+        match crate::css::crack_key_outcome(reader, &title.extents, batch_sectors, None) {
             crate::css::CrackOutcome::Cracked(state) => (
                 crate::decrypt::DecryptKeys::Css {
                     title_key: state.title_key,
                 },
                 false,
             ),
-            // No scrambled sector in THIS title's extents: it is genuinely clear.
-            // Signal `title_is_clear` so the per-title gate passes it without a
-            // key — NO FALSE E7023 for an unencrypted extra title.
-            crate::css::CrackOutcome::Unencrypted => (crate::decrypt::DecryptKeys::None, true),
-            // Scrambled sectors seen but no key recovered: a genuine hard failure.
+            // Scrambled but no key recoverable → hard failure.
             crate::css::CrackOutcome::ScrambledUncracked => {
                 (crate::decrypt::DecryptKeys::None, false)
             }
+            // No scrambled sector anywhere in the whole title → genuinely clear.
+            crate::css::CrackOutcome::Unencrypted => (crate::decrypt::DecryptKeys::None, true),
         }
     }
 
@@ -2694,6 +2708,25 @@ impl Disc {
         // disc-wide `css_error` is deliberately NOT consulted here: it reflects
         // the MAIN feature's crack, not this clear extra title.
         if title_is_clear && !keys.is_encrypted() {
+            return Ok(());
+        }
+        // A DVD title that cracked to no key and is NOT clear is scrambled-but-
+        // uncrackable (`decrypt_keys_for_title` → `ScrambledUncracked`). Hard-fail
+        // here directly: `ensure_decryptable_keys` gates CSS on `self.css.is_some()`
+        // (the scan's disc-wide detection), which can be `None` when that up-front
+        // detection missed — exactly the case the per-title crack exists to catch.
+        // Without this, an uncrackable DVD title would fall through to `Ok` and mux
+        // scrambled sectors as corrupt PES at exit 0.
+        if self.format == DiscFormat::Dvd && !title_is_clear && !keys.is_encrypted() {
+            return Err(Error::CssKeyMissing);
+        }
+        // A usable per-title key was resolved (a freshly-cracked CSS key, or AACS
+        // unit keys) — the title IS decryptable, so pass it WITHOUT consulting the
+        // disc-wide gate. `ensure_decryptable_keys` hard-fails on `self.css_error`
+        // unconditionally, which reflects the MAIN feature's crack: a bonus title
+        // in a different VTS that just cracked its own key must not be blocked by
+        // the main title having failed.
+        if keys.is_encrypted() {
             return Ok(());
         }
         self.ensure_decryptable_keys(raw, keys)
@@ -5169,6 +5202,8 @@ mod tests {
     /// `[main_lba, main_end)`, plus a clear stub title living in a DISJOINT VTS.
     fn css_disc_with_clear_stub() -> (Disc, usize) {
         let mut disc = make_test_disc(100_000, "DVD");
+        disc.format = DiscFormat::Dvd; // make_test_disc defaults to Uhd
+        disc.content_format = ContentFormat::MpegPs;
         disc.encrypted = true;
         disc.css = Some(crate::css::CssState {
             title_key: [0u8; 5],
@@ -5190,29 +5225,31 @@ mod tests {
         (disc, 1) // stub is title index 1
     }
 
-    /// THE Fix 2/3 regression: on a multi-VTS CSS DVD, a genuinely-clear extra
-    /// title (an unencrypted menu stub in its own VTS) must resolve to
-    /// `title_is_clear = true` with `None` keys, and `ensure_title_decryptable`
-    /// must PASS it — no false E7023. The old `decrypt_keys_for_title` +
-    /// `ensure_decryptable_keys` pair raised CssKeyMissing here because the
-    /// re-crack of the clear stub returned `None`, indistinguishable from a
-    /// scrambled-uncracked title.
+    /// A genuinely-clear extra title (an unencrypted menu stub in its own VTS)
+    /// on a CSS DVD must mux without a false E7023. The stub lives in a DISJOINT
+    /// VTS (its extents don't overlap the scan's `crack_span`), so
+    /// `decrypt_keys_for_title` takes the crack path over the stub's own extents;
+    /// the reader serves only clear sectors, so the crack returns `Unencrypted`
+    /// → `(None, title_is_clear=true)`. The gate must then PASS the title with no
+    /// key — no false E7023.
     #[test]
     fn clear_stub_title_on_css_disc_is_not_a_key_failure() {
         let (disc, stub_idx) = css_disc_with_clear_stub();
+        assert_eq!(
+            disc.format,
+            DiscFormat::Dvd,
+            "fixture must exercise the DVD path"
+        );
         let mut reader = ClearStubReader {
             clear_range: (0, 100_000),
         };
         let (keys, title_is_clear) = disc.decrypt_keys_for_title(stub_idx, &mut reader, 8);
         assert!(
-            !keys.is_encrypted(),
-            "a clear stub needs no key (got encrypted keys)"
+            matches!(keys, crate::decrypt::DecryptKeys::None),
+            "a clear stub in a disjoint VTS cracks to no key"
         );
-        assert!(
-            title_is_clear,
-            "the stub's own extents show no scrambling → title_is_clear must be true"
-        );
-        // The gate must PASS the clear stub — NO false E7023.
+        assert!(title_is_clear, "the stub's own extents show no scrambling");
+        // The gate must PASS a clear title — NO false E7023.
         assert!(
             disc.ensure_title_decryptable(false, &keys, title_is_clear)
                 .is_ok(),
@@ -5617,53 +5654,333 @@ mod tests {
         disc
     }
 
-    /// Regression (multi-VTS CSS): a title that OVERLAPS the cracked span is
-    /// the same VTS — the existing key is reused and the reader is NOT touched.
+    /// Build a Stevenson-crackable scrambled CSS sector (a periodic run in the
+    /// clear header continuing past 0x80), mirroring the css-module fixture.
+    fn crackable_css_sector(title_key: &[u8; 5]) -> [u8; 2048] {
+        const RUN_START: usize = 0x59;
+        const PERIOD: usize = 8;
+        let mut sec = [0u8; 2048];
+        sec[0x00..0x04].copy_from_slice(&crate::css::PACK_START);
+        sec[0x14] = 0x10; // scramble flag
+        for (i, b) in sec.iter_mut().enumerate().skip(RUN_START) {
+            *b = (0xA0u8.wrapping_add((i % PERIOD) as u8)) ^ 0x5A;
+        }
+        crate::css::lfsr::scramble_sector(title_key, &mut sec);
+        sec
+    }
+
+    /// A reader that serves crackable CSS sectors for LBAs in `scrambled`
+    /// (half-open), all-zero (clear) elsewhere — records every LBA read.
+    struct CssMapReader {
+        key: [u8; 5],
+        scrambled: (u32, u32),
+        reads: std::cell::RefCell<Vec<u32>>,
+    }
+    impl SectorSource for CssMapReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            self.reads.borrow_mut().push(lba);
+            let n = (count as usize * 2048).min(buf.len());
+            for s in 0..(n / 2048) {
+                let this = lba + s as u32;
+                let dst = &mut buf[s * 2048..(s + 1) * 2048];
+                if this >= self.scrambled.0 && this < self.scrambled.1 {
+                    dst.copy_from_slice(&crackable_css_sector(&self.key));
+                } else {
+                    dst.fill(0);
+                }
+            }
+            Ok(n)
+        }
+    }
+
+    fn css_dvd_with_extents(extents: Vec<Extent>) -> Disc {
+        let mut disc = make_test_disc(200_000, "DVD");
+        disc.format = DiscFormat::Dvd;
+        disc.content_format = ContentFormat::MpegPs;
+        disc.encrypted = true;
+        let mut t = title_with_video(Codec::Mpeg2, Resolution::R480p);
+        t.extents = extents;
+        disc.titles = vec![t];
+        disc
+    }
+
+    /// `decrypt_keys_for_title` cracks a scrambled DVD title's key from the
+    /// title's OWN extents and hands the mux the validated key — the seed the
+    /// descramble needs, since a crib-less sector cannot self-crack and CSS leaves
+    /// the pack/PES header clear (an un-seeded mux would emit corrupt PES).
     #[test]
-    fn decrypt_keys_for_title_reuses_key_for_same_vts() {
-        let disc = css_disc_with_two_vts();
-        let mut src = RecordingSource {
+    fn decrypt_keys_for_title_cracks_the_titles_key() {
+        let key = [0x11, 0x22, 0x33, 0x44, 0x55];
+        let disc = css_dvd_with_extents(vec![Extent {
+            start_lba: 100,
+            sector_count: 64,
+        }]);
+        let mut src = CssMapReader {
+            key,
+            scrambled: (100, 164),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        match disc.decrypt_keys_for_title(0, &mut src, 16).0 {
+        let (keys, title_is_clear) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        assert!(!title_is_clear, "a scrambled title is not clear");
+        match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => {
-                assert_eq!(title_key, [0xAB; 5], "same-VTS title reuses cracked key");
+                assert_eq!(title_key, key, "must crack the title's own key")
             }
-            _ => panic!("expected Css keys for same-VTS title"),
+            _ => panic!("expected Css{{key}} for a scrambled DVD title"),
+        }
+    }
+
+    /// REGRESSION (the 1.5.1 garbage bug): the crack scans extents in PLAYBACK
+    /// ORDER, never largest-cell-first. A title whose LARGEST cell opens with a
+    /// long unscrambled run must still crack its key from the smaller,
+    /// scrambled-early cell that plays first — largest-first would exhaust the
+    /// crack budget in the clear giant and wrongly report the title unencrypted,
+    /// which the mux would pass through as scrambled garbage.
+    #[test]
+    fn decrypt_keys_for_title_scans_playback_order_not_largest_first() {
+        let key = [0xDE, 0xAD, 0xBE, 0xEF, 0x01];
+        let disc = css_dvd_with_extents(vec![
+            // Plays FIRST: small, scrambled from its start.
+            Extent {
+                start_lba: 100,
+                sector_count: 32,
+            },
+            // A CLEAR cell far larger than the crack budget (would starve a
+            // largest-first scan before it reached the scrambled cell above).
+            Extent {
+                start_lba: 10_000,
+                sector_count: 100_000,
+            },
+        ]);
+        let mut src = CssMapReader {
+            key,
+            scrambled: (100, 132),
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+        let (keys, _) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        match keys {
+            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
+                title_key, key,
+                "must crack from the scrambled cell that plays first, not miss it behind the clear giant"
+            ),
+            _ => panic!("largest-first regression: the title was read as unencrypted"),
         }
         assert!(
-            src.reads.borrow().is_empty(),
-            "an overlapping title must not trigger a re-crack read"
+            src.reads.borrow().iter().all(|&l| l < 10_000),
+            "the key is found in the first (scrambled) cell — the clear giant must never be scanned: {:?}",
+            src.reads.borrow()
         );
     }
 
-    /// Regression (multi-VTS CSS): a title in a DIFFERENT VTS (no overlap with
-    /// the cracked span) must re-crack from its OWN extents — verified by the
-    /// reader being driven over that title's LBA range (5000..). The fixture
-    /// yields unscrambled sectors so the re-crack finds NO key; the fix
-    /// requires this to be a HARD failure (`DecryptKeys::None`), NOT a silent
-    /// fall-back to the known-wrong-VTS disc-wide key (which would descramble
-    /// to garbage). Both the read-attempt and the None result are asserted.
+    /// A reader whose every read is CSS-locked (`05/6F/03`) — a genuinely
+    /// encrypted DVD whose sectors can't be authenticated/cracked.
+    struct LockedReader;
+    impl SectorSource for LockedReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            Err(Error::DiscRead {
+                sector: lba as u64,
+                status: Some(2),
+                sense: Some(crate::scsi::ScsiSense {
+                    sense_key: 0x05,
+                    asc: 0x6F,
+                    ascq: 0x03,
+                }),
+            })
+        }
+    }
+
+    /// End-to-end: a scrambled-but-uncrackable DVD title with NO up-front
+    /// detection (`self.css == None`) drives `decrypt_keys_for_title` to
+    /// `(None, false)`, and the gate MUST hard-fail (CssKeyMissing) rather than
+    /// pass it to the muxer — the silent-garbage case the per-title crack catches.
     #[test]
-    fn decrypt_keys_for_title_recracks_for_other_vts() {
-        let disc = css_disc_with_two_vts();
+    fn decrypt_keys_for_title_scrambled_uncracked_dvd_hard_fails_even_without_detection() {
+        let disc = css_dvd_with_extents(vec![Extent {
+            start_lba: 100,
+            sector_count: 8,
+        }]);
+        assert!(disc.css.is_none(), "fixture: no up-front detection");
+        let mut reader = LockedReader;
+        let (keys, title_is_clear) = disc.decrypt_keys_for_title(0, &mut reader, 8);
+        assert!(
+            matches!(keys, crate::decrypt::DecryptKeys::None) && !title_is_clear,
+            "a locked/uncrackable scrambled title resolves to (None, false)"
+        );
+        let err = disc
+            .ensure_title_decryptable(false, &keys, title_is_clear)
+            .expect_err("scrambled-uncracked DVD title must hard-fail without detection");
+        assert_eq!(err.code(), crate::error::Error::CssKeyMissing.code());
+    }
+
+    /// Fast path: when the scan already cracked a key whose `crack_span` COVERS
+    /// this title's VTS, `decrypt_keys_for_title` reuses it and never touches the
+    /// reader (no redundant crack, no second bus-auth on a live drive).
+    #[test]
+    fn decrypt_keys_for_title_reuses_covered_scan_key_without_reading() {
+        let disc = css_disc_with_two_vts(); // css=[0xAB;5], crack_span=(100,200)
         let mut src = RecordingSource {
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let keys = disc.decrypt_keys_for_title(1, &mut src, 16).0;
+        // Title 0's extents (100..200) overlap the cracked span → reuse.
+        let (keys, clear) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        assert!(!clear);
+        match keys {
+            crate::decrypt::DecryptKeys::Css { title_key } => {
+                assert_eq!(title_key, [0xAB; 5], "reuse the scan's cracked key")
+            }
+            _ => panic!("expected the reused Css key"),
+        }
         assert!(
-            matches!(keys, crate::decrypt::DecryptKeys::None),
-            "a re-crack miss in a provably-different VTS must be a hard failure (None), \
-             not the wrong-VTS disc-wide key"
+            src.reads.borrow().is_empty(),
+            "a covered title must NOT re-read/re-crack: {:?}",
+            src.reads.borrow()
         );
-        let reads = src.reads.borrow();
+    }
+
+    /// A title in a DIFFERENT VTS (extents disjoint from `crack_span`) does NOT
+    /// reuse the scan key — it cracks its own key from its own extents.
+    #[test]
+    fn decrypt_keys_for_title_cracks_other_vts_on_no_overlap() {
+        let key = [0x77, 0x66, 0x55, 0x44, 0x33];
+        let disc = css_disc_with_two_vts(); // title 1 lives at 5000.., span=(100,200)
+        let mut src = CssMapReader {
+            key,
+            scrambled: (5000, 5100),
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+        let (keys, _) = disc.decrypt_keys_for_title(1, &mut src, 16);
+        match keys {
+            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
+                title_key, key,
+                "a disjoint-VTS title cracks its OWN key, not the reused scan key"
+            ),
+            _ => panic!("expected a freshly-cracked Css key for the other VTS"),
+        }
         assert!(
-            !reads.is_empty(),
-            "a non-overlapping title must trigger a re-crack read"
+            src.reads.borrow().iter().all(|&l| l >= 5000),
+            "must crack from title 1's own extents (>=5000): {:?}",
+            src.reads.borrow()
+        );
+    }
+
+    /// A title whose (realistic) clear front matter — studio logo / rating card —
+    /// plays FIRST, then the scrambled feature, still cracks: the single
+    /// playback-order scan reads through the small clear prefix and reaches the
+    /// scrambled body within its budget. (A clear prefix LARGER than the ~100 MB
+    /// crack budget would starve — the accepted bounded-budget limit, identical to
+    /// the disc-wide scan; not producible by real DVD front matter.)
+    #[test]
+    fn decrypt_keys_for_title_cracks_feature_after_clear_front_matter() {
+        let key = [0xCA, 0xFE, 0xBA, 0xBE, 0x02];
+        // css=None so the crack path runs. ~10 MB of clear front matter plays
+        // first (well under the crack budget), then the scrambled feature.
+        let disc = css_dvd_with_extents(vec![
+            Extent {
+                start_lba: 10_000,
+                sector_count: 5_000,
+            }, // clear front matter (~10 MB), plays first
+            Extent {
+                start_lba: 100,
+                sector_count: 2_000,
+            }, // scrambled feature body
+        ]);
+        let mut src = CssMapReader {
+            key,
+            scrambled: (100, 2_100),
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+        let (keys, _) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        match keys {
+            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
+                title_key, key,
+                "must crack the scrambled feature after reading through clear front matter"
+            ),
+            _ => panic!("clear front matter wrongly starved the crack"),
+        }
+    }
+
+    /// Scrambling that begins well INTO a cell (after a clear prefix), not at its
+    /// start, must still be cracked: the single playback-order scan reads through
+    /// the clear prefix and reaches the scrambled body within its budget — never a
+    /// silent "clear" verdict that would mux the scrambled tail as corrupt PES.
+    #[test]
+    fn decrypt_keys_for_title_cracks_scrambling_after_a_clear_prefix_in_one_cell() {
+        let key = [0x0D, 0xEE, 0x40, 0x00, 0x05];
+        // One cell: clear for the first 9000 sectors, then scrambled (well within
+        // the crack budget). css=None so the crack path runs.
+        let disc = css_dvd_with_extents(vec![Extent {
+            start_lba: 100,
+            sector_count: 20_000,
+        }]);
+        let mut src = CssMapReader {
+            key,
+            scrambled: (100 + 9_000, 100 + 20_000),
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+        let (keys, _) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        match keys {
+            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
+                title_key, key,
+                "the scan must crack scrambling that starts past a clear prefix"
+            ),
+            _ => panic!("in-cell-deep scrambling was misread as clear (silent-garbage direction)"),
+        }
+    }
+
+    /// A DVD title with EMPTY extents (an angle/PGC placeholder with no cells)
+    /// resolves to `(decrypt_keys(), true)` — clear, no key needed — and the gate
+    /// must PASS it. Returning `false` here would trip the DVD scrambled-uncracked
+    /// rule and wrongly hard-fail a genuinely-clear empty title.
+    #[test]
+    fn decrypt_keys_for_title_empty_extents_is_clear_not_hard_fail() {
+        let mut disc = css_dvd_with_extents(vec![Extent {
+            start_lba: 100,
+            sector_count: 8,
+        }]);
+        disc.titles
+            .push(title_with_video(Codec::Mpeg2, Resolution::R480p)); // idx 1: no extents
+        let mut reader = LockedReader;
+        let (keys, title_is_clear) = disc.decrypt_keys_for_title(1, &mut reader, 8);
+        assert!(
+            title_is_clear,
+            "an empty-extents title is clear (nothing to descramble)"
         );
         assert!(
-            reads.iter().all(|&lba| lba >= 5000),
-            "re-crack must read title 1's own extents (>=5000), got {reads:?}"
+            disc.ensure_title_decryptable(false, &keys, title_is_clear)
+                .is_ok(),
+            "an empty-extents DVD title must not hard-fail"
+        );
+    }
+
+    /// A bonus title that cracked its OWN valid key must NOT be blocked by the
+    /// disc-wide `css_error` set when the MAIN feature's scan failed. A usable
+    /// per-title key means the title is decryptable regardless of another title's
+    /// failure. (Regression for the audit r5 css_error-over-valid-key finding.)
+    #[test]
+    fn ensure_title_decryptable_valid_key_ignores_disc_wide_css_error() {
+        let mut disc = css_dvd_with_extents(vec![Extent {
+            start_lba: 100,
+            sector_count: 8,
+        }]);
+        disc.css_error = Some(crate::error::Error::CssKeyMissing); // main feature failed
+        let keys = crate::decrypt::DecryptKeys::Css {
+            title_key: [0x42; 5], // this bonus title cracked its own key
+        };
+        assert!(
+            disc.ensure_title_decryptable(false, &keys, false).is_ok(),
+            "a title with its own valid CSS key must pass despite disc-wide css_error"
         );
     }
 

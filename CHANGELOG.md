@@ -1,6 +1,30 @@
 # Changelog
 
-## [1.5.1] — UNRELEASED
+## [1.5.2] — UNRELEASED
+
+### Fixed
+
+- **A CSS DVD whose main title opens with a long unscrambled run no longer
+  produces a silent garbage MKV.** The mux resolved a DVD's descramble key from
+  an up-front detection pass that scanned the title's largest cell first and gave
+  up after a fixed budget; a feature cell that begins with a long clear stretch
+  (well over that budget) was read as "unencrypted", so the muxer passed the
+  still-scrambled sectors through as plaintext and exited 0 with corrupt video.
+  A DVD now always muxes through the self-contained CSS descramble path, which
+  checks each sector's own scramble flag and re-cracks the per-region title key
+  from the data itself — no up-front key, no detection gate. A clear DVD is a
+  per-sector no-op; an encrypted one self-recovers, including across VOB/VTS key
+  changes; a detection miss can no longer route scrambled data to the muxer.
+
+### Changed
+
+- The per-rip unlocker report renames the DVD entry **CSS → DVD** and now
+  reflects the bus-auth that actually ran (it engages on any DVD to clear the
+  drive's scrambled-read barrier), rather than whether a title-key crack happened
+  to succeed. An encrypted DVD that reads and muxes fine previously showed
+  `CSS: no`; it now correctly shows `DVD: yes`.
+
+## [1.5.1] — 2026-07-20
 
 ### Fixed
 
