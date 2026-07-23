@@ -106,6 +106,23 @@ pub fn aacs_unit_encrypted(unit: &[u8], format: crate::disc::ContentFormat) -> b
     }
 }
 
+/// The AACS encrypted flag from an aligned unit's CLEAR seed, readable even on a
+/// trailing PARTIAL unit (unlike [`aacs_unit_encrypted`], which requires a whole
+/// 6144-byte unit). The flag lives at a fixed low offset in the clear header, so a
+/// fragment that still contains that byte can be classified. Used to catch an
+/// encrypted unit truncated across a buffer/extent boundary — a fragment we cannot
+/// CBC-decrypt and must not emit as clear. `false` for a slice too short to hold
+/// the flag byte. Same clip-anchored-read caveat as [`aacs_unit_encrypted`].
+pub fn aacs_unit_seed_encrypted(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
+    use crate::disc::ContentFormat;
+    match format {
+        ContentFormat::BdTs => unit.first().is_some_and(|b| b & 0xC0 != 0),
+        ContentFormat::MpegPs => unit
+            .get(PS_SCRAMBLE_OFF)
+            .is_some_and(|b| b & PS_SCRAMBLE_MASK != 0),
+    }
+}
+
 /// True when an aligned unit is flagged encrypted AND still looks scrambled
 /// (structure not yet restored) — i.e. genuine encrypted content NOT yet decrypted.
 ///
