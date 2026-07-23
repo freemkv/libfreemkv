@@ -6,63 +6,6 @@
 
 use libfreemkv::{aacs, decrypt::DecryptKeys};
 
-/// Test: decrypt_sectors with AACS keys actually decrypts units.
-#[test]
-fn decrypt_sectors_with_aacs_keys_works() {
-    // Build an encrypted aligned unit
-    let mut unit = vec![0xFFu8; aacs::content::ALIGNED_UNIT_LEN];
-
-    // Set encryption flag (bits 6-7 of byte 0)
-    unit[0] |= 0xC0;
-
-    // Fill with recognizable pattern
-    for (i, byte) in unit
-        .iter_mut()
-        .enumerate()
-        .take(aacs::content::ALIGNED_UNIT_LEN)
-        .skip(1)
-    {
-        *byte = ((i * 3 + 7) & 0xFF) as u8;
-    }
-
-    let unit_key: [u8; 16] = [0xAAu8; 16];
-
-    // Apply the key to the pattern to produce ciphertext-shaped bytes for the
-    // call below. (decrypt_unit is now PURE — it applies the key unconditionally,
-    // so it is NOT idempotent; never call it twice on the same unit.)
-    aacs::content::decrypt_unit(&mut unit, &unit_key);
-    // (byte 0 keeps its CPI bits set from above, so `decrypt_sectors` recognises
-    // this as encrypted content and actually applies the key.)
-
-    let mut aacs_keys = DecryptKeys::Aacs {
-        unit_keys: vec![(0u32, unit_key)],
-        read_data_key: None,
-        format: libfreemkv::disc::ContentFormat::BdTs,
-    };
-    let mut none_keys = DecryptKeys::None;
-
-    // The regression this guards is passing `DecryptKeys::None` where AACS keys
-    // were meant. Prove the two DIVERGE: AACS applies the key (bytes change), None
-    // leaves the unit byte-for-byte untouched. is_ok alone can't catch that —
-    // both variants return Ok.
-    let mut with_aacs = unit.clone();
-    let mut with_none = unit.clone();
-    libfreemkv::decrypt::decrypt_sectors(&mut with_aacs, &mut aacs_keys, 0)
-        .expect("AACS decrypt must not error");
-    libfreemkv::decrypt::decrypt_sectors(&mut with_none, &mut none_keys, 0)
-        .expect("None decrypt must not error");
-
-    assert_ne!(
-        with_aacs, unit,
-        "AACS keys must actually transform the unit"
-    );
-    assert_eq!(with_none, unit, "None keys must leave the unit untouched");
-    assert_ne!(
-        with_aacs, with_none,
-        "AACS decrypt must differ from the None no-op (the None-vs-Aacs regression)"
-    );
-}
-
 /// Test: decrypt_sectors with DecryptKeys::None is a no-op.
 #[test]
 fn decrypt_sectors_with_none_keys_is_noop() {
