@@ -111,12 +111,6 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     ///
     /// [`set_unit_base`]: Self::set_unit_base
     unit_base: u32,
-    /// The miss policy (see [`crate::sector::recovery::Recover`]) — a generic,
-    /// scheme-neutral recovery the input stream (L3) installs and this decorator
-    /// (L2) executes at the one seam when a content unit will not decrypt. `None`
-    /// = no recovery (a miss is loss). Installed via
-    /// [`with_key_fetch`](Self::with_key_fetch).
-    recovery: Option<crate::sector::recovery::Recover>,
     /// Encrypted-content extent map — the disc's m2ts ranges as sorted/merged
     /// `(start_lba, sector_count)` (see
     /// [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)).
@@ -126,19 +120,12 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// reads encrypted content" (the mux reads title extents only) → every unit
     /// is treated as content (the legacy behaviour).
     content_ranges: Option<Arc<[(u32, u32)]>>,
-    /// Reused scratch holding the pre-decrypt on-disc ciphertext for the
-    /// key-fetch retry. Only touched when `recovery` is installed; kept on the
-    /// struct (rather than a per-read `Vec`) so the mux hot path — 16 MiB
-    /// batches at highway speed, now that the mux installs a key-fetch for
-    /// multi-CPS — reuses one allocation instead of alloc/free-ing every read.
-    cipher_scratch: Vec<u8>,
     /// Proactive AACS key map (see [`crate::decrypt::AacsKeyMap`]). When set, the
-    /// mux resolved one key per CPS unit / segment UP FRONT, so this read decrypts
-    /// each aligned unit with its MAPPED key and TRUSTS it — no per-unit
-    /// `is_clean` verdict, no reactive key-fetch, no key-server storm. `None`
-    /// keeps the legacy trial-and-recover path (sweep / patch, or a mux that did
-    /// not build a map). Mutually exclusive with `recovery` in practice: the mux
-    /// installs one or the other.
+    /// caller resolved one key per CPS unit / segment UP FRONT, so this read
+    /// decrypts each aligned unit with its MAPPED key and TRUSTS it — no per-unit
+    /// `is_clean` verdict, no key-server storm. `None` is a clear / CSS source
+    /// (CSS self-descrambles in `decrypt_sectors`); an AACS source without a map
+    /// is a bug and fails loud on the first unit (AACS decrypts only via the map).
     key_map: Option<Arc<crate::decrypt::AacsKeyMap>>,
 }
 
@@ -154,22 +141,15 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             keys,
             unit_key_idx: 0,
             unit_base: 0,
-            // No recovery by default. CSS self-decrypts in `decrypt_sectors`
-            // (needs no external input); AACS installs a key-fetch via
-            // `with_key_fetch`.
-            recovery: None,
             content_ranges: None,
-            cipher_scratch: Vec::new(),
             key_map: None,
         }
     }
 
-    /// Install a proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap): the mux
+    /// Install a proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap): the caller
     /// resolved one key per CPS unit / segment up front, so every aligned unit is
-    /// decrypted with its MAPPED key and trusted — no per-unit `is_clean` check,
-    /// no reactive key-fetch. This is the storm-free mux path; it supersedes
-    /// [`with_key_fetch`](Self::with_key_fetch) (do not set both). AACS-only; a
-    /// CSS / clear disc ignores it.
+    /// decrypted with its MAPPED key and trusted — no per-unit `is_clean` check.
+    /// AACS-only; a CSS / clear disc ignores it.
     pub fn with_key_map(mut self, map: Arc<crate::decrypt::AacsKeyMap>) -> Self {
         self.key_map = Some(map);
         self
@@ -199,16 +179,6 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// [`DecryptKeys::Aacs`]; other variants ignore it.
     pub fn with_unit_key_idx(mut self, idx: usize) -> Self {
         self.unit_key_idx = idx;
-        self
-    }
-
-    /// Install a [`KeyFetch`] callback: when a read holds scrambled AACS units
-    /// that no current key decrypts, the decorator hands those units to `cb` and
-    /// adds any keys it returns to the pool, then re-decrypts. Only meaningful
-    /// for [`DecryptKeys::Aacs`]; ignored otherwise. The library makes no network
-    /// call — `cb` is the application's seam to its key source.
-    pub fn with_key_fetch(mut self, cb: KeyFetch) -> Self {
-        self.recovery = Some(crate::sector::recovery::key_fetch(cb));
         self
     }
 
@@ -325,54 +295,20 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         // sectors are marked by physical read success, not by TS structure.)
         let content = self.content_ranges.clone(); // cheap Arc bump; frees the &self borrow
         let content_ref = content.as_deref();
-        let unit_key_idx = self.unit_key_idx;
 
-        let dropped = Self::decrypt_buf(
+        // No map installed → CSS self-descramble / clear pass-through. A genuine
+        // can't-decrypt (misaligned unit, or an AACS source reaching here without
+        // a map — a bug, since AACS decrypts only via the mapped path) surfaces as
+        // `Err` and propagates; otherwise every unit gets its key applied and the
+        // bytes pass through — a unit that decrypts to broken TS is the consumer's
+        // concern (the muxer drops it), never a read failure.
+        Self::decrypt_buf(
             &mut buf[..n],
             &mut self.keys,
             self.unit_key_idx,
             lba,
             content_ref,
         )?;
-
-        // FRESH-KEY-ON-FAILURE: hand a unit no held key opened (as its on-disc
-        // ciphertext) to the application's key source; any returned key is added to
-        // the pool and the read is re-decrypted, caching the key for later units.
-        // If the source is asked for this exact ciphertext and STILL cannot supply a
-        // key (the recovery's residual `dropped > 0`), the unit is genuinely
-        // unresolvable — this decrypting sweep/patch path FAILS LOUD rather than
-        // write the still-encrypted bytes into the output as if they were clear
-        // content (the mux path fails loud the same way via `decrypt_sectors_mapped`).
-        if dropped > 0 && self.recovery.is_some() {
-            // Rare miss only: the in-place decrypt overwrote `buf`, so RE-READ the
-            // on-disc ciphertext for the key-fetch retry. This keeps the happy path
-            // zero-copy — the common single-CPS mux batch (dropped == 0) never
-            // captures or copies; a genuine miss pays one re-read into the reused
-            // `cipher_scratch`.
-            self.cipher_scratch.resize(n, 0);
-            self.inner.read_sectors_fua(
-                lba,
-                count,
-                &mut self.cipher_scratch[..n],
-                recovery,
-                fua,
-            )?;
-            let rctx = crate::sector::recovery::RecoverCtx {
-                unit_key_idx,
-                lba,
-                content: content.clone(),
-                prev_dropped: dropped,
-            };
-            let r = self
-                .recovery
-                .as_mut()
-                .expect("recovery.is_some() checked above");
-            let cipher = &self.cipher_scratch[..n];
-            let outcome = r(&mut buf[..n], cipher, &mut self.keys, &rctx);
-            if outcome.dropped > 0 {
-                return Err(crate::error::Error::DecryptFailed);
-            }
-        }
         Ok(n)
     }
 

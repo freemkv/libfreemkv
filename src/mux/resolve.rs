@@ -439,9 +439,34 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // raw output isn't decoded anyway).
             if !opts.raw {
                 match crate::io::file_sector_source::FileSectorSource::open(path) {
-                    Ok(probe) => {
-                        let mut dec =
-                            crate::sector::DecryptingSectorSource::new(probe, keys.clone());
+                    Ok(mut probe) => {
+                        // The probe DECRYPTS the title head, so it needs the SAME
+                        // up-front key map the mux read installs below. An AACS
+                        // `DecryptingSectorSource` with no map fails loud on the
+                        // first unit (`decrypt_sectors_mapped` is the only AACS
+                        // decrypt path) — without resolving one here the correction
+                        // is silently skipped on every AACS disc and 7.1/Atmos stays
+                        // understated as the MPLS-declared 5.1. Resolution failure is
+                        // non-fatal (`.ok()`): leave channels uncorrected, never
+                        // fail the mux.
+                        let mut probe_keys = keys.clone();
+                        let probe_title = disc.titles[idx].clone();
+                        let probe_map = match &probe_keys {
+                            crate::decrypt::DecryptKeys::Aacs { .. } => resolve_mux_key_map(
+                                &mut probe,
+                                &probe_title,
+                                &mut probe_keys,
+                                opts.key_fetch.as_ref(),
+                                disc.content_format,
+                            )
+                            .ok()
+                            .map(std::sync::Arc::new),
+                            _ => None,
+                        };
+                        let mut dec = crate::sector::DecryptingSectorSource::new(probe, probe_keys);
+                        if let Some(map) = probe_map {
+                            dec = dec.with_key_map(map);
+                        }
                         crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]);
                     }
                     Err(e) => {
