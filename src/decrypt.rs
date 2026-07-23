@@ -704,30 +704,51 @@ mod tests {
         );
     }
 
-    /// Whole leading units plus a SCRAMBLED trailing partial (the malformed
-    /// danger case): an encrypted unit split across an extent boundary cannot be
-    /// decrypted standalone. Passing it through as clear would be silent
-    /// corruption, so we must fail loud with `DecryptFailed`.
+    /// Whole leading unit plus a SCRAMBLED trailing partial that is FLAGGED
+    /// encrypted in its clear seed (the malformed danger case): an encrypted unit
+    /// split across an extent boundary cannot be CBC-decrypted standalone. The
+    /// mapped decrypt must fail loud with `DecryptFailed` rather than emit the
+    /// ciphertext partial as clear. Exercises the real shipping path
+    /// (`decrypt_sectors_mapped`) and its trailing-partial guard.
     #[test]
     fn aacs_scrambled_trailing_partial_is_rejected() {
-        let mut keys = DecryptKeys::Aacs {
+        let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
-        // One full unit + a 4096-byte (two-sector) SCRAMBLED tail.
-        let unit = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
-        let tail = scrambled_region(4096);
-        let mut buf = unit;
+        // One CLEAR leading unit (passes through) + a 4096-byte (two-sector) tail
+        // whose seed byte flags it encrypted, inside the mapped range.
+        let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
+        let mut tail = scrambled_region(4096);
+        tail[0] |= 0xC0; // CPI bits → flagged encrypted on the partial
         buf.extend_from_slice(&tail);
 
-        let err = decrypt_sectors(&mut buf, &mut keys, 0)
-            .expect_err("scrambled trailing partial must be rejected");
+        let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
+        let err = decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
+            .expect_err("scrambled encrypted trailing partial must be rejected");
         assert_eq!(
             err.code(),
             crate::error::Error::DecryptFailed.code(),
             "scrambled trailing partial must fail with DecryptFailed"
         );
+    }
+
+    /// A CLEAR trailing partial (encrypted flag NOT set) is a legitimate content
+    /// tail and must pass through, never trip the guard above.
+    #[test]
+    fn aacs_clear_trailing_partial_passes_through() {
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
+        let mut tail = clear_ts_region(4096);
+        tail[0] &= 0x3F; // ensure the CPI bits are clear
+        buf.extend_from_slice(&tail);
+        let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
+        assert!(decrypt_sectors_mapped(&mut buf, &keys, 0, &map).is_ok());
     }
 
     // ── DecryptKeys::None and is_encrypted ─────────────────────────────────
@@ -960,45 +981,60 @@ mod tests {
 
     // ── AACS unit-key index selection ──────────────────────────────────────
 
-    /// AACS decrypt with an out-of-range unit_key_idx must fail loud with
-    /// DecryptFailed — never silently fall back to a wrong key or pass
-    /// encrypted data through as clear.
+    /// A map that selects a key index OUTSIDE the held pool must fail loud with
+    /// DecryptFailed — never silently apply a wrong key or pass ciphertext through.
+    /// This validates `decrypt_sectors_mapped`'s up-front `key_indices()` bounds
+    /// check (the real shipping AACS decrypt path).
     ///
-    /// Grounding: `let uk = match unit_keys.get(unit_key_idx) { Some => ...,
-    /// None => return Err(DecryptFailed) }`.
-    /// Mutation: change `unit_keys.get(unit_key_idx)` to `unit_keys.get(0)` or
-    /// `.unwrap_or` a default -> the out-of-range index would not error; this
-    /// fails.
+    /// Mutation: drop the `unit_keys.get(idx).is_none()` guard → the out-of-range
+    /// index would not error; this fails.
     #[test]
-    fn aacs_out_of_range_unit_key_idx_errors() {
+    fn aacs_mapped_out_of_range_key_idx_errors() {
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
+        let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 5)]); // idx 5, pool holds 1 key
+        let err = decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
+            .expect_err("map index 5 is out of range for a 1-key pool");
+        assert_eq!(
+            err.code(),
+            crate::error::Error::DecryptFailed.code(),
+            "out-of-range mapped key index must be DecryptFailed"
+        );
+    }
+
+    /// A non-empty map over an EMPTY unit_keys pool has no key to satisfy its
+    /// selected index → DecryptFailed (via the same bounds check).
+    #[test]
+    fn aacs_mapped_empty_unit_keys_errors() {
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
+        let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
+        let err = decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
+            .expect_err("empty unit_keys cannot satisfy map idx 0");
+        assert_eq!(err.code(), crate::error::Error::DecryptFailed.code());
+    }
+
+    /// SAFETY NET: reaching the CSS/`None` wrapper (`decrypt_sectors`) with AACS
+    /// keys means a reader was built with no map — a bug. It must fail loud, never
+    /// apply a guessed key. (AACS decrypts exclusively via `decrypt_sectors_mapped`.)
+    #[test]
+    fn aacs_via_unmapped_decrypt_sectors_fails_loud() {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
-        let err = decrypt_sectors(&mut buf, &mut keys, 5)
-            .expect_err("unit_key_idx 5 is out of range for a 1-key list");
-        assert_eq!(
-            err.code(),
-            crate::error::Error::DecryptFailed.code(),
-            "out-of-range unit key index must be DecryptFailed"
-        );
-    }
-
-    /// AACS with an empty unit_keys list and any index errors (no key to use).
-    ///
-    /// Grounding: `unit_keys.get(0)` on an empty Vec is None -> DecryptFailed.
-    /// Mutation: defaulting to [0u8;16] on None would proceed; this fails.
-    #[test]
-    fn aacs_empty_unit_keys_errors() {
-        let mut keys = DecryptKeys::Aacs {
-            unit_keys: vec![],
-            read_data_key: None,
-            format: crate::disc::ContentFormat::BdTs,
-        };
-        let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
-        let err = decrypt_sectors(&mut buf, &mut keys, 0).expect_err("empty unit_keys must error");
+        let err = decrypt_sectors(&mut buf, &mut keys, 0)
+            .expect_err("AACS through the unmapped path must fail loud");
         assert_eq!(err.code(), crate::error::Error::DecryptFailed.code());
     }
 

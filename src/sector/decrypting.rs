@@ -792,47 +792,6 @@ mod tests {
         unit
     }
 
-    /// Like [`encrypt_aacs_unit`] but knocks out the TS sync on `bad_pkts` (kept as
-    /// NON-zero content, so they read as authored-bad packets, not padding) BEFORE
-    /// encryption — a unit the correct key still OPENS on its remaining good
-    /// packets, but that carries bad-encoded content the muxer must drop.
-    fn encrypt_aacs_unit_bad(unit_key: &[u8; 16], bad_pkts: &[usize]) -> Vec<u8> {
-        use aes::Aes128;
-        use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-        let mut unit = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
-        let mut off = 4;
-        while off < unit.len() {
-            unit[off] = 0x47;
-            off += 192;
-        }
-        for &p in bad_pkts {
-            let o = p * 192;
-            unit[o + 4] = 0x00; // no TS sync after decrypt
-            unit[o + 5] = 0xAB; // non-zero payload => real content, not padding
-        }
-        unit[0] |= 0xC0;
-        let header: [u8; 16] = unit[..16].try_into().unwrap();
-        let derived = crate::aacs::crypto::aes_ecb_encrypt(unit_key, &header);
-        let mut k = [0u8; 16];
-        for i in 0..16 {
-            k[i] = derived[i] ^ header[i];
-        }
-        let cipher = Aes128::new(GenericArray::from_slice(&k));
-        let mut prev = crate::aacs::crypto::AACS_IV;
-        let blocks = (crate::aacs::content::ALIGNED_UNIT_LEN - 16) / 16;
-        for i in 0..blocks {
-            let o = 16 + i * 16;
-            for j in 0..16 {
-                unit[o + j] ^= prev[j];
-            }
-            let mut blk = GenericArray::clone_from_slice(&unit[o..o + 16]);
-            cipher.encrypt_block(&mut blk);
-            unit[o..o + 16].copy_from_slice(&blk);
-            prev.copy_from_slice(&unit[o..o + 16]);
-        }
-        unit
-    }
-
     /// `into_inner` / `inner` / `inner_mut` must hand back the original
     /// source unchanged. Grounding: the accessor methods.
     #[test]
@@ -863,22 +822,55 @@ mod tests {
         }
     }
 
-    /// A source that returns a fixed encrypted unit for ANY read — used to drive
-    /// the verify-only fetch + cache tests below.
-    struct AnyLbaUnit {
-        unit: Vec<u8>,
-    }
-    impl SectorSource for AnyLbaUnit {
-        fn read_sectors(
-            &mut self,
-            _lba: u32,
-            count: u16,
-            buf: &mut [u8],
-            _r: bool,
-        ) -> Result<usize> {
-            let b = count as usize * 2048;
-            buf[..b].copy_from_slice(&self.unit);
-            Ok(b)
+    /// END-TO-END AACS: an encrypted unit read through the decorator with a matching
+    /// [`AacsKeyMap`] comes back as the known plaintext. This is the round-trip that
+    /// was previously only asserted through the (deleted) reactive path — the actual
+    /// shipping mapped-decrypt path had no decorator-level coverage.
+    #[test]
+    fn aacs_decorator_decrypts_encrypted_unit_via_map() {
+        let key = [0x5Au8; 16];
+        let unit = encrypt_aacs_unit(&key);
+        let src = FixedUnit { unit };
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
+            0,
+            u32::MAX,
+            0,
+        )]));
+        let mut dec = DecryptingSectorSource::new(src, keys).with_key_map(map);
+        let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+        let n = dec.read_sectors(0, 3, &mut buf, false).unwrap();
+        assert_eq!(n, crate::aacs::content::ALIGNED_UNIT_LEN);
+        // Decrypted: the TS sync 0x47 reappears at the BD-TS stride (offset 4, then
+        // every 192 bytes). If the map/keys were wrong the bytes would stay
+        // ciphertext and these syncs would be absent.
+        for off in (4..crate::aacs::content::ALIGNED_UNIT_LEN).step_by(192) {
+            assert_eq!(buf[off], 0x47, "TS sync recovered at offset {off}");
         }
+    }
+
+    /// An AACS decorator built WITHOUT a key map must fail loud on the first unit —
+    /// the map is mandatory for AACS (it decrypts only via the mapped path). Guards
+    /// the class of bug the TrueHD probe shipped (a mapless AACS `DecryptingSectorSource`).
+    #[test]
+    fn aacs_decorator_without_map_fails_loud() {
+        let key = [0x5Au8; 16];
+        let unit = encrypt_aacs_unit(&key);
+        let src = FixedUnit { unit };
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let mut dec = DecryptingSectorSource::new(src, keys); // no with_key_map
+        let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+        let err = dec
+            .read_sectors(0, 3, &mut buf, false)
+            .expect_err("AACS decorator with no key map must fail loud");
+        assert_eq!(err.code(), crate::error::Error::DecryptFailed.code());
     }
 }
