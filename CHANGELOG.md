@@ -4,6 +4,26 @@
 
 ### Fixed
 
+- TrueHD 7.1/Atmos channel correction now works on AACS-encrypted (Blu-ray/UHD)
+  discs. The channel-correction probe was built without an AACS key map, so on
+  every AACS disc its first read failed and the correction was silently skipped —
+  a 7.1/Atmos TrueHD track was muxed with its MPLS-declared channel count (often
+  understated 5.1). The probe now resolves and installs the same key map the mux
+  read uses.
+- AACS 2.1 (FMTS) discs: a non-forensic title (menu/extras playlist, or any clip
+  that carries no forensic segments) no longer hard-fails the rip. `resolve_fmts_key_map`
+  now filters segments to those addressable within the title and falls back to the
+  base Unit-Key map when none apply — previously the first non-forensic title
+  aborted the whole-disc decrypt and blocked muxing any non-main title. A
+  forensic phase probe whose sampled units are all source-zero padding (an
+  even/odd tie) no longer aborts the rip either.
+- Multi-CPS AACS `dir://` extraction now decrypts each clip with its own CPS-unit
+  key instead of keying the whole disc with unit key 0 (which silently wrote
+  secondary-CPS files as garbage). A missing key fails loud at resolve. Single-CPS
+  extraction is unchanged (one key opens every unit, orphan clips included).
+- A trailing partial aligned unit that is inside a mapped range AND flagged
+  encrypted now fails loud (a CBC fragment split across a boundary cannot be
+  decrypted) instead of being emitted as ciphertext-as-clear.
 - CSS DVDs no longer mux to garbage. Every DVD read path — the file-backed mux
   highway (`build_iso_pipeline`) and the live-drive single-pass `DiscStream` —
   now resolves the per-VTS title key at read time through one shared step
