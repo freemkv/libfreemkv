@@ -8,8 +8,9 @@
 //! as a decoder-choking glitch.
 //!
 //! The DETECTION is inherently per-codec — each format carries its own
-//! authoritative corruption check (DTS: ffmpeg's core-header parse; AC-3: the
-//! header CRC; FLAC: the frame CRC-16; …). This type only carries the UNIFORM
+//! authoritative corruption check (DTS: the core sync/header parse per ETSI TS
+//! 102 114; AC-3: the header CRC per ETSI TS 102 366; FLAC: the frame CRC-16; …).
+//! This type only carries the UNIFORM
 //! response so every audio parser behaves identically:
 //!
 //! 1. **Count** kept vs dropped AUs and the dropped duration.
@@ -197,5 +198,18 @@ mod tests {
             t.record_kept();
         }
         assert!(!t.is_poisoned());
+    }
+
+    #[test]
+    fn collateral_drops_never_poison_the_track() {
+        // A TrueHD resync-forward run collaterally drops a long burst of AUs, but
+        // none are individually undecodable — the whole-track verdict must stay
+        // clean so one corruption event can't amplify into a false total loss.
+        let mut t = DropTally::new("test");
+        for _ in 0..(TRACK_VERDICT_MIN_AUS * 3) {
+            t.record_collateral_drop(0, 1000, 512, "resync-forward");
+        }
+        assert!(t.dropped_frames() >= TRACK_VERDICT_MIN_AUS, "drops counted");
+        assert!(!t.is_poisoned(), "collateral drops must not poison");
     }
 }

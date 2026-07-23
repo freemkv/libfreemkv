@@ -1,15 +1,18 @@
 //! MPEG-1/2/2.5 audio (MP1/MP2/MP3) decodability gate.
 //!
-//! ffmpeg validates MPEG-audio frames by header sanity + framing resync, not a
-//! payload CRC (`mpegaudiodecheader.c` `ff_mpa_check_header`; the optional CRC
-//! covers only side-info and is off by default). Its `ff_mpa_decode_header`
-//! additionally rejects free-format (`bitrate_index == 0`). So the gate mirrors
-//! exactly those header rejects: a packet that begins with the 11-bit MPEG-audio
-//! sync but whose version / layer / bitrate-index / sample-rate fields are the
-//! reserved/invalid values is undecodable → drop it (a silence gap; each packet
-//! keeps its own PTS). A packet with no leading sync is not a frame we can
-//! validate (raw payload / continuation), so it passes through unchanged —
-//! never false-dropped.
+//! Per ISO/IEC 11172-3 / ISO/IEC 13818-3, an MPEG-audio frame is validated by
+//! header sanity + framing resync, not a payload CRC (the optional 16-bit CRC in
+//! the header protects only the side-information and is absent unless the
+//! protection bit says otherwise). The gate mirrors that header-only check and
+//! ACCEPTS free-format (`bitrate_index == 0`) as a legal decodable mode — it
+//! deliberately does NOT apply the stricter free-format reject that a full
+//! decoder would (see the note at the `bitrate_index` check). So the gate rejects
+//! only the truly invalid headers: a packet that begins with the 11-bit
+//! MPEG-audio sync but whose version / layer / sample-rate fields (or the
+//! reserved bitrate index 15) are reserved/invalid is undecodable → drop it (a
+//! silence gap; each packet keeps its own PTS). A packet with no leading sync is
+//! not a frame we can validate (raw payload / continuation), so it passes through
+//! unchanged — never false-dropped.
 
 use super::dropgate::DropTally;
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
@@ -20,14 +23,16 @@ enum MpaVerdict {
     NoSync,
     /// Sync present and every field is legal — decodable.
     Valid,
-    /// Sync present but a field is reserved/invalid (or free-format) — ffmpeg's
-    /// parser rejects this exactly.
+    /// Sync present but a field is reserved/invalid — a conformant header parser
+    /// rejects this exactly.
     Invalid,
 }
 
-/// Mirror ffmpeg's `ff_mpa_check_header` + the `ff_mpa_decode_header`
-/// free-format reject. A dropped MPEG-audio frame has a corrupt header, so no
-/// duration is computed (the fields it would come from are the invalid ones).
+/// Header-only validity check per ISO/IEC 11172-3 / ISO/IEC 13818-3 (which
+/// ACCEPTS free-format, `bitrate_index == 0`) — deliberately NOT the stricter
+/// free-format reject a full decoder applies. A dropped MPEG-audio frame has a
+/// corrupt header, so no duration is computed (the fields it would come from are
+/// the invalid ones).
 fn mpa_verdict(data: &[u8]) -> MpaVerdict {
     if data.len() < 4 {
         return MpaVerdict::NoSync;
@@ -37,8 +42,8 @@ fn mpa_verdict(data: &[u8]) -> MpaVerdict {
     if (h & 0xffe0_0000) != 0xffe0_0000 {
         return MpaVerdict::NoSync;
     }
-    // ff_mpa_check_header rejects: version field 01, layer field 00,
-    // bitrate_index 15, sample-rate field 3.
+    // Reject per spec: version field 01, layer field 00, bitrate_index 15,
+    // sample-rate field 3.
     if (h & (3 << 19)) == (1 << 19)
         || (h & (3 << 17)) == 0
         || (h & (0xf << 12)) == (0xf << 12)
@@ -47,14 +52,17 @@ fn mpa_verdict(data: &[u8]) -> MpaVerdict {
         return MpaVerdict::Invalid;
     }
     // NOTE: bitrate_index == 0 (free format) is NOT rejected. It is a legal,
-    // decodable MPEG-audio mode (ffmpeg's ff_mpa_check_header accepts it and the
-    // decoder derives the frame size from the sync spacing). Dropping it would be
-    // a false positive on a clean stream, so it passes the gate.
+    // decodable MPEG-audio mode (the spec permits it and a decoder derives the
+    // frame size from the sync spacing). Dropping it would be a false positive on
+    // a clean stream, so it passes the gate.
     MpaVerdict::Valid
 }
 
 pub struct MpegAudioParser {
     tally: DropTally,
+    /// Last emitted PTS (ns), carried forward across a PES with no PTS rather than
+    /// resetting the timeline to 0 (see the AC-3/DTS parsers) — preserves A/V sync.
+    last_pts_ns: i64,
 }
 
 impl Default for MpegAudioParser {
@@ -67,6 +75,7 @@ impl MpegAudioParser {
     pub fn new() -> Self {
         Self {
             tally: DropTally::new("mpegaudio"),
+            last_pts_ns: 0,
         }
     }
 
@@ -84,7 +93,12 @@ impl CodecParser for MpegAudioParser {
         if pes.data.is_empty() {
             return Vec::new();
         }
-        let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
+        let pts_ns = pes
+            .pts
+            .or(pes.dts)
+            .map(pts_to_ns)
+            .unwrap_or(self.last_pts_ns);
+        self.last_pts_ns = pts_ns;
 
         let drop =
             self.tally.is_poisoned() || matches!(mpa_verdict(&pes.data), MpaVerdict::Invalid);
@@ -154,8 +168,20 @@ mod tests {
     }
 
     #[test]
+    fn reserved_version_field_is_dropped() {
+        // version field = 01 (reserved) → rejected. byte1 = 111_01_01_1 = 0xEB
+        // keeps the 11-bit sync (0xFF + top 3 bits 111) but sets version bits to 01.
+        let mut p = MpegAudioParser::new();
+        let mut frame = mp3_frame(400);
+        frame[1] = 0xEB;
+        let f = p.parse(&make_pes(frame, Some(90000)));
+        assert!(f.is_empty(), "reserved version dropped");
+        assert_eq!(p.dropped_frames(), 1);
+    }
+
+    #[test]
     fn reserved_sample_rate_is_dropped() {
-        // Sync present but sample-rate field = 3 (reserved) → ffmpeg rejects.
+        // Sync present but sample-rate field = 3 (reserved) → rejected per spec.
         // 0xFF 0xFB then byte2 with bits 11..10 = 11: 0x9C.
         let mut p = MpegAudioParser::new();
         let mut frame = mp3_frame(400);

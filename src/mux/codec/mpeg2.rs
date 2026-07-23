@@ -483,7 +483,8 @@ fn coding_type_from_raw(raw: u8) -> CodingType {
 
 /// Number of field-display periods a coded picture occupies, from its picture
 /// coding extension (`00 00 01 B5`, ext-id `1000`), per ISO/IEC 13818-2 §6.3.10
-/// and ffmpeg `mpeg_field_start` (`nb_fields = repeat_pict + 2`). This is what
+/// (`nb_fields = repeat_pict + 2`, the field count the spec's repeat rules
+/// yield). This is what
 /// times soft-telecined (2:3 pulldown) DVD video correctly: a
 /// `repeat_first_field` frame occupies 3 fields, a normal frame 2, so honoring
 /// it spreads the ~23.976 coded frames across the 29.97 display span with no

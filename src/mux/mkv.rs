@@ -131,7 +131,7 @@ fn mvc_decoder_config_record(subset_sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> {
 ///
 /// The size field is the extension block length **excluding the 4-byte size
 /// field itself** — i.e. `4 ("mvcC") + record.len()`. This is the track-level
-/// MVC signal that decoders and mediainfo read (the per-frame `BlockAdditional`
+/// MVC signal that decoders and media analyzers read (the per-frame `BlockAdditional`
 /// under the `mvcC` BlockAdditionMapping carries the dependent view's data). A
 /// plain (2D) track never calls this — it writes its `avcc` verbatim.
 fn mvc_codec_private(avcc: &[u8], record: &[u8]) -> Vec<u8> {
@@ -432,22 +432,23 @@ impl MkvTrack {
             // to fix the Windows-fps report, on the theory that Windows derives
             // fps from it. The captured SOTL evidence proves the opposite: with
             // FlagInterlaced=1 + DefaultDuration=40 ms + DefaultDecodedFieldDuration=20 ms,
-            // Windows Explorer reports 12.5 fps (half), and MediaInfo flips the
-            // track to "Frame rate mode: Variable" with no clean rate. MakeMKV's
-            // correct rip of the same disc OMITS DefaultDecodedFieldDuration,
+            // Windows Explorer reports 12.5 fps (half), and a media analyzer
+            // flips the track to "Frame rate mode: Variable" with no clean rate. A
+            // known-correct rip of the same disc OMITS DefaultDecodedFieldDuration,
             // keeps FlagInterlaced=1 + FieldOrder=TFF + DefaultDuration=40 ms, and
-            // Explorer reports the full 25 fps with MediaInfo "Constant". ffmpeg's
-            // matroskaenc.c does the same (full-frame DefaultDuration, no field
-            // duration). The lone frame-rate signal every tool actually trusts is
+            // Explorer reports the full 25 fps with the analyzer showing "Constant".
+            // A conformant Matroska muxer does the same (full-frame DefaultDuration,
+            // no field duration). The lone frame-rate signal every tool actually
+            // trusts is
             // `1 / DefaultDuration`; that full-frame value (40 ms → 25 fps) is kept
             // below. Dropping the field-duration element removes the per-field
             // signal that made Explorer halve the rate.
             //
             // Trade-off: the container no longer carries an explicit per-field
             // decoded duration. Nothing is lost in practice — the interlace
-            // signaling that deinterlacers and MediaInfo rely on lives in the
+            // signaling that deinterlacers and media analyzers rely on lives in the
             // MPEG-2 elementary stream's picture_coding_extension (picture_structure /
-            // top_field_first), which MediaInfo reads directly (so it still reports
+            // top_field_first), which analyzers read directly (so they still report
             // "Interlaced / Top Field First"), and the container still flags
             // FlagInterlaced=1 + FieldOrder=TFF so players keep deinterlacing.
             field_duration_ns: 0,
@@ -480,8 +481,8 @@ impl MkvTrack {
         // and DTS-HD Master Audio." Players distinguish core vs HD-HRA vs
         // HD-MA by parsing the DTS bitstream extension substreams, not by
         // the container codec ID. The previously-emitted `A_DTS/MA` and
-        // `A_DTS/HR` suffixes are NOT registered codec IDs; strict parsers
-        // (libmatroska) and some hardware renderers fail to recognise the
+        // `A_DTS/HR` suffixes are NOT registered codec IDs; strict Matroska
+        // parsers and some hardware renderers fail to recognise the
         // track at all. Emit plain `A_DTS` for every DTS variant — the
         // lossless MA / HRA payload bytes are unchanged, only the
         // container codec-ID string differs.
@@ -602,7 +603,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     base_pts_ticks: Option<i64>,
     /// Last block timecode (TimestampScale ticks, relative to base_pts) written
     /// PER TRACK, to enforce strictly-monotonic per-track timestamps —
-    /// players/ffmpeg reject non-monotonic DTS, and some audio PES PTS land on
+    /// players and decoders reject non-monotonic DTS, and some audio PES PTS land on
     /// the same tick (or tick back one from rounding).
     last_pts_ticks: std::collections::HashMap<usize, i64>,
     /// Per-track-index flag: true if the track is video. The strictly-monotonic
@@ -762,7 +763,7 @@ const MIN_BLOCK_REL: i64 = i16::MIN as i64;
 /// later than the previous one written for that track. `prev` is the last
 /// timestamp for the track (`None` for the first frame). Fixes non-monotonic
 /// DTS: some audio PES PTS truncate to the same tick as the prior frame (or tick
-/// back one from rounding), which ffmpeg/strict players reject. At the 0.1 ms
+/// back one from rounding), which strict players/decoders reject. At the 0.1 ms
 /// scale a TrueHD AU (0.833 ms = ~8 ticks) no longer collides with its
 /// neighbour, so this rarely fires for lossless audio — but a +1-tick nudge
 /// (0.1 ms, sub-AU and inaudible) still guards genuine same-tick collisions on
@@ -919,7 +920,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             Some(pos + 3)
         };
         // Stamp the freemkv version so any muxed file is traceable to the build
-        // that produced it (MediaInfo "Writing application"/"library").
+        // that produced it (surfaced as a media analyzer's "Writing
+        // application"/"library" field).
         ebml::write_string(&mut writer, ebml::MUXING_APP, crate::MUX_APP)?;
         ebml::write_string(&mut writer, ebml::WRITING_APP, crate::MUX_APP)?;
         if let Some(t) = title {
@@ -992,7 +994,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 match mvc_record.as_ref() {
                     // MVC (Blu-ray 3D) base track: CodecPrivate = base-view avcC
                     // followed by the `mvcC` extension block. This is the
-                    // track-level signal decoders/mediainfo read to recognise the
+                    // track-level signal decoders/analyzers read to recognise the
                     // stereoscopic MVC track (the per-frame dependent view rides
                     // in BlockAdditional under the mapping below).
                     Some(record) => {
@@ -1023,9 +1025,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
             // child of TrackEntry. The production video path now ALWAYS passes
             // `field_duration_ns == 0` (see `MkvTrack::video`) so this element is
             // NOT written: emitting it (20 ms for 576i25) is exactly what made
-            // Windows Explorer report 12.5 fps and MediaInfo flip to VFR on the
-            // captured SOTL rip, while MakeMKV — which omits it — shows the full
-            // 25 fps. The guard below is retained so a non-zero value still emits
+            // Windows Explorer report 12.5 fps and a media analyzer flip to VFR on
+            // the captured SOTL rip, while a known-correct rip — which omits it —
+            // shows the full 25 fps. The guard below is retained so a non-zero
+            // value still emits
             // a well-formed element for any future caller / round-trip test, but
             // the muxer's own callers no longer trigger it.
             if track.track_type == ebml::TRACK_TYPE_VIDEO
@@ -1100,7 +1103,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
 
             // Blu-ray 3D (MVC) signaling — BlockAdditionMapping (sibling of
             // Video) carries the mvcC MVCDecoderConfigurationRecord so players /
-            // mediainfo recognise the dependent (right-eye) view that rides as a
+            // analyzers recognise the dependent (right-eye) view that rides as a
             // per-frame BlockAdditional under this mapping (BlockAddIDValue = 2).
             match mvc_record.as_ref() {
                 Some(record) => {
@@ -1134,7 +1137,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
 
             // Dolby Vision signaling — BlockAdditionMapping is a child of the
             // TrackEntry (sibling of Video). Carries the dvcC so players /
-            // mediainfo recognise the track as Dolby Vision.
+            // analyzers recognise the track as Dolby Vision.
             if let Some(ref dvcc) = track.dv_config {
                 let map_pos = ebml::start_master(&mut writer, ebml::BLOCK_ADDITION_MAPPING)?;
                 // BlockAddIDType = "dvcC" fourcc (DOVIDecoderConfigurationRecord).
@@ -4279,8 +4282,8 @@ mod tests {
         // fps, the only rate every tool trusts) and must NOT emit
         // DefaultDecodedFieldDuration. rc.5.1 emitted the 20 ms field duration to
         // try to fix Windows; the captured SOTL evidence proved it did the
-        // opposite (Explorer 12.5 fps, MediaInfo VFR). MakeMKV's correct rip omits
-        // it (Explorer 25 fps, MediaInfo CFR). So: frame duration present = 40 ms,
+        // opposite (Explorer 12.5 fps, analyzer VFR). A known-correct rip omits
+        // it (Explorer 25 fps, analyzer CFR). So: frame duration present = 40 ms,
         // field duration ABSENT, interlace signalling (FlagInterlaced/FieldOrder)
         // retained.
         let v = VideoStream {
@@ -4313,7 +4316,7 @@ mod tests {
             "DefaultDecodedFieldDuration must NOT be written (Windows halves the rate when it is)"
         );
         // Interlace signalling is RETAINED so deinterlacers still engage and
-        // MediaInfo (which also reads scan type from the MPEG-2 ES) agrees.
+        // a media analyzer (which also reads scan type from the MPEG-2 ES) agrees.
         let fi = find_id(&data, ebml::FLAG_INTERLACED).expect("FlagInterlaced present");
         assert_eq!(
             data[fi + 2],
@@ -4816,7 +4819,7 @@ mod tests {
     fn mvc_track_emits_mvcc_block_addition_mapping() {
         // A track with mvc_params must emit BlockAdditionMapping (0x41E4) with the
         // mvcC BlockAddIDType (0x6D766343) and a BlockAddIDValue (0x41F0), so
-        // players / mediainfo recognise the Blu-ray 3D dependent view.
+        // players / analyzers recognise the Blu-ray 3D dependent view.
         let mut v = make_video_track();
         v.mvc_params = Some((
             vec![0x6F, 0x80, 0x00, 0x33, 0x11, 0x22],
@@ -4869,7 +4872,7 @@ mod tests {
     #[test]
     fn mvc_track_codec_private_carries_avcc_plus_mvcc() {
         // An MVC base track's CodecPrivate must be the base avcC followed by the
-        // mvcC extension — the track-level signal mediainfo/decoders read.
+        // mvcC extension — the track-level signal analyzers/decoders read.
         let avcc = vec![
             0x01, 0x64, 0x00, 0x33, 0xFF, 0xE1, 0x00, 0x05, 0x67, 0x64, 0x00, 0x33, 0x99,
         ];

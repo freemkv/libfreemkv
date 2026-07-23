@@ -261,9 +261,10 @@ mod tests {
         }
     }
 
-    /// Call `set_unit_base` through a generic `S: SectorSource` bound — this is
-    /// the path that actually exercises the `Box<dyn>` / `&mut dyn` FORWARDING
-    /// impls (a direct call on a `dyn` value dispatches via the vtable instead).
+    /// Call `set_unit_base` through a generic `S: SectorSource` bound so the
+    /// `Box<dyn SectorSource>` / `&mut dyn SectorSource` FORWARDING impls are the
+    /// ones invoked (the generic monomorphizes to each forwarding body — the same
+    /// body a direct call on those receiver types also resolves to).
     fn set_unit_base_generic<S: SectorSource>(mut s: S, base: u32) {
         s.set_unit_base(base);
     }

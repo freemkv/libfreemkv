@@ -224,8 +224,10 @@ pub(super) fn audio_sample_entry(
     e.extend_from_slice(&16u16.to_be_bytes()); // samplesize
     e.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
     e.extend_from_slice(&0u16.to_be_bytes()); // reserved
-    // samplerate is 16.16 fixed point; the integer rate in the high 16 bits.
-    e.extend_from_slice(&(sample_rate << 16).to_be_bytes());
+    // samplerate is 16.16 fixed point; the integer rate in the high 16 bits. The
+    // integer part is only 16 bits, so cap at 65535 — 96/192 kHz (DTS-HD) would
+    // otherwise overflow u32 and write a garbage rate (the true rate is in ddts).
+    e.extend_from_slice(&(sample_rate.min(0xFFFF) << 16).to_be_bytes());
     e.extend_from_slice(config);
     bx(fourcc, &e)
 }
@@ -278,13 +280,15 @@ fn parse_dts(frame: &[u8]) -> Option<DtsConfig> {
     let base_ch = DTS_AMODE_CH.get(amode).copied().unwrap_or(6);
     let channels = base_ch as u16 + lfe as u16;
     let channel_layout = dts_channel_layout(amode, lfe);
-    // DTS-HD extension substream sync (0x64582025) after the core frame.
+    // DTS-HD extension substream sync (0x64582025) after the core frame. Search
+    // ONLY the region at/after the core end (core_size = fsize+1): scanning the
+    // whole frame would false-positive on the same 4 bytes occurring inside the
+    // compressed core payload, mislabeling a plain DTS core as DTS-HD (dtsh).
     let ext_sync = [0x64, 0x58, 0x20, 0x25];
-    let has_extension = f
-        .windows(4)
-        .skip((fsize as usize + 1).min(f.len()).saturating_sub(4))
-        .any(|w| w == ext_sync)
-        || f.windows(4).any(|w| w == ext_sync);
+    // The EXSS begins at byte core_size (= fsize + 1); start the window search
+    // exactly there so no 4-byte window inside the compressed core is ever tested.
+    let ext_sync_start = (fsize as usize + 1).min(f.len());
+    let has_extension = f.windows(4).skip(ext_sync_start).any(|w| w == ext_sync);
 
     Some(DtsConfig {
         sample_rate,
@@ -522,5 +526,43 @@ mod tests {
         // Sample entry uses dtsc (no extension in this synthetic frame).
         let e = dolby_sample_entry(Codec::DtsHdMa, &f).unwrap();
         assert_eq!(&e[4..8], b"dtsc");
+    }
+
+    #[test]
+    fn dts_ext_sync_inside_core_is_not_a_false_positive() {
+        // The 4-byte ext-sync pattern occurring INSIDE the compressed core payload
+        // (before core_size) must NOT be read as a DTS-HD extension → stays dtsc.
+        // f[4..8] = ext_sync makes core_size huge (>> frame len), so the search
+        // region is only after the core (skipped past this frame) → no extension.
+        let f = vec![
+            0x7F, 0xFE, 0x80, 0x01, 0x64, 0x58, 0x20, 0x25, 0x00, 0x00, 0x02, 0x00,
+        ];
+        let c = parse_dts(&f).expect("parses");
+        assert!(!c.has_extension, "ext-sync inside core is not an extension");
+        let e = dolby_sample_entry(Codec::DtsHdMa, &f).unwrap();
+        assert_eq!(&e[4..8], b"dtsc");
+    }
+
+    #[test]
+    fn dts_ext_sync_at_core_end_is_detected() {
+        // fsize=8 → core_size=9; the EXSS sync sits exactly at byte 9 (right after
+        // the core) and MUST be detected → dtsh. Guards the off-by-4 boundary.
+        let f = vec![
+            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x00, 0x00, 0x80, 0x00, 0x64, 0x58, 0x20, 0x25,
+        ];
+        let c = parse_dts(&f).expect("parses");
+        assert_eq!(c.core_size, 9);
+        assert!(c.has_extension, "EXSS sync at core end is a real extension");
+        let e = dolby_sample_entry(Codec::DtsHdMa, &f).unwrap();
+        assert_eq!(&e[4..8], b"dtsh");
+    }
+
+    #[test]
+    fn sample_entry_samplerate_does_not_overflow_at_96k() {
+        // 96 kHz > 65535: the 16.16 integer part must saturate, not wrap to garbage.
+        let e = audio_sample_entry(b"ac-3", 6, 96_000, &[]);
+        // 8-byte box header + body offset 24 (6+2+8+2+2+2+2) → samplerate at 32;
+        // high 16 bits = the integer rate.
+        assert_eq!(&e[32..34], &[0xFF, 0xFF], "capped to 65535, not wrapped");
     }
 }

@@ -118,13 +118,13 @@ impl Ac3Parser {
 
 use super::crc::crc16_ansi;
 
-/// Whether a fully-buffered (E-)AC-3 frame passes its native CRC. ffmpeg's
-/// decoder checks exactly this — `av_crc(AV_CRC_16_ANSI, 0, &buf[2],
-/// frame_size - 2) == 0` (ac3dec.c) — over the frame after the 2-byte syncword;
-/// the trailing crc word makes a clean frame's residue zero. A nonzero residue
-/// is a ~1-in-65536-certain sign of payload corruption, so we drop the frame
-/// (silence gap) rather than ship a glitch. `frame` must be exactly the frame
-/// bytes (syncword .. frame_size).
+/// Whether a fully-buffered (E-)AC-3 frame passes its native CRC. Per ETSI TS
+/// 102 366 (ATSC A/52) the frame carries a CRC-16/ANSI (poly 0x8005, init 0,
+/// non-reflected) over the bytes after the 2-byte syncword — i.e. `crc16_ansi(
+/// &buf[2..]) == 0` covers `frame_size - 2` bytes; the trailing crc word makes a
+/// clean frame's residue zero. A nonzero residue is a ~1-in-65536-certain sign
+/// of payload corruption, so we drop the frame (silence gap) rather than ship a
+/// glitch. `frame` must be exactly the frame bytes (syncword .. frame_size).
 fn frame_crc_ok(frame: &[u8]) -> bool {
     // Need the syncword (2) plus at least one covered byte; the caller only
     // invokes this on a fully-sized frame, so this is defensive.
@@ -136,8 +136,8 @@ fn frame_crc_ok(frame: &[u8]) -> bool {
 
 /// Decodability verdict for a fully-sized (E-)AC-3 frame: `Some(reason)` when it
 /// must be dropped, `None` when it decodes. Drops (in order): a poisoned track
-/// (mostly-undecodable → drop the rest), a bitstream id ffmpeg's parser rejects
-/// (`bsid > 16` → `AC3_PARSE_ERROR_BSID`), or a failed native frame CRC.
+/// (mostly-undecodable → drop the rest), an out-of-range bitstream id (`bsid >
+/// 16`; ETSI TS 102 366 defines no bsid above 16), or a failed native frame CRC.
 fn ac3_drop_reason(
     tally: &super::dropgate::DropTally,
     frame: &[u8],
@@ -233,7 +233,7 @@ impl CodecParser for Ac3Parser {
 
             let duration_ns = frame_duration_ns(remaining, bsid);
             let frame = &data[start..start + frame_size];
-            // Decodability gate: drop a frame ffmpeg's parser rejects (bsid > 16)
+            // Decodability gate: drop a frame with an out-of-range bsid (> 16)
             // or whose native CRC fails (payload corruption). `frame_pts_ns` is
             // advanced BELOW whether or not the frame survives, so a drop is a
             // silence gap and the following frames keep their true PTS.
@@ -385,8 +385,8 @@ const ACMOD_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
 ///
 /// This is the AUTHORITATIVE channel count for the track header: the DVD IFO
 /// `audio_attr_t.channels` nibble is a well-known unreliable/stale field, so
-/// the muxer prefers this over the IFO-claimed count (mirrors MakeMKV /
-/// HandBrake, which never trust the IFO audio nibble). LFE adds one channel
+/// the muxer prefers this over the IFO-claimed count (the bitstream acmod is
+/// authoritative; the IFO audio nibble is not trusted). LFE adds one channel
 /// (e.g. acmod=7 + lfeon → 6 = 5.1).
 ///
 /// Bit layout from the syncword (A/52 §5.3.2 BSI):
@@ -628,7 +628,7 @@ mod tests {
         // (PES marked discontinuity) carrying a fresh complete frame. The
         // truncated partial must be DROPPED, not spliced — otherwise the parser
         // emits one corrupt frame built from [stale partial | head of fresh] and
-        // strands the tail (FFmpeg: "incomplete frame" / wrong sync).
+        // strands the tail (decoders report "incomplete frame" / wrong sync).
         let mut parser = Ac3Parser::new();
         let frame_data = make_ac3_frame(0, 2); // 160 bytes, starts with 0x0B77
 
@@ -1463,8 +1463,8 @@ mod tests {
 
     #[test]
     fn bsid_over_16_is_dropped() {
-        // ffmpeg's parser rejects bsid > 16 (AC3_PARSE_ERROR_BSID). A frame with
-        // bsid = 17 that still sizes must be dropped, not emitted.
+        // bsid > 16 is out of range (ETSI TS 102 366 defines no bsid above 16).
+        // A frame with bsid = 17 that still sizes must be dropped, not emitted.
         let mut frame = vec![0u8; 128];
         frame[0] = 0x0B;
         frame[1] = 0x77;

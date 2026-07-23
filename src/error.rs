@@ -152,9 +152,9 @@ pub const E_MUX_EMPTY: u16 = 9023;
 pub const E_EXTENT_NOT_UNIT_ALIGNED: u16 = 9030;
 /// `mp4://` output but the title has no (primary) video track to carry.
 pub const E_MP4_NO_VIDEO_TRACK: u16 = 9048;
-/// `mp4://` video track uses a codec with no MP4 mapping / no config record
-/// available here (e.g. VC-1, or MPEG-2 without an avcC/hvcC-style record).
-pub const E_MP4_UNSUPPORTED_VIDEO_CODEC: u16 = 9049;
+/// `mp4://` SOURCE file is malformed/truncated (bad box structure, sample table,
+/// or offsets) — the MP4 demuxer could not parse it.
+pub const E_MP4_INVALID: u16 = 9049;
 /// `mp4://` video track is missing its codec-configuration record
 /// (`hvcC`/`avcC`), without which the sample entry can't be written.
 pub const E_MP4_MISSING_CODEC_PRIVATE: u16 = 9050;
@@ -370,12 +370,10 @@ pub enum Error {
     AacsBusKeyUnavailable,
 
     /// AACS 2.1 (FMTS) disc carries forensic variant segments, but no segment
-    /// (variant) key is available to open them, and `BYPASS_FMTS_KEY` is `false`
-    /// (strict mode). Raised UPFRONT — before the mux — exactly like a missing
-    /// unit key, so a 2.1 disc that would rip with holes is refused rather than
-    /// silently producing a forensic-holed output. When `BYPASS_FMTS_KEY` is
-    /// `true` (the default today) this is never raised: the bulk decodes with the
-    /// unit key and the forensic segments are skipped as expected loss.
+    /// (variant) key is available to open them. Raised UPFRONT — before the mux —
+    /// exactly like a missing unit key, so a 2.1 disc that would rip with holes is
+    /// refused rather than silently producing a forensic-holed output. (The mux
+    /// resolves the full forensic key set up front; a resolution gap fails here.)
     FmtsKeyMissing,
 
     // Keydb (8xxx)
@@ -429,11 +427,11 @@ pub enum Error {
     /// `m2ts://` analogue of [`Error::MkvInvalid`]'s zero-frame guard.
     MuxEmpty,
     /// `mp4://` target title has no primary video track to mux.
-    MuxNoVideoTrack,
-    /// `mp4://` video codec has no MP4 sample-entry mapping available here.
-    Mp4UnsupportedVideoCodec,
+    Mp4NoVideoTrack,
+    /// `mp4://` source file is malformed/truncated — the MP4 demuxer failed.
+    Mp4Invalid,
     /// `mp4://` video track is missing its `hvcC`/`avcC` configuration record.
-    MuxMissingCodecPrivate,
+    Mp4MissingCodecPrivate,
     PesFrameTooLarge {
         size: usize,
     },
@@ -613,9 +611,9 @@ impl Error {
             Error::StreamUrlMissingPort { .. } => E_STREAM_URL_MISSING_PORT,
             Error::NetworkAddrBlocked { .. } => E_NETWORK_ADDR_BLOCKED,
             Error::MuxEmpty => E_MUX_EMPTY,
-            Error::MuxNoVideoTrack => E_MP4_NO_VIDEO_TRACK,
-            Error::Mp4UnsupportedVideoCodec => E_MP4_UNSUPPORTED_VIDEO_CODEC,
-            Error::MuxMissingCodecPrivate => E_MP4_MISSING_CODEC_PRIVATE,
+            Error::Mp4NoVideoTrack => E_MP4_NO_VIDEO_TRACK,
+            Error::Mp4Invalid => E_MP4_INVALID,
+            Error::Mp4MissingCodecPrivate => E_MP4_MISSING_CODEC_PRIVATE,
             Error::PesFrameTooLarge { .. } => E_PES_FRAME_TOO_LARGE,
             Error::PesInvalidMagic => E_PES_INVALID_MAGIC,
             Error::PesTrackTooLarge { .. } => E_PES_TRACK_TOO_LARGE,
@@ -850,9 +848,9 @@ impl From<Error> for std::io::Error {
             // 9023 MuxEmpty: finish() reached with zero frames — the output
             // would be a header-only container. Treat as invalid output.
             E_MUX_EMPTY => std::io::ErrorKind::InvalidData,
-            // 9048-9050 mp4:// track/codec/config mismatches: the requested
-            // output can't hold this title's video — invalid output request.
-            E_MP4_NO_VIDEO_TRACK | E_MP4_UNSUPPORTED_VIDEO_CODEC | E_MP4_MISSING_CODEC_PRIVATE => {
+            // mp4:// track/config mismatches: the requested output can't hold
+            // this title's video — invalid output request.
+            E_MP4_NO_VIDEO_TRACK | E_MP4_INVALID | E_MP4_MISSING_CODEC_PRIVATE => {
                 std::io::ErrorKind::InvalidData
             }
             // 9030 ExtentNotUnitAligned: a malformed/non-AACS-aligned
@@ -1259,7 +1257,7 @@ mod tests {
             E_NETWORK_ADDR_BLOCKED,
             E_MUX_EMPTY,
             E_MP4_NO_VIDEO_TRACK,
-            E_MP4_UNSUPPORTED_VIDEO_CODEC,
+            E_MP4_INVALID,
             E_MP4_MISSING_CODEC_PRIVATE,
             E_PES_FRAME_TOO_LARGE,
             E_PES_INVALID_MAGIC,
@@ -1348,12 +1346,9 @@ mod tests {
             (Error::PipelineConsumerGone, E_PIPELINE_CONSUMER_GONE),
             (Error::DiscCapacityOverflow, E_DISC_CAPACITY_OVERFLOW),
             (Error::MuxEmpty, E_MUX_EMPTY),
-            (Error::MuxNoVideoTrack, E_MP4_NO_VIDEO_TRACK),
-            (
-                Error::Mp4UnsupportedVideoCodec,
-                E_MP4_UNSUPPORTED_VIDEO_CODEC,
-            ),
-            (Error::MuxMissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),
+            (Error::Mp4NoVideoTrack, E_MP4_NO_VIDEO_TRACK),
+            (Error::Mp4Invalid, E_MP4_INVALID),
+            (Error::Mp4MissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),
             (Error::M2tsPacketMalformed, E_M2TS_PACKET_MALFORMED),
             (Error::ExtentNotUnitAligned, E_EXTENT_NOT_UNIT_ALIGNED),
             (Error::DiscCapacityMalformed, E_DISC_CAPACITY_MALFORMED),

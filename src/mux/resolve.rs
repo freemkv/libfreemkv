@@ -724,26 +724,6 @@ fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
     (parsers, pid_to_track, ts, ps)
 }
 
-/// Resolve the proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap) for a title
-/// before muxing. It decides which held unit key decrypts each of the title's
-/// LBA ranges and secures any key the pool is missing through the app's
-/// configured source (`fetch`) up front, never reactively per unit at mux time.
-///
-/// This is what ends the key-server storm. The old mux decrypted a unit, checked
-/// whether the plaintext looked like clean MPEG-TS, and — because authored-bad
-/// content never reaches that bar — re-asked the key service for a key it already
-/// held. There is no per-unit byte pattern that separates "correctly decrypted
-/// but authored-bad" from "still encrypted", so that check is unanswerable. Here
-/// we answer the answerable question instead: which CPS unit does each LBA range
-/// belong to, decided by the disc's key structure (validated once against real
-/// ciphertext samples, where the `is_clean` proof IS sound). The mux then just
-/// decrypts each unit with its mapped key and trusts it.
-///
-/// Single-CPS (the overwhelming majority, incl. every single-key UHD) is the
-/// trivial map: one key everywhere, no sampling. Multi-CPS assigns each extent to
-/// the key that opens a real sample from it; a bad-content extent no sample can
-/// classify inherits its predecessor's key (contiguity). FMTS segment mapping
-/// layers onto the same structure.
 /// FMTS (AACS 2.1) branch of [`resolve_mux_key_map`]. Returns `Some(map)` when the
 /// disc carries `IndividualSegment.tbl` AND a key source is configured; `None`
 /// otherwise (not FMTS, or no source — the caller's base-Unit-Key path then
@@ -932,6 +912,13 @@ fn resolve_fmts_key_map(
         Vec::with_capacity(segments.len());
     let mut unresolved = 0usize;
     for seg in &segments {
+        // SPNs are untrusted (from IndividualSegment.tbl); an inverted record
+        // (start_spn > end_spn) would underflow `end_byte - 1 - start_byte` below.
+        // (Mirrors the guard in `aacs::segment::fmts_key_ranges`.)
+        if seg.start_spn > seg.end_spn {
+            unresolved += 1;
+            continue;
+        }
         let Some(&slot) = tag_slot.get(&seg.index) else {
             unresolved += 1;
             continue;
@@ -969,6 +956,26 @@ fn resolve_fmts_key_map(
     )))
 }
 
+/// Resolve the proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap) for a title
+/// before muxing. It decides which held unit key decrypts each of the title's
+/// LBA ranges and secures any key the pool is missing through the app's
+/// configured source (`fetch`) up front, never reactively per unit at mux time.
+///
+/// This is what ends the key-server storm. The old mux decrypted a unit, checked
+/// whether the plaintext looked like clean MPEG-TS, and — because authored-bad
+/// content never reaches that bar — re-asked the key service for a key it already
+/// held. There is no per-unit byte pattern that separates "correctly decrypted
+/// but authored-bad" from "still encrypted", so that check is unanswerable. Here
+/// we answer the answerable question instead: which CPS unit does each LBA range
+/// belong to, decided by the disc's key structure (validated once against real
+/// ciphertext samples, where the `is_clean` proof IS sound). The mux then just
+/// decrypts each unit with its mapped key and trusts it.
+///
+/// Single-CPS (the overwhelming majority, incl. every single-key UHD) is the
+/// trivial map: one key everywhere, no sampling. Multi-CPS assigns each extent to
+/// the key that opens a real sample from it; a bad-content extent no sample can
+/// classify inherits its predecessor's key (contiguity). FMTS segment mapping
+/// layers onto the same structure.
 pub fn resolve_mux_key_map(
     reader: &mut dyn SectorSource,
     title: &DiscTitle,
@@ -980,42 +987,16 @@ pub fn resolve_mux_key_map(
         ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted, decrypt_unit, is_clean,
     };
 
+    // The base Unit Key pool is always resolved and banked by the caller before mux
+    // (autorip's pre-rip gate; the ISO path's `decrypt_keys()`), so an AACS title
+    // reaches here with a non-empty pool — an empty pool is reported as
+    // `DecryptKeys::None` and takes the CSS/clear arm above. `pool_len` is therefore
+    // always >= 1 for the AACS map paths below.
     let pool_len = match keys {
         crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => unit_keys.len(),
         // CSS / clear: no AACS map (the decorator's map path is AACS-only).
         _ => return Ok(crate::decrypt::AacsKeyMap::single(0)),
     };
-
-    // Secure the disc's key up front from the configured source when the pool is
-    // empty (a genuine "no key yet" — e.g. keydb miss, online-only disc).
-    if pool_len == 0 {
-        if let Some(f) = fetch {
-            let samples = crate::keysource::read_encrypted_units(reader, title, 8);
-            if !samples.is_empty() {
-                let fresh = f.unit_keys(&samples);
-                if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
-                    for k in fresh {
-                        if !unit_keys.iter().any(|(_, h)| *h == k) {
-                            let i = unit_keys.len() as u32;
-                            unit_keys.push((i, k));
-                        }
-                    }
-                }
-            }
-        }
-        // If the pool is STILL empty, this AACS-encrypted title needs a Unit Key we
-        // could not obtain from any source. That is the same situation as any known
-        // key we don't hold — fail loud at resolve time rather than deferring an
-        // opaque decrypt error (or, worse, emitting ciphertext) at mux time.
-        let empty = matches!(
-            keys,
-            crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } if unit_keys.is_empty()
-        );
-        if empty {
-            return Err(crate::error::Error::DecryptFailed.into());
-        }
-        return Ok(crate::decrypt::AacsKeyMap::single(0));
-    }
     // FMTS (AACS 2.1): if the disc carries `IndividualSegment.tbl`, the forensic
     // segments need per-index keys the base Unit Key can't open. Resolve them up
     // front from the configured source and build a per-segment map. Returns `None`
@@ -1095,10 +1076,18 @@ pub fn resolve_mux_key_map(
                 }
             }
         }
-        // A bad-content extent no sample can classify inherits its predecessor's
-        // key (CPS boundaries are contiguous, so the neighbour is almost always
-        // right); this never storms and never mis-fails a decryptable disc.
-        let idx = idx.unwrap_or(last_idx);
+        // `sample_units` draws REAL content (not authored-bad units), so a sample
+        // no held or fetched key decrypts to clean means this extent's CPS-unit key
+        // is genuinely absent. Building a map that silently assigns a WRONG key
+        // (the neighbour's) would corrupt the whole extent with lost_bytes==0 — so
+        // fail loud instead: the keymap is built ONLY when every extent with
+        // encrypted content is classified. An extent with no sampleable encrypted
+        // units (nothing to mis-decrypt) carries the previous index harmlessly.
+        let idx = match idx {
+            Some(i) => i,
+            None if samples.is_empty() => last_idx,
+            None => return Err(crate::error::Error::DecryptFailed.into()),
+        };
         last_idx = idx;
         ranges.push((
             ext.start_lba,

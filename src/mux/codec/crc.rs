@@ -1,16 +1,18 @@
 //! Bit-exact CRC helpers shared by the audio codec decodability gates.
 //!
-//! Both match ffmpeg's `av_crc` tables so a frame that ffmpeg's decoder would
-//! flag as a CRC mismatch is flagged identically here. All are MSB-first
-//! (non-reflected), init 0, no final XOR — the ffmpeg `AV_CRC_*` (big-endian)
-//! variants. Each format transmits its CRC so that the residue over
-//! `data + transmitted_crc` is zero, which is exactly how these are used:
-//! compute over the whole frame (including its trailing CRC) and check `== 0`.
+//! Each matches the CRC defined by its format's bitstream specification, so a
+//! frame these routines flag as a CRC mismatch is exactly the frame a
+//! spec-conformant decoder would reject. All are MSB-first (non-reflected),
+//! init 0, no final XOR — the big-endian CRC variants. Each format transmits
+//! its CRC so that the residue over `data + transmitted_crc` is zero, which is
+//! exactly how these are used: compute over the whole frame (including its
+//! trailing CRC) and check `== 0`.
 
 /// CRC-16/ANSI (a.k.a. CRC-16/BUYPASS): polynomial 0x8005, init 0x0000,
-/// MSB-first, no reflection, no final XOR — ffmpeg `AV_CRC_16_ANSI`.
-/// Used by AC-3/E-AC-3 (frame CRC), FLAC (frame footer), MPEG-audio and
-/// AAC-ADTS (header CRC).
+/// MSB-first, no reflection, no final XOR. Called by the AC-3/E-AC-3 frame-CRC
+/// gate (ETSI TS 102 366) and the FLAC frame footer. (The MPEG-audio and
+/// AAC-ADTS gates validate the header structurally and do not verify their
+/// optional CRC, so they do not call this.)
 pub(crate) fn crc16_ansi(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
     for &b in data {
@@ -26,14 +28,12 @@ pub(crate) fn crc16_ansi(data: &[u8]) -> u16 {
     crc
 }
 
-/// CRC-16 with polynomial 0x002D, init 0, MSB-first — ffmpeg's `crc_2D` table
-/// (`av_crc_init(crc_2D, 0, 16, 0x002D)`), used by the MLP/TrueHD major-sync
-/// header checksum. NOTE: MLP's checksum is the "reversed" scheme — ffmpeg
-/// computes `av_crc(...) ^ AV_RL16(trailer)` and compares against `AV_RL16` of
-/// the stored word; equivalently, this standard CRC compared against the stored
-/// bytes read big-endian. The caller handles that comparison
-/// (see `truehd::mlp_major_sync_ok`). Verified against real ffmpeg TrueHD
-/// output (225/225 major-sync AUs).
+/// CRC-16 with polynomial 0x002D, init 0, MSB-first, used by the MLP / Dolby
+/// TrueHD major-sync header checksum. NOTE: MLP's checksum is the "reversed"
+/// scheme — the stored trailer word is the little-endian-read CRC, so this
+/// standard CRC must be compared against the stored bytes read big-endian.
+/// The caller handles that comparison (see `truehd::mlp_major_sync_ok`).
+/// Verified against real MLP/TrueHD bitstreams (225/225 major-sync AUs).
 pub(crate) fn crc16_mlp(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
     for &b in data {
@@ -50,8 +50,8 @@ pub(crate) fn crc16_mlp(data: &[u8]) -> u16 {
 }
 
 /// CRC-8/ATM (a.k.a. CRC-8/ITU without the final XOR): polynomial 0x07, init 0,
-/// MSB-first, no reflection — ffmpeg `AV_CRC_8_ATM`. Used by the FLAC frame
-/// header.
+/// MSB-first, no reflection — the FLAC frame-header CRC-8 (RFC 9639). Available
+/// as a primitive; the FLAC gate currently validates only the frame footer CRC-16.
 pub(crate) fn crc8_atm(data: &[u8]) -> u8 {
     let mut crc: u8 = 0;
     for &b in data {
@@ -88,6 +88,29 @@ mod tests {
         // CRC-16/BUYPASS check value for the ASCII string "123456789" is 0xFEE8
         // (the standard catalogue check value for poly 0x8005, init 0).
         assert_eq!(crc16_ansi(b"123456789"), 0xFEE8);
+    }
+
+    #[test]
+    fn crc16_mlp_known_vector_check_bytes() {
+        // Independent known-answer for CRC-16 poly 0x002D, init 0, MSB-first over
+        // the catalogue string "123456789" is 0x4FF7 — computed by a separate
+        // reference implementation (NOT by crc16_mlp), so a wrong polynomial or
+        // shift direction here fails this test even though every truehd fixture
+        // (which derives its trailer from crc16_mlp itself) would still pass.
+        assert_eq!(crc16_mlp(b"123456789"), 0x4FF7);
+        assert_eq!(crc16_mlp(&[0x00, 0x01, 0x02, 0x03]), 0x5E26);
+    }
+
+    #[test]
+    fn crc16_mlp_residue_property_holds() {
+        // Appending the big-endian CRC zeroes the residue over message+crc — the
+        // scheme `truehd::mlp_major_sync_ok` relies on.
+        let msg = [0xF8u8, 0x72, 0x6F, 0xBA];
+        let c = crc16_mlp(&msg);
+        let mut framed = msg.to_vec();
+        framed.push((c >> 8) as u8);
+        framed.push((c & 0xFF) as u8);
+        assert_eq!(crc16_mlp(&framed), 0);
     }
 
     #[test]
