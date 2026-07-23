@@ -192,6 +192,16 @@ impl Disc {
         // borrowing wrapper (so the caller keeps `reader`), swap keys per CSS
         // VTS group via `set_keys`; AACS/None keep `base_keys` throughout.
         let mut dec = DecryptingSectorSource::new(Borrowed(reader), base_keys.clone());
+        // AACS decrypts via the key map. Extract reads arbitrary files (not resolved
+        // title extents), so key every unit with the disc's base Unit Key: the mapped
+        // decrypt applies it to encrypted units and passes clear filesystem/nav
+        // through (its encrypted-flag gate). Single-CPS is exact; a multi-CPS disc's
+        // secondary units are not separately keyed here (extract is not the mux path).
+        if matches!(base_keys, DecryptKeys::Aacs { .. }) {
+            dec = dec.with_key_map(std::sync::Arc::new(
+                crate::decrypt::AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]),
+            ));
+        }
 
         let mut result = ExtractResult::default();
         let total_bytes = required;
