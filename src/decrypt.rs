@@ -408,7 +408,20 @@ pub fn decrypt_sectors_mapped(
 
     let decrypt_one = |idx_in_buf: usize, chunk: &mut [u8]| {
         if chunk.len() != unit_len {
-            return; // trailing partial unit: clear tail on disc, leave as-is
+            // Trailing partial unit (buffer/region tail shorter than a whole unit).
+            // Normally a genuinely-clear content tail (source-zero padding or a
+            // short final fragment) — leave as-is. But a partial that is BOTH inside
+            // a mapped (encrypted) range AND flagged encrypted in its clear seed is
+            // an encrypted unit split across a boundary: a CBC fragment we cannot
+            // decrypt, so emitting it verbatim would ship ciphertext as clear. Fail
+            // loud instead (restores the guard the removed `decrypt_sectors` had).
+            let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
+            if map.entry_for(unit_lba).is_some()
+                && aacs::content::aacs_unit_seed_encrypted(chunk, format)
+            {
+                verify_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
         }
         let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
         // No range covers this LBA → the map keys no content here, so pass the
@@ -470,30 +483,21 @@ pub fn decrypt_sectors_mapped(
     Ok(())
 }
 
-/// Decrypt a buffer of sectors in-place.
+/// Decrypt a buffer of sectors in-place — the CSS / clear path only.
 ///
-/// For AACS: processes in 6144-byte aligned units (3 sectors).
-/// For CSS: processes per 2048-byte sector.
-/// For None: no-op.
+/// For CSS: descrambles per 2048-byte sector, self-cracking the title key from the
+/// data (no external input). For `None`: a no-op. For AACS: **always** returns
+/// `Err(DecryptFailed)` — AACS decrypts exclusively through the resolved key map
+/// ([`decrypt_sectors_mapped`]), which keys every content unit up front and fails
+/// at RESOLVE time when a key is missing. Reaching this arm with AACS keys means a
+/// reader was built without installing its map (a bug), so it fails loud rather
+/// than apply a guessed key.
 ///
-/// `unit_key_idx` is the initial AACS unit-key hint (0 for most discs). On a
-/// multi-CPS-unit disc every key is tried per unit until the TS-sync verify
-/// passes; `unit_key_idx` is tried first so single-CPS-unit discs pay zero
-/// overhead. An out-of-range `unit_key_idx` is always an error.
-///
-/// Returns `Err` if decryption was expected but keys are missing or invalid.
-/// Never produces silently corrupted output.
-///
-/// Pure decrypt: every encrypted unit has a key APPLIED in place and the
-/// plaintext is left as-is — this function applies NO policy (it never restores
-/// ciphertext, nulls, or re-fetches). On success it returns the number of bytes
-/// belonging to units a key was applied to but that did NOT reassemble to clean
-/// MPEG-TS ("unverified"). "Did a key open it to clean TS?" is a key-SELECTION /
-/// read-VERIFY signal, NOT a "did we decrypt?" verdict — a correct key can
-/// decrypt content whose encoding is broken. The caller decides what an
-/// unverified unit means: the mux passes the bytes to the muxer; the sweep/patch
-/// verify path recovers a key and retries, or fails the read. `0` for `None` /
-/// `Css` and for any AACS buffer where every unit reached clean TS.
+/// `unit_key_idx` and `content` are legacy parameters kept so the CSS / `None`
+/// wrapper signatures stay stable; they are ignored (the CSS arm self-gates on its
+/// per-sector scramble flag). Returns `Err` if decryption was expected but
+/// impossible; never produces silently corrupted output. The `usize` return is a
+/// legacy unverified-byte count that is always `0` for the CSS / `None` arms.
 pub fn decrypt_sectors(
     buf: &mut [u8],
     keys: &mut DecryptKeys,

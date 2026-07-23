@@ -786,11 +786,27 @@ fn resolve_fmts_key_map(
     if segments.is_empty() {
         return Ok(None);
     }
-    // This IS an FMTS disc, so the forensic index keys are REQUIRED — exactly like
-    // a Unit Key. Without a configured key source we cannot obtain them, so we
-    // cannot produce a complete rip: fail loud rather than silently drop the
-    // forensic segments. (The caller may still choose `--raw`, which never reaches
-    // this path.)
+    // The segment SPNs are in the FORENSIC FEATURE clip's byte space. A title
+    // whose extents do not cover any segment's clip bytes carries no forensic
+    // content (a menu/extras playlist, or simply a different clip): its base Unit
+    // Key/CPS map applies and there is nothing forensic to resolve. Filter to the
+    // segments addressable within THIS title; if none, fall back (`Ok(None)`)
+    // rather than hard-failing. Without this, `resolve_content_key_map` — which
+    // resolves EVERY title for the whole-disc sweep — aborts the entire decrypt on
+    // the first non-forensic title (a menu playlist), and `build_iso_pipeline`
+    // aborts muxing any non-main title.
+    let segments: Vec<crate::aacs::segment::Segment> = segments
+        .into_iter()
+        .filter(|s| clip_byte_to_lba(&title.extents, s.start_spn as u64 * 192).is_some())
+        .collect();
+    if segments.is_empty() {
+        return Ok(None);
+    }
+    // This title HAS forensic content, so the forensic index keys are REQUIRED —
+    // exactly like a Unit Key. Without a configured key source we cannot obtain
+    // them, so we cannot produce a complete rip: fail loud rather than silently
+    // drop the forensic segments. (The caller may still choose `--raw`, which never
+    // reaches this path.)
     let Some(fetch) = fetch else {
         return Err(crate::error::Error::FmtsKeyMissing.into());
     };
@@ -918,11 +934,21 @@ fn resolve_fmts_key_map(
         let phase = match even.cmp(&odd) {
             std::cmp::Ordering::Greater => crate::decrypt::Phase::Even,
             std::cmp::Ordering::Less => crate::decrypt::Phase::Odd,
-            std::cmp::Ordering::Equal => {
-                // Neither half decrypts clean under this index's key: the map would
-                // be wrong. Fail loud rather than emit a broken segment map.
+            std::cmp::Ordering::Equal if even == 0 => {
+                // NEITHER half decrypts clean under this index's key: the key is
+                // wrong or the sampled units aren't this index's real content. The
+                // map would be wrong — fail loud rather than emit a broken segment.
                 tracing::warn!(target: "freemkv::keysource", index = tag, even, odd, "fmts: no clean phase under index key — refusing broken map");
                 return Err(crate::error::Error::FmtsKeyMissing.into());
+            }
+            std::cmp::Ordering::Equal => {
+                // BOTH halves decrypt clean: the sampled units are source-zero
+                // padding (`is_clean_ts` is true for all-zero content under ANY
+                // key), so the key is valid and the parity is immaterial here —
+                // default Even (we decrypt one parity; padding in the dropped parity
+                // is harmless). A padding-heavy sample must NOT abort the rip.
+                tracing::debug!(target: "freemkv::keysource", index = tag, even, odd, "fmts: padding tie — defaulting Even");
+                crate::decrypt::Phase::Even
             }
         };
         phase_of_index.insert(tag, phase);

@@ -185,22 +185,43 @@ impl Disc {
         // Per-VTS CSS key map (DVD only): "VTS_xx" -> DecryptKeys. Built lazily
         // when a scrambled VOB group needs it. AACS / None discs keep the
         // disc-wide keys for every file.
-        let base_keys = self.decrypt_keys();
+        let mut base_keys = self.decrypt_keys();
+
+        // AACS key map for the extract, chosen by CPS-unit count:
+        //
+        // * SINGLE CPS (the overwhelming majority, incl. every single-key UHD): one
+        //   Unit Key opens EVERY encrypted unit on the disc — content in a parsed
+        //   title AND an orphan clip that no playlist references. A blanket key-0
+        //   map over the whole LBA space is exact and covers orphans; clear
+        //   filesystem/nav (encrypted-flag off) passes through untouched.
+        //
+        // * MULTI-CPS: each clip is protected by a different Unit Key, so a blanket
+        //   key-0 map would mis-decrypt every secondary-CPS file into garbage
+        //   (silently, since Phase::All is trust-only). Build the EXACT per-CPS
+        //   content map instead (each title's extents → the CPS key that opens a
+        //   real sample from it), up front before the decorator takes the reader. A
+        //   content unit whose key the pool lacks fails loud at resolve (extract has
+        //   no CPS/forensic fetch source), never emits a wrong-key garble.
+        let key_map =
+            match &base_keys {
+                DecryptKeys::Aacs { unit_keys, .. } if unit_keys.len() <= 1 => {
+                    Some(std::sync::Arc::new(
+                        crate::decrypt::AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]),
+                    ))
+                }
+                DecryptKeys::Aacs { .. } => Some(std::sync::Arc::new(
+                    self.resolve_content_key_map(reader, &mut base_keys, None)?,
+                )),
+                _ => None,
+            };
 
         // ── Phase 2: stream each file through the decrypting decorator ────
         // The decorator owns its inner source for its lifetime. We hand it a
         // borrowing wrapper (so the caller keeps `reader`), swap keys per CSS
         // VTS group via `set_keys`; AACS/None keep `base_keys` throughout.
         let mut dec = DecryptingSectorSource::new(Borrowed(reader), base_keys.clone());
-        // AACS decrypts via the key map. Extract reads arbitrary files (not resolved
-        // title extents), so key every unit with the disc's base Unit Key: the mapped
-        // decrypt applies it to encrypted units and passes clear filesystem/nav
-        // through (its encrypted-flag gate). Single-CPS is exact; a multi-CPS disc's
-        // secondary units are not separately keyed here (extract is not the mux path).
-        if matches!(base_keys, DecryptKeys::Aacs { .. }) {
-            dec = dec.with_key_map(std::sync::Arc::new(
-                crate::decrypt::AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]),
-            ));
+        if let Some(map) = key_map {
+            dec = dec.with_key_map(map);
         }
 
         let mut result = ExtractResult::default();
