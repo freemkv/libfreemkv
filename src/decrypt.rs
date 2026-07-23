@@ -206,97 +206,67 @@ pub enum Phase {
 /// common disc pays zero lookup cost and needs no structural walk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AacsKeyMap {
-    // (start_lba, end_lba, key_idx, phase)
+    // (start_lba, end_lba, key_idx, phase). An LBA in NO range is passed through
+    // untouched — the map is a positive list of "this key here", nothing more.
     ranges: Vec<(u32, u32, usize, Phase)>,
-    default_idx: usize,
 }
 
 impl AacsKeyMap {
-    /// The whole title is one CPS unit → one key (`idx`) everywhere. This is the
-    /// overwhelmingly common disc (incl. every single-CPS UHD); no LBA walk.
-    pub fn single(idx: usize) -> Self {
-        Self {
-            ranges: Vec::new(),
-            default_idx: idx,
-        }
-    }
-
     /// Build from `[start_lba, end_lba) → key_idx` ranges that decrypt EVERY unit
-    /// (multi-CPS): each range is [`Phase::All`]. `default_idx` answers any
-    /// uncovered LBA. Byte-for-byte identical behaviour to before phases existed.
-    pub fn from_ranges(ranges: Vec<(u32, u32, usize)>, default_idx: usize) -> Self {
+    /// (single- or multi-CPS): each range is [`Phase::All`]. An LBA in no range is
+    /// passed through untouched.
+    pub fn from_ranges(ranges: Vec<(u32, u32, usize)>) -> Self {
         let phased = ranges
             .into_iter()
             .map(|(s, e, i)| (s, e, i, Phase::All))
             .collect();
-        Self::from_ranges_phased(phased, default_idx)
+        Self::from_ranges_phased(phased)
     }
 
     /// Build a PHASE-AWARE map (FMTS): each range carries which unit-parity its key
     /// opens ([`Phase::Even`]/[`Phase::Odd`] for a forensic segment, [`Phase::All`]
-    /// for base/CPS). Ranges are sorted; `default_idx` answers any uncovered LBA.
-    pub fn from_ranges_phased(
-        mut ranges: Vec<(u32, u32, usize, Phase)>,
-        default_idx: usize,
-    ) -> Self {
+    /// for base/CPS). Ranges are sorted; an LBA in no range is passed through.
+    pub fn from_ranges_phased(mut ranges: Vec<(u32, u32, usize, Phase)>) -> Self {
         ranges.sort_by_key(|&(start, _, _, _)| start);
-        Self {
-            ranges,
-            default_idx,
-        }
+        Self { ranges }
     }
 
-    /// The `(key_idx, phase, range_start_lba)` for the aligned unit at `lba`.
-    /// O(log n) — the last range whose start is `<= lba` and whose end is `> lba`,
-    /// else `(default_idx, All, 0)`. `range_start_lba` lets the mapped decrypt
-    /// compute a unit's parity WITHIN a forensic segment (for `Even`/`Odd`).
-    pub fn entry_for(&self, lba: u32) -> (usize, Phase, u32) {
-        if self.ranges.is_empty() {
-            return (self.default_idx, Phase::All, 0);
-        }
+    /// The `(key_idx, phase, range_start_lba)` for the aligned unit at `lba`, or
+    /// `None` when no range covers it (not encrypted content this map keys — pass
+    /// the unit through untouched). O(log n). `range_start_lba` lets the mapped
+    /// decrypt compute a unit's parity WITHIN a forensic segment (`Even`/`Odd`).
+    pub fn entry_for(&self, lba: u32) -> Option<(usize, Phase, u32)> {
         match self
             .ranges
             .binary_search_by(|&(start, _, _, _)| start.cmp(&lba))
         {
             Ok(i) => {
                 let (start, _, idx, ph) = self.ranges[i];
-                (idx, ph, start)
+                Some((idx, ph, start))
             }
-            Err(0) => (self.default_idx, Phase::All, 0),
+            Err(0) => None,
             Err(i) => {
                 let (start, end, idx, ph) = self.ranges[i - 1];
-                if lba >= start && lba < end {
-                    (idx, ph, start)
-                } else {
-                    (self.default_idx, Phase::All, 0)
-                }
+                (lba >= start && lba < end).then_some((idx, ph, start))
             }
         }
     }
 
-    /// The unit-key index for the aligned unit at `lba` (phase-agnostic; see
-    /// [`entry_for`](Self::entry_for) for the phase). Cheap per-unit hot-path call.
-    pub fn key_idx_for(&self, lba: u32) -> usize {
-        self.entry_for(lba).0
+    /// The unit-key index for the aligned unit at `lba`, or `None` when no range
+    /// covers it (pass through). See [`entry_for`](Self::entry_for) for the phase.
+    pub fn key_idx_for(&self, lba: u32) -> Option<usize> {
+        self.entry_for(lba).map(|(idx, _, _)| idx)
     }
 
     /// The `[start_lba, end_lba) → (key_idx, phase)` ranges (sorted, disjoint).
-    /// Empty for a single-CPS map (everything uses [`default_idx`](Self::default_idx)).
     pub fn ranges(&self) -> &[(u32, u32, usize, Phase)] {
         &self.ranges
     }
 
-    /// The key index for any LBA no explicit range claims (the single-CPS key).
-    pub fn default_idx(&self) -> usize {
-        self.default_idx
-    }
-
-    /// The distinct key indices this map can select — the CPS units / segments a
-    /// title actually reaches. Used by the resolver to know which keys to secure
-    /// up front.
+    /// The distinct key indices this map selects — the CPS units / segments the
+    /// title actually reaches. The resolver secures exactly these up front.
     pub fn key_indices(&self) -> Vec<usize> {
         let mut v: Vec<usize> = self.ranges.iter().map(|&(_, _, i, _)| i).collect();
-        v.push(self.default_idx);
         v.sort_unstable();
         v.dedup();
         v
@@ -367,10 +337,11 @@ impl AacsKeyMap {
                     push(lba, remaining);
                     break;
                 }
-                let (_, phase, range_start) = self.entry_for(lba);
-                let keep = match phase {
-                    Phase::All => true,
-                    Phase::Even | Phase::Odd => {
+                // A unit in NO range is pass-through content (base/default) — read
+                // it. Only an alternate-phase forensic unit is dropped from the plan.
+                let keep = match self.entry_for(lba) {
+                    None | Some((_, Phase::All, _)) => true,
+                    Some((_, phase, range_start)) => {
                         let unit_ix = (lba - range_start) / us;
                         let is_odd = unit_ix % 2 == 1;
                         is_odd == matches!(phase, Phase::Odd)
@@ -440,7 +411,11 @@ pub fn decrypt_sectors_mapped(
             return; // trailing partial unit: clear tail on disc, leave as-is
         }
         let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
-        let (key_idx, phase, range_start) = map.entry_for(unit_lba);
+        // No range covers this LBA → the map keys no content here, so pass the
+        // unit through untouched (clear filesystem / nav on a whole-disc read).
+        let Some((key_idx, phase, range_start)) = map.entry_for(unit_lba) else {
+            return;
+        };
         // PHASE GATE (FMTS forensic segment): the segment interleaves two variants
         // at the unit level. Decrypt ONLY our parity; leave the alternate half as
         // ciphertext (the muxer drops untouched ciphertext cleanly — no garble).
@@ -1626,18 +1601,19 @@ mod tests {
 
     // ── FMTS phase-aware map ──────────────────────────────────────────────────
 
-    /// `entry_for` returns (idx, phase, range_start); `from_ranges` is All,
-    /// `from_ranges_phased` carries the phase; uncovered → (default, All, 0).
+    /// `entry_for` returns Some((idx, phase, range_start)) inside a range;
+    /// `from_ranges` is All, `from_ranges_phased` carries the phase; an uncovered
+    /// LBA is `None` (pass through).
     #[test]
     fn aacskeymap_phase_entry_for() {
-        let all = AacsKeyMap::from_ranges(vec![(100, 200, 3)], 0);
-        assert_eq!(all.entry_for(150), (3, Phase::All, 100));
-        assert_eq!(all.entry_for(50), (0, Phase::All, 0));
+        let all = AacsKeyMap::from_ranges(vec![(100, 200, 3)]);
+        assert_eq!(all.entry_for(150), Some((3, Phase::All, 100)));
+        assert_eq!(all.entry_for(50), None);
 
-        let phased = AacsKeyMap::from_ranges_phased(vec![(100, 200, 3, Phase::Odd)], 7);
-        assert_eq!(phased.entry_for(150), (3, Phase::Odd, 100));
-        assert_eq!(phased.entry_for(250), (7, Phase::All, 0));
-        assert_eq!(phased.key_idx_for(150), 3);
+        let phased = AacsKeyMap::from_ranges_phased(vec![(100, 200, 3, Phase::Odd)]);
+        assert_eq!(phased.entry_for(150), Some((3, Phase::Odd, 100)));
+        assert_eq!(phased.entry_for(250), None);
+        assert_eq!(phased.key_idx_for(150), Some(3));
     }
 
     /// A map with no forensic (Even/Odd) range is the common disc: `read_plan`
@@ -1656,9 +1632,9 @@ mod tests {
                 sector_count: 60,
             },
         ];
-        // Single-CPS and multi-CPS (All) maps both leave the plan untouched.
-        assert_eq!(AacsKeyMap::single(0).read_plan(&ext, us), ext);
-        let multi = AacsKeyMap::from_ranges(vec![(1000, 1150, 2)], 0);
+        // A non-forensic map (empty, or multi-CPS All) leaves the plan untouched.
+        assert_eq!(AacsKeyMap::from_ranges(vec![]).read_plan(&ext, us), ext);
+        let multi = AacsKeyMap::from_ranges(vec![(1000, 1150, 2)]);
         assert_eq!(multi.read_plan(&ext, us), ext);
     }
 
@@ -1677,7 +1653,7 @@ mod tests {
             start_lba: 1000,
             sector_count: 300,
         }];
-        let map = AacsKeyMap::from_ranges_phased(vec![(1030, 1060, 5, Phase::Even)], 0);
+        let map = AacsKeyMap::from_ranges_phased(vec![(1030, 1060, 5, Phase::Even)]);
         let plan = map.read_plan(&ext, us);
         let expected = vec![
             Extent {
@@ -1719,8 +1695,7 @@ mod tests {
             let mut off = 0;
             while off < e.sector_count {
                 let lba = e.start_lba + off;
-                let (_, phase, rs) = map.entry_for(lba);
-                if let Phase::Even | Phase::Odd = phase {
+                if let Some((_, phase @ (Phase::Even | Phase::Odd), rs)) = map.entry_for(lba) {
                     let is_odd = ((lba - rs) / us) % 2 == 1;
                     assert!(
                         is_odd == matches!(phase, Phase::Odd),
@@ -1756,7 +1731,7 @@ mod tests {
             read_data_key: None,
             format: ContentFormat::BdTs,
         };
-        let map = AacsKeyMap::from_ranges_phased(vec![(0, 8 * usz, 0, Phase::Even)], 0);
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 8 * usz, 0, Phase::Even)]);
         decrypt_sectors_mapped(&mut buf, &keys, 0, &map).expect("even phase decrypts clean");
         for i in 0..8 {
             let u = &buf[i * ul..(i + 1) * ul];
@@ -1791,7 +1766,7 @@ mod tests {
             read_data_key: None,
             format: ContentFormat::BdTs,
         };
-        let map = AacsKeyMap::from_ranges_phased(vec![(0, 2 * usz, 0, Phase::Even)], 0);
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 2 * usz, 0, Phase::Even)]);
         assert!(matches!(
             decrypt_sectors_mapped(&mut buf, &keys, 0, &map),
             Err(crate::error::Error::DecryptFailed)
@@ -1816,8 +1791,13 @@ mod tests {
             read_data_key: None,
             format: ContentFormat::BdTs,
         };
-        decrypt_sectors_mapped(&mut buf, &keys, 0, &AacsKeyMap::single(0))
-            .expect("all-phase decrypts");
+        decrypt_sectors_mapped(
+            &mut buf,
+            &keys,
+            0,
+            &AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]),
+        )
+        .expect("all-phase decrypts");
         for i in 0..4 {
             assert!(
                 aacs::content::is_clean(&buf[i * ul..(i + 1) * ul], ContentFormat::BdTs),

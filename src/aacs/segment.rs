@@ -274,15 +274,23 @@ mod tests {
         // sectors 937..=946 → LBA 1937..1947, key index 7.
         assert_eq!(ranges[1], (1937, 1947, 7));
 
-        // The ranges drive an AacsKeyMap with the Unit Key (index 0) as default.
-        let map = crate::decrypt::AacsKeyMap::from_ranges(ranges, 0);
-        assert_eq!(map.key_idx_for(500), 0, "outside any segment → Unit Key");
-        assert_eq!(map.key_idx_for(1012), 5, "inside index-5 segment → key 5");
-        assert_eq!(map.key_idx_for(1940), 7, "inside index-7 segment → key 7");
+        // The ranges drive a positive AacsKeyMap: an LBA in no range has no key.
+        let map = crate::decrypt::AacsKeyMap::from_ranges(ranges);
+        assert_eq!(map.key_idx_for(500), None, "outside any segment → no key");
+        assert_eq!(
+            map.key_idx_for(1012),
+            Some(5),
+            "inside index-5 segment → key 5"
+        );
+        assert_eq!(
+            map.key_idx_for(1940),
+            Some(7),
+            "inside index-7 segment → key 7"
+        );
         assert_eq!(
             map.key_idx_for(1019),
-            0,
-            "segment end is exclusive → Unit Key"
+            None,
+            "segment end is exclusive → no key"
         );
     }
 
