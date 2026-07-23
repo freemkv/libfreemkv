@@ -38,6 +38,10 @@ pub use read::Mp4Reader;
 /// Nanoseconds per second — PTS is carried in ns, media timescales are Hz.
 const NS: i64 = 1_000_000_000;
 
+/// Movie (mvhd) timescale in Hz. `tkhd.duration` is expressed in THIS timescale
+/// (ISO/IEC 14496-12 §8.3.2), not the track's own media timescale.
+const MOVIE_TIMESCALE: u32 = 90_000;
+
 // ── faststart reserve sizing ─────────────────────────────────────────────────
 //
 // Faststart is on by default: reserve a `moov`-sized hole between `ftyp` and
@@ -133,10 +137,14 @@ struct Track {
 pub enum Mp4SkipReason {
     /// A subtitle track — MP4 carries only text subs; disc subs are bitmap.
     BitmapSubtitle,
-    /// An audio codec with no MP4 mapping here (TrueHD, DTS, LPCM, …).
+    /// An audio codec with no MP4 mapping here (TrueHD, LPCM, …). AC-3/E-AC-3 and
+    /// DTS/DTS-HD ARE mapped and carried.
     UnmappableAudio,
     /// A secondary/dependent video view (e.g. MVC 3D right eye).
     SecondaryVideo,
+    /// A primary video track whose codec this MP4 writer can't carry
+    /// (only HEVC/H.264 are supported — e.g. VC-1, MPEG-2, AV1).
+    UnmappableVideo,
 }
 
 /// The plan for an `mp4://` mux of `title`: which streams are carried and which
@@ -164,8 +172,12 @@ pub fn fit_report(title: &DiscTitle) -> Mp4FitReport {
                 } else if !have_video && matches!(v.codec, Codec::Hevc | Codec::H264) {
                     included.push(i);
                     have_video = true;
-                } else {
+                } else if have_video {
+                    // A second primary video (after one was already carried).
                     skipped.push((i, Mp4SkipReason::SecondaryVideo));
+                } else {
+                    // First primary video, but an unsupported codec (VC-1/MPEG-2/AV1).
+                    skipped.push((i, Mp4SkipReason::UnmappableVideo));
                 }
             }
             DiscStream::Audio(a) => {
@@ -227,7 +239,7 @@ impl<W: Write + Seek> Mp4Sink<W> {
             .iter()
             .any(|&i| matches!(title.streams[i], DiscStream::Video(_)));
         if !has_video {
-            return Err(crate::error::Error::MuxNoVideoTrack.into());
+            return Err(crate::error::Error::Mp4NoVideoTrack.into());
         }
 
         let mut tracks = Vec::new();
@@ -245,7 +257,7 @@ impl<W: Write + Seek> Mp4Sink<W> {
                         .codec_privates
                         .get(i)
                         .and_then(|c| c.clone())
-                        .ok_or(crate::error::Error::MuxMissingCodecPrivate)?;
+                        .ok_or(crate::error::Error::Mp4MissingCodecPrivate)?;
                     let (w, h) = v.resolution.pixels();
                     tracks.push(Track {
                         media: Media::Video,
@@ -317,7 +329,7 @@ impl<W: Write + Seek> Mp4Sink<W> {
     /// Assemble the `moov` box from every track's sample tables.
     fn build_moov(&self) -> Vec<u8> {
         // Movie timescale = 90 kHz; movie duration = the longest track (converted).
-        let movie_ts = 90_000u32;
+        let movie_ts = MOVIE_TIMESCALE;
         let mut movie_dur = 0u64;
         let mut traks: Vec<Vec<u8>> = Vec::new();
         for t in &self.tracks {
@@ -441,7 +453,9 @@ fn build_video_trak_full(t: &Track) -> (Vec<u8>, f64) {
         "VideoHandler",
         minf,
     );
-    let tkhd = build_tkhd(t.track_id, t.width, t.height, media_dur, false);
+    // tkhd.duration is in the MOVIE timescale, not `timing.timescale`.
+    let tkhd_dur = (secs * MOVIE_TIMESCALE as f64) as u64;
+    let tkhd = build_tkhd(t.track_id, t.width, t.height, tkhd_dur, false);
     let mut body = tkhd;
     body.extend_from_slice(&mdia);
     (bx(b"trak", &body), secs)
@@ -457,7 +471,9 @@ fn build_audio_trak_full(t: &Track) -> (Vec<u8>, f64) {
     let stbl = build_audio_stbl(entry, &t.samples, &durs);
     let minf = build_minf(audio_smhd(), stbl);
     let mdia = build_mdia(t.language, ts, media_dur, b"soun", "SoundHandler", minf);
-    let tkhd = build_tkhd(t.track_id, 0, 0, media_dur, true);
+    // tkhd.duration is in the MOVIE timescale, not the audio media timescale.
+    let tkhd_dur = (secs * MOVIE_TIMESCALE as f64) as u64;
+    let tkhd = build_tkhd(t.track_id, 0, 0, tkhd_dur, true);
     let mut body = tkhd;
     body.extend_from_slice(&mdia);
     (bx(b"trak", &body), secs)
@@ -945,6 +961,24 @@ mod tests {
         // TrueHD (unmappable audio) and PGS (bitmap subtitle) are skipped.
         assert!(r.skipped.contains(&(1, Mp4SkipReason::UnmappableAudio)));
         assert!(r.skipped.contains(&(4, Mp4SkipReason::BitmapSubtitle)));
+    }
+
+    #[test]
+    fn fit_report_labels_unsupported_primary_video() {
+        // A primary video whose codec the MP4 writer can't carry (VC-1) must be
+        // skipped as UnmappableVideo, NOT SecondaryVideo (which means an MVC view).
+        let mut vc1 = match hevc_video() {
+            DiscStream::Video(v) => v,
+            _ => unreachable!(),
+        };
+        vc1.codec = Codec::Vc1;
+        let t = title(
+            vec![DiscStream::Video(vc1), audio(Codec::Ac3, "eng")],
+            vec![None, None],
+        );
+        let r = fit_report(&t);
+        assert!(r.skipped.contains(&(0, Mp4SkipReason::UnmappableVideo)));
+        assert_eq!(r.included, vec![1], "only the AC-3 audio is carried");
     }
 
     #[test]

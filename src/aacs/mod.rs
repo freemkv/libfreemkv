@@ -126,16 +126,14 @@ pub(crate) fn role_paths(udf: &crate::udf::UdfFs, role: AacsRole) -> Vec<String>
                 // VTKF000 (Freedom ships VTKF090 + VTKF100). Sorted for a
                 // deterministic try order.
                 //
-                // TODO(hddvd-playlist): each VTKF%%%.AACS is bound to ONE
-                // playlist (VPLST%%%.XPL) — the AACS HD DVD Book gives the
-                // selector explicitly: match the TKF's 12-byte PLAYLIST_NAME
-                // field (bytes 0x10..0x1C) to the playlist of the title being
-                // decrypted; "unless the names are identical, the Title Keys in
-                // this TKF must not be used." Today read_first just takes the
-                // first that reads, which is correct only for a single-playlist
-                // disc. Thread the active playlist name here (owned by the HD
-                // DVD enumerator) and pick the name-matched VTKF once a
-                // multi-playlist encrypted disc is available to validate against.
+                // Each VTKF%%%.AACS is bound to ONE playlist (VPLST%%%.XPL): the
+                // TKF's 12-byte PLAYLIST_NAME field (bytes 0x10..0x1C) names the
+                // playlist whose Title Keys it carries, and keys from a TKF whose
+                // name does not match the title's playlist must not be used. The
+                // caller resolves this by trying candidates in sorted order and
+                // decrypting with the one whose keys verify — correct for a
+                // single-playlist disc; a name-matched selection keyed on the
+                // active playlist is the precise form for multi-playlist discs.
                 let mut names: Vec<&str> = dir
                     .entries
                     .iter()

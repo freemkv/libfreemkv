@@ -238,7 +238,7 @@ impl CodecParser for DtsParser {
         if pes.data.is_empty() {
             return Vec::new();
         }
-        // A PES with no PTS (rare for audio, but legal — the case OSS demuxers
+        // A PES with no PTS (rare for audio, but legal — the case demuxers
         // guard at a post-gap continuation) must NOT reset the timeline to 0;
         // continue from the most recent known base. Defense-in-depth: the
         // discontinuity-carrying PES is a PUSI with a PTS in practice.
@@ -351,7 +351,16 @@ impl CodecParser for DtsParser {
             let mut forced = false;
             let (au_end, ext_clean) = match next_core_boundary(&self.buf, core_size) {
                 NextCore::Found { end, ext_clean } => (end, ext_clean),
-                NextCore::NeedMore => break, // candidate sync needs more header
+                NextCore::NeedMore if self.buf.len() <= MAX_AU_BYTES => break,
+                NextCore::NeedMore => {
+                    // A candidate boundary exists but is not fully buffered. Normally
+                    // we wait for more PES; but once the buffer exceeds the AU cap,
+                    // apply the same force-flush safety valve as `None` so a crafted
+                    // stream that keeps a boundary perpetually incomplete can't grow
+                    // `buf` without bound (the `break` above never reaches it).
+                    forced = true;
+                    (self.buf.len(), true)
+                }
                 NextCore::None => {
                     // No next core sync buffered yet. The trailing extension
                     // substream PES packets may still be arriving, so WAIT for
@@ -643,8 +652,8 @@ const DTS_CORE_SAMPLE_RATES: [u32; 16] = [
 ];
 
 /// Samples in one DTS core frame: `(NBLKS + 1) * 32`. `NBLKS` (7 bits) is the
-/// core-header PCM-sample-block count — the same field ffmpeg's `dca` decoder
-/// uses to timestamp frames. Bit layout after the 32-bit sync: FTYPE(1) SHORT(5)
+/// core-header PCM-sample-block count (ETSI TS 102 114) that fixes the frame's
+/// decoded sample count. Bit layout after the 32-bit sync: FTYPE(1) SHORT(5)
 /// CPF(1) **NBLKS(7)** FSIZE(14) …, so NBLKS = byte4 bit0 + byte5 bits7-2.
 fn dts_core_samples(data: &[u8]) -> u32 {
     if data.len() < CORE_HEADER_MIN_BYTES {
@@ -673,18 +682,18 @@ fn dts_core_duration_ns(data: &[u8]) -> u64 {
     (samples * 1_000_000_000 + rate / 2) / rate
 }
 
-/// DCA core-header constants, mirrored from ffmpeg `libavcodec/dca_core.h`.
-/// `deficit_samples` must equal this (`DCA_PCMBLOCK_SAMPLES`); `npcmblocks`
-/// must be a multiple of `DCA_SUBBAND_SAMPLES`; `audio_mode` must be below
-/// `DCA_AMODE_COUNT`; `lfe_present == DCA_LFE_FLAG_INVALID` is rejected.
+/// DTS core-header validity constants (ETSI TS 102 114).
+/// `deficit_samples` must equal this (`DTS_PCMBLOCK_SAMPLES`); `npcmblocks`
+/// must be a multiple of `DTS_SUBBAND_SAMPLES`; `audio_mode` must be below
+/// `DTS_AMODE_COUNT`; `lfe_present == DTS_LFE_FLAG_INVALID` is rejected.
 const DTS_PCMBLOCK_SAMPLES: u32 = 32;
 const DTS_SUBBAND_SAMPLES: u32 = 8;
 const DTS_AMODE_COUNT: u32 = 10;
 const DTS_LFE_FLAG_INVALID: u32 = 3;
 
-/// `ff_dca_sample_rates[16]` — sample rate (Hz) per core `SFREQ` code; a `0`
-/// entry marks a reserved code that ffmpeg's parser rejects
-/// (`DCA_PARSE_ERROR_SAMPLE_RATE`). Valid entries are locked to the spec by
+/// Sample rate (Hz) per core `SFREQ` code (ETSI TS 102 114 Table 6-4); a `0`
+/// entry marks a reserved code that fails header validation as an invalid
+/// sample rate. Valid entries are locked to the spec by
 /// `dts_core_sfreq_table_matches_the_dca_spec`; the reserved codes are
 /// {0, 4, 5, 9, 10}.
 const DTS_CORE_SR_VALID: [u32; 16] = [
@@ -692,14 +701,14 @@ const DTS_CORE_SR_VALID: [u32; 16] = [
     192_000,
 ];
 
-/// `ff_dca_bits_per_sample[8]` — a `0` entry marks a reserved `PCMR` code that
-/// ffmpeg's parser rejects (`DCA_PARSE_ERROR_PCM_RES`); reserved codes are
-/// {4, 7}.
+/// Bits per sample per core `PCMR` code (ETSI TS 102 114); a `0` entry marks a
+/// reserved `PCMR` code that fails header validation as an invalid PCM
+/// resolution; reserved codes are {4, 7}.
 const DTS_CORE_PCMR_BITS: [u8; 8] = [16, 16, 20, 20, 0, 24, 24, 0];
 
-/// Why an access unit was judged undecodable. Each core-header variant is the
-/// exact condition under which ffmpeg's `ff_dca_parse_core_frame_header` returns
-/// the matching `DCA_PARSE_ERROR_*`; `TrackPoisoned` is our whole-track drop.
+/// Why an access unit was judged undecodable. Each core-header variant is a
+/// condition under which the DTS core-frame header (ETSI TS 102 114) is invalid
+/// and a decoder would reject the frame; `TrackPoisoned` is our whole-track drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DropReason {
     DeficitSamples,
@@ -730,19 +739,19 @@ impl DropReason {
     }
 }
 
-/// Decodability gate: a faithful port of ffmpeg's `ff_dca_parse_core_frame_header`
-/// validity checks (libavcodec/dca.c). Returns `Some(reason)` when ffmpeg's own
-/// parser would reject this core frame's header — in which case the packet is
-/// undecodable ("Invalid data found") and dropping it loses nothing a decoder
-/// could have used. Returns `None` (keep) for a decodable header OR if the
-/// header can't be fully read (never false-drop on our own buffer underrun; the
-/// framer only emits AUs whose core is fully buffered and ≥ 96 bytes).
+/// Decodability gate: the core-frame header validity checks from ETSI TS 102
+/// 114. Returns `Some(reason)` when the DTS core-frame header is invalid — in
+/// which case the packet is undecodable ("Invalid data found") and dropping it
+/// loses nothing a decoder could have used. Returns `None` (keep) for a
+/// decodable header OR if the header can't be fully read (never false-drop on
+/// our own buffer underrun; the framer only emits AUs whose core is fully
+/// buffered and ≥ 96 bytes).
 ///
 /// The 4-byte core sync is already validated by the framer, so this reads the
-/// header fields that follow it. ffmpeg's parser does NOT verify the CPF header
-/// CRC (it `skip_bits(16)` past it — dca.c) and the core decoder likewise skips
-/// the audio-header/side-info CRCs (dca_core.c), so no CRC check is mirrored
-/// here: doing so would drop frames ffmpeg decodes fine (false positives).
+/// header fields that follow it. The 16-bit CPF header CRC is not verified (we
+/// skip past it) and the audio-header/side-info CRCs are likewise not checked,
+/// because decoders treat those bytes as optional/ignored — verifying them
+/// would drop frames that decode fine (false positives).
 fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
     let mut r = BitReader::new(au.get(SYNCWORD_BYTES..)?);
 
@@ -782,7 +791,7 @@ fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
     }
     let _predictor_history = r.read_bit()?;
     if crc_present {
-        // ffmpeg only skips the 16-bit header CRC here — it is not verified.
+        // Skip past the 16-bit header CRC here — it is not verified.
         r.skip_bits(16)?;
     }
     let _filter_perfect = r.read_bit()?;
@@ -816,8 +825,8 @@ mod tests {
         let mut data = vec![0u8; size];
         data[0..4].copy_from_slice(&DTS_CORE_SYNC);
         // byte4: FTYPE(0) SHORT(5) CPF(0) NBLKS-high(0). SHORT = 31 makes
-        // deficit_samples = 32 = DCA_PCMBLOCK_SAMPLES, which ffmpeg's parser
-        // (and our decodability gate) require of a real core frame. NBLKS high
+        // deficit_samples = 32 = DTS_PCMBLOCK_SAMPLES, which the decodability
+        // gate (per ETSI TS 102 114) requires of a real core frame. NBLKS high
         // bit (byte4 bit0) stays 0 for NBLKS = 15.
         data[4] = 31u8 << 2;
         // NBLKS = 15 → (15+1)*32 = 512 samples/frame (the DVD/UHD DTS-core norm).
@@ -867,8 +876,8 @@ mod tests {
         // AU = core(512) + a REAL EXSS substream whose XLL payload embeds a DTS
         // core syncword decoding to a plausible size (512). The heuristic-only
         // framer would split here and truncate the lossless extension (the
-        // Dunkirk `dca` "Failed to decode block code(s)" class). Precise EXSS
-        // sizing spans the whole extension to the REAL next core.
+        // Dunkirk "Failed to decode block code(s)" decoder-failure class).
+        // Precise EXSS sizing spans the whole extension to the REAL next core.
         let core = make_dts_core(512);
         let exss = make_exss(600, Some(40));
         let next = make_dts_core(512);
@@ -975,9 +984,9 @@ mod tests {
         // B1: a partial DTS core is buffered, then a concealed gap (PES marked
         // discontinuity) carries a fresh core. The truncated partial must be
         // DROPPED — splicing it makes the framer emit a corrupt sub-core-length
-        // AU (the Dunkirk `dca` "Failed to decode block code(s)" class) and
-        // strands the rest. With the fix the post-gap core is the only AU, and it
-        // carries the post-gap PTS (not the stale pre-gap one).
+        // AU (the Dunkirk "Failed to decode block code(s)" decoder-failure
+        // class) and strands the rest. With the fix the post-gap core is the
+        // only AU, and it carries the post-gap PTS (not the stale pre-gap one).
         let mut parser = DtsParser::new();
 
         // PES 1: first half of a 512-byte core (no boundary marker).
@@ -1124,7 +1133,7 @@ mod tests {
     fn dvd_many_cores_one_pes_are_strictly_monotonic() {
         // Punisher-DVD reproduction: a single PES carrying SEVERAL DTS core
         // frames (the DVD packing) must emit STRICTLY-increasing PTSs. The old
-        // code stamped every AU with the one PES PTS, which ffmpeg rejected as
+        // code stamped every AU with the one PES PTS, which a muxer rejects as
         // "non monotonically increasing dts to muxer: X >= X".
         let mut parser = DtsParser::new();
         let mut stream = Vec::new();
@@ -1171,9 +1180,9 @@ mod tests {
 
     #[test]
     fn dts_core_sfreq_table_matches_the_dca_spec() {
-        // Lock the SFREQ → sample-rate table to ffmpeg's authoritative
-        // `avpriv_dca_sample_rates` (ETSI TS 102 114 Table 6-4). The high-rate
-        // triad in particular — 48 k / 96 k / 192 k at indices 13/14/15 — must not
+        // Lock the SFREQ → sample-rate table to the authoritative values in
+        // ETSI TS 102 114 Table 6-4. The high-rate triad in particular —
+        // 48 k / 96 k / 192 k at indices 13/14/15 — must not
         // be shifted; a wrong entry would compute an N× frame duration and
         // reintroduce PTS drift on a 96/192 kHz DTS stream.
         let mut core = make_dts_core(512);
@@ -1732,8 +1741,8 @@ mod tests {
 
     /// A structurally-framed but UNDECODABLE core: a valid `make_dts_core`
     /// whose reserved header bit is set. It still sizes and syncs correctly (so
-    /// the framer delimits it normally), but ffmpeg's `ff_dca_parse_core_frame_header`
-    /// — and our port — reject it (`DCA_PARSE_ERROR_RESERVED_BIT`). The reserved
+    /// the framer delimits it normally), but the core-frame header validity
+    /// check rejects it as a set reserved bit (ETSI TS 102 114). The reserved
     /// bit is byte9 bit4 in the core header (after SYNC..RATE).
     fn make_bad_dts_core(size: usize) -> Vec<u8> {
         let mut d = make_dts_core(size);
@@ -1753,7 +1762,8 @@ mod tests {
     #[test]
     fn valid_stream_drops_nothing() {
         // A clean stream of decodable cores must pass the gate untouched — the
-        // detector is an exact ffmpeg-parity port, so zero false positives.
+        // detector follows the spec's validity rules exactly, so zero false
+        // positives.
         let mut parser = DtsParser::new();
         let mut stream = Vec::new();
         for _ in 0..5 {
@@ -1859,7 +1869,7 @@ mod tests {
     fn sr_validity_table_marks_reserved_codes() {
         // The core-header sample-rate validity table must have ZERO (reject) at
         // exactly the reserved SFREQ codes {0,4,5,9,10} and a real rate
-        // elsewhere — this is what mirrors ffmpeg's DCA_PARSE_ERROR_SAMPLE_RATE.
+        // elsewhere — this is what drives the invalid-sample-rate rejection.
         for code in 0..16usize {
             let reserved = matches!(code, 0 | 4 | 5 | 9 | 10);
             assert_eq!(
@@ -1872,8 +1882,8 @@ mod tests {
 
     #[test]
     fn every_core_header_error_class_is_detected() {
-        // Exercise each ffmpeg-parity rejection so the port stays faithful.
-        // Start from a decodable core and corrupt one field at a time.
+        // Exercise each header-validity rejection so the gate stays faithful to
+        // the spec. Start from a decodable core and corrupt one field at a time.
         let good = make_dts_core(512);
         assert_eq!(core_header_drop_reason(&good), None);
 
@@ -1913,7 +1923,7 @@ mod tests {
         assert_eq!(core_header_drop_reason(&d), Some(DropReason::LfeFlag));
 
         // pcmr_code reserved (7): pcmr is byte11 bit0 + byte12 bits7-6 → set all
-        // three to 1 (code 7 → ff_dca_bits_per_sample[7] = 0).
+        // three to 1 (code 7 → DTS_CORE_PCMR_BITS[7] = 0, a reserved PCMR code).
         let mut d = good.clone();
         d[11] |= 0x01;
         d[12] |= 0xC0;
@@ -1924,7 +1934,7 @@ mod tests {
     /// through `DtsParser` and writes the emitted access units back out, so the
     /// garbage-extension → core-only drop can be validated against an actual
     /// damaged stream (e.g. the extracted Bourne DTS-HD MA track) end-to-end
-    /// with ffmpeg. Env: `DTS_IN` (input), `DTS_OUT` (output).
+    /// with an external DTS decoder. Env: `DTS_IN` (input), `DTS_OUT` (output).
     ///   cargo test --lib dts::tests::reparse_real_dts_file -- --ignored --nocapture
     #[test]
     #[ignore]

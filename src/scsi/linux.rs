@@ -8,8 +8,9 @@
 //! when `hdr.timeout` expires, and by the time the ioctl returns the
 //! kernel has already done what it can.
 //!
-//! This matches what every reference project does: MakeMKV (8 s sync
-//! ioctl), sg_dd (60 s sync ioctl), the kernel default for SCSI block
+//! This matches established practice for optical/SCSI I/O: a single
+//! synchronous ioctl with a bounded per-command timeout (commonly in the
+//! 8–60 s range), consistent with the Linux kernel default for SCSI block
 //! devices (30 s `/sys/.../timeout`).
 //!
 //! Pre-0.13.20 we ran an async `write() + poll(1.5s) + close-on-timeout +

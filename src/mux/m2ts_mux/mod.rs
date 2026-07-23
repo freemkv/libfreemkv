@@ -1,9 +1,10 @@
 //! Standard MPEG-TS (188-byte packets) muxer — sequential-only.
 //!
 //! Distinct from `super::tsmux::TsMuxer` (BD-TS with 192-byte packets
-//! and the 4-byte TP_extra_header). This muxer emits the IETF / ISO/IEC
-//! 13818-1 wire format that ffmpeg, VLC, and `m2tsindex` consume
-//! out of the box. Use it for plain `.ts` / `.m2ts` files over a
+//! and the 4-byte TP_extra_header). This muxer emits the ITU-T H.222.0 /
+//! ISO/IEC 13818-1 wire format that any conformant transport-stream
+//! demuxer or player consumes out of the box. Use it for plain
+//! `.ts` / `.m2ts` files over a
 //! [`SequentialSink`](crate::io::sink::SequentialSink), and for
 //! MPEG-TS-over-UDP via [`UdpSocketSink`](crate::io::sink::UdpSocketSink).
 //!
@@ -44,8 +45,8 @@
 //!     attached to the video PID's adaptation field every
 //!     `PCR_INTERVAL_PACKETS` packets.
 //!   - No language / descriptor tags, no SCTE-35 markers, no per-PID
-//!     PMT version bumps, no SDT/EIT. Sufficient for "ffmpeg can play
-//!     this back", not for full broadcast deployment.
+//!     PMT version bumps, no SDT/EIT. Sufficient for a conformant
+//!     demuxer to play this back, not for full broadcast deployment.
 
 use std::io::{self, Write};
 
