@@ -589,6 +589,25 @@ pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut
     }
 }
 
+/// Merge per-title AACS key ranges into the sorted, disjoint set the whole-disc map
+/// needs ([`crate::decrypt::AacsKeyMap::entry_for`] requires disjoint ranges).
+/// Titles that share a clip resolve the SAME physical span (same LBAs → same CPS
+/// unit → same key), so a later range that starts before the previous kept range's
+/// end is that duplicate and is dropped. A real disc never produces two DIFFERENT
+/// keys for one LBA, so the drop is a dedup, not a conflict resolution.
+fn merge_content_key_ranges(
+    mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)>,
+) -> Vec<(u32, u32, usize, crate::decrypt::Phase)> {
+    ranges.sort_by_key(|&(s, _, _, _)| s);
+    let mut merged: Vec<(u32, u32, usize, crate::decrypt::Phase)> = Vec::new();
+    for r in ranges {
+        if merged.last().is_none_or(|&(_, e, _, _)| r.0 >= e) {
+            merged.push(r);
+        }
+    }
+    merged
+}
+
 /// Calculate how many bytes of bad/unreadable data fall within a title's extents.
 /// `pub(crate)` so autorip can use it for main-movie lost_ms computation.
 pub fn bytes_bad_in_title(title: &DiscTitle, bad_ranges: &[(u64, u64)]) -> u64 {
@@ -2376,16 +2395,9 @@ impl Disc {
                 crate::mux::resolve_mux_key_map(reader, title, keys, fetch, self.content_format)?;
             ranges.extend_from_slice(map.ranges());
         }
-        ranges.sort_by_key(|&(s, _, _, _)| s);
-        let mut merged: Vec<(u32, u32, usize, crate::decrypt::Phase)> = Vec::new();
-        for r in ranges {
-            // Drop a range that overlaps one already kept (a clip shared by two
-            // titles resolves the same span twice) — entry_for needs disjoint ranges.
-            if merged.last().is_none_or(|&(_, e, _, _)| r.0 >= e) {
-                merged.push(r);
-            }
-        }
-        Ok(crate::decrypt::AacsKeyMap::from_ranges_phased(merged))
+        Ok(crate::decrypt::AacsKeyMap::from_ranges_phased(
+            merge_content_key_ranges(ranges),
+        ))
     }
 
     /// The disc's AACS-encrypted content as a sorted, merged, disjoint set of
@@ -4318,6 +4330,63 @@ mod tests {
     fn merged_extents_dedups_shared_clip() {
         let v = vec![ext(100, 50), ext(100, 50)];
         assert_eq!(merged_extents(v.iter()), vec![(100, 50)]);
+    }
+
+    // ── merge_content_key_ranges (whole-disc AACS map assembly) ────────────────
+    use crate::decrypt::Phase;
+
+    /// Ranges from different titles are sorted by start LBA and kept disjoint.
+    #[test]
+    fn merge_key_ranges_sorts_and_keeps_disjoint() {
+        let v = vec![
+            (500u32, 600u32, 1usize, Phase::All),
+            (100, 200, 0, Phase::All),
+            (300, 400, 2, Phase::All),
+        ];
+        assert_eq!(
+            merge_content_key_ranges(v),
+            vec![
+                (100, 200, 0, Phase::All),
+                (300, 400, 2, Phase::All),
+                (500, 600, 1, Phase::All),
+            ]
+        );
+    }
+
+    /// A clip shared by two titles resolves the SAME span twice; the duplicate is
+    /// dropped so `entry_for` sees a disjoint set (one key for the span).
+    #[test]
+    fn merge_key_ranges_dedups_shared_clip_span() {
+        let v = vec![
+            (100u32, 300u32, 0usize, Phase::All),
+            (100, 300, 0, Phase::All),
+        ];
+        assert_eq!(merge_content_key_ranges(v), vec![(100, 300, 0, Phase::All)]);
+    }
+
+    /// A later range that merely overlaps a kept one (starts before its end) is
+    /// dropped — the map stays disjoint rather than admitting an ambiguous LBA.
+    #[test]
+    fn merge_key_ranges_drops_overlap() {
+        let v = vec![
+            (100u32, 400u32, 0usize, Phase::All),
+            (200, 500, 0, Phase::All),
+        ];
+        assert_eq!(merge_content_key_ranges(v), vec![(100, 400, 0, Phase::All)]);
+    }
+
+    /// Adjacent (touching) ranges are BOTH kept — `r.0 >= prev_end` holds when the
+    /// next starts exactly at the previous end, so no coverage is lost.
+    #[test]
+    fn merge_key_ranges_keeps_adjacent() {
+        let v = vec![
+            (100u32, 200u32, 0usize, Phase::All),
+            (200, 300, 1, Phase::All),
+        ];
+        assert_eq!(
+            merge_content_key_ranges(v),
+            vec![(100, 200, 0, Phase::All), (200, 300, 1, Phase::All)]
+        );
     }
 
     /// A Windows-form optical device path (`\\.\CdRom0`, `\\.\D:`) must never

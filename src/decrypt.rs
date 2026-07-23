@@ -209,6 +209,10 @@ pub struct AacsKeyMap {
     // (start_lba, end_lba, key_idx, phase). An LBA in NO range is passed through
     // untouched — the map is a positive list of "this key here", nothing more.
     ranges: Vec<(u32, u32, usize, Phase)>,
+    // Distinct, sorted key indices the map selects — derived from `ranges` once at
+    // construction so the per-batch decrypt bounds check does not re-allocate/sort
+    // it on every read. Kept in sync by building both in `from_ranges_phased`.
+    key_indices: Vec<usize>,
 }
 
 impl AacsKeyMap {
@@ -228,7 +232,13 @@ impl AacsKeyMap {
     /// for base/CPS). Ranges are sorted; an LBA in no range is passed through.
     pub fn from_ranges_phased(mut ranges: Vec<(u32, u32, usize, Phase)>) -> Self {
         ranges.sort_by_key(|&(start, _, _, _)| start);
-        Self { ranges }
+        let mut key_indices: Vec<usize> = ranges.iter().map(|&(_, _, i, _)| i).collect();
+        key_indices.sort_unstable();
+        key_indices.dedup();
+        Self {
+            ranges,
+            key_indices,
+        }
     }
 
     /// The `(key_idx, phase, range_start_lba)` for the aligned unit at `lba`, or
@@ -264,12 +274,10 @@ impl AacsKeyMap {
     }
 
     /// The distinct key indices this map selects — the CPS units / segments the
-    /// title actually reaches. The resolver secures exactly these up front.
-    pub fn key_indices(&self) -> Vec<usize> {
-        let mut v: Vec<usize> = self.ranges.iter().map(|&(_, _, i, _)| i).collect();
-        v.sort_unstable();
-        v.dedup();
-        v
+    /// title actually reaches. The resolver secures exactly these up front. Computed
+    /// once at construction (see [`from_ranges_phased`](Self::from_ranges_phased)).
+    pub fn key_indices(&self) -> &[usize] {
+        &self.key_indices
     }
 
     /// Build the FMTS **read plan**: the title's aligned units filtered down to
@@ -392,7 +400,7 @@ pub fn decrypt_sectors_mapped(
     // Validate every selectable index up front (fail loud) so the per-unit hot
     // loop can index without bounds churn and a resolver gap never silently
     // passes ciphertext through as "decrypted".
-    for idx in map.key_indices() {
+    for &idx in map.key_indices() {
         if unit_keys.get(idx).is_none() {
             return Err(crate::error::Error::DecryptFailed);
         }
