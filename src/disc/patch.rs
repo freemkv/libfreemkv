@@ -1329,23 +1329,32 @@ impl Disc {
         // PHYSICAL read success, not by decrypt structure: a re-read that returns
         // good bytes recovers the range; a read that errors leaves it NonTrimmed
         // for the next pass. (The old decrypt-VERIFY read gate was removed.)
-        let keys = if opts.decrypt {
+        let mut keys = if opts.decrypt {
             self.decrypt_keys()
         } else {
             crate::decrypt::DecryptKeys::None
         };
         let decrypt_is_aacs = matches!(keys, crate::decrypt::DecryptKeys::Aacs { .. });
+        // AACS decrypting patch: resolve the whole-disc key map up front and decrypt
+        // via the map (identical to `Disc::sweep`). CSS keeps the content-gated
+        // self-descramble path. (Multipass patch is `--raw`, so decrypt is a no-op.)
+        let key_map = if opts.decrypt && decrypt_is_aacs {
+            Some(std::sync::Arc::new(self.resolve_content_key_map(
+                reader,
+                &mut keys,
+                opts.key_fetch.as_ref(),
+            )?))
+        } else {
+            None
+        };
         let content_ranges = self.encrypted_content_ranges();
         let can_gate = !content_ranges.is_empty();
         let mut reader = {
             let mut dec = DecryptingSectorSource::new(reader, keys);
-            if opts.decrypt && can_gate {
+            if let Some(map) = key_map {
+                dec = dec.with_key_map(map);
+            } else if opts.decrypt && can_gate {
                 dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
-            }
-            if decrypt_is_aacs && opts.decrypt {
-                if let Some(cb) = &opts.key_fetch {
-                    dec = dec.with_key_fetch(cb.clone());
-                }
             }
             dec
         };

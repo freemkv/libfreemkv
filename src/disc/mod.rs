@@ -2357,6 +2357,37 @@ impl Disc {
         }
     }
 
+    /// Resolve a WHOLE-DISC AACS key map for a decrypting sweep (`disc:// → iso://`):
+    /// the union of every title's proactive key map ([`crate::mux::resolve_mux_key_map`]),
+    /// so a sequential read of the entire disc decrypts each content unit with its
+    /// mapped key and passes clear filesystem/nav sectors (in no range) through.
+    /// Fails loud (via the per-title resolve) if any content unit's key is missing.
+    /// `keys` is mutated as fetched keys are banked; the merged ranges are disjoint
+    /// (titles that share a clip resolve the same span — the duplicate is dropped).
+    pub(crate) fn resolve_content_key_map(
+        &self,
+        reader: &mut dyn SectorSource,
+        keys: &mut crate::decrypt::DecryptKeys,
+        fetch: Option<&crate::sector::KeyFetch>,
+    ) -> Result<crate::decrypt::AacsKeyMap> {
+        let mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)> = Vec::new();
+        for title in &self.titles {
+            let map =
+                crate::mux::resolve_mux_key_map(reader, title, keys, fetch, self.content_format)?;
+            ranges.extend_from_slice(map.ranges());
+        }
+        ranges.sort_by_key(|&(s, _, _, _)| s);
+        let mut merged: Vec<(u32, u32, usize, crate::decrypt::Phase)> = Vec::new();
+        for r in ranges {
+            // Drop a range that overlaps one already kept (a clip shared by two
+            // titles resolves the same span twice) — entry_for needs disjoint ranges.
+            if merged.last().is_none_or(|&(_, e, _, _)| r.0 >= e) {
+                merged.push(r);
+            }
+        }
+        Ok(crate::decrypt::AacsKeyMap::from_ranges_phased(merged))
+    }
+
     /// The disc's AACS-encrypted content as a sorted, merged, disjoint set of
     /// `(start_lba, sector_count)` ranges — the union of every title's m2ts
     /// stream extents.
@@ -3138,26 +3169,36 @@ impl Disc {
         // clips like Dunkirk's orphan-CPS clip — was removed. There is no scratch
         // verify and no post-sweep clip-anchored pass; decryptability is proven at
         // mux time, not at capture time.)
-        let keys = if opts.decrypt {
+        let mut keys = if opts.decrypt {
             self.decrypt_keys()
         } else {
             crate::decrypt::DecryptKeys::None
         };
         let decrypt_is_aacs = matches!(keys, crate::decrypt::DecryptKeys::Aacs { .. });
-        // Content extent map — only the in-place decrypt path (`opts.decrypt`) gates
-        // on it so clear filesystem / nav sectors pass through untouched.
+        // AACS decrypting sweep: resolve a WHOLE-DISC key map up front (the fetch
+        // secures any missing CPS-unit key, fail-loud) and decrypt via the map —
+        // a clear nav/filesystem sector is in no range and passes through, so no
+        // separate content gate is needed. CSS keeps the content-gated
+        // self-descramble path (the map path is AACS-only).
+        let key_map = if opts.decrypt && decrypt_is_aacs {
+            Some(std::sync::Arc::new(self.resolve_content_key_map(
+                reader,
+                &mut keys,
+                opts.key_fetch.as_ref(),
+            )?))
+        } else {
+            None
+        };
         let content_ranges = self.encrypted_content_ranges();
         let can_gate = !content_ranges.is_empty();
 
         let mut reader = {
             let mut dec = DecryptingSectorSource::new(reader, keys);
-            if opts.decrypt && can_gate {
+            if let Some(map) = key_map {
+                dec = dec.with_key_map(map);
+            } else if opts.decrypt && can_gate {
+                // CSS / clear decrypt: content-gate the self-descramble path.
                 dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
-            }
-            if decrypt_is_aacs && opts.decrypt {
-                if let Some(cb) = &opts.key_fetch {
-                    dec = dec.with_key_fetch(cb.clone());
-                }
             }
             dec
         };
