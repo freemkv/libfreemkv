@@ -1611,6 +1611,36 @@ impl Disc {
         // (BD/UHD speed is set by drive unlock/init, but DVD needs explicit SET CD SPEED)
         session.set_speed(0xFFFF);
 
+        // CSS bus-auth unlock — run BEFORE any scrambled-sector read.
+        // On a CSS-enforcing drive (e.g. the BU40N) the UDF metadata prefetch
+        // below reaches small/menu VOB extents that are themselves CSS-scrambled;
+        // without the bus-auth handshake first, each of those reads is rejected
+        // with sense 05/6F/03 ("read of scrambled sector without authentication")
+        // after a full drive round-trip — ~13s of pure waste on a real disc, and
+        // the prefetch caches nothing. The handshake needs no title info (it takes
+        // no extents), is self-guarding to DVD media, and is non-fatal on failure,
+        // so run it as soon as the drive has classified the disc as a DVD. The
+        // per-VTS title key is NOT recovered here (or anywhere in scan) — it is
+        // cracked keylessly at read/mux time via `css::resolve_dvd_title_key`;
+        // this only unlocks the drive's read gating so those reads can happen.
+        if session.disc_is_dvd() {
+            tracing::info!(target: "freemkv::scan", "phase: CSS — bus-auth unlock (pre-scan)");
+            let drive_id = session.drive_id.clone();
+            let (_, css_unlock_res) = crate::unlock_bridge::run_bus(
+                session.scsi_mut(),
+                &drive_id,
+                freemkv_unlock::DiscKind::Css,
+                &[],
+            );
+            if let Err(e) = css_unlock_res {
+                tracing::warn!(
+                    target: "freemkv::scan",
+                    outcome = ?e,
+                    "CSS bus-auth unlock did not apply; scrambled sectors may be unavailable"
+                );
+            }
+        }
+
         // Read UDF filesystem with buffered sector reader
         tracing::info!(target: "freemkv::scan", "phase: reading UDF filesystem");
         let (capacity, mut buffered, udf_fs) = Self::read_udf(session)?;
@@ -1623,7 +1653,7 @@ impl Disc {
         }
 
         tracing::info!(target: "freemkv::scan", "phase: parsing titles/streams");
-        let mut disc = Self::scan_with(
+        let disc = Self::scan_with(
             &mut buffered,
             capacity,
             handshake,
@@ -1633,119 +1663,21 @@ impl Disc {
         )?;
         tracing::info!(target: "freemkv::scan", titles = disc.titles.len(), format = ?disc.content_format, "phase: titles parsed");
 
-        // CSS key extraction for DVDs (bus auth → disc key → title key).
-        // Must be a single auth session — can't call authenticate() separately.
-        // Route through the DRM dispatcher: probe a title sector, detect
-        // CSS if scrambled, then load via the SCSI auth path.
-        // We already know this is a DVD (MPEG-PS program stream), so drive the
-        // CSS handshake DIRECTLY off the main title's first content sector. We
-        // must NOT first read a scrambled sector to "detect" CSS: a drive that
-        // enforces CSS (e.g. the BU40N) rejects an UNauthenticated read of a
-        // scrambled sector with sense 05/6F/03 ("read of scrambled sector
-        // without authentication"), so a detect-then-auth ordering dead-locks —
-        // detection needs the read, the read needs auth, auth needs detection.
-        // The handshake is itself the detector: on a non-CSS (unencrypted) DVD
-        // the disc-key read fails, `resolve` returns None, and the disc is left
-        // in the clear. This block is DVD-only: gate on `DiscFormat::Dvd`, NOT
-        // `content_format == MpegPs` — HD-DVD `.evo` is ALSO MPEG-PS but is AACS,
-        // not CSS, so it must never enter the CSS/REPORT-KEY handshake (it goes
-        // through the AACS path above). BD/UHD are MPEG-TS and never reach here.
-        if disc.css.is_none() && disc.format == DiscFormat::Dvd && !disc.titles.is_empty() {
-            // CSS title keys are per-VTS, and ONLY the scrambled movie content
-            // carries a non-zero key. Menu / VMG / logo cells (often the
-            // low-LBA first extent) return a ZERO title key over REPORT KEY —
-            // accepting that would leave the whole feature un-descrambled
-            // (raw scrambled bytes passed through as "clear"). So build
-            // candidate LBAs from the MAIN feature (largest title), LARGEST
-            // extent first (the movie body is the biggest scrambled chunk),
-            // and accept the first auth that yields a NON-ZERO title key. A
-            // genuinely unencrypted DVD returns zero for every candidate →
-            // disc stays in the clear. This block is DVD-only (MPEG-PS);
-            // BD/UHD (MPEG-TS) used the AACS handshake above and never reach here.
-            // Main feature = the largest title; its extents, largest (the movie
-            // body) first — that's where the scrambled content with a recoverable
-            // title key lives.
-            let main_extents = match disc
-                .titles
-                .iter()
-                .filter(|t| !t.extents.is_empty())
-                .max_by_key(|t| t.extents.iter().map(|e| e.sector_count as u64).sum::<u64>())
-            {
-                Some(t) => {
-                    let mut v = t.extents.clone();
-                    v.sort_by(|a, b| b.sector_count.cmp(&a.sector_count));
-                    v
-                }
-                None => Vec::new(),
-            };
-            tracing::info!(target: "freemkv::scan", extents = main_extents.len(), "phase: CSS — main feature located");
-            if let Some(unlock_lba) = main_extents.first().map(|e| e.start_lba) {
-                tracing::info!(target: "freemkv::scan", unlock_lba, "phase: CSS — bus-auth unlock");
-                // Unlock the drive's CSS read gating through the uniform
-                // unlocker dispatch: the CSS unlocker matches DiscKind::Css and
-                // runs the bus-auth handshake (self-guarding to DVD media). A
-                // CSS-enforcing drive (the BU40N) refuses to return scrambled
-                // sectors until that handshake has run; we run it purely for that
-                // unlock and IGNORE any key (the descramble key is recovered
-                // keylessly from the scrambled movie data via the known-plaintext
-                // attack — no player keys, no disc-key crack, no REPORT-KEY title
-                // key). Any failure is non-fatal: continue to the crack, which
-                // simply finds nothing if the drive kept the sectors gated.
-                let drive_id = session.drive_id.clone();
-                let (_, css_unlock_res) = crate::unlock_bridge::run_bus(
-                    session.scsi_mut(),
-                    &drive_id,
-                    freemkv_unlock::DiscKind::Css,
-                    &[],
-                );
-                if let Err(e) = css_unlock_res {
-                    tracing::warn!(
-                        target: "freemkv::scan",
-                        outcome = ?e,
-                        "CSS bus-auth unlock did not apply; scrambled sectors may be unavailable"
-                    );
-                }
-                // Size the crack's batch reads to THIS drive's per-command max
-                // (DVD ≈ 16; the USB bridge may be lower) — an over-large
-                // READ(10) fails outright and would scan nothing.
-                let crack_batch = detect_max_batch_sectors(session.device_path());
-                tracing::info!(target: "freemkv::scan", crack_batch, "phase: CSS — known-plaintext crack");
-                let crack_t0 = std::time::Instant::now();
-                let crack_result = crate::css::crack_key_outcome(
-                    session,
-                    &main_extents,
-                    crack_batch,
-                    opts.halt.as_ref(),
-                );
-                tracing::info!(
-                    target: "freemkv::scan",
-                    elapsed_ms = crack_t0.elapsed().as_millis() as u64,
-                    outcome = ?crack_result,
-                    "phase: CSS — crack done"
-                );
-                match crack_result {
-                    crate::css::CrackOutcome::Cracked(state) => {
-                        tracing::debug!(target: "freemkv::disc", "dvd css: title key recovered via known-plaintext crack");
-                        disc.css = Some(state);
-                        disc.encrypted = true;
-                    }
-                    crate::css::CrackOutcome::ScrambledUncracked => {
-                        // Scrambled sectors WERE seen but no key could be
-                        // recovered — the content is encrypted-but-uncrackable.
-                        // Record a hard error so callers fail loudly instead of
-                        // muxing scrambled MPEG as plaintext garbage at exit 0.
-                        tracing::warn!(target: "freemkv::disc", "dvd css: scrambled sectors seen but no title key cracked");
-                        disc.encrypted = true;
-                        disc.css_error = Some(crate::error::Error::CssKeyMissing);
-                    }
-                    crate::css::CrackOutcome::Unencrypted => {
-                        tracing::debug!(target: "freemkv::disc", "dvd css: no scrambled sector seen (genuinely unencrypted)");
-                    }
-                }
-            }
-        }
+        // No CSS key recovery at scan time. DVD CSS keys are per-VTS/per-title,
+        // and the descramble path re-cracks each title's key keylessly from that
+        // title's own extents at the moment its sectors are read/decrypted — so a
+        // single up-front "disc key" is meaningless (it's not valid for the other
+        // titles and every title re-derives its key at read time anyway). The
+        // scan's only CSS responsibility is the bus-auth unlock above, which opens
+        // the drive's read gating so the sweep can read scrambled sectors at all.
+        // Detection is likewise moot: encrypted or not, a DVD muxes identically —
+        // the read-time descrambler cracks a title key if the sectors are
+        // scrambled and is a no-op if they are clear.
 
-        tracing::info!(target: "freemkv::scan", css = disc.css.is_some(), "phase: scan complete");
+        // `disc.css` is intentionally never set at scan time now (per-title CSS
+        // keys are cracked at read/mux time), so log the format the scan actually
+        // determined rather than a key state that is always `None` here.
+        tracing::info!(target: "freemkv::scan", format = ?disc.format, titles = disc.titles.len(), "phase: scan complete");
         Ok(disc)
     }
 

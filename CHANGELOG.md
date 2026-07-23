@@ -4,14 +4,20 @@
 
 ### Fixed
 
-- CSS DVDs whose main title opens with a long clear run no longer mux to garbage.
-  The key crack scanned the largest cell first and gave up in its clear prefix, so
-  the scrambled feature was muxed as plaintext at exit 0. The per-title key is now
-  reused from the scan when it covers the title's VTS, else cracked from the
-  title's extents in playback order; an uncrackable title hard-fails (E7023).
+- CSS DVDs no longer mux to garbage. Every DVD read path — the file-backed mux
+  highway (`build_iso_pipeline`) and the live-drive single-pass `DiscStream` —
+  now resolves the per-VTS title key at read time through one shared step
+  (`resolve_dvd_title_key`), cracked keylessly in playback order from the title's
+  own extents. An uncrackable title hard-fails (E7023) instead of passing
+  scrambled sectors through as plaintext; `--raw` skips the crack entirely; a
+  user Stop mid-crack surfaces as `Halted`.
 
 ### Changed
 
+- DVD scan no longer cracks a title key up front (the key is per-VTS, so a single
+  disc key was meaningless). Scan does only the CSS bus-auth read-unlock — hoisted
+  before the UDF prefetch so scrambled small/menu VOBs no longer cost a rejected
+  read each. Cuts a CSS-DVD scan from ~25s to ~6s.
 - Unlocker report: the DVD entry is renamed `CSS` → `DVD`.
 
 ## [1.5.1] — 2026-07-20
