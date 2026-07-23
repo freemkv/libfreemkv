@@ -136,7 +136,16 @@ fn test_bytes_read_emitted_during_disc_copy() {
     let title = synthetic_title(64);
     let keys = libfreemkv::DecryptKeys::None;
 
-    let mut stream = DiscStream::new(Box::new(reader), title, keys, 60, ContentFormat::BdTs);
+    let mut stream = DiscStream::new(
+        Box::new(reader),
+        title,
+        keys,
+        60,
+        ContentFormat::BdTs,
+        false,
+        None,
+    )
+    .unwrap();
 
     let count = Arc::new(AtomicU64::new(0));
     let count_cb = count.clone();
@@ -286,7 +295,16 @@ fn test_drop_impls_do_not_panic_or_block() {
     let reader = ZeroSectorReader::new(64);
     let title = synthetic_title(64);
     let keys = libfreemkv::DecryptKeys::None;
-    let stream = DiscStream::new(Box::new(reader), title, keys, 60, ContentFormat::BdTs);
+    let stream = DiscStream::new(
+        Box::new(reader),
+        title,
+        keys,
+        60,
+        ContentFormat::BdTs,
+        false,
+        None,
+    )
+    .unwrap();
 
     // Drop on a worker thread; main thread enforces the timeout.
     let handle = std::thread::spawn(move || {

@@ -209,14 +209,34 @@ impl DiscStream {
     /// The caller opens the source, scans for titles/keys, and passes them in.
     /// The stream handles demuxing, decryption, and codec parsing internally.
     pub fn new(
-        reader: Box<dyn SectorSource>,
+        mut reader: Box<dyn SectorSource>,
         title: DiscTitle,
-        decrypt_keys: crate::decrypt::DecryptKeys,
+        mut decrypt_keys: crate::decrypt::DecryptKeys,
         batch_sectors: u16,
         content_format: crate::disc::ContentFormat,
-    ) -> Self {
+        raw: bool,
+        halt: Option<Halt>,
+    ) -> std::io::Result<Self> {
         let mut title = title;
         let extents = title.extents.clone();
+
+        // Resolve this title's CSS key from the reader if the caller supplied
+        // none — the SAME shared step the file-backed mux highway
+        // (`build_iso_pipeline`) uses, so single-pass and multi-pass descramble a
+        // DVD identically. No-op for AACS / already-keyed / genuinely-clear input
+        // or `raw`; a scrambled-but-uncrackable DVD is a hard `CssKeyMissing`.
+        // `halt` is passed here (not deferred to `with_halt`) so a Stop during the
+        // crack scan is honored — the scan runs at construction, before the caller
+        // can attach a token.
+        crate::css::resolve_dvd_title_key(
+            &mut *reader,
+            &extents,
+            &mut decrypt_keys,
+            batch_sectors,
+            content_format,
+            raw,
+            halt.as_ref(),
+        )?;
         let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
         // Debug log reader type at construction — critical for diagnosing mux
@@ -301,7 +321,7 @@ impl DiscStream {
             .map(|_| super::resync::ResyncGate::new())
             .collect();
 
-        Self {
+        Ok(Self {
             reader,
             title,
             decrypt_keys,
@@ -315,7 +335,7 @@ impl DiscStream {
             errors: 0,
             lost_bytes: 0,
             skip_errors: false,
-            halt: None,
+            halt,
             event_fn: None,
             eof: false,
             dropped_nav_packets: 0,
@@ -330,7 +350,7 @@ impl DiscStream {
             profiling: std::env::var_os("FREEMKV_PROFILE").is_some(),
             resync,
             is_video,
-        }
+        })
     }
 
     /// Set event handler for sector-level events (binary search, skip, recover).
@@ -1094,7 +1114,10 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
-        );
+            false,
+            None,
+        )
+        .unwrap();
 
         let mut src: Box<dyn Stream> = Box::new(stream);
 
@@ -1129,7 +1152,10 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             crate::disc::ContentFormat::BdTs,
+            false,
+            None,
         )
+        .unwrap()
         .with_halt(halt.clone());
         assert!(!stream.is_halted());
         halt.cancel();
@@ -1161,7 +1187,10 @@ mod tests {
             aacs,
             8,
             ContentFormat::BdTs,
+            false,
+            None,
         )
+        .unwrap()
         .with_key_map(std::sync::Arc::new(map));
         let total: u32 = stream.extents.iter().map(|e| e.sector_count).sum();
         assert_eq!(
@@ -1320,7 +1349,10 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
-        );
+            false,
+            None,
+        )
+        .unwrap();
         // skip_errors=false: if the recovery read did NOT succeed, fill_extents
         // would return Err — so reaching EOF cleanly proves recovery worked.
         stream.skip_errors = false;
@@ -1433,7 +1465,10 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
-        );
+            false,
+            None,
+        )
+        .unwrap();
         stream.skip_errors = true;
 
         // Drive fill_extents across batches: the good leading sectors mux fine,
@@ -1493,7 +1528,10 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
-        );
+            false,
+            None,
+        )
+        .unwrap();
         stream.skip_errors = true;
 
         let res = stream.fill_extents();
@@ -1539,7 +1577,16 @@ mod tests {
             read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
-        let mut stream = DiscStream::new(Box::new(reader), title, keys, 8, ContentFormat::BdTs);
+        let mut stream = DiscStream::new(
+            Box::new(reader),
+            title,
+            keys,
+            8,
+            ContentFormat::BdTs,
+            false,
+            None,
+        )
+        .unwrap();
         stream.skip_errors = true;
         assert_eq!(
             stream.unit_align, ALIGN as u16,
@@ -1635,7 +1682,10 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
-        );
+            false,
+            None,
+        )
+        .unwrap();
         stream.skip_errors = true;
         assert_eq!(stream.unit_align, 1, "None keys must leave unit_align=1");
 
@@ -1676,13 +1726,89 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             crate::disc::ContentFormat::BdTs,
+            false,
+            None,
         )
+        .unwrap()
         .with_halt(Halt::from_arc(arc.clone()));
         assert!(!stream.is_halted());
         arc.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(
             stream.is_halted(),
             "with_halt(Halt::from_arc) must observe Arc-side flips"
+        );
+    }
+
+    /// Every read fails CSS-locked (`05/6F/03`) — a scrambled DVD whose title key
+    /// can't be cracked. Drives `resolve_dvd_title_key` to `ScrambledUncracked`.
+    struct LockedReader;
+    impl crate::sector::SectorSource for LockedReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            Err(crate::error::Error::DiscRead {
+                sector: lba as u64,
+                status: Some(2),
+                sense: Some(crate::scsi::ScsiSense {
+                    sense_key: 0x05,
+                    asc: 0x6F,
+                    ascq: 0x03,
+                }),
+            })
+        }
+        fn capacity_sectors(&self) -> u32 {
+            64
+        }
+    }
+
+    fn mpegps_title(sector_count: u32) -> DiscTitle {
+        let mut t = synthetic_title(sector_count);
+        t.content_format = ContentFormat::MpegPs;
+        t
+    }
+
+    /// PARITY with `build_iso_pipeline_dvd_none_keys_scrambled_hard_fails`: the
+    /// live-drive single-pass constructor must ALSO hard-fail (not build a
+    /// scrambled-passthrough stream) for a `None`-keyed scrambled MPEG-PS DVD —
+    /// the exact 328k-decode-error corruption path, on the single-pass side.
+    #[test]
+    fn disc_stream_new_dvd_none_scrambled_hard_fails() {
+        let res = DiscStream::new(
+            Box::new(LockedReader),
+            mpegps_title(8),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::MpegPs,
+            false,
+            None,
+        );
+        assert!(
+            res.is_err(),
+            "single-pass DiscStream must hard-fail on a scrambled, keyless CSS DVD"
+        );
+    }
+
+    /// `raw` must bypass the CSS crack at the DiscStream boundary too: the same
+    /// scrambled-uncrackable input that hard-fails above must CONSTRUCT in raw
+    /// mode (ciphertext passthrough), never hard-fail.
+    #[test]
+    fn disc_stream_new_raw_bypasses_css_crack() {
+        let res = DiscStream::new(
+            Box::new(LockedReader),
+            mpegps_title(8),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::MpegPs,
+            true, // raw
+            None,
+        );
+        assert!(
+            res.is_ok(),
+            "raw single-pass must construct without cracking, even on scrambled-uncrackable input"
         );
     }
 }
