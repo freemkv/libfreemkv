@@ -1180,7 +1180,7 @@ mod tests {
         };
         // 100 units (300 sectors). A 10-unit Even forensic segment at LBA [30,60):
         // even units (30,36,42,48,54) are ours; odd (33,39,45,51,57) are dropped.
-        let map = AacsKeyMap::from_ranges_phased(vec![(30, 60, 1, Phase::Even)], 0);
+        let map = AacsKeyMap::from_ranges_phased(vec![(30, 60, 1, Phase::Even)]);
         let stream = DiscStream::new(
             Box::new(ZeroReader { capacity: 300 }),
             synthetic_title(300),

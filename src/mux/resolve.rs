@@ -951,9 +951,33 @@ fn resolve_fmts_key_map(
         return Err(crate::error::Error::FmtsKeyMissing.into());
     }
 
-    Ok(Some(crate::decrypt::AacsKeyMap::from_ranges_phased(
-        ranges, base_idx,
-    )))
+    // Cover the NON-segment content with the base Unit Key: the forensic segments
+    // (added above with their index keys) carve holes out of the title's content
+    // extents; every other content unit uses the base UK. Fill the gaps so the map
+    // is a complete positive list — an LBA in no range is nav and passes through.
+    let cuts: Vec<(u32, u32)> = {
+        let mut c: Vec<(u32, u32)> = ranges.iter().map(|&(s, e, _, _)| (s, e)).collect();
+        c.sort_unstable();
+        c
+    };
+    for ext in &title.extents {
+        let end = ext.start_lba.saturating_add(ext.sector_count);
+        let mut cur = ext.start_lba;
+        for &(cs, ce) in &cuts {
+            if ce <= cur || cs >= end {
+                continue; // cut outside this extent
+            }
+            if cs > cur {
+                ranges.push((cur, cs, base_idx, crate::decrypt::Phase::All));
+            }
+            cur = cur.max(ce);
+        }
+        if cur < end {
+            ranges.push((cur, end, base_idx, crate::decrypt::Phase::All));
+        }
+    }
+
+    Ok(Some(crate::decrypt::AacsKeyMap::from_ranges_phased(ranges)))
 }
 
 /// Resolve the proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap) for a title
@@ -971,11 +995,22 @@ fn resolve_fmts_key_map(
 /// ciphertext samples, where the `is_clean` proof IS sound). The mux then just
 /// decrypts each unit with its mapped key and trusts it.
 ///
-/// Single-CPS (the overwhelming majority, incl. every single-key UHD) is the
-/// trivial map: one key everywhere, no sampling. Multi-CPS assigns each extent to
-/// the key that opens a real sample from it; a bad-content extent no sample can
-/// classify inherits its predecessor's key (contiguity). FMTS segment mapping
-/// layers onto the same structure.
+/// Single-CPS (the overwhelming majority, incl. every single-key UHD) keys every
+/// content extent with one index; multi-CPS keys each extent with the key that
+/// opens a real sample from it; FMTS layers per-segment index keys on top. Any LBA
+/// outside the title's content (nav/filesystem) is in no range and passes through.
+///
+/// A single-key content map: every content extent → `idx`; everything else passes
+/// through. The positive-map replacement for the old "one key everywhere" default.
+fn content_map(title: &DiscTitle, idx: usize) -> crate::decrypt::AacsKeyMap {
+    let ranges = title
+        .extents
+        .iter()
+        .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count), idx))
+        .collect();
+    crate::decrypt::AacsKeyMap::from_ranges(ranges)
+}
+
 pub fn resolve_mux_key_map(
     reader: &mut dyn SectorSource,
     title: &DiscTitle,
@@ -994,8 +1029,9 @@ pub fn resolve_mux_key_map(
     // always >= 1 for the AACS map paths below.
     let pool_len = match keys {
         crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => unit_keys.len(),
-        // CSS / clear: no AACS map (the decorator's map path is AACS-only).
-        _ => return Ok(crate::decrypt::AacsKeyMap::single(0)),
+        // CSS / clear: the AACS map keys nothing here — an empty map passes every
+        // unit through (CSS self-descrambles on its own path).
+        _ => return Ok(crate::decrypt::AacsKeyMap::from_ranges(Vec::new())),
     };
     // FMTS (AACS 2.1): if the disc carries `IndividualSegment.tbl`, the forensic
     // segments need per-index keys the base Unit Key can't open. Resolve them up
@@ -1006,8 +1042,8 @@ pub fn resolve_mux_key_map(
         return Ok(map);
     }
     if pool_len == 1 {
-        // One CPS unit → one key everywhere. No structural walk, no sampling.
-        return Ok(crate::decrypt::AacsKeyMap::single(0));
+        // One CPS unit → key 0 over every content extent; nav passes through.
+        return Ok(content_map(title, 0));
     }
 
     // Multi-CPS: read a spread of real encrypted units from each extent and pick
@@ -1095,7 +1131,7 @@ pub fn resolve_mux_key_map(
             idx,
         ));
     }
-    Ok(crate::decrypt::AacsKeyMap::from_ranges(ranges, 0))
+    Ok(crate::decrypt::AacsKeyMap::from_ranges(ranges))
 }
 
 /// Assemble the ISO mux pipeline (read+decrypt → demux → parse) for
