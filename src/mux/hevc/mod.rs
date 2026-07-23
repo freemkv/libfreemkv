@@ -29,8 +29,8 @@ const HEVC_NAL_TYPE_MASK: u8 = 0x3F;
 ///
 /// One instance per output stream. Tracks whether parameter sets have
 /// already been emitted so they're written exactly once at the head of
-/// the stream, mirroring the convention used by `ffmpeg -c:v copy -f
-/// hevc`.
+/// the stream, per the Annex B convention of ITU-T H.265 / ISO/IEC
+/// 23008-2 (parameter sets precede the coded slices they govern).
 pub struct HevcMux<W: Write> {
     writer: W,
     /// `HEVCDecoderConfigurationRecord` payload (hvcC). Parsed lazily

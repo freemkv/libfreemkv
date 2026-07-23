@@ -485,9 +485,9 @@ pub fn key_fetch(
 ///
 /// "Encrypted" is decided by [`crate::aacs::content::aacs_unit_encrypted`] — the
 /// AACS Copy Permission Indicator (CPI) in the top 2 bits of byte 0, the
-/// spec-correct signal (`buf[0] & 0xc0`). NOT the `ts_sync_destroyed`
-/// sync heuristic: destroyed TS syncs do not imply encryption (an FMTS variant
-/// frame or an odd clear unit can lack syncs yet be unencrypted), and a clear
+/// spec-correct signal (`buf[0] & 0xc0`). NOT the `is_clean` TS-sync
+/// heuristic: a unit lacking clean TS syncs does not imply encryption (an FMTS
+/// variant frame or an odd clear unit can lack syncs yet be unencrypted), and a clear
 /// unit sent to a key server yields nothing to validate against — the "0
 /// encrypted units" rejection. A clip opens with clear navigation units (PAT/PMT,
 /// menus) whose CPI is clear; only CPI-flagged content units are collected —
@@ -818,6 +818,55 @@ mod tests {
         assert_eq!(*builds.lock().unwrap(), 1, "make_sources invoked per fetch");
     }
 
+    /// `key_fetch` memoizes each operation by the fingerprint of the sample batch:
+    /// identical samples reuse the cached keys (no rebuild), different samples miss,
+    /// the two operations keep independent caches, and even an empty reply is cached.
+    #[test]
+    fn key_fetch_memoizes_per_op_by_sample_fingerprint() {
+        let builds = Arc::new(Mutex::new(0usize));
+        let builds_c = Arc::clone(&builds);
+        let key = [0x11u8; 16];
+        let make: Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync> = Arc::new(move || {
+            *builds_c.lock().unwrap() += 1;
+            vec![Box::new(HasKey(key)) as Box<dyn KeySource>]
+        });
+        let cb = key_fetch(empty_inputs(), make);
+        let a = vec![vec![0xAAu8; 8]];
+        let b = vec![vec![0xBBu8; 8]];
+
+        // First resolve for `a` builds sources; the identical repeat is cached.
+        assert_eq!(cb.unit_keys(&a), vec![key]);
+        assert_eq!(cb.unit_keys(&a), vec![key]);
+        assert_eq!(
+            *builds.lock().unwrap(),
+            1,
+            "identical samples reuse the cache"
+        );
+
+        // A different sample batch is a cache miss → one more build.
+        assert_eq!(cb.unit_keys(&b), vec![key]);
+        assert_eq!(
+            *builds.lock().unwrap(),
+            2,
+            "different samples miss the cache"
+        );
+
+        // The forensic op has its OWN cache (HasKey has no forensic keys → empty),
+        // so `a` builds once more here; its empty reply is then cached too.
+        assert!(cb.fmts_indexes(&a).is_empty());
+        assert_eq!(
+            *builds.lock().unwrap(),
+            3,
+            "unit/fmts caches are independent"
+        );
+        assert!(cb.fmts_indexes(&a).is_empty());
+        assert_eq!(
+            *builds.lock().unwrap(),
+            3,
+            "an empty reply is cached, not re-asked"
+        );
+    }
+
     /// The two `KeyFetch` operations route to the two DISTINCT trait methods:
     /// `unit_keys` drives `get_unit_keys`, `fmts_indexes` drives
     /// `get_fmts_indexes`. A source that returns different keys per method proves
@@ -982,12 +1031,12 @@ mod tests {
     }
 
     /// DISCRIMINATING: selection is by the AACS CPI (byte 0), NOT the
-    /// `ts_sync_destroyed` heuristic. Half the units are sync-destroyed but
+    /// TS-sync clarity heuristic. Half the units lack TS syncs but are
     /// CPI-CLEAR (`byte0 & 0xC0 == 0`) — genuinely UNencrypted units that merely
     /// lack TS syncs; the old sampler collected these and the key server rejected
     /// the POST as "0 encrypted units". `read_encrypted_units` must skip them and
-    /// return ONLY CPI-flagged units. A regression to `ts_sync_destroyed` would
-    /// collect the CPI-clear units too and fail the `& 0xC0` assertion.
+    /// return ONLY CPI-flagged units. A regression to selecting by TS-sync clarity
+    /// would collect the CPI-clear units too and fail the `& 0xC0` assertion.
     #[test]
     fn read_encrypted_units_selects_by_cpi_not_ts_sync() {
         use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
@@ -996,7 +1045,8 @@ mod tests {
 
         // Even units: CPI-clear (byte0 & 0xC0 == 0) AND sync-destroyed (no 0x47).
         // Odd units:  CPI-set (byte0 = 0xC0) with a scrambled body.
-        // `ts_sync_destroyed` is TRUE for BOTH; `aacs_unit_encrypted` only odd.
+        // Neither has clean TS syncs, so `is_clean` is FALSE for BOTH;
+        // `aacs_unit_encrypted` flags only the odd units.
         struct MixSource {
             ext_start: u32,
             total_units: u32,

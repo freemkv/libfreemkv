@@ -34,16 +34,28 @@ fn chapters_vtt(chapters: &[Chapter]) -> String {
     let mut s = String::from("WEBVTT\n\n");
     for (i, c) in chapters.iter().enumerate() {
         let start = c.time_secs.max(0.0);
+        // Each cue runs until the next chapter. WebVTT drops a cue whose end is not
+        // strictly after its start, so the last chapter (and any degenerate
+        // equal-timestamp pair) gets a 1 s minimum duration rather than being lost.
         let end = chapters
             .get(i + 1)
             .map(|n| n.time_secs.max(0.0))
-            .unwrap_or(start);
+            .filter(|&e| e > start)
+            .unwrap_or(start + 1.0);
+        // No localized prose in the library (see Chapter::name): emit the bare
+        // name, or a plain ordinal when unnamed — the app prepends any "Chapter "
+        // prefix in the user's language. Matches chapters_xml / chapters_ogm.
+        let name = if c.name.is_empty() {
+            (i + 1).to_string()
+        } else {
+            c.name.clone()
+        };
         s.push_str(&format!(
-            "{}\n{} --> {}\nChapter {}\n\n",
+            "{}\n{} --> {}\n{}\n\n",
             i + 1,
             vtt_time(start),
             vtt_time(end),
-            c.name
+            name
         ));
     }
     s
@@ -231,8 +243,13 @@ pub struct JsonSink {
 
 impl JsonSink {
     pub fn create(path: &Path, title: &DiscTitle) -> io::Result<Self> {
-        let doc =
-            serde_json::to_string_pretty(&title_json(title)).unwrap_or_else(|_| "{}".to_string());
+        // Serializing our own `Value` is infallible in practice (serde_json maps
+        // any non-finite float to `null` at Value construction, so `title_json`
+        // never holds an unencodable value); still, propagate rather than silently
+        // writing "{}" if that ever changes — an empty metadata file must not
+        // masquerade as a successful json:// export.
+        let doc = serde_json::to_string_pretty(&title_json(title))
+            .map_err(|_| crate::error::Error::MkvInvalid)?;
         let mut f = File::create(path)?;
         f.write_all(doc.as_bytes())?;
         f.write_all(b"\n")?;

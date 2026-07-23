@@ -1,20 +1,22 @@
 //! AAC ADTS decodability gate.
 //!
-//! ffmpeg's `ff_adts_header_parse` (adts_header.c) has exactly three hard
-//! rejects: syncword != 0xFFF, a reserved `sampling_frequency_index`
-//! (`ff_mpeg4audio_sample_rates[sr] == 0`, i.e. index ≥ 13), and
-//! `aac_frame_length < 7`. It does NOT verify the optional ADTS CRC (it only
-//! `skip_bits(16)` past it). So the gate mirrors those three rejects: a packet
-//! that begins with the ADTS sync but is otherwise malformed is dropped; a
-//! packet with no ADTS sync is raw AAC (e.g. from mp4, which carries no ADTS
-//! header) or a continuation and passes through unchanged — never false-dropped.
-//! Raw AAC has no per-frame integrity data, so like LPCM it cannot be gated.
+//! Per the ADTS framing defined in ISO/IEC 13818-7 / ISO/IEC 14496-3, a header
+//! is structurally invalid in exactly three ways this gate treats as hard
+//! rejects: syncword != 0xFFF, a reserved `sampling_frequency_index` (the sample
+//! rate table has 13 valid entries, so index ≥ 13 is reserved), and
+//! `aac_frame_length < 7` (shorter than the fixed+variable header itself). The
+//! optional 16-bit ADTS CRC is not verified here — it is simply skipped. So the
+//! gate enforces those three rejects: a packet that begins with the ADTS sync
+//! but is otherwise malformed is dropped; a packet with no ADTS sync is raw AAC
+//! (e.g. from an MP4 container, which carries no ADTS header) or a continuation
+//! and passes through unchanged — never false-dropped. Raw AAC has no per-frame
+//! integrity data, so like LPCM it cannot be gated.
 
 use super::dropgate::DropTally;
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
-/// `ff_mpeg4audio_sample_rates` — 13 valid entries; indices 13/14/15 are 0
-/// (reserved), which is exactly what ffmpeg rejects.
+/// ADTS `sampling_frequency_index` table (ISO/IEC 14496-3) — 13 valid entries;
+/// indices 13/14/15 are 0 (reserved) and constitute a hard reject.
 const ADTS_SAMPLE_RATE_VALID: [u32; 16] = [
     96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350, 0, 0,
     0,
@@ -24,10 +26,10 @@ const ADTS_SAMPLE_RATE_VALID: [u32; 16] = [
 enum AdtsVerdict {
     /// No 12-bit ADTS sync at the head — not an ADTS frame we can validate.
     NoSync,
-    /// Sync present and the three ffmpeg-checked fields are legal.
+    /// Sync present and the three structural fields are legal.
     Valid,
     /// Sync present but a reserved sample-rate index or a sub-header
-    /// frame-length — ffmpeg's parser rejects this.
+    /// frame-length — structurally invalid per the ADTS spec.
     Invalid,
 }
 
@@ -56,6 +58,10 @@ fn adts_verdict(data: &[u8]) -> AdtsVerdict {
 
 pub struct AdtsParser {
     tally: DropTally,
+    /// Last emitted PTS (ns). A PES with no PTS (legal for audio, e.g. a
+    /// post-discontinuity continuation) carries this forward rather than resetting
+    /// the timeline to 0 — matching the AC-3/DTS parsers and preserving A/V sync.
+    last_pts_ns: i64,
 }
 
 impl Default for AdtsParser {
@@ -68,6 +74,7 @@ impl AdtsParser {
     pub fn new() -> Self {
         Self {
             tally: DropTally::new("aac"),
+            last_pts_ns: 0,
         }
     }
 
@@ -85,7 +92,12 @@ impl CodecParser for AdtsParser {
         if pes.data.is_empty() {
             return Vec::new();
         }
-        let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
+        let pts_ns = pes
+            .pts
+            .or(pes.dts)
+            .map(pts_to_ns)
+            .unwrap_or(self.last_pts_ns);
+        self.last_pts_ns = pts_ns;
 
         let drop =
             self.tally.is_poisoned() || matches!(adts_verdict(&pes.data), AdtsVerdict::Invalid);
@@ -160,6 +172,22 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].pts_ns, pts_to_ns(90000));
         assert_eq!(p.dropped_frames(), 0);
+    }
+
+    #[test]
+    fn pes_without_pts_carries_last_timestamp_not_zero() {
+        // A PES with no PTS (legal for audio, e.g. after a discontinuity) must
+        // carry the last known timestamp forward — resetting to 0 would corrupt
+        // A/V sync.
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(adts_frame(400), Some(90000)));
+        let f = p.parse(&make_pes(adts_frame(400), None));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].pts_ns,
+            pts_to_ns(90000),
+            "carried forward, not reset to 0"
+        );
     }
 
     #[test]

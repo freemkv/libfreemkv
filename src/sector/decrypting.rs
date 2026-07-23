@@ -19,6 +19,11 @@ use std::sync::Arc;
 
 use super::SectorSource;
 
+/// A closure resolving keys from encrypted-content samples — the shape of both
+/// [`KeyFetch`] operations. Named so the two constructors (and the struct fields)
+/// read clearly.
+pub type KeyFetchFn = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Vec<[u8; 16]> + Send + Sync>;
+
 /// Application-supplied "fetch a fresh key for THIS data" callback.
 ///
 /// Invoked by [`DecryptingSectorSource`] when a read contains scrambled AACS
@@ -49,11 +54,6 @@ use super::SectorSource;
 /// mutable state (its call-count cap and spent flag), so one `KeyFetch` is built
 /// once and cloned cheaply (two `Arc` bumps) into every read path. `Send + Sync`
 /// so it can ride the mux highway's producer thread.
-/// A closure resolving keys from encrypted-content samples — the shape of both
-/// [`KeyFetch`] operations. Named so the two constructors (and the struct fields)
-/// read clearly.
-pub type KeyFetchFn = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Vec<[u8; 16]> + Send + Sync>;
-
 #[derive(Clone)]
 pub struct KeyFetch {
     unit: KeyFetchFn,
@@ -187,7 +187,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// (sorted/merged `(start_lba, sector_count)` — see
     /// [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)).
     /// Units outside content (UDF filesystem / BDMV nav) pass through untouched,
-    /// so [`ts_sync_destroyed`](crate::aacs::content::ts_sync_destroyed) is never consulted
+    /// so the TS-sync content check is never consulted
     /// about non-content bytes. Whole-disc readers (sweep / patch) set this; the
     /// mux leaves it unset because it only ever reads title extents.
     pub fn with_content_ranges(mut self, ranges: Arc<[(u32, u32)]>) -> Self {
@@ -338,11 +338,11 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         // FRESH-KEY-ON-FAILURE: hand a unit no held key opened (as its on-disc
         // ciphertext) to the application's key source; any returned key is added to
         // the pool and the read is re-decrypted, caching the key for later units.
-        // The pass-through result is the consumer's concern — the decorator never
-        // counts a decrypt-quality miss as loss. Genuine missing data is the
-        // zero-filled sectors the physical read layer records, not a TS-structure
-        // miss; a real can't-decrypt (empty pool / misalignment) already surfaced
-        // as `Err` from `decrypt_buf`.
+        // If the source is asked for this exact ciphertext and STILL cannot supply a
+        // key (the recovery's residual `dropped > 0`), the unit is genuinely
+        // unresolvable — this decrypting sweep/patch path FAILS LOUD rather than
+        // write the still-encrypted bytes into the output as if they were clear
+        // content (the mux path fails loud the same way via `decrypt_sectors_mapped`).
         if dropped > 0 && self.recovery.is_some() {
             // Rare miss only: the in-place decrypt overwrote `buf`, so RE-READ the
             // on-disc ciphertext for the key-fetch retry. This keeps the happy path
@@ -368,7 +368,10 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
                 .as_mut()
                 .expect("recovery.is_some() checked above");
             let cipher = &self.cipher_scratch[..n];
-            let _ = r(&mut buf[..n], cipher, &mut self.keys, &rctx);
+            let outcome = r(&mut buf[..n], cipher, &mut self.keys, &rctx);
+            if outcome.dropped > 0 {
+                return Err(crate::error::Error::DecryptFailed);
+            }
         }
         Ok(n)
     }
@@ -701,8 +704,8 @@ mod tests {
 
     /// A source that yields exactly one CLEAR AACS aligned unit (6144
     /// bytes = 3 sectors) with MPEG-TS sync bytes (0x47) at the BD-TS
-    /// stride (offset 4, then every 192 bytes). `ts_sync_destroyed`
-    /// reports such a unit as NOT scrambled, so the AACS decrypt path
+    /// stride (offset 4, then every 192 bytes). `is_clean`
+    /// reports such a unit as clear (not scrambled), so the AACS decrypt path
     /// reaches the per-unit closure and leaves it untouched — letting
     /// us prove the unit-key LOOKUP (not the cipher) is what fails for
     /// an out-of-range index.

@@ -99,7 +99,8 @@ fn hevc_first_slice_coding_type(nal: &[u8], nal_type: u8, num_extra: u32) -> Opt
 pub struct HevcParser {
     // First-seen parameter set of each type → seeds the MKV codecPrivate (hvcC).
     // This is the ONLY copy the player gets out-of-band, and a player re-applies
-    // it at every keyframe (ffmpeg's hvcC→Annex-B insertion). A stream may
+    // it at every keyframe (the hvcC→Annex-B parameter-set insertion a decoder
+    // performs). A stream may
     // redefine a parameter set mid-title under the SAME id with a different body
     // (some discs redefine PPS id 0 partway through). Any occurrence whose body
     // DIFFERS from this codecPrivate copy must therefore be emitted IN-BAND at
@@ -116,8 +117,9 @@ pub struct HevcParser {
     // set mid-title (e.g. PPS id 0 body changes partway through, then the
     // source STOPS repeating it at later IRAPs and relies on the decoder
     // retaining it), a raw decode is fine — but an hvcC/MKV decode is NOT: a
-    // player re-applies the codecPrivate set at EVERY keyframe (ffmpeg's
-    // hvcC→Annex-B insertion), reverting id 0 to the stale FIRST body. We must
+    // player re-applies the codecPrivate set at EVERY keyframe (the
+    // hvcC→Annex-B parameter-set insertion), reverting id 0 to the stale FIRST
+    // body. We must
     // therefore re-emit the active set IN-BAND at every keyframe whenever it
     // differs from the codecPrivate copy and the access unit didn't already
     // carry it. See `parse`.
@@ -364,9 +366,10 @@ impl HevcParser {
 /// codecPrivate copy (`first`). The two player behaviours for hvcC-in-MKV
 /// diverge exactly here:
 ///
-/// - A *seek-capable / Annex-B* player (e.g. ffmpeg's `hevc_mp4toannexb`)
-///   re-applies the hvcC sets at every keyframe. `reassert_active` handles it.
-/// - A *streaming* decode (ffmpeg decoding the MKV directly — what most
+/// - A *seek-capable / Annex-B* player (one that converts hvcC to Annex-B by
+///   inserting the parameter sets) re-applies the hvcC sets at every keyframe.
+///   `reassert_active` handles it.
+/// - A *streaming* decode (a decoder consuming the MKV directly — what most
 ///   integrity checkers do) applies hvcC ONCE at init and thereafter updates a
 ///   parameter set ONLY from an in-band NAL.
 ///
@@ -427,7 +430,7 @@ fn handle_param_set(
 /// or SPS event), nothing re-sends it and every subsequent slice fails with
 /// "PPS id out of range" until the next genuine change (observed as a ~24 min
 /// corrupt band on one dual-layer UHD title). Re-asserting the active set at
-/// EVERY keyframe — what compliant muxers (mkvmerge) do at every IRAP — makes
+/// EVERY keyframe — what compliant Matroska muxers do at every IRAP — makes
 /// streaming decode self-healing. Re-sending an identical param set is benign
 /// (decoders expect it at IRAPs); cost is a few hundred bytes per keyframe.
 /// This strictly supersets the earlier change-only re-assert, so the

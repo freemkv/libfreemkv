@@ -22,6 +22,26 @@ use std::path::Path;
 
 const NS: i128 = 1_000_000_000;
 
+/// Upper bound on the number of tracks. Track count is otherwise unbounded (a
+/// crafted moov can pack tens of thousands of `trak` boxes), and the per-track
+/// PID is `0x1011 + track_idx` — which overflows u16 past ~61k tracks. Real
+/// titles have well under a hundred tracks.
+const MAX_TRACKS: usize = 512;
+
+/// Upper bound on a track's decoded sample count. MP4 sample-table fields
+/// (`stsz` sample_count, `stts`/`ctts` run-lengths) are untrusted 32-bit values;
+/// a crafted box can declare billions of entries in a few bytes. Real titles stay
+/// far under this (a 10 h/60 fps track is ~2M samples), so clamping to it caps a
+/// hostile file's allocation without truncating any legitimate track.
+const MAX_SAMPLE_COUNT: usize = 1 << 24;
+
+/// Absolute ceiling on a single allocation sized from an untrusted MP4 field (a
+/// per-sample buffer or the `moov` payload). The EOF check alone is not enough:
+/// `file_len` is cheaply inflatable with a sparse file (`truncate -s 8G`), so a
+/// crafted stsz size or moov box size just under an 8 GiB apparent length would
+/// otherwise force a multi-GiB allocation. No real sample or moov approaches this.
+const MAX_ALLOC_BYTES: u64 = 256 << 20; // 256 MiB
+
 /// One sample's location + timing in the emission plan.
 struct SampleRef {
     track: usize,
@@ -39,6 +59,9 @@ struct SampleRef {
 /// source) or an in-memory `Cursor` (round-trip tests).
 pub struct Mp4Reader<R: Read + Seek> {
     file: R,
+    /// Total length of the backing file, captured at open — used to reject a
+    /// crafted `stsz` sample size that would over-allocate the per-sample buffer.
+    file_len: u64,
     title: DiscTitle,
     samples: Vec<SampleRef>,
     cursor: usize,
@@ -59,6 +82,8 @@ impl Mp4Reader<File> {
 impl<R: Read + Seek> Mp4Reader<R> {
     /// Index an already-opened seekable MP4 reader.
     pub fn from_reader(mut file: R, name: String) -> io::Result<Self> {
+        let file_len = file.seek(SeekFrom::End(0))?;
+        file.seek(SeekFrom::Start(0))?;
         let moov = read_moov(&mut file)?;
         let mut title = DiscTitle::empty();
         title.playlist = name;
@@ -66,13 +91,21 @@ impl<R: Read + Seek> Mp4Reader<R> {
         let mut samples: Vec<SampleRef> = Vec::new();
         let mut codec_privates: Vec<Option<Vec<u8>>> = Vec::new();
         let mut track_idx = 0usize;
+        // Global cap on total decoded samples across ALL tracks — a crafted file
+        // with many `trak` boxes must not sum past this even though each track is
+        // individually bounded. Real titles stay far under it.
+        let mut sample_budget = MAX_SAMPLE_COUNT;
 
         for trak in find_boxes(&moov, b"trak") {
+            if track_idx >= MAX_TRACKS {
+                break; // bound track count so the per-track PID can't overflow u16
+            }
             let Some(mdia) = find_box(trak, b"mdia") else {
                 continue;
             };
             let timescale = find_box(mdia, b"mdhd")
                 .and_then(mdhd_timescale)
+                .filter(|&t| t != 0) // a crafted mdhd timescale of 0 would divide-by-zero below
                 .unwrap_or(90_000);
             let language = find_box(mdia, b"mdhd").and_then(mdhd_language);
             let handler = find_box(mdia, b"hdlr").and_then(hdlr_type);
@@ -113,7 +146,9 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 Some(h) if &h == b"soun" => DiscStream::Audio(AudioStream {
                     pid: 0x1100 + track_idx as u16,
                     codec,
-                    channels: AudioChannels::from_count(channels as u8),
+                    // `channels` is an untrusted u16; saturate rather than wrap with
+                    // `as u8` (a crafted 256 would alias to 0/Mono).
+                    channels: AudioChannels::from_count(channels.min(u8::MAX as u16) as u8),
                     language: language.clone().unwrap_or_else(|| "und".into()),
                     sample_rate: SampleRate::from_hz(timescale),
                     secondary: false,
@@ -123,8 +158,12 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 _ => continue, // non-A/V handler
             };
 
-            // Per-sample tables.
-            let sizes = find_box(stbl, b"stsz").map(parse_stsz).unwrap_or_default();
+            // Per-sample tables. `stsz` is bounded by the remaining global budget;
+            // `stts`/`ctts` need at most one entry per sample, so they are bounded by
+            // this track's sample count (indices past it are never read).
+            let sizes = find_box(stbl, b"stsz")
+                .map(|b| parse_stsz(b, sample_budget))
+                .unwrap_or_default();
             let n = sizes.len();
             if n == 0 {
                 track_idx += 1;
@@ -132,24 +171,49 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 codec_privates.push(config);
                 continue;
             }
+            sample_budget -= n;
             let chunk_offsets = find_box(stbl, b"stco")
                 .map(|b| parse_stco(b, false))
                 .or_else(|| find_box(stbl, b"co64").map(|b| parse_stco(b, true)))
                 .unwrap_or_default();
+            if chunk_offsets.is_empty() {
+                // Samples exist but there is no chunk-offset table: the stbl is
+                // malformed and every sample offset would resolve to file byte 0
+                // (muxing header bytes as frame data). Drop the track rather than
+                // emit garbage; an all-tracks-dropped file fails Mp4Invalid below.
+                continue;
+            }
             let stsc = find_box(stbl, b"stsc").map(parse_stsc).unwrap_or_default();
+            if stsc.is_empty() {
+                // No sample-to-chunk map: samples can't be placed against the chunk
+                // offsets (they would pack from byte 0). Drop the track rather than
+                // emit header bytes as frame data — a valid stbl always has stsc.
+                continue;
+            }
             let offsets = sample_offsets(&sizes, &chunk_offsets, &stsc);
-            let durations = find_box(stbl, b"stts").map(parse_stts).unwrap_or_default();
-            let ctts = find_box(stbl, b"ctts").map(parse_ctts).unwrap_or_default();
+            let durations = find_box(stbl, b"stts")
+                .map(|b| parse_stts(b, n))
+                .unwrap_or_default();
+            let ctts = find_box(stbl, b"ctts")
+                .map(|b| parse_ctts(b, n))
+                .unwrap_or_default();
             let sync = find_box(stbl, b"stss").map(parse_stss);
 
+            // ticks → ns, saturating: a crafted tiny timescale + huge stts deltas can
+            // push the i128 quotient past i64::MAX; wrapping it would silently corrupt
+            // the sort/timestamps, so clamp instead.
+            let to_ns = |ticks: i64| -> i64 {
+                (ticks as i128 * NS / timescale as i128).clamp(i64::MIN as i128, i64::MAX as i128)
+                    as i64
+            };
             let mut decode_ticks: i64 = 0;
             for (i, &size) in sizes.iter().enumerate() {
                 let dur = durations.get(i).copied().unwrap_or(0);
                 let comp = ctts.get(i).copied().unwrap_or(0);
-                let dts_ns = (decode_ticks as i128 * NS / timescale as i128) as i64;
-                let pts_ticks = decode_ticks + comp as i64;
-                let pts_ns = (pts_ticks as i128 * NS / timescale as i128) as i64;
-                decode_ticks += dur as i64;
+                let dts_ns = to_ns(decode_ticks);
+                let pts_ticks = decode_ticks.saturating_add(comp as i64);
+                let pts_ns = to_ns(pts_ticks);
+                decode_ticks = decode_ticks.saturating_add(dur as i64);
                 let keyframe = match &sync {
                     Some(set) => set.contains(&(i as u32 + 1)),
                     None => true, // no stss → every sample is a sync sample
@@ -170,7 +234,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
         }
 
         if title.streams.is_empty() {
-            return Err(crate::error::Error::MkvInvalid.into());
+            return Err(crate::error::Error::Mp4Invalid.into());
         }
         title.codec_privates = codec_privates;
 
@@ -180,6 +244,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
 
         Ok(Self {
             file,
+            file_len,
             title,
             samples,
             cursor: 0,
@@ -193,6 +258,13 @@ impl<R: Read + Seek + Send> Stream for Mp4Reader<R> {
             return Ok(None);
         };
         self.cursor += 1;
+        // `s.size`/`s.offset` come from the untrusted stsz/stco tables; reject a
+        // sample that claims to extend past EOF before allocating its buffer, so a
+        // crafted size can't force a multi-GB allocation the read would then fail.
+        let end = s.offset.checked_add(s.size as u64);
+        if s.size as u64 > MAX_ALLOC_BYTES || end.is_none_or(|e| e > self.file_len) {
+            return Err(crate::error::Error::Mp4Invalid.into());
+        }
         self.file.seek(SeekFrom::Start(s.offset))?;
         let mut data = vec![0u8; s.size as usize];
         self.file.read_exact(&mut data)?;
@@ -229,28 +301,47 @@ impl<R: Read + Seek + Send> Stream for Mp4Reader<R> {
 /// Read top-level boxes until `moov`, returning its payload (after the header).
 /// Skips over `ftyp`/`mdat`/etc. via seek; samples are read later by offset.
 fn read_moov<R: Read + Seek>(file: &mut R) -> io::Result<Vec<u8>> {
+    let file_end = file.seek(SeekFrom::End(0))?;
+    file.seek(SeekFrom::Start(0))?;
     loop {
+        let pos = file.stream_position()?;
         let mut hdr = [0u8; 8];
         if file.read_exact(&mut hdr).is_err() {
-            return Err(crate::error::Error::MkvInvalid.into());
+            return Err(crate::error::Error::Mp4Invalid.into());
         }
         let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
         let btype = [hdr[4], hdr[5], hdr[6], hdr[7]];
-        // 64-bit largesize (size==1): the real size is the next 8 bytes; a
-        // 16-byte header precedes the payload. size==0 means "to EOF".
-        let payload_len: u64 = if size32 == 1 {
-            let mut ext = [0u8; 8];
-            file.read_exact(&mut ext)?;
-            u64::from_be_bytes(ext).saturating_sub(16)
-        } else {
-            (size32 as u64).saturating_sub(8)
+        // Total box size INCLUDING the header. `size==1` → 64-bit largesize in the
+        // next 8 bytes (16-byte header); `size==0` → the box runs to end of file.
+        let box_size: u64 = match size32 {
+            1 => {
+                let mut ext = [0u8; 8];
+                file.read_exact(&mut ext)?;
+                u64::from_be_bytes(ext)
+            }
+            0 => file_end.saturating_sub(pos),
+            n => n as u64,
         };
+        let header_len: u64 = if size32 == 1 { 16 } else { 8 };
+        // A box must contain at least its own header and cannot run past EOF. This
+        // also guarantees forward progress (box_size >= header_len > 0), so a
+        // crafted size < 8 can't spin the loop in place, and bounds every payload
+        // allocation to the real file length (no gigabyte over-allocation). Use
+        // checked_add so a 64-bit largesize near u64::MAX can't wrap past the guard.
+        if box_size < header_len || pos.checked_add(box_size).is_none_or(|end| end > file_end) {
+            return Err(crate::error::Error::Mp4Invalid.into());
+        }
         if &btype == b"moov" {
+            let payload_len = box_size - header_len;
+            // Absolute cap independent of the (sparse-file-inflatable) length.
+            if payload_len > MAX_ALLOC_BYTES {
+                return Err(crate::error::Error::Mp4Invalid.into());
+            }
             let mut buf = vec![0u8; payload_len as usize];
             file.read_exact(&mut buf)?;
             return Ok(buf);
         }
-        file.seek(SeekFrom::Current(payload_len as i64))?;
+        file.seek(SeekFrom::Start(pos + box_size))?;
     }
 }
 
@@ -310,7 +401,9 @@ fn mdhd_timescale(b: &[u8]) -> Option<u32> {
 /// mdhd language (5-bit packed ISO 639-2) → lowercase 3-letter code.
 fn mdhd_language(b: &[u8]) -> Option<String> {
     let version = b.first().copied()?;
-    let off = if version == 1 { 28 } else { 20 };
+    // v0: vflags(4)+creation(4)+modification(4)+timescale(4)+duration(4) = 20.
+    // v1: creation/modification/duration are 64-bit → vflags(4)+8+8+4+8 = 32.
+    let off = if version == 1 { 32 } else { 20 };
     if b.len() < off + 2 {
         return None;
     }
@@ -352,7 +445,9 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
     }
     let size = be32(entry, 0) as usize;
     let fourcc = [entry[4], entry[5], entry[6], entry[7]];
-    let body = &entry[8..size.min(entry.len())];
+    // `size` is untrusted: clamp to [8, entry.len()] so a declared size < 8 (or a
+    // truncated entry) yields an empty body instead of panicking on `entry[8..<8]`.
+    let body = &entry[8..size.clamp(8, entry.len())];
 
     let codec = match &fourcc {
         b"hvc1" | b"hev1" => Codec::Hevc,
@@ -384,28 +479,96 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
         })
     } else {
         // AudioSampleEntry: 6 reserved + 2 dri + 8 reserved + channelcount(2)
-        // samplesize(2) + 2 pre + 2 reserved + samplerate(4) = 28 bytes.
+        // samplesize(2) + 2 pre + 2 reserved + samplerate(4) = 28 bytes, then child
+        // boxes. AAC (mp4a) carries its AudioSpecificConfig in an `esds` box — the
+        // MKV CodecPrivate for A_AAC. AC-3/DTS are self-describing in-band (None).
         let channels = if body.len() >= 28 { be16(body, 16) } else { 2 };
+        let config = if matches!(codec, Codec::Aac) && body.len() >= 28 {
+            find_box(&body[28..], b"esds").and_then(parse_esds_asc)
+        } else {
+            None
+        };
         Some(StsdInfo {
             codec,
             height: 0,
-            config: None,
+            config,
             channels,
         })
     }
 }
 
+/// Read an MPEG-4 expandable descriptor length (ISO/IEC 14496-1), advancing `pos`.
+/// Each byte contributes 7 bits, continued while the high bit is set (max 4 bytes).
+fn read_descriptor_len(b: &[u8], pos: &mut usize) -> usize {
+    let mut len = 0usize;
+    for _ in 0..4 {
+        let Some(&byte) = b.get(*pos) else { break };
+        *pos += 1;
+        len = (len << 7) | (byte & 0x7F) as usize;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    len
+}
+
+/// esds → AAC AudioSpecificConfig (the A_AAC CodecPrivate), or `None`. Walks
+/// ES_Descriptor(0x03) → DecoderConfigDescriptor(0x04) → DecoderSpecificInfo(0x05).
+/// Fully bounds-checked: a malformed/truncated esds returns None, never panics.
+fn parse_esds_asc(b: &[u8]) -> Option<Vec<u8>> {
+    // esds is a FullBox: version+flags(4), then the ES_Descriptor.
+    let mut pos = 4;
+    if *b.get(pos)? != 0x03 {
+        return None;
+    }
+    pos += 1;
+    read_descriptor_len(b, &mut pos); // ES_Descriptor length (unused)
+    pos += 2; // ES_ID
+    let flags = *b.get(pos)?;
+    pos += 1;
+    if flags & 0x80 != 0 {
+        pos += 2; // streamDependenceFlag → dependsOn_ES_ID
+    }
+    if flags & 0x40 != 0 {
+        // URL_flag → URLlength(1) + URLstring
+        pos += 1 + *b.get(pos)? as usize;
+    }
+    if flags & 0x20 != 0 {
+        pos += 2; // OCRstreamFlag → OCR_ES_Id
+    }
+    if *b.get(pos)? != 0x04 {
+        return None; // DecoderConfigDescriptor
+    }
+    pos += 1;
+    read_descriptor_len(b, &mut pos);
+    // objectTypeIndication(1) + streamType/bufferSizeDB(4) + maxBitrate(4) + avgBitrate(4)
+    pos += 13;
+    if *b.get(pos)? != 0x05 {
+        return None; // DecoderSpecificInfo
+    }
+    pos += 1;
+    let asc_len = read_descriptor_len(b, &mut pos);
+    let end = pos.checked_add(asc_len)?;
+    if asc_len == 0 || end > b.len() {
+        return None;
+    }
+    Some(b[pos..end].to_vec())
+}
+
 /// stsz → per-sample sizes.
-fn parse_stsz(b: &[u8]) -> Vec<u32> {
+fn parse_stsz(b: &[u8], max: usize) -> Vec<u32> {
     if b.len() < 12 {
         return Vec::new();
     }
     let sample_size = be32(b, 4);
-    let count = be32(b, 8) as usize;
+    // `count` is untrusted; clamp to the caller's remaining sample budget so neither
+    // a single 0xFFFFFFFF nor many crafted tracks can over-allocate (see from_reader).
+    let count = (be32(b, 8) as usize).min(max);
     if sample_size != 0 {
         return vec![sample_size; count];
     }
-    let mut out = Vec::with_capacity(count);
+    // Each entry is 4 bytes; `count` also can't exceed what the box actually holds.
+    let mut out = Vec::with_capacity(count.min((b.len() - 12) / 4));
     for i in 0..count {
         let o = 12 + i * 4;
         if o + 4 > b.len() {
@@ -422,8 +585,9 @@ fn parse_stco(b: &[u8], is64: bool) -> Vec<u64> {
         return Vec::new();
     }
     let count = be32(b, 4) as usize;
-    let mut out = Vec::with_capacity(count);
     let stride = if is64 { 8 } else { 4 };
+    // `count` entries of `stride` bytes can't exceed the box body.
+    let mut out = Vec::with_capacity(count.min((b.len() - 8) / stride));
     for i in 0..count {
         let o = 8 + i * stride;
         if o + stride > b.len() {
@@ -453,7 +617,8 @@ fn parse_stsc(b: &[u8]) -> Vec<(u32, u32)> {
         return Vec::new();
     }
     let count = be32(b, 4) as usize;
-    let mut out = Vec::with_capacity(count);
+    // Each entry is 12 bytes; `count` can't exceed what the box actually holds.
+    let mut out = Vec::with_capacity(count.min((b.len() - 8) / 12));
     for i in 0..count {
         let o = 8 + i * 12;
         if o + 12 > b.len() {
@@ -489,7 +654,9 @@ fn sample_offsets(sizes: &[u32], chunk_offsets: &[u64], stsc: &[(u32, u32)]) -> 
                 break;
             }
             offsets.push(off);
-            off += sizes[sidx] as u64;
+            // `choff`/`sizes` are untrusted; saturate so a crafted co64 offset near
+            // u64::MAX can't overflow-panic (the read() EOF guard rejects it later).
+            off = off.saturating_add(sizes[sidx] as u64);
             sidx += 1;
         }
     }
@@ -500,13 +667,15 @@ fn sample_offsets(sizes: &[u32], chunk_offsets: &[u64], stsc: &[(u32, u32)]) -> 
             .get(offsets.len().saturating_sub(1))
             .copied()
             .unwrap_or(0);
-        offsets.push(last + last_sz as u64);
+        offsets.push(last.saturating_add(last_sz as u64));
     }
     offsets
 }
 
-/// stts → per-sample decode durations (expanded from run-length entries).
-fn parse_stts(b: &[u8]) -> Vec<u32> {
+/// stts → per-sample decode durations (expanded from run-length entries). `max`
+/// caps the expansion — the caller passes the track's real sample count, past which
+/// entries are never read (and an untrusted run-length must not grow the Vec).
+fn parse_stts(b: &[u8], max: usize) -> Vec<u32> {
     if b.len() < 8 {
         return Vec::new();
     }
@@ -520,6 +689,9 @@ fn parse_stts(b: &[u8]) -> Vec<u32> {
         let n = be32(b, o);
         let delta = be32(b, o + 4);
         for _ in 0..n {
+            if out.len() >= max {
+                return out;
+            }
             out.push(delta);
         }
     }
@@ -527,7 +699,8 @@ fn parse_stts(b: &[u8]) -> Vec<u32> {
 }
 
 /// ctts → per-sample composition offsets (version 0 unsigned / version 1 signed).
-fn parse_ctts(b: &[u8]) -> Vec<i32> {
+/// `max` caps the expansion, as in [`parse_stts`].
+fn parse_ctts(b: &[u8], max: usize) -> Vec<i32> {
     if b.len() < 8 {
         return Vec::new();
     }
@@ -543,6 +716,9 @@ fn parse_ctts(b: &[u8]) -> Vec<i32> {
         let n = be32(b, o);
         let offset = be32(b, o + 4) as i32;
         for _ in 0..n {
+            if out.len() >= max {
+                return out;
+            }
             out.push(offset);
         }
     }
@@ -590,6 +766,72 @@ mod tests {
         let stsc = vec![(1u32, 2u32), (2u32, 1u32)];
         // chunk1@500: s0@500, s1@510; chunk2@900: s2@900.
         assert_eq!(sample_offsets(&sizes, &chunks, &stsc), vec![500, 510, 900]);
+    }
+
+    #[test]
+    fn sample_offsets_saturates_on_huge_chunk_offset() {
+        // A co64 chunk offset near u64::MAX plus a sample size must saturate, not
+        // overflow-panic (debug) / wrap (release) — the read() EOF guard rejects
+        // the resulting out-of-range offset later.
+        let sizes = vec![10u32, 20];
+        let chunks = vec![u64::MAX - 5];
+        let stsc = vec![(1u32, 2u32)]; // 2 samples in the single chunk
+        let offs = sample_offsets(&sizes, &chunks, &stsc);
+        assert_eq!(offs[0], u64::MAX - 5);
+        assert_eq!(offs[1], u64::MAX, "(MAX-5)+10 saturates to MAX");
+    }
+
+    #[test]
+    fn read_rejects_sample_offset_past_eof() {
+        use crate::disc::{
+            Codec, DiscTitle, FrameRate, HdrFormat, Resolution, Stream as DiscStreamE, VideoStream,
+        };
+        use crate::mux::mp4::Mp4Sink;
+        use crate::pes::{PesFrame, Stream as _};
+        use std::io::Cursor;
+
+        // The MP4 writer requires a primary video track, so build an HEVC one.
+        let mut t = DiscTitle::empty();
+        t.streams = vec![DiscStreamE::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::Hevc,
+            resolution: Resolution::R1080p,
+            frame_rate: FrameRate::F23_976,
+            hdr: HdrFormat::Sdr,
+            color_space: crate::disc::ColorSpace::Unknown,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        })];
+        t.codec_privates = vec![Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE])];
+        let mut buf = Vec::new();
+        {
+            let mut sink = Mp4Sink::create(Cursor::new(&mut buf), &t).unwrap();
+            sink.write(&PesFrame {
+                track: 0,
+                pts: 0,
+                keyframe: true,
+                data: vec![0x11u8; 700],
+                duration_ns: None,
+                source: None,
+                coding: None,
+            })
+            .unwrap();
+            sink.finish().unwrap();
+        }
+        // Faststart writes `moov` near the front and `mdat` after a multi-MiB
+        // reserve, so a 64 KiB truncation keeps the parseable moov but drops mdat.
+        // from_reader still succeeds; read() must reject the now-out-of-range
+        // sample rather than allocate for it or read past EOF.
+        buf.truncate(64 * 1024);
+        let mut rd = Mp4Reader::from_reader(Cursor::new(buf), "trunc".into()).unwrap();
+        let err = rd.read().unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a sample offset past EOF must be rejected"
+        );
     }
 
     #[test]
@@ -700,6 +942,161 @@ mod tests {
         stts.extend_from_slice(&1u32.to_be_bytes()); // entry_count
         stts.extend_from_slice(&3u32.to_be_bytes());
         stts.extend_from_slice(&1001u32.to_be_bytes());
-        assert_eq!(parse_stts(&stts), vec![1001, 1001, 1001]);
+        assert_eq!(parse_stts(&stts, MAX_SAMPLE_COUNT), vec![1001, 1001, 1001]);
+    }
+
+    // ── Untrusted-input hardening: a crafted MP4 must never panic or over-allocate.
+
+    #[test]
+    fn parse_stsz_fixed_size_caps_hostile_count() {
+        // sample_size != 0, count = u32::MAX: a 12-byte box must not allocate ~16 GiB.
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+        b.extend_from_slice(&1u32.to_be_bytes()); // sample_size
+        b.extend_from_slice(&u32::MAX.to_be_bytes()); // count
+        let out = parse_stsz(&b, MAX_SAMPLE_COUNT);
+        assert_eq!(out.len(), MAX_SAMPLE_COUNT);
+        // And a smaller budget (the cumulative multi-track cap) bounds it tighter.
+        assert_eq!(parse_stsz(&b, 100).len(), 100);
+    }
+
+    #[test]
+    fn parse_stsz_table_count_bounded_by_box() {
+        // sample_size == 0, count huge, but only two real entries in the buffer.
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0, 0, 0, 0]);
+        b.extend_from_slice(&0u32.to_be_bytes()); // sample_size == 0 → table
+        b.extend_from_slice(&u32::MAX.to_be_bytes()); // count (lie)
+        b.extend_from_slice(&10u32.to_be_bytes());
+        b.extend_from_slice(&20u32.to_be_bytes());
+        assert_eq!(parse_stsz(&b, MAX_SAMPLE_COUNT), vec![10, 20]);
+    }
+
+    #[test]
+    fn parse_stco_stsc_count_bounded_by_box() {
+        // stco: count lie, one real 32-bit offset.
+        let mut stco = Vec::new();
+        stco.extend_from_slice(&[0, 0, 0, 0]);
+        stco.extend_from_slice(&u32::MAX.to_be_bytes());
+        stco.extend_from_slice(&4096u32.to_be_bytes());
+        assert_eq!(parse_stco(&stco, false), vec![4096]);
+        // stsc: count lie, one real (first_chunk, per) tuple.
+        let mut stsc = Vec::new();
+        stsc.extend_from_slice(&[0, 0, 0, 0]);
+        stsc.extend_from_slice(&u32::MAX.to_be_bytes());
+        stsc.extend_from_slice(&1u32.to_be_bytes());
+        stsc.extend_from_slice(&7u32.to_be_bytes());
+        stsc.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx (unused)
+        assert_eq!(parse_stsc(&stsc), vec![(1, 7)]);
+    }
+
+    #[test]
+    fn parse_stts_caps_hostile_runlength() {
+        // One entry with a u32::MAX run-length must cap, not push billions.
+        let mut stts = Vec::new();
+        stts.extend_from_slice(&[0, 0, 0, 0]);
+        stts.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        stts.extend_from_slice(&u32::MAX.to_be_bytes()); // n
+        stts.extend_from_slice(&33u32.to_be_bytes()); // delta
+        assert_eq!(parse_stts(&stts, MAX_SAMPLE_COUNT).len(), MAX_SAMPLE_COUNT);
+        // A tight per-track cap (the real sample count) bounds the run-length too.
+        assert_eq!(parse_stts(&stts, 5).len(), 5);
+    }
+
+    #[test]
+    fn parse_stsd_short_size_does_not_panic() {
+        // stsd sample entry declaring size = 0 must not panic on `entry[8..<8]`.
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+        b.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        b.extend_from_slice(&0u32.to_be_bytes()); // sample entry size = 0
+        b.extend_from_slice(b"avc1"); // fourcc
+        // Recognised codec but empty body → None (no dimensions), no panic.
+        assert!(parse_stsd(&b).is_none());
+    }
+
+    #[test]
+    fn read_moov_oversize_is_rejected() {
+        use std::io::Cursor;
+        // A tiny file whose first box claims to be a `moov` far larger than the file.
+        let mut b = Vec::new();
+        b.extend_from_slice(&0xFFFF_FFF0u32.to_be_bytes()); // size32 (~4 GiB)
+        b.extend_from_slice(b"moov");
+        b.extend_from_slice(&[0u8; 16]); // a few real bytes, nowhere near the claim
+        assert!(read_moov(&mut Cursor::new(b)).is_err());
+    }
+
+    #[test]
+    fn parse_esds_extracts_aac_asc() {
+        // esds: version/flags + ES_Descriptor(0x03) + DecoderConfigDescriptor(0x04)
+        // + DecoderSpecificInfo(0x05) carrying a 2-byte AudioSpecificConfig.
+        let esds = vec![
+            0, 0, 0, 0, // version+flags
+            0x03, 0x19, 0x00, 0x00, 0x00, // ES_Descriptor: tag,len, ES_ID(2), flags(0)
+            0x04, 0x11, // DecoderConfigDescriptor: tag,len
+            0x40, // objectTypeIndication (AAC)
+            0x15, 0, 0, 0, // streamType/bufferSizeDB
+            0, 0, 0, 0, // maxBitrate
+            0, 0, 0, 0, // avgBitrate
+            0x05, 0x02, // DecoderSpecificInfo: tag,len
+            0x12, 0x10, // AudioSpecificConfig (AAC-LC 44.1k stereo)
+        ];
+        assert_eq!(parse_esds_asc(&esds), Some(vec![0x12, 0x10]));
+        // A truncated esds must return None, never panic.
+        assert_eq!(parse_esds_asc(&esds[..12]), None);
+    }
+
+    #[test]
+    fn read_moov_size_zero_spans_to_eof() {
+        use std::io::Cursor;
+        // size32 == 0 means "box extends to end of file"; the moov body is the rest.
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u32.to_be_bytes()); // size = 0 → to EOF
+        b.extend_from_slice(b"moov");
+        b.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // body
+        assert_eq!(
+            read_moov(&mut Cursor::new(b)).unwrap(),
+            vec![0xAA, 0xBB, 0xCC]
+        );
+    }
+
+    #[test]
+    fn read_moov_largesize_overflow_is_rejected() {
+        use std::io::Cursor;
+        // A 64-bit largesize near u64::MAX must not wrap the `pos + box_size` EOF
+        // guard (it would otherwise pass and drive an exabyte allocation).
+        let mut b = Vec::new();
+        b.extend_from_slice(&16u32.to_be_bytes()); // ftyp box, size 16
+        b.extend_from_slice(b"ftyp");
+        b.extend_from_slice(&[0u8; 8]);
+        b.extend_from_slice(&1u32.to_be_bytes()); // moov, size==1 → largesize
+        b.extend_from_slice(b"moov");
+        b.extend_from_slice(&0xFFFF_FFFF_FFFF_FFF8u64.to_be_bytes());
+        assert!(read_moov(&mut Cursor::new(b)).is_err());
+    }
+
+    #[test]
+    fn read_moov_undersized_box_does_not_hang() {
+        use std::io::Cursor;
+        // A box whose declared size is < 8 (here 3) must be rejected, not spin the
+        // loop in place forever (size.saturating_sub(8) == 0 → no forward progress).
+        let mut b = Vec::new();
+        b.extend_from_slice(&3u32.to_be_bytes());
+        b.extend_from_slice(b"free");
+        assert!(read_moov(&mut Cursor::new(b)).is_err());
+    }
+
+    #[test]
+    fn mdhd_language_offsets_per_version() {
+        // "eng" packed = 0x15C7. v0 carries it at byte 20, v1 (64-bit times) at 32.
+        let packed = [0x15u8, 0xC7];
+        let mut v0 = vec![0u8; 22];
+        v0[0] = 0; // version 0
+        v0[20..22].copy_from_slice(&packed);
+        assert_eq!(mdhd_language(&v0).as_deref(), Some("eng"));
+        let mut v1 = vec![0u8; 34];
+        v1[0] = 1; // version 1
+        v1[32..34].copy_from_slice(&packed);
+        assert_eq!(mdhd_language(&v1).as_deref(), Some("eng"));
     }
 }

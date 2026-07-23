@@ -492,7 +492,14 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     // so the 30s zone-entry cooldown below keys off the real
     // transition rather than re-deriving it from a counter that the
     // fast-jump path resets after every jump.
-    let is_zone_entry_transition = !ctx.in_damage_zone && !ctx.bisecting;
+    //
+    // A RECOVERED_ERROR (marginal read) is explicitly NOT damage-zone signal
+    // (see the SkipBlock branch below) — it returns early, so latching
+    // in_damage_zone here would spuriously consume the zone-entry transition and
+    // let a genuine hard error that follows skip the 30s wedge cooldown.
+    let is_recovered =
+        err.scsi_sense().map(|s| s.sense_key) == Some(scsi::SENSE_KEY_RECOVERED_ERROR);
+    let is_zone_entry_transition = !ctx.in_damage_zone && !ctx.bisecting && !is_recovered;
     if is_zone_entry_transition {
         ctx.in_damage_zone = true;
         ctx.zones_entered += 1;
@@ -872,6 +879,24 @@ mod tests {
         // It must not have inflated the damage-jump multiplier (not damage signal).
         assert_eq!(ctx.jump_multiplier, 1);
         assert_eq!(ctx.jumps_taken, 0);
+    }
+
+    #[test]
+    fn recovered_error_does_not_consume_zone_entry() {
+        // A recovered (marginal) read must NOT latch in_damage_zone — otherwise a
+        // genuine hard error that follows would not be seen as the zone entry and
+        // would skip the 30s wedge cooldown.
+        let mut ctx = ReadCtx::for_sweep(32);
+        handle_read_error(&recovered_err(), &mut ctx);
+        assert!(
+            !ctx.in_damage_zone,
+            "recovered read is not damage-zone signal"
+        );
+        assert_eq!(ctx.zones_entered, 0);
+        // The following genuine hard error IS the real zone entry.
+        handle_read_error(&hardware_err(), &mut ctx);
+        assert!(ctx.in_damage_zone);
+        assert_eq!(ctx.zones_entered, 1, "hard error registers the zone entry");
     }
 
     #[test]

@@ -88,11 +88,11 @@ impl TrueHdParser {
     }
 
     /// Decide whether an access unit is corrupt, updating `num_substreams` from a
-    /// valid major sync. Mirrors ffmpeg `read_access_unit`: a major sync with a
-    /// bad header CRC, or any AU whose header parity fails, is undecodable.
+    /// valid major sync. Per the MLP/TrueHD access-unit decode rules: a major sync
+    /// with a bad header CRC, or any AU whose header parity fails, is undecodable.
     /// Returns `false` (not corrupt) when the AU is too short to judge or no
     /// major sync has established `num_substreams` yet — we never drop what we
-    /// cannot verify. Verified against real ffmpeg TrueHD (3600/3600 AUs).
+    /// cannot verify. Verified against real TrueHD streams (3600/3600 AUs).
     fn au_check(&mut self, au: &[u8], is_major_sync: bool) -> AuCheck {
         let mut header_size = 4;
         let mut format_info = None;
@@ -231,7 +231,7 @@ enum Ac3Size {
     Frame(usize),
 }
 
-// --- MLP/TrueHD access-unit integrity (mirrors ffmpeg mlpdec.c / mlp_parse.c) ---
+// --- MLP/TrueHD access-unit integrity (per the MLP/TrueHD bitstream spec) ---
 
 /// Major-sync header size in bytes: base 28, plus `2 + extensions*2` when the
 /// extension flag (major-sync byte 25, bit 0) is set (`extensions` = byte 26
@@ -251,8 +251,8 @@ fn mlp_major_sync_header_size(ms: &[u8]) -> Option<usize> {
     Some(size)
 }
 
-/// Validate the MLP/TrueHD major-sync header checksum (ffmpeg `ff_mlp_checksum16`,
-/// CRC-16 poly 0x002D). The stored trailer is the last 2 header bytes; because
+/// Validate the MLP/TrueHD major-sync header checksum (a CRC-16 with polynomial
+/// 0x002D). The stored trailer is the last 2 header bytes; because
 /// MLP's checksum is byte-reversed relative to a standard CRC, a standard CRC of
 /// the header body XOR the little-endian word before the trailer must equal the
 /// trailer read big-endian.
@@ -260,14 +260,15 @@ fn mlp_major_sync_crc_ok(ms: &[u8], mshdr: usize) -> bool {
     if mshdr < 4 || ms.len() < mshdr {
         return false;
     }
-    // ffmpeg `ff_mlp_checksum16(buf, buf_size)` (libavcodec/mlp.c):
-    //     av_crc(crc_2D, 0, buf, buf_size - 2) ^ AV_RL16(buf + buf_size - 2)
-    // is called with `buf_size = mshdr - 2` and its result compared to
-    // `AV_RL16(buf + mshdr - 2)` — i.e. the 16-bit checksum over `ms[..mshdr-4]`,
-    // XORed with the LITTLE-ENDIAN word just before the trailer, must equal the
-    // LITTLE-ENDIAN trailer word. `crc16_mlp` is the same crc_2D table (poly 0x2D,
-    // MSB-first) but yields its two bytes in the OPPOSITE order to libavutil's
-    // `av_crc`, so swap them back to match. (The previous code mixed endianness —
+    // The MLP major-sync checksum, `checksum16(buf, buf_size)`, is defined as
+    //     crc16_2D(buf, buf_size - 2) ^ read_le16(buf + buf_size - 2)
+    // evaluated with `buf_size = mshdr - 2` and its result compared to
+    // `read_le16(buf + mshdr - 2)` — i.e. the 16-bit CRC (poly 0x2D, MSB-first)
+    // over `ms[..mshdr-4]`, XORed with the LITTLE-ENDIAN word just before the
+    // trailer, must equal the LITTLE-ENDIAN trailer word. `crc16_mlp` uses that
+    // same poly-0x2D MSB-first table but yields its two bytes in the OPPOSITE
+    // order to a standard little-endian CRC readout, so swap them back to match.
+    // (The previous code mixed endianness —
     // little-endian XOR word but big-endian compare — so the checksum could never
     // validate any real extended major sync, silently dropping the whole track;
     // cross-verified byte-exact against real 7.1/Atmos and 5.1 discs.)
@@ -304,9 +305,8 @@ fn mlp_substr_header_size(au: &[u8], header_size: usize, num_substreams: u8) -> 
     Some(shs)
 }
 
-/// MLP/TrueHD AU-header parity check (ffmpeg `ff_mlp_calculate_parity`): the XOR
-/// of the 4-byte AU header with the substream directory, folded, must have its
-/// two nibbles XOR to 0xF.
+/// MLP/TrueHD AU-header parity check: the XOR of the 4-byte AU header with the
+/// substream directory, folded, must have its two nibbles XOR to 0xF.
 fn mlp_parity_ok(au: &[u8], header_size: usize, substr_header_size: usize) -> bool {
     let end = header_size + substr_header_size;
     if end > au.len() {
@@ -560,7 +560,7 @@ impl CodecParser for TrueHdParser {
 }
 
 /// Per-bit channel counts for the TrueHD 8-channel and 6-channel presentation
-/// channel-assignment masks (per the MLP spec / FFmpeg `thd_channels`). Some
+/// channel-assignment masks (per the MLP/TrueHD bitstream spec). Some
 /// bits denote a stereo pair (2), others a single channel (1).
 const THD_8CH: [u8; 13] = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1];
 const THD_6CH: [u8; 5] = [2, 1, 1, 2, 1];
@@ -720,7 +720,7 @@ mod tests {
     /// `format_info` set) into one that passes the decodability gate: 1 substream,
     /// a clean substream directory, a valid major-sync CRC-16, and a valid header
     /// parity nibble. Mirrors what a real encoder writes (verified against real
-    /// ffmpeg TrueHD). The AU must be ≥ 36 bytes (4 AU header + 28 major-sync
+    /// TrueHD streams). The AU must be ≥ 36 bytes (4 AU header + 28 major-sync
     /// header + 2 directory + slack), which every `make_truehd_unit(≥200)` is.
     fn finalize_major_sync(au: &mut [u8]) {
         const MSHDR: usize = 28; // no extension (byte 25 clear)
@@ -729,7 +729,7 @@ mod tests {
         // Substream directory entry at AU[4+MSHDR] = AU[32]: extraword flag clear.
         au[32] &= 0x7F;
         // Major-sync checksum, built EXACTLY as `mlp_major_sync_crc_ok` verifies it
-        // (ffmpeg `ff_mlp_checksum16`): swap_bytes(crc16_mlp(body)) ^ LE word before
+        // (the MLP checksum16): swap_bytes(crc16_mlp(body)) ^ LE word before
         // the trailer, stored little-endian in the trailer.
         let body_end = 4 + MSHDR - 4; // AU[4..28]
         let crc = super::crc16_mlp(&au[4..body_end]).swap_bytes()
@@ -842,7 +842,7 @@ mod tests {
         let mut parser = TrueHdParser::new();
         let ms1 = valid_major_sync();
         let mut bad = valid_normal_au();
-        // A single-nibble flip: MLP's nibble-fold parity (like ffmpeg's) is blind
+        // A single-nibble flip: MLP's nibble-fold parity is blind
         // to a full-byte flip, which changes both nibbles equally and cancels.
         bad[2] ^= 0x01;
         let ms2 = valid_major_sync();
@@ -974,7 +974,7 @@ mod tests {
     #[test]
     fn clean_truehd_stream_drops_nothing() {
         // A run of valid AUs passes untouched — zero false positives (the CRC and
-        // parity are verified against real ffmpeg TrueHD output).
+        // parity are verified against real TrueHD output).
         let mut parser = TrueHdParser::new();
         let mut data = valid_major_sync();
         for _ in 0..5 {
@@ -1297,7 +1297,7 @@ mod tests {
         assert_eq!(truehd_channels_from_stream(&data), Some(8));
     }
 
-    // --- truehd_channels: per-bit mask channel counts (MLP / FFmpeg table) ---
+    // --- truehd_channels: per-bit mask channel counts (MLP channel table) ---
 
     #[test]
     fn truehd_channels_8ch_single_bit_counts() {

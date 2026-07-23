@@ -659,8 +659,8 @@ mod tests {
 
     /// B1 end-to-end: after a TS discontinuity on a VIDEO track the consumer
     /// must DROP every inter-coded frame until the next keyframe, so no frame
-    /// with a dangling reference reaches the muxer (an ffmpeg deep-scan would
-    /// otherwise report a missing reference). The frame carrying the
+    /// with a dangling reference reaches the muxer (a strict decode-order
+    /// deep-scan would otherwise report a missing reference). The frame carrying the
     /// discontinuity and the inter frames behind it are dropped; the stream
     /// resumes cleanly at the next keyframe.
     #[test]

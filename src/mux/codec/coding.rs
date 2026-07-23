@@ -206,8 +206,8 @@ impl PictureInfo {
     }
 
     /// Number of field-display periods this picture occupies — the basis for
-    /// soft-telecine (2:3 pulldown) timing. MPEG-2 (ISO/IEC 13818-2 §6.3.10,
-    /// ffmpeg `nb_fields = repeat_pict + 2`): a field picture occupies 1 field,
+    /// soft-telecine (2:3 pulldown) timing. MPEG-2 (ISO/IEC 13818-2 §6.3.10):
+    /// a field picture occupies 1 field,
     /// a normal frame 2, a `repeat_first_field` progressive-frame 3 (or 4/6 in a
     /// progressive sequence); an rff bit on a non-progressive interlaced frame is
     /// spec-forbidden (§6.3.10) and is treated as 2. Codecs without pulldown

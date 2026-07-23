@@ -5,9 +5,9 @@
 //! When packets are lost, the affected access unit is already dropped at the TS
 //! layer (the assembler drops the partial PES on the continuity gap). But for
 //! INTER-CODED video the frames that follow reference the lost frame (and each
-//! other) until the next IRAP/IDR keyframe — emitting them yields an ffmpeg
-//! "missing reference / non-existing PPS" deep-scan error and visibly broken
-//! decode. So after a gap on a video track we DROP FORWARD to the next keyframe
+//! other) until the next IRAP/IDR keyframe — emitting them makes any decoder
+//! fault on the "missing reference / non-existing PPS" condition and visibly
+//! break decode. So after a gap on a video track we DROP FORWARD to the keyframe
 //! and resume cleanly there. The gap rounds up to (at most) one GOP — the price
 //! of never emitting a dangling reference; it is logged.
 //!

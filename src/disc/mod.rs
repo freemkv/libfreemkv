@@ -1867,7 +1867,7 @@ impl Disc {
         capacity: u32,
         handshake: Option<HandshakeResult>,
         handshake_error: Option<Error>,
-        _opts: &ScanOptions,
+        opts: &ScanOptions,
         udf_fs: udf::UdfFs,
     ) -> Result<Self> {
         let scan_with_t0 = std::time::Instant::now();
@@ -1931,7 +1931,7 @@ impl Disc {
         // forced flags match what the muxer derives during a rip (both use the
         // one shared PGS classifier); the rip path leaves it off — the muxer
         // detects forced while muxing, without a second read of the clip.
-        if _opts.probe_forced_subtitles {
+        if opts.probe_forced_subtitles {
             for title in &mut titles {
                 if title.content_format == ContentFormat::BdTs {
                     pgs_forced_probe::probe_and_set_forced(reader, title);
@@ -2277,8 +2277,8 @@ impl std::fmt::Debug for Key {
 ///      next candidate (and ultimately surfaces a key error rather than silently
 ///      writing ciphertext).
 ///
-/// Reuses the ecosystem's single `ts_sync_destroyed` predicate and the full
-/// (bus + AACS) unit decrypt, so it agrees with the actual mux decrypt.
+/// Reuses the ecosystem's single `is_clean` content-clarity predicate and the
+/// full (bus + AACS) unit decrypt, so it agrees with the actual mux decrypt.
 fn aligned_unit_keys_validate(
     unit_keys: &[(u32, [u8; 16])],
     read_data_key: Option<&[u8; 16]>,
@@ -2367,7 +2367,7 @@ impl Disc {
     /// else (UDF filesystem, BDMV nav, PLAYLIST/CLIPINF) is always clear.
     ///
     /// The in-read decrypt-verify gate (`DecryptingSectorSource`) uses this so it
-    /// never consults [`ts_sync_destroyed`](crate::aacs::content::ts_sync_destroyed) about
+    /// never consults the TS-sync content check about
     /// non-content bytes — filesystem data has no TS sync and would otherwise be
     /// mistaken for ciphertext (the first-2-GB false-positive this fixes).
     ///

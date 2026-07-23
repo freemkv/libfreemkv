@@ -1284,7 +1284,7 @@ mod tests {
         }
     }
 
-    // ── ts_sync_destroyed / ts_sync_count edge cases ───────────────────────
+    // ── is_clean / ts_sync_count edge cases ────────────────────────────────
 
     #[test]
     fn ts_sync_destroyed_false_for_sub_unit_length() {

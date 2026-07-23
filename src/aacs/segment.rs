@@ -193,6 +193,11 @@ pub fn fmts_key_ranges(
 ) -> Vec<(u32, u32, usize)> {
     let mut ranges = Vec::new();
     for s in segments {
+        // SPNs are untrusted (from IndividualSegment.tbl); an inverted record
+        // (start_spn > end_spn) would underflow `end_byte - 1 - start_byte` below.
+        if s.start_spn > s.end_spn {
+            continue;
+        }
         let start_byte = s.start_spn as u64 * SOURCE_PACKET_LEN;
         let end_byte = (s.end_spn as u64 + 1) * SOURCE_PACKET_LEN; // exclusive
         // A segment is unit-aligned and contiguous in clip bytes; map its first
@@ -279,6 +284,24 @@ mod tests {
             0,
             "segment end is exclusive → Unit Key"
         );
+    }
+
+    #[test]
+    fn fmts_key_ranges_skips_inverted_segment_without_underflow() {
+        use crate::disc::Extent;
+        let extents = vec![Extent {
+            start_lba: 1000,
+            sector_count: 1_000_000,
+        }];
+        // start_spn == end_spn + 1: `end_byte - 1 - start_byte` would underflow.
+        // The record must be skipped rather than panic (debug) / wrap (release).
+        let segs = vec![Segment {
+            index: 5,
+            start_spn: 200,
+            end_spn: 199,
+        }];
+        let ranges = fmts_key_ranges(&segs, &extents, &|v| v as usize);
+        assert!(ranges.is_empty(), "inverted segment yields no range");
     }
 
     #[test]

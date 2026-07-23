@@ -171,6 +171,19 @@ impl DecryptKeys {
     }
 }
 
+/// Which aligned units of a range a key decrypts. AACS 2.1 FMTS forensic segments
+/// interleave TWO variants at the unit level; `Even`/`Odd` selects the variant's
+/// half (parity of the unit's index within the segment) and the ALTERNATE half is
+/// left untouched (ciphertext) for the muxer to drop. Every non-forensic range —
+/// the base Unit Key, a multi-CPS unit — is `All` (decrypt every unit), so the
+/// common disc is byte-for-byte unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    All,
+    Even,
+    Odd,
+}
+
 /// Proactive AACS key-selection map: which held unit key decrypts each LBA of a
 /// title's encrypted content, decided ONCE before mux from the disc's CPS-unit
 /// (and, later, FMTS segment) structure — never by trial-decrypt-and-check per
@@ -191,19 +204,6 @@ impl DecryptKeys {
 /// sorted and disjoint. `default_idx` covers any LBA no range claims — the
 /// single-CPS case is just an empty range list with `default_idx = 0`, so the
 /// common disc pays zero lookup cost and needs no structural walk.
-/// Which aligned units of a range a key decrypts. AACS 2.1 FMTS forensic segments
-/// interleave TWO variants at the unit level; `Even`/`Odd` selects the variant's
-/// half (parity of the unit's index within the segment) and the ALTERNATE half is
-/// left untouched (ciphertext) for the muxer to drop. Every non-forensic range —
-/// the base Unit Key, a multi-CPS unit — is `All` (decrypt every unit), so the
-/// common disc is byte-for-byte unchanged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
-    All,
-    Even,
-    Odd,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AacsKeyMap {
     // (start_lba, end_lba, key_idx, phase)
@@ -531,8 +531,9 @@ pub fn decrypt_sectors(
 /// falls inside `content_ranges` — the disc's AACS-encrypted content (the m2ts
 /// stream extents). Units OUTSIDE content (UDF filesystem / nav) are left
 /// untouched and never counted as decrypt loss: they are clear by definition, so
-/// [`ts_sync_destroyed`] must not be consulted about them (a filesystem unit has
-/// no TS sync, which would otherwise be mistaken for ciphertext). `base_lba` is
+/// the content-clarity check [`is_clean`](crate::aacs::content::is_clean) must not
+/// be consulted about them (a filesystem unit has no TS sync, so it would
+/// otherwise be mistaken for ciphertext). `base_lba` is
 /// the absolute LBA of `buf`'s first sector; aligned units are 3 sectors.
 ///
 /// `content_ranges` is sorted, merged, disjoint `(start_lba, sector_count)`
@@ -610,11 +611,11 @@ fn decrypt_sectors_impl(
             //     silent corruption. We fail loud (Error::DecryptFailed), matching
             //     the highway path's Error::ExtentNotUnitAligned policy.
             //
-            // Detection: !crate::aacs::content::is_clean(, crate::disc::ContentFormat::BdTs) short-circuits to false for any
-            // buffer shorter than a full unit, so it cannot judge a partial. We
-            // instead apply the same TS-sync-intactness test it uses internally
-            // (ts_sync_count vs ts_packet_total) directly to the available
-            // partial bytes. A clear TS tail carries 0x47 syncs at the 192-byte
+            // Detection: `is_clean` cannot judge a partial (it reports a
+            // shorter-than-a-full-unit buffer as clean, having no full encrypted
+            // packet to check), so we apply the same TS-sync-intactness test it
+            // uses internally (ts_sync_count vs ts_packet_total) directly to the
+            // available partial bytes. A clear TS tail carries 0x47 syncs at the 192-byte
             // stride (> half the packets) → intact → not scrambled → tolerate. An
             // encrypted tail has those syncs destroyed (≤ half) → scrambled →
             // reject. If the partial is too short to hold even one TS packet
@@ -1611,7 +1612,7 @@ mod tests {
     }
 
     /// Build a clear aligned unit with TS sync bytes placed at the BD-TS stride
-    /// (offset 4 + k*192) so `ts_sync_destroyed` reports false and
+    /// (offset 4 + k*192) so `is_clean` reports true and
     /// `decrypt_unit` verifies it as clear after decryption.
     fn clear_ts_unit() -> Vec<u8> {
         let mut unit = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
@@ -1837,7 +1838,7 @@ mod tests {
     /// Grounding: `for idx in try_order { … if aacs::content::decrypt_unit(&mut attempt, key) { … } }`
     /// Mutation: revert to the pre-fix `decrypt_unit_full(chunk, &uk, …)` where
     /// `uk = raw_keys[unit_key_idx]` (always key 0) → the unit comes out as
-    /// garbled bytes that still look scrambled, failing the `!ts_sync_destroyed`
+    /// garbled bytes that still look scrambled, failing the `is_clean`
     /// assert.
     #[test]
     fn aacs_multi_cps_unit_disc_decrypts_under_non_zero_key() {

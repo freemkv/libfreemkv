@@ -49,7 +49,8 @@ pub enum Naming {
 /// How (and whether) to record audio sync delay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DelayMode {
-    /// Embed `DELAY <n>ms` in each audio filename (mkvmerge-readable).
+    /// Embed `DELAY <n>ms` in each audio filename (the filename-delay
+    /// convention downstream muxers parse).
     #[default]
     Filename,
     /// Write a `<base> delays.txt` sidecar instead.
@@ -64,7 +65,7 @@ pub enum DelayMode {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChaptersFmt {
-    /// mkvmerge chapter XML.
+    /// Matroska chapter XML.
     #[default]
     Xml,
     /// OGM/simple `CHAPTERnn=`/`CHAPTERnnNAME=` text.
@@ -121,7 +122,8 @@ pub enum TrackKind {
 // ── Codec → on-disk extension ────────────────────────────────────────────────
 
 /// File extension (without the dot) for a codec's standalone elementary stream.
-/// Chosen to match what mkvmerge / x265 / ffmpeg / BDSup2Sub expect.
+/// Chosen to match the conventional elementary-stream extensions downstream
+/// muxers and codec tools expect.
 fn extension_for(codec: Codec) -> &'static str {
     match codec {
         Codec::Hevc => "hevc",
@@ -440,7 +442,7 @@ impl VobSubWriter {
             .map(|s| s.trim_end().to_string());
         // VobSub `id:` lines use a 2-letter code; stream languages are ISO
         // 639-2 (3-letter). Take the leading two chars — the convention
-        // mkvmerge reads to assign a track language.
+        // downstream muxers read to assign a track language.
         let lang2: String = lang.chars().take(2).collect();
         Self {
             idx_path,
@@ -468,8 +470,8 @@ impl EsWriter for VobSubWriter {
             idx.push('\n');
         }
         idx.push_str("langidx: 0\n\n");
-        // The conventional `id: <lang2>, index: 0` line mkvmerge reads to
-        // assign the subtitle track's language. Omit the language token when
+        // The conventional `id: <lang2>, index: 0` line downstream muxers read
+        // to assign the subtitle track's language. Omit the language token when
         // unknown but still emit the index so the entry list is well-formed.
         if self.lang2.is_empty() {
             idx.push_str("id: , index: 0\n");
@@ -530,8 +532,8 @@ fn delay_ms(audio_first_pts_ns: i64, ref_video_first_pts_ns: i64) -> i64 {
     }
 }
 
-/// `DELAY <signed-int>ms` — matches mkvmerge's case-insensitive
-/// `delay\s+(-?\d+)` filename-delay parser.
+/// `DELAY <signed-int>ms` — matches the conventional case-insensitive
+/// `delay\s+(-?\d+)` filename-delay convention downstream muxers parse.
 fn delay_token(ms: i64) -> String {
     format!("DELAY {ms}ms")
 }
@@ -547,7 +549,7 @@ fn fmt_chapter_time_ns(time_secs: f64) -> String {
     format!("{h:02}:{m:02}:{s:02}.{ns:09}")
 }
 
-/// Serialize chapters as mkvmerge chapter XML.
+/// Serialize chapters as Matroska chapter XML.
 pub(crate) fn chapters_xml(chapters: &[Chapter]) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -665,13 +667,17 @@ impl DemuxSink {
                     (TrackKind::Subtitle, s.codec, s.pid, s.language.clone())
                 }
             };
+            // Record the primary-video reference BEFORE the kind filter: the video
+            // track drives multi-clip PTS-continuity rebasing and the audio DELAY
+            // tag even for `audio://` / `sub://` outputs, where its frames flow
+            // through write() but are not persisted to disk.
+            if kind == TrackKind::Video && ref_video_track.is_none() {
+                ref_video_track = Some(idx);
+            }
             // Kind filter: `audio://` / `sub://` keep only their class.
             if opts.kind_filter.is_some_and(|k| k != kind) {
                 tracks.push(None);
                 continue;
-            }
-            if kind == TrackKind::Video && ref_video_track.is_none() {
-                ref_video_track = Some(idx);
             }
 
             let ext = extension_for(codec);
@@ -1033,7 +1039,7 @@ mod tests {
 
     #[test]
     fn delay_token_matches_mkvmerge_regex() {
-        // mkvmerge: case-insensitive /delay\s+(-?\d+)/.
+        // Convention: case-insensitive /delay\s+(-?\d+)/.
         let re = regex_lite_delay;
         assert_eq!(re("Movie eng AC3 DELAY -248ms.ac3"), Some(-248));
         assert_eq!(re(&format!("x {}.dts", delay_token(1000))), Some(1000));
@@ -1041,7 +1047,7 @@ mod tests {
         assert_eq!(re(&format!("x {}.eac3", delay_token(-5))), Some(-5));
     }
 
-    /// Minimal stand-in for mkvmerge's `delay\s+(-?\d+)` (case-insensitive).
+    /// Minimal stand-in for the `delay\s+(-?\d+)` convention (case-insensitive).
     fn regex_lite_delay(name: &str) -> Option<i64> {
         let lower = name.to_lowercase();
         let idx = lower.find("delay")?;
@@ -1193,7 +1199,7 @@ mod tests {
         w.finish(&mut sub).unwrap();
         let idx_text = std::fs::read_to_string(&idx).unwrap();
         assert!(idx_text.contains("palette: 000000, ffffff"));
-        // The conventional `id:` line mkvmerge reads to assign the language.
+        // The conventional `id:` line downstream muxers read to assign the language.
         assert!(
             idx_text.contains("id: en, index: 0"),
             "missing id: line, got:\n{idx_text}"

@@ -3,10 +3,11 @@
 //! FLAC frames carry no length field, so a raw stream is delimited only by
 //! sync-scanning + CRC validation. In freemkv, though, FLAC never arrives raw:
 //! it comes from mp4/mkv, where each packet is exactly one container-delimited
-//! FLAC frame (the `PARSER_FLAG_COMPLETE_FRAMES` case in ffmpeg). So this parser
+//! FLAC frame (a complete, pre-delimited frame per packet). So this parser
 //! is a per-packet gate, not a framer: every FLAC frame ends with a 16-bit CRC
-//! (poly 0x8005) computed so the residue over the whole frame is zero
-//! (ffmpeg `flac_decode_frame`, `av_crc(AV_CRC_16_ANSI, 0, buf, len) == 0`). A
+//! (poly 0x8005, init 0, non-reflected) computed so the residue over the whole
+//! frame — footer CRC included — is zero (per the FLAC format specification,
+//! RFC 9639, frame footer). A
 //! nonzero residue is definitive corruption → drop the frame (a silence gap,
 //! never a shift — each packet keeps its own PTS), logged via the shared tally.
 //!
@@ -18,17 +19,17 @@ use super::dropgate::DropTally;
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 /// FLAC frame sync: 14-bit code `0x3FFE` + a mandatory-0 reserved bit; the next
-/// bit (blocking strategy) is masked off. ffmpeg tests `(AV_RB16 & 0xFFFE) ==
-/// 0xFFF8` (flac_parser.c).
+/// bit (blocking strategy) is masked off. Test the top 15 bits of the first two
+/// bytes: `(be16 & 0xFFFE) == 0xFFF8` (per RFC 9639, frame header).
 fn has_flac_sync(data: &[u8]) -> bool {
     data.len() >= 2 && ((u16::from(data[0]) << 8 | u16::from(data[1])) & 0xFFFE) == 0xFFF8
 }
 
-/// Block-size code → samples, `ff_flac_blocksize_table` (0 = reserved/explicit).
+/// Block-size code → samples (RFC 9639 block-size table; 0 = reserved/explicit).
 const FLAC_BLOCKSIZE_TABLE: [u32; 16] = [
     0, 192, 576, 1152, 2304, 4608, 0, 0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
 ];
-/// Sample-rate code → Hz, `ff_flac_sample_rate_table` (0 = STREAMINFO/explicit).
+/// Sample-rate code → Hz (RFC 9639 sample-rate table; 0 = STREAMINFO/explicit).
 const FLAC_SAMPLE_RATE_TABLE: [u32; 16] = [
     0, 88_200, 176_400, 192_000, 8_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 96_000, 0,
     0, 0, 0,
@@ -55,6 +56,9 @@ fn flac_frame_duration_ns(frame: &[u8]) -> Option<i64> {
 
 pub struct FlacParser {
     tally: DropTally,
+    /// Last emitted PTS (ns), carried forward across a PES with no PTS rather than
+    /// resetting the timeline to 0 (see the AC-3/DTS parsers) — preserves A/V sync.
+    last_pts_ns: i64,
 }
 
 impl Default for FlacParser {
@@ -67,6 +71,7 @@ impl FlacParser {
     pub fn new() -> Self {
         Self {
             tally: DropTally::new("flac"),
+            last_pts_ns: 0,
         }
     }
 
@@ -86,7 +91,12 @@ impl CodecParser for FlacParser {
         if pes.data.is_empty() {
             return Vec::new();
         }
-        let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
+        let pts_ns = pes
+            .pts
+            .or(pes.dts)
+            .map(pts_to_ns)
+            .unwrap_or(self.last_pts_ns);
+        self.last_pts_ns = pts_ns;
 
         // Gate: a packet that begins with a FLAC frame sync but whose whole-frame
         // CRC-16 residue is nonzero is corrupt → drop. Anything else passes

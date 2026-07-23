@@ -23,7 +23,8 @@ pub(crate) const DISCONTINUITY_GAP_NS: i64 = 1_000_000;
 /// one concatenated sector stream (clip boundaries / mpls connection_condition
 /// are not plumbed to the mux), so at a non-seamless boundary the source PES
 /// PTS jumps backward. Left uncorrected, that produces a sustained band of
-/// non-monotonic block timestamps (ffmpeg then derives non-monotonic DTS).
+/// non-monotonic block timestamps (a downstream muxer then derives
+/// non-monotonic DTS from them).
 ///
 /// A single running `offset_ns` is applied to EVERY track, so the concatenated
 /// clips form one monotonic timeline AND A/V sync is preserved (all tracks at a

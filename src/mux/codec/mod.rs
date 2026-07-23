@@ -121,11 +121,11 @@ pub trait CodecParser: Send {
 
 /// Passthrough parser — treats each PES as one frame, no parsing.
 ///
-/// Used for the audio codecs that have no dedicated parser and whose PES
-/// boundaries already line up with frame boundaries (Aac, Mp2, Mp3, Flac,
-/// Opus). AC3/DTS/TrueHD have their own parsers; PGS/DvdSub have their own
-/// subtitle parsers. Video codecs must NOT use the all-keyframe form of this
-/// parser — see `parser_for_codec`.
+/// Used for Opus (and any audio codec with no dedicated parser) whose PES
+/// boundaries already line up with frame boundaries. AC3/E-AC3, DTS, TrueHD,
+/// AAC(ADTS), MP2/MP3 and FLAC now have their own gating parsers; PGS/DvdSub
+/// have their own subtitle parsers. Video codecs must NOT use the all-keyframe
+/// form of this parser — see `parser_for_codec`.
 pub struct PassthroughParser {
     keyframe: bool,
 }
@@ -168,8 +168,8 @@ impl CodecParser for PassthroughParser {
 /// - **Audio with independent access units** (DTS, AC-3/E-AC-3, …) gates each AU
 ///   through a per-codec corruption check and drops the ones that fail, keeping
 ///   A/V sync (a drop is a silence gap, never a shift) and logging every drop
-///   via the shared [`dropgate::DropTally`]. DTS uses ffmpeg's core-header parse;
-///   AC-3 uses its native frame CRC.
+///   via the shared [`dropgate::DropTally`]. DTS validates via its core-frame
+///   header (ETSI TS 102 114); AC-3 uses its native frame CRC.
 /// - **LPCM is excluded on purpose**: raw PCM carries no framing or integrity
 ///   data, so a corrupt sample is indistinguishable from a quiet one — there is
 ///   nothing to detect, so nothing can be honestly dropped.
@@ -228,9 +228,9 @@ pub fn parser_for_codec(
             );
             Box::new(PassthroughParser::new(false))
         }
-        // Remaining audio-only codecs (Aac, Mp2, Mp3, Flac, Opus) where PES =
-        // frame: all-keyframe passthrough is correct. Subtitle/Unknown also land
-        // here; keyframe flag is irrelevant for them.
+        // Opus (PES = frame): all-keyframe passthrough is correct. Subtitle/Unknown
+        // also land here; the keyframe flag is irrelevant for them. (Aac/Mp2/Mp3/Flac
+        // have dedicated parsers dispatched earlier in the match.)
         Codec::Opus => Box::new(PassthroughParser::new(true)),
         Codec::Srt | Codec::Ssa | Codec::Unknown(_) => Box::new(PassthroughParser::new(true)),
     }
@@ -285,9 +285,10 @@ mod tests {
     }
 
     #[test]
-    fn unhandled_audio_codecs_use_keyframe_passthrough() {
-        // PES = frame audio codecs: every frame is independently decodable, so
-        // all-keyframe passthrough is correct.
+    fn audio_codecs_emit_keyframe_frames() {
+        // PES = frame audio: every frame is independently decodable → keyframe.
+        // Aac/Mp2/Mp3/Flac go through their dedicated gating parsers (which pass a
+        // non-sync/too-short payload straight through); Opus uses PassthroughParser.
         for codec in [Codec::Aac, Codec::Mp2, Codec::Mp3, Codec::Flac, Codec::Opus] {
             let mut parser = parser_for_codec(codec, None, false);
             let frames = parser.parse(&pes(Some(0), vec![0x01, 0x02]));
