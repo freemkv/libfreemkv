@@ -178,10 +178,9 @@ impl CodecParser for PassthroughParser {
 ///   until the next keyframe. Video instead resyncs at GOP/IDR boundaries (the
 ///   ResyncGate) and lets the decoder conceal — a fundamentally different model
 ///   than per-frame audio dropping.
-/// - TrueHD/MLP and the rare passthrough audio codecs (FLAC/MP2/AAC) do not yet
-///   gate: MLP carries inter-AU restart state so a safe drop must land on a
-///   major-sync boundary, and the passthrough codecs are essentially never seen
-///   on optical media.
+/// - TrueHD/MLP, FLAC, MP2/MP3 and AAC-ADTS also gate undecodable frames via a
+///   `DropTally` (poison/drop-forward for MLP's inter-AU restart state on a
+///   major-sync boundary; CRC/sync-verdict drops for the passthrough codecs).
 ///
 /// Create the appropriate parser for a codec, with optional codec private data.
 ///

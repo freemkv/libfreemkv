@@ -403,38 +403,29 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 }
                 .into());
             }
-            // Per-title key resolution. For a multi-VTS CSS DVD the scan's
-            // single cracked key only descrambles its own VTS; re-crack from
-            // the chosen title's extents if it lives elsewhere. A fresh reader
-            // avoids disturbing the mux reader below. 64 sectors is a
-            // file-safe batch for an ISO. AACS / single-VTS paths are
-            // unchanged (decrypt_keys_for_title short-circuits to decrypt_keys).
-            //
-            // Only a DVD needs this fresh reader (its per-title crack reads the
-            // title's sectors); AACS / unencrypted resolve their keys from
-            // `decrypt_keys()` with NO read, so we must not open — and fail on —
-            // a probe handle for them (v1.5.1 tolerated an open blip on non-DVDs).
-            // For a DVD the reader IS required, so a failed open is PROPAGATED as
-            // a real, loud, retryable I/O error — never guessed into a
-            // `title_is_clear` verdict: guessing `true` would mux a
-            // detection-miss scrambled DVD keyless (silent garbage); guessing
-            // `false` would falsely hard-fail an unencrypted DVD.
-            let (keys, title_is_clear) = if disc.format == crate::disc::DiscFormat::Dvd {
-                let mut crack_reader = crate::io::file_sector_source::FileSectorSource::open(path)
-                    .map_err(|e| -> io::Error { e.into() })?;
-                disc.decrypt_keys_for_title(idx, &mut crack_reader, 64)
+            // Per-title key resolution. DVD CSS is resolved at exactly ONE site —
+            // `build_iso_pipeline`'s per-title crack (below), which decrypts a
+            // crackable title, passes a genuinely-clear one through, and
+            // hard-fails an uncrackable one with CssKeyMissing. So for a DVD we do
+            // NOT pre-crack here: pass `None` and let the pipeline own it.
+            // Pre-cracking would re-open the ISO and re-scan every clear title
+            // (`decrypt_keys_for_title` → None → the pipeline re-cracks anyway).
+            // AACS / unencrypted resolve from `decrypt_keys()` with NO read; `--raw`
+            // (any format) is deliberate ciphertext passthrough — also `None`.
+            let is_dvd = disc.format == crate::disc::DiscFormat::Dvd;
+            let (keys, title_is_clear) = if opts.raw || is_dvd {
+                (crate::decrypt::DecryptKeys::None, false)
             } else {
                 (disc.decrypt_keys(), false)
             };
-            // Per-title decrypt gate (parallel to the disc-wide gate above): on
-            // a multi-VTS CSS disc, the per-title re-crack may return `None` when
-            // the chosen title's VTS could not be re-cracked. Muxing that would
-            // emit scrambled ciphertext verbatim, so fail loudly here — EXCEPT
-            // when the title proved genuinely clear (`title_is_clear`), an
-            // unencrypted stub on an otherwise-CSS disc that needs no key. That
-            // case must NOT raise a false E7023.
-            disc.ensure_title_decryptable(opts.raw, &keys, title_is_clear)
-                .map_err(|e| -> io::Error { e.into() })?;
+            // Decrypt gate for the AACS / non-DVD path: a None key means no usable
+            // disc key, which would mux scrambled ciphertext verbatim — fail loudly
+            // (NoDiscKey). The DVD path is gated inside `build_iso_pipeline` (its
+            // CSS hard-fail), and `--raw` passes.
+            if !is_dvd {
+                disc.ensure_title_decryptable(opts.raw, &keys, title_is_clear)
+                    .map_err(|e| -> io::Error { e.into() })?;
+            }
             // FMTS (AACS 2.1) forensic segments are sourced + fail-loud-checked
             // downstream by `resolve_mux_key_map`/`resolve_fmts_key_map`, which hold
             // the key-fetch closure and can actually attempt resolution. (An older
@@ -497,6 +488,7 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 effective_keys,
                 ISO_MUX_BATCH_SECTORS,
                 format,
+                opts.raw,
                 None,
                 None,
                 fetch,
@@ -1132,13 +1124,17 @@ pub fn resolve_mux_key_map(
 /// - `batch_sectors`: read batch size in logical (2048-byte) sectors — a
 ///   throughput/latency tuning knob, not a correctness parameter.
 /// - `format`: container format (`BdTs` → TS demuxer, `MpegPs` → PS demuxer).
+/// - `raw`: ciphertext passthrough. When `true`, the per-title CSS crack
+///   (`resolve_dvd_title_key`) is skipped entirely — no key is resolved and a
+///   scrambled title is neither descrambled nor hard-failed.
 /// - `halt`: cooperative cancel token (not a timeout); when cancelled the
-///   pipeline stops at the next boundary. `None` disables cancellation.
+///   pipeline stops at the next boundary (and the CSS crack surfaces `Halted`).
+///   `None` disables cancellation.
 /// - `event_fn`: optional progress/event callback invoked by the prefetcher.
 /// - `fetch`: optional key source used UP FRONT by [`resolve_mux_key_map`] to
 ///   secure any CPS-unit key the pool is missing. Not a per-unit mux-time
 ///   callback: the map decides the key for every LBA before the read loop starts.
-// Eight reader/title/keys/tuning/callback params is inherent to the mux entry
+// Nine reader/title/keys/tuning/callback params is inherent to the mux entry
 // point; grouping them into a struct would only move the same fields around.
 #[allow(clippy::too_many_arguments)]
 pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
@@ -1147,11 +1143,27 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     mut keys: crate::decrypt::DecryptKeys,
     batch_sectors: u16,
     format: ContentFormat,
+    raw: bool,
     halt: Option<crate::halt::Halt>,
     event_fn: Option<crate::sector::prefetched::EventFn>,
     fetch: Option<crate::sector::KeyFetch>,
 ) -> io::Result<PipelinedPesStream> {
     let extents = title.extents.clone();
+    // CSS (DVD) key resolution — the shared per-title step (also used by the
+    // live-drive single-pass `DiscStream`). A `None`/MPEG-PS title cracks its own
+    // key from the reader in playback order; AACS `.evo` (also MPEG-PS) arrives as
+    // `Aacs` and is untouched; a clear DVD stays `None`; `raw` skips it entirely.
+    // Without this a detection-miss CSS DVD would mux scrambled sectors as corrupt
+    // video. `halt` lets /api/stop interrupt the crack scan.
+    crate::css::resolve_dvd_title_key(
+        &mut reader,
+        &extents,
+        &mut keys,
+        batch_sectors,
+        format,
+        raw,
+        halt.as_ref(),
+    )?;
     // Unit alignment is an AACS concept: AACS decrypts whole 6144-byte (3-sector)
     // units, so the producer must hand the decrypt step 3-sector-aligned batches.
     // CSS (DVD) and unencrypted content decrypt per 2048-byte sector — forcing
@@ -1714,6 +1726,7 @@ mod tests {
             DecryptKeys::None,
             8192,
             ContentFormat::BdTs,
+            false,
             None,
             None,
             None,
@@ -1755,6 +1768,7 @@ mod tests {
             DecryptKeys::None,
             8192,
             ContentFormat::BdTs,
+            false,
             None,
             None,
             None,
@@ -1807,10 +1821,56 @@ mod tests {
             DecryptKeys::None,
             0,
             ContentFormat::BdTs,
+            false,
             None,
             None,
             None,
         );
         assert!(res.is_err(), "zero batch_sectors must be rejected");
+    }
+
+    /// REGRESSION (autorip production corruption): `build_iso_pipeline` for a DVD
+    /// (MPEG-PS) with `None` keys — what autorip's mux passes on a detection-miss
+    /// DVD (`disc.decrypt_keys()` == None) — must resolve the CSS key from the
+    /// reader itself. A scrambled-but-uncrackable title must HARD-FAIL, never
+    /// build a passthrough pipeline that muxes the scrambled sectors as corrupt
+    /// video. Before this fix, autorip handed None straight through and the mux
+    /// wrote garbage at exit 0.
+    #[test]
+    fn build_iso_pipeline_dvd_none_keys_scrambled_hard_fails() {
+        // One CSS-scrambled, crib-less (uncrackable) MPEG-PS sector.
+        let key = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+        let mut sec = vec![0u8; 2048];
+        sec[0..4].copy_from_slice(&crate::css::PACK_START);
+        for (i, b) in sec.iter_mut().enumerate().take(0x80).skip(4) {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(1); // non-repeating → no crib
+        }
+        sec[0x14] = 0x10; // scramble flag
+        for (i, b) in sec.iter_mut().enumerate().skip(0x80) {
+            *b = (i as u8) ^ 0x3C;
+        }
+        crate::css::lfsr::scramble_sector(&key, &mut sec);
+
+        let mut title = aac_audio_title(0x1100);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 1,
+        }];
+
+        let res = build_iso_pipeline(
+            MemSource { data: sec },
+            title,
+            DecryptKeys::None,
+            8192,
+            ContentFormat::MpegPs,
+            false,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            res.is_err(),
+            "a scrambled DVD title with no key must hard-fail, not build a scrambled-passthrough pipeline"
+        );
     }
 }

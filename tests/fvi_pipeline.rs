@@ -175,6 +175,7 @@ fn run_to_fvi(image: Vec<u8>, title: DiscTitle, path: &std::path::Path) {
         DecryptKeys::None,
         3, // 3-sector (one AACS unit) batches → one source stamp per GOP region
         ContentFormat::MpegPs,
+        false,
         None,
         None,
         None,

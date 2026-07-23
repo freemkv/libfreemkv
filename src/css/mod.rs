@@ -136,6 +136,65 @@ pub fn crack_key_outcome(
     crack_key_scan(reader, extents, batch_sectors, halt, true)
 }
 
+/// Resolve a DVD title's CSS descramble key from the reader when the caller
+/// supplied none — the SINGLE place every DVD read path obtains a title key, so
+/// the file-backed mux highway ([`crate::build_iso_pipeline`]) and the
+/// live-drive single-pass [`crate::DiscStream`] descramble a DVD identically
+/// ("reading is reading"). CSS keys are per-VTS and crackable from the scrambled
+/// data itself, so a `None`/MPEG-PS title cracks its own key here, in playback
+/// order over `extents`. Everything else is left untouched:
+/// - AACS keys (HD-DVD `.evo` is also MPEG-PS but arrives as `Aacs`) — no CSS.
+/// - a title that already carries a key — nothing to resolve.
+/// - a genuinely clear DVD (no scrambled sector) — stays `None`, a mux no-op.
+///
+/// A scrambled-but-uncrackable title is a hard [`crate::error::Error::CssKeyMissing`],
+/// never a silent scrambled-passthrough mux.
+pub(crate) fn resolve_dvd_title_key(
+    reader: &mut dyn SectorSource,
+    extents: &[Extent],
+    keys: &mut crate::decrypt::DecryptKeys,
+    batch_sectors: u16,
+    format: crate::disc::ContentFormat,
+    raw: bool,
+    halt: Option<&crate::halt::Halt>,
+) -> std::io::Result<()> {
+    // `--raw` = deliberate ciphertext passthrough: never crack or descramble, and
+    // never hard-fail on scrambled-uncrackable — the user asked for the scrambled
+    // bytes. (In raw mode the caller hands us `None` on purpose; without this
+    // guard we'd install a real key and silently DECRYPT, or abort a raw mux.)
+    if raw {
+        return Ok(());
+    }
+    if matches!(keys, crate::decrypt::DecryptKeys::None)
+        && format == crate::disc::ContentFormat::MpegPs
+    {
+        // `halt` threads the caller's cancellation token so /api/stop can
+        // interrupt a long crack scan (the old scan-time crack honored it too).
+        let outcome = crack_key_outcome(reader, extents, batch_sectors, halt);
+        // A cancelled crack breaks out early, so its outcome is a TRUNCATED scan
+        // — not a real verdict. Interpreting it would either hard-fail a good disc
+        // as `ScrambledUncracked` (quarantining staging on a Stop) or, worse,
+        // read a half-scanned title as `Unencrypted` and mux scrambled bytes as
+        // plaintext. Surface the cancellation as `Halted` so the caller takes its
+        // graceful-stop path instead of trusting the partial outcome.
+        if halt.map(|h| h.is_cancelled()).unwrap_or(false) {
+            return Err(crate::error::Error::Halted.into());
+        }
+        match outcome {
+            CrackOutcome::Cracked(state) => {
+                *keys = crate::decrypt::DecryptKeys::Css {
+                    title_key: state.title_key,
+                };
+            }
+            CrackOutcome::ScrambledUncracked => {
+                return Err(crate::error::Error::CssKeyMissing.into());
+            }
+            CrackOutcome::Unencrypted => {}
+        }
+    }
+    Ok(())
+}
+
 /// The crack scan, returning the full [`CrackOutcome`]. Tracks a
 /// `saw_scrambled` flag so a scrambled-but-uncracked disc is distinguished
 /// from a genuinely-unencrypted one (the [`crack_key`] `Option` wrapper
@@ -890,6 +949,205 @@ mod tests {
             state.crack_span,
             Some((1000, 1050)),
             "crack_span must record the extent LBA span for per-VTS routing"
+        );
+    }
+
+    /// `resolve_dvd_title_key` is the SINGLE shared per-title CSS step both read
+    /// paths (`build_iso_pipeline` multi-pass and `DiscStream::new` single-pass)
+    /// call, so these pin its full contract at the shared boundary.
+    ///
+    /// Crack path: a `None`-keyed MPEG-PS title with a crackable scrambled sector
+    /// installs a `Css` key that round-trips the sector.
+    #[test]
+    fn resolve_dvd_title_key_cracks_none_mpegps() {
+        let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let seed = [0x11, 0x22, 0x33, 0x44, 0x55];
+        let crackable = crackable_sector(&title_key, &seed, 8);
+        let mut src = MockSource::new(0x00);
+        src.crackable = Some((1003, crackable));
+        let extents = [Extent {
+            start_lba: 1000,
+            sector_count: 50,
+        }];
+        let mut keys = crate::decrypt::DecryptKeys::None;
+        resolve_dvd_title_key(
+            &mut src,
+            &extents,
+            &mut keys,
+            4,
+            crate::disc::ContentFormat::MpegPs,
+            false,
+            None,
+        )
+        .expect("crackable title resolves");
+        match keys {
+            crate::decrypt::DecryptKeys::Css { title_key: got } => {
+                assert_eq!(got, title_key, "installed key must be the cracked key")
+            }
+            _ => panic!("expected Css key"),
+        }
+    }
+
+    /// Hard-fail path: a scrambled-but-uncrackable `None`-keyed MPEG-PS title must
+    /// return `CssKeyMissing`, never leave `keys` as `None` (which would mux
+    /// scrambled bytes as plaintext — the 328k-decode-error corruption).
+    #[test]
+    fn resolve_dvd_title_key_scrambled_uncrackable_hard_fails() {
+        let mut src = MockSource::new(0x00);
+        src.lock_all = true; // every read CSS-locked → ScrambledUncracked
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 4,
+        }];
+        let mut keys = crate::decrypt::DecryptKeys::None;
+        let err = resolve_dvd_title_key(
+            &mut src,
+            &extents,
+            &mut keys,
+            4,
+            crate::disc::ContentFormat::MpegPs,
+            false,
+            None,
+        )
+        .expect_err("scrambled-uncrackable must hard-fail");
+        // The Error::CssKeyMissing flattens into io::Error carrying its E-code
+        // (7023) in the message — assert that specific code survived.
+        assert!(
+            err.to_string()
+                .contains(&format!("E{}", crate::error::E_CSS_KEY_MISSING)),
+            "must surface CssKeyMissing (E{}), got: {err}",
+            crate::error::E_CSS_KEY_MISSING
+        );
+        assert!(
+            matches!(keys, crate::decrypt::DecryptKeys::None),
+            "keys must stay None on hard-fail (never a scrambled-passthrough key)"
+        );
+    }
+
+    /// `raw` is deliberate ciphertext passthrough: even a scrambled-uncrackable
+    /// title must return `Ok` and leave `keys` untouched (`None`) — no crack, no
+    /// hard-fail. This is the `--raw` guarantee.
+    #[test]
+    fn resolve_dvd_title_key_raw_skips_crack_and_never_fails() {
+        let mut src = MockSource::new(0x00);
+        src.lock_all = true;
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 4,
+        }];
+        let mut keys = crate::decrypt::DecryptKeys::None;
+        resolve_dvd_title_key(
+            &mut src,
+            &extents,
+            &mut keys,
+            4,
+            crate::disc::ContentFormat::MpegPs,
+            true, // raw
+            None,
+        )
+        .expect("raw must never hard-fail");
+        assert!(
+            matches!(keys, crate::decrypt::DecryptKeys::None),
+            "raw must leave keys None (no descramble)"
+        );
+        assert!(
+            src.reads.borrow().is_empty(),
+            "raw must not read any sector for a crack"
+        );
+    }
+
+    /// AACS gate: an MPEG-PS title carrying `Aacs` keys (HD-DVD `.evo`) must be
+    /// left untouched — resolve only fires on `None` keys, never overwriting a
+    /// real key set or cracking AACS ciphertext as CSS.
+    #[test]
+    fn resolve_dvd_title_key_leaves_aacs_untouched() {
+        let mut src = MockSource::new(0x00);
+        src.lock_all = true; // would hard-fail IF it ran the crack
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 4,
+        }];
+        let mut keys = crate::decrypt::DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0u8; 16])],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::MpegPs,
+        };
+        resolve_dvd_title_key(
+            &mut src,
+            &extents,
+            &mut keys,
+            4,
+            crate::disc::ContentFormat::MpegPs,
+            false,
+            None,
+        )
+        .expect("AACS title must be left untouched, not cracked");
+        assert!(
+            matches!(keys, crate::decrypt::DecryptKeys::Aacs { .. }),
+            "Aacs keys must survive unchanged"
+        );
+        assert!(
+            src.reads.borrow().is_empty(),
+            "must not read for a crack when keys are already Aacs"
+        );
+    }
+
+    /// Clear DVD: a `None`-keyed MPEG-PS title with no scrambled sector stays
+    /// `None` (a mux no-op) and returns `Ok` — genuinely-unencrypted DVDs pass.
+    #[test]
+    fn resolve_dvd_title_key_clear_dvd_stays_none() {
+        let mut src = MockSource::new(0x00); // all-clear sectors
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 4,
+        }];
+        let mut keys = crate::decrypt::DecryptKeys::None;
+        resolve_dvd_title_key(
+            &mut src,
+            &extents,
+            &mut keys,
+            4,
+            crate::disc::ContentFormat::MpegPs,
+            false,
+            None,
+        )
+        .expect("clear DVD passes");
+        assert!(
+            matches!(keys, crate::decrypt::DecryptKeys::None),
+            "a clear DVD must keep None keys"
+        );
+    }
+
+    /// A cancelled crack (user Stop mid-scan) must surface as `Halted`, NOT be
+    /// misread from the truncated scan as `Unencrypted` (→ scrambled passthrough,
+    /// corruption) or `ScrambledUncracked` (→ CssKeyMissing, which quarantines a
+    /// good disc). This pins the halt-outcome fix.
+    #[test]
+    fn resolve_dvd_title_key_halt_surfaces_as_halted_not_a_verdict() {
+        let mut src = MockSource::new(0x00);
+        src.lock_all = true; // without the halt guard this would be ScrambledUncracked
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 4,
+        }];
+        let halt = crate::halt::Halt::new();
+        halt.cancel(); // Stop already pressed
+        let mut keys = crate::decrypt::DecryptKeys::None;
+        let err = resolve_dvd_title_key(
+            &mut src,
+            &extents,
+            &mut keys,
+            4,
+            crate::disc::ContentFormat::MpegPs,
+            false,
+            Some(&halt),
+        )
+        .expect_err("a cancelled crack must return an error");
+        assert!(
+            err.to_string()
+                .contains(&format!("E{}", crate::error::E_HALTED)),
+            "cancelled crack must surface Halted (E{}), got: {err}",
+            crate::error::E_HALTED
         );
     }
 
