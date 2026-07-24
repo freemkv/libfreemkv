@@ -38,7 +38,9 @@ use crate::pes::{CountingStream, PesFrame, Stream};
 use crate::sector::{FileSectorSource, KeyFetch, SectorSource};
 use crate::session::DiscSession;
 
-use super::resolve::{InputOptions, StreamUrl, build_iso_pipeline, input, output, parse_url};
+use super::resolve::{
+    InputOptions, StreamUrl, build_iso_pipeline, input, output, parse_url, resolve_mux_key_map,
+};
 
 /// Effectively-unbounded per-frame send deadline used when a consumer passes
 /// `MuxOptions.send_deadline == None` (the CLI's interactive stdout / network
@@ -302,7 +304,7 @@ pub fn mux_stream(
             // Pull everything we need out of the disc as owned values so the
             // immutable disc borrow is released before the mutable
             // `take_reader` below.
-            let (title, format, keys, playlist) = {
+            let (title, format, mut keys, playlist) = {
                 let disc = session.disc().ok_or_else(|| Error::DeviceNotReady {
                     path: session.device_path().to_string(),
                 })?;
@@ -324,9 +326,25 @@ pub fn mux_stream(
             };
             // A missing staged reader ("already consumed" / never staged) is a
             // clean error, not a panic (contract Q2).
-            let reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
+            let mut reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
                 path: session.device_path().to_string(),
             })?;
+            // Resolve the AACS key map off the STAGED reader BEFORE it is moved
+            // into `DiscStream::new` (borrow to sample, then move to construct).
+            // Without this the AACS `DecryptingSectorSource` inside the stream has
+            // no map and fails `DecryptFailed` on the first content unit — the
+            // single-pass live-mux decrypt bug. `session.key_fetch()` (retained by
+            // `resolve_keys`) recovers a multi-CPS/orphan/forensic unit the pool is
+            // missing. DVD/clear/`raw` resolve to `None` (CSS self-cracks in
+            // `DiscStream::new`; raw is ciphertext passthrough) — unchanged.
+            let base_map = resolve_inline_base_map(
+                &mut *reader,
+                &title,
+                &mut keys,
+                session.key_fetch(),
+                format,
+                opts.raw,
+            )?;
             let mut stream = crate::mux::DiscStream::new(
                 reader,
                 title,
@@ -339,6 +357,9 @@ pub fn mux_stream(
             if opts.raw {
                 stream.set_raw();
             }
+            if let Some(map) = base_map {
+                stream = stream.with_key_map(map);
+            }
             stream.skip_errors = opts.skip_errors;
             // Live path: the `DiscStream` emits the full reader-side vocabulary
             // (`SectorSkipped` on skip-mode zero-fill, `BatchSizeChanged` on the
@@ -347,12 +368,35 @@ pub fn mux_stream(
             (Box::new(stream), Some(playlist))
         }
         MuxInput::Live {
-            reader,
+            mut reader,
             title,
             format,
-            keys,
+            mut keys,
             key_map,
         } => {
+            // The map installed BEFORE reads begin. Two sources:
+            // - A caller-supplied `key_map` (autorip's FMTS gate resolved the
+            //   forensic per-segment map and passes it here) is used VERBATIM —
+            //   never re-resolved.
+            // - `None` on an AACS disc means a plain (non-FMTS) single/multi-CPS
+            //   disc that the caller did NOT map. Resolve the base map here off the
+            //   live reader, exactly as the `Session` arm and `build_iso_pipeline`
+            //   do — otherwise the AACS `DecryptingSectorSource` has no map and
+            //   fails `DecryptFailed` on the first content unit (the single-pass
+            //   live-mux decrypt bug). Borrow to sample, then move into the stream.
+            // DVD/clear/`raw` → `None` (unchanged: CSS self-cracks in
+            // `DiscStream::new`; raw is ciphertext passthrough).
+            let base_map = match key_map {
+                Some(map) => Some(map),
+                None => resolve_inline_base_map(
+                    &mut *reader,
+                    &title,
+                    &mut keys,
+                    None,
+                    format,
+                    opts.raw,
+                )?,
+            };
             // INLINE `DiscStream` — the same constructor the `Session` arm uses,
             // NOT `build_iso_pipeline` (the prefetch highway). The consumer's
             // adaptive batch-retry lives in `DiscStream::fill_extents`, which the
@@ -369,13 +413,14 @@ pub fn mux_stream(
             if opts.raw {
                 stream.set_raw();
             }
-            // Apply the forensic FMTS key map BEFORE reads begin — rewrites the
-            // extent walk to our-phase units only and installs the map so each
-            // unit decrypts with its mapped key. `None` leaves the walk unchanged
-            // (identical to a plain single/multi-CPS disc). Single-pass FMTS
-            // correctness depends on this: dropping it reads the alternate
-            // device-group units and mis-decrypts the forensic segment.
-            if let Some(map) = key_map {
+            // Apply the key map BEFORE reads begin — for an FMTS forensic map this
+            // rewrites the extent walk to our-phase units only and installs the map
+            // so each unit decrypts with its mapped key; for a plain single/multi-CPS
+            // base map it installs the per-unit content key. `None` leaves the walk
+            // unchanged (CSS / clear / raw). Single-pass FMTS correctness depends on
+            // this: dropping the forensic map reads the alternate device-group units
+            // and mis-decrypts the forensic segment.
+            if let Some(map) = base_map {
                 stream = stream.with_key_map(map);
             }
             stream.skip_errors = opts.skip_errors;
@@ -431,6 +476,50 @@ fn session_mux_keys(disc: &crate::disc::Disc) -> DecryptKeys {
     } else {
         disc.decrypt_keys()
     }
+}
+
+/// Resolve the base AACS key map for an INLINE live-drive mux (the `Session` /
+/// `Live` arms) BEFORE the reader is moved into [`DiscStream::new`] — the
+/// counterpart to the map resolution [`build_iso_pipeline`] performs internally
+/// for the file highway.
+///
+/// Under the map-only decrypt model an AACS [`DecryptingSectorSource`] decrypts
+/// NOTHING until a key map is installed: with no map the AACS arm of the decrypt
+/// path fails loud with [`Error::DecryptFailed`] on the first content unit (the
+/// deliberate "a reader built without its map is a bug" guard). Both inline arms
+/// used to skip this — `Session` installed no map at all, and `Live` installed
+/// only a caller-supplied forensic FMTS map (`None` for a plain AACS disc) — so
+/// EVERY plain AACS Blu-ray/UHD muxed via the live single-pass path failed
+/// `DecryptFailed` on the first content read. This resolves + returns the map so
+/// the caller can install it via [`DiscStream::with_key_map`].
+///
+/// - AACS keys → resolve (`resolve_mux_key_map`: single-CPS content map,
+///   multi-CPS per-extent key selection, or FMTS per-segment map) and return
+///   `Some(map)`. Resolution failure propagates (fail loud), matching the ISO
+///   path's decrypt gate.
+/// - CSS / clear / `None` → `Ok(None)`: CSS self-cracks per title inside
+///   [`DiscStream::new`], and a genuinely-clear disc needs no map.
+/// - `raw` → `Ok(None)`: ciphertext passthrough, no decrypt step to key.
+///
+/// The `reader` is borrowed only to SAMPLE ciphertext here (the UDF/FMTS probe
+/// and any multi-CPS unit samples); a single-CPS disc — the overwhelming
+/// majority, including every single-key UHD — resolves its map with NO content
+/// read beyond the one-time UDF filesystem probe. The caller then moves the same
+/// reader into [`DiscStream::new`]; reads are by absolute LBA, so the sampling
+/// leaves no read-position state behind.
+fn resolve_inline_base_map(
+    reader: &mut dyn SectorSource,
+    title: &DiscTitle,
+    keys: &mut DecryptKeys,
+    fetch: Option<&KeyFetch>,
+    format: crate::disc::ContentFormat,
+    raw: bool,
+) -> std::io::Result<Option<Arc<AacsKeyMap>>> {
+    if raw || !matches!(keys, DecryptKeys::Aacs { .. }) {
+        return Ok(None);
+    }
+    let map = resolve_mux_key_map(reader, title, keys, fetch, format)?;
+    Ok(Some(Arc::new(map)))
 }
 
 fn reader_event_fn(events: Arc<dyn MuxEvents>) -> crate::sector::prefetched::EventFn {
@@ -1344,6 +1433,188 @@ mod tests {
             read_lbas.contains(&1030) && read_lbas.contains(&1054),
             "our-phase forensic units must still be read (kept LBAs 1030/1054)"
         );
+    }
+
+    /// A `SectorSource` that serves ONE genuinely-AACS-encrypted aligned unit
+    /// (6144 bytes) at LBA 0..3 and zeros everywhere else — enough for the
+    /// map-only decrypt path to prove itself end-to-end. Zeros elsewhere make the
+    /// UDF filesystem probe inside `resolve_mux_key_map` fail cleanly (→ not an
+    /// FMTS disc, single-CPS base map).
+    struct AacsUnitReader {
+        unit: Vec<u8>, // 6144 bytes, encrypted
+        capacity: u32,
+    }
+    impl crate::sector::SectorSource for AacsUnitReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(0);
+            // The content unit lives at LBA 0..3; serve it whenever a read starts
+            // there (the inline `DiscStream` reads the [0,3) extent as one batch).
+            if lba == 0 && bytes >= self.unit.len() {
+                buf[..self.unit.len()].copy_from_slice(&self.unit);
+            }
+            Ok(bytes)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    /// Build one AACS-encrypted BD-TS aligned unit whose plaintext is a single
+    /// audio PES (the same clip the ISO test muxes), encrypted under `unit_key`.
+    fn encrypted_audio_unit(unit_key: &[u8; 16]) -> Vec<u8> {
+        let es = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
+        let pkt = bdts_data_packet(0x1100, true, &audio_pes(&es));
+        let mut unit = vec![0u8; 3 * 2048]; // one 6144-byte aligned unit
+        unit[..192].copy_from_slice(&pkt);
+        crate::aacs::content::aacs_encrypt_unit_for_test(&mut unit, unit_key);
+        unit
+    }
+
+    /// END-TO-END decrypt on the live single-pass `MuxInput::Live` path with a
+    /// plain (non-FMTS) AACS disc and NO caller-supplied key map — the exact shape
+    /// of `freemkv rip disc://…` and autorip's non-FMTS single-pass. The driver's
+    /// `Live` arm must RESOLVE + INSTALL the base AACS key map itself; the unit
+    /// then decrypts to a valid audio PES and the mux drains and finalises.
+    ///
+    /// This is the regression guard for the confirmed bug: without the map the
+    /// AACS `DecryptingSectorSource` fails `DecryptFailed` on the first content
+    /// unit and no AACS disc could ever be live-muxed.
+    ///
+    /// Mutation: deleting the `resolve_inline_base_map` call (or the
+    /// `stream = stream.with_key_map(map)` install) in the `Live` arm leaves the
+    /// reader mapless → the first content batch cannot decrypt (root cause
+    /// `DecryptFailed`, surfaced through `fill_extents`' non-skip read-error path
+    /// as a `DiscRead`) → `mux_stream` returns `Err` and `out.completed` is never
+    /// reached (verified: the mux aborts instead of finalising).
+    #[test]
+    fn mux_input_live_aacs_without_caller_map_resolves_and_decrypts() {
+        use crate::disc::Extent;
+
+        let unit_key = [0x5Au8; 16];
+        let reader = Box::new(AacsUnitReader {
+            unit: encrypted_audio_unit(&unit_key),
+            capacity: 2048,
+        });
+        let mut title = aac_audio_title(0x1100);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 3,
+        }];
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, unit_key)],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+
+        let opts = MuxOptions {
+            skip_errors: false, // a DecryptFailed must PROPAGATE, not zero-fill
+            batch_sectors: 3,   // one aligned unit per read
+            raw: false,
+            send_deadline: Some(Duration::from_secs(60)),
+        };
+        let halt = Halt::new();
+        let out = mux_stream(
+            MuxInput::Live {
+                reader,
+                title,
+                format: crate::disc::ContentFormat::BdTs,
+                keys,
+                key_map: None, // plain AACS disc: the driver must resolve the base map
+            },
+            "null://",
+            &opts,
+            &halt,
+            Arc::new(NoopEvents),
+        )
+        .expect(
+            "a plain AACS live mux must resolve+install its base key map and DECRYPT \
+             (no map → the content batch fails to decrypt and the mux aborts)",
+        );
+        assert!(
+            out.completed,
+            "the decrypted audio PES drained and finalised — proves the unit decrypted"
+        );
+        assert!(
+            out.bytes_written > 0,
+            "decrypted payload bytes reached the sink"
+        );
+    }
+
+    /// The shared `resolve_inline_base_map` helper's gating: an AACS key set
+    /// yields a map (Some); CSS/clear/None and `raw` yield None (CSS self-cracks
+    /// in `DiscStream::new`; raw is ciphertext passthrough). Guards the Session
+    /// and Live arms against accidentally mapping a DVD (which would suppress the
+    /// per-title CSS crack) or resolving under `--raw`.
+    #[test]
+    fn resolve_inline_base_map_gates_on_aacs_and_raw() {
+        use crate::disc::Extent;
+        let unit_key = [0x5Au8; 16];
+        let mut title = aac_audio_title(0x1100);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 3,
+        }];
+        let mk_reader = || AacsUnitReader {
+            unit: encrypted_audio_unit(&unit_key),
+            capacity: 2048,
+        };
+
+        // AACS, not raw → a map is resolved and installed.
+        let mut r = mk_reader();
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, unit_key)],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map = resolve_inline_base_map(
+            &mut r,
+            &title,
+            &mut keys,
+            None,
+            crate::disc::ContentFormat::BdTs,
+            false,
+        )
+        .expect("resolve must not error for a single-CPS AACS disc");
+        assert!(map.is_some(), "AACS non-raw must resolve a base map");
+
+        // AACS but raw → no map (ciphertext passthrough).
+        let mut r = mk_reader();
+        let mut keys_raw = DecryptKeys::Aacs {
+            unit_keys: vec![(0, unit_key)],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map_raw = resolve_inline_base_map(
+            &mut r,
+            &title,
+            &mut keys_raw,
+            None,
+            crate::disc::ContentFormat::BdTs,
+            true,
+        )
+        .expect("raw resolve is a no-op");
+        assert!(map_raw.is_none(), "raw must NOT resolve a map");
+
+        // CSS / clear (DecryptKeys::None) → no map (CSS self-cracks per title).
+        let mut r = mk_reader();
+        let mut keys_none = DecryptKeys::None;
+        let map_none = resolve_inline_base_map(
+            &mut r,
+            &title,
+            &mut keys_none,
+            None,
+            crate::disc::ContentFormat::MpegPs,
+            false,
+        )
+        .expect("clear/CSS resolve is a no-op");
+        assert!(map_none.is_none(), "CSS/clear must NOT resolve an AACS map");
     }
 
     // ── Regression A: header-buffer cap fails fast instead of OOM ───────────
