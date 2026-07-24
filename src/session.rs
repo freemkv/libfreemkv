@@ -381,9 +381,12 @@ impl DiscSession {
     /// The drive slot stays `None` (a `MuxInput::Session` mux never touches it —
     /// it reads through the staged `reader`); `device` carries a sentinel path so
     /// the driver's missing-reader error still has a name.
+    ///
+    /// `disc` is an `Option` so a test can construct a session that has NOT been
+    /// scanned (`None`) to exercise the `resolve_keys` "called before scan" guard.
     #[cfg(test)]
     pub(crate) fn from_parts_for_test(
-        disc: Disc,
+        disc: Option<Disc>,
         reader: Option<Box<dyn SectorSource>>,
         key_fetch: Option<KeyFetch>,
     ) -> DiscSession {
@@ -391,7 +394,7 @@ impl DiscSession {
             drive: None,
             device: "test://session".to_string(),
             spec: KeySpec::default(),
-            disc: Some(disc),
+            disc,
             reader,
             key_fetch,
         }
@@ -731,6 +734,24 @@ mod tests {
         assert!(
             matches!(disc.decrypt_keys(), DecryptKeys::None),
             "the disc is left untouched"
+        );
+    }
+
+    /// `resolve_keys` called before `scan` (disc slot still `None`) must return the
+    /// clean typed `DeviceNotReady` guard, never reach the `.expect("disc present
+    /// (checked above)")` below it and panic.
+    ///
+    /// Mutation: change the `if self.disc.is_none()` guard to `.expect()`/panic
+    /// (e.g. drop the early return) → this test panics instead of getting an Err.
+    #[test]
+    fn resolve_keys_before_scan_is_clean_device_not_ready() {
+        let mut session = DiscSession::from_parts_for_test(None, None, None);
+        let err = session
+            .resolve_keys(factory_of(|| HasUnitKey([1; 16])))
+            .expect_err("resolve_keys before scan must error, not panic");
+        assert!(
+            matches!(err, Error::DeviceNotReady { .. }),
+            "expected DeviceNotReady, got {err:?}"
         );
     }
 }

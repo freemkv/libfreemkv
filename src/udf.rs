@@ -731,11 +731,9 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
 
     let tag_id = u16::from_le_bytes([avdp[0], avdp[1]]);
     if tag_id != 2 {
-        return Err(Error::DiscRead {
-            sector: 256,
-            status: None,
-            sense: None,
-        });
+        // Sector 256 read fine but carries no Anchor Volume Descriptor Pointer:
+        // this is deterministically not a UDF disc, not a transient read fault.
+        return Err(Error::UdfNotFilesystem);
     }
 
     // Main VDS extent location: bytes [16:20] = LBA, [20:24] = length
@@ -776,11 +774,8 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     }
 
     if partition_start == 0 {
-        return Err(Error::DiscRead {
-            sector: 0,
-            status: None,
-            sense: None,
-        });
+        // No Partition Descriptor found in the VDS: structurally not a UDF disc.
+        return Err(Error::UdfNotFilesystem);
     }
 
     // Step 3: Parse partition maps from LVD to find metadata partition
@@ -871,11 +866,9 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
 
     let fsd_tag = u16::from_le_bytes([fsd[0], fsd[1]]);
     if fsd_tag != 256 {
-        return Err(Error::DiscRead {
-            sector: metadata_start as u64,
-            status: None,
-            sense: None,
-        });
+        // The metadata sector read fine but carries no File Set Descriptor:
+        // structurally not a UDF disc, not a transient read fault.
+        return Err(Error::UdfNotFilesystem);
     }
 
     // Root Directory ICB: long_ad at FSD offset 400

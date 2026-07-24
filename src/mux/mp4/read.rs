@@ -201,6 +201,15 @@ impl<R: Read + Seek> Mp4Reader<R> {
             let durations = find_box(stbl, b"stts")
                 .map(|b| parse_stts(b, n))
                 .unwrap_or_default();
+            if durations.is_empty() {
+                // Samples exist but there is no decoding-time table: `stts` is
+                // mandatory in a valid stbl (ISO/IEC 14496-12 §8.6.1). Without it
+                // every sample would take dur=0 → all-zero, identical timestamps,
+                // collapsing the whole track onto one instant. Drop the track
+                // rather than emit degenerate timing (mirrors the stco/stsc
+                // guards above); an all-tracks-dropped file fails Mp4Invalid below.
+                continue;
+            }
             let ctts = find_box(stbl, b"ctts")
                 .map(|b| parse_ctts(b, n))
                 .unwrap_or_default();
@@ -1216,11 +1225,21 @@ mod tests {
             p.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx
             mp4_box(b"stsc", &p)
         };
+        let stts = {
+            // Mandatory time-to-sample box: 1 entry → 1 sample × 1000 ticks.
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+            p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+            p.extend_from_slice(&1u32.to_be_bytes()); // sample_count
+            p.extend_from_slice(&1000u32.to_be_bytes()); // sample_delta
+            mp4_box(b"stts", &p)
+        };
         let mut stbl = Vec::new();
         stbl.extend_from_slice(&stsd);
         stbl.extend_from_slice(&stsz);
         stbl.extend_from_slice(&stco);
         stbl.extend_from_slice(&stsc);
+        stbl.extend_from_slice(&stts);
         let minf = mp4_box(b"minf", &mp4_box(b"stbl", &stbl));
         let mut mdia = Vec::new();
         mdia.extend_from_slice(&mdhd);
@@ -1319,11 +1338,20 @@ mod tests {
             p.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx
             mp4_box(b"stsc", &p)
         };
+        let stts = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+            p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+            p.extend_from_slice(&1u32.to_be_bytes()); // sample_count
+            p.extend_from_slice(&1000u32.to_be_bytes()); // sample_delta
+            mp4_box(b"stts", &p)
+        };
         let mut stbl = Vec::new();
         stbl.extend_from_slice(&stsd);
         stbl.extend_from_slice(&stsz);
         stbl.extend_from_slice(&stco);
         stbl.extend_from_slice(&stsc);
+        stbl.extend_from_slice(&stts);
         let minf = mp4_box(b"minf", &mp4_box(b"stbl", &stbl));
         let mut mdia = Vec::new();
         mdia.extend_from_slice(&mdhd);
@@ -1397,6 +1425,15 @@ mod tests {
             p.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx
             mp4_box(b"stsc", &p)
         };
+        let stts = {
+            // Mandatory time-to-sample box: 3 entries' worth via one run (3×1000).
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+            p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+            p.extend_from_slice(&3u32.to_be_bytes()); // sample_count
+            p.extend_from_slice(&1000u32.to_be_bytes()); // sample_delta
+            mp4_box(b"stts", &p)
+        };
         let mut stbl = Vec::new();
         stbl.extend_from_slice(&stsd);
         stbl.extend_from_slice(&stsz);
@@ -1405,6 +1442,9 @@ mod tests {
         }
         if omit != b"stsc" {
             stbl.extend_from_slice(&stsc);
+        }
+        if omit != b"stts" {
+            stbl.extend_from_slice(&stts);
         }
         let minf = mp4_box(b"minf", &mp4_box(b"stbl", &stbl));
         let mut mdia = Vec::new();
@@ -1443,6 +1483,23 @@ mod tests {
         assert!(
             rd.is_err(),
             "a track with stsz + stco but no stsc must be dropped; all-dropped → Mp4Invalid"
+        );
+    }
+
+    /// A track with samples (`stsz`) but no time-to-sample table (`stts`, mandatory
+    /// per ISO/IEC 14496-12 §8.6.1) must be DROPPED — without it every sample takes
+    /// dur=0, collapsing the whole track onto one instant (all-zero timestamps).
+    /// With it the only track, the file fails `Mp4Invalid`.
+    /// Mutation check: delete the `if durations.is_empty() { continue; }` guard and
+    /// `from_reader` returns `Ok` (all-zero-timestamp samples), flipping this to FAIL.
+    #[test]
+    fn missing_stts_drops_track_all_dropped_is_invalid() {
+        use std::io::Cursor;
+        let moov = mp4_box(b"moov", &audio_trak_missing(b"stts"));
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "no-stts".into());
+        assert!(
+            rd.is_err(),
+            "a track with stsz but no stts must be dropped; all-dropped → Mp4Invalid"
         );
     }
 

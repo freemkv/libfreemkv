@@ -60,6 +60,7 @@ pub const E_NO_STREAMS: u16 = 6009;
 pub const E_HALTED: u16 = 6010;
 pub const E_MAPFILE_INVALID: u16 = 6011;
 pub const E_UDF_BUFFER_TOO_SMALL: u16 = 6012;
+pub const E_UDF_NOT_FILESYSTEM: u16 = 6013;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -272,6 +273,14 @@ pub enum Error {
     UdfNotFound {
         path: String,
     },
+    /// The reader was addressable but the bytes are structurally NOT a UDF
+    /// filesystem — a deterministic tag/format mismatch (e.g. no Anchor Volume
+    /// Descriptor Pointer at sector 256, no partition descriptor, no File Set
+    /// Descriptor). Distinct from [`Error::DiscRead`] (a transient I/O fault):
+    /// this is a stable property of the media, not something a retry fixes. Lets
+    /// callers (notably FMTS key resolution) treat "not a UDF/FMTS disc" as a
+    /// clean negative while still failing loud on a real read fault.
+    UdfNotFilesystem,
     /// A `SectorSource` caller passed a destination buffer smaller than one
     /// 2048-byte sector. A contract violation on the public reader API —
     /// returned instead of panicking on the slice.
@@ -564,6 +573,7 @@ impl Error {
             Error::MplsParse => E_MPLS_PARSE,
             Error::ClpiParse => E_CLPI_PARSE,
             Error::UdfNotFound { .. } => E_UDF_NOT_FOUND,
+            Error::UdfNotFilesystem => E_UDF_NOT_FILESYSTEM,
             Error::UdfBufferTooSmall => E_UDF_BUFFER_TOO_SMALL,
             Error::DiscTitleRange { .. } => E_DISC_TITLE_RANGE,
             Error::IfoParse => E_IFO_PARSE,
@@ -1275,6 +1285,7 @@ mod tests {
             E_HALTED,
             E_MAPFILE_INVALID,
             E_UDF_BUFFER_TOO_SMALL,
+            E_UDF_NOT_FILESYSTEM,
             E_AACS_NO_KEYS,
             E_AACS_CERT_SHORT,
             E_AACS_AGID_ALLOC,
