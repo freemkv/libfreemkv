@@ -326,6 +326,41 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     }
 }
 
+/// Test-only inverse of [`decrypt_unit`]: encrypt a clear aligned unit under
+/// `unit_key` and set the CPI-encrypted flag (top 2 bits of byte 0) so the unit
+/// reads as encrypted under [`aacs_unit_encrypted`]. Exposed `pub(crate)` for
+/// cross-module mux tests (the mux `driver.rs` builds a genuinely-AACS-encrypted
+/// fixture to prove the live/session decrypt path installs its key map). Uses
+/// only the module-scope primitives so it stays in lock-step with `decrypt_unit`.
+#[cfg(test)]
+pub(crate) fn aacs_encrypt_unit_for_test(unit: &mut [u8], unit_key: &[u8; 16]) {
+    if unit.len() < ALIGNED_UNIT_LEN {
+        return;
+    }
+    // Set CPI bits BEFORE key derivation so the recovered plaintext header matches.
+    unit[0] |= 0xC0;
+    let mut header = [0u8; 16];
+    header.copy_from_slice(&unit[..16]);
+    let derived = aes_ecb_encrypt(unit_key, &header);
+    let mut k = [0u8; 16];
+    for i in 0..16 {
+        k[i] = derived[i] ^ header[i];
+    }
+    // CBC-encrypt bytes 16.. under the fixed AACS IV (forward of `aes_cbc_decrypt`).
+    let mut prev = AACS_IV;
+    let num_blocks = (ALIGNED_UNIT_LEN - 16) / 16;
+    for i in 0..num_blocks {
+        let off = 16 + i * 16;
+        let mut block = [0u8; 16];
+        for j in 0..16 {
+            block[j] = unit[off + j] ^ prev[j];
+        }
+        let enc = aes_ecb_encrypt(&k, &block);
+        unit[off..off + 16].copy_from_slice(&enc);
+        prev.copy_from_slice(&enc);
+    }
+}
+
 /// Remove bus encryption from an aligned unit (AACS 2.0 / UHD).
 /// Bus encryption uses read_data_key, decrypting bytes 16..2048 of each 2048-byte sector.
 pub(crate) fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
@@ -615,29 +650,9 @@ mod tests {
     /// header) XOR header`, then CBC-encrypt bytes 16..6144 under the
     /// fixed AACS IV.
     fn aacs_encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
-        // Set the CPI bits (top 2 of byte 0) so the unit reads as encrypted under
-        // `aacs_unit_encrypted` — done BEFORE key derivation so the plaintext
-        // header the real decrypt recovers matches what we encrypt under.
-        unit[0] |= 0xC0;
-        let header: [u8; 16] = unit[..16].try_into().unwrap();
-        let derived = aes_ecb_encrypt(unit_key, &header);
-        let mut k = [0u8; 16];
-        for i in 0..16 {
-            k[i] = derived[i] ^ header[i];
-        }
-        let cipher = Aes128::new(GenericArray::from_slice(&k));
-        let mut prev = AACS_IV;
-        let num_blocks = (ALIGNED_UNIT_LEN - 16) / 16;
-        for i in 0..num_blocks {
-            let off = 16 + i * 16;
-            for j in 0..16 {
-                unit[off + j] ^= prev[j];
-            }
-            let mut block = GenericArray::clone_from_slice(&unit[off..off + 16]);
-            cipher.encrypt_block(&mut block);
-            unit[off..off + 16].copy_from_slice(&block);
-            prev.copy_from_slice(&unit[off..off + 16]);
-        }
+        // Delegate to the module-scope `pub(crate)` helper (the single encrypt
+        // implementation, shared with the mux `driver.rs` decrypt test).
+        super::aacs_encrypt_unit_for_test(unit, unit_key);
     }
 
     /// Build a clear aligned unit with TS sync bytes at offset 4 + k*192.
