@@ -182,6 +182,136 @@ mod tests {
         assert!(s.forced, "no content observed → vendor forced preserved");
     }
 
+    /// A reader that serves a fixed BD-TS byte stream once (across sequential
+    /// `read_sectors` calls), then EOF — so the probe's demux→parse→observe→apply
+    /// path runs on real synthetic PGS content.
+    struct TsReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+    impl SectorSource for TsReader {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            _count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.data.len().div_ceil(SECTOR_BYTES) as u32
+        }
+    }
+
+    // PGS PCS layout (matches the private constants in mux::codec::pgs): a
+    // display-set frame begins with a PCS (segment type 0x16); byte 13 is
+    // number_of_composition_objects; byte 17 is the first object's flags, whose
+    // 0x40 bit is forced_on_flag.
+    const PCS_SEG: u8 = 0x16;
+    const PCS_NUM_OBJECTS_OFF: usize = 13;
+    const PCS_FLAGS_OFF: usize = 17;
+    const PCS_FORCED_FLAG: u8 = 0x40;
+
+    /// One PGS display-set elementary payload with a single composition object;
+    /// `forced` sets forced_on_flag.
+    fn pcs_display(forced: bool) -> Vec<u8> {
+        let mut d = vec![0u8; 18];
+        d[0] = PCS_SEG;
+        d[PCS_NUM_OBJECTS_OFF] = 1;
+        d[PCS_FLAGS_OFF] = if forced { PCS_FORCED_FLAG } else { 0 };
+        d
+    }
+
+    /// Wrap an elementary payload in one 192-byte BD-TS PES packet (PUSI, PTS
+    /// present) on `pid`. `cc` is the 4-bit continuity counter.
+    fn bd_pes_packet(pid: u16, cc: u8, es: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 192];
+        // pkt[0..4] = TP_extra_header (zeros). TS packet starts at pkt[4].
+        pkt[4] = 0x47; // sync
+        pkt[5] = 0x40 | ((pid >> 8) & 0x1F) as u8; // PUSI + PID high 5 bits
+        pkt[6] = (pid & 0xFF) as u8; // PID low 8 bits
+        pkt[7] = 0x10 | (cc & 0x0F); // adaptation=payload-only + continuity counter
+        // PES header (at ts payload = pkt[8..]): 00 00 01 stream_id len flags.
+        let p = 8;
+        pkt[p] = 0x00;
+        pkt[p + 1] = 0x00;
+        pkt[p + 2] = 0x01;
+        pkt[p + 3] = 0xBD; // private_stream_1 (carries the standard PES extension)
+        pkt[p + 4] = 0x00; // PES packet length hi (0 = unbounded; ignored by demux)
+        pkt[p + 5] = 0x00; // PES packet length lo
+        pkt[p + 6] = 0x80; // flags1 ('10' marker)
+        pkt[p + 7] = 0x80; // flags2 → PTS present
+        pkt[p + 8] = 0x05; // PES_header_data_length = 5 (one PTS)
+        // 5-byte PTS with the mandatory marker bits (bytes 0,2,4 low bit = 1).
+        pkt[p + 9] = 0x21;
+        pkt[p + 10] = 0x00;
+        pkt[p + 11] = 0x01;
+        pkt[p + 12] = 0x00;
+        pkt[p + 13] = 0x01;
+        let es_off = p + 14; // ES data follows the 14-byte PES header
+        let n = es.len().min(192 - es_off);
+        pkt[es_off..es_off + n].copy_from_slice(&es[..n]);
+        pkt
+    }
+
+    /// Two BD-TS PES on `pid`: the FIRST carries `es` (the observed display set);
+    /// the second (a fresh PUSI) exists only to flush the first PES out of the
+    /// demuxer — the probe never calls `TsDemuxer::flush`, so an open PES stays
+    /// buffered until the next PES start arrives.
+    fn ts_stream(pid: u16, es: &[u8]) -> Vec<u8> {
+        let mut s = bd_pes_packet(pid, 0, es);
+        s.extend_from_slice(&bd_pes_packet(pid, 1, &pcs_display(false)));
+        s
+    }
+
+    #[test]
+    fn forced_display_sets_apply_forced_verdict() {
+        // Feed REAL synthetic PGS bytes through the full demux→parse→observe→apply
+        // path: a forced display set must flip a vendor-not-forced PGS track to
+        // forced. Mutation guard: inverting ForcedTracker::is_forced flips this.
+        let pid = 0x1200u16;
+        let mut reader = TsReader {
+            data: ts_stream(pid, &pcs_display(true)),
+            pos: 0,
+        };
+        let mut title = pgs_title(pid, false); // vendor label says NOT forced
+        probe_and_set_forced(&mut reader, &mut title);
+        let Stream::Subtitle(s) = &title.streams[0] else {
+            panic!()
+        };
+        assert!(
+            s.forced,
+            "an all-forced PGS track → forced verdict applied onto the stream"
+        );
+    }
+
+    #[test]
+    fn nonforced_display_sets_clear_forced_verdict() {
+        // A non-forced display set observed on the wire overrides a vendor-forced
+        // label → the track settles as not-forced.
+        let pid = 0x1200u16;
+        let mut reader = TsReader {
+            data: ts_stream(pid, &pcs_display(false)),
+            pos: 0,
+        };
+        let mut title = pgs_title(pid, true); // vendor label says forced
+        probe_and_set_forced(&mut reader, &mut title);
+        let Stream::Subtitle(s) = &title.streams[0] else {
+            panic!()
+        };
+        assert!(
+            !s.forced,
+            "a non-forced display set observed → forced verdict cleared"
+        );
+    }
+
     #[test]
     fn no_pgs_streams_is_noop() {
         // A title with no PGS subtitle streams is a no-op (the reader is never
