@@ -239,8 +239,12 @@ const DTS_SFREQ: [u32; 16] = [
     48_000, 8_000, 16_000, 32_000, 48_000, 48_000, 11_025, 22_050, 44_100, 48_000, 48_000, 12_000,
     24_000, 48_000, 96_000, 192_000,
 ];
-/// DTS core base channel count per `AMODE` (0..=9); higher AMODEs are rare on disc.
-const DTS_AMODE_CH: [u8; 10] = [1, 2, 2, 2, 2, 3, 3, 4, 4, 5];
+/// DTS core base channel count per `AMODE` (all 16 defined values). Matches the
+/// reference `ff_dca_channels[16]` table (ETSI TS 102 114) that the decodability
+/// gate in `dts.rs` (`DTS_AMODE_COUNT`) also uses, so a spec-legal DTS-ES / 6.1 /
+/// 7.1 core (AMODE 13→7, 14/15→8) is DECLARED with its true channel count in the
+/// mp4 AudioSampleEntry / `ddts` box rather than a truncated 6.
+const DTS_AMODE_CH: [u8; 16] = [1, 2, 2, 2, 2, 3, 3, 4, 4, 5, 6, 6, 6, 7, 8, 8];
 
 /// Decoded DTS core parameters needed for the `ddts` box.
 struct DtsConfig {
@@ -555,6 +559,37 @@ mod tests {
         assert!(c.has_extension, "EXSS sync at core end is a real extension");
         let e = dolby_sample_entry(Codec::DtsHdMa, &f).unwrap();
         assert_eq!(&e[4..8], b"dtsh");
+    }
+
+    #[test]
+    fn dts_high_amode_channel_counts_are_declared() {
+        // The 16-entry DTS_AMODE_CH must declare the true core channel count for the
+        // spec-legal high AMODEs that now pass the decodability gate: AMODE 13→7,
+        // 14→8, 15→8 (ETSI TS 102 114 / ff_dca_channels). The old 10-entry table
+        // fell through `unwrap_or(6)` → every one of these was declared as 6.
+        //
+        // Frame layout (mirrors dts_core_5_1_and_ddts): SFREQ=13 (48k), LFF=0 (no
+        // LFE) so `channels` is the bare base count. AMODE is split across
+        // f[7] low nibble (amode>>2) and f[8] top 2 bits (amode&3).
+        //   f[8] = (amode&3)<<6 | 13<<2 = ...  (keeps SFREQ=13)
+        let frame = |f7: u8, f8: u8| {
+            vec![
+                0x7F, 0xFE, 0x80, 0x01, 0x00, 0x05, 0xF2, f7, f8, 0x00, 0x00, 0x00,
+            ]
+        };
+        // AMODE 13 → base 7 channels.
+        let c = parse_dts(&frame(0xF3, 0x74)).expect("amode 13 parses");
+        assert_eq!(c.amode, 13);
+        assert!(!c.lfe);
+        assert_eq!(c.channels, 7, "AMODE 13 core is 7 channels, not 6");
+        // AMODE 14 → base 8 channels.
+        let c = parse_dts(&frame(0xF3, 0xB4)).expect("amode 14 parses");
+        assert_eq!(c.amode, 14);
+        assert_eq!(c.channels, 8, "AMODE 14 core is 8 channels, not 6");
+        // AMODE 15 → base 8 channels.
+        let c = parse_dts(&frame(0xF3, 0xF4)).expect("amode 15 parses");
+        assert_eq!(c.amode, 15);
+        assert_eq!(c.channels, 8, "AMODE 15 core is 8 channels, not 6");
     }
 
     #[test]

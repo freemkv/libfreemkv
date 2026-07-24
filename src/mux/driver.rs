@@ -111,10 +111,6 @@ pub enum MuxInput<'a> {
         format: crate::disc::ContentFormat,
         /// Decryption keys for the title (`DecryptKeys::None` for raw/clear).
         keys: DecryptKeys,
-        /// Optional pre-resolved AACS key map. Carried for forward-compat and
-        /// the live path; the file highway re-derives its own map from
-        /// `keys`/`key_fetch` inside [`build_iso_pipeline`].
-        key_map: Option<Arc<AacsKeyMap>>,
         /// Optional read-time key fetch closure (banked by `resolve_keys`).
         key_fetch: Option<KeyFetch>,
     },
@@ -280,7 +276,6 @@ pub fn mux_stream(
             title,
             format,
             keys,
-            key_map: _,
             key_fetch,
         } => {
             let reader = FileSectorSource::open(path)?;
@@ -1307,7 +1302,6 @@ mod tests {
                 title,
                 format: crate::disc::ContentFormat::BdTs,
                 keys: DecryptKeys::None,
-                key_map: None,
                 key_fetch: None,
             },
             "null://",
@@ -1620,7 +1614,7 @@ mod tests {
         let disc = aacs_session_disc(title, unit_key);
         // No caller key_fetch: a single-CPS disc resolves its base map with the
         // banked unit key alone (the FMTS/multi-CPS fetch path is not exercised).
-        let mut session = DiscSession::from_parts_for_test(disc, Some(reader), None);
+        let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader), None);
 
         let opts = MuxOptions {
             skip_errors: false, // a DecryptFailed must PROPAGATE, not zero-fill
@@ -1670,7 +1664,7 @@ mod tests {
         }];
         let disc = aacs_session_disc(title, unit_key);
         // reader: None — never staged.
-        let mut session = DiscSession::from_parts_for_test(disc, None, None);
+        let mut session = DiscSession::from_parts_for_test(Some(disc), None, None);
 
         let opts = MuxOptions {
             skip_errors: false,
