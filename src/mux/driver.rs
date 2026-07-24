@@ -108,17 +108,27 @@ pub struct MuxOptions {
 /// [`Arc<dyn MuxEvents>`] and clones it into the constructors' `'static`
 /// [`EventFn`] (via [`reader_event_fn`]) so the reader-side events fire from the
 /// highway's producer thread / the live `DiscStream`'s read loop. The driver
-/// fires [`Self::on_output_opened`] and the write-side [`Self::on_progress`]
+/// fires [`Self::on_output_opened`] and the write-side [`Self::on_write_progress`]
 /// from the driving thread; the reader-side events
 /// ([`Self::on_sector_skipped`] / [`Self::on_batch_size_changed`] /
-/// [`Self::on_read_error`], plus a read-side [`Self::on_progress`]) are fired
+/// [`Self::on_read_error`], plus [`Self::on_read_progress`]) are fired
 /// by that cloned `EventFn`.
+///
+/// Progress is split into two callbacks because consumers drive their progress
+/// UI from different sides of the pipeline: the CLI renders from the WRITE side
+/// (bytes finalised to the sink), autorip from the READ side (bytes pulled off
+/// the disc). Keeping them distinct avoids the old ambiguous single
+/// `on_progress(bytes, total)` where the caller couldn't tell which number it
+/// was handed.
 pub trait MuxEvents: Send + Sync + 'static {
     /// Fired once, immediately after the output sink is created.
     fn on_output_opened(&self, _title: &DiscTitle) {}
+    /// Fired periodically from the reader side with the running read-byte count
+    /// and the source extents' total byte estimate.
+    fn on_read_progress(&self, _bytes_read: u64, _bytes_total: u64) {}
     /// Fired periodically during the frame pump with the running written-byte
     /// count and the title's total byte estimate.
-    fn on_progress(&self, _bytes_written: u64, _bytes_total: u64) {}
+    fn on_write_progress(&self, _bytes_written: u64, _bytes_total: u64) {}
     /// A bad sector was skipped (zero-filled) at `lba`.
     fn on_sector_skipped(&self, _lba: u32) {}
     /// The adaptive read batch size changed.
@@ -216,7 +226,7 @@ pub fn mux_stream(
             // `take_reader` below.
             let (title, format, keys, playlist) = {
                 let disc = session.disc().ok_or_else(|| Error::DeviceNotReady {
-                    path: session.drive().device_path().to_string(),
+                    path: session.device_path().to_string(),
                 })?;
                 let title = disc
                     .titles
@@ -235,7 +245,7 @@ pub fn mux_stream(
             // A missing staged reader ("already consumed" / never staged) is a
             // clean error, not a panic (contract Q2).
             let reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
-                path: session.drive().device_path().to_string(),
+                path: session.device_path().to_string(),
             })?;
             let mut stream = crate::mux::DiscStream::new(
                 reader,
@@ -276,8 +286,8 @@ pub fn mux_stream(
 /// borrow cannot satisfy the `'static` bound.
 ///
 /// Mapping (real [`EventKind`] variants):
-/// - `BytesRead { bytes, total }`   → [`MuxEvents::on_progress`] (read-side; the
-///   file highway's only reader event — `total` is the extents' byte total)
+/// - `BytesRead { bytes, total }`   → [`MuxEvents::on_read_progress`] (read-side;
+///   the file highway's only reader event — `total` is the extents' byte total)
 /// - `SectorSkipped { sector }`     → [`MuxEvents::on_sector_skipped`] (live only)
 /// - `BatchSizeChanged { new_size, reason }` → [`MuxEvents::on_batch_size_changed`]
 ///   (live only)
@@ -287,7 +297,7 @@ pub fn mux_stream(
 /// (the disc's LBA space), so they are narrowed with `as u32`.
 fn reader_event_fn(events: Arc<dyn MuxEvents>) -> crate::sector::prefetched::EventFn {
     Box::new(move |e: Event| match e.kind {
-        EventKind::BytesRead { bytes, total } => events.on_progress(bytes, total),
+        EventKind::BytesRead { bytes, total } => events.on_read_progress(bytes, total),
         EventKind::SectorSkipped { sector } => events.on_sector_skipped(sector as u32),
         EventKind::BatchSizeChanged { new_size, reason } => {
             events.on_batch_size_changed(new_size, reason)
@@ -387,7 +397,7 @@ fn drive_mux(
 
     // The write consumer runs on its own thread so the latency-bound sink write
     // overlaps the next `stream.read()`. `bytes` mirrors the consumer's running
-    // written-byte count out to the driving thread for `on_progress`.
+    // written-byte count out to the driving thread for `on_write_progress`.
     let bytes = Arc::new(AtomicU64::new(0));
     let sink = WriteSink {
         output: output_stream,
@@ -421,7 +431,7 @@ fn drive_mux(
                         interrupted = true;
                         break;
                     }
-                    events.on_progress(bytes.load(Ordering::Relaxed), total_bytes);
+                    events.on_write_progress(bytes.load(Ordering::Relaxed), total_bytes);
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -717,10 +727,11 @@ mod tests {
     struct CountingEvents {
         opened: AtomicBool,
         progress_calls: AtomicU64,
-        /// Set once `on_progress` is called with a `total` equal to the ISO
+        /// Set once `on_read_progress` is called with a `total` equal to the ISO
         /// extents' byte total — the fingerprint of the *read-side* `BytesRead`
-        /// event (the write-side `on_progress` carries the title's `size_bytes`,
-        /// a different number), so it isolates the `EventFn` translation.
+        /// event (the write-side `on_write_progress` carries the title's
+        /// `size_bytes`, a different number), so it isolates the `EventFn`
+        /// translation.
         saw_read_total: AtomicBool,
         read_total: u64,
         skipped: AtomicU64,
@@ -744,7 +755,7 @@ mod tests {
         fn on_output_opened(&self, _title: &DiscTitle) {
             self.opened.store(true, Ordering::SeqCst);
         }
-        fn on_progress(&self, _bytes_written: u64, bytes_total: u64) {
+        fn on_read_progress(&self, _bytes_read: u64, bytes_total: u64) {
             self.progress_calls.fetch_add(1, Ordering::SeqCst);
             if bytes_total == self.read_total {
                 self.saw_read_total.store(true, Ordering::SeqCst);
@@ -793,7 +804,7 @@ mod tests {
         assert_eq!(
             events.progress_calls.load(Ordering::SeqCst),
             1,
-            "BytesRead → on_progress"
+            "BytesRead → on_read_progress"
         );
         assert!(
             events.saw_read_total.load(Ordering::SeqCst),
@@ -866,8 +877,8 @@ mod tests {
     ///
     /// Mutation: passing `None` (instead of `Some(reader_event_fn(...))`) to
     /// `build_iso_pipeline` in the ISO arm leaves `saw_read_total` false — the
-    /// write-side `on_progress` carries `size_bytes` (0 here), never the 6144
-    /// extents total — and this test fails.
+    /// write-side `on_write_progress` carries `size_bytes` (0 here), never the
+    /// 6144 extents total — and this test fails.
     #[test]
     fn mux_stream_iso_forwards_reader_progress_through_arc() {
         let es = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
@@ -919,7 +930,7 @@ mod tests {
         );
         assert!(
             events.progress_calls.load(Ordering::SeqCst) > 0,
-            "at least one on_progress call observed"
+            "at least one on_read_progress call observed"
         );
     }
 }
