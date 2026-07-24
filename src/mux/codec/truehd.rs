@@ -835,6 +835,103 @@ mod tests {
         // `corrupt_major_sync_drops_forward_to_next_valid`).
     }
 
+    /// Independent bitwise CRC-16 (poly 0x002D, init 0, MSB-first) — a SEPARATE
+    /// oracle from `crc16_mlp`, so a fixture built with it is not tautological
+    /// with the validator under test. Anchored to the catalogue check value
+    /// (0x4FF7 for "123456789") so the oracle itself is proven correct without
+    /// reference to the code under test.
+    fn ref_crc16_2d(data: &[u8]) -> u16 {
+        let mut crc: u16 = 0;
+        for &b in data {
+            crc ^= (b as u16) << 8;
+            for _ in 0..8 {
+                crc = if crc & 0x8000 != 0 {
+                    (crc << 1) ^ 0x002D
+                } else {
+                    crc << 1
+                };
+            }
+        }
+        crc
+    }
+
+    #[test]
+    fn extended_major_sync_crc_validates_and_rejects() {
+        // COVERAGE GAP (the endianness bug that once "silently dropped the whole
+        // track" on real 7.1/Atmos): the EXTENDED major-sync header path
+        // (ms[25]&1 set, mshdr = 28 + 2 + 2*n) had ZERO test coverage — every
+        // other fixture builds only the basic 28-byte header. Build an extended
+        // header whose trailer is an INDEPENDENTLY-computed oracle (ref_crc16_2d,
+        // NOT crc16_mlp) stored LITTLE-ENDIAN, and assert the validator accepts
+        // it, rejects a body corruption, and rejects the same trailer stored
+        // big-endian (which is exactly the endianness-mix regression).
+        assert_eq!(
+            ref_crc16_2d(b"123456789"),
+            0x4FF7,
+            "oracle anchored to catalogue"
+        );
+
+        // n = 3 extension words → mshdr = 28 + 2 + 2*3 = 36.
+        let n = 3usize;
+        let mshdr = 28 + 2 + 2 * n;
+        assert_eq!(mshdr, 36);
+        let mut ms = vec![0u8; 40]; // slack past the 36-byte header
+        // Non-trivial, varied body so the CRC is a meaningful function of it.
+        for (i, b) in ms.iter_mut().enumerate().take(mshdr - 4) {
+            *b = (0x37u8).wrapping_add((i as u8).wrapping_mul(0x53));
+        }
+        ms[25] |= 1; // extension flag → selects the extended header size
+        ms[26] = (ms[26] & 0x0F) | ((n as u8) << 4); // extension word count in high nibble
+
+        // The 2-byte "penultimate" word (between the CRC-covered body and the
+        // trailer). Chosen non-zero and non-palindromic so the LE/BE distinction
+        // is observable.
+        ms[mshdr - 4] = 0x12;
+        ms[mshdr - 3] = 0x34;
+
+        // Oracle: checksum16 = crc16_2D(body).swap_bytes() ^ le16(penultimate),
+        // computed with the INDEPENDENT ref CRC, then stored LITTLE-ENDIAN.
+        let le_word = u16::from_le_bytes([ms[mshdr - 4], ms[mshdr - 3]]);
+        let trailer = ref_crc16_2d(&ms[..mshdr - 4]).swap_bytes() ^ le_word;
+        ms[mshdr - 2] = (trailer & 0xFF) as u8;
+        ms[mshdr - 1] = (trailer >> 8) as u8;
+        assert_ne!(
+            ms[mshdr - 2],
+            ms[mshdr - 1],
+            "trailer bytes must differ so the LE/BE swap below is a real distinction"
+        );
+
+        // The extended header size is computed from ms[25]/ms[26].
+        assert_eq!(
+            mlp_major_sync_header_size(&ms),
+            Some(mshdr),
+            "extended header size = 28 + 2 + 2*n"
+        );
+        // The validator accepts the independently-built extended major sync.
+        assert!(
+            mlp_major_sync_crc_ok(&ms, mshdr),
+            "valid extended major-sync checksum must validate"
+        );
+
+        // A single corrupted body byte must be rejected.
+        let mut corrupt = ms.clone();
+        corrupt[10] ^= 0xFF;
+        assert!(
+            !mlp_major_sync_crc_ok(&corrupt, mshdr),
+            "a corrupted extended major sync must be rejected"
+        );
+
+        // The endianness regression: the SAME checksum stored big-endian must be
+        // rejected. A validator that reads the trailer big-endian (the shipped
+        // bug) would instead accept this and reject the correct LE form above.
+        let mut swapped = ms.clone();
+        swapped.swap(mshdr - 2, mshdr - 1);
+        assert!(
+            !mlp_major_sync_crc_ok(&swapped, mshdr),
+            "a big-endian-stored trailer must be rejected (little-endian is load-bearing)"
+        );
+    }
+
     #[test]
     fn parity_failure_is_dropped() {
         // A normal AU whose header parity is broken (after a major sync sets
