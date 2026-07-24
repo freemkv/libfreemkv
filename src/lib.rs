@@ -125,6 +125,7 @@ pub(crate) mod platform;
 pub mod progress;
 pub mod scsi;
 pub mod sector;
+pub mod session;
 pub(crate) mod speed;
 pub(crate) mod udf;
 pub(crate) mod unlock_bridge;
@@ -138,6 +139,14 @@ pub use drive::capture::{
     CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string,
 };
 pub use drive::{Drive, DriveStatus, find_drive};
+
+// ─── Disc session (drive open + SCSI bring-up hoist) ─────────────────────────
+//
+// One entry point that opens a drive and brings the transport up, so consumers
+// stop hand-rolling `open → wait_ready → init → probe_disc → identify → scan`.
+// Owns the `Drive` by value; forwards consumer-built key material into
+// `ScanOptions` (the library derives no certs — see `KeySpec`).
+pub use session::{DeviceTarget, DiscSession, KeySpec};
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
 //
