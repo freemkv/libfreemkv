@@ -35,7 +35,7 @@ use crate::event::{BatchSizeReason, Event, EventKind};
 use crate::halt::Halt;
 use crate::io::pipeline::{Flow, Pipeline, Sink, WRITE_PIPELINE_DEPTH};
 use crate::pes::{CountingStream, PesFrame, Stream};
-use crate::sector::{FileSectorSource, KeyFetch};
+use crate::sector::{FileSectorSource, KeyFetch, SectorSource};
 use crate::session::DiscSession;
 
 use super::resolve::{InputOptions, StreamUrl, build_iso_pipeline, input, output, parse_url};
@@ -78,6 +78,34 @@ pub enum MuxInput<'a> {
         key_map: Option<Arc<AacsKeyMap>>,
         /// Optional read-time key fetch closure (banked by `resolve_keys`).
         key_fetch: Option<KeyFetch>,
+    },
+    /// Live single-pass mux off a raw disc [`SectorSource`] (autorip's
+    /// live-drive path). The driver wraps the reader in a
+    /// [`DiscStream`](crate::mux::DiscStream) — the **INLINE** stream, NOT the
+    /// prefetch highway — so the consumer's adaptive batch-retry in
+    /// `DiscStream::fill_extents` still fires on a bad sector (the highway would
+    /// bypass it). The live analogue of [`MuxInput::Iso`]: the consumer resolves
+    /// keys as its own app-layer policy and hands the already-banked material in;
+    /// the driver does no internal re-resolution.
+    Live {
+        /// The raw sector source (physical drive). Boxed `dyn` — the driver owns
+        /// it and moves it into `DiscStream::new` (whose reader param is exactly
+        /// `Box<dyn SectorSource>`), so no concrete drive type leaks in here.
+        reader: Box<dyn SectorSource>,
+        /// The scanned title to mux.
+        title: DiscTitle,
+        /// Container format (TS vs PS demux selection).
+        format: crate::disc::ContentFormat,
+        /// Decryption keys the consumer already banked (`DecryptKeys::None` for
+        /// raw/clear). The driver consumes them as-is — never re-resolves.
+        keys: DecryptKeys,
+        /// Optional pre-resolved forensic AACS key map, applied VERBATIM via
+        /// [`DiscStream::with_key_map`](crate::mux::DiscStream::with_key_map)
+        /// BEFORE any read. `None` for every non-FMTS disc. Single-pass FMTS
+        /// correctness depends on this reaching the inline reader: `with_key_map`
+        /// rewrites the extent walk to our-phase units only and installs the map
+        /// so each unit decrypts with its mapped key.
+        key_map: Option<Arc<AacsKeyMap>>,
     },
     /// Any URL-addressed source (`iso://`, `mkv://`, `m2ts://`, `network://`,
     /// stdio) opened via [`input`].
@@ -265,6 +293,44 @@ pub fn mux_stream(
             // adaptive sizer, `BytesRead` progress) — forward them all.
             stream.on_event(reader_event_fn(events.clone()));
             (Box::new(stream), Some(playlist))
+        }
+        MuxInput::Live {
+            reader,
+            title,
+            format,
+            keys,
+            key_map,
+        } => {
+            // INLINE `DiscStream` — the same constructor the `Session` arm uses,
+            // NOT `build_iso_pipeline` (the prefetch highway). The consumer's
+            // adaptive batch-retry lives in `DiscStream::fill_extents`, which the
+            // highway would bypass; the live single-pass path must keep it.
+            let mut stream = crate::mux::DiscStream::new(
+                reader,
+                title,
+                keys,
+                opts.batch_sectors,
+                format,
+                opts.raw,
+                Some(halt.clone()),
+            )?;
+            if opts.raw {
+                stream.set_raw();
+            }
+            // Apply the forensic FMTS key map BEFORE reads begin — rewrites the
+            // extent walk to our-phase units only and installs the map so each
+            // unit decrypts with its mapped key. `None` leaves the walk unchanged
+            // (identical to a plain single/multi-CPS disc). Single-pass FMTS
+            // correctness depends on this: dropping it reads the alternate
+            // device-group units and mis-decrypts the forensic segment.
+            if let Some(map) = key_map {
+                stream = stream.with_key_map(map);
+            }
+            stream.skip_errors = opts.skip_errors;
+            // Same reader-side event vocabulary as the `Session` arm
+            // (`SectorSkipped` / `BatchSizeChanged` / `BytesRead`).
+            stream.on_event(reader_event_fn(events.clone()));
+            (Box::new(stream), None)
         }
     };
 
@@ -931,6 +997,116 @@ mod tests {
         assert!(
             events.progress_calls.load(Ordering::SeqCst) > 0,
             "at least one on_read_progress call observed"
+        );
+    }
+
+    /// Recording `SectorSource` for the live-path tests: logs every read's
+    /// `(lba, count)` and returns zeroed sectors (never flagged scrambled, so a
+    /// synthetic key map's decrypt is a pass-through — no real crypto). The
+    /// recorded LBAs are the observable proof of WHICH extent walk the inline
+    /// `DiscStream` executed.
+    struct RecordingReader {
+        capacity: u32,
+        log: std::sync::Arc<std::sync::Mutex<Vec<(u32, u16)>>>,
+    }
+    impl crate::sector::SectorSource for RecordingReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.log.lock().unwrap().push((lba, count));
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(0);
+            Ok(bytes)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    /// `MuxInput::Live` builds the INLINE `DiscStream` (not the highway) AND
+    /// applies the forensic `key_map` before reading. Proof is the recorded LBA
+    /// set: `with_key_map` rewrites the extent walk via `AacsKeyMap::read_plan`
+    /// so the alternate-phase (odd) forensic units are NEVER fetched off the
+    /// source. The zeroed reader can't resolve codec headers, so the mux drains
+    /// to a `NoStreams`/`MkvInvalid` refusal — irrelevant here; the test asserts
+    /// only the read plan the reader actually executed.
+    ///
+    /// Mutation: deleting the `stream = stream.with_key_map(map)` line in the
+    /// `Live` arm leaves the extents un-rewritten, so the reader DOES fetch the
+    /// dropped odd-phase LBAs and the "never read" assertion below fails. (A
+    /// second mutation — routing `Live` through `build_iso_pipeline` instead of
+    /// `DiscStream::new` — would not compile against a `Box<dyn SectorSource>`
+    /// and drop the inline `fill_extents` retry entirely.)
+    #[test]
+    fn mux_input_live_uses_inline_discstream_and_applies_key_map() {
+        use crate::decrypt::{AacsKeyMap, Phase};
+        use crate::disc::Extent;
+
+        // 3 sectors == one AACS aligned unit. A 10-unit Even forensic segment at
+        // LBA [1030, 1060): kept even units start at 1030,1036,1042,1048,1054;
+        // the odd units 1033,1039,1045,1051,1057 must never be read.
+        let us = 3u32;
+        let map = std::sync::Arc::new(AacsKeyMap::from_ranges_phased(vec![(
+            1030,
+            1060,
+            5,
+            Phase::Even,
+        )]));
+
+        let mut title = aac_audio_title(0x1100);
+        title.extents = vec![Extent {
+            start_lba: 1000,
+            sector_count: 300,
+        }];
+
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u32, u16)>::new()));
+        let reader = Box::new(RecordingReader {
+            capacity: 4000,
+            log: log.clone(),
+        });
+
+        let opts = MuxOptions {
+            skip_errors: false,
+            // One unit per read so the recorded LBAs land on unit boundaries and
+            // an odd-phase unit can't hide inside a larger coalesced batch.
+            batch_sectors: us as u16,
+            raw: false,
+        };
+        let halt = Halt::new();
+        // Drains to a NoStreams refusal (zeroed data resolves no headers); we
+        // only care about the reads it performed on the way there.
+        let _ = mux_stream(
+            MuxInput::Live {
+                reader,
+                title,
+                format: crate::disc::ContentFormat::BdTs,
+                keys: DecryptKeys::None,
+                key_map: Some(map),
+            },
+            "null://",
+            &opts,
+            &halt,
+            Arc::new(NoopEvents),
+        );
+
+        let reads = log.lock().unwrap();
+        let read_lbas: std::collections::HashSet<u32> = reads.iter().map(|&(lba, _)| lba).collect();
+        // The dropped odd-phase forensic units must never be fetched.
+        for odd in [1033u32, 1039, 1045, 1051, 1057] {
+            assert!(
+                !read_lbas.contains(&odd),
+                "alternate-phase forensic unit LBA {odd} was read — key_map not applied \
+                 (with_key_map dropped from the Live arm?)"
+            );
+        }
+        // Sanity: our-phase units on either side ARE read (the walk still ran).
+        assert!(
+            read_lbas.contains(&1030) && read_lbas.contains(&1054),
+            "our-phase forensic units must still be read (kept LBAs 1030/1054)"
         );
     }
 }
