@@ -152,11 +152,19 @@ pub struct KeySpec {
 /// `DiscStream`) reach it via [`Self::drive_mut`] / [`Self::into_drive`]; the
 /// scanned [`Disc`] comes out via [`Self::disc`] / [`Self::take_disc`].
 pub struct DiscSession {
-    drive: Drive,
+    /// The opened drive. `Some` from [`Self::open`] until
+    /// [`Self::stage_drive_as_reader`] (live-drive mux) or [`Self::into_drive`]
+    /// moves it out. The cached [`Self::device_path`] survives that move so the
+    /// mux driver can still name the device in an error without the drive.
+    drive: Option<Drive>,
+    /// The drive's device path, cached at [`Self::open`] so it outlives a
+    /// [`Self::stage_drive_as_reader`] that moves the drive into `reader`.
+    device: String,
     spec: KeySpec,
     disc: Option<Disc>,
-    /// Sector source for a later file/live mux to `.take()` (steps 3–4).
-    /// Unpopulated in the current step; shapes the struct for the mux hoist.
+    /// Sector source for a later file/live mux to `.take()` (steps 3–4). The
+    /// file path stages a `FileSectorSource`; the live-drive path stages the
+    /// drive itself via [`Self::stage_drive_as_reader`].
     reader: Option<Box<dyn SectorSource>>,
     /// The read-time AACS fetch closure, built by [`Self::resolve_keys`] and
     /// retained so a later mux (step 4) can install it into the decrypt
@@ -214,8 +222,10 @@ impl DiscSession {
             tracing::warn!(target: "freemkv::session", error = %e, "probe_disc advisory failed (continuing)");
         }
 
+        let device = drive.device_path().to_string();
         Ok(DiscSession {
-            drive,
+            drive: Some(drive),
+            device,
             spec,
             disc: None,
             reader: None,
@@ -226,7 +236,7 @@ impl DiscSession {
     /// Fast disc identification — name/format only, no playlist parse. Wraps
     /// [`Disc::identify`].
     pub fn identify(&mut self) -> Result<DiscId> {
-        Disc::identify(&mut self.drive)
+        Disc::identify(self.drive_mut())
     }
 
     /// Full structure scan. Forwards the session's [`KeySpec`] credentials /
@@ -234,7 +244,7 @@ impl DiscSession {
     /// set), runs [`Disc::scan`], stores the result, and returns a borrow.
     pub fn scan(&mut self, opts: ScanOptions) -> Result<&Disc> {
         let opts = forward_key_material(&mut self.spec, opts);
-        let disc = Disc::scan(&mut self.drive, &opts)?;
+        let disc = Disc::scan(self.drive.as_mut().expect("drive present for scan"), &opts)?;
         self.disc = Some(disc);
         Ok(self.disc.as_ref().expect("disc just stored"))
     }
@@ -252,7 +262,7 @@ impl DiscSession {
         // The disc must have been scanned so its AACS inputs are captured.
         if self.disc.is_none() {
             return Err(Error::DeviceNotReady {
-                path: self.drive.device_path().to_string(),
+                path: self.device.clone(),
             });
         }
         // Sample through the staged reader when present (file-backed), else the
@@ -263,7 +273,11 @@ impl DiscSession {
             resolve_keys_for(reader.as_mut(), disc, sources)
         } else {
             let disc = self.disc.as_mut().expect("disc present (checked above)");
-            resolve_keys_for(&mut self.drive, disc, sources)
+            resolve_keys_for(
+                self.drive.as_mut().expect("drive present for key sampling"),
+                disc,
+                sources,
+            )
         };
         self.key_fetch = resolved.key_fetch;
         Ok(resolved.trace)
@@ -293,27 +307,51 @@ impl DiscSession {
         self.disc.take()
     }
 
-    /// Shared access to the opened drive (identity, profile, path).
+    /// Shared access to the opened drive (identity, profile, path). Panics if the
+    /// drive has already been staged into the reader slot
+    /// ([`Self::stage_drive_as_reader`]) or moved out via [`Self::into_drive`] —
+    /// use [`Self::device_path`] for a name that survives those moves.
     pub fn drive(&self) -> &Drive {
-        &self.drive
+        self.drive.as_ref().expect("drive present")
+    }
+
+    /// The opened drive's device path. Cached at [`Self::open`], so it remains
+    /// available after [`Self::stage_drive_as_reader`] moves the drive into the
+    /// reader slot (the mux driver names the device here without the drive).
+    pub fn device_path(&self) -> &str {
+        &self.device
     }
 
     /// Mutable access to the opened drive — for ciphertext sampling and other
     /// direct reads consumers still perform.
     pub fn drive_mut(&mut self) -> &mut Drive {
-        &mut self.drive
+        self.drive.as_mut().expect("drive present")
     }
 
     /// Lock the tray so the disc cannot eject mid-rip. Unlock is guaranteed by
-    /// `Drive::drop`.
+    /// `Drive::drop`. A no-op if the drive is no longer held by the session.
     pub fn lock_tray(&mut self) {
-        self.drive.lock_tray();
+        if let Some(drive) = self.drive.as_mut() {
+            drive.lock_tray();
+        }
     }
 
     /// Consume the session, returning the owned drive (e.g. to move into a
     /// `DiscStream` for a live-drive mux).
     pub fn into_drive(self) -> Drive {
-        self.drive
+        self.drive.expect("drive present")
+    }
+
+    /// Stage the owned drive as the session's boxed sector source so a live
+    /// single-pass mux can drive it through
+    /// [`MuxInput::Session`](crate::mux::MuxInput::Session). Moves the `Drive`
+    /// (itself a [`SectorSource`]) into the `reader` slot; the cached
+    /// [`Self::device_path`] keeps the device name available afterward. A no-op
+    /// if the drive was already staged or moved out.
+    pub fn stage_drive_as_reader(&mut self) {
+        if let Some(drive) = self.drive.take() {
+            self.reader = Some(Box::new(drive));
+        }
     }
 
     /// Consume the session, returning the sector source staged for a later mux
