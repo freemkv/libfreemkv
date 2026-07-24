@@ -201,9 +201,13 @@ pub enum Phase {
 /// concern, exactly as for a physically-read clear disc.
 ///
 /// Ranges are `[start_lba, end_lba)` → index into the `Aacs { unit_keys }` pool,
-/// sorted and disjoint. `default_idx` covers any LBA no range claims — the
-/// single-CPS case is just an empty range list with `default_idx = 0`, so the
-/// common disc pays zero lookup cost and needs no structural walk.
+/// sorted and disjoint. The map is a POSITIVE list: an LBA in no range is passed
+/// through untouched (no default key). How a single-CPS disc is mapped depends on
+/// the caller: the whole-disc EXTRACT path uses one blanket range `(0, u32::MAX,
+/// 0)` so every encrypted unit — parsed title or orphan clip — resolves to key 0;
+/// the per-title MUX/sweep path (`resolve_mux_key_map` → `content_map`) maps only
+/// the title's own extents, so an orphan clip outside them is left as pass-through.
+/// Either way, clear nav/filesystem sectors (encrypted-flag off) pass through.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AacsKeyMap {
     // (start_lba, end_lba, key_idx, phase). An LBA in NO range is passed through
@@ -514,17 +518,13 @@ pub fn decrypt_sectors(
     decrypt_sectors_impl(buf, keys, unit_key_idx, None)
 }
 
-/// Like [`decrypt_sectors`], but ONLY decrypts/verifies units whose absolute LBA
-/// falls inside `content_ranges` — the disc's AACS-encrypted content (the m2ts
-/// stream extents). Units OUTSIDE content (UDF filesystem / nav) are left
-/// untouched and never counted as decrypt loss: they are clear by definition, so
-/// the content-clarity check [`is_clean`](crate::aacs::content::is_clean) must not
-/// be consulted about them (a filesystem unit has no TS sync, so it would
-/// otherwise be mistaken for ciphertext). `base_lba` is
-/// the absolute LBA of `buf`'s first sector; aligned units are 3 sectors.
-///
-/// `content_ranges` is sorted, merged, disjoint `(start_lba, sector_count)`
-/// tuples (each covering `[start_lba, start_lba + sector_count)`).
+/// Legacy alias of [`decrypt_sectors`]. Under the keymap-only model AACS decrypts
+/// EXCLUSIVELY through the resolved key map (`decrypt_sectors_mapped`), so there is
+/// no per-unit content-extent gate here any more: the AACS arm fails loud and the
+/// CSS / `None` arm self-gates on its per-sector scramble flag. `base_lba` and
+/// `content_ranges` are therefore inert — retained only so the wrapper signature
+/// stays stable for the `DecryptingSectorSource` dispatch. Prefer
+/// [`decrypt_sectors`] in new code.
 pub fn decrypt_sectors_in_content(
     buf: &mut [u8],
     keys: &mut DecryptKeys,
@@ -607,7 +607,7 @@ mod tests {
         v
     }
 
-    // ── Content-extent gate (`decrypt_sectors_in_content` / `lba_in_ranges`) ──
+    // ── `decrypt_sectors_in_content` (now a legacy alias of `decrypt_sectors`) ──
 
     /// `DecryptKeys::None` is a no-op even with a content map + scrambled bytes.
     #[test]
