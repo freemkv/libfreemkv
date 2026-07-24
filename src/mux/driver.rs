@@ -40,11 +40,37 @@ use crate::session::DiscSession;
 
 use super::resolve::{InputOptions, StreamUrl, build_iso_pipeline, input, output, parse_url};
 
-/// Per-frame send deadline for the write pipeline. Longer than a soft stall
-/// warning, shorter than the pipeline's own join backstop, so a wedged sink
-/// surfaces here as a per-frame timeout rather than blocking the whole mux.
-/// Mirrors autorip's `MUX_SEND_DEADLINE_SECS`.
-const MUX_SEND_DEADLINE_SECS: u64 = 60;
+/// Effectively-unbounded per-frame send deadline used when a consumer passes
+/// `MuxOptions.send_deadline == None` (the CLI's interactive stdout / network
+/// path). A slow-but-alive downstream — a paused pager, a backpressured pipe,
+/// a slow network sink — must NOT be reported as an interrupted mux, which is
+/// exactly what a finite per-frame deadline would do after that much
+/// backpressure. `None` therefore means "block on backpressure, don't time
+/// out", while still honouring the halt token for Ctrl-C / `/api/stop`.
+///
+/// This is safe because [`Pipeline::send_with_halt`] slices its wait at
+/// [`crate::halt::POLL_INTERVAL`] (250 ms) internally and re-checks the halt
+/// token on EVERY slice — halt responsiveness is independent of the deadline
+/// value. So a huge (but finite, `Instant`-overflow-safe) duration blocks
+/// indefinitely on a live-but-slow sink yet still unwinds within ~250 ms of a
+/// halt. ~10 years is far past any real mux; a literal `Duration::MAX` risks
+/// panicking the `Instant::now() + deadline` addition inside `send_with_halt`.
+const NO_SEND_DEADLINE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
+/// Resolve [`MuxOptions::send_deadline`] into the concrete per-frame deadline
+/// handed to [`Pipeline::send_with_halt`] — the tightest seam of the
+/// send-path decision.
+///
+/// - `Some(d)` → a hard `d` per-frame timeout. autorip's file mux wants this:
+///   its container-restart watchdog model treats a genuinely wedged sink as a
+///   bounded per-frame timeout rather than an unbounded block.
+/// - `None` → [`NO_SEND_DEADLINE`] (no backpressure timeout). The CLI's
+///   interactive stdout / network sinks must block on a slow-but-alive
+///   downstream, exactly as the pre-refactor inline `output.write()` did, and
+///   surface only a real halt as an interrupt.
+fn effective_send_deadline(send_deadline: Option<Duration>) -> Duration {
+    send_deadline.unwrap_or(NO_SEND_DEADLINE)
+}
 
 /// Ceiling on bytes buffered while waiting for `headers_ready()` to resolve.
 /// Normally that resolves after a handful of frames; a damaged/undecryptable
@@ -137,6 +163,19 @@ pub struct MuxOptions {
     pub batch_sectors: u16,
     /// Ciphertext passthrough — skip decryption / CSS self-crack.
     pub raw: bool,
+    /// Per-frame write-pipeline send deadline.
+    ///
+    /// - `Some(d)` — a hard `d` timeout: a sink that back-pressures a single
+    ///   frame past `d` is treated as wedged and the mux returns
+    ///   `completed = false`. autorip passes `Some(Duration::from_secs(60))`
+    ///   so its hard watchdog / container-restart model bounds a stuck sink.
+    /// - `None` — NO backpressure timeout: the send blocks as long as the
+    ///   downstream is alive (only a `halt` interrupts it). The CLI's
+    ///   interactive stdout / network sinks pass `None` so a slow-but-alive
+    ///   consumer (paused pager, backpressured pipe, slow peer) is never
+    ///   spuriously reported as an interrupted/incomplete mux — matching the
+    ///   pre-refactor inline `output.write()` which had no deadline.
+    pub send_deadline: Option<Duration>,
 }
 
 /// Progress / event callbacks the consumer implements (CLI `CliProgress`,
@@ -353,6 +392,7 @@ pub fn mux_stream(
         halt,
         events.as_ref(),
         playlist_name.as_deref(),
+        effective_send_deadline(opts.send_deadline),
     )
 }
 
@@ -414,6 +454,7 @@ fn drive_mux(
     halt: &Halt,
     events: &dyn MuxEvents,
     playlist_name: Option<&str>,
+    send_deadline: Duration,
 ) -> std::io::Result<MuxOutcome> {
     // Title assembled from the scanned metadata; the playlist name (disc name)
     // overrides `info().playlist` where the consumer supplied one.
@@ -518,7 +559,12 @@ fn drive_mux(
         .map_err(std::io::Error::from)?;
 
     // ── Frame pump ──
-    let deadline = Duration::from_secs(MUX_SEND_DEADLINE_SECS);
+    // Per-frame send deadline resolved from `MuxOptions.send_deadline` at the
+    // driver entry: a hard bound (autorip) or the effectively-unbounded
+    // [`NO_SEND_DEADLINE`] (CLI interactive path). Either way `send_with_halt`
+    // re-checks the halt token every `POLL_INTERVAL`, so Ctrl-C / `/api/stop`
+    // stays responsive regardless of this value.
+    let deadline = send_deadline;
     let mut interrupted = false;
 
     // Buffered header frames first, in order.
@@ -770,7 +816,8 @@ mod tests {
         let (_dir, url) = tmp("out.xml");
         let halt = Halt::new();
         let spy = SpyEvents::new();
-        let out = drive_mux(stream, &url, &halt, &spy, None).expect("chapters must short-circuit");
+        let out = drive_mux(stream, &url, &halt, &spy, None, Duration::from_secs(60))
+            .expect("chapters must short-circuit");
         assert!(out.completed, "metadata sink completes without headers");
         assert!(out.output_opened);
         assert!(spy.opened.load(Ordering::SeqCst), "sink was opened");
@@ -783,8 +830,15 @@ mod tests {
         let url = format!("json://{}", dir.path().join("out.json").display());
         let stream = Box::new(FakeStream::new(1).never_ready());
         let halt = Halt::new();
-        let out =
-            drive_mux(stream, &url, &halt, &NoopEvents, None).expect("json must short-circuit");
+        let out = drive_mux(
+            stream,
+            &url,
+            &halt,
+            &NoopEvents,
+            None,
+            Duration::from_secs(60),
+        )
+        .expect("json must short-circuit");
         assert!(out.completed);
         assert!(out.output_opened);
     }
@@ -795,8 +849,15 @@ mod tests {
     fn header_gate_rejects_unresolved_codec_private() {
         let stream = Box::new(FakeStream::new(1).with_frames(3).never_ready());
         let halt = Halt::new();
-        let err = drive_mux(stream, "null://", &halt, &NoopEvents, None)
-            .expect_err("unresolved headers must be refused");
+        let err = drive_mux(
+            stream,
+            "null://",
+            &halt,
+            &NoopEvents,
+            None,
+            Duration::from_secs(60),
+        )
+        .expect_err("unresolved headers must be refused");
         assert!(
             crate::error::is_skippable_title_stub(&err),
             "MkvInvalid is a skippable stub, got {err}"
@@ -810,8 +871,15 @@ mod tests {
     fn zero_output_gate_refuses_empty_drain() {
         let stream = Box::new(FakeStream::new(1)); // headers ready, no frames
         let halt = Halt::new();
-        let err = drive_mux(stream, "null://", &halt, &NoopEvents, None)
-            .expect_err("empty drain must be refused");
+        let err = drive_mux(
+            stream,
+            "null://",
+            &halt,
+            &NoopEvents,
+            None,
+            Duration::from_secs(60),
+        )
+        .expect_err("empty drain must be refused");
         assert_eq!(err.to_string(), format!("E{}", crate::error::E_NO_STREAMS));
     }
 
@@ -825,8 +893,15 @@ mod tests {
                 .with_frames(1000)
                 .cancels(halt.clone(), 2),
         );
-        let out = drive_mux(stream, "null://", &halt, &NoopEvents, None)
-            .expect("halt is a clean stop, not an error");
+        let out = drive_mux(
+            stream,
+            "null://",
+            &halt,
+            &NoopEvents,
+            None,
+            Duration::from_secs(60),
+        )
+        .expect("halt is a clean stop, not an error");
         assert!(!out.completed, "an interrupted mux is not complete");
         assert!(out.output_opened, "the sink was opened before the halt");
     }
@@ -837,7 +912,15 @@ mod tests {
         let stream = Box::new(FakeStream::new(2).with_frames(10));
         let halt = Halt::new();
         let spy = SpyEvents::new();
-        let out = drive_mux(stream, "null://", &halt, &spy, None).expect("normal mux completes");
+        let out = drive_mux(
+            stream,
+            "null://",
+            &halt,
+            &spy,
+            None,
+            Duration::from_secs(60),
+        )
+        .expect("normal mux completes");
         assert!(out.completed);
         assert!(out.output_opened);
         assert!(spy.opened.load(Ordering::SeqCst));
@@ -1026,6 +1109,7 @@ mod tests {
             skip_errors: false,
             batch_sectors: 8192,
             raw: false,
+            send_deadline: Some(Duration::from_secs(60)),
         };
         let halt = Halt::new();
         let out = mux_stream(
@@ -1134,6 +1218,7 @@ mod tests {
             // an odd-phase unit can't hide inside a larger coalesced batch.
             batch_sectors: us as u16,
             raw: false,
+            send_deadline: Some(Duration::from_secs(60)),
         };
         let halt = Halt::new();
         // Drains to a NoStreams refusal (zeroed data resolves no headers); we
@@ -1204,8 +1289,15 @@ mod tests {
             });
         }
         let halt = Halt::new();
-        let err = drive_mux(Box::new(fs), "null://", &halt, &NoopEvents, None)
-            .expect_err("over-cap header buffer must fail fast, not OOM");
+        let err = drive_mux(
+            Box::new(fs),
+            "null://",
+            &halt,
+            &NoopEvents,
+            None,
+            Duration::from_secs(60),
+        )
+        .expect_err("over-cap header buffer must fail fast, not OOM");
         assert_eq!(
             err.to_string(),
             format!("E{}", crate::error::E_MKV_INVALID),
@@ -1246,8 +1338,15 @@ mod tests {
             writes: AtomicU64::new(0),
         };
         let halt = Halt::new();
-        let out = drive_mux(Box::new(fs), "null://", &halt, &events, None)
-            .expect("K-frame stream muxes cleanly");
+        let out = drive_mux(
+            Box::new(fs),
+            "null://",
+            &halt,
+            &events,
+            None,
+            Duration::from_secs(60),
+        )
+        .expect("K-frame stream muxes cleanly");
         assert!(out.completed);
         assert_eq!(
             events.writes.load(Ordering::SeqCst),
@@ -1300,6 +1399,70 @@ mod tests {
         assert!(
             matches!(session_mux_keys(&dvd), DecryptKeys::None),
             "a DVD must be handed None so DiscStream cracks the per-title key"
+        );
+    }
+
+    // ── Regression E: send_deadline routing (Some vs None) ──────────────────
+    //
+    // `effective_send_deadline` is the tightest seam of the write-pipeline send
+    // decision. autorip passes `Some(60s)` (bounded, watchdog-backed file mux);
+    // the CLI's interactive stdout/network path passes `None`, which must map to
+    // an effectively-unbounded deadline so a slow-but-alive downstream is never
+    // spuriously reported as an interrupted mux. Ctrl-C stays responsive under
+    // `None` because `send_with_halt` re-checks the halt token every
+    // `POLL_INTERVAL` regardless of the deadline (see `NO_SEND_DEADLINE`).
+    //
+    // Mutation: reverting `None` to a fixed `Duration::from_secs(60)` (the
+    // pre-fix behaviour) makes the None-case assertions fail.
+    #[test]
+    fn effective_send_deadline_routes_some_and_none() {
+        // Some(d) → exactly d.
+        assert_eq!(
+            effective_send_deadline(Some(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "Some(d) must resolve to the bounded per-frame deadline d"
+        );
+        assert_eq!(
+            effective_send_deadline(Some(Duration::from_secs(5))),
+            Duration::from_secs(5),
+        );
+        // None → the effectively-unbounded no-timeout sentinel, far larger than
+        // any real Some deadline so backpressure never trips it.
+        let none = effective_send_deadline(None);
+        assert_eq!(
+            none, NO_SEND_DEADLINE,
+            "None must resolve to NO_SEND_DEADLINE"
+        );
+        assert!(
+            none >= Duration::from_secs(365 * 24 * 60 * 60),
+            "None must be effectively unbounded (>= 1 year), got {none:?}"
+        );
+        assert!(
+            none > Duration::from_secs(60),
+            "None must NOT collapse to the old fixed 60s deadline"
+        );
+    }
+
+    // MuxOptions must actually carry the send_deadline knob end-to-end so a
+    // consumer can pick the bounded (autorip) vs unbounded (CLI) policy.
+    #[test]
+    fn mux_options_carries_send_deadline() {
+        let cli = MuxOptions {
+            skip_errors: false,
+            batch_sectors: 0,
+            raw: false,
+            send_deadline: None,
+        };
+        assert_eq!(effective_send_deadline(cli.send_deadline), NO_SEND_DEADLINE);
+        let autorip = MuxOptions {
+            skip_errors: false,
+            batch_sectors: 8192,
+            raw: false,
+            send_deadline: Some(Duration::from_secs(60)),
+        };
+        assert_eq!(
+            effective_send_deadline(autorip.send_deadline),
+            Duration::from_secs(60)
         );
     }
 
