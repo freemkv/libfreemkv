@@ -375,14 +375,42 @@ pub fn resolve_and_apply_traced(
 /// [`resolve_and_apply`] this does not validate/commit to a disc — the read's
 /// decorator re-decrypts with the returned keys, which is the validation.
 pub fn fetch_unit_keys(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
+    drive_unit_keys(sources, ctx).keys
+}
+
+/// Whether a driver run resolved keys, and — when it did NOT — whether the miss
+/// was a genuine "no source holds this key" (`errored == false`) or at least one
+/// source FAILED (`errored == true`, e.g. a network source was unreachable). The
+/// distinction gates negative-result memoization: an empty-because-absent result
+/// is safe to cache, an empty-because-a-source-was-down result is transient and
+/// must NOT be cached (the key may resolve once the source recovers).
+struct FetchOutcome {
+    keys: Vec<UnitKey>,
+    errored: bool,
+}
+
+/// [`fetch_unit_keys`] plus the error signal: drive `sources` in order, return the
+/// first source's non-empty Unit Keys, and flag whether any source that failed to
+/// answer did so with an `Err` (a source failure) rather than an empty `Ok`
+/// (genuine absence — see [`KeySource::get_unit_keys`]).
+fn drive_unit_keys(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> FetchOutcome {
+    let mut errored = false;
     for source in sources {
-        if let Ok(uks) = source.get_unit_keys(ctx) {
-            if !uks.is_empty() {
-                return uks;
+        match source.get_unit_keys(ctx) {
+            Ok(uks) if !uks.is_empty() => {
+                return FetchOutcome {
+                    keys: uks,
+                    errored: false,
+                };
             }
+            Ok(_) => {}
+            Err(_) => errored = true,
         }
     }
-    Vec::new()
+    FetchOutcome {
+        keys: Vec::new(),
+        errored,
+    }
 }
 
 /// The forensic counterpart to [`fetch_unit_keys`]: drive `sources` in order and
@@ -392,14 +420,29 @@ pub fn fetch_unit_keys(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> 
 /// keying on `disc_hash`) ignores them. Whatever the winning source returns —
 /// ≥ 1 key — is trusted as the COMPLETE ordered set; no fixed count is assumed.
 pub fn fetch_fmts_indexes(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
+    drive_fmts_indexes(sources, ctx).keys
+}
+
+/// [`fetch_fmts_indexes`] plus the error signal (see [`drive_unit_keys`]): the
+/// forensic counterpart that flags whether any source `Err`ed during the miss.
+fn drive_fmts_indexes(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> FetchOutcome {
+    let mut errored = false;
     for source in sources {
-        if let Ok(uks) = source.get_fmts_indexes(ctx) {
-            if !uks.is_empty() {
-                return uks;
+        match source.get_fmts_indexes(ctx) {
+            Ok(uks) if !uks.is_empty() => {
+                return FetchOutcome {
+                    keys: uks,
+                    errored: false,
+                };
             }
+            Ok(_) => {}
+            Err(_) => errored = true,
         }
     }
-    Vec::new()
+    FetchOutcome {
+        keys: Vec::new(),
+        errored,
+    }
 }
 
 /// Build the read-time [`crate::sector::KeyFetch`] from the disc's public AACS
@@ -426,12 +469,17 @@ pub fn key_fetch(
     // batch: the resolved keys are disc-level (a clip's index / CPS keys are
     // identical for every title that references it), so the first batch resolves
     // over the network and every repeat is answered from the cache with no
-    // request. Empty replies are cached too — a key the service lacks for a batch
-    // won't appear on a re-ask, so re-hitting the network buys nothing. Each
-    // operation gets its OWN cache: a base batch and a forensic anchor never
-    // collide, and the same bytes could legitimately resolve differently per op.
-    // The per-kind driver: `fetch_unit_keys` or `fetch_fmts_indexes`.
-    type FetchDriver = fn(&[Box<dyn KeySource>], &dyn ResolveCtx) -> Vec<UnitKey>;
+    // request. A GENUINELY-empty reply (every source ran and none held the key)
+    // is cached too — the key the service lacks for a batch won't appear on a
+    // re-ask, so re-hitting the network buys nothing. But an empty reply caused
+    // by a source FAILURE (network down, source unreachable) is NOT cached: that
+    // is a transient miss, and caching it would permanently drop a unit that
+    // could be recovered once the source recovers — the `errored` flag on
+    // `FetchOutcome` draws exactly that line. Each operation gets its OWN cache:
+    // a base batch and a forensic anchor never collide, and the same bytes could
+    // legitimately resolve differently per op.
+    // The per-kind driver: `drive_unit_keys` or `drive_fmts_indexes`.
+    type FetchDriver = fn(&[Box<dyn KeySource>], &dyn ResolveCtx) -> FetchOutcome;
     fn make_op(
         inputs: DiscInputs,
         make_sources: std::sync::Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>,
@@ -460,16 +508,22 @@ pub fn key_fetch(
             // derives unit keys from `enc_title_keys`, which a V10 disc parses at
             // the 48-byte stride — hardcoding the V20 stride here corrupted them.
             let ctx = DiscInputsCtx::new(&di);
-            let keys: Vec<[u8; 16]> = drive(&sources, &ctx).into_iter().map(|u| u.key).collect();
-            cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(fp, keys.clone());
+            let outcome = drive(&sources, &ctx);
+            let keys: Vec<[u8; 16]> = outcome.keys.into_iter().map(|u| u.key).collect();
+            // Memoize a positive result always; memoize a NEGATIVE (empty) result
+            // only when it is a genuine absence, never when a source errored — a
+            // transient outage must not permanently poison this fingerprint.
+            if !keys.is_empty() || !outcome.errored {
+                cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(fp, keys.clone());
+            }
             keys
         })
     }
-    let unit = make_op(inputs.clone(), make_sources.clone(), fetch_unit_keys);
-    let fmts = make_op(inputs, make_sources, fetch_fmts_indexes);
+    let unit = make_op(inputs.clone(), make_sources.clone(), drive_unit_keys);
+    let fmts = make_op(inputs, make_sources, drive_fmts_indexes);
     crate::sector::KeyFetch::new(unit, fmts)
 }
 
@@ -864,6 +918,97 @@ mod tests {
             *builds.lock().unwrap(),
             3,
             "an empty reply is cached, not re-asked"
+        );
+    }
+
+    /// A transient source outage must NOT be memoized as a permanent "no key":
+    /// a fingerprint whose first fetch failed because the source errored must be
+    /// re-asked, and once the source recovers the key resolves. Regression guard
+    /// for the negative-result memoization fix — caching the errored empty would
+    /// permanently drop a recoverable unit for the rest of the op.
+    #[test]
+    fn errored_empty_is_not_cached_and_retries_when_source_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let key = [0x77u8; 16];
+        // Shared across every `make_sources()` rebuild: call 0 errors (source
+        // down), every later call succeeds (source recovered).
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        struct Flaky {
+            calls: Arc<AtomicUsize>,
+            key: [u8; 16],
+        }
+        impl KeySource for Flaky {
+            fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(Error::AacsNoKeys) // first attempt: source unreachable
+                } else {
+                    Ok(vec![UnitKey::new(0, self.key)])
+                }
+            }
+        }
+
+        let calls_c = Arc::clone(&calls);
+        let make: Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync> = Arc::new(move || {
+            vec![Box::new(Flaky {
+                calls: Arc::clone(&calls_c),
+                key,
+            }) as Box<dyn KeySource>]
+        });
+
+        let cb = key_fetch(empty_inputs(), make);
+        let samples = vec![vec![0xCDu8; 8]];
+
+        // First fetch: the source errors → empty, but the miss must NOT be cached.
+        assert!(
+            cb.unit_keys(&samples).is_empty(),
+            "source down → empty this time"
+        );
+        // Second fetch, SAME samples: not blocked by a cached empty → the now-
+        // recovered source resolves the key.
+        assert_eq!(
+            cb.unit_keys(&samples),
+            vec![key],
+            "recovered source resolves — errored empty was not memoized"
+        );
+    }
+
+    /// A GENUINE absence (a source that runs and returns an empty `Ok`) is still
+    /// memoized — the benefit the fix preserves. A source counting its calls must
+    /// be asked exactly once for a fingerprint whose first (clean) reply was empty.
+    #[test]
+    fn genuine_empty_is_still_memoized() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        struct AlwaysEmpty {
+            calls: Arc<AtomicUsize>,
+        }
+        impl KeySource for AlwaysEmpty {
+            fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new()) // ran fine, genuinely holds no key
+            }
+        }
+
+        let calls_c = Arc::clone(&calls);
+        let make: Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync> = Arc::new(move || {
+            vec![Box::new(AlwaysEmpty {
+                calls: Arc::clone(&calls_c),
+            }) as Box<dyn KeySource>]
+        });
+
+        let cb = key_fetch(empty_inputs(), make);
+        let samples = vec![vec![0xEFu8; 8]];
+
+        assert!(cb.unit_keys(&samples).is_empty());
+        assert!(cb.unit_keys(&samples).is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a clean empty reply is cached — the source is asked only once"
         );
     }
 
