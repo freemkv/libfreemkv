@@ -458,6 +458,9 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                                 &mut probe_keys,
                                 opts.key_fetch.as_ref(),
                                 disc.content_format,
+                                // File-backed, bounded probe (best-effort `.ok()`);
+                                // no live drive to protect from a stuck stop here.
+                                None,
                             )
                             .ok()
                             .map(std::sync::Arc::new),
@@ -769,9 +772,22 @@ fn resolve_fmts_key_map(
     keys: &mut crate::decrypt::DecryptKeys,
     fetch: Option<&crate::sector::KeyFetch>,
     format: ContentFormat,
+    halt: Option<&crate::halt::Halt>,
 ) -> io::Result<Option<crate::decrypt::AacsKeyMap>> {
     use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_encrypted, decrypt_unit, is_clean};
     use crate::aacs::segment::{clip_byte_to_lba, parse_individual_segments};
+
+    // Cooperative cancel: this probes the LIVE drive across up to a few hundred
+    // `read_sectors` (the anchor + per-index probe loops), each able to stall to
+    // the SCSI recovery timeout. An operator `/api/stop` during forensic key
+    // resolution must be honored at each loop boundary rather than blocking until
+    // the whole probe completes (hard rule: don't hammer a struggling live drive).
+    let check_halt = || -> io::Result<()> {
+        if halt.is_some_and(|h| h.is_cancelled()) {
+            return Err(crate::error::Error::Halted.into());
+        }
+        Ok(())
+    };
 
     // Load the segment map; absent → not an FMTS disc.
     let Ok(udf) = crate::udf::read_filesystem(reader) else {
@@ -855,6 +871,7 @@ fn resolve_fmts_key_map(
         .filter(|s| s.index == 1)
         .take(MAX_ANCHOR_ATTEMPTS)
     {
+        check_halt()?;
         for phase_off in [0usize, 1usize] {
             let Some(batch) = read_phase_batch(reader, seg, phase_off) else {
                 continue; // read fault on this phase — try the other / next segment
@@ -911,6 +928,7 @@ fn resolve_fmts_key_map(
     let mut phase_of_index: std::collections::HashMap<u16, crate::decrypt::Phase> =
         std::collections::HashMap::new();
     for (i, k) in index_keys.iter().enumerate() {
+        check_halt()?;
         let tag = (i + 1) as u16;
         let Some(seg) = segments.iter().find(|s| s.index == tag) else {
             continue; // no segment carries this index on this feature — skip
@@ -1132,6 +1150,7 @@ pub fn resolve_mux_key_map(
     keys: &mut crate::decrypt::DecryptKeys,
     fetch: Option<&crate::sector::KeyFetch>,
     format: ContentFormat,
+    halt: Option<&crate::halt::Halt>,
 ) -> io::Result<crate::decrypt::AacsKeyMap> {
     use crate::aacs::content::{
         ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted, decrypt_unit, is_clean,
@@ -1153,7 +1172,7 @@ pub fn resolve_mux_key_map(
     // front from the configured source and build a per-segment map. Returns `None`
     // when the disc is not FMTS, or no key source is configured (then the base UK
     // path below applies and the forensic units garble → demux drops them).
-    if let Some(map) = resolve_fmts_key_map(reader, title, keys, fetch, format)? {
+    if let Some(map) = resolve_fmts_key_map(reader, title, keys, fetch, format, halt)? {
         return Ok(map);
     }
     if pool_len == 1 {
@@ -1204,6 +1223,11 @@ pub fn resolve_mux_key_map(
     let mut ranges: Vec<(u32, u32, usize)> = Vec::with_capacity(title.extents.len());
     let mut last_idx = 0usize;
     for ext in &title.extents {
+        // Cooperative cancel between extents: multi-CPS sampling reads real
+        // content units off the live drive, so honor an operator stop here too.
+        if halt.is_some_and(|h| h.is_cancelled()) {
+            return Err(crate::error::Error::Halted.into());
+        }
         let samples = sample_units(reader, ext.start_lba, ext.sector_count);
         // Snapshot the current pool for the pure `pick` closure.
         let pool: Vec<(u32, [u8; 16])> = match keys {
@@ -1319,13 +1343,17 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     // with its KNOWN key and trusts it: no per-unit `is_clean` verdict, no reactive
     // key-fetch, no key-server storm. A unit that decrypts to broken TS is the
     // muxer's problem, exactly as before. AACS-only; CSS self-cracks per region.
-    let key_map =
-        match &keys {
-            crate::decrypt::DecryptKeys::Aacs { .. } => Some(std::sync::Arc::new(
-                resolve_mux_key_map(&mut reader, &title, &mut keys, fetch.as_ref(), format)?,
-            )),
-            _ => None,
-        };
+    let key_map = match &keys {
+        crate::decrypt::DecryptKeys::Aacs { .. } => Some(std::sync::Arc::new(resolve_mux_key_map(
+            &mut reader,
+            &title,
+            &mut keys,
+            fetch.as_ref(),
+            format,
+            halt.as_ref(),
+        )?)),
+        _ => None,
+    };
     // The map IS the title's read plan: it says which CPS unit / forensic segment
     // each LBA belongs to. Walk ONLY the units it marks as ours — every default /
     // CPS unit, and inside an FMTS forensic segment only our-phase units. The
@@ -1792,6 +1820,126 @@ mod tests {
         assert!(pid_to_track.is_empty());
         assert!(ts.is_none(), "no PIDs → no TsDemuxer");
         assert!(ps.is_none());
+    }
+
+    // ── Fix 1: halt threading into live-drive key resolution ───────────────
+
+    /// A counting `SectorSource` over zeros. `touched_extent` flags whether any
+    /// read landed in the title's extent region (LBA >= 1000); the UDF probe only
+    /// reads near LBA 256 (small `capacity`), so a hit there means the expensive
+    /// per-extent `sample_units` loop ran.
+    struct HaltCountSource {
+        reads: u32,
+        touched_extent: bool,
+    }
+    impl SectorSource for HaltCountSource {
+        fn capacity_sectors(&self) -> u32 {
+            512 // keeps the UDF secondary anchor well below the extent region
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.reads += 1;
+            if lba >= 1000 {
+                self.touched_extent = true;
+            }
+            let want = count as usize * 2048;
+            buf[..want].fill(0);
+            Ok(want)
+        }
+    }
+
+    /// `resolve_mux_key_map` on the multi-CPS live path must honor a pre-cancelled
+    /// halt PROMPTLY — `Err(Halted)` at the first extent boundary, before sampling
+    /// any extent's ciphertext — rather than reading through every extent. This is
+    /// the round-2 Fix 1 guard: the resolve chain runs on the LIVE drive (each
+    /// `read_sectors` can stall to the SCSI recovery timeout), so an operator Stop
+    /// during key resolution must interrupt it.
+    ///
+    /// Mutation: dropping the `halt.is_some_and(...) → Err(Halted)` check in the
+    /// multi-CPS extent loop makes the resolve run the sampling reads and return
+    /// `Ok(map)` (zeros sample to no encrypted units → carry key 0), so
+    /// `expect_err` fails AND `touched_extent` flips true.
+    #[test]
+    fn resolve_mux_key_map_honors_pre_cancelled_halt() {
+        use crate::halt::Halt;
+        let mut title = DiscTitle::empty();
+        title.extents = vec![
+            Extent {
+                start_lba: 1000,
+                sector_count: 300,
+            },
+            Extent {
+                start_lba: 5000,
+                sector_count: 300,
+            },
+        ];
+        // Multi-CPS (pool_len = 2) → the extent-sampling loop is the resolve path
+        // (pool_len == 1 would short-circuit to content_map before any read).
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0x11u8; 16]), (1, [0x22u8; 16])],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let mut reader = HaltCountSource {
+            reads: 0,
+            touched_extent: false,
+        };
+        let halt = Halt::new();
+        halt.cancel(); // pre-cancelled: the very first extent boundary must bail
+
+        let err = super::resolve_mux_key_map(
+            &mut reader,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            Some(&halt),
+        )
+        .expect_err("a pre-cancelled halt must abort key resolution");
+        assert!(crate::error::is_halt(&err), "expected Halted, got: {err}");
+        assert!(
+            !reader.touched_extent,
+            "extent sampling must be skipped on a pre-cancelled halt (a read landed \
+             in the extent region — the halt check was not honored)"
+        );
+    }
+
+    /// A `None` halt (no token) must NOT abort — the resolve runs to completion.
+    /// Guards against a mutation that treats `None` as cancelled.
+    #[test]
+    fn resolve_mux_key_map_none_halt_does_not_abort() {
+        let mut title = DiscTitle::empty();
+        title.extents = vec![Extent {
+            start_lba: 1000,
+            sector_count: 300,
+        }];
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0x11u8; 16]), (1, [0x22u8; 16])],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let mut reader = HaltCountSource {
+            reads: 0,
+            touched_extent: false,
+        };
+        // No halt token → resolution proceeds and samples the extent (zeros → no
+        // encrypted unit → carries key 0), returning Ok.
+        let map = super::resolve_mux_key_map(
+            &mut reader,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+        )
+        .expect("no halt → resolution completes");
+        assert!(reader.touched_extent, "the extent WAS sampled with no halt");
+        assert!(!map.ranges().is_empty(), "a map is produced for the extent");
     }
 
     // ── build_iso_pipeline: end-to-end highway wiring ──────────────────────
