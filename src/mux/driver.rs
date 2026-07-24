@@ -505,7 +505,26 @@ fn drive_mux(
                 streams: 0,
             });
         }
-        match stream.read()? {
+        let read = match stream.read() {
+            Ok(r) => r,
+            // A halt landing DURING a blocking read surfaces as `Error::Halted`
+            // (reads dominate wall-clock, so an operator stop most often lands
+            // here, not at the between-reads check above). A clean stop is not a
+            // failure — yield `completed = false`, matching the finish stage and
+            // the highway path, so the consumer's stop-preserves-staging path runs.
+            Err(e) if crate::error::is_halt(&e) => {
+                return Ok(MuxOutcome {
+                    completed: false,
+                    output_opened: false,
+                    bytes_written: 0,
+                    errors: stream.errors(),
+                    lost_bytes: stream.lost_bytes(),
+                    streams: 0,
+                });
+            }
+            Err(e) => return Err(e),
+        };
+        match read {
             Some(frame) => {
                 buffered_bytes = buffered_bytes.saturating_add(frame.data.len());
                 buffered.push(frame);
@@ -597,6 +616,14 @@ fn drive_mux(
                     events.on_write_progress(bytes.load(Ordering::Relaxed), total_bytes);
                 }
                 Ok(None) => break,
+                // A halt landing mid-read is a clean operator stop, not a read
+                // failure: drain the consumer and fall through to the
+                // `completed = false` interrupt path, matching the header pump,
+                // the finish stage, and the highway (which returns Ok(None) on halt).
+                Err(e) if crate::error::is_halt(&e) => {
+                    interrupted = true;
+                    break;
+                }
                 Err(e) => {
                     // Drain + join the consumer so its output file handle is
                     // released, then propagate the read error.
@@ -694,6 +721,10 @@ mod tests {
         /// can observe how many frames the pump consumed after the stream was
         /// moved into `drive_mux`.
         read_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
+        /// If set, `read()` returns `Err(Error::Halted)` once `reads` reaches the
+        /// value — simulating a halt landing DURING a blocking `fill_extents` read
+        /// (the common operator-stop case).
+        halt_err_at_read: Option<usize>,
     }
 
     fn audio_stream() -> crate::disc::Stream {
@@ -723,7 +754,14 @@ mod tests {
                 codec_private_ready: true,
                 cancel_halt: None,
                 read_observer: None,
+                halt_err_at_read: None,
             }
+        }
+        /// After `after` successful reads, the next `read()` returns
+        /// `Err(Error::Halted)` (a stop landing mid-read).
+        fn halt_errs_at(mut self, after: usize) -> Self {
+            self.halt_err_at_read = Some(after);
+            self
         }
         fn with_frames(mut self, n: usize) -> Self {
             for i in 0..n {
@@ -755,6 +793,11 @@ mod tests {
             if let Some((halt, after)) = &self.cancel_halt {
                 if self.reads >= *after {
                     halt.cancel();
+                }
+            }
+            if let Some(after) = self.halt_err_at_read {
+                if self.reads >= after {
+                    return Err(crate::error::Error::Halted.into());
                 }
             }
             let f = self.frames.pop_front();
@@ -904,6 +947,55 @@ mod tests {
         .expect("halt is a clean stop, not an error");
         assert!(!out.completed, "an interrupted mux is not complete");
         assert!(out.output_opened, "the sink was opened before the halt");
+    }
+
+    // ── A halt landing mid-read (Err(Halted) from the stream, the common
+    //    operator-stop case since reads dominate wall-clock) is a clean stop,
+    //    NOT a mux failure. Both the frame pump and the header pump must yield
+    //    completed=false. Mutation: propagating the read-arm Err instead of
+    //    mapping Halted → completed=false makes these `.expect` calls panic. ──
+    #[test]
+    fn halt_err_during_frame_read_yields_completed_false() {
+        let halt = Halt::new();
+        // Headers ready immediately; the 3rd read (in the frame pump) errors Halted.
+        let stream = Box::new(FakeStream::new(1).with_frames(1000).halt_errs_at(2));
+        let out = drive_mux(
+            stream,
+            "null://",
+            &halt,
+            &NoopEvents,
+            None,
+            Duration::from_secs(60),
+        )
+        .expect("a halt mid frame-read is a clean stop, not an Err");
+        assert!(!out.completed, "interrupted mux is not complete");
+        assert!(out.output_opened, "sink opened before the mid-read halt");
+    }
+
+    #[test]
+    fn halt_err_during_header_read_yields_completed_false() {
+        let halt = Halt::new();
+        // Headers never resolve; the 2nd read (in the header pump) errors Halted.
+        let stream = Box::new(
+            FakeStream::new(1)
+                .with_frames(1000)
+                .never_ready()
+                .halt_errs_at(1),
+        );
+        let out = drive_mux(
+            stream,
+            "null://",
+            &halt,
+            &NoopEvents,
+            None,
+            Duration::from_secs(60),
+        )
+        .expect("a halt mid header-read is a clean stop, not an Err");
+        assert!(!out.completed, "interrupted mux is not complete");
+        assert!(
+            !out.output_opened,
+            "halt before headers resolve → sink never opened"
+        );
     }
 
     // ── a normal stream pumps N frames → bytes_written>0, completed=true. ──

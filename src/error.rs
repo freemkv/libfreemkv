@@ -912,6 +912,15 @@ pub fn is_skippable_title_stub(e: &std::io::Error) -> bool {
     matches!(io_error_code(e), Some(E_MKV_INVALID | E_CSS_KEY_MISSING))
 }
 
+/// Whether an [`io::Error`](std::io::Error) is a cooperative user stop
+/// ([`Error::Halted`], code [`E_HALTED`]) — vs a structural failure. A stop is
+/// resumable, not a rip failure: `mux_stream` maps a mid-run halt to
+/// `completed = false`, and consumers preserve staging rather than quarantining.
+/// Typed replacement for the consumers' `E<code>`-leading-token string match.
+pub fn is_halt(e: &std::io::Error) -> bool {
+    io_error_code(e) == Some(E_HALTED)
+}
+
 impl Error {
     /// Borrow the drive-returned SPC-4 sense triple if this error is a
     /// [`Error::ScsiError`] carrying sense data. `None` for any other
