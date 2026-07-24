@@ -146,7 +146,9 @@ pub use drive::{Drive, DriveStatus, find_drive};
 // stop hand-rolling `open → wait_ready → init → probe_disc → identify → scan`.
 // Owns the `Drive` by value; forwards consumer-built key material into
 // `ScanOptions` (the library derives no certs — see `KeySpec`).
-pub use session::{DeviceTarget, DiscSession, KeySpec, scan_iso};
+pub use session::{
+    DeviceTarget, DiscSession, KeySourceFactory, KeySpec, ResolvedKeys, resolve_keys_for, scan_iso,
+};
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
 //
