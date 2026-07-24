@@ -789,12 +789,26 @@ fn resolve_fmts_key_map(
         Ok(())
     };
 
-    // Load the segment map; absent → not an FMTS disc.
-    let Ok(udf) = crate::udf::read_filesystem(reader) else {
-        return Ok(None);
+    // Load the segment map. Distinguish a genuine "not an FMTS disc" negative
+    // from a transient live-drive I/O fault: swallowing the latter into Ok(None)
+    // would fall through to a base-Unit-Key-only map, garble the forensic units,
+    // let the demux drop them, and complete the mux with NO error — silently
+    // losing forensic content, contradicting this function's fail-loud contract.
+    //   - `UdfNotFilesystem`: bytes read fine but are not a UDF disc (deterministic
+    //     tag/format mismatch) → genuinely not FMTS → Ok(None).
+    //   - `UdfNotFound`: the disc is UDF but has no `IndividualSegment.tbl`
+    //     → genuinely not FMTS → Ok(None).
+    //   - any other error (notably `DiscRead`): a read fault → propagate so the
+    //     rip fails loud / can be retried rather than dropping forensic content.
+    let udf = match crate::udf::read_filesystem(reader) {
+        Ok(u) => u,
+        Err(crate::error::Error::UdfNotFilesystem) => return Ok(None),
+        Err(e) => return Err(e.into()),
     };
-    let Ok(tbl) = udf.read_file(reader, "/AACS/IndividualSegment.tbl") else {
-        return Ok(None);
+    let tbl = match udf.read_file(reader, "/AACS/IndividualSegment.tbl") {
+        Ok(t) => t,
+        Err(crate::error::Error::UdfNotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
     };
     let Some(segments) = parse_individual_segments(&tbl) else {
         return Ok(None);
@@ -2833,5 +2847,96 @@ mod tests {
             Some(2),
             "the fetched key is appended at pool index 2 and keys the extent"
         );
+    }
+
+    // ── Fix 1: read-fault vs genuinely-not-FMTS in resolve_fmts_key_map ──────
+
+    /// A SectorSource whose every read is a transient I/O fault (`DiscRead`),
+    /// modelling a marginal live drive stalling while `resolve_fmts_key_map`
+    /// probes the UDF metadata / segment table.
+    struct FaultSource;
+    impl SectorSource for FaultSource {
+        fn capacity_sectors(&self) -> u32 {
+            1_000_000
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            Err(crate::error::Error::DiscRead {
+                sector: lba as u64,
+                status: None,
+                sense: None,
+            })
+        }
+    }
+
+    /// A transient `DiscRead` fault while reading the UDF metadata for the segment
+    /// table must PROPAGATE (fail loud / retryable), NOT be swallowed into the
+    /// not-FMTS `Ok(None)` fall-through — otherwise a marginal AACS 2.1 disc would
+    /// silently drop its forensic content under a base-Unit-Key-only map and the
+    /// mux would report success.
+    ///
+    /// Mutation: revert the read_filesystem arm to `let Ok(udf) = ... else { return
+    /// Ok(None) }` → this returns `Ok(None)` and the assert fails.
+    #[test]
+    fn resolve_fmts_key_map_read_fault_propagates() {
+        let mut reader = FaultSource;
+        let title = multi_cps_title(1000, 30);
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0x01u8; 16])],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let got = super::resolve_fmts_key_map(
+            &mut reader,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+        );
+        let err = got.expect_err("a transient DiscRead must fail loud, never Ok(None)");
+        let expected = std::io::Error::from(crate::error::Error::DiscRead {
+            sector: 256,
+            status: None,
+            sense: None,
+        })
+        .to_string();
+        assert_eq!(
+            err.to_string(),
+            expected,
+            "the DiscRead fault must propagate"
+        );
+    }
+
+    /// A reader whose bytes are structurally NOT a UDF disc (all zeros → no AVDP at
+    /// sector 256 → `UdfNotFilesystem`) is genuinely not FMTS: it must map to the
+    /// clean `Ok(None)` negative, NOT fail loud. Guards against Fix 1 over-reaching
+    /// and rejecting benign non-FMTS discs.
+    #[test]
+    fn resolve_fmts_key_map_not_udf_is_clean_none() {
+        // CipherSource with no registered units reads as all zeros everywhere, so
+        // read_filesystem sees tag_id 0 at sector 256 → UdfNotFilesystem.
+        let mut reader = CipherSource { units: Vec::new() };
+        let title = multi_cps_title(1000, 30);
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0x01u8; 16])],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let got = super::resolve_fmts_key_map(
+            &mut reader,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+        )
+        .expect("a structurally non-UDF disc is a clean not-FMTS negative");
+        assert!(got.is_none(), "not a UDF/FMTS disc → Ok(None)");
     }
 }
