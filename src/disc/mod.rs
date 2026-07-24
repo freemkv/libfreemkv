@@ -592,17 +592,30 @@ pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut
 /// Merge per-title AACS key ranges into the sorted, disjoint set the whole-disc map
 /// needs ([`crate::decrypt::AacsKeyMap::entry_for`] requires disjoint ranges).
 /// Titles that share a clip resolve the SAME physical span (same LBAs → same CPS
-/// unit → same key), so a later range that starts before the previous kept range's
-/// end is that duplicate and is dropped. A real disc never produces two DIFFERENT
-/// keys for one LBA, so the drop is a dedup, not a conflict resolution.
+/// unit → same key). When a later range overlaps a kept one that carries the SAME
+/// key index and phase, the two are UNIONED (end extended to the max) — this covers
+/// both the exact-duplicate (shared clip) case and any partial overlap without ever
+/// dropping coverage, so no encrypted LBA is left in no range (which would pass
+/// through as ciphertext). A real disc never produces two DIFFERENT keys for one
+/// LBA; if that malformed case ever appeared, the later range is dropped to keep the
+/// set disjoint rather than extend one key over another key's LBAs.
 fn merge_content_key_ranges(
     mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)>,
 ) -> Vec<(u32, u32, usize, crate::decrypt::Phase)> {
     ranges.sort_by_key(|&(s, _, _, _)| s);
     let mut merged: Vec<(u32, u32, usize, crate::decrypt::Phase)> = Vec::new();
     for r in ranges {
-        if merged.last().is_none_or(|&(_, e, _, _)| r.0 >= e) {
-            merged.push(r);
+        match merged.last_mut() {
+            // Overlaps the previous kept range.
+            Some(last) if r.0 < last.1 => {
+                // Same key + phase → union (coverage-preserving); a genuine
+                // different-key overlap (malformed disc) is dropped to stay disjoint.
+                if r.2 == last.2 && r.3 == last.3 {
+                    last.1 = last.1.max(r.1);
+                }
+            }
+            // Disjoint or exactly adjacent → keep as its own range.
+            _ => merged.push(r),
         }
     }
     merged
@@ -4364,13 +4377,26 @@ mod tests {
         assert_eq!(merge_content_key_ranges(v), vec![(100, 300, 0, Phase::All)]);
     }
 
-    /// A later range that merely overlaps a kept one (starts before its end) is
-    /// dropped — the map stays disjoint rather than admitting an ambiguous LBA.
+    /// A later range that partially overlaps a kept one carrying the SAME key is
+    /// UNIONED, not dropped — the tail (400..500) must stay covered, or those
+    /// encrypted LBAs would fall in no range and pass through as ciphertext.
     #[test]
-    fn merge_key_ranges_drops_overlap() {
+    fn merge_key_ranges_unions_same_key_overlap() {
         let v = vec![
             (100u32, 400u32, 0usize, Phase::All),
             (200, 500, 0, Phase::All),
+        ];
+        assert_eq!(merge_content_key_ranges(v), vec![(100, 500, 0, Phase::All)]);
+    }
+
+    /// A different-key partial overlap (malformed disc) is dropped rather than
+    /// unioned, so one unit key is never stretched over another key's LBAs; the set
+    /// stays disjoint for `entry_for`.
+    #[test]
+    fn merge_key_ranges_drops_conflicting_key_overlap() {
+        let v = vec![
+            (100u32, 400u32, 0usize, Phase::All),
+            (200, 500, 1, Phase::All),
         ];
         assert_eq!(merge_content_key_ranges(v), vec![(100, 400, 0, Phase::All)]);
     }

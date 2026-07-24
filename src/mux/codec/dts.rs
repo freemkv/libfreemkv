@@ -1474,6 +1474,51 @@ mod tests {
     }
 
     #[test]
+    fn needmore_past_cap_force_flushes_to_bound_buffer() {
+        // A crafted DTS-HD stream whose extension substream declares a size
+        // larger than what is (ever) buffered keeps `next_core_boundary` in a
+        // sustained NeedMore state (a candidate boundary that is never fully
+        // buffered). Once `buf` exceeds MAX_AU_BYTES the NeedMore force-flush
+        // safety valve must fire — mirroring the None arm — so the buffer can't
+        // grow without bound. WITHOUT the guard the parser would `break` and
+        // retain everything, emitting nothing.
+        let mut parser = DtsParser::new();
+
+        let core = make_dts_core(512);
+        // Short-form EXSS header declaring the maximum 16-bit size (65536 bytes);
+        // we buffer only a truncated prefix of it, so the extension is never
+        // "fully buffered" and the candidate boundary stays NeedMore.
+        let full_ext = make_exss(65536, None);
+        assert_eq!(exss_frame_size(&full_ext), Some(65536));
+
+        // Land the total buffer in (MAX_AU_BYTES, core_size + declared_ext_size):
+        // 65600 > 65536 fires the cap; 65600 < 512 + 65536 = 66048 keeps NeedMore.
+        let total = 65600usize;
+        let mut data = core.clone();
+        data.extend_from_slice(&full_ext[..total - core.len()]);
+        assert!(data.len() > MAX_AU_BYTES, "buffer must exceed the AU cap");
+        assert!(
+            data.len() < core.len() + 65536,
+            "extension must not be fully buffered (sustained NeedMore)"
+        );
+        assert!(
+            matches!(next_core_boundary(&data, core.len()), NextCore::NeedMore),
+            "the framing decision at this buffer size is NeedMore past the cap"
+        );
+
+        let frames = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(
+            frames.len(),
+            1,
+            "NeedMore past the AU cap must force-emit, not stall and balloon the buffer"
+        );
+        assert!(
+            parser.buf.is_empty(),
+            "the forced flush drains the buffer instead of growing it unbounded"
+        );
+    }
+
+    #[test]
     fn codec_private_none() {
         let parser = DtsParser::new();
         assert!(parser.codec_private().is_none());

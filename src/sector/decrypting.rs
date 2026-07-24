@@ -93,15 +93,12 @@ impl KeyFetch {
 /// Decorator: read from `inner`, then run the configured
 /// AACS / CSS decrypt over the bytes that landed in `buf`.
 ///
-/// `unit_key_idx` selects the AACS unit key for the disc (0 for
-/// the vast majority of titles; the rare multi-CPS-unit discs pick
-/// the index that covers the title being read). For
-/// [`DecryptKeys::None`] and [`DecryptKeys::Css`] the index is
-/// ignored.
+/// AACS decrypts EXCLUSIVELY through the installed [`key_map`](Self::key_map)
+/// (one key per CPS unit / segment, resolved up front); CSS self-descrambles on
+/// its per-sector scramble flag; [`DecryptKeys::None`] is a pass-through.
 pub struct DecryptingSectorSource<S: SectorSource> {
     inner: S,
     keys: DecryptKeys,
-    unit_key_idx: usize,
     /// Base LBA of the encrypted region currently being read — the clip /
     /// extent `start_lba` that AACS aligned units are anchored at. The unit-
     /// alignment gate measures `lba` relative to THIS, not absolute disc LBA 0,
@@ -130,16 +127,13 @@ pub struct DecryptingSectorSource<S: SectorSource> {
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
-    /// Wrap `inner` with the given keys. The default unit-key
-    /// index is 0; use [`with_unit_key_idx`] for the multi-CPS-unit
-    /// case.
-    ///
-    /// [`with_unit_key_idx`]: Self::with_unit_key_idx
+    /// Wrap `inner` with the given keys. For an AACS source, install a key map
+    /// via [`with_key_map`](Self::with_key_map) before reading — AACS decrypts
+    /// only through the map and fails loud without one.
     pub fn new(inner: S, keys: DecryptKeys) -> Self {
         Self {
             inner,
             keys,
-            unit_key_idx: 0,
             unit_base: 0,
             content_ranges: None,
             key_map: None,
@@ -172,13 +166,6 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// mux leaves it unset because it only ever reads title extents.
     pub fn with_content_ranges(mut self, ranges: Arc<[(u32, u32)]>) -> Self {
         self.content_ranges = Some(ranges);
-        self
-    }
-
-    /// Override the AACS unit-key index. Only meaningful for
-    /// [`DecryptKeys::Aacs`]; other variants ignore it.
-    pub fn with_unit_key_idx(mut self, idx: usize) -> Self {
-        self.unit_key_idx = idx;
         self
     }
 
@@ -216,13 +203,14 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     fn decrypt_buf(
         buf: &mut [u8],
         keys: &mut DecryptKeys,
-        unit_key_idx: usize,
         lba: u32,
         content: Option<&[(u32, u32)]>,
     ) -> Result<usize> {
+        // The `unit_key_idx` arg on `decrypt_sectors[_in_content]` is a legacy
+        // inert param (AACS is map-only; CSS/None ignore it) — pass 0.
         match content {
-            Some(ranges) => decrypt_sectors_in_content(buf, keys, unit_key_idx, lba, ranges),
-            None => decrypt_sectors(buf, keys, unit_key_idx),
+            Some(ranges) => decrypt_sectors_in_content(buf, keys, 0, lba, ranges),
+            None => decrypt_sectors(buf, keys, 0),
         }
     }
 }
@@ -302,13 +290,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         // `Err` and propagates; otherwise every unit gets its key applied and the
         // bytes pass through — a unit that decrypts to broken TS is the consumer's
         // concern (the muxer drops it), never a read failure.
-        Self::decrypt_buf(
-            &mut buf[..n],
-            &mut self.keys,
-            self.unit_key_idx,
-            lba,
-            content_ref,
-        )?;
+        Self::decrypt_buf(&mut buf[..n], &mut self.keys, lba, content_ref)?;
         Ok(n)
     }
 
@@ -612,10 +594,10 @@ mod tests {
         assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
     }
 
-    /// With AACS keys but an out-of-range `unit_key_idx`, the decrypt
-    /// step must fail (DecryptFailed) rather than silently returning
-    /// still-encrypted bytes. Grounding: `decrypt_sectors`' unit-key
-    /// lookup — `unit_keys.get(idx)` → None → Error::DecryptFailed.
+    /// An AACS source reaching the decrypt step WITHOUT an installed key map
+    /// must fail loud (DecryptFailed) rather than silently return still-encrypted
+    /// bytes. Grounding: the map-only model — `decrypt_sectors`' AACS arm
+    /// unconditionally returns `Error::DecryptFailed` when no map path handled it.
     #[test]
     fn aacs_missing_unit_key_errors() {
         let src = PatternedSource { capacity: 16 };

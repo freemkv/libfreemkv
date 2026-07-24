@@ -93,10 +93,17 @@ impl<R: Read + Seek> Mp4Reader<R> {
         let mut track_idx = 0usize;
         // Global cap on total decoded samples across ALL tracks — a crafted file
         // with many `trak` boxes must not sum past this even though each track is
-        // individually bounded. Real titles stay far under it.
-        let mut sample_budget = MAX_SAMPLE_COUNT;
+        // individually bounded. Real titles stay far under it. Also bound by
+        // `file_len`: a sample occupies at least one byte of the file, so a tiny
+        // crafted file with a fixed-size `stsz` claiming count=0xFFFFFFFF can't
+        // inflate the `sizes`/`Vec<SampleRef>` allocations past the file's own size
+        // (a genuine large title has file_len ≫ sample count, so it is unaffected).
+        let mut sample_budget = MAX_SAMPLE_COUNT.min(file_len.min(usize::MAX as u64) as usize);
 
-        for trak in find_boxes(&moov, b"trak") {
+        // Bound the scan at MAX_TRACKS *matches* so a crafted moov packed with tiny
+        // (8-byte) trak headers can't force the scan to materialize a Vec far
+        // larger than the moov payload before the per-track cap below ever runs.
+        for trak in find_boxes_capped(&moov, b"trak", MAX_TRACKS) {
             if track_idx >= MAX_TRACKS {
                 break; // bound track count so the per-track PID can't overflow u16
             }
@@ -348,14 +355,20 @@ fn read_moov<R: Read + Seek>(file: &mut R) -> io::Result<Vec<u8>> {
 /// The first child box of `payload` with the given type — returns its payload
 /// (bytes after the 8-byte header). One level.
 fn find_box<'a>(payload: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
-    find_boxes(payload, want).into_iter().next()
+    // cap=1: a single lookup only needs the first match, so a crafted payload
+    // packed with millions of tiny boxes can't force a huge transient match Vec
+    // before `.next()` throws all but one entry away.
+    find_boxes_capped(payload, want, 1).into_iter().next()
 }
 
-/// All child boxes of `payload` with the given type — each as its payload slice.
-fn find_boxes<'a>(payload: &'a [u8], want: &[u8; 4]) -> Vec<&'a [u8]> {
+/// All child boxes of `payload` with the given type (each as its payload slice),
+/// stopping after `cap` matches so a caller that only processes the first `cap`
+/// never forces an oversized Vec of slice fat-pointers from a crafted payload
+/// packed with minimum-size boxes. Pass `usize::MAX` for "all matches".
+fn find_boxes_capped<'a>(payload: &'a [u8], want: &[u8; 4], cap: usize) -> Vec<&'a [u8]> {
     let mut out = Vec::new();
     let mut pos = 0;
-    while pos + 8 <= payload.len() {
+    while pos + 8 <= payload.len() && out.len() < cap {
         let size = u32::from_be_bytes([
             payload[pos],
             payload[pos + 1],
@@ -1047,6 +1060,65 @@ mod tests {
     }
 
     #[test]
+    fn read_moov_over_cap_rejected_despite_inflated_file_len() {
+        use std::io::{Read, Seek, SeekFrom};
+        // A reader that reports an 8 GiB length on `seek(End)` (trivially forged by
+        // a sparse file, e.g. `truncate -s 8G`) but is backed by a tiny crafted
+        // header followed by an endless run of zeros. A `moov` whose declared size
+        // (512 MiB) is UNDER that inflated length passes the plain EOF check AND
+        // (crucially) the payload `read_exact` would SUCCEED against the zero
+        // stream — so only the absolute MAX_ALLOC_BYTES (256 MiB) cap can reject
+        // it. This makes the test flip to Ok (allocation attempted) if a regression
+        // drops the cap and keeps only the (sparse-file-defeatable) EOF check.
+        struct InflatedReader {
+            data: Vec<u8>,
+            pos: u64,
+            fake_len: u64,
+        }
+        impl Read for InflatedReader {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                let remaining = self.fake_len.saturating_sub(self.pos);
+                let n = (out.len() as u64).min(remaining) as usize;
+                for (i, byte) in out[..n].iter_mut().enumerate() {
+                    let idx = self.pos + i as u64;
+                    *byte = if idx < self.data.len() as u64 {
+                        self.data[idx as usize]
+                    } else {
+                        0 // endless zero fill past the crafted header
+                    };
+                }
+                self.pos += n as u64;
+                Ok(n)
+            }
+        }
+        impl Seek for InflatedReader {
+            fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+                self.pos = match from {
+                    SeekFrom::Start(p) => p,
+                    SeekFrom::End(off) => (self.fake_len as i64 + off) as u64,
+                    SeekFrom::Current(off) => (self.pos as i64 + off) as u64,
+                };
+                Ok(self.pos)
+            }
+        }
+
+        // Only the 8-byte box header is served; the 512 MiB payload is never read.
+        let box_size: u32 = (512 << 20) + 8; // 512 MiB > 256 MiB cap, < 8 GiB len
+        let mut data = Vec::new();
+        data.extend_from_slice(&box_size.to_be_bytes());
+        data.extend_from_slice(b"moov");
+        let mut rd = InflatedReader {
+            data,
+            pos: 0,
+            fake_len: 8 << 30, // 8 GiB
+        };
+        // Sanity: the EOF check would pass (claim < inflated len), so a rejection
+        // can only come from the MAX_ALLOC_BYTES cap.
+        assert!((box_size as u64) < rd.fake_len);
+        assert!(read_moov(&mut rd).is_err());
+    }
+
+    #[test]
     fn read_moov_size_zero_spans_to_eof() {
         use std::io::Cursor;
         // size32 == 0 means "box extends to end of file"; the moov body is the rest.
@@ -1084,6 +1156,307 @@ mod tests {
         b.extend_from_slice(&3u32.to_be_bytes());
         b.extend_from_slice(b"free");
         assert!(read_moov(&mut Cursor::new(b)).is_err());
+    }
+
+    /// Wrap `payload` in an ISO-BMFF box with the given 4-byte type.
+    fn mp4_box(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = (payload.len() + 8) as u32;
+        let mut v = Vec::with_capacity(payload.len() + 8);
+        v.extend_from_slice(&size.to_be_bytes());
+        v.extend_from_slice(typ);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Build a minimal-but-complete audio `trak` (one AC-3 sample) with the given
+    /// media timescale — enough boxes that `from_reader` reaches the per-sample
+    /// `to_ns` timestamp conversion (mdia → mdhd/hdlr/minf → stbl → stsd/stsz/
+    /// stco/stsc, one sample).
+    fn audio_trak(timescale: u32) -> Vec<u8> {
+        let mdhd = {
+            // v0: version+flags(4) creation(4) modification(4) timescale(4) duration(4).
+            let mut p = vec![0u8; 24];
+            p[12..16].copy_from_slice(&timescale.to_be_bytes());
+            mp4_box(b"mdhd", &p)
+        };
+        let hdlr = {
+            // version+flags(4) pre_defined(4) handler_type(4).
+            let mut p = vec![0u8; 12];
+            p[8..12].copy_from_slice(b"soun");
+            mp4_box(b"hdlr", &p)
+        };
+        let stsd = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+            p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+            p.extend_from_slice(&8u32.to_be_bytes()); // sample entry size (header only)
+            p.extend_from_slice(b"ac-3"); // fourcc → Codec::Ac3
+            mp4_box(b"stsd", &p)
+        };
+        let stsz = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+            p.extend_from_slice(&10u32.to_be_bytes()); // sample_size (fixed) = 10
+            p.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+            mp4_box(b"stsz", &p)
+        };
+        let stco = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]);
+            p.extend_from_slice(&1u32.to_be_bytes()); // count
+            p.extend_from_slice(&0u32.to_be_bytes()); // chunk offset 0
+            mp4_box(b"stco", &p)
+        };
+        let stsc = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]);
+            p.extend_from_slice(&1u32.to_be_bytes()); // count
+            p.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
+            p.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk
+            p.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx
+            mp4_box(b"stsc", &p)
+        };
+        let mut stbl = Vec::new();
+        stbl.extend_from_slice(&stsd);
+        stbl.extend_from_slice(&stsz);
+        stbl.extend_from_slice(&stco);
+        stbl.extend_from_slice(&stsc);
+        let minf = mp4_box(b"minf", &mp4_box(b"stbl", &stbl));
+        let mut mdia = Vec::new();
+        mdia.extend_from_slice(&mdhd);
+        mdia.extend_from_slice(&hdlr);
+        mdia.extend_from_slice(&minf);
+        mp4_box(b"trak", &mp4_box(b"mdia", &mdia))
+    }
+
+    #[test]
+    fn mdhd_timescale_zero_does_not_divide_by_zero() {
+        use std::io::Cursor;
+        // Without the `.filter(|&t| t != 0)` guard the per-sample `to_ns` closure
+        // divides by the zero timescale and panics; with it the track falls back
+        // to the 90 kHz default and is indexed normally.
+        let moov = mp4_box(b"moov", &audio_trak(0));
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "ts0".into());
+        assert!(
+            rd.is_ok(),
+            "timescale 0 must be handled via fallback, no divide-by-zero panic"
+        );
+        assert_eq!(
+            rd.unwrap().info().streams.len(),
+            1,
+            "the timescale-0 track is still indexed"
+        );
+    }
+
+    #[test]
+    fn trak_loop_stops_at_max_tracks() {
+        use std::io::Cursor;
+        // A crafted moov packing more than MAX_TRACKS trak boxes must not index
+        // past the cap — the per-track PID `0x1011 + idx` overflows u16 past ~61k
+        // tracks. Without the cap this indexes all MAX_TRACKS + 50 tracks.
+        let mut traks = Vec::new();
+        for _ in 0..(MAX_TRACKS + 50) {
+            traks.extend_from_slice(&audio_trak(48_000));
+        }
+        let moov = mp4_box(b"moov", &traks);
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "many".into()).unwrap();
+        assert_eq!(
+            rd.info().streams.len(),
+            MAX_TRACKS,
+            "trak loop must stop at MAX_TRACKS"
+        );
+    }
+
+    /// A crafted file with a *fixed-size* `stsz` (sample_size != 0) claiming
+    /// count = 0xFFFFFFFF must not inflate the sample index past the file's own
+    /// byte length. `from_reader` sets `sample_budget = MAX_SAMPLE_COUNT.min(file_len)`,
+    /// so a few-hundred-byte file bounds the `Vec<SampleRef>` to a few hundred —
+    /// NOT the 16M `MAX_SAMPLE_COUNT` ceiling. Mutation check: revert the budget
+    /// to a bare `MAX_SAMPLE_COUNT` and this file yields ~16M samples, failing the
+    /// `<= file_len` (and `< MAX_SAMPLE_COUNT`) assertions below.
+    #[test]
+    fn stsz_sample_count_bounded_by_file_len() {
+        use std::io::Cursor;
+        // A minimal audio trak, but with a fixed-size stsz lying about its count.
+        let mdhd = {
+            let mut p = vec![0u8; 24];
+            p[12..16].copy_from_slice(&48_000u32.to_be_bytes()); // timescale
+            mp4_box(b"mdhd", &p)
+        };
+        let hdlr = {
+            let mut p = vec![0u8; 12];
+            p[8..12].copy_from_slice(b"soun");
+            mp4_box(b"hdlr", &p)
+        };
+        let stsd = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+            p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+            p.extend_from_slice(&8u32.to_be_bytes()); // sample entry size (header only)
+            p.extend_from_slice(b"ac-3"); // fourcc → Codec::Ac3
+            mp4_box(b"stsd", &p)
+        };
+        let stsz = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+            p.extend_from_slice(&10u32.to_be_bytes()); // sample_size != 0 (fixed)
+            p.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // count = u32::MAX (lie)
+            mp4_box(b"stsz", &p)
+        };
+        let stco = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]);
+            p.extend_from_slice(&1u32.to_be_bytes()); // count
+            p.extend_from_slice(&0u32.to_be_bytes()); // chunk offset 0
+            mp4_box(b"stco", &p)
+        };
+        let stsc = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]);
+            p.extend_from_slice(&1u32.to_be_bytes()); // count
+            p.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
+            p.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk
+            p.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx
+            mp4_box(b"stsc", &p)
+        };
+        let mut stbl = Vec::new();
+        stbl.extend_from_slice(&stsd);
+        stbl.extend_from_slice(&stsz);
+        stbl.extend_from_slice(&stco);
+        stbl.extend_from_slice(&stsc);
+        let minf = mp4_box(b"minf", &mp4_box(b"stbl", &stbl));
+        let mut mdia = Vec::new();
+        mdia.extend_from_slice(&mdhd);
+        mdia.extend_from_slice(&hdlr);
+        mdia.extend_from_slice(&minf);
+        let trak = mp4_box(b"trak", &mp4_box(b"mdia", &mdia));
+        let moov = mp4_box(b"moov", &trak);
+
+        let file_len = moov.len() as u64;
+        assert!(
+            file_len < 1024,
+            "fixture stays a few hundred bytes ({file_len})"
+        );
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "hostile".into()).unwrap();
+        // The index must be bounded by the file's byte length, NOT the 16M ceiling.
+        assert!(
+            (rd.samples.len() as u64) <= file_len,
+            "sample count {} must be bounded by file_len {file_len}, not the count lie",
+            rd.samples.len()
+        );
+        assert!(
+            rd.samples.len() < MAX_SAMPLE_COUNT,
+            "a tiny file must not allocate the 16M MAX_SAMPLE_COUNT ceiling"
+        );
+    }
+
+    /// Build an audio `trak` identical to `audio_trak(48_000)` but with the
+    /// named stbl child box omitted. Used to reach the untrusted-input guards
+    /// that drop a track whose `stsz` says samples exist yet whose `stco`/`co64`
+    /// (chunk offsets) or `stsc` (sample-to-chunk map) is missing — without such
+    /// a table every sample offset would resolve near file byte 0.
+    fn audio_trak_missing(omit: &[u8; 4]) -> Vec<u8> {
+        let mdhd = {
+            let mut p = vec![0u8; 24];
+            p[12..16].copy_from_slice(&48_000u32.to_be_bytes()); // timescale
+            mp4_box(b"mdhd", &p)
+        };
+        let hdlr = {
+            let mut p = vec![0u8; 12];
+            p[8..12].copy_from_slice(b"soun");
+            mp4_box(b"hdlr", &p)
+        };
+        let stsd = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+            p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+            p.extend_from_slice(&8u32.to_be_bytes()); // sample entry size (header only)
+            p.extend_from_slice(b"ac-3"); // fourcc → Codec::Ac3
+            mp4_box(b"stsd", &p)
+        };
+        let stsz = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+            p.extend_from_slice(&10u32.to_be_bytes()); // sample_size (fixed) = 10
+            p.extend_from_slice(&3u32.to_be_bytes()); // count = 3 (samples exist)
+            mp4_box(b"stsz", &p)
+        };
+        let stco = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]);
+            p.extend_from_slice(&1u32.to_be_bytes()); // count
+            p.extend_from_slice(&0u32.to_be_bytes()); // chunk offset 0
+            mp4_box(b"stco", &p)
+        };
+        let stsc = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]);
+            p.extend_from_slice(&1u32.to_be_bytes()); // count
+            p.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
+            p.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk
+            p.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx
+            mp4_box(b"stsc", &p)
+        };
+        let mut stbl = Vec::new();
+        stbl.extend_from_slice(&stsd);
+        stbl.extend_from_slice(&stsz);
+        if omit != b"stco" {
+            stbl.extend_from_slice(&stco);
+        }
+        if omit != b"stsc" {
+            stbl.extend_from_slice(&stsc);
+        }
+        let minf = mp4_box(b"minf", &mp4_box(b"stbl", &stbl));
+        let mut mdia = Vec::new();
+        mdia.extend_from_slice(&mdhd);
+        mdia.extend_from_slice(&hdlr);
+        mdia.extend_from_slice(&minf);
+        mp4_box(b"trak", &mp4_box(b"mdia", &mdia))
+    }
+
+    /// A track with samples (`stsz`) but no chunk-offset table (`stco`/`co64`)
+    /// must be DROPPED, not indexed with offsets that resolve near file byte 0.
+    /// With it the only track, the whole file fails `Mp4Invalid`.
+    /// Mutation check: delete the `if chunk_offsets.is_empty() { continue; }`
+    /// guard and `from_reader` returns `Ok` (garbage samples), flipping this to FAIL.
+    #[test]
+    fn missing_stco_drops_track_all_dropped_is_invalid() {
+        use std::io::Cursor;
+        let moov = mp4_box(b"moov", &audio_trak_missing(b"stco"));
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "no-stco".into());
+        assert!(
+            rd.is_err(),
+            "a track with stsz but no stco/co64 must be dropped; all-dropped → Mp4Invalid"
+        );
+    }
+
+    /// A track with samples (`stsz`) and chunk offsets (`stco`) but no
+    /// sample-to-chunk map (`stsc`) must be DROPPED — without `stsc` the samples
+    /// cannot be placed against the chunk offsets and would pack from byte 0.
+    /// Mutation check: delete the `if stsc.is_empty() { continue; }` guard and
+    /// `from_reader` returns `Ok`, flipping this to FAIL.
+    #[test]
+    fn missing_stsc_drops_track_all_dropped_is_invalid() {
+        use std::io::Cursor;
+        let moov = mp4_box(b"moov", &audio_trak_missing(b"stsc"));
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "no-stsc".into());
+        assert!(
+            rd.is_err(),
+            "a track with stsz + stco but no stsc must be dropped; all-dropped → Mp4Invalid"
+        );
+    }
+
+    /// Sanity companion: the SAME builder WITH both tables present yields a valid,
+    /// indexed single-track file — proving the two Err results above come from the
+    /// missing table, not from some unrelated defect in the fixture builder.
+    #[test]
+    fn audio_trak_missing_none_is_valid() {
+        use std::io::Cursor;
+        // omit a box that isn't in the stbl → nothing omitted, fixture is complete.
+        let moov = mp4_box(b"moov", &audio_trak_missing(b"____"));
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "complete".into())
+            .expect("complete stbl (stsz+stco+stsc) must index");
+        assert_eq!(rd.info().streams.len(), 1, "the complete track is indexed");
     }
 
     #[test]

@@ -202,6 +202,13 @@ impl Disc {
         //   real sample from it), up front before the decorator takes the reader. A
         //   content unit whose key the pool lacks fails loud at resolve (extract has
         //   no CPS/forensic fetch source), never emits a wrong-key garble.
+        //
+        //   KNOWN LIMITATION (by design): an orphan encrypted clip on a multi-CPS
+        //   disc — referenced by no playlist, so in no title extent — is in no range
+        //   and passes through as ciphertext. There is no correct key to apply (its
+        //   CPS unit is unknown without a playlist reference), and blind trial-decrypt
+        //   is exactly what this keymap-only model removes. Single-CPS is unaffected
+        //   (the blanket key-0 map above covers orphans).
         let key_map =
             match &base_keys {
                 DecryptKeys::Aacs { unit_keys, .. } if unit_keys.len() <= 1 => {

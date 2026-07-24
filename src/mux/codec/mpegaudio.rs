@@ -168,6 +168,22 @@ mod tests {
     }
 
     #[test]
+    fn pes_without_pts_carries_last_timestamp_not_zero() {
+        // A PES with no PTS (legal for audio, e.g. after a discontinuity) must
+        // carry the last known timestamp forward — resetting to 0 would corrupt
+        // A/V sync. Mirrors the adts.rs guard test.
+        let mut p = MpegAudioParser::new();
+        p.parse(&make_pes(mp3_frame(400), Some(90000)));
+        let f = p.parse(&make_pes(mp3_frame(400), None));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].pts_ns,
+            pts_to_ns(90000),
+            "carried forward, not reset to 0"
+        );
+    }
+
+    #[test]
     fn reserved_version_field_is_dropped() {
         // version field = 01 (reserved) → rejected. byte1 = 111_01_01_1 = 0xEB
         // keeps the 11-bit sync (0xFF + top 3 bits 111) but sets version bits to 01.

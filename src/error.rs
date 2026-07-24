@@ -848,8 +848,9 @@ impl From<Error> for std::io::Error {
             // 9023 MuxEmpty: finish() reached with zero frames — the output
             // would be a header-only container. Treat as invalid output.
             E_MUX_EMPTY => std::io::ErrorKind::InvalidData,
-            // mp4:// track/config mismatches: the requested output can't hold
-            // this title's video — invalid output request.
+            // mp4:// demux errors: a malformed/truncated source file
+            // (E_MP4_INVALID), or a source whose tracks the mux can't use — no
+            // video track / missing codec-private config. All are invalid data.
             E_MP4_NO_VIDEO_TRACK | E_MP4_INVALID | E_MP4_MISSING_CODEC_PRIVATE => {
                 std::io::ErrorKind::InvalidData
             }

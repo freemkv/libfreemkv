@@ -795,10 +795,7 @@ fn resolve_fmts_key_map(
     // resolves EVERY title for the whole-disc sweep — aborts the entire decrypt on
     // the first non-forensic title (a menu playlist), and `build_iso_pipeline`
     // aborts muxing any non-main title.
-    let segments: Vec<crate::aacs::segment::Segment> = segments
-        .into_iter()
-        .filter(|s| clip_byte_to_lba(&title.extents, s.start_spn as u64 * 192).is_some())
-        .collect();
+    let segments = filter_addressable_segments(segments, &title.extents);
     if segments.is_empty() {
         return Ok(None);
     }
@@ -931,24 +928,25 @@ fn resolve_fmts_key_map(
                 }
             }
         }
-        let phase = match even.cmp(&odd) {
-            std::cmp::Ordering::Greater => crate::decrypt::Phase::Even,
-            std::cmp::Ordering::Less => crate::decrypt::Phase::Odd,
-            std::cmp::Ordering::Equal if even == 0 => {
+        let phase = match resolve_tie_phase(even, odd) {
+            Ok(p) => {
+                if even == odd {
+                    // BOTH halves decrypt clean (even == odd > 0): the sampled units
+                    // are source-zero padding (`is_clean_ts` is true for all-zero
+                    // content under ANY key), so the key is valid and the parity is
+                    // immaterial here — default Even (we decrypt one parity; padding
+                    // in the dropped parity is harmless). A padding-heavy sample must
+                    // NOT abort the rip.
+                    tracing::debug!(target: "freemkv::keysource", index = tag, even, odd, "fmts: padding tie — defaulting Even");
+                }
+                p
+            }
+            Err(e) => {
                 // NEITHER half decrypts clean under this index's key: the key is
                 // wrong or the sampled units aren't this index's real content. The
                 // map would be wrong — fail loud rather than emit a broken segment.
                 tracing::warn!(target: "freemkv::keysource", index = tag, even, odd, "fmts: no clean phase under index key — refusing broken map");
-                return Err(crate::error::Error::FmtsKeyMissing.into());
-            }
-            std::cmp::Ordering::Equal => {
-                // BOTH halves decrypt clean: the sampled units are source-zero
-                // padding (`is_clean_ts` is true for all-zero content under ANY
-                // key), so the key is valid and the parity is immaterial here —
-                // default Even (we decrypt one parity; padding in the dropped parity
-                // is harmless). A padding-heavy sample must NOT abort the rip.
-                tracing::debug!(target: "freemkv::keysource", index = tag, even, odd, "fmts: padding tie — defaulting Even");
-                crate::decrypt::Phase::Even
+                return Err(e);
             }
         };
         phase_of_index.insert(tag, phase);
@@ -1006,12 +1004,80 @@ fn resolve_fmts_key_map(
     // (added above with their index keys) carve holes out of the title's content
     // extents; every other content unit uses the base UK. Fill the gaps so the map
     // is a complete positive list — an LBA in no range is nav and passes through.
+    let base_gaps = fill_base_key_gaps(&title.extents, &ranges, base_idx);
+    ranges.extend(base_gaps);
+
+    Ok(Some(crate::decrypt::AacsKeyMap::from_ranges_phased(ranges)))
+}
+
+/// Keep only the forensic segments addressable within THIS title's extents: a
+/// segment whose clip-byte start (`start_spn * 192`) maps to an LBA inside the
+/// title is forensic content for this title; one that does not belongs to a
+/// different clip (a menu/extras playlist) and is dropped. An empty result means
+/// the title carries no forensic content, so [`resolve_fmts_key_map`] returns
+/// `Ok(None)` and the caller's base Unit-Key path applies. Extracted from
+/// `resolve_fmts_key_map` for direct testing of the inclusion/exclusion decision.
+fn filter_addressable_segments(
+    segments: Vec<crate::aacs::segment::Segment>,
+    extents: &[crate::disc::Extent],
+) -> Vec<crate::aacs::segment::Segment> {
+    segments
+        .into_iter()
+        .filter(|s| {
+            crate::aacs::segment::clip_byte_to_lba(extents, s.start_spn as u64 * 192).is_some()
+        })
+        .collect()
+}
+
+/// Decide a forensic index's decrypt phase from the clean-sample counts of its
+/// EVEN vs ODD aligned units under that index's key. Extracted from
+/// [`resolve_fmts_key_map`] so the tie logic is unit-testable; the `tracing`
+/// diagnostics stay at the call site, which holds the segment-index context.
+///
+/// * `even > odd` → [`Phase::Even`](crate::decrypt::Phase::Even); `odd > even` →
+///   [`Phase::Odd`](crate::decrypt::Phase::Odd) — the clean half is this index's
+///   real content variant.
+/// * `even == odd == 0` → [`Error::FmtsKeyMissing`](crate::error::Error::FmtsKeyMissing):
+///   NEITHER half decrypts clean, so the key is wrong (or the sample is not this
+///   index's content) — fail loud rather than emit a broken segment.
+/// * `even == odd > 0` → [`Phase::Even`](crate::decrypt::Phase::Even): BOTH halves
+///   are clean, i.e. source-zero padding (clean under any key), so the parity is
+///   immaterial — default Even.
+fn resolve_tie_phase(even_clean: usize, odd_clean: usize) -> io::Result<crate::decrypt::Phase> {
+    match even_clean.cmp(&odd_clean) {
+        std::cmp::Ordering::Greater => Ok(crate::decrypt::Phase::Even),
+        std::cmp::Ordering::Less => Ok(crate::decrypt::Phase::Odd),
+        std::cmp::Ordering::Equal if even_clean == 0 => {
+            Err(crate::error::Error::FmtsKeyMissing.into())
+        }
+        std::cmp::Ordering::Equal => Ok(crate::decrypt::Phase::Even),
+    }
+}
+
+/// Back-fill the LBA gaps NOT covered by the forensic segment ranges with the base
+/// Unit Key, so the finished map is a COMPLETE positive list over the title's
+/// content extents: every content LBA resolves to either a forensic key (inside a
+/// segment) or the base key (`base_idx`). An LBA left in no range would pass
+/// ciphertext through as clear — this range arithmetic guarantees there is no such
+/// hole inside any extent. Extracted from [`resolve_fmts_key_map`] for exhaustive
+/// direct testing (gaplessness over every extent).
+///
+/// `forensic_ranges` are the already-built per-segment ranges; only their
+/// `[start, end)` spans matter here (they carve the holes — the key idx / phase are
+/// irrelevant). The return is the base-key fill ranges ONLY; the caller appends
+/// them to `forensic_ranges` to form the full map.
+fn fill_base_key_gaps(
+    extents: &[crate::disc::Extent],
+    forensic_ranges: &[(u32, u32, usize, crate::decrypt::Phase)],
+    base_idx: usize,
+) -> Vec<(u32, u32, usize, crate::decrypt::Phase)> {
     let cuts: Vec<(u32, u32)> = {
-        let mut c: Vec<(u32, u32)> = ranges.iter().map(|&(s, e, _, _)| (s, e)).collect();
+        let mut c: Vec<(u32, u32)> = forensic_ranges.iter().map(|&(s, e, _, _)| (s, e)).collect();
         c.sort_unstable();
         c
     };
-    for ext in &title.extents {
+    let mut fills = Vec::new();
+    for ext in extents {
         let end = ext.start_lba.saturating_add(ext.sector_count);
         let mut cur = ext.start_lba;
         for &(cs, ce) in &cuts {
@@ -1019,16 +1085,26 @@ fn resolve_fmts_key_map(
                 continue; // cut outside this extent
             }
             if cs > cur {
-                ranges.push((cur, cs, base_idx, crate::decrypt::Phase::All));
+                fills.push((cur, cs, base_idx, crate::decrypt::Phase::All));
             }
             cur = cur.max(ce);
         }
         if cur < end {
-            ranges.push((cur, end, base_idx, crate::decrypt::Phase::All));
+            fills.push((cur, end, base_idx, crate::decrypt::Phase::All));
         }
     }
+    fills
+}
 
-    Ok(Some(crate::decrypt::AacsKeyMap::from_ranges_phased(ranges)))
+/// A single-key content map: every content extent → `idx`; everything else passes
+/// through. The positive-map replacement for the old "one key everywhere" default.
+fn content_map(title: &DiscTitle, idx: usize) -> crate::decrypt::AacsKeyMap {
+    let ranges = title
+        .extents
+        .iter()
+        .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count), idx))
+        .collect();
+    crate::decrypt::AacsKeyMap::from_ranges(ranges)
 }
 
 /// Resolve the proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap) for a title
@@ -1050,18 +1126,6 @@ fn resolve_fmts_key_map(
 /// content extent with one index; multi-CPS keys each extent with the key that
 /// opens a real sample from it; FMTS layers per-segment index keys on top. Any LBA
 /// outside the title's content (nav/filesystem) is in no range and passes through.
-///
-/// A single-key content map: every content extent → `idx`; everything else passes
-/// through. The positive-map replacement for the old "one key everywhere" default.
-fn content_map(title: &DiscTitle, idx: usize) -> crate::decrypt::AacsKeyMap {
-    let ranges = title
-        .extents
-        .iter()
-        .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count), idx))
-        .collect();
-    crate::decrypt::AacsKeyMap::from_ranges(ranges)
-}
-
 pub fn resolve_mux_key_map(
     reader: &mut dyn SectorSource,
     title: &DiscTitle,
@@ -1948,5 +2012,269 @@ mod tests {
             res.is_err(),
             "a scrambled DVD title with no key must hard-fail, not build a scrambled-passthrough pipeline"
         );
+    }
+
+    // ── content_map: single-CPS positive range building ────────────────────
+
+    /// `content_map(title, idx)` keys every single-CPS UHD disc (the common
+    /// case): each content extent → one `[start_lba, start_lba+sector_count)`
+    /// range at `idx`, phase `All`. Assert the exact ranges — an off-by-one on
+    /// the end (or a wrong idx / phase) must flip this test to FAIL.
+    #[test]
+    fn content_map_builds_exact_ranges_from_extents() {
+        use crate::decrypt::Phase;
+        let mut t = DiscTitle::empty();
+        t.extents = vec![
+            Extent {
+                start_lba: 100,
+                sector_count: 50,
+            },
+            Extent {
+                start_lba: 1000,
+                sector_count: 200,
+            },
+        ];
+        let map = super::content_map(&t, 3);
+        // end = start + count (exclusive), idx = 3, phase = All, for each extent.
+        assert_eq!(
+            map.ranges(),
+            &[
+                (100u32, 150u32, 3usize, Phase::All),
+                (1000u32, 1200u32, 3usize, Phase::All),
+            ],
+            "each extent maps to [start, start+count) at the given idx"
+        );
+        // Spot-check the derived lookups: inside → idx 3, the exclusive end and
+        // the inter-extent gap → no key (pass-through).
+        assert_eq!(map.key_idx_for(100), Some(3), "range start is inclusive");
+        assert_eq!(map.key_idx_for(149), Some(3), "last sector of extent 0");
+        assert_eq!(map.key_idx_for(150), None, "extent end is exclusive");
+        assert_eq!(map.key_idx_for(500), None, "gap between extents → no key");
+        assert_eq!(map.key_idx_for(1199), Some(3), "last sector of extent 1");
+    }
+
+    /// A single-extent title still produces exactly one range with the correct
+    /// end (`saturating_add`), and a `sector_count` that would overflow u32
+    /// saturates rather than wrapping past `u32::MAX`.
+    #[test]
+    fn content_map_single_extent_end_saturates() {
+        use crate::decrypt::Phase;
+        let mut t = DiscTitle::empty();
+        t.extents = vec![Extent {
+            start_lba: u32::MAX - 10,
+            sector_count: 100, // (MAX-10)+100 would overflow → saturate to MAX
+        }];
+        let map = super::content_map(&t, 0);
+        assert_eq!(
+            map.ranges(),
+            &[(u32::MAX - 10, u32::MAX, 0usize, Phase::All)],
+            "range end saturates at u32::MAX, no wrap"
+        );
+    }
+
+    // ── resolve_fmts_key_map decision helpers (behaviors flagged by audit) ──
+
+    /// BEHAVIOR 1 — segment filter (`resolve_fmts_key_map` line ~800). A segment
+    /// whose clip-byte start (`start_spn * 192`) maps inside the title's extents is
+    /// kept; one whose start is past the clip is dropped; all-outside → empty (the
+    /// resolver then returns `Ok(None)` and the base-UK path applies).
+    #[test]
+    fn filter_addressable_segments_keeps_only_in_title_segments() {
+        use crate::aacs::segment::Segment;
+        // One extent covering clip bytes [0, 60*2048) = [0, 122880).
+        let extents = vec![Extent {
+            start_lba: 500,
+            sector_count: 60,
+        }];
+        // start_spn 100 → clip byte 19200 < 122880 → maps to an LBA → KEEP.
+        let inside = Segment {
+            index: 1,
+            start_spn: 100,
+            end_spn: 199,
+        };
+        // start_spn 1000 → clip byte 192000 >= 122880 → clip_byte_to_lba None → DROP.
+        let outside = Segment {
+            index: 2,
+            start_spn: 1000,
+            end_spn: 1099,
+        };
+        let kept = super::filter_addressable_segments(vec![inside, outside], &extents);
+        assert_eq!(kept, vec![inside], "only the in-title segment survives");
+        // All-outside → empty; `resolve_fmts_key_map` maps this to Ok(None).
+        assert!(
+            super::filter_addressable_segments(vec![outside], &extents).is_empty(),
+            "no addressable segment → empty (→ resolver Ok(None))"
+        );
+        // Boundary: a segment whose start is the LAST clip byte still maps (Some);
+        // one exactly at the clip end (122880) does not.
+        let at_last = Segment {
+            index: 3,
+            start_spn: (122_879 / 192) as u32, // 639 → byte 122688 < 122880
+            end_spn: 700,
+        };
+        let at_end = Segment {
+            index: 4,
+            start_spn: (122_880 / 192) as u32, // 640 → byte 122880 == clip end → None
+            end_spn: 700,
+        };
+        assert_eq!(
+            super::filter_addressable_segments(vec![at_last, at_end], &extents),
+            vec![at_last],
+            "start inside the clip is kept; start at/after the clip end is dropped"
+        );
+    }
+
+    /// BEHAVIOR 2 — phase-tie default (`resolve_fmts_key_map` line ~936). All four
+    /// arms of the even/odd clean-count decision.
+    #[test]
+    fn resolve_tie_phase_covers_all_arms() {
+        use crate::decrypt::Phase;
+        // Non-tie: the clean half is the index's real variant.
+        assert_eq!(
+            super::resolve_tie_phase(5, 2).unwrap(),
+            Phase::Even,
+            "even majority → Even"
+        );
+        assert_eq!(
+            super::resolve_tie_phase(2, 5).unwrap(),
+            Phase::Odd,
+            "odd majority → Odd"
+        );
+        // Padding tie (both halves clean, > 0): parity immaterial → default Even.
+        assert_eq!(
+            super::resolve_tie_phase(3, 3).unwrap(),
+            Phase::Even,
+            "even == odd > 0 → default Even"
+        );
+        assert_eq!(super::resolve_tie_phase(1, 1).unwrap(), Phase::Even);
+        // Neither half clean (even == odd == 0): fail loud with FmtsKeyMissing.
+        let err = super::resolve_tie_phase(0, 0).unwrap_err();
+        let expected = std::io::Error::from(crate::error::Error::FmtsKeyMissing).to_string();
+        assert_eq!(
+            err.to_string(),
+            expected,
+            "even == odd == 0 → FmtsKeyMissing"
+        );
+    }
+
+    /// Assert `forensic` + `fills` together cover every LBA of every extent EXACTLY
+    /// once — no gap (a hole would pass ciphertext through as clear) and no overlap
+    /// (two keys over one LBA). This is the load-bearing invariant of the gap-fill.
+    fn assert_gapless(
+        extents: &[Extent],
+        forensic: &[(u32, u32, usize, crate::decrypt::Phase)],
+        fills: &[(u32, u32, usize, crate::decrypt::Phase)],
+    ) {
+        let mut spans: Vec<(u32, u32)> = forensic.iter().map(|&(s, e, _, _)| (s, e)).collect();
+        spans.extend(fills.iter().map(|&(s, e, _, _)| (s, e)));
+        spans.sort_unstable();
+        for w in spans.windows(2) {
+            assert!(w[0].1 <= w[1].0, "spans overlap: {:?} vs {:?}", w[0], w[1]);
+        }
+        for ext in extents {
+            let end = ext.start_lba + ext.sector_count;
+            for lba in ext.start_lba..end {
+                let covering = spans.iter().filter(|&&(s, e)| lba >= s && lba < e).count();
+                assert_eq!(
+                    covering, 1,
+                    "LBA {lba} covered {covering}× (want exactly 1)"
+                );
+            }
+        }
+    }
+
+    /// BEHAVIOR 3 — gap-fill range arithmetic (`resolve_fmts_key_map` line ~1005).
+    /// Exhaustive: no segments, mid-extent, at-start, at-end, adjacent segments,
+    /// and multi-extent. Each asserts the EXACT fills AND gaplessness over every
+    /// extent — an off-by-one that leaves a hole flips this to FAIL.
+    #[test]
+    fn fill_base_key_gaps_is_gapless_over_every_extent() {
+        use crate::decrypt::Phase::{All, Even, Odd};
+        let base = 0usize;
+
+        // No segments → the whole extent is base key.
+        let ext = vec![Extent {
+            start_lba: 100,
+            sector_count: 60,
+        }];
+        let forensic: Vec<(u32, u32, usize, crate::decrypt::Phase)> = vec![];
+        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
+        assert_eq!(fills, vec![(100, 160, base, All)], "no segments → all base");
+        assert_gapless(&ext, &forensic, &fills);
+
+        // One segment mid-extent → base | forensic | base, gapless.
+        let forensic = vec![(120, 130, 5, Even)];
+        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
+        assert_eq!(
+            fills,
+            vec![(100, 120, base, All), (130, 160, base, All)],
+            "mid-extent segment → leading + trailing base"
+        );
+        assert_gapless(&ext, &forensic, &fills);
+
+        // Segment at extent START → only a trailing base fill (no zero-length lead).
+        let forensic = vec![(100, 130, 5, Even)];
+        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
+        assert_eq!(
+            fills,
+            vec![(130, 160, base, All)],
+            "segment at start → no leading base, one trailing"
+        );
+        assert_gapless(&ext, &forensic, &fills);
+
+        // Segment at extent END → only a leading base fill (no zero-length trail).
+        let forensic = vec![(130, 160, 5, Even)];
+        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
+        assert_eq!(
+            fills,
+            vec![(100, 130, base, All)],
+            "segment at end → one leading base, no trailing"
+        );
+        assert_gapless(&ext, &forensic, &fills);
+
+        // Whole extent is one segment → no base fill at all, still gapless.
+        let forensic = vec![(100, 160, 5, Even)];
+        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
+        assert!(
+            fills.is_empty(),
+            "segment spans whole extent → no base fill"
+        );
+        assert_gapless(&ext, &forensic, &fills);
+
+        // Adjacent segments (touching, no gap between) → NO zero-length base range
+        // between them (guards the `cs > cur` off-by-one).
+        let forensic = vec![(110, 120, 5, Even), (120, 130, 6, Odd)];
+        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
+        assert_eq!(
+            fills,
+            vec![(100, 110, base, All), (130, 160, base, All)],
+            "adjacent segments → no zero-length fill between them"
+        );
+        assert_gapless(&ext, &forensic, &fills);
+
+        // Multi-extent: a segment mid-first-extent and one at the start of the
+        // second. Fills are per-extent and the union is gapless across both.
+        let exts = vec![
+            Extent {
+                start_lba: 100,
+                sector_count: 60,
+            }, // [100, 160)
+            Extent {
+                start_lba: 1000,
+                sector_count: 40,
+            }, // [1000, 1040)
+        ];
+        let forensic = vec![(120, 130, 5, Even), (1000, 1010, 7, Odd)];
+        let fills = super::fill_base_key_gaps(&exts, &forensic, base);
+        assert_eq!(
+            fills,
+            vec![
+                (100, 120, base, All),
+                (130, 160, base, All),
+                (1010, 1040, base, All),
+            ],
+            "each extent filled independently"
+        );
+        assert_gapless(&exts, &forensic, &fills);
     }
 }
