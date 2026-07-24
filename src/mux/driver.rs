@@ -46,6 +46,17 @@ use super::resolve::{InputOptions, StreamUrl, build_iso_pipeline, input, output,
 /// Mirrors autorip's `MUX_SEND_DEADLINE_SECS`.
 const MUX_SEND_DEADLINE_SECS: u64 = 60;
 
+/// Ceiling on bytes buffered while waiting for `headers_ready()` to resolve.
+/// Normally that resolves after a handful of frames; a damaged/undecryptable
+/// title whose video `codec_private` never resolves would otherwise grow the
+/// pre-headers buffer without bound (the whole 30-90 GB title, one PES frame at
+/// a time) until the process is OOM-killed. 512 MiB is far more than any real
+/// codec-private resolution needs but small enough to fail fast rather than
+/// swap the box to death. Once exceeded the mux is refused exactly as the
+/// headers-never-resolved gate refuses it (`Error::MkvInvalid`). Mirrors
+/// autorip's pre-refactor `HEADER_BUFFER_CAP_BYTES`.
+const HEADER_BUFFER_CAP_BYTES: usize = 512 * 1024 * 1024;
+
 /// Where [`mux_stream`] reads its PES frames from. The driver owns the
 /// construction of the underlying [`Stream`] so consumers stop hand-rolling
 /// `DiscStream::new` / `build_iso_pipeline` / `input()`.
@@ -268,7 +279,9 @@ pub fn mux_stream(
                     .meta_title
                     .clone()
                     .unwrap_or_else(|| disc.volume_id.clone());
-                (title, disc.content_format, disc.decrypt_keys(), playlist)
+                // DVD CSS is per-VTS: resolve the per-title key via the pipeline
+                // (see `session_mux_keys`), never the whole-disc `decrypt_keys()`.
+                (title, disc.content_format, session_mux_keys(disc), playlist)
             };
             // A missing staged reader ("already consumed" / never staged) is a
             // clean error, not a panic (contract Q2).
@@ -361,6 +374,25 @@ pub fn mux_stream(
 ///
 /// Sector numbers are the library's `u64`; the `MuxEvents` LBA hooks take `u32`
 /// (the disc's LBA space), so they are narrowed with `as u32`.
+/// Decrypt keys for the live `Session` mux of `disc`.
+///
+/// A DVD is handed [`DecryptKeys::None`] so [`DiscStream::new`](crate::mux::DiscStream)
+/// cracks the CORRECT per-title CSS key: CSS title keys are per-VTS, and
+/// [`Disc::decrypt_keys`](crate::disc::Disc::decrypt_keys) returns the LARGEST
+/// title's VTS key — muxing a bonus title in a DIFFERENT VTS with it descrambles
+/// to corrupt MPEG-PS. `resolve_dvd_title_key`'s crack-guard only fires when
+/// `keys` is `None`, so passing the whole-disc key would skip the per-title
+/// crack entirely. This mirrors the sibling `resolve.rs::input()` DVD
+/// special-case (and the pre-refactor CLI `pipe.rs`). AACS / genuinely-clear
+/// discs resolve from `decrypt_keys()` with no read.
+fn session_mux_keys(disc: &crate::disc::Disc) -> DecryptKeys {
+    if matches!(disc.format, crate::disc::DiscFormat::Dvd) {
+        DecryptKeys::None
+    } else {
+        disc.decrypt_keys()
+    }
+}
+
 fn reader_event_fn(events: Arc<dyn MuxEvents>) -> crate::sector::prefetched::EventFn {
     Box::new(move |e: Event| match e.kind {
         EventKind::BytesRead { bytes, total } => events.on_read_progress(bytes, total),
@@ -420,6 +452,7 @@ fn drive_mux(
     // can't write a track header without codec init data. The loop breaks on
     // EOF/None too, so the gate below re-checks.
     let mut buffered: Vec<PesFrame> = Vec::new();
+    let mut buffered_bytes: usize = 0;
     while !stream.headers_ready() {
         if halt.is_cancelled() {
             return Ok(MuxOutcome {
@@ -432,7 +465,19 @@ fn drive_mux(
             });
         }
         match stream.read()? {
-            Some(frame) => buffered.push(frame),
+            Some(frame) => {
+                buffered_bytes = buffered_bytes.saturating_add(frame.data.len());
+                buffered.push(frame);
+                // Bounded header buffer: a title whose codec_private never
+                // resolves would otherwise buffer the entire (tens-of-GB)
+                // stream into RAM until OOM. Treat cap-exceeded identically to
+                // "headers never resolved" — fail fast with the SAME
+                // `Error::MkvInvalid` the header gate below returns, instead of
+                // swapping the box to death.
+                if buffered_bytes > HEADER_BUFFER_CAP_BYTES {
+                    return Err(Error::MkvInvalid.into());
+                }
+            }
             None => break,
         }
     }
@@ -482,6 +527,12 @@ fn drive_mux(
             interrupted = true;
             break;
         }
+        // Feed write-side progress during the drain exactly as the steady-state
+        // loop below does. The watchdog is fed only from `on_write_progress`;
+        // no `stream.read()` runs here (reads finished in the header pump), so
+        // omitting this leaves the watchdog unfed for the whole header-drain
+        // phase and it can false-escalate on a long/slow drain.
+        events.on_write_progress(bytes.load(Ordering::Relaxed), total_bytes);
     }
 
     // Then the remainder of the stream.
@@ -593,6 +644,10 @@ mod tests {
         codec_private_ready: bool,
         /// If set, `read()` cancels this halt once `reads` reaches the value.
         cancel_halt: Option<(Halt, usize)>,
+        /// If set, every successful `read()` bumps this shared counter so a test
+        /// can observe how many frames the pump consumed after the stream was
+        /// moved into `drive_mux`.
+        read_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
     }
 
     fn audio_stream() -> crate::disc::Stream {
@@ -621,6 +676,7 @@ mod tests {
                 reads: 0,
                 codec_private_ready: true,
                 cancel_halt: None,
+                read_observer: None,
             }
         }
         fn with_frames(mut self, n: usize) -> Self {
@@ -658,6 +714,9 @@ mod tests {
             let f = self.frames.pop_front();
             if f.is_some() {
                 self.reads += 1;
+                if let Some(obs) = &self.read_observer {
+                    obs.fetch_add(1, Ordering::SeqCst);
+                }
             }
             Ok(f)
         }
@@ -1107,6 +1166,152 @@ mod tests {
         assert!(
             read_lbas.contains(&1030) && read_lbas.contains(&1054),
             "our-phase forensic units must still be read (kept LBAs 1030/1054)"
+        );
+    }
+
+    // ── Regression A: header-buffer cap fails fast instead of OOM ───────────
+    //
+    // A stream whose headers never resolve but that keeps yielding frames must
+    // be refused once the pre-headers buffer passes `HEADER_BUFFER_CAP_BYTES`,
+    // BEFORE draining the whole (unbounded, OOM-inducing) stream. Frames are
+    // zero-filled `Vec`s (`alloc_zeroed`, lazily paged) so the nominal size is
+    // cheap in RSS. We hand the pump FAR more frames than the cap needs and
+    // assert both that it fails with the same `MkvInvalid` outcome AND that it
+    // stopped EARLY (bounded read count) — the latter is what distinguishes the
+    // capped path from the un-capped one.
+    //
+    // Mutation: removing the cap makes the pump drain all `MANY` frames (reads
+    // == MANY) before failing at the header gate → the `reads_seen` bound fails.
+    #[test]
+    fn header_buffer_cap_fails_fast_instead_of_oom() {
+        use std::sync::atomic::AtomicUsize;
+        const FRAME: usize = 64 * 1024 * 1024; // 64 MiB per frame
+        let cap_frames = HEADER_BUFFER_CAP_BYTES / FRAME; // 8 frames == cap
+        const MANY: usize = 200; // vastly more than the cap needs
+
+        let reads_seen = Arc::new(AtomicUsize::new(0));
+        let mut fs = FakeStream::new(1).never_ready();
+        fs.read_observer = Some(reads_seen.clone());
+        for i in 0..MANY {
+            fs.frames.push_back(PesFrame {
+                track: 0,
+                pts: i as i64,
+                keyframe: true,
+                data: vec![0u8; FRAME],
+                duration_ns: None,
+                source: None,
+                coding: None,
+            });
+        }
+        let halt = Halt::new();
+        let err = drive_mux(Box::new(fs), "null://", &halt, &NoopEvents, None)
+            .expect_err("over-cap header buffer must fail fast, not OOM");
+        assert_eq!(
+            err.to_string(),
+            format!("E{}", crate::error::E_MKV_INVALID),
+            "cap-exceeded returns the same MkvInvalid as headers-never-resolved"
+        );
+        let reads = reads_seen.load(Ordering::SeqCst);
+        assert!(
+            reads <= cap_frames + 1,
+            "must fail after ~{cap_frames} frames (cap), not drain all {MANY} (read {reads})"
+        );
+    }
+
+    // ── Regression B: watchdog fed during the buffered header drain ─────────
+    //
+    // Headers resolve only after K frames are buffered; those K frames are then
+    // flushed to the sink in the drain loop. Every flushed frame must fire
+    // `on_write_progress` (the sole watchdog feed) — with exactly K frames and
+    // no remainder, ALL `on_write_progress` calls come from the drain.
+    //
+    // Mutation: dropping the `events.on_write_progress(...)` call in the drain
+    // loop leaves the count at 0 → this fails.
+    #[test]
+    fn write_progress_fed_during_header_drain() {
+        const K: usize = 6;
+        let mut fs = FakeStream::new(1).with_frames(K);
+        // Headers stay unresolved until all K frames have been read+buffered.
+        fs.headers_ready_after = K;
+
+        struct WriteProgressCounter {
+            writes: AtomicU64,
+        }
+        impl MuxEvents for WriteProgressCounter {
+            fn on_write_progress(&self, _bytes_written: u64, _bytes_total: u64) {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let events = WriteProgressCounter {
+            writes: AtomicU64::new(0),
+        };
+        let halt = Halt::new();
+        let out = drive_mux(Box::new(fs), "null://", &halt, &events, None)
+            .expect("K-frame stream muxes cleanly");
+        assert!(out.completed);
+        assert_eq!(
+            events.writes.load(Ordering::SeqCst),
+            K as u64,
+            "each of the K buffered header frames must feed on_write_progress on drain"
+        );
+    }
+
+    // ── Regression C: Session key selection special-cases DVD ───────────────
+    //
+    // `session_mux_keys` is the seam the `MuxInput::Session` arm uses to pick
+    // decrypt keys. A DVD must get `None` (so DiscStream cracks the correct
+    // per-title/per-VTS CSS key); a non-DVD passes `decrypt_keys()` through.
+    // Building a full multi-VTS DiscSession fixture is infeasible in a unit
+    // test, so this asserts the is_dvd→None DECISION at the tightest seam.
+    //
+    // Mutation: reverting to unconditional `disc.decrypt_keys()` returns
+    // `Css{..}` for the DVD case → the `None` assertion fails.
+    fn disc_with_css(format: crate::disc::DiscFormat) -> crate::disc::Disc {
+        crate::disc::Disc {
+            volume_id: "TEST".into(),
+            meta_title: None,
+            format,
+            capacity_sectors: 0,
+            capacity_bytes: 0,
+            layers: 1,
+            titles: Vec::new(),
+            region: crate::disc::DiscRegion::Free,
+            aacs: None,
+            css: Some(crate::css::CssState {
+                title_key: [1, 2, 3, 4, 5],
+                crack_span: None,
+            }),
+            encrypted: true,
+            aacs_error: None,
+            css_error: None,
+            content_format: crate::disc::ContentFormat::MpegPs,
+        }
+    }
+
+    #[test]
+    fn session_mux_keys_uses_none_for_dvd() {
+        // DVD: must be None so the pipeline cracks the correct per-title key,
+        // even though decrypt_keys() would hand back a whole-disc Css key.
+        let dvd = disc_with_css(crate::disc::DiscFormat::Dvd);
+        assert!(
+            matches!(dvd.decrypt_keys(), DecryptKeys::Css { .. }),
+            "precondition: a CSS disc's decrypt_keys() is Css{{..}}"
+        );
+        assert!(
+            matches!(session_mux_keys(&dvd), DecryptKeys::None),
+            "a DVD must be handed None so DiscStream cracks the per-title key"
+        );
+    }
+
+    #[test]
+    fn session_mux_keys_passes_decrypt_keys_for_non_dvd() {
+        // Non-DVD (e.g. BluRay): the whole-disc key IS the per-title key, so it
+        // passes through — proving the special-case keys on FORMAT, not on the
+        // mere presence of a key.
+        let bd = disc_with_css(crate::disc::DiscFormat::BluRay);
+        assert!(
+            matches!(session_mux_keys(&bd), DecryptKeys::Css { .. }),
+            "a non-DVD passes decrypt_keys() through unchanged"
         );
     }
 }
