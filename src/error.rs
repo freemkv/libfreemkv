@@ -879,6 +879,39 @@ impl From<Error> for std::io::Error {
 /// Convenience alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The numeric error code carried by an [`io::Error`](std::io::Error) that was
+/// produced from an [`Error`], or `None` if it carries none.
+///
+/// Two shapes are recognised: an `io::Error` that still wraps the typed
+/// [`Error`] (via `io::Error::new(kind, Error)`), and the round-tripped form
+/// produced by [`From<Error> for io::Error`] whose message is the `Error`'s
+/// `E<code>[: …]` [`Display`](std::fmt::Display) string.
+fn io_error_code(e: &std::io::Error) -> Option<u16> {
+    // Direct: the io::Error still holds the typed Error.
+    if let Some(err) = e.get_ref().and_then(|r| r.downcast_ref::<Error>()) {
+        return Some(err.code());
+    }
+    // Round-tripped: `From<Error> for io::Error` stringifies as "E<code>[: …]".
+    let s = e.to_string();
+    let digits = s.strip_prefix('E')?;
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits.get(..end)?.parse::<u16>().ok()
+}
+
+/// Whether a per-title mux failure is a *skippable title stub* — a
+/// copy-protected-but-uncrackable title ([`Error::CssKeyMissing`]) or a title
+/// that produced no muxable frames ([`Error::MkvInvalid`], an empty nav/menu
+/// PGC stub). An all-titles rip skips such a title and finishes the rest;
+/// every other error stays fatal.
+///
+/// This replaces the CLI's `E7023`/`E6008` string-match with a typed check on
+/// the [`io::Error`](std::io::Error) `mux_stream` returns.
+pub fn is_skippable_title_stub(e: &std::io::Error) -> bool {
+    matches!(io_error_code(e), Some(E_MKV_INVALID | E_CSS_KEY_MISSING))
+}
+
 impl Error {
     /// Borrow the drive-returned SPC-4 sense triple if this error is a
     /// [`Error::ScsiError`] carrying sense data. `None` for any other
@@ -972,6 +1005,25 @@ mod tests {
     //! check. Without these, future drift between the const codes and the
     //! match arms in `code()` / the From impl could silently miscategorize.
     use super::*;
+
+    #[test]
+    fn is_skippable_title_stub_matches_only_the_two_stub_codes() {
+        // The two skippable per-title stub codes, round-tripped through io::Error
+        // exactly as `mux_stream` returns them.
+        let mkv: std::io::Error = Error::MkvInvalid.into();
+        let css: std::io::Error = Error::CssKeyMissing.into();
+        assert!(is_skippable_title_stub(&mkv));
+        assert!(is_skippable_title_stub(&css));
+
+        // A different coded error is NOT skippable (kills a "match anything with
+        // an E-code" mutant).
+        let nostreams: std::io::Error = Error::NoStreams.into();
+        assert!(!is_skippable_title_stub(&nostreams));
+
+        // A plain io::Error with no E-code prefix is not skippable.
+        let plain = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(!is_skippable_title_stub(&plain));
+    }
 
     #[test]
     fn new_variants_have_distinct_codes() {

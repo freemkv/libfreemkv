@@ -321,6 +321,17 @@ impl DiscSession {
     pub fn into_reader(self) -> Option<Box<dyn SectorSource>> {
         self.reader
     }
+
+    /// Take the staged sector source out of the session by mutable borrow,
+    /// leaving `None` behind. Used by [`crate::mux::mux_stream`]'s
+    /// [`MuxInput::Session`](crate::mux::MuxInput::Session) arm, which drives
+    /// the mux from `&mut DiscSession` and so cannot consume the whole session.
+    /// A second call (or a call before the reader is staged) returns `None`, and
+    /// the driver maps that to a clean error rather than a panic (see Q2 of the
+    /// boundary-audit contract).
+    pub fn take_reader(&mut self) -> Option<Box<dyn SectorSource>> {
+        self.reader.take()
+    }
 }
 
 /// Scan an ISO image's structure from a file path, returning the scanned
