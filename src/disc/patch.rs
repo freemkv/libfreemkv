@@ -1339,10 +1339,12 @@ impl Disc {
         // via the map (identical to `Disc::sweep`). CSS keeps the content-gated
         // self-descramble path. (Multipass patch is `--raw`, so decrypt is a no-op.)
         let key_map = if opts.decrypt && decrypt_is_aacs {
+            let halt = opts.halt.clone().map(crate::halt::Halt::from_arc);
             Some(std::sync::Arc::new(self.resolve_content_key_map(
                 reader,
                 &mut keys,
                 opts.key_fetch.as_ref(),
+                halt.as_ref(),
             )?))
         } else {
             None

@@ -217,7 +217,7 @@ impl Disc {
                     ))
                 }
                 DecryptKeys::Aacs { .. } => Some(std::sync::Arc::new(
-                    self.resolve_content_key_map(reader, &mut base_keys, None)?,
+                    self.resolve_content_key_map(reader, &mut base_keys, None, opts.halt.as_ref())?,
                 )),
                 _ => None,
             };

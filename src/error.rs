@@ -882,15 +882,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The numeric error code carried by an [`io::Error`](std::io::Error) that was
 /// produced from an [`Error`], or `None` if it carries none.
 ///
-/// Two shapes are recognised: an `io::Error` that still wraps the typed
-/// [`Error`] (via `io::Error::new(kind, Error)`), and the round-tripped form
-/// produced by [`From<Error> for io::Error`] whose message is the `Error`'s
-/// `E<code>[: …]` [`Display`](std::fmt::Display) string.
+/// [`From<Error> for io::Error`] is the ONLY path from a typed [`Error`] to an
+/// `io::Error` in this crate, and it stringifies (`io::Error::new(kind, msg)`
+/// where `msg` is the `Error`'s `E<code>[: …]` [`Display`](std::fmt::Display)
+/// string) rather than boxing the typed value — no code path constructs an
+/// `io::Error` that still holds a `crate::error::Error` via `get_ref`. So the
+/// only recognised shape is the round-tripped `E<code>` message prefix.
 fn io_error_code(e: &std::io::Error) -> Option<u16> {
-    // Direct: the io::Error still holds the typed Error.
-    if let Some(err) = e.get_ref().and_then(|r| r.downcast_ref::<Error>()) {
-        return Some(err.code());
-    }
     // Round-tripped: `From<Error> for io::Error` stringifies as "E<code>[: …]".
     let s = e.to_string();
     let digits = s.strip_prefix('E')?;

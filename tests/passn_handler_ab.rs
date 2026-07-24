@@ -814,6 +814,18 @@ fn profile_08_batch_fail_singles_ok() {
 /// Run a single-always-bad-sector (LBA 130, inside a NonTrimmed [128,192)
 /// range) patch pass with the given failure step and return the final map
 /// stats. 256-sector synthetic disc; everything outside the range is Finished.
+///
+/// TODO(coverage gap): these HARDWARE_ERROR / ILLEGAL_REQUEST cases assert only
+/// the persistent-sense RECOVERY CONTRACT (never Unreadable, byte conservation,
+/// dead sector stays pending) — they do NOT exercise the patch WEDGE-EXIT path.
+/// A single dead sector in one range structurally cannot reach either exit:
+/// `WEDGE_ABORT_THRESHOLD=16` needs 16 CONSECUTIVE wedge-family senses within a
+/// range, and the `wedged_threshold=50` exit additionally needs `range_idx > 0`
+/// (a prior range already processed). No test anywhere asserts
+/// `PatchOutcome::wedged_exit == true`. A real wedge-exit fixture (a first
+/// throwaway range, then a second range of >=16 sectors that ALL always-fail
+/// with HARDWARE_ERROR, in reverse mode) is a separate, larger synthetic build;
+/// left out here rather than bent into this shared single-sector helper.
 fn single_dead_sector_patch_stats(step: ScriptStep) -> libfreemkv::disc::mapfile::MapStats {
     let capacity_sectors: u32 = 256;
     let (mut reader, _trace) = ScriptedSectorReader::new(capacity_sectors);

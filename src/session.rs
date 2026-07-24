@@ -370,6 +370,32 @@ impl DiscSession {
     pub fn take_reader(&mut self) -> Option<Box<dyn SectorSource>> {
         self.reader.take()
     }
+
+    /// Test-only constructor: build a session over an INJECTED reader + already-
+    /// scanned disc WITHOUT opening a live [`Drive`]. `DiscSession::open` needs
+    /// real hardware, so this is the only way to exercise the
+    /// [`MuxInput::Session`](crate::mux::MuxInput::Session) mux arm (take_reader →
+    /// resolve_inline_base_map → DiscStream → with_key_map) and
+    /// [`Self::resolve_keys`]'s title-sampling branch against a synthetic reader.
+    ///
+    /// The drive slot stays `None` (a `MuxInput::Session` mux never touches it —
+    /// it reads through the staged `reader`); `device` carries a sentinel path so
+    /// the driver's missing-reader error still has a name.
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        disc: Disc,
+        reader: Option<Box<dyn SectorSource>>,
+        key_fetch: Option<KeyFetch>,
+    ) -> DiscSession {
+        DiscSession {
+            drive: None,
+            device: "test://session".to_string(),
+            spec: KeySpec::default(),
+            disc: Some(disc),
+            reader,
+            key_fetch,
+        }
+    }
 }
 
 /// Scan an ISO image's structure from a file path, returning the scanned
@@ -613,6 +639,71 @@ mod tests {
         assert!(
             resolved.key_fetch.is_some(),
             "an AACS disc retains a fetch even when the up-front resolve misses"
+        );
+    }
+
+    /// A counting reader over zeros — records the highest LBA sampled so the test
+    /// can prove the LARGEST title's extent (not the small one) was read.
+    struct SamplingReader {
+        reads: u32,
+        max_lba: u32,
+    }
+    impl SectorSource for SamplingReader {
+        fn capacity_sectors(&self) -> u32 {
+            100_000
+        }
+        fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+            self.reads += 1;
+            self.max_lba = self.max_lba.max(lba);
+            let want = count as usize * 2048;
+            buf[..want].fill(0);
+            Ok(want)
+        }
+    }
+
+    /// `resolve_keys_for` samples the LARGEST title's ciphertext through the
+    /// reader when a source is configured (the `session.rs:90` sampling branch).
+    /// The other tests use a title-less disc (no sampling read), so this branch
+    /// was uncovered. With two titles and a non-empty source, the sampling read
+    /// fires against the LARGER title's extent.
+    #[test]
+    fn resolve_keys_for_samples_largest_title_through_reader() {
+        use crate::disc::{DiscTitle, Extent};
+        let mut disc = aacs_disc();
+        let mut small = DiscTitle::empty();
+        small.size_bytes = 1_000;
+        small.extents = vec![Extent {
+            start_lba: 100,
+            sector_count: 300,
+        }];
+        let mut large = DiscTitle::empty();
+        large.size_bytes = 9_000_000;
+        large.extents = vec![Extent {
+            start_lba: 9_000,
+            sector_count: 300,
+        }];
+        disc.titles = vec![small, large];
+        let mut reader = SamplingReader {
+            reads: 0,
+            max_lba: 0,
+        };
+
+        // Non-empty source ⇒ the sampling read is NOT skipped.
+        let resolved = resolve_keys_for(&mut reader, &mut disc, factory_of(|| HasUnitKey([1; 16])));
+
+        assert!(
+            reader.reads > 0,
+            "the largest title was sampled via the reader"
+        );
+        assert!(
+            reader.max_lba >= 9_000,
+            "sampling read the LARGER title's extent (lba>=9000), not the small one \
+             (max_lba={})",
+            reader.max_lba
+        );
+        assert!(
+            resolved.key_fetch.is_some(),
+            "an AACS disc still retains a read-time fetch"
         );
     }
 
