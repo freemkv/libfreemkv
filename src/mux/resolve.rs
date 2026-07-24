@@ -774,7 +774,7 @@ fn resolve_fmts_key_map(
     format: ContentFormat,
     halt: Option<&crate::halt::Halt>,
 ) -> io::Result<Option<crate::decrypt::AacsKeyMap>> {
-    use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_encrypted, decrypt_unit, is_clean};
+    use crate::aacs::content::ALIGNED_UNIT_LEN;
     use crate::aacs::segment::{clip_byte_to_lba, parse_individual_segments};
 
     // Cooperative cancel: this probes the LIVE drive across up to a few hundred
@@ -930,44 +930,45 @@ fn resolve_fmts_key_map(
     for (i, k) in index_keys.iter().enumerate() {
         check_halt()?;
         let tag = (i + 1) as u16;
-        let Some(seg) = segments.iter().find(|s| s.index == tag) else {
-            continue; // no segment carries this index on this feature — skip
-        };
-        let (mut even, mut odd) = (0usize, 0usize);
-        for p in 0..BATCH_UNITS {
-            for (phase_off, counter) in [(0usize, &mut even), (1usize, &mut odd)] {
-                if let Some(mut c) = read_unit(reader, seg, p * 2 + phase_off) {
-                    if aacs_unit_encrypted(&c, format) {
-                        decrypt_unit(&mut c, k);
-                        if is_clean(&c, format) {
-                            *counter += 1;
-                        }
-                    }
-                }
+        // Probe this index's parity with the anchor loop's read-fault tolerance:
+        // try up to MAX_ANCHOR_ATTEMPTS same-index segments (not a single `.find`),
+        // skipping any whose reads all fault. The outcome distinguishes a genuine
+        // wrong key (reads succeeded, no clean parity) from a transient live-drive
+        // read fault (zero decrypt evidence) — the load-bearing distinction so a
+        // recoverable fault never hard-aborts a rip whose index keys are valid.
+        match probe_index_phase(
+            &segments,
+            tag,
+            BATCH_UNITS,
+            MAX_ANCHOR_ATTEMPTS,
+            format,
+            k,
+            |seg, unit| read_unit(reader, seg, unit),
+        ) {
+            IndexProbe::Phase(phase) => {
+                phase_of_index.insert(tag, phase);
+            }
+            IndexProbe::WrongKey => {
+                // Reads SUCCEEDED but NEITHER parity decrypts clean under this index's
+                // key on any same-index segment: the key is wrong (or the sample isn't
+                // this index's real content). The map would be wrong — fail loud rather
+                // than emit a broken segment. (Preserves the genuine-wrong-key path.)
+                tracing::warn!(target: "freemkv::keysource", index = tag, "fmts: no clean phase under index key — refusing broken map");
+                return Err(crate::error::Error::FmtsKeyMissing.into());
+            }
+            IndexProbe::ReadFault => {
+                // EVERY probe read of EVERY same-index segment faulted (a transient
+                // live-drive read fault — e.g. NOT READY 2/04/3E, the common bad-sector
+                // sense on the BU40N). There is ZERO decrypt evidence, so this is NOT a
+                // wrong key: the index key is valid and already in hand. Do NOT abort a
+                // rip whose forensic keys are good. Leave this index's phase unresolved
+                // so the range-builder below defaults it to `Phase::All` — decrypt BOTH
+                // parities and let the demux drop the garbled alternate half (the
+                // coherent-stream outcome the module doc describes for whole-range key
+                // application). Degraded but complete; never a wrong-key abort.
+                tracing::warn!(target: "freemkv::keysource", index = tag, "fmts: index phase probe read-faulted on every segment — defaulting Phase::All (recoverable read fault, not a wrong key)");
             }
         }
-        let phase = match resolve_tie_phase(even, odd) {
-            Ok(p) => {
-                if even == odd {
-                    // BOTH halves decrypt clean (even == odd > 0): the sampled units
-                    // are source-zero padding (`is_clean_ts` is true for all-zero
-                    // content under ANY key), so the key is valid and the parity is
-                    // immaterial here — default Even (we decrypt one parity; padding
-                    // in the dropped parity is harmless). A padding-heavy sample must
-                    // NOT abort the rip.
-                    tracing::debug!(target: "freemkv::keysource", index = tag, even, odd, "fmts: padding tie — defaulting Even");
-                }
-                p
-            }
-            Err(e) => {
-                // NEITHER half decrypts clean under this index's key: the key is
-                // wrong or the sampled units aren't this index's real content. The
-                // map would be wrong — fail loud rather than emit a broken segment.
-                tracing::warn!(target: "freemkv::keysource", index = tag, even, odd, "fmts: no clean phase under index key — refusing broken map");
-                return Err(e);
-            }
-        };
-        phase_of_index.insert(tag, phase);
     }
 
     // ── Build the per-segment LBA ranges: each forensic segment → its tag's key
@@ -1069,6 +1070,90 @@ fn resolve_tie_phase(even_clean: usize, odd_clean: usize) -> io::Result<crate::d
             Err(crate::error::Error::FmtsKeyMissing.into())
         }
         std::cmp::Ordering::Equal => Ok(crate::decrypt::Phase::Even),
+    }
+}
+
+/// Outcome of probing ONE forensic index's decrypt phase (see [`probe_index_phase`]).
+/// The load-bearing distinction is between the last two: a genuine wrong key and a
+/// transient live-drive read fault both leave zero clean decrypts, but only the
+/// former is a real `FmtsKeyMissing` — the latter must NOT abort a rip whose index
+/// keys are valid.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexProbe {
+    /// A parity decrypted clean under this index's key (or a padding tie) → its phase.
+    Phase(crate::decrypt::Phase),
+    /// At least one unit was READ and decrypt-attempted, yet NEITHER parity came up
+    /// clean under this index's key on any same-index segment → genuine wrong key.
+    WrongKey,
+    /// EVERY probe read of every same-index segment faulted (`read` returned `None`
+    /// for all attempts) → zero decrypt evidence. A recoverable read fault, NOT a
+    /// wrong key: there is no data to conclude the key is bad.
+    ReadFault,
+}
+
+/// Probe one forensic index's decrypt phase by reading a representative segment's
+/// EVEN vs ODD aligned units and counting clean decrypts under `key`. Extracted
+/// from [`resolve_fmts_key_map`] so the read-fault-vs-wrong-key decision is
+/// directly testable without a full UDF/segment-table fixture.
+///
+/// Mirrors the anchor loop's read-fault tolerance: try up to `max_segments`
+/// same-index segments (rather than a single `.find`), skipping any whose reads all
+/// fault, and only conclude [`IndexProbe::WrongKey`] once a segment actually yielded
+/// decrypt attempts. If EVERY read of EVERY same-index segment faults, return
+/// [`IndexProbe::ReadFault`] — the caller then leaves the phase unresolved (defaults
+/// to `Phase::All`) instead of hard-aborting the rip. `read(seg, unit)` reads
+/// aligned unit `unit` of `seg`; `None` is a read fault.
+///
+/// Masking guard: [`IndexProbe::ReadFault`] is returned ONLY when not a single read
+/// succeeded, so a genuine wrong key (whose reads DO succeed) can never be masked as
+/// a read fault — any successful, non-clean decrypt yields [`IndexProbe::WrongKey`].
+fn probe_index_phase(
+    segments: &[crate::aacs::segment::Segment],
+    tag: u16,
+    batch_units: usize,
+    max_segments: usize,
+    format: ContentFormat,
+    key: &[u8; 16],
+    mut read: impl FnMut(&crate::aacs::segment::Segment, usize) -> Option<Vec<u8>>,
+) -> IndexProbe {
+    use crate::aacs::content::{aacs_unit_encrypted, decrypt_unit, is_clean};
+    let mut any_read = false;
+    for seg in segments
+        .iter()
+        .filter(|s| s.index == tag)
+        .take(max_segments)
+    {
+        let (mut even, mut odd) = (0usize, 0usize);
+        let mut seg_read = false;
+        for p in 0..batch_units {
+            for (phase_off, counter) in [(0usize, &mut even), (1usize, &mut odd)] {
+                if let Some(mut c) = read(seg, p * 2 + phase_off) {
+                    seg_read = true;
+                    if aacs_unit_encrypted(&c, format) {
+                        decrypt_unit(&mut c, key);
+                        if is_clean(&c, format) {
+                            *counter += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if !seg_read {
+            continue; // every read of this segment faulted — try the next same-index one
+        }
+        any_read = true;
+        // A clean parity (even != odd) or a padding tie (even == odd > 0) resolves the
+        // phase; even == odd == 0 is this segment's wrong-key signature, but a DIFFERENT
+        // same-index segment could still anchor (this one's sampled units may all be the
+        // alternate variant), so keep trying rather than concluding immediately.
+        if let Ok(phase) = resolve_tie_phase(even, odd) {
+            return IndexProbe::Phase(phase);
+        }
+    }
+    if any_read {
+        IndexProbe::WrongKey
+    } else {
+        IndexProbe::ReadFault
     }
 }
 
@@ -2424,5 +2509,329 @@ mod tests {
             "each extent filled independently"
         );
         assert_gapless(&exts, &forensic, &fills);
+    }
+
+    // ── Fix 1: FMTS phase-probe read-fault vs wrong-key distinction ─────────
+
+    /// Build a 6144-byte aligned unit of CLEAN MPEG-TS (sync `0x47` + non-zero
+    /// payload in packets 1.., packet 0 is the clear seed) then AACS-encrypt it
+    /// under `key`. Decrypting under the SAME key restores clean TS (`is_clean` →
+    /// true); decrypting under any other key yields garbage.
+    fn encrypted_clean_unit(key: &[u8; 16]) -> Vec<u8> {
+        use crate::aacs::content::ALIGNED_UNIT_LEN;
+        let mut u = vec![0u8; ALIGNED_UNIT_LEN];
+        let mut off = 0;
+        while off + 192 <= ALIGNED_UNIT_LEN {
+            u[off + 4] = 0x47; // TS sync at the BD-TS packet stride
+            for b in &mut u[off + 5..off + 192] {
+                *b = 0xAB; // non-zero payload so is_clean counts it as content
+            }
+            off += 192;
+        }
+        crate::aacs::content::aacs_encrypt_unit_for_test(&mut u, key);
+        u
+    }
+
+    fn a_segment(index: u16) -> crate::aacs::segment::Segment {
+        crate::aacs::segment::Segment {
+            index,
+            start_spn: 0,
+            end_spn: 100,
+        }
+    }
+
+    /// A probe whose EVERY read faults (`read` returns `None`) must classify as
+    /// [`IndexProbe::ReadFault`], NOT [`IndexProbe::WrongKey`] — a transient
+    /// live-drive read fault while probing must not be read as a missing key (which
+    /// the caller turns into a rip-aborting `FmtsKeyMissing`).
+    ///
+    /// Mutation: reverting to the no-fallback single-segment probe (i.e. treating
+    /// even==odd==0 as unconditional `FmtsKeyMissing` regardless of whether any read
+    /// succeeded) makes this return `WrongKey` → the assert fails.
+    #[test]
+    fn probe_index_phase_all_faults_is_read_fault_not_wrong_key() {
+        let segs = vec![a_segment(1)];
+        let key = [0x11u8; 16];
+        let got = super::probe_index_phase(
+            &segs,
+            1,
+            8,
+            16,
+            ContentFormat::BdTs,
+            &key,
+            |_seg, _unit| None, // every read faults
+        );
+        assert_eq!(
+            got,
+            super::IndexProbe::ReadFault,
+            "all-faulted probe is a recoverable read fault, never a wrong key"
+        );
+    }
+
+    /// Reads SUCCEED but decrypt to NEITHER clean parity (ciphertext under a key we
+    /// do NOT hold) → [`IndexProbe::WrongKey`]. This is the genuine-missing-key path
+    /// the caller MUST keep as a hard `FmtsKeyMissing`.
+    #[test]
+    fn probe_index_phase_reads_succeed_but_no_clean_phase_is_wrong_key() {
+        let segs = vec![a_segment(1)];
+        let cipher = encrypted_clean_unit(&[0xAAu8; 16]); // encrypted under key A
+        let probe_key = [0xBBu8; 16]; // ... probed under the WRONG key B
+        let got = super::probe_index_phase(
+            &segs,
+            1,
+            8,
+            16,
+            ContentFormat::BdTs,
+            &probe_key,
+            |_seg, _unit| Some(cipher.clone()),
+        );
+        assert_eq!(
+            got,
+            super::IndexProbe::WrongKey,
+            "reads that decrypt to no clean parity under the probed key are a wrong key"
+        );
+    }
+
+    /// Reads succeed and the EVEN units decrypt clean under this index's key while
+    /// the ODD units are (unencrypted) padding → [`IndexProbe::Phase`]`(Even)`.
+    #[test]
+    fn probe_index_phase_resolves_clean_even_phase() {
+        use crate::aacs::content::ALIGNED_UNIT_LEN;
+        use crate::decrypt::Phase;
+        let segs = vec![a_segment(1)];
+        let key = [0x33u8; 16];
+        let even_unit = encrypted_clean_unit(&key);
+        let got = super::probe_index_phase(
+            &segs,
+            1,
+            8,
+            16,
+            ContentFormat::BdTs,
+            &key,
+            // even unit index → clean ciphertext under `key`; odd → zero padding
+            // (aacs_unit_encrypted false → not counted).
+            |_seg, unit| {
+                if unit % 2 == 0 {
+                    Some(even_unit.clone())
+                } else {
+                    Some(vec![0u8; ALIGNED_UNIT_LEN])
+                }
+            },
+        );
+        assert_eq!(
+            got,
+            super::IndexProbe::Phase(Phase::Even),
+            "clean even units + padding odd → Even phase"
+        );
+    }
+
+    /// Read-fault TOLERANCE across segments: the first same-index segment faults on
+    /// every read, but a SECOND same-index segment decrypts clean → the probe must
+    /// fall through to it and resolve a phase (mirrors the anchor loop's multi-
+    /// segment retry). A single-`.find` probe would have stopped at the faulting
+    /// first segment.
+    #[test]
+    fn probe_index_phase_falls_through_faulting_segment_to_next() {
+        use crate::decrypt::Phase;
+        let mut faulting = a_segment(1);
+        faulting.start_spn = 1; // distinguish the two same-index segments
+        let good = a_segment(1);
+        let segs = vec![faulting, good];
+        let key = [0x44u8; 16];
+        let clean = encrypted_clean_unit(&key);
+        let got = super::probe_index_phase(
+            &segs,
+            1,
+            8,
+            16,
+            ContentFormat::BdTs,
+            &key,
+            // The faulting segment (start_spn == 1) reads None; the good one reads a
+            // clean even unit / padding odd.
+            |seg, unit| {
+                if seg.start_spn == 1 {
+                    None
+                } else if unit % 2 == 0 {
+                    Some(clean.clone())
+                } else {
+                    Some(vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN])
+                }
+            },
+        );
+        assert_eq!(
+            got,
+            super::IndexProbe::Phase(Phase::Even),
+            "a faulting first segment must not block resolving from the next same-index one"
+        );
+    }
+
+    // ── Fix 2: resolve_mux_key_map multi-CPS key selection (real ciphertext) ─
+
+    /// A SectorSource that tiles a fixed 6144-byte ciphertext unit across each
+    /// registered extent range (`(start_lba, end_lba, unit)`), zeros elsewhere.
+    /// Every 3-sector aligned-unit read inside a range returns the same ciphertext,
+    /// so `sample_units` collects real encrypted content for `pick`/fetch to run on.
+    /// Low LBAs are zero, so `udf::read_filesystem` fails → the FMTS branch returns
+    /// `Ok(None)` and the multi-CPS path is exercised.
+    struct CipherSource {
+        units: Vec<(u32, u32, Vec<u8>)>,
+    }
+    impl SectorSource for CipherSource {
+        fn capacity_sectors(&self) -> u32 {
+            1_000_000
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let want = count as usize * 2048;
+            buf[..want].fill(0);
+            for s in 0..count as usize {
+                let cur = lba + s as u32;
+                if let Some((start, _end, unit)) =
+                    self.units.iter().find(|(a, b, _)| cur >= *a && cur < *b)
+                {
+                    // 3 sectors per aligned unit; tile the ciphertext by sector.
+                    let within = ((cur - start) % 3) as usize;
+                    let src = &unit[within * 2048..within * 2048 + 2048];
+                    buf[s * 2048..s * 2048 + 2048].copy_from_slice(src);
+                }
+            }
+            Ok(want)
+        }
+    }
+
+    fn multi_cps_title(start_lba: u32, sectors: u32) -> DiscTitle {
+        let mut t = DiscTitle::empty();
+        t.extents = vec![Extent {
+            start_lba,
+            sector_count: sectors,
+        }];
+        t
+    }
+
+    /// `pick()` must select the pool index of the key that actually opens the
+    /// extent's real ciphertext — index 2 here, NOT 0. Feeds units encrypted under
+    /// the third pool key through the live multi-CPS path.
+    ///
+    /// Mutation: `pick` hard-returning `Some(0)` keys the extent to 0 → this assert
+    /// (Some(2)) fails.
+    #[test]
+    fn resolve_mux_key_map_multi_cps_pick_selects_correct_index() {
+        let key_a = [0x01u8; 16];
+        let key_b = [0x02u8; 16];
+        let key_c = [0x03u8; 16];
+        let unit = encrypted_clean_unit(&key_c); // extent content opens under C (idx 2)
+        let start = 1000u32;
+        let sectors = 30u32; // 10 aligned units
+        let mut reader = CipherSource {
+            units: vec![(start, start + sectors, unit)],
+        };
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b), (2, key_c)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let title = multi_cps_title(start, sectors);
+        let map = super::resolve_mux_key_map(
+            &mut reader,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+        )
+        .expect("multi-CPS resolve succeeds when a held key opens the extent");
+        assert_eq!(
+            map.key_idx_for(start),
+            Some(2),
+            "the extent must be keyed to the pool index whose key opens its ciphertext"
+        );
+    }
+
+    /// Fail-loud: a sample that decrypts clean under NO held key and NO fetched key
+    /// (fetch = None) must surface [`Error::DecryptFailed`], never silently key the
+    /// extent to a neighbour's (wrong) index.
+    ///
+    /// Mutation: dropping the `None => Err(DecryptFailed)` guard (e.g. falling back
+    /// to `last_idx`) returns `Ok` → this `expect_err` fails.
+    #[test]
+    fn resolve_mux_key_map_multi_cps_fail_loud_on_absent_key() {
+        let key_a = [0x01u8; 16];
+        let key_b = [0x02u8; 16];
+        let key_x = [0x09u8; 16]; // NOT in the pool, NOT fetchable (fetch None)
+        let unit = encrypted_clean_unit(&key_x);
+        let start = 1000u32;
+        let sectors = 30u32;
+        let mut reader = CipherSource {
+            units: vec![(start, start + sectors, unit)],
+        };
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let title = multi_cps_title(start, sectors);
+        let err = super::resolve_mux_key_map(
+            &mut reader,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+        )
+        .expect_err("an extent no held/fetched key opens must fail loud, not mis-key");
+        let expected = std::io::Error::from(crate::error::Error::DecryptFailed).to_string();
+        assert_eq!(err.to_string(), expected, "expected DecryptFailed");
+    }
+
+    /// KeyFetch cold path: the pool is missing the extent's key, but the injected
+    /// `KeyFetch::unit_keys` returns it from the failing samples → the extent
+    /// resolves to the newly-appended pool index (2) and the map succeeds. Proves
+    /// the on-miss fetch+re-pick branch runs end to end.
+    #[test]
+    fn resolve_mux_key_map_multi_cps_fetch_recovers_missing_key() {
+        let key_a = [0x01u8; 16];
+        let key_b = [0x02u8; 16];
+        let key_x = [0x09u8; 16]; // absent from the pool, supplied by fetch
+        let unit = encrypted_clean_unit(&key_x);
+        let start = 1000u32;
+        let sectors = 30u32;
+        let mut reader = CipherSource {
+            units: vec![(start, start + sectors, unit)],
+        };
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let title = multi_cps_title(start, sectors);
+        // A unit-only KeyFetch that hands back key_x for any non-empty sample batch.
+        let fetch = crate::sector::KeyFetch::unit_only(std::sync::Arc::new(
+            move |samples: &[Vec<u8>]| {
+                if samples.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![key_x]
+                }
+            },
+        ));
+        let map = super::resolve_mux_key_map(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+        )
+        .expect("the fetched key recovers the extent");
+        assert_eq!(
+            map.key_idx_for(start),
+            Some(2),
+            "the fetched key is appended at pool index 2 and keys the extent"
+        );
     }
 }
