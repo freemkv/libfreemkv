@@ -443,24 +443,6 @@ pub fn mux_stream(
     )
 }
 
-/// Translate libfreemkv's reader-side [`Event`]s into [`MuxEvents`] calls,
-/// producing the `'static` [`EventFn`](crate::sector::prefetched::EventFn) the
-/// file highway ([`build_iso_pipeline`]) and the live
-/// [`DiscStream`](crate::mux::DiscStream) constructors require. Cloning the
-/// `Arc` into the returned closure is precisely what lets a borrowed-lifetime
-/// consumer's events reach the highway's producer thread — a `&dyn MuxEvents`
-/// borrow cannot satisfy the `'static` bound.
-///
-/// Mapping (real [`EventKind`] variants):
-/// - `BytesRead { bytes, total }`   → [`MuxEvents::on_read_progress`] (read-side;
-///   the file highway's only reader event — `total` is the extents' byte total)
-/// - `SectorSkipped { sector }`     → [`MuxEvents::on_sector_skipped`] (live only)
-/// - `BatchSizeChanged { new_size, reason }` → [`MuxEvents::on_batch_size_changed`]
-///   (live only)
-/// - `ReadError { sector, .. }`     → [`MuxEvents::on_read_error`]
-///
-/// Sector numbers are the library's `u64`; the `MuxEvents` LBA hooks take `u32`
-/// (the disc's LBA space), so they are narrowed with `as u32`.
 /// Decrypt keys for the live `Session` mux of `disc`.
 ///
 /// A DVD is handed [`DecryptKeys::None`] so [`DiscStream::new`](crate::mux::DiscStream)
@@ -530,6 +512,24 @@ fn resolve_inline_base_map(
     Ok(Some(Arc::new(map)))
 }
 
+/// Translate libfreemkv's reader-side [`Event`]s into [`MuxEvents`] calls,
+/// producing the `'static` [`EventFn`](crate::sector::prefetched::EventFn) the
+/// file highway ([`build_iso_pipeline`]) and the live
+/// [`DiscStream`](crate::mux::DiscStream) constructors require. Cloning the
+/// `Arc` into the returned closure is precisely what lets a borrowed-lifetime
+/// consumer's events reach the highway's producer thread — a `&dyn MuxEvents`
+/// borrow cannot satisfy the `'static` bound.
+///
+/// Mapping (real [`EventKind`] variants):
+/// - `BytesRead { bytes, total }`   → [`MuxEvents::on_read_progress`] (read-side;
+///   the file highway's only reader event — `total` is the extents' byte total)
+/// - `SectorSkipped { sector }`     → [`MuxEvents::on_sector_skipped`] (live only)
+/// - `BatchSizeChanged { new_size, reason }` → [`MuxEvents::on_batch_size_changed`]
+///   (live only)
+/// - `ReadError { sector, .. }`     → [`MuxEvents::on_read_error`]
+///
+/// Sector numbers are the library's `u64`; the `MuxEvents` LBA hooks take `u32`
+/// (the disc's LBA space), so they are narrowed with `as u32`.
 fn reader_event_fn(events: Arc<dyn MuxEvents>) -> crate::sector::prefetched::EventFn {
     Box::new(move |e: Event| match e.kind {
         EventKind::BytesRead { bytes, total } => events.on_read_progress(bytes, total),
