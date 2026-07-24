@@ -344,6 +344,7 @@ pub fn mux_stream(
                 session.key_fetch(),
                 format,
                 opts.raw,
+                Some(halt),
             )?;
             let mut stream = crate::mux::DiscStream::new(
                 reader,
@@ -395,6 +396,7 @@ pub fn mux_stream(
                     None,
                     format,
                     opts.raw,
+                    Some(halt),
                 )?,
             };
             // INLINE `DiscStream` — the same constructor the `Session` arm uses,
@@ -514,11 +516,17 @@ fn resolve_inline_base_map(
     fetch: Option<&KeyFetch>,
     format: crate::disc::ContentFormat,
     raw: bool,
+    halt: Option<&crate::halt::Halt>,
 ) -> std::io::Result<Option<Arc<AacsKeyMap>>> {
     if raw || !matches!(keys, DecryptKeys::Aacs { .. }) {
         return Ok(None);
     }
-    let map = resolve_mux_key_map(reader, title, keys, fetch, format)?;
+    // Thread the driver's cancel token into the live-drive key resolution: the
+    // resolve chain samples ciphertext off the LIVE reader (the FMTS probe can do
+    // hundreds of reads, each able to stall to the SCSI recovery timeout), so an
+    // operator `/api/stop` mid-resolution must be honored here — not only once the
+    // read loop starts.
+    let map = resolve_mux_key_map(reader, title, keys, fetch, format, halt)?;
     Ok(Some(Arc::new(map)))
 }
 
@@ -1547,6 +1555,149 @@ mod tests {
         );
     }
 
+    /// Build a synthetic single-CPS AACS `Disc` carrying `unit_key` and one
+    /// title whose sole extent is the encrypted unit at LBA 0..3 — the disc a
+    /// `MuxInput::Session` mux scans off a live drive, minus the hardware.
+    fn aacs_session_disc(title: DiscTitle, unit_key: [u8; 16]) -> crate::disc::Disc {
+        crate::disc::Disc {
+            volume_id: "TEST".into(),
+            meta_title: None,
+            format: crate::DiscFormat::Uhd,
+            capacity_sectors: 0,
+            capacity_bytes: 0,
+            layers: 1,
+            titles: vec![title],
+            region: crate::disc::DiscRegion::Free,
+            aacs: Some(crate::disc::AacsState {
+                version: crate::aacs::mkb::AACS_MAJOR_UHD,
+                bus_encryption: false,
+                mkb_version: None,
+                disc_hash: "0xabc".into(),
+                key_source: crate::disc::KeyOrigin::KeyDb,
+                vuk: None,
+                unit_keys: vec![(0, unit_key)],
+                read_data_key: None,
+                volume_id: [0u8; 16],
+                uk_ro: Vec::new(),
+                mkb: Vec::new(),
+            }),
+            css: None,
+            encrypted: true,
+            aacs_error: None,
+            css_error: None,
+            content_format: crate::ContentFormat::BdTs,
+        }
+    }
+
+    /// END-TO-END decrypt on the live single-pass `MuxInput::Session` path — the
+    /// exact shape of `freemkv rip disc://…mkv`. The `Session` arm runs the SAME
+    /// sequence as `Live` (take_reader → resolve_inline_base_map → DiscStream →
+    /// with_key_map), but until now had NO end-to-end coverage because a real
+    /// `DiscSession` needs a live `Drive`. Using the `#[cfg(test)]`
+    /// `from_parts_for_test` constructor, a genuinely-AACS-encrypted unit muxed
+    /// through the `Session` arm must resolve+install the base key map itself and
+    /// DECRYPT to a valid audio PES.
+    ///
+    /// Mutation: dropping `stream = stream.with_key_map(map)` (or the
+    /// resolve_inline_base_map call) in the `Session` arm leaves the reader
+    /// mapless → the content batch cannot decrypt → the mux aborts (`Err`) and
+    /// `out.completed` is never reached.
+    #[test]
+    fn mux_input_session_aacs_without_caller_map_resolves_and_decrypts() {
+        use crate::disc::Extent;
+        use crate::session::DiscSession;
+
+        let unit_key = [0x5Au8; 16];
+        let reader = Box::new(AacsUnitReader {
+            unit: encrypted_audio_unit(&unit_key),
+            capacity: 2048,
+        });
+        let mut title = aac_audio_title(0x1100);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 3,
+        }];
+        let disc = aacs_session_disc(title, unit_key);
+        // No caller key_fetch: a single-CPS disc resolves its base map with the
+        // banked unit key alone (the FMTS/multi-CPS fetch path is not exercised).
+        let mut session = DiscSession::from_parts_for_test(disc, Some(reader), None);
+
+        let opts = MuxOptions {
+            skip_errors: false, // a DecryptFailed must PROPAGATE, not zero-fill
+            batch_sectors: 3,   // one aligned unit per read
+            raw: false,
+            send_deadline: Some(Duration::from_secs(60)),
+        };
+        let halt = Halt::new();
+        let out = mux_stream(
+            MuxInput::Session {
+                session: &mut session,
+                title_index: 0,
+            },
+            "null://",
+            &opts,
+            &halt,
+            Arc::new(NoopEvents),
+        )
+        .expect(
+            "a plain AACS Session mux must resolve+install its base key map and DECRYPT \
+             (no map → the content batch fails to decrypt and the mux aborts)",
+        );
+        assert!(
+            out.completed,
+            "the decrypted audio PES drained and finalised — proves the unit decrypted"
+        );
+        assert!(
+            out.bytes_written > 0,
+            "decrypted payload bytes reached the sink"
+        );
+    }
+
+    /// A `MuxInput::Session` whose reader was never staged (`take_reader()` →
+    /// `None`) must surface a clean typed error, NOT panic — the boundary-audit
+    /// Q2 contract. Guards the `ok_or_else(|| Error::DeviceNotReady …)` in the
+    /// `Session` arm against a regression to `.expect()`/`.unwrap()`.
+    #[test]
+    fn mux_input_session_missing_reader_is_clean_error_not_panic() {
+        use crate::disc::Extent;
+        use crate::session::DiscSession;
+
+        let unit_key = [0x5Au8; 16];
+        let mut title = aac_audio_title(0x1100);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 3,
+        }];
+        let disc = aacs_session_disc(title, unit_key);
+        // reader: None — never staged.
+        let mut session = DiscSession::from_parts_for_test(disc, None, None);
+
+        let opts = MuxOptions {
+            skip_errors: false,
+            batch_sectors: 3,
+            raw: false,
+            send_deadline: Some(Duration::from_secs(60)),
+        };
+        let halt = Halt::new();
+        let err = mux_stream(
+            MuxInput::Session {
+                session: &mut session,
+                title_index: 0,
+            },
+            "null://",
+            &opts,
+            &halt,
+            Arc::new(NoopEvents),
+        )
+        .expect_err("a missing staged reader must be a clean error, not a panic");
+        // The device-name-carrying DeviceNotReady (code E4xxx) round-trips through
+        // io::Error; assert it is NOT a decrypt/other-shaped failure.
+        assert!(
+            err.to_string().starts_with('E'),
+            "expected a typed libfreemkv error (E<code>…), got: {err}"
+        );
+    }
+
     /// The shared `resolve_inline_base_map` helper's gating: an AACS key set
     /// yields a map (Some); CSS/clear/None and `raw` yield None (CSS self-cracks
     /// in `DiscStream::new`; raw is ciphertext passthrough). Guards the Session
@@ -1580,6 +1731,7 @@ mod tests {
             None,
             crate::disc::ContentFormat::BdTs,
             false,
+            None,
         )
         .expect("resolve must not error for a single-CPS AACS disc");
         assert!(map.is_some(), "AACS non-raw must resolve a base map");
@@ -1598,6 +1750,7 @@ mod tests {
             None,
             crate::disc::ContentFormat::BdTs,
             true,
+            None,
         )
         .expect("raw resolve is a no-op");
         assert!(map_raw.is_none(), "raw must NOT resolve a map");
@@ -1612,6 +1765,7 @@ mod tests {
             None,
             crate::disc::ContentFormat::MpegPs,
             false,
+            None,
         )
         .expect("clear/CSS resolve is a no-op");
         assert!(map_none.is_none(), "CSS/clear must NOT resolve an AACS map");

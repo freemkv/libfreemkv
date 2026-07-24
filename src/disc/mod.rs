@@ -2401,11 +2401,18 @@ impl Disc {
         reader: &mut dyn SectorSource,
         keys: &mut crate::decrypt::DecryptKeys,
         fetch: Option<&crate::sector::KeyFetch>,
+        halt: Option<&crate::halt::Halt>,
     ) -> Result<crate::decrypt::AacsKeyMap> {
         let mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)> = Vec::new();
         for title in &self.titles {
-            let map =
-                crate::mux::resolve_mux_key_map(reader, title, keys, fetch, self.content_format)?;
+            let map = crate::mux::resolve_mux_key_map(
+                reader,
+                title,
+                keys,
+                fetch,
+                self.content_format,
+                halt,
+            )?;
             ranges.extend_from_slice(map.ranges());
         }
         Ok(crate::decrypt::AacsKeyMap::from_ranges_phased(
@@ -3206,10 +3213,12 @@ impl Disc {
         // separate content gate is needed. CSS keeps the content-gated
         // self-descramble path (the map path is AACS-only).
         let key_map = if opts.decrypt && decrypt_is_aacs {
+            let halt = opts.halt.clone().map(crate::halt::Halt::from_arc);
             Some(std::sync::Arc::new(self.resolve_content_key_map(
                 reader,
                 &mut keys,
                 opts.key_fetch.as_ref(),
+                halt.as_ref(),
             )?))
         } else {
             None
