@@ -17,8 +17,8 @@ use crate::disc::{Disc, DiscId, DriveCredentials, ScanOptions};
 use crate::drive::{Drive, find_drive};
 use crate::error::{Error, Result};
 use crate::keysource::KeySource;
-use crate::sector::SectorSource;
-use std::path::PathBuf;
+use crate::sector::{FileSectorSource, SectorSource};
+use std::path::{Path, PathBuf};
 
 /// Which optical device a [`DiscSession`] should open.
 pub enum DeviceTarget {
@@ -188,6 +188,29 @@ impl DiscSession {
     pub fn into_reader(self) -> Option<Box<dyn SectorSource>> {
         self.reader
     }
+}
+
+/// Scan an ISO image's structure from a file path, returning the scanned
+/// [`Disc`] together with a reusable [`SectorSource`] over the same file.
+///
+/// This is the file-backed counterpart to [`DiscSession::scan`]: it is the one
+/// place that opens a [`FileSectorSource`], reads its capacity, and runs
+/// [`Disc::scan_image`], so consumers (CLI, autorip) stop hand-rolling that
+/// triple and stop constructing the low-level reader themselves. No SCSI, no
+/// handshake, no key resolution — AACS resolution during the scan uses only
+/// whatever `opts` already carries (mirroring how `Disc::scan_image` forwards
+/// `ScanOptions`).
+///
+/// The returned reader is a fresh handle positioned at the start of the image;
+/// callers that need to sample ciphertext (key resolution) or feed a mux can
+/// reuse it directly rather than re-opening the file. `Disc::scan_image` reads
+/// only through the same reader, and all reads are LBA-addressed, so the
+/// handle is fully reusable afterward.
+pub fn scan_iso(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorSource>)> {
+    let mut reader = FileSectorSource::open(path)?;
+    let capacity = reader.capacity_sectors();
+    let disc = Disc::scan_image(&mut reader, capacity, &opts)?;
+    Ok((disc, Box::new(reader)))
 }
 
 #[cfg(test)]
