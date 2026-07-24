@@ -31,7 +31,7 @@ use std::time::Duration;
 use crate::decrypt::{AacsKeyMap, DecryptKeys};
 use crate::disc::DiscTitle;
 use crate::error::Error;
-use crate::event::BatchSizeReason;
+use crate::event::{BatchSizeReason, Event, EventKind};
 use crate::halt::Halt;
 use crate::io::pipeline::{Flow, Pipeline, Sink, WRITE_PIPELINE_DEPTH};
 use crate::pes::{CountingStream, PesFrame, Stream};
@@ -102,17 +102,18 @@ pub struct MuxOptions {
 
 /// Progress / event callbacks the consumer implements (CLI `CliProgress`,
 /// autorip's stream event handler). Every method has a no-op default so a
-/// consumer overrides only what it renders. `Send + Sync` so a future
-/// reader-side wiring can share it across the highway's threads.
+/// consumer overrides only what it renders.
 ///
-/// The driver fires [`Self::on_output_opened`] and [`Self::on_progress`] from
-/// the driving thread. The reader-side events
+/// `Send + Sync + 'static` because [`mux_stream`] takes the handle as an
+/// [`Arc<dyn MuxEvents>`] and clones it into the constructors' `'static`
+/// [`EventFn`] (via [`reader_event_fn`]) so the reader-side events fire from the
+/// highway's producer thread / the live `DiscStream`'s read loop. The driver
+/// fires [`Self::on_output_opened`] and the write-side [`Self::on_progress`]
+/// from the driving thread; the reader-side events
 /// ([`Self::on_sector_skipped`] / [`Self::on_batch_size_changed`] /
-/// [`Self::on_read_error`]) are declared here for the consumer to consume once
-/// the constructor `event_fn` is wired (steps 4b/4c) — the file highway's
-/// `EventFn` is `'static`, so it can only carry an owned (`Arc`) events handle,
-/// not the `&dyn` borrow this driver takes.
-pub trait MuxEvents: Send + Sync {
+/// [`Self::on_read_error`], plus a read-side [`Self::on_progress`]) are fired
+/// by that cloned `EventFn`.
+pub trait MuxEvents: Send + Sync + 'static {
     /// Fired once, immediately after the output sink is created.
     fn on_output_opened(&self, _title: &DiscTitle) {}
     /// Fired periodically during the frame pump with the running written-byte
@@ -173,13 +174,15 @@ pub fn mux_stream(
     dest_url: &str,
     opts: &MuxOptions,
     halt: &Halt,
-    events: &dyn MuxEvents,
+    events: std::sync::Arc<dyn MuxEvents>,
 ) -> std::io::Result<MuxOutcome> {
     // Construct the source stream. The file/ISO path calls the untouched
     // `build_iso_pipeline` highway (zero added copies); the live path builds a
-    // `DiscStream`; a URL source goes through `input()`. `event_fn` is `None`
-    // here — the highway's `EventFn` is `'static` and cannot carry the `&dyn`
-    // events borrow; reader-side event forwarding is wired in 4b/4c.
+    // `DiscStream`; a URL source goes through `input()`. The reader-side
+    // constructors take a `'static` `EventFn`; we clone the `Arc<dyn MuxEvents>`
+    // into one (`reader_event_fn`) so the highway's producer thread — and the
+    // live `DiscStream`'s read loop — forward `BytesRead`/`SectorSkipped`/
+    // `BatchSizeChanged`/`ReadError` back to the consumer's handle.
     let (stream, playlist_name): (Box<dyn Stream>, Option<String>) = match input_src {
         MuxInput::Url { url, opts: in_opts } => (input(url, &in_opts)?, None),
         MuxInput::Iso {
@@ -199,7 +202,7 @@ pub fn mux_stream(
                 format,
                 opts.raw,
                 Some(halt.clone()),
-                None,
+                Some(reader_event_fn(events.clone())),
                 key_fetch,
             )?;
             (Box::new(stream), None)
@@ -247,11 +250,51 @@ pub fn mux_stream(
                 stream.set_raw();
             }
             stream.skip_errors = opts.skip_errors;
+            // Live path: the `DiscStream` emits the full reader-side vocabulary
+            // (`SectorSkipped` on skip-mode zero-fill, `BatchSizeChanged` on the
+            // adaptive sizer, `BytesRead` progress) — forward them all.
+            stream.on_event(reader_event_fn(events.clone()));
             (Box::new(stream), Some(playlist))
         }
     };
 
-    drive_mux(stream, dest_url, halt, events, playlist_name.as_deref())
+    drive_mux(
+        stream,
+        dest_url,
+        halt,
+        events.as_ref(),
+        playlist_name.as_deref(),
+    )
+}
+
+/// Translate libfreemkv's reader-side [`Event`]s into [`MuxEvents`] calls,
+/// producing the `'static` [`EventFn`](crate::sector::prefetched::EventFn) the
+/// file highway ([`build_iso_pipeline`]) and the live
+/// [`DiscStream`](crate::mux::DiscStream) constructors require. Cloning the
+/// `Arc` into the returned closure is precisely what lets a borrowed-lifetime
+/// consumer's events reach the highway's producer thread — a `&dyn MuxEvents`
+/// borrow cannot satisfy the `'static` bound.
+///
+/// Mapping (real [`EventKind`] variants):
+/// - `BytesRead { bytes, total }`   → [`MuxEvents::on_progress`] (read-side; the
+///   file highway's only reader event — `total` is the extents' byte total)
+/// - `SectorSkipped { sector }`     → [`MuxEvents::on_sector_skipped`] (live only)
+/// - `BatchSizeChanged { new_size, reason }` → [`MuxEvents::on_batch_size_changed`]
+///   (live only)
+/// - `ReadError { sector, .. }`     → [`MuxEvents::on_read_error`]
+///
+/// Sector numbers are the library's `u64`; the `MuxEvents` LBA hooks take `u32`
+/// (the disc's LBA space), so they are narrowed with `as u32`.
+fn reader_event_fn(events: Arc<dyn MuxEvents>) -> crate::sector::prefetched::EventFn {
+    Box::new(move |e: Event| match e.kind {
+        EventKind::BytesRead { bytes, total } => events.on_progress(bytes, total),
+        EventKind::SectorSkipped { sector } => events.on_sector_skipped(sector as u32),
+        EventKind::BatchSizeChanged { new_size, reason } => {
+            events.on_batch_size_changed(new_size, reason)
+        }
+        EventKind::ReadError { sector, .. } => events.on_read_error(sector as u32),
+        _ => {}
+    })
 }
 
 /// The reader-agnostic driver body: headers → gate → sink → pump → finish.
@@ -665,5 +708,218 @@ mod tests {
         assert!(spy.opened.load(Ordering::SeqCst));
         assert_eq!(out.bytes_written, 10 * 100, "10 frames × 100 bytes payload");
         assert_eq!(out.streams, 2);
+    }
+
+    // ── reader-side event forwarding through the Arc ────────────────────────
+
+    /// A [`MuxEvents`] backed by atomics that records every callback so a test
+    /// can assert reader-side events actually flowed through the `Arc` clone.
+    struct CountingEvents {
+        opened: AtomicBool,
+        progress_calls: AtomicU64,
+        /// Set once `on_progress` is called with a `total` equal to the ISO
+        /// extents' byte total — the fingerprint of the *read-side* `BytesRead`
+        /// event (the write-side `on_progress` carries the title's `size_bytes`,
+        /// a different number), so it isolates the `EventFn` translation.
+        saw_read_total: AtomicBool,
+        read_total: u64,
+        skipped: AtomicU64,
+        batch_changed: AtomicU64,
+        read_errors: AtomicU64,
+    }
+    impl CountingEvents {
+        fn new(read_total: u64) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(CountingEvents {
+                opened: AtomicBool::new(false),
+                progress_calls: AtomicU64::new(0),
+                saw_read_total: AtomicBool::new(false),
+                read_total,
+                skipped: AtomicU64::new(0),
+                batch_changed: AtomicU64::new(0),
+                read_errors: AtomicU64::new(0),
+            })
+        }
+    }
+    impl MuxEvents for CountingEvents {
+        fn on_output_opened(&self, _title: &DiscTitle) {
+            self.opened.store(true, Ordering::SeqCst);
+        }
+        fn on_progress(&self, _bytes_written: u64, bytes_total: u64) {
+            self.progress_calls.fetch_add(1, Ordering::SeqCst);
+            if bytes_total == self.read_total {
+                self.saw_read_total.store(true, Ordering::SeqCst);
+            }
+        }
+        fn on_sector_skipped(&self, _lba: u32) {
+            self.skipped.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_batch_size_changed(&self, _batch: u16, _reason: BatchSizeReason) {
+            self.batch_changed.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_read_error(&self, _lba: u32) {
+            self.read_errors.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The `reader_event_fn` translation maps every real [`EventKind`] the
+    /// reader emits onto the matching [`MuxEvents`] method, dispatched through
+    /// the cloned `Arc`. Mutation: dropping any match arm (or narrowing the
+    /// `Arc` clone so nothing fires) leaves that counter at 0 and fails here.
+    #[test]
+    fn reader_event_fn_translates_every_variant() {
+        let events = CountingEvents::new(6144);
+        let f = reader_event_fn(events.clone());
+        f(Event {
+            kind: EventKind::BytesRead {
+                bytes: 4096,
+                total: 6144,
+            },
+        });
+        f(Event {
+            kind: EventKind::SectorSkipped { sector: 42 },
+        });
+        f(Event {
+            kind: EventKind::BatchSizeChanged {
+                new_size: 8,
+                reason: BatchSizeReason::Shrunk,
+            },
+        });
+        f(Event {
+            kind: EventKind::ReadError {
+                sector: 7,
+                error: Error::NoStreams,
+            },
+        });
+        assert_eq!(
+            events.progress_calls.load(Ordering::SeqCst),
+            1,
+            "BytesRead → on_progress"
+        );
+        assert!(
+            events.saw_read_total.load(Ordering::SeqCst),
+            "read-side total forwarded"
+        );
+        assert_eq!(
+            events.skipped.load(Ordering::SeqCst),
+            1,
+            "SectorSkipped → on_sector_skipped"
+        );
+        assert_eq!(
+            events.batch_changed.load(Ordering::SeqCst),
+            1,
+            "BatchSizeChanged → on_batch_size_changed"
+        );
+        assert_eq!(
+            events.read_errors.load(Ordering::SeqCst),
+            1,
+            "ReadError → on_read_error"
+        );
+    }
+
+    /// A 192-byte BD-TS packet carrying `payload` as a payload-only TS packet on
+    /// `pid` (4-byte TP_extra_header + 188-byte TS packet, AFC=payload-only).
+    fn bdts_data_packet(pid: u16, pusi: bool, payload: &[u8]) -> [u8; 192] {
+        let mut pkt = [0u8; 192];
+        pkt[4] = 0x47;
+        pkt[5] = ((pid >> 8) as u8) & 0x1F;
+        if pusi {
+            pkt[5] |= 0x40;
+        }
+        pkt[6] = (pid & 0xFF) as u8;
+        pkt[7] = 0x10;
+        let n = payload.len().min(184);
+        pkt[8..8 + n].copy_from_slice(&payload[..n]);
+        pkt
+    }
+
+    /// A complete audio PES (stream_id 0xC0, no PTS) carrying `es`.
+    fn audio_pes(es: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00, 0x01, 0xC0];
+        let len = (3 + es.len()) as u16;
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(&[0x80, 0x00, 0x00]);
+        v.extend_from_slice(es);
+        v
+    }
+
+    fn aac_audio_title(pid: u16) -> DiscTitle {
+        use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate, Stream};
+        let mut t = DiscTitle::empty();
+        t.streams.push(Stream::Audio(AudioStream {
+            pid,
+            codec: Codec::Aac,
+            channels: AudioChannels::Stereo,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        }));
+        t
+    }
+
+    /// End-to-end through `mux_stream` on the ISO path: a real 3-sector ISO on
+    /// disk (one BD-TS audio PES, one AACS unit) muxed to `null://`. Asserts the
+    /// reader-side `BytesRead` progress AND `on_output_opened` reach the
+    /// `Arc<dyn MuxEvents>` — i.e. the constructor `EventFn` really carries the
+    /// consumer's events across the highway's producer thread.
+    ///
+    /// Mutation: passing `None` (instead of `Some(reader_event_fn(...))`) to
+    /// `build_iso_pipeline` in the ISO arm leaves `saw_read_total` false — the
+    /// write-side `on_progress` carries `size_bytes` (0 here), never the 6144
+    /// extents total — and this test fails.
+    #[test]
+    fn mux_stream_iso_forwards_reader_progress_through_arc() {
+        let es = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
+        let pkt = bdts_data_packet(0x1100, true, &audio_pes(&es));
+        let mut data = vec![0u8; 3 * 2048]; // 3 sectors = one AACS unit = 6144 bytes
+        data[..192].copy_from_slice(&pkt);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let iso_path = dir.path().join("clip.iso");
+        std::fs::write(&iso_path, &data).expect("write iso");
+
+        let mut title = aac_audio_title(0x1100);
+        title.extents = vec![crate::disc::Extent {
+            start_lba: 0,
+            sector_count: 3,
+        }];
+
+        let events = CountingEvents::new(3 * 2048);
+        let opts = MuxOptions {
+            skip_errors: false,
+            batch_sectors: 8192,
+            raw: false,
+        };
+        let halt = Halt::new();
+        let out = mux_stream(
+            MuxInput::Iso {
+                path: &iso_path,
+                title,
+                format: crate::disc::ContentFormat::BdTs,
+                keys: DecryptKeys::None,
+                key_map: None,
+                key_fetch: None,
+            },
+            "null://",
+            &opts,
+            &halt,
+            events.clone(),
+        )
+        .expect("audio-only ISO muxes to null sink");
+
+        assert!(out.completed, "the clip drained and finalised");
+        assert!(
+            events.saw_read_total.load(Ordering::SeqCst),
+            "the reader-side BytesRead (total=6144) reached the Arc via the EventFn"
+        );
+        assert!(
+            events.opened.load(Ordering::SeqCst),
+            "on_output_opened fired through the Arc"
+        );
+        assert!(
+            events.progress_calls.load(Ordering::SeqCst) > 0,
+            "at least one on_progress call observed"
+        );
     }
 }
