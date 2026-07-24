@@ -158,8 +158,9 @@ pub struct Mp4FitReport {
 }
 
 /// Compute the fit plan without opening a file. Video: the first primary
-/// HEVC/H.264 track. Audio: every AC-3 / E-AC-3 track. Everything else is
-/// skipped with a reason.
+/// HEVC/H.264 track. Audio: every track `audio::audio_fits` carries — the Dolby
+/// family (AC-3 / E-AC-3) and DTS (core / DTS-HD HRA / DTS-HD MA). Everything
+/// else is skipped with a reason.
 pub fn fit_report(title: &DiscTitle) -> Mp4FitReport {
     let mut included = Vec::new();
     let mut skipped = Vec::new();

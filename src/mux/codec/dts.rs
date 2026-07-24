@@ -688,7 +688,14 @@ fn dts_core_duration_ns(data: &[u8]) -> u64 {
 /// `DTS_AMODE_COUNT`; `lfe_present == DTS_LFE_FLAG_INVALID` is rejected.
 const DTS_PCMBLOCK_SAMPLES: u32 = 32;
 const DTS_SUBBAND_SAMPLES: u32 = 8;
-const DTS_AMODE_COUNT: u32 = 10;
+/// Number of LEGAL `AMODE` (channel-arrangement) codes. The 6-bit AMODE field
+/// (ETSI TS 102 114 §5.3.1) has 16 defined channel arrangements, codes 0-15;
+/// only 16-63 are reserved/user-defined and undecodable. ffmpeg's
+/// `ff_dca_channels[16] = {1,2,2,2,2,3,3,4,4,5,6,6,6,7,8,8}` confirms all 16 are
+/// decodable — codes 10-15 are the 6/7/8-channel layouts. A frame is dropped
+/// only when `audio_mode >= DTS_AMODE_COUNT` (i.e. a truly reserved 16-63 code);
+/// dropping a legal 10-15 multichannel core would silence recoverable audio.
+const DTS_AMODE_COUNT: u32 = 16;
 const DTS_LFE_FLAG_INVALID: u32 = 3;
 
 /// Sample rate (Hz) per core `SFREQ` code (ETSI TS 102 114 Table 6-4); a `0`
@@ -1946,8 +1953,11 @@ mod tests {
         d[5] = (d[5] & 0x03) | (14u8 << 2);
         assert_eq!(core_header_drop_reason(&d), Some(DropReason::PcmBlocks));
 
-        // audio_mode >= 10: AMODE = byte7 bits3-0 (high 4) + byte8 bits7-6. Set
-        // AMODE high nibble to 0xF → audio_mode >= 60.
+        // audio_mode reserved (>= 16): AMODE = byte7 bits3-0 (high 4) + byte8
+        // bits7-6. Set AMODE high nibble to 0xF → audio_mode = 60, a genuinely
+        // RESERVED code (16-63) a decoder rejects. (Codes 10-15 are LEGAL
+        // multichannel layouts and must NOT be dropped — see
+        // legal_multichannel_amode_is_not_dropped.)
         let mut d = good.clone();
         d[7] |= 0x0F;
         assert_eq!(core_header_drop_reason(&d), Some(DropReason::Amode));
@@ -1973,6 +1983,43 @@ mod tests {
         d[11] |= 0x01;
         d[12] |= 0xC0;
         assert_eq!(core_header_drop_reason(&d), Some(DropReason::PcmRes));
+    }
+
+    #[test]
+    fn legal_multichannel_amode_is_not_dropped() {
+        // ETSI TS 102 114 §5.3.1: AMODE is a 6-bit field with 16 LEGAL
+        // channel-arrangement codes (0-15); only 16-63 are reserved. ffmpeg's
+        // ff_dca_channels[16] = {1,2,2,2,2,3,3,4,4,5,6,6,6,7,8,8} confirms codes
+        // 10-15 are decodable 6/7/8-channel layouts. The decodability gate must
+        // KEEP them — dropping a spec-legal multichannel core silences audio the
+        // recover-100% goal must preserve.
+        fn set_amode(core: &mut [u8], amode: u32) {
+            // audio_mode = (byte7 & 0x0F) << 2 | (byte8 >> 6).
+            core[7] = (core[7] & 0xF0) | ((amode >> 2) & 0x0F) as u8;
+            core[8] = (core[8] & 0x3F) | (((amode & 0x03) << 6) as u8);
+        }
+
+        // Every legal code 0-15 is kept — the range is a literal (NOT
+        // DTS_AMODE_COUNT) so reverting the bound to 10 makes 10-15 fail here.
+        for amode in 0u32..16 {
+            let mut core = make_dts_core(512);
+            set_amode(&mut core, amode);
+            assert_eq!(
+                core_header_drop_reason(&core),
+                None,
+                "legal AMODE {amode} must not be dropped"
+            );
+        }
+        // The first reserved code (16) and above are still rejected.
+        for amode in [16u32, 40, 63] {
+            let mut core = make_dts_core(512);
+            set_amode(&mut core, amode);
+            assert_eq!(
+                core_header_drop_reason(&core),
+                Some(DropReason::Amode),
+                "reserved AMODE {amode} must be dropped"
+            );
+        }
     }
 
     /// Real-data fixture (ignored). Re-parses a raw `.dts` elementary stream

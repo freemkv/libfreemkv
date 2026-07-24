@@ -141,10 +141,20 @@ fn scan_iso_matches_manual_scan_image_path() {
         .expect("manual scan_image succeeds");
 
     assert_eq!(disc.capacity_sectors, manual.capacity_sectors, "capacity");
-    assert_eq!(disc.capacity_sectors, expected_capacity, "capacity value");
     assert_eq!(disc.titles.len(), manual.titles.len(), "title count");
     assert_eq!(disc.encrypted, manual.encrypted, "encrypted flag");
     assert_eq!(disc.format, manual.format, "disc format");
+
+    // Independent expectations (not parity against a re-run of the same
+    // composition): the scanned Disc must match KNOWN properties of the fixture
+    // itself — its capacity (max LBA + 1), its PVD volume id ("TEST_DISC"), and
+    // that a UDF with no /AACS directory is unencrypted. These would fail even if
+    // scan_iso and the manual path drifted together.
+    assert_eq!(disc.capacity_sectors, expected_capacity, "capacity value");
+    assert_eq!(
+        disc.volume_id, "TEST_DISC",
+        "PVD volume id from the fixture"
+    );
     assert!(!disc.encrypted, "minimal UDF (no /AACS) is not encrypted");
 
     // The returned reader is usable: correct capacity and a real read of sector
