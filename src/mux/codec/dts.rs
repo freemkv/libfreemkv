@@ -683,9 +683,10 @@ fn dts_core_duration_ns(data: &[u8]) -> u64 {
 }
 
 /// DTS core-header validity constants (ETSI TS 102 114).
-/// `deficit_samples` must equal this (`DTS_PCMBLOCK_SAMPLES`); `npcmblocks`
-/// must be a multiple of `DTS_SUBBAND_SAMPLES`; `audio_mode` must be below
-/// `DTS_AMODE_COUNT`; `lfe_present == DTS_LFE_FLAG_INVALID` is rejected.
+/// For a NORMAL frame `deficit_samples` must equal this (`DTS_PCMBLOCK_SAMPLES`)
+/// — a termination frame may carry fewer; `npcmblocks` must be a multiple of
+/// `DTS_SUBBAND_SAMPLES`; `audio_mode` must be below `DTS_AMODE_COUNT`;
+/// `lfe_present == DTS_LFE_FLAG_INVALID` is rejected.
 const DTS_PCMBLOCK_SAMPLES: u32 = 32;
 const DTS_SUBBAND_SAMPLES: u32 = 8;
 /// Number of LEGAL `AMODE` (channel-arrangement) codes. The 6-bit AMODE field
@@ -723,7 +724,6 @@ enum DropReason {
     FrameSize,
     Amode,
     SampleRate,
-    ReservedBit,
     LfeFlag,
     PcmRes,
     TrackPoisoned,
@@ -738,7 +738,6 @@ impl DropReason {
             DropReason::FrameSize => "frame-size",
             DropReason::Amode => "audio-mode",
             DropReason::SampleRate => "sample-rate",
-            DropReason::ReservedBit => "reserved-bit",
             DropReason::LfeFlag => "lfe-flag",
             DropReason::PcmRes => "pcm-resolution",
             DropReason::TrackPoisoned => "track-poisoned",
@@ -762,9 +761,17 @@ impl DropReason {
 fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
     let mut r = BitReader::new(au.get(SYNCWORD_BYTES..)?);
 
-    let _ftype = r.read_bit()?;
+    // FTYPE: 1 = NORMAL frame, 0 = TERMINATION frame (the last frame of the
+    // stream). Per ETSI TS 102 114 and both reference decoders — ffmpeg's
+    // `ff_dca_parse_core_frame_header` (`normal_frame && deficit_samples !=
+    // DCA_PCMBLOCK_SAMPLES`) and dcadec's `parse_frame_header` (which branches
+    // on `normal_frame`) — the deficit-sample field must equal 32 ONLY for a
+    // normal frame. A termination frame legitimately carries fewer samples and
+    // is fully decodable; dropping it would silence the last frame of every
+    // stream that ends on one (a guaranteed per-track loss on real discs).
+    let normal_frame = r.read_bit()? == 1;
     let deficit_samples = r.read_bits(5)? + 1;
-    if deficit_samples != DTS_PCMBLOCK_SAMPLES {
+    if normal_frame && deficit_samples != DTS_PCMBLOCK_SAMPLES {
         return Some(DropReason::DeficitSamples);
     }
     let crc_present = r.read_bit()? == 1;
@@ -785,9 +792,12 @@ fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
         return Some(DropReason::SampleRate);
     }
     let _br_code = r.read_bits(5)?;
-    if r.read_bit()? != 0 {
-        return Some(DropReason::ReservedBit);
-    }
+    // Reserved bit. Both reference decoders SKIP this field rather than reject
+    // on it — ffmpeg (`skip_bits1`) and dcadec (`bits_skip1`, comment "Reserved
+    // field"). A frame that sets it is still fully decodable, so rejecting it
+    // was a false-drop that silenced any real stream whose encoder set the bit.
+    // Read past it without gating (never reject a decodable frame).
+    let _reserved = r.read_bit()?;
     // drc, ts, aux, hdcd (1 each) → ext_audio_type (3) → ext_present, aspf (1 each).
     r.skip_bits(4)?;
     r.skip_bits(3)?;
@@ -831,11 +841,12 @@ mod tests {
         let fsize = size - 1;
         let mut data = vec![0u8; size];
         data[0..4].copy_from_slice(&DTS_CORE_SYNC);
-        // byte4: FTYPE(0) SHORT(5) CPF(0) NBLKS-high(0). SHORT = 31 makes
-        // deficit_samples = 32 = DTS_PCMBLOCK_SAMPLES, which the decodability
-        // gate (per ETSI TS 102 114) requires of a real core frame. NBLKS high
-        // bit (byte4 bit0) stays 0 for NBLKS = 15.
-        data[4] = 31u8 << 2;
+        // byte4: FTYPE(1) SHORT(5) CPF(0) NBLKS-high(0). FTYPE = 1 = a NORMAL
+        // frame (the common real-stream case); SHORT = 31 makes deficit_samples
+        // = 32 = DTS_PCMBLOCK_SAMPLES, which the decodability gate (per ETSI TS
+        // 102 114) requires of a normal frame. NBLKS high bit (byte4 bit0) stays
+        // 0 for NBLKS = 15. (0x80 | (31 << 2) = 0xFC.)
+        data[4] = 0x80 | (31u8 << 2);
         // NBLKS = 15 → (15+1)*32 = 512 samples/frame (the DVD/UHD DTS-core norm).
         // NBLKS is byte4 bit0 + byte5 bits7-2; here byte4 bit0 = 0, byte5 = 15<<2.
         data[5] = (15u8 << 2) | ((fsize >> 12) & 0x03) as u8;
@@ -1791,22 +1802,24 @@ mod tests {
         );
     }
 
-    /// A structurally-framed but UNDECODABLE core: a valid `make_dts_core`
-    /// whose reserved header bit is set. It still sizes and syncs correctly (so
-    /// the framer delimits it normally), but the core-frame header validity
-    /// check rejects it as a set reserved bit (ETSI TS 102 114). The reserved
-    /// bit is byte9 bit4 in the core header (after SYNC..RATE).
+    /// A structurally-framed but UNDECODABLE core: a valid `make_dts_core` whose
+    /// LFE flag is set to the reserved value 3 (`DTS_LFE_FLAG_INVALID`). It still
+    /// sizes and syncs correctly (so the framer delimits it normally), but the
+    /// core-frame header validity check rejects it as an invalid LFE flag (ETSI
+    /// TS 102 114; dcadec `LFE_FLAG_INVALID`). LFE is byte10 bits2-1, and does
+    /// NOT feed the frame duration (NBLKS + SFREQ only), so a dropped bad core
+    /// still carries the same `DTS_CORE_DUR_NS` as its good peers.
     fn make_bad_dts_core(size: usize) -> Vec<u8> {
         let mut d = make_dts_core(size);
         assert!(
             core_header_drop_reason(&d).is_none(),
             "base core is decodable"
         );
-        d[9] |= 0x10; // set the reserved bit
+        d[10] |= 0x06; // LFE flag = 3 (invalid)
         assert_eq!(
             core_header_drop_reason(&d),
-            Some(DropReason::ReservedBit),
-            "reserved-bit core must be judged undecodable"
+            Some(DropReason::LfeFlag),
+            "invalid-LFE core must be judged undecodable"
         );
         d
     }
@@ -1967,11 +1980,6 @@ mod tests {
         d[8] &= !0x3C;
         assert_eq!(core_header_drop_reason(&d), Some(DropReason::SampleRate));
 
-        // reserved bit set: byte9 bit4.
-        let mut d = good.clone();
-        d[9] |= 0x10;
-        assert_eq!(core_header_drop_reason(&d), Some(DropReason::ReservedBit));
-
         // lfe_present == 3: LFE is byte10 bits2-1.
         let mut d = good.clone();
         d[10] |= 0x06;
@@ -2020,6 +2028,70 @@ mod tests {
                 "reserved AMODE {amode} must be dropped"
             );
         }
+    }
+
+    /// Set FTYPE (byte4 bit7: 1 = normal, 0 = termination) and the 5-bit SHORT
+    /// field (byte4 bits6-2), leaving CPF and the NBLKS high bit (bits1-0) intact.
+    /// `deficit_samples = short_field + 1`.
+    fn set_ftype_short(core: &mut [u8], normal: bool, short_field: u8) {
+        core[4] = (core[4] & 0x03) | ((normal as u8) << 7) | ((short_field & 0x1F) << 2);
+    }
+
+    #[test]
+    fn termination_frame_with_small_deficit_is_kept() {
+        // ETSI TS 102 114 / ffmpeg (`normal_frame && deficit != 32`) / dcadec:
+        // a TERMINATION frame (FTYPE=0) may legally carry fewer than 32 deficit
+        // samples and is fully decodable. It must NOT be dropped — dropping the
+        // last frame of a stream silences real audio (recover-100% violation).
+        let mut core = make_dts_core(512);
+        set_ftype_short(&mut core, false, 10); // termination, deficit = 11 (< 32)
+        assert_eq!(
+            core_header_drop_reason(&core),
+            None,
+            "a termination frame with a small deficit is decodable and must be kept"
+        );
+        // End-to-end: a termination frame closed by a following core survives.
+        let mut term = make_dts_core(512);
+        set_ftype_short(&mut term, false, 5); // deficit = 6
+        let mut stream = term;
+        stream.extend_from_slice(&make_dts_core(640));
+        let mut parser = DtsParser::new();
+        let mut frames = parser.parse(&make_pes(stream, Some(90000)));
+        frames.extend(parser.flush());
+        assert_eq!(frames.len(), 2, "termination frame is emitted, not dropped");
+        assert_eq!(frames[0].data.len(), 512);
+        assert_eq!(parser.dropped_frames(), 0);
+    }
+
+    #[test]
+    fn normal_frame_with_wrong_deficit_is_dropped() {
+        // The other side of the FTYPE gate: a NORMAL frame (FTYPE=1) whose
+        // deficit-sample field is not 32 is genuinely undecodable and must be
+        // dropped. Guards against the fix over-relaxing into "never check deficit".
+        let mut core = make_dts_core(512);
+        set_ftype_short(&mut core, true, 10); // normal, deficit = 11 (!= 32)
+        assert_eq!(
+            core_header_drop_reason(&core),
+            Some(DropReason::DeficitSamples),
+            "a normal frame with deficit != 32 is undecodable and must be dropped"
+        );
+    }
+
+    #[test]
+    fn reserved_bit_set_is_not_dropped() {
+        // The bit after RATE is a RESERVED field that both reference decoders
+        // SKIP (ffmpeg `skip_bits1`, dcadec `bits_skip1` "Reserved field") — they
+        // never reject a frame that sets it. Rejecting was a false-drop that
+        // silenced any real stream whose encoder set the bit. Setting it (byte9
+        // bit4) on an otherwise-valid core must leave it KEPT.
+        let mut core = make_dts_core(512);
+        assert_eq!(core_header_drop_reason(&core), None, "baseline decodable");
+        core[9] |= 0x10; // set the reserved bit
+        assert_eq!(
+            core_header_drop_reason(&core),
+            None,
+            "a set reserved bit must NOT drop a decodable frame"
+        );
     }
 
     /// Real-data fixture (ignored). Re-parses a raw `.dts` elementary stream

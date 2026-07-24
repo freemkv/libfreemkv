@@ -540,6 +540,20 @@ fn reader_event_fn(events: Arc<dyn MuxEvents>) -> crate::sector::prefetched::Eve
 /// The reader-agnostic driver body: headers → gate → sink → pump → finish.
 /// Split out so it can be unit-tested against a synthetic [`Stream`] (the
 /// injection seam), independent of which constructor built `stream`.
+/// Whether a finished mux counts as COMPLETED. A clean operator stop
+/// (`interrupted`), a wedged/halted finalize (`finalize_failed` — the write
+/// [`Pipeline`] returned `Halted`/`PipelineJoinTimeout` from `finish`), or a
+/// halt cancellation each force `completed = false`, so the consumer runs its
+/// stop-preserves-staging path instead of reporting a truncated file as done.
+///
+/// Extracted as a pure fn because the `finalize_failed` branch is otherwise
+/// reachable only through real write-thread wedge timing (the internally-built
+/// `WriteSink` offers no seam to force a `finish` timeout deterministically), so
+/// the mapping is unit-tested here directly.
+fn mux_run_completed(interrupted: bool, finalize_failed: bool, halt_cancelled: bool) -> bool {
+    !(interrupted || finalize_failed || halt_cancelled)
+}
+
 fn drive_mux(
     mut stream: Box<dyn Stream>,
     dest_url: &str,
@@ -738,7 +752,7 @@ fn drive_mux(
         Err(e) => return Err(e.into()),
     };
 
-    if interrupted || finalize_failed || halt.is_cancelled() {
+    if !mux_run_completed(interrupted, finalize_failed, halt.is_cancelled()) {
         return Ok(MuxOutcome {
             completed: false,
             output_opened: true,
@@ -1689,6 +1703,89 @@ mod tests {
         assert!(
             err.to_string().starts_with('E'),
             "expected a typed libfreemkv error (E<code>…), got: {err}"
+        );
+    }
+
+    /// FIX 3: a mux whose read side drained cleanly (`interrupted = false`, halt
+    /// not cancelled) but whose write pipeline WEDGED on finish (`finish_with_halt`
+    /// → `Err(Halted | PipelineJoinTimeout)` → `finalize_failed = true`) must fall
+    /// through to `completed = false` — never surface a truncated file as a
+    /// finished rip. The wedge is reachable only via real write-thread timing, so
+    /// the completion mapping is tested via the extracted pure fn.
+    ///
+    /// Mutation: dropping `finalize_failed` from `mux_run_completed`'s condition
+    /// makes `mux_run_completed(false, true, false)` return `true` → this fails.
+    #[test]
+    fn finalize_failed_forces_incomplete_outcome() {
+        // The load-bearing case: clean drain, wedged finalize → NOT completed.
+        assert!(
+            !mux_run_completed(false, true, false),
+            "a wedged/halted finalize must force completed = false"
+        );
+        // A fully clean finish is the only path to completed = true.
+        assert!(
+            mux_run_completed(false, false, false),
+            "a clean drain + clean finalize completes"
+        );
+        // The other two forcers likewise yield incomplete.
+        assert!(
+            !mux_run_completed(true, false, false),
+            "operator stop → incomplete"
+        );
+        assert!(
+            !mux_run_completed(false, false, true),
+            "halt cancel → incomplete"
+        );
+    }
+
+    /// FIX 4: `MuxInput::Session` with a `title_index` past the disc's title count
+    /// must surface a clean `Error::MuxTrackRange` (code E9011), NOT panic on the
+    /// out-of-range `titles.get(idx)`. Everything else is valid (disc scanned,
+    /// reader staged) so the range guard is the sole failure.
+    ///
+    /// Mutation: replacing the `.ok_or(MuxTrackRange…)?` guard with `.unwrap()`
+    /// panics on the out-of-range index → this test fails.
+    #[test]
+    fn mux_input_session_out_of_range_title_is_clean_error_not_panic() {
+        use crate::disc::Extent;
+        use crate::session::DiscSession;
+
+        let unit_key = [0x5Au8; 16];
+        let reader = Box::new(AacsUnitReader {
+            unit: encrypted_audio_unit(&unit_key),
+            capacity: 2048,
+        });
+        let mut title = aac_audio_title(0x1100);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 3,
+        }];
+        let disc = aacs_session_disc(title, unit_key);
+        let num_titles = disc.titles.len();
+        let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader), None);
+
+        let opts = MuxOptions {
+            skip_errors: false,
+            batch_sectors: 3,
+            raw: false,
+            send_deadline: Some(Duration::from_secs(60)),
+        };
+        let halt = Halt::new();
+        let err = mux_stream(
+            MuxInput::Session {
+                session: &mut session,
+                title_index: num_titles + 5, // out of range
+            },
+            "null://",
+            &opts,
+            &halt,
+            Arc::new(NoopEvents),
+        )
+        .expect_err("an out-of-range title index must be a clean error, not a panic");
+        // MuxTrackRange renders as "E9011: track/tracks".
+        assert!(
+            err.to_string().contains("E9011"),
+            "expected MuxTrackRange (E9011), got: {err}"
         );
     }
 
