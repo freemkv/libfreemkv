@@ -25,6 +25,7 @@
 
 // Public modules — types here are intentionally part of the consumable API.
 pub mod disc;
+pub mod driver;
 pub mod pipelined_stream;
 pub mod resolve;
 
@@ -114,6 +115,7 @@ pub(crate) mod videomap;
 // direct `super::demux_sink::` / `super::fvi_sink::` paths — no re-export needed,
 // and no consumer names these types, so they are not public API.
 pub use disc::DiscStream;
+pub use driver::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, NoopEvents, mux_stream};
 pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
 pub use mp4::{Mp4FitReport, Mp4SkipReason, fit_report as mp4_fit_report};
