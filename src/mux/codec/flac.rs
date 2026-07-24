@@ -178,6 +178,22 @@ mod tests {
     }
 
     #[test]
+    fn pes_without_pts_carries_last_timestamp_not_zero() {
+        // A PES with no PTS (legal for audio, e.g. after a discontinuity) must
+        // carry the last known timestamp forward — resetting to 0 would corrupt
+        // A/V sync. Mirrors the adts.rs guard test.
+        let mut p = FlacParser::new();
+        p.parse(&make_pes(make_flac_frame(100), Some(90000)));
+        let f = p.parse(&make_pes(make_flac_frame(100), None));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].pts_ns,
+            pts_to_ns(90000),
+            "carried forward, not reset to 0"
+        );
+    }
+
+    #[test]
     fn corrupt_frame_is_dropped() {
         let mut p = FlacParser::new();
         let mut frame = make_flac_frame(100);
