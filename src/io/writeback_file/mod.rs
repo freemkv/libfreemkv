@@ -97,7 +97,7 @@ fn writeback_chunk_bytes() -> u64 {
         .unwrap_or(WRITEBACK_CHUNK_BYTES_DEFAULT)
 }
 
-pub(crate) struct WritebackFile {
+pub struct WritebackFile {
     file: File,
     pipeline: WritebackPipeline,
     pos: u64,
@@ -115,7 +115,7 @@ impl WritebackFile {
     /// once so the pipeline starts tracking from wherever the file
     /// already is (typically 0 for fresh files; non-zero for resumed
     /// or appended files).
-    pub(crate) fn new(mut file: File) -> io::Result<Self> {
+    pub fn new(mut file: File) -> io::Result<Self> {
         let pos = file.stream_position()?;
         let pipeline = WritebackPipeline::new(&file, pos, writeback_chunk_bytes());
         Ok(Self {
@@ -136,7 +136,7 @@ impl WritebackFile {
     /// [`Self::create_with_size_hint`] so the kernel can pre-reserve
     /// extents.
     #[allow(dead_code)]
-    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+    pub fn create(path: &Path) -> io::Result<Self> {
         let file = File::create(path)?;
         Self::new(file)
     }
@@ -153,7 +153,7 @@ impl WritebackFile {
     /// On platforms without an extent-preallocation primitive this is
     /// equivalent to `create` — the size hint is dropped after a debug
     /// log.
-    pub(crate) fn create_with_size_hint(path: &Path, size_bytes: u64) -> io::Result<Self> {
+    pub fn create_with_size_hint(path: &Path, size_bytes: u64) -> io::Result<Self> {
         let file = File::create(path)?;
         platform::preallocate(&file, size_bytes);
         Self::new(file)
@@ -163,7 +163,7 @@ impl WritebackFile {
     /// wrap it. Mirrors `File::open` semantics for the writable case
     /// — used by patch / resume paths that mutate an existing ISO in
     /// place.
-    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+    pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).open(path)?;
         Self::new(file)
     }
@@ -184,7 +184,7 @@ impl WritebackFile {
     /// completed. Callers needing crash-consistency (e.g. mux-finish
     /// then external commit/DB update) must not treat `Ok(())` as a
     /// durability barrier.
-    pub(crate) fn sync_all(&mut self) -> io::Result<()> {
+    pub fn sync_all(&mut self) -> io::Result<()> {
         if self.seek_count > 0 {
             tracing::debug!(
                 target: "mux",
