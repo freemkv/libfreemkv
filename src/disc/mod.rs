@@ -2396,7 +2396,7 @@ impl Disc {
     /// Fails loud (via the per-title resolve) if any content unit's key is missing.
     /// `keys` is mutated as fetched keys are banked; the merged ranges are disjoint
     /// (titles that share a clip resolve the same span — the duplicate is dropped).
-    pub(crate) fn resolve_content_key_map(
+    pub fn resolve_content_key_map(
         &self,
         reader: &mut dyn SectorSource,
         keys: &mut crate::decrypt::DecryptKeys,
@@ -2436,7 +2436,7 @@ impl Disc {
     ///
     /// Empty when the disc has no parsed titles (CSS / unencrypted / unscanned);
     /// callers treat an empty map as "no content gate" and fall back accordingly.
-    pub(crate) fn encrypted_content_ranges(&self) -> Vec<(u32, u32)> {
+    pub fn encrypted_content_ranges(&self) -> Vec<(u32, u32)> {
         merged_extents(self.titles.iter().flat_map(|t| &t.extents))
     }
 
