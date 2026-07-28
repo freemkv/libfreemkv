@@ -119,6 +119,76 @@ pub const SENSE_KEY_DATA_PROTECT: u8 = 0x07;
 pub const SENSE_KEY_BLANK_CHECK: u8 = 0x08;
 pub const SENSE_KEY_ABORTED_COMMAND: u8 = 0x0B;
 
+/// Coarse classification of a SCSI sense key, for callers that need to
+/// branch on "what kind of failure was this" without a `match` over every
+/// `SENSE_KEY_*` constant. Pure hardware-fact translation — no retry policy
+/// here; see the recovery/engine layer for what to DO about a given family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenseFamily {
+    NotReady,
+    Medium,
+    Hardware,
+    IllegalRequest,
+    Other,
+}
+
+impl SenseFamily {
+    pub fn from_sense_key(sense_key: u8) -> Self {
+        match sense_key {
+            SENSE_KEY_NOT_READY => SenseFamily::NotReady,
+            SENSE_KEY_MEDIUM_ERROR => SenseFamily::Medium,
+            SENSE_KEY_HARDWARE_ERROR => SenseFamily::Hardware,
+            SENSE_KEY_ILLEGAL_REQUEST => SenseFamily::IllegalRequest,
+            _ => SenseFamily::Other,
+        }
+    }
+
+    /// True for the "wedge family" — some drives (e.g. the BU40N over a
+    /// USB-SATA bridge) return Hardware or IllegalRequest sense once their
+    /// firmware enters a fast-fail state after sustained bad-media reads.
+    pub fn is_wedge_family(self) -> bool {
+        matches!(self, SenseFamily::Hardware | SenseFamily::IllegalRequest)
+    }
+}
+
+#[cfg(test)]
+mod sense_family_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_each_named_sense_key() {
+        assert_eq!(
+            SenseFamily::from_sense_key(SENSE_KEY_NOT_READY),
+            SenseFamily::NotReady
+        );
+        assert_eq!(
+            SenseFamily::from_sense_key(SENSE_KEY_MEDIUM_ERROR),
+            SenseFamily::Medium
+        );
+        assert_eq!(
+            SenseFamily::from_sense_key(SENSE_KEY_HARDWARE_ERROR),
+            SenseFamily::Hardware
+        );
+        assert_eq!(
+            SenseFamily::from_sense_key(SENSE_KEY_ILLEGAL_REQUEST),
+            SenseFamily::IllegalRequest
+        );
+        assert_eq!(
+            SenseFamily::from_sense_key(SENSE_KEY_ABORTED_COMMAND),
+            SenseFamily::Other
+        );
+    }
+
+    #[test]
+    fn wedge_family_is_hardware_and_illegal_request_only() {
+        assert!(SenseFamily::Hardware.is_wedge_family());
+        assert!(SenseFamily::IllegalRequest.is_wedge_family());
+        assert!(!SenseFamily::Medium.is_wedge_family());
+        assert!(!SenseFamily::NotReady.is_wedge_family());
+        assert!(!SenseFamily::Other.is_wedge_family());
+    }
+}
+
 // ── Sense parsing ───────────────────────────────────────────────────────────
 
 /// Decoded SPC-4 sense triple — the precise reason a SCSI command failed.
