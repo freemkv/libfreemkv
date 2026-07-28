@@ -330,6 +330,12 @@ pub struct InputOptions {
     /// still-scrambled unit is re-tried via the application's key source.
     /// Application seam only; the library makes no network call.
     pub key_fetch: Option<crate::sector::KeyFetch>,
+    /// Which audio/subtitle streams to keep. `input()` scans the source and
+    /// picks the title internally, so the caller can't prune the `DiscTitle`
+    /// itself — it passes the selection here and `input()` applies it right
+    /// after the title-index bounds check. Default keeps every stream (video is
+    /// always kept). See [`crate::StreamSelection`].
+    pub selection: crate::StreamSelection,
 }
 
 // `KeyFetchFactory` holds a trait object that is not `Debug`; hand-roll the
@@ -342,6 +348,7 @@ impl std::fmt::Debug for InputOptions {
             .field("title_index", &self.title_index)
             .field("raw", &self.raw)
             .field("key_fetch", &self.key_fetch.is_some())
+            .field("selection", &self.selection)
             .finish()
     }
 }
@@ -403,6 +410,14 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 }
                 .into());
             }
+            // Prune to the selected audio/subtitle streams now, on the scanned
+            // (pre-`probe_and_remap`) title, so everything downstream — the
+            // TrueHD channel-correction probe, the final title clone, and
+            // `build_iso_pipeline`'s demux/track construction — sees the pruned
+            // list. Video is always kept; a no-op for the default All/All.
+            opts.selection
+                .apply(&mut disc.titles[idx])
+                .map_err(|e| -> io::Error { e.into() })?;
             // Per-title key resolution. DVD CSS is resolved at exactly ONE site —
             // `build_iso_pipeline`'s per-title crack (below), which decrypts a
             // crackable title, passes a genuinely-clear one through, and
