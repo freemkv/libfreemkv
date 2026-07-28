@@ -28,6 +28,7 @@ pub mod disc;
 pub mod driver;
 pub mod pipelined_stream;
 pub mod resolve;
+pub mod select;
 
 // Internal-only modules. Every reference is via `crate::mux::…` /
 // `super::…` from inside the crate; nothing in the downstream crates or

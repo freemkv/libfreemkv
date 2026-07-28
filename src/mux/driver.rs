@@ -153,6 +153,11 @@ pub enum MuxInput<'a> {
 }
 
 /// Tuning / behaviour knobs for a mux run.
+///
+/// `Default` = keep-everything, no-skip, decrypt, no send deadline — the
+/// archival default. Added so callers set only the fields they care about
+/// (and so the additive `selection` field doesn't churn every constructor).
+#[derive(Default)]
 pub struct MuxOptions {
     /// Skip past read errors (zero-fill + continue) on the live-drive path
     /// instead of aborting. Wired onto `DiscStream::skip_errors`.
@@ -161,6 +166,11 @@ pub struct MuxOptions {
     pub batch_sectors: u16,
     /// Ciphertext passthrough — skip decryption / CSS self-crack.
     pub raw: bool,
+    /// Which audio/subtitle streams to keep in the muxed title. Default keeps
+    /// every stream (video is always kept). Applied to the title before the
+    /// demux pipeline is built, so track headers, `codec_privates`, and frame
+    /// routing all follow the pruned list. See [`crate::StreamSelection`].
+    pub selection: crate::StreamSelection,
     /// Per-frame write-pipeline send deadline.
     ///
     /// - `Some(d)` — a hard `d` timeout: a sink that back-pressures a single
@@ -278,6 +288,14 @@ pub fn mux_stream(
             keys,
             key_fetch,
         } => {
+            // Prune to the selected audio/subtitle streams BEFORE the highway
+            // builds its demux state from `title.streams` (and before
+            // `build_iso_pipeline`'s `probe_and_remap` may rewrite DVD AC-3
+            // PIDs). Video is always kept; a no-op for the default All/All.
+            let mut title = title;
+            opts.selection
+                .apply(&mut title)
+                .map_err(std::io::Error::from)?;
             let reader = FileSectorSource::open(path)?;
             let stream = build_iso_pipeline(
                 reader,
@@ -299,7 +317,7 @@ pub fn mux_stream(
             // Pull everything we need out of the disc as owned values so the
             // immutable disc borrow is released before the mutable
             // `take_reader` below.
-            let (title, format, mut keys, playlist) = {
+            let (mut title, format, mut keys, playlist) = {
                 let disc = session.disc().ok_or_else(|| Error::DeviceNotReady {
                     path: session.device_path().to_string(),
                 })?;
@@ -319,6 +337,14 @@ pub fn mux_stream(
                 // (see `session_mux_keys`), never the whole-disc `decrypt_keys()`.
                 (title, disc.content_format, session_mux_keys(disc), playlist)
             };
+            // Prune to the selected streams before `DiscStream::new` builds its
+            // demux tables from `title.streams` (and before its inline
+            // `probe_and_remap`). Only touches the stream list, so the
+            // ciphertext sampling in `resolve_inline_base_map` (keyed on extents)
+            // is unaffected. No-op for the default All/All.
+            opts.selection
+                .apply(&mut title)
+                .map_err(std::io::Error::from)?;
             // A missing staged reader ("already consumed" / never staged) is a
             // clean error, not a panic (contract Q2).
             let mut reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
@@ -1308,6 +1334,7 @@ mod tests {
             batch_sectors: 8192,
             raw: false,
             send_deadline: Some(Duration::from_secs(60)),
+            selection: Default::default(),
         };
         let halt = Halt::new();
         let out = mux_stream(
@@ -1416,6 +1443,7 @@ mod tests {
             batch_sectors: us as u16,
             raw: false,
             send_deadline: Some(Duration::from_secs(60)),
+            selection: Default::default(),
         };
         let halt = Halt::new();
         // Drains to a NoStreams refusal (zeroed data resolves no headers); we
@@ -1534,6 +1562,7 @@ mod tests {
             batch_sectors: 3,   // one aligned unit per read
             raw: false,
             send_deadline: Some(Duration::from_secs(60)),
+            selection: Default::default(),
         };
         let halt = Halt::new();
         let out = mux_stream(
@@ -1635,6 +1664,7 @@ mod tests {
             batch_sectors: 3,   // one aligned unit per read
             raw: false,
             send_deadline: Some(Duration::from_secs(60)),
+            selection: Default::default(),
         };
         let halt = Halt::new();
         let out = mux_stream(
@@ -1685,6 +1715,7 @@ mod tests {
             batch_sectors: 3,
             raw: false,
             send_deadline: Some(Duration::from_secs(60)),
+            selection: Default::default(),
         };
         let halt = Halt::new();
         let err = mux_stream(
@@ -1769,6 +1800,7 @@ mod tests {
             batch_sectors: 3,
             raw: false,
             send_deadline: Some(Duration::from_secs(60)),
+            selection: Default::default(),
         };
         let halt = Halt::new();
         let err = mux_stream(
@@ -2060,6 +2092,7 @@ mod tests {
             batch_sectors: 0,
             raw: false,
             send_deadline: None,
+            selection: Default::default(),
         };
         assert_eq!(effective_send_deadline(cli.send_deadline), NO_SEND_DEADLINE);
         let autorip = MuxOptions {
@@ -2067,6 +2100,7 @@ mod tests {
             batch_sectors: 8192,
             raw: false,
             send_deadline: Some(Duration::from_secs(60)),
+            selection: Default::default(),
         };
         assert_eq!(
             effective_send_deadline(autorip.send_deadline),
