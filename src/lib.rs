@@ -155,7 +155,7 @@ pub use session::{
 // All fallible APIs return `Result<T, Error>`. `Error` is a typed enum with a
 // numeric `code()`; **no English text in the library** — applications map
 // codes to localized messages. See `error.rs` for the full taxonomy.
-pub use error::{Error, Result, is_halt, is_skippable_title_stub};
+pub use error::{Error, Result, is_disc_level_no_key, is_halt, is_skippable_title_stub};
 
 // ─── Cooperative cancellation ───────────────────────────────────────────────
 //
