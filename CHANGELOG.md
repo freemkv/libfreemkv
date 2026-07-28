@@ -1,6 +1,56 @@
 # Changelog
 
-## [1.5.2] — UNRELEASED
+## [1.6.0] — UNRELEASED
+
+### Added
+
+- **High-level orchestration API — a single mux driver and a disc session.**
+  `mux_stream` drives the whole read → decrypt → demux → write pipeline for any
+  source (`MuxInput::Url` / `Iso` / `Session` / `Live`), so consumers stop
+  hand-rolling the frame pump. `DiscSession` hoists drive open + SCSI bring-up +
+  scan + key resolution behind one type; `scan_iso` does the same for a
+  file-backed ISO; `resolve_keys` / `resolve_keys_for` resolve base AACS keys.
+  These let the CLI and autorip shrink to thin front-ends (and back the new
+  `freemkv-engine` crate).
+- **Per-title stream selection (`StreamSelection`).** A pure primitive that
+  prunes a `DiscTitle`'s audio/subtitle streams to a chosen set of PIDs (video
+  is always kept) before the mux builds its demux state — so track headers,
+  `codec_privates`, and frame routing all follow the pruned list, with no
+  demux-internal filter. Carried on `MuxOptions.selection` /
+  `InputOptions.selection` (both default to keep-everything, a no-op).
+  Languages are the caller's concern; the library speaks PIDs.
+- `DiscTitle::audio_streams()` / `subtitle_streams()` / `video_streams()` —
+  typed iterators over each stream class.
+- `MuxOptions` gains a per-call write-pipeline `send_deadline` and derives
+  `Default`.
+
+### Changed
+
+- **The recovery strategy moved to the new `freemkv-engine` crate.** Sweep,
+  patch, the retry-decision state machine, mapfile bookkeeping, and damage
+  classification are freemkv's specific recovery *philosophy*, not disc-access
+  primitives — they now live in `freemkv-engine`, which composes libfreemkv's
+  public API. The library keeps the raw single-shot read, SCSI-sense-fact
+  translation (`SenseFamily`, now in `scsi`), decrypt, and the mux highway.
+- Small deliberate `pub` promotions to support the engine as an external
+  consumer: `Disc::resolve_content_key_map` / `encrypted_content_ranges`,
+  `io::WritebackFile`, `drive::extract_scsi_context`, `disc::locate_ranges`.
+- New typed error classifiers re-exported at the crate root — `is_halt`,
+  `is_skippable_title_stub`, `is_disc_level_no_key` — and a new error variant
+  `SelectionPidUnknown` (E6014).
+
+### Fixed
+
+- **Mux correctness pass** (the `v1.4.0..HEAD` 10-phase audit): DTS core-header
+  false-drops that dropped good DTS frames; the TrueHD channel-correction probe
+  now runs correctly on AACS discs (7.1/Atmos no longer understated as 5.1);
+  an FMTS phase-probe read fault is distinguished from a wrong key; multi-CPS
+  and orphan-clip keying; the AACS key map is now a *positive* map (a sector
+  with no key passes through rather than failing), with fail-loud on genuinely
+  unresolvable keys; a user Stop mid-read is reported as `completed = false`
+  (a stop is not a failure), not a spurious error.
+
+## [1.5.2] — 2026-07-22
 
 ### Fixed
 
