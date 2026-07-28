@@ -483,7 +483,7 @@ impl Drive {
         // the stock riplock). A stock-mode drive with no firmware unlocker still
         // wants max speed. Best-effort: a failure here must NOT fail the rip.
         if r.is_ok() {
-            self.set_speed(crate::speed::DriveSpeed::Max.to_kbps());
+            self.set_speed(Self::SPEED_MAX_KBPS);
             // Ask the drive to REPORT recovered/marginal reads rather than
             // silently commit best-effort data as GOOD (the dirty-disc
             // "passed-clean-but-decodes-with-errors" trap). Best-effort: a drive
@@ -950,6 +950,9 @@ impl Drive {
         )?;
         decode_read_capacity(&buf, result.bytes_transferred)
     }
+
+    /// SET CD SPEED "use the drive's maximum" sentinel (0xFFFF KB/s per MMC).
+    pub const SPEED_MAX_KBPS: u16 = 0xFFFF;
 
     pub fn set_speed(&mut self, speed_kbs: u16) {
         let cdb = crate::scsi::build_set_cd_speed(speed_kbs);

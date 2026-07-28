@@ -1,20 +1,14 @@
-//! Sector-level I/O traits.
+//! Sector-level read I/O traits.
 //!
-//! The sector layer is direction-typed: [`SectorSource`] reads
-//! 2048-byte sectors, [`SectorSink`] writes them. Concrete impls
-//! never do both — physical drives are read-only, file-backed
-//! ISO images are opened for read OR write at construction time.
+//! [`SectorSource`] reads 2048-byte sectors from a disc.
 //!
 //! - [`SectorSource`] is implemented by `Drive` (hardware) and
 //!   [`FileSectorSource`] (file-backed).
-//! - [`SectorSink`] is implemented by [`FileSectorSink`]
-//!   (ISO-backed).
 //! - [`DecryptingSectorSource`] is a decorator that wraps any
 //!   `SectorSource` and applies AACS / CSS in-place decrypt to
 //!   yield plaintext sectors.
 
 pub mod decrypting;
-pub mod file;
 pub mod prefetched;
 
 use crate::error::Result;
@@ -169,27 +163,8 @@ impl SectorSource for &mut (dyn SectorSource + '_) {
     }
 }
 
-/// Write 2048-byte sectors to a disc image or composed sink.
-///
-/// The terminal [`finish`] takes `Box<Self>` so it can run on `dyn
-/// SectorSink` and consume the sink (`fsync` + close).
-///
-/// [`finish`]: SectorSink::finish
-pub trait SectorSink: Send {
-    /// Write the sectors in `buf` starting at `lba`. `buf.len()`
-    /// must be a multiple of 2048; the implementation seeks to
-    /// `lba as u64 * 2048` before writing (the `u64` cast is required —
-    /// a bare `u32` `lba * 2048` wraps past ~4 GB on UHD-scale images).
-    fn write_sectors(&mut self, lba: u32, buf: &[u8]) -> Result<()>;
-
-    /// Flush, fsync, and close. Consumes the sink. Always called
-    /// last; subsequent operations are not defined.
-    fn finish(self: Box<Self>) -> Result<()>;
-}
-
 pub use crate::io::file_sector_source::FileSectorSource;
 pub use decrypting::{DecryptingSectorSource, KeyFetch, KeyFetchFn};
-pub use file::FileSectorSink;
 pub use prefetched::PrefetchedSectorSource;
 
 #[cfg(test)]

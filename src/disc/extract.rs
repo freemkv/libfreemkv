@@ -1,6 +1,7 @@
 //! `Disc::extract_tree` — decrypted file-tree extraction (`dir://`).
 //!
-//! Sibling of [`Disc::copy`](super::Disc::copy) (disc → ISO sector dump),
+//! Sibling of the disc→ISO sector dump (the sweep/patch recovery passes, which
+//! now live in the `freemkv-engine` crate),
 //! specialized to write **per file** rather than a whole image, applying
 //! decryption on the way out, and **without** any multipass / recovery
 //! orchestration. 1-shot, decrypt-only.
