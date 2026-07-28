@@ -381,7 +381,7 @@ impl AacsKeyMap {
 /// decorator can dispatch uniformly. A map index outside the held pool is a
 /// fail-loud [`Error::DecryptFailed`]: the resolver's job is to guarantee every
 /// selectable index is present, so a gap here is a resolver bug, not silent loss.
-pub fn decrypt_sectors_mapped(
+pub(crate) fn decrypt_sectors_mapped(
     buf: &mut [u8],
     keys: &DecryptKeys,
     base_lba: u32,

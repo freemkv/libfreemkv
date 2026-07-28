@@ -223,9 +223,11 @@ pub trait MuxEvents: Send + Sync + 'static {
     fn on_read_error(&self, _lba: u32) {}
 }
 
-/// A [`MuxEvents`] that ignores everything — for callers that render no
-/// progress.
-pub struct NoopEvents;
+/// A [`MuxEvents`] that ignores everything — test-only (production callers
+/// supply their own events sink).
+#[cfg(test)]
+pub(crate) struct NoopEvents;
+#[cfg(test)]
 impl MuxEvents for NoopEvents {}
 
 /// The result of a [`mux_stream`] run.

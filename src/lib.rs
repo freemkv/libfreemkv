@@ -126,7 +126,6 @@ pub mod progress;
 pub mod scsi;
 pub mod sector;
 pub mod session;
-pub(crate) mod speed;
 pub(crate) mod udf;
 pub(crate) mod unlock_bridge;
 
@@ -159,25 +158,26 @@ pub use error::{Error, Result, is_disc_level_no_key, is_halt, is_skippable_title
 
 // ─── Cooperative cancellation ───────────────────────────────────────────────
 //
-// One-bit cooperative cancellation token, shared by every long-running loop
-// in libfreemkv (sweep, patch, mux). Clone it cheaply; pass it by value into
-// each component; poll `is_cancelled()` inside the loop body.
+// One-bit cooperative cancellation token, shared by every long-running loop —
+// libfreemkv's mux, and the recovery passes (sweep/patch) that now live in the
+// freemkv-engine crate. Clone it cheaply; pass it by value into each component;
+// poll `is_cancelled()` inside the loop body.
 pub use halt::Halt;
 
-// Generic bounded producer/consumer primitive used by sweep, patch, and
-// mux to overlap reads with writes via a dedicated consumer thread.
+// Generic bounded producer/consumer primitive used by the mux pipeline (and,
+// via this re-export, by the engine's sweep/patch recovery passes) to overlap
+// reads with writes via a dedicated consumer thread.
 // `Pipeline::spawn(name, depth, sink)` spawns a named consumer; `pipe.send(item)`
 // pushes one item with back-pressure; `pipe.finish()` joins the
 // consumer and surfaces its `close()` output. Callers implement `Sink`
 // to define per-item behaviour and end-of-stream finalisation.
 //
 // `DEFAULT_PIPELINE_DEPTH` (=4) is for callers without specific needs;
-// most should use READ_PIPELINE_DEPTH or WRITE_PIPELINE_DEPTH instead.
+// most should use WRITE_PIPELINE_DEPTH instead.
 // Patch uses `WRITE_THROUGH_DEPTH` (=1). Returning `Flow::Stop` from
 // `apply` ends the consumer cleanly (still calls `close()`).
 pub use io::pipeline::{
-    DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, READ_PIPELINE_DEPTH, Sink, WRITE_PIPELINE_DEPTH,
-    WRITE_THROUGH_DEPTH,
+    DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, Sink, WRITE_PIPELINE_DEPTH, WRITE_THROUGH_DEPTH,
 };
 
 // ─── Bounded-cache buffered file writer ─────────────────────────────────────
@@ -206,10 +206,7 @@ pub use identity::DriveId;
 // don't touch `DecryptKeys` directly — `DiscStream::new(reader, title, keys, …)`
 // accepts whatever `Disc::decrypt_keys()` returned. `decrypt_sectors()` is
 // for callers that operate on raw sector buffers (e.g. ISO patching).
-pub use decrypt::{
-    AacsKeyMap, DecryptKeys, decrypt_sectors, decrypt_sectors_mapped, decrypt_threads,
-    set_decrypt_threads,
-};
+pub use decrypt::{AacsKeyMap, DecryptKeys, decrypt_sectors, decrypt_threads, set_decrypt_threads};
 
 // ─── Disc structure ─────────────────────────────────────────────────────────
 //
@@ -223,11 +220,10 @@ pub use decrypt::{
 // different concepts, the same short name; the trait gets the `Pes`
 // prefix at the crate root to keep both addressable.
 pub use disc::{
-    AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, DamageSeverity,
-    Disc, DiscFormat, DiscId, DiscTitle, DriveCredentials, Extent, ExtractOptions, ExtractResult,
-    FileResult, FrameRate, HdrFormat, Key, KeyOrigin, LabelPurpose, LabelQualifier, PatchOptions,
-    PatchOutcome, Resolution, SampleRate, ScanOptions, Stream, SubtitleStream, SweepOptions,
-    VideoStream, classify_damage,
+    AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, Disc,
+    DiscFormat, DiscId, DiscTitle, DriveCredentials, Extent, ExtractOptions, ExtractResult,
+    FileResult, FrameRate, HdrFormat, Key, KeyOrigin, LabelPurpose, LabelQualifier, Resolution,
+    SampleRate, ScanOptions, Stream, SubtitleStream, VideoStream,
 };
 pub use keysource::{DiscInputs, KeySource, read_encrypted_units, resolve_and_apply};
 
@@ -273,11 +269,9 @@ pub use mux::{Mp4FitReport, Mp4SkipReason, mp4_fit_report};
 pub use mux::build_iso_pipeline;
 pub use mux::resolve_mux_key_map;
 pub use mux::select::{PidFilter, StreamSelection};
-pub use mux::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, NoopEvents, mux_stream};
+pub use mux::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, mux_stream};
 pub use scsi::{DriveInfo, ScsiSense, ScsiTransport, SenseFamily, drive_has_disc, list_drives};
 pub use sector::{
-    DecryptingSectorSource, FileSectorSink, FileSectorSource, KeyFetch, PrefetchedSectorSource,
-    SectorSink, SectorSource,
+    DecryptingSectorSource, FileSectorSource, KeyFetch, PrefetchedSectorSource, SectorSource,
 };
-pub use speed::DriveSpeed;
 pub use udf::{UdfFs, read_filesystem};

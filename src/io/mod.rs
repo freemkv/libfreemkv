@@ -43,6 +43,5 @@ pub mod pipeline;
 pub use writeback_file::WritebackFile;
 
 pub use pipeline::{
-    DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, READ_PIPELINE_DEPTH, Sink, WRITE_PIPELINE_DEPTH,
-    WRITE_THROUGH_DEPTH,
+    DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, Sink, WRITE_PIPELINE_DEPTH, WRITE_THROUGH_DEPTH,
 };
