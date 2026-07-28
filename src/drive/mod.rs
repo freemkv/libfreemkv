@@ -4,7 +4,7 @@
 //! optionally unlocks/initializes via the `freemkv-unlock` dispatch
 //! (through [`crate::unlock_bridge`]), and reads sectors.
 
-pub(crate) fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
+pub fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
     match e {
         Error::ScsiError { status, sense, .. } => (*status, *sense),
         Error::DiscRead { status, sense, .. } => (status.unwrap_or(0), *sense),

@@ -138,7 +138,7 @@ pub(crate) mod unlock_bridge;
 pub use drive::capture::{
     CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string,
 };
-pub use drive::{Drive, DriveStatus, find_drive};
+pub use drive::{Drive, DriveStatus, extract_scsi_context, find_drive};
 
 // ─── Disc session (drive open + SCSI bring-up hoist) ─────────────────────────
 //
