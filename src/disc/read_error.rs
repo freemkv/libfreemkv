@@ -11,6 +11,7 @@
 
 use crate::error::Error;
 use crate::scsi;
+use crate::scsi::SenseFamily;
 
 /// In-flight bookkeeping a read loop must keep across iterations. The
 /// handler reads and mutates this. Caller owns the storage.
@@ -120,36 +121,6 @@ pub struct ReadCtx {
     /// pass summary so an operator can see how much of a "clean" rip was actually
     /// marginal.
     pub marginal_recovered: u64,
-}
-
-/// Coarse classification of a SCSI sense key for diagnostic logging.
-/// Wedge-family events (Hardware + IllegalRequest) get their own
-/// transition log when the sense family changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SenseFamily {
-    NotReady,
-    Medium,
-    Hardware,
-    IllegalRequest,
-    Other,
-}
-
-impl SenseFamily {
-    pub fn from_sense_key(sense_key: u8) -> Self {
-        match sense_key {
-            scsi::SENSE_KEY_NOT_READY => SenseFamily::NotReady,
-            scsi::SENSE_KEY_MEDIUM_ERROR => SenseFamily::Medium,
-            scsi::SENSE_KEY_HARDWARE_ERROR => SenseFamily::Hardware,
-            scsi::SENSE_KEY_ILLEGAL_REQUEST => SenseFamily::IllegalRequest,
-            _ => SenseFamily::Other,
-        }
-    }
-
-    /// True for the "wedge family" — Hardware + IllegalRequest are
-    /// the senses the BU40N firmware returns in its fast-fail state.
-    pub fn is_wedge_family(self) -> bool {
-        matches!(self, SenseFamily::Hardware | SenseFamily::IllegalRequest)
-    }
 }
 
 impl ReadCtx {
