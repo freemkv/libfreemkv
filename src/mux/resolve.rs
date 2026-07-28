@@ -2211,6 +2211,89 @@ mod tests {
         );
     }
 
+    /// End-to-end proof of stream selection: a title declaring TWO audio PIDs,
+    /// pruned to one via `StreamSelection::apply` BEFORE `build_iso_pipeline`,
+    /// must never surface a frame from the excluded PID. The demuxer is built
+    /// from the pruned `title.streams`, so the excluded PID is untracked and its
+    /// packets are skipped — track headers and frames both follow the pruned
+    /// list, which is the whole point of the selection seam.
+    #[test]
+    fn build_iso_pipeline_pruned_title_drops_unselected_pid_frames() {
+        use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate, Stream};
+        use crate::mux::select::{PidFilter, StreamSelection};
+
+        let es_keep = [0xDE, 0xAD, 0xBE, 0xEF];
+        let es_drop = [0x99, 0x88, 0x77, 0x66];
+        let pkt_keep = bdts_data_packet(0x1100, true, &audio_pes(&es_keep));
+        let pkt_drop = bdts_data_packet(0x1101, true, &audio_pes(&es_drop));
+        // Both 192-byte packets in one 3-sector extent (offsets 0 and 192).
+        let mut data = vec![0u8; 3 * 2048];
+        data[..192].copy_from_slice(&pkt_keep);
+        data[192..384].copy_from_slice(&pkt_drop);
+
+        // Title declares BOTH audio streams (eng 0x1100, spa 0x1101).
+        let mut title = aac_audio_title(0x1100);
+        title.streams.push(Stream::Audio(AudioStream {
+            pid: 0x1101,
+            codec: Codec::Aac,
+            channels: AudioChannels::Stereo,
+            language: "spa".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        }));
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 3,
+        }];
+
+        // Prune to keep only PID 0x1100 (the eng audio) — exactly what a
+        // `-a eng` selection resolves to.
+        let sel = StreamSelection {
+            audio: PidFilter::Only(vec![0x1100]),
+            subtitle: PidFilter::All,
+        };
+        sel.apply(&mut title).unwrap();
+        assert_eq!(
+            title.streams.len(),
+            1,
+            "only the kept audio survives pruning"
+        );
+
+        let mut stream = build_iso_pipeline(
+            MemSource { data },
+            title,
+            DecryptKeys::None,
+            8192,
+            ContentFormat::BdTs,
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("pipeline builds");
+
+        // Exactly ONE frame — the kept PID's — reaches us; the 0x1101 packet was
+        // never tracked by the demuxer, so it produced no frame.
+        let frame = stream
+            .read()
+            .expect("read ok")
+            .expect("one frame from 0x1100");
+        assert_eq!(frame.track, 0, "the single retained stream is track 0");
+        assert_eq!(
+            &frame.data[..es_keep.len()],
+            &es_keep[..],
+            "the KEPT PID's ES bytes"
+        );
+        assert!(
+            stream.read().unwrap().is_none(),
+            "clean EOF — the excluded 0x1101 packet never surfaced as a frame"
+        );
+        // The muxed stream info advertises exactly the one retained audio stream.
+        assert_eq!(stream.info().streams.len(), 1);
+    }
+
     /// build_iso_pipeline with batch_sectors = 0 must fail fast (the
     /// prefetcher rejects a zero batch as a programming error — a zero batch
     /// would spin the producer forever). Surfaced as an io error, not a hang.
