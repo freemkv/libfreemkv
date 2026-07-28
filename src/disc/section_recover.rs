@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::patch::{SubRanges, recovery_read};
-use super::read_error::SenseFamily;
+use crate::scsi::SenseFamily;
 use crate::sector::SectorSource;
 
 /// One 2048-byte sector.
