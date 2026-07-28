@@ -1391,6 +1391,33 @@ impl DiscTitle {
     pub fn total_sectors(&self) -> u64 {
         self.extents.iter().map(|e| e.sector_count as u64).sum()
     }
+
+    /// The title's audio streams, in declared order. Cleaner than matching on
+    /// the [`Stream`] enum for the common "iterate the audio tracks" case
+    /// (stream selection, the desktop UI's info panel, disc-info listing).
+    pub fn audio_streams(&self) -> impl Iterator<Item = &AudioStream> {
+        self.streams.iter().filter_map(|s| match s {
+            Stream::Audio(a) => Some(a),
+            _ => None,
+        })
+    }
+
+    /// The title's subtitle streams, in declared order.
+    pub fn subtitle_streams(&self) -> impl Iterator<Item = &SubtitleStream> {
+        self.streams.iter().filter_map(|s| match s {
+            Stream::Subtitle(s) => Some(s),
+            _ => None,
+        })
+    }
+
+    /// The title's video streams, in declared order (usually one; two for a
+    /// Blu-ray 3D MVC title — the base view plus the dependent view).
+    pub fn video_streams(&self) -> impl Iterator<Item = &VideoStream> {
+        self.streams.iter().filter_map(|s| match s {
+            Stream::Video(v) => Some(v),
+            _ => None,
+        })
+    }
 }
 
 // ─── Encryption ─────────────────────────────────────────────────────────────
