@@ -59,6 +59,7 @@ pub const E_MKV_INVALID: u16 = 6008;
 pub const E_NO_STREAMS: u16 = 6009;
 pub const E_HALTED: u16 = 6010;
 pub const E_MAPFILE_INVALID: u16 = 6011;
+pub const E_SELECTION_PID_UNKNOWN: u16 = 6014;
 pub const E_UDF_BUFFER_TOO_SMALL: u16 = 6012;
 pub const E_UDF_NOT_FILESYSTEM: u16 = 6013;
 
@@ -292,6 +293,12 @@ pub enum Error {
     IfoParse,
     MkvInvalid,
     NoStreams,
+    /// A [`crate::StreamSelection`] listed a PID that does not exist in the
+    /// title's declared streams — a caller bug (e.g. a stale scan), reported
+    /// loudly rather than silently producing an MKV missing a requested track.
+    SelectionPidUnknown {
+        pid: u16,
+    },
     /// ddrescue mapfile parse failed. `kind` is a stable, language-neutral
     /// identifier (e.g. `"status_char"`, `"hex"`); not a translatable
     /// English message.
@@ -579,6 +586,7 @@ impl Error {
             Error::IfoParse => E_IFO_PARSE,
             Error::MkvInvalid => E_MKV_INVALID,
             Error::NoStreams => E_NO_STREAMS,
+            Error::SelectionPidUnknown { .. } => E_SELECTION_PID_UNKNOWN,
             Error::MapfileInvalid { .. } => E_MAPFILE_INVALID,
             Error::AacsNoKeys => E_AACS_NO_KEYS,
             Error::AacsCertShort => E_AACS_CERT_SHORT,
@@ -785,6 +793,9 @@ impl std::fmt::Display for Error {
             }
             Error::InvalidCdbLength { len, max } => {
                 write!(f, "E{}: {}/{}", self.code(), len, max)
+            }
+            Error::SelectionPidUnknown { pid } => {
+                write!(f, "E{}: 0x{:04x}", self.code(), pid)
             }
             _ => write!(f, "E{}", self.code()),
         }

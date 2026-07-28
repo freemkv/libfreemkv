@@ -272,6 +272,7 @@ pub use mux::{Mp4FitReport, Mp4SkipReason, mp4_fit_report};
 // `SectorSource` to get plaintext sectors out.
 pub use mux::build_iso_pipeline;
 pub use mux::resolve_mux_key_map;
+pub use mux::select::{PidFilter, StreamSelection};
 pub use mux::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, NoopEvents, mux_stream};
 pub use scsi::{DriveInfo, ScsiSense, ScsiTransport, SenseFamily, drive_has_disc, list_drives};
 pub use sector::{

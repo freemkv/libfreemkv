@@ -19,10 +19,11 @@ reach into the others.
 The library exposes flat verbs; the caller drives the multipass loop. Autorip
 runs `Disc::sweep` once, then loops `Disc::patch` until either the mapfile is
 clean or the configured retry budget is exhausted, then hands the ISO off to
-the mux pipeline. The `freemkv` CLI does the same shape with a
-terminal-output progress sink. Layer 3 runs inside any consumer of
-`DiscStream` (direct PES pipeline, ISO playback, etc.) without caller
-involvement.
+the mux pipeline. The `freemkv` CLI does the same shape, but as of 1.6.0 the
+loop itself (including the multi-title rip loop) lives one layer up, in the
+shared `freemkv-engine` crate, with a terminal-output progress sink plugged
+into it as the `Sink`. Layer 3 runs inside any consumer of `DiscStream`
+(direct PES pipeline, ISO playback, etc.) without caller involvement.
 
 Three primitives compose the disc-side flow:
 
