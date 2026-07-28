@@ -180,6 +180,14 @@ pub use io::pipeline::{
     WRITE_THROUGH_DEPTH,
 };
 
+// ─── Bounded-cache buffered file writer ─────────────────────────────────────
+//
+// Drop-in `std::fs::File` replacement used everywhere the lib writes large
+// sequential output (mux, extract, sweep, patch) — drains dirty pages
+// continuously instead of bursting. General I/O infra, not recovery policy;
+// promoted to `pub` so freemkv-engine's relocated sweep/patch can use it too.
+pub use io::WritebackFile;
+
 // ─── Drive events (low-level callbacks) ─────────────────────────────────────
 pub use event::{BatchSizeReason, Event, EventKind};
 pub use identity::DriveId;
