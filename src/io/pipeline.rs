@@ -173,13 +173,8 @@ fn finish_with_grace<R: Send + 'static>(
 
 /// Default channel depth for callers without a specific reason to
 /// pick another value. Kept conservative (4) — most callers should
-/// use READ_PIPELINE_DEPTH or WRITE_PIPELINE_DEPTH instead.
+/// use WRITE_PIPELINE_DEPTH instead.
 pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
-
-/// Read pipeline depth. Larger buffer compensates for drive variability
-/// and NFS sync_file_range stalls; keeps ISO reader thread fed even when
-/// consumer blocks on write.
-pub const READ_PIPELINE_DEPTH: usize = 32;
 
 /// Write pipeline depth. Smaller buffer reduces backpressure risk when
 /// sync_file_range blocks; prevents producer from accumulating too much
