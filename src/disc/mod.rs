@@ -716,10 +716,7 @@ fn range_chapter(lba: u32, title: &DiscTitle) -> (Option<u32>, Option<f64>) {
 /// This is the single place range→chapter/time annotation happens; autorip used
 /// to own it and read the mapfile to do so. Now the library computes it from
 /// its in-memory mapfile + title, and the client renders the result verbatim.
-pub(crate) fn locate_ranges(
-    raw: &[(u64, u64)],
-    title: &DiscTitle,
-) -> crate::progress::LocatedProgress {
+pub fn locate_ranges(raw: &[(u64, u64)], title: &DiscTitle) -> crate::progress::LocatedProgress {
     use crate::consts::{MILLIS_PER_SEC, SECTOR_BYTES_U64};
     use crate::progress::{LocatedProgress, LocatedRange};
     const MAX_LOCATED: usize = 50;
