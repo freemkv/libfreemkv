@@ -929,6 +929,21 @@ pub fn is_halt(e: &std::io::Error) -> bool {
     io_error_code(e) == Some(E_HALTED)
 }
 
+/// Whether an [`io::Error`](std::io::Error) is a **disc-level** key failure —
+/// the disc as a whole cannot be decrypted, so EVERY title will fail the same
+/// way. Distinct from a per-title skippable stub
+/// ([`is_skippable_title_stub`]): `E_NO_DISC_KEY` (keydb present but no entry
+/// for this disc), `E_KEYDB_LOAD` (no keydb at all), and `E_AACS_NO_KEYS` (no
+/// usable AACS key material) are all whole-disc conditions. A multi-title rip
+/// loop should stop immediately on this (fail-fast) rather than iterate every
+/// title re-printing the same error.
+pub fn is_disc_level_no_key(e: &std::io::Error) -> bool {
+    matches!(
+        io_error_code(e),
+        Some(E_NO_DISC_KEY | E_KEYDB_LOAD | E_AACS_NO_KEYS)
+    )
+}
+
 impl Error {
     /// Borrow the drive-returned SPC-4 sense triple if this error is a
     /// [`Error::ScsiError`] carrying sense data. `None` for any other
