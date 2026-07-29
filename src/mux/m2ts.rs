@@ -8,7 +8,7 @@
 //! write-only.
 
 use super::meta;
-use crate::disc::{DiscTitle, Stream as DiscStream};
+use crate::disc::{Codec, DiscTitle, Stream as DiscStream};
 use std::io::{self, Write};
 
 /// BD transport stream write sink with embedded FMKV metadata
@@ -40,6 +40,16 @@ impl M2tsStream {
             .collect();
         let boxed: Box<dyn Write + Send> = Box::new(writer);
         let mut muxer = super::tsmux::TsMuxer::new(boxed, &pids);
+        // Only HEVC/H.264 arrive length-prefixed (MKV/PES NALU convention);
+        // MPEG-2 and VC-1 are already start-code ES and must NOT go through
+        // Annex-B conversion (see `TsMuxer::set_nal_video`) or the frame is
+        // silently mangled while the mux still reports success.
+        for (i, s) in title.streams.iter().enumerate() {
+            if let DiscStream::Video(v) = s {
+                let is_nal = matches!(v.codec, Codec::Hevc | Codec::H264);
+                muxer.set_nal_video(i, is_nal)?;
+            }
+        }
         for (i, cp) in title.codec_privates.iter().enumerate() {
             // codec_privates is parallel to streams/pids; ignore any
             // trailing entries that exceed the track count rather than
