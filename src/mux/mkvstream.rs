@@ -677,6 +677,15 @@ impl crate::pes::Stream for MkvStream {
                     let mut remaining = size;
                     let mut block: Option<Vec<u8>> = None;
                     let mut duration_ms: Option<u64> = None;
+                    // Keyframe-ness of a BlockGroup is carried ONLY by the
+                    // presence/absence of a ReferenceBlock child: inside a
+                    // BlockGroup the SimpleBlock 0x80 keyframe bit is reserved
+                    // and the writer always emits it as 0. Reading that bit
+                    // (as this arm used to) makes EVERY BlockGroup frame look
+                    // like a non-keyframe — which silently broke every re-mux
+                    // of MPEG-2 video, whose parser stamps a per-frame duration
+                    // so all of its frames take the BlockGroup path.
+                    let mut has_reference = false;
                     while remaining > 0 {
                         let (cid, cs, hlen) = ebml::read_element_header(&mut rs.reader)?;
                         if cs == u64::MAX {
@@ -700,6 +709,13 @@ impl crate::pes::Stream for MkvStream {
                             ebml::BLOCK_DURATION => {
                                 duration_ms = Some(read_uint_bounded(&mut rs.reader, cs)?);
                             }
+                            ebml::REFERENCE_BLOCK => {
+                                // Presence alone is the signal — this Block
+                                // references another, so it is not a keyframe.
+                                // The offset value itself is not needed here.
+                                has_reference = true;
+                                skip_bytes(&mut rs.reader, cs)?;
+                            }
                             _ => skip_bytes(&mut rs.reader, cs)?,
                         }
                     }
@@ -710,13 +726,17 @@ impl crate::pes::Stream for MkvStream {
                         // in foreign MKVs) — same scaling PTS uses.
                         let dur_ns =
                             duration_ms.map(|ticks| ticks.saturating_mul(rs.ts_scale_ns as u64));
-                        if let Some(frame) = parse_block(
+                        if let Some(mut frame) = parse_block(
                             &block,
                             rs.cluster_ts_ticks,
                             rs.ts_scale_ns,
                             streams_len,
                             dur_ns,
                         ) {
+                            // Override the flag-bit guess from `parse_block`
+                            // (meaningful for SimpleBlock only) with the
+                            // BlockGroup's authoritative signal.
+                            frame.keyframe = !has_reference;
                             return Ok(Some(frame));
                         }
                     }
@@ -1803,11 +1823,20 @@ mod tests {
 
     #[test]
     fn block_group_frame_round_trips_with_duration() {
-        // MkvMuxer emits AC3/PGS frames as a BlockGroup (BLOCK + BLOCK_DURATION).
-        // The reader must descend into the group and yield the frame (with its
-        // duration) rather than skipping it — otherwise every AC3/PGS frame this
-        // muxer writes is lost on read-back.
-        let block = [0x82u8, 0x00, 0x05, 0x00, 0x11, 0x22, 0x33]; // track 2, rel 5, not-kf, 3 data
+        // MkvMuxer emits AC3/PGS frames — and every MPEG-2 video frame — as a
+        // BlockGroup (BLOCK + BLOCK_DURATION [+ REFERENCE_BLOCK]). The reader
+        // must descend into the group and yield the frame (with its duration)
+        // rather than skipping it — otherwise every such frame this muxer writes
+        // is lost on read-back.
+        //
+        // Keyframe-ness: inside a BlockGroup the SimpleBlock 0x80 bit is
+        // RESERVED (always 0 here); a Block with NO ReferenceBlock child is a
+        // keyframe. This group has none, so the frame is a keyframe — which is
+        // also the truth for the AC-3/PGS frames this path was written for
+        // (they are self-contained). The `!keyframe` this test used to assert
+        // came from reading the reserved bit; see
+        // `reference_block_marks_block_group_frame_as_non_keyframe`.
+        let block = [0x82u8, 0x00, 0x05, 0x00, 0x11, 0x22, 0x33]; // track 2, rel 5, reserved bit 0, 3 data
         let mut bg_body = Vec::new();
         ebml::write_id(&mut bg_body, ebml::BLOCK).unwrap();
         ebml::write_size(&mut bg_body, block.len() as u64).unwrap();
@@ -1853,9 +1882,76 @@ mod tests {
             .unwrap()
             .expect("BlockGroup frame must be read");
         assert_eq!(frame.track, 1, "track 2 → index 1");
-        assert!(!frame.keyframe);
+        assert!(
+            frame.keyframe,
+            "a BlockGroup with no ReferenceBlock is a keyframe (the 0x80 bit is reserved here)"
+        );
         assert_eq!(frame.data, vec![0x11, 0x22, 0x33]);
         assert_eq!(frame.pts, 105 * 1_000_000, "pts = (cluster 100 + rel 5) ms");
+        assert_eq!(frame.duration_ns, Some(40 * 1_000_000));
+    }
+
+    /// A BlockGroup carrying a ReferenceBlock is NOT a keyframe — that element's
+    /// presence is the only non-keyframe signal a BlockGroup has (the
+    /// SimpleBlock 0x80 flag bit is reserved and always 0 inside one).
+    ///
+    /// Regression: the reader used to `skip_bytes` past REFERENCE_BLOCK and read
+    /// the reserved bit instead, so EVERY BlockGroup frame came back as a
+    /// non-keyframe. Since the MPEG-2 parser stamps a per-frame duration, all
+    /// MPEG-2 video takes the BlockGroup path — so no video frame ever looked
+    /// like a keyframe on re-mux. That silently dropped all video on
+    /// `mkv://`→`m2ts://` and failed `mkv://`→`mkv://` with E6008.
+    #[test]
+    fn reference_block_marks_block_group_frame_as_non_keyframe() {
+        // Same construction as the test above, plus a ReferenceBlock child.
+        let block = [0x82u8, 0x00, 0x05, 0x00, 0x11, 0x22, 0x33];
+        let mut bg_body = Vec::new();
+        ebml::write_id(&mut bg_body, ebml::BLOCK).unwrap();
+        ebml::write_size(&mut bg_body, block.len() as u64).unwrap();
+        bg_body.extend_from_slice(&block);
+        ebml::write_uint(&mut bg_body, ebml::BLOCK_DURATION, 40).unwrap();
+        // References a keyframe 40 ms earlier ⇒ this Block is not a seek point.
+        ebml::write_int(&mut bg_body, ebml::REFERENCE_BLOCK, -40).unwrap();
+
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        ebml::write_uint(&mut cluster, ebml::CLUSTER_TIMESTAMP, 100).unwrap();
+        ebml::write_id(&mut cluster, ebml::BLOCK_GROUP).unwrap();
+        ebml::write_size(&mut cluster, bg_body.len() as u64).unwrap();
+        cluster.extend_from_slice(&bg_body);
+
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        let mut tracks = Vec::new();
+        for (n, t) in [(1u64, 1u64), (2u64, 2u64)] {
+            let mut entry = Vec::new();
+            ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, n).unwrap();
+            ebml::write_uint(&mut entry, ebml::TRACK_TYPE, t).unwrap();
+            ebml::write_id(&mut tracks, ebml::TRACK_ENTRY).unwrap();
+            ebml::write_size(&mut tracks, entry.len() as u64).unwrap();
+            tracks.extend_from_slice(&entry);
+        }
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, tracks.len() as u64).unwrap();
+        out.extend_from_slice(&tracks);
+        out.extend_from_slice(&cluster);
+
+        let mut stream = MkvStream::open(Cursor::new(out)).unwrap();
+        let frame = stream
+            .read()
+            .unwrap()
+            .expect("BlockGroup frame must be read");
+        assert!(
+            !frame.keyframe,
+            "a BlockGroup WITH a ReferenceBlock must read back as a non-keyframe"
+        );
+        assert_eq!(frame.data, vec![0x11, 0x22, 0x33]);
         assert_eq!(frame.duration_ns, Some(40 * 1_000_000));
     }
 
