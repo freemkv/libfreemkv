@@ -282,6 +282,10 @@ pub fn mux_stream(
     // live `DiscStream`'s read loop — forward `BytesRead`/`SectorSkipped`/
     // `BatchSizeChanged`/`ReadError` back to the consumer's handle.
     let (stream, playlist_name): (Box<dyn Stream>, Option<String>) = match input_src {
+        // The Url path builds its demux INSIDE `input()`, which prunes to the
+        // selected streams via `InputOptions.selection` (which the caller sets).
+        // Note: `MuxOptions.selection` does NOT apply here — that's the File/
+        // Session arms' field; a Url-source caller must set `InputOptions.selection`.
         MuxInput::Url { url, opts: in_opts } => (input(url, &in_opts)?, None),
         MuxInput::Iso {
             path,
