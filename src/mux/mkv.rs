@@ -1469,27 +1469,36 @@ impl<W: Write + Seek> MkvMuxer<W> {
             Some(_) => None,
             None => None,
         };
+        // Offset (ticks) of the referenced keyframe relative to this block, for
+        // any BlockGroup Block that is NOT a keyframe. Inside a BlockGroup the
+        // SimpleBlock 0x80 keyframe bit is reserved and MUST be 0, so
+        // keyframe-ness is carried ONLY by the presence/absence of a
+        // ReferenceBlock. A non-keyframe that omits it is indistinguishable from
+        // an intra frame — which is how every MPEG-2 P/B frame used to be written
+        // (the MPEG-2 parser stamps a per-frame duration, so ALL its frames take
+        // the BlockGroup path, not just the intra ones this path was written for).
+        // Gated to video: audio/subtitle frames on this path are self-contained
+        // (keyframe==true), and referencing a video keyframe from a non-video
+        // track would be a bogus cross-track reference.
+        //
+        // Fall back to 0 (self-relative) in the pre-first-keyframe corner
+        // (unreachable in practice — such frames are dropped before a cluster
+        // opens) so the marker is never absent.
+        let reference = if keyframe || !is_video {
+            None
+        } else {
+            Some(
+                self.last_video_keyframe_ticks
+                    .map(|kf| kf - pts_ticks)
+                    .unwrap_or(0),
+            )
+        };
         match block_additional {
             // MVC: base view Block + dependent-view BlockAdditional, always a
             // BlockGroup. Non-keyframe base frames get a ReferenceBlock to the
             // last keyframe (a keyframe carries none), so a player never treats a
             // P/B frame as a seek point.
             Some(additional) => {
-                let reference = if keyframe {
-                    None
-                } else {
-                    // Offset (ticks) of the referenced keyframe relative to this
-                    // block. A non-keyframe MUST carry a ReferenceBlock or a reader
-                    // treats it as a seek point; fall back to 0 (self-relative) in
-                    // the pre-first-keyframe corner (unreachable in practice — such
-                    // frames are dropped before a cluster opens) so the marker is
-                    // never absent.
-                    Some(
-                        self.last_video_keyframe_ticks
-                            .map(|kf| kf - pts_ticks)
-                            .unwrap_or(0),
-                    )
-                };
                 self.write_block_group_mvc(
                     track_idx + 1,
                     relative_ts,
@@ -1500,9 +1509,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 )?;
             }
             None => match duration_ticks {
-                // BlockDuration present (PGS subtitles) → BlockGroup.
+                // BlockDuration present (PGS subtitles, AC-3 audio, and EVERY
+                // MPEG-2 video frame) → BlockGroup.
                 Some(dt) => {
-                    self.write_block_group(track_idx + 1, relative_ts, keyframe, data, dt)?;
+                    self.write_block_group(track_idx + 1, relative_ts, data, reference, dt)?;
                 }
                 None => {
                     self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
@@ -1797,22 +1807,25 @@ impl<W: Write + Seek> MkvMuxer<W> {
         Ok(())
     }
 
+    /// Write a BlockGroup (Block + BlockDuration, plus a ReferenceBlock when the
+    /// frame is not a keyframe).
+    ///
+    /// `reference` is `Some(offset_ticks)` for a non-keyframe and `None` for a
+    /// keyframe. Inside a BlockGroup the SimpleBlock `0x80` keyframe bit is
+    /// reserved and MUST be 0, so a non-keyframe that omits ReferenceBlock is
+    /// indistinguishable from an intra frame. This path is NOT subtitle-only:
+    /// the MPEG-2 parser stamps a per-frame duration, so every MPEG-2 video
+    /// frame (I, P and B) arrives here.
     fn write_block_group(
         &mut self,
         track_num: usize,
         relative_ts: i16,
-        keyframe: bool,
         data: &[u8],
+        reference: Option<i64>,
         duration_ticks: u64,
     ) -> io::Result<()> {
         let (tv, tv_len) = track_vint(track_num);
         let track_vint = &tv[..tv_len];
-        // The 0x80 Keyframe flag is defined only for SimpleBlock; inside a
-        // Block within a BlockGroup that high bit is reserved and MUST be 0
-        // (keyframe-ness is signalled by the absence of a ReferenceBlock
-        // child). `keyframe` is intentionally unused here — every Block this
-        // path emits is intra (PGS subtitle frames carrying a duration).
-        let _ = keyframe;
         let flags: u8 = 0x00;
         let block_size = track_vint.len() + 2 + 1 + data.len();
 
@@ -1824,6 +1837,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         self.writer.write_all(&[flags])?;
         self.writer.write_all(data)?;
         ebml::write_uint(&mut self.writer, ebml::BLOCK_DURATION, duration_ticks)?;
+        if let Some(ref_off) = reference {
+            ebml::write_int(&mut self.writer, ebml::REFERENCE_BLOCK, ref_off)?;
+        }
         ebml::end_master(&mut self.writer, bg_pos)?;
         Ok(())
     }
@@ -1886,6 +1902,206 @@ impl<W: Write + Seek> MkvMuxer<W> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Keyframe flags must survive a write→read round-trip for frames that
+    /// carry a per-frame DURATION, i.e. the BlockGroup path.
+    ///
+    /// Regression: every MPEG-2 frame carries a duration (the parser stamps one
+    /// on I, P and B alike), so ALL MPEG-2 video is written as BlockGroup, not
+    /// SimpleBlock. Inside a BlockGroup the SimpleBlock `0x80` keyframe bit is
+    /// reserved and the writer emits 0 — keyframe-ness lives ONLY in the
+    /// presence/absence of a ReferenceBlock. Two halves were broken:
+    ///   - the writer discarded `keyframe` on this path (no ReferenceBlock ever),
+    ///     so a shipped DVD rip marked every P/B frame as a seek point;
+    ///   - the reader ignored ReferenceBlock and read the always-0 reserved bit,
+    ///     so EVERY BlockGroup frame read back as a non-keyframe.
+    /// Downstream that silently dropped all video on `mkv://`(MPEG-2)→`m2ts://`
+    /// (TsMuxer drops non-key video until the first keyframe) and made
+    /// `mkv://`→`mkv://` / `stdio://` fail E6008 (MkvMuxer opens a cluster only
+    /// on a track-0 video keyframe → zero frames written).
+    ///
+    /// A SimpleBlock case (duration `None`) is asserted alongside so a fix that
+    /// regresses the non-duration path is caught too.
+    #[test]
+    fn keyframe_survives_roundtrip_for_duration_bearing_frames() {
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R480i,
+            frame_rate: crate::disc::FrameRate::F29_97,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt470bg,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        };
+        // ── BlockGroup path: every frame carries a duration (the MPEG-2 shape).
+        let t = MkvTrack::video(&v);
+        let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
+        let dur = Some(33_366_667u64);
+        // I, then P, then B — decode order, all duration-bearing.
+        muxer
+            .write_frame(0, 0, true, &vec![0xAA; 188_459], dur, None)
+            .unwrap();
+        muxer
+            .write_frame(0, 33_366_667, false, &vec![0xBB; 27_053], dur, None)
+            .unwrap();
+        muxer
+            .write_frame(0, 66_733_334, false, &vec![0xCC; 4_096], dur, None)
+            .unwrap();
+        let data = muxer.writer.into_inner();
+
+        // The non-keyframes MUST have emitted a ReferenceBlock; the file is
+        // otherwise structurally unable to express "not a seek point".
+        assert!(
+            find_id(&data, ebml::REFERENCE_BLOCK).is_some(),
+            "a non-keyframe BlockGroup must carry a ReferenceBlock"
+        );
+
+        let mut s = crate::mux::mkvstream::MkvStream::open(Cursor::new(data)).unwrap();
+        let f0 = crate::pes::Stream::read(&mut s).unwrap().unwrap();
+        assert!(
+            f0.keyframe,
+            "BlockGroup I-frame must read back keyframe=true"
+        );
+        let f1 = crate::pes::Stream::read(&mut s).unwrap().unwrap();
+        assert!(
+            !f1.keyframe,
+            "BlockGroup P-frame must read back keyframe=false"
+        );
+        let f2 = crate::pes::Stream::read(&mut s).unwrap().unwrap();
+        assert!(
+            !f2.keyframe,
+            "BlockGroup B-frame must read back keyframe=false"
+        );
+    }
+
+    /// SimpleBlock path (no per-frame duration) — the keyframe bit is
+    /// authoritative there and must keep round-tripping.
+    #[test]
+    fn keyframe_survives_roundtrip_for_simple_blocks() {
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R480i,
+            frame_rate: crate::disc::FrameRate::F29_97,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt470bg,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        };
+        let t = MkvTrack::video(&v);
+        let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
+        muxer
+            .write_frame(0, 0, true, &vec![0xAA; 188_459], None, None)
+            .unwrap();
+        muxer
+            .write_frame(0, 33_366_667, false, &vec![0xBB; 27_053], None, None)
+            .unwrap();
+        let data = muxer.writer.into_inner();
+
+        let mut s = crate::mux::mkvstream::MkvStream::open(Cursor::new(data)).unwrap();
+        let f0 = crate::pes::Stream::read(&mut s).unwrap().unwrap();
+        assert!(
+            f0.keyframe,
+            "SimpleBlock keyframe must read back keyframe=true"
+        );
+        let f1 = crate::pes::Stream::read(&mut s).unwrap().unwrap();
+        assert!(
+            !f1.keyframe,
+            "SimpleBlock non-keyframe must read back keyframe=false"
+        );
+    }
+
+    /// End-to-end through the REAL `MkvStream::create`/`write`/`finish` path
+    /// (deferred Pending→activate buffering), in the shape the DVD pipeline
+    /// actually produces: several AC-3 audio frames arrive BEFORE the first
+    /// video frame (audio emits per-PES immediately, while MPEG-2 holds its
+    /// first GOP), and the video frame carries a per-frame DURATION so it is
+    /// written as a BlockGroup.
+    ///
+    /// Guards the same regression as
+    /// `keyframe_survives_roundtrip_for_duration_bearing_frames`, but across the
+    /// buffering machinery rather than the bare muxer — the video keyframe must
+    /// still be a keyframe after being buffered and replayed on activation.
+    #[test]
+    fn mkvstream_preserves_video_keyframe_after_audio_preroll() {
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R480i,
+            frame_rate: crate::disc::FrameRate::F29_97,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt470bg,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        };
+        let a = crate::disc::AudioStream {
+            pid: 0xBD,
+            codec: Codec::Ac3,
+            channels: crate::disc::AudioChannels::Stereo,
+            language: String::new(),
+            sample_rate: crate::disc::SampleRate::S48,
+            secondary: false,
+            purpose: crate::disc::LabelPurpose::Normal,
+            label: String::new(),
+        };
+        let mut title = crate::disc::DiscTitle::empty();
+        title.streams.push(crate::disc::Stream::Video(v));
+        title.streams.push(crate::disc::Stream::Audio(a));
+
+        let dir = std::env::temp_dir()
+            .join("fmkv-test-preroll")
+            .join(format!("{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preroll.mkv");
+        let writer: Box<dyn crate::mux::WriteSeek + Send> =
+            Box::new(std::fs::File::create(&path).unwrap());
+        let mut s = crate::mux::mkvstream::MkvStream::create(writer, &title, None).unwrap();
+
+        // 5 audio frames arrive first (realistic pre-video buffering).
+        for i in 0..5u32 {
+            let f = crate::pes::PesFrame {
+                coding: None,
+                source: None,
+                track: 1,
+                pts: i as i64 * 32_000_000,
+                keyframe: false,
+                data: vec![0xCC; 768],
+                duration_ns: None,
+            };
+            crate::pes::Stream::write(&mut s, &f).unwrap();
+        }
+        // Then the true video keyframe — duration-bearing, as MPEG-2 always is,
+        // so it is written as a BlockGroup (where the keyframe bit is reserved).
+        let vf = crate::pes::PesFrame {
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xAA; 188_459],
+            duration_ns: Some(33_366_667),
+        };
+        crate::pes::Stream::write(&mut s, &vf).unwrap();
+        crate::pes::Stream::finish(&mut s).unwrap();
+        drop(s);
+
+        let f = std::fs::File::open(&path).unwrap();
+        let mut r = crate::mux::mkvstream::MkvStream::open(f).unwrap();
+        let f0 = crate::pes::Stream::read(&mut r).unwrap().unwrap();
+        assert_eq!(f0.track, 0, "first readback frame must be track 0 (video)");
+        assert!(
+            f0.keyframe,
+            "video keyframe written with 5 audio frames ahead of it must read back keyframe=true"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Anamorphic DVD: a 720x576 (R576i) PAL stream flagged 16:9 must write a
     /// DisplayWidth/Height carrying the 16:9 DAR (1024x576), NOT the square-pixel

@@ -42,6 +42,16 @@ pub struct TsMuxer<W: Write> {
     continuity: Vec<u8>,                  // per-PID continuity counter (0-15)
     codec_privates: Vec<Option<Vec<u8>>>, // per-track codec_private (for video parameter sets)
     params_written: Vec<bool>,            // per-track: have we written parameter sets?
+    /// Per-track: does this video track's ES arrive length-prefixed (MKV/PES
+    /// NALU convention — HEVC, H.264) and need Annex-B conversion? Defaults
+    /// to `true` (the prior, only behavior) so every existing call site is
+    /// unaffected; a track carrying MPEG-2 or VC-1 — neither is NAL-based,
+    /// both already arrive as plain start-code ES — must opt OUT via
+    /// [`TsMuxer::set_nal_video`] or `length_prefixed_to_annex_b` mangles the
+    /// frame into empty/garbage output (frame_count still increments, so the
+    /// mux "succeeds" while silently producing a video-less file). Ignored
+    /// for non-video tracks.
+    nal_video: Vec<bool>,
     /// Global PTS origin (nanoseconds), seeded by the FIRST video frame so
     /// the audio/video offset is preserved. Frames that arrive before it
     /// is set saturate to 0.
@@ -63,6 +73,7 @@ impl<W: Write> TsMuxer<W> {
             continuity: vec![0u8; n],
             codec_privates: vec![None; n],
             params_written: vec![false; n],
+            nal_video: vec![true; n],
             base_pts_ns: None,
             frame_count: 0,
         }
@@ -83,6 +94,25 @@ impl<W: Write> TsMuxer<W> {
             .into());
         }
         self.codec_privates[track] = Some(data);
+        Ok(())
+    }
+
+    /// Mark whether a video track's ES arrives length-prefixed (MKV/PES NALU
+    /// convention) and needs Annex-B conversion. Call with `false` for MPEG-2
+    /// or VC-1 tracks — neither is NAL-based, so the ES already IS the wire
+    /// format and must pass through unconverted (see [`Self::nal_video`]).
+    /// Ignored (harmlessly) for a non-video track. Returns
+    /// [`Error::MuxTrackRange`](crate::error::Error::MuxTrackRange) for an
+    /// out-of-range index.
+    pub fn set_nal_video(&mut self, track: usize, is_nal: bool) -> io::Result<()> {
+        if track >= self.nal_video.len() {
+            return Err(crate::error::Error::MuxTrackRange {
+                track,
+                tracks: self.nal_video.len(),
+            }
+            .into());
+        }
+        self.nal_video[track] = is_nal;
         Ok(())
     }
 
@@ -125,17 +155,19 @@ impl<W: Write> TsMuxer<W> {
         let base = self.base_pts_ns.unwrap_or(pts_ns);
         let pts_ns = pts_ns.saturating_sub(base);
 
-        // For video: convert length-prefixed NALUs to Annex B (start codes).
-        // Prepend codec_private parameter sets on the FIRST keyframe only.
+        // For NAL-based video (HEVC, H.264): convert length-prefixed NALUs to
+        // Annex B (start codes) and prepend codec_private parameter sets on
+        // the FIRST keyframe only.
         //
         // Arm `params_written` on the first video keyframe regardless of
         // whether it carries data: an empty-data keyframe still anchors
         // the stream, and leaving the flag unset would make every later
         // non-key frame fail the drop guard above and silently vanish.
-        // For non-video the ES bytes pass through unchanged, so borrow
-        // `data` directly rather than copying it; only video needs an
-        // owned Annex-B conversion buffer.
-        let es_data: std::borrow::Cow<'_, [u8]> = if is_video {
+        // For non-video AND for non-NAL video (MPEG-2, VC-1 — already
+        // start-code ES, never length-prefixed) the bytes pass through
+        // unchanged, so borrow `data` directly rather than copying it; only
+        // NAL video needs an owned Annex-B conversion buffer.
+        let es_data: std::borrow::Cow<'_, [u8]> = if is_video && self.nal_video[track] {
             let mut annex_b = Vec::new();
             if keyframe && !self.params_written[track] {
                 if let Some(ref cp) = self.codec_privates[track] {
@@ -148,6 +180,9 @@ impl<W: Write> TsMuxer<W> {
             annex_b.extend_from_slice(&length_prefixed_to_annex_b(data));
             std::borrow::Cow::Owned(annex_b)
         } else {
+            if is_video {
+                self.params_written[track] = true;
+            }
             std::borrow::Cow::Borrowed(data)
         };
 
