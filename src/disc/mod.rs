@@ -4808,21 +4808,4 @@ mod tests {
         assert_eq!(chapter_name(0), "1");
         assert_eq!(chapter_name(41), "42");
     }
-
-    // ── Regression tests for bisect inner-loop ReadAction dispatch ───────────
-    //
-    // Before the fix the bisect inner loop discarded the ReadAction returned by
-    // handle_read_error:
-    //
-    //   let _ = read_error::handle_read_error(&inner_err, &mut read_ctx);
-    //
-    // Consequences:
-    //   (a) Retry{pause_secs} — cooldown skipped; sector immediately marked
-    //       BisectBad, hammering a degraded drive (violates Hard Rule #2).
-    //   (b) AbortPass — ignored; loop kept issuing reads against a crashed drive.
-    //
-    // The fix replaces the discard with a match.  The tests below prove the
-    // required ReadAction values are produced by handle_read_error in the
-    // bisect-inner context (bisecting=true, batch=1), so that any regression
-    // to `let _ = ...` would break real behaviour on the tested error paths.
 }
