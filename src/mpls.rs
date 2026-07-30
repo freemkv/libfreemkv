@@ -1416,4 +1416,285 @@ mod tests {
         data[8..12].copy_from_slice(&40u32.to_be_bytes()); // playlist_start = 40 = len
         assert!(parse(&data).is_err());
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Added: STN-table block alignment and section-boundary hardening.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build an MPLS from raw PlayItem bodies, with no PlayListMark section
+    /// (mark_start = 0). Lets a test control item_length exactly.
+    fn build_mpls_raw_items(items: &[Vec<u8>]) -> Vec<u8> {
+        let playlist_start: u32 = 40;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"MPLS0200");
+        buf.extend_from_slice(&playlist_start.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 28]); // mark_start = 0, then padding
+        let pl_start = buf.len();
+        buf.extend_from_slice(&[0u8; 4]); // PlayList length placeholder
+        buf.extend_from_slice(&[0u8; 2]); // reserved
+        buf.extend_from_slice(&(items.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&[0u8; 2]); // num_sub_paths
+        for it in items {
+            buf.extend_from_slice(&(it.len() as u16).to_be_bytes());
+            buf.extend_from_slice(it);
+        }
+        let pl_len = (buf.len() - pl_start - 4) as u32;
+        buf[pl_start..pl_start + 4].copy_from_slice(&pl_len.to_be_bytes());
+        buf
+    }
+
+    /// The 20 bytes a PlayItem needs for clip_id(5) + codec_id(4) +
+    /// connection_condition(1) + reserved(2) + IN_time(4) + OUT_time(4).
+    fn play_item_20(clip: &[u8; 5], cc: u8, in_t: u32, out_t: u32) -> Vec<u8> {
+        let mut it = Vec::new();
+        it.extend_from_slice(clip);
+        it.extend_from_slice(b"M2TS");
+        it.push(cc);
+        it.extend_from_slice(&[0u8; 2]);
+        it.extend_from_slice(&in_t.to_be_bytes());
+        it.extend_from_slice(&out_t.to_be_bytes());
+        assert_eq!(it.len(), 20);
+        it
+    }
+
+    /// A PlayItem body of exactly 20 bytes carries every field the parser
+    /// reads (the last is OUT_time at [16..20]), so it must be RECORDED,
+    /// not skipped — and it has no STN table, which starts at byte 32.
+    #[test]
+    fn play_item_of_exactly_20_bytes_is_recorded_without_stn() {
+        let data = build_mpls_raw_items(&[play_item_20(b"00007", 5, 90_000, 180_000)]);
+        let pl = parse(&data).expect("a 20-byte PlayItem must parse");
+        assert_eq!(pl.play_items.len(), 1);
+        assert_eq!(pl.play_items[0].clip_id, "00007");
+        assert_eq!(pl.play_items[0].in_time, 90_000);
+        assert_eq!(pl.play_items[0].out_time, 180_000);
+        assert_eq!(pl.play_items[0].connection_condition, 5);
+        assert!(pl.streams.is_empty(), "no STN table exists below byte 32");
+    }
+
+    /// A 40-byte MPLS whose PlayList section is exactly its 10-byte header
+    /// (length(4)+reserved(2)+num_play_items(2)+num_sub_paths(2)) ending at
+    /// EOF is structurally complete, not truncated: nothing the parser reads
+    /// lies past the buffer, so it must parse to an empty playlist.
+    #[test]
+    fn minimum_size_mpls_with_empty_playlist_header_parses() {
+        let mut data = vec![0u8; 40];
+        data[0..4].copy_from_slice(b"MPLS");
+        data[4..8].copy_from_slice(b"0200");
+        data[8..12].copy_from_slice(&30u32.to_be_bytes()); // playlist_start + 10 == 40
+        // mark_start (12..16) stays 0; num_play_items at data[36..38] is 0.
+        let pl = parse(&data).expect("40-byte MPLS with a complete PlayList header must parse");
+        assert!(pl.play_items.is_empty());
+        assert!(pl.streams.is_empty());
+        assert!(pl.marks.is_empty());
+    }
+
+    /// A mark_start of 0 means "no PlayListMark section". The file header
+    /// bytes at offset 0 must not be decoded as one — data[4..6] is the
+    /// version string "02", which as a big-endian num_marks would be 12338.
+    #[test]
+    fn mark_start_zero_does_not_parse_header_as_marks() {
+        let data = build_mpls_raw_items(&[play_item_20(b"00007", 1, 0, 90_000)]);
+        assert_eq!(
+            &data[12..16],
+            &[0, 0, 0, 0],
+            "fixture must have mark_start 0"
+        );
+        let pl = parse(&data).expect("should parse");
+        assert!(
+            pl.marks.is_empty(),
+            "mark_start == 0 must mean absent, got {} marks",
+            pl.marks.len()
+        );
+    }
+
+    /// Full STN table walk with every category populated and DISTINCT
+    /// counts, so no count byte can be read from a neighbour's offset
+    /// without changing the result.
+    ///
+    /// Each secondary block is followed by its reference block(s), which
+    /// per the BD STN table are num_refs(1) + reserved(1) + one byte per
+    /// ref + one padding byte when the ref count is odd. Every ref count
+    /// here is 1 — the value that distinguishes `n % 2` (=1) from `n / 2`
+    /// (=0) — so a wrong skip length misaligns the cursor and every
+    /// following stream decodes from the wrong offset. IG entries are
+    /// consumed to keep the cursor aligned but never retained.
+    #[test]
+    fn full_stn_table_block_alignment() {
+        let mut entries: Vec<Vec<u8>> = Vec::new();
+        entries.push(build_stream_entry_video(0x1011, 0x1B, 6, 1, None));
+        entries.push(build_stream_entry_audio(0x1100, 0x83, 6, 1, b"eng"));
+        entries.push(build_stream_entry_audio(0x1101, 0x86, 3, 1, b"fra"));
+        entries.push(build_stream_entry_pg(0x1200, 0x90, b"eng"));
+        entries.push(build_stream_entry_pg(0x1201, 0x90, b"fra"));
+        entries.push(build_stream_entry_pg(0x1202, 0x90, b"deu"));
+        for i in 0..4u16 {
+            entries.push(build_stream_entry_pg(0x1400 + i, 0x91, b"eng"));
+        }
+        // secondary audio + its secondary-audio ref block (1 ref → 1 pad)
+        let mut sec_audio = build_stream_entry_audio(0x1A00, 0x83, 3, 1, b"spa");
+        sec_audio.extend_from_slice(&[1, 0, 0x55, 0x00]);
+        entries.push(sec_audio);
+        // secondary video + audio-ref block + PiP-PG-ref block
+        let mut sec_video = build_stream_entry_video(0x1B00, 0x1B, 4, 1, None);
+        sec_video.extend_from_slice(&[1, 0, 0x55, 0x00]);
+        sec_video.extend_from_slice(&[1, 0, 0x66, 0x00]);
+        entries.push(sec_video);
+        // PiP PG + its ref block
+        let mut pip_pg = build_stream_entry_pg(0x1C00, 0x90, b"jpn");
+        pip_pg.extend_from_slice(&[1, 0, 0x77, 0x00]);
+        entries.push(pip_pg);
+        // Dolby Vision enhancement layer
+        entries.push(build_stream_entry_video(0x1015, 0x24, 8, 1, Some(0x12)));
+
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9_000_000)],
+            (1, 2, 3, 4, 1, 1, 1, 1),
+            &entries,
+        );
+        let pl = parse(&data).expect("should parse");
+
+        let got: Vec<(u8, u16, bool)> = pl
+            .streams
+            .iter()
+            .map(|s| (s.stream_type, s.pid, s.secondary))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, 0x1011, false), // primary video
+                (2, 0x1100, false), // primary audio ×2
+                (2, 0x1101, false),
+                (3, 0x1200, false), // PG ×3
+                (3, 0x1201, false),
+                (3, 0x1202, false),
+                // the 4 IG entries are consumed and discarded
+                (5, 0x1A00, true), // secondary audio
+                (6, 0x1B00, true), // secondary video
+                (3, 0x1C00, true), // PiP PG
+                (7, 0x1015, true), // Dolby Vision EL
+            ]
+        );
+        // Languages prove each entry was decoded at its own offset.
+        assert_eq!(pl.streams[1].language, "eng");
+        assert_eq!(pl.streams[2].language, "fra");
+        assert_eq!(pl.streams[6].language, "spa");
+        assert_eq!(pl.streams[8].language, "jpn");
+    }
+
+    /// A secondary block whose stream entry ends exactly at the end of the
+    /// PlayItem has no reference block at all; the count byte must not be
+    /// read from one-past-the-end. Covers all three secondary blocks that
+    /// carry reference data.
+    #[test]
+    fn secondary_ref_block_at_item_end_is_not_read() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+
+        // Secondary audio is the last entry, with no ref bytes following.
+        let sec_audio = build_stream_entry_audio(0x1A00, 0x83, 3, 1, b"eng");
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9_000_000)],
+            (1, 0, 0, 0, 1, 0, 0, 0),
+            &[video.clone(), sec_audio],
+        );
+        let pl = parse(&data).expect("secondary audio at item end");
+        assert_eq!(pl.streams.len(), 2);
+        assert_eq!(pl.streams[1].pid, 0x1A00);
+
+        // Secondary video is the last entry, with no ref bytes following.
+        let sec_video = build_stream_entry_video(0x1B00, 0x1B, 4, 1, None);
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9_000_000)],
+            (1, 0, 0, 0, 0, 1, 0, 0),
+            &[video.clone(), sec_video.clone()],
+        );
+        let pl = parse(&data).expect("secondary video at item end");
+        assert_eq!(pl.streams.len(), 2);
+        assert_eq!(pl.streams[1].pid, 0x1B00);
+
+        // Secondary video whose audio-ref block ends exactly at item end, so
+        // the PiP-PG ref count byte would sit one past it.
+        let mut sec_video_arefs = sec_video;
+        sec_video_arefs.extend_from_slice(&[0, 0]); // n_arefs = 0, reserved
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9_000_000)],
+            (1, 0, 0, 0, 0, 1, 0, 0),
+            &[video.clone(), sec_video_arefs],
+        );
+        let pl = parse(&data).expect("secondary video aref block at item end");
+        assert_eq!(pl.streams.len(), 2);
+        assert_eq!(pl.streams[1].pid, 0x1B00);
+
+        // PiP PG is the last entry, with no ref bytes following.
+        let pip_pg = build_stream_entry_pg(0x1C00, 0x90, b"jpn");
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9_000_000)],
+            (1, 0, 0, 0, 0, 0, 1, 0),
+            &[video, pip_pg],
+        );
+        let pl = parse(&data).expect("PiP PG at item end");
+        assert_eq!(pl.streams.len(), 2);
+        assert_eq!(pl.streams[1].pid, 0x1C00);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // parse_stream_entry bounds, exercised directly.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Fewer than 2 bytes remain for the stream_entry header
+    /// (length(1) + stream_entry_type(1)) → None, without reading either.
+    #[test]
+    fn stream_entry_header_past_end_is_none() {
+        let item = [0u8; 8];
+        for pos in 7..12usize {
+            assert!(
+                parse_stream_entry(&item, pos, STREAM_CATEGORY_VIDEO).is_none(),
+                "pos={pos}"
+            );
+        }
+    }
+
+    /// The stream_attributes header (length(1) + coding_type(1)) lies past
+    /// the end of the PlayItem → None, without reading the length byte.
+    #[test]
+    fn stream_attributes_header_past_end_is_none() {
+        // se_len = 3 → se_end = 4 == item.len(); the sa length byte would be
+        // at item[4] and the coding type at item[5].
+        let item = [3u8, STREAM_ENTRY_PLAYITEM_CLIP, 0x10, 0x11];
+        assert!(parse_stream_entry(&item, 0, STREAM_CATEGORY_VIDEO).is_none());
+    }
+
+    /// A declared stream_attributes length of 0 has no coding_type byte and
+    /// must be rejected — even when the (empty) attribute region is itself
+    /// in bounds.
+    #[test]
+    fn zero_length_attributes_in_bounds_is_none() {
+        // se_len = 3 → se_end = 4; sa_len = item[4] = 0 → sa_end = 5 ≤ 6.
+        let item = [3u8, STREAM_ENTRY_PLAYITEM_CLIP, 0x10, 0x11, 0, 0];
+        assert!(parse_stream_entry(&item, 0, STREAM_CATEGORY_VIDEO).is_none());
+    }
+
+    /// stream_attributes of exactly 1 byte carries only the coding_type.
+    /// That is the minimum the parser accepts, so the entry is returned
+    /// with its PID and coding_type and no format-specific fields — for a
+    /// PG stream the 3-byte language must NOT be read past the attributes.
+    #[test]
+    fn one_byte_stream_attributes_yields_bare_entry() {
+        // se_len = 3 → se_end = 4; sa_len = 1 → sa_end = 6 == item.len().
+        let item = [3u8, STREAM_ENTRY_PLAYITEM_CLIP, 0x10, 0x11, 1, 0x1B];
+        let (entry, next) =
+            parse_stream_entry(&item, 0, STREAM_CATEGORY_VIDEO).expect("1-byte attrs are valid");
+        assert_eq!(entry.pid, 0x1011);
+        assert_eq!(entry.coding_type, 0x1B);
+        assert_eq!(entry.video_format, 0);
+        assert_eq!(entry.video_rate, 0);
+        assert_eq!(next, 6);
+
+        let pg = [3u8, STREAM_ENTRY_PLAYITEM_CLIP, 0x12, 0x00, 1, 0x90];
+        let (entry, _) = parse_stream_entry(&pg, 0, STREAM_CATEGORY_PG_SUBTITLE)
+            .expect("1-byte PG attrs are valid");
+        assert_eq!(entry.pid, 0x1200);
+        assert_eq!(entry.coding_type, 0x90);
+        assert_eq!(entry.language, "");
+    }
 }
