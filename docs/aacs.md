@@ -65,27 +65,38 @@ if disc.encrypted {
     }
 }
 
-// Read content -- decryption is automatic
-let mut reader = disc.open_title(&mut session, 0).unwrap();
-while let Some(unit) = reader.read_unit().unwrap() {
-    // decrypted content
+// Read content -- decryption is applied on read by the DiscStream decorator.
+// Live disc does NOT go through the URL resolver: `input("disc://...")` returns
+// Error::DiscUrlNotDirect by design.
+let keys = disc.decrypt_keys();
+let mut stream = DiscStream::new(
+    Box::new(drive),
+    disc.titles[0].clone(),
+    keys,
+    batch_sectors,
+    disc.titles[0].content_format,
+    false, // raw: false → decrypt on read
+    None,  // halt
+)?;
+while let Ok(Some(frame)) = stream.read() {
+    // decrypted PES frames
 }
 ```
 
-The application never touches keys, never calls decryption functions, and never
-manages handshakes. All of that is internal to `Disc::scan()` and the content
-reader.
+The application never calls decryption functions and never manages the
+drive-level handshake. It DOES own key resolution — see below.
 
-### KEYDB Location
+### Key resolution is the caller's job
 
-`ScanOptions` controls where the keydb is loaded from. If no explicit path is
-set, the library checks the standard config locations. To specify an explicit
-path:
+`libfreemkv` is **lookup-free: it resolves no keys and reads no keydb.** There is
+no `ScanOptions::with_keydb`, and `ScanOptions` has no keydb field — its only
+scan input is the optional drive credentials for the live-drive authenticated
+handshake.
 
-```rust
-let opts = ScanOptions::with_keydb("/path/to/keydb.cfg");
-let disc = Disc::scan(&mut session, &opts).unwrap();
-```
+The caller resolves a key out-of-band through a key source and applies it with
+[`Disc::decrypt_with`]. `freemkv-keysources` is the crate that implements the
+keydb and key-server sources; `ScanOptions::key_sources` takes them as
+`Box<dyn KeySource>`.
 
 ### AacsState
 
@@ -97,7 +108,7 @@ After a successful scan, `disc.aacs` contains an `AacsState`:
 | `bus_encryption` | `bool` | Whether bus encryption is active |
 | `mkb_version` | `Option<u32>` | MKB version from disc |
 | `disc_hash` | `String` | Identifier for the disc's key-input files |
-| `key_source` | `KeySource` | How the disc's key was resolved |
+| `key_source` | `KeyOrigin` | How the disc's key was resolved |
 
 ## keydb.cfg
 
