@@ -340,9 +340,34 @@ impl PsDemuxer {
             }
         }
 
+        // Trim a start-code-free tail. Every other exit from the loop above
+        // leaves the buffer bounded (a pack, system header or length-bounded
+        // PES is at most ~64 KiB; a length-0 PES is force-flushed at
+        // MAX_PS_BUFFER), but a buffer that holds no `00 00 01` at all never
+        // reaches any of those branches: `find_start_code` returns None, `pos`
+        // stays 0 and nothing drains. Input that never contains a start code —
+        // a zero-filled VOB extent, or an AACS-encrypted clip probed as
+        // ciphertext — would then grow the buffer to the size of the whole
+        // title. Nothing in such a buffer can begin a PS unit except a 2-byte
+        // `00 00` prefix of a start code straddling the feed boundary, so keep
+        // exactly that and drop the rest. Lossless: the retained bytes are the
+        // only ones a later feed could complete into a start code.
+        if self.buffer.len() > START_CODE_PREFIX_KEEP && find_start_code(&self.buffer, 0).is_none()
+        {
+            let drop = self.buffer.len() - START_CODE_PREFIX_KEEP;
+            self.buffer.drain(..drop);
+            if self.has_base {
+                self.buffer_base += drop as u64;
+            }
+        }
+
         packets
     }
 }
+
+/// Bytes retained when the buffer holds no start code: a `00 00 01` prefix can
+/// straddle a feed boundary by at most its first two bytes.
+const START_CODE_PREFIX_KEEP: usize = 2;
 
 /// Find the next PS-layer unit boundary at or after `from`: a start code whose
 /// ID byte is a pack (0xBA), system header (0xBB), program-end (0xB9), or a
@@ -897,9 +922,53 @@ mod tests {
     }
 
     #[test]
-    fn unbounded_video_pes_buffer_is_bounded() {
+    fn input_with_no_start_code_at_all_is_bounded() {
+        // An extent that never contains a 00 00 01 start code — a zero-filled
+        // VOB extent, or an AACS-encrypted clip probed as ciphertext (see
+        // src/disc/hddvd.rs) — must not accumulate. The whole-title feed in
+        // src/mux/disc.rs would otherwise grow the buffer to the size of the
+        // title (up to ~90 GB for UHD).
+        let mut demuxer = PsDemuxer::new();
+        let chunk = vec![0u8; 1024 * 1024];
+        for _ in 0..(MAX_PS_BUFFER / chunk.len() + 8) {
+            assert!(demuxer.feed(&chunk).is_empty(), "no start code → no PES");
+        }
+        assert!(
+            demuxer.buffer.len() <= MAX_PS_BUFFER,
+            "buffer grew to {} with no start code ever seen (cap {})",
+            demuxer.buffer.len(),
+            MAX_PS_BUFFER
+        );
+        // Nothing in a start-code-free buffer can ever begin a unit except a
+        // 2-byte 00 00 prefix, so the retained tail is tiny.
+        assert!(
+            demuxer.buffer.len() <= 2,
+            "start-code-free tail retained {} bytes",
+            demuxer.buffer.len()
+        );
+    }
+
+    #[test]
+    fn start_code_split_across_feeds_still_parses() {
+        // The start-code-free trim must keep the 2 bytes that can be the
+        // prefix of a start code straddling a feed boundary.
+        let mut demuxer = PsDemuxer::new();
+        assert!(demuxer.feed(&[0xFF, 0xFF, 0x00, 0x00]).is_empty());
+        let mut rest = vec![0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00, 0xAA, 0xBB];
+        rest.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]); // PS-layer boundary
+        let packets = demuxer.feed(&rest);
+        assert_eq!(packets.len(), 1, "split start code must still be found");
+        assert_eq!(packets[0].stream_id, 0xE0);
+        assert_eq!(packets[0].data, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn unbounded_video_pes_over_cap_is_force_flushed() {
         // A corrupt stream declaring an unbounded PES followed by endless
         // non-boundary bytes must not grow the buffer without limit.
+        // NOTE: this case feeds a real start code first, so it exercises only
+        // the in-PES cap; the no-start-code path is covered by
+        // `input_with_no_start_code_at_all_is_bounded`.
         let mut demuxer = PsDemuxer::new();
         let header = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
         let packets = demuxer.feed(&header);
