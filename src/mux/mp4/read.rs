@@ -1197,6 +1197,398 @@ mod tests {
         assert_eq!(parse_stts(&stts, MAX_SAMPLE_COUNT), vec![1001, 1001, 1001]);
     }
 
+    // ── Composition offsets (`ctts`) — ISO/IEC 14496-12 §8.6.1.3.
+    //
+    // `ctts` is the ONLY place a reordered (B-frame) track's presentation time
+    // survives the write→read cycle: `stts` carries decode duration and `stss`
+    // carries sync points, so with the composition table wrong or absent every
+    // frame's PTS collapses onto its DTS and the picture order is destroyed.
+    // The writer's builder and this reader's parser must therefore be exact
+    // inverses, over the SIGNED offsets that make it a version-1 box.
+
+    #[test]
+    fn ctts_build_and_parse_are_exact_inverses_over_signed_offsets() {
+        // Includes a negative offset (version 1 only), a repeated run, and a
+        // value repeated non-adjacently — so a parser that loses the sign, drops
+        // the run expansion, or returns a constant cannot agree.
+        let offsets: Vec<i32> = vec![0, 2, -1, -1, 0, 3003];
+        let boxed = crate::mux::mp4::build_ctts(&offsets);
+
+        assert_eq!(&boxed[4..8], b"ctts", "box type");
+        assert_eq!(
+            boxed[8], 1,
+            "signed composition offsets require ctts version 1 (§8.6.1.3)"
+        );
+        // Run-length coalescing: the two adjacent -1s share one entry, so the
+        // six offsets become five runs. Size = 8 hdr + 4 ver/flags + 4 count + 5×8.
+        assert_eq!(
+            u32::from_be_bytes(boxed[0..4].try_into().unwrap()) as usize,
+            8 + 4 + 4 + 5 * 8,
+            "equal ADJACENT offsets coalesce into a single run"
+        );
+        assert_eq!(
+            u32::from_be_bytes(boxed[12..16].try_into().unwrap()),
+            5,
+            "entry_count is the run count, not the sample count"
+        );
+
+        // The box header is not part of the parser's input: it takes the payload
+        // from version/flags onward.
+        assert_eq!(parse_ctts(&boxed[8..], MAX_SAMPLE_COUNT), offsets);
+    }
+
+    #[test]
+    fn b_frame_presentation_order_survives_the_mp4_round_trip() {
+        // Four samples in DECODE order carrying a classic I-P-B-B reorder: the
+        // second sample presents last. At 25 fps (timescale 25, one tick per
+        // frame) the composition offsets are [0, +2, -1, -1] — negative, so this
+        // exercises the signed version-1 path end to end.
+        //
+        // Before this test the round trip asserted sample sizes and keyframe
+        // flags only, so the entire composition-time chain (VideoTiming::ctts,
+        // build_ctts, parse_ctts) was unconstrained and a demuxed B-frame title
+        // could have presented in decode order with nothing noticing.
+        use crate::disc::{
+            Codec, DiscTitle, FrameRate, HdrFormat, Resolution, Stream as DiscStreamE, VideoStream,
+        };
+        use crate::mux::mp4::Mp4Sink;
+        use crate::pes::{PesFrame, Stream as _};
+        use std::io::Cursor;
+
+        const FRAME_NS: i64 = 40_000_000; // 25 fps, exact
+
+        let mut t = DiscTitle::empty();
+        t.streams = vec![DiscStreamE::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::Hevc,
+            resolution: Resolution::R1080p,
+            frame_rate: FrameRate::F25,
+            hdr: HdrFormat::Sdr,
+            color_space: crate::disc::ColorSpace::Unknown,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        })];
+        t.codec_privates = vec![Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE])];
+
+        // (presentation time, payload byte) in decode order.
+        let plan: [(i64, u8); 4] = [
+            (0, 0x10),            // I, presents first
+            (3 * FRAME_NS, 0x20), // P, presents last
+            (FRAME_NS, 0x30),     // B
+            (2 * FRAME_NS, 0x40), // B
+        ];
+
+        let mut buf = Vec::new();
+        {
+            let mut sink = Mp4Sink::create(Cursor::new(&mut buf), &t).unwrap();
+            for (i, &(pts, fill)) in plan.iter().enumerate() {
+                sink.write(&PesFrame {
+                    track: 0,
+                    pts,
+                    keyframe: i == 0,
+                    data: vec![fill; 64 + i * 8],
+                    duration_ns: None,
+                    source: None,
+                    coding: None,
+                })
+                .unwrap();
+            }
+            sink.finish().unwrap();
+        }
+
+        let mut rd = Mp4Reader::from_reader(Cursor::new(buf), "reorder".into()).unwrap();
+        let mut got = Vec::new();
+        while let Some(f) = rd.read().unwrap() {
+            got.push((f.pts, f.data[0]));
+        }
+        assert_eq!(got.len(), 4);
+
+        // Frames come back in decode order (sorted by DTS), each still carrying
+        // the presentation time it was written with — identified by payload, so
+        // a reordering of the samples themselves cannot be mistaken for success.
+        assert_eq!(
+            got,
+            vec![
+                (0, 0x10),
+                (3 * FRAME_NS, 0x20),
+                (FRAME_NS, 0x30),
+                (2 * FRAME_NS, 0x40),
+            ],
+            "composition times must survive the write→read cycle"
+        );
+
+        // The property that matters to a player: presentation order differs from
+        // decode order, and sorting by PTS recovers the display sequence.
+        let mut by_pts = got.clone();
+        by_pts.sort_by_key(|&(pts, _)| pts);
+        assert_eq!(
+            by_pts.iter().map(|&(_, b)| b).collect::<Vec<_>>(),
+            vec![0x10, 0x30, 0x40, 0x20],
+            "display order is I,B,B,P — not the decode order I,P,B,B"
+        );
+    }
+
+    /// A track's declared duration must be its real length. `mdhd.duration` is in
+    /// the MEDIA timescale and `mvhd.duration` in the movie timescale
+    /// (ISO/IEC 14496-12 §8.2.2, §8.4.2); a player uses them to draw the seek bar
+    /// and to decide when the title ends, so a zeroed or constant duration makes
+    /// a correct file unseekable and apparently empty.
+    #[test]
+    fn declared_track_duration_equals_frame_count_times_frame_duration() {
+        use crate::disc::{
+            Codec, DiscTitle, FrameRate, HdrFormat, Resolution, Stream as DiscStreamE, VideoStream,
+        };
+        use crate::mux::mp4::Mp4Sink;
+        use crate::pes::{PesFrame, Stream as _};
+        use std::io::Cursor;
+
+        const FRAME_NS: i64 = 40_000_000; // 25 fps, exact
+        const FRAMES: usize = 5;
+
+        let mut t = DiscTitle::empty();
+        t.streams = vec![DiscStreamE::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::Hevc,
+            resolution: Resolution::R1080p,
+            frame_rate: FrameRate::F25,
+            hdr: HdrFormat::Sdr,
+            color_space: crate::disc::ColorSpace::Unknown,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        })];
+        t.codec_privates = vec![Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE])];
+
+        let mut buf = Vec::new();
+        {
+            let mut sink = Mp4Sink::create(Cursor::new(&mut buf), &t).unwrap();
+            for i in 0..FRAMES {
+                sink.write(&PesFrame {
+                    track: 0,
+                    pts: i as i64 * FRAME_NS,
+                    keyframe: i == 0,
+                    data: vec![0x55u8; 128],
+                    duration_ns: None,
+                    source: None,
+                    coding: None,
+                })
+                .unwrap();
+            }
+            sink.finish().unwrap();
+        }
+
+        let moov = find_box(&buf, b"moov").expect("moov");
+
+        // mvhd is a version-1 FullBox here: vflags(4) creation(8) modification(8)
+        // timescale(4) duration(8).
+        let mvhd = find_box(moov, b"mvhd").expect("mvhd");
+        assert_eq!(mvhd[0], 1, "mvhd version 1");
+        let movie_ts = be32(mvhd, 20);
+        let movie_dur = u64::from_be_bytes(mvhd[24..32].try_into().unwrap());
+        assert_eq!(movie_ts, 90_000);
+        assert_eq!(
+            movie_dur, 18_000,
+            "5 frames at 25 fps is 0.2 s = 18000 ticks at 90 kHz"
+        );
+
+        // mdhd, same version-1 layout, but in the media timescale the writer chose.
+        let mdhd = find_box(
+            find_box(find_box(moov, b"trak").expect("trak"), b"mdia").expect("mdia"),
+            b"mdhd",
+        )
+        .expect("mdhd");
+        assert_eq!(mdhd[0], 1, "mdhd version 1");
+        let media_ts = be32(mdhd, 20);
+        let media_dur = u64::from_be_bytes(mdhd[24..32].try_into().unwrap());
+        assert_eq!(media_ts, 25, "25 fps snaps to a 25-tick timescale");
+        assert_eq!(
+            media_dur, FRAMES as u64,
+            "duration is one tick per frame in this timescale"
+        );
+        assert_eq!(
+            media_dur as f64 / media_ts as f64,
+            movie_dur as f64 / movie_ts as f64,
+            "the two declared durations must describe the same wall-clock length"
+        );
+    }
+
+    /// The `moov` tree must carry the boxes ISO/IEC 14496-12 makes mandatory for a
+    /// playable track, with the field values the spec fixes. These live in this
+    /// module rather than the writer's because the box-walking helpers
+    /// ([`find_box`]) are here — asserting through them means the test reads the
+    /// file the way the demuxer does, instead of re-deriving the layout.
+    ///
+    /// Nothing in the demux path needs `tkhd`/`vmhd`/`smhd`/`dinf`, so an empty
+    /// one of any of them round-trips through this crate unnoticed while making
+    /// the file unplayable elsewhere.
+    #[test]
+    fn moov_tree_carries_the_mandatory_track_header_and_media_boxes() {
+        use crate::disc::{
+            AudioChannels, AudioStream, Codec, DiscTitle, FrameRate, HdrFormat, LabelPurpose,
+            Resolution, SampleRate, Stream as DiscStreamE, VideoStream,
+        };
+        use crate::mux::mp4::Mp4Sink;
+        use crate::pes::{PesFrame, Stream as _};
+        use std::io::Cursor;
+
+        let mut t = DiscTitle::empty();
+        t.streams = vec![
+            DiscStreamE::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::Hevc,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F25,
+                hdr: HdrFormat::Sdr,
+                color_space: crate::disc::ColorSpace::Unknown,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            }),
+            DiscStreamE::Audio(AudioStream {
+                pid: 0x1100,
+                codec: Codec::Ac3,
+                channels: AudioChannels::Surround51,
+                language: "eng".into(),
+                sample_rate: SampleRate::S48,
+                secondary: false,
+                purpose: LabelPurpose::Normal,
+                label: String::new(),
+            }),
+        ];
+        t.codec_privates = vec![Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]), None];
+
+        let ac3 = vec![
+            0x0B,
+            0x77,
+            0x00,
+            0x00,
+            0b00_010110,
+            0b01000_000,
+            0b111_00_00_1,
+            0x00,
+            0xFF,
+            0xFF,
+        ];
+
+        let mut buf = Vec::new();
+        {
+            let mut sink = Mp4Sink::create(Cursor::new(&mut buf), &t).unwrap();
+            for i in 0..4i64 {
+                sink.write(&PesFrame {
+                    track: 0,
+                    pts: i * 40_000_000,
+                    keyframe: i == 0,
+                    data: vec![0x55u8; 128],
+                    duration_ns: None,
+                    source: None,
+                    coding: None,
+                })
+                .unwrap();
+                sink.write(&PesFrame {
+                    track: 1,
+                    pts: i * 32_000_000,
+                    keyframe: true,
+                    data: ac3.clone(),
+                    duration_ns: None,
+                    source: None,
+                    coding: None,
+                })
+                .unwrap();
+            }
+            sink.finish().unwrap();
+        }
+
+        let moov = find_box(&buf, b"moov").expect("moov");
+        let traks = find_boxes_capped(moov, b"trak", usize::MAX);
+        assert_eq!(traks.len(), 2, "one video trak + one audio trak");
+
+        // ── tkhd (§8.3.2). Mandatory in every trak. flags bit 0 = track_enabled;
+        // a track with flags 0 is ignored by a conforming player. Width/height are
+        // 16.16 fixed point.
+        let vid_tkhd = find_box(traks[0], b"tkhd").expect("video tkhd");
+        assert_eq!(vid_tkhd[0], 1, "tkhd version 1");
+        let flags = u32::from_be_bytes([0, vid_tkhd[1], vid_tkhd[2], vid_tkhd[3]]);
+        assert_eq!(flags & 0x1, 0x1, "track_enabled must be set");
+        assert_eq!(be32(vid_tkhd, 20), 1, "first track_id is 1");
+        assert_eq!(
+            be32(vid_tkhd, 88) >> 16,
+            1920,
+            "tkhd width is 16.16 fixed point"
+        );
+        assert_eq!(be32(vid_tkhd, 92) >> 16, 1080, "tkhd height");
+
+        let aud_tkhd = find_box(traks[1], b"tkhd").expect("audio tkhd");
+        assert_eq!(be32(aud_tkhd, 20), 2, "second track_id is 2");
+        assert_eq!(
+            be16(aud_tkhd, 48),
+            0x0100,
+            "an audio track's tkhd volume is 1.0 (8.8 fixed), not muted"
+        );
+        assert_eq!(
+            (be32(aud_tkhd, 88), be32(aud_tkhd, 92)),
+            (0, 0),
+            "a sound track declares zero visual dimensions"
+        );
+
+        // ── minf media headers: vmhd for video, smhd for audio (§12.1.2, §12.2.2).
+        // Exactly one of them, and never the wrong one for the handler.
+        let minf = |trak: &[u8]| -> Vec<u8> {
+            find_box(find_box(trak, b"mdia").expect("mdia"), b"minf")
+                .expect("minf")
+                .to_vec()
+        };
+        let vid_minf = minf(traks[0]);
+        let aud_minf = minf(traks[1]);
+
+        let vmhd = find_box(&vid_minf, b"vmhd").expect("video minf must carry vmhd");
+        assert!(
+            find_box(&vid_minf, b"smhd").is_none(),
+            "a video minf must not carry smhd"
+        );
+        // §12.1.2 fixes vmhd flags to 1.
+        assert_eq!(
+            u32::from_be_bytes([0, vmhd[1], vmhd[2], vmhd[3]]),
+            1,
+            "vmhd flags must be 1"
+        );
+        assert_eq!(
+            (be16(vmhd, 4), &vmhd[6..12]),
+            (0u16, &[0u8; 6][..]),
+            "graphicsmode 0 (copy) with a zero opcolor"
+        );
+
+        let smhd = find_box(&aud_minf, b"smhd").expect("audio minf must carry smhd");
+        assert!(
+            find_box(&aud_minf, b"vmhd").is_none(),
+            "an audio minf must not carry vmhd"
+        );
+        assert_eq!(be16(smhd, 4), 0, "smhd balance is centre");
+
+        // ── dinf > dref > "url " with flags 1 = media is in THIS file (§8.7.2).
+        // Both tracks need it; a missing/empty dref makes the samples unreachable.
+        for (name, m) in [("video", &vid_minf), ("audio", &aud_minf)] {
+            let dinf = find_box(m, b"dinf").unwrap_or_else(|| panic!("{name} dinf"));
+            let dref = find_box(dinf, b"dref").unwrap_or_else(|| panic!("{name} dref"));
+            assert_eq!(be32(dref, 4), 1, "{name} dref entry_count");
+            let url = find_box(&dref[8..], b"url ").unwrap_or_else(|| panic!("{name} url "));
+            // `url ` payload is version(1)+flags(3) only when self-contained.
+            assert_eq!(
+                u32::from_be_bytes([0, url[1], url[2], url[3]]),
+                1,
+                "{name} url flags=1 (self-contained), so no external name follows"
+            );
+            assert_eq!(
+                url.len(),
+                4,
+                "{name} self-contained url carries no location"
+            );
+        }
+    }
+
     // ── Untrusted-input hardening: a crafted MP4 must never panic or over-allocate.
 
     #[test]

@@ -1413,6 +1413,49 @@ mod tests {
         assert!(ogm.contains("CHAPTER02NAME=2"));
     }
 
+    /// Chapter names originate on the disc, which is untrusted input, and the
+    /// sink drops them straight into an XML document (`<ChapterString>`). Escaping
+    /// is what keeps a hostile or merely odd name from terminating the element and
+    /// injecting markup — the document is character data, so XML 1.0 §2.4 requires
+    /// `&` and `<`, and escaping `>` as well keeps a `]]>` sequence safe too.
+    ///
+    /// The order matters as much as the set: `&` must be replaced FIRST, otherwise
+    /// the ampersands introduced by the `<`/`>` replacements get escaped a second
+    /// time and `<` renders as the literal text `&lt;` instead of a `<`.
+    #[test]
+    fn chapter_names_are_xml_escaped_so_a_disc_cannot_inject_markup() {
+        let chaps = vec![Chapter {
+            time_secs: 0.0,
+            name: "</ChapterString><Injected/> Tom & Jerry <3 >:(".to_string(),
+        }];
+        let xml = chapters_xml(&chaps);
+
+        assert!(
+            xml.contains(
+                "<ChapterString>&lt;/ChapterString&gt;&lt;Injected/&gt; \
+                 Tom &amp; Jerry &lt;3 &gt;:(</ChapterString>"
+            ),
+            "every metacharacter escaped, and `&` escaped first so nothing is \
+             double-escaped; got:\n{xml}"
+        );
+        // The injected element must not survive as markup anywhere in the file.
+        assert!(
+            !xml.contains("<Injected/>"),
+            "a chapter name must not be able to open a new element"
+        );
+        // Exactly one ChapterString element pair — the name did not close it early.
+        assert_eq!(xml.matches("<ChapterString>").count(), 1);
+        assert_eq!(xml.matches("</ChapterString>").count(), 1);
+
+        // A name with no metacharacters passes through byte-identical: escaping
+        // must not rewrite ordinary text.
+        let plain = chapters_xml(&[Chapter {
+            time_secs: 0.0,
+            name: "Opening Credits".to_string(),
+        }]);
+        assert!(plain.contains("<ChapterString>Opening Credits</ChapterString>"));
+    }
+
     // ── Timeline continuity ──────────────────────────────────────────────────
     //
     // The corrector itself is tested verbatim in `crate::mux::timeline`. Here we
