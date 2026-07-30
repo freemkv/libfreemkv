@@ -786,13 +786,139 @@ const FMTS_POOL_TAG_BASE: u32 = 1 << 24;
 /// are excluded, so the answer is a property of the DISC and not of how many titles
 /// have already resolved through the shared pool.
 fn single_base_key_slot(unit_keys: &[(u32, [u8; 16])]) -> Option<usize> {
-    let mut base = unit_keys
+    match base_key_slots(unit_keys)[..] {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
+/// The pool slots of the disc's BASE CPS Unit Keys, in pool order — i.e. every
+/// entry that is not a forensic index key banked by [`resolve_fmts_key_map`]
+/// ([`FMTS_POOL_TAG_BASE`]). One element per CPS unit whose key is held.
+fn base_key_slots(unit_keys: &[(u32, [u8; 16])]) -> Vec<usize> {
+    unit_keys
         .iter()
         .enumerate()
         .filter(|(_, (cps_id, _))| *cps_id < FMTS_POOL_TAG_BASE)
-        .map(|(slot, _)| slot);
-    let slot = base.next()?;
-    base.next().is_none().then_some(slot)
+        .map(|(slot, _)| slot)
+        .collect()
+}
+
+/// Read a spread of real encrypted aligned units from `[start, start + sectors)`.
+/// Only units that are genuinely AACS-encrypted are returned, so a caller can
+/// treat a decrypt-to-clean as proof that the key it used is this extent's.
+fn sample_encrypted_units(
+    reader: &mut dyn SectorSource,
+    start: u32,
+    sectors: u32,
+    format: ContentFormat,
+) -> Vec<Vec<u8>> {
+    use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
+    let total_units = sectors / ALIGNED_UNIT_SECTORS;
+    let mut out = Vec::new();
+    if total_units == 0 {
+        return out;
+    }
+    const PROBES: u32 = 8;
+    for p in 1..=PROBES {
+        let unit = ((total_units as u64 * p as u64) / (PROBES as u64 + 1)) as u32;
+        if unit >= total_units {
+            continue;
+        }
+        let lba = start.saturating_add(unit.saturating_mul(ALIGNED_UNIT_SECTORS));
+        let mut buf = vec![0u8; ALIGNED_UNIT_LEN];
+        if reader
+            .read_sectors(lba, ALIGNED_UNIT_SECTORS as u16, &mut buf, false)
+            .is_ok()
+            && aacs_unit_encrypted(&buf, format)
+        {
+            out.push(buf);
+        }
+    }
+    out
+}
+
+/// The FIRST pool slot whose key decrypts one of `samples` to clean content.
+/// `slots` restricts the search (and its order) to the candidate pool entries —
+/// the whole pool for the multi-CPS path, the base CPS unit keys only when the
+/// question is "which CPS unit is this extent in".
+fn pick_pool_slot(
+    samples: &[Vec<u8>],
+    pool: &[(u32, [u8; 16])],
+    slots: &[usize],
+    format: ContentFormat,
+) -> Option<usize> {
+    use crate::aacs::content::{decrypt_unit, is_clean};
+    slots.iter().copied().find(|&slot| {
+        let Some((_, k)) = pool.get(slot) else {
+            return false;
+        };
+        samples.iter().any(|s| {
+            let mut u = s.clone();
+            decrypt_unit(&mut u, k);
+            is_clean(&u, format)
+        })
+    })
+}
+
+/// Which CPS unit's BASE Unit Key opens `ext`, as a pool slot — decided by this
+/// extent's own ciphertext, exactly like the multi-CPS path in
+/// [`resolve_mux_key_map_cached`], and memoised in the same per-disc
+/// [`CpsUnitCache`] so a clip several playlists share is sampled once.
+///
+/// Only base keys are considered: the forensic index keys share the pool but
+/// belong to segment ranges, which are already mapped by tag before this runs.
+///
+/// `last_idx` is the slot resolved for the PRECEDING extent of this title,
+/// carried into an extent with no sampleable encrypted units (nothing to
+/// mis-decrypt). An extent that does have real ciphertext no held or fetched key
+/// opens is a fail-loud [`crate::error::Error::DecryptFailed`] rather than a
+/// silently wrong key over the whole extent.
+fn base_slot_for_extent(
+    reader: &mut dyn SectorSource,
+    ext: &crate::disc::Extent,
+    keys: &mut crate::decrypt::DecryptKeys,
+    fetch: Option<&crate::sector::KeyFetch>,
+    format: ContentFormat,
+    cps: &mut CpsUnitCache,
+    last_idx: usize,
+) -> io::Result<usize> {
+    let ck = (format, ext.start_lba, ext.sector_count);
+    if let Some(&hit) = cps.get(&ck) {
+        return Ok(hit);
+    }
+    let samples = sample_encrypted_units(reader, ext.start_lba, ext.sector_count, format);
+    let pool: Vec<(u32, [u8; 16])> = match keys {
+        crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => unit_keys.clone(),
+        _ => Vec::new(),
+    };
+    let mut idx = pick_pool_slot(&samples, &pool, &base_key_slots(&pool), format);
+    if idx.is_none()
+        && let Some(f) = fetch
+        && !samples.is_empty()
+    {
+        let fresh = f.unit_keys(&samples);
+        if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
+            for k in fresh {
+                if !unit_keys.iter().any(|(_, h)| *h == k) {
+                    let i = unit_keys.len() as u32;
+                    unit_keys.push((i, k));
+                }
+            }
+            idx = pick_pool_slot(&samples, unit_keys, &base_key_slots(unit_keys), format);
+        }
+    }
+    match idx {
+        // A real decision from this extent's own ciphertext — memoise it.
+        Some(i) => {
+            cps.insert(ck, i);
+            Ok(i)
+        }
+        // Inherited from the PRECEDING extent of THIS title, so it is not a
+        // property of this extent: never cache it.
+        None if samples.is_empty() => Ok(last_idx),
+        None => Err(crate::error::Error::DecryptFailed.into()),
+    }
 }
 
 /// FMTS (AACS 2.1) branch of [`resolve_mux_key_map`]. Returns `Some(map)` when the
@@ -821,6 +947,13 @@ fn single_base_key_slot(unit_keys: &[(u32, [u8; 16])]) -> Option<usize> {
 /// index keys + phases. See [`resolve_mux_key_map_cached`] for why a hit is provably
 /// the same answer. What remains per title is the pool→slot mapping, the LBA range
 /// arithmetic and the base-key gap fill.
+///
+/// The gap fill covers each non-forensic LBA with the base Unit Key of the CPS unit
+/// it belongs to. On the single-base-key disc that is every FMTS disc seen so far
+/// that costs nothing; a disc with several base CPS Unit Keys resolves each extent
+/// from its own ciphertext through `cps` ([`CpsUnitCache`], shared with the
+/// multi-CPS path so a clip is sampled once per disc).
+#[allow(clippy::too_many_arguments)]
 fn resolve_fmts_key_map(
     reader: &mut dyn SectorSource,
     title: &DiscTitle,
@@ -829,6 +962,7 @@ fn resolve_fmts_key_map(
     format: ContentFormat,
     halt: Option<&crate::halt::Halt>,
     cache: &mut FmtsCache,
+    cps: &mut CpsUnitCache,
 ) -> io::Result<Option<crate::decrypt::AacsKeyMap>> {
     let FmtsCache {
         table,
@@ -971,11 +1105,10 @@ fn resolve_fmts_key_map(
     };
 
     // Map array position → forensic index (element i = index i+1); add each key to
-    // the pool and remember its slot by tag. `base_idx` is the Unit Key (slot 0).
-    // Per TITLE, and deliberately so: the pool is the caller's and grows across
-    // titles, so a title reached with the keys already banked finds them by value at
-    // the same slots instead of appending duplicates.
-    let base_idx = 0usize;
+    // the pool and remember its slot by tag. Per TITLE, and deliberately so: the
+    // pool is the caller's and grows across titles, so a title reached with the keys
+    // already banked finds them by value at the same slots instead of appending
+    // duplicates.
     let mut tag_slot: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
     if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
         for (i, k) in index_keys.iter().enumerate() {
@@ -1046,12 +1179,46 @@ fn resolve_fmts_key_map(
         return Err(crate::error::Error::FmtsKeyMissing.into());
     }
 
-    // Cover the NON-segment content with the base Unit Key: the forensic segments
-    // (added above with their index keys) carve holes out of the title's content
-    // extents; every other content unit uses the base UK. Fill the gaps so the map
-    // is a complete positive list — an LBA in no range is nav and passes through.
-    let base_gaps = fill_base_key_gaps(&title.extents, &ranges, base_idx);
-    ranges.extend(base_gaps);
+    // Cover the NON-segment content with the base Unit Key OF THE CPS UNIT THAT LBA
+    // BELONGS TO: the forensic segments (added above with their index keys) carve
+    // holes out of the title's content extents; every other content unit uses its own
+    // CPS unit's base UK. Fill the gaps so the map is a complete positive list — an
+    // LBA in no range is nav and passes through.
+    //
+    // "The" base key is only well defined when the disc has ONE base CPS Unit Key.
+    // Hardcoding pool slot 0 keyed every non-forensic LBA of every OTHER CPS unit
+    // with the first unit's key — and that does not fail loudly, it decrypts to
+    // garbage with `lost_bytes == 0`. `resolve_mux_key_map_cached` reaches this
+    // resolver BEFORE its own `single_base_key_slot` short-circuit, so that guard
+    // never gets to make slot 0 correct here. Resolve it per extent instead, the same
+    // way the multi-CPS path does: from the extent's own ciphertext.
+    let base_slots: Vec<usize> = match keys {
+        crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => base_key_slots(unit_keys),
+        _ => Vec::new(),
+    };
+    if base_slots.len() <= 1 {
+        // One base CPS unit (the overwhelming majority, incl. every single-key UHD):
+        // its key covers every non-forensic LBA and NO extent sampling is needed —
+        // an FMTS disc stays at the anchor + phase probes it already pays for. An
+        // empty pool keeps slot 0, which is what an empty map keys nothing with.
+        let base_idx = base_slots.first().copied().unwrap_or(0);
+        let base_gaps = fill_base_key_gaps(&title.extents, &ranges, base_idx);
+        ranges.extend(base_gaps);
+    } else {
+        let mut last_idx = base_slots[0];
+        let mut gaps = Vec::new();
+        for ext in &title.extents {
+            // Cooperative cancel between extents: this samples real content units
+            // off the live drive, exactly like the multi-CPS loop.
+            if halt.is_some_and(|h| h.is_cancelled()) {
+                return Err(crate::error::Error::Halted.into());
+            }
+            let idx = base_slot_for_extent(reader, ext, keys, Some(fetch), format, cps, last_idx)?;
+            last_idx = idx;
+            gaps.extend(fill_base_key_gaps(std::slice::from_ref(ext), &ranges, idx));
+        }
+        ranges.extend(gaps);
+    }
 
     Ok(Some(crate::decrypt::AacsKeyMap::from_ranges_phased(ranges)))
 }
@@ -1530,11 +1697,14 @@ pub fn resolve_mux_key_map(
 /// the same extents are re-sampled off the drive once per playlist: 8 random
 /// 6144-byte reads each, ~200 ms of seek apiece on a stock BD drive.
 ///
-/// Scope, stated precisely: this memo covers the MULTI-CPS extent-sampling reads
-/// and nothing else. On an FMTS (AACS 2.1) disc it removes NO reads at all, because
-/// [`resolve_fmts_key_map`] runs first and returns a finished map before the extent
-/// loop is ever reached — the per-title cost on those discs is removed by
-/// [`FmtsTableCache`] and [`FmtsKeyCache`] instead.
+/// Scope, stated precisely: this memo covers the extent-sampling reads that decide
+/// which CPS unit an extent belongs to, and nothing else. On an FMTS (AACS 2.1)
+/// disc [`resolve_fmts_key_map`] runs first and returns a finished map before the
+/// extent loop below is ever reached, so the loop's reads are removed by
+/// [`FmtsTableCache`] and [`FmtsKeyCache`] instead — but a MULTI-CPS FMTS disc
+/// samples through this same memo from the gap fill ([`base_slot_for_extent`]), and
+/// the cached value means the same thing on both paths: the pool slot whose key
+/// opens that extent's own ciphertext.
 pub(crate) type CpsUnitCache = std::collections::HashMap<(ContentFormat, u32, u32), usize>;
 
 /// The disc's forensic segment table (`/AACS/IndividualSegment.tbl`), resolved at
@@ -1709,10 +1879,6 @@ pub(crate) fn resolve_mux_key_map_cached(
     halt: Option<&crate::halt::Halt>,
     cache: &mut DiscKeyCache,
 ) -> io::Result<crate::decrypt::AacsKeyMap> {
-    use crate::aacs::content::{
-        ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted, decrypt_unit, is_clean,
-    };
-
     // Borrow the memos disjointly: the FMTS branch needs its three mutably while the
     // multi-CPS loop below needs the CPS one.
     let DiscKeyCache { cps: cache, fmts } = cache;
@@ -1731,7 +1897,8 @@ pub(crate) fn resolve_mux_key_map_cached(
     // front from the configured source and build a per-segment map. Returns `None`
     // when the disc is not FMTS, or no key source is configured (then the base UK
     // path below applies and the forensic units garble → demux drops them).
-    if let Some(map) = resolve_fmts_key_map(reader, title, keys, fetch, format, halt, fmts)? {
+    if let Some(map) = resolve_fmts_key_map(reader, title, keys, fetch, format, halt, fmts, cache)?
+    {
         return Ok(map);
     }
     // The single-CPS short-circuit asks about the BASE CPS unit keys only. It must not
@@ -1755,40 +1922,13 @@ pub(crate) fn resolve_mux_key_map_cached(
     // the held key that opens one (the `is_clean` proof is sound HERE — samples
     // are guaranteed real content, not the authored-bad units that trip the mux).
     let sample_units = |reader: &mut dyn SectorSource, start: u32, sectors: u32| -> Vec<Vec<u8>> {
-        let total_units = sectors / ALIGNED_UNIT_SECTORS;
-        let mut out = Vec::new();
-        if total_units == 0 {
-            return out;
-        }
-        const PROBES: u32 = 8;
-        for p in 1..=PROBES {
-            let unit = ((total_units as u64 * p as u64) / (PROBES as u64 + 1)) as u32;
-            if unit >= total_units {
-                continue;
-            }
-            let lba = start.saturating_add(unit.saturating_mul(ALIGNED_UNIT_SECTORS));
-            let mut buf = vec![0u8; ALIGNED_UNIT_LEN];
-            if reader
-                .read_sectors(lba, ALIGNED_UNIT_SECTORS as u16, &mut buf, false)
-                .is_ok()
-                && aacs_unit_encrypted(&buf, format)
-            {
-                out.push(buf);
-            }
-        }
-        out
+        sample_encrypted_units(reader, start, sectors, format)
     };
+    // Here the question is "which HELD key opens this extent", so every pool entry
+    // is a candidate, in pool order.
     let pick = |samples: &[Vec<u8>], pool: &[(u32, [u8; 16])]| -> Option<usize> {
-        for (i, (_, k)) in pool.iter().enumerate() {
-            if samples.iter().any(|s| {
-                let mut u = s.clone();
-                decrypt_unit(&mut u, k);
-                is_clean(&u, format)
-            }) {
-                return Some(i);
-            }
-        }
-        None
+        let all: Vec<usize> = (0..pool.len()).collect();
+        pick_pool_slot(samples, pool, &all, format)
     };
 
     let mut ranges: Vec<(u32, u32, usize)> = Vec::with_capacity(title.extents.len());
@@ -3845,6 +3985,7 @@ mod tests {
             ContentFormat::BdTs,
             None,
             &mut super::FmtsCache::default(),
+            &mut super::CpsUnitCache::default(),
         );
         let err = got.expect_err("a transient DiscRead must fail loud, never Ok(None)");
         let expected = std::io::Error::from(crate::error::Error::DiscRead {
@@ -3883,6 +4024,7 @@ mod tests {
             ContentFormat::BdTs,
             None,
             &mut super::FmtsCache::default(),
+            &mut super::CpsUnitCache::default(),
         )
         .expect("a structurally non-UDF disc is a clean not-FMTS negative");
         assert!(got.is_none(), "not a UDF/FMTS disc → Ok(None)");
@@ -3904,6 +4046,15 @@ mod tests {
     const FMTS_CONTENT_SECTORS: u32 = 2_000;
     /// The base CPS Unit Key (pool slot 0) of the synthetic disc.
     const FMTS_BASE_KEY: [u8; 16] = [0x01u8; 16];
+    /// The base Unit Key of a SECOND CPS unit (pool slot 1) on the multi-CPS
+    /// variant of the synthetic disc — the key of every content sector in
+    /// [`FMTS_CPS2_LBA`]'s extent.
+    const FMTS_CPS2_KEY: [u8; 16] = [0x02u8; 16];
+    /// First LBA of the second CPS unit's extent, immediately after the
+    /// forensic clip.
+    const FMTS_CPS2_LBA: u32 = FMTS_CONTENT_LBA + FMTS_CONTENT_SECTORS;
+    /// Sectors in the second CPS unit's extent (200 aligned units).
+    const FMTS_CPS2_SECTORS: u32 = 600;
     /// The disc's forensic index keys: element i = forensic index i+1. Two, not 32 —
     /// the resolver sizes itself to whatever the source returns.
     const FMTS_INDEX_KEYS: [[u8; 16]; 2] = [[0x21u8; 16], [0x22u8; 16]];
@@ -3958,6 +4109,9 @@ mod tests {
         probe_reads: u32,
         /// `[start, end)` LBA span whose every read returns `DiscRead`.
         fault_span: Option<(u32, u32)>,
+        /// When set, LBAs at/above [`FMTS_CPS2_LBA`] belong to a SECOND CPS
+        /// unit and are encrypted under [`FMTS_CPS2_KEY`], not the base key.
+        second_cps: bool,
     }
 
     impl FmtsDisc {
@@ -4030,6 +4184,17 @@ mod tests {
                 meta_reads: 0,
                 probe_reads: 0,
                 fault_span: None,
+                second_cps: false,
+            }
+        }
+
+        /// The same disc, plus a second CPS unit occupying the extent at
+        /// [`FMTS_CPS2_LBA`] — a disc whose `Unit_Key_RO.inf` carries two base
+        /// Unit Keys, which is what makes "the base key" ambiguous.
+        fn with_second_cps_unit() -> Self {
+            Self {
+                second_cps: true,
+                ..Self::new()
             }
         }
 
@@ -4078,8 +4243,19 @@ mod tests {
                 self.meta_reads += 1;
                 return self.meta_disc.read_sectors(lba, count, buf, recovery);
             }
-            self.probe_reads += 1;
             let want = count as usize * 2048;
+            // The SECOND CPS unit's extent: ordinary (non-forensic) content,
+            // encrypted under that unit's own base Unit Key.
+            if self.second_cps && lba >= FMTS_CPS2_LBA {
+                self.probe_reads += 1;
+                let unit = encrypted_clean_unit(&FMTS_CPS2_KEY);
+                for s in 0..count as usize {
+                    let within = ((lba as usize + s - FMTS_CPS2_LBA as usize) % 3) * 2048;
+                    buf[s * 2048..(s + 1) * 2048].copy_from_slice(&unit[within..within + 2048]);
+                }
+                return Ok(want);
+            }
+            self.probe_reads += 1;
             buf[..want].fill(0);
             for s in 0..count as u32 {
                 let off = (lba + s - FMTS_CONTENT_LBA) as u64;
@@ -4128,6 +4304,106 @@ mod tests {
             read_data_key: None,
             format: ContentFormat::BdTs,
         }
+    }
+
+    /// A play-all title over BOTH CPS units: the forensic clip (CPS unit 1)
+    /// then the second unit's extent (CPS unit 2).
+    fn fmts_two_cps_title() -> DiscTitle {
+        let mut t = DiscTitle::empty();
+        t.extents = vec![
+            Extent {
+                start_lba: FMTS_CONTENT_LBA,
+                sector_count: FMTS_CONTENT_SECTORS,
+            },
+            Extent {
+                start_lba: FMTS_CPS2_LBA,
+                sector_count: FMTS_CPS2_SECTORS,
+            },
+        ];
+        t
+    }
+
+    /// The disc's two BASE CPS Unit Keys, in `Unit_Key_RO.inf` order — the
+    /// pool an AACS 2.1 disc with two CPS units is resolved with.
+    fn fmts_two_cps_keys() -> DecryptKeys {
+        DecryptKeys::Aacs {
+            unit_keys: vec![(1, FMTS_BASE_KEY), (2, FMTS_CPS2_KEY)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        }
+    }
+
+    /// On an FMTS (AACS 2.1) disc the non-forensic gap fill used to hardcode
+    /// pool slot 0 as "the" base Unit Key. On a disc carrying MORE THAN ONE
+    /// base CPS Unit Key in `Unit_Key_RO.inf` that is simply the first CPS
+    /// unit's key, so every content LBA outside a forensic segment in any
+    /// OTHER CPS unit was keyed with the wrong key.
+    ///
+    /// It does not fail loudly: the mapped decrypt runs the wrong key over
+    /// those units and emits garbage plaintext with `lost_bytes == 0`. And
+    /// `resolve_mux_key_map_cached` calls the FMTS resolver BEFORE the
+    /// `single_base_key_slot` short-circuit, so the guard that makes slot 0
+    /// correct on a single-CPS disc is never consulted on this path.
+    ///
+    /// The title spans both CPS units; the second extent's every unit is
+    /// encrypted under the SECOND base key (pool slot 1). Mutation: pinning
+    /// the gap fill back to slot 0 fails the second extent's asserts, and
+    /// pinning it to slot 1 fails the first extent's.
+    #[test]
+    fn fmts_gap_fill_uses_each_lbas_own_cps_unit_key_not_pool_slot_zero() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls.clone());
+        let mut reader = FmtsDisc::with_second_cps_unit();
+        let mut keys = fmts_two_cps_keys();
+        let mut cache = super::DiscKeyCache::new();
+        let title = fmts_two_cps_title();
+
+        let map = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("a two-CPS-unit FMTS disc resolves");
+
+        // CPS unit 1 (the forensic clip): the forensic segments keep their own
+        // index-key slots, and the gaps between them take unit 1's key, which
+        // IS pool slot 0 here.
+        assert_eq!(
+            map.key_idx_for(10_300),
+            Some(2),
+            "segment index 1 keys to its own pool slot (appended after the 2 base keys)"
+        );
+        assert_eq!(
+            map.key_idx_for(10_600),
+            Some(3),
+            "segment index 2 keys to its own pool slot"
+        );
+        assert_eq!(
+            map.key_idx_for(10_000),
+            Some(0),
+            "a non-segment LBA of CPS unit 1 takes CPS unit 1's key"
+        );
+
+        // CPS unit 2: every LBA of this extent must take the SECOND base Unit
+        // Key (pool slot 1). Slot 0 here is CPS unit 1's key — the defect.
+        for lba in [FMTS_CPS2_LBA, FMTS_CPS2_LBA + 300, FMTS_CPS2_LBA + 599] {
+            assert_eq!(
+                map.key_idx_for(lba),
+                Some(1),
+                "LBA {lba} is in CPS unit 2 and must take CPS unit 2's key, not unit 1's"
+            );
+        }
+
+        // Nothing outside the title's extents is keyed at all.
+        assert_eq!(
+            map.key_idx_for(FMTS_CPS2_LBA + FMTS_CPS2_SECTORS),
+            None,
+            "past the last extent is nav/filesystem and passes through"
+        );
     }
 
     fn pool_of(keys: &DecryptKeys) -> Vec<(u32, [u8; 16])> {
