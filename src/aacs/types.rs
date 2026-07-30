@@ -196,6 +196,77 @@ impl std::fmt::Debug for DiscEntry {
 }
 
 #[cfg(test)]
+mod unit_key_tests {
+    use super::*;
+
+    /// `is_default_index` is the public predicate that separates ordinary
+    /// (index-0) content keys from FMTS forensic index keys ([`UnitKey`] docs;
+    /// AACS 2.1 `IndividualSegment.tbl` tagging). A body answering `true` for
+    /// everything would present a forensic index key as an ordinary content
+    /// key — the caller would decrypt the bulk of the title with a key that
+    /// only opens 1/32nd of it; answering `false` for everything would hide
+    /// every ordinary key.
+    ///
+    /// Pinned against the two NAMED constructors, which are the contract:
+    /// [`UnitKey::new`] builds the ordinary key, [`UnitKey::forensic`] builds
+    /// an index key for `1..=32`.
+    #[test]
+    fn is_default_index_separates_the_two_constructors() {
+        let ordinary = UnitKey::new(0, [0xAA; 16]);
+        assert!(
+            ordinary.is_default_index(),
+            "UnitKey::new builds the ordinary (index-0) key"
+        );
+
+        // Every forensic index the spec allows must be reported as NOT default.
+        for n in 1u8..=32 {
+            let k = UnitKey::forensic(0, [0xAA; 16], n);
+            assert!(
+                !k.is_default_index(),
+                "UnitKey::forensic({n}) is an index key, not the default key"
+            );
+        }
+    }
+
+    /// The predicate must agree with the one consumer of `index_number` in the
+    /// crate: [`crate::aacs::index_select::resolve_disc_index`] resolves the
+    /// disc's forensic index from exactly the keys that are NOT default. If
+    /// the two disagree, a disc resolves an index whose key the rest of the
+    /// pipeline treats as ordinary (or vice versa).
+    #[test]
+    fn is_default_index_agrees_with_the_forensic_index_resolver() {
+        use crate::aacs::index_select::resolve_disc_index;
+
+        let keys = [
+            UnitKey::new(0, [0x11; 16]),
+            UnitKey::forensic(1, [0x22; 16], 7),
+        ];
+        assert_eq!(
+            resolve_disc_index(&keys),
+            Some(7),
+            "sanity: the resolver picks the forensic key's index"
+        );
+
+        let non_default: Vec<u8> = keys
+            .iter()
+            .filter(|k| !k.is_default_index())
+            .map(|k| k.index_number)
+            .collect();
+        assert_eq!(
+            non_default,
+            vec![7],
+            "exactly the key the resolver picked must be non-default"
+        );
+
+        // An all-ordinary key set resolves no index, and every key must report
+        // itself default.
+        let plain = [UnitKey::new(0, [0x11; 16]), UnitKey::new(1, [0x22; 16])];
+        assert_eq!(resolve_disc_index(&plain), None);
+        assert!(plain.iter().all(|k| k.is_default_index()));
+    }
+}
+
+#[cfg(test)]
 mod redaction_tests {
     use super::*;
 

@@ -197,6 +197,17 @@ mod tests {
         }
     }
 
+    /// A host cert whose (non-secret) certificate body and private key are both
+    /// filled with `byte`, so a cert is identifiable in an aggregated list.
+    fn cert(byte: u8) -> HostCert {
+        HostCert {
+            private_key: [byte; 20],
+            certificate: vec![byte; 92],
+            private_key_v2: None,
+            certificate_v2: None,
+        }
+    }
+
     fn dk(byte: u8, node: u16) -> DeviceKey {
         DeviceKey {
             key: [byte; 16],
@@ -355,6 +366,42 @@ mod tests {
         let arr: &[&dyn KeyProvider] = &[&a, &b];
         let got = Providers(arr).lookup_disc_by_vid(&[0u8; 16]).unwrap();
         assert_eq!(got.disc_hash, "vid-a");
+    }
+
+    /// `Providers::host_certs` is the union across the provider array. It is not
+    /// wired into the handshake today (see the module docs), so nothing else in
+    /// the crate would notice a body that dropped every cert on the floor — and
+    /// the day it IS wired in, a silently-empty cert list means the drive AACS
+    /// authentication finds no host certificate to present and every disc fails
+    /// to open, with no indication that the caller's certs were discarded.
+    ///
+    /// Unlike the bulk key unions this one does NOT dedup (HostCert is not
+    /// Ord/Hash), so the assertion is on the full concatenation in array order.
+    #[test]
+    fn providers_host_certs_unions_every_providers_certs_in_array_order() {
+        struct Certs(Vec<HostCert>);
+        impl KeyProvider for Certs {
+            fn host_certs(&self) -> Vec<HostCert> {
+                self.0.clone()
+            }
+        }
+        // Distinguish certs by their (non-secret) certificate body, so the
+        // assertion lands on WHICH certs came back, not merely how many.
+        let a = Certs(vec![cert(0xA1), cert(0xA2)]);
+        let b = Certs(vec![cert(0xB1)]);
+        let arr: &[&dyn KeyProvider] = &[&a, &b];
+
+        let got = Providers(arr).host_certs();
+        let bodies: Vec<Vec<u8>> = got.iter().map(|c| c.certificate.clone()).collect();
+        assert_eq!(
+            bodies,
+            vec![vec![0xA1u8; 92], vec![0xA2u8; 92], vec![0xB1u8; 92]],
+            "every provider's certs must survive the union, in array order"
+        );
+        // The private key travels with the cert — a union that returned default
+        // certs would still have the right count.
+        assert_eq!(got[0].private_key, [0xA1u8; 20]);
+        assert_eq!(got[2].private_key, [0xB1u8; 20]);
     }
 
     #[test]
