@@ -93,6 +93,45 @@ fn scan_jar(archive: &mut jar::Jar) -> Vec<StreamLabel> {
     out
 }
 
+/// Cap on the bytes retained for one stream label.
+///
+/// The label is an owned copy of a slice of a `CONSTANT_Utf8_info` entry,
+/// whose `length` field is a `u16` (JVMS §4.4.7) — so a single crafted
+/// constant contributes up to 65535 bytes, and the `u16` stream-number
+/// keyspace admits 65536 of them per type.
+///
+/// Headroom: real dbp menu labels are short display names — "English Dolby
+/// Atmos" (19 bytes), "Spanish 5.1 Dolby Digital" (25). The longest plausible
+/// retail string ("Portuguese (Brazilian) 5.1 Dolby Digital Plus") is 45
+/// bytes. 256 leaves >5x headroom over that, and any string past it is menu
+/// geometry or padding, never a language name — `vocab::lang` would not
+/// resolve it anyway.
+const MAX_LABEL_BYTES: usize = 256;
+
+/// Cap on retained stream slots per type.
+///
+/// The keys come from `parse::<u16>()` on disc bytes, so all 65536 slots per
+/// type are reachable; paired with [`MAX_LABEL_BYTES`] this bounds the whole
+/// scan at 2 x 512 x 256 bytes.
+///
+/// Headroom: the BD STN_table admits at most 32 primary audio and 32 PG
+/// streams per playlist, and dbp emits one menu TextField per stream. 512
+/// leaves 16x headroom over the spec maximum.
+const MAX_LABELS_PER_TYPE: usize = 512;
+
+/// Record `label` for stream `n`, honouring the retention caps. Existing
+/// slots are still overwritten at the cap so the documented last-write-wins
+/// behaviour is preserved; only NEW slots are refused.
+fn retain_label(map: &mut BTreeMap<u16, String>, n: u16, label: &str) {
+    if label.len() > MAX_LABEL_BYTES {
+        return;
+    }
+    if map.len() >= MAX_LABELS_PER_TYPE && !map.contains_key(&n) {
+        return;
+    }
+    map.insert(n, label.to_string());
+}
+
 fn collect_textfield(
     s: &str,
     audios: &mut BTreeMap<u16, String>,
@@ -112,7 +151,7 @@ fn collect_textfield(
     }
     if let Some(rest) = kind_n.strip_prefix("Audio") {
         if let Ok(n) = rest.parse::<u16>() {
-            audios.insert(n, label.to_string());
+            retain_label(audios, n, label);
         }
     } else if let Some(rest) = kind_n.strip_prefix("Subtitle")
         && let Ok(n) = rest.parse::<u16>()
@@ -120,7 +159,7 @@ fn collect_textfield(
         // Subtitle0 is conventionally the "None / Off" disable
         // button, not an actual subtitle stream.
         if n > 0 {
-            subs.insert(n, label.to_string());
+            retain_label(subs, n, label);
         }
     }
 }
@@ -147,6 +186,100 @@ fn make_label(num: u16, label: String, stream_type: StreamLabelType) -> StreamLa
 mod tests {
     use super::super::{LabelPurpose, LabelQualifier};
     use super::*;
+
+    /// A `CONSTANT_Utf8_info` carries a `u16` length (JVMS §4.4.7), so one
+    /// crafted constant contributes up to 65535 bytes and the `u16` stream
+    /// keyspace admits 65536 slots per type — ~4 GiB of retained `String` per
+    /// map from a jar that is orders of magnitude smaller.
+    ///
+    /// Boundary literals, not the constant: a 256-byte label is kept, 257 and
+    /// the JVMS maximum 65535 are refused.
+    #[test]
+    fn oversized_labels_are_not_retained() {
+        let mut audios = BTreeMap::new();
+        let mut subs = BTreeMap::new();
+
+        collect_textfield(
+            &format!("XTextField,Audio1,{},rest", "A".repeat(256)),
+            &mut audios,
+            &mut subs,
+        );
+        assert_eq!(
+            audios.get(&1).map(String::len),
+            Some(256),
+            "a 256-byte label must still be retained"
+        );
+
+        collect_textfield(
+            &format!("XTextField,Audio2,{},rest", "A".repeat(257)),
+            &mut audios,
+            &mut subs,
+        );
+        assert!(!audios.contains_key(&2), "a 257-byte label must be refused");
+
+        collect_textfield(
+            &format!("XTextField,Subtitle1,{},rest", "B".repeat(65_535)),
+            &mut audios,
+            &mut subs,
+        );
+        assert!(
+            !subs.contains_key(&1),
+            "a JVMS-maximum 65535-byte Utf8 label must be refused"
+        );
+    }
+
+    /// The stream-slot keyspace is the full `u16` on both maps. Offer 600
+    /// distinct audio slots; exactly 512 are retained.
+    #[test]
+    fn retained_stream_slots_are_capped_per_type() {
+        let mut audios = BTreeMap::new();
+        let mut subs = BTreeMap::new();
+        for n in 1..=600u16 {
+            collect_textfield(
+                &format!("XTextField,Audio{n},English,rest"),
+                &mut audios,
+                &mut subs,
+            );
+        }
+        assert_eq!(
+            audios.len(),
+            512,
+            "600 audio slots offered, {} retained — the slot count is unbounded",
+            audios.len()
+        );
+    }
+
+    /// Reaching the slot cap must not break the documented last-write-wins
+    /// behaviour for slots already held.
+    #[test]
+    fn existing_slot_is_still_overwritten_at_the_cap() {
+        let mut audios = BTreeMap::new();
+        let mut subs = BTreeMap::new();
+        for n in 1..=600u16 {
+            collect_textfield(
+                &format!("XTextField,Audio{n},English,rest"),
+                &mut audios,
+                &mut subs,
+            );
+        }
+        collect_textfield("XTextField,Audio1,Spanish,rest", &mut audios, &mut subs);
+        assert_eq!(audios.get(&1).map(String::as_str), Some("Spanish"));
+    }
+
+    /// Headroom: the longest plausible retail label must survive untouched.
+    #[test]
+    fn longest_realistic_label_survives_the_cap() {
+        let mut audios = BTreeMap::new();
+        let mut subs = BTreeMap::new();
+        let real = "Portuguese (Brazilian) 5.1 Dolby Digital Plus";
+        assert_eq!(real.len(), 45, "fixture length changed");
+        collect_textfield(
+            &format!("XTextField,Audio1,{real},Fontstrip_Composite,296,763"),
+            &mut audios,
+            &mut subs,
+        );
+        assert_eq!(audios.get(&1).map(String::as_str), Some(real));
+    }
 
     #[test]
     fn collect_extracts_audio_and_subtitle_indices() {

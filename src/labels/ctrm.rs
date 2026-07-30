@@ -87,7 +87,21 @@ fn prefix_is_commentary(prefix: &str) -> bool {
 fn parse_language_streams(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
     let data = super::read_jar_file(reader, udf, "language_streams.txt")?;
     let text = std::str::from_utf8(&data).ok()?;
+    let labels = parse_language_streams_text(text);
+    if labels.is_empty() {
+        return None;
+    }
+    Some(labels)
+}
 
+/// Parse the body of a `language_streams.txt` file into stream labels.
+///
+/// This is the shipping parser: [`parse_language_streams`] does the UDF read
+/// and UTF-8 decode and then delegates here. It is split out — rather than
+/// duplicated under `#[cfg(test)]`, which is what it used to be — so the unit
+/// tests below exercise production code. A test that re-implements the
+/// function it guards cannot fail when the real function breaks.
+fn parse_language_streams_text(text: &str) -> Vec<StreamLabel> {
     let mut labels = Vec::new();
 
     for line in text.lines() {
@@ -188,122 +202,6 @@ fn parse_language_streams(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<
                 // (returns something other than the input) it's a known
                 // codec — store the canonical name. Otherwise it's an
                 // unknown token, stored as-is.
-                _ => codec_hint = vocab::codec(&variant).to_string(),
-            }
-        }
-
-        labels.push(StreamLabel {
-            stream_number: stream_num,
-            stream_type,
-            language,
-            name: String::new(),
-            purpose: final_purpose,
-            qualifier,
-            codec_hint,
-            variant: variant_code,
-        });
-    }
-
-    if labels.is_empty() {
-        return None;
-    }
-    Some(labels)
-}
-
-/// Parse the body of a `language_streams.txt` file into stream labels. Split
-/// out from [`parse_language_streams`] so unit tests exercise the real parsing
-/// logic without needing a SectorSource / UdfFs.
-#[cfg(test)]
-fn parse_language_streams_text(text: &str) -> Vec<StreamLabel> {
-    let mut labels = Vec::new();
-
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-        if parts.len() < 4 {
-            continue;
-        }
-
-        let type_str = parts[1];
-        let stream_num: u16 = match parts[2].parse() {
-            Ok(n) if n > 0 => n,
-            _ => continue,
-        };
-        let language = parts[3].to_string();
-        let variant = if parts.len() > 4 {
-            parts[4].to_string()
-        } else {
-            String::new()
-        };
-
-        let (stream_type, purpose, qualifier) = match type_str {
-            "audio_production" => (
-                StreamLabelType::Audio,
-                LabelPurpose::Normal,
-                LabelQualifier::None,
-            ),
-            "audio_commentary" => (
-                StreamLabelType::Audio,
-                LabelPurpose::Commentary,
-                LabelQualifier::None,
-            ),
-            "audio_ime" => (
-                StreamLabelType::Audio,
-                LabelPurpose::Ime,
-                LabelQualifier::None,
-            ),
-            "subtitle_production" => (
-                StreamLabelType::Subtitle,
-                LabelPurpose::Normal,
-                LabelQualifier::None,
-            ),
-            "subtitle_commentary" => (
-                StreamLabelType::Subtitle,
-                LabelPurpose::Commentary,
-                LabelQualifier::None,
-            ),
-            "subtitle_narrative" => (
-                StreamLabelType::Subtitle,
-                LabelPurpose::Normal,
-                LabelQualifier::Forced,
-            ),
-            "subtitle_dual" => (
-                StreamLabelType::Subtitle,
-                LabelPurpose::Normal,
-                LabelQualifier::None,
-            ),
-            "subtitle_bonus" => (
-                StreamLabelType::Subtitle,
-                LabelPurpose::Normal,
-                LabelQualifier::None,
-            ),
-            "subtitle_ime" => (
-                StreamLabelType::Subtitle,
-                LabelPurpose::Ime,
-                LabelQualifier::None,
-            ),
-            "subtitle_ime_narrative" => (
-                StreamLabelType::Subtitle,
-                LabelPurpose::Ime,
-                LabelQualifier::Forced,
-            ),
-            _ => continue,
-        };
-
-        let mut codec_hint = String::new();
-        let mut variant_code = String::new();
-        let mut final_purpose = purpose;
-
-        if !variant.is_empty() {
-            match variant.as_str() {
-                "eda" => final_purpose = LabelPurpose::Descriptive,
-                "csp" | "cs" | "lsp" | "ls" | "cf" | "pf" | "bp" | "pp" => {
-                    variant_code = variant.clone();
-                }
                 _ => codec_hint = vocab::codec(&variant).to_string(),
             }
         }

@@ -78,27 +78,7 @@ pub(super) fn durable_sync(file: &File) -> io::Result<()> {
         },
     ) {
         Ok(inner) => inner,
-        Err(crate::io::bounded::BoundedError::Timeout) => {
-            tracing::error!(
-                target: "mux",
-                "WritebackFile::sync_all fsync timed out after 60s; kernel will flush on close (best-effort)"
-            );
-            Ok(())
-        }
-        Err(crate::io::bounded::BoundedError::Halted) => {
-            tracing::warn!(
-                target: "mux",
-                "WritebackFile::sync_all fsync skipped (halt requested); data not durably flushed, kernel will flush on close"
-            );
-            Ok(())
-        }
-        Err(crate::io::bounded::BoundedError::WorkerLost) => {
-            tracing::error!(
-                target: "mux",
-                "WritebackFile::sync_all fsync worker lost before completion; data not durably flushed, kernel will flush on close"
-            );
-            Ok(())
-        }
+        Err(e) => bounded_failure_to_result(e),
     }
 }
 
@@ -141,5 +121,76 @@ mod tests {
 
         // durable_sync must complete without error on the local tempfile.
         durable_sync(f.as_file()).expect("durable_sync must return Ok on a local tempfile");
+    }
+}
+
+/// Map a [`crate::io::bounded::BoundedError`] from the bounded `fsync` onto the
+/// `io::Error` `durable_sync` returns.
+///
+/// Every arm means the same thing: **no sync observably ran**. All three used to
+/// return `Ok(())`, so `WritebackFile::sync_all` reported success for a
+/// durability barrier that never happened. POSIX gives `fsync` one way to say
+/// "the data is on stable storage" — a zero return — and a call that never
+/// reached the device has not earned it.
+///
+/// This mirrors the macOS `F_FULLFSYNC` mapping exactly. The two were found
+/// carrying the identical defect, and a platform disagreeing with its sibling
+/// about whether a failed sync is an error is the "works on my platform" class
+/// this crate has been bitten by before — most recently an over-length SCSI CDB
+/// that macOS rejected and the other two silently truncated.
+///
+/// No message text (this crate ships no user-facing English): the kind, and
+/// `EIO` for the worker-lost case, are the signal; `tracing` carries the detail.
+fn bounded_failure_to_result(e: crate::io::bounded::BoundedError) -> io::Result<()> {
+    match e {
+        crate::io::bounded::BoundedError::Timeout => {
+            tracing::error!(
+                target: "mux",
+                "WritebackFile::sync_all fsync timed out after 60s; data NOT durably flushed, kernel will flush on close"
+            );
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        }
+        crate::io::bounded::BoundedError::Halted => {
+            tracing::warn!(
+                target: "mux",
+                "WritebackFile::sync_all fsync skipped (halt requested); data NOT durably flushed, kernel will flush on close"
+            );
+            Err(io::Error::from(io::ErrorKind::Interrupted))
+        }
+        crate::io::bounded::BoundedError::WorkerLost => {
+            tracing::error!(
+                target: "mux",
+                "WritebackFile::sync_all fsync worker lost before completion; data NOT durably flushed, kernel will flush on close"
+            );
+            Err(io::Error::from(std::io::ErrorKind::Other))
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounded_failure_tests {
+    use super::*;
+    use crate::io::bounded::BoundedError;
+
+    /// Every bounded-fsync failure must be an error. Asserted per variant rather
+    /// than as a loop so a new variant defaulting to Ok cannot slip through.
+    #[test]
+    fn no_bounded_fsync_failure_maps_to_ok() {
+        assert_eq!(
+            bounded_failure_to_result(BoundedError::Timeout)
+                .expect_err("a timed-out fsync must be an error")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            bounded_failure_to_result(BoundedError::Halted)
+                .expect_err("a halted fsync must be an error")
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(
+            bounded_failure_to_result(BoundedError::WorkerLost).is_err(),
+            "a lost fsync worker must be an error"
+        );
     }
 }

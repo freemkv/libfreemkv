@@ -105,32 +105,45 @@ pub(super) fn durable_sync(file: &File) -> io::Result<()> {
         },
     ) {
         Ok(inner) => inner,
-        Err(crate::io::bounded::BoundedError::Timeout) => {
+        Err(e) => bounded_failure_to_result(e),
+    }
+}
+
+/// Map a [`crate::io::bounded::BoundedError`] from the bounded `F_FULLFSYNC`
+/// onto the `io::Error` `durable_sync` returns.
+///
+/// Every arm here means the same thing: **no sync observably ran**. All three
+/// previously returned `Ok(())`, so `WritebackFile::sync_all` reported success
+/// for a durability barrier that never happened — a total failure exiting 0,
+/// with only a log line to distinguish it. POSIX gives `fsync` exactly one way
+/// to say "the data is on stable storage" and that is a zero return; a call
+/// that never reached the device has not earned it.
+///
+/// The errors carry no message text (this crate ships no user-facing English):
+/// the kind, and `EIO` for the worker-lost case, are the whole signal, and the
+/// `tracing` lines above/below carry the operator detail.
+fn bounded_failure_to_result(e: crate::io::bounded::BoundedError) -> io::Result<()> {
+    match e {
+        crate::io::bounded::BoundedError::Timeout => {
             tracing::error!(
                 target: "mux",
-                "WritebackFile::sync_all F_FULLFSYNC timed out after 60s; kernel will flush on close (best-effort)"
+                "WritebackFile::sync_all F_FULLFSYNC timed out after 60s; data NOT durably flushed, kernel will flush on close"
             );
-            Ok(())
+            Err(io::Error::from(io::ErrorKind::TimedOut))
         }
-        // Both arms below used to map to `Ok(())` with NO diagnostic at all, while
-        // the Linux sibling logs the identical failures (writeback_file/linux.rs).
-        // A lost F_FULLFSYNC worker at the end of a UHD mux therefore reported
-        // `completed = true` with an empty log, leaving an operator investigating a
-        // truncated/corrupt output file after a power loss no record that the final
-        // fsync never ran — on Linux the same failure is at error level.
-        Err(crate::io::bounded::BoundedError::Halted) => {
+        crate::io::bounded::BoundedError::Halted => {
             tracing::warn!(
                 target: "mux",
-                "WritebackFile::sync_all F_FULLFSYNC skipped (halt requested); data not durably flushed, kernel will flush on close"
+                "WritebackFile::sync_all F_FULLFSYNC skipped (halt requested); data NOT durably flushed, kernel will flush on close"
             );
-            Ok(())
+            Err(io::Error::from(io::ErrorKind::Interrupted))
         }
-        Err(crate::io::bounded::BoundedError::WorkerLost) => {
+        crate::io::bounded::BoundedError::WorkerLost => {
             tracing::error!(
                 target: "mux",
-                "WritebackFile::sync_all F_FULLFSYNC worker lost before completion; data not durably flushed, kernel will flush on close"
+                "WritebackFile::sync_all F_FULLFSYNC worker lost before completion; data NOT durably flushed, kernel will flush on close"
             );
-            Ok(())
+            Err(io::Error::from_raw_os_error(libc::EIO))
         }
     }
 }
@@ -173,5 +186,60 @@ mod tests {
 
         // durable_sync must complete without error on the local tempfile.
         durable_sync(f.as_file()).expect("durable_sync must return Ok on a local tempfile");
+    }
+
+    /// Every `BoundedError` arm of the bounded `F_FULLFSYNC` means no sync
+    /// observably ran. All three returned `Ok(())`, so `sync_all` reported a
+    /// durability barrier that never happened — the caller could not tell a
+    /// completed flush from a skipped one by any means except reading a log.
+    ///
+    /// Asserted on the concrete `ErrorKind` / `errno` each arm must produce,
+    /// so a future arm that quietly reverts to `Ok(())` fails here.
+    #[test]
+    fn every_bounded_failure_is_reported_as_an_error() {
+        use crate::io::bounded::BoundedError;
+
+        let timeout = bounded_failure_to_result(BoundedError::Timeout)
+            .expect_err("a timed-out F_FULLFSYNC must be an error");
+        assert_eq!(
+            timeout.kind(),
+            io::ErrorKind::TimedOut,
+            "a timed-out F_FULLFSYNC must not be reported as a completed sync"
+        );
+
+        let halted = bounded_failure_to_result(BoundedError::Halted)
+            .expect_err("a halted F_FULLFSYNC must be an error");
+        assert_eq!(
+            halted.kind(),
+            io::ErrorKind::Interrupted,
+            "a halted F_FULLFSYNC must not be reported as a completed sync"
+        );
+
+        let lost = bounded_failure_to_result(BoundedError::WorkerLost)
+            .expect_err("a lost F_FULLFSYNC worker must be an error");
+        assert_eq!(
+            lost.raw_os_error(),
+            Some(libc::EIO),
+            "a lost F_FULLFSYNC worker must not be reported as a completed sync"
+        );
+    }
+
+    /// The failure path must be reachable through the public surface: a
+    /// `WritebackFile::sync_all` that hits any of these arms must surface an
+    /// `Err`, not a silent `Ok`. Pinned at the mapping boundary because the
+    /// timeout itself is not deterministically inducible in a unit test.
+    #[test]
+    fn bounded_failures_are_never_mapped_to_ok() {
+        use crate::io::bounded::BoundedError;
+        for e in [
+            BoundedError::Timeout,
+            BoundedError::Halted,
+            BoundedError::WorkerLost,
+        ] {
+            assert!(
+                bounded_failure_to_result(e).is_err(),
+                "a bounded F_FULLFSYNC failure must never map to Ok"
+            );
+        }
     }
 }
