@@ -7,8 +7,12 @@
 use super::ebml;
 use super::timeline::TimelineContinuity;
 use crate::disc::{
-    AudioStream, Chapter, Codec, ColorSpace, HdrFormat, Resolution, SubtitleStream, VideoStream,
+    AudioStream, Chapter, Codec, ColorSpace, HdrFormat, SubtitleStream, VideoStream,
 };
+// Production code reaches resolutions only through `VideoStream::resolution`;
+// the fixtures below name the variants directly.
+#[cfg(test)]
+use crate::disc::Resolution;
 use std::io::{self, Seek, Write};
 
 // ── CICP colour codes (ITU-T H.273) ──────────────────────────────────────────
@@ -375,14 +379,13 @@ impl MkvTrack {
             // keeps a fallback rather than erroring.
             _ => ebml::CODEC_MPEG2,
         };
-        // An Unknown resolution has no real dimensions — emit (0, 0) so the
-        // serializer omits PixelWidth/PixelHeight (Matroska marks them
-        // optional) rather than writing a fabricated 1920x1080 default.
-        let (w, h) = if matches!(v.resolution, Resolution::Unknown) {
-            (0, 0)
-        } else {
-            v.resolution.pixels()
-        };
+        // An Unknown resolution has no real dimensions — `pixels()` reports
+        // (0, 0) for it, and the serializer then omits PixelWidth/PixelHeight
+        // (Matroska marks them optional). The local `matches!(Unknown)` guard
+        // that used to sit here existed only because `pixels()` fabricated a
+        // 1920x1080 default; it does not any more, so the check belongs in the
+        // one accessor rather than in each caller that remembered to write it.
+        let (w, h) = v.resolution.pixels();
         let (num, den) = v.frame_rate.as_fraction();
         let default_duration_ns = if num > 0 {
             (1_000_000_000u64 * den as u64) / num as u64
