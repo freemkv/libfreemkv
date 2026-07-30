@@ -28,6 +28,11 @@ const SG_DXFER_TO_DEV: i32 = -2;
 const SG_DXFER_FROM_DEV: i32 = -3;
 const SG_FLAG_Q_AT_HEAD: u32 = 0x10;
 
+/// Width of `sg_io_hdr.cmdp` as far as SG_IO is concerned: `cmd_len` is a
+/// single byte and every SPC-4/MMC command this crate issues is 6, 10, 12 or
+/// 16 bytes. Matches `K_MAX_CDB_SIZE` in the macOS and Windows backends.
+const K_MAX_CDB_SIZE: usize = 16;
+
 #[repr(C)]
 #[allow(non_camel_case_types)]
 struct sg_io_hdr {
@@ -289,7 +294,13 @@ impl ScsiTransport for SgIoTransport {
             DataDirection::FromDevice => SG_DXFER_FROM_DEV,
             DataDirection::ToDevice => SG_DXFER_TO_DEV,
         };
-        let cmd_len = cdb.len().min(16) as u8;
+        // Reject an over-length CDB rather than truncating it. This used to be
+        // `cdb.len().min(16) as u8`, which silently dropped the tail: SPC-4
+        // fixes a command's length by its opcode group code, so the shortened
+        // CDB is a DIFFERENT command, which the drive executes and answers
+        // with GOOD status and data for a request nobody made. Matches the
+        // macOS and Windows backends (all three call the same helper).
+        let cmd_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
 
         let mut sense = [0u8; 32];
         let mut hdr: sg_io_hdr = unsafe { std::mem::zeroed() };

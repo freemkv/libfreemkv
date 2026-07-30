@@ -436,7 +436,14 @@ impl ScsiTransport for SptiTransport {
 
         let mut sptwb: SptwbDirect = unsafe { std::mem::zeroed() };
 
-        let cdb_len = cdb.len().min(K_MAX_CDB_SIZE);
+        // Reject an over-length CDB rather than truncating it. This used to be
+        // `cdb.len().min(K_MAX_CDB_SIZE)`, and the copy into `sptwb.spt.Cdb`
+        // below then took only the first 16 bytes: SPC-4 fixes a command's
+        // length by its opcode group code, so the shortened CDB is a DIFFERENT
+        // command, which the drive executes and answers with GOOD status and
+        // data for a request nobody made. Matches the Linux and macOS backends
+        // (all three call the same helper).
+        let cdb_len = usize::from(super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?);
         sptwb.spt.Length = std::mem::size_of::<ScsiPassThroughDirect>() as u16;
         sptwb.spt.CdbLength = cdb_len as u8;
         sptwb.spt.SenseInfoLength = K_SENSE_SIZE as u8;

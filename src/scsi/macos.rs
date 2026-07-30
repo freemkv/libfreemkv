@@ -161,13 +161,11 @@ impl ScsiTransport for MacScsiTransport {
         let mut task_status: u8 = 0xFF;
         let mut transfer_count: u64 = 0;
 
-        if cdb.len() > K_MAX_CDB_SIZE {
-            return Err(Error::InvalidCdbLength {
-                len: cdb.len(),
-                max: K_MAX_CDB_SIZE,
-            });
-        }
-        let cdb_len = cdb.len() as u8;
+        // Reject an over-length CDB rather than truncating it. The guard now
+        // lives in `scsi::checked_cdb_len`, shared with the Linux and Windows
+        // backends (which used to truncate here instead of erroring) so it
+        // cannot drift per platform again.
+        let cdb_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
         let kr = unsafe {
             shim_execute(
                 cdb.as_ptr(),
@@ -266,39 +264,30 @@ mod tests {
     use crate::error::Error;
 
     /// A CDB longer than K_MAX_CDB_SIZE must be rejected with
-    /// `Error::InvalidCdbLength` before the shim is ever called.
-    /// This test exercises the length guard portably — it calls the
-    /// guard logic directly without opening an IOKit handle.
+    /// `Error::InvalidCdbLength` before the shim is ever called. Exercises the
+    /// real guard `MacScsiTransport::execute` uses, without opening an IOKit
+    /// handle.
     #[test]
     fn oversized_cdb_returns_invalid_cdb_length() {
         // Build a CDB one byte over the limit.
         let long_cdb = [0u8; K_MAX_CDB_SIZE + 1];
-        // Replicate the guard logic from MacScsiTransport::execute so
-        // this test runs on Linux CI as well (no IOKit present there).
-        let result: Result<(), Error> = if long_cdb.len() > K_MAX_CDB_SIZE {
-            Err(Error::InvalidCdbLength {
-                len: long_cdb.len(),
-                max: K_MAX_CDB_SIZE,
-            })
-        } else {
-            Ok(())
-        };
-        match result {
+        match crate::scsi::checked_cdb_len(&long_cdb, K_MAX_CDB_SIZE) {
             Err(Error::InvalidCdbLength { len, max }) => {
                 assert_eq!(len, K_MAX_CDB_SIZE + 1);
                 assert_eq!(max, K_MAX_CDB_SIZE);
             }
-            other => panic!("expected InvalidCdbLength, got {:?}", other),
+            other => panic!("expected InvalidCdbLength, got {other:?}"),
         }
     }
 
-    /// A CDB exactly at the limit must not trigger the guard.
+    /// A CDB exactly at the limit must not trigger the guard, and its length
+    /// reaches the shim verbatim.
     #[test]
     fn max_length_cdb_does_not_trigger_guard() {
         let cdb = [0u8; K_MAX_CDB_SIZE];
-        let triggered = cdb.len() > K_MAX_CDB_SIZE;
-        assert!(
-            !triggered,
+        assert_eq!(
+            crate::scsi::checked_cdb_len(&cdb, K_MAX_CDB_SIZE).ok(),
+            Some(K_MAX_CDB_SIZE as u8),
             "CDB of exactly K_MAX_CDB_SIZE should not trigger guard"
         );
     }
