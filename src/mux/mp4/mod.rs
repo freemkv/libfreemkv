@@ -560,8 +560,12 @@ fn audio_sample_durations(samples: &[Sample], timescale: u32) -> Vec<u32> {
     durs
 }
 
-/// Standard frame rates as `(timescale, sample_duration)` — exact integer ratios
-/// so a CFR track has zero accumulated drift.
+/// Standard frame rates as `(timescale, sample_duration, fps)` — exact integer
+/// ratios so a CFR track has zero accumulated drift.
+///
+/// The order of this table is NOT significant: [`detect_rate`] picks the entry
+/// nearest the measured rate, so a new rate may be appended anywhere without
+/// shadowing an existing one.
 const STD_RATES: &[(u32, u32, f64)] = &[
     (24000, 1001, 23.976),
     (24, 1, 24.0),
@@ -572,6 +576,12 @@ const STD_RATES: &[(u32, u32, f64)] = &[
     (60000, 1001, 59.94),
     (60, 1, 60.0),
 ];
+
+/// How far the measured rate may sit from a [`STD_RATES`] entry and still snap to
+/// it. Half an fps separates every neighbouring pair in the table (23.976/24 are
+/// 0.024 apart, so both fall inside one another's window — which is exactly why
+/// the match must be nearest-wins, not first-wins).
+const RATE_TOLERANCE_FPS: f64 = 0.5;
 
 /// Detect the constant frame rate from the median presentation delta, snapping
 /// to the nearest standard rate. Falls back to a 90 kHz timescale with a rounded
@@ -593,10 +603,23 @@ fn detect_rate(samples: &[Sample]) -> (u32, u32) {
     deltas.sort_unstable();
     let median = deltas[deltas.len() / 2];
     let fps = NS as f64 / median as f64;
+    // Snap to the NEAREST standard rate inside the tolerance window, not the
+    // first one inside it. First-match made the answer depend on table order:
+    // every 1000/1001 rate sits within 0.5 fps of its integer twin and precedes
+    // it, so an exact 24.000 / 30.000 / 60.000 fps source was always declared
+    // 24000/1001, 30000/1001, 60000/1001 — a 0.1% timing error over the whole
+    // track. Nearest-match is order-independent, so the fix cannot be undone by
+    // someone appending a rate to STD_RATES (which is why it is preferred over
+    // simply reordering the table).
+    let mut best: Option<(u32, u32, f64)> = None;
     for &(ts, dur, rate) in STD_RATES {
-        if (fps - rate).abs() < 0.5 {
-            return (ts, dur);
+        let d = (fps - rate).abs();
+        if d < RATE_TOLERANCE_FPS && best.is_none_or(|(_, _, best_d)| d < best_d) {
+            best = Some((ts, dur, d));
         }
+    }
+    if let Some((ts, dur, _)) = best {
+        return (ts, dur);
     }
     let dur = ((median as i128 * 90_000) / NS as i128).max(1) as u32;
     (90_000, dur)
@@ -725,29 +748,37 @@ fn build_dinf() -> Vec<u8> {
     bx(b"dinf", &dref)
 }
 
-/// Colour signalling for the `colr` box (nclx): (primaries, transfer, matrix,
-/// full_range). `None` when the stream carries no usable colour info.
+/// Colour signalling for the `colr` box (nclx, ISO/IEC 14496-12 §12.1.5):
+/// (primaries, transfer, matrix, full_range) as ITU-T H.273 code points. `None`
+/// when the stream carries no usable colour info.
+///
+/// The code points come from [`crate::mux::mkv::cicp_for_video`] — the single
+/// resolver EVERY sink shares (measured bitstream CICP first, then the coarse
+/// `ColorSpace` enum with the HDR-driven transfer override). This box must never
+/// carry its own copy of that mapping: the copy that used to live here had drifted
+/// to hardcode transfer 16 (SMPTE ST 2084 / PQ) for all BT.2020 — tagging an HLG
+/// title, whose transfer is 18 (ARIB STD-B67), as PQ — and transfer 6 (BT.601) for
+/// BT.470 System B/G, whose transfer is 5. Both disagreed with the MKV sink and
+/// the FVI sidecar for the same disc.
 fn video_colr(stream: &DiscStream) -> Option<(u16, u16, u16, bool)> {
     let DiscStream::Video(v) = stream else {
         return None;
     };
-    if let Some(c) = v.measured_cicp {
-        return Some((
-            c.primaries as u16,
-            c.transfer as u16,
-            c.matrix as u16,
-            c.range == 2,
-        ));
+    // No measured CICP and no colorimetry from the playlist → nothing usable to
+    // signal. The shared resolver returns the CICP "unspecified" triple (2/2/2)
+    // for that case; an ABSENT `colr` box already means exactly that, so omit the
+    // box rather than write it (unchanged behaviour for this sink).
+    if v.measured_cicp.is_none() && v.color_space == crate::disc::ColorSpace::Unknown {
+        return None;
     }
-    use crate::disc::ColorSpace::*;
-    let cicp = match v.color_space {
-        Bt709 => (1, 1, 1),
-        Bt2020 => (9, 16, 9),
-        Bt470bg => (5, 6, 5),
-        Smpte170m => (6, 6, 6),
-        Unknown => return None,
-    };
-    Some((cicp.0, cicp.1, cicp.2, false))
+    let (matrix, transfer, primaries, range) = crate::mux::mkv::cicp_for_video(v);
+    Some((
+        primaries as u16,
+        transfer as u16,
+        matrix as u16,
+        // MeasuredCicp/Matroska Range: 2 = full, 1 = limited (the disc norm).
+        range == 2,
+    ))
 }
 
 /// Video `stbl`: sample entry + `stts`(constant) + `stss` + `ctts` + `stsc` +
@@ -1213,5 +1244,172 @@ mod tests {
             })
             .collect();
         assert_eq!(detect_rate(&samples), (24000, 1001));
+    }
+
+    // ── colr (ITU-T H.273 / CICP) ────────────────────────────────────────────
+
+    /// Decode `(primaries, transfer, matrix, full_range)` back out of the `colr`
+    /// nclx box of an emitted visual sample entry, so the assertion is on the
+    /// bytes that reach the file. `None` when no `colr` box was written.
+    fn colr_of(v: &VideoStream) -> Option<(u16, u16, u16, bool)> {
+        // `codec_private` is a byte pattern that cannot itself contain "colr".
+        let stsd = build_visual_stsd(
+            Codec::Hevc,
+            &[0u8; 8],
+            1920,
+            1080,
+            video_colr(&DiscStream::Video(v.clone())),
+        );
+        let i = stsd.windows(4).position(|w| w == b"colr")?;
+        let p = &stsd[i + 4..];
+        assert_eq!(&p[..4], b"nclx", "only the nclx colour type is written");
+        Some((
+            u16::from_be_bytes([p[4], p[5]]),
+            u16::from_be_bytes([p[6], p[7]]),
+            u16::from_be_bytes([p[8], p[9]]),
+            p[10] & 0x80 != 0,
+        ))
+    }
+
+    fn video_stream() -> VideoStream {
+        match hevc_video() {
+            DiscStream::Video(v) => v,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn colr_transfer_is_hlg_for_an_hlg_title_not_pq() {
+        // ITU-T H.273 Table 3: transfer 18 = ARIB STD-B67 (HLG), 16 = SMPTE
+        // ST 2084 (PQ). `video_colr` hardcoded 16 for every BT.2020 stream, so an
+        // HLG title got the PQ EOTF applied to it — while the MKV sink of the same
+        // rip correctly wrote 18.
+        let mut v = video_stream();
+        v.hdr = HdrFormat::Hlg;
+        v.color_space = ColorSpace::Bt2020;
+        assert_eq!(
+            colr_of(&v).expect("colr written"),
+            (9, 18, 9, false),
+            "BT.2020 primaries/matrix (9) with the HLG transfer (18)"
+        );
+    }
+
+    #[test]
+    fn colr_transfer_is_bt470bg_for_a_pal_dvd_not_bt601() {
+        // ITU-T H.273: transfer 5 = ITU-R BT.470-6 System B/G, 6 = BT.601.
+        // A PAL DVD is System B/G in all three code points.
+        let mut v = video_stream();
+        v.hdr = HdrFormat::Sdr;
+        v.color_space = ColorSpace::Bt470bg;
+        assert_eq!(colr_of(&v).expect("colr written"), (5, 5, 5, false));
+    }
+
+    #[test]
+    fn colr_agrees_with_the_shared_cicp_resolver_for_every_color_space() {
+        // One resolver, every sink: the `colr` box must carry exactly what
+        // `mkv::cicp_for_video` returns for the same stream, so an mp4:// rip and
+        // an mkv:// rip of one title can never describe different colour.
+        for cs in [
+            ColorSpace::Bt709,
+            ColorSpace::Bt2020,
+            ColorSpace::Bt470bg,
+            ColorSpace::Smpte170m,
+        ] {
+            for hdr in [
+                HdrFormat::Sdr,
+                HdrFormat::Hdr10,
+                HdrFormat::Hdr10Plus,
+                HdrFormat::Hlg,
+                HdrFormat::DolbyVision,
+            ] {
+                let mut v = video_stream();
+                v.color_space = cs;
+                v.hdr = hdr;
+                let (m, t, p, r) = crate::mux::mkv::cicp_for_video(&v);
+                assert_eq!(
+                    colr_of(&v).expect("colr written"),
+                    (p as u16, t as u16, m as u16, r == 2),
+                    "colr disagrees with the shared resolver for {cs:?} / {hdr:?}"
+                );
+            }
+        }
+        // Unknown colorimetry: no usable colour info, so no `colr` box at all —
+        // an absent box and an "unspecified" (2/2/2) box mean the same thing, and
+        // writing nothing is what this sink has always done.
+        let mut v = video_stream();
+        v.color_space = ColorSpace::Unknown;
+        assert!(colr_of(&v).is_none());
+    }
+
+    // ── detect_rate ──────────────────────────────────────────────────────────
+
+    /// Mux a video-only MP4 whose samples are exactly `delta_ns` apart and return
+    /// the `(mdhd.timescale, stts.sample_delta)` decoded out of the emitted file.
+    fn muxed_video_timing(delta_ns: i64) -> (u32, u32) {
+        let t = title(vec![hevc_video()], vec![Some(vec![1, 2, 3, 4])]);
+        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        for i in 0..10i64 {
+            s.write(&frame(0, i * delta_ns, i == 0, vec![0xAB; 16]))
+                .unwrap();
+        }
+        s.finish().unwrap();
+        let buf = s.writer.into_inner();
+
+        // One trak → exactly one `mdhd` and one `stts`.
+        let i = buf.windows(4).position(|w| w == b"mdhd").expect("mdhd");
+        // After the type: version+flags(4), creation(8), modification(8), timescale(4).
+        let timescale = u32::from_be_bytes(buf[i + 24..i + 28].try_into().unwrap());
+        let j = buf.windows(4).position(|w| w == b"stts").expect("stts");
+        // After the type: version+flags(4), entry_count(4), sample_count(4), sample_delta(4).
+        let delta = u32::from_be_bytes(buf[j + 16..j + 20].try_into().unwrap());
+        (timescale, delta)
+    }
+
+    #[test]
+    fn exact_integer_frame_rates_are_not_declared_as_their_fractional_twins() {
+        // `detect_rate` returned the FIRST STD_RATES entry within 0.5 fps, and each
+        // 1000/1001 rate precedes its integer twin, so 24.000 / 30.000 / 60.000
+        // were always written as 24000/1001, 30000/1001 and 60000/1001. The
+        // declared timescale/sample_delta is read back out of the muxed file.
+        for (delta_ns, want) in [
+            (41_666_667i64, (24u32, 1u32)), // 24.000
+            (33_333_333, (30, 1)),          // 30.000
+            (16_666_667, (60, 1)),          // 60.000
+            (40_000_000, (25, 1)),          // 25.000
+            (20_000_000, (50, 1)),          // 50.000
+            (41_708_333, (24_000, 1001)),   // 23.976
+            (33_366_667, (30_000, 1001)),   // 29.97
+            (16_683_333, (60_000, 1001)),   // 59.94
+        ] {
+            assert_eq!(
+                muxed_video_timing(delta_ns),
+                want,
+                "{delta_ns} ns/frame must be declared as {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_rate_picks_the_nearest_std_rate_regardless_of_table_order() {
+        // Order-independence is the property that keeps this fixed: every entry
+        // must resolve to itself when its own exact rate is measured, no matter
+        // where it sits in STD_RATES. A first-match rule can only satisfy this if
+        // the table happens to be ordered, which is what broke.
+        for &(ts, dur, rate) in STD_RATES {
+            let d = (NS as f64 / rate).round() as i64;
+            let samples: Vec<Sample> = (0..10)
+                .map(|i| Sample {
+                    offset: 0,
+                    size: 1,
+                    pts_ns: i as i64 * d,
+                    keyframe: i == 0,
+                })
+                .collect();
+            assert_eq!(
+                detect_rate(&samples),
+                (ts, dur),
+                "{rate} fps must resolve to its own STD_RATES entry"
+            );
+        }
     }
 }

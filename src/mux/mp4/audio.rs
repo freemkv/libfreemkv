@@ -5,7 +5,9 @@
 //! Atmos-in-DD+ JOC), and **DTS / DTS-HD** (`dtsc`/`dtsh` + `ddts`, describing
 //! the core with whole access units passed through so an HD decoder finds the
 //! extension). Config boxes are derived from the first audio frame's bitstream
-//! (ISO/IEC 14496-12 amendments; ETSI TS 102 366 / 102 114). Codecs with no
+//! (ISO/IEC 14496-12 amendments; ETSI TS 102 366 / 102 114) — so the entry always
+//! describes the syntax actually found, and a track the playlist calls DD+ whose
+//! first syncframe is a legacy AC-3 one is declared `ac-3`/`dac3`. Codecs with no
 //! clean MP4 mapping (TrueHD, LPCM, bitmap subtitles) are excluded by the fit
 //! oracle in the sink.
 
@@ -18,6 +20,15 @@ const FSCOD_RATES: [u32; 3] = [48_000, 44_100, 32_000];
 const EAC3_REDUCED_RATES: [u32; 4] = [24_000, 22_050, 16_000, 48_000];
 /// Base channel count per `acmod` (A/52 Table 5.8), before the LFE.
 const ACMOD_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
+/// Lowest `bsid` that identifies an Annex-E (E-AC-3) bitstream: ETSI TS 102 366
+/// Annex E uses bsid 16, while 8 is AC-3 and 9/10 are the AC-3 alternate bit
+/// stream syntax of Annex D. Both the parser and the sample-entry chooser read
+/// this one constant so they cannot disagree about which syntax was found.
+const EAC3_MIN_BSID: u8 = 11;
+/// Width of the `dec3` `data_rate` field in bits (ETSI TS 102 366 Annex F.6.1).
+const DEC3_DATA_RATE_BITS: u32 = 13;
+/// Largest data rate the 13-bit `dec3` `data_rate` field can express, in kbit/s.
+const DEC3_MAX_DATA_RATE_KBPS: u16 = (1 << DEC3_DATA_RATE_BITS) - 1;
 
 /// A big-endian MSB-first bit reader over a byte slice.
 struct BitReader<'a> {
@@ -78,7 +89,7 @@ pub(super) fn parse_dolby(frame: &[u8]) -> Option<DolbyConfig> {
     }
     // bsid lives in byte 5 bits 7-3 for both AC-3 and E-AC-3.
     let bsid = (f[5] >> 3) & 0x1F;
-    if bsid >= 11 {
+    if bsid >= EAC3_MIN_BSID {
         parse_eac3(f)
     } else {
         parse_ac3(f)
@@ -188,10 +199,20 @@ pub(super) fn dac3_box(c: &DolbyConfig) -> Vec<u8> {
 /// substream, no dependent substreams: data_rate(13) num_ind_sub(3) then
 /// fscod(2) bsid(5) reserved(1) asvc(1) bsmod(3) acmod(3) lfeon(1) reserved(3)
 /// num_dep_sub(4) reserved(1).
+///
+/// `data_rate` states the bitstream's rate in kbit/s and must be non-zero; only
+/// [`parse_eac3`] computes one, so this box is written only for a config that came
+/// from an Annex-E syncframe (see [`dolby_sample_entry`]).
 pub(super) fn dec3_box(c: &DolbyConfig) -> Vec<u8> {
     let mut v: u64 = 0;
     let mut push = |val: u64, bits: u32| v = (v << bits) | (val & ((1u64 << bits) - 1));
-    push(c.data_rate_kbps as u64, 13);
+    // Saturate rather than let `push`'s mask wrap a rate that does not fit the
+    // 13-bit field: a truncated/garbage frame yielding e.g. 9000 kbit/s would
+    // otherwise be declared as 808.
+    push(
+        c.data_rate_kbps.min(DEC3_MAX_DATA_RATE_KBPS) as u64,
+        DEC3_DATA_RATE_BITS,
+    );
     push(0, 3); // num_ind_sub - 1 = 0 (one substream)
     push(c.fscod as u64, 2);
     push(c.bsid as u64, 5);
@@ -324,17 +345,24 @@ fn parse_dts(frame: &[u8]) -> Option<DtsConfig> {
 /// the Ls/Rs pair, so it is 3 channels and `0x0012`, not 4 and `0x0006`.
 /// `ddts_channel_layout_speaker_count_matches_declared_channels` pins the
 /// invariant for all 16 values.
+/// The AMODE annotations below name the layout ETSI TS 102 114 §5.3.1 gives for
+/// that AMODE and the mask that encodes it. Three of them used to be rotated by
+/// one (AMODE 2 labelled "sum/difference", 3 "left/right total", 4 plain "L/R")
+/// and AMODE 9 was labelled "5.1 core with LFE" although 0x0007 is the 5.0 mask —
+/// LFE is bit 3, OR'd in separately by [`dts_channel_layout`]. Both mislabels
+/// invited a "correction" to the VALUES, which are right and are pinned by
+/// `ddts_channel_layout_speaker_count_matches_declared_channels`.
 const DTS_AMODE_LAYOUT: [u16; 16] = [
-    0x0001, // 0  C
-    0x0002, // 1  L/R
-    0x0002, // 2  L/R  (sum/difference)
-    0x0002, // 3  L/R  (left/right total)
-    0x0002, // 4  L/R
+    0x0001, // 0  A                      → C
+    0x0002, // 1  A + B (dual mono)      → L/R
+    0x0002, // 2  L + R (stereo)         → L/R
+    0x0002, // 3  (L+R) + (L−R) (sum/difference) → L/R
+    0x0002, // 4  LT + RT (left/right total)     → L/R
     0x0003, // 5  C + L/R
     0x0012, // 6  L/R + Cs
     0x0013, // 7  C + L/R + Cs
     0x0006, // 8  L/R + Ls/Rs
-    0x0007, // 9  C + L/R + Ls/Rs                    (5.1 core with LFE)
+    0x0007, // 9  C + L/R + Ls/Rs        (5.0; the LFE bit is added separately)
     0x0206, // 10 L/R + Ls/Rs + Lc/Rc
     0x0143, // 11 C + L/R + Lsr/Rsr + Oh
     0x0053, // 12 C + L/R + Cs + Lsr/Rsr
@@ -405,7 +433,16 @@ fn ddts_box(c: &DtsConfig) -> Vec<u8> {
     push(0, 1); // StereoDownmix
     push(0, 3); // RepresentationType
     push(c.channel_layout as u128, 16);
-    push(c.has_extension as u128, 1); // MultiAssetFlag
+    // MultiAssetFlag signals more than one audio ASSET in the substream — a parser
+    // that reads it goes on to select between asset descriptors. `has_extension`
+    // is a different thing entirely: a DTS-HD MA / HRA track is ONE asset whose
+    // extension substream carries the XLL/XBR component, so deriving the flag from
+    // it sent a parser looking for a second asset that does not exist (while
+    // StreamConstruction, pinned to the core-only value below, simultaneously said
+    // there was no extension at all — the box contradicting itself). This module
+    // parses the core header only and never reads the EXSS asset table, so the
+    // single-asset declaration is the only one it can honestly make.
+    push(0, 1); // MultiAssetFlag
     push(0, 1); // LBRDurationMod
     push(0, 1); // ReservedBoxPresent
     push(0, 5); // Reserved
@@ -431,11 +468,28 @@ pub(super) fn dolby_sample_entry(codec: Codec, first_frame: &[u8]) -> Option<Vec
         }
         Codec::Ac3Plus => {
             let c = parse_dolby(first_frame)?;
+            // The config box must describe the syncframe that was actually found,
+            // not the codec the playlist claimed. When the first syncframe carries
+            // a legacy AC-3 bsid (≤ 10 — a Dolby Digital compatibility substream
+            // ahead of the Annex-E substreams, or a misdetected stream),
+            // `parse_dolby` took the AC-3 path: it has no nominal data rate, so an
+            // EC3SpecificBox built from it declares data_rate = 0 with an AC-3
+            // bit_stream_identification — and ETSI TS 102 366 Annex F.6.1 defines
+            // data_rate as the bitstream's rate in kbit/s, which 0 is not. Annex F.4
+            // assigns the AC3SampleEntry (`ac-3`) + AC3SpecificBox to an AC-3
+            // bitstream, so emit that: it describes the parsed frame exactly, and
+            // whole access units still pass through, so a DD+ decoder finds any
+            // Annex-E substreams in the samples themselves.
+            let (fourcc, config): (&[u8; 4], Vec<u8>) = if c.bsid >= EAC3_MIN_BSID {
+                (b"ec-3", dec3_box(&c))
+            } else {
+                (b"ac-3", dac3_box(&c))
+            };
             Some(audio_sample_entry(
-                b"ec-3",
+                fourcc,
                 c.channels,
                 c.sample_rate,
-                &dec3_box(&c),
+                &config,
             ))
         }
         Codec::Dts | Codec::DtsHdMa | Codec::DtsHdHr => {
@@ -502,8 +556,9 @@ mod tests {
         assert_eq!(&dac3[4..8], b"dac3");
     }
 
-    #[test]
-    fn eac3_bsi_and_dec3() {
+    /// A synthetic Annex-E (E-AC-3) syncframe: bsid=16, fscod=0 (48 kHz),
+    /// numblkscod=3 (6 blocks), acmod=7 (3/2), lfeon=1 → 5.1, frmsiz=63 (128 B).
+    fn eac3_frame_5_1() -> Vec<u8> {
         // E-AC-3: syncword | strmtyp/substreamid/frmsiz | fscod/numblks/acmod/lfeon | bsid
         let mut f = vec![0x0B, 0x77];
         f.push(0x00); // strmtyp=0, substreamid=0, frmsiz high=0
@@ -513,6 +568,19 @@ mod tests {
         // byte5: bsid(5)=16 (E-AC-3) | dialnorm high(3)
         f.push(0b10000_000);
         f.push(0x00);
+        f
+    }
+
+    /// Decode `data_rate` (the leading 13 bits) back out of an emitted `dec3`
+    /// box body, so a test measures the FILE and not this module's arithmetic.
+    fn dec3_data_rate(dec3: &[u8]) -> u16 {
+        assert_eq!(&dec3[4..8], b"dec3");
+        (u16::from_be_bytes([dec3[8], dec3[9]]) >> 3) & 0x1FFF
+    }
+
+    #[test]
+    fn eac3_bsi_and_dec3() {
+        let f = eac3_frame_5_1();
         let c = parse_dolby(&f).expect("parsed");
         assert!(c.bsid >= 11, "E-AC-3");
         assert_eq!(c.bsid, 16);
@@ -525,6 +593,75 @@ mod tests {
         // [size:4]["dec3"][5-byte payload] = 13 bytes.
         assert_eq!(dec3.len(), 13);
         assert_eq!(&dec3[4..8], b"dec3");
+    }
+
+    #[test]
+    fn ac3plus_with_a_legacy_syncframe_is_declared_ac3_not_a_zero_rate_ec3() {
+        // A Codec::Ac3Plus track whose first syncframe is a legacy AC-3 frame
+        // (bsid 8 < 11) is parsed by `parse_ac3`, which has no nominal data rate.
+        // ETSI TS 102 366 Annex F.6.1 requires the EC3SpecificBox `data_rate` to
+        // state the bitstream's rate in kbit/s and `bit_stream_identification` to
+        // be the substream's bsid, so an `ec-3` entry built from that config
+        // declared 0 kbps for an AC-3 bsid — a decoder configured from it sees a
+        // zero-bitrate stream. Annex F.4 assigns the AC3SampleEntry ('ac-3') +
+        // AC3SpecificBox to an AC-3 bitstream: emit the box that matches the
+        // syncframe that was actually parsed.
+        let e = dolby_sample_entry(Codec::Ac3Plus, &ac3_frame_5_1()).expect("entry built");
+        assert_eq!(
+            &e[4..8],
+            b"ac-3",
+            "a legacy AC-3 syncframe gets the AC3SampleEntry"
+        );
+        assert!(
+            e.windows(4).any(|w| w == b"dac3"),
+            "AC3SpecificBox present in the emitted entry"
+        );
+        assert!(
+            !e.windows(4).any(|w| w == b"dec3"),
+            "no EC3SpecificBox may describe an AC-3 syncframe"
+        );
+    }
+
+    #[test]
+    fn ec3_entry_declares_a_nonzero_data_rate_decoded_from_the_box() {
+        // A real Annex-E syncframe still gets `ec-3` + `dec3`, and the data_rate
+        // read back out of the emitted box is the frame's nominal rate, not 0.
+        // 128 B / 1536 samples @ 48 kHz = 32 kbit/s.
+        let e = dolby_sample_entry(Codec::Ac3Plus, &eac3_frame_5_1()).expect("entry built");
+        assert_eq!(&e[4..8], b"ec-3");
+        let i = e
+            .windows(4)
+            .position(|w| w == b"dec3")
+            .expect("EC3SpecificBox present");
+        let rate = dec3_data_rate(&e[i - 4..]);
+        assert_ne!(
+            rate, 0,
+            "ETSI TS 102 366 Annex F.6.1: data_rate is in kbit/s"
+        );
+        assert_eq!(rate, 32);
+    }
+
+    #[test]
+    fn dec3_data_rate_saturates_at_the_13_bit_field_maximum() {
+        // `data_rate` is a 13-bit field (max 8191 kbit/s). The `& mask` in `push`
+        // wraps anything larger into a small, wrong rate — 9000 became 808.
+        let c = DolbyConfig {
+            fscod: 0,
+            bsid: 16,
+            bsmod: 0,
+            acmod: 7,
+            lfeon: true,
+            bit_rate_code: 0,
+            data_rate_kbps: 9000,
+            sample_rate: 48_000,
+            channels: 6,
+        };
+        let rate = dec3_data_rate(&dec3_box(&c));
+        assert_eq!(
+            rate, 8191,
+            "an out-of-range rate saturates, it does not wrap"
+        );
+        assert_ne!(rate, 808, "9000 & 0x1FFF");
     }
 
     #[test]
@@ -671,6 +808,37 @@ mod tests {
             "a 16384-byte core must be declared as the 14-bit maximum, not wrapped"
         );
         assert_ne!(core_size, 0, "wrapping to 0 declares an empty core frame");
+    }
+
+    #[test]
+    fn ddts_multi_asset_flag_is_clear_for_a_single_asset_with_an_extension() {
+        // MultiAssetFlag in the ETSI TS 102 114 DTSSpecificBox signals more than
+        // one audio ASSET in the substream. A DTS-HD MA track is ONE asset whose
+        // extension substream carries the XLL component, so deriving the flag
+        // from "an EXSS sync follows the core" told a parser to go select a
+        // second asset descriptor that does not exist. This module never parses
+        // the EXSS asset table, so the only declaration it can make is 0.
+        let f = vec![
+            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x00, 0x00, 0x80, 0x00, 0x64, 0x58, 0x20, 0x25,
+        ];
+        let c = parse_dts(&f).expect("parses");
+        assert!(c.has_extension, "fixture must exercise the extension path");
+
+        // Decode the flag back out of the emitted box: 8-byte box header, then
+        // DTSSamplingFrequency(4) + maxBitrate(4) + avgBitrate(4) +
+        // pcmSampleDepth(1) = 13 bytes, then the 56-bit packed tail. Within the
+        // tail MultiAssetFlag is bit 48 — after FrameDuration(2) +
+        // StreamConstruction(5) + CoreLFEPresent(1) + CoreLayout(6) +
+        // CoreSize(14) + StereoDownmix(1) + RepresentationType(3) +
+        // ChannelLayout(16) — i.e. the MSB of the tail's 7th byte.
+        let b = ddts_box(&c);
+        let tail = &b[8 + 13..];
+        assert_eq!(tail.len(), 7, "56-bit packed tail");
+        assert_eq!(
+            (tail[6] >> 7) & 1,
+            0,
+            "MultiAssetFlag must not be set from has_extension"
+        );
     }
 
     #[test]

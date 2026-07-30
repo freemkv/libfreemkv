@@ -550,6 +550,25 @@ impl MkvTrack {
             field_duration_ns: 0,
             sample_rate: sr,
             channels: ch,
+            // KNOWN GAP, not a deliberate omission. The Matroska Codec
+            // Specifications say of `A_PCM/INT/BIG` and `A_PCM/INT/LIT` that "the
+            // audio bit depth MUST be read and set from the `BitDepth` element",
+            // and raw PCM has no in-band header left to recover it from once
+            // `LpcmParser` has stripped the BD/DVD framing — so a `Codec::Lpcm`
+            // track written with 0 here (the serializer then omits BitDepth
+            // entirely) has no recoverable sample width.
+            //
+            // The value is NOT available at this call site: [`AudioStream`] has no
+            // bit-depth member, and neither of the two places that know it reaches
+            // here. BD LPCM signals it in the 4-byte ES header (byte 3 bits 7-6)
+            // that `LpcmParser` discards, and the Blu-ray clip info does not carry
+            // it at all; DVD LPCM signals it in the IFO audio-attribute block
+            // (byte 1 bits 7-6, quantization: 16/20/24-bit), which `parse_audio_attr`
+            // does not read. Closing it means carrying the depth on `AudioStream`
+            // for the DVD path and a deferred setter fed from the first PES for the
+            // BD path (the route `hdr10` and `field_order` already take). Guessing
+            // 16 here would be worse than omitting: it turns a track a player may
+            // probe or reject into one it confidently misdecodes.
             bit_depth: 0,
             dv_config: None,
             hdr10: None,
