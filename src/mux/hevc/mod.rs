@@ -96,7 +96,17 @@ impl<W: Write> HevcMux<W> {
                 }
             }
         }
-        let annex_b = length_prefixed_to_annex_b(data);
+        // The hvcC declares the NAL length-prefix width (ISO/IEC 14496-15
+        // §8.3.3.1.2 `lengthSizeMinusOne + 1`). Assuming 4 for a source that
+        // declares 1 or 2 emits the raw prefixed bytes with no start codes.
+        let length_size = nal_length_size(crate::disc::Codec::Hevc, self.codec_private.as_deref());
+        let annex_b = if starts_with_start_code(data) {
+            data.to_vec()
+        } else {
+            let mut out = Vec::with_capacity(data.len() + (data.len() / 32));
+            append_length_prefixed_as_annex_b_sized(&mut out, data, length_size);
+            out
+        };
         self.writer.write_all(&annex_b)
     }
 
@@ -190,6 +200,44 @@ pub(crate) fn length_prefixed_to_annex_b(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The NAL length-prefix width this crate's own parsers emit, and the width
+/// ISO/IEC 14496-15 records declare as `lengthSizeMinusOne = 3`.
+pub(crate) const DEFAULT_NAL_LENGTH_SIZE: usize = 4;
+
+/// Number of octets each NAL length prefix occupies in the elementary data of a
+/// track described by `record` — the `lengthSizeMinusOne + 1` field of the
+/// decoder configuration record (ISO/IEC 14496-15).
+///
+/// * avcC (`AVCDecoderConfigurationRecord`, §5.3.3.1.2): byte 4 is
+///   `bit(6) reserved | unsigned int(2) lengthSizeMinusOne`.
+/// * hvcC (`HEVCDecoderConfigurationRecord`, §8.3.3.1.2): byte 21 is
+///   `constantFrameRate(2) | numTemporalLayers(3) | temporalIdNested(1) |
+///   lengthSizeMinusOne(2)`.
+///
+/// The spec permits only 1, 2 or 4 octets (`lengthSizeMinusOne` of 0, 1 or 3);
+/// a declared 3 is non-conformant but is decoded rather than rejected, since
+/// reading N octets is the same operation for every N. A record too short to
+/// carry the field, or a codec with no such record, falls back to
+/// [`DEFAULT_NAL_LENGTH_SIZE`] — the width every freemkv parser emits.
+///
+/// This exists because assuming 4 is silent corruption for a legal source:
+/// reading a 2-octet-prefixed frame as u32-BE yields an absurd first length, the
+/// conversion loop bails with nothing parsed, and the raw length-prefixed bytes
+/// are passed through as though they were already Annex B — a stream with no
+/// start codes at all, and no error anywhere.
+pub(crate) fn nal_length_size(codec: crate::disc::Codec, record: Option<&[u8]>) -> usize {
+    use crate::disc::Codec;
+    let field_offset = match codec {
+        Codec::H264 => 4,
+        Codec::Hevc => 21,
+        _ => return DEFAULT_NAL_LENGTH_SIZE,
+    };
+    match record.and_then(|r| r.get(field_offset)) {
+        Some(&b) => (b & 0x03) as usize + 1,
+        None => DEFAULT_NAL_LENGTH_SIZE,
+    }
+}
+
 /// Append the Annex B form of `data` (length-prefixed NALs) into `out`.
 ///
 /// Same conversion as [`length_prefixed_to_annex_b`] but writes directly
@@ -198,20 +246,40 @@ pub(crate) fn length_prefixed_to_annex_b(data: &[u8]) -> Vec<u8> {
 /// length-prefixed (no NALs extracted), it's appended unchanged on the
 /// assumption it's already Annex B.
 pub(crate) fn append_length_prefixed_as_annex_b(out: &mut Vec<u8>, data: &[u8]) {
+    append_length_prefixed_as_annex_b_sized(out, data, DEFAULT_NAL_LENGTH_SIZE);
+}
+
+/// [`append_length_prefixed_as_annex_b`] for a source whose NAL length prefixes
+/// are `length_size` octets wide rather than the 4 this crate's own parsers
+/// emit. Derive `length_size` from the track's configuration record with
+/// [`nal_length_size`] — ISO/IEC 14496-15 lets a legal avcC/hvcC declare 1 or 2
+/// octet prefixes, and reading those as u32-BE mangles the frame.
+///
+/// `length_size` outside `1..=4` is clamped to [`DEFAULT_NAL_LENGTH_SIZE`]; the
+/// field it comes from is 2 bits wide, so that is unreachable from real input.
+pub(crate) fn append_length_prefixed_as_annex_b_sized(
+    out: &mut Vec<u8>,
+    data: &[u8],
+    length_size: usize,
+) {
+    let length_size = if (1..=4).contains(&length_size) {
+        length_size
+    } else {
+        DEFAULT_NAL_LENGTH_SIZE
+    };
     let mut offset = 0;
     // True once we've consumed at least one well-formed length prefix
     // (even a zero-length one). Distinguishes "parsed as length-prefixed,
     // all NALs empty" (emit nothing) from "not length-prefixed at all"
     // (pass through as already-Annex B).
     let mut parsed_any = false;
-    while offset + 4 <= data.len() {
-        let len = u32::from_be_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]) as usize;
-        offset += 4;
+    while offset + length_size <= data.len() {
+        // Big-endian over exactly `length_size` octets (ISO/IEC 14496-15: the
+        // prefix is an unsigned integer of `lengthSizeMinusOne + 1` bytes).
+        let len = data[offset..offset + length_size]
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | b as usize);
+        offset += length_size;
         if offset + len > data.len() {
             // Mid-NAL truncation (e.g. a NAL cut by a bad disc sector) —
             // drop the truncated trailing NAL and emit only the valid
@@ -635,6 +703,101 @@ mod tests {
         want.extend_from_slice(&START_CODE);
         want.extend_from_slice(&[0x11, 0x22]);
         assert_eq!(out, want);
+    }
+
+    /// ISO/IEC 14496-15 §5.3.3.1.2 (avcC byte 4) and §8.3.3.1.2 (hvcC byte 21)
+    /// each carry `lengthSizeMinusOne` in the low 2 bits. Nothing in the crate
+    /// read it, so every conversion assumed a 4-octet prefix.
+    #[test]
+    fn nal_length_size_is_read_from_the_configuration_record() {
+        use crate::disc::Codec;
+        // avcC: byte 4 = 0xFF → lengthSizeMinusOne 3 → 4-octet prefixes.
+        let mut avcc = vec![0x01, 0x64, 0x00, 0x28, 0xFF, 0xE1];
+        assert_eq!(nal_length_size(Codec::H264, Some(&avcc)), 4);
+        // 0xFD → lengthSizeMinusOne 1 → 2-octet prefixes (legal per §5.3.3.1.2).
+        avcc[4] = 0xFD;
+        assert_eq!(nal_length_size(Codec::H264, Some(&avcc)), 2);
+        // 0xFC → lengthSizeMinusOne 0 → 1-octet prefixes.
+        avcc[4] = 0xFC;
+        assert_eq!(nal_length_size(Codec::H264, Some(&avcc)), 1);
+
+        // hvcC: the field is byte 21, not byte 4.
+        let mut hvcc = vec![0u8; 23];
+        hvcc[21] = 0xFF;
+        assert_eq!(nal_length_size(Codec::Hevc, Some(&hvcc)), 4);
+        hvcc[21] = 0xFD;
+        assert_eq!(nal_length_size(Codec::Hevc, Some(&hvcc)), 2);
+
+        // Absent / too-short record, or a non-NAL codec → the crate's own width.
+        assert_eq!(nal_length_size(Codec::Hevc, None), DEFAULT_NAL_LENGTH_SIZE);
+        assert_eq!(
+            nal_length_size(Codec::Hevc, Some(&hvcc[..8])),
+            DEFAULT_NAL_LENGTH_SIZE
+        );
+        assert_eq!(
+            nal_length_size(Codec::Mpeg2, Some(&avcc)),
+            DEFAULT_NAL_LENGTH_SIZE
+        );
+    }
+
+    /// Regression (silent corruption): a source whose avcC declares 2-octet NAL
+    /// lengths was reframed by reading the first FOUR octets as one u32-BE
+    /// length. That value is absurd, the loop breaks with `parsed_any == false`,
+    /// and the whole frame is passed through verbatim — raw length-prefixed
+    /// bytes in a stream that is supposed to be Annex B, with no start codes,
+    /// no NALs and no error.
+    #[test]
+    fn two_octet_length_prefixes_convert_instead_of_leaking_raw_bytes() {
+        // Two NALs with 2-octet prefixes: [0x00 0x03][3 bytes][0x00 0x02][2 bytes]
+        let data = [
+            0x00, 0x03, 0x67, 0x42, 0x1E, // NAL 1
+            0x00, 0x02, 0x68, 0xCE, // NAL 2
+        ];
+        let mut want = START_CODE.to_vec();
+        want.extend_from_slice(&[0x67, 0x42, 0x1E]);
+        want.extend_from_slice(&START_CODE);
+        want.extend_from_slice(&[0x68, 0xCE]);
+
+        let mut got = Vec::new();
+        append_length_prefixed_as_annex_b_sized(&mut got, &data, 2);
+        assert_eq!(got, want, "2-octet prefixes must be reframed to Annex B");
+
+        // What the 4-octet assumption produced: the raw bytes, verbatim, with no
+        // start code anywhere.
+        let mut assumed_four = Vec::new();
+        append_length_prefixed_as_annex_b(&mut assumed_four, &data);
+        assert_eq!(
+            assumed_four,
+            data.to_vec(),
+            "the 4-octet assumption leaks the source bytes unconverted"
+        );
+        assert!(
+            !assumed_four.starts_with(&START_CODE),
+            "no start code at all — the video cannot decode"
+        );
+    }
+
+    /// A 1-octet prefix width works the same way, and an out-of-range width
+    /// falls back to the crate's own 4 rather than panicking or looping.
+    #[test]
+    fn one_octet_length_prefixes_and_out_of_range_width() {
+        let data = [0x02, 0x40, 0x01, 0x01, 0x09];
+        let mut got = Vec::new();
+        append_length_prefixed_as_annex_b_sized(&mut got, &data, 1);
+        let mut want = START_CODE.to_vec();
+        want.extend_from_slice(&[0x40, 0x01]);
+        want.extend_from_slice(&START_CODE);
+        want.extend_from_slice(&[0x09]);
+        assert_eq!(got, want);
+
+        // width 0 and width 9 both clamp to DEFAULT_NAL_LENGTH_SIZE.
+        let mut four = Vec::new();
+        append_length_prefixed_as_annex_b(&mut four, &data);
+        for bad in [0usize, 9] {
+            let mut clamped = Vec::new();
+            append_length_prefixed_as_annex_b_sized(&mut clamped, &data, bad);
+            assert_eq!(clamped, four, "an impossible width clamps to 4");
+        }
     }
 
     #[test]

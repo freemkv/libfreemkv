@@ -4,7 +4,9 @@
 //! packets. Each frame is wrapped in a PES header, split into TS packets,
 //! and prepended with the 4-byte TP_extra_header.
 
-use super::hevc::{append_length_prefixed_as_annex_b, avcc_to_annex_b, hvcc_to_annex_b};
+use super::hevc::{
+    append_length_prefixed_as_annex_b_sized, avcc_to_annex_b, hvcc_to_annex_b, nal_length_size,
+};
 use crate::disc::Codec;
 use std::io::{self, Write};
 
@@ -239,7 +241,15 @@ impl<W: Write> TsMuxer<W> {
             // and we then copied it in, so every video frame cost two full-frame
             // allocations and two full-frame copies. At ~200k frames averaging
             // ~310 KB of ES on a UHD, that is ~124 GB of pointless memcpy.
-            append_length_prefixed_as_annex_b(&mut annex_b, data);
+            // The prefix width is whatever the source's avcC/hvcC declares
+            // (ISO/IEC 14496-15 `lengthSizeMinusOne + 1`), NOT an assumed 4:
+            // a 1- or 2-octet-prefixed source read as u32-BE parses no NALs at
+            // all and its raw bytes are passed through with no start codes.
+            let length_size = nal_length_size(
+                self.video_codec[track],
+                self.codec_privates[track].as_deref(),
+            );
+            append_length_prefixed_as_annex_b_sized(&mut annex_b, data, length_size);
         } else if is_video {
             self.params_written[track] = true;
         }
