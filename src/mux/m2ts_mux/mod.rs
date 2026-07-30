@@ -242,7 +242,14 @@ impl<W: Write> M2tsMux<W> {
         }
         // Append the Annex-B form directly into the pre-sized `es`
         // buffer rather than materializing an intermediate Vec.
-        super::hevc::append_length_prefixed_as_annex_b(&mut es, data);
+        // The source's hvcC declares the NAL length-prefix width (ISO/IEC
+        // 14496-15 §8.3.3.1.2 `lengthSizeMinusOne + 1`); assuming 4 mangles a
+        // legal 1- or 2-octet-prefixed source into a start-code-free stream.
+        let length_size = super::hevc::nal_length_size(
+            crate::disc::Codec::Hevc,
+            self.video_codec_private.as_deref(),
+        );
+        super::hevc::append_length_prefixed_as_annex_b_sized(&mut es, data, length_size);
 
         let pes = build_video_pes(pts_90k, &es);
         self.write_pes(PID_VIDEO, &pes, Some(pcr), keyframe)

@@ -6,9 +6,10 @@
 use super::mkv::{MkvMuxer, MkvTrack};
 use super::{WriteSeek, ebml};
 
-/// (title, codec_privates, ts_scale_ns) — `ts_scale_ns` is the
-/// TimestampScale in nanoseconds per tick, threaded into the frame read path.
-type MkvHeaderResult = io::Result<(crate::disc::DiscTitle, Vec<(u16, Vec<u8>)>, i64)>;
+/// (title, codec_privates, ts_scale_ns, track_table) — `ts_scale_ns` is the
+/// TimestampScale in nanoseconds per tick, threaded into the frame read path;
+/// `track_table` maps Matroska TrackNumbers onto `DiscTitle::streams` indices.
+type MkvHeaderResult = io::Result<(crate::disc::DiscTitle, Vec<(u16, Vec<u8>)>, i64, TrackTable)>;
 
 /// Skip `n` bytes on a forward-only reader (no Seek required).
 fn skip_bytes(r: &mut impl Read, n: u64) -> io::Result<()> {
@@ -74,6 +75,14 @@ struct ReadState {
     ts_scale_ns: i64,
     /// Codec private data per track (track_number, hvcC/avcC bytes).
     codec_privates: Vec<(u16, Vec<u8>)>,
+    /// TrackNumber → stream-index map (and per-track DefaultDuration). MKV
+    /// TrackNumbers are not required to be `1..=N` in TrackEntry order, so this
+    /// is the only permitted translation between the two spaces.
+    tracks: TrackTable,
+    /// Frames decoded from a LACED Block that have not been handed out yet. One
+    /// Block can carry many frames (RFC 9559 §10.3) while `Stream::read` yields
+    /// one at a time, so the surplus waits here.
+    pending: std::collections::VecDeque<crate::pes::PesFrame>,
     /// Number of `BlockAdditions` subtrees skipped on read-back (see
     /// `MkvStream`'s `Stream::lost_bytes`). Each one is a per-frame side payload — for a
     /// Blu-ray 3D rip written by this crate, one MVC dependent-view (right-eye)
@@ -550,7 +559,7 @@ impl MkvStream {
 
     /// Open an MKV file for reading → PES frames.
     pub fn open(mut reader: impl Read + Send + 'static) -> io::Result<Self> {
-        let (disc_title, codec_privates, ts_scale_ns) = parse_mkv_header(&mut reader)?;
+        let (disc_title, codec_privates, ts_scale_ns, tracks) = parse_mkv_header(&mut reader)?;
         Ok(Self {
             disc_title,
             mvc: None,
@@ -559,6 +568,8 @@ impl MkvStream {
                 cluster_ts_ticks: 0,
                 ts_scale_ns,
                 codec_privates,
+                tracks,
+                pending: std::collections::VecDeque::new(),
                 additions_dropped: 0,
                 additions_dropped_bytes: 0,
             }),
@@ -628,11 +639,16 @@ fn apply_coding_to_track(
 
 impl crate::pes::Stream for MkvStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
-        let streams_len = self.disc_title.streams.len();
         let rs = match self.mode {
             Mode::Read(ref mut rs) => rs,
             Mode::Write(_) => return Err(crate::error::Error::StreamWriteOnly.into()),
         };
+
+        // Frames still owed from the last LACED Block come out before any new
+        // element is read, so a lace is never truncated by the next Block.
+        if let Some(frame) = rs.pending.pop_front() {
+            return Ok(Some(frame));
+        }
 
         loop {
             let (id, size, _) = match ebml::read_element_header(&mut rs.reader) {
@@ -662,13 +678,15 @@ impl crate::pes::Stream for MkvStream {
                 ebml::SIMPLE_BLOCK => {
                     let block =
                         ebml::read_binary_val(&mut rs.reader, checked_size(size, MAX_BLOCK_SIZE)?)?;
-                    if let Some(frame) = parse_block(
+                    let frames = parse_block(
                         &block,
                         rs.cluster_ts_ticks,
                         rs.ts_scale_ns,
-                        streams_len,
+                        &rs.tracks,
                         None,
-                    ) {
+                    )?;
+                    rs.pending.extend(frames);
+                    if let Some(frame) = rs.pending.pop_front() {
                         return Ok(Some(frame));
                     }
                     continue;
@@ -773,17 +791,21 @@ impl crate::pes::Stream for MkvStream {
                         // in foreign MKVs) — same scaling PTS uses.
                         let dur_ns =
                             duration_ms.map(|ticks| ticks.saturating_mul(rs.ts_scale_ns as u64));
-                        if let Some(mut frame) = parse_block(
+                        let frames = parse_block(
                             &block,
                             rs.cluster_ts_ticks,
                             rs.ts_scale_ns,
-                            streams_len,
+                            &rs.tracks,
                             dur_ns,
-                        ) {
-                            // Override the flag-bit guess from `parse_block`
-                            // (meaningful for SimpleBlock only) with the
-                            // BlockGroup's authoritative signal.
-                            frame.keyframe = !has_reference;
+                        )?;
+                        // Override the flag-bit guess from `parse_block`
+                        // (meaningful for SimpleBlock only) with the
+                        // BlockGroup's authoritative signal.
+                        rs.pending.extend(frames.into_iter().map(|mut f| {
+                            f.keyframe = !has_reference;
+                            f
+                        }));
+                        if let Some(frame) = rs.pending.pop_front() {
                             return Ok(Some(frame));
                         }
                     }
@@ -859,8 +881,12 @@ impl crate::pes::Stream for MkvStream {
     }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
-        let track_num = (track + 1) as u16; // MKV tracks are 1-based
         if let Mode::Read(ref rs) = self.mode {
+            // `track` is a stream index; `codec_privates` is keyed by Matroska
+            // TrackNumber. Those are NOT the same space (RFC 9559 §5.1.4.1.1
+            // requires only a non-zero TrackNumber), so translate through the
+            // real map instead of assuming `track + 1`.
+            let track_num = rs.tracks.num_of(track)?;
             rs.codec_privates
                 .iter()
                 .find(|(tn, _)| *tn == track_num)
@@ -914,6 +940,7 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
     let mut ts_scale: u64 = 1_000_000;
     let mut streams: Vec<crate::disc::Stream> = Vec::new();
     let mut codec_privates: Vec<(u16, Vec<u8>)> = Vec::new();
+    let mut tracks = TrackTable::default();
 
     let (id, size, _) = ebml::read_element_header(r)?;
     if id != ebml::EBML {
@@ -982,9 +1009,13 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
                     }
                     remaining = remaining.saturating_sub(hlen as u64 + cs);
                     if cid == ebml::TRACK_ENTRY {
-                        let (stream, tnum, cp) = parse_track(r, cs)?;
+                        let (stream, tnum, cp, default_dur) = parse_track(r, cs)?;
                         if let Some(s) = stream {
+                            // Record the TrackNumber alongside the stream it maps
+                            // to, in the SAME order, so block routing never has to
+                            // guess that TrackNumbers are 1..=N.
                             streams.push(s);
+                            tracks.push(tnum, default_dur);
                         }
                         if let Some(cp) = cp {
                             codec_privates.push((tnum, cp));
@@ -1016,7 +1047,7 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
     } else {
         ts_scale as i64
     };
-    Ok((disc_title, codec_privates, ts_scale_ns))
+    Ok((disc_title, codec_privates, ts_scale_ns, tracks))
 }
 
 /// Largest valid 13-bit MPEG-TS PID.
@@ -1043,12 +1074,24 @@ fn ts_pid_for_track(tnum: u16) -> io::Result<u16> {
     Ok(pid as u16)
 }
 
-/// Returns (stream, track_number, codec_private_bytes)
-fn parse_track(
-    r: &mut impl Read,
-    size: u64,
-) -> io::Result<(Option<crate::disc::Stream>, u16, Option<Vec<u8>>)> {
+/// (stream, track_number, codec_private_bytes, default_duration_ns) — one
+/// decoded `TrackEntry`. `stream` is `None` for a TrackType this crate does not
+/// carry, in which case the TrackNumber gets no stream index at all.
+type ParsedTrack = (
+    Option<crate::disc::Stream>,
+    u16,
+    Option<Vec<u8>>,
+    Option<u64>,
+);
+
+/// Returns (stream, track_number, codec_private_bytes, default_duration_ns)
+fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     let (mut ttype, mut tnum) = (0u64, 0u16);
+    /// RFC 9559 §5.1.4.1.13 gives DefaultDuration as nanoseconds per frame with
+    /// "range: not 0". A value this large is nonsense for a frame period and
+    /// would only skew laced-frame spacing, so treat it as absent.
+    const MAX_DEFAULT_DURATION_NS: u64 = 60 * 1_000_000_000;
+    let mut default_dur: Option<u64> = None;
     let (mut codec_id, mut lang, mut name) = (String::new(), String::from("und"), String::new());
     let (mut ph, mut sr, mut ch, mut forced) = (0u32, 0.0f64, 0u8, false);
     let mut codec_priv: Option<Vec<u8>> = None;
@@ -1072,6 +1115,10 @@ fn parse_track(
                 tnum = n as u16;
             }
             ebml::TRACK_TYPE => ttype = read_uint_bounded(r, cs)?,
+            ebml::DEFAULT_DURATION => {
+                let ns = read_uint_bounded(r, cs)?;
+                default_dur = (ns > 0 && ns <= MAX_DEFAULT_DURATION_NS).then_some(ns);
+            }
             ebml::CODEC_ID => codec_id = read_string_bounded(r, cs)?,
             ebml::CODEC_PRIVATE => {
                 codec_priv = Some(ebml::read_binary_val(
@@ -1212,65 +1259,322 @@ fn parse_track(
         })),
         _ => None,
     };
-    Ok((stream, tnum, codec_priv))
+    Ok((stream, tnum, codec_priv, default_dur))
 }
 
-/// Parse a (Simple)Block payload into a PesFrame, or `None` if it should be
-/// skipped (too short, track 0, or a track index out of range).
+/// Read-side map from Matroska TrackNumber to the index of the corresponding
+/// entry in `DiscTitle::streams`.
+///
+/// RFC 9559 §5.1.4.1.1 constrains TrackNumber only to be non-zero ("range: not
+/// 0"); NOTHING in the specification requires the numbers to be `1..=N`, to be
+/// contiguous, or to appear in ascending TrackEntry order. `parse_track` also
+/// DROPS every TrackEntry whose TrackType this crate cannot carry (anything but
+/// 1/2/17 — e.g. a TrackType 18 buttons track), so the TrackNumber space and the
+/// stream vector diverge for perfectly legal inputs.
+///
+/// The reader used to derive the stream index as `TrackNumber - 1`, which routes
+/// blocks to the WRONG stream (parsed by the wrong codec parser) or drops them
+/// entirely. This table records the real TrackNumber for each retained stream,
+/// in stream order, and is the only thing allowed to translate between the two.
+#[derive(Default)]
+struct TrackTable {
+    /// Matroska TrackNumber of `DiscTitle::streams[i]`, indexed by `i`.
+    nums: Vec<u16>,
+    /// TrackEntry `DefaultDuration` (RFC 9559 §5.1.4.1.13 — nanoseconds per
+    /// frame, already in Matroska Ticks = ns), per stream index, when declared.
+    /// Used to space the frames of a LACED Block, whose second and later frames
+    /// carry an "underdetermined" timestamp per RFC 9559 §10.3.5.
+    default_durations: Vec<Option<u64>>,
+}
+
+impl TrackTable {
+    fn push(&mut self, num: u16, default_duration_ns: Option<u64>) {
+        self.nums.push(num);
+        self.default_durations.push(default_duration_ns);
+    }
+
+    /// Stream index carrying blocks with this TrackNumber, or `None` when the
+    /// file has no such (retained) track.
+    fn index_of(&self, num: u64) -> Option<usize> {
+        if num == 0 || num > u16::MAX as u64 {
+            return None;
+        }
+        let num = num as u16;
+        self.nums.iter().position(|&n| n == num)
+    }
+
+    /// TrackNumber of a stream index (the inverse of `index_of`).
+    fn num_of(&self, idx: usize) -> Option<u16> {
+        self.nums.get(idx).copied()
+    }
+
+    /// TrackNumbers `1..=n` in stream order — the layout this crate's own writer
+    /// emits, and the shape the unit tests exercise.
+    #[cfg(test)]
+    fn contiguous(n: usize) -> Self {
+        Self {
+            nums: (1..=n as u16).collect(),
+            default_durations: vec![None; n],
+        }
+    }
+}
+
+/// Lacing mode from the 2-bit LACING field of a (Simple)Block flags byte
+/// (RFC 9559 §10.1/§10.2: `KEY | Rsvrd | INV | LACING(2) | DIS`, bit 0 = MSB,
+/// so the field is `flags & 0x06` shifted right by 1).
+const LACING_MASK: u8 = 0x06;
+const LACING_NONE: u8 = 0b00;
+const LACING_XIPH: u8 = 0b01;
+const LACING_FIXED: u8 = 0b10;
+const LACING_EBML: u8 = 0b11;
+
+/// Read one unsigned EBML VINT (RFC 8794 §4.4) from the head of `d`, returning
+/// `(value, octet width)`. `None` when the first octet has no VINT_MARKER (a
+/// width above 8 octets, which Matroska lacing never uses) or the value is
+/// truncated.
+///
+/// Distinct from `block_vint`: that one is the *track number* decoder and caps
+/// at 4 octets with a "treat as track 0" fallback, whereas lacing sizes need the
+/// full 1..=8 range and must be able to report malformedness.
+fn lace_vint(d: &[u8]) -> Option<(u64, usize)> {
+    let first = *d.first()?;
+    if first == 0 {
+        return None; // width > 8 octets — not representable here
+    }
+    let width = first.leading_zeros() as usize + 1; // 1..=8
+    if d.len() < width {
+        return None;
+    }
+    // Strip the VINT_MARKER bit, then fold in the remaining octets big-endian.
+    let mut v = (first as u64) & (0xFFu64 >> width);
+    for &b in &d[1..width] {
+        v = (v << 8) | b as u64;
+    }
+    Some((v, width))
+}
+
+/// Read one SIGNED EBML lacing VINT. Per RFC 9559 §10.3.3 the signed value is
+/// the unsigned VINT value minus `2^((7*n)-1) - 1`, where `n` is the octet width.
+fn lace_svint(d: &[u8]) -> Option<(i64, usize)> {
+    let (v, width) = lace_vint(d)?;
+    // width <= 8 → 7*8-1 = 55, so both the bias and `v` (at most 2^56-1) are
+    // exactly representable in i64; no overflow is possible here.
+    let bias = (1i64 << (7 * width as u32 - 1)) - 1;
+    Some(((v as i64) - bias, width))
+}
+
+/// Split the body of a LACED (Simple)Block — the bytes after the flags octet,
+/// beginning with the Lacing Head — into its individual frame payloads, per
+/// RFC 9559 §10.3.
+///
+/// `lacing` is the 2-bit LACING field value (`LACING_XIPH`, `LACING_EBML` or
+/// `LACING_FIXED`). Returns `None` when the lacing header is malformed — the
+/// frame boundaries are then unknown, and the caller MUST reject the block
+/// rather than hand a concatenation of frames plus lacing header downstream as
+/// though it were one frame (which is exactly the silent corruption this
+/// function exists to end).
+///
+/// The Lacing Head is "number of frames in the lace minus 1" on one octet, so
+/// the frame count is bounded by 256 and no allocation here is attacker-scaled.
+fn split_lacing(lacing: u8, body: &[u8]) -> Option<Vec<&[u8]>> {
+    let (&count_minus_one, rest) = body.split_first()?;
+    let n = count_minus_one as usize + 1;
+
+    // Sizes of the first n-1 frames; the last frame's size is deduced from what
+    // remains in the Block (RFC 9559 §10.3.2/§10.3.3).
+    let mut sizes: Vec<usize> = Vec::with_capacity(n);
+    let mut pos = 0usize;
+    match lacing {
+        LACING_FIXED => {
+            // §10.3.4: no sizes are stored; every frame MUST have the same size,
+            // deduced from the Block's total size. A body that does not divide
+            // evenly is malformed.
+            if rest.len() % n != 0 {
+                return None;
+            }
+            let each = rest.len() / n;
+            return Some(rest.chunks(each.max(1)).take(n).collect());
+        }
+        LACING_XIPH => {
+            // §10.3.2: each size is a run of 0xFF octets (255 each) terminated
+            // by an octet below 255 (which may itself be 0).
+            for _ in 0..n - 1 {
+                let mut sz = 0usize;
+                loop {
+                    let b = *rest.get(pos)?;
+                    pos += 1;
+                    sz = sz.checked_add(b as usize)?;
+                    if b != 0xFF {
+                        break;
+                    }
+                }
+                sizes.push(sz);
+            }
+        }
+        LACING_EBML => {
+            // §10.3.3: the first size is an unsigned VINT; each later size is a
+            // SIGNED VINT holding the difference from the previous size.
+            if n >= 2 {
+                let (first, w) = lace_vint(rest.get(pos..)?)?;
+                pos += w;
+                let mut prev = i64::try_from(first).ok()?;
+                sizes.push(usize::try_from(prev).ok()?);
+                for _ in 0..n - 2 {
+                    let (delta, w) = lace_svint(rest.get(pos..)?)?;
+                    pos += w;
+                    prev = prev.checked_add(delta)?;
+                    sizes.push(usize::try_from(prev).ok()?);
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    // Carve the frames out of the bytes after the size table. The declared sizes
+    // must fit inside what remains, with the remainder going to the last frame.
+    let payload = rest.get(pos..)?;
+    let declared: usize = sizes.iter().try_fold(0usize, |a, &s| a.checked_add(s))?;
+    let last = payload.len().checked_sub(declared)?;
+    sizes.push(last);
+
+    let mut out = Vec::with_capacity(n);
+    let mut at = 0usize;
+    for sz in sizes {
+        let end = at.checked_add(sz)?;
+        out.push(payload.get(at..end)?);
+        at = end;
+    }
+    Some(out)
+}
+
+/// Parse a (Simple)Block payload into zero or more PesFrames.
+///
+/// Zero frames means the block was SKIPPED — too short, track 0, or a
+/// TrackNumber this file does not (retainedly) declare. More than one frame
+/// means the Block was LACED (RFC 9559 §10.3): one Block legitimately carries
+/// several frames, and handing the raw payload downstream as a single frame
+/// feeds the codec parser a concatenation of frames plus lacing header. An
+/// `Err` means the lacing header is malformed, so the frame boundaries are
+/// unknowable — the block is rejected rather than mangled.
 ///
 /// `cluster_ts_ticks` is the open cluster's timestamp in TimestampScale ticks
 /// and `ts_scale_ns` is that scale (ns per tick); the block PTS is computed as
 /// `(cluster_ts_ticks + rel_ts) * ts_scale_ns` so foreign MKVs whose scale
 /// isn't 1 ms are honoured (freemkv's own output uses 1_000_000 and round-trips
-/// unchanged). `streams_len` bounds the resolved track index; `duration_ns` is
-/// propagated for BlockGroup blocks (None for SimpleBlock).
+/// unchanged). `tracks` resolves the TrackNumber to a stream index; `duration_ns`
+/// is propagated for BlockGroup blocks (None for SimpleBlock).
 fn parse_block(
     block: &[u8],
     cluster_ts_ticks: i64,
     ts_scale_ns: i64,
-    streams_len: usize,
+    tracks: &TrackTable,
     duration_ns: Option<u64>,
-) -> Option<crate::pes::PesFrame> {
+) -> io::Result<Vec<crate::pes::PesFrame>> {
     if block.len() < 4 {
-        return None;
+        return Ok(Vec::new());
     }
     let (track, vl) = block_vint(block);
     if vl + 3 > block.len() {
-        return None;
+        return Ok(Vec::new());
     }
-    // Track 0 is invalid (MKV track numbers are 1-based). block_vint also
+    // Track 0 is invalid (RFC 9559 §5.1.4.1.1: "range: not 0"). block_vint also
     // returns 0 for an unsupported 5+ byte VINT, so a corrupt/zero-track block
     // must be skipped rather than attributed to the first stream.
     if track == 0 {
-        return None;
+        return Ok(Vec::new());
     }
 
     let rel_ts = i16::from_be_bytes([block[vl], block[vl + 1]]);
-    let keyframe = block[vl + 2] & 0x80 != 0;
-    let data = block[vl + 3..].to_vec();
+    let flags = block[vl + 2];
+    let keyframe = flags & 0x80 != 0;
+    let body = &block[vl + 3..];
     // saturating_add: a hostile CLUSTER_TIMESTAMP near i64::MAX plus a positive
     // rel_ts would overflow this add (panic in debug/test, wrap to a large
     // negative PTS in release) — one operation BEFORE the saturating_mul below.
     // rel_ts as i64 is exact, so this fully bounds the sum on adversarial input.
     let pts_ticks = cluster_ts_ticks.saturating_add(rel_ts as i64);
-    let track_idx = (track as usize) - 1; // track >= 1 checked above
+    // saturating_mul: a hostile CLUSTER_TIMESTAMP could push pts_ticks near
+    // i64::MAX, where ticks→ns would overflow and panic in debug builds.
+    let base_pts = pts_ticks.saturating_mul(ts_scale_ns);
 
-    // Skip blocks for non-existent tracks.
-    if track_idx >= streams_len {
-        return None;
+    // Blocks for tracks this file does not declare (or whose TrackType this
+    // reader dropped) are skipped. Resolved through the real TrackNumber→index
+    // map, NOT `TrackNumber - 1`.
+    let Some(track_idx) = tracks.index_of(track) else {
+        return Ok(Vec::new());
+    };
+
+    let lacing = (flags & LACING_MASK) >> 1;
+    if lacing == LACING_NONE {
+        return Ok(vec![crate::pes::PesFrame {
+            coding: None,
+            source: None,
+            track: track_idx,
+            pts: base_pts,
+            keyframe,
+            data: body.to_vec(),
+            duration_ns,
+        }]);
     }
 
-    Some(crate::pes::PesFrame {
-        coding: None,
-        source: None,
-        track: track_idx,
-        // saturating_mul: a hostile CLUSTER_TIMESTAMP could push pts_ticks near
-        // i64::MAX, where ticks→ns would overflow and panic in debug builds.
-        pts: pts_ticks.saturating_mul(ts_scale_ns),
-        keyframe,
-        data,
-        duration_ns,
-    })
+    let Some(laced) = split_lacing(lacing, body) else {
+        tracing::warn!(
+            target: "mux",
+            track_number = track,
+            lacing,
+            body_len = body.len(),
+            "mkv read-back: malformed lacing header in a (Simple)Block; the frame \
+             boundaries are unknowable, so the block is rejected rather than passed \
+             downstream as one mangled frame"
+        );
+        // NOT MkvInvalid: `error::is_skippable_title_stub` classifies that code
+        // as an empty nav/menu stub, so a real track with unseparable frames
+        // would be dropped by the caller and the run would still report success.
+        return Err(crate::error::Error::MkvLacingInvalid.into());
+    };
+
+    // RFC 9559 §10.3.5: a Block carries a single timestamp, which applies to the
+    // FIRST frame of the lace; every later frame has an "underdetermined"
+    // timestamp but MUST be contiguous with its predecessor. Recover the spacing
+    // from the track's DefaultDuration (§5.1.4.1.13, already nanoseconds) when
+    // declared, else by dividing this Block's BlockDuration across the lace.
+    let count = laced.len().max(1) as u64;
+    let per_frame_ns = tracks
+        .default_durations
+        .get(track_idx)
+        .copied()
+        .flatten()
+        .or_else(|| duration_ns.map(|d| d / count));
+    if per_frame_ns.is_none() && laced.len() > 1 {
+        tracing::warn!(
+            target: "mux",
+            track_number = track,
+            frames = laced.len(),
+            "mkv read-back: laced Block on a track with neither DefaultDuration nor \
+             BlockDuration; the laced frames share one timestamp because the source \
+             declares nothing to derive their spacing from (RFC 9559 §10.3.5)"
+        );
+    }
+
+    let mut out = Vec::with_capacity(laced.len());
+    for (i, data) in laced.into_iter().enumerate() {
+        let step = per_frame_ns
+            .unwrap_or(0)
+            .saturating_mul(i as u64)
+            .min(i64::MAX as u64) as i64;
+        out.push(crate::pes::PesFrame {
+            coding: None,
+            source: None,
+            track: track_idx,
+            pts: base_pts.saturating_add(step),
+            keyframe,
+            data: data.to_vec(),
+            // A laced Block's BlockDuration covers the WHOLE lace, so the
+            // per-frame duration is the derived spacing, not the block's.
+            duration_ns: per_frame_ns,
+        });
+    }
+    Ok(out)
 }
 
 fn block_vint(d: &[u8]) -> (u64, usize) {
@@ -1674,9 +1978,13 @@ mod tests {
     }
 
     fn is_mkv_invalid(e: &io::Error) -> bool {
-        e.kind() == io::ErrorKind::InvalidData
-            && e.to_string()
-                .starts_with(&format!("E{}", crate::error::E_MKV_INVALID))
+        has_code(e, crate::error::E_MKV_INVALID)
+    }
+
+    /// Whether an error carries the given numeric code (the crate's errors
+    /// render as `E<code>` with no English text).
+    fn has_code(e: &io::Error, code: u16) -> bool {
+        e.kind() == io::ErrorKind::InvalidData && e.to_string().starts_with(&format!("E{code}"))
     }
 
     #[test]
@@ -2301,17 +2609,42 @@ mod tests {
     }
 
     // ============================================================
-    // parse_block — turns a (Simple)Block payload into a PesFrame.
+    // parse_block — turns a (Simple)Block payload into PesFrames.
     // Layout: [track VINT][rel_ts i16 BE][flags u8][data...].
-    // Guards: len<4 → None; vl+3 > len → None; track 0 → None;
-    // track_idx >= streams_len → None.
+    // Guards: len<4 → none; vl+3 > len → none; track 0 → none;
+    // unknown TrackNumber → none.
     // ============================================================
+
+    /// `parse_block` for an UNLACED block on a file whose TrackNumbers are
+    /// `1..=streams_len` (the layout this crate's own writer emits): the single
+    /// frame, or `None` when the block was skipped.
+    fn parse_block_one(
+        block: &[u8],
+        cluster_ts_ticks: i64,
+        ts_scale_ns: i64,
+        streams_len: usize,
+        duration_ns: Option<u64>,
+    ) -> Option<crate::pes::PesFrame> {
+        let frames = parse_block(
+            block,
+            cluster_ts_ticks,
+            ts_scale_ns,
+            &TrackTable::contiguous(streams_len),
+            duration_ns,
+        )
+        .expect("unlaced block never errors");
+        assert!(
+            frames.len() <= 1,
+            "an unlaced block yields at most one frame"
+        );
+        frames.into_iter().next()
+    }
 
     #[test]
     fn parse_block_too_short_is_none() {
         // Fewer than 4 bytes can't hold vint(1)+ts(2)+flags(1); must be None.
-        assert!(parse_block(&[0x81, 0x00, 0x00], 0, 1_000_000, 1, None).is_none());
-        assert!(parse_block(&[], 0, 1_000_000, 1, None).is_none());
+        assert!(parse_block_one(&[0x81, 0x00, 0x00], 0, 1_000_000, 1, None).is_none());
+        assert!(parse_block_one(&[], 0, 1_000_000, 1, None).is_none());
     }
 
     #[test]
@@ -2319,7 +2652,7 @@ mod tests {
         // A 2-byte track VINT (0x40 0x01) needs vl(2)+3 = 5 bytes minimum, but
         // only 4 are supplied → vl+3 > len → None (no OOB index of data slice).
         let block = [0x40u8, 0x01, 0x00, 0x00]; // len 4, vl 2 → 2+3=5 > 4
-        assert!(parse_block(&block, 0, 1_000_000, 2, None).is_none());
+        assert!(parse_block_one(&block, 0, 1_000_000, 2, None).is_none());
     }
 
     #[test]
@@ -2327,9 +2660,9 @@ mod tests {
         // track 2 → index 1, but only 1 stream exists → must skip (None),
         // never index past the streams slice.
         let block = [0x82u8, 0x00, 0x00, 0x80, 0xAA]; // track 2
-        assert!(parse_block(&block, 0, 1_000_000, 1, None).is_none());
+        assert!(parse_block_one(&block, 0, 1_000_000, 1, None).is_none());
         // With 2 streams it resolves to index 1.
-        let f = parse_block(&block, 0, 1_000_000, 2, None).unwrap();
+        let f = parse_block_one(&block, 0, 1_000_000, 2, None).unwrap();
         assert_eq!(f.track, 1);
     }
 
@@ -2339,11 +2672,11 @@ mod tests {
         // the result must scale accordingly (foreign MKVs). rel_ts = 10 here.
         let block = [0x81u8, 0x00, 0x0A, 0x80, 0xAA]; // track 1, rel 10, kf
         // ts_scale 1_000_000 (1ms): cluster 100 + rel 10 = 110 ticks → 110ms.
-        let f = parse_block(&block, 100, 1_000_000, 1, None).unwrap();
+        let f = parse_block_one(&block, 100, 1_000_000, 1, None).unwrap();
         assert_eq!(f.pts, 110 * 1_000_000);
         assert!(f.keyframe);
         // ts_scale 90_000 (90kHz): (100+10) * 90_000.
-        let f = parse_block(&block, 100, 90_000, 1, None).unwrap();
+        let f = parse_block_one(&block, 100, 90_000, 1, None).unwrap();
         assert_eq!(f.pts, 110 * 90_000);
     }
 
@@ -2352,7 +2685,7 @@ mod tests {
         // rel_ts is a SIGNED 16-bit big-endian value. 0xFFFF = -1. The pts must
         // go DOWN from the cluster timestamp, not jump to +65535.
         let block = [0x81u8, 0xFF, 0xFF, 0x80, 0xAA]; // rel_ts = -1
-        let f = parse_block(&block, 100, 1_000_000, 1, None).unwrap();
+        let f = parse_block_one(&block, 100, 1_000_000, 1, None).unwrap();
         assert_eq!(f.pts, 99 * 1_000_000, "rel_ts -1 must subtract one tick");
     }
 
@@ -2362,9 +2695,17 @@ mod tests {
         // passed through unchanged (BlockGroup path supplies it).
         let kf = [0x81u8, 0x00, 0x00, 0x80, 0xAA];
         let nkf = [0x81u8, 0x00, 0x00, 0x00, 0xAA];
-        assert!(parse_block(&kf, 0, 1_000_000, 1, None).unwrap().keyframe);
-        assert!(!parse_block(&nkf, 0, 1_000_000, 1, None).unwrap().keyframe);
-        let f = parse_block(&kf, 0, 1_000_000, 1, Some(40_000_000)).unwrap();
+        assert!(
+            parse_block_one(&kf, 0, 1_000_000, 1, None)
+                .unwrap()
+                .keyframe
+        );
+        assert!(
+            !parse_block_one(&nkf, 0, 1_000_000, 1, None)
+                .unwrap()
+                .keyframe
+        );
+        let f = parse_block_one(&kf, 0, 1_000_000, 1, Some(40_000_000)).unwrap();
         assert_eq!(f.duration_ns, Some(40_000_000));
     }
 
@@ -2374,7 +2715,7 @@ mod tests {
         // ticks→ns multiply; saturating_mul caps it. (Guards the debug-build
         // overflow the source comment calls out.)
         let block = [0x81u8, 0x00, 0x00, 0x80, 0xAA];
-        let f = parse_block(&block, i64::MAX, 1_000_000, 1, None).unwrap();
+        let f = parse_block_one(&block, i64::MAX, 1_000_000, 1, None).unwrap();
         assert_eq!(f.pts, i64::MAX, "ticks→ns must saturate, not wrap/panic");
     }
 
@@ -2386,7 +2727,7 @@ mod tests {
         // checks on) and silently wraps to a large negative PTS in release.
         // rel_ts = +0x7FFF = 32767 (max positive signed 16-bit).
         let block = [0x81u8, 0x7F, 0xFF, 0x80, 0xAA];
-        let f = parse_block(&block, i64::MAX, 1_000_000, 1, None).unwrap();
+        let f = parse_block_one(&block, i64::MAX, 1_000_000, 1, None).unwrap();
         // The add saturates at i64::MAX, then the mul saturates too.
         assert_eq!(
             f.pts,
@@ -2593,5 +2934,372 @@ mod tests {
         let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
         assert!(stream.read().unwrap().is_some(), "first frame");
         assert!(stream.read().unwrap().is_none(), "clean EOF → None");
+    }
+
+    // ============================================================
+    // Block LACING (RFC 9559 §10.3) and TrackNumber→stream routing
+    // (RFC 9559 §5.1.4.1.1).
+    // ============================================================
+
+    /// One TrackEntry description for `mkv_with_tracks_and_cluster`:
+    /// (TrackNumber, TrackType, DefaultDuration ns, CodecPrivate).
+    struct TrackSpec {
+        tnum: u64,
+        ttype: u64,
+        default_duration_ns: Option<u64>,
+        codec_private: Option<Vec<u8>>,
+    }
+
+    impl TrackSpec {
+        fn new(tnum: u64, ttype: u64) -> Self {
+            Self {
+                tnum,
+                ttype,
+                default_duration_ns: None,
+                codec_private: None,
+            }
+        }
+        fn with_default_duration(mut self, ns: u64) -> Self {
+            self.default_duration_ns = Some(ns);
+            self
+        }
+        fn with_codec_private(mut self, cp: &[u8]) -> Self {
+            self.codec_private = Some(cp.to_vec());
+            self
+        }
+    }
+
+    /// Build an MKV header with an arbitrary set of TrackEntries — arbitrary
+    /// TrackNumbers, in arbitrary order — followed by `cluster_body`.
+    fn mkv_with_tracks_and_cluster(specs: &[TrackSpec], cluster_body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+
+        let mut tracks = Vec::new();
+        for s in specs {
+            let mut entry = Vec::new();
+            ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, s.tnum).unwrap();
+            ebml::write_uint(&mut entry, ebml::TRACK_TYPE, s.ttype).unwrap();
+            if let Some(ns) = s.default_duration_ns {
+                ebml::write_uint(&mut entry, ebml::DEFAULT_DURATION, ns).unwrap();
+            }
+            if let Some(cp) = &s.codec_private {
+                ebml::write_binary(&mut entry, ebml::CODEC_PRIVATE, cp).unwrap();
+            }
+            ebml::write_id(&mut tracks, ebml::TRACK_ENTRY).unwrap();
+            ebml::write_size(&mut tracks, entry.len() as u64).unwrap();
+            tracks.extend_from_slice(&entry);
+        }
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, tracks.len() as u64).unwrap();
+        out.extend_from_slice(&tracks);
+        out.extend_from_slice(cluster_body);
+        out
+    }
+
+    /// Wrap one raw (Simple)Block payload in a Cluster with the given timestamp.
+    fn cluster_with_simple_block(cluster_ts: u64, block: &[u8]) -> Vec<u8> {
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        ebml::write_uint(&mut cluster, ebml::CLUSTER_TIMESTAMP, cluster_ts).unwrap();
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, block.len() as u64).unwrap();
+        cluster.extend_from_slice(block);
+        cluster
+    }
+
+    /// Drain every frame a reader will yield.
+    fn drain(stream: &mut MkvStream) -> Vec<crate::pes::PesFrame> {
+        let mut out = Vec::new();
+        while let Some(f) = stream.read().expect("no read error") {
+            out.push(f);
+        }
+        out
+    }
+
+    /// EBML lacing (RFC 9559 §10.3.3): the Lacing Head, the first frame's size as
+    /// an unsigned VINT, then each later size as a SIGNED VINT difference from
+    /// the previous one. Three frames of 3/4/5 octets must come out as THREE
+    /// frames with byte-exact payloads.
+    ///
+    /// Regression (silent corruption): the reader took the Block payload verbatim
+    /// and never looked at the LACING bits, so this Block became ONE 15-byte frame
+    /// whose first three bytes are the lacing header — garbage handed to the codec
+    /// parser with no error, and one timestamp for three frames.
+    #[test]
+    fn ebml_laced_block_yields_every_frame_with_exact_payloads() {
+        // size 3 → 0x83 (VINT, value 3). size delta 4-3 = +1 → unsigned 1 + bias
+        // (2^6-1 = 63) = 64 → 0xC0 with the VINT_MARKER.
+        let mut block = vec![
+            0x81, // TrackNumber 1
+            0x00, 0x00, // rel_ts 0
+            0x86, // KEY | LACING = 11b (EBML)
+            0x02, // Lacing Head: 3 frames minus 1
+            0x83, // first frame size = 3
+            0xC0, // second frame size = previous + 1 = 4
+        ];
+        block.extend_from_slice(&[0xAA; 3]);
+        block.extend_from_slice(&[0xBB; 4]);
+        block.extend_from_slice(&[0xCC; 5]);
+
+        // DefaultDuration 24 ms/frame is what §10.3.5 leaves the reader to space
+        // the second and later frames by.
+        let specs = [TrackSpec::new(1, 2).with_default_duration(24_000_000)];
+        let bytes = mkv_with_tracks_and_cluster(&specs, &cluster_with_simple_block(100, &block));
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let frames = drain(&mut stream);
+
+        assert_eq!(frames.len(), 3, "one laced Block carries three frames");
+        assert_eq!(frames[0].data, vec![0xAA; 3], "frame 1 payload byte-exact");
+        assert_eq!(frames[1].data, vec![0xBB; 4], "frame 2 payload byte-exact");
+        assert_eq!(frames[2].data, vec![0xCC; 5], "frame 3 payload byte-exact");
+        for f in &frames {
+            assert_eq!(f.track, 0);
+            assert!(f.keyframe, "the KEY flag covers the whole lace");
+            assert_eq!(f.duration_ns, Some(24_000_000));
+        }
+        // The Block timestamp applies to the FIRST frame; the rest are spaced by
+        // DefaultDuration (§10.3.5).
+        assert_eq!(frames[0].pts, 100 * 1_000_000);
+        assert_eq!(frames[1].pts, 100 * 1_000_000 + 24_000_000);
+        assert_eq!(frames[2].pts, 100 * 1_000_000 + 48_000_000);
+    }
+
+    /// Xiph lacing (RFC 9559 §10.3.2): sizes are runs of 0xFF octets terminated
+    /// by an octet below 255, and a size that is a multiple of 255 ends in a 0.
+    #[test]
+    fn xiph_laced_block_splits_on_255_coded_sizes() {
+        let mut block = vec![
+            0x81, // TrackNumber 1
+            0x00, 0x00, // rel_ts 0
+            0x82, // KEY | LACING = 01b (Xiph)
+            0x01, // Lacing Head: 2 frames minus 1
+            0xFF, 0x00, // first frame size = 255 (a multiple of 255 → trailing 0)
+        ];
+        block.extend_from_slice(&[0xAA; 255]);
+        block.extend_from_slice(&[0xBB; 2]);
+
+        let specs = [TrackSpec::new(1, 2)];
+        let bytes = mkv_with_tracks_and_cluster(&specs, &cluster_with_simple_block(0, &block));
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let frames = drain(&mut stream);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].data, vec![0xAA; 255]);
+        assert_eq!(
+            frames[1].data,
+            vec![0xBB; 2],
+            "the last frame's size is the Block remainder"
+        );
+    }
+
+    /// Fixed-size lacing (RFC 9559 §10.3.4): no sizes are stored; every frame is
+    /// the Block remainder divided by the frame count.
+    #[test]
+    fn fixed_size_laced_block_splits_evenly() {
+        let mut block = vec![
+            0x81, // TrackNumber 1
+            0x00, 0x00, // rel_ts 0
+            0x84, // KEY | LACING = 10b (fixed-size)
+            0x02, // Lacing Head: 3 frames minus 1
+        ];
+        block.extend_from_slice(&[0x11, 0x11, 0x22, 0x22, 0x33, 0x33]);
+
+        let specs = [TrackSpec::new(1, 2)];
+        let bytes = mkv_with_tracks_and_cluster(&specs, &cluster_with_simple_block(0, &block));
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let frames = drain(&mut stream);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].data, vec![0x11, 0x11]);
+        assert_eq!(frames[1].data, vec![0x22, 0x22]);
+        assert_eq!(frames[2].data, vec![0x33, 0x33]);
+    }
+
+    /// A lacing header whose declared sizes do not fit in the Block leaves the
+    /// frame boundaries unknowable. That MUST be an error, never a pass-through
+    /// of the raw payload as one frame.
+    #[test]
+    fn malformed_lacing_header_is_rejected_not_passed_through() {
+        // Xiph, 2 frames, first size declared as 200 but only 4 payload octets
+        // follow → the remainder for the last frame underflows.
+        let block = [
+            0x81, 0x00, 0x00, 0x82, // KEY | Xiph lacing
+            0x01, // 2 frames
+            0xC8, // first frame size = 200
+            0xAA, 0xBB, 0xCC, 0xDD,
+        ];
+        let specs = [TrackSpec::new(1, 2)];
+        let bytes = mkv_with_tracks_and_cluster(&specs, &cluster_with_simple_block(0, &block));
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let e = stream.read().unwrap_err();
+        assert!(
+            has_code(&e, crate::error::E_MKV_LACING_INVALID),
+            "malformed lacing must be rejected"
+        );
+        assert!(
+            !crate::error::is_skippable_title_stub(&e),
+            "a track whose frames cannot be separated is NOT an empty nav stub"
+        );
+
+        // Fixed-size lacing whose body does not divide evenly by the frame count.
+        let block = [
+            0x81, 0x00, 0x00, 0x84, // KEY | fixed-size lacing
+            0x02, // 3 frames
+            0xAA, 0xBB, 0xCC, 0xDD, // 4 octets — not divisible by 3
+        ];
+        let bytes = mkv_with_tracks_and_cluster(&specs, &cluster_with_simple_block(0, &block));
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert!(has_code(
+            &stream.read().unwrap_err(),
+            crate::error::E_MKV_LACING_INVALID
+        ));
+    }
+
+    /// A laced Block on a track with no DefaultDuration falls back to spreading
+    /// the BlockGroup's BlockDuration across the lace: the Block's duration covers
+    /// the WHOLE lace (RFC 9559 §5.1.3.5), not each frame.
+    #[test]
+    fn laced_block_duration_is_divided_across_the_lace() {
+        let mut block = vec![0x81u8, 0x00, 0x00, 0x04, 0x01]; // fixed-size, 2 frames, no KEY
+        block.extend_from_slice(&[0x11, 0x22]);
+        let mut bg_body = Vec::new();
+        ebml::write_id(&mut bg_body, ebml::BLOCK).unwrap();
+        ebml::write_size(&mut bg_body, block.len() as u64).unwrap();
+        bg_body.extend_from_slice(&block);
+        // 48 ms for the pair → 24 ms per frame.
+        ebml::write_uint(&mut bg_body, ebml::BLOCK_DURATION, 48).unwrap();
+
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        ebml::write_id(&mut cluster, ebml::BLOCK_GROUP).unwrap();
+        ebml::write_size(&mut cluster, bg_body.len() as u64).unwrap();
+        cluster.extend_from_slice(&bg_body);
+
+        let specs = [TrackSpec::new(1, 2)];
+        let bytes = mkv_with_tracks_and_cluster(&specs, &cluster);
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let frames = drain(&mut stream);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].data, vec![0x11]);
+        assert_eq!(frames[1].data, vec![0x22]);
+        assert_eq!(frames[0].duration_ns, Some(24_000_000));
+        assert_eq!(frames[1].pts, 24_000_000, "spaced by the derived duration");
+    }
+
+    /// RFC 9559 §5.1.4.1.1 constrains TrackNumber only to be non-zero — nothing
+    /// requires `1..=N` in TrackEntry order. A file with a TrackType this reader
+    /// drops (18 = buttons) between two carried tracks makes the TrackNumber
+    /// space and the stream vector diverge.
+    ///
+    /// Regression (silent corruption): the reader computed the stream index as
+    /// `TrackNumber - 1`, so the audio blocks of TrackNumber 3 resolved to index
+    /// 2 in a 2-stream title and were DISCARDED — a remux with no audio, reported
+    /// as success.
+    #[test]
+    fn sparse_track_numbers_route_to_the_right_stream() {
+        let video = [0x81u8, 0x00, 0x00, 0x80, 0x11]; // TrackNumber 1
+        let audio = [0x83u8, 0x00, 0x0A, 0x80, 0x22]; // TrackNumber 3, rel_ts 10
+        let buttons = [0x82u8, 0x00, 0x00, 0x80, 0x33]; // TrackNumber 2 — dropped track
+
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        for b in [video.as_slice(), buttons.as_slice(), audio.as_slice()] {
+            ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+            ebml::write_size(&mut cluster, b.len() as u64).unwrap();
+            cluster.extend_from_slice(b);
+        }
+
+        let specs = [
+            TrackSpec::new(1, 1),  // video   → stream 0
+            TrackSpec::new(2, 18), // buttons → dropped, no stream
+            TrackSpec::new(3, 2),  // audio   → stream 1
+        ];
+        let bytes = mkv_with_tracks_and_cluster(&specs, &cluster);
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            stream.info().streams.len(),
+            2,
+            "the buttons track is dropped"
+        );
+        let frames = drain(&mut stream);
+        assert_eq!(
+            frames.len(),
+            2,
+            "the video and audio blocks both survive; only the dropped track's do not"
+        );
+        assert_eq!(frames[0].track, 0, "TrackNumber 1 → stream 0");
+        assert_eq!(frames[0].data, vec![0x11]);
+        assert_eq!(frames[1].track, 1, "TrackNumber 3 → stream 1, not dropped");
+        assert_eq!(frames[1].data, vec![0x22]);
+    }
+
+    /// A descending TrackEntry order is legal too: the map is by number, not by
+    /// position, and a block must never be attributed to the wrong codec parser.
+    #[test]
+    fn descending_track_numbers_route_by_number_not_position() {
+        let first = [0x87u8, 0x00, 0x00, 0x80, 0xAA]; // TrackNumber 7
+        let second = [0x84u8, 0x00, 0x00, 0x80, 0xBB]; // TrackNumber 4
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        for b in [first.as_slice(), second.as_slice()] {
+            ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+            ebml::write_size(&mut cluster, b.len() as u64).unwrap();
+            cluster.extend_from_slice(b);
+        }
+        let specs = [TrackSpec::new(7, 1), TrackSpec::new(4, 2)];
+        let bytes = mkv_with_tracks_and_cluster(&specs, &cluster);
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let frames = drain(&mut stream);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].track, 0, "TrackNumber 7 is the FIRST TrackEntry");
+        assert_eq!(frames[1].track, 1, "TrackNumber 4 is the second");
+    }
+
+    /// `codec_private(stream_idx)` is keyed by TrackNumber internally, so it must
+    /// translate through the same map — not assume `stream_idx + 1`.
+    #[test]
+    fn codec_private_resolves_through_the_track_number_map() {
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        let specs = [
+            TrackSpec::new(1, 1).with_codec_private(&[0x01, 0x02]),
+            TrackSpec::new(2, 18).with_codec_private(&[0xDE, 0xAD]),
+            TrackSpec::new(3, 2).with_codec_private(&[0x03, 0x04]),
+        ];
+        let bytes = mkv_with_tracks_and_cluster(&specs, &cluster);
+        let stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(stream.codec_private(0), Some(vec![0x01, 0x02]));
+        assert_eq!(
+            stream.codec_private(1),
+            Some(vec![0x03, 0x04]),
+            "stream 1 is TrackNumber 3 — not TrackNumber 2 (the dropped track)"
+        );
+        assert_eq!(stream.codec_private(2), None, "no third stream");
+    }
+
+    /// The signed-VINT bias of RFC 9559 §10.3.3 exactly as the spec's own EBML
+    /// lacing example encodes it (800 then 500 → a delta of -300).
+    #[test]
+    fn lace_vint_matches_the_spec_worked_example() {
+        // 800 = 0x320, encoded as a 2-octet VINT: 0x43 0x20.
+        assert_eq!(lace_vint(&[0x43, 0x20]), Some((800, 2)));
+        // -300 as a 2-octet signed VINT: 0x5E 0xD3 (value 0x1ED3 minus bias 8191).
+        assert_eq!(lace_svint(&[0x5E, 0xD3]), Some((-300, 2)));
+        // 1-octet forms: 0x81 → 1; signed 0x80 → -(2^6-1) = -63.
+        assert_eq!(lace_vint(&[0x81]), Some((1, 1)));
+        assert_eq!(lace_svint(&[0x80]), Some((-63, 1)));
+        // A first octet of 0 has no VINT_MARKER within 8 octets → unrepresentable.
+        assert!(lace_vint(&[0x00, 0x01]).is_none());
+        // Truncated: a 2-octet marker with only one octet available.
+        assert!(lace_vint(&[0x43]).is_none());
     }
 }

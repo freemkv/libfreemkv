@@ -23,7 +23,9 @@
 //! The sink does NOT touch the MKV mux path; it is purely additive.
 
 use crate::disc::{Chapter, Codec, DiscTitle, Stream as DiscStream};
-use crate::mux::hevc::{append_length_prefixed_as_annex_b, avcc_to_annex_b, hvcc_to_annex_b};
+use crate::mux::hevc::{
+    append_length_prefixed_as_annex_b_sized, avcc_to_annex_b, hvcc_to_annex_b, nal_length_size,
+};
 use crate::mux::timeline::TimelineContinuity;
 use crate::pes::{PesFrame, Stream};
 use std::fs::File;
@@ -207,12 +209,17 @@ impl EsWriter for PassthroughWriter {
     }
 }
 
-/// HEVC/H.264 writer: reframes 4-byte-length-prefixed NALs (the hvcC/avcC form
-/// the parsers emit) into Annex-B, prepending the parameter sets once.
+/// HEVC/H.264 writer: reframes length-prefixed NALs (the hvcC/avcC form the
+/// parsers emit) into Annex-B, prepending the parameter sets once.
 struct AnnexBWriter {
     /// Annex-B-framed VPS/SPS/PPS (or SPS/PPS), parsed from the hvcC/avcC.
     params: Vec<u8>,
     wrote_params: bool,
+    /// Octets per NAL length prefix, from the configuration record's
+    /// `lengthSizeMinusOne` (ISO/IEC 14496-15). NOT assumed to be 4: a legal
+    /// avcC/hvcC may declare 1 or 2, and reading those as u32-BE parses no NALs
+    /// at all, so the raw prefixed bytes would be emitted as if already Annex B.
+    length_size: usize,
 }
 
 impl AnnexBWriter {
@@ -223,6 +230,7 @@ impl AnnexBWriter {
         Self {
             params,
             wrote_params: false,
+            length_size: nal_length_size(codec, codec_private),
         }
     }
 }
@@ -244,7 +252,7 @@ impl EsWriter for AnnexBWriter {
         // zero-length NALs and drops a truncated trailing NAL without panicking,
         // rather than `break`ing on the first zero-length NAL.
         let mut scratch = Vec::with_capacity(f.data.len() + (f.data.len() / 32) + 4);
-        append_length_prefixed_as_annex_b(&mut scratch, &f.data);
+        append_length_prefixed_as_annex_b_sized(&mut scratch, &f.data, self.length_size);
         w.write_all(&scratch)?;
         n += scratch.len();
         Ok(n)
@@ -979,6 +987,45 @@ mod tests {
             out,
             vec![0, 0, 0, 1, 0xAA, 0xBB, 0, 0, 0, 1, 0x01, 0x02, 0x03],
             "trailing NAL after a zero-length NAL must NOT be dropped"
+        );
+    }
+
+    /// Regression (silent corruption): the sink reframed every frame as if the
+    /// NAL length prefixes were 4 octets wide. ISO/IEC 14496-15 §5.3.3.1.2 lets
+    /// an avcC declare `lengthSizeMinusOne = 1` (2-octet prefixes); reading those
+    /// as one u32-BE gives an absurd length, so nothing parsed and the raw
+    /// prefixed bytes were written to the `demux://` ES verbatim — no start
+    /// codes, undecodable video, and no error anywhere.
+    #[test]
+    fn annexb_writer_honours_the_records_declared_nal_length_size() {
+        // avcC with byte 4 = 0xFD → lengthSizeMinusOne 1 → 2-octet prefixes.
+        // numSPS = 1 (0xE1), SPS len 2 = [0x67 0x42], numPPS = 1, PPS len 1.
+        let rec = [
+            1, 0x42, 0x00, 0x1F, 0xFD, 0xE1, 0, 2, 0x67, 0x42, 1, 0, 1, 0x68,
+        ];
+        assert_eq!(nal_length_size(Codec::H264, Some(&rec)), 2);
+        let mut w = AnnexBWriter::new(Codec::H264, Some(&rec));
+        let mut out = Vec::new();
+        let f = PesFrame {
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            // Two NALs with 2-octet length prefixes.
+            data: vec![0, 2, 0xAA, 0xBB, 0, 3, 0x01, 0x02, 0x03],
+            duration_ns: None,
+        };
+        w.write_frame(&mut out, &f, 0).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                0, 0, 0, 1, 0x67, 0x42, // SPS
+                0, 0, 0, 1, 0x68, // PPS
+                0, 0, 0, 1, 0xAA, 0xBB, // frame NAL #1
+                0, 0, 0, 1, 0x01, 0x02, 0x03, // frame NAL #2
+            ],
+            "2-octet-prefixed NALs must reach the ES as Annex B"
         );
     }
 
