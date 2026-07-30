@@ -1906,6 +1906,77 @@ mod tests {
         assert_eq!(r.vuk, Some(derive_vuk(&mk, &vid)));
     }
 
+    /// `resolve_keys_v21` gates paths 1 and 3 on `has_vid`, and an all-zero
+    /// Volume ID is the crate's "the VID was never read" sentinel — the SCSI
+    /// handshake leaves the buffer zeroed when it does not run or fails.
+    ///
+    /// Both directions matter and both fail silently:
+    ///   - treating the zero sentinel as a real VID runs path 3 and derives
+    ///     `Kvu = AES-G(Km, 0…0)`, a perfectly well-formed but WRONG VUK. It
+    ///     unwraps the title keys to garbage, and nothing downstream errors —
+    ///     the rip just decodes to noise.
+    ///   - treating a real VID as absent skips paths 1 and 3 entirely, so a
+    ///     disc that could have been resolved from its Media Key reports no key.
+    ///
+    /// Asserted through the final VUK, not through the flag.
+    #[test]
+    fn resolve_keys_v21_treats_the_all_zero_volume_id_as_no_vid() {
+        let uk_ro = minimal_unit_key_ro();
+        let vid = [0x42u8; 16];
+        let mk = [0x24u8; 16];
+        // A VID-keyed entry carrying an MK and nothing else: no VUK and no unit
+        // keys, so paths 4 and 5 cannot fire and ONLY the VID-gated path 3 can
+        // produce a result.
+        let entry = DiscEntry {
+            disc_hash: "not-this-disc".to_string(),
+            title: "sibling".to_string(),
+            media_key: Some(mk),
+            disc_id: Some(vid),
+            vuk: None,
+            unit_keys: Vec::new(),
+        };
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: Some(entry),
+        };
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
+
+        // A real VID → path 3 fires and the VUK derives from Km + THIS VID.
+        let with_vid = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &vid,
+            providers,
+            mkb: None,
+        };
+        let r = resolve_keys_v21(&with_vid).expect("a real VID must reach path 3");
+        assert_eq!(r.key_source, 3);
+        assert_eq!(
+            r.vuk,
+            Some(derive_vuk(&mk, &vid)),
+            "VUK must derive from the Media Key and the disc's own VID"
+        );
+
+        // The all-zero sentinel → paths 1 and 3 are skipped entirely; with no
+        // VUK and no unit keys on the entry, nothing resolves.
+        let no_vid = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &[0u8; 16],
+            providers,
+            mkb: None,
+        };
+        let got = resolve_keys_v21(&no_vid);
+        assert!(
+            got.is_none(),
+            "a zero VID must not be used to derive a VUK; got key_source {:?} vuk {:?}",
+            got.as_ref().map(|r| r.key_source),
+            got.as_ref().map(|r| r.vuk.is_some())
+        );
+    }
+
     #[test]
     fn resolve_keys_returns_none_when_no_provider_has_anything() {
         // Empty provider array + VID present + no MKB → all paths miss → None.

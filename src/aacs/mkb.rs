@@ -432,4 +432,109 @@ mod tests {
             "trim keeps the framed records, dropping the end marker and padding"
         );
     }
+
+    // ── BE24 length field: all THREE bytes ────────────────────────────────
+
+    /// The record length is a big-endian **24-bit** field, so the high byte
+    /// carries lengths of 64 KiB and up. The MKB records that matter most are
+    /// exactly that size — a real UHD cvalue table is `46_101 * 16` bytes and a
+    /// `0x2d` variant record is ~92 KiB — so a walker that dropped the high
+    /// byte would mis-frame every record of a real MKB from the first big one
+    /// onward, and every downstream key lookup would read the wrong bytes.
+    ///
+    /// (The pre-existing high-byte test used total length `0x0110`, whose high
+    /// byte is ZERO — it exercised the middle byte only. This one puts a
+    /// non-zero value in the high byte.)
+    #[test]
+    fn mkb_records_honors_the_high_byte_of_the_be24_length() {
+        const TOTAL: usize = 0x0001_0004; // 65_540 — high byte 0x01
+        let mut mkb = vec![REC_VKD_TABLE, 0x01, 0x00, 0x04];
+        mkb.resize(TOTAL, 0xAB);
+        // A second record follows, so a walker that mis-read the length would
+        // frame a different number of records rather than merely a short one.
+        mkb.extend(rec(REC_TYPE_AND_VERSION, &[0x11; 8]));
+
+        let recs = walk_mkb(&mkb);
+        assert_eq!(recs.len(), 2, "the big record must be framed as ONE record");
+        assert_eq!(
+            recs[0].rec_len, TOTAL,
+            "rec_len must include the high BE24 byte"
+        );
+        assert_eq!(recs[0].body.len(), TOTAL - 4);
+        assert_eq!(
+            recs[1].rec_type, REC_TYPE_AND_VERSION,
+            "the following record must start where the big one ends"
+        );
+    }
+
+    // ── Header-only records and the exact end marker ──────────────────────
+
+    /// `rec_len == 4` is a well-formed HEADER-ONLY record (the minimum the
+    /// walker accepts), including one sitting at the very end of the buffer
+    /// with no bytes after it. Rejecting either — the `pos + 4` bound or the
+    /// `rec_len < 4` floor being off by one — silently drops the MKB's last
+    /// record, and "the record isn't there" is indistinguishable from "the disc
+    /// doesn't carry it".
+    #[test]
+    fn mkb_records_yields_a_header_only_record_at_the_buffer_end() {
+        let mut mkb = rec(REC_TYPE_AND_VERSION, &[0xAA, 0xBB]);
+        mkb.extend([REC_VKD_TABLE, 0x00, 0x00, 0x04]); // 4-byte, empty body, at EOF
+        assert_eq!(
+            mkb.len(),
+            10,
+            "sanity: the last record ends at the buffer end"
+        );
+
+        let recs = walk_mkb(&mkb);
+        assert_eq!(recs.len(), 2, "the trailing header-only record is a record");
+        assert_eq!(recs[1].rec_type, REC_VKD_TABLE);
+        assert_eq!(recs[1].rec_len, 4);
+        assert!(recs[1].body.is_empty());
+    }
+
+    /// ONLY the exact `00 00 00 00` marker ends the walk. A record whose TYPE
+    /// happens to be `0x00` but which declares a real length is a record, not
+    /// the end of the MKB — stopping there would truncate everything after it,
+    /// including the cvalue and verify records the key derivation needs.
+    #[test]
+    fn mkb_records_stops_only_on_the_all_zero_end_marker() {
+        // A type-0 record of length 8, then a normal record, then the marker.
+        let mut mkb = vec![0x00, 0x00, 0x00, 0x08, 1, 2, 3, 4];
+        mkb.extend(rec(REC_VKD_TABLE, &[0x55; 16]));
+        mkb.extend([0x00, 0x00, 0x00, 0x00]); // the real end marker
+        mkb.extend(rec(0x99, &[0xFF; 4])); // past the marker: not walked
+
+        let recs = walk_mkb(&mkb);
+        assert_eq!(
+            recs.len(),
+            2,
+            "a type-0 record with a non-zero length is a record, not the end"
+        );
+        assert_eq!(recs[0].rec_type, 0x00);
+        assert_eq!(recs[0].rec_len, 8);
+        assert_eq!(recs[1].rec_type, REC_VKD_TABLE);
+        assert_eq!(recs[1].body, vec![0x55; 16]);
+    }
+
+    /// `mkb_type_raw` reports the 32-bit MKBType field verbatim ([C] §3.2.5.1.1
+    /// Table 3-2), including a value this build does not recognise — the caller
+    /// uses it to tell "unknown MKB generation" from "no Type record at all".
+    /// All four bytes must come from the record body; reading any of them from
+    /// the wrong offset yields a type that silently classifies as a different
+    /// AACS generation.
+    ///
+    /// The recognised constants all share bytes with the `0x10` record-type
+    /// header byte (e.g. `MKB_21_CATEGORY_C` is `48 15 10 03`), so this uses a
+    /// value with four distinct bytes, none of them `0x10`.
+    #[test]
+    fn mkb_type_raw_reads_all_four_body_bytes() {
+        const RAW: u32 = 0xDEAD_BEEF;
+        let mkb = type_and_version(RAW, 7);
+        assert_eq!(
+            mkb_type_raw(&mkb),
+            Some(RAW),
+            "every byte of the MKBType field must come from the record body"
+        );
+        assert_eq!(mkb_version(&mkb), Some(7));
+    }
 }

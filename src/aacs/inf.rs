@@ -639,6 +639,176 @@ mod read_mkb_tests {
         }
     }
 
+    /// The CDB is what the drive actually acts on, and every byte of it is
+    /// load-bearing: a wrong format code returns a different disc structure
+    /// entirely, and a wrong allocation length truncates the pack. The existing
+    /// test above pins the opcode, the format code and the pack number; this
+    /// pins the WHOLE 12-byte CDB, so no field can drift unnoticed.
+    ///
+    /// Expected layout (MMC-6 READ DISC STRUCTURE, AACS MKB format):
+    ///   `[0]` opcode, `[1]` media type 0x01, `[2..6]` address = pack number
+    ///   (BE32), `[6]` layer 0, `[7]` format 0x83, `[8..10]` allocation length
+    ///   BE16 = 32772 = `0x80 0x04`, `[10..12]` reserved/control.
+    #[test]
+    fn read_mkb_from_drive_issues_the_exact_mmc_cdb_for_each_pack() {
+        let mut drive = MkbDrive {
+            packs: vec![vec![0x11u8; 64], vec![0x22u8; 64], vec![0x33u8; 64]],
+            cdbs: Vec::new(),
+        };
+        read_mkb_from_drive(&mut drive).expect("scripted drive answers");
+
+        assert_eq!(drive.cdbs.len(), 3, "one command per declared pack");
+        for (pack, cdb) in drive.cdbs.iter().enumerate() {
+            let p = pack as u32;
+            let expected: [u8; 12] = [
+                SCSI_READ_DISC_STRUCTURE,
+                0x01,
+                (p >> 24) as u8,
+                (p >> 16) as u8,
+                (p >> 8) as u8,
+                p as u8,
+                0x00,
+                0x83, // AACS MKB disc-structure format
+                0x80, // allocation length 32772 = 0x8004, high byte
+                0x04, // …low byte
+                0x00,
+                0x00,
+            ];
+            assert_eq!(
+                cdb.as_slice(),
+                &expected[..],
+                "CDB for pack {pack} must match the MMC-6 READ DISC STRUCTURE layout"
+            );
+        }
+    }
+
+    /// A pack payload filling the FULL 32768-byte window must come back whole.
+    /// The `len > 0 && len <= 32768` bound is what stands between a maximal
+    /// pack and a silently dropped one, and the small payloads used elsewhere
+    /// in this module never reach it.
+    #[test]
+    fn read_mkb_from_drive_accepts_a_full_size_pack() {
+        let full: Vec<u8> = (0..32768u32).map(|i| (i % 251) as u8).collect();
+        let other: Vec<u8> = (0..32768u32).map(|i| (i % 241) as u8 ^ 0x5A).collect();
+        // TWO maximal packs: the first-pack read and the per-pack loop carry
+        // separate bounds, so both must accept a full-window payload.
+        let mut drive = MkbDrive {
+            packs: vec![full.clone(), other.clone()],
+            cdbs: Vec::new(),
+        };
+        let mkb = read_mkb_from_drive(&mut drive).expect("scripted drive answers");
+        assert_eq!(
+            mkb.len(),
+            65536,
+            "neither maximal pack may be dropped at the size bound"
+        );
+        let mut expected = full.clone();
+        expected.extend_from_slice(&other);
+        assert!(mkb == expected, "both maximal packs' bytes must be intact");
+    }
+
+    /// A pack that declares only the 2-byte header and NO payload contributes
+    /// nothing, and must not push a phantom byte into the MKB — an off-by-one
+    /// at the zero-length boundary corrupts every following pack's alignment.
+    #[test]
+    fn read_mkb_from_drive_zero_length_pack_contributes_nothing() {
+        let mut drive = MkbDrive {
+            packs: vec![Vec::new(), vec![0xABu8; 32]],
+            cdbs: Vec::new(),
+        };
+        let mkb = read_mkb_from_drive(&mut drive).expect("scripted drive answers");
+        assert_eq!(
+            mkb.len(),
+            32,
+            "an empty pack adds no bytes; only pack 1's payload is present"
+        );
+        assert!(mkb == vec![0xABu8; 32], "and the bytes are pack 1's");
+    }
+
+    /// A drive that DECLARES more payload than it returned must not be
+    /// believed. The BE16 length in the response header is drive-supplied data:
+    /// a firmware bug, a short transfer, or a hostile device can put a value in
+    /// it that runs past the 32772-byte buffer. Copying `len` bytes on that word
+    /// alone panics the rip thread mid-scan.
+    ///
+    /// Both the first-pack read and the per-pack loop carry the same bound, so
+    /// both are exercised here: the over-declared pack contributes nothing and
+    /// the honest pack still comes through.
+    #[test]
+    fn read_mkb_from_drive_ignores_a_pack_declaring_more_than_the_buffer_holds() {
+        /// Pack 0 is honest; pack 1 declares a 60000-byte payload it never sent.
+        struct LyingDrive {
+            honest: Vec<u8>,
+        }
+        impl ScsiTransport for LyingDrive {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _direction: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::error::Result<ScsiResult> {
+                let pack = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+                data[3] = 2; // two packs declared
+                if pack == 0 {
+                    let dl = self.honest.len() + 2;
+                    data[0..2].copy_from_slice(&(dl as u16).to_be_bytes());
+                    data[4..4 + self.honest.len()].copy_from_slice(&self.honest);
+                } else {
+                    // A length far beyond the 32772-byte response buffer.
+                    data[0..2].copy_from_slice(&60_000u16.to_be_bytes());
+                }
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: 4,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+
+        let honest = vec![0xC7u8; 256];
+        let mut drive = LyingDrive {
+            honest: honest.clone(),
+        };
+        let mkb = read_mkb_from_drive(&mut drive).expect("an over-declared pack is not an error");
+        assert_eq!(
+            mkb.len(),
+            honest.len(),
+            "only the honest pack's bytes may be taken; the over-declared pack \
+             contributes nothing and must not be read past the buffer"
+        );
+        assert!(mkb == honest, "and those bytes are pack 0's");
+    }
+
+    /// The same over-declaration on the FIRST pack, which uses a separate bound
+    /// from the loop's.
+    #[test]
+    fn read_mkb_from_drive_ignores_a_first_pack_declaring_more_than_the_buffer() {
+        struct LyingFirst;
+        impl ScsiTransport for LyingFirst {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _direction: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::error::Result<ScsiResult> {
+                data[0..2].copy_from_slice(&60_000u16.to_be_bytes());
+                data[3] = 1;
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: 4,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let mkb = read_mkb_from_drive(&mut LyingFirst).expect("not an error");
+        assert!(
+            mkb.is_empty(),
+            "a first pack declaring more than the buffer holds yields no bytes"
+        );
+    }
+
     /// A single-pack disc still yields that pack's bytes — the common case, and
     /// the one where a body returning an empty vector looks most plausible.
     #[test]

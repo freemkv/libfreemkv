@@ -1015,6 +1015,604 @@ mod position_recovery_tests {
         );
     }
 
+    // ════════════════════════════════════════════════════════════════════
+    // A MULTI-SLOT MKB where the device key sits ABOVE the matching slot.
+    //
+    // `plant_mkb` above is a ONE-slot, ZERO-descent fixture: the matching
+    // subset-difference is at index 0 and the device sits exactly on it. That
+    // leaves two whole behaviours of `recover_dk_position` unexercised —
+    //   * slot INDEXING (`uvs[5*i]`, `uvs[1 + 5*i]`, `cvalues[i*16..]`), which
+    //     is the identity permutation when i is always 0, and
+    //   * the DESCENT branch, where the device is an ancestor of the slot and
+    //     the candidate position is walked up bit by bit —
+    // so an MKB whose keyed slot is index 2 of 3, opened by a device one level
+    // above it, is what pins them.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// v-masks for the fixture's two positions, written as literals from
+    /// [C] §3.2.3 (`v_mask` is all-ones above the LOWEST set bit of `uv`, i.e.
+    /// `0xFFFF_FFFF << (uv.trailing_zeros() + 1)`) rather than computed with
+    /// `calc_v_mask`, which is itself under test.
+    const UV_SLOT: u32 = 0x0000_9400; // lowest set bit 10
+    const V_MASK_SLOT: u32 = 0xFFFF_F800; // 0xFFFF_FFFF << 11
+    const UV_ANCESTOR: u32 = 0x0000_9800; // lowest set bit 11
+    const V_MASK_ANCESTOR: u32 = 0xFFFF_F000; // 0xFFFF_FFFF << 12
+    const U_MASK_SHIFT: u8 = 16;
+
+    /// `calc_v_mask` implements [C] §3.2.3. Every subset-difference gate and
+    /// every descent in the walk is masked by its result, so a wrong mask makes
+    /// the walk match the wrong slots (or none) — pinned here against literal
+    /// expectations, not against a re-computation.
+    #[test]
+    fn calc_v_mask_is_all_ones_above_the_lowest_set_bit() {
+        // (uv, expected v_mask) — expected = 0xFFFF_FFFF << (trailing_zeros+1).
+        let cases: &[(u32, u32)] = &[
+            (0x0000_0001, 0xFFFF_FFFE),
+            (0x0000_0002, 0xFFFF_FFFC),
+            (0x0000_0400, 0xFFFF_F800),
+            (UV_SLOT, V_MASK_SLOT),
+            (UV_ANCESTOR, V_MASK_ANCESTOR),
+            (0x0000_00FF, 0xFFFF_FFFE), // lowest set bit is 0
+        ];
+        for &(uv, expected) in cases {
+            assert_eq!(
+                calc_v_mask(uv),
+                expected,
+                "v_mask for uv={uv:#010x} must be all-ones above its lowest set bit"
+            );
+        }
+    }
+
+    /// The planted multi-slot fixture.
+    struct PlantedDescent {
+        mkb: Vec<u8>,
+        dkey: [u8; 16],
+        mk: [u8; 16],
+    }
+
+    /// Build an MKB with THREE subset-difference slots where only slot **2** is
+    /// keyed, and the device key sits one level ABOVE that slot (at
+    /// `UV_ANCESTOR`, the position `recover_dk_position`'s descent loop reaches
+    /// first from `UV_SLOT`).
+    ///
+    /// The two decoy slots carry real-looking `uv`s and junk cvalues, so a walk
+    /// that indexes the slot table wrongly reads a decoy's cvalue and validates
+    /// nothing.
+    fn plant_descent_mkb() -> PlantedDescent {
+        let dkey: [u8; 16] = [
+            0x5A, 0x4B, 0x3C, 0x2D, 0x1E, 0x0F, 0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87,
+            0x78, 0x69,
+        ];
+        let mk: [u8; 16] = [
+            0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD,
+            0xBE, 0xBF,
+        ];
+
+        // The Processing Key the device produces after descending from
+        // UV_ANCESTOR to the slot. Built with the same descent the walk uses
+        // (as `plant_mkb` builds its cvalue with the same `aesg3`), but anchored
+        // to the FIXED ancestor position above — so a walk that computes a
+        // different candidate position derives a different Kp and fails.
+        let pk = calc_pk_from_dk(&dkey, UV_SLOT, V_MASK_SLOT, V_MASK_ANCESTOR);
+
+        // Invert [C] §3.2.4 for slot 2's cvalue.
+        let mut mk_raw = mk;
+        for (a, b) in mk_raw[12..16].iter_mut().zip(UV_SLOT.to_be_bytes()) {
+            *a ^= b;
+        }
+        let cv2 = aes_ecb_encrypt(&pk, &mk_raw);
+
+        // Invert [C] §3.2.5.1.4.
+        let mut vd = [0x33u8; 16];
+        vd[..8].copy_from_slice(&VERIFY_MAGIC);
+        let mk_dv = aes_ecb_encrypt(&mk, &vd);
+
+        // Three 5-byte slots: two decoys, then the keyed one.
+        let mut subdiff = Vec::new();
+        for uv in [0x0000_1100u32, 0x0000_2200, UV_SLOT] {
+            subdiff.push(U_MASK_SHIFT);
+            subdiff.extend_from_slice(&uv.to_be_bytes());
+        }
+        // Three 16-byte cvalues, 1:1 with the slots; only index 2 is real.
+        let mut cvalues = vec![0x11u8; 16];
+        cvalues.extend_from_slice(&[0x22u8; 16]);
+        cvalues.extend_from_slice(&cv2);
+
+        let mut mkb = Vec::new();
+        mkb.extend_from_slice(&rec(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]));
+        mkb.extend_from_slice(&rec(0x86, &mk_dv));
+        mkb.extend_from_slice(&rec(0x04, &subdiff));
+        mkb.extend_from_slice(&rec(0x05, &cvalues));
+
+        PlantedDescent { mkb, dkey, mk }
+    }
+
+    /// Fixture sanity: three slots, three cvalues, and the keyed slot is NOT
+    /// index 0 (otherwise the indexing this fixture exists to pin is trivial).
+    #[test]
+    fn the_planted_descent_mkb_has_three_slots_and_is_keyed_at_the_last() {
+        let p = plant_descent_mkb();
+        assert_eq!(
+            mkb_find_subdiff_records(&p.mkb).map(|v| v.len()),
+            Some(15),
+            "three 5-byte subset-difference slots"
+        );
+        assert_eq!(
+            mkb_find_cvalues(&p.mkb).map(|v| v.len()),
+            Some(48),
+            "three 16-byte cvalues"
+        );
+        assert_ne!(UV_SLOT, UV_ANCESTOR, "the device is not at the slot");
+    }
+
+    /// `recover_dk_position` must find the device's ANCESTOR position and that
+    /// position must walk the MKB to the planted Media Key.
+    ///
+    /// Two things are pinned that the single-slot fixture cannot pin:
+    ///   * the recovered `uv` is the ancestor, not the slot's own `uv` — proof
+    ///     the descent branch ran rather than the zero-descent shortcut;
+    ///   * the keyed slot is index 2, so the slot-table and cvalue-table
+    ///     offsets must both be computed correctly to reach it.
+    ///
+    /// As always the load-bearing assertion is the final Media Key: a position
+    /// that does not walk to it is no better than `None`.
+    #[test]
+    fn recover_dk_position_finds_an_ancestor_position_in_a_multi_slot_mkb() {
+        let p = plant_descent_mkb();
+
+        let recovered = recover_dk_position(&p.mkb, &p.dkey)
+            .expect("the planted key opens slot 2 from one level above it");
+
+        assert_eq!(
+            recovered.uv, UV_ANCESTOR,
+            "the recovered position is the device's ancestor node, not the slot's"
+        );
+        assert_ne!(
+            recovered.uv, UV_SLOT,
+            "a zero-descent answer would mean the descent branch never ran"
+        );
+        assert_eq!(recovered.u_mask_shift, U_MASK_SHIFT);
+        assert_eq!(recovered.key, p.dkey);
+
+        assert_eq!(
+            derive_media_key_from_dk(&p.mkb, std::slice::from_ref(&recovered)),
+            Some(p.mk),
+            "the recovered ancestor position must walk to the planted Media Key"
+        );
+    }
+
+    /// The same multi-slot MKB must not hand a position to a key it does not
+    /// open — including one that differs by a single bit.
+    #[test]
+    fn recover_dk_position_rejects_a_stranger_against_the_multi_slot_mkb() {
+        let p = plant_descent_mkb();
+        let mut stranger = p.dkey;
+        stranger[15] ^= 0x01;
+        assert!(recover_dk_position(&p.mkb, &stranger).is_none());
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // A FOUR-LEVEL descent taking both branches.
+    //
+    // The fixtures above descend zero levels and one level (left). The tree
+    // walk's per-level branch decision — [C] §3.2.4: descend RIGHT
+    // (`aesg3(.,2)`) when the slot's `uv` has the level's bit set, LEFT
+    // (`aesg3(.,0)`) when it is clear, terminal Processing Key `aesg3(.,1)` —
+    // is only pinned by a descent that takes both branches more than once.
+    //
+    // The expected Processing Key here is written out as an EXPLICIT chain of
+    // `aesg3` calls, not computed with `calc_pk_from_dk`: a fixture built by
+    // the function under test moves with it, and every mutation of the descent
+    // would stay self-consistent.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Slot `uv` for the four-level fixture: bits 8, 6 and 4 set. Lowest set
+    /// bit 4 → the descent reads bits 8, 7, 6, 5 (set, clear, set, clear).
+    const UV_SLOT4: u32 = 0x0000_0150;
+    const V_MASK_SLOT4: u32 = 0xFFFF_FFE0; // 0xFFFF_FFFF << 5
+    /// The device's ancestor position: lowest set bit 8, four levels above.
+    const UV_ANC4: u32 = 0x0000_0100;
+    const V_MASK_ANC4: u32 = 0xFFFF_FE00; // 0xFFFF_FFFF << 9
+
+    struct PlantedDescent4 {
+        mkb: Vec<u8>,
+        dkey: [u8; 16],
+        mk: [u8; 16],
+        /// The Processing Key the four-level descent must produce.
+        pk: [u8; 16],
+    }
+
+    fn plant_four_level_mkb() -> PlantedDescent4 {
+        let dkey: [u8; 16] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ];
+        let mk: [u8; 16] = [
+            0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD,
+            0xDE, 0xDF,
+        ];
+
+        // [C] §3.2.4, written out level by level. Descending from the ancestor
+        // node to the slot reads UV_SLOT4's bits 8, 7, 6, 5 in that order:
+        //   bit 8 = 1 → right child, aesg3(., 2)
+        //   bit 7 = 0 → left  child, aesg3(., 0)
+        //   bit 6 = 1 → right child, aesg3(., 2)
+        //   bit 5 = 0 → left  child, aesg3(., 0)
+        // and the Processing Key is aesg3(final_node, 1).
+        let n1 = aesg3(&dkey, 2);
+        let n2 = aesg3(&n1, 0);
+        let n3 = aesg3(&n2, 2);
+        let n4 = aesg3(&n3, 0);
+        let pk = aesg3(&n4, 1);
+
+        let mut mk_raw = mk;
+        for (a, b) in mk_raw[12..16].iter_mut().zip(UV_SLOT4.to_be_bytes()) {
+            *a ^= b;
+        }
+        let cv1 = aes_ecb_encrypt(&pk, &mk_raw);
+
+        let mut vd = [0x77u8; 16];
+        vd[..8].copy_from_slice(&VERIFY_MAGIC);
+        let mk_dv = aes_ecb_encrypt(&mk, &vd);
+
+        // Two slots; the keyed one is index 1.
+        let mut subdiff = Vec::new();
+        for uv in [0x0000_1100u32, UV_SLOT4] {
+            subdiff.push(U_MASK_SHIFT);
+            subdiff.extend_from_slice(&uv.to_be_bytes());
+        }
+        let mut cvalues = vec![0x44u8; 16];
+        cvalues.extend_from_slice(&cv1);
+
+        let mut mkb = Vec::new();
+        mkb.extend_from_slice(&rec(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]));
+        mkb.extend_from_slice(&rec(0x86, &mk_dv));
+        mkb.extend_from_slice(&rec(0x04, &subdiff));
+        mkb.extend_from_slice(&rec(0x05, &cvalues));
+
+        PlantedDescent4 { mkb, dkey, mk, pk }
+    }
+
+    /// `calc_pk_from_dk` must reproduce the explicit four-level AES-G3 chain:
+    /// right, left, right, left, then the terminal `aesg3(.,1)`.
+    ///
+    /// This is the tree descent every device-key path in the crate runs. A
+    /// wrong branch, a wrong level count, or a wrong terminal increment yields
+    /// a Processing Key that validates against nothing — the disc reports no
+    /// key while the operator's device key is perfectly good.
+    #[test]
+    fn calc_pk_from_dk_walks_the_uv_bits_right_left_right_left() {
+        let p = plant_four_level_mkb();
+        assert_eq!(
+            calc_pk_from_dk(&p.dkey, UV_SLOT4, V_MASK_SLOT4, V_MASK_ANC4),
+            p.pk,
+            "the four-level descent must be aesg3(.,2), (.,0), (.,2), (.,0) then (.,1)"
+        );
+
+        // Zero levels to descend (device sits AT the slot) → the terminal step
+        // alone, with no descent.
+        assert_eq!(
+            calc_pk_from_dk(&p.dkey, UV_SLOT4, V_MASK_SLOT4, V_MASK_SLOT4),
+            aesg3(&p.dkey, 1),
+            "no descent needed → Kp is aesg3(dk, 1)"
+        );
+    }
+
+    /// End-to-end through the four-level fixture: the position recovered for an
+    /// unpositioned key must be the ancestor four levels up, and it must walk
+    /// the MKB to the planted Media Key.
+    #[test]
+    fn recover_dk_position_descends_four_levels_to_the_planted_media_key() {
+        let p = plant_four_level_mkb();
+
+        let recovered = recover_dk_position(&p.mkb, &p.dkey)
+            .expect("the planted key opens the slot from four levels above it");
+
+        assert_eq!(
+            recovered.uv, UV_ANC4,
+            "the recovered position is four levels above the slot"
+        );
+        assert_eq!(recovered.u_mask_shift, U_MASK_SHIFT);
+        assert_eq!(
+            derive_media_key_from_dk(&p.mkb, std::slice::from_ref(&recovered)),
+            Some(p.mk),
+            "the recovered position must walk to the planted Media Key"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // MALFORMED MKBs: a truncated cvalue table, and a revoked-marker slot.
+    //
+    // The MKB is disc-controlled data. Both of these shapes are reachable from
+    // a corrupt or crafted disc, and in both the walk must decline to derive a
+    // key rather than index past the end of a record.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Assemble an MKB from an explicit slot list and cvalue table.
+    /// `slots` is `(u_mask_shift, uv)` per subset-difference entry.
+    fn build_mkb(slots: &[(u8, u32)], cvalues: &[u8], mk_dv: &[u8; 16]) -> Vec<u8> {
+        let mut subdiff = Vec::new();
+        for &(shift, uv) in slots {
+            subdiff.push(shift);
+            subdiff.extend_from_slice(&uv.to_be_bytes());
+        }
+        let mut mkb = Vec::new();
+        mkb.extend_from_slice(&rec(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]));
+        mkb.extend_from_slice(&rec(0x86, mk_dv));
+        mkb.extend_from_slice(&rec(0x04, &subdiff));
+        mkb.extend_from_slice(&rec(0x05, cvalues));
+        mkb
+    }
+
+    /// The planted slot-2 material from the four-level fixture, reusable for
+    /// the malformed-MKB shapes below: `(dkey, mk, pk, cvalue, mk_dv)`.
+    fn four_level_parts() -> ([u8; 16], [u8; 16], [u8; 16], [u8; 16], [u8; 16]) {
+        let p = plant_four_level_mkb();
+        let cvalues = mkb_find_cvalues(&p.mkb).expect("cvalues");
+        let mut cv = [0u8; 16];
+        cv.copy_from_slice(&cvalues[16..32]); // the keyed slot's cvalue
+        let mk_dv = mkb_find_mk_dv(&p.mkb).expect("mk_dv");
+        (p.dkey, p.mk, p.pk, cv, mk_dv)
+    }
+
+    /// A cvalue table with FEWER entries than the subset-difference index has
+    /// slots — a truncated or short-read `0x05` record. The slot whose cvalue is
+    /// missing must be skipped, not read past the end of the table.
+    ///
+    /// Asserted as "no key, no panic": the keyed slot's cvalue is absent, so
+    /// there is nothing to derive, and the walk must say so rather than index
+    /// out of bounds.
+    #[test]
+    fn a_cvalue_table_shorter_than_the_slot_index_is_not_read_past() {
+        let (dkey, _mk, _pk, cv, mk_dv) = four_level_parts();
+
+        // Three slots; the keyed one is index 2 — but only TWO cvalues exist.
+        let slots = [
+            (U_MASK_SHIFT, 0x0000_1100u32),
+            (U_MASK_SHIFT, 0x0000_2200u32),
+            (U_MASK_SHIFT, UV_SLOT4),
+        ];
+        let mut cvalues = vec![0x44u8; 16];
+        cvalues.extend_from_slice(&[0x55u8; 16]);
+        assert_eq!(cvalues.len(), 32, "two cvalues for three slots");
+        let mkb = build_mkb(&slots, &cvalues, &mk_dv);
+
+        let dk = DeviceKey {
+            key: dkey,
+            node: 0x0101,
+            uv: UV_ANC4,
+            u_mask_shift: U_MASK_SHIFT,
+        };
+        assert_eq!(
+            derive_media_key_and_pk_from_dk(&mkb, std::slice::from_ref(&dk)),
+            None,
+            "slot 2 has no cvalue → no Media Key, and no read past the table"
+        );
+
+        // The unpositioned-key scan walks the same tables and must also stop at
+        // the last cvalue rather than at the last slot.
+        assert!(
+            recover_dk_position(&mkb, &dkey).is_none(),
+            "the position scan must stop at the last cvalue, not the last slot"
+        );
+
+        // The bare-PK table scan likewise: a PK that matches nothing must sweep
+        // every slot and return None without reading past the cvalue table.
+        let uvs = mkb_find_subdiff_records(&mkb).expect("subdiff");
+        assert_eq!(
+            try_pk_against_tables(&[[0x00u8; 16]], &uvs, &cvalues, &mk_dv),
+            None,
+            "a non-matching PK sweeps all slots without over-reading"
+        );
+
+        // …and when the keyed slot IS inside the truncated table, it resolves —
+        // proving the guard skips only the missing entries.
+        let ok_slots = [(U_MASK_SHIFT, UV_SLOT4), (U_MASK_SHIFT, 0x0000_1100u32)];
+        let mut ok_cvalues = cv.to_vec();
+        ok_cvalues.extend_from_slice(&[0x55u8; 16]);
+        let ok_mkb = build_mkb(&ok_slots, &ok_cvalues, &mk_dv);
+        let ok_uvs = mkb_find_subdiff_records(&ok_mkb).expect("subdiff");
+        assert!(
+            try_pk_against_tables(&[_pk], &ok_uvs, &ok_cvalues, &mk_dv).is_some(),
+            "sanity: the same PK/cvalue pair does resolve when present"
+        );
+    }
+
+    /// The `0xC0` revoked marker in a slot's `u_mask_shift` byte TERMINATES the
+    /// subset-difference table ([C] §3.2.5.1.5). Slots after it are not part of
+    /// the index and must not be walked — a walk that ran past the marker would
+    /// derive keys from entries the MKB has explicitly ended.
+    ///
+    /// The fixture puts the keyed slot AFTER a marker, so "the marker stopped
+    /// the walk" is observable as no key; removing the marker resolves the same
+    /// MKB, which is what makes the first assertion mean something.
+    #[test]
+    fn a_revoked_marker_slot_terminates_the_subset_difference_table() {
+        let (dkey, mk, pk, cv, mk_dv) = four_level_parts();
+
+        // Slot 0 = ordinary decoy, slot 1 = revoked marker, slot 2 = the keyed
+        // slot (unreachable), each with its own cvalue.
+        let barred = [
+            (U_MASK_SHIFT, 0x0000_1100u32),
+            (0xC0u8, 0x0000_2200u32),
+            (U_MASK_SHIFT, UV_SLOT4),
+        ];
+        let mut cvalues = vec![0x44u8; 16];
+        cvalues.extend_from_slice(&[0x55u8; 16]);
+        cvalues.extend_from_slice(&cv);
+        let mkb = build_mkb(&barred, &cvalues, &mk_dv);
+
+        let dk = DeviceKey {
+            key: dkey,
+            node: 0x0101,
+            uv: UV_ANC4,
+            u_mask_shift: U_MASK_SHIFT,
+        };
+        assert_eq!(
+            derive_media_key_and_pk_from_dk(&mkb, std::slice::from_ref(&dk)),
+            None,
+            "the table ends at the revoked marker; slot 2 is not in it"
+        );
+        assert!(
+            recover_dk_position(&mkb, &dkey).is_none(),
+            "the position scan must stop at the marker too"
+        );
+        let uvs = mkb_find_subdiff_records(&mkb).expect("subdiff");
+        assert_eq!(
+            try_pk_against_tables(&[pk], &uvs, &cvalues, &mk_dv),
+            None,
+            "the terminal-PK scan must stop at the marker too"
+        );
+
+        // Same MKB with the marker cleared → the keyed slot is in the table and
+        // every one of the three paths resolves the planted Media Key.
+        let open = [
+            (U_MASK_SHIFT, 0x0000_1100u32),
+            (U_MASK_SHIFT, 0x0000_2200u32),
+            (U_MASK_SHIFT, UV_SLOT4),
+        ];
+        let mkb_open = build_mkb(&open, &cvalues, &mk_dv);
+        assert_eq!(
+            derive_media_key_from_dk(&mkb_open, std::slice::from_ref(&dk)),
+            Some(mk),
+            "sanity: without the marker the same slot derives the Media Key"
+        );
+        let uvs_open = mkb_find_subdiff_records(&mkb_open).expect("subdiff");
+        assert_eq!(
+            try_pk_against_tables(&[pk], &uvs_open, &cvalues, &mk_dv),
+            Some(mk)
+        );
+    }
+
+    /// A device key applies to a subset-difference only when BOTH gates hold
+    /// ([C] §3.2.4): its u-mask must equal the slot's, AND its `uv` must agree
+    /// with the slot's under the device's v-mask. A key filed with the wrong
+    /// `u_mask_shift` describes a different region of the tree and must not be
+    /// used, even though its tree position would otherwise line up — accepting
+    /// it derives a Media Key from a slot the key does not actually cover.
+    #[test]
+    fn a_device_key_with_the_wrong_u_mask_shift_does_not_apply() {
+        let p = plant_four_level_mkb();
+
+        let good = DeviceKey {
+            key: p.dkey,
+            node: 0x0101,
+            uv: UV_ANC4,
+            u_mask_shift: U_MASK_SHIFT,
+        };
+        assert_eq!(
+            derive_media_key_from_dk(&p.mkb, std::slice::from_ref(&good)),
+            Some(p.mk),
+            "sanity: the correctly-filed key derives the planted Media Key"
+        );
+
+        // Identical in every way except the u-mask.
+        let wrong_u_mask = DeviceKey {
+            u_mask_shift: U_MASK_SHIFT - 1,
+            ..good.clone()
+        };
+        assert_eq!(
+            derive_media_key_from_dk(&p.mkb, std::slice::from_ref(&wrong_u_mask)),
+            None,
+            "a mismatched u-mask must fail the subset-difference gate"
+        );
+    }
+
+    /// `validate_processing_key` XORs the slot's 4-byte `uv` into `mk[12..16]`
+    /// ([C] §3.2.4 step 2). XOR, not OR: the operation must be reversible, and
+    /// it must be able to CLEAR a bit the AES output set. A `uv` and a Media Key
+    /// that share set bits in those four bytes are what tell the two apart.
+    #[test]
+    fn validate_processing_key_xors_the_uv_into_the_media_key_tail() {
+        // uv with all four bytes non-zero and overlapping the planted mk tail.
+        const UV: u32 = 0xF0F0_F0F0;
+        let pk = [0x5Au8; 16];
+        // Choose a Media Key whose tail shares bits with uv, so XOR and OR
+        // differ, and invert the relation to build the cvalue and verify block.
+        let mk: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xFF, 0xFF,
+            0xFF, 0xFF,
+        ];
+        let mut pre = mk;
+        for (a, b) in pre[12..16].iter_mut().zip(UV.to_be_bytes()) {
+            *a ^= b;
+        }
+        let cvalue = aes_ecb_encrypt(&pk, &pre);
+        let mut vd = [0x0Fu8; 16];
+        vd[..8].copy_from_slice(&VERIFY_MAGIC);
+        let mk_dv = aes_ecb_encrypt(&mk, &vd);
+
+        assert_eq!(
+            validate_processing_key(&pk, &cvalue, &UV.to_be_bytes(), &mk_dv),
+            Some(mk),
+            "uv must be XORed (not ORed) into the Media Key's low 4 bytes"
+        );
+    }
+
+    /// `validate_processing_key` is handed slices straight out of MKB records,
+    /// so its length guards are what stand between a short/truncated record and
+    /// an out-of-bounds read. Under-length inputs must yield `None`.
+    #[test]
+    fn validate_processing_key_refuses_short_cvalue_or_uv() {
+        let p = plant_mkb();
+        let pk = aesg3(&p.dkey, 1);
+
+        assert!(
+            validate_processing_key(&pk, &p.cv[..15], &p.uv.to_be_bytes(), &p.mk_dv).is_none(),
+            "a cvalue shorter than 16 bytes is not usable"
+        );
+        assert!(
+            validate_processing_key(&pk, &p.cv, &p.uv.to_be_bytes()[..3], &p.mk_dv).is_none(),
+            "a uv shorter than 4 bytes is not usable"
+        );
+        // Exactly-sized inputs are accepted and yield the planted Media Key.
+        assert_eq!(
+            validate_processing_key(&pk, &p.cv, &p.uv.to_be_bytes(), &p.mk_dv),
+            Some(p.mk),
+            "the exactly-sized planted inputs must still validate"
+        );
+    }
+
+    /// `probe::aes_dec` is the single AACS verify primitive a reproduction
+    /// harness has: every claim such a harness makes about a Media Key is
+    /// `aes_dec(km, mk_dv)` starting with the [C] §3.2.5.1.4 magic. A body
+    /// returning a fixed block makes the harness answer the SAME way for every
+    /// key and every disc — either "nothing verifies" or, if the constant
+    /// happened to start with the magic, "everything verifies", which is the
+    /// `km_verifies` failure again one layer out.
+    ///
+    /// Asserted against the planted MKB: the probe must reproduce the verify
+    /// relation for the planted Media Key and must NOT reproduce it for a key
+    /// one bit away.
+    #[test]
+    fn probe_aes_dec_reproduces_the_verify_relation_for_the_planted_key() {
+        let p = plant_mkb();
+
+        let plain = probe::aes_dec(&p.mk, &p.mk_dv);
+        assert_eq!(
+            &plain[..8],
+            &VERIFY_MAGIC[..],
+            "AES-D(Km, mk_dv) must open with the Verify-Media-Key magic"
+        );
+
+        let mut stranger = p.mk;
+        stranger[0] ^= 0x01;
+        assert_ne!(
+            &probe::aes_dec(&stranger, &p.mk_dv)[..8],
+            &VERIFY_MAGIC[..],
+            "a key one bit away must not reproduce the magic"
+        );
+
+        // It is a decryption, not a transformation of its own choosing: it must
+        // invert the forward primitive for an arbitrary block.
+        let block = [0x5Cu8; 16];
+        assert_eq!(
+            probe::aes_dec(&p.mk, &aes_ecb_encrypt(&p.mk, &block)),
+            block,
+            "aes_dec must be the exact inverse of AES-128-ECB encrypt"
+        );
+    }
+
     /// `probe::mkb_cvalues` is the Media-Key-Data table the whole PK×cvalue
     /// scan iterates. An empty or one-byte table makes every scan find nothing,
     /// so a harness would report a good key as non-working.
