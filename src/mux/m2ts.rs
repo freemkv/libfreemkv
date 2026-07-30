@@ -8,7 +8,7 @@
 //! write-only.
 
 use super::meta;
-use crate::disc::{Codec, DiscTitle, Stream as DiscStream};
+use crate::disc::{DiscTitle, Stream as DiscStream};
 use std::io::{self, Write};
 
 /// BD transport stream write sink with embedded FMKV metadata
@@ -40,14 +40,15 @@ impl M2tsStream {
             .collect();
         let boxed: Box<dyn Write + Send> = Box::new(writer);
         let mut muxer = super::tsmux::TsMuxer::new(boxed, &pids);
-        // Only HEVC/H.264 arrive length-prefixed (MKV/PES NALU convention);
-        // MPEG-2 and VC-1 are already start-code ES and must NOT go through
-        // Annex-B conversion (see `TsMuxer::set_nal_video`) or the frame is
-        // silently mangled while the mux still reports success.
+        // Declare each video track's codec. This one call decides both the ES
+        // framing (HEVC/H.264 arrive length-prefixed and need Annex-B conversion;
+        // MPEG-2 and VC-1 are already start-code ES and would be mangled by it)
+        // and which parameter-set record parser applies (avcC vs hvcC). Passing
+        // the codec rather than a NAL-or-not flag is deliberate: the two facts
+        // must never be able to disagree.
         for (i, s) in title.streams.iter().enumerate() {
             if let DiscStream::Video(v) = s {
-                let is_nal = matches!(v.codec, Codec::Hevc | Codec::H264);
-                muxer.set_nal_video(i, is_nal)?;
+                muxer.set_video_codec(i, v.codec)?;
             }
         }
         for (i, cp) in title.codec_privates.iter().enumerate() {
@@ -170,16 +171,78 @@ mod tests {
         }
     }
 
+    /// An H.264 track's codec_private is an **avcC** record, not hvcC. The BD-TS
+    /// muxer must parse it with the avcC parser and emit the SPS/PPS as Annex-B
+    /// parameter sets, or the H.264 elementary stream reaches the player with no
+    /// SPS/PPS at all and is undecodable — silently, because frame_count still
+    /// advances and the mux reports success.
+    ///
+    /// Mutation: parse codec_private with hvcc_to_annex_b (the pre-fix behaviour) ->
+    /// the parser returns None, no parameter sets are emitted, and this fails.
+    #[test]
+    fn h264_avcc_parameter_sets_are_emitted_as_annex_b() {
+        let sps: &[u8] = &[0x67, 0x42, 0xC0, 0x1E, 0xAB, 0xCD];
+        let pps: &[u8] = &[0x68, 0xCE, 0x3C, 0x80];
+        // avcC (ISO/IEC 14496-15 §5.3.3.1.2): 5-byte fixed header, then
+        // numOfSequenceParameterSets (low 5 bits), each SPS as u16-BE length +
+        // bytes, then numOfPictureParameterSets, each PPS likewise.
+        let mut avcc = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF];
+        avcc.push(0xE0 | 1); // reserved 111b + numSPS = 1
+        avcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        avcc.extend_from_slice(sps);
+        avcc.push(1); // numPPS = 1
+        avcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        avcc.extend_from_slice(pps);
+
+        let mut title = make_title();
+        if let DiscStream::Video(v) = &mut title.streams[0] {
+            v.codec = Codec::H264;
+        }
+        title.codec_privates = vec![Some(avcc)];
+
+        // A length-prefixed IDR NAL, the shape the muxer expects for NAL video.
+        let nal: Vec<u8> = vec![0x65, 0x88, 0x84, 0x00, 0x11, 0x22];
+        let mut es = (nal.len() as u32).to_be_bytes().to_vec();
+        es.extend_from_slice(&nal);
+
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = SharedSink(shared.clone());
+        let mut stream = M2tsStream::create(sink, &title).unwrap();
+        stream
+            .write(&PesFrame {
+                coding: None,
+                source: None,
+                track: 0,
+                pts: 0,
+                keyframe: true,
+                data: es,
+                duration_ns: None,
+            })
+            .unwrap();
+        stream.finish().unwrap();
+        drop(stream);
+
+        let buf = shared.lock().unwrap().clone();
+        assert!(
+            buf.windows(sps.len()).any(|w| w == sps),
+            "the avcC SPS must reach the transport stream"
+        );
+        assert!(
+            buf.windows(pps.len()).any(|w| w == pps),
+            "the avcC PPS must reach the transport stream"
+        );
+    }
+
     /// `M2tsStream::create` must opt a VC-1 video track OUT of Annex-B conversion.
     ///
     /// This pins the WIRING in `create`, not just `TsMuxer`'s flag: deleting the
-    /// `set_nal_video` loop leaves every TsMuxer-level test passing, because those
+    /// `set_video_codec` loop leaves every TsMuxer-level test passing, because those
     /// drive the muxer directly and set the flag themselves. Only a test that goes
     /// through `create` catches it — and mangling MPEG-2/VC-1 video is silent, since
     /// frame_count still increments and the mux reports success.
     ///
-    /// Mutation: remove the `set_nal_video` loop from `create`, or widen its
-    /// `matches!` to include Vc1 -> the ES gains a start code and this fails.
+    /// Mutation: remove the `set_video_codec` loop from `create`, or make it declare
+    /// Vc1 as a NAL codec -> the ES gains a start code and this fails.
     #[test]
     fn vc1_video_is_wired_to_the_non_nal_path() {
         let mut title = make_title();
