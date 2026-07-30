@@ -1641,4 +1641,124 @@ mod position_recovery_tests {
             "the probe's cvalue table must be the one the PK scan can use"
         );
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // An ODD subset-difference `uv` — the depth-0 slot.
+    //
+    // `recover_dk_position`'s descent starts at `uv_r.trailing_zeros() + 1`.
+    // Every other fixture in this module uses an even `uv` (lowest set bit 4,
+    // 10 or 11), so `trailing_zeros()` was never 0 and the descent never began
+    // at level 1. That left the whole depth-0 case unexecuted: a slot whose `uv`
+    // is odd sits at the very bottom of the subset-difference tree, and it is a
+    // perfectly legal MKB shape.
+    //
+    // It is also the arithmetic boundary of the loop bound: at `p == 0` the
+    // `+ 1` is the only thing keeping `(p - 1)` — an unsigned underflow — off
+    // the range expression.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Slot `uv` with bits 8, 6, 4 AND 0 set: lowest set bit 0, so
+    /// `trailing_zeros() == 0` and the descent must start at level 1.
+    const UV_ODD: u32 = 0x0000_0151;
+    /// The ancestor one level up — what the descent's first candidate
+    /// (`k == 1`) resolves to: `(UV_ODD & !0b11) | 0b10`.
+    const UV_ODD_ANC: u32 = 0x0000_0152;
+    const U_MASK_SHIFT_ODD: u8 = 12;
+
+    /// An MKB with a single ODD-`uv` slot, keyed by a device one level above it.
+    ///
+    /// The expected Processing Key is written as the EXPLICIT `aesg3` chain the
+    /// one-level descent produces ([C] §3.2.4): from the ancestor, bit 1 of
+    /// `UV_ODD` is CLEAR, so the walk takes the left child (`aesg3(.,0)`) and
+    /// then terminates with `aesg3(.,1)`. Not built with `calc_pk_from_dk` —
+    /// a fixture built by the walk moves with the walk's own mutations.
+    fn plant_odd_uv_mkb() -> (Vec<u8>, [u8; 16], [u8; 16], [u8; 16]) {
+        let dkey: [u8; 16] = [
+            0x2F, 0x3E, 0x4D, 0x5C, 0x6B, 0x7A, 0x89, 0x98, 0xA7, 0xB6, 0xC5, 0xD4, 0xE3, 0xF2,
+            0x01, 0x10,
+        ];
+        let mk: [u8; 16] = [
+            0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED,
+            0xEE, 0xEF,
+        ];
+
+        let pk = aesg3(&aesg3(&dkey, 0), 1);
+
+        let mut mk_raw = mk;
+        for (a, b) in mk_raw[12..16].iter_mut().zip(UV_ODD.to_be_bytes()) {
+            *a ^= b;
+        }
+        let cv = aes_ecb_encrypt(&pk, &mk_raw);
+
+        let mut vd = [0x27u8; 16];
+        vd[..8].copy_from_slice(&VERIFY_MAGIC);
+        let mk_dv = aes_ecb_encrypt(&mk, &vd);
+
+        let mkb = build_mkb(&[(U_MASK_SHIFT_ODD, UV_ODD)], &cv, &mk_dv);
+        (mkb, dkey, mk, pk)
+    }
+
+    /// Fixture sanity: the slot really is odd, and the ancestor really is the
+    /// level-1 candidate. If either drifted, the test below would silently stop
+    /// covering the depth-0 descent it exists for.
+    #[test]
+    fn the_odd_uv_fixture_sits_at_tree_depth_zero() {
+        assert_eq!(UV_ODD.trailing_zeros(), 0, "an odd uv is at depth 0");
+        assert_eq!(
+            UV_ODD_ANC,
+            (UV_ODD & (0xFFFF_FFFFu32 << 2)) | (1u32 << 1),
+            "the level-1 ancestor of an odd uv"
+        );
+        // The walk's own gate: the device's position must agree with the slot's
+        // above the ancestor's own lowest set bit.
+        let dev_v_mask = calc_v_mask(UV_ODD_ANC);
+        assert_eq!(UV_ODD & dev_v_mask, UV_ODD_ANC & dev_v_mask);
+    }
+
+    /// `recover_dk_position` must find the ancestor position of an ODD-`uv`
+    /// slot and derive its Media Key. Depth 0 is where the descent's lower bound
+    /// is at its arithmetic edge; a wrong bound either underflows or starts the
+    /// scan at the slot's own level, and in both cases a device key that DOES
+    /// open the disc is reported as not applying.
+    #[test]
+    fn recover_dk_position_descends_from_an_odd_uv_slot_at_tree_depth_zero() {
+        let (mkb, dkey, mk, pk) = plant_odd_uv_mkb();
+
+        let recovered =
+            recover_dk_position(&mkb, &dkey).expect("the planted key opens the odd-uv slot");
+
+        assert_eq!(
+            recovered.uv, UV_ODD_ANC,
+            "the recovered position is the level-1 ancestor, not the slot itself"
+        );
+        assert_eq!(recovered.u_mask_shift, U_MASK_SHIFT_ODD);
+        assert_eq!(
+            derive_media_key_from_dk(&mkb, std::slice::from_ref(&recovered)),
+            Some(mk),
+            "the recovered position must walk the odd-uv slot to its Media Key"
+        );
+
+        // The Processing Key the walk produces at that position is the explicit
+        // one-level descent, not the zero-descent key.
+        assert_eq!(
+            derive_media_key_and_pk_from_dk(&mkb, std::slice::from_ref(&recovered)),
+            Some((mk, pk))
+        );
+        assert_ne!(pk, aesg3(&dkey, 1), "this is NOT the zero-descent key");
+    }
+
+    /// The negative direction on the same odd-`uv` MKB: a key that does not open
+    /// it must sweep every descent level (1..32 — the full range, since the slot
+    /// is at depth 0) and return `None`, without underflowing the lower bound or
+    /// shifting a `u32` by 32 at the top of the range.
+    #[test]
+    fn an_odd_uv_slot_sweeps_every_descent_level_without_arithmetic_overflow() {
+        let (mkb, dkey, _mk, _pk) = plant_odd_uv_mkb();
+        let mut stranger = dkey;
+        stranger[0] ^= 0x01;
+        assert!(
+            recover_dk_position(&mkb, &stranger).is_none(),
+            "a key one bit off must not be handed a position"
+        );
+    }
 }
