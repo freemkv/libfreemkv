@@ -744,6 +744,12 @@ mod tests {
 
     /// A CLEAR trailing partial (encrypted flag NOT set) is a legitimate content
     /// tail and must pass through, never trip the guard above.
+    ///
+    /// "Passes through" means byte-for-byte unchanged, not merely `Ok`. Asserting
+    /// only `is_ok()` let a mutant that corrupts the clear partial while still
+    /// returning `Ok` pass — which is the whole failure this test names.
+    /// Mutation: XOR any byte of the tail before returning -> the snapshot
+    /// comparison fails.
     #[test]
     fn aacs_clear_trailing_partial_passes_through() {
         let keys = DecryptKeys::Aacs {
@@ -755,8 +761,14 @@ mod tests {
         let mut tail = clear_ts_region(4096);
         tail[0] &= 0x3F; // ensure the CPI bits are clear
         buf.extend_from_slice(&tail);
+        let snapshot = buf.clone();
         let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
-        assert!(decrypt_sectors_mapped(&mut buf, &keys, 0, &map).is_ok());
+        decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
+            .expect("a clear trailing partial is legitimate content");
+        assert_eq!(
+            buf, snapshot,
+            "a clear trailing partial must pass through byte-for-byte, not just return Ok"
+        );
     }
 
     // ── DecryptKeys::None and is_encrypted ─────────────────────────────────
@@ -1048,34 +1060,12 @@ mod tests {
 
     // ── Multi-CPS-unit key selection ──────────────────────────────────────
 
-    /// Encrypt an aligned unit with the AACS algorithm run in reverse so that
-    /// `aacs::content::decrypt_unit` with the same key recovers the plaintext. Mirrors
-    /// the `aacs_encrypt_unit` helper in `aacs::content::tests`.
+    /// Encrypt an aligned unit so `aacs::content::decrypt_unit` with the same key
+    /// recovers the plaintext, flagging it encrypted first (bytes 0..16 are the key
+    /// seed, so the flag must be set before the crypto runs).
     fn aacs_encrypt_unit_for_test(unit: &mut [u8], unit_key: &[u8; 16]) {
-        use aes::Aes128;
-        use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-        // CPI bits on byte 0 so the unit reads as encrypted; set before deriving
-        // the per-unit key so the recovered plaintext header matches.
         unit[0] |= 0xC0;
-        let header: [u8; 16] = unit[..16].try_into().unwrap();
-        let derived = crate::aacs::crypto::aes_ecb_encrypt(unit_key, &header);
-        let mut k = [0u8; 16];
-        for i in 0..16 {
-            k[i] = derived[i] ^ header[i];
-        }
-        let cipher = Aes128::new(GenericArray::from_slice(&k));
-        let mut prev = crate::aacs::crypto::AACS_IV;
-        let num_blocks = (aacs::content::ALIGNED_UNIT_LEN - 16) / 16;
-        for i in 0..num_blocks {
-            let off = 16 + i * 16;
-            for j in 0..16 {
-                unit[off + j] ^= prev[j];
-            }
-            let mut block = GenericArray::clone_from_slice(&unit[off..off + 16]);
-            cipher.encrypt_block(&mut block);
-            unit[off..off + 16].copy_from_slice(&block);
-            prev.copy_from_slice(&unit[off..off + 16]);
-        }
+        aacs::content::encrypt_unit(unit, unit_key);
     }
 
     /// Build a clear aligned unit with TS sync bytes placed at the BD-TS stride

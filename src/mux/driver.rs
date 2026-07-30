@@ -1523,7 +1523,9 @@ mod tests {
         let pkt = bdts_data_packet(0x1100, true, &audio_pes(&es));
         let mut unit = vec![0u8; 3 * 2048]; // one 6144-byte aligned unit
         unit[..192].copy_from_slice(&pkt);
-        crate::aacs::content::aacs_encrypt_unit_for_test(&mut unit, unit_key);
+        // Flag encrypted BEFORE encrypting: bytes 0..16 are the key seed.
+        unit[0] |= 0xC0;
+        crate::aacs::content::encrypt_unit(&mut unit, unit_key);
         unit
     }
 
