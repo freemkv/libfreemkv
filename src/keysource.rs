@@ -352,6 +352,29 @@ pub fn resolve_and_apply_traced(
             }
             // Empty (no key here) or a source failure — both are "no key from
             // this source"; move on to the next.
+            //
+            // NOTE: the `Err` half is currently UNREACHABLE in production, and the
+            // conflation below is therefore latent rather than live. Every shipped
+            // `KeySource` swallows its own failures into `Ok(Vec::new())`:
+            // `KeydbSource::get_unit_keys` maps a load/parse error to an empty vec,
+            // `OnlineSource::get_unit_keys` is `Ok(self.query(ctx))` where `query`
+            // returns empty on transport error, HTTP status, oversize body and bad
+            // JSON alike, and `MultiSource` discards inner `Err`s. Only test doubles
+            // return `Err`.
+            //
+            // Consequence: an unreachable key server arrives here as "no entry",
+            // and an operator is told their disc is not in the database. autorip
+            // works around it by re-probing the service over HTTP
+            // (`probe_online_reachability` / `key_service_transient_status`), whose
+            // own comment names the incident — "the online keysource swallows every
+            // failure (transport error, 502, timeout)".
+            //
+            // Fixing it HERE would change nothing: the fix belongs at the source
+            // boundary in `freemkv-keysources`, so a failure is reported as a
+            // failure, with `Disc::aacs_error` as the channel the operator actually
+            // reads. `FetchOutcome::errored` in `drive_unit_keys` /
+            // `drive_fmts_indexes` is dead for the same reason — it is the right
+            // contract, honoured by no source yet.
             Ok(_) | Err(_) => {
                 trace.keys.push(KeyStep {
                     who,
