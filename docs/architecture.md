@@ -96,7 +96,7 @@ After open:
 - `init()` -- routes to the matching registered unlocker (if any); otherwise
   a no-op and the cert handshake carries the disc
 - `probe_disc()` -- probe disc surface for optimal speeds
-- `read(lba, count, buf, recovery)` -- single-shot read; `recovery` only selects the per-CDB timeout (1.5 s vs. 30 s)
+- `read(lba, count, buf, recovery)` -- single-shot read; `recovery` only selects the per-CDB timeout (`READ_TIMEOUT_MS` 10 s vs. `READ_RECOVERY_TIMEOUT_MS` 60 s)
 - `wait_ready()` -- wait for disc insertion
 - `eject()` -- eject tray
 
