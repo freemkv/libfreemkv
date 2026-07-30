@@ -1370,6 +1370,73 @@ mod tests {
         assert_eq!(p[0].data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
+    /// `is_nav()` exists to separate the ONE unmappable stream a DVD is expected
+    /// to contain — private_stream_2 (0xBF), the PCI/DSI navigation packs
+    /// (ISO/IEC 13818-1 Table 2-22) — from every other packet whose `dvd_pid()`
+    /// comes back `None`, which is an unexpected, possibly-lost real stream. The
+    /// mux loops use the distinction to choose between a silent tally and a
+    /// per-packet WARN, so collapsing it to a constant either buries a genuine
+    /// stream loss in the nav tally, or floods the log with one warning per
+    /// navigation pack on every DVD ever ripped.
+    ///
+    /// The invariant that ties the two together: `is_nav()` may only ever be true
+    /// where `dvd_pid()` is `None` — a packet that routes to a real track must
+    /// never be silently classified as navigation.
+    #[test]
+    fn only_private_stream_2_is_navigation_and_never_a_routable_stream() {
+        // Demux a program stream carrying, in order: a navigation pack, MPEG-2
+        // video, an AC-3 audio substream, and an MPEG audio stream (unmappable on
+        // DVD, but NOT navigation).
+        let mut demuxer = PsDemuxer::new();
+        let mut data = Vec::new();
+        // private_stream_2: no PES extension, payload follows the 6-byte prefix.
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0xBF, 0x00, 0x02, 0x00, 0x01]);
+        // video 0xE0
+        data.extend_from_slice(&[
+            0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x11, 0x22,
+        ]);
+        // private_stream_1 with AC-3 sub-stream 0x80 (4 bytes of substream header
+        // follow the sub-id on DVD).
+        data.extend_from_slice(&[
+            0x00, 0x00, 0x01, 0xBD, 0x00, 0x0A, 0x80, 0x00, 0x00, 0x80, 0x01, 0x00, 0x03, 0x00,
+            0xAA, 0xBB,
+        ]);
+        // MPEG audio 0xC0
+        data.extend_from_slice(&[
+            0x00, 0x00, 0x01, 0xC0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x33, 0x44,
+        ]);
+        data.extend_from_slice(&PROGRAM_END);
+
+        let packets = demuxer.feed(&data);
+        assert_eq!(packets.len(), 4, "four PES packets demuxed");
+
+        let nav: Vec<u8> = packets
+            .iter()
+            .filter(|p| p.is_nav())
+            .map(|p| p.stream_id)
+            .collect();
+        assert_eq!(
+            nav,
+            vec![0xBF],
+            "exactly the private_stream_2 pack is navigation"
+        );
+
+        for p in &packets {
+            if p.is_nav() {
+                assert_eq!(
+                    p.dvd_pid(),
+                    None,
+                    "a navigation pack must not also route to a track"
+                );
+            }
+        }
+        // The MPEG-audio packet is equally unroutable on DVD, yet must NOT be
+        // absorbed into the nav tally — that is the distinction being drawn.
+        let mpa = packets.iter().find(|p| p.stream_id == 0xC0).unwrap();
+        assert_eq!(mpa.dvd_pid(), None, "MPEG audio is unmappable on DVD");
+        assert!(!mpa.is_nav(), "...but it is a lost stream, not navigation");
+    }
+
     #[test]
     fn unknown_start_code_is_skipped_not_parsed() {
         // A start code with an ID outside the known PS-layer set

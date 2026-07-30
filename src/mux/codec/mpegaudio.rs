@@ -183,6 +183,30 @@ mod tests {
         );
     }
 
+    /// Same contract as the ADTS gate: an MPEG-audio frame is dropped because
+    /// its header is invalid, and the header is exactly where a frame duration
+    /// (samples-per-frame for the layer, divided by the sampling rate) would
+    /// have to come from — see `mpa_verdict`'s doc comment. So the drop's
+    /// duration is reported as zero, not derived from rejected fields.
+    #[test]
+    fn dropped_frames_are_counted_but_their_duration_is_not_invented() {
+        let mut parser = MpegAudioParser::new();
+        // Reserved layer field (00) — rejected per ISO/IEC 11172-3.
+        let mut bad = mp3_frame(32);
+        bad[1] &= !0b0000_0110;
+        for i in 0..3 {
+            let out = parser.parse(&make_pes(bad.clone(), Some(i * 90_000)));
+            assert!(out.is_empty(), "an invalid MPEG-audio frame is not emitted");
+        }
+        assert_eq!(parser.dropped_frames(), 3, "every drop is counted");
+        assert_eq!(
+            parser.dropped_duration_ns(),
+            0,
+            "the duration comes from the header that just failed validation, so \
+             it is reported as unmeasured rather than guessed"
+        );
+    }
+
     #[test]
     fn reserved_version_field_is_dropped() {
         // version field = 01 (reserved) → rejected. byte1 = 111_01_01_1 = 0xEB

@@ -190,6 +190,33 @@ mod tests {
         );
     }
 
+    /// A dropped ADTS frame is dropped BECAUSE its header failed validation, so
+    /// the very fields a duration would come from (sampling_frequency_index, and
+    /// the 1024-samples-per-AAC-frame constant applied to it) are the ones known
+    /// to be untrustworthy. This gate therefore reports the drop's duration as
+    /// zero rather than deriving a number from a header it has just rejected —
+    /// the honest answer, and the one the count alongside it must be read with.
+    /// A nonzero constant here would report silence that was never measured.
+    #[test]
+    fn dropped_frames_are_counted_but_their_duration_is_not_invented() {
+        let mut parser = AdtsParser::new();
+        // Three frames whose sampling_frequency_index is a reserved value (13),
+        // so `adts_verdict` rejects each one.
+        let mut bad = adts_frame(32);
+        bad[2] = (bad[2] & 0b1100_0011) | (13 << 2);
+        for i in 0..3 {
+            let out = parser.parse(&make_pes(bad.clone(), Some(i * 90_000)));
+            assert!(out.is_empty(), "an invalid ADTS frame is not emitted");
+        }
+        assert_eq!(parser.dropped_frames(), 3, "every drop is counted");
+        assert_eq!(
+            parser.dropped_duration_ns(),
+            0,
+            "the duration comes from the header that just failed validation, so \
+             it is reported as unmeasured rather than guessed"
+        );
+    }
+
     #[test]
     fn reserved_sample_rate_index_is_dropped() {
         // sr_index = 13 (reserved). byte2 bits5..2 = 1101 → 0x34.
