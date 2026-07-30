@@ -74,9 +74,14 @@ pub fn set_decrypt_threads(n: usize) {
     DECRYPT_THREADS.store(clamped, Ordering::Relaxed);
     // Drop the existing pool. Next decrypt_pool() call rebuilds with
     // the new resolved thread count.
-    if let Ok(mut guard) = DECRYPT_POOL.write() {
-        *guard = None;
-    }
+    //
+    // Recover the guard on poisoning, exactly as `decrypt_pool` does. Skipping
+    // the swap on a poisoned lock silently kept the STALE pool alive while the
+    // atomic above already reported the new thread count, so the setting appeared
+    // to take effect and never did. The pool Arc is immutable once stored, so a
+    // prior panic cannot have left it half-written.
+    let mut guard = DECRYPT_POOL.write().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
 }
 
 /// Get (or lazily build) the active rayon thread pool. Returns an

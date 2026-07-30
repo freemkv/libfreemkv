@@ -361,12 +361,17 @@ fn dts_channel_layout(amode: usize, lfe: bool) -> u16 {
 fn ddts_box(c: &DtsConfig) -> Vec<u8> {
     // avg/max bitrate: computed from the core frame size × frame rate (the core
     // RATE field reads "open/variable" for lossless, so it's not usable directly).
-    let frames_per_sec = if c.frame_samples > 0 {
-        c.sample_rate as u64 / c.frame_samples as u64
+    // Rate is NOT integral in general (e.g. 48000 / 512 = 93.75 frames/s for a
+    // 512-sample core), so dividing first truncates and under-declares the
+    // bitrate. Multiply before dividing to keep the full precision, rounding to
+    // nearest so the declared value is not systematically low.
+    let bitrate = if c.frame_samples > 0 {
+        let num = c.core_size as u64 * 8 * c.sample_rate as u64;
+        let den = c.frame_samples as u64;
+        ((num + den / 2) / den).min(u32::MAX as u64) as u32
     } else {
         0
     };
-    let bitrate = (c.core_size as u64 * 8 * frames_per_sec) as u32;
 
     let mut out = Vec::new();
     out.extend_from_slice(&c.sample_rate.to_be_bytes()); // DTSSamplingFrequency
@@ -392,7 +397,11 @@ fn ddts_box(c: &DtsConfig) -> Vec<u8> {
     push(stream_construction, 5);
     push(c.lfe as u128, 1);
     push(c.amode as u128, 6);
-    push(c.core_size as u128, 14);
+    // CoreSize is 14 bits, but core_size = FSIZE + 1 and FSIZE is itself 14 bits,
+    // so a maximum-size core is 16384 — one past what the field can hold, and the
+    // `& ((1<<14)-1)` mask in `push` would wrap it to 0. Clamp: declaring 16383 is
+    // one byte short, declaring 0 tells a decoder the core is empty.
+    push((c.core_size as u128).min((1u128 << 14) - 1), 14);
     push(0, 1); // StereoDownmix
     push(0, 3); // RepresentationType
     push(c.channel_layout as u128, 16);
@@ -629,6 +638,39 @@ mod tests {
         let c = parse_dts(&frame(0xF3, 0xF4)).expect("amode 15 parses");
         assert_eq!(c.amode, 15);
         assert_eq!(c.channels, 8, "AMODE 15 core is 8 channels, not 6");
+    }
+
+    #[test]
+    fn ddts_core_size_clamps_instead_of_wrapping_to_zero() {
+        // core_size = FSIZE + 1 with FSIZE 14 bits, so its maximum is 16384 — one
+        // past the 14-bit ddts CoreSize field. Masking wrapped that to 0, telling a
+        // decoder the core frame is empty.
+        let c = DtsConfig {
+            sample_rate: 48_000,
+            channels: 6,
+            amode: 9,
+            lfe: true,
+            core_size: 16_384,
+            frame_samples: 512,
+            has_extension: false,
+            channel_layout: dts_channel_layout(9, true),
+        };
+        let b = ddts_box(&c);
+        // Decode CoreSize back out of the emitted box rather than restating the
+        // clamp. Layout: 8-byte box header, then DTSSamplingFrequency(4) +
+        // maxBitrate(4) + avgBitrate(4) + pcmSampleDepth(1) = 13 bytes, then the
+        // 56-bit packed tail. Within that tail CoreSize sits after
+        // FrameDuration(2) + StreamConstruction(5) + CoreLFEPresent(1) +
+        // CoreLayout(6) = 14 bits, so it occupies bits 14..28.
+        let tail = &b[8 + 13..];
+        assert!(tail.len() >= 4, "packed tail present");
+        let word = u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]);
+        let core_size = (word >> 4) & 0x3FFF;
+        assert_eq!(
+            core_size, 16_383,
+            "a 16384-byte core must be declared as the 14-bit maximum, not wrapped"
+        );
+        assert_ne!(core_size, 0, "wrapping to 0 declares an empty core frame");
     }
 
     #[test]
