@@ -109,6 +109,12 @@ pub(crate) struct AuAssembler {
     marks: VecDeque<Mark>,
     /// Absolute offsets of fragments flagged with an upstream discontinuity.
     disc_marks: VecDeque<u64>,
+    /// A `MAX_AU_BUFFER` backstop discard happened and no AU has been emitted
+    /// since. Sticky rather than an offset mark, because the bytes it refers to
+    /// no longer exist: the discard is followed by a pre-sync trim that would
+    /// retire any mark placed at the new base, and the gap must outlive that.
+    /// Consumed by the next AU to emit. See `discard_gap_before`.
+    pending_gap: bool,
     /// Incremental boundary-scan cursor: the offset into `buf` up to which the
     /// current AU has already been searched for its end without finding one. Each
     /// `push` resumes the boundary search from here instead of rescanning the
@@ -158,6 +164,7 @@ impl AuAssembler {
             base: 0,
             marks: VecDeque::new(),
             disc_marks: VecDeque::new(),
+            pending_gap: false,
             scan_pos: 0,
             seen_unit: false,
             opener_pos: 0,
@@ -177,6 +184,7 @@ impl AuAssembler {
             base: 0,
             marks: VecDeque::new(),
             disc_marks: VecDeque::new(),
+            pending_gap: false,
             scan_pos: 0,
             seen_unit: false,
             opener_pos: 0,
@@ -281,7 +289,7 @@ impl AuAssembler {
                     self.buf.drain(..drop);
                     self.base += drop as u64;
                     self.reset_scan();
-                    self.drop_marks_before(self.base);
+                    self.discard_gap_before(self.base);
                 }
                 break;
             };
@@ -323,7 +331,10 @@ impl AuAssembler {
                 dts = dts.or(m.dts);
                 source = source.or(m.source);
             }
-            let mut discontinuity = false;
+            // A backstop discard is a gap in its own right, independent of any
+            // upstream signal: bytes were thrown away, so this AU does not
+            // continue the last one emitted.
+            let mut discontinuity = std::mem::take(&mut self.pending_gap);
             if self.disc_marks.front().is_some_and(|&o| o < end_abs) {
                 discontinuity = true;
             }
@@ -486,6 +497,14 @@ impl AuAssembler {
         None
     }
 
+    /// Retire every mark that falls before `off`, timing and discontinuity
+    /// alike.
+    ///
+    /// This is the STREAM-START case: bytes ahead of the first AU boundary are
+    /// the tail of an access unit that began before we had sync, and there is
+    /// no prior AU for them to be discontinuous *from*. Carrying a mark forward
+    /// here would arm the resync gate at the head of every title and drop its
+    /// first GOP.
     fn drop_marks_before(&mut self, off: u64) {
         while self.marks.front().is_some_and(|m| m.off < off) {
             self.marks.pop_front();
@@ -493,6 +512,36 @@ impl AuAssembler {
         while self.disc_marks.front().is_some_and(|&o| o < off) {
             self.disc_marks.pop_front();
         }
+    }
+
+    /// Retire stale timing marks before `off` and record that a GAP occurred
+    /// there.
+    ///
+    /// This is the BACKSTOP case: `MAX_AU_BUFFER` bytes accumulated with no AU
+    /// start code in them, so the run is unusable and gets thrown away. Unlike
+    /// the stream-start trim above, there IS a prior AU here, and whatever
+    /// follows definitively does not continue it — a decoder handed the next
+    /// picture would resolve its references against frames separated from it by
+    /// megabytes of discarded data.
+    ///
+    /// So the discard is itself a discontinuity, whether or not the source
+    /// signalled one. It is recorded as a sticky flag rather than an offset
+    /// mark because a mark placed at the new base would be retired moments
+    /// later by the pre-sync trim that follows resync — the gap has to outlive
+    /// the bytes that caused it. It arms the resync gate, which drops to the
+    /// next keyframe instead of emitting a picture with dangling references.
+    ///
+    /// Timing marks before `off` are still retired — they describe bytes that
+    /// no longer exist, and the AU that eventually emits takes its PTS from the
+    /// fragment that actually opened it.
+    fn discard_gap_before(&mut self, off: u64) {
+        while self.marks.front().is_some_and(|m| m.off < off) {
+            self.marks.pop_front();
+        }
+        while self.disc_marks.front().is_some_and(|&o| o < off) {
+            self.disc_marks.pop_front();
+        }
+        self.pending_gap = true;
     }
 }
 
@@ -896,6 +945,119 @@ mod tests {
             a.disc_marks.len() <= MAX_MARKS,
             "disc_marks bounded at MAX_MARKS, got {}",
             a.disc_marks.len()
+        );
+    }
+
+    /// The 8 MiB backstop throws away a start-code-free run as unusable. The
+    /// AU that eventually emits after that discard MUST be marked
+    /// discontinuous, whether or not the source ever signalled a
+    /// discontinuity: megabytes of the stream are simply gone, so the next
+    /// picture cannot resolve its references against the last one that was
+    /// emitted.
+    ///
+    /// `discontinuity` is what arms the resync gate downstream
+    /// (`resync.rs`, driven from `mux/disc.rs`), which drops to the next
+    /// keyframe rather than emitting a picture with dangling references. If the
+    /// flag is retired with the discarded bytes, the gate never arms and the
+    /// broken picture goes out — a silent corruption, which is the one class of
+    /// loss this crate refuses to have.
+    #[test]
+    fn a_backstop_discard_marks_the_next_au_discontinuous() {
+        let mut a = AuAssembler::for_codec(Codec::H264);
+
+        // A clean AU first, so there IS a prior AU to be discontinuous from.
+        let first = au(0x11, 64);
+        let mut stream = first.clone();
+        stream.extend_from_slice(AUD);
+        let out = a.push(&stream, Some(1000), None, None, false);
+        assert_eq!(out.len(), 1, "the first AU emits normally");
+        assert!(
+            !out[0].discontinuity,
+            "an ordinary AU at the head of a clean run is continuous"
+        );
+
+        // Now start-code-free junk past the cap. The FIRST over-cap run still
+        // has the next AU's delimiter at buf[0], so it is force-flushed as an
+        // (over-long) access unit — nothing is discarded and nothing is lost.
+        // Only once the buffer holds no opener at all does the backstop throw
+        // bytes away, which is the case this test is about.
+        let junk = vec![0xAB; MAX_AU_BUFFER + 4096];
+        a.push(&junk, Some(2000), None, None, false);
+        a.push(&junk, Some(2100), None, None, false);
+
+        // Resync: a fresh AU, followed by the delimiter that closes it.
+        let mut resumed = au(0x22, 64);
+        resumed.extend_from_slice(AUD);
+        let out = a.push(&resumed, Some(3000), None, None, false);
+
+        let au2 = out
+            .iter()
+            .find(|x| x.data.contains(&0x22))
+            .expect("the post-gap AU must emit");
+        assert!(
+            au2.discontinuity,
+            "the AU following an 8 MiB backstop discard follows a gap and must \
+             say so; without the flag the resync gate never arms and a picture \
+             with dangling references is emitted as if it were sound"
+        );
+    }
+
+    /// The opposite case, and the reason the two call sites are separate.
+    ///
+    /// Bytes ahead of the FIRST access-unit delimiter are the tail of an AU
+    /// that began before we had sync. There is no prior AU for them to be
+    /// discontinuous from, so retiring the marks there is right — and
+    /// necessary: marking the first AU of every title discontinuous would arm
+    /// the resync gate at the head of each one and drop its opening GOP.
+    #[test]
+    fn a_stream_start_trim_does_not_mark_the_first_au_discontinuous() {
+        let mut a = AuAssembler::for_codec(Codec::H264);
+
+        // Junk BEFORE the first delimiter — a partial AU from before sync.
+        // Small enough that the backstop never fires; this is the a0 > 0 path.
+        let mut stream = vec![0xCD; 512];
+        stream.extend_from_slice(&au(0x33, 64));
+        stream.extend_from_slice(AUD);
+
+        let out = a.push(&stream, Some(1000), None, None, false);
+        let first = out.first().expect("the first synced AU must emit");
+        assert!(
+            !first.discontinuity,
+            "trimming pre-sync bytes at stream start is not a gap in the \
+             stream; flagging it would drop the opening GOP of every title"
+        );
+    }
+
+    /// A discontinuity the SOURCE signalled, on bytes the backstop later throws
+    /// away, must not be lost either — the gap is real regardless of which
+    /// mechanism noticed it first, and the two must not cancel out.
+    #[test]
+    fn a_signalled_discontinuity_survives_a_backstop_discard() {
+        let mut a = AuAssembler::for_codec(Codec::H264);
+
+        let mut stream = au(0x11, 64);
+        stream.extend_from_slice(AUD);
+        a.push(&stream, Some(1000), None, None, false);
+
+        // The source says this fragment follows a gap, AND it is start-code-free
+        // and long enough to trip the backstop. Two runs, so the second reaches
+        // the discard rather than the force-flush (see the test above).
+        let junk = vec![0xAB; MAX_AU_BUFFER + 4096];
+        a.push(&junk, Some(2000), None, None, true);
+        a.push(&junk, Some(2100), None, None, false);
+
+        let mut resumed = au(0x22, 64);
+        resumed.extend_from_slice(AUD);
+        let out = a.push(&resumed, Some(3000), None, None, false);
+
+        let au2 = out
+            .iter()
+            .find(|x| x.data.contains(&0x22))
+            .expect("the post-gap AU must emit");
+        assert!(
+            au2.discontinuity,
+            "a source-signalled discontinuity on discarded bytes must still \
+             reach the AU that follows them"
         );
     }
 
