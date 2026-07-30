@@ -64,10 +64,33 @@ impl StreamSelection {
 
         // Validate every listed PID exists in the title before mutating, so an
         // unknown PID leaves the title untouched (no partial prune).
-        for pid in self.listed_pids() {
-            let present = title.streams.iter().any(|s| stream_pid(s) == Some(pid));
-            if !present {
-                return Err(Error::SelectionPidUnknown { pid });
+        //
+        // Validate PER CLASS. Scanning both classes let a PID listed in the WRONG
+        // filter pass validation — an audio filter naming a subtitle PID, say —
+        // and `keeps` then matches it against the audio streams only, so the
+        // requested track is silently absent from the output. That is exactly the
+        // "fail loud rather than silently emit an MKV missing a requested track"
+        // contract this validation exists to enforce.
+        if let PidFilter::Only(pids) = &self.audio {
+            for &pid in pids {
+                let present = title
+                    .streams
+                    .iter()
+                    .any(|s| matches!(s, Stream::Audio(_)) && stream_pid(s) == Some(pid));
+                if !present {
+                    return Err(Error::SelectionPidUnknown { pid });
+                }
+            }
+        }
+        if let PidFilter::Only(pids) = &self.subtitle {
+            for &pid in pids {
+                let present = title
+                    .streams
+                    .iter()
+                    .any(|s| matches!(s, Stream::Subtitle(_)) && stream_pid(s) == Some(pid));
+                if !present {
+                    return Err(Error::SelectionPidUnknown { pid });
+                }
             }
         }
 
@@ -104,18 +127,6 @@ impl StreamSelection {
             Stream::Audio(a) => filter_keeps(&self.audio, a.pid),
             Stream::Subtitle(s) => filter_keeps(&self.subtitle, s.pid),
         }
-    }
-
-    /// Every PID explicitly listed across both filters (for existence checking).
-    fn listed_pids(&self) -> Vec<u16> {
-        let mut v = Vec::new();
-        if let PidFilter::Only(pids) = &self.audio {
-            v.extend_from_slice(pids);
-        }
-        if let PidFilter::Only(pids) = &self.subtitle {
-            v.extend_from_slice(pids);
-        }
-        v
     }
 }
 
@@ -294,6 +305,52 @@ mod tests {
             t.codec_privates,
             vec![Some(vec![0xAA]), Some(vec![0x11])],
             "codec_privates pruned to match the retained streams, in order"
+        );
+    }
+    /// A PID listed in the WRONG class's filter must fail loud, not validate and
+    /// then quietly vanish. Validation used to scan both audio and subtitle
+    /// streams, so an audio filter naming a subtitle PID passed — and `keeps`
+    /// then matched it against audio streams only, dropping the requested track
+    /// from the output with no error. That defeats the documented "fail loud
+    /// rather than silently emit an MKV missing a requested track" contract.
+    #[test]
+    fn a_pid_listed_in_the_wrong_class_filter_is_rejected() {
+        let mut t = title();
+        let before = t.streams.len();
+
+        // 0x1200 is a SUBTITLE pid, listed here in the AUDIO filter.
+        let sel = StreamSelection {
+            audio: PidFilter::Only(vec![0x1200]),
+            subtitle: PidFilter::All,
+        };
+        assert!(
+            sel.apply(&mut t).is_err(),
+            "a subtitle PID in the audio filter must be rejected"
+        );
+        assert_eq!(
+            t.streams.len(),
+            before,
+            "a rejected selection must not prune"
+        );
+
+        // And the mirror case: an audio pid listed in the subtitle filter.
+        let sel = StreamSelection {
+            audio: PidFilter::All,
+            subtitle: PidFilter::Only(vec![0x1100]),
+        };
+        assert!(
+            sel.apply(&mut t).is_err(),
+            "an audio PID in the subtitle filter must be rejected"
+        );
+
+        // Sanity: each PID in its OWN class still validates.
+        let sel = StreamSelection {
+            audio: PidFilter::Only(vec![0x1100]),
+            subtitle: PidFilter::Only(vec![0x1200]),
+        };
+        assert!(
+            sel.apply(&mut t).is_ok(),
+            "correctly-classed PIDs must apply"
         );
     }
 }
