@@ -76,7 +76,7 @@ pub struct Disc {
 }
 
 /// Content format — determines how sectors are interpreted downstream.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContentFormat {
     /// Blu-ray BD Transport Stream (192-byte packets)
     BdTs,
@@ -2396,14 +2396,22 @@ impl Disc {
         halt: Option<&crate::halt::Halt>,
     ) -> Result<crate::decrypt::AacsKeyMap> {
         let mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)> = Vec::new();
+        // One multi-CPS extent cache across every title. A disc's playlists
+        // overwhelmingly reference the same handful of clips (main feature,
+        // play-all, per-chapter and seamless-branch variants), so without this the
+        // same extents are re-sampled off the drive once per playlist — 8 random
+        // 6144-byte reads each, ~200 ms of seek apiece on a stock BD drive, all to
+        // recompute the same index from byte-identical input.
+        let mut cps_cache = crate::mux::resolve::CpsUnitCache::new();
         for title in &self.titles {
-            let map = crate::mux::resolve_mux_key_map(
+            let map = crate::mux::resolve::resolve_mux_key_map_cached(
                 reader,
                 title,
                 keys,
                 fetch,
                 self.content_format,
                 halt,
+                &mut cps_cache,
             )?;
             ranges.extend_from_slice(map.ranges());
         }

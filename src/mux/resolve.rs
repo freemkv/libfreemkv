@@ -1266,6 +1266,62 @@ pub fn resolve_mux_key_map(
     format: ContentFormat,
     halt: Option<&crate::halt::Halt>,
 ) -> io::Result<crate::decrypt::AacsKeyMap> {
+    // One-shot: a single title shares no extents with anything, so a fresh cache
+    // never hits. Multi-title callers use `resolve_mux_key_map_cached` instead.
+    resolve_mux_key_map_cached(
+        reader,
+        title,
+        keys,
+        fetch,
+        format,
+        halt,
+        &mut CpsUnitCache::new(),
+    )
+}
+
+/// Memoises the multi-CPS "which held unit key opens this extent" decision across
+/// the titles of ONE disc, for [`resolve_mux_key_map_cached`].
+///
+/// Keyed by content format plus the extent's exact `(start_lba, sector_count)`, so
+/// a hit returns the index that was resolved from *those same physical bytes* —
+/// see the safety argument on [`resolve_mux_key_map_cached`]. Only successfully
+/// resolved extents are memoised; a no-samples extent (whose index is inherited
+/// from the preceding extent of the SAME title, i.e. not a property of the extent)
+/// and the fail-loud "no key opens it" outcome are never cached.
+///
+/// A disc's playlists overwhelmingly reference the same handful of clips (main
+/// feature, play-all, per-chapter and seamless-branch variants), so without this
+/// the same extents are re-sampled off the drive once per playlist: 8 random
+/// 6144-byte reads each, ~200 ms of seek apiece on a stock BD drive.
+pub(crate) type CpsUnitCache = std::collections::HashMap<(ContentFormat, u32, u32), usize>;
+
+/// [`resolve_mux_key_map`] with a caller-owned multi-CPS extent cache
+/// ([`CpsUnitCache`]) shared across the titles of one disc.
+///
+/// # Why a cache cannot change a resolved key
+///
+/// The cached value is the pool index `pick` chose for an extent, and every input
+/// to that choice is stable across the titles of one disc:
+///
+/// * The samples are a deterministic function of the extent's `(start_lba,
+///   sector_count)` and `format` — both in the key — read from unchanging media.
+/// * The key pool is APPEND-only here (base-key fetch and the FMTS resolver only
+///   push), and `pick` returns the FIRST pool entry that opens a sample, so a
+///   later, longer pool yields the same first match for the same samples.
+/// * [`crate::sector::KeyFetch`] is stateless by contract, and any key a hit's
+///   index refers to was already banked into the pool on the miss that filled the
+///   entry — so skipping the re-fetch skips no side effect the map depends on.
+///
+/// Halt is still polled per extent, so cancellation behaves as before.
+pub(crate) fn resolve_mux_key_map_cached(
+    reader: &mut dyn SectorSource,
+    title: &DiscTitle,
+    keys: &mut crate::decrypt::DecryptKeys,
+    fetch: Option<&crate::sector::KeyFetch>,
+    format: ContentFormat,
+    halt: Option<&crate::halt::Halt>,
+    cache: &mut CpsUnitCache,
+) -> io::Result<crate::decrypt::AacsKeyMap> {
     use crate::aacs::content::{
         ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted, decrypt_unit, is_clean,
     };
@@ -1342,6 +1398,18 @@ pub fn resolve_mux_key_map(
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(crate::error::Error::Halted.into());
         }
+        // Already resolved for this exact extent (a clip another playlist shares):
+        // reuse the index instead of re-sampling the same physical units.
+        let ck = (format, ext.start_lba, ext.sector_count);
+        if let Some(&hit) = cache.get(&ck) {
+            last_idx = hit;
+            ranges.push((
+                ext.start_lba,
+                ext.start_lba.saturating_add(ext.sector_count),
+                hit,
+            ));
+            continue;
+        }
         let samples = sample_units(reader, ext.start_lba, ext.sector_count);
         // Snapshot the current pool for the pure `pick` closure.
         let pool: Vec<(u32, [u8; 16])> = match keys {
@@ -1373,8 +1441,18 @@ pub fn resolve_mux_key_map(
         // encrypted content is classified. An extent with no sampleable encrypted
         // units (nothing to mis-decrypt) carries the previous index harmlessly.
         let idx = match idx {
-            Some(i) => i,
+            // A real decision from this extent's own ciphertext — memoise it.
+            Some(i) => {
+                cache.insert(ck, i);
+                i
+            }
+            // Inherited from the PRECEDING extent of THIS title, so it is not a
+            // property of this extent: never cache it (another title reaching the
+            // same extent may carry a different previous index).
             None if samples.is_empty() => last_idx,
+            // Fail-loud, and not cached: a later extent's fetch may bank the key
+            // that opens this one, so a retry must re-sample rather than inherit a
+            // stale verdict.
             None => return Err(crate::error::Error::DecryptFailed.into()),
         };
         last_idx = idx;
@@ -2949,6 +3027,364 @@ mod tests {
             map.key_idx_for(start),
             Some(2),
             "the fetched key is appended at pool index 2 and keys the extent"
+        );
+    }
+
+    // ── Multi-CPS extent cache: shared clips are sampled ONCE per disc ───────
+
+    /// LBA below which a read is disc metadata, not content sampling: the FMTS
+    /// branch probes the UDF anchor/metadata before concluding "not an FMTS disc",
+    /// and every content extent in these tests starts at or above this.
+    const CONTENT_LBA_FLOOR: u32 = 1000;
+
+    /// [`CipherSource`] plus a counter of CONTENT reads (`lba >=
+    /// CONTENT_LBA_FLOOR`) — the `sample_units` probes whose cost this cache
+    /// exists to remove. Low-LBA UDF metadata probes are excluded so the counts
+    /// speak only about extent sampling.
+    struct CountingCipherSource {
+        inner: CipherSource,
+        probes: u32,
+    }
+    impl CountingCipherSource {
+        fn new(units: Vec<(u32, u32, Vec<u8>)>) -> Self {
+            Self {
+                inner: CipherSource { units },
+                probes: 0,
+            }
+        }
+    }
+    impl SectorSource for CountingCipherSource {
+        fn capacity_sectors(&self) -> u32 {
+            self.inner.capacity_sectors()
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if lba >= CONTENT_LBA_FLOOR {
+                self.probes += 1;
+            }
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    /// A disc's playlists overwhelmingly share clips, and the multi-CPS path issues
+    /// 8 random 6144-byte reads per extent. The SECOND title over the same extent
+    /// must cost ZERO further reads and resolve the SAME index; a DIFFERENT extent
+    /// must still be sampled and get its own index.
+    ///
+    /// Mutation: dropping the `cache.get` short-circuit re-samples → the
+    /// zero-further-reads assert fails. Caching the wrong index (e.g. inserting
+    /// `last_idx`) breaks the same-index asserts.
+    #[test]
+    fn multi_cps_shared_extent_is_served_from_cache_not_resampled() {
+        let key_a = [0x01u8; 16];
+        let key_b = [0x02u8; 16];
+        let key_c = [0x03u8; 16];
+        let shared_start = 1000u32; // ciphertext under key_c → pool index 2
+        let other_start = 9000u32; // ciphertext under key_b → pool index 1
+        let sectors = 30u32; // 10 aligned units → all 8 probes land
+        let mut reader = CountingCipherSource::new(vec![
+            (
+                shared_start,
+                shared_start + sectors,
+                encrypted_clean_unit(&key_c),
+            ),
+            (
+                other_start,
+                other_start + sectors,
+                encrypted_clean_unit(&key_b),
+            ),
+        ]);
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b), (2, key_c)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let mut cache = super::CpsUnitCache::new();
+
+        let title = multi_cps_title(shared_start, sectors);
+        let first = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("first title resolves");
+        let after_first = reader.probes;
+        assert_eq!(
+            after_first, 8,
+            "the first title must actually sample the extent (8 probes)"
+        );
+        assert_eq!(first.key_idx_for(shared_start), Some(2));
+
+        // Same clip referenced by another playlist → cache hit, no further reads.
+        let second = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("second title resolves");
+        assert_eq!(
+            reader.probes, after_first,
+            "an identical extent must be served from cache with no further reads"
+        );
+        assert_eq!(
+            second.key_idx_for(shared_start),
+            first.key_idx_for(shared_start),
+            "the cached index must equal the one originally resolved"
+        );
+
+        // A DIFFERENT extent is a miss: it must still be sampled, and must get its
+        // OWN index (1), never the cached neighbour's (2).
+        let third = multi_cps_title(other_start, sectors);
+        let map = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &third,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("a different extent resolves");
+        assert_eq!(
+            reader.probes,
+            after_first + 8,
+            "a different extent must not hit the cache"
+        );
+        assert_eq!(
+            map.key_idx_for(other_start),
+            Some(1),
+            "each distinct extent keeps its own resolved index"
+        );
+    }
+
+    /// The cached index must be exactly what a full recompute produces: resolve the
+    /// same title twice, once through a warm shared cache and once through a cold
+    /// one (a real re-read), and compare the maps range for range.
+    ///
+    /// Mutation: caching under a key that ignores `start_lba`/`sector_count`, or
+    /// storing anything but `pick`'s index, diverges here.
+    #[test]
+    fn multi_cps_cache_hit_matches_a_full_recompute() {
+        let key_a = [0x01u8; 16];
+        let key_b = [0x02u8; 16];
+        let key_c = [0x03u8; 16];
+        let units = vec![
+            (1000u32, 1030u32, encrypted_clean_unit(&key_c)),
+            (9000u32, 9030u32, encrypted_clean_unit(&key_b)),
+        ];
+        let mut title = DiscTitle::empty();
+        title.extents = vec![
+            Extent {
+                start_lba: 1000,
+                sector_count: 30,
+            },
+            Extent {
+                start_lba: 9000,
+                sector_count: 30,
+            },
+        ];
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b), (2, key_c)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+
+        // Warm a cache, then serve the whole title from it.
+        let mut warm = CountingCipherSource::new(units.clone());
+        let mut cache = super::CpsUnitCache::new();
+        for _ in 0..2 {
+            super::resolve_mux_key_map_cached(
+                &mut warm,
+                &title,
+                &mut keys,
+                None,
+                ContentFormat::BdTs,
+                None,
+                &mut cache,
+            )
+            .expect("warm resolve");
+        }
+        let cached = super::resolve_mux_key_map_cached(
+            &mut warm,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("cached resolve");
+
+        // The same title resolved from scratch, re-reading every unit.
+        let mut cold = CountingCipherSource::new(units);
+        let recomputed = super::resolve_mux_key_map_cached(
+            &mut cold,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut super::CpsUnitCache::new(),
+        )
+        .expect("cold resolve");
+
+        assert_eq!(
+            cached.ranges(),
+            recomputed.ranges(),
+            "a cache hit must produce byte-for-byte the same map as a recompute"
+        );
+        assert_eq!(cold.probes, 16, "the cold resolve samples both extents");
+        assert_eq!(
+            warm.probes, 16,
+            "the warm reader samples each extent exactly once across three resolves"
+        );
+    }
+
+    /// An extent with no sampleable encrypted units inherits the PRECEDING extent's
+    /// index — per-title state, not a property of the extent — so it must never be
+    /// memoised. Title A reaches the clear extent carrying index 2, title B carries
+    /// index 1: B's clear extent must key to 1, not to A's cached 2.
+    ///
+    /// Mutation: caching the `samples.is_empty() => last_idx` arm makes B's clear
+    /// extent resolve to 2 and this fails.
+    #[test]
+    fn multi_cps_inherited_index_is_not_cached() {
+        let key_a = [0x01u8; 16];
+        let key_b = [0x02u8; 16];
+        let key_c = [0x03u8; 16];
+        let clear = 5000u32; // registered nowhere → reads as zeros → no samples
+        let mut reader = CountingCipherSource::new(vec![
+            (1000, 1030, encrypted_clean_unit(&key_c)), // → index 2
+            (9000, 9030, encrypted_clean_unit(&key_b)), // → index 1
+        ]);
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b), (2, key_c)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let mut cache = super::CpsUnitCache::new();
+
+        let mut with_c = DiscTitle::empty();
+        with_c.extents = vec![
+            Extent {
+                start_lba: 1000,
+                sector_count: 30,
+            },
+            Extent {
+                start_lba: clear,
+                sector_count: 30,
+            },
+        ];
+        let a = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &with_c,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("title A resolves");
+        assert_eq!(
+            a.key_idx_for(clear),
+            Some(2),
+            "a clear extent inherits the preceding extent's index"
+        );
+
+        let mut with_b = DiscTitle::empty();
+        with_b.extents = vec![
+            Extent {
+                start_lba: 9000,
+                sector_count: 30,
+            },
+            Extent {
+                start_lba: clear,
+                sector_count: 30,
+            },
+        ];
+        let b = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &with_b,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("title B resolves");
+        assert_eq!(
+            b.key_idx_for(clear),
+            Some(1),
+            "the inherited index must not be served from another title's cache entry"
+        );
+    }
+
+    /// A fail-loud extent (real ciphertext no key opens) must not be memoised: a
+    /// later retry, after a key source banked the missing key, has to re-sample and
+    /// succeed rather than inherit the earlier failure.
+    ///
+    /// Mutation: caching before the `None => Err(DecryptFailed)` arm (or caching the
+    /// error) leaves the retry unable to resolve.
+    #[test]
+    fn multi_cps_failed_extent_is_not_cached() {
+        let key_a = [0x01u8; 16];
+        let key_x = [0x09u8; 16];
+        let start = 1000u32;
+        let mut reader =
+            CountingCipherSource::new(vec![(start, start + 30, encrypted_clean_unit(&key_x))]);
+        let title = multi_cps_title(start, 30);
+        let mut cache = super::CpsUnitCache::new();
+
+        // Two held keys → the multi-CPS sampling path (a one-key pool short-circuits
+        // to index 0 without sampling); neither opens the extent → fail loud.
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, [0x02u8; 16])],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect_err("no held key opens the extent → fail loud");
+        assert!(cache.is_empty(), "a failed extent must not be memoised");
+
+        // The operator supplies the missing key; the retry must resolve it.
+        if let DecryptKeys::Aacs { unit_keys, .. } = &mut keys {
+            unit_keys.push((2, key_x));
+        }
+        let map = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("the retry resolves once the key is banked");
+        assert_eq!(
+            map.key_idx_for(start),
+            Some(2),
+            "the retry re-samples and resolves to the newly banked key"
         );
     }
 
