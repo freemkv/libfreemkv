@@ -4,7 +4,7 @@
 //! packets. Each frame is wrapped in a PES header, split into TS packets,
 //! and prepended with the 4-byte TP_extra_header.
 
-use super::hevc::{avcc_to_annex_b, hvcc_to_annex_b, length_prefixed_to_annex_b};
+use super::hevc::{append_length_prefixed_as_annex_b, avcc_to_annex_b, hvcc_to_annex_b};
 use crate::disc::Codec;
 use std::io::{self, Write};
 
@@ -181,7 +181,10 @@ impl<W: Write> TsMuxer<W> {
         // unchanged, so borrow `data` directly rather than copying it; only
         // NAL video needs an owned Annex-B conversion buffer.
         let es_data: std::borrow::Cow<'_, [u8]> = if is_video && self.is_nal_video(track) {
-            let mut annex_b = Vec::new();
+            // Size the buffer once for the whole frame. `Vec::new()` re-grew from
+            // zero capacity on every frame, reallocating repeatedly inside a single
+            // ~310 KB conversion. The slack covers any prepended parameter sets.
+            let mut annex_b = Vec::with_capacity(data.len() + 1024);
             if keyframe && !self.params_written[track] {
                 if let Some(ref cp) = self.codec_privates[track] {
                     // avcC and hvcC are DIFFERENT box layouts; parsing one with
@@ -198,7 +201,12 @@ impl<W: Write> TsMuxer<W> {
                 }
                 self.params_written[track] = true;
             }
-            annex_b.extend_from_slice(&length_prefixed_to_annex_b(data));
+            // Write the conversion STRAIGHT into the destination.
+            // `length_prefixed_to_annex_b` allocates a whole-frame Vec of its own
+            // and we then copied it in, so every video frame cost two full-frame
+            // allocations and two full-frame copies. At ~200k frames averaging
+            // ~310 KB of ES on a UHD, that is ~124 GB of pointless memcpy.
+            append_length_prefixed_as_annex_b(&mut annex_b, data);
             std::borrow::Cow::Owned(annex_b)
         } else {
             if is_video {
