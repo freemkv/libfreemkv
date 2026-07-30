@@ -2396,13 +2396,27 @@ impl Disc {
         halt: Option<&crate::halt::Halt>,
     ) -> Result<crate::decrypt::AacsKeyMap> {
         let mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)> = Vec::new();
-        // One multi-CPS extent cache across every title. A disc's playlists
-        // overwhelmingly reference the same handful of clips (main feature,
-        // play-all, per-chapter and seamless-branch variants), so without this the
-        // same extents are re-sampled off the drive once per playlist — 8 random
-        // 6144-byte reads each, ~200 ms of seek apiece on a stock BD drive, all to
-        // recompute the same index from byte-identical input.
-        let mut cps_cache = crate::mux::resolve::CpsUnitCache::new();
+        // ONE per-disc memo across every title. Without it every playlist re-derives
+        // the same disc-wide facts off the drive:
+        //
+        // * the multi-CPS "which held key opens this extent" decision — 8 random
+        //   6144-byte reads per extent, ~200 ms of seek apiece on a stock BD drive.
+        //   A disc's playlists overwhelmingly reference the same handful of clips
+        //   (main feature, play-all, per-chapter and seamless-branch variants), so
+        //   this recomputed the same index from byte-identical input;
+        // * the UDF walk + `/AACS/IndividualSegment.tbl` read that decides whether
+        //   the disc is FMTS at all — ~35 single-sector reads at low LBAs, reached
+        //   from a head the previous title's content sampling left deep in the
+        //   content area, so a full-stroke seek out and back per playlist. This
+        //   runs on EVERY disc, FMTS or not;
+        // * on an FMTS (AACS 2.1) disc, the forensic anchor probe, the per-index
+        //   phase probe AND the key-service round trip that returns the disc's
+        //   index-key set. That last one is the key-server storm: one round trip
+        //   per playlist for one disc-wide answer.
+        //
+        // The FMTS memos are what makes the multi-CPS memo reachable at all on an
+        // FMTS disc — that path returns its finished map before the extent loop.
+        let mut cache = crate::mux::resolve::DiscKeyCache::new();
         for title in &self.titles {
             let map = crate::mux::resolve::resolve_mux_key_map_cached(
                 reader,
@@ -2411,7 +2425,7 @@ impl Disc {
                 fetch,
                 self.content_format,
                 halt,
-                &mut cps_cache,
+                &mut cache,
             )?;
             ranges.extend_from_slice(map.ranges());
         }
