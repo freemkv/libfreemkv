@@ -1462,6 +1462,33 @@ mod tests {
             r >= 12 << 20 && r <= 20 << 20,
             "≈12-16 MB for a 2h feature, got {r}"
         );
+
+        // The case above is dominated by RESERVE_FLOOR + RESERVE_BUFFER: its
+        // per-sample term is ~6.4 MB, under the 8 MiB floor, so setting
+        // BYTES_PER_SAMPLE to 0 would leave it green. Pin a case where the
+        // per-sample estimate is what the result is MADE of.
+        //
+        // 2 hr, 23.976 fps HEVC + EIGHT AC-3 tracks (a commentary-heavy disc):
+        //   video  7200 × 24000/1001            = 172_627 samples
+        //   audio  8 × 7200 × (48000 / 1536)    = 1_800_000 samples
+        //   total  1_972_627 × 16 B             = 31_562_032 B (30.1 MiB)
+        // → round up to 8 grains = 32 MiB, + 4 MiB buffer = 36 MiB exactly.
+        // With BYTES_PER_SAMPLE = 0 this collapses to the 12 MiB floor+buffer.
+        let mut streams = vec![hevc_video()];
+        streams.extend((0..8).map(|_| audio(Codec::Ac3, "eng")));
+        let mut t = title(streams, vec![]);
+        t.duration_secs = 7200.0;
+        let included: Vec<usize> = (0..9).collect();
+        let r = estimate_reserve(&t, &included);
+        assert_eq!(
+            r,
+            36 << 20,
+            "per-sample term must dominate: 1.97M samples × 16 B → 32 MiB + 4 MiB buffer"
+        );
+        assert!(
+            r > RESERVE_FLOOR + RESERVE_BUFFER,
+            "this case must NOT be reachable from the floor alone"
+        );
     }
 
     #[test]

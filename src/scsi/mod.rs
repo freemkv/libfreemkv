@@ -41,6 +41,11 @@ pub const AACS_KEY_CLASS: u8 = 0x02;
 /// TUR is the cheapest SCSI op (no data transfer); 5 s is generous
 /// for any healthy bus and short enough that a hung device can't stall
 /// a poll-loop tick.
+///
+/// Used by the Linux and Windows backends. macOS answers the same question
+/// from the IOKit registry (no SCSI command is issued, so no timeout applies)
+/// — see `macos::drive_has_disc`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 
 /// Timeout for content READ commands (READ_10 / READ_12) on the fast
@@ -117,8 +122,14 @@ pub const SCSI_STATUS_TRANSPORT_FAILURE: u8 = 0xFF;
 /// Lives here, shared by all three platform backends, so the guard cannot
 /// drift per platform (it previously truncated on Linux and Windows while
 /// erroring on macOS — the "works on my platform, not theirs" class).
+/// An EMPTY CDB is rejected here too. `ScsiTransport` is a public trait, so an
+/// out-of-crate caller can pass one; every backend then either indexes `cdb[0]`
+/// (a panic out of a public API) or hands the driver a zero-length command
+/// descriptor, which under SPC-4 is not a command at all. That guard used to
+/// exist ONLY in the Linux backend — macOS and Windows had nothing — which is
+/// the same per-platform drift this helper exists to prevent.
 pub(crate) fn checked_cdb_len(cdb: &[u8], max: usize) -> Result<u8> {
-    if cdb.len() > max {
+    if cdb.is_empty() || cdb.len() > max {
         return Err(Error::InvalidCdbLength {
             len: cdb.len(),
             max,
@@ -165,17 +176,39 @@ mod cdb_len_tests {
     }
 
     /// Every real CDB length (SPC-4 groups 0-5: 6, 10, 12, 16 bytes) is
-    /// accepted and reported verbatim, and an empty CDB reports 0 — the
-    /// backends' own empty-CDB guards handle that case.
+    /// accepted and reported verbatim.
     #[test]
     fn in_range_cdb_lengths_pass_through_verbatim() {
-        for len in [0usize, 6, 10, 12, 16] {
+        for len in [6usize, 10, 12, 16] {
             let cdb = vec![0u8; len];
             assert_eq!(
                 checked_cdb_len(&cdb, MAX).ok(),
                 Some(len as u8),
                 "CDB of {len} bytes must be accepted verbatim"
             );
+        }
+    }
+
+    /// An EMPTY CDB must be rejected by the SHARED helper, not left to a
+    /// per-backend guard. It previously reported `Ok(0)` and only the Linux
+    /// backend caught it before `cdb[0]`; macOS and Windows passed a
+    /// zero-length command descriptor straight to the driver.
+    ///
+    /// This is the only place the property can be tested on every platform's
+    /// CI — none of `linux.rs` / `macos.rs` / `windows.rs` compiles on more
+    /// than one host.
+    #[test]
+    fn empty_cdb_is_rejected_by_the_shared_helper() {
+        match checked_cdb_len(&[], MAX) {
+            Err(Error::InvalidCdbLength { len, max }) => {
+                assert_eq!(len, 0);
+                assert_eq!(max, MAX);
+            }
+            Err(other) => panic!("expected InvalidCdbLength, got {other:?}"),
+            Ok(n) => panic!(
+                "empty CDB accepted with length {n} — every backend would then \
+                 index cdb[0] or issue a zero-length command descriptor"
+            ),
         }
     }
 }

@@ -434,19 +434,36 @@ mod tests {
     // Additional coverage.
     // ---------------------------------------------------------------
 
-    /// `count == 0` must short-circuit to Ok(0) WITHOUT seeking or
-    /// reading, even at an out-of-range LBA — the early-return guard
-    /// runs before any I/O. Grounding: `if count == 0 { return Ok(0) }`.
+    /// `count == 0` must short-circuit to Ok(0) WITHOUT seeking or reading,
+    /// even at an out-of-range LBA. Grounding: `if count == 0 { return Ok(0) }`.
+    ///
+    /// The `Ok(0)` return alone proves nothing: with the guard deleted, a seek
+    /// past EOF succeeds (POSIX permits seeking beyond the end of a file) and a
+    /// zero-length `read_exact` returns `Ok(())` immediately, so the call still
+    /// returns `Ok(0)`. The observable difference is the file's cursor — the
+    /// seek MOVES it to `lba * 2048`. Assert on that, so the guard is what the
+    /// test is actually measuring.
     #[test]
     fn zero_count_returns_zero_no_io() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("zc.iso");
         make_iso(&path, 4);
         let mut src = FileSectorSource::open(&path).unwrap();
+        let before = src.file.stream_position().expect("cursor readable");
+        assert_eq!(before, 0, "a freshly opened file starts at offset 0");
         // LBA far past EOF — must not matter because count==0 returns early.
         let mut buf = [0u8; 1];
         let n = src.read_sectors(1_000_000, 0, &mut buf, false).unwrap();
         assert_eq!(n, 0);
+        assert_eq!(
+            src.file.stream_position().expect("cursor readable"),
+            before,
+            "count == 0 must return before the seek — an unmoved cursor is the \
+             only observable proof that no I/O was issued"
+        );
+        // And the drop-window accounting must not have advanced either.
+        assert_eq!(src.bytes_read_since_drop, 0);
+        assert_eq!(src.drop_window_start, 0);
     }
 
     /// Reading past EOF must ERROR (read_exact's UnexpectedEof), never
