@@ -1065,7 +1065,10 @@ mod tests {
     /// seed, so the flag must be set before the crypto runs).
     fn aacs_encrypt_unit_for_test(unit: &mut [u8], unit_key: &[u8; 16]) {
         unit[0] |= 0xC0;
-        aacs::content::encrypt_unit(unit, unit_key);
+        assert!(
+            aacs::content::encrypt_unit(unit, unit_key),
+            "a full-length unit must encrypt"
+        );
     }
 
     /// Build a clear aligned unit with TS sync bytes placed at the BD-TS stride

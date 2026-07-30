@@ -6,7 +6,11 @@ use aes::Aes128;
 #[cfg(test)]
 use aes::cipher::{KeyInit, generic_array::GenericArray};
 
-use super::crypto::{AACS_IV, aes_cbc_decrypt, aes_ecb_encrypt};
+use super::crypto::{aes_cbc_decrypt, aes_cbc_encrypt, aes_ecb_encrypt};
+// Only this module's test fixtures build CBC ciphertext by hand now — the
+// production paths get the IV from `aes_cbc_encrypt` / `aes_cbc_decrypt`.
+#[cfg(test)]
+use super::crypto::AACS_IV;
 
 // ── AACS constants ──────────────────────────────────────────────────────────
 
@@ -347,9 +351,17 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
 /// packet encrypts to ciphertext that is not all-zero, so it is not mistaken for
 /// padding on the way back and the round trip is still exact. Authoring that wants
 /// true source-zero padding leaves those packets unencrypted instead.
-pub fn encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
+///
+/// Returns `false` — encrypting nothing — when `unit` is shorter than
+/// [`ALIGNED_UNIT_LEN`]. That case MUST be checked: the caller has already set the
+/// container's encrypted flag by then (this function's contract requires it), so
+/// ignoring the result leaves a unit marked encrypted while still carrying
+/// plaintext, which is the worst possible outcome for an authoring tool.
+#[must_use = "returns false when the slice is too short to encrypt, leaving \
+              plaintext behind a flag that already says 'encrypted'"]
+pub fn encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
     if unit.len() < ALIGNED_UNIT_LEN {
-        return;
+        return false;
     }
     let mut header = [0u8; 16];
     header.copy_from_slice(&unit[..16]);
@@ -358,19 +370,11 @@ pub fn encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     for i in 0..16 {
         k[i] = derived[i] ^ header[i];
     }
-    // CBC-encrypt bytes 16.. under the fixed AACS IV (forward of `aes_cbc_decrypt`).
-    let mut prev = AACS_IV;
-    let num_blocks = (ALIGNED_UNIT_LEN - 16) / 16;
-    for i in 0..num_blocks {
-        let off = 16 + i * 16;
-        let mut block = [0u8; 16];
-        for j in 0..16 {
-            block[j] = unit[off + j] ^ prev[j];
-        }
-        let enc = aes_ecb_encrypt(&k, &block);
-        unit[off..off + 16].copy_from_slice(&enc);
-        prev.copy_from_slice(&enc);
-    }
+    // CBC-encrypt bytes 16.. under the fixed AACS IV — the exact forward of the
+    // `aes_cbc_decrypt` call in `decrypt_unit`, and one key expansion for the whole
+    // unit rather than one per 16-byte block.
+    aes_cbc_encrypt(&k, &mut unit[16..ALIGNED_UNIT_LEN]);
+    true
 }
 
 /// Remove bus encryption from an aligned unit (AACS 2.0 / UHD).
@@ -412,7 +416,10 @@ mod tests {
         clear[0] |= 0xC0;
 
         let mut unit = clear.clone();
-        encrypt_unit(&mut unit, &key);
+        assert!(
+            encrypt_unit(&mut unit, &key),
+            "a full-length unit must encrypt"
+        );
         assert_ne!(
             unit[16..],
             clear[16..],
@@ -433,6 +440,31 @@ mod tests {
     /// to non-zero bytes, so it is not mistaken for padding and still round-trips.
     /// This is the one place the two functions are deliberately not symmetric, so
     /// the claim is worth pinning rather than asserting in prose alone.
+    /// A slice too short to encrypt must SAY so. The caller has already set the
+    /// container's encrypted flag by the time it calls this (the contract requires
+    /// flag-before-crypto, since the header is the key seed), so a silent no-op
+    /// leaves a unit advertised as encrypted while still carrying plaintext.
+    #[test]
+    fn encrypt_unit_reports_a_slice_too_short_to_encrypt() {
+        let key = [0x11u8; 16];
+        let mut short = vec![0u8; ALIGNED_UNIT_LEN - 1];
+        short[0] |= 0xC0; // the caller already flagged it encrypted
+        let before = short.clone();
+        assert!(
+            !encrypt_unit(&mut short, &key),
+            "a short slice must report false, not silently succeed"
+        );
+        assert_eq!(
+            short, before,
+            "a refused encrypt must leave the buffer untouched"
+        );
+
+        // Exactly ALIGNED_UNIT_LEN is the boundary and must succeed.
+        let mut exact = vec![0u8; ALIGNED_UNIT_LEN];
+        exact[0] |= 0xC0;
+        assert!(encrypt_unit(&mut exact, &key), "a full unit must encrypt");
+    }
+
     #[test]
     fn encrypt_unit_round_trips_all_zero_plaintext_packets() {
         let key = [0xA5u8; 16];
@@ -444,7 +476,10 @@ mod tests {
         }
 
         let mut unit = clear.clone();
-        encrypt_unit(&mut unit, &key);
+        assert!(
+            encrypt_unit(&mut unit, &key),
+            "a full-length unit must encrypt"
+        );
         // No later packet may encipher to all-zero, or decrypt would treat it as
         // source padding and the asymmetry would bite.
         for p in 1..ALIGNED_UNIT_LEN / BD_SOURCE_PACKET_BYTES {
@@ -732,7 +767,10 @@ mod tests {
         // Delegate to the module-scope `pub(crate)` helper (the single encrypt
         // implementation, shared with the mux `driver.rs` decrypt test).
         unit[0] |= 0xC0;
-        super::encrypt_unit(unit, unit_key);
+        assert!(
+            super::encrypt_unit(unit, unit_key),
+            "a full-length unit must encrypt"
+        );
     }
 
     /// Build a clear aligned unit with TS sync bytes at offset 4 + k*192.

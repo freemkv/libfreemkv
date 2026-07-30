@@ -759,7 +759,10 @@ mod tests {
     /// encrypt it under `unit_key` so `aacs::content::decrypt_unit` recovers it.
     fn encrypt_aacs_unit(unit_key: &[u8; 16]) -> Vec<u8> {
         let mut unit = clear_aacs_unit();
-        crate::aacs::content::encrypt_unit(&mut unit, unit_key);
+        assert!(
+            crate::aacs::content::encrypt_unit(&mut unit, unit_key),
+            "a full-length unit must encrypt"
+        );
         unit
     }
 

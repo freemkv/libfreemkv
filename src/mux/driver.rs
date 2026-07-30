@@ -1555,7 +1555,10 @@ mod tests {
         unit[..192].copy_from_slice(&pkt);
         // Flag encrypted BEFORE encrypting: bytes 0..16 are the key seed.
         unit[0] |= 0xC0;
-        crate::aacs::content::encrypt_unit(&mut unit, unit_key);
+        assert!(
+            crate::aacs::content::encrypt_unit(&mut unit, unit_key),
+            "a full-length unit must encrypt"
+        );
         unit
     }
 
