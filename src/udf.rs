@@ -43,6 +43,22 @@ const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// length cannot force a ~1 GiB zeroed allocation per recursion level.
 const MAX_DIR_BYTES: u32 = 1024 * 1024;
 
+/// Smallest Main Volume Descriptor Sequence extent that ECMA-167 3/10.2.1
+/// permits an Anchor Volume Descriptor Pointer to record: 16 logical sectors
+/// (32 768 bytes). An anchor declaring less is not describing a usable
+/// sequence, so its extent is ignored in favour of [`VDS_FALLBACK_START`].
+const VDS_MIN_SECTORS: u32 = 16;
+
+/// Sectors of the Volume Descriptor Sequence actually swept. The sequence is
+/// a short run of descriptors terminated by a Terminating Descriptor (tag 8),
+/// so this only bounds the work an oversized/corrupt ExtentLength can force.
+const VDS_MAX_SECTORS: u32 = 32;
+
+/// Where the Main VDS is swept from when the anchor's own extent is unusable.
+/// The customary location on optical media, and what this reader assumed
+/// unconditionally before it followed the anchor's pointer.
+const VDS_FALLBACK_START: u32 = 32;
+
 /// A UDF filesystem parsed from disc.
 #[derive(Debug)]
 pub struct UdfFs {
@@ -57,6 +73,31 @@ pub struct UdfFs {
     metadata_start: u32,
     /// Metadata partition size in sectors
     metadata_sectors: u32,
+}
+
+/// One allocation extent of a file, as recorded in its ICB.
+///
+/// `recorded` distinguishes the two extent types this reader can encounter in
+/// an allocation descriptor (ECMA-167 4/14.14.1.1):
+///
+/// * type 0 — recorded and allocated: `len` bytes of real data live at `lba`.
+/// * type 1 — allocated but NOT recorded: the space belongs to the file and
+///   occupies `len` bytes of its byte space, but nothing was ever written
+///   there, so its contents are defined to be zeros. Its `lba` is where the
+///   space is allocated, not where readable data lives.
+///
+/// The distinction is load-bearing: dropping a type-1 descriptor slides every
+/// later extent's data down by that hole's length, corrupting the file silently
+/// rather than failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IcbExtent {
+    /// Partition-relative LBA of the extent.
+    pub lba: u32,
+    /// Declared length of the extent in bytes.
+    pub len: u32,
+    /// `false` for an ECMA-167 4/14.14.1.1 type-1 (allocated, not recorded)
+    /// extent, whose bytes are logically zeros and must not be read off media.
+    pub recorded: bool,
 }
 
 /// A directory or file entry.
@@ -131,7 +172,7 @@ impl UdfFs {
             .ok_or_else(|| Error::UdfNotFound {
                 path: path.to_string(),
             })?;
-        let (data_lba, _) = self.read_icb_extent(reader, entry.meta_lba)?;
+        let data_lba = self.read_icb_extent(reader, entry.meta_lba)?.lba;
         self.partition_start
             .checked_add(data_lba)
             .ok_or(Error::DiscRead {
@@ -248,7 +289,8 @@ impl UdfFs {
             .min(MAX_FILE_BYTES as usize);
         let mut data = Vec::with_capacity(cap_hint);
         let mut sector = [0u8; 2048];
-        'extents: for (data_lba, data_len) in extents {
+        'extents: for ext in extents {
+            let (data_lba, data_len) = (ext.lba, ext.len);
             if max_bytes.is_none() {
                 // Anti-DoS guards for the unbounded path: a crafted ICB can
                 // chain many extents whose running total grows `data` into GiB,
@@ -264,6 +306,22 @@ impl UdfFs {
                     });
                 }
             }
+            let sector_count = (data_len as u64).div_ceil(2048) as u32;
+            // ECMA-167 4/14.14.1.1 type 1: allocated but not recorded. The
+            // extent occupies the file's byte space and its contents are
+            // defined to be zeros, so emit the zeros WITHOUT reading the media
+            // (those sectors hold nothing this file wrote). Skipping the extent
+            // instead would slide every later extent's bytes down by this
+            // hole's length — silent corruption, no error.
+            if !ext.recorded {
+                for _ in 0..sector_count {
+                    if data.len() >= limit {
+                        break 'extents;
+                    }
+                    data.extend_from_slice(&[0u8; 2048]);
+                }
+                continue;
+            }
             let abs_start = self
                 .partition_start
                 .checked_add(data_lba)
@@ -272,7 +330,6 @@ impl UdfFs {
                     status: None,
                     sense: None,
                 })?;
-            let sector_count = (data_len as u64).div_ceil(2048) as u32;
             for i in 0..sector_count {
                 if data.len() >= limit {
                     break 'extents;
@@ -351,12 +408,16 @@ impl UdfFs {
                 // span multiple extents, and key readers downstream need all
                 // of them (mirror collect_all_file_ranges).
                 if let Ok(extents) = self.read_icb_extents(reader, child.meta_lba) {
-                    for (data_lba, data_len) in extents {
-                        let abs_start = match self.partition_start.checked_add(data_lba) {
+                    for ext in extents {
+                        // An unrecorded extent holds nothing to cache.
+                        if !ext.recorded {
+                            continue;
+                        }
+                        let abs_start = match self.partition_start.checked_add(ext.lba) {
                             Some(v) => v,
                             None => continue,
                         };
-                        let sector_count = (data_len as u64).div_ceil(2048) as u32;
+                        let sector_count = (ext.len as u64).div_ceil(2048) as u32;
                         ranges.push((abs_start, sector_count));
                     }
                 }
@@ -381,7 +442,7 @@ impl UdfFs {
     /// Read an Extended File Entry (tag 266) or File Entry (tag 261)
     /// and return its first allocation extent: (data_lba, data_length).
     /// The data_lba is partition-relative.
-    fn read_icb_extent(&self, reader: &mut dyn SectorSource, meta_lba: u32) -> Result<(u32, u32)> {
+    fn read_icb_extent(&self, reader: &mut dyn SectorSource, meta_lba: u32) -> Result<IcbExtent> {
         let extents = self.read_icb_extents(reader, meta_lba)?;
         extents.first().copied().ok_or(Error::DiscRead {
             // Diagnostic sector only; meta_to_abs can overflow on a crafted
@@ -446,16 +507,20 @@ impl UdfFs {
         Ok(Some(icb[ad_offset..ad_offset + l_ad].to_vec()))
     }
 
-    /// Read ALL allocation extents for a file from its ICB.
-    /// Returns Vec of (partition_relative_lba, byte_length) pairs.
+    /// Read ALL allocation extents for a file from its ICB, in file order.
     /// Handles files with many extents (e.g. 88 GB m2ts files have ~90 extents)
     /// including files whose allocation descriptors span multiple blocks via
     /// continuation (extent_type 3) descriptors.
+    ///
+    /// Unrecorded (type-1) extents are returned too, flagged `recorded: false`
+    /// — see [`IcbExtent`]. They carry no readable data but they DO occupy the
+    /// file's byte space, so a caller reconstructing file contents must emit
+    /// `len` zeros for them rather than skip them.
     fn read_icb_extents(
         &self,
         reader: &mut dyn SectorSource,
         meta_lba: u32,
-    ) -> Result<Vec<(u32, u32)>> {
+    ) -> Result<Vec<IcbExtent>> {
         let icb_abs = self.meta_to_abs(meta_lba)?;
         let mut icb = [0u8; 2048];
         read_sector(reader, icb_abs, &mut icb)?;
@@ -575,8 +640,23 @@ impl UdfFs {
                     // blocks are scanned to the end of the sector, so the
                     // trailing zero padding must not be read as extents).
                     0 if data_len == 0 => break,
-                    0 => extents.push((data_lba, data_len)),
-                    1 => {} // allocated but not recorded (sparse)
+                    0 => extents.push(IcbExtent {
+                        lba: data_lba,
+                        len: data_len,
+                        recorded: true,
+                    }),
+                    // ECMA-167 4/14.14.1.1 type 1: allocated but NOT recorded.
+                    // The extent is part of the file and occupies `data_len`
+                    // bytes of its byte space — its contents are defined to be
+                    // zeros. It must be KEPT (with `recorded: false`, so no
+                    // caller reads those sectors): dropping it slid every later
+                    // extent's data down by this hole's length, silently
+                    // corrupting the file with no error anywhere.
+                    1 => extents.push(IcbExtent {
+                        lba: data_lba,
+                        len: data_len,
+                        recorded: false,
+                    }),
                     3 => {
                         // Continuation: the rest of the ADs live in the block
                         // at data_lba (metadata-partition-relative). Stop
@@ -641,6 +721,11 @@ impl UdfFs {
     /// without re-navigating a path) and preserving the per-extent byte length
     /// (so the last sector can be trimmed to the file's real size). Resolves
     /// multi-extent / Long-AD / continuation ICBs.
+    ///
+    /// Unrecorded (ECMA-167 4/14.14.1.1 type-1) extents are included: their
+    /// space is allocated to the file at that location and occupies its byte
+    /// space, so dropping them would slide every later extent's bytes down by
+    /// the hole's length in a sequential extraction.
     pub fn extents_abs_at(
         &self,
         reader: &mut dyn SectorSource,
@@ -648,22 +733,25 @@ impl UdfFs {
     ) -> Result<Vec<(u32, u32)>> {
         let alloc = self.read_icb_extents(reader, meta_lba)?;
         let mut out = Vec::with_capacity(alloc.len());
-        for (lba, byte_len) in alloc {
+        for ext in alloc {
             let abs = self
                 .partition_start
-                .checked_add(lba)
+                .checked_add(ext.lba)
                 .ok_or(Error::DiscRead {
                     sector: self.partition_start as u64,
                     status: None,
                     sense: None,
                 })?;
-            out.push((abs, byte_len));
+            out.push((abs, ext.len));
         }
         Ok(out)
     }
 
     /// Get all absolute disc sector extents for a file.
-    /// Returns Vec of (absolute_lba, sector_count) covering the entire file.
+    /// Returns Vec of (absolute_lba, sector_count) covering the entire file,
+    /// including any unrecorded (ECMA-167 4/14.14.1.1 type-1) extent — the
+    /// space is allocated to the file and occupies its byte space, so omitting
+    /// it would misplace every later extent.
     pub fn file_extents(
         &self,
         reader: &mut dyn SectorSource,
@@ -698,16 +786,16 @@ impl UdfFs {
 
         let alloc_extents = self.read_icb_extents(reader, entry.meta_lba)?;
         let mut disc_extents = Vec::with_capacity(alloc_extents.len());
-        for (lba, byte_len) in alloc_extents {
+        for ext in alloc_extents {
             let abs_lba = self
                 .partition_start
-                .checked_add(lba)
+                .checked_add(ext.lba)
                 .ok_or(Error::DiscRead {
                     sector: self.partition_start as u64,
                     status: None,
                     sense: None,
                 })?;
-            let sectors = (byte_len as u64).div_ceil(2048) as u32;
+            let sectors = (ext.len as u64).div_ceil(2048) as u32;
             disc_extents.push((abs_lba, sectors));
         }
         Ok(disc_extents)
@@ -736,18 +824,37 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
         return Err(Error::UdfNotFilesystem);
     }
 
-    // Main VDS extent location: bytes [16:20] = LBA, [20:24] = length
-    // (We use the VDS at sectors 32+, not the reserve copy at sector 32768+)
+    // Step 2: Read the Main Volume Descriptor Sequence and find the Partition
+    // Descriptor (tag 5) and Logical Volume Descriptor (tag 6).
+    //
+    // ECMA-167 3/10.2.1 DEFINES the Main VDS by the extent_ad the AVDP carries
+    // — ExtentLength (bytes) at [16:20], ExtentLocation (LBA) at [20:24] — it
+    // does NOT fix the sequence at sector 32. Sweeping a hardcoded 32..64
+    // window therefore fails to mount a conformant volume that records its VDS
+    // anywhere else (and reads 32 sectors that belong to something else).
+    // Follow the pointer; fall back to the customary window only when the
+    // anchor's extent is unusable (zero length, zero location, or a location
+    // whose sweep would wrap the address space), which is exactly the
+    // malformed-anchor case the old constant silently papered over. The
+    // reserve sequence recorded at [24:32] is not consulted here.
+    let vds_len_bytes = u32::from_le_bytes([avdp[16], avdp[17], avdp[18], avdp[19]]);
+    let vds_lba = u32::from_le_bytes([avdp[20], avdp[21], avdp[22], avdp[23]]);
+    let (vds_start, vds_sectors) = match vds_len_bytes.div_ceil(2048) {
+        // ECMA-167 3/10.2.1 requires the extent to be at least 16 sectors
+        // (32 768 bytes); a shorter or absent extent is not a usable VDS.
+        n if n >= VDS_MIN_SECTORS && vds_lba > 0 && vds_lba.checked_add(n).is_some() => {
+            (vds_lba, n.min(VDS_MAX_SECTORS))
+        }
+        _ => (VDS_FALLBACK_START, VDS_MAX_SECTORS),
+    };
 
-    // Step 2: Read Volume Descriptor Sequence (sectors 32-37 typically)
-    // Find Partition Descriptor (tag 5) and Logical Volume Descriptor (tag 6)
     let mut partition_start: u32 = 0;
     let mut num_partition_maps: u32 = 0;
     let mut lvd_sector: Option<u32> = None;
     let mut volume_id = String::new();
     let mut metadata_size_bytes: u32 = 0;
 
-    for i in 32..64 {
+    for i in vds_start..vds_start.saturating_add(vds_sectors) {
         let mut desc = [0u8; 2048];
         read_sector(reader, i, &mut desc)?;
 
@@ -1004,13 +1111,24 @@ fn read_directory(
             ]);
             (len, pos)
         }
+        // ECMA-167 4/14.9 (File Entry, tag 261) and 4/14.17 (Extended File
+        // Entry, tag 266) are the only descriptors that can be a directory's
+        // ICB. Any other tag means the FID's ICB pointer landed on something
+        // that is not a file entry (a corrupt disc, or a descriptor from
+        // another structure), so this directory's allocation extent — and
+        // therefore its contents — cannot be located.
+        //
+        // That is a FAILURE, and it must be reported as one. Returning an
+        // empty DirEntry instead makes a corrupt directory indistinguishable
+        // from a genuinely empty one: a caller enumerating titles then sees a
+        // disc whose BDMV/PLAYLIST is simply empty and reports success on a
+        // rip that produced nothing. The same bad tag on a FILE ICB is already
+        // a hard error in `read_icb_extents`, so a directory cannot be softer.
         _ => {
-            return Ok(DirEntry {
-                name: name.to_string(),
-                is_dir: true,
-                meta_lba,
-                size: 0,
-                entries: Vec::new(),
+            return Err(Error::DiscRead {
+                sector: icb_abs as u64,
+                status: None,
+                sense: None,
             });
         }
     };
@@ -1612,6 +1730,12 @@ mod tests {
         }
     }
 
+    /// `(lba, len)` of each extent, in file order, for the tests that care
+    /// about placement rather than about the recorded/unrecorded distinction.
+    fn tuples(extents: &[IcbExtent]) -> Vec<(u32, u32)> {
+        extents.iter().map(|e| (e.lba, e.len)).collect()
+    }
+
     fn file_entry(name: &str, meta_lba: u32, size: u64) -> DirEntry {
         DirEntry {
             name: name.to_string(),
@@ -1642,7 +1766,7 @@ mod tests {
         reader.put(meta_start + 50, cont);
 
         let fs = fs_with(part_start, meta_start, file_entry("X", 5, 6144));
-        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        let extents = tuples(&fs.read_icb_extents(&mut reader, 5).expect("extents"));
         assert_eq!(extents, vec![(10, 4096), (20, 2048)]);
     }
 
@@ -1667,7 +1791,7 @@ mod tests {
         reader.put(5, icb);
         reader.put(50, cont);
         let fs = fs_with(0, 0, file_entry("3D", 5, 6144));
-        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        let extents = tuples(&fs.read_icb_extents(&mut reader, 5).expect("extents"));
         assert_eq!(
             extents,
             vec![(10, 4096), (20, 2048)],
@@ -1698,7 +1822,7 @@ mod tests {
         let mut reader = MapReader::new();
         reader.put(5, icb);
         let fs = fs_with(0, 0, file_entry("BIG", 5, 4 * 1_000_000_000));
-        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        let extents = tuples(&fs.read_icb_extents(&mut reader, 5).expect("extents"));
         assert_eq!(
             extents,
             vec![
@@ -2135,23 +2259,25 @@ mod tests {
         let mut reader = MapReader::new();
         reader.put(5, icb);
         let fs = fs_with(0, 0, file_entry("EXT", 5, 3 * 2048));
-        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        let extents = tuples(&fs.read_icb_extents(&mut reader, 5).expect("extents"));
         // If the stride were wrong (8 or 16) or lba_off were off+4, the LBAs
         // would be the 0xDEADBEEF junk or misaligned garbage, not these.
         assert_eq!(extents, vec![(700, 2048), (800, 2048), (900, 4096)]);
     }
 
     #[test]
-    fn icb_extents_short_ad_type1_sparse_extent_is_skipped_not_emitted() {
-        // ECMA-167 §14.14.1.1: extent type 1 = "allocated but not recorded"
-        // (a sparse hole). It carries no on-disc data, so it must NOT be
-        // returned as a readable extent. A type-0 extent after it must still
+    fn icb_extents_short_ad_type1_sparse_extent_is_kept_and_flagged_unrecorded() {
+        // ECMA-167 4/14.14.1.1: extent type 1 = "allocated but not recorded".
+        // It carries no on-disc data — but it IS part of the file and occupies
+        // its declared length of the file's byte space, so it must be returned
+        // (flagged unrecorded) rather than dropped: dropping it slides every
+        // later extent down by 2048 bytes. A type-0 extent after it must still
         // be reached (the loop must continue past a type-1, not break).
         let icb = build_efe(
             6144,
             &[
                 (0, 2048, 10), // recorded
-                (1, 2048, 20), // sparse — allocated, not recorded
+                (1, 2048, 20), // allocated, not recorded
                 (0, 2048, 30), // recorded, after the hole
             ],
         );
@@ -2159,9 +2285,26 @@ mod tests {
         reader.put(5, icb);
         let fs = fs_with(0, 0, file_entry("SP", 5, 6144));
         let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
-        // The sparse (type-1) middle descriptor must be absent; the two
-        // recorded extents must both be present and in order.
-        assert_eq!(extents, vec![(10, 2048), (30, 2048)]);
+        assert_eq!(
+            extents,
+            vec![
+                IcbExtent {
+                    lba: 10,
+                    len: 2048,
+                    recorded: true
+                },
+                IcbExtent {
+                    lba: 20,
+                    len: 2048,
+                    recorded: false
+                },
+                IcbExtent {
+                    lba: 30,
+                    len: 2048,
+                    recorded: true
+                },
+            ]
+        );
     }
 
     #[test]
@@ -2181,7 +2324,7 @@ mod tests {
         let mut reader = MapReader::new();
         reader.put(5, icb);
         let fs = fs_with(0, 0, file_entry("T", 5, 2048));
-        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        let extents = tuples(&fs.read_icb_extents(&mut reader, 5).expect("extents"));
         assert_eq!(
             extents,
             vec![(10, 2048)],
@@ -2203,7 +2346,7 @@ mod tests {
         reader.put(50, cont);
         let fs = fs_with(0, 0, file_entry("LOOP", 5, 2048));
         // Must return Ok (bounded), not hang or panic.
-        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        let extents = tuples(&fs.read_icb_extents(&mut reader, 5).expect("extents"));
         // First block contributes extent (10,2048); each revisit of the
         // self-referential cont block adds (20,2048). The hop bound caps the
         // total, so the Vec is finite. (256 blocks max → < 600 extents.)
@@ -2612,6 +2755,149 @@ mod tests {
             parsed.entries[0].entries.is_empty(),
             "cycle entry must be a leaf, not recursed"
         );
+    }
+
+    #[test]
+    fn read_directory_rejects_an_icb_whose_tag_is_not_a_file_entry() {
+        // ECMA-167 4/14.9 (File Entry, tag 261) and 4/14.17 (Extended File
+        // Entry, tag 266) are the only descriptors that can be the ICB of a
+        // directory. Any other tag is a corrupt/foreign descriptor: the
+        // directory's allocation extent cannot be located, so its contents are
+        // UNKNOWN — not known to be empty. Returning an empty DirEntry makes a
+        // corrupt directory indistinguishable from a genuinely empty one, so a
+        // caller enumerating titles sees a disc that "has no BDMV/PLAYLIST"
+        // and exits 0. The same tag on a FILE ICB is already a hard error
+        // (`read_icb_extents`), so this must be one too.
+        //
+        // Tag 258 (Allocation Extent Descriptor) is a real UDF descriptor that
+        // is simply not a File Entry — the exact "pointer landed on the wrong
+        // structure" shape.
+        let mut icb = build_efe_icb(2048, 2048, 60);
+        icb[0..2].copy_from_slice(&258u16.to_le_bytes());
+        let mut reader = MemReader::new();
+        reader.put(5, icb);
+
+        let err = read_directory(&mut reader, 0, 0, 5, "BDMV", 0, &mut 0, &mut HashSet::new())
+            .expect_err("a non-File-Entry directory ICB must fail, not read as an empty directory");
+        assert!(
+            matches!(err, Error::DiscRead { sector: 5, .. }),
+            "the error must name the ICB sector that carried the bad tag, got {err:?}"
+        );
+
+        // And the genuinely-empty case still succeeds: a real Extended File
+        // Entry (266) whose directory data holds no FID is Ok and empty, so
+        // this test is about the TAG and not about emptiness.
+        let mut ok_reader = MemReader::new();
+        ok_reader.put(5, build_efe_icb(2048, 2048, 60));
+        let dir = read_directory(
+            &mut ok_reader,
+            0,
+            0,
+            5,
+            "BDMV",
+            0,
+            &mut 0,
+            &mut HashSet::new(),
+        )
+        .expect("a real Extended File Entry with no FIDs is a genuinely empty directory");
+        assert!(dir.entries.is_empty());
+    }
+
+    #[test]
+    fn read_file_unrecorded_extent_contributes_zeros_and_does_not_shift_later_extents() {
+        // ECMA-167 4/14.14.1.1: extent type 1 is "extent allocated but not
+        // recorded" — its bytes are logically zeros that STILL OCCUPY the
+        // file's byte space. Dropping the descriptor entirely slides every
+        // later extent's data down by the hole's length, so the file's bytes
+        // land at the wrong offsets with no error at all.
+        //
+        // Three 2048-byte extents: recorded 0xAA, unrecorded (the hole),
+        // recorded 0xCC. The 0xCC extent's data belongs at byte 4096.
+        let icb = build_efe(
+            3 * 2048,
+            &[
+                (0, 2048, 10), // recorded
+                (1, 2048, 20), // allocated but NOT recorded
+                (0, 2048, 30), // recorded, after the hole
+            ],
+        );
+        let mut reader = MemReader::new();
+        reader.put(5, icb);
+        reader.put(10, [0xAAu8; 2048]);
+        // LBA 20 is deliberately given NON-zero bytes: an unrecorded extent's
+        // sectors must never be read, so 0xBB must not appear in the output.
+        reader.put(20, [0xBBu8; 2048]);
+        reader.put(30, [0xCCu8; 2048]);
+
+        let fs = fs_with_file(5, 3 * 2048);
+        let data = fs.read_file(&mut reader, "/F").expect("file reads");
+
+        assert_eq!(data.len(), 6144, "the hole occupies file space");
+        assert!(data[0..2048].iter().all(|&b| b == 0xAA));
+        assert!(
+            data[2048..4096].iter().all(|&b| b == 0x00),
+            "an unrecorded extent reads as zeros, not as whatever is on the media"
+        );
+        assert!(
+            data[4096..6144].iter().all(|&b| b == 0xCC),
+            "the extent after the hole must land at byte 4096, not 2048"
+        );
+    }
+
+    #[test]
+    fn read_filesystem_follows_the_avdp_main_vds_extent_pointer() {
+        // ECMA-167 3/10.2.1: the Anchor Volume Descriptor Pointer DEFINES the
+        // Main Volume Descriptor Sequence by the extent_ad it carries
+        // (ExtentLength at [16:20], ExtentLocation at [20:24]) — the sequence
+        // is not fixed at sector 32. A conformant volume that records its VDS
+        // elsewhere must still mount.
+        use fixture::{DirSpec, MemDisc, PART_START, build_udf_skeleton, file, lay_dir};
+
+        // Where this volume really keeps its Volume Descriptor Sequence.
+        const VDS_LBA: u32 = 300;
+
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(
+            &mut disc,
+            &DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: vec![file("INDEX.BDMV", 12, 13, 2048, false)],
+                subdirs: Vec::new(),
+            },
+        );
+
+        // Re-point the anchor at the real sequence and MOVE the descriptors
+        // there, leaving 32..64 blank (as a conformant volume that never used
+        // sector 32 would).
+        let mut avdp = vec![0u8; 2048];
+        avdp[0..2].copy_from_slice(&2u16.to_le_bytes());
+        // 16 sectors is the ECMA-167 3/10.2.1 minimum VDS extent length.
+        avdp[16..20].copy_from_slice(&(16u32 * 2048).to_le_bytes());
+        avdp[20..24].copy_from_slice(&VDS_LBA.to_le_bytes());
+        disc.put_bytes(256, &avdp);
+
+        let mut pd = vec![0u8; 2048];
+        pd[0..2].copy_from_slice(&5u16.to_le_bytes());
+        pd[188..192].copy_from_slice(&PART_START.to_le_bytes());
+        let mut lvd = vec![0u8; 2048];
+        lvd[0..2].copy_from_slice(&6u16.to_le_bytes());
+        lvd[268..272].copy_from_slice(&1u32.to_le_bytes());
+        let mut td = vec![0u8; 2048];
+        td[0..2].copy_from_slice(&8u16.to_le_bytes());
+        disc.put_bytes(VDS_LBA, &pd);
+        disc.put_bytes(VDS_LBA + 1, &lvd);
+        disc.put_bytes(VDS_LBA + 2, &td);
+        // Blank the hardcoded window.
+        disc.put_bytes(32, &vec![0u8; 3 * 2048]);
+
+        let fs = super::read_filesystem(&mut disc)
+            .expect("a volume whose AVDP points its VDS elsewhere must still mount");
+        assert_eq!(fs.partition_start(), PART_START);
+        assert_eq!(fs.root.entries.len(), 1);
+        assert_eq!(fs.root.entries[0].name, "INDEX.BDMV");
     }
 }
 

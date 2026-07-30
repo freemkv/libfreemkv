@@ -324,14 +324,61 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 8];
-        match self.scsi.as_mut().execute(
+        let reply = self.scsi.as_mut().execute(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             &mut buf,
             5_000,
-        ) {
+        );
+
+        // MMC-6 §6.7: byte 5 is a Media Status only when the Event Header
+        // actually announces a Media Event Descriptor behind it. The header is
+        // Event Descriptor Length (big-endian, bytes 0-1), then byte 2 = NEA
+        // (bit 7) + Notification Class (bits 2-0), then byte 3 = Supported
+        // Event Classes. With NEA set the drive is telling us there is NO event
+        // to report and returns the header alone; with a different Notification
+        // Class the descriptor that follows is not a media one and its second
+        // byte means something else entirely.
+        //
+        // Decoding byte 5 unconditionally turns both of those into Media Status
+        // 0 == "tray closed, no disc" — a drive with a disc loaded reported as
+        // empty, from a reply that said nothing about the media at all. The
+        // drive is untrusted input here, so an event-less or foreign-class reply
+        // yields no media state and the TEST UNIT READY fallback answers
+        // instead.
+        const NEA: u8 = 0x80;
+        const NOTIFICATION_CLASS_MASK: u8 = 0x07;
+        const NOTIFICATION_CLASS_MEDIA: u8 = 0x04;
+        // Bytes 2..7: the 2 remaining header bytes plus the 4-byte Media Event
+        // Descriptor — the shortest reply in which byte 5 exists and is a Media
+        // Status.
+        const MIN_DESCRIPTOR_LENGTH: u16 = 6;
+
+        let media_status = match reply {
             Ok(r) if r.bytes_transferred >= 6 => {
-                let media_status = buf[5];
+                let descriptor_len = u16::from_be_bytes([buf[0], buf[1]]);
+                let class = buf[2] & NOTIFICATION_CLASS_MASK;
+                if buf[2] & NEA == 0
+                    && class == NOTIFICATION_CLASS_MEDIA
+                    && descriptor_len >= MIN_DESCRIPTOR_LENGTH
+                {
+                    Some(buf[5])
+                } else {
+                    tracing::debug!(
+                        target: "freemkv::drive",
+                        nea = buf[2] & NEA != 0,
+                        class,
+                        descriptor_len,
+                        "get event status carried no media event descriptor"
+                    );
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        match media_status {
+            Some(media_status) => {
                 // Bits 1-0: door/tray state
                 // Bit 1: media present, Bit 0: tray open
                 match media_status & 0x03 {
@@ -346,7 +393,7 @@ impl Drive {
                     _ => DriveStatus::Unknown,
                 }
             }
-            _ => {
+            None => {
                 // Fallback: try TUR
                 let tur = [SCSI_TEST_UNIT_READY, 0x00, 0x00, 0x00, 0x00, 0x00];
                 let mut empty = [0u8; 0];
@@ -1569,23 +1616,81 @@ mod command_tests {
         );
     }
 
+    /// A conformant GET EVENT STATUS NOTIFICATION reply carrying one Media
+    /// Event Descriptor (MMC-6 §6.7): Event Header — Event Descriptor Length
+    /// (big-endian, bytes 0-1), then NEA (bit 7) + Notification Class (bits
+    /// 2-0) in byte 2 and the Supported Event Class bitmap in byte 3 — followed
+    /// by the 4-byte Media Event Descriptor whose byte 1 (reply byte 5) is the
+    /// Media Status.
+    fn media_event_reply(media_status: u8) -> Vec<u8> {
+        let mut buf = vec![0u8; 8];
+        buf[0..2].copy_from_slice(&6u16.to_be_bytes()); // 6 bytes follow
+        buf[2] = 0x04; // NEA = 0, Notification Class 4 = Media
+        buf[3] = 0x10; // Supported Event Classes: media
+        buf[4] = 0x00; // Event Code: NoChg
+        buf[5] = media_status;
+        buf
+    }
+
     #[test]
     fn drive_status_tray_open_and_media_present_is_not_ready_to_rip() {
-        // GET EVENT STATUS reply: byte 5 (media_status) low bits = 0b11
-        // (tray-open AND media-present, contradictory). Must NOT report
-        // DiscPresent. Buffer is 8 bytes; bytes_transferred >= 6.
-        let mut buf = vec![0u8; 8];
-        buf[5] = 0x03;
-        let mut d = drive_with(buf);
+        // Media Status low bits = 0b11 (tray-open AND media-present,
+        // contradictory). Must NOT report DiscPresent.
+        let mut d = drive_with(media_event_reply(0x03));
         assert_eq!(d.drive_status(), DriveStatus::TrayOpen);
     }
 
     #[test]
     fn drive_status_disc_present_maps_correctly() {
-        let mut buf = vec![0u8; 8];
-        buf[5] = 0x02; // media present, tray closed
-        let mut d = drive_with(buf);
+        // Media Status 0x02 = media present, tray closed.
+        let mut d = drive_with(media_event_reply(0x02));
         assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
+    }
+
+    /// MMC-6 §6.7: byte 5 of the reply is a Media Status ONLY when the Event
+    /// Header says a media event descriptor follows — NEA (byte 2 bit 7) clear
+    /// AND Notification Class (byte 2 bits 2-0) == 4 (Media). A drive that
+    /// answers with NEA set, or with a different class it chose to report, still
+    /// returns 8 bytes; decoding byte 5 regardless reads a reserved/zero byte as
+    /// Media Status 0 and reports NoDisc on a drive that has a disc loaded —
+    /// the classic "works on my drive, not theirs" firmware split. The drive is
+    /// untrusted input: an event-less reply carries no media state at all, so
+    /// the status must come from the TEST UNIT READY fallback instead.
+    ///
+    /// This mock answers every command (including the fallback TUR) with
+    /// success, so the fallback's verdict is `DiscPresent` — the point is that
+    /// it is NOT the fabricated `NoDisc`.
+    #[test]
+    fn drive_status_rejects_a_reply_carrying_no_media_event_descriptor() {
+        // NEA = 1: "No Event Available" — no descriptor was returned, so the
+        // bytes after the header are not a Media Event Descriptor.
+        let mut nea = media_event_reply(0x00);
+        nea[2] = 0x80 | 0x04;
+        let mut d = drive_with(nea);
+        assert_ne!(
+            d.drive_status(),
+            DriveStatus::NoDisc,
+            "NEA=1 means no event descriptor — byte 5 is not a Media Status"
+        );
+        assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
+
+        // Notification Class 1 (Operational Change), not 4 (Media): a real
+        // descriptor, but of a class whose byte 5 means something else.
+        let mut other_class = media_event_reply(0x00);
+        other_class[2] = 0x01;
+        let mut d = drive_with(other_class);
+        assert_ne!(
+            d.drive_status(),
+            DriveStatus::NoDisc,
+            "a non-Media notification class carries no media status"
+        );
+        assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
+
+        // Control: the same 8 bytes WITH a valid media event header really do
+        // decode Media Status 0 as NoDisc, so the two asserts above are about
+        // the header and not about byte 5.
+        let mut d = drive_with(media_event_reply(0x00));
+        assert_eq!(d.drive_status(), DriveStatus::NoDisc);
     }
 
     // ── Mocks for Drive::read single-shot semantics + CDB encoding ──
@@ -2009,9 +2114,7 @@ mod command_tests {
     /// 0x00 = NoDisc, etc. Stands in for a real opened drive so the
     /// selection policy is testable without hardware.
     fn drive_with_media_byte(media_status: u8) -> Drive {
-        let mut buf = vec![0u8; 8];
-        buf[5] = media_status;
-        drive_with(buf)
+        drive_with(media_event_reply(media_status))
     }
 
     #[test]
@@ -2056,29 +2159,23 @@ mod command_tests {
     #[test]
     fn drive_status_no_disc_maps_correctly() {
         // media_status low bits 0b00 = tray closed, no disc.
-        let mut buf = vec![0u8; 8];
-        buf[5] = 0x00;
-        let mut d = drive_with(buf);
+        let mut d = drive_with(media_event_reply(0x00));
         assert_eq!(d.drive_status(), DriveStatus::NoDisc);
     }
 
     #[test]
     fn drive_status_tray_open_maps_correctly() {
         // media_status low bits 0b01 = tray open, no media.
-        let mut buf = vec![0u8; 8];
-        buf[5] = 0x01;
-        let mut d = drive_with(buf);
+        let mut d = drive_with(media_event_reply(0x01));
         assert_eq!(d.drive_status(), DriveStatus::TrayOpen);
     }
 
     #[test]
     fn drive_status_high_bits_in_media_status_ignored() {
-        // Only the low 2 bits of byte 5 are the door/media state; upper
-        // bits (NEA, etc.) must be masked. 0xFE has low bits 0b10 =
-        // DiscPresent.
-        let mut buf = vec![0u8; 8];
-        buf[5] = 0xFE;
-        let mut d = drive_with(buf);
+        // MMC-6 §6.7: only the low 2 bits of the Media Event Descriptor's
+        // Media Status are the door/media state; the reserved upper bits must
+        // be masked. 0xFE has low bits 0b10 = DiscPresent.
+        let mut d = drive_with(media_event_reply(0xFE));
         assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
     }
 
