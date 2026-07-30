@@ -41,6 +41,20 @@
 
 ### Fixed
 
+- **The FMTS (AACS 2.1) forensic key resolution now runs once per disc, not once
+  per title.** `Disc::resolve_content_key_map` resolves every title, and the FMTS
+  branch ran ahead of everything else — so each playlist re-walked the UDF
+  filesystem to re-read `/AACS/IndividualSegment.tbl`, re-ran the forensic anchor
+  probe and the per-index phase probe, and **re-asked the key service for the
+  disc's index-key set**. On a 60-playlist AACS 2.1 disc that was 60 identical
+  key-service round trips (a key-server storm) and tens of thousands of random
+  6144-byte reads for one disc-wide answer. The UDF walk is now memoised for the
+  whole disc and the index keys + phases per distinct extent list — the only
+  per-title input to the probes. A read-faulted phase probe is deliberately never
+  memoised, so one bad read is not spread across the remaining playlists. The
+  per-title UDF walk was paid on **every** disc, FMTS or not, so a plain BD sweep
+  loses ~59 full-stroke seeks too. The multi-CPS extent memo added in 1.6.0 is
+  also reachable on an FMTS disc for the first time.
 - **Mux correctness pass** (the `v1.4.0..HEAD` 10-phase audit): DTS core-header
   false-drops that dropped good DTS frames; the TrueHD channel-correction probe
   now runs correctly on AACS discs (7.1/Atmos no longer understated as 5.1);
