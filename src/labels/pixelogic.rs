@@ -638,6 +638,87 @@ mod tests {
         assert!(audio.is_empty() || audio.iter().all(|l| l.stream_number <= 512));
     }
 
+    /// Spec: the FPL section also ends on an `SF_` marker (not just
+    /// `SEG_`/`FPL_`). Only `assign_labels_fpl_section_ends_on_seg_boundary`
+    /// existed before, which cannot distinguish a mutated `||` chain from
+    /// the correct one (any single true operand already ends the section).
+    /// This test isolates the `SF_` alternative specifically.
+    /// Mutation: `||` -> `&&` in the end-of-section check would require
+    /// ALL THREE prefixes to match simultaneously (impossible for a real
+    /// single token), so the section would never end on `SF_` alone.
+    #[test]
+    fn assign_labels_fpl_section_ends_on_sf_boundary() {
+        let mut flag = false;
+        let tokens = strs(&[
+            "FPL_MainFeature",
+            "eng_MLP_",
+            "SF_Something", // must end the FPL section
+            "fra_AC3_",     // must NOT be parsed
+        ]);
+        let labels = assign_labels(&tokens, &mut flag);
+        assert_eq!(labels.len(), 1, "only eng from FPL section");
+        assert_eq!(labels[0].language, "eng");
+    }
+
+    /// Spec: the two per-type caps are independent — the loop only stops
+    /// early once BOTH audio and subtitle counters have reached
+    /// `MAX_STREAMS_PER_TYPE`. Reaching the audio cap alone must not cut
+    /// off subtitle processing.
+    /// Mutation: `&&` -> `||` in the outer stop-condition would break the
+    /// loop as soon as EITHER counter reaches the cap, silently dropping
+    /// a legitimate subtitle stream that comes after audio saturates.
+    #[test]
+    fn assign_labels_audio_cap_alone_does_not_stop_subtitle_processing() {
+        let mut flag = false;
+        let mut tokens = vec!["FPL_MainFeature".to_string()];
+        for i in 1..=(MAX_STREAMS_PER_TYPE as usize) {
+            tokens.push(format!("Audio Stream {}", i));
+        }
+        // Subtitle counter is still 0 here — well under the cap.
+        tokens.push("eng_SDH_".to_string());
+        let labels = assign_labels(&tokens, &mut flag);
+        let subs: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Subtitle)
+            .collect();
+        assert_eq!(
+            subs.len(),
+            1,
+            "a subtitle stream after the audio cap (but under the subtitle \
+             cap) must still be labeled"
+        );
+    }
+
+    /// Companion to the above: with the subtitle counter saturated but
+    /// audio still under its cap, a subsequent audio token must still be
+    /// processed. Isolates the first `>=` operand (`audio_num >=
+    /// MAX_STREAMS_PER_TYPE`) from the second.
+    /// Mutation: `audio_num >= MAX_STREAMS_PER_TYPE` -> `audio_num <
+    /// MAX_STREAMS_PER_TYPE` would flip the stop-condition to trigger
+    /// whenever audio is UNDER cap and subtitle is AT/over cap — exactly
+    /// this scenario — dropping the trailing audio token.
+    #[test]
+    fn assign_labels_subtitle_cap_alone_does_not_stop_audio_processing() {
+        let mut flag = false;
+        let mut tokens = vec!["FPL_MainFeature".to_string()];
+        for _ in 1..=(MAX_STREAMS_PER_TYPE as usize) {
+            tokens.push("eng_SDH_".to_string());
+        }
+        // Audio counter is still 0 here — well under the cap.
+        tokens.push("fra_MLP_".to_string());
+        let labels = assign_labels(&tokens, &mut flag);
+        let audio: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .collect();
+        assert_eq!(
+            audio.len(),
+            1,
+            "an audio stream after the subtitle cap (but under the audio \
+             cap) must still be labeled"
+        );
+    }
+
     /// Spec: subtitle placeholders (PG Stream N) do NOT advance the subtitle counter.
     /// Only audio placeholders (`Audio Stream N`) do.
     /// Mutation: also advance sub counter on PG placeholder → subtitle labels misnumbered.

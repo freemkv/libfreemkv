@@ -470,4 +470,23 @@ mod tests {
         assert!(find_feature_playlist("").is_none());
         assert!(find_feature_playlist("<root />").is_none());
     }
+
+    /// Spec: on a tie in audio-slot count, the FIRST playlist encountered
+    /// wins (consistent with `select_result`'s first-wins tiebreak
+    /// elsewhere in the registry) — later playlists only displace the
+    /// current best on a STRICTLY greater count.
+    /// Mutation: `count > best_aud_count` -> `count >= best_aud_count`
+    /// would let a later tied playlist silently displace the first.
+    #[test]
+    fn find_feature_first_wins_on_audio_count_tie() {
+        let xml = r#"
+            <playlist name="A" aud="eng,fra" />
+            <playlist name="B" aud="deu,spa" />
+        "#;
+        let feature = find_feature_playlist(xml).expect("a feature is found");
+        assert!(
+            feature.contains(r#"name="A""#),
+            "first playlist must win a tie, got: {feature}"
+        );
+    }
 }

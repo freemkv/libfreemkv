@@ -634,4 +634,136 @@ mod tests {
         let (s, e) = find_element(xml, "name", 0).unwrap();
         assert_eq!(&xml[s..e], "<di:name>Title</di:name>");
     }
+
+    // ── Malformed / truncated input (untrusted on-disc XML) ────────────────
+    //
+    // These scrapers run on XML lifted out of BD-J jar entries, which is
+    // attacker-controllable. Every scan in this module must terminate and
+    // stay in bounds on truncated or unbalanced input rather than panic.
+    // XML 1.0 §2.3 defines the Name production these boundary rules model.
+
+    /// A quoted attribute value that is never closed must terminate the
+    /// scan at EOF rather than reading past the end of the buffer.
+    #[test]
+    fn attr_unterminated_quoted_value_scan_stops_at_eof() {
+        // The scanner enters the `y="` value and runs off the end looking
+        // for the closing quote; `name` is never found.
+        assert_eq!(attr(r#"<x y="oops"#, "name"), None);
+        assert_eq!(attr("<x y='oops", "name"), None);
+        // The truncated attribute itself has no terminated value either.
+        assert_eq!(attr(r#"<x y="oops"#, "y"), None);
+    }
+
+    /// An attribute name at EOF followed only by whitespace (no `=`) must
+    /// return None, not read past the buffer while skipping that whitespace.
+    #[test]
+    fn attr_name_with_trailing_whitespace_and_no_equals_returns_none() {
+        assert_eq!(attr("<x name   ", "name"), None);
+    }
+
+    /// `name=` followed only by whitespace to EOF has no value to return.
+    #[test]
+    fn attr_equals_with_trailing_whitespace_and_no_value_returns_none() {
+        assert_eq!(attr("<x name=  ", "name"), None);
+    }
+
+    /// A quoted attribute value is opaque: a `name="..."` pair that appears
+    /// *inside* another attribute's value must never be reported, even when
+    /// it is preceded by whitespace so it would otherwise clear the
+    /// word-boundary check.
+    #[test]
+    fn attr_decoy_name_after_space_inside_quoted_value_is_skipped() {
+        assert_eq!(attr(r#"<x y=" name='decoy'" />"#, "name"), None);
+        // The real attribute after the decoy still resolves.
+        assert_eq!(
+            attr(r#"<x y=" name='decoy'" name="real" />"#, "name"),
+            Some("real".into())
+        );
+    }
+
+    /// XML 1.0 §2.3 NameChar includes `-`, `_` and `.`, so `q-a`, `q_a` and
+    /// `q.a` are each a single attribute name distinct from `a`. Searching
+    /// for `a` must not match the tail of any of them.
+    #[test]
+    fn attr_name_char_boundary_covers_hyphen_underscore_and_dot() {
+        assert_eq!(
+            attr(r#"<x q-a="decoy" a="real" />"#, "a"),
+            Some("real".into())
+        );
+        assert_eq!(
+            attr(r#"<x q_a="decoy" a="real" />"#, "a"),
+            Some("real".into())
+        );
+        assert_eq!(
+            attr(r#"<x q.a="decoy" a="real" />"#, "a"),
+            Some("real".into())
+        );
+    }
+
+    /// An open tag truncated mid-attribute never terminates, so no element
+    /// can be returned — and the attribute walk must not read past EOF.
+    #[test]
+    fn find_element_unterminated_open_tag_returns_none() {
+        assert_eq!(find_element("<x attr=", "x", 0), None);
+    }
+
+    /// A `/` as the final byte of the buffer is not a self-closing marker;
+    /// probing for the `>` that would follow it must stay in bounds.
+    #[test]
+    fn find_element_trailing_slash_at_eof_returns_none() {
+        assert_eq!(find_element("<a /", "a", 0), None);
+    }
+
+    /// `/>` inside a quoted attribute value does not close the element.
+    #[test]
+    fn find_element_quoted_self_close_marker_does_not_end_element() {
+        let xml = r#"<x a="/>"/>"#;
+        let (s, e) = find_element(xml, "x", 0).unwrap();
+        assert_eq!(&xml[s..e], r#"<x a="/>"/>"#);
+    }
+
+    /// An attribute value whose quote is never closed leaves the open tag
+    /// unterminated; the scan must end at EOF and report no element.
+    #[test]
+    fn find_element_unterminated_quoted_attr_returns_none() {
+        assert_eq!(find_element(r#"<x a="oops"#, "x", 0), None);
+    }
+
+    /// A `/` in the middle of an unquoted attribute value is not a
+    /// self-closing marker — only `/>` is.
+    #[test]
+    fn find_element_unquoted_slash_is_not_self_closing() {
+        let xml = "<a href=x/y>body</a>";
+        let (s, e) = find_element(xml, "a", 0).unwrap();
+        assert_eq!(&xml[s..e], "<a href=x/y>body</a>");
+    }
+
+    /// `text` must locate the real end of the open tag: a bare `/` inside
+    /// an unquoted attribute value must not be treated as `/>`, which would
+    /// shift the body start and leak tag bytes into the returned text.
+    #[test]
+    fn text_unquoted_slash_in_attr_does_not_truncate_body() {
+        assert_eq!(text("<x a=b/c>hello</x>", "x"), Some("hello".into()));
+    }
+
+    /// A `>` inside a quoted attribute value must not be mistaken for the
+    /// end of the open tag when `text` computes the body start.
+    #[test]
+    fn text_quoted_gt_in_attr_does_not_truncate_body() {
+        assert_eq!(text(r#"<x a="b>c">hello</x>"#, "x"), Some("hello".into()));
+    }
+
+    /// A close tag truncated mid-name (`</x` with no `>`) is not a close
+    /// tag; matching it must stay in bounds and report no text.
+    #[test]
+    fn text_truncated_close_tag_returns_none() {
+        assert_eq!(text("<x>body</x", "x"), None);
+    }
+
+    /// A `/` in element content is only a close tag when preceded by `<`.
+    /// Body text containing `a/x>` must not be mistaken for `</x>`.
+    #[test]
+    fn text_slash_in_body_is_not_a_close_tag() {
+        assert_eq!(text("<x>a/x> </x>", "x"), Some("a/x>".into()));
+    }
 }

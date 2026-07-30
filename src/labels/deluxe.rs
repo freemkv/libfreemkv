@@ -1106,6 +1106,341 @@ fn deluxe_purpose_to_label(ordinal: u16) -> (LabelPurpose, LabelQualifier) {
 mod tests {
     use super::*;
 
+    // ── Raw .class / .jar fixture builders ──────────────────────────────────
+    //
+    // `identify_master_enums`, `find_binding_classes` and `decode_binding`
+    // operate on `jar::Jar` (a real `ZipArchive`), not on the in-memory
+    // `ClassFile` struct the rest of this module's tests build directly (see
+    // `class_with_clinit`). To exercise them we need real serialized
+    // `.class` bytes inside a real (stored, uncompressed) zip — this is the
+    // inverse of `ClassFile::parse` / JVMS §4.
+
+    /// Serialize a constant pool (no Long/Double entries — those need the
+    /// post-slot `Empty` padding this helper doesn't handle) to the on-disk
+    /// `cp_info` sequence, prefixed by `constant_pool_count`.
+    fn encode_cp(entries: &[CpInfo]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        for e in &entries[1..] {
+            match e {
+                CpInfo::Utf8(s) => {
+                    out.push(1);
+                    out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+                CpInfo::Integer(n) => {
+                    out.push(3);
+                    out.extend_from_slice(&n.to_be_bytes());
+                }
+                CpInfo::Class { name_index } => {
+                    out.push(7);
+                    out.extend_from_slice(&name_index.to_be_bytes());
+                }
+                CpInfo::String { string_index } => {
+                    out.push(8);
+                    out.extend_from_slice(&string_index.to_be_bytes());
+                }
+                CpInfo::Fieldref {
+                    class_index,
+                    name_and_type_index,
+                } => {
+                    out.push(9);
+                    out.extend_from_slice(&class_index.to_be_bytes());
+                    out.extend_from_slice(&name_and_type_index.to_be_bytes());
+                }
+                CpInfo::NameAndType {
+                    name_index,
+                    descriptor_index,
+                } => {
+                    out.push(12);
+                    out.extend_from_slice(&name_index.to_be_bytes());
+                    out.extend_from_slice(&descriptor_index.to_be_bytes());
+                }
+                CpInfo::Methodref {
+                    class_index,
+                    name_and_type_index,
+                } => {
+                    out.push(10);
+                    out.extend_from_slice(&class_index.to_be_bytes());
+                    out.extend_from_slice(&name_and_type_index.to_be_bytes());
+                }
+                other => unimplemented!("fixture builder doesn't need {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// One method's worth of `Code` attribute bytecode, keyed by the cp
+    /// index of the `"Code"` Utf8 entry.
+    struct MethodSpec {
+        name_index: u16,
+        descriptor_index: u16,
+        code_attr_name_index: u16,
+        max_stack: u16,
+        code: Vec<u8>,
+    }
+
+    /// Serialize a minimal but real `.class` byte buffer: magic, versions,
+    /// constant pool, an empty interfaces/fields table, the given methods
+    /// (each with exactly one `Code` attribute), and no class attributes.
+    fn encode_class(cp: &[CpInfo], this_class: u16, methods: &[MethodSpec]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xCAFEBABEu32.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes()); // minor
+        out.extend_from_slice(&52u16.to_be_bytes()); // major
+        out.extend_from_slice(&encode_cp(cp));
+        out.extend_from_slice(&0u16.to_be_bytes()); // access_flags
+        out.extend_from_slice(&this_class.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes()); // super_class
+        out.extend_from_slice(&0u16.to_be_bytes()); // interfaces_count
+        out.extend_from_slice(&0u16.to_be_bytes()); // fields_count
+        out.extend_from_slice(&(methods.len() as u16).to_be_bytes());
+        for m in methods {
+            out.extend_from_slice(&0u16.to_be_bytes()); // access_flags
+            out.extend_from_slice(&m.name_index.to_be_bytes());
+            out.extend_from_slice(&m.descriptor_index.to_be_bytes());
+            out.extend_from_slice(&1u16.to_be_bytes()); // attributes_count = 1 (Code)
+            out.extend_from_slice(&m.code_attr_name_index.to_be_bytes());
+            let info_len = 2 + 2 + 4 + m.code.len();
+            out.extend_from_slice(&(info_len as u32).to_be_bytes());
+            out.extend_from_slice(&m.max_stack.to_be_bytes());
+            out.extend_from_slice(&0u16.to_be_bytes()); // max_locals
+            out.extend_from_slice(&(m.code.len() as u32).to_be_bytes());
+            out.extend_from_slice(&m.code);
+        }
+        out.extend_from_slice(&0u16.to_be_bytes()); // attributes_count (class)
+        out
+    }
+
+    /// Build a raw, multi-entry, Stored (uncompressed) ZIP — same format as
+    /// `jar::tests::build_stored_zip`, generalized to N entries (that helper
+    /// is private to `jar.rs`).
+    fn build_zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        fn crc32(payload: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in payload {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        let mut offsets = Vec::new();
+        for (name, payload) in entries {
+            let name_bytes = name.as_bytes();
+            let crc = crc32(payload);
+            offsets.push(out.len() as u32);
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // Stored
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(payload);
+        }
+        for ((name, payload), &lfh_offset) in entries.iter().zip(&offsets) {
+            let name_bytes = name.as_bytes();
+            let crc = crc32(payload);
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&lfh_offset.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+        let cd_offset = out.len() as u32;
+        let cd_size = central.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    fn open_jar(bytes: Vec<u8>) -> jar::Jar {
+        jar::Jar::new(std::io::Cursor::new(bytes)).expect("valid zip")
+    }
+
+    /// Build a `.class` fixture whose `<clinit>` does N `ldc` of distinct
+    /// Utf8 constants `values[0..N]` — i.e. a class matching a
+    /// `FINGERPRINTS` shape by ldc-sequence.
+    fn class_with_ldc_strings(class_name: &str, values: &[&str]) -> Vec<u8> {
+        // cp layout: 1 "<clinit>", 2 "()V", 3 "Code", then one Utf8 +
+        // one String per value, in pairs (4,5), (6,7), ...
+        let mut cp = vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("<clinit>".into()),
+            CpInfo::Utf8("()V".into()),
+            CpInfo::Utf8("Code".into()),
+        ];
+        let mut code = Vec::new();
+        for v in values {
+            let utf8_idx = cp.len() as u16;
+            cp.push(CpInfo::Utf8((*v).to_string()));
+            let str_idx = cp.len() as u16;
+            cp.push(CpInfo::String {
+                string_index: utf8_idx,
+            });
+            code.push(LDC);
+            code.push(str_idx as u8);
+        }
+        cp.push(CpInfo::Utf8(class_name.to_string()));
+        let this_class_name_idx = (cp.len() - 1) as u16;
+        cp.push(CpInfo::Class {
+            name_index: this_class_name_idx,
+        });
+        let this_class_idx = (cp.len() - 1) as u16;
+        let methods = vec![MethodSpec {
+            name_index: 1,
+            descriptor_index: 2,
+            code_attr_name_index: 3,
+            max_stack: 2,
+            code,
+        }];
+        encode_class(&cp, this_class_idx, &methods)
+    }
+
+    /// Build a `.class` fixture whose `<clinit>` does N `getstatic`
+    /// references to `enum_class.FIELD_i`, for `count_master_enum_getstatic`
+    /// / `find_binding_classes` Jar-level fixtures.
+    fn class_with_getstatic_refs(class_name: &str, enum_class: &str, n: usize) -> Vec<u8> {
+        let mut cp = vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("<clinit>".into()),
+            CpInfo::Utf8("()V".into()),
+            CpInfo::Utf8("Code".into()),
+            CpInfo::Utf8(enum_class.to_string()),
+        ];
+        let enum_class_name_idx = 4u16;
+        cp.push(CpInfo::Class {
+            name_index: enum_class_name_idx,
+        });
+        let enum_class_idx = (cp.len() - 1) as u16;
+        cp.push(CpInfo::Utf8("Lsome/Enum;".into()));
+        let descriptor_idx = (cp.len() - 1) as u16;
+        let mut code = Vec::new();
+        for i in 0..n {
+            let field_name_idx = cp.len() as u16;
+            cp.push(CpInfo::Utf8(format!("F{i}")));
+            let nat_idx = cp.len() as u16;
+            cp.push(CpInfo::NameAndType {
+                name_index: field_name_idx,
+                descriptor_index: descriptor_idx,
+            });
+            let fieldref_idx = cp.len() as u16;
+            cp.push(CpInfo::Fieldref {
+                class_index: enum_class_idx,
+                name_and_type_index: nat_idx,
+            });
+            code.push(GETSTATIC);
+            code.extend_from_slice(&fieldref_idx.to_be_bytes());
+            code.push(0x57); // pop, so the symbolic stack doesn't matter here
+        }
+        cp.push(CpInfo::Utf8(class_name.to_string()));
+        let this_name_idx = (cp.len() - 1) as u16;
+        cp.push(CpInfo::Class {
+            name_index: this_name_idx,
+        });
+        let this_class_idx = (cp.len() - 1) as u16;
+        let methods = vec![MethodSpec {
+            name_index: 1,
+            descriptor_index: 2,
+            code_attr_name_index: 3,
+            max_stack: 2,
+            code,
+        }];
+        encode_class(&cp, this_class_idx, &methods)
+    }
+
+    /// A `.class` fixture whose `<clinit>` is exactly `new AudioSlot; dup;
+    /// getstatic LanguageEnum.English; invokespecial AudioSlot.<init>
+    /// (LLanguageEnum;)V` — one real `Construction`, for Jar-level
+    /// `decode_binding` tests. `class_name` only affects the class's own
+    /// `this_class` entry (informational); the Jar-level lookup key is the
+    /// zip entry path passed to `build_zip`, not this name.
+    fn class_with_simple_construction(class_name: &str) -> Vec<u8> {
+        let cp = vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("<clinit>".into()),       // 1
+            CpInfo::Utf8("()V".into()),            // 2
+            CpInfo::Utf8("Code".into()),           // 3
+            CpInfo::Utf8("LanguageEnum".into()),   // 4
+            CpInfo::Class { name_index: 4 },       // 5
+            CpInfo::Utf8("English".into()),        // 6
+            CpInfo::Utf8("LLanguageEnum;".into()), // 7
+            CpInfo::NameAndType {
+                name_index: 6,
+                descriptor_index: 7,
+            }, // 8
+            CpInfo::Fieldref {
+                class_index: 5,
+                name_and_type_index: 8,
+            }, // 9
+            CpInfo::Utf8("AudioSlot".into()),      // 10
+            CpInfo::Class { name_index: 10 },      // 11
+            CpInfo::Utf8("<init>".into()),         // 12
+            CpInfo::Utf8("(LLanguageEnum;)V".into()), // 13
+            CpInfo::NameAndType {
+                name_index: 12,
+                descriptor_index: 13,
+            }, // 14
+            CpInfo::Methodref {
+                class_index: 11,
+                name_and_type_index: 14,
+            }, // 15
+            CpInfo::Utf8(class_name.to_string()),  // 16
+            CpInfo::Class { name_index: 16 },      // 17
+        ];
+        let this_class_idx = 17u16;
+        let code: Vec<u8> = vec![
+            NEW,
+            0,
+            11,   // new AudioSlot
+            0x59, // dup
+            GETSTATIC,
+            0,
+            9, // getstatic LanguageEnum.English
+            INVOKESPECIAL,
+            0,
+            15, // invokespecial AudioSlot.<init>(LLanguageEnum;)V
+        ];
+        let methods = vec![MethodSpec {
+            name_index: 1,
+            descriptor_index: 2,
+            code_attr_name_index: 3,
+            max_stack: 4,
+            code,
+        }];
+        encode_class(&cp, this_class_idx, &methods)
+    }
+
     #[test]
     fn ldcs_match_prefix_exact() {
         let ldcs = vec![
@@ -1165,6 +1500,188 @@ mod tests {
                 fp.label
             );
         }
+    }
+
+    // ── Phase A: identify_master_enums (Jar-level) ──────────────────────────
+
+    #[test]
+    fn identify_master_enums_matches_purpose_fingerprint() {
+        // Exact match: 8 ldcs, first 4 = the Purpose prefix, count ==
+        // expected_count exactly (abs_diff == 0). A decoy class with the
+        // same prefix but a wildly different count must be rejected and
+        // must NOT win over the exact match.
+        let good = class_with_ldc_strings(
+            "GoodPurpose",
+            &[
+                "Normal",
+                "Commentary",
+                "PiP",
+                "Trivia",
+                "Descriptive",
+                "Score",
+                "NoForced",
+                "NoForcedDescriptive",
+            ],
+        );
+        // Prefix matches but count is 100 — abs_diff(100, 8) = 92, far
+        // outside LDC_COUNT_TOLERANCE (4). Real logic must reject this
+        // class as a Purpose candidate entirely.
+        let mut decoy_values: Vec<&str> = vec!["Normal", "Commentary", "PiP", "Trivia"];
+        let filler: Vec<String> = (0..96).map(|i| format!("Filler{i}")).collect();
+        decoy_values.extend(filler.iter().map(String::as_str));
+        let decoy = class_with_ldc_strings("DecoyPurpose", &decoy_values);
+
+        let zip = build_zip(&[
+            ("com/bydeluxe/Good.class", good),
+            ("com/bydeluxe/Decoy.class", decoy),
+        ]);
+        let mut archive = open_jar(zip);
+        let enums = identify_master_enums(&mut archive);
+        let purpose = enums
+            .iter()
+            .find(|(label, _)| *label == "Purpose")
+            .unwrap_or_else(|| panic!("Purpose fingerprint not matched: {enums:?}"));
+        assert_eq!(purpose.1.class_name, "com/bydeluxe/Good.class");
+        assert_eq!(purpose.1.values.len(), 8);
+        assert_eq!(purpose.1.values[0], "Normal");
+        assert_eq!(purpose.1.values[7], "NoForcedDescriptive");
+    }
+
+    #[test]
+    fn identify_master_enums_accepts_count_at_the_tolerance_boundary() {
+        // abs_diff(expected_count, count) == LDC_COUNT_TOLERANCE (4) exactly
+        // must still be accepted (`> tolerance` rejects, so `== tolerance`
+        // is the last accepted value). This is the boundary `327:50`
+        // mutants (`>` -> `==`/`<`/`>=`) disagree on.
+        let mut values: Vec<&str> = vec!["Normal", "Commentary", "PiP", "Trivia"];
+        let filler: Vec<String> = (0..8).map(|i| format!("Filler{i}")).collect(); // 4+8=12, diff=4
+        values.extend(filler.iter().map(String::as_str));
+        assert_eq!(values.len(), 12);
+        let class = class_with_ldc_strings("BoundaryPurpose", &values);
+        let zip = build_zip(&[("com/bydeluxe/B.class", class)]);
+        let mut archive = open_jar(zip);
+        let enums = identify_master_enums(&mut archive);
+        assert!(
+            enums.iter().any(|(label, _)| *label == "Purpose"),
+            "a class exactly LDC_COUNT_TOLERANCE away from expected_count must still match"
+        );
+    }
+
+    #[test]
+    fn identify_master_enums_finds_nothing_without_com_bydeluxe_signal() {
+        // No FINGERPRINTS-matching class in the jar at all -> empty result
+        // (kills the `vec![]` mutant only vacuously if paired with the
+        // positive tests above proving non-emptiness on a real match).
+        let unrelated = class_with_ldc_strings("Unrelated", &["Foo", "Bar"]);
+        let zip = build_zip(&[("x/Unrelated.class", unrelated)]);
+        let mut archive = open_jar(zip);
+        assert!(identify_master_enums(&mut archive).is_empty());
+    }
+
+    // ── Phase C: find_binding_classes / count_master_enum_getstatic ────────
+
+    #[test]
+    fn count_master_enum_getstatic_counts_only_master_classes() {
+        // Directly exercises count_master_enum_getstatic on a synthetic
+        // ClassFile (no Jar needed — this function takes &ClassFile).
+        let master: HashSet<&str> = ["LanguageEnum"].into_iter().collect();
+        let code_bytes = class_with_getstatic_refs("X", "LanguageEnum", 5);
+        // Round-trip through ClassFile::parse to get a real &ClassFile.
+        let class =
+            super::super::class_reader::ClassFile::parse(&code_bytes).expect("fixture must parse");
+        assert_eq!(count_master_enum_getstatic(&class, &master), 5);
+
+        // getstatic refs to a class NOT in master_enum_classes must not count.
+        let other_master: HashSet<&str> = ["SomeOtherEnum"].into_iter().collect();
+        assert_eq!(count_master_enum_getstatic(&class, &other_master), 0);
+    }
+
+    #[test]
+    fn find_binding_classes_picks_top_candidates_above_threshold() {
+        // Class A: 100 getstatic refs (the top / binding class). B: 45
+        // (>40% of top, kept). F: 40 (EXACTLY the 40% threshold — pins
+        // both the `(top_count * 2) / 5` arithmetic and the `>=`
+        // comparison: any of the `460`/`461` arithmetic mutants shift
+        // the threshold away from exactly 40, and a `>= -> <` mutant at
+        // 461 would drop this exact-boundary entry). E: 39 (just BELOW
+        // the true 40% threshold — a mutant that shrinks the threshold
+        // below 39 would wrongly keep this). C: 10 (well below, always
+        // dropped). D: 3 — below MIN_GETSTATIC(4), never even a raw
+        // candidate.
+        let master_classes: HashSet<&str> = ["LanguageEnum"].into_iter().collect();
+        let a = class_with_getstatic_refs("A", "LanguageEnum", 100);
+        let b = class_with_getstatic_refs("B", "LanguageEnum", 45);
+        let f = class_with_getstatic_refs("F", "LanguageEnum", 40);
+        let e = class_with_getstatic_refs("E", "LanguageEnum", 39);
+        let c = class_with_getstatic_refs("C", "LanguageEnum", 10);
+        let d = class_with_getstatic_refs("D", "LanguageEnum", 3);
+        let zip = build_zip(&[
+            ("com/bydeluxe/A.class", a),
+            ("com/bydeluxe/B.class", b),
+            ("com/bydeluxe/F.class", f),
+            ("com/bydeluxe/E.class", e),
+            ("com/bydeluxe/C.class", c),
+            ("com/bydeluxe/D.class", d),
+        ]);
+        let mut archive = open_jar(zip);
+        let candidates = find_binding_classes(&mut archive, &master_classes);
+        let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "com/bydeluxe/A.class",
+                "com/bydeluxe/B.class",
+                "com/bydeluxe/F.class"
+            ],
+            "expected [A(100), B(45), F(40)] retained (>=40% of top, descending \
+             order, E(39)/C(10)/D(3) dropped), got {names:?}"
+        );
+        assert_eq!(candidates[0].1, 100);
+        assert_eq!(candidates[1].1, 45);
+    }
+
+    #[test]
+    fn find_binding_classes_empty_master_set_yields_no_candidates() {
+        let master_classes: HashSet<&str> = HashSet::new();
+        let a = class_with_getstatic_refs("A", "LanguageEnum", 100);
+        let zip = build_zip(&[("com/bydeluxe/A.class", a)]);
+        let mut archive = open_jar(zip);
+        assert!(find_binding_classes(&mut archive, &master_classes).is_empty());
+    }
+
+    // ── Phase D: decode_binding (Jar-level short-circuit wrapper) ───────────
+
+    #[test]
+    fn decode_binding_finds_named_class_and_stops_at_first_match() {
+        // `decode_binding` matches by the Jar entry path (the same string
+        // `find_binding_classes` returns), not by the class's own
+        // `this_class` name. Two entries: the target path carries a real
+        // `new AudioSlot; dup; getstatic; invokespecial` construction; a
+        // decoy at a different path carries none (and, being pure
+        // getstatic/pop, would also match nothing if walked). If the name
+        // comparison is broken (`!=` mutated to `==`), decode_binding would
+        // either never match the real target (empty result) or would match
+        // and decode the WRONG entry.
+        let target = class_with_simple_construction("Ignored");
+        let decoy = class_with_getstatic_refs("Ignored2", "LanguageEnum", 2);
+        let zip = build_zip(&[
+            ("com/bydeluxe/Target.class", target),
+            ("com/bydeluxe/Decoy.class", decoy),
+        ]);
+        let mut archive = open_jar(zip);
+        let master = lang_enum_master();
+
+        let ctors = decode_binding(&mut archive, "com/bydeluxe/Target.class", &master);
+        assert_eq!(
+            ctors.len(),
+            1,
+            "expected the Target entry's one construction"
+        );
+        assert_eq!(ctors[0].binding_type, "AudioSlot");
+
+        // A name with no matching entry must yield nothing (try_each_class
+        // never finds a Some).
+        assert!(decode_binding(&mut archive, "com/bydeluxe/NoSuchClass.class", &master).is_empty());
     }
 
     // ── Phase D bytecode walker tests ───────────────────────────────────────
@@ -1305,6 +1822,32 @@ mod tests {
     }
 
     #[test]
+    fn clinit_ldc_string_bytes_boundary_matches_256kib_not_1280() {
+        // `MAX_CLINIT_LDC_BYTES = 256 * 1024` (262144). A `* -> +` mutant at
+        // that computation collapses the cap to `256 + 1024` (1280) — 205x
+        // smaller. 1000-byte strings make the two cap values discriminate
+        // sharply: correct code retains 262 of them (262000 bytes, the
+        // 263rd would push to 263000 > 262144); the mutant retains only 1
+        // (the 2nd would push to 2000 > 1280).
+        const N: usize = 400;
+        let one = "x".repeat(1000);
+        let mut code = Vec::with_capacity(N * 2);
+        for _ in 0..N {
+            code.push(LDC);
+            code.push(4);
+        }
+        let class = class_with_clinit(ldc_pool(&one), 2, &code);
+        let ldcs = clinit_ldc_strings(&class).expect("<clinit> present");
+        assert_eq!(
+            ldcs.len(),
+            262,
+            "expected 262 retained 1000-byte strings under a 256 KiB cap, got {} \
+             — either the cap value or the truncation arithmetic changed",
+            ldcs.len()
+        );
+    }
+
+    #[test]
     fn clinit_ldc_strings_admits_largest_real_fingerprint() {
         // The biggest framework-stable enum is Language at 70 values; the cap
         // must not clip a real one.
@@ -1396,6 +1939,33 @@ mod tests {
             "a 3000-class jar with 200 bytes of clinit strings per class must \
              not be truncated"
         );
+    }
+
+    /// `insert` rejects when `bytes.saturating_add(cost) > MAX_CANDIDATE_TOTAL_BYTES`
+    /// — i.e. landing EXACTLY on the cap is still accepted; only strictly
+    /// exceeding it is rejected. A `>` -> `>=` mutant would reject the
+    /// exact-cap entry too. Two entries are sized so the second brings
+    /// `bytes` to precisely `MAX_CANDIDATE_TOTAL_BYTES`, not one byte over.
+    #[test]
+    fn candidate_pool_insert_accepts_landing_exactly_on_the_cap() {
+        let mut pool = CandidatePool::default();
+        // cost = name.len() + payload.len() = 1 + (CAP - 2) = CAP - 1.
+        let first_payload = "a".repeat(MAX_CANDIDATE_TOTAL_BYTES - 2);
+        assert!(pool.insert("a", vec![first_payload]));
+        assert_eq!(pool.bytes, MAX_CANDIDATE_TOTAL_BYTES - 1);
+
+        // cost = 1 (name "b") + 0 (empty string) = 1. bytes becomes exactly
+        // MAX_CANDIDATE_TOTAL_BYTES — must be ACCEPTED, not rejected.
+        let accepted = pool.insert("b", vec![String::new()]);
+        assert!(
+            accepted,
+            "an entry landing exactly on MAX_CANDIDATE_TOTAL_BYTES must be accepted, \
+             only entries that exceed it should be rejected"
+        );
+        assert_eq!(pool.bytes, MAX_CANDIDATE_TOTAL_BYTES);
+
+        // One more byte of cost now genuinely exceeds the cap and must be rejected.
+        assert!(!pool.insert("c", vec!["x".to_string()]));
     }
 
     // ── Construction accumulation bounds ────────────────────────────────────
@@ -1575,6 +2145,80 @@ mod tests {
     }
 
     #[test]
+    fn decode_binding_class_finds_the_clinit_method_and_emits_its_construction() {
+        // decode_binding_class wraps BindingDecoder over every method literally
+        // named "<clinit>" on the class. Exercises the method-selection
+        // (`member_name(m) != Some("<clinit>")`) and per-method-union
+        // truncation (`room == 0`) logic that decode_binding_class adds on
+        // top of the already-tested BindingDecoder::step/run.
+        //
+        // Pool layout (must hold "<clinit>"/"()V"/"Code" at 1/2/3 per
+        // `class_with_clinit`'s contract, while ALSO matching the fixed cp
+        // indices — 6/8/12 — the reused `new AudioSlot; dup; getstatic;
+        // invokespecial` bytecode below references):
+        //   1 Utf8 "<clinit>"          2 Utf8 "()V"            3 Utf8 "Code"
+        //   4 Utf8 "LanguageEnum"      5 Class->4
+        //   6 Fieldref{class:5,nat:9}  7 Utf8 "English"
+        //   8 Class->10 (AudioSlot)    9 NameAndType{name:7,desc:11}
+        //  10 Utf8 "AudioSlot"        11 Utf8 "LLanguageEnum;"
+        //  12 Methodref{class:8,nat:13}
+        //  13 NameAndType{name:14,desc:15}
+        //  14 Utf8 "<init>"           15 Utf8 "(LLanguageEnum;)V"
+        let pool = ConstantPool::from_entries(vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("<clinit>".into()),
+            CpInfo::Utf8("()V".into()),
+            CpInfo::Utf8("Code".into()),
+            CpInfo::Utf8("LanguageEnum".into()),
+            CpInfo::Class { name_index: 4 },
+            CpInfo::Fieldref {
+                class_index: 5,
+                name_and_type_index: 9,
+            },
+            CpInfo::Utf8("English".into()),
+            CpInfo::Class { name_index: 10 },
+            CpInfo::NameAndType {
+                name_index: 7,
+                descriptor_index: 11,
+            },
+            CpInfo::Utf8("AudioSlot".into()),
+            CpInfo::Utf8("LLanguageEnum;".into()),
+            CpInfo::Methodref {
+                class_index: 8,
+                name_and_type_index: 13,
+            },
+            CpInfo::NameAndType {
+                name_index: 14,
+                descriptor_index: 15,
+            },
+            CpInfo::Utf8("<init>".into()),
+            CpInfo::Utf8("(LLanguageEnum;)V".into()),
+        ]);
+        let code: Vec<u8> = vec![
+            NEW,
+            0,
+            8,    // new AudioSlot
+            0x59, // dup
+            GETSTATIC,
+            0,
+            6, // getstatic LanguageEnum.English
+            INVOKESPECIAL,
+            0,
+            12, // invokespecial AudioSlot.<init>(LLanguageEnum;)V
+        ];
+        let class = class_with_clinit(pool, 4, &code);
+        let master = lang_enum_master();
+        let constructions = decode_binding_class(&class, &master);
+        assert_eq!(
+            constructions.len(),
+            1,
+            "expected exactly 1 Construction from the single <clinit>, got {}",
+            constructions.len()
+        );
+        assert_eq!(constructions[0].binding_type, "AudioSlot");
+    }
+
+    #[test]
     fn binding_decoder_recognizes_simple_construction() {
         // Synthetic <clinit>:
         //   new AudioSlot       (cp idx 8 -> Class -> Utf8 "AudioSlot")
@@ -1653,6 +2297,217 @@ mod tests {
         // Should still produce one construction, ignoring the
         // standalone int pushes that have no construction context.
         assert_eq!(decoder.constructions.len(), 1);
+    }
+
+    #[test]
+    fn binding_decoder_dup_duplicates_top_of_stack() {
+        // JVMS §3.11.7 `dup` (0x59): duplicate the top stack value. Checked
+        // directly on `decoder.stack` (not via emitted Constructions, which
+        // a single `new X; dup; invokespecial` sequence can satisfy either
+        // way — the leftover copy `dup` is responsible for only matters
+        // once something ELSE consumes it afterward). `new AudioSlot; dup`
+        // with no invokespecial must leave exactly two NewObj("AudioSlot")
+        // entries.
+        let pool = build_simple_pool();
+        let master = lang_enum_master();
+        let code: Vec<u8> = vec![NEW, 0, 8, 0x59 /* dup */];
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: 4,
+            max_locals: 0,
+            code: &code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        assert_eq!(
+            decoder.stack.len(),
+            2,
+            "dup must duplicate, not skip, the top value"
+        );
+        for v in &decoder.stack {
+            match v {
+                StackVal::NewObj(name) => assert_eq!(name, "AudioSlot"),
+                other => panic!("expected NewObj(\"AudioSlot\") x2, got {other:?}"),
+            }
+        }
+    }
+
+    /// Pool with a single Methodref (cp index 6) to `AnyClass.m<descriptor>`,
+    /// for the `invokevirtual`/`invokestatic`/`invokeinterface` arg-popping
+    /// tests below.
+    fn call_ref_pool(descriptor: &str) -> ConstantPool {
+        ConstantPool::from_entries(vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("AnyClass".into()),      // 1
+            CpInfo::Class { name_index: 1 },      // 2
+            CpInfo::Utf8("m".into()),             // 3
+            CpInfo::Utf8(descriptor.to_string()), // 4
+            CpInfo::NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            }, // 5
+            CpInfo::Methodref {
+                class_index: 2,
+                name_and_type_index: 5,
+            }, // 6
+        ])
+    }
+
+    #[test]
+    fn binding_decoder_invokevirtual_pops_receiver_plus_args() {
+        // JVMS §6.5 `invokevirtual`/`invokeinterface` pop the receiver
+        // PLUS the descriptor's args (`extra = 1` for opcodes 0xB6/0xB9);
+        // `invokestatic` (0xB8) pops ONLY the args (no receiver). Each
+        // case below pushes exactly `to_pop` placeholder ints and checks
+        // the stack is fully drained — a wrong `extra`/`arg_count+extra`
+        // computation leaves a wrong number of leftovers.
+        let master = lang_enum_master();
+        let run_stack_len = |opcode: u8, descriptor: &str, n_pushes: usize| -> usize {
+            let pool = call_ref_pool(descriptor);
+            let mut code = Vec::new();
+            for i in 0..n_pushes {
+                code.push(ICONST_0 + i as u8); // distinct placeholder ints
+            }
+            code.push(opcode);
+            code.push(0);
+            code.push(6);
+            if opcode == 0xB9 {
+                // invokeinterface (JVMS §6.5): 2 extra operand bytes —
+                // `count` (here: arg slot count + 1 for the receiver, per
+                // spec) and a reserved zero byte.
+                code.push((n_pushes) as u8);
+                code.push(0);
+            }
+            let attr = super::super::class_reader::CodeAttribute {
+                max_stack: 8,
+                max_locals: 0,
+                code: &code,
+            };
+            let mut decoder = BindingDecoder::new(&pool, &master);
+            decoder.run(&attr);
+            decoder.stack.len()
+        };
+
+        // invokevirtual, 1-arg descriptor: pops receiver + 1 arg = 2.
+        assert_eq!(
+            run_stack_len(0xB6, "(I)V", 2),
+            0,
+            "invokevirtual must pop receiver + args"
+        );
+        // invokeinterface, 1-arg descriptor: same as invokevirtual.
+        assert_eq!(
+            run_stack_len(0xB9, "(I)V", 2),
+            0,
+            "invokeinterface must pop receiver + args"
+        );
+        // invokestatic, 2-arg descriptor: pops ONLY the 2 args, no receiver.
+        assert_eq!(
+            run_stack_len(0xB8, "(II)V", 2),
+            0,
+            "invokestatic must pop exactly the arg count, no receiver"
+        );
+        // invokestatic with a leftover value UNDER the args: only the args
+        // are popped, the leftover survives. Distinguishes a `>` mutant at
+        // the `len < to_pop` guard (which would incorrectly `clear()` the
+        // whole stack here instead of leaving the leftover).
+        assert_eq!(
+            run_stack_len(0xB8, "(I)V", 2), // 1 leftover + 1 real arg pushed
+            1,
+            "only the descriptor's args must be popped, not the whole stack"
+        );
+    }
+
+    #[test]
+    fn binding_decoder_invoke_family_defensively_clears_on_stack_underflow() {
+        // If the symbolic stack has FEWER entries than the call needs to
+        // pop (malformed/adversarial bytecode, or earlier drift), the
+        // decoder must defensively clear rather than underflow-subtract
+        // (`len - to_pop` with `len < to_pop` would panic on the `usize`
+        // subtraction).
+        let pool = call_ref_pool("(II)V"); // needs to_pop = 2
+        let code: Vec<u8> = vec![ICONST_0, 0xB8, 0, 6]; // only 1 value on stack
+        let master = lang_enum_master();
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: 8,
+            max_locals: 0,
+            code: &code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        assert_eq!(
+            decoder.stack.len(),
+            0,
+            "stack-underflowing invoke must clear defensively, not underflow-subtract"
+        );
+    }
+
+    /// Pool for a single-int-arg constructor `AudioSlot.<init>(I)V`, used by
+    /// `binding_decoder_int_push_opcodes_produce_the_right_value` to isolate
+    /// each int-push opcode's produced VALUE (not just "a construction
+    /// happened") — JVMS §3.11.3 (`iconst_<i>`, `bipush`, `sipush`, `ldc` of
+    /// a `CONSTANT_Integer`) each push a specific known int.
+    fn int_ctor_pool() -> ConstantPool {
+        ConstantPool::from_entries(vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("AudioSlot".into()), // 1
+            CpInfo::Class { name_index: 1 },  // 2
+            CpInfo::Utf8("<init>".into()),    // 3
+            CpInfo::Utf8("(I)V".into()),      // 4
+            CpInfo::NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            }, // 5
+            CpInfo::Methodref {
+                class_index: 2,
+                name_and_type_index: 5,
+            }, // 6
+            CpInfo::Integer(12345),           // 7 — for the `ldc`/Integer case
+        ])
+    }
+
+    #[test]
+    fn binding_decoder_int_push_opcodes_produce_the_right_value() {
+        // JVMS §3.11.3: iconst_<i> pushes exactly i (i in -1..=5); bipush
+        // sign-extends its i8 operand; sipush sign-extends its i16 operand;
+        // ldc of a CONSTANT_Integer pushes that constant. Each is checked
+        // as the sole arg of `new AudioSlot; dup; <push>; invokespecial
+        // AudioSlot.<init>(I)V` so a wrong (or absent, if the opcode's match
+        // arm were deleted) push shows up as a wrong (or missing/Unknown)
+        // arg value, not just "some construction happened".
+        let cases: Vec<(&str, Vec<u8>, i32)> = vec![
+            ("iconst_m1", vec![ICONST_M1], -1),
+            ("iconst_0", vec![ICONST_0], 0),
+            ("iconst_1", vec![ICONST_1], 1),
+            ("iconst_2", vec![ICONST_2], 2),
+            ("iconst_3", vec![ICONST_3], 3),
+            ("iconst_4", vec![ICONST_4], 4),
+            ("iconst_5", vec![ICONST_5], 5),
+            ("bipush -100", vec![BIPUSH, 0x9C], -100), // 0x9C as i8 = -100
+            ("sipush 4660", vec![SIPUSH, 0x12, 0x34], 4660), // 0x1234
+            ("ldc Integer(12345)", vec![LDC, 7], 12345),
+        ];
+        let pool = int_ctor_pool();
+        let master = lang_enum_master();
+        for (label, push, expected) in cases {
+            let mut code = vec![NEW, 0, 2, 0x59 /* dup */];
+            code.extend_from_slice(&push);
+            code.extend_from_slice(&[INVOKESPECIAL, 0, 6]);
+            let attr = super::super::class_reader::CodeAttribute {
+                max_stack: 4,
+                max_locals: 0,
+                code: &code,
+            };
+            let mut decoder = BindingDecoder::new(&pool, &master);
+            decoder.run(&attr);
+            assert_eq!(
+                decoder.constructions.len(),
+                1,
+                "{label}: expected exactly 1 construction"
+            );
+            match &decoder.constructions[0].args[0] {
+                StackVal::Int(n) => assert_eq!(*n, expected, "{label}: wrong int value"),
+                other => panic!("{label}: expected StackVal::Int({expected}), got {other:?}"),
+            }
+        }
     }
 
     #[test]

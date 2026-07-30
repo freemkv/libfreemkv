@@ -963,6 +963,24 @@ mod tests {
             sniff_video_codec(&[0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]),
             None
         );
+
+        // Every byte of the `00 00 01` marker is load-bearing: a near-miss
+        // that gets ANY one of the three bytes wrong must not be recognized.
+        assert_eq!(
+            sniff_video_codec(&[0x05, 0x00, 0x01, 0xB3]),
+            None,
+            "leading byte must be 0x00, not just any byte"
+        );
+        assert_eq!(
+            sniff_video_codec(&[0x00, 0x05, 0x01, 0xB3]),
+            None,
+            "second byte must be 0x00, not just any byte"
+        );
+        assert_eq!(
+            sniff_video_codec(&[0x00, 0xFF, 0x01, 0xB3]),
+            None,
+            "the middle byte of the marker must actually be checked, not skipped"
+        );
     }
 
     #[test]
@@ -972,6 +990,13 @@ mod tests {
             Some(Codec::Ac3Plus)
         );
         assert_eq!(sniff_audio_codec(&[0x00, 0x01, 0x02, 0x03]), None);
+        // Both syncword bytes are required together: a lone 0x0B with no 0x77
+        // partner anywhere must not be recognized.
+        assert_eq!(
+            sniff_audio_codec(&[0x0B, 0x00, 0x0B, 0x01]),
+            None,
+            "0x0B alone (no 0x77 partner) is not the E-AC-3 syncword"
+        );
     }
 
     // ── EVO head probe → streams ──────────────────────────────────────────
@@ -1393,5 +1418,491 @@ mod tests {
         assert_eq!(mm.chapters[0].name, "1", "bare ordinal chapter name");
         // Both feature halves are in ONE title's extents.
         assert!(!mm.extents.is_empty());
+    }
+
+    // ── parse_vti_clip_order: bound / cap / termination edge cases ────────
+
+    /// The outer scan cap (`MAX_VTI_HITS`) must be exact, not off-by-one. Every
+    /// entry here is stride-aligned so they ALL land in one residue bucket —
+    /// unlike the scattered-token cap test above, the cap is directly visible
+    /// in the output length (the total scanned-hit count IS the bucket size).
+    #[test]
+    fn parse_vti_clip_order_caps_hits_at_exact_boundary_same_residue() {
+        let table_start = 0x200usize;
+        let n = MAX_VTI_HITS + 50;
+        let mut v = vec![0u8; table_start + n * VTI_CLIP_ENTRY_STRIDE];
+        v[..HDDVD_VTI_MAGIC.len()].copy_from_slice(HDDVD_VTI_MAGIC);
+        for i in 0..n {
+            let off = table_start + i * VTI_CLIP_ENTRY_STRIDE + 0x42;
+            v[off..off + b"X.EVO".len()].copy_from_slice(b"X.EVO");
+        }
+        let out = parse_vti_clip_order(&v);
+        assert_eq!(
+            out.len(),
+            MAX_VTI_HITS,
+            "the scan must stop at exactly MAX_VTI_HITS, not one past it"
+        );
+    }
+
+    /// A name-byte run that reaches the exact end of the buffer with NO NUL
+    /// terminator must not be read out of bounds — the inner scan (and the
+    /// nul-terminated check) must stop at the buffer boundary rather than
+    /// indexing one past it.
+    #[test]
+    fn parse_vti_clip_order_handles_unterminated_name_run_at_buffer_end() {
+        let mut v = HDDVD_VTI_MAGIC.to_vec();
+        v.extend_from_slice(b"TRAILING_JUNK_NO_TERMINATOR"); // all ascii-graphic, no NUL, ends at EOF
+        let out = parse_vti_clip_order(&v);
+        assert!(
+            out.is_empty(),
+            "unterminated trailing run yields no entries (and must not panic)"
+        );
+    }
+
+    /// A `.EVO`-suffixed name run followed by an in-bounds byte that is NOT a
+    /// NUL must not be treated as terminated — being merely in-bounds is not
+    /// the same as actually finding a NUL.
+    #[test]
+    fn parse_vti_clip_order_requires_actual_nul_terminator_not_just_in_bounds() {
+        let mut v = HDDVD_VTI_MAGIC.to_vec();
+        v.extend_from_slice(b"FEATURE.EVO");
+        v.push(0x01); // in-bounds terminator byte, but NOT a NUL
+        v.extend_from_slice(&[0u8; 16]);
+        let out = parse_vti_clip_order(&v);
+        assert!(
+            out.is_empty(),
+            "a non-NUL byte after .EVO must not count as terminated"
+        );
+    }
+
+    /// A NUL-terminated ascii run that does NOT end in ".EVO" must never be
+    /// collected, no matter how many repeat at a shared residue: nul-
+    /// termination and the `.EVO`-suffix check are independent gates, one must
+    /// not short-circuit the other away.
+    #[test]
+    fn parse_vti_clip_order_rejects_nul_terminated_names_without_evo_suffix() {
+        let mut v = HDDVD_VTI_MAGIC.to_vec();
+        for _ in 0..20 {
+            v.extend_from_slice(b"HELLO\0"); // nul-terminated, 5 bytes, not .EVO
+        }
+        let out = parse_vti_clip_order(&v);
+        assert!(
+            out.is_empty(),
+            "non-.EVO nul-terminated names must not be collected"
+        );
+    }
+
+    /// A short (<4-byte) nul-terminated name run must be rejected by the
+    /// length guard BEFORE the `.EVO`-suffix slice runs — slicing a name
+    /// shorter than 4 bytes at `name.len() - 4` would otherwise underflow.
+    /// Must not panic, and must not be collected.
+    #[test]
+    fn parse_vti_clip_order_short_circuits_length_check_before_slicing_short_names() {
+        let mut v = HDDVD_VTI_MAGIC.to_vec();
+        v.push(b' '); // non-name-byte separator: isolates "AB" from the magic run
+        v.extend_from_slice(b"AB\0"); // 2-byte name, under the 4-byte slice width
+        let out = parse_vti_clip_order(&v);
+        assert!(
+            out.is_empty(),
+            "short name is rejected without slicing/panicking"
+        );
+    }
+
+    // ── EVO_ES_SAMPLE_CAP / collect_es capping ─────────────────────────────
+
+    /// The documented sample cap is 128 KiB, i.e. `128 * 1024`.
+    #[test]
+    fn evo_es_sample_cap_is_128_kib() {
+        assert_eq!(EVO_ES_SAMPLE_CAP, 128 * 1024);
+    }
+
+    /// Plain-video-range (`0xE0..=0xEF`) samples stop growing once the buffer
+    /// has reached the cap — a subsequent packet must not push it past.
+    #[test]
+    fn collect_es_caps_video_sample_at_the_length_cap() {
+        use crate::consts::pes_stream_id::VIDEO;
+        let mut video = Vec::new();
+        let mut video_pid: Option<u16> = None;
+        let mut audio = BTreeMap::new();
+        collect_es(
+            &ps_pkt(VIDEO, None, vec![0xAA; EVO_ES_SAMPLE_CAP]),
+            &mut video,
+            &mut video_pid,
+            &mut audio,
+        );
+        assert_eq!(video.len(), EVO_ES_SAMPLE_CAP);
+        collect_es(
+            &ps_pkt(VIDEO, None, vec![0xBB; 16]),
+            &mut video,
+            &mut video_pid,
+            &mut audio,
+        );
+        assert_eq!(
+            video.len(),
+            EVO_ES_SAMPLE_CAP,
+            "no further growth once at the cap"
+        );
+    }
+
+    /// The VC-1 extended-stream-id (0xFD, ext 0x55) video branch has its own
+    /// cap check; it must behave identically to the plain-video branch.
+    #[test]
+    fn collect_es_caps_vc1_video_sample_at_the_length_cap() {
+        let mut video = Vec::new();
+        let mut video_pid: Option<u16> = None;
+        let mut audio = BTreeMap::new();
+        collect_es(
+            &ps_pkt(0xFD, Some(0x55), vec![0xAA; EVO_ES_SAMPLE_CAP]),
+            &mut video,
+            &mut video_pid,
+            &mut audio,
+        );
+        assert_eq!(video.len(), EVO_ES_SAMPLE_CAP);
+        collect_es(
+            &ps_pkt(0xFD, Some(0x55), vec![0xBB; 16]),
+            &mut video,
+            &mut video_pid,
+            &mut audio,
+        );
+        assert_eq!(
+            video.len(),
+            EVO_ES_SAMPLE_CAP,
+            "no further growth once at the cap (VC-1 0xFD branch)"
+        );
+    }
+
+    /// The per-sub-id audio branch has its own cap check; same requirement.
+    #[test]
+    fn collect_es_caps_audio_sample_at_the_length_cap() {
+        use crate::consts::pes_stream_id::PRIVATE_STREAM_1;
+        let mut video = Vec::new();
+        let mut video_pid: Option<u16> = None;
+        let mut audio = BTreeMap::new();
+        collect_es(
+            &ps_pkt(PRIVATE_STREAM_1, Some(0xC0), vec![0xAA; EVO_ES_SAMPLE_CAP]),
+            &mut video,
+            &mut video_pid,
+            &mut audio,
+        );
+        assert_eq!(audio[&0xC0].len(), EVO_ES_SAMPLE_CAP);
+        collect_es(
+            &ps_pkt(PRIVATE_STREAM_1, Some(0xC0), vec![0xBB; 16]),
+            &mut video,
+            &mut video_pid,
+            &mut audio,
+        );
+        assert_eq!(
+            audio[&0xC0].len(),
+            EVO_ES_SAMPLE_CAP,
+            "no further growth once at the cap (audio branch)"
+        );
+    }
+
+    // ── read_adv_obj_xpl: prefix AND suffix are both required ──────────────
+
+    /// A file matching the `vplst` prefix but NOT the `.xpl` suffix must not
+    /// be adopted as the playlist — both conditions are independently
+    /// required, one must not be short-circuited away by the other.
+    #[test]
+    fn read_adv_obj_xpl_requires_both_vplst_prefix_and_xpl_suffix() {
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "ADV_OBJ".to_string(),
+                icb_lba: 30,
+                dir_data_lba: 31,
+                files: vec![file_with(
+                    "VPLST_NOTES.TXT",
+                    40,
+                    4000,
+                    b"not a playlist".to_vec(),
+                    true,
+                )],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        assert!(
+            read_adv_obj_xpl(&mut disc, &udf).is_none(),
+            "prefix match alone (not ending .xpl) must not select a file"
+        );
+    }
+
+    // ── compose_xpl_titles: size/offset arithmetic ─────────────────────────
+
+    /// Direct unit test of the arithmetic composing a title from its XPL
+    /// clips: clip sizes are SUMMED (not multiplied), title-time in/out ticks
+    /// are `seconds * 45000` (not divided), and `duration_secs` is
+    /// `end - begin` (not `end + begin` or a division).
+    #[test]
+    fn compose_xpl_titles_sums_sizes_and_computes_in_out_times() {
+        let clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = [
+            (
+                "a.evo".to_string(),
+                (
+                    "A.EVO".to_string(),
+                    1000u64,
+                    vec![Extent {
+                        start_lba: 1,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+            (
+                "b.evo".to_string(),
+                (
+                    "B.EVO".to_string(),
+                    2000u64,
+                    vec![Extent {
+                        start_lba: 2,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let xpl_titles = vec![XplTitle {
+            number: 1,
+            name: "T".to_string(),
+            duration_secs: 10.0,
+            clips: vec![
+                XplClip {
+                    evo: "a.evo".to_string(),
+                    begin_secs: 2.0,
+                    end_secs: 5.0,
+                },
+                XplClip {
+                    evo: "b.evo".to_string(),
+                    begin_secs: 5.0,
+                    end_secs: 9.0,
+                },
+            ],
+            chapters: vec![],
+        }];
+        let mut disc = MemDisc::new();
+        let titles = compose_xpl_titles(&mut disc, &xpl_titles, &clip_extents);
+        assert_eq!(titles.len(), 1);
+        let t = &titles[0];
+        assert_eq!(t.size_bytes, 3000, "clip sizes summed, not multiplied");
+        assert_eq!(
+            t.clips[0].in_time,
+            (2.0f64 * 45000.0) as u32,
+            "in_time is begin_secs * 45000, not divided"
+        );
+        assert_eq!(
+            t.clips[0].out_time,
+            (5.0f64 * 45000.0) as u32,
+            "out_time is end_secs * 45000, not divided"
+        );
+        assert!(
+            (t.clips[0].duration_secs - 3.0).abs() < 1e-9,
+            "duration_secs is end_secs - begin_secs, not +/÷: got {}",
+            t.clips[0].duration_secs
+        );
+        assert!(
+            (t.clips[1].duration_secs - 4.0).abs() < 1e-9,
+            "second clip's duration is also end - begin: got {}",
+            t.clips[1].duration_secs
+        );
+    }
+
+    // ── Disc::scan_hddvd_titles: VTI-selection / extent-filter guards ──────
+
+    /// A file carrying the real `ADVANCED-VTS` magic but the WRONG extension
+    /// (not `.vti`) must never be adopted as the navigation file. Absent a
+    /// real `.vti` file, the scan must fall back to one title per clip (no
+    /// VTI-driven feature composition) rather than trusting a same-content
+    /// impostor by name-agnostic magic alone.
+    #[test]
+    fn scan_hddvd_titles_ignores_a_vti_look_alike_with_the_wrong_extension() {
+        let mut disc = MemDisc::new();
+        let vti_bytes = synthetic_vti(&["FEATURE_1.EVO", "FEATURE_2.EVO"]);
+        let files = vec![
+            file_with("IMPOSTER.DAT", 90, 20000, vti_bytes, true),
+            file("FEATURE_1.EVO", 100, 5000, 10 * 2048, true),
+            file("FEATURE_2.EVO", 101, 8000, 6 * 2048, true),
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        assert_eq!(
+            titles.len(),
+            2,
+            "no real .vti present -> no VTI-driven composition, one title per clip"
+        );
+    }
+
+    /// A clip whose file has a zero-byte size (a degenerate/empty allocation:
+    /// its ICB's allocation descriptor has `data_len == 0`, the UDF AD-list
+    /// terminator, so `file_extents` yields no extent at all) must not
+    /// produce a title. NOTE: this exercises the *upstream* `data_len == 0`
+    /// terminator path in [`crate::udf::UdfFs::file_extents`], not the
+    /// `sectors > 0 && lba > 0` guard in `scan_hddvd_titles` itself — with
+    /// this fixture (`file_extents` never returns a `(lba, 0)` tuple, and
+    /// `PART_START` unconditionally makes every resolved `lba` positive)
+    /// that guard is unreachable in a divergent way; kept here as a
+    /// regression check on the zero-byte-file behavior in its own right.
+    #[test]
+    fn scan_hddvd_titles_excludes_a_clip_with_zero_sectors() {
+        let mut disc = MemDisc::new();
+        let files = vec![
+            file("REAL.EVO", 100, 5000, 4 * 2048, true), // ordinary, valid clip
+            file("BOGUS.EVO", 101, 9000, 0, true),       // size 0 -> zero-sector extent
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        assert_eq!(
+            titles.len(),
+            1,
+            "the zero-sector clip must not produce a title"
+        );
+        assert_eq!(titles[0].playlist, "REAL.EVO");
+    }
+
+    // ── probe_evo_streams: sector-cursor bookkeeping ───────────────────────
+
+    /// A zero-sector extent must be skipped outright, never entering the read
+    /// loop — `left` (an unsigned sector count) starting at 0 must gate the
+    /// loop closed. (A `left >= 0` tautology here would spin forever: `n`
+    /// would be pinned at 0, so neither `lba`, `left`, nor `remaining` would
+    /// ever change — a non-terminating loop reachable from a crafted extent
+    /// list.)
+    #[test]
+    fn probe_evo_streams_skips_a_zero_sector_extent_without_reading() {
+        let mut disc = MemDisc::new();
+        let extent = Extent {
+            start_lba: 500_000,
+            sector_count: 0,
+        };
+        let streams = probe_evo_streams(&mut disc, std::slice::from_ref(&extent));
+        assert!(streams.is_empty(), "a zero-sector extent yields no streams");
+    }
+
+    /// The read cursor must advance FORWARD by each chunk's sector count, not
+    /// backward — real content living only in the second 512-sector (1 MiB)
+    /// chunk must be reached.
+    #[test]
+    fn probe_evo_streams_advances_lba_forward_across_chunk_reads() {
+        let mut disc = MemDisc::new();
+        let start_lba = 100_000u32;
+        // First chunk (512 sectors): inert filler, no start codes.
+        disc.put_bytes(start_lba, &vec![0x55u8; 512 * 2048]);
+        // Second chunk: the real EVO content (H.264 video PES).
+        let evo = synthetic_evo();
+        disc.put_bytes(start_lba + 512, &evo);
+        let extent = Extent {
+            start_lba,
+            sector_count: 512 + (evo.len() as u32).div_ceil(2048),
+        };
+
+        let streams = probe_evo_streams(&mut disc, std::slice::from_ref(&extent));
+        let has_h264 = streams
+            .iter()
+            .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264));
+        assert!(
+            has_h264,
+            "the second 1 MiB chunk must be read from the correct (forward) LBA"
+        );
+    }
+
+    /// The read loop must stop at the extent's DECLARED `sector_count` — data
+    /// living just past it must never be read (a buffer over-read past the
+    /// caller-supplied extent bound, on untrusted disc-layout input).
+    #[test]
+    fn probe_evo_streams_stops_reading_at_the_extents_declared_sector_count() {
+        let mut disc = MemDisc::new();
+        let start_lba = 200_000u32;
+        let declared_sectors = 4u32;
+        disc.put_bytes(start_lba, &vec![0x55u8; declared_sectors as usize * 2048]);
+        // Real H.264 PES data placed just PAST the declared extent — must
+        // never be read.
+        let evo = synthetic_evo();
+        disc.put_bytes(start_lba + declared_sectors, &evo);
+        let extent = Extent {
+            start_lba,
+            sector_count: declared_sectors,
+        };
+
+        let streams = probe_evo_streams(&mut disc, std::slice::from_ref(&extent));
+        let has_h264 = streams
+            .iter()
+            .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264));
+        assert!(
+            !has_h264,
+            "must not read past the extent's declared sector_count"
+        );
+    }
+
+    /// The total read budget (`EVO_PROBE_SECTORS`) must be enforced ACROSS
+    /// extents, not just within one — once it is exhausted by an earlier
+    /// extent, a later extent in the same probe must not be read at all.
+    #[test]
+    fn probe_evo_streams_caps_total_reads_across_extents_at_evo_probe_sectors() {
+        let mut disc = MemDisc::new();
+        let first_lba = 300_000u32;
+        disc.put_bytes(first_lba, &vec![0x55u8; EVO_PROBE_SECTORS as usize * 2048]);
+        // A second extent, following the first in the extents list: once the
+        // whole EVO_PROBE_SECTORS budget is spent on the first, this must
+        // never be reached.
+        let second_lba = first_lba + EVO_PROBE_SECTORS;
+        let evo = synthetic_evo();
+        disc.put_bytes(second_lba, &evo);
+
+        let extents = vec![
+            Extent {
+                start_lba: first_lba,
+                sector_count: EVO_PROBE_SECTORS,
+            },
+            Extent {
+                start_lba: second_lba,
+                sector_count: 10,
+            },
+        ];
+        let streams = probe_evo_streams(&mut disc, &extents);
+        let has_h264 = streams
+            .iter()
+            .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264));
+        assert!(
+            !has_h264,
+            "must not read past the total EVO_PROBE_SECTORS budget across extents"
+        );
     }
 }

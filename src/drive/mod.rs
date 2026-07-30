@@ -1536,6 +1536,27 @@ mod command_tests {
         assert!(build_error_recovery_select_payload(&bad).is_none());
     }
 
+    /// Boundary for the "does the buffer hold the full 3-byte page header
+    /// (code/length/flags)?" guard: `page_off + 3 > sense.len()`. Build a
+    /// buffer that is EXACTLY long enough (no slack) — `page_off + 3 ==
+    /// sense.len()` — which must be accepted (`> ` is false), not rejected
+    /// (a `>=` mutation would wrongly reject the last valid byte and return
+    /// None even though every byte the function touches is in bounds).
+    #[test]
+    fn error_recovery_payload_accepts_exact_minimum_length() {
+        // No block descriptors: page starts right after the 8-byte header.
+        // Page needs exactly 3 bytes (code, length, flags) -> total 11.
+        let mut sense = vec![0u8; MODE10_HEADER_LEN + 3];
+        let po = MODE10_HEADER_LEN;
+        sense[po] = MODE_PAGE_ERROR_RECOVERY;
+        sense[po + 1] = 0x00; // page length field (unused by this function)
+        sense[po + 2] = ERP_FLAG_DTE; // flags: DTE on, PER/TB off
+        let out = build_error_recovery_select_payload(&sense)
+            .expect("page_off + 3 == len is exactly enough room, must be accepted");
+        assert_eq!(out[po + 2] & ERP_FLAG_PER, ERP_FLAG_PER, "PER set");
+        assert_eq!(out[po + 2] & ERP_FLAG_DTE, 0, "DTE cleared");
+    }
+
     /// Mock transport: returns a fixed data payload (copied into the
     /// caller's buffer, truncated to fit) on every `execute()`.
     struct FixedTransport {
@@ -1803,6 +1824,37 @@ mod command_tests {
         );
     }
 
+    /// The existing CDB-encoding test (`read_builds_read10_cdb_with_be_lba_and_count`)
+    /// uses LBA `0x00AB_CDEF` and count `2` — both of which have a ZERO top
+    /// byte/top-byte-of-count, so a `(lba >> 24) as u8` or `(count >> 8) as
+    /// u8` silently mutated to a left shift still yields `0x00` (any
+    /// left-shift of at least 8 bits zeroes the low byte a `u8` cast keeps),
+    /// and the assertion can't tell the two apart. Use values with a NONZERO
+    /// top byte so a right-shift mutated to a left-shift is observable.
+    #[test]
+    fn read_cdb_shifts_are_not_masked_by_a_zero_top_byte() {
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(300 * 2048));
+        let mut buf = vec![0u8; 300 * 2048];
+        // count = 300 (0x012C): count >> 8 == 0x01, nonzero — a `<<`
+        // mutation would instead yield 0x00.
+        d.read(0xAABB_CCDD, 300, &mut buf, false).unwrap();
+        let c = cdb.lock().unwrap();
+        assert_eq!(
+            &c[2..6],
+            &[0xAA, 0xBB, 0xCC, 0xDD],
+            "LBA bytes, including the >>24 top byte, must be big-endian verbatim"
+        );
+        assert_eq!(
+            &c[7..9],
+            &[0x01, 0x2C],
+            "count bytes, including the >>8 top byte"
+        );
+    }
+
     #[test]
     fn read_recovery_flag_selects_60s_timeout() {
         // recovery=true must use READ_RECOVERY_TIMEOUT_MS (60 s); false
@@ -2059,6 +2111,69 @@ mod command_tests {
         assert_eq!(*reads.lock().unwrap(), vec![(0, 3)], "single CDB, no split");
     }
 
+    /// Transport that fills whatever slice of `data` it's given with a
+    /// marker byte derived from the CDB's LBA, so a test can verify BYTE
+    /// POSITION, not just which (lba, count) pairs were issued.
+    struct PlacementTransport;
+    impl ScsiTransport for PlacementTransport {
+        fn max_transfer_bytes(&self) -> usize {
+            4 * 2048
+        }
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            if cdb.first() != Some(&crate::scsi::SCSI_READ_10) || cdb.len() < 10 {
+                return Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: data.len(),
+                    sense: [0u8; 32],
+                });
+            }
+            let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+            data.fill((lba + 1) as u8);
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: data.len(),
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    /// The chunk loop computes each chunk's destination slice as
+    /// `buf[done * 2048 .. done * 2048 + chunk * 2048]`. `reads.lock()`-style
+    /// assertions on the (lba, count) pairs alone can't tell `done * 2048`
+    /// apart from a corrupted `done + 2048` (chunk boundaries still line up
+    /// on nice round numbers for small test LBAs, and neither mock transport
+    /// above touches the buffer at all) — this test writes a distinct marker
+    /// per chunk and checks it landed at the BYTE offset the request maps
+    /// to, catching a `*` -> `+`/`/` mutation in the offset arithmetic that
+    /// would silently misplace or overlap chunk data written from the
+    /// physical drive into the caller's assembled buffer.
+    #[test]
+    fn read_chunks_write_into_correctly_offset_buffer_regions() {
+        // max_transfer = 4 sectors (8192 bytes): a 10-sector read at LBA 0
+        // splits into (lba=0,4), (lba=4,4), (lba=8,2).
+        let mut d = Drive::from_transport_for_test(Box::new(PlacementTransport));
+        let mut buf = vec![0u8; 10 * 2048];
+        d.read(0, 10, &mut buf, false).unwrap();
+        assert!(
+            buf[0..8192].iter().all(|&b| b == 1),
+            "chunk at LBA 0 (marker 1) must fill bytes [0, 8192)"
+        );
+        assert!(
+            buf[8192..16384].iter().all(|&b| b == 5),
+            "chunk at LBA 4 (marker 5) must fill bytes [8192, 16384), not overlap the first chunk"
+        );
+        assert!(
+            buf[16384..20480].iter().all(|&b| b == 9),
+            "chunk at LBA 8 (marker 9) must fill bytes [16384, 20480)"
+        );
+    }
+
     /// The multi-chunk path slices the caller's buffer by `count * 2048` with no
     /// length check, so an undersized `buf` PANICKED ('range end index out of
     /// range') out of the public `Drive::read` / `Drive::read_fua` — while the
@@ -2177,6 +2292,30 @@ mod command_tests {
         // be masked. 0xFE has low bits 0b10 = DiscPresent.
         let mut d = drive_with(media_event_reply(0xFE));
         assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
+    }
+
+    /// The `bytes_transferred >= 6` guard exists so byte 5 (Media Status) is
+    /// only trusted when the transport actually delivered it. Craft a SHORT
+    /// transfer (5 bytes) whose delivered prefix (bytes 0-2) still passes
+    /// every OTHER check a look-ahead decode would make (descriptor_len=6,
+    /// NEA clear, class=Media) — the only thing distinguishing "trust it"
+    /// from "don't" is the byte count. Byte 5 itself was never delivered and
+    /// is zero only because the local buffer was zero-initialised, not
+    /// because the drive said so. Correct code falls back to the TUR (which
+    /// this mock always answers OK) and reports DiscPresent; a guard
+    /// weakened to unconditionally-true would decode the untransferred
+    /// byte 5 as Media Status 0 and misreport NoDisc — a disc silently
+    /// reported as absent from a reply that never said so.
+    #[test]
+    fn drive_status_rejects_media_status_from_an_undelivered_byte() {
+        let short = vec![0x00, 0x06, 0x04, 0x00, 0x00]; // 5 bytes: descriptor_len=6, NEA=0, class=Media
+        let mut d = drive_with(short);
+        assert_eq!(
+            d.drive_status(),
+            DriveStatus::DiscPresent,
+            "a transfer too short to include byte 5 must fall back to TUR, \
+             not decode a media status the drive never sent"
+        );
     }
 
     #[test]
@@ -2306,6 +2445,15 @@ mod command_tests {
     }
 
     #[test]
+    fn mode_sense_page_positive_transfer_returns_prefix() {
+        // Guard is `end > 0`; without a positive-transfer case the guard
+        // could be flipped to `end < 0` (always false for a usize) and
+        // every call would silently return None.
+        let mut d = drive_with(vec![0xAA, 0xBB, 0xCC]);
+        assert_eq!(d.mode_sense_page(0x01), Some(vec![0xAA, 0xBB, 0xCC]));
+    }
+
+    #[test]
     fn read_buffer_returns_prefix_and_clamps() {
         // read_buffer allocates `length` bytes; FixedTransport returns
         // min(payload, length). Request 16 with a 4-byte payload → 4 bytes.
@@ -2344,6 +2492,93 @@ mod command_tests {
         // With no unlocker, probe_disc is a successful no-op.
         let mut d = drive_with(vec![]);
         assert!(d.probe_disc().is_ok());
+    }
+
+    // ── Tray/speed control CDBs (thin wrappers; verify they actually send) ──
+
+    #[test]
+    fn set_speed_sends_set_cd_speed_cdb_with_be_speed() {
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(0));
+        d.set_speed(0x1234);
+        let c = cdb.lock().unwrap();
+        assert_eq!(c[0], crate::scsi::SCSI_SET_CD_SPEED);
+        assert_eq!(&c[2..4], &[0x12, 0x34], "read speed big-endian");
+    }
+
+    #[test]
+    fn lock_tray_sends_prevent_with_removal_bit_set() {
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(0));
+        d.lock_tray();
+        let c = cdb.lock().unwrap();
+        assert_eq!(c[0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
+        assert_eq!(c[4], 0x01, "PREVENT bit set (locked)");
+    }
+
+    #[test]
+    fn unlock_tray_sends_prevent_with_removal_bit_clear() {
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(0));
+        d.unlock_tray();
+        let c = cdb.lock().unwrap();
+        assert_eq!(c[0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
+        assert_eq!(c[4], 0x00, "PREVENT bit clear (unlocked)");
+    }
+
+    #[test]
+    fn eject_unlocks_then_sends_start_stop_with_loej() {
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(0));
+        d.eject().unwrap();
+        // The mock only records the LAST cdb; eject's own START STOP UNIT
+        // (with LOEJ=1, byte 4 == 0x02) must be what's left recorded, not
+        // the PREVENT/ALLOW from unlock_tray it calls first.
+        let c = cdb.lock().unwrap();
+        assert_eq!(c[0], SCSI_START_STOP_UNIT);
+        assert_eq!(c[4], 0x02, "START=0, LOEJ=1 -> eject");
+    }
+
+    /// `SectorSource for Drive` must actually forward to `Drive`'s own
+    /// methods, not silently become a no-op / stub return.
+    #[test]
+    fn sector_source_impl_forwards_to_drive_methods() {
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(2048));
+        let mut buf = vec![0u8; 2048];
+        let n = SectorSource::read_sectors(&mut d, 0, 1, &mut buf, false).unwrap();
+        assert_eq!(n, 2048, "read_sectors must forward to Drive::read");
+        assert_eq!(cdb.lock().unwrap()[0], crate::scsi::SCSI_READ_10);
+
+        let n2 = SectorSource::read_sectors_fua(&mut d, 0, 1, &mut buf, false, true).unwrap();
+        assert_eq!(n2, 2048, "read_sectors_fua must forward to Drive::read_fua");
+        assert_eq!(
+            cdb.lock().unwrap()[1],
+            0x08,
+            "fua=true must reach the CDB via the trait method"
+        );
+
+        SectorSource::set_speed(&mut d, 0xFFFF);
+        assert_eq!(
+            cdb.lock().unwrap()[0],
+            crate::scsi::SCSI_SET_CD_SPEED,
+            "SectorSource::set_speed must forward to Drive::set_speed"
+        );
     }
 
     // ── decode_read_capacity additional boundaries ──────────────────

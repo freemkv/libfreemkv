@@ -1053,6 +1053,32 @@ mod tests {
         s
     }
 
+    /// Like [`build_two_extent_icb`] but the two extents may have DIFFERENT
+    /// sector counts — used to exercise the within-extent batch-size
+    /// arithmetic (`sectors - sector_off`) with a first extent long enough to
+    /// force a second while-loop iteration.
+    fn build_two_extent_icb_sized(
+        sectors_a: u32,
+        data_lba_a: u32,
+        sectors_b: u32,
+        data_lba_b: u32,
+    ) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        s[0..2].copy_from_slice(&266u16.to_le_bytes()); // Extended File Entry
+        s[34..36].copy_from_slice(&0u16.to_le_bytes()); // Short AD
+        let size = (sectors_a as u64 + sectors_b as u64) * SECTOR_BYTES as u64;
+        s[56..64].copy_from_slice(&size.to_le_bytes()); // info_length
+        s[208..212].copy_from_slice(&0u32.to_le_bytes()); // l_ea
+        s[212..216].copy_from_slice(&16u32.to_le_bytes()); // l_ad = 2 Short ADs
+        let len_a = sectors_a * SECTOR_BYTES as u32;
+        let len_b = sectors_b * SECTOR_BYTES as u32;
+        s[216..220].copy_from_slice(&(len_a & 0x3FFF_FFFF).to_le_bytes());
+        s[220..224].copy_from_slice(&data_lba_a.to_le_bytes());
+        s[224..228].copy_from_slice(&(len_b & 0x3FFF_FFFF).to_le_bytes());
+        s[228..232].copy_from_slice(&data_lba_b.to_le_bytes());
+        s
+    }
+
     /// Encrypt the clear unit from `clear_aacs_unit(tag)` under `unit_key` so
     /// `aacs::content::decrypt_unit` recovers it cleanly (zero decrypt loss).
     /// `tag` distinguishes two units' payloads.
@@ -1654,5 +1680,463 @@ mod tests {
             .expect("extract");
         assert_eq!(read_out(out.path(), "tiny.inf"), Some(payload));
         assert!(res.complete);
+    }
+
+    // ── Mutation-triage additions ───────────────────────────────────────────
+
+    /// `cancelled` must stop on EITHER signal alone (a disjunction) — a
+    /// progress sink asking to stop must cancel even with no halt token, and a
+    /// cancelled halt token must cancel even when progress says continue.
+    #[test]
+    fn cancelled_stops_on_either_signal_alone() {
+        let opts_no_halt = ExtractOptions::default();
+        assert!(
+            opts_no_halt.cancelled(false),
+            "a progress sink asking to stop must cancel even with no halt token"
+        );
+        assert!(
+            !opts_no_halt.cancelled(true),
+            "neither signal firing must not cancel"
+        );
+
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let opts_halted = ExtractOptions {
+            halt: Some(halt),
+            ..Default::default()
+        };
+        assert!(
+            opts_halted.cancelled(true),
+            "a cancelled halt token must cancel even when progress says continue"
+        );
+    }
+
+    /// The free-space pre-check must fire whenever the disc's declared total
+    /// exceeds real available space. An absurdly large declared size (an
+    /// exabyte) trips it regardless of the actual free space on whatever
+    /// machine runs the test.
+    #[test]
+    fn insufficient_space_errors_on_absurdly_large_required() {
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: vec![file("huge.bin", 30, 31, Vec::new(), false)],
+            subdirs: vec![],
+        };
+        let mut disc = build_disc(root);
+        // Overwrite the declared size (info_length) with an absurd value; the
+        // extent length stays 0 so no real content is ever read (the space
+        // gate runs before Phase 2 touches content).
+        let mut icb = build_file_icb(0, 31, false);
+        let huge: u64 = 1u64 << 60; // ~1 exabyte -- no real disk has this free
+        icb[56..64].copy_from_slice(&huge.to_le_bytes());
+        disc.put(PART_START + 30, icb);
+
+        let out = TmpDir::new("insufficient_space");
+        let err = clear_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect_err("an absurdly large declared size must trip the space gate");
+        assert!(matches!(err, Error::DirInsufficientSpace { .. }));
+    }
+
+    /// Regression: the per-VTS key crack in `resolve_vts_key` must gather ONLY
+    /// this VTS's own title-VOB extents. Two VTS groups here carry DISTINCT
+    /// scrambling keys; if the group filter (`vts_group_of(..) == Some(vts) &&
+    /// is_title_vob(..)`) is loosened (`!=`, or `&&` -> `||`), one VTS's
+    /// resolve gathers the OTHER VTS's extents, cracks the wrong key, and that
+    /// VTS's own content silently fails to descramble to the expected
+    /// plaintext.
+    #[test]
+    fn css_two_vts_groups_do_not_cross_contaminate_keys() {
+        fn scrambled_vob(title_key: [u8; 5], marker: u8) -> (Vec<u8>, Vec<u8>) {
+            let seed = [0x11u8, 0x22, 0x33, 0x44, marker];
+            let mut plain = vec![0u8; 2048];
+            // The crack scan's hardened `is_scrambled_pack` gate requires the
+            // MPEG-PS pack-start signature before it will even ATTEMPT a
+            // Stevenson crack (see `css::is_scrambled_pack`) -- without it,
+            // `resolve_vts_key` silently falls back to `base_keys` for BOTH
+            // VTS groups regardless of which extents were gathered, masking
+            // this exact regression.
+            plain[0x00..0x04].copy_from_slice(&crate::css::PACK_START);
+            plain[0x14] = 0x10; // scramble flag
+            let pat: Vec<u8> = (0..8)
+                .map(|k| (0xA0u8.wrapping_add(k as u8) ^ marker) ^ 0x5A)
+                .collect();
+            for (i, b) in plain.iter_mut().enumerate().skip(0x59) {
+                *b = pat[i % 8];
+            }
+            plain[0x54..0x59].copy_from_slice(&seed);
+            let mut scrambled = plain.clone();
+            lfsr::scramble_sector(&title_key, &mut scrambled);
+            (plain, scrambled)
+        }
+
+        let key_1 = [0x10u8, 0x20, 0x30, 0x40, 0x50];
+        let key_2 = [0x90u8, 0x80, 0x70, 0x60, 0x51];
+        let (plain_1, scrambled_1) = scrambled_vob(key_1, 0x01);
+        let (plain_2, scrambled_2) = scrambled_vob(key_2, 0x02);
+
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: vec![
+                    file("VTS_01_1.VOB", 30, 5000, scrambled_1.clone(), false),
+                    file("VTS_02_1.VOB", 32, 6000, scrambled_2.clone(), false),
+                ],
+                subdirs: vec![],
+            }],
+        };
+        let mut disc = build_disc(root);
+        let out = TmpDir::new("css_two_vts");
+        let mut d = clear_disc();
+        d.content_format = crate::disc::ContentFormat::MpegPs;
+        // Disc-wide key deliberately matches NEITHER VTS's real key: if the
+        // per-VTS group filter is broken and a crack attempt fails (or is
+        // skipped), falling back to this key must still mismatch, so the
+        // fallback path can never accidentally mask a broken filter.
+        d.css = Some(crate::css::CssState {
+            title_key: [0xFFu8; 5],
+            crack_span: None,
+        });
+        let res = d
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect("extract");
+
+        let got_1 = read_out(out.path(), "VIDEO_TS/VTS_01_1.VOB").expect("vts01 vob");
+        let got_2 = read_out(out.path(), "VIDEO_TS/VTS_02_1.VOB").expect("vts02 vob");
+        let mut expect_1 = plain_1.clone();
+        expect_1[0x14] = 0x00;
+        let mut expect_2 = plain_2.clone();
+        expect_2[0x14] = 0x00;
+        assert_eq!(
+            got_1, expect_1,
+            "VTS_01 must descramble under its OWN cracked key, not VTS_02's"
+        );
+        assert_eq!(
+            got_2, expect_2,
+            "VTS_02 must descramble under its OWN cracked key, not VTS_01's"
+        );
+        assert!(res.complete);
+    }
+
+    /// `Borrowed` is a thin forwarding wrapper the decrypting decorator uses
+    /// to avoid taking ownership of the caller's reader -- every
+    /// `SectorSource` method must forward to the wrapped `&mut dyn
+    /// SectorSource` verbatim. Calling directly on a concrete `Borrowed`
+    /// value (not through `&mut dyn SectorSource`) exercises the actual
+    /// forwarding body via static dispatch, not vtable dispatch through a
+    /// trait object.
+    #[test]
+    fn borrowed_forwards_every_sector_source_call() {
+        struct Recorder {
+            capacity: u32,
+            last_speed: Option<u16>,
+            last_unit_base: Option<u32>,
+        }
+        impl SectorSource for Recorder {
+            fn capacity_sectors(&self) -> u32 {
+                self.capacity
+            }
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                _count: u16,
+                _buf: &mut [u8],
+                _recovery: bool,
+            ) -> Result<usize> {
+                Ok(0)
+            }
+            fn set_speed(&mut self, kbs: u16) {
+                self.last_speed = Some(kbs);
+            }
+            fn set_unit_base(&mut self, lba: u32) {
+                self.last_unit_base = Some(lba);
+            }
+        }
+
+        let mut inner = Recorder {
+            capacity: 42,
+            last_speed: None,
+            last_unit_base: None,
+        };
+        {
+            let mut b = Borrowed(&mut inner);
+            assert_eq!(b.capacity_sectors(), 42, "capacity_sectors must forward");
+            b.set_speed(7200);
+            b.set_unit_base(1234);
+        }
+        assert_eq!(inner.last_speed, Some(7200), "set_speed must forward");
+        assert_eq!(
+            inner.last_unit_base,
+            Some(1234),
+            "set_unit_base must forward"
+        );
+    }
+
+    /// Regression: within ONE extent, a batch's "sectors remaining IN THIS
+    /// EXTENT" must be computed as `sectors - sector_off`, not `sectors +
+    /// sector_off`. The latter inflates without bound as the loop advances,
+    /// letting a later batch's read run PAST this extent's true end into
+    /// whatever content sits at the following LBAs (an unrelated disc region
+    /// in this fixture) and get written into the file as if it were this
+    /// extent's own data -- untrusted-disc content bleed across extent
+    /// boundaries.
+    #[test]
+    fn extent_second_batch_stays_within_its_own_bounds() {
+        // Extent A: 1600 sectors of pattern 'A' -- just over
+        // READ_BATCH_SECTORS (1536), forcing a second while-loop iteration
+        // with sector_off > 0.
+        const SECTORS_A: u32 = 1600;
+        const LBA_A: u32 = 5000;
+        // The disc region immediately following extent A's true end. Must
+        // NEVER be read as part of extent A: sized to cover a full erroneous
+        // READ_BATCH_SECTORS second batch starting right after extent A's
+        // real tail.
+        const LBA_FILLER: u32 = LBA_A + SECTORS_A;
+        const SECTORS_FILLER: u32 = 1472;
+        // Extent B: the file's real second extent, at a completely different
+        // LBA, same size as the filler region so the two are exact substitutes
+        // if the arithmetic bug reads the wrong one.
+        const SECTORS_B: u32 = SECTORS_FILLER;
+        const LBA_B: u32 = 90_000;
+
+        let a = vec![0xAAu8; SECTORS_A as usize * SECTOR_BYTES];
+        let filler = vec![0xCCu8; SECTORS_FILLER as usize * SECTOR_BYTES];
+        let b = vec![0xBBu8; SECTORS_B as usize * SECTOR_BYTES];
+
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        disc.put_bytes(PART_START + LBA_A, &a);
+        disc.put_bytes(PART_START + LBA_FILLER, &filler);
+        disc.put_bytes(PART_START + LBA_B, &b);
+        disc.put(
+            PART_START + 30,
+            build_two_extent_icb_sized(SECTORS_A, LBA_A, SECTORS_B, LBA_B),
+        );
+        let mut root_fids = Vec::new();
+        push_fid(&mut root_fids, "", 10, true, true);
+        push_fid(&mut root_fids, "big.bin", 30, false, false);
+        disc.put(PART_START + 10, build_dir_icb(11, root_fids.len() as u32));
+        disc.put_bytes(PART_START + 11, &root_fids);
+
+        let out = TmpDir::new("extent_bounds");
+        let res = clear_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect("extract");
+
+        let got = read_out(out.path(), "big.bin").expect("file written");
+        let mut expect = a.clone();
+        expect.extend_from_slice(&b);
+        assert_eq!(
+            got.len(),
+            expect.len(),
+            "file size matches the two extents' declared total"
+        );
+        assert_eq!(
+            got, expect,
+            "extent A's tail batch must not read past its own declared length \
+             into the following disc region (pattern 'C' must never appear)"
+        );
+        assert!(res.complete);
+        assert_eq!(res.bytes_unreadable, 0);
+    }
+
+    /// Pure-function coverage of `whole_unit_batch`'s cap: a batch that is
+    /// NOT the extent's final chunk (there is more remaining after it) is
+    /// capped at `READ_BATCH_SECTORS`, which is itself an exact multiple of
+    /// `AACS_UNIT_SECTORS` (1536 = 512 * 3) -- so the result is already
+    /// unit-aligned.
+    #[test]
+    fn whole_unit_batch_caps_mid_stream_batches() {
+        assert_eq!(whole_unit_batch(2000), READ_BATCH_SECTORS);
+        assert_eq!(whole_unit_batch(READ_BATCH_SECTORS + 1), READ_BATCH_SECTORS);
+        assert_eq!(whole_unit_batch(READ_BATCH_SECTORS + 2), READ_BATCH_SECTORS);
+    }
+
+    /// Pure-function coverage of `whole_unit_batch`'s tail contract: the
+    /// FINAL chunk of an extent (`batch == remaining`, i.e. `remaining <=
+    /// READ_BATCH_SECTORS`) must NOT be rounded down to a unit boundary, even
+    /// when it is not itself a multiple of 3 -- `decrypt_sectors`'s
+    /// trailing-partial contract handles a non-multiple tail specially, and
+    /// rounding it here would silently drop sectors from the read.
+    #[test]
+    fn whole_unit_batch_true_tail_is_never_rounded() {
+        assert_eq!(whole_unit_batch(5), 5);
+        assert_eq!(whole_unit_batch(1535), 1535);
+        assert_eq!(whole_unit_batch(2), 2);
+        assert_eq!(whole_unit_batch(1), 1);
+        assert_eq!(whole_unit_batch(READ_BATCH_SECTORS), READ_BATCH_SECTORS);
+    }
+
+    /// `read_batch` must retry a non-decrypt read failure up to
+    /// `READ_RETRIES` times and succeed if a later attempt does -- a
+    /// transient failure must not be treated as permanent on the very first
+    /// try.
+    #[test]
+    fn read_batch_retries_transient_failures_and_succeeds() {
+        struct FlakySource {
+            fail_first: u32,
+            calls: u32,
+        }
+        impl SectorSource for FlakySource {
+            fn capacity_sectors(&self) -> u32 {
+                100_000
+            }
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> Result<usize> {
+                self.calls += 1;
+                if self.calls <= self.fail_first {
+                    return Err(Error::DiscRead {
+                        sector: 0,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                let need = count as usize * SECTOR_BYTES;
+                buf[..need].fill(0x11);
+                Ok(need)
+            }
+        }
+
+        // Fails exactly READ_RETRIES times (attempts 0..READ_RETRIES all
+        // error), then succeeds on the FINAL attempt (attempt ==
+        // READ_RETRIES) -- the last chance the retry budget allows.
+        let src = FlakySource {
+            fail_first: READ_RETRIES,
+            calls: 0,
+        };
+        let mut dec = DecryptingSectorSource::new(src, DecryptKeys::None);
+        let mut buf = vec![0u8; 2 * SECTOR_BYTES];
+        let ok = read_batch(&mut dec, 0, 2, &mut buf);
+        assert!(
+            ok,
+            "a failure that clears up within the retry budget must succeed, not hole"
+        );
+        assert_eq!(dec.inner().calls, READ_RETRIES + 1);
+    }
+
+    /// `report` must reflect the sink's verdict -- a sink asking to stop must
+    /// actually halt the run mid-file, not be swallowed.
+    #[test]
+    fn progress_sink_stop_halts_run_mid_file() {
+        struct StopImmediately;
+        impl crate::progress::Progress for StopImmediately {
+            fn report(&self, _p: &crate::progress::PassProgress) -> bool {
+                false
+            }
+        }
+
+        let good = vec![0x66u8; 4 * 2048];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![DirSpec {
+                    name: "STREAM".to_string(),
+                    icb_lba: 22,
+                    dir_data_lba: 23,
+                    files: vec![file("00001.m2ts", 24, 5000, good, true)],
+                    subdirs: vec![],
+                }],
+            }],
+        };
+        let mut disc = build_disc(root);
+        let out = TmpDir::new("progress_stop");
+        let sink = StopImmediately;
+        let opts = ExtractOptions {
+            progress: Some(&sink),
+            ..Default::default()
+        };
+        let res = clear_disc()
+            .extract_tree(&mut disc, out.path(), &opts)
+            .expect("extract does not error on a progress halt");
+
+        assert!(res.halted, "a sink returning false must halt the run");
+        assert!(
+            !res.files[0].complete,
+            "the in-flight file must be left incomplete, not finalized"
+        );
+        assert!(
+            read_out(out.path(), "BDMV/STREAM/00001.m2ts").is_none(),
+            "an incomplete file must not be renamed to its final name"
+        );
+    }
+
+    /// `available_space` must return the real free-space figure (`Some`) for
+    /// an existing directory on a platform that exposes it -- the free-space
+    /// pre-check in `extract_tree` silently no-ops whenever this returns
+    /// `None`, so a `statvfs` SUCCESS (`rc == 0`) must never be read as
+    /// "unavailable".
+    #[cfg(unix)]
+    #[test]
+    fn available_space_reports_free_bytes_on_a_real_dir() {
+        let out = TmpDir::new("available_space");
+        std::fs::create_dir_all(out.path()).unwrap();
+        assert!(
+            available_space(out.path()).is_some(),
+            "a real, existing directory must report Some(_) free bytes"
+        );
+    }
+
+    /// A raw control byte (below 0x20, distinct from the separately-rejected
+    /// NUL) in a disc-authored name must be rejected, not passed through into
+    /// the host filename.
+    #[test]
+    fn sanitize_rejects_control_bytes() {
+        assert!(
+            sanitize_component("a\u{1}b").is_err(),
+            "0x01 must be rejected"
+        );
+        assert!(
+            sanitize_component("a\nb").is_err(),
+            "0x0A (newline) must be rejected"
+        );
+        assert!(
+            sanitize_component("a\u{1f}b").is_err(),
+            "0x1F must be rejected"
+        );
+        // 0x20 (space) is NOT a control byte -- allowed mid-name (only
+        // trimmed if trailing).
+        assert!(sanitize_component("a b").is_ok());
+    }
+
+    /// The VTS group number must be EXACTLY 2 ASCII digits -- neither a
+    /// non-numeric group nor a wrong-length one is a valid `VTS_xx` group.
+    #[test]
+    fn vts_group_of_requires_exactly_two_digits() {
+        assert_eq!(
+            vts_group_of("VTS_AB_1.VOB"),
+            None,
+            "letters are not a group number"
+        );
+        assert_eq!(
+            vts_group_of("VTS_123_1.VOB"),
+            None,
+            "a 3-digit group is not a valid 2-digit VTS number"
+        );
+        assert_eq!(
+            vts_group_of("VTS_1_1.VOB"),
+            None,
+            "a 1-digit group is not valid"
+        );
+        assert_eq!(vts_group_of("VTS_01_1.VOB").as_deref(), Some("VTS_01"));
     }
 }

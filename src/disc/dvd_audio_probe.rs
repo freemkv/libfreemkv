@@ -242,7 +242,11 @@ pub fn probe_and_remap<S: SectorSource + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate};
+    use crate::disc::{
+        AudioChannels, AudioStream, Codec, ContentFormat, DiscTitle, Extent, LabelPurpose,
+        SampleRate,
+    };
+    use crate::sector::SectorSource;
 
     /// Build a single, correctly-SIZED AC-3 frame whose `acmod`/`lfeon` encode a
     /// known channel count. `byte4` is `fscod=0 | frmsizecod=0`, so
@@ -462,5 +466,169 @@ mod tests {
             panic!()
         };
         assert_eq!(a.pid, 0xBD80, "no probe data → keep ordinal");
+    }
+
+    /// `max_substream_channels` must locate the sync at its true ABSOLUTE
+    /// position (`pos + rel`) when it is preceded by non-sync bytes, not just
+    /// when the sync sits at offset 0. Regression guard for a hand-checked
+    /// mutation (`+` → `-` at the `pos + rel` offset computation): with `pos`
+    /// starting at 0 and the first sync found 3 bytes in, `pos - rel` would
+    /// underflow a `usize` and panic, or (if it somehow didn't) index the
+    /// wrong start entirely. `pos + rel` is the only computation that is
+    /// always in-bounds, since `rel` is itself bounded by the length of the
+    /// slice searched from `pos`.
+    #[test]
+    fn max_substream_channels_locates_sync_after_leading_non_sync_bytes() {
+        let mut data = vec![0xAA, 0xAA, 0xAA]; // no 0x0B77 pattern in here
+        data.extend(ac3_frame(2, false)); // real 2.0 frame, sync at absolute offset 3
+        assert_eq!(
+            max_substream_channels(&data),
+            Some(2),
+            "must find and decode the frame whose sync is NOT at offset 0"
+        );
+    }
+
+    /// When an AC-3 header's `fscod`/`frmsizecod` is unmappable (reserved
+    /// `fscod == 3`), `max_substream_channels` must fall back to stepping
+    /// `start + 2` bytes past the sync to re-lock onto the next genuine sync,
+    /// and must keep making forward progress doing so (never revisit the same
+    /// sync, which would loop forever, and never jump so far that it skips
+    /// the very next real frame). This lays a bogus-sized header at absolute
+    /// offset 4 (so `start == 4`, `start + 2 == 6`) immediately followed, at
+    /// offset 6, by a real, fully decodable 2.0 frame — the position the
+    /// `+ 2` fallback must land on exactly.
+    #[test]
+    fn max_substream_channels_unmappable_size_steps_forward_by_two() {
+        let mut real = ac3_frame(2, false);
+        // Overwrite the (unchecked) CRC bytes of the real frame — these double
+        // as byte4/byte5 of the bogus header 2 bytes earlier, at absolute
+        // offset 4: byte4 = 0xC0 (fscod=3 reserved -> ac3_frame_size == 0,
+        // unmappable), byte5 = 0xF8 (bsid=31 >= 11 -> acmod_channels == None,
+        // so the bogus header itself never contributes a spurious channel
+        // count).
+        real[2] = 0xC0;
+        real[3] = 0xF8;
+        let mut data = vec![0xAA, 0xAA, 0xAA, 0xAA]; // offsets 0..4, no sync
+        data.push(0x0B); // offset 4: bogus header sync byte 0
+        data.push(0x77); // offset 5: bogus header sync byte 1
+        data.extend(real); // offset 6..: the real frame (also serves as the
+        // bogus header's byte4/byte5 at offsets 8/9)
+        assert_eq!(
+            max_substream_channels(&data),
+            Some(2),
+            "must recover the real frame 2 bytes after the unmappable-size sync, not lose it"
+        );
+    }
+
+    /// Same fallback as above, but with the unmappable-size sync at absolute
+    /// offset 0 (`start == 0`) so that stepping backward instead of forward
+    /// (`start - 2`) would underflow rather than merely land on the wrong
+    /// byte. Also proves the real frame is still found 6 bytes further in,
+    /// confirming forward progress past the bogus header.
+    #[test]
+    fn max_substream_channels_unmappable_size_at_start_steps_forward_not_back() {
+        let mut data = vec![0x0B, 0x77, 0x00, 0x00, 0xC0, 0xF8]; // bogus header, offsets 0..6
+        data.extend(ac3_frame(2, false)); // real 2.0 frame at offset 6
+        assert_eq!(
+            max_substream_channels(&data),
+            Some(2),
+            "must step forward past the bogus header at offset 0 and find the real frame at offset 6"
+        );
+    }
+
+    /// `remap_audio_pids` must read a stream's CURRENT physical sub-stream id
+    /// from the low byte of its PID via `pid & 0x00FF` — not `|` or `^` with
+    /// `0x00FF`, both of which force the low byte to `0xFF` regardless of the
+    /// real PID and so always miss the "already matches" shortcut. That
+    /// matters observably when TWO physical sub-streams share the same probed
+    /// channel count: with a correct read, a stream already sitting on a
+    /// matching sub-stream is left alone (conservative, per the module's
+    /// documented behaviour); with the low byte forced to `0xFF`,
+    /// `probed.get(&0xFF)` is always `None`, so the code falls through to the
+    /// "find any unclaimed match" path and picks the FIRST (lowest-keyed,
+    /// BTreeMap-ordered) matching physical sub-stream instead — which here is
+    /// a *different* sub-stream (0x80) than the one the PID already correctly
+    /// names (0x81), producing a spurious PID change.
+    #[test]
+    fn remap_reads_current_substream_via_and_not_or_or_xor() {
+        let mut probed = BTreeMap::new();
+        probed.insert(0x80u8, 6u8);
+        probed.insert(0x81u8, 6u8); // ambiguous: two physical 6ch sub-streams
+        let mut streams = vec![ac3_stream(0xBD81, AudioChannels::Surround51)];
+        let changed = remap_audio_pids(&mut streams, &probed);
+        assert_eq!(
+            changed, 0,
+            "already sitting on a matching physical sub-stream (0x81) must be left alone"
+        );
+        let Stream::Audio(a) = &streams[0] else {
+            panic!()
+        };
+        assert_eq!(
+            a.pid, 0xBD81,
+            "must not be bumped to the other matching sub-stream (0x80)"
+        );
+    }
+
+    /// A `SectorSource` stub that hands back fixed bytes regardless of the
+    /// requested LBA/count, for exercising `probe_and_remap`'s end-to-end
+    /// wiring (format/AC-3/extent/count guards -> read -> probe -> remap).
+    struct FixedSource {
+        data: Vec<u8>,
+    }
+
+    impl SectorSource for FixedSource {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            _count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let n = self.data.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            Ok(n)
+        }
+    }
+
+    /// End-to-end `probe_and_remap`: a Silence-of-the-Lambs-shaped MpegPs
+    /// title (one declared 5.1 AC-3 stream ordinally assigned 0x80) whose
+    /// physical VOB bytes carry the 2.0 down-mix on 0x80 and the real 5.1 on
+    /// 0x81. This must reach the `remap_audio_pids` call and re-route the
+    /// stream to 0xBD81. It also, by construction, proves each of the guards
+    /// along the way lets a real, positive case through: the content-format
+    /// check must NOT bail on `MpegPs` (only on non-`MpegPs`), the AC-3
+    /// presence check must NOT bail when AC-3 IS present, and the
+    /// sector-count check must NOT bail when the count is nonzero — any one
+    /// of those inverted would skip the probe entirely and leave the PID at
+    /// its untouched ordinal value (0xBD80), which the assertion below would
+    /// catch.
+    #[test]
+    fn probe_and_remap_reroutes_silence_of_the_lambs_scenario_end_to_end() {
+        let mut bytes = ps_ac3(0x80, 2, false); // physical 0x80 = 2.0 down-mix
+        bytes.extend(ps_ac3(0x81, 7, true)); // physical 0x81 = 5.1 main mix
+        let mut title = DiscTitle {
+            playlist: "00001.ifo".into(),
+            playlist_id: 1,
+            duration_secs: 60.0,
+            size_bytes: bytes.len() as u64,
+            clips: Vec::new(),
+            streams: vec![ac3_stream(0xBD80, AudioChannels::Surround51)],
+            chapters: Vec::new(),
+            extents: vec![Extent {
+                start_lba: 0,
+                sector_count: 2,
+            }],
+            content_format: ContentFormat::MpegPs,
+            codec_privates: vec![None],
+        };
+        let mut source = FixedSource { data: bytes };
+        probe_and_remap(&mut source, &mut title);
+        let Stream::Audio(a) = &title.streams[0] else {
+            panic!("audio")
+        };
+        assert_eq!(
+            a.pid, 0xBD81,
+            "declared 5.1 stream must be re-routed to the physical 5.1 sub-stream 0x81"
+        );
     }
 }

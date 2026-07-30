@@ -249,6 +249,27 @@ impl Drop for BytePrefetcher {
 mod tests {
     use super::*;
 
+    /// `RECYCLE_DEPTH` must be one MORE than `FORWARD_DEPTH` per its own
+    /// doc comment: the producer needs at least one buffer to fill while
+    /// the consumer holds the other `FORWARD_DEPTH`-worth in flight. A
+    /// `+` -> `*`/`-` mutation on `FORWARD_DEPTH + 1` would under-size the
+    /// recycle channel (e.g. `FORWARD_DEPTH * 1 == FORWARD_DEPTH`, one
+    /// short), which starves the producer of a spare buffer.
+    #[test]
+    fn recycle_depth_is_forward_depth_plus_one() {
+        assert_eq!(RECYCLE_DEPTH, FORWARD_DEPTH + 1);
+        assert_eq!(RECYCLE_DEPTH, 3, "FORWARD_DEPTH is 2, so recycle must be 3");
+    }
+
+    /// `DEFAULT_CHUNK_BYTES` is documented as 16 MiB. Pins the literal so a
+    /// `*` -> `+`/`/` mutation on either factor (16 * 1024 * 1024) is
+    /// caught by a concrete, spec-derived expected value rather than by
+    /// recomputing the same expression.
+    #[test]
+    fn default_chunk_bytes_is_16_mib() {
+        assert_eq!(DEFAULT_CHUNK_BYTES, 16_777_216, "documented as 16 MiB");
+    }
+
     /// Endless reader: every `read` fills the whole buffer and never
     /// hits EOF, so the producer keeps trying to push batches forward
     /// until the forward channel disconnects. Exactly the shape that

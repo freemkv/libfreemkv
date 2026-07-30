@@ -5167,4 +5167,1210 @@ mod tests {
         assert_eq!(chapter_name(0), "1");
         assert_eq!(chapter_name(41), "42");
     }
+
+    // ── correct_truehd_channels ──────────────────────────────────────────
+
+    /// Records every `read_sectors` call and serves a fixed byte buffer
+    /// (zero-padded to the requested size) — probes
+    /// `correct_truehd_channels`'s early-return guards (empty pid list, `n ==
+    /// 0`) without needing real TrueHD content, and carries real synthetic
+    /// TrueHD bytes for the full round-trip tests below.
+    struct ThdSpyReader {
+        calls: std::cell::RefCell<Vec<(u32, u16)>>,
+        data: Vec<u8>,
+    }
+    impl SectorSource for ThdSpyReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            self.calls.borrow_mut().push((lba, count));
+            let n = self.data.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            for b in buf[n..].iter_mut() {
+                *b = 0;
+            }
+            Ok(buf.len())
+        }
+    }
+
+    /// One 192-byte BD-TS PES packet on `pid` carrying `es` as its raw
+    /// elementary payload. Minimal PES header (no PTS/DTS) — this probe
+    /// reads and demuxes+flushes in one shot, so no timestamp is needed.
+    fn thd_bd_pes(pid: u16, es: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 192];
+        pkt[4] = 0x47; // TS sync
+        pkt[5] = 0x40 | ((pid >> 8) & 0x1F) as u8; // PUSI + PID hi
+        pkt[6] = (pid & 0xFF) as u8; // PID lo
+        pkt[7] = 0x10; // adaptation = payload-only, cc = 0
+        let p = 8;
+        pkt[p] = 0x00;
+        pkt[p + 1] = 0x00;
+        pkt[p + 2] = 0x01;
+        pkt[p + 3] = 0xBD; // private_stream_1
+        pkt[p + 4] = 0x00;
+        pkt[p + 5] = 0x00;
+        pkt[p + 6] = 0x80; // flags1 marker bits
+        pkt[p + 7] = 0x00; // flags2: no PTS/DTS
+        pkt[p + 8] = 0x00; // PES_header_data_length = 0
+        let es_off = p + 9;
+        let n = es.len().min(192 - es_off);
+        pkt[es_off..es_off + n].copy_from_slice(&es[..n]);
+        pkt
+    }
+
+    /// A synthetic TrueHD major-sync access unit: 2 junk bytes, the
+    /// 0xF8726FBA sync, `format_info`, then padding through the
+    /// num_substreams byte (sync offset + 16) so Atmos detection can read it.
+    fn thd_major_sync_es(format_info: u32, num_substreams: u8) -> Vec<u8> {
+        let mut es = vec![0u8; 24];
+        es[0] = 0xAA;
+        es[1] = 0xBB;
+        es[2..6].copy_from_slice(&0xF872_6FBAu32.to_be_bytes());
+        es[6..10].copy_from_slice(&format_info.to_be_bytes());
+        es[2 + 16] = num_substreams << 4;
+        es
+    }
+
+    fn truehd_audio_stream(pid: u16, channels: AudioChannels, sample_rate: SampleRate) -> Stream {
+        Stream::Audio(AudioStream {
+            pid,
+            codec: Codec::TrueHd,
+            channels,
+            language: "eng".into(),
+            sample_rate,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: crate::labels::generate_audio_label(&Codec::TrueHd, &channels, false),
+        })
+    }
+
+    /// No TrueHd stream in the title → the pid list is empty and the probe
+    /// must return before ever touching the reader (extent/read-count guards
+    /// are irrelevant once there's nothing to probe for). Mutation guard:
+    /// `matches!(a.codec, Codec::TrueHd)` flipped to `true` would sweep this
+    /// title's non-TrueHD stream's pid into the probe list too, and it would
+    /// read the (spied) source.
+    #[test]
+    fn correct_truehd_channels_skips_probe_when_no_truehd_stream() {
+        let mut title = DiscTitle::empty();
+        title.streams = vec![Stream::Audio(AudioStream {
+            pid: 0x1100,
+            codec: Codec::Ac3,
+            channels: AudioChannels::Surround51,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        })];
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 10,
+        }];
+        let mut reader = ThdSpyReader {
+            calls: std::cell::RefCell::new(Vec::new()),
+            data: Vec::new(),
+        };
+        correct_truehd_channels(&mut reader, &mut title);
+        assert!(
+            reader.calls.borrow().is_empty(),
+            "no TrueHD stream present → the reader must never be touched: {:?}",
+            reader.calls.borrow()
+        );
+    }
+
+    /// A TrueHd stream IS present → the probe must proceed past the pid-list
+    /// guard and actually read the title's first extent. Mutation guard:
+    /// `matches!(a.codec, Codec::TrueHd)` flipped to `false` would empty the
+    /// pid list even here and the probe would return before ever reading.
+    #[test]
+    fn correct_truehd_channels_reads_when_truehd_stream_present() {
+        let mut title = DiscTitle::empty();
+        title.streams = vec![truehd_audio_stream(
+            0x1100,
+            AudioChannels::Surround51,
+            SampleRate::S48,
+        )];
+        title.extents = vec![Extent {
+            start_lba: 7,
+            sector_count: 10,
+        }];
+        let mut reader = ThdSpyReader {
+            calls: std::cell::RefCell::new(Vec::new()),
+            data: Vec::new(),
+        };
+        correct_truehd_channels(&mut reader, &mut title);
+        assert!(
+            !reader.calls.borrow().is_empty(),
+            "a TrueHD stream present must drive a probe read"
+        );
+    }
+
+    /// The bounded-probe sector count is `ext.sector_count.min(4096)`; when the
+    /// extent has ZERO sectors that count is zero and there is nothing to read
+    /// — the probe must return before calling into the reader. Mutation guard:
+    /// `n == 0` flipped to `n != 0` inverts this so a zero-sector extent
+    /// wrongly falls through to a (zero-length) read.
+    #[test]
+    fn correct_truehd_channels_skips_read_on_zero_sector_extent() {
+        let mut title = DiscTitle::empty();
+        title.streams = vec![truehd_audio_stream(
+            0x1100,
+            AudioChannels::Surround51,
+            SampleRate::S48,
+        )];
+        title.extents = vec![Extent {
+            start_lba: 7,
+            sector_count: 0,
+        }];
+        let mut reader = ThdSpyReader {
+            calls: std::cell::RefCell::new(Vec::new()),
+            data: Vec::new(),
+        };
+        correct_truehd_channels(&mut reader, &mut title);
+        assert!(
+            reader.calls.borrow().is_empty(),
+            "a zero-sector extent must never trigger a read: {:?}",
+            reader.calls.borrow()
+        );
+    }
+
+    /// Full round-trip: a real major sync carrying a 7.1 (8ch) presentation, a
+    /// whitelisted 96 kHz rate nibble, and an Atmos substream count, probed
+    /// through a container-declared 5.1/48 kHz basic-descriptor stream. All
+    /// three corrections must land, and the label must be promoted to the
+    /// Atmos form (the stream still carried the basic, non-editorial label).
+    /// Kills the was_basic `==`, the channels/rate `!=`/`&&` guards' "already
+    /// correct" branch, the `!matches!` per-stream skip, the `is_atmos ==
+    /// Some(true)` branch, and the whole-function no-op mutant.
+    #[test]
+    fn correct_truehd_channels_full_correction_and_atmos_promotion() {
+        let pid = 0x1100u16;
+        // format_info: top nibble 0x1 -> 96 kHz; low 13 bits 0x1F -> 7.1 (8ch).
+        let format_info = (0x1u32 << 28) | 0x1F;
+        let es = thd_major_sync_es(format_info, 4); // num_substreams=4 -> Atmos
+        let ts = thd_bd_pes(pid, &es);
+        let mut title = DiscTitle::empty();
+        title.streams = vec![truehd_audio_stream(
+            pid,
+            AudioChannels::Surround51, // base 5.1 the MPLS descriptor understates
+            SampleRate::S48,           // base 48 kHz the container guessed
+        )];
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 1,
+        }];
+        let mut reader = ThdSpyReader {
+            calls: std::cell::RefCell::new(Vec::new()),
+            data: ts,
+        };
+        correct_truehd_channels(&mut reader, &mut title);
+        let Stream::Audio(a) = &title.streams[0] else {
+            panic!("stream type must be preserved")
+        };
+        assert_eq!(
+            a.channels,
+            AudioChannels::Surround71,
+            "the 8ch major-sync presentation must correct the understated 5.1"
+        );
+        assert_eq!(
+            a.sample_rate,
+            SampleRate::S96,
+            "the whitelisted 0x1 rate nibble must correct the guessed 48 kHz"
+        );
+        assert_eq!(
+            a.label,
+            crate::labels::generate_audio_label_atmos(
+                &Codec::TrueHd,
+                &AudioChannels::Surround71,
+                false
+            ),
+            "basic descriptor + detected Atmos substream must promote the label"
+        );
+    }
+
+    /// A major sync whose 8ch/6ch presentation masks are BOTH set to values
+    /// with no real channel-count meaning (all 13 8ch bits, summing to 20) —
+    /// `AudioChannels::from_count` maps that to `Unknown`. The correction must
+    /// leave the container's channel count untouched rather than overwrite a
+    /// known-good value with `Unknown`. Kills the `new_ch != Unknown` guard's
+    /// `==` and `&&`-to-`||` mutants (both would let an unmapped count
+    /// clobber a valid `a.channels`).
+    #[test]
+    fn correct_truehd_channels_leaves_channels_when_count_unmapped() {
+        let pid = 0x1100u16;
+        // All 13 8ch bits set -> truehd_channels sums to 20 -> from_count(20)
+        // -> Unknown. Rate nibble 0x0 -> 48 kHz (matches the container, so
+        // this test isolates the channels guard from the rate guard).
+        let format_info = 0x1FFF;
+        let es = thd_major_sync_es(format_info, 0); // not Atmos
+        let ts = thd_bd_pes(pid, &es);
+        let mut title = DiscTitle::empty();
+        title.streams = vec![truehd_audio_stream(
+            pid,
+            AudioChannels::Surround51,
+            SampleRate::S48,
+        )];
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 1,
+        }];
+        let mut reader = ThdSpyReader {
+            calls: std::cell::RefCell::new(Vec::new()),
+            data: ts,
+        };
+        correct_truehd_channels(&mut reader, &mut title);
+        let Stream::Audio(a) = &title.streams[0] else {
+            panic!("stream type must be preserved")
+        };
+        assert_eq!(
+            a.channels,
+            AudioChannels::Surround51,
+            "an unmapped (Unknown) major-sync channel count must not overwrite a known container value"
+        );
+    }
+
+    // ── bytes_bad_in_title: empty-input guard ────────────────────────────
+
+    // NOTE: `bad_ranges.is_empty() || title.extents.is_empty()` (mod.rs:628) —
+    // the `||`-to-`&&` mutant is EQUIVALENT here, not tested: the guard is a
+    // pure short-circuit. Whichever operand is empty, the corresponding loop
+    // (the outer `for ext in &title.extents` or the inner `for (pos, size) in
+    // bad_ranges`) simply iterates zero times and `total` stays its initial
+    // 0 — the early return changes nothing observable. See report.
+
+    // ── byte_offset_in_title ──────────────────────────────────────────────
+
+    fn title_with_size(size_bytes: u64, extents: Vec<Extent>) -> DiscTitle {
+        DiscTitle {
+            size_bytes,
+            extents,
+            ..DiscTitle::empty()
+        }
+    }
+
+    /// A multi-extent title where the target LBA lands in the SECOND extent.
+    /// Exercises both the boundary check for the FIRST (non-matching) extent
+    /// and the running `cumulative` byte total added on the way past it.
+    /// Kills: `lba >= start && lba < end` flipped to `||` (the first extent's
+    /// disjunction would trivially match almost any lba and return the wrong,
+    /// too-early offset); `cumulative +=` flipped to `*=` (cumulative is
+    /// seeded at 0, so `*=` freezes it at 0 forever); and `sector_count *
+    /// SECTOR_BYTES_U64` flipped to `+` or `/` (wrong per-extent byte length
+    /// folded into cumulative).
+    #[test]
+    fn byte_offset_in_title_accumulates_across_extents() {
+        let title = title_with_size(
+            0,
+            vec![
+                Extent {
+                    start_lba: 100,
+                    sector_count: 10,
+                }, // LBAs 100..110, 20_480 bytes
+                Extent {
+                    start_lba: 200,
+                    sector_count: 10,
+                }, // LBAs 200..210
+            ],
+        );
+        // lba 205 is 5 sectors into the SECOND extent.
+        let got = byte_offset_in_title(205, &title);
+        assert_eq!(
+            got,
+            Some(20_480 + 5 * 2048),
+            "offset must be the first extent's full byte length plus the \
+             position within the second extent, not a first-extent mismatch"
+        );
+    }
+
+    /// An extent's end is EXCLUSIVE (`start_lba + sector_count`): the LBA one
+    /// past the last sector of an extent belongs to no extent (or the next
+    /// one), never this one. Kills `lba < ext_end` flipped to `<=`.
+    #[test]
+    fn byte_offset_in_title_extent_end_is_exclusive() {
+        let title = title_with_size(
+            0,
+            vec![Extent {
+                start_lba: 100,
+                sector_count: 10, // covers LBAs 100..110
+            }],
+        );
+        assert_eq!(
+            byte_offset_in_title(110, &title),
+            None,
+            "LBA 110 is one past this extent's last sector (109) and must not resolve inside it"
+        );
+        assert_eq!(
+            byte_offset_in_title(109, &title),
+            Some(9 * 2048),
+            "sanity: the extent's actual last sector still resolves"
+        );
+    }
+
+    // ── chapter_at_offset ─────────────────────────────────────────────────
+
+    fn three_chapters() -> Vec<Chapter> {
+        vec![
+            Chapter {
+                time_secs: 0.0,
+                name: "1".into(),
+            },
+            Chapter {
+                time_secs: 50.0,
+                name: "2".into(),
+            },
+            Chapter {
+                time_secs: 100.0,
+                name: "3".into(),
+            },
+        ]
+    }
+
+    /// Concrete end-to-end arithmetic check: byte_offset 60/100 of a 100s
+    /// title lands at t=60s, which is chapter index 1 (0-based, the last
+    /// chapter whose start <= 60) → 1-based chapter 2. Kills: the `/`
+    /// (time-fraction) flipped to `%` or `*`; the `*` (duration scale)
+    /// flipped to `+`; the `<=` chapter-scan comparison flipped to `>`; the
+    /// final `chapter_idx + 1` flipped to `-` or `*`; and every
+    /// whole-function fixed-tuple replacement (none produce `(2, 60.0)`).
+    #[test]
+    fn chapter_at_offset_concrete_arithmetic() {
+        let chapters = three_chapters();
+        let got = chapter_at_offset(&chapters, 60, 100.0, 100);
+        assert_eq!(
+            got,
+            Some((2, 60.0)),
+            "byte 60/100 of a 100s title = t=60s = chapter 2 (1-based)"
+        );
+    }
+
+    /// `total_bytes == 0` must short-circuit to `None` (no title size to
+    /// compute a fraction against) regardless of whether chapters exist.
+    /// Kills `total_bytes == 0` flipped to `!=`, and (combined with the next
+    /// test) the `||` flipped to `&&`.
+    #[test]
+    fn chapter_at_offset_zero_total_bytes_is_none() {
+        let chapters = three_chapters();
+        assert_eq!(
+            chapter_at_offset(&chapters, 10, 100.0, 0),
+            None,
+            "a title with no declared size has no byte-fraction to place a chapter at"
+        );
+    }
+
+    /// No chapters declared → `None`, even with a perfectly valid nonzero
+    /// title size. Kills the `||` flipped to `&&` (which would let this case
+    /// fall through the guard and return a bogus `Some((1, ..))` from the
+    /// then-empty scan loop).
+    #[test]
+    fn chapter_at_offset_no_chapters_is_none() {
+        assert_eq!(
+            chapter_at_offset(&[], 10, 100.0, 100),
+            None,
+            "a title with no chapters has nothing to report a chapter index against"
+        );
+    }
+
+    // ── range_chapter ─────────────────────────────────────────────────────
+
+    fn title_for_range_chapter() -> DiscTitle {
+        DiscTitle {
+            duration_secs: 100.0,
+            size_bytes: 204_800, // 100 sectors * 2048
+            chapters: three_chapters(),
+            extents: vec![Extent {
+                start_lba: 1_000,
+                sector_count: 100,
+            }],
+            ..DiscTitle::empty()
+        }
+    }
+
+    /// Concrete positive case chaining `byte_offset_in_title` +
+    /// `chapter_at_offset`: lba 1060 is 60 sectors (122_880 bytes) into the
+    /// extent, 60% of the 204_800-byte title → t=60s → chapter 2. This exact
+    /// non-default tuple kills every fixed-tuple whole-function replacement
+    /// mutant (`(None, None)`, `(Some(0), ..)`, `(Some(1), ..)`, etc. — none
+    /// equal `(Some(2), Some(60.0))`).
+    #[test]
+    fn range_chapter_concrete_positive_case() {
+        let title = title_for_range_chapter();
+        assert_eq!(range_chapter(1_060, &title), (Some(2), Some(60.0)));
+    }
+
+    /// An LBA outside every extent resolves to `(None, None)`.
+    #[test]
+    fn range_chapter_outside_extents_is_none() {
+        let title = title_for_range_chapter();
+        assert_eq!(range_chapter(5_000, &title), (None, None));
+    }
+
+    // ── locate_ranges ─────────────────────────────────────────────────────
+
+    /// Isolates the per-range `lba`/`count` sector-arithmetic from every
+    /// bps-dependent branch (duration_secs is negative, so `bps` is 0.0
+    /// under both the real `>` and any surviving `>=`/`==`/`<` mutant at that
+    /// same guard). Non-power-coincidental `pos`/`size` so `/` vs `%` vs `*`
+    /// all disagree with the expected quotient. Kills `pos / SECTOR_BYTES_U64`
+    /// and `size / SECTOR_BYTES_U64` each flipped to `%` or `*`.
+    #[test]
+    fn locate_ranges_lba_and_count_are_sector_quotients() {
+        let title = title_with_size(0, vec![]);
+        let mut title = title;
+        title.duration_secs = -1.0;
+        let result = locate_ranges(&[(5_000, 6_000)], &title);
+        assert_eq!(result.ranges.len(), 1);
+        assert_eq!(result.ranges[0].lba, 2, "5000 / 2048 = 2");
+        assert_eq!(result.ranges[0].count, 2, "6000 / 2048 = 2");
+    }
+
+    /// Concrete positive-`bps` arithmetic for both `duration_ms` (per-range)
+    /// and `main_at_risk_ms` (title-wide): bps = 204_800 B / 100 s = 2048
+    /// B/s exactly. A 4096-byte range = 2 sectors = 2000 ms at that rate,
+    /// and it's entirely inside the title's only extent so all of it counts
+    /// toward `main_at_risk_ms` too. Kills `bps > 0.0` flipped to `==`/`<`
+    /// (both would take the `else 0.0` branch here, wrongly reporting 0);
+    /// `(*size as f64) / bps` flipped to `%` or `*`; and the trailing
+    /// `* MILLIS_PER_SEC` flipped to `+` or `/`.
+    #[test]
+    fn locate_ranges_positive_bps_duration_and_at_risk() {
+        let title = title_with_size(
+            204_800,
+            vec![Extent {
+                start_lba: 0,
+                sector_count: 100,
+            }],
+        );
+        let mut title = title;
+        title.duration_secs = 100.0;
+        let result = locate_ranges(&[(0, 4096)], &title);
+        assert_eq!(result.ranges.len(), 1);
+        assert_eq!(
+            result.ranges[0].duration_ms, 2000.0,
+            "4096 B / 2048 B/s * 1000 = 2000 ms"
+        );
+        assert_eq!(result.largest_gap_ms, 2000.0);
+        assert_eq!(
+            result.main_at_risk_ms, 2000.0,
+            "the range is entirely inside the title's extent"
+        );
+    }
+
+    /// `bps` computed exactly `0.0` (duration_secs == 0.0): both the
+    /// per-range `duration_ms` and title-wide `main_at_risk_ms` must stay
+    /// `0.0`, never a divide-by-zero `inf`/`NaN`. Kills `bps > 0.0` flipped
+    /// to `>=` at BOTH sites (mod.rs:743 and mod.rs:768) — with the boundary
+    /// exactly zero, `>=` wrongly takes the division branch and produces
+    /// `inf` instead of the real code's `0.0`.
+    #[test]
+    fn locate_ranges_zero_bps_stays_zero_not_infinite() {
+        let title = title_with_size(
+            204_800,
+            vec![Extent {
+                start_lba: 0,
+                sector_count: 100,
+            }],
+        );
+        // duration_secs left at DiscTitle::empty()'s default 0.0.
+        let result = locate_ranges(&[(0, 4096)], &title);
+        assert_eq!(result.ranges[0].duration_ms, 0.0);
+        assert_eq!(result.main_at_risk_ms, 0.0);
+    }
+
+    // NOTE: mod.rs:732 (`title.duration_secs > 0.0` seeding `bps`) — the
+    // `>`-to-`>=` mutant is EQUIVALENT. `bps` is only ever consumed behind
+    // its own `bps > 0.0` re-check at both use sites (mod.rs:743, 768); at
+    // the exact boundary (`duration_secs == 0.0`) the mutant instead computes
+    // `bps = size_bytes / 0.0` (`inf` or `NaN` since `size_bytes >= 0`), and
+    // `inf > 0.0` / `NaN > 0.0` are both `false` at the re-check — so the
+    // final output (`0.0` via the `else` branch) is identical either way. No
+    // reachable input makes this observable.
+
+    // ── Codec::name / Display ────────────────────────────────────────────
+
+    /// `name()` is a linear lookup keyed by `==` against `ALL_CODECS`; picking
+    /// a codec that is NOT the first table entry means a mutated `==`→`!=`
+    /// returns the (wrong) first entry's name instead. `Unknown` isn't in the
+    /// table at all, exercising the post-loop fallback.
+    #[test]
+    fn codec_name_lookup_and_unknown_fallback() {
+        assert_eq!(Codec::Hevc.name(), "HEVC");
+        assert_eq!(Codec::TrueHd.name(), "TrueHD");
+        assert_eq!(
+            Codec::Unknown(0xAB).name(),
+            "Unknown",
+            "a coding type outside the table falls back to the literal \"Unknown\""
+        );
+    }
+
+    /// `Display` must forward to `name()`, not silently emit nothing.
+    #[test]
+    fn codec_display_forwards_to_name() {
+        assert_eq!(format!("{}", Codec::TrueHd), "TrueHD");
+    }
+
+    // ── Resolution::is_sd / from_height ──────────────────────────────────
+
+    #[test]
+    fn resolution_is_sd_matches_sd_variants_only() {
+        assert!(Resolution::R480i.is_sd());
+        assert!(Resolution::R480p.is_sd());
+        assert!(Resolution::R576i.is_sd());
+        assert!(Resolution::R576p.is_sd());
+        assert!(!Resolution::R720p.is_sd());
+        assert!(!Resolution::R1080p.is_sd());
+        assert!(!Resolution::Unknown.is_sd());
+    }
+
+    /// Every from_height bucket boundary — deleting any one match arm makes
+    /// its heights fall through to the NEXT surviving arm (a strictly
+    /// different variant), so each of these pairs (top of one bucket, bottom
+    /// of the next) pins the arm to its own boundary.
+    #[test]
+    fn resolution_from_height_bucket_boundaries() {
+        assert_eq!(Resolution::from_height(0), Resolution::R480p);
+        assert_eq!(Resolution::from_height(480), Resolution::R480p);
+        assert_eq!(Resolution::from_height(481), Resolution::R576p);
+        assert_eq!(Resolution::from_height(576), Resolution::R576p);
+        assert_eq!(Resolution::from_height(577), Resolution::R720p);
+        assert_eq!(Resolution::from_height(720), Resolution::R720p);
+        assert_eq!(Resolution::from_height(721), Resolution::R1080p);
+        assert_eq!(Resolution::from_height(1080), Resolution::R1080p);
+        assert_eq!(Resolution::from_height(1081), Resolution::R2160p);
+        assert_eq!(Resolution::from_height(2160), Resolution::R2160p);
+        assert_eq!(Resolution::from_height(2161), Resolution::R4320p);
+    }
+
+    // ── AudioChannels::from_count ─────────────────────────────────────────
+
+    /// Every mapped count 1..=8, plus an out-of-range fallback. Deleting any
+    /// one match arm makes that count fall through to `_ => Unknown`.
+    #[test]
+    fn audio_channels_from_count_every_mapped_value() {
+        assert_eq!(AudioChannels::from_count(1), AudioChannels::Mono);
+        assert_eq!(AudioChannels::from_count(2), AudioChannels::Stereo);
+        assert_eq!(AudioChannels::from_count(3), AudioChannels::Stereo21);
+        assert_eq!(AudioChannels::from_count(4), AudioChannels::Quad);
+        assert_eq!(AudioChannels::from_count(5), AudioChannels::Surround50);
+        assert_eq!(AudioChannels::from_count(6), AudioChannels::Surround51);
+        assert_eq!(AudioChannels::from_count(7), AudioChannels::Surround61);
+        assert_eq!(AudioChannels::from_count(8), AudioChannels::Surround71);
+        assert_eq!(AudioChannels::from_count(0), AudioChannels::Unknown);
+        assert_eq!(AudioChannels::from_count(9), AudioChannels::Unknown);
+    }
+
+    // ── SampleRate::from_hz ───────────────────────────────────────────────
+
+    /// Every rate the enum can represent, expressed in Hz. Deleting any one
+    /// match arm sends that rate to `_ => Unknown`, so a rate-by-rate check
+    /// pins each arm independently. The two combo rates (`S48_96`,
+    /// `S48_192`) deliberately have no Hz spelling — `hz()` collapses them
+    /// onto 48000, so 48000 must map back to the plain `S48` and nothing else.
+    #[test]
+    fn sample_rate_from_hz_every_mapped_rate() {
+        assert_eq!(SampleRate::from_hz(44_100), SampleRate::S44_1);
+        assert_eq!(SampleRate::from_hz(48_000), SampleRate::S48);
+        assert_eq!(SampleRate::from_hz(88_200), SampleRate::S88_2);
+        assert_eq!(SampleRate::from_hz(96_000), SampleRate::S96);
+        assert_eq!(SampleRate::from_hz(176_400), SampleRate::S176_4);
+        assert_eq!(SampleRate::from_hz(192_000), SampleRate::S192);
+        assert_eq!(SampleRate::from_hz(0), SampleRate::Unknown);
+        assert_eq!(SampleRate::from_hz(32_000), SampleRate::Unknown);
+    }
+
+    /// `from_hz` must invert `hz()` for every rate that has a single Hz
+    /// value (i.e. all but the two combo rates, whose `hz()` reports their
+    /// primary 48 kHz). Round-tripping rather than restating the table keeps
+    /// this honest if a rate is ever added.
+    #[test]
+    fn sample_rate_from_hz_inverts_hz_for_single_rate_variants() {
+        for r in [
+            SampleRate::S44_1,
+            SampleRate::S48,
+            SampleRate::S88_2,
+            SampleRate::S96,
+            SampleRate::S176_4,
+            SampleRate::S192,
+        ] {
+            assert_eq!(
+                SampleRate::from_hz(r.hz() as u32),
+                r,
+                "from_hz must round-trip {r:?}"
+            );
+        }
+    }
+
+    // ── HdrFormat / ColorSpace: name, Display, FromStr ────────────────────
+
+    /// `Display` must forward to `name()`, not emit an empty string: these
+    /// strings reach Matroska track names and the JSON sink, where a blank
+    /// HDR field is indistinguishable from "no HDR metadata".
+    #[test]
+    fn hdr_format_display_forwards_to_name() {
+        assert_eq!(format!("{}", HdrFormat::Hdr10Plus), "HDR10+");
+        assert_eq!(format!("{}", HdrFormat::DolbyVision), "Dolby Vision");
+        assert_eq!(format!("{}", HdrFormat::Hlg), HdrFormat::Hlg.name());
+    }
+
+    /// `FromStr` accepts the human display names as well as the compact ids,
+    /// via a second linear scan keyed on `name(v) == s`. Every probe here is
+    /// a display name that is NOT its own id, so it can only be resolved by
+    /// that second scan — and none of them is the first table entry, so a
+    /// scan whose comparison is inverted returns the wrong (first) variant
+    /// rather than the right one.
+    #[test]
+    fn hdr_format_from_str_resolves_display_names() {
+        assert_eq!(
+            "Dolby Vision".parse::<HdrFormat>(),
+            Ok(HdrFormat::DolbyVision)
+        );
+        assert_eq!("HDR10+".parse::<HdrFormat>(), Ok(HdrFormat::Hdr10Plus));
+        assert_eq!("HLG".parse::<HdrFormat>(), Ok(HdrFormat::Hlg));
+        // An unrecognised string is an error, never a silent SDR.
+        assert_eq!("not-an-hdr-format".parse::<HdrFormat>(), Err(()));
+    }
+
+    /// `ColorSpace::name` is the ITU-R designation used in track metadata.
+    /// `Unknown` is the one variant with no designation: it names the empty
+    /// string so nothing prints a fabricated colour space.
+    #[test]
+    fn color_space_name_is_the_itu_designation() {
+        assert_eq!(ColorSpace::Bt709.name(), "BT.709");
+        assert_eq!(ColorSpace::Bt2020.name(), "BT.2020");
+        assert_eq!(ColorSpace::Bt470bg.name(), "BT.470BG");
+        assert_eq!(ColorSpace::Smpte170m.name(), "SMPTE 170M");
+        assert!(ColorSpace::Unknown.name().is_empty());
+    }
+
+    /// `Display` must forward to `name()`.
+    #[test]
+    fn color_space_display_forwards_to_name() {
+        assert_eq!(format!("{}", ColorSpace::Bt2020), "BT.2020");
+        assert_eq!(
+            format!("{}", ColorSpace::Smpte170m),
+            ColorSpace::Smpte170m.name()
+        );
+    }
+
+    /// Same second-scan property as `HdrFormat`: display names resolve, and
+    /// they resolve to THEIR OWN variant. `ColorSpace` has no error case — an
+    /// unrecognised string is `Unknown`, not `Err`.
+    #[test]
+    fn color_space_from_str_resolves_display_names() {
+        assert_eq!("BT.2020".parse::<ColorSpace>(), Ok(ColorSpace::Bt2020));
+        assert_eq!("BT.470BG".parse::<ColorSpace>(), Ok(ColorSpace::Bt470bg));
+        assert_eq!(
+            "SMPTE 170M".parse::<ColorSpace>(),
+            Ok(ColorSpace::Smpte170m)
+        );
+        assert_eq!("bt2020".parse::<ColorSpace>(), Ok(ColorSpace::Bt2020));
+        assert_eq!("nonsense".parse::<ColorSpace>(), Ok(ColorSpace::Unknown));
+    }
+
+    // ── DiscTitle stream filters ──────────────────────────────────────────
+
+    /// A title whose stream list interleaves all three kinds. Each accessor
+    /// must yield exactly its own kind, in declared order — an accessor that
+    /// yields nothing (or drops its match arm) would leave stream selection
+    /// and the info panel with no tracks at all.
+    #[test]
+    fn disc_title_stream_filters_select_their_own_kind_in_order() {
+        let mut title = DiscTitle::empty();
+        title.streams = vec![
+            Stream::Subtitle(SubtitleStream {
+                pid: 0x1200,
+                codec: Codec::Pgs,
+                language: "eng".into(),
+                forced: false,
+                qualifier: LabelQualifier::None,
+                codec_data: None,
+            }),
+            Stream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::Hevc,
+                resolution: Resolution::R2160p,
+                frame_rate: FrameRate::F23_976,
+                hdr: HdrFormat::Hdr10,
+                color_space: ColorSpace::Bt2020,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            }),
+            Stream::Audio(AudioStream {
+                pid: 0x1100,
+                codec: Codec::TrueHd,
+                channels: AudioChannels::Surround71,
+                language: "eng".into(),
+                sample_rate: SampleRate::S48,
+                secondary: false,
+                purpose: LabelPurpose::Normal,
+                label: String::new(),
+            }),
+            Stream::Audio(AudioStream {
+                pid: 0x1101,
+                codec: Codec::Ac3,
+                channels: AudioChannels::Stereo,
+                language: "fra".into(),
+                sample_rate: SampleRate::S48,
+                secondary: true,
+                purpose: LabelPurpose::Commentary,
+                label: String::new(),
+            }),
+            // Blu-ray 3D dependent view: a second video stream.
+            Stream::Video(VideoStream {
+                pid: 0x1012,
+                codec: Codec::H264,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F23_976,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: true,
+                label: String::new(),
+                measured_cicp: None,
+            }),
+        ];
+
+        let audio: Vec<u16> = title.audio_streams().map(|a| a.pid).collect();
+        assert_eq!(
+            audio,
+            vec![0x1100, 0x1101],
+            "audio_streams must yield both audio PIDs in declared order"
+        );
+        let subs: Vec<u16> = title.subtitle_streams().map(|s| s.pid).collect();
+        assert_eq!(subs, vec![0x1200]);
+        let video: Vec<u16> = title.video_streams().map(|v| v.pid).collect();
+        assert_eq!(
+            video,
+            vec![0x1011, 0x1012],
+            "video_streams must yield the base view then the dependent view"
+        );
+        // The three filters partition the stream list: nothing is dropped and
+        // nothing is counted twice.
+        assert_eq!(audio.len() + subs.len() + video.len(), title.streams.len());
+        // Each accessor's payload is the real stream, not a placeholder.
+        assert_eq!(
+            title.audio_streams().next().unwrap().channels,
+            AudioChannels::Surround71
+        );
+        assert_eq!(
+            title.video_streams().next().unwrap().resolution,
+            Resolution::R2160p
+        );
+        assert_eq!(title.subtitle_streams().next().unwrap().language, "eng");
+    }
+
+    // ── DiscId::name ──────────────────────────────────────────────────────
+
+    /// The disc's best available name: the META/DL `bdmt_*.xml` title when the
+    /// disc carries one, otherwise the UDF Volume Identifier. Never a constant
+    /// and never empty when either source has content — this string names the
+    /// output file and the rip's directory.
+    #[test]
+    fn disc_id_name_prefers_meta_title_then_volume_id() {
+        let with_meta = DiscId {
+            volume_id: "SAMPLE_FILM".to_string(),
+            meta_title: Some("Sample Film".to_string()),
+            format: DiscFormat::BluRay,
+            capacity_sectors: 0,
+            encrypted: false,
+            layers: 1,
+        };
+        assert_eq!(with_meta.name(), with_meta.meta_title.as_deref().unwrap());
+        let without_meta = DiscId {
+            meta_title: None,
+            ..with_meta
+        };
+        assert_eq!(without_meta.name(), without_meta.volume_id);
+    }
+
+    // ── canonical_title_order: the capacity gate is STRICTLY greater-than ──
+
+    /// The "physically possible on this disc" gate is `size_bytes <=
+    /// capacity_bytes` (see [`Disc::canonical_title_order`]'s contract:
+    /// *"Real titles (`size_bytes ≤ capacity_bytes`) before virtual
+    /// composites"*). A title whose declared size EXACTLY equals the disc
+    /// capacity fits — a full-disc single-layer authoring, no double-counted
+    /// clips — so it is a REAL title and must outrank the oversize composite,
+    /// never be demoted alongside it.
+    ///
+    /// Asserted on the comparator directly (both argument orders), not on a
+    /// sort: an inconsistent comparator produces an implementation-defined
+    /// permutation, which would make a sort-based assertion prove nothing.
+    #[test]
+    fn canonical_order_capacity_gate_admits_a_title_that_exactly_fills_the_disc() {
+        use std::cmp::Ordering;
+        const CAP: u64 = 50_000_000_000;
+        // Exactly fills the disc — physically possible, therefore real.
+        let exact = title_with("00800.mpls", 7_200.0, CAP, 1);
+        // Twice the disc: cannot exist unless clips are double-counted.
+        let huge = title_with("00020.mpls", 15_000.0, CAP * 2, 253);
+        // A smaller real title.
+        let smaller = title_with("00200.mpls", 3_600.0, CAP / 2, 1);
+
+        // exact (real) before huge (composite), whichever way round it is asked.
+        assert_eq!(
+            Disc::canonical_title_order(&exact, &huge, CAP),
+            Ordering::Less,
+            "a title that exactly fills the disc is real and outranks the oversize composite"
+        );
+        assert_eq!(
+            Disc::canonical_title_order(&huge, &exact, CAP),
+            Ordering::Greater,
+            "the oversize composite is demoted behind the exactly-fitting real title"
+        );
+        // Both real: the LARGER real title wins. `exact` is the larger, so it
+        // must still be treated as real when it is the RIGHT-hand argument.
+        assert_eq!(
+            Disc::canonical_title_order(&smaller, &exact, CAP),
+            Ordering::Greater,
+            "the exactly-fitting title is real on the right-hand side too, and it is larger"
+        );
+        assert_eq!(
+            Disc::canonical_title_order(&exact, &smaller, CAP),
+            Ordering::Less
+        );
+    }
+
+    // ── audio_richness: the same-size / same-duration tiebreak ─────────────
+
+    /// A title carrying the given audio tracks, with size and duration fixed so
+    /// every comparison below falls through to the audio-richness tiebreak.
+    fn title_with_audio(audio: &[(Codec, AudioChannels)]) -> DiscTitle {
+        DiscTitle {
+            size_bytes: 40_000_000_000,
+            duration_secs: 7_200.0,
+            streams: audio
+                .iter()
+                .enumerate()
+                .map(|(i, &(codec, channels))| {
+                    Stream::Audio(AudioStream {
+                        pid: 0x1100 + i as u16,
+                        codec,
+                        channels,
+                        language: "eng".into(),
+                        sample_rate: SampleRate::S48,
+                        secondary: false,
+                        purpose: LabelPurpose::Normal,
+                        label: String::new(),
+                    })
+                })
+                .collect(),
+            ..DiscTitle::empty()
+        }
+    }
+
+    /// Equal-size, equal-duration sibling playlists (the same feature authored
+    /// twice — a full-audio main and an audio-reduced twin) are separated by
+    /// audio richness, ranked `(any lossless, best channel count, track count)`
+    /// with richer first. Each assertion below varies exactly ONE component of
+    /// that key and holds the other two equal, so each component is pinned
+    /// independently; the final pair is identical in all three and must compare
+    /// Equal, so "richer first" is not satisfied by a comparator that simply
+    /// never reports a tie.
+    #[test]
+    fn canonical_order_breaks_equal_size_ties_on_audio_richness() {
+        use std::cmp::Ordering;
+        const CAP: u64 = 50_000_000_000;
+
+        // (1) lossless beats lossy at the same channel count and track count.
+        let lossless = title_with_audio(&[(Codec::DtsHdMa, AudioChannels::Stereo)]);
+        let lossy = title_with_audio(&[(Codec::Ac3, AudioChannels::Stereo)]);
+        assert_eq!(
+            Disc::canonical_title_order(&lossless, &lossy, CAP),
+            Ordering::Less,
+            "a lossless track outranks a lossy one"
+        );
+        assert_eq!(
+            Disc::canonical_title_order(&lossy, &lossless, CAP),
+            Ordering::Greater
+        );
+
+        // (2) more channels wins when both are lossy and single-track.
+        let surround = title_with_audio(&[(Codec::Ac3, AudioChannels::Surround51)]);
+        assert_eq!(
+            Disc::canonical_title_order(&surround, &lossy, CAP),
+            Ordering::Less,
+            "5.1 outranks stereo at the same losslessness"
+        );
+
+        // (3) more tracks wins when losslessness and channel count are equal.
+        let two_tracks = title_with_audio(&[
+            (Codec::Ac3, AudioChannels::Stereo),
+            (Codec::Ac3, AudioChannels::Stereo),
+        ]);
+        assert_eq!(
+            Disc::canonical_title_order(&two_tracks, &lossy, CAP),
+            Ordering::Less,
+            "the title with more audio tracks is the richer one"
+        );
+
+        // (4) identical audio really is a tie.
+        let same = title_with_audio(&[(Codec::Ac3, AudioChannels::Stereo)]);
+        assert_eq!(
+            Disc::canonical_title_order(&same, &lossy, CAP),
+            Ordering::Equal,
+            "identical titles must compare Equal — the tiebreak is a real comparison, not a constant"
+        );
+    }
+
+    // ── detect_disc_format: the MKB-less BDMV fallback ────────────────────
+
+    /// A BDMV-tree disc with NO readable `/AACS/MKB_RO.inf` (unencrypted, or an
+    /// unreadable MKB) has no AACS generation to classify by, so the format
+    /// falls back to video resolution. Two rules apply there:
+    ///   * UHD resolution PROMOTES the disc to [`DiscFormat::Uhd`] — the ECC
+    ///     block sweep is sized off this, so losing the promotion mis-sizes it;
+    ///   * everything else is clamped UP to [`DiscFormat::BluRay`], because a
+    ///     BD-tree disc is never a DVD even when an SD bonus title is scanned
+    ///     first.
+    #[test]
+    fn mkb_less_bdmv_disc_is_promoted_to_uhd_by_resolution_and_clamped_up_otherwise() {
+        use crate::udf::fixture::*;
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            // BDMV only — no /AACS, so there is no MKB Type record to read.
+            subdirs: vec![DirSpec {
+                name: "BDMV".into(),
+                icb_lba: 12,
+                dir_data_lba: 13,
+                files: Vec::new(),
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let uhd = [title_with_video(Codec::Hevc, Resolution::R2160p)];
+        assert_eq!(
+            Disc::detect_disc_format(&mut disc, &udf, &uhd),
+            DiscFormat::Uhd,
+            "a 2160p BDMV disc with no MKB is a UHD"
+        );
+        let hd = [title_with_video(Codec::H264, Resolution::R1080p)];
+        assert_eq!(
+            Disc::detect_disc_format(&mut disc, &udf, &hd),
+            DiscFormat::BluRay
+        );
+        let sd = [title_with_video(Codec::Mpeg2, Resolution::R480i)];
+        assert_eq!(
+            Disc::detect_disc_format(&mut disc, &udf, &sd),
+            DiscFormat::BluRay,
+            "an SD title on a BDMV disc must never downgrade the disc to DVD"
+        );
+    }
+
+    // ── encrypted_content_ranges ──────────────────────────────────────────
+
+    /// The authoritative "which sectors are AACS content" map is the UNION of
+    /// every title's extents, sorted and merged into a disjoint set. Titles
+    /// routinely share clips (a play-all playlist references the feature's
+    /// clips), so the raw per-title extents overlap and arrive in playlist
+    /// order, not LBA order. The fixture below carries all three shapes at
+    /// once — an OVERLAP across two titles, an ADJACENT pair, and a DISJOINT
+    /// region — supplied out of order.
+    #[test]
+    fn encrypted_content_ranges_unions_sorts_and_merges_every_titles_extents() {
+        let mut disc = make_test_disc(200_000, "BD");
+        let mut feature = DiscTitle::empty();
+        feature.extents = vec![ext(1_000, 100), ext(5_000, 50)];
+        let mut play_all = DiscTitle::empty();
+        // [1050,1250) overlaps the feature's [1000,1100); [1250,1260) is
+        // exactly adjacent to it.
+        play_all.extents = vec![ext(1_050, 200), ext(1_250, 10)];
+        disc.titles = vec![play_all, feature];
+
+        assert_eq!(
+            disc.encrypted_content_ranges(),
+            vec![(1_000, 260), (5_000, 50)],
+            "the encrypted-content map is the merged, disjoint union of every title's extents"
+        );
+
+        // No parsed titles => no content gate at all (callers fall back).
+        let unscanned = make_test_disc(200_000, "BD");
+        assert!(
+            unscanned.encrypted_content_ranges().is_empty(),
+            "a disc with no titles declares no encrypted content"
+        );
+    }
+
+    // ── aacs_disc_hash ────────────────────────────────────────────────────
+
+    /// The disc hash names the disc in an [`Error::NoDiscKey`] so the caller can
+    /// tell the user which keydb entry to add — it must be the disc's OWN
+    /// captured SHA-1 of `Unit_Key_RO.inf`, in the bare 40-hex form the keydb is
+    /// keyed on (the stored field carries a `0x` prefix). A disc with no AACS
+    /// state has no hash to report, and reports nothing rather than a
+    /// placeholder that would send the user hunting a non-existent entry.
+    #[test]
+    fn aacs_disc_hash_is_the_captured_hash_without_its_0x_prefix() {
+        const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+        let mut disc = make_test_disc(1_000, "UHD");
+        assert!(
+            disc.aacs_disc_hash().is_empty(),
+            "no AACS state => no disc to name"
+        );
+        disc.aacs = Some(AacsState {
+            disc_hash: format!("0x{SHA1}"),
+            ..aacs_with(Vec::new())
+        });
+        assert_eq!(disc.aacs_disc_hash(), SHA1);
+        // Already bare (no prefix) passes through unchanged, never re-stripped.
+        disc.aacs = Some(AacsState {
+            disc_hash: SHA1.to_string(),
+            ..aacs_with(Vec::new())
+        });
+        assert_eq!(disc.aacs_disc_hash(), SHA1);
+    }
+
+    // ── decrypt_keys_for_title: CSS crack-span reuse is half-open ─────────
+
+    /// A CSS title key is per-VTS: reusing the scan's cracked key for a title
+    /// that lives OUTSIDE the cracked span descrambles that title with the wrong
+    /// key, and the mux emits garbage at exit 0. `crack_span` is documented as
+    /// the half-open LBA span `[start, end)`, so overlap is
+    /// `extent.start < span.end && span.start < extent.end` — both comparisons
+    /// STRICT. A title that merely ABUTS the span (ends exactly where it begins,
+    /// or begins exactly where it ends) shares no sector with it and must NOT
+    /// reuse the key.
+    ///
+    /// The reader serves only clear (all-zero) sectors, so a title that falls
+    /// through to its own crack is reported unencrypted — distinguishable from
+    /// the reused-key answer both in the key and in the is-clear flag.
+    #[test]
+    fn decrypt_keys_for_title_css_span_reuse_is_half_open() {
+        const KEY: [u8; 5] = [0xA1, 0xB2, 0xC3, 0xD4, 0xE5];
+        let mut disc = make_test_disc(200_000, "DVD");
+        disc.format = DiscFormat::Dvd;
+        disc.content_format = ContentFormat::MpegPs;
+        disc.encrypted = true;
+        // Key cracked from sectors [250, 300).
+        disc.css = Some(crate::css::CssState {
+            title_key: KEY,
+            crack_span: Some((250, 300)),
+        });
+        let mk = |extents: &[(u32, u32)]| {
+            let mut t = title_with_video(Codec::Mpeg2, Resolution::R480p);
+            t.extents = extents
+                .iter()
+                .map(|&(start_lba, sector_count)| Extent {
+                    start_lba,
+                    sector_count,
+                })
+                .collect();
+            t
+        };
+        disc.titles = vec![
+            // 0: [200,250) — ends exactly where the span begins.
+            mk(&[(200, 50)]),
+            // 1: [300,350) — begins exactly where the span ends.
+            mk(&[(300, 50)]),
+            // 2: [260,270) — genuinely inside the span.
+            mk(&[(260, 10)]),
+            // 3: no extents at all.
+            mk(&[]),
+        ];
+        let mut clear = CssMapReader {
+            key: KEY,
+            scrambled: (0, 0),
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+
+        for idx in [0usize, 1] {
+            let (keys, title_is_clear) = disc.decrypt_keys_for_title(idx, &mut clear, 16);
+            assert!(
+                matches!(keys, crate::decrypt::DecryptKeys::None),
+                "title {idx} only ABUTS the crack span — it shares no sector with it, so the \
+                 per-VTS key must not be reused"
+            );
+            assert!(
+                title_is_clear,
+                "title {idx} re-cracks from its own (clear) extents and is reported unencrypted"
+            );
+        }
+
+        let (keys, title_is_clear) = disc.decrypt_keys_for_title(2, &mut clear, 16);
+        match keys {
+            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
+                title_key, KEY,
+                "a title INSIDE the crack span reuses the scan's key"
+            ),
+            _ => panic!("expected the reused CSS key for an overlapping title"),
+        }
+        assert!(!title_is_clear);
+
+        // A title with NO extents has nothing to crack from: it short-circuits
+        // to the disc-wide keys and is marked clear, so the decrypt gate's
+        // "None keys + not clear" rule cannot hard-fail it.
+        let (keys, title_is_clear) = disc.decrypt_keys_for_title(3, &mut clear, 16);
+        match keys {
+            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(title_key, KEY),
+            _ => panic!("an extent-less title must return the disc-wide keys"),
+        }
+        assert!(
+            title_is_clear,
+            "an extent-less title is clear — nothing scrambled to worry about"
+        );
+    }
+
+    // ── mapfile paths ─────────────────────────────────────────────────────
+
+    /// The mapfile sits BESIDE the output as `<output>.mapfile`: the suffix is
+    /// appended to the whole path, never substituted for the extension (which
+    /// would make `movie.iso` and `movie.mkv` share one mapfile).
+    #[test]
+    fn mapfile_path_for_appends_the_suffix_to_the_whole_output_path() {
+        assert_eq!(
+            mapfile_path_for(std::path::Path::new("/tmp/rip/movie.iso")),
+            std::path::PathBuf::from("/tmp/rip/movie.iso.mapfile")
+        );
+        assert_eq!(
+            mapfile_path_for(std::path::Path::new("/tmp/rip/movie")),
+            std::path::PathBuf::from("/tmp/rip/movie.mapfile")
+        );
+    }
+
+    /// Regular output: `Disc::mapfile_for` is the plain `<path>.mapfile` rule.
+    #[test]
+    fn mapfile_for_regular_output_is_the_output_path_plus_suffix() {
+        let disc = make_test_disc(1_000, "SOME_DISC");
+        assert_eq!(
+            disc.mapfile_for(std::path::Path::new("/tmp/rip/movie.iso")),
+            std::path::PathBuf::from("/tmp/rip/movie.iso.mapfile")
+        );
+    }
+
+    /// `/dev/null` output (the benchmark sink) cannot host a sibling mapfile, so
+    /// the mapfile is named from the disc and placed in the temp dir. The name
+    /// is sanitized to `[A-Za-z0-9-_]` — every other character, including the
+    /// spaces and punctuation that appear in real META/DL titles and the
+    /// non-ASCII ones, becomes `_` — because this string is used verbatim as a
+    /// filename.
+    #[test]
+    fn mapfile_for_dev_null_sanitizes_the_disc_name_into_a_temp_path() {
+        let mut disc = make_test_disc(1_000, "VOLUME_ID");
+        // Keeps: alphanumeric, '-', '_'. Replaces: space, '!', non-ASCII.
+        disc.meta_title = Some("A-B_c1 d!é".into());
+        assert_eq!(
+            disc.mapfile_for(std::path::Path::new("/dev/null")),
+            std::env::temp_dir().join("A-B_c1_d__.mapfile")
+        );
+        // The UDF volume id is the fallback when the disc carries no META/DL
+        // title.
+        disc.meta_title = None;
+        assert_eq!(
+            disc.mapfile_for(std::path::Path::new("/dev/null")),
+            std::env::temp_dir().join("VOLUME_ID.mapfile")
+        );
+    }
 }

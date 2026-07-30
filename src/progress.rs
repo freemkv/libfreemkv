@@ -472,6 +472,33 @@ mod pass_progress_tests {
         assert_eq!(p.pending_pct(), 75.0, "a sized disc must not report 0%");
     }
 
+    /// The three disc-relative percentages clamp an overshoot too, not just
+    /// `work_pct`. A counter can transiently exceed the disc size while a pass
+    /// re-reads a region, and a client fed 137% renders past the end of its bar.
+    #[test]
+    fn the_disc_percentages_clamp_an_overshoot_to_a_hundred() {
+        let over = |f: fn(&PassProgress) -> f64, set: fn(&mut PassProgress)| {
+            let mut p = PassProgress {
+                bytes_total_disc: 1000,
+                ..sample()
+            };
+            set(&mut p);
+            f(&p)
+        };
+        assert_eq!(
+            over(PassProgress::good_pct, |p| p.bytes_good_total = 5000),
+            100.0
+        );
+        assert_eq!(
+            over(PassProgress::bad_pct, |p| p.bytes_unreadable_total = 5000),
+            100.0
+        );
+        assert_eq!(
+            over(PassProgress::pending_pct, |p| p.bytes_pending_total = 5000),
+            100.0
+        );
+    }
+
     /// The three disc-relative percentages read three DIFFERENT byte counters.
     /// Nothing above would catch `bad_pct` reading `bytes_pending_total`: each
     /// test sets one counter and leaves the others zero, so a swapped field

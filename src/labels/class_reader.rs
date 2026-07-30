@@ -1388,4 +1388,162 @@ mod tests {
             let _ = decode_modified_utf8(&buf);
         }
     }
+
+    // -----------------------------------------------------------------
+    // ConstantPool / ClassFile accessor correctness
+    //
+    // These exercise plain data accessors on an already-parsed pool
+    // (built via the test-only `from_entries` constructor) — not the
+    // untrusted-bytes parsing path, just "does the right variant map to
+    // the right Option value."
+    // -----------------------------------------------------------------
+
+    fn sample_pool() -> ConstantPool {
+        // index: 0=Empty (reserved), 1=Utf8("Hello"), 2=Integer(42),
+        // 3=String{string_index:1}, 4=Class{name_index:1}, 5=Float(1.5),
+        // 6=Long(9), 7=Empty (2-slot tail), 8=Double(2.5), 9=Empty (tail).
+        ConstantPool::from_entries(vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("Hello".to_string()),
+            CpInfo::Integer(42),
+            CpInfo::String { string_index: 1 },
+            CpInfo::Class { name_index: 1 },
+            CpInfo::Float(1.5),
+            CpInfo::Long(9),
+            CpInfo::Empty,
+            CpInfo::Double(2.5),
+            CpInfo::Empty,
+        ])
+    }
+
+    #[test]
+    fn constant_pool_string_resolves_through_string_index() {
+        let pool = sample_pool();
+        // index 3 is CpInfo::String{string_index: 1} -> utf8(1) = "Hello".
+        assert_eq!(pool.string(3), Some("Hello"));
+        // Wrong variant (Integer at index 2) must not resolve as a string.
+        assert_eq!(pool.string(2), None);
+        // Out of range index.
+        assert_eq!(pool.string(999), None);
+    }
+
+    #[test]
+    fn constant_pool_integer_resolves_only_integer_entries() {
+        let pool = sample_pool();
+        assert_eq!(pool.integer(2), Some(42));
+        // Wrong variant (Utf8 at index 1) must not resolve as an integer.
+        assert_eq!(pool.integer(1), None);
+        assert_eq!(pool.integer(999), None);
+    }
+
+    #[test]
+    fn constant_pool_load_constant_display_covers_ldc_operand_kinds() {
+        let pool = sample_pool();
+        assert_eq!(
+            pool.load_constant_display(1),
+            Some("utf8:\"Hello\"".to_string())
+        );
+        assert_eq!(pool.load_constant_display(2), Some("int:42".to_string()));
+        assert_eq!(
+            pool.load_constant_display(3),
+            Some("str:\"Hello\"".to_string())
+        );
+        assert_eq!(
+            pool.load_constant_display(4),
+            Some("class:\"Hello\"".to_string())
+        );
+        assert_eq!(pool.load_constant_display(5), Some("float:1.5".to_string()));
+        assert_eq!(pool.load_constant_display(6), Some("long:9".to_string()));
+        assert_eq!(
+            pool.load_constant_display(8),
+            Some("double:2.5".to_string())
+        );
+        // A variant with no display arm (e.g. reserved Empty slot) -> None.
+        assert_eq!(pool.load_constant_display(0), None);
+        assert_eq!(pool.load_constant_display(999), None);
+    }
+
+    #[test]
+    fn constant_pool_len_and_is_empty() {
+        let pool = sample_pool();
+        assert_eq!(pool.len(), 10);
+        assert!(!pool.is_empty());
+
+        let empty = ConstantPool::from_entries(vec![]);
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn constant_pool_iter_yields_index_and_entry_pairs() {
+        let pool = ConstantPool::from_entries(vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("A".to_string()),
+            CpInfo::Integer(7),
+        ]);
+        let indices: Vec<u16> = pool.iter().map(|(i, _)| i).collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+        // Confirm the entries themselves come through, not an empty iterator.
+        let utf8_at_1 = pool.iter().find(|(i, _)| *i == 1).map(|(_, e)| match e {
+            CpInfo::Utf8(s) => s.as_str(),
+            _ => "?",
+        });
+        assert_eq!(utf8_at_1, Some("A"));
+    }
+
+    fn class_file_with(this_class: u16, super_class: u16, pool: ConstantPool) -> ClassFile {
+        ClassFile {
+            minor_version: 0,
+            major_version: 0,
+            constant_pool: pool,
+            access_flags: 0,
+            this_class,
+            super_class,
+            interfaces: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            attributes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn this_class_name_and_super_class_name_resolve_distinct_indices() {
+        let pool = ConstantPool::from_entries(vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("com/example/Foo".to_string()),
+            CpInfo::Utf8("com/example/Bar".to_string()),
+            CpInfo::Class { name_index: 1 },
+            CpInfo::Class { name_index: 2 },
+        ]);
+        let cf = class_file_with(3, 4, pool);
+        assert_eq!(cf.this_class_name(), Some("com/example/Foo"));
+        assert_eq!(cf.super_class_name(), Some("com/example/Bar"));
+
+        // this_class index pointing at a non-Class entry must not resolve.
+        let pool2 = ConstantPool::from_entries(vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("not a class ref".to_string()),
+        ]);
+        let cf2 = class_file_with(1, 1, pool2);
+        assert_eq!(cf2.this_class_name(), None);
+        assert_eq!(cf2.super_class_name(), None);
+    }
+
+    #[test]
+    fn member_descriptor_resolves_the_descriptor_not_the_name() {
+        let pool = ConstantPool::from_entries(vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("doStuff".to_string()), // index 1: name
+            CpInfo::Utf8("()V".to_string()),     // index 2: descriptor
+        ]);
+        let cf = class_file_with(0, 0, pool);
+        let m = Member {
+            access_flags: 0,
+            name_index: 1,
+            descriptor_index: 2,
+            attributes: Vec::new(),
+        };
+        assert_eq!(cf.member_descriptor(&m), Some("()V"));
+        assert_ne!(cf.member_descriptor(&m), Some("doStuff"));
+    }
 }

@@ -569,3 +569,76 @@ fn scan_encrypted_resolves_no_keys() {
     // capture, so the keyless state isn't even built) — either way, no keys.
     assert!(matches!(disc.decrypt_keys(), libfreemkv::DecryptKeys::None));
 }
+
+#[test]
+fn aacs_dir_alone_marks_the_disc_encrypted_and_reports_the_capture_error() {
+    // Encryption detection is an OR over the two on-disc AACS locations:
+    // `/AACS` (Blu-ray / UHD, ECMA-167 root) and `/BDMV/AACS` (the BDMV-nested
+    // variant). This fixture carries ONLY `/AACS`, the standard retail layout,
+    // so a detector that required BOTH would call a genuinely encrypted disc
+    // clear — the worst possible failure here, because a "clear" disc is muxed
+    // straight through and ships ciphertext as if it were video, at exit 0.
+    let mut reader = MockSectorReader::new();
+    build_udf_with_aacs_dir(&mut reader);
+
+    let disc = Disc::scan_image(&mut reader, 1000, &ScanOptions::default()).unwrap();
+
+    assert!(
+        disc.encrypted,
+        "a disc carrying /AACS is encrypted even though /BDMV/AACS is absent"
+    );
+    // Encrypted => the scan attempts the (lookup-free) AACS input capture. This
+    // fixture's /AACS is empty, so that capture fails and the failure must be
+    // PRESERVED on the disc: callers render it, and its absence is what a scan
+    // that never attempted the capture at all would look like.
+    assert!(
+        disc.aacs_error.is_some(),
+        "the failed AACS capture on an encrypted disc must be surfaced, not dropped"
+    );
+    assert!(
+        disc.aacs.is_none(),
+        "no VID was resolvable from this fixture"
+    );
+}
+
+/// The scan reports the medium's size on BOTH axes it exposes, derived from the
+/// one sector count the caller hands in:
+///
+/// * `capacity_bytes` is that sector count times the 2048-byte logical sector
+///   (ECMA-167 / BD-ROM logical block size). It is what sizes a full-disc image
+///   read and what the progress percentage divides by, so a wrong scale is a
+///   wrong ISO length, not a cosmetic number.
+/// * `layers` distinguishes single- from dual-layer media. The threshold sits
+///   between the two real capacities: a single-layer BD-25 is 12,219,392
+///   sectors (25,025,314,816 bytes / 2048) and a dual-layer BD-50 is 24,438,784
+///   sectors, so BD-25 must report 1 layer and BD-50 must report 2.
+///
+/// `scan_image` takes the sector count as a parameter, so this exercises the
+/// real derivation without a 50 GB fixture.
+#[test]
+fn scan_image_reports_capacity_in_bytes_and_the_layer_count() {
+    let opts = ScanOptions::default();
+
+    let mut reader = MockSectorReader::new();
+    build_minimal_udf(&mut reader);
+    let disc = Disc::scan_image(&mut reader, 1_000, &opts).unwrap();
+    assert_eq!(disc.capacity_sectors, 1_000);
+    assert_eq!(
+        disc.capacity_bytes, 2_048_000,
+        "capacity_bytes is the sector count scaled by the 2048-byte logical sector"
+    );
+
+    // BD-25: single layer.
+    let mut reader = MockSectorReader::new();
+    build_minimal_udf(&mut reader);
+    let bd25 = Disc::scan_image(&mut reader, 12_219_392, &opts).unwrap();
+    assert_eq!(bd25.capacity_bytes, 25_025_314_816);
+    assert_eq!(bd25.layers, 1, "a BD-25 is single-layer");
+
+    // BD-50: dual layer.
+    let mut reader = MockSectorReader::new();
+    build_minimal_udf(&mut reader);
+    let bd50 = Disc::scan_image(&mut reader, 24_438_784, &opts).unwrap();
+    assert_eq!(bd50.capacity_bytes, 50_050_629_632);
+    assert_eq!(bd50.layers, 2, "a BD-50 is dual-layer");
+}

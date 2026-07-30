@@ -186,6 +186,91 @@ fn make_label(num: u16, label: String, stream_type: StreamLabelType) -> StreamLa
 mod tests {
     use super::super::{LabelPurpose, LabelQualifier};
     use super::*;
+    use std::io::{Cursor, Write as _};
+
+    /// Build a minimal, structurally valid `.class` file (JVMS §4.1) whose
+    /// constant pool holds exactly the given `Utf8` strings (indices 1..=N,
+    /// no long/double slot padding needed for plain strings). No fields,
+    /// methods, interfaces, or attributes — `scan_jar`'s only interest is
+    /// the constant pool.
+    fn build_class(utf8_entries: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xCAFEBABEu32.to_be_bytes()); // magic
+        out.extend_from_slice(&0u16.to_be_bytes()); // minor_version
+        out.extend_from_slice(&52u16.to_be_bytes()); // major_version (Java 8)
+        out.extend_from_slice(&((utf8_entries.len() + 1) as u16).to_be_bytes()); // cp_count
+        for s in utf8_entries {
+            out.push(1); // CONSTANT_Utf8 tag
+            out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        out.extend_from_slice(&0u16.to_be_bytes()); // access_flags
+        out.extend_from_slice(&0u16.to_be_bytes()); // this_class
+        out.extend_from_slice(&0u16.to_be_bytes()); // super_class
+        out.extend_from_slice(&0u16.to_be_bytes()); // interfaces_count
+        out.extend_from_slice(&0u16.to_be_bytes()); // fields_count
+        out.extend_from_slice(&0u16.to_be_bytes()); // methods_count
+        out.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+        out
+    }
+
+    /// Zip `entries` (name -> bytes) into an in-memory, Stored (uncompressed)
+    /// `jar::Jar` via the `zip` crate's own writer — a real archive, not a
+    /// hand-rolled central directory.
+    fn build_jar(entries: &[(&str, Vec<u8>)]) -> jar::Jar {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, data) in entries {
+                writer.start_file(*name, opts).expect("start_file");
+                writer.write_all(&data[..]).expect("write class bytes");
+            }
+            writer.finish().expect("finish zip");
+        }
+        zip::ZipArchive::new(Cursor::new(buf)).expect("valid zip")
+    }
+
+    /// `scan_jar` wires together `for_each_class`, constant-pool iteration,
+    /// `collect_textfield`, and `make_label` into the actual per-jar scan
+    /// used by `parse`. The pure `collect_textfield`/`make_label` unit
+    /// tests above don't exercise this wiring at all.
+    ///
+    /// Mutation: replace the whole function body with `vec![]` — every
+    /// dbp disc would silently lose all its stream labels regardless of
+    /// what's in the jar.
+    #[test]
+    fn scan_jar_extracts_labels_from_real_class_entries() {
+        let class_bytes = build_class(&[
+            "com/dbp/Whatever", // unrelated string — must be ignored
+            "LTextField,Audio1,English Dolby Atmos,Fontstrip_Composite,296,763",
+            "HTextField,Subtitle1,English SDH,Fontstrip_Composite,1312,763",
+            "ATextField,Subtitle0,None,Fontstrip_Composite,1312,843", // disable button, skipped
+        ]);
+        let mut archive = build_jar(&[("com/dbp/Menu.class", class_bytes)]);
+
+        let labels = scan_jar(&mut archive);
+
+        assert_eq!(
+            labels.len(),
+            2,
+            "expected one audio + one real subtitle label"
+        );
+        let audio = labels
+            .iter()
+            .find(|l| l.stream_type == StreamLabelType::Audio)
+            .expect("audio label present");
+        assert_eq!(audio.stream_number, 1);
+        assert_eq!(audio.language, "eng");
+
+        let sub = labels
+            .iter()
+            .find(|l| l.stream_type == StreamLabelType::Subtitle)
+            .expect("subtitle label present");
+        assert_eq!(sub.stream_number, 1);
+        assert_eq!(sub.qualifier, LabelQualifier::Sdh);
+    }
 
     /// A `CONSTANT_Utf8_info` carries a `u16` length (JVMS §4.4.7), so one
     /// crafted constant contributes up to 65535 bytes and the `u16` stream

@@ -306,7 +306,7 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{K_MAX_CDB_SIZE, OPEN, bsd_name_of, drive_has_disc};
+    use super::{K_MAX_CDB_SIZE, OPEN, bsd_name_of, cstr_to_str, drive_has_disc};
     use crate::error::Error;
     use std::path::Path;
     use std::sync::atomic::Ordering;
@@ -316,6 +316,30 @@ mod tests {
         assert_eq!(bsd_name_of(Path::new("/dev/disk4")).unwrap(), "disk4");
         assert_eq!(bsd_name_of(Path::new("/dev/rdisk4")).unwrap(), "disk4");
         assert_eq!(bsd_name_of(Path::new("disk4")).unwrap(), "disk4");
+    }
+
+    /// The shim's fixed-width `[u8; N]` fields are C strings: NUL-terminated,
+    /// with trailing bytes undefined/garbage past the terminator. `cstr_to_str`
+    /// must stop at the first NUL, not read the full fixed width, and must
+    /// never panic on a non-UTF-8 tail the shim could hand back.
+    #[test]
+    fn cstr_to_str_stops_at_first_nul() {
+        let mut bytes = [0xAAu8; 8]; // 0xAA is not valid UTF-8 on its own
+        bytes[..5].copy_from_slice(b"BU40N");
+        bytes[5] = 0; // terminator; bytes[6..8] remain 0xAA "garbage"
+        assert_eq!(cstr_to_str(&bytes), "BU40N");
+    }
+
+    #[test]
+    fn cstr_to_str_no_nul_uses_whole_buffer() {
+        let bytes = *b"HL-DT-ST";
+        assert_eq!(cstr_to_str(&bytes), "HL-DT-ST");
+    }
+
+    #[test]
+    fn cstr_to_str_invalid_utf8_returns_empty_not_panic() {
+        let bytes = [0xFFu8, 0xFE, 0x00, 0x00];
+        assert_eq!(cstr_to_str(&bytes), "");
     }
 
     /// `drive_has_disc` is documented as a cheap, side-effect-free presence
