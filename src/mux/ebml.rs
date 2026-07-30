@@ -46,7 +46,7 @@ pub fn write_size(w: &mut impl Write, size: u64) -> io::Result<()> {
         // "unknown/open-ended" sentinel), and anything larger doesn't fit
         // the 7-byte payload. Reject so a finite size can never be emitted
         // as the unknown-size marker.
-        Err(crate::error::Error::MkvInvalid.into())
+        Err(crate::error::Error::MkvUnencodable.into())
     } else {
         // 8-byte size for large elements
         w.write_all(&[
@@ -211,14 +211,14 @@ pub fn start_master_buf(buf: &mut Vec<u8>, id: u32) -> io::Result<usize> {
 pub fn end_master_buf(buf: &mut [u8], size_pos: usize) -> io::Result<()> {
     let end = buf.len();
     let Some(body_start) = size_pos.checked_add(8) else {
-        return Err(crate::error::Error::MkvInvalid.into());
+        return Err(crate::error::Error::MkvUnencodable.into());
     };
     if end < body_start {
-        return Err(crate::error::Error::MkvInvalid.into());
+        return Err(crate::error::Error::MkvUnencodable.into());
     }
     let data_size = (end - body_start) as u64;
     if data_size >= 0x0100_0000_0000_0000 {
-        return Err(crate::error::Error::MkvInvalid.into());
+        return Err(crate::error::Error::MkvUnencodable.into());
     }
     buf[size_pos..body_start].copy_from_slice(&[
         0x01,
@@ -261,7 +261,7 @@ pub fn read_id(r: &mut impl Read) -> io::Result<(u32, usize)> {
             4,
         ))
     } else {
-        Err(crate::error::Error::MkvInvalid.into())
+        Err(crate::error::Error::MkvSourceInvalid.into())
     }
 }
 
@@ -362,7 +362,7 @@ pub fn read_size(r: &mut impl Read) -> io::Result<(u64, usize)> {
         // is a malformed/over-long size field rather than a valid 8-byte
         // length. Reject it instead of silently building a size from the
         // following 7 bytes (which would desync the parse).
-        Err(crate::error::Error::MkvInvalid.into())
+        Err(crate::error::Error::MkvSourceInvalid.into())
     }
 }
 
@@ -380,7 +380,7 @@ pub fn read_uint_val(r: &mut impl Read, len: usize) -> io::Result<u64> {
     // (DoS on untrusted input) — reject it at the source so every caller
     // is safe, not just the ones that pre-check.
     if len > 8 {
-        return Err(crate::error::Error::MkvInvalid.into());
+        return Err(crate::error::Error::MkvSourceInvalid.into());
     }
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf[..len])?;
@@ -392,7 +392,7 @@ pub fn read_uint_val(r: &mut impl Read, len: usize) -> io::Result<u64> {
 }
 
 /// Read a float value. EBML floats are exactly 0, 4, or 8 bytes; any other
-/// length is rejected as [`Error::MkvInvalid`] and exactly the float width is
+/// length is rejected as [`Error::MkvSourceInvalid`] and exactly the float width is
 /// consumed (so a malformed element never under- or over-reads and desyncs the
 /// rest of the parent element).
 pub fn read_float_val(r: &mut impl Read, len: usize) -> io::Result<f64> {
@@ -408,7 +408,7 @@ pub fn read_float_val(r: &mut impl Read, len: usize) -> io::Result<f64> {
             r.read_exact(&mut buf)?;
             Ok(f64::from_be_bytes(buf))
         }
-        _ => Err(crate::error::Error::MkvInvalid.into()),
+        _ => Err(crate::error::Error::MkvSourceInvalid.into()),
     }
 }
 
@@ -420,8 +420,8 @@ pub fn read_string_val(r: &mut impl Read, len: usize) -> io::Result<String> {
         buf.pop();
     }
     // Library rule: errors are numeric variants, never English strings.
-    // A non-UTF-8 string element is malformed input → MkvInvalid.
-    String::from_utf8(buf).map_err(|_| crate::error::Error::MkvInvalid.into())
+    // A non-UTF-8 string element is malformed input → MkvSourceInvalid.
+    String::from_utf8(buf).map_err(|_| crate::error::Error::MkvSourceInvalid.into())
 }
 
 /// Read binary data of `len` bytes.
@@ -441,9 +441,9 @@ fn read_exact_bounded(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
     let got = r.take(len as u64).read_to_end(&mut buf)?;
     if got != len {
         // A truncated element is malformed input. Use the typed crate error
-        // so callers matching on Error::MkvInvalid catch short reads rather
+        // so callers matching on Error::MkvSourceInvalid catch short reads rather
         // than a bare io::ErrorKind that bypasses the numeric-code identity.
-        return Err(crate::error::Error::MkvInvalid.into());
+        return Err(crate::error::Error::MkvSourceInvalid.into());
     }
     Ok(buf)
 }
@@ -1186,7 +1186,7 @@ mod tests {
     #[test]
     fn read_uint_val_rejects_len_above_8() {
         // len 9 would index past the [0u8; 8] buffer → OOB/DoS on untrusted
-        // input. Must be a clean MkvInvalid.
+        // input. Must be a clean MkvSourceInvalid.
         let e = read_uint_val(&mut Cursor::new(&[0u8; 16]), 9).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
@@ -1227,7 +1227,7 @@ mod tests {
 
     #[test]
     fn read_binary_val_short_read_errors() {
-        // Declare 100 bytes but supply 4 → MkvInvalid (truncated element).
+        // Declare 100 bytes but supply 4 → MkvSourceInvalid (truncated element).
         let e = read_binary_val(&mut Cursor::new(&[1u8, 2, 3, 4]), 100).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         // Exact-length read returns the bytes verbatim.

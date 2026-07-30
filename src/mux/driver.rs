@@ -80,8 +80,10 @@ fn effective_send_deadline(send_deadline: Option<Duration>) -> Duration {
 /// pre-headers buffer without bound (the whole 30-90 GB title, one PES frame at
 /// a time) until the process is OOM-killed. 512 MiB is far more than any real
 /// codec-private resolution needs but small enough to fail fast rather than
-/// swap the box to death. Once exceeded the mux is refused exactly as the
-/// headers-never-resolved gate refuses it (`Error::MkvInvalid`). Mirrors
+/// swap the box to death. Once exceeded the mux is refused with
+/// `Error::MuxHeaderBufferExceeded` — its OWN code, not the
+/// headers-never-resolved gate's `Error::MkvInvalid`, which
+/// `error::is_skippable_title_stub` reports as a skippable stub. Mirrors
 /// autorip's pre-refactor `HEADER_BUFFER_CAP_BYTES`.
 const HEADER_BUFFER_CAP_BYTES: usize = 512 * 1024 * 1024;
 
@@ -1152,6 +1154,11 @@ mod tests {
             Duration::from_secs(60),
         )
         .expect_err("unresolved headers must be refused");
+        // This gate is the GENUINE stub case — the pump ended without any video
+        // track's codec_private resolving, so the title produced no muxable
+        // frames. `MkvInvalid` now means only this (malformed `mkv://` input is
+        // `MkvSourceInvalid`, E9053), and it must stay skippable so an all-titles
+        // rip drops the empty nav/menu PGC and finishes the rest.
         assert!(
             crate::error::is_skippable_title_stub(&err),
             "MkvInvalid is a skippable stub, got {err}"
