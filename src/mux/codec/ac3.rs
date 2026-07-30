@@ -2,13 +2,29 @@
 //!
 //! Every (E-)AC-3 syncframe starts with syncword 0x0B77. A legacy AC-3
 //! syncframe is a complete access unit on its own, but an E-AC-3 access unit
-//! (ETSI TS 102 366 / ATSC A/52 Annex E) is an INDEPENDENT substream frame
-//! plus every DEPENDENT substream frame that follows it — a decoder needs the
-//! whole set to reconstruct the programme (a 5.1 independent substream plus a
-//! dependent substream carrying the extra channels of a 7.1 programme, and the
-//! AC-3-core + E-AC-3-dependent arrangement used for backwards-compatible
-//! Dolby Digital Plus). This parser therefore groups syncframes into access
-//! units by `strmtyp` rather than emitting one frame per syncframe.
+//! (ETSI TS 102 366 / ATSC A/52 Annex E) is a whole FRAME SET: the mandatory
+//! independent substream (`substreamid` 0) plus every DEPENDENT substream frame
+//! that follows it, plus any ADDITIONAL independent substreams (`substreamid`
+//! 1..7) and their own dependents. A decoder needs the whole set to reconstruct
+//! the programme (a 5.1 independent substream plus a dependent substream
+//! carrying the extra channels of a 7.1 programme, and the AC-3-core +
+//! E-AC-3-dependent arrangement used for backwards-compatible Dolby Digital
+//! Plus), and every substream of the frame set covers the SAME time period.
+//! This parser therefore groups syncframes into access units at each
+//! independent substream whose `substreamid` is 0, rather than emitting one
+//! frame per syncframe or breaking at every independent substream.
+//!
+//! WHY the whole frame set is ONE sample, rather than splitting an additional
+//! independent substream (an associated / commentary service) into a track of its
+//! own: Annex E orders the substreams of a frame set inside a single elementary
+//! stream, all covering one time period, and a decoder handed a frame set renders
+//! the programme it is asked for from it — that is exactly what the container's
+//! E-AC-3 sample and its `dec3`/`num_ind_sub` description denote. Splitting would
+//! mean rewriting the bitstream (re-numbering `substreamid` so the extracted
+//! service becomes substream 0, and rebuilding its frame sets), because a
+//! substream numbered 1..7 with no substream 0 is not a conforming stream. That
+//! is a transcode, not a remux; this parser is lossless, so the frame set stays
+//! whole and player-side programme selection decides what is heard.
 //!
 //! Buffers across PES boundaries so access units that span two PES packets
 //! are emitted complete, not truncated or split.
@@ -36,13 +52,14 @@ const MIN_FRAME_BYTES: usize = 6;
 const AC3_SAMPLES_PER_FRAME: u32 = 1536;
 
 /// Hard cap on the carry-over buffer. An AC-3/E-AC-3 syncframe is at most 8192
-/// bytes (the `frame_size > 8192` reject below) and an access unit is at most one
-/// independent substream plus 8 dependent substreams (ETSI TS 102 366 Annex E),
-/// so a single straddling access unit plus slack never needs more than this. If
-/// the buffer grows past the cap without yielding a frame (pathological /
+/// bytes (the `frame_size > 8192` reject below) and an access unit is a whole
+/// frame set: up to 8 independent substreams, each with up to 8 dependent
+/// substreams (ETSI TS 102 366 Annex E) — 72 syncframes worst case. A cap of one
+/// straddling frame set plus slack therefore has to exceed 72 × 8192 = 576 KiB.
+/// If the buffer grows past the cap without yielding a frame (pathological /
 /// never-syncing input) we drop it and resync rather than accumulate one PES
 /// worth of data per call for the whole title.
-const MAX_AC3_BUF: usize = 128 * 1024;
+const MAX_AC3_BUF: usize = 1024 * 1024;
 
 pub struct Ac3Parser {
     /// Leftover bytes from previous PES (incomplete frame at end).
@@ -56,13 +73,14 @@ pub struct Ac3Parser {
     /// the running PTS is advanced across it (see the emit loop) so the drop is a
     /// silence gap, never a shift of the following audio.
     tally: super::dropgate::DropTally,
-    /// Set once a dependent substream (E-AC-3 `strmtyp` == 1) has been seen on
-    /// this track. Until then a trailing LEGACY AC-3 syncframe is closed and
-    /// emitted in-call (a plain AC-3 / DVD track has no substreams at all, so
-    /// holding it back would only add latency); afterwards it is held open
+    /// Set once a syncframe that EXTENDS an access unit (an E-AC-3 dependent
+    /// substream, or an additional independent substream with `substreamid` != 0)
+    /// has been seen on this track. Until then a trailing LEGACY AC-3 syncframe is
+    /// closed and emitted in-call (a plain AC-3 / DVD track has no substreams at
+    /// all, so holding it back would only add latency); afterwards it is held open
     /// across the PES boundary because it may be the core of an AC-3-core +
-    /// E-AC-3-dependent access unit whose dependent half is in the next PES.
-    saw_dependent: bool,
+    /// E-AC-3-dependent frame set whose remaining substreams are in the next PES.
+    saw_extension: bool,
 }
 
 impl Default for Ac3Parser {
@@ -77,7 +95,7 @@ impl Ac3Parser {
             buf: Vec::with_capacity(4096),
             flush_pts_ns: 0,
             tally: super::dropgate::DropTally::new("ac3"),
-            saw_dependent: false,
+            saw_extension: false,
         }
     }
 
@@ -93,13 +111,15 @@ impl Ac3Parser {
 
     /// Scan `data` for (E-)AC-3 syncframes and group them into access units.
     ///
-    /// Per ETSI TS 102 366 (ATSC A/52) Annex E an access unit is one INDEPENDENT
-    /// substream frame plus every DEPENDENT substream frame that follows it, up
-    /// to the next independent substream. The access unit therefore closes only
-    /// when the NEXT independent substream (or, with `at_eos`, the end of the
-    /// stream) is seen, and it carries the INDEPENDENT substream's PTS and
-    /// duration: dependent substreams describe the same time period and add no
-    /// duration of their own.
+    /// Per ETSI TS 102 366 (ATSC A/52) Annex E an access unit is one FRAME SET:
+    /// the mandatory independent substream (`substreamid` 0) plus every DEPENDENT
+    /// substream that follows it, plus any ADDITIONAL independent substreams
+    /// (`substreamid` 1..7 — associated/commentary services) with their own
+    /// dependents. The access unit therefore closes only when the next
+    /// `substreamid`-0 independent substream (or, with `at_eos`, the end of the
+    /// stream) is seen, and it carries THAT substream's PTS and duration: every
+    /// other substream of the frame set describes the SAME time period and adds no
+    /// duration of its own.
     ///
     /// `base_pts_ns` times the access unit that begins at `data[0]` — i.e. the
     /// running cadence carried over from the previous call. `anchor` re-anchors
@@ -165,26 +185,35 @@ impl Ac3Parser {
             // vice versa, so the whole access unit is dropped as one silence gap.
             let reason = ac3_drop_reason(&self.tally, frame, bsid);
 
-            if is_dependent_substream(remaining, bsid) {
+            if substream_role(remaining, bsid) == SubstreamRole::Extends {
                 match pending.as_mut() {
-                    // A dependent substream extends the access unit it directly
-                    // follows. Requiring byte contiguity keeps skipped junk out of
-                    // the emitted access unit.
+                    // A dependent substream — or an additional independent
+                    // substream (`substreamid` 1..7) — extends the frame set it
+                    // directly follows. Requiring byte contiguity keeps skipped
+                    // junk out of the emitted access unit.
                     Some(au) if au.end == start => {
                         au.end = start + frame_size;
                         if au.drop_reason.is_none() {
                             au.drop_reason = reason;
                         }
-                        self.saw_dependent = true;
+                        self.saw_extension = true;
                     }
-                    // A dependent substream with no independent parent (a mid-AU
-                    // resync, or a stream that starts inside an access unit) is not
-                    // decodable on its own; skip it rather than ship a frame a
-                    // decoder cannot use. No PTS advance: it carries no duration.
+                    // A substream with no open access unit — a mid-frame-set
+                    // resync, or a stream whose first syncframe is not
+                    // `substreamid` 0 (Annex E orders a frame set independent
+                    // substream 0 first, so joining mid-set is exactly the case
+                    // here). It belongs to a frame set whose mandatory
+                    // `substreamid`-0 substream was never seen, so it is neither
+                    // decodable on its own (a dependent substream) nor timeable
+                    // (an additional independent substream carries the frame set's
+                    // time period, not its own PTS). Skip it rather than ship a
+                    // fragment a decoder cannot use and re-time the whole
+                    // timeline around; resync at the next `substreamid`-0
+                    // substream. No PTS advance: it carries no duration.
                     _ => {
                         tracing::debug!(
                             target: "mux",
-                            "ac3: dependent substream with no independent parent; skipped"
+                            "ac3: substream with no open access unit (frame set joined mid-set); skipped"
                         );
                     }
                 }
@@ -210,24 +239,28 @@ impl Ac3Parser {
                     drop_reason: reason,
                     bsid,
                 });
-                // Only the independent substream advances the timeline.
+                // Only the frame set's `substreamid`-0 independent substream
+                // advances the timeline: every other substream of the set covers
+                // the same time period (Annex E).
                 frame_pts_ns += duration_ns as i64;
             }
 
             pos = start + frame_size;
         }
 
-        // Close or HOLD the trailing access unit. Its dependent substreams may
+        // Close or HOLD the trailing access unit. The rest of its frame set — its
+        // dependent substreams and any additional independent substreams — may
         // still be in the next PES, so an access unit that can still grow is
         // held: the carry-over rewinds to its first byte and the whole access
         // unit is re-scanned (and only then counted/emitted) next call. An
-        // E-AC-3 independent substream can always gain dependents; a legacy
-        // AC-3 syncframe only in the AC-3-core + E-AC-3-dependent arrangement,
-        // so it is held only once this track has actually shown a dependent
-        // substream — a plain AC-3 track keeps emitting every frame in-call.
+        // E-AC-3 `substreamid`-0 substream can always gain more of its frame set;
+        // a legacy AC-3 syncframe only in the AC-3-core + E-AC-3-dependent
+        // arrangement, so it is held only once this track has actually shown a
+        // substream that extends an access unit — a plain AC-3 track keeps
+        // emitting every frame in-call.
         let mut hold_from = None;
         if let Some(au) = pending {
-            if !at_eos && (au.bsid >= 11 || self.saw_dependent) {
+            if !at_eos && (au.bsid >= 11 || self.saw_extension) {
                 frame_pts_ns = au.pts_ns;
                 hold_from = Some(au.start);
             } else {
@@ -274,18 +307,22 @@ struct PtsAnchor {
     pts_ns: i64,
 }
 
-/// An access unit under construction: `data[start..end]` is an independent
-/// substream frame plus the dependent substream frames appended so far.
+/// An access unit (frame set) under construction: `data[start..end]` is the
+/// `substreamid`-0 independent substream frame plus every substream appended to it
+/// so far — its dependents, and any additional independent substreams 1..7 with
+/// their own dependents.
 struct PendingAu {
     start: usize,
     end: usize,
-    /// PTS of the independent substream — the PTS the whole access unit carries.
+    /// PTS of the `substreamid`-0 independent substream — the PTS the whole frame
+    /// set carries.
     pts_ns: i64,
-    /// Duration of the independent substream; dependent substreams add none.
+    /// Duration of the `substreamid`-0 independent substream; the frame set's other
+    /// substreams cover the same time period and add none.
     duration_ns: u64,
     /// First decodability failure among the access unit's substreams, if any.
     drop_reason: Option<&'static str>,
-    /// bsid of the independent substream (< 11 = legacy AC-3 core).
+    /// bsid of the substream that opened the access unit (< 11 = legacy AC-3 core).
     bsid: u8,
 }
 
@@ -315,20 +352,61 @@ fn close_access_unit(
     });
 }
 
-/// Whether a syncframe is an E-AC-3 DEPENDENT substream, i.e. one that must be
-/// decoded together with the preceding independent substream.
+/// What a syncframe does to the access unit (frame set) being assembled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SubstreamRole {
+    /// Begins a new access unit.
+    Starts,
+    /// Belongs to the access unit already open — it covers the same time period
+    /// and must not close it or advance the timeline.
+    Extends,
+}
+
+/// Classify a syncframe for access-unit assembly.
 ///
 /// Byte 2 of an E-AC-3 syncframe is `strmtyp(2) | substreamid(3) | frmsiz[10:8]`
 /// (ETSI TS 102 366 Annex E BSI). `strmtyp` 0 and 2 are independent substreams
 /// (type 2 being an independent substream that is not the first of the bit
-/// stream); `strmtyp` 1 is the dependent substream. `strmtyp` 3 is reserved and
-/// is treated as independent, so an unknown type starts a fresh access unit
-/// rather than being merged into an unrelated one.
+/// stream); `strmtyp` 1 is the dependent substream.
+///
+/// Annex E defines a FRAME SET as independent substream 0 — mandatory, always
+/// first — with its dependent substreams, followed by the OPTIONAL additional
+/// independent substreams 1..7, each with their own dependents; all of them carry
+/// the same time period. So the access-unit boundary is an independent substream
+/// with `substreamid` == 0, and NOT merely "an independent substream": an
+/// additional independent substream (an associated or commentary service) sits
+/// INSIDE the frame set already open. Keying the boundary on `strmtyp` alone made
+/// every such substream close the access unit and advance the running PTS a
+/// second time over the same ~32 ms, doubling the timeline (about a second of A/V
+/// drift per second of audio).
+///
+/// `strmtyp` 3 is reserved: its BSI layout is not defined, so its `substreamid`
+/// bits cannot be trusted and it is treated as starting a fresh access unit —
+/// an unknown frame is never merged into an unrelated programme, and never
+/// discarded as an orphan either.
 ///
 /// Legacy AC-3 (`bsid < 11`) has no substream structure — byte 2 there is the
-/// crc1 field, never `strmtyp` — so it is never dependent.
-fn is_dependent_substream(data: &[u8], bsid: u8) -> bool {
-    bsid >= 11 && data.len() >= 3 && ((data[2] >> 6) & 0x03) == 1
+/// crc1 field, never `strmtyp` — so it always starts an access unit.
+///
+/// A frame set MAY carry a substream as several consecutive syncframes of fewer
+/// than six blocks each (Annex E allows numblkscod < 3). Those extra syncframes
+/// are `substreamid` 0 too, so each starts its own access unit here rather than
+/// merging into one frame set. That is deliberate: each carries its OWN
+/// numblkscod-derived duration (see `frame_duration_ns`), so the timeline total
+/// stays exact, and the substreams are still delivered in bitstream order.
+fn substream_role(data: &[u8], bsid: u8) -> SubstreamRole {
+    if bsid < 11 || data.len() < 3 {
+        return SubstreamRole::Starts;
+    }
+    let strmtyp = (data[2] >> 6) & 0x03;
+    let substreamid = (data[2] >> 3) & 0x07;
+    match strmtyp {
+        // Dependent substream: always part of the open frame set.
+        1 => SubstreamRole::Extends,
+        // Independent substream: only id 0 begins a frame set.
+        0 | 2 if substreamid != 0 => SubstreamRole::Extends,
+        _ => SubstreamRole::Starts,
+    }
 }
 
 use super::crc::crc16_ansi;
@@ -1870,6 +1948,87 @@ mod tests {
             f[0].pts_ns,
             pts_to_ns(90000),
             "orphan consumed no time — following audio keeps its true PTS"
+        );
+    }
+
+    #[test]
+    fn eac3_additional_independent_substream_stays_in_the_frame_set() {
+        // THE FIX: an Annex E frame set is independent substream 0 (mandatory,
+        // first) with its dependents, then the OPTIONAL additional independent
+        // substreams 1..7 with theirs — ALL covering the SAME time period. An
+        // additional independent substream (an associated / commentary service)
+        // therefore belongs to the frame set already open; keying the access-unit
+        // boundary on `strmtyp` alone made it close the AU and advance the running
+        // PTS a SECOND time over the same 32 ms, doubling the timeline (~1 s of
+        // A/V drift per second of audio).
+        let mut parser = Ac3Parser::new();
+        let ind0 = make_eac3_frame(0, 0, 160); // main programme
+        let dep0 = make_eac3_frame(1, 0, 96); // its dependent (7.1 extension)
+        let ind1 = make_eac3_frame(0, 1, 128); // associated service
+        let dep1 = make_eac3_frame(1, 1, 96); // its dependent
+        let mut set = ind0.clone();
+        set.extend_from_slice(&dep0);
+        set.extend_from_slice(&ind1);
+        set.extend_from_slice(&dep1);
+
+        // Three consecutive frame sets: the third closes the second, and the
+        // third itself is held for a possible continuation and drained by flush().
+        let mut data = Vec::new();
+        for _ in 0..3 {
+            data.extend_from_slice(&set);
+        }
+        let mut f = parser.parse(&make_eac3_pes(data));
+        f.extend(parser.flush());
+
+        assert_eq!(
+            f.len(),
+            3,
+            "one access unit per frame set — NOT one per independent substream"
+        );
+        let base = pts_to_ns(90000);
+        for (i, fr) in f.iter().enumerate() {
+            assert_eq!(
+                fr.data, set,
+                "frame set {i} emerges whole, all four substreams in bitstream order"
+            );
+            assert_eq!(
+                fr.pts_ns,
+                base + i as i64 * 32_000_000,
+                "frame set {i} advances by ONE 32 ms period, not two"
+            );
+            assert_eq!(
+                fr.duration_ns,
+                Some(32_000_000),
+                "the additional independent substream adds no duration"
+            );
+        }
+        assert_eq!(parser.dropped_frames(), 0, "nothing dropped");
+    }
+
+    #[test]
+    fn eac3_stream_joined_mid_frame_set_resyncs_at_substreamid_0() {
+        // A stream whose first syncframe is an ADDITIONAL independent substream
+        // (here substreamid 3) joined a frame set whose mandatory substreamid-0
+        // substream was never seen. Mirroring the orphan-dependent rule, it is
+        // skipped: it carries the frame set's time period rather than its own, so
+        // emitting it as an access unit would invent a period for audio whose
+        // main programme is missing. Grouping resyncs at the next substreamid-0
+        // substream, and the orphan consumes none of the timeline.
+        let mut parser = Ac3Parser::new();
+        let orphan = make_eac3_frame(0, 3, 128);
+        let orphan_dep = make_eac3_frame(1, 3, 96);
+        let ind0 = make_eac3_frame(0, 0, 160);
+        let mut data = orphan;
+        data.extend_from_slice(&orphan_dep);
+        data.extend_from_slice(&ind0);
+        let mut f = parser.parse(&make_eac3_pes(data));
+        f.extend(parser.flush());
+        assert_eq!(f.len(), 1, "only the frame set that has substreamid 0");
+        assert_eq!(f[0].data, ind0, "the orphan substreams are not shipped");
+        assert_eq!(
+            f[0].pts_ns,
+            pts_to_ns(90000),
+            "orphans consumed no time — the resynced audio keeps its true PTS"
         );
     }
 
