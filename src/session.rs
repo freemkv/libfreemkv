@@ -244,7 +244,15 @@ impl DiscSession {
     /// set), runs [`Disc::scan`], stores the result, and returns a borrow.
     pub fn scan(&mut self, opts: ScanOptions) -> Result<&Disc> {
         let opts = forward_key_material(&mut self.spec, opts);
-        let disc = Disc::scan(self.drive.as_mut().expect("drive present for scan"), &opts)?;
+        // `stage_drive_as_reader` is PUBLIC and moves the drive into the reader
+        // slot, so this slot can legitimately be empty when a caller reaches
+        // here. A library must not panic from public API, and "no shipped
+        // consumer calls it in that order" is not the same as "cannot happen" —
+        // the public surface permits it, so it must be an error.
+        let drive = self.drive.as_mut().ok_or_else(|| Error::DeviceNotReady {
+            path: self.device.clone(),
+        })?;
+        let disc = Disc::scan(drive, &opts)?;
         self.disc = Some(disc);
         Ok(self.disc.as_ref().expect("disc just stored"))
     }
@@ -272,12 +280,13 @@ impl DiscSession {
             let disc = self.disc.as_mut().expect("disc present (checked above)");
             resolve_keys_for(reader.as_mut(), disc, sources)
         } else {
+            // Same reachability as `scan` above: the drive may have been staged
+            // into the reader slot by the public `stage_drive_as_reader`.
+            let drive = self.drive.as_mut().ok_or_else(|| Error::DeviceNotReady {
+                path: self.device.clone(),
+            })?;
             let disc = self.disc.as_mut().expect("disc present (checked above)");
-            resolve_keys_for(
-                self.drive.as_mut().expect("drive present for key sampling"),
-                disc,
-                sources,
-            )
+            resolve_keys_for(drive, disc, sources)
         };
         self.key_fetch = resolved.key_fetch;
         Ok(resolved.trace)

@@ -236,8 +236,8 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
 }
 
 /// Parse the ProgramInfo section: per-stream (pid, coding_type,
-/// language, codec sub-fields). Layout per the BD CLPI spec
-/// clpi_parse.c:
+/// language, codec sub-fields). Layout per the Blu-ray Disc Read-Only Format
+/// Part 3 CLIPINF (CLPI) specification:
 ///
 /// ```text
 /// ProgramInfo:

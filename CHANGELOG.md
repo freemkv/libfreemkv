@@ -877,12 +877,13 @@ consumers are the in-tree toolchain crates.
   SD-DVD.** rc.5.1 added a 20 ms `DefaultDecodedFieldDuration` field element to
   the 576i/480i track header on the theory that Windows derives fps from it.
   Captured evidence showed that element made Windows Explorer report 12.5 fps
-  (half) and MediaInfo flip the track to "Frame rate mode: Variable", while
-  MakeMKV's rip of the same disc omits it. The element is therefore no longer
-  written (`MkvTrack::video` now passes `field_duration_ns == 0`); the track
-  keeps `FlagInterlaced=1` + `FieldOrder=TFF` and the full-frame 40 ms
-  `DefaultDuration` (`1/DefaultDuration` = 25 fps), matching MakeMKV. How a given
-  player or shell handler chooses to display interlaced fps is not guaranteed.
+  (half) and MediaInfo flip the track to "Frame rate mode: Variable". The
+  element is optional in RFC 9559 and nothing requires it for interlaced SD, so
+  it is no longer written (`MkvTrack::video` now passes `field_duration_ns == 0`);
+  the track keeps `FlagInterlaced=1` + `FieldOrder=TFF` and the full-frame 40 ms
+  `DefaultDuration` (`1/DefaultDuration` = 25 fps), which is the frame rate the
+  source actually carries. How a given player or shell handler chooses to display
+  interlaced fps is not guaranteed.
 - **Correct AC-3 audio track selected on DVDs with non-standard sub-stream
   ordering.** freemkv assigned each declared audio stream a physical sub-stream
   by ordinal (`0x80+n`), assuming the IFO's first stream lives at `0x80`. On
