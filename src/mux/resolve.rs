@@ -16,7 +16,7 @@
 //! | fvi://  | -- | Yes | file path (required) — per-picture video index |
 //!
 //! Bare paths without a scheme are rejected.
-//! For disc→ISO (raw sector copy), use `Disc::copy()` instead.
+//! For disc→ISO (raw sector copy), use `freemkv_engine::recovery::copy` instead.
 //!
 //! Note: `disc://` cannot be opened through [`input`]; it returns
 //! [`crate::error::Error::DiscUrlNotDirect`]. Live-disc input must go

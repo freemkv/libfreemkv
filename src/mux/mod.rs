@@ -21,7 +21,7 @@
 //! output.finish()?;
 //! ```
 //!
-//! For disc→ISO (raw sector copy), use `Disc::copy()` instead.
+//! For disc→ISO (raw sector copy), use `freemkv_engine::recovery::copy` instead.
 
 // Public modules — types here are intentionally part of the consumable API.
 pub mod disc;

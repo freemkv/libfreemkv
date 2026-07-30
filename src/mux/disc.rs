@@ -3,7 +3,7 @@
 //! One stream type for all disc sources. The source is a SectorSource —
 //! Drive (hardware) or FileSectorSource (file). DiscStream doesn't care.
 //!
-//! Read-only. For disc→ISO (raw sector copy), use `Disc::copy()`.
+//! Read-only. For disc→ISO (raw sector copy), use `freemkv_engine::recovery::copy`.
 
 use crate::disc::{DiscTitle, Extent};
 use crate::drive::extract_scsi_context;

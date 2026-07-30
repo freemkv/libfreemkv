@@ -42,7 +42,8 @@ base64 = "0.22.1"
 # parser, not a hand-rolled scanner: the XPL is genuine XML (comments, varied
 # attribute order, self-closing tags).
 roxmltree = "0.20"
-# Trace-level instrumentation for Disc::copy + SgIoTransport::execute. Permitted
+# Trace-level instrumentation for the read/transport path (SgIoTransport::execute
+# and friends). Permitted
 # under CLAUDE.md ("Acceptable strings: debug/trace logging"). Consumers (autorip)
 # wire a tracing subscriber and pipe events into the JSONL debug log.
 tracing = "0.1"

@@ -44,7 +44,7 @@ pub const AACS_KEY_CLASS: u8 = 0x02;
 pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 
 /// Timeout for content READ commands (READ_10 / READ_12) on the fast
-/// path — the [`disc::Disc::copy`] sweep that bisects-on-failure.
+/// path — the `freemkv_engine::recovery::copy` sweep that bisects-on-failure.
 ///
 /// 10 s is calibrated from live empirical data on an LG BU40N + Initio
 /// 1618L bridge ripping a UHD with marginal sectors:
@@ -67,7 +67,7 @@ pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 pub(crate) const READ_TIMEOUT_MS: u32 = 10_000;
 
 /// Timeout for content READ commands on the recovery path —
-/// [`disc::Disc::patch`]'s targeted retries on bad ranges. Matches
+/// `freemkv_engine::recovery::patch`'s targeted retries on bad ranges. Matches
 /// `sg_dd`'s 60 s ceiling: long enough that any sector the drive can
 /// recover at all gets the time to do so, short enough that an
 /// unresponsive bus is detected before the per-range watchdog fires.
@@ -77,7 +77,7 @@ pub(crate) const READ_TIMEOUT_MS: u32 = 10_000;
 /// safety ceiling, not a steady-state cost.
 ///
 /// Historical note (2026-05-08): briefly lowered to 2 s with a 5×
-/// inline retry loop in `Disc::patch` to mimic the kernel `sr_mod`
+/// inline retry loop in `freemkv_engine::recovery::patch` to mimic the kernel `sr_mod`
 /// driver's auto-retry pattern. The synthetic logic worked but on the
 /// live drive each "2 s" read paid ~1.5 s of kernel SCSI mid-layer
 /// error escalation on top, so 5× retries took ~17 s per LBA and
@@ -237,7 +237,7 @@ impl ScsiSense {
     ///
     /// `false` for HARDWARE ERROR, DATA PROTECT, UNIT ATTENTION,
     /// ILLEGAL REQUEST, BLANK CHECK, and any unknown key. Used
-    /// by [`Error::is_marginal_read`] / `Disc::copy`'s hysteresis
+    /// by [`Error::is_marginal_read`] / `freemkv_engine::recovery::copy`'s hysteresis
     /// dispatch.
     pub fn is_marginal(&self) -> bool {
         matches!(
@@ -1022,8 +1022,8 @@ mod parse_sense_tests {
 #[cfg(test)]
 mod scsi_sense_predicate_tests {
     //! Classification of [`ScsiSense`] predicate methods against SPC-4
-    //! §4.5.6 Table 28 sense keys. These drive `Disc::copy` hysteresis
-    //! and `Disc::patch` routing; a misclassification here silently
+    //! §4.5.6 Table 28 sense keys. These drive `freemkv_engine::recovery::copy` hysteresis
+    //! and `freemkv_engine::recovery::patch` routing; a misclassification here silently
     //! changes which sectors get retried vs. marked unreadable.
     use super::*;
 

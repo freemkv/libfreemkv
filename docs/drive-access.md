@@ -58,15 +58,16 @@ selects the per-CDB timeout:
 
 | `recovery` | Timeout  | Used by                                  |
 |------------|----------|------------------------------------------|
-| `false`    | 1.5 s    | `Disc::sweep` fast skip-forward pass, `DiscStream::fill_extents` |
-| `true`     | 30 s     | `Disc::patch` retry pass over the mapfile |
+| `false`    | 10 s     | `freemkv_engine::recovery::sweep` fast skip-forward pass, `DiscStream::fill_extents` |
+| `true`     | 60 s     | `freemkv_engine::recovery::patch` retry pass over the mapfile |
 
 On any SCSI failure or timeout, `read` returns `Err(DiscRead)` immediately.
 There are no inline retries, no SCSI reset, no Phase 1/2/3 escalation.
 
 Recovery is layered above `Drive::read`:
 
-- **Layer 1 — `Disc::patch`** loops over the ddrescue mapfile and re-issues
+- **Layer 1 — `freemkv_engine::recovery::patch`** (in the engine crate, not
+  here) loops over the ddrescue mapfile and re-issues
   `read(.., recovery=true)` against each non-`+` range.
 - **Layer 3 — `DiscStream::fill_extents`** halves the request size on
   failure, retries at the same LBA, and probes back up on a clean-read

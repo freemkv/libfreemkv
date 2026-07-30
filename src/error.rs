@@ -1032,7 +1032,7 @@ impl Error {
     /// REQUEST, BLANK CHECK, kernel `IoError`, and any non-SCSI variant.
     /// Caller-agnostic predicate — describes a property of the *error*,
     /// not what one specific call site should do with it. Used by
-    /// `Disc::copy`'s hysteresis dispatch.
+    /// `freemkv_engine::recovery::copy`'s hysteresis dispatch.
     pub fn is_marginal_read(&self) -> bool {
         self.scsi_sense()
             .map(crate::scsi::ScsiSense::is_marginal)
