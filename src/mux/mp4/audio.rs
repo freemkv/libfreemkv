@@ -281,7 +281,11 @@ fn parse_dts(frame: &[u8]) -> Option<DtsConfig> {
     let lfe = lff == 1 || lff == 2;
 
     let sample_rate = DTS_SFREQ[sfreq];
-    let base_ch = DTS_AMODE_CH.get(amode).copied().unwrap_or(6);
+    // AMODE is a 6-bit field, so 16..=63 are reachable — they are RESERVED in
+    // ETSI TS 102 114 and describe a layout this code cannot name. Refuse rather
+    // than guess: the old `unwrap_or(6)` invented a channel count that the speaker
+    // mask could not match, which is the self-contradiction this box must not have.
+    let base_ch = *DTS_AMODE_CH.get(amode)?;
     let channels = base_ch as u16 + lfe as u16;
     let channel_layout = dts_channel_layout(amode, lfe);
     // DTS-HD extension substream sync (0x64582025) after the core frame. Search
@@ -306,16 +310,45 @@ fn parse_dts(frame: &[u8]) -> Option<DtsConfig> {
     })
 }
 
-/// `ddts` ChannelLayout (16-bit speaker mask) for the common core layouts.
-/// bit0=C, bit1=L/R, bit2=Ls/Rs, bit3=LFE.
+/// `ddts` ChannelLayout speaker mask (ETSI TS 102 114 / DTS-in-ISOBMFF) per core
+/// `AMODE`. Bit assignment: 0=C, 1=L/R, 2=Ls/Rs, 3=LFE, 4=Cs, 5=Lh/Rh,
+/// 6=Lsr/Rsr, 7=Ch, 8=Oh, 9=Lc/Rc, 10=Lw/Rw, 11=Lss/Rss, 12=LFE2, 13=Lhs/Rhs,
+/// 14=Chr, 15=Lhr/Rhr. Paired bits denote two speakers, single bits one.
+///
+/// This must stay consistent with [`DTS_AMODE_CH`]: the `ddts` box declares both a
+/// channel count and this mask, and a decoder may trust either — so a mask that
+/// describes fewer speakers than the declared count makes the box self-contra-
+/// dictory and provokes a downmix or an outright error. The previous `_ => 0x0007`
+/// catch-all did exactly that for AMODE 6, 7, and 10 through 15. AMODE 6
+/// (`L + R + S`) is the reachable one: its `S` is a single centre-surround, not
+/// the Ls/Rs pair, so it is 3 channels and `0x0012`, not 4 and `0x0006`.
+/// `ddts_channel_layout_speaker_count_matches_declared_channels` pins the
+/// invariant for all 16 values.
+const DTS_AMODE_LAYOUT: [u16; 16] = [
+    0x0001, // 0  C
+    0x0002, // 1  L/R
+    0x0002, // 2  L/R  (sum/difference)
+    0x0002, // 3  L/R  (left/right total)
+    0x0002, // 4  L/R
+    0x0003, // 5  C + L/R
+    0x0012, // 6  L/R + Cs
+    0x0013, // 7  C + L/R + Cs
+    0x0006, // 8  L/R + Ls/Rs
+    0x0007, // 9  C + L/R + Ls/Rs                    (5.1 core with LFE)
+    0x0206, // 10 L/R + Ls/Rs + Lc/Rc
+    0x0143, // 11 C + L/R + Lsr/Rsr + Oh
+    0x0053, // 12 C + L/R + Cs + Lsr/Rsr
+    0x0207, // 13 C + L/R + Ls/Rs + Lc/Rc
+    0x0246, // 14 L/R + Ls/Rs + Lsr/Rsr + Lc/Rc
+    0x0217, // 15 C + L/R + Ls/Rs + Cs + Lc/Rc
+];
+
+/// `ddts` ChannelLayout (16-bit speaker mask) for a core `AMODE`, plus LFE.
+///
+/// `amode` must be 0..=15; `parse_dts` rejects the reserved 16..=63 before this is
+/// reached, so there is no layout to invent for them.
 fn dts_channel_layout(amode: usize, lfe: bool) -> u16 {
-    let mut m = match amode {
-        0 => 0x0001,     // C (mono)
-        1..=4 => 0x0002, // L/R
-        5 => 0x0003,     // C + L/R
-        6 | 8 => 0x0006, // L/R + Ls/Rs (no centre)
-        _ => 0x0007,     // C + L/R + surround (amode 7, 9, …)
-    };
+    let mut m = DTS_AMODE_LAYOUT[amode];
     if lfe {
         m |= 0x0008;
     }
@@ -536,10 +569,16 @@ mod tests {
     fn dts_ext_sync_inside_core_is_not_a_false_positive() {
         // The 4-byte ext-sync pattern occurring INSIDE the compressed core payload
         // (before core_size) must NOT be read as a DTS-HD extension → stays dtsc.
-        // f[4..8] = ext_sync makes core_size huge (>> frame len), so the search
-        // region is only after the core (skipped past this frame) → no extension.
+        // fsize=0x3FFF makes core_size far larger than the frame, so the search
+        // region starts past the end and the embedded pattern is never tested.
+        //
+        // The frame is otherwise spec-legal: f[7]=0xF2/f[8]=0x74 give AMODE 9 (5.1)
+        // and SFREQ 13 (48 kHz). An earlier fixture put the ext-sync at f[4..8],
+        // which made f[7]=0x25 → AMODE 20, a RESERVED value `parse_dts` now
+        // refuses; the pattern's position is what this test is about, not AMODE.
         let f = vec![
-            0x7F, 0xFE, 0x80, 0x01, 0x64, 0x58, 0x20, 0x25, 0x00, 0x00, 0x02, 0x00,
+            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x07, 0xFF, 0xF2, 0x74, 0x00, 0x00, 0x00, 0x64, 0x58,
+            0x20, 0x25,
         ];
         let c = parse_dts(&f).expect("parses");
         assert!(!c.has_extension, "ext-sync inside core is not an extension");
@@ -590,6 +629,84 @@ mod tests {
         let c = parse_dts(&frame(0xF3, 0xF4)).expect("amode 15 parses");
         assert_eq!(c.amode, 15);
         assert_eq!(c.channels, 8, "AMODE 15 core is 8 channels, not 6");
+    }
+
+    #[test]
+    fn ddts_channel_layout_speaker_count_matches_declared_channels() {
+        // The `ddts` box carries BOTH a channel count and a 16-bit speaker mask,
+        // and a decoder may trust either. They must agree for all 16 AMODEs.
+        //
+        // Speakers per ChannelLayout bit (ETSI TS 102 114 / DTS-in-ISOBMFF): the
+        // paired bits contribute 2, the single bits 1. LFE (bit3) is excluded here
+        // because DTS_AMODE_CH is the base count and `parse_dts` adds LFE on top.
+        const SPEAKERS_PER_BIT: [u8; 16] = [
+            1, // bit0  C
+            2, // bit1  L/R
+            2, // bit2  Ls/Rs
+            0, // bit3  LFE      (counted separately)
+            1, // bit4  Cs
+            2, // bit5  Lh/Rh
+            2, // bit6  Lsr/Rsr
+            1, // bit7  Ch
+            1, // bit8  Oh
+            2, // bit9  Lc/Rc
+            2, // bit10 Lw/Rw
+            2, // bit11 Lss/Rss
+            0, // bit12 LFE2     (counted separately)
+            2, // bit13 Lhs/Rhs
+            1, // bit14 Chr
+            2, // bit15 Lhr/Rhr
+        ];
+        let speakers = |mask: u16| -> u8 {
+            (0..16)
+                .filter(|b| mask & (1 << b) != 0)
+                .map(|b| SPEAKERS_PER_BIT[b])
+                .sum()
+        };
+
+        for amode in 0..=15usize {
+            let mask = dts_channel_layout(amode, false);
+            assert_eq!(
+                speakers(mask),
+                DTS_AMODE_CH[amode],
+                "AMODE {amode}: mask {mask:#06x} describes {} speakers but \
+                 DTS_AMODE_CH declares {} — the ddts box contradicts itself",
+                speakers(mask),
+                DTS_AMODE_CH[amode],
+            );
+            // LFE must be additive: same speakers plus the LFE bit, nothing else.
+            let with_lfe = dts_channel_layout(amode, true);
+            assert_eq!(
+                with_lfe,
+                mask | 0x0008,
+                "AMODE {amode}: LFE must only set bit3"
+            );
+        }
+    }
+
+    #[test]
+    fn dts_reserved_amode_is_rejected_not_guessed() {
+        // AMODE is a 6-bit field, so a malformed or future stream can carry 16..=63.
+        // Those are RESERVED: neither the channel count nor the speaker mask is
+        // known, and the old code guessed 6 channels while the mask described far
+        // fewer. Refusing to parse is the only answer that cannot contradict itself.
+        //
+        // amode = (f[7] & 0x0F) << 2 | (f[8] >> 6), so f[7] low nibble 0b0100 (=4)
+        // gives amode 16..19 depending on f[8]'s top bits. SFREQ stays 13 (48 kHz).
+        let frame = |f7: u8, f8: u8| {
+            vec![
+                0x7F, 0xFE, 0x80, 0x01, 0x00, 0x05, 0xF2, f7, f8, 0x00, 0x00, 0x00,
+            ]
+        };
+        for (f7, f8, amode) in [(0xF4, 0x34, 16), (0xF4, 0xF4, 19), (0xFF, 0xF4, 63)] {
+            assert!(
+                parse_dts(&frame(f7, f8)).is_none(),
+                "reserved AMODE {amode} must not parse"
+            );
+        }
+        // The boundary below it still parses, so the guard is not over-broad.
+        let c = parse_dts(&frame(0xF3, 0xF4)).expect("AMODE 15 is valid and must parse");
+        assert_eq!(c.amode, 15);
     }
 
     #[test]
