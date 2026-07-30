@@ -4112,6 +4112,35 @@ mod tests {
         /// When set, LBAs at/above [`FMTS_CPS2_LBA`] belong to a SECOND CPS
         /// unit and are encrypted under [`FMTS_CPS2_KEY`], not the base key.
         second_cps: bool,
+        /// `[start, end)` LBA span that reads back as zeros — CLEAR content, with
+        /// no encrypted unit to sample and so no CPS-unit evidence of its own.
+        clear_span: Option<(u32, u32)>,
+        /// An operator Stop that lands MID-resolve: the token is cancelled as soon
+        /// as this many reads of the given kind have been served.
+        cancel_after: Option<(crate::halt::Halt, CancelWhen, u32)>,
+    }
+
+    /// Which read counter [`FmtsDisc::cancel_after`] watches.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CancelWhen {
+        /// UDF-metadata reads — the Stop lands after the segment table is loaded and
+        /// before a single content sector has been touched.
+        Meta,
+        /// Content-probe reads — the Stop lands with the drive already working.
+        Probe,
+    }
+
+    /// The same synthetic disc with extra records appended to
+    /// `IndividualSegment.tbl` ONLY — the content region is laid out from
+    /// [`fmts_segments`] exactly as before, so the anchor and phase probes still
+    /// resolve normally and the extra records are seen purely by the range builder.
+    /// That is what isolates each of its "this record does not map" arms.
+    fn fmts_disc_with_extra_records(extra: &[crate::aacs::segment::Segment]) -> FmtsDisc {
+        let mut all = fmts_segments();
+        all.extend_from_slice(extra);
+        let mut d = FmtsDisc::new();
+        d.meta_disc = FmtsDisc::rebuild_meta(&all);
+        d
     }
 
     impl FmtsDisc {
@@ -4122,24 +4151,32 @@ mod tests {
         /// `clip = false` drops `BDMV/STREAM/00001.fmts` from the tree: an FMTS disc
         /// (the table is there) whose forensic clip cannot be identified, so the
         /// segment SPNs have no defensible anchor.
+        /// The UDF metadata image alone, with `tbl_segs` as the segment table and
+        /// the forensic clip present — see [`fmts_disc_with_extra_records`].
+        fn rebuild_meta(
+            tbl_segs: &[crate::aacs::segment::Segment],
+        ) -> crate::udf::fixture::MemDisc {
+            let mut d = Self::build(true, tbl_segs);
+            std::mem::replace(&mut d.meta_disc, crate::udf::fixture::MemDisc::new())
+        }
+
         fn with_forensic_clip(clip: bool) -> Self {
+            Self::build(clip, &fmts_segments())
+        }
+
+        fn build(clip: bool, tbl_segs: &[crate::aacs::segment::Segment]) -> Self {
             use crate::udf::fixture::{
                 DirSpec, PART_START, build_udf_skeleton, file, file_with, lay_dir,
             };
             let segs = fmts_segments();
+            let tbl_image = fmts_tbl(tbl_segs);
             let mut meta_disc = crate::udf::fixture::MemDisc::new();
             build_udf_skeleton(&mut meta_disc, 10);
             let mut subdirs = vec![DirSpec {
                 name: "AACS".to_string(),
                 icb_lba: 12,
                 dir_data_lba: 13,
-                files: vec![file_with(
-                    "IndividualSegment.tbl",
-                    14,
-                    15,
-                    fmts_tbl(&segs),
-                    true,
-                )],
+                files: vec![file_with("IndividualSegment.tbl", 14, 15, tbl_image, true)],
                 subdirs: Vec::new(),
             }];
             if clip {
@@ -4185,6 +4222,8 @@ mod tests {
                 probe_reads: 0,
                 fault_span: None,
                 second_cps: false,
+                clear_span: None,
+                cancel_after: None,
             }
         }
 
@@ -4201,6 +4240,19 @@ mod tests {
         /// The 6144-byte ciphertext of the aligned unit starting at clip byte
         /// `unit_byte`: inside a segment, EVEN units carry that index's content and
         /// ODD units the alternate variant; outside, ordinary base-Unit-Key content.
+        /// Flip the operator's Stop once the watched counter reaches its threshold.
+        fn maybe_cancel(&mut self) {
+            if let Some((h, when, n)) = &self.cancel_after {
+                let seen = match when {
+                    CancelWhen::Meta => self.meta_reads,
+                    CancelWhen::Probe => self.probe_reads,
+                };
+                if seen >= *n {
+                    h.cancel();
+                }
+            }
+        }
+
         fn unit_at(&self, unit_byte: u64) -> Vec<u8> {
             for s in &self.segs {
                 let sb = s.start_byte();
@@ -4232,6 +4284,7 @@ mod tests {
             if let Some((a, b)) = self.fault_span {
                 if lba >= a && lba < b {
                     self.probe_reads += 1;
+                    self.maybe_cancel();
                     return Err(crate::error::Error::DiscRead {
                         sector: lba as u64,
                         status: None,
@@ -4241,13 +4294,25 @@ mod tests {
             }
             if lba < FMTS_CONTENT_LBA {
                 self.meta_reads += 1;
+                self.maybe_cancel();
                 return self.meta_disc.read_sectors(lba, count, buf, recovery);
             }
             let want = count as usize * 2048;
+            // A clear span: readable, but carrying no encrypted unit at all.
+            if let Some((a, b)) = self.clear_span
+                && lba >= a
+                && lba < b
+            {
+                self.probe_reads += 1;
+                self.maybe_cancel();
+                buf[..want].fill(0);
+                return Ok(want);
+            }
             // The SECOND CPS unit's extent: ordinary (non-forensic) content,
             // encrypted under that unit's own base Unit Key.
             if self.second_cps && lba >= FMTS_CPS2_LBA {
                 self.probe_reads += 1;
+                self.maybe_cancel();
                 let unit = encrypted_clean_unit(&FMTS_CPS2_KEY);
                 for s in 0..count as usize {
                     let within = ((lba as usize + s - FMTS_CPS2_LBA as usize) % 3) * 2048;
@@ -4256,6 +4321,7 @@ mod tests {
                 return Ok(want);
             }
             self.probe_reads += 1;
+            self.maybe_cancel();
             buf[..want].fill(0);
             for s in 0..count as u32 {
                 let off = (lba + s - FMTS_CONTENT_LBA) as u64;
@@ -5048,6 +5114,682 @@ mod tests {
             super::single_base_key_slot(&[(super::FMTS_POOL_TAG_BASE, idx1), (7, base)]),
             Some(1),
             "the slot is the BASE key's, wherever it sits in the pool"
+        );
+    }
+
+    /// The forensic ranges reach `fill_base_key_gaps` in `IndividualSegment.tbl`
+    /// RECORD order, which is not LBA order — the table is a list of segments, and
+    /// nothing in `aacs::segment` sorts it. The gap walk is a single forward sweep
+    /// (`cur = cur.max(ce)`), so it is only correct on cuts in ascending order; that
+    /// is what `c.sort_unstable()` is for.
+    ///
+    /// Every existing gap-fill case happens to pass its cuts already sorted, so the
+    /// sort is unconstrained by them. Here the cuts arrive REVERSED: without the
+    /// sort the sweep takes the high cut first, jumps `cur` past it, then discards
+    /// the low cut as "already behind" — and emits a base-key fill straight over the
+    /// low forensic segment. That is the silent-wrong-key shape: the forensic LBAs
+    /// end up in TWO ranges, one of them keyed with the base Unit Key.
+    #[test]
+    fn fill_base_key_gaps_sorts_cuts_that_arrive_in_table_order_not_lba_order() {
+        use crate::decrypt::Phase::{All, Even, Odd};
+        let ext = vec![Extent {
+            start_lba: 100,
+            sector_count: 60,
+        }];
+        // Table order: the HIGH segment recorded before the LOW one.
+        let forensic = vec![(140, 150, 6, Odd), (110, 120, 5, Even)];
+        let fills = super::fill_base_key_gaps(&ext, &forensic, 0);
+        assert_eq!(
+            fills,
+            vec![(100, 110, 0, All), (120, 140, 0, All), (150, 160, 0, All),],
+            "the gaps around BOTH forensic cuts must be filled, whatever order the \
+             segment table listed them in"
+        );
+        // The load-bearing invariant: exactly one range covers every content LBA.
+        assert_gapless(&ext, &forensic, &fills);
+    }
+
+    /// A `SectorSource` that records every `(lba, count)` it is asked for and serves
+    /// a caller-chosen aligned unit, so the probe SPREAD of `sample_encrypted_units`
+    /// is observable directly.
+    struct RecordingSource {
+        reads: Vec<(u32, u16)>,
+        unit: Vec<u8>,
+    }
+    impl SectorSource for RecordingSource {
+        fn capacity_sectors(&self) -> u32 {
+            1_000_000
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.reads.push((lba, count));
+            let want = count as usize * 2048;
+            buf[..want].copy_from_slice(&self.unit[..want]);
+            Ok(want)
+        }
+    }
+
+    /// `sample_encrypted_units` is the evidence every CPS-unit decision rests on, so
+    /// WHICH units it reads matters: 8 probes at `total * p / 9` for p in 1..=8, each
+    /// a whole aligned unit (3 sectors) measured from the extent's own start.
+    ///
+    /// Pinned exactly. A probe count, a divisor or a `p` range that drifts moves the
+    /// sample set — clustering probes at one end of a 20-minute clip, where an
+    /// authored-bad or padding region can make an extent look unopenable — and each
+    /// of those is an independently reachable mutation of this arithmetic.
+    #[test]
+    fn sample_encrypted_units_probes_eight_aligned_units_spread_across_the_extent() {
+        let unit = encrypted_clean_unit(&[0x5Au8; 16]);
+        let mut src = RecordingSource {
+            reads: Vec::new(),
+            unit: unit.clone(),
+        };
+        // 90 aligned units (270 sectors) from LBA 3000.
+        let got = super::sample_encrypted_units(&mut src, 3000, 270, ContentFormat::BdTs);
+        assert_eq!(
+            src.reads,
+            vec![
+                (3000 + 10 * 3, 3),
+                (3000 + 20 * 3, 3),
+                (3000 + 30 * 3, 3),
+                (3000 + 40 * 3, 3),
+                (3000 + 50 * 3, 3),
+                (3000 + 60 * 3, 3),
+                (3000 + 70 * 3, 3),
+                (3000 + 80 * 3, 3),
+            ],
+            "8 probes at total*p/9 aligned units, each a whole 3-sector unit, \
+             anchored on the extent start"
+        );
+        assert_eq!(got.len(), 8, "every encrypted probe is returned");
+        assert!(
+            got.iter().all(|s| *s == unit),
+            "the returned samples are the units as read"
+        );
+    }
+
+    /// Only genuinely AACS-encrypted units come back — that is the whole contract
+    /// that lets a caller treat a decrypt-to-clean as proof of the key. A clear
+    /// (unencrypted) extent yields NO samples, which is what makes `pick_pool_slot`
+    /// return `None` and the caller inherit rather than fail loud.
+    #[test]
+    fn sample_encrypted_units_drops_clear_units_and_reads_nothing_below_one_unit() {
+        // A clear unit: the AACS scrambling bits in byte 0 are zero.
+        let mut clear = encrypted_clean_unit(&[0x5Au8; 16]);
+        clear[0] &= 0x3F;
+        let mut src = RecordingSource {
+            reads: Vec::new(),
+            unit: clear,
+        };
+        let got = super::sample_encrypted_units(&mut src, 3000, 270, ContentFormat::BdTs);
+        assert_eq!(src.reads.len(), 8, "the probes are still attempted");
+        assert!(got.is_empty(), "a clear unit is not evidence of any key");
+
+        // Under one whole aligned unit there is nothing to sample: no read at all.
+        let mut src = RecordingSource {
+            reads: Vec::new(),
+            unit: encrypted_clean_unit(&[0x5Au8; 16]),
+        };
+        let got = super::sample_encrypted_units(&mut src, 3000, 2, ContentFormat::BdTs);
+        assert!(
+            src.reads.is_empty(),
+            "an extent shorter than one aligned unit must not touch the drive"
+        );
+        assert!(got.is_empty());
+    }
+
+    /// `pick_pool_slot` answers "which of THESE slots, in THIS order, opens the
+    /// extent" — and its two callers pass different slot lists for a reason: the
+    /// multi-CPS path offers the whole pool, the FMTS gap fill only the BASE keys
+    /// (offering a forensic index key there would key a whole extent with it).
+    ///
+    /// So both the RESTRICTION and the ORDER are load-bearing, and neither is
+    /// implied by "some slot matched". Two samples open under two different pool
+    /// slots here, so the answer is decided purely by which slot the caller listed
+    /// first — a `find` that ignored `slots` order, or that scanned the pool
+    /// instead, would return the same value for both directions.
+    #[test]
+    fn pick_pool_slot_honours_the_caller_s_slot_list_and_its_order() {
+        let k0 = [0x01u8; 16];
+        let k1 = [0x02u8; 16];
+        let k2 = [0x03u8; 16];
+        let pool = vec![(0u32, k0), (1, k1), (2, k2)];
+        // One sample opens under slot 0, another under slot 2. Slot 1 opens neither.
+        let samples = vec![encrypted_clean_unit(&k0), encrypted_clean_unit(&k2)];
+
+        assert_eq!(
+            super::pick_pool_slot(&samples, &pool, &[2, 0], ContentFormat::BdTs),
+            Some(2),
+            "the FIRST slot in the caller's order that opens a sample wins"
+        );
+        assert_eq!(
+            super::pick_pool_slot(&samples, &pool, &[0, 2], ContentFormat::BdTs),
+            Some(0),
+            "reversing the caller's order reverses the answer"
+        );
+        assert_eq!(
+            super::pick_pool_slot(&samples, &pool, &[1], ContentFormat::BdTs),
+            None,
+            "a slot list that excludes every opening key resolves to nothing"
+        );
+        assert_eq!(
+            super::pick_pool_slot(&samples, &pool, &[7], ContentFormat::BdTs),
+            None,
+            "an out-of-range slot is skipped, not panicked on"
+        );
+        assert_eq!(
+            super::pick_pool_slot(&[], &pool, &[0, 1, 2], ContentFormat::BdTs),
+            None,
+            "no samples is no evidence"
+        );
+    }
+
+    /// Extents are `[start_lba, start_lba + sector_count)` — half open. This decides
+    /// whether a title "reads the forensic clip", i.e. whether `resolve_fmts_key_map`
+    /// resolves index keys at all or returns `Ok(None)` and leaves the title on the
+    /// base-Unit-Key path.
+    ///
+    /// Both directions are wrong in a way that does not fail loudly: an inclusive
+    /// end makes a title that merely ABUTS the forensic clip resolve (and pay a
+    /// key-service round trip) for content it does not read, while a stricter test
+    /// makes a title that shares exactly one sector fall through to a base-key-only
+    /// map and silently garble its forensic units.
+    #[test]
+    fn extents_overlap_is_half_open_at_both_ends() {
+        let at = |start_lba, sector_count| {
+            vec![Extent {
+                start_lba,
+                sector_count,
+            }]
+        };
+        assert!(
+            !super::extents_overlap(&at(100, 10), &at(110, 10)),
+            "b starts exactly where a ends → no shared sector"
+        );
+        assert!(
+            !super::extents_overlap(&at(110, 10), &at(100, 10)),
+            "and the same the other way round"
+        );
+        assert!(
+            super::extents_overlap(&at(100, 11), &at(110, 10)),
+            "one shared sector (110) IS an overlap"
+        );
+        assert!(
+            super::extents_overlap(&at(110, 10), &at(100, 11)),
+            "and the same the other way round"
+        );
+        assert!(
+            super::extents_overlap(&at(100, 100), &at(120, 5)),
+            "wholly contained is an overlap"
+        );
+        assert!(
+            !super::extents_overlap(&at(100, 10), &[]),
+            "nothing overlaps an empty extent list"
+        );
+        assert!(
+            !super::extents_overlap(&[], &at(100, 10)),
+            "in either position"
+        );
+        // A LATER extent of `a` matching is still an overlap — the scan must not
+        // stop at the first extent of either list.
+        assert!(
+            super::extents_overlap(&[at(0, 10)[0], at(500, 10)[0]], &at(505, 10)),
+            "any extent pair sharing a sector is an overlap"
+        );
+    }
+
+    // ── An unmappable forensic record is a HOLE, and a hole is a hard failure ──
+    //
+    // `resolve_fmts_key_map`'s range builder has four independent arms that refuse
+    // to emit a range for a record: inverted SPNs, an index with no key, clip bytes
+    // past the clip's end, and a span that is not one contiguous run of sectors.
+    // Each one tallies `unresolved`, and a non-zero tally aborts the disc.
+    //
+    // The tally is what makes those refusals SAFE. Drop it (or the `unresolved != 0`
+    // check) and the `continue` still fires — so the record's LBAs fall through to
+    // `fill_base_key_gaps`, which covers them with the BASE Unit Key. The forensic
+    // units then decrypt to garbage under a key that was never theirs, the map
+    // reports no error, and the rip completes with `lost_bytes == 0`. That is the
+    // exact silent-wrong-key shape this module's comments call out; the four tests
+    // below drive one arm each so no single tally can be deleted unnoticed.
+
+    fn fmts_missing_err() -> String {
+        std::io::Error::from(crate::error::Error::FmtsKeyMissing).to_string()
+    }
+
+    /// Resolve the synthetic FMTS disc with `extra` bogus records appended to its
+    /// segment table, and return the error text.
+    fn fmts_resolve_err_with(extra: &[crate::aacs::segment::Segment]) -> String {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls);
+        let mut reader = fmts_disc_with_extra_records(extra);
+        let mut keys = fmts_keys();
+        let mut cache = super::DiscKeyCache::new();
+        let title = fmts_title(FMTS_CONTENT_SECTORS);
+        super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect_err("a forensic record that maps to no range must abort the disc")
+        .to_string()
+    }
+
+    /// Control: the SAME resolve with no extra records succeeds. Without this the
+    /// four tests below could be passing for any reason at all — a fixture that
+    /// never reaches the range builder would `expect_err` just as happily.
+    #[test]
+    fn fmts_baseline_table_resolves_so_the_unmappable_record_tests_mean_something() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls);
+        let mut reader = fmts_disc_with_extra_records(&[]);
+        let mut keys = fmts_keys();
+        let mut cache = super::DiscKeyCache::new();
+        let title = fmts_title(FMTS_CONTENT_SECTORS);
+        let map = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("the well-formed synthetic FMTS disc resolves");
+        // And it really is the forensic map: the segments carry their own index-key
+        // slots (appended after the single base key), the gaps carry the base key.
+        assert_eq!(map.key_idx_for(10_300), Some(1), "segment 1 → index key 1");
+        assert_eq!(map.key_idx_for(10_600), Some(2), "segment 2 → index key 2");
+        assert_eq!(
+            map.key_idx_for(10_000),
+            Some(0),
+            "a gap → the base Unit Key"
+        );
+    }
+
+    /// Arm 1 — an INVERTED record (`start_spn > end_spn`). `end_byte - 1 -
+    /// start_byte` would underflow, so the record is refused; the tally is what
+    /// turns that refusal into a loud failure instead of a base-keyed hole.
+    #[test]
+    fn fmts_inverted_segment_record_aborts_rather_than_base_keying_the_hole() {
+        let bad = crate::aacs::segment::Segment {
+            index: 1,
+            start_spn: 12_000,
+            end_spn: 11_000,
+        };
+        assert_eq!(fmts_resolve_err_with(&[bad]), fmts_missing_err());
+    }
+
+    /// Arm 2 — a record whose forensic INDEX has no key. The synthetic source
+    /// returns two index keys, so tags 1 and 2 have pool slots and tag 3 has none.
+    /// On a real disc this is a table that outruns the key set the service
+    /// returned — precisely the case where guessing a key is worst.
+    #[test]
+    fn fmts_record_with_no_index_key_aborts_rather_than_base_keying_the_hole() {
+        let bad = crate::aacs::segment::Segment {
+            index: 3,
+            start_spn: 12_000,
+            end_spn: 12_000 + 2559,
+        };
+        assert_eq!(fmts_resolve_err_with(&[bad]), fmts_missing_err());
+    }
+
+    /// Arm 3 — a record whose START is addressable within the clip (so
+    /// `filter_addressable_segments` keeps it) but whose END runs past the clip's
+    /// last byte. Only the second `clip_byte_to_lba` fails, which is why the
+    /// filter upstream cannot stand in for this check.
+    #[test]
+    fn fmts_record_running_past_the_clips_end_aborts_rather_than_base_keying_it() {
+        // The clip is FMTS_CONTENT_SECTORS * 2048 bytes = 21_333 whole packets.
+        let bad = crate::aacs::segment::Segment {
+            index: 2,
+            start_spn: 21_000, // byte 4_032_000 — inside the clip
+            end_spn: 22_000,   // byte 4_224_191 — past its 4_096_000-byte end
+        };
+        assert!(
+            crate::aacs::segment::clip_byte_to_lba(
+                &[Extent {
+                    start_lba: FMTS_CONTENT_LBA,
+                    sector_count: FMTS_CONTENT_SECTORS,
+                }],
+                bad.start_byte(),
+            )
+            .is_some(),
+            "the fixture must reach the END check — its START has to be addressable"
+        );
+        assert_eq!(fmts_resolve_err_with(&[bad]), fmts_missing_err());
+    }
+
+    /// Arm 4 — a record whose LBA span is not one contiguous run: `b - a` counts
+    /// SECTOR crossings while `(end_byte - 1 - start_byte) / 2048` counts the
+    /// span's own length in sectors, and the two disagree exactly when the record
+    /// is not aligned to the aligned-unit grid the forensic interleave is defined
+    /// on (or when it straddles a clip extent boundary).
+    ///
+    /// A structurally valid forensic segment cannot hit this: the interleave is
+    /// per 6144-byte aligned unit, so a real record starts and ends on a
+    /// 32-packet boundary and the two counts agree. `start_spn = 10` does not —
+    /// clip byte 1920 is mid-sector — so the span is refused.
+    #[test]
+    fn fmts_record_off_the_aligned_unit_grid_aborts_rather_than_spanning_wrongly() {
+        let bad = crate::aacs::segment::Segment {
+            index: 2,
+            start_spn: 10, // clip byte 1920 — 1920 % 2048 != 0
+            end_spn: 19,   // last byte 3839 — a different sector, but < 2048 long
+        };
+        assert_eq!(fmts_resolve_err_with(&[bad]), fmts_missing_err());
+    }
+
+    /// The multi-CPS loop's inheritance chain has to run THROUGH a cache hit. An
+    /// extent served from the memo never re-samples, so its index reaches the next
+    /// extent only because the hit arm carries it into `last_idx`; without that, a
+    /// following extent with no sampleable ciphertext inherits whatever the loop
+    /// started at (slot 0) instead of its neighbour's key.
+    ///
+    /// That is silent: an unsampleable extent produces no error either way, so the
+    /// map simply keys those LBAs to the wrong CPS unit and the mux decrypts them
+    /// to garbage with `lost_bytes == 0`. The existing shared-extent test resolves a
+    /// SINGLE-extent title through the cache, so nothing downstream of the hit is
+    /// observed; here the clear extent is deliberately placed AFTER the hit.
+    #[test]
+    fn multi_cps_cache_hit_still_feeds_the_next_extents_inheritance() {
+        let key_a = [0x01u8; 16];
+        let key_b = [0x02u8; 16];
+        let key_c = [0x03u8; 16];
+        let shared = 1000u32;
+        let clear = 5000u32; // no registered ciphertext → zeros → no samples
+        let sectors = 30u32;
+        let mut reader = CountingCipherSource::new(vec![(
+            shared,
+            shared + sectors,
+            encrypted_clean_unit(&key_c),
+        )]);
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b), (2, key_c)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let mut cache = super::DiscKeyCache::new();
+
+        // Title 1 fills the memo for `shared` (index 2) by really sampling it.
+        let first = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &multi_cps_title(shared, sectors),
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("title 1 resolves");
+        assert_eq!(first.key_idx_for(shared), Some(2), "sampled to its own key");
+        let after_first = reader.probes;
+
+        // Title 2: the same clip (a cache HIT — assert that below) followed by an
+        // extent with nothing to sample.
+        let mut title2 = DiscTitle::empty();
+        title2.extents = vec![
+            Extent {
+                start_lba: shared,
+                sector_count: sectors,
+            },
+            Extent {
+                start_lba: clear,
+                sector_count: sectors,
+            },
+        ];
+        let second = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title2,
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("title 2 resolves");
+        assert_eq!(
+            reader.probes - after_first,
+            8,
+            "only the CLEAR extent is sampled — the shared one must be a cache hit, \
+             which is the path under test"
+        );
+        assert_eq!(second.key_idx_for(shared), Some(2), "the hit's own index");
+        assert_eq!(
+            second.key_idx_for(clear),
+            Some(2),
+            "an unsampleable extent inherits the PRECEDING extent's index even when \
+             that index came from the cache, not from a fresh sample"
+        );
+    }
+
+    /// The FMTS gap fill on a MULTI-CPS disc runs its own extent loop, with its own
+    /// inheritance chain (`base_slot_for_extent`'s `last_idx`). A title whose last
+    /// extent has no sampleable ciphertext — a clear/nav tail, which is exactly the
+    /// case that cannot fail loudly — must take the CPS unit its neighbour is in,
+    /// not `base_slots[0]`.
+    ///
+    /// Slot 0 here is CPS unit 1's key and the neighbour is CPS unit 2, so losing
+    /// the carry keys the tail with the wrong unit's key and decrypts it to garbage
+    /// with no error at all.
+    #[test]
+    fn fmts_multi_cps_gap_fill_carries_the_preceding_extents_cps_unit_to_a_clear_tail() {
+        const CLEAR_LBA: u32 = FMTS_CPS2_LBA + FMTS_CPS2_SECTORS;
+        const CLEAR_SECTORS: u32 = 300;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls);
+        let mut reader = FmtsDisc::with_second_cps_unit();
+        reader.clear_span = Some((CLEAR_LBA, CLEAR_LBA + CLEAR_SECTORS));
+        let mut keys = fmts_two_cps_keys();
+        let mut cache = super::DiscKeyCache::new();
+        let mut title = fmts_two_cps_title();
+        title.extents.push(Extent {
+            start_lba: CLEAR_LBA,
+            sector_count: CLEAR_SECTORS,
+        });
+
+        let map = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("a two-CPS FMTS disc with a clear tail resolves");
+        assert_eq!(
+            map.key_idx_for(FMTS_CPS2_LBA),
+            Some(1),
+            "the preceding extent is CPS unit 2 (pool slot 1)"
+        );
+        for lba in [CLEAR_LBA, CLEAR_LBA + CLEAR_SECTORS - 1] {
+            assert_eq!(
+                map.key_idx_for(lba),
+                Some(1),
+                "LBA {lba} has nothing to sample and must inherit CPS unit 2 from its \
+                 neighbour, not fall back to the first CPS unit's key"
+            );
+        }
+    }
+
+    /// The FMTS gap fill samples extents off the LIVE DRIVE through the same
+    /// per-disc [`CpsUnitCache`] the multi-CPS path uses — 8 random 6144-byte reads
+    /// per extent, ~200 ms of seek apiece. Every input to that decision is in the
+    /// cache key, so a second title over the same extents must cost ZERO further
+    /// content reads.
+    ///
+    /// The index-key memo alone does not deliver that: it short-circuits the anchor
+    /// and phase probes but the gap-fill loop still runs, and on a multi-CPS disc it
+    /// re-samples every extent unless `base_slot_for_extent` banked its verdict.
+    #[test]
+    fn fmts_multi_cps_gap_fill_samples_each_extent_once_per_disc() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls);
+        let mut reader = FmtsDisc::with_second_cps_unit();
+        let mut keys = fmts_two_cps_keys();
+        let mut cache = super::DiscKeyCache::new();
+        let title = fmts_two_cps_title();
+
+        let first = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("first title resolves");
+        let after_first = reader.probe_reads;
+        assert!(
+            after_first >= 16,
+            "the first title really samples both extents (8 probes each), saw \
+             {after_first} content reads"
+        );
+
+        let second = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("second title resolves");
+        assert_eq!(
+            reader.probe_reads, after_first,
+            "a second title over the same extents must touch the drive ZERO more \
+             times — the CPS verdict is a property of the extent's own bytes"
+        );
+        for lba in [
+            10_000u32,
+            10_300,
+            10_600,
+            FMTS_CPS2_LBA,
+            FMTS_CPS2_LBA + 599,
+        ] {
+            assert_eq!(
+                second.key_idx_for(lba),
+                first.key_idx_for(lba),
+                "and the cached map must be identical at LBA {lba}"
+            );
+        }
+    }
+
+    // ── An operator Stop that lands MID-probe ────────────────────────────────
+    //
+    // The FMTS probes are the heaviest thing this crate does to a live drive:
+    // hundreds of random 6144-byte reads, each able to stall to the SCSI recovery
+    // timeout on a marginal disc. The module's hard rule is that `/api/stop` is
+    // honored at every loop boundary rather than after the whole probe completes.
+    //
+    // The existing halt tests all pre-cancel, so the ENTRY poll alone satisfies
+    // them and the two polls inside the probe loops are unconstrained. Cancelling
+    // by OUTCOME is not enough either — a later poll still returns `Halted`, so a
+    // deleted poll looks identical. What distinguishes them is what the drive was
+    // asked to do after the Stop, so both tests below count reads.
+
+    fn halted_err() -> String {
+        std::io::Error::from(crate::error::Error::Halted).to_string()
+    }
+
+    /// Stop lands while the UDF walk is still running — before the anchor loop.
+    /// The anchor loop's own poll must catch it, so the drive is never asked for a
+    /// single CONTENT sector. Without that poll the entry poll has already passed
+    /// and the next one is inside the phase loop, so the full anchor batch (two
+    /// `MIN_SAMPLE_UNITS` phase reads plus a key-service round trip) is issued to a
+    /// drive the operator has already stopped.
+    #[test]
+    fn fmts_stop_during_the_udf_walk_touches_no_content_sector() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls.clone());
+        let halt = crate::halt::Halt::new();
+        let mut reader = FmtsDisc::new();
+        reader.cancel_after = Some((halt.clone(), CancelWhen::Meta, 1));
+        let mut keys = fmts_keys();
+        let mut cache = super::DiscKeyCache::new();
+        let title = fmts_title(FMTS_CONTENT_SECTORS);
+
+        let err = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            Some(&halt),
+            &mut cache,
+        )
+        .expect_err("a Stop during the UDF walk must abort the resolve");
+        assert_eq!(err.to_string(), halted_err(), "the verdict is Halted");
+        assert!(
+            reader.meta_reads > 0,
+            "the fixture must really have reached the UDF walk"
+        );
+        assert_eq!(
+            reader.probe_reads, 0,
+            "a stopped drive must not be asked for a single content sector"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nor the key service asked for anything"
+        );
+    }
+
+    /// Stop lands with the drive already working, during the anchor batch. The
+    /// PHASE loop's poll must catch it before probing index 1's parity — otherwise
+    /// every index in the set is probed (`MAX_ANCHOR_ATTEMPTS` segments ×
+    /// `MIN_SAMPLE_UNITS` × 2 parities each) after the operator said stop.
+    #[test]
+    fn fmts_stop_during_the_anchor_batch_stops_before_the_phase_probes() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls.clone());
+        let halt = crate::halt::Halt::new();
+        let mut reader = FmtsDisc::new();
+        // One content read in, i.e. inside the very first anchor phase batch: the
+        // anchor loop's poll has already run and passed for this segment.
+        reader.cancel_after = Some((halt.clone(), CancelWhen::Probe, 1));
+        let mut keys = fmts_keys();
+        let mut cache = super::DiscKeyCache::new();
+        let title = fmts_title(FMTS_CONTENT_SECTORS);
+
+        let err = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            Some(&halt),
+            &mut cache,
+        )
+        .expect_err("a Stop during the anchor batch must abort the resolve");
+        assert_eq!(err.to_string(), halted_err(), "the verdict is Halted");
+        // The anchor completed (it is one uninterruptible batch by construction);
+        // the phase probes must NOT have started. Each phase probe reads
+        // 2 * MIN_SAMPLE_UNITS units per attempted segment, so anything beyond the
+        // anchor's own reads is the phase loop running past the Stop.
+        let anchor_cost = crate::keysource::MIN_SAMPLE_UNITS as u32;
+        assert!(
+            reader.probe_reads > 0,
+            "the fixture must really have reached the anchor batch"
+        );
+        assert!(
+            reader.probe_reads <= 2 * anchor_cost,
+            "the phase probes must not run after the Stop — saw {} content reads, \
+             at most {} belong to the anchor",
+            reader.probe_reads,
+            2 * anchor_cost
         );
     }
 }
