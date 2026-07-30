@@ -40,6 +40,35 @@ pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
 /// Precondition: `data.len()` is a multiple of 16. Any trailing partial
 /// block is silently ignored; all callers pass aligned regions (6128 and
 /// 2032 bytes), and the assert documents/enforces that contract.
+/// AES-128-CBC encrypt in place under the fixed [`AACS_IV`] — the forward
+/// direction of [`aes_cbc_decrypt`], and its exact inverse.
+///
+/// Constructs the cipher ONCE for the whole slice. Driving this from the
+/// single-block [`aes_ecb_encrypt`] instead rebuilds the AES key schedule per
+/// 16-byte block, which for a 6144-byte aligned unit is 383 redundant key
+/// expansions.
+pub(crate) fn aes_cbc_encrypt(key: &[u8; 16], data: &mut [u8]) {
+    debug_assert!(
+        data.len() % 16 == 0,
+        "aes_cbc_encrypt requires a block-aligned slice"
+    );
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let num_blocks = data.len() / 16;
+    let mut prev = AACS_IV;
+    // Forward order: each block is XORed with the PRECEDING ciphertext block.
+    for i in 0..num_blocks {
+        let offset = i * 16;
+        let mut block = [0u8; 16];
+        for j in 0..16 {
+            block[j] = data[offset + j] ^ prev[j];
+        }
+        let mut ga = GenericArray::clone_from_slice(&block);
+        cipher.encrypt_block(&mut ga);
+        data[offset..offset + 16].copy_from_slice(&ga);
+        prev.copy_from_slice(&ga);
+    }
+}
+
 pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
     debug_assert!(
         data.len() % 16 == 0,

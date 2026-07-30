@@ -1057,7 +1057,10 @@ mod tests {
     /// `tag` distinguishes two units' payloads.
     fn encrypt_aacs_unit(unit_key: &[u8; 16], tag: u8) -> Vec<u8> {
         let mut unit = clear_aacs_unit(tag);
-        crate::aacs::content::encrypt_unit(&mut unit, unit_key);
+        assert!(
+            crate::aacs::content::encrypt_unit(&mut unit, unit_key),
+            "a full-length unit must encrypt"
+        );
         unit
     }
 
