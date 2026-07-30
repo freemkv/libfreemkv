@@ -184,6 +184,55 @@ pub fn end_master<W: Write + Seek>(w: &mut W, size_pos: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Start a master element **in an in-memory buffer**: append ID + the same
+/// 8-byte size placeholder [`start_master`] writes. Returns the buffer index of
+/// the size field, for [`end_master_buf`].
+///
+/// This is the seek-free twin of [`start_master`]/[`end_master`] for elements
+/// small enough to assemble whole before hitting the file (a BlockGroup: one
+/// Block plus a couple of tiny elements). Because [`end_master`] always
+/// back-patches a FIXED-WIDTH 8-byte VINT (`0x01` + 7 payload bytes) rather
+/// than a minimal-width one, the bytes produced by this pair are byte-for-byte
+/// identical to the seek-and-back-patch pair — assembling in memory cannot
+/// change the emitted Matroska.
+pub fn start_master_buf(buf: &mut Vec<u8>, id: u32) -> io::Result<usize> {
+    write_id(buf, id)?;
+    let size_pos = buf.len();
+    // 8-byte size placeholder (overwritten by end_master_buf)
+    buf.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    Ok(size_pos)
+}
+
+/// End a master element in an in-memory buffer: patch the 8-byte size field at
+/// `size_pos` (as returned by [`start_master_buf`]) with the body length.
+///
+/// Errors rather than panicking if `size_pos` does not name a placeholder that
+/// is still inside the buffer, or if the body exceeds the 7-byte VINT payload.
+pub fn end_master_buf(buf: &mut [u8], size_pos: usize) -> io::Result<()> {
+    let end = buf.len();
+    let Some(body_start) = size_pos.checked_add(8) else {
+        return Err(crate::error::Error::MkvInvalid.into());
+    };
+    if end < body_start {
+        return Err(crate::error::Error::MkvInvalid.into());
+    }
+    let data_size = (end - body_start) as u64;
+    if data_size >= 0x0100_0000_0000_0000 {
+        return Err(crate::error::Error::MkvInvalid.into());
+    }
+    buf[size_pos..body_start].copy_from_slice(&[
+        0x01,
+        (data_size >> 48) as u8,
+        (data_size >> 40) as u8,
+        (data_size >> 32) as u8,
+        (data_size >> 24) as u8,
+        (data_size >> 16) as u8,
+        (data_size >> 8) as u8,
+        data_size as u8,
+    ]);
+    Ok(())
+}
+
 // ============================================================
 // EBML Read primitives
 // ============================================================
@@ -1329,5 +1378,91 @@ mod tests {
         assert_eq!(consumed, osize, "outer size must bound both children");
         // And the whole buffer is exactly the outer element.
         assert_eq!(data.len() as u64, outer_body_start + osize);
+    }
+    /// The buffer-based master helpers must produce byte-for-byte what the
+    /// seek-based ones produce. `write_block_group` was rewritten onto
+    /// `start_master_buf`/`end_master_buf` to eliminate ~4 seeks (and 4 MiB
+    /// BufWriter flushes) PER FRAME, which on an MPEG-2 title is ~350k frames — a
+    /// change only safe because the two encodings are identical.
+    ///
+    /// Both write a FIXED-width 8-byte VINT placeholder (0x01 + 7 payload bytes)
+    /// and patch it in place; neither ever emits a minimal-width size. This test
+    /// pins that, so a future "optimisation" of either one to minimal-width sizes
+    /// cannot silently desync the two and change emitted Matroska.
+    #[test]
+    fn buffered_master_matches_seeking_master_byte_for_byte() {
+        use std::io::Cursor;
+
+        // Bodies chosen to cross VINT-relevant magnitudes: empty, tiny, and one
+        // spanning more than a byte of length.
+        for body in [
+            Vec::new(),
+            vec![0xAAu8],
+            (0..300u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
+        ] {
+            // Seek-based path.
+            let mut c = Cursor::new(Vec::new());
+            let pos = start_master(&mut c, BLOCK_GROUP).unwrap();
+            c.write_all(&body).unwrap();
+            end_master(&mut c, pos).unwrap();
+            let seeking = c.into_inner();
+
+            // Buffer-based path.
+            let mut buf = Vec::new();
+            let bpos = start_master_buf(&mut buf, BLOCK_GROUP).unwrap();
+            buf.extend_from_slice(&body);
+            end_master_buf(&mut buf, bpos).unwrap();
+
+            assert_eq!(
+                buf,
+                seeking,
+                "buffered and seeking master encodings diverged for a {}-byte body",
+                body.len()
+            );
+        }
+    }
+
+    /// Nested masters must patch correctly too — the MVC BlockGroup nests
+    /// BlockAdditions > BlockMore inside the BlockGroup, and in-memory patching
+    /// works by index rather than by file offset, so nesting is where an
+    /// index-arithmetic slip would show up.
+    #[test]
+    fn buffered_master_nests_correctly() {
+        use std::io::Cursor;
+
+        let mut c = Cursor::new(Vec::new());
+        let outer = start_master(&mut c, BLOCK_GROUP).unwrap();
+        c.write_all(&[0x11, 0x22]).unwrap();
+        let inner = start_master(&mut c, BLOCK_ADDITIONS).unwrap();
+        c.write_all(&[0x33, 0x44, 0x55]).unwrap();
+        end_master(&mut c, inner).unwrap();
+        c.write_all(&[0x66]).unwrap();
+        end_master(&mut c, outer).unwrap();
+        let seeking = c.into_inner();
+
+        let mut buf = Vec::new();
+        let outer_b = start_master_buf(&mut buf, BLOCK_GROUP).unwrap();
+        buf.extend_from_slice(&[0x11, 0x22]);
+        let inner_b = start_master_buf(&mut buf, BLOCK_ADDITIONS).unwrap();
+        buf.extend_from_slice(&[0x33, 0x44, 0x55]);
+        end_master_buf(&mut buf, inner_b).unwrap();
+        buf.extend_from_slice(&[0x66]);
+        end_master_buf(&mut buf, outer_b).unwrap();
+
+        assert_eq!(
+            buf, seeking,
+            "nested buffered masters must match the seeking form"
+        );
+    }
+
+    /// `end_master_buf` must REFUSE a bogus position rather than panic on the
+    /// slice index — this crate must not panic from library code.
+    #[test]
+    fn end_master_buf_rejects_a_position_outside_the_buffer() {
+        let mut buf = vec![0u8; 4];
+        assert!(
+            end_master_buf(&mut buf, 99).is_err(),
+            "a size_pos past the end of the buffer must error, not panic"
+        );
     }
 }
