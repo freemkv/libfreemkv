@@ -8,6 +8,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <signal.h>
 
 extern char **environ;
 
@@ -33,14 +34,27 @@ static ShimHandle g_handle = {NULL, NULL, NULL, 0};
 
 // ── Registry helpers ──────────────────────────────────────────────────────
 
-static int cfstring_to_cstr(CFStringRef cf, char *buf, size_t buflen) {
+// Convert a registry property to a C string.
+//
+// The value is taken as CFTypeRef, not CFStringRef, and its type is checked
+// before use. IORegistryEntryCreateCFProperty / CFDictionaryGetValue return
+// whatever the driver published: the IOKit registry contract (Apple, "Accessing
+// Hardware From Applications" — Device Access and the I/O Kit) fixes the
+// property KEYS, not the CoreFoundation type behind them, and a third-party
+// optical driver publishing a CFNumber or CFData for "BSD Name" or "Product
+// Revision Level" is legal. CFStringGetCString on a non-CFString aborts the
+// process (CFRuntime type assertion) — from inside the public
+// scsi::list_drives(), which is documented never to fail. Wrong type → treated
+// as absent.
+static int cfstring_to_cstr(CFTypeRef cf, char *buf, size_t buflen) {
     if (!cf) return 0;
-    if (!CFStringGetCString(cf, buf, buflen, kCFStringEncodingUTF8)) return 0;
+    if (CFGetTypeID(cf) != CFStringGetTypeID()) return 0;
+    if (!CFStringGetCString((CFStringRef)cf, buf, buflen, kCFStringEncodingUTF8)) return 0;
     return 1;
 }
 
 static int registry_entry_bsd_name(io_registry_entry_t entry, char *buf, size_t buflen) {
-    CFStringRef cf = IORegistryEntryCreateCFProperty(entry, CFSTR("BSD Name"),
+    CFTypeRef cf = IORegistryEntryCreateCFProperty(entry, CFSTR("BSD Name"),
         kCFAllocatorDefault, 0);
     if (!cf) return 0;
     int ok = cfstring_to_cstr(cf, buf, buflen);
@@ -119,19 +133,29 @@ static int bdsvc_to_bsd_name(io_registry_entry_t bdsvc, char *buf, size_t buflen
 
 // Given an IOBDServices, extract Device Characteristics strings.
 static void bdsvc_device_info(io_registry_entry_t bdsvc, ShimDriveInfo *info) {
-    CFDictionaryRef dc = IORegistryEntryCreateCFProperty(bdsvc,
+    // "Device Characteristics" is declared a dictionary, but the value is
+    // driver-published and the registry contract does not enforce the type.
+    // CFDictionaryGetValue on a non-dictionary aborts the process, so the type
+    // is checked before it is used as one. Each member string is type-checked
+    // in turn by cfstring_to_cstr.
+    CFTypeRef dc = IORegistryEntryCreateCFProperty(bdsvc,
         CFSTR("Device Characteristics"), kCFAllocatorDefault, 0);
     if (!dc) return;
+    if (CFGetTypeID(dc) != CFDictionaryGetTypeID()) {
+        CFRelease(dc);
+        return;
+    }
+    CFDictionaryRef dict = (CFDictionaryRef)dc;
 
-    CFStringRef val;
+    CFTypeRef val;
 
-    val = CFDictionaryGetValue(dc, CFSTR("Vendor Name"));
+    val = CFDictionaryGetValue(dict, CFSTR("Vendor Name"));
     if (val) cfstring_to_cstr(val, info->vendor, sizeof(info->vendor));
 
-    val = CFDictionaryGetValue(dc, CFSTR("Product Name"));
+    val = CFDictionaryGetValue(dict, CFSTR("Product Name"));
     if (val) cfstring_to_cstr(val, info->model, sizeof(info->model));
 
-    val = CFDictionaryGetValue(dc, CFSTR("Product Revision Level"));
+    val = CFDictionaryGetValue(dict, CFSTR("Product Revision Level"));
     if (val) cfstring_to_cstr(val, info->firmware, sizeof(info->firmware));
 
     CFRelease(dc);
@@ -236,8 +260,41 @@ int shim_open_exclusive(const char *bsd_name) {
         };
         pid_t pid;
         if (posix_spawn(&pid, "/usr/sbin/diskutil", &fa, NULL, argv, environ) == 0) {
+            // BOUNDED wait. A plain blocking waitpid() here hung the public
+            // scsi::open() forever whenever the unmount wedged — diskutil
+            // blocks indefinitely on a volume whose filesystem is stuck (a
+            // hung network mount, a fs process not answering the unmount
+            // notification), and there is no signal, timeout or cancellation
+            // reaching this frame. Poll with WNOHANG to a deadline, then
+            // SIGKILL and reap so no zombie is left behind.
+            //
+            // Continuing after a killed unmount is deliberate:
+            // ObtainExclusiveAccess below is the real gate, and it reports the
+            // still-mounted disc through the shim's -5 sentinel (mapped to
+            // Error::DeviceLocked) — a typed error the caller can act on,
+            // instead of a process that never returns.
+            const int poll_us = 50000;      // 50 ms
+            const int max_polls = 400;      // 400 x 50 ms = 20 s
             int status;
-            waitpid(pid, &status, 0);
+            int reaped = 0;
+            for (int i = 0; i <= max_polls; i++) {
+                pid_t r = waitpid(pid, &status, WNOHANG);
+                if (r == pid) { reaped = 1; break; }
+                // r < 0 means the child is already gone (ECHILD) — nothing to
+                // wait for, and looping would spin to the deadline.
+                if (r < 0) { reaped = 1; break; }
+                if (i == max_polls) break;
+                usleep(poll_us);
+            }
+            if (!reaped) {
+                kill(pid, SIGKILL);
+                // SIGKILL is uncatchable, so this reap converges; still poll
+                // rather than block, so the shim has no unbounded wait at all.
+                for (int i = 0; i < 100; i++) {
+                    if (waitpid(pid, &status, WNOHANG) != 0) break;
+                    usleep(10000); // 10 ms x 100 = 1 s
+                }
+            }
         }
         posix_spawn_file_actions_destroy(&fa);
     }
@@ -254,8 +311,14 @@ int shim_open_exclusive(const char *bsd_name) {
         svc = find_bdsvc_from_iomedia(mp, bsd_name);
     }
     if (!svc) {
+        // IOServiceMatching returns NULL on allocation failure. Both other call
+        // sites in this file check it; this one did not, and
+        // IOServiceGetMatchingService with a NULL matching dictionary is
+        // undefined (it consumes the reference it is given).
         CFMutableDictionaryRef matching = IOServiceMatching("IOBDServices");
-        svc = IOServiceGetMatchingService(mp, matching);
+        if (matching) {
+            svc = IOServiceGetMatchingService(mp, matching);
+        }
     }
     if (!svc) return -1;
 
@@ -367,6 +430,50 @@ int shim_execute(const unsigned char *cdb, unsigned char cdb_len,
     (*task)->Release(task);
 
     return (int)kr;
+}
+
+// ── Registry-based media-presence probe ───────────────────────────────────
+//
+// "Is a disc inserted?" answered from the IOKit registry alone: no exclusive
+// access, no unmount, no SCSI command, no state change of any kind.
+//
+// Apple's IOStorageFamily publishes an IOMedia object for a removable device
+// only while media is present, and tears it down on eject — that is the
+// documented media lifecycle (Apple, "Mass Storage Device Driver Programming
+// Guide": Media Objects / media arrival and removal). So the presence of an
+// IOMedia whose "BSD Name" is the requested device IS the presence of a disc.
+//
+// Returns 1 (media present), 0 (no media), or -1 (IOKit unavailable).
+int shim_media_present(const char *bsd_name) {
+    mach_port_t mp;
+    if (IOMainPort(0, &mp) != kIOReturnSuccess) return -1;
+
+    CFMutableDictionaryRef matching = IOServiceMatching("IOMedia");
+    if (!matching) return -1;
+
+    io_iterator_t iter;
+    // Consumes `matching` whether it succeeds or fails.
+    if (IOServiceGetMatchingServices(mp, matching, &iter) != KERN_SUCCESS) return -1;
+
+    int found = 0;
+    io_service_t media;
+    while ((media = IOIteratorNext(iter)) != 0) {
+        char name[64];
+        if (registry_entry_bsd_name(media, name, sizeof(name))
+            && strcmp(name, bsd_name) == 0)
+        {
+            found = 1;
+        }
+        IOObjectRelease(media);
+        if (found) break;
+    }
+
+    // Drain the rest so no entry is leaked when we broke early.
+    while ((media = IOIteratorNext(iter)) != 0) {
+        IOObjectRelease(media);
+    }
+    IOObjectRelease(iter);
+    return found;
 }
 
 // ── Registry-based drive enumeration ──────────────────────────────────────

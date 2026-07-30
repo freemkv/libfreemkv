@@ -379,85 +379,119 @@ fn resolve_encryption_no_aacs_dir() {
 }
 
 // ── Batch count arithmetic tests ──────────────────────────────────────────
-// Regression tests for the u16 truncation bug: when (remaining as u16) was
-// used instead of remaining.min(batch as u32) as u16, any remaining count
-// that was a multiple of 65536 would truncate to 0, causing an infinite loop.
+// Regression tests for the u16 truncation bug in the prefetch producer's
+// per-batch sector count (`src/sector/prefetched.rs`): when
+// `(remaining as u16).min(batch_sectors)` was used instead of
+// `remaining.min(batch_sectors as u32) as u16`, any remaining count that is a
+// multiple of 65536 truncated to 0.
+//
+// These tests used to assert against `safe_batch_count`/`buggy_batch_count`
+// copies defined in THIS file, so the production expression could be reverted
+// with every one of them staying green. They now drive the real producer
+// through the public `PrefetchedSectorSource` API and assert on the sector
+// count of the batch it actually emits.
 
-/// Simulates the fixed batch count calculation from pipe.rs / drive.rs
-fn safe_batch_count(remaining: u32, batch_sectors: u16) -> u16 {
-    remaining.min(batch_sectors as u32) as u16
+/// Endless zero-filled source: every read succeeds with the full requested
+/// span, so the producer's batch size is the only thing the returned byte
+/// count can reflect.
+struct ZeroSectorSource;
+
+impl SectorSource for ZeroSectorSource {
+    fn read_sectors(
+        &mut self,
+        _lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
+        let bytes = count as usize * SECTOR_SIZE;
+        buf[..bytes].fill(0);
+        Ok(bytes)
+    }
 }
 
-/// Simulates the BUGGY calculation that caused the infinite loop
-fn buggy_batch_count(remaining: u32, batch_sectors: u16) -> u16 {
-    (remaining as u16).min(batch_sectors)
+/// Sectors in the FIRST batch the real prefetch producer emits for an extent
+/// of `sector_count` sectors at the configured `batch_sectors`. This is the
+/// production expression under test, reached only through public API.
+fn first_batch_sectors(sector_count: u32, batch_sectors: u16) -> usize {
+    let mut src = libfreemkv::PrefetchedSectorSource::new(
+        ZeroSectorSource,
+        vec![libfreemkv::Extent {
+            start_lba: 0,
+            sector_count,
+        }],
+        batch_sectors,
+        None,
+    )
+    .expect("prefetch producer spawns");
+    let mut buf = vec![0u8; batch_sectors as usize * SECTOR_SIZE];
+    let n = src
+        .read_sectors(0, batch_sectors, &mut buf, false)
+        .expect("first batch");
+    assert_eq!(
+        n % SECTOR_SIZE,
+        0,
+        "batch must be a whole number of sectors"
+    );
+    n / SECTOR_SIZE
 }
 
 #[test]
 fn batch_count_normal() {
-    // Normal case: remaining > batch_sectors
-    assert_eq!(safe_batch_count(1000, 60), 60);
-    assert_eq!(safe_batch_count(47533152, 60), 60);
+    // Normal case: remaining > batch_sectors → a full batch.
+    assert_eq!(first_batch_sectors(1000, 60), 60);
+    assert_eq!(first_batch_sectors(47533152, 60), 60);
 }
 
 #[test]
 fn batch_count_last_batch() {
-    // Last batch: remaining < batch_sectors
-    assert_eq!(safe_batch_count(30, 60), 30);
-    assert_eq!(safe_batch_count(1, 60), 1);
+    // Only batch: remaining < batch_sectors → the remainder, not the batch.
+    assert_eq!(first_batch_sectors(30, 60), 30);
+    assert_eq!(first_batch_sectors(3, 60), 3);
 }
 
 #[test]
 fn batch_count_exact_boundary() {
-    // Exact boundary: remaining == batch_sectors
-    assert_eq!(safe_batch_count(60, 60), 60);
+    // Exact boundary: remaining == batch_sectors.
+    assert_eq!(first_batch_sectors(60, 60), 60);
 }
 
 #[test]
 fn batch_count_u16_overflow_regression() {
-    // THE BUG: remaining is a multiple of 65536 → truncates to 0
-    // 47513600 = 725 * 65536, lower 16 bits = 0
-    let remaining: u32 = 47533152 - 19552; // = 47513600
+    // THE BUG: remaining is a multiple of 65536 → `remaining as u16` is 0, so
+    // the batch collapses (the unit-alignment clamp below it then floors the
+    // batch at one 3-sector AACS unit — a 20x throughput cliff on exactly the
+    // disc sizes that hit it, and an outright stall before that clamp existed).
+    let remaining: u32 = 47533152 - 19552; // = 47513600 = 725 * 65536
     assert_eq!(remaining, 47513600);
     assert_eq!(
         remaining % 65536,
         0,
-        "remaining should be multiple of 65536"
+        "remaining must be a multiple of 65536"
     );
-
-    // Buggy version produces 0 → infinite loop
-    assert_eq!(buggy_batch_count(remaining, 60), 0);
-
-    // Fixed version produces 60
-    assert_eq!(safe_batch_count(remaining, 60), 60);
+    assert_eq!(
+        first_batch_sectors(remaining, 60),
+        60,
+        "a remaining count that is a multiple of 65536 must still yield a full batch"
+    );
 }
 
 #[test]
 fn batch_count_other_u16_overflow_values() {
-    // Other multiples of 65536
-    assert_eq!(safe_batch_count(65536, 60), 60);
-    assert_eq!(safe_batch_count(131072, 60), 60);
-    assert_eq!(safe_batch_count(65536 * 100, 60), 60);
-
-    // Verify buggy version fails on all of these
-    assert_eq!(buggy_batch_count(65536, 60), 0);
-    assert_eq!(buggy_batch_count(131072, 60), 0);
-    assert_eq!(buggy_batch_count(65536 * 100, 60), 0);
+    // Other multiples of 65536 — every one truncates to 0 under the old cast.
+    assert_eq!(first_batch_sectors(65536, 60), 60);
+    assert_eq!(first_batch_sectors(131072, 60), 60);
+    assert_eq!(first_batch_sectors(65536 * 100, 60), 60);
 }
 
 #[test]
 fn batch_count_near_u16_boundary() {
-    // Values just below and above 65536
-    assert_eq!(safe_batch_count(65535, 60), 60);
-    assert_eq!(safe_batch_count(65536, 60), 60);
-    assert_eq!(safe_batch_count(65537, 60), 60);
-
-    // Buggy: 65535 as u16 = 65535, min(60) = 60 (OK by accident)
-    assert_eq!(buggy_batch_count(65535, 60), 60);
-    // Buggy: 65536 as u16 = 0, min(60) = 0 (BUG)
-    assert_eq!(buggy_batch_count(65536, 60), 0);
-    // Buggy: 65537 as u16 = 1, min(60) = 1 (wrong but doesn't loop)
-    assert_eq!(buggy_batch_count(65537, 60), 1);
+    // Just below, at, and just above the 16-bit wrap point. 65535 survives the
+    // bad cast by accident; 65536 truncates to 0 and 65537 to 1 — all three
+    // must produce the same full batch.
+    assert_eq!(first_batch_sectors(65535, 60), 60);
+    assert_eq!(first_batch_sectors(65536, 60), 60);
+    assert_eq!(first_batch_sectors(65537, 60), 60);
 }
 
 #[test]
@@ -465,39 +499,59 @@ fn batch_count_real_disc_sizes() {
     let batch: u16 = 60;
 
     // DVD-5: ~2,295,104 sectors
-    assert_eq!(safe_batch_count(2295104, batch), 60);
+    assert_eq!(first_batch_sectors(2295104, batch), 60);
 
     // BD-25: ~12,219,392 sectors
-    assert_eq!(safe_batch_count(12219392, batch), 60);
+    assert_eq!(first_batch_sectors(12219392, batch), 60);
 
     // BD-50: ~24,438,784 sectors
-    assert_eq!(safe_batch_count(24438784, batch), 60);
+    assert_eq!(first_batch_sectors(24438784, batch), 60);
 
     // UHD BD-66: ~33,554,432 sectors
-    assert_eq!(safe_batch_count(33554432, batch), 60);
+    assert_eq!(first_batch_sectors(33554432, batch), 60);
 
     // UHD BD-100: ~47,533,152 sectors
-    assert_eq!(safe_batch_count(47533152, batch), 60);
+    assert_eq!(first_batch_sectors(47533152, batch), 60);
 
-    // Last few sectors of each
-    assert_eq!(safe_batch_count(52, batch), 52);
-    assert_eq!(safe_batch_count(3, batch), 3);
+    // Short tails (whole AACS units, as Blu-ray m2ts extents are by spec).
+    assert_eq!(first_batch_sectors(51, batch), 51);
+    assert_eq!(first_batch_sectors(3, batch), 3);
 }
 
 #[test]
 fn batch_count_zero_remaining() {
-    // Zero remaining should produce 0 (loop exits before this)
-    assert_eq!(safe_batch_count(0, 60), 0);
+    // A zero-sector extent yields no batch at all: the producer skips it and
+    // the channel closes, which the consumer reads as end-of-stream (Ok(0)).
+    let mut src = libfreemkv::PrefetchedSectorSource::new(
+        ZeroSectorSource,
+        vec![libfreemkv::Extent {
+            start_lba: 0,
+            sector_count: 0,
+        }],
+        60,
+        None,
+    )
+    .expect("prefetch producer spawns");
+    let mut buf = vec![0u8; 60 * SECTOR_SIZE];
+    assert_eq!(src.read_sectors(0, 60, &mut buf, false).unwrap(), 0);
 }
 
 #[test]
 fn batch_count_max_batch_sizes() {
-    // Test with different batch sizes used by detect_max_batch_sectors
+    // Every batch size detect_max_batch_sectors can pick. All are multiples of
+    // the 3-sector AACS unit, so none is reshaped by the alignment trim — the
+    // batch the producer emits is the truncation-prone expression's output.
     for &batch in &[3u16, 6, 9, 30, 60, 120, 240, 510] {
-        // Large remaining should always return batch
-        assert_eq!(safe_batch_count(47533152, batch), batch);
-        // Small remaining should return remaining
-        assert_eq!(safe_batch_count(1, batch), 1);
+        assert_eq!(
+            first_batch_sectors(65536 * 100, batch),
+            batch as usize,
+            "batch {batch}: multiple-of-65536 remaining must still fill the batch"
+        );
+        assert_eq!(
+            first_batch_sectors(3, batch),
+            3,
+            "batch {batch}: short tail"
+        );
     }
 }
 

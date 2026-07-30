@@ -1638,22 +1638,43 @@ mod tests {
         assert_eq!(parser.buf.len(), 100, "partial AU retained");
     }
 
+    /// Largest AU the 12-bit length field can declare: 0xFFF words × 2.
+    const MAX_AU_BYTES: usize = 0xFFF * 2; // 8190
+
     #[test]
     fn buffer_stays_bounded_across_many_partial_pes() {
         // Malformed/never-completing input must keep the reassembly buffer
-        // bounded by MAX_TRUEHD_BUF. Repeatedly feed AU fragments whose declared
-        // length always exceeds what is buffered, so no AU ever completes; the
-        // post-loop cap guard must clear the buffer instead of letting it grow
-        // unbounded across many calls.
+        // bounded across an unbounded number of PES packets.
+        //
+        // The bound that actually holds is MAX_AU_BYTES, not MAX_TRUEHD_BUF:
+        // `parse`'s loop only breaks with data retained when
+        // `self.buf.len() < unit_bytes`, and `unit_bytes` is
+        // `((buf[0] << 8 | buf[1]) & 0xFFF) * 2 <= 8190`. Every other exit
+        // drains. So the post-loop `buf.len() > MAX_TRUEHD_BUF` cap (256 KiB) is
+        // an unreachable backstop — an exhaustive sweep of all 65536 two-byte
+        // AU heads × fragment sizes {3, 5, 100, 4096, 8189, 65535} over 20 PES
+        // each peaks at 8189 bytes. Asserting only `<= MAX_TRUEHD_BUF` is
+        // therefore vacuous; assert the reachable ceiling instead.
+        //
+        // Fixture: heads of 0xFF 0xFF (masked to 0xFFF words = 8190 bytes
+        // declared — this also exercises the 12-bit mask) with 8189 bytes
+        // present, so each PES leaves the buffer one byte short of a complete
+        // AU. The previous fixture used 4096-byte fragments, which completed an
+        // AU every second call and never loaded the buffer past ~4 KiB.
         let mut parser = TrueHdParser::new();
-        // Each PES: a head declaring 0xFFF words (8190 bytes) but only 4096 bytes
-        // present → incomplete → retained. Across many PES this would accumulate
-        // without the cap.
+        let mut worst = 0usize;
         for _ in 0..200 {
-            let mut frag = vec![0u8; 4096];
-            frag[0] = 0x0F; // 0x0FFF words = 4095 → 8190 bytes declared
+            let mut frag = vec![0u8; MAX_AU_BYTES - 1];
+            frag[0] = 0xFF;
             frag[1] = 0xFF;
             let _ = parser.parse(&make_pes(frag, Some(0)));
+            worst = worst.max(parser.buf.len());
+            assert!(
+                parser.buf.len() < MAX_AU_BYTES,
+                "reassembly buffer exceeded the AU-length ceiling: {} >= {}",
+                parser.buf.len(),
+                MAX_AU_BYTES
+            );
             assert!(
                 parser.buf.len() <= MAX_TRUEHD_BUF,
                 "reassembly buffer exceeded cap: {} > {}",
@@ -1661,6 +1682,12 @@ mod tests {
                 MAX_TRUEHD_BUF
             );
         }
+        // The fixture must genuinely load the buffer, not self-drain: if this
+        // trips, the test is measuring nothing.
+        assert!(
+            worst >= MAX_AU_BYTES - 8,
+            "fixture must drive the buffer to the ceiling, peaked at {worst}"
+        );
     }
 
     // --- ac3_boundary_corroborated: the AC-3-vs-TrueHD disambiguation ---

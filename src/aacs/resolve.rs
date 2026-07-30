@@ -379,26 +379,18 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
             // One AES-D + magic check per candidate (cheap). mk_dv is hoisted
             // out of the loop so the MKB is not re-walked per candidate.
             let mks = providers.media_keys();
-            let mut mk_hits: Vec<[u8; 16]> = Vec::new();
-            if let Some(mk_dv) = mkb_find_mk_dv(mkb) {
-                for mk in &mks {
-                    let verifies = aes_ecb_decrypt(mk, &mk_dv)[..8]
-                        == [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
-                    if verifies && !mk_hits.contains(mk) {
-                        mk_hits.push(*mk);
-                        if mk_hits.len() > 1 {
-                            break; // ambiguous — bail to avoid a wrong key
-                        }
-                    }
-                }
-            }
-            if mk_hits.len() == 1 {
-                let vuk = derive_vuk(&mk_hits[0], ctx.volume_id);
+            let chosen_mk = mkb_find_mk_dv(mkb).and_then(|mk_dv| {
+                unique_verifying_mk(&mks, |mk| {
+                    aes_ecb_decrypt(mk, &mk_dv)[..8] == MK_VERIFY_MAGIC
+                })
+            });
+            if let Some(mk) = chosen_mk {
+                let vuk = derive_vuk(&mk, ctx.volume_id);
                 tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path2_5_hit", mk_pool = mks.len(), "media key from keydb MK-pool brute (km_verifies)");
                 // Same class as path 3 (KEYDB MK → derived VUK).
                 return Some(build(Some(vuk), derive_uks(&vuk), 3));
             }
-            tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path2_5_miss", mk_pool = mks.len(), mk_hits = mk_hits.len(), "MK-pool brute: no unique verifying MK");
+            tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path2_5_miss", mk_pool = mks.len(), "MK-pool brute: no unique verifying MK");
         } else {
             tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_no_mkb", "no MKB; paths 1/2 skipped");
         }
@@ -448,6 +440,42 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
     }
 
     None
+}
+
+/// First 8 bytes of the plaintext behind an MKB Verify Media Key record — the
+/// AACS "this is the right Km" sentinel (`0123456789ABCDEF`). A candidate MK
+/// verifies when AES-128-ECB-D(mk, mk_dv) starts with it.
+const MK_VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+
+/// The MK-pool selection rule of path 2.5, split out of [`resolve_keys_v1`] so
+/// the ambiguity guard has a reachable test.
+///
+/// `verifies` is the MKB check — in production
+/// `AES-D(mk, mk_dv)[..8] == MK_VERIFY_MAGIC`. Returns a Media Key only when
+/// EXACTLY ONE DISTINCT candidate passes. Duplicates of the same key are one
+/// candidate (a pool aggregated across providers routinely repeats a key), but
+/// two DIFFERENT keys that both verify mean the pool cannot say which is this
+/// disc's Km: picking either derives a wrong VUK, and a wrong VUK decrypts to
+/// plausible-looking garbage rather than failing loudly. Bail and let the
+/// later hash/VID paths answer instead.
+///
+/// The predicate is a parameter rather than the inlined AES check because a
+/// genuine two-key multi-hit cannot be synthesised: it needs one ciphertext
+/// that decrypts under two distinct AES-128 keys to plaintexts sharing a
+/// 64-bit prefix — a 2^64 search. Injecting the verifier is the only way the
+/// ambiguity branch is reachable from a test at all.
+fn unique_verifying_mk(mks: &[[u8; 16]], verifies: impl Fn(&[u8; 16]) -> bool) -> Option<[u8; 16]> {
+    let mut hits: Vec<[u8; 16]> = Vec::new();
+    for mk in mks {
+        if verifies(mk) && !hits.contains(mk) {
+            hits.push(*mk);
+            if hits.len() > 1 {
+                // Ambiguous — bail rather than pick a Media Key.
+                return None;
+            }
+        }
+    }
+    hits.first().copied()
 }
 
 /// For path 5: cross-reference the disc's `Unit_Key_RO.inf` CPS-unit
@@ -1300,6 +1328,62 @@ mod tests {
             "VUK must derive from the verified Km + this disc's VID"
         );
     }
+
+    /// Path 2.5's ambiguity guard: when MORE THAN ONE DISTINCT pooled Media Key
+    /// verifies against the MKB, the resolver must return no key at all rather
+    /// than pick one. A wrong Km derives a wrong VUK, and a wrong VUK does not
+    /// fail loudly — it decrypts the title to garbage that muxes and plays as a
+    /// corrupt rip.
+    ///
+    /// The real MKB check cannot be forced into a multi-hit: two distinct
+    /// AES-128 keys decrypting one `mk_dv` to plaintexts that share the 64-bit
+    /// verify magic is a 2^64 search, not a fixture. So the rule is tested
+    /// through `unique_verifying_mk`, whose verifier is a parameter — the same
+    /// function `resolve_keys_v1` calls, with the same pool semantics.
+    #[test]
+    fn mk_pool_ambiguity_bails_rather_than_picking_a_media_key() {
+        let a = [0xAAu8; 16];
+        let b = [0xBBu8; 16];
+        let c = [0xCCu8; 16];
+
+        // One verifying candidate → that key.
+        assert_eq!(
+            unique_verifying_mk(&[a, b, c], |mk| *mk == b),
+            Some(b),
+            "a single verifying MK resolves"
+        );
+
+        // The SAME key repeated across providers is one candidate, not an
+        // ambiguity — the dedup (`!hits.contains`) must keep this resolvable.
+        assert_eq!(
+            unique_verifying_mk(&[b, b, b], |mk| *mk == b),
+            Some(b),
+            "duplicates of one key are not ambiguity"
+        );
+
+        // TWO DISTINCT verifying candidates → bail, no key.
+        assert_eq!(
+            unique_verifying_mk(&[a, b], |mk| *mk == a || *mk == b),
+            None,
+            "two distinct verifying MKs must yield NO key, not the first one"
+        );
+
+        // Ambiguity must still be detected when the second hit is last in the
+        // pool, i.e. the scan may not stop at the first hit.
+        assert_eq!(
+            unique_verifying_mk(&[a, c, [0u8; 16], b], |mk| *mk == a || *mk == b),
+            None,
+            "a late second hit is still ambiguous"
+        );
+
+        // Every candidate verifying is the degenerate ambiguous case.
+        assert_eq!(unique_verifying_mk(&[a, b, c], |_| true), None);
+
+        // No candidate verifies → no key (and no panic on an empty pool).
+        assert_eq!(unique_verifying_mk(&[a, b, c], |_| false), None);
+        assert_eq!(unique_verifying_mk(&[], |_| true), None);
+    }
+
     #[test]
     fn test_content_cert_parse() {
         // AACS 1.0 cert, bus encryption OFF. Content-cert layout: flag in

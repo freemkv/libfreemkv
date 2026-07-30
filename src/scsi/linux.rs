@@ -242,17 +242,14 @@ impl ScsiTransport for SgIoTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
-        // Guard the entry point: `ScsiTransport` is a pub trait, so an
-        // external caller could pass an empty CDB. Indexing cdb[0] below
-        // (and in the error paths) would panic. In-crate callers always
-        // pass non-empty literal CDBs.
-        if cdb.is_empty() {
-            return Err(Error::ScsiError {
-                opcode: 0,
-                status: super::SCSI_STATUS_TRANSPORT_FAILURE,
-                sense: None,
-            });
-        }
+        // Validate the CDB length at the entry point, BEFORE `cdb[0]` below.
+        // `ScsiTransport` is a pub trait, so an external caller could pass an
+        // empty CDB and indexing it would panic; an over-length CDB must be
+        // rejected rather than truncated (see `checked_cdb_len`). Both checks
+        // live in the shared helper so they cannot drift per platform — this
+        // backend used to carry its own bespoke empty-CDB guard, which macOS
+        // and Windows never had.
+        let cmd_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
         let exec_t0 = std::time::Instant::now();
         let opcode = cdb[0];
         tracing::trace!(
@@ -294,14 +291,6 @@ impl ScsiTransport for SgIoTransport {
             DataDirection::FromDevice => SG_DXFER_FROM_DEV,
             DataDirection::ToDevice => SG_DXFER_TO_DEV,
         };
-        // Reject an over-length CDB rather than truncating it. This used to be
-        // `cdb.len().min(16) as u8`, which silently dropped the tail: SPC-4
-        // fixes a command's length by its opcode group code, so the shortened
-        // CDB is a DIFFERENT command, which the drive executes and answers
-        // with GOOD status and data for a request nobody made. Matches the
-        // macOS and Windows backends (all three call the same helper).
-        let cmd_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
-
         let mut sense = [0u8; 32];
         let mut hdr: sg_io_hdr = unsafe { std::mem::zeroed() };
         hdr.interface_id = b'S' as i32;
