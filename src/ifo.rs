@@ -1923,4 +1923,417 @@ mod tests {
             title.chapter_times[0]
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Added: cell-category bit isolation, palette/program-map arithmetic,
+    // and the malformed-language salvage paths.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Each low flag of the cell-category byte comes from its OWN bit and no
+    /// other: bit3 seamless_play, bit2 interleaved, bit1 stc_discontinuity,
+    /// bit0 seamless_angle (DVD-Video cell playback `cell_category`).
+    /// Setting one bit must leave all three siblings clear.
+    #[test]
+    fn cell_category_low_flags_are_bit_isolated() {
+        let c = CellCategory::decode(0x00);
+        assert_eq!(
+            [
+                c.seamless_play,
+                c.interleaved,
+                c.stc_discontinuity,
+                c.seamless_angle
+            ],
+            [false, false, false, false],
+            "category 0x00 sets no flag"
+        );
+        for bit in 0..4u8 {
+            let c = CellCategory::decode(1u8 << bit);
+            assert_eq!(
+                [
+                    c.seamless_play,
+                    c.interleaved,
+                    c.stc_discontinuity,
+                    c.seamless_angle
+                ],
+                [bit == 3, bit == 2, bit == 1, bit == 0],
+                "only bit {bit} may be set"
+            );
+        }
+    }
+
+    /// `is_plain_feature` requires BOTH block_mode and block_type to be zero.
+    /// A cell inside a block is not plain feature content even when the other
+    /// field happens to be zero.
+    #[test]
+    fn is_plain_feature_requires_both_block_fields_zero() {
+        assert!(CellCategory::decode(0x00).is_plain_feature());
+        // block_type = 1, block_mode = 0
+        assert!(!CellCategory::decode(0b0001_0000).is_plain_feature());
+        // block_mode = 1, block_type = 0
+        assert!(!CellCategory::decode(0b0100_0000).is_plain_feature());
+        assert!(!CellCategory::decode(0b0101_0000).is_plain_feature());
+    }
+
+    /// be_u32 reads four CONSECUTIVE big-endian bytes from `offset`.
+    /// All four values are distinct so a repeated or skipped index shows up.
+    #[test]
+    fn be_u32_reads_four_consecutive_be_bytes() {
+        let data = [0xFFu8, 0x01, 0x02, 0x03, 0x04, 0xFF];
+        assert_eq!(be_u32(&data, 1).unwrap(), 0x0102_0304);
+    }
+
+    // ── malformed language codes ─────────────────────────────────────────
+
+    /// The ISO 639 language code in the audio/subtitle attribute block is
+    /// two bytes at +2. Only a pair of lowercase a-z bytes is taken verbatim;
+    /// anything else falls through to the ASCII-alphanumeric salvage, which
+    /// keeps only the usable characters. A byte outside a-z must never end up
+    /// in the language string.
+    #[test]
+    fn language_code_rejects_non_lowercase_bytes() {
+        // (byte0, byte1, expected language)
+        let cases: [(u8, u8, &str); 8] = [
+            (b'e', b'n', "en"), // both in range → verbatim
+            (0x21, b'n', "n"),  // '!' is below 'a'
+            (0x7B, b'n', "n"),  // '{' is above 'z'
+            (b'e', 0x21, "e"),  // second byte below 'a'
+            (b'e', 0x7B, "e"),  // second byte above 'z'
+            (b'E', 0x00, "E"),  // only the second byte is zero
+            (0x00, b'E', "E"),  // only the first byte is zero
+            (0x00, 0x00, ""),   // both zero → unset
+        ];
+        for (b0, b1, want) in cases {
+            let mut audio = vec![0u8; 8];
+            audio[2] = b0;
+            audio[3] = b1;
+            assert_eq!(
+                parse_audio_attr(&audio, 0).unwrap().language,
+                want,
+                "audio language for ({b0:#04x}, {b1:#04x})"
+            );
+
+            let mut sub = vec![0u8; 6];
+            sub[2] = b0;
+            sub[3] = b1;
+            assert_eq!(
+                parse_subtitle_attr(&sub, 0).unwrap().language,
+                want,
+                "subtitle language for ({b0:#04x}, {b1:#04x})"
+            );
+        }
+    }
+
+    // ── PGC fixtures ─────────────────────────────────────────────────────
+
+    /// Build a standalone PGC starting at offset 0.
+    ///
+    /// Layout: 0xEA-byte header, then the program map (one byte per program,
+    /// the 1-based first cell number), then the 24-byte cell playback table.
+    /// `cells` are `(category, BCD time, first_sector, last_sector)`.
+    fn build_pgc(
+        pgc_time: [u8; 4],
+        cells: &[(u8, [u8; 4], u32, u32)],
+        programs: &[u8],
+        palette: Option<[[u8; 4]; 16]>,
+    ) -> Vec<u8> {
+        let mut d = vec![0u8; 0xEA];
+        d[0x02] = programs.len() as u8;
+        d[0x03] = cells.len() as u8;
+        d[0x04..0x08].copy_from_slice(&pgc_time);
+        if let Some(p) = palette {
+            for (i, c) in p.iter().enumerate() {
+                d[0xA4 + i * 4..0xA4 + i * 4 + 4].copy_from_slice(c);
+            }
+        }
+        let pgm_off = 0xEAusize;
+        let cell_off = pgm_off + programs.len();
+        if !programs.is_empty() {
+            d[0xE6..0xE8].copy_from_slice(&(pgm_off as u16).to_be_bytes());
+        }
+        if !cells.is_empty() {
+            d[0xE8..0xEA].copy_from_slice(&(cell_off as u16).to_be_bytes());
+        }
+        d.extend_from_slice(programs);
+        for &(cat, time, first, last) in cells {
+            let mut c = vec![0u8; 24];
+            c[0] = cat;
+            c[4..8].copy_from_slice(&time);
+            c[8..12].copy_from_slice(&first.to_be_bytes());
+            c[20..24].copy_from_slice(&last.to_be_bytes());
+            d.extend_from_slice(&c);
+        }
+        d
+    }
+
+    /// BCD playback time of `secs` seconds (< 60) at the 29.97 fps flag.
+    fn bcd_secs(secs: u8) -> [u8; 4] {
+        assert!(secs < 60);
+        [0, 0, ((secs / 10) << 4) | (secs % 10), 0b11_000000]
+    }
+
+    /// When the PGC-level playback time is zero, the duration is recomputed
+    /// as the SUM of every cell's own BCD time, each read from its own
+    /// 24-byte cell playback record at +4.
+    #[test]
+    fn pgc_zero_duration_recomputed_as_sum_of_cell_times() {
+        let pgc = build_pgc(
+            [0, 0, 0, 0],
+            &[
+                (0x00, bcd_secs(10), 100, 199),
+                (0x00, bcd_secs(20), 200, 299),
+                (0x00, bcd_secs(31), 300, 399),
+            ],
+            &[],
+            None,
+        );
+        let title = parse_pgc(&pgc, 0, 3).unwrap();
+        assert_eq!(title.cells.len(), 3);
+        assert_eq!(title.cells[0].duration_secs, 10.0);
+        assert_eq!(title.cells[1].duration_secs, 20.0);
+        assert_eq!(title.cells[2].duration_secs, 31.0);
+        assert_eq!(
+            title.duration_secs, 61.0,
+            "recomputed duration must be the sum of the distinct cell times"
+        );
+    }
+
+    /// Chapter times come from the program map: each program's byte is the
+    /// 1-based number of its first cell, and the chapter time is the sum of
+    /// the durations of every cell BEFORE it. Distinct cell durations mean a
+    /// misread program byte or a mis-strided cell table changes the result.
+    #[test]
+    fn pgc_chapter_times_sum_preceding_cell_durations() {
+        let pgc = build_pgc(
+            bcd_secs(59),
+            &[
+                (0x00, bcd_secs(10), 0, 9),
+                (0x00, bcd_secs(20), 10, 19),
+                (0x00, bcd_secs(31), 20, 29),
+            ],
+            &[1, 2, 3],
+            None,
+        );
+        let title = parse_pgc(&pgc, 0, 3).unwrap();
+        assert_eq!(title.chapter_times, vec![0.0, 10.0, 30.0]);
+    }
+
+    /// A program map offset of 0 means there is no program map, so no chapter
+    /// times may be produced — the PGC header must not be read as one. Same
+    /// for a cell playback offset of 0.
+    #[test]
+    fn pgc_absent_program_map_or_cell_table_yields_no_chapter_times() {
+        // programs declared, but pgm_map_offset patched to 0
+        let mut pgc = build_pgc(
+            bcd_secs(30),
+            &[(0x00, bcd_secs(10), 0, 9), (0x00, bcd_secs(20), 10, 19)],
+            &[1, 2],
+            None,
+        );
+        pgc[0xE6..0xE8].copy_from_slice(&0u16.to_be_bytes());
+        let title = parse_pgc(&pgc, 0, 2).unwrap();
+        assert!(
+            title.chapter_times.is_empty(),
+            "no program map → no chapter times, got {:?}",
+            title.chapter_times
+        );
+
+        // program map present, but cell_playback_offset patched to 0
+        let mut pgc = build_pgc(
+            bcd_secs(30),
+            &[(0x00, bcd_secs(10), 0, 9), (0x00, bcd_secs(20), 10, 19)],
+            &[1, 2],
+            None,
+        );
+        pgc[0xE8..0xEA].copy_from_slice(&0u16.to_be_bytes());
+        let title = parse_pgc(&pgc, 0, 2).unwrap();
+        assert!(title.cells.is_empty());
+        assert!(
+            title.chapter_times.is_empty(),
+            "no cell table → no chapter times, got {:?}",
+            title.chapter_times
+        );
+    }
+
+    /// A declared cell count larger than the cell table actually holds must
+    /// not read past the end while collecting durations for the chapter-time
+    /// calculation; the missing cells contribute zero.
+    #[test]
+    fn pgc_cell_count_overshoot_does_not_read_past_end() {
+        let mut pgc = build_pgc(
+            bcd_secs(30),
+            &[(0x00, bcd_secs(10), 0, 9), (0x00, bcd_secs(20), 10, 19)],
+            &[1, 2],
+            None,
+        );
+        pgc[0x03] = 8; // declare 8 cells; only 2 records exist
+        let title = parse_pgc(&pgc, 0, 2).unwrap();
+        assert_eq!(title.cells.len(), 2, "only the readable cells are kept");
+        // Program 2 starts at cell 2, so its time is cell 0's duration.
+        assert_eq!(title.chapter_times, vec![0.0, 10.0]);
+    }
+
+    /// A program map that runs past the end of the data must stop at the
+    /// buffer end rather than reading past it. The fixture's map begins at
+    /// PGC+0xEA and the buffer holds 50 bytes from there, so a declared
+    /// count of 255 programs must yield exactly 50 chapter times.
+    #[test]
+    fn pgc_program_map_past_end_stops() {
+        let mut pgc = build_pgc(
+            bcd_secs(30),
+            &[(0x00, bcd_secs(10), 0, 9), (0x00, bcd_secs(20), 10, 19)],
+            &[1, 2],
+            None,
+        );
+        pgc[0x02] = 255; // declare 255 programs
+        let available = pgc.len() - 0xEA;
+        assert_eq!(available, 50, "fixture: 2 map bytes + 2 cells of 24");
+        let title = parse_pgc(&pgc, 0, 2).unwrap();
+        assert_eq!(
+            title.chapter_times.len(),
+            available,
+            "the program map walk must stop exactly at the buffer end"
+        );
+        assert_eq!(title.chapter_times[0], 0.0);
+        assert_eq!(title.chapter_times[1], 10.0);
+    }
+
+    /// The subtitle palette is 16 entries of 4 bytes at PGC+0xA4, each
+    /// `[padding, Y, Cb, Cr]`. Every byte of every entry is distinct here, so
+    /// a wrong stride, a wrong base or a shifted component shows up.
+    #[test]
+    fn pgc_palette_entries_read_at_correct_stride() {
+        let mut pal = [[0u8; 4]; 16];
+        for (i, c) in pal.iter_mut().enumerate() {
+            let b = i as u8;
+            *c = [0x10 + b, 0x30 + b, 0x50 + b, 0x70 + b];
+        }
+        let pgc = build_pgc(bcd_secs(30), &[], &[], Some(pal));
+        let title = parse_pgc(&pgc, 0, 1).unwrap();
+        let got = title.palette.expect("palette present");
+        assert_eq!(got.len(), 16);
+        for i in 0..16 {
+            let b = i as u8;
+            assert_eq!(
+                got[i],
+                [0x10 + b, 0x30 + b, 0x50 + b, 0x70 + b],
+                "palette entry {i}"
+            );
+        }
+    }
+
+    /// A palette is "present" when ANY of Y, Cb or Cr is non-zero in ANY
+    /// entry — a single non-zero chroma component is enough. Only the
+    /// padding byte [0] is ignored.
+    #[test]
+    fn pgc_palette_present_on_any_single_nonzero_component() {
+        for comp in 1..4usize {
+            let mut pal = [[0u8; 4]; 16];
+            pal[7][comp] = 0x40; // exactly one non-zero component, in one entry
+            let pgc = build_pgc(bcd_secs(30), &[], &[], Some(pal));
+            let title = parse_pgc(&pgc, 0, 1).unwrap();
+            assert!(
+                title.palette.is_some(),
+                "component {comp} alone must mark the palette present"
+            );
+        }
+        // Only the padding byte set → still empty.
+        let mut pal = [[0u8; 4]; 16];
+        for c in pal.iter_mut() {
+            c[0] = 0xFF;
+        }
+        let pgc = build_pgc(bcd_secs(30), &[], &[], Some(pal));
+        assert!(parse_pgc(&pgc, 0, 1).unwrap().palette.is_none());
+    }
+
+    // ── PGCIT ────────────────────────────────────────────────────────────
+
+    /// Build a VTS_PGCIT at offset 0: VTS_PGC_Ns(2) + reserved(2) +
+    /// VTS_PGCIT_EA(4), then one 8-byte VTS_PGCI_SRP per PGC
+    /// (VTS_PGC_CAT(4) + VTS_PGCI_SA(4), the PGC's byte offset from the
+    /// VTS_PGCIT start). `pgcs` are appended after the SRP table.
+    fn build_pgcit(pgcs: &[Vec<u8>]) -> Vec<u8> {
+        let mut d = vec![0u8; 8 + pgcs.len() * 8];
+        d[0..2].copy_from_slice(&(pgcs.len() as u16).to_be_bytes());
+        let mut off = d.len();
+        for (i, p) in pgcs.iter().enumerate() {
+            let e = 8 + i * 8;
+            d[e + 4..e + 8].copy_from_slice(&(off as u32).to_be_bytes());
+            off += p.len();
+        }
+        for p in pgcs {
+            d.extend_from_slice(p);
+        }
+        d
+    }
+
+    /// Each VTS_PGCI_SRP is 8 bytes and the PGC start address is the second
+    /// word of its own entry, so title N must resolve to PGC N. Two PGCs
+    /// with distinct durations catch an entry read at the wrong stride or
+    /// from the wrong entry.
+    #[test]
+    fn pgcit_entry_stride_selects_the_right_pgc() {
+        let pgc0 = build_pgc(bcd_secs(11), &[(0x00, bcd_secs(11), 0, 9)], &[], None);
+        let pgc1 = build_pgc(bcd_secs(22), &[(0x00, bcd_secs(22), 50, 59)], &[], None);
+        let data = build_pgcit(&[pgc0, pgc1]);
+
+        // vts_title_num is 1-based: title 2 → PGC index 1.
+        let titles = parse_pgcit(&data, 0, &[(5, 2)]).unwrap();
+        assert_eq!(titles.len(), 1);
+        assert_eq!(titles[0].duration_secs, 22.0);
+        assert_eq!(titles[0].cells[0].first_sector, 50);
+
+        let titles = parse_pgcit(&data, 0, &[(5, 1)]).unwrap();
+        assert_eq!(titles.len(), 1);
+        assert_eq!(titles[0].duration_secs, 11.0);
+        assert_eq!(titles[0].cells[0].first_sector, 0);
+
+        // Both titles, in order.
+        let titles = parse_pgcit(&data, 0, &[(5, 1), (7, 2)]).unwrap();
+        assert_eq!(titles.len(), 2);
+        assert_eq!(titles[0].duration_secs, 11.0);
+        assert_eq!(titles[1].duration_secs, 22.0);
+    }
+
+    /// A VTS_PGCIT whose 8-byte header ends exactly at the end of the data is
+    /// a complete header with no SRP entries: an empty title list, not an
+    /// error. Below 8 bytes the header itself is truncated → IfoParse.
+    #[test]
+    fn pgcit_header_boundary() {
+        let data = vec![0u8; 8];
+        let titles = parse_pgcit(&data, 0, &[(5, 1)]).expect("complete header parses");
+        assert!(titles.is_empty());
+        for len in 0..8usize {
+            assert!(
+                parse_pgcit(&vec![0u8; len], 0, &[(5, 1)]).is_err(),
+                "len={len}"
+            );
+        }
+    }
+
+    /// An SRP entry that runs past the end of the data is SKIPPED, leaving
+    /// an empty title list — a truncated entry table must not turn into a
+    /// parse error for the whole PGCIT.
+    #[test]
+    fn pgcit_entry_past_end_is_skipped_not_an_error() {
+        // 8-byte header declaring 3 PGCs, then only 12 bytes of table: the
+        // entry for PGC index 2 (offset 24..32) is entirely past the end.
+        let mut data = vec![0u8; 20];
+        data[0..2].copy_from_slice(&3u16.to_be_bytes());
+        let titles = parse_pgcit(&data, 0, &[(5, 3)])
+            .expect("a truncated SRP entry is skipped, not an error");
+        assert!(titles.is_empty());
+    }
+
+    /// A TT_SRP entry is 12 bytes: playback_type(1) + angles(1) +
+    /// number_of_PTTs(2) + parental_mask(2) + VTSN(1) + VTS_TTN(1) +
+    /// VTS_start_sector(4). The chapter count is the 16-bit field at +2, and
+    /// each entry's own value must be carried through. Distinct counts per
+    /// entry catch a read from a neighbouring offset.
+    #[test]
+    fn tt_srpt_chapter_count_read_from_entry_offset_2() {
+        let data = tt_srpt_bytes(3, &[(7, 1, 1), (13, 1, 2), (0x0102, 2, 1)]);
+        let map = parse_tt_srpt(&data, 0).unwrap();
+        assert_eq!(map[&1], vec![(7u16, 1u8), (13, 2)]);
+        assert_eq!(map[&2], vec![(0x0102u16, 1u8)]);
+    }
 }

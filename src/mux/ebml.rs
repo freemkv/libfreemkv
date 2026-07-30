@@ -150,6 +150,30 @@ pub fn start_master<W: Write + Seek>(w: &mut W, id: u32) -> io::Result<u64> {
     Ok(size_pos)
 }
 
+/// Encode `data_size` as the FIXED-WIDTH 8-octet EBML VINT used to back-patch
+/// a master element's size field: the `0x01` VINT_MARKER octet followed by the
+/// 56-bit VINT_DATA payload, big-endian (RFC 8794 section 4.4 — an 8-octet
+/// VINT carries 7 octets of VINT_DATA).
+///
+/// Extracted so the full 56-bit payload can be exercised directly: reaching
+/// the high payload bytes through [`end_master`] / [`end_master_buf`] would
+/// take a multi-terabyte buffer, leaving them unconstrained by any test.
+///
+/// `data_size` must be below 2^56; both callers check that first.
+fn fixed_width_vint8(data_size: u64) -> [u8; 8] {
+    debug_assert!(data_size < 0x0100_0000_0000_0000);
+    [
+        0x01,
+        (data_size >> 48) as u8,
+        (data_size >> 40) as u8,
+        (data_size >> 32) as u8,
+        (data_size >> 24) as u8,
+        (data_size >> 16) as u8,
+        (data_size >> 8) as u8,
+        data_size as u8,
+    ]
+}
+
 /// End a master element: seek back and write the actual size.
 ///
 /// `size_pos` must be the offset returned by [`start_master`], which always
@@ -170,16 +194,7 @@ pub fn end_master<W: Write + Seek>(w: &mut W, size_pos: u64) -> io::Result<()> {
     );
     w.seek(SeekFrom::Start(size_pos))?;
     // Write as 8-byte VINT: 0x01 followed by 7 bytes of size
-    w.write_all(&[
-        0x01,
-        (data_size >> 48) as u8,
-        (data_size >> 40) as u8,
-        (data_size >> 32) as u8,
-        (data_size >> 24) as u8,
-        (data_size >> 16) as u8,
-        (data_size >> 8) as u8,
-        data_size as u8,
-    ])?;
+    w.write_all(&fixed_width_vint8(data_size))?;
     w.seek(SeekFrom::Start(end_pos))?;
     Ok(())
 }
@@ -220,16 +235,7 @@ pub fn end_master_buf(buf: &mut [u8], size_pos: usize) -> io::Result<()> {
     if data_size >= 0x0100_0000_0000_0000 {
         return Err(crate::error::Error::MkvUnencodable.into());
     }
-    buf[size_pos..body_start].copy_from_slice(&[
-        0x01,
-        (data_size >> 48) as u8,
-        (data_size >> 40) as u8,
-        (data_size >> 32) as u8,
-        (data_size >> 24) as u8,
-        (data_size >> 16) as u8,
-        (data_size >> 8) as u8,
-        data_size as u8,
-    ]);
+    buf[size_pos..body_start].copy_from_slice(&fixed_width_vint8(data_size));
     Ok(())
 }
 
@@ -1464,5 +1470,31 @@ mod tests {
             end_master_buf(&mut buf, 99).is_err(),
             "a size_pos past the end of the buffer must error, not panic"
         );
+    }
+
+    /// The fixed-width 8-octet VINT is `0x01` followed by the 56-bit
+    /// VINT_DATA payload in BIG-ENDIAN order (RFC 8794 section 4.4). Every
+    /// payload octet is distinct here, so a shifted, reversed or dropped
+    /// octet is visible; the top payload octets are unreachable through
+    /// end_master without a multi-terabyte buffer, which is why this is
+    /// tested at the encoder.
+    #[test]
+    fn fixed_width_vint8_is_big_endian_over_the_full_payload() {
+        assert_eq!(
+            fixed_width_vint8(0x00AA_BB_CC_DD_EE_FF_11),
+            [0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11]
+        );
+        assert_eq!(fixed_width_vint8(0), [0x01, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            fixed_width_vint8(0x00FF_FFFF_FFFF_FFFE),
+            [0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]
+        );
+        // Each payload octet in isolation lands in its own position.
+        for i in 0..7u32 {
+            let mut want = [0u8; 8];
+            want[0] = 0x01;
+            want[7 - i as usize] = 0x5A;
+            assert_eq!(fixed_width_vint8(0x5Au64 << (8 * i)), want, "octet {i}");
+        }
     }
 }
