@@ -1938,7 +1938,14 @@ mod tests {
         };
         // ── BlockGroup path: every frame carries a duration (the MPEG-2 shape).
         let t = MkvTrack::video(&v);
-        let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
+        // Write through SharedWriter and call finish(), so the buffer is a WELL-FORMED
+        // Matroska file whose cluster sizes are back-patched. The previous form took
+        // `muxer.writer.into_inner()` without finishing, leaving cluster sizes unwritten
+        // — which is why this test could only byte-scan for a ReferenceBlock instead of
+        // parsing the structure it actually cares about.
+        use std::sync::{Arc, Mutex};
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let mut muxer = MkvMuxer::new(SharedWriter(shared.clone()), &[t], None, 0.0, &[]).unwrap();
         let dur = Some(33_366_667u64);
         // I, then P, then B — decode order, all duration-bearing.
         muxer
@@ -1950,14 +1957,45 @@ mod tests {
         muxer
             .write_frame(0, 66_733_334, false, &vec![0xCC; 4_096], dur, None)
             .unwrap();
-        let data = muxer.writer.into_inner();
+        muxer.finish().unwrap();
+        let data = shared.lock().unwrap().clone().into_inner();
 
-        // The non-keyframes MUST have emitted a ReferenceBlock; the file is
-        // otherwise structurally unable to express "not a seek point".
-        assert!(
-            find_id(&data, ebml::REFERENCE_BLOCK).is_some(),
-            "a non-keyframe BlockGroup must carry a ReferenceBlock"
+        // Assert PER BLOCK, not "a ReferenceBlock exists somewhere". Keyframe-ness
+        // inside a BlockGroup is signalled by the ABSENCE of ReferenceBlock, so the
+        // I-frame must carry none and each non-keyframe must carry one pointing back
+        // at the keyframe. A mutant that emits one on every block satisfies a
+        // presence check while making the whole file read as non-keyframe.
+        let groups = all_block_groups(&data);
+        assert_eq!(
+            groups.len(),
+            3,
+            "three duration-bearing frames → three BlockGroups"
         );
+        assert_eq!(
+            groups[0].reference, None,
+            "the I-frame BlockGroup must carry NO ReferenceBlock — that absence IS the keyframe signal"
+        );
+        // Offsets are relative to the referenced keyframe, in ticks. The keyframe
+        // sits at tick 0 here, so each non-keyframe's offset is -(its own timestamp).
+        for (i, g) in groups.iter().enumerate().skip(1) {
+            let off = g.reference.unwrap_or_else(|| {
+                panic!("non-keyframe BlockGroup {i} must carry a ReferenceBlock")
+            });
+            assert_eq!(
+                off,
+                -(g.rel_ts as i64),
+                "BlockGroup {i}: ReferenceBlock must point back to the keyframe at tick 0"
+            );
+        }
+        // Inside a BlockGroup the 0x80 keyframe flag is reserved and MUST be 0 for
+        // every block, keyframe or not — the signal lives in ReferenceBlock alone.
+        for (i, g) in groups.iter().enumerate() {
+            assert_eq!(
+                g.flags & 0x80,
+                0,
+                "BlockGroup {i}: the SimpleBlock-only keyframe flag must be clear"
+            );
+        }
 
         let mut s = crate::mux::mkvstream::MkvStream::open(Cursor::new(data)).unwrap();
         let f0 = crate::pes::Stream::read(&mut s).unwrap().unwrap();
@@ -4026,45 +4064,97 @@ mod tests {
     // subtitle frames take this path.
     // ============================================================
 
-    fn first_block_group(data: &[u8]) -> (Vec<u8>, u64, u8) {
-        // Returns (inner BLOCK payload bytes after vint+ts+flags, block_duration_ms, flags).
-        let clusters = find_clusters(data);
-        for (body_start, body_size, _ts) in clusters {
+    /// One parsed BlockGroup.
+    struct BlockGroupInfo {
+        /// Inner BLOCK payload after the track vint, timestamp and flags.
+        data: Vec<u8>,
+        /// BlockDuration in ticks, or 0 when the element is absent.
+        duration: u64,
+        /// The Block's flags byte (0xFF when no Block was seen).
+        flags: u8,
+        /// Block-relative timestamp (signed, from the Block header).
+        rel_ts: i16,
+        /// The ReferenceBlock value in ticks, or `None` when the element is
+        /// absent — which is precisely how Matroska signals a keyframe inside a
+        /// BlockGroup (RFC 9559 §5.1.3.5).
+        reference: Option<i64>,
+    }
+
+    /// Parse EVERY BlockGroup in the output, in emission order.
+    ///
+    /// A presence check like `find_id(data, ebml::REFERENCE_BLOCK).is_some()` cannot
+    /// express what actually matters here: ReferenceBlock's ID is the single byte
+    /// 0xFB, and finding one somewhere in the file says nothing about WHICH blocks
+    /// carry it. A mutant emitting a ReferenceBlock on every BlockGroup — keyframes
+    /// included — satisfies that check while making every frame read back as a
+    /// non-keyframe, which is the exact defect these tests exist to guard.
+    fn all_block_groups(data: &[u8]) -> Vec<BlockGroupInfo> {
+        let mut out = Vec::new();
+        for (body_start, body_size, _ts) in find_clusters(data) {
             let body = &data[body_start..body_start + body_size as usize];
             let mut cursor = Cursor::new(body);
             let (tid, tsize, _) = ebml::read_element_header(&mut cursor).unwrap();
             assert_eq!(tid, ebml::CLUSTER_TIMESTAMP);
             cursor.seek(io::SeekFrom::Current(tsize as i64)).unwrap();
             while (cursor.position() as usize) < body.len() {
-                let (id, size, _) = ebml::read_element_header(&mut cursor).unwrap();
+                // Stop at a tail that is not a whole element (padding, or a cluster
+                // body that runs to the end of the buffer) rather than unwrapping.
+                // Callers assert the expected BlockGroup COUNT, so a desync that
+                // truncated this walk would fail there rather than pass quietly.
+                let Ok((id, size, _)) = ebml::read_element_header(&mut cursor) else {
+                    break;
+                };
+                let start = cursor.position() as usize;
+                if start + size as usize > body.len() {
+                    break;
+                }
                 if id == ebml::BLOCK_GROUP {
-                    let bg_start = cursor.position() as usize;
-                    let bg = &body[bg_start..bg_start + size as usize];
-                    // Parse the BlockGroup children.
+                    let bg = &body[start..start + size as usize];
                     let mut bc = Cursor::new(bg);
-                    let mut data_after = Vec::new();
-                    let mut dur = 0u64;
-                    let mut flags = 0xFFu8;
+                    let mut info = BlockGroupInfo {
+                        data: Vec::new(),
+                        duration: 0,
+                        flags: 0xFF,
+                        rel_ts: 0,
+                        reference: None,
+                    };
                     while (bc.position() as usize) < bg.len() {
                         let (cid, cs, _) = ebml::read_element_header(&mut bc).unwrap();
                         let cstart = bc.position() as usize;
                         if cid == ebml::BLOCK {
                             let blk = &bg[cstart..cstart + cs as usize];
                             let vl = if blk[0] & 0x80 != 0 { 1 } else { 2 };
-                            flags = blk[vl + 2];
-                            data_after = blk[vl + 3..].to_vec();
+                            info.rel_ts = i16::from_be_bytes([blk[vl], blk[vl + 1]]);
+                            info.flags = blk[vl + 2];
+                            info.data = blk[vl + 3..].to_vec();
                         } else if cid == ebml::BLOCK_DURATION {
-                            dur = ebml::read_uint_val(&mut bc, cs as usize).unwrap();
+                            info.duration = ebml::read_uint_val(&mut bc, cs as usize).unwrap();
                             continue;
+                        } else if cid == ebml::REFERENCE_BLOCK {
+                            // Two's-complement big-endian, minimal width: sign-extend
+                            // from the top bit of the first byte.
+                            let raw = &bg[cstart..cstart + cs as usize];
+                            let mut v: i64 = if raw[0] & 0x80 != 0 { -1 } else { 0 };
+                            for &b in raw {
+                                v = (v << 8) | b as i64;
+                            }
+                            info.reference = Some(v);
                         }
                         bc.seek(io::SeekFrom::Current(cs as i64)).unwrap();
                     }
-                    return (data_after, dur, flags);
+                    out.push(info);
                 }
                 cursor.seek(io::SeekFrom::Current(size as i64)).unwrap();
             }
         }
-        panic!("no BlockGroup found");
+        out
+    }
+
+    fn first_block_group(data: &[u8]) -> (Vec<u8>, u64, u8) {
+        // Returns (inner BLOCK payload bytes after vint+ts+flags, block_duration_ms, flags).
+        let g = all_block_groups(data);
+        let first = g.first().expect("no BlockGroup found");
+        (first.data.clone(), first.duration, first.flags)
     }
 
     #[test]
@@ -4974,7 +5064,11 @@ mod tests {
             vec![0x6F, 0x80, 0x00, 0x33, 0x11, 0x22],
             vec![0x68, 0xEE, 0x3C],
         ));
-        let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[v], None, 0.0, &[]).unwrap();
+        // finish() so cluster sizes are back-patched and the output can be PARSED
+        // per-block rather than only byte-scanned.
+        use std::sync::{Arc, Mutex};
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let mut muxer = MkvMuxer::new(SharedWriter(shared.clone()), &[v], None, 0.0, &[]).unwrap();
         let dep_kf = [0xDEu8, 0xAD, 0xBE, 0xEF];
         let dep_p = [0xCAu8, 0xFE];
         muxer
@@ -4983,7 +5077,8 @@ mod tests {
         muxer
             .write_frame(0, 40_000_000, false, &[0x41, 0x03], None, Some(&dep_p))
             .unwrap();
-        let data = muxer.writer.into_inner();
+        muxer.finish().unwrap();
+        let data = shared.lock().unwrap().clone().into_inner();
 
         assert!(
             find_id(&data, ebml::BLOCK_ADDITIONS).is_some(),
@@ -5002,9 +5097,23 @@ mod tests {
             data.windows(2).any(|w| w == dep_p),
             "non-keyframe dependent AU present"
         );
+        // Per-block, not a byte scan. ReferenceBlock's ID is the single byte 0xFB, so
+        // "one exists somewhere in the file" says nothing about WHICH block carries it:
+        // a mutant emitting one on every BlockGroup — the keyframe included — passed
+        // the old presence check while making every frame read back as a non-keyframe.
+        let groups = all_block_groups(&data);
+        assert_eq!(
+            groups.len(),
+            2,
+            "one keyframe + one non-keyframe MVC BlockGroup"
+        );
+        assert_eq!(
+            groups[0].reference, None,
+            "the MVC keyframe must carry NO ReferenceBlock — that absence IS the keyframe signal"
+        );
         assert!(
-            find_id(&data, ebml::REFERENCE_BLOCK).is_some(),
-            "non-keyframe MVC base frame must carry a ReferenceBlock"
+            groups[1].reference.is_some(),
+            "the non-keyframe MVC base frame must carry a ReferenceBlock"
         );
     }
 
