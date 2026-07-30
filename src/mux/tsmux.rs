@@ -4,7 +4,8 @@
 //! packets. Each frame is wrapped in a PES header, split into TS packets,
 //! and prepended with the 4-byte TP_extra_header.
 
-use super::hevc::{hvcc_to_annex_b, length_prefixed_to_annex_b};
+use super::hevc::{avcc_to_annex_b, hvcc_to_annex_b, length_prefixed_to_annex_b};
+use crate::disc::Codec;
 use std::io::{self, Write};
 
 const SYNC_BYTE: u8 = 0x47;
@@ -42,16 +43,23 @@ pub struct TsMuxer<W: Write> {
     continuity: Vec<u8>,                  // per-PID continuity counter (0-15)
     codec_privates: Vec<Option<Vec<u8>>>, // per-track codec_private (for video parameter sets)
     params_written: Vec<bool>,            // per-track: have we written parameter sets?
-    /// Per-track: does this video track's ES arrive length-prefixed (MKV/PES
-    /// NALU convention — HEVC, H.264) and need Annex-B conversion? Defaults
-    /// to `true` (the prior, only behavior) so every existing call site is
-    /// unaffected; a track carrying MPEG-2 or VC-1 — neither is NAL-based,
-    /// both already arrive as plain start-code ES — must opt OUT via
-    /// [`TsMuxer::set_nal_video`] or `length_prefixed_to_annex_b` mangles the
-    /// frame into empty/garbage output (frame_count still increments, so the
-    /// mux "succeeds" while silently producing a video-less file). Ignored
-    /// for non-video tracks.
-    nal_video: Vec<bool>,
+    /// Per-track video codec, which decides BOTH how the ES is framed and how
+    /// its `codec_private` parameter-set record is parsed. One fact, one field:
+    /// carrying NAL-ness separately from the codec is what let a track be
+    /// treated as NAL video while its avcC record was handed to the hvcC parser.
+    ///
+    /// * HEVC / H.264 arrive length-prefixed (MKV/PES NALU convention) and need
+    ///   Annex-B conversion; their parameter sets live in an hvcC / avcC record
+    ///   respectively, and the two layouts are NOT interchangeable.
+    /// * MPEG-2 and VC-1 are already plain start-code ES; running
+    ///   `length_prefixed_to_annex_b` over them mangles the frame into
+    ///   empty/garbage output while `frame_count` still increments, so the mux
+    ///   "succeeds" and silently produces a video-less file.
+    ///
+    /// Defaults to [`Codec::Hevc`] — the prior, only behaviour — so a caller that
+    /// never calls [`TsMuxer::set_video_codec`] is unaffected. Ignored for
+    /// non-video tracks.
+    video_codec: Vec<Codec>,
     /// Global PTS origin (nanoseconds), seeded by the FIRST video frame so
     /// the audio/video offset is preserved. Frames that arrive before it
     /// is set saturate to 0.
@@ -73,7 +81,7 @@ impl<W: Write> TsMuxer<W> {
             continuity: vec![0u8; n],
             codec_privates: vec![None; n],
             params_written: vec![false; n],
-            nal_video: vec![true; n],
+            video_codec: vec![Codec::Hevc; n],
             base_pts_ns: None,
             frame_count: 0,
         }
@@ -97,23 +105,28 @@ impl<W: Write> TsMuxer<W> {
         Ok(())
     }
 
-    /// Mark whether a video track's ES arrives length-prefixed (MKV/PES NALU
-    /// convention) and needs Annex-B conversion. Call with `false` for MPEG-2
-    /// or VC-1 tracks — neither is NAL-based, so the ES already IS the wire
-    /// format and must pass through unconverted (see [`Self::nal_video`]).
-    /// Ignored (harmlessly) for a non-video track. Returns
-    /// [`Error::MuxTrackRange`](crate::error::Error::MuxTrackRange) for an
-    /// out-of-range index.
-    pub fn set_nal_video(&mut self, track: usize, is_nal: bool) -> io::Result<()> {
-        if track >= self.nal_video.len() {
+    /// Declare a video track's codec. This selects both the ES framing (NAL
+    /// length-prefixed vs. plain start-code) and the `codec_private`
+    /// parameter-set parser (avcC for H.264, hvcC for HEVC) — see
+    /// [`Self::video_codec`]. Ignored (harmlessly) for a non-video track.
+    /// Returns [`Error::MuxTrackRange`](crate::error::Error::MuxTrackRange) for
+    /// an out-of-range index.
+    pub fn set_video_codec(&mut self, track: usize, codec: Codec) -> io::Result<()> {
+        if track >= self.video_codec.len() {
             return Err(crate::error::Error::MuxTrackRange {
                 track,
-                tracks: self.nal_video.len(),
+                tracks: self.video_codec.len(),
             }
             .into());
         }
-        self.nal_video[track] = is_nal;
+        self.video_codec[track] = codec;
         Ok(())
+    }
+
+    /// True when this track's video ES arrives length-prefixed and must be
+    /// converted to Annex B. HEVC and H.264 are the only NAL codecs carried.
+    fn is_nal_video(&self, track: usize) -> bool {
+        matches!(self.video_codec[track], Codec::Hevc | Codec::H264)
     }
 
     /// Write a PES frame as BD-TS packets.
@@ -167,11 +180,19 @@ impl<W: Write> TsMuxer<W> {
         // start-code ES, never length-prefixed) the bytes pass through
         // unchanged, so borrow `data` directly rather than copying it; only
         // NAL video needs an owned Annex-B conversion buffer.
-        let es_data: std::borrow::Cow<'_, [u8]> = if is_video && self.nal_video[track] {
+        let es_data: std::borrow::Cow<'_, [u8]> = if is_video && self.is_nal_video(track) {
             let mut annex_b = Vec::new();
             if keyframe && !self.params_written[track] {
                 if let Some(ref cp) = self.codec_privates[track] {
-                    if let Some(params) = hvcc_to_annex_b(cp) {
+                    // avcC and hvcC are DIFFERENT box layouts; parsing one with
+                    // the other's parser yields no parameter sets at all, and the
+                    // stream is then undecodable. Dispatch on the declared codec,
+                    // matching `demux_sink::annexb_param_sets`.
+                    let params = match self.video_codec[track] {
+                        Codec::H264 => avcc_to_annex_b(cp),
+                        _ => hvcc_to_annex_b(cp),
+                    };
+                    if let Some(params) = params {
                         annex_b.extend_from_slice(&params);
                     }
                 }
@@ -786,7 +807,7 @@ mod tests {
         out
     }
 
-    /// `set_nal_video(_, false)` must pass the ES through byte-for-byte: MPEG-2 and
+    /// A non-NAL codec must pass the ES through byte-for-byte: MPEG-2 and
     /// VC-1 are not NAL-based, so their ES already IS the wire format and
     /// `length_prefixed_to_annex_b` would mangle it.
     ///
@@ -796,7 +817,7 @@ mod tests {
     /// paths produce visibly different bytes; a payload the converter happened to
     /// leave alone would let a mutant pass.
     ///
-    /// Mutation: delete the `set_nal_video` call, or flip the `nal_video` default,
+    /// Mutation: delete the `set_video_codec` call, or make Mpeg2 report as NAL,
     /// and the emitted ES gains a start code -> this fails.
     #[test]
     fn non_nal_video_es_passes_through_unconverted() {
@@ -807,7 +828,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
-            mux.set_nal_video(0, false).unwrap();
+            mux.set_video_codec(0, Codec::Mpeg2).unwrap();
             mux.write_frame(0, 0, true, &es).unwrap();
             mux.finish().unwrap();
         }
@@ -820,7 +841,7 @@ mod tests {
         );
     }
 
-    /// The default (`nal_video` = true) still converts, so the test above is
+    /// The default (`video_codec` = HEVC) still converts, so the test above is
     /// pinning the flag rather than a no-op. Same input, opposite expectation.
     #[test]
     fn nal_video_es_is_converted_to_annex_b_by_default() {
@@ -829,7 +850,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
-            // No set_nal_video call — the default must be the converting path.
+            // No set_video_codec call — the default must be the converting path.
             mux.write_frame(0, 0, true, &es).unwrap();
             mux.finish().unwrap();
         }
@@ -859,7 +880,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
-            mux.set_nal_video(0, false).unwrap();
+            mux.set_video_codec(0, Codec::Mpeg2).unwrap();
             mux.write_frame(0, 0, true, &key).unwrap();
             mux.write_frame(0, 41_000_000, false, &non_key).unwrap();
             mux.finish().unwrap();
@@ -872,17 +893,20 @@ mod tests {
         );
     }
 
-    /// `set_nal_video` rejects an out-of-range track rather than panicking on the
+    /// `set_video_codec` rejects an out-of-range track rather than panicking on the
     /// index — this is library API and the crate must not panic from it.
     #[test]
-    fn set_nal_video_out_of_range_track_errors() {
+    fn set_video_codec_out_of_range_track_errors() {
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
         assert!(
-            mux.set_nal_video(1, false).is_err(),
+            mux.set_video_codec(1, Codec::Mpeg2).is_err(),
             "track 1 does not exist on a one-track muxer"
         );
-        assert!(mux.set_nal_video(0, false).is_ok(), "track 0 does exist");
+        assert!(
+            mux.set_video_codec(0, Codec::Mpeg2).is_ok(),
+            "track 0 does exist"
+        );
     }
 
     #[test]
