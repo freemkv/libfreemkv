@@ -23,14 +23,12 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
         if !std::path::Path::new(&path).exists() {
             continue;
         }
-        if let Ok(mut transport) = crate::scsi::open(std::path::Path::new(&path)) {
-            if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
-                if !id.raw_inquiry.is_empty()
-                    && (id.raw_inquiry[0] & 0x1F) == SCSI_PERIPHERAL_TYPE_OPTICAL
-                {
-                    drives.push((path, id));
-                }
-            }
+        if let Ok(mut transport) = crate::scsi::open(std::path::Path::new(&path))
+            && let Ok(id) = DriveId::from_drive(transport.as_mut())
+            && !id.raw_inquiry.is_empty()
+            && (id.raw_inquiry[0] & 0x1F) == SCSI_PERIPHERAL_TYPE_OPTICAL
+        {
+            drives.push((path, id));
         }
     }
     drives

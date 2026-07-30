@@ -272,7 +272,7 @@ impl WritebackPipeline {
             self.chunk_bytes,
             self.skip_wait(),
         );
-        if self.chunk_count % SIZE_LOG_INTERVAL == 0 {
+        if self.chunk_count.is_multiple_of(SIZE_LOG_INTERVAL) {
             tracing::debug!(
                 target: "mux",
                 "WritebackPipeline chunk_bytes={} after {} chunks is_nfs={} degraded={}",
