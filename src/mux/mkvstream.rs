@@ -3465,4 +3465,204 @@ mod tests {
         // Truncated: a 2-octet marker with only one octet available.
         assert!(lace_vint(&[0x43]).is_none());
     }
+
+    // ── finish(): the only thing that produces a valid file ───────────────
+
+    /// A `Cursor<Vec<u8>>` the test still owns after `MkvStream` takes it, so the
+    /// bytes the writer actually produced can be inspected (and re-opened).
+    #[derive(Clone)]
+    struct SharedOut(std::sync::Arc<std::sync::Mutex<Cursor<Vec<u8>>>>);
+
+    impl SharedOut {
+        fn new() -> Self {
+            Self(std::sync::Arc::new(std::sync::Mutex::new(Cursor::new(
+                Vec::new(),
+            ))))
+        }
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().get_ref().clone()
+        }
+    }
+
+    impl io::Write for SharedOut {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    impl io::Seek for SharedOut {
+        fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+            self.0.lock().unwrap().seek(pos)
+        }
+    }
+
+    fn h264_title() -> crate::disc::DiscTitle {
+        use crate::disc::{
+            Codec, ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream, VideoStream,
+        };
+        let mut t = DiscTitle {
+            streams: vec![Stream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::H264,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F24,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })],
+            ..DiscTitle::empty()
+        };
+        t.playlist = "FinishTitle".into();
+        // A minimal avcC so the written TrackEntry carries a CodecPrivate.
+        t.codec_privates = vec![Some(vec![0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1])];
+        t
+    }
+
+    /// `finish()` is what turns a stream of frames into a FILE. It activates a
+    /// still-pending muxer (writing EBML header, Segment, Info, Tracks), then
+    /// finalizes it (Cues, SeekHead, the backpatched Segment size). A `finish`
+    /// that returned `Ok(())` without doing any of that leaves the caller with a
+    /// zero-byte or truncated `.mkv` and an exit code of 0 — a rip that reports
+    /// success and produced nothing.
+    ///
+    /// Proven by reading the output back through this crate's own MKV reader:
+    /// the frames must come out in order, with their real payloads, timestamps
+    /// and keyframe flags.
+    #[test]
+    fn finish_produces_a_readable_mkv_with_every_written_frame() {
+        let out = SharedOut::new();
+        let title = h264_title();
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+
+        let frames = [
+            (0i64, true, vec![0xA1u8; 48]),
+            (41_708_333i64, false, vec![0xB2u8; 24]),
+            (83_416_666i64, false, vec![0xC3u8; 96]),
+        ];
+        for (pts, keyframe, data) in &frames {
+            s.write(&crate::pes::PesFrame {
+                coding: None,
+                source: None,
+                track: 0,
+                pts: *pts,
+                keyframe: *keyframe,
+                data: data.clone(),
+                duration_ns: None,
+            })
+            .unwrap();
+        }
+        s.finish().unwrap();
+
+        let bytes = out.bytes();
+        assert!(!bytes.is_empty(), "finish must have produced a file");
+
+        let mut back = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let mut got = Vec::new();
+        while let Some(f) = back.read().unwrap() {
+            got.push(f);
+        }
+        assert_eq!(
+            got.len(),
+            frames.len(),
+            "every frame survives the round trip"
+        );
+        for (i, (pts, keyframe, data)) in frames.iter().enumerate() {
+            assert_eq!(&got[i].data, data, "frame {i} payload");
+            assert_eq!(got[i].keyframe, *keyframe, "frame {i} keyframe flag");
+            // Matroska block timestamps are milliseconds at the default
+            // TimestampScale (RFC 9559 §5.1.2.6), so the ns PTS round-trips to
+            // the nearest ms.
+            assert_eq!(
+                got[i].pts / 1_000_000,
+                pts / 1_000_000,
+                "frame {i} timestamp"
+            );
+        }
+        assert_eq!(
+            back.info().playlist,
+            "FinishTitle",
+            "the Segment Title written at finish survives"
+        );
+        assert_eq!(
+            back.codec_private(0).as_deref(),
+            Some(&[0x01u8, 0x64, 0x00, 0x1F, 0xFF, 0xE1][..]),
+            "the TrackEntry CodecPrivate written at finish survives"
+        );
+    }
+
+    /// A title that produced NO frames must NOT finish successfully. `finish()`
+    /// activates the still-pending muxer (so the header/Tracks are written) and
+    /// then hands off to `MkvMuxer::finish`, whose zero-frame guard raises
+    /// `Error::MkvInvalid` (E6008) rather than emitting a structurally valid but
+    /// clusterless MKV.
+    ///
+    /// A `finish` that returned `Ok(())` would report a completed rip for a
+    /// title that muxed nothing — precisely the "empty title, exit code 0"
+    /// outcome the guard exists to prevent — and `error::is_skippable_title_stub`
+    /// would never get the code it classifies on.
+    #[test]
+    fn finish_refuses_a_zero_frame_title_instead_of_reporting_success() {
+        let out = SharedOut::new();
+        let title = h264_title();
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+
+        let err = s
+            .finish()
+            .expect_err("a title that muxed no frames must not finish successfully");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let code = format!("E{}", crate::error::Error::MkvInvalid.code());
+        assert!(
+            err.to_string().contains(&code),
+            "expected the empty-mux code {code}, got {err}"
+        );
+        assert!(
+            crate::error::is_skippable_title_stub(&err),
+            "the code raised must be the one the title loop classifies as a stub"
+        );
+    }
+
+    /// `headers_ready()` gates the CLI's wait-for-codec-private loop. For
+    /// Matroska it is unconditionally true because RFC 9559 §5.1 places the
+    /// Tracks element (carrying every CodecPrivate) in the Segment header,
+    /// ahead of the first Cluster — `MkvStream::open` has therefore already
+    /// parsed them by the time it returns. Returning `false` would hang the
+    /// mux forever on a source whose headers are, by construction, present.
+    ///
+    /// Pinned as an implication rather than a bare constant: readiness is
+    /// asserted TOGETHER with the codec private actually being retrievable, on
+    /// a freshly opened stream that has read no frame yet.
+    #[test]
+    fn headers_are_ready_at_open_because_matroska_front_loads_them() {
+        let out = SharedOut::new();
+        let title = h264_title();
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        s.write(&crate::pes::PesFrame {
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xA1; 48],
+            duration_ns: None,
+        })
+        .unwrap();
+        s.finish().unwrap();
+
+        let back = MkvStream::open(Cursor::new(out.bytes())).unwrap();
+        assert!(
+            back.headers_ready(),
+            "Matroska carries Tracks before the first Cluster; open() already has them"
+        );
+        assert!(
+            back.codec_private(0).is_some(),
+            "and the readiness claim is honest: the codec private IS available \
+             before any frame has been read"
+        );
+    }
 }

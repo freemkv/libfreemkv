@@ -3233,4 +3233,100 @@ mod tests {
             "oversized param set must not produce a (truncated) hvcC"
         );
     }
+
+    /// HEVC counterpart of `h264_ps_reorder_reconstructs_distinct_display_pts`.
+    ///
+    /// A DVD/HD-DVD program stream stamps a PTS only on each GOP anchor, so the
+    /// parser must reconstruct display-order timestamps for the rest. Two things
+    /// are pinned here that nothing else constrained:
+    ///
+    ///   * `with_ps_reorder(true)` must actually INSTALL the reorderer (a builder
+    ///     that returned a default-constructed parser would silently leave the
+    ///     transport-stream path in place on every DVD title), and
+    ///   * `flush()` must drain the reorderer's real buffered frames at EOF —
+    ///     not nothing (the tail of every title lost) and not a manufactured
+    ///     empty frame at PTS 0 (a zero-length Block whose timestamp jumps back
+    ///     behind every cluster already written, RFC 9559 §5.1.3.2).
+    ///
+    /// Slice bodies follow H.265 §7.3.6.1: `first_slice_segment_in_pic_flag`,
+    /// the IRAP-only `no_output_of_prior_pics_flag`, `ue(pps_id)`, `ue(slice_type)`
+    /// (Table 7-7: 0 = B, 1 = P, 2 = I). PPS body 0xC0 sets
+    /// `num_extra_slice_header_bits = 0`.
+    #[test]
+    fn hevc_ps_reorder_is_installed_and_flush_drains_its_real_frames() {
+        const NAL_IDR_W_RADL: u8 = 19; // IRAP → keyframe / GOP anchor
+        const NAL_TRAIL_R: u8 = 1; // non-IRAP coded slice
+        let nal = |t: u8, body: u8| {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(t));
+            v.push(body);
+            v
+        };
+        // One access unit = active PPS + one coded slice, in one PES.
+        let au = |t: u8, body: u8| {
+            let mut d = nal(NAL_PPS, 0xC0);
+            d.extend_from_slice(&nal(t, body));
+            d
+        };
+        // Decode order of a classic single-B GOP: I P B P B.
+        let gop = |anchor: Option<i64>| {
+            vec![
+                (au(NAL_IDR_W_RADL, 0xAC), anchor), // I, IRAP anchor
+                (au(NAL_TRAIL_R, 0xD0), None),      // P
+                (au(NAL_TRAIL_R, 0xE0), None),      // B
+                (au(NAL_TRAIL_R, 0xD0), None),      // P
+                (au(NAL_TRAIL_R, 0xE0), None),      // B
+            ]
+        };
+
+        let feed = |reorder: bool| -> (Vec<Frame>, Vec<Frame>) {
+            let mut p = HevcParser::new().with_ps_reorder(reorder);
+            let mut during = Vec::new();
+            // Two GOPs; the second anchor is 5 frames later (90 kHz: 5 × 3750).
+            for (data, pts) in gop(Some(0)).into_iter().chain(gop(Some(18_750))) {
+                during.extend(p.parse(&make_pes(data, pts)));
+            }
+            let tail = p.flush();
+            (during, tail)
+        };
+
+        let (during, tail) = feed(true);
+        assert!(
+            !tail.is_empty(),
+            "the reorderer holds frames back; flush must release them"
+        );
+        for f in &tail {
+            assert!(
+                !f.data.is_empty(),
+                "a flushed frame carries real coded bytes, never a manufactured empty one"
+            );
+        }
+        let all: Vec<&Frame> = during.iter().chain(tail.iter()).collect();
+        assert_eq!(all.len(), 10, "every access unit is emitted exactly once");
+        let mut pts: Vec<i64> = all.iter().map(|f| f.pts_ns).collect();
+        let n = pts.len();
+        pts.sort_unstable();
+        pts.dedup();
+        assert_eq!(
+            pts.len(),
+            n,
+            "reconstructed PTS are all distinct (no DTS collision)"
+        );
+
+        // With reorder OFF (transport-stream behaviour) the sparse-PTS frames
+        // collapse onto the anchor's timestamp and nothing is buffered, so flush
+        // is empty. This is the discriminator that proves `with_ps_reorder(true)`
+        // really changed the parser rather than the two paths being identical.
+        let (raw_during, raw_tail) = feed(false);
+        assert!(
+            raw_tail.is_empty(),
+            "no reorderer installed → nothing buffered at EOF"
+        );
+        assert_eq!(raw_during.len(), 10);
+        let collisions = raw_during.iter().filter(|f| f.pts_ns == 0).count();
+        assert!(
+            collisions >= 4,
+            "without reorder the sparse-PTS frames collide on 0 (got {collisions})"
+        );
+    }
 }

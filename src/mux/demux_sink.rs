@@ -1628,4 +1628,165 @@ mod tests {
         std::fs::create_dir_all(&p).unwrap();
         p
     }
+
+    /// `demux://` exports the title's chapters as side files at `finish()`.
+    /// A `write_chapters` that returned `Ok(())` without writing produces a
+    /// demux run that reports complete success while the chapter files simply
+    /// do not exist — the caller has no way to tell an intentionally
+    /// chapterless title from a lost export.
+    ///
+    /// Both formats are requested at once and BOTH files are checked, with
+    /// distinct chapter names and a non-zero timestamp, so a writer that emitted
+    /// one format, an empty file, or the wrong chapter list cannot pass.
+    #[test]
+    fn finish_exports_both_chapter_formats_with_real_content() {
+        let dir = tempdir();
+        let mut title = title_with(vec![video_stream(Codec::Mpeg2)], vec![None]);
+        title.chapters = vec![
+            crate::disc::Chapter {
+                time_secs: 0.0,
+                name: "Opening".into(),
+            },
+            crate::disc::Chapter {
+                time_secs: 62.5,
+                name: "Second".into(),
+            },
+        ];
+        let opts = DemuxOptions {
+            base: "ChapTitle".into(),
+            export_chapters: true,
+            chapters_fmt: ChaptersFmt::Both,
+            ..Default::default()
+        };
+        let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
+        sink.finish().unwrap();
+
+        let xml = std::fs::read_to_string(dir.join("ChapTitle chapters.xml"))
+            .expect("chapters.xml must exist after finish");
+        let ogm = std::fs::read_to_string(dir.join("ChapTitle chapters.txt"))
+            .expect("chapters.txt must exist after finish");
+
+        // Content, not merely existence: both chapters, both names, and the
+        // 62.5 s timestamp formatted per its format.
+        assert!(
+            xml.contains("Opening") && xml.contains("Second"),
+            "xml: {xml}"
+        );
+        assert!(
+            xml.contains("00:01:02.500"),
+            "xml must carry the real chapter time: {xml}"
+        );
+        assert!(
+            ogm.contains("CHAPTER01=") && ogm.contains("CHAPTER02="),
+            "ogm: {ogm}"
+        );
+        assert!(
+            ogm.contains("Opening") && ogm.contains("Second"),
+            "ogm names: {ogm}"
+        );
+        assert!(
+            ogm.contains("00:01:02.500"),
+            "ogm must carry the real chapter time: {ogm}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other side of the gate: with the export switched off, no chapter
+    /// file is written at all. Without this the test above would also pass for
+    /// a `write_chapters` that ignored `opts.export_chapters`.
+    #[test]
+    fn chapters_are_not_exported_when_the_option_is_off() {
+        let dir = tempdir();
+        let mut title = title_with(vec![video_stream(Codec::Mpeg2)], vec![None]);
+        title.chapters = vec![crate::disc::Chapter {
+            time_secs: 0.0,
+            name: "Opening".into(),
+        }];
+        let opts = DemuxOptions {
+            base: "ChapTitle".into(),
+            export_chapters: false,
+            chapters_fmt: ChaptersFmt::Both,
+            ..Default::default()
+        };
+        let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
+        sink.finish().unwrap();
+        assert!(!dir.join("ChapTitle chapters.xml").exists());
+        assert!(!dir.join("ChapTitle chapters.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every filename component `demux://` writes is built from DISC-CONTROLLED
+    /// text — the volume label / playlist name (`opts.base`) and the track label.
+    /// `sanitize` is the only thing standing between that text and the
+    /// filesystem: a surviving `/` (or `\` on Windows) makes the sink write
+    /// OUTSIDE the output directory the caller chose, and `:` / `?` / `*` / `"` /
+    /// `<` / `>` / `|` make the create fail outright on Windows and on SMB/exFAT
+    /// shares, which are the normal targets for a rip.
+    #[test]
+    fn sanitize_neutralises_every_path_hostile_character() {
+        for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|'] {
+            let got = sanitize(&format!("a{c}b"));
+            assert_eq!(got, "a_b", "{c:?} must be replaced, got {got:?}");
+        }
+        // A traversal attempt in a disc label cannot escape the output directory:
+        // no separator survives, so the whole thing stays ONE component.
+        let escaped = sanitize("../../etc/passwd");
+        assert_eq!(escaped, ".._.._etc_passwd");
+        assert!(
+            !std::path::Path::new(&escaped)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "the sanitized name must not decompose into a parent-directory hop"
+        );
+        // Ordinary characters — including spaces, dots, unicode and other
+        // punctuation — are preserved, so the replacement is targeted, not a
+        // blanket scrub that would mangle real titles.
+        assert_eq!(
+            sanitize("Amélie (2001) - Chapter 1.5 [Director's Cut]"),
+            "Amélie (2001) - Chapter 1.5 [Director's Cut]"
+        );
+    }
+
+    /// End-to-end witness that `sanitize` is actually applied on the write path:
+    /// a disc label containing a separator must produce ONE file inside the
+    /// chosen directory, never a write into a sibling/parent path.
+    #[test]
+    fn a_disc_label_with_a_separator_cannot_write_outside_the_output_directory() {
+        let dir = tempdir();
+        let title = title_with(vec![video_stream(Codec::Mpeg2)], vec![None]);
+        let opts = DemuxOptions {
+            base: "../evil/Title".into(),
+            export_chapters: false,
+            ..Default::default()
+        };
+        let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
+        sink.write(&PesFrame {
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0x00, 0x00, 0x01, 0xB3, 0xAA],
+            duration_ns: None,
+        })
+        .unwrap();
+        sink.finish().unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "exactly one output file; got {names:?}");
+        assert!(
+            names[0].starts_with(".._evil_Title"),
+            "the separators must be neutralised in the real filename; got {names:?}"
+        );
+        assert!(
+            !dir.parent().unwrap().join("evil").exists(),
+            "nothing may be created outside the output directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

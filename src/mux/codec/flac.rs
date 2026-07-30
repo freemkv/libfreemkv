@@ -241,4 +241,34 @@ mod tests {
         let mut p = FlacParser::new();
         assert!(p.parse(&make_pes(Vec::new(), Some(0))).is_empty());
     }
+
+    /// FLAC packets are self-framing: `parse` emits or drops each one on the
+    /// spot and buffers nothing, so `flush` has nothing to deliver. A
+    /// manufactured tail frame would be a zero-length block at PTS 0 appended
+    /// after the track's real end — a backwards timestamp (RFC 9559 §5.1.3.2)
+    /// carrying no decodable FLAC frame.
+    #[test]
+    fn flush_adds_no_phantom_frame_after_the_last_real_packet() {
+        let mut p = FlacParser::new();
+        let mut emitted = Vec::new();
+        emitted.extend(p.parse(&make_pes(make_flac_frame(100), Some(90_000))));
+        emitted.extend(p.parse(&make_pes(make_flac_frame(120), Some(180_000))));
+        // A frame whose CRC-16 residue is nonzero is dropped, not buffered.
+        let mut corrupt = make_flac_frame(100);
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        emitted.extend(p.parse(&make_pes(corrupt, Some(270_000))));
+        assert_eq!(emitted.len(), 2, "two valid frames out, one dropped");
+        assert_eq!(p.dropped_frames(), 1);
+
+        let tail = p.flush();
+        assert!(
+            tail.is_empty(),
+            "nothing is buffered past the last packet; flush produced {:?}",
+            tail.iter()
+                .map(|f| (f.pts_ns, f.data.len()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(emitted.len() + tail.len(), 2);
+    }
 }

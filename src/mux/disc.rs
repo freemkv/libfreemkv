@@ -2056,4 +2056,449 @@ mod tests {
             "raw single-pass must construct without cracking, even on scrambled-uncrackable input"
         );
     }
+
+    mod stream_surface_tests {
+        //! The `impl crate::pes::Stream for DiscStream` surface plus the adaptive
+        //! batch sizer. These are the accessors the CLI's abort gate and the
+        //! header-wait loop read; a constant in any of them hides read loss or
+        //! stalls the mux, so each is constrained against a value that is neither
+        //! the mutation constant nor the initial state.
+        use super::*;
+        use crate::pes::Stream as PesStream;
+
+        // ── errors() / lost_bytes(): honest loss reporting ─────────────────
+
+        /// `Stream::errors()` and `Stream::lost_bytes()` are the ONLY channel by
+        /// which a caller learns that bytes went missing (the abort gate and the
+        /// "N sectors skipped" report both read them). A constant there reports a
+        /// lossy rip as clean.
+        ///
+        /// Two short-read fills are driven so both counters land on values that are
+        /// neither `0` nor `1` and are distinct from each other — a single fill
+        /// would leave `errors == 1`, indistinguishable from a stuck constant, and
+        /// equal counters would not prove the two accessors read different fields.
+        #[test]
+        fn errors_and_lost_bytes_report_real_short_read_loss_through_the_trait() {
+            let mut s = short_read_stream(true);
+
+            // Before any read the stream is clean — establishes the accessors are
+            // not simply echoing a preloaded value.
+            assert_eq!(PesStream::errors(&s), 0);
+            assert_eq!(PesStream::lost_bytes(&s), 0);
+
+            for _ in 0..2 {
+                assert!(
+                    s.fill_extents()
+                        .expect("skip_errors absorbs the short read")
+                );
+            }
+
+            // Two 8-sector (16384 B) requests, 2048 B delivered each: two skip
+            // events, 2 * (16384 - 2048) = 28672 bytes lost.
+            assert_eq!(
+                PesStream::errors(&s),
+                2,
+                "errors() must report BOTH short reads, not a constant"
+            );
+            assert_eq!(
+                PesStream::lost_bytes(&s),
+                28_672,
+                "lost_bytes() must report the byte total, not an event count or a constant"
+            );
+            assert_ne!(
+                PesStream::errors(&s),
+                PesStream::lost_bytes(&s),
+                "the two accessors must read different fields"
+            );
+        }
+
+        // ── write(): DiscStream is read-only ──────────────────────────────
+
+        /// `DiscStream` is the tree's only read-only `Stream`. `write()` returning
+        /// `Ok(())` would make a caller that muxed INTO a disc stream believe every
+        /// frame landed, producing a silent no-op rip. It must refuse with the
+        /// numeric code `E_STREAM_READ_ONLY`.
+        #[test]
+        fn write_refuses_with_the_read_only_code() {
+            let mut s = short_read_stream(false);
+            let frame = crate::pes::PesFrame {
+                coding: None,
+                source: None,
+                track: 0,
+                pts: 0,
+                keyframe: true,
+                data: vec![0u8; 4],
+                duration_ns: None,
+            };
+            let err = PesStream::write(&mut s, &frame)
+                .expect_err("a read-only stream must never accept a frame");
+            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+            let code = format!("E{}", crate::error::Error::StreamReadOnly.code());
+            assert!(
+                err.to_string().contains(&code),
+                "expected the read-only code {code}, got {err}"
+            );
+        }
+
+        // ── codec_private() / headers_ready() ─────────────────────────────
+
+        /// MPEG-2 sequence header (ISO/IEC 13818-2 §6.2.2.1) — start code `0x000001B3`
+        /// followed by 12-bit horizontal_size, 12-bit vertical_size, then
+        /// aspect_ratio_information / frame_rate_code and the bit-rate/VBV tail.
+        fn seq_header(width: u16, height: u16) -> Vec<u8> {
+            let mut h = vec![0x00, 0x00, 0x01, 0xB3];
+            h.push((width >> 4) as u8);
+            h.push((((width & 0x0F) as u8) << 4) | ((height >> 8) & 0x0F) as u8);
+            h.push((height & 0xFF) as u8);
+            h.push((3 << 4) | 4); // aspect_ratio_information=3, frame_rate_code=4
+            h.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0x00]);
+            h
+        }
+
+        /// MPEG-2 picture header (ISO/IEC 13818-2 §6.2.3), coding type in bits 3..5
+        /// of the sixth byte. Type 1 = I-picture.
+        fn picture_header(coding_type: u8) -> Vec<u8> {
+            vec![
+                0x00,
+                0x00,
+                0x01,
+                0x00,
+                0x00,
+                (coding_type & 0x07) << 3,
+                0,
+                0,
+            ]
+        }
+
+        /// One video (MPEG-2, track 1) behind one audio (AC-3, track 0). The video
+        /// is deliberately NOT track 0 so a `codec_private` that ignored its `track`
+        /// argument, or read the pid map in the wrong direction, would answer with
+        /// the audio parser (which has no codec private) and fail.
+        fn audio_then_video_title() -> DiscTitle {
+            use crate::disc::{
+                AudioChannels, AudioStream, Codec, ColorSpace, FrameRate, HdrFormat, LabelPurpose,
+                Resolution, SampleRate, VideoStream,
+            };
+            let mut t = DiscTitle {
+                extents: vec![crate::disc::Extent {
+                    start_lba: 0,
+                    sector_count: 8,
+                }],
+                ..DiscTitle::empty()
+            };
+            t.content_format = ContentFormat::MpegPs;
+            t.streams = vec![
+                crate::disc::Stream::Audio(AudioStream {
+                    pid: 0x00BD,
+                    codec: Codec::Ac3,
+                    channels: AudioChannels::Stereo,
+                    language: "eng".to_string(),
+                    sample_rate: SampleRate::S48,
+                    secondary: false,
+                    purpose: LabelPurpose::Normal,
+                    label: String::new(),
+                }),
+                crate::disc::Stream::Video(VideoStream {
+                    pid: 0x00E0,
+                    codec: Codec::Mpeg2,
+                    resolution: Resolution::R480i,
+                    frame_rate: FrameRate::F29_97,
+                    hdr: HdrFormat::Sdr,
+                    color_space: ColorSpace::Smpte170m,
+                    display_aspect: None,
+                    secondary: false,
+                    label: String::new(),
+                    measured_cicp: None,
+                }),
+            ];
+            t
+        }
+
+        fn mixed_stream() -> DiscStream {
+            DiscStream::new(
+                Box::new(ZeroReader { capacity: 8 }),
+                audio_then_video_title(),
+                crate::decrypt::DecryptKeys::None,
+                8,
+                ContentFormat::MpegPs,
+                false,
+                None,
+            )
+            .unwrap()
+        }
+
+        /// `headers_ready()` gates the CLI's "wait for codec private" loop: a
+        /// constant `true` starts the mux before the video's extradata exists
+        /// (an MKV with an empty CodecPrivate — unplayable video, RFC 9559 §5.1.4.1.5
+        /// requires it for V_MPEG2), and a constant `false` hangs forever.
+        ///
+        /// Both directions are pinned in one case: not ready before the video
+        /// parser has seen a sequence header, ready after.
+        #[test]
+        fn headers_ready_follows_the_video_codec_private_and_flips_both_ways() {
+            let mut s = mixed_stream();
+
+            assert!(
+                PesStream::codec_private(&s, 1).is_none(),
+                "no sequence header parsed yet"
+            );
+            assert!(
+                !PesStream::headers_ready(&s),
+                "a non-secondary video track without codec private must NOT be reported ready"
+            );
+
+            // Feed the video parser a complete access unit: sequence header +
+            // I-picture, closed by a following picture so the AU boundary is hit.
+            let vpid = 0x00E0u16;
+            let (_, parser) = s
+                .parsers
+                .iter_mut()
+                .find(|(p, _)| *p == vpid)
+                .expect("video parser present");
+            let mut au = seq_header(720, 480);
+            au.extend_from_slice(&picture_header(1));
+            au.extend_from_slice(&[0xAA; 16]);
+            let pes = |data: Vec<u8>, pts: Option<i64>| crate::mux::ts::PesPacket {
+                source: None,
+                pid: vpid,
+                pts,
+                dts: None,
+                data,
+                discontinuity: false,
+            };
+            let _ = parser.parse(&pes(au, Some(0)));
+            let mut next = picture_header(3);
+            next.extend_from_slice(&[0xBB; 16]);
+            let _ = parser.parse(&pes(next, None));
+
+            let cp = PesStream::codec_private(&s, 1)
+                .expect("codec_private must reach the VIDEO track's parser, not track 0's");
+            assert_eq!(
+                &cp[..4],
+                &[0x00, 0x00, 0x01, 0xB3],
+                "codec private is the MPEG-2 sequence header"
+            );
+            assert_eq!(&cp[4..7], &[0x2D, 0x01, 0xE0], "720x480 as authored");
+
+            assert!(
+                PesStream::headers_ready(&s),
+                "with the video's codec private present the mux may start"
+            );
+            // The AC-3 track genuinely has none — so the Some() above is a real
+            // per-track lookup, not a fixed answer.
+            assert!(PesStream::codec_private(&s, 0).is_none());
+            // And a track index past the end of the pid map has none either.
+            assert!(PesStream::codec_private(&s, 7).is_none());
+        }
+
+        // ── on_event() / emit() ───────────────────────────────────────────
+
+        /// `on_event()` installs the sink and `emit()` feeds it. If either is a
+        /// no-op the CLI's progress bar never moves and skipped sectors are never
+        /// reported — the rip looks clean and stalled at 0 %.
+        #[test]
+        fn installed_event_sink_receives_skip_and_progress_events() {
+            let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let sink = log.clone();
+            let mut s = short_read_stream(true);
+            s.on_event(move |e| {
+                let tag = match e.kind {
+                    EventKind::SectorSkipped { sector } => format!("skip:{sector}"),
+                    EventKind::BytesRead { bytes, total } => format!("bytes:{bytes}/{total}"),
+                    other => format!("other:{other:?}"),
+                };
+                sink.lock().unwrap().push(tag);
+            });
+
+            assert!(s.fill_extents().expect("short read absorbed"));
+
+            let got = log.lock().unwrap().clone();
+            assert!(
+                got.contains(&"skip:0".to_string()),
+                "the skipped unit at LBA 0 must reach the installed sink; got {got:?}"
+            );
+            // 2048 B delivered out of a 64-sector (131072 B) title.
+            assert!(
+                got.contains(&"bytes:2048/131072".to_string()),
+                "progress must report DELIVERED bytes against the extent total; got {got:?}"
+            );
+        }
+
+        // ── set_raw() ─────────────────────────────────────────────────────
+
+        /// `set_raw()` must flip BOTH key holders — the metadata mirror read by
+        /// `info()`-side callers and the wrapped reader that actually decrypts. A
+        /// no-op leaves an AACS stream decrypting when the caller asked for
+        /// ciphertext (the `--raw` forensic path), silently returning plaintext.
+        #[test]
+        fn set_raw_clears_both_the_mirror_and_the_readers_keys() {
+            let mut s = DiscStream::new(
+                Box::new(ZeroReader { capacity: 8 }),
+                synthetic_title(8),
+                crate::decrypt::DecryptKeys::Aacs {
+                    unit_keys: vec![(0, [0x11u8; 16])],
+                    read_data_key: None,
+                    format: ContentFormat::BdTs,
+                },
+                3,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(
+                s.decrypt_keys.is_encrypted(),
+                "fixture must start encrypted or the test proves nothing"
+            );
+
+            // Behavioural witness for the WRAPPED reader's keys: while AACS keys
+            // are installed the decorator refuses a read that does not begin on a
+            // 6144-byte aligned unit (it would mis-decrypt every following unit),
+            // so a mid-unit LBA hard-fails.
+            let mut buf = vec![0u8; 2048];
+            let before = s.reader.read_sectors(1, 1, &mut buf, false);
+            assert!(
+                matches!(before, Err(crate::error::Error::DecryptFailed)),
+                "the encrypted fixture must reject a mid-unit read; got {before:?}"
+            );
+
+            s.set_raw();
+
+            assert!(
+                !s.decrypt_keys.is_encrypted(),
+                "the metadata mirror must report the stream as raw"
+            );
+            let after = s.reader.read_sectors(1, 1, &mut buf, false);
+            assert_eq!(
+                after.expect("raw mode must pass ciphertext straight through"),
+                2048,
+                "the wrapped reader must stop decrypting, not just the mirror"
+            );
+        }
+
+        // ── AdaptiveBatch ─────────────────────────────────────────────────
+
+        /// AACS decrypts whole 3-sector (6144 B) units, so every batch size at or
+        /// above one doubled unit must stay a multiple of 3 — an unaligned size
+        /// makes the next read straddle a unit boundary and mis-decrypt the rest of
+        /// the title. Below 6 the ladder descends 3 → 1 with no unaligned rungs.
+        #[test]
+        fn halve_batch_size_keeps_unit_alignment_and_bottoms_out_at_one() {
+            assert_eq!(
+                halve_batch_size(64),
+                30,
+                "32 rounded down to a unit multiple"
+            );
+            assert_eq!(halve_batch_size(30), 15);
+            assert_eq!(halve_batch_size(12), 6, "6 is already unit-aligned");
+            assert_eq!(halve_batch_size(11), 5, "below 6: no alignment rounding");
+            assert_eq!(halve_batch_size(6), 3);
+            assert_eq!(halve_batch_size(3), 1);
+            assert_eq!(halve_batch_size(2), 1);
+            assert_eq!(
+                halve_batch_size(1),
+                1,
+                "must never reach 0 — a 0-sector read"
+            );
+            for size in 1u16..=4096 {
+                let h = halve_batch_size(size);
+                assert!(h >= 1, "halve({size}) must never be 0");
+                assert!(h <= size, "halve({size}) = {h} must not grow");
+                assert!(h < 6 || h % 3 == 0, "halve({size}) = {h} is unit-unaligned");
+            }
+        }
+
+        #[test]
+        fn double_batch_size_grows_toward_preferred_without_breaking_alignment() {
+            assert_eq!(double_batch_size(30, 64), 60);
+            assert_eq!(
+                double_batch_size(4, 64),
+                6,
+                "8 rounded down to a unit multiple"
+            );
+            assert_eq!(
+                double_batch_size(1, 64),
+                2,
+                "below 6: no alignment rounding"
+            );
+            assert_eq!(
+                double_batch_size(60, 64),
+                63,
+                "clamped to preferred, then aligned"
+            );
+            for size in 1u16..=2048 {
+                let d = double_batch_size(size, 4096);
+                assert!(d >= size, "double({size}) = {d} must not shrink");
+                assert!(
+                    d < 6 || d % 3 == 0,
+                    "double({size}) = {d} is unit-unaligned"
+                );
+            }
+        }
+
+        /// The sizer must actually probe back up: after a failure drops the batch,
+        /// a sustained clean run has to return a `BatchSizeChanged{Probed}` event
+        /// AND raise `current`. Never probing locks a rip at the reduced size for
+        /// the rest of the disc (the whole point of the amortised descent).
+        #[test]
+        fn on_success_probes_up_after_a_sustained_clean_run_and_resets_the_streak() {
+            let mut b = AdaptiveBatch::new(64);
+            assert!(
+                matches!(
+                    b.on_failure(),
+                    Some(EventKind::BatchSizeChanged {
+                        new_size: 30,
+                        reason: BatchSizeReason::Shrunk
+                    })
+                ),
+                "a failure must shrink 64 -> 30"
+            );
+            assert_eq!(b.current(), 30);
+
+            // Just under the 51200-sector probe threshold: still silent.
+            let mut fed = 0u32;
+            while fed + 30 < PROBE_THRESHOLD_SECTORS {
+                assert!(
+                    b.on_success(30).is_none(),
+                    "no probe before {PROBE_THRESHOLD_SECTORS} clean sectors (at {fed})"
+                );
+                fed += 30;
+            }
+            assert_eq!(b.current(), 30, "still at the reduced size");
+
+            // The read that crosses the threshold probes up.
+            let ev = b
+                .on_success(30)
+                .expect("a sustained clean run must probe the batch size back up");
+            assert!(
+                matches!(
+                    ev,
+                    EventKind::BatchSizeChanged {
+                        new_size: 60,
+                        reason: BatchSizeReason::Probed
+                    }
+                ),
+                "expected a Probed grow to 60, got {ev:?}"
+            );
+            assert_eq!(
+                b.current(),
+                60,
+                "the sizer must actually adopt the new size"
+            );
+            assert_eq!(
+                b.streak_sectors, 0,
+                "the streak resets so the next probe needs a fresh clean run"
+            );
+
+            // At the preferred size a clean run must NOT keep firing events.
+            let mut b = AdaptiveBatch::new(64);
+            for _ in 0..(PROBE_THRESHOLD_SECTORS / 64 + 2) {
+                assert!(
+                    b.on_success(64).is_none(),
+                    "no probe is possible when already at the preferred size"
+                );
+            }
+            assert_eq!(b.current(), 64);
+        }
+    }
 }

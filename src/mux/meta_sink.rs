@@ -428,4 +428,53 @@ mod tests {
         assert_eq!(vid["hdr"], "hdr10");
         assert_eq!(vid["color_space"], "bt2020");
     }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("fmkv_meta_sink_{}_{n}_{name}", std::process::id()))
+    }
+
+    fn sink_title() -> crate::disc::DiscTitle {
+        let mut t = crate::disc::DiscTitle::empty();
+        t.playlist = "MAIN".into();
+        t.chapters = chaps();
+        t
+    }
+
+    /// `chapters://` and `json://` are WRITE-ONLY sinks: the whole file is
+    /// emitted at `create()` and there is nothing to demux back. `read()`
+    /// returning `Ok(None)` instead of the write-only error makes a caller that
+    /// pointed a mux INPUT at one of these URLs see a clean empty stream — the
+    /// exact shape of the shipped "empty title, exit code 0" defect. It must
+    /// refuse with the numeric code `E_STREAM_WRITE_ONLY`.
+    #[test]
+    fn metadata_sinks_refuse_to_be_read_from() {
+        let code = format!("E{}", crate::error::Error::StreamWriteOnly.code());
+
+        let cpath = temp_path("chapters.xml");
+        let mut c = ChaptersSink::create(&cpath, &sink_title()).unwrap();
+        let err = c
+            .read()
+            .expect_err("chapters:// is write-only; read must not report a clean EOF");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            err.to_string().contains(&code),
+            "expected {code}, got {err}"
+        );
+        let _ = std::fs::remove_file(&cpath);
+
+        let jpath = temp_path("meta.json");
+        let mut j = JsonSink::create(&jpath, &sink_title()).unwrap();
+        let err = j
+            .read()
+            .expect_err("json:// is write-only; read must not report a clean EOF");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            err.to_string().contains(&code),
+            "expected {code}, got {err}"
+        );
+        let _ = std::fs::remove_file(&jpath);
+    }
 }

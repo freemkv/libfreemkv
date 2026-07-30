@@ -1186,15 +1186,43 @@ mod tests {
         assert_eq!(auds[0].1, ac3.len());
     }
 
+    /// `stts` run-length expansion — ISO/IEC 14496-12 §8.6.1.2. The box stores
+    /// `(sample_count, sample_delta)` runs; the reader must expand them back to
+    /// one delta PER SAMPLE, in order, or every sample after the first run lands
+    /// on the wrong decode time.
+    ///
+    /// (This test used to be called `stts_and_ctts_expand` while touching no
+    /// `ctts` box at all. The composition-offset half now lives in
+    /// `ctts_build_and_parse_are_exact_inverses_over_signed_offsets` and
+    /// `b_frame_presentation_order_survives_the_mp4_round_trip`.)
     #[test]
-    fn stts_and_ctts_expand() {
-        // stts: 3 samples × 1001 ticks.
+    fn stts_expands_runs_to_per_sample_deltas_in_order() {
+        // Three runs with DISTINCT deltas and distinct lengths, so a parser that
+        // dropped a run, reused the first delta, or emitted the runs in the
+        // wrong order cannot agree. A trailing 0-length run must contribute
+        // nothing (legal: §8.6.1.2 places no lower bound on sample_count).
         let mut stts = Vec::new();
-        stts.extend_from_slice(&[0, 0, 0, 0]); // version+flags
-        stts.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-        stts.extend_from_slice(&3u32.to_be_bytes());
-        stts.extend_from_slice(&1001u32.to_be_bytes());
-        assert_eq!(parse_stts(&stts, MAX_SAMPLE_COUNT), vec![1001, 1001, 1001]);
+        stts.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+        stts.extend_from_slice(&4u32.to_be_bytes()); // entry_count
+        for (n, delta) in [(3u32, 1001u32), (1, 2002), (0, 7777), (2, 1002)] {
+            stts.extend_from_slice(&n.to_be_bytes());
+            stts.extend_from_slice(&delta.to_be_bytes());
+        }
+        assert_eq!(
+            parse_stts(&stts, MAX_SAMPLE_COUNT),
+            vec![1001, 1001, 1001, 2002, 1002, 1002],
+        );
+
+        // A truncated box (entry_count claims more runs than the bytes hold)
+        // must yield the runs actually present, never read past the end.
+        let truncated = &stts[..stts.len() - 6];
+        assert_eq!(
+            parse_stts(truncated, MAX_SAMPLE_COUNT),
+            vec![1001, 1001, 1001, 2002],
+        );
+
+        // Too short to hold version/flags + entry_count → no samples.
+        assert!(parse_stts(&stts[..7], MAX_SAMPLE_COUNT).is_empty());
     }
 
     // ── Composition offsets (`ctts`) — ISO/IEC 14496-12 §8.6.1.3.

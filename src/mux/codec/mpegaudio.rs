@@ -287,4 +287,36 @@ mod tests {
             "next frame keeps its own PTS"
         );
     }
+
+    /// This parser is self-framing at PES granularity: `parse` emits (or drops)
+    /// every packet immediately and buffers nothing, so end-of-stream has
+    /// nothing left to hand over. A `flush` that manufactured a frame would
+    /// append a zero-length block at PTS 0 AFTER a track that has already run to
+    /// its real end — a Matroska Block whose timestamp jumps backwards past every
+    /// cluster before it (RFC 9559 §5.1.3.2 Blocks are relative to their
+    /// cluster's timestamp; a phantom 0 lands in the wrong cluster entirely) and
+    /// an empty audio frame no decoder can consume.
+    #[test]
+    fn flush_adds_no_phantom_frame_after_the_last_real_packet() {
+        let mut p = MpegAudioParser::new();
+        let mut emitted = Vec::new();
+        emitted.extend(p.parse(&make_pes(mp3_frame(400), Some(90_000))));
+        emitted.extend(p.parse(&make_pes(mp3_frame(400), Some(180_000))));
+        // An invalid header (version field 01 = reserved) is dropped, not buffered.
+        emitted.extend(p.parse(&make_pes(vec![0xFF, 0xEB, 0x90, 0x00, 0xAA], Some(270_000))));
+        assert_eq!(emitted.len(), 2, "two valid packets out, one dropped");
+        assert_eq!(p.dropped_frames(), 1);
+
+        let tail = p.flush();
+        assert!(
+            tail.is_empty(),
+            "nothing is buffered past the last packet; flush produced {:?}",
+            tail.iter()
+                .map(|f| (f.pts_ns, f.data.len()))
+                .collect::<Vec<_>>()
+        );
+        // Total frame count over the whole stream equals the valid input count —
+        // a manufactured tail frame would break this even if it were non-empty.
+        assert_eq!(emitted.len() + tail.len(), 2);
+    }
 }

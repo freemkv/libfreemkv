@@ -350,4 +350,56 @@ mod tests {
         let pid = u16::from_be_bytes([p.bytes()[1] & 0x1F, p.bytes()[2]]);
         assert_eq!(pid, 0xE100 & 0x1FFF, "PID masked to 13 bits");
     }
+
+    /// A sink that records only what actually reaches it, so "was flush called"
+    /// is MEASURED rather than assumed. Its own `flush` is a no-op — the whole
+    /// point is that the intermediate `BufWriter` must be told to hand its bytes
+    /// over.
+    #[derive(Clone, Default)]
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedSink {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `PacketWriter` adds no buffering of its own, so the sink's buffer is the
+    /// only one — and `flush()` is the only thing that empties it. Skipping it
+    /// truncates the transport stream mid-packet: the final 188-byte packets
+    /// never reach the file, so the last PES of the title is lost and the stream
+    /// ends on a partial packet (ISO/IEC 13818-1 §2.4.3.2 requires whole
+    /// 188-byte packets).
+    #[test]
+    fn flush_delivers_the_buffered_packets_to_the_sink() {
+        let sink = SharedSink::default();
+        let mut w = PacketWriter::new(io::BufWriter::new(sink.clone()));
+        let mut p = Packet::new();
+        p.set_header(0x1011, true, true, false, 3);
+        p.append_payload(&[0x11, 0x22, 0x33]).unwrap();
+        p.pad_to_188();
+        w.write_packet(&p).unwrap();
+
+        assert!(
+            sink.bytes().is_empty(),
+            "the fixture must actually buffer, or this test proves nothing"
+        );
+
+        w.flush().unwrap();
+
+        let out = sink.bytes();
+        assert_eq!(out.len(), TS_PACKET_BYTES, "one whole 188-byte TS packet");
+        assert_eq!(out[0], SYNC_BYTE, "ISO/IEC 13818-1 sync_byte 0x47");
+        assert_eq!(out, p.bytes(), "the bytes written are the packet's own");
+    }
 }
