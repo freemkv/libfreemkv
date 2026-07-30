@@ -195,8 +195,22 @@ impl<W: Write> TsMuxer<W> {
                         Codec::H264 => avcc_to_annex_b(cp),
                         _ => hvcc_to_annex_b(cp),
                     };
-                    if let Some(params) = params {
-                        annex_b.extend_from_slice(&params);
+                    match params {
+                        Some(params) => annex_b.extend_from_slice(&params),
+                        // A codec_private that EXISTS but will not parse means no
+                        // VPS/SPS/PPS reaches the stream and it is undecodable.
+                        // Arming the flag below is still right — retrying the same
+                        // bytes on the next keyframe cannot succeed — but it must
+                        // not be silent, which is what it was: the mux reported
+                        // success while emitting parameter-set-free video.
+                        None => tracing::warn!(
+                            track,
+                            codec = ?self.video_codec[track],
+                            codec_private_len = cp.len(),
+                            "bd-ts: codec_private did not parse as an avcC/hvcC \
+                             record; no parameter sets emitted and the video will \
+                             not decode"
+                        ),
                     }
                 }
                 self.params_written[track] = true;
