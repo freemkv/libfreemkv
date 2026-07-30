@@ -255,7 +255,8 @@ fn mlp_major_sync_header_size(ms: &[u8]) -> Option<usize> {
 /// 0x002D). The stored trailer is the last 2 header bytes; because
 /// MLP's checksum is byte-reversed relative to a standard CRC, a standard CRC of
 /// the header body XOR the little-endian word before the trailer must equal the
-/// trailer read big-endian.
+/// trailer read LITTLE-endian. (Comparing it big-endian was the bug this function
+/// was fixed for; the body and the inline note below are authoritative.)
 fn mlp_major_sync_crc_ok(ms: &[u8], mshdr: usize) -> bool {
     if mshdr < 4 || ms.len() < mshdr {
         return false;

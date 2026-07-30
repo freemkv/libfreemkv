@@ -184,7 +184,8 @@ pub const WRITE_PIPELINE_DEPTH: usize = 16;
 /// Channel depth for write-through pipelines. Each `send` fully
 /// drains before the next can enqueue. Use this when the producer
 /// must observe consumer side-effects (e.g. mapfile state) before
-/// emitting the next item. Currently used by `disc::patch`.
+/// emitting the next item. Used by `freemkv_engine::recovery::patch` — the
+/// recovery strategy moved to that crate in 1.6.0, so there is no `patch` here.
 pub const WRITE_THROUGH_DEPTH: usize = 1;
 
 /// Outcome of [`Sink::apply`]: either keep feeding items
