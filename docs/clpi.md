@@ -69,12 +69,22 @@ Each stream PID entry header (14 bytes):
 ```
 Offset  Size  Field
 ------  ----  -----
-0       2     Stream PID
-2       2     Reserved + EP stream type
-4       2     Number of coarse entries
-6       4     Number of fine entries (note: 32-bit, can be large)
-10      4     EP map start offset (relative to EP map start)
+2       2     stream_PID (byte-aligned)
+4       10    Bit-packed block, 80 bits total (see below)
 ```
+
+The stream PID entry is **not** byte-aligned past `stream_PID`. Bytes 4..14 are one
+80-bit packed field, read as a `u64` plus a trailing `u16`:
+
+Bits    Width  Field
+----    -----  -----
+0-9     10     reserved
+10-13   4      EP_stream_type
+14-29   16     num_EP_coarse
+30-47   18     num_EP_fine
+48-79   32     EP_map_start_address (relative to the EP map start)
+
+Note `num_EP_fine` is **18 bits**, not 32. See `parse_cpi` in `src/clpi.rs`.
 
 libfreemkv parses only the first stream (primary video), which is sufficient for sector-level seeking.
 

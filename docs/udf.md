@@ -114,7 +114,7 @@ The `read_filesystem()` function in `src/udf.rs` follows the pointer chain above
 2. Scans sectors 32-63 for the Partition Descriptor and Logical Volume Descriptor.
 3. If two partition maps exist and the second is Type 2, reads the metadata file ICB at partition_start to find metadata_start.
 4. Reads the FSD at metadata_start, extracts the root directory ICB LBA.
-5. Calls `read_directory()` recursively (max depth 3) to build the full file tree.
+5. Calls `read_directory()` recursively (max depth `MAX_DIR_DEPTH` = 8) to build the full file tree.
 
 Each directory read involves two sector reads: one for the ICB, then one or more for the directory data. File sizes are read from info_length in each file's ICB.
 

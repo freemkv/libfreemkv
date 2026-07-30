@@ -141,7 +141,7 @@ If your machine has a free SATA port, use it.
 
 freemkv uses a three-layer recovery model. See [`docs/rip-recovery.md`](docs/rip-recovery.md) for full details.
 
-- **Pass 1 (`freemkv_engine::recovery::copy`):** Fast sweep with 64 KB reads. On failure, zero-fills the block and skips forward. Writes a ddrescue-format mapfile for later retry.
+- **Pass 1 (`freemkv_engine::recovery::sweep`):** Fast sweep with 64 KB reads. On failure, zero-fills the block and skips forward. Writes a ddrescue-format mapfile for later retry.
 - **Pass 2+ (`freemkv_engine::recovery::patch`):** Targeted re-reads of bad ranges with a long 60-second timeout per CDB. The drive firmware performs its own ECC and laser power retries within that window.
 - **In-stream (DiscStream):** Adaptive batch halving -- reduces request size on failure to isolate bad sectors within a larger block.
 
