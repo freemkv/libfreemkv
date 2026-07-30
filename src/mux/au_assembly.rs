@@ -1001,4 +1001,237 @@ mod tests {
              after a large one: {hits} copies over 20 access units"
         );
     }
+
+    // ── AU-opener detection: the per-mode start-code rule ─────────────────
+    //
+    // `au_opener_from` is the SECOND implementation of a rule each codec parser
+    // also encodes (h264 `NAL_AUD`, hevc `NAL_AUD`, vc1 `SC_*`, mpeg2
+    // `PICTURE_CODE`/`SEQ_HEADER_CODE`/`GOP_CODE`). Two independent copies of one
+    // rule drift; these cases pin this copy to the normative byte values and to
+    // the codes that are explicitly NOT openers, so a drift shows up here.
+
+    /// The opener offset must be the position of the real start code, never a
+    /// fixed 0. A constant `Some(0)` makes every pre-sync run of junk bytes look
+    /// like the head of an access unit, so the first AU of every stream that does
+    /// not begin exactly on a start code is emitted with junk glued to its front.
+    #[test]
+    fn au_opener_from_locates_the_real_start_code_per_codec() {
+        // Junk that contains a start-code PREFIX but no opener suffix, so a
+        // scanner that stopped at `00 00 01` alone would answer wrongly.
+        let junk: &[u8] = &[0xFF, 0x00, 0x00, 0x01, 0x67, 0xAA];
+        let cases: &[(Mode, u8, &str)] = &[
+            // ISO/IEC 14496-10 §7.4.1: nal_unit_type 9 = access unit delimiter,
+            // and nal_ref_idc shall be 0 for it, so the header byte is 0x09.
+            (Mode::StartCode(0x09), 0x09, "H.264 AUD"),
+            // ITU-T H.265 §7.4.2.2: nal_unit_type 35 = AUD_NUT. The first NAL
+            // header byte is forbidden_zero_bit(1) | nal_unit_type(6) |
+            // nuh_layer_id MSB(1) = (35 << 1) = 0x46 on the base layer.
+            (Mode::StartCode(0x46), 0x46, "HEVC AUD"),
+            // SMPTE 421M Annex E BDU types.
+            (Mode::Vc1, VC1_SEQ, "VC-1 sequence header"),
+            (Mode::Vc1, VC1_ENTRY, "VC-1 entry point"),
+            (Mode::Vc1, VC1_FRAME, "VC-1 frame"),
+            // ISO/IEC 13818-2 §6.2.1 Table 6-1 start code values.
+            (Mode::Mpeg2, MP2_PICTURE, "MPEG-2 picture"),
+            (Mode::Mpeg2, MP2_SEQ, "MPEG-2 sequence header"),
+            (Mode::Mpeg2, MP2_GOP, "MPEG-2 GOP header"),
+        ];
+        for &(mode, code, what) in cases {
+            let mut buf = junk.to_vec();
+            buf.extend_from_slice(&[0x00, 0x00, 0x01, code, 0x5A]);
+            assert_eq!(
+                au_opener_from(mode, &buf, 0),
+                Some(junk.len()),
+                "{what}: opener must be found at the start code, not at 0"
+            );
+            // `from` must actually skip: searching past the only opener finds none.
+            assert_eq!(
+                au_opener_from(mode, &buf, junk.len() + 1),
+                None,
+                "{what}: the resume cursor must be honoured"
+            );
+        }
+    }
+
+    /// Start codes that are NOT access-unit openers must not be reported as one.
+    /// Treating a slice or an extension header as an AU start splits one coded
+    /// picture into several frames, each missing its picture header.
+    #[test]
+    fn non_opening_start_codes_are_not_au_openers() {
+        // ISO/IEC 13818-2 Table 6-1: slice (0x01..=0xAF), user data (0xB2),
+        // extension (0xB5), sequence end (0xB7) all appear INSIDE an access unit.
+        for code in [0x01u8, 0xAF, 0xB2, 0xB5, 0xB7] {
+            let buf = [0x00, 0x00, 0x01, code, 0x11, 0x22];
+            assert_eq!(
+                au_opener_from(Mode::Mpeg2, &buf, 0),
+                None,
+                "MPEG-2 start code {code:#04x} must not open an access unit"
+            );
+        }
+        // SMPTE 421M: slice (0x0B) and field (0x0C) BDUs belong to the frame
+        // already in progress; end-of-sequence (0x0A) opens nothing.
+        for code in [0x0Au8, 0x0B, 0x0C] {
+            let buf = [0x00, 0x00, 0x01, code, 0x11, 0x22];
+            assert_eq!(
+                au_opener_from(Mode::Vc1, &buf, 0),
+                None,
+                "VC-1 BDU {code:#04x} must not open an access unit"
+            );
+        }
+        // H.264: an SPS (7) / PPS (8) / IDR slice (5) is not the AU DELIMITER the
+        // StartCode mode splits on.
+        for code in [0x05u8, 0x67, 0x68] {
+            let buf = [0x00, 0x00, 0x01, code, 0x11, 0x22];
+            assert_eq!(au_opener_from(Mode::StartCode(0x09), &buf, 0), None);
+        }
+        // Passthrough never frames — the codec self-frames.
+        assert_eq!(
+            au_opener_from(Mode::Passthrough, &[0, 0, 1, 0x09, 0xAA], 0),
+            None
+        );
+    }
+
+    /// `au_opener_resumable` must return the true offset AND advance
+    /// `opener_pos` only over bytes that cannot hide a straddling start code.
+    /// A constant `Some(0)` short-circuits both.
+    #[test]
+    fn au_opener_resumable_reports_the_real_offset_and_resumes_safely() {
+        let mut a = AuAssembler::for_codec(Codec::H264);
+
+        // A junk run with no opener: None, and the cursor parks 3 bytes back so a
+        // start code split across the append boundary is still found.
+        a.buf.extend_from_slice(&[0xFFu8; 32]);
+        assert_eq!(a.au_opener_resumable(), None, "no opener in a junk run");
+        assert_eq!(
+            a.opener_pos, 29,
+            "resume 3 bytes back for a straddling code"
+        );
+
+        // Now append a start code that STRADDLES the previous end: the first three
+        // bytes of `00 00 01 09` land at offsets 29..32.
+        a.buf.truncate(29);
+        a.buf.extend_from_slice(&[0x00, 0x00, 0x01, 0x09, 0x77]);
+        assert_eq!(
+            a.au_opener_resumable(),
+            Some(29),
+            "a start code straddling the previous scan end must still be found"
+        );
+    }
+
+    /// After the pre-sync bytes are discarded, the emitted AU must take the
+    /// timing of the fragment that ACTUALLY opened it. `drop_marks_before` is
+    /// what retires the discarded fragment's marks; a no-op there stamps the
+    /// first real access unit with the PTS and source of bytes that were thrown
+    /// away — a whole-title A/V sync offset, since every later frame is timed
+    /// relative to it.
+    #[test]
+    fn discarded_pre_sync_marks_do_not_time_the_first_access_unit() {
+        let src = |b: u64| SourcePos {
+            byte: b,
+            ..Default::default()
+        };
+        let mut a = AuAssembler::for_codec(Codec::H264);
+
+        // Fragment 1: pre-sync junk, no start code. Carries its own PTS/source.
+        assert!(
+            a.push(&[0xFFu8; 24], Some(1_000), Some(900), Some(src(11)), false)
+                .is_empty()
+        );
+        // Fragment 2: the first real AU opener, with the timing that belongs to it.
+        assert!(
+            a.push(
+                &au(0x33, 40),
+                Some(2_000),
+                Some(1_900),
+                Some(src(22)),
+                false
+            )
+            .is_empty()
+        );
+        // Fragment 3: a second AU, closing the first.
+        let out = a.push(
+            &au(0x44, 40),
+            Some(3_000),
+            Some(2_900),
+            Some(src(33)),
+            false,
+        );
+
+        assert_eq!(out.len(), 1, "the first AU closes on the second opener");
+        assert_eq!(out[0].data, au(0x33, 40), "junk discarded, AU intact");
+        assert_eq!(
+            out[0].pts,
+            Some(2_000),
+            "the AU must take the opening fragment's PTS, not the discarded junk's"
+        );
+        assert_eq!(out[0].dts, Some(1_900), "same for DTS");
+        assert_eq!(
+            out[0].source.map(|s| s.byte),
+            Some(22),
+            "same for the source position used by the recovery map"
+        );
+
+        let tail = a.flush();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].pts, Some(3_000), "the second AU keeps its own PTS");
+    }
+
+    /// `for_codec` is the dispatch that decides whether a stream is REASSEMBLED
+    /// across PES fragments or passed straight through. Getting it wrong is
+    /// silent: an H.264/HEVC/VC-1 stream routed to `Passthrough` on a program
+    /// source emits one "frame" per PES fragment — a few hundred bytes of a
+    /// coded picture, framed as a whole access unit — and the output plays as
+    /// corruption, not as an error.
+    ///
+    /// Each mode is identified BEHAVIOURALLY (feed a two-AU stream in two halves
+    /// and see whether it reassembles), so the case cannot pass by matching a
+    /// constant.
+    #[test]
+    fn for_codec_routes_each_video_codec_to_its_reassembly_mode() {
+        // Buffering codecs: a stream split mid-AU must NOT emit until the second
+        // AU's opener arrives, and must then emit the FIRST AU whole.
+        let buffering: &[(Codec, u8)] = &[
+            (Codec::H264, 0x09), // ISO/IEC 14496-10 §7.4.1 AUD
+            (Codec::Hevc, 0x46), // ITU-T H.265 §7.4.2.2 AUD_NUT, (35 << 1)
+        ];
+        for &(codec, marker) in buffering {
+            let mut a = AuAssembler::for_codec(codec);
+            let mut unit = vec![0x00, 0x00, 0x01, marker];
+            unit.extend(std::iter::repeat_n(0x5Au8, 30));
+            // First half of AU 1: nothing complete yet.
+            assert!(
+                a.push(&unit[..20], Some(1), None, None, false).is_empty(),
+                "{codec:?} must buffer a partial access unit, not emit it"
+            );
+            assert!(
+                a.push(&unit[20..], None, None, None, false).is_empty(),
+                "{codec:?} must hold AU 1 until the next opener"
+            );
+            // AU 2's opener closes AU 1.
+            let out = a.push(&unit, Some(2), None, None, false);
+            assert_eq!(out.len(), 1, "{codec:?} emits exactly one AU");
+            assert_eq!(out[0].data, unit, "{codec:?} reassembles AU 1 whole");
+            assert_eq!(out[0].pts, Some(1), "{codec:?} carries the AU-start PTS");
+        }
+
+        // VC-1 buffers too, on its own boundary rule (no single AU delimiter).
+        let mut a = AuAssembler::for_codec(Codec::Vc1);
+        let frame = bdu(VC1_FRAME, 0x77, 30);
+        assert!(a.push(&frame, Some(1), None, None, false).is_empty());
+        assert_eq!(
+            a.push(&frame, Some(2), None, None, false).len(),
+            1,
+            "VC-1 emits AU 1 when the next frame BDU opens AU 2"
+        );
+
+        // Self-framing codecs pass each fragment through immediately — the same
+        // half-AU input that the buffering modes held back comes straight out.
+        for codec in [Codec::Mpeg2, Codec::Ac3, Codec::TrueHd, Codec::Pgs] {
+            let mut a = AuAssembler::for_codec(codec);
+            let out = a.push(&[0x00, 0x00, 0x01, 0x09, 0xAA], Some(7), None, None, false);
+            assert_eq!(out.len(), 1, "{codec:?} must pass through, not buffer");
+            assert_eq!(out[0].pts, Some(7));
+            assert!(a.flush().is_empty(), "{codec:?} buffers nothing at EOF");
+        }
+    }
 }
