@@ -1401,7 +1401,7 @@ fn lace_svint(d: &[u8]) -> Option<(i64, usize)> {
 ///
 /// The Lacing Head is "number of frames in the lace minus 1" on one octet, so
 /// the frame count is bounded by 256 and no allocation here is attacker-scaled.
-fn split_lacing(lacing: u8, body: &[u8]) -> Option<Vec<&[u8]>> {
+pub(crate) fn split_lacing(lacing: u8, body: &[u8]) -> Option<Vec<&[u8]>> {
     let (&count_minus_one, rest) = body.split_first()?;
     let n = count_minus_one as usize + 1;
 
