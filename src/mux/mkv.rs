@@ -617,6 +617,20 @@ pub struct MkvMuxer<W: Write + Seek> {
     cluster_pos: u64,
     cluster_size_pos: u64,
     cluster_ts_ticks: i64,
+    /// Reusable scratch buffer for assembling ONE BlockGroup before it is
+    /// written with a single `write_all`.
+    ///
+    /// The BlockGroup path is the hot one — the MPEG-2 parser stamps a per-frame
+    /// duration, so every I/P/B frame lands there, plus AC-3 audio and PGS
+    /// subtitles (~350k BlockGroups for a 90-minute feature). Building the
+    /// element in memory means its size is known before it reaches the file, so
+    /// no `start_master`/`end_master` back-patch is needed: that removes the
+    /// per-frame `stream_position()` + two `seek()`s, each of which flushed the
+    /// 4 MiB `BufWriter` (`BufWriter` does not override `stream_position`, so a
+    /// position query is `seek(Current(0))` = flush + lseek) and reset the
+    /// writeback pipeline's `last_flush_pos`. Kept on the muxer so the
+    /// allocation is made once, not per frame.
+    block_group_buf: Vec<u8>,
     base_pts_ticks: Option<i64>,
     /// Last block timecode (TimestampScale ticks, relative to base_pts) written
     /// PER TRACK, to enforce strictly-monotonic per-track timestamps —
@@ -1237,6 +1251,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             cluster_open: false,
             cluster_pos: 0,
             cluster_size_pos: 0,
+            block_group_buf: Vec::new(),
             cluster_ts_ticks: 0,
             base_pts_ticks: None,
             last_pts_ticks: std::collections::HashMap::new(),
@@ -1852,23 +1867,68 @@ impl<W: Write + Seek> MkvMuxer<W> {
         reference: Option<i64>,
         duration_ticks: u64,
     ) -> io::Result<()> {
+        let mut buf = std::mem::take(&mut self.block_group_buf);
+        buf.clear();
+        let res = Self::build_block_group(
+            &mut buf,
+            track_num,
+            relative_ts,
+            data,
+            reference,
+            Some(duration_ticks),
+            None,
+        )
+        .and_then(|()| self.writer.write_all(&buf));
+        // Hand the (now grown) scratch buffer back so the next frame reuses the
+        // allocation, on the error path too.
+        self.block_group_buf = buf;
+        res
+    }
+
+    /// Assemble a complete BlockGroup into `buf` — one `write_all` at the call
+    /// site, no `stream_position` and no `seek`.
+    ///
+    /// `additional` is `Some(dependent AU)` for the MVC path, which appends
+    /// `BlockAdditions > BlockMore { BlockAddID=2, BlockAdditional }`.
+    fn build_block_group(
+        buf: &mut Vec<u8>,
+        track_num: usize,
+        relative_ts: i16,
+        data: &[u8],
+        reference: Option<i64>,
+        duration_ticks: Option<u64>,
+        additional: Option<&[u8]>,
+    ) -> io::Result<()> {
         let (tv, tv_len) = track_vint(track_num);
         let track_vint = &tv[..tv_len];
+        // The 0x80 Keyframe flag is SimpleBlock-only; inside a BlockGroup Block
+        // it is reserved and MUST be 0 — keyframe-ness is signalled by the
+        // presence/absence of ReferenceBlock.
         let flags: u8 = 0x00;
         let block_size = track_vint.len() + 2 + 1 + data.len();
 
-        let bg_pos = ebml::start_master(&mut self.writer, ebml::BLOCK_GROUP)?;
-        ebml::write_id(&mut self.writer, ebml::BLOCK)?;
-        ebml::write_size(&mut self.writer, block_size as u64)?;
-        self.writer.write_all(track_vint)?;
-        self.writer.write_all(&relative_ts.to_be_bytes())?;
-        self.writer.write_all(&[flags])?;
-        self.writer.write_all(data)?;
-        ebml::write_uint(&mut self.writer, ebml::BLOCK_DURATION, duration_ticks)?;
-        if let Some(ref_off) = reference {
-            ebml::write_int(&mut self.writer, ebml::REFERENCE_BLOCK, ref_off)?;
+        let bg_pos = ebml::start_master_buf(buf, ebml::BLOCK_GROUP)?;
+        ebml::write_id(buf, ebml::BLOCK)?;
+        ebml::write_size(buf, block_size as u64)?;
+        buf.extend_from_slice(track_vint);
+        buf.extend_from_slice(&relative_ts.to_be_bytes());
+        buf.push(flags);
+        buf.extend_from_slice(data);
+        if let Some(dt) = duration_ticks {
+            ebml::write_uint(buf, ebml::BLOCK_DURATION, dt)?;
         }
-        ebml::end_master(&mut self.writer, bg_pos)?;
+        if let Some(ref_off) = reference {
+            ebml::write_int(buf, ebml::REFERENCE_BLOCK, ref_off)?;
+        }
+        if let Some(additional) = additional {
+            let adds_pos = ebml::start_master_buf(buf, ebml::BLOCK_ADDITIONS)?;
+            let more_pos = ebml::start_master_buf(buf, ebml::BLOCK_MORE)?;
+            ebml::write_uint(buf, ebml::BLOCK_ADD_ID, BLOCK_ADD_ID_VALUE_MVC)?;
+            ebml::write_binary(buf, ebml::BLOCK_ADDITIONAL, additional)?;
+            ebml::end_master_buf(buf, more_pos)?;
+            ebml::end_master_buf(buf, adds_pos)?;
+        }
+        ebml::end_master_buf(buf, bg_pos)?;
         Ok(())
     }
 
@@ -1886,36 +1946,20 @@ impl<W: Write + Seek> MkvMuxer<W> {
         reference: Option<i64>,
         duration_ticks: Option<u64>,
     ) -> io::Result<()> {
-        let (tv, tv_len) = track_vint(track_num);
-        let track_vint = &tv[..tv_len];
-        // The 0x80 Keyframe flag is SimpleBlock-only; inside a BlockGroup Block
-        // it is reserved and MUST be 0 — keyframe-ness is signalled by the
-        // presence/absence of ReferenceBlock.
-        let flags: u8 = 0x00;
-        let block_size = track_vint.len() + 2 + 1 + data.len();
-
-        let bg_pos = ebml::start_master(&mut self.writer, ebml::BLOCK_GROUP)?;
-        ebml::write_id(&mut self.writer, ebml::BLOCK)?;
-        ebml::write_size(&mut self.writer, block_size as u64)?;
-        self.writer.write_all(track_vint)?;
-        self.writer.write_all(&relative_ts.to_be_bytes())?;
-        self.writer.write_all(&[flags])?;
-        self.writer.write_all(data)?;
-        if let Some(dt) = duration_ticks {
-            ebml::write_uint(&mut self.writer, ebml::BLOCK_DURATION, dt)?;
-        }
-        if let Some(ref_off) = reference {
-            ebml::write_int(&mut self.writer, ebml::REFERENCE_BLOCK, ref_off)?;
-        }
-        // BlockAdditions → BlockMore { BlockAddID=2, BlockAdditional=dependent AU }.
-        let adds_pos = ebml::start_master(&mut self.writer, ebml::BLOCK_ADDITIONS)?;
-        let more_pos = ebml::start_master(&mut self.writer, ebml::BLOCK_MORE)?;
-        ebml::write_uint(&mut self.writer, ebml::BLOCK_ADD_ID, BLOCK_ADD_ID_VALUE_MVC)?;
-        ebml::write_binary(&mut self.writer, ebml::BLOCK_ADDITIONAL, additional)?;
-        ebml::end_master(&mut self.writer, more_pos)?;
-        ebml::end_master(&mut self.writer, adds_pos)?;
-        ebml::end_master(&mut self.writer, bg_pos)?;
-        Ok(())
+        let mut buf = std::mem::take(&mut self.block_group_buf);
+        buf.clear();
+        let res = Self::build_block_group(
+            &mut buf,
+            track_num,
+            relative_ts,
+            data,
+            reference,
+            duration_ticks,
+            Some(additional),
+        )
+        .and_then(|()| self.writer.write_all(&buf));
+        self.block_group_buf = buf;
+        res
     }
 }
 
