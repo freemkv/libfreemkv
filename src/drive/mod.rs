@@ -715,19 +715,19 @@ impl Drive {
     /// SCSI reset.
     ///
     /// `recovery=true` uses [`crate::scsi::READ_RECOVERY_TIMEOUT_MS`] (60 s,
-    /// matches sg_dd) for the `Disc::patch` pass; `recovery=false` uses
-    /// [`crate::scsi::READ_TIMEOUT_MS`] (10 s) for `Disc::copy`'s fast
+    /// matches sg_dd) for the `freemkv_engine::recovery::patch` pass; `recovery=false` uses
+    /// [`crate::scsi::READ_TIMEOUT_MS`] (10 s) for `freemkv_engine::recovery::copy`'s fast
     /// skip-forward sweep. Both budgets are generous enough that the drive
     /// can finish ECC recovery on a marginal sector — pre-0.13.21 this was
     /// 1.5 s on the fast path which forced the kernel mid-layer to time
     /// out and escalate while we waited anyway. On any failure returns
-    /// `Err(DiscRead)` immediately; orchestration (`Disc::patch` multi-pass,
+    /// `Err(DiscRead)` immediately; orchestration (`freemkv_engine::recovery::patch` multi-pass,
     /// `DiscStream` adaptive batch halving) handles retry policy.
     ///
     /// Inline retry phases (5× gentle + reset+reopen + 5× more) were
     /// removed in 0.13.6: on some USB-SATA bridges the inline reset wedged
     /// drive firmware without ever recovering a sector. The remaining
-    /// recovery layers (Disc::patch multi-pass, DiscStream batch halving)
+    /// recovery layers (freemkv_engine::recovery::patch multi-pass, DiscStream batch halving)
     /// do not touch the wedge-prone reset path.
     pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
         // Bulk path: FUA off (the drive cache IS the streaming throughput).

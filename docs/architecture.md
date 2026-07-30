@@ -101,7 +101,8 @@ After open:
 - `eject()` -- eject tray
 
 Recovery is layered above `Drive::read`, not inside it. Layer 1
-(`Disc::patch`) handles bad-range retry by replaying the ddrescue mapfile.
+(`freemkv_engine::recovery::patch`, in the engine crate) handles bad-range
+retry by replaying the ddrescue mapfile.
 Layer 3 (`DiscStream::fill_extents` adaptive batch sizer) handles in-loop
 request-size adaptation. Inline recovery (gentle retry → SCSI reset → retry)
 was removed in 0.13.6 — see [`rip-recovery.md`](rip-recovery.md) and
