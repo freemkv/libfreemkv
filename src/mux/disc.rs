@@ -512,16 +512,16 @@ impl DiscStream {
             // priority, mirroring the multipass sweep's transport-failure rule
             // in `read_error::handle_read_error`. The CLI/UX surfaces this so the
             // user power-cycles the drive (or switches to multipass recovery).
-            if let Some(e) = res.as_ref().err() {
-                if e.is_scsi_transport_failure() {
-                    let (status, sense) = extract_scsi_context(e);
-                    return Err(crate::error::Error::DiscRead {
-                        sector: lba as u64,
-                        status: Some(status),
-                        sense,
-                    }
-                    .into());
+            if let Some(e) = res.as_ref().err()
+                && e.is_scsi_transport_failure()
+            {
+                let (status, sense) = extract_scsi_context(e);
+                return Err(crate::error::Error::DiscRead {
+                    sector: lba as u64,
+                    status: Some(status),
+                    sense,
                 }
+                .into());
             }
 
             if (sectors as u32) <= align {
@@ -571,16 +571,16 @@ impl DiscStream {
                 // a dead bridge as a skippable unit and marching the whole disc
                 // at one bridge-recovery per probe (hard rule #2, "runs forever,
                 // no MKV"). Re-check `rec` and abort, mirroring line 442.
-                if let Some(e) = rec.as_ref().err() {
-                    if e.is_scsi_transport_failure() {
-                        let (status, sense) = extract_scsi_context(e);
-                        return Err(crate::error::Error::DiscRead {
-                            sector: lba as u64,
-                            status: Some(status),
-                            sense,
-                        }
-                        .into());
+                if let Some(e) = rec.as_ref().err()
+                    && e.is_scsi_transport_failure()
+                {
+                    let (status, sense) = extract_scsi_context(e);
+                    return Err(crate::error::Error::DiscRead {
+                        sector: lba as u64,
+                        status: Some(status),
+                        sense,
                     }
+                    .into());
                 }
 
                 // Recovery read also failed. Skip the WHOLE failed unit or bail.
@@ -725,29 +725,27 @@ impl crate::pes::Stream for DiscStream {
                     for pes in &demuxer.flush() {
                         if let Some((_, track)) =
                             self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid)
-                        {
-                            if let Some((_, parser)) =
+                            && let Some((_, parser)) =
                                 self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
-                            {
-                                let resync = &mut self.resync;
-                                let is_video = &self.is_video;
-                                let pending = &mut self.pending_frames;
-                                for frame in parser.parse(pes) {
-                                    // Same B1 gate — a concealed gap can leave a
-                                    // post-gap frame in the demuxer's final flush.
-                                    let emit = match resync.get_mut(*track) {
-                                        Some(gate) => gate.admit(
-                                            is_video.get(*track).copied().unwrap_or(false),
-                                            frame.discontinuity,
-                                            frame.keyframe,
-                                        ),
-                                        None => true,
-                                    };
-                                    if emit {
-                                        pending.push_back(crate::pes::PesFrame::from_codec_frame(
-                                            *track, frame,
-                                        ));
-                                    }
+                        {
+                            let resync = &mut self.resync;
+                            let is_video = &self.is_video;
+                            let pending = &mut self.pending_frames;
+                            for frame in parser.parse(pes) {
+                                // Same B1 gate — a concealed gap can leave a
+                                // post-gap frame in the demuxer's final flush.
+                                let emit = match resync.get_mut(*track) {
+                                    Some(gate) => gate.admit(
+                                        is_video.get(*track).copied().unwrap_or(false),
+                                        frame.discontinuity,
+                                        frame.keyframe,
+                                    ),
+                                    None => true,
+                                };
+                                if emit {
+                                    pending.push_back(crate::pes::PesFrame::from_codec_frame(
+                                        *track, frame,
+                                    ));
                                 }
                             }
                         }
@@ -1021,10 +1019,11 @@ impl crate::pes::Stream for DiscStream {
             return true;
         }
         for (idx, s) in self.title.streams.iter().enumerate() {
-            if let crate::disc::Stream::Video(v) = s {
-                if !v.secondary && self.codec_private(idx).is_none() {
-                    return false;
-                }
+            if let crate::disc::Stream::Video(v) = s
+                && !v.secondary
+                && self.codec_private(idx).is_none()
+            {
+                return false;
             }
         }
         true

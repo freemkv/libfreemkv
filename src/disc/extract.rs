@@ -165,13 +165,13 @@ impl Disc {
             .iter()
             .map(|p| p.size)
             .fold(0u64, |a, b| a.saturating_add(b));
-        if let Some(available) = available_space(dest) {
-            if available < required {
-                return Err(Error::DirInsufficientSpace {
-                    required,
-                    available,
-                });
-            }
+        if let Some(available) = available_space(dest)
+            && available < required
+        {
+            return Err(Error::DirInsufficientSpace {
+                required,
+                available,
+            });
         }
 
         // Create directories up-front so a leaf write never races a missing
@@ -388,12 +388,12 @@ fn plan_tree(
         let child_rel = host_rel.join(&safe);
         let child_disc = format!("{disc_path}/{}", entry.name);
         // Collision: two distinct disc paths → same host path.
-        if let Some(prev) = seen_hosts.insert(child_rel.clone(), child_disc.clone()) {
-            if prev != child_disc {
-                return Err(Error::DirNameCollision {
-                    host: child_rel.to_string_lossy().into_owned(),
-                });
-            }
+        if let Some(prev) = seen_hosts.insert(child_rel.clone(), child_disc.clone())
+            && prev != child_disc
+        {
+            return Err(Error::DirNameCollision {
+                host: child_rel.to_string_lossy().into_owned(),
+            });
         }
         if entry.is_dir {
             dirs.push(child_rel.clone());
@@ -756,10 +756,11 @@ fn is_windows_reserved(base: &str) -> bool {
     }
     let up = base.to_ascii_uppercase();
     for prefix in ["COM", "LPT"] {
-        if let Some(rest) = up.strip_prefix(prefix) {
-            if rest.len() == 1 && matches!(rest.as_bytes()[0], b'1'..=b'9') {
-                return true;
-            }
+        if let Some(rest) = up.strip_prefix(prefix)
+            && rest.len() == 1
+            && matches!(rest.as_bytes()[0], b'1'..=b'9')
+        {
+            return true;
         }
     }
     false

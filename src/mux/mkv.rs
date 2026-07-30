@@ -1583,10 +1583,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // track: the ReferenceBlock above is emitted for any video track, so a
         // single global slot produced cross-track references on a multi-video-track
         // title (MVC base + secondary view, or a disc with two angles).
-        if keyframe && is_video {
-            if let Some(slot) = self.last_video_keyframe_ticks.get_mut(track_idx) {
-                *slot = Some(pts_ticks);
-            }
+        if keyframe
+            && is_video
+            && let Some(slot) = self.last_video_keyframe_ticks.get_mut(track_idx)
+        {
+            *slot = Some(pts_ticks);
         }
         self.frame_count += 1;
 
@@ -1600,29 +1601,29 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // (it claims 5.1 on a 2.0 stream); the bitstream acmod is authoritative.
         // Only the first frame triggers it; the byte width is unchanged so the
         // patch is a single-byte in-place rewrite (then restore position).
-        if let Some(fixup) = self.ac3_channel_fixups.get_mut(&track_idx) {
-            if !fixup.corrected {
-                match super::codec::ac3::acmod_channels(data) {
-                    Some(actual) if actual > 0 => {
-                        if actual != fixup.claimed {
-                            tracing::warn!(
-                                target: "mux",
-                                "AC-3 track {track_idx}: IFO claimed {} channels but bitstream acmod says {}; trusting the bitstream (possible wrong-stream selection)",
-                                fixup.claimed,
-                                actual,
-                            );
-                            let here = self.writer.stream_position()?;
-                            self.writer
-                                .seek(std::io::SeekFrom::Start(fixup.value_offset))?;
-                            self.writer.write_all(&[actual])?;
-                            self.writer.seek(std::io::SeekFrom::Start(here))?;
-                        }
-                        fixup.corrected = true;
+        if let Some(fixup) = self.ac3_channel_fixups.get_mut(&track_idx)
+            && !fixup.corrected
+        {
+            match super::codec::ac3::acmod_channels(data) {
+                Some(actual) if actual > 0 => {
+                    if actual != fixup.claimed {
+                        tracing::warn!(
+                            target: "mux",
+                            "AC-3 track {track_idx}: IFO claimed {} channels but bitstream acmod says {}; trusting the bitstream (possible wrong-stream selection)",
+                            fixup.claimed,
+                            actual,
+                        );
+                        let here = self.writer.stream_position()?;
+                        self.writer
+                            .seek(std::io::SeekFrom::Start(fixup.value_offset))?;
+                        self.writer.write_all(&[actual])?;
+                        self.writer.seek(std::io::SeekFrom::Start(here))?;
                     }
-                    // Frame too short to carry the BSI bits — keep the passed
-                    // (IFO) value and try again on the next frame.
-                    _ => {}
+                    fixup.corrected = true;
                 }
+                // Frame too short to carry the BSI bits — keep the passed
+                // (IFO) value and try again on the next frame.
+                _ => {}
             }
         }
 
@@ -1767,14 +1768,12 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // with a 1-byte size VINT covering the remaining 19 bytes occupies
         // exactly 1 + 1 + 19 = 21 bytes, overwriting the entry in place without
         // shifting any following element.
-        if !have_cues {
-            if let Some(entry_pos) = self.cues_seek_entry_pos {
-                self.writer.seek(std::io::SeekFrom::Start(entry_pos))?;
-                ebml::write_id(&mut self.writer, ebml::VOID)?;
-                // 19 = 21-byte entry minus the Void ID (1) and size (1) bytes.
-                ebml::write_size(&mut self.writer, 19)?;
-                self.writer.write_all(&[0u8; 19])?;
-            }
+        if !have_cues && let Some(entry_pos) = self.cues_seek_entry_pos {
+            self.writer.seek(std::io::SeekFrom::Start(entry_pos))?;
+            ebml::write_id(&mut self.writer, ebml::VOID)?;
+            // 19 = 21-byte entry minus the Void ID (1) and size (1) bytes.
+            ebml::write_size(&mut self.writer, 19)?;
+            self.writer.write_all(&[0u8; 19])?;
         }
         self.writer.seek(std::io::SeekFrom::End(0))?;
 

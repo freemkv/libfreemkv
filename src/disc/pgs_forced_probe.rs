@@ -42,7 +42,7 @@ const CHUNK_SECTORS: u16 = 1023;
 
 // The alignment requirement above is enforced, not just described.
 const _: () = assert!(
-    CHUNK_SECTORS as u32 % crate::aacs::content::ALIGNED_UNIT_SECTORS == 0,
+    (CHUNK_SECTORS as u32).is_multiple_of(crate::aacs::content::ALIGNED_UNIT_SECTORS),
     "probe chunks must be a whole number of AACS aligned units"
 );
 
@@ -393,12 +393,11 @@ fn verdicts(evidence: &HashMap<u16, TrackEvidence>, conclusive: bool) -> HashMap
 /// from the map was never observed and keeps its vendor-derived flag.
 fn apply_verdicts(title: &mut DiscTitle, verdicts: &HashMap<u16, bool>) {
     for s in &mut title.streams {
-        if let Stream::Subtitle(sub) = s {
-            if sub.codec == Codec::Pgs {
-                if let Some(&forced) = verdicts.get(&sub.pid) {
-                    sub.forced = forced;
-                }
-            }
+        if let Stream::Subtitle(sub) = s
+            && sub.codec == Codec::Pgs
+            && let Some(&forced) = verdicts.get(&sub.pid)
+        {
+            sub.forced = forced;
         }
     }
 }

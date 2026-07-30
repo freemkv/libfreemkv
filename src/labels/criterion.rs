@@ -36,10 +36,10 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 
     // Stream number mapping from playbackconfig.xml
     let mut stream_map: HashMap<String, u16> = HashMap::new();
-    if let Some(pc_data) = super::read_jar_file(reader, udf, "playbackconfig.xml") {
-        if let Ok(pc_text) = std::str::from_utf8(&pc_data) {
-            parse_playback_config(pc_text, &mut stream_map);
-        }
+    if let Some(pc_data) = super::read_jar_file(reader, udf, "playbackconfig.xml")
+        && let Ok(pc_text) = std::str::from_utf8(&pc_data)
+    {
+        parse_playback_config(pc_text, &mut stream_map);
     }
 
     let stream_nums = assign_stream_numbers(&stream_infos, &stream_map);
@@ -189,14 +189,13 @@ fn parse_playback_config(text: &str, map: &mut HashMap<String, u16>) {
             if let (Some(stream_id_str), Some(info_id)) = (
                 xml::text(block, "StreamID"),
                 xml::text(block, "StreamInfo_ID"),
-            ) {
-                if let Ok(stream_num) = stream_id_str.parse::<u16>() {
-                    // Stream numbers are 1-based per the apply_labels
-                    // contract; a mapped 0 is unmatchable and silently
-                    // drops the label. Skip it rather than store it.
-                    if stream_num != 0 {
-                        map.insert(info_id, stream_num);
-                    }
+            ) && let Ok(stream_num) = stream_id_str.parse::<u16>()
+            {
+                // Stream numbers are 1-based per the apply_labels
+                // contract; a mapped 0 is unmatchable and silently
+                // drops the label. Skip it rather than store it.
+                if stream_num != 0 {
+                    map.insert(info_id, stream_num);
                 }
             }
             from = end;

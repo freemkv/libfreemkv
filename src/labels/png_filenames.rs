@@ -41,10 +41,10 @@ pub fn parse(_reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult>
 fn labels_from_filenames(names: &[String]) -> Vec<StreamLabel> {
     let mut seen: Vec<&'static str> = Vec::new();
     for name in names {
-        if let Some(code) = filename_lang(name) {
-            if !seen.contains(&code) {
-                seen.push(code);
-            }
+        if let Some(code) = filename_lang(name)
+            && !seen.contains(&code)
+        {
+            seen.push(code);
         }
     }
     seen.into_iter()

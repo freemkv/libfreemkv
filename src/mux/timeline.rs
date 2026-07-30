@@ -140,14 +140,14 @@ impl TimelineContinuity {
             // overflow: a panic out of the public `Stream::write` path in an
             // overflow-checked build, and in release a wrap to the opposite sign
             // that fires the straggler clamp on essentially every passive frame.
-            if let Some(high) = self.high_ns {
-                if mapped > high.saturating_add(DISCONTINUITY_BACKSTEP_NS) {
-                    let prev_mapped = raw_pts_ns.saturating_add(self.prev_offset_ns);
-                    if prev_mapped <= high
-                        && prev_mapped >= high.saturating_sub(DISCONTINUITY_BACKSTEP_NS)
-                    {
-                        return prev_mapped;
-                    }
+            if let Some(high) = self.high_ns
+                && mapped > high.saturating_add(DISCONTINUITY_BACKSTEP_NS)
+            {
+                let prev_mapped = raw_pts_ns.saturating_add(self.prev_offset_ns);
+                if prev_mapped <= high
+                    && prev_mapped >= high.saturating_sub(DISCONTINUITY_BACKSTEP_NS)
+                {
+                    return prev_mapped;
                 }
             }
             return mapped;

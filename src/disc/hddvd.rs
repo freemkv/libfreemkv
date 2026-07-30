@@ -305,12 +305,12 @@ fn collect_es(
             }
         }
         PRIVATE_STREAM_1 => {
-            if let Some(sub) = pkt.sub_stream_id {
-                if (0xC0..=0xC7).contains(&sub) {
-                    let slot = audio.entry(sub).or_default();
-                    if slot.len() < EVO_ES_SAMPLE_CAP {
-                        slot.extend_from_slice(&pkt.data);
-                    }
+            if let Some(sub) = pkt.sub_stream_id
+                && (0xC0..=0xC7).contains(&sub)
+            {
+                let slot = audio.entry(sub).or_default();
+                if slot.len() < EVO_ES_SAMPLE_CAP {
+                    slot.extend_from_slice(&pkt.data);
                 }
             }
         }

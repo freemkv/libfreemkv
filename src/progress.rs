@@ -233,7 +233,7 @@ impl Heartbeat {
     /// iterations. Otherwise identical to [`tick`](Heartbeat::tick).
     pub fn tick_cpu(&mut self, pos: u64, total: u64) -> bool {
         self.cpu_counter = self.cpu_counter.wrapping_add(1);
-        if self.cpu_counter % 256 != 0 {
+        if !self.cpu_counter.is_multiple_of(256) {
             return false;
         }
         self.tick(pos, total)

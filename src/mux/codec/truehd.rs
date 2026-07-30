@@ -344,49 +344,49 @@ impl CodecParser for TrueHdParser {
         // mid-AU would snap that AU's PTS backward/forward and break the
         // monotonic +AU_DURATION_NS cadence (A/V drift). Once the buffer is empty
         // the next PES legitimately begins a new AU and seeds the base.
-        if self.buf.is_empty() {
-            if let Some(pts) = pes.pts {
-                // Resync to the authoritative PES PTS. TrueHD AUs are a fixed
-                // sample count (40 @ 48 kHz), so the per-AU `+AU_DURATION_NS`
-                // cadence is sample-accurate — more so than the disc's per-PES
-                // PTS, which carries the source muxer's own rounding jitter.
-                //
-                // Two distinct backward steps must be handled OPPOSITELY:
-                //
-                // 1. Small backward jitter (sub-second PES rounding): when the
-                //    buffer empties exactly on a PES boundary and that PES's PTS
-                //    lands a few ticks *below* the running cadence, an
-                //    unconditional reset would set the next AU's timestamp below
-                //    the AU just emitted, producing non-monotonic block
-                //    timestamps a muxer rejects. CLAMP to the running position so
-                //    output stays strictly monotonic.
-                //
-                // 2. Large backward step (> DISCONTINUITY_BACKSTEP_NS): this is a
-                //    clip-boundary PTS reset — the title's clips are read as one
-                //    concatenated stream and a non-seamless boundary resets the
-                //    source PES PTS near zero. This is NOT jitter and must NOT be
-                //    clamped: clamping strands the audio at the previous clip's
-                //    tail cadence, so when `TimelineContinuity` later bumps the
-                //    global offset for the new epoch (driven by the video
-                //    back-jump) the stranded-high audio PTS is flung ~a whole
-                //    clip past the frontier, producing the non-monotonic
-                //    audio-DTS band on multi-clip titles (Dune: Part Two, Top
-                //    Gun). ADOPT the raw reset so the per-track raw PTS that
-                //    reaches `TimelineContinuity` carries the true boundary, and
-                //    the corrector rebases it exactly as it already does for the
-                //    DTS / AC-3 parsers (which never clamp). Same threshold the
-                //    timeline corrector uses to classify a discontinuity.
-                //
-                // A genuine forward gap/discontinuity is always adopted by the
-                // `.max()`.
-                let new = pts_to_ns(pts);
-                if new < self.next_pts_ns - DISCONTINUITY_BACKSTEP_NS {
-                    // Clip-boundary reset: take the raw PTS, restart the cadence.
-                    self.next_pts_ns = new;
-                } else {
-                    // Within-clip jitter (or forward progression): stay monotonic.
-                    self.next_pts_ns = self.next_pts_ns.max(new);
-                }
+        if self.buf.is_empty()
+            && let Some(pts) = pes.pts
+        {
+            // Resync to the authoritative PES PTS. TrueHD AUs are a fixed
+            // sample count (40 @ 48 kHz), so the per-AU `+AU_DURATION_NS`
+            // cadence is sample-accurate — more so than the disc's per-PES
+            // PTS, which carries the source muxer's own rounding jitter.
+            //
+            // Two distinct backward steps must be handled OPPOSITELY:
+            //
+            // 1. Small backward jitter (sub-second PES rounding): when the
+            //    buffer empties exactly on a PES boundary and that PES's PTS
+            //    lands a few ticks *below* the running cadence, an
+            //    unconditional reset would set the next AU's timestamp below
+            //    the AU just emitted, producing non-monotonic block
+            //    timestamps a muxer rejects. CLAMP to the running position so
+            //    output stays strictly monotonic.
+            //
+            // 2. Large backward step (> DISCONTINUITY_BACKSTEP_NS): this is a
+            //    clip-boundary PTS reset — the title's clips are read as one
+            //    concatenated stream and a non-seamless boundary resets the
+            //    source PES PTS near zero. This is NOT jitter and must NOT be
+            //    clamped: clamping strands the audio at the previous clip's
+            //    tail cadence, so when `TimelineContinuity` later bumps the
+            //    global offset for the new epoch (driven by the video
+            //    back-jump) the stranded-high audio PTS is flung ~a whole
+            //    clip past the frontier, producing the non-monotonic
+            //    audio-DTS band on multi-clip titles (Dune: Part Two, Top
+            //    Gun). ADOPT the raw reset so the per-track raw PTS that
+            //    reaches `TimelineContinuity` carries the true boundary, and
+            //    the corrector rebases it exactly as it already does for the
+            //    DTS / AC-3 parsers (which never clamp). Same threshold the
+            //    timeline corrector uses to classify a discontinuity.
+            //
+            // A genuine forward gap/discontinuity is always adopted by the
+            // `.max()`.
+            let new = pts_to_ns(pts);
+            if new < self.next_pts_ns - DISCONTINUITY_BACKSTEP_NS {
+                // Clip-boundary reset: take the raw PTS, restart the cadence.
+                self.next_pts_ns = new;
+            } else {
+                // Within-clip jitter (or forward progression): stay monotonic.
+                self.next_pts_ns = self.next_pts_ns.max(new);
             }
         }
 

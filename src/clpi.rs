@@ -328,10 +328,8 @@ fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
                     }
                 }
                 // PG, IG: coding_type + 3-byte language [+ char_code for PG]
-                c::PG | c::IG => {
-                    if sci.len() >= 4 {
-                        language = String::from_utf8_lossy(&sci[1..4]).to_string();
-                    }
+                c::PG | c::IG if sci.len() >= 4 => {
+                    language = String::from_utf8_lossy(&sci[1..4]).to_string();
                 }
                 _ => {}
             }
