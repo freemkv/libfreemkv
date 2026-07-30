@@ -1283,6 +1283,128 @@ mod tests {
         }
     }
 
+    /// A forensic range does NOT start on an aligned-unit boundary. Its start LBA
+    /// comes from a source-packet number — `start_spn * 192` put through
+    /// `clip_byte_to_lba` (`mux/resolve.rs`) — and 192-byte packets have no
+    /// relationship to the 3-sector aligned unit, so `range_start % 3` is
+    /// whatever the disc says.
+    ///
+    /// That makes `unit_ix = (lba - range_start) / us` load-bearing in both of
+    /// its operations, and the existing coverage used a range starting exactly
+    /// on the extent's first unit, where several wrong formulas agree with the
+    /// right one by arithmetic accident.
+    ///
+    /// Getting the parity wrong is not a crash. It reads and decrypts the
+    /// ALTERNATE variant's half of a forensic segment: the units this disc's
+    /// key does not open decrypt to garbage, and the units it does open are
+    /// skipped. AACS 2.1 forensic marking is exactly the mechanism that makes
+    /// the two halves different, so a phase inversion is silent — it produces a
+    /// full-length rip carrying the wrong variant.
+    #[test]
+    fn read_plan_phase_parity_is_measured_from_an_unaligned_range_start() {
+        use crate::disc::Extent;
+        let us = (aacs::content::ALIGNED_UNIT_LEN / 2048) as u32; // 3
+
+        // Case A — range_start is itself unaligned (1001 % 3 == 2) and the extent
+        // begins on it, so unit offsets are 0, 3, 6, ... Under this shape the
+        // formula `(lba + range_start) / us` shifts every index by an ODD amount
+        // and inverts the kept half.
+        let ext = vec![Extent {
+            start_lba: 1001,
+            sector_count: 12,
+        }];
+        let map = AacsKeyMap::from_ranges_phased(vec![(1001, 1013, 5, Phase::Even)]);
+        assert_eq!(
+            map.read_plan(&ext, us),
+            vec![
+                Extent {
+                    start_lba: 1001,
+                    sector_count: 3
+                }, // ix 0, even
+                Extent {
+                    start_lba: 1007,
+                    sector_count: 3
+                }, // ix 2, even
+            ],
+            "unit index must be measured as (lba - range_start), so the kept \
+             units are the even-indexed ones counting from the range start"
+        );
+
+        // Case B — the extent begins one unit-remainder away from the range start
+        // (1001 - 1000 = 1), so offsets are 1, 4, 7, 10. Here `(lba - range_start)
+        // * us` inverts the halves instead: the division is what maps a byte
+        // offset onto a unit index, and multiplying happens to preserve parity
+        // only when the offset is already a multiple of the unit size.
+        let ext = vec![Extent {
+            start_lba: 1001,
+            sector_count: 12,
+        }];
+        let map = AacsKeyMap::from_ranges_phased(vec![(1000, 1013, 5, Phase::Even)]);
+        assert_eq!(
+            map.read_plan(&ext, us),
+            vec![
+                Extent {
+                    start_lba: 1001,
+                    sector_count: 3
+                }, // (1001-1000)/3 = 0, even
+                Extent {
+                    start_lba: 1007,
+                    sector_count: 3
+                }, // (1007-1000)/3 = 2, even
+            ],
+            "the offset must be DIVIDED by the unit size to become a unit index"
+        );
+    }
+
+    /// An extent whose last whole unit is an alternate-phase unit must still drop
+    /// it. The tail guard exists for a REMNANT shorter than a unit — bytes with
+    /// no following unit to desync — and an extent ending exactly on a unit
+    /// boundary has no remnant at all.
+    ///
+    /// With the guard widened to `remaining <= us`, the final unit of every
+    /// extent bypasses the phase gate and is read unconditionally. On a forensic
+    /// segment that lands at an extent end, that is one alternate-variant unit
+    /// pulled into the rip and decrypted with a key that does not open it.
+    #[test]
+    fn read_plan_gates_the_last_whole_unit_of_an_extent_not_just_the_remnant() {
+        use crate::disc::Extent;
+        let us = (aacs::content::ALIGNED_UNIT_LEN / 2048) as u32; // 3
+
+        // Two whole units, no remnant. ix 0 is even (kept), ix 1 is odd (dropped)
+        // and it is the LAST thing in the extent.
+        let ext = vec![Extent {
+            start_lba: 1000,
+            sector_count: 6,
+        }];
+        let map = AacsKeyMap::from_ranges_phased(vec![(1000, 1006, 5, Phase::Even)]);
+        assert_eq!(
+            map.read_plan(&ext, us),
+            vec![Extent {
+                start_lba: 1000,
+                sector_count: 3
+            }],
+            "the trailing odd-phase unit is a whole unit and must be dropped; the \
+             short-tail guard is for a remnant SMALLER than a unit"
+        );
+
+        // And the remnant case the guard is actually for: 4 sectors = one whole
+        // unit plus a 1-sector tail. The tail is ordinary content and is kept
+        // even though the unit before it was dropped.
+        let ext = vec![Extent {
+            start_lba: 1000,
+            sector_count: 4,
+        }];
+        let map = AacsKeyMap::from_ranges_phased(vec![(1000, 1004, 5, Phase::Odd)]);
+        assert_eq!(
+            map.read_plan(&ext, us),
+            vec![Extent {
+                start_lba: 1003,
+                sector_count: 1
+            }],
+            "a sub-unit remnant is ordinary content and is always read"
+        );
+    }
+
     /// Phase::Even → only even-index units in the range are decrypted; the odd
     /// (alternate variant) half is left BYTE-FOR-BYTE as ciphertext for the muxer.
     #[test]
