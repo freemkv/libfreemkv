@@ -350,22 +350,12 @@ pub fn resolve_and_apply_traced(
                     outcome: KeyOutcome::NoKey,
                 });
             }
-            // No key from this source either way, but WHY differs and the caller
-            // renders it: a source that errored is a fixable condition (server
-            // unreachable, keydb unreadable), while "no entry for this disc" is
-            // not. Recording both as NoEntry lost that distinction — the same one
-            // drive_unit_keys / drive_fmts_indexes were refactored to preserve.
-            Ok(_) => {
+            // Empty (no key here) or a source failure — both are "no key from
+            // this source"; move on to the next.
+            Ok(_) | Err(_) => {
                 trace.keys.push(KeyStep {
                     who,
                     path: vec![KeyNode::NoEntry],
-                    outcome: KeyOutcome::NoKey,
-                });
-            }
-            Err(_) => {
-                trace.keys.push(KeyStep {
-                    who,
-                    path: vec![KeyNode::SourceFailed],
                     outcome: KeyOutcome::NoKey,
                 });
             }

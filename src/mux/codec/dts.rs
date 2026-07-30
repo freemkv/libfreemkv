@@ -690,13 +690,12 @@ fn dts_core_duration_ns(data: &[u8]) -> u64 {
 const DTS_PCMBLOCK_SAMPLES: u32 = 32;
 const DTS_SUBBAND_SAMPLES: u32 = 8;
 /// Number of LEGAL `AMODE` (channel-arrangement) codes. The 6-bit AMODE field
-/// (ETSI TS 102 114 §5.3.1) defines 16 channel arrangements, codes 0-15, of
-/// which 10-15 are the 6/7/8-channel layouts; codes 16-63 are
-/// reserved/user-defined and undecodable. A frame is dropped only when
-/// `audio_mode >= DTS_AMODE_COUNT` (i.e. a truly reserved 16-63 code); dropping a
-/// legal 10-15 multichannel core would silence recoverable audio. The per-AMODE
-/// channel counts live in `DTS_AMODE_CH` in `mux/mp4/audio.rs`, cross-checked
-/// against the speaker masks in `DTS_AMODE_LAYOUT` by an invariant test.
+/// (ETSI TS 102 114 §5.3.1) has 16 defined channel arrangements, codes 0-15;
+/// only 16-63 are reserved/user-defined and undecodable. ffmpeg's
+/// `ff_dca_channels[16] = {1,2,2,2,2,3,3,4,4,5,6,6,6,7,8,8}` confirms all 16 are
+/// decodable — codes 10-15 are the 6/7/8-channel layouts. A frame is dropped
+/// only when `audio_mode >= DTS_AMODE_COUNT` (i.e. a truly reserved 16-63 code);
+/// dropping a legal 10-15 multichannel core would silence recoverable audio.
 const DTS_AMODE_COUNT: u32 = 16;
 const DTS_LFE_FLAG_INVALID: u32 = 3;
 
