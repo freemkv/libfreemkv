@@ -169,11 +169,11 @@ impl SgIoTransport {
 
         if dev_name.starts_with("sr") {
             let sg_dir = format!("/sys/class/block/{}/device/scsi_generic", dev_name);
-            if let Ok(mut entries) = std::fs::read_dir(&sg_dir) {
-                if let Some(Ok(entry)) = entries.next() {
-                    let sg_name = entry.file_name();
-                    return std::path::PathBuf::from(format!("/dev/{}", sg_name.to_string_lossy()));
-                }
+            if let Ok(mut entries) = std::fs::read_dir(&sg_dir)
+                && let Some(Ok(entry)) = entries.next()
+            {
+                let sg_name = entry.file_name();
+                return std::path::PathBuf::from(format!("/dev/{}", sg_name.to_string_lossy()));
             }
         }
 

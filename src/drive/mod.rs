@@ -902,45 +902,39 @@ impl Drive {
                 // 2026-05-08) dd via /dev/sr0 recovers ~50% of bad
                 // sectors that a single-shot SG_IO READ misses.
                 #[cfg(target_os = "linux")]
-                if recovery {
-                    if let Some(fd) = self.block_dev_fd {
-                        let len = count as usize * 2048;
-                        if buf.len() >= len {
-                            let offset = lba as i64 * 2048;
-                            // Drop kernel cache for this region so we get
-                            // a fresh device read, not stale page-cache
-                            // data from a prior successful neighbour read.
-                            let _ = unsafe {
-                                libc::posix_fadvise(
-                                    fd,
-                                    offset,
-                                    len as i64,
-                                    libc::POSIX_FADV_DONTNEED,
-                                )
-                            };
-                            let n = unsafe {
-                                libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, len, offset)
-                            };
-                            if n == len as isize {
-                                tracing::info!(
-                                    target: "freemkv::drive",
-                                    lba,
-                                    count,
-                                    bytes = len,
-                                    "Drive::read recovered via /dev/sr0 pread fallback"
-                                );
-                                return Ok(len);
-                            }
-                            tracing::debug!(
-                                target: "freemkv::drive",
-                                lba,
-                                count,
-                                pread_ret = n as i64,
-                                errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                                "/dev/sr0 pread fallback also failed"
-                            );
-                        }
+                if recovery
+                    && let Some(fd) = self.block_dev_fd
+                    && buf.len() >= count as usize * 2048
+                {
+                    let len = count as usize * 2048;
+                    let offset = lba as i64 * 2048;
+                    // Drop kernel cache for this region so we get
+                    // a fresh device read, not stale page-cache
+                    // data from a prior successful neighbour read.
+                    let _ = unsafe {
+                        libc::posix_fadvise(fd, offset, len as i64, libc::POSIX_FADV_DONTNEED)
+                    };
+                    let n = unsafe {
+                        libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, len, offset)
+                    };
+                    if n == len as isize {
+                        tracing::info!(
+                            target: "freemkv::drive",
+                            lba,
+                            count,
+                            bytes = len,
+                            "Drive::read recovered via /dev/sr0 pread fallback"
+                        );
+                        return Ok(len);
                     }
+                    tracing::debug!(
+                        target: "freemkv::drive",
+                        lba,
+                        count,
+                        pread_ret = n as i64,
+                        errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                        "/dev/sr0 pread fallback also failed"
+                    );
                 }
 
                 Err(Error::DiscRead {
