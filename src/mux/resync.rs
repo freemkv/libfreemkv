@@ -100,7 +100,13 @@ mod tests {
         // Gap arrives on the next frame (a P referencing lost data) → drop it
         // and every inter frame until the next keyframe.
         assert!(!g.admit(true, true, false), "post-gap P dropped");
+        assert!(
+            g.is_armed(),
+            "the gate reports itself armed WHILE it is dropping — this is what \
+             the consumer reads to know the stream is in a resync hole"
+        );
         assert!(!g.admit(true, false, false), "still dropping (no key yet)");
+        assert!(g.is_armed(), "still armed mid-run");
         assert!(!g.admit(true, false, false));
         assert_eq!(g.dropped_in_run(), 3);
         // Next keyframe resyncs and is emitted.

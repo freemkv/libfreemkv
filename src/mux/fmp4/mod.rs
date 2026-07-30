@@ -630,6 +630,93 @@ mod tests {
         assert_eq!(&body[8..12], b"vide", "handler_type must be 'vide'");
     }
 
+    /// `mdhd` (§8.4.2), `vmhd` (§12.1.2) and `dinf`/`dref` (§8.7.1–2) are all
+    /// mandatory in a video track's media tree, and each fixes field values a
+    /// player relies on. None of them is read back by this crate — the init
+    /// segment is only ever written — so nothing else constrains them.
+    #[test]
+    fn mdhd_vmhd_and_dinf_carry_the_values_the_spec_fixes() {
+        let buf = init_segment();
+        let boxes = walk_boxes(&buf);
+        let (_, moov_start, moov_size) = boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
+        let moov_payload = &buf[moov_start + 8..moov_start + moov_size];
+        let trak = child(moov_payload, b"trak").expect("trak");
+        let mdia = child(&trak[8..], b"mdia").expect("mdia");
+        let minf = child(&mdia[8..], b"minf").expect("minf");
+
+        // ── mdhd. Version 0 layout: vflags(4) creation(4) modification(4)
+        // timescale(4) duration(4) language(2) pre_defined(2) = 20 bytes.
+        let mdhd = child(&mdia[8..], b"mdhd").expect("mdia must carry mdhd");
+        let body = &mdhd[8..];
+        assert_eq!(body[0], 0, "mdhd version 0 (32-bit times)");
+        assert_eq!(
+            body.len(),
+            24,
+            "version-0 mdhd body: vflags(4) creation(4) modification(4) timescale(4) duration(4) language(2) pre_defined(2)"
+        );
+        let media_ts = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+        assert_ne!(
+            media_ts, 0,
+            "every fragment's tfdt is expressed in this timescale; zero is a divide-by-zero"
+        );
+        // The mvhd timescale is the movie clock; this single-track init has one
+        // clock, so the media timescale must agree with it rather than carry an
+        // independent copy that can drift.
+        let mvhd = child(moov_payload, b"mvhd").expect("mvhd");
+        let mvhd_body = &mvhd[8..];
+        let movie_ts =
+            u32::from_be_bytes([mvhd_body[12], mvhd_body[13], mvhd_body[14], mvhd_body[15]]);
+        assert_eq!(media_ts, movie_ts, "media clock must match the movie clock");
+
+        // language: ISO 639-2/T packed as three 5-bit values, bit 15 = 0 (§8.4.2).
+        let packed = u16::from_be_bytes([body[20], body[21]]);
+        assert_eq!(packed & 0x8000, 0, "language pad bit must be 0");
+        let lang: String = (0..3)
+            .map(|i| (((packed >> (10 - 5 * i)) & 0x1F) as u8 + 0x60) as char)
+            .collect();
+        assert_eq!(lang, "und", "unknown language is 'und', not empty or 'eng'");
+
+        // ── vmhd. §12.1.2 fixes flags to 1 and the stub picks the neutral
+        // compositing mode: graphicsmode 0 (copy) with a zero opcolor.
+        let vmhd = child(&minf[8..], b"vmhd").expect("minf must carry vmhd");
+        let body = &vmhd[8..];
+        assert_eq!(body[0], 0, "vmhd version 0");
+        assert_eq!(
+            u32::from_be_bytes([0, body[1], body[2], body[3]]),
+            1,
+            "vmhd flags must be 1"
+        );
+        assert_eq!(body.len(), 12, "vmhd body: vflags(4) mode(2) opcolor(6)");
+        assert_eq!(
+            u16::from_be_bytes([body[4], body[5]]),
+            0,
+            "graphicsmode copy"
+        );
+        assert_eq!(&body[6..12], &[0u8; 6], "opcolor is black");
+
+        // ── dinf > dref > 'url ' with flags 1: the media lives in this same
+        // file/segment, so no external location follows (§8.7.2).
+        let dinf = child(&minf[8..], b"dinf").expect("minf must carry dinf");
+        let dref = child(&dinf[8..], b"dref").expect("dinf must carry dref");
+        let body = &dref[8..];
+        assert_eq!(
+            u32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+            1,
+            "dref entry_count"
+        );
+        let url = child(&body[8..], b"url ").expect("dref must carry a 'url ' entry");
+        assert_eq!(
+            u32::from_be_bytes([0, url[9], url[10], url[11]]),
+            1,
+            "url flags=1 means self-contained"
+        );
+        assert_eq!(
+            url.len(),
+            12,
+            "a self-contained url is header(8) + vflags(4) and no location string"
+        );
+    }
+
     #[test]
     fn wrap_box_size_includes_header() {
         // §4.2: a box's size field counts the full box including the 8-byte

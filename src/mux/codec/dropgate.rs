@@ -200,6 +200,31 @@ mod tests {
         assert!(!t.is_poisoned());
     }
 
+    /// The poison verdict is a RATIO — verified drops against every AU seen — so
+    /// the kept count is half of it. `does_not_poison_a_mostly_good_track` above
+    /// records its keeps AFTER the single drop, and `maybe_poison` only runs
+    /// inside `record_drop`, so the keeps are never in the denominator when the
+    /// verdict is actually computed: that test passes even with the kept count
+    /// never incremented. Interleaving them puts the kept count on the critical
+    /// path, where losing it turns the ratio into "verified drops vs verified
+    /// drops" — always >50% — and silently discards a healthy track.
+    #[test]
+    fn interleaved_keeps_are_in_the_poison_denominator() {
+        let mut t = DropTally::new("test");
+        // 2 kept per 1 dropped, well past the minimum-AU gate: a third of the
+        // track is undecodable, which is bad but nowhere near the >50% threshold.
+        for _ in 0..(TRACK_VERDICT_MIN_AUS * 3) {
+            t.record_kept();
+            t.record_kept();
+            t.record_drop(0, 1000, 512, "bad");
+            assert!(
+                !t.is_poisoned(),
+                "33% dropped must never poison, at any point in the run"
+            );
+        }
+        assert_eq!(t.dropped_frames(), TRACK_VERDICT_MIN_AUS * 3);
+    }
+
     #[test]
     fn collateral_drops_never_poison_the_track() {
         // A TrueHD resync-forward run collaterally drops a long burst of AUs, but

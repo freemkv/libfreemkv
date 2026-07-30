@@ -752,6 +752,70 @@ mod tests {
         }
     }
 
+    /// The substream count and the substream-directory size are the two numbers
+    /// that position `mlp_parity_ok`'s check window over the AU header. Every
+    /// other fixture in this module uses the degenerate shape — one substream,
+    /// no extraword — so neither function's real behaviour was ever exercised:
+    /// a constant answer agreed with all of them, and would then mis-window the
+    /// parity check on the multi-substream AUs that carry 7.1 and Atmos, judging
+    /// clean audio corrupt (or corrupt audio clean).
+    #[test]
+    fn mlp_num_substreams_is_the_top_nibble_of_major_sync_byte_16() {
+        // Byte 16 of the major sync: top nibble is num_substreams, bottom nibble
+        // is a different field, so it must not leak into the answer.
+        for n in 0..16u8 {
+            let mut ms = vec![0u8; 17];
+            ms[16] = (n << 4) | 0x0F;
+            assert_eq!(
+                mlp_num_substreams(&ms),
+                Some(n),
+                "num_substreams is the high nibble only"
+            );
+        }
+        // Real counts: 1 substream for 2.0/5.1 core-only, 4 for the 7.1/Atmos
+        // layouts this crate has to mux.
+        let mut ms = vec![0u8; 20];
+        ms[16] = 0x40;
+        assert_eq!(mlp_num_substreams(&ms), Some(4));
+
+        // A major sync too short to contain byte 16 yields no answer — never a
+        // defaulted count, which would arm the parity check against garbage.
+        assert_eq!(mlp_num_substreams(&[0u8; 16]), None);
+    }
+
+    #[test]
+    fn mlp_substr_header_size_counts_the_extraword_entries() {
+        // Directory entry: 2 bytes, plus 2 more when the entry's top bit
+        // (extraword) is set. Build a 4-substream directory that mixes both.
+        const HDR: usize = 4;
+        let mut au = vec![0xAAu8; HDR];
+        au.extend_from_slice(&[0x00, 0x11]); // plain          → 2
+        au.extend_from_slice(&[0x80, 0x22, 0x01, 0x02]); // extraword → 4
+        au.extend_from_slice(&[0x00, 0x33]); // plain          → 2
+        au.extend_from_slice(&[0x80, 0x44, 0x03, 0x04]); // extraword → 4
+        au.extend_from_slice(&[0xFFu8; 8]); // payload past the directory
+        assert_eq!(
+            mlp_substr_header_size(&au, HDR, 4),
+            Some(12),
+            "2 + 4 + 2 + 4"
+        );
+
+        // Same AU, fewer declared substreams → only that many entries counted.
+        assert_eq!(mlp_substr_header_size(&au, HDR, 1), Some(2));
+        assert_eq!(mlp_substr_header_size(&au, HDR, 2), Some(6));
+        assert_eq!(mlp_substr_header_size(&au, HDR, 0), Some(0));
+
+        // An all-plain directory is 2 bytes per substream.
+        let plain = vec![0x00u8; HDR + 8];
+        assert_eq!(mlp_substr_header_size(&plain, HDR, 4), Some(8));
+
+        // A directory that runs past the AU has no answer: the parity window
+        // would otherwise be placed over bytes that are not there.
+        let truncated = &au[..HDR + 9];
+        assert_eq!(mlp_substr_header_size(truncated, HDR, 4), None);
+        assert_eq!(mlp_substr_header_size(&plain, HDR, 5), None);
+    }
+
     fn make_truehd_unit(size_bytes: usize) -> Vec<u8> {
         let words = size_bytes / 2;
         let mut data = vec![0u8; size_bytes];
@@ -994,6 +1058,15 @@ mod tests {
         frames.extend(parser.flush());
         assert_eq!(frames.len(), 2, "the parity-broken AU is dropped");
         assert_eq!(parser.dropped_frames(), 1);
+        // The drop is a SILENCE GAP, and its length is what the CLI reports as
+        // lost audio. One TrueHD access unit is 40 samples; at the 48 kHz base
+        // rate that is 40/48000 s = 833_333 ns. A count without a duration (or a
+        // duration that ignores the AU rate) understates or invents the loss.
+        assert_eq!(
+            parser.dropped_duration_ns(),
+            833_333,
+            "one dropped AU = 40 samples at 48 kHz"
+        );
     }
 
     #[test]

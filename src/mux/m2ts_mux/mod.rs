@@ -646,6 +646,64 @@ fn mpegts_crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    /// Golden vector for an audio PES header (ISO/IEC 13818-1 §2.4.3.7).
+    ///
+    /// Audio and video differ in TWO fields that no downstream check in this
+    /// module distinguishes: the stream_id, and whether `PES_packet_length` is
+    /// filled in or left at the unbounded 0x0000 form. A receiver reads the
+    /// length to find the end of the access unit without scanning for the next
+    /// start code, so an audio PES that borrowed the video form (or emitted a
+    /// stub header) still tiles into valid-looking 188-byte packets and only
+    /// fails inside a decoder.
+    #[test]
+    fn audio_pes_header_is_byte_exact_and_bounded_unlike_video() {
+        let es = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        // PTS = 90000 ticks = exactly 1 s at 90 kHz. Encoded across 5 bytes as
+        // '0010' | PTS[32..30] | marker, PTS[29..15] | marker, PTS[14..0] | marker.
+        let pes = build_audio_pes(90_000, &es);
+        assert_eq!(
+            pes,
+            vec![
+                0x00, 0x00, 0x01, // packet_start_code_prefix
+                0xBD, // stream_id = private_stream_1 (BD audio)
+                0x00, 0x0C, // PES_packet_length = 3 flag bytes + 5 PTS + 4 ES
+                0x80, // '10' MPEG-2 marker, no scrambling/priority
+                0x80, // PTS_DTS_flags = '10' (PTS only)
+                0x05, // PES_header_data_length = 5
+                0x21, 0x00, 0x05, 0xBF, 0x21, // PTS 90000 with marker bits
+                0xDE, 0xAD, 0xBE, 0xEF, // the access unit, verbatim
+            ]
+        );
+
+        // The video builder over the SAME inputs differs in exactly the two
+        // fields above — proving neither is incidental.
+        let vid = build_video_pes(90_000, &es);
+        assert_eq!(vid[3], 0xE0, "video uses the video stream_id");
+        assert_eq!(
+            &vid[4..6],
+            &[0x00, 0x00],
+            "video length is the unbounded form (a video PES can exceed u16)"
+        );
+        assert_eq!(&vid[6..], &pes[6..], "everything after the length matches");
+
+        // A different PTS must move the timestamp bytes and nothing else.
+        let later = build_audio_pes(180_000, &es);
+        assert_eq!(&later[..9], &pes[..9], "header up to the PTS is unchanged");
+        assert_ne!(&later[9..14], &pes[9..14], "the PTS bytes change");
+        assert_eq!(&later[14..], &es, "the access unit is unchanged");
+
+        // An access unit too large for the u16 length field falls back to the
+        // unbounded form rather than writing a truncated (wrapped) length.
+        let big = vec![0x5Au8; u16::MAX as usize - 7];
+        let big_pes = build_audio_pes(90_000, &big);
+        assert_eq!(
+            &big_pes[4..6],
+            &[0x00, 0x00],
+            "8 + es.len() overflows u16 → unbounded length, never a wrapped one"
+        );
+        assert_eq!(&big_pes[14..], &big[..]);
+    }
+
     /// All emitted bytes must align to 188-byte packet boundaries and
     /// every packet must start with `0x47`.
     fn assert_ts_well_formed(buf: &[u8]) {

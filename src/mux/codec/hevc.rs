@@ -1447,6 +1447,81 @@ mod tests {
         assert_eq!(h.max_display_mastering_luminance, 10_000_000);
     }
 
+    /// `num_extra_slice_header_bits` (H.265 §7.3.2.3) is a PPS field, and the
+    /// `slice_reserved_flag[i]` bits it counts sit BETWEEN
+    /// `slice_pic_parameter_set_id` and `slice_type` in the slice segment header
+    /// (§7.3.6.1). Every existing fixture used a PPS with the field == 0, so the
+    /// skip was never exercised: a parser that ignored the field entirely agreed
+    /// with all of them, and would then read `slice_type` from the wrong bit
+    /// offset on any real stream that sets it — mislabelling every picture's
+    /// coding type.
+    #[test]
+    fn nonzero_num_extra_slice_header_bits_shifts_the_slice_type_offset() {
+        use super::super::coding::CodingType;
+
+        // PPS body bits: pps_id ue=0 ('1'), sps_id ue=0 ('1'),
+        // dependent_slice_segments_enabled_flag 0, output_flag_present_flag 0,
+        // num_extra_slice_header_bits u(3).
+        let pps_body = |num_extra: u8| 0b1100_0000u8 | (num_extra << 1);
+        assert_eq!(pps_body(0), 0xC0, "matches the existing zero-extra fixture");
+        assert_eq!(pps_body(3), 0xC6);
+
+        let pps_nal = |num_extra: u8| {
+            let mut v = hevc_nal_header(NAL_PPS).to_vec();
+            v.push(pps_body(num_extra));
+            v
+        };
+        for n in 0..8u8 {
+            assert_eq!(
+                hevc_num_extra_slice_header_bits(&pps_nal(n)),
+                Some(n as u32),
+                "PPS must yield the value it encodes, for every u(3) code point"
+            );
+        }
+        // A PPS truncated to just its 2-byte NAL header carries no field to read,
+        // so the answer is absent — never a defaulted zero.
+        assert_eq!(
+            hevc_num_extra_slice_header_bits(&hevc_nal_header(NAL_PPS)),
+            None
+        );
+
+        // Slice segment header for a non-IRAP VCL NAL (TRAIL_R, type 1):
+        // first_slice_segment_in_pic_flag 1, slice_pic_parameter_set_id ue=0
+        // ('1'), then THREE reserved bits set to 101 (deliberately not zero, so a
+        // parser that reads them instead of skipping them cannot agree), then
+        // slice_type ue(v) = '011' → 2 → I.
+        let slice_body = 0b1_1_101_011u8;
+        assert_eq!(slice_body, 0xEB);
+
+        let nal = |t: u8, body: u8| {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(t));
+            v.push(body);
+            v
+        };
+        let mut data = nal(NAL_PPS, pps_body(3));
+        data.extend_from_slice(&nal(1, slice_body));
+        let frames = HevcParser::new().parse(&make_pes(data, Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].coding.expect("PictureInfo").coding_type(),
+            CodingType::I,
+            "with num_extra=3 the reserved bits are skipped and slice_type reads 2 (I)"
+        );
+
+        // Control: the SAME slice bytes under a PPS declaring num_extra=0 land on
+        // a different slice_type — proving the PPS field, not the slice bytes,
+        // decides the offset.
+        let mut data0 = nal(NAL_PPS, pps_body(0));
+        data0.extend_from_slice(&nal(1, slice_body));
+        let frames0 = HevcParser::new().parse(&make_pes(data0, Some(0)));
+        assert_eq!(
+            frames0[0].coding.expect("PictureInfo").coding_type(),
+            CodingType::B,
+            "num_extra=0 reads slice_type from bit 2 instead → 0 (B)"
+        );
+    }
+
     #[test]
     fn hevc_populates_measured_coding_type_and_source() {
         use super::super::coding::CodingType;

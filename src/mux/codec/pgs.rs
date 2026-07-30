@@ -341,6 +341,40 @@ mod tests {
         assert_eq!(display_set_is_forced(&[]), None);
     }
 
+    /// `observed()` is the probe's "did I actually see any PGS content?" signal.
+    /// When it is false the track's forced state is UNKNOWN, and the probe leaves
+    /// whatever flag the disc's own metadata supplied alone; when it is true the
+    /// probe overwrites that flag with its own verdict. A tracker that always
+    /// claims to have observed something therefore lets an unread or undecrypted
+    /// subtitle track — where `is_forced()` is vacuously false — overwrite a
+    /// correct vendor "forced" flag with "not forced".
+    #[test]
+    fn observed_stays_false_until_a_real_display_set_is_seen() {
+        let mut t = ForcedTracker::new();
+        assert!(!t.observed(), "a fresh tracker has seen nothing");
+        assert!(!t.is_forced(), "and has no verdict to give");
+
+        // Blocks that carry no display set must not count as observation: a clear
+        // PCS (zero composition objects), a non-PCS segment, a truncated PCS, and
+        // an empty frame.
+        let mut clear = pcs_display(false);
+        clear[PCS_NUM_OBJECTS_OFFSET] = 0;
+        let mut ods = pcs_display(true);
+        ods[0] = 0x15;
+        for block in [clear, ods, pcs_display(true)[..15].to_vec(), Vec::new()] {
+            t.observe(&block);
+            assert!(
+                !t.observed(),
+                "a block with no display set leaves the verdict unknown"
+            );
+        }
+
+        // The first real display set is what flips it.
+        t.observe(&pcs_display(true));
+        assert!(t.observed());
+        assert!(t.is_forced(), "the only display set seen was forced");
+    }
+
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
         PesPacket {
             source: None,

@@ -988,6 +988,65 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
 mod tests {
     use super::*;
 
+    /// The PSI scanner walks a BD-TS buffer one BYTE at a time until it finds a
+    /// packet boundary, so `is_resync_point` is the only thing standing between
+    /// it and a stray 0x47 in a TP_extra_header or a payload. Latching onto one
+    /// puts every subsequent field read 1..191 bytes out of phase, so the PID and
+    /// PUSI bits it then decodes belong to nothing — the scanner either invents a
+    /// stream or loses the real PMT. Accepting every offset (the shape a constant
+    /// `true` takes) guarantees it latches on the first offset it tries.
+    #[test]
+    fn resync_requires_a_corroborating_follower_not_just_one_sync_byte() {
+        const P: usize = BD_SOURCE_PACKET_BYTES;
+
+        // Two well-formed source packets: sync at +4 of each.
+        let mut two = vec![0u8; 2 * P];
+        two[4] = SYNC_BYTE;
+        two[P + 4] = SYNC_BYTE;
+        assert!(
+            is_resync_point(&two, 0),
+            "a real boundary: sync here and 192 bytes on"
+        );
+
+        // No sync byte at all → never a boundary.
+        two[4] = 0x00;
+        assert!(!is_resync_point(&two, 0));
+        two[4] = SYNC_BYTE;
+
+        // Sync here, but the next 192-spaced position is not a sync byte: this is
+        // a 0x47 that happens to sit inside a header or payload, not a boundary.
+        two[P + 4] = 0x00;
+        assert!(
+            !is_resync_point(&two, 0),
+            "an uncorroborated 0x47 must be rejected"
+        );
+        two[P + 4] = SYNC_BYTE;
+
+        // The concrete desync the corroboration prevents: a 0x47 byte sitting in
+        // the payload of the first packet. Its own "sync" test passes, and the
+        // scanner must still refuse the offset.
+        let stray = 60usize;
+        two[stray + 4] = SYNC_BYTE;
+        assert!(
+            !is_resync_point(&two, stray),
+            "a stray 0x47 inside a payload is not a packet boundary"
+        );
+        // ...while the genuine boundaries either side still are.
+        assert!(is_resync_point(&two, 0));
+
+        // A lone trailing packet has no follower to corroborate, so it is accepted
+        // on its own sync byte — otherwise the last packet of every buffer would
+        // be unreachable.
+        let mut one = vec![0u8; P];
+        one[4] = SYNC_BYTE;
+        assert!(is_resync_point(&one, 0), "last packet in the buffer");
+        one[4] = 0x00;
+        assert!(
+            !is_resync_point(&one, 0),
+            "...but it still needs its own sync byte"
+        );
+    }
+
     #[test]
     fn test_parse_timestamp() {
         // Example: PTS = 0 → encoded as 21 00 01 00 01

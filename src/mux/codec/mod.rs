@@ -284,6 +284,63 @@ mod tests {
         }
     }
 
+    /// A codec parser's `codec_private()` feeds `DiscStream::codec_private`,
+    /// which the MKV muxer turns directly into the track's `CodecPrivate`
+    /// element (RFC 9559 §5.1.4.1.24): `Some(bytes)` writes an element holding
+    /// exactly those bytes, `None` omits the element entirely. The two are NOT
+    /// interchangeable — a zero-length `CodecPrivate` asserts that the codec's
+    /// initialisation data IS empty, which is not true of any codec, and a
+    /// one-byte one asserts a config no decoder can parse.
+    ///
+    /// The gating parsers (ADTS, MPEG audio, FLAC) and the passthrough parser
+    /// extract no configuration at all: they validate and forward frames whose
+    /// configuration is carried in band (ADTS headers, MPEG-1 audio frame
+    /// headers, FLAC frame headers) or supplied by the source container. Having
+    /// derived nothing, the only truthful answer they can give is "absent" —
+    /// any `Some` would be a value they invented. Nothing else in the suite
+    /// distinguished the two, so each of these impls could have returned a
+    /// fabricated `Some` and produced a malformed track header unnoticed.
+    #[test]
+    fn parsers_that_derive_no_config_report_absent_never_an_empty_codec_private() {
+        // Codecs whose parsers do no configuration extraction, paired with a
+        // payload that is a REAL frame of that codec so the gate takes its
+        // keep-path (a rejected frame proves nothing about the config answer).
+        let cases: [(Codec, Vec<u8>); 5] = [
+            // ADTS: syncword FFF1, MPEG-4 AAC-LC, 44.1 kHz, stereo, 7-byte frame.
+            (Codec::Aac, vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0xBF, 0xFC]),
+            // MPEG-1 Layer II, 44.1 kHz, 128 kbit/s, stereo.
+            (Codec::Mp2, vec![0xFF, 0xFD, 0x70, 0x00, 0x00, 0x00]),
+            // MPEG-1 Layer III, 44.1 kHz, 128 kbit/s, stereo.
+            (Codec::Mp3, vec![0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00]),
+            // Not a FLAC frame sync, so the gate passes it through unvalidated —
+            // still the keep path, and still no configuration derived.
+            (Codec::Flac, vec![0x01, 0x02, 0x03, 0x04]),
+            // Opus rides the all-keyframe passthrough parser.
+            (Codec::Opus, vec![0x78, 0x01, 0x02, 0x03]),
+        ];
+
+        for (codec, payload) in cases {
+            let mut parser = parser_for_codec(codec, None, false);
+            assert_eq!(
+                parser.codec_private(),
+                None,
+                "{codec:?}: no config before any frame"
+            );
+            parser.parse(&pes(Some(0), payload.clone()));
+            parser.parse(&pes(Some(90_000), payload));
+            assert_eq!(
+                parser.codec_private(),
+                None,
+                "{codec:?}: this parser derives no config, so it must report the \
+                 CodecPrivate as ABSENT — an empty or invented Some would be \
+                 written into the track header as if it were real"
+            );
+            // Flushing at end of stream must not conjure one either.
+            parser.flush();
+            assert_eq!(parser.codec_private(), None, "{codec:?}: after flush");
+        }
+    }
+
     #[test]
     fn audio_codecs_emit_keyframe_frames() {
         // PES = frame audio: every frame is independently decodable → keyframe.
