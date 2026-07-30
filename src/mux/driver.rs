@@ -170,6 +170,11 @@ pub struct MuxOptions {
     /// every stream (video is always kept). Applied to the title before the
     /// demux pipeline is built, so track headers, `codec_privates`, and frame
     /// routing all follow the pruned list. See [`crate::StreamSelection`].
+    ///
+    /// Applies to the `Iso`, `Session` and `Live` inputs. It does NOT apply to
+    /// [`MuxInput::Url`], which builds its demux inside `input()` — a Url-source
+    /// caller sets `InputOptions::selection` instead. Setting this field for a Url
+    /// input has no effect.
     pub selection: crate::StreamSelection,
     /// Per-frame write-pipeline send deadline.
     ///
@@ -402,6 +407,16 @@ pub fn mux_stream(
             mut keys,
             key_map,
         } => {
+            // Prune to the selected streams, exactly as the Iso and Session arms
+            // do. Without this a caller's audio/subtitle selection was silently
+            // ignored on the live-drive path while the field's own doc said it was
+            // applied. Only touches the stream list, so the extent-keyed ciphertext
+            // sampling in `resolve_inline_base_map` below is unaffected. No-op for
+            // the default All/All.
+            let mut title = title;
+            opts.selection
+                .apply(&mut title)
+                .map_err(std::io::Error::from)?;
             // The map installed BEFORE reads begin. Two sources:
             // - A caller-supplied `key_map` (autorip's FMTS gate resolved the
             //   forensic per-segment map and passes it here) is used VERBATIM —
@@ -687,6 +702,21 @@ fn drive_mux(
     // CODEC_PRIVATE — a structurally-invalid MKV the zero-output guard does not
     // catch. Refuse.
     if !stream.headers_ready() {
+        // Re-check halt FIRST. On the prefetch-highway path a halt landing while
+        // the pump is blocked in a read can end the stream as `Ok(None)` rather
+        // than `Err(Halted)`, so the loop breaks with headers unresolved through no
+        // fault of the data. Reporting that as MkvInvalid tells the consumer its
+        // disc is malformed and skips the stop-preserves-staging path.
+        if halt.is_cancelled() {
+            return Ok(MuxOutcome {
+                completed: false,
+                output_opened: false,
+                bytes_written: 0,
+                errors: stream.errors(),
+                lost_bytes: stream.lost_bytes(),
+                streams: 0,
+            });
+        }
         return Err(Error::MkvInvalid.into());
     }
 
