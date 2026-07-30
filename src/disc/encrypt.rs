@@ -987,6 +987,87 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // Minimal hand-rolled `tracing::Subscriber` used ONLY to capture the
+    // `has_volume_id` boolean field off the `bus_key_unavailable` warn event.
+    // That field is diagnostic-only (never read back into control flow), so
+    // it is otherwise invisible to `#[test]` assertions on the returned
+    // `Result`. No `tracing-subscriber` dev-dependency exists in this crate,
+    // hence the manual `Subscriber` impl instead of a capture layer.
+    // ---------------------------------------------------------------
+
+    struct HasVidCapture(std::sync::Mutex<Option<bool>>);
+
+    impl tracing::Subscriber for HasVidCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct V<'a>(&'a HasVidCapture);
+            impl tracing::field::Visit for V<'_> {
+                fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                    if field.name() == "has_volume_id" {
+                        *self.0.0.lock().unwrap() = Some(value);
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    _field: &tracing::field::Field,
+                    _value: &dyn std::fmt::Debug,
+                ) {
+                }
+            }
+            event.record(&mut V(self));
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// The `bus_key_unavailable` warn's `has_volume_id` field must report
+    /// the ACTUAL presence of a non-zero Volume ID on the handshake (encrypt.rs
+    /// `h.volume_id != [0u8; 16]`), not its negation. This is diagnostic-only
+    /// (it does not affect the returned `Err(AacsBusKeyUnavailable)` itself,
+    /// which is why a plain `Result` assertion can't distinguish `!=` from
+    /// `==` here) but it is the ONLY signal an operator has, from this log
+    /// line, for whether the handshake actually carried a VID when bus
+    /// encryption could not be removed — a `==` flip would silently invert it.
+    #[test]
+    fn resolve_vid_only_bus_key_gate_reports_true_has_volume_id_when_vid_nonzero() {
+        let capture = std::sync::Arc::new(HasVidCapture(std::sync::Mutex::new(None)));
+        let dispatch = tracing::Dispatch::new(capture.clone());
+        let (mut disc, udf) = disc_with_cert(0x01, true);
+        let hs = HandshakeResult {
+            volume_id: [0x11u8; 16], // non-zero: a VID WAS present
+            read_data_key: None,
+            read_data_key_err: None,
+            drive_unlocked: false,
+        };
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        // Tracing caches per-callsite "any subscriber interested?" the FIRST
+        // time a callsite fires; another test in this suite may already have
+        // hit the exact same `warn!` call site under the process default
+        // (no-op) dispatch, permanently caching "not interested" for it. Force
+        // recomputation now that our capturing dispatch is installed, or the
+        // event is silently dropped before it reaches our `Visit` — flaky only
+        // under full-suite (parallel, ordering-dependent) runs, not in isolation.
+        tracing::callsite::rebuild_interest_cache();
+        let err = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs))
+            .expect_err("bus-encrypted, no read_data_key must still hard-error");
+        drop(guard);
+        tracing::callsite::rebuild_interest_cache();
+        assert!(matches!(err, Error::AacsBusKeyUnavailable));
+        assert_eq!(
+            *capture.0.lock().unwrap(),
+            Some(true),
+            "has_volume_id must be true: the handshake's volume_id was non-zero"
+        );
+    }
+
+    // ---------------------------------------------------------------
     // Tests: read_vid_oem (response parsing). The OEM path issues a
     // READ_BUFFER CDB and parses a 36-byte response; we can't easily
     // fixture a real Drive, but the response-shape contract (3-byte

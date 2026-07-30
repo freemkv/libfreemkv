@@ -566,4 +566,33 @@ mod tests {
         let (title, _, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Real Title");
     }
+
+    /// `is_bdmt_filename` must recognize the `bdmt_<lang>.xml` convention
+    /// and reject everything else — it drives `detect`'s directory scan.
+    /// Mutation: stub the return to a constant `true`/`false` → every
+    /// directory listing (or none) would match regardless of filename.
+    #[test]
+    fn is_bdmt_filename_matches_convention_only() {
+        assert!(is_bdmt_filename("bdmt_eng.xml"));
+        assert!(is_bdmt_filename("BDMT_FRA.XML"));
+        assert!(!is_bdmt_filename("bdmt_engl.xml"));
+        assert!(!is_bdmt_filename("index.bdmv"));
+        assert!(!is_bdmt_filename("foo.xml"));
+    }
+
+    /// Spec: "Disc 1 of 1" (a single-disc release whose bdmt XML still
+    /// carries `<di:numSets>1</di:numSets>`) is a valid, non-nonsensical
+    /// pair — `total < 1` must reject only `total == 0`, not `total == 1`.
+    /// Mutation: `total < 1` -> `total == 1` or `total <= 1` would reject
+    /// this legitimate (1, 1) pair as if it were malformed.
+    #[test]
+    fn disc_set_allows_single_disc_release() {
+        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+  <di:name>Film</di:name>
+  <di:discNumber>1</di:discNumber>
+  <di:numSets>1</di:numSets>
+</discInfo>"#;
+        let (_, _, set) = parse_bdmt_xml(xml).unwrap();
+        assert_eq!(set, Some((1, 1)));
+    }
 }

@@ -1292,4 +1292,240 @@ mod tests {
         assert!(s.forced, "inconclusive run keeps the vendor flag");
         assert!(cache.is_empty(), "inconclusive run is not memoised");
     }
+
+    // ── mutation-triage additions ───────────────────────────────────────────
+
+    /// Mutation guard for the `sub.codec == Codec::Pgs` match guard (probe's PID
+    /// collection): only PGS subtitle tracks are ever probed by content — DVD
+    /// VobSub forced comes from the IFO/vendor path, never from sniffing PGS
+    /// segments over non-PGS bytes. If the guard were dropped, a non-PGS
+    /// subtitle stream would be treated as a PGS PID and the reader would be
+    /// touched even though there is nothing PGS to probe.
+    #[test]
+    fn non_pgs_subtitle_codec_is_excluded_from_the_probe() {
+        let mut reader = EndlessReader { served: 0 };
+        let mut title = pgs_title(0x1200, true);
+        title.streams = vec![Stream::Subtitle(SubtitleStream {
+            pid: 0x1200,
+            codec: Codec::DvdSub,
+            language: "eng".into(),
+            forced: true,
+            qualifier: LabelQualifier::None,
+            codec_data: None,
+        })];
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: u32::MAX,
+        }];
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+        assert_eq!(
+            reader.served, 0,
+            "a non-PGS subtitle codec must never be probed as if it were PGS"
+        );
+    }
+
+    /// Mutation guard for `stalled > STALL_RETRY_LIMIT`: exactly
+    /// `STALL_RETRY_LIMIT` retries are allowed (`STALL_RETRY_LIMIT + 1` total
+    /// read attempts) before the stalled run gives up. Weakening the
+    /// comparison to `==` or `>=` still stops the spin (so a `<=` bound alone
+    /// does not catch it), but one retry early — after `STALL_RETRY_LIMIT`
+    /// attempts instead of `STALL_RETRY_LIMIT + 1`.
+    #[test]
+    fn stalled_retries_stop_at_exactly_the_limit() {
+        let pid = 0x1200u16;
+        let mut reader = ShortReader {
+            batch: 1, // never a whole aligned unit
+            served: Vec::new(),
+        };
+        let mut title = pgs_title(pid, true);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: CHUNK_SECTORS as u32,
+        }];
+        let mut cache = ForcedProbeCache::new();
+        probe_and_set_forced(&mut reader, &mut title, &mut cache, None);
+
+        assert_eq!(
+            reader.served.len() as u32,
+            STALL_RETRY_LIMIT + 1,
+            "expected exactly STALL_RETRY_LIMIT + 1 read attempts before giving up, got {}",
+            reader.served.len()
+        );
+    }
+
+    /// `STALL_RETRY_LIMIT` padding TS packets (sync byte only, PID 0 →
+    /// `adaptation == 0` → discarded harmlessly by the demuxer) so the real
+    /// display set lands at a byte offset that survives a correct
+    /// `got * SECTOR_BYTES` feed length but is cut off by a mutated
+    /// `got + SECTOR_BYTES`.
+    fn filler_packets(count: usize) -> Vec<u8> {
+        let mut v = vec![0u8; count * 192];
+        for i in 0..count {
+            v[i * 192 + 4] = 0x47; // sync byte only; pid 0, adaptation 0 → discarded
+        }
+        v
+    }
+
+    /// Mutation guard for `got as usize * SECTOR_BYTES` (the feed-length
+    /// computation on a fully-served chunk): a 3-sector read must hand the
+    /// WHOLE 6144-byte chunk to the demuxer. Padding pushes the real display
+    /// set to byte 4032 — past `got + SECTOR_BYTES` (2051) but inside
+    /// `got * SECTOR_BYTES` (6144) — so a mutated addition would silently
+    /// drop it from the feed and the run would never observe it.
+    #[test]
+    fn feed_uses_the_full_read_length_not_a_truncated_one() {
+        let pid = 0x1200u16;
+        let mut data = filler_packets(21); // 21 * 192 = 4032 bytes of padding
+        data.extend_from_slice(&ts_stream(pid, &pcs_display(false)));
+        let mut reader = TsReader { data, pos: 0 };
+        let mut title = pgs_title(pid, true); // vendor label: forced
+        title.extents = vec![Extent {
+            start_lba: 0,
+            // 3 * 2048 = 6144 B: covers all 4416 B of real data plus the
+            // reader's zero padding to the sector boundary, in one read.
+            sector_count: 3,
+        }];
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+        let Stream::Subtitle(s) = &title.streams[0] else {
+            panic!()
+        };
+        assert!(
+            !s.forced,
+            "the padding-shifted non-forced display set must still reach the demuxer \
+             and clear the vendor-forced flag"
+        );
+    }
+
+    /// A reader that serves fixed content until exhausted, then unlimited
+    /// zeros — like [`PartialTsReader`]'s `ThenWhat::Zeros`, but also counts
+    /// every sector requested (not just what one extent's read attempted), so
+    /// a test can measure how much of a SECOND, effectively infinite extent
+    /// actually got read.
+    struct RealThenZerosReader {
+        inner: TsReader,
+        served: u32,
+    }
+    impl SectorSource for RealThenZerosReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.served += count as u32;
+            if self.inner.pos < self.inner.data.len() {
+                self.inner.read_sectors(lba, count, buf, recovery)
+            } else {
+                let want = count as usize * SECTOR_BYTES;
+                buf[..want].fill(0);
+                Ok(want)
+            }
+        }
+        fn capacity_sectors(&self) -> u32 {
+            u32::MAX
+        }
+    }
+
+    /// Mutation guard for the `||` in the early-exit check ("every track has
+    /// already shown a non-forced set — counting evidence CARRIED IN from
+    /// other extents"): non-forced evidence carried in from a prior extent
+    /// must stop reading a later extent immediately, even though that later
+    /// extent's OWN fresh tracker has not itself observed anything. Weakening
+    /// `||` to `&&` requires local confirmation too, so a huge trailing extent
+    /// with no PGS content of its own would be read all the way to the sector
+    /// budget instead of one chunk.
+    #[test]
+    fn carried_non_forced_evidence_stops_reading_a_content_free_extent() {
+        let pid = 0x1200u16;
+        let mut reader = RealThenZerosReader {
+            inner: TsReader {
+                data: ts_stream(pid, &pcs_display(false)),
+                pos: 0,
+            },
+            served: 0,
+        };
+        let mut title = multi_read_pgs_title(pid, true); // vendor label: forced
+        let mut cache = ForcedProbeCache::new();
+        probe_and_set_forced(&mut reader, &mut title, &mut cache, None);
+
+        let Stream::Subtitle(s) = &title.streams[0] else {
+            panic!()
+        };
+        assert!(
+            !s.forced,
+            "non-forced evidence from extent 1 must still clear the forced flag"
+        );
+        assert!(
+            reader.served < PROBE_BUDGET_SECTORS,
+            "carried non-forced evidence must stop extent 2's read after a single \
+             chunk, not run it to the sector budget; served {}",
+            reader.served
+        );
+    }
+
+    /// Counts `tracing` events on target `freemkv::scan`, so a test can prove
+    /// a debug log fires (or doesn't) without depending on any output
+    /// formatting.
+    #[derive(Clone)]
+    struct ScanDebugCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl tracing::Subscriber for ScanDebugCounter {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "freemkv::scan"
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() == "freemkv::scan" {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Mutation guard for the `!` in `if !conclusive { tracing::debug!(...) }`:
+    /// the "truncated; verdicts limited" log must fire exactly on an
+    /// INCONCLUSIVE run, never on one that reached a designed stop.
+    #[test]
+    fn truncated_run_logs_but_a_conclusive_run_does_not() {
+        let pid = 0x1200u16;
+
+        // Conclusive: one exactly-sized read, extent read to its end, no stall.
+        let conclusive_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tracing::subscriber::with_default(ScanDebugCounter(conclusive_count.clone()), || {
+            let mut reader = TsReader {
+                data: ts_stream(pid, &pcs_display(true)),
+                pos: 0,
+            };
+            let mut title = pgs_title(pid, false);
+            title.extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 1,
+            }];
+            probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+        });
+        assert_eq!(
+            conclusive_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a conclusive (Exhausted) run must not log the truncation debug message"
+        );
+
+        // Inconclusive: dies mid-title with a read error → ReadFailed.
+        let truncated_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tracing::subscriber::with_default(ScanDebugCounter(truncated_count.clone()), || {
+            let mut reader =
+                PartialTsReader::new(ts_stream(pid, &pcs_display(true)), ThenWhat::Error);
+            let mut title = multi_read_pgs_title(pid, false);
+            probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+        });
+        assert_eq!(
+            truncated_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a truncated (ReadFailed) run must log the truncation debug message exactly once"
+        );
+    }
 }

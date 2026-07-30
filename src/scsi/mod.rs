@@ -1205,6 +1205,57 @@ mod scsi_sense_predicate_tests {
         assert_eq!(ScsiSense::NONE.sense_key, SENSE_KEY_NO_SENSE);
         assert!(ScsiSense::NONE.is_marginal());
     }
+
+    /// `is_css_locked` must be the exact triple `05/6F/03` (MMC "READ OF
+    /// SCRAMBLED SECTOR WITHOUT AUTHENTICATION"), all three fields ANDed
+    /// together — not any single field, and not an OR of the three. The
+    /// CSS crack scan keys on this to positively distinguish "encrypted but
+    /// locked" from "unreadable"; a false positive on a bare ILLEGAL REQUEST
+    /// (e.g. a malformed CDB) would make the scanner treat an unrelated
+    /// error as proof of CSS scrambling.
+    #[test]
+    fn is_css_locked_requires_exact_key_asc_ascq_triple() {
+        // The real signature: true.
+        assert!(
+            ScsiSense {
+                sense_key: SENSE_KEY_ILLEGAL_REQUEST,
+                asc: 0x6F,
+                ascq: 0x03,
+            }
+            .is_css_locked()
+        );
+        // Right key, wrong ASC only -> must be false (rules out `||`
+        // between key and asc, and rules out the `true` constant mutant).
+        assert!(
+            !ScsiSense {
+                sense_key: SENSE_KEY_ILLEGAL_REQUEST,
+                asc: 0x00,
+                ascq: 0x03,
+            }
+            .is_css_locked()
+        );
+        // Right key, right ASC, wrong ASCQ -> must be false (rules out `||`
+        // between asc and ascq).
+        assert!(
+            !ScsiSense {
+                sense_key: SENSE_KEY_ILLEGAL_REQUEST,
+                asc: 0x6F,
+                ascq: 0x00,
+            }
+            .is_css_locked()
+        );
+        // Right ASC/ASCQ but wrong key (e.g. a bare ILLEGAL REQUEST with
+        // unrelated ASC/ASCQ would already fail above; here flip the key
+        // instead) -> must be false.
+        assert!(
+            !ScsiSense {
+                sense_key: SENSE_KEY_MEDIUM_ERROR,
+                asc: 0x6F,
+                ascq: 0x03,
+            }
+            .is_css_locked()
+        );
+    }
 }
 
 #[cfg(test)]

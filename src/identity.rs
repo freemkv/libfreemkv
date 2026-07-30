@@ -339,9 +339,136 @@ mod tests {
         );
     }
 
+    /// `ascii_field`'s guard is `data.len() > start` (strictly greater), not
+    /// `>=`: a buffer whose length is exactly `start` has NO byte at that
+    /// offset, so it must still yield empty, not attempt to slice.
+    /// Mutation: `>` -> `>=` would try to slice `data[start..]` when
+    /// `data.len() == start`, which panics (empty range at the very end is
+    /// fine, but the guard's job is the `< start` case below it — pinning the
+    /// exact boundary catches an off-by-one either direction).
+    #[test]
+    fn ascii_field_boundary_len_equals_start_is_empty() {
+        let buf = vec![0u8; 8];
+        assert_eq!(ascii_field(&buf, 8, 16), "");
+    }
+
+    /// One byte past the boundary: `data.len() == start + 1` must extract
+    /// that single byte (clamped to `end`), proving the guard is `>` and not
+    /// off by one in the other direction.
+    #[test]
+    fn ascii_field_boundary_len_one_past_start_extracts_one_byte() {
+        let mut buf = vec![0u8; 9];
+        buf[8] = b'X';
+        assert_eq!(ascii_field(&buf, 8, 16), "X");
+    }
+
+    /// `Display` renders the four trimmed identity fields space-separated —
+    /// the human-readable counterpart of `match_key`'s pipe-separated form.
+    /// Not exercised anywhere else in this test module.
+    /// Mutation: replacing the `fmt` body with `Ok(Default::default())`
+    /// writes nothing at all, so formatting any `DriveId` yields "".
+    #[test]
+    fn display_formats_trimmed_fields_space_separated() {
+        let mut inquiry = vec![0u8; 96];
+        inquiry[8..16].copy_from_slice(b"PIONEER ");
+        inquiry[16..32].copy_from_slice(b"BD-RW   BDR-S09 ");
+        inquiry[32..36].copy_from_slice(b"1.34");
+        inquiry[36..43].copy_from_slice(b" 16/04/");
+        let id = DriveId::from_inquiry(&inquiry, "201604250000");
+        assert_eq!(id.to_string(), "PIONEER BD-RW   BDR-S09 1.34 16/04/");
+    }
+
     /// GET CONFIGURATION failure (transport error) must not abort the
     /// identity probe — firmware_date is empty, raw_gc_010c is empty.
     /// Mutation: propagating the GET_CONFIGURATION error with `?` aborts from_drive.
+    /// Transport whose GET CONFIGURATION responses report an exact,
+    /// caller-chosen `bytes_transferred` for each of the two GC features
+    /// (010Ch firmware date / 0108h serial), so the `end > 12` / `> 12`
+    /// boundary guards can be pinned precisely. INQUIRY always succeeds.
+    struct FixedGcCountTransport {
+        firmware_bytes: usize,
+        serial_bytes: usize,
+    }
+
+    impl ScsiTransport for FixedGcCountTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            buf: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            for b in buf.iter_mut() {
+                *b = b'Z';
+            }
+            let bytes_transferred = match cdb.first() {
+                Some(&0x12) => buf.len(),
+                Some(&0x46) if cdb[3] == 0x0C => self.firmware_bytes,
+                Some(&0x46) if cdb[3] == 0x08 => self.serial_bytes,
+                _ => buf.len(),
+            };
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    /// `end > 12` in the firmware-date branch (`from_drive`) is a strict
+    /// inequality: `bytes_transferred == 12` reports the field absent
+    /// (offset 12 is the first byte of the 12-char date; a count of exactly
+    /// 12 covers bytes 0..12, none of which is the date), so `firmware_date`
+    /// must be empty, not the mutant's off-by-one read.
+    /// Mutation: `>` -> `>=` would try `gc[12..12]` at the boundary — an
+    /// empty but non-panicking slice — silently reporting "present" data
+    /// that is actually all outside the transferred count.
+    #[test]
+    fn from_drive_firmware_date_boundary_exactly_12_is_empty() {
+        let mut t = FixedGcCountTransport {
+            firmware_bytes: 12,
+            serial_bytes: 0,
+        };
+        let id = DriveId::from_drive(&mut t).unwrap();
+        assert_eq!(id.firmware_date, "");
+    }
+
+    /// One byte past the boundary (`bytes_transferred == 13`) must extract
+    /// exactly the one available date byte (offset 12), proving the guard
+    /// is `>` and the slice end is clamped to `end`, not always to 24.
+    #[test]
+    fn from_drive_firmware_date_boundary_13_extracts_one_byte() {
+        let mut t = FixedGcCountTransport {
+            firmware_bytes: 13,
+            serial_bytes: 0,
+        };
+        let id = DriveId::from_drive(&mut t).unwrap();
+        assert_eq!(id.firmware_date, "Z");
+    }
+
+    /// Same `> 12` boundary for the serial-number branch: exactly 12
+    /// transferred bytes must yield an empty serial.
+    #[test]
+    fn from_drive_serial_boundary_exactly_12_is_empty() {
+        let mut t = FixedGcCountTransport {
+            firmware_bytes: 0,
+            serial_bytes: 12,
+        };
+        let id = DriveId::from_drive(&mut t).unwrap();
+        assert_eq!(id.serial_number, "");
+    }
+
+    /// One byte past the serial boundary extracts exactly that byte.
+    #[test]
+    fn from_drive_serial_boundary_13_extracts_one_byte() {
+        let mut t = FixedGcCountTransport {
+            firmware_bytes: 0,
+            serial_bytes: 13,
+        };
+        let id = DriveId::from_drive(&mut t).unwrap();
+        assert_eq!(id.serial_number, "Z");
+    }
+
     #[test]
     fn from_drive_gc_failure_yields_empty_firmware_date() {
         struct GcFailTransport;

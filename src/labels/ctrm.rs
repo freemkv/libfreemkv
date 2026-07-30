@@ -324,6 +324,68 @@ mod tests {
         assert_eq!(labels[0].qualifier, LabelQualifier::None);
     }
 
+    /// Spec: `menu_base.prop` lines are skipped when `is_empty() ||
+    /// starts_with('#')` — either alone is sufficient. A commented-out
+    /// key=value line must never be parsed into an entry.
+    /// Mutation: `||` -> `&&` requires both, which a non-empty comment
+    /// line can't satisfy, so it falls through to `line.find('=')` and
+    /// gets parsed as a real property.
+    #[test]
+    fn menu_base_comment_line_with_equals_is_still_skipped() {
+        let labels = parse_props(
+            "#audio_1.class=AudioButton\n\
+             #audio_1.streamNumber=9\n\
+             #audio_1.name=Should Not Appear\n\
+             audio_2.class=AudioButton\n\
+             audio_2.streamNumber=1\n\
+             audio_2.name=Real Track\n",
+        );
+        assert_eq!(labels.len(), 1, "commented-out entry must not be parsed");
+        assert_eq!(labels[0].name, "Real Track");
+    }
+
+    /// Spec: `menu_base.prop` streamNumber (or audioStream/subtitleStream)
+    /// must be strictly positive — `0` means "no STN entry" and must be
+    /// skipped, matching the `n > 0` guard on the language_streams side.
+    /// Mutation: `n > 0` -> `n >= 0` (or the guard deleted) would let a
+    /// stream_num of 0 through, emitting a dead label apply_labels can
+    /// never match (its counter starts at 1).
+    #[test]
+    fn menu_base_zero_stream_number_skipped() {
+        let labels = parse_props(
+            "audio_1.class=AudioButton\n\
+             audio_1.streamNumber=0\n\
+             audio_1.name=Disabled Slot\n",
+        );
+        assert!(
+            labels.is_empty(),
+            "streamNumber=0 must be skipped, got {labels:?}"
+        );
+    }
+
+    /// Spec: `is_subtitle` is `class.contains("SubtitleButton") ||
+    /// prefix.starts_with("subtitle_")` — EITHER signal alone is
+    /// sufficient to classify (and keep) a subtitle entry whose prefix
+    /// doesn't follow the `subtitle_` naming convention.
+    /// Mutation: `||` -> `&&` would require BOTH signals; an entry whose
+    /// class says SubtitleButton but whose prefix is something else
+    /// (e.g. a vendor-specific button id) would then satisfy neither
+    /// `is_audio` nor `is_subtitle` and get dropped entirely.
+    #[test]
+    fn menu_base_subtitle_class_alone_is_sufficient() {
+        let labels = parse_props(
+            "menuBtn7.class=SubtitleButton\n\
+             menuBtn7.streamNumber=1\n\
+             menuBtn7.name=English SDH\n",
+        );
+        assert_eq!(
+            labels.len(),
+            1,
+            "class=SubtitleButton alone must classify as subtitle, not be dropped"
+        );
+        assert_eq!(labels[0].stream_type, StreamLabelType::Subtitle);
+    }
+
     #[test]
     fn prefix_commentary_segment_match_not_substring() {
         // Genuine commentary group segments match.
@@ -348,6 +410,39 @@ mod tests {
             codec_hint: String::new(),
             variant: String::new(),
         }
+    }
+
+    /// Spec: `merge`'s `mb.iter().find(...)` must match an mb entry by
+    /// (stream_type AND stream_number) TOGETHER — either alone is not a
+    /// unique key (there can be an audio #1 and a subtitle #1, or two
+    /// different audio streams).
+    /// Mutation: `&&` -> `||` inside the closure would match on type OR
+    /// number alone, so `.find` (which returns the FIRST match) can pick
+    /// an mb entry with the right type but the WRONG stream number.
+    #[test]
+    fn merge_matches_mb_entry_by_type_and_number_together() {
+        // ls wants audio #2 (empty name, so it will borrow from mb).
+        let ls = vec![lbl(StreamLabelType::Audio, 2, "")];
+        // mb's FIRST audio entry is #1 (wrong number); its #2 entry (the
+        // real match) comes second.
+        let mb = vec![
+            lbl(StreamLabelType::Audio, 1, "Wrong Number Match"),
+            lbl(StreamLabelType::Audio, 2, "Correct Match"),
+        ];
+        let merged = merge(ls, mb);
+        assert_eq!(
+            merged.len(),
+            2,
+            "mb's own audio #1 must also survive as its own entry"
+        );
+        let a2 = merged
+            .iter()
+            .find(|l| l.stream_type == StreamLabelType::Audio && l.stream_number == 2)
+            .unwrap();
+        assert_eq!(
+            a2.name, "Correct Match",
+            "must match mb by (type AND number), not type or number alone"
+        );
     }
 
     #[test]
@@ -504,6 +599,60 @@ mod tests {
             parse_language_streams_text("# this is a comment\nid,audio_production,1,eng\n");
         assert_eq!(labels.len(), 1);
         assert_eq!(labels[0].language, "eng");
+    }
+
+    /// Spec: the skip test is `is_empty() || starts_with('#')` — EITHER
+    /// condition alone must skip the line. A commented-out line that
+    /// happens to look like valid CSV (a real authoring pattern for
+    /// disabling a stream entry) must never produce a label.
+    /// Mutation: `||` -> `&&` requires BOTH conditions, which a non-empty
+    /// comment line can never satisfy, so it would fall through to the
+    /// CSV parser and (since it has >= 4 comma fields) emit a spurious
+    /// label instead of being skipped.
+    #[test]
+    fn ls_comment_line_with_csv_shape_is_still_skipped() {
+        let labels =
+            parse_language_streams_text("#id,audio_production,1,eng\nid2,audio_production,2,fra\n");
+        assert_eq!(
+            labels.len(),
+            1,
+            "the commented-out CSV-shaped line must not parse"
+        );
+        assert_eq!(labels[0].language, "fra");
+    }
+
+    /// Spec: `subtitle_dual` is a recognized subtitle type (Normal/no
+    /// qualifier). Mutation: delete this match arm → falls to the
+    /// catch-all `_ => continue`, silently dropping the stream.
+    #[test]
+    fn ls_subtitle_dual_parsed() {
+        let labels = parse_language_streams_text("id,subtitle_dual,1,eng\n");
+        assert_eq!(labels.len(), 1, "subtitle_dual must produce a label");
+        assert_eq!(labels[0].stream_type, StreamLabelType::Subtitle);
+        assert_eq!(labels[0].purpose, LabelPurpose::Normal);
+        assert_eq!(labels[0].qualifier, LabelQualifier::None);
+    }
+
+    /// Spec: `subtitle_bonus` is a recognized subtitle type (Normal/no
+    /// qualifier). Mutation: delete this match arm → dropped as unknown.
+    #[test]
+    fn ls_subtitle_bonus_parsed() {
+        let labels = parse_language_streams_text("id,subtitle_bonus,2,eng\n");
+        assert_eq!(labels.len(), 1, "subtitle_bonus must produce a label");
+        assert_eq!(labels[0].stream_type, StreamLabelType::Subtitle);
+        assert_eq!(labels[0].purpose, LabelPurpose::Normal);
+    }
+
+    /// Spec: `subtitle_ime` maps to Subtitle/Ime (no Forced qualifier,
+    /// unlike `subtitle_ime_narrative`).
+    /// Mutation: delete this match arm → dropped as unknown.
+    #[test]
+    fn ls_subtitle_ime_parsed() {
+        let labels = parse_language_streams_text("id,subtitle_ime,3,jpn\n");
+        assert_eq!(labels.len(), 1, "subtitle_ime must produce a label");
+        assert_eq!(labels[0].stream_type, StreamLabelType::Subtitle);
+        assert_eq!(labels[0].purpose, LabelPurpose::Ime);
+        assert_eq!(labels[0].qualifier, LabelQualifier::None);
     }
 
     /// Spec: multiple valid lines produce multiple labels.

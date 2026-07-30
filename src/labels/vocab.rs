@@ -685,4 +685,108 @@ mod tests {
     fn codec_empty_passes_through() {
         assert_eq!(codec(""), "");
     }
+
+    /// `purpose()`'s multi-word-compound fast path ORs two independent
+    /// phrase checks ("audio description" / "descriptive service"). Each
+    /// phrase, when it appears as a *word*-bounded match, is independently
+    /// caught by the has_word fallback further down — so the OR only
+    /// matters when a phrase appears as a *substring inside a larger word*
+    /// (no boundary), which .contains() still catches but has_word() would
+    /// reject.
+    ///
+    /// Mutation: replace `||` with `&&` at line 238 → since "audio
+    /// description" is absent here, the AND fails, the fast path doesn't
+    /// fire, and the fallback has_word("descriptive") also fails (no word
+    /// boundary before "descriptive" in "nondescriptive"), so purpose()
+    /// wrongly returns Normal instead of Descriptive.
+    #[test]
+    fn purpose_descriptive_service_substring_without_word_boundary() {
+        assert_eq!(
+            purpose("nondescriptive service track"),
+            LabelPurpose::Descriptive
+        );
+    }
+
+    /// `menu_lang()` maps every authoring-filename token in its table
+    /// (ISO-639-2/B and /T spellings, plus ISO-639-1) to the canonical
+    /// /T code used by the rest of the pipeline. Exhaustive per-arm check:
+    /// deleting any single match arm makes that arm's tokens return None
+    /// instead of the documented code.
+    #[test]
+    fn menu_lang_covers_every_table_entry() {
+        let cases: &[(&str, &str)] = &[
+            ("eng", "eng"),
+            ("en", "eng"),
+            ("ger", "deu"),
+            ("deu", "deu"),
+            ("de", "deu"),
+            ("fre", "fra"),
+            ("fra", "fra"),
+            ("fr", "fra"),
+            ("spa", "spa"),
+            ("es", "spa"),
+            ("ita", "ita"),
+            ("it", "ita"),
+            ("por", "por"),
+            ("pt", "por"),
+            ("jpn", "jpn"),
+            ("jap", "jpn"),
+            ("ja", "jpn"),
+            ("kor", "kor"),
+            ("ko", "kor"),
+            ("chi", "zho"),
+            ("zho", "zho"),
+            ("zh", "zho"),
+            ("rus", "rus"),
+            ("ru", "rus"),
+            ("dut", "nld"),
+            ("nld", "nld"),
+            ("nl", "nld"),
+            ("pol", "pol"),
+            ("pl", "pol"),
+            ("cze", "ces"),
+            ("ces", "ces"),
+            ("cs", "ces"),
+            ("dan", "dan"),
+            ("da", "dan"),
+            ("fin", "fin"),
+            ("fi", "fin"),
+            ("nor", "nor"),
+            ("no", "nor"),
+            ("swe", "swe"),
+            ("sv", "swe"),
+            ("hun", "hun"),
+            ("hu", "hun"),
+            ("gre", "ell"),
+            ("ell", "ell"),
+            ("el", "ell"),
+            ("tur", "tur"),
+            ("tr", "tur"),
+            ("ara", "ara"),
+            ("ar", "ara"),
+            ("hin", "hin"),
+            ("hi", "hin"),
+            ("tha", "tha"),
+            ("th", "tha"),
+            ("ukr", "ukr"),
+            ("uk", "ukr"),
+            ("cat", "cat"),
+            ("ca", "cat"),
+        ];
+        for (token, expected) in cases {
+            assert_eq!(
+                menu_lang(token),
+                Some(*expected),
+                "menu_lang({:?}) should map to {:?}",
+                token,
+                expected
+            );
+        }
+        // Case-insensitive and trimmed.
+        assert_eq!(menu_lang("ENG"), Some("eng"));
+        assert_eq!(menu_lang("  Eng  "), Some("eng"));
+        // Unrecognized token -> None, never a guess.
+        assert_eq!(menu_lang("xyz"), None);
+        assert_eq!(menu_lang(""), None);
+    }
 }

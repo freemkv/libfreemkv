@@ -441,6 +441,18 @@ mod tests {
         out.extend_from_slice(&attrs);
         out
     }
+    /// HEVC video stream entry carrying the third (HDR) attribute byte:
+    /// high nibble = dynamic_range, low nibble = color_space (mpls.rs only
+    /// parses this byte for coding_type == HEVC and sa.len() > 2).
+    fn se_video_hevc(pid: u16, dynamic_range: u8, color_space: u8) -> Vec<u8> {
+        let mut out = vec![3u8, 0x01];
+        out.extend_from_slice(&pid.to_be_bytes());
+        let hdr_byte = (dynamic_range << 4) | color_space;
+        let attrs = vec![0x24u8, 0x10, hdr_byte]; // coding_type = HEVC
+        out.push(attrs.len() as u8);
+        out.extend_from_slice(&attrs);
+        out
+    }
 
     /// Build an MPLS playlist. `stn_counts` = (video, audio, pg, ig,
     /// sec_audio, sec_video, pip_pg, dv); `stream_entries` are appended on
@@ -698,6 +710,77 @@ mod tests {
         udf::read_filesystem(disc).expect("fs")
     }
 
+    /// Full BDMV with a real Blu-ray 3D layout: `.ssif` files under
+    /// `BDMV/STREAM/SSIF/<clip>.ssif` (note the SSIF subdirectory, unlike
+    /// [`make_bdmv_fs_ext`]) plus a matching `.clpi` in CLIPINF. Resolving
+    /// the SSIF is what latches `is_3d = true` in `parse_playlist`.
+    fn make_bdmv_fs_ssif(
+        disc: &mut MemDisc,
+        clips: &[(
+            &str,
+            u32, /*sectors*/
+            u32, /*packets*/
+            u32, /*data_lba*/
+        )],
+    ) -> udf::UdfFs {
+        let mut ssif_files = Vec::new();
+        let mut clipinf_files = Vec::new();
+        let mut icb = 200u32;
+        for (name, sectors, packets, data_lba) in clips {
+            let ssif = format!("{name}.ssif");
+            let size = sectors * 2048;
+            ssif_files.push(file(&ssif, icb, *data_lba, size, true));
+            icb += 1;
+            let clpi = format!("{name}.clpi");
+            clipinf_files.push(file_with(
+                &clpi,
+                icb,
+                *data_lba + 1000,
+                build_clpi(*packets),
+                false,
+            ));
+            icb += 1;
+        }
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 40,
+            dir_data_lba: 41,
+            files: Vec::new(),
+            subdirs: vec![
+                DirSpec {
+                    name: "STREAM".to_string(),
+                    icb_lba: 42,
+                    dir_data_lba: 43,
+                    files: Vec::new(),
+                    subdirs: vec![DirSpec {
+                        name: "SSIF".to_string(),
+                        icb_lba: 44,
+                        dir_data_lba: 45,
+                        files: ssif_files,
+                        subdirs: vec![],
+                    }],
+                },
+                DirSpec {
+                    name: "CLIPINF".to_string(),
+                    icb_lba: 46,
+                    dir_data_lba: 47,
+                    files: clipinf_files,
+                    subdirs: vec![],
+                },
+            ],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        build_udf_skeleton(disc, 10);
+        lay_dir(disc, &root);
+        udf::read_filesystem(disc).expect("fs")
+    }
+
     /// Single-clip playlist: size_bytes = source_packets * 192 and the
     /// physical extent is pulled from the m2ts Long-AD ICB. Per bluray.rs:
     /// `total_size += pkt_count * 192`; extents from file_extents.
@@ -725,6 +808,33 @@ mod tests {
         assert_eq!(t.extents[0].sector_count, 1000);
         assert_eq!(t.clips.len(), 1);
         assert_eq!(t.clips[0].source_packets, 4000);
+    }
+
+    /// Each Clip's `duration_secs` is `(out_time - in_time) / 45000` (the BD
+    /// 45kHz playback clock). Uses a duration (75s) whose ticks are not a
+    /// multiple of any small constant, so a `*` or `%` in place of `/` would
+    /// produce a wildly different (or non-matching) value instead of 75.0.
+    #[test]
+    fn parse_playlist_clip_duration_secs_computed_from_ticks() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 45000,
+                out_time: 45000 + 75 * 45000, // 75s clip
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        assert_eq!(t.clips.len(), 1);
+        assert!(
+            (t.clips[0].duration_secs - 75.0).abs() < 1e-6,
+            "clip duration_secs must be ticks/45000 seconds, got {}",
+            t.clips[0].duration_secs
+        );
     }
 
     /// AACS 2.1: the feature clip is `00001.fmts`, NOT `.m2ts`. The
@@ -995,6 +1105,66 @@ mod tests {
         assert_eq!(videos[0].codec, Codec::Hevc);
     }
 
+    /// HEVC HDR byte (sa[2]): high nibble = dynamic_range, low nibble =
+    /// color_space. dynamic_range 1 -> HDR10, color_space 2 -> BT.2020
+    /// (bluray.rs `match s.dynamic_range { 1 => Hdr10, ... }` /
+    /// `match s.color_space { 2 => Bt2020, ... }`).
+    #[test]
+    fn parse_playlist_maps_hdr10_bt2020_from_hevc_nibbles() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[se_video_hevc(0x1011, 1, 2)],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let v = t
+            .streams
+            .iter()
+            .find_map(|s| match s {
+                Stream::Video(v) => Some(v),
+                _ => None,
+            })
+            .expect("video stream");
+        assert_eq!(v.hdr, HdrFormat::Hdr10);
+        assert_eq!(v.color_space, ColorSpace::Bt2020);
+    }
+
+    /// dynamic_range 2 -> DolbyVision, color_space 1 -> BT.709: the other
+    /// pair of named arms in the same two match expressions.
+    #[test]
+    fn parse_playlist_maps_dolby_vision_bt709_from_hevc_nibbles() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[se_video_hevc(0x1011, 2, 1)],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let v = t
+            .streams
+            .iter()
+            .find_map(|s| match s {
+                Stream::Video(v) => Some(v),
+                _ => None,
+            })
+            .expect("video stream");
+        assert_eq!(v.hdr, HdrFormat::DolbyVision);
+        assert_eq!(v.color_space, ColorSpace::Bt709);
+    }
+
     /// A PGS coding_type (0x90) sitting in the AUDIO STN slot is a
     /// misaligned-stream guard case: bluray.rs routes it to Subtitle, not
     /// Audio (`if matches!(codec, Codec::Pgs)`). Wrong-title regression
@@ -1055,6 +1225,43 @@ mod tests {
         assert_eq!(audios.len(), 1);
         assert_eq!(audios[0].codec, Codec::Ac3);
         assert_eq!(audios[0].language, "eng");
+        assert!(
+            !audios[0].secondary,
+            "a primary (stream_type 2) audio entry must not be marked secondary"
+        );
+    }
+
+    /// A secondary-audio STN entry (stream_type 5, e.g. a director's
+    /// commentary track) must set `AudioStream::secondary` (bluray.rs
+    /// `secondary: s.stream_type == 5`).
+    #[test]
+    fn parse_playlist_secondary_audio_flag_set_for_stream_type_5() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 0, 0, 1, 0, 0, 0), // one secondary-audio (stream_type 5) entry
+            &[se_audio(0x1a00, 0x83, b"eng")],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let audios: Vec<_> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(audios.len(), 1);
+        assert!(
+            audios[0].secondary,
+            "stream_type 5 (secondary audio) must set AudioStream::secondary"
+        );
     }
 
     /// stream_type 3 PG (PGS 0x90) → Stream::Subtitle with language.
@@ -1084,6 +1291,85 @@ mod tests {
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].codec, Codec::Pgs);
         assert_eq!(subs[0].language, "fra");
+    }
+
+    // ---------------------------------------------------------------
+    // Tests: Blu-ray 3D dependent-view stream
+    // ---------------------------------------------------------------
+
+    /// When a clip resolves via `STREAM/SSIF/<clip>.ssif`, `is_3d` latches
+    /// and a synthetic MVC dependent-view video stream is added at
+    /// `base_pid + 1` (bluray.rs's 3D block). Verifies all three fields set
+    /// on the synthesized `VideoStream`: `pid`, `secondary`, `label`.
+    #[test]
+    fn parse_playlist_3d_adds_dependent_view_stream() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs_ssif(&mut disc, &[("00001", 1000, 4000, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            // Base (left-eye) view only -- STN table omits the dependent view.
+            &[se_video(0x1011, 0x1B)],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let videos: Vec<_> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Video(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            videos.len(),
+            2,
+            "a 3D title must add one dependent-view video stream"
+        );
+        let dep = videos
+            .iter()
+            .find(|v| v.pid == 0x1012)
+            .expect("dependent-view stream at base_pid + 1");
+        assert!(dep.secondary, "dependent view must be marked secondary");
+        assert_eq!(
+            dep.label,
+            crate::disc::MVC_DEPENDENT_LABEL,
+            "dependent view must carry the MVC dependent-view label"
+        );
+    }
+
+    /// If the STN table already lists a video stream at `base_pid + 1`
+    /// (e.g. an authoring tool that populated STN_table_SS), the synthetic
+    /// push must be skipped -- never duplicate an existing dependent-view
+    /// entry (bluray.rs `if !have_dep`).
+    #[test]
+    fn parse_playlist_3d_does_not_duplicate_existing_dependent_stream() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs_ssif(&mut disc, &[("00001", 1000, 4000, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (1, 0, 0, 0, 0, 1, 0, 0), // primary video + secondary (PiP) video
+            &[se_video(0x1011, 0x1B), se_video(0x1012, 0x1B)],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let dep_count = t
+            .streams
+            .iter()
+            .filter(|s| matches!(s, Stream::Video(v) if v.pid == 0x1012))
+            .count();
+        assert_eq!(
+            dep_count, 1,
+            "an already-present stream at base_pid + 1 must not be duplicated"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1173,6 +1459,47 @@ mod tests {
         assert!(
             (t.chapters[0].time_secs - 60.0).abs() < 1e-6,
             "chapter must sit at 60s, got {}",
+            t.chapters[0].time_secs
+        );
+    }
+
+    /// The within-PlayItem offset is `(timestamp - pi.in_time) / 45000`
+    /// ticks-to-seconds. Uses a non-zero, non-round offset (5s) added to a
+    /// non-zero `preceding` (60s) so a `*` or `%` in place of `/` would not
+    /// coincidentally produce the same total (bluray.rs `within = ... /
+    /// 45000.0`).
+    #[test]
+    fn parse_playlist_chapter_within_offset_divides_ticks_to_seconds() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let pi1_in = 10 * 45000u32;
+        let within_ticks = 5 * 45000u32; // 5s into PI1
+        let mpls = build_mpls(
+            &[
+                PiSpec {
+                    clip_id: *b"00001",
+                    in_time: 0,
+                    out_time: 60 * 45000, // PI0 lasts 60s
+                },
+                PiSpec {
+                    clip_id: *b"00001",
+                    in_time: pi1_in,
+                    out_time: pi1_in + 60 * 45000,
+                },
+            ],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[MarkSpec {
+                mark_type: 1,
+                play_item_ref: 1,
+                timestamp: pi1_in + within_ticks,
+            }],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        assert_eq!(t.chapters.len(), 1);
+        assert!(
+            (t.chapters[0].time_secs - 65.0).abs() < 1e-6,
+            "chapter time must be preceding(60s) + within(5s) = 65s, got {}",
             t.chapters[0].time_secs
         );
     }
@@ -1279,6 +1606,35 @@ mod tests {
         assert_eq!(t.playlist_id, 0);
     }
 
+    /// A filename that is long enough (>= 5 bytes) but does NOT end in
+    /// ".mpls" must NOT have its last 5 bytes stripped -- the whole string
+    /// is handed to the numeric parse instead, which fails and falls back
+    /// to playlist_id 0 (bluray.rs `filename.len() >= 5 &&
+    /// filename[len-5..].eq_ignore_ascii_case(".mpls")`).
+    #[test]
+    fn parse_playlist_id_falls_back_to_zero_when_suffix_is_not_mpls() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        // "00800zzzzz": stripping the last 5 bytes would leave "00800" (a
+        // valid u16), but the suffix isn't ".mpls" so nothing may be
+        // stripped -- the whole (non-numeric) string must fail to parse.
+        let t = Disc::parse_playlist(&mut disc, &udf, "00800zzzzz", &mpls).expect("title");
+        assert_eq!(
+            t.playlist_id, 0,
+            "a filename not ending in .mpls must not have its last 5 bytes stripped"
+        );
+    }
+
     // ---------------------------------------------------------------
     // Tests: scan_bluray_titles
     // ---------------------------------------------------------------
@@ -1355,6 +1711,56 @@ mod tests {
         let titles = Disc::scan_bluray_titles(&mut disc, &udf);
         assert_eq!(titles.len(), 1, "only the 2h playlist should survive");
         assert_eq!(titles[0].playlist_id, 800);
+    }
+
+    /// A non-directory PLAYLIST entry whose name does NOT end in ".mpls"
+    /// must be skipped even though its content parses as a perfectly good
+    /// (long) MPLS playlist -- extension gating, not content sniffing,
+    /// decides eligibility (bluray.rs `!entry.is_dir &&
+    /// entry.name...ends_with(".mpls")`).
+    #[test]
+    fn scan_bluray_titles_skips_non_mpls_extension_file() {
+        let mut disc = MemDisc::new();
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 7200 * 45000, // 2h -- easily long enough to be kept
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let playlist = DirSpec {
+            name: "PLAYLIST".to_string(),
+            icb_lba: 26,
+            dir_data_lba: 27,
+            files: vec![file_with("00800.dat", 104, 30000, mpls, false)],
+            subdirs: vec![],
+        };
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![playlist],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = udf::read_filesystem(&mut disc).expect("fs");
+
+        let titles = Disc::scan_bluray_titles(&mut disc, &udf);
+        assert!(
+            titles.is_empty(),
+            "a PLAYLIST entry not ending in .mpls must be skipped regardless of content"
+        );
     }
 
     /// With no PLAYLIST directory, scan_bluray_titles returns an empty
@@ -1462,6 +1868,52 @@ mod tests {
                 "placeholder/empty title must be rejected for body {body:?}"
             );
         }
+    }
+
+    /// A non-.xml file must be ignored even if its content looks like a
+    /// valid meta XML (contains a `<di:name>`) -- extension gating, not
+    /// content sniffing, decides eligibility (bluray.rs `!e.is_dir &&
+    /// e.name...ends_with(".xml")`).
+    #[test]
+    fn read_meta_title_ignores_non_xml_file_regardless_of_content() {
+        let mut disc = MemDisc::new();
+        let bogus = b"<x><di:name>Should Not Be Used</di:name></x>".to_vec();
+        let dl = DirSpec {
+            name: "DL".to_string(),
+            icb_lba: 30,
+            dir_data_lba: 31,
+            files: vec![file_with("bdmt_eng.txt", 104, 50000, bogus, false)],
+            subdirs: vec![],
+        };
+        let meta = DirSpec {
+            name: "META".to_string(),
+            icb_lba: 28,
+            dir_data_lba: 29,
+            files: Vec::new(),
+            subdirs: vec![dl],
+        };
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![meta],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = udf::read_filesystem(&mut disc).expect("fs");
+        assert_eq!(
+            Disc::read_meta_title(&mut disc, &udf),
+            None,
+            "a non-.xml file must be ignored even if its content looks like valid meta XML"
+        );
     }
 
     /// No META directory → None.
