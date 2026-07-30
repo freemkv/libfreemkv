@@ -302,7 +302,7 @@ Many external drive enclosures (Vantec NexStar, Sabrent, OWC, etc.) do not adver
 When something goes wrong during a rip, gather this information before filing an issue:
 
 1. **freemkv version:** `freemkv --version` or the crate version in `Cargo.toml`.
-2. **Drive model:** from the drive label, or from `freemkv info`.
+2. **Drive model:** from the drive label, or from `freemkv info disc://`.
 3. **Connection type:** USB (with bridge chipset if known) or direct SATA.
 4. **Operating system and kernel:** `uname -a`.
 5. **Kernel messages during the failure:** `dmesg | tail -50` immediately after the crash.
