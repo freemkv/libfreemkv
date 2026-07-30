@@ -313,6 +313,60 @@ mod tests {
         );
     }
 
+    /// The `!`-suffix and the `MKBROM.AACS` presence test are BOTH required —
+    /// the discovery is a conjunction, not a disjunction.
+    ///
+    /// The existing fixtures only ever present a directory that satisfies both
+    /// (`AAC!` with `MKBROM.AACS`) alongside one that satisfies neither
+    /// (`AAC!_BAK` — which contains `MKBROM.AACS` but is ALSO reached only after
+    /// the real dir), so either half of the conjunction could be dropped and the
+    /// same directory would still be found. Here a directory satisfies the name
+    /// half and NOT the contents half: it must not be picked.
+    ///
+    /// If it were, the HD DVD path would resolve `MKBROM.AACS`,
+    /// `CONTENT_CERT.AACS` and the title-key file under a directory that holds
+    /// none of them — the disc reports "no AACS key files" and never rips.
+    #[test]
+    fn a_bang_suffixed_directory_without_mkbrom_is_not_the_aacs_directory() {
+        use crate::udf::fixture::*;
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                // Ends in '!' — but carries no MKBROM.AACS, so it is not the
+                // HD DVD AACS directory.
+                name: "AAC!".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: vec![
+                    file("VTKF090.AACS", 102, 5200, 2048, true),
+                    file("CONTENT_CERT.AACS", 103, 5300, 2048, true),
+                ],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        assert!(
+            super::find_hddvd_aacs_dir(&udf).is_none(),
+            "a '!' directory without MKBROM.AACS is not the AACS directory"
+        );
+        assert_eq!(
+            super::role_paths(&udf, super::AacsRole::UnitKey),
+            vec![
+                super::PATH_UNIT_KEY_RO.to_string(),
+                super::PATH_UNIT_KEY_RO_DUPLICATE.to_string(),
+            ],
+            "no HD DVD candidates may be appended from a directory that was \
+             never identified as the AACS directory"
+        );
+    }
+
     #[test]
     fn role_paths_bd_uhd_disc_yields_no_hddvd_candidates() {
         use crate::udf::fixture::*;
