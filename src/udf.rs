@@ -905,17 +905,49 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
         let pm1_len = lvd[441] as usize;
 
         if pm1_len > 0 && 440 + pm1_len < 2048 {
-            let pm2_type = lvd[440 + pm1_len]; // Second map type
+            let pm2_map = 440 + pm1_len;
+            let pm2_type = lvd[pm2_map]; // Second map type
 
             if pm2_type == 2 {
-                // Type 2 = metadata partition
-                // The metadata file ICB is at physical partition lba 0
-                // Read it to find where the metadata content starts
-                let meta_file_lba = partition_start; // lba 0 of partition
+                // Type 2 = metadata partition. UDF 2.50 2.2.10 records WHERE
+                // the Metadata File's File Entry lives in the Metadata
+                // Partition Map itself — Metadata File Location, a
+                // partition-relative Uint32 at map offset 40. It is not fixed
+                // at block 0 of the physical partition; block 0 is merely
+                // where authoring tools usually put it.
+                //
+                // Assuming block 0 unconditionally mounts NOTHING on a
+                // conformant volume that recorded the File Entry anywhere
+                // else: block 0 then holds something that is not a File
+                // Entry, `metadata_start` falls back to `partition_start`,
+                // the File Set Descriptor read at that sector finds that
+                // other descriptor's tag instead of 256, and the volume is
+                // rejected outright as `UdfNotFilesystem`.
+                //
+                // The recorded location is trusted only when the map's
+                // partition type identifier actually reads
+                // "*UDF Metadata Partition": a Virtual (UDF 2.50 2.2.8) or
+                // Sparable (2.2.9) partition map is also Type 2 and carries
+                // completely different fields at that offset. And if the
+                // recorded location turns out not to hold a File Entry,
+                // block 0 is still tried, so a volume whose map field is
+                // wrong but whose Metadata File does sit at block 0 keeps
+                // working exactly as before.
+                let recorded = metadata_file_location(&lvd, pm2_map)
+                    .and_then(|loc| partition_start.checked_add(loc));
+                let mut meta_file_lba = partition_start;
                 let mut meta_icb = [0u8; 2048];
-                read_sector(reader, meta_file_lba, &mut meta_icb)?;
+                let mut meta_tag = 0u16;
+                for cand in recorded.into_iter().chain(std::iter::once(partition_start)) {
+                    if read_sector(reader, cand, &mut meta_icb).is_ok() {
+                        meta_tag = u16::from_le_bytes([meta_icb[0], meta_icb[1]]);
+                        meta_file_lba = cand;
+                        if meta_tag == 266 {
+                            break;
+                        }
+                    }
+                }
 
-                let meta_tag = u16::from_le_bytes([meta_icb[0], meta_icb[1]]);
                 if meta_tag == 266 {
                     // Extended File Entry — get allocation extent
                     let l_ea = u32::from_le_bytes([
@@ -1007,6 +1039,33 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
         metadata_start,
         metadata_sectors,
     })
+}
+
+/// UDF 2.50 2.2.10 Metadata File Location: the partition-relative logical
+/// block of the Metadata File's File Entry, a Uint32 at offset 40 of the
+/// Metadata Partition Map that starts at `map` within the Logical Volume
+/// Descriptor `lvd`.
+///
+/// `None` when the map does not fit wholly inside the descriptor, or when its
+/// partition type identifier is not "*UDF Metadata Partition" — a Virtual
+/// (UDF 2.50 2.2.8) or Sparable (2.2.9) partition map is also ECMA-167
+/// 3/10.7.3 Type 2 and records unrelated fields at that offset, so its bytes
+/// must never be read as a location.
+fn metadata_file_location(lvd: &[u8; 2048], map: usize) -> Option<u32> {
+    // ECMA-167 3/10.7.3 fixes the Type 2 map at 64 bytes.
+    if map.checked_add(64)? > lvd.len() {
+        return None;
+    }
+    // EntityID (ECMA-167 1/7.4): a flags byte then 23 identifier characters.
+    if &lvd[map + 5..map + 28] != b"*UDF Metadata Partition" {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        lvd[map + 40],
+        lvd[map + 41],
+        lvd[map + 42],
+        lvd[map + 43],
+    ]))
 }
 
 /// Maximum directory nesting depth followed when building the tree.
@@ -1729,6 +1788,152 @@ mod tests {
         s
     }
 
+    /// Build a File Entry (ECMA-167 4/14.9, tag 261) or Extended File Entry
+    /// (4/14.17, tag 266) carrying short ADs, with every disc-controlled
+    /// field of the descriptor area exposed:
+    ///
+    /// * `l_ea`  — extended-attribute length. The descriptors begin at the
+    ///   entry type's own base (176 for a 261, 216 for a 266) PLUS this. The
+    ///   attribute area is filled with a recognisable pattern so a descriptor
+    ///   read from the wrong offset cannot silently produce a usable value.
+    /// * `l_ad`  — the DECLARED descriptor-area length, independent of how
+    ///   many descriptors are actually written.
+    /// * `extra` — descriptors written immediately after the declared area,
+    ///   i.e. bytes the entry does not claim are descriptors at all.
+    fn build_entry_ads(
+        tag: u16,
+        l_ea: usize,
+        l_ad: u32,
+        ads: &[(u32, u32, u32)],
+        extra: &[(u32, u32, u32)],
+    ) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        s[0..2].copy_from_slice(&tag.to_le_bytes());
+        let (l_ea_off, base) = if tag == 266 {
+            (208usize, 216usize)
+        } else {
+            (168usize, 176usize)
+        };
+        s[l_ea_off..l_ea_off + 4].copy_from_slice(&(l_ea as u32).to_le_bytes());
+        s[l_ea_off + 4..l_ea_off + 8].copy_from_slice(&l_ad.to_le_bytes());
+        s[base..base + l_ea].fill(0xA5);
+        let mut off = base + l_ea;
+        for &(etype, dlen, dlba) in ads.iter().chain(extra) {
+            if off + 8 > s.len() {
+                break;
+            }
+            let raw_len = (etype << 30) | (dlen & 0x3FFF_FFFF);
+            s[off..off + 4].copy_from_slice(&raw_len.to_le_bytes());
+            s[off + 4..off + 8].copy_from_slice(&dlba.to_le_bytes());
+            off += 8;
+        }
+        s
+    }
+
+    #[test]
+    fn icb_extents_reads_both_entry_types_at_their_own_descriptor_offsets() {
+        // ECMA-167 4/14.9 puts a File Entry's L_EA at byte 168 and its
+        // allocation descriptors at 176 + L_EA; 4/14.17 puts an Extended File
+        // Entry's at 208 and 216 + L_EA. Both are legal ICBs for a file — a
+        // 261 is what UDF 1.02 DVD-Video discs carry — and real entries do
+        // record extended attributes, so the offset must be computed, not
+        // assumed. Refusing a 261 outright loses every file on such a disc;
+        // computing the offset any other way reads the attribute bytes (or
+        // the fixed header) as an extent.
+        let want = vec![(4096, 8192), (16384, 2048)];
+        for tag in [261u16, 266u16] {
+            for l_ea in [0usize, 88] {
+                let icb = build_entry_ads(tag, l_ea, 16, &[(0, 8192, 4096), (0, 2048, 16384)], &[]);
+                let mut reader = MapReader::new();
+                reader.put(5, icb);
+                let fs = fs_with(0, 0, file_entry("F", 5, 10240));
+                let got = tuples(
+                    &fs.read_icb_extents(&mut reader, 5)
+                        .unwrap_or_else(|e| panic!("tag {tag}, L_EA {l_ea}: {e:?}")),
+                );
+                assert_eq!(got, want, "tag {tag}, L_EA {l_ea}");
+            }
+        }
+    }
+
+    #[test]
+    fn icb_extents_reads_a_descriptor_list_flush_with_the_end_of_the_entry() {
+        // The extended-attribute area may run right up to the point where the
+        // final short_ad exactly fills the rest of the 2048-byte logical
+        // block. That descriptor is wholly inside the entry and must be read:
+        // a bound that excludes it drops the file's only extent and reports a
+        // file with no data instead of an error.
+        for tag in [261u16, 266u16] {
+            let base = if tag == 266 { 216 } else { 176 };
+            let icb = build_entry_ads(tag, 2048 - base - 8, 8, &[(0, 2048, 4096)], &[]);
+            let mut reader = MapReader::new();
+            reader.put(5, icb);
+            let fs = fs_with(0, 0, file_entry("F", 5, 2048));
+            let got =
+                tuples(&fs.read_icb_extents(&mut reader, 5).unwrap_or_else(|e| {
+                    panic!("tag {tag}: a flush descriptor is in bounds: {e:?}")
+                }));
+            assert_eq!(got, vec![(4096, 2048)], "tag {tag}");
+        }
+    }
+
+    #[test]
+    fn icb_extents_refuses_a_descriptor_area_that_runs_past_the_entry() {
+        // L_AD is a disc-controlled Uint32. One that puts the end of the
+        // descriptor area past the end of the 2048-byte entry is malformed,
+        // and reading it walks off the sector buffer.
+        for tag in [261u16, 266u16] {
+            let icb = build_entry_ads(tag, 0, 4000, &[(0, 2048, 4096)], &[]);
+            let mut reader = MapReader::new();
+            reader.put(5, icb);
+            let fs = fs_with(0, 0, file_entry("F", 5, 2048));
+            let err = fs
+                .read_icb_extents(&mut reader, 5)
+                .expect_err("a descriptor area larger than the entry cannot be read");
+            assert!(matches!(err, Error::DiscRead { .. }), "tag {tag}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn icb_extents_stops_at_the_declared_descriptor_area_length() {
+        // L_AD says how many bytes of the entry are allocation descriptors.
+        // What follows is extended-attribute padding, alignment, or nothing
+        // at all — never descriptors. Reading past L_AD invents extents the
+        // file does not have, and they land at whatever LBAs those bytes
+        // happen to spell: for a file being reassembled from its extents that
+        // is silent corruption, appended to the end of every such file.
+        let icb = build_entry_ads(266, 0, 8, &[(0, 2048, 4096)], &[(0, 2048, 999_999)]);
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        let fs = fs_with(0, 0, file_entry("F", 5, 2048));
+        let got = tuples(&fs.read_icb_extents(&mut reader, 5).expect("extents"));
+        assert_eq!(
+            got,
+            vec![(4096, 2048)],
+            "bytes past the declared L_AD are not allocation descriptors"
+        );
+    }
+
+    #[test]
+    fn icb_extents_does_not_follow_a_zero_length_continuation_pointer() {
+        // ECMA-167 4/14.14.1.1: an allocation descriptor whose extent length
+        // is zero designates no extent — including a type-3 "next extent of
+        // allocation descriptors" pointer. Following one reads whatever
+        // sector its extent_location happens to name and parses it as an
+        // Allocation Extent Descriptor, appending extents the file never had.
+        let icb = build_efe(2048, &[(0, 2048, 10), (3, 0, 50)]);
+        let mut reader = MapReader::new();
+        reader.put(105, icb); // meta_start 100 + meta_lba 5
+        reader.put(150, build_cont_block(&[(0, 4096, 700), (0, 4096, 800)]));
+        let fs = fs_with(1000, 100, file_entry("F", 5, 2048));
+        let got = tuples(&fs.read_icb_extents(&mut reader, 5).expect("extents"));
+        assert_eq!(
+            got,
+            vec![(10, 2048)],
+            "a zero-length continuation pointer points at nothing"
+        );
+    }
+
     fn fs_with(part_start: u32, meta_start: u32, root: DirEntry) -> UdfFs {
         UdfFs {
             root,
@@ -2264,14 +2469,33 @@ mod tests {
         // is at byte offset +12, NOT +4 (that's RecordedLength). The parser
         // branches on ICB-tag flags==2 to a 20-byte stride and lba_off=off+12.
         // Three extents must come back with the CORRECT LBAs and lengths.
-        let icb = build_efe_ext(3 * 2048, &[(0, 2048, 700), (0, 2048, 800), (0, 4096, 900)]);
+        //
+        // Each logicalBlockNumber is given four distinct non-zero bytes: the
+        // field is a Uint32 and every byte of it carries weight, so a byte
+        // sourced from the wrong offset must change the answer rather than
+        // landing on a zero that happens to match.
+        let icb = build_efe_ext(
+            3 * 2048,
+            &[
+                (0, 2048, 0x0102_0304),
+                (0, 2048, 0x0506_0708),
+                (0, 4096, 0x090A_0B0C),
+            ],
+        );
         let mut reader = MapReader::new();
         reader.put(5, icb);
         let fs = fs_with(0, 0, file_entry("EXT", 5, 3 * 2048));
         let extents = tuples(&fs.read_icb_extents(&mut reader, 5).expect("extents"));
         // If the stride were wrong (8 or 16) or lba_off were off+4, the LBAs
         // would be the 0xDEADBEEF junk or misaligned garbage, not these.
-        assert_eq!(extents, vec![(700, 2048), (800, 2048), (900, 4096)]);
+        assert_eq!(
+            extents,
+            vec![
+                (0x0102_0304, 2048),
+                (0x0506_0708, 2048),
+                (0x090A_0B0C, 4096)
+            ]
+        );
     }
 
     #[test]
@@ -2371,6 +2595,26 @@ mod tests {
         // Bytes: [16][00 'A'][00 'Z'].
         let raw = [16u8, 0x00, b'A', 0x00, b'Z'];
         assert_eq!(parse_udf_name(&raw), "AZ");
+    }
+
+    #[test]
+    fn parse_udf_name_utf16be_uses_both_bytes_of_each_dchar_and_stops_on_an_odd_tail() {
+        // UDF 2.50 2.1.1 / ECMA-167 1/7.2.2: compression ID 16 means the
+        // characters are 16-bit BIG-endian — the FIRST byte of each pair is
+        // the high half. Discs really do carry names outside Latin-1 (a
+        // Japanese BD's disc label, a track name), and dropping the high half
+        // turns each of those into a different character entirely.
+        //
+        // The byte run is also given an ODD length, as a truncated or
+        // corrupt name field has: the trailing lone byte is not half a
+        // character and must be left alone, not paired with whatever follows
+        // the buffer.
+        let raw = [16u8, 0x4E, 0x2D, 0x00, b'A', 0x42];
+        assert_eq!(
+            parse_udf_name(&raw),
+            "\u{4E2D}A",
+            "0x4E,0x2D is one dchar U+4E2D, and the lone 0x42 is not a character"
+        );
     }
 
     #[test]
@@ -2536,6 +2780,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_dstring_decodes_a_utf16be_volume_identifier() {
+        // ECMA-167 1/7.2.12 d-strings carry the same OSTA CS0 encoding as
+        // file names: a compression ID then the characters, with the used
+        // byte count in the LAST byte of the fixed field. Compression ID 16
+        // means 16-bit BIG-endian characters — a Volume Identifier decoded
+        // any other way is the wrong string in the disc label a caller shows
+        // and in every name it is matched against.
+        //
+        // The content deliberately contains a character above Latin-1 (so the
+        // high byte of the pair carries weight), an embedded NUL pair (which
+        // pads a fixed-width field and is not a character), and an odd
+        // trailing byte (which is not half a character).
+        let mut field = [0u8; 32];
+        let content: [u8; 10] = [16, 0x4E, 0x2D, 0x00, b'A', 0x00, 0x00, 0x00, b'B', 0x43];
+        field[..content.len()].copy_from_slice(&content);
+        *field.last_mut().unwrap() = content.len() as u8;
+        assert_eq!(
+            parse_dstring(&field),
+            "\u{4E2D}AB",
+            "big-endian pairs, no NUL padding, and no character made from the odd tail byte"
+        );
+    }
+
+    #[test]
     fn parse_dstring_oversized_length_byte_returns_empty_not_panic() {
         // Hostile/corrupt input: a length byte larger than the field must not
         // index out of bounds. parse_dstring guards len > data.len() → "".
@@ -2544,6 +2812,252 @@ mod tests {
         field[1] = b'A';
         *field.last_mut().unwrap() = 200; // way past the 8-byte field
         assert_eq!(parse_dstring(&field), "");
+    }
+
+    /// Build an Extended File Entry whose data is EMBEDDED in the ICB —
+    /// ICB Tag flags (abs offset 34) low three bits == 3, ECMA-167 4/14.6.8.
+    /// The allocation-descriptor area then holds the file's bytes, not
+    /// descriptors. Tiny files (the AACS `*.inf` key files, small nav files)
+    /// are routinely recorded this way.
+    fn build_inline_icb(info_len: u64, payload: &[u8]) -> [u8; 2048] {
+        build_inline_icb_tagged(266, 0, info_len, payload)
+    }
+
+    /// As [`build_inline_icb`], for either entry type and with an explicit
+    /// extended-attribute length: a 261 File Entry keeps L_EA at 168 and its
+    /// descriptor area at 176 + L_EA, a 266 at 208 and 216 + L_EA.
+    fn build_inline_icb_tagged(tag: u16, l_ea: usize, info_len: u64, payload: &[u8]) -> [u8; 2048] {
+        let mut icb = [0u8; 2048];
+        icb[0..2].copy_from_slice(&tag.to_le_bytes());
+        icb[34..36].copy_from_slice(&3u16.to_le_bytes()); // AD type 3 = embedded
+        icb[56..64].copy_from_slice(&info_len.to_le_bytes());
+        let (l_ea_off, base) = if tag == 266 {
+            (208usize, 216usize)
+        } else {
+            (168usize, 176usize)
+        };
+        icb[l_ea_off..l_ea_off + 4].copy_from_slice(&(l_ea as u32).to_le_bytes());
+        icb[l_ea_off + 4..l_ea_off + 8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        icb[base..base + l_ea].fill(0xA5);
+        let at = base + l_ea;
+        if at + payload.len() <= icb.len() {
+            icb[at..at + payload.len()].copy_from_slice(payload);
+        }
+        icb
+    }
+
+    #[test]
+    fn read_file_reads_embedded_data_from_both_entry_types_at_their_own_offsets() {
+        // Embedded data lives in the allocation-descriptor area, which starts
+        // at 176 + L_EA in a File Entry (ECMA-167 4/14.9) and 216 + L_EA in
+        // an Extended File Entry (4/14.17). Both entry types can embed, and
+        // real entries do carry extended attributes.
+        //
+        // Getting the offset wrong here does not fail — `read_inline_data`
+        // returns whatever bytes are at the computed offset, so an AACS
+        // `*.inf` key file comes back as extended-attribute bytes, and the
+        // key derivation fails somewhere else entirely. Missing the 261 arm
+        // is worse: the file falls through to the extent path, where the
+        // embedded payload is parsed as allocation descriptors.
+        let payload: Vec<u8> = (0..48u8)
+            .map(|i| i.wrapping_mul(11).wrapping_add(3))
+            .collect();
+        for tag in [261u16, 266u16] {
+            for l_ea in [0usize, 24] {
+                let mut reader = MapReader::new();
+                reader.put(5, build_inline_icb_tagged(tag, l_ea, 48, &payload));
+                let fs = fs_with_file(5, 48);
+                let got = fs
+                    .read_file(&mut reader, "/F")
+                    .unwrap_or_else(|e| panic!("tag {tag}, L_EA {l_ea}: {e:?}"));
+                assert_eq!(got, payload, "tag {tag}, L_EA {l_ea}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_file_reads_embedded_data_flush_with_the_end_of_the_entry() {
+        // The embedded payload may run exactly to the end of the 2048-byte
+        // logical block. Those bytes are inside the entry and are the file:
+        // refusing them turns a readable file into a disc-read failure.
+        let len = 2048 - 216;
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8 + 1).collect();
+        let mut reader = MapReader::new();
+        reader.put(5, build_inline_icb(len as u64, &payload));
+        let fs = fs_with_file(5, len as u64);
+
+        let got = fs
+            .read_file(&mut reader, "/F")
+            .expect("a payload flush with the end of the entry is in bounds");
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn read_file_refuses_embedded_data_that_runs_past_the_entry() {
+        // L_AD is disc-controlled. One that claims more embedded bytes than
+        // the entry holds must be refused, not silently clamped: a clamp
+        // hands back a short prefix of a key file, which reads as a valid but
+        // wrong record rather than as a failure.
+        let mut icb = build_inline_icb(64, &[0xAB; 64]);
+        icb[212..216].copy_from_slice(&4000u32.to_le_bytes()); // L_AD past the sector
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        let fs = fs_with_file(5, 64);
+
+        let err = fs
+            .read_file(&mut reader, "/F")
+            .expect_err("an embedded payload larger than the entry cannot be read");
+        assert!(matches!(err, Error::DiscRead { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn read_sectors_batches_a_cold_single_sector_read_into_a_full_window() {
+        // The whole point of this reader is that one single-sector request
+        // pulls a `batch`-sector window off the drive so the neighbouring
+        // requests — which UDF parsing issues constantly — cost nothing.
+        // A window sized wrongly still returns correct bytes (the read falls
+        // back to one sector at a time), so only the command count shows it.
+        let mut inner = CountReader::new();
+        {
+            let mut br = BufferedSectorReader::new(&mut inner, 4);
+            let mut buf = [0u8; 2048];
+            for lba in [500u32, 501, 502, 503] {
+                br.read_sectors(lba, 1, &mut buf, true)
+                    .unwrap_or_else(|e| panic!("read of {lba}: {e:?}"));
+                assert_eq!(buf, CountReader::expected(lba), "sector {lba}");
+            }
+        }
+        assert_eq!(
+            inner.calls, 1,
+            "one batch command must serve all four sectors of the window"
+        );
+        assert_eq!(inner.sectors_read, 4);
+    }
+
+    #[test]
+    fn read_file_trims_embedded_data_to_the_declared_information_length() {
+        // ECMA-167 4/14.17: Information Length is the file's real size. The
+        // embedded-data area (L_AD bytes) is padded out to whatever alignment
+        // the authoring tool chose, so it is routinely LONGER than the file.
+        // Returning the padding makes every embedded file longer than it is —
+        // an AACS `*.inf` record parsed with trailing garbage, a nav file
+        // whose trailing structure count no longer matches its length.
+        let payload: Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(7).wrapping_add(1))
+            .collect();
+        let mut reader = MapReader::new();
+        reader.put(5, build_inline_icb(20, &payload));
+        let fs = fs_with_file(5, 20);
+
+        let got = fs
+            .read_file(&mut reader, "/F")
+            .expect("embedded file reads");
+        assert_eq!(
+            got,
+            payload[..20].to_vec(),
+            "an embedded file is Information Length bytes long, not L_AD bytes"
+        );
+    }
+
+    #[test]
+    fn read_file_prefix_caps_embedded_data_at_the_requested_length() {
+        // `read_file_prefix` exists to bound a read: the AACS `MKB_RO.inf` is
+        // allocated to ~128 MiB of zero padding and only its leading record
+        // is wanted. The bound must apply on the EMBEDDED path too — nothing
+        // else limits it there, since the embedded payload is already in
+        // hand by the time the cap would be checked.
+        let payload: Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(7).wrapping_add(1))
+            .collect();
+        let mut reader = MapReader::new();
+        reader.put(5, build_inline_icb(64, &payload));
+        let fs = fs_with_file(5, 64);
+
+        let got = fs
+            .read_file_prefix(&mut reader, "/F", 8)
+            .expect("embedded prefix reads");
+        assert_eq!(got, payload[..8].to_vec(), "the requested prefix bounds it");
+    }
+
+    #[test]
+    fn file_start_lba_descends_only_through_directories_that_match_the_path() {
+        // Each path component must match a child that is BOTH a directory AND
+        // named for that component. Matching either alone walks into the
+        // first directory it meets — on a BD-ROM that is `AACS/`, sitting
+        // right next to `BDMV/` — and then reports the LBA of a file from a
+        // completely different subtree as if it were the requested one.
+        let fs = fs_with(
+            1000,
+            0,
+            DirEntry {
+                name: String::new(),
+                is_dir: true,
+                meta_lba: 0,
+                size: 0,
+                entries: vec![
+                    DirEntry {
+                        name: "AACS".to_string(),
+                        is_dir: true,
+                        meta_lba: 0,
+                        size: 0,
+                        entries: vec![file_entry("INDEX.BDMV", 6, 2048)],
+                    },
+                    DirEntry {
+                        name: "BDMV".to_string(),
+                        is_dir: true,
+                        meta_lba: 0,
+                        size: 0,
+                        entries: vec![file_entry("INDEX.BDMV", 7, 2048)],
+                    },
+                ],
+            },
+        );
+        let mut reader = MapReader::new();
+        reader.put(6, build_efe(2048, &[(0, 2048, 111)])); // the AACS/ copy
+        reader.put(7, build_efe(2048, &[(0, 2048, 222)])); // the BDMV/ copy
+
+        let lba = fs
+            .file_start_lba(&mut reader, "/BDMV/INDEX.BDMV")
+            .expect("the path resolves");
+        assert_eq!(lba, 1000 + 222, "BDMV/INDEX.BDMV, not AACS/INDEX.BDMV");
+    }
+
+    #[test]
+    fn read_file_accepts_a_file_exactly_at_the_size_ceiling() {
+        // `MAX_FILE_BYTES` bounds what an unbounded read may allocate. A file
+        // whose declared size, and whose single extent, are exactly the
+        // ceiling is admissible: rejecting it makes the largest legal read
+        // fail, and the caller cannot tell that from a corrupt disc.
+        let cap = MAX_FILE_BYTES as u32;
+        let mut reader = MapReader::new();
+        reader.put(5, build_efe(MAX_FILE_BYTES, &[(0, cap, 40)]));
+        let fs = fs_with_file(5, MAX_FILE_BYTES);
+
+        let got = fs
+            .read_file(&mut reader, "/F")
+            .expect("a file exactly at the ceiling must be readable");
+        assert_eq!(got.len(), MAX_FILE_BYTES as usize);
+    }
+
+    #[test]
+    fn read_file_sums_extent_lengths_rather_than_combining_them_some_other_way() {
+        // The running-total guard exists so that many individually-legal
+        // extents cannot add up to a GiB allocation. It must compare the SUM
+        // of what has been read with the ceiling: two 16 MiB extents are
+        // 32 MiB of file, comfortably legal, and combining them any other way
+        // refuses a file that is well within bounds.
+        const EXT: u32 = 16 * 1024 * 1024;
+        let mut reader = MapReader::new();
+        reader.put(
+            5,
+            build_efe(2 * EXT as u64, &[(0, EXT, 100), (0, EXT, 20_000)]),
+        );
+        let fs = fs_with_file(5, 2 * EXT as u64);
+
+        let got = fs
+            .read_file(&mut reader, "/F")
+            .expect("32 MiB across two extents is under the 64 MiB ceiling");
+        assert_eq!(got.len(), 2 * EXT as usize);
     }
 
     #[test]
@@ -2573,6 +3087,202 @@ mod tests {
         assert!(
             result.is_err(),
             "oversized L_EA must return Err, not Ok(Some(empty vec))"
+        );
+    }
+
+    /// A `SectorSource` that gives every sector a content derived from its
+    /// own LBA and counts how many read commands it is issued. Both matter:
+    /// the content says WHICH sector a caller actually got, the count says
+    /// whether the cache served it without touching the media.
+    struct CountReader {
+        calls: usize,
+        sectors_read: usize,
+    }
+
+    impl CountReader {
+        fn new() -> Self {
+            Self {
+                calls: 0,
+                sectors_read: 0,
+            }
+        }
+        /// Sector `lba` is filled with a byte pattern unique to `lba`.
+        fn expected(lba: u32) -> [u8; 2048] {
+            let mut s = [0u8; 2048];
+            s[0..4].copy_from_slice(&lba.to_le_bytes());
+            s[2044..2048].copy_from_slice(&(!lba).to_le_bytes());
+            s
+        }
+    }
+
+    impl SectorSource for CountReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            let need = count as usize * 2048;
+            if buf.len() < need {
+                return Err(Error::UdfBufferTooSmall);
+            }
+            self.calls += 1;
+            self.sectors_read += count as usize;
+            for i in 0..count as u32 {
+                let off = i as usize * 2048;
+                buf[off..off + 2048].copy_from_slice(&Self::expected(lba.wrapping_add(i)));
+            }
+            Ok(need)
+        }
+    }
+
+    #[test]
+    fn prefetch_serves_every_sector_of_the_window_from_the_cache() {
+        // `prefetch` exists to turn thousands of single-sector reads of the
+        // metadata partition into a handful of batched commands. It only does
+        // that if the window it loads is (a) actually read, (b) placed so
+        // each sector is served from its OWN offset, and (c) consulted
+        // afterwards. Loading nothing, or misplacing the window, still
+        // "works" — every read just goes back to the drive, or worse returns
+        // a neighbouring sector's bytes.
+        let mut inner = CountReader::new();
+        {
+            let mut br = BufferedSectorReader::new(&mut inner, 3);
+            br.prefetch(100, 8); // 8 sectors in batches of 3 → 3 commands
+            let mut buf = [0u8; 2048];
+            for lba in [100u32, 103, 107] {
+                br.read_sectors(lba, 1, &mut buf, true)
+                    .unwrap_or_else(|e| panic!("cached read of {lba}: {e:?}"));
+                assert_eq!(
+                    buf,
+                    CountReader::expected(lba),
+                    "sector {lba} came back as some other sector"
+                );
+            }
+        }
+        assert_eq!(
+            inner.calls, 3,
+            "the window is loaded in batch-sized commands and then answers reads without the drive"
+        );
+        assert_eq!(inner.sectors_read, 8);
+    }
+
+    #[test]
+    fn prefetch_window_does_not_answer_for_the_sector_just_past_its_end() {
+        // The window covers `count` sectors starting at `start_lba` — the
+        // sector at start_lba + count belongs to whatever is next, not to
+        // this window. Answering for it hands back bytes from beyond the
+        // loaded data.
+        let mut inner = CountReader::new();
+        let mut br = BufferedSectorReader::new(&mut inner, 8);
+        br.prefetch(100, 8);
+        let mut buf = [0u8; 2048];
+        br.read_sectors(108, 1, &mut buf, true)
+            .expect("the sector past the window is read from the drive");
+        assert_eq!(buf, CountReader::expected(108));
+    }
+
+    #[test]
+    fn prefetch_ranges_serves_every_sector_of_every_range_from_the_permanent_cache() {
+        // `prefetch_ranges` seeds the permanent per-sector cache from the
+        // scattered ranges `metadata_sector_ranges` produced. Each sector of
+        // each range must be keyed at its own LBA: a key computed from the
+        // wrong base silently answers later reads of unrelated LBAs — the
+        // AVDP/VDS re-reads among them — with this file's bytes.
+        let mut inner = CountReader::new();
+        {
+            let mut br = BufferedSectorReader::new(&mut inner, 2);
+            br.prefetch_ranges(&[(200, 5), (300, 2)]);
+            let mut buf = [0u8; 2048];
+            for lba in [200u32, 202, 204, 300, 301] {
+                br.read_sectors(lba, 1, &mut buf, true)
+                    .unwrap_or_else(|e| panic!("cached read of {lba}: {e:?}"));
+                assert_eq!(
+                    buf,
+                    CountReader::expected(lba),
+                    "sector {lba} came back as some other sector"
+                );
+            }
+        }
+        // 5 sectors in batches of 2 → 3 commands; 2 sectors → 1 command. The
+        // five reads above add none.
+        assert_eq!(inner.calls, 4);
+        assert_eq!(inner.sectors_read, 7);
+    }
+
+    #[test]
+    fn metadata_sector_ranges_covers_the_structure_and_each_small_files_extents() {
+        // The prefetch plan is what decides which sectors are pulled off the
+        // disc in bulk before scanning. It must cover the UDF structure
+        // through the end of the metadata partition, every non-STREAM file's
+        // ICB, and every RECORDED extent of the files small enough to cache —
+        // and it must not cache the multi-GB STREAM payloads or the extents
+        // of a file past the size cap. Returning an empty or arbitrary plan
+        // costs no correctness, only every bulk read, so nothing downstream
+        // notices; the ranges themselves are the only observable.
+        const PART: u32 = 1000;
+        let fs = UdfFs {
+            root: DirEntry {
+                name: String::new(),
+                is_dir: true,
+                meta_lba: 0,
+                size: 0,
+                entries: vec![
+                    DirEntry {
+                        name: "BDMV".to_string(),
+                        is_dir: true,
+                        meta_lba: 1,
+                        size: 0,
+                        entries: vec![file_entry("INDEX.BDMV", 10, 4096)],
+                    },
+                    DirEntry {
+                        name: "STREAM".to_string(),
+                        is_dir: true,
+                        meta_lba: 2,
+                        size: 0,
+                        entries: vec![file_entry("00000.M2TS", 11, 2048)],
+                    },
+                    // Exactly at the 50 MB ceiling — cacheable.
+                    file_entry("EXACT.BIN", 12, 50_000_000),
+                    // One byte over — its data is not cached, but its ICB is.
+                    file_entry("HUGE.BIN", 13, 50_000_001),
+                    file_entry("SPARSE.BIN", 14, 6144),
+                ],
+            },
+            volume_id: String::new(),
+            partition_start: PART,
+            metadata_start: PART,
+            metadata_sectors: 4,
+        };
+
+        let mut reader = MapReader::new();
+        reader.put(PART + 10, build_efe(4096, &[(0, 4096, 500)]));
+        reader.put(PART + 11, build_efe(2048, &[(0, 2048, 600)])); // STREAM: never read
+        reader.put(PART + 12, build_efe(50_000_000, &[(0, 2048, 800)]));
+        reader.put(PART + 13, build_efe(50_000_001, &[(0, 2048, 850)]));
+        // An unrecorded extent holds nothing to cache; the recorded one does.
+        reader.put(
+            PART + 14,
+            build_efe(6144, &[(1, 4096, 700), (0, 2048, 900)]),
+        );
+
+        let ranges = fs
+            .metadata_sector_ranges(&mut reader)
+            .expect("the plan is built");
+
+        // (0, 1004)  structure through the end of the metadata partition
+        // (1010, 5)  the ICBs of INDEX.BDMV, EXACT.BIN, HUGE.BIN, SPARSE.BIN,
+        //            merged with the adjacent LBAs between them
+        // (1500, 2)  INDEX.BDMV's 4096-byte extent
+        // (1800, 1)  EXACT.BIN's extent — at the ceiling, so still cached
+        // (1900, 1)  SPARSE.BIN's recorded extent only
+        // Absent: 1011 alone (STREAM is not descended at all, not even for
+        // its ICB), 1600 (00000.M2TS), 1850 (HUGE.BIN's data), 1700
+        // (SPARSE.BIN's unrecorded extent).
+        assert_eq!(
+            ranges,
+            vec![(0, 1004), (1010, 5), (1500, 2), (1800, 1), (1900, 1)]
         );
     }
 
@@ -2635,6 +3345,16 @@ mod tests {
             assert!(
                 lba >= 0xFFFF_FFF0,
                 "prefetch_ranges wrapped a near-u32::MAX LBA to {lba}"
+            );
+        }
+        // Clamping the range must drop only the sectors that cannot be
+        // addressed. Dropping the addressable ones too costs the bulk read
+        // that is this function's entire purpose, and nothing downstream can
+        // tell, because the sliding-window path still serves every LBA.
+        for lba in 0xFFFF_FFF0u32..=0xFFFF_FFFE {
+            assert!(
+                br.prefetched.contains_key(&lba),
+                "addressable sector {lba} was dropped from the prefetch"
             );
         }
     }
@@ -2907,6 +3627,514 @@ mod tests {
         assert_eq!(fs.partition_start(), PART_START);
         assert_eq!(fs.root.entries.len(), 1);
         assert_eq!(fs.root.entries[0].name, "INDEX.BDMV");
+    }
+
+    // ---- UDF 2.50 Metadata Partition coverage.
+    //
+    // Every BD-ROM records its file-system metadata in a Metadata Partition
+    // (UDF 2.50 2.2.10 / BD white paper 3 §"Metadata File"): the Logical
+    // Volume Descriptor carries TWO partition maps, a Type 1 physical map and
+    // a Type 2 metadata map, and the directory tree lives inside a Metadata
+    // File whose own File Entry sits in the physical partition. Nothing in
+    // this crate built such a volume, so the entire two-map branch of
+    // `read_filesystem` — the branch every real disc takes — was parsed by no
+    // test at all.
+
+    /// How one synthetic UDF 2.50 metadata-partition volume is laid out.
+    /// Every field a disc controls is a knob so a single builder can produce
+    /// the conformant case and each malformed variant.
+    struct MetaVol {
+        /// Map type byte of the first partition map (1 = physical).
+        pm1_type: u8,
+        /// Length byte of the Type 1 physical partition map (real value: 6).
+        /// The Type 2 map begins at 440 + this.
+        pm1_len: u8,
+        /// Map type byte of the second partition map (2 = Type 2).
+        pm2_type: u8,
+        /// The Type 2 map's partition type identifier (UDF 2.50 2.2.10).
+        ident: &'static [u8],
+        /// UDF 2.50 2.2.10 Metadata File Location: the partition-relative
+        /// block recorded in the map as holding the Metadata File's FE.
+        meta_file_loc: u32,
+        /// Where the Metadata File's File Entry is ACTUALLY written
+        /// (partition-relative). Equal to `meta_file_loc` on a sane volume.
+        meta_fe_at: u32,
+        /// L_EA of that File Entry — its allocation descriptor starts at
+        /// 216 + L_EA, not at 216.
+        l_ea: usize,
+        /// The Metadata File's single extent: byte length and its
+        /// partition-relative LBA. Together these define the metadata
+        /// partition, i.e. `metadata_start` and `metadata_sectors`.
+        meta_bytes: u32,
+        meta_pos: u32,
+        /// A second, DIFFERENT Metadata-File-shaped File Entry planted at this
+        /// partition-relative block. Following the wrong one yields a
+        /// different metadata partition, so a reader that picks it up is
+        /// caught by `metadata_start`, not merely by an error.
+        decoy_meta_fe: Option<u32>,
+    }
+
+    /// A conformant UDF 2.50 metadata-partition volume, as a BD-ROM records
+    /// it, with the Metadata File FE where the partition map says it is.
+    ///
+    /// The extent length and position are given distinct byte patterns, and
+    /// distinct patterns from one another, so a descriptor byte sourced from
+    /// the wrong offset — or the two fields transposed — changes the reported
+    /// metadata partition rather than landing on a value that happens to
+    /// work. The length is an exact multiple of the 2048-byte logical sector,
+    /// as a real metadata partition is: its only observable is a sector
+    /// COUNT, which rounds up, so an off-by-one byte in the low half is
+    /// visible only when the true value sits exactly on the boundary.
+    fn conformant_meta_vol() -> MetaVol {
+        MetaVol {
+            pm1_type: 1,
+            pm1_len: 6,
+            pm2_type: 2,
+            ident: b"*UDF Metadata Partition",
+            meta_file_loc: 9,
+            meta_fe_at: 9,
+            l_ea: 8,
+            meta_bytes: 0x0102_0800, // 16 910 336 bytes == exactly 8257 sectors
+            meta_pos: 0x0203_0405,
+            decoy_meta_fe: None,
+        }
+    }
+
+    /// Metadata-partition-relative LBAs of the tree inside the Metadata File.
+    const MV_ROOT_ICB: u32 = 3;
+    const MV_ROOT_DATA: u32 = 4;
+    const MV_FILE_ICB: u32 = 5;
+    const MV_VOLUME_ID: &str = "FREEMKV-META";
+    const MV_FILE_SIZE: u64 = 100;
+
+    /// Partition-relative LBAs of a SECOND, decoy tree rooted at block 0 of
+    /// the physical partition — what a reader sees if it never resolves the
+    /// metadata partition and treats the physical partition as the file set.
+    /// Its file has a different name and a different size from the metadata
+    /// partition's, so "fell back to the physical partition" and "read the
+    /// metadata partition" are told apart by CONTENT, not by an error code.
+    const MV_FB_ROOT_ICB: u32 = 40;
+    const MV_FB_ROOT_DATA: u32 = 41;
+    const MV_FB_FILE_ICB: u32 = 42;
+    const MV_FB_FILE_SIZE: u64 = 777;
+
+    /// Lay out `spec` as a complete disc image. Also returns the absolute LBA
+    /// the metadata partition starts at, which is what `metadata_start()`
+    /// must come out as when the volume is conformant.
+    fn build_meta_vol(spec: &MetaVol) -> (fixture::MemDisc, u32) {
+        use fixture::{MemDisc, PART_START};
+        let mut disc = MemDisc::new();
+
+        // Anchor Volume Descriptor Pointer with no usable extent → the
+        // customary 32.. window is swept (exercised on its own elsewhere).
+        let mut avdp = vec![0u8; 2048];
+        avdp[0..2].copy_from_slice(&2u16.to_le_bytes());
+        disc.put_bytes(256, &avdp);
+
+        // Primary Volume Descriptor: Volume Identifier is a 32-byte d-string
+        // (ECMA-167 1/7.2.12) at offset 24 — compression id, characters, and
+        // the used length in the LAST byte of the field.
+        let mut pvd = vec![0u8; 2048];
+        pvd[0..2].copy_from_slice(&1u16.to_le_bytes());
+        pvd[24] = 8; // OSTA CS0 compression id 8 (8-bit characters)
+        pvd[25..25 + MV_VOLUME_ID.len()].copy_from_slice(MV_VOLUME_ID.as_bytes());
+        pvd[55] = 1 + MV_VOLUME_ID.len() as u8;
+        disc.put_bytes(32, &pvd);
+
+        let mut pd = vec![0u8; 2048];
+        pd[0..2].copy_from_slice(&5u16.to_le_bytes());
+        pd[188..192].copy_from_slice(&PART_START.to_le_bytes());
+        disc.put_bytes(33, &pd);
+
+        // Logical Volume Descriptor with two partition maps (ECMA-167 3/10.6:
+        // number of maps at 268, maps themselves from 440; 3/10.7 gives each
+        // map a type byte then a length byte).
+        let mut lvd = vec![0u8; 2048];
+        lvd[0..2].copy_from_slice(&6u16.to_le_bytes());
+        lvd[268..272].copy_from_slice(&2u32.to_le_bytes());
+        // Second map first, so a spec whose first map has length 0 puts both
+        // maps in the same slot exactly as a corrupt descriptor would.
+        let map2 = 440 + spec.pm1_len as usize;
+        lvd[map2] = spec.pm2_type;
+        lvd[map2 + 1] = 64; // UDF 2.50 2.2.10: the map is 64 bytes
+        // EntityID (ECMA-167 1/7.4): flags byte then 23 identifier chars.
+        lvd[map2 + 5..map2 + 5 + spec.ident.len()].copy_from_slice(spec.ident);
+        lvd[map2 + 40..map2 + 44].copy_from_slice(&spec.meta_file_loc.to_le_bytes());
+        lvd[440] = spec.pm1_type;
+        lvd[441] = spec.pm1_len;
+        disc.put_bytes(34, &lvd);
+
+        let mut td = vec![0u8; 2048];
+        td[0..2].copy_from_slice(&8u16.to_le_bytes());
+        disc.put_bytes(35, &td);
+
+        // The Metadata File's own File Entry, in the PHYSICAL partition. Its
+        // single allocation descriptor is what defines the whole metadata
+        // partition. The extended-attribute area is filled with a
+        // recognisable pattern so an allocation descriptor read from the
+        // wrong offset cannot silently produce a usable value.
+        let mut meta_fe = vec![0u8; 2048];
+        meta_fe[0..2].copy_from_slice(&266u16.to_le_bytes());
+        meta_fe[208..212].copy_from_slice(&(spec.l_ea as u32).to_le_bytes());
+        meta_fe[212..216].copy_from_slice(&8u32.to_le_bytes()); // L_AD: one short_ad
+        meta_fe[216..216 + spec.l_ea].fill(0xA5);
+        let ad = 216 + spec.l_ea;
+        // A spec whose L_EA pushes the allocation descriptor off the end of
+        // the File Entry records no descriptor at all — that is the point of
+        // such a spec.
+        if ad + 8 <= meta_fe.len() {
+            meta_fe[ad..ad + 4].copy_from_slice(&spec.meta_bytes.to_le_bytes());
+            meta_fe[ad + 4..ad + 8].copy_from_slice(&spec.meta_pos.to_le_bytes());
+        }
+        disc.put_bytes(PART_START + spec.meta_fe_at, &meta_fe);
+
+        if let Some(block) = spec.decoy_meta_fe {
+            let mut decoy = vec![0u8; 2048];
+            decoy[0..2].copy_from_slice(&266u16.to_le_bytes());
+            decoy[212..216].copy_from_slice(&8u32.to_le_bytes());
+            decoy[216..220].copy_from_slice(&0x0011_2233u32.to_le_bytes());
+            decoy[220..224].copy_from_slice(&(spec.meta_pos.wrapping_add(1000)).to_le_bytes());
+            disc.put_bytes(PART_START + block, &decoy);
+        }
+
+        // Decoy file set at block 0 of the physical partition, laid only when
+        // the Metadata File's File Entry is not itself there. Any failure to
+        // resolve the metadata partition lands `metadata_start` on
+        // `partition_start`, where this tree then mounts — so a reader that
+        // silently skips the metadata partition produces a plausible,
+        // successful, WRONG filesystem instead of an error.
+        if spec.meta_fe_at != 0 {
+            let mut fb_fsd = vec![0u8; 2048];
+            fb_fsd[0..2].copy_from_slice(&256u16.to_le_bytes());
+            fb_fsd[404..408].copy_from_slice(&MV_FB_ROOT_ICB.to_le_bytes());
+            disc.put_bytes(PART_START, &fb_fsd);
+
+            let mut fb_fids = Vec::new();
+            push_fid_iu(&mut fb_fids, "", MV_FB_ROOT_ICB, true, true, 0);
+            push_fid_iu(
+                &mut fb_fids,
+                "FALLBACK.BDMV",
+                MV_FB_FILE_ICB,
+                false,
+                false,
+                0,
+            );
+            disc.put_bytes(
+                PART_START + MV_FB_ROOT_ICB,
+                &build_dir_icb_tagged(266, 0, fb_fids.len() as u32, MV_FB_ROOT_DATA),
+            );
+            disc.put_bytes(PART_START + MV_FB_ROOT_DATA, &fb_fids);
+            disc.put_bytes(
+                PART_START + MV_FB_FILE_ICB,
+                &build_efe_icb(MV_FB_FILE_SIZE, MV_FB_FILE_SIZE as u32, 60),
+            );
+        }
+
+        // Inside the metadata partition: File Set Descriptor, root directory
+        // ICB, its FID list, and one file's ICB.
+        let meta_start = PART_START + spec.meta_pos;
+
+        let mut fsd = vec![0u8; 2048];
+        fsd[0..2].copy_from_slice(&256u16.to_le_bytes());
+        fsd[404..408].copy_from_slice(&MV_ROOT_ICB.to_le_bytes());
+        disc.put_bytes(meta_start, &fsd);
+
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "", MV_ROOT_ICB, true, true, 0);
+        push_fid_iu(&mut fids, "INDEX.BDMV", MV_FILE_ICB, false, false, 0);
+        disc.put_bytes(
+            meta_start + MV_ROOT_ICB,
+            &build_dir_icb_tagged(266, 0, fids.len() as u32, MV_ROOT_DATA),
+        );
+        disc.put_bytes(meta_start + MV_ROOT_DATA, &fids);
+        disc.put_bytes(
+            meta_start + MV_FILE_ICB,
+            &build_efe_icb(MV_FILE_SIZE, MV_FILE_SIZE as u32, 20),
+        );
+
+        (disc, meta_start)
+    }
+
+    #[test]
+    fn read_filesystem_locates_the_metadata_file_where_the_partition_map_records_it() {
+        // UDF 2.50 2.2.10 Metadata Partition Map: "Metadata File Location —
+        // the logical block address of the Metadata File within the partition
+        // identified by Partition Number", a Uint32 at map offset 40. It is
+        // the ONLY thing on the volume that says where the Metadata File's
+        // File Entry lives. Block 0 of the physical partition is a common
+        // choice, not a requirement.
+        //
+        // A volume that records the FE anywhere else must still mount.
+        use fixture::PART_START;
+        let spec = MetaVol {
+            meta_file_loc: 9,
+            meta_fe_at: 9,
+            ..conformant_meta_vol()
+        };
+        let (mut disc, meta_start) = build_meta_vol(&spec);
+
+        let fs = super::read_filesystem(&mut disc)
+            .expect("a UDF 2.50 metadata partition whose File Entry is not at block 0 must mount");
+
+        assert_eq!(fs.partition_start(), PART_START);
+        assert_eq!(
+            fs.metadata_start(),
+            meta_start,
+            "the metadata partition begins at the Metadata File's extent"
+        );
+        assert_eq!(
+            fs.metadata_sectors(),
+            spec.meta_bytes.div_ceil(2048),
+            "the metadata partition is as long as the Metadata File's extent"
+        );
+        assert_eq!(fs.volume_id, MV_VOLUME_ID);
+        assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
+        assert_eq!(fs.root.entries[0].size, MV_FILE_SIZE);
+    }
+
+    #[test]
+    fn read_filesystem_still_finds_a_metadata_file_entry_recorded_at_block_zero() {
+        // The overwhelmingly common layout: the Metadata File's File Entry is
+        // at block 0 of the physical partition and the map's Metadata File
+        // Location says so. Honouring the recorded location must not change
+        // this case.
+        let spec = MetaVol {
+            meta_file_loc: 0,
+            meta_fe_at: 0,
+            ..conformant_meta_vol()
+        };
+        let (mut disc, meta_start) = build_meta_vol(&spec);
+
+        let fs = super::read_filesystem(&mut disc).expect("the ordinary BD-ROM layout must mount");
+        assert_eq!(fs.metadata_start(), meta_start);
+        assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
+    }
+
+    #[test]
+    fn read_filesystem_falls_back_to_block_zero_when_the_recorded_location_holds_no_file_entry() {
+        // A Metadata File Location that points at a block holding no File
+        // Entry is a broken volume, not an unmountable one: the Metadata File
+        // is still discoverable at block 0, where it almost always is. A
+        // reader that trusted the field blindly would refuse a disc that used
+        // to mount.
+        let spec = MetaVol {
+            meta_file_loc: 999, // nothing is recorded there
+            meta_fe_at: 0,
+            ..conformant_meta_vol()
+        };
+        let (mut disc, meta_start) = build_meta_vol(&spec);
+
+        let fs = super::read_filesystem(&mut disc)
+            .expect("a wrong Metadata File Location must not lose a volume readable at block 0");
+        assert_eq!(fs.metadata_start(), meta_start);
+        assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
+    }
+
+    #[test]
+    fn read_filesystem_reads_no_metadata_file_location_out_of_a_sparable_partition_map() {
+        // UDF 2.50 2.2.9 Sparable and 2.2.8 Virtual partition maps are also
+        // ECMA-167 3/10.7.3 Type 2 maps, and they record entirely unrelated
+        // fields where 2.2.10 puts the Metadata File Location. Those bytes
+        // must never be read as a location: here they address a decoy File
+        // Entry declaring a different extent, which would silently mount a
+        // completely different metadata partition.
+        let spec = MetaVol {
+            ident: b"*UDF Sparable Partition",
+            meta_file_loc: 9,
+            decoy_meta_fe: Some(9),
+            meta_fe_at: 0,
+            ..conformant_meta_vol()
+        };
+        let (mut disc, meta_start) = build_meta_vol(&spec);
+
+        let fs = super::read_filesystem(&mut disc).expect(
+            "a Type 2 map that is not a Metadata Partition Map must not misdirect the read",
+        );
+        assert_eq!(
+            fs.metadata_start(),
+            meta_start,
+            "the Metadata File at block 0 defines the partition, not a byte read out of a sparable map"
+        );
+        assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
+    }
+
+    #[test]
+    fn read_filesystem_reads_a_metadata_file_extent_that_ends_flush_with_the_file_entry() {
+        // ECMA-167 4/14.17: the allocation descriptors of an Extended File
+        // Entry begin at 216 + L_EA, and the extended-attribute area may run
+        // right up to the point where the single short_ad exactly fills the
+        // rest of the logical block. That descriptor is entirely inside the
+        // File Entry and must be read: refusing it loses the whole volume,
+        // because the Metadata File's extent is the only thing that says
+        // where the file system is.
+        let spec = MetaVol {
+            l_ea: 2048 - 216 - 8, // short_ad occupies the final 8 bytes
+            ..conformant_meta_vol()
+        };
+        let (mut disc, meta_start) = build_meta_vol(&spec);
+
+        let fs = super::read_filesystem(&mut disc)
+            .expect("an allocation descriptor flush with the end of the File Entry is in bounds");
+        assert_eq!(fs.metadata_start(), meta_start);
+        assert_eq!(fs.metadata_sectors(), spec.meta_bytes.div_ceil(2048));
+        assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
+    }
+
+    #[test]
+    fn read_filesystem_refuses_a_metadata_file_whose_descriptor_runs_off_the_file_entry() {
+        // L_EA is a disc-controlled Uint32. One that leaves fewer than eight
+        // bytes of the 2048-byte File Entry after 216 + L_EA leaves no room
+        // for the short_ad, so the Metadata File's extent — and with it the
+        // metadata partition — cannot be located. Reading the descriptor
+        // anyway runs past the end of the sector buffer.
+        //
+        // 1830 is chosen so the descriptor STRADDLES the end (216 + 1830 + 8
+        // == 2054): a bound computed the other way round still looks
+        // satisfied, and then indexes out of the buffer.
+        let spec = MetaVol {
+            l_ea: 1830,
+            ..conformant_meta_vol()
+        };
+        let (mut disc, _) = build_meta_vol(&spec);
+
+        let err = super::read_filesystem(&mut disc)
+            .expect_err("a short_ad that does not fit inside the File Entry cannot be read");
+        assert!(matches!(err, Error::DiscRead { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn read_filesystem_ignores_a_zero_length_first_partition_map() {
+        // ECMA-167 3/10.7 walks the partition-map list by each map's own
+        // length byte, and that byte is disc-controlled. A map declaring
+        // length 0 does not advance the walk — the "second" map would be the
+        // first map re-read at the same offset — so the list cannot be walked
+        // and no metadata partition is resolved. Reading the map at 440 as if
+        // it were the second one lets a Type 2 byte there hijack the mount:
+        // here that map's Metadata File Location addresses the real Metadata
+        // File, so a reader that walks it lands on a whole different, and
+        // entirely plausible, filesystem.
+        let spec = MetaVol {
+            pm1_type: 2,
+            pm1_len: 0,
+            ..conformant_meta_vol()
+        };
+        let (mut disc, _) = build_meta_vol(&spec);
+
+        let fs = super::read_filesystem(&mut disc)
+            .expect("a zero-length partition map must not abort the mount");
+        assert_eq!(fs.metadata_start(), fixture::PART_START);
+        assert_eq!(child_names(&fs.root), vec!["FALLBACK.BDMV".to_string()]);
+    }
+
+    #[test]
+    fn read_filesystem_seeds_the_cycle_guard_with_the_metadata_relative_root_key() {
+        // The tree walk's cycle guard keys on (metadata_start, ICB LBA) so
+        // that two volumes' identical LBAs are not confused. `read_filesystem`
+        // pre-seeds it with the ROOT's key, so a File Identifier Descriptor
+        // pointing back at the root is recognised on sight.
+        //
+        // Composing that key wrongly (dropping the metadata half, or ANDing
+        // instead of ORing the two halves) still produces a key — just not
+        // one the walk will ever compute again. The pre-seed then matches
+        // nothing, the root is descended a second time, and the tree gains a
+        // phantom copy of itself under its own root. `metadata_start` is
+        // non-zero here precisely so that the two halves are distinguishable.
+        let spec = conformant_meta_vol();
+        let (mut disc, meta_start) = build_meta_vol(&spec);
+
+        // Re-lay the root's FID list with a directory entry pointing straight
+        // back at the root ICB.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "", MV_ROOT_ICB, true, true, 0);
+        push_fid_iu(&mut fids, "LOOP", MV_ROOT_ICB, true, false, 0);
+        disc.put_bytes(meta_start + MV_ROOT_DATA, &fids);
+
+        let fs = super::read_filesystem(&mut disc).expect("a self-referential root must not hang");
+        assert_eq!(child_names(&fs.root), vec!["LOOP".to_string()]);
+        assert!(
+            fs.root.entries[0].entries.is_empty(),
+            "the root's own ICB is already visited, so LOOP is a leaf, not a second copy of the \
+             root: got {:?}",
+            child_names(&fs.root.entries[0])
+        );
+    }
+
+    #[test]
+    fn read_filesystem_stops_the_volume_descriptor_sweep_at_the_terminating_descriptor() {
+        // ECMA-167 3/8.4.2: a Terminating Descriptor ends the Volume
+        // Descriptor Sequence. Sectors past it are not part of the sequence —
+        // they are whatever the volume happens to record next, and on a
+        // rewritten volume that is commonly a stale copy of an earlier
+        // sequence. Reading on past the terminator lets a stale Partition
+        // Descriptor overwrite the live one, and every subsequent LBA in the
+        // mount is then offset by the difference.
+        use fixture::{DirSpec, MemDisc, PART_START, build_udf_skeleton, file, lay_dir};
+
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(
+            &mut disc,
+            &DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: vec![file("INDEX.BDMV", 12, 13, 2048, false)],
+                subdirs: Vec::new(),
+            },
+        );
+
+        // Stale Partition Descriptor recorded after the Terminating
+        // Descriptor the skeleton puts at sector 34.
+        let mut stale_pd = vec![0u8; 2048];
+        stale_pd[0..2].copy_from_slice(&5u16.to_le_bytes());
+        stale_pd[188..192].copy_from_slice(&(PART_START + 4096).to_le_bytes());
+        disc.put_bytes(35, &stale_pd);
+
+        let fs = super::read_filesystem(&mut disc)
+            .expect("descriptors past the terminator must not be swept");
+        assert_eq!(
+            fs.partition_start(),
+            PART_START,
+            "the live Partition Descriptor is the one before the Terminating Descriptor"
+        );
+        assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
+    }
+
+    #[test]
+    fn read_filesystem_ignores_an_anchor_whose_main_vds_extent_starts_at_block_zero() {
+        // ECMA-167 3/10.2.1: the anchor's Main VDS extent_ad is the pointer to
+        // the sequence. Logical block 0 is the start of the volume space —
+        // reserved area, never a Volume Descriptor Sequence — so an extent
+        // recorded there is not describing one, however plausible its length.
+        // Sweeping from 0 reads the reserved area as descriptors and finds no
+        // Partition Descriptor, so the disc is rejected as not a filesystem;
+        // the customary window is the right answer for such an anchor.
+        use fixture::{DirSpec, MemDisc, PART_START, build_udf_skeleton, file, lay_dir};
+
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(
+            &mut disc,
+            &DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: vec![file("INDEX.BDMV", 12, 13, 2048, false)],
+                subdirs: Vec::new(),
+            },
+        );
+
+        let mut avdp = vec![0u8; 2048];
+        avdp[0..2].copy_from_slice(&2u16.to_le_bytes());
+        // A length that satisfies the 16-sector minimum, at block 0.
+        avdp[16..20].copy_from_slice(&(VDS_MIN_SECTORS * 2048).to_le_bytes());
+        avdp[20..24].copy_from_slice(&0u32.to_le_bytes());
+        disc.put_bytes(256, &avdp);
+
+        let fs = super::read_filesystem(&mut disc)
+            .expect("an anchor pointing its VDS at block 0 must fall back, not fail the mount");
+        assert_eq!(fs.partition_start(), PART_START);
+        assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
     }
 
     // ---- directory-descriptor boundary coverage (ECMA-167 4/14.4, 4/14.9,
