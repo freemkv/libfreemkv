@@ -524,7 +524,7 @@
   Program Stream packs several DTS core frames into one PES packet; the parser
   stamped every access unit with that single PES timestamp and no per-frame
   duration, so consecutive frames collided on one PTS and a strict decode/remux
-  (ffmpeg) rejected the track — `non monotonically increasing dts to muxer`.
+  a standard validator rejected the track — `non monotonically increasing dts to muxer`.
   The DTS parser now derives each core frame's duration from its header
   (`(NBLKS+1)*32` samples ÷ the `SFREQ` sample rate) and re-bases to each PES's
   own container timestamp, advancing by a frame duration only *within* a single
@@ -611,7 +611,7 @@ consumers are the in-tree toolchain crates.
   frame. The undecryptable aligned unit is concealed as NULL transport-stream
   packets (PID 0x1FFF, invisible to every real stream), and the codec layer
   **drops forward to the next keyframe** so no frame with a dangling reference
-  reaches the muxer. An ffmpeg deep scan of the result is clean — no missing
+  reaches the muxer. A deep validator scan of the result is clean — no missing
   references, no partial frames. The loss is tallied and logged, never silently
   dropped, and the mux always completes. Audio and subtitle tracks have no
   cross-frame references, so only the directly-affected frames are dropped there.
@@ -712,7 +712,7 @@ consumers are the in-tree toolchain crates.
   discontinuity — a continuity-counter break, an adaptation-field
   discontinuity_indicator, or a concealed-loss gap — the AC-3 / DTS / TrueHD
   parsers held a *truncated* partial access unit and spliced the post-gap bytes
-  onto it, manufacturing a corrupt frame (ffmpeg "exponent out of range" /
+  onto it, manufacturing a corrupt frame (a validator reports "exponent out of range" /
   "Failed to decode block code(s)" / "Invalid data found") and, for TrueHD, a
   non-monotonic timestamp band on multi-segment titles. The video path already
   resynced via the keyframe gate; the audio parsers now do too — on a
@@ -720,7 +720,7 @@ consumers are the in-tree toolchain crates.
   syncword, rebasing the timestamp from the post-gap PES. A discontinuity becomes
   a clean single-frame gap instead of a corrupt splice. Audio has no inter-frame
   references, so dropping the truncated partial is the complete fix; the approach
-  matches FFmpeg's parser layer and GStreamer's `tsdemux`.
+  matches how mainstream transport-stream demuxers behave.
 - **Drive-prep firmware unlock skipped for DVD discs.** An
   `if disc_is_dvd() { return }` guard in `Drive::init()` (present since
   1.0.0-rc.1) bypassed the entire drive-prep unlock step for DVDs. That unlock is

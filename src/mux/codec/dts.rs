@@ -763,9 +763,9 @@ fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
     let mut r = BitReader::new(au.get(SYNCWORD_BYTES..)?);
 
     // FTYPE: 1 = NORMAL frame, 0 = TERMINATION frame (the last frame of the
-    // stream). Per ETSI TS 102 114 and both reference decoders — ffmpeg's
-    // `ff_dca_parse_core_frame_header` (`normal_frame && deficit_samples !=
-    // DCA_PCMBLOCK_SAMPLES`) and dcadec's `parse_frame_header` (which branches
+    // stream). Per ETSI TS 102 114: a normal frame must carry a full 32-sample
+    // PCM block, so a DEFICIT_SAMPLE_COUNT other than the full block marks a
+    // terminating/short frame (the spec's deficit semantics, which
     // on `normal_frame`) — the deficit-sample field must equal 32 ONLY for a
     // normal frame. A termination frame legitimately carries fewer samples and
     // is fully decodable; dropping it would silence the last frame of every
@@ -794,7 +794,7 @@ fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
     }
     let _br_code = r.read_bits(5)?;
     // Reserved bit. Both reference decoders SKIP this field rather than reject
-    // on it — ffmpeg (`skip_bits1`) and dcadec (`bits_skip1`, comment "Reserved
+    // on it — the field is reserved in ETSI TS 102 114 and skipped ("Reserved
     // field"). A frame that sets it is still fully decodable, so rejecting it
     // was a false-drop that silenced any real stream whose encoder set the bit.
     // Read past it without gating (never reject a decodable frame).
@@ -1807,7 +1807,7 @@ mod tests {
     /// LFE flag is set to the reserved value 3 (`DTS_LFE_FLAG_INVALID`). It still
     /// sizes and syncs correctly (so the framer delimits it normally), but the
     /// core-frame header validity check rejects it as an invalid LFE flag (ETSI
-    /// TS 102 114; dcadec `LFE_FLAG_INVALID`). LFE is byte10 bits2-1, and does
+    /// TS 102 114 §5.3.1: an LFF value of 3 is invalid). LFE is byte10 bits2-1, and does
     /// NOT feed the frame duration (NBLKS + SFREQ only), so a dropped bad core
     /// still carries the same `DTS_CORE_DUR_NS` as its good peers.
     fn make_bad_dts_core(size: usize) -> Vec<u8> {
@@ -1997,8 +1997,8 @@ mod tests {
     #[test]
     fn legal_multichannel_amode_is_not_dropped() {
         // ETSI TS 102 114 §5.3.1: AMODE is a 6-bit field with 16 LEGAL
-        // channel-arrangement codes (0-15); only 16-63 are reserved. ffmpeg's
-        // ff_dca_channels[16] = {1,2,2,2,2,3,3,4,4,5,6,6,6,7,8,8} confirms codes
+        // channel-arrangement codes (0-15); only 16-63 are reserved. ETSI TS 102
+        // 114 §5.3.1's per-AMODE channel counts cover all 16, confirming codes
         // 10-15 are decodable 6/7/8-channel layouts. The decodability gate must
         // KEEP them — dropping a spec-legal multichannel core silences audio the
         // recover-100% goal must preserve.
@@ -2040,7 +2040,7 @@ mod tests {
 
     #[test]
     fn termination_frame_with_small_deficit_is_kept() {
-        // ETSI TS 102 114 / ffmpeg (`normal_frame && deficit != 32`) / dcadec:
+        // ETSI TS 102 114 (a normal frame carries a full 32-sample PCM block):
         // a TERMINATION frame (FTYPE=0) may legally carry fewer than 32 deficit
         // samples and is fully decodable. It must NOT be dropped — dropping the
         // last frame of a stream silences real audio (recover-100% violation).
@@ -2081,7 +2081,7 @@ mod tests {
     #[test]
     fn reserved_bit_set_is_not_dropped() {
         // The bit after RATE is a RESERVED field that both reference decoders
-        // SKIP (ffmpeg `skip_bits1`, dcadec `bits_skip1` "Reserved field") — they
+        // SKIP (a reserved field per ETSI TS 102 114) — they
         // never reject a frame that sets it. Rejecting was a false-drop that
         // silenced any real stream whose encoder set the bit. Setting it (byte9
         // bit4) on an otherwise-valid core must leave it KEPT.

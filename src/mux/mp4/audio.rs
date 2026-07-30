@@ -240,7 +240,7 @@ const DTS_SFREQ: [u32; 16] = [
     24_000, 48_000, 96_000, 192_000,
 ];
 /// DTS core base channel count per `AMODE` (all 16 defined values). Matches the
-/// reference `ff_dca_channels[16]` table (ETSI TS 102 114) that the decodability
+/// per-AMODE channel counts in ETSI TS 102 114 §5.3.1, the same table the decodability
 /// gate in `dts.rs` (`DTS_AMODE_COUNT`) also uses, so a spec-legal DTS-ES / 6.1 /
 /// 7.1 core (AMODE 13→7, 14/15→8) is DECLARED with its true channel count in the
 /// mp4 AudioSampleEntry / `ddts` box rather than a truncated 6.
@@ -613,7 +613,7 @@ mod tests {
     fn dts_high_amode_channel_counts_are_declared() {
         // The 16-entry DTS_AMODE_CH must declare the true core channel count for the
         // spec-legal high AMODEs that now pass the decodability gate: AMODE 13→7,
-        // 14→8, 15→8 (ETSI TS 102 114 / ff_dca_channels). The old 10-entry table
+        // 14→8, 15→8 (ETSI TS 102 114 §5.3.1). The old 10-entry table
         // fell through `unwrap_or(6)` → every one of these was declared as 6.
         //
         // Frame layout (mirrors dts_core_5_1_and_ddts): SFREQ=13 (48k), LFF=0 (no
