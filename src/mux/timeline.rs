@@ -130,10 +130,22 @@ impl TimelineContinuity {
             // within a backstep below the frontier keeps the remap to genuine
             // tail stragglers; a long audio-only tail, a sparse subtitle, or an
             // EL frame that simply runs ahead is left on the current offset.
+            //
+            // Every comparison below saturates. `high` is derived from an
+            // untrusted container timestamp (an `mkv://` source's
+            // CLUSTER_TIMESTAMP × TimestampScale is clamped only against
+            // `i64::MAX`, so a hostile file can put the frontier AT `i64::MAX`),
+            // and `raw_pts_ns` can be negative (a SimpleBlock's signed relative
+            // timestamp). Plain `high + BACKSTEP` / `high - BACKSTEP` would then
+            // overflow: a panic out of the public `Stream::write` path in an
+            // overflow-checked build, and in release a wrap to the opposite sign
+            // that fires the straggler clamp on essentially every passive frame.
             if let Some(high) = self.high_ns {
-                if mapped > high + DISCONTINUITY_BACKSTEP_NS {
+                if mapped > high.saturating_add(DISCONTINUITY_BACKSTEP_NS) {
                     let prev_mapped = raw_pts_ns.saturating_add(self.prev_offset_ns);
-                    if prev_mapped <= high && prev_mapped >= high - DISCONTINUITY_BACKSTEP_NS {
+                    if prev_mapped <= high
+                        && prev_mapped >= high.saturating_sub(DISCONTINUITY_BACKSTEP_NS)
+                    {
                         return prev_mapped;
                     }
                 }
@@ -147,12 +159,17 @@ impl TimelineContinuity {
             return adj;
         };
         let adj = raw_pts_ns.saturating_add(self.offset_ns);
-        if adj < high - DISCONTINUITY_BACKSTEP_NS {
+        if adj < high.saturating_sub(DISCONTINUITY_BACKSTEP_NS) {
             // Clip-boundary reset (real multi-clip seam): continue just after the
             // frontier. Save the previous offset so a lagging non-video tail
             // frame can be recognised and remapped to the seam (see above).
             self.prev_offset_ns = self.offset_ns;
-            let bump = (high - adj).saturating_add(DISCONTINUITY_GAP_NS);
+            // `high - adj` is a backward step, so positive — but both ends are
+            // untrusted (`high` up to i64::MAX, `adj` down to i64::MIN), so
+            // saturate rather than panic in a checked build.
+            let bump = high
+                .saturating_sub(adj)
+                .saturating_add(DISCONTINUITY_GAP_NS);
             self.offset_ns = self.offset_ns.saturating_add(bump);
             let adj2 = raw_pts_ns.saturating_add(self.offset_ns);
             self.high_ns = Some(high.max(adj2));
@@ -463,5 +480,41 @@ mod tests {
             out > frontier,
             "frame must stay in the new epoch (> frontier), got {out}"
         );
+    }
+
+    /// A saturated frontier must not panic the muxer. An `mkv://` source's
+    /// tick→ns multiply saturates at `i64::MAX` (mkvstream's `parse_block`), so a
+    /// hostile TimestampScale/CLUSTER_TIMESTAMP puts `high_ns` AT `i64::MAX`.
+    /// Every subsequent PASSIVE frame then evaluated `high + BACKSTEP`, which
+    /// panicked ("attempt to add with overflow") out of the public
+    /// `Stream::write` path in any overflow-checked build.
+    #[test]
+    fn saturated_frontier_does_not_overflow_on_passive_frame() {
+        let mut tc = TimelineContinuity::new();
+        // Video establishes the frontier at the saturation point.
+        assert_eq!(adj_video(&mut tc, i64::MAX), i64::MAX);
+        assert_eq!(tc.high_ns, Some(i64::MAX));
+        // Passive frame: `high + BACKSTEP` overflowed here.
+        let out = adj_other(&mut tc, 0);
+        assert_eq!(out, 0, "a passive frame keeps its own mapping");
+        // And a passive frame AT the frontier: `high - BACKSTEP` is the other
+        // unchecked side of the straggler discriminator.
+        assert_eq!(adj_other(&mut tc, i64::MAX), i64::MAX);
+    }
+
+    /// The epoch-decision side of the same arithmetic: `adj < high - BACKSTEP`
+    /// and the `high - adj` bump both took untrusted ends. A frontier at
+    /// `i64::MIN`-adjacent values (a negative SimpleBlock-relative timestamp) and
+    /// a `i64::MAX` frontier are both reachable from container data.
+    #[test]
+    fn extreme_video_pts_does_not_overflow_the_epoch_bump() {
+        let mut tc = TimelineContinuity::new();
+        assert_eq!(adj_video(&mut tc, i64::MAX), i64::MAX);
+        // Hard backward jump to the negative extreme: `high - adj` overflowed.
+        let out = adj_video(&mut tc, i64::MIN);
+        // Saturated bump (`i64::MAX`) applied to `i64::MIN` → -1, and the
+        // frontier never regresses.
+        assert_eq!(out, -1);
+        assert_eq!(tc.high_ns, Some(i64::MAX));
     }
 }

@@ -70,6 +70,15 @@ pub struct TsMuxer<W: Write> {
     /// so a header-only `m2ts://` output can't be reported as success —
     /// mirroring `MkvMuxer.frame_count`.
     frame_count: u64,
+    /// Reusable Annex-B conversion buffer for NAL video, kept across frames so
+    /// the conversion does not allocate (and free) a whole-frame buffer per
+    /// coded picture — the same reason `MkvMuxer` keeps its `block_group_buf`.
+    /// A UHD frame is ~310 KB, i.e. an mmap + first-touch page faults + munmap
+    /// per frame, ~200k times per feature. Cleared (never shrunk) per use, so it
+    /// settles at the largest frame's size. Taken out of `self` while in use, so
+    /// the borrow of the converted bytes does not conflict with the `&mut self`
+    /// the writer needs.
+    annex_b: Vec<u8>,
 }
 
 impl<W: Write> TsMuxer<W> {
@@ -84,6 +93,7 @@ impl<W: Write> TsMuxer<W> {
             video_codec: vec![Codec::Hevc; n],
             base_pts_ns: None,
             frame_count: 0,
+            annex_b: Vec::new(),
         }
     }
 
@@ -180,11 +190,20 @@ impl<W: Write> TsMuxer<W> {
         // start-code ES, never length-prefixed) the bytes pass through
         // unchanged, so borrow `data` directly rather than copying it; only
         // NAL video needs an owned Annex-B conversion buffer.
-        let es_data: std::borrow::Cow<'_, [u8]> = if is_video && self.is_nal_video(track) {
-            // Size the buffer once for the whole frame. `Vec::new()` re-grew from
-            // zero capacity on every frame, reallocating repeatedly inside a single
-            // ~310 KB conversion. The slack covers any prepended parameter sets.
-            let mut annex_b = Vec::with_capacity(data.len() + 1024);
+        // Take the reusable conversion buffer out of `self` for the duration of
+        // this frame: that frees the `&mut self` the writer needs below while the
+        // converted bytes are still borrowed, and keeps the allocation across
+        // frames instead of making (and dropping) a whole-frame one per picture.
+        // It is put back at the end of the function, so a mid-frame error path
+        // costs only the buffer's capacity, never correctness.
+        let mut annex_b = std::mem::take(&mut self.annex_b);
+        let convert = is_video && self.is_nal_video(track);
+        if convert {
+            annex_b.clear();
+            // Size once for the whole frame; the slack covers any prepended
+            // parameter sets. `reserve` is a no-op once the buffer has settled at
+            // the largest frame's size.
+            annex_b.reserve(data.len() + 1024);
             if keyframe && !self.params_written[track] {
                 if let Some(ref cp) = self.codec_privates[track] {
                     // avcC and hvcC are DIFFERENT box layouts; parsing one with
@@ -221,13 +240,12 @@ impl<W: Write> TsMuxer<W> {
             // allocations and two full-frame copies. At ~200k frames averaging
             // ~310 KB of ES on a UHD, that is ~124 GB of pointless memcpy.
             append_length_prefixed_as_annex_b(&mut annex_b, data);
-            std::borrow::Cow::Owned(annex_b)
-        } else {
-            if is_video {
-                self.params_written[track] = true;
-            }
-            std::borrow::Cow::Borrowed(data)
-        };
+        } else if is_video {
+            self.params_written[track] = true;
+        }
+        // Borrowed from a LOCAL (the taken-out buffer), never from `self`, so the
+        // `&mut self` writes below are free of it.
+        let es_data: &[u8] = if convert { &annex_b } else { data };
 
         let pts_90k = if pts_ns >= 0 {
             (pts_ns as u64).saturating_mul(9) / 100_000
@@ -240,15 +258,32 @@ impl<W: Write> TsMuxer<W> {
         // access units into multiple PES packets. Each emitted PES carries
         // the same PTS and starts on its own PUSI packet (only the keyframe
         // RAI rides the first packet of the first PES).
-        if is_video || es_data.len() <= MAX_BD_PES_PAYLOAD {
-            self.write_pes_chain(track, pid, pts_90k, is_video, keyframe, &es_data)?;
+        //
+        // The write result is held rather than `?`-propagated so the conversion
+        // buffer goes back into `self` on every path.
+        let res = if is_video || es_data.len() <= MAX_BD_PES_PAYLOAD {
+            self.write_pes_chain(track, pid, pts_90k, is_video, keyframe, es_data)
         } else {
             let mut first_pes = true;
+            let mut res = Ok(());
             for chunk in es_data.chunks(MAX_BD_PES_PAYLOAD) {
-                self.write_pes_chain(track, pid, pts_90k, is_video, keyframe && first_pes, chunk)?;
+                res = self.write_pes_chain(
+                    track,
+                    pid,
+                    pts_90k,
+                    is_video,
+                    keyframe && first_pes,
+                    chunk,
+                );
+                if res.is_err() {
+                    break;
+                }
                 first_pes = false;
             }
-        }
+            res
+        };
+        self.annex_b = annex_b;
+        res?;
         // A frame that survived the pre-keyframe drop guard above and reached
         // the writer counts as emitted. `finish()` checks this so a zero-frame
         // mux fails loudly instead of producing a header-only "success".
@@ -1132,5 +1167,42 @@ mod tests {
         let got = reassemble_es(&packets, AUDIO_PID);
         assert_eq!(got.len(), big.len(), "no bytes lost in the PES split");
         assert_eq!(got, big, "split audio reassembles byte-for-byte");
+    }
+
+    /// MEASURED: the Annex-B conversion buffer must be REUSED across video
+    /// frames, not allocated per frame. Both the allocation's address and its
+    /// capacity are unchanged after the second and third same-sized frames — if
+    /// the conversion allocated a fresh `Vec` per frame (the old
+    /// `Vec::with_capacity(data.len() + 1024)`), the buffer left on the muxer
+    /// would be empty with zero capacity, and each frame would pay an
+    /// allocate/first-touch/free cycle over the whole ~310 KB frame.
+    #[test]
+    fn annex_b_conversion_buffer_is_reused_across_frames() {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+        let idr = fake_hevc_nal(19, 300_000);
+        mux.write_frame(0, 0, true, &idr).unwrap();
+        let cap = mux.annex_b.capacity();
+        let ptr = mux.annex_b.as_ptr();
+        assert!(
+            cap >= idr.len(),
+            "buffer survives the frame with the frame's capacity, got {cap}"
+        );
+
+        for i in 1..4 {
+            let p = fake_hevc_nal(1, 300_000);
+            mux.write_frame(0, i * 41_000_000, false, &p).unwrap();
+            assert_eq!(
+                mux.annex_b.as_ptr(),
+                ptr,
+                "frame {i}: conversion buffer must be the same allocation"
+            );
+            assert_eq!(
+                mux.annex_b.capacity(),
+                cap,
+                "frame {i}: no re-grow once the buffer has settled"
+            );
+        }
+        mux.finish().unwrap();
     }
 }

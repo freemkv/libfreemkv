@@ -321,8 +321,7 @@ impl AuAssembler {
                 self.disc_marks.pop_front();
             }
 
-            let data = self.buf[..end].to_vec();
-            self.buf.drain(..end);
+            let data = self.take_front(end);
             self.base += end as u64;
             self.reset_scan();
             out.push(AssembledAu {
@@ -334,6 +333,41 @@ impl AuAssembler {
             });
         }
         out
+    }
+
+    /// Detach `buf[..end]` as the emitted AU's own `Vec` and leave `buf` holding
+    /// the tail.
+    ///
+    /// The AU's bytes are HANDED OVER — `buf`'s allocation becomes the returned
+    /// `Vec` and a fresh buffer (pre-sized to the same capacity, so the next AU
+    /// accumulates without re-growing) takes its place holding only the short
+    /// tail. `buf[..end].to_vec()` + `drain(..end)` instead copied every AU out
+    /// in full: on a UHD HEVC title that is a whole-frame memcpy (hundreds of KB)
+    /// per coded picture, ~200k times, for bytes that are about to be discarded
+    /// from `buf` anyway.
+    ///
+    /// The allocation COUNT is unchanged (one per AU either way — the frame `Vec`
+    /// before, the replacement buffer now), so the only difference is the copy
+    /// that no longer happens. Nothing depends on `buf` keeping its identity: the
+    /// only state tied to `buf[0]`'s position is `base`/`scan_pos`/`opener_pos`,
+    /// which the caller updates immediately after.
+    ///
+    /// Falls back to a copy when the buffer's capacity is far larger than the AU
+    /// (a small AU after a multi-MB one): handing over would otherwise attach an
+    /// oversized idle allocation to a small frame for as long as the frame queues
+    /// downstream, trading a copy for resident memory.
+    fn take_front(&mut self, end: usize) -> Vec<u8> {
+        let cap = self.buf.capacity();
+        if cap > end.saturating_mul(2) {
+            let data = self.buf[..end].to_vec();
+            self.buf.drain(..end);
+            return data;
+        }
+        let mut tail = Vec::with_capacity(cap.max(self.buf.len() - end));
+        tail.extend_from_slice(&self.buf[end..]);
+        let mut data = std::mem::replace(&mut self.buf, tail);
+        data.truncate(end);
+        data
     }
 
     /// Reset the incremental boundary-scan cursor. Called whenever `buf[0]` moves
@@ -840,5 +874,52 @@ mod tests {
             !emitted.is_empty(),
             "over-cap AU is force-flushed, not buffered forever"
         );
+    }
+
+    /// MEASURED: a drained AU must be HANDED the accumulation buffer's
+    /// allocation, not copied out of it. The emitted `Vec`'s data pointer is the
+    /// buffer's own pointer — which is only true if no full-frame copy happened.
+    /// (`buf[..end].to_vec()` allocates fresh, so the pointers differ.) One
+    /// whole-AU memcpy per coded picture is ~200k memcpys of a few hundred KB
+    /// each on a UHD feature.
+    #[test]
+    fn drained_au_takes_over_the_buffer_allocation_without_copying() {
+        let mut a = AuAssembler::for_codec(Codec::H264);
+        // An AU large enough that the buffer's capacity is not >2x its size (the
+        // small-AU copy path exists so a small frame cannot carry an oversized
+        // idle allocation downstream).
+        let au1 = au(0x11, 400 * 1024);
+        let au2 = au(0x22, 400 * 1024);
+        let mut stream = au1.clone();
+        stream.extend_from_slice(&au2);
+
+        // Push everything except the final byte of AU2's delimiter, so no AU has
+        // been emitted yet but the buffer holds the whole of AU1.
+        a.push(&stream[..au1.len() + 3], Some(1), None, None, false);
+        let before = a.buf.as_ptr();
+        let cap_before = a.buf.capacity();
+        let out = a.push(
+            &stream[au1.len() + 3..au1.len() + 4],
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].data, au1,
+            "handover must preserve the AU bytes exactly"
+        );
+        assert_eq!(
+            out[0].data.as_ptr(),
+            before,
+            "the emitted AU must own the buffer's allocation (no whole-frame copy)"
+        );
+        assert_eq!(
+            a.buf.capacity(),
+            cap_before,
+            "the replacement buffer keeps the capacity, so the next AU does not re-grow"
+        );
+        assert_eq!(a.buf.len(), 4, "the buffer holds only AU2's delimiter tail");
     }
 }
