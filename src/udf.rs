@@ -1195,8 +1195,17 @@ fn read_directory(
 
         let is_dir = (file_chars & 0x02) != 0;
         let is_parent = (file_chars & 0x08) != 0;
+        // ECMA-167 4/14.4.4 file characteristics bit 2 = Deleted. Such a
+        // descriptor names a file that no longer exists, and 4/14.4.3 lets its
+        // ICB field specify an extent of length zero — it need not point at a
+        // File Entry at all. Following it reads whatever descriptor happens to
+        // occupy that metadata LBA: on a deleted DIRECTORY that is a hard
+        // "not a File Entry" error which fails the whole volume enumeration,
+        // and on a deleted FILE it invents a zero-byte entry that was never
+        // recorded.
+        let is_deleted = (file_chars & 0x04) != 0;
 
-        if !is_parent && l_fi > 0 {
+        if !is_parent && !is_deleted && l_fi > 0 {
             let name_start = pos + 38 + l_iu;
             let name_end = name_start + l_fi;
             if name_end > dir_data.len() {
@@ -2898,6 +2907,661 @@ mod tests {
         assert_eq!(fs.partition_start(), PART_START);
         assert_eq!(fs.root.entries.len(), 1);
         assert_eq!(fs.root.entries[0].name, "INDEX.BDMV");
+    }
+
+    // ---- directory-descriptor boundary coverage (ECMA-167 4/14.4, 4/14.9,
+    // 4/14.17). Every field below is disc-controlled, so each boundary is a
+    // place a malformed image can push the parser off the end of a buffer or
+    // turn a failure into a plausible-looking success.
+
+    /// Build a directory ICB with an explicit descriptor tag, extended
+    /// attribute length, RAW (unmasked) allocation-descriptor length field
+    /// and allocation position.
+    ///
+    /// ECMA-167 4/14.17 Extended File Entry (tag 266): L_EA at byte 208,
+    /// L_AD at 212, allocation descriptors start at 216 + L_EA.
+    /// ECMA-167 4/14.9 File Entry (tag 261): L_EA at 168, L_AD at 172,
+    /// allocation descriptors start at 176 + L_EA.
+    /// The extended-attribute area is filled with a recognisable non-zero
+    /// pattern so that reading the allocation descriptor from the wrong
+    /// offset cannot silently produce a usable value.
+    fn build_dir_icb_tagged(tag: u16, l_ea: usize, raw_len: u32, ad_pos: u32) -> [u8; 2048] {
+        let mut icb = [0u8; 2048];
+        icb[0..2].copy_from_slice(&tag.to_le_bytes());
+        let (l_ea_off, ad_base) = if tag == 266 {
+            (208usize, 216usize)
+        } else {
+            (168usize, 176usize)
+        };
+        icb[l_ea_off..l_ea_off + 4].copy_from_slice(&(l_ea as u32).to_le_bytes());
+        // L_AD = 8: exactly one short_ad (ECMA-167 4/14.14.1).
+        icb[l_ea_off + 4..l_ea_off + 8].copy_from_slice(&8u32.to_le_bytes());
+        icb[ad_base..ad_base + l_ea].fill(0xA5);
+        let ad = ad_base + l_ea;
+        if ad + 8 <= icb.len() {
+            icb[ad..ad + 4].copy_from_slice(&raw_len.to_le_bytes());
+            icb[ad + 4..ad + 8].copy_from_slice(&ad_pos.to_le_bytes());
+        }
+        icb
+    }
+
+    /// Append one File Identifier Descriptor (ECMA-167 4/14.4) to `buf`,
+    /// with an explicit L_IU implementation-use area (4/14.4.7) sitting
+    /// between the 38-byte header and the File Identifier (4/14.4.8).
+    /// The descriptor is padded to a 4-byte multiple per 4/14.4.9.
+    fn push_fid_iu(
+        buf: &mut Vec<u8>,
+        name: &str,
+        icb_lba: u32,
+        is_dir: bool,
+        is_parent: bool,
+        l_iu: u16,
+    ) {
+        let start = buf.len();
+        let name_field: Vec<u8> = if name.is_empty() {
+            Vec::new()
+        } else {
+            let mut v = vec![0x08u8]; // OSTA CS0 compression id 8
+            v.extend_from_slice(name.as_bytes());
+            v
+        };
+        let mut fid = vec![0u8; 38];
+        fid[0..2].copy_from_slice(&257u16.to_le_bytes());
+        let mut fc = 0u8;
+        if is_dir {
+            fc |= 0x02;
+        }
+        if is_parent {
+            fc |= 0x08;
+        }
+        fid[18] = fc;
+        fid[19] = name_field.len() as u8;
+        fid[24..28].copy_from_slice(&icb_lba.to_le_bytes());
+        fid[36..38].copy_from_slice(&l_iu.to_le_bytes());
+        buf.extend_from_slice(&fid);
+        buf.extend_from_slice(&vec![0xC3u8; l_iu as usize]);
+        buf.extend_from_slice(&name_field);
+        let used = buf.len() - start;
+        buf.resize(start + ((used + 3) & !3), 0);
+    }
+
+    /// Names of the children `read_directory` reported, in order.
+    fn child_names(d: &DirEntry) -> Vec<String> {
+        d.entries.iter().map(|e| e.name.clone()).collect()
+    }
+
+    #[test]
+    fn read_directory_reads_a_plain_file_entry_tag_261_directory_icb() {
+        // ECMA-167 4/14.9 File Entry (tag 261) is a directory ICB in its own
+        // right — UDF 2.50 discs use the Extended File Entry (266), but a
+        // 261 File Entry is equally valid and is what UDF 1.02 DVD-Video
+        // discs carry. Its L_EA lives at byte 168 and its allocation
+        // descriptors begin at 176 + L_EA, NOT at the 208/216 offsets of a
+        // 266. Dropping the 261 arm, or testing the ad-bounds guard the
+        // wrong way round, turns every UDF 1.02 directory into a hard read
+        // error — the disc mounts and reports no titles.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "", 5, true, true, 0); // parent (..)
+        push_fid_iu(&mut fids, "VIDEO_TS.IFO", 7, false, false, 0);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_tagged(261, 0, fids.len() as u32, 60));
+        reader.put(60, dir);
+        reader.put(7, build_efe_icb(4096, 4096, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("a File Entry (261) directory ICB is valid and must be readable");
+        assert_eq!(child_names(&parsed), vec!["VIDEO_TS.IFO".to_string()]);
+        assert_eq!(
+            parsed.entries[0].size, 4096,
+            "the child's size must come from its own ICB info_length"
+        );
+    }
+
+    #[test]
+    fn read_directory_masks_the_extent_type_bits_out_of_the_ad_length() {
+        // ECMA-167 4/14.14.1.1: the 32-bit field at the head of a short_ad is
+        // a 30-bit extent length plus a 2-bit extent TYPE in bits 30..31. The
+        // type bits must be masked off before the value is used as a byte
+        // count; folding them in yields a length of >= 1 GiB, which then trips
+        // the MAX_DIR_BYTES guard and turns a perfectly readable directory
+        // into a read error.
+        //
+        // Encoded here as extent type 1 (bits = 01) over a real, tiny length.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "", 5, true, true, 0);
+        push_fid_iu(&mut fids, "INDEX.BDMV", 7, false, false, 0);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+        let raw = 0x4000_0000u32 | fids.len() as u32;
+
+        for tag in [261u16, 266u16] {
+            let mut reader = MemReader::new();
+            reader.put(5, build_dir_icb_tagged(tag, 0, raw, 60));
+            reader.put(60, dir);
+            reader.put(7, build_efe_icb(1024, 1024, 0));
+
+            let parsed =
+                read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+                    .unwrap_or_else(|e| {
+                        panic!("tag {tag}: extent-type bits must not inflate the length: {e:?}")
+                    });
+            assert_eq!(child_names(&parsed), vec!["INDEX.BDMV".to_string()]);
+            assert_eq!(
+                parsed.size,
+                fids.len() as u64,
+                "tag {tag}: the reported directory size is the 30-bit length only"
+            );
+        }
+    }
+
+    #[test]
+    fn read_directory_ignores_fid_bytes_past_the_declared_directory_length() {
+        // The directory's information length (the short_ad length field) is
+        // the authority on how far the FID list extends; the read buffer is
+        // rounded up to a whole sector, so bytes between the declared end and
+        // the end of the sector are NOT part of the directory. Scanning one
+        // descriptor too far invents a file that the disc never recorded —
+        // stale bytes from a previously deleted FID read as a live entry.
+        //
+        // Layout: a 40-byte FID for "A" at 0, then a well-formed FID for
+        // "GHOST" at 40. The declared length is 78 = 40 + 38, i.e. exactly
+        // the header of the second FID and not one byte more.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "A", 7, false, false, 0);
+        assert_eq!(
+            fids.len(),
+            40,
+            "first FID must be 40 bytes for this fixture"
+        );
+        push_fid_iu(&mut fids, "GHOST", 8, false, false, 0);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_tagged(266, 0, 78, 60));
+        reader.put(60, dir);
+        reader.put(7, build_efe_icb(11, 2048, 0));
+        reader.put(8, build_efe_icb(22, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("dir parses");
+        assert_eq!(
+            child_names(&parsed),
+            vec!["A".to_string()],
+            "a FID header starting at the declared end of the directory is not an entry"
+        );
+    }
+
+    #[test]
+    fn read_directory_stops_at_a_descriptor_whose_tag_is_not_a_fid() {
+        // ECMA-167 3/7.2.1: the tag identifier is a 16-bit little-endian
+        // field; 257 is File Identifier Descriptor. The FID list ends at the
+        // first descriptor that is not a FID. Reading only the low byte of
+        // the tag would accept tag 0x0201 (=513, Partition Descriptor's
+        // neighbourhood) as if it were 257, because 257 is 0x0101 and both of
+        // its bytes are 0x01 — a single-byte comparison cannot tell them
+        // apart. Anything after the terminator is then parsed as FIDs.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "REAL.MPLS", 7, false, false, 0);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+        // A non-FID descriptor whose LOW tag byte still reads 0x01.
+        let next = fids.len();
+        dir[next..next + 2].copy_from_slice(&513u16.to_le_bytes());
+        // ... followed by bytes that would parse as a named file FID if the
+        // scan wrongly continued.
+        dir[next + 18] = 0x00;
+        dir[next + 19] = 6;
+        dir[next + 38] = 0x08;
+        dir[next + 39..next + 44].copy_from_slice(b"AFTER");
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_tagged(266, 0, 2048, 60));
+        reader.put(60, dir);
+        reader.put(7, build_efe_icb(1, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("dir parses");
+        assert_eq!(
+            child_names(&parsed),
+            vec!["REAL.MPLS".to_string()],
+            "both bytes of the descriptor tag must be compared"
+        );
+    }
+
+    #[test]
+    fn read_directory_keeps_a_fid_name_that_ends_exactly_at_the_buffer_end() {
+        // A File Identifier that ends on the last byte of the directory's
+        // read buffer is entirely present and must be decoded. Treating
+        // "ends exactly at the end" as "runs past the end" silently drops the
+        // last file of a directory that happens to fill its final sector —
+        // and a dropped .m2ts is a missing title, not a visible failure.
+        //
+        // The first FID is a parent (..) with a 1959-byte implementation-use
+        // area, which lands the second FID at offset 2000; its name then runs
+        // 2038..2048 inclusive.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "", 5, true, true, 1959);
+        assert_eq!(fids.len(), 2000, "parent FID must end at 2000");
+        push_fid_iu(&mut fids, "ENDSATEND", 7, false, false, 0);
+        assert_eq!(fids.len(), 2048, "second FID must end exactly at 2048");
+        let mut dir = [0u8; 2048];
+        dir.copy_from_slice(&fids);
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_tagged(266, 0, 2048, 60));
+        reader.put(60, dir);
+        reader.put(7, build_efe_icb(99, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("dir parses");
+        assert_eq!(child_names(&parsed), vec!["ENDSATEND".to_string()]);
+        assert_eq!(parsed.entries[0].size, 99);
+    }
+
+    #[test]
+    fn read_directory_stops_instead_of_panicking_when_a_name_runs_past_the_buffer() {
+        // L_IU (ECMA-167 4/14.4.7) is a disc-controlled 16-bit field, so a
+        // malformed FID can place the File Identifier tens of kilobytes past
+        // the end of the directory's read buffer. The scan must stop; slicing
+        // there would panic out of the public API on a damaged disc.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "OK.MPLS", 7, false, false, 0);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+        // Second FID: header inside the buffer, name far outside it.
+        let next = fids.len();
+        dir[next..next + 2].copy_from_slice(&257u16.to_le_bytes());
+        dir[next + 18] = 0x00;
+        dir[next + 19] = 8; // L_FI
+        dir[next + 36..next + 38].copy_from_slice(&60000u16.to_le_bytes()); // L_IU
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_tagged(266, 0, 2048, 60));
+        reader.put(60, dir);
+        reader.put(7, build_efe_icb(5, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("an out-of-range File Identifier must end the scan, not fail the read");
+        assert_eq!(
+            child_names(&parsed),
+            vec!["OK.MPLS".to_string()],
+            "entries read before the malformed FID are kept"
+        );
+    }
+
+    #[test]
+    fn read_directory_admits_a_tree_that_exactly_fills_the_entry_budget() {
+        // The global entry budget is an anti-DoS ceiling on a crafted disc.
+        // A tree that reaches the ceiling exactly is still a legal tree and
+        // must be enumerated; rejecting it makes the largest admissible disc
+        // unreadable. Pre-load the counter to one below the cap so that this
+        // directory's single entry lands exactly on it.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "LAST.M2TS", 7, false, false, 0);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_tagged(266, 0, fids.len() as u32, 60));
+        reader.put(60, dir);
+        reader.put(7, build_efe_icb(7, 2048, 0));
+
+        let mut budget = MAX_TOTAL_DIR_ENTRIES - 1;
+        let parsed = read_directory(
+            &mut reader,
+            0,
+            0,
+            5,
+            "ROOT",
+            0,
+            &mut budget,
+            &mut HashSet::new(),
+        )
+        .expect("a tree that exactly reaches the entry budget must still be enumerated");
+        assert_eq!(child_names(&parsed), vec!["LAST.M2TS".to_string()]);
+        assert_eq!(budget, MAX_TOTAL_DIR_ENTRIES, "the entry was counted");
+    }
+
+    /// Lay a chain of `levels` nested directories into `reader`: directory
+    /// *n* has ICB at LBA `100 + n`, FID list at LBA `200 + n`, and one
+    /// subdirectory FID naming `D{n+1}`.
+    fn lay_dir_chain(reader: &mut MemReader, levels: u32) {
+        for n in 0..levels {
+            let mut fids = Vec::new();
+            push_fid_iu(&mut fids, "", 100 + n, true, true, 0);
+            push_fid_iu(
+                &mut fids,
+                &format!("D{}", n + 1),
+                100 + n + 1,
+                true,
+                false,
+                0,
+            );
+            let mut dir = [0u8; 2048];
+            dir[..fids.len()].copy_from_slice(&fids);
+            reader.put(
+                100 + n,
+                build_dir_icb_tagged(266, 0, fids.len() as u32, 200 + n),
+            );
+            reader.put(200 + n, dir);
+        }
+    }
+
+    /// Length of the chain of first-children hanging off `root`, counting
+    /// `root` itself.
+    fn chain_len(root: &DirEntry) -> usize {
+        let mut n = 1;
+        let mut cur = root;
+        while let Some(next) = cur.entries.first() {
+            n += 1;
+            cur = next;
+        }
+        n
+    }
+
+    #[test]
+    fn read_directory_stops_descending_at_the_nesting_cap() {
+        // MAX_DIR_DEPTH bounds how far a crafted disc can drive recursion.
+        // The directory sitting AT the cap must be emitted as a leaf and not
+        // descended into: descending one level further (an off-by-one on the
+        // comparison), or failing to increment the depth at all, removes the
+        // bound that the recursion depends on for termination.
+        //
+        // The chain laid here is deliberately deeper than the cap, so the
+        // returned tree's depth is decided by the cap and not by the fixture.
+        let deeper = MAX_DIR_DEPTH + 4;
+        let mut reader = MemReader::new();
+        lay_dir_chain(&mut reader, deeper);
+
+        let parsed = read_directory(
+            &mut reader,
+            0,
+            0,
+            100,
+            "ROOT",
+            0,
+            &mut 0,
+            &mut HashSet::new(),
+        )
+        .expect("a deep but well-formed chain parses");
+
+        // The root is read at depth 0; a directory read at depth d descends
+        // into its children only while d < MAX_DIR_DEPTH, so the deepest
+        // directory that is itself READ is the one at depth MAX_DIR_DEPTH,
+        // and the child named by its FID is emitted as a leaf. That is
+        // MAX_DIR_DEPTH + 2 nodes on the chain, root and leaf included.
+        assert_eq!(
+            chain_len(&parsed),
+            MAX_DIR_DEPTH as usize + 2,
+            "recursion must stop at the nesting cap, not before or after it"
+        );
+        // The deepest node is still reported (its NAME is known from the
+        // FID) but carries no children.
+        let mut cur = &parsed;
+        while let Some(next) = cur.entries.first() {
+            cur = next;
+        }
+        assert!(
+            cur.is_dir,
+            "the capped node is still known to be a directory"
+        );
+        assert!(cur.entries.is_empty());
+    }
+
+    #[test]
+    fn read_directory_advances_past_a_fids_implementation_use_area() {
+        // ECMA-167 4/14.4.9: the next FID starts at
+        // (38 + L_IU + L_FI) rounded up to a multiple of 4. Leaving L_IU out
+        // of the stride lands the scan in the middle of the current
+        // descriptor, so every file after the first one with a non-empty
+        // implementation-use area disappears.
+        //
+        // L_IU = 4, L_FI = 6 → stride 48. Dropping L_IU gives 40, which lands
+        // inside the first descriptor's name field.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "AAAAA", 7, false, false, 4);
+        assert_eq!(
+            fids.len(),
+            48,
+            "first FID stride must be 48 for this fixture"
+        );
+        push_fid_iu(&mut fids, "BBBBB", 8, false, false, 4);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_tagged(266, 0, fids.len() as u32, 60));
+        reader.put(60, dir);
+        reader.put(7, build_efe_icb(1, 2048, 0));
+        reader.put(8, build_efe_icb(2, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("dir parses");
+        assert_eq!(
+            child_names(&parsed),
+            vec!["AAAAA".to_string(), "BBBBB".to_string()],
+            "the FID stride must include L_IU"
+        );
+    }
+
+    #[test]
+    fn read_directory_reads_an_ad_that_ends_exactly_at_the_icb_sector_end() {
+        // The allocation descriptor sits at 216 + L_EA (tag 266) or
+        // 176 + L_EA (tag 261). A short_ad whose last byte is the last byte
+        // of the 2048-byte ICB sector is entirely present, so the guard must
+        // reject only descriptors that run PAST the sector. Rejecting the
+        // exact fit turns a readable directory into a read error.
+        for (tag, ad_base) in [(266u16, 216usize), (261u16, 176usize)] {
+            let l_ea = 2048 - 8 - ad_base; // ad_off + 8 == 2048 exactly
+            let mut fids = Vec::new();
+            push_fid_iu(&mut fids, "TIGHT.CLPI", 7, false, false, 0);
+            let mut dir = [0u8; 2048];
+            dir[..fids.len()].copy_from_slice(&fids);
+
+            let mut reader = MemReader::new();
+            reader.put(5, build_dir_icb_tagged(tag, l_ea, fids.len() as u32, 60));
+            reader.put(60, dir);
+            reader.put(7, build_efe_icb(3, 2048, 0));
+
+            let parsed =
+                read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+                    .unwrap_or_else(|e| panic!("tag {tag}: exact-fit AD must be read: {e:?}"));
+            assert_eq!(child_names(&parsed), vec!["TIGHT.CLPI".to_string()]);
+        }
+    }
+
+    #[test]
+    fn read_directory_rejects_an_ad_running_past_the_icb_sector() {
+        // L_EA is a disc-controlled 32-bit byte count. One large enough to
+        // push the allocation descriptor past the end of the 2048-byte ICB
+        // sector must be an error, not an out-of-bounds read.
+        for (tag, ad_base) in [(266u16, 216usize), (261u16, 176usize)] {
+            let l_ea = 2048 - 4 - ad_base; // ad_off + 8 == 2052 > 2048
+            let mut reader = MemReader::new();
+            reader.put(5, build_dir_icb_tagged(tag, l_ea, 2048, 60));
+
+            let err = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+                .expect_err("an AD past the end of the ICB sector must fail");
+            assert!(
+                matches!(err, Error::DiscRead { sector: 5, .. }),
+                "tag {tag}: the error must name the ICB sector, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_directory_locates_the_ad_after_a_non_empty_extended_attribute_area() {
+        // ECMA-167 4/14.9 / 4/14.17: the Extended Attributes field occupies
+        // L_EA bytes immediately before the allocation descriptors, so the
+        // descriptors begin at base + L_EA. Real UDF file entries do carry
+        // extended attributes; computing the offset any other way reads the
+        // attribute bytes (or the fixed header) as an extent.
+        for (tag, _base) in [(266u16, 216usize), (261u16, 176usize)] {
+            let mut fids = Vec::new();
+            push_fid_iu(&mut fids, "WITHEA.MPLS", 7, false, false, 0);
+            let mut dir = [0u8; 2048];
+            dir[..fids.len()].copy_from_slice(&fids);
+
+            let mut reader = MemReader::new();
+            reader.put(5, build_dir_icb_tagged(tag, 88, fids.len() as u32, 60));
+            reader.put(60, dir);
+            reader.put(7, build_efe_icb(6, 2048, 0));
+
+            let parsed =
+                read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+                    .unwrap_or_else(|e| panic!("tag {tag}: L_EA offset must be honoured: {e:?}"));
+            assert_eq!(child_names(&parsed), vec!["WITHEA.MPLS".to_string()]);
+        }
+    }
+
+    #[test]
+    fn read_directory_skips_a_deleted_fid_and_never_follows_its_icb() {
+        // ECMA-167 4/14.4.4 File Characteristics bit 2 = Deleted: "the file
+        // ... has been deleted". 4/14.4.3 then says the ICB field of such a
+        // descriptor MAY specify an extent of length zero — i.e. it need not
+        // point at anything at all.
+        //
+        // So a deleted FID must be skipped outright. Following its ICB reads
+        // whatever descriptor happens to sit at metadata LBA 0 (the File Set
+        // Descriptor, tag 256), which is not a File Entry. On a deleted
+        // DIRECTORY FID that is a hard read error — one stale descriptor in
+        // one directory and the entire volume fails to enumerate. On a
+        // deleted FILE FID it is worse than an error: the phantom name is
+        // reported as a real zero-byte file.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "", 5, true, true, 0); // parent (..)
+        // Deleted directory FID with a zeroed ICB field, exactly as 4/14.4.3
+        // permits.
+        let del = fids.len();
+        push_fid_iu(&mut fids, "OLDDIR", 0, true, false, 0);
+        fids[del + 18] |= 0x04; // Deleted
+        push_fid_iu(&mut fids, "LIVE.MPLS", 7, false, false, 0);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_tagged(266, 0, fids.len() as u32, 60));
+        reader.put(60, dir);
+        reader.put(7, build_efe_icb(64, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("a deleted FID must not fail the enumeration of its directory");
+        assert_eq!(
+            child_names(&parsed),
+            vec!["LIVE.MPLS".to_string()],
+            "a deleted File Identifier Descriptor is not a file"
+        );
+    }
+
+    #[test]
+    fn read_directory_reads_every_byte_of_the_short_ad_length_and_location() {
+        // ECMA-167 4/14.14.1: a short_ad is two little-endian 32-bit fields —
+        // ExtentLength then ExtentPosition — and each of their four bytes
+        // carries weight. This fixture gives every byte a distinct non-zero
+        // value (except the length's most-significant byte, which any legal
+        // directory keeps at zero — see the oversized-length test), so a
+        // descriptor byte sourced from the wrong offset changes either the
+        // reported directory length or the sector the FID list is read from.
+        //
+        //   length   = 0x0002_012C = 131 372 bytes  (a large but legal dir)
+        //   location = 0x0102_033C = 16 909 628     (a high-LBA volume)
+        let ad_len: u32 = 0x0002_012C;
+        let ad_pos: u32 = 0x0102_033C;
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "BYTEWISE.CLPI", 7, false, false, 0);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+
+        for tag in [261u16, 266u16] {
+            let mut reader = MemReader::new();
+            reader.put(5, build_dir_icb_tagged(tag, 0, ad_len, ad_pos));
+            reader.put(ad_pos, dir);
+            reader.put(7, build_efe_icb(12, 2048, 0));
+
+            let parsed =
+                read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+                    .unwrap_or_else(|e| panic!("tag {tag}: short_ad must be decoded: {e:?}"));
+            assert_eq!(
+                parsed.size, ad_len as u64,
+                "tag {tag}: every byte of the ExtentLength field is significant"
+            );
+            assert_eq!(
+                child_names(&parsed),
+                vec!["BYTEWISE.CLPI".to_string()],
+                "tag {tag}: every byte of the ExtentPosition field is significant"
+            );
+        }
+    }
+
+    #[test]
+    fn read_directory_rejects_a_length_whose_high_byte_alone_exceeds_the_cap() {
+        // The most-significant byte of the 30-bit ExtentLength is enough on
+        // its own to demand a 16 MiB allocation — sixteen times the ceiling.
+        // It must be read, and the directory refused; ignoring that byte
+        // lets a crafted descriptor through with a length of zero, which
+        // then reads as a legitimately empty directory.
+        for tag in [261u16, 266u16] {
+            let mut reader = MemReader::new();
+            reader.put(5, build_dir_icb_tagged(tag, 0, 0x0100_0000, 60));
+
+            let err = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+                .expect_err("a 16 MiB directory length must be refused, not read as empty");
+            assert!(
+                matches!(err, Error::DiscRead { .. }),
+                "tag {tag}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_directory_reads_a_directory_exactly_at_the_size_cap() {
+        // MAX_DIR_BYTES bounds the allocation a corrupt 30-bit length can
+        // force. A directory whose declared length is exactly the ceiling is
+        // admissible and must be read; rejecting it would make the largest
+        // legal STREAM/ directory unreadable.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "00000.M2TS", 7, false, false, 0);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_tagged(266, 0, MAX_DIR_BYTES, 60));
+        reader.put(60, dir); // remaining sectors read as zeros → scan ends
+        reader.put(7, build_efe_icb(4, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("a directory exactly at the size ceiling must be readable");
+        assert_eq!(child_names(&parsed), vec!["00000.M2TS".to_string()]);
+    }
+
+    #[test]
+    fn read_directory_reads_each_sector_of_a_multi_sector_directory_into_its_own_slot() {
+        // A directory larger than one sector is read a sector at a time into
+        // successive 2048-byte windows of one buffer. Every sector must land
+        // in its OWN window: a later sector written over an earlier one
+        // destroys FIDs that were already read correctly.
+        //
+        // Sector 0 of the FID list holds the only entry; sector 1 is blank.
+        // If sector 1's read lands at offset 0 it erases the entry, and the
+        // directory reads as empty rather than failing.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "FIRST.CLPI", 7, false, false, 0);
+        let mut sector0 = [0u8; 2048];
+        sector0[..fids.len()].copy_from_slice(&fids);
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_tagged(266, 0, 4096, 60));
+        reader.put(60, sector0);
+        reader.put(61, [0u8; 2048]);
+        reader.put(7, build_efe_icb(8, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("a two-sector directory parses");
+        assert_eq!(child_names(&parsed), vec!["FIRST.CLPI".to_string()]);
     }
 }
 
