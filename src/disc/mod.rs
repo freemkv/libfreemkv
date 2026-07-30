@@ -656,7 +656,15 @@ fn byte_offset_in_title(lba: u32, title: &DiscTitle) -> Option<u64> {
     use crate::consts::SECTOR_BYTES_U64;
     let mut cumulative = 0u64;
     for ext in &title.extents {
-        if lba >= ext.start_lba && lba < ext.start_lba + ext.sector_count {
+        // Saturating, like every other extent-end computation in the crate
+        // (`bytes_bad_in_title`, `crack_key_scan`'s crack span,
+        // `DiscStream::fill_extents`). ECMA-167 logical block numbers are
+        // 32-bit, so a malformed UDF/IFO extent near the top of that space
+        // makes a plain `+` overflow — a debug-build PANIC inside a library,
+        // and a release-build wrap to a tiny end LBA that silently reports the
+        // offset as outside the title.
+        let ext_end = ext.start_lba.saturating_add(ext.sector_count);
+        if lba >= ext.start_lba && lba < ext_end {
             return Some(cumulative + (lba - ext.start_lba) as u64 * SECTOR_BYTES_U64);
         }
         cumulative += ext.sector_count as u64 * SECTOR_BYTES_U64;
@@ -837,10 +845,18 @@ impl Codec {
             c::AC3 => Codec::Ac3,
             c::AC3_PLUS | c::AC3_PLUS_SECONDARY => Codec::Ac3Plus,
             c::LPCM => Codec::Lpcm,
-            // DTS_HD_MA (primary 0x86) / DTS_HD_SECONDARY (0xA2) are the
-            // DTS-HD MA lossless pair, parallel to AC3/AC3_PLUS_SECONDARY for
-            // AC-3. The secondary code is lossless MA, not lossy HR.
-            c::DTS_HD_SECONDARY => Codec::DtsHdMa,
+            // 0xA2 is the SECONDARY DTS-HD audio stream (Blu-ray Disc
+            // Read-Only Format part 3, stream_coding_type table): DTS Express /
+            // DTS-HD LBR, a LOSSY low-bitrate extension carried alongside the
+            // primary track for picture-in-picture and BD-J mixing — exactly
+            // parallel to 0xA1 (secondary E-AC-3) on the Dolby side. It is NOT
+            // DTS-HD Master Audio, which has its own primary code 0x86; mapping
+            // it there advertised a lossless track for lossy content, so the
+            // muxer's stream metadata and every label derived from it claimed a
+            // quality the bitstream does not carry. The crate has no distinct
+            // DTS Express variant, so it is represented by the LOSSY DTS-HD
+            // member.
+            c::DTS_HD_SECONDARY => Codec::DtsHdHr,
             // PG (0x90) = Presentation Graphics (subtitles). IG (0x91, menus)
             // and TEXT_SUBTITLE (0x92) are distinct HDMV coding types and are
             // NOT PG subtitle streams; only PG maps to Pgs. IG falls through to
@@ -911,7 +927,24 @@ impl Resolution {
         }
     }
 
-    /// Pixel dimensions (width, height).
+    /// Pixel dimensions (width, height). `(0, 0)` when the resolution is
+    /// [`Resolution::Unknown`] — "no dimensions", not a guess.
+    ///
+    /// The SD frames are the DVD-Video coded pictures (ITU-R BT.601 525/60 and
+    /// 625/50 active area); the HD frames are the Blu-ray Disc Read-Only Format
+    /// part 3 video formats; 3840x2160 is the UHD BD frame.
+    ///
+    /// `Unknown` deliberately does NOT fabricate a plausible 1920x1080. This is
+    /// the same trap already closed on [`AudioChannels::count`] (which used to
+    /// return 6) and [`SampleRate::hz`] (48000.0): a plausible wrong answer is
+    /// indistinguishable from a real one at every call site, so it makes each
+    /// caller responsible for remembering to check the variant first — and the
+    /// `json://` sink had already walked into exactly that, reporting confident
+    /// dimensions for a stream whose neighbouring `resolution` field said
+    /// "unknown". A zero is unmistakable, and every caller in tree already
+    /// handles it: the Matroska sink omits the optional PixelWidth/PixelHeight,
+    /// the VobSub `.idx` writer omits its `size:` line, and no caller divides by
+    /// either dimension.
     pub fn pixels(&self) -> (u32, u32) {
         match self {
             Resolution::R480i | Resolution::R480p => (720, 480),
@@ -920,7 +953,7 @@ impl Resolution {
             Resolution::R1080i | Resolution::R1080p => (1920, 1080),
             Resolution::R2160p => (3840, 2160),
             Resolution::R4320p => (7680, 4320),
-            Resolution::Unknown => (1920, 1080),
+            Resolution::Unknown => (0, 0),
         }
     }
 
@@ -1709,6 +1742,50 @@ impl Disc {
         Ok(disc)
     }
 
+    /// The extents an image-time CSS crack scans, in the crate's CANONICAL
+    /// order: the main feature's own extents, in natural playback order.
+    ///
+    /// Both halves are deferred to logic the crate already owns rather than
+    /// re-derived here:
+    /// - WHICH title — `scan_with` has already sorted `titles` with
+    ///   [`Self::canonical_title_order`], so the canonical main feature is the
+    ///   first title that actually has extents. No local pick.
+    /// - WHAT ORDER — playback order, i.e. the extent vector untouched, exactly
+    ///   as [`Self::decrypt_keys_for_title`] hands `&title.extents` to
+    ///   `css::crack_key_outcome`.
+    ///
+    /// **Why this function exists (do not let the copy grow back):**
+    /// `Disc::scan_image` used to re-implement both halves inline — it picked
+    /// the title with the largest total sector count, then re-sorted that
+    /// title's extents LARGEST-CELL-FIRST before handing them to
+    /// `crack_key_outcome`. Both had drifted from the canonical rules:
+    ///
+    /// - Largest-cell-first is the 1.5.1 garbage bug. A CSS DVD's biggest cell
+    ///   opens with a long CLEAR run, and the crack's 50_000-sector budget is
+    ///   shared across the whole extent list, so starting there can exhaust the
+    ///   budget without ever reaching a scrambled sector — the crack reports
+    ///   `Unencrypted` and the mux emits scrambled MPEG as plaintext. Playback
+    ///   order reaches the scrambled feature body after only the small clear
+    ///   front matter that precedes it on a real disc (CSS: the title key is
+    ///   recovered from the scrambled data itself, so the scan must actually
+    ///   MEET scrambled data).
+    /// - The sector-count pick ignores `canonical_title_order`'s capacity gate,
+    ///   so it selects the oversize "play-all" composite (whose declared cells
+    ///   double-count data shared with other playlists) instead of the real
+    ///   feature — i.e. a DIFFERENT title, and on a multi-VTS disc a different
+    ///   VTS, whose CSS title key does not descramble the feature at all.
+    ///
+    /// The result: the same disc cracked as an ISO could disagree with the same
+    /// disc cracked from the drive, which is precisely what the duplicate was
+    /// free to do. Keep the derivation here, shared, so it cannot recur.
+    fn image_crack_extents(titles: &[DiscTitle]) -> &[Extent] {
+        titles
+            .iter()
+            .find(|t| !t.extents.is_empty())
+            .map(|t| t.extents.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// Scan a disc image (ISO or any SectorSource). No SCSI, no handshake.
     /// AACS resolution uses KEYDB VUK lookup only.
     pub fn scan_image(
@@ -1733,19 +1810,11 @@ impl Disc {
         // this branch reads) is unscrambled, so `detect_format` reliably sets
         // `Dvd` from the SD-resolution titles even on a still-scrambled image.
         if disc.css.is_none() && disc.format == DiscFormat::Dvd && !disc.titles.is_empty() {
-            let main_extents = match disc
-                .titles
-                .iter()
-                .filter(|t| !t.extents.is_empty())
-                .max_by_key(|t| t.extents.iter().map(|e| e.sector_count as u64).sum::<u64>())
-            {
-                Some(t) => {
-                    let mut v = t.extents.clone();
-                    v.sort_by_key(|e| std::cmp::Reverse(e.sector_count));
-                    v
-                }
-                None => Vec::new(),
-            };
+            // Copied out so the crack's `disc.css` / `disc.encrypted` writes
+            // below don't collide with a live borrow of `disc.titles`. The
+            // ORDER is whatever `image_crack_extents` returns — never re-sorted
+            // here (see that function's docs: the local re-sort was the defect).
+            let main_extents = Self::image_crack_extents(&disc.titles).to_vec();
             if !main_extents.is_empty() {
                 // Image reads aren't drive-batch-limited; use a generous batch.
                 match crate::css::crack_key_outcome(reader, &main_extents, 32, None) {
@@ -2082,6 +2151,20 @@ impl Disc {
     /// is already the longest 1-clip title.
     /// **Effect on branching UHDs:** the virtual play-all playlist is
     /// pushed to the back, the actual movie surfaces at index 0.
+    /// The sort keys [`Self::canonical_title_order`] applies, in priority
+    /// order, as diagnostic-facing tokens.
+    ///
+    /// Defined HERE, immediately beside the comparator, so a diagnostic can
+    /// NAME the ordering instead of restating it. The `freemkv::diag`
+    /// main-feature decision row used to carry its own hand-written copy of
+    /// this list, and it drifted: it still advertised a `fewest-clips` key long
+    /// after the comparator replaced clip-count with largest-physical-size, so
+    /// the `--log-level 3` bug-report log explained freemkv's top-level pick
+    /// with a rule freemkv does not apply. Any change to the keys below must
+    /// change this list in the same edit.
+    pub const CANONICAL_TITLE_ORDER_KEYS: &'static [&'static str] =
+        &["fits-disc", "largest-size", "longest", "richest-audio"];
+
     pub fn canonical_title_order(
         a: &DiscTitle,
         b: &DiscTitle,
@@ -3106,6 +3189,166 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── image-time CSS crack: canonical extent ordering (finding 1) ─────────
+
+    /// Build a title with the given extents (start_lba, sector_count) and a
+    /// declared `size_bytes` (used by `canonical_title_order`'s capacity gate).
+    fn title_with_extents(size_bytes: u64, extents: &[(u32, u32)]) -> DiscTitle {
+        DiscTitle {
+            size_bytes,
+            extents: extents
+                .iter()
+                .map(|&(start_lba, sector_count)| Extent {
+                    start_lba,
+                    sector_count,
+                })
+                .collect(),
+            content_format: ContentFormat::MpegPs,
+            ..DiscTitle::empty()
+        }
+    }
+
+    /// The image-time CSS crack must scan the main feature's extents in natural
+    /// PLAYBACK order — the same order `decrypt_keys_for_title` (the canonical
+    /// per-title crack) uses. Largest-cell-first is the 1.5.1 garbage bug: a big
+    /// cell's long clear prefix starves the 50k-sector budget before the crack
+    /// ever reaches a scrambled sector.
+    ///
+    /// This test distinguishes the two orderings: the fixture's LARGEST cell is
+    /// physically LAST, so largest-cell-first yields a strictly different LBA
+    /// sequence than playback order.
+    #[test]
+    fn image_crack_extents_are_playback_order_not_largest_cell_first() {
+        // A real CSS DVD: a short clear front matter cell (logo/rating card)
+        // precedes the big scrambled feature body.
+        let title = title_with_extents(0, &[(1_000, 16), (1_016, 512), (2_000, 40_960)]);
+        let got = Disc::image_crack_extents(std::slice::from_ref(&title));
+        let lbas: Vec<u32> = got.iter().map(|e| e.start_lba).collect();
+        assert_eq!(
+            lbas,
+            vec![1_000, 1_016, 2_000],
+            "extents must be handed to the crack in playback order"
+        );
+    }
+
+    /// The main feature for the image-time crack is the canonically-ordered
+    /// `titles[0]` (`scan_with` has already applied `canonical_title_order`),
+    /// NOT a locally re-derived "most sectors" pick. The capacity gate is the
+    /// difference: an oversize play-all composite double-counts shared cells, so
+    /// it has the most sectors while being demoted to the back by the canonical
+    /// order. Cracking from its extents is cracking from the wrong title.
+    #[test]
+    fn image_crack_extents_follow_canonical_title_order_not_sector_count() {
+        // titles[0] = the real feature (canonical order already applied).
+        let feature = title_with_extents(2_000_000_000, &[(5_000, 100_000)]);
+        // Demoted play-all composite: MORE total sectors than the feature.
+        let play_all = title_with_extents(9_000_000_000, &[(5_000, 100_000), (5_000, 100_000)]);
+        let titles = [feature, play_all];
+        let got = Disc::image_crack_extents(&titles);
+        assert_eq!(
+            got.len(),
+            1,
+            "the crack must use the canonical main feature's single extent"
+        );
+        assert_eq!(got[0].sector_count, 100_000);
+    }
+
+    // ── Unknown must not fabricate a plausible value (finding 2) ────────────
+
+    /// `Resolution::Unknown` has no dimensions, so `pixels()` must report none
+    /// (0, 0) — the same treatment `AudioChannels::count()` and
+    /// `SampleRate::hz()` already give their `Unknown` variants. Returning a
+    /// plausible 1920x1080 is indistinguishable from a real 1080p title, so a
+    /// sink (the `json://` one already did this for audio) reports confident
+    /// dimensions for video its own neighbouring `resolution` field calls
+    /// "unknown".
+    ///
+    /// The real variants are asserted against spec literals, not against
+    /// `pixels()` itself: 720x480 / 720x576 are the DVD-Video coded frames
+    /// (ITU-R BT.601 525/60 and 625/50 active area), 1920x1080 and 1280x720 are
+    /// the Blu-ray Disc Read-Only Format part 3 HD frames, 3840x2160 the UHD
+    /// BD frame.
+    #[test]
+    fn unknown_resolution_reports_no_pixel_dimensions() {
+        assert_eq!(
+            Resolution::Unknown.pixels(),
+            (0, 0),
+            "an unknown resolution must report no dimensions, not a fabricated default"
+        );
+        assert_eq!(Resolution::R480i.pixels(), (720, 480));
+        assert_eq!(Resolution::R480p.pixels(), (720, 480));
+        assert_eq!(Resolution::R576i.pixels(), (720, 576));
+        assert_eq!(Resolution::R576p.pixels(), (720, 576));
+        assert_eq!(Resolution::R720p.pixels(), (1280, 720));
+        assert_eq!(Resolution::R1080i.pixels(), (1920, 1080));
+        assert_eq!(Resolution::R1080p.pixels(), (1920, 1080));
+        assert_eq!(Resolution::R2160p.pixels(), (3840, 2160));
+        assert_eq!(Resolution::R4320p.pixels(), (7680, 4320));
+    }
+
+    /// Every `Unknown` variant that exposes a numeric accessor must report
+    /// "nothing", never a plausible default — the sibling sweep the previous
+    /// round skipped. `FrameRate::Unknown` reports the 0/1 null fraction rather
+    /// than 0 fps, because callers divide by the numerator.
+    #[test]
+    fn no_unknown_variant_fabricates_a_numeric_value() {
+        assert_eq!(Resolution::Unknown.pixels(), (0, 0));
+        assert_eq!(FrameRate::Unknown.as_fraction(), (0, 1));
+        assert_eq!(AudioChannels::Unknown.count(), 0);
+        assert_eq!(SampleRate::Unknown.hz(), 0.0);
+        // Not numeric, but the same rule: the token names the unknown, it does
+        // not name a plausible colorimetry.
+        assert_eq!(ColorSpace::Unknown.id(), "unknown");
+    }
+
+    // ── BD-ROM stream_coding_type 0xA2 (finding 3) ──────────────────────────
+
+    /// Blu-ray Disc Read-Only Format part 3, `stream_coding_type` table: 0xA2 is
+    /// the SECONDARY DTS-HD audio stream — DTS Express / DTS-HD LBR, a LOSSY
+    /// low-bitrate codec carried alongside the primary track for
+    /// picture-in-picture and BD-J mixing. It is NOT DTS-HD Master Audio (0x86),
+    /// which is the lossless primary code.
+    ///
+    /// Literals, not the `consts::coding_type` names, so renaming or re-valuing
+    /// a constant cannot make this pass vacuously.
+    #[test]
+    fn secondary_dts_hd_0xa2_is_lossy_not_master_audio() {
+        assert_ne!(
+            Codec::from_coding_type(0xA2),
+            Codec::DtsHdMa,
+            "0xA2 is the lossy secondary DTS-HD stream, not lossless Master Audio"
+        );
+        assert_eq!(Codec::from_coding_type(0xA2), Codec::DtsHdHr);
+        // The lossless primary keeps its own code, unchanged.
+        assert_eq!(Codec::from_coding_type(0x86), Codec::DtsHdMa);
+        // ...and both remain audio, so the STN/PMT walker still enumerates them.
+        assert_eq!(Codec::from_coding_type(0xA2).kind(), CodecKind::Audio);
+    }
+
+    // ── extent-end arithmetic saturates (finding 5) ─────────────────────────
+
+    /// `byte_offset_in_title` must compute its extent end with saturating
+    /// arithmetic, like every other extent-end computation in the crate. A
+    /// malformed UDF/IFO extent near the top of the 32-bit LBA space (ECMA-167
+    /// logical block numbers are 32-bit) otherwise overflows: a debug build
+    /// PANICS inside a library, and a release build wraps to a tiny end LBA so
+    /// the range test silently fails and the offset comes back `None`.
+    #[test]
+    fn byte_offset_in_title_saturates_the_extent_end() {
+        let title = title_with_extents(0, &[(u32::MAX - 10, 100)]);
+        // 9 sectors past the extent start; 2048 is the ECMA-167 / UDF logical
+        // sector size, so the byte offset is 9 * 2048.
+        let got = byte_offset_in_title(u32::MAX - 1, &title);
+        assert_eq!(got, Some(18_432));
+        // The saturated end is u32::MAX (exclusive), so the very last
+        // addressable LBA is still inside the extent.
+        assert_eq!(
+            byte_offset_in_title(u32::MAX - 10, &title),
+            Some(0),
+            "the extent start itself maps to offset 0"
+        );
+    }
 
     /// `AacsState` (public via `Disc.aacs`) and `Key` (the key-transport enum)
     /// must never print raw key bytes on `{:?}`. Sentinel 213 (0xD5); non-secret
@@ -4899,12 +5142,10 @@ mod tests {
         assert_eq!(bytes_bad_in_title(&title, &spanning), 20 * 2048);
     }
 
-    /// 0xA2 is secondary DTS-HD MA (lossless), not lossy HR.
-    #[test]
-    fn coding_type_a2_is_dts_hd_ma() {
-        assert_eq!(Codec::from_coding_type(0xA2), Codec::DtsHdMa);
-        assert_eq!(Codec::from_coding_type(0x86), Codec::DtsHdMa);
-    }
+    // (The former `coding_type_a2_is_dts_hd_ma` asserted the DEFECT — that
+    // BD-ROM Part 3 code 0xA2 is lossless Master Audio. It is the lossy
+    // secondary stream; see `secondary_dts_hd_0xa2_is_lossy_not_master_audio`,
+    // which now covers both 0xA2 and the 0x86 primary.)
 
     /// HDMV coding_type 0x90 = Presentation Graphics (PG / subtitles) → Pgs,
     /// but 0x91 = Interactive Graphics (IG / menus) is NOT a subtitle stream.

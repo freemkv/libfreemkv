@@ -99,7 +99,11 @@ pub mod coding_type {
 
     /// Secondary Dolby Digital Plus audio (BD-ROM convention).
     pub const AC3_PLUS_SECONDARY: u8 = 0xA1;
-    /// Secondary DTS-HD audio (lossless MA, not lossy HR) (BD-ROM convention).
+    /// Secondary DTS-HD audio — DTS Express / DTS-HD LBR, a LOSSY low-bitrate
+    /// stream for picture-in-picture and BD-J mixing (BD-ROM Part 3
+    /// `stream_coding_type` table). The lossless primary is [`DTS_HD_MA`]
+    /// (0x86); this code is its lossy secondary counterpart, parallel to
+    /// [`AC3_PLUS_SECONDARY`] (0xA1) on the Dolby side.
     pub const DTS_HD_SECONDARY: u8 = 0xA2;
 }
 

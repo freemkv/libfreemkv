@@ -472,13 +472,29 @@ pub fn dump_disc(disc: &Disc) {
         tracing::debug!(
             target: DIAG,
             "tag=decision pick=main_feature title_idx=0 playlist={:?} dur={:.1}s \
-        size={}B clips={} reason=canonical_title_order(fits-disc, fewest-clips, longest, richest-audio)",
+        size={}B clips={} reason={}",
             main.playlist,
             main.duration_secs,
             main.size_bytes,
             main.clips.len(),
+            main_feature_reason(),
         );
     }
+}
+
+/// The `reason=` token on the main-feature decision row.
+///
+/// DERIVED from [`Disc::CANONICAL_TITLE_ORDER_KEYS`], which lives beside the
+/// comparator that actually implements them — never restated here. The previous
+/// hand-written copy drifted (it advertised a `fewest-clips` key the comparator
+/// had replaced with largest-physical-size), which made the self-diagnosing log
+/// explain the pick with a rule the code does not apply. A diagnostic that
+/// disagrees with the decision it documents is worse than no diagnostic.
+fn main_feature_reason() -> String {
+    format!(
+        "canonical_title_order({})",
+        Disc::CANONICAL_TITLE_ORDER_KEYS.join(", ")
+    )
 }
 
 fn dump_aacs(disc: &Disc) {
@@ -608,6 +624,55 @@ mod tests {
     // these types directly, since the local channel/sample-rate duplicates were
     // deleted in favour of the canonical accessors.
     use crate::disc::{AudioChannels, SampleRate};
+
+    /// The main-feature decision row must NAME `canonical_title_order`'s sort
+    /// keys, not restate them from memory. The restated copy had drifted: it
+    /// still advertised a "fewest-clips" key long after the comparator replaced
+    /// clip-count with largest-physical-size, so a bug report read at
+    /// `--log-level 3` explained the pick with a rule the code does not apply.
+    ///
+    /// The behavioural half is asserted first — against the comparator itself,
+    /// with literals — so the key names are checked against what the code
+    /// actually does, not against the string that names them.
+    #[test]
+    fn main_feature_reason_names_the_comparators_real_keys() {
+        use crate::disc::{Clip, Disc, DiscTitle};
+
+        let sized = |size_bytes: u64, n_clips: usize| DiscTitle {
+            size_bytes,
+            clips: (0..n_clips)
+                .map(|i| Clip {
+                    clip_id: format!("{i:05}"),
+                    in_time: 0,
+                    out_time: 0,
+                    duration_secs: 0.0,
+                    source_packets: 0,
+                })
+                .collect(),
+            ..DiscTitle::empty()
+        };
+        // A 40-clip 8 GB title beats a 1-clip 1 GB title: the comparator's
+        // primary key among disc-fitting titles is LARGEST SIZE. "fewest clips"
+        // would predict the opposite, so the drifted string described a rule
+        // the comparator does not implement.
+        let many_clips_big = sized(8_000_000_000, 40);
+        let one_clip_small = sized(1_000_000_000, 1);
+        assert_eq!(
+            Disc::canonical_title_order(&many_clips_big, &one_clip_small, 25_000_000_000),
+            std::cmp::Ordering::Less,
+            "largest size wins regardless of clip count"
+        );
+
+        let reason = main_feature_reason();
+        assert!(
+            !reason.contains("clips"),
+            "the reason must not advertise a clip-count key the comparator dropped: {reason}"
+        );
+        assert_eq!(
+            reason, "canonical_title_order(fits-disc, largest-size, longest, richest-audio)",
+            "the reason must name the comparator's four keys in priority order"
+        );
+    }
 
     #[test]
     fn res_str_keeps_interlace_marker() {

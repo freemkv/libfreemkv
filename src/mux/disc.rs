@@ -396,6 +396,65 @@ impl DiscStream {
         self.reader.set_keys(crate::decrypt::DecryptKeys::None);
     }
 
+    /// Commit a SUCCESSFUL `read_sectors` into the read buffer and advance the
+    /// extent cursor. `got` is the byte count the source reported (already
+    /// clamped to `bytes`, the full span requested for `sectors`).
+    ///
+    /// The full case (`got == bytes`) is the only one every in-tree
+    /// `SectorSource` produces — they are all full-or-error — and it behaves
+    /// exactly as before.
+    ///
+    /// A SHORT read (`got < bytes`) used to be handled inconsistently: the
+    /// returned count was trusted for `buf_valid`, but `current_offset` still
+    /// advanced by the full requested `sectors`. The undelivered tail therefore
+    /// vanished from the muxed title with no error, no `SectorSkipped` event and
+    /// no `lost_bytes` — a silent hole, indistinguishable from clean output, in
+    /// a single-pass path that has no later pass to recover it. It is handled
+    /// here rather than trusted away because invisible data loss is the one
+    /// outcome this stream must never produce.
+    ///
+    /// The tail is NOT re-read from a smaller offset: `current_offset` must stay
+    /// on an AACS unit boundary (`unit_align`), and resuming mid-unit desyncs
+    /// the decrypt of everything after it — the same reason the failed-unit skip
+    /// branch below advances by the whole unit. So the gap is either
+    ///
+    /// - a hard [`crate::error::Error::DiscRead`] (E6000) when the caller has
+    ///   NOT opted into holes, or
+    /// - zero-filled and ACCOUNTED under `skip_errors`, identically to a failed
+    ///   unit: the stale buffer tail is cleared, `errors` / `lost_bytes` are
+    ///   charged, and a `SectorSkipped` event is emitted.
+    fn commit_read(&mut self, lba: u32, got: usize, bytes: usize) -> io::Result<()> {
+        if got < bytes {
+            if !self.skip_errors {
+                return Err(crate::error::Error::DiscRead {
+                    sector: lba as u64,
+                    status: None,
+                    sense: None,
+                }
+                .into());
+            }
+            // Clear the tail the source did not write — it holds stale bytes
+            // from a previous batch, which would mux as plausible garbage.
+            self.read_buf[got..bytes].fill(0);
+            self.errors += 1;
+            self.lost_bytes = self.lost_bytes.saturating_add((bytes - got) as u64);
+            self.emit(EventKind::SectorSkipped { sector: lba as u64 });
+        }
+        self.buf_valid = bytes;
+        // `bytes` is always a whole number of 2048-byte logical sectors (it is
+        // `sectors * 2048`), so this is the requested sector count — the cursor
+        // advances a whole unit span either way, keeping AACS alignment.
+        self.current_offset += (bytes / 2048) as u32;
+        // Only the bytes the source actually delivered count as read; the
+        // zero-filled tail is loss, already charged to `lost_bytes`.
+        self.bytes_read_total = self.bytes_read_total.saturating_add(got as u64);
+        self.emit(EventKind::BytesRead {
+            bytes: self.bytes_read_total,
+            total: self.bytes_total_extents,
+        });
+        Ok(())
+    }
+
     fn fill_extents(&mut self) -> io::Result<bool> {
         if self.current_extent >= self.extents.len() {
             return Ok(false);
@@ -470,19 +529,13 @@ impl DiscStream {
                 // SectorSource::read_sectors returns the number of bytes
                 // written into buf. All in-tree sources return full-or-error,
                 // but a short count would leave the stale/zeroed tail of
-                // read_buf in place; trust the returned count, not `bytes`.
+                // read_buf in place.
                 debug_assert!(got <= bytes, "read_sectors over-reported byte count");
                 if let Some(ev) = self.adaptive.on_success(sectors) {
                     self.emit(ev);
                 }
-                let bytes = got.min(bytes);
-                self.buf_valid = bytes;
-                self.current_offset += sectors as u32;
-                self.bytes_read_total = self.bytes_read_total.saturating_add(bytes as u64);
-                self.emit(EventKind::BytesRead {
-                    bytes: self.bytes_read_total,
-                    total: self.bytes_total_extents,
-                });
+                let got = got.min(bytes);
+                self.commit_read(lba, got, bytes)?;
                 break;
             }
 
@@ -535,13 +588,9 @@ impl DiscStream {
                         self.emit(ev);
                     }
                     let got = got.min(bytes);
-                    self.buf_valid = got;
-                    self.current_offset += sectors as u32;
-                    self.bytes_read_total = self.bytes_read_total.saturating_add(got as u64);
-                    self.emit(EventKind::BytesRead {
-                        bytes: self.bytes_read_total,
-                        total: self.bytes_total_extents,
-                    });
+                    // Same short-read rule as the first-attempt read above —
+                    // one shared commit, so the two cannot drift apart.
+                    self.commit_read(lba, got, bytes)?;
                     break;
                 }
 
@@ -1071,6 +1120,103 @@ mod tests {
         fn capacity_sectors(&self) -> u32 {
             self.capacity
         }
+    }
+
+    /// A `SectorSource` that UNDER-reports: it writes the whole requested span
+    /// (leaving the tail as stale bytes a real short read would also leave) but
+    /// reports only the first sector as valid. Every in-tree source is
+    /// full-or-error; this models one that is not, which is exactly the case
+    /// `fill_extents` handled inconsistently — trusting the short count for
+    /// `buf_valid` while still advancing the extent cursor by the full request.
+    struct ShortReader {
+        capacity: u32,
+    }
+
+    impl crate::sector::SectorSource for ShortReader {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let bytes = count as usize * 2048;
+            // Stale marker across the whole span; only the first sector is
+            // reported as actually delivered.
+            buf[..bytes].fill(0xAB);
+            Ok(2048usize.min(bytes))
+        }
+
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    fn short_read_stream(skip_errors: bool) -> DiscStream {
+        let mut s = DiscStream::new(
+            Box::new(ShortReader { capacity: 64 }),
+            synthetic_title(64),
+            crate::decrypt::DecryptKeys::None,
+            8, // request 8 sectors (16384 B); the source delivers 1 (2048 B)
+            ContentFormat::BdTs,
+            false,
+            None,
+        )
+        .unwrap();
+        s.skip_errors = skip_errors;
+        s
+    }
+
+    /// A short read must never become a SILENT gap. `buf_valid` trusts the
+    /// returned byte count, so advancing `current_offset` by the full requested
+    /// sector count drops the undelivered tail out of the muxed title with no
+    /// error, no skip event, and no `lost_bytes` — data loss invisible to the
+    /// caller and to the progress accounting.
+    ///
+    /// Without `skip_errors` the caller has NOT opted into holes, so it is a
+    /// hard read error: numeric code E6000 (`Error::DiscRead`).
+    #[test]
+    fn short_read_without_skip_errors_is_reported_not_silently_skipped() {
+        let mut s = short_read_stream(false);
+        let err = s
+            .fill_extents()
+            .expect_err("a short read must not be reported as a clean fill");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("E6000"),
+            "expected the disc-read code E6000, got {err}"
+        );
+    }
+
+    /// With `skip_errors` the caller HAS opted into holes, so the undelivered
+    /// tail is zero-filled and ACCOUNTED — never left as stale buffer bytes and
+    /// never dropped silently. `current_offset` still advances by the full
+    /// request so it stays on an AACS unit boundary (resuming mid-unit desyncs
+    /// the rest of the title, per the failed-unit skip branch).
+    #[test]
+    fn short_read_with_skip_errors_is_zero_filled_and_accounted() {
+        let mut s = short_read_stream(true);
+        assert!(
+            s.fill_extents()
+                .expect("skip_errors absorbs the short read")
+        );
+
+        // 8 sectors requested at 2048 B/sector (the ECMA-167 / UDF logical
+        // sector size) = 16384 B of buffer; the source delivered 2048 B.
+        assert_eq!(s.buf_valid, 16_384, "the whole requested span stays valid");
+        assert_eq!(s.current_offset, 8, "the cursor advances a whole unit span");
+        assert_eq!(
+            s.lost_bytes, 14_336,
+            "16384 requested - 2048 delivered = 14336 lost bytes must be counted"
+        );
+        assert_eq!(s.errors, 1, "the gap is counted as one skip event");
+        // The delivered sector survives; the undelivered tail is zeroed, not
+        // the stale 0xAB the source left behind.
+        assert!(s.read_buf[..2048].iter().all(|&b| b == 0xAB));
+        assert!(
+            s.read_buf[2048..16_384].iter().all(|&b| b == 0),
+            "the undelivered tail must be zero-filled, not stale bytes"
+        );
     }
 
     fn synthetic_title(sector_count: u32) -> DiscTitle {

@@ -236,7 +236,16 @@ impl DiscSession {
     /// Fast disc identification — name/format only, no playlist parse. Wraps
     /// [`Disc::identify`].
     pub fn identify(&mut self) -> Result<DiscId> {
-        Disc::identify(self.drive_mut())
+        // Same reachability as `scan` / `resolve_keys` below: the PUBLIC
+        // `stage_drive_as_reader` / `into_drive` move the drive out of the
+        // session, so this slot can legitimately be empty when a caller reaches
+        // here. A library must not panic from public API — going through
+        // `drive_mut` would hit its `.expect("drive present")`. Return the same
+        // typed `DeviceNotReady` its two siblings already do.
+        let drive = self.drive.as_mut().ok_or_else(|| Error::DeviceNotReady {
+            path: self.device.clone(),
+        })?;
+        Disc::identify(drive)
     }
 
     /// Full structure scan. Forwards the session's [`KeySpec`] credentials /
@@ -758,6 +767,27 @@ mod tests {
         let err = session
             .resolve_keys(factory_of(|| HasUnitKey([1; 16])))
             .expect_err("resolve_keys before scan must error, not panic");
+        assert!(
+            matches!(err, Error::DeviceNotReady { .. }),
+            "expected DeviceNotReady, got {err:?}"
+        );
+    }
+
+    /// `identify` after the drive has left the session (the PUBLIC
+    /// `stage_drive_as_reader` / `into_drive` both permit that ordering) must
+    /// return the typed `DeviceNotReady`, not reach `drive_mut`'s
+    /// `.expect("drive present")` and panic. A library returns errors from its
+    /// public API; only `main()` exits. This is the sibling of
+    /// `scan` / `resolve_keys`, which were already converted.
+    ///
+    /// Mutation: restore `Disc::identify(self.drive_mut())` → this test panics
+    /// instead of receiving an `Err`.
+    #[test]
+    fn identify_without_a_drive_is_clean_device_not_ready() {
+        let mut session = DiscSession::from_parts_for_test(None, None, None);
+        let err = session
+            .identify()
+            .expect_err("identify without a drive must error, not panic");
         assert!(
             matches!(err, Error::DeviceNotReady { .. }),
             "expected DeviceNotReady, got {err:?}"
