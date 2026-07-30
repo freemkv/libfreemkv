@@ -132,6 +132,32 @@ thread_local! {
     static PARAM_REASSERT_REALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Copy the leading bytes of an EBSP with emulation-prevention bytes removed
+/// (ISO/IEC 14496-10 §7.3.1: a 0x03 following 0x00 0x00 is not part of the RBSP).
+///
+/// Only a short prefix is produced, because the sole caller decodes two ue(v)
+/// fields from the very start of a slice header. `first_mb_in_slice` and
+/// `slice_type` are each at most 32 bits, so 16 octets is ample and keeps this
+/// off the per-frame allocation path for anything larger.
+fn unescape_ebsp_prefix(ebsp: &[u8]) -> Vec<u8> {
+    const PREFIX_OCTETS: usize = 16;
+    let mut out = Vec::with_capacity(PREFIX_OCTETS);
+    let mut zeros = 0usize;
+    for &b in ebsp {
+        if out.len() == PREFIX_OCTETS {
+            break;
+        }
+        // Drop the escape octet itself, but only in the 00 00 03 position.
+        if zeros >= 2 && b == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        out.push(b);
+    }
+    out
+}
+
 /// Append `nal` to `out` as a 4-byte big-endian length prefix + body. A NAL
 /// longer than `u32::MAX` can't be length-prefixed in the 4-byte field, so it
 /// is skipped rather than mis-framed. Unreachable in practice (no AU > 4 GiB).
@@ -263,16 +289,29 @@ impl CodecParser for H264Parser {
                         keyframe = true;
                     }
                     // Measure the coding type from the FIRST coded slice's header
-                    // (H.264 §7.3.3: first_mb_in_slice ue(v), then slice_type
-                    // ue(v)). Populates PictureInfo so a consumer reads a MEASURED
-                    // I/P/B, never a keyframe-only guess. Only the first slice of
-                    // the access unit is read; `nal[1..]` is the RBSP after the
-                    // 1-byte NAL header (slice_type is too early for an
-                    // emulation-prevention byte to intervene).
+                    // (ISO/IEC 14496-10 §7.3.3: first_mb_in_slice ue(v), then
+                    // slice_type ue(v)). Populates PictureInfo so a consumer reads
+                    // a MEASURED I/P/B, never a keyframe-only guess. Only the first
+                    // slice of the access unit is read.
+                    //
+                    // The bytes after the 1-byte NAL header are EBSP, not RBSP, so
+                    // emulation-prevention bytes must come out first (§7.4.1: the
+                    // encoder inserts 0x03 after any 0x00 0x00, and §7.3.1 removes
+                    // it before parsing). This used to read the raw NAL on the
+                    // reasoning that slice_type is too early for one to intervene.
+                    // That holds only up to a point: first_mb_in_slice is ue(v), so
+                    // a value of 65535 or more needs sixteen leading zero bits and
+                    // puts 0x00 0x00 at the very start of the payload, which an
+                    // encoder must then escape. A UHD frame is ~32,400 macroblocks
+                    // so a conforming Blu-ray never reaches it, but 8K does, and
+                    // the disc is untrusted input — a stream declaring a large
+                    // first_mb_in_slice made slice_type decode against a byte the
+                    // encoder inserted, yielding a wrong picture type.
                     if (nal_type == NAL_SLICE_NON_IDR || nal_type == NAL_SLICE_IDR)
                         && coding_type.is_none()
                     {
-                        let mut br = BitReader::new(&nal[1..]);
+                        let header = unescape_ebsp_prefix(&nal[1..]);
+                        let mut br = BitReader::new(&header);
                         if let (Some(_first_mb), Some(slice_type)) = (br.read_ue(), br.read_ue()) {
                             coding_type = h264_slice_coding_type(slice_type);
                         }
@@ -645,6 +684,67 @@ mod tests {
             data,
             discontinuity: false,
         }
+    }
+
+    /// The slice-header parse must remove emulation-prevention bytes first
+    /// (ISO/IEC 14496-10 §7.3.1/§7.4.1): the payload after the NAL header is
+    /// EBSP, and a 0x03 following 0x00 0x00 is not part of the RBSP.
+    ///
+    /// Reachable when `first_mb_in_slice` is 65535 or more — a ue(v) that needs
+    /// sixteen leading zero bits, so the payload opens 0x00 0x00 and an encoder
+    /// must escape it. A UHD frame is ~32,400 macroblocks so conforming Blu-ray
+    /// never gets there, but 8K does, and the disc is untrusted input. Reading
+    /// the raw NAL decoded `slice_type` against the inserted byte and produced
+    /// the wrong picture type.
+    #[test]
+    fn slice_header_parse_removes_emulation_prevention_bytes() {
+        // first_mb_in_slice = 65535: ue(v) is 16 zero bits, a 1, then 16 bits of
+        // (v+1) below the leading bit — 33 bits total. slice_type = 2 (I) is
+        // ue(v) = 011. Bit string, before escaping:
+        //   0000000000000000 1 0000000000000000 011
+        // = 36 bits, padded to octets 00 00 80 00 30 — and the leading 00 00
+        // obliges the encoder to insert 0x03, giving 00 00 03 80 00 30.
+        let rbsp = [0x00u8, 0x00, 0x80, 0x00, 0x30];
+        let ebsp = [0x00u8, 0x00, 0x03, 0x80, 0x00, 0x30];
+
+        // The un-escaped prefix must equal the original RBSP.
+        assert_eq!(
+            super::unescape_ebsp_prefix(&ebsp),
+            rbsp,
+            "the 0x03 after 00 00 must be dropped"
+        );
+
+        // And both must decode to the same two fields. Reading the EBSP raw is
+        // what used to happen, and it does NOT agree.
+        let unescaped = super::unescape_ebsp_prefix(&ebsp);
+        let mut good = super::BitReader::new(&unescaped);
+        let (first_mb, slice_type) = (good.read_ue(), good.read_ue());
+        assert_eq!(first_mb, Some(65535), "first_mb_in_slice");
+        assert_eq!(slice_type, Some(2), "slice_type must survive the escape");
+
+        let mut raw = super::BitReader::new(&ebsp[..]);
+        let (_, raw_slice_type) = (raw.read_ue(), raw.read_ue());
+        assert_ne!(
+            raw_slice_type,
+            Some(2),
+            "if the raw EBSP decoded correctly this test would prove nothing"
+        );
+    }
+
+    /// A 0x03 that does NOT follow 00 00 is ordinary payload and must be kept,
+    /// and the sequence 00 00 03 03 keeps its second 0x03 (§7.4.1 resets the
+    /// zero run at the escape).
+    #[test]
+    fn unescape_keeps_an_0x03_that_is_not_an_escape() {
+        assert_eq!(super::unescape_ebsp_prefix(&[0x03, 0x03]), vec![0x03, 0x03]);
+        assert_eq!(
+            super::unescape_ebsp_prefix(&[0x01, 0x00, 0x03]),
+            vec![0x01, 0x00, 0x03]
+        );
+        assert_eq!(
+            super::unescape_ebsp_prefix(&[0x00, 0x00, 0x03, 0x03]),
+            vec![0x00, 0x00, 0x03]
+        );
     }
 
     // --- keyframe parameter-set re-assert: exact bytes + no whole-frame copy ---
