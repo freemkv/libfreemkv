@@ -101,6 +101,85 @@ pub const SCSI_STATUS_CHECK_CONDITION: u8 = 0x02;
 /// [`Error::ScsiError`] with `sense = None`.
 pub const SCSI_STATUS_TRANSPORT_FAILURE: u8 = 0xFF;
 
+// ── CDB length validation ──────────────────────────────────────────────────
+
+/// Validate a CDB against a transport's CDB field width, returning the length
+/// as the `u8` every backend's pass-through descriptor wants.
+///
+/// A CDB longer than the field must be REJECTED, never truncated. Under SPC-4
+/// the opcode's group code (bits 7-5 of byte 0) fixes the CDB length, so
+/// dropping the tail bytes does not produce a shorter form of the same
+/// command — it produces a DIFFERENT command with a different meaning for the
+/// bytes that remain. The drive will usually execute it and return GOOD
+/// status with data for a request the caller never made: a silently wrong
+/// result, on the transport layer everything else in the crate sits on.
+///
+/// Lives here, shared by all three platform backends, so the guard cannot
+/// drift per platform (it previously truncated on Linux and Windows while
+/// erroring on macOS — the "works on my platform, not theirs" class).
+pub(crate) fn checked_cdb_len(cdb: &[u8], max: usize) -> Result<u8> {
+    if cdb.len() > max {
+        return Err(Error::InvalidCdbLength {
+            len: cdb.len(),
+            max,
+        });
+    }
+    // `max` is 16 on every backend, so the cast cannot truncate.
+    Ok(cdb.len() as u8)
+}
+
+#[cfg(test)]
+mod cdb_len_tests {
+    use super::*;
+
+    /// The maximum every backend declares (`K_MAX_CDB_SIZE`).
+    const MAX: usize = 16;
+
+    /// A CDB one byte over the transport's field width must be REJECTED with
+    /// [`Error::InvalidCdbLength`], never silently shortened to `max`. This is
+    /// the cross-platform test for the guard that `linux.rs`, `macos.rs` and
+    /// `windows.rs` all route through — none of those three modules is
+    /// compiled on more than one host, so the shared helper is the only place
+    /// the behaviour can be tested on every platform's CI.
+    #[test]
+    fn oversized_cdb_is_rejected_not_truncated() {
+        let cdb = [0u8; MAX + 1];
+        match checked_cdb_len(&cdb, MAX) {
+            Err(Error::InvalidCdbLength { len, max }) => {
+                assert_eq!(len, MAX + 1);
+                assert_eq!(max, MAX);
+            }
+            Err(other) => panic!("expected InvalidCdbLength, got {other:?}"),
+            Ok(n) => panic!(
+                "over-length CDB was accepted and truncated to {n} bytes — the drive \
+                 would execute a DIFFERENT command than the caller asked for"
+            ),
+        }
+    }
+
+    /// A CDB exactly at the field width is legal and passes through untouched.
+    #[test]
+    fn max_length_cdb_is_accepted() {
+        let cdb = [0u8; MAX];
+        assert_eq!(checked_cdb_len(&cdb, MAX).ok(), Some(MAX as u8));
+    }
+
+    /// Every real CDB length (SPC-4 groups 0-5: 6, 10, 12, 16 bytes) is
+    /// accepted and reported verbatim, and an empty CDB reports 0 — the
+    /// backends' own empty-CDB guards handle that case.
+    #[test]
+    fn in_range_cdb_lengths_pass_through_verbatim() {
+        for len in [0usize, 6, 10, 12, 16] {
+            let cdb = vec![0u8; len];
+            assert_eq!(
+                checked_cdb_len(&cdb, MAX).ok(),
+                Some(len as u8),
+                "CDB of {len} bytes must be accepted verbatim"
+            );
+        }
+    }
+}
+
 // ── SPC-4 sense keys (§4.5.6 Table 28) ─────────────────────────────────────
 //
 // Broad failure category returned in a CHECK CONDITION reply's sense data.
