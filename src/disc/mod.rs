@@ -1945,9 +1945,20 @@ impl Disc {
         // one shared PGS classifier); the rip path leaves it off — the muxer
         // detects forced while muxing, without a second read of the clip.
         if opts.probe_forced_subtitles {
+            // One cache across every title: a disc's playlists overwhelmingly
+            // reference the same handful of clips (main feature, play-all,
+            // seamless-branch variants), so without memoisation the same physical
+            // extents are re-read from the drive once per playlist — 30-150 times
+            // on a typical Blu-ray.
+            let mut cache = pgs_forced_probe::ForcedProbeCache::new();
             for title in &mut titles {
                 if title.content_format == ContentFormat::BdTs {
-                    pgs_forced_probe::probe_and_set_forced(reader, title);
+                    pgs_forced_probe::probe_and_set_forced(
+                        reader,
+                        title,
+                        &mut cache,
+                        opts.halt.as_ref(),
+                    );
                 }
             }
         }
