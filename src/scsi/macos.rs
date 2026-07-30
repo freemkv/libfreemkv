@@ -181,6 +181,20 @@ impl ScsiTransport for MacScsiTransport {
         };
 
         if kr != 0 {
+            // Log the IOKit return before collapsing it. `open()` above decodes
+            // the shim's sentinel into typed variants rather than flattening
+            // every failure, but `execute()` discarded `kr` entirely — and this
+            // file had no tracing at all, where the Linux and Windows backends
+            // both log their execute failures. That left resource contention
+            // (another process taking exclusive access mid-rip) and a real
+            // hardware wedge indistinguishable, with no diagnostic trail on
+            // either.
+            tracing::warn!(
+                target: "freemkv::scsi",
+                opcode = cdb.first().copied().unwrap_or(0),
+                kr,
+                "shim_execute failed"
+            );
             return Err(Error::ScsiError {
                 opcode: cdb.first().copied().unwrap_or(0),
                 status: super::SCSI_STATUS_TRANSPORT_FAILURE,
