@@ -767,6 +767,34 @@ fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
     (parsers, pid_to_track, ts, ps)
 }
 
+/// CPS-unit id given to an FMTS forensic **index key** banked into the caller's key
+/// pool by [`resolve_fmts_key_map`] (`FMTS_POOL_TAG_BASE + slot`).
+///
+/// The pool entry's first field is a CPS-unit number that the mapped decrypt never
+/// reads — it indexes the pool by SLOT ([`crate::decrypt::AacsKeyMap`] ranges carry
+/// slots) — so the field doubles as the tag that separates the disc's BASE CPS unit
+/// keys from the forensic index keys appended on top of them. Base ids come from a
+/// key's position in `Unit_Key_RO.inf` (+1), whose count is a BE16, so they cannot
+/// exceed 65_536; this base is far above that, so the two id spaces can never
+/// collide and misclassify a base key as forensic (which would under-count the CPS
+/// units and hand the wrong key to a whole extent).
+const FMTS_POOL_TAG_BASE: u32 = 1 << 24;
+
+/// The pool slot of the disc's ONE base CPS Unit Key, or `None` when the pool holds
+/// several (a genuine multi-CPS disc) — the forensic index keys
+/// ([`FMTS_POOL_TAG_BASE`]) that [`resolve_fmts_key_map`] appends to the same pool
+/// are excluded, so the answer is a property of the DISC and not of how many titles
+/// have already resolved through the shared pool.
+fn single_base_key_slot(unit_keys: &[(u32, [u8; 16])]) -> Option<usize> {
+    let mut base = unit_keys
+        .iter()
+        .enumerate()
+        .filter(|(_, (cps_id, _))| *cps_id < FMTS_POOL_TAG_BASE)
+        .map(|(slot, _)| slot);
+    let slot = base.next()?;
+    base.next().is_none().then_some(slot)
+}
+
 /// FMTS (AACS 2.1) branch of [`resolve_mux_key_map`]. Returns `Some(map)` when the
 /// disc carries `IndividualSegment.tbl` AND a key source is configured; `None`
 /// otherwise (not FMTS, or no source — the caller's base-Unit-Key path then
@@ -782,10 +810,15 @@ fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
 /// then drops, yielding one coherent stream. The base Unit Key covers everything
 /// outside a segment.
 ///
+/// The segment SPNs are offsets into the FORENSIC FEATURE CLIP, so every clip-byte →
+/// LBA mapping here is anchored on that clip's own extents ([`forensic_clip_extents`])
+/// — never on `title.extents`, which on a play-all playlist is the concatenation of
+/// several clips and would put the segments in the wrong one.
+///
 /// Everything expensive here is memoised per DISC, not recomputed per title:
-/// `cache.table` holds the UDF walk + `IndividualSegment.tbl` (disc-invariant outright)
-/// and `cache.keys` holds the index keys + phases (keyed on the extent list, the only
-/// per-title input). See [`resolve_mux_key_map_cached`] for why a hit is provably
+/// `cache.table` holds the UDF walk + `IndividualSegment.tbl` and `cache.clip` the
+/// forensic clip's extents (both disc-invariant outright), and `cache.keys` holds the
+/// index keys + phases. See [`resolve_mux_key_map_cached`] for why a hit is provably
 /// the same answer. What remains per title is the pool→slot mapping, the LBA range
 /// arithmetic and the base-key gap fill.
 fn resolve_fmts_key_map(
@@ -797,7 +830,11 @@ fn resolve_fmts_key_map(
     halt: Option<&crate::halt::Halt>,
     cache: &mut FmtsCache,
 ) -> io::Result<Option<crate::decrypt::AacsKeyMap>> {
-    let FmtsCache { table, keys: memo } = cache;
+    let FmtsCache {
+        table,
+        clip,
+        keys: memo,
+    } = cache;
     use crate::aacs::segment::{clip_byte_to_lba, parse_individual_segments};
 
     // Cooperative cancel: this probes the LIVE drive across up to a few hundred
@@ -837,7 +874,7 @@ fn resolve_fmts_key_map(
             Err(crate::error::Error::UdfNotFilesystem) => None,
             Err(e) => return Err(e.into()),
         };
-        let tbl = match udf {
+        let tbl = match udf.as_ref() {
             None => None,
             Some(u) => match u.read_file(reader, "/AACS/IndividualSegment.tbl") {
                 Ok(t) => Some(t),
@@ -845,26 +882,56 @@ fn resolve_fmts_key_map(
                 Err(e) => return Err(e.into()),
             },
         };
-        *table = Some(
-            tbl.as_deref()
-                .and_then(parse_individual_segments)
-                .filter(|s| !s.is_empty()),
-        );
+        let parsed = tbl
+            .as_deref()
+            .and_then(parse_individual_segments)
+            .filter(|s| !s.is_empty());
+        // Locate the forensic feature clip in the SAME walk — the byte space the
+        // segment SPNs are relative to (see `FmtsClipCache`). Only an FMTS disc pays
+        // for the lookup. Assigned before `*table` so a read fault on the clip's ICB
+        // leaves NEITHER memo filled and a later title retries the whole thing.
+        *clip = Some(match (&parsed, udf.as_ref()) {
+            (Some(_), Some(u)) => forensic_clip_extents(u, reader)?,
+            _ => None,
+        });
+        *table = Some(parsed);
     }
     let Some(Some(segments)) = table.as_ref() else {
         return Ok(None); // not an FMTS disc
     };
     let segments = segments.clone();
-    // The segment SPNs are in the FORENSIC FEATURE clip's byte space. A title
-    // whose extents do not cover any segment's clip bytes carries no forensic
+    // ── ANCHOR the segment byte space. The SPNs are offsets into the FORENSIC
+    //    FEATURE clip, NOT into this title's extent concatenation: a playlist that
+    //    plays a trailer before the feature has the trailer's sectors FIRST in
+    //    `title.extents`, so mapping clip byte 0 to `title.extents[0]` puts every
+    //    segment in the wrong clip — the anchor probe then samples the trailer (no
+    //    index key anchors ⇒ `FmtsKeyMissing` aborts the whole disc) or, worse, index
+    //    keys get applied to non-forensic sectors while the real forensic units keep
+    //    the base key: silent garble, no error. So the arithmetic is anchored on the
+    //    forensic clip's OWN extents, which are a disc fact read from UDF. ─────────
+    let Some(Some(clip_extents)) = clip.as_ref() else {
+        // The disc carries a non-empty `IndividualSegment.tbl` — it HAS forensic
+        // content — but the clip that content lives in could not be identified, so
+        // there is no defensible anchor for the SPNs. Fail loud: a hard, retryable
+        // error beats silently mapping index keys onto the wrong clip's sectors.
+        tracing::warn!(target: "freemkv::keysource", segments = segments.len(), "fmts: forensic feature clip not identifiable — refusing an unanchored segment map");
+        return Err(crate::error::Error::FmtsKeyMissing.into());
+    };
+    let clip_extents = clip_extents.clone();
+    // A title that does not read the forensic clip's sectors carries no forensic
     // content (a menu/extras playlist, or simply a different clip): its base Unit
-    // Key/CPS map applies and there is nothing forensic to resolve. Filter to the
-    // segments addressable within THIS title; if none, fall back (`Ok(None)`)
-    // rather than hard-failing. Without this, `resolve_content_key_map` — which
-    // resolves EVERY title for the whole-disc sweep — aborts the entire decrypt on
-    // the first non-forensic title (a menu playlist), and `build_iso_pipeline`
-    // aborts muxing any non-main title.
-    let segments = filter_addressable_segments(segments, &title.extents);
+    // Key/CPS map applies and there is nothing forensic to resolve — fall back
+    // (`Ok(None)`) rather than hard-failing. Without this, `resolve_content_key_map`
+    // — which resolves EVERY title for the whole-disc sweep — aborts the entire
+    // decrypt on the first non-forensic title (a menu playlist), and
+    // `build_iso_pipeline` aborts muxing any non-main title.
+    if !extents_overlap(&title.extents, &clip_extents) {
+        return Ok(None);
+    }
+    // Keep only the segments the forensic clip actually contains: a record whose
+    // clip bytes run past the clip's end belongs to no readable sector (a stale or
+    // foreign table entry) and must not be mapped.
+    let segments = filter_addressable_segments(segments, &clip_extents);
     if segments.is_empty() {
         return Ok(None);
     }
@@ -878,17 +945,20 @@ fn resolve_fmts_key_map(
     };
 
     // ── The expensive half — the anchor probe, the per-index phase probe and the
-    //    ONE key-service round trip — depends on the title ONLY through its extent
-    //    list, so it is resolved at most once per distinct extent list per disc
-    //    (`FmtsKeyCache`). Without this, `resolve_content_key_map` re-ran the whole
-    //    probe AND re-asked the key service once per playlist: on a 60-playlist disc
-    //    that is 60 identical key-service round trips (the storm) and tens of
-    //    thousands of random 6144-byte reads for one disc-wide answer. ────────────
+    //    ONE key-service round trip — reads only the FORENSIC CLIP's sectors, so it is
+    //    resolved at most once per disc; it stays keyed on the title's extent list
+    //    (`FmtsKeyCache`), a key FINER than the answer needs, so each distinct extent
+    //    list keeps its own verdict rather than inheriting another's. Without this,
+    //    `resolve_content_key_map` re-ran the whole probe AND re-asked the key service
+    //    once per playlist: on a 60-playlist disc that is 60 identical key-service
+    //    round trips (the storm) and tens of thousands of random 6144-byte reads for
+    //    one disc-wide answer. ───────────────────────────────────────────────────────
     let ek = extent_key(format, title);
     let (index_keys, phase_of_index) = match memo.get(&ek) {
         Some((k, p)) => (k.clone(), p.clone()),
         None => {
-            let probed = probe_fmts_index_keys(reader, title, &segments, fetch, format, halt)?;
+            let probed =
+                probe_fmts_index_keys(reader, &clip_extents, &segments, fetch, format, halt)?;
             // Only memoise a run whose every index reached a DEFINITE phase. A
             // read-faulted index defaulted to `Phase::All` is a property of a
             // transient live-drive fault, not of these extents — caching it would
@@ -915,8 +985,10 @@ fn resolve_fmts_key_map(
                 None => {
                     let s = unit_keys.len();
                     // CPS-unit id is cosmetic for the mapped decrypt (it indexes by
-                    // slot); use a high, distinct number for the forensic keys.
-                    unit_keys.push((1000 + s as u32, *k));
+                    // slot), so it carries the forensic TAG instead: it is what tells
+                    // the single-CPS short-circuit these are not base CPS unit keys
+                    // (see `FMTS_POOL_TAG_BASE` / `single_base_key_slot`).
+                    unit_keys.push((FMTS_POOL_TAG_BASE.saturating_add(s as u32), *k));
                     s
                 }
             };
@@ -950,9 +1022,11 @@ fn resolve_fmts_key_map(
             .unwrap_or(crate::decrypt::Phase::All);
         let start_byte = seg.start_spn as u64 * 192;
         let end_byte = (seg.end_spn as u64 + 1) * 192;
+        // Clip bytes → LBAs through the FORENSIC CLIP's extents (see the anchor note
+        // above), never the title's.
         let (Some(a), Some(b)) = (
-            clip_byte_to_lba(&title.extents, start_byte),
-            clip_byte_to_lba(&title.extents, end_byte - 1),
+            clip_byte_to_lba(&clip_extents, start_byte),
+            clip_byte_to_lba(&clip_extents, end_byte - 1),
         ) else {
             unresolved += 1;
             continue;
@@ -999,13 +1073,15 @@ struct FmtsIndexKeys {
 /// ([`FmtsKeyCache`]) — the arithmetic that turns these keys into a per-title LBA
 /// map stays at the call site, where the title belongs.
 ///
-/// `segments` are the segments already filtered to those addressable within
-/// `title`; every read is `clip_byte_to_lba(&title.extents, …)`. Neither probe reads
+/// `clip_extents` are the FORENSIC FEATURE CLIP's own extents — the byte space the
+/// segment SPNs are relative to — and `segments` those addressable within it; every
+/// read is `clip_byte_to_lba(clip_extents, …)`, so a probe never lands in another
+/// clip's sectors whatever order a playlist lists its clips in. Neither probe reads
 /// the caller's key pool, which is what makes the result independent of resolve
 /// order across titles.
 fn probe_fmts_index_keys(
     reader: &mut dyn SectorSource,
-    title: &DiscTitle,
+    clip_extents: &[crate::disc::Extent],
     segments: &[crate::aacs::segment::Segment],
     fetch: &crate::sector::KeyFetch,
     format: ContentFormat,
@@ -1020,13 +1096,13 @@ fn probe_fmts_index_keys(
         }
         Ok(())
     };
-    tracing::info!(target: "freemkv::keysource", segments = segments.len(), extents = title.extents.len(), "fmts: begin index-key resolution");
+    tracing::info!(target: "freemkv::keysource", segments = segments.len(), extents = clip_extents.len(), "fmts: begin index-key resolution");
 
     // Read aligned unit `index` of `seg`: clip byte `start_spn*192 + index*6144`.
     let read_unit =
         |reader: &mut dyn SectorSource, seg: &crate::aacs::segment::Segment, index: usize| {
             let clip_byte = seg.start_spn as u64 * 192 + index as u64 * ALIGNED_UNIT_LEN as u64;
-            let lba = clip_byte_to_lba(&title.extents, clip_byte)?;
+            let lba = clip_byte_to_lba(clip_extents, clip_byte)?;
             let mut c = vec![0u8; ALIGNED_UNIT_LEN];
             reader.read_sectors(lba, 3, &mut c, false).ok()?;
             Some(c)
@@ -1156,13 +1232,75 @@ fn probe_fmts_index_keys(
     })
 }
 
-/// Keep only the forensic segments addressable within THIS title's extents: a
-/// segment whose clip-byte start (`start_spn * 192`) maps to an LBA inside the
-/// title is forensic content for this title; one that does not belongs to a
-/// different clip (a menu/extras playlist) and is dropped. An empty result means
-/// the title carries no forensic content, so [`resolve_fmts_key_map`] returns
-/// `Ok(None)` and the caller's base Unit-Key path applies. Extracted from
-/// `resolve_fmts_key_map` for direct testing of the inclusion/exclusion decision.
+/// The FMTS forensic feature clip's own extents — the byte space every
+/// `IndividualSegment.tbl` SPN is relative to — or `None` when the disc does not
+/// identify exactly one such clip.
+///
+/// An AACS 2.1 disc names its forensic feature `BDMV/STREAM/<clip>.fmts` (the
+/// extension `bluray.rs` already resolves clip extents through), and the disc carries
+/// ONE segment table, whose SPNs are therefore in ONE clip's byte space. So: exactly
+/// one `.fmts` file → that clip's extents; none, or several (an ambiguous SPN space),
+/// → `None`, which [`resolve_fmts_key_map`] turns into a loud
+/// [`Error::FmtsKeyMissing`](crate::error::Error::FmtsKeyMissing) rather than a guess.
+///
+/// This is a DISC fact — no title is consulted — which is exactly why it is a sound
+/// anchor: a playlist's `extents` are the concatenation of ALL its clips in playback
+/// order, so their byte space is the playlist's, not the forensic clip's.
+///
+/// A read fault on the clip's ICB propagates (`Err`), like every other read on this
+/// path; a purely structural absence is `Ok(None)`.
+fn forensic_clip_extents(
+    udf: &crate::udf::UdfFs,
+    reader: &mut dyn SectorSource,
+) -> io::Result<Option<Vec<crate::disc::Extent>>> {
+    let Some(dir) = udf.find_dir("/BDMV/STREAM") else {
+        return Ok(None);
+    };
+    let mut names = dir
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".fmts"))
+        .map(|e| e.name.clone());
+    let Some(name) = names.next() else {
+        return Ok(None);
+    };
+    if names.next().is_some() {
+        tracing::warn!(target: "freemkv::keysource", "fmts: more than one forensic clip on the disc — segment byte space is ambiguous");
+        return Ok(None);
+    }
+    let exts: Vec<crate::disc::Extent> = udf
+        .file_extents(reader, &format!("/BDMV/STREAM/{name}"))
+        .map_err(io::Error::from)?
+        .into_iter()
+        .filter(|&(lba, sectors)| lba > 0 && sectors > 0)
+        .map(|(start_lba, sector_count)| crate::disc::Extent {
+            start_lba,
+            sector_count,
+        })
+        .collect();
+    Ok((!exts.is_empty()).then_some(exts))
+}
+
+/// True when any extent of `a` shares a sector with any extent of `b`. Used to decide
+/// whether a title actually reads the forensic clip (and so carries forensic content)
+/// without assuming the two extent lists are byte-identical.
+fn extents_overlap(a: &[crate::disc::Extent], b: &[crate::disc::Extent]) -> bool {
+    a.iter().any(|x| {
+        let x_end = x.start_lba.saturating_add(x.sector_count);
+        b.iter().any(|y| {
+            let y_end = y.start_lba.saturating_add(y.sector_count);
+            x.start_lba < y_end && y.start_lba < x_end
+        })
+    })
+}
+
+/// Keep only the forensic segments addressable within the FORENSIC CLIP's extents: a
+/// segment whose clip-byte start (`start_spn * 192`) maps to an LBA inside the clip is
+/// real forensic content; one that does not is past the clip's end (a stale or foreign
+/// table record) and is dropped. An empty result means there is nothing forensic to
+/// resolve, so [`resolve_fmts_key_map`] returns `Ok(None)` and the caller's base
+/// Unit-Key path applies. Extracted from `resolve_fmts_key_map` for direct testing of
+/// the inclusion/exclusion decision.
 fn filter_addressable_segments(
     segments: Vec<crate::aacs::segment::Segment>,
     extents: &[crate::disc::Extent],
@@ -1420,14 +1558,17 @@ pub(crate) type FmtsTableCache = Option<Option<Vec<crate::aacs::segment::Segment
 /// the expensive half of [`resolve_fmts_key_map`] — across the titles of ONE disc.
 ///
 /// Keyed by `(format, the title's exact extent list)`, mirroring
-/// [`crate::disc::pgs_forced_probe::ForcedProbeCache`]. The extent list is the key
-/// because it is the ONLY per-title input to the anchor probe, the phase probe and
-/// the key-service call: every read those make is
-/// `clip_byte_to_lba(&title.extents, …)`, and which segments are probed at all is
-/// `filter_addressable_segments(_, &title.extents)`. Two titles with the same
-/// extent list therefore feed byte-identical samples to a stateless
-/// [`crate::sector::KeyFetch`] and to the same `is_clean` arithmetic under the same
-/// `format` — see the safety argument on [`resolve_mux_key_map_cached`].
+/// [`crate::disc::pgs_forced_probe::ForcedProbeCache`]. Every read the anchor probe,
+/// the phase probe and the key-service call make is
+/// `clip_byte_to_lba(forensic_clip_extents, …)` and the probed segments are
+/// `filter_addressable_segments(_, forensic_clip_extents)` — both DISC facts (see
+/// [`forensic_clip_extents`]), so the answer no longer varies by title at all. The
+/// extent list is KEPT in the key deliberately: it is finer than the answer needs, so
+/// each distinct extent list still gets its own verdict rather than inheriting
+/// another's, and a title can never be served an answer resolved from bytes it does
+/// not read. Two titles with the same extent list feed byte-identical samples to a
+/// stateless [`crate::sector::KeyFetch`] and to the same `is_clean` arithmetic under
+/// the same `format` — see the safety argument on [`resolve_mux_key_map_cached`].
 ///
 /// The value holds the ordered index keys (element `i` = forensic index `i + 1`)
 /// and the resolved phase per index tag. It is key material: never logged, never
@@ -1440,12 +1581,23 @@ pub(crate) type FmtsKeyCache = std::collections::HashMap<
     ),
 >;
 
-/// The two FMTS memos, bundled so [`resolve_fmts_key_map`] takes one argument for
-/// both and the multi-CPS memo can be borrowed independently.
+/// The disc's forensic feature clip extents, resolved in the SAME UDF walk as
+/// [`FmtsTableCache`] and at most once per disc: `None` = not looked for yet;
+/// `Some(None)` = looked for and not identifiable (or the disc is not FMTS);
+/// `Some(Some(v))` = the clip's extents, the anchor for every segment SPN.
+///
+/// A disc fact like the table itself — see [`forensic_clip_extents`] for why, and for
+/// what `Some(None)` costs on an FMTS disc (a loud `FmtsKeyMissing`, not a guess).
+pub(crate) type FmtsClipCache = Option<Option<Vec<crate::disc::Extent>>>;
+
+/// The three FMTS memos, bundled so [`resolve_fmts_key_map`] takes one argument for
+/// all of them and the multi-CPS memo can be borrowed independently.
 #[derive(Default)]
 pub(crate) struct FmtsCache {
     /// The disc's forensic segment table — see [`FmtsTableCache`].
     table: FmtsTableCache,
+    /// The disc's forensic feature clip extents — see [`FmtsClipCache`].
+    clip: FmtsClipCache,
     /// The forensic index keys + phases — see [`FmtsKeyCache`].
     keys: FmtsKeyCache,
 }
@@ -1504,12 +1656,22 @@ fn extent_key(format: ContentFormat, title: &DiscTitle) -> (ContentFormat, Vec<(
 /// mentions the title. See the type's doc for the negatives that are (and are not)
 /// memoised.
 ///
+/// ## FMTS forensic clip extents ([`FmtsClipCache`])
+///
+/// Disc-invariant outright, like the table: the clip is found by name in the UDF tree
+/// and its extents come from its own allocation descriptors. No title is consulted —
+/// which is the point. It is the byte-space anchor for every segment SPN, and
+/// anchoring on a TITLE's extent list instead made a playlist that lists a trailer
+/// before the feature map every segment into the trailer's sectors.
+///
 /// ## FMTS index keys and phases ([`FmtsKeyCache`])
 ///
-/// The title enters the anchor and phase probes through exactly one channel — the
-/// extent list, via `clip_byte_to_lba` (which segments are addressable, and which
-/// LBA each probed clip byte maps to) — and that list is IN the key. Given the same
-/// list, the same `format` and unchanging media:
+/// Every input to the anchor and phase probes is now a disc fact: the probes read
+/// `clip_byte_to_lba(forensic_clip_extents, …)` and visit
+/// `filter_addressable_segments(_, forensic_clip_extents)`. The title's extent list
+/// stays IN the key anyway — a strictly finer key than the answer needs, so no title
+/// inherits a verdict resolved from bytes it does not read. Given the same key, the
+/// same `format` and unchanging media:
 ///
 /// * `filter_addressable_segments` yields the same segments in the same order, so
 ///   the anchor loop and each `probe_index_phase` visit the same segments.
@@ -1551,21 +1713,19 @@ pub(crate) fn resolve_mux_key_map_cached(
         ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted, decrypt_unit, is_clean,
     };
 
-    // Borrow the three memos disjointly: the FMTS branch needs two of them mutably
-    // while the multi-CPS loop below needs the third.
+    // Borrow the memos disjointly: the FMTS branch needs its three mutably while the
+    // multi-CPS loop below needs the CPS one.
     let DiscKeyCache { cps: cache, fmts } = cache;
 
     // The base Unit Key pool is always resolved and banked by the caller before mux
     // (autorip's pre-rip gate; the ISO path's `decrypt_keys()`), so an AACS title
     // reaches here with a non-empty pool — an empty pool is reported as
-    // `DecryptKeys::None` and takes the CSS/clear arm above. `pool_len` is therefore
-    // always >= 1 for the AACS map paths below.
-    let pool_len = match keys {
-        crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => unit_keys.len(),
+    // `DecryptKeys::None` and takes the CSS/clear arm above.
+    if !matches!(keys, crate::decrypt::DecryptKeys::Aacs { .. }) {
         // CSS / clear: the AACS map keys nothing here — an empty map passes every
         // unit through (CSS self-descrambles on its own path).
-        _ => return Ok(crate::decrypt::AacsKeyMap::from_ranges(Vec::new())),
-    };
+        return Ok(crate::decrypt::AacsKeyMap::from_ranges(Vec::new()));
+    }
     // FMTS (AACS 2.1): if the disc carries `IndividualSegment.tbl`, the forensic
     // segments need per-index keys the base Unit Key can't open. Resolve them up
     // front from the configured source and build a per-segment map. Returns `None`
@@ -1574,9 +1734,21 @@ pub(crate) fn resolve_mux_key_map_cached(
     if let Some(map) = resolve_fmts_key_map(reader, title, keys, fetch, format, halt, fmts)? {
         return Ok(map);
     }
-    if pool_len == 1 {
-        // One CPS unit → key 0 over every content extent; nav passes through.
-        return Ok(content_map(title, 0));
+    // The single-CPS short-circuit asks about the BASE CPS unit keys only. It must not
+    // read the pool's LENGTH: on an FMTS disc `resolve_fmts_key_map` APPENDS this
+    // disc's forensic index keys to the same caller-owned pool, so once ANY forensic
+    // title has resolved the pool is `1 + n_index` long for every later title. Keying
+    // off the length there dropped every subsequent single-CPS title into the
+    // multi-CPS sampling path (8 random 6144-byte reads per extent, and a
+    // `DecryptFailed` abort of the WHOLE-disc map for any extent no pooled key opens)
+    // — making the outcome depend on which playlist happened to resolve FIRST, the
+    // exact order-independence this function's docs promise. The forensic keys are
+    // tagged in the pool ([`FMTS_POOL_TAG_BASE`]), so the base count is exact.
+    if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys
+        && let Some(slot) = single_base_key_slot(unit_keys)
+    {
+        // One CPS unit → its key over every content extent; nav passes through.
+        return Ok(content_map(title, slot));
     }
 
     // Multi-CPS: read a spread of real encrypted units from each extent and pick
@@ -3790,10 +3962,58 @@ mod tests {
 
     impl FmtsDisc {
         fn new() -> Self {
-            use crate::udf::fixture::{DirSpec, build_udf_skeleton, file_with, lay_dir};
+            Self::with_forensic_clip(true)
+        }
+
+        /// `clip = false` drops `BDMV/STREAM/00001.fmts` from the tree: an FMTS disc
+        /// (the table is there) whose forensic clip cannot be identified, so the
+        /// segment SPNs have no defensible anchor.
+        fn with_forensic_clip(clip: bool) -> Self {
+            use crate::udf::fixture::{
+                DirSpec, PART_START, build_udf_skeleton, file, file_with, lay_dir,
+            };
             let segs = fmts_segments();
             let mut meta_disc = crate::udf::fixture::MemDisc::new();
             build_udf_skeleton(&mut meta_disc, 10);
+            let mut subdirs = vec![DirSpec {
+                name: "AACS".to_string(),
+                icb_lba: 12,
+                dir_data_lba: 13,
+                files: vec![file_with(
+                    "IndividualSegment.tbl",
+                    14,
+                    15,
+                    fmts_tbl(&segs),
+                    true,
+                )],
+                subdirs: Vec::new(),
+            }];
+            if clip {
+                // The forensic FEATURE clip, as a real AACS 2.1 disc names it:
+                // `BDMV/STREAM/<clip>.fmts`, whose extents are the byte space the
+                // segment SPNs are relative to. Declared in UDF only (the reader
+                // synthesises its content), at exactly the content region:
+                // partition-relative data LBA + PART_START = FMTS_CONTENT_LBA.
+                subdirs.push(DirSpec {
+                    name: "BDMV".to_string(),
+                    icb_lba: 16,
+                    dir_data_lba: 17,
+                    files: Vec::new(),
+                    subdirs: vec![DirSpec {
+                        name: "STREAM".to_string(),
+                        icb_lba: 18,
+                        dir_data_lba: 19,
+                        files: vec![file(
+                            "00001.fmts",
+                            20,
+                            FMTS_CONTENT_LBA - PART_START,
+                            FMTS_CONTENT_SECTORS * 2048,
+                            true,
+                        )],
+                        subdirs: Vec::new(),
+                    }],
+                });
+            }
             lay_dir(
                 &mut meta_disc,
                 &DirSpec {
@@ -3801,19 +4021,7 @@ mod tests {
                     icb_lba: 10,
                     dir_data_lba: 11,
                     files: Vec::new(),
-                    subdirs: vec![DirSpec {
-                        name: "AACS".to_string(),
-                        icb_lba: 12,
-                        dir_data_lba: 13,
-                        files: vec![file_with(
-                            "IndividualSegment.tbl",
-                            14,
-                            15,
-                            fmts_tbl(&segs),
-                            true,
-                        )],
-                        subdirs: Vec::new(),
-                    }],
+                    subdirs,
                 },
             );
             Self {
@@ -4337,5 +4545,233 @@ mod tests {
         )
         .expect_err("a cancelled halt must abort even a fully-memoised title");
         assert!(crate::error::is_halt(&err), "expected Halted, got: {err}");
+    }
+
+    /// The single-CPS short-circuit must depend on the number of BASE CPS Unit Keys,
+    /// NOT on the length of the whole pool — which the FMTS resolver APPENDS its
+    /// forensic index keys to. Before the fix, a disc whose first-resolved playlist
+    /// was forensic left the shared pool at `1 + n_index`, so every LATER title
+    /// (single-CPS, non-forensic) missed the short-circuit and took the multi-CPS
+    /// sampling path: 8 random 6144-byte reads per extent, and a `DecryptFailed`
+    /// abort of the WHOLE-disc key map for any extent no pooled key opened. That made
+    /// the result depend on the ORDER titles resolve in, contradicting the
+    /// order-independence `resolve_mux_key_map_cached` documents.
+    ///
+    /// Mutation: count the whole pool (`unit_keys.len() == 1`) → the menu title
+    /// samples its extent and the `probe_reads` assert fails.
+    #[test]
+    fn single_cps_short_circuit_survives_a_forensic_title_resolving_first() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls);
+        let mut reader = FmtsDisc::new();
+        let mut keys = fmts_keys();
+        let mut cache = super::DiscKeyCache::new();
+
+        // 1) The FORENSIC title resolves FIRST and banks the disc's index keys into
+        //    the shared pool.
+        let forensic = fmts_title(FMTS_CONTENT_SECTORS);
+        super::resolve_mux_key_map_cached(
+            &mut reader,
+            &forensic,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("the forensic title resolves");
+        assert_eq!(
+            pool_of(&keys).len(),
+            1 + FMTS_INDEX_KEYS.len(),
+            "the forensic index keys really are banked into the shared pool"
+        );
+        let probes_after_forensic = reader.probe_reads;
+
+        // 2) A NON-forensic title of the same disc (a menu playlist: its extents lie
+        //    outside the forensic clip) still has exactly ONE base CPS Unit Key, so it
+        //    must take the single-CPS short-circuit — no sampling reads at all.
+        // (+9_000 keeps the extent on the fixture's 3-sector aligned-unit grid, so
+        // the multi-CPS path WOULD succeed here — the test is about it not running at
+        // all, not about it failing.)
+        let menu = multi_cps_title(FMTS_CONTENT_LBA + 9_000, 300);
+        let map = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &menu,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("a single-CPS menu title must not need the sampling path");
+        assert_eq!(
+            reader.probe_reads, probes_after_forensic,
+            "single base CPS key → the short-circuit fires, so NO multi-CPS sampling"
+        );
+        assert_eq!(
+            map.ranges(),
+            super::content_map(&menu, 0).ranges(),
+            "one base CPS key → key 0 over every content extent"
+        );
+    }
+
+    /// First extent of the play-all playlist's TRAILER clip in the defect-2 test.
+    /// Placed AFTER the forensic clip on disc but FIRST in the extent list — the
+    /// authoring order that broke the segment byte-space anchor.
+    const TRAILER_LBA: u32 = FMTS_CONTENT_LBA + FMTS_CONTENT_SECTORS + 1_000;
+    /// Sectors in the trailer clip — exactly the byte offset of forensic segment 1
+    /// (3200 * 192 = 614_400 = 300 * 2048), so a wrong anchor is off by exactly the
+    /// trailer's length and the two candidate LBAs are unambiguous.
+    const TRAILER_SECTORS: u32 = 300;
+
+    /// Forensic segment SPNs live in the FORENSIC FEATURE CLIP's byte space, so
+    /// mapping them through the TITLE's extent list is wrong for any playlist whose
+    /// extents do not begin with that clip. On a play-all playlist ordered [trailer,
+    /// forensic feature] the old code treated clip byte 0 as the trailer's first
+    /// sector: every segment landed 300 sectors early, the anchor probe sampled the
+    /// TRAILER (so the key service never anchored → `FmtsKeyMissing` aborted the
+    /// whole disc), and had it anchored, the index keys would have been applied to
+    /// non-forensic sectors — silent garble with no error at all.
+    ///
+    /// Mutation: anchor the byte space on `title.extents` again → the resolve either
+    /// errors (no anchor) or maps segment 1 to 10_000 instead of 10_300.
+    #[test]
+    fn forensic_segments_anchor_to_the_forensic_clip_not_the_titles_first_extent() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls);
+        let mut reader = FmtsDisc::new();
+        let mut keys = fmts_keys();
+        let mut cache = super::DiscKeyCache::new();
+
+        // A play-all playlist: the trailer clip FIRST, the forensic feature second.
+        let mut title = DiscTitle::empty();
+        title.extents = vec![
+            Extent {
+                start_lba: TRAILER_LBA,
+                sector_count: TRAILER_SECTORS,
+            },
+            Extent {
+                start_lba: FMTS_CONTENT_LBA,
+                sector_count: FMTS_CONTENT_SECTORS,
+            },
+        ];
+
+        let map = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("a play-all playlist carrying the forensic clip must resolve");
+
+        // Segment index 1 starts at clip byte 3200 * 192 = 614_400 → sector 300 OF
+        // THE FORENSIC CLIP → LBA 10_300. Segment index 2: 6400 * 192 = 1_228_800 →
+        // sector 600 → LBA 10_600.
+        assert_eq!(
+            map.key_idx_for(FMTS_CONTENT_LBA + 300),
+            Some(1),
+            "segment index 1 maps to its own key at the FORENSIC clip's offset"
+        );
+        assert_eq!(
+            map.key_idx_for(FMTS_CONTENT_LBA + 600),
+            Some(2),
+            "segment index 2 maps to its own key at the FORENSIC clip's offset"
+        );
+        assert_eq!(
+            map.key_idx_for(FMTS_CONTENT_LBA),
+            Some(0),
+            "the forensic clip's first sectors are ordinary base-key content"
+        );
+        assert_eq!(
+            map.key_idx_for(TRAILER_LBA),
+            Some(0),
+            "the trailer clip is base-key content — never a forensic index key"
+        );
+        assert_eq!(
+            map.key_idx_for(TRAILER_LBA + TRAILER_SECTORS - 1),
+            Some(0),
+            "and the trailer's last sector too"
+        );
+    }
+
+    /// The anchor is only sound because the forensic clip is IDENTIFIED. A disc that
+    /// carries a non-empty `IndividualSegment.tbl` but no `BDMV/STREAM/*.fmts` gives
+    /// the SPNs no defensible byte space, so the resolve must fail LOUD
+    /// (`FmtsKeyMissing`, retryable) rather than fall back to a title's extent list
+    /// and map forensic index keys onto whatever clip happens to be first — which
+    /// produces silently garbled output with no error at all.
+    #[test]
+    fn unidentifiable_forensic_clip_fails_loud_rather_than_guessing_an_anchor() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls);
+        let mut reader = FmtsDisc::with_forensic_clip(false);
+        let mut keys = fmts_keys();
+        let mut cache = super::DiscKeyCache::new();
+        let title = fmts_title(FMTS_CONTENT_SECTORS);
+
+        let err = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect_err("an unanchorable segment map must never be built");
+        assert_eq!(
+            err.to_string(),
+            std::io::Error::from(crate::error::Error::FmtsKeyMissing).to_string(),
+            "the forensic-content-without-an-anchor verdict is FmtsKeyMissing"
+        );
+        assert_eq!(
+            pool_of(&keys).len(),
+            1,
+            "and nothing was banked into the pool"
+        );
+    }
+
+    /// The base-CPS count that drives the single-CPS short-circuit, in isolation: the
+    /// forensic index keys the FMTS resolver appends (tagged `FMTS_POOL_TAG_BASE + n`)
+    /// are NOT CPS units, and a genuine second CPS unit is.
+    ///
+    /// Mutation: drop the tag filter → the first case returns `None` and its assert
+    /// fails.
+    #[test]
+    fn single_base_key_slot_counts_cps_units_not_banked_forensic_keys() {
+        let base = [0x01u8; 16];
+        let idx1 = [0x21u8; 16];
+        assert_eq!(
+            super::single_base_key_slot(&[(1, base)]),
+            Some(0),
+            "one base CPS key → its slot"
+        );
+        assert_eq!(
+            super::single_base_key_slot(&[
+                (1, base),
+                (super::FMTS_POOL_TAG_BASE + 1, idx1),
+                (super::FMTS_POOL_TAG_BASE + 2, [0x22u8; 16]),
+            ]),
+            Some(0),
+            "banked forensic index keys must not turn a single-CPS disc into multi-CPS"
+        );
+        assert_eq!(
+            super::single_base_key_slot(&[(1, base), (2, idx1)]),
+            None,
+            "two real CPS units → the multi-CPS sampling path"
+        );
+        assert_eq!(
+            super::single_base_key_slot(&[]),
+            None,
+            "an empty pool has no base key"
+        );
+        assert_eq!(
+            super::single_base_key_slot(&[(super::FMTS_POOL_TAG_BASE, idx1), (7, base)]),
+            Some(1),
+            "the slot is the BASE key's, wherever it sits in the pool"
+        );
     }
 }
