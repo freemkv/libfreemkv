@@ -2146,4 +2146,149 @@ mod tests {
             bytes.len().saturating_sub(out_bytes)
         );
     }
+
+    // ── Exact-boundary behaviour of the AU framer ────────────────────────────
+
+    /// `find_sync` scans `0..=len-4`, so a buffer that is EXACTLY the syncword
+    /// still matches. The existing tests cover 0, 3 and "longer than 4", which
+    /// leaves the `len == 4` boundary open — and that is the case a syncword split
+    /// across PES packets lands on the moment its last byte arrives.
+    #[test]
+    fn find_sync_matches_a_buffer_that_is_exactly_the_syncword() {
+        assert_eq!(
+            find_sync(&DTS_CORE_SYNC, &DTS_CORE_SYNC),
+            Some(0),
+            "a four-byte buffer that IS the syncword matches at 0"
+        );
+        let mut five = vec![0x00u8];
+        five.extend_from_slice(&DTS_CORE_SYNC);
+        assert_eq!(
+            find_sync(&five, &DTS_CORE_SYNC),
+            Some(1),
+            "and the last possible start offset is len - 4"
+        );
+    }
+
+    /// `CORE_HEADER_MIN_BYTES` is "enough bytes to DECODE the size field", so a
+    /// buffer holding exactly that many must be decoded, not deferred. The
+    /// distinction is visible precisely at the boundary: with 10 bytes of a core
+    /// sync whose decoded size is sub-spec, the parser must recognise the false
+    /// sync, drain past it and resync down to the 3-byte carry-over tail. Waiting
+    /// instead leaves the false sync sitting at the front of the buffer, where it
+    /// blocks every later real core behind it.
+    #[test]
+    fn a_core_header_of_exactly_the_minimum_length_is_decoded_not_deferred() {
+        let mut parser = DtsParser::new();
+        let mut d = vec![0u8; CORE_HEADER_MIN_BYTES];
+        d[0..4].copy_from_slice(&DTS_CORE_SYNC);
+        d[6] = 0x01; // fsize = 16 → core_size 17, below the 96-byte ETSI floor
+        assert_eq!(d.len(), 10, "the fixture is exactly at the boundary");
+        let out = parser.parse(&make_pes(d, Some(90_000)));
+        assert!(out.is_empty(), "a false sync emits nothing");
+        assert_eq!(
+            parser.buf.len(),
+            3,
+            "the false sync was decoded, drained and resynced past — leaving only \
+             the 3-byte split-sync carry-over"
+        );
+        assert_ne!(
+            find_sync(&parser.buf, &DTS_CORE_SYNC),
+            Some(0),
+            "and the bogus sync is no longer at the front of the buffer"
+        );
+    }
+
+    /// The end-of-stream flush must emit a final access unit whose core is exactly
+    /// as long as the buffer — the ordinary case, since the last AU is closed by
+    /// end-of-stream rather than by a following core sync. Rejecting it at the
+    /// boundary silently drops the last frame of every DTS track.
+    #[test]
+    fn flush_emits_a_core_that_exactly_fills_the_buffer() {
+        let mut parser = DtsParser::new();
+        let core = make_dts_core(512);
+        parser.buf = core.clone();
+        parser.pending_pts = 90_000;
+        let out = parser.flush();
+        assert_eq!(out.len(), 1, "the final AU is emitted, not dropped");
+        assert_eq!(out[0].data, core, "and it is the whole core frame");
+        // One byte short is still refused — the bound is not simply absent.
+        let mut parser = DtsParser::new();
+        parser.buf = core[..511].to_vec();
+        parser.pending_pts = 90_000;
+        assert!(
+            parser.flush().is_empty(),
+            "a core one byte short of its declared size is not emitted truncated"
+        );
+    }
+
+    /// The flush guard is a DISJUNCTION: a buffer that does not BEGIN with a core
+    /// sync is discarded whatever its length. Requiring both conditions instead
+    /// lets a long run of junk through to `dts_core_frame_size`, which happily
+    /// decodes a 14-bit size out of arbitrary bytes — and the flush then emits an
+    /// "access unit" that is not DTS at all.
+    ///
+    /// The junk here is sized so that mis-decoding it yields a plausible core size
+    /// that the buffer fully covers, which is exactly when the wrong answer looks
+    /// like a right one.
+    #[test]
+    fn flush_discards_a_long_buffer_that_does_not_begin_with_a_core_sync() {
+        // A well-formed core frame with ONE byte of its syncword corrupted: every
+        // other field still decodes, and the decodability gate would pass it, so
+        // only the leading-sync test stands between it and the output.
+        let mut parser = DtsParser::new();
+        let mut broken = make_dts_core(300);
+        broken[0] ^= 0xFF; // no longer 0x7FFE8001 at offset 0
+        assert_ne!(
+            find_sync(&broken, &DTS_CORE_SYNC),
+            Some(0),
+            "the fixture really has no core sync at the front"
+        );
+        parser.buf = broken;
+        parser.pending_pts = 90_000;
+        assert!(
+            parser.flush().is_empty(),
+            "a buffer whose front is not a core sync is discarded, not size-decoded"
+        );
+        assert!(parser.buf.is_empty(), "and the junk is dropped");
+
+        // The other half of the disjunction: a buffer too short to size, whose
+        // front IS a core sync, is discarded too.
+        let mut parser = DtsParser::new();
+        parser.buf = DTS_CORE_SYNC.to_vec();
+        parser.pending_pts = 90_000;
+        assert!(parser.flush().is_empty(), "a bare sync tail is not an AU");
+    }
+
+    /// `EXSS_HEADER_MIN_BYTES` is the WORST-CASE header length — the long form's
+    /// 43 bits after the syncword, rounded up to 6 bytes, plus the 4-byte sync.
+    /// It gates whether an extension substream can be sized precisely, and that is
+    /// what keeps a chance core syncword inside XLL payload from being mistaken
+    /// for the next AU boundary; too large and every extension falls back to the
+    /// payload scan, too small and the reader runs off a truncated header.
+    ///
+    /// Pinned at both sides of the boundary rather than by value, so the field
+    /// widths it is summed from stay honest.
+    #[test]
+    fn exss_frame_size_needs_the_worst_case_header_and_no_more() {
+        assert_eq!(
+            EXSS_HEADER_MIN_BYTES, 10,
+            "4 sync bytes + ceil((8 + 2 + 1 + 12 + 20) / 8)"
+        );
+        let ext = make_exss(10, None);
+        assert_eq!(
+            exss_frame_size(&ext),
+            Some(10),
+            "exactly the minimum is enough to size a substream"
+        );
+        assert_eq!(
+            exss_frame_size(&ext[..9]),
+            None,
+            "one byte short cannot be sized — the long form's fields are not all in"
+        );
+        assert_eq!(
+            exss_frame_size(&ext[..4]),
+            None,
+            "the bare sync sizes nothing"
+        );
+    }
 }

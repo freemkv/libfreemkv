@@ -2598,4 +2598,251 @@ mod tests {
             "recovered PES carries only the post-reset ES bytes"
         );
     }
+
+    // ── PAT / PMT section-walk boundaries (ISO/IEC 13818-1 §2.4.4.3, §2.4.4.8) ──
+
+    /// A PAT TS packet with an arbitrary program loop and arbitrary CRC bytes.
+    /// `entries` is `(program_number, pid)`; `crc` is the 4 bytes that follow the
+    /// loop, which the scanner never validates and must never PARSE either.
+    fn pat_packet_entries(entries: &[(u16, u16)], crc: [u8; 4]) -> Vec<u8> {
+        let mut body = [0xFFu8; 184];
+        body[0] = 0x00; // pointer_field
+        let s = 1;
+        body[s] = 0x00; // table_id = PAT
+        // tsid(2) + version(1) + section_number(1) + last_section(1)
+        // + 4 per program entry + 4-byte CRC.
+        let section_length = 5 + entries.len() * 4 + 4;
+        body[s + 1] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        body[s + 2] = (section_length & 0xFF) as u8;
+        body[s + 3] = 0x00; // tsid hi
+        body[s + 4] = 0x01; // tsid lo
+        body[s + 5] = 0xC1; // version / current_next
+        body[s + 6] = 0x00; // section_number
+        body[s + 7] = 0x00; // last_section_number
+        let mut p = s + 8;
+        for &(prog, pid) in entries {
+            body[p] = (prog >> 8) as u8;
+            body[p + 1] = (prog & 0xFF) as u8;
+            body[p + 2] = 0xE0 | (((pid >> 8) as u8) & 0x1F);
+            body[p + 3] = (pid & 0xFF) as u8;
+            p += 4;
+        }
+        body[p..p + 4].copy_from_slice(&crc);
+        bdts_packet(body, 0, true)
+    }
+
+    /// A PMT TS packet whose ES entries may carry descriptors, and whose section
+    /// may declare `stuffing` extra bytes between the last entry and the CRC.
+    /// `entries` is `(stream_type, es_pid, es_info bytes)`.
+    fn pmt_packet_desc(
+        pmt_pid: u16,
+        entries: &[(u8, u16, Vec<u8>)],
+        stuffing: &[u8],
+        crc: [u8; 4],
+    ) -> Vec<u8> {
+        let mut body = [0xFFu8; 184];
+        body[0] = 0x00; // pointer_field
+        let s = 1;
+        body[s] = 0x02; // table_id = PMT
+        let entries_len: usize = entries.iter().map(|(_, _, d)| 5 + d.len()).sum();
+        let section_length = 9 + entries_len + stuffing.len() + 4;
+        body[s + 1] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        body[s + 2] = (section_length & 0xFF) as u8;
+        body[s + 3] = 0x00; // program_number hi
+        body[s + 4] = 0x01; // program_number lo
+        body[s + 5] = 0xC1;
+        body[s + 6] = 0x00;
+        body[s + 7] = 0x00;
+        body[s + 8] = 0xE0; // PCR PID
+        body[s + 9] = 0x00;
+        body[s + 10] = 0xF0; // program_info_length = 0
+        body[s + 11] = 0x00;
+        let mut p = s + 12;
+        for (stype, es_pid, desc) in entries {
+            body[p] = *stype;
+            body[p + 1] = 0xE0 | (((es_pid >> 8) as u8) & 0x1F);
+            body[p + 2] = (es_pid & 0xFF) as u8;
+            body[p + 3] = 0xF0 | (((desc.len() >> 8) as u8) & 0x0F);
+            body[p + 4] = (desc.len() & 0xFF) as u8;
+            body[p + 5..p + 5 + desc.len()].copy_from_slice(desc);
+            p += 5 + desc.len();
+        }
+        body[p..p + stuffing.len()].copy_from_slice(stuffing);
+        p += stuffing.len();
+        body[p..p + 4].copy_from_slice(&crc);
+        bdts_packet(body, pmt_pid, true)
+    }
+
+    fn stream_pids(streams: &[crate::disc::Stream]) -> Vec<u16> {
+        use crate::disc::Stream;
+        streams
+            .iter()
+            .map(|s| match s {
+                Stream::Video(v) => v.pid,
+                Stream::Audio(a) => a.pid,
+                Stream::Subtitle(t) => t.pid,
+            })
+            .collect()
+    }
+
+    /// ISO/IEC 13818-1 §2.4.4.3: a PAT entry with `program_number == 0` carries the
+    /// **network PID**, not a program's PMT PID. Taking it would point pass 2 at the
+    /// NIT, where there is no `table_id 0x02` — so the title's whole stream list
+    /// comes back empty and the disc looks like it has no streams.
+    ///
+    /// Two entries with DISTINCT PIDs, the NIT first, so the test also pins the loop
+    /// STRIDE: a 4-byte program entry. A stride that is not 4 lands mid-entry on the
+    /// second one and decodes a PID belonging to nothing.
+    #[test]
+    fn scan_streams_skips_the_pat_network_entry_and_takes_the_real_program() {
+        let pmt_pid = 0x0100u16;
+        let nit_pid = 0x0010u16; // the customary network PID
+        let pat = pat_packet_entries(&[(0, nit_pid), (1, pmt_pid)], [0xFF; 4]);
+        let mut data = pat.clone();
+        data.extend(pmt_packet(pmt_pid, &[(0x1B, 0x1011)]));
+        data.extend(pat); // follower, for the resync corroboration
+        let streams =
+            scan_streams(&data).expect("the program-1 entry must be the one that is used");
+        assert_eq!(
+            stream_pids(&streams),
+            vec![0x1011],
+            "the PMT found through program 1's PID"
+        );
+
+        // And a PAT that carries ONLY a network entry declares no program at all.
+        let nit_only = pat_packet_entries(&[(0, nit_pid)], [0xFF; 4]);
+        let mut data = nit_only.clone();
+        data.extend(pmt_packet(pmt_pid, &[(0x1B, 0x1011)]));
+        data.extend(nit_only);
+        assert!(
+            scan_streams(&data).is_none(),
+            "a network entry is not a program — there is nothing to scan"
+        );
+    }
+
+    /// The PAT program loop stops before the 4-byte `CRC_32`
+    /// (ISO/IEC 13818-1 Table 2-30): `section_length` counts the CRC, the loop
+    /// must not. The scanner never validates the CRC, so those 4 bytes are
+    /// effectively arbitrary — here they are the bit pattern of a valid-looking
+    /// `program_number 1 → pmt_pid` entry.
+    ///
+    /// Reading them as a program is not a crash, it is a WRONG ANSWER that looks
+    /// right: the scan returns a full stream list for a PAT that declares no
+    /// program at all. So the assertion is that the streams are NOT found.
+    #[test]
+    fn scan_streams_does_not_read_the_pat_crc_as_a_program_entry() {
+        let pmt_pid = 0x0100u16;
+        // A CRC whose bytes spell "program 1 → 0x0100".
+        let crc = [
+            0x00,
+            0x01,
+            0xE0 | ((pmt_pid >> 8) as u8 & 0x1F),
+            pmt_pid as u8,
+        ];
+        let pat = pat_packet_entries(&[(0, 0x0010)], crc);
+        let mut data = pat.clone();
+        data.extend(pmt_packet(pmt_pid, &[(0x1B, 0x1011)]));
+        data.extend(pat);
+        assert!(
+            scan_streams(&data).is_none(),
+            "the CRC_32 is not a program entry, however much it looks like one"
+        );
+    }
+
+    /// ISO/IEC 13818-1 §2.4.4.8: each ES entry is followed by `ES_info_length`
+    /// bytes of descriptors, and the next entry starts after them. Every existing
+    /// PMT fixture declares `ES_info_length = 0`, so the skip is unconstrained by
+    /// them — while a real BD PMT carries a registration descriptor on essentially
+    /// every entry.
+    ///
+    /// Failing to skip them does not fail loudly: the descriptor bytes are decoded
+    /// as an ES entry, so the scan reports streams on PIDs that carry nothing and
+    /// silently loses the entries that follow. Here the first entry's descriptor is
+    /// a real `registration_descriptor` for 'HDMV'.
+    #[test]
+    fn scan_streams_steps_over_es_descriptors_to_reach_the_next_entry() {
+        let pmt_pid = 0x0100u16;
+        let hdmv = vec![0x05, 0x04, b'H', b'D', b'M', b'V'];
+        let pmt = pmt_packet_desc(
+            pmt_pid,
+            &[
+                (0x1B, 0x1011, hdmv),       // H.264 video, with a descriptor
+                (0x81, 0x1100, Vec::new()), // AC-3 audio, without
+            ],
+            &[],
+            [0xFF; 4],
+        );
+        let mut data = pat_packet(pmt_pid);
+        data.extend(pmt);
+        data.extend(pat_packet(pmt_pid));
+        let streams = scan_streams(&data).expect("both entries parse");
+        assert_eq!(
+            stream_pids(&streams),
+            vec![0x1011, 0x1100],
+            "the descriptor bytes are skipped, not decoded as an entry, and the \
+             entry after them is still reached"
+        );
+        assert!(
+            matches!(streams[0], crate::disc::Stream::Video(_)),
+            "0x1B is video"
+        );
+        assert!(
+            matches!(streams[1], crate::disc::Stream::Audio(_)),
+            "0x81 is audio"
+        );
+    }
+
+    /// The PMT ES loop stops before the `CRC_32` for the same reason the PAT loop
+    /// does. It only shows when the declared section is longer than the entries —
+    /// a padded PMT — because otherwise the loop runs out of room on its own and
+    /// the CRC is never in reach.
+    ///
+    /// Here two stuffing bytes sit between the last entry and the CRC, and the
+    /// first of them is `0x1B`. Parsing into the CRC therefore invents a SECOND
+    /// video stream, on a PID assembled from CRC bytes — a stream the mux would go
+    /// on to demux, finding nothing.
+    #[test]
+    fn scan_streams_does_not_read_the_pmt_crc_as_an_es_entry() {
+        let pmt_pid = 0x0100u16;
+        let pmt = pmt_packet_desc(
+            pmt_pid,
+            &[(0x1B, 0x1011, Vec::new())],
+            &[0x1B, 0xE2], // padding: a stream_type byte and a PID high byte
+            [0x22, 0xF0, 0x00, 0x99],
+        );
+        let mut data = pat_packet(pmt_pid);
+        data.extend(pmt);
+        data.extend(pat_packet(pmt_pid));
+        let streams = scan_streams(&data).expect("the real entry parses");
+        assert_eq!(
+            stream_pids(&streams),
+            vec![0x1011],
+            "only the declared ES entry — the CRC_32 is not an entry"
+        );
+    }
+
+    /// `section_length` counts the bytes AFTER the length field including the
+    /// 4-byte CRC, so the program loop's end is `3 + section_length - 4`. A section
+    /// declaring less than 4 underflows that subtraction — a debug panic, and in
+    /// release a wrapped bound clamped to the whole buffer. The guard turns a
+    /// malformed PAT into an ordinary "no program here" instead.
+    ///
+    /// Reachable exactly as written: `collect_psi_section` truncates the section to
+    /// `3 + section_length`, so a declared 0 yields the 3-byte header alone.
+    #[test]
+    fn scan_streams_pat_section_length_below_the_crc_size_is_rejected_not_underflowed() {
+        let mut body = [0xFFu8; 184];
+        body[0] = 0x00; // pointer_field
+        body[1] = 0x00; // table_id = PAT
+        body[2] = 0xB0; // section_syntax + reserved, length high nibble = 0
+        body[3] = 0x00; // section_length = 0 — shorter than its own CRC
+        let pat = bdts_packet(body, 0, true);
+        let mut data = pat.clone();
+        data.extend(pmt_packet(0x0100, &[(0x1B, 0x1011)]));
+        data.extend(pat);
+        assert!(
+            scan_streams(&data).is_none(),
+            "an undersized PAT section declares no program"
+        );
+    }
 }
