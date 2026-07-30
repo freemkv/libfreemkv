@@ -265,34 +265,17 @@ impl DiscStream {
         // for non-DVD or when the probe yields nothing.
         crate::disc::dvd_audio_probe::probe_and_remap(&mut reader, &mut title);
 
-        let mut pids = Vec::new();
-        let mut parsers = Vec::new();
-        let mut pid_to_track = Vec::new();
-        for (idx, s) in title.streams.iter().enumerate() {
-            let (pid, codec) = match s {
-                crate::disc::Stream::Video(v) => (v.pid, v.codec),
-                crate::disc::Stream::Audio(a) => (a.pid, a.codec),
-                crate::disc::Stream::Subtitle(s) => (s.pid, s.codec),
-            };
-            pids.push(pid);
-            pid_to_track.push((pid, idx));
-            let is_dvd_ps = matches!(content_format, crate::disc::ContentFormat::MpegPs);
-            parsers.push((pid, super::codec::parser_for_codec(codec, None, is_dvd_ps)));
-        }
-
-        let mut ts_demuxer = None;
-        let mut ps_demuxer = None;
-        match content_format {
-            crate::disc::ContentFormat::MpegPs => {
-                ps_demuxer = Some(super::ps::PsDemuxer::new());
-            }
-            crate::disc::ContentFormat::BdTs => {
-                let ts_pids: Vec<u16> = pids.clone();
-                if !ts_pids.is_empty() {
-                    ts_demuxer = Some(super::ts::TsDemuxer::new(&ts_pids));
-                }
-            }
-        }
+        // Parser table + PID map + demuxer come from the CANONICAL builder shared
+        // with the file-backed highway (`resolve::build_demux_state`). This used
+        // to be an open-coded copy of the same loop, which drifted: it built every
+        // parser with plain `parser_for_codec` and so never routed a Blu-ray 3D
+        // MVC dependent (right-eye) view to the param-set-passthrough parser
+        // (ISO/IEC 14496-10 Annex H) — the same 3D disc muxed correctly from an
+        // ISO and incorrectly from a live drive. Call the canonical builder rather
+        // than repeating its dispatch, so a future rule added there cannot go
+        // missing on the `disc://` path again.
+        let (parsers, pid_to_track, ts_demuxer, ps_demuxer) =
+            super::resolve::build_demux_state(&title, content_format);
 
         // AACS decrypts whole 6144-byte (3-sector) units keyed off each read
         // buffer's first 16 bytes, so reads/skips must stay 3-sector aligned.
@@ -1137,6 +1120,123 @@ mod tests {
             }
         }
         assert_eq!(frames, 0);
+    }
+
+    /// A Blu-ray 3D title: an AVC base view plus the MVC dependent (right-eye)
+    /// view, marked by `MVC_DEPENDENT_LABEL`.
+    fn mvc_title() -> DiscTitle {
+        use crate::disc::{Codec, ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
+        let view = |pid: u16, label: &str| {
+            crate::disc::Stream::Video(VideoStream {
+                pid,
+                codec: Codec::H264,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F23_976,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: false,
+                label: label.to_string(),
+                measured_cicp: None,
+            })
+        };
+        let mut t = synthetic_title(8);
+        t.streams = vec![
+            view(0x1011, ""),                               // base view
+            view(0x1012, crate::disc::MVC_DEPENDENT_LABEL), // dependent view
+        ];
+        t.content_format = ContentFormat::BdTs;
+        t
+    }
+
+    /// A dependent-view access unit: PPS (NAL 8) + coded-slice-extension (NAL 20),
+    /// no IDR. The base-view parser strips the PPS from a non-keyframe AU; the
+    /// MVC passthrough parser keeps every parameter set in-band so each dependent
+    /// frame is a self-contained access unit (ISO/IEC 14496-10 Annex H).
+    fn mvc_dependent_au_pes(pid: u16) -> crate::mux::ts::PesPacket {
+        let nal = |t: u8, body: &[u8]| {
+            let mut v = vec![0x00, 0x00, 0x01, t];
+            v.extend_from_slice(body);
+            v
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(&nal(0x68, &[0xCE, 0x01])); // PPS (8)
+        data.extend_from_slice(&nal(0x74, &[0x11, 0x22])); // slice extension (20)
+        crate::mux::ts::PesPacket {
+            source: None,
+            pid,
+            pts: Some(90_000),
+            dts: None,
+            data,
+            discontinuity: false,
+        }
+    }
+
+    /// Whether a parser's output for a dependent-view AU still carries the PPS —
+    /// the observable signature of the MVC param-set-passthrough parser.
+    fn keeps_pps_inband(parser: &mut dyn super::super::codec::CodecParser, pid: u16) -> bool {
+        let frames = parser.parse(&mvc_dependent_au_pes(pid));
+        assert_eq!(frames.len(), 1, "one access unit in, one frame out");
+        // Frame payload is length-prefixed NALs (4-byte BE length + NAL).
+        let d = &frames[0].data;
+        let mut i = 0;
+        while i + 4 <= d.len() {
+            let len = u32::from_be_bytes([d[i], d[i + 1], d[i + 2], d[i + 3]]) as usize;
+            i += 4;
+            if i + len > d.len() {
+                break;
+            }
+            if len > 0 && d[i] & 0x1F == 8 {
+                return true;
+            }
+            i += len;
+        }
+        false
+    }
+
+    /// The LIVE `disc://` path (`DiscStream::new`) must dispatch the Blu-ray 3D
+    /// MVC dependent view to the param-set-passthrough parser, exactly as the
+    /// file-backed ISO path (`resolve::build_demux_state`) does. Before this was
+    /// shared, the live path built every parser with plain `parser_for_codec`, so
+    /// the same 3D disc muxed correctly from an ISO and incorrectly from a drive.
+    #[test]
+    fn live_path_dispatches_mvc_dependent_view_to_passthrough_parser() {
+        let title = mvc_title();
+        let mut stream = DiscStream::new(
+            Box::new(ZeroReader { capacity: 8 }),
+            title.clone(),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::BdTs,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let idx_of = |parsers: &Vec<(u16, Box<dyn super::super::codec::CodecParser>)>, pid: u16| {
+            parsers.iter().position(|(p, _)| *p == pid).unwrap()
+        };
+
+        // Live path: dependent view keeps its PPS in-band, base view does not.
+        let dep = idx_of(&stream.parsers, 0x1012);
+        assert!(
+            keeps_pps_inband(stream.parsers[dep].1.as_mut(), 0x1012),
+            "live disc:// path must give the MVC dependent view the passthrough parser"
+        );
+        let base = idx_of(&stream.parsers, 0x1011);
+        assert!(
+            !keeps_pps_inband(stream.parsers[base].1.as_mut(), 0x1011),
+            "base view keeps the ordinary parser (discriminator is real, not vacuous)"
+        );
+
+        // And it must agree with the ISO path, which is the canonical builder.
+        let (mut iso_parsers, _, _, _) =
+            crate::mux::resolve::build_demux_state(&title, ContentFormat::BdTs);
+        let iso_dep = idx_of(&iso_parsers, 0x1012);
+        assert!(
+            keeps_pps_inband(iso_parsers[iso_dep].1.as_mut(), 0x1012),
+            "ISO path reference behaviour"
+        );
     }
 
     /// `is_halted()` must observe a cancellation signal installed via
