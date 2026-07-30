@@ -989,7 +989,18 @@ impl<'a> Reader<'a> {
     }
 
     fn slice(&mut self, n: usize, needed: &'static str) -> Result<&'a [u8]> {
-        if self.pos + n > self.data.len() {
+        // `n` is attacker-supplied: it comes from a JVMS `u4` attribute_length
+        // / code_length (§4.7, §4.7.3) or a `u2` Utf8 length (§4.4.7). Unlike
+        // the fixed-width readers above, whose `self.pos + k` cannot leave the
+        // buffer's own address range, `self.pos + n` can wrap — on a 32-bit
+        // target a `u4` length near 0xFFFF_FFFF plus a non-zero `pos` panics
+        // in debug and in release wraps to a SMALL end offset that passes the
+        // bounds check, after which the slice index itself panics. Checked, so
+        // an out-of-range length is the EOF error it always should have been.
+        let Some(end) = self.pos.checked_add(n) else {
+            return Err(Error::UnexpectedEof { needed });
+        };
+        if end > self.data.len() {
             return Err(Error::UnexpectedEof { needed });
         }
         let s = &self.data[self.pos..self.pos + n];
@@ -1005,6 +1016,46 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Reader::slice` takes an attacker-supplied length: a JVMS `u4`
+    /// `attribute_length` / `code_length` (§4.7, §4.7.3) or a `u2` Utf8
+    /// length (§4.4.7). Adding it to `pos` without a wrap check panics on
+    /// overflow in debug and, in release, wraps to a small end offset that
+    /// slips past the bounds check and then panics inside the slice index.
+    /// Both are panics escaping a parser whose whole input is untrusted disc
+    /// bytes; the contract is an EOF error.
+    #[test]
+    fn slice_rejects_a_length_that_would_wrap_pos() {
+        let data = [0u8; 16];
+        let mut r = Reader::new(&data);
+        r.u64("advance pos").expect("8 bytes available");
+        // pos is now 8; usize::MAX would wrap the end offset to 7.
+        match r.slice(usize::MAX, "wrapping length") {
+            Err(Error::UnexpectedEof { .. }) => {}
+            Err(other) => panic!("expected UnexpectedEof, got {other:?}"),
+            Ok(s) => panic!("expected UnexpectedEof, got a {}-byte slice", s.len()),
+        }
+        // The reader must not have consumed anything.
+        match r.slice(8, "remaining bytes") {
+            Ok(s) => assert_eq!(s.len(), 8, "pos moved on the rejected slice"),
+            Err(e) => panic!("the remaining 8 bytes must still be readable: {e:?}"),
+        }
+    }
+
+    /// The ordinary out-of-range case (no wrap) must keep returning EOF, and
+    /// an exactly-fitting length must still succeed — the check is `>`, not
+    /// `>=`.
+    #[test]
+    fn slice_boundary_is_inclusive_of_the_final_byte() {
+        let data = [0u8; 16];
+        let mut r = Reader::new(&data);
+        assert_eq!(r.slice(16, "whole buffer").expect("exact fit").len(), 16);
+        let mut r = Reader::new(&data);
+        assert!(matches!(
+            r.slice(17, "one past"),
+            Err(Error::UnexpectedEof { .. })
+        ));
+    }
 
     #[test]
     fn rejects_non_class_bytes() {

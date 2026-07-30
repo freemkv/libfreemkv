@@ -178,12 +178,15 @@ impl WritebackFile {
     /// is left to the kernel's normal flush-on-close path — best
     /// effort, but bounded.
     ///
-    /// IMPORTANT: on Linux/macOS a successful `Ok(())` does NOT
-    /// guarantee the data is durable if the bounded fsync timed out or
-    /// was halted — only the hang is bounded, the fsync may not have
-    /// completed. Callers needing crash-consistency (e.g. mux-finish
-    /// then external commit/DB update) must not treat `Ok(())` as a
-    /// durability barrier.
+    /// IMPORTANT — platform difference. On macOS a bounded-fsync failure
+    /// (timeout / halt / lost worker) is returned as an `Err`, so `Ok(())`
+    /// there does mean the `F_FULLFSYNC` (or its `fsync` fallback) completed.
+    /// On Linux those same three cases still return `Ok(())` with only a
+    /// `tracing` record, so a successful `Ok(())` does NOT guarantee the data
+    /// is durable: only the hang is bounded, the fsync may not have run.
+    /// Callers needing crash-consistency on Linux (e.g. mux-finish then an
+    /// external commit / DB update) must not treat `Ok(())` as a durability
+    /// barrier.
     pub fn sync_all(&mut self) -> io::Result<()> {
         if self.seek_count > 0 {
             tracing::debug!(
@@ -257,8 +260,8 @@ impl super::sink::SequentialSink for WritebackFile {
     /// blanket impl) so a `dyn SequentialSink` / `dyn RandomAccessSink`
     /// `finish()` actually finalises + fsyncs instead of hitting a no-op
     /// default. Note the bounded-fsync caveat from [`Self::sync_all`]
-    /// applies: `Ok(())` is not a durability barrier if the fsync timed
-    /// out or was halted.
+    /// applies: on Linux `Ok(())` is not a durability barrier if the fsync
+    /// timed out or was halted.
     fn finish(&mut self) -> io::Result<()> {
         self.sync_all()
     }
