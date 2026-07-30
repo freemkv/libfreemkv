@@ -356,32 +356,7 @@ pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> 
         return Err(Error::IfoParse);
     }
 
-    let num_titles = be_u16(&vmg_data, tt_srpt_offset)?;
-
-    // Parse title entries — each is 12 bytes, starting at tt_srpt_offset + 8
-    let entries_start = tt_srpt_offset + 8;
-    let mut title_set_map: std::collections::BTreeMap<u8, Vec<(u16, u8)>> =
-        std::collections::BTreeMap::new();
-
-    for i in 0..num_titles as usize {
-        let base = entries_start + i * 12;
-        if base + 12 > vmg_data.len() {
-            break; // truncated — parse what we can
-        }
-
-        let num_chapters = be_u16(&vmg_data, base + 2)?;
-        let vts_number = byte_at(&vmg_data, base + 6)?;
-        let vts_title_num = byte_at(&vmg_data, base + 7)?;
-
-        if vts_number == 0 {
-            continue; // invalid
-        }
-
-        title_set_map
-            .entry(vts_number)
-            .or_default()
-            .push((num_chapters, vts_title_num));
-    }
+    let title_set_map = parse_tt_srpt(&vmg_data, tt_srpt_offset)?;
 
     // Parse each VTS IFO
     let mut title_sets = Vec::new();
@@ -396,6 +371,71 @@ pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> 
     }
 
     Ok(DvdInfo { title_sets })
+}
+
+/// Maximum TT_SRPT entries honoured. DVD-Video caps a disc at 99 titles
+/// (VMGI TT_SRPT `TT_Ns`, and the 99-title / 99-title-set structure the format
+/// is built around), but the on-disc count is an untrusted `u16`: a ~800 KB
+/// crafted IFO can declare 65535 entries, each re-parsing a PGC into a full
+/// `DvdTitle` (~540 MB of `DvdInfo`).
+///
+/// Headroom: this IS the format maximum, so it clips no conformant disc — a
+/// real DVD cannot address a 100th title through TT_SRPT.
+const MAX_TT_SRPT_TITLES: usize = 99;
+
+/// Parse the VMG TT_SRPT into a per-title-set map of
+/// `(chapter_count, vts_title_number)`.
+///
+/// Two bounds on untrusted input: the declared entry count is clamped to
+/// [`MAX_TT_SRPT_TITLES`], and entries naming a `(vts_number, vts_title_num)`
+/// pair already seen are dropped. De-duplication is a correctness fix as well
+/// as a bound: two TT_SRPT entries pointing at the same VTS title are the same
+/// title, and `parse_pgcit` would otherwise re-parse that one PGC into a
+/// separate `DvdTitle` per entry.
+fn parse_tt_srpt(
+    vmg_data: &[u8],
+    tt_srpt_offset: usize,
+) -> Result<std::collections::BTreeMap<u8, Vec<(u16, u8)>>> {
+    let num_titles = be_u16(vmg_data, tt_srpt_offset)? as usize;
+    if num_titles > MAX_TT_SRPT_TITLES {
+        tracing::warn!(
+            declared = num_titles,
+            cap = MAX_TT_SRPT_TITLES,
+            "TT_SRPT title count exceeds the DVD-Video maximum, clamping"
+        );
+    }
+    let num_titles = num_titles.min(MAX_TT_SRPT_TITLES);
+
+    // Title entries are 12 bytes each, starting at tt_srpt_offset + 8.
+    let entries_start = tt_srpt_offset + 8;
+    let mut title_set_map: std::collections::BTreeMap<u8, Vec<(u16, u8)>> =
+        std::collections::BTreeMap::new();
+    let mut seen: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
+
+    for i in 0..num_titles {
+        let base = entries_start + i * 12;
+        if base + 12 > vmg_data.len() {
+            break; // truncated — parse what we can
+        }
+
+        let num_chapters = be_u16(vmg_data, base + 2)?;
+        let vts_number = byte_at(vmg_data, base + 6)?;
+        let vts_title_num = byte_at(vmg_data, base + 7)?;
+
+        if vts_number == 0 {
+            continue; // invalid
+        }
+        if !seen.insert((vts_number, vts_title_num)) {
+            continue; // duplicate entry for the same VTS title
+        }
+
+        title_set_map
+            .entry(vts_number)
+            .or_default()
+            .push((num_chapters, vts_title_num));
+    }
+
+    Ok(title_set_map)
 }
 
 // ── VTS parser ──────────────────────────────────────────────────────────────
@@ -857,6 +897,79 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a synthetic TT_SRPT at offset 0: a declared `u16` title count
+    /// followed by `entries` 12-byte records of
+    /// `(num_chapters, vts_number, vts_title_num)`.
+    fn tt_srpt_bytes(declared: u16, entries: &[(u16, u8, u8)]) -> Vec<u8> {
+        let mut data = vec![0u8; 8 + entries.len() * 12];
+        data[0..2].copy_from_slice(&declared.to_be_bytes());
+        for (i, &(chapters, vts, title)) in entries.iter().enumerate() {
+            let base = 8 + i * 12;
+            data[base + 2..base + 4].copy_from_slice(&chapters.to_be_bytes());
+            data[base + 6] = vts;
+            data[base + 7] = title;
+        }
+        data
+    }
+
+    #[test]
+    fn tt_srpt_title_count_is_capped_and_deduplicated() {
+        // The TT_SRPT count is an untrusted u16. A ~800 KB crafted IFO declares
+        // 65535 entries, and each one re-parses a PGC into another full DvdTitle.
+        //
+        // The entries are DISTINCT, which matters: with 65535 identical entries
+        // the de-duplication collapses them to one title on its own and the count
+        // cap is never what bounds the result — the test would then pass with the
+        // cap removed entirely, proving only that dedup works. Distinct entries
+        // defeat dedup, so the cap is the only thing left holding the line.
+        // De-duplication gets its own assertion below, on its own fixture.
+        // Both title fields are u8, so vary each within its own range to get
+        // ~65025 distinct pairs out of the 65535 entries.
+        let entries: Vec<(u16, u8, u8)> = (0..u16::MAX)
+            .map(|i| (5u16, (i % 255) as u8 + 1, ((i / 255) % 255) as u8 + 1))
+            .collect();
+        let data = tt_srpt_bytes(u16::MAX, &entries);
+        let map = parse_tt_srpt(&data, 0).expect("well-formed TT_SRPT");
+        let total: usize = map.values().map(|v| v.len()).sum();
+        // Asserted against the DVD-Video format maximum as a LITERAL, not against
+        // MAX_TT_SRPT_TITLES. Comparing a result to the very constant under test
+        // passes vacuously the moment someone raises that constant, which is the
+        // most likely regression here — and is the tautology class this audit has
+        // now found six times. 99 is the format's own ceiling, so this pins the
+        // cap to the spec rather than to whatever the code currently says.
+        assert!(
+            total <= 99,
+            "TT_SRPT produced {total} titles from a crafted 65535-entry table; \
+             DVD-Video allows at most 99"
+        );
+        // De-duplication, on its own fixture: the same VTS title named 65535
+        // times is one title, not many. Kept separate from the cap assertion
+        // above so neither guard can mask the other.
+        let dupes = vec![(5u16, 1u8, 1u8); u16::MAX as usize];
+        let dup_map =
+            parse_tt_srpt(&tt_srpt_bytes(u16::MAX, &dupes), 0).expect("well-formed TT_SRPT");
+        assert_eq!(
+            dup_map.get(&1).map(Vec::len),
+            Some(1),
+            "duplicate (vts_number, vts_title_num) entries must collapse"
+        );
+    }
+
+    #[test]
+    fn tt_srpt_admits_a_full_99_title_disc() {
+        // The DVD-Video maximum must still parse in full: 99 distinct titles
+        // spread over two title sets.
+        let entries: Vec<(u16, u8, u8)> = (0..99u8)
+            .map(|i| (3u16, if i < 50 { 1 } else { 2 }, i + 1))
+            .collect();
+        let data = tt_srpt_bytes(99, &entries);
+        let map = parse_tt_srpt(&data, 0).expect("well-formed TT_SRPT");
+        let total: usize = map.values().map(|v| v.len()).sum();
+        assert_eq!(total, 99, "a full 99-title disc must survive the cap");
+        assert_eq!(map.get(&1).map(Vec::len), Some(50));
+        assert_eq!(map.get(&2).map(Vec::len), Some(49));
+    }
 
     #[test]
     fn bcd_to_secs_basic() {

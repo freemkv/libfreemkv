@@ -208,6 +208,31 @@ const FINGERPRINTS: &[Fingerprint] = &[
 /// prefix, so a count mismatch within tolerance is informative-but-OK.
 const LDC_COUNT_TOLERANCE: usize = 4;
 
+/// Cap on the `ldc` operands retained per class by [`clinit_ldc_strings`].
+///
+/// Unlike every other count cap in this crate, the paired byte cap here cannot
+/// be the disc-file size: a `.class` entry gated only by a `com/bydeluxe/` path
+/// prefix deflates from ~100 KB up to the 64 MiB `MAX_CLASS_BYTES` read ceiling,
+/// so ~33M two-byte `ldc` instructions — one retained `String` each — are
+/// reachable from a small crafted disc. The bound has to be on the decompressed
+/// work, so it is applied here.
+///
+/// Headroom: the largest framework-stable enum is `Language` at 70 values
+/// (`FINGERPRINTS`), and no fingerprint matches a count more than
+/// `LDC_COUNT_TOLERANCE` away from its expected size, so anything past ~74 can
+/// never identify a master enum. 4096 leaves ~55x headroom over the largest
+/// real enum for framework drift.
+const MAX_CLINIT_LDC_STRINGS: usize = 4096;
+
+/// Companion byte cap for [`MAX_CLINIT_LDC_STRINGS`]: the count cap alone still
+/// admits 4096 x 64 KiB of `Utf8` (a JVMS `CONSTANT_Utf8_info` length is a u16),
+/// i.e. ~268 MB per class from repeated `ldc` of one huge constant.
+///
+/// Headroom: master-enum values are short display names ("English",
+/// "HDR10 Plus", "USA_D1") well under 32 bytes, so a real Language enum retains
+/// ~1 KB. 256 KiB admits 4096 values averaging 64 bytes each.
+const MAX_CLINIT_LDC_BYTES: usize = 256 * 1024;
+
 /// Phase A. Walk every `.class` in `archive`, identify the master
 /// enums by `<clinit>` ldc-sequence fingerprint. Returns a vector of
 /// `(label, MasterEnum)` — at most one match per fingerprint label.
@@ -258,9 +283,18 @@ pub(crate) fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str
 /// Walk `<clinit>` and collect every `ldc` / `ldc_w` operand that
 /// resolves to either a `String` constant or a `Utf8` constant, in
 /// declaration order. Returns `None` if the class has no `<clinit>`.
+///
+/// Collection stops at [`MAX_CLINIT_LDC_STRINGS`] operands or
+/// [`MAX_CLINIT_LDC_BYTES`] of retained text, whichever comes first: the walk
+/// is driven by the DECOMPRESSED class, so it is not bounded by the disc-file
+/// size cap the way the rest of this module's counts are. Truncation cannot
+/// lose a real match — a truncated sequence is far longer than any
+/// `FINGERPRINTS` entry's `expected_count + LDC_COUNT_TOLERANCE`, so it would
+/// have been rejected on count anyway.
 fn clinit_ldc_strings(class: &super::class_reader::ClassFile) -> Option<Vec<String>> {
     let mut found = false;
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut out_bytes = 0usize;
     for m in &class.methods {
         let Some(name) = class.member_name(m) else {
             continue;
@@ -287,6 +321,18 @@ fn clinit_ldc_strings(class: &super::class_reader::ClassFile) -> Option<Vec<Stri
                 _ => None,
             };
             if let Some(s) = resolved {
+                if out.len() >= MAX_CLINIT_LDC_STRINGS
+                    || out_bytes.saturating_add(s.len()) > MAX_CLINIT_LDC_BYTES
+                {
+                    tracing::debug!(
+                        class = class.this_class_name().unwrap_or(""),
+                        strings = out.len(),
+                        bytes = out_bytes,
+                        "deluxe: clinit ldc collection hit cap, truncating"
+                    );
+                    return Some(out);
+                }
+                out_bytes += s.len();
                 out.push(s);
             }
         }
@@ -475,6 +521,9 @@ struct BindingDecoder<'a> {
     pool: &'a ConstantPool,
     master: &'a MasterEnumTable,
     stack: Vec<StackVal>,
+    /// Depth limit for `stack`, taken from the Code attribute's own `max_stack`
+    /// in [`run`](Self::run). Zero until then.
+    max_stack: usize,
     constructions: Vec<Construction>,
 }
 
@@ -484,6 +533,7 @@ impl<'a> BindingDecoder<'a> {
             pool,
             master,
             stack: Vec::new(),
+            max_stack: 0,
             constructions: Vec::new(),
         }
     }
@@ -491,33 +541,56 @@ impl<'a> BindingDecoder<'a> {
     /// Run the walker over the given Code attribute. On exit the
     /// `constructions` field holds the result.
     pub(crate) fn run(&mut self, code: &CodeAttribute<'_>) {
+        self.max_stack = code.max_stack as usize;
         for insn in code.instructions() {
             self.step(insn);
         }
     }
 
+    /// Push onto the symbolic stack, honouring the Code attribute's declared
+    /// `max_stack`.
+    ///
+    /// JVMS 4.7.3 requires that a method's operand stack never exceed
+    /// `max_stack` at any point, so a push past it can only come from bytecode
+    /// that would fail JVM verification. Dropping it costs nothing on real
+    /// bytecode and bounds the decoder: a `.class` gated only by a
+    /// `com/bydeluxe/` path prefix deflates from ~100 KB to the 64 MiB
+    /// `MAX_CLASS_BYTES` ceiling, i.e. ~67M single-byte `iconst_0` (~2 GiB of
+    /// `StackVal`) on an unbounded `Vec`.
+    ///
+    /// Headroom: `max_stack` is exactly what javac computed for the real
+    /// binding `<clinit>`, so no real construction can be clipped. Our symbolic
+    /// stack counts `long`/`double` as one slot where the JVM counts two, so
+    /// our depth is never greater than the verified depth.
+    fn push(&mut self, val: StackVal) {
+        if self.stack.len() >= self.max_stack {
+            return;
+        }
+        self.stack.push(val);
+    }
+
     fn step(&mut self, insn: super::class_reader::Instruction<'_>) {
         match insn.opcode {
             // Push small int constants.
-            ICONST_M1 => self.stack.push(StackVal::Int(-1)),
-            ICONST_0 => self.stack.push(StackVal::Int(0)),
-            ICONST_1 => self.stack.push(StackVal::Int(1)),
-            ICONST_2 => self.stack.push(StackVal::Int(2)),
-            ICONST_3 => self.stack.push(StackVal::Int(3)),
-            ICONST_4 => self.stack.push(StackVal::Int(4)),
-            ICONST_5 => self.stack.push(StackVal::Int(5)),
+            ICONST_M1 => self.push(StackVal::Int(-1)),
+            ICONST_0 => self.push(StackVal::Int(0)),
+            ICONST_1 => self.push(StackVal::Int(1)),
+            ICONST_2 => self.push(StackVal::Int(2)),
+            ICONST_3 => self.push(StackVal::Int(3)),
+            ICONST_4 => self.push(StackVal::Int(4)),
+            ICONST_5 => self.push(StackVal::Int(5)),
             BIPUSH => {
                 if let Some(b) = insn.operand_u8() {
-                    self.stack.push(StackVal::Int(b as i8 as i32));
+                    self.push(StackVal::Int(b as i8 as i32));
                 } else {
-                    self.stack.push(StackVal::Unknown);
+                    self.push(StackVal::Unknown);
                 }
             }
             SIPUSH => {
                 if let Some(w) = insn.operand_u16() {
-                    self.stack.push(StackVal::Int(w as i16 as i32));
+                    self.push(StackVal::Int(w as i16 as i32));
                 } else {
-                    self.stack.push(StackVal::Unknown);
+                    self.push(StackVal::Unknown);
                 }
             }
             // ldc/ldc_w: push Int when the operand is an Integer
@@ -531,7 +604,7 @@ impl<'a> BindingDecoder<'a> {
                         _ => None,
                     })
                     .unwrap_or(StackVal::Unknown);
-                self.stack.push(v);
+                self.push(v);
             }
             // new X — push an uninit-object marker. The matching
             // invokespecial will consume this + the args and emit a
@@ -542,12 +615,12 @@ impl<'a> BindingDecoder<'a> {
                     .and_then(|i| self.pool.class_name(i))
                     .unwrap_or("")
                     .to_string();
-                self.stack.push(StackVal::NewObj(class_name));
+                self.push(StackVal::NewObj(class_name));
             }
             // dup — duplicate top of stack.
             0x59 /* dup */ => {
                 if let Some(top) = self.stack.last().cloned() {
-                    self.stack.push(top);
+                    self.push(top);
                 }
             }
             // getstatic Y.Z — if Y is one of our master enum classes,
@@ -572,7 +645,7 @@ impl<'a> BindingDecoder<'a> {
                         }
                     })
                     .unwrap_or(StackVal::Unknown);
-                self.stack.push(val);
+                self.push(val);
             }
             // invokespecial X.<init>(...) — pop args per descriptor.
             // If the object on the stack underneath the args is a
@@ -620,7 +693,7 @@ impl<'a> BindingDecoder<'a> {
                 }
                 // Push return placeholder unless void.
                 if !member.descriptor.ends_with(")V") {
-                    self.stack.push(StackVal::Unknown);
+                    self.push(StackVal::Unknown);
                 }
             }
             // pop / pop2 — drop stack values.
@@ -1011,6 +1084,153 @@ mod tests {
     fn parse_method_arg_count_malformed_descriptor() {
         // Best-effort: stops on the bad byte, doesn't panic.
         assert_eq!(parse_method_arg_count("(Ifoo)V"), 1);
+    }
+
+    // ── Decompression-amplification bounds ──────────────────────────────────
+
+    /// Build a `ClassFile` whose single `<clinit>` has the given bytecode and
+    /// `max_stack`, over the given constant pool. The pool must hold
+    /// "<clinit>" at 1, "()V" at 2 and "Code" at 3.
+    fn class_with_clinit(pool: ConstantPool, max_stack: u16, code: &[u8]) -> ClassFile {
+        let mut info = Vec::with_capacity(8 + code.len());
+        info.extend_from_slice(&max_stack.to_be_bytes());
+        info.extend_from_slice(&0u16.to_be_bytes()); // max_locals
+        info.extend_from_slice(&(code.len() as u32).to_be_bytes());
+        info.extend_from_slice(code);
+        ClassFile {
+            minor_version: 0,
+            major_version: 49,
+            constant_pool: pool,
+            access_flags: 0,
+            this_class: 0,
+            super_class: 0,
+            interfaces: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![super::super::class_reader::Member {
+                access_flags: 0,
+                name_index: 1,
+                descriptor_index: 2,
+                attributes: vec![super::super::class_reader::Attribute {
+                    name_index: 3,
+                    info,
+                }],
+            }],
+            attributes: Vec::new(),
+        }
+    }
+
+    /// Pool for `class_with_clinit`: 1 "<clinit>", 2 "()V", 3 "Code",
+    /// 4 String -> 5, 5 Utf8(`value`).
+    fn ldc_pool(value: &str) -> ConstantPool {
+        ConstantPool::from_entries(vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("<clinit>".into()),
+            CpInfo::Utf8("()V".into()),
+            CpInfo::Utf8("Code".into()),
+            CpInfo::String { string_index: 5 },
+            CpInfo::Utf8(value.into()),
+        ])
+    }
+
+    #[test]
+    fn clinit_ldc_string_count_is_capped() {
+        // A `.class` gated only by a `com/bydeluxe/` path prefix deflates from
+        // ~100 KB up to the 64 MiB MAX_CLASS_BYTES ceiling, giving ~33M 2-byte
+        // `ldc` instructions. Every resolved operand is retained as an owned
+        // String, and identify_master_enums keeps the whole vector per class in
+        // a HashMap — so the allocation scales with the DECOMPRESSED size while
+        // the only byte cap is on the compressed disc file.
+        const N: usize = 200_000;
+        let mut code = Vec::with_capacity(N * 2);
+        for _ in 0..N {
+            code.push(LDC);
+            code.push(4); // cp index 4 -> String -> "English"
+        }
+        let class = class_with_clinit(ldc_pool("English"), 2, &code);
+        let ldcs = clinit_ldc_strings(&class).expect("<clinit> present");
+        // Asserted against a LITERAL, not against MAX_CLINIT_LDC_STRINGS. A test
+        // that compares the result to the very constant under test passes
+        // vacuously the moment someone raises that constant — which is the most
+        // likely future regression here, and exactly the tautology class this
+        // audit has now found six times. 8192 is double the current cap, so this
+        // still allows the cap to be tuned, but not removed.
+        assert!(
+            ldcs.len() <= 8192,
+            "retained {} ldc strings from {N} ldc instructions — the cap is not \
+             bounding the walk",
+            ldcs.len()
+        );
+        assert!(
+            ldcs.len() < N,
+            "nothing was truncated at all: retained all {N} strings"
+        );
+    }
+
+    #[test]
+    fn clinit_ldc_string_bytes_are_capped() {
+        // Few instructions, huge operands: the count cap alone still admits
+        // MAX_CLINIT_LDC_STRINGS x 64 KiB of Utf8. Bound the retained bytes too.
+        let big = "A".repeat(32 * 1024);
+        const N: usize = 512;
+        let mut code = Vec::with_capacity(N * 2);
+        for _ in 0..N {
+            code.push(LDC);
+            code.push(4);
+        }
+        let class = class_with_clinit(ldc_pool(&big), 2, &code);
+        let ldcs = clinit_ldc_strings(&class).expect("<clinit> present");
+        let bytes: usize = ldcs.iter().map(|s| s.len()).sum();
+        // Literal, not the constant under test — see the sibling test above.
+        assert!(
+            bytes <= 512 * 1024,
+            "retained {bytes} bytes of ldc strings — the byte cap is not bounding \
+             the walk"
+        );
+    }
+
+    #[test]
+    fn clinit_ldc_strings_admits_largest_real_fingerprint() {
+        // The biggest framework-stable enum is Language at 70 values; the cap
+        // must not clip a real one.
+        let n = FINGERPRINTS
+            .iter()
+            .map(|fp| fp.expected_count)
+            .max()
+            .unwrap()
+            + LDC_COUNT_TOLERANCE;
+        let mut code = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            code.push(LDC);
+            code.push(4);
+        }
+        let class = class_with_clinit(ldc_pool("English"), 2, &code);
+        let ldcs = clinit_ldc_strings(&class).expect("<clinit> present");
+        assert_eq!(ldcs.len(), n, "real-size enum must survive the cap");
+    }
+
+    #[test]
+    fn binding_decoder_stack_is_bounded_by_max_stack() {
+        // ~67M single-byte `iconst_0` fit in a 64 MiB decompressed class, and
+        // each pushes a StackVal onto a Vec with no depth limit (~2 GiB). The
+        // Code attribute's own max_stack is parsed and must be honoured: JVMS
+        // 4.7.3 requires the operand stack never exceed it.
+        const MAX_STACK: u16 = 4;
+        let code = vec![ICONST_0; 200_000];
+        let pool = build_simple_pool();
+        let master = lang_enum_master();
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: MAX_STACK,
+            max_locals: 0,
+            code: &code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        assert!(
+            decoder.stack.len() <= MAX_STACK as usize,
+            "symbolic stack grew to {} with max_stack {}",
+            decoder.stack.len(),
+            MAX_STACK
+        );
     }
 
     /// Construct a minimal ConstantPool that supports the synthetic
