@@ -112,6 +112,26 @@ impl H264Parser {
     }
 }
 
+// Bytes reserved at the front of every assembled access unit so the keyframe
+// parameter-set re-assert can be spliced in without reallocating. An SPS + PPS
+// re-assert is a couple hundred bytes (each a 4-byte length prefix plus a NAL
+// that is tens to low hundreds of bytes on real BD/UHD streams); 1 KiB covers it
+// with margin, and costs 1 KiB of slack per in-flight frame. If a stream's
+// parameter sets ever exceed this the splice still produces correct output — it
+// just reallocates once, exactly as it always did. Mirrors the HEVC parser.
+const PARAM_REASSERT_HEADROOM: usize = 1024;
+
+// Per-thread count of keyframe re-asserts that had to reallocate the frame
+// buffer. Test-only instrumentation: the whole point of
+// `PARAM_REASSERT_HEADROOM` is that the splice is in-place, so that is MEASURED
+// rather than reasoned about. See
+// `keyframe_param_reassert_does_not_reallocate_the_frame`. Mirrors the HEVC
+// parser.
+#[cfg(test)]
+thread_local! {
+    static PARAM_REASSERT_REALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Append `nal` to `out` as a 4-byte big-endian length prefix + body. A NAL
 /// longer than `u32::MAX` can't be length-prefixed in the 4-byte field, so it
 /// is skipped rather than mis-framed. Unreachable in practice (no AU > 4 GiB).
@@ -207,7 +227,11 @@ impl CodecParser for H264Parser {
         // Pre-size: output is ~input bytes plus a few 4-byte NAL length prefixes.
         // The unsized Vec growth chain otherwise reallocs several times per
         // frame in the mux hot path (mirrors the HEVC parser).
-        let mut frame_data = Vec::with_capacity(pes.data.len() + 64);
+        //
+        // Plus `PARAM_REASSERT_HEADROOM` so the keyframe parameter-set re-assert
+        // below can be spliced in FRONT of the frame without reallocating. See
+        // that site.
+        let mut frame_data = Vec::with_capacity(pes.data.len() + 64 + PARAM_REASSERT_HEADROOM);
 
         // MVC dependent-view passthrough: keep ALL param sets in-band (the frame
         // is a self-contained BlockAdditional access unit), never strip/re-assert.
@@ -274,12 +298,36 @@ impl CodecParser for H264Parser {
         // that dropped the set at a reset recovers, and a stale avcC re-apply
         // can't revert it. Skipped per-type only when this AU already carried it.
         if keyframe && !mvc {
-            let mut prefix = Vec::new();
+            let mut prefix = Vec::with_capacity(PARAM_REASSERT_HEADROOM);
             reassert_active(&mut prefix, &self.cur_sps, emitted_sps);
             reassert_active(&mut prefix, &self.cur_pps, emitted_pps);
             if !prefix.is_empty() {
-                prefix.extend_from_slice(&frame_data);
-                frame_data = prefix;
+                // SPLICE the couple hundred prefix bytes into the front of the
+                // already-assembled frame, in place.
+                //
+                // This used to be `prefix.extend_from_slice(&frame_data)` followed
+                // by `frame_data = prefix`: that grew `prefix` from a couple hundred
+                // bytes to the FULL access-unit size (a fresh multi-hundred-KB
+                // allocation), memcpy'd the whole frame into it, and dropped the
+                // presized `frame_data` buffer — one extra whole-frame allocation
+                // plus one extra whole-frame copy per keyframe. A UHD title is
+                // ~200,000 frames of 150-400 KB with a keyframe every 1-2 s, so
+                // that is thousands of avoidable multi-hundred-KB copies per title,
+                // each large enough to go through mmap.
+                //
+                // `frame_data` was reserved with `PARAM_REASSERT_HEADROOM` to spare
+                // precisely so this splice fits without reallocating; what remains
+                // is one in-place memmove inside the existing buffer. Byte-identical
+                // output either way — pinned by
+                // `keyframe_param_reassert_emits_exact_bytes`. Mirrors the HEVC
+                // parser's fix so the two stay consistent.
+                #[cfg(test)]
+                let cap_before = frame_data.capacity();
+                frame_data.splice(0..0, prefix);
+                #[cfg(test)]
+                if frame_data.capacity() != cap_before {
+                    PARAM_REASSERT_REALLOCS.with(|c| c.set(c.get() + 1));
+                }
             }
         }
 
@@ -597,6 +645,123 @@ mod tests {
             data,
             discontinuity: false,
         }
+    }
+
+    // --- keyframe parameter-set re-assert: exact bytes + no whole-frame copy ---
+
+    /// The keyframe SPS/PPS re-assert must produce EXACTLY these bytes: the
+    /// active SPS, then the active PPS, then the access unit's own NALs, each as
+    /// a 4-byte big-endian length prefix followed by the NAL body (ISO/IEC
+    /// 14496-15 length-prefixed form, lengthSizeMinusOne = 3).
+    ///
+    /// This pins the full byte string, not just its length, so the in-place
+    /// `splice` that replaced the build-a-new-buffer-and-copy approach is proven
+    /// byte-for-byte equivalent — including the ORDER (parameter sets ahead of
+    /// the slices, which is what makes the keyframe self-contained). The literals
+    /// below were captured from the pre-splice implementation's output.
+    #[test]
+    fn keyframe_param_reassert_emits_exact_bytes() {
+        fn annexb(nal: &[u8]) -> Vec<u8> {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(nal);
+            v
+        }
+        const SPS: [u8; 5] = [0x67, 0x42, 0x00, 0x1E, 0xAB];
+        const PPS: [u8; 3] = [0x68, 0xCE, 0x01];
+        const IDR1: [u8; 4] = [0x65, 0x88, 0x84, 0x21];
+        const IDR2: [u8; 4] = [0x65, 0x88, 0x11, 0x22];
+
+        let mut parser = H264Parser::new();
+
+        // AU1: SPS + PPS + IDR. Both parameter sets are first-of-type, so they
+        // seed avcC and are stripped from the in-band scan output; the keyframe
+        // re-assert then splices them back in ahead of the slice.
+        let au1 = [annexb(&SPS), annexb(&PPS), annexb(&IDR1)].concat();
+        let f1 = parser.parse(&make_pes(au1, Some(0)));
+        assert_eq!(
+            f1[0].data,
+            vec![
+                0x00, 0x00, 0x00, 0x05, 0x67, 0x42, 0x00, 0x1E, 0xAB, // SPS
+                0x00, 0x00, 0x00, 0x03, 0x68, 0xCE, 0x01, // PPS
+                0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x21, // IDR slice
+            ],
+            "keyframe must emit length-prefixed SPS, PPS, then the slice"
+        );
+
+        // AU2: BARE keyframe — the source omits the parameter sets. The active
+        // set must be re-asserted ahead of the slice, byte-identically.
+        let f2 = parser.parse(&make_pes(annexb(&IDR2), Some(3600)));
+        assert_eq!(
+            f2[0].data,
+            vec![
+                0x00, 0x00, 0x00, 0x05, 0x67, 0x42, 0x00, 0x1E, 0xAB, // SPS
+                0x00, 0x00, 0x00, 0x03, 0x68, 0xCE, 0x01, // PPS
+                0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x11, 0x22, // IDR slice
+            ],
+            "bare keyframe must re-assert the active SPS/PPS ahead of the slice"
+        );
+    }
+
+    /// MEASURED: the keyframe parameter-set re-assert must be spliced into the
+    /// front of the already-assembled access unit IN PLACE, not built as a fresh
+    /// full-size buffer.
+    ///
+    /// It used to `prefix.extend_from_slice(&frame_data)` and then replace
+    /// `frame_data` with `prefix`, which grew a few-hundred-byte `prefix` to the
+    /// FULL access-unit size — a fresh multi-hundred-KB allocation — memcpy'd the
+    /// whole frame into it, and dropped the presized buffer. One extra
+    /// whole-frame allocation plus one extra whole-frame copy per keyframe: a UHD
+    /// title is ~200,000 frames of 150-400 KB with a keyframe every 1-2 s, i.e.
+    /// thousands of avoidable multi-hundred-KB copies per title, each large
+    /// enough to go through mmap. `PARAM_REASSERT_HEADROOM` exists so the splice
+    /// never reallocates; this counts the reallocations that happen, which must
+    /// be zero. Mirrors the HEVC parser's test of the same name.
+    #[test]
+    fn keyframe_param_reassert_does_not_reallocate_the_frame() {
+        fn annexb(nal_header: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![0x00, 0x00, 0x01, nal_header];
+            v.extend_from_slice(body);
+            v
+        }
+        let mut parser = H264Parser::new();
+        // AU1 seeds the active SPS/PPS. The SPS is deliberately ~200 bytes rather
+        // than a handful: `frame_data` is presized to `pes.data.len() + 64 +
+        // PARAM_REASSERT_HEADROOM` and a bare keyframe uses slightly less than
+        // `pes.data.len()`, so a tiny parameter set fits in the incidental `+64`
+        // slack and the test would pass with `PARAM_REASSERT_HEADROOM` set to
+        // zero — proving only that this fixture does not realloc, not that the
+        // headroom is what prevents it. At ~200 bytes the prefix exceeds the
+        // incidental slack, so the constant is load-bearing and zeroing it makes
+        // this test fail.
+        let mut big_sps = vec![0x42, 0x00, 0x1E];
+        big_sps.extend(std::iter::repeat_n(0xAB, 200));
+        let au1 = [
+            annexb(0x67, &big_sps),
+            annexb(0x68, &[0xCE, 0x01]),
+            annexb(0x65, &[0x88; 4096]),
+        ]
+        .concat();
+        parser.parse(&make_pes(au1, Some(0)));
+
+        // A run of BARE keyframes (source omits the parameter sets), each of
+        // which takes the re-assert path. Payload sized like a real coded
+        // picture so a reallocation would be the expensive one.
+        PARAM_REASSERT_REALLOCS.with(|c| c.set(0));
+        for i in 0..30i64 {
+            let au = annexb(0x65, &vec![0x88u8; 300_000]);
+            let f = parser.parse(&make_pes(au, Some(3600 * (i + 1))));
+            // The re-assert really happened (otherwise the count is vacuously 0).
+            assert!(
+                f[0].data.len() > 300_000,
+                "keyframe {i} must carry the re-asserted parameter sets"
+            );
+        }
+        let reallocs = PARAM_REASSERT_REALLOCS.with(|c| c.get());
+        assert_eq!(
+            reallocs, 0,
+            "the parameter-set splice must fit in the reserved headroom; \
+             {reallocs} of 30 keyframes reallocated the whole frame"
+        );
     }
 
     // --- parse SPS+PPS → codec_private ---
