@@ -660,6 +660,15 @@ pub struct DemuxSink {
     /// Index = track id; `None` for unselected tracks.
     tracks: Vec<Option<TrackOut>>,
     ref_video_track: Option<usize>,
+    /// First PTS observed on `ref_video_track`, recorded in `write()` REGARDLESS
+    /// of whether that track has a `TrackOut`. The DELAY reference cannot live in
+    /// `TrackOut::first_pts_ns`: `audio://` / `sub://` filter the video track's
+    /// output away in `create()`, so no `TrackOut` exists to record it, and the
+    /// old `unwrap_or(0)` fallback then measured every delay against a reference
+    /// of zero and baked a plausible-looking wrong `DELAY` into the filename.
+    /// `None` = no reference seen → no delay is emitted at all (see
+    /// `apply_delays`).
+    ref_first_pts_ns: Option<i64>,
     timeline: TimelineContinuity,
     finished: bool,
 }
@@ -732,6 +741,7 @@ impl DemuxSink {
             opts: opts.clone(),
             tracks,
             ref_video_track,
+            ref_first_pts_ns: None,
             timeline: TimelineContinuity::new(),
             finished: false,
         })
@@ -758,11 +768,19 @@ impl DemuxSink {
         if self.opts.delay_mode == DelayMode::None {
             return Ok(());
         }
-        let ref_pts = self
-            .ref_video_track
-            .and_then(|t| self.tracks.get(t).and_then(|o| o.as_ref()))
-            .and_then(|t| t.first_pts_ns)
-            .unwrap_or(0);
+        // No video reference (audio-only title, or the reference track never
+        // produced a frame) → there is nothing to measure a delay against.
+        // OMIT the delay entirely rather than fall back to a reference of zero:
+        // a filename claiming `DELAY 600ms` when the real offset is unknown is a
+        // silently wrong number that downstream muxers will act on, while a
+        // missing tag is simply "no delay information", which is the truth.
+        let Some(ref_pts) = self.ref_first_pts_ns else {
+            tracing::warn!(
+                target: "mux",
+                "demux sink: no reference video PTS observed; omitting audio DELAY metadata"
+            );
+            return Ok(());
+        };
 
         let mut sidecar_lines = String::new();
 
@@ -849,6 +867,12 @@ impl Stream for DemuxSink {
         // non-video epoch driver would ratchet the frontier on sparse/lagging PTS.
         let drives = Some(frame.track) == self.ref_video_track;
         let pts = self.timeline.adjust(frame.pts, drives);
+        if drives {
+            // Delay reference: recorded here, not in the track's `TrackOut`, so
+            // it survives the `audio://` / `sub://` kind filter dropping the
+            // video output.
+            self.ref_first_pts_ns.get_or_insert(pts);
+        }
         if let Some(Some(t)) = self.tracks.get_mut(frame.track) {
             t.first_pts_ns.get_or_insert(pts);
             t.writer.write_frame(&mut t.w, frame, pts)?;
@@ -965,6 +989,95 @@ mod tests {
             audio.tracks[0].is_none() && audio.tracks[1].is_some() && audio.tracks[2].is_none(),
             "audio:// keeps only the audio track"
         );
+    }
+
+    /// `audio://` filters the video track's file out, but the video track is
+    /// still the DELAY reference. The delay must be measured against the video's
+    /// actual first PTS, not against an assumed zero — a filename that says
+    /// `DELAY 600ms` when the true audio offset is 100ms is worse than no tag.
+    #[test]
+    fn audio_only_sink_delays_against_filtered_video_reference() {
+        let dir = tempdir();
+        let title = title_with(
+            vec![video_stream(Codec::Mpeg2), audio_stream(Codec::Ac3, "eng")],
+            vec![None, None],
+        );
+        let opts = DemuxOptions {
+            base: "Ao".to_string(),
+            kind_filter: Some(TrackKind::Audio),
+            export_chapters: false,
+            ..Default::default()
+        };
+        let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
+        // Video starts at 500ms, audio at 600ms → true delay is +100ms.
+        sink.write(&PesFrame {
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 500_000_000,
+            keyframe: true,
+            data: vec![0x00, 0x00, 0x01, 0xB3],
+            duration_ns: None,
+        })
+        .unwrap();
+        sink.write(&PesFrame {
+            coding: None,
+            source: None,
+            track: 1,
+            pts: 600_000_000,
+            keyframe: true,
+            data: vec![0x0B, 0x77],
+            duration_ns: None,
+        })
+        .unwrap();
+        sink.finish().unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "Ao t01 eng AC3 DELAY 100ms.ac3"),
+            "audio delay must be relative to the filtered video reference \
+             (500ms), got {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no video reference at all (audio-only title), there is nothing to
+    /// measure the delay against. Omit the DELAY tag rather than emit one
+    /// computed against a fabricated zero reference.
+    #[test]
+    fn no_video_reference_omits_delay_tag() {
+        let dir = tempdir();
+        let title = title_with(vec![audio_stream(Codec::Ac3, "eng")], vec![None]);
+        let opts = DemuxOptions {
+            base: "NoRef".to_string(),
+            export_chapters: false,
+            ..Default::default()
+        };
+        let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
+        sink.write(&PesFrame {
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 600_000_000,
+            keyframe: true,
+            data: vec![0x0B, 0x77],
+            duration_ns: None,
+        })
+        .unwrap();
+        sink.finish().unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.to_lowercase().contains("delay")),
+            "no video reference → no DELAY tag, got {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Annex-B reframing ────────────────────────────────────────────────────

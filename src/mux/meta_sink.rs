@@ -178,12 +178,26 @@ fn stream_json(s: &DiscStream) -> serde_json::Value {
                 "pid": a.pid,
                 "language": a.language,
                 "channels": a.channels.to_string(),
-                "channel_count": a.channels.count(),
                 "sample_rate": a.sample_rate.to_string(),
-                "sample_rate_hz": a.sample_rate.hz(),
                 "secondary": a.secondary,
                 "purpose": purpose_id(a.purpose),
             });
+            // `AudioChannels::count()` and `SampleRate::hz()` FABRICATE a concrete
+            // value for the `Unknown` variant (6 channels / 48000 Hz), so calling
+            // them unconditionally reported a confident 5.1 / 48 kHz for audio
+            // whose format is genuinely unknown — contradicting the neighbouring
+            // `channels` / `sample_rate` strings, which honestly say "unknown".
+            // Omit the numeric key entirely instead: the same guard `mkv.rs`
+            // applies before writing Channels / SamplingFrequency (there it emits
+            // 0 so the EBML serializer drops the element). Kept as a guard here
+            // rather than fixed in `count()`/`hz()` because those return
+            // non-optional scalars that other callers rely on.
+            if !matches!(a.channels, crate::disc::AudioChannels::Unknown) {
+                o["channel_count"] = json!(a.channels.count());
+            }
+            if !matches!(a.sample_rate, crate::disc::SampleRate::Unknown) {
+                o["sample_rate_hz"] = json!(a.sample_rate.hz());
+            }
             if !a.label.is_empty() {
                 o["label"] = json!(a.label);
             }
@@ -344,6 +358,44 @@ mod tests {
         assert_eq!(v["chapters"][1]["n"], 2);
         assert_eq!(v["chapters"][1]["start_secs"], 62.5);
         assert_eq!(v["chapters"][1]["name"], "2");
+    }
+
+    /// An audio stream whose channel layout / sample rate are genuinely unknown
+    /// must not be reported with a fabricated 5.1 / 48 kHz. `AudioChannels::count()`
+    /// maps `Unknown` to 6 and `SampleRate::hz()` maps `Unknown` to 48000, so the
+    /// numeric fields must be omitted rather than computed — otherwise the JSON
+    /// contradicts its own `channels` / `sample_rate` strings ("unknown").
+    #[test]
+    fn unknown_audio_layout_omits_fabricated_numeric_fields() {
+        use crate::disc::{AudioChannels, AudioStream, Codec, DiscTitle};
+        use crate::disc::{LabelPurpose, SampleRate, Stream as DiscStream};
+        let mut t = DiscTitle::empty();
+        t.streams = vec![DiscStream::Audio(AudioStream {
+            pid: 0x1100,
+            codec: Codec::DtsHdMa,
+            channels: AudioChannels::Unknown,
+            language: "eng".into(),
+            sample_rate: SampleRate::Unknown,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        })];
+        let v = title_json(&t);
+        let a = &v["streams"][0];
+        // The honest string fields.
+        assert_eq!(a["channels"], "unknown");
+        assert_eq!(a["sample_rate"], "unknown");
+        // The numeric fields must not assert a value the scan never resolved.
+        assert!(
+            a["channel_count"].is_null(),
+            "unknown channel layout must not report a channel_count, got {}",
+            a["channel_count"]
+        );
+        assert!(
+            a["sample_rate_hz"].is_null(),
+            "unknown sample rate must not report a sample_rate_hz, got {}",
+            a["sample_rate_hz"]
+        );
     }
 
     #[test]

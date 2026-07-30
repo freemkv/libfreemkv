@@ -487,14 +487,7 @@ impl TsDemuxer {
         // adaptation == 0x02 (AF only) already returned above, so only 0x03
         // (AF + payload) can carry an adaptation field here.
         let discontinuity_flag = adaptation == 0x03 && ts[4] > 0 && (ts[5] & 0x80) != 0;
-        // A gap is a CC that is neither the expected `(prev + 1) & 0xf` nor a
-        // duplicate `prev` (ISO 13818-1 permits a packet to repeat its CC; a
-        // duplicate is not a loss). Anything else means one or more packets for
-        // this PID were dropped.
-        let cc_gap = match asm.last_cc {
-            Some(prev) => cc != ((prev + 1) & 0x0f) && cc != prev,
-            None => false,
-        };
+        let cc_gap = cc_is_gap(asm.last_cc, cc);
         asm.last_cc = Some(cc);
         // A continuity gap means packets for THIS PID were lost (a damaged source,
         // or — for the conceal path — a loss that the CC-independent NULL-TS marker
@@ -657,6 +650,31 @@ fn parse_timestamp(data: &[u8]) -> Option<i64> {
     Some(((b0 >> 1) & 0x07) << 30 | b1 << 22 | (b2 >> 1) << 15 | b3 << 7 | b4 >> 1)
 }
 
+/// Canonical continuity-counter gap test (ISO/IEC 13818-1 §2.4.3.3).
+///
+/// The 4-bit `continuity_counter` increments by one for each TS packet of a PID
+/// that CARRIES PAYLOAD — a packet with adaptation field only does not increment
+/// it, so such packets must be excluded by the caller rather than diffed here.
+/// A packet MAY legally repeat the previous counter (the spec's duplicate
+/// packet, whose payload is identical); that is not a loss. Anything else means
+/// one or more packets for the PID were dropped.
+///
+/// `last_cc` is `None` before the first payload packet of a PID, where there is
+/// nothing to diff against and no gap can be asserted.
+///
+/// Single source of truth for BOTH users in this file: the PES assembler
+/// (`process_packet`) and the PSI section reassembler (`collect_psi_section`).
+/// `collect_psi_section` used to reimplement it as a strict `cc != expected`,
+/// which rejected legal duplicates and legal AF-only packets — a spec-conformant
+/// PMT continuation was then reported as desync and the title's stream list came
+/// back empty.
+fn cc_is_gap(last_cc: Option<u8>, cc: u8) -> bool {
+    match last_cc {
+        Some(prev) => cc != ((prev + 1) & 0x0f) && cc != prev,
+        None => false,
+    }
+}
+
 // ============================================================
 // Stream scanning (PAT/PMT → stream list)
 // ============================================================
@@ -765,13 +783,18 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
                 section.truncate(total);
                 return Some(section);
             }
-            // Need continuation packets: same PID, no PUSI, with a
-            // monotonically incrementing continuity counter. The CC lives in
-            // the low nibble of the 4th TS-header byte (offset+7 here: the
-            // BD-TS 4-byte prefix precedes the sync byte). A CC gap means a
-            // dropped/duplicated packet → the assembled section is corrupt, so
-            // abandon it rather than splicing in misordered payload.
-            let mut expected_cc = ((data[offset + 7] & 0x0F) + 1) & 0x0F;
+            // Need continuation packets: same PID, no PUSI. Continuity is
+            // checked with the CANONICAL `cc_is_gap` (ISO/IEC 13818-1 §2.4.3.3)
+            // shared with `process_packet`, NOT a local `cc != expected` test:
+            // that copy rejected a legal duplicate packet and counted
+            // adaptation-field-only packets (which do not increment the CC)
+            // as gaps, so a spec-conformant PMT was misdiagnosed as desync and
+            // the title's stream list came back empty. A real CC gap means a
+            // dropped/reordered packet → the assembled section is corrupt, so
+            // abandon it rather than splicing in misordered payload. The CC
+            // lives in the low nibble of the 4th TS-header byte (offset+7 here:
+            // the BD-TS 4-byte prefix precedes the sync byte).
+            let mut last_cc = Some(data[offset + 7] & 0x0F);
             let mut scan = offset + BD_SOURCE_PACKET_BYTES;
             let mut desync = false;
             while scan + BD_SOURCE_PACKET_BYTES <= data.len() && section.len() < total {
@@ -786,17 +809,27 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
                 let cpid = (((data[scan + 5] & 0x1F) as u16) << 8) | data[scan + 6] as u16;
                 let cpusi = data[scan + 5] & 0x40 != 0;
                 if cpid == target_pid && !cpusi {
+                    // Continuation packets may also carry an adaptation field;
+                    // compute their payload base the same way. `None` = the
+                    // packet carries NO payload (adaptation field only, or a
+                    // malformed AF): §2.4.3.3 does not increment the CC for
+                    // those, so they take no part in the continuity check.
+                    let Some(cbase) = psi_payload_base(&data[scan..scan + BD_SOURCE_PACKET_BYTES])
+                    else {
+                        scan += BD_SOURCE_PACKET_BYTES;
+                        continue;
+                    };
                     let cc = data[scan + 7] & 0x0F;
-                    if cc != expected_cc {
+                    if cc_is_gap(last_cc, cc) {
                         desync = true;
                         break;
                     }
-                    expected_cc = (cc + 1) & 0x0F;
-                    // Continuation packets may also carry an adaptation
-                    // field; compute their payload base the same way.
-                    if let Some(cbase) =
-                        psi_payload_base(&data[scan..scan + BD_SOURCE_PACKET_BYTES])
-                    {
+                    // A repeated CC is the spec's duplicate packet: identical
+                    // payload, already collected. Skip it — appending it again
+                    // would corrupt the section it is meant to protect.
+                    let duplicate = last_cc == Some(cc);
+                    last_cc = Some(cc);
+                    if !duplicate {
                         section
                             .extend_from_slice(&data[scan + cbase..scan + BD_SOURCE_PACKET_BYTES]);
                     }
@@ -1588,6 +1621,138 @@ mod tests {
                 |s| matches!(s, Stream::Audio(a) if a.pid == 0x1100 + 39 && a.codec == Codec::Lpcm)
             ),
             "trailing audio entry from the continuation packet survives"
+        );
+    }
+
+    /// Raw PMT PSI section (table_id .. CRC) for `entries`.
+    fn pmt_section(entries: &[(u8, u16)]) -> Vec<u8> {
+        let section_length = 9 + entries.len() * 5 + 4;
+        let mut section = Vec::new();
+        section.push(0x02); // table_id
+        section.push(0xB0 | (((section_length >> 8) as u8) & 0x0F));
+        section.push((section_length & 0xFF) as u8);
+        section.extend_from_slice(&[0x00, 0x01]); // program_number
+        section.push(0xC1); // version/current_next
+        section.push(0x00); // section_number
+        section.push(0x00); // last_section_number
+        section.extend_from_slice(&[0xE0, 0x00]); // PCR PID
+        section.extend_from_slice(&[0xF0, 0x00]); // program_info_length = 0
+        for &(stype, es_pid) in entries {
+            section.push(stype);
+            section.push(0xE0 | (((es_pid >> 8) as u8) & 0x1F));
+            section.push((es_pid & 0xFF) as u8);
+            section.extend_from_slice(&[0xF0, 0x00]); // ES_info_length = 0
+        }
+        section.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // CRC (unchecked)
+        section
+    }
+
+    /// Split a PSI section into BD-TS packets on `pid`: a PUSI packet carrying
+    /// the pointer_field + head, then continuation packets, each with the
+    /// continuity counter incremented by one (every packet here carries payload).
+    fn psi_packets(pid: u16, section: &[u8]) -> Vec<Vec<u8>> {
+        let mut pkts = Vec::new();
+        let head_len = (184 - 1).min(section.len());
+        let mut p0 = [0xFFu8; 184];
+        p0[0] = 0x00; // pointer_field
+        p0[1..1 + head_len].copy_from_slice(&section[..head_len]);
+        pkts.push(bdts_packet(p0, pid, true));
+        let mut pos = head_len;
+        let mut cc = 0u8;
+        while pos < section.len() {
+            let n = 184.min(section.len() - pos);
+            let mut p = [0xFFu8; 184];
+            p[..n].copy_from_slice(&section[pos..pos + n]);
+            let mut pkt = bdts_packet(p, pid, false);
+            cc = (cc + 1) & 0x0F;
+            pkt[7] = (pkt[7] & 0xF0) | cc;
+            pkts.push(pkt);
+            pos += n;
+        }
+        pkts
+    }
+
+    /// An adaptation-field-ONLY BD-TS packet (AFC = 0b10, no payload) on `pid`.
+    /// ISO/IEC 13818-1 §2.4.3.3: such a packet does NOT increment the
+    /// continuity_counter, so it repeats the previous packet's value.
+    fn af_only_packet(pid: u16, cc: u8) -> Vec<u8> {
+        let mut pkt = vec![0xFFu8; BD_SOURCE_PACKET_BYTES];
+        pkt[..4].fill(0); // TP_extra_header
+        pkt[4] = SYNC_BYTE;
+        pkt[5] = ((pid >> 8) as u8) & 0x1F; // no PUSI
+        pkt[6] = (pid & 0xFF) as u8;
+        pkt[7] = 0x20 | (cc & 0x0F); // AFC = 0b10 (adaptation field only)
+        pkt[8] = 183; // adaptation_field_length fills the packet
+        pkt[9] = 0x00; // AF flags (no discontinuity_indicator)
+        pkt
+    }
+
+    /// A spec-legal adaptation-field-only packet interleaved between PMT
+    /// continuations must not be mistaken for a continuity desync: per ISO/IEC
+    /// 13818-1 §2.4.3.3 a packet with no payload does not increment the
+    /// continuity_counter, so it repeats the previous value. Misdiagnosing it
+    /// abandoned the PMT and returned an EMPTY stream list for a perfectly
+    /// valid title.
+    #[test]
+    fn scan_streams_tolerates_af_only_packet_between_pmt_continuations() {
+        let pmt_pid = 0x0100;
+        let mut entries: Vec<(u8, u16)> = vec![(0x1B, 0x1011)];
+        for i in 0..40u16 {
+            entries.push((0x80, 0x1100 + i));
+        }
+        let pkts = psi_packets(pmt_pid, &pmt_section(&entries));
+        assert!(pkts.len() >= 2, "section must span a continuation");
+
+        let mut data = pat_packet(pmt_pid);
+        data.extend(pkts[0].clone());
+        // AF-only packet after the PUSI packet (CC = 0, unchanged).
+        data.extend(af_only_packet(pmt_pid, 0));
+        for p in &pkts[1..] {
+            data.extend(p.clone());
+        }
+
+        let streams = scan_streams(&data)
+            .expect("an adaptation-field-only packet must not abort PMT assembly");
+        assert_eq!(streams.len(), entries.len(), "every PMT entry reassembled");
+    }
+
+    /// A duplicate TS packet (same continuity_counter, identical payload) is
+    /// explicitly legal (ISO/IEC 13818-1 §2.4.3.3) — `process_packet` already
+    /// tolerates it. The PSI reassembler must too: treat it as a duplicate
+    /// (payload NOT appended a second time), not as a desync.
+    #[test]
+    fn scan_streams_tolerates_duplicate_pmt_continuation_packet() {
+        use crate::disc::{Codec, Stream};
+        let pmt_pid = 0x0100;
+        // Enough entries that the section spans three packets, so the duplicate
+        // lands mid-assembly rather than after the section has completed.
+        let mut entries: Vec<(u8, u16)> = vec![(0x1B, 0x1011)];
+        for i in 0..90u16 {
+            entries.push((0x80, 0x1100 + i));
+        }
+        let pkts = psi_packets(pmt_pid, &pmt_section(&entries));
+        assert!(
+            pkts.len() >= 3,
+            "section must span at least two continuations, got {}",
+            pkts.len()
+        );
+
+        let mut data = pat_packet(pmt_pid);
+        data.extend(pkts[0].clone());
+        data.extend(pkts[1].clone());
+        data.extend(pkts[1].clone()); // legal duplicate of the first continuation
+        for p in &pkts[2..] {
+            data.extend(p.clone());
+        }
+
+        let streams =
+            scan_streams(&data).expect("a duplicate PSI packet must not abort PMT assembly");
+        assert_eq!(streams.len(), entries.len(), "every PMT entry reassembled");
+        assert!(
+            streams.iter().any(
+                |s| matches!(s, Stream::Audio(a) if a.pid == 0x1100 + 89 && a.codec == Codec::Lpcm)
+            ),
+            "the trailing entry survives (duplicate payload was not spliced in twice)"
         );
     }
 
