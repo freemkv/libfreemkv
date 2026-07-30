@@ -781,6 +781,13 @@ fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
 /// to clean TS and garbles the other ~40 (the alternate half), which the demux
 /// then drops, yielding one coherent stream. The base Unit Key covers everything
 /// outside a segment.
+///
+/// Everything expensive here is memoised per DISC, not recomputed per title:
+/// `cache.table` holds the UDF walk + `IndividualSegment.tbl` (disc-invariant outright)
+/// and `cache.keys` holds the index keys + phases (keyed on the extent list, the only
+/// per-title input). See [`resolve_mux_key_map_cached`] for why a hit is provably
+/// the same answer. What remains per title is the pool→slot mapping, the LBA range
+/// arithmetic and the base-key gap fill.
 fn resolve_fmts_key_map(
     reader: &mut dyn SectorSource,
     title: &DiscTitle,
@@ -788,8 +795,9 @@ fn resolve_fmts_key_map(
     fetch: Option<&crate::sector::KeyFetch>,
     format: ContentFormat,
     halt: Option<&crate::halt::Halt>,
+    cache: &mut FmtsCache,
 ) -> io::Result<Option<crate::decrypt::AacsKeyMap>> {
-    use crate::aacs::content::ALIGNED_UNIT_LEN;
+    let FmtsCache { table, keys: memo } = cache;
     use crate::aacs::segment::{clip_byte_to_lba, parse_individual_segments};
 
     // Cooperative cancel: this probes the LIVE drive across up to a few hundred
@@ -803,6 +811,10 @@ fn resolve_fmts_key_map(
         }
         Ok(())
     };
+    // Poll once on ENTRY as well as inside the probe loops: with both memos warm a
+    // title can reach the finished map without touching a single loop, so a
+    // 60-playlist sweep would otherwise run to completion after an operator Stop.
+    check_halt()?;
 
     // Load the segment map. Distinguish a genuine "not an FMTS disc" negative
     // from a transient live-drive I/O fault: swallowing the latter into Ok(None)
@@ -815,22 +827,34 @@ fn resolve_fmts_key_map(
     //     → genuinely not FMTS → Ok(None).
     //   - any other error (notably `DiscRead`): a read fault → propagate so the
     //     rip fails loud / can be retried rather than dropping forensic content.
-    let udf = match crate::udf::read_filesystem(reader) {
-        Ok(u) => u,
-        Err(crate::error::Error::UdfNotFilesystem) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let tbl = match udf.read_file(reader, "/AACS/IndividualSegment.tbl") {
-        Ok(t) => t,
-        Err(crate::error::Error::UdfNotFound { .. }) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let Some(segments) = parse_individual_segments(&tbl) else {
-        return Ok(None);
-    };
-    if segments.is_empty() {
-        return Ok(None);
+    // …and memoise the outcome for the whole disc: the walk reads the same fixed low
+    // LBAs and the same file for every title (see `FmtsTableCache`). Only the two
+    // DETERMINISTIC negatives are cached; a read fault propagates uncached so a
+    // later title still retries.
+    if table.is_none() {
+        let udf = match crate::udf::read_filesystem(reader) {
+            Ok(u) => Some(u),
+            Err(crate::error::Error::UdfNotFilesystem) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let tbl = match udf {
+            None => None,
+            Some(u) => match u.read_file(reader, "/AACS/IndividualSegment.tbl") {
+                Ok(t) => Some(t),
+                Err(crate::error::Error::UdfNotFound { .. }) => None,
+                Err(e) => return Err(e.into()),
+            },
+        };
+        *table = Some(
+            tbl.as_deref()
+                .and_then(parse_individual_segments)
+                .filter(|s| !s.is_empty()),
+        );
     }
+    let Some(Some(segments)) = table.as_ref() else {
+        return Ok(None); // not an FMTS disc
+    };
+    let segments = segments.clone();
     // The segment SPNs are in the FORENSIC FEATURE clip's byte space. A title
     // whose extents do not cover any segment's clip bytes carries no forensic
     // content (a menu/extras playlist, or simply a different clip): its base Unit
@@ -851,6 +875,150 @@ fn resolve_fmts_key_map(
     // reaches this path.)
     let Some(fetch) = fetch else {
         return Err(crate::error::Error::FmtsKeyMissing.into());
+    };
+
+    // ── The expensive half — the anchor probe, the per-index phase probe and the
+    //    ONE key-service round trip — depends on the title ONLY through its extent
+    //    list, so it is resolved at most once per distinct extent list per disc
+    //    (`FmtsKeyCache`). Without this, `resolve_content_key_map` re-ran the whole
+    //    probe AND re-asked the key service once per playlist: on a 60-playlist disc
+    //    that is 60 identical key-service round trips (the storm) and tens of
+    //    thousands of random 6144-byte reads for one disc-wide answer. ────────────
+    let ek = extent_key(format, title);
+    let (index_keys, phase_of_index) = match memo.get(&ek) {
+        Some((k, p)) => (k.clone(), p.clone()),
+        None => {
+            let probed = probe_fmts_index_keys(reader, title, &segments, fetch, format, halt)?;
+            // Only memoise a run whose every index reached a DEFINITE phase. A
+            // read-faulted index defaulted to `Phase::All` is a property of a
+            // transient live-drive fault, not of these extents — caching it would
+            // spread one bad read across every remaining title.
+            if probed.all_phases_definite {
+                memo.insert(ek, (probed.keys.clone(), probed.phases.clone()));
+            }
+            (probed.keys, probed.phases)
+        }
+    };
+
+    // Map array position → forensic index (element i = index i+1); add each key to
+    // the pool and remember its slot by tag. `base_idx` is the Unit Key (slot 0).
+    // Per TITLE, and deliberately so: the pool is the caller's and grows across
+    // titles, so a title reached with the keys already banked finds them by value at
+    // the same slots instead of appending duplicates.
+    let base_idx = 0usize;
+    let mut tag_slot: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+    if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
+        for (i, k) in index_keys.iter().enumerate() {
+            let tag = (i + 1) as u16;
+            let slot = match unit_keys.iter().position(|(_, h)| h == k) {
+                Some(s) => s,
+                None => {
+                    let s = unit_keys.len();
+                    // CPS-unit id is cosmetic for the mapped decrypt (it indexes by
+                    // slot); use a high, distinct number for the forensic keys.
+                    unit_keys.push((1000 + s as u32, *k));
+                    s
+                }
+            };
+            tag_slot.insert(tag, slot);
+        }
+    }
+
+    // ── Build the per-segment LBA ranges: each forensic segment → its tag's key
+    //    AND its index's phase. The mapped decrypt opens only that half and leaves
+    //    the alternate as ciphertext (the muxer drops untouched ciphertext) —
+    //    clean by construction, no garble. A segment straddling an extent boundary
+    //    is left unmapped and tallied (a hard failure below). ────────────────────
+    let mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)> =
+        Vec::with_capacity(segments.len());
+    let mut unresolved = 0usize;
+    for seg in &segments {
+        // SPNs are untrusted (from IndividualSegment.tbl); an inverted record
+        // (start_spn > end_spn) would underflow `end_byte - 1 - start_byte` below.
+        // (Mirrors the guard in `aacs::segment::fmts_key_ranges`.)
+        if seg.start_spn > seg.end_spn {
+            unresolved += 1;
+            continue;
+        }
+        let Some(&slot) = tag_slot.get(&seg.index) else {
+            unresolved += 1;
+            continue;
+        };
+        let phase = phase_of_index
+            .get(&seg.index)
+            .copied()
+            .unwrap_or(crate::decrypt::Phase::All);
+        let start_byte = seg.start_spn as u64 * 192;
+        let end_byte = (seg.end_spn as u64 + 1) * 192;
+        let (Some(a), Some(b)) = (
+            clip_byte_to_lba(&title.extents, start_byte),
+            clip_byte_to_lba(&title.extents, end_byte - 1),
+        ) else {
+            unresolved += 1;
+            continue;
+        };
+        // Only emit a contiguous within-extent range (segments are ~480 KB; a rare
+        // extent-straddle is left unresolved rather than given a wrong span).
+        if b >= a && (b - a) as u64 == (end_byte - 1 - start_byte) / 2048 {
+            ranges.push((a, b + 1, slot, phase));
+        } else {
+            unresolved += 1;
+        }
+    }
+    // Every forensic segment must map to an index key. Any that did not is a hole
+    // in the rip — with the full 32-key set in hand this should never happen, so
+    // treat it as a hard failure rather than silently emitting a garbled segment.
+    if unresolved != 0 {
+        return Err(crate::error::Error::FmtsKeyMissing.into());
+    }
+
+    // Cover the NON-segment content with the base Unit Key: the forensic segments
+    // (added above with their index keys) carve holes out of the title's content
+    // extents; every other content unit uses the base UK. Fill the gaps so the map
+    // is a complete positive list — an LBA in no range is nav and passes through.
+    let base_gaps = fill_base_key_gaps(&title.extents, &ranges, base_idx);
+    ranges.extend(base_gaps);
+
+    Ok(Some(crate::decrypt::AacsKeyMap::from_ranges_phased(ranges)))
+}
+
+/// The disc-wide forensic answer [`probe_fmts_index_keys`] resolves: the ordered
+/// index keys (element `i` = forensic index `i + 1`) and each index's decrypt phase.
+struct FmtsIndexKeys {
+    keys: Vec<[u8; 16]>,
+    phases: std::collections::HashMap<u16, crate::decrypt::Phase>,
+    /// Every index reached a DEFINITE phase — no index fell back to `Phase::All`
+    /// after [`IndexProbe::ReadFault`]. Only such a run is safe to memoise; see
+    /// [`resolve_mux_key_map_cached`].
+    all_phases_definite: bool,
+}
+
+/// The drive- and key-service-hitting half of [`resolve_fmts_key_map`]: anchor the
+/// disc's whole forensic index-key set from ONE key-service round trip, then probe
+/// each index's interleave phase. Split out so the result can be memoised per disc
+/// ([`FmtsKeyCache`]) — the arithmetic that turns these keys into a per-title LBA
+/// map stays at the call site, where the title belongs.
+///
+/// `segments` are the segments already filtered to those addressable within
+/// `title`; every read is `clip_byte_to_lba(&title.extents, …)`. Neither probe reads
+/// the caller's key pool, which is what makes the result independent of resolve
+/// order across titles.
+fn probe_fmts_index_keys(
+    reader: &mut dyn SectorSource,
+    title: &DiscTitle,
+    segments: &[crate::aacs::segment::Segment],
+    fetch: &crate::sector::KeyFetch,
+    format: ContentFormat,
+    halt: Option<&crate::halt::Halt>,
+) -> io::Result<FmtsIndexKeys> {
+    use crate::aacs::content::ALIGNED_UNIT_LEN;
+    use crate::aacs::segment::clip_byte_to_lba;
+
+    let check_halt = || -> io::Result<()> {
+        if halt.is_some_and(|h| h.is_cancelled()) {
+            return Err(crate::error::Error::Halted.into());
+        }
+        Ok(())
     };
     tracing::info!(target: "freemkv::keysource", segments = segments.len(), extents = title.extents.len(), "fmts: begin index-key resolution");
 
@@ -925,27 +1093,6 @@ fn resolve_fmts_key_map(
         return Err(crate::error::Error::FmtsKeyMissing.into());
     }
 
-    // Map array position → forensic index (element i = index i+1); add each key to
-    // the pool and remember its slot by tag. `base_idx` is the Unit Key (slot 0).
-    let base_idx = 0usize;
-    let mut tag_slot: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
-    if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
-        for (i, k) in index_keys.iter().enumerate() {
-            let tag = (i + 1) as u16;
-            let slot = match unit_keys.iter().position(|(_, h)| h == k) {
-                Some(s) => s,
-                None => {
-                    let s = unit_keys.len();
-                    // CPS-unit id is cosmetic for the mapped decrypt (it indexes by
-                    // slot); use a high, distinct number for the forensic keys.
-                    unit_keys.push((1000 + s as u32, *k));
-                    s
-                }
-            };
-            tag_slot.insert(tag, slot);
-        }
-    }
-
     // ── PROBE each index's phase. A forensic segment interleaves two variants at
     //    the aligned-unit level; only ONE parity is this index's real content (the
     //    other is the alternate variant — a different key, garbles under ours). For
@@ -956,6 +1103,7 @@ fn resolve_fmts_key_map(
     //    Phase is per-index and shared by every segment carrying that index. ──────
     let mut phase_of_index: std::collections::HashMap<u16, crate::decrypt::Phase> =
         std::collections::HashMap::new();
+    let mut all_phases_definite = true;
     for (i, k) in index_keys.iter().enumerate() {
         check_halt()?;
         let tag = (i + 1) as u16;
@@ -966,7 +1114,7 @@ fn resolve_fmts_key_map(
         // read fault (zero decrypt evidence) — the load-bearing distinction so a
         // recoverable fault never hard-aborts a rip whose index keys are valid.
         match probe_index_phase(
-            &segments,
+            segments,
             tag,
             BATCH_UNITS,
             MAX_ANCHOR_ATTEMPTS,
@@ -996,66 +1144,16 @@ fn resolve_fmts_key_map(
                 // coherent-stream outcome the module doc describes for whole-range key
                 // application). Degraded but complete; never a wrong-key abort.
                 tracing::warn!(target: "freemkv::keysource", index = tag, "fmts: index phase probe read-faulted on every segment — defaulting Phase::All (recoverable read fault, not a wrong key)");
+                all_phases_definite = false;
             }
         }
     }
 
-    // ── Build the per-segment LBA ranges: each forensic segment → its tag's key
-    //    AND its index's phase. The mapped decrypt opens only that half and leaves
-    //    the alternate as ciphertext (the muxer drops untouched ciphertext) —
-    //    clean by construction, no garble. A segment straddling an extent boundary
-    //    is left unmapped and tallied (a hard failure below). ────────────────────
-    let mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)> =
-        Vec::with_capacity(segments.len());
-    let mut unresolved = 0usize;
-    for seg in &segments {
-        // SPNs are untrusted (from IndividualSegment.tbl); an inverted record
-        // (start_spn > end_spn) would underflow `end_byte - 1 - start_byte` below.
-        // (Mirrors the guard in `aacs::segment::fmts_key_ranges`.)
-        if seg.start_spn > seg.end_spn {
-            unresolved += 1;
-            continue;
-        }
-        let Some(&slot) = tag_slot.get(&seg.index) else {
-            unresolved += 1;
-            continue;
-        };
-        let phase = phase_of_index
-            .get(&seg.index)
-            .copied()
-            .unwrap_or(crate::decrypt::Phase::All);
-        let start_byte = seg.start_spn as u64 * 192;
-        let end_byte = (seg.end_spn as u64 + 1) * 192;
-        let (Some(a), Some(b)) = (
-            clip_byte_to_lba(&title.extents, start_byte),
-            clip_byte_to_lba(&title.extents, end_byte - 1),
-        ) else {
-            unresolved += 1;
-            continue;
-        };
-        // Only emit a contiguous within-extent range (segments are ~480 KB; a rare
-        // extent-straddle is left unresolved rather than given a wrong span).
-        if b >= a && (b - a) as u64 == (end_byte - 1 - start_byte) / 2048 {
-            ranges.push((a, b + 1, slot, phase));
-        } else {
-            unresolved += 1;
-        }
-    }
-    // Every forensic segment must map to an index key. Any that did not is a hole
-    // in the rip — with the full 32-key set in hand this should never happen, so
-    // treat it as a hard failure rather than silently emitting a garbled segment.
-    if unresolved != 0 {
-        return Err(crate::error::Error::FmtsKeyMissing.into());
-    }
-
-    // Cover the NON-segment content with the base Unit Key: the forensic segments
-    // (added above with their index keys) carve holes out of the title's content
-    // extents; every other content unit uses the base UK. Fill the gaps so the map
-    // is a complete positive list — an LBA in no range is nav and passes through.
-    let base_gaps = fill_base_key_gaps(&title.extents, &ranges, base_idx);
-    ranges.extend(base_gaps);
-
-    Ok(Some(crate::decrypt::AacsKeyMap::from_ranges_phased(ranges)))
+    Ok(FmtsIndexKeys {
+        keys: index_keys,
+        phases: phase_of_index,
+        all_phases_definite,
+    })
 }
 
 /// Keep only the forensic segments addressable within THIS title's extents: a
@@ -1275,7 +1373,7 @@ pub fn resolve_mux_key_map(
         fetch,
         format,
         halt,
-        &mut CpsUnitCache::new(),
+        &mut DiscKeyCache::new(),
     )
 }
 
@@ -1293,12 +1391,100 @@ pub fn resolve_mux_key_map(
 /// feature, play-all, per-chapter and seamless-branch variants), so without this
 /// the same extents are re-sampled off the drive once per playlist: 8 random
 /// 6144-byte reads each, ~200 ms of seek apiece on a stock BD drive.
+///
+/// Scope, stated precisely: this memo covers the MULTI-CPS extent-sampling reads
+/// and nothing else. On an FMTS (AACS 2.1) disc it removes NO reads at all, because
+/// [`resolve_fmts_key_map`] runs first and returns a finished map before the extent
+/// loop is ever reached — the per-title cost on those discs is removed by
+/// [`FmtsTableCache`] and [`FmtsKeyCache`] instead.
 pub(crate) type CpsUnitCache = std::collections::HashMap<(ContentFormat, u32, u32), usize>;
 
-/// [`resolve_mux_key_map`] with a caller-owned multi-CPS extent cache
-/// ([`CpsUnitCache`]) shared across the titles of one disc.
+/// The disc's forensic segment table (`/AACS/IndividualSegment.tbl`), resolved at
+/// most ONCE per disc: `None` = not looked for yet; `Some(None)` = looked for and
+/// this disc is not FMTS; `Some(Some(v))` = the parsed, non-empty segment list.
+///
+/// Every input is a property of the MEDIA, not of a title: the UDF walk
+/// ([`crate::udf::read_filesystem`]) reads fixed low LBAs (the anchor at 256, the
+/// VDS, the FSD, the root directory), `read_file` follows that file's own
+/// allocation descriptors, and `parse_individual_segments` is pure. Re-running it
+/// per title re-reads ~35 single sectors at low LBAs from a head the previous
+/// title's content sampling left deep in the content area — a full-stroke seek out
+/// and back per playlist, for a byte-identical answer.
+///
+/// Only the two *deterministic* negatives are memoised as "not FMTS"
+/// (`UdfNotFilesystem`, and `UdfNotFound` for the table): a read fault is NEVER
+/// cached, so a transient failure still propagates and a later title still retries.
+pub(crate) type FmtsTableCache = Option<Option<Vec<crate::aacs::segment::Segment>>>;
+
+/// Memoises the FMTS (AACS 2.1) forensic **index-key set and per-index phase** —
+/// the expensive half of [`resolve_fmts_key_map`] — across the titles of ONE disc.
+///
+/// Keyed by `(format, the title's exact extent list)`, mirroring
+/// [`crate::disc::pgs_forced_probe::ForcedProbeCache`]. The extent list is the key
+/// because it is the ONLY per-title input to the anchor probe, the phase probe and
+/// the key-service call: every read those make is
+/// `clip_byte_to_lba(&title.extents, …)`, and which segments are probed at all is
+/// `filter_addressable_segments(_, &title.extents)`. Two titles with the same
+/// extent list therefore feed byte-identical samples to a stateless
+/// [`crate::sector::KeyFetch`] and to the same `is_clean` arithmetic under the same
+/// `format` — see the safety argument on [`resolve_mux_key_map_cached`].
+///
+/// The value holds the ordered index keys (element `i` = forensic index `i + 1`)
+/// and the resolved phase per index tag. It is key material: never logged, never
+/// rendered, and dropped with the disc's resolve.
+pub(crate) type FmtsKeyCache = std::collections::HashMap<
+    (ContentFormat, Vec<(u32, u32)>),
+    (
+        Vec<[u8; 16]>,
+        std::collections::HashMap<u16, crate::decrypt::Phase>,
+    ),
+>;
+
+/// The two FMTS memos, bundled so [`resolve_fmts_key_map`] takes one argument for
+/// both and the multi-CPS memo can be borrowed independently.
+#[derive(Default)]
+pub(crate) struct FmtsCache {
+    /// The disc's forensic segment table — see [`FmtsTableCache`].
+    table: FmtsTableCache,
+    /// The forensic index keys + phases — see [`FmtsKeyCache`].
+    keys: FmtsKeyCache,
+}
+
+/// Everything [`resolve_mux_key_map_cached`] memoises across the titles of ONE
+/// disc. One value threaded through `resolve_content_key_map`'s per-title loop; the
+/// fields are independent and are borrowed disjointly.
+#[derive(Default)]
+pub(crate) struct DiscKeyCache {
+    /// Multi-CPS "which held key opens this extent" — see [`CpsUnitCache`].
+    pub(crate) cps: CpsUnitCache,
+    /// The FMTS segment table and index-key memos — see [`FmtsCache`].
+    pub(crate) fmts: FmtsCache,
+}
+
+impl DiscKeyCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// The `(format, extents)` cache key used by [`FmtsKeyCache`].
+fn extent_key(format: ContentFormat, title: &DiscTitle) -> (ContentFormat, Vec<(u32, u32)>) {
+    (
+        format,
+        title
+            .extents
+            .iter()
+            .map(|e| (e.start_lba, e.sector_count))
+            .collect(),
+    )
+}
+
+/// [`resolve_mux_key_map`] with a caller-owned per-disc cache ([`DiscKeyCache`])
+/// shared across the titles of one disc.
 ///
 /// # Why a cache cannot change a resolved key
+///
+/// ## Multi-CPS extents ([`CpsUnitCache`])
 ///
 /// The cached value is the pool index `pick` chose for an extent, and every input
 /// to that choice is stable across the titles of one disc:
@@ -1312,7 +1498,46 @@ pub(crate) type CpsUnitCache = std::collections::HashMap<(ContentFormat, u32, u3
 ///   index refers to was already banked into the pool on the miss that filled the
 ///   entry — so skipping the re-fetch skips no side effect the map depends on.
 ///
-/// Halt is still polled per extent, so cancellation behaves as before.
+/// ## FMTS segment table ([`FmtsTableCache`])
+///
+/// Disc-invariant outright: no input to the UDF walk, the `read_file` or the parse
+/// mentions the title. See the type's doc for the negatives that are (and are not)
+/// memoised.
+///
+/// ## FMTS index keys and phases ([`FmtsKeyCache`])
+///
+/// The title enters the anchor and phase probes through exactly one channel — the
+/// extent list, via `clip_byte_to_lba` (which segments are addressable, and which
+/// LBA each probed clip byte maps to) — and that list is IN the key. Given the same
+/// list, the same `format` and unchanging media:
+///
+/// * `filter_addressable_segments` yields the same segments in the same order, so
+///   the anchor loop and each `probe_index_phase` visit the same segments.
+/// * every probe read is at the same LBA, so the same ciphertext is fed to a
+///   [`crate::sector::KeyFetch`] that is stateless by contract, and to the same
+///   `aacs_unit_encrypted` / `decrypt_unit` / `is_clean` arithmetic.
+/// * NEITHER probe reads the key pool. The anchor takes its keys from `fetch`; the
+///   phase probe takes them from the anchor's reply. So the pool's growth across
+///   titles — the one thing that does change between calls — cannot move this
+///   result, and the cached value is independent of the order titles are resolved
+///   in.
+///
+/// What is deliberately NOT memoised, which is what makes this safe rather than
+/// merely faster:
+///
+/// * the fail-loud `FmtsKeyMissing` verdicts (no anchor, wrong key), so a retry
+///   after a key source is reconfigured re-probes rather than inheriting nothing;
+/// * a run where any index's phase probe came back
+///   [`IndexProbe::ReadFault`] — that leaves the phase defaulted to `Phase::All`
+///   (degraded but complete), a property of a transient live-drive fault and NOT of
+///   the extents. Caching it would spread one bad read across every remaining title.
+///
+/// Everything downstream of the cache still runs per title: the pool insertion that
+/// turns index keys into slots, the per-segment LBA range arithmetic, and the
+/// base-key gap fill — all of which genuinely depend on this title's extents.
+///
+/// Halt is polled per extent AND once on entry to the FMTS branch, so a 60-playlist
+/// sweep stays cancellable even when every title is served from cache.
 pub(crate) fn resolve_mux_key_map_cached(
     reader: &mut dyn SectorSource,
     title: &DiscTitle,
@@ -1320,11 +1545,15 @@ pub(crate) fn resolve_mux_key_map_cached(
     fetch: Option<&crate::sector::KeyFetch>,
     format: ContentFormat,
     halt: Option<&crate::halt::Halt>,
-    cache: &mut CpsUnitCache,
+    cache: &mut DiscKeyCache,
 ) -> io::Result<crate::decrypt::AacsKeyMap> {
     use crate::aacs::content::{
         ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted, decrypt_unit, is_clean,
     };
+
+    // Borrow the three memos disjointly: the FMTS branch needs two of them mutably
+    // while the multi-CPS loop below needs the third.
+    let DiscKeyCache { cps: cache, fmts } = cache;
 
     // The base Unit Key pool is always resolved and banked by the caller before mux
     // (autorip's pre-rip gate; the ISO path's `decrypt_keys()`), so an AACS title
@@ -1342,7 +1571,7 @@ pub(crate) fn resolve_mux_key_map_cached(
     // front from the configured source and build a per-segment map. Returns `None`
     // when the disc is not FMTS, or no key source is configured (then the base UK
     // path below applies and the forensic units garble → demux drops them).
-    if let Some(map) = resolve_fmts_key_map(reader, title, keys, fetch, format, halt)? {
+    if let Some(map) = resolve_fmts_key_map(reader, title, keys, fetch, format, halt, fmts)? {
         return Ok(map);
     }
     if pool_len == 1 {
@@ -3044,12 +3273,17 @@ mod tests {
     struct CountingCipherSource {
         inner: CipherSource,
         probes: u32,
+        /// Reads BELOW `CONTENT_LBA_FLOOR` — the FMTS branch's UDF walk and
+        /// `IndividualSegment.tbl` load, whose per-title repetition the disc-wide
+        /// `FmtsTableCache` exists to remove.
+        meta: u32,
     }
     impl CountingCipherSource {
         fn new(units: Vec<(u32, u32, Vec<u8>)>) -> Self {
             Self {
                 inner: CipherSource { units },
                 probes: 0,
+                meta: 0,
             }
         }
     }
@@ -3066,6 +3300,8 @@ mod tests {
         ) -> crate::error::Result<usize> {
             if lba >= CONTENT_LBA_FLOOR {
                 self.probes += 1;
+            } else {
+                self.meta += 1;
             }
             self.inner.read_sectors(lba, count, buf, recovery)
         }
@@ -3104,7 +3340,7 @@ mod tests {
             read_data_key: None,
             format: ContentFormat::BdTs,
         };
-        let mut cache = super::CpsUnitCache::new();
+        let mut cache = super::DiscKeyCache::new();
 
         let title = multi_cps_title(shared_start, sectors);
         let first = super::resolve_mux_key_map_cached(
@@ -3204,7 +3440,7 @@ mod tests {
 
         // Warm a cache, then serve the whole title from it.
         let mut warm = CountingCipherSource::new(units.clone());
-        let mut cache = super::CpsUnitCache::new();
+        let mut cache = super::DiscKeyCache::new();
         for _ in 0..2 {
             super::resolve_mux_key_map_cached(
                 &mut warm,
@@ -3237,7 +3473,7 @@ mod tests {
             None,
             ContentFormat::BdTs,
             None,
-            &mut super::CpsUnitCache::new(),
+            &mut super::DiscKeyCache::new(),
         )
         .expect("cold resolve");
 
@@ -3275,7 +3511,7 @@ mod tests {
             read_data_key: None,
             format: ContentFormat::BdTs,
         };
-        let mut cache = super::CpsUnitCache::new();
+        let mut cache = super::DiscKeyCache::new();
 
         let mut with_c = DiscTitle::empty();
         with_c.extents = vec![
@@ -3346,7 +3582,7 @@ mod tests {
         let mut reader =
             CountingCipherSource::new(vec![(start, start + 30, encrypted_clean_unit(&key_x))]);
         let title = multi_cps_title(start, 30);
-        let mut cache = super::CpsUnitCache::new();
+        let mut cache = super::DiscKeyCache::new();
 
         // Two held keys → the multi-CPS sampling path (a one-key pool short-circuits
         // to index 0 without sampling); neither opens the extent → fail loud.
@@ -3365,7 +3601,7 @@ mod tests {
             &mut cache,
         )
         .expect_err("no held key opens the extent → fail loud");
-        assert!(cache.is_empty(), "a failed extent must not be memoised");
+        assert!(cache.cps.is_empty(), "a failed extent must not be memoised");
 
         // The operator supplies the missing key; the retry must resolve it.
         if let DecryptKeys::Aacs { unit_keys, .. } = &mut keys {
@@ -3437,6 +3673,7 @@ mod tests {
             None,
             ContentFormat::BdTs,
             None,
+            &mut super::FmtsCache::default(),
         );
         let err = got.expect_err("a transient DiscRead must fail loud, never Ok(None)");
         let expected = std::io::Error::from(crate::error::Error::DiscRead {
@@ -3474,8 +3711,632 @@ mod tests {
             None,
             ContentFormat::BdTs,
             None,
+            &mut super::FmtsCache::default(),
         )
         .expect("a structurally non-UDF disc is a clean not-FMTS negative");
         assert!(got.is_none(), "not a UDF/FMTS disc → Ok(None)");
+    }
+
+    // ── FMTS index-key resolution is memoised per DISC, not per title ─────────
+    //
+    // A synthetic AACS 2.1 disc: a real UDF tree (so `read_filesystem` walks it
+    // for real) carrying `/AACS/IndividualSegment.tbl`, plus a content region whose
+    // aligned units are genuinely encrypted — the EVEN units of a segment under its
+    // index key and the ODD units under the alternate interleaved variant's key,
+    // exactly the layout the phase probe exists to discover. The reader COUNTS its
+    // reads (metadata vs probe) and the `KeyFetch` double COUNTS its calls, so the
+    // tests can state the cost of N titles rather than assume it.
+
+    /// First LBA of the synthetic disc's content. Everything below is UDF metadata.
+    const FMTS_CONTENT_LBA: u32 = 10_000;
+    /// Sectors in the content extent — enough to cover both forensic segments.
+    const FMTS_CONTENT_SECTORS: u32 = 2_000;
+    /// The base CPS Unit Key (pool slot 0) of the synthetic disc.
+    const FMTS_BASE_KEY: [u8; 16] = [0x01u8; 16];
+    /// The disc's forensic index keys: element i = forensic index i+1. Two, not 32 —
+    /// the resolver sizes itself to whatever the source returns.
+    const FMTS_INDEX_KEYS: [[u8; 16]; 2] = [[0x21u8; 16], [0x22u8; 16]];
+    /// The alternate interleaved variant's key: the ODD units of every segment are
+    /// encrypted under it, so they do NOT open under the segment's index key.
+    const FMTS_ALT_KEY: [u8; 16] = [0x99u8; 16];
+
+    /// The disc's forensic segments: one per index, 2560 packets each (the retail
+    /// size), on a 6144-byte-aligned start so units line up with sectors.
+    fn fmts_segments() -> Vec<crate::aacs::segment::Segment> {
+        use crate::aacs::segment::Segment;
+        vec![
+            Segment {
+                index: 1,
+                start_spn: 3200,
+                end_spn: 3200 + 2559,
+            },
+            Segment {
+                index: 2,
+                start_spn: 6400,
+                end_spn: 6400 + 2559,
+            },
+        ]
+    }
+
+    /// Serialise `segs` as an `IndividualSegment.tbl` image (8-byte header:
+    /// type, record count, record size; then 16-byte records).
+    fn fmts_tbl(segs: &[crate::aacs::segment::Segment]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0x0100_0000u32.to_be_bytes());
+        v.extend_from_slice(&(segs.len() as u16).to_be_bytes());
+        v.extend_from_slice(&(crate::aacs::segment::SEGMENT_RECORD_LEN as u16).to_be_bytes());
+        for s in segs {
+            v.extend_from_slice(&0x0100_0000u32.to_be_bytes());
+            v.extend_from_slice(&s.index.to_be_bytes());
+            v.extend_from_slice(&1u16.to_be_bytes());
+            v.extend_from_slice(&s.start_spn.to_be_bytes());
+            v.extend_from_slice(&s.end_spn.to_be_bytes());
+        }
+        v
+    }
+
+    /// The synthetic FMTS disc. Counts UDF-metadata reads and content-probe reads
+    /// separately, and can be told to fault every read of one LBA span (a marginal
+    /// live drive) to exercise the read-fault path.
+    struct FmtsDisc {
+        meta_disc: crate::udf::fixture::MemDisc,
+        segs: Vec<crate::aacs::segment::Segment>,
+        /// Reads below `FMTS_CONTENT_LBA`: the UDF walk + segment-table load.
+        meta_reads: u32,
+        /// Reads at/above `FMTS_CONTENT_LBA`: the anchor + phase probes.
+        probe_reads: u32,
+        /// `[start, end)` LBA span whose every read returns `DiscRead`.
+        fault_span: Option<(u32, u32)>,
+    }
+
+    impl FmtsDisc {
+        fn new() -> Self {
+            use crate::udf::fixture::{DirSpec, build_udf_skeleton, file_with, lay_dir};
+            let segs = fmts_segments();
+            let mut meta_disc = crate::udf::fixture::MemDisc::new();
+            build_udf_skeleton(&mut meta_disc, 10);
+            lay_dir(
+                &mut meta_disc,
+                &DirSpec {
+                    name: String::new(),
+                    icb_lba: 10,
+                    dir_data_lba: 11,
+                    files: Vec::new(),
+                    subdirs: vec![DirSpec {
+                        name: "AACS".to_string(),
+                        icb_lba: 12,
+                        dir_data_lba: 13,
+                        files: vec![file_with(
+                            "IndividualSegment.tbl",
+                            14,
+                            15,
+                            fmts_tbl(&segs),
+                            true,
+                        )],
+                        subdirs: Vec::new(),
+                    }],
+                },
+            );
+            Self {
+                meta_disc,
+                segs,
+                meta_reads: 0,
+                probe_reads: 0,
+                fault_span: None,
+            }
+        }
+
+        /// The 6144-byte ciphertext of the aligned unit starting at clip byte
+        /// `unit_byte`: inside a segment, EVEN units carry that index's content and
+        /// ODD units the alternate variant; outside, ordinary base-Unit-Key content.
+        fn unit_at(&self, unit_byte: u64) -> Vec<u8> {
+            for s in &self.segs {
+                let sb = s.start_byte();
+                if unit_byte >= sb && unit_byte < sb + s.byte_len() {
+                    let n = (unit_byte - sb) / crate::aacs::content::ALIGNED_UNIT_LEN as u64;
+                    let key = if n % 2 == 0 {
+                        FMTS_INDEX_KEYS[(s.index - 1) as usize]
+                    } else {
+                        FMTS_ALT_KEY
+                    };
+                    return encrypted_clean_unit(&key);
+                }
+            }
+            encrypted_clean_unit(&FMTS_BASE_KEY)
+        }
+    }
+
+    impl SectorSource for FmtsDisc {
+        fn capacity_sectors(&self) -> u32 {
+            1_000_000
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if let Some((a, b)) = self.fault_span {
+                if lba >= a && lba < b {
+                    self.probe_reads += 1;
+                    return Err(crate::error::Error::DiscRead {
+                        sector: lba as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+            }
+            if lba < FMTS_CONTENT_LBA {
+                self.meta_reads += 1;
+                return self.meta_disc.read_sectors(lba, count, buf, recovery);
+            }
+            self.probe_reads += 1;
+            let want = count as usize * 2048;
+            buf[..want].fill(0);
+            for s in 0..count as u32 {
+                let off = (lba + s - FMTS_CONTENT_LBA) as u64;
+                let unit_byte = (off / 3) * crate::aacs::content::ALIGNED_UNIT_LEN as u64;
+                let within = (off % 3) as usize * 2048;
+                let unit = self.unit_at(unit_byte);
+                let dst = s as usize * 2048;
+                buf[dst..dst + 2048].copy_from_slice(&unit[within..within + 2048]);
+            }
+            Ok(want)
+        }
+    }
+
+    /// A `KeyFetch` whose `fmts_indexes` counts its calls and behaves like the real
+    /// service: it replies with the disc's COMPLETE ordered index-key set only for a
+    /// genuine index-1 anchor batch (one that opens under index key 1), and empty
+    /// otherwise. `unit_keys` is never used on this path.
+    fn counting_fmts_fetch(
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> crate::sector::KeyFetch {
+        crate::sector::KeyFetch::new(
+            std::sync::Arc::new(|_| Vec::new()),
+            std::sync::Arc::new(move |batch: &[Vec<u8>]| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(first) = batch.first() else {
+                    return Vec::new();
+                };
+                let mut u = first.clone();
+                crate::aacs::content::decrypt_unit(&mut u, &FMTS_INDEX_KEYS[0]);
+                if crate::aacs::content::is_clean(&u, ContentFormat::BdTs) {
+                    FMTS_INDEX_KEYS.to_vec()
+                } else {
+                    Vec::new()
+                }
+            }),
+        )
+    }
+
+    fn fmts_title(sectors: u32) -> DiscTitle {
+        multi_cps_title(FMTS_CONTENT_LBA, sectors)
+    }
+
+    fn fmts_keys() -> DecryptKeys {
+        DecryptKeys::Aacs {
+            unit_keys: vec![(0, FMTS_BASE_KEY)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        }
+    }
+
+    fn pool_of(keys: &DecryptKeys) -> Vec<(u32, [u8; 16])> {
+        match keys {
+            DecryptKeys::Aacs { unit_keys, .. } => unit_keys.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The defect this fixes: `resolve_content_key_map` resolves EVERY title, and the
+    /// FMTS branch used to re-walk the UDF filesystem, re-run the anchor probe, re-run
+    /// the 2-index phase probe AND re-ask the key service — once per playlist — for an
+    /// answer that is a property of the DISC. N titles must cost ONE UDF walk, ONE
+    /// index probe and ONE `fmts_indexes` call.
+    ///
+    /// Mutations, and which assert kills each:
+    /// * `if table.is_none()` → `if true` (never memoise the segment table):
+    ///   the `meta_reads` assert fails (the walk repeats per title).
+    /// * removing the `memo.get(&ek)` short-circuit: the `probe_reads` AND the
+    ///   `fmts_indexes` call-count asserts both fail.
+    /// * `if probed.all_phases_definite` → `if false` (never insert): same two.
+    #[test]
+    fn fmts_index_keys_resolved_once_per_disc_not_once_per_title() {
+        use std::sync::atomic::Ordering;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls.clone());
+        let mut reader = FmtsDisc::new();
+        let mut keys = fmts_keys();
+        let mut cache = super::DiscKeyCache::new();
+        let title = fmts_title(FMTS_CONTENT_SECTORS);
+
+        let first = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("the synthetic FMTS disc resolves");
+        let (meta1, probe1) = (reader.meta_reads, reader.probe_reads);
+        let calls1 = calls.load(Ordering::SeqCst);
+        assert!(meta1 > 0, "the first title really does walk the UDF tree");
+        assert_eq!(
+            probe1, 40,
+            "the first title pays the anchor (8 reads) plus a 16-read phase probe per index"
+        );
+        assert_eq!(calls1, 1, "ONE anchor batch resolves the whole index set");
+        // The map really is the forensic one: two segment ranges on their index-key
+        // slots with the probed phase, and the base key over the rest.
+        assert_eq!(
+            first.key_idx_for(10_300),
+            Some(1),
+            "segment index 1 keys to its own pool slot"
+        );
+        assert_eq!(
+            first.key_idx_for(10_600),
+            Some(2),
+            "segment index 2 keys to its own pool slot"
+        );
+        assert_eq!(
+            first.key_idx_for(10_000),
+            Some(0),
+            "base key outside segments"
+        );
+
+        // 59 more playlists of the same clip — the shape of a real BD.
+        for _ in 0..59 {
+            let again = super::resolve_mux_key_map_cached(
+                &mut reader,
+                &title,
+                &mut keys,
+                Some(&fetch),
+                ContentFormat::BdTs,
+                None,
+                &mut cache,
+            )
+            .expect("a later title resolves from the memo");
+            assert_eq!(
+                again.ranges(),
+                first.ranges(),
+                "a memoised title must produce the byte-identical map"
+            );
+        }
+        assert_eq!(
+            reader.meta_reads, meta1,
+            "the UDF walk / segment table is a DISC fact: exactly one walk for 60 titles"
+        );
+        assert_eq!(
+            reader.probe_reads, probe1,
+            "the anchor and phase probes must not re-run per title"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the key service must be asked ONCE per disc, not once per playlist"
+        );
+        // And the pool grew exactly once — the index keys were banked, not duplicated.
+        assert_eq!(
+            pool_of(&keys).len(),
+            1 + FMTS_INDEX_KEYS.len(),
+            "the base key plus one slot per forensic index, appended once"
+        );
+    }
+
+    /// Result-identity, proven rather than assumed: the same three titles resolved
+    /// with a SHARED per-disc memo must produce the same maps — and leave the key
+    /// pool in the same state — as resolving each with a FRESH memo (i.e. the
+    /// unmemoised per-title recomputation).
+    ///
+    /// Mutation: key the FMTS memo on something NOT title-invariant (e.g. drop the
+    /// extent list from `extent_key` and key on `format` alone) → title 3's differing
+    /// extents are served the wrong answer and the range comparison fails.
+    #[test]
+    fn fmts_memoised_map_equals_per_title_recomputation() {
+        let titles = [
+            fmts_title(FMTS_CONTENT_SECTORS),
+            fmts_title(FMTS_CONTENT_SECTORS),
+            // A DIFFERENT extent list (a longer clip): a memo miss that must be
+            // recomputed, not served the first title's answer.
+            fmts_title(FMTS_CONTENT_SECTORS + 500),
+        ];
+
+        let mut shared_cache = super::DiscKeyCache::new();
+        let mut shared_keys = fmts_keys();
+        let mut reader = FmtsDisc::new();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls.clone());
+        let shared: Vec<_> = titles
+            .iter()
+            .map(|t| {
+                super::resolve_mux_key_map_cached(
+                    &mut reader,
+                    t,
+                    &mut shared_keys,
+                    Some(&fetch),
+                    ContentFormat::BdTs,
+                    None,
+                    &mut shared_cache,
+                )
+                .expect("shared-memo resolve")
+            })
+            .collect();
+
+        let mut fresh_keys = fmts_keys();
+        let mut reader2 = FmtsDisc::new();
+        let calls2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch2 = counting_fmts_fetch(calls2.clone());
+        let fresh: Vec<_> = titles
+            .iter()
+            .map(|t| {
+                super::resolve_mux_key_map_cached(
+                    &mut reader2,
+                    t,
+                    &mut fresh_keys,
+                    Some(&fetch2),
+                    ContentFormat::BdTs,
+                    None,
+                    // A fresh memo per title == the unmemoised behaviour.
+                    &mut super::DiscKeyCache::new(),
+                )
+                .expect("per-title recompute")
+            })
+            .collect();
+
+        for (i, (a, b)) in shared.iter().zip(fresh.iter()).enumerate() {
+            assert_eq!(
+                a.ranges(),
+                b.ranges(),
+                "title {i}: the memoised map must equal the per-title recomputation"
+            );
+        }
+        assert_eq!(
+            pool_of(&shared_keys),
+            pool_of(&fresh_keys),
+            "the key pool must end in the same state — same keys, same slots, same order"
+        );
+        // And the memo really was doing work: the unmemoised run paid 3 walks and 3
+        // key-service calls where the memoised one paid 1 walk and 2 calls (title 3's
+        // extent list is a genuine miss).
+        assert!(
+            reader2.meta_reads > reader.meta_reads,
+            "the per-title recomputation re-walks the UDF tree; the memoised run does not"
+        );
+        assert_eq!(
+            (
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                calls2.load(std::sync::atomic::Ordering::SeqCst)
+            ),
+            (2, 3),
+            "memoised: one call per DISTINCT extent list; unmemoised: one per title"
+        );
+    }
+
+    /// A DIFFERENT extent list is a genuine miss: the extent list is the only
+    /// per-title input to the probes, so it is IN the memo key and a title with a
+    /// different one must re-probe rather than inherit.
+    ///
+    /// Mutation: drop `title.extents` from `extent_key` → the second title hits and
+    /// the `probe_reads` / call-count asserts fail.
+    #[test]
+    fn fmts_different_extent_list_is_a_miss_and_reprobes() {
+        use std::sync::atomic::Ordering;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls.clone());
+        let mut reader = FmtsDisc::new();
+        let mut keys = fmts_keys();
+        let mut cache = super::DiscKeyCache::new();
+
+        let a = fmts_title(FMTS_CONTENT_SECTORS);
+        super::resolve_mux_key_map_cached(
+            &mut reader,
+            &a,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("first title resolves");
+        let (meta1, probe1) = (reader.meta_reads, reader.probe_reads);
+
+        let b = fmts_title(FMTS_CONTENT_SECTORS + 500);
+        super::resolve_mux_key_map_cached(
+            &mut reader,
+            &b,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("second title resolves");
+        assert_eq!(
+            reader.meta_reads, meta1,
+            "the segment table is disc-wide: still no second UDF walk"
+        );
+        assert_eq!(
+            reader.probe_reads,
+            probe1 * 2,
+            "a different extent list must re-probe from its own bytes"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "and re-ask the key service for that extent list"
+        );
+    }
+
+    /// A phase probe that READ-FAULTED on every segment of an index leaves that
+    /// index defaulted to `Phase::All` — degraded but complete. That is a property of
+    /// a transient live-drive fault, NOT of the title's extents, so it must NOT be
+    /// memoised: caching it would spread one bad read across every remaining
+    /// playlist. The next title must re-probe.
+    ///
+    /// Mutation: memoise unconditionally (drop the `all_phases_definite` guard) →
+    /// the second title is served from cache and both the `probe_reads` and the
+    /// key-service call-count asserts fail.
+    #[test]
+    fn fmts_read_faulted_phase_is_not_memoised() {
+        use std::sync::atomic::Ordering;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls.clone());
+        let mut reader = FmtsDisc::new();
+        // Fault every read of the index-2 segment (clip bytes 6400*192.. → LBAs
+        // 10600..10840): the anchor (index 1) still succeeds, so the keys are in
+        // hand, but index 2's phase probe has zero decrypt evidence.
+        reader.fault_span = Some((10_600, 10_840));
+        let mut keys = fmts_keys();
+        let mut cache = super::DiscKeyCache::new();
+        let title = fmts_title(FMTS_CONTENT_SECTORS);
+
+        let first = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("a read fault must NOT abort a rip whose index keys are good");
+        assert_eq!(
+            first.entry_for(10_600).map(|(_, p, _)| p),
+            Some(crate::decrypt::Phase::All),
+            "the read-faulted index defaults to Phase::All"
+        );
+        assert_eq!(
+            first.entry_for(10_300).map(|(_, p, _)| p),
+            Some(crate::decrypt::Phase::Even),
+            "the index that DID probe keeps its resolved phase"
+        );
+        let probe1 = reader.probe_reads;
+
+        super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("second title resolves");
+        assert!(
+            reader.probe_reads > probe1,
+            "a read-faulted run must not be memoised — the next title re-probes"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "and re-anchors rather than inheriting a degraded answer"
+        );
+    }
+
+    /// The UDF walk that decides whether a disc is FMTS at all runs on EVERY disc,
+    /// FMTS or not. On a plain (non-UDF / non-FMTS) BD it must be attempted ONCE for
+    /// the whole disc, not once per playlist — ~35 low-LBA single-sector reads reached
+    /// by a full-stroke seek back from wherever the last title's content sampling left
+    /// the head.
+    ///
+    /// Mutation: `if table.is_none()` → `if true` → the second title re-reads the
+    /// metadata and the `meta` assert fails.
+    #[test]
+    fn non_fmts_disc_walks_the_filesystem_once_for_every_title() {
+        let key_a = [0x01u8; 16];
+        let key_b = [0x02u8; 16];
+        // All-zero metadata → no AVDP at sector 256 → `UdfNotFilesystem`, the
+        // deterministic "not an FMTS disc" negative that IS memoised.
+        let mut reader = CountingCipherSource::new(vec![
+            (1000, 1030, encrypted_clean_unit(&key_b)),
+            (9000, 9030, encrypted_clean_unit(&key_b)),
+        ]);
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let mut cache = super::DiscKeyCache::new();
+
+        super::resolve_mux_key_map_cached(
+            &mut reader,
+            &multi_cps_title(1000, 30),
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("first title resolves");
+        let meta1 = reader.meta;
+        assert!(
+            meta1 > 0,
+            "the first title really does attempt the UDF walk"
+        );
+
+        // A second title with DIFFERENT extents (so the CPS memo misses and the
+        // title is genuinely resolved) must still not re-walk the filesystem.
+        super::resolve_mux_key_map_cached(
+            &mut reader,
+            &multi_cps_title(9000, 30),
+            &mut keys,
+            None,
+            ContentFormat::BdTs,
+            None,
+            &mut cache,
+        )
+        .expect("second title resolves");
+        assert_eq!(
+            reader.meta, meta1,
+            "the not-FMTS verdict is a disc fact: one filesystem walk for the disc"
+        );
+    }
+
+    /// Halt must stay responsive even when both FMTS memos are warm and a title does
+    /// no I/O at all: `resolve_content_key_map` polls nothing itself, so the entry
+    /// check inside the FMTS branch is the only cancellation point a fully-memoised
+    /// title reaches.
+    ///
+    /// Mutation: remove the `check_halt()?` at the top of `resolve_fmts_key_map` →
+    /// the cancelled second title returns `Ok(map)` and `expect_err` fails.
+    #[test]
+    fn fmts_memoised_title_still_honors_halt() {
+        use crate::halt::Halt;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls);
+        let mut reader = FmtsDisc::new();
+        let mut keys = fmts_keys();
+        let mut cache = super::DiscKeyCache::new();
+        let title = fmts_title(FMTS_CONTENT_SECTORS);
+        let halt = Halt::new();
+
+        // Warm both memos.
+        super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            Some(&halt),
+            &mut cache,
+        )
+        .expect("first title resolves");
+
+        halt.cancel();
+        let err = super::resolve_mux_key_map_cached(
+            &mut reader,
+            &title,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            Some(&halt),
+            &mut cache,
+        )
+        .expect_err("a cancelled halt must abort even a fully-memoised title");
+        assert!(crate::error::is_halt(&err), "expected Halted, got: {err}");
     }
 }
