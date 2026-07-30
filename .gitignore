@@ -14,3 +14,8 @@ scratch/
 # internal agent context — never publish (path AND dir; leak-guard blocks both)
 CLAUDE.md
 .claude/
+
+# Nightly harness output. Written into the repo it audits, and it embeds
+# absolute paths from the machine that ran it — which must never reach a public
+# repo. Ignored rather than relocated so a run from any working copy is safe.
+.nightly/

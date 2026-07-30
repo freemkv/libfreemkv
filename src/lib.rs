@@ -112,6 +112,8 @@ pub mod dvdnav;
 pub mod error;
 pub mod event;
 pub mod halt;
+#[cfg(test)]
+mod harness;
 pub mod hex;
 pub(crate) mod identity;
 pub(crate) mod ifo;
