@@ -316,3 +316,232 @@ mod heartbeat_tests {
         assert!(hb.tick_cpu(0, 100));
     }
 }
+
+#[cfg(test)]
+mod pass_progress_tests {
+    use super::*;
+
+    /// A zeroed sample. Each test sets only the fields its percentage reads, so
+    /// a failure names the field that mattered rather than drowning in a
+    /// thirteen-field literal.
+    fn sample() -> PassProgress {
+        PassProgress {
+            kind: PassKind::Sweep,
+            work_done: 0,
+            work_total: 0,
+            bytes_good_total: 0,
+            bytes_unreadable_total: 0,
+            bytes_pending_total: 0,
+            bytes_retryable_total: 0,
+            bytes_total_disc: 0,
+            disc_duration_secs: None,
+            bytes_bad_in_main_title: 0,
+            main_title_duration_secs: None,
+            main_title_size_bytes: None,
+            located: LocatedProgress::default(),
+        }
+    }
+
+    /// The ordinary case: a quarter of the work done reads 25%, not some other
+    /// arrangement of the same three numbers. The exact value is what pins the
+    /// arithmetic — `done / total * 100` and `done * total / 100` and
+    /// `done / total + 100` all "look like" a percentage and only one is right.
+    #[test]
+    fn work_pct_is_done_over_total_scaled_to_a_hundred() {
+        let p = PassProgress {
+            work_done: 250,
+            work_total: 1000,
+            ..sample()
+        };
+        assert_eq!(p.work_pct(), 25.0);
+    }
+
+    /// Zero total is the divide-by-zero guard, and it must report COMPLETE, not
+    /// zero: a pass with no work to do has finished all of it. A UI that read
+    /// 0% here would sit at "0%" forever on an empty pass.
+    #[test]
+    fn work_pct_with_no_work_reports_complete() {
+        assert_eq!(sample().work_pct(), 100.0);
+    }
+
+    /// The guard must fire on `total == 0` ONLY. With work present the real
+    /// arithmetic has to run — a guard inverted to `!=` would short-circuit
+    /// every real pass to 100% and divide by zero on the empty one.
+    #[test]
+    fn work_pct_guard_fires_only_on_zero_total() {
+        let p = PassProgress {
+            work_done: 1,
+            work_total: 4,
+            ..sample()
+        };
+        assert_eq!(p.work_pct(), 25.0, "a non-empty pass must not report 100%");
+    }
+
+    /// A transient overshoot clamps rather than reporting above 100%. Sector
+    /// counts briefly exceed the total when a pass re-reads, and a progress bar
+    /// fed 137% renders past its own end.
+    #[test]
+    fn work_pct_clamps_an_overshoot_to_a_hundred() {
+        let p = PassProgress {
+            work_done: 1370,
+            work_total: 1000,
+            ..sample()
+        };
+        assert_eq!(p.work_pct(), 100.0);
+    }
+
+    #[test]
+    fn good_pct_is_good_bytes_over_disc_size() {
+        let p = PassProgress {
+            bytes_good_total: 750,
+            bytes_total_disc: 1000,
+            ..sample()
+        };
+        assert_eq!(p.good_pct(), 75.0);
+    }
+
+    /// An unknown disc size reports 100% clean, matching `bad_pct` and
+    /// `pending_pct` both reporting 0% there: the triple is the coherent
+    /// "nothing known to be damaged" state a client renders before the disc
+    /// size is established, rather than three percentages that disagree.
+    #[test]
+    fn good_pct_with_unknown_disc_size_reports_clean() {
+        assert_eq!(sample().good_pct(), 100.0);
+    }
+
+    #[test]
+    fn good_pct_guard_fires_only_on_zero_disc_size() {
+        let p = PassProgress {
+            bytes_good_total: 1,
+            bytes_total_disc: 2,
+            ..sample()
+        };
+        assert_eq!(p.good_pct(), 50.0, "a sized disc must not report 100%");
+    }
+
+    #[test]
+    fn bad_pct_is_unreadable_bytes_over_disc_size() {
+        let p = PassProgress {
+            bytes_unreadable_total: 125,
+            bytes_total_disc: 1000,
+            ..sample()
+        };
+        assert_eq!(p.bad_pct(), 12.5);
+    }
+
+    /// Unknown disc size reports 0% bad — the opposite default from `good_pct`,
+    /// and deliberately so. Reporting 100% bad on an unsized disc would show a
+    /// fully-damaged disc the instant a rip started.
+    #[test]
+    fn bad_pct_with_unknown_disc_size_reports_none() {
+        assert_eq!(sample().bad_pct(), 0.0);
+    }
+
+    #[test]
+    fn bad_pct_guard_fires_only_on_zero_disc_size() {
+        let p = PassProgress {
+            bytes_unreadable_total: 1,
+            bytes_total_disc: 4,
+            ..sample()
+        };
+        assert_eq!(p.bad_pct(), 25.0, "a sized disc must not report 0% bad");
+    }
+
+    #[test]
+    fn pending_pct_is_pending_bytes_over_disc_size() {
+        let p = PassProgress {
+            bytes_pending_total: 400,
+            bytes_total_disc: 1000,
+            ..sample()
+        };
+        assert_eq!(p.pending_pct(), 40.0);
+    }
+
+    #[test]
+    fn pending_pct_with_unknown_disc_size_reports_none() {
+        assert_eq!(sample().pending_pct(), 0.0);
+    }
+
+    #[test]
+    fn pending_pct_guard_fires_only_on_zero_disc_size() {
+        let p = PassProgress {
+            bytes_pending_total: 3,
+            bytes_total_disc: 4,
+            ..sample()
+        };
+        assert_eq!(p.pending_pct(), 75.0, "a sized disc must not report 0%");
+    }
+
+    /// The three disc-relative percentages read three DIFFERENT byte counters.
+    /// Nothing above would catch `bad_pct` reading `bytes_pending_total`: each
+    /// test sets one counter and leaves the others zero, so a swapped field
+    /// still returns the right answer for its own test. This one sets all three
+    /// to distinct values at once.
+    #[test]
+    fn the_disc_percentages_read_distinct_counters() {
+        let p = PassProgress {
+            bytes_good_total: 500,
+            bytes_unreadable_total: 200,
+            bytes_pending_total: 300,
+            bytes_total_disc: 1000,
+            ..sample()
+        };
+        assert_eq!(p.good_pct(), 50.0, "good_pct must read bytes_good_total");
+        assert_eq!(
+            p.bad_pct(),
+            20.0,
+            "bad_pct must read bytes_unreadable_total"
+        );
+        assert_eq!(
+            p.pending_pct(),
+            30.0,
+            "pending_pct must read bytes_pending_total"
+        );
+    }
+
+    /// A closure IS a `Progress` via the blanket impl, and its return value is
+    /// the cancellation signal: `false` means stop. A blanket body that ignored
+    /// the closure and returned a constant would make every closure-based
+    /// consumer uncancellable — the caller asks to stop, the rip keeps going.
+    #[test]
+    fn the_closure_blanket_impl_returns_the_closures_own_verdict() {
+        fn ask<P: Progress>(p: &P, s: &PassProgress) -> bool {
+            p.report(s)
+        }
+
+        let keep_going = |_: &PassProgress| true;
+        let cancel = |_: &PassProgress| false;
+
+        assert!(ask(&keep_going, &sample()), "true must survive the forward");
+        assert!(
+            !ask(&cancel, &sample()),
+            "a closure returning false is a CANCEL and must not be reported as \
+             keep-going; a constant-true blanket impl makes cancellation a no-op"
+        );
+    }
+
+    /// The blanket impl must hand the closure the caller's sample, not a
+    /// fabricated one — a consumer decides whether to cancel FROM the numbers.
+    #[test]
+    fn the_closure_blanket_impl_passes_the_sample_through() {
+        use std::sync::{Arc, Mutex};
+        fn ask<P: Progress>(p: &P, s: &PassProgress) -> bool {
+            p.report(s)
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let recorder = move |p: &PassProgress| {
+            sink.lock().unwrap().push((p.work_done, p.work_total));
+            true
+        };
+
+        let s = PassProgress {
+            work_done: 7,
+            work_total: 9,
+            ..sample()
+        };
+        assert!(ask(&recorder, &s));
+        assert_eq!(*seen.lock().unwrap(), vec![(7, 9)]);
+    }
+}

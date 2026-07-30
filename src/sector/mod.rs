@@ -415,6 +415,13 @@ mod tests {
         s.read_sectors(lba, count, buf, recovery)
     }
 
+    /// Same, for the speed lever. The trait's own `set_speed` default is a
+    /// no-op, so a forwarding body that also did nothing is indistinguishable
+    /// from the default unless the call is routed through the generic bound.
+    fn set_speed_generic<S: SectorSource>(mut s: S, kbs: u16) {
+        s.set_speed(kbs);
+    }
+
     /// Same, for the FUA entry point.
     fn read_fua_generic<S: SectorSource>(
         mut s: S,
@@ -494,6 +501,46 @@ mod tests {
             *calls.lock().unwrap(),
             vec![(42, 2, false, Some(true))],
             "the FUA entry point must be the one reached, with fua=true intact"
+        );
+    }
+
+    /// The `&mut dyn SectorSource` forwarding impl must delegate `set_speed`.
+    ///
+    /// This one hides better than the read methods, because the trait's own
+    /// default body is `fn set_speed(&mut self, _kbs: u16) {}` — so a forwarding
+    /// impl that dropped the call on the floor compiles, type-checks, and looks
+    /// exactly like a source that legitimately has no speed control. The
+    /// consequence is not a wrong value but a silently absent one: the recovery
+    /// path throttles a struggling drive by lowering its read speed, and a
+    /// forwarder that swallowed the call would leave the drive at full speed
+    /// through the damaged region while the caller believed it had slowed down.
+    #[test]
+    fn mut_ref_dyn_forwards_set_speed_to_the_inner_source() {
+        let (mut spy, _reads, speeds, _bases) = Spy::new(0);
+        let r: &mut dyn SectorSource = &mut spy;
+        set_speed_generic(r, 5540);
+
+        assert_eq!(
+            *speeds.lock().unwrap(),
+            vec![5540],
+            "the forwarding impl must pass set_speed through to the inner \
+             source; swallowing it is indistinguishable from the trait default \
+             and silently disables recovery-path throttling"
+        );
+    }
+
+    /// The same for `Box<dyn SectorSource>`, which is the receiver the mux read
+    /// paths actually hold.
+    #[test]
+    fn boxed_dyn_forwards_set_speed_to_the_inner_source() {
+        let (spy, _reads, speeds, _bases) = Spy::new(0);
+        let b: Box<dyn SectorSource> = Box::new(spy);
+        set_speed_generic(b, 11080);
+
+        assert_eq!(
+            *speeds.lock().unwrap(),
+            vec![11080],
+            "the boxed forwarding impl must pass set_speed through unchanged"
         );
     }
 }
