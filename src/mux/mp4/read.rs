@@ -98,6 +98,12 @@ impl<R: Read + Seek> Mp4Reader<R> {
         // crafted file with a fixed-size `stsz` claiming count=0xFFFFFFFF can't
         // inflate the `sizes`/`Vec<SampleRef>` allocations past the file's own size
         // (a genuine large title has file_len ≫ sample count, so it is unaffected).
+        // NOTE on the bound this actually gives: each indexed sample costs about
+        // 52 bytes of RAM (SampleRef 40 + u32 size 4 + u64 offset 8, plus 4 each
+        // for the expanded stts/ctts), so the ceiling is ~52x file_len, not 1x —
+        // capped by MAX_SAMPLE_COUNT. That is still a real bound (a 1 MiB crafted
+        // file cannot reach the 16M-sample ceiling), just not the "past the file's
+        // own size" the previous comment implied.
         let mut sample_budget = MAX_SAMPLE_COUNT.min(file_len.min(usize::MAX as u64) as usize);
 
         // Bound the scan at MAX_TRACKS *matches* so a crafted moov packed with tiny

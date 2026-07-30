@@ -679,10 +679,15 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// the muxed runtime, used to back-patch the DURATION placeholder.
     max_block_ticks: i64,
     /// Timestamp (TimestampScale ticks) of the last video keyframe written on the
-    /// primary video track. A non-keyframe MVC base frame lives in a BlockGroup
-    /// (to carry its dependent-view BlockAdditional) and needs a `ReferenceBlock`
-    /// so players don't mistake it for a keyframe; it references this keyframe.
-    last_video_keyframe_ticks: Option<i64>,
+    /// video track. A non-keyframe frame written as a BlockGroup needs a
+    /// `ReferenceBlock` so players don't mistake it for a keyframe, and it must
+    /// reference a keyframe on its OWN track.
+    ///
+    /// Per track, not global: the ReferenceBlock is emitted for ANY video track,
+    /// so a single global value made a secondary video track's non-keyframe point
+    /// at a keyframe on a different track (or at 0, a self-reference, when the
+    /// primary had not produced one yet). Indexed by `track_idx`.
+    last_video_keyframe_ticks: Vec<Option<i64>>,
     /// Per-AC-3-audio-track channel-correction state. The DVD IFO audio nibble
     /// is unreliable, so the channel count written in the track header is
     /// corrected from the AC-3 bitstream `acmod` of the first frame on the
@@ -1257,7 +1262,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             duration_secs,
             duration_patch_pos,
             max_block_ticks: 0,
-            last_video_keyframe_ticks: None,
+            last_video_keyframe_ticks: vec![None; tracks.len()],
             ac3_channel_fixups,
             pgs_forced_fixups,
             opening_capture: None,
@@ -1506,6 +1511,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         } else {
             Some(
                 self.last_video_keyframe_ticks
+                    .get(track_idx)
+                    .copied()
+                    .flatten()
                     .map(|kf| kf - pts_ticks)
                     .unwrap_or(0),
             )
@@ -1536,12 +1544,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 }
             },
         }
-        // Remember the last PRIMARY-video keyframe's tick so a later non-keyframe
-        // MVC base frame references a keyframe on its OWN track (see the
-        // block_additional path above). Gating to the primary video track avoids a
-        // secondary video track's keyframe becoming a cross-track reference target.
-        if keyframe && Some(track_idx) == self.primary_video_track {
-            self.last_video_keyframe_ticks = Some(pts_ticks);
+        // Remember this VIDEO track's last keyframe tick, so a later non-keyframe
+        // on the same track references a keyframe on its own track. Recorded per
+        // track: the ReferenceBlock above is emitted for any video track, so a
+        // single global slot produced cross-track references on a multi-video-track
+        // title (MVC base + secondary view, or a disc with two angles).
+        if keyframe && is_video {
+            if let Some(slot) = self.last_video_keyframe_ticks.get_mut(track_idx) {
+                *slot = Some(pts_ticks);
+            }
         }
         self.frame_count += 1;
 
@@ -5220,9 +5231,17 @@ mod tests {
             groups[0].reference, None,
             "the MVC keyframe must carry NO ReferenceBlock — that absence IS the keyframe signal"
         );
-        assert!(
-            groups[1].reference.is_some(),
-            "the non-keyframe MVC base frame must carry a ReferenceBlock"
+        // Assert the OFFSET, not just presence — the sibling non-MVC BlockGroup
+        // test pins the exact value, and a mutant emitting a constant or a
+        // wrong-signed offset would pass a presence-only check. The keyframe sits
+        // at tick 0, so the offset is the negated block-relative timestamp.
+        let off = groups[1]
+            .reference
+            .expect("the non-keyframe MVC base frame must carry a ReferenceBlock");
+        assert_eq!(
+            off,
+            -(groups[1].rel_ts as i64),
+            "the MVC ReferenceBlock must point back to the keyframe at tick 0"
         );
     }
 
