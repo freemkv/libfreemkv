@@ -41,6 +41,17 @@
 
 ### Fixed
 
+- **An undecryptable CSS disc no longer exits successfully.**
+  `Error::CssKeyMissing` (E7023) carried two conditions needing opposite
+  responses: one title of a multi-VTS DVD failing its own re-crack — correctly
+  skippable, the rest of the disc still rips — and the *whole disc* failing its
+  crack (`Disc::css_error`), where every title fails identically. Both raised
+  E7023, which `is_skippable_title_stub` classifies, so an uncrackable disc
+  iterated all N titles logging "title skipped" and exited 0. The disc-wide gate
+  (`Disc::ensure_decryptable[_keys]`) now raises `Error::CssNoDiscKey`
+  (**E7027**) — the CSS analogue of `NoDiscKey` (E7022), classified by
+  `is_disc_level_no_key`, so a rip loop fails fast. The per-title raise keeps
+  E7023 and stays skippable.
 - **A corrupt `mkv://` input is no longer reported as a title worth silently
   skipping.** `Error::MkvInvalid` (E6008) carried two unrelated meanings: the
   genuine "this title produced no muxable frames" stub — which

@@ -91,8 +91,11 @@ pub fn crack_key(
 ///   key could be recovered (the Stevenson attack found no crackable crib, or
 ///   the scrambled region was unreadable). The content is encrypted; muxing it
 ///   as plaintext would emit garbage, so callers MUST surface a hard error
-///   ([`crate::error::Error::CssKeyMissing`]) instead of falling through to
-///   "unencrypted".
+///   instead of falling through to "unencrypted" — the per-title
+///   [`crate::error::Error::CssKeyMissing`] when it is ONE title's own re-crack
+///   that failed (skippable: a sibling VTS may still crack), or the disc-level
+///   [`crate::error::Error::CssNoDiscKey`] when it is the disc-wide scan
+///   (`Disc::css_error`, every title fails identically).
 #[derive(Debug, Clone)]
 pub enum CrackOutcome {
     Cracked(CssState),
@@ -148,7 +151,12 @@ pub fn crack_key_outcome(
 /// - a genuinely clear DVD (no scrambled sector) — stays `None`, a mux no-op.
 ///
 /// A scrambled-but-uncrackable title is a hard [`crate::error::Error::CssKeyMissing`],
-/// never a silent scrambled-passthrough mux.
+/// never a silent scrambled-passthrough mux. That code is the PER-TITLE one
+/// (`error::is_skippable_title_stub`), which is correct here: this function
+/// cracks ONE title's own extents, and another VTS on the same disc may still
+/// yield its key, so an all-titles rip skips this title and finishes the rest.
+/// The whole-disc failure is [`crate::error::Error::CssNoDiscKey`], raised by
+/// `Disc::ensure_decryptable_keys` from the scan's `css_error`.
 pub(crate) fn resolve_dvd_title_key(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
