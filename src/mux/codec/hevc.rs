@@ -201,11 +201,20 @@ struct ContentLightLevel {
 // window (HEVC reorder depth tops out ~16 frames, <1 s at 24 fps). 3 s = 270000
 // ticks sits well above any legitimate reorder dip and far below any real clip's
 // duration, so it never false-triggers within a clip. This MIRRORS the mux-side
-// `DISCONTINUITY_BACKSTEP_NS` (3 s) in `mux/mkv.rs`, which independently rebases
-// the timeline at the same boundaries; here it drives the CRA→BLA rewrite that
-// kills the dangling-RASL "Could not find ref with POC N" decode errors a
+// `DISCONTINUITY_BACKSTEP_NS` (3 s) in `mux/timeline.rs`, which independently
+// rebases the timeline at the same boundaries; here it drives the CRA→BLA rewrite
+// that kills the dangling-RASL "Could not find ref with POC N" decode errors a
 // concatenated multi-clip title otherwise produces.
 const BACKSTEP_TICKS: i64 = 270_000;
+
+// The mirror above is enforced, not just described: 90 kHz ticks → ns is
+// × (1_000_000_000 / 90_000) = × 100_000 / 9, so 270_000 ticks must be exactly
+// `DISCONTINUITY_BACKSTEP_NS`. Changing either constant without the other fails
+// the build here, which is the drift the comment exists to prevent.
+const _: () = assert!(
+    BACKSTEP_TICKS * 100_000 / 9 == crate::mux::timeline::DISCONTINUITY_BACKSTEP_NS,
+    "HEVC BACKSTEP_TICKS must mirror mux::timeline::DISCONTINUITY_BACKSTEP_NS"
+);
 
 // The 33-bit 90 kHz PES PTS counter wraps at 2^33 ticks (~26.5 h). When the raw
 // PTS steps backward by approximately a full period — i.e. it landed just past

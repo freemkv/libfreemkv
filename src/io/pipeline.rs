@@ -33,7 +33,7 @@
 //! consumer lag detection). This is critical for diagnosing stalls.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -117,8 +117,29 @@ fn consumer_panicked(payload: Box<dyn std::any::Any + Send>) -> Error {
     Error::PipelineConsumerPanicked
 }
 
+/// Consumer lifecycle state, shared between the caller and the consumer thread.
+///
+/// A plain `AtomicBool` could not make "the caller abandons" and "the consumer
+/// commits to finalising" mutually exclusive: the consumer loaded the flag, the
+/// caller stored it, and the consumer then finalised the container anyway — the
+/// caller reporting the rip as interrupted while a fully finalised MKV (Cues
+/// written, Segment size patched) landed on disk, indistinguishable from a
+/// complete one. The two transitions are therefore a single compare-exchange each,
+/// out of [`ST_RUNNING`]: whoever wins decides, and the loser observes the winner.
+mod state {
+    /// Consumer is running; neither side has committed yet.
+    pub const RUNNING: u8 = 0;
+    /// The caller gave up on the consumer and will report failure — the consumer
+    /// must NOT finalise the output.
+    pub const ABANDONED: u8 = 1;
+    /// The consumer has committed to `close()` (finalising the output). The caller
+    /// can no longer abandon it; it must wait for the result it is about to
+    /// produce.
+    pub const CLOSING: u8 = 2;
+}
+
 /// After a halt or deadline fires, spin-poll `handle.is_finished()` for
-/// [`FINISH_GRACE_SECS`] before accepting the thread leak. This converts
+/// `grace` before accepting the thread leak. This converts
 /// the common "nearly-done" consumer (whose own bounded_syscall just
 /// returned and is about to drop its output file) into a clean join,
 /// releasing the file handle without waiting the full grace period.
@@ -132,11 +153,12 @@ fn consumer_panicked(payload: Box<dyn std::any::Any + Send>) -> Error {
 /// syscall itself; that still returns on its own (or at process exit).
 fn finish_with_grace<R: Send + 'static>(
     handle: thread::JoinHandle<Result<R, Error>>,
-    abandoned: &Arc<AtomicBool>,
+    state: &Arc<AtomicU8>,
+    grace: Duration,
     leak_err: Error,
 ) -> Result<R, Error> {
-    let grace = Instant::now() + Duration::from_secs(FINISH_GRACE_SECS);
-    while Instant::now() < grace {
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
         if handle.is_finished() {
             return match handle.join() {
                 Ok(result) => result,
@@ -145,16 +167,50 @@ fn finish_with_grace<R: Send + 'static>(
         }
         thread::sleep(POLL_INTERVAL);
     }
-    // Grace expired. Signal abandonment, then log and leak. Setting the
-    // flag BEFORE dropping the handle guarantees the leaked consumer
-    // observes it the moment its wedged syscall returns: it then skips
-    // any further `apply` and skips `close()`, rather than running on to
-    // finalise the abandoned output file.
-    // `Release` here pairs with the `Acquire` loads in the consumer loop so
-    // the leaked consumer reliably observes the flag the moment its wedged
-    // syscall returns, even on weak memory models (ARM64/POWER) where
-    // `Relaxed` gives no cross-thread visibility guarantee.
-    abandoned.store(true, Ordering::Release);
+    // Grace expired. CLAIM abandonment, then log and leak. Claiming BEFORE
+    // dropping the handle guarantees the leaked consumer observes it the moment
+    // its wedged syscall returns: it then skips any further `apply` and skips
+    // `close()`, rather than running on to finalise the abandoned output file.
+    //
+    // A compare-exchange, not a store, because the consumer may have committed to
+    // `close()` in the instant between our last `is_finished()` poll and now. It
+    // then cannot be stopped — the finalise IS happening — so abandoning it would
+    // report the rip as interrupted while a valid, fully finalised container
+    // lands on disk. Losing the race means waiting for the result the consumer is
+    // already producing instead. `AcqRel` pairs with the consumer's own
+    // compare-exchange and with the `Acquire` loads in its drain loop, so the flag
+    // is reliably observed even on weak memory models (ARM64/POWER).
+    if state
+        .compare_exchange(
+            state::RUNNING,
+            state::ABANDONED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        tracing::warn!(
+            target: "freemkv::pipeline",
+            phase = "finish_with_halt_close_in_flight",
+            "pipeline consumer had already committed to finalising the output; \
+             waiting for it rather than reporting an unfinalised output"
+        );
+        let close_deadline = Instant::now() + grace;
+        while Instant::now() < close_deadline {
+            if handle.is_finished() {
+                return match handle.join() {
+                    Ok(result) => result,
+                    Err(payload) => Err(consumer_panicked(payload)),
+                };
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        // Still finalising after a second grace window: leak and report the wedge.
+        // The output may end up finalised by the leaked thread — but that is now a
+        // wedged-`close()` case, not the check-then-finalise race.
+        drop(handle);
+        return Err(leak_err);
+    }
     tracing::warn!(
         target: "freemkv::pipeline",
         phase = "finish_with_halt_grace_expired",
@@ -243,7 +299,21 @@ pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
     /// a syscall the consumer is currently wedged in, but it does bound
     /// the damage to "whatever write is already in flight" once that
     /// syscall returns, instead of running on to a clean finalise.
-    abandoned: Arc<AtomicBool>,
+    ///
+    /// One of [`state::RUNNING`] / [`state::ABANDONED`] / [`state::CLOSING`];
+    /// both transitions are compare-exchanges so abandoning and finalising are
+    /// mutually exclusive rather than racing.
+    state: Arc<AtomicU8>,
+    /// Set by the consumer the moment an `apply` returns `Err`. The consumer keeps
+    /// draining the channel after that (so the producer never blocks on a dead
+    /// receiver) — which means a producer watching only `send`'s return value
+    /// cannot tell the difference between "being consumed" and "being discarded
+    /// after a fatal write error", and would go on reading the whole remaining
+    /// disc before `finish()` finally surfaced the error. This flag is that
+    /// missing edge: [`Pipeline::send_with_halt`] fails fast on it, and
+    /// [`Pipeline::consumer_failed`] exposes it to producers that use plain
+    /// [`Pipeline::send`].
+    failed: Arc<AtomicBool>,
 }
 
 impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
@@ -277,8 +347,10 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         sink: S,
     ) -> Result<Self, Error> {
         let (tx, rx) = bounded::<I>(depth);
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let abandoned_consumer = abandoned.clone();
+        let state = Arc::new(AtomicU8::new(state::RUNNING));
+        let state_consumer = state.clone();
+        let failed = Arc::new(AtomicBool::new(false));
+        let failed_consumer = failed.clone();
         let handle = thread::Builder::new()
             .name(name.into())
             .spawn(move || -> Result<R, Error> {
@@ -309,7 +381,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     // dead receiver, but we touch the output no further. The
                     // final post-loop abandonment check returns the error
                     // and skips `close()`.
-                    if abandoned_consumer.load(Ordering::Acquire) {
+                    if state_consumer.load(Ordering::Acquire) == state::ABANDONED {
                         continue;
                     }
 
@@ -338,6 +410,12 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                                 tracing::debug!("Pipeline: apply error, stopping, err={:?}", e);
                             }
                             first_err = Some(e);
+                            // Publish the failure so the producer can stop
+                            // FEEDING a dead write side instead of only learning
+                            // about it at `finish()` — by which time it has read
+                            // the rest of the disc. `Release` pairs with the
+                            // `Acquire` load in `send_with_halt`.
+                            failed_consumer.store(true, Ordering::Release);
                         }
                     }
 
@@ -398,13 +476,38 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                 // MKV Cues + patching the segment header) on a file the
                 // caller already reported as failed is exactly the
                 // write race we must not run.
-                if abandoned_consumer.load(Ordering::Acquire) {
-                    return Err(Error::Halted);
-                }
-
                 match first_err {
-                    Some(e) => Err(e),
-                    None => sink.close(),
+                    // No `close()` on this path, so there is nothing to claim —
+                    // just report, unless the caller has already given up on us.
+                    Some(e) => {
+                        if state_consumer.load(Ordering::Acquire) == state::ABANDONED {
+                            Err(Error::Halted)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                    // CLAIM the finalise. A plain load here left a window in which
+                    // the caller stored `abandoned` AFTER we read it as clear, so
+                    // `close()` ran anyway and finalised (Cues + Segment-size
+                    // patch) an output the caller had already reported as
+                    // interrupted — a truncated rip indistinguishable from a
+                    // complete one. The compare-exchange closes that window: if the
+                    // caller got there first we skip `close()`, and if we get there
+                    // first the caller waits for us instead of abandoning.
+                    None => {
+                        if state_consumer
+                            .compare_exchange(
+                                state::RUNNING,
+                                state::CLOSING,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_err()
+                        {
+                            return Err(Error::Halted);
+                        }
+                        sink.close()
+                    }
                 }
             })
             .map_err(|e| Error::IoError { source: e })?;
@@ -412,8 +515,22 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         Ok(Pipeline {
             tx,
             handle,
-            abandoned,
+            state,
+            failed,
         })
+    }
+
+    /// Whether the consumer's `apply` has already failed fatally.
+    ///
+    /// The consumer keeps draining the channel after an `apply` error (so the
+    /// producer never blocks on a dead receiver), which means `send` keeps
+    /// succeeding and a producer has no other way to tell that everything it feeds
+    /// is being discarded. A long-running producer — the mux frame pump reading a
+    /// 60 GB title off an optical drive — should check this and unwind instead of
+    /// reading the rest of the disc for a write that has already failed.
+    /// [`Pipeline::send_with_halt`] checks it automatically.
+    pub fn consumer_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
     }
 
     /// Push one item. Blocks if the channel is full — that's the
@@ -513,6 +630,21 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         let end = Instant::now() + deadline;
         let mut pending = item;
         loop {
+            // The consumer's `apply` has failed fatally: everything sent from here
+            // is drained and discarded, so hand the item back at once. Without this
+            // the producer saw every send succeed (the channel is always being
+            // drained) and went on reading the whole remaining title — an hour of
+            // drive time on a UHD — for a write that died on the first frame, only
+            // learning about it at `finish()`.
+            if self.consumer_failed() {
+                if debug_enabled() {
+                    tracing::debug!(
+                        "Pipeline send_with_halt: consumer apply failed, returning item={}",
+                        std::any::type_name::<I>()
+                    );
+                }
+                return Err(pending);
+            }
             // Pre-check the cheap exit conditions before parking.
             if halt.is_cancelled() {
                 if debug_enabled() {
@@ -567,7 +699,8 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         let Pipeline {
             tx,
             handle,
-            abandoned: _,
+            state: _,
+            failed: _,
         } = self;
         // Explicit drop, although the destructure already drops `tx`
         // at end-of-scope. Being explicit keeps the intent obvious.
@@ -607,7 +740,8 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         let Pipeline {
             tx,
             handle,
-            abandoned,
+            state,
+            failed: _,
         } = self;
         drop(tx);
         let deadline = Instant::now() + Duration::from_secs(JOIN_TIMEOUT_SECS);
@@ -620,11 +754,21 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             }
             if let Some(h) = halt {
                 if h.is_cancelled() {
-                    return finish_with_grace(handle, &abandoned, Error::Halted);
+                    return finish_with_grace(
+                        handle,
+                        &state,
+                        Duration::from_secs(FINISH_GRACE_SECS),
+                        Error::Halted,
+                    );
                 }
             }
             if Instant::now() >= deadline {
-                return finish_with_grace(handle, &abandoned, Error::PipelineJoinTimeout);
+                return finish_with_grace(
+                    handle,
+                    &state,
+                    Duration::from_secs(FINISH_GRACE_SECS),
+                    Error::PipelineJoinTimeout,
+                );
             }
             thread::sleep(POLL_INTERVAL);
         }
@@ -1593,5 +1737,133 @@ mod tests {
         }
         let res = pipe.finish_with_halt(None);
         assert!(matches!(res, Ok(190)), "expected Ok(190), got {res:?}");
+    }
+
+    /// A fatal `apply` error must become visible to the PRODUCER, not only to
+    /// `finish()`. The consumer keeps draining after the error (so the producer
+    /// never blocks on a dead receiver), which meant every `send_with_halt`
+    /// returned `Ok` for the rest of the run: on a 60 GB mkv:// mux that hit
+    /// ENOSPC on the first frame, the mux driver read the entire remaining title —
+    /// an hour of optical-drive time — before learning the write had died.
+    #[test]
+    fn send_with_halt_fails_fast_once_apply_has_failed() {
+        struct FailFirst {
+            failed: Arc<AtomicUsize>,
+        }
+        impl Sink<u64> for FailFirst {
+            type Output = ();
+            fn apply(&mut self, _item: u64) -> Result<Flow, Error> {
+                self.failed.fetch_add(1, Ordering::SeqCst);
+                Err(Error::DecryptFailed)
+            }
+            fn close(self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let applied = Arc::new(AtomicUsize::new(0));
+        let pipe = Pipeline::spawn(
+            DEFAULT_PIPELINE_DEPTH,
+            FailFirst {
+                failed: applied.clone(),
+            },
+        )
+        .expect("spawn");
+        let halt = crate::halt::Halt::new();
+        let deadline = Duration::from_secs(5);
+
+        // Feed one item and wait until the consumer has actually applied (and
+        // failed on) it, so the check below is deterministic rather than racy.
+        pipe.send_with_halt(0u64, &halt, deadline)
+            .expect("the first send lands");
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until && applied.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(applied.load(Ordering::SeqCst), 1, "apply ran and failed");
+
+        assert!(pipe.consumer_failed(), "the failure must be observable");
+        // The very next send must hand the item straight back — the producer's
+        // signal to stop reading the disc.
+        assert_eq!(
+            pipe.send_with_halt(1u64, &halt, deadline),
+            Err(1u64),
+            "send_with_halt must fail fast once the consumer's apply has failed"
+        );
+        // The halt was never fired, so this is not a cancellation: the real error
+        // still comes out of finish().
+        assert!(matches!(pipe.finish(), Err(Error::DecryptFailed)));
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            1,
+            "no further item was applied"
+        );
+    }
+
+    /// The abandon/finalise race. A consumer that has ALREADY committed to
+    /// `close()` when the grace period expires cannot be stopped — the finalise is
+    /// happening — so the caller must wait for its result instead of reporting the
+    /// output as un-finalised. With a plain flag the consumer read it as clear, the
+    /// caller then stored it, and the caller returned `Err(Halted)`
+    /// (`completed = false`) while a fully finalised MKV (Cues written, Segment
+    /// size patched) landed on disk — a truncated rip indistinguishable from a
+    /// complete one.
+    #[test]
+    fn abandon_loses_to_a_close_already_committed() {
+        let state = Arc::new(AtomicU8::new(state::RUNNING));
+        let release = Arc::new(AtomicBool::new(false));
+        let in_close = Arc::new(AtomicBool::new(false));
+
+        let (st, rel, inc) = (state.clone(), release.clone(), in_close.clone());
+        let handle = thread::Builder::new()
+            .name("test-consumer".into())
+            .spawn(move || -> Result<u64, Error> {
+                // Exactly what the consumer does before finalising: claim the
+                // right to close.
+                assert!(
+                    st.compare_exchange(
+                        state::RUNNING,
+                        state::CLOSING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire
+                    )
+                    .is_ok(),
+                    "the consumer claims the finalise first"
+                );
+                inc.store(true, Ordering::SeqCst);
+                // Inside `close()`, finalising the container.
+                while !rel.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(42)
+            })
+            .expect("spawn");
+
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until && !in_close.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(in_close.load(Ordering::SeqCst), "consumer reached close()");
+
+        // Finish the close only AFTER the first grace window has expired, so the
+        // caller genuinely reaches the abandon decision with a close in flight.
+        let rel = release.clone();
+        thread::spawn(move || {
+            // Past the first grace window (and past the 250 ms poll cadence that
+            // bounds when the window is actually observed), inside the second.
+            thread::sleep(Duration::from_millis(600));
+            rel.store(true, Ordering::SeqCst);
+        });
+
+        let grace = Duration::from_millis(300);
+        let res = finish_with_grace(handle, &state, grace, Error::Halted);
+        assert!(
+            matches!(res, Ok(42)),
+            "a finalise already in flight must be waited for, not abandoned: {res:?}"
+        );
+        assert_eq!(
+            state.load(Ordering::SeqCst),
+            state::CLOSING,
+            "the caller must not have overwritten the consumer's claim"
+        );
     }
 }
