@@ -720,7 +720,7 @@ pub fn output(
 /// table (keyed by PID), the PID-to-track index map, and an initial
 /// `TsDemuxer` / `PsDemuxer` (whichever the content format calls
 /// for).
-type DemuxState = (
+pub(crate) type DemuxState = (
     Vec<(u16, Box<dyn super::codec::CodecParser>)>,
     Vec<(u16, usize)>,
     Option<super::ts::TsDemuxer>,
@@ -729,7 +729,7 @@ type DemuxState = (
 
 /// Build the title's codec parser table + initial `TsDemuxer` /
 /// `PsDemuxer`. Used by both the ISO and M2TS pipeline builders.
-fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
+pub(crate) fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
     let mut pids = Vec::new();
     let mut parsers = Vec::new();
     let mut pid_to_track = Vec::new();
