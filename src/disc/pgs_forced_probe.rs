@@ -28,13 +28,33 @@ const SECTOR_BYTES: usize = 2048;
 /// Read the clip in 2 MiB chunks.
 const CHUNK_SECTORS: u16 = 1024;
 
+/// Hard ceiling on sectors read per probe call (256 MiB).
+///
+/// The probe's natural exit is "every track has shown a non-forced display set",
+/// which a genuinely FORCED track never satisfies — so on the common authoring
+/// (a forced-narrative track for foreign dialogue) the loop would otherwise read
+/// the title's whole extent set, tens of GB, at optical-drive speed. A forced
+/// track's display sets appear throughout the title, so a bounded prefix is
+/// enough to classify it; the budget only decides how long we keep looking for a
+/// non-forced set before accepting the forced verdict.
+const PROBE_BUDGET_SECTORS: u32 = 131_072;
+
 /// Read the title's PGS streams and set `SubtitleStream::forced` from their
 /// content. Best-effort: any read error ends the probe with whatever verdicts
 /// have accumulated. Only PGS tracks are touched (DVD VobSub forced comes from
 /// the IFO/vendor path).
+/// Memoises probe results across titles. Keyed by the title's exact extent
+/// list, so a hit returns a result computed from byte-identical input — many
+/// playlists on one disc reference the same clips (main feature, play-all,
+/// seamless-branch variants), and without this the same physical extents are
+/// re-read from the drive once per playlist.
+pub(crate) type ForcedProbeCache = HashMap<Vec<(u32, u32)>, HashMap<u16, bool>>;
+
 pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
     reader: &mut S,
     title: &mut DiscTitle,
+    cache: &mut ForcedProbeCache,
+    halt: Option<&crate::halt::Halt>,
 ) {
     let pg_pids: Vec<u16> = title
         .streams
@@ -48,6 +68,17 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
         return;
     }
 
+    // Same extents → same verdicts. Serve from cache rather than re-reading.
+    let key: Vec<(u32, u32)> = title
+        .extents
+        .iter()
+        .map(|e| (e.start_lba, e.sector_count))
+        .collect();
+    if let Some(hit) = cache.get(&key) {
+        apply_verdicts(title, hit);
+        return;
+    }
+
     let mut demux = TsDemuxer::new(&pg_pids);
     let mut parsers: HashMap<u16, PgsParser> =
         pg_pids.iter().map(|&p| (p, PgsParser::new())).collect();
@@ -56,11 +87,18 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
 
     let extents = title.extents.clone();
     let mut buf = vec![0u8; CHUNK_SECTORS as usize * SECTOR_BYTES];
+    let mut sectors_read: u32 = 0;
     'outer: for ext in &extents {
         let mut lba = ext.start_lba;
         let mut remaining = ext.sector_count;
         while remaining > 0 {
-            let count = remaining.min(CHUNK_SECTORS as u32) as u16;
+            // Bounded work and a responsive cancel: without these the probe reads
+            // the entire title whenever a track really is forced.
+            if halt.is_some_and(|h| h.is_cancelled()) || sectors_read >= PROBE_BUDGET_SECTORS {
+                break 'outer;
+            }
+            let budget_left = PROBE_BUDGET_SECTORS - sectors_read;
+            let count = remaining.min(CHUNK_SECTORS as u32).min(budget_left) as u16;
             let want = count as usize * SECTOR_BYTES;
             let n = match reader.read_sectors(lba, count, &mut buf[..want], false) {
                 Ok(n) => n,
@@ -85,6 +123,7 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
             }
             lba += count as u32;
             remaining -= count as u32;
+            sectors_read += count as u32;
         }
     }
 
@@ -97,15 +136,26 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
         }
     }
 
-    // Apply verdicts. Only override a track we actually saw content for — an
-    // undecrypted/unread track keeps its vendor-derived flag.
+    // Collect the verdicts we actually observed, memoise them against this
+    // extent list, and apply. A track we saw no content for is absent from the
+    // map and keeps its vendor-derived flag.
+    let verdicts: HashMap<u16, bool> = trackers
+        .iter()
+        .filter(|(_, t)| t.observed())
+        .map(|(&pid, t)| (pid, t.is_forced()))
+        .collect();
+    cache.insert(key, verdicts.clone());
+    apply_verdicts(title, &verdicts);
+}
+
+/// Set `forced` on every PGS subtitle track named in `verdicts`. A track absent
+/// from the map was never observed and keeps its vendor-derived flag.
+fn apply_verdicts(title: &mut DiscTitle, verdicts: &HashMap<u16, bool>) {
     for s in &mut title.streams {
         if let Stream::Subtitle(sub) = s {
             if sub.codec == Codec::Pgs {
-                if let Some(t) = trackers.get(&sub.pid) {
-                    if t.observed() {
-                        sub.forced = t.is_forced();
-                    }
+                if let Some(&forced) = verdicts.get(&sub.pid) {
+                    sub.forced = forced;
                 }
             }
         }
@@ -168,6 +218,112 @@ mod tests {
         }
     }
 
+    /// A reader that counts sectors served and never runs out — stands in for a
+    /// real title whose forced track means the probe's natural exit never fires.
+    struct EndlessReader {
+        served: u32,
+    }
+    impl SectorSource for EndlessReader {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _skip_errors: bool,
+        ) -> crate::error::Result<usize> {
+            let want = count as usize * SECTOR_BYTES;
+            buf[..want].fill(0);
+            self.served += count as u32;
+            Ok(want)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            u32::MAX
+        }
+    }
+
+    #[test]
+    fn probe_stops_at_the_sector_budget() {
+        // The probe's only natural exit is "every track settled as NOT forced",
+        // which a genuinely forced track never satisfies. Without a budget the
+        // loop reads the whole title — tens of GB off an optical drive.
+        let mut reader = EndlessReader { served: 0 };
+        let mut title = pgs_title(0x1200, true);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: u32::MAX,
+        }];
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+        assert_eq!(
+            reader.served, PROBE_BUDGET_SECTORS,
+            "the probe must stop at exactly the budget, not read the whole extent"
+        );
+    }
+
+    #[test]
+    fn probe_honours_halt() {
+        // `info -v` must stay cancellable: an already-cancelled halt means no
+        // sectors are read at all.
+        let mut reader = EndlessReader { served: 0 };
+        let mut title = pgs_title(0x1200, true);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: u32::MAX,
+        }];
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        probe_and_set_forced(
+            &mut reader,
+            &mut title,
+            &mut ForcedProbeCache::new(),
+            Some(&halt),
+        );
+        assert_eq!(
+            reader.served, 0,
+            "a cancelled halt must stop the probe dead"
+        );
+    }
+
+    #[test]
+    fn identical_extents_are_served_from_cache_not_reread() {
+        // A disc's playlists overwhelmingly share clips. The second title with the
+        // same extent list must cost ZERO further reads, or `info -v` re-reads the
+        // same physical clip once per playlist.
+        let mut reader = EndlessReader { served: 0 };
+        let mut cache = ForcedProbeCache::new();
+
+        let mut first = pgs_title(0x1200, true);
+        first.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: u32::MAX,
+        }];
+        probe_and_set_forced(&mut reader, &mut first, &mut cache, None);
+        let after_first = reader.served;
+        assert!(after_first > 0, "the first title must actually read");
+
+        let mut second = pgs_title(0x1200, true);
+        second.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: u32::MAX,
+        }];
+        probe_and_set_forced(&mut reader, &mut second, &mut cache, None);
+        assert_eq!(
+            reader.served, after_first,
+            "identical extents must be served from cache with no further reads"
+        );
+
+        // A DIFFERENT extent list is a cache miss and must still be probed.
+        let mut third = pgs_title(0x1200, true);
+        third.extents = vec![Extent {
+            start_lba: 9_000,
+            sector_count: u32::MAX,
+        }];
+        probe_and_set_forced(&mut reader, &mut third, &mut cache, None);
+        assert!(
+            reader.served > after_first,
+            "a different extent list must not hit the cache"
+        );
+    }
+
     #[test]
     fn no_observed_content_preserves_vendor_forced() {
         // An unreadable/encrypted clip yields no PGS display sets — the probe must
@@ -175,7 +331,7 @@ mod tests {
         // "not forced" from having seen nothing.
         let mut reader = ZeroReader { served: 0, cap: 4 };
         let mut title = pgs_title(0x1200, true);
-        probe_and_set_forced(&mut reader, &mut title);
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
         let Stream::Subtitle(s) = &title.streams[0] else {
             panic!()
         };
@@ -282,7 +438,7 @@ mod tests {
             pos: 0,
         };
         let mut title = pgs_title(pid, false); // vendor label says NOT forced
-        probe_and_set_forced(&mut reader, &mut title);
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
         let Stream::Subtitle(s) = &title.streams[0] else {
             panic!()
         };
@@ -302,7 +458,7 @@ mod tests {
             pos: 0,
         };
         let mut title = pgs_title(pid, true); // vendor label says forced
-        probe_and_set_forced(&mut reader, &mut title);
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
         let Stream::Subtitle(s) = &title.streams[0] else {
             panic!()
         };
@@ -320,7 +476,7 @@ mod tests {
         let mut title = pgs_title(0x1200, false);
         // Swap the PGS sub for an audio stream so there are no PGS PIDs.
         title.streams.clear();
-        probe_and_set_forced(&mut reader, &mut title);
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
         assert_eq!(reader.served, 0, "no PGS PIDs → no reads");
     }
 }
