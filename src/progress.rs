@@ -1,7 +1,7 @@
 //! Pipeline-progress reporting for the rip pipeline.
 //!
 //! Architecture rule: ONE progress signal type. Every long-running
-//! pipeline operation (`Disc::copy`, `Disc::patch`, `verify_title`) emits the
+//! pipeline operation (`freemkv_engine::recovery::{copy, patch}`) emits the
 //! same [`PassProgress`] shape via the [`Progress`] trait. Consumers (autorip)
 //! compute their own single derived view from these fields and never reach
 //! into per-pass internals.
@@ -18,12 +18,12 @@
 /// (reverse)", "Scrape", "Mux") or just use a generic "Pass N" label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassKind {
-    /// `Disc::copy` — initial sweep across the entire disc.
+    /// `freemkv_engine::recovery::copy` — initial sweep across the entire disc.
     Sweep,
-    /// `Disc::patch` retry pass with `block_sectors >= 2`. `reverse=true`
+    /// `freemkv_engine::recovery::patch` retry pass with `block_sectors >= 2`. `reverse=true`
     /// means walking bad ranges from highest to lowest LBA.
     Trim { reverse: bool },
-    /// `Disc::patch` final pass at 1 sector per block.
+    /// `freemkv_engine::recovery::patch` final pass at 1 sector per block.
     Scrape { reverse: bool },
     /// Demux ISO → output (MKV / M2TS / network). Single phase that runs
     /// after all rip passes complete. The library's mux pipeline does not

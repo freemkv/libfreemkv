@@ -55,48 +55,15 @@ output.finish()?;
 
 ### Multi-pass recovery rip
 
-For damaged discs the library exposes two flat verbs — `Disc::sweep` for the
-forward Pass 1 and `Disc::patch` for retrying bad ranges. The library never
-loops; the multipass policy is the caller's job. See
-[`docs/rip-recovery.md`](docs/rip-recovery.md).
+Recovery moved OUT of this crate in 1.6.0. The sweep/patch strategy, the
+ddrescue mapfile, damage classification and the multipass loop now live in the
+`freemkv-engine` crate as `freemkv_engine::recovery::{copy, sweep, patch}`.
 
-```rust
-use libfreemkv::{SweepOptions, PatchOptions};
-use libfreemkv::disc::{mapfile, mapfile_path_for};
-use std::path::Path;
-
-let iso = Path::new("disc.iso");
-
-// Pass 1: disc → ISO. Skip-on-error, zero-fill, write the sidecar mapfile.
-disc.sweep(&mut drive, iso, &SweepOptions {
-    decrypt: true,
-    resume: false,
-    batch_sectors: None,
-    skip_on_error: true,
-    progress: None,
-    halt: None,
-})?;
-
-// Pass 2..N: retry every non-finished range. Idempotent.
-loop {
-    let map = mapfile::Mapfile::load(&mapfile_path_for(iso))?;
-    let stats = map.stats();
-    if stats.bytes_pending + stats.bytes_unreadable == 0 { break; }
-
-    let outcome = disc.patch(&mut drive, iso, &PatchOptions {
-        decrypt: true,
-        block_sectors: None,
-        full_recovery: true,
-        reverse: true,
-        wedged_threshold: 50,
-        progress: None,
-        halt: None,
-    })?;
-    if outcome.bytes_recovered_this_pass == 0 { break; }
-}
-
-// Mux from the ISO via the normal stream pipeline (no drive involvement).
-```
+libfreemkv keeps the layers underneath: the raw single-shot read
+(`Drive::read`) and the SCSI-fact translation (`SenseFamily`) that the engine's
+strategy is built on. The dependency runs engine → libfreemkv, so this crate
+cannot call into it; front-ends get recovery from the engine directly. See
+[`docs/rip-recovery.md`](docs/rip-recovery.md) for what stayed here.
 
 ## What It Does
 
@@ -114,7 +81,7 @@ loop {
 | Stream | Input | Output | Transport |
 |--------|-------|--------|-----------|
 | DiscStream | Yes | -- | Optical drive via SCSI |
-| IsoStream | Yes | -- | Blu-ray ISO image file (read via stream pipeline; written via `Disc::sweep()`) |
+| IsoStream | Yes | -- | Blu-ray ISO image file (read via stream pipeline; written by `freemkv_engine::recovery`) |
 | MkvStream | Yes | Yes | Matroska container |
 | M2tsStream | Yes | Yes | BD transport stream with FMKV metadata header |
 | NetworkStream | Yes (listen) | Yes (connect) | TCP with FMKV metadata header |

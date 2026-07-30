@@ -79,7 +79,7 @@ Insert disc
      │  Or: read sectors → decrypt → raw bytes (for ISO output)
      │  Drive::read() is single-shot. DiscStream::fill_extents adapts the
      │  batch size on failure (halve / probe-up). Bad-range retry is layer
-     │  1 above this — Disc::patch re-runs against the mapfile.
+     │  1 above this — freemkv_engine::recovery::patch re-runs against the mapfile.
      │
      ▼
   PES frames → output stream (MKV, M2TS, network, etc.)
@@ -123,7 +123,7 @@ output.finish()?;
 | aacs/ | [aacs.md](aacs.md) | Key resolution + content decrypt + bus handshake |
 | css/ | -- | DVD CSS cipher |
 | decrypt.rs | -- | Unified decrypt dispatcher (AACS/CSS/None) |
-| disc/ | [rip-recovery.md](rip-recovery.md) | Disc::scan + Disc::sweep + Disc::patch + mapfile |
+| disc/ | [rip-recovery.md](rip-recovery.md) | Disc::scan (sweep/patch/mapfile moved to freemkv-engine in 1.6.0) |
 | labels/ | -- | BD-J stream labels (5 format parsers) |
 | mux/ | -- | Stream implementations (7 stream types) |
 | pes.rs | -- | PES frame types + FrameSource / FrameSink traits |

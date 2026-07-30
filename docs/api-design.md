@@ -170,17 +170,20 @@ libfreemkv/src/
 │   ├── writeback_file.rs  WritebackFile (was crate::io::Writer)
 │   └── writeback.rs    sync_file_range pipeline
 ├── drive/              Drive (open, init, single-shot read)
-│   ├── mod.rs          Drive struct, init, read (single-shot), reset, eject
+│   ├── mod.rs          Drive struct, init, read (single-shot), eject
 │   ├── capture.rs      Raw drive SCSI capture (INQUIRY/GET_CONFIG) for contribution
 │   ├── linux.rs        Linux drive discovery
 │   ├── macos.rs        macOS drive discovery
 │   └── windows.rs      Windows drive discovery
-├── disc/               Disc (scan, titles, AACS setup, sweep, patch)
-│   ├── mod.rs          Disc struct, scan, titles, formats; Disc::copy + Disc::sweep (Pass 1)
-│   ├── sweep.rs        Pass 1 internal helpers (pub(super))
-│   ├── patch.rs        Disc::patch (Pass N retry over mapfile)
-│   ├── mapfile.rs      ddrescue-format mapfile
-│   └── read_error.rs   ReadCtx / ReadAction state machine
+├── disc/               Disc (scan, titles, AACS setup, per-format parsing)
+│   ├── mod.rs          Disc struct, scan, titles, formats
+│   ├── bluray.rs       Blu-ray / UHD scanning (MPLS/CLPI-driven)
+│   ├── dvd.rs          DVD-Video scanning (IFO-driven)
+│   ├── hddvd.rs        HD-DVD scanning
+│   ├── extract.rs      Per-extent content extraction
+│   ├── encrypt.rs      Encrypted-range mapping for content reads
+│   ├── dvd_audio_probe.rs   DVD audio-stream probing
+│   └── pgs_forced_probe.rs  PGS forced-subtitle probing
 ├── scsi/               SCSI transport (Linux SG_IO, macOS IOKit, Windows SPTI)
 ├── unlock.rs           Unlocker trait + registry (pluggable unlock seam)
 ├── aacs/               AACS decryption (handshake, keys, keydb, decrypt)
