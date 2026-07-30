@@ -1205,4 +1205,292 @@ mod tests {
             .expect_err("soft-correction bit → classified, not a key");
         assert_eq!(err, MediaKeyVariantError::SoftCorrectionRequired);
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // A COMPLETE variant MKB — the AACS 2.1 happy path
+    //
+    // Every other test in this module asserts an ERROR classification, so
+    // until now no test ever drove `derive_media_key_variant` to a Media
+    // Key. That left the whole success path — the VARIANTS lookup, the VKD
+    // selection, the final `Km` unwrap and the verify gate — pinned by
+    // nothing: a body that answered a constant for any of those steps still
+    // produced the same errors these tests expect.
+    //
+    // No real key material is involved. Every AACS 2.1 relation in the chain
+    // is invertible, so the fixture below picks a Media Key and a Processing
+    // Key and computes the MKB records that connect them, exactly as
+    // `derive::position_recovery_tests::plant_mkb` does for the classical
+    // chain.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// A planted variant MKB and the values it was built from.
+    struct PlantedVariant {
+        records: Vec<MkbRecord>,
+        /// The Processing Key that covers slot 0.
+        kp: [u8; 16],
+        /// The Media Key the chain must derive from `kp`.
+        km: [u8; 16],
+        /// The `0x86` Verify-Media-Key block.
+        mk_dv: [u8; 16],
+        /// The `VARIANTS[0]` entry planted in the `0x2d` table.
+        variants0: u16,
+        /// The `0x2d` tail Nonce.
+        nonce: [u8; 16],
+    }
+
+    /// An MKB record: 1-byte type + BE24 total length (header included) + body.
+    fn vrec(t: u8, body: &[u8]) -> Vec<u8> {
+        let total = 4 + body.len();
+        let mut r = vec![
+            t,
+            ((total >> 16) & 0xFF) as u8,
+            ((total >> 8) & 0xFF) as u8,
+            (total & 0xFF) as u8,
+        ];
+        r.extend_from_slice(body);
+        r
+    }
+
+    /// Build a variant MKB by inverting the 2.1 chain for a CHOSEN `(Kp, Km)`.
+    ///
+    /// One subset-difference slot (`uv = 2`, `u_mask_shift = 3`, slot index 0).
+    /// The VKD the chain must land on is planted at index **1** of the `0x2f`
+    /// table, behind a decoy at index 0, so `VARIANTS[0]` is load-bearing: it is
+    /// chosen as `Kvn XOR 1`, and any other value selects the decoy (wrong `Km`,
+    /// rejected by the verify gate) or indexes past the table.
+    fn plant_variant_mkb() -> PlantedVariant {
+        use crate::aacs::crypto::{aes_ecb_encrypt, aes_g};
+
+        const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+        const UV: u32 = 2;
+        const U_MASK_SHIFT: u8 = 3;
+
+        let kp: [u8; 16] = [
+            0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6, 0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF,
+            0x4F, 0x3C,
+        ];
+        let km: [u8; 16] = [
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD,
+            0xCE, 0xCF,
+        ];
+        let nonce: [u8; 16] = [
+            0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D,
+            0x3E, 0x3F,
+        ];
+        let uv_bytes = UV.to_be_bytes();
+
+        // ── Verify-Media-Key record (0x86): AES-D(Km, mk_dv) opens with the
+        // magic ([C] §3.2.5.1.4), so mk_dv = AES-E(Km, magic || padding).
+        let mut vd = [0x5Au8; 16];
+        vd[..8].copy_from_slice(&VERIFY_MAGIC);
+        let mk_dv = aes_ecb_encrypt(&km, &vd);
+
+        // ── C (0x0c): the chain computes Kmp = AES-D(Kp, C) XOR uv. Pick a Kmp
+        // with BOTH condition bits on byte 15 clear (0x02 soft-correction,
+        // 0x04 online challenge) so the default KCD path runs, then invert.
+        let mut kmp = [0x42u8; 16];
+        kmp[15] = 0x40; // neither 0x02 nor 0x04
+        let mut c_plain = kmp;
+        for i in 0..4 {
+            c_plain[12 + i] ^= uv_bytes[i];
+        }
+        let c_block = aes_ecb_encrypt(&kp, &c_plain);
+
+        // ── Kpnew = Kmp XOR KCD. Read through the production constant rather
+        // than assuming it is zero, so the fixture stays valid if a real
+        // per-licensee KCD is ever wired in (see `KEY_CORRECTION_DATA`).
+        let mut kpnew = [0u8; 16];
+        for i in 0..16 {
+            kpnew[i] = kmp[i] ^ KEY_CORRECTION_DATA[i];
+        }
+
+        // ── VKD: the chain computes Km = AES-D(Kpnew, VKD) XOR uv, so
+        // VKD = AES-E(Kpnew, Km with uv XORed back into its low 4 bytes).
+        let mut km_pre = km;
+        for i in 0..4 {
+            km_pre[12 + i] ^= uv_bytes[i];
+        }
+        let vkd = aes_ecb_encrypt(&kpnew, &km_pre);
+
+        // ── VARIANTS[0]: VKD_idx = Kvn XOR VARIANTS[uv], and we planted the
+        // real VKD at table index 1, so VARIANTS[0] = Kvn XOR 1.
+        // Kvn = low 16 bits (BE) of AES-G(Kp, Nonce).
+        let kvn_block = aes_g(&kp, &nonce);
+        let kvn = u16::from_be_bytes([kvn_block[14], kvn_block[15]]);
+        let variants0 = kvn ^ 1;
+
+        // ── Assemble.
+        let mut mkb = Vec::new();
+        mkb.extend_from_slice(&vrec(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]));
+        // 0x04 subset-difference: one slot.
+        let mut subdiff = vec![U_MASK_SHIFT];
+        subdiff.extend_from_slice(&uv_bytes);
+        mkb.extend_from_slice(&vrec(0x04, &subdiff));
+        // 0x0c per-slot C table: one 16-byte entry.
+        mkb.extend_from_slice(&vrec(0x0c, &c_block));
+        // 0x86 Verify-Media-Key.
+        mkb.extend_from_slice(&vrec(0x86, &mk_dv));
+        // 0x2d: VARIANTS table (one BE u16) then the 16-byte tail Nonce.
+        let mut vdata = Vec::new();
+        vdata.extend_from_slice(&variants0.to_be_bytes());
+        vdata.extend_from_slice(&nonce);
+        mkb.extend_from_slice(&vrec(0x2d, &vdata));
+        // 0x2f VKD table: a decoy at index 0, the real VKD at index 1.
+        let mut vkd_table = vec![0x9Au8; 16];
+        vkd_table.extend_from_slice(&vkd);
+        mkb.extend_from_slice(&vrec(0x2f, &vkd_table));
+
+        PlantedVariant {
+            records: walk_mkb(&mkb),
+            kp,
+            km,
+            mk_dv,
+            variants0,
+            nonce,
+        }
+    }
+
+    /// Sanity-check the fixture before anything is asserted through it: an MKB
+    /// the record finders cannot read would make every "returns an error" body
+    /// look correct.
+    #[test]
+    fn the_planted_variant_mkb_is_a_well_formed_variant_mkb() {
+        let p = plant_variant_mkb();
+        assert!(is_variant_mkb(&p.records), "0x2d/0x2f present");
+        assert_eq!(variant_nonce(&p.records), Some(p.nonce), "tail Nonce");
+        assert_eq!(
+            variant_key_data(&p.records).map(<[u8]>::len),
+            Some(32),
+            "two 16-byte VKD entries"
+        );
+        assert_eq!(
+            variant_uv_slots(&p.records),
+            Some(vec![(2u32, 0usize)]),
+            "one subset-difference slot at index 0 with uv=2"
+        );
+    }
+
+    /// THE happy path: a Processing Key covering slot 0 of a complete variant
+    /// MKB must derive the planted Media Key.
+    ///
+    /// This is the assertion the whole 2.1 chain hangs from — `derive_media_key_variant`
+    /// is what `resolve` calls for a 2.1 disc, and its output becomes the VUK,
+    /// the title keys and every decrypted byte. The assertion lands on the FINAL
+    /// derived Media Key, so no intermediate step (VARIANTS lookup, VKD index,
+    /// Kpnew, the unwrap) can be replaced by a constant and still pass.
+    #[test]
+    fn variant_chain_derives_the_planted_media_key_for_a_covering_kp() {
+        let p = plant_variant_mkb();
+        assert_eq!(
+            derive_media_key_variant(&p.records, &p.kp),
+            Ok(p.km),
+            "a covering 2.1 Processing Key must derive the planted Media Key"
+        );
+    }
+
+    /// The other direction: a Processing Key one bit away must NOT yield a key.
+    /// The terminal Verify-Media-Key gate is what stands between a wrong Kp and
+    /// a wrong Media Key silently propagating into the VUK and title keys.
+    #[test]
+    fn variant_chain_yields_no_key_for_a_kp_one_bit_away() {
+        let p = plant_variant_mkb();
+        let mut stranger = p.kp;
+        stranger[0] ^= 0x01;
+        let got = derive_media_key_variant(&p.records, &stranger);
+        assert!(
+            got.is_err(),
+            "a non-covering Kp must never produce a Media Key, got {got:?}"
+        );
+        assert_ne!(got, Ok(p.km));
+    }
+
+    /// `mkb_find_mk_dv` supplies the block the terminal verify gate compares
+    /// against. A body answering a FIXED block would make the gate compare every
+    /// derived Media Key against a record no disc carries: on a real disc every
+    /// correct key is rejected (2.1 discs stop resolving entirely), and any key
+    /// that happened to open the fixed block would be accepted wholesale.
+    #[test]
+    fn mkb_find_mk_dv_returns_the_verify_records_actual_bytes() {
+        let p = plant_variant_mkb();
+        assert_eq!(
+            mkb_find_mk_dv(&p.records),
+            Some(p.mk_dv),
+            "mk_dv must be the bytes the 0x86 record carries"
+        );
+        assert_ne!(mkb_find_mk_dv(&p.records), Some([0u8; 16]));
+        assert_ne!(mkb_find_mk_dv(&p.records), Some([1u8; 16]));
+
+        // And it is the block the gate actually uses: swapping the 0x86 record
+        // for an unrelated one must break the derivation that just succeeded.
+        let mut recs = p.records.clone();
+        let v = recs
+            .iter_mut()
+            .find(|r| r.rec_type == 0x86)
+            .expect("verify record present");
+        v.body = vec![0x00; 16];
+        assert!(
+            derive_media_key_variant(&recs, &p.kp).is_err(),
+            "with a foreign verify block the same Kp must no longer verify"
+        );
+    }
+
+    /// `variants_for_uv` reads `VARIANTS[slot]` — the value XORed with `Kvn` to
+    /// index the VKD table. A body answering a constant picks the WRONG VKD
+    /// entry for every disc, so the derived Media Key fails the verify gate and
+    /// every 2.1 variant disc reports `ProcessingKeyUnavailable` with a
+    /// perfectly good Processing Key in hand.
+    ///
+    /// Asserted two ways: the exact planted table entry, and — the load-bearing
+    /// one — that this entry is what carries the chain to the planted Media Key.
+    #[test]
+    fn variants_for_uv_reads_the_planted_table_entry_that_selects_the_vkd() {
+        let p = plant_variant_mkb();
+        assert_eq!(
+            variants_for_uv(&p.records, 0),
+            Some(p.variants0),
+            "slot 0 must read the planted VARIANTS entry"
+        );
+        // The planted entry is Kvn ^ 1 (the real VKD sits at table index 1), so
+        // it is neither 0 nor 1 — a constant body is a different value here.
+        assert_ne!(variants_for_uv(&p.records, 0), Some(0));
+        assert_ne!(variants_for_uv(&p.records, 0), Some(1));
+
+        // Perturbing ONLY the VARIANTS entry breaks the derivation: proof the
+        // value this function returns is the one that selects the VKD.
+        let mut recs = p.records.clone();
+        let d = recs
+            .iter_mut()
+            .find(|r| r.rec_type == 0x2d)
+            .expect("0x2d present");
+        d.body[0] ^= 0x80;
+        assert!(
+            derive_media_key_variant(&recs, &p.kp).is_err(),
+            "a different VARIANTS entry must select a different VKD and fail the gate"
+        );
+    }
+
+    /// The `0x2d` body is `VARIANTS` table then a 16-byte tail Nonce. A slot
+    /// index whose entry would fall inside the Nonce must be refused rather than
+    /// read Nonce bytes as a VARIANTS value.
+    #[test]
+    fn variants_for_uv_stops_before_the_tail_nonce() {
+        // Three-entry table with distinct values, then the Nonce.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x1234u16.to_be_bytes());
+        body.extend_from_slice(&0xABCDu16.to_be_bytes());
+        body.extend_from_slice(&0x00FFu16.to_be_bytes());
+        let nonce = [0x77u8; 16];
+        body.extend_from_slice(&nonce);
+        let recs = walk_mkb(&vrec(0x2d, &body));
+
+        assert_eq!(variants_for_uv(&recs, 0), Some(0x1234));
+        assert_eq!(variants_for_uv(&recs, 1), Some(0xABCD));
+        assert_eq!(variants_for_uv(&recs, 2), Some(0x00FF));
+        assert_eq!(
+            variants_for_uv(&recs, 3),
+            None,
+            "slot 3 starts inside the Nonce — must be refused, not read"
+        );
+        assert_eq!(variant_nonce(&recs), Some(nonce), "the Nonce is the tail");
+    }
 }

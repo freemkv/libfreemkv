@@ -450,6 +450,64 @@ mod tests {
         }
     }
 
+    /// `descramble_matches` is the ONLY gate between the LFSR search and a key
+    /// handed back to the caller: both [`recover_title_key`] and the crib-driven
+    /// `crack_title_key_inner` return a candidate only if this says the key
+    /// really descrambles the sector to the known plaintext. A body that always
+    /// answered `true` would let the first spurious LFSR-seed match through as
+    /// the title key — the ripper would then descramble the whole title with a
+    /// key that opens nothing, producing garbage rather than a "no key" error.
+    ///
+    /// Pinned both directions: the genuine key is accepted, and EVERY key one
+    /// bit away from it is rejected. The one-bit neighbours are the strongest
+    /// form of wrong key — a gate that only rejects wildly different keys would
+    /// still pass a near-miss out of the 2^16 seed search.
+    #[test]
+    fn descramble_matches_accepts_only_the_key_the_sector_was_scrambled_with() {
+        let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
+        let seed = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+        let (sector, _body) = synth_sector(&title_key, &seed, &PES);
+
+        assert!(
+            descramble_matches(&sector, &title_key, &PES),
+            "the key the sector was scrambled with must be accepted"
+        );
+
+        for byte in 0..5usize {
+            for bit in 0..8u32 {
+                let mut wrong = title_key;
+                wrong[byte] ^= 1u8 << bit;
+                assert!(
+                    !descramble_matches(&sector, &wrong, &PES),
+                    "key differing only in byte {byte} bit {bit} must be rejected"
+                );
+            }
+        }
+    }
+
+    /// The gate is applied to a COPY: verifying a candidate must not modify the
+    /// caller's sector. `recover_title_key` runs the gate and then hands the
+    /// sector on to be descrambled for real — if verification descrambled in
+    /// place, that second descramble would run over already-transformed bytes
+    /// (and, worse, a rejected candidate would leave the sector corrupted).
+    #[test]
+    fn descramble_matches_does_not_disturb_the_caller_s_sector() {
+        let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
+        let seed = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+        let (sector, _body) = synth_sector(&title_key, &seed, &PES);
+        let before = sector.clone();
+
+        assert!(descramble_matches(&sector, &title_key, &PES));
+        let mut wrong = title_key;
+        wrong[0] ^= 0x01;
+        assert!(!descramble_matches(&sector, &wrong, &PES));
+
+        assert_eq!(
+            sector, before,
+            "verification must leave the sector byte-for-byte unchanged"
+        );
+    }
+
     /// MANDATORY (Task C.1): the crib-based entry point crack_title_key —
     /// no plaintext supplied — recovers a round-tripping key when the
     /// cleartext ends in a periodic run that continues into 0x80.

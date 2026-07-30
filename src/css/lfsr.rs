@@ -443,6 +443,49 @@ mod tests {
         );
     }
 
+    /// The length guard is a FLOOR, not a ceiling: `descramble_sector` is a
+    /// no-op below one sector, and processes the FIRST sector of anything at
+    /// least that long (the loop is `.take(2048)`). `css::descramble_sector` is
+    /// a public entry taking `&mut [u8]` of any length, so a caller handing it a
+    /// multi-sector buffer must get its first sector descrambled — a guard that
+    /// rejected over-long buffers would hand that caller its ciphertext back
+    /// unchanged, with the scramble flag cleared as if it had worked.
+    #[test]
+    fn descramble_processes_the_first_sector_of_an_over_long_buffer() {
+        let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let seed = [0xDE, 0xAD, 0xBE, 0xEF, 0x42];
+
+        // Two sectors' worth of buffer; only the first is a sector.
+        let mut buf = vec![0xAAu8; 4096];
+        buf[0x14] = 0x30;
+        buf[0x54..0x59].copy_from_slice(&seed);
+        let original = buf.clone();
+
+        descramble_sector(&title_key, &mut buf);
+
+        assert_ne!(
+            &buf[0x80..0x800],
+            &original[0x80..0x800],
+            "the first sector's body must be descrambled"
+        );
+        assert_eq!(buf[0x14] & 0x30, 0x00, "and its scramble flag cleared");
+        assert_eq!(
+            &buf[2048..4096],
+            &original[2048..4096],
+            "bytes past the first sector must be left untouched"
+        );
+
+        // The result must equal what a caller gets by passing exactly one
+        // sector — the same transform, not a length-dependent one.
+        let mut one = original[..2048].to_vec();
+        descramble_sector(&title_key, &mut one);
+        assert_eq!(
+            &buf[..2048],
+            &one[..],
+            "the first sector must descramble identically either way"
+        );
+    }
+
     /// Descramble is keyed by `title_key XOR seed`: two different title keys
     /// produce two different bodies for the same scrambled input. A cipher that
     /// ignored the title key (or mixed it in wrongly) would yield identical

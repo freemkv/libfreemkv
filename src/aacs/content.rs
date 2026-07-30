@@ -1564,6 +1564,95 @@ mod tests {
         assert_eq!(ts_sync_count(&unit), 1);
     }
 
+    // ── the encrypted-flag readers ────────────────────────────────────────
+
+    /// `aacs_unit_seed_encrypted` is the flag reader for a PARTIAL unit — the
+    /// guard that stops a truncated encrypted fragment from being emitted as
+    /// clear content. It reads ONLY the two Copy Permission Indicator bits
+    /// ([BD] §3.10.2, byte 0 bits 6-7); the remaining six bits are
+    /// `TP_extra_header` arrival-timestamp bits and carry no encryption
+    /// meaning.
+    ///
+    /// Both failure directions are damaging and silent: a reader that answers
+    /// "encrypted" for a clear fragment discards good content, and one that
+    /// answers "clear" for an encrypted fragment writes ciphertext into the
+    /// output as if it were video.
+    #[test]
+    fn aacs_unit_seed_encrypted_reads_only_the_two_cpi_bits() {
+        use crate::disc::ContentFormat::BdTs;
+
+        // CPI bits clear → NOT encrypted, whatever the ATS bits say.
+        for ats in 0u8..=0x3F {
+            assert!(
+                !aacs_unit_seed_encrypted(&[ats], BdTs),
+                "byte0={ats:#04x} has both CPI bits clear → not encrypted"
+            );
+        }
+
+        // Either CPI bit set → encrypted, whatever the ATS bits say.
+        for &cpi in &[0x40u8, 0x80, 0xC0] {
+            assert!(
+                aacs_unit_seed_encrypted(&[cpi], BdTs),
+                "byte0={cpi:#04x} has a CPI bit set → encrypted"
+            );
+            assert!(
+                aacs_unit_seed_encrypted(&[cpi | 0x3F], BdTs),
+                "ATS bits must not change the answer"
+            );
+        }
+
+        // Too short to hold the flag → false rather than a panic.
+        assert!(!aacs_unit_seed_encrypted(&[], BdTs));
+    }
+
+    /// The MpegPs (HD-DVD `.evo`) side reads `PES_scrambling_control` at its own
+    /// fixed offset, and a fragment shorter than that offset must be reported
+    /// clear rather than panic.
+    #[test]
+    fn aacs_unit_seed_encrypted_reads_the_ps_scramble_flag_or_says_clear() {
+        use crate::disc::ContentFormat::MpegPs;
+
+        let mut frag = vec![0u8; PS_SCRAMBLE_OFF + 1];
+        assert!(!aacs_unit_seed_encrypted(&frag, MpegPs), "flag byte zero");
+        frag[PS_SCRAMBLE_OFF] = PS_SCRAMBLE_MASK;
+        assert!(aacs_unit_seed_encrypted(&frag, MpegPs), "flag byte set");
+        // Bits outside the mask are not the scrambling control.
+        frag[PS_SCRAMBLE_OFF] = !PS_SCRAMBLE_MASK;
+        assert!(!aacs_unit_seed_encrypted(&frag, MpegPs), "outside the mask");
+        // A fragment that stops short of the flag byte is not classifiable.
+        assert!(!aacs_unit_seed_encrypted(&frag[..PS_SCRAMBLE_OFF], MpegPs));
+    }
+
+    /// `aacs_unit_encrypted` is the AUTHORITATIVE gate and requires a WHOLE
+    /// 6144-byte aligned unit: on anything shorter the flag byte is not
+    /// guaranteed to be the unit's, so it must answer `false` and leave the
+    /// partial-unit case to `aacs_unit_seed_encrypted`. A reversed length guard
+    /// would both classify fragments off arbitrary mid-stream bytes and, on an
+    /// empty slice, index out of bounds.
+    #[test]
+    fn aacs_unit_encrypted_requires_a_whole_aligned_unit() {
+        use crate::disc::ContentFormat::BdTs;
+
+        // A short buffer whose byte 0 has the CPI bits set is still NOT a unit.
+        let mut short = vec![0u8; ALIGNED_UNIT_LEN - 1];
+        short[0] = 0xC0;
+        assert!(
+            !aacs_unit_encrypted(&short, BdTs),
+            "a sub-unit buffer must not be classified"
+        );
+        assert!(!aacs_unit_encrypted(&[], BdTs), "empty must not index");
+
+        // Exactly one aligned unit IS classified.
+        let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+        unit[0] = 0xC0;
+        assert!(
+            aacs_unit_encrypted(&unit, BdTs),
+            "a full unit with CPI set is encrypted"
+        );
+        unit[0] = 0x00;
+        assert!(!aacs_unit_encrypted(&unit, BdTs), "CPI clear is not");
+    }
+
     #[test]
     fn ts_packet_total_for_various_lengths() {
         // total = len / 192 (BD-TS packet size). Pin a few lengths.
