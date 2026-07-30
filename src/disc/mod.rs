@@ -70,6 +70,12 @@ pub struct Disc {
     /// plaintext garbage. `None` when no scrambled sector was seen (genuinely
     /// unencrypted) or a key was recovered (`css.is_some()`). The CSS analogue
     /// of [`Self::aacs_error`].
+    ///
+    /// This records the MAIN feature's crack, so it is a WHOLE-DISC signal: the
+    /// gates convert it into [`crate::error::Error::CssNoDiscKey`] (disc-level,
+    /// `error::is_disc_level_no_key`), not the per-title
+    /// [`crate::error::Error::CssKeyMissing`] the field itself carries as its
+    /// recorded reason.
     pub css_error: Option<crate::error::Error>,
     /// Content format (BD transport stream vs DVD program stream)
     pub content_format: ContentFormat,
@@ -2530,10 +2536,13 @@ impl Disc {
     /// The verdict, in order:
     /// - `raw == true` → `Ok(())`. `--raw` intentionally skips decryption and
     ///   needs no key (the caller wants an encrypted image).
-    /// - `self.css_error.is_some()` → `Err(Error::CssKeyMissing)`. The scan saw
+    /// - `self.css_error.is_some()` → `Err(Error::CssNoDiscKey)`. The scan saw
     ///   scrambled CSS sectors but recovered no title key (`self.css` is `None`
     ///   yet the content IS encrypted). Treating `css.is_none()` as
-    ///   "unencrypted" would mux scrambled MPEG as plaintext garbage.
+    ///   "unencrypted" would mux scrambled MPEG as plaintext garbage. A
+    ///   DISC-LEVEL verdict (`error::is_disc_level_no_key`) — the main feature's
+    ///   crack failed, so every title fails the same way and the rip loop must
+    ///   stop rather than skip each title in turn.
     /// - AACS-encrypted (`self.aacs.is_some()`) with no usable key
     ///   (`decrypt_keys()` is `None`) → `Err(Error::NoDiscKey { .. })`, naming
     ///   the disc by hash.
@@ -2567,9 +2576,15 @@ impl Disc {
             return Ok(());
         }
         // Scrambled-but-uncracked CSS: the disc is encrypted but `css` is None,
-        // so the key check below can't see it. Surface the recorded hard error.
+        // so the key check below can't see it. `css_error` records the MAIN
+        // feature's crack, so this is a WHOLE-DISC verdict — every title would
+        // fail identically — and it is raised as `CssNoDiscKey` (disc-level,
+        // `error::is_disc_level_no_key`), never as the per-title
+        // `CssKeyMissing` (`error::is_skippable_title_stub`). Raised as the
+        // latter, an undecryptable disc made the rip loop iterate all N titles
+        // logging "title skipped, it was an empty stub" and exit 0.
         if self.css_error.is_some() {
-            return Err(Error::CssKeyMissing);
+            return Err(Error::CssNoDiscKey);
         }
         // Decryption is needed iff the disc carries cipher state. A no-key
         // verdict on a non-encrypted disc is impossible here (the disc has no
@@ -2726,12 +2741,20 @@ impl Disc {
         // detection missed — exactly the case the per-title crack exists to catch.
         // Without this, an uncrackable DVD title would fall through to `Ok` and mux
         // scrambled sectors as corrupt PES at exit 0.
+        //
+        // `CssKeyMissing` (per-title, `error::is_skippable_title_stub`) is the
+        // RIGHT code here and must stay: this is one title of a multi-VTS disc,
+        // and a sibling title in another VTS may still crack its own key, so an
+        // all-titles rip skips this one and finishes the rest. The whole-disc
+        // failure — nothing on the disc cracked — is the gate above's
+        // `CssNoDiscKey`.
         if self.format == DiscFormat::Dvd && !title_is_clear && !keys.is_encrypted() {
             return Err(Error::CssKeyMissing);
         }
         // A usable per-title key was resolved (a freshly-cracked CSS key, or AACS
         // unit keys) — the title IS decryptable, so pass it WITHOUT consulting the
-        // disc-wide gate. `ensure_decryptable_keys` hard-fails on `self.css_error`
+        // disc-wide gate. `ensure_decryptable_keys` hard-fails (disc-level,
+        // `CssNoDiscKey`) on `self.css_error`
         // unconditionally, which reflects the MAIN feature's crack: a bonus title
         // in a different VTS that just cracked its own key must not be blocked by
         // the main title having failed.
@@ -3914,8 +3937,10 @@ mod tests {
     }
 
     /// CSS scrambled-but-uncracked (the keyless crack failed): `css` is None but
-    /// `css_error` is Some — the disc IS encrypted. The gate must fail with
-    /// CssKeyMissing rather than read `css.is_none()` as "unencrypted".
+    /// `css_error` is Some — the disc IS encrypted. The gate must fail rather
+    /// than read `css.is_none()` as "unencrypted", and with the DISC-LEVEL
+    /// `CssNoDiscKey` (not the per-title, skippable `CssKeyMissing`): `css_error`
+    /// reflects the main feature's crack, so every title fails identically.
     #[test]
     fn ensure_decryptable_css_error_errors() {
         let mut disc = make_test_disc(1000, "DVD");
@@ -3924,9 +3949,60 @@ mod tests {
         let err = disc
             .ensure_decryptable(false)
             .expect_err("scrambled-but-uncracked CSS must error");
-        assert_eq!(err.code(), crate::error::Error::CssKeyMissing.code());
+        assert_eq!(err.code(), crate::error::Error::CssNoDiscKey.code());
         // --raw is exempt.
         assert!(disc.ensure_decryptable(true).is_ok());
+    }
+
+    /// The two CSS no-key conditions are NOT the same verdict and must classify
+    /// oppositely through the public predicates:
+    ///
+    /// - **disc-wide** — `css_error` is set: the MAIN feature's crack failed, so
+    ///   every title of this disc fails identically. Must be
+    ///   [`crate::error::is_disc_level_no_key`] (the rip loop fail-fasts) and
+    ///   must NOT be [`crate::error::is_skippable_title_stub`]. While both
+    ///   conditions shared `E_CSS_KEY_MISSING`, an uncrackable CSS disc iterated
+    ///   all N titles logging "title skipped" and exited 0 — a total failure
+    ///   reported as success.
+    /// - **per-title** — one title's own re-crack failed on a multi-VTS disc
+    ///   (`title_is_clear == false`, no key): skipping it and finishing the rest
+    ///   is correct policy, so it must STAY skippable and must NOT be disc-level.
+    ///
+    /// Pinned in both directions so a future change cannot silently flip either.
+    #[test]
+    fn css_disc_wide_no_key_is_disc_level_while_per_title_stays_skippable() {
+        // Disc-wide: the scan saw scrambled sectors and recovered no key.
+        let mut disc = make_test_disc(1000, "DVD");
+        disc.encrypted = true;
+        disc.css_error = Some(crate::error::Error::CssKeyMissing);
+        let wide: std::io::Error = disc
+            .ensure_decryptable(false)
+            .expect_err("scrambled-but-uncracked CSS disc must error")
+            .into();
+        assert!(
+            crate::error::is_disc_level_no_key(&wide),
+            "a whole-disc CSS crack failure must classify as disc-level: {wide}"
+        );
+        assert!(
+            !crate::error::is_skippable_title_stub(&wide),
+            "a whole-disc CSS crack failure must NOT be a skippable title stub: {wide}"
+        );
+
+        // Per-title: this title's VTS could not be re-cracked; the rest of the
+        // disc may still rip.
+        let (stub_disc, _) = css_disc_with_clear_stub();
+        let per_title: std::io::Error = stub_disc
+            .ensure_title_decryptable(false, &crate::decrypt::DecryptKeys::None, false)
+            .expect_err("scrambled-uncracked title must error")
+            .into();
+        assert!(
+            crate::error::is_skippable_title_stub(&per_title),
+            "a per-title CSS re-crack failure must stay skippable: {per_title}"
+        );
+        assert!(
+            !crate::error::is_disc_level_no_key(&per_title),
+            "a per-title CSS re-crack failure must NOT stop the whole rip: {per_title}"
+        );
     }
 
     /// CSS-keyless-crack SUCCESS: `css` is Some with a title key → proceed.

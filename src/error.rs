@@ -91,6 +91,16 @@ pub const E_CSS_KEY_MISSING: u16 = 7023;
 pub const E_AACS_NO_HOST_CERT: u16 = 7024;
 pub const E_AACS_BUS_KEY_UNAVAILABLE: u16 = 7025;
 pub const E_FMTS_KEY_MISSING: u16 = 7026;
+/// The CSS disc as a WHOLE could not be decrypted — the scan saw scrambled
+/// sectors and the known-plaintext crack recovered no title key at all, so every
+/// title will fail identically. The CSS analogue of [`E_NO_DISC_KEY`], and
+/// deliberately NOT [`E_CSS_KEY_MISSING`], which [`is_skippable_title_stub`]
+/// treats as one skippable per-title stub: while both conditions shared
+/// `E_CSS_KEY_MISSING`, an uncrackable CSS disc was iterated title by title,
+/// each one logged as skipped, and the run exited reporting success — a total
+/// failure reported as success. [`is_disc_level_no_key`] classifies this code, so
+/// a multi-title rip loop fails fast on it.
+pub const E_CSS_NO_DISC_KEY: u16 = 7027;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -419,7 +429,24 @@ pub enum Error {
     /// title (e.g. a multi-VTS DVD where the title's VTS could not be
     /// re-cracked). Muxing would emit scrambled ciphertext, so the caller
     /// fails fast instead. CSS analogue of [`Error::NoDiscKey`].
+    ///
+    /// PER-TITLE by construction: a sibling title in another VTS may still crack
+    /// its own key, so [`is_skippable_title_stub`] classifies this code and an
+    /// all-titles rip skips the title and finishes the rest. The whole-disc
+    /// counterpart — the main feature's crack failed, so nothing on the disc can
+    /// be decrypted — is [`Error::CssNoDiscKey`].
     CssKeyMissing,
+    /// The disc is CSS-encrypted and decryption was requested, but the
+    /// known-plaintext crack recovered NO title key for the disc at all (the scan
+    /// saw scrambled sectors and stamped `Disc::css_error`). A whole-disc
+    /// condition: every title would fail the same way, so a multi-title rip loop
+    /// must stop instead of iterating. The CSS analogue of [`Error::NoDiscKey`]
+    /// on the disc-wide axis, and classified by [`is_disc_level_no_key`] — NOT by
+    /// [`is_skippable_title_stub`], which owns the per-title
+    /// [`Error::CssKeyMissing`]. Raising this as `CssKeyMissing` (as the disc-wide
+    /// gate once did) makes an undecryptable disc log one "title skipped" notice
+    /// per title and exit successfully.
+    CssNoDiscKey,
     /// The live-drive AACS cert-auth handshake (the OEM/AACS baseline route)
     /// could not run because NO host certificate was available from any key
     /// source. Host certs are keysource-served, never compiled in, so without
@@ -687,6 +714,7 @@ impl Error {
             Error::VidCdbUnavailable => E_VID_CDB_UNAVAILABLE,
             Error::NoDiscKey { .. } => E_NO_DISC_KEY,
             Error::CssKeyMissing => E_CSS_KEY_MISSING,
+            Error::CssNoDiscKey => E_CSS_NO_DISC_KEY,
             Error::AacsNoHostCert { .. } => E_AACS_NO_HOST_CERT,
             Error::AacsBusKeyUnavailable => E_AACS_BUS_KEY_UNAVAILABLE,
             Error::FmtsKeyMissing => E_FMTS_KEY_MISSING,
@@ -1029,6 +1057,13 @@ fn io_error_code(e: &std::io::Error) -> Option<u16> {
 /// worth silently passing over by a run that then exited successfully. They now
 /// carry their own codes and are fatal here — as is
 /// [`Error::MuxHeaderBufferExceeded`].
+///
+/// Nor is a WHOLE-DISC key failure. [`Error::CssNoDiscKey`] (the disc's CSS
+/// crack recovered no key at all) is the same conflation on the decrypt axis:
+/// while it too was raised as [`Error::CssKeyMissing`], every title of an
+/// undecryptable disc classified as a skippable stub, so the rip loop skipped
+/// all of them and exited successfully. It is [`is_disc_level_no_key`]'s, and
+/// fatal here.
 pub fn is_skippable_title_stub(e: &std::io::Error) -> bool {
     matches!(io_error_code(e), Some(E_MKV_INVALID | E_CSS_KEY_MISSING))
 }
@@ -1046,14 +1081,21 @@ pub fn is_halt(e: &std::io::Error) -> bool {
 /// the disc as a whole cannot be decrypted, so EVERY title will fail the same
 /// way. Distinct from a per-title skippable stub
 /// ([`is_skippable_title_stub`]): `E_NO_DISC_KEY` (keydb present but no entry
-/// for this disc), `E_KEYDB_LOAD` (no keydb at all), and `E_AACS_NO_KEYS` (no
-/// usable AACS key material) are all whole-disc conditions. A multi-title rip
-/// loop should stop immediately on this (fail-fast) rather than iterate every
-/// title re-printing the same error.
+/// for this disc), `E_KEYDB_LOAD` (no keydb at all), `E_AACS_NO_KEYS` (no
+/// usable AACS key material), and `E_CSS_NO_DISC_KEY` (the CSS crack recovered
+/// no title key for the disc at all) are all whole-disc conditions. A
+/// multi-title rip loop should stop immediately on this (fail-fast) rather than
+/// iterate every title re-printing the same error.
+///
+/// `E_CSS_NO_DISC_KEY` is the CSS side of exactly that split, and it exists
+/// because the disc-wide CSS failure used to be raised as the per-title
+/// [`E_CSS_KEY_MISSING`]: an undecryptable CSS disc landed in
+/// [`is_skippable_title_stub`], so the rip loop skipped all N titles with an
+/// "empty stub" notice and exited successfully.
 pub fn is_disc_level_no_key(e: &std::io::Error) -> bool {
     matches!(
         io_error_code(e),
-        Some(E_NO_DISC_KEY | E_KEYDB_LOAD | E_AACS_NO_KEYS)
+        Some(E_NO_DISC_KEY | E_KEYDB_LOAD | E_AACS_NO_KEYS | E_CSS_NO_DISC_KEY)
     )
 }
 
@@ -1205,6 +1247,49 @@ mod tests {
         assert!(!is_skippable_title_stub(&cap));
     }
 
+    /// The two CSS no-key conditions must land on OPPOSITE sides of the
+    /// per-title / whole-disc split, and the AACS pair must keep doing the same.
+    ///
+    /// [`Error::CssNoDiscKey`] is the disc-wide verdict (the main feature's crack
+    /// failed, so every title fails identically) and belongs ONLY to
+    /// [`is_disc_level_no_key`], exactly like its AACS analogue
+    /// [`Error::NoDiscKey`]. [`Error::CssKeyMissing`] is the per-title verdict
+    /// (one VTS of a multi-VTS DVD could not be re-cracked) and belongs ONLY to
+    /// [`is_skippable_title_stub`], so an all-titles rip skips that title and
+    /// finishes the rest. While the disc-wide raise also used
+    /// `E_CSS_KEY_MISSING`, an uncrackable CSS disc was iterated title by title,
+    /// each one "skipped", and the run exited 0.
+    #[test]
+    fn css_no_key_codes_split_disc_level_from_skippable() {
+        let wide: std::io::Error = Error::CssNoDiscKey.into();
+        assert!(
+            is_disc_level_no_key(&wide),
+            "the disc-wide CSS no-key code must be disc-level: {wide}"
+        );
+        assert!(
+            !is_skippable_title_stub(&wide),
+            "the disc-wide CSS no-key code must not be skippable: {wide}"
+        );
+
+        let per_title: std::io::Error = Error::CssKeyMissing.into();
+        assert!(
+            is_skippable_title_stub(&per_title),
+            "the per-title CSS no-key code must stay skippable: {per_title}"
+        );
+        assert!(
+            !is_disc_level_no_key(&per_title),
+            "the per-title CSS no-key code must not stop the whole rip: {per_title}"
+        );
+
+        // The AACS side of the same split, unchanged.
+        let aacs: std::io::Error = Error::NoDiscKey {
+            disc_hash: String::new(),
+        }
+        .into();
+        assert!(is_disc_level_no_key(&aacs));
+        assert!(!is_skippable_title_stub(&aacs));
+    }
+
     #[test]
     fn new_variants_have_distinct_codes() {
         let codes = [
@@ -1285,6 +1370,9 @@ mod tests {
             (Error::MapfileInvalid { kind: "hex" }, E_MAPFILE_INVALID),
             (Error::DiscUrlNotDirect, E_DISC_URL_NOT_DIRECT),
             (Error::ExtentNotUnitAligned, E_EXTENT_NOT_UNIT_ALIGNED),
+            // Both CSS no-key verdicts: numeric-only Display, no English.
+            (Error::CssKeyMissing, E_CSS_KEY_MISSING),
+            (Error::CssNoDiscKey, E_CSS_NO_DISC_KEY),
         ];
         for (e, want_code) in cases {
             let s = e.to_string();
@@ -1485,6 +1573,7 @@ mod tests {
             E_VID_CDB_UNAVAILABLE,
             E_NO_DISC_KEY,
             E_CSS_KEY_MISSING,
+            E_CSS_NO_DISC_KEY,
             E_AACS_NO_HOST_CERT,
             E_AACS_BUS_KEY_UNAVAILABLE,
             E_FMTS_KEY_MISSING,
