@@ -368,6 +368,12 @@ impl MkvTrack {
             Codec::Hevc => ebml::CODEC_HEVC,
             Codec::Vc1 => ebml::CODEC_VC1,
             Codec::Mpeg2 => ebml::CODEC_MPEG2,
+            Codec::Mpeg1 => ebml::CODEC_MPEG1,
+            Codec::Av1 => ebml::CODEC_AV1,
+            // Every video codec this crate can produce is named above. The
+            // remaining arm is reached only by a non-video or Unknown codec
+            // routed here in error — see the audio counterpart for why this
+            // keeps a fallback rather than erroring.
             _ => ebml::CODEC_MPEG2,
         };
         // An Unknown resolution has no real dimensions — emit (0, 0) so the
@@ -492,6 +498,17 @@ impl MkvTrack {
             Codec::TrueHd => ebml::CODEC_TRUEHD,
             Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => ebml::CODEC_DTS,
             Codec::Lpcm => ebml::CODEC_PCM_BE,
+            Codec::Aac => ebml::CODEC_AAC,
+            Codec::Mp2 => ebml::CODEC_MP2,
+            Codec::Mp3 => ebml::CODEC_MP3,
+            Codec::Flac => ebml::CODEC_FLAC,
+            Codec::Opus => ebml::CODEC_OPUS,
+            // Every audio codec this crate can produce is named above. The
+            // remaining arm is reached only by a non-audio or Unknown codec
+            // routed here in error; A_AC3 is the historical fallback and is
+            // wrong for such a track, but MkvTrack::audio has no error channel —
+            // `every_audio_codec_gets_its_own_registered_codec_id` pins the real
+            // codecs so a newly-added one cannot silently land here instead.
             _ => ebml::CODEC_AC3,
         };
         // Unknown sample rate / channel layout: emit 0 so the serializer omits
@@ -2378,6 +2395,98 @@ mod tests {
             MkvTrack::audio(&audio_stream(Codec::TrueHd)).codec_id,
             "A_TRUEHD"
         );
+    }
+
+    #[test]
+    fn every_audio_codec_gets_its_own_registered_codec_id() {
+        // A CodecID names the payload. Falling through to A_AC3 for a codec the
+        // match had no arm for writes a track declaring AC-3 while carrying
+        // something else entirely — a player either refuses the track or decodes
+        // noise. Every audio codec this crate can produce must map to its own
+        // registered Matroska ID.
+        //
+        // Reachable: ifo.rs maps DVD audio_coding_mode 3 to Codec::Mp2, and
+        // mp4/read.rs maps the `mp4a` sample entry to Codec::Aac, so a DVD with
+        // MPEG audio and an mp4:// AAC source both hit this path.
+        for (codec, want) in [
+            (Codec::Ac3, "A_AC3"),
+            (Codec::Ac3Plus, "A_EAC3"),
+            (Codec::TrueHd, "A_TRUEHD"),
+            (Codec::Dts, "A_DTS"),
+            (Codec::DtsHdHr, "A_DTS"),
+            (Codec::DtsHdMa, "A_DTS"),
+            (Codec::Lpcm, "A_PCM/INT/BIG"),
+            (Codec::Aac, "A_AAC"),
+            (Codec::Mp2, "A_MPEG/L2"),
+            (Codec::Mp3, "A_MPEG/L3"),
+            (Codec::Flac, "A_FLAC"),
+            (Codec::Opus, "A_OPUS"),
+        ] {
+            let got = MkvTrack::audio(&audio_stream(codec)).codec_id;
+            assert_eq!(
+                got, want,
+                "{codec:?} must declare {want}, got {got} — a wrong CodecID \
+                 mislabels the payload"
+            );
+        }
+        // Every Codec of audio kind must be covered above: a new audio codec
+        // added to the enum must not silently inherit some other codec's ID.
+        let covered = [
+            Codec::Ac3,
+            Codec::Ac3Plus,
+            Codec::TrueHd,
+            Codec::Dts,
+            Codec::DtsHdHr,
+            Codec::DtsHdMa,
+            Codec::Lpcm,
+            Codec::Aac,
+            Codec::Mp2,
+            Codec::Mp3,
+            Codec::Flac,
+            Codec::Opus,
+        ];
+        for codec in covered {
+            assert_eq!(
+                codec.kind(),
+                crate::disc::CodecKind::Audio,
+                "{codec:?} is listed as audio here but kind() disagrees"
+            );
+        }
+    }
+
+    #[test]
+    fn every_video_codec_gets_its_own_registered_codec_id() {
+        // Same defect class as the audio counterpart: the catch-all declared
+        // V_MPEG2 for Codec::Mpeg1 and Codec::Av1, so an AV1 track was announced
+        // to the decoder as MPEG-2 video.
+        for (codec, want) in [
+            (Codec::H264, "V_MPEG4/ISO/AVC"),
+            (Codec::Hevc, "V_MPEGH/ISO/HEVC"),
+            (Codec::Vc1, "V_MS/VFW/FOURCC"),
+            (Codec::Mpeg2, "V_MPEG2"),
+            (Codec::Mpeg1, "V_MPEG1"),
+            (Codec::Av1, "V_AV1"),
+        ] {
+            let v = VideoStream {
+                pid: 0xE0,
+                codec,
+                resolution: Resolution::R1080p,
+                frame_rate: crate::disc::FrameRate::F24,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            };
+            let got = MkvTrack::video(&v).codec_id;
+            assert_eq!(got, want, "{codec:?} must declare {want}, got {got}");
+            assert_eq!(
+                codec.kind(),
+                crate::disc::CodecKind::Video,
+                "{codec:?} is listed as video here but kind() disagrees"
+            );
+        }
     }
 
     #[test]

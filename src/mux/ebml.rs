@@ -582,11 +582,28 @@ pub const CODEC_HEVC: &str = "V_MPEGH/ISO/HEVC";
 pub const CODEC_H264: &str = "V_MPEG4/ISO/AVC";
 pub const CODEC_VC1: &str = "V_MS/VFW/FOURCC";
 pub const CODEC_MPEG2: &str = "V_MPEG2";
+/// MPEG-1 Video. Distinct from V_MPEG2: a decoder selects its bitstream
+/// parser from this ID.
+pub const CODEC_MPEG1: &str = "V_MPEG1";
+/// AV1. CodecPrivate carries the AV1CodecConfigurationRecord.
+pub const CODEC_AV1: &str = "V_AV1";
 pub const CODEC_AC3: &str = "A_AC3";
 pub const CODEC_EAC3: &str = "A_EAC3";
 pub const CODEC_TRUEHD: &str = "A_TRUEHD";
 pub const CODEC_DTS: &str = "A_DTS";
 pub const CODEC_PCM_BE: &str = "A_PCM/INT/BIG";
+/// AAC. The generic registered ID; the AudioSpecificConfig travels in
+/// CodecPrivate, so no profile suffix is needed (and the `A_AAC/MPEG4/*`
+/// suffixed forms are legacy).
+pub const CODEC_AAC: &str = "A_AAC";
+/// MPEG-1/2 Audio Layer II — DVD audio_coding_mode 3.
+pub const CODEC_MP2: &str = "A_MPEG/L2";
+/// MPEG-1/2 Audio Layer III.
+pub const CODEC_MP3: &str = "A_MPEG/L3";
+/// FLAC. CodecPrivate carries the STREAMINFO metadata block.
+pub const CODEC_FLAC: &str = "A_FLAC";
+/// Opus. CodecPrivate carries the OpusHead identification header.
+pub const CODEC_OPUS: &str = "A_OPUS";
 pub const CODEC_PGS: &str = "S_HDMV/PGS";
 pub const CODEC_VOBSUB: &str = "S_VOBSUB";
 
