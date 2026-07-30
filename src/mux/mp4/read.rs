@@ -2437,4 +2437,318 @@ mod tests {
         v1[32..34].copy_from_slice(&packed);
         assert_eq!(mdhd_language(&v1).as_deref(), Some("eng"));
     }
+
+    // ── Sample-entry field offsets (ISO/IEC 14496-12 §12.1.3, §12.2.3) ────────
+
+    /// Build an `stsd` payload holding ONE sample entry of type `fourcc`.
+    fn stsd_with(fourcc: &[u8; 4], entry_body: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8, 0, 0, 0]; // version + flags
+        p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        p.extend_from_slice(&mp4_box(fourcc, entry_body));
+        p
+    }
+
+    /// A `VisualSampleEntry` body with DISTINCT width and height, plus optional
+    /// child boxes (ISO/IEC 14496-12 §12.1.3): 6 reserved + 2 data_reference_index
+    /// + 16 pre_defined/reserved, then width(2) at 24 and height(2) at 26, then 50
+    /// more bytes of resolution / frame_count / compressorname / depth / pre_defined
+    /// to the 78-byte fixed part.
+    fn visual_entry(width: u16, height: u16, children: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 78];
+        b[24..26].copy_from_slice(&width.to_be_bytes());
+        b[26..28].copy_from_slice(&height.to_be_bytes());
+        b.extend_from_slice(children);
+        b
+    }
+
+    /// An `AudioSampleEntry` body (ISO/IEC 14496-12 §12.2.3): 6 reserved + 2
+    /// data_reference_index + 8 reserved, then channelcount(2) at 16, samplesize(2),
+    /// pre_defined(2), reserved(2), samplerate(4) — 28 bytes — then child boxes.
+    /// `decoy` goes in the reserved field at 14 so an offset slip is visible.
+    fn audio_entry(channels: u16, decoy: u16, children: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 28];
+        b[14..16].copy_from_slice(&decoy.to_be_bytes());
+        b[16..18].copy_from_slice(&channels.to_be_bytes());
+        b[18..20].copy_from_slice(&16u16.to_be_bytes()); // samplesize
+        b[24..28].copy_from_slice(&(48_000u32 << 16).to_be_bytes());
+        b.extend_from_slice(children);
+        b
+    }
+
+    /// `height` is the SECOND of the two 16-bit dimensions in a VisualSampleEntry,
+    /// at byte 26 — width sits at 24. Reading the wrong one is silent: the value is
+    /// still a plausible dimension, so the track's seeded resolution simply comes
+    /// out wrong (1920 read as a height would classify a 1080p title as UHD).
+    ///
+    /// The two are deliberately different here; a fixture with width == height
+    /// would pass under either offset.
+    #[test]
+    fn parse_stsd_takes_height_from_its_own_field_not_the_width_beside_it() {
+        let stsd = stsd_with(b"avc1", &visual_entry(1920, 1080, &[]));
+        let info = parse_stsd(&stsd).expect("an avc1 entry parses");
+        assert!(matches!(info.codec, Codec::H264), "avc1 is H.264");
+        assert_eq!(info.height, 1080, "height is at byte 26, width at 24");
+        assert_eq!(info.channels, 0, "a video entry declares no channel count");
+
+        // And a VisualSampleEntry too short to hold the fixed part is refused
+        // rather than read out of a shorter buffer.
+        let short = stsd_with(b"avc1", &vec![0u8; 40]);
+        assert!(
+            parse_stsd(&short).is_none(),
+            "a truncated VisualSampleEntry has no dimensions to read"
+        );
+    }
+
+    /// `channelcount` is at byte 16 of an AudioSampleEntry, after the 8 reserved
+    /// bytes that follow `data_reference_index`. An offset slip reads a reserved
+    /// field, and reserved fields are conventionally zero — which would make every
+    /// audio track come out as 0 channels rather than fail.
+    ///
+    /// The short-entry fallback of 2 is pinned in the same test: an entry with no
+    /// room for the fixed part still has to name SOME channel count, and 0 is not a
+    /// usable one.
+    #[test]
+    fn parse_stsd_reads_channelcount_from_its_own_field_and_defaults_a_short_entry() {
+        let stsd = stsd_with(b"ac-3", &audio_entry(6, 0xBEEF, &[]));
+        let info = parse_stsd(&stsd).expect("an ac-3 entry parses");
+        assert!(matches!(info.codec, Codec::Ac3), "ac-3 is AC-3");
+        assert_eq!(
+            info.channels, 6,
+            "channelcount is at byte 16 — 0xBEEF at 14 is the reserved field"
+        );
+        assert_eq!(info.height, 0, "an audio entry declares no height");
+
+        // Too short for the 28-byte fixed part: fall back to stereo, not to 0.
+        let short = stsd_with(b"ac-3", &vec![0u8; 12]);
+        let info = parse_stsd(&short).expect("a short audio entry still names a codec");
+        assert_eq!(
+            info.channels, 2,
+            "an entry with no readable channelcount defaults to stereo"
+        );
+    }
+
+    // ── MPEG-4 expandable descriptors (ISO/IEC 14496-1 §8.3.3) ────────────────
+
+    /// A descriptor length is a base-128 varint: 7 bits per byte, continued while
+    /// the top bit is set, to a maximum of FOUR bytes. Every existing esds fixture
+    /// uses a single-byte length, so the continuation path is unconstrained by
+    /// them — yet a multi-byte length is exactly what an `esds` carrying a long
+    /// AudioSpecificConfig (or one written by a tool that always pads to 4 bytes,
+    /// which is common) uses.
+    #[test]
+    fn read_descriptor_len_is_a_four_byte_base_128_varint() {
+        let read = |b: &[u8]| {
+            let mut pos = 0usize;
+            let n = read_descriptor_len(b, &mut pos);
+            (n, pos)
+        };
+        assert_eq!(read(&[0x02]), (2, 1), "a short length is one byte");
+        assert_eq!(
+            read(&[0x7F]),
+            (127, 1),
+            "127 is the largest one-byte length"
+        );
+        assert_eq!(
+            read(&[0x81, 0x00]),
+            (128, 2),
+            "128 continues into a second byte, 7 bits at a time"
+        );
+        assert_eq!(
+            read(&[0x81, 0x80, 0x80, 0x01]),
+            ((1usize << 21) | 1, 4),
+            "four bytes contribute 7 bits each"
+        );
+        // A fifth continuation byte is NOT consumed: the encoding is capped at 4.
+        let mut pos = 0usize;
+        read_descriptor_len(&[0x80, 0x80, 0x80, 0x80, 0x7F], &mut pos);
+        assert_eq!(pos, 4, "the walk stops after four bytes, whatever follows");
+        // Truncated input stops at the end rather than reading past it.
+        assert_eq!(read(&[0x81]), (1, 1), "a dangling continuation just ends");
+    }
+
+    /// The optional `ES_Descriptor` fields (ISO/IEC 14496-1 §7.2.6.5) are selected
+    /// by three flag bits, and each one that is set inserts bytes before the
+    /// `DecoderConfigDescriptor`. Skipping them wrongly does not corrupt anything —
+    /// the tag check fails and `parse_esds_asc` returns `None`, so the AAC track
+    /// simply loses its CodecPrivate and the remux emits AAC no decoder can
+    /// initialise.
+    ///
+    /// The existing fixture has flags = 0, so all three skips are unconstrained.
+    /// This one sets all three at once and still has to reach the same ASC.
+    #[test]
+    fn parse_esds_asc_steps_over_every_optional_es_descriptor_field() {
+        let asc = vec![0x12u8, 0x10]; // AAC-LC 44.1 kHz stereo
+        let build = |flags: u8, extra: &[u8]| {
+            let mut v = vec![0u8, 0, 0, 0]; // FullBox version + flags
+            v.push(0x03); // ES_Descriptor
+            v.push(0x19); // length (unused by the parser)
+            v.extend_from_slice(&[0x00, 0x01]); // ES_ID
+            v.push(flags);
+            v.extend_from_slice(extra);
+            v.push(0x04); // DecoderConfigDescriptor
+            v.push(0x11);
+            v.push(0x40); // objectTypeIndication = AAC
+            v.extend_from_slice(&[0x15, 0, 0, 0]); // streamType + bufferSizeDB
+            v.extend_from_slice(&[0, 0, 0, 0]); // maxBitrate
+            v.extend_from_slice(&[0, 0, 0, 0]); // avgBitrate
+            v.push(0x05); // DecoderSpecificInfo
+            v.push(asc.len() as u8);
+            v.extend_from_slice(&asc);
+            v
+        };
+
+        // streamDependenceFlag alone: 2 bytes of dependsOn_ES_ID.
+        assert_eq!(
+            parse_esds_asc(&build(0x80, &[0xAA, 0xBB])).as_deref(),
+            Some(&asc[..]),
+            "dependsOn_ES_ID must be stepped over"
+        );
+        // URL_flag alone: a length byte plus that many URL bytes.
+        assert_eq!(
+            parse_esds_asc(&build(0x40, b"\x05hello")).as_deref(),
+            Some(&asc[..]),
+            "URLlength + URLstring must be stepped over"
+        );
+        // OCRstreamFlag alone: 2 bytes of OCR_ES_Id.
+        assert_eq!(
+            parse_esds_asc(&build(0x20, &[0xCC, 0xDD])).as_deref(),
+            Some(&asc[..]),
+            "OCR_ES_Id must be stepped over"
+        );
+        // All three together, in the order the standard lists them.
+        assert_eq!(
+            parse_esds_asc(&build(0xE0, b"\xAA\xBB\x03abc\xCC\xDD")).as_deref(),
+            Some(&asc[..]),
+            "all three optional fields present at once"
+        );
+    }
+
+    /// A box header is 8 bytes, so a declared `size` below 8 cannot describe a box —
+    /// and taking it at face value slices `payload[pos + 8 .. pos + size]` with the
+    /// start past the end, which panics. A crafted `moov` is untrusted input read
+    /// straight off a user's file.
+    #[test]
+    fn find_boxes_capped_refuses_a_box_smaller_than_its_own_header() {
+        // size = 4, type = 'avcC': shorter than the header that declares it.
+        let payload = [0u8, 0, 0, 4, b'a', b'v', b'c', b'C'];
+        assert!(
+            find_boxes_capped(&payload, b"avcC", 8).is_empty(),
+            "a sub-header-size box is not a box"
+        );
+        assert!(find_box(&payload, b"avcC").is_none());
+        // Size 8 exactly IS a box — an empty one — so the bound is not off by one.
+        let empty = [0u8, 0, 0, 8, b'a', b'v', b'c', b'C'];
+        assert_eq!(
+            find_box(&empty, b"avcC"),
+            Some(&[][..]),
+            "an 8-byte box is a valid empty box"
+        );
+    }
+
+    /// An `stsc` entry names a `first_chunk` that may exceed the chunk count the
+    /// `stco` actually declares (a truncated or crafted table). The run it would
+    /// fill has to be clamped to the chunks that exist — indexing `spc` past its
+    /// length is a panic on a file the user merely opened.
+    ///
+    /// The clamp is only reachable through a NON-final entry: the final entry's end
+    /// is `n_chunks` by construction, so a fixture whose only over-range entry is
+    /// last never reaches the line.
+    #[test]
+    fn sample_offsets_clamps_an_stsc_run_that_outruns_the_chunk_table() {
+        let sizes = [10u32, 20];
+        let chunk_offsets = [1000u64, 2000];
+        // Three entries, two chunks: entry 0's run would end at chunk 3.
+        let stsc = [(1u32, 1u32), (4, 1), (9, 1)];
+        let offsets = sample_offsets(&sizes, &chunk_offsets, &stsc);
+        assert_eq!(
+            offsets,
+            vec![1000, 2000],
+            "one sample per existing chunk; the out-of-range runs place nothing"
+        );
+    }
+
+    /// ISO/IEC 14496-12 §8.6.6: an edit list may hold several media edits. This
+    /// frame model can only express a constant shift, so it honours the LEADING
+    /// one and logs the rest — taking the last instead would shift the whole track
+    /// by a trim that belongs to a later segment, i.e. silent A/V desync of exactly
+    /// the size of the difference.
+    #[test]
+    fn elst_offset_ticks_honours_the_first_media_edit_not_the_last() {
+        // Two non-empty edits with different media_time; no empty edit.
+        let entries = vec![(1000u64, 500i64, 1i16), (1000, 9000, 1)];
+        assert_eq!(
+            elst_offset_ticks(&entries, Some(1000), 48_000, 0),
+            -500,
+            "the leading media edit's trim is the one applied"
+        );
+
+        // A leading EMPTY edit still delays, and only the empty edits BEFORE the
+        // first media edit count — one that trails a media edit does not.
+        let entries = vec![
+            (100u64, -1i64, 1i16), // empty: 100 movie ticks of delay
+            (1000, 200, 1),        // media edit: trims 200 media ticks
+            (5000, -1, 1),         // a LATER empty edit — not a start delay
+        ];
+        assert_eq!(
+            elst_offset_ticks(&entries, Some(1000), 48_000, 0),
+            100 * 48 - 200,
+            "leading empty edits delay (converted to media ticks); trailing ones do not"
+        );
+    }
+
+    /// A version-1 `mvhd` carries 64-bit creation/modification times, so its
+    /// `timescale` sits at byte 20 rather than 12 (ISO/IEC 14496-12 §8.2.2). Every
+    /// existing fixture is version 0, so the version-1 offset is unconstrained by
+    /// them — and it is not a hypothetical: writers emit version 1 whenever the
+    /// movie duration does not fit 32 bits.
+    ///
+    /// A wrong offset reads part of the 64-bit modification time, which is a large
+    /// arbitrary number — and the movie timescale is the denominator that converts
+    /// an empty edit's delay into media ticks, so the A/V offset it produces is
+    /// arbitrary too.
+    #[test]
+    fn mvhd_timescale_version_1_reads_past_the_64_bit_times() {
+        let mut v1 = vec![0u8; 24];
+        v1[0] = 1; // version 1
+        v1[12..20].copy_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_be_bytes()); // mod time
+        v1[20..24].copy_from_slice(&90_000u32.to_be_bytes());
+        assert_eq!(mvhd_timescale(&v1), Some(90_000), "v1 timescale is at 20");
+        assert_eq!(
+            mvhd_timescale(&v1[..23]),
+            None,
+            "a v1 mvhd too short to hold it yields nothing, not a partial read"
+        );
+
+        let mut v0 = vec![0u8; 16];
+        v0[0] = 0;
+        v0[4..12].copy_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_be_bytes());
+        v0[12..16].copy_from_slice(&600u32.to_be_bytes());
+        assert_eq!(mvhd_timescale(&v0), Some(600), "v0 timescale is at 12");
+    }
+
+    /// Only the leading empty edits and the FIRST media edit shape the offset, so
+    /// [`MAX_ELST_ENTRIES`] bounds what a crafted `elst` can allocate. Without it a
+    /// box declaring millions of entries — and carrying the bytes for them, inside a
+    /// `moov` already capped at 256 MiB — expands to a Vec of 20-byte tuples for no
+    /// benefit at all.
+    #[test]
+    fn parse_elst_entry_count_is_capped() {
+        let n = MAX_ELST_ENTRIES + 500;
+        let mut p = vec![0u8, 0, 0, 0]; // version 0 + flags
+        p.extend_from_slice(&(n as u32).to_be_bytes());
+        for i in 0..n {
+            p.extend_from_slice(&(i as u32).to_be_bytes()); // segment_duration
+            p.extend_from_slice(&0u32.to_be_bytes()); // media_time
+            p.extend_from_slice(&1i16.to_be_bytes());
+            p.extend_from_slice(&0i16.to_be_bytes());
+        }
+        let entries = parse_elst(&p);
+        assert_eq!(
+            entries.len(),
+            MAX_ELST_ENTRIES,
+            "capped, not truncated short"
+        );
+        assert_eq!(entries[0].0, 0, "and the entries kept are the LEADING ones");
+        assert_eq!(entries[1].0, 1);
+    }
 }
