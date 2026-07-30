@@ -125,7 +125,10 @@ fn consumer_panicked(payload: Box<dyn std::any::Any + Send>) -> Error {
 /// caller reporting the rip as interrupted while a fully finalised MKV (Cues
 /// written, Segment size patched) landed on disk, indistinguishable from a
 /// complete one. The two transitions are therefore a single compare-exchange each,
-/// out of [`ST_RUNNING`]: whoever wins decides, and the loser observes the winner.
+/// out of [`state::RUNNING`]: whoever wins decides, and the loser observes the
+/// winner. (`ST_RUNNING` does not exist anywhere in the crate — the constants are
+/// `state::RUNNING` / `state::ABANDONED` / `state::CLOSING` below, and both
+/// compare-exchange sites that must stay in step with this argument name them.)
 mod state {
     /// Consumer is running; neither side has committed yet.
     pub const RUNNING: u8 = 0;

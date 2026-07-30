@@ -1315,6 +1315,15 @@ impl BufferedSectorReader<'_> {
         // Cap to 8192 sectors (16 MiB) so a disc-controlled ad_len cannot
         // drive a multi-hundred-MiB allocation before any sectors are read.
         let count = count.min(8192);
+        // Clamp the range to the u32 LBA space. `start_lba` comes straight off
+        // the disc (ECMA-167 §14.1 `extent_location` is an unconstrained Uint32),
+        // so a metadata partition declared near the top of the space made
+        // `start_lba + offset` below overflow: an 'attempt to add with overflow'
+        // panic in debug inside the public `Disc::scan`, and in release a wrap to
+        // a low LBA that filled the sliding cache with a completely different
+        // region while `cache_start` still claimed the high one. Sectors past
+        // `u32::MAX` cannot be addressed at all, so dropping them loses nothing.
+        let count = count.min(u32::MAX - start_lba);
         let total = count as usize * 2048;
         self.cache.resize(total, 0);
         let mut offset = 0u32;
@@ -1359,6 +1368,16 @@ impl BufferedSectorReader<'_> {
         let mut done: u64 = 0;
         let mut hb = crate::progress::Heartbeat::new("udf_prefetch");
         for &(start, count) in ranges {
+            // Clamp each range to the u32 LBA space before walking it. Ranges come
+            // from `collect_file_ranges`, whose allocation descriptors are
+            // unconstrained ECMA-167 §14.14.1 Uint32s, and nothing bounds
+            // `start + count`; a range within one batch of the top of the space
+            // made `start + offset` and `start + offset + i` below overflow —
+            // a debug panic inside the public `Disc::scan`, and in release a wrap
+            // that seeded the PERMANENT cache with this file's bytes keyed at low
+            // LBAs, so every later single-sector read of those LBAs (the AVDP/VDS
+            // re-reads) silently parsed the wrong sector.
+            let count = count.min(u32::MAX - start);
             let mut offset = 0u32;
             while offset < count {
                 hb.tick(done, total);
@@ -1409,8 +1428,13 @@ impl SectorSource for BufferedSectorReader<'_> {
                 buf[..2048].copy_from_slice(data);
                 return Ok(2048);
             }
-            // Check sliding cache
-            if lba >= self.cache_start && lba < self.cache_start + self.cache_sectors {
+            // Check sliding cache. Tested as a DISTANCE from `cache_start`, not
+            // as `cache_start + cache_sectors`: `cache_start` is a disc-controlled
+            // LBA (and the batch-read path below sets it verbatim), so the sum
+            // overflowed for a window near `u32::MAX` — a debug panic inside
+            // `SectorSource::read_sectors`, and in release a wrap to a small value
+            // that silently disabled the cache.
+            if lba >= self.cache_start && lba - self.cache_start < self.cache_sectors {
                 let offset = (lba - self.cache_start) as usize * 2048;
                 buf[..2048].copy_from_slice(&self.cache[offset..offset + 2048]);
                 return Ok(2048);
@@ -1487,7 +1511,14 @@ mod tests {
             }
             for i in 0..count as u32 {
                 let off = i as usize * 2048;
-                let s = self.sectors.get(&(lba + i)).copied().unwrap_or([0u8; 2048]);
+                // `wrapping_add`: the near-`u32::MAX` overflow regressions below
+                // hand this harness LBAs at the top of the space on purpose, and
+                // the harness's own bookkeeping must not be what panics.
+                let s = self
+                    .sectors
+                    .get(&lba.wrapping_add(i))
+                    .copied()
+                    .unwrap_or([0u8; 2048]);
                 buf[off..off + 2048].copy_from_slice(&s);
             }
             Ok(need)
@@ -2330,6 +2361,71 @@ mod tests {
             "prefetch cache exceeded cap: {} bytes",
             br.cache.len()
         );
+    }
+
+    /// `prefetch` advances the read LBA with `start_lba + offset`. A UDF whose
+    /// metadata descriptor declares a partition near the top of the LBA space
+    /// (ECMA-167 §14.1: `extent_location` is an unconstrained Uint32) drove that
+    /// add past `u32::MAX` — an 'attempt to add with overflow' panic in debug
+    /// inside the public `Disc::scan`, and in release a wrap to a low LBA that
+    /// filled the sliding cache with a completely different region while
+    /// `cache_start` still claimed the high one.
+    #[test]
+    fn prefetch_near_u32_max_does_not_overflow() {
+        let mut inner = MapReader::new();
+        let mut br = BufferedSectorReader::new(&mut inner, 60);
+        // start + count = 0xFFFF_FFC0 + 200 > u32::MAX: the second batch
+        // iteration evaluates 0xFFFF_FFC0 + 60.
+        br.prefetch(0xFFFF_FFC0, 200);
+        // Nothing read (MapReader serves no sector here), but crucially the
+        // walk must never form an LBA above u32::MAX.
+        assert!(
+            br.cache_start.checked_add(br.cache_sectors).is_some(),
+            "cache window must stay inside the u32 LBA space: {} + {}",
+            br.cache_start,
+            br.cache_sectors
+        );
+    }
+
+    /// `prefetch_ranges` walks each disc-derived `(start_lba, sector_count)`
+    /// range with `start + offset + i`. `collect_file_ranges` permits any LBA up
+    /// to `u32::MAX` (ECMA-167 §14.14.1 allocation descriptors are unconstrained
+    /// Uint32s) and nothing bounds `start + count`, so a range within one batch
+    /// of the top of the space overflowed: debug panic inside `Disc::scan`, or in
+    /// release a wrap that seeded the PERMANENT cache with this file's bytes keyed
+    /// at LBA 0 — every later single-sector read of those low LBAs (the AVDP/VDS
+    /// re-reads) then returned the wrong sector.
+    #[test]
+    fn prefetch_ranges_near_u32_max_does_not_overflow() {
+        let mut inner = MapReader::new();
+        let mut br = BufferedSectorReader::new(&mut inner, 60);
+        br.prefetch_ranges(&[(0xFFFF_FFF0, 512)]);
+        // Every key the permanent cache holds must be a real LBA, i.e. inside
+        // the declared range — never a wrapped low sector.
+        for &lba in br.prefetched.keys() {
+            assert!(
+                lba >= 0xFFFF_FFF0,
+                "prefetch_ranges wrapped a near-u32::MAX LBA to {lba}"
+            );
+        }
+    }
+
+    /// The sliding-cache hit test computed `cache_start + cache_sectors`. Once
+    /// `cache_start` is a disc-controlled LBA near `u32::MAX` (set by the batch
+    /// read below) that add overflowed: debug panic inside
+    /// `SectorSource::read_sectors`, release wrap to a small value that silently
+    /// disabled the cache.
+    #[test]
+    fn cache_hit_test_near_u32_max_does_not_overflow() {
+        let mut inner = MapReader::new();
+        let mut br = BufferedSectorReader::new(&mut inner, 60);
+        let mut buf = [0u8; 2048];
+        // First read seeds cache_start = 0xFFFF_FFF5, cache_sectors = 60.
+        br.read_sectors(0xFFFF_FFF5, 1, &mut buf, true)
+            .expect("seed read");
+        // Second read of the same LBA evaluates the hit test: 0xFFFF_FFF5 + 60.
+        br.read_sectors(0xFFFF_FFF5, 1, &mut buf, true)
+            .expect("cache hit test must not overflow");
     }
 
     /// Build a 2048-byte directory sector containing `count` minimal file FIDs.

@@ -20,7 +20,7 @@
 //! different output format would be a DIFFERENT sink reusing this same model,
 //! not a pluggable encoder here.
 
-use crate::disc::{ColorSpace, DiscTitle, FrameRate, Stream as DiscStream, VideoStream};
+use crate::disc::{ColorSpace, DiscTitle, Stream as DiscStream, VideoStream};
 use crate::mux::codec::PictureInfo;
 use crate::mux::codec::coding::{CodingType, FieldOrder};
 use crate::pes::{PesFrame, SourcePos};
@@ -266,13 +266,6 @@ fn display_aspect_ratio(v: &VideoStream, w: u32, h: u32) -> (u32, u32) {
         _ if h != 0 => (w, h),
         _ => (0, 1),
     }
-}
-
-/// The title's nominal frame rate as a fraction — the single mapping site reused
-/// by the header builder. (Retained as the canonical accessor.)
-#[allow(dead_code)]
-fn frame_rate_fraction(fr: FrameRate) -> (u32, u32) {
-    fr.as_fraction()
 }
 
 /// One per-picture index record, distilled from a video [`PesFrame`]

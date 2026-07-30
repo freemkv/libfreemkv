@@ -1240,6 +1240,62 @@ mod tests {
         }
     }
 
+    /// The mapped descramble indexes the committed key pool POSITIONALLY
+    /// (`unit_keys[key_idx].1`), so the ORDER of the `Vec<UnitKey>` a
+    /// `KeySource` returns is load-bearing — it is NOT "cosmetic, the decrypt path
+    /// strips it and tries every key", as `keysource::resolve_and_apply_traced`'s
+    /// doc used to claim. Trial-decrypt was deliberately deleted; nothing here
+    /// searches the pool. Reordering the same two keys therefore sends each range
+    /// to the WRONG key: the range that decrypted clean now fails the correct-phase
+    /// `is_clean` net loudly (or, off a forensic phase, would decrypt a whole span
+    /// under a neighbour's key). Pins the corrected doc.
+    #[test]
+    fn mapped_key_selection_is_positional_so_pool_order_matters() {
+        use crate::disc::ContentFormat;
+        let key_a = [0xAAu8; 16];
+        let key_b = [0xBBu8; 16];
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let usz = (ul / 2048) as u32;
+        // Unit 0 encrypted under key_a, unit 1 under key_b.
+        let build = || {
+            let mut buf = vec![0u8; 2 * ul];
+            for (i, k) in [key_a, key_b].iter().enumerate() {
+                let mut u = clear_ts_unit();
+                aacs_encrypt_unit_for_test(&mut u, k);
+                buf[i * ul..(i + 1) * ul].copy_from_slice(&u);
+            }
+            buf
+        };
+        // Map: unit 0 → pool position 0, unit 1 → pool position 1.
+        let map = AacsKeyMap::from_ranges_phased(vec![
+            (0, usz, 0, Phase::Even),
+            (usz, 2 * usz, 1, Phase::Even),
+        ]);
+        // Pool in CPS-unit order: each range gets its own key, both come clean.
+        let mut buf = build();
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
+            .expect("pool in CPS-unit order decrypts clean");
+        // SAME keys, SAME CPS-unit numbers, swapped POSITIONS. If the number were
+        // what mattered (or if the path searched the pool) this would be
+        // equivalent; positional indexing makes it decrypt both units wrong.
+        let mut buf = build();
+        let swapped = DecryptKeys::Aacs {
+            unit_keys: vec![(1, key_b), (0, key_a)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        assert!(
+            decrypt_sectors_mapped(&mut buf, &swapped, 0, &map).is_err(),
+            "a reordered pool must fail loud — key selection is positional, so the \
+             ORDER a KeySource returns its keys in is part of the contract"
+        );
+    }
+
     /// The correct-phase safety `is_clean` fires loud: an even unit whose mapped
     /// key is wrong does NOT come clean → `DecryptFailed` (not silent corruption).
     #[test]

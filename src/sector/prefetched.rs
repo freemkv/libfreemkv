@@ -403,10 +403,32 @@ impl Drop for PrefetchShell {
 
 impl Drop for PrefetchedSectorSource {
     fn drop(&mut self) {
-        // Dropping the receiver closes the channel, which makes the
-        // next producer `send` return Err and exits the loop. Joining
-        // here gives us a deterministic shutdown — no detached thread
-        // can outlive the source.
+        // Drop the channel endpoints BEFORE joining the producer.
+        //
+        // `rx` and `recycle_tx` are sibling fields, so they are dropped only
+        // AFTER this `Drop::drop` body returns. Joining first therefore joined
+        // while both endpoints were still alive: a producer parked in the plain
+        // blocking `tx.send(Ok(buf))` (no timeout, so the `Halt` is never
+        // re-polled) never observed a disconnect and never returned, and the
+        // dropping thread blocked in `join()` forever. Any source dropped before
+        // its extents were drained — an error path, an operator stop, or a
+        // consuming crate using the public `new` + direct `read_sectors` — hit a
+        // permanent two-thread deadlock. `BytePrefetcher::drop` already had this
+        // shape; see `drop_undrained_source_joins_cleanly`.
+        //
+        // The endpoints are moved out via `mem::replace` with already-disconnected
+        // stand-ins (each stand-in's peer is dropped immediately), which drops the
+        // real ones here and needs neither `Option` fields nor `unsafe` — and
+        // leaves `into_channels`'s `ptr::read` moves untouched.
+        let (dead_tx, dead_rx) = bounded::<Batch>(0);
+        drop(dead_tx);
+        drop(std::mem::replace(&mut self.rx, dead_rx));
+        let (dead_send, dead_recv) = bounded::<Vec<u8>>(0);
+        drop(dead_recv);
+        drop(std::mem::replace(&mut self.recycle_tx, dead_send));
+        // Now the producer's next `send`/`recv` returns Err and its loop exits;
+        // joining gives a deterministic shutdown — no detached thread can outlive
+        // the source.
         if let Some(h) = self.producer.take() {
             let _ = h.join();
         }
@@ -613,6 +635,42 @@ mod tests {
             }
             Err(_) => panic!("watchdog timeout — likely deadlock/hang in prefetch read path"),
         }
+    }
+
+    /// Regression: dropping a `PrefetchedSectorSource` DIRECTLY — the
+    /// public `new` + documented direct-read path, and any error/halt
+    /// exit before the extents are drained — must join the producer
+    /// cleanly. `Drop::drop` used to `join()` while the struct still
+    /// held `rx` and `recycle_tx` (sibling fields drop only AFTER
+    /// `Drop::drop` returns), so a producer parked in the plain blocking
+    /// `tx.send(Ok(buf))` never saw a disconnect and the dropping thread
+    /// blocked in `join()` forever — a permanent two-thread deadlock that
+    /// cancelling the `Halt` could not escape, because that `send` has no
+    /// timeout and never re-polls the token.
+    ///
+    /// 300 sectors at batch=3 is 100 batches against a forward channel of
+    /// depth `PREFETCH_CHANNEL_DEPTH` (2), so the producer is guaranteed
+    /// to be blocked in `send` by the time the drop runs. Mirrors
+    /// `byte_prefetcher::drop_endless_prefetcher_joins_cleanly`, whose
+    /// `Drop` already had the correct shape.
+    #[test]
+    fn drop_undrained_source_joins_cleanly() {
+        with_watchdog(Duration::from_secs(10), || {
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 300,
+            }];
+            let halt = Halt::new();
+            let pf = PrefetchedSectorSource::new(
+                PatternSource { capacity: 9999 },
+                extents,
+                3,
+                Some(halt.clone()),
+            )
+            .expect("spawn");
+            // Drop without draining a single batch — the old Drop deadlocked here.
+            drop(pf);
+        });
     }
 
     /// The CRITICAL regression: after `into_channels`, dropping the
@@ -1002,11 +1060,11 @@ mod tests {
             let pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
             // 9 + 6 + 3 = 18, independent of inner source capacity.
             assert_eq!(pf.capacity_sectors(), 18);
-            // Release the producer without draining: peel the channels
-            // and drop them so the producer observes disconnection
-            // (dropping `pf` directly would join while still holding the
-            // channels → deadlock; the production drain path always uses
-            // into_channels).
+            // Release the producer without draining via the production
+            // zero-copy path: peel the channels and drop them so the
+            // producer observes disconnection. (A direct `drop(pf)` is
+            // also safe now — see `drop_undrained_source_joins_cleanly`
+            // — but the mux always uses into_channels.)
             let (rx, recycle_tx, shell) = pf.into_channels();
             drop(rx);
             drop(recycle_tx);
@@ -1042,9 +1100,9 @@ mod tests {
                 u32::MAX,
                 "summed total must saturate at u32::MAX, not wrap"
             );
-            // Release the producer via into_channels + drop (a direct
-            // drop of `pf` would join while still holding the channels →
-            // deadlock against the still-running EndlessZeroSource).
+            // Release the producer via into_channels + drop, the production
+            // zero-copy path. (A direct `drop(pf)` also joins cleanly now —
+            // see `drop_undrained_source_joins_cleanly`.)
             let (rx, recycle_tx, shell) = pf.into_channels();
             drop(rx);
             drop(recycle_tx);

@@ -1151,6 +1151,15 @@ mod tests {
         })
     }
 
+    /// Every packet on `pid` (optionally requiring PUSI), in stream order.
+    fn find_all_pkts(buf: &[u8], pid: u16, pusi: bool) -> Vec<&[u8]> {
+        buf.chunks(188)
+            .filter(|p| {
+                u16::from_be_bytes([p[1] & 0x1F, p[2]]) == pid && (!pusi || (p[1] & 0x40) != 0)
+            })
+            .collect()
+    }
+
     /// Extract a PSI section (after the pointer_field) from a PUSI PSI
     /// packet: payload starts at byte 4 (no AF on PSI here), first payload
     /// byte is pointer_field, section follows.
@@ -1355,31 +1364,92 @@ mod tests {
 
     #[test]
     fn extreme_pts_does_not_overflow_and_clamps_to_33bit() {
-        // base_relative_pts widens to u128 then masks to 33 bits. An
-        // adversarial i64::MAX ns must not overflow and the encoded PTS must
-        // stay within the 33-bit field. With a single video frame the base
-        // is itself, so relative PTS is 0 — proving no panic on the path.
+        // `base_relative_pts` widens to u128 then wraps the delta into 33 bits. An
+        // adversarial i64::MAX ns must not overflow, and the encoded PES PTS must be
+        // the EXACT wrapped value.
+        //
+        // The old version of this test wrote a single video frame, which by its own
+        // admission rebases to relative PTS 0 — so its only assertion was
+        // `0 < 2^33`, which cannot fail: widening the 33-bit mask (or deleting it)
+        // left the one test named for 33-bit clamping green. Two frames are needed
+        // so the second has a non-zero delta to pin, and the expected value is
+        // computed here from the spec formula rather than read back from the code
+        // under test.
+        //
+        // NOTE on the test's name: bit 32 of the PES PTS field is UNREACHABLE from
+        // this path. `base_relative_pts` interprets the delta as a signed 33-bit
+        // value and floors the entire upper half [2^32, 2^33) to 0, so anything the
+        // encoder ever receives is < 2^32. "Clamping to 33 bits" is therefore a
+        // structural property of the delta rule, not something a test can exercise;
+        // what IS pinned below is the exact encoding of the largest reachable value
+        // and the documented i64::MAX outcome.
+        // Decode the 33-bit PTS out of a PUSI video packet's PES header.
+        let decode_pts = |pkt: &[u8]| -> u64 {
+            // Payload after the AF: AF area = 1 (length byte) + af_len.
+            let af_len = pkt[4] as usize;
+            let pes = &pkt[4 + 1 + af_len..];
+            // PES: 00 00 01 E0 00 00 80 80 05 PTS[5]. PTS at pes[9..14].
+            ((((pes[9] >> 1) & 0x07) as u64) << 30)
+                | ((pes[10] as u64) << 22)
+                | (((pes[11] >> 1) as u64) << 15)
+                | ((pes[12] as u64) << 7)
+                | ((pes[13] >> 1) as u64)
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&4u32.to_be_bytes());
+        frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
+
+        // (a) A LARGE but forward delta: exact-value assertion across all 33 bits.
+        //
+        // Frame 1 at PTS 0 seeds the base to 0, so frame 2's relative PTS is its own
+        // tick value. 477_218_477 x 100_000 ns divides exactly by the 100_000/9
+        // conversion, giving 4_294_966_293 ticks — just under 2^32, i.e. the largest
+        // magnitude the signed-33-bit delta rule treats as forward progression, and
+        // a value that needs the full 3+15+15-bit PES PTS field to survive.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = M2tsMux::new(&mut sink);
-            let mut frame = Vec::new();
-            frame.extend_from_slice(&4u32.to_be_bytes());
-            frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
+            mux.write_video(0, true, &frame).unwrap();
+            mux.write_video(477_218_477 * 100_000, true, &frame)
+                .unwrap();
+            mux.finish().unwrap();
+        }
+        assert_ts_well_formed(&sink);
+        let pkts = find_all_pkts(&sink, PID_VIDEO, true);
+        assert_eq!(pkts.len(), 2, "one PUSI packet per video frame");
+        let pts = decode_pts(pkts[1]);
+        assert!(pts < (1u64 << 33), "PTS stays within the 33-bit field");
+        assert_eq!(
+            pts, 4_294_966_293,
+            "the encoded PES PTS must be the exact tick value, not a truncated one"
+        );
+
+        // (b) The adversarial i64::MAX: no overflow, no panic, and the documented
+        // signed-33-bit outcome. Its tick count masks to 6_564_084_417, which is in
+        // the UPPER half of the 33-bit range, so the delta rule reads it as a frame
+        // BEFORE the base and floors it to 0 (the same rule that floors leading
+        // audio). Asserted explicitly so this is a pinned decision, not the vacuous
+        // `0 < 2^33` the old single-frame version checked.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = M2tsMux::new(&mut sink);
+            mux.write_video(0, true, &frame).unwrap();
             mux.write_video(i64::MAX, true, &frame).unwrap();
             mux.finish().unwrap();
         }
         assert_ts_well_formed(&sink);
-        let pkt = find_pkt(&sink, PID_VIDEO, true).unwrap();
-        // Reach the PES PTS: payload after AF. AF area = 1 (length) + af_len.
-        let af_len = pkt[4] as usize;
-        let pes = &pkt[4 + 1 + af_len..];
-        // PES: 00 00 01 E0 00 00 80 80 05 PTS[5]. PTS at pes[9..14].
-        let pts = ((((pes[9] >> 1) & 0x07) as u64) << 30)
-            | ((pes[10] as u64) << 22)
-            | (((pes[11] >> 1) as u64) << 15)
-            | ((pes[12] as u64) << 7)
-            | ((pes[13] >> 1) as u64);
+        let masked = (((i64::MAX as u128) * 9 / 100_000) as u64) & 0x1_FFFF_FFFF;
+        assert!(
+            masked >= 1 << 32,
+            "i64::MAX masks into the upper (negative) half"
+        );
+        let pkts = find_all_pkts(&sink, PID_VIDEO, true);
+        let pts = decode_pts(pkts[1]);
         assert!(pts < (1u64 << 33), "PTS stays within the 33-bit field");
+        assert_eq!(
+            pts, 0,
+            "an i64::MAX tick lands in the signed-33-bit upper half and floors to 0"
+        );
     }
 
     #[test]

@@ -147,8 +147,14 @@ pub fn aacs_unit_needs_decrypt(unit: &[u8], format: crate::disc::ContentFormat) 
 }
 
 /// Minimum synced content packets that PROVE a key opened a unit. Four `0x47`
-/// syncs ≈ 32 bits of MPEG-TS structure ≈ 1-in-4-billion that a wrong key (uniform
-/// AES noise, `0x47` at 1/256 per packet) fakes it. It is an ABSOLUTE proof floor,
+/// syncs are 32 bits of MPEG-TS structure, but the per-UNIT false-pass risk is
+/// NOT 2^-32: `is_clean_ts` accepts ANY four of the ~31 encrypted packets in a
+/// 6144-byte aligned unit, so for a wrong key (uniform AES noise, `0x47` at 1/256
+/// per packet) it is ≈ C(31,4)·256^-4 ≈ 7e-6, i.e. ~1e-5 — the figure
+/// [`is_clean_ts`]'s own doc below states. 1-in-4-billion is the probability for
+/// four SPECIFIC packets and overstates the margin by ~4000x; at
+/// `KEY_PROOF_PACKETS = 3` the per-unit rate is ≈ C(31,3)·256^-3 ≈ 2.6e-4, so do
+/// NOT lower it on the strength of slack that is not there. It is an ABSOLUTE proof floor,
 /// NOT a proportion — a unit the key opened but whose content is bad-encoded
 /// (many non-conforming packets) is proven by ANY four good packets, not rejected
 /// for the bad ones.
@@ -172,8 +178,16 @@ pub fn is_clean(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
 /// Structural "does this unit carry enough valid MPEG-TS to prove a key opened
 /// it?" — the Transport-Stream arm of [`is_clean`]. It is
 /// NOT a decryption verdict: [`decrypt_unit`] applies a key (that is
-/// "decrypt"); whether the plaintext is clean TS is this SEPARATE question. The
-/// mux never calls this — TS validity is a muxer concern, never a decrypt result.
+/// "decrypt"); whether the plaintext is clean TS is this SEPARATE question.
+///
+/// The mux is its PRINCIPAL consumer for `BdTs` discs, reaching it through
+/// [`is_clean`]: `mux::resolve`'s multi-CPS `pick` closure selects a unit key by
+/// it, `probe_index_phase` reports each FMTS index's interleave parity by it, and
+/// `decrypt::decrypt_sectors_mapped` uses it as the forensic-range verify net.
+/// (The doc used to say "the mux never calls this", which invited a maintainer to
+/// tighten or loosen the proof rule below believing only whole-disc read
+/// verification was affected — while it in fact changes which unit key a
+/// multi-CPS disc muxes with and which phase an FMTS index is muxed at.)
 ///
 /// Rule — evidence is ABSOLUTE, scaled to the packets that exist. Over the
 /// ENCRYPTED packets (skip packet 0: its `0x47` sits in the clear 16-byte seed, so
@@ -381,13 +395,20 @@ pub fn encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
 /// Remove bus encryption from an aligned unit (AACS 2.0 / UHD).
 /// Bus encryption uses read_data_key, decrypting bytes 16..2048 of each 2048-byte sector.
 pub(crate) fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
+    // Expand the key schedule ONCE for the whole unit. `read_data_key` is
+    // loop-invariant here (and constant for the entire disc), but calling
+    // `aes_cbc_decrypt` per sector rebuilt the AES-128 schedule per sector — three
+    // expansions per 6144-byte aligned unit, i.e. ~29 million redundant expansions
+    // over a 90 GB read on a stock drive, on the per-unit decrypt hot path.
+    // Measured by `decrypt_bus_expands_the_read_data_key_once_per_unit`.
+    let cipher = crate::aacs::crypto::new_cipher_for(read_data_key);
     for sector_start in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES) {
         if sector_start + SECTOR_BYTES > unit.len() {
             break;
         }
         // First 16 bytes of each sector are plaintext
-        aes_cbc_decrypt(
-            read_data_key,
+        crate::aacs::crypto::cbc_decrypt_blocks(
+            &cipher,
             &mut unit[sector_start + 16..sector_start + SECTOR_BYTES],
         );
     }
@@ -1182,21 +1203,100 @@ mod tests {
         assert_eq!(aes_ecb_decrypt(&key, &expected), pt);
     }
 
+    // ── decrypt_bus: one key schedule per unit, not one per sector ─────────
+
+    /// MEASURED, not reasoned: `decrypt_bus` called `aes_cbc_decrypt` once per
+    /// 2048-byte sector, and each call built its own AES-128 key schedule, so a
+    /// 6144-byte aligned unit performed THREE key expansions under the same
+    /// loop-invariant `read_data_key`. On a 90 GB UHD read on a stock (non-
+    /// LibreDrive) drive — ~14.6 million aligned units — that is ~29 million
+    /// redundant expansions on the per-unit decrypt hot path, for a key that is
+    /// constant for the whole disc. The counter is incremented inside
+    /// `crypto::new_cipher`, the single construction site.
+    #[test]
+    fn decrypt_bus_expands_the_read_data_key_once_per_unit() {
+        use crate::aacs::crypto::KEY_EXPANSIONS;
+        let mut unit = clear_unit();
+        let rdk = [0x4Eu8; 16];
+        KEY_EXPANSIONS.with(|c| c.set(0));
+        decrypt_bus(&mut unit, &rdk);
+        let n = KEY_EXPANSIONS.with(|c| c.get());
+        assert_eq!(
+            n, 1,
+            "one aligned unit under one read_data_key must expand the schedule \
+             exactly once, not once per 2048-byte sector"
+        );
+    }
+
+    /// The single-expansion refactor must be byte-identical: bus encryption
+    /// ([C] §4.2) covers bytes 16..2048 of every 2048-byte sector, so a
+    /// three-sector aligned unit round-trips through the forward direction
+    /// sector by sector and `decrypt_bus` must recover it exactly.
+    #[test]
+    fn decrypt_bus_roundtrips_every_sector_region() {
+        let rdk = [0x91u8; 16];
+        let original = clear_unit();
+        let mut unit = original.clone();
+        // Forward direction, region by region — the inverse of decrypt_bus.
+        for start in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES) {
+            crate::aacs::crypto::aes_cbc_encrypt(&rdk, &mut unit[start + 16..start + SECTOR_BYTES]);
+        }
+        assert_ne!(
+            &unit[16..64],
+            &original[16..64],
+            "the forward direction must have changed the bytes"
+        );
+        decrypt_bus(&mut unit, &rdk);
+        assert_eq!(
+            unit.as_slice(),
+            original.as_slice(),
+            "decrypt_bus must invert the per-sector bus encryption exactly"
+        );
+    }
+
     // ── CBC decrypt: first-block uses fixed AACS IV ────────────────────────
+
+    /// The published `iv0` bytes, INDEPENDENT of the production constant.
+    ///
+    /// [C] §2.1.2 fixes one default CBC IV for every AACS AES-CBC operation.
+    /// Both IV tests below used to compute their expected value from
+    /// `crypto::AACS_IV` itself, so the constant was asserted against itself and
+    /// NOTHING in the suite pinned its bytes: swapping `AACS_IV` for `[0u8; 16]`
+    /// left both tests passing (one builds its ciphertext with the same value and
+    /// the other cancels the change in a triple XOR) while every real AACS disc
+    /// decrypted to noise — block 0 of every 6128-byte aligned unit and of every
+    /// bus-encrypted sector XORed with the wrong IV. This literal is the
+    /// independent witness the tests assert against.
+    const IV0_PUBLISHED: [u8; 16] = [
+        0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3, 0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05, 0x0F,
+        0x78,
+    ];
+
+    /// Pins the fixed AACS CBC IV ([C] §2.1.2 `iv0`) against a literal, so a
+    /// change to `crypto::AACS_IV` fails HERE rather than silently shipping.
+    #[test]
+    fn aacs_iv_matches_published_iv0() {
+        assert_eq!(
+            AACS_IV, IV0_PUBLISHED,
+            "the fixed AACS CBC IV must be the published iv0"
+        );
+    }
 
     #[test]
     fn cbc_decrypt_first_block_xors_aacs_iv() {
         // CBC: P[0] = AES-D(K, C[0]) XOR IV, and the IV is the fixed AACS
-        // constant (not zero). Encrypt a single block forward with IV, then
-        // confirm aes_cbc_decrypt recovers it — proving the IV used on block
-        // 0 is exactly AACS_IV. A mutation that swaps AACS_IV for [0u8;16]
-        // makes the recovered block wrong.
+        // constant (not zero). Encrypt a single block forward with the PUBLISHED
+        // iv0 literal, then confirm aes_cbc_decrypt recovers it — proving the IV
+        // the production code uses on block 0 is exactly that value. Building the
+        // fixture from `IV0_PUBLISHED` rather than from `AACS_IV` is what makes
+        // the claim real: a mutation that swaps AACS_IV for [0u8;16] now makes the
+        // recovered block wrong.
         let key = [0x24u8; 16];
         let plain = [0x5Au8; 16];
         // Forward CBC for one block: C = AES-E(K, P XOR IV).
         let mut x = plain;
         for j in 0..16 {
-            x[j] ^= AACS_IV[j];
+            x[j] ^= IV0_PUBLISHED[j];
         }
         let ct = aes_ecb_encrypt(&key, &x);
         let mut buf = ct;
@@ -1225,10 +1325,13 @@ mod tests {
         //   * Blocks 1..=3 are independent of the IV — they MUST equal the NIST
         //     plaintext byte-for-byte (P[i] = AES-D(K, C[i]) XOR C[i-1]). This
         //     pins the real reverse-order CBC chaining against a published KAT.
-        //   * Block 0 = AES-D(K, C[0]) XOR AACS_IV = NIST_PT[0] XOR NIST_IV
-        //     XOR AACS_IV — the documented IV substitution. Asserting this exact
-        //     relation pins both the AES decrypt of C[0] AND that block 0 uses
-        //     AACS_IV (a swap to [0u8;16] or a chaining bug fails it).
+        //   * Block 0 = AES-D(K, C[0]) XOR iv0 = NIST_PT[0] XOR NIST_IV XOR iv0 —
+        //     the documented IV substitution. Asserting this exact relation pins
+        //     both the AES decrypt of C[0] AND that block 0 uses iv0. The expected
+        //     value is built from the `IV0_PUBLISHED` literal, NOT from
+        //     `crypto::AACS_IV`: computing it from the production constant made
+        //     the change cancel out of the triple XOR, so a swap to [0u8;16] still
+        //     passed. It now fails.
         let key = [
             0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6, 0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF,
             0x4F, 0x3C,
@@ -1268,7 +1371,7 @@ mod tests {
         // Block 0: NIST_PT[0] XOR NIST_IV XOR AACS_IV (the fixed-IV substitution).
         let mut expected_block0 = [0u8; 16];
         for i in 0..16 {
-            expected_block0[i] = nist_plaintext[i] ^ nist_iv[i] ^ AACS_IV[i];
+            expected_block0[i] = nist_plaintext[i] ^ nist_iv[i] ^ IV0_PUBLISHED[i];
         }
         assert_eq!(
             &buf[0..16],

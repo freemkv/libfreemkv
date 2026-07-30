@@ -17,6 +17,32 @@ use super::dropgate::DropTally;
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 use crate::mux::timeline::DISCONTINUITY_BACKSTEP_NS;
 
+/// Is `w` an MLP-family major sync — a random-access / decoder re-init point?
+///
+/// The 24-bit signature is 0xF8726F; the following byte is the STREAM TYPE:
+/// 0xBA = Dolby TrueHD (the only one Blu-ray carries), 0xBB = MLP. Both are
+/// restart points, so the keyframe / re-sync decision accepts either.
+fn is_mlp_major_sync(w: u32) -> bool {
+    (w & 0xFFFF_FFFE) == 0xF872_6FBA
+}
+
+/// Is `w` specifically the TrueHD major sync (stream type 0xBA)?
+///
+/// The 32-bit word that FOLLOWS the sync is laid out per stream type: TrueHD's
+/// `format_info` carries [31..28] audio_sampling_frequency, the 5-bit 6-channel
+/// and 13-bit 8-channel presentation channel-assignment masks; MLP's (0xBB) same
+/// word carries quantization word lengths and the MLP group sample-rate fields
+/// instead. So every site that DECODES `format_info` with the TrueHD layout must
+/// require 0xBA exactly — masking the low sync bit there read a quantization code
+/// as the rate nibble and pulled channel masks out of unrelated bits, giving the
+/// track header a wrong `SamplingFrequency` and `truehd_au_duration_ns` a wrong
+/// per-AU increment (audio drifting against video for the whole track).
+/// `None` from these helpers is the safe outcome: the caller falls back to its
+/// container-derived rate/channel count.
+fn is_truehd_major_sync(w: u32) -> bool {
+    w == 0xF872_6FBA
+}
+
 /// Duration of one TrueHD access unit in nanoseconds for the 48 kHz family
 /// (48 / 96 / 192 kHz). `access_unit_size = 40 << (ratebits & 7)` and
 /// `sample_rate = 48000 << (ratebits & 7)`; the shared shift cancels in
@@ -130,7 +156,13 @@ impl TrueHdParser {
             // The rate nibble is only trustworthy once the major sync's CRC has
             // validated (above), so capture format_info here and refine the PTS
             // cadence from it ONLY on this validated path.
-            if au.len() >= 12 {
+            // ONLY for stream type 0xBA. An MLP (0xBB) major sync's following word
+            // is not the TrueHD `format_info` layout, so decoding it as one gave a
+            // wrong rate and channel count; leaving it `None` keeps the
+            // container-derived rate, which is the honest answer.
+            if au.len() >= 12
+                && is_truehd_major_sync(u32::from_be_bytes([au[4], au[5], au[6], au[7]]))
+            {
                 format_info = Some(u32::from_be_bytes([au[8], au[9], au[10], au[11]]));
             }
         }
@@ -445,10 +477,17 @@ impl CodecParser for TrueHdParser {
                 break; // incomplete access unit, wait for more data
             }
 
+            // Restart-point question — either stream type (0xBA TrueHD, 0xBB MLP)
+            // is a decoder re-init point, so both count as a major sync here.
+            // DECODING format_info with the TrueHD layout is a separate question,
+            // gated on 0xBA alone in `au_check`.
             let is_major_sync = unit_bytes >= 8
-                && (u32::from_be_bytes([self.buf[4], self.buf[5], self.buf[6], self.buf[7]])
-                    & 0xFFFF_FFFE)
-                    == 0xF872_6FBA;
+                && is_mlp_major_sync(u32::from_be_bytes([
+                    self.buf[4],
+                    self.buf[5],
+                    self.buf[6],
+                    self.buf[7],
+                ]));
 
             // Decodability gate. MLP/TrueHD decode state persists across access
             // units, so a corrupt AU is dropped FORWARD to the next VALIDATED
@@ -597,7 +636,9 @@ pub fn truehd_channels_from_stream(data: &[u8]) -> Option<u8> {
     let mut p = 0;
     while p + 8 <= data.len() {
         let w = u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
-        if (w & 0xFFFF_FFFE) == 0xF872_6FBA {
+        // 0xBA only: `truehd_channels` reads the TrueHD `format_info` channel
+        // masks, which an MLP (0xBB) major sync does not carry.
+        if is_truehd_major_sync(w) {
             let fi = u32::from_be_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]);
             return truehd_channels(fi);
         }
@@ -663,7 +704,9 @@ pub fn truehd_sync_info_from_stream(data: &[u8]) -> Option<TrueHdSyncInfo> {
     let mut p = 0;
     while p + 8 <= data.len() {
         let w = u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
-        if (w & 0xFFFF_FFFE) == 0xF872_6FBA {
+        // 0xBA only: `format_info` (and the num_substreams/Atmos nibble) are the
+        // TrueHD layout, not MLP's.
+        if is_truehd_major_sync(w) {
             let format_info =
                 u32::from_be_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]);
             // num_substreams is the top nibble of the 17th sync byte (p + 16).
@@ -1447,14 +1490,51 @@ mod tests {
     // --- truehd_channels_from_stream: major-sync variant bit + scan ---
 
     #[test]
-    fn channels_from_stream_matches_variant_sync_0xfb() {
-        // The sync match masks the low bit: 0xF8726FBA & 0xFFFFFFFE == base, and
-        // 0xF8726FBB (the +1 variant) matches the same masked pattern. A stream
-        // carrying 0xF8726FBB must still be recognised.
+    fn channels_from_stream_rejects_mlp_sync_0xfb() {
+        // 0xF8726FBB is the MLP stream type, NOT TrueHD (0xF8726FBA). The word
+        // after an MLP major sync holds quantization word lengths and the MLP
+        // group sample-rate fields, not TrueHD's rate nibble plus the 6ch/8ch
+        // presentation channel-assignment masks. Decoding it with the TrueHD
+        // layout (the scan used to mask the low sync bit) reported channels out of
+        // unrelated bits; the honest answer is None so the caller keeps its
+        // container-derived count. Byte pattern below decodes as 8 channels ONLY
+        // under the TrueHD layout, so this test fails if the mask comes back.
         let mut data = vec![0x00];
         data.extend_from_slice(&0xF872_6FBBu32.to_be_bytes());
         data.extend_from_slice(&0x0000_001Fu32.to_be_bytes());
+        assert_eq!(
+            truehd_channels_from_stream(&data),
+            None,
+            "an MLP (0xBB) major sync must not be decoded as TrueHD format_info"
+        );
+        // The same bytes under the TrueHD stream type DO decode.
+        let mut data = vec![0x00];
+        data.extend_from_slice(&0xF872_6FBAu32.to_be_bytes());
+        data.extend_from_slice(&0x0000_001Fu32.to_be_bytes());
         assert_eq!(truehd_channels_from_stream(&data), Some(8));
+    }
+
+    #[test]
+    fn mlp_sync_0xfb_yields_no_sample_rate_or_atmos() {
+        // Same split for the shared scan: an MLP major sync must not produce a
+        // TrueHD rate (bits 31..28 of an MLP header are a quantization code, not
+        // the rate) nor an Atmos verdict.
+        let mut data = vec![0x00];
+        data.extend_from_slice(&0xF872_6FBBu32.to_be_bytes());
+        // ratebits nibble 0x1 would decode as 96 kHz under the TrueHD layout.
+        data.extend_from_slice(&0x1000_001Fu32.to_be_bytes());
+        data.extend_from_slice(&[0x00; 12]);
+        assert!(
+            truehd_sync_info_from_stream(&data).is_none(),
+            "no TrueHD sync info from an MLP major sync"
+        );
+        assert_eq!(truehd_sample_rate_from_stream(&data), None);
+        // TrueHD stream type, identical trailing bytes → the rate IS decoded.
+        let mut data = vec![0x00];
+        data.extend_from_slice(&0xF872_6FBAu32.to_be_bytes());
+        data.extend_from_slice(&0x1000_001Fu32.to_be_bytes());
+        data.extend_from_slice(&[0x00; 12]);
+        assert_eq!(truehd_sample_rate_from_stream(&data), Some(96000));
     }
 
     #[test]
@@ -1527,8 +1607,10 @@ mod tests {
 
     #[test]
     fn major_sync_variant_bit_also_keyframe() {
-        // The keyframe check masks the low bit (0xFFFF_FFFE), so the 0xF8726FBB
-        // variant must also be detected as a major sync.
+        // The RESTART-POINT check masks the low sync bit, so 0xF8726FBB (MLP)
+        // counts as a major sync too — both stream types re-init the decoder, so
+        // both are keyframes. (Only the format_info DECODE is 0xBA-only; see
+        // `channels_from_stream_rejects_mlp_sync_0xfb`.)
         let mut parser = TrueHdParser::new();
         let mut unit = make_truehd_unit(200);
         unit[4..8].copy_from_slice(&0xF872_6FBBu32.to_be_bytes());

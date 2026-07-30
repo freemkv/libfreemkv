@@ -53,6 +53,11 @@ pub struct PesPacket {
 /// Per-PID PES reassembly state.
 struct PesAssembler {
     pid: u16,
+    /// This PID's PES-reassembly ceiling: its share of [`MAX_PES_BUFFER_TOTAL`],
+    /// clamped to [`MAX_PES_BUFFER`]. Resolved once by `TsDemuxer::new` so the
+    /// per-PID caps sum to a bounded total no matter how many streams the disc
+    /// declares.
+    cap: usize,
     buffer: Vec<u8>,
     pts: Option<i64>,
     dts: Option<i64>,
@@ -107,10 +112,34 @@ const PES_BUFFER_INIT_CAP: usize = 16 * 1024;
 /// the next PUSI.
 const MAX_PES_BUFFER: usize = 64 * 1024 * 1024; // 64 MiB
 
+/// AGGREGATE ceiling across every tracked PID.
+///
+/// [`MAX_PES_BUFFER`] bounds each PID's buffer independently and never sees the
+/// total, while the tracked-PID count comes straight off the disc: `TsDemuxer::new`
+/// makes one [`PesAssembler`] per SELECTED stream, and the selection derives from
+/// the MPLS STN, whose per-category counts are `u8` (up to 255 each across 8
+/// categories) bounded only by the MPLS file's own bytes. A crafted MPLS declaring
+/// 100 streams on 100 distinct PIDs, plus a clip feeding each PID continuation
+/// packets (no PUSI) until just under the per-PID cap, held 100 x 64 MiB = 6.4 GiB
+/// of PES buffers at once; 1000 distinct PIDs — well inside the 8192-entry
+/// `pid_index` table — is 64 GiB.
+///
+/// So the per-PID cap is derived from this total instead: `pes_cap` (below) is
+/// `MAX_PES_BUFFER_TOTAL / tracked_pids`, clamped to `MAX_PES_BUFFER`. A real title
+/// selects a handful of streams and keeps the full 64 MiB each; only a stream count
+/// far past anything an authored disc carries is squeezed, and even then a complete
+/// HEVC/UHD access unit (1-3 MiB) still fits at ~170 PIDs. Overflow is graceful in
+/// any case — the partial PES is dropped and the assembler resyncs on the next
+/// PUSI, flagging a discontinuity.
+const MAX_PES_BUFFER_TOTAL: usize = 512 * 1024 * 1024; // 512 MiB
+
 impl PesAssembler {
-    fn new(pid: u16) -> Self {
+    /// `cap` is this PID's SHARE of [`MAX_PES_BUFFER_TOTAL`], resolved by
+    /// `TsDemuxer::new` from the tracked-PID count.
+    fn new(pid: u16, cap: usize) -> Self {
         Self {
             pid,
+            cap,
             buffer: Vec::with_capacity(PES_BUFFER_INIT_CAP),
             pts: None,
             dts: None,
@@ -155,13 +184,14 @@ impl PesAssembler {
 
     /// Append payload data to the current PES packet.
     ///
-    /// If the buffer would exceed [`MAX_PES_BUFFER`] the partial PES is
+    /// If the buffer would exceed this PID's `cap` — its share of
+    /// [`MAX_PES_BUFFER_TOTAL`], at most [`MAX_PES_BUFFER`] — the partial PES is
     /// silently dropped and the assembler is reset. Normal traffic resumes
     /// on the next PUSI; a crafted/corrupt stream that never sends one can
-    /// no longer drive unbounded allocation.
+    /// no longer drive unbounded allocation, on this PID OR in aggregate.
     fn push(&mut self, data: &[u8]) {
         if self.active {
-            if self.buffer.len().saturating_add(data.len()) > MAX_PES_BUFFER {
+            if self.buffer.len().saturating_add(data.len()) > self.cap {
                 tracing::trace!(
                     target: "mux",
                     pid = self.pid,
@@ -237,9 +267,13 @@ impl TsDemuxer {
         let table_size = (max_pid + 1).max(8192);
         let mut pid_index = vec![-1i32; table_size];
         let mut assemblers = Vec::with_capacity(pids.len());
+        // Per-PID cap = this PID's share of the AGGREGATE ceiling. Without this the
+        // caps were per-PID only and never saw the total, so a disc-declared stream
+        // list could multiply 64 MiB by its own length.
+        let pes_cap = (MAX_PES_BUFFER_TOTAL / pids.len().max(1)).min(MAX_PES_BUFFER);
         for (i, &pid) in pids.iter().enumerate() {
             pid_index[pid as usize] = i as i32;
-            assemblers.push(PesAssembler::new(pid));
+            assemblers.push(PesAssembler::new(pid, pes_cap));
         }
         Self {
             assemblers,
@@ -2228,6 +2262,58 @@ mod tests {
     }
 
     // ── PES reassembly buffer cap (DoS hardening) ─────────────────────────
+
+    /// The per-PID PES cap must be a SHARE of an aggregate ceiling, not a flat
+    /// 64 MiB per PID that never sees the total. The tracked-PID count comes off
+    /// the disc (one assembler per selected stream, selection driven by the MPLS
+    /// STN whose per-category counts are u8), so a crafted MPLS declaring many
+    /// streams on distinct PIDs held `count x 64 MiB` of PES buffers at once —
+    /// 6.4 GiB at 100 PIDs, 64 GiB at 1000 (still inside the 8192-entry pid_index
+    /// table). With 64 tracked PIDs each share is 512 MiB / 64 = 8 MiB, so a PID
+    /// flooded with continuation packets must drop its partial PES at ~8 MiB, not
+    /// at 64 MiB.
+    #[test]
+    fn per_pid_pes_cap_is_a_share_of_an_aggregate_ceiling() {
+        let pids: Vec<u16> = (0x1000..0x1040).collect(); // 64 PIDs
+        assert_eq!(pids.len(), 64);
+        let mut demux = TsDemuxer::new(&pids);
+
+        let expected_share = MAX_PES_BUFFER_TOTAL / 64;
+        assert!(
+            expected_share < MAX_PES_BUFFER,
+            "the test is only meaningful when the share is below the per-PID cap"
+        );
+        // The caps must sum to the aggregate ceiling, never to 64 x 64 MiB.
+        let total: usize = demux.assemblers.iter().map(|a| a.cap).sum();
+        assert!(
+            total <= MAX_PES_BUFFER_TOTAL,
+            "per-PID caps must sum within the aggregate ceiling: {total} > {MAX_PES_BUFFER_TOTAL}"
+        );
+
+        // Behavioural: flood ONE PID with continuation packets and confirm the
+        // partial PES is dropped at its share, not at MAX_PES_BUFFER.
+        let pid = pids[0];
+        let mut pes_start = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        pes_start.extend_from_slice(&[0xAB; 10]);
+        demux.feed(&es_packet_exact(pid, true, &pes_start));
+        let payload = [0xCCu8; 184];
+        let cont_pkt = data_packet(pid, false, &payload);
+        let mut high_water = 0usize;
+        for _ in 0..(expected_share / 184 + 64) {
+            demux.feed(&cont_pkt);
+            let idx = demux.pid_index[pid as usize] as usize;
+            high_water = high_water.max(demux.assemblers[idx].buffer.len());
+        }
+        assert!(
+            high_water <= expected_share,
+            "a flooded PID must be capped at its share ({expected_share}), \
+             not at the flat per-PID cap; high water was {high_water}"
+        );
+        assert!(
+            high_water > expected_share / 2,
+            "sanity: the flood must actually have filled the share, got {high_water}"
+        );
+    }
 
     #[test]
     fn pes_buffer_cap_resets_on_overflow_and_recovers_on_next_pusi() {

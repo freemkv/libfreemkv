@@ -53,8 +53,29 @@ pub const MIN_SAMPLE_UNITS: usize = 8;
 /// units it yields); the *requested* count is a caller-side compile-time constant that
 /// callers pin to `MIN_SAMPLE_UNITS` (see e.g. autorip's `SAMPLE_UNITS`). Together the
 /// two make under-sampling unrepresentable at the request boundary.
-#[derive(Debug, Clone)]
+///
+/// The wrapped samples are on-disc AACS ciphertext — the same bytes the sibling
+/// [`DiscInputs::samples`] redacts as key MATERIAL — so [`Debug`] is hand-written
+/// and redacting; see the impl below.
+#[derive(Clone)]
 pub struct DecodeSampleSet(Vec<Vec<u8>>);
+
+impl std::fmt::Debug for DecodeSampleSet {
+    /// Prints the SHAPE only. A derived `Debug` dumped every wrapped sample
+    /// verbatim: a `DecodeSampleSet` carries at least [`MIN_SAMPLE_UNITS`]
+    /// 6144-byte aligned units (≥ 49 KiB, in practice multi-MB) of AACS
+    /// ciphertext plus each unit's clear 16-byte derivation seed, so one
+    /// `tracing::debug!("{set:?}")` on a failed `/decode` request — or an
+    /// `assert_eq!` whose panic message formats it — wrote all of it to the log
+    /// that gets attached to a bug report. Same policy and same shape as
+    /// [`DiscInputs`]'s impl below.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeSampleSet")
+            .field("units", &"<redacted>")
+            .field("units_len", &self.0.len())
+            .finish()
+    }
+}
 
 impl DecodeSampleSet {
     /// Wrap `units` iff it carries at least [`MIN_SAMPLE_UNITS`] samples; `None`
@@ -334,8 +355,23 @@ pub fn resolve_and_apply(
 /// from [`crate::aacs::derive::decrypt_unit_key`]; the library's canonical CPS-unit number is
 /// `position + 1` (matching [`crate::aacs::inf::parse_unit_key_ro`]'s `(i + 1)`), so
 /// the committed `AacsState.unit_keys` is byte-identical to the library-resolved
-/// path. The number is cosmetic for descramble (the decrypt path strips it and
-/// tries every key) but is kept faithful to the resolver's convention.
+/// path.
+///
+/// The NUMBER itself is not what descramble indexes by — but the ORDER is
+/// load-bearing, so a source must return its keys in CPS-unit order. Trial
+/// decrypt-and-check was deliberately deleted (see
+/// [`crate::decrypt::AacsKeyMap`]: decryption is driven by the disc's CPS-unit /
+/// FMTS-segment structure, "never by trial-decrypt-and-check per unit"), and
+/// `decrypt_sectors_mapped` indexes the committed pool POSITIONALLY —
+/// `unit_keys[key_idx].1`, where `key_idx` is a POSITION in the Vec a source
+/// returned, recorded by `resolve_mux_key_map_cached` / `resolve_fmts_key_map`.
+/// Return the same keys in a different order and every `AacsKeyMap` points at the
+/// wrong key: the whole title decrypts under a neighbour's key, or a forensic
+/// range trips the `is_clean` net into `DecryptFailed`. (The doc used to say the
+/// number "is cosmetic for descramble (the decrypt path strips it and tries every
+/// key)", which is what the DELETED trial-decrypt path did; the only place that
+/// still tries every key is `Disc::decrypt_with`'s sample VALIDATION, which does
+/// not descramble content.)
 pub fn resolve_and_apply_traced(
     sources: &[Box<dyn KeySource>],
     inputs: &DiscInputs,
@@ -400,8 +436,15 @@ pub fn resolve_and_apply_traced(
             // boundary in `freemkv-keysources`, so a failure is reported as a
             // failure, with `Disc::aacs_error` as the channel the operator actually
             // reads. `FetchOutcome::errored` in `drive_unit_keys` /
-            // `drive_fmts_indexes` is dead for the same reason — it is the right
-            // contract, honoured by no source yet.
+            // `drive_fmts_indexes` never FIRES for the same reason — it is the
+            // right contract, honoured by no shipped source yet. It is NOT dead
+            // code: it is written at both `drive_*` sites and read by the
+            // cache-insert guard `if !keys.is_empty() || !outcome.errored`, the
+            // only thing that stops a transient source outage from being memoised
+            // permanently into the per-fingerprint key cache — pinned by
+            // `errored_empty_is_not_cached_and_retries_when_source_recovers`. Do
+            // not delete it while making a source report failures as `Err`; that
+            // is precisely when it starts to matter.
             Ok(_) | Err(_) => {
                 trace.keys.push(KeyStep {
                     who,
@@ -1395,5 +1438,29 @@ mod tests {
         assert!(dbg.contains("unit_key_ro_len: 48"), "{dbg}");
         assert!(dbg.contains("samples_len: 1"), "{dbg}");
         assert!(dbg.contains("TITLE_2024"), "{dbg}");
+    }
+
+    /// `DecodeSampleSet` is public and wraps the SAME on-disc ciphertext the
+    /// sibling `DiscInputs` redacts, so a derived `Debug` dumped ≥ MIN_SAMPLE_UNITS
+    /// × 6144 bytes of verbatim AACS ciphertext (plus every unit's clear 16-byte
+    /// derivation seed) into any log that formatted it. Sentinel byte 0xD5 =
+    /// decimal 213, matching `aacs::types::redaction_tests` and the
+    /// `DiscInputs` test above. Mutation guard: restoring `#[derive(Debug)]`
+    /// fails this.
+    #[test]
+    fn decode_sample_set_debug_is_redacted() {
+        let set = DecodeSampleSet::new(vec![vec![0xD5; 6144]; MIN_SAMPLE_UNITS])
+            .expect("MIN_SAMPLE_UNITS units is a valid set");
+        let dbg = format!("{set:?}");
+        assert!(
+            !dbg.contains("213"),
+            "DecodeSampleSet Debug leaked ciphertext (decimal 213): {dbg}"
+        );
+        assert!(
+            dbg.contains("redacted"),
+            "DecodeSampleSet Debug missing redaction marker: {dbg}"
+        );
+        // Non-secret shape stays printable for diagnostics.
+        assert!(dbg.contains("units_len: 8"), "{dbg}");
     }
 }

@@ -825,9 +825,42 @@ fn drive_mux(
                 }
                 Err(e) => {
                     // Drain + join the consumer so its output file handle is
-                    // released, then propagate the read error.
-                    let _ = pipe.finish_with_halt(Some(halt));
-                    return Err(e);
+                    // released, then report the ROOT cause.
+                    //
+                    // The consumer's result used to be discarded with `let _`. A
+                    // write-side `WriteSink::apply` failure that had ALREADY killed
+                    // the output — the destination volume filling, say — was thrown
+                    // away, and only the read error surfaced: the caller diagnosed a
+                    // damaged disc and retried the rip onto the same full volume
+                    // instead of being told it was out of space. A hard write
+                    // failure precedes and explains the read error here (the
+                    // producer only reaches the next `read()` because its previous
+                    // `send` did not block on a dead consumer), so prefer it.
+                    // Halt/join-timeout are NOT root causes — those are the clean
+                    // operator-stop and wedge paths the finish stage below
+                    // translates to `completed = false` — so the read error still
+                    // wins over them.
+                    match pipe.finish_with_halt(Some(halt)) {
+                        Err(w @ (Error::Halted | Error::PipelineJoinTimeout)) => {
+                            tracing::debug!(
+                                target: "mux",
+                                write_side = %w,
+                                read_side = %e,
+                                "read failed; consumer stopped for a non-root-cause reason — reporting the read error"
+                            );
+                            return Err(e);
+                        }
+                        Err(w) => {
+                            tracing::error!(
+                                target: "mux",
+                                write_side = %w,
+                                read_side = %e,
+                                "read failed, but the write side had already failed — reporting the write failure as the root cause"
+                            );
+                            return Err(w.into());
+                        }
+                        Ok(_) => return Err(e),
+                    }
                 }
             }
         }
