@@ -7,8 +7,7 @@
 use super::ebml;
 use super::timeline::TimelineContinuity;
 use crate::disc::{
-    AudioChannels, AudioStream, Chapter, Codec, ColorSpace, HdrFormat, Resolution, SampleRate,
-    SubtitleStream, VideoStream,
+    AudioStream, Chapter, Codec, ColorSpace, HdrFormat, Resolution, SubtitleStream, VideoStream,
 };
 use std::io::{self, Seek, Write};
 
@@ -515,16 +514,11 @@ impl MkvTrack {
         // the SamplingFrequency / Channels element (Matroska supplies its own
         // spec default) rather than writing a fabricated 48000 Hz / 6-channel
         // value into the file.
-        let sr = if matches!(a.sample_rate, SampleRate::Unknown) {
-            0.0
-        } else {
-            a.sample_rate.hz()
-        };
-        let ch = if matches!(a.channels, AudioChannels::Unknown) {
-            0
-        } else {
-            a.channels.count()
-        };
+        // No guard needed: the accessors return 0 for Unknown, which is exactly
+        // what this wants. They used to fabricate 6 channels at 48 kHz, so every
+        // caller had to remember to check the variant first.
+        let sr = a.sample_rate.hz();
+        let ch = a.channels.count();
 
         let name = a.label.clone();
 
