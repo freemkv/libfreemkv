@@ -681,10 +681,18 @@ pub struct MkvMuxer<W: Write + Seek> {
     cues: Vec<CuePoint>,
     frame_count: u64,
     /// Frames handed to `write_frame` that were dropped because no cluster was
-    /// open yet (a cluster only opens on a track-0 video keyframe). If this is
-    /// non-zero at `finish()` and not a single frame was ever written, the
-    /// caller produced an empty MKV — surfaced as an error rather than a
-    /// silently empty file. See `write_frame` for the track-0 invariant.
+    /// open yet (a cluster only opens on a track-0 video keyframe). See
+    /// `write_frame` for the track-0 invariant.
+    ///
+    /// The ALL-dropped case is surfaced as an error by `finish()`, but via
+    /// `frame_count == 0`, not via this counter. A PARTIAL drop — leading audio /
+    /// subtitle frames ahead of the first video IDR, or an M2TS whose PMT lists
+    /// audio before video — is normal enough not to fail the mux, but it used to
+    /// leave NO record anywhere: the field was incremented at two sites and read
+    /// nowhere (no log, no error, no accessor), so those frames vanished from the
+    /// output with `completed = true`, an empty `undelivered_streams`, and nothing
+    /// in the log. `finish()` now logs the count — that log is the field's only
+    /// reader, so do not delete it and turn this back into dead bookkeeping.
     dropped_pre_cluster: u64,
     seek_fixups: Vec<SeekPositionFixup>,
     /// Absolute file offset of the CUES SeekHead entry (a fixed 21-byte Seek
@@ -1657,6 +1665,18 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if self.frame_count == 0 {
             return Err(crate::error::Error::MkvInvalid.into());
         }
+        // Partial pre-cluster drops do not fail the mux (leading audio ahead of the
+        // first video IDR is normal), but they MUST leave a record: this counter
+        // was write-only, so frames silently vanished from the output while the run
+        // reported success. See the field's doc.
+        if self.dropped_pre_cluster > 0 {
+            tracing::warn!(
+                target: "mux",
+                dropped = self.dropped_pre_cluster,
+                frames_written = self.frame_count,
+                "frames were discarded before the first cluster opened (no track-0 video keyframe had arrived yet); they are absent from the output"
+            );
+        }
         // The source declared no duration up-front (DURATION was reserved as a
         // placeholder). Derive the real runtime from the muxed timeline so the
         // Segment declares it — and so the BPS tags below can be computed.
@@ -2613,6 +2633,47 @@ mod tests {
             find_id(&data, ebml::CLUSTER).is_some(),
             "Cluster element not found after write_frame"
         );
+    }
+
+    /// Frames dropped before the first cluster opens must be COUNTED, and the
+    /// count must survive to `finish()` so it can be reported. The counter was
+    /// incremented at two sites and read nowhere — no log, no error, no accessor —
+    /// so a partial drop (leading audio/subtitle frames ahead of the first video
+    /// IDR, or an M2TS whose PMT lists audio before video) silently omitted those
+    /// frames from the output while the run reported `completed = true` with an
+    /// empty `undelivered_streams` and nothing in the log. `finish()` now logs it;
+    /// this pins the accounting the log depends on.
+    #[test]
+    fn frames_dropped_before_first_cluster_are_counted() {
+        let buf = Cursor::new(Vec::new());
+        let tracks = [make_video_track()];
+        let mut muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
+        // Two non-keyframes arrive before any track-0 keyframe: no cluster can be
+        // open, so both are dropped.
+        muxer
+            .write_frame(0, 0, false, &[0x01; 8], None, None)
+            .unwrap();
+        muxer
+            .write_frame(0, 1_000_000, false, &[0x02; 8], None, None)
+            .unwrap();
+        assert_eq!(
+            muxer.dropped_pre_cluster, 2,
+            "both pre-cluster frames must be counted, not silently lost"
+        );
+        assert_eq!(muxer.frame_count, 0, "neither frame was written");
+        // A keyframe then opens the cluster and is written; the drop count stands
+        // so `finish()` can still report it.
+        muxer
+            .write_frame(0, 2_000_000, true, &[0x03; 8], None, None)
+            .unwrap();
+        assert_eq!(muxer.frame_count, 1);
+        assert_eq!(
+            muxer.dropped_pre_cluster, 2,
+            "the drop count must survive to finish(), which reports it"
+        );
+        muxer
+            .finish()
+            .expect("a mux with one written frame succeeds");
     }
 
     #[test]

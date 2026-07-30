@@ -126,6 +126,12 @@ pub(crate) struct AuAssembler {
     /// so a long run of junk with no start code (hostile/corrupt input) costs
     /// O(bytes) total, not O(buffer) per push. Reset when `buf[0]` moves.
     opener_pos: usize,
+    /// Test-only: how many times `take_front` fell back to the COPY path. The
+    /// handover is the whole point of `take_front`, so "did it actually fire" is a
+    /// property to MEASURE, not to reason about. See
+    /// `handover_survives_a_large_au_instead_of_copying_every_later_one`.
+    #[cfg(test)]
+    copy_path_hits: usize,
 }
 
 impl AuAssembler {
@@ -155,6 +161,8 @@ impl AuAssembler {
             scan_pos: 0,
             seen_unit: false,
             opener_pos: 0,
+            #[cfg(test)]
+            copy_path_hits: 0,
         }
     }
 
@@ -172,6 +180,8 @@ impl AuAssembler {
             scan_pos: 0,
             seen_unit: false,
             opener_pos: 0,
+            #[cfg(test)]
+            copy_path_hits: 0,
         }
     }
 
@@ -356,14 +366,38 @@ impl AuAssembler {
     /// (a small AU after a multi-MB one): handing over would otherwise attach an
     /// oversized idle allocation to a small frame for as long as the frame queues
     /// downstream, trading a copy for resident memory.
+    ///
+    /// That fallback must not become permanent. `buf`'s capacity used to be a
+    /// one-way high-water mark — the replacement buffer was created with
+    /// `cap.max(tail_len)`, and the copy path's `drain` also preserves `cap` — so
+    /// once ONE large AU had been assembled, every later smaller AU satisfied
+    /// `cap > 2*end` and took the copy path forever. On a UHD HEVC title the first
+    /// IDR grows `buf` to ~4-8 MB, after which each ~200-400 KB P/B AU paid a
+    /// whole-AU allocation plus a whole-AU memcpy plus a tail memmove for ~99% of
+    /// the ~200,000 coded pictures — tens of GB of exactly the memcpy this handover
+    /// exists to remove. So the copy path now also RELEASES the high-water
+    /// capacity, which re-arms the handover for the next AU: one copy after a size
+    /// step down, not one per frame forever.
     fn take_front(&mut self, end: usize) -> Vec<u8> {
         let cap = self.buf.capacity();
+        let tail_len = self.buf.len() - end;
         if cap > end.saturating_mul(2) {
+            #[cfg(test)]
+            {
+                self.copy_path_hits += 1;
+            }
             let data = self.buf[..end].to_vec();
             self.buf.drain(..end);
+            // Shrink toward what this AU actually needed (the tail plus room for
+            // another AU of about this size). Only the short tail is copied, and it
+            // brings `cap` back under the `2*end` threshold so the next AU of this
+            // size hands over instead of copying.
+            self.buf.shrink_to(end.max(tail_len));
             return data;
         }
-        let mut tail = Vec::with_capacity(cap.max(self.buf.len() - end));
+        // Replacement buffer: enough for the tail plus room to accumulate the next
+        // AU of about this size. NOT `cap`, which would re-pin the high-water mark.
+        let mut tail = Vec::with_capacity(end.max(tail_len));
         tail.extend_from_slice(&self.buf[end..]);
         let mut data = std::mem::replace(&mut self.buf, tail);
         data.truncate(end);
@@ -915,11 +949,56 @@ mod tests {
             before,
             "the emitted AU must own the buffer's allocation (no whole-frame copy)"
         );
-        assert_eq!(
+        // The replacement buffer keeps room for another AU of about this size, so
+        // the next AU does not re-grow — but it is NOT pinned to the OLD capacity,
+        // which would make `buf` a permanent high-water mark and send every later
+        // smaller AU down the copy path (see
+        // `handover_survives_a_large_au_instead_of_copying_every_later_one`).
+        assert!(
+            a.buf.capacity() >= au1.len(),
+            "replacement buffer must fit another AU of this size: {} < {}",
             a.buf.capacity(),
-            cap_before,
-            "the replacement buffer keeps the capacity, so the next AU does not re-grow"
+            au1.len()
+        );
+        assert!(
+            a.buf.capacity() <= cap_before,
+            "replacement buffer must never EXCEED the old capacity"
         );
         assert_eq!(a.buf.len(), 4, "the buffer holds only AU2's delimiter tail");
+    }
+
+    /// MEASURED: `take_front`'s copy fallback must not become permanent.
+    ///
+    /// `buf`'s capacity used to be a one-way high-water mark, and the copy path's
+    /// `drain` preserves it, so after ONE large AU every later smaller AU satisfied
+    /// `cap > 2*end` and copied forever. On a UHD HEVC title the first IDR grows
+    /// `buf` to multiple MB, after which ~99% of the ~200,000 coded pictures each
+    /// paid a whole-AU allocation + whole-AU memcpy + tail memmove — tens of GB of
+    /// exactly the copy the handover exists to remove. Counted at the copy path
+    /// itself: one copy is expected right after the size step down; a per-frame
+    /// copy is the bug.
+    #[test]
+    fn handover_survives_a_large_au_instead_of_copying_every_later_one() {
+        let mut a = AuAssembler::for_codec(Codec::H264);
+        // Production shape: BD-TS aligns one access unit per PES, so each `push`
+        // carries about one AU and the buffer holds ~one AU at a time. One large AU
+        // (the IDR) followed by a run of much smaller ones (P/B frames). Each AU is
+        // pushed with the NEXT AU's opener so the previous one closes.
+        const SMALL: usize = 64 * 1024;
+        let mut pending = au(0x11, 2 * 1024 * 1024);
+        for i in 0..20u8 {
+            let next = au(0x30 + i, SMALL);
+            // Append the next AU's 4-byte opener to close `pending`, push, and
+            // carry the rest of `next` forward.
+            pending.extend_from_slice(&next[..4]);
+            a.push(&pending, Some(1), None, None, false);
+            pending = next[4..].to_vec();
+        }
+        let hits = a.copy_path_hits;
+        assert!(
+            hits <= 2,
+            "the copy fallback must re-arm the handover, not fire for every AU \
+             after a large one: {hits} copies over 20 access units"
+        );
     }
 }

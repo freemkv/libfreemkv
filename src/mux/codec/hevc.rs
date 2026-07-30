@@ -138,13 +138,28 @@ pub struct HevcParser {
     // is consumed (cleared) by that first CRA so only ONE CRA per boundary is
     // touched — never a mid-stream CRA, never an IDR, never a non-CRA NAL.
     //
-    // SAFETY: defaults to `false` and is ONLY ever set through
-    // `mark_clip_boundary`, which the caller invokes ONLY for a non-seamless
-    // (0x05/0x06) join. connection_condition 0x01 is the first-item/seamless
-    // case and must NOT trigger this flag. A stream with no boundary marker
-    // (single-clip title, or seamless-joined 0x01 UHD/BD) never has this set,
-    // so the rewrite branch is never reached and output is byte-identical to a
-    // parser without this field.
+    // ARMED BY TWO PATHS — do not read this flag as caller-driven only:
+    //
+    //  1. `mark_clip_boundary`, which a caller invokes only for a non-seamless
+    //     (0x05/0x06) join. connection_condition 0x01 is the first-item/seamless
+    //     case and must NOT trigger this flag. In practice NO caller wires this
+    //     up: the mpls connection_condition is not plumbed through the threaded
+    //     mux pipeline (see the note at the auto-detect site in `parse`).
+    //  2. The in-parser PTS-backstep AUTO-DETECTION in `parse` — a backward PES
+    //     PTS step beyond `BACKSTEP_TICKS` sets it with no caller involvement.
+    //     This is the path that actually fires in production, and it is the one
+    //     the CRA→BLA rewrite exists for.
+    //
+    // So the rewrite branch is NOT dead, and output is NOT byte-identical to a
+    // parser without this field: any stream whose PES PTS steps backward by more
+    // than `BACKSTEP_TICKS` — including a damaged/rewritten PTS field on an
+    // untrusted disc — has its next CRA_NUT rewritten to BLA_W_LP, which makes a
+    // decoder discard that CRA's valid RASL leading pictures. That false-arming
+    // risk is held down by the `PTS_WRAP_PERIOD` unwrapping and the high-water
+    // watermark, not by the flag being unreachable: REMOVING either guard on the
+    // strength of "only `mark_clip_boundary` sets this" is a live corruption bug.
+    // Pinned by `cra_at_auto_detected_pts_backstep_rewritten_to_bla` and
+    // `cra_after_33bit_pts_wrap_not_rewritten`.
     pending_clip_boundary: bool,
     // Highest PES PTS seen on this video stream so far, on a MONOTONIC 64-bit
     // timeline (raw 33-bit PTS unwrapped across 2^33 wraparounds — see
@@ -215,6 +230,24 @@ const _: () = assert!(
     BACKSTEP_TICKS * 100_000 / 9 == crate::mux::timeline::DISCONTINUITY_BACKSTEP_NS,
     "HEVC BACKSTEP_TICKS must mirror mux::timeline::DISCONTINUITY_BACKSTEP_NS"
 );
+
+// Bytes reserved at the front of every assembled access unit so the keyframe
+// parameter-set re-assert can be spliced in without reallocating. A VPS + SPS +
+// PPS re-assert is a few hundred bytes (each a 4-byte length prefix plus a NAL
+// that is tens to low hundreds of bytes on real BD/UHD streams); 1 KiB covers it
+// with margin, and costs 1 KiB of slack per in-flight frame. If a stream's
+// parameter sets ever exceed this the splice still produces correct output — it
+// just reallocates once, exactly as it always did.
+const PARAM_REASSERT_HEADROOM: usize = 1024;
+
+// Per-thread count of keyframe re-asserts that had to reallocate the frame buffer.
+// Test-only instrumentation: the whole point of `PARAM_REASSERT_HEADROOM` is that
+// the splice is in-place, so that is MEASURED rather than reasoned about. See
+// `keyframe_param_reassert_does_not_reallocate_the_frame`.
+#[cfg(test)]
+thread_local! {
+    static PARAM_REASSERT_REALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // The 33-bit 90 kHz PES PTS counter wraps at 2^33 ticks (~26.5 h). When the raw
 // PTS steps backward by approximately a full period — i.e. it landed just past
@@ -302,6 +335,16 @@ impl HevcParser {
     /// Unknown payload types are skipped by their size so a later HDR10 message
     /// in the same NAL is still reached.
     fn scan_sei(&mut self, nal: &[u8]) {
+        // Both HDR10 messages are per-stream constants and STICKY (first seen
+        // wins), so once both are captured every remaining match arm below
+        // declines and the whole scan is a guaranteed no-op. Return BEFORE
+        // `strip_emulation_prevention`, which allocates and byte-copies the entire
+        // SEI RBSP: an HDR10 UHD stream carries a prefix SEI per access unit, so
+        // without this the other ~200,000 access units of a title each paid one
+        // allocation and one copy for a result that is discarded.
+        if self.sei_mastering.is_some() && self.sei_content_light.is_some() {
+            return;
+        }
         let Some(raw) = nal.get(2..) else {
             return;
         };
@@ -532,7 +575,11 @@ impl CodecParser for HevcParser {
         // Pre-size: output is ~input bytes with a few 4-byte length
         // prefixes added. UHD frames are 150-300 KB; the unsized Vec
         // growth chain otherwise reallocs 5-7× per frame.
-        let mut frame_data = Vec::with_capacity(data.len() + 64);
+        //
+        // Plus `PARAM_REASSERT_HEADROOM` so the keyframe parameter-set re-assert
+        // below can be spliced in FRONT of the frame without reallocating. See
+        // that site.
+        let mut frame_data = Vec::with_capacity(data.len() + 64 + PARAM_REASSERT_HEADROOM);
 
         // Single-pass NAL scan: extract params, detect keyframes, build length-prefixed output
         let mut pos = 0;
@@ -670,13 +717,34 @@ impl CodecParser for HevcParser {
         // when active == codecPrivate) so each keyframe is self-contained and a
         // decoder that dropped the set (CRA reset / SPS event) self-heals.
         if keyframe {
-            let mut prefix = Vec::new();
+            let mut prefix = Vec::with_capacity(PARAM_REASSERT_HEADROOM);
             reassert_active(&mut prefix, &self.cur_vps, emitted_vps);
             reassert_active(&mut prefix, &self.cur_sps, emitted_sps);
             reassert_active(&mut prefix, &self.cur_pps, emitted_pps);
             if !prefix.is_empty() {
-                prefix.extend_from_slice(&frame_data);
-                frame_data = prefix;
+                // SPLICE the few hundred prefix bytes into the front of the
+                // already-assembled frame, in place.
+                //
+                // This used to be `prefix.extend_from_slice(&frame_data)` followed
+                // by `frame_data = prefix`: that grew `prefix` from a few hundred
+                // bytes to the FULL access-unit size (a fresh multi-MB allocation),
+                // memcpy'd the whole frame into it, and dropped the presized
+                // `frame_data` buffer — one extra whole-frame allocation plus one
+                // extra whole-frame copy per keyframe. A 2 h UHD title at 24 fps
+                // with a 1 s GOP is ~7,200 keyframes, i.e. ~7,200 multi-MB
+                // allocations and ~14-28 GB of avoidable memcpy per title.
+                //
+                // `frame_data` was reserved with `PARAM_REASSERT_HEADROOM` to spare
+                // precisely so this splice fits without reallocating; what remains
+                // is one in-place memmove inside the existing buffer. Byte-identical
+                // output either way.
+                #[cfg(test)]
+                let cap_before = frame_data.capacity();
+                frame_data.splice(0..0, prefix);
+                #[cfg(test)]
+                if frame_data.capacity() != cap_before {
+                    PARAM_REASSERT_REALLOCS.with(|c| c.set(c.get() + 1));
+                }
             }
         }
 
@@ -839,9 +907,22 @@ struct SpsChroma {
     temporal_id_nesting_flag: u8,
 }
 
+// Per-thread count of `strip_emulation_prevention` calls. Test-only
+// instrumentation: the function allocates and byte-copies a whole RBSP, and
+// `scan_sei` used to run it for every SEI NAL of every access unit, so "how many
+// copies did a stream actually cost" is worth MEASURING rather than reasoning
+// about. Thread-local, not a global atomic, because `cargo test` runs tests
+// concurrently. See `scan_sei_stops_copying_once_both_hdr10_messages_are_captured`.
+#[cfg(test)]
+thread_local! {
+    static RBSP_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Strip HEVC/H.264 emulation-prevention bytes (00 00 03 → 00 00) from a NAL
 /// RBSP so a bit reader sees the true coded values.
 fn strip_emulation_prevention(rbsp: &[u8]) -> Vec<u8> {
+    #[cfg(test)]
+    RBSP_COPIES.with(|c| c.set(c.get() + 1));
     let mut out = Vec::with_capacity(rbsp.len());
     let mut zeros = 0usize;
     for &b in rbsp {
@@ -1167,6 +1248,67 @@ mod tests {
         assert_eq!(h.min_display_mastering_luminance, min_lum);
         assert_eq!(h.max_content_light_level, maxcll);
         assert_eq!(h.max_pic_average_light_level, maxfall);
+    }
+
+    /// MEASURED, not reasoned: an HDR10 stream carries a prefix SEI per access
+    /// unit, and `scan_sei` allocated + byte-copied the whole SEI RBSP through
+    /// `strip_emulation_prevention` on EVERY one — including after both HDR10
+    /// messages were already captured and every match arm was guaranteed to
+    /// decline. On a ~200,000-frame UHD title that is ~200,000 allocations and
+    /// copies for a discarded result. Counted at the single
+    /// `strip_emulation_prevention` site.
+    #[test]
+    fn scan_sei_stops_copying_once_both_hdr10_messages_are_captured() {
+        let pps = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(NAL_PPS));
+            v.push(0xC0);
+            v
+        };
+        let idr = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(19));
+            v.push(0xEC);
+            v
+        };
+        // Every AU carries BOTH HDR10 SEI messages, as a real HDR10 stream does.
+        let au = || {
+            let mut data = pps.clone();
+            data.extend_from_slice(&sei_nal(&[
+                sei_message(
+                    SEI_MASTERING_DISPLAY_COLOUR_VOLUME,
+                    &mastering_payload([1, 2, 3], [4, 5, 6], 7, 8, 9, 10),
+                ),
+                sei_message(SEI_CONTENT_LIGHT_LEVEL_INFO, &cll_payload(1000, 400)),
+            ]));
+            data.extend_from_slice(&idr);
+            data
+        };
+
+        let mut parser = HevcParser::new();
+        // First AU: both messages captured, so this one legitimately copies.
+        parser.parse(&make_pes(au(), Some(0)));
+        assert!(
+            parser.sei_mastering.is_some() && parser.sei_content_light.is_some(),
+            "first AU must capture both HDR10 messages"
+        );
+        // Now measure the next 50 AUs, whose SEI scan is a guaranteed no-op.
+        RBSP_COPIES.with(|c| c.set(0));
+        for i in 0..50 {
+            parser.parse(&make_pes(au(), Some(3750 * (i + 1))));
+        }
+        let copies = RBSP_COPIES.with(|c| c.get());
+        assert_eq!(
+            copies, 0,
+            "SEI RBSP must not be copied once both HDR10 messages are captured; \
+             {copies} copies over 50 access units"
+        );
+        // And the captured metadata is still surfaced on those later frames.
+        let f = parser.parse(&make_pes(au(), Some(3750 * 51)));
+        assert!(
+            f[0].coding.unwrap().hdr10().is_some(),
+            "the sticky HDR10 metadata must still ride every later frame"
+        );
     }
 
     /// Only the mastering-display SEI (no content-light SEI) → metadata is NOT
@@ -1507,6 +1649,60 @@ mod tests {
         assert!(
             pps_of(&nals_in(&f5[0].data)).iter().any(|b| b == &pps_a),
             "bare keyframe must re-assert the active PPS even when == codecPrivate"
+        );
+    }
+
+    /// MEASURED: the keyframe parameter-set re-assert must be spliced into the
+    /// front of the already-assembled access unit IN PLACE, not built as a fresh
+    /// full-size buffer.
+    ///
+    /// It used to `prefix.extend_from_slice(&frame_data)` and then replace
+    /// `frame_data` with `prefix`, which grew a few-hundred-byte `prefix` to the
+    /// FULL access-unit size — a fresh multi-MB allocation — memcpy'd the whole
+    /// frame into it, and dropped the presized buffer. One extra whole-frame
+    /// allocation plus one extra whole-frame copy per keyframe: a 2 h UHD title at
+    /// 24 fps with a 1 s GOP is ~7,200 keyframes, ~14-28 GB of avoidable memcpy per
+    /// title. `PARAM_REASSERT_HEADROOM` exists so the splice never reallocates;
+    /// this counts the reallocations that happen, which must be zero.
+    #[test]
+    fn keyframe_param_reassert_does_not_reallocate_the_frame() {
+        fn nal(t: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(t));
+            v.extend_from_slice(body);
+            v
+        }
+        let sps_body = [0x01u8; 24];
+        let pps_body = [0xA1u8, 0xA2, 0xA3];
+        let mut parser = HevcParser::new();
+        // AU1 seeds the active VPS/SPS/PPS.
+        let au1 = [
+            nal(32, &[0xAA; 12]),
+            nal(33, &sps_body),
+            nal(34, &pps_body),
+            nal(19, &[0x10; 4096]),
+        ]
+        .concat();
+        parser.parse(&make_pes(au1, Some(0)));
+
+        // A run of BARE keyframes (source omits the parameter sets), each of which
+        // takes the re-assert path. Payload sized like a real coded picture so a
+        // reallocation would be the expensive one.
+        PARAM_REASSERT_REALLOCS.with(|c| c.set(0));
+        for i in 0..30i64 {
+            let au = nal(19, &vec![0x11u8; 300_000]);
+            let f = parser.parse(&make_pes(au, Some(3600 * (i + 1))));
+            // The re-assert really happened (otherwise the count is vacuously 0).
+            assert!(
+                f[0].data.len() > 300_000,
+                "keyframe {i} must carry the re-asserted parameter sets"
+            );
+        }
+        let reallocs = PARAM_REASSERT_REALLOCS.with(|c| c.get());
+        assert_eq!(
+            reallocs, 0,
+            "the parameter-set splice must fit in the reserved headroom; \
+             {reallocs} of 30 keyframes reallocated the whole frame"
         );
     }
 
