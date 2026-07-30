@@ -436,7 +436,7 @@ impl<W: Write> M2tsMux<W> {
     }
 
     fn maybe_emit_psi(&mut self) -> io::Result<()> {
-        if self.packets_written == 0 || self.packets_written % PSI_INTERVAL_PACKETS == 0 {
+        if self.packets_written == 0 || self.packets_written.is_multiple_of(PSI_INTERVAL_PACKETS) {
             self.emit_pat()?;
             self.emit_pmt()?;
         }

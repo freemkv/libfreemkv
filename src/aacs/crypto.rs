@@ -49,7 +49,7 @@ pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
 /// expansions.
 pub(crate) fn aes_cbc_encrypt(key: &[u8; 16], data: &mut [u8]) {
     debug_assert!(
-        data.len() % 16 == 0,
+        data.len().is_multiple_of(16),
         "aes_cbc_encrypt requires a block-aligned slice"
     );
     let cipher = Aes128::new(GenericArray::from_slice(key));
@@ -71,7 +71,7 @@ pub(crate) fn aes_cbc_encrypt(key: &[u8; 16], data: &mut [u8]) {
 
 pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
     debug_assert!(
-        data.len() % 16 == 0,
+        data.len().is_multiple_of(16),
         "aes_cbc_decrypt requires a block-aligned slice"
     );
     let cipher = Aes128::new(GenericArray::from_slice(key));

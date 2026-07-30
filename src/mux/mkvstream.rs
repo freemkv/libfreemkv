@@ -254,11 +254,11 @@ impl MvcMerge {
                 .front()
                 .map(|pb| pb.additional.is_some())
                 .unwrap_or(false);
-            if front_ready || self.pending_base.len() > MVC_PAIR_WINDOW {
-                if let Some(pb) = self.pending_base.pop_front() {
-                    out.push((pb.frame, pb.additional));
-                    continue;
-                }
+            if (front_ready || self.pending_base.len() > MVC_PAIR_WINDOW)
+                && let Some(pb) = self.pending_base.pop_front()
+            {
+                out.push((pb.frame, pb.additional));
+                continue;
             }
             break;
         }

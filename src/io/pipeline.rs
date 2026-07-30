@@ -752,15 +752,15 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     Err(payload) => Err(consumer_panicked(payload)),
                 };
             }
-            if let Some(h) = halt {
-                if h.is_cancelled() {
-                    return finish_with_grace(
-                        handle,
-                        &state,
-                        Duration::from_secs(FINISH_GRACE_SECS),
-                        Error::Halted,
-                    );
-                }
+            if let Some(h) = halt
+                && h.is_cancelled()
+            {
+                return finish_with_grace(
+                    handle,
+                    &state,
+                    Duration::from_secs(FINISH_GRACE_SECS),
+                    Error::Halted,
+                );
             }
             if Instant::now() >= deadline {
                 return finish_with_grace(

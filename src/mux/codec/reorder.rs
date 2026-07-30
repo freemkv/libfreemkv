@@ -168,12 +168,12 @@ impl SparsePtsReorder {
                 // (assumes both anchors sit at a similar relative display slot),
                 // but each GOP re-locks its own origin, so the estimate only sets
                 // intra-GOP spacing.
-                if self.dur_ns == 0 {
-                    if let (Some((p_held, _)), Some((p_next, _))) = (held.anchor, gop.anchor) {
-                        let span = p_next - p_held;
-                        if span > 0 && held.count > 0 {
-                            self.dur_ns = (span / held.count).max(1);
-                        }
+                if self.dur_ns == 0
+                    && let (Some((p_held, _)), Some((p_next, _))) = (held.anchor, gop.anchor)
+                {
+                    let span = p_next - p_held;
+                    if span > 0 && held.count > 0 {
+                        self.dur_ns = (span / held.count).max(1);
                     }
                 }
                 out = self.emit_gop(held);

@@ -50,10 +50,10 @@ fn merge(ls: Vec<StreamLabel>, mb: Vec<StreamLabel>) -> Vec<StreamLabel> {
         if let Some(mb_match) = mb
             .iter()
             .find(|m| m.stream_type == label.stream_type && m.stream_number == label.stream_number)
+            && label.name.is_empty()
+            && !mb_match.name.is_empty()
         {
-            if label.name.is_empty() && !mb_match.name.is_empty() {
-                label.name = mb_match.name.clone();
-            }
+            label.name = mb_match.name.clone();
         }
     }
     // Append any menu_base-only stream (present in mb but not in ls by

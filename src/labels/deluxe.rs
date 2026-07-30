@@ -596,14 +596,13 @@ impl<'a> BindingDecoder<'a> {
                 // Underneath the args: the object the constructor
                 // operates on. For our pattern it's NewObj(X).
                 let receiver = self.stack.pop().unwrap_or(StackVal::Unknown);
-                if let StackVal::NewObj(name) = receiver {
-                    if name == member.class_name {
+                if let StackVal::NewObj(name) = receiver
+                    && name == member.class_name {
                         self.constructions.push(Construction {
                             binding_type: name,
                             args,
                         });
                     }
-                }
             }
             // invokevirtual / invokestatic / invokeinterface — pop
             // args per descriptor, push a return placeholder unless

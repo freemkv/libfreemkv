@@ -159,11 +159,9 @@ fn parse_eac3(f: &[u8]) -> Option<DolbyConfig> {
     // samples at sample_rate. rate = bytes·8·sr / samples / 1000.
     let frame_bytes = (frmsiz as u64 + 1) * 2;
     let samples = blocks as u64 * 256;
-    let data_rate_kbps = if samples > 0 {
-        ((frame_bytes * 8 * sample_rate as u64) / samples / 1000) as u16
-    } else {
-        0
-    };
+    let data_rate_kbps = (frame_bytes * 8 * sample_rate as u64)
+        .checked_div(samples)
+        .map_or(0, |r| (r / 1000) as u16);
 
     Some(DolbyConfig {
         fscod,

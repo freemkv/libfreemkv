@@ -249,10 +249,10 @@ fn crack_key_scan(
         while i < ext.sector_count && tried < max_tries {
             // Cooperative cancellation — poll once per batch, the same cadence
             // sweep/patch use, so a Stop / watchdog can interrupt the scan.
-            if let Some(h) = halt {
-                if h.is_cancelled() {
-                    break 'outer;
-                }
+            if let Some(h) = halt
+                && h.is_cancelled()
+            {
+                break 'outer;
             }
             // Liveness beacon: a long scan over a damaged disc stays visible.
             // The heartbeat is time-throttled; only when it actually beats do
@@ -367,16 +367,16 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) {
             original.copy_from_slice(chunk);
         }
         lfsr::descramble_sector(title_key, chunk);
-        if let Some(crib) = crib {
-            if chunk[0x80..0x80 + 10] != crib[..] {
-                // Cached key is stale for this region — restore the ciphertext and
-                // crack this sector's own key.
-                chunk.copy_from_slice(&original);
-                if let Some(fresh) = stevenson::crack_title_key(chunk) {
-                    *title_key = fresh;
-                }
-                lfsr::descramble_sector(title_key, chunk);
+        if let Some(crib) = crib
+            && chunk[0x80..0x80 + 10] != crib[..]
+        {
+            // Cached key is stale for this region — restore the ciphertext and
+            // crack this sector's own key.
+            chunk.copy_from_slice(&original);
+            if let Some(fresh) = stevenson::crack_title_key(chunk) {
+                *title_key = fresh;
             }
+            lfsr::descramble_sector(title_key, chunk);
         }
     }
 }

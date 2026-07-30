@@ -20,7 +20,7 @@ pub fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
     let bytes = body.as_bytes();
     // Empty → empty Vec (a legitimately-empty variable-length field); odd length
     // is malformed. (`parse_hex_fixed` enforces a concrete length separately.)
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);

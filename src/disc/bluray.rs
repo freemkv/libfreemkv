@@ -29,12 +29,11 @@ impl Disc {
             for entry in &playlist_dir.entries {
                 if !entry.is_dir && entry.name.to_lowercase().ends_with(".mpls") {
                     let path = format!("/BDMV/PLAYLIST/{}", entry.name);
-                    if let Ok(mpls_data) = udf_fs.read_file(reader, &path) {
-                        if let Some(title) =
+                    if let Ok(mpls_data) = udf_fs.read_file(reader, &path)
+                        && let Some(title) =
                             Self::parse_playlist(reader, udf_fs, &entry.name, &mpls_data)
-                        {
-                            titles.push(title);
-                        }
+                    {
+                        titles.push(title);
                     }
                 }
             }
@@ -92,54 +91,54 @@ impl Disc {
             let mut pkt_count: u32 = 0;
 
             let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
-            if let Ok(clpi_data) = udf_fs.read_file(reader, &clpi_path) {
-                if let Ok(clip_info) = clpi::parse(&clpi_data) {
-                    pkt_count = clip_info.source_packet_count;
+            if let Ok(clpi_data) = udf_fs.read_file(reader, &clpi_path)
+                && let Ok(clip_info) = clpi::parse(&clpi_data)
+            {
+                pkt_count = clip_info.source_packet_count;
 
-                    // Mark the clip seen ONLY after its .clpi parses — a transient
-                    // read/parse failure on the first PlayItem referencing a clip
-                    // must not permanently suppress its extents/size for a later
-                    // PlayItem referencing the same clip that succeeds.
-                    let first_ref = seen_clips.insert(play_item.clip_id.clone());
+                // Mark the clip seen ONLY after its .clpi parses — a transient
+                // read/parse failure on the first PlayItem referencing a clip
+                // must not permanently suppress its extents/size for a later
+                // PlayItem referencing the same clip that succeeds.
+                let first_ref = seen_clips.insert(play_item.clip_id.clone());
 
-                    // Only fetch/push the physical extents and add to the
-                    // total size the first time this clip_id is seen.
-                    if first_ref {
-                        total_size += pkt_count as u64 * 192;
+                // Only fetch/push the physical extents and add to the
+                // total size the first time this clip_id is seen.
+                if first_ref {
+                    total_size += pkt_count as u64 * 192;
 
-                        // Get stream file extents from UDF allocation descriptors.
-                        // Dual-layer discs split files across layers — UDF knows the real layout.
-                        //
-                        // The clip's stream file is normally `.m2ts`, but AACS 2.1
-                        // (FMTS) discs name the main feature `.fmts` and 3D discs
-                        // use `.ssif` (see [`CLIP_STREAM_EXTS`]). A normal `.m2ts`
-                        // clip is unchanged — the fallback only runs when `.m2ts`
-                        // is absent, which is exactly when `file_extents` errors.
-                        // 3D discs interleave the left (base) and right (MVC
-                        // dependent) views in STREAM/SSIF/<clip>.ssif — note the
-                        // SSIF/ subdir. Prefer it when present: the SSIF is one
-                        // transport stream carrying BOTH eyes on distinct PIDs,
-                        // so muxing it captures the full 3D. 2D clips fall back to
-                        // the base .m2ts / .fmts as before.
-                        let ssif = format!("/BDMV/STREAM/SSIF/{}.ssif", play_item.clip_id);
-                        let file_exts = match udf_fs.file_extents(reader, &ssif) {
-                            Ok(exts) => {
-                                is_3d = true;
-                                Some(exts)
-                            }
-                            Err(_) => CLIP_STREAM_EXTS.iter().find_map(|ext| {
-                                let path = format!("/BDMV/STREAM/{}.{}", play_item.clip_id, ext);
-                                udf_fs.file_extents(reader, &path).ok()
-                            }),
-                        };
-                        if let Some(file_exts) = file_exts {
-                            for (lba, sectors) in file_exts {
-                                if sectors > 0 && lba > 0 {
-                                    extents.push(Extent {
-                                        start_lba: lba,
-                                        sector_count: sectors,
-                                    });
-                                }
+                    // Get stream file extents from UDF allocation descriptors.
+                    // Dual-layer discs split files across layers — UDF knows the real layout.
+                    //
+                    // The clip's stream file is normally `.m2ts`, but AACS 2.1
+                    // (FMTS) discs name the main feature `.fmts` and 3D discs
+                    // use `.ssif` (see [`CLIP_STREAM_EXTS`]). A normal `.m2ts`
+                    // clip is unchanged — the fallback only runs when `.m2ts`
+                    // is absent, which is exactly when `file_extents` errors.
+                    // 3D discs interleave the left (base) and right (MVC
+                    // dependent) views in STREAM/SSIF/<clip>.ssif — note the
+                    // SSIF/ subdir. Prefer it when present: the SSIF is one
+                    // transport stream carrying BOTH eyes on distinct PIDs,
+                    // so muxing it captures the full 3D. 2D clips fall back to
+                    // the base .m2ts / .fmts as before.
+                    let ssif = format!("/BDMV/STREAM/SSIF/{}.ssif", play_item.clip_id);
+                    let file_exts = match udf_fs.file_extents(reader, &ssif) {
+                        Ok(exts) => {
+                            is_3d = true;
+                            Some(exts)
+                        }
+                        Err(_) => CLIP_STREAM_EXTS.iter().find_map(|ext| {
+                            let path = format!("/BDMV/STREAM/{}.{}", play_item.clip_id, ext);
+                            udf_fs.file_extents(reader, &path).ok()
+                        }),
+                    };
+                    if let Some(file_exts) = file_exts {
+                        for (lba, sectors) in file_exts {
+                            if sectors > 0 && lba > 0 {
+                                extents.push(Extent {
+                                    start_lba: lba,
+                                    sector_count: sectors,
+                                });
                             }
                         }
                     }
@@ -266,23 +265,23 @@ impl Disc {
         // optional) but over-claims 3D for those frames. Real 3D main-feature
         // playlists are single-clip or uniformly 3D, so this is not exercised;
         // per-clip 3D would need per-clip stream sets (a larger change).
-        if is_3d {
-            if let Some(base) = streams.iter().find_map(|s| match s {
+        if is_3d
+            && let Some(base) = streams.iter().find_map(|s| match s {
                 Stream::Video(v) => Some(v.clone()),
                 _ => None,
-            }) {
-                let dep_pid = base.pid.wrapping_add(1);
-                let have_dep = streams
-                    .iter()
-                    .any(|s| matches!(s, Stream::Video(v) if v.pid == dep_pid));
-                if !have_dep {
-                    streams.push(Stream::Video(VideoStream {
-                        pid: dep_pid,
-                        secondary: true,
-                        label: crate::disc::MVC_DEPENDENT_LABEL.to_string(),
-                        ..base
-                    }));
-                }
+            })
+        {
+            let dep_pid = base.pid.wrapping_add(1);
+            let have_dep = streams
+                .iter()
+                .any(|s| matches!(s, Stream::Video(v) if v.pid == dep_pid));
+            if !have_dep {
+                streams.push(Stream::Video(VideoStream {
+                    pid: dep_pid,
+                    secondary: true,
+                    label: crate::disc::MVC_DEPENDENT_LABEL.to_string(),
+                    ..base
+                }));
             }
         }
 

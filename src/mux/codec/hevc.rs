@@ -307,11 +307,10 @@ impl HevcParser {
         };
         let rbsp = strip_emulation_prevention(raw);
         let mut i = 0usize;
-        loop {
-            // payloadType: sum of 0xFF run + final byte.
-            let Some(payload_type) = read_sei_ff_value(&rbsp, &mut i) else {
-                break;
-            };
+        // payloadType: sum of 0xFF run + final byte. Exhausting the RBSP ends the
+        // walk; the remaining `let ... else break` arms below handle a TRUNCATED
+        // message, which is a different condition from a clean end.
+        while let Some(payload_type) = read_sei_ff_value(&rbsp, &mut i) {
             // payloadSize: same ff-extension coding.
             let Some(payload_size) = read_sei_ff_value(&rbsp, &mut i) else {
                 break;
@@ -504,11 +503,11 @@ impl CodecParser for HevcParser {
             // 33-bit counter wrapped: add another period and re-check, rather
             // than treat the wrap as a backward clip reset.
             let mut unwrapped = raw_pts + self.pts_wrap_offset;
-            if let Some(high) = self.high_pts {
-                if high - unwrapped > PTS_WRAP_PERIOD / 2 {
-                    self.pts_wrap_offset += PTS_WRAP_PERIOD;
-                    unwrapped += PTS_WRAP_PERIOD;
-                }
+            if let Some(high) = self.high_pts
+                && high - unwrapped > PTS_WRAP_PERIOD / 2
+            {
+                self.pts_wrap_offset += PTS_WRAP_PERIOD;
+                unwrapped += PTS_WRAP_PERIOD;
             }
             match self.high_pts {
                 Some(high) if unwrapped < high - BACKSTEP_TICKS => {
@@ -564,18 +563,18 @@ impl CodecParser for HevcParser {
                     // `num_extra_slice_header_bits` — and thus the bit offset to
                     // `slice_type` — is EXACT. With no PPS we decline rather than
                     // guess, leaving coding `None` (honestly absent).
-                    if coding_type.is_none() && nal_type <= NAL_VCL_MAX {
-                        if let Some(num_extra) = self
+                    if coding_type.is_none()
+                        && nal_type <= NAL_VCL_MAX
+                        && let Some(num_extra) = self
                             .cur_pps
                             .as_deref()
                             .and_then(hevc_num_extra_slice_header_bits)
-                        {
-                            coding_type = hevc_first_slice_coding_type(
-                                &data[nal_start..end],
-                                nal_type,
-                                num_extra,
-                            );
-                        }
+                    {
+                        coding_type = hevc_first_slice_coding_type(
+                            &data[nal_start..end],
+                            nal_type,
+                            num_extra,
+                        );
                     }
 
                     match nal_type {

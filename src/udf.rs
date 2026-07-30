@@ -1264,10 +1264,10 @@ fn parse_dstring(data: &[u8]) -> String {
             for i in (0..chars.len()).step_by(2) {
                 if i + 1 < chars.len() {
                     let c = ((chars[i] as u16) << 8) | chars[i + 1] as u16;
-                    if c != 0 {
-                        if let Some(ch) = char::from_u32(c as u32) {
-                            s.push(ch);
-                        }
+                    if c != 0
+                        && let Some(ch) = char::from_u32(c as u32)
+                    {
+                        s.push(ch);
                     }
                 }
             }

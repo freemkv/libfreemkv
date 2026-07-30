@@ -420,10 +420,11 @@ impl Stream for PipelinedPesStream {
             return true;
         }
         for (idx, s) in self.title.streams.iter().enumerate() {
-            if let crate::disc::Stream::Video(v) = s {
-                if !v.secondary && self.codec_private(idx).is_none() {
-                    return false;
-                }
+            if let crate::disc::Stream::Video(v) = s
+                && !v.secondary
+                && self.codec_private(idx).is_none()
+            {
+                return false;
             }
         }
         true

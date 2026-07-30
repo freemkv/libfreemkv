@@ -332,11 +332,11 @@ impl AacsKeyMap {
             if sectors == 0 {
                 return;
             }
-            if let Some(last) = plan.last_mut() {
-                if last.start_lba.saturating_add(last.sector_count) == lba {
-                    last.sector_count += sectors;
-                    return;
-                }
+            if let Some(last) = plan.last_mut()
+                && last.start_lba.saturating_add(last.sector_count) == lba
+            {
+                last.sector_count += sectors;
+                return;
             }
             plan.push(crate::disc::Extent {
                 start_lba: lba,
