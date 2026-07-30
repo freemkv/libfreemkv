@@ -664,23 +664,11 @@ mod tests {
         let original = vec![0x42u8; 128]; // 8 blocks
         let mut data = original.clone();
 
-        // Encrypt with CBC manually (forward direction)
-        fn aes_cbc_encrypt(key: &[u8; 16], data: &mut [u8]) {
-            let cipher = Aes128::new(GenericArray::from_slice(key));
-            let mut prev = super::AACS_IV;
-            let num_blocks = data.len() / 16;
-            for i in 0..num_blocks {
-                let offset = i * 16;
-                for j in 0..16 {
-                    data[offset + j] ^= prev[j];
-                }
-                let mut block = GenericArray::clone_from_slice(&data[offset..offset + 16]);
-                cipher.encrypt_block(&mut block);
-                data[offset..offset + 16].copy_from_slice(&block);
-                prev.copy_from_slice(&data[offset..offset + 16]);
-            }
-        }
-
+        // Encrypt with the REAL production primitive. This test previously
+        // defined a local `fn aes_cbc_encrypt` that SHADOWED it, so it round-
+        // tripped a copy of the algorithm against itself and never exercised
+        // `crypto::aes_cbc_encrypt` at all — a mutation to the shipped function
+        // could not fail it.
         aes_cbc_encrypt(&key, &mut data);
         assert_ne!(data, original); // should be different after encrypt
 
