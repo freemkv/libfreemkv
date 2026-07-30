@@ -6,11 +6,7 @@ use aes::Aes128;
 #[cfg(test)]
 use aes::cipher::{KeyInit, generic_array::GenericArray};
 
-use super::crypto::{aes_cbc_decrypt, aes_ecb_encrypt};
-// Available at module scope for this module's test fixtures (they reference
-// `super::AACS_IV` when building CBC ciphertext directly); test-only.
-#[cfg(test)]
-use super::crypto::AACS_IV;
+use super::crypto::{AACS_IV, aes_cbc_decrypt, aes_ecb_encrypt};
 
 // ── AACS constants ──────────────────────────────────────────────────────────
 
@@ -326,19 +322,35 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     }
 }
 
-/// Test-only inverse of [`decrypt_unit`]: encrypt a clear aligned unit under
-/// `unit_key` and set the CPI-encrypted flag (top 2 bits of byte 0) so the unit
-/// reads as encrypted under [`aacs_unit_encrypted`]. Exposed `pub(crate)` for
-/// cross-module mux tests (the mux `driver.rs` builds a genuinely-AACS-encrypted
-/// fixture to prove the live/session decrypt path installs its key map). Uses
-/// only the module-scope primitives so it stays in lock-step with `decrypt_unit`.
-#[cfg(test)]
-pub(crate) fn aacs_encrypt_unit_for_test(unit: &mut [u8], unit_key: &[u8; 16]) {
+/// Encrypt one AACS aligned unit (6144 bytes) IN PLACE — the exact inverse of
+/// [`decrypt_unit`], for authoring an encrypted disc image (and for building
+/// genuinely-encrypted read-path fixtures).
+///
+/// PURE, on the same terms as `decrypt_unit`: it applies the key and nothing else.
+/// It does NOT set the encrypted flag, because where that flag lives is
+/// container-specific (CPI bits in byte 0 for BD-TS, elsewhere for HD-DVD-PS) and
+/// keeping it out is what lets this stay container-agnostic. The only guard is the
+/// length check, since the crypto is defined only over a whole 6144-byte unit.
+///
+/// **Set the encrypted flag BEFORE calling, never after.** Bytes 0..16 are the key
+/// seed and are left in plaintext, so the Block Key derives from them: mutating any
+/// header byte after encrypting changes the seed a decryptor will derive from and
+/// silently yields garbage. The caller's order must be flag, then encrypt.
+///
+/// Block Key = AES-128E(Kcu, seed) ⊕ seed, then AES-128-CBC **encrypt** bytes
+/// 16..6144 under the AACS IV — the forward direction of the same construction
+/// `decrypt_unit` documents, sharing its module-scope primitives so the two cannot
+/// drift apart.
+///
+/// Note one deliberate asymmetry: `decrypt_unit` restores all-zero-on-disc source
+/// padding packets to zero. This does not, and need not — an all-zero plaintext
+/// packet encrypts to ciphertext that is not all-zero, so it is not mistaken for
+/// padding on the way back and the round trip is still exact. Authoring that wants
+/// true source-zero padding leaves those packets unencrypted instead.
+pub fn encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     if unit.len() < ALIGNED_UNIT_LEN {
         return;
     }
-    // Set CPI bits BEFORE key derivation so the recovered plaintext header matches.
-    unit[0] |= 0xC0;
     let mut header = [0u8; 16];
     header.copy_from_slice(&unit[..16]);
     let derived = aes_ecb_encrypt(unit_key, &header);
@@ -381,6 +393,73 @@ mod tests {
     use super::super::crypto::aes_ecb_decrypt;
     use super::*;
     use aes::cipher::BlockEncrypt; // test fixtures build ciphertext directly
+
+    /// [`encrypt_unit`] is the exact inverse of [`decrypt_unit`]: whatever an
+    /// authoring caller encrypts, the read path must recover byte-for-byte.
+    ///
+    /// Mutation: drop the trailing `⊕ header` from either function's Block Key
+    /// derivation, or swap `AACS_IV` for zeroes in one of them, and the two stop
+    /// agreeing -> this fails.
+    #[test]
+    fn encrypt_unit_is_the_exact_inverse_of_decrypt_unit() {
+        let key = [0x3Cu8; 16];
+        // Content with no all-zero packets: every byte position exercised.
+        let mut clear: Vec<u8> = (0..ALIGNED_UNIT_LEN)
+            .map(|i| (i * 7 % 251 + 1) as u8)
+            .collect();
+        // The encrypted flag belongs to the caller and must be set BEFORE the
+        // crypto, since bytes 0..16 are the key seed.
+        clear[0] |= 0xC0;
+
+        let mut unit = clear.clone();
+        encrypt_unit(&mut unit, &key);
+        assert_ne!(
+            unit[16..],
+            clear[16..],
+            "the payload must actually be enciphered"
+        );
+        assert_eq!(
+            unit[..16],
+            clear[..16],
+            "the 16-byte seed stays plaintext on disc"
+        );
+
+        decrypt_unit(&mut unit, &key);
+        assert_eq!(unit, clear, "round trip must be byte-exact");
+    }
+
+    /// The documented padding asymmetry actually holds: `decrypt_unit` restores
+    /// all-zero-ON-DISC packets to zero, but an all-zero PLAINTEXT packet enciphers
+    /// to non-zero bytes, so it is not mistaken for padding and still round-trips.
+    /// This is the one place the two functions are deliberately not symmetric, so
+    /// the claim is worth pinning rather than asserting in prose alone.
+    #[test]
+    fn encrypt_unit_round_trips_all_zero_plaintext_packets() {
+        let key = [0xA5u8; 16];
+        let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
+        clear[0] |= 0xC0; // flag before crypto
+        // Give packet 0 some content; leave every later packet entirely zero.
+        for (i, b) in clear[16..192].iter_mut().enumerate() {
+            *b = (i % 255 + 1) as u8;
+        }
+
+        let mut unit = clear.clone();
+        encrypt_unit(&mut unit, &key);
+        // No later packet may encipher to all-zero, or decrypt would treat it as
+        // source padding and the asymmetry would bite.
+        for p in 1..ALIGNED_UNIT_LEN / BD_SOURCE_PACKET_BYTES {
+            let off = p * BD_SOURCE_PACKET_BYTES;
+            assert!(
+                unit[off..off + BD_SOURCE_PACKET_BYTES]
+                    .iter()
+                    .any(|&b| b != 0),
+                "packet {p} enciphered to all-zero, which decrypt reads as padding"
+            );
+        }
+
+        decrypt_unit(&mut unit, &key);
+        assert_eq!(unit, clear, "zero-payload packets must round trip exactly");
+    }
 
     #[test]
     fn test_aes_ecb_roundtrip() {
@@ -652,7 +731,8 @@ mod tests {
     fn aacs_encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
         // Delegate to the module-scope `pub(crate)` helper (the single encrypt
         // implementation, shared with the mux `driver.rs` decrypt test).
-        super::aacs_encrypt_unit_for_test(unit, unit_key);
+        unit[0] |= 0xC0;
+        super::encrypt_unit(unit, unit_key);
     }
 
     /// Build a clear aligned unit with TS sync bytes at offset 4 + k*192.

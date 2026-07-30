@@ -2640,7 +2640,9 @@ mod tests {
             }
             off += 192;
         }
-        crate::aacs::content::aacs_encrypt_unit_for_test(&mut u, key);
+        // Flag encrypted BEFORE encrypting: bytes 0..16 are the key seed.
+        u[0] |= 0xC0;
+        crate::aacs::content::encrypt_unit(&mut u, key);
         u
     }
 

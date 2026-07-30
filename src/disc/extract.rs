@@ -1052,43 +1052,12 @@ mod tests {
         s
     }
 
-    /// Build a clear 6144-byte AACS unit (TS syncs at the 192-byte BD-TS
-    /// stride) then encrypt it under `unit_key` so `aacs::content::decrypt_unit`
-    /// recovers it cleanly (zero decrypt loss). Mirrors the encrypt helper in
-    /// `sector/decrypting.rs` tests. `tag` distinguishes two units' payloads.
+    /// Encrypt the clear unit from `clear_aacs_unit(tag)` under `unit_key` so
+    /// `aacs::content::decrypt_unit` recovers it cleanly (zero decrypt loss).
+    /// `tag` distinguishes two units' payloads.
     fn encrypt_aacs_unit(unit_key: &[u8; 16], tag: u8) -> Vec<u8> {
-        use aes::Aes128;
-        use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-        let mut unit = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
-        let mut off = 4;
-        while off < unit.len() {
-            unit[off] = 0x47; // TS sync
-            if off + 1 < unit.len() {
-                unit[off + 1] = tag; // payload marker so the two extents differ
-            }
-            off += 192;
-        }
-        // Flag encrypted via CPI bits (byte 0) before key derivation.
-        unit[0] |= 0xC0;
-        let header: [u8; 16] = unit[..16].try_into().unwrap();
-        let derived = crate::aacs::crypto::aes_ecb_encrypt(unit_key, &header);
-        let mut k = [0u8; 16];
-        for i in 0..16 {
-            k[i] = derived[i] ^ header[i];
-        }
-        let cipher = Aes128::new(GenericArray::from_slice(&k));
-        let mut prev = crate::aacs::crypto::AACS_IV;
-        let blocks = (crate::aacs::content::ALIGNED_UNIT_LEN - 16) / 16;
-        for i in 0..blocks {
-            let o = 16 + i * 16;
-            for j in 0..16 {
-                unit[o + j] ^= prev[j];
-            }
-            let mut blk = GenericArray::clone_from_slice(&unit[o..o + 16]);
-            cipher.encrypt_block(&mut blk);
-            unit[o..o + 16].copy_from_slice(&blk);
-            prev.copy_from_slice(&unit[o..o + 16]);
-        }
+        let mut unit = clear_aacs_unit(tag);
+        crate::aacs::content::encrypt_unit(&mut unit, unit_key);
         unit
     }
 
