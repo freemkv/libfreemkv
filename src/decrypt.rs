@@ -640,6 +640,92 @@ mod tests {
         );
     }
 
+    /// `decrypt_sectors_in_content` is the entry point `DecryptingSectorSource`
+    /// dispatches to whenever a content map is installed (`sector/decrypting.rs`
+    /// line ~211), so it is on the live read path for every mapped rip. It must
+    /// actually DECRYPT. The two `_is_noop` tests above only assert its `usize`
+    /// return is `0` — which is what a body replaced by `Ok(0)` also returns, so
+    /// neither one constrains it at all.
+    ///
+    /// Here a genuinely scrambled CSS sector goes in and the CONSTRUCTED
+    /// plaintext must come out. Anything that skips `css::descramble_region` —
+    /// including a body that just reports `Ok(0)` — leaves ciphertext in the
+    /// buffer and the caller muxes scrambled MPEG at exit 0.
+    ///
+    /// Expected bytes come from the plaintext this test built BEFORE scrambling
+    /// (CSS scrambles only 0x80..2048; the header stays clear), not from
+    /// re-running any descramble routine.
+    #[test]
+    fn content_gate_css_actually_descrambles_the_buffer() {
+        const RUN_START: usize = 0x59;
+        const SEED_OFFSET: usize = 0x54;
+        const PERIOD: usize = 8;
+        let title_key = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+
+        let mut plaintext = vec![0u8; 2048];
+        plaintext[0x00..0x04].copy_from_slice(&css::PACK_START);
+        plaintext[0x14] = 0x10; // CSS scramble flag (DVD-Video sector header)
+        let pat: Vec<u8> = (0..PERIOD)
+            .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
+            .collect();
+        for (i, b) in plaintext.iter_mut().enumerate().skip(RUN_START) {
+            *b = pat[i % PERIOD];
+        }
+        plaintext[SEED_OFFSET..SEED_OFFSET + 5].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05]);
+
+        let mut buf = plaintext.clone();
+        css::lfsr::scramble_sector(&title_key, &mut buf);
+        let ciphertext = buf.clone();
+        assert_ne!(
+            &ciphertext[0x80..],
+            &plaintext[0x80..],
+            "fixture malformed — the sector was not actually scrambled"
+        );
+
+        let mut keys = DecryptKeys::Css { title_key };
+        decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(0, 1)])
+            .expect("CSS descramble must not fail");
+
+        // Report the first differing offset rather than dumping 1.9 KB.
+        let mismatch = (0x80..2048).find(|&i| buf[i] != plaintext[i]);
+        assert!(
+            mismatch.is_none(),
+            "the scrambled body must come back as the plaintext it was built \
+             from; first mismatch at offset {mismatch:?} (buf={:#04x} \
+             expected={:#04x}) — a wrapper that decrypts nothing leaves the \
+             ciphertext in place and the caller muxes scrambled MPEG",
+            buf[mismatch.unwrap_or(0x80)],
+            plaintext[mismatch.unwrap_or(0x80)],
+        );
+    }
+
+    /// The AACS arm of the same entry point must fail LOUD. Under the
+    /// keymap-only model AACS decrypts exclusively through
+    /// `decrypt_sectors_mapped`; reaching this wrapper with AACS keys means a
+    /// reader was built without installing its key map, and continuing would
+    /// hand the caller ciphertext under an `Ok`. `DecryptFailed` is the correct
+    /// verdict per the function's own contract — it must not be softened into a
+    /// success with a zero count.
+    #[test]
+    fn content_gate_aacs_keys_fail_loud_not_ok_zero() {
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(1, [0xAB; 16])],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let original = scrambled_region(aacs::content::ALIGNED_UNIT_LEN);
+        let mut buf = original.clone();
+        let r = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(0, 3)]);
+        assert!(
+            matches!(r, Err(crate::error::Error::DecryptFailed)),
+            "AACS without an installed key map must be DecryptFailed, got {r:?}"
+        );
+        assert_eq!(
+            buf, original,
+            "and it must not have half-decrypted the buffer on the way out"
+        );
+    }
+
     /// Build a Stevenson-crackable scrambled CSS sector for `title_key` (mirrors
     /// `crackable_sector` in the css::mod tests): a periodic run in the clear
     /// header continues past 0x80 into the encrypted region, so

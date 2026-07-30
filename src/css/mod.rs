@@ -960,6 +960,71 @@ mod tests {
         );
     }
 
+    /// `is_scrambled_uncracked` is the predicate form of the Cracked /
+    /// Unencrypted / ScrambledUncracked split that round 7 introduced precisely
+    /// because conflating those cases made an uncrackable disc exit 0 with
+    /// garbage output. It is a public API predicate, so a consumer of this crate
+    /// can route on it in place of matching the enum.
+    ///
+    /// Every existing use of it asserts only the TRUE direction (the
+    /// ScrambledUncracked case). Nothing anywhere asserted it is FALSE for the
+    /// other two variants, so a body that answered "yes, uncrackable" to
+    /// everything was indistinguishable: a genuinely clear DVD and a
+    /// successfully cracked one would both be routed to `CssNoDiscKey` /
+    /// `CssKeyMissing` and refuse to rip.
+    ///
+    /// All three outcomes here come from real `crack_key_outcome` scans, not
+    /// hand-built enum values, so the predicate is checked against the verdicts
+    /// the scanner actually produces.
+    #[test]
+    fn is_scrambled_uncracked_is_true_for_that_case_and_false_for_the_other_two() {
+        let extents = [Extent {
+            start_lba: 1000,
+            sector_count: 50,
+        }];
+
+        // Cracked: a real Stevenson-crackable sector in an otherwise clear scan.
+        let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let seed = [0x11, 0x22, 0x33, 0x44, 0x55];
+        let mut cracked_src = MockSource::new(0x00);
+        cracked_src.crackable = Some((1003, crackable_sector(&title_key, &seed, 8)));
+        let cracked = crack_key_outcome(&mut cracked_src, &extents, 4, None);
+        assert!(
+            matches!(cracked, CrackOutcome::Cracked(_)),
+            "fixture malformed — expected a real crack, got {cracked:?}"
+        );
+        assert!(
+            !cracked.is_scrambled_uncracked(),
+            "a disc whose key WAS recovered is not scrambled-uncracked; saying \
+             so aborts a rip that had its key in hand"
+        );
+
+        // Unencrypted: scramble flag never set across the scan.
+        let mut clear_src = MockSource::new(0x00);
+        let clear = crack_key_outcome(&mut clear_src, &extents, 4, None);
+        assert!(
+            matches!(clear, CrackOutcome::Unencrypted),
+            "fixture malformed — expected Unencrypted, got {clear:?}"
+        );
+        assert!(
+            !clear.is_scrambled_uncracked(),
+            "a genuinely plaintext disc is not scrambled-uncracked; saying so \
+             turns every unencrypted DVD into a hard CSS key error"
+        );
+
+        // ScrambledUncracked: scrambled sectors seen, no crackable crib.
+        let mut locked_src = MockSource::new(0x30);
+        let locked = crack_key_outcome(&mut locked_src, &extents, 4, None);
+        assert!(
+            matches!(locked, CrackOutcome::ScrambledUncracked),
+            "fixture malformed — expected ScrambledUncracked, got {locked:?}"
+        );
+        assert!(
+            locked.is_scrambled_uncracked(),
+            "scrambled sectors seen and no key recovered IS the hard-failure case"
+        );
+    }
+
     /// `resolve_dvd_title_key` is the SINGLE shared per-title CSS step both read
     /// paths (`build_iso_pipeline` multi-pass and `DiscStream::new` single-pass)
     /// call, so these pin its full contract at the shared boundary.
