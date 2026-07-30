@@ -127,7 +127,14 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         // Phase D — decode each binding class's <clinit>.
         let mut streams: Vec<Construction> = Vec::new();
         for (name, _) in &binding_classes {
-            streams.extend(decode_binding(archive, name, &master_table));
+            // Cross-class union is bounded by the same cap as each walk.
+            let room = MAX_CONSTRUCTIONS.saturating_sub(streams.len());
+            if room == 0 {
+                break;
+            }
+            let mut decoded = decode_binding(archive, name, &master_table);
+            decoded.truncate(room);
+            streams.extend(decoded);
         }
         if streams.is_empty() {
             tracing::info!(
@@ -233,14 +240,63 @@ const MAX_CLINIT_LDC_STRINGS: usize = 4096;
 /// ~1 KB. 256 KiB admits 4096 values averaging 64 bytes each.
 const MAX_CLINIT_LDC_BYTES: usize = 256 * 1024;
 
+/// Aggregate companion to [`MAX_CLINIT_LDC_BYTES`], which bounds retention PER
+/// CLASS only. `identify_master_enums` holds every class's retained strings in
+/// one map SIMULTANEOUSLY, so the per-class cap alone still admits
+/// `classes x 256 KiB`: a 64 MiB jar of minimal `.class` entries reaches tens
+/// of GiB. This is the same bound one level up.
+///
+/// Headroom: the five `FINGERPRINTS` enums together hold ~113 short values
+/// (~1.2 KB). Every other class in a real BD-J jar contributes only whatever
+/// string constants its own `<clinit>` loads — resource paths, config keys —
+/// so a large authored jar lands in the low hundreds of KB. 16 MiB leaves
+/// ~40x headroom over a deliberately generous 400 KB estimate for real media.
+const MAX_CANDIDATE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+
+/// Entry-count companion to [`MAX_CANDIDATE_TOTAL_BYTES`]. The byte budget
+/// alone still admits ~16M map entries when every class retains a single
+/// one-byte `ldc`, and the per-entry `HashMap` + `String` overhead is not
+/// counted by that budget.
+///
+/// Headroom: a large retail BD-J title ships on the order of 1-3k classes,
+/// and only those with a non-empty `<clinit>` ldc sequence become candidates.
+/// 65536 leaves >20x headroom over the class count of any real jar.
+const MAX_CANDIDATE_CLASSES: usize = 65536;
+
+/// The Phase A candidate pool: every class's retained `<clinit>` ldc strings,
+/// bounded in aggregate by [`MAX_CANDIDATE_TOTAL_BYTES`] and
+/// [`MAX_CANDIDATE_CLASSES`].
+#[derive(Default)]
+struct CandidatePool {
+    by_class: HashMap<String, Vec<String>>,
+    /// Retained bytes: class names plus every retained string.
+    bytes: usize,
+}
+
+impl CandidatePool {
+    /// Retain `ldcs` under `class_name` if both aggregate budgets allow it.
+    /// Returns false when the entry was rejected (pool full).
+    fn insert(&mut self, class_name: &str, ldcs: Vec<String>) -> bool {
+        let cost = class_name
+            .len()
+            .saturating_add(ldcs.iter().map(String::len).sum::<usize>());
+        if self.by_class.len() >= MAX_CANDIDATE_CLASSES
+            || self.bytes.saturating_add(cost) > MAX_CANDIDATE_TOTAL_BYTES
+        {
+            return false;
+        }
+        self.bytes += cost;
+        self.by_class.insert(class_name.to_string(), ldcs);
+        true
+    }
+}
+
 /// Phase A. Walk every `.class` in `archive`, identify the master
 /// enums by `<clinit>` ldc-sequence fingerprint. Returns a vector of
 /// `(label, MasterEnum)` — at most one match per fingerprint label.
 pub(crate) fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnum)> {
-    use std::collections::HashMap;
-
     // First pass: collect every class's <clinit> ldc string sequence.
-    let mut candidates: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pool = CandidatePool::default();
     jar::for_each_class(archive, |class_name, class| {
         let Some(ldcs) = clinit_ldc_strings(class) else {
             return;
@@ -248,8 +304,16 @@ pub(crate) fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str
         if ldcs.is_empty() {
             return;
         }
-        candidates.insert(class_name.to_string(), ldcs);
+        if !pool.insert(class_name, ldcs) {
+            tracing::debug!(
+                class = class_name,
+                classes = pool.by_class.len(),
+                bytes = pool.bytes,
+                "deluxe: candidate pool aggregate cap hit, dropping class"
+            );
+        }
     });
+    let candidates = pool.by_class;
 
     // Second pass: match each fingerprint against the candidate pool.
     let mut out = Vec::new();
@@ -471,6 +535,24 @@ pub(crate) enum StackVal {
 /// Deluxe constructors reference directly.
 const BD_CODING_TYPE_CLASS: &str = "org/bluray/ti/CodingType";
 
+/// Cap on `Construction`s retained from a binding `<clinit>` walk.
+///
+/// One entry is appended per matched `new X / dup / invokespecial X.<init>`
+/// with no other bound: a `.class` gated only by a `com/bydeluxe/` path prefix
+/// deflates to the 64 MiB `MAX_CLASS_BYTES` ceiling, and the shortest matching
+/// sequence is a handful of bytes, so millions of `Construction`s — each a
+/// `String` plus an arg `Vec` — are reachable from a small crafted disc
+/// (~1 GiB). The same cap bounds the per-class union in
+/// [`decode_binding_class`] (a crafted class may repeat `<clinit>`, which JVMS
+/// §4.6 forbids but this reader tolerates) and the cross-class union in
+/// [`parse`], so the whole phase retains at most this many.
+///
+/// Headroom: the BD STN_table (BDAV, `STN_table` stream-entry counts) admits
+/// at most 32 primary audio and 32 PG streams per playlist, and a Deluxe
+/// binding table covers the disc's playlists — low hundreds of entries on the
+/// largest retail titles. 4096 leaves >20x headroom.
+const MAX_CONSTRUCTIONS: usize = 4096;
+
 /// Phase D entry point: find the binding class in `archive`, run the
 /// bytecode walker against its `<clinit>`, return one `Construction`
 /// per `new X / invokespecial X.<init>` sequence.
@@ -500,7 +582,7 @@ pub(crate) fn decode_binding_class(
     class: &ClassFile,
     master: &MasterEnumTable,
 ) -> Vec<Construction> {
-    let mut all = Vec::new();
+    let mut all: Vec<Construction> = Vec::new();
     for m in &class.methods {
         if class.member_name(m) != Some("<clinit>") {
             continue;
@@ -510,6 +592,14 @@ pub(crate) fn decode_binding_class(
         };
         let mut ctx = BindingDecoder::new(&class.constant_pool, master);
         ctx.run(&code);
+        // Bound the union too: JVMS §4.6 makes (name, descriptor) unique per
+        // class so a real class has one `<clinit>`, but this reader does not
+        // enforce that and a crafted class can repeat it.
+        let room = MAX_CONSTRUCTIONS.saturating_sub(all.len());
+        if room == 0 {
+            break;
+        }
+        ctx.constructions.truncate(room);
         all.extend(ctx.constructions);
     }
     all
@@ -671,6 +761,11 @@ impl<'a> BindingDecoder<'a> {
                 let receiver = self.stack.pop().unwrap_or(StackVal::Unknown);
                 if let StackVal::NewObj(name) = receiver
                     && name == member.class_name {
+                        // Bounded by MAX_CONSTRUCTIONS: an unbounded push here
+                        // is ~1 GiB reachable from a crafted `<clinit>`.
+                        if self.constructions.len() >= MAX_CONSTRUCTIONS {
+                            return;
+                        }
                         self.constructions.push(Construction {
                             binding_type: name,
                             args,
@@ -888,11 +983,32 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
             .map(str::to_string)
             .unwrap_or_default();
 
+        // Neither `+= 1` (panics in debug, wraps in release) nor
+        // `saturating_add` is correct here. Saturation is what turned an
+        // overflow guard into a non-terminating loop in `criterion`, and here
+        // it would peg every stream past 65535 at the SAME number — silently
+        // mislabelling tracks, since `apply_labels` binds on
+        // `(type, stream_number)`. The 1-based u16 numbering space is a hard
+        // ceiling, so exhausting it stops label emission instead.
         let (stream_type, stream_number) = if coding_type.is_some() {
-            audio_idx += 1;
+            let Some(n) = audio_idx.checked_add(1) else {
+                tracing::warn!(
+                    emitted = out.len(),
+                    "deluxe: audio stream-number space exhausted; truncating labels"
+                );
+                break;
+            };
+            audio_idx = n;
             (StreamLabelType::Audio, audio_idx)
         } else {
-            sub_idx += 1;
+            let Some(n) = sub_idx.checked_add(1) else {
+                tracing::warn!(
+                    emitted = out.len(),
+                    "deluxe: subtitle stream-number space exhausted; truncating labels"
+                );
+                break;
+            };
+            sub_idx = n;
             (StreamLabelType::Subtitle, sub_idx)
         };
 
@@ -1206,6 +1322,178 @@ mod tests {
         let class = class_with_clinit(ldc_pool("English"), 2, &code);
         let ldcs = clinit_ldc_strings(&class).expect("<clinit> present");
         assert_eq!(ldcs.len(), n, "real-size enum must survive the cap");
+    }
+
+    // ── Aggregate (cross-class) candidate-pool bounds ───────────────────────
+
+    /// `MAX_CLINIT_LDC_BYTES` bounds retention PER CLASS; the candidate pool
+    /// holds every class's strings at once, so without an aggregate a 64 MiB
+    /// jar reaches tens of GiB.
+    ///
+    /// Fixture arithmetic (deliberately NOT expressed in terms of the constant
+    /// under test — raising the constant must FAIL this test, not silently
+    /// widen it): each entry costs a 5-byte class name plus a 65536-byte
+    /// string = 65541 bytes. 65541 x 255 = 16 712 955 fits in the budget;
+    /// 65541 x 256 = 16 778 496 does not, and the leftover 64 261 bytes admit
+    /// no further entry. So exactly 255 of the 1024 offered entries are kept.
+    #[test]
+    fn candidate_pool_bounds_bytes_retained_across_classes() {
+        let payload = "x".repeat(64 * 1024);
+        let mut pool = CandidatePool::default();
+        let mut accepted = 0usize;
+        for i in 0..1024u32 {
+            // Fixed-width 5-byte names so the cost per entry is uniform.
+            if pool.insert(&format!("c{i:04}"), vec![payload.clone()]) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, 255,
+            "candidate pool retained {accepted} x 64 KiB classes — the \
+             cross-class byte aggregate is not bounding retention"
+        );
+        assert_eq!(pool.by_class.len(), 255);
+    }
+
+    /// The byte budget alone still admits millions of map entries when each
+    /// class retains one tiny string, and per-entry `HashMap`/`String`
+    /// overhead is not charged against it. The entry-count cap binds there.
+    ///
+    /// Fixture: 1-byte payloads, so ~7 bytes per entry — the byte budget is
+    /// nowhere near reached and the count cap is the only thing that can stop
+    /// this at 65536.
+    #[test]
+    fn candidate_pool_bounds_entry_count_for_tiny_classes() {
+        let mut pool = CandidatePool::default();
+        let mut accepted = 0usize;
+        for i in 0..70_000u32 {
+            if pool.insert(&format!("c{i}"), vec!["x".to_string()]) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, 65_536,
+            "candidate pool retained {accepted} entries — the entry-count \
+             aggregate is not bounding retention"
+        );
+    }
+
+    /// Headroom check: a jar far larger than any real BD-J title (3000
+    /// classes, 200 bytes of `<clinit>` strings each — the five master enums
+    /// together are ~1.2 KB) must be retained in full. A cap that rejects real
+    /// media is a defect in the other direction.
+    #[test]
+    fn candidate_pool_admits_a_generously_sized_real_jar() {
+        let mut pool = CandidatePool::default();
+        let mut accepted = 0usize;
+        for i in 0..3000u32 {
+            if pool.insert(&format!("com/bydeluxe/x{i}"), vec!["y".repeat(200)]) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, 3000,
+            "a 3000-class jar with 200 bytes of clinit strings per class must \
+             not be truncated"
+        );
+    }
+
+    // ── Construction accumulation bounds ────────────────────────────────────
+
+    /// One `new X / dup / ... / invokespecial X.<init>` per 11 code bytes, so
+    /// a 64 MiB decompressed class reaches ~6M `Construction`s (~1 GiB of
+    /// `String` + arg `Vec`). Offer 5000 and exactly 4096 must be retained.
+    ///
+    /// 4096 is asserted as a literal, not as `MAX_CONSTRUCTIONS`: raising the
+    /// constant must fail this test rather than pass vacuously.
+    #[test]
+    fn binding_decoder_construction_count_is_capped() {
+        // new AudioSlot; dup; getstatic Lang.English; invokespecial <init>; pop
+        let one: [u8; 11] = [
+            NEW,
+            0,
+            8,
+            0x59,
+            GETSTATIC,
+            0,
+            6,
+            INVOKESPECIAL,
+            0,
+            12,
+            0x57, // pop the leftover NewObj so the stack returns to empty
+        ];
+        let code: Vec<u8> = one.iter().copied().cycle().take(one.len() * 5000).collect();
+        let pool = build_simple_pool();
+        let master = lang_enum_master();
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: 4,
+            max_locals: 0,
+            code: &code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        assert_eq!(
+            decoder.constructions.len(),
+            4096,
+            "5000 constructions offered, {} retained — the accumulation is \
+             not bounded",
+            decoder.constructions.len()
+        );
+    }
+
+    /// Headroom: the BD STN_table admits at most 32 primary audio + 32 PG
+    /// streams per playlist, so even a disc binding several hundred stream
+    /// slots must survive the cap untouched.
+    #[test]
+    fn binding_decoder_admits_a_large_real_binding_table() {
+        let one: [u8; 11] = [NEW, 0, 8, 0x59, GETSTATIC, 0, 6, INVOKESPECIAL, 0, 12, 0x57];
+        let code: Vec<u8> = one.iter().copied().cycle().take(one.len() * 512).collect();
+        let pool = build_simple_pool();
+        let master = lang_enum_master();
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: 4,
+            max_locals: 0,
+            code: &code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        assert_eq!(
+            decoder.constructions.len(),
+            512,
+            "a 512-slot binding table must not be clipped"
+        );
+    }
+
+    /// `interpret_streams` numbers streams with a 1-based `u16` counter. An
+    /// unguarded `+= 1` panics in debug and wraps in release past 65535;
+    /// `saturating_add` would be worse still (every stream past the ceiling
+    /// pegged to the SAME number, and `apply_labels` binds on
+    /// `(type, stream_number)` — silent mislabelling). Emission must stop at
+    /// the end of the numbering space instead.
+    ///
+    /// 65535 is the size of the 1-based u16 domain, not a tunable constant.
+    #[test]
+    fn interpret_streams_stops_at_the_u16_numbering_ceiling() {
+        let master = lang_enum_master();
+        let one = Construction {
+            binding_type: "SubSlot".into(),
+            args: vec![StackVal::EnumRef {
+                kind: "Language",
+                ordinal: 0,
+            }],
+        };
+        // No CodingType arg => every construction is a subtitle stream.
+        let constructions: Vec<Construction> = std::iter::repeat_n(one, 70_000).collect();
+        let labels = interpret_streams(&constructions, &master);
+        assert_eq!(
+            labels.len(),
+            65_535,
+            "emitted {} labels from 70000 constructions — the 1-based u16 \
+             stream-number space holds 65535",
+            labels.len()
+        );
+        assert_eq!(labels[0].stream_number, 1);
+        assert_eq!(labels[65_534].stream_number, 65_535);
     }
 
     #[test]

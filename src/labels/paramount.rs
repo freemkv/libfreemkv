@@ -15,6 +15,7 @@
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, xml};
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
+use std::collections::HashSet;
 
 pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "playlists.xml")
@@ -49,7 +50,12 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
         // aud_com1_idx is a trimmed, comma-separated list of CSV positions
         // (some authoring tools emit whitespace, and multiple commentary
         // tracks are possible) — symmetric with sub_com1_idx below.
-        let com_indices: Vec<usize> = xml::attr(feature, "aud_com1_idx")
+        // A HashSet, not a Vec: `com_indices` is parsed straight out of an
+        // attacker-controlled attribute with no length bound and was scanned
+        // linearly once per stream, so `aud="..."` and `aud_com1_idx="..."`
+        // both grown large make this quadratic in the size of one XML file.
+        // Membership is the only operation performed on it.
+        let com_indices: HashSet<usize> = xml::attr(feature, "aud_com1_idx")
             .map(|s| s.split(',').filter_map(|i| i.trim().parse().ok()).collect())
             .unwrap_or_default();
 
@@ -89,7 +95,9 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
             .map(|s| s.split(',').map(|f| f.trim() == "1").collect())
             .unwrap_or_default();
 
-        let com_indices: Vec<usize> = xml::attr(feature, "sub_com1_idx")
+        // HashSet for the same reason as the audio side above: unbounded
+        // parsed input, membership-only use, linear scan once per stream.
+        let com_indices: HashSet<usize> = xml::attr(feature, "sub_com1_idx")
             .map(|s| s.split(',').filter_map(|i| i.trim().parse().ok()).collect())
             .unwrap_or_default();
 
@@ -167,6 +175,75 @@ fn find_feature_playlist(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sub_com1_idx` is an unbounded index list parsed straight out of the
+    /// disc's `playlists.xml` and was membership-tested with a linear
+    /// `Vec::contains` once per subtitle stream — quadratic in the size of a
+    /// single attacker-supplied file.
+    ///
+    /// Proof is by deadline rather than micro-benchmark. With the linear scan
+    /// this fixture (200 000 streams x 1 000 001 indices) measures 31 s in a
+    /// release build and far longer in debug; with a set it measures 0.03 s
+    /// release / 0.56 s debug. A 10 s deadline sits ~18x above the slowest
+    /// passing measurement and ~3x below the fastest failing one, and makes a
+    /// regression fail fast instead of hanging CI.
+    ///
+    /// Correctness is pinned on fixture-derived literals: indices 0, 2 and 4
+    /// are the commentary tracks, 1 and 3 are not.
+    #[test]
+    fn commentary_index_lookup_is_not_quadratic() {
+        const STREAMS: usize = 200_000;
+        const INDICES: usize = 1_000_000;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut feature = String::from(r#"<playlist name="Feature" sub=""#);
+            feature.push_str(&"eng,".repeat(STREAMS));
+            feature.pop();
+            // Three real commentary indices, then a long run of one
+            // out-of-range value: nothing here is bounded by the stream count.
+            feature.push_str(r#"" sub_com1_idx="0,2,4,"#);
+            feature.push_str(&"9999999,".repeat(INDICES));
+            feature.pop();
+            feature.push_str(r#"" />"#);
+            let _ = tx.send(labels_from_feature(&feature));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(labels) => {
+                worker.join().expect("worker panicked");
+                assert_eq!(labels.len(), STREAMS);
+                assert_eq!(labels[0].purpose, LabelPurpose::Commentary);
+                assert_eq!(labels[1].purpose, LabelPurpose::Normal);
+                assert_eq!(labels[2].purpose, LabelPurpose::Commentary);
+                assert_eq!(labels[3].purpose, LabelPurpose::Normal);
+                assert_eq!(labels[4].purpose, LabelPurpose::Commentary);
+            }
+            Err(_) => panic!(
+                "labels_from_feature did not finish {STREAMS} streams x \
+                 {INDICES} commentary indices within 10s — the membership \
+                 test is still a linear scan"
+            ),
+        }
+    }
+
+    /// Headroom: the BD STN_table admits at most 32 PG streams per playlist,
+    /// and a real `sub_com1_idx` lists a handful of commentary tracks. The set
+    /// must behave identically to the old scan on real-shaped input.
+    #[test]
+    fn commentary_indices_still_match_on_real_shaped_input() {
+        let feature = r#"<playlist name="Feature" sub="eng,eng,zho,ces,dan" sub_com1_idx="1,3" />"#;
+        let labels = labels_from_feature(feature);
+        let purposes: Vec<LabelPurpose> = labels.iter().map(|l| l.purpose).collect();
+        assert_eq!(
+            purposes,
+            vec![
+                LabelPurpose::Normal,
+                LabelPurpose::Commentary,
+                LabelPurpose::Normal,
+                LabelPurpose::Commentary,
+                LabelPurpose::Normal,
+            ]
+        );
+    }
 
     fn audio(labels: &[StreamLabel]) -> Vec<&StreamLabel> {
         labels

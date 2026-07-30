@@ -42,7 +42,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         parse_playback_config(pc_text, &mut stream_map);
     }
 
-    let stream_nums = assign_stream_numbers(&stream_infos, &stream_map);
+    let stream_nums = assign_stream_numbers(&stream_infos, &stream_map)?;
 
     let mut labels = Vec::new();
     for (info, &stream_num) in stream_infos.iter().zip(stream_nums.iter()) {
@@ -76,7 +76,29 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 /// map-assigned one. (Both numbering domains are 1-based per type, and
 /// `apply_labels` matches on `(type, stream_number)`, so a collision
 /// would mislabel tracks.)
-fn assign_stream_numbers(infos: &[StreamInfo], stream_map: &HashMap<String, u16>) -> Vec<u16> {
+///
+/// Returns `None` when the 1-based stream-number space is exhausted — every
+/// number in `1..=u16::MAX` for that type is either already claimed by the map
+/// or already synthesized. That is unreachable on real media: the BD STN_table
+/// carries at most 32 primary audio and 32 PG streams per playlist, so the
+/// 65535-wide space leaves >2000x headroom. It IS reachable from a crafted
+/// `streamproperties.xml` listing >65535 stream entries, and the only correct
+/// answers there are "fail the parse" or "emit colliding numbers"; we fail.
+///
+/// The skip search is bounded by the numbering space itself: a `u16`
+/// `saturating_add` here parked the counter at `u16::MAX` forever whenever the
+/// map also claimed `u16::MAX`, turning an overflow guard into a hang that
+/// `apply()`'s `catch_unwind` cannot interrupt. The counters are therefore
+/// widened to `u32` so the skip loop strictly increases toward a fixed ceiling
+/// (guaranteeing termination) and exhaustion is reported rather than absorbed.
+fn assign_stream_numbers(
+    infos: &[StreamInfo],
+    stream_map: &HashMap<String, u16>,
+) -> Option<Vec<u16>> {
+    /// One past the last assignable stream number, as a `u32` so the
+    /// counters can step off the end of the `u16` domain without wrapping.
+    const NUMBER_SPACE_END: u32 = u16::MAX as u32 + 1;
+
     // Numbers already claimed by the map, per type. A map value of 0 is NOT a
     // claim: apply_labels binds on 1-based stream numbers, so 0 is unmatchable.
     // Treat 0 as "unmapped" here (defense in depth — parse_playback_config also
@@ -96,8 +118,8 @@ fn assign_stream_numbers(infos: &[StreamInfo], stream_map: &HashMap<String, u16>
         }
     }
 
-    let mut audio_idx: u16 = 1;
-    let mut sub_idx: u16 = 1;
+    let mut audio_idx: u32 = 1;
+    let mut sub_idx: u32 = 1;
     let mut out = Vec::with_capacity(infos.len());
     for info in infos {
         let n = match stream_map.get(&info.id).copied() {
@@ -107,21 +129,31 @@ fn assign_stream_numbers(infos: &[StreamInfo], stream_map: &HashMap<String, u16>
                     StreamLabelType::Audio => (&mut audio_idx, &taken_audio),
                     StreamLabelType::Subtitle => (&mut sub_idx, &taken_sub),
                 };
-                // Advance past any number already claimed via the map.
-                // saturating: a crafted XML with >65k stream entries must
-                // not overflow (panic in debug, wrap-to-0 in release) on
-                // untrusted disc bytes.
-                while taken.contains(idx) {
-                    *idx = idx.saturating_add(1);
+                // Advance past any number already claimed via the map. The
+                // counter strictly increases and NUMBER_SPACE_END is fixed, so
+                // this terminates in at most 65535 steps for any input.
+                while *idx < NUMBER_SPACE_END && taken.contains(&(*idx as u16)) {
+                    *idx += 1;
                 }
-                let n = *idx;
-                *idx = idx.saturating_add(1);
+                if *idx >= NUMBER_SPACE_END {
+                    // Numbering space exhausted. Emitting anything here would
+                    // either wrap to 0 (unmatchable) or duplicate a number
+                    // already bound to a different stream, so the parse fails.
+                    tracing::warn!(
+                        streams = infos.len(),
+                        "criterion: 1-based u16 stream-number space exhausted; \
+                         refusing to synthesize a colliding stream number"
+                    );
+                    return None;
+                }
+                let n = *idx as u16;
+                *idx += 1;
                 n
             }
         };
         out.push(n);
     }
-    out
+    Some(out)
 }
 
 struct StreamInfo {
@@ -225,7 +257,8 @@ mod tests {
             info("a1", StreamLabelType::Audio),
             info("s0", StreamLabelType::Subtitle),
         ];
-        let nums = assign_stream_numbers(&infos, &HashMap::new());
+        let nums =
+            assign_stream_numbers(&infos, &HashMap::new()).expect("numbering space not exhausted");
         // Per-type 1-based: audio 1,2 ; subtitle 1.
         assert_eq!(nums, vec![1, 2, 1]);
     }
@@ -241,7 +274,7 @@ mod tests {
             info("a1", StreamLabelType::Audio), // mapped → 1
             info("a2", StreamLabelType::Audio), // unmapped → fallback
         ];
-        let nums = assign_stream_numbers(&infos, &map);
+        let nums = assign_stream_numbers(&infos, &map).expect("numbering space not exhausted");
         // a0 skips the taken 1 → 2; a1 keeps 1; a2 → 3. All distinct.
         assert_eq!(nums, vec![2, 1, 3]);
         let mut sorted = nums.clone();
@@ -259,7 +292,10 @@ mod tests {
             info("a0", StreamLabelType::Audio),
             info("a1", StreamLabelType::Audio),
         ];
-        assert_eq!(assign_stream_numbers(&infos, &map), vec![5, 9]);
+        assert_eq!(
+            assign_stream_numbers(&infos, &map).expect("numbering space not exhausted"),
+            vec![5, 9]
+        );
     }
 
     // ── Additional hardening tests ─────────────────────────────────────────
@@ -275,7 +311,8 @@ mod tests {
             info("a1", StreamLabelType::Audio),
             info("s1", StreamLabelType::Subtitle),
         ];
-        let nums = assign_stream_numbers(&infos, &HashMap::new());
+        let nums =
+            assign_stream_numbers(&infos, &HashMap::new()).expect("numbering space not exhausted");
         // Audio: 1, 2; Subtitle: 1, 2 — each counter resets at 1 per type.
         assert_eq!(nums[0], 1); // audio 1
         assert_eq!(nums[1], 1); // subtitle 1
@@ -292,7 +329,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("a0".to_string(), 0u16); // 0 must not be treated as a claim
         let infos = vec![info("a0", StreamLabelType::Audio)];
-        let nums = assign_stream_numbers(&infos, &map);
+        let nums = assign_stream_numbers(&infos, &map).expect("numbering space not exhausted");
         // 0 is treated as unmapped → the fallback counter assigns 1.
         assert_eq!(nums[0], 1);
     }
@@ -308,7 +345,7 @@ mod tests {
             info("real", StreamLabelType::Audio),
             info("bad", StreamLabelType::Audio),
         ];
-        let nums = assign_stream_numbers(&infos, &map);
+        let nums = assign_stream_numbers(&infos, &map).expect("numbering space not exhausted");
         assert_eq!(nums[0], 1); // the genuinely-mapped stream keeps 1
         assert_eq!(nums[1], 2); // the 0-stream is synthesized to the next free slot
     }
@@ -325,16 +362,74 @@ mod tests {
             info("a0", StreamLabelType::Audio),    // fallback
             info("s0", StreamLabelType::Subtitle), // mapped → 2
         ];
-        let nums = assign_stream_numbers(&infos, &map);
+        let nums = assign_stream_numbers(&infos, &map).expect("numbering space not exhausted");
         // Audio fallback for a0 → 1 (subtitle's taken-2 doesn't block it).
         assert_eq!(nums[0], 1);
         assert_eq!(nums[1], 2);
     }
 
-    /// Spec: saturating_add prevents overflow when many streams are listed.
-    /// Mutation: use wrapping_add → counter wraps to 0 and collides.
+    /// A crafted `streamproperties.xml` can drive the fallback counter to the
+    /// top of the 1-based u16 stream-number space and then present one more
+    /// unmapped stream whose successor number is also claimed by the map.
+    ///
+    /// This must TERMINATE. The bound is the numbering space itself, so the
+    /// assertion is on the spec-derived exhaustion behaviour (`None`), not on
+    /// any tunable constant. Run on a worker thread with a deadline so a
+    /// non-terminating loop fails the test in 20 s instead of hanging CI.
     #[test]
-    fn assign_stream_numbers_saturation_on_overflow() {
+    fn exhausted_numbering_terminates_instead_of_looping() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // One mapped audio stream claims the last number in the space.
+            let mut map = HashMap::new();
+            map.insert("claims_max".to_string(), u16::MAX);
+            let mut infos = vec![info("claims_max", StreamLabelType::Audio)];
+            // Enough unmapped audio streams to walk the counter to the top.
+            for i in 0..=(u16::MAX as u32) {
+                infos.push(info(&format!("u{i}"), StreamLabelType::Audio));
+            }
+            let _ = tx.send(assign_stream_numbers(&infos, &map));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(result) => {
+                worker.join().expect("worker panicked");
+                assert!(
+                    result.is_none(),
+                    "an exhausted 1-based u16 numbering space must fail the parse, \
+                     not emit colliding or wrapped stream numbers"
+                );
+            }
+            Err(_) => panic!(
+                "assign_stream_numbers did not terminate within 20s — \
+                 non-terminating skip loop on crafted stream_map"
+            ),
+        }
+    }
+
+    /// The whole 1-based u16 space must remain usable: 65535 unmapped audio
+    /// streams get 65535 distinct numbers with no panic and no wrap. The
+    /// literals here are the JVMS-independent, spec-derived size of a u16
+    /// 1-based numbering domain, not a tunable cap.
+    #[test]
+    fn full_u16_numbering_space_is_usable_and_unique() {
+        let infos: Vec<StreamInfo> = (0..65_535u32)
+            .map(|i| info(&format!("a{i}"), StreamLabelType::Audio))
+            .collect();
+        let nums = assign_stream_numbers(&infos, &HashMap::new()).expect("space is not exhausted");
+        assert_eq!(nums.len(), 65_535);
+        assert_eq!(nums[0], 1);
+        assert_eq!(nums[65_534], 65_535);
+        let mut sorted = nums.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 65_535, "stream numbers must all be distinct");
+    }
+
+    /// Spec: a partially-mapped playlist with many claimed numbers must still
+    /// synthesize past every claim without panicking or colliding.
+    /// Mutation: drop the skip loop → the fallback reuses a claimed number.
+    #[test]
+    fn fallback_skips_a_dense_block_of_claimed_numbers() {
         // Force the counter past u16::MAX by pre-taking all values 1..=u16::MAX.
         // Doing that for real would be slow; instead inject u16::MAX into taken.
         let mut map = HashMap::new();
@@ -361,7 +456,7 @@ mod tests {
             qualifier: LabelQualifier::None,
         });
         // This must not panic.
-        let nums = assign_stream_numbers(&infos, &map);
+        let nums = assign_stream_numbers(&infos, &map).expect("numbering space not exhausted");
         assert_eq!(nums.len(), 501);
         // The last (unmapped) entry's number must be > 500 (skipped all taken).
         assert!(nums[500] > 500);

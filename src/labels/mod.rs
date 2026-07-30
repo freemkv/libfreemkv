@@ -977,18 +977,29 @@ pub(crate) fn jar_inventory(udf: &UdfFs) -> Vec<String> {
     let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
         return Vec::new();
     };
-    let mut out: Vec<String> = Vec::new();
-    for entry in &jar_dir.entries {
+    jar_inventory_from(&jar_dir.entries)
+}
+
+/// The body of [`jar_inventory`], over the `/BDMV/JAR` children directly, so
+/// it is unit-testable without a `UdfFs`.
+///
+/// A `BTreeSet`, not `Vec::contains`: the entry names come from the disc's own
+/// UDF directory records, so both the file count and the name lengths are
+/// attacker-controlled, and a linear `contains` doing a full `String` compare
+/// per candidate is quadratic in the number of files. The set also subsumes
+/// the trailing sort — it yields sorted, deduplicated output directly.
+fn jar_inventory_from(entries: &[crate::udf::DirEntry]) -> Vec<String> {
+    let mut out: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for entry in entries {
         if entry.is_dir {
             for child in &entry.entries {
-                if !child.is_dir && !out.contains(&child.name) {
-                    out.push(child.name.clone());
+                if !child.is_dir {
+                    out.insert(child.name.as_str());
                 }
             }
         }
     }
-    out.sort();
-    out
+    out.into_iter().map(str::to_string).collect()
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────────────
@@ -1030,6 +1041,94 @@ pub(crate) fn read_jar_file(
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    fn dir_entry(
+        name: &str,
+        is_dir: bool,
+        entries: Vec<crate::udf::DirEntry>,
+    ) -> crate::udf::DirEntry {
+        crate::udf::DirEntry {
+            name: name.to_string(),
+            is_dir,
+            meta_lba: 0,
+            size: 0,
+            entries,
+        }
+    }
+
+    /// `jar_inventory` deduplicated with a linear `Vec::contains`, doing a full
+    /// `String` comparison per candidate — quadratic in a file count taken
+    /// straight from the disc's UDF directory records, with attacker-chosen
+    /// name lengths to inflate each comparison.
+    ///
+    /// Proof is by deadline. With the linear scan this fixture measures well
+    /// past the deadline; with a set it is milliseconds. Bounded so a
+    /// regression fails fast instead of hanging CI.
+    #[test]
+    fn jar_inventory_dedup_is_not_quadratic() {
+        const FILES: usize = 120_000;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // Long shared prefix so every comparison runs to the tail.
+            let prefix = "a".repeat(180);
+            let children: Vec<crate::udf::DirEntry> = (0..FILES)
+                .map(|i| dir_entry(&format!("{prefix}{i:08}.png"), false, Vec::new()))
+                .collect();
+            let entries = vec![dir_entry("00000", true, children)];
+            let _ = tx.send(jar_inventory_from(&entries));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(names) => {
+                worker.join().expect("worker panicked");
+                assert_eq!(names.len(), FILES);
+            }
+            Err(_) => panic!(
+                "jar_inventory_from did not finish {FILES} entries within 10s \
+                 — the dedup is still a linear scan"
+            ),
+        }
+    }
+
+    /// Behaviour contract: output is deduplicated across subdirectories,
+    /// sorted, and excludes directories and files sitting directly under
+    /// `/BDMV/JAR` (only one level down counts).
+    #[test]
+    fn jar_inventory_dedups_sorts_and_skips_dirs() {
+        let entries = vec![
+            dir_entry(
+                "00000",
+                true,
+                vec![
+                    dir_entry("streamproperties.xml", false, Vec::new()),
+                    dir_entry("zeta.png", false, Vec::new()),
+                    dir_entry(
+                        "nested",
+                        true,
+                        vec![dir_entry("hidden.txt", false, Vec::new())],
+                    ),
+                ],
+            ),
+            dir_entry(
+                "00001",
+                true,
+                vec![
+                    dir_entry("alpha.png", false, Vec::new()),
+                    // Duplicate of the entry in 00000 — must appear once.
+                    dir_entry("streamproperties.xml", false, Vec::new()),
+                ],
+            ),
+            // A jar sitting directly under /BDMV/JAR is not inventoried.
+            dir_entry("top.jar", false, Vec::new()),
+        ];
+        assert_eq!(
+            jar_inventory_from(&entries),
+            vec![
+                "alpha.png".to_string(),
+                "streamproperties.xml".to_string(),
+                "zeta.png".to_string(),
+            ]
+        );
+    }
 
     /// Lock the parser roster + order. If someone reorders the array
     /// or adds/removes a parser, this test forces them to update the
