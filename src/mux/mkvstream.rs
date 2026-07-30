@@ -1226,8 +1226,18 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         SampleRate::S88_2
     } else if (44100.0..48000.0).contains(&sr) {
         SampleRate::S44_1
-    } else {
+    } else if sr >= 48000.0 {
         SampleRate::S48
+    } else {
+        // Anything below the lowest rate this enum maps is UNKNOWN, not 48 kHz.
+        // The ladder's final `else` used to be S48, so a legal 32000 Hz AC-3 or
+        // DTS track — common in broadcast-sourced content — was recorded as
+        // 48 kHz, and the wrong rate then propagated into the reconstructed
+        // AudioStream. `SampleRate::from_hz` in disc/mod.rs is the crate's
+        // canonical mapping and returns Unknown here; this ladder exists only
+        // because the MKV element is a float and needs tolerance rather than
+        // exact equality.
+        SampleRate::Unknown
     };
 
     // Map MKV track numbers to BD-TS PIDs. A 13-bit TS PID tops out at
@@ -3301,6 +3311,59 @@ mod tests {
     /// `TrackNumber - 1`, so the audio blocks of TrackNumber 3 resolved to index
     /// 2 in a 2-stream title and were DISCARDED — a remux with no audio, reported
     /// as success.
+    /// A legal SamplingFrequency below the lowest rate this enum maps must come
+    /// back as Unknown, not silently as 48 kHz.
+    ///
+    /// The ladder's final `else` was `SampleRate::S48`, so a 32000 Hz AC-3 or DTS
+    /// track — legal, and common in broadcast-sourced content — was recorded as
+    /// 48 kHz and the wrong rate propagated into the reconstructed AudioStream.
+    /// The crate's canonical mapping, `SampleRate::from_hz`, returns Unknown for
+    /// 32000; this ladder disagreed with it.
+    #[test]
+    fn a_sub_44100_sampling_frequency_is_unknown_not_48k() {
+        /// One TrackEntry body: an audio track with the given sampling frequency.
+        fn audio_track_body(freq: f64) -> Vec<u8> {
+            let mut audio = Vec::new();
+            audio.push(super::ebml::SAMPLING_FREQUENCY as u8);
+            audio.push(0x88); // 8-byte float payload
+            audio.extend_from_slice(&freq.to_be_bytes());
+            audio.push(super::ebml::CHANNELS as u8);
+            audio.extend_from_slice(&[0x81, 0x02]);
+
+            let mut body = Vec::new();
+            body.push(super::ebml::TRACK_NUMBER as u8);
+            body.extend_from_slice(&[0x81, 0x01]);
+            body.push(super::ebml::TRACK_TYPE as u8);
+            body.extend_from_slice(&[0x81, super::ebml::TRACK_TYPE_AUDIO as u8]);
+            body.push(super::ebml::CODEC_ID as u8);
+            let cid = b"A_AC3";
+            body.push(0x80 | cid.len() as u8);
+            body.extend_from_slice(cid);
+            body.push(super::ebml::AUDIO as u8);
+            body.push(0x80 | audio.len() as u8);
+            body.extend_from_slice(&audio);
+            body
+        }
+
+        for (freq, want) in [
+            (32000.0f64, SampleRate::Unknown),
+            (16000.0, SampleRate::Unknown),
+            (44100.0, SampleRate::S44_1),
+            (48000.0, SampleRate::S48),
+            (96000.0, SampleRate::S96),
+        ] {
+            let body = audio_track_body(freq);
+            let mut cur = std::io::Cursor::new(body.clone());
+            let parsed = super::parse_track(&mut cur, body.len() as u64)
+                .unwrap_or_else(|e| panic!("track with {freq} Hz must parse: {e}"));
+            let got = match parsed.0.as_ref().expect("an audio track yields a stream") {
+                Stream::Audio(a) => a.sample_rate,
+                other => panic!("expected an audio stream, got {other:?}"),
+            };
+            assert_eq!(got, want, "{freq} Hz must map to {want:?}, got {got:?}");
+        }
+    }
+
     #[test]
     fn sparse_track_numbers_route_to_the_right_stream() {
         let video = [0x81u8, 0x00, 0x00, 0x80, 0x11]; // TrackNumber 1

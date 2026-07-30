@@ -22,7 +22,7 @@ fn main() {
             &target_arch // x86_64 → x86_64
         };
 
-        std::process::Command::new("cc")
+        let cc_status = std::process::Command::new("cc")
             .args([
                 "-arch",
                 clang_arch,
@@ -38,12 +38,19 @@ fn main() {
                 "-O2",
             ])
             .status()
-            .expect("failed to compile macos_shim.c");
+            .expect("failed to spawn cc for macos_shim.c");
+        // `.status()` succeeding only means the process RAN. A real compile error
+        // exits non-zero, and ignoring that left no object file, which surfaced
+        // much later as an unexplained link failure against a missing symbol. The
+        // shim is macOS-only and is neither linted nor compiled on the other two
+        // platforms, so a mistake in it has exactly one chance to be noticed.
+        assert!(cc_status.success(), "cc failed to compile macos_shim.c");
 
-        std::process::Command::new("ar")
+        let ar_status = std::process::Command::new("ar")
             .args(["rcs", &lib, &obj])
             .status()
-            .expect("failed to create static lib");
+            .expect("failed to spawn ar");
+        assert!(ar_status.success(), "ar failed to create the static lib");
 
         println!("cargo:rustc-link-search=native={out_dir}");
         println!("cargo:rustc-link-lib=static=macos_scsi");

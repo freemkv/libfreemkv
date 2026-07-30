@@ -244,7 +244,10 @@ int shim_open_exclusive(const char *bsd_name) {
     usleep(500000);
 
     mach_port_t mp;
-    IOMainPort(0, &mp);
+    // Check the return before using the port. On failure IOMainPort leaves `mp`
+    // untouched, so every IOKit call below would run against an uninitialised
+    // mach port. shim_list_drives does check it; this path did not.
+    if (IOMainPort(0, &mp) != kIOReturnSuccess) return -1;
 
     io_service_t svc = find_bdsvc_by_bsd_name(mp, bsd_name);
     if (!svc) {
