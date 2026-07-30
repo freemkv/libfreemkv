@@ -902,4 +902,58 @@ mod tests {
         assert_eq!(sink[11], 0xAA);
         assert_eq!(sink[17], 0xAA);
     }
+
+    /// A sink that records only what actually reaches it, so "was flush called"
+    /// is MEASURED rather than assumed. Its own `flush` is a no-op — the whole
+    /// point is that the intermediate `BufWriter` must be told to hand its bytes
+    /// over.
+    #[derive(Clone, Default)]
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedSink {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `finish()` is the ONLY thing that pushes a buffered sink's tail to the
+    /// file. Real sinks (`LocalFileSink`, `SocketSink`) buffer, and this muxer
+    /// deliberately adds none of its own — so a `finish` that skipped the flush
+    /// truncates every `.hevc` output by up to a whole sink buffer of trailing
+    /// NAL units, producing a file whose last GOP simply is not there.
+    #[test]
+    fn finish_flushes_the_buffered_sink_or_the_stream_tail_is_lost() {
+        let sink = SharedSink::default();
+        let mut mux = HevcMux::new(io::BufWriter::new(sink.clone()));
+        // One length-prefixed NAL: [len:u32-BE][NAL bytes] → Annex B.
+        let nal = [0x26u8, 0x01, 0xAA, 0xBB]; // (0x26 >> 1) = 19 = IDR_W_RADL
+        let mut frame = (nal.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&nal);
+        mux.write_frame(0, &frame).unwrap();
+
+        assert!(
+            sink.bytes().is_empty(),
+            "the fixture must actually buffer, or this test proves nothing"
+        );
+
+        mux.finish().unwrap();
+
+        let out = sink.bytes();
+        let mut expected = START_CODE.to_vec();
+        expected.extend_from_slice(&nal);
+        assert_eq!(
+            out, expected,
+            "finish must deliver the whole Annex B stream to the sink"
+        );
+    }
 }
