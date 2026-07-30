@@ -531,6 +531,24 @@ impl ScsiTransport for SptiTransport {
         };
 
         if ok == 0 {
+            // Capture the Win32 error before returning. `open()` and `reset()`
+            // in this file both do; `execute()` did not, and it is the hot path
+            // — every READ(10) of a rip goes through here. Without it
+            // ERROR_INVALID_PARAMETER (a struct-layout regression, the very
+            // class this file's SDK-layout tests exist to catch),
+            // ERROR_ACCESS_DENIED and ERROR_GEN_FAILURE (a genuinely wedged
+            // drive) all collapse to the same status-0xFF transport failure
+            // with nothing in the log to tell a code bug from a hardware one.
+            // Logged rather than added to the error type: the typed variant is
+            // public API and the recovery classification is deliberately the
+            // same for all of them.
+            let last_error = unsafe { GetLastError() };
+            tracing::warn!(
+                target: "freemkv::scsi",
+                opcode = cdb.first().copied().unwrap_or(0),
+                last_error,
+                "DeviceIoControl(IOCTL_SCSI_PASS_THROUGH_DIRECT) failed"
+            );
             // Driver-level failure (timeout, handle gone, etc.). Bubble
             // up; in-library handle recovery was removed in 0.13.20 along
             // with Linux's async fd-recovery and macOS's `try_recover` —
