@@ -187,12 +187,20 @@ impl SectorSource for FileSectorSource {
     ) -> Result<usize> {
         let count = count as u32;
         let bytes = count as usize * SECTOR_BYTES;
-        debug_assert!(
-            out.len() >= bytes,
-            "FileSectorSource::read_sectors: out len {} < requested {}",
-            out.len(),
-            bytes
-        );
+        // A real check, not a debug_assert: this is a public `SectorSource` impl,
+        // so an undersized `out` is caller input, and `out[..bytes]` below would
+        // panic with 'range end index out of range' in release where the assert is
+        // compiled away. `Drive::read_fua` already carries exactly this guard, with
+        // a comment recording the same panic being fixed there — this impl was
+        // simply never given it, and `PrefetchedSectorSource` has a regression test
+        // for the case that this one lacked.
+        if out.len() < bytes {
+            return Err(Error::DiscRead {
+                sector: lba as u64,
+                status: None,
+                sense: None,
+            });
+        }
         if count == 0 {
             return Ok(0);
         }
@@ -234,6 +242,40 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+
+    /// An undersized output buffer must return an error, never panic. This is a
+    /// public `SectorSource` impl, so buffer length is caller input, and the guard
+    /// used to be a `debug_assert!` — compiled out in release, where the
+    /// `out[..bytes]` slice then panicked with 'range end index out of range'.
+    ///
+    /// `Drive::read_fua` already carries this exact guard with a comment recording
+    /// the same panic being fixed there, and `PrefetchedSectorSource` has
+    /// `direct_read_too_small_buffer_errors` for the same case; this impl had
+    /// neither.
+    #[test]
+    fn read_sectors_with_an_undersized_buffer_errors_rather_than_panicking() {
+        let dir = tempdir().unwrap();
+        let iso = dir.path().join("t.iso");
+        make_iso(&iso, 8);
+        let mut src = FileSectorSource::open(&iso).expect("iso opens");
+
+        // Ask for four sectors but supply room for barely more than one.
+        let mut out = vec![0u8; SECTOR_BYTES + 1];
+        let err = src
+            .read_sectors(0, 4, &mut out, false)
+            .expect_err("an undersized buffer must be an error, not a panic");
+        assert!(
+            matches!(err, Error::DiscRead { .. }),
+            "expected DiscRead, got {err:?}"
+        );
+
+        // Exactly-sized still works, so the guard is not off by one.
+        let mut out = vec![0u8; 4 * SECTOR_BYTES];
+        assert_eq!(
+            src.read_sectors(0, 4, &mut out, false).unwrap(),
+            4 * SECTOR_BYTES
+        );
+    }
 
     /// Build a deterministic ISO of `sectors` sectors where sector `n`
     /// is filled with the byte pattern `((n & 0xff) as u8)`. Lets us
