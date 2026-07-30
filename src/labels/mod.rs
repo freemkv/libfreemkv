@@ -1885,6 +1885,32 @@ mod apply_tests {
         }
     }
 
+    /// Spec: fill_defaults must not clobber a video label that's already
+    /// set (mirrors the audio preserve-existing-label contract above).
+    /// Mutation: replace the `v.label.is_empty()` guard with `true` so the
+    /// Video arm always fires, wiping out a pre-set label.
+    #[test]
+    fn fill_defaults_preserves_existing_video_label() {
+        let mut titles = vec![title_with(vec![Stream::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::Hevc,
+            resolution: Resolution::R2160p,
+            frame_rate: FrameRate::F23_976,
+            hdr: HdrFormat::Hdr10,
+            color_space: ColorSpace::Bt2020,
+            display_aspect: None,
+            secondary: false,
+            label: "Pre-set 4K HDR".into(),
+            measured_cicp: None,
+        })])];
+        fill_defaults(&mut titles);
+        if let Stream::Video(v) = &titles[0].streams[0] {
+            assert_eq!(v.label, "Pre-set 4K HDR");
+        } else {
+            panic!("expected video stream");
+        }
+    }
+
     #[test]
     fn fill_defaults_generates_video_label_with_hdr() {
         let mut titles = vec![title_with(vec![video()])];
@@ -2085,5 +2111,248 @@ mod apply_tests {
         assert!(!codec_hint_adds_detail("DTS-HD Master Audio"));
         assert!(!codec_hint_adds_detail("Dolby Digital Plus 5.1"));
         assert!(!codec_hint_adds_detail(""));
+    }
+
+    // ── generate_video_label hardening ─────────────────────────────────────
+
+    /// Spec: a secondary (dependent-view) video stream with Dolby Vision
+    /// enhancement layer gets the brand string "Dolby Vision EL"; every
+    /// other HDR format on a secondary stream gets no label at all (that
+    /// wording is a CLI concern).
+    /// Mutation: delete the `HdrFormat::DolbyVision` arm so it falls
+    /// through to the `_ => String::new()` catch-all, losing the brand.
+    #[test]
+    fn generate_video_label_secondary_dolby_vision_el() {
+        assert_eq!(
+            generate_video_label(
+                &Codec::Hevc,
+                (3840, 2160),
+                false,
+                &HdrFormat::DolbyVision,
+                true
+            ),
+            "Dolby Vision EL"
+        );
+        // Every other HDR format on a secondary stream: empty, not text.
+        assert_eq!(
+            generate_video_label(&Codec::Hevc, (3840, 2160), false, &HdrFormat::Hdr10, true),
+            ""
+        );
+    }
+
+    /// Spec: 480 lines is the SD floor — a stream with height exactly 480
+    /// must get the "480p"/"480i" token (BD spec height boundary), not fall
+    /// through to the empty-resolution case.
+    /// Mutation: `h >= 480` -> `h < 480` inverts the boundary so a legitimate
+    /// 480-line stream (h == 480) produces no resolution token at all.
+    #[test]
+    fn generate_video_label_480_boundary() {
+        let label = generate_video_label(&Codec::Mpeg2, (0, 480), false, &HdrFormat::Sdr, false);
+        assert!(
+            label.contains("480p"),
+            "h == 480 must resolve to 480p, got {label:?}"
+        );
+    }
+
+    /// Spec: SDR is the unmarked default — it must never appear as a token
+    /// in the generated label (only non-SDR formats get an explicit tag).
+    /// Mutation: delete the `HdrFormat::Sdr` arm so it falls through to
+    /// `_ => parts.push(hdr.name())`, appending a spurious "SDR" token.
+    #[test]
+    fn generate_video_label_sdr_produces_no_hdr_token() {
+        assert_eq!(
+            generate_video_label(&Codec::Hevc, (1920, 1080), false, &HdrFormat::Sdr, false),
+            "HEVC 1080p"
+        );
+    }
+
+    // ── generate_audio_label_atmos ───────────────────────────────────────
+
+    /// Spec: the Atmos-aware variant folds "Atmos" into the codec brand
+    /// name for TrueHD/DD+ carriers, distinct from the plain wrapper.
+    /// Mutation: stub the whole function to `String::new()` / a constant
+    /// literal — either way it stops reflecting the codec/channel inputs.
+    #[test]
+    fn generate_audio_label_atmos_folds_brand() {
+        assert_eq!(
+            generate_audio_label_atmos(&Codec::TrueHd, &AudioChannels::Surround71, false),
+            "Dolby TrueHD Atmos 7.1"
+        );
+        assert_eq!(
+            generate_audio_label_atmos(&Codec::Ac3Plus, &AudioChannels::Surround51, false),
+            "Dolby Digital Plus Atmos 5.1"
+        );
+    }
+
+    /// Spec: every disc-audio codec in the enum has a full marketing name,
+    /// including the lossy PC-container codecs (AAC/MP2/MP3/FLAC/Opus) that
+    /// `generate_audio_label_all_codecs` above doesn't cover.
+    /// Mutation: delete any one of these match arms — the codec falls
+    /// through to `_ => return String::new()`, silently losing its label.
+    #[test]
+    fn generate_audio_label_covers_pc_container_codecs() {
+        assert_eq!(
+            generate_audio_label(&Codec::Aac, &AudioChannels::Stereo, false),
+            "AAC 2.0"
+        );
+        assert_eq!(
+            generate_audio_label(&Codec::Mp2, &AudioChannels::Stereo, false),
+            "MPEG Audio 2.0"
+        );
+        assert_eq!(
+            generate_audio_label(&Codec::Mp3, &AudioChannels::Stereo, false),
+            "MP3 2.0"
+        );
+        assert_eq!(
+            generate_audio_label(&Codec::Flac, &AudioChannels::Stereo, false),
+            "FLAC 2.0"
+        );
+        assert_eq!(
+            generate_audio_label(&Codec::Opus, &AudioChannels::Stereo, false),
+            "Opus 2.0"
+        );
+    }
+
+    // ── codec_hint_consistent: chained-OR boundary hardening ────────────────
+    //
+    // The family-detection booleans are built from chains of `h.contains(..)
+    // || h.contains(..) || ...` synonym checks. Each test below isolates ONE
+    // synonym clause (a hint string that matches that clause and NO other
+    // clause in the same chain) so a `||` -> `&&` flip at that specific
+    // position changes the family verdict — and, downstream, whether the
+    // codec match arm returns the spec-correct answer.
+
+    /// Isolates the `"true hd"` (space form) synonym in `says_truehd`,
+    /// which mutant testing hit at 396:44's `||`. If that `||` is
+    /// weakened to `&&`, "True HD" alone (no "truehd" substring) no longer
+    /// sets `says_truehd`, `names_family` goes false entirely (no other
+    /// family clause matches), and the function takes the "no family
+    /// named" early-return path — turning a should-be-`false` verdict for
+    /// a mismatched codec into `true`.
+    #[test]
+    fn codec_hint_consistent_truehd_space_synonym() {
+        assert!(codec_hint_consistent("True HD 7.1", &Codec::TrueHd));
+        assert!(!codec_hint_consistent("True HD 7.1", &Codec::Ac3));
+    }
+
+    /// Isolates the `"ac3+"` (no-hyphen) synonym in `says_ddp` (398:9's
+    /// `||`). A hint matching only this clause must still classify as
+    /// DD+, not fall through to the plain-AC3 `says_ac3` check.
+    #[test]
+    fn codec_hint_consistent_ddp_ac3_plus_no_hyphen_synonym() {
+        assert!(codec_hint_consistent("AC3+ 5.1", &Codec::Ac3Plus));
+        assert!(!codec_hint_consistent("AC3+ 5.1", &Codec::Ac3));
+    }
+
+    /// Isolates the `"eac3"` synonym in `says_ddp` (401:9's `||`), the
+    /// last clause before the chain moves to "digital plus"/"dd+".
+    #[test]
+    fn codec_hint_consistent_ddp_eac3_synonym() {
+        assert!(codec_hint_consistent("EAC3 5.1", &Codec::Ac3Plus));
+        assert!(!codec_hint_consistent("EAC3 5.1", &Codec::Ac3));
+    }
+
+    /// Isolates the `"pcm"` (no "lpcm") synonym in `says_lpcm` (409:40's
+    /// `||`). A bare "PCM" hint on a non-LPCM stream must still be judged
+    /// inconsistent — if the `||` were `&&`, "PCM" alone would fail to set
+    /// `says_lpcm`, `names_family` would go false, and the function would
+    /// take the "no family named" path, wrongly returning `true` for ANY
+    /// codec.
+    #[test]
+    fn codec_hint_consistent_lpcm_bare_pcm_synonym() {
+        assert!(codec_hint_consistent("PCM", &Codec::Lpcm));
+        assert!(!codec_hint_consistent("PCM", &Codec::Ac3));
+    }
+
+    /// Isolates the `says_dts_ma || says_dts_hr` disjunction inside the
+    /// `names_family` chain (418:60). A hint that sets `says_dts_ma` alone
+    /// (e.g. "Master Audio", without "hd ma") must still make
+    /// `names_family` true; weakening that `||` to `&&` requires both
+    /// clauses at once, so `names_family` goes false and the function
+    /// wrongly reports "consistent" for a codec the hint never named.
+    #[test]
+    fn codec_hint_consistent_names_family_dts_ma_alone() {
+        assert!(!codec_hint_consistent("Master Audio", &Codec::Ac3));
+        assert!(codec_hint_consistent("Master Audio", &Codec::DtsHdMa));
+    }
+
+    /// Isolates the `Codec::TrueHd => says_truehd || says_atmos` arm
+    /// (433:38). An Atmos-tagged hint that names a DIFFERENT lossless
+    /// carrier by name (DD+) must still be judged consistent with a
+    /// TrueHd stream purely on the Atmos marker — `||` -> `&&` would
+    /// require the hint to ALSO say "truehd", which an Atmos-only marker
+    /// doesn't.
+    #[test]
+    fn codec_hint_consistent_truehd_arm_atmos_alone() {
+        assert!(codec_hint_consistent(
+            "Dolby Digital Plus Atmos",
+            &Codec::TrueHd
+        ));
+    }
+
+    /// Spec: `Codec::Dts` is consistent ONLY when the hint's DTS-family
+    /// bookkeeping (`says_dts`) is true, not just because `names_family` is
+    /// true via some other carrier.
+    /// Mutation: delete the `Codec::Dts => says_dts` arm (438:9) — it falls
+    /// to `_ => true`, so ANY named family is (wrongly) "consistent" with
+    /// a Dts stream.
+    #[test]
+    fn codec_hint_consistent_dts_arm_not_bypassed() {
+        assert!(!codec_hint_consistent("Dolby Digital", &Codec::Dts));
+    }
+
+    /// Spec: `Codec::Lpcm` is consistent ONLY when `says_lpcm` is true.
+    /// Mutation: delete the `Codec::Lpcm => says_lpcm` arm (439:9) — same
+    /// bypass-to-`_ => true` failure mode as the Dts arm above.
+    #[test]
+    fn codec_hint_consistent_lpcm_arm_not_bypassed() {
+        assert!(!codec_hint_consistent("Dolby Digital", &Codec::Lpcm));
+    }
+}
+
+// ── fill_gaps_from_mpls: no-op-when-nothing-added hardening ────────────────
+
+#[cfg(test)]
+mod fill_gaps_sort_tests {
+    use super::*;
+
+    fn label(t: StreamLabelType, n: u16, lang: &str, codec: &str) -> StreamLabel {
+        StreamLabel {
+            stream_number: n,
+            stream_type: t,
+            language: lang.into(),
+            name: String::new(),
+            purpose: LabelPurpose::Normal,
+            qualifier: LabelQualifier::None,
+            codec_hint: codec.into(),
+            variant: String::new(),
+        }
+    }
+
+    /// Spec: the sort-by-(type, number) pass only runs when the merge
+    /// actually added something (`added > 0`); when MPLS contributed
+    /// nothing new, `framework`'s existing order (however the caller built
+    /// it) must be left untouched.
+    /// Mutation: `added > 0` -> `added >= 0` is always true, so the sort
+    /// runs unconditionally, silently reordering a framework list that
+    /// wasn't already in (type, number) order even on a no-op merge.
+    #[test]
+    fn fill_gaps_leaves_order_untouched_when_nothing_added() {
+        // Deliberately out of (type, number) order: number 2 before 1.
+        let mut framework = vec![
+            label(StreamLabelType::Audio, 2, "fra", "AC-3"),
+            label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
+        ];
+        // MPLS covers exactly the same (type, number) slots -> added == 0.
+        let mpls = vec![
+            label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
+            label(StreamLabelType::Audio, 2, "fra", "AC-3"),
+        ];
+        fill_gaps_from_mpls(&mut framework, &mpls);
+        assert_eq!(
+            framework[0].stream_number, 2,
+            "no gap-fill happened, so the original (out-of-order) sequence must survive"
+        );
+        assert_eq!(framework[1].stream_number, 1);
     }
 }

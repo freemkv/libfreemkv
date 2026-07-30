@@ -216,6 +216,27 @@ mod tests {
         ZipArchive::new(Cursor::new(bytes)).expect("valid zip")
     }
 
+    /// The doc comment states the cap is 64 MiB. Pin the exact numeric
+    /// value (not derived from the same `64 * 1024 * 1024` expression
+    /// under test — a hardcoded literal) so a mutation of the arithmetic
+    /// (e.g. `*` -> `+`) is caught even though no test builds an actual
+    /// 64 MiB buffer.
+    #[test]
+    fn max_class_bytes_is_64_mebibytes() {
+        assert_eq!(MAX_CLASS_BYTES, 67_108_864);
+    }
+
+    #[test]
+    fn has_path_prefix_matches_only_declared_prefix() {
+        let jar = open(build_stored_zip(
+            "com/dbp/Loader.class",
+            MINIMAL_CLASS,
+            MINIMAL_CLASS.len() as u32,
+        ));
+        assert!(has_path_prefix(&jar, "com/dbp/"));
+        assert!(!has_path_prefix(&jar, "com/bydeluxe/"));
+    }
+
     #[test]
     fn try_each_class_reads_minimal_class() {
         let mut jar = open(build_stored_zip(

@@ -1320,4 +1320,51 @@ mod tests {
         // Chapter 0 stays at 0.0 (no shift).
         assert!((t.chapters[0].time_secs - 0.0).abs() < 0.01);
     }
+
+    /// Audio PID fallback (dvd.rs `Disc::scan_dvd_titles`): when an audio
+    /// stream has no on-wire private_stream_1 sub-stream id — MP1/MP2 audio,
+    /// per `ifo::assign_audio_sub_stream_ids` — the PID falls back to
+    /// `0xBD00 + i` where `i` is the stream's positional index in the IFO
+    /// audio-attribute table. Two MPEG-audio (coding_mode 2) streams must
+    /// land on two DISTINCT, correctly-offset PIDs: 0xBD00 and 0xBD01. This
+    /// pins the `+` (not `-`/`*`) so the second stream doesn't collide with,
+    /// or wrap under, the first.
+    #[test]
+    fn scan_dvd_titles_mp2_audio_pid_fallback_is_additive() {
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(1, 1, 1)]);
+        // coding_mode bits are b0>>5 & 0x7; mode 2 = MPEG-1 Layer II (Mp2),
+        // which `assign_audio_sub_stream_ids` leaves at `sub_stream_id: None`.
+        // b0 = 0b010_00000 = 0x40. b1 = 0 (mono, sample rate 48k).
+        let audio = [(0x40u8, 0x00u8, [0u8, 0u8]), (0x40u8, 0x00u8, [0u8, 0u8])];
+        let vts = build_vts(1000, 0x00, &audio, &[], &[(10, 109)], false);
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let titles = Disc::scan_dvd_titles(&mut disc, &udf);
+        let t = &titles[0];
+        let audio_pids: Vec<u16> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some(a.pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(audio_pids, vec![0xBD00u16, 0xBD01u16]);
+    }
 }

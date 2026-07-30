@@ -61,6 +61,37 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         return None;
     }
 
+    let mut playlists: Vec<crate::mpls::Playlist> = Vec::new();
+    for name in &mpls_names {
+        let path = format!("/BDMV/PLAYLIST/{}", name);
+        let Ok(data) = udf.read_file(reader, &path) else {
+            continue;
+        };
+        let Ok(playlist) = crate::mpls::parse(&data) else {
+            continue;
+        };
+        playlists.push(playlist);
+    }
+
+    let labels = build_labels(&playlists);
+    if labels.is_empty() {
+        return None;
+    }
+
+    // MPLS gives language + codec but never editorial info (no
+    // commentary/SDH/director's cut). Low confidence means framework
+    // parsers (paramount, criterion, pixelogic, ctrm, dbp, deluxe) always
+    // win when they match. MPLS only gets chosen as the parser when
+    // nothing else fired — exactly the universal-fallback role we want.
+    Some(ParseResult::low(labels))
+}
+
+/// Convert every stream entry across `playlists` into deduped
+/// [`StreamLabel`]s. Factored out of [`parse`] so unit tests can drive
+/// the actual conversion logic (stream-type mapping, dedup key, dense
+/// global counters) directly from already-parsed [`crate::mpls::Playlist`]
+/// values, without needing a synthetic on-disc UDF image.
+fn build_labels(playlists: &[crate::mpls::Playlist]) -> Vec<StreamLabel> {
     let mut labels: Vec<StreamLabel> = Vec::new();
     // (stream_type_tag, language, codec_hint, pid) — PID is the
     // canonical "same physical stream" key; type+lang+codec round
@@ -77,15 +108,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     let mut audio_idx: u16 = 0;
     let mut sub_idx: u16 = 0;
 
-    for name in &mpls_names {
-        let path = format!("/BDMV/PLAYLIST/{}", name);
-        let Ok(data) = udf.read_file(reader, &path) else {
-            continue;
-        };
-        let Ok(playlist) = crate::mpls::parse(&data) else {
-            continue;
-        };
-
+    for playlist in playlists {
         for entry in &playlist.streams {
             let label_type = match entry.stream_type {
                 2 | 5 => StreamLabelType::Audio, // primary + secondary audio
@@ -130,17 +153,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
             });
         }
     }
-
-    if labels.is_empty() {
-        return None;
-    }
-
-    // MPLS gives language + codec but never editorial info (no
-    // commentary/SDH/director's cut). Low confidence means framework
-    // parsers (paramount, criterion, pixelogic, ctrm, dbp, deluxe) always
-    // win when they match. MPLS only gets chosen as the parser when
-    // nothing else fired — exactly the universal-fallback role we want.
-    Some(ParseResult::low(labels))
+    labels
 }
 
 fn has_mpls_extension(name: &str) -> bool {
@@ -336,60 +349,14 @@ mod tests {
         }
     }
 
-    /// Drive the same conversion logic that `parse()` runs on real
-    /// disc data, but starting from already-parsed Playlists so we
-    /// don't have to synthesize valid MPLS bytes.
+    /// Drive the actual production conversion logic (`build_labels`, the
+    /// function `parse()` calls) starting from already-parsed Playlists,
+    /// so tests don't have to synthesize valid on-disc MPLS/UDF bytes.
+    /// This calls the *real* code under test rather than a hand-written
+    /// re-implementation, so mutations inside `build_labels` (stream-type
+    /// mapping, dedup key, counters) are actually caught here.
     fn labels_from_playlists(playlists: &[Playlist]) -> Vec<StreamLabel> {
-        let mut labels: Vec<StreamLabel> = Vec::new();
-        let mut seen: Vec<(StreamLabelType, String, String, u16)> = Vec::new();
-
-        // Global counters hoisted OUT of the playlist loop to match
-        // production `parse()` (lines 77-78): stream_numbers are dense
-        // per type across the whole disc, not reset per playlist.
-        let mut audio_idx: u16 = 0;
-        let mut sub_idx: u16 = 0;
-
-        for playlist in playlists {
-            for entry in &playlist.streams {
-                let label_type = match entry.stream_type {
-                    2 | 5 => StreamLabelType::Audio,
-                    3 => StreamLabelType::Subtitle,
-                    _ => continue,
-                };
-                // Dedup BEFORE consuming a counter value, matching prod
-                // parse() ordering so a deduped duplicate does not burn a
-                // stream number.
-                let language = normalize_language(&entry.language);
-                let name = language_display_name(&language);
-                let codec_hint = build_codec_hint(label_type, entry);
-                let key = (label_type, language.clone(), codec_hint.clone(), entry.pid);
-                if seen.contains(&key) {
-                    continue;
-                }
-                seen.push(key);
-                let stream_number = match label_type {
-                    StreamLabelType::Audio => {
-                        audio_idx += 1;
-                        audio_idx
-                    }
-                    StreamLabelType::Subtitle => {
-                        sub_idx += 1;
-                        sub_idx
-                    }
-                };
-                labels.push(StreamLabel {
-                    stream_number,
-                    stream_type: label_type,
-                    language,
-                    name,
-                    purpose: LabelPurpose::Normal,
-                    qualifier: LabelQualifier::None,
-                    codec_hint,
-                    variant: String::new(),
-                });
-            }
-        }
-        labels
+        build_labels(playlists)
     }
 
     #[test]
