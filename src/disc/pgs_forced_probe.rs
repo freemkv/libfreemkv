@@ -46,6 +46,14 @@ const _: () = assert!(
     "probe chunks must be a whole number of AACS aligned units"
 );
 
+/// How many times a read that came back with less than one AACS aligned unit — so
+/// the read position could not advance without leaving the unit grid — is retried
+/// at the same LBA before the run is declared truncated. A couple of retries covers
+/// a source whose batching straddles the request (a short call followed by a
+/// satisfying one); a source that can never yield a whole unit must not spin, so
+/// the count is small and the stop is `ReadFailed` (inconclusive, not memoised).
+const STALL_RETRY_LIMIT: u32 = 2;
+
 /// Hard ceiling on sectors read per probe call (256 MiB).
 ///
 /// The probe's natural exit is "every track has shown a non-forced display set",
@@ -237,6 +245,9 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
         // `None` = this extent was read to its end, so its evidence is complete
         // and may be memoised. `Some(reason)` = the read stopped early.
         let mut cut_short: Option<StopReason> = None;
+        // Consecutive reads that came back with less than one AACS aligned unit, so
+        // the read position could not move (see the short-read handling below).
+        let mut stalled: u32 = 0;
         while remaining > 0 {
             // Bounded work and a responsive cancel: without these the probe
             // reads the entire title whenever a track really is forced.
@@ -266,15 +277,49 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
             // used to advance `lba`/`remaining`/`sectors_read` by the full
             // `count`, silently SKIPPING the unread tail of the chunk while
             // `stop` stayed `Exhausted` — so an absence-based forced verdict was
-            // asserted (and memoised) over data that was never seen. The partial
-            // trailing sector, if any, is left for the next read rather than fed
-            // twice.
-            let got = (n.min(want) / SECTOR_BYTES) as u32;
+            // asserted (and memoised) over data that was never seen.
+            let served = (n.min(want) / SECTOR_BYTES) as u32;
+            // ...but advancing by the raw sector count breaks the OTHER invariant
+            // this loop rests on: with a decrypting source every read must BEGIN a
+            // whole number of AACS aligned units past `ext.start_lba`, which is why
+            // `CHUNK_SECTORS` is a multiple of `ALIGNED_UNIT_SECTORS` (see the
+            // const-assert above). A short read of, say, 64 sectors is not a whole
+            // number of units, so the next `lba` would be off the unit grid,
+            // `DecryptingSectorSource` would reject it with `DecryptFailed` before
+            // reading, and the run would end `ReadFailed` — inconclusive, nothing
+            // memoised, forced detection silently back to the vendor label on
+            // exactly the encrypted discs the aligned chunk size was chosen for.
+            //
+            // So a read that did NOT satisfy the whole request advances only by
+            // whole aligned units, and the residue sectors are simply RE-READ from
+            // the next unit boundary on the following pass: at most two sectors of
+            // duplicated drive work, no gap, no double-feed of any byte to the
+            // demuxer (only the aligned prefix is fed), and no trailing partial
+            // unit — whose plaintext a unit-anchored decrypt cannot produce anyway
+            // — is ever handed to the parsers.
+            //
+            // A read that satisfied the whole request advances by all of it even
+            // when `count` itself was not unit-aligned: `count` is only ever below
+            // `CHUNK_SECTORS` on the extent's final chunk or at the sector budget,
+            // and both end the loop before another read of this extent.
+            let got = if served >= u32::from(count) {
+                u32::from(count)
+            } else {
+                served - served % crate::aacs::content::ALIGNED_UNIT_SECTORS
+            };
             if got == 0 {
-                // Less than one whole sector: the bytes are real, so feed them,
-                // but the loop cannot advance (re-reading the same partial sector
-                // would feed it twice) — so this is the truncated prefix an error
-                // is. A source that claims sectors and yields none is the same case.
+                // Less than one whole aligned unit came back, so the read position
+                // cannot move: the next aligned boundary IS the one just read. The
+                // bytes are real, so feed them (never lose an observation), then
+                // RETRY the same aligned lba — a source that short-changed one call
+                // commonly satisfies the next, and only when it repeatedly cannot
+                // yield a whole unit is the run the truncated prefix an error is.
+                // Bounded retries are what keep a source that never yields a unit
+                // (including one that claims sectors and returns none) from
+                // spinning here for ever. A retry that re-serves the same bytes
+                // feeds them twice; the evidence a [`ForcedTracker`] keeps is
+                // monotone (observed / saw-a-non-forced-set), so a repeat cannot
+                // change a verdict.
                 for pes in demux.feed(&buf[..n.min(want)]) {
                     if let (Some(parser), Some(tracker)) =
                         (parsers.get_mut(&pes.pid), trackers.get_mut(&pes.pid))
@@ -284,9 +329,21 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                         }
                     }
                 }
-                cut_short = Some(StopReason::ReadFailed);
-                break;
+                stalled += 1;
+                if stalled > STALL_RETRY_LIMIT {
+                    tracing::debug!(
+                        target: "freemkv::scan",
+                        lba,
+                        requested = count,
+                        served,
+                        "forced-subtitle probe stalled below one aligned unit; stopping"
+                    );
+                    cut_short = Some(StopReason::ReadFailed);
+                    break;
+                }
+                continue;
             }
+            stalled = 0;
             for pes in demux.feed(&buf[..got as usize * SECTOR_BYTES]) {
                 if let (Some(parser), Some(tracker)) =
                     (parsers.get_mut(&pes.pid), trackers.get_mut(&pes.pid))
@@ -1089,11 +1146,11 @@ mod tests {
         }
     }
 
-    /// A source that serves only `frac` of the sectors requested, never erroring —
-    /// what `PrefetchedSectorSource` does (it returns its producer's batch, not
-    /// `count * 2048`). Records the LBAs it actually served.
+    /// A source that never serves more than `batch` sectors per call, never
+    /// erroring — what `PrefetchedSectorSource` does (it returns its producer's
+    /// batch, not `count * 2048`). Records what it actually served, per call.
     struct ShortReader {
-        frac: u32,
+        batch: u32,
         served: Vec<(u32, u32)>,
     }
     impl SectorSource for ShortReader {
@@ -1104,7 +1161,7 @@ mod tests {
             buf: &mut [u8],
             _recovery: bool,
         ) -> crate::error::Result<usize> {
-            let give = (count as u32 / self.frac).max(1);
+            let give = u32::from(count).min(self.batch);
             self.served.push((lba, give));
             let n = give as usize * SECTOR_BYTES;
             buf[..n].fill(0);
@@ -1124,7 +1181,7 @@ mod tests {
         let pid = 0x1200u16;
         let count = CHUNK_SECTORS as u32 * 2;
         let mut reader = ShortReader {
-            frac: 4,
+            batch: 64,
             served: Vec::new(),
         };
         let mut title = pgs_title(pid, true);
@@ -1134,15 +1191,105 @@ mod tests {
         }];
         probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
 
-        // The served ranges must tile the extent exactly: contiguous, no gaps.
-        let mut next = 0u32;
+        // The served ranges must cover the extent with NO GAP. A residue re-read
+        // (the sectors of a partial aligned unit, read again from the unit
+        // boundary) is allowed — what must never happen is an unread sector.
+        let mut covered = 0u32;
         for &(lba, given) in &reader.served {
-            assert_eq!(lba, next, "gap: sectors {next}..{lba} were never read");
-            next += given;
+            assert!(
+                lba <= covered,
+                "gap: sectors {covered}..{lba} were never read"
+            );
+            covered = covered.max(lba + given);
         }
         assert_eq!(
-            next, count,
+            covered, count,
             "every sector of the extent must be read when the source short-reads"
         );
+    }
+
+    /// A short read must not break the aligned-unit invariant the chunk size
+    /// exists to hold. `CHUNK_SECTORS` is a multiple of `ALIGNED_UNIT_SECTORS` so
+    /// that every read BEGINS on an AACS aligned-unit boundary measured from the
+    /// extent base; a source that serves fewer sectors than requested (a 64-sector
+    /// prefetch batch: `64 % 3 == 1`) used to advance `lba` by that raw count, so
+    /// every subsequent read of the extent was off the unit grid.
+    /// `DecryptingSectorSource` rejects those before reading (`DecryptFailed`) →
+    /// `ReadFailed` → `absence_is_conclusive()` false → no verdict asserted and
+    /// nothing memoised, i.e. content-based forced detection silently degraded to
+    /// the vendor label on precisely the encrypted discs it was fixed for.
+    #[test]
+    fn short_reads_stay_on_aacs_unit_boundaries() {
+        let pid = 0x1200u16;
+        // A base that is NOT itself 3-aligned, so only the base-relative gate is
+        // satisfiable — absolute `lba % 3` would disagree.
+        let base = 4_001u32;
+        let count = CHUNK_SECTORS as u32 * 2;
+        let mut reader = ShortReader {
+            batch: 64,
+            served: Vec::new(),
+        };
+        let mut title = pgs_title(pid, true);
+        title.extents = vec![Extent {
+            start_lba: base,
+            sector_count: count,
+        }];
+        let mut cache = ForcedProbeCache::new();
+        probe_and_set_forced(&mut reader, &mut title, &mut cache, None);
+
+        assert!(reader.served.len() > 2, "several short reads happened");
+        for &(lba, _) in &reader.served {
+            assert!(
+                crate::aacs::content::is_unit_aligned(lba, base),
+                "read at lba {lba} is off the aligned-unit grid from base {base}"
+            );
+        }
+        // ...and the extent still gets read to its end, so the run reaches a
+        // designed stop and its (absence-based) evidence is memoisable.
+        let last = reader.served.last().copied().unwrap_or_default();
+        assert_eq!(
+            last.0 + last.1,
+            base + count,
+            "the extent must still be read to its end"
+        );
+        assert!(
+            cache.contains_key(&(base, count, pid)),
+            "a fully-read extent must be memoised, not discarded as inconclusive"
+        );
+    }
+
+    /// A source that can never yield a whole aligned unit cannot be advanced past
+    /// without leaving the unit grid — so the loop retries a bounded number of
+    /// times and then stops. It must NOT spin: the test simply completing is the
+    /// assertion, plus a bounded read count and an inconclusive (uncached,
+    /// vendor-flag-preserving) outcome.
+    #[test]
+    fn a_source_below_one_aligned_unit_stops_instead_of_spinning() {
+        let pid = 0x1200u16;
+        let mut reader = ShortReader {
+            batch: 1, // one sector: less than an aligned unit, for ever
+            served: Vec::new(),
+        };
+        let mut title = pgs_title(pid, true);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: CHUNK_SECTORS as u32,
+        }];
+        let mut cache = ForcedProbeCache::new();
+        probe_and_set_forced(&mut reader, &mut title, &mut cache, None);
+
+        assert!(
+            reader.served.len() as u32 <= STALL_RETRY_LIMIT + 1,
+            "a stalled source must be retried a bounded number of times, got {} reads",
+            reader.served.len()
+        );
+        for &(lba, _) in &reader.served {
+            assert_eq!(lba, 0, "a stalled read never advances off the unit grid");
+        }
+        let Stream::Subtitle(s) = &title.streams[0] else {
+            panic!()
+        };
+        assert!(s.forced, "inconclusive run keeps the vendor flag");
+        assert!(cache.is_empty(), "inconclusive run is not memoised");
     }
 }
