@@ -507,6 +507,12 @@ impl CodecParser for Ac3Parser {
                     MAX_AC3_BUF
                 );
                 self.buf.clear();
+                // Advance the cadence, as both sibling branches below do, so the
+                // three paths out of this block cannot disagree. Defensive: no
+                // input reaching this parser was found that both parses frames and
+                // leaves a residue this large, so the stale-cadence bug this
+                // prevents is not currently reachable and has no regression test.
+                self.flush_pts_ns = frame_pts_ns;
             } else {
                 self.buf = tail.to_vec();
                 // The carried bytes, when later completed and emitted (next call
