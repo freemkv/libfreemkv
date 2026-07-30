@@ -357,14 +357,15 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
         let Some(slot) = self.route.get(frame.track).copied().flatten() else {
             return Ok(()); // excluded track (or out of range)
         };
-        // Build the audio sample entry from the first frame of an audio track.
+        // Derive the audio sample entry opportunistically from whichever frame
+        // parses first. The entry is only needed at finish(), when build_moov runs
+        // — nothing on this path consumes it — so an unparseable frame must NOT
+        // cost us the frame. Dropping leading frames here lost audio silently, and
+        // a track whose frames never parsed vanished from the output entirely with
+        // no report; finish() now decides that case loudly instead.
         if self.tracks[slot].media == Media::Audio && self.tracks[slot].audio_entry.is_none() {
             if let Some(entry) = audio::dolby_sample_entry(self.tracks[slot].codec, &frame.data) {
                 self.tracks[slot].audio_entry = Some(entry);
-            } else {
-                // Unparseable first frame — skip until one parses (avoids a
-                // track with samples but no sample entry).
-                return Ok(());
             }
         }
         let pts_ns = frame.pts;
@@ -385,9 +386,25 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
             return Ok(());
         }
         self.finished = true;
-        // Drop tracks that never received a sample (e.g. an audio track whose
-        // frames never parsed) so moov carries no empty trak.
+        // Drop tracks that never received a sample so moov carries no empty trak.
         self.tracks.retain(|t| !t.samples.is_empty());
+        // An audio track with samples but no sample entry cannot be DESCRIBED: the
+        // moov would carry an stsd declaring entry_count=1 around an empty entry,
+        // i.e. a structurally invalid mp4 returned as success. Drop it instead, and
+        // say so — this crate's policy is that a skipped track is never silent.
+        // Its bytes stay in mdat unreferenced, which is harmless (wasted space in a
+        // valid file) and preferable to failing an export whose video is fine.
+        self.tracks.retain(|t| {
+            let describable = t.media != Media::Audio || t.audio_entry.is_some();
+            if !describable {
+                tracing::warn!(
+                    codec = ?t.codec,
+                    samples = t.samples.len(),
+                    "mp4: no audio frame yielded a parseable sample entry, dropping track"
+                );
+            }
+            describable
+        });
         if self.tracks.is_empty() {
             return Err(crate::error::Error::MuxEmpty.into());
         }
@@ -468,6 +485,8 @@ fn build_audio_trak_full(t: &Track) -> (Vec<u8>, f64) {
     let media_dur: u64 = durs.iter().map(|&d| d as u64).sum();
     let secs = media_dur as f64 / ts as f64;
 
+    // finish() drops any audio track without an entry, so this is Some for every
+    // track that reaches here; default only guards a future caller of build_trak.
     let entry = t.audio_entry.clone().unwrap_or_default();
     let stbl = build_audio_stbl(entry, &t.samples, &durs);
     let minf = build_minf(audio_smhd(), stbl);
@@ -1046,6 +1065,61 @@ mod tests {
         }
         assert_eq!(pos, buf.len(), "top-level boxes tile exactly");
         out
+    }
+
+    /// An audio track whose frames never yield a parseable sample entry must be
+    /// dropped from moov, NOT written as an stsd declaring entry_count=1 around an
+    /// empty entry — that is a structurally invalid mp4 returned as success.
+    ///
+    /// The video track must survive, and no audio frame may be lost from mdat on
+    /// the way: write() previously returned Ok(()) without recording the sample,
+    /// so leading audio frames vanished silently.
+    ///
+    /// Mutation check: restore write()'s early `return Ok(())` and the unparseable
+    /// bytes never reach mdat; drop finish()'s describability retain and moov gains
+    /// a second trak carrying an empty sample entry.
+    #[test]
+    fn audio_track_with_no_parseable_sample_entry_is_dropped_not_emitted_empty() {
+        let t = title(
+            vec![hevc_video(), audio(Codec::Ac3, "eng")],
+            vec![Some(vec![1, 2, 3, 4]), None],
+        );
+        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        s.write(&frame(0, 0, true, vec![0xAB; 800])).unwrap();
+        // Not an AC-3 syncframe: dolby_sample_entry cannot parse it, ever.
+        let junk = vec![0x5Au8; 64];
+        s.write(&frame(1, 0, true, junk.clone())).unwrap();
+        s.write(&frame(1, 32_000_000, true, junk.clone())).unwrap();
+        s.finish().unwrap();
+        let buf = s.writer.into_inner();
+
+        let boxes = walk(&buf);
+        let (_, ms, msz) = *boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
+        let moov = &buf[ms + 8..ms + msz];
+        let mut traks = 0;
+        let mut pos = 0;
+        while pos + 8 <= moov.len() {
+            let size = u32::from_be_bytes([moov[pos], moov[pos + 1], moov[pos + 2], moov[pos + 3]])
+                as usize;
+            if &moov[pos + 4..pos + 8] == b"trak" {
+                traks += 1;
+            }
+            if size < 8 {
+                break;
+            }
+            pos += size;
+        }
+        assert_eq!(
+            traks, 1,
+            "only the video trak may be described; the undescribable audio track is dropped"
+        );
+
+        // The audio bytes were still WRITTEN (no silent frame loss) — they simply
+        // end up unreferenced in mdat rather than being discarded at write time.
+        assert!(
+            buf.windows(junk.len()).any(|w| w == &junk[..]),
+            "audio frames must reach mdat rather than being dropped by write()"
+        );
     }
 
     #[test]
