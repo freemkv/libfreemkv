@@ -15,6 +15,33 @@ pub(crate) const AACS_IV: [u8; 16] = [
     0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3, 0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05, 0x0F, 0x78,
 ];
 
+// Per-thread count of AES-128 key schedules built through `new_cipher`.
+// Test-only instrumentation: an AES-128 key expansion is 10 round-key
+// derivations, and the CBC helpers here run on the per-aligned-unit decrypt hot
+// path of a whole disc read, so "how many times was the schedule built for one
+// loop-invariant key" is a property worth asserting rather than reasoning about.
+// THREAD-LOCAL, not a global atomic: `cargo test` runs tests concurrently, so a
+// shared counter would see every other test's expansions. See
+// `content::tests::decrypt_bus_expands_the_read_data_key_once_per_unit`.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static KEY_EXPANSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Build an AES-128 key schedule for a caller that will drive
+/// [`cbc_decrypt_blocks`] over several regions under one key.
+pub(crate) fn new_cipher_for(key: &[u8; 16]) -> Aes128 {
+    new_cipher(key)
+}
+
+/// Build an AES-128 key schedule. The single construction site for the CBC
+/// helpers, so [`KEY_EXPANSIONS`] can count them under test.
+fn new_cipher(key: &[u8; 16]) -> Aes128 {
+    #[cfg(test)]
+    KEY_EXPANSIONS.with(|c| c.set(c.get() + 1));
+    Aes128::new(GenericArray::from_slice(key))
+}
+
 /// AES-128-ECB encrypt a single 16-byte block. [C] §2.1.1 (`AES-128E`).
 pub(crate) fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let cipher = Aes128::new(GenericArray::from_slice(key));
@@ -35,13 +62,12 @@ pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     out
 }
 
-/// AES-128-CBC decrypt in-place with the fixed AACS IV. [C] §2.1.2 (`AES-128CBCD`).
+/// AES-128-CBC ENCRYPT in place under the fixed [`AACS_IV`] — the forward
+/// direction of [`aes_cbc_decrypt`], and its exact inverse. [C] §2.1.2
+/// (`AES-128CBCE`).
 ///
-/// Precondition: `data.len()` is a multiple of 16. Any trailing partial
-/// block is silently ignored; all callers pass aligned regions (6128 and
-/// 2032 bytes), and the assert documents/enforces that contract.
-/// AES-128-CBC encrypt in place under the fixed [`AACS_IV`] — the forward
-/// direction of [`aes_cbc_decrypt`], and its exact inverse.
+/// Precondition: `data.len()` is a multiple of 16; the assert
+/// documents/enforces that contract.
 ///
 /// Constructs the cipher ONCE for the whole slice. Driving this from the
 /// single-block [`aes_ecb_encrypt`] instead rebuilds the AES key schedule per
@@ -52,7 +78,7 @@ pub(crate) fn aes_cbc_encrypt(key: &[u8; 16], data: &mut [u8]) {
         data.len().is_multiple_of(16),
         "aes_cbc_encrypt requires a block-aligned slice"
     );
-    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let cipher = new_cipher(key);
     let num_blocks = data.len() / 16;
     let mut prev = AACS_IV;
     // Forward order: each block is XORed with the PRECEDING ciphertext block.
@@ -69,12 +95,40 @@ pub(crate) fn aes_cbc_encrypt(key: &[u8; 16], data: &mut [u8]) {
     }
 }
 
+/// AES-128-CBC DECRYPT in-place with the fixed AACS IV. [C] §2.1.2
+/// (`AES-128CBCD`).
+///
+/// Precondition: `data.len()` is a multiple of 16. Any trailing partial
+/// block is silently ignored; all callers pass aligned regions (6128 and
+/// 2032 bytes), and the assert documents/enforces that contract.
+///
+/// (This doc block was orphaned onto `aes_cbc_encrypt` above when that function
+/// was inserted directly after it with no separating blank line, so rustdoc
+/// rendered the crate's only forward-direction AACS primitive as "decrypt" and
+/// cited the spec's DECRYPT clause for it, while this function had no doc at
+/// all. `encrypt_unit_is_the_exact_inverse_of_decrypt_unit` in `content.rs` pins
+/// the directions behaviourally so a maintainer 'fixing' the contradiction by
+/// swapping the two bodies fails the suite instead of shipping a second
+/// decryptor behind an already-set encrypted flag.)
 pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
     debug_assert!(
         data.len().is_multiple_of(16),
         "aes_cbc_decrypt requires a block-aligned slice"
     );
-    let cipher = Aes128::new(GenericArray::from_slice(key));
+    cbc_decrypt_blocks(&new_cipher(key), data);
+}
+
+/// AES-128-CBC decrypt in place under the fixed [`AACS_IV`] with an ALREADY
+/// EXPANDED key schedule.
+///
+/// Split out of [`aes_cbc_decrypt`] so a caller that decrypts several regions
+/// under one loop-invariant key expands the schedule once. `decrypt_bus`
+/// ([`super::content::decrypt_bus`]) is that caller: bus encryption
+/// ([C] §4.2 / the AACS 2.0 Read Data Key) covers bytes 16..2048 of EVERY
+/// 2048-byte sector, so a 6144-byte aligned unit is three regions under one
+/// `read_data_key` — three key schedules where one suffices, on the per-unit
+/// decrypt hot path of a whole 90 GB read.
+pub(crate) fn cbc_decrypt_blocks(cipher: &Aes128, data: &mut [u8]) {
     let num_blocks = data.len() / 16;
     // Process blocks in reverse to avoid clobbering ciphertext needed for XOR
     for i in (0..num_blocks).rev() {

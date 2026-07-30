@@ -781,9 +781,34 @@ impl Drive {
         // each a self-contained READ(10) with the same validation. Any
         // chunk error reports that chunk's LBA (more precise than the whole
         // request's base LBA).
+        let count = count as u32;
+        // Check the caller's buffer ONCE, up front. The chunk loop slices `buf`
+        // by `count * 2048`; without this an undersized buffer PANICKED ('range
+        // end index out of range') out of the public `read`/`read_fua`, while the
+        // single-chunk path above tolerates the same undersized buffer and returns
+        // `Err(DiscRead)` from `checked_exec`. Behaviour on an undersized buffer
+        // must not depend on the transport's transfer limit.
+        if buf.len() < count as usize * 2048 {
+            return Err(Error::DiscRead {
+                sector: lba as u64,
+                status: None,
+                sense: None,
+            });
+        }
+        // The whole range must be addressable: SBC-3 READ(10) carries a 32-bit
+        // LOGICAL BLOCK ADDRESS, so a request whose last chunk crosses `u32::MAX`
+        // has no valid CDB. `lba + done` below was unchecked — a debug panic out
+        // of the public API, and in release a wrap to a low LBA that was read and
+        // returned as if it were the requested one.
+        if lba.checked_add(count.saturating_sub(1)).is_none() {
+            return Err(Error::DiscRead {
+                sector: lba as u64,
+                status: None,
+                sense: None,
+            });
+        }
         let mut done: u32 = 0;
         let mut total: usize = 0;
-        let count = count as u32;
         while done < count {
             let chunk = (count - done).min(max_sectors);
             let cur_lba = lba + done;
@@ -1933,6 +1958,54 @@ mod command_tests {
         let mut buf = vec![0u8; 3 * 2048];
         assert_eq!(d.read(0, 3, &mut buf, false).unwrap(), 3 * 2048);
         assert_eq!(*reads.lock().unwrap(), vec![(0, 3)], "single CDB, no split");
+    }
+
+    /// The multi-chunk path slices the caller's buffer by `count * 2048` with no
+    /// length check, so an undersized `buf` PANICKED ('range end index out of
+    /// range') out of the public `Drive::read` / `Drive::read_fua` — while the
+    /// single-chunk path (`read_one` → `checked_exec`) tolerates the same
+    /// undersized buffer and returns `Err(DiscRead)`. The public API's behaviour
+    /// on an undersized buffer must not depend on the transport's transfer limit.
+    #[test]
+    fn undersized_buffer_multi_chunk_errors_not_panics() {
+        let ChunkingHarness {
+            drive: mut d,
+            reads: _reads,
+        } = chunking(4 * 2048, None);
+        // count (10) > max_sectors (4) → the chunk loop; buf holds only 1 sector.
+        let mut buf = vec![0u8; 2048];
+        assert!(
+            matches!(d.read(0, 10, &mut buf, false), Err(Error::DiscRead { .. })),
+            "an undersized buffer must error, not panic"
+        );
+        // The single-chunk path with the SAME undersized buffer already errored;
+        // the two paths must now agree.
+        let mut buf = vec![0u8; 2048];
+        assert!(
+            matches!(d.read(0, 3, &mut buf, false), Err(Error::DiscRead { .. })),
+            "single-chunk path errors on an undersized buffer (unchanged)"
+        );
+    }
+
+    /// `Drive::read`'s chunk loop advanced the per-chunk LBA with an unchecked
+    /// `lba + done`. SBC-3 READ(10) `LOGICAL BLOCK ADDRESS` is a 32-bit field, so
+    /// a request whose last chunk crosses `u32::MAX` overflowed: debug panic out
+    /// of the public API, release wrap to a low LBA silently read instead.
+    #[test]
+    fn chunk_lba_near_u32_max_errors_not_overflows() {
+        let ChunkingHarness {
+            drive: mut d,
+            reads: _reads,
+        } = chunking(4 * 2048, None);
+        let mut buf = vec![0u8; 10 * 2048];
+        // 0xFFFF_FFFE + 4 overflows on the second chunk.
+        assert!(
+            matches!(
+                d.read(0xFFFF_FFFE, 10, &mut buf, false),
+                Err(Error::DiscRead { .. })
+            ),
+            "an LBA range past u32::MAX must error, not overflow"
+        );
     }
 
     // ── find_drive media-preference selection policy ────────────────

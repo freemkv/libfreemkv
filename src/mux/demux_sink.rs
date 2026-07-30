@@ -220,6 +220,13 @@ struct AnnexBWriter {
     /// avcC/hvcC may declare 1 or 2, and reading those as u32-BE parses no NALs
     /// at all, so the raw prefixed bytes would be emitted as if already Annex B.
     length_size: usize,
+    /// Reused length-prefixed -> Annex-B conversion buffer. `write_frame` used to
+    /// allocate and free a whole-frame Vec per video frame; extracting the video ES
+    /// of a UHD title is ~200,000 frames of 150-400 KB, every one over the
+    /// allocator's mmap threshold, so that was ~200,000 mmap/munmap pairs plus
+    /// millions of first-touch page faults of pure overhead. Kept on the writer and
+    /// cleared per frame instead, matching what tsmux.rs already does.
+    scratch: Vec<u8>,
 }
 
 impl AnnexBWriter {
@@ -231,6 +238,7 @@ impl AnnexBWriter {
             params,
             wrote_params: false,
             length_size: nal_length_size(codec, codec_private),
+            scratch: Vec::new(),
         }
     }
 }
@@ -251,10 +259,16 @@ impl EsWriter for AnnexBWriter {
         // source of truth across all muxers — see `crate::mux::hevc`). It skips
         // zero-length NALs and drops a truncated trailing NAL without panicking,
         // rather than `break`ing on the first zero-length NAL.
-        let mut scratch = Vec::with_capacity(f.data.len() + (f.data.len() / 32) + 4);
+        // Reuse the writer's buffer rather than allocating per frame; clear()
+        // keeps the capacity, so steady state costs no allocation at all. The
+        // prefix width still comes from the record, never a hardcoded 4.
+        self.scratch.clear();
+        self.scratch.reserve(f.data.len() + (f.data.len() / 32) + 4);
+        let mut scratch = std::mem::take(&mut self.scratch);
         append_length_prefixed_as_annex_b_sized(&mut scratch, &f.data, self.length_size);
         w.write_all(&scratch)?;
         n += scratch.len();
+        self.scratch = scratch;
         Ok(n)
     }
 }

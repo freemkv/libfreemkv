@@ -265,14 +265,22 @@ impl<W: Write> TsMuxer<W> {
 
         // Video PES may be unbounded (length 0); a 0xBD private_stream_1
         // PES must carry a bounded length, so split oversized audio/sub
-        // access units into multiple PES packets. Each emitted PES carries
-        // the same PTS and starts on its own PUSI packet (only the keyframe
-        // RAI rides the first packet of the first PES).
+        // access units into multiple PES packets.
+        //
+        // ONLY THE FIRST emitted PES carries the PTS. ISO/IEC 13818-1 §2.4.3.7
+        // puts the PTS in the header of the PES packet containing the FIRST byte of
+        // the access unit; every chunk used to repeat it, so on read-back a demuxer
+        // (which treats each PUSI as a new access unit) received the second half of
+        // e.g. an oversized full-screen PGS display set as an independent segment at
+        // the SAME timestamp, and the display set was emitted as two blocks with
+        // identical timestamps instead of one. Each PES still necessarily starts on
+        // its own PUSI packet — that is what delimits a PES — but only the keyframe
+        // RAI rides the first packet of the first PES.
         //
         // The write result is held rather than `?`-propagated so the conversion
         // buffer goes back into `self` on every path.
         let res = if is_video || es_data.len() <= MAX_BD_PES_PAYLOAD {
-            self.write_pes_chain(track, pid, pts_90k, is_video, keyframe, es_data)
+            self.write_pes_chain(track, pid, Some(pts_90k), is_video, keyframe, es_data)
         } else {
             let mut first_pes = true;
             let mut res = Ok(());
@@ -280,7 +288,7 @@ impl<W: Write> TsMuxer<W> {
                 res = self.write_pes_chain(
                     track,
                     pid,
-                    pts_90k,
+                    first_pes.then_some(pts_90k),
                     is_video,
                     keyframe && first_pes,
                     chunk,
@@ -309,7 +317,7 @@ impl<W: Write> TsMuxer<W> {
         &mut self,
         track: usize,
         pid: u16,
-        pts_90k: u64,
+        pts_90k: Option<u64>,
         is_video: bool,
         keyframe: bool,
         es_data: &[u8],
@@ -434,7 +442,14 @@ impl<W: Write> TsMuxer<W> {
 }
 
 /// Build a PES packet header for a BD stream.
-fn build_pes_header(pid: u16, pts_90k: u64, data_len: usize) -> Vec<u8> {
+/// `pts_90k` is `None` for a CONTINUATION PES packet — one carrying the rest of an
+/// access unit that was too large for a single bounded-length private_stream_1 PES.
+/// ISO/IEC 13818-1 §2.4.3.7 puts the PTS in the header of the PES packet that
+/// contains the FIRST byte of the access unit; repeating it on the continuations
+/// makes each of them look like a new access unit at the same timestamp, so a
+/// demuxer re-reading the stream splits one display set into two blocks with
+/// identical timestamps.
+fn build_pes_header(pid: u16, pts_90k: Option<u64>, data_len: usize) -> Vec<u8> {
     use crate::consts::pes_stream_id;
     // Determine stream_id from PID range
     let stream_id: u8 = if is_video_pid(pid) {
@@ -443,7 +458,8 @@ fn build_pes_header(pid: u16, pts_90k: u64, data_len: usize) -> Vec<u8> {
         pes_stream_id::PRIVATE_STREAM_1 // audio, PGS subtitle, or default
     };
 
-    let pes_data_len = data_len + 8; // 3 header bytes + 5 PTS bytes + data
+    // 3 optional-header bytes + 5 PTS bytes (when present) + data.
+    let pes_data_len = data_len + if pts_90k.is_some() { 8 } else { 3 };
     let mut header = Vec::with_capacity(14);
 
     // Start code: 00 00 01 stream_id
@@ -465,8 +481,14 @@ fn build_pes_header(pid: u16, pts_90k: u64, data_len: usize) -> Vec<u8> {
         header.push(len as u8);
     }
 
-    // Flags: 10xx xxxx — MPEG-2, PTS present
+    // Flags: 10xx xxxx — MPEG-2
     header.push(0x80); // marker bits
+    let Some(pts_90k) = pts_90k else {
+        // Continuation packet: PTS_DTS_flags = 00, no optional fields.
+        header.push(0x00);
+        header.push(0);
+        return header;
+    };
     header.push(0x80); // PTS present
 
     // PES header data length
@@ -863,15 +885,29 @@ mod tests {
         let mut out = Vec::new();
         for p in packets.iter().filter(|p| p.pid == pid) {
             if p.pusi {
-                // Skip the 14-byte PES header (3 startcode + 1 stream_id +
-                // 2 length + 2 flags + 1 hdr_len + 5 PTS).
-                assert!(p.payload.len() >= 14, "PUSI payload holds a PES header");
-                out.extend_from_slice(&p.payload[14..]);
+                // Read the PES header's own length rather than assuming one:
+                // 6 bytes (startcode + stream_id + length) + 3 optional-header
+                // bytes + PES_header_data_length. A CONTINUATION PES carries no PTS
+                // (ISO/IEC 13818-1 §2.4.3.7), so its header is 9 bytes, not 14 —
+                // this helper used to hardcode 14 and so silently depended on every
+                // split chunk repeating the PTS.
+                assert!(p.payload.len() >= 9, "PUSI payload holds a PES header");
+                let hdr = 9 + p.payload[8] as usize;
+                out.extend_from_slice(&p.payload[hdr..]);
             } else {
                 out.extend_from_slice(&p.payload);
             }
         }
         out
+    }
+
+    /// PTS_DTS_flags of every PUSI PES header on `pid`, in order.
+    fn pes_pts_flags(packets: &[TsPacket], pid: u16) -> Vec<u8> {
+        packets
+            .iter()
+            .filter(|p| p.pid == pid && p.pusi)
+            .map(|p| (p.payload[7] >> 6) & 0x03)
+            .collect()
     }
 
     /// A non-NAL codec must pass the ES through byte-for-byte: MPEG-2 and
@@ -1177,6 +1213,44 @@ mod tests {
         let got = reassemble_es(&packets, AUDIO_PID);
         assert_eq!(got.len(), big.len(), "no bytes lost in the PES split");
         assert_eq!(got, big, "split audio reassembles byte-for-byte");
+    }
+
+    /// ISO/IEC 13818-1 §2.4.3.7: the PTS belongs in the header of the PES packet
+    /// that contains the FIRST byte of the access unit. An oversized
+    /// private_stream_1 access unit is split across several PES packets, and every
+    /// one of them used to carry the SAME PTS (PTS_DTS_flags = 0b10) even though
+    /// only the first holds the start of the AU. On read-back a demuxer treats each
+    /// PUSI as a new access unit, so the second half of e.g. a full-screen PGS
+    /// display set arrived as an independent segment at an identical timestamp and
+    /// the display set was emitted as TWO blocks with the same timestamp instead of
+    /// one. Only the first PES may carry a PTS; the continuations must set
+    /// PTS_DTS_flags = 0b00.
+    #[test]
+    fn split_access_unit_carries_pts_only_on_the_first_pes() {
+        // Three PES worth of ES so there are two continuations to check.
+        let big: Vec<u8> = (0..(2 * MAX_BD_PES_PAYLOAD + 3000))
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
+            mux.write_frame(0, 1_000_000_000, false, &big).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let flags = pes_pts_flags(&packets, AUDIO_PID);
+        assert_eq!(flags.len(), 3, "the AU must split into three PES packets");
+        assert_eq!(
+            flags,
+            vec![0b10, 0b00, 0b00],
+            "only the PES containing the first byte of the access unit may carry a PTS"
+        );
+        // And the split is still lossless with the shorter continuation headers.
+        assert_eq!(
+            reassemble_es(&packets, AUDIO_PID),
+            big,
+            "split audio still reassembles byte-for-byte"
+        );
     }
 
     /// MEASURED: the Annex-B conversion buffer must be REUSED across video

@@ -112,8 +112,26 @@ pub(super) fn durable_sync(file: &File) -> io::Result<()> {
             );
             Ok(())
         }
-        Err(crate::io::bounded::BoundedError::Halted) => Ok(()),
-        Err(crate::io::bounded::BoundedError::WorkerLost) => Ok(()),
+        // Both arms below used to map to `Ok(())` with NO diagnostic at all, while
+        // the Linux sibling logs the identical failures (writeback_file/linux.rs).
+        // A lost F_FULLFSYNC worker at the end of a UHD mux therefore reported
+        // `completed = true` with an empty log, leaving an operator investigating a
+        // truncated/corrupt output file after a power loss no record that the final
+        // fsync never ran — on Linux the same failure is at error level.
+        Err(crate::io::bounded::BoundedError::Halted) => {
+            tracing::warn!(
+                target: "mux",
+                "WritebackFile::sync_all F_FULLFSYNC skipped (halt requested); data not durably flushed, kernel will flush on close"
+            );
+            Ok(())
+        }
+        Err(crate::io::bounded::BoundedError::WorkerLost) => {
+            tracing::error!(
+                target: "mux",
+                "WritebackFile::sync_all F_FULLFSYNC worker lost before completion; data not durably flushed, kernel will flush on close"
+            );
+            Ok(())
+        }
     }
 }
 
