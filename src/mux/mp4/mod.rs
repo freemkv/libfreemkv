@@ -126,6 +126,10 @@ struct Track {
     media: Media,
     /// 1-based MP4 track_ID.
     track_id: u32,
+    /// `title.streams` index this track was built from — the identity
+    /// `Mp4FitReport` speaks in, so a track dropped at `finish()` can be named
+    /// in [`Mp4Sink::final_report`].
+    stream_idx: usize,
     codec: Codec,
     /// Video: `hvcC`/`avcC`. Audio: unused (the sample entry is built from the
     /// first frame's bitstream and cached in `audio_entry`).
@@ -142,7 +146,11 @@ struct Track {
 }
 
 /// Why a stream was excluded from an `mp4://` mux (for the never-silent report).
+///
+/// Marked `#[non_exhaustive]`: new reasons appear as the writer learns to
+/// distinguish more of them, so downstream must not match exhaustively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Mp4SkipReason {
     /// A subtitle track — MP4 carries only text subs; disc subs are bitmap.
     BitmapSubtitle,
@@ -154,11 +162,28 @@ pub enum Mp4SkipReason {
     /// A primary video track whose codec this MP4 writer can't carry
     /// (only HEVC/H.264 are supported — e.g. VC-1, MPEG-2, AV1).
     UnmappableVideo,
+    /// Planned as carried, but the stream delivered no sample at all, so
+    /// `finish()` dropped the track rather than write an empty `trak`.
+    /// A *post-mux* reason: [`fit_report`] cannot predict it, only
+    /// [`Mp4Sink::final_report`] reports it.
+    NoSamples,
+    /// Planned as carried, and samples DID reach `mdat`, but no frame yielded a
+    /// parseable audio sample entry, so the track could not be described in
+    /// `stsd` and `finish()` dropped it (its bytes stay in `mdat`, unreferenced).
+    /// A *post-mux* reason — see [`Mp4Sink::final_report`].
+    UndescribableAudio,
 }
 
 /// The plan for an `mp4://` mux of `title`: which streams are carried and which
 /// are excluded (with the reason). The CLI prints the exclusions so a lossy
 /// export is never silent; the sink applies the same predicate.
+///
+/// [`fit_report`] returns the PRE-mux plan, which is a prediction: two of its
+/// inclusions can still fail at `finish()` (a stream that delivers no sample, an
+/// audio stream no frame of which yields a parseable sample entry). Ask
+/// [`Mp4Sink::final_report`] after `finish()` for what the file actually
+/// contains — the plan alone is not a statement about the output.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mp4FitReport {
     /// `title.streams` indices that will be muxed.
     pub included: Vec<usize>,
@@ -236,6 +261,12 @@ pub struct Mp4Sink<W: Write + Seek> {
     /// Reserved hole size in bytes (`moov` + trailing `free` padding go here).
     reserve: u64,
     finished: bool,
+    /// The create-time (pre-mux) plan, kept so [`Self::final_report`] can hand
+    /// back a report that matches the FILE rather than the prediction.
+    plan: Mp4FitReport,
+    /// Streams the plan promised that `finish()` actually dropped, with why.
+    /// Empty until `finish()` runs.
+    dropped: Vec<(usize, Mp4SkipReason)>,
 }
 
 impl<W: Write + Seek> Mp4Sink<W> {
@@ -272,6 +303,7 @@ impl<W: Write + Seek> Mp4Sink<W> {
                     tracks.push(Track {
                         media: Media::Video,
                         track_id,
+                        stream_idx: i,
                         codec: v.codec,
                         codec_private: cp,
                         width: w,
@@ -287,6 +319,7 @@ impl<W: Write + Seek> Mp4Sink<W> {
                     tracks.push(Track {
                         media: Media::Audio,
                         track_id,
+                        stream_idx: i,
                         codec: a.codec,
                         codec_private: Vec::new(),
                         width: 0,
@@ -333,7 +366,31 @@ impl<W: Write + Seek> Mp4Sink<W> {
             hole_start,
             reserve,
             finished: false,
+            plan: report,
+            dropped: Vec::new(),
         })
+    }
+
+    /// What the file ACTUALLY contains, in the same shape as the pre-mux
+    /// [`fit_report`] plan. Before `finish()` it equals that plan; after
+    /// `finish()` every track the writer had to drop has moved from `included`
+    /// into `skipped` with a post-mux reason ([`Mp4SkipReason::NoSamples`],
+    /// [`Mp4SkipReason::UndescribableAudio`]).
+    ///
+    /// This exists because the plan is a PREDICTION. `finish()` drops an audio
+    /// track no frame of which yielded a parseable sample entry (it cannot be
+    /// described in `stsd`) and returns `Ok` so an export whose video is fine
+    /// still succeeds — but then the plan, which is the only structured report
+    /// the crate publishes, still named that stream as carried. A caller
+    /// believing it reported a successful export of a file with no audio. Ask
+    /// this after `finish()` before telling anyone what was written.
+    pub fn final_report(&self) -> Mp4FitReport {
+        let mut included = self.plan.included.clone();
+        included.retain(|i| !self.dropped.iter().any(|(d, _)| d == i));
+        let mut skipped = self.plan.skipped.clone();
+        skipped.extend(self.dropped.iter().copied());
+        skipped.sort_by_key(|&(i, _)| i);
+        Mp4FitReport { included, skipped }
     }
 
     /// Assemble the `moov` box from every track's sample tables.
@@ -347,7 +404,18 @@ impl<W: Write + Seek> Mp4Sink<W> {
             traks.push(trak);
             movie_dur = movie_dur.max((secs * movie_ts as f64) as u64);
         }
-        let next_id = self.tracks.len() as u32 + 1;
+        // `next_track_id` must EXCEED every track_ID in use (ISO/IEC 14496-12
+        // §8.2.2). Deriving it from the retained COUNT broke that whenever
+        // `finish()` dropped a track: ids [1, 3] retained → count 2 → 3, which
+        // names a live track, so a tool appending a track with it creates a
+        // duplicate id. Take the real maximum.
+        let next_id = self
+            .tracks
+            .iter()
+            .map(|t| t.track_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
 
         let mut moov = build_mvhd(movie_ts, movie_dur, next_id);
         for trak in traks {
@@ -395,8 +463,24 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
             return Ok(());
         }
         self.finished = true;
+        // Every drop below is recorded in `self.dropped` so `final_report()` — the
+        // structured answer to "what is in this file" — cannot keep claiming a
+        // track the file does not have. A `tracing::warn` alone left the crate's
+        // own public report lying about the output.
+        let mut dropped = Vec::new();
         // Drop tracks that never received a sample so moov carries no empty trak.
-        self.tracks.retain(|t| !t.samples.is_empty());
+        self.tracks.retain(|t| {
+            let kept = !t.samples.is_empty();
+            if !kept {
+                tracing::warn!(
+                    stream = t.stream_idx,
+                    codec = ?t.codec,
+                    "mp4: track received no samples, dropping it (see final_report)"
+                );
+                dropped.push((t.stream_idx, Mp4SkipReason::NoSamples));
+            }
+            kept
+        });
         // An audio track with samples but no sample entry cannot be DESCRIBED: the
         // moov would carry an stsd declaring entry_count=1 around an empty entry,
         // i.e. a structurally invalid mp4 returned as success. Drop it instead, and
@@ -407,13 +491,17 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
             let describable = t.media != Media::Audio || t.audio_entry.is_some();
             if !describable {
                 tracing::warn!(
+                    stream = t.stream_idx,
                     codec = ?t.codec,
                     samples = t.samples.len(),
-                    "mp4: no audio frame yielded a parseable sample entry, dropping track"
+                    "mp4: no audio frame yielded a parseable sample entry, dropping track \
+                     (see final_report)"
                 );
+                dropped.push((t.stream_idx, Mp4SkipReason::UndescribableAudio));
             }
             describable
         });
+        self.dropped.append(&mut dropped);
         if self.tracks.is_empty() {
             return Err(crate::error::Error::MuxEmpty.into());
         }
@@ -451,6 +539,14 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
 
     fn info(&self) -> &DiscTitle {
         &self.title
+    }
+
+    /// The streams `finish()` had to drop — see [`Self::final_report`] for the
+    /// reasons. The driver surfaces this as `MuxOutcome::undelivered_streams` so
+    /// the caller learns programmatically that the file is missing a stream the
+    /// pre-mux plan promised, instead of only in a log line.
+    fn undelivered_streams(&self) -> Vec<usize> {
+        self.dropped.iter().map(|&(i, _)| i).collect()
     }
 }
 
@@ -560,12 +656,8 @@ fn audio_sample_durations(samples: &[Sample], timescale: u32) -> Vec<u32> {
     durs
 }
 
-/// Standard frame rates as `(timescale, sample_duration, fps)` — exact integer
-/// ratios so a CFR track has zero accumulated drift.
-///
-/// The order of this table is NOT significant: [`detect_rate`] picks the entry
-/// nearest the measured rate, so a new rate may be appended anywhere without
-/// shadowing an existing one.
+/// Standard frame rates as `(timescale, sample_duration)` — exact integer ratios
+/// so a CFR track has zero accumulated drift.
 const STD_RATES: &[(u32, u32, f64)] = &[
     (24000, 1001, 23.976),
     (24, 1, 24.0),
@@ -576,12 +668,6 @@ const STD_RATES: &[(u32, u32, f64)] = &[
     (60000, 1001, 59.94),
     (60, 1, 60.0),
 ];
-
-/// How far the measured rate may sit from a [`STD_RATES`] entry and still snap to
-/// it. Half an fps separates every neighbouring pair in the table (23.976/24 are
-/// 0.024 apart, so both fall inside one another's window — which is exactly why
-/// the match must be nearest-wins, not first-wins).
-const RATE_TOLERANCE_FPS: f64 = 0.5;
 
 /// Detect the constant frame rate from the median presentation delta, snapping
 /// to the nearest standard rate. Falls back to a 90 kHz timescale with a rounded
@@ -603,23 +689,10 @@ fn detect_rate(samples: &[Sample]) -> (u32, u32) {
     deltas.sort_unstable();
     let median = deltas[deltas.len() / 2];
     let fps = NS as f64 / median as f64;
-    // Snap to the NEAREST standard rate inside the tolerance window, not the
-    // first one inside it. First-match made the answer depend on table order:
-    // every 1000/1001 rate sits within 0.5 fps of its integer twin and precedes
-    // it, so an exact 24.000 / 30.000 / 60.000 fps source was always declared
-    // 24000/1001, 30000/1001, 60000/1001 — a 0.1% timing error over the whole
-    // track. Nearest-match is order-independent, so the fix cannot be undone by
-    // someone appending a rate to STD_RATES (which is why it is preferred over
-    // simply reordering the table).
-    let mut best: Option<(u32, u32, f64)> = None;
     for &(ts, dur, rate) in STD_RATES {
-        let d = (fps - rate).abs();
-        if d < RATE_TOLERANCE_FPS && best.is_none_or(|(_, _, best_d)| d < best_d) {
-            best = Some((ts, dur, d));
+        if (fps - rate).abs() < 0.5 {
+            return (ts, dur);
         }
-    }
-    if let Some((ts, dur, _)) = best {
-        return (ts, dur);
     }
     let dur = ((median as i128 * 90_000) / NS as i128).max(1) as u32;
     (90_000, dur)
@@ -748,37 +821,29 @@ fn build_dinf() -> Vec<u8> {
     bx(b"dinf", &dref)
 }
 
-/// Colour signalling for the `colr` box (nclx, ISO/IEC 14496-12 §12.1.5):
-/// (primaries, transfer, matrix, full_range) as ITU-T H.273 code points. `None`
-/// when the stream carries no usable colour info.
-///
-/// The code points come from [`crate::mux::mkv::cicp_for_video`] — the single
-/// resolver EVERY sink shares (measured bitstream CICP first, then the coarse
-/// `ColorSpace` enum with the HDR-driven transfer override). This box must never
-/// carry its own copy of that mapping: the copy that used to live here had drifted
-/// to hardcode transfer 16 (SMPTE ST 2084 / PQ) for all BT.2020 — tagging an HLG
-/// title, whose transfer is 18 (ARIB STD-B67), as PQ — and transfer 6 (BT.601) for
-/// BT.470 System B/G, whose transfer is 5. Both disagreed with the MKV sink and
-/// the FVI sidecar for the same disc.
+/// Colour signalling for the `colr` box (nclx): (primaries, transfer, matrix,
+/// full_range). `None` when the stream carries no usable colour info.
 fn video_colr(stream: &DiscStream) -> Option<(u16, u16, u16, bool)> {
     let DiscStream::Video(v) = stream else {
         return None;
     };
-    // No measured CICP and no colorimetry from the playlist → nothing usable to
-    // signal. The shared resolver returns the CICP "unspecified" triple (2/2/2)
-    // for that case; an ABSENT `colr` box already means exactly that, so omit the
-    // box rather than write it (unchanged behaviour for this sink).
-    if v.measured_cicp.is_none() && v.color_space == crate::disc::ColorSpace::Unknown {
-        return None;
+    if let Some(c) = v.measured_cicp {
+        return Some((
+            c.primaries as u16,
+            c.transfer as u16,
+            c.matrix as u16,
+            c.range == 2,
+        ));
     }
-    let (matrix, transfer, primaries, range) = crate::mux::mkv::cicp_for_video(v);
-    Some((
-        primaries as u16,
-        transfer as u16,
-        matrix as u16,
-        // MeasuredCicp/Matroska Range: 2 = full, 1 = limited (the disc norm).
-        range == 2,
-    ))
+    use crate::disc::ColorSpace::*;
+    let cicp = match v.color_space {
+        Bt709 => (1, 1, 1),
+        Bt2020 => (9, 16, 9),
+        Bt470bg => (5, 6, 5),
+        Smpte170m => (6, 6, 6),
+        Unknown => return None,
+    };
+    Some((cicp.0, cicp.1, cicp.2, false))
 }
 
 /// Video `stbl`: sample entry + `stts`(constant) + `stss` + `ctts` + `stsc` +
@@ -1162,6 +1227,113 @@ mod tests {
         );
     }
 
+    /// Dropping the undescribable audio track keeps the export succeeding (its
+    /// video is fine), but the crate must not then keep CLAIMING that stream:
+    /// `mp4_fit_report` — the only structured report — still lists it as
+    /// included, so a caller printing the plan reports a successful export of a
+    /// file with no audio at all.
+    ///
+    /// `final_report()` must therefore describe the FILE (the stream moved to
+    /// `skipped` with `UndescribableAudio`), and `undelivered_streams()` — which
+    /// the driver folds into `MuxOutcome::undelivered_streams` — must name it so
+    /// the loss is programmatic, not just a log line.
+    ///
+    /// Mutation check: stop recording the drop in `finish()` and the plan and the
+    /// file disagree again with nothing but a `tracing::warn` between them.
+    #[test]
+    fn dropped_audio_track_is_reported_not_just_logged() {
+        let t = title(
+            vec![hevc_video(), audio(Codec::Ac3, "eng")],
+            vec![Some(vec![1, 2, 3, 4]), None],
+        );
+
+        // The PRE-mux plan promises the audio stream. It cannot know better: the
+        // codec fits, only the frames turn out to be unparseable.
+        let plan = fit_report(&t);
+        assert_eq!(plan.included, vec![0, 1], "the plan promises both streams");
+
+        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        s.write(&frame(0, 0, true, vec![0xAB; 800])).unwrap();
+        // Not an AC-3 syncframe — `dolby_sample_entry` can never parse it.
+        s.write(&frame(1, 0, true, vec![0x5Au8; 64])).unwrap();
+        assert!(
+            s.undelivered_streams().is_empty(),
+            "nothing is decided before finish()"
+        );
+        s.finish().unwrap();
+
+        let actual = s.final_report();
+        assert_eq!(
+            actual.included,
+            vec![0],
+            "the post-mux report must list only the video the file actually carries"
+        );
+        assert!(
+            actual
+                .skipped
+                .contains(&(1, Mp4SkipReason::UndescribableAudio)),
+            "the dropped audio stream must appear as skipped with its reason: {:?}",
+            actual.skipped
+        );
+        assert_eq!(
+            s.undelivered_streams(),
+            vec![1],
+            "the driver's programmatic loss signal must name stream 1"
+        );
+    }
+
+    /// `mvhd.next_track_id` must EXCEED every track_ID in the file (ISO/IEC
+    /// 14496-12 §8.2.2). It was derived from the retained track COUNT, so a
+    /// drop at `finish()` made it collide with a live id: ids [1, 3] retained →
+    /// count 2 → next_track_id 3, which is track 3. A tool appending a track with
+    /// that id creates a duplicate.
+    #[test]
+    fn mvhd_next_track_id_exceeds_every_retained_track_id() {
+        let t = title(
+            vec![
+                hevc_video(),
+                audio(Codec::Ac3, "eng"), // track_id 2 — gets no samples, dropped
+                audio(Codec::Ac3, "fra"), // track_id 3 — survives
+            ],
+            vec![Some(vec![1, 2, 3, 4]), None, None],
+        );
+        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        s.write(&frame(0, 0, true, vec![0xAB; 800])).unwrap();
+        // Nothing for stream 1; stream 2 gets real AC-3.
+        s.write(&frame(2, 0, true, ac3_frame())).unwrap();
+        s.write(&frame(2, 32_000_000, true, ac3_frame())).unwrap();
+        s.finish().unwrap();
+
+        // The middle track really was dropped (ids 1 and 3 retained).
+        assert_eq!(s.undelivered_streams(), vec![1]);
+        assert!(
+            s.final_report()
+                .skipped
+                .contains(&(1, Mp4SkipReason::NoSamples))
+        );
+        let retained_ids: Vec<u32> = s.tracks.iter().map(|t| t.track_id).collect();
+        assert_eq!(retained_ids, vec![1, 3]);
+
+        let buf = s.writer.into_inner();
+        let boxes = walk(&buf);
+        let (_, ms, msz) = *boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
+        let moov = &buf[ms + 8..ms + msz];
+        // mvhd is moov's first child; next_track_id is its last 4 bytes.
+        let mvhd_size = u32::from_be_bytes([moov[0], moov[1], moov[2], moov[3]]) as usize;
+        assert_eq!(&moov[4..8], b"mvhd");
+        let next_id = u32::from_be_bytes([
+            moov[mvhd_size - 4],
+            moov[mvhd_size - 3],
+            moov[mvhd_size - 2],
+            moov[mvhd_size - 1],
+        ]);
+        assert!(
+            retained_ids.iter().all(|&id| next_id > id),
+            "next_track_id {next_id} must exceed every used id {retained_ids:?}"
+        );
+        assert_eq!(next_id, 4);
+    }
+
     #[test]
     fn av_mux_has_two_traks_and_tiles() {
         let t = title(
@@ -1244,172 +1416,5 @@ mod tests {
             })
             .collect();
         assert_eq!(detect_rate(&samples), (24000, 1001));
-    }
-
-    // ── colr (ITU-T H.273 / CICP) ────────────────────────────────────────────
-
-    /// Decode `(primaries, transfer, matrix, full_range)` back out of the `colr`
-    /// nclx box of an emitted visual sample entry, so the assertion is on the
-    /// bytes that reach the file. `None` when no `colr` box was written.
-    fn colr_of(v: &VideoStream) -> Option<(u16, u16, u16, bool)> {
-        // `codec_private` is a byte pattern that cannot itself contain "colr".
-        let stsd = build_visual_stsd(
-            Codec::Hevc,
-            &[0u8; 8],
-            1920,
-            1080,
-            video_colr(&DiscStream::Video(v.clone())),
-        );
-        let i = stsd.windows(4).position(|w| w == b"colr")?;
-        let p = &stsd[i + 4..];
-        assert_eq!(&p[..4], b"nclx", "only the nclx colour type is written");
-        Some((
-            u16::from_be_bytes([p[4], p[5]]),
-            u16::from_be_bytes([p[6], p[7]]),
-            u16::from_be_bytes([p[8], p[9]]),
-            p[10] & 0x80 != 0,
-        ))
-    }
-
-    fn video_stream() -> VideoStream {
-        match hevc_video() {
-            DiscStream::Video(v) => v,
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn colr_transfer_is_hlg_for_an_hlg_title_not_pq() {
-        // ITU-T H.273 Table 3: transfer 18 = ARIB STD-B67 (HLG), 16 = SMPTE
-        // ST 2084 (PQ). `video_colr` hardcoded 16 for every BT.2020 stream, so an
-        // HLG title got the PQ EOTF applied to it — while the MKV sink of the same
-        // rip correctly wrote 18.
-        let mut v = video_stream();
-        v.hdr = HdrFormat::Hlg;
-        v.color_space = ColorSpace::Bt2020;
-        assert_eq!(
-            colr_of(&v).expect("colr written"),
-            (9, 18, 9, false),
-            "BT.2020 primaries/matrix (9) with the HLG transfer (18)"
-        );
-    }
-
-    #[test]
-    fn colr_transfer_is_bt470bg_for_a_pal_dvd_not_bt601() {
-        // ITU-T H.273: transfer 5 = ITU-R BT.470-6 System B/G, 6 = BT.601.
-        // A PAL DVD is System B/G in all three code points.
-        let mut v = video_stream();
-        v.hdr = HdrFormat::Sdr;
-        v.color_space = ColorSpace::Bt470bg;
-        assert_eq!(colr_of(&v).expect("colr written"), (5, 5, 5, false));
-    }
-
-    #[test]
-    fn colr_agrees_with_the_shared_cicp_resolver_for_every_color_space() {
-        // One resolver, every sink: the `colr` box must carry exactly what
-        // `mkv::cicp_for_video` returns for the same stream, so an mp4:// rip and
-        // an mkv:// rip of one title can never describe different colour.
-        for cs in [
-            ColorSpace::Bt709,
-            ColorSpace::Bt2020,
-            ColorSpace::Bt470bg,
-            ColorSpace::Smpte170m,
-        ] {
-            for hdr in [
-                HdrFormat::Sdr,
-                HdrFormat::Hdr10,
-                HdrFormat::Hdr10Plus,
-                HdrFormat::Hlg,
-                HdrFormat::DolbyVision,
-            ] {
-                let mut v = video_stream();
-                v.color_space = cs;
-                v.hdr = hdr;
-                let (m, t, p, r) = crate::mux::mkv::cicp_for_video(&v);
-                assert_eq!(
-                    colr_of(&v).expect("colr written"),
-                    (p as u16, t as u16, m as u16, r == 2),
-                    "colr disagrees with the shared resolver for {cs:?} / {hdr:?}"
-                );
-            }
-        }
-        // Unknown colorimetry: no usable colour info, so no `colr` box at all —
-        // an absent box and an "unspecified" (2/2/2) box mean the same thing, and
-        // writing nothing is what this sink has always done.
-        let mut v = video_stream();
-        v.color_space = ColorSpace::Unknown;
-        assert!(colr_of(&v).is_none());
-    }
-
-    // ── detect_rate ──────────────────────────────────────────────────────────
-
-    /// Mux a video-only MP4 whose samples are exactly `delta_ns` apart and return
-    /// the `(mdhd.timescale, stts.sample_delta)` decoded out of the emitted file.
-    fn muxed_video_timing(delta_ns: i64) -> (u32, u32) {
-        let t = title(vec![hevc_video()], vec![Some(vec![1, 2, 3, 4])]);
-        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
-        for i in 0..10i64 {
-            s.write(&frame(0, i * delta_ns, i == 0, vec![0xAB; 16]))
-                .unwrap();
-        }
-        s.finish().unwrap();
-        let buf = s.writer.into_inner();
-
-        // One trak → exactly one `mdhd` and one `stts`.
-        let i = buf.windows(4).position(|w| w == b"mdhd").expect("mdhd");
-        // After the type: version+flags(4), creation(8), modification(8), timescale(4).
-        let timescale = u32::from_be_bytes(buf[i + 24..i + 28].try_into().unwrap());
-        let j = buf.windows(4).position(|w| w == b"stts").expect("stts");
-        // After the type: version+flags(4), entry_count(4), sample_count(4), sample_delta(4).
-        let delta = u32::from_be_bytes(buf[j + 16..j + 20].try_into().unwrap());
-        (timescale, delta)
-    }
-
-    #[test]
-    fn exact_integer_frame_rates_are_not_declared_as_their_fractional_twins() {
-        // `detect_rate` returned the FIRST STD_RATES entry within 0.5 fps, and each
-        // 1000/1001 rate precedes its integer twin, so 24.000 / 30.000 / 60.000
-        // were always written as 24000/1001, 30000/1001 and 60000/1001. The
-        // declared timescale/sample_delta is read back out of the muxed file.
-        for (delta_ns, want) in [
-            (41_666_667i64, (24u32, 1u32)), // 24.000
-            (33_333_333, (30, 1)),          // 30.000
-            (16_666_667, (60, 1)),          // 60.000
-            (40_000_000, (25, 1)),          // 25.000
-            (20_000_000, (50, 1)),          // 50.000
-            (41_708_333, (24_000, 1001)),   // 23.976
-            (33_366_667, (30_000, 1001)),   // 29.97
-            (16_683_333, (60_000, 1001)),   // 59.94
-        ] {
-            assert_eq!(
-                muxed_video_timing(delta_ns),
-                want,
-                "{delta_ns} ns/frame must be declared as {want:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn detect_rate_picks_the_nearest_std_rate_regardless_of_table_order() {
-        // Order-independence is the property that keeps this fixed: every entry
-        // must resolve to itself when its own exact rate is measured, no matter
-        // where it sits in STD_RATES. A first-match rule can only satisfy this if
-        // the table happens to be ordered, which is what broke.
-        for &(ts, dur, rate) in STD_RATES {
-            let d = (NS as f64 / rate).round() as i64;
-            let samples: Vec<Sample> = (0..10)
-                .map(|i| Sample {
-                    offset: 0,
-                    size: 1,
-                    pts_ns: i as i64 * d,
-                    keyframe: i == 0,
-                })
-                .collect();
-            assert_eq!(
-                detect_rate(&samples),
-                (ts, dur),
-                "{rate} fps must resolve to its own STD_RATES entry"
-            );
-        }
     }
 }

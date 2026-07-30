@@ -119,7 +119,11 @@ pub use disc::DiscStream;
 pub use driver::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, mux_stream};
 pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
-pub use mp4::{Mp4FitReport, Mp4SkipReason, fit_report as mp4_fit_report};
+// `Mp4Sink` is public (like `MkvStream` / `M2tsStream`) so a caller that drives
+// the sink directly can ask `final_report()` what the finished file actually
+// contains — the pre-mux `mp4_fit_report` plan is a prediction, and two of its
+// inclusions can still be dropped at `finish()`.
+pub use mp4::{Mp4FitReport, Mp4Sink, Mp4SkipReason, fit_report as mp4_fit_report};
 pub use network::NetworkStream;
 pub use null::NullStream;
 pub use pipelined_stream::PipelinedPesStream;

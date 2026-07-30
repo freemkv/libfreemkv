@@ -234,6 +234,21 @@ pub trait Stream: Send {
     fn lost_bytes(&self) -> u64 {
         0
     }
+
+    /// Sink side: `info().streams` indices this sink PLANNED to carry (and
+    /// accepted frames for) but could not put in the finished container, valid
+    /// after [`finish`](Self::finish). Empty for every sink that writes
+    /// everything it accepted — which is all of them except `mp4://`, whose
+    /// `finish()` must drop an audio track no frame of which yielded a parseable
+    /// sample entry (an `stsd` cannot describe it).
+    ///
+    /// This exists because such a drop otherwise contradicts the pre-mux plan the
+    /// crate publishes (`mp4_fit_report`), leaving the caller reporting a
+    /// successful export of a file missing a stream it was told would be there.
+    /// The driver folds this into `MuxOutcome::undelivered_streams`.
+    fn undelivered_streams(&self) -> Vec<usize> {
+        Vec::new()
+    }
 }
 
 /// Wraps any output stream and counts bytes written.
@@ -295,6 +310,10 @@ impl Stream for CountingStream {
 
     fn errors(&self) -> u64 {
         self.inner.errors()
+    }
+
+    fn undelivered_streams(&self) -> Vec<usize> {
+        self.inner.undelivered_streams()
     }
 
     fn lost_bytes(&self) -> u64 {

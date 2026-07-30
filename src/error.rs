@@ -151,6 +151,11 @@ pub const E_NETWORK_ADDR_BLOCKED: u16 = 9022;
 /// zero-frame mux (undecryptable input, fully-unreadable title, every
 /// frame dropped before the first keyframe) cannot report success.
 pub const E_MUX_EMPTY: u16 = 9023;
+/// The mux driver buffered past its pre-headers cap without every video track's
+/// `codec_private` resolving. Deliberately NOT [`E_MKV_INVALID`], which
+/// [`is_skippable_title_stub`] treats as a skippable empty nav/menu stub — a
+/// cap-overflow is a real title and must never be silently skipped.
+pub const E_MUX_HEADER_BUFFER_EXCEEDED: u16 = 9051;
 pub const E_EXTENT_NOT_UNIT_ALIGNED: u16 = 9030;
 /// `mp4://` output but the title has no (primary) video track to carry.
 pub const E_MP4_NO_VIDEO_TRACK: u16 = 9048;
@@ -442,6 +447,20 @@ pub enum Error {
     /// every frame dropped before the first keyframe — fails loudly. The
     /// `m2ts://` analogue of [`Error::MkvInvalid`]'s zero-frame guard.
     MuxEmpty,
+    /// The mux driver's pre-headers frame buffer passed its cap before every
+    /// video track's `codec_private` resolved: the title keeps yielding real
+    /// frames but its codec init data never appears, so buffering further would
+    /// swap the box to death. Carries the buffered byte count.
+    ///
+    /// DISTINCT from [`Error::MkvInvalid`] on purpose. `MkvInvalid` is what an
+    /// empty nav/menu PGC stub yields, and [`is_skippable_title_stub`] classifies
+    /// it as skippable — an all-titles rip drops that title and finishes the
+    /// rest. Hundreds of megabytes of real frames with unresolvable headers is
+    /// NOT a stub; reporting it as one silently dropped a main feature from a
+    /// rip that then exited successfully. This code is not skippable.
+    MuxHeaderBufferExceeded {
+        bytes: u64,
+    },
     /// `mp4://` target title has no primary video track to mux.
     Mp4NoVideoTrack,
     /// `mp4://` source file is malformed/truncated — the MP4 demuxer failed.
@@ -629,6 +648,7 @@ impl Error {
             Error::StreamUrlMissingPort { .. } => E_STREAM_URL_MISSING_PORT,
             Error::NetworkAddrBlocked { .. } => E_NETWORK_ADDR_BLOCKED,
             Error::MuxEmpty => E_MUX_EMPTY,
+            Error::MuxHeaderBufferExceeded { .. } => E_MUX_HEADER_BUFFER_EXCEEDED,
             Error::Mp4NoVideoTrack => E_MP4_NO_VIDEO_TRACK,
             Error::Mp4Invalid => E_MP4_INVALID,
             Error::Mp4MissingCodecPrivate => E_MP4_MISSING_CODEC_PRIVATE,
@@ -797,6 +817,9 @@ impl std::fmt::Display for Error {
             Error::SelectionPidUnknown { pid } => {
                 write!(f, "E{}: 0x{:04x}", self.code(), pid)
             }
+            Error::MuxHeaderBufferExceeded { bytes } => {
+                write!(f, "E{}: {}", self.code(), bytes)
+            }
             _ => write!(f, "E{}", self.code()),
         }
     }
@@ -869,6 +892,9 @@ impl From<Error> for std::io::Error {
             // 9023 MuxEmpty: finish() reached with zero frames — the output
             // would be a header-only container. Treat as invalid output.
             E_MUX_EMPTY => std::io::ErrorKind::InvalidData,
+            // 9051 MuxHeaderBufferExceeded: the source kept yielding frames but
+            // never its codec init data — the input is unusable as declared.
+            E_MUX_HEADER_BUFFER_EXCEEDED => std::io::ErrorKind::InvalidData,
             // mp4:// demux errors: a malformed/truncated source file
             // (E_MP4_INVALID), or a source whose tracks the mux can't use — no
             // video track / missing codec-private config. All are invalid data.
@@ -1066,6 +1092,17 @@ mod tests {
         // A plain io::Error with no E-code prefix is not skippable.
         let plain = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
         assert!(!is_skippable_title_stub(&plain));
+
+        // A header-buffer cap overflow is a REAL title whose codec init data
+        // never resolved — hundreds of MiB of frames, not an empty nav/menu
+        // stub. It used to be reported as `MkvInvalid`, which lands in the
+        // skippable set above, so an all-titles rip dropped a main feature and
+        // still exited successfully. It must have its own, non-skippable code.
+        let cap: std::io::Error = Error::MuxHeaderBufferExceeded {
+            bytes: 512 * 1024 * 1024 + 1,
+        }
+        .into();
+        assert!(!is_skippable_title_stub(&cap));
     }
 
     #[test]
@@ -1353,6 +1390,7 @@ mod tests {
             E_STREAM_URL_MISSING_PORT,
             E_NETWORK_ADDR_BLOCKED,
             E_MUX_EMPTY,
+            E_MUX_HEADER_BUFFER_EXCEEDED,
             E_MP4_NO_VIDEO_TRACK,
             E_MP4_INVALID,
             E_MP4_MISSING_CODEC_PRIVATE,
@@ -1443,6 +1481,10 @@ mod tests {
             (Error::PipelineConsumerGone, E_PIPELINE_CONSUMER_GONE),
             (Error::DiscCapacityOverflow, E_DISC_CAPACITY_OVERFLOW),
             (Error::MuxEmpty, E_MUX_EMPTY),
+            (
+                Error::MuxHeaderBufferExceeded { bytes: 0 },
+                E_MUX_HEADER_BUFFER_EXCEEDED,
+            ),
             (Error::Mp4NoVideoTrack, E_MP4_NO_VIDEO_TRACK),
             (Error::Mp4Invalid, E_MP4_INVALID),
             (Error::Mp4MissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),

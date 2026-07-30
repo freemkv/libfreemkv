@@ -51,7 +51,9 @@ impl StreamSelection {
     /// PID passes the corresponding [`PidFilter`]; drop the rest. Declared order
     /// is preserved. The parallel `codec_privates` vec is pruned in lockstep
     /// when it is populated (it is empty on a freshly-scanned title, non-empty
-    /// only if a caller pre-filled it).
+    /// only if a caller pre-filled it) — by index, whatever its length, since it
+    /// is consumed positionally and a partial prune would attach the wrong
+    /// codec-private to a retained track.
     ///
     /// Errors [`Error::SelectionPidUnknown`] if a filter lists a PID that does
     /// not exist in `title.streams` — a caller bug (e.g. a stale scan). Fail
@@ -94,8 +96,6 @@ impl StreamSelection {
             }
         }
 
-        let codec_privates_aligned = title.codec_privates.len() == title.streams.len();
-
         // Retain by index so we can prune the parallel codec_privates in lockstep.
         let keep: Vec<bool> = title
             .streams
@@ -109,14 +109,37 @@ impl StreamSelection {
             i += 1;
             k
         });
-        if codec_privates_aligned {
-            let mut j = 0;
-            title.codec_privates.retain(|_| {
-                let k = keep[j];
-                j += 1;
-                k
-            });
+        // Prune `codec_privates` by the SAME index decision, whatever its length.
+        //
+        // This used to run only when `codec_privates.len() == streams.len()`, and
+        // do nothing otherwise. `codec_privates` is consumed positionally
+        // (`codec_privates[i]` describes `streams[i]` — see
+        // `TsMuxer::set_codec_private` / `Mp4Sink::create`), and `m2ts.rs::create`
+        // documents a longer-than-streams vec as benign ("ignore any trailing
+        // entries that exceed the track count"). So a title carrying one trailing
+        // extra entry skipped the prune entirely and every retained stream after
+        // the first dropped one silently got the PREVIOUS stream's
+        // codec_private — wrong SPS/PPS on the track, no error, no log.
+        //
+        // Indices at or past `keep`'s length can only be entries that already
+        // exceeded the stream count, i.e. describe no stream; drop them rather
+        // than leave them dangling behind the pruned list.
+        let extra = title.codec_privates.len().saturating_sub(keep.len());
+        if extra > 0 {
+            tracing::debug!(
+                target: "mux",
+                codec_privates = title.codec_privates.len(),
+                streams = keep.len(),
+                "stream selection: dropping {extra} codec_private entry/entries that describe \
+                 no declared stream"
+            );
         }
+        let mut j = 0;
+        title.codec_privates.retain(|_| {
+            let k = keep.get(j).copied().unwrap_or(false);
+            j += 1;
+            k
+        });
         Ok(())
     }
 
@@ -305,6 +328,46 @@ mod tests {
             t.codec_privates,
             vec![Some(vec![0xAA]), Some(vec![0x11])],
             "codec_privates pruned to match the retained streams, in order"
+        );
+    }
+
+    /// A `codec_privates` vec that is NOT exactly stream-length must still be
+    /// pruned in lockstep. `m2ts.rs::create` documents a longer-than-streams vec
+    /// as a benign shape ("ignore any trailing entries that exceed the track
+    /// count"), and the vec is consumed positionally, so skipping the prune left
+    /// `codec_privates[i]` describing a stream that is no longer at index `i`.
+    ///
+    /// Regression: with one trailing extra entry the prune was skipped entirely
+    /// and index 1 — the retained `fra` audio — resolved to `eng`'s record, so
+    /// the muxer attached the wrong codec-private to the track. No error, no log.
+    #[test]
+    fn apply_prunes_codec_privates_even_when_length_does_not_match_streams() {
+        let mut t = title();
+        t.streams.truncate(4); // video + eng + spa + fra audio
+        t.codec_privates = vec![
+            Some(vec![0xAA]), // video 0x1011
+            Some(vec![0x11]), // audio 0x1100 eng
+            Some(vec![0x22]), // audio 0x1101 spa
+            Some(vec![0x33]), // audio 0x1102 fra
+            Some(vec![0xEE]), // trailing extra — describes no declared stream
+        ];
+        let sel = StreamSelection {
+            audio: PidFilter::Only(vec![0x1102]),
+            subtitle: PidFilter::All,
+        };
+        sel.apply(&mut t).unwrap();
+
+        assert_eq!(pids(&t), vec![0x1011, 0x1102], "video + fra audio");
+        assert_eq!(
+            t.codec_privates,
+            vec![Some(vec![0xAA]), Some(vec![0x33])],
+            "the retained fra track must keep ITS OWN codec_private, and the \
+             trailing entry that describes no stream must not survive the prune"
+        );
+        assert_eq!(
+            t.codec_privates.len(),
+            t.streams.len(),
+            "the two positional vecs must be aligned after apply()"
         );
     }
     /// A PID listed in the WRONG class's filter must fail loud, not validate and

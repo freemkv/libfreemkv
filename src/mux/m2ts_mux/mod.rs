@@ -117,8 +117,16 @@ pub struct M2tsMux<W: Write> {
     /// Optional — if the upstream frames already carry inline params,
     /// callers can omit this.
     video_codec_private: Option<Vec<u8>>,
-    /// Set on first video frame: have we emitted VPS/SPS/PPS?
-    params_written: bool,
+    /// Set on the first video keyframe: has the parameter-set prepend been
+    /// ATTEMPTED? Latched even when it produced nothing (no codec_private, or
+    /// one that would not parse) — the same bytes cannot parse better on the
+    /// next keyframe, so retrying is pointless.
+    params_attempted: bool,
+    /// Whether VPS/SPS/PPS actually REACHED the stream. Distinct from
+    /// `params_attempted`: `false` after an attempt means the emitted TS carries
+    /// no parameter sets and the video will not decode. See
+    /// [`parameter_sets_emitted`](Self::parameter_sets_emitted).
+    params_emitted: bool,
     /// Audio codec, if an audio track is configured. `None` = video-only.
     audio: Option<AudioCodec>,
     /// First seen PTS (90 kHz). All subsequent PTS / PCR values are
@@ -149,7 +157,8 @@ impl<W: Write> M2tsMux<W> {
         Self {
             out: PacketWriter::new(writer),
             video_codec_private: None,
-            params_written: false,
+            params_attempted: false,
+            params_emitted: false,
             audio: None,
             base_pts_90k: None,
             cc_video: 0,
@@ -166,6 +175,19 @@ impl<W: Write> M2tsMux<W> {
     /// muxer prepends VPS/SPS/PPS Annex B NALs at stream start.
     pub fn set_video_codec_private(&mut self, hvcc: Vec<u8>) {
         self.video_codec_private = Some(hvcc);
+    }
+
+    /// Whether VPS/SPS/PPS parameter sets actually reached the emitted stream.
+    ///
+    /// `false` after any video frame has been written means the TS carries no
+    /// parameter sets — because none were set, or because the `hvcC` record would
+    /// not parse — and its video will not decode unless the frames themselves
+    /// carry inline parameter sets. The prepend is attempted exactly once (on the
+    /// first keyframe) and never retried, so a caller wiring this muxer into a
+    /// pipeline must check this rather than assume `finish() == Ok` means a
+    /// decodable stream.
+    pub fn parameter_sets_emitted(&self) -> bool {
+        self.params_emitted
     }
 
     /// Enable a single audio track. Must be called before
@@ -189,13 +211,34 @@ impl<W: Write> M2tsMux<W> {
         // FIRST keyframe (not first frame — non-key frames before the
         // first keyframe can't carry params usefully).
         let mut es = Vec::with_capacity(data.len() + 64);
-        if keyframe && !self.params_written {
-            if let Some(cp) = &self.video_codec_private {
-                if let Some(params) = super::hevc::hvcc_to_annex_b(cp) {
-                    es.extend_from_slice(&params);
-                }
+        if keyframe && !self.params_attempted {
+            // Arming the latch below is right either way — the same codec_private
+            // bytes cannot parse better on a later keyframe — but it must not be
+            // SILENT, which is what it was: no parameter sets reached the stream,
+            // every later keyframe skipped the prepend, and `finish()` returned Ok
+            // on a TS whose video cannot be decoded. Mirrors the same fix in the
+            // BD-TS sibling (`tsmux.rs`).
+            match self.video_codec_private.as_deref() {
+                Some(cp) => match super::hevc::hvcc_to_annex_b(cp) {
+                    Some(params) => {
+                        es.extend_from_slice(&params);
+                        self.params_emitted = true;
+                    }
+                    None => tracing::warn!(
+                        target: "mux",
+                        codec_private_len = cp.len(),
+                        "m2ts: video codec_private did not parse as an hvcC record; no VPS/SPS/PPS \
+                         emitted and the video will not decode (parameter_sets_emitted() == false)"
+                    ),
+                },
+                None => tracing::warn!(
+                    target: "mux",
+                    "m2ts: no video codec_private was set before the first keyframe; no \
+                     VPS/SPS/PPS emitted and the video will not decode unless the frames carry \
+                     inline parameter sets (parameter_sets_emitted() == false)"
+                ),
             }
-            self.params_written = true;
+            self.params_attempted = true;
         }
         // Append the Annex-B form directly into the pre-sized `es`
         // buffer rather than materializing an intermediate Vec.
@@ -850,6 +893,83 @@ mod tests {
         let af = af_body(pkt).expect("AF present on first packet of keyframe video PES");
         assert!(!af.is_empty(), "AF flags byte present");
         assert_eq!(af[0] & 0x40, 0x40, "RAI bit set");
+    }
+
+    /// The parameter-set prepend is attempted once, on the first keyframe, and
+    /// the latch is armed whether or not it produced anything. When it produced
+    /// nothing — no `codec_private` was set, or the `hvcC` will not parse — the
+    /// emitted TS carries no VPS/SPS/PPS at all and its video cannot be decoded,
+    /// yet `finish()` returns `Ok`. That must not be silent (same defect, and the
+    /// same fix, as the BD-TS sibling `tsmux.rs`): the muxer now warns and, so a
+    /// caller can act on it, exposes `parameter_sets_emitted()`.
+    ///
+    /// Mutation check: drop the `params_emitted` bookkeeping and the two arms are
+    /// indistinguishable to any caller.
+    #[test]
+    fn absent_or_unparseable_codec_private_is_reported_not_silent() {
+        // A VPS NAL the parser can find, and the hvcC that carries it.
+        let vps: [u8; 4] = [0x40, 0x01, 0x0C, 0x77];
+        let mut hvcc = vec![0u8; 22];
+        hvcc.push(1); // num_arrays
+        hvcc.push(0x20); // array_completeness | nal_type = VPS
+        hvcc.extend_from_slice(&1u16.to_be_bytes()); // num_nalus
+        hvcc.extend_from_slice(&(vps.len() as u16).to_be_bytes());
+        hvcc.extend_from_slice(&vps);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&4u32.to_be_bytes());
+        frame.extend_from_slice(&[0x26, 0x01, 0xAF, 0x10]); // an IDR-ish slice NAL
+
+        // ── Control: a parseable hvcC really does emit its parameter sets ──
+        let mut good_sink: Vec<u8> = Vec::new();
+        let emitted_good = {
+            let mut mux = M2tsMux::new(&mut good_sink);
+            mux.set_video_codec_private(hvcc.clone());
+            mux.write_video(0, true, &frame).unwrap();
+            mux.finish().unwrap();
+            mux.parameter_sets_emitted()
+        };
+        assert!(
+            emitted_good,
+            "a parseable hvcC must emit its parameter sets"
+        );
+        assert!(
+            good_sink.windows(vps.len()).any(|w| w == vps),
+            "the VPS must appear in the emitted TS"
+        );
+
+        // ── A truncated hvcC: hvcc_to_annex_b returns None ──
+        let mut bad_sink: Vec<u8> = Vec::new();
+        let emitted_bad = {
+            let mut mux = M2tsMux::new(&mut bad_sink);
+            mux.set_video_codec_private(hvcc[..10].to_vec());
+            mux.write_video(0, true, &frame).unwrap();
+            // A LATER keyframe cannot recover it — the latch is already armed.
+            mux.write_video(40_000_000, true, &frame).unwrap();
+            mux.finish().unwrap(); // Ok, despite undecodable video
+            mux.parameter_sets_emitted()
+        };
+        assert!(
+            !emitted_bad,
+            "an unparseable hvcC emits nothing — the caller must be able to see that"
+        );
+        assert!(
+            !bad_sink.windows(vps.len()).any(|w| w == vps),
+            "no parameter sets reached the stream"
+        );
+
+        // ── No codec_private at all: same undecodable outcome, same signal ──
+        let mut none_sink: Vec<u8> = Vec::new();
+        let emitted_none = {
+            let mut mux = M2tsMux::new(&mut none_sink);
+            mux.write_video(0, true, &frame).unwrap();
+            mux.finish().unwrap();
+            mux.parameter_sets_emitted()
+        };
+        assert!(
+            !emitted_none,
+            "no codec_private means no parameter sets, and that must be observable"
+        );
     }
 
     #[test]
