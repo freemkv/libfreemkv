@@ -74,6 +74,13 @@ struct ReadState {
     ts_scale_ns: i64,
     /// Codec private data per track (track_number, hvcC/avcC bytes).
     codec_privates: Vec<(u16, Vec<u8>)>,
+    /// Number of `BlockAdditions` subtrees skipped on read-back (see
+    /// `MkvStream`'s `Stream::lost_bytes`). Each one is a per-frame side payload — for a
+    /// Blu-ray 3D rip written by this crate, one MVC dependent-view (right-eye)
+    /// access unit — that the PES frame model cannot carry, so it is dropped.
+    additions_dropped: u64,
+    /// Cumulative `BlockAdditional` payload bytes dropped on read-back.
+    additions_dropped_bytes: u64,
 }
 
 /// Safety cap on frames buffered before the first video frame triggers muxer
@@ -552,6 +559,8 @@ impl MkvStream {
                 cluster_ts_ticks: 0,
                 ts_scale_ns,
                 codec_privates,
+                additions_dropped: 0,
+                additions_dropped_bytes: 0,
             }),
         })
     }
@@ -716,6 +725,44 @@ impl crate::pes::Stream for MkvStream {
                                 has_reference = true;
                                 skip_bytes(&mut rs.reader, cs)?;
                             }
+                            ebml::BLOCK_ADDITIONS => {
+                                // A `BlockAdditions > BlockMore > BlockAdditional`
+                                // subtree is a per-frame SIDE payload. For a
+                                // Blu-ray 3D title written by this crate it is the
+                                // MVC dependent-view (right-eye) access unit,
+                                // BlockAddID=2, described by the track's `mvcC`
+                                // BlockAdditionMapping.
+                                //
+                                // `PesFrame` has no side-payload field and the
+                                // read-side stream table (built by
+                                // `parse_mkv_header`, which does not parse
+                                // BlockAdditionMapping) has no dependent-view
+                                // track to hand it to, so this reader CANNOT
+                                // reconstruct it — re-muxing a 3D MKV yields a
+                                // base-view-only (2D) file. Reconstruction needs
+                                // header-parse plumbing well beyond this arm.
+                                //
+                                // What it must NOT be is silent: this used to fall
+                                // into the `_` skip arm below, so an
+                                // `mkv://` → `mkv://` re-mux of a 3D rip dropped
+                                // one whole eye with no error, no warning and
+                                // `lost_bytes == 0`. Account for it so the loss
+                                // reaches `MuxOutcome.lost_bytes` / `errors`.
+                                if rs.additions_dropped == 0 {
+                                    tracing::warn!(
+                                        target: "mux",
+                                        bytes = cs,
+                                        "mkv read-back: dropping a BlockAdditions payload this \
+                                         reader cannot carry (a Blu-ray 3D MVC dependent view is \
+                                         the expected case); the output will be base-view only. \
+                                         Counted in lost_bytes/errors."
+                                    );
+                                }
+                                rs.additions_dropped = rs.additions_dropped.saturating_add(1);
+                                rs.additions_dropped_bytes =
+                                    rs.additions_dropped_bytes.saturating_add(cs);
+                                skip_bytes(&mut rs.reader, cs)?;
+                            }
                             _ => skip_bytes(&mut rs.reader, cs)?,
                         }
                     }
@@ -825,6 +872,33 @@ impl crate::pes::Stream for MkvStream {
 
     fn headers_ready(&self) -> bool {
         true // MKV has all headers upfront in the EBML header
+    }
+
+    /// Count of `BlockAdditions` subtrees dropped on read-back — each one a
+    /// per-frame side payload (a Blu-ray 3D MVC dependent-view access unit for a
+    /// 3D rip written by this crate) that the PES frame model cannot carry.
+    ///
+    /// Reported through the same channel as a disc-read skip event because it is
+    /// the same kind of fact: input bytes that did not reach the output. A 3D
+    /// re-mux losing an eye is a degraded outcome, and a degraded outcome is
+    /// never silent. `0` for the write side and for any source with no
+    /// `BlockAdditions`.
+    fn errors(&self) -> u64 {
+        match self.mode {
+            Mode::Read(ref rs) => rs.additions_dropped,
+            _ => 0,
+        }
+    }
+
+    /// Cumulative `BlockAdditions` bytes dropped on read-back — see
+    /// [`errors`](crate::pes::Stream::errors). Counts the whole skipped subtree (the
+    /// `BlockAdditional` payload plus a handful of bytes of EBML framing above
+    /// it), so it is an upper bound on the payload proper.
+    fn lost_bytes(&self) -> u64 {
+        match self.mode {
+            Mode::Read(ref rs) => rs.additions_dropped_bytes,
+            _ => 0,
+        }
     }
 }
 
@@ -1889,6 +1963,107 @@ mod tests {
         assert_eq!(frame.data, vec![0x11, 0x22, 0x33]);
         assert_eq!(frame.pts, 105 * 1_000_000, "pts = (cluster 100 + rel 5) ms");
         assert_eq!(frame.duration_ns, Some(40 * 1_000_000));
+    }
+
+    /// A BlockGroup's `BlockAdditions` subtree (BlockAddID=2 — the MVC
+    /// dependent/right-eye access unit this crate's 3D writer emits, see
+    /// `mkv.rs::build_block_group`) cannot be carried by `PesFrame`, so read-back
+    /// drops it. That is a LOSSY outcome, and this crate's rule is that a lossy
+    /// outcome is never silent.
+    ///
+    /// Regression: the arm did not exist, so the subtree fell into the `_ =>`
+    /// skip arm — an `mkv://` → `mkv://` re-mux of a 3D rip lost one whole eye
+    /// with no error, no warning and `lost_bytes == 0`, i.e. the mux reported a
+    /// clean, complete, loss-free copy of a file it had halved. The base view
+    /// must still read back intact, and the dropped payload must now be counted
+    /// so it reaches `MuxOutcome.lost_bytes` / `.errors`.
+    #[test]
+    fn block_additions_dropped_on_read_back_is_counted_not_silent() {
+        // The dependent-view payload: big enough that a byte count is unambiguous.
+        let dependent_au = vec![0x5Au8; 512];
+
+        // BlockAdditions > BlockMore > { BlockAddID = 2, BlockAdditional }.
+        let mut more = Vec::new();
+        ebml::write_uint(&mut more, ebml::BLOCK_ADD_ID, 2).unwrap();
+        ebml::write_binary(&mut more, ebml::BLOCK_ADDITIONAL, &dependent_au).unwrap();
+        let mut adds = Vec::new();
+        ebml::write_id(&mut adds, ebml::BLOCK_MORE).unwrap();
+        ebml::write_size(&mut adds, more.len() as u64).unwrap();
+        adds.extend_from_slice(&more);
+
+        // BlockGroup > { Block(base view), BlockAdditions }.
+        let block = [0x81u8, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC];
+        let mut bg_body = Vec::new();
+        ebml::write_id(&mut bg_body, ebml::BLOCK).unwrap();
+        ebml::write_size(&mut bg_body, block.len() as u64).unwrap();
+        bg_body.extend_from_slice(&block);
+        ebml::write_id(&mut bg_body, ebml::BLOCK_ADDITIONS).unwrap();
+        ebml::write_size(&mut bg_body, adds.len() as u64).unwrap();
+        bg_body.extend_from_slice(&adds);
+
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        ebml::write_id(&mut cluster, ebml::BLOCK_GROUP).unwrap();
+        ebml::write_size(&mut cluster, bg_body.len() as u64).unwrap();
+        cluster.extend_from_slice(&bg_body);
+
+        // One video TRACK_ENTRY (track number 1) so track index 0 is in range.
+        let mut entry = Vec::new();
+        ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
+        ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 1).unwrap();
+        let mut tracks = Vec::new();
+        ebml::write_id(&mut tracks, ebml::TRACK_ENTRY).unwrap();
+        ebml::write_size(&mut tracks, entry.len() as u64).unwrap();
+        tracks.extend_from_slice(&entry);
+
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, tracks.len() as u64).unwrap();
+        out.extend_from_slice(&tracks);
+        out.extend_from_slice(&cluster);
+
+        let mut stream = MkvStream::open(Cursor::new(out)).unwrap();
+        assert_eq!(stream.errors(), 0, "no BlockAdditions seen before the read");
+        assert_eq!(stream.lost_bytes(), 0);
+
+        let frame = stream
+            .read()
+            .unwrap()
+            .expect("the base-view BlockGroup frame must still be read");
+        assert_eq!(frame.track, 0);
+        assert_eq!(
+            frame.data,
+            vec![0xAA, 0xBB, 0xCC],
+            "the frame carries the BASE view only — the dependent view is lost"
+        );
+        assert!(
+            !frame.data.contains(&0x5A),
+            "PesFrame has no side-payload field, so the dependent AU is NOT in the frame"
+        );
+
+        // The loss is now reported.
+        assert_eq!(
+            stream.errors(),
+            1,
+            "one dropped BlockAdditions subtree must be counted as a loss event"
+        );
+        assert!(
+            stream.lost_bytes() >= dependent_au.len() as u64,
+            "dropped bytes ({}) must cover the {}-byte dependent AU",
+            stream.lost_bytes(),
+            dependent_au.len()
+        );
+
+        // EOF, and the counters survive it (the driver samples them after the run).
+        assert!(stream.read().unwrap().is_none());
+        assert_eq!(stream.errors(), 1);
     }
 
     /// A BlockGroup carrying a ReferenceBlock is NOT a keyframe — that element's

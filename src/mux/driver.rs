@@ -253,6 +253,17 @@ pub struct MuxOutcome {
     pub lost_bytes: u64,
     /// Number of streams in the muxed title.
     pub streams: usize,
+    /// `title.streams` indices the output sink accepted frames for but could not
+    /// put in the finished container (`Stream::undelivered_streams`) — today only
+    /// the `mp4://` sink, which must drop an audio track no frame of which
+    /// yielded a parseable sample entry.
+    ///
+    /// Non-empty means the file does NOT match the pre-mux plan
+    /// (`mp4_fit_report`), even with `completed = true`: those streams are
+    /// missing. A caller that reports a successful export must report these too —
+    /// a lossy outcome is never silent. Always empty when the run stopped before
+    /// the sink was finalised (nothing was finished, so nothing is known).
+    pub undelivered_streams: Vec<usize>,
 }
 
 /// Run the decrypt + mux pipeline end-to-end: construct the source stream from
@@ -637,6 +648,7 @@ fn drive_mux(
             errors: stream.errors(),
             lost_bytes: stream.lost_bytes(),
             streams: out_title.streams.len(),
+            undelivered_streams: sink.undelivered_streams(),
         });
     }
 
@@ -656,6 +668,7 @@ fn drive_mux(
                 errors: stream.errors(),
                 lost_bytes: stream.lost_bytes(),
                 streams: 0,
+                undelivered_streams: Vec::new(),
             });
         }
         let read = match stream.read() {
@@ -673,6 +686,7 @@ fn drive_mux(
                     errors: stream.errors(),
                     lost_bytes: stream.lost_bytes(),
                     streams: 0,
+                    undelivered_streams: Vec::new(),
                 });
             }
             Err(e) => return Err(e),
@@ -683,12 +697,28 @@ fn drive_mux(
                 buffered.push(frame);
                 // Bounded header buffer: a title whose codec_private never
                 // resolves would otherwise buffer the entire (tens-of-GB)
-                // stream into RAM until OOM. Treat cap-exceeded identically to
-                // "headers never resolved" — fail fast with the SAME
-                // `Error::MkvInvalid` the header gate below returns, instead of
-                // swapping the box to death.
+                // stream into RAM until OOM. Fail fast instead of swapping the
+                // box to death.
+                //
+                // NOT `Error::MkvInvalid` — that code is what an empty nav/menu
+                // PGC stub yields and `error::is_skippable_title_stub`
+                // classifies it as skippable, so an all-titles rip DROPPED a
+                // title that had produced half a gigabyte of real frames and
+                // then exited reporting success. A cap overflow gets its own
+                // non-skippable code so it can never be mistaken for a stub.
                 if buffered_bytes > HEADER_BUFFER_CAP_BYTES {
-                    return Err(Error::MkvInvalid.into());
+                    tracing::error!(
+                        target: "mux",
+                        buffered_bytes,
+                        cap = HEADER_BUFFER_CAP_BYTES,
+                        "header buffer cap exceeded: the title keeps yielding frames but no \
+                         video track's codec_private ever resolved; refusing rather than \
+                         buffering the whole stream into RAM"
+                    );
+                    return Err(Error::MuxHeaderBufferExceeded {
+                        bytes: buffered_bytes as u64,
+                    }
+                    .into());
                 }
             }
             None => break,
@@ -715,6 +745,7 @@ fn drive_mux(
                 errors: stream.errors(),
                 lost_bytes: stream.lost_bytes(),
                 streams: 0,
+                undelivered_streams: Vec::new(),
             });
         }
         return Err(Error::MkvInvalid.into());
@@ -808,11 +839,21 @@ fn drive_mux(
     // container and returns the payload-byte count. On halt/wedge this returns
     // an error variant; we translate that to `completed = false` rather than
     // surfacing it as a hard failure (a clean operator stop is not an error).
-    let (bytes_written, finalize_failed) = match pipe.finish_with_halt(Some(halt)) {
-        Ok(b) => (b, false),
-        Err(Error::Halted | Error::PipelineJoinTimeout) => (bytes.load(Ordering::Relaxed), true),
-        Err(e) => return Err(e.into()),
-    };
+    let (bytes_written, undelivered_streams, finalize_failed) =
+        match pipe.finish_with_halt(Some(halt)) {
+            Ok((b, undelivered)) => (b, undelivered, false),
+            Err(Error::Halted | Error::PipelineJoinTimeout) => {
+                (bytes.load(Ordering::Relaxed), Vec::new(), true)
+            }
+            Err(e) => return Err(e.into()),
+        };
+    if !undelivered_streams.is_empty() {
+        tracing::warn!(
+            target: "mux",
+            streams = ?undelivered_streams,
+            "output sink could not deliver every planned stream; the file does not match              the pre-mux plan (surfaced as MuxOutcome::undelivered_streams)"
+        );
+    }
 
     if !mux_run_completed(interrupted, finalize_failed, halt.is_cancelled()) {
         return Ok(MuxOutcome {
@@ -822,6 +863,7 @@ fn drive_mux(
             errors: stream.errors(),
             lost_bytes: stream.lost_bytes(),
             streams: num_streams,
+            undelivered_streams,
         });
     }
 
@@ -840,18 +882,22 @@ fn drive_mux(
         errors: stream.errors(),
         lost_bytes: stream.lost_bytes(),
         streams: num_streams,
+        undelivered_streams,
     })
 }
 
 /// Write-side [`Sink`]: applies each frame to the counting output stream and
-/// finalises the container on close. `close()` returns the payload-byte count.
+/// finalises the container on close. `close()` returns the payload-byte count
+/// plus any streams the sink could not deliver (see
+/// [`MuxOutcome::undelivered_streams`]) — that fact lives only in the sink and
+/// dies with the consumer thread unless it is carried out here.
 struct WriteSink {
     output: CountingStream,
     bytes: Arc<AtomicU64>,
 }
 
 impl Sink<PesFrame> for WriteSink {
-    type Output = u64;
+    type Output = (u64, Vec<usize>);
 
     fn apply(&mut self, frame: PesFrame) -> Result<Flow, Error> {
         self.output.write(&frame).map_err(Error::from)?;
@@ -860,9 +906,13 @@ impl Sink<PesFrame> for WriteSink {
         Ok(Flow::Continue)
     }
 
-    fn close(mut self) -> Result<u64, Error> {
+    fn close(mut self) -> Result<(u64, Vec<usize>), Error> {
         self.output.finish().map_err(Error::from)?;
-        Ok(self.output.bytes_written())
+        // Sample AFTER finish(): the mp4 sink decides its drops there.
+        Ok((
+            self.output.bytes_written(),
+            self.output.undelivered_streams(),
+        ))
     }
 }
 
@@ -1935,6 +1985,55 @@ mod tests {
         assert!(map_none.is_none(), "CSS/clear must NOT resolve an AACS map");
     }
 
+    /// A sink that accepts every frame but reports one stream it could not put in
+    /// the finished container — the `mp4://` shape (an audio track dropped at
+    /// `finish()` because no frame yielded a parseable sample entry).
+    struct UndeliveringSink {
+        info: DiscTitle,
+    }
+
+    impl Stream for UndeliveringSink {
+        fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
+            Ok(None)
+        }
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn info(&self) -> &DiscTitle {
+            &self.info
+        }
+        fn undelivered_streams(&self) -> Vec<usize> {
+            vec![1]
+        }
+    }
+
+    /// The sink lives in the consumer thread and is destroyed with it, so a
+    /// stream it could not deliver is knowable ONLY at `close()`. `close()` must
+    /// carry that out alongside the byte count, or `MuxOutcome` can never report
+    /// it and the loss stays a log line.
+    ///
+    /// Mutation: return `Vec::new()` from `close()` instead of sampling the sink
+    /// and the fact never leaves the thread.
+    #[test]
+    fn write_sink_carries_undelivered_streams_out_of_the_consumer_thread() {
+        let sink = WriteSink {
+            output: CountingStream::new(Box::new(UndeliveringSink {
+                info: DiscTitle::empty(),
+            })),
+            bytes: Arc::new(AtomicU64::new(0)),
+        };
+        let (bytes, undelivered) = sink.close().expect("close succeeds");
+        assert_eq!(bytes, 0);
+        assert_eq!(
+            undelivered,
+            vec![1],
+            "the sink's undelivered stream must reach the driver"
+        );
+    }
+
     // ── Regression A: header-buffer cap fails fast instead of OOM ───────────
     //
     // A stream whose headers never resolve but that keeps yielding frames must
@@ -1979,10 +2078,21 @@ mod tests {
             Duration::from_secs(60),
         )
         .expect_err("over-cap header buffer must fail fast, not OOM");
+        // The cap overflow must carry its OWN code, not `MkvInvalid`: an
+        // all-titles rip asks `is_skippable_title_stub` whether to move on, and
+        // `MkvInvalid` answers "yes, an empty nav/menu stub" — which silently
+        // dropped a title that had just produced 512 MiB of real frames.
         assert_eq!(
             err.to_string(),
-            format!("E{}", crate::error::E_MKV_INVALID),
-            "cap-exceeded returns the same MkvInvalid as headers-never-resolved"
+            format!("E{}: {}", crate::error::E_MUX_HEADER_BUFFER_EXCEEDED, {
+                let frames = cap_frames + 1;
+                frames * FRAME
+            }),
+            "cap-exceeded must report its own code plus the buffered byte count"
+        );
+        assert!(
+            !crate::error::is_skippable_title_stub(&err),
+            "a cap overflow is a real title, never a skippable stub"
         );
         let reads = reads_seen.load(Ordering::SeqCst);
         assert!(
