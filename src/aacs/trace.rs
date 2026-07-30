@@ -77,6 +77,11 @@ pub enum KeyNode {
     MatchedDisc,
     /// The source had no entry for this disc.
     NoEntry,
+    /// The source FAILED — it errored rather than reporting no entry. Distinct
+    /// from [`Self::NoEntry`]: an unreachable key server or an unreadable keydb is
+    /// a fixable condition, whereas "this disc is not in the database" is not, and
+    /// collapsing the two told the front-end the wrong cause.
+    SourceFailed,
     /// Pre-decrypted unit keys were found.
     FoundUnitKeys,
     /// A VUK was found.
