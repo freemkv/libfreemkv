@@ -85,11 +85,27 @@ use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
 /// pressure concurrent writes. Override via `FREEMKV_READ_DROP_CHUNK_MIB`.
 const READ_DROP_CHUNK_BYTES_DEFAULT: u64 = 32 * 1024 * 1024;
 
+/// Upper bound (in MiB) accepted from `FREEMKV_READ_DROP_CHUNK_MIB`. 64 GiB —
+/// generous for any real medium, and small enough that `n * 1024 * 1024` cannot
+/// wrap `u64`. Mirrors `WRITEBACK_CHUNK_MIB_MAX`, whose identical multiply is
+/// bounded for exactly this reason: without the bound, a value above 2^44
+/// overflows — a panic on the first ISO open in an overflow-checked build, and in
+/// release a wrap to a near-zero window that fires `drop_window` on every read.
+/// Out-of-range values fall back to the default.
+const READ_DROP_CHUNK_MIB_MAX: u64 = 64 * 1024;
+
 fn read_drop_chunk_bytes() -> u64 {
-    std::env::var("FREEMKV_READ_DROP_CHUNK_MIB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&n| n > 0)
+    resolve_read_drop_chunk(
+        std::env::var("FREEMKV_READ_DROP_CHUNK_MIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok()),
+    )
+}
+
+/// The pure part of [`read_drop_chunk_bytes`], split out so the bound is
+/// testable without mutating process environment.
+fn resolve_read_drop_chunk(mib: Option<u64>) -> u64 {
+    mib.filter(|&n| n > 0 && n <= READ_DROP_CHUNK_MIB_MAX)
         .map(|n| n * 1024 * 1024)
         .unwrap_or(READ_DROP_CHUNK_BYTES_DEFAULT)
 }
@@ -517,5 +533,37 @@ mod tests {
             }
             lba += batch as u32;
         }
+    }
+
+    /// `FREEMKV_READ_DROP_CHUNK_MIB` must be BOUNDED before the MiB→byte
+    /// multiply, exactly as its writeback twin bounds the identical multiply.
+    /// Unbounded, any value above 2^44 overflowed `n * 1024 * 1024`: a panic on
+    /// the first ISO open in an overflow-checked build, and in release a wrap to
+    /// a near-zero window that fires `drop_window` on essentially every read.
+    #[test]
+    fn read_drop_chunk_env_is_bounded_before_the_multiply() {
+        // Default when unset / zero / out of range.
+        assert_eq!(resolve_read_drop_chunk(None), READ_DROP_CHUNK_BYTES_DEFAULT);
+        assert_eq!(
+            resolve_read_drop_chunk(Some(0)),
+            READ_DROP_CHUNK_BYTES_DEFAULT
+        );
+        // The overflow value: `u64::MAX * 1024 * 1024` panicked here.
+        assert_eq!(
+            resolve_read_drop_chunk(Some(u64::MAX)),
+            READ_DROP_CHUNK_BYTES_DEFAULT
+        );
+        assert_eq!(
+            resolve_read_drop_chunk(Some(READ_DROP_CHUNK_MIB_MAX + 1)),
+            READ_DROP_CHUNK_BYTES_DEFAULT
+        );
+        // In-range values convert MiB→bytes. Mutation: `* 1024` breaks this.
+        assert_eq!(resolve_read_drop_chunk(Some(1)), 1024 * 1024);
+        assert_eq!(
+            resolve_read_drop_chunk(Some(READ_DROP_CHUNK_MIB_MAX)),
+            READ_DROP_CHUNK_MIB_MAX * 1024 * 1024
+        );
+        // And the bound itself keeps the multiply inside u64.
+        assert!((READ_DROP_CHUNK_MIB_MAX as u128) * 1024 * 1024 <= u64::MAX as u128);
     }
 }

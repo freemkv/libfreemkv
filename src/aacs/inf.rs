@@ -5,7 +5,6 @@
 use super::mkb::*;
 
 /// Parsed Unit_Key_RO.inf file.
-#[derive(Debug)]
 pub struct UnitKeyFile {
     /// Disc hash (SHA1 of the entire file) — used as KEYDB lookup key
     pub disc_hash: [u8; 20],
@@ -21,6 +20,29 @@ pub struct UnitKeyFile {
     pub encrypted_keys: Vec<(u32, [u8; 16])>,
     /// Title → CPS unit index mapping (title_idx → unit_key_idx)
     pub title_cps_unit: Vec<u16>,
+}
+
+/// Redacting `Debug`, per the policy `aacs::types` documents: this struct holds
+/// the disc's ENCRYPTED CPS unit keys — exactly the material a keydb entry stores
+/// — plus the disc hash they are looked up by. A derived `Debug` printed every key
+/// byte verbatim, so any `{:?}` (a downstream crate, an `assert_eq!` failure
+/// message, a future `tracing::debug!` in this module) leaked them. Only
+/// non-secret shape is printed. Guarded by `unit_key_file_debug_is_redacted`.
+impl std::fmt::Debug for UnitKeyFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnitKeyFile")
+            // The disc hash is the public keydb lookup key, printed as hex the
+            // same way `DiscEntry` prints its own — never as raw bytes.
+            .field("disc_hash", &disc_hash_hex(&self.disc_hash))
+            .field("app_type", &self.app_type)
+            .field("num_bdmv_dir", &self.num_bdmv_dir)
+            .field("use_skb_mkb", &self.use_skb_mkb)
+            .field("version", &self.version)
+            .field("encrypted_keys", &"<redacted>")
+            .field("encrypted_keys_len", &self.encrypted_keys.len())
+            .field("title_cps_unit", &self.title_cps_unit)
+            .finish()
+    }
 }
 
 /// Compute disc hash (SHA1 of Unit_Key_RO.inf content).
@@ -496,5 +518,34 @@ mod vtkf_tests {
         let derived = super::super::derive::decrypt_unit_key(&vuk, &ukf.encrypted_keys[0].1);
         // Same as applying the shared unwrap directly to the stored enc key.
         assert_eq!(derived, super::super::derive::decrypt_unit_key(&vuk, &enc));
+    }
+
+    /// `UnitKeyFile` holds the disc's ENCRYPTED CPS unit keys. A derived `Debug`
+    /// printed every byte; the hand-written impl must not. Sentinel key byte
+    /// 0xD5 = decimal 213 (a derived `Debug` renders `[u8; 16]` in decimal), the
+    /// same probe `aacs::types::redaction_tests` uses. Mutation guard: putting
+    /// `#[derive(Debug)]` back fails this.
+    #[test]
+    fn unit_key_file_debug_is_redacted() {
+        let f = UnitKeyFile {
+            disc_hash: [0xD5; 20],
+            app_type: 1,
+            num_bdmv_dir: 1,
+            use_skb_mkb: false,
+            version: AacsVersion::V20,
+            encrypted_keys: vec![(0, [0xD5; 16]), (1, [0xD5; 16])],
+            title_cps_unit: vec![0, 1],
+        };
+        let dbg = format!("{f:?}");
+        assert!(
+            !dbg.contains("213"),
+            "UnitKeyFile Debug leaked key bytes (decimal 213): {dbg}"
+        );
+        assert!(
+            dbg.contains("redacted"),
+            "UnitKeyFile Debug missing redaction marker: {dbg}"
+        );
+        // Non-secret shape is still useful for diagnostics.
+        assert!(dbg.contains("encrypted_keys_len: 2"), "{dbg}");
     }
 }

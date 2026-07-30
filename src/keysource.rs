@@ -82,9 +82,12 @@ impl DecodeSampleSet {
 }
 
 /// The public AACS inputs a key source needs to look a disc up. Captured at
-/// scan; contains no secrets — only the disc identity and the on-disc AACS
-/// structures a source or key server may key on.
-#[derive(Debug, Clone)]
+/// scan; carries no DERIVED secrets (no media key, VUK or plaintext unit key) —
+/// only the disc identity and the on-disc AACS structures a source or key server
+/// may key on. The on-disc structures are nonetheless key MATERIAL (the encrypted
+/// title keys live in `unit_key_ro`), so [`Debug`] is hand-written and redacting;
+/// see the impl below.
+#[derive(Clone)]
 pub struct DiscInputs {
     /// SHA-1 of `Unit_Key_RO.inf`, `0x`-prefixed hex. The value a keydb keys
     /// its per-disc entries by, and a key server identifies the disc with.
@@ -113,6 +116,30 @@ pub struct DiscInputs {
     /// record it (keyed by `disc_hash`) to build a hash→title catalog. Not used
     /// in any AACS derivation.
     pub volume_label: Option<String>,
+}
+
+/// Redacting `Debug`, per the policy `aacs::types` documents (and which
+/// `aacs::types::Vid` already applies to this very Volume ID). `DiscInputs` is
+/// public and returned by [`crate::Disc::inputs`], so a consumer's
+/// `tracing::debug!("{inputs:?}")` used to print the Volume ID, the whole
+/// `Unit_Key_RO.inf` (the encrypted title keys), the entire MKB and every
+/// ciphertext sample verbatim into a log that ends up attached to a bug report.
+/// Only non-secret identity and shape (presence, lengths) is printed.
+impl std::fmt::Debug for DiscInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscInputs")
+            .field("disc_hash", &self.disc_hash)
+            .field("volume_id", &"<redacted>")
+            .field("version", &self.version)
+            .field("mkb", &"<redacted>")
+            .field("mkb_len", &self.mkb.len())
+            .field("unit_key_ro", &"<redacted>")
+            .field("unit_key_ro_len", &self.unit_key_ro.len())
+            .field("samples", &"<redacted>")
+            .field("samples_len", &self.samples.len())
+            .field("volume_label", &self.volume_label)
+            .finish()
+    }
 }
 
 /// A lazy view of a disc's AACS material, handed to [`KeySource::get_unit_keys`] so a
@@ -1333,5 +1360,40 @@ mod tests {
         assert_eq!(k20[1], [0x20; 16], "V20 reads the 2nd key at +64");
         assert_eq!(k10[1], [0x10; 16], "V10 reads the 2nd key at +48");
         assert_ne!(k20[1], k10[1], "the parse stride follows inputs.version");
+    }
+
+    /// `DiscInputs` is public and returned by `Disc::inputs`, so any consumer's
+    /// `tracing::debug!("{inputs:?}")` prints it. A derived `Debug` printed the
+    /// Volume ID (the value `aacs::types::Vid` deliberately renders as
+    /// `Vid(<redacted>)`), the whole `Unit_Key_RO.inf` (the encrypted title keys),
+    /// the entire MKB and every ciphertext sample verbatim. Sentinel byte
+    /// 0xD5 = decimal 213, matching `aacs::types::redaction_tests`. Mutation
+    /// guard: restoring `#[derive(Debug)]` fails this.
+    #[test]
+    fn disc_inputs_debug_is_redacted() {
+        let inputs = DiscInputs {
+            disc_hash: "0xAA".into(),
+            volume_id: [0xD5; 16],
+            version: 2,
+            mkb: vec![0xD5; 64],
+            unit_key_ro: vec![0xD5; 48],
+            samples: vec![vec![0xD5; 6144]],
+            volume_label: Some("TITLE_2024".into()),
+        };
+        let dbg = format!("{inputs:?}");
+        assert!(
+            !dbg.contains("213"),
+            "DiscInputs Debug leaked key material (decimal 213): {dbg}"
+        );
+        assert!(
+            dbg.contains("redacted"),
+            "DiscInputs Debug missing redaction marker: {dbg}"
+        );
+        // Non-secret identity and shape stay printable for diagnostics.
+        assert!(dbg.contains("0xAA"), "{dbg}");
+        assert!(dbg.contains("mkb_len: 64"), "{dbg}");
+        assert!(dbg.contains("unit_key_ro_len: 48"), "{dbg}");
+        assert!(dbg.contains("samples_len: 1"), "{dbg}");
+        assert!(dbg.contains("TITLE_2024"), "{dbg}");
     }
 }

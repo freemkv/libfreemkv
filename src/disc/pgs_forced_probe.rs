@@ -29,8 +29,22 @@ use crate::sector::SectorSource;
 use std::collections::HashMap;
 
 const SECTOR_BYTES: usize = 2048;
-/// Read the clip in 2 MiB chunks.
-const CHUNK_SECTORS: u16 = 1024;
+/// Read the clip in ~2 MiB chunks.
+///
+/// A whole number of AACS aligned units (3 sectors / 6144 B), because with a
+/// decrypting source — the case this module's doc promises — every read must
+/// begin on a unit boundary measured from the extent base or
+/// `DecryptingSectorSource` rejects it outright with `DecryptFailed`. At 1024
+/// (`1024 % 3 == 1`) every chunk after the first drifted off the boundary, so
+/// content-based forced detection was unreachable past the first chunk of an
+/// AACS disc. 1023 = 341 units.
+const CHUNK_SECTORS: u16 = 1023;
+
+// The alignment requirement above is enforced, not just described.
+const _: () = assert!(
+    CHUNK_SECTORS as u32 % crate::aacs::content::ALIGNED_UNIT_SECTORS == 0,
+    "probe chunks must be a whole number of AACS aligned units"
+);
 
 /// Hard ceiling on sectors read per probe call (256 MiB).
 ///
@@ -43,12 +57,46 @@ const CHUNK_SECTORS: u16 = 1024;
 /// non-forced set before accepting the forced verdict.
 const PROBE_BUDGET_SECTORS: u32 = 131_072;
 
-/// Memoises probe results across titles. Keyed by the title's exact extent
-/// list, so a hit returns a result computed from byte-identical input — many
-/// playlists on one disc reference the same clips (main feature, play-all,
-/// seamless-branch variants), and without this the same physical extents are
-/// re-read from the drive once per playlist.
-pub(crate) type ForcedProbeCache = HashMap<Vec<(u32, u32)>, HashMap<u16, bool>>;
+/// What one probed extent showed about one PGS track — the two monotone facts a
+/// [`ForcedTracker`] accumulates, and nothing else.
+///
+/// Keeping the EVIDENCE (rather than a composed forced/not-forced verdict) is
+/// what makes per-extent memoisation sound: both fields only ever go from
+/// `false` to `true` as more data is seen, so a title's verdict is the
+/// field-wise OR over its extents, in any order, with no dependence on how the
+/// extents were grouped into playlists.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct TrackEvidence {
+    /// A PGS display set was actually seen for this track in this extent.
+    observed: bool,
+    /// At least one of those display sets was NOT forced.
+    non_forced: bool,
+}
+
+impl TrackEvidence {
+    fn merge(&mut self, other: Self) {
+        self.observed |= other.observed;
+        self.non_forced |= other.non_forced;
+    }
+}
+
+/// Memoises probe results across titles, keyed PER PHYSICAL EXTENT and per PGS
+/// track — `(start_lba, sector_count, pid)`.
+///
+/// Many playlists on one disc reference the same clips (main feature, play-all,
+/// seamless-branch variants) but rarely with byte-identical extent LISTS: 00800
+/// = [A, B], 00801 = [A], 00802 = [B] are three different lists over two clips.
+/// Keying on the whole list de-duplicated only exactly-identical playlists and
+/// re-read every shared clip once per list — up to `PROBE_BUDGET_SECTORS`
+/// (256 MiB) of optical-drive time each. Per-extent keying reads each physical
+/// extent at most once per disc, and per-track keying means a playlist that
+/// declares MORE PGS tracks over the same extents still probes the extra ones
+/// instead of silently taking a verdict map that has no entry for them.
+///
+/// Only extents whose read reached a DESIGNED stop are memoised (see
+/// `probe_and_set_forced`), so one cancellation or read fault is never frozen in
+/// as an extent's answer.
+pub(crate) type ForcedProbeCache = HashMap<(u32, u32, u16), TrackEvidence>;
 
 /// Why the read loop stopped — which decides whether the observations it
 /// accumulated may be applied as an authoritative verdict.
@@ -125,57 +173,109 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
         return;
     }
 
-    // Same extents → same verdicts. Serve from cache rather than re-reading.
-    let key: Vec<(u32, u32)> = title
-        .extents
+    // Same extent → same evidence. Take from the cache what is already known and
+    // read only the extents that are not (for every declared track).
+    let mut evidence: HashMap<u16, TrackEvidence> = pg_pids
         .iter()
-        .map(|e| (e.start_lba, e.sector_count))
+        .map(|&p| (p, TrackEvidence::default()))
         .collect();
-    if let Some(hit) = cache.get(&key) {
-        apply_verdicts(title, hit);
+    let mut todo: Vec<crate::disc::Extent> = Vec::new();
+    for ext in &title.extents {
+        let hits: Option<Vec<TrackEvidence>> = pg_pids
+            .iter()
+            .map(|&p| cache.get(&(ext.start_lba, ext.sector_count, p)).copied())
+            .collect();
+        match hits {
+            Some(known) => {
+                for (&pid, ev) in pg_pids.iter().zip(known) {
+                    if let Some(slot) = evidence.get_mut(&pid) {
+                        slot.merge(ev);
+                    }
+                }
+            }
+            // At least one declared track has no evidence for this extent — read
+            // it. (A playlist that declares a PGS PID a previous playlist did not
+            // lands here, so the extra track is genuinely probed.)
+            None => todo.push(*ext),
+        }
+    }
+    if todo.is_empty() {
+        // Every extent's evidence came from a run that reached a designed stop, so
+        // an absence claim over the composed evidence is as sound as the run that
+        // produced each part.
+        apply_verdicts(title, &verdicts(&evidence, true));
         return;
     }
 
-    let mut demux = TsDemuxer::new(&pg_pids);
-    let mut parsers: HashMap<u16, PgsParser> =
-        pg_pids.iter().map(|&p| (p, PgsParser::new())).collect();
-    let mut trackers: HashMap<u16, ForcedTracker> =
-        pg_pids.iter().map(|&p| (p, ForcedTracker::new())).collect();
-
-    let extents = title.extents.clone();
     let mut buf = vec![0u8; CHUNK_SECTORS as usize * SECTOR_BYTES];
     let mut sectors_read: u32 = 0;
     // Record WHY the loop ended rather than leaving it implicit in the control
     // flow: every exit below names its reason, and the reason decides what may be
     // asserted from what was observed.
-    let stop = 'outer: {
-        for ext in &extents {
-            let mut lba = ext.start_lba;
-            let mut remaining = ext.sector_count;
-            while remaining > 0 {
-                // Bounded work and a responsive cancel: without these the probe
-                // reads the entire title whenever a track really is forced.
-                if halt.is_some_and(|h| h.is_cancelled()) {
-                    break 'outer StopReason::Halted;
+    let mut stop = StopReason::Exhausted;
+    'outer: for ext in &todo {
+        // Demux/parse state is PER EXTENT, so the evidence an extent yields is
+        // derived from that extent's own bytes and nothing else — which is what
+        // makes the per-extent cache entry mean what it claims, and is required
+        // now that a cache hit can make the read skip an extent in the middle of
+        // the title (a demuxer carried across a skipped extent would splice two
+        // non-adjacent byte runs into one PES). Each extent is a clip's own
+        // contiguous run, so this loses at most a display set that straddles an
+        // extent boundary of a fragmented file.
+        let mut demux = TsDemuxer::new(&pg_pids);
+        let mut parsers: HashMap<u16, PgsParser> =
+            pg_pids.iter().map(|&p| (p, PgsParser::new())).collect();
+        let mut trackers: HashMap<u16, ForcedTracker> =
+            pg_pids.iter().map(|&p| (p, ForcedTracker::new())).collect();
+        // AACS aligned units are anchored at THIS extent's start LBA, so tell a
+        // decrypt-on-read source to gate relative to it rather than absolute disc
+        // LBA 0 — without this the very first read of a clip whose start_lba is
+        // not itself 3-aligned is rejected. Mirrors the mux read paths.
+        reader.set_unit_base(ext.start_lba);
+        let mut lba = ext.start_lba;
+        let mut remaining = ext.sector_count;
+        // `None` = this extent was read to its end, so its evidence is complete
+        // and may be memoised. `Some(reason)` = the read stopped early.
+        let mut cut_short: Option<StopReason> = None;
+        while remaining > 0 {
+            // Bounded work and a responsive cancel: without these the probe
+            // reads the entire title whenever a track really is forced.
+            if halt.is_some_and(|h| h.is_cancelled()) {
+                cut_short = Some(StopReason::Halted);
+                break;
+            }
+            if sectors_read >= PROBE_BUDGET_SECTORS {
+                cut_short = Some(StopReason::Budget);
+                break;
+            }
+            let budget_left = PROBE_BUDGET_SECTORS - sectors_read;
+            let count = remaining.min(CHUNK_SECTORS as u32).min(budget_left) as u16;
+            let want = count as usize * SECTOR_BYTES;
+            let n = match reader.read_sectors(lba, count, &mut buf[..want], false) {
+                Ok(n) => n,
+                // Best-effort — stop reading, but the data past here was never
+                // seen, so the observation is a truncated prefix.
+                Err(_) => {
+                    cut_short = Some(StopReason::ReadFailed);
+                    break;
                 }
-                if sectors_read >= PROBE_BUDGET_SECTORS {
-                    break 'outer StopReason::Budget;
-                }
-                let budget_left = PROBE_BUDGET_SECTORS - sectors_read;
-                let count = remaining.min(CHUNK_SECTORS as u32).min(budget_left) as u16;
-                let want = count as usize * SECTOR_BYTES;
-                let n = match reader.read_sectors(lba, count, &mut buf[..want], false) {
-                    Ok(n) => n,
-                    // Best-effort — stop reading, but the data past here was never
-                    // seen, so the observation is a truncated prefix.
-                    Err(_) => break 'outer StopReason::ReadFailed,
-                };
-                if n == 0 {
-                    // Short read: the extent claimed sectors the source would not
-                    // yield. Same truncated prefix as an error.
-                    break 'outer StopReason::ReadFailed;
-                }
-                for pes in demux.feed(&buf[..n]) {
+            };
+            // Advance by what was actually READ, not by what was requested. A
+            // short-but-nonzero read (a source whose batch is smaller than the
+            // request — `PrefetchedSectorSource` returns its producer's batch)
+            // used to advance `lba`/`remaining`/`sectors_read` by the full
+            // `count`, silently SKIPPING the unread tail of the chunk while
+            // `stop` stayed `Exhausted` — so an absence-based forced verdict was
+            // asserted (and memoised) over data that was never seen. The partial
+            // trailing sector, if any, is left for the next read rather than fed
+            // twice.
+            let got = (n.min(want) / SECTOR_BYTES) as u32;
+            if got == 0 {
+                // Less than one whole sector: the bytes are real, so feed them,
+                // but the loop cannot advance (re-reading the same partial sector
+                // would feed it twice) — so this is the truncated prefix an error
+                // is. A source that claims sectors and yields none is the same case.
+                for pes in demux.feed(&buf[..n.min(want)]) {
                     if let (Some(parser), Some(tracker)) =
                         (parsers.get_mut(&pes.pid), trackers.get_mut(&pes.pid))
                     {
@@ -184,62 +284,109 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                         }
                     }
                 }
-                // Every track has already shown a non-forced set → nothing left to
-                // learn; stop reading the (huge) clip.
-                if trackers.values().all(ForcedTracker::settled_not_forced) {
-                    break 'outer StopReason::Exhausted;
+                cut_short = Some(StopReason::ReadFailed);
+                break;
+            }
+            for pes in demux.feed(&buf[..got as usize * SECTOR_BYTES]) {
+                if let (Some(parser), Some(tracker)) =
+                    (parsers.get_mut(&pes.pid), trackers.get_mut(&pes.pid))
+                {
+                    for frame in parser.parse(&pes) {
+                        tracker.observe(&frame.data);
+                    }
                 }
-                lba += count as u32;
-                remaining -= count as u32;
-                sectors_read += count as u32;
+            }
+            lba += got;
+            remaining -= got;
+            sectors_read += got;
+            // Every track has already shown a non-forced set — counting the
+            // evidence carried in from other extents — so there is nothing left to
+            // learn; stop reading the (huge) clip.
+            if pg_pids.iter().all(|p| {
+                let carried = evidence.get(p).copied().unwrap_or_default().non_forced;
+                carried
+                    || trackers
+                        .get(p)
+                        .is_some_and(ForcedTracker::settled_not_forced)
+            }) {
+                cut_short = Some(StopReason::Exhausted);
+                break;
             }
         }
-        StopReason::Exhausted
-    };
 
-    // Drain any buffered final display set.
-    for (pid, parser) in parsers.iter_mut() {
-        if let Some(tracker) = trackers.get_mut(pid) {
-            for frame in parser.flush() {
-                tracker.observe(&frame.data);
+        // Drain any buffered final display set of THIS extent.
+        for (pid, parser) in parsers.iter_mut() {
+            if let Some(tracker) = trackers.get_mut(pid) {
+                for frame in parser.flush() {
+                    tracker.observe(&frame.data);
+                }
             }
+        }
+
+        // Fold this extent's evidence in, and memoise it if the extent's read
+        // reached a DESIGNED stop — read to its end, stopped at the sector budget,
+        // or stopped because every track had already settled. The budget is a
+        // designed stop for exactly the reason [`StopReason`] documents (a forced
+        // track's display sets appear throughout, so a bounded prefix is
+        // representative), and it is the stop that fires on every disc that HAS a
+        // forced track — excluding it from the cache would mean nothing is ever
+        // memoised on precisely those discs.
+        //
+        // A halt or a read fault is different: the cut-off point is arbitrary, so
+        // its evidence is real for THIS title (nothing observed is retracted) but
+        // must not be frozen in as the extent's answer, or one transient fault
+        // would be replayed onto every other playlist sharing the clip.
+        let cacheable = cut_short.is_none_or(StopReason::absence_is_conclusive);
+        for (&pid, t) in trackers.iter() {
+            let ev = TrackEvidence {
+                observed: t.observed(),
+                non_forced: t.settled_not_forced(),
+            };
+            if let Some(slot) = evidence.get_mut(&pid) {
+                slot.merge(ev);
+            }
+            if cacheable {
+                cache.insert((ext.start_lba, ext.sector_count, pid), ev);
+            }
+        }
+        if let Some(reason) = cut_short {
+            stop = reason;
+            break 'outer;
         }
     }
 
-    // Collect the verdicts we are entitled to assert and apply them. A track
-    // absent from the map keeps its vendor-derived flag.
-    //
-    // Two gates, both PER TRACK, because the evidence is per track:
-    //   * `observed()` — saw no display set at all, so nothing is known. (Never
-    //     assert "not forced" from having seen nothing.)
-    //   * on a truncated run, `settled_not_forced()` — the track saw an actual
-    //     non-forced display set, which no further reading could retract, so that
-    //     verdict stands even though the run was cut short. A track that merely
-    //     hadn't YET seen a non-forced set is exactly the claim the truncation
-    //     invalidates, so it is dropped and keeps the vendor flag.
     let conclusive = stop.absence_is_conclusive();
-    let verdicts: HashMap<u16, bool> = trackers
-        .iter()
-        .filter(|(_, t)| t.observed() && (conclusive || t.settled_not_forced()))
-        .map(|(&pid, t)| (pid, t.is_forced()))
-        .collect();
-    // Only memoise a run that reached a designed stop. The cache key is the
-    // extent list, so caching a truncated run would replay one read fault (or one
-    // cancellation) onto every other playlist that shares these clips, and a later
-    // title would never get the chance to re-read them successfully.
-    if conclusive {
-        cache.insert(key, verdicts.clone());
-    } else {
+    let verdicts = verdicts(&evidence, conclusive);
+    if !conclusive {
         tracing::debug!(
             target: "freemkv::scan",
             stop = ?stop,
             sectors_read,
             asserted = verdicts.len(),
             tracks = pg_pids.len(),
-            "forced-subtitle probe truncated; verdicts limited and not cached"
+            "forced-subtitle probe truncated; verdicts limited and truncated extents not cached"
         );
     }
     apply_verdicts(title, &verdicts);
+}
+
+/// Compose the per-track verdicts a run is ENTITLED to assert from the evidence
+/// it gathered. A track absent from the result keeps its vendor-derived flag.
+///
+/// Two gates, both PER TRACK, because the evidence is per track:
+///   * `observed` — saw no display set at all, so nothing is known. (Never assert
+///     "not forced" from having seen nothing.)
+///   * on a truncated run, `non_forced` — the track saw an actual non-forced
+///     display set, which no further reading could retract, so that verdict
+///     stands even though the run was cut short. A track that merely hadn't YET
+///     seen a non-forced set is exactly the claim the truncation invalidates, so
+///     it is dropped and keeps the vendor flag.
+fn verdicts(evidence: &HashMap<u16, TrackEvidence>, conclusive: bool) -> HashMap<u16, bool> {
+    evidence
+        .iter()
+        .filter(|(_, e)| e.observed && (conclusive || e.non_forced))
+        .map(|(&pid, e)| (pid, !e.non_forced))
+        .collect()
 }
 
 /// Set `forced` on every PGS subtitle track named in `verdicts`. A track absent
@@ -435,6 +582,11 @@ mod tests {
     /// A reader that serves a fixed BD-TS byte stream once (across sequential
     /// `read_sectors` calls), then EOF — so the probe's demux→parse→observe→apply
     /// path runs on real synthetic PGS content.
+    ///
+    /// Sector-granular, like every real [`SectorSource`]: a read that is served
+    /// from the payload's short tail zero-pads to the sector boundary and reports
+    /// whole sectors. (The probe accounts in SECTORS, so a source that returned a
+    /// sub-sector byte count could never advance.)
     struct TsReader {
         data: Vec<u8>,
         pos: usize,
@@ -453,7 +605,10 @@ mod tests {
             let n = buf.len().min(self.data.len() - self.pos);
             buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
             self.pos += n;
-            Ok(n)
+            let padded = n.div_ceil(SECTOR_BYTES) * SECTOR_BYTES;
+            let out = padded.min(buf.len());
+            buf[n..out].fill(0);
+            Ok(out)
         }
         fn capacity_sectors(&self) -> u32 {
             self.data.len().div_ceil(SECTOR_BYTES) as u32
@@ -532,6 +687,14 @@ mod tests {
             pos: 0,
         };
         let mut title = pgs_title(pid, false); // vendor label says NOT forced
+        // One sector, which is exactly what the reader serves: an extent that
+        // claims more sectors than the source yields is a SHORT read, and a short
+        // read is (correctly) inconclusive — see
+        // `read_error_after_partial_content_preserves_vendor_forced`.
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 1,
+        }];
         probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
         let Stream::Subtitle(s) = &title.streams[0] else {
             panic!()
@@ -705,7 +868,13 @@ mod tests {
             s.forced,
             "a forced verdict from a budget-bounded prefix must still be applied"
         );
-        assert_eq!(cache.len(), 1, "a conclusive probe is memoised");
+        // One entry per (extent, PGS track): both extents reached a designed stop
+        // (the first was read to its end, the second stopped at the budget), so
+        // both are memoised — the budget is the stop that fires on every disc that
+        // HAS a forced track, so excluding it would memoise nothing there.
+        assert_eq!(cache.len(), 2, "a conclusive probe is memoised per extent");
+        assert!(cache.contains_key(&(0, 4, pid)));
+        assert!(cache.contains_key(&(100, u32::MAX, pid)));
     }
 
     #[test]
@@ -731,9 +900,14 @@ mod tests {
             !s.forced,
             "a verdict from a cancelled probe must not overwrite the vendor flag"
         );
+        // The cancel landed inside the SECOND extent, whose read is therefore an
+        // arbitrary prefix: that extent must not be memoised, or the one
+        // cancellation would be replayed onto every other playlist sharing the
+        // clip. (The first extent WAS read to its end before the cancel, so its
+        // own evidence is sound and keeping it is the point of per-extent keying.)
         assert!(
-            cache.is_empty(),
-            "a cancelled probe must not poison the extent cache"
+            !cache.contains_key(&(100, u32::MAX, pid)),
+            "a cancelled probe must not poison the cancelled extent's cache entry"
         );
     }
 
@@ -747,5 +921,229 @@ mod tests {
         title.streams.clear();
         probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
         assert_eq!(reader.served, 0, "no PGS PIDs → no reads");
+    }
+
+    // ── per-extent, per-track memoisation ───────────────────────────────────
+
+    /// MEASURED: overlapping-but-not-identical extent lists must not re-read the
+    /// shared clips. A disc's playlists share clips without sharing whole extent
+    /// LISTS (00800 = [X, Y], 00801 = [X], 00802 = [Y]), and keying the cache on
+    /// the whole list de-duplicated only exactly-identical playlists: each of the
+    /// three lists missed, so clip X was read twice and Y twice — up to
+    /// PROBE_BUDGET_SECTORS (256 MiB) of optical-drive time per miss.
+    #[test]
+    fn overlapping_extent_lists_read_each_clip_once() {
+        let pid = 0x1200u16;
+        let x = Extent {
+            start_lba: 0,
+            sector_count: 600,
+        };
+        let y = Extent {
+            start_lba: 10_000,
+            sector_count: 900,
+        };
+        let mut reader = EndlessReader { served: 0 };
+        let mut cache = ForcedProbeCache::new();
+
+        let mut both = pgs_title(pid, true);
+        both.extents = vec![x, y];
+        probe_and_set_forced(&mut reader, &mut both, &mut cache, None);
+        let after_both = reader.served;
+        assert_eq!(
+            after_both,
+            x.sector_count + y.sector_count,
+            "the first title reads both clips exactly once"
+        );
+
+        // A playlist over X alone, and one over Y alone: every extent is already
+        // known, so neither costs a single further sector.
+        let mut only_x = pgs_title(pid, true);
+        only_x.extents = vec![x];
+        probe_and_set_forced(&mut reader, &mut only_x, &mut cache, None);
+        let mut only_y = pgs_title(pid, true);
+        only_y.extents = vec![y];
+        probe_and_set_forced(&mut reader, &mut only_y, &mut cache, None);
+        assert_eq!(
+            reader.served, after_both,
+            "clips shared with an already-probed playlist must not be re-read"
+        );
+
+        // And a list that mixes a known extent with a NEW one reads only the new
+        // one.
+        let z = Extent {
+            start_lba: 50_000,
+            sector_count: 300,
+        };
+        let mut mixed = pgs_title(pid, true);
+        mixed.extents = vec![x, z];
+        probe_and_set_forced(&mut reader, &mut mixed, &mut cache, None);
+        assert_eq!(
+            reader.served,
+            after_both + z.sector_count,
+            "a partially-known list reads only the extents it adds"
+        );
+    }
+
+    /// A later playlist that declares MORE PGS tracks over the SAME extents must
+    /// still probe the extra track. With the cache keyed on the extent list alone,
+    /// the verdict map it hit had no entry for the new PID, so that track was never
+    /// probed and silently kept its vendor-label flag — `info` then reported a
+    /// different forced flag for it depending purely on playlist ordering.
+    #[test]
+    fn extra_pgs_track_over_known_extents_is_still_probed() {
+        let ext = Extent {
+            start_lba: 0,
+            sector_count: 600,
+        };
+        let mut reader = EndlessReader { served: 0 };
+        let mut cache = ForcedProbeCache::new();
+
+        let mut one_track = pgs_title(0x1200, true);
+        one_track.extents = vec![ext];
+        probe_and_set_forced(&mut reader, &mut one_track, &mut cache, None);
+        let after_first = reader.served;
+        assert_eq!(after_first, ext.sector_count);
+
+        // Same extents, two declared PGS tracks.
+        let mut two_tracks = pgs_title(0x1200, true);
+        two_tracks.extents = vec![ext];
+        two_tracks.streams.push(Stream::Subtitle(SubtitleStream {
+            pid: 0x1201,
+            codec: Codec::Pgs,
+            language: "fra".into(),
+            forced: true,
+            qualifier: LabelQualifier::None,
+            codec_data: None,
+        }));
+        probe_and_set_forced(&mut reader, &mut two_tracks, &mut cache, None);
+        assert!(
+            reader.served > after_first,
+            "a newly declared PGS track must be probed, not served from a verdict \
+             map that has no entry for it"
+        );
+        assert!(
+            cache.contains_key(&(ext.start_lba, ext.sector_count, 0x1201)),
+            "the new track gets its own per-extent evidence"
+        );
+    }
+
+    /// Records every (lba, count) served and every `set_unit_base` call.
+    struct AlignSpy {
+        reads: Vec<(u32, u16)>,
+        bases: Vec<u32>,
+    }
+    impl SectorSource for AlignSpy {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.reads.push((lba, count));
+            let want = count as usize * SECTOR_BYTES;
+            buf[..want].fill(0);
+            Ok(want)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            u32::MAX
+        }
+        fn set_unit_base(&mut self, lba: u32) {
+            self.bases.push(lba);
+        }
+    }
+
+    /// Every probe read must begin on an AACS aligned-unit boundary measured from
+    /// the extent's own base, and the probe must declare that base to the source.
+    /// A `DecryptingSectorSource` holding AACS keys rejects any other read outright
+    /// (`DecryptFailed`) — and with a 1024-sector chunk (`1024 % 3 == 1`) every
+    /// read after the first was misaligned, so content-based forced detection was
+    /// unreachable past the first chunk of an encrypted disc, silently.
+    #[test]
+    fn probe_reads_stay_on_aacs_unit_boundaries() {
+        let pid = 0x1200u16;
+        // A start_lba that is NOT itself 3-aligned, so absolute `lba % 3` and the
+        // base-relative gate disagree — the case the gate exists for.
+        let base = 4_001u32;
+        let mut reader = AlignSpy {
+            reads: Vec::new(),
+            bases: Vec::new(),
+        };
+        let mut title = pgs_title(pid, true);
+        title.extents = vec![Extent {
+            start_lba: base,
+            sector_count: CHUNK_SECTORS as u32 * 3,
+        }];
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+
+        assert_eq!(
+            reader.bases,
+            vec![base],
+            "the probe must anchor the source's unit gate at the extent's start_lba"
+        );
+        assert!(reader.reads.len() > 1, "more than one chunk was read");
+        for &(lba, _) in &reader.reads {
+            assert!(
+                crate::aacs::content::is_unit_aligned(lba, base),
+                "read at lba {lba} is not on an aligned-unit boundary from base {base}"
+            );
+        }
+    }
+
+    /// A source that serves only `frac` of the sectors requested, never erroring —
+    /// what `PrefetchedSectorSource` does (it returns its producer's batch, not
+    /// `count * 2048`). Records the LBAs it actually served.
+    struct ShortReader {
+        frac: u32,
+        served: Vec<(u32, u32)>,
+    }
+    impl SectorSource for ShortReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let give = (count as u32 / self.frac).max(1);
+            self.served.push((lba, give));
+            let n = give as usize * SECTOR_BYTES;
+            buf[..n].fill(0);
+            Ok(n)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            u32::MAX
+        }
+    }
+
+    /// A short-but-nonzero read must advance by what was READ, not by what was
+    /// requested. Advancing by the request skipped the unread tail of every chunk
+    /// — silently, with `StopReason` still `Exhausted`, so the absence-based
+    /// forced verdict was asserted (and memoised) over sectors nobody read.
+    #[test]
+    fn short_reads_do_not_skip_sectors() {
+        let pid = 0x1200u16;
+        let count = CHUNK_SECTORS as u32 * 2;
+        let mut reader = ShortReader {
+            frac: 4,
+            served: Vec::new(),
+        };
+        let mut title = pgs_title(pid, true);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: count,
+        }];
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+
+        // The served ranges must tile the extent exactly: contiguous, no gaps.
+        let mut next = 0u32;
+        for &(lba, given) in &reader.served {
+            assert_eq!(lba, next, "gap: sectors {next}..{lba} were never read");
+            next += given;
+        }
+        assert_eq!(
+            next, count,
+            "every sector of the extent must be read when the source short-reads"
+        );
     }
 }

@@ -142,6 +142,17 @@ impl PrefetchedSectorSource {
                 source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
             });
         }
+        // A zero alignment is the sibling programming error, and it is worse: the
+        // producer thread reaches `remaining % unit_align` and panics with a
+        // divide-by-zero, which `catch_unwind` then reports as
+        // `DemuxThreadPanicked` — a panic printed through the process hook and a
+        // misleading error, out of a public constructor that returned `Ok`. Reject
+        // it here, exactly as `batch_sectors == 0` is rejected.
+        if unit_align == 0 {
+            return Err(crate::error::Error::IoError {
+                source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
+            });
+        }
         // Accumulate in u64 then clamp: extents can derive from
         // untrusted nav/MPLS/UDF data, so a naive u32 `sum()` could
         // panic in debug / wrap in release on a hostile total. The
@@ -665,6 +676,29 @@ mod tests {
     fn zero_batch_rejected() {
         let err = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 0, None);
         assert!(err.is_err(), "zero batch_sectors must be rejected");
+    }
+
+    /// `unit_align == 0` must be rejected by the constructor, not turned into a
+    /// divide-by-zero panic on the producer thread. Before the guard,
+    /// `new_with_events` returned `Ok` and the producer evaluated
+    /// `remaining % 0`, panicking ("attempt to calculate the remainder with a
+    /// divisor of zero"); `catch_unwind` then reported the read as
+    /// `DemuxThreadPanicked` instead of the `InvalidInput` its sibling parameter
+    /// gets — a panic printed out of a public constructor's own thread.
+    #[test]
+    fn zero_unit_align_rejected() {
+        let res = PrefetchedSectorSource::new_with_events(
+            EndlessZeroSource,
+            big_extent(),
+            4096,
+            0,
+            None,
+            None,
+        );
+        let Err(crate::error::Error::IoError { source }) = res else {
+            panic!("zero unit_align must be rejected with InvalidInput");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     /// More than 3 sequential direct `read_sectors` calls must succeed. The

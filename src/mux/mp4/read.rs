@@ -35,6 +35,17 @@ const MAX_TRACKS: usize = 512;
 /// hostile file's allocation without truncating any legitimate track.
 const MAX_SAMPLE_COUNT: usize = 1 << 24;
 
+/// Smallest number of FILE bytes one indexed sample is assumed to occupy — the
+/// divisor that turns `file_len` into a sample-count budget (see `from_reader`).
+///
+/// Only `vide` and `soun` tracks are indexed here, and no real coded video or
+/// audio access unit is anywhere near this small: the shortest legal AC-3 frame is
+/// 128 bytes, an AAC frame is hundreds, and a video sample carries at least a NAL
+/// header plus slice data. A 2-hour title runs to thousands of file bytes per
+/// sample, so this cannot truncate a genuine track — it only stops a crafted
+/// sample table from claiming more samples than the file could possibly hold.
+const MIN_FILE_BYTES_PER_SAMPLE: u64 = 16;
+
 /// Absolute ceiling on a single allocation sized from an untrusted MP4 field (a
 /// per-sample buffer or the `moov` payload). The EOF check alone is not enough:
 /// `file_len` is cheaply inflatable with a sparse file (`truncate -s 8G`), so a
@@ -98,13 +109,16 @@ impl<R: Read + Seek> Mp4Reader<R> {
         // crafted file with a fixed-size `stsz` claiming count=0xFFFFFFFF can't
         // inflate the `sizes`/`Vec<SampleRef>` allocations past the file's own size
         // (a genuine large title has file_len ≫ sample count, so it is unaffected).
-        // NOTE on the bound this actually gives: each indexed sample costs about
-        // 52 bytes of RAM (SampleRef 40 + u32 size 4 + u64 offset 8, plus 4 each
-        // for the expanded stts/ctts), so the ceiling is ~52x file_len, not 1x —
-        // capped by MAX_SAMPLE_COUNT. That is still a real bound (a 1 MiB crafted
-        // file cannot reach the 16M-sample ceiling), just not the "past the file's
-        // own size" the previous comment implied.
-        let mut sample_budget = MAX_SAMPLE_COUNT.min(file_len.min(usize::MAX as u64) as usize);
+        // The bound is in file BYTES PER SAMPLE, not in samples: each indexed
+        // sample costs ~60 bytes of RAM (SampleRef 40 + u32 size 4 + u64 offset 8,
+        // plus 4 each for the expanded stts/ctts), so a budget of one sample per
+        // file byte still let a 16 MiB crafted file (a fixed-size `stsz` declaring
+        // 16M one-byte samples, a one-entry stsc/stco/stts) force a ~1 GiB eager
+        // allocation and a 16M-element sort before a single frame was read — a 64x
+        // amplification. Dividing by MIN_FILE_BYTES_PER_SAMPLE caps the
+        // amplification at ~4x instead.
+        let mut sample_budget = MAX_SAMPLE_COUNT
+            .min((file_len / MIN_FILE_BYTES_PER_SAMPLE).min(usize::MAX as u64) as usize);
 
         // Bound the scan at MAX_TRACKS *matches* so a crafted moov packed with tiny
         // (8-byte) trak headers can't force the scan to materialize a Vec far
@@ -1341,10 +1355,10 @@ mod tests {
     /// NOT the 16M `MAX_SAMPLE_COUNT` ceiling. Mutation check: revert the budget
     /// to a bare `MAX_SAMPLE_COUNT` and this file yields ~16M samples, failing the
     /// `<= file_len` (and `< MAX_SAMPLE_COUNT`) assertions below.
-    #[test]
-    fn stsz_sample_count_bounded_by_file_len() {
-        use std::io::Cursor;
-        // A minimal audio trak, but with a fixed-size stsz lying about its count.
+    /// A minimal-but-complete audio `trak` whose fixed-size `stsz` LIES about its
+    /// sample count (`u32::MAX`), with an stsc/stts wide enough to place whatever
+    /// count survives the budget. The shape the sample-table budget bounds.
+    fn audio_trak_hostile_count() -> Vec<u8> {
         let mdhd = {
             let mut p = vec![0u8; 24];
             p[12..16].copy_from_slice(&48_000u32.to_be_bytes()); // timescale
@@ -1410,6 +1424,13 @@ mod tests {
         mdia.extend_from_slice(&hdlr);
         mdia.extend_from_slice(&minf);
         let trak = mp4_box(b"trak", &mp4_box(b"mdia", &mdia));
+        trak
+    }
+
+    #[test]
+    fn stsz_sample_count_bounded_by_file_len() {
+        use std::io::Cursor;
+        let trak = audio_trak_hostile_count();
         let moov = mp4_box(b"moov", &trak);
 
         let file_len = moov.len() as u64;
@@ -1418,15 +1439,49 @@ mod tests {
             "fixture stays a few hundred bytes ({file_len})"
         );
         let rd = Mp4Reader::from_reader(Cursor::new(moov), "hostile".into()).unwrap();
-        // The index must be bounded by the file's byte length, NOT the 16M ceiling.
+        // The index must be bounded by the file's byte length in FILE BYTES PER
+        // SAMPLE, not one sample per byte: each indexed sample costs ~60 bytes of
+        // RAM, so a one-sample-per-byte budget still let a 16 MiB crafted file
+        // force a ~1 GiB allocation (64x amplification) before a frame was read.
         assert!(
-            (rd.samples.len() as u64) <= file_len,
-            "sample count {} must be bounded by file_len {file_len}, not the count lie",
-            rd.samples.len()
+            (rd.samples.len() as u64) <= file_len / MIN_FILE_BYTES_PER_SAMPLE,
+            "sample count {} must be bounded by file_len/{MIN_FILE_BYTES_PER_SAMPLE} \
+             ({}), not by the count lie",
+            rd.samples.len(),
+            file_len / MIN_FILE_BYTES_PER_SAMPLE
         );
         assert!(
             rd.samples.len() < MAX_SAMPLE_COUNT,
             "a tiny file must not allocate the 16M MAX_SAMPLE_COUNT ceiling"
+        );
+    }
+
+    /// The RAM amplification the byte-per-sample budget actually bounds: a small
+    /// crafted file whose `stsz` claims `u32::MAX` samples must not force an eager
+    /// multi-hundred-MB index. At ~60 bytes of RAM per indexed sample, a budget of
+    /// one sample per file byte gave ~60x the input size; the assertion below pins
+    /// the amplification factor rather than a raw count, so it fails if the budget
+    /// ever goes back to counting samples per byte.
+    #[test]
+    fn sample_index_ram_is_bounded_by_a_multiple_of_the_file() {
+        use std::io::Cursor;
+        // ~64 KiB of `free` padding so file_len is large enough for the ratio to
+        // be meaningful, with the same lying stsz as above.
+        let mut traks = Vec::new();
+        traks.extend_from_slice(&audio_trak_hostile_count());
+        let mut file = mp4_box(b"moov", &traks);
+        file.extend_from_slice(&mp4_box(b"free", &vec![0u8; 64 * 1024]));
+        let file_len = file.len() as u64;
+
+        let rd = Mp4Reader::from_reader(Cursor::new(file), "amp".into()).unwrap();
+        // ~60 bytes of RAM per sample; assert the index cannot exceed ~4x the file.
+        const RAM_PER_SAMPLE: u64 = 60;
+        let ram = rd.samples.len() as u64 * RAM_PER_SAMPLE;
+        assert!(
+            ram <= file_len * 4,
+            "sample index RAM {ram} B from a {file_len} B file is more than 4x \
+             amplification ({} samples)",
+            rd.samples.len()
         );
     }
 
