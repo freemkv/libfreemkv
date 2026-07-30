@@ -41,6 +41,23 @@
 
 ### Fixed
 
+- **A corrupt `mkv://` input is no longer reported as a title worth silently
+  skipping.** `Error::MkvInvalid` (E6008) carried two unrelated meanings: the
+  genuine "this title produced no muxable frames" stub — which
+  `is_skippable_title_stub` classifies as skippable, so an all-titles rip drops
+  the title and finishes the rest — and *every* malformed-input rejection in the
+  MKV read path. A truncated file, a bad VINT, a cluster timestamp past
+  `i64::MAX`, a BlockGroup child overrunning its group: all of them classified as
+  skippable, so a broken source was passed over by a run that then exited
+  successfully. The read path now raises `Error::MkvSourceInvalid`
+  (**E9053**) — the counterpart of `Mp4Invalid` (E9049) — and the writer's
+  unrepresentable-element-size guards raise `Error::MkvUnencodable` (**E9054**).
+  Neither is skippable. `E6008` now means only the no-muxable-frames stub (the
+  mux driver's headers-never-resolved gate and the MKV muxer's zero-frame
+  `finish()` guard). The `json://` sink's metadata-encoding guard, which also
+  raised `MkvInvalid`, now raises `NoMetadata` (E9008) like `mux::meta`'s.
+  Front-ends rendering error strings need entries for E9053 and E9054 (and for
+  E9051 / E9052, split off `E6008` earlier in this cycle for the same reason).
 - **The FMTS (AACS 2.1) forensic key resolution now runs once per disc, not once
   per title.** `Disc::resolve_content_key_map` resolves every title, and the FMTS
   branch ran ahead of everything else — so each playlist re-walked the UDF

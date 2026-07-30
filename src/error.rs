@@ -165,6 +165,29 @@ pub const E_MUX_HEADER_BUFFER_EXCEEDED: u16 = 9051;
 /// successfully — the same conflation [`E_MUX_HEADER_BUFFER_EXCEEDED`] exists to
 /// avoid.
 pub const E_MKV_LACING_INVALID: u16 = 9052;
+/// An `mkv://` SOURCE file is malformed or truncated — the EBML/Matroska reader
+/// rejected it (bad element ID or VINT size, an unknown-size element where a
+/// finite one is required, a child overrunning its parent, a truncated element
+/// body, a non-UTF-8 string element, an element size above the parser's
+/// allocation caps, an out-of-range TimestampScale / cluster timestamp / track
+/// number).
+///
+/// The read-path counterpart of [`E_MP4_INVALID`], and deliberately NOT
+/// [`E_MKV_INVALID`]: [`is_skippable_title_stub`] classifies `E_MKV_INVALID` as
+/// a title that yielded no muxable frames, which an all-titles rip may skip
+/// while finishing the rest. A corrupt or truncated input file is a FAILURE, not
+/// a stub — reporting it as skippable would let a broken source be silently
+/// passed over by a run that then exits successfully. The same conflation
+/// [`E_MUX_HEADER_BUFFER_EXCEEDED`] and [`E_MKV_LACING_INVALID`] exist to avoid.
+pub const E_MKV_SOURCE_INVALID: u16 = 9053;
+/// The Matroska WRITER was asked to emit something EBML cannot represent: an
+/// element body at or above the 56-bit VINT payload limit (which would encode
+/// byte-for-byte as the reserved "unknown size" marker or not fit at all), or a
+/// master-element size placeholder that no longer lies inside the buffer being
+/// patched. An output-side limit, not a property of any input — so neither
+/// [`E_MKV_INVALID`] (a no-frames stub) nor [`E_MKV_SOURCE_INVALID`] (a corrupt
+/// source) describes it, and it must not be classified as skippable.
+pub const E_MKV_UNENCODABLE: u16 = 9054;
 pub const E_EXTENT_NOT_UNIT_ALIGNED: u16 = 9030;
 /// `mp4://` output but the title has no (primary) video track to carry.
 pub const E_MP4_NO_VIDEO_TRACK: u16 = 9048;
@@ -305,7 +328,25 @@ pub enum Error {
         count: usize,
     },
     IfoParse,
+    /// A title produced NO muxable frames: the mux driver's pump ended without
+    /// any video track's `codec_private` resolving, or the MKV muxer reached
+    /// `finish()` with zero frames written. The canonical case is an empty
+    /// nav/menu PGC stub, and [`is_skippable_title_stub`] classifies this code as
+    /// skippable so an all-titles rip drops the stub and finishes the rest.
+    ///
+    /// This meaning is EXCLUSIVE. Malformed `mkv://` source input is
+    /// [`Error::MkvSourceInvalid`]; an unrepresentable element on the write side
+    /// is [`Error::MkvUnencodable`]. Routing either of those here would report a
+    /// broken file as a title worth silently skipping.
     MkvInvalid,
+    /// An `mkv://` SOURCE file is malformed or truncated — the EBML/Matroska
+    /// reader rejected it. NOT [`Error::MkvInvalid`]: see
+    /// [`E_MKV_SOURCE_INVALID`].
+    MkvSourceInvalid,
+    /// The Matroska WRITER cannot encode an element size in EBML (body at or
+    /// above the 56-bit VINT limit, or a stale master-size placeholder). NOT
+    /// [`Error::MkvInvalid`]: see [`E_MKV_UNENCODABLE`].
+    MkvUnencodable,
     /// An `mkv://` source Block's lacing header does not describe its payload —
     /// the frames packed into that Block cannot be separated. NOT
     /// [`Error::MkvInvalid`]: see [`E_MKV_LACING_INVALID`].
@@ -617,6 +658,8 @@ impl Error {
             Error::DiscTitleRange { .. } => E_DISC_TITLE_RANGE,
             Error::IfoParse => E_IFO_PARSE,
             Error::MkvInvalid => E_MKV_INVALID,
+            Error::MkvSourceInvalid => E_MKV_SOURCE_INVALID,
+            Error::MkvUnencodable => E_MKV_UNENCODABLE,
             Error::MkvLacingInvalid => E_MKV_LACING_INVALID,
             Error::NoStreams => E_NO_STREAMS,
             Error::SelectionPidUnknown { .. } => E_SELECTION_PID_UNKNOWN,
@@ -912,6 +955,12 @@ impl From<Error> for std::io::Error {
             // 9052 MkvLacingInvalid: a source Block's lacing header does not
             // describe its own payload — malformed input data.
             E_MKV_LACING_INVALID => std::io::ErrorKind::InvalidData,
+            // 9053 MkvSourceInvalid: the mkv:// source file is malformed or
+            // truncated — invalid input data.
+            E_MKV_SOURCE_INVALID => std::io::ErrorKind::InvalidData,
+            // 9054 MkvUnencodable: the writer was asked for an element size EBML
+            // cannot represent. An output-side limit, not bad input.
+            E_MKV_UNENCODABLE => std::io::ErrorKind::InvalidData,
             // mp4:// demux errors: a malformed/truncated source file
             // (E_MP4_INVALID), or a source whose tracks the mux can't use — no
             // video track / missing codec-private config. All are invalid data.
@@ -970,6 +1019,16 @@ fn io_error_code(e: &std::io::Error) -> Option<u16> {
 ///
 /// This replaces the CLI's `E7023`/`E6008` string-match with a typed check on
 /// the [`io::Error`](std::io::Error) `mux_stream` returns.
+///
+/// # Not skippable
+///
+/// A BROKEN input is not a stub. [`Error::MkvSourceInvalid`] (malformed or
+/// truncated `mkv://` source), [`Error::MkvLacingInvalid`], and
+/// [`Error::MkvUnencodable`] all used to be raised as [`Error::MkvInvalid`] and
+/// therefore landed in this set, so a corrupt source was reported as a title
+/// worth silently passing over by a run that then exited successfully. They now
+/// carry their own codes and are fatal here — as is
+/// [`Error::MuxHeaderBufferExceeded`].
 pub fn is_skippable_title_stub(e: &std::io::Error) -> bool {
     matches!(io_error_code(e), Some(E_MKV_INVALID | E_CSS_KEY_MISSING))
 }
@@ -1093,13 +1152,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_skippable_title_stub_matches_only_the_two_stub_codes() {
-        // The two skippable per-title stub codes, round-tripped through io::Error
-        // exactly as `mux_stream` returns them.
+    fn is_skippable_title_stub_excludes_malformed_mkv_input() {
+        // The two skippable per-title codes, round-tripped through io::Error
+        // exactly as `mux_stream` returns them. `MkvInvalid` now means ONLY the
+        // no-muxable-frames stub (the driver's headers-never-resolved gate and the
+        // MKV muxer's zero-frame `finish()` guard) — the meaning the doc on this
+        // predicate has always described.
         let mkv: std::io::Error = Error::MkvInvalid.into();
         let css: std::io::Error = Error::CssKeyMissing.into();
         assert!(is_skippable_title_stub(&mkv));
         assert!(is_skippable_title_stub(&css));
+
+        // A malformed / truncated `mkv://` SOURCE is a FAILURE, not a stub. Every
+        // read-path rejection in `mux::mkvstream` and `mux::ebml`'s read
+        // primitives used to be raised as `MkvInvalid`, so a bad VINT, a cluster
+        // timestamp past i64::MAX or a BlockGroup child overrunning its group all
+        // landed in the skippable set above: an all-titles rip would pass silently
+        // over a corrupt input and exit reporting success. Reverting
+        // `Error::MkvSourceInvalid` back to `Error::MkvInvalid` at those raise
+        // sites turns this assertion red.
+        let corrupt: std::io::Error = Error::MkvSourceInvalid.into();
+        assert!(
+            !is_skippable_title_stub(&corrupt),
+            "a malformed mkv:// source must never classify as a skippable stub, got {corrupt}"
+        );
+        // Same for the write side: an element size EBML cannot represent is an
+        // output-side limit, not an empty nav/menu stub.
+        let unencodable: std::io::Error = Error::MkvUnencodable.into();
+        assert!(!is_skippable_title_stub(&unencodable));
+        // And for the lacing rejection carved out in the same spirit.
+        let lacing: std::io::Error = Error::MkvLacingInvalid.into();
+        assert!(!is_skippable_title_stub(&lacing));
 
         // A different coded error is NOT skippable (kills a "match anything with
         // an E-code" mutant).
@@ -1274,6 +1357,19 @@ mod tests {
         assert_eq!(mapped(Error::M2tsPacketMalformed), ErrorKind::InvalidData);
         // 9047 DiscCapacityMalformed → InvalidData
         assert_eq!(mapped(Error::DiscCapacityMalformed), ErrorKind::InvalidData);
+        // 9053/9054: the mkv:// read-path and write-path rejections split off
+        // `MkvInvalid`. Both are InvalidData, and both must render as a bare code
+        // with no English (this crate has none).
+        assert_eq!(mapped(Error::MkvSourceInvalid), ErrorKind::InvalidData);
+        assert_eq!(mapped(Error::MkvUnencodable), ErrorKind::InvalidData);
+        assert_eq!(
+            Error::MkvSourceInvalid.to_string(),
+            format!("E{}", E_MKV_SOURCE_INVALID)
+        );
+        assert_eq!(
+            Error::MkvUnencodable.to_string(),
+            format!("E{}", E_MKV_UNENCODABLE)
+        );
     }
 
     /// `Error::IoError` must round-trip back to the *original*
@@ -1409,6 +1505,8 @@ mod tests {
             E_MUX_EMPTY,
             E_MUX_HEADER_BUFFER_EXCEEDED,
             E_MKV_LACING_INVALID,
+            E_MKV_SOURCE_INVALID,
+            E_MKV_UNENCODABLE,
             E_MP4_NO_VIDEO_TRACK,
             E_MP4_INVALID,
             E_MP4_MISSING_CODEC_PRIVATE,
@@ -1504,6 +1602,8 @@ mod tests {
                 E_MUX_HEADER_BUFFER_EXCEEDED,
             ),
             (Error::MkvLacingInvalid, E_MKV_LACING_INVALID),
+            (Error::MkvSourceInvalid, E_MKV_SOURCE_INVALID),
+            (Error::MkvUnencodable, E_MKV_UNENCODABLE),
             (Error::Mp4NoVideoTrack, E_MP4_NO_VIDEO_TRACK),
             (Error::Mp4Invalid, E_MP4_INVALID),
             (Error::Mp4MissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),
