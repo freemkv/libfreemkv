@@ -1035,7 +1035,14 @@ impl AudioChannels {
             AudioChannels::Surround51 => 6,
             AudioChannels::Surround61 => 7,
             AudioChannels::Surround71 => 8,
-            AudioChannels::Unknown => 6,
+            // 0, not 6. An unknown layout has no channel count, and returning a
+            // plausible one made every caller responsible for remembering to
+            // check the variant first — a trap, and one this crate walked into:
+            // the json:// sink reported a confident 5.1 for audio its own
+            // neighbouring fields called "unknown". 0 is the value Matroska and
+            // the sinks already coerce Unknown to, and unlike 6 it is obviously
+            // wrong if it ever reaches output.
+            AudioChannels::Unknown => 0,
         }
     }
 
@@ -1082,7 +1089,9 @@ impl SampleRate {
             SampleRate::S96 => 96000.0,
             SampleRate::S176_4 => 176400.0,
             SampleRate::S192 => 192000.0,
-            SampleRate::Unknown => 48000.0,
+            // 0.0, not 48000.0 — see AudioChannels::count. A fabricated rate is
+            // indistinguishable from a real one; a zero is not.
+            SampleRate::Unknown => 0.0,
         }
     }
 

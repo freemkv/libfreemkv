@@ -22,10 +22,7 @@
 //! `Disc`-level dump ([`dump_disc`]) covers everything that survives
 //! lowering: titles, streams, the picked main feature, and AACS state.
 
-use crate::disc::{
-    AudioChannels, ColorSpace, Disc, DiscTitle, FrameRate, HdrFormat, Resolution, SampleRate,
-    Stream,
-};
+use crate::disc::{ColorSpace, Disc, DiscTitle, FrameRate, HdrFormat, Resolution, Stream};
 use crate::ifo::{CellCategory, DvdTitle};
 
 const DIAG: &str = "freemkv::diag";
@@ -95,36 +92,12 @@ pub fn hdr_str(h: HdrFormat) -> &'static str {
     }
 }
 
-/// Channel count from an [`AudioChannels`] layout (what lands in the MKV
-/// `Channels` element).
-pub fn channel_count(ch: AudioChannels) -> u8 {
-    match ch {
-        AudioChannels::Mono => 1,
-        AudioChannels::Stereo => 2,
-        AudioChannels::Stereo21 => 3,
-        AudioChannels::Quad => 4,
-        AudioChannels::Surround50 => 5,
-        AudioChannels::Surround51 => 6,
-        AudioChannels::Surround61 => 7,
-        AudioChannels::Surround71 => 8,
-        AudioChannels::Unknown => 0,
-    }
-}
-
-/// Sample-rate in Hz for a [`SampleRate`].
-pub fn sample_rate_hz(s: SampleRate) -> u32 {
-    match s {
-        SampleRate::S44_1 => 44100,
-        SampleRate::S48 => 48000,
-        SampleRate::S88_2 => 88200,
-        SampleRate::S96 => 96000,
-        SampleRate::S176_4 => 176400,
-        SampleRate::S192 => 192000,
-        SampleRate::S48_96 => 96000,
-        SampleRate::S48_192 => 192000,
-        SampleRate::Unknown => 0,
-    }
-}
+// `channel_count` and `sample_rate_hz` lived here as a third copy of the
+// AudioChannels/SampleRate mappings. They were the only HONEST copy — returning
+// 0 for Unknown where the canonical accessors fabricated 6 channels at 48 kHz —
+// and their only caller was the trace line below, in this same file. The
+// canonical accessors are honest now, so the duplicates are gone rather than
+// left to drift a fourth time.
 
 // ── DVD cell-category dump (from the IFO scan, pre-lowering) ─────────────────
 
@@ -610,8 +583,8 @@ fn dump_title(ti: usize, title: &DiscTitle) {
                 a.pid,
                 a.codec,
                 a.channels,
-                channel_count(a.channels),
-                sample_rate_hz(a.sample_rate),
+                a.channels.count(),
+                a.sample_rate.hz(),
                 a.language,
                 a.secondary,
             ),
@@ -631,6 +604,10 @@ fn dump_title(ti: usize, title: &DiscTitle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Needed only by the tests: the production code in this file no longer names
+    // these types directly, since the local channel/sample-rate duplicates were
+    // deleted in favour of the canonical accessors.
+    use crate::disc::{AudioChannels, SampleRate};
 
     #[test]
     fn res_str_keeps_interlace_marker() {
@@ -656,18 +633,33 @@ mod tests {
         assert_eq!(hdr_str(HdrFormat::Sdr), "SDR");
     }
 
+    /// Moved from the deleted local duplicates onto the canonical accessors,
+    /// with the Unknown case added — which is the whole point of the change.
     #[test]
-    fn channel_count_matches_layout() {
-        assert_eq!(channel_count(AudioChannels::Mono), 1);
-        assert_eq!(channel_count(AudioChannels::Stereo), 2);
-        assert_eq!(channel_count(AudioChannels::Surround51), 6);
-        assert_eq!(channel_count(AudioChannels::Surround71), 8);
+    fn channel_count_matches_layout_and_is_zero_when_unknown() {
+        assert_eq!(AudioChannels::Mono.count(), 1);
+        assert_eq!(AudioChannels::Stereo.count(), 2);
+        assert_eq!(AudioChannels::Surround51.count(), 6);
+        assert_eq!(AudioChannels::Surround71.count(), 8);
+        // The one that matters. This used to return 6, which is indistinguishable
+        // from a real 5.1 track and left every caller responsible for checking
+        // the variant first.
+        assert_eq!(
+            AudioChannels::Unknown.count(),
+            0,
+            "an unknown layout must not report a plausible channel count"
+        );
     }
 
     #[test]
-    fn sample_rate_hz_values() {
-        assert_eq!(sample_rate_hz(SampleRate::S48), 48000);
-        assert_eq!(sample_rate_hz(SampleRate::S96), 96000);
+    fn sample_rate_hz_values_and_zero_when_unknown() {
+        assert_eq!(SampleRate::S48.hz(), 48000.0);
+        assert_eq!(SampleRate::S96.hz(), 96000.0);
+        assert_eq!(
+            SampleRate::Unknown.hz(),
+            0.0,
+            "an unknown sample rate must not report a plausible 48 kHz"
+        );
     }
 
     #[test]
