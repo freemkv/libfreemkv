@@ -98,6 +98,11 @@ struct ReadState {
 /// stream — past it we build with no measured field order (logged) rather than
 /// buffer unbounded.
 const MAX_PENDING_FRAMES: usize = 4096;
+/// Companion byte cap on the same pending buffer. The frame count alone does not
+/// bound memory: frames are arbitrarily large, and a UHD video frame runs to a
+/// few hundred KB, so 4096 of them is over a gigabyte. 64 MiB is far more than
+/// the handful of frames a real audio-only prefix produces, and finite.
+const MAX_PENDING_BYTES: usize = 64 << 20;
 
 enum Mode {
     Write(WriteMode),
@@ -140,6 +145,10 @@ struct PendingMux {
     /// carries an optional MVC dependent-view `BlockAdditional` (present only
     /// for a 3D base-view frame that was already paired before activation).
     buffered: Vec<(crate::pes::PesFrame, Option<Vec<u8>>)>,
+    /// Running payload total of `buffered`, so the cap can bound bytes and not
+    /// only frame count. Maintained on push; `buffered` is drained exactly once,
+    /// at activation, after which neither field is consulted again.
+    buffered_bytes: usize,
 }
 
 /// Matroska container stream.
@@ -439,6 +448,7 @@ impl MkvStream {
                 video_track,
                 opening_capture_path: output_path.map(|p| p.to_path_buf()),
                 buffered: Vec::new(),
+                buffered_bytes: 0,
             }))),
         })
     }
@@ -535,7 +545,9 @@ impl MkvStream {
                     // No video track: nothing to wait for — build on frame one.
                     None => true,
                 };
-                (is_video || p.buffered.len() >= MAX_PENDING_FRAMES, is_video)
+                let capped =
+                    p.buffered.len() >= MAX_PENDING_FRAMES || p.buffered_bytes >= MAX_PENDING_BYTES;
+                (is_video || capped, is_video)
             }
             _ => unreachable!("guarded above"),
         };
@@ -550,8 +562,11 @@ impl MkvStream {
             Ok(())
         } else {
             if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
-                p.buffered
-                    .push((frame.clone(), additional.map(|a| a.to_vec())));
+                let add = additional.map(|a| a.to_vec());
+                p.buffered_bytes = p
+                    .buffered_bytes
+                    .saturating_add(frame.data.len() + add.as_ref().map_or(0, |a| a.len()));
+                p.buffered.push((frame.clone(), add));
             }
             Ok(())
         }
@@ -1393,7 +1408,17 @@ fn split_lacing(lacing: u8, body: &[u8]) -> Option<Vec<&[u8]>> {
                 return None;
             }
             let each = rest.len() / n;
-            return Some(rest.chunks(each.max(1)).take(n).collect());
+            // A zero-size frame carries no data and cannot be a valid frame, so
+            // `each == 0` is malformed rather than "n empty frames". It has to be
+            // rejected explicitly: 0 % n == 0 passes the divisibility check above,
+            // and `chunks` on an empty slice yields nothing whatever its argument,
+            // so clamping the chunk width instead returned Some(vec![]) — zero
+            // frames where the Lacing Head declared n, dropping the whole lace
+            // silently with no error raised.
+            if each == 0 {
+                return None;
+            }
+            return Some(rest.chunks(each).take(n).collect());
         }
         LACING_XIPH => {
             // §10.3.2: each size is a run of 0xFF octets (255 each) terminated
@@ -1610,6 +1635,29 @@ fn block_vint(d: &[u8]) -> (u64, usize) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A fixed lace whose body is empty declares n frames and carries none. It is
+    /// malformed, and must be rejected rather than silently yielding zero frames:
+    /// 0 % n == 0 passes the divisibility check, and `chunks` on an empty slice
+    /// yields nothing whatever width it is given, so the whole lace vanished with
+    /// no error raised and the caller saw a clean short block.
+    #[test]
+    fn fixed_lacing_with_an_empty_body_is_malformed_not_zero_frames() {
+        // Lacing Head only: count_minus_one = 2, i.e. three frames declared,
+        // followed by no payload at all.
+        assert_eq!(super::split_lacing(super::LACING_FIXED, &[2u8]), None);
+        // Same shape for a single declared frame.
+        assert_eq!(super::split_lacing(super::LACING_FIXED, &[0u8]), None);
+    }
+
+    /// The non-degenerate fixed lace still splits evenly, so the guard above did
+    /// not tighten the valid case.
+    #[test]
+    fn fixed_lacing_splits_an_evenly_divisible_body() {
+        let laced = super::split_lacing(super::LACING_FIXED, &[2u8, 1, 2, 3, 4, 5, 6])
+            .expect("three 2-byte frames is a well-formed fixed lace");
+        assert_eq!(laced, vec![&[1u8, 2][..], &[3, 4][..], &[5, 6][..]]);
+    }
     use super::*;
     use crate::pes::Stream as _;
     use std::io::Cursor;

@@ -1098,8 +1098,16 @@ fn read_directory(
                     });
                 }
 
-                // Read the ICB to get file size
-                let file_size = read_file_size(reader, meta_start, icb_lba).unwrap_or(0);
+                // Read the ICB to get file size. A read failure here must
+                // propagate, not become a size of zero: this function already
+                // fails hard on the budget guard above, and a file reported as
+                // zero bytes is indistinguishable from a genuinely empty one, so
+                // an unreadable ICB on a damaged disc would silently change which
+                // titles a caller considers present. `read_file_size` still
+                // returns Ok(0) for an ICB whose tag is neither File Entry (261)
+                // nor Extended File Entry (266), which is a real zero, not a
+                // failure.
+                let file_size = read_file_size(reader, meta_start, icb_lba)?;
 
                 if is_dir && depth < MAX_DIR_DEPTH {
                     // Cycle guard: skip any ICB LBA we have already opened as
@@ -2219,6 +2227,75 @@ mod tests {
         let mut raw = vec![8u8];
         raw.extend_from_slice(b"BDMV");
         assert_eq!(parse_udf_name(&raw), "BDMV");
+    }
+
+    /// A disc read failure while fetching an entry's ICB must propagate, not
+    /// become a file size of zero. A zero size is indistinguishable from a
+    /// genuinely empty file, so an unreadable ICB on a damaged disc silently
+    /// changed which titles a caller saw as present.
+    #[test]
+    fn read_directory_propagates_an_icb_read_failure_instead_of_size_zero() {
+        /// Serves every sector from an inner MemReader except one, which fails
+        /// the way a bad sector does.
+        struct FailingAt {
+            inner: MemReader,
+            fail_lba: u32,
+        }
+        impl SectorSource for FailingAt {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> Result<usize> {
+                if lba == self.fail_lba {
+                    return Err(Error::DiscRead {
+                        sector: lba as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                self.inner.read_sectors(lba, count, buf, recovery)
+            }
+        }
+
+        // One directory holding one file entry whose ICB lives at LBA 7.
+        let mut dir = [0u8; 2048];
+        let mut name_bytes = vec![8u8];
+        name_bytes.extend_from_slice(b"CLPI");
+        dir[0..2].copy_from_slice(&257u16.to_le_bytes());
+        dir[18] = 0x00; // a file, not a parent, not a dir
+        dir[19] = name_bytes.len() as u8;
+        dir[24..28].copy_from_slice(&7u32.to_le_bytes());
+        dir[38..38 + name_bytes.len()].copy_from_slice(&name_bytes);
+
+        let mut inner = MemReader::new();
+        inner.put(5, build_efe_icb(2048, 2048, 60));
+        inner.put(60, dir);
+        inner.put(7, build_efe_icb(123, 2048, 0));
+
+        // Sanity: with every sector readable the entry parses and carries its
+        // real size, so the failure below is the ICB read and nothing else.
+        let ok = read_directory(&mut inner, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("dir parses when every sector reads");
+        assert_eq!(ok.entries.len(), 1);
+        assert_eq!(ok.entries[0].size, 123);
+
+        let mut reader = FailingAt {
+            inner: MemReader::new(),
+            fail_lba: 7,
+        };
+        reader.inner.put(5, build_efe_icb(2048, 2048, 60));
+        reader.inner.put(60, dir);
+        reader.inner.put(7, build_efe_icb(123, 2048, 0));
+
+        let err = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect_err("an unreadable entry ICB must fail the scan, not report size 0");
+        assert!(
+            matches!(err, Error::DiscRead { sector: 7, .. }),
+            "the propagated error must name the sector that failed, got {err:?}"
+        );
     }
 
     #[test]

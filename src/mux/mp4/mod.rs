@@ -59,9 +59,15 @@ const RESERVE_BUFFER: u64 = 4 << 20; // 4 MiB
 const RESERVE_FLOOR: u64 = 8 << 20; // 8 MiB
 /// Rounding granularity for the reserve.
 const RESERVE_GRAIN: u64 = 4 << 20; // 4 MiB
+/// Largest reserve expressible in a `free` box's 32-bit size field, rounded down
+/// to a whole grain.
+const RESERVE_CAP: u64 = (u32::MAX as u64 / RESERVE_GRAIN) * RESERVE_GRAIN;
 
+/// Round up to `RESERVE_GRAIN`, saturating rather than wrapping. `div_ceil` then
+/// multiply overflows for inputs within one grain of `u64::MAX`, which would turn
+/// an enormous estimate into a tiny reserve — the opposite of the intent.
 fn round_up_grain(x: u64) -> u64 {
-    x.div_ceil(RESERVE_GRAIN) * RESERVE_GRAIN
+    x.div_ceil(RESERVE_GRAIN).saturating_mul(RESERVE_GRAIN)
 }
 
 /// Estimate the faststart hole: `round_up_4MB(bytes_per_sample × est_samples)`
@@ -98,7 +104,16 @@ fn estimate_reserve(title: &DiscTitle, included: &[usize]) -> u64 {
         }
     }
     let est = (est_samples as u64).saturating_mul(BYTES_PER_SAMPLE);
-    round_up_grain(est).max(RESERVE_FLOOR) + RESERVE_BUFFER
+    let reserve = round_up_grain(est)
+        .max(RESERVE_FLOOR)
+        .saturating_add(RESERVE_BUFFER);
+    // The hole is a `free` box with a 32-bit size field, so a reserve at or above
+    // u32::MAX cannot be expressed: writing it truncated the size and left mdat
+    // beyond a box that claimed to be far shorter. Clamp to the largest
+    // grain-aligned value the field can hold. No real title comes near this —
+    // a 90 GB UHD title estimates a few MiB — but truncating silently produces an
+    // unreadable file, so it is bounded rather than trusted.
+    reserve.min(RESERVE_CAP)
 }
 
 /// One accumulated sample's bookkeeping (the mdat bytes are already on disk).
@@ -1420,6 +1435,17 @@ mod tests {
     #[test]
     fn reserve_rounds_to_4mb_plus_buffer() {
         // round_up_4MB(x) + 4 MiB, floored at 8 MiB.
+        // Saturates rather than wrapping. div_ceil(GRAIN) * GRAIN overflows within
+        // one grain of u64::MAX, and the wrapped product is SMALL — which would
+        // turn the largest possible estimate into a negligible reserve, the exact
+        // opposite of the intent. Only the no-wrap property matters here.
+        assert!(
+            round_up_grain(u64::MAX) >= u64::MAX - (4 << 20),
+            "round_up_grain must saturate near u64::MAX, not wrap to a small value"
+        );
+        // The reserve the writer emits must fit the `free` box's 32-bit size field.
+        assert!(RESERVE_CAP <= u32::MAX as u64);
+        assert_eq!(RESERVE_CAP % RESERVE_GRAIN, 0);
         assert_eq!(round_up_grain(1), 4 << 20);
         assert_eq!(round_up_grain(4 << 20), 4 << 20);
         assert_eq!(round_up_grain((4 << 20) + 1), 8 << 20);
