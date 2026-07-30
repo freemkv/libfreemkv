@@ -353,4 +353,147 @@ mod tests {
             "set_unit_base must forward through &mut dyn"
         );
     }
+
+    /// Records every read that reaches it, including whether it arrived on the
+    /// FUA path and with which `fua` bit — `Spy` above leaves `read_sectors_fua`
+    /// to the trait default, so it cannot tell the two entry points apart.
+    /// One recorded read: `(lba, count, recovery, fua)`, where `fua` is `None`
+    /// when the plain `read_sectors` entry point was the one reached.
+    type ReadLog = Arc<Mutex<Vec<(u32, u16, bool, Option<bool>)>>>;
+
+    #[derive(Default)]
+    struct ReadSpy {
+        calls: ReadLog,
+        fill: u8,
+    }
+
+    impl SectorSource for ReadSpy {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> Result<usize> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((lba, count, recovery, None));
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(self.fill);
+            Ok(bytes)
+        }
+        fn read_sectors_fua(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+            fua: bool,
+        ) -> Result<usize> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((lba, count, recovery, Some(fua)));
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(self.fill);
+            Ok(bytes)
+        }
+    }
+
+    /// Read through a generic `S: SectorSource` bound so the FORWARDING impl is
+    /// what runs. A direct `r.read_sectors(..)` on a `&mut dyn SectorSource`
+    /// receiver auto-derefs to the vtable and never touches the forwarding body,
+    /// which is exactly why `set_unit_base` needed `set_unit_base_generic` too.
+    fn read_generic<S: SectorSource>(
+        mut s: S,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> Result<usize> {
+        s.read_sectors(lba, count, buf, recovery)
+    }
+
+    /// Same, for the FUA entry point.
+    fn read_fua_generic<S: SectorSource>(
+        mut s: S,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+        fua: bool,
+    ) -> Result<usize> {
+        s.read_sectors_fua(lba, count, buf, recovery, fua)
+    }
+
+    /// The `&mut dyn SectorSource` forwarding impl must actually DELEGATE
+    /// `read_sectors` — pass the args through unchanged, return the inner
+    /// source's byte count, and leave the inner source's bytes in the caller's
+    /// buffer. A body that returned a bare `Ok(n)` without calling the inner
+    /// source would be a delegating reader that reads NOTHING and reports
+    /// success: the caller sees `Ok` and consumes an untouched buffer.
+    ///
+    /// `mut_ref_dyn_forwards_all_methods` above does not cover this: its
+    /// `r.read_sectors(..)` call on a `&mut dyn` receiver dispatches through the
+    /// vtable to `Spy`, not through the forwarding impl.
+    #[test]
+    fn mut_ref_dyn_forwards_read_sectors_to_the_inner_source() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut inner = ReadSpy {
+            calls: calls.clone(),
+            fill: 0x5C,
+        };
+
+        let mut buf = vec![0u8; 4 * 2048];
+        let r: &mut dyn SectorSource = &mut inner;
+        let n = read_generic(r, 0x1234, 4, &mut buf, true).expect("delegated read succeeds");
+
+        assert_eq!(
+            n,
+            4 * 2048,
+            "the forwarding impl must return the INNER source's byte count"
+        );
+        assert!(
+            buf.iter().all(|b| *b == 0x5C),
+            "the inner source's bytes must land in the caller's buffer; an \
+             undelegated read leaves it untouched and the caller muxes zeroes"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(0x1234, 4, true, None)],
+            "lba/count/recovery must reach the inner source unchanged, on the \
+             non-FUA entry point"
+        );
+    }
+
+    /// The same for `read_sectors_fua`: the forwarding impl must reach the inner
+    /// source's FUA entry point (not silently downgrade to the plain read, and
+    /// not fabricate a count), carrying the `fua` bit through. FUA is the
+    /// Pass-N lever that re-fetches a stochastic sector past the drive cache
+    /// (MMC-6 READ(10) FUA bit); a forwarder that dropped it would make every
+    /// FUA retry re-read the same cached bytes and "confirm" the bad sector.
+    #[test]
+    fn mut_ref_dyn_forwards_read_sectors_fua_to_the_inner_source() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut inner = ReadSpy {
+            calls: calls.clone(),
+            fill: 0x3B,
+        };
+
+        let mut buf = vec![0u8; 2 * 2048];
+        let r: &mut dyn SectorSource = &mut inner;
+        let n = read_fua_generic(r, 42, 2, &mut buf, false, true).expect("delegated FUA read");
+
+        assert_eq!(n, 2 * 2048, "byte count must come from the inner source");
+        assert!(
+            buf.iter().all(|b| *b == 0x3B),
+            "the inner source's bytes must land in the caller's buffer"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(42, 2, false, Some(true))],
+            "the FUA entry point must be the one reached, with fua=true intact"
+        );
+    }
 }

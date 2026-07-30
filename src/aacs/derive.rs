@@ -787,3 +787,260 @@ mod resolve_candidate_tests {
         );
     }
 }
+
+/// Device-key POSITION recovery and the MKB probe accessors.
+///
+/// This file holds the whole subset-difference walk and had five tests for it.
+/// There are no published AACS test vectors, but none are needed: the AACS
+/// relations ([C] §3.2.3–§3.2.5) are invertible, so a valid MKB for a CHOSEN
+/// key can be constructed with `aes_ecb_encrypt` and the same `aesg3` the walk
+/// uses as its node function. That is what `plant_mkb` below does — no real
+/// key material, and the assertions check the DERIVED Media Key, not any
+/// intermediate the code under test also produces.
+#[cfg(test)]
+mod position_recovery_tests {
+    use super::*;
+    use crate::aacs::crypto::aes_ecb_encrypt;
+
+    /// [C] §3.2.5.1.4 Verify-Media-Key plaintext prefix.
+    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+
+    /// An MKB record: 1-byte type + BE24 total length (header included) + body.
+    fn rec(t: u8, body: &[u8]) -> Vec<u8> {
+        let total = 4 + body.len();
+        let mut r = vec![
+            t,
+            ((total >> 16) & 0xFF) as u8,
+            ((total >> 8) & 0xFF) as u8,
+            (total & 0xFF) as u8,
+        ];
+        r.extend_from_slice(body);
+        r
+    }
+
+    /// The planted fixture: an MKB whose single subset-difference slot is opened
+    /// by `dkey` sitting EXACTLY at that slot (zero descent), yielding `mk`.
+    struct Planted {
+        mkb: Vec<u8>,
+        dkey: [u8; 16],
+        mk: [u8; 16],
+        mk_dv: [u8; 16],
+        cv: [u8; 16],
+        uv: u32,
+        u_mask_shift: u8,
+    }
+
+    /// Build the fixture by inverting the AACS relations.
+    ///
+    /// `uv = 0x0400` (lowest set bit 10) with `u_mask_shift = 12` is chosen so a
+    /// gating device node exists: `resolve_dk_node` flips one bit `b < 12`, and
+    /// the walk's gate ([C] §3.2.4) needs that bit inside `v_mask`
+    /// (`0xFFFF_FFFF << 11`) and outside `u_mask` (`0xFFFF_FFFF << 12`) — i.e.
+    /// `b == 11`. `uv` is kept under 0x10000 because `DeviceKey::node` is a u16.
+    fn plant_mkb() -> Planted {
+        let dkey: [u8; 16] = [
+            0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2,
+            0xE1, 0xF0,
+        ];
+        let mk: [u8; 16] = [
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ];
+        let uv: u32 = 0x0000_0400;
+        let u_mask_shift: u8 = 12;
+
+        // The Processing Key a device sitting AT the slot produces: [C] §3.2.4
+        // makes it the AES-G3(.,1) of its own node, with no descent.
+        let pk = aesg3(&dkey, 1);
+
+        // Invert [C] §3.2.4: mk = AES-D(pk, cvalue) then XOR uv into mk[12..16].
+        let mut mk_raw = mk;
+        for (a, b) in mk_raw[12..16].iter_mut().zip(uv.to_be_bytes()) {
+            *a ^= b;
+        }
+        let cv = aes_ecb_encrypt(&pk, &mk_raw);
+
+        // Invert [C] §3.2.5.1.4: AES-D(mk, mk_dv) must start with the magic.
+        let mut vd = [0x5Au8; 16];
+        vd[..8].copy_from_slice(&VERIFY_MAGIC);
+        let mk_dv = aes_ecb_encrypt(&mk, &vd);
+
+        let mut subdiff = vec![u_mask_shift];
+        subdiff.extend_from_slice(&uv.to_be_bytes());
+
+        let mut mkb = Vec::new();
+        mkb.extend_from_slice(&rec(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]));
+        mkb.extend_from_slice(&rec(0x86, &mk_dv));
+        mkb.extend_from_slice(&rec(0x04, &subdiff));
+        mkb.extend_from_slice(&rec(0x05, &cv));
+
+        Planted {
+            mkb,
+            dkey,
+            mk,
+            mk_dv,
+            cv,
+            uv,
+            u_mask_shift,
+        }
+    }
+
+    /// Sanity-check the fixture itself before anything is asserted about the
+    /// functions under test: an MKB the parser cannot read would make every
+    /// "returns None" body look correct.
+    #[test]
+    fn the_planted_mkb_is_a_parseable_mkb() {
+        let p = plant_mkb();
+        assert_eq!(mkb_find_mk_dv(&p.mkb), Some(p.mk_dv), "verify record");
+        assert_eq!(
+            mkb_find_cvalues(&p.mkb).as_deref(),
+            Some(&p.cv[..]),
+            "cvalue record"
+        );
+        assert_eq!(
+            mkb_find_subdiff_records(&p.mkb).map(|v| v.len()),
+            Some(5),
+            "one 5-byte subset-difference slot"
+        );
+    }
+
+    /// `recover_dk_position` turns an UNPOSITIONED 16-byte device key into a
+    /// bankable `DeviceKey`. Returning `None` means "this key does not apply to
+    /// this disc" — indistinguishable, to every caller, from a key that does
+    /// apply but whose position was never found. The whole feature silently
+    /// stops working: the key is discarded, the disc reports no usable key, and
+    /// the operator is pointed at their keydb.
+    ///
+    /// The load-bearing assertion is the last one: the recovered position must
+    /// actually drive `derive_media_key_from_dk` to the planted Media Key. That
+    /// is the property the caller depends on, and it cannot be satisfied by a
+    /// position that merely looks plausible.
+    #[test]
+    fn recover_dk_position_finds_a_position_that_derives_the_planted_media_key() {
+        let p = plant_mkb();
+
+        let recovered =
+            recover_dk_position(&p.mkb, &p.dkey).expect("the planted key applies to this MKB");
+
+        assert_eq!(
+            recovered.uv, p.uv,
+            "uv is invariant for the key across discs and must be the slot's"
+        );
+        assert_eq!(
+            recovered.u_mask_shift, p.u_mask_shift,
+            "u_mask_shift must be the slot's"
+        );
+        assert_eq!(recovered.key, p.dkey, "the key bytes are carried through");
+
+        assert_eq!(
+            derive_media_key_from_dk(&p.mkb, std::slice::from_ref(&recovered)),
+            Some(p.mk),
+            "the recovered position must walk the MKB to the planted Media Key \
+             — a position that does not is no better than None"
+        );
+    }
+
+    /// The other direction: a key the MKB does NOT open must not be given a
+    /// position. A device key wrongly declared as applying would be banked and
+    /// reused on every future disc, and each of those discs would derive a wrong
+    /// Media Key.
+    #[test]
+    fn recover_dk_position_rejects_a_key_the_mkb_does_not_open() {
+        let p = plant_mkb();
+        let mut stranger = p.dkey;
+        stranger[0] ^= 0x01; // one bit off — the strongest form of wrong key
+        assert!(
+            recover_dk_position(&p.mkb, &stranger).is_none(),
+            "a key differing by one bit must not be handed a position"
+        );
+    }
+
+    /// `resolve_dk_node` picks the `device_number` that passes the walk's
+    /// subset-difference gate ([C] §3.2.4). `None` here strands a key whose
+    /// position was already successfully recovered, so it is the last step of
+    /// position recovery and fails the same way: usable key, discarded.
+    ///
+    /// Asserted through the Media Key the chosen node derives, not through the
+    /// node value itself — the doc comment's own claim is that any gating node
+    /// works, so pinning a specific number would test the wrong thing.
+    #[test]
+    fn resolve_dk_node_returns_a_node_that_passes_the_walk_gate() {
+        let p = plant_mkb();
+
+        let dk = resolve_dk_node(&p.mkb, &p.dkey, p.uv, p.u_mask_shift)
+            .expect("a gating node exists for the planted slot");
+
+        assert_eq!(dk.uv, p.uv);
+        assert_eq!(dk.u_mask_shift, p.u_mask_shift);
+        assert_eq!(
+            derive_media_key_from_dk(&p.mkb, std::slice::from_ref(&dk)),
+            Some(p.mk),
+            "the resolved node must actually pass the gate and derive the \
+             planted Media Key"
+        );
+
+        // The gate is the point: the node must differ from uv inside v_mask.
+        // (v_mask for uv=0x400 is 0xFFFF_F800.)
+        let v_mask = calc_v_mask(p.uv);
+        assert_ne!(
+            (dk.node as u32) & v_mask,
+            p.uv & v_mask,
+            "a node equal to uv under v_mask does not gate — the walk would \
+             skip the slot entirely"
+        );
+    }
+
+    /// `probe::mkb_mk_dv` is the reproduction harnesses' view of the MKB's
+    /// Verify-Media-Key record. It feeds `km_verifies`, so a body returning a
+    /// fixed block would make an independent harness "verify" Media Keys
+    /// against a record no disc ever carried, and a body returning `None` would
+    /// make every verification report "unverifiable".
+    #[test]
+    fn probe_mkb_mk_dv_returns_the_records_actual_bytes() {
+        let p = plant_mkb();
+        assert_eq!(
+            probe::mkb_mk_dv(&p.mkb),
+            Some(p.mk_dv),
+            "mk_dv must be the bytes the 0x86 record carries"
+        );
+        assert_ne!(
+            probe::mkb_mk_dv(&p.mkb),
+            Some([0u8; 16]),
+            "and not a constant block"
+        );
+        assert_eq!(
+            probe::mkb_mk_dv(&[0x10, 0x00, 0x00, 0x04]),
+            None,
+            "an MKB with no verify record has no mk_dv"
+        );
+    }
+
+    /// `probe::mkb_cvalues` is the Media-Key-Data table the whole PK×cvalue
+    /// scan iterates. An empty or one-byte table makes every scan find nothing,
+    /// so a harness would report a good key as non-working.
+    #[test]
+    fn probe_mkb_cvalues_returns_the_records_actual_bytes() {
+        let p = plant_mkb();
+        let cvalues = probe::mkb_cvalues(&p.mkb).expect("the 0x05 record is present");
+        assert_eq!(
+            cvalues.len(),
+            16,
+            "one 16-byte cvalue was planted; the table must be that long"
+        );
+        assert_eq!(
+            &cvalues[..],
+            &p.cv[..],
+            "cvalue bytes must be the planted ones"
+        );
+
+        // The table is what the terminal-PK scan consumes; prove it drives the
+        // real scan to the planted Media Key.
+        let uvs = probe::mkb_subdiff(&p.mkb).expect("subdiff record present");
+        let pk = aesg3(&p.dkey, 1);
+        assert_eq!(
+            try_pk_against_tables(&[pk], &uvs, &cvalues, &p.mk_dv),
+            Some(p.mk),
+            "the probe's cvalue table must be the one the PK scan can use"
+        );
+    }
+}
