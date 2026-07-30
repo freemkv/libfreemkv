@@ -216,12 +216,11 @@ impl CodecParser for Vc1Parser {
                         let end = find_next_sc(data, i + 4).unwrap_or(data.len());
                         let sh = &data[i..end];
                         // Try to parse resolution from advanced profile sequence header
-                        if self.seq_header.is_none() {
-                            if let Some((w, h)) = parse_vc1_resolution(sh) {
+                        if self.seq_header.is_none()
+                            && let Some((w, h)) = parse_vc1_resolution(sh) {
                                 self.width = w;
                                 self.height = h;
                             }
-                        }
                         // Collect into a scratch Vec so handle_header can
                         // append; we discard the Vec and only keep the flag.
                         let mut scratch = Vec::new();
@@ -250,12 +249,11 @@ impl CodecParser for Vc1Parser {
                         }
                         has_entry_point = true;
                     }
-                    SC_FRAME => {
+                    SC_FRAME
                         // Frame data starts at this start code
-                        if frame_start.is_none() {
+                        if frame_start.is_none() => {
                             frame_start = Some(i);
                         }
-                    }
                     _ => {}
                 }
                 i += 4;

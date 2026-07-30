@@ -365,17 +365,17 @@ impl CodecParser for H264Parser {
         const HIGH_PROFILES: [u8; 14] = [
             100, 110, 122, 144, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135,
         ];
-        if HIGH_PROFILES.contains(&profile_idc) {
-            if let Some((chroma_fmt, depth_luma, depth_chroma)) = parse_sps_high_profile_ext(sps) {
-                // byte 0: 111111xx — reserved(6) + chroma_format_idc(2)
-                record.push(0xFC | (chroma_fmt & 0x03));
-                // byte 1: 11111xxx — reserved(5) + bit_depth_luma_minus8(3)
-                record.push(0xF8 | (depth_luma & 0x07));
-                // byte 2: 11111xxx — reserved(5) + bit_depth_chroma_minus8(3)
-                record.push(0xF8 | (depth_chroma & 0x07));
-                // byte 3: num_of_sequence_parameter_set_ext (0 = none)
-                record.push(0x00);
-            }
+        if HIGH_PROFILES.contains(&profile_idc)
+            && let Some((chroma_fmt, depth_luma, depth_chroma)) = parse_sps_high_profile_ext(sps)
+        {
+            // byte 0: 111111xx — reserved(6) + chroma_format_idc(2)
+            record.push(0xFC | (chroma_fmt & 0x03));
+            // byte 1: 11111xxx — reserved(5) + bit_depth_luma_minus8(3)
+            record.push(0xF8 | (depth_luma & 0x07));
+            // byte 2: 11111xxx — reserved(5) + bit_depth_chroma_minus8(3)
+            record.push(0xF8 | (depth_chroma & 0x07));
+            // byte 3: num_of_sequence_parameter_set_ext (0 = none)
+            record.push(0x00);
         }
 
         Some(record)

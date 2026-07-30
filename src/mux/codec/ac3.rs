@@ -195,11 +195,11 @@ impl Ac3Parser {
                 // First access unit that starts in this PES's own bytes: adopt
                 // this PES's timestamp so a genuine PTS jump is followed instead
                 // of the running cadence drifting past it.
-                if let Some(a) = &anchor {
-                    if start >= a.at {
-                        frame_pts_ns = a.pts_ns;
-                        anchor = None;
-                    }
+                if let Some(a) = &anchor
+                    && start >= a.at
+                {
+                    frame_pts_ns = a.pts_ns;
+                    anchor = None;
                 }
                 let duration_ns = frame_duration_ns(remaining, bsid);
                 pending = Some(PendingAu {

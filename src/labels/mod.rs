@@ -574,10 +574,10 @@ fn extract(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<StreamLabel> {
     // so the user sees every track even when only the "interesting"
     // ones have editorial names. Skips the merge when mpls_universal
     // was itself the chosen parser (its labels ARE the labels).
-    if name != "mpls_universal" {
-        if let Some(mpls_result) = mpls_universal::parse(reader, udf) {
-            fill_gaps_from_mpls(&mut labels, &mpls_result.labels);
-        }
+    if name != "mpls_universal"
+        && let Some(mpls_result) = mpls_universal::parse(reader, udf)
+    {
+        fill_gaps_from_mpls(&mut labels, &mpls_result.labels);
     }
 
     // CLPI orphan streams: PIDs in /BDMV/CLIPINF/*.clpi ProgramInfo

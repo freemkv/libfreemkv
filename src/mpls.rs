@@ -432,14 +432,13 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
                 }
             }
         }
-        STREAM_CATEGORY_PG_SUBTITLE => {
+        STREAM_CATEGORY_PG_SUBTITLE
             // PG: coding_type(1) + language(3).
             // IG is parsed only to advance spos and is then discarded by the
             // caller, so it deliberately has no arm here.
-            if sa.len() >= 4 {
+            if sa.len() >= 4 => {
                 language = String::from_utf8_lossy(&sa[1..4]).to_string();
             }
-        }
         _ => {}
     }
 

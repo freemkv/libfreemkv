@@ -285,11 +285,13 @@ impl<W: Write + Seek> Mp4Sink<W> {
 
         let mut tracks = Vec::new();
         let mut route = vec![None; title.streams.len()];
-        let mut next_id = 1u32;
         let mut video_codec = Codec::Hevc;
-        for &i in &report.included {
-            let track_id = next_id;
-            next_id += 1;
+        // Track ids are 1-based and assigned in inclusion order. `moov`'s
+        // next_track_id is NOT derived from this counter — it is max(track_id) + 1
+        // computed after the sample-less retain, since ids are handed out here
+        // before any track is dropped.
+        for (n, &i) in report.included.iter().enumerate() {
+            let track_id = n as u32 + 1;
             route[i] = Some(tracks.len());
             match &title.streams[i] {
                 DiscStream::Video(v) => {
@@ -440,10 +442,11 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
         // cost us the frame. Dropping leading frames here lost audio silently, and
         // a track whose frames never parsed vanished from the output entirely with
         // no report; finish() now decides that case loudly instead.
-        if self.tracks[slot].media == Media::Audio && self.tracks[slot].audio_entry.is_none() {
-            if let Some(entry) = audio::dolby_sample_entry(self.tracks[slot].codec, &frame.data) {
-                self.tracks[slot].audio_entry = Some(entry);
-            }
+        if self.tracks[slot].media == Media::Audio
+            && self.tracks[slot].audio_entry.is_none()
+            && let Some(entry) = audio::dolby_sample_entry(self.tracks[slot].codec, &frame.data)
+        {
+            self.tracks[slot].audio_entry = Some(entry);
         }
         let pts_ns = frame.pts;
         let offset = self.mdat_start + 16 + self.mdat_payload;

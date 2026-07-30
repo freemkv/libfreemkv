@@ -100,10 +100,10 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<DiscMetadata>
         // Disc-set position is disc-global; first one we successfully
         // read wins. (All bdmt_*.xml on a given disc carry the same
         // value in practice.)
-        if out.disc_number.is_none() {
-            if let Some(ds) = disc_set {
-                out.disc_number = Some(ds);
-            }
+        if out.disc_number.is_none()
+            && let Some(ds) = disc_set
+        {
+            out.disc_number = Some(ds);
         }
     }
 
@@ -184,20 +184,20 @@ fn extract_title(xml_text: &str) -> Option<String> {
     // xml::text already trims its result, so an empty string after
     // extraction means a genuinely empty element.
     for tag in ["name", "title"] {
-        if let Some(s) = xml::text(xml_text, tag) {
-            if !s.is_empty() {
-                return Some(s);
-            }
+        if let Some(s) = xml::text(xml_text, tag)
+            && !s.is_empty()
+        {
+            return Some(s);
         }
     }
     // tableOfContents/titleName: search inside the toc block so we
     // don't accidentally pick a stray <titleName> from elsewhere.
     if let Some((s, e)) = xml::find_element(xml_text, "tableOfContents", 0) {
         let block = &xml_text[s..e];
-        if let Some(t) = xml::text(block, "titleName") {
-            if !t.is_empty() {
-                return Some(t);
-            }
+        if let Some(t) = xml::text(block, "titleName")
+            && !t.is_empty()
+        {
+            return Some(t);
         }
     }
     None

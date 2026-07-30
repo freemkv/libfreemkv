@@ -142,10 +142,10 @@ fn find_feature_playlist(text: &str) -> Option<String> {
         let element = &text[start..end];
 
         // Prefer name="Feature" explicitly.
-        if let Some(name) = xml::attr(element, "name") {
-            if name.eq_ignore_ascii_case("Feature") {
-                return Some(element.to_string());
-            }
+        if let Some(name) = xml::attr(element, "name")
+            && name.eq_ignore_ascii_case("Feature")
+        {
+            return Some(element.to_string());
         }
 
         // Otherwise pick the one with the most audio streams. Count only

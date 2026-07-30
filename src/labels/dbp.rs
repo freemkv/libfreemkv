@@ -114,13 +114,13 @@ fn collect_textfield(
         if let Ok(n) = rest.parse::<u16>() {
             audios.insert(n, label.to_string());
         }
-    } else if let Some(rest) = kind_n.strip_prefix("Subtitle") {
-        if let Ok(n) = rest.parse::<u16>() {
-            // Subtitle0 is conventionally the "None / Off" disable
-            // button, not an actual subtitle stream.
-            if n > 0 {
-                subs.insert(n, label.to_string());
-            }
+    } else if let Some(rest) = kind_n.strip_prefix("Subtitle")
+        && let Ok(n) = rest.parse::<u16>()
+    {
+        // Subtitle0 is conventionally the "None / Off" disable
+        // button, not an actual subtitle stream.
+        if n > 0 {
+            subs.insert(n, label.to_string());
         }
     }
 }

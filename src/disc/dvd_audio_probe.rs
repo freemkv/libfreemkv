@@ -104,10 +104,10 @@ fn max_substream_channels(data: &[u8]) -> Option<u8> {
         };
         let start = pos + rel;
         let frame = &data[start..];
-        if let Some(ch) = ac3::acmod_channels(frame) {
-            if ch > 0 {
-                best = Some(best.map_or(ch, |b| b.max(ch)));
-            }
+        if let Some(ch) = ac3::acmod_channels(frame)
+            && ch > 0
+        {
+            best = Some(best.map_or(ch, |b| b.max(ch)));
         }
         // Advance past this frame by its declared size when that is mappable;
         // otherwise step 2 bytes past the sync and re-scan for the next one.

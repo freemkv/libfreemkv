@@ -41,7 +41,8 @@ pub const ALIGNED_UNIT_SECTORS: u32 = (ALIGNED_UNIT_LEN / SECTOR_BYTES) as u32;
 /// underflow wraps to ~2^32 and, because `2^32 ≡ 1 (mod 3)`, mis-reports the
 /// alignment (e.g. `lba == unit_base - 1` would falsely read as aligned).
 pub fn is_unit_aligned(lba: u32, unit_base: u32) -> bool {
-    lba.saturating_sub(unit_base) % ALIGNED_UNIT_SECTORS == 0
+    lba.saturating_sub(unit_base)
+        .is_multiple_of(ALIGNED_UNIT_SECTORS)
 }
 
 use crate::consts::SECTOR_BYTES;

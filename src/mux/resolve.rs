@@ -193,10 +193,10 @@ pub fn parse_url(url: &str) -> StreamUrl {
             return StreamUrl::Null;
         }
     }
-    if let Some(rest) = url.strip_prefix("stdio://") {
-        if rest.is_empty() {
-            return StreamUrl::Stdio;
-        }
+    if let Some(rest) = url.strip_prefix("stdio://")
+        && rest.is_empty()
+    {
+        return StreamUrl::Stdio;
     }
     if let Some(rest) = url.strip_prefix("iso://") {
         return StreamUrl::Iso {
@@ -1646,20 +1646,19 @@ pub(crate) fn resolve_mux_key_map_cached(
             _ => Vec::new(),
         };
         let mut idx = pick(&samples, &pool);
-        if idx.is_none() {
-            if let Some(f) = fetch {
-                if !samples.is_empty() {
-                    let fresh = f.unit_keys(&samples);
-                    if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
-                        for k in fresh {
-                            if !unit_keys.iter().any(|(_, h)| *h == k) {
-                                let i = unit_keys.len() as u32;
-                                unit_keys.push((i, k));
-                            }
-                        }
-                        idx = pick(&samples, unit_keys);
+        if idx.is_none()
+            && let Some(f) = fetch
+            && !samples.is_empty()
+        {
+            let fresh = f.unit_keys(&samples);
+            if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
+                for k in fresh {
+                    if !unit_keys.iter().any(|(_, h)| *h == k) {
+                        let i = unit_keys.len() as u32;
+                        unit_keys.push((i, k));
                     }
                 }
+                idx = pick(&samples, unit_keys);
             }
         }
         // `sample_units` draws REAL content (not authored-bad units), so a sample

@@ -196,10 +196,10 @@ impl Mpeg2Parser {
         if let Some(h) = extract_seq_header(&data) {
             self.progressive_sequence = parse_progressive_sequence(&h);
             self.seq_header = Some(h);
-            if let Some((num, den)) = self.frame_rate() {
-                if num > 0 {
-                    self.frame_duration_ns = 1_000_000_000i64 * den as i64 / num as i64;
-                }
+            if let Some((num, den)) = self.frame_rate()
+                && num > 0
+            {
+                self.frame_duration_ns = 1_000_000_000i64 * den as i64 / num as i64;
             }
         }
         // A GOP header (0xB8) or a fresh sequence header (0xB3) starts a new GOP,

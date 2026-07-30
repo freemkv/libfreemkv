@@ -77,10 +77,10 @@ fn emit_git_suffix() {
     // Re-run when HEAD (or the branch it points at) moves so the stamp stays
     // current without a clean rebuild.
     println!("cargo:rerun-if-changed=.git/HEAD");
-    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
-        if let Some(ref_path) = head.strip_prefix("ref: ") {
-            println!("cargo:rerun-if-changed=.git/{}", ref_path.trim());
-        }
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD")
+        && let Some(ref_path) = head.strip_prefix("ref: ")
+    {
+        println!("cargo:rerun-if-changed=.git/{}", ref_path.trim());
     }
 }
 

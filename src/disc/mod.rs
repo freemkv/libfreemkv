@@ -687,15 +687,15 @@ pub fn chapter_at_offset(
 /// The 1-based chapter + movie-time offset an LBA falls in, or `(None, None)`
 /// if it isn't inside the title.
 fn range_chapter(lba: u32, title: &DiscTitle) -> (Option<u32>, Option<f64>) {
-    if let Some(byte_offset) = byte_offset_in_title(lba, title) {
-        if let Some((ch, t)) = chapter_at_offset(
+    if let Some(byte_offset) = byte_offset_in_title(lba, title)
+        && let Some((ch, t)) = chapter_at_offset(
             &title.chapters,
             byte_offset,
             title.duration_secs,
             title.size_bytes,
-        ) {
-            return (Some(ch as u32), Some(t));
-        }
+        )
+    {
+        return (Some(ch as u32), Some(t));
     }
     (None, None)
 }
@@ -1726,7 +1726,7 @@ impl Disc {
             {
                 Some(t) => {
                     let mut v = t.extents.clone();
-                    v.sort_by(|a, b| b.sector_count.cmp(&a.sector_count));
+                    v.sort_by_key(|e| std::cmp::Reverse(e.sector_count));
                     v
                 }
                 None => Vec::new(),
@@ -3049,15 +3049,15 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
 
         if let Some(bname) = block_name {
             let sysfs_path = format!("/sys/block/{bname}/queue/max_hw_sectors_kb");
-            if let Ok(content) = std::fs::read_to_string(&sysfs_path) {
-                if let Ok(kb) = content.trim().parse::<u32>() {
-                    // Convert KB to sectors (1 sector = 2 KB = 2048 bytes)
-                    let sectors = (kb / 2).min(u16::MAX as u32) as u16;
-                    // Align down to 3 (one aligned unit)
-                    let aligned = (sectors / 3) * 3;
-                    if aligned >= MIN_BATCH_SECTORS {
-                        return aligned.min(MAX_BATCH_SECTORS);
-                    }
+            if let Ok(content) = std::fs::read_to_string(&sysfs_path)
+                && let Ok(kb) = content.trim().parse::<u32>()
+            {
+                // Convert KB to sectors (1 sector = 2 KB = 2048 bytes)
+                let sectors = (kb / 2).min(u16::MAX as u32) as u16;
+                // Align down to 3 (one aligned unit)
+                let aligned = (sectors / 3) * 3;
+                if aligned >= MIN_BATCH_SECTORS {
+                    return aligned.min(MAX_BATCH_SECTORS);
                 }
             }
         }

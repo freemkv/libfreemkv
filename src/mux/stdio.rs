@@ -53,12 +53,12 @@ impl StdioStream {
     /// zero-frame output stream still emits the magic + metadata header,
     /// keeping the wire protocol symmetric with the read side's read_header().
     fn ensure_header_written(&mut self) -> io::Result<()> {
-        if let Some(w) = &mut self.writer {
-            if !self.header_written {
-                let m = meta::M2tsMeta::from_title(&self.disc_title);
-                meta::write_header(w, &m)?;
-                self.header_written = true;
-            }
+        if let Some(w) = &mut self.writer
+            && !self.header_written
+        {
+            let m = meta::M2tsMeta::from_title(&self.disc_title);
+            meta::write_header(w, &m)?;
+            self.header_written = true;
         }
         Ok(())
     }

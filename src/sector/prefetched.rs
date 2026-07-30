@@ -227,7 +227,9 @@ impl PrefetchedSectorSource {
                         // way to hand the decrypt step an aligned chunk —
                         // surface a typed error instead of emitting
                         // still-encrypted bytes.
-                        if remaining % unit_align as u32 != 0 && remaining < unit_align as u32 {
+                        if !remaining.is_multiple_of(unit_align as u32)
+                            && remaining < unit_align as u32
+                        {
                             let _ = tx.send(Err(crate::error::Error::ExtentNotUnitAligned.into()));
                             return;
                         }

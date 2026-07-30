@@ -133,10 +133,10 @@ where
         match rx.recv_timeout(slice) {
             Ok(v) => return Ok(v),
             Err(RecvTimeoutError::Timeout) => {
-                if let Some(h) = halt {
-                    if h.is_cancelled() {
-                        return Err(BoundedError::Halted);
-                    }
+                if let Some(h) = halt
+                    && h.is_cancelled()
+                {
+                    return Err(BoundedError::Halted);
                 }
                 if Instant::now() >= deadline {
                     return Err(BoundedError::Timeout);
