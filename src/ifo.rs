@@ -571,10 +571,14 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
     let b1 = byte_at(data, offset + 1)?;
 
     let coding_mode = (b0 >> 5) & 0x07;
+    // DVD-Video audio_coding_mode. Modes 2 and 3 are both MPEG audio Layer II
+    // (3 adds the MPEG-2 multichannel extension), so both are Codec::Mp2.
+    // Mode 2 previously mapped to Codec::Mpeg1 — a VIDEO variant, so
+    // Codec::kind() reported Video and the audio stream was classified and
+    // handled as video everywhere downstream.
     let codec = match coding_mode {
         0 => Codec::Ac3,
-        2 => Codec::Mpeg1,
-        3 => Codec::Mp2,
+        2 | 3 => Codec::Mp2,
         4 => Codec::Lpcm,
         6 => Codec::Dts,
         _ => Codec::Unknown(coding_mode),
@@ -1216,6 +1220,33 @@ mod tests {
         );
         // The routing key the muxer actually uses must resolve for 0x89.
         assert_eq!(crate::mux::ps::dvd_audio_pid(0x89), Some(0xBD89));
+    }
+
+    #[test]
+    fn every_audio_coding_mode_maps_to_an_audio_codec() {
+        // An audio attribute block must never yield a codec whose kind() is Video.
+        // Mode 2 (MPEG-1 audio Layer II) mapped to Codec::Mpeg1 — the MPEG-1 VIDEO
+        // variant — so a DVD MPEG-audio stream was classified as video downstream.
+        for (mode, want) in [
+            (0u8, Codec::Ac3),
+            (2, Codec::Mp2),
+            (3, Codec::Mp2),
+            (4, Codec::Lpcm),
+            (6, Codec::Dts),
+        ] {
+            let mut data = vec![0u8; 16];
+            data[0] = mode << 5;
+            data[2] = b'e';
+            data[3] = b'n';
+            let attr = parse_audio_attr(&data, 0).unwrap();
+            assert_eq!(attr.codec, want, "coding_mode {mode} must map to {want:?}");
+            assert_eq!(
+                attr.codec.kind(),
+                crate::disc::CodecKind::Audio,
+                "coding_mode {mode} produced {:?}, whose kind is not Audio",
+                attr.codec
+            );
+        }
     }
 
     #[test]
