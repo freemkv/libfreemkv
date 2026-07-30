@@ -583,6 +583,70 @@ mod resolve_candidate_tests {
     use super::*;
     use crate::aacs::crypto::aes_ecb_encrypt;
 
+    /// `km_verifies` is the gate deciding whether a candidate Media Key is the
+    /// disc's. `resolve.rs`'s MK-pool brute force runs every candidate through
+    /// it, so if it said yes to everything the first candidate would be accepted
+    /// and the rip would continue with a wrong Media Key — wrong VUK, wrong
+    /// title keys, garbage plaintext, and no error raised anywhere.
+    ///
+    /// Nothing tested it. Whole-crate mutation testing surfaced
+    /// `replace km_verifies -> bool with true` as SURVIVING: the body could be
+    /// replaced by `true` and all 2,556 tests still passed. A verification
+    /// routine whose verification was itself unverified.
+    ///
+    /// No real key material is needed. AACS defines the relation as
+    /// `AES-D(km, mk_dv)[0..8] == 01 23 45 67 89 AB CD EF`, so a valid record
+    /// for a chosen `km` is simply `AES-E(km, <that constant> || anything)`.
+    #[test]
+    fn km_verifies_accepts_only_the_key_its_record_was_built_for() {
+        use crate::aacs::mkb::mkb_find_mk_dv;
+
+        const MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+        let km: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+
+        let mut plain = [0u8; 16];
+        plain[..8].copy_from_slice(&MAGIC);
+        plain[8..].copy_from_slice(&[0xA5; 8]);
+        let mk_dv = aes_ecb_encrypt(&km, &plain);
+
+        let mut mkb = vec![
+            0x10, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        mkb.extend_from_slice(&[0x81, 0x00, 0x00, 0x18]);
+        mkb.extend_from_slice(&mk_dv);
+        mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            mkb_find_mk_dv(&mkb),
+            Some(mk_dv),
+            "fixture malformed — the verify record is not being found at all"
+        );
+
+        assert!(
+            probe::km_verifies(&mkb, &km),
+            "the key the record was built for must verify"
+        );
+
+        // The half that kills the `-> true` mutant. One flipped bit is the
+        // strongest form of wrong key: a near-miss, not a random one.
+        let mut wrong = km;
+        wrong[15] ^= 0x01;
+        assert!(
+            !probe::km_verifies(&mkb, &wrong),
+            "a key differing by ONE BIT must not verify; if it did, the MK-pool \
+             brute force would accept whichever candidate it happened to try first"
+        );
+
+        // No verify record means UNVERIFIABLE, which is not the same as verified.
+        let bare = vec![0x10, 0x00, 0x00, 0x0C, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert!(
+            !probe::km_verifies(&bare, &km),
+            "an MKB with no verify record must not default to yes"
+        );
+    }
+
     /// `ResolvedChain.unit_keys` holds raw title-key bytes (the other rungs are
     /// self-redacting `types` newtypes). `Debug` must not leak the title keys.
     #[test]
