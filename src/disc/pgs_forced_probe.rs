@@ -16,6 +16,10 @@
 //! With a decrypting source it sees real PGS; without keys it reads ciphertext
 //! and observes no display sets, in which case it leaves each track's existing
 //! (vendor-label-derived) forced flag untouched rather than asserting anything.
+//!
+//! Truncated reads: the probe is best-effort, but "best-effort" must not mean
+//! "assert a verdict from an arbitrary prefix". [`StopReason`] records why the
+//! read loop ended and narrows what may be asserted accordingly.
 
 use crate::disc::{Codec, DiscTitle, Stream};
 use crate::mux::codec::CodecParser;
@@ -39,10 +43,6 @@ const CHUNK_SECTORS: u16 = 1024;
 /// non-forced set before accepting the forced verdict.
 const PROBE_BUDGET_SECTORS: u32 = 131_072;
 
-/// Read the title's PGS streams and set `SubtitleStream::forced` from their
-/// content. Best-effort: any read error ends the probe with whatever verdicts
-/// have accumulated. Only PGS tracks are touched (DVD VobSub forced comes from
-/// the IFO/vendor path).
 /// Memoises probe results across titles. Keyed by the title's exact extent
 /// list, so a hit returns a result computed from byte-identical input — many
 /// playlists on one disc reference the same clips (main feature, play-all,
@@ -50,6 +50,63 @@ const PROBE_BUDGET_SECTORS: u32 = 131_072;
 /// re-read from the drive once per playlist.
 pub(crate) type ForcedProbeCache = HashMap<Vec<(u32, u32)>, HashMap<u16, bool>>;
 
+/// Why the read loop stopped — which decides whether the observations it
+/// accumulated may be applied as an authoritative verdict.
+///
+/// The distinction matters because the two kinds of per-track verdict rest on
+/// opposite kinds of evidence:
+///
+///   * "not forced" is POSITIVE evidence — a non-forced display set was actually
+///     seen on the wire. Nothing read later can retract it, so it is sound no
+///     matter how the loop stopped.
+///   * "forced" is an ABSENCE claim — display sets were seen and none of them was
+///     non-forced. It is only sound if the read got far enough for that absence
+///     to mean something. On an arbitrarily truncated prefix it does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StopReason {
+    /// Every extent was read to its end, or every track had already settled as
+    /// not-forced. The observation is as complete as it will ever get.
+    Exhausted,
+    /// [`PROBE_BUDGET_SECTORS`] was reached. A DESIGNED stop, not a failure: the
+    /// natural exit never fires for a genuinely forced track, so the budget
+    /// exists precisely so that a forced verdict can be accepted from a bounded
+    /// prefix. A forced track's display sets appear throughout the title, so the
+    /// prefix is representative — treating this as inconclusive would disable
+    /// forced detection outright, the very thing the budget was added to enable.
+    Budget,
+    /// Operator cancellation. The bytes read were read correctly, but the cut-off
+    /// point is arbitrary — cancellation can land after a single chunk (or, as
+    /// with an already-cancelled halt, after none at all). Epistemically that is
+    /// the same arbitrary prefix as a read fault, so an absence claim from it is
+    /// not trustworthy.
+    Halted,
+    /// A read error, or a short/zero-length read. The rest of the data was never
+    /// seen; what was accumulated is an arbitrary prefix. Genuinely inconclusive.
+    ReadFailed,
+}
+
+impl StopReason {
+    /// Whether "no non-forced display set was seen" is a meaningful statement
+    /// about the track — i.e. whether a `forced` verdict may be asserted and the
+    /// result memoised.
+    fn absence_is_conclusive(self) -> bool {
+        match self {
+            Self::Exhausted | Self::Budget => true,
+            Self::Halted | Self::ReadFailed => false,
+        }
+    }
+}
+
+/// Read the title's PGS streams and set `SubtitleStream::forced` from their
+/// content. Only PGS tracks are touched (DVD VobSub forced comes from the
+/// IFO/vendor path).
+///
+/// Best-effort by design: this returns `()` and never fails. Where the read is
+/// cut short, the probe narrows what it is willing to assert instead of failing
+/// — see [`StopReason`]. A track whose verdict is not assertable keeps its
+/// existing vendor-label-derived flag, and an inconclusive run is NOT memoised,
+/// so one transient read fault cannot be replayed onto every other playlist
+/// sharing those extents.
 pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
     reader: &mut S,
     title: &mut DiscTitle,
@@ -88,44 +145,57 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
     let extents = title.extents.clone();
     let mut buf = vec![0u8; CHUNK_SECTORS as usize * SECTOR_BYTES];
     let mut sectors_read: u32 = 0;
-    'outer: for ext in &extents {
-        let mut lba = ext.start_lba;
-        let mut remaining = ext.sector_count;
-        while remaining > 0 {
-            // Bounded work and a responsive cancel: without these the probe reads
-            // the entire title whenever a track really is forced.
-            if halt.is_some_and(|h| h.is_cancelled()) || sectors_read >= PROBE_BUDGET_SECTORS {
-                break 'outer;
-            }
-            let budget_left = PROBE_BUDGET_SECTORS - sectors_read;
-            let count = remaining.min(CHUNK_SECTORS as u32).min(budget_left) as u16;
-            let want = count as usize * SECTOR_BYTES;
-            let n = match reader.read_sectors(lba, count, &mut buf[..want], false) {
-                Ok(n) => n,
-                Err(_) => break 'outer, // best-effort — stop, keep what we have
-            };
-            if n == 0 {
-                break 'outer;
-            }
-            for pes in demux.feed(&buf[..n]) {
-                if let (Some(parser), Some(tracker)) =
-                    (parsers.get_mut(&pes.pid), trackers.get_mut(&pes.pid))
-                {
-                    for frame in parser.parse(&pes) {
-                        tracker.observe(&frame.data);
+    // Record WHY the loop ended rather than leaving it implicit in the control
+    // flow: every exit below names its reason, and the reason decides what may be
+    // asserted from what was observed.
+    let stop = 'outer: {
+        for ext in &extents {
+            let mut lba = ext.start_lba;
+            let mut remaining = ext.sector_count;
+            while remaining > 0 {
+                // Bounded work and a responsive cancel: without these the probe
+                // reads the entire title whenever a track really is forced.
+                if halt.is_some_and(|h| h.is_cancelled()) {
+                    break 'outer StopReason::Halted;
+                }
+                if sectors_read >= PROBE_BUDGET_SECTORS {
+                    break 'outer StopReason::Budget;
+                }
+                let budget_left = PROBE_BUDGET_SECTORS - sectors_read;
+                let count = remaining.min(CHUNK_SECTORS as u32).min(budget_left) as u16;
+                let want = count as usize * SECTOR_BYTES;
+                let n = match reader.read_sectors(lba, count, &mut buf[..want], false) {
+                    Ok(n) => n,
+                    // Best-effort — stop reading, but the data past here was never
+                    // seen, so the observation is a truncated prefix.
+                    Err(_) => break 'outer StopReason::ReadFailed,
+                };
+                if n == 0 {
+                    // Short read: the extent claimed sectors the source would not
+                    // yield. Same truncated prefix as an error.
+                    break 'outer StopReason::ReadFailed;
+                }
+                for pes in demux.feed(&buf[..n]) {
+                    if let (Some(parser), Some(tracker)) =
+                        (parsers.get_mut(&pes.pid), trackers.get_mut(&pes.pid))
+                    {
+                        for frame in parser.parse(&pes) {
+                            tracker.observe(&frame.data);
+                        }
                     }
                 }
+                // Every track has already shown a non-forced set → nothing left to
+                // learn; stop reading the (huge) clip.
+                if trackers.values().all(ForcedTracker::settled_not_forced) {
+                    break 'outer StopReason::Exhausted;
+                }
+                lba += count as u32;
+                remaining -= count as u32;
+                sectors_read += count as u32;
             }
-            // Every track has already shown a non-forced set → nothing left to
-            // learn; stop reading the (huge) clip.
-            if trackers.values().all(ForcedTracker::settled_not_forced) {
-                break 'outer;
-            }
-            lba += count as u32;
-            remaining -= count as u32;
-            sectors_read += count as u32;
         }
-    }
+        StopReason::Exhausted
+    };
 
     // Drain any buffered final display set.
     for (pid, parser) in parsers.iter_mut() {
@@ -136,15 +206,39 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
         }
     }
 
-    // Collect the verdicts we actually observed, memoise them against this
-    // extent list, and apply. A track we saw no content for is absent from the
-    // map and keeps its vendor-derived flag.
+    // Collect the verdicts we are entitled to assert and apply them. A track
+    // absent from the map keeps its vendor-derived flag.
+    //
+    // Two gates, both PER TRACK, because the evidence is per track:
+    //   * `observed()` — saw no display set at all, so nothing is known. (Never
+    //     assert "not forced" from having seen nothing.)
+    //   * on a truncated run, `settled_not_forced()` — the track saw an actual
+    //     non-forced display set, which no further reading could retract, so that
+    //     verdict stands even though the run was cut short. A track that merely
+    //     hadn't YET seen a non-forced set is exactly the claim the truncation
+    //     invalidates, so it is dropped and keeps the vendor flag.
+    let conclusive = stop.absence_is_conclusive();
     let verdicts: HashMap<u16, bool> = trackers
         .iter()
-        .filter(|(_, t)| t.observed())
+        .filter(|(_, t)| t.observed() && (conclusive || t.settled_not_forced()))
         .map(|(&pid, t)| (pid, t.is_forced()))
         .collect();
-    cache.insert(key, verdicts.clone());
+    // Only memoise a run that reached a designed stop. The cache key is the
+    // extent list, so caching a truncated run would replay one read fault (or one
+    // cancellation) onto every other playlist that shares these clips, and a later
+    // title would never get the chance to re-read them successfully.
+    if conclusive {
+        cache.insert(key, verdicts.clone());
+    } else {
+        tracing::debug!(
+            target: "freemkv::scan",
+            stop = ?stop,
+            sectors_read,
+            asserted = verdicts.len(),
+            tracks = pg_pids.len(),
+            "forced-subtitle probe truncated; verdicts limited and not cached"
+        );
+    }
     apply_verdicts(title, &verdicts);
 }
 
@@ -465,6 +559,181 @@ mod tests {
         assert!(
             !s.forced,
             "a non-forced display set observed → forced verdict cleared"
+        );
+    }
+
+    /// What a [`PartialTsReader`] does once its BD-TS payload is exhausted.
+    enum ThenWhat {
+        /// Fail the read — the data past this point is never seen.
+        Error,
+        /// Keep serving readable (but PGS-free) sectors forever, so the probe
+        /// runs on to the sector budget instead.
+        Zeros,
+    }
+
+    /// Serves a fixed BD-TS byte stream (as [`TsReader`] does), then either fails
+    /// or runs on with zeros. Models the two truncated-run shapes: real content
+    /// observed, then the read abandoned mid-title, versus real content observed
+    /// and then a designed stop at the budget.
+    struct PartialTsReader<'a> {
+        inner: TsReader,
+        then: ThenWhat,
+        /// Cancelled the moment the payload runs out, to model an operator
+        /// cancelling MID-run — after real content has been observed.
+        cancel: Option<&'a crate::halt::Halt>,
+    }
+    impl PartialTsReader<'_> {
+        fn new(data: Vec<u8>, then: ThenWhat) -> Self {
+            Self {
+                inner: TsReader { data, pos: 0 },
+                then,
+                cancel: None,
+            }
+        }
+    }
+    impl SectorSource for PartialTsReader<'_> {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if self.inner.pos < self.inner.data.len() {
+                return self.inner.read_sectors(lba, count, buf, recovery);
+            }
+            if let Some(h) = self.cancel.take() {
+                h.cancel();
+            }
+            match self.then {
+                ThenWhat::Error => Err(crate::error::Error::DiscRead {
+                    sector: lba as u64,
+                    status: None,
+                    sense: None,
+                }),
+                ThenWhat::Zeros => {
+                    buf.fill(0);
+                    Ok(buf.len())
+                }
+            }
+        }
+        fn capacity_sectors(&self) -> u32 {
+            u32::MAX
+        }
+    }
+
+    /// A title whose extents need more than one read, so a reader can serve
+    /// content on the first call and stop (error / budget) on a later one.
+    fn multi_read_pgs_title(pid: u16, vendor_forced: bool) -> DiscTitle {
+        let mut t = pgs_title(pid, vendor_forced);
+        t.extents = vec![
+            Extent {
+                start_lba: 0,
+                sector_count: 4,
+            },
+            Extent {
+                start_lba: 100,
+                sector_count: u32::MAX,
+            },
+        ];
+        t
+    }
+
+    #[test]
+    fn read_error_after_partial_content_preserves_vendor_forced() {
+        // The defect: a forced verdict rests on the ABSENCE of a non-forced
+        // display set. When the read dies mid-title that absence means nothing —
+        // the rest of the track was never seen — yet the probe used to apply it as
+        // authoritative, overwriting the vendor flag from a fraction of the data.
+        let pid = 0x1200u16;
+        let mut reader = PartialTsReader::new(ts_stream(pid, &pcs_display(true)), ThenWhat::Error);
+        let mut title = multi_read_pgs_title(pid, false); // vendor label: NOT forced
+        let mut cache = ForcedProbeCache::new();
+        probe_and_set_forced(&mut reader, &mut title, &mut cache, None);
+        let Stream::Subtitle(s) = &title.streams[0] else {
+            panic!()
+        };
+        assert!(
+            !s.forced,
+            "a forced verdict from a read-truncated prefix must not overwrite the vendor flag"
+        );
+        // And it must not be memoised: the cache is keyed on the extent list, so a
+        // cached inconclusive result would spread this one read fault across every
+        // playlist sharing these clips and block any later re-read.
+        assert!(
+            cache.is_empty(),
+            "an inconclusive probe must not be cached against these extents"
+        );
+    }
+
+    #[test]
+    fn read_error_keeps_a_track_that_already_settled_not_forced() {
+        // Per-track, not per-title: "not forced" is POSITIVE evidence — a
+        // non-forced display set was actually seen — and no amount of unread data
+        // could retract it. That verdict survives the truncation even though a
+        // forced verdict would not.
+        let pid = 0x1200u16;
+        let mut reader = PartialTsReader::new(ts_stream(pid, &pcs_display(false)), ThenWhat::Error);
+        let mut title = multi_read_pgs_title(pid, true); // vendor label: forced
+        let mut cache = ForcedProbeCache::new();
+        probe_and_set_forced(&mut reader, &mut title, &mut cache, None);
+        let Stream::Subtitle(s) = &title.streams[0] else {
+            panic!()
+        };
+        assert!(
+            !s.forced,
+            "an observed non-forced display set stands even when the read was cut short"
+        );
+        assert!(cache.is_empty(), "still an inconclusive run — not cached");
+    }
+
+    #[test]
+    fn budget_stop_still_applies_the_forced_verdict() {
+        // The budget is a DESIGNED stop, not a failure: the probe's natural exit
+        // never fires for a genuinely forced track, so the budget is exactly the
+        // mechanism by which a forced verdict gets accepted from a bounded prefix.
+        // Classifying it as inconclusive would disable forced detection.
+        let pid = 0x1200u16;
+        let mut reader = PartialTsReader::new(ts_stream(pid, &pcs_display(true)), ThenWhat::Zeros);
+        let mut title = multi_read_pgs_title(pid, false); // vendor label: NOT forced
+        let mut cache = ForcedProbeCache::new();
+        probe_and_set_forced(&mut reader, &mut title, &mut cache, None);
+        let Stream::Subtitle(s) = &title.streams[0] else {
+            panic!()
+        };
+        assert!(
+            s.forced,
+            "a forced verdict from a budget-bounded prefix must still be applied"
+        );
+        assert_eq!(cache.len(), 1, "a conclusive probe is memoised");
+    }
+
+    #[test]
+    fn cancelled_probe_is_neither_asserted_nor_cached() {
+        // A halt lands at an arbitrary chunk boundary, so an absence claim from it
+        // is worth no more than one from a read fault. Here the cancel arrives
+        // AFTER a forced display set has been observed — the same setup that,
+        // uncancelled, reaches the budget and legitimately asserts forced (see
+        // budget_stop_still_applies_the_forced_verdict).
+        let pid = 0x1200u16;
+        let halt = crate::halt::Halt::new();
+        let mut reader = PartialTsReader {
+            cancel: Some(&halt),
+            ..PartialTsReader::new(ts_stream(pid, &pcs_display(true)), ThenWhat::Zeros)
+        };
+        let mut title = multi_read_pgs_title(pid, false);
+        let mut cache = ForcedProbeCache::new();
+        probe_and_set_forced(&mut reader, &mut title, &mut cache, Some(&halt));
+        let Stream::Subtitle(s) = &title.streams[0] else {
+            panic!()
+        };
+        assert!(
+            !s.forced,
+            "a verdict from a cancelled probe must not overwrite the vendor flag"
+        );
+        assert!(
+            cache.is_empty(),
+            "a cancelled probe must not poison the extent cache"
         );
     }
 
