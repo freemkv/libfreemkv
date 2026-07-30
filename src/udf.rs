@@ -1193,7 +1193,7 @@ fn read_file_size(reader: &mut dyn SectorSource, meta_start: u32, meta_lba: u32)
 /// UDF uses a compression ID as the first byte:
 ///   8  = 8-bit characters (ASCII)
 ///   16 = 16-bit big-endian Unicode (UTF-16BE)
-fn parse_udf_name(data: &[u8]) -> String {
+pub(crate) fn parse_udf_name(data: &[u8]) -> String {
     if data.is_empty() {
         return String::new();
     }
