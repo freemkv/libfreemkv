@@ -156,6 +156,15 @@ pub const E_MUX_EMPTY: u16 = 9023;
 /// [`is_skippable_title_stub`] treats as a skippable empty nav/menu stub — a
 /// cap-overflow is a real title and must never be silently skipped.
 pub const E_MUX_HEADER_BUFFER_EXCEEDED: u16 = 9051;
+/// An `mkv://` SOURCE Block declared lacing (RFC 9559 §10.3) whose header does
+/// not describe its own payload, so the frame boundaries inside the Block are
+/// unknowable. Deliberately NOT [`E_MKV_INVALID`], which
+/// [`is_skippable_title_stub`] treats as a skippable empty nav/menu stub: a
+/// laced Block belongs to a track with real media in it, and mis-reporting the
+/// rejection as a stub would drop that media from a run that then exits
+/// successfully — the same conflation [`E_MUX_HEADER_BUFFER_EXCEEDED`] exists to
+/// avoid.
+pub const E_MKV_LACING_INVALID: u16 = 9052;
 pub const E_EXTENT_NOT_UNIT_ALIGNED: u16 = 9030;
 /// `mp4://` output but the title has no (primary) video track to carry.
 pub const E_MP4_NO_VIDEO_TRACK: u16 = 9048;
@@ -297,6 +306,10 @@ pub enum Error {
     },
     IfoParse,
     MkvInvalid,
+    /// An `mkv://` source Block's lacing header does not describe its payload —
+    /// the frames packed into that Block cannot be separated. NOT
+    /// [`Error::MkvInvalid`]: see [`E_MKV_LACING_INVALID`].
+    MkvLacingInvalid,
     NoStreams,
     /// A [`crate::StreamSelection`] listed a PID that does not exist in the
     /// title's declared streams — a caller bug (e.g. a stale scan), reported
@@ -604,6 +617,7 @@ impl Error {
             Error::DiscTitleRange { .. } => E_DISC_TITLE_RANGE,
             Error::IfoParse => E_IFO_PARSE,
             Error::MkvInvalid => E_MKV_INVALID,
+            Error::MkvLacingInvalid => E_MKV_LACING_INVALID,
             Error::NoStreams => E_NO_STREAMS,
             Error::SelectionPidUnknown { .. } => E_SELECTION_PID_UNKNOWN,
             Error::MapfileInvalid { .. } => E_MAPFILE_INVALID,
@@ -895,6 +909,9 @@ impl From<Error> for std::io::Error {
             // 9051 MuxHeaderBufferExceeded: the source kept yielding frames but
             // never its codec init data — the input is unusable as declared.
             E_MUX_HEADER_BUFFER_EXCEEDED => std::io::ErrorKind::InvalidData,
+            // 9052 MkvLacingInvalid: a source Block's lacing header does not
+            // describe its own payload — malformed input data.
+            E_MKV_LACING_INVALID => std::io::ErrorKind::InvalidData,
             // mp4:// demux errors: a malformed/truncated source file
             // (E_MP4_INVALID), or a source whose tracks the mux can't use — no
             // video track / missing codec-private config. All are invalid data.
@@ -1391,6 +1408,7 @@ mod tests {
             E_NETWORK_ADDR_BLOCKED,
             E_MUX_EMPTY,
             E_MUX_HEADER_BUFFER_EXCEEDED,
+            E_MKV_LACING_INVALID,
             E_MP4_NO_VIDEO_TRACK,
             E_MP4_INVALID,
             E_MP4_MISSING_CODEC_PRIVATE,
@@ -1485,6 +1503,7 @@ mod tests {
                 Error::MuxHeaderBufferExceeded { bytes: 0 },
                 E_MUX_HEADER_BUFFER_EXCEEDED,
             ),
+            (Error::MkvLacingInvalid, E_MKV_LACING_INVALID),
             (Error::Mp4NoVideoTrack, E_MP4_NO_VIDEO_TRACK),
             (Error::Mp4Invalid, E_MP4_INVALID),
             (Error::Mp4MissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),

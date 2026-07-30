@@ -99,6 +99,13 @@ impl<R: Read + Seek> Mp4Reader<R> {
         let mut title = DiscTitle::empty();
         title.playlist = name;
 
+        // Movie timescale (ISO/IEC 14496-12 §8.2.2). An edit list's
+        // `segment_duration` is expressed in it, while its `media_time` is in the
+        // track's own media timescale, so both are needed to place an edit.
+        let movie_timescale = find_box(&moov, b"mvhd")
+            .and_then(mvhd_timescale)
+            .filter(|&t| t != 0);
+
         let mut samples: Vec<SampleRef> = Vec::new();
         let mut codec_privates: Vec<Option<Vec<u8>>> = Vec::new();
         let mut track_idx = 0usize;
@@ -288,12 +295,27 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 (ticks as i128 * NS / timescale as i128).clamp(i64::MIN as i128, i64::MAX as i128)
                     as i64
             };
+            // Edit list (ISO/IEC 14496-12 §8.6.5 `edts` / §8.6.6 `elst`): the
+            // presentation timeline is NOT the media timeline. Ignoring it — which
+            // this reader did — starts every track at media time 0, so a track
+            // carrying the standard encoder-delay/A-V-offset edit ends up shifted
+            // against its siblings for the whole title, silently.
+            let edit_offset_ticks = find_box(trak, b"edts")
+                .and_then(|edts| find_box(edts, b"elst"))
+                .map(|elst| {
+                    let entries = parse_elst(elst);
+                    elst_offset_ticks(&entries, movie_timescale, timescale, track_idx)
+                })
+                .unwrap_or(0);
+
             let mut decode_ticks: i64 = 0;
             for (i, &size) in sizes.iter().enumerate() {
                 let dur = durations.get(i).copied().unwrap_or(0);
                 let comp = ctts.get(i).copied().unwrap_or(0);
-                let dts_ns = to_ns(decode_ticks);
-                let pts_ticks = decode_ticks.saturating_add(comp as i64);
+                let dts_ns = to_ns(decode_ticks.saturating_add(edit_offset_ticks));
+                let pts_ticks = decode_ticks
+                    .saturating_add(comp as i64)
+                    .saturating_add(edit_offset_ticks);
                 let pts_ns = to_ns(pts_ticks);
                 decode_ticks = decode_ticks.saturating_add(dur as i64);
                 let keyframe = match &sync {
@@ -472,6 +494,152 @@ fn be32(b: &[u8], o: usize) -> u32 {
 }
 fn be16(b: &[u8], o: usize) -> u16 {
     u16::from_be_bytes([b[o], b[o + 1]])
+}
+
+/// mvhd (version 0/1) → movie timescale (ISO/IEC 14496-12 §8.2.2).
+fn mvhd_timescale(b: &[u8]) -> Option<u32> {
+    let version = b.first().copied()?;
+    if version == 1 {
+        // version(1)+flags(3) creation(8) modification(8) timescale(4) ...
+        (b.len() >= 24).then(|| be32(b, 20))
+    } else {
+        // version(1)+flags(3) creation(4) modification(4) timescale(4) ...
+        (b.len() >= 16).then(|| be32(b, 12))
+    }
+}
+
+/// Upper bound on parsed `elst` entries. Only the leading empty edits and the
+/// FIRST non-empty edit shape the offset applied below, so a longer list buys
+/// nothing but allocation; the cap keeps a crafted 256 MiB `moov` from turning
+/// a box into a larger Vec than the box itself.
+const MAX_ELST_ENTRIES: usize = 1024;
+
+/// One `elst` entry: `(segment_duration, media_time, media_rate_integer)`.
+type EditListEntry = (u64, i64, i16);
+
+/// Parse an `elst` payload (ISO/IEC 14496-12 §8.6.6). Entry count is clamped
+/// both by the box's own bytes and by [`MAX_ELST_ENTRIES`].
+///
+/// Version 1 entries are `segment_duration:u64, media_time:i64,
+/// media_rate_integer:i16, media_rate_fraction:i16` (20 bytes); version 0 uses
+/// 32-bit duration/time (12 bytes).
+fn parse_elst(b: &[u8]) -> Vec<EditListEntry> {
+    if b.len() < 8 {
+        return Vec::new();
+    }
+    let version = b[0];
+    let entry_size = if version == 1 { 20 } else { 12 };
+    let declared = be32(b, 4) as usize;
+    let available = (b.len() - 8) / entry_size;
+    let n = declared.min(available).min(MAX_ELST_ENTRIES);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let o = 8 + i * entry_size;
+        let (seg, media_time, rate_off) = if version == 1 {
+            let seg = u64::from_be_bytes([
+                b[o],
+                b[o + 1],
+                b[o + 2],
+                b[o + 3],
+                b[o + 4],
+                b[o + 5],
+                b[o + 6],
+                b[o + 7],
+            ]);
+            let mt = i64::from_be_bytes([
+                b[o + 8],
+                b[o + 9],
+                b[o + 10],
+                b[o + 11],
+                b[o + 12],
+                b[o + 13],
+                b[o + 14],
+                b[o + 15],
+            ]);
+            (seg, mt, 16)
+        } else {
+            (be32(b, o) as u64, be32(b, o + 4) as i32 as i64, 8)
+        };
+        let rate = be16(b, o + rate_off) as i16;
+        out.push((seg, media_time, rate));
+    }
+    out
+}
+
+/// Presentation-time offset an edit list imposes on a track's samples, in the
+/// track's MEDIA timescale ticks (ISO/IEC 14496-12 §8.6.5-§8.6.6).
+///
+/// Two constructs cover essentially every real edit list, and both reduce to a
+/// constant shift of the whole track:
+///   * an EMPTY edit (`media_time == -1`) before the media edit, whose
+///     `segment_duration` — in MOVIE timescale ticks — delays presentation;
+///   * a non-empty edit whose `media_time` trims that much media off the front.
+///
+/// So the offset is `(sum of leading empty segment_durations) - media_time`.
+/// A list with several non-empty edits, or a non-empty edit at a rate other than
+/// 1, describes a timeline this frame model cannot express (it would need samples
+/// dropped, reordered or repeated); the leading edit is still honoured, and the
+/// part that is not is LOGGED rather than passed off as a faithful copy.
+fn elst_offset_ticks(
+    entries: &[EditListEntry],
+    movie_timescale: Option<u32>,
+    media_timescale: u32,
+    track_idx: usize,
+) -> i64 {
+    let mut empty_movie_ticks: u64 = 0;
+    let mut trim_media_ticks: i64 = 0;
+    let mut media_edits = 0usize;
+    let mut odd_rate = false;
+
+    for &(segment_duration, media_time, rate) in entries {
+        if media_time < 0 {
+            // Empty edit: blank presentation time. Only the ones BEFORE the first
+            // media edit shift this track's start.
+            if media_edits == 0 {
+                empty_movie_ticks = empty_movie_ticks.saturating_add(segment_duration);
+            }
+            continue;
+        }
+        media_edits += 1;
+        if media_edits == 1 {
+            trim_media_ticks = media_time;
+            odd_rate = rate != 1;
+        }
+    }
+
+    if media_edits > 1 || odd_rate {
+        tracing::warn!(
+            track = track_idx,
+            media_edits,
+            odd_rate,
+            "mp4: edit list describes a timeline richer than a constant shift \
+             (several media edits, or a rate other than 1); only the leading edit \
+             is applied and the remainder of the presentation timeline is not"
+        );
+    }
+
+    // An empty edit's duration is in MOVIE ticks; convert to media ticks before
+    // subtracting the media-timescale trim. i128 so neither product overflows.
+    let delay_media_ticks = match movie_timescale {
+        Some(mts) if empty_movie_ticks > 0 => {
+            ((empty_movie_ticks as i128 * media_timescale as i128) / mts as i128)
+                .clamp(0, i64::MAX as i128) as i64
+        }
+        Some(_) => 0,
+        None => {
+            if empty_movie_ticks > 0 {
+                tracing::warn!(
+                    track = track_idx,
+                    "mp4: edit list has an empty edit but the movie timescale is \
+                     absent or zero, so its delay cannot be converted to media \
+                     ticks; the delay is not applied"
+                );
+            }
+            0
+        }
+    };
+
+    delay_media_ticks.saturating_sub(trim_media_ticks)
 }
 
 /// mdhd (version 0/1) → media timescale.
@@ -1326,6 +1494,143 @@ mod tests {
             rd.unwrap().info().streams.len(),
             1,
             "the timescale-0 track is still indexed"
+        );
+    }
+
+    // ============================================================
+    // Edit lists — ISO/IEC 14496-12 §8.6.5 (`edts`) / §8.6.6 (`elst`).
+    // ============================================================
+
+    /// A `mvhd` payload declaring the movie timescale (ISO/IEC 14496-12 §8.2.2).
+    fn mvhd_box(timescale: u32) -> Vec<u8> {
+        // v0: version+flags(4) creation(4) modification(4) timescale(4) duration(4) …
+        let mut p = vec![0u8; 100];
+        p[12..16].copy_from_slice(&timescale.to_be_bytes());
+        mp4_box(b"mvhd", &p)
+    }
+
+    /// A version-0 `elst` payload: `(segment_duration, media_time)` per entry,
+    /// each at media_rate 1.
+    fn elst_v0(entries: &[(u32, i32)]) -> Vec<u8> {
+        let mut p = vec![0u8, 0, 0, 0]; // version 0 + flags
+        p.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for &(seg, media_time) in entries {
+            p.extend_from_slice(&seg.to_be_bytes());
+            p.extend_from_slice(&media_time.to_be_bytes());
+            p.extend_from_slice(&1i16.to_be_bytes()); // media_rate_integer
+            p.extend_from_slice(&0i16.to_be_bytes()); // media_rate_fraction
+        }
+        p
+    }
+
+    /// Insert an `edts > elst` into an existing `trak` box.
+    fn trak_with_elst(trak: &[u8], elst_payload: &[u8]) -> Vec<u8> {
+        let mut payload = mp4_box(b"edts", &mp4_box(b"elst", elst_payload));
+        payload.extend_from_slice(&trak[8..]); // the original trak's children
+        mp4_box(b"trak", &payload)
+    }
+
+    /// Regression (silent A/V desync): the sample timeline was built purely from
+    /// stts/ctts starting at tick 0 and no `edts`/`elst` was ever parsed, so the
+    /// presentation timeline an edit list defines was discarded. A non-empty edit
+    /// with `media_time = 1024` — the standard way encoder delay is expressed —
+    /// must move the track's presentation, not be ignored.
+    #[test]
+    fn edit_list_media_time_shifts_the_presentation_timeline() {
+        use std::io::Cursor;
+        let trak = trak_with_elst(&audio_trak(48_000), &elst_v0(&[(0, 1024)]));
+        let moov = mp4_box(b"moov", &trak);
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "elst".into()).unwrap();
+        assert_eq!(rd.samples.len(), 1);
+        // media_time 1024 at 48 kHz trims 1024 ticks off the front, so the first
+        // sample sits 1024 ticks BEFORE the presentation origin.
+        let want = -(1024i128 * NS / 48_000) as i64;
+        assert_eq!(rd.samples[0].pts_ns, want, "media_time must shift the pts");
+        assert_eq!(rd.samples[0].dts_ns, want, "and the dts with it");
+        assert_ne!(want, 0, "the shift is observable");
+    }
+
+    /// An EMPTY edit (`media_time == -1`) delays presentation by its
+    /// `segment_duration`, which is in MOVIE timescale ticks and must be
+    /// converted to the track's media timescale before it is applied.
+    #[test]
+    fn empty_edit_delays_presentation_in_movie_timescale() {
+        use std::io::Cursor;
+        // Movie timescale 1000 → segment_duration 40 = 40 ms of blank leader,
+        // then the media edit itself.
+        let trak = trak_with_elst(&audio_trak(48_000), &elst_v0(&[(40, -1), (0, 0)]));
+        let mut moov_payload = mvhd_box(1000);
+        moov_payload.extend_from_slice(&trak);
+        let moov = mp4_box(b"moov", &moov_payload);
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "empty-edit".into()).unwrap();
+        assert_eq!(rd.samples.len(), 1);
+        assert_eq!(
+            rd.samples[0].pts_ns, 40_000_000,
+            "a 40 ms empty edit delays the track by 40 ms"
+        );
+    }
+
+    /// A track with no `edts` is untouched — the shift only ever comes from a
+    /// declared edit list.
+    #[test]
+    fn no_edit_list_leaves_the_timeline_at_zero() {
+        use std::io::Cursor;
+        let moov = mp4_box(b"moov", &audio_trak(48_000));
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "no-elst".into()).unwrap();
+        assert_eq!(rd.samples[0].pts_ns, 0);
+        assert_eq!(rd.samples[0].dts_ns, 0);
+    }
+
+    /// `elst` decoding: both versions, the entry count bounded by the box's own
+    /// bytes, and the offset arithmetic in isolation.
+    #[test]
+    fn parse_elst_and_offset_arithmetic() {
+        // Version 0, two entries: an empty edit then a media edit.
+        let v0 = elst_v0(&[(40, -1), (0, 1024)]);
+        let entries = parse_elst(&v0);
+        assert_eq!(entries, vec![(40, -1, 1), (0, 1024, 1)]);
+
+        // Version 1: 64-bit segment_duration and media_time.
+        let mut v1 = vec![1u8, 0, 0, 0];
+        v1.extend_from_slice(&1u32.to_be_bytes());
+        v1.extend_from_slice(&5_000u64.to_be_bytes());
+        v1.extend_from_slice(&(-1i64).to_be_bytes());
+        v1.extend_from_slice(&1i16.to_be_bytes());
+        v1.extend_from_slice(&0i16.to_be_bytes());
+        assert_eq!(parse_elst(&v1), vec![(5_000, -1, 1)]);
+
+        // A declared count larger than the box can hold is clamped by the bytes.
+        let mut lying = elst_v0(&[(0, 0)]);
+        lying[4..8].copy_from_slice(&9_999u32.to_be_bytes());
+        assert_eq!(parse_elst(&lying).len(), 1, "bounded by the box bytes");
+        // Too short to hold even the header → no entries, no panic.
+        assert!(parse_elst(&[0, 0, 0, 0]).is_empty());
+
+        // Offset: the empty edit's 40 movie ticks at movie timescale 1000 is
+        // 40 ms = 1920 ticks at 48 kHz, minus a media_time trim of 1024.
+        assert_eq!(
+            elst_offset_ticks(&[(40, -1, 1), (0, 1024, 1)], Some(1000), 48_000, 0),
+            1920 - 1024
+        );
+        // No movie timescale → the empty edit's delay cannot be converted, so
+        // only the trim applies (and it is logged, not silently dropped).
+        assert_eq!(
+            elst_offset_ticks(&[(40, -1, 1), (0, 1024, 1)], None, 48_000, 0),
+            -1024
+        );
+        // An empty list, or a single identity edit, shifts nothing.
+        assert_eq!(elst_offset_ticks(&[], Some(1000), 48_000, 0), 0);
+        assert_eq!(elst_offset_ticks(&[(1000, 0, 1)], Some(1000), 48_000, 0), 0);
+        // Only the FIRST media edit's media_time is applied; trailing empty
+        // edits do not add to the leading delay.
+        assert_eq!(
+            elst_offset_ticks(&[(0, 512, 1), (40, -1, 1)], Some(1000), 48_000, 0),
+            -512
+        );
+        // A hostile segment_duration cannot overflow the tick conversion.
+        assert_eq!(
+            elst_offset_ticks(&[(u64::MAX, -1, 1)], Some(1), 48_000, 0),
+            i64::MAX,
         );
     }
 
