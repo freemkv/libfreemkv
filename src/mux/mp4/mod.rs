@@ -82,8 +82,17 @@ fn estimate_reserve(title: &DiscTitle, included: &[usize]) -> u64 {
                 est_samples += dur * fps;
             }
             DiscStream::Audio(a) => {
-                // ~1536 samples per (E-)AC-3 frame.
-                est_samples += dur * (a.sample_rate.hz() / 1536.0);
+                // Samples per frame differs sharply by codec, and 1.6.0 added DTS
+                // to the carried set (audio_fits now admits Dts | DtsHdMa |
+                // DtsHdHr). A DTS core AU is (nblks+1)*32 — commonly 512 samples,
+                // a third of an (E-)AC-3 frame's 1536 — so modelling every audio
+                // track as AC-3 under-reserved a DTS track's sample table 3x and
+                // pushed the mux onto the moov-at-end fallback.
+                let samples_per_frame = match a.codec {
+                    Codec::Dts | Codec::DtsHdMa | Codec::DtsHdHr => 512.0,
+                    _ => 1536.0,
+                };
+                est_samples += dur * (a.sample_rate.hz() / samples_per_frame);
             }
             DiscStream::Subtitle(_) => {}
         }
