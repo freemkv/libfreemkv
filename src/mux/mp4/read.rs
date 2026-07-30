@@ -108,6 +108,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 break; // bound track count so the per-track PID can't overflow u16
             }
             let Some(mdia) = find_box(trak, b"mdia") else {
+                tracing::warn!(track = track_idx, "mp4: trak has no mdia, dropping track");
                 continue;
             };
             let timescale = find_box(mdia, b"mdhd")
@@ -117,12 +118,15 @@ impl<R: Read + Seek> Mp4Reader<R> {
             let language = find_box(mdia, b"mdhd").and_then(mdhd_language);
             let handler = find_box(mdia, b"hdlr").and_then(hdlr_type);
             let Some(minf) = find_box(mdia, b"minf") else {
+                tracing::warn!(track = track_idx, "mp4: mdia has no minf, dropping track");
                 continue;
             };
             let Some(stbl) = find_box(minf, b"stbl") else {
+                tracing::warn!(track = track_idx, "mp4: minf has no stbl, dropping track");
                 continue;
             };
             let Some(stsd) = find_box(stbl, b"stsd") else {
+                tracing::warn!(track = track_idx, "mp4: stbl has no stsd, dropping track");
                 continue;
             };
 
@@ -133,7 +137,11 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 channels,
             }) = parse_stsd(stsd)
             else {
-                continue; // unrecognised sample entry — skip the track
+                tracing::warn!(
+                    track = track_idx,
+                    "mp4: unrecognised stsd sample entry, dropping track"
+                );
+                continue;
             };
 
             // Build the stream model for this track.
@@ -162,7 +170,13 @@ impl<R: Read + Seek> Mp4Reader<R> {
                     purpose: LabelPurpose::Normal,
                     label: String::new(),
                 }),
-                _ => continue, // non-A/V handler
+                _ => {
+                    tracing::debug!(
+                        track = track_idx,
+                        "mp4: non-audio/video handler, skipping track"
+                    );
+                    continue;
+                }
             };
 
             // Per-sample tables. `stsz` is bounded by the remaining global budget;
@@ -184,6 +198,11 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 .or_else(|| find_box(stbl, b"co64").map(|b| parse_stco(b, true)))
                 .unwrap_or_default();
             if chunk_offsets.is_empty() {
+                tracing::warn!(
+                    track = track_idx,
+                    samples = n,
+                    "mp4: stbl has samples but no stco/co64 chunk-offset table, dropping track"
+                );
                 // Samples exist but there is no chunk-offset table: the stbl is
                 // malformed and every sample offset would resolve to file byte 0
                 // (muxing header bytes as frame data). Drop the track rather than
@@ -192,16 +211,43 @@ impl<R: Read + Seek> Mp4Reader<R> {
             }
             let stsc = find_box(stbl, b"stsc").map(parse_stsc).unwrap_or_default();
             if stsc.is_empty() {
+                tracing::warn!(
+                    track = track_idx,
+                    samples = n,
+                    "mp4: stbl has samples but no stsc sample-to-chunk map, dropping track"
+                );
                 // No sample-to-chunk map: samples can't be placed against the chunk
                 // offsets (they would pack from byte 0). Drop the track rather than
                 // emit header bytes as frame data — a valid stbl always has stsc.
                 continue;
             }
             let offsets = sample_offsets(&sizes, &chunk_offsets, &stsc);
+            if offsets.len() < sizes.len() {
+                // The stsc passed the non-empty guard but does not place every
+                // sample. The unplaced tail has no real offset, so carrying the
+                // track would read frames from arbitrary file bytes.
+                tracing::warn!(
+                    track = track_idx,
+                    placed = offsets.len(),
+                    samples = n,
+                    "mp4: stsc places fewer samples than stsz declares, dropping track"
+                );
+                continue;
+            }
             let durations = find_box(stbl, b"stts")
                 .map(|b| parse_stts(b, n))
                 .unwrap_or_default();
-            if durations.is_empty() {
+            if durations.len() < n {
+                // Absent OR short: `stts` is mandatory and must cover every sample
+                // (ISO/IEC 14496-12 §8.6.1). A short table gave every unmapped tail
+                // sample dur=0, collapsing the whole tail onto one instant — the
+                // same degenerate timing the absent case refuses, so refuse both.
+                tracing::warn!(
+                    track = track_idx,
+                    durations = durations.len(),
+                    samples = n,
+                    "mp4: stts does not cover every sample, dropping track"
+                );
                 // Samples exist but there is no decoding-time table: `stts` is
                 // mandatory in a valid stbl (ISO/IEC 14496-12 §8.6.1). Without it
                 // every sample would take dur=0 → all-zero, identical timestamps,
@@ -682,15 +728,11 @@ fn sample_offsets(sizes: &[u32], chunk_offsets: &[u64], stsc: &[(u32, u32)]) -> 
             sidx += 1;
         }
     }
-    // Any trailing samples with no chunk mapping: pack after the last offset.
-    while offsets.len() < sizes.len() {
-        let last = offsets.last().copied().unwrap_or(0);
-        let last_sz = sizes
-            .get(offsets.len().saturating_sub(1))
-            .copied()
-            .unwrap_or(0);
-        offsets.push(last.saturating_add(last_sz as u64));
-    }
+    // Samples the stsc did not place have NO known location. Fabricating one by
+    // packing after the last offset invents a position, and the frame is then read
+    // from arbitrary file bytes — exactly the "emit garbage" outcome the stco/stsc
+    // guards above refuse. Report the shortfall instead and let the caller drop
+    // the track.
     offsets
 }
 
@@ -1334,7 +1376,11 @@ mod tests {
             p.extend_from_slice(&[0, 0, 0, 0]);
             p.extend_from_slice(&1u32.to_be_bytes()); // count
             p.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
-            p.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk
+            // Deliberately large: the stsz COUNT is the lie under test, so the
+            // stsc and stts must still cover whatever count survives the file_len
+            // bound. Both are clamped to the real sample count when expanded, so
+            // this places every bounded sample without itself being degenerate.
+            p.extend_from_slice(&0xFFFFu32.to_be_bytes()); // samples_per_chunk
             p.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx
             mp4_box(b"stsc", &p)
         };
@@ -1342,7 +1388,7 @@ mod tests {
             let mut p = Vec::new();
             p.extend_from_slice(&[0, 0, 0, 0]); // version+flags
             p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-            p.extend_from_slice(&1u32.to_be_bytes()); // sample_count
+            p.extend_from_slice(&0xFFFFu32.to_be_bytes()); // sample_count (see stsc)
             p.extend_from_slice(&1000u32.to_be_bytes()); // sample_delta
             mp4_box(b"stts", &p)
         };
@@ -1421,7 +1467,11 @@ mod tests {
             p.extend_from_slice(&[0, 0, 0, 0]);
             p.extend_from_slice(&1u32.to_be_bytes()); // count
             p.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
-            p.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk
+            // All 3 samples live in the single chunk. This MUST match the stsz
+            // count: an stsc placing fewer samples than stsz declares is a
+            // malformed stbl, and the reader now drops such a track rather than
+            // fabricating offsets for the unplaced tail.
+            p.extend_from_slice(&3u32.to_be_bytes()); // samples_per_chunk
             p.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx
             mp4_box(b"stsc", &p)
         };
@@ -1500,6 +1550,78 @@ mod tests {
         assert!(
             rd.is_err(),
             "a track with stsz but no stts must be dropped; all-dropped → Mp4Invalid"
+        );
+    }
+
+    /// An `stsc` that PASSES the non-empty guard but places fewer samples than
+    /// `stsz` declares must drop the track. `sample_offsets` used to pack the
+    /// unplaced tail after the last known offset, inventing a position, so those
+    /// frames were read from arbitrary file bytes — the same "emit garbage"
+    /// outcome the stco/stsc presence guards exist to refuse.
+    ///
+    /// Mutation check: restore the trailing `while offsets.len() < sizes.len()`
+    /// pack-after-last loop and this file indexes 3 samples instead of erroring.
+    #[test]
+    fn stsc_placing_fewer_samples_than_stsz_drops_the_track() {
+        use std::io::Cursor;
+        // audio_trak_missing(b"____") is the complete, consistent fixture: stsz=3
+        // and stsc samples_per_chunk=3. Knock samples_per_chunk down to 1 so the
+        // stsc is present and non-empty yet places only sample 1 of 3.
+        let mut trak = audio_trak_missing(b"____");
+        let stsc_tag = b"stsc";
+        let pos = trak
+            .windows(4)
+            .position(|w| w == stsc_tag)
+            .expect("fixture has an stsc");
+        // stsc payload: version+flags(4) entry_count(4) first_chunk(4)
+        // samples_per_chunk(4) — so samples_per_chunk starts 16 bytes past the tag.
+        let spc = pos + 4 + 12;
+        assert_eq!(
+            &trak[spc..spc + 4],
+            &3u32.to_be_bytes(),
+            "expected the consistent fixture's samples_per_chunk = 3"
+        );
+        trak[spc..spc + 4].copy_from_slice(&1u32.to_be_bytes());
+
+        let moov = mp4_box(b"moov", &trak);
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "short-stsc".into());
+        assert!(
+            rd.is_err(),
+            "an stsc that places 1 of 3 samples must drop the track; \
+             all-dropped → Mp4Invalid"
+        );
+    }
+
+    /// A SHORT `stts` — present and non-empty, but covering fewer samples than
+    /// `stsz` declares — must drop the track just like an absent one. The tail
+    /// samples took `dur = 0`, collapsing the whole tail onto a single timestamp,
+    /// which is the exact degenerate timing the absent-stts guard refuses.
+    ///
+    /// Mutation check: weaken the guard back to `durations.is_empty()` and this
+    /// file indexes 3 samples whose last two share one timestamp.
+    #[test]
+    fn short_stts_drops_the_track_like_an_absent_one() {
+        use std::io::Cursor;
+        let mut trak = audio_trak_missing(b"____");
+        let pos = trak
+            .windows(4)
+            .position(|w| w == b"stts")
+            .expect("fixture has an stts");
+        // stts payload: version+flags(4) entry_count(4) sample_count(4) delta(4)
+        let sample_count = pos + 4 + 8;
+        assert_eq!(
+            &trak[sample_count..sample_count + 4],
+            &3u32.to_be_bytes(),
+            "expected the consistent fixture's stts sample_count = 3"
+        );
+        trak[sample_count..sample_count + 4].copy_from_slice(&1u32.to_be_bytes());
+
+        let moov = mp4_box(b"moov", &trak);
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "short-stts".into());
+        assert!(
+            rd.is_err(),
+            "an stts covering 1 of 3 samples must drop the track; \
+             all-dropped → Mp4Invalid"
         );
     }
 
