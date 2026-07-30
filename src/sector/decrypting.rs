@@ -50,8 +50,7 @@ pub type KeyFetchFn = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Vec<[u8; 16]> + Send 
 ///   `len()` and never assumes a fixed N (32 is all we've seen, but the contract
 ///   is "whatever the source returns, ≥ 1, is all of them").
 ///
-/// A **stateless, shared** pair of `Arc<Fn>` — the decorator owns the only
-/// mutable state (its call-count cap and spent flag), so one `KeyFetch` is built
+/// A **stateless, shared** pair of `Arc<Fn>`, so one `KeyFetch` is built
 /// once and cloned cheaply (two `Arc` bumps) into every read path. `Send + Sync`
 /// so it can ride the mux highway's producer thread.
 #[derive(Clone)]
