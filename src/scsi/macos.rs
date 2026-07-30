@@ -13,6 +13,9 @@
 //!
 //! Drive enumeration (`list_drives`) uses the IOKit registry directly via
 //! `shim_list_drives` — no exclusive access, no SCSI commands, no unmounts.
+//! The media-presence probe (`drive_has_disc`) does the same via
+//! `shim_media_present`: steps 1-5 above are the *transport* open path, and a
+//! probe documented as side-effect-free must not run any of them.
 
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
@@ -56,6 +59,21 @@ unsafe extern "C" {
         transfer_count: *mut u64,
     ) -> i32;
     fn shim_list_drives(out: *mut ShimDriveInfo, max_entries: i32) -> i32;
+    fn shim_media_present(bsd_name: *const u8) -> i32;
+}
+
+/// Strip the `/dev/` (or raw-device `/dev/r`) prefix off a device path,
+/// yielding the BSD name the shim's IOKit lookups take. Shared by
+/// [`MacScsiTransport::open`] and [`drive_has_disc`] so the two cannot
+/// disagree about what device they are talking about.
+fn bsd_name_of(device: &Path) -> Result<&str> {
+    let dev_str = device.to_str().ok_or_else(|| Error::DeviceNotFound {
+        path: device.display().to_string(),
+    })?;
+    Ok(dev_str
+        .strip_prefix("/dev/r")
+        .or_else(|| dev_str.strip_prefix("/dev/"))
+        .unwrap_or(dev_str))
 }
 
 pub struct MacScsiTransport {
@@ -66,17 +84,7 @@ unsafe impl Send for MacScsiTransport {}
 
 impl MacScsiTransport {
     pub fn open(device: &Path) -> Result<Self> {
-        let dev_str = device.to_str().ok_or_else(|| Error::DeviceNotFound {
-            path: device.display().to_string(),
-        })?;
-
-        let bsd_name = if let Some(rest) = dev_str.strip_prefix("/dev/r") {
-            rest
-        } else if let Some(rest) = dev_str.strip_prefix("/dev/") {
-            rest
-        } else {
-            dev_str
-        };
+        let bsd_name = bsd_name_of(device)?;
 
         // Enforce single-instance: the shim's global handle can't back two
         // live transports safely. Bail rather than corrupt shared state.
@@ -256,26 +264,95 @@ fn cstr_to_str(bytes: &[u8]) -> &str {
     std::str::from_utf8(&bytes[..end]).unwrap_or("")
 }
 
+/// Media-presence probe, via the IOKit registry only.
+///
+/// [`crate::scsi::drive_has_disc`] is documented as the cheap, side-effect-free
+/// "is there a disc?" question, suitable for a poll-loop tick. The Linux
+/// backend honours that: `open(O_RDWR|O_NONBLOCK)` + one TEST UNIT READY, no
+/// exclusive access, no unmount. The Windows backend likewise opens a shared
+/// handle and issues one TUR.
+///
+/// macOS could not: `MacScsiTransport::open` is the FULL exclusive-transport
+/// path, whose first act is `diskutil unmountDisk force` on the target device.
+/// So the probe documented as side-effect-free force-unmounted the user's disc
+/// — and on every poll tick, taking (and dropping) exclusive access each time.
+///
+/// The registry answers the same question with no side effect at all: the
+/// IOStorageFamily publishes an IOMedia object for a removable device only
+/// while media is present and removes it on eject, so a matching IOMedia is
+/// exactly "a disc is in the drive". No SCSI command is issued, which is why
+/// no timeout parameter is involved.
+///
+/// Trade-off, stated plainly: this reports what the OS has *enumerated*, so a
+/// disc that is inserted but still spinning up (no IOMedia published yet) reads
+/// as absent for the moment the enumeration takes — the same window in which a
+/// TUR would answer "not ready" and this function's contract already maps to
+/// `Ok(false)`.
 pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
-    let mut transport = MacScsiTransport::open(path)?;
-    let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
-    let mut buf = [0u8; 0];
-    match transport.execute(
-        &cdb,
-        crate::scsi::DataDirection::None,
-        &mut buf,
-        crate::scsi::TUR_TIMEOUT_MS,
-    ) {
-        Ok(_) => Ok(true),
-        Err(ref e) if e.scsi_sense().is_some_and(|s| s.is_not_ready()) => Ok(false),
-        Err(e) => Err(e),
+    let bsd_name = bsd_name_of(path)?;
+    let mut bsd_c = bsd_name.as_bytes().to_vec();
+    bsd_c.push(0);
+    match unsafe { shim_media_present(bsd_c.as_ptr()) } {
+        1 => Ok(true),
+        0 => Ok(false),
+        // -1: IOKit itself is unavailable (IOMainPort / matching-dictionary
+        // failure). That is not "no disc" — surface it rather than report a
+        // false negative the caller would act on.
+        _ => Err(Error::DeviceNotFound {
+            path: bsd_name.to_string(),
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::K_MAX_CDB_SIZE;
+    use super::{K_MAX_CDB_SIZE, OPEN, bsd_name_of, drive_has_disc};
     use crate::error::Error;
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn bsd_name_strips_dev_and_raw_dev_prefixes() {
+        assert_eq!(bsd_name_of(Path::new("/dev/disk4")).unwrap(), "disk4");
+        assert_eq!(bsd_name_of(Path::new("/dev/rdisk4")).unwrap(), "disk4");
+        assert_eq!(bsd_name_of(Path::new("disk4")).unwrap(), "disk4");
+    }
+
+    /// `drive_has_disc` is documented as a cheap, side-effect-free presence
+    /// probe. It used to be implemented by constructing a FULL exclusive
+    /// transport, whose first act is `diskutil unmountDisk force` on the target
+    /// device followed by an unconditional `usleep(500000)` — so the probe
+    /// force-unmounted the user's disc, on every poll tick.
+    ///
+    /// Two observables separate the registry probe from the transport open,
+    /// neither of which needs an optical drive to be attached:
+    ///
+    /// 1. It ANSWERS. The transport path returned `Err(DeviceNotFound)` here;
+    ///    the registry path reports "no media" as `Ok(false)`.
+    /// 2. It is FAST. The transport path's `usleep(500000)` after the spawn is
+    ///    unconditional, so it could not complete inside this budget even when
+    ///    the spawn itself failed.
+    #[test]
+    fn presence_probe_does_not_open_a_transport() {
+        let path = Path::new("/dev/freemkv-no-such-device");
+        let t0 = std::time::Instant::now();
+        let r = drive_has_disc(path);
+        let elapsed = t0.elapsed();
+
+        assert!(
+            matches!(r, Ok(false)),
+            "a device with no IOMedia must report absent media, got {r:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "probe took {elapsed:?}: the transport path's unconditional 500 ms \
+             post-unmount sleep means this budget can only be met without it"
+        );
+        assert!(
+            !OPEN.load(Ordering::Acquire),
+            "the probe must not leave the exclusive-transport lock held"
+        );
+    }
 
     /// A CDB longer than K_MAX_CDB_SIZE must be rejected with
     /// `Error::InvalidCdbLength` before the shim is ever called. Exercises the
