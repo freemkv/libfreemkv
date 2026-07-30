@@ -170,6 +170,52 @@ mod tests {
         }
     }
 
+    /// `M2tsStream::create` must opt a VC-1 video track OUT of Annex-B conversion.
+    ///
+    /// This pins the WIRING in `create`, not just `TsMuxer`'s flag: deleting the
+    /// `set_nal_video` loop leaves every TsMuxer-level test passing, because those
+    /// drive the muxer directly and set the flag themselves. Only a test that goes
+    /// through `create` catches it — and mangling MPEG-2/VC-1 video is silent, since
+    /// frame_count still increments and the mux reports success.
+    ///
+    /// Mutation: remove the `set_nal_video` loop from `create`, or widen its
+    /// `matches!` to include Vc1 -> the ES gains a start code and this fails.
+    #[test]
+    fn vc1_video_is_wired_to_the_non_nal_path() {
+        let mut title = make_title();
+        if let DiscStream::Video(v) = &mut title.streams[0] {
+            v.codec = Codec::Vc1;
+        }
+        title.codec_privates = vec![None];
+
+        // Length-prefix SHAPED ES: if the conversion is wrongly applied it rewrites
+        // these leading four bytes into a 00 00 00 01 start code.
+        let es: Vec<u8> = vec![0x00, 0x00, 0x00, 0x06, 0x0F, 0x12, 0x34, 0x56, 0x78, 0x9A];
+
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = SharedSink(shared.clone());
+        let mut stream = M2tsStream::create(sink, &title).unwrap();
+        stream
+            .write(&PesFrame {
+                coding: None,
+                source: None,
+                track: 0,
+                pts: 0,
+                keyframe: true,
+                data: es.clone(),
+                duration_ns: None,
+            })
+            .unwrap();
+        stream.finish().unwrap();
+        drop(stream);
+
+        let buf = shared.lock().unwrap().clone();
+        assert!(
+            buf.windows(es.len()).any(|w| w == &es[..]),
+            "VC-1 ES must reach the output verbatim, not converted to Annex-B"
+        );
+    }
+
     #[test]
     fn m2ts_stream_forwards_keyframe_to_rai() {
         let title = make_title();

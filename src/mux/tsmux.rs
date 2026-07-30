@@ -786,6 +786,105 @@ mod tests {
         out
     }
 
+    /// `set_nal_video(_, false)` must pass the ES through byte-for-byte: MPEG-2 and
+    /// VC-1 are not NAL-based, so their ES already IS the wire format and
+    /// `length_prefixed_to_annex_b` would mangle it.
+    ///
+    /// The payload is deliberately length-prefix SHAPED (a big-endian length
+    /// followed by that many bytes) so the conversion, if wrongly applied, rewrites
+    /// the leading four bytes into a `00 00 00 01` start code. That makes the two
+    /// paths produce visibly different bytes; a payload the converter happened to
+    /// leave alone would let a mutant pass.
+    ///
+    /// Mutation: delete the `set_nal_video` call, or flip the `nal_video` default,
+    /// and the emitted ES gains a start code -> this fails.
+    #[test]
+    fn non_nal_video_es_passes_through_unconverted() {
+        // 4-byte BE length (6) + 6 payload bytes: exactly what the Annex-B
+        // converter looks for, so a wrongly-applied conversion is unmissable.
+        let es: Vec<u8> = vec![0x00, 0x00, 0x00, 0x06, 0xB3, 0x12, 0x34, 0x56, 0x78, 0x9A];
+
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            mux.set_nal_video(0, false).unwrap();
+            mux.write_frame(0, 0, true, &es).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let out = reassemble_es(&packets, VIDEO_PID);
+        assert_eq!(
+            &out[..es.len()],
+            &es[..],
+            "non-NAL video ES must be emitted verbatim, start-code-free"
+        );
+    }
+
+    /// The default (`nal_video` = true) still converts, so the test above is
+    /// pinning the flag rather than a no-op. Same input, opposite expectation.
+    #[test]
+    fn nal_video_es_is_converted_to_annex_b_by_default() {
+        let es: Vec<u8> = vec![0x00, 0x00, 0x00, 0x06, 0xB3, 0x12, 0x34, 0x56, 0x78, 0x9A];
+
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            // No set_nal_video call — the default must be the converting path.
+            mux.write_frame(0, 0, true, &es).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let out = reassemble_es(&packets, VIDEO_PID);
+        assert_eq!(
+            &out[..4],
+            &[0x00, 0x00, 0x00, 0x01],
+            "the default path replaces the length prefix with an Annex-B start code"
+        );
+        assert_eq!(
+            &out[4..10],
+            &es[4..10],
+            "the NAL body itself is carried unchanged"
+        );
+    }
+
+    /// A non-NAL video track must still arm `params_written`, or every later
+    /// non-keyframe would fail the drop guard and silently vanish — the same class
+    /// of bug `empty_data_keyframe_arms_params_so_later_frames_survive` guards on
+    /// the NAL path.
+    #[test]
+    fn non_nal_video_keyframe_arms_params_so_later_frames_survive() {
+        let key: Vec<u8> = vec![0x00, 0x00, 0x01, 0xB3, 0xAA, 0xBB];
+        let non_key: Vec<u8> = vec![0x00, 0x00, 0x01, 0xB6, 0xCC, 0xDD];
+
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            mux.set_nal_video(0, false).unwrap();
+            mux.write_frame(0, 0, true, &key).unwrap();
+            mux.write_frame(0, 41_000_000, false, &non_key).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let out = reassemble_es(&packets, VIDEO_PID);
+        assert!(
+            out.windows(non_key.len()).any(|w| w == &non_key[..]),
+            "the non-keyframe following a non-NAL keyframe must not be dropped"
+        );
+    }
+
+    /// `set_nal_video` rejects an out-of-range track rather than panicking on the
+    /// index — this is library API and the crate must not panic from it.
+    #[test]
+    fn set_nal_video_out_of_range_track_errors() {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+        assert!(
+            mux.set_nal_video(1, false).is_err(),
+            "track 1 does not exist on a one-track muxer"
+        );
+        assert!(mux.set_nal_video(0, false).is_ok(), "track 0 does exist");
+    }
+
     #[test]
     fn every_packet_is_exactly_192_bytes() {
         // BD-TS packets are 192 bytes (4 TP_extra + 188 TS). The muxer must
