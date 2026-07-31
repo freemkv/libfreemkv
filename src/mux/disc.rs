@@ -1062,7 +1062,20 @@ impl crate::pes::Stream for DiscStream {
     }
 
     fn errors(&self) -> u64 {
+        // Read errors PLUS every frame the B1 resync gates discarded.
+        //
+        // Summed from the gates here rather than counted at each of the three
+        // `admit` call sites: one place cannot drift, three can, and a frame
+        // dropped by the demuxer flush is the same loss as one dropped on the
+        // main path. `ResyncGate::dropped` is zeroed at every resync, so only
+        // `dropped_total` sees a gap that RESOLVES — which is most of them, and
+        // was the whole reason concealed video loss reached no caller.
         self.errors
+            + self
+                .resync
+                .iter()
+                .map(super::resync::ResyncGate::dropped_total)
+                .sum::<u64>()
     }
 
     fn lost_bytes(&self) -> u64 {
@@ -2109,6 +2122,46 @@ mod tests {
                 PesStream::errors(&s),
                 PesStream::lost_bytes(&s),
                 "the two accessors must read different fields"
+            );
+        }
+
+        /// Frames the B1 resync gate discards must reach `errors()`, including
+        /// after the gap RESOLVES.
+        ///
+        /// `ResyncGate::dropped` is zeroed the moment a keyframe disarms the
+        /// gate, and the only EOF warning fires for gates STILL armed — so a
+        /// mid-title gap that resolves left no trace anywhere. That is the
+        /// common case: most gaps do resolve. A rip with several concealed gaps
+        /// reported 0 errors and 0 lost bytes while whole GOPs were discarded.
+        ///
+        /// This asserts the accessor, not the gate's own counter, because
+        /// `errors()` is the only channel through which a caller learns
+        /// anything went wrong.
+        #[test]
+        fn errors_reports_frames_the_resync_gate_dropped_after_the_gap_resolves() {
+            let mut s = short_read_stream(true);
+            assert_eq!(PesStream::errors(&s), 0, "clean before anything happens");
+
+            // Drive a gate directly: a discontinuity, two dropped inter-coded
+            // frames, then a keyframe that resyncs and zeroes the per-run count.
+            // The short-read fixture's title carries no streams, so give it a
+            // gate to drive.
+            s.resync.push(crate::mux::resync::ResyncGate::new());
+            let gate = s.resync.last_mut().expect("just pushed");
+            assert!(!gate.admit(true, true, false));
+            assert!(!gate.admit(true, false, false));
+            assert!(gate.admit(true, false, true));
+            assert_eq!(
+                gate.dropped_in_run(),
+                0,
+                "the resync zeroed the per-run counter, which is the whole trap"
+            );
+
+            assert_eq!(
+                PesStream::errors(&s),
+                2,
+                "the two discarded frames must still reach the caller after the \
+                 gap resolved; reading the per-run counter here would report 0"
             );
         }
 
