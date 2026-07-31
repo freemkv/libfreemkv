@@ -1055,13 +1055,21 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The numeric error code carried by an [`io::Error`](std::io::Error) that was
 /// produced from an [`Error`], or `None` if it carries none.
 ///
+/// Public because consumers need the code itself, not just the yes/no
+/// predicates built on it below. `mux_stream` hands back an `io::Error`, and a
+/// front-end reporting *why* a title failed had no way to recover the code
+/// from it — the typed `Error` is gone by then and only the `E<code>` string
+/// prefix survives. Parsing that prefix is this function's job; every consumer
+/// re-implementing the parse is how the string-matching this crate spent 1.5.x
+/// removing comes back.
+///
 /// [`From<Error> for io::Error`] is the ONLY path from a typed [`Error`] to an
 /// `io::Error` in this crate, and it stringifies (`io::Error::new(kind, msg)`
 /// where `msg` is the `Error`'s `E<code>[: …]` [`Display`](std::fmt::Display)
 /// string) rather than boxing the typed value — no code path constructs an
 /// `io::Error` that still holds a `crate::error::Error` via `get_ref`. So the
 /// only recognised shape is the round-tripped `E<code>` message prefix.
-fn io_error_code(e: &std::io::Error) -> Option<u16> {
+pub fn error_code(e: &std::io::Error) -> Option<u16> {
     // Round-tripped: `From<Error> for io::Error` stringifies as "E<code>[: …]".
     let s = e.to_string();
     let digits = s.strip_prefix('E')?;
@@ -1097,7 +1105,7 @@ fn io_error_code(e: &std::io::Error) -> Option<u16> {
 /// all of them and exited successfully. It is [`is_disc_level_no_key`]'s, and
 /// fatal here.
 pub fn is_skippable_title_stub(e: &std::io::Error) -> bool {
-    matches!(io_error_code(e), Some(E_MKV_INVALID | E_CSS_KEY_MISSING))
+    matches!(error_code(e), Some(E_MKV_INVALID | E_CSS_KEY_MISSING))
 }
 
 /// Whether an [`io::Error`](std::io::Error) is a cooperative user stop
@@ -1106,7 +1114,7 @@ pub fn is_skippable_title_stub(e: &std::io::Error) -> bool {
 /// `completed = false`, and consumers preserve staging rather than quarantining.
 /// Typed replacement for the consumers' `E<code>`-leading-token string match.
 pub fn is_halt(e: &std::io::Error) -> bool {
-    io_error_code(e) == Some(E_HALTED)
+    error_code(e) == Some(E_HALTED)
 }
 
 /// Whether an [`io::Error`](std::io::Error) is a **disc-level** key failure —
@@ -1126,7 +1134,7 @@ pub fn is_halt(e: &std::io::Error) -> bool {
 /// "empty stub" notice and exited successfully.
 pub fn is_disc_level_no_key(e: &std::io::Error) -> bool {
     matches!(
-        io_error_code(e),
+        error_code(e),
         Some(E_NO_DISC_KEY | E_KEYDB_LOAD | E_AACS_NO_KEYS | E_CSS_NO_DISC_KEY)
     )
 }
