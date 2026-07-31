@@ -325,25 +325,11 @@ impl DiscSession {
         self.disc.take()
     }
 
-    /// Shared access to the opened drive (identity, profile, path). Panics if the
-    /// drive has already been staged into the reader slot
-    /// ([`Self::stage_drive_as_reader`]) or moved out via [`Self::into_drive`] —
-    /// use [`Self::device_path`] for a name that survives those moves.
-    pub fn drive(&self) -> &Drive {
-        self.drive.as_ref().expect("drive present")
-    }
-
     /// The opened drive's device path. Cached at [`Self::open`], so it remains
     /// available after [`Self::stage_drive_as_reader`] moves the drive into the
     /// reader slot (the mux driver names the device here without the drive).
     pub fn device_path(&self) -> &str {
         &self.device
-    }
-
-    /// Mutable access to the opened drive — for ciphertext sampling and other
-    /// direct reads consumers still perform.
-    pub fn drive_mut(&mut self) -> &mut Drive {
-        self.drive.as_mut().expect("drive present")
     }
 
     /// Lock the tray so the disc cannot eject mid-rip. Unlock is guaranteed by
@@ -356,8 +342,19 @@ impl DiscSession {
 
     /// Consume the session, returning the owned drive (e.g. to move into a
     /// `DiscStream` for a live-drive mux).
-    pub fn into_drive(self) -> Drive {
-        self.drive.expect("drive present")
+    ///
+    /// # Errors
+    ///
+    /// [`Error::DeviceNotReady`] when the drive is no longer held — the PUBLIC
+    /// [`Self::stage_drive_as_reader`] moves it into the reader slot, and
+    /// calling this twice moves it out, so an empty slot is reachable through
+    /// ordinary use rather than being a caller error. A library must not panic
+    /// from public API, and a precondition that normal flow violates is a trap
+    /// rather than a contract.
+    pub fn into_drive(self) -> Result<Drive> {
+        self.drive.ok_or_else(|| Error::DeviceNotReady {
+            path: self.device.clone(),
+        })
     }
 
     /// Stage the owned drive as the session's boxed sector source so a live
