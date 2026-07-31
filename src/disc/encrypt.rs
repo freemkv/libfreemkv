@@ -181,6 +181,24 @@ fn cert_unlock_outcome(e: &CertUnlockFailure) -> crate::aacs::trace::UnlockOutco
     }
 }
 
+/// Did the cert handshake actually carry a Volume ID?
+///
+/// Extracted so it can be tested as a VALUE. It only ever reaches an operator
+/// as the `has_volume_id` field of the `bus_key_unavailable` warn, and
+/// asserting on a `tracing` field means installing a capturing subscriber —
+/// which is thread-local, while `tracing`'s callsite-interest cache is global.
+/// Those two facts race: the test failed roughly one run in ten under the full
+/// parallel suite while passing every time in isolation, and serialising the
+/// captures was not enough because the cache can be re-evaluated against the
+/// process default rather than the thread-local dispatch.
+///
+/// A predicate this small does not need a subscriber to verify. The polarity is
+/// the whole point: an `==` here would tell an operator a VID was absent on
+/// exactly the discs where one was present.
+fn handshake_has_volume_id(h: &HandshakeResult) -> bool {
+    h.volume_id != [0u8; 16]
+}
+
 impl Disc {
     /// SCSI handshake — drives the VID-acquisition flow and returns
     /// a structured `HandshakeResult` for downstream key resolution.
@@ -369,7 +387,7 @@ impl Disc {
         // file/ISO, drive unlock, cert bus key). The gate enumerates nothing.
         if !bus_encryption_removed(bus_encryption, handshake) {
             let (rdk_err, has_vid) = handshake
-                .map(|h| (h.read_data_key_err, h.volume_id != [0u8; 16]))
+                .map(|h| (h.read_data_key_err, handshake_has_volume_id(h)))
                 .unwrap_or((None, false));
             tracing::warn!(
                 target: "freemkv::disc",
@@ -1027,44 +1045,72 @@ mod tests {
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
-    /// The `bus_key_unavailable` warn's `has_volume_id` field must report
-    /// the ACTUAL presence of a non-zero Volume ID on the handshake (encrypt.rs
-    /// `h.volume_id != [0u8; 16]`), not its negation. This is diagnostic-only
-    /// (it does not affect the returned `Err(AacsBusKeyUnavailable)` itself,
-    /// which is why a plain `Result` assertion can't distinguish `!=` from
-    /// `==` here) but it is the ONLY signal an operator has, from this log
-    /// line, for whether the handshake actually carried a VID when bus
-    /// encryption could not be removed — a `==` flip would silently invert it.
+    /// `has_volume_id` must report the ACTUAL presence of a non-zero Volume ID
+    /// on the handshake, not its negation.
+    ///
+    /// Diagnostic-only — it does not change the returned
+    /// `Err(AacsBusKeyUnavailable)`, which is why asserting on the `Result`
+    /// cannot distinguish `!=` from `==`. But it is the ONLY signal an operator
+    /// gets, from that one log line, for whether the handshake carried a VID
+    /// when bus encryption could not be removed. A flipped comparison would
+    /// report "no VID" on exactly the discs that had one.
+    ///
+    /// This asserts the PREDICATE rather than the emitted `tracing` field. The
+    /// previous version installed a capturing subscriber and read the field
+    /// back; that subscriber is thread-local while `tracing`'s callsite-interest
+    /// cache is global, so the event was silently dropped about one run in ten
+    /// under the full parallel suite — passing every time in isolation.
+    /// Serialising the captures crate-wide did not fix it, because the cache can
+    /// still be re-evaluated against the process default dispatch rather than
+    /// the thread-local one. A boolean does not need a subscriber to check.
     #[test]
-    fn resolve_vid_only_bus_key_gate_reports_true_has_volume_id_when_vid_nonzero() {
-        let capture = std::sync::Arc::new(HasVidCapture(std::sync::Mutex::new(None)));
-        let dispatch = tracing::Dispatch::new(capture.clone());
-        let (mut disc, udf) = disc_with_cert(0x01, true);
-        let hs = HandshakeResult {
-            volume_id: [0x11u8; 16], // non-zero: a VID WAS present
+    fn handshake_has_volume_id_reports_presence_not_absence() {
+        let with_vid = HandshakeResult {
+            volume_id: [0x11u8; 16],
             read_data_key: None,
             read_data_key_err: None,
             drive_unlocked: false,
         };
-        let guard = tracing::dispatcher::set_default(&dispatch);
-        // Tracing caches per-callsite "any subscriber interested?" the FIRST
-        // time a callsite fires; another test in this suite may already have
-        // hit the exact same `warn!` call site under the process default
-        // (no-op) dispatch, permanently caching "not interested" for it. Force
-        // recomputation now that our capturing dispatch is installed, or the
-        // event is silently dropped before it reaches our `Visit` — flaky only
-        // under full-suite (parallel, ordering-dependent) runs, not in isolation.
-        tracing::callsite::rebuild_interest_cache();
+        assert!(
+            super::handshake_has_volume_id(&with_vid),
+            "a non-zero Volume ID must report as PRESENT"
+        );
+
+        let without = HandshakeResult {
+            volume_id: [0u8; 16],
+            ..with_vid
+        };
+        assert!(
+            !super::handshake_has_volume_id(&without),
+            "an all-zero Volume ID is the absent case"
+        );
+
+        // One bit of difference is still a VID: the check is != all-zero, not a
+        // heuristic about how much of it looks populated.
+        let mut barely = [0u8; 16];
+        barely[15] = 1;
+        assert!(
+            super::handshake_has_volume_id(&HandshakeResult {
+                volume_id: barely,
+                ..with_vid
+            }),
+            "any non-zero byte makes a Volume ID present"
+        );
+    }
+
+    /// The gate itself still hard-errors — the property the log line annotates.
+    #[test]
+    fn resolve_vid_only_bus_key_gate_hard_errors_without_a_read_data_key() {
+        let (mut disc, udf) = disc_with_cert(0x01, true);
+        let hs = HandshakeResult {
+            volume_id: [0x11u8; 16],
+            read_data_key: None,
+            read_data_key_err: None,
+            drive_unlocked: false,
+        };
         let err = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs))
             .expect_err("bus-encrypted, no read_data_key must still hard-error");
-        drop(guard);
-        tracing::callsite::rebuild_interest_cache();
         assert!(matches!(err, Error::AacsBusKeyUnavailable));
-        assert_eq!(
-            *capture.0.lock().unwrap(),
-            Some(true),
-            "has_volume_id must be true: the handshake's volume_id was non-zero"
-        );
     }
 
     // ---------------------------------------------------------------
