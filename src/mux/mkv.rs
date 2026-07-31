@@ -385,7 +385,9 @@ impl MkvTrack {
         // that used to sit here existed only because `pixels()` fabricated a
         // 1920x1080 default; it does not any more, so the check belongs in the
         // one accessor rather than in each caller that remembered to write it.
-        let (w, h) = v.resolution.pixels();
+        // None -> 0, and the writer already omits the optional
+        // PixelWidth/PixelHeight elements on 0 (RFC 9559 5.1.4.1.28-29).
+        let (w, h) = v.resolution.pixels().unwrap_or((0, 0));
         let (num, den) = v.frame_rate.as_fraction();
         let default_duration_ns = if num > 0 {
             (1_000_000_000u64 * den as u64) / num as u64

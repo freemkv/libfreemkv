@@ -945,15 +945,34 @@ impl Resolution {
     /// handles it: the Matroska sink omits the optional PixelWidth/PixelHeight,
     /// the VobSub `.idx` writer omits its `size:` line, and no caller divides by
     /// either dimension.
-    pub fn pixels(&self) -> (u32, u32) {
+    /// `None` when the resolution never resolved.
+    ///
+    /// Returns an `Option` rather than a sentinel because every caller has to
+    /// make a DIFFERENT decision and the compiler is the only thing that
+    /// reliably makes them: Matroska omits the optional PixelWidth/PixelHeight
+    /// elements, the metadata sinks report the dimensions as absent, and MP4
+    /// cannot do either — ISO/IEC 14496-12 makes width and height MANDATORY in
+    /// both `tkhd` (8.3.2) and VisualSampleEntry (12.1.3), so it must refuse.
+    ///
+    /// This returned `(0, 0)` before, and that is the shape the sentinel
+    /// creates: `(0, 0)` looks like a usable pair, so the MP4 sink stored it
+    /// and serialised a 0x0 video track — a structurally complete file that no
+    /// player can render, written with no error. It returned a fabricated
+    /// 1920x1080 before that, which was wrong but at least playable, so the
+    /// sink had never needed a guard and the absence of one was invisible.
+    ///
+    /// A doc comment listing which callers are safe cannot hold this: one did
+    /// not check, and a third kept its own duplicate `Unknown` test long after
+    /// the accessor took the job over.
+    pub fn pixels(&self) -> Option<(u32, u32)> {
         match self {
-            Resolution::R480i | Resolution::R480p => (720, 480),
-            Resolution::R576i | Resolution::R576p => (720, 576),
-            Resolution::R720p => (1280, 720),
-            Resolution::R1080i | Resolution::R1080p => (1920, 1080),
-            Resolution::R2160p => (3840, 2160),
-            Resolution::R4320p => (7680, 4320),
-            Resolution::Unknown => (0, 0),
+            Resolution::R480i | Resolution::R480p => Some((720, 480)),
+            Resolution::R576i | Resolution::R576p => Some((720, 576)),
+            Resolution::R720p => Some((1280, 720)),
+            Resolution::R1080i | Resolution::R1080p => Some((1920, 1080)),
+            Resolution::R2160p => Some((3840, 2160)),
+            Resolution::R4320p => Some((7680, 4320)),
+            Resolution::Unknown => None,
         }
     }
 
@@ -3273,18 +3292,18 @@ mod tests {
     fn unknown_resolution_reports_no_pixel_dimensions() {
         assert_eq!(
             Resolution::Unknown.pixels(),
-            (0, 0),
+            None,
             "an unknown resolution must report no dimensions, not a fabricated default"
         );
-        assert_eq!(Resolution::R480i.pixels(), (720, 480));
-        assert_eq!(Resolution::R480p.pixels(), (720, 480));
-        assert_eq!(Resolution::R576i.pixels(), (720, 576));
-        assert_eq!(Resolution::R576p.pixels(), (720, 576));
-        assert_eq!(Resolution::R720p.pixels(), (1280, 720));
-        assert_eq!(Resolution::R1080i.pixels(), (1920, 1080));
-        assert_eq!(Resolution::R1080p.pixels(), (1920, 1080));
-        assert_eq!(Resolution::R2160p.pixels(), (3840, 2160));
-        assert_eq!(Resolution::R4320p.pixels(), (7680, 4320));
+        assert_eq!(Resolution::R480i.pixels(), Some((720, 480)));
+        assert_eq!(Resolution::R480p.pixels(), Some((720, 480)));
+        assert_eq!(Resolution::R576i.pixels(), Some((720, 576)));
+        assert_eq!(Resolution::R576p.pixels(), Some((720, 576)));
+        assert_eq!(Resolution::R720p.pixels(), Some((1280, 720)));
+        assert_eq!(Resolution::R1080i.pixels(), Some((1920, 1080)));
+        assert_eq!(Resolution::R1080p.pixels(), Some((1920, 1080)));
+        assert_eq!(Resolution::R2160p.pixels(), Some((3840, 2160)));
+        assert_eq!(Resolution::R4320p.pixels(), Some((7680, 4320)));
     }
 
     /// Every `Unknown` variant that exposes a numeric accessor must report
@@ -3293,7 +3312,11 @@ mod tests {
     /// than 0 fps, because callers divide by the numerator.
     #[test]
     fn no_unknown_variant_fabricates_a_numeric_value() {
-        assert_eq!(Resolution::Unknown.pixels(), (0, 0));
+        assert_eq!(
+            Resolution::Unknown.pixels(),
+            None,
+            "the strongest form of this rule: not even a zero pair, which reads              as a usable value and was serialised into an MP4 as a 0x0 track"
+        );
         assert_eq!(FrameRate::Unknown.as_fraction(), (0, 1));
         assert_eq!(AudioChannels::Unknown.count(), 0);
         assert_eq!(SampleRate::Unknown.hz(), 0.0);

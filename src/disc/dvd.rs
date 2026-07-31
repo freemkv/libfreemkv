@@ -179,7 +179,10 @@ impl Disc {
                 // the coded video frame the subpicture was authored against
                 // (720x480 NTSC / 720x576 PAL) so players place and scale the
                 // bitmap correctly.
-                let (vid_w, vid_h) = ts.video.resolution.pixels();
+                // format_palette guards on (0, 0) and omits its `size:` line,
+                // so an unresolved resolution degrades to a palette-only .idx
+                // rather than one claiming a 0x0 frame.
+                let (vid_w, vid_h) = ts.video.resolution.pixels().unwrap_or((0, 0));
                 let codec_data = dvd_title
                     .palette
                     .as_ref()

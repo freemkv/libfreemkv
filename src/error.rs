@@ -207,6 +207,12 @@ pub const E_MP4_INVALID: u16 = 9049;
 /// `mp4://` video track is missing its codec-configuration record
 /// (`hvcC`/`avcC`), without which the sample entry can't be written.
 pub const E_MP4_MISSING_CODEC_PRIVATE: u16 = 9050;
+/// `mp4://` video track has no resolved frame dimensions. ISO/IEC 14496-12
+/// makes width and height mandatory in both `tkhd` (8.3.2) and
+/// VisualSampleEntry (12.1.3), so unlike Matroska there is no element to omit:
+/// the sink would have to write 0x0, producing a structurally complete file no
+/// player can render. Refuse instead.
+pub const E_MP4_UNKNOWN_RESOLUTION: u16 = 9055;
 /// READ CAPACITY returned a short or overflowing transfer.
 pub const E_DISC_CAPACITY_MALFORMED: u16 = 9047;
 
@@ -548,6 +554,9 @@ pub enum Error {
     Mp4Invalid,
     /// `mp4://` video track is missing its `hvcC`/`avcC` configuration record.
     Mp4MissingCodecPrivate,
+    /// `mp4://` video track has no resolved frame dimensions. See
+    /// [`E_MP4_UNKNOWN_RESOLUTION`].
+    Mp4UnknownResolution,
     PesFrameTooLarge {
         size: usize,
     },
@@ -737,6 +746,7 @@ impl Error {
             Error::Mp4NoVideoTrack => E_MP4_NO_VIDEO_TRACK,
             Error::Mp4Invalid => E_MP4_INVALID,
             Error::Mp4MissingCodecPrivate => E_MP4_MISSING_CODEC_PRIVATE,
+            Error::Mp4UnknownResolution => E_MP4_UNKNOWN_RESOLUTION,
             Error::PesFrameTooLarge { .. } => E_PES_FRAME_TOO_LARGE,
             Error::PesInvalidMagic => E_PES_INVALID_MAGIC,
             Error::PesTrackTooLarge { .. } => E_PES_TRACK_TOO_LARGE,
@@ -992,9 +1002,10 @@ impl From<Error> for std::io::Error {
             // mp4:// demux errors: a malformed/truncated source file
             // (E_MP4_INVALID), or a source whose tracks the mux can't use — no
             // video track / missing codec-private config. All are invalid data.
-            E_MP4_NO_VIDEO_TRACK | E_MP4_INVALID | E_MP4_MISSING_CODEC_PRIVATE => {
-                std::io::ErrorKind::InvalidData
-            }
+            E_MP4_NO_VIDEO_TRACK
+            | E_MP4_INVALID
+            | E_MP4_MISSING_CODEC_PRIVATE
+            | E_MP4_UNKNOWN_RESOLUTION => std::io::ErrorKind::InvalidData,
             // 9030 ExtentNotUnitAligned: a malformed/non-AACS-aligned
             // extent was handed to the prefetch producer.
             9030 => std::io::ErrorKind::InvalidInput,
@@ -1696,6 +1707,7 @@ mod tests {
             (Error::Mp4NoVideoTrack, E_MP4_NO_VIDEO_TRACK),
             (Error::Mp4Invalid, E_MP4_INVALID),
             (Error::Mp4MissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),
+            (Error::Mp4UnknownResolution, E_MP4_UNKNOWN_RESOLUTION),
             (Error::M2tsPacketMalformed, E_M2TS_PACKET_MALFORMED),
             (Error::ExtentNotUnitAligned, E_EXTENT_NOT_UNIT_ALIGNED),
             (Error::DiscCapacityMalformed, E_DISC_CAPACITY_MALFORMED),
