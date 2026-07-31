@@ -442,16 +442,34 @@ impl UdfFs {
     /// Read an Extended File Entry (tag 266) or File Entry (tag 261)
     /// and return its first allocation extent: (data_lba, data_length).
     /// The data_lba is partition-relative.
+    /// The file's first RECORDED extent — where its readable data actually
+    /// begins.
+    ///
+    /// Not `extents.first()`. `read_icb_extents` retains ECMA-167 4/14.14.1.1
+    /// type-1 (allocated, not recorded) descriptors, because dropping one would
+    /// slide every later extent's data down by the hole's length. But a type-1
+    /// extent's `lba` is where SPACE is allocated, not where bytes live, and
+    /// this accessor's one caller — `file_start_lba` — hands its result out as
+    /// "the absolute starting LBA of a file's first data extent".
+    ///
+    /// `ifo.rs` then uses that as the base for every VTS VOB extent
+    /// (`file_start_lba(IFO) + vtstt_vobs + cell.first_sector`), so a file whose
+    /// FIRST descriptor is type-1 would put the entire video title set at the
+    /// wrong place on disc, with no error anywhere.
     fn read_icb_extent(&self, reader: &mut dyn SectorSource, meta_lba: u32) -> Result<IcbExtent> {
         let extents = self.read_icb_extents(reader, meta_lba)?;
-        extents.first().copied().ok_or(Error::DiscRead {
-            // Diagnostic sector only; meta_to_abs can overflow on a crafted
-            // meta_lba, in which case 0 is a harmless placeholder for the
-            // error-context field.
-            sector: self.meta_to_abs(meta_lba).unwrap_or(0) as u64,
-            status: None,
-            sense: None,
-        })
+        extents
+            .iter()
+            .find(|e| e.recorded)
+            .copied()
+            .ok_or(Error::DiscRead {
+                // Diagnostic sector only; meta_to_abs can overflow on a crafted
+                // meta_lba, in which case 0 is a harmless placeholder for the
+                // error-context field.
+                sector: self.meta_to_abs(meta_lba).unwrap_or(0) as u64,
+                status: None,
+                sense: None,
+            })
     }
 
     /// If this ICB stores its file data INLINE (embedded — ICB Tag flags low
@@ -1889,6 +1907,57 @@ mod tests {
             off += 8;
         }
         s
+    }
+
+    /// `file_start_lba` must skip a leading UNRECORDED extent and report where
+    /// the file's DATA starts.
+    ///
+    /// ECMA-167 4/14.14.1.1 type 1 is allocated-but-not-recorded: the space
+    /// belongs to the file and occupies its byte range, but nothing was written
+    /// there and its `lba` is where SPACE lives, not bytes. `read_icb_extents`
+    /// retains such descriptors — dropping one would slide every later extent's
+    /// data down by the hole's length — so `.first()` can now be one.
+    ///
+    /// `ifo.rs` uses this value as the base for every VTS VOB extent
+    /// (`file_start_lba(IFO) + vtstt_vobs + cell.first_sector`), so getting it
+    /// wrong puts the entire video title set at the wrong place on disc, with
+    /// no error anywhere — a silent wrong answer on an ordinary DVD.
+    #[test]
+    fn file_start_lba_skips_a_leading_unrecorded_extent() {
+        use fixture::{DirSpec, MemDisc, PART_START, build_udf_skeleton, lay_dir};
+
+        const HOLE_LBA: u32 = 900;
+        const DATA_LBA: u32 = 40;
+
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(
+            &mut disc,
+            &DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: vec![fixture::file("VIDEO_TS.IFO", 12, DATA_LBA, 2048, false)],
+                subdirs: Vec::new(),
+            },
+        );
+
+        // Rewrite the file's ICB: a type-1 hole FIRST, then the real data.
+        let icb = build_entry_ads(266, 0, 16, &[(1, 2048, HOLE_LBA), (0, 2048, DATA_LBA)], &[]);
+        disc.put_bytes(PART_START + 12, &icb);
+
+        let mut fs = super::read_filesystem(&mut disc).expect("volume mounts");
+        let lba = fs
+            .file_start_lba(&mut disc, "/VIDEO_TS.IFO")
+            .expect("a file whose first descriptor is a hole still has data");
+
+        assert_eq!(
+            lba,
+            PART_START + DATA_LBA,
+            "must report the first RECORDED extent; reporting the hole's LBA \\
+             ({}) would rebase every VTS VOB extent onto unrelated sectors",
+            PART_START + HOLE_LBA
+        );
     }
 
     #[test]
