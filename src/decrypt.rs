@@ -386,7 +386,26 @@ impl AacsKeyMap {
 /// decorator can dispatch uniformly. A map index outside the held pool is a
 /// fail-loud [`Error::DecryptFailed`]: the resolver's job is to guarantee every
 /// selectable index is present, so a gap here is a resolver bug, not silent loss.
+/// Decrypt `buf` with a resolved AACS key map. Thin wrapper over
+/// [`decrypt_span`] — the map is the AACS scheme's input, not a second
+/// orchestrator.
 pub(crate) fn decrypt_sectors_mapped(
+    buf: &mut [u8],
+    keys: &DecryptKeys,
+    base_lba: u32,
+    map: &AacsKeyMap,
+) -> Result<(), crate::error::Error> {
+    let mut keys = keys.clone();
+    decrypt_span(buf, &mut keys, base_lba, Some(map), None).map(|_| ())
+}
+
+/// AACS scheme step: apply `map`'s per-unit keys to `buf`.
+///
+/// A SCHEME, not a policy. It reports what it could not open by returning
+/// `Err(DecryptFailed)`; the decision that an unopenable unit must never be
+/// emitted belongs to [`decrypt_span`], which is the one place that decides it
+/// for every scheme.
+fn apply_aacs_map(
     buf: &mut [u8],
     keys: &DecryptKeys,
     base_lba: u32,
@@ -535,7 +554,8 @@ pub fn decrypt_sectors(
     keys: &mut DecryptKeys,
     unit_key_idx: usize,
 ) -> Result<usize, crate::error::Error> {
-    decrypt_sectors_impl(buf, keys, unit_key_idx, None)
+    let _ = unit_key_idx;
+    decrypt_span(buf, keys, 0, None, None)
 }
 
 /// Legacy alias of [`decrypt_sectors`]. Under the keymap-only model AACS decrypts
@@ -552,28 +572,50 @@ pub fn decrypt_sectors_in_content(
     base_lba: u32,
     content_ranges: &[(u32, u32)],
 ) -> Result<usize, crate::error::Error> {
-    decrypt_sectors_impl(buf, keys, unit_key_idx, Some((base_lba, content_ranges)))
+    let _ = unit_key_idx;
+    decrypt_span(buf, keys, base_lba, None, Some((base_lba, content_ranges)))
 }
 
-fn decrypt_sectors_impl(
+/// THE decrypt orchestrator. Every path into this crate's decryption goes
+/// through here.
+///
+/// How a disc decrypts is one process — resolve a key for this span, apply it,
+/// and refuse if no key can be proven. Only the resolve-and-apply step is
+/// scheme-specific. This function owns the loop and the refusal; the schemes
+/// below supply only what genuinely differs between AACS, CSS and clear media.
+///
+/// That split exists because its absence caused six separate defects in one
+/// release. There used to be TWO top-level paths — this one for CSS and clear,
+/// and a wholly separate `decrypt_sectors_mapped` for AACS whose arm here was a
+/// bare `return Err` stub — so each scheme decided its own answer to "there is
+/// no key for these bytes" and nothing held them to the same one. CSS drifted to
+/// descrambling with a key it had just proven stale; the mapped path drifted to
+/// passing an unkeyable encrypted unit through as ciphertext. Both looked like
+/// success to the caller.
+///
+/// Adding a scheme means adding an arm here, which means answering the refusal
+/// question. That is the point.
+fn decrypt_span(
     buf: &mut [u8],
     keys: &mut DecryptKeys,
-    // Unused now that AACS decrypts via the key map only; the CSS arm self-gates on
-    // its per-sector scramble flag and `None` is a no-op. Kept so the wrapper
-    // signatures (decrypt_sectors / _in_content) stay stable for CSS/None callers.
-    _unit_key_idx: usize,
+    base_lba: u32,
+    map: Option<&AacsKeyMap>,
     _content: Option<(u32, &[(u32, u32)])>,
 ) -> Result<usize, crate::error::Error> {
     let dropped: usize = match keys {
         DecryptKeys::None => 0,
         DecryptKeys::Aacs { .. } => {
-            // AACS decrypts EXCLUSIVELY through the resolved key map
-            // (`decrypt_sectors_mapped`): the map keys every content unit up front,
-            // and a missing key fails at RESOLVE time. The old trial-decrypt path
-            // (try each held key, keep the first-tried plaintext on a miss) is gone
-            // — reaching it means an AACS reader was built without installing its
-            // key map, which would silently apply a wrong key. Fail loud instead.
-            return Err(crate::error::Error::DecryptFailed);
+            // AACS decrypts EXCLUSIVELY through a resolved key map: the map keys
+            // every content unit up front and a missing key fails at RESOLVE
+            // time. No map here means an AACS reader was built without
+            // installing one — the old trial-decrypt path (try each held key,
+            // keep the first-tried plaintext on a miss) is gone precisely
+            // because it silently applied wrong keys.
+            let Some(map) = map else {
+                return Err(crate::error::Error::DecryptFailed);
+            };
+            apply_aacs_map(buf, keys, base_lba, map)?;
+            0
         }
         DecryptKeys::Css { title_key } => {
             // CSS SELF-recovers: the title key changes per VOB region and is
@@ -1416,6 +1458,81 @@ mod tests {
                 sector_count: 1
             }],
             "a sub-unit remnant is ordinary content and is always read"
+        );
+    }
+
+    /// Every scheme answers "there is no key for these bytes" the SAME way.
+    ///
+    /// This is the property `decrypt_span` exists to hold. There used to be two
+    /// top-level decrypt paths — one for CSS and clear media, one for AACS —
+    /// and each decided its own answer, so they drifted apart in opposite
+    /// directions within a single release: CSS descrambled with a key it had
+    /// just proven stale, and the AACS path passed an unkeyable encrypted unit
+    /// through as ciphertext. Both reported success.
+    ///
+    /// Asserting one verdict across the schemes is what makes a future
+    /// divergence a test failure rather than a silent corruption. A per-scheme
+    /// test cannot do that: each would still pass while the two disagreed.
+    #[test]
+    fn every_scheme_gives_the_same_verdict_when_no_key_can_be_proven() {
+        use crate::disc::ContentFormat;
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+
+        // AACS, encrypted, no map installed at all.
+        let mut aacs_keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAAu8; 16])],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let mut buf = vec![0u8; ul];
+        let aacs_no_map = decrypt_span(&mut buf, &mut aacs_keys, 0, None, None)
+            .expect_err("an AACS reader with no key map cannot prove any key");
+
+        // AACS, encrypted, mapped but the unit falls outside every range.
+        let mut orphan = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut orphan, &[0xCCu8; 16]);
+        let mut buf = orphan.to_vec();
+        let empty = AacsKeyMap::from_ranges(vec![]);
+        let aacs_unmapped = decrypt_span(&mut buf, &mut aacs_keys, 0, Some(&empty), None)
+            .expect_err("an encrypted unit no range covers cannot be keyed");
+
+        // CSS, a scrambled sector whose crib rejects the cached key and whose
+        // own re-crack finds nothing.
+        let mut sector = [0u8; 2048];
+        sector[0x14] = 0x30;
+        for (i, b) in sector.iter_mut().enumerate().take(0x80).skip(0x20) {
+            *b = (i % 4) as u8;
+        }
+        for (i, b) in sector.iter_mut().enumerate().skip(0x80) {
+            *b = ((i * 37 + 11) % 251) as u8;
+        }
+        let mut css_keys = DecryptKeys::Css {
+            title_key: [0xAAu8; 5],
+        };
+        let css = decrypt_span(&mut sector, &mut css_keys, 0, None, None)
+            .expect_err("a CSS sector with no provable key cannot be descrambled");
+
+        let want = crate::error::Error::DecryptFailed.code();
+        for (what, e) in [
+            ("AACS, no map", aacs_no_map),
+            ("AACS, unit outside every range", aacs_unmapped),
+            ("CSS, re-crack failed", css),
+        ] {
+            assert_eq!(
+                e.code(),
+                want,
+                "{what}: every scheme must refuse identically, or one of them is \
+                 quietly emitting data it could not decrypt"
+            );
+        }
+
+        // And clear media is NOT a refusal — the shared policy must not turn
+        // "nothing to decrypt" into an error.
+        let mut none_keys = DecryptKeys::None;
+        let mut buf = vec![0u8; 2048];
+        assert!(
+            decrypt_span(&mut buf, &mut none_keys, 0, None, None).is_ok(),
+            "clear media has no key to prove and must pass through"
         );
     }
 
