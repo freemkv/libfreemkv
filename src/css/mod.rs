@@ -361,7 +361,23 @@ pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
 /// sector (no periodic run) can be neither validated nor cracked, so it rides the
 /// cached key — correct, because it lives in the same region as the nearby crib
 /// sector that set the cache.
-pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) {
+///
+/// # Errors
+///
+/// [`Error::DecryptFailed`] when a sector's own crib proves the cached key stale
+/// and the re-crack from that same sector also fails. CSS has no external key
+/// source — the title key comes only from cracking the data — so on a readable
+/// sector this is not a missing input, it is recovery failing on data we can
+/// see. Emitting the sector anyway means one of two bad outcomes: descrambled
+/// with the key its crib just rejected, which yields garbage behind an intact
+/// clear header (valid pack start, passes every structural check the PS demuxer
+/// applies, corruption confined to the PES payload where nothing looks); or
+/// passed through still scrambled, which is ciphertext delivered where plaintext
+/// is meant to be. Both are bad data reported as success.
+///
+/// This matches the AACS sibling, which returns [`Error::DecryptFailed`] rather
+/// than apply a neighbouring CPS unit's key.
+pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::error::Result<usize> {
     for chunk in buf.chunks_mut(2048) {
         if chunk.len() < 2048 || !is_scrambled(chunk) {
             continue;
@@ -381,12 +397,25 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) {
             // Cached key is stale for this region — restore the ciphertext and
             // crack this sector's own key.
             chunk.copy_from_slice(&original);
-            if let Some(fresh) = stevenson::crack_title_key(chunk) {
-                *title_key = fresh;
+            match stevenson::crack_title_key(chunk) {
+                Some(fresh) => {
+                    *title_key = fresh;
+                    lfsr::descramble_sector(title_key, chunk);
+                }
+                None => {
+                    // No provable key. `chunk` already holds the restored
+                    // ciphertext; fail rather than emit it descrambled with a
+                    // key this sector's own crib just rejected.
+                    tracing::error!(
+                        target: "css",
+                        "css: cached title key stale and re-crack failed on a readable sector"
+                    );
+                    return Err(crate::error::Error::DecryptFailed);
+                }
             }
-            lfsr::descramble_sector(title_key, chunk);
         }
     }
+    Ok(0)
 }
 
 /// Check if a sector has the CSS scramble flag set.
@@ -435,6 +464,66 @@ pub fn is_scrambled_pack(sector: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::error::{Error, Result};
+
+    /// A sector whose cached key is provably stale and whose own re-crack fails
+    /// must FAIL, not emit data.
+    ///
+    /// The clear header (`<0x80`) is not scrambled, so it survives a wrong-key
+    /// descramble intact: the sector still opens with a valid pack start and
+    /// passes every structural check the PS demuxer applies. Only the PES
+    /// payload is corrupted, which is exactly where nothing looks. Leaving it
+    /// CSS has no external key source, so on a readable sector this is recovery
+    /// failing on data we can see — the same condition AACS treats as
+    /// `DecryptFailed` rather than applying a neighbouring unit's key.
+    #[test]
+    fn a_sector_with_no_provable_key_fails_instead_of_emitting_data() {
+        // Header periodic enough to yield a crib, so the cached key IS validated
+        // (a crib-less sector rides the cache by design and is not this case).
+        let mut sector = [0u8; 2048];
+        sector[0x14] = 0x30; // scramble flag bits 4-5
+        for (i, b) in sector.iter_mut().enumerate().take(0x80).skip(0x20) {
+            *b = (i % 4) as u8;
+        }
+        // Body is random-ish so no LFSR seed reproduces the crib from it: the
+        // re-crack must fail.
+        for (i, b) in sector.iter_mut().enumerate().skip(0x80) {
+            *b = ((i * 37 + 11) % 251) as u8;
+        }
+        assert!(
+            is_scrambled(&sector),
+            "fixture must actually be a scrambled sector, or descramble_region \
+             skips it and this test proves nothing"
+        );
+        assert!(
+            stevenson::attack_crib(&sector).is_some(),
+            "fixture must yield a crib, or the stale-key branch is never entered"
+        );
+        assert!(
+            stevenson::crack_title_key(&sector).is_none(),
+            "fixture must be uncrackable, or the failure branch is never entered"
+        );
+
+        let before = sector;
+        let mut key = [0xAAu8; 5];
+        let err = descramble_region(&mut sector, &mut key)
+            .expect_err("an unprovable key must fail, not emit data");
+
+        assert!(
+            matches!(err, Error::DecryptFailed),
+            "must be the same verdict the AACS path gives for an unopenable unit, \
+             got {err:?}"
+        );
+        assert_eq!(
+            sector, before,
+            "the sector must be left untouched; descrambling it with the stale key \
+             would leave the clear header intact and corrupt only the payload, \
+             which passes every structural check downstream"
+        );
+        assert_eq!(
+            key, [0xAAu8; 5],
+            "a failed re-crack must not overwrite the cached key"
+        );
+    }
 
     /// `CssState` is reachable via the public `Disc.css` field, so a `{:?}` on a
     /// `Disc` must not print the raw CSS title key. Sentinel byte 213 (0xD5);

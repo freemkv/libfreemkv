@@ -567,8 +567,7 @@ fn decrypt_sectors_impl(
             // `css::descramble_region`), and CSS does not need the post-decrypt
             // recovery seam that AACS key-fetch / FMTS segment-skip use (those DO
             // consume external inputs a `decrypt_sectors` caller cannot supply).
-            css::descramble_region(buf, title_key);
-            0
+            css::descramble_region(buf, title_key)?
         }
     };
     Ok(dropped)

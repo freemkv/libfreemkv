@@ -24,20 +24,35 @@ fn decrypt_sectors_with_none_keys_is_noop() {
 
 /// Test: decrypt_sectors with CSS keys descrambles sectors.
 #[test]
-fn decrypt_sectors_with_css_keys_works() {
+fn css_decrypt_of_an_unkeyable_sector_fails_instead_of_emitting_data() {
+    // A scrambled sector whose header is uniformly periodic yields a crib, so
+    // the supplied key IS validated — and this arbitrary key is not the right
+    // one, so the crib check rejects it and the re-crack from this synthetic
+    // body finds nothing.
+    //
+    // CSS has no external key source: the title key comes only from cracking
+    // the data. So "no key" on a readable sector is recovery failing on bytes
+    // we can see, not a missing input — the same condition AACS answers with
+    // DecryptFailed rather than applying a neighbouring unit's key. Emitting
+    // the sector either way is bad data reported as success: descrambled with
+    // the rejected key it is garbage behind an intact clear header, and passed
+    // through untouched it is ciphertext where plaintext is meant to be.
+    //
+    // This test previously asserted the scramble flag was cleared, which pinned
+    // the old behaviour of descrambling with whatever key happened to be held.
     let mut sector = vec![0xFFu8; 2048];
+    sector[0x14] |= 0x30; // CSS scramble flag, bits 4-5
 
-    // Set CSS scramble flag (bits 4-5 of byte 0x14)
-    sector[0x14] |= 0x30;
-
-    let title_key: [u8; 5] = [0x42, 0x13, 0x37, 0xBE, 0xEF]; // Not used - defined later
+    let title_key: [u8; 5] = [0x42, 0x13, 0x37, 0xBE, 0xEF];
     let mut keys = DecryptKeys::Css { title_key };
 
-    // Descramble (CSS uses same operation for encrypt/decrypt)
-    libfreemkv::decrypt::decrypt_sectors(&mut sector, &mut keys, 0).unwrap();
-
-    // Flag should be cleared
-    assert_eq!(sector[0x14] & 0x30, 0x00, "CSS flag should be cleared");
+    let err = libfreemkv::decrypt::decrypt_sectors(&mut sector, &mut keys, 0)
+        .expect_err("an unkeyable CSS sector must fail loud");
+    assert_eq!(
+        err.code(),
+        libfreemkv::error::Error::DecryptFailed.code(),
+        "CSS and AACS must give the SAME verdict for 'no provable key'"
+    );
 }
 
 /// Test: AACS unit encryption detection works.
