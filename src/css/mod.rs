@@ -403,14 +403,29 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
                     lfsr::descramble_sector(title_key, chunk);
                 }
                 None => {
-                    // No provable key. `chunk` already holds the restored
-                    // ciphertext; fail rather than emit it descrambled with a
-                    // key this sector's own crib just rejected.
-                    tracing::error!(
-                        target: "css",
-                        "css: cached title key stale and re-crack failed on a readable sector"
-                    );
-                    return Err(crate::error::Error::DecryptFailed);
+                    // The re-crack found nothing. Descramble with the CACHED
+                    // key anyway — it is the best available evidence, and this
+                    // is very probably still the right key.
+                    //
+                    // `attack_crib` is a heuristic, not a proof. It finds a
+                    // periodic run in the unscrambled header and predicts that
+                    // the run continues past 0x80. When that prediction does
+                    // not hold, the crib check reports a mismatch even though
+                    // the cached key is correct, and the re-crack from this
+                    // sector then fails BECAUSE the crib was never valid.
+                    // Crib mismatch + crack failure is therefore the signature
+                    // of a crib false positive, not of a stale key.
+                    //
+                    // Round 9 read this as "descrambling with a key we just
+                    // proved stale" and made it Error::DecryptFailed to match
+                    // the AACS path. That was wrong on both counts: the key is
+                    // not proven stale, and CSS is not AACS — an AACS unit key
+                    // either opens a unit or does not, whereas a CSS title key
+                    // is recovered from data whose recoverability varies sector
+                    // by sector. Real DVDs hit this constantly; the change made
+                    // Greenland.iso unrippable and was caught by the real-media
+                    // acceptance gate, not by any unit test.
+                    lfsr::descramble_sector(title_key, chunk);
                 }
             }
         }
@@ -465,63 +480,56 @@ mod tests {
     use super::*;
     use crate::error::{Error, Result};
 
-    /// A sector whose cached key is provably stale and whose own re-crack fails
-    /// must FAIL, not emit data.
+    /// A crib mismatch whose re-crack fails keeps the CACHED key and
+    /// descrambles with it — it does NOT fail the rip.
     ///
-    /// The clear header (`<0x80`) is not scrambled, so it survives a wrong-key
-    /// descramble intact: the sector still opens with a valid pack start and
-    /// passes every structural check the PS demuxer applies. Only the PES
-    /// payload is corrupted, which is exactly where nothing looks. Leaving it
-    /// CSS has no external key source, so on a readable sector this is recovery
-    /// failing on data we can see — the same condition AACS treats as
-    /// `DecryptFailed` rather than applying a neighbouring unit's key.
+    /// `attack_crib` is a heuristic: it finds a periodic run in the
+    /// unscrambled header and predicts the run continues past 0x80. When that
+    /// prediction does not hold, the crib reports a mismatch even though the
+    /// cached key is correct, and the re-crack then fails BECAUSE the crib was
+    /// never valid. So this combination is the signature of a crib false
+    /// positive, not of a stale key, and the cached key remains the best
+    /// available evidence.
+    ///
+    /// This test exists because round 9 read the same code as "descrambling
+    /// with a key we just proved stale" and made it `DecryptFailed` to match
+    /// the AACS path. Real DVDs hit this constantly — the change made
+    /// Greenland.iso unrippable, and no unit test caught it; the real-media
+    /// acceptance gate did. CSS is not AACS: an AACS unit key either opens a
+    /// unit or does not, whereas a CSS title key is recovered from data whose
+    /// recoverability varies sector by sector.
     #[test]
-    fn a_sector_with_no_provable_key_fails_instead_of_emitting_data() {
-        // Header periodic enough to yield a crib, so the cached key IS validated
-        // (a crib-less sector rides the cache by design and is not this case).
+    fn a_crib_false_positive_keeps_the_cached_key_rather_than_failing() {
+        // Header periodic enough to yield a crib, body random enough that no
+        // LFSR seed reproduces it — crib mismatch, re-crack fails.
         let mut sector = [0u8; 2048];
-        sector[0x14] = 0x30; // scramble flag bits 4-5
+        sector[0x14] = 0x30;
         for (i, b) in sector.iter_mut().enumerate().take(0x80).skip(0x20) {
             *b = (i % 4) as u8;
         }
-        // Body is random-ish so no LFSR seed reproduces the crib from it: the
-        // re-crack must fail.
         for (i, b) in sector.iter_mut().enumerate().skip(0x80) {
             *b = ((i * 37 + 11) % 251) as u8;
         }
-        assert!(
-            is_scrambled(&sector),
-            "fixture must actually be a scrambled sector, or descramble_region \
-             skips it and this test proves nothing"
-        );
+        assert!(is_scrambled(&sector), "fixture must be a scrambled sector");
         assert!(
             stevenson::attack_crib(&sector).is_some(),
-            "fixture must yield a crib, or the stale-key branch is never entered"
+            "fixture must yield a crib, or the mismatch branch is never entered"
         );
         assert!(
             stevenson::crack_title_key(&sector).is_none(),
             "fixture must be uncrackable, or the failure branch is never entered"
         );
 
-        let before = sector;
-        let mut key = [0xAAu8; 5];
-        let err = descramble_region(&mut sector, &mut key)
-            .expect_err("an unprovable key must fail, not emit data");
+        let key_before = [0xAAu8; 5];
+        let mut key = key_before;
+        let out = descramble_region(&mut sector, &mut key)
+            .expect("a crib false positive must NOT fail the rip");
 
-        assert!(
-            matches!(err, Error::DecryptFailed),
-            "must be the same verdict the AACS path gives for an unopenable unit, \
-             got {err:?}"
-        );
+        assert_eq!(out, 0, "CSS reports no loss term of its own");
         assert_eq!(
-            sector, before,
-            "the sector must be left untouched; descrambling it with the stale key \
-             would leave the clear header intact and corrupt only the payload, \
-             which passes every structural check downstream"
-        );
-        assert_eq!(
-            key, [0xAAu8; 5],
-            "a failed re-crack must not overwrite the cached key"
+            key, key_before,
+            "a failed re-crack must leave the cached key in place — it is still \
+             the best evidence, and overwriting it would poison every later sector"
         );
     }
 
