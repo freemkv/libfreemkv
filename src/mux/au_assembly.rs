@@ -535,12 +535,7 @@ impl AuAssembler {
     /// no longer exist, and the AU that eventually emits takes its PTS from the
     /// fragment that actually opened it.
     fn discard_gap_before(&mut self, off: u64) {
-        while self.marks.front().is_some_and(|m| m.off < off) {
-            self.marks.pop_front();
-        }
-        while self.disc_marks.front().is_some_and(|&o| o < off) {
-            self.disc_marks.pop_front();
-        }
+        self.drop_marks_before(off);
         self.pending_gap = true;
     }
 }

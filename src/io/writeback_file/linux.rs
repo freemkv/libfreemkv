@@ -30,14 +30,15 @@ pub(super) fn preallocate(file: &File, size_bytes: u64) {
     );
 }
 
-/// Run `fsync` on `file` with a 60 s deadline. On timeout — and
-/// likewise on halt or a lost worker — we log and return `Ok(())`: the
-/// kernel will still flush on close, so the data is best-effort durable.
-/// The alternative (trap the thread for the rest of the rip, or return
-/// an error that aborts an otherwise-complete mux) is worse, so all
-/// three fallbacks return `Ok(())`. `Ok(())` from these paths is NOT a
-/// durability barrier — the durable flush did not complete; only the
-/// hang is bounded.
+/// Run `fsync` on `file` with a 60 s deadline. On timeout, halt or a lost
+/// worker we log and return `Err` — matching macOS. POSIX gives `fsync`
+/// exactly one way to say "the data is on stable storage" and that is a zero
+/// return; a call that never reached the device has not earned it, so `Ok(())`
+/// from here means the flush completed and nothing else.
+///
+/// The kernel will still flush on close, so the data is usually durable
+/// anyway — but that is a probability, not a barrier, and a caller that needs
+/// crash-consistency has to be able to tell the difference.
 ///
 /// ## fd-reuse safety
 ///
@@ -162,7 +163,10 @@ fn bounded_failure_to_result(e: crate::io::bounded::BoundedError) -> io::Result<
                 target: "mux",
                 "WritebackFile::sync_all fsync worker lost before completion; data NOT durably flushed, kernel will flush on close"
             );
-            Err(io::Error::from(std::io::ErrorKind::Other))
+            // EIO, matching the macOS sibling: a consumer distinguishing these
+            // three failures does so on the same value on every platform.
+            // ErrorKind::Other carries nothing a caller can branch on.
+            Err(io::Error::from_raw_os_error(libc::EIO))
         }
     }
 }
