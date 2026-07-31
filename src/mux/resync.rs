@@ -21,8 +21,17 @@
 pub(crate) struct ResyncGate {
     /// True while dropping post-gap inter-coded frames until the next keyframe.
     armed: bool,
-    /// Count of frames dropped while armed (for a single summary log on resync).
+    /// Count of frames dropped in the CURRENT armed run. Reset at each resync,
+    /// so it answers "how expensive was this gap" and nothing else.
     dropped: u64,
+    /// Every frame this gate has ever dropped, across all runs. NOT reset on
+    /// resync.
+    ///
+    /// `dropped` alone cannot report loss: it is zeroed the moment a keyframe
+    /// disarms the gate, so a mid-title gap that resolves before EOF leaves no
+    /// trace at all. That is the common case — most gaps do resolve — which
+    /// made concealed video loss invisible to every consumer.
+    dropped_total: u64,
 }
 
 impl ResyncGate {
@@ -30,6 +39,7 @@ impl ResyncGate {
         Self {
             armed: false,
             dropped: 0,
+            dropped_total: 0,
         }
     }
 
@@ -58,6 +68,7 @@ impl ResyncGate {
                 true
             } else {
                 self.dropped += 1;
+                self.dropped_total += 1;
                 false
             }
         } else {
@@ -71,6 +82,12 @@ impl ResyncGate {
         self.dropped
     }
 
+    /// Every frame this gate has dropped, across all armed runs. Survives
+    /// resync, so it is the number a caller reports loss from.
+    pub(crate) fn dropped_total(&self) -> u64 {
+        self.dropped_total
+    }
+
     /// Whether the gate is currently dropping frames (armed, awaiting keyframe).
     pub(crate) fn is_armed(&self) -> bool {
         self.armed
@@ -79,6 +96,55 @@ impl ResyncGate {
 
 #[cfg(test)]
 mod tests {
+
+    /// `dropped` is per-run and `dropped_total` is cumulative, and only the
+    /// second can report loss.
+    ///
+    /// A gap that RESOLVES — the common case — disarms the gate at the next
+    /// keyframe and zeroes `dropped`. Anything reading that counter afterwards
+    /// sees nothing happened, which is how concealed video loss reached no
+    /// caller: the only EOF warning fired for gates STILL armed, i.e. exactly
+    /// the gaps that did not resolve.
+    #[test]
+    fn a_resolved_gap_still_reports_its_dropped_frames() {
+        let mut g = ResyncGate::new();
+
+        // Gap, then two inter-coded frames dropped, then a keyframe resyncs.
+        assert!(
+            !g.admit(true, true, false),
+            "post-gap non-keyframe is dropped"
+        );
+        assert!(
+            !g.admit(true, false, false),
+            "still dropping until a keyframe"
+        );
+        assert!(
+            g.admit(true, false, true),
+            "the keyframe resyncs and is emitted"
+        );
+
+        assert_eq!(
+            g.dropped_in_run(),
+            0,
+            "the per-run counter is zeroed by the resync — by design"
+        );
+        assert_eq!(
+            g.dropped_total(),
+            2,
+            "but the frames are still gone, and the cumulative count must say so"
+        );
+        assert!(!g.is_armed(), "resynced");
+
+        // A second gap accumulates rather than restarting.
+        assert!(!g.admit(true, true, false));
+        assert!(g.admit(true, false, true));
+        assert_eq!(
+            g.dropped_total(),
+            3,
+            "totals accumulate across runs; a title with several concealed gaps \
+             must not report only the last one"
+        );
+    }
     use super::*;
 
     #[test]
