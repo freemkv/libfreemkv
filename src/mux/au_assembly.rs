@@ -1023,36 +1023,48 @@ mod tests {
         );
     }
 
-    /// A discontinuity the SOURCE signalled, on bytes the backstop later throws
-    /// away, must not be lost either — the gap is real regardless of which
-    /// mechanism noticed it first, and the two must not cancel out.
+    /// A source-signalled discontinuity reaches the AU it opens.
+    ///
+    /// This is the `disc_marks` path — the ORIGINAL mechanism, distinct from
+    /// the sticky `pending_gap` the backstop sets. Nothing else pins it: the
+    /// two tests above drive `pending_gap`, and a mark placed on a fragment
+    /// that is later discarded is retired by design.
+    ///
+    /// Deliberately NOT combined with the backstop. A previous version of this
+    /// test signalled the discontinuity on the first over-cap push and asserted
+    /// the flag on the AU after the discard — but that first run still has the
+    /// next AU's delimiter at `buf[0]`, so it force-flushes as an over-long AU,
+    /// and THAT AU consumes the mark. The assertion was then satisfied entirely
+    /// by `pending_gap`, making the test a duplicate of the one above it under
+    /// a name promising something else. The two mechanisms cannot be isolated
+    /// in one fixture, so they get one test each.
     #[test]
-    fn a_signalled_discontinuity_survives_a_backstop_discard() {
+    fn a_source_signalled_discontinuity_reaches_the_au_it_opens() {
         let mut a = AuAssembler::for_codec(Codec::H264);
 
-        let mut stream = au(0x11, 64);
-        stream.extend_from_slice(AUD);
-        a.push(&stream, Some(1000), None, None, false);
+        // A clean AU first, so there is a prior AU and the gate has somewhere
+        // to be discontinuous FROM.
+        let mut first = au(0x11, 64);
+        first.extend_from_slice(AUD);
+        let out = a.push(&first, Some(1000), None, None, false);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].discontinuity, "a clean run is continuous");
 
-        // The source says this fragment follows a gap, AND it is start-code-free
-        // and long enough to trip the backstop. Two runs, so the second reaches
-        // the discard rather than the force-flush (see the test above).
-        let junk = vec![0xAB; MAX_AU_BUFFER + 4096];
-        a.push(&junk, Some(2000), None, None, true);
-        a.push(&junk, Some(2100), None, None, false);
-
-        let mut resumed = au(0x22, 64);
-        resumed.extend_from_slice(AUD);
-        let out = a.push(&resumed, Some(3000), None, None, false);
+        // The source flags this fragment as following a gap. It carries the
+        // body of the next AU and its closing delimiter, so it is emitted
+        // rather than discarded — the mark must ride through to it.
+        let mut second = au(0x22, 64);
+        second.extend_from_slice(AUD);
+        let out = a.push(&second, Some(2000), None, None, true);
 
         let au2 = out
             .iter()
             .find(|x| x.data.contains(&0x22))
-            .expect("the post-gap AU must emit");
+            .expect("the flagged AU must emit");
         assert!(
             au2.discontinuity,
-            "a source-signalled discontinuity on discarded bytes must still \
-             reach the AU that follows them"
+            "a discontinuity the SOURCE signalled must reach the AU whose bytes \
+             carried it; this is the disc_marks path and no other test drives it"
         );
     }
 
