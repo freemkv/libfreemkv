@@ -1461,7 +1461,7 @@ mod tests {
         );
     }
 
-    /// Every scheme answers "there is no key for these bytes" the SAME way.
+    /// Every scheme that CANNOT prove a key answers the same way.
     ///
     /// This is the property `decrypt_span` exists to hold. There used to be two
     /// top-level decrypt paths — one for CSS and clear media, one for AACS —
@@ -1473,6 +1473,14 @@ mod tests {
     /// Asserting one verdict across the schemes is what makes a future
     /// divergence a test failure rather than a silent corruption. A per-scheme
     /// test cannot do that: each would still pass while the two disagreed.
+    ///
+    /// CSS is deliberately NOT in this list. Its title key is recovered from
+    /// the data, sector by sector, by a heuristic that false-positives — a crib
+    /// mismatch whose re-crack fails means the crib was wrong, not that the key
+    /// is stale, so the cached key is kept and used. Round 9 folded CSS in here
+    /// on the reasoning that "no key" should mean one thing everywhere; that
+    /// made real DVDs unrippable, and the real-media gate caught it. Uniform
+    /// policy is right for schemes that can PROVE a key wrong. CSS cannot.
     #[test]
     fn every_scheme_gives_the_same_verdict_when_no_key_can_be_proven() {
         use crate::disc::ContentFormat;
@@ -1496,27 +1504,10 @@ mod tests {
         let aacs_unmapped = decrypt_span(&mut buf, &mut aacs_keys, 0, Some(&empty), None)
             .expect_err("an encrypted unit no range covers cannot be keyed");
 
-        // CSS, a scrambled sector whose crib rejects the cached key and whose
-        // own re-crack finds nothing.
-        let mut sector = [0u8; 2048];
-        sector[0x14] = 0x30;
-        for (i, b) in sector.iter_mut().enumerate().take(0x80).skip(0x20) {
-            *b = (i % 4) as u8;
-        }
-        for (i, b) in sector.iter_mut().enumerate().skip(0x80) {
-            *b = ((i * 37 + 11) % 251) as u8;
-        }
-        let mut css_keys = DecryptKeys::Css {
-            title_key: [0xAAu8; 5],
-        };
-        let css = decrypt_span(&mut sector, &mut css_keys, 0, None, None)
-            .expect_err("a CSS sector with no provable key cannot be descrambled");
-
         let want = crate::error::Error::DecryptFailed.code();
         for (what, e) in [
             ("AACS, no map", aacs_no_map),
             ("AACS, unit outside every range", aacs_unmapped),
-            ("CSS, re-crack failed", css),
         ] {
             assert_eq!(
                 e.code(),

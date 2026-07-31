@@ -24,34 +24,36 @@ fn decrypt_sectors_with_none_keys_is_noop() {
 
 /// Test: decrypt_sectors with CSS keys descrambles sectors.
 #[test]
-fn css_decrypt_of_an_unkeyable_sector_fails_instead_of_emitting_data() {
+fn css_decrypt_of_an_uncrackable_sector_still_descrambles() {
     // A scrambled sector whose header is uniformly periodic yields a crib, so
-    // the supplied key IS validated — and this arbitrary key is not the right
+    // the supplied key IS checked — and this arbitrary key is not the right
     // one, so the crib check rejects it and the re-crack from this synthetic
     // body finds nothing.
     //
-    // CSS has no external key source: the title key comes only from cracking
-    // the data. So "no key" on a readable sector is recovery failing on bytes
-    // we can see, not a missing input — the same condition AACS answers with
-    // DecryptFailed rather than applying a neighbouring unit's key. Emitting
-    // the sector either way is bad data reported as success: descrambled with
-    // the rejected key it is garbage behind an intact clear header, and passed
-    // through untouched it is ciphertext where plaintext is meant to be.
+    // That combination does NOT fail the rip. `attack_crib` is a heuristic: it
+    // predicts that a periodic header run continues past 0x80, and when that
+    // prediction does not hold it reports a mismatch even for a CORRECT key —
+    // whereupon the re-crack fails because the crib was never valid. Crib
+    // mismatch plus crack failure is the signature of a crib false positive,
+    // and the cached key stays the best available evidence.
     //
-    // This test previously asserted the scramble flag was cleared, which pinned
-    // the old behaviour of descrambling with whatever key happened to be held.
+    // This test previously asserted DecryptFailed, matching a round-9 change
+    // that made real DVDs unrippable (Greenland.iso). CSS is not AACS: an AACS
+    // unit key either opens a unit or does not, whereas a CSS title key is
+    // recovered from data whose recoverability varies sector by sector.
     let mut sector = vec![0xFFu8; 2048];
     sector[0x14] |= 0x30; // CSS scramble flag, bits 4-5
 
     let title_key: [u8; 5] = [0x42, 0x13, 0x37, 0xBE, 0xEF];
     let mut keys = DecryptKeys::Css { title_key };
 
-    let err = libfreemkv::decrypt::decrypt_sectors(&mut sector, &mut keys, 0)
-        .expect_err("an unkeyable CSS sector must fail loud");
+    let dropped = libfreemkv::decrypt::decrypt_sectors(&mut sector, &mut keys, 0)
+        .expect("a crib false positive must not fail the rip");
+    assert_eq!(dropped, 0, "CSS reports no loss term of its own");
     assert_eq!(
-        err.code(),
-        libfreemkv::error::Error::DecryptFailed.code(),
-        "CSS and AACS must give the SAME verdict for 'no provable key'"
+        sector[0x14] & 0x30,
+        0x00,
+        "the sector is descrambled with the cached key, which clears the flag"
     );
 }
 
