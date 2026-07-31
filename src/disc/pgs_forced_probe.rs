@@ -1496,7 +1496,10 @@ mod tests {
 
         // Conclusive: one exactly-sized read, extent read to its end, no stall.
         let conclusive_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        tracing::subscriber::with_default(ScanDebugCounter(conclusive_count.clone()), || {
+        // Serialised crate-wide — see `harness::with_captured_tracing`. These
+        // race the capture in disc/encrypt.rs otherwise: the dispatch is
+        // thread-local but the callsite-interest cache is global.
+        crate::harness::with_captured_tracing(ScanDebugCounter(conclusive_count.clone()), || {
             let mut reader = TsReader {
                 data: ts_stream(pid, &pcs_display(true)),
                 pos: 0,
@@ -1516,7 +1519,7 @@ mod tests {
 
         // Inconclusive: dies mid-title with a read error → ReadFailed.
         let truncated_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        tracing::subscriber::with_default(ScanDebugCounter(truncated_count.clone()), || {
+        crate::harness::with_captured_tracing(ScanDebugCounter(truncated_count.clone()), || {
             let mut reader =
                 PartialTsReader::new(ts_stream(pid, &pcs_display(true)), ThenWhat::Error);
             let mut title = multi_read_pgs_title(pid, false);
