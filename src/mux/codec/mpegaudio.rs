@@ -154,7 +154,7 @@ mod tests {
     /// 0xFF 0xFB 0x90 0x00 — the canonical MP3 frame header.
     fn mp3_frame(payload: usize) -> Vec<u8> {
         let mut f = vec![0xFF, 0xFB, 0x90, 0x00];
-        f.extend(std::iter::repeat(0xAA).take(payload));
+        f.extend(std::iter::repeat_n(0xAA, payload));
         f
     }
 

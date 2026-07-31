@@ -1306,7 +1306,7 @@ mod tests {
                         break;
                     }
                     let abs = (lba - self.ext_start) / ALIGNED_UNIT_SECTORS + i as u32;
-                    if abs % 2 == 0 {
+                    if abs.is_multiple_of(2) {
                         chunk.fill(0x11); // CPI-clear (0x11 & 0xC0 == 0), no TS sync
                     } else {
                         chunk.fill(0xAB); // scrambled body (no TS sync)

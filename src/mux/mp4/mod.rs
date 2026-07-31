@@ -1226,6 +1226,11 @@ mod tests {
     }
 
     // A minimal AC-3 5.1 frame the audio parser accepts.
+    // The underscores in these literals mark BITFIELD boundaries in the
+    // bitstream header being built (e.g. a 5-bit field then a 3-bit field),
+    // not thousands-style digit groups. Regrouping them uniformly would
+    // satisfy the lint by destroying the only thing they encode.
+    #[allow(clippy::unusual_byte_groupings)]
     fn ac3_frame() -> Vec<u8> {
         vec![
             0x0B,
@@ -1503,11 +1508,11 @@ mod tests {
         t.duration_secs = 7200.0;
         let r = estimate_reserve(&t, &[0, 1]);
         assert!(
-            r % (4 << 20) == 0,
+            r.is_multiple_of(4 << 20),
             "reserve is 4 MiB-aligned + 4 MiB buffer"
         );
         assert!(
-            r >= 12 << 20 && r <= 20 << 20,
+            (12 << 20..=20 << 20).contains(&r),
             "≈12-16 MB for a 2h feature, got {r}"
         );
 

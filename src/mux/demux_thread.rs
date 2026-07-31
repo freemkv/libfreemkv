@@ -417,9 +417,7 @@ mod tests {
         let (_dt, rx) =
             DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
 
-        pf_tx
-            .send(Err(std::io::Error::new(std::io::ErrorKind::Other, "boom")))
-            .unwrap();
+        pf_tx.send(Err(std::io::Error::other("boom"))).unwrap();
         drop(pf_tx);
 
         let batches = collect_batches(&rx, Duration::from_secs(5));

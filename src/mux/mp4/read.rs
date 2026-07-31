@@ -1087,6 +1087,11 @@ mod tests {
     }
 
     #[test]
+    // The underscores in these literals mark BITFIELD boundaries in the
+    // bitstream header being built (e.g. a 5-bit field then a 3-bit field),
+    // not thousands-style digit groups. Regrouping them uniformly would
+    // satisfy the lint by destroying the only thing they encode.
+    #[allow(clippy::unusual_byte_groupings)]
     fn write_then_read_round_trip() {
         // Mux a small A/V title to an in-memory MP4, then demux it back and
         // check the streams, codec_private, and sample payloads survive.
@@ -1453,6 +1458,11 @@ mod tests {
     /// one of any of them round-trips through this crate unnoticed while making
     /// the file unplayable elsewhere.
     #[test]
+    // The underscores in these literals mark BITFIELD boundaries in the
+    // bitstream header being built (e.g. a 5-bit field then a 3-bit field),
+    // not thousands-style digit groups. Regrouping them uniformly would
+    // satisfy the lint by destroying the only thing they encode.
+    #[allow(clippy::unusual_byte_groupings)]
     fn moov_tree_carries_the_mandatory_track_header_and_media_boxes() {
         use crate::disc::{
             AudioChannels, AudioStream, Codec, DiscTitle, FrameRate, HdrFormat, LabelPurpose,
@@ -2148,8 +2158,8 @@ mod tests {
         mdia.extend_from_slice(&mdhd);
         mdia.extend_from_slice(&hdlr);
         mdia.extend_from_slice(&minf);
-        let trak = mp4_box(b"trak", &mp4_box(b"mdia", &mdia));
-        trak
+
+        mp4_box(b"trak", &mp4_box(b"mdia", &mdia))
     }
 
     #[test]
@@ -2449,10 +2459,10 @@ mod tests {
     }
 
     /// A `VisualSampleEntry` body with DISTINCT width and height, plus optional
-    /// child boxes (ISO/IEC 14496-12 §12.1.3): 6 reserved + 2 data_reference_index
-    /// + 16 pre_defined/reserved, then width(2) at 24 and height(2) at 26, then 50
-    /// more bytes of resolution / frame_count / compressorname / depth / pre_defined
-    /// to the 78-byte fixed part.
+    /// child boxes (ISO/IEC 14496-12 §12.1.3). The fixed part is 78 bytes:
+    /// 6 reserved, 2 data_reference_index, 16 pre_defined/reserved, width(2) at
+    /// offset 24, height(2) at 26, then 50 more bytes of resolution,
+    /// frame_count, compressorname, depth and pre_defined.
     fn visual_entry(width: u16, height: u16, children: &[u8]) -> Vec<u8> {
         let mut b = vec![0u8; 78];
         b[24..26].copy_from_slice(&width.to_be_bytes());
@@ -2492,7 +2502,7 @@ mod tests {
 
         // And a VisualSampleEntry too short to hold the fixed part is refused
         // rather than read out of a shorter buffer.
-        let short = stsd_with(b"avc1", &vec![0u8; 40]);
+        let short = stsd_with(b"avc1", &[0u8; 40]);
         assert!(
             parse_stsd(&short).is_none(),
             "a truncated VisualSampleEntry has no dimensions to read"
@@ -2519,7 +2529,7 @@ mod tests {
         assert_eq!(info.height, 0, "an audio entry declares no height");
 
         // Too short for the 28-byte fixed part: fall back to stereo, not to 0.
-        let short = stsd_with(b"ac-3", &vec![0u8; 12]);
+        let short = stsd_with(b"ac-3", &[0u8; 12]);
         let info = parse_stsd(&short).expect("a short audio entry still names a codec");
         assert_eq!(
             info.channels, 2,

@@ -3432,7 +3432,7 @@ mod tests {
     fn merged_extents_unions_sorts_and_merges() {
         // [300,310) ; [100,150) ; [150,200) adjacent→merges with prev ;
         // [120,160) overlaps [100,150)&[150,200) ; [500,505) disjoint.
-        let v = vec![
+        let v = [
             ext(300, 10),
             ext(100, 50),
             ext(150, 50),
@@ -3450,7 +3450,7 @@ mod tests {
     /// to a single range — no double-counting of shared content.
     #[test]
     fn merged_extents_dedups_shared_clip() {
-        let v = vec![ext(100, 50), ext(100, 50)];
+        let v = [ext(100, 50), ext(100, 50)];
         assert_eq!(merged_extents(v.iter()), vec![(100, 50)]);
     }
 
@@ -3666,7 +3666,7 @@ mod tests {
     #[test]
     fn canonical_order_pushes_oversize_play_all_behind_real_main() {
         const CAPACITY: u64 = 58_500_000_000; // 58.5 GB
-        let mut titles = vec![
+        let mut titles = [
             // Title 1 in the raw MPLS order — virtual play-all
             title_with(
                 "00020.mpls",
@@ -3694,7 +3694,7 @@ mod tests {
     #[test]
     fn canonical_order_preserves_natural_ranking_on_normal_disc() {
         const CAPACITY: u64 = 60_000_000_000;
-        let mut titles = vec![
+        let mut titles = [
             title_with("00100.mpls", 600.0, 500_000_000, 1), // 10 min menu (small)
             title_with("00800.mpls", 7320.0, 55_000_000_000, 1), // 2h02m main feature
             title_with("00200.mpls", 1800.0, 2_000_000_000, 1), // 30 min extra
@@ -3717,7 +3717,7 @@ mod tests {
     #[test]
     fn title_index_0_is_main_feature_dvd_the_dash_t_1_contract() {
         const DVD9: u64 = 7_900_000_000; // dual-layer DVD
-        let mut titles = vec![
+        let mut titles = [
             title_with("VTS_01_menu", 120.0, 200_000_000, 1), // 2m menu/setup loop
             title_with("VTS_02_main", 6540.0, 6_300_000_000, 1), // 1h49m main feature
             title_with("VTS_03_extra", 900.0, 800_000_000, 1), // 15m extra
@@ -3871,7 +3871,7 @@ mod tests {
         let feature = title_sized(57_000_000_000, 7860.0, 11); // 2h11m, 11 chapters
         let bonus = title_sized(1_200_000_000, 600.0, 1); // 10m, 1 clip
         let decoy = title_sized(400_000_000, 5460.0, 91); // 1h31m but tiny (reused)
-        let mut v = vec![bonus, decoy, feature];
+        let mut v = [bonus, decoy, feature];
         v.sort_by(|a, b| Disc::canonical_title_order(a, b, capacity));
         assert_eq!(
             v[0].size_bytes, 57_000_000_000,
@@ -4610,14 +4610,14 @@ mod tests {
         assert!(super::aligned_unit_keys_validate(
             &[(7, uk)],
             None,
-            &[enc.clone()],
+            std::slice::from_ref(&enc),
             ContentFormat::BdTs
         ));
         // Wrong key -> cannot de-scramble a scrambled sample -> reject.
         assert!(!super::aligned_unit_keys_validate(
             &[(7, [0x00u8; 16])],
             None,
-            &[enc.clone()],
+            std::slice::from_ref(&enc),
             ContentFormat::BdTs
         ));
         // Empty key set against a scrambled sample -> reject.

@@ -370,10 +370,10 @@ mod tests {
             if let Some(d) = desc {
                 meta.descriptions.insert(lang.to_string(), d);
             }
-            if meta.disc_number.is_none() {
-                if let Some(d) = ds {
-                    meta.disc_number = Some(d);
-                }
+            if meta.disc_number.is_none()
+                && let Some(d) = ds
+            {
+                meta.disc_number = Some(d);
             }
         }
 

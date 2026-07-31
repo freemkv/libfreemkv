@@ -1456,6 +1456,11 @@ mod tests {
     /// offset on any real stream that sets it — mislabelling every picture's
     /// coding type.
     #[test]
+    // The underscores in these literals mark BITFIELD boundaries in the
+    // bitstream header being built (e.g. a 5-bit field then a 3-bit field),
+    // not thousands-style digit groups. Regrouping them uniformly would
+    // satisfy the lint by destroying the only thing they encode.
+    #[allow(clippy::unusual_byte_groupings)]
     fn nonzero_num_extra_slice_header_bits_shifts_the_slice_type_offset() {
         use super::super::coding::CodingType;
 
@@ -2690,7 +2695,7 @@ mod tests {
             }
         }
         fn put_bit(&mut self, b: u32) {
-            if self.nbits % 8 == 0 {
+            if self.nbits.is_multiple_of(8) {
                 self.bytes.push(0);
             }
             if b & 1 != 0 {

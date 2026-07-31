@@ -1043,15 +1043,15 @@ mod tests {
 
     impl Stream for FakeStream {
         fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
-            if let Some((halt, after)) = &self.cancel_halt {
-                if self.reads >= *after {
-                    halt.cancel();
-                }
+            if let Some((halt, after)) = &self.cancel_halt
+                && self.reads >= *after
+            {
+                halt.cancel();
             }
-            if let Some(after) = self.halt_err_at_read {
-                if self.reads >= after {
-                    return Err(crate::error::Error::Halted.into());
-                }
+            if let Some(after) = self.halt_err_at_read
+                && self.reads >= after
+            {
+                return Err(crate::error::Error::Halted.into());
             }
             let f = self.frames.pop_front();
             if f.is_some() {

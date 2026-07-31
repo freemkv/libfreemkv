@@ -2201,6 +2201,11 @@ mod tests {
     /// `[padding, Y, Cb, Cr]`. Every byte of every entry is distinct here, so
     /// a wrong stride, a wrong base or a shifted component shows up.
     #[test]
+    // The loop variable is the DOMAIN VALUE being checked (a palette entry number), not a
+    // cursor into a collection: it is what the assertion message names and
+    // what the table is keyed by. `.iter().enumerate()` would rename the
+    // thing under test to `i` and read worse.
+    #[allow(clippy::needless_range_loop)]
     fn pgc_palette_entries_read_at_correct_stride() {
         let mut pal = [[0u8; 4]; 16];
         for (i, c) in pal.iter_mut().enumerate() {

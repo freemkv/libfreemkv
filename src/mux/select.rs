@@ -232,10 +232,10 @@ mod tests {
     fn pids(t: &DiscTitle) -> Vec<u16> {
         t.streams
             .iter()
-            .filter_map(|s| match s {
-                Stream::Video(v) => Some(v.pid),
-                Stream::Audio(a) => Some(a.pid),
-                Stream::Subtitle(s) => Some(s.pid),
+            .map(|s| match s {
+                Stream::Video(v) => v.pid,
+                Stream::Audio(a) => a.pid,
+                Stream::Subtitle(s) => s.pid,
             })
             .collect()
     }

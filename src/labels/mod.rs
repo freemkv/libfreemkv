@@ -1333,7 +1333,7 @@ mod gap_fill_tests {
         // duplicate. Stream_number is computed from the EXISTING
         // labels' max(stream_number) per type so orphans (when they
         // do fire) sort cleanly at the tail.
-        let labels = vec![
+        let labels = [
             label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
             label(StreamLabelType::Audio, 2, "fra", "AC-3"),
         ];

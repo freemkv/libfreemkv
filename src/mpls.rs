@@ -1521,13 +1521,14 @@ mod tests {
     /// consumed to keep the cursor aligned but never retained.
     #[test]
     fn full_stn_table_block_alignment() {
-        let mut entries: Vec<Vec<u8>> = Vec::new();
-        entries.push(build_stream_entry_video(0x1011, 0x1B, 6, 1, None));
-        entries.push(build_stream_entry_audio(0x1100, 0x83, 6, 1, b"eng"));
-        entries.push(build_stream_entry_audio(0x1101, 0x86, 3, 1, b"fra"));
-        entries.push(build_stream_entry_pg(0x1200, 0x90, b"eng"));
-        entries.push(build_stream_entry_pg(0x1201, 0x90, b"fra"));
-        entries.push(build_stream_entry_pg(0x1202, 0x90, b"deu"));
+        let mut entries: Vec<Vec<u8>> = vec![
+            build_stream_entry_video(0x1011, 0x1B, 6, 1, None),
+            build_stream_entry_audio(0x1100, 0x83, 6, 1, b"eng"),
+            build_stream_entry_audio(0x1101, 0x86, 3, 1, b"fra"),
+            build_stream_entry_pg(0x1200, 0x90, b"eng"),
+            build_stream_entry_pg(0x1201, 0x90, b"fra"),
+            build_stream_entry_pg(0x1202, 0x90, b"deu"),
+        ];
         for i in 0..4u16 {
             entries.push(build_stream_entry_pg(0x1400 + i, 0x91, b"eng"));
         }

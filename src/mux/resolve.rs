@@ -4258,7 +4258,7 @@ mod tests {
                 let sb = s.start_byte();
                 if unit_byte >= sb && unit_byte < sb + s.byte_len() {
                     let n = (unit_byte - sb) / crate::aacs::content::ALIGNED_UNIT_LEN as u64;
-                    let key = if n % 2 == 0 {
+                    let key = if n.is_multiple_of(2) {
                         FMTS_INDEX_KEYS[(s.index - 1) as usize]
                     } else {
                         FMTS_ALT_KEY
@@ -4281,16 +4281,17 @@ mod tests {
             buf: &mut [u8],
             recovery: bool,
         ) -> crate::error::Result<usize> {
-            if let Some((a, b)) = self.fault_span {
-                if lba >= a && lba < b {
-                    self.probe_reads += 1;
-                    self.maybe_cancel();
-                    return Err(crate::error::Error::DiscRead {
-                        sector: lba as u64,
-                        status: None,
-                        sense: None,
-                    });
-                }
+            if let Some((a, b)) = self.fault_span
+                && lba >= a
+                && lba < b
+            {
+                self.probe_reads += 1;
+                self.maybe_cancel();
+                return Err(crate::error::Error::DiscRead {
+                    sector: lba as u64,
+                    status: None,
+                    sense: None,
+                });
             }
             if lba < FMTS_CONTENT_LBA {
                 self.meta_reads += 1;

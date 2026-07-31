@@ -1880,7 +1880,7 @@ mod tests {
             // would straddle AACS unit boundaries and decrypt under the wrong
             // alignment.
             assert!(
-                count as u32 % ALIGN == 0 || (count as u32) < ALIGN,
+                (count as u32).is_multiple_of(ALIGN) || (count as u32) < ALIGN,
                 "read count {count} is neither a whole number of units nor a sub-unit tail"
             );
         }
@@ -2457,7 +2457,10 @@ mod tests {
                 let h = halve_batch_size(size);
                 assert!(h >= 1, "halve({size}) must never be 0");
                 assert!(h <= size, "halve({size}) = {h} must not grow");
-                assert!(h < 6 || h % 3 == 0, "halve({size}) = {h} is unit-unaligned");
+                assert!(
+                    h < 6 || h.is_multiple_of(3),
+                    "halve({size}) = {h} is unit-unaligned"
+                );
             }
         }
 
@@ -2483,7 +2486,7 @@ mod tests {
                 let d = double_batch_size(size, 4096);
                 assert!(d >= size, "double({size}) = {d} must not shrink");
                 assert!(
-                    d < 6 || d % 3 == 0,
+                    d < 6 || d.is_multiple_of(3),
                     "double({size}) = {d} is unit-unaligned"
                 );
             }

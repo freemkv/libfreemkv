@@ -1479,6 +1479,11 @@ mod tests {
     /// end_master without a multi-terabyte buffer, which is why this is
     /// tested at the encoder.
     #[test]
+    // The underscores in these literals mark BITFIELD boundaries in the
+    // bitstream header being built (e.g. a 5-bit field then a 3-bit field),
+    // not thousands-style digit groups. Regrouping them uniformly would
+    // satisfy the lint by destroying the only thing they encode.
+    #[allow(clippy::unusual_byte_groupings)]
     fn fixed_width_vint8_is_big_endian_over_the_full_payload() {
         assert_eq!(
             fixed_width_vint8(0x00AA_BB_CC_DD_EE_FF_11),

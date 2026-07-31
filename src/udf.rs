@@ -1946,7 +1946,7 @@ mod tests {
         let icb = build_entry_ads(266, 0, 16, &[(1, 2048, HOLE_LBA), (0, 2048, DATA_LBA)], &[]);
         disc.put_bytes(PART_START + 12, &icb);
 
-        let mut fs = super::read_filesystem(&mut disc).expect("volume mounts");
+        let fs = super::read_filesystem(&mut disc).expect("volume mounts");
         let lba = fs
             .file_start_lba(&mut disc, "/VIDEO_TS.IFO")
             .expect("a file whose first descriptor is a hole still has data");
