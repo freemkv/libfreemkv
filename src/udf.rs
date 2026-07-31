@@ -938,14 +938,36 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
                 let mut meta_file_lba = partition_start;
                 let mut meta_icb = [0u8; 2048];
                 let mut meta_tag = 0u16;
+                // Track whether ANY candidate was readable. "Read fine, and the
+                // bytes are not a File Entry" is a deterministic verdict about
+                // the disc; "could not read either candidate" is a transient
+                // fault. Collapsing them here would report a marginal sector as
+                // `UdfNotFilesystem`, and `mux::resolve` memoises that negative
+                // for the whole disc — so one flaky read would silently demote
+                // every remaining title to the base-key-only path.
+                let mut last_err = None;
                 for cand in recorded.into_iter().chain(std::iter::once(partition_start)) {
-                    if read_sector(reader, cand, &mut meta_icb).is_ok() {
-                        meta_tag = u16::from_le_bytes([meta_icb[0], meta_icb[1]]);
-                        meta_file_lba = cand;
-                        if meta_tag == 266 {
-                            break;
+                    match read_sector(reader, cand, &mut meta_icb) {
+                        Ok(()) => {
+                            meta_tag = u16::from_le_bytes([meta_icb[0], meta_icb[1]]);
+                            meta_file_lba = cand;
+                            if meta_tag == 266 {
+                                break;
+                            }
                         }
+                        Err(e) => last_err = Some(e),
                     }
+                }
+                // Not `meta_tag == 0`: the damaging case is the RECORDED
+                // candidate faulting while block 0 reads fine and happens to
+                // hold some other descriptor. `meta_tag` is then non-zero and
+                // not 266, and without this the fault is laundered into a
+                // structural negative. Any unread candidate leaves the verdict
+                // unproven, so the fault wins.
+                if meta_tag != 266
+                    && let Some(e) = last_err
+                {
+                    return Err(e);
                 }
 
                 if meta_tag == 266 {
@@ -3853,6 +3875,81 @@ mod tests {
         );
 
         (disc, meta_start)
+    }
+
+    /// A read fault while locating the Metadata File must surface as a read
+    /// error, NOT as "this is not a UDF disc".
+    ///
+    /// The candidate chain tries the recorded Metadata File Location and then
+    /// block 0. If neither can be READ — a marginal sector, a drive re-read, an
+    /// ECC recovery that reports failure once — that is transient and
+    /// retryable. If it were reported as a structural negative instead, the
+    /// caller would get the deterministic verdict `UdfNotFilesystem`, and
+    /// `mux::resolve` MEMOISES that negative for the whole disc: every
+    /// remaining title would silently drop to the base-Unit-Key-only path, the
+    /// AACS 2.1 forensic units would garble, and the mux would complete with
+    /// less content and no error.
+    ///
+    /// This file draws the same distinction twice in prose already — at the
+    /// AVDP check and the File Set Descriptor check — so the loop must not
+    /// erase it.
+    #[test]
+    fn a_read_fault_locating_the_metadata_file_is_not_reported_as_a_non_udf_disc() {
+        use fixture::PART_START;
+
+        /// Wraps a built volume and fails every read of the two candidate LBAs.
+        struct FailsMetaCandidates {
+            inner: fixture::MemDisc,
+            deny: Vec<u32>,
+        }
+        impl SectorSource for FailsMetaCandidates {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> crate::error::Result<usize> {
+                if (0..count as u32).any(|i| self.deny.contains(&(lba + i))) {
+                    return Err(Error::DiscRead {
+                        sector: lba as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                self.inner.read_sectors(lba, count, buf, recovery)
+            }
+        }
+
+        let spec = MetaVol {
+            meta_file_loc: 9,
+            meta_fe_at: 9,
+            ..conformant_meta_vol()
+        };
+        let (disc, _meta_start) = build_meta_vol(&spec);
+
+        // ONLY the recorded location faults. Block 0 reads fine and holds the
+        // Volume Descriptor content that lives there on this fixture — not a
+        // File Entry. This is the damaging shape: `meta_tag` ends up non-zero
+        // and not 266, so a guard keyed on "nothing read at all" would miss it,
+        // and the fault would be laundered into `UdfNotFilesystem`.
+        //
+        // Denying BOTH candidates does NOT test this: the block-0 fallback read
+        // fails too, so a read error propagates from further down either way
+        // and the test passes without the fix.
+        let mut reader = FailsMetaCandidates {
+            inner: disc,
+            deny: vec![PART_START + 9],
+        };
+
+        match super::read_filesystem(&mut reader) {
+            Err(Error::DiscRead { .. }) => {}
+            Err(Error::UdfNotFilesystem) => panic!(
+                "a transient read fault was reported as the deterministic verdict \
+                 'not a UDF disc'; mux::resolve caches that for the whole disc"
+            ),
+            other => panic!("expected a read error, got {other:?}"),
+        }
     }
 
     #[test]
