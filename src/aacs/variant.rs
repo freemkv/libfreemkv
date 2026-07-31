@@ -1707,8 +1707,6 @@ mod tests {
         records: Vec<MkbRecord>,
         /// The device key that covers slot 1 with zero descent.
         dk: DeviceKey,
-        /// The Processing Key the walk must produce for it.
-        kp: [u8; 16],
         /// The Media Key the full chain must reach from that Processing Key.
         km: [u8; 16],
         /// The `0x0c` C block of slot 1 — the cvalue the walk must select.
@@ -1833,7 +1831,6 @@ mod tests {
                 uv: UV_REAL,
                 u_mask_shift: U_MASK_SHIFT,
             },
-            kp,
             km,
             c_block1,
         }

@@ -837,7 +837,7 @@ mod tests {
         // descramble-and-rekey lives in `css::descramble_region` (the recovery
         // seam calls it); the region change must re-crack region B's key.
         let mut ended = key_a;
-        css::descramble_region(&mut buf, &mut ended);
+        css::descramble_region(&mut buf, &mut ended).expect("descramble");
 
         assert_eq!(
             &buf[0x80..2048],
@@ -986,7 +986,7 @@ mod tests {
         let (mut sector, plaintext) = make_css_sector(&title_key, &seed, 0xA5);
         // CSS descramble lives in `css::descramble_region` (the recovery seam
         // calls it); `decrypt_sectors` only flags CSS sectors for recovery.
-        css::descramble_region(&mut sector, &mut title_key);
+        css::descramble_region(&mut sector, &mut title_key).expect("descramble");
         assert_eq!(
             &sector[0x80..2048],
             &plaintext[0x80..2048],
@@ -1016,7 +1016,7 @@ mod tests {
         let mut buf = s0;
         buf.extend_from_slice(&s1);
         let mut title_key = title_key;
-        css::descramble_region(&mut buf, &mut title_key);
+        css::descramble_region(&mut buf, &mut title_key).expect("descramble");
         assert_eq!(
             &buf[0x80..2048],
             &p0[0x80..2048],
@@ -1095,7 +1095,7 @@ mod tests {
 
         // Cache primed to key_a only — exactly what the one-shot scan crack yields.
         let mut title_key = key_a;
-        css::descramble_region(&mut buf, &mut title_key);
+        css::descramble_region(&mut buf, &mut title_key).expect("descramble");
 
         assert_eq!(
             &buf[0x80..2048],

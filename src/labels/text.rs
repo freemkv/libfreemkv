@@ -169,7 +169,7 @@ mod tests {
     /// Mutation: skip the final `if !current.is_empty()` emit → trailing run lost.
     #[test]
     fn large_buffer_trailing_run_emitted() {
-        let buf: Vec<u8> = (0..1000u32).map(|i| (0x41u8 + (i % 26) as u8)).collect();
+        let buf: Vec<u8> = (0..1000u32).map(|i| 0x41u8 + (i % 26) as u8).collect();
         let got = extract_ascii_strings(&buf, 1);
         // All printable, so one big run at the end.
         assert!(!got.is_empty());

@@ -1539,7 +1539,7 @@ mod tests {
         // 0xAA filler and the embedded 00 00 01 sequence must be absent — the
         // malformed PES header contributed ZERO bytes to the elementary stream.
         assert!(
-            !pes.data.iter().any(|&b| b == 0xAA),
+            !pes.data.contains(&0xAA),
             "garbage PES-header bytes must not appear in the elementary stream"
         );
         assert!(
@@ -2124,7 +2124,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         // None of the 0xEE AF-only bytes may appear.
         assert!(
-            !out[0].data.iter().any(|&b| b == 0xEE),
+            !out[0].data.contains(&0xEE),
             "AF-only packet bytes must never be appended as ES"
         );
         assert_eq!(out[0].data, vec![0x01, 0x02, 0x03, 0x04]);
@@ -2165,7 +2165,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].data, vec![0x77, 0x88]);
         assert!(
-            !out[0].data.iter().any(|&b| b == 0xBB),
+            !out[0].data.contains(&0xBB),
             "adaptation-field stuffing must not appear in the ES"
         );
     }

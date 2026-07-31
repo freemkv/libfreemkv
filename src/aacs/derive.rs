@@ -1344,9 +1344,14 @@ mod position_recovery_tests {
         mkb
     }
 
+    /// `(dkey, mk, pk, cvalue, mk_dv)` — the five 16-byte AACS keys the
+    /// four-level fixture plants. Named so the return type says what it is
+    /// rather than repeating `[u8; 16]` five times.
+    type FourLevelParts = ([u8; 16], [u8; 16], [u8; 16], [u8; 16], [u8; 16]);
+
     /// The planted slot-2 material from the four-level fixture, reusable for
-    /// the malformed-MKB shapes below: `(dkey, mk, pk, cvalue, mk_dv)`.
-    fn four_level_parts() -> ([u8; 16], [u8; 16], [u8; 16], [u8; 16], [u8; 16]) {
+    /// the malformed-MKB shapes below.
+    fn four_level_parts() -> FourLevelParts {
         let p = plant_four_level_mkb();
         let cvalues = mkb_find_cvalues(&p.mkb).expect("cvalues");
         let mut cv = [0u8; 16];

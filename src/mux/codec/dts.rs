@@ -921,7 +921,7 @@ mod tests {
         let core = make_dts_core(512);
         let garbage = vec![0xE4, 0x3F, 0xE3, 0x90, 0xCC, 0x6C]; // real Bourne head bytes
         let mut garbage = garbage;
-        garbage.extend(std::iter::repeat(0xAB).take(300));
+        garbage.extend(std::iter::repeat_n(0xAB, 300));
         let next = make_dts_core(512);
         let mut buf = core.clone();
         buf.extend_from_slice(&garbage);
@@ -1931,6 +1931,11 @@ mod tests {
     }
 
     #[test]
+    // The loop variable is the DOMAIN VALUE being checked (a DTS SFREQ code), not a
+    // cursor into a collection: it is what the assertion message names and
+    // what the table is keyed by. `.iter().enumerate()` would rename the
+    // thing under test to `i` and read worse.
+    #[allow(clippy::needless_range_loop)]
     fn sr_validity_table_marks_reserved_codes() {
         // The core-header sample-rate validity table must have ZERO (reject) at
         // exactly the reserved SFREQ codes {0,4,5,9,10} and a real rate
