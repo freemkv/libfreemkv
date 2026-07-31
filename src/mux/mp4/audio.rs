@@ -522,6 +522,11 @@ mod tests {
 
     /// A synthetic legacy AC-3 header: syncword, crc, fscod=0 (48k),
     /// frmsizecod, bsid=8, bsmod=0, acmod=7 (3/2), lfeon=1 → 5.1.
+    // The underscores in these literals mark BITFIELD boundaries in the
+    // bitstream header being built (e.g. a 5-bit field then a 3-bit field),
+    // not thousands-style digit groups. Regrouping them uniformly would
+    // satisfy the lint by destroying the only thing they encode.
+    #[allow(clippy::unusual_byte_groupings)]
     fn ac3_frame_5_1() -> Vec<u8> {
         let mut f = vec![0x0B, 0x77, 0x00, 0x00];
         // byte4: fscod(2)=0 | frmsizecod(6)=0b010110 (22)
@@ -556,6 +561,11 @@ mod tests {
 
     /// A synthetic Annex-E (E-AC-3) syncframe: bsid=16, fscod=0 (48 kHz),
     /// numblkscod=3 (6 blocks), acmod=7 (3/2), lfeon=1 → 5.1, frmsiz=63 (128 B).
+    // The underscores in these literals mark BITFIELD boundaries in the
+    // bitstream header being built (e.g. a 5-bit field then a 3-bit field),
+    // not thousands-style digit groups. Regrouping them uniformly would
+    // satisfy the lint by destroying the only thing they encode.
+    #[allow(clippy::unusual_byte_groupings)]
     fn eac3_frame_5_1() -> Vec<u8> {
         // E-AC-3: syncword | strmtyp/substreamid/frmsiz | fscod/numblks/acmod/lfeon | bsid
         let mut f = vec![0x0B, 0x77];
@@ -840,6 +850,11 @@ mod tests {
     }
 
     #[test]
+    // The loop variable is the DOMAIN VALUE being checked (a DTS AMODE value), not a
+    // cursor into a collection: it is what the assertion message names and
+    // what the table is keyed by. `.iter().enumerate()` would rename the
+    // thing under test to `i` and read worse.
+    #[allow(clippy::needless_range_loop)]
     fn ddts_channel_layout_speaker_count_matches_declared_channels() {
         // The `ddts` box carries BOTH a channel count and a 16-bit speaker mask,
         // and a decoder may trust either. They must agree for all 16 AMODEs.

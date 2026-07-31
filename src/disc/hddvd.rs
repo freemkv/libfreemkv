@@ -716,12 +716,15 @@ mod tests {
     /// Build a UDF with an `HVDVD_TS/` tree holding the listed `.evo` clips
     /// (name, sector count, data LBA).
     fn make_hddvd_fs(disc: &mut MemDisc, evos: &[(&str, u32, u32)]) -> crate::udf::UdfFs {
-        let mut files = Vec::new();
-        let mut icb = 100u32;
-        for (name, sectors, data_lba) in evos {
-            files.push(file(name, icb, *data_lba, sectors * 2048, true));
-            icb += 1;
-        }
+        // ICBs are handed out from 100 upward, one per EVO, so the index IS
+        // the offset from that base.
+        let files: Vec<_> = evos
+            .iter()
+            .enumerate()
+            .map(|(i, (name, sectors, data_lba))| {
+                file(name, 100 + i as u32, *data_lba, sectors * 2048, true)
+            })
+            .collect();
         let root = DirSpec {
             name: String::new(),
             icb_lba: 10,
@@ -1337,12 +1340,15 @@ mod tests {
         evos: &[(&str, u32, u32)],
         xpl: &[u8],
     ) -> crate::udf::UdfFs {
-        let mut hv_files = Vec::new();
-        let mut icb = 100u32;
-        for (name, sectors, data_lba) in evos {
-            hv_files.push(file(name, icb, *data_lba, sectors * 2048, true));
-            icb += 1;
-        }
+        // ICBs are handed out from 100 upward, one per EVO, so the index IS
+        // the offset from that base.
+        let hv_files: Vec<_> = evos
+            .iter()
+            .enumerate()
+            .map(|(i, (name, sectors, data_lba))| {
+                file(name, 100 + i as u32, *data_lba, sectors * 2048, true)
+            })
+            .collect();
         let root = DirSpec {
             name: String::new(),
             icb_lba: 10,

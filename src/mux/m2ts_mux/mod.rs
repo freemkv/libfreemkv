@@ -766,7 +766,7 @@ mod tests {
         // First two packets: PAT, PMT. At least one video packet after.
         assert_eq!(pids[0], PID_PAT);
         assert_eq!(pids[1], PID_PMT);
-        assert!(pids.iter().any(|p| *p == PID_VIDEO));
+        assert!(pids.contains(&PID_VIDEO));
     }
 
     #[test]
@@ -810,8 +810,8 @@ mod tests {
 
         assert_ts_well_formed(&sink);
         let pids = extract_pids(&sink);
-        assert!(pids.iter().any(|p| *p == PID_VIDEO));
-        assert!(pids.iter().any(|p| *p == PID_AUDIO));
+        assert!(pids.contains(&PID_VIDEO));
+        assert!(pids.contains(&PID_AUDIO));
     }
 
     #[test]
@@ -1129,10 +1129,11 @@ mod tests {
                 continue;
             }
             total_video += 1;
-            if let Some(af) = af_body(pkt) {
-                if !af.is_empty() && (af[0] & 0x10) != 0 {
-                    pcr_indices.push(video_idx);
-                }
+            if let Some(af) = af_body(pkt)
+                && !af.is_empty()
+                && (af[0] & 0x10) != 0
+            {
+                pcr_indices.push(video_idx);
             }
             video_idx += 1;
         }
@@ -1582,7 +1583,7 @@ mod tests {
         }
         let pids = extract_pids(&sink);
         assert!(
-            !pids.iter().any(|p| *p == PID_AUDIO),
+            !pids.contains(&PID_AUDIO),
             "no audio track configured → no audio PID emitted"
         );
     }

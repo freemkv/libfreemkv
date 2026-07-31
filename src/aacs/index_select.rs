@@ -189,7 +189,7 @@ mod tests {
         let unit_packets = (ALIGNED_UNIT_LEN as u64 / SOURCE_PACKET_LEN) as u32; // 32
         // Start so the unit covers [80, 80+31] = [80, 111]: overlaps at 100.
         let off = 80u64 * SOURCE_PACKET_LEN;
-        assert!(80 + unit_packets - 1 >= 100, "sanity: unit tails into seg");
+        assert!(80 + unit_packets > 100, "sanity: unit tails into seg");
         assert_eq!(
             unit_disposition(off, &segs, Some(5)),
             UnitDisposition::Index(5)

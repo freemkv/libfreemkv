@@ -1738,7 +1738,7 @@ mod tests {
     /// byte 5 = bsid 16 so the E-AC-3 paths are taken. CRC finalized so the frame
     /// passes the decodability gate.
     fn make_eac3_frame(strmtyp: u8, substreamid: u8, size: usize) -> Vec<u8> {
-        assert!(size >= MIN_FRAME_BYTES && size % 2 == 0);
+        assert!(size >= MIN_FRAME_BYTES && size.is_multiple_of(2));
         let frmsiz = size / 2 - 1;
         let mut f = vec![0u8; size];
         f[0] = 0x0B;

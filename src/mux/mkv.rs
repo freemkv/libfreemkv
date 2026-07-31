@@ -2024,6 +2024,7 @@ mod tests {
     ///     so a shipped DVD rip marked every P/B frame as a seek point;
     ///   - the reader ignored ReferenceBlock and read the always-0 reserved bit,
     ///     so EVERY BlockGroup frame read back as a non-keyframe.
+    ///
     /// Downstream that silently dropped all video on `mkv://`(MPEG-2)→`m2ts://`
     /// (TsMuxer drops non-key video until the first keyframe) and made
     /// `mkv://`→`mkv://` / `stdio://` fail E6008 (MkvMuxer opens a cluster only
