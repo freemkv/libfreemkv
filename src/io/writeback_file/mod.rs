@@ -178,15 +178,15 @@ impl WritebackFile {
     /// is left to the kernel's normal flush-on-close path — best
     /// effort, but bounded.
     ///
-    /// IMPORTANT — platform difference. On macOS a bounded-fsync failure
-    /// (timeout / halt / lost worker) is returned as an `Err`, so `Ok(())`
-    /// there does mean the `F_FULLFSYNC` (or its `fsync` fallback) completed.
-    /// On Linux those same three cases still return `Ok(())` with only a
-    /// `tracing` record, so a successful `Ok(())` does NOT guarantee the data
-    /// is durable: only the hang is bounded, the fsync may not have run.
-    /// Callers needing crash-consistency on Linux (e.g. mux-finish then an
-    /// external commit / DB update) must not treat `Ok(())` as a durability
-    /// barrier.
+    /// A bounded-fsync failure (timeout / halt / lost worker) is returned as
+    /// an `Err` on BOTH macOS and Linux, with the same `ErrorKind` per case and
+    /// `EIO` for the lost worker. So `Ok(())` means the `F_FULLFSYNC` (macOS)
+    /// or `fsync` (Linux) completed, on either platform, and a caller needing
+    /// crash-consistency can treat it as a durability barrier.
+    ///
+    /// Linux used to return `Ok(())` for all three failures with only a
+    /// `tracing` record; that was fixed, and this doc said otherwise for
+    /// longer than the bug existed.
     pub fn sync_all(&mut self) -> io::Result<()> {
         if self.seek_count > 0 {
             tracing::debug!(
@@ -259,9 +259,8 @@ impl super::sink::SequentialSink for WritebackFile {
     /// the same work [`Self::sync_all`] does. Implemented explicitly (no
     /// blanket impl) so a `dyn SequentialSink` / `dyn RandomAccessSink`
     /// `finish()` actually finalises + fsyncs instead of hitting a no-op
-    /// default. Note the bounded-fsync caveat from [`Self::sync_all`]
-    /// applies: on Linux `Ok(())` is not a durability barrier if the fsync
-    /// timed out or was halted.
+    /// default. A bounded-fsync failure surfaces as an `Err` here, on every
+    /// platform, exactly as it does from [`Self::sync_all`].
     fn finish(&mut self) -> io::Result<()> {
         self.sync_all()
     }
