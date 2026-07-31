@@ -149,14 +149,14 @@ fn bounded_failure_to_result(e: crate::io::bounded::BoundedError) -> io::Result<
                 target: "mux",
                 "WritebackFile::sync_all fsync timed out after 60s; data NOT durably flushed, kernel will flush on close"
             );
-            Err(io::Error::from(io::ErrorKind::TimedOut))
+            Err(crate::error::Error::SyncTimeout.into())
         }
         crate::io::bounded::BoundedError::Halted => {
             tracing::warn!(
                 target: "mux",
                 "WritebackFile::sync_all fsync skipped (halt requested); data NOT durably flushed, kernel will flush on close"
             );
-            Err(io::Error::from(io::ErrorKind::Interrupted))
+            Err(crate::error::Error::Halted.into())
         }
         crate::io::bounded::BoundedError::WorkerLost => {
             tracing::error!(
@@ -166,7 +166,7 @@ fn bounded_failure_to_result(e: crate::io::bounded::BoundedError) -> io::Result<
             // EIO, matching the macOS sibling: a consumer distinguishing these
             // three failures does so on the same value on every platform.
             // ErrorKind::Other carries nothing a caller can branch on.
-            Err(io::Error::from_raw_os_error(libc::EIO))
+            Err(crate::error::Error::SyncWorkerLost.into())
         }
     }
 }

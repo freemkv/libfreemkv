@@ -129,21 +129,21 @@ fn bounded_failure_to_result(e: crate::io::bounded::BoundedError) -> io::Result<
                 target: "mux",
                 "WritebackFile::sync_all F_FULLFSYNC timed out after 60s; data NOT durably flushed, kernel will flush on close"
             );
-            Err(io::Error::from(io::ErrorKind::TimedOut))
+            Err(crate::error::Error::SyncTimeout.into())
         }
         crate::io::bounded::BoundedError::Halted => {
             tracing::warn!(
                 target: "mux",
                 "WritebackFile::sync_all F_FULLFSYNC skipped (halt requested); data NOT durably flushed, kernel will flush on close"
             );
-            Err(io::Error::from(io::ErrorKind::Interrupted))
+            Err(crate::error::Error::Halted.into())
         }
         crate::io::bounded::BoundedError::WorkerLost => {
             tracing::error!(
                 target: "mux",
                 "WritebackFile::sync_all F_FULLFSYNC worker lost before completion; data NOT durably flushed, kernel will flush on close"
             );
-            Err(io::Error::from_raw_os_error(libc::EIO))
+            Err(crate::error::Error::SyncWorkerLost.into())
         }
     }
 }
@@ -215,12 +215,28 @@ mod tests {
             "a halted F_FULLFSYNC must not be reported as a completed sync"
         );
 
+        // The three arms must be DISTINGUISHABLE, not merely non-Ok. Each
+        // carries its own numeric code through the "E<code>" prefix that
+        // `From<Error> for io::Error` mints — the only shape `io_error_code`
+        // recognises. A bare `ErrorKind` cannot be classified, which is how a
+        // user cancel here used to read as a hard I/O failure.
         let lost = bounded_failure_to_result(BoundedError::WorkerLost)
             .expect_err("a lost F_FULLFSYNC worker must be an error");
-        assert_eq!(
-            lost.raw_os_error(),
-            Some(libc::EIO),
-            "a lost F_FULLFSYNC worker must not be reported as a completed sync"
+        assert!(
+            lost.to_string()
+                .starts_with(&format!("E{}", crate::error::E_SYNC_WORKER_LOST)),
+            "a lost worker must be identifiable, got {lost}"
+        );
+        assert!(
+            timeout
+                .to_string()
+                .starts_with(&format!("E{}", crate::error::E_SYNC_TIMEOUT)),
+            "a timeout must be distinguishable from a lost worker, got {timeout}"
+        );
+        assert!(
+            crate::error::is_halt(&halted),
+            "a halt must satisfy the crate's own is_halt(), or the CLI reports a \
+             user cancel as a failure; got {halted}"
         );
     }
 

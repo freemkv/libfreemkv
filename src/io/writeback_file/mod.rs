@@ -178,15 +178,19 @@ impl WritebackFile {
     /// is left to the kernel's normal flush-on-close path — best
     /// effort, but bounded.
     ///
-    /// A bounded-fsync failure (timeout / halt / lost worker) is returned as
-    /// an `Err` on BOTH macOS and Linux, with the same `ErrorKind` per case and
-    /// `EIO` for the lost worker. So `Ok(())` means the `F_FULLFSYNC` (macOS)
-    /// or `fsync` (Linux) completed, on either platform, and a caller needing
+    /// A bounded-fsync failure is returned as an `Err` on BOTH platforms, so
+    /// `Ok(())` means the flush completed and a caller needing
     /// crash-consistency can treat it as a durability barrier.
     ///
-    /// Linux used to return `Ok(())` for all three failures with only a
-    /// `tracing` record; that was fixed, and this doc said otherwise for
-    /// longer than the bug existed.
+    /// The three causes are DISTINGUISHABLE by numeric code, because a caller
+    /// should not retry a lost worker the way it retries a timeout, and must
+    /// not report a user cancel as a failure:
+    ///
+    /// * [`E_SYNC_TIMEOUT`](crate::error::E_SYNC_TIMEOUT) — deadline expired
+    /// * [`E_HALTED`](crate::error::E_HALTED) — cancelled;
+    ///   [`is_halt`](crate::error::is_halt) recognises it
+    /// * [`E_SYNC_WORKER_LOST`](crate::error::E_SYNC_WORKER_LOST) — the worker
+    ///   thread died before reporting
     pub fn sync_all(&mut self) -> io::Result<()> {
         if self.seek_count > 0 {
             tracing::debug!(

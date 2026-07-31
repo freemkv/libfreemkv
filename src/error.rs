@@ -213,6 +213,14 @@ pub const E_MP4_MISSING_CODEC_PRIVATE: u16 = 9050;
 /// the sink would have to write 0x0, producing a structurally complete file no
 /// player can render. Refuse instead.
 pub const E_MP4_UNKNOWN_RESOLUTION: u16 = 9055;
+/// The bounded durable flush did not complete within its deadline. The data is
+/// NOT known to be on stable storage; the kernel will still flush on close, but
+/// that is a probability, not a barrier.
+pub const E_SYNC_TIMEOUT: u16 = 9056;
+/// The bounded durable flush's worker thread was lost before it reported. Same
+/// durability consequence as [`E_SYNC_TIMEOUT`], different cause — a caller
+/// retrying a timeout should not retry this.
+pub const E_SYNC_WORKER_LOST: u16 = 9057;
 /// READ CAPACITY returned a short or overflowing transfer.
 pub const E_DISC_CAPACITY_MALFORMED: u16 = 9047;
 
@@ -557,6 +565,10 @@ pub enum Error {
     /// `mp4://` video track has no resolved frame dimensions. See
     /// [`E_MP4_UNKNOWN_RESOLUTION`].
     Mp4UnknownResolution,
+    /// The bounded durable flush timed out. See [`E_SYNC_TIMEOUT`].
+    SyncTimeout,
+    /// The bounded durable flush's worker was lost. See [`E_SYNC_WORKER_LOST`].
+    SyncWorkerLost,
     PesFrameTooLarge {
         size: usize,
     },
@@ -747,6 +759,8 @@ impl Error {
             Error::Mp4Invalid => E_MP4_INVALID,
             Error::Mp4MissingCodecPrivate => E_MP4_MISSING_CODEC_PRIVATE,
             Error::Mp4UnknownResolution => E_MP4_UNKNOWN_RESOLUTION,
+            Error::SyncTimeout => E_SYNC_TIMEOUT,
+            Error::SyncWorkerLost => E_SYNC_WORKER_LOST,
             Error::PesFrameTooLarge { .. } => E_PES_FRAME_TOO_LARGE,
             Error::PesInvalidMagic => E_PES_INVALID_MAGIC,
             Error::PesTrackTooLarge { .. } => E_PES_TRACK_TOO_LARGE,
@@ -957,6 +971,9 @@ impl From<Error> for std::io::Error {
             3000..=3999 => std::io::ErrorKind::PermissionDenied,
             4000..=4999 => std::io::ErrorKind::Other,
             5000..=5999 => std::io::ErrorKind::Other,
+            // A stop is an interruption, not invalid data. MUST precede the
+            // 6000..=6999 arm — E_HALTED is 6010 and match arms are ordered.
+            E_HALTED => std::io::ErrorKind::Interrupted,
             6000..=6999 => std::io::ErrorKind::InvalidData,
             7000..=7999 => std::io::ErrorKind::PermissionDenied,
             8000..=8999 => std::io::ErrorKind::Other,
@@ -1006,6 +1023,10 @@ impl From<Error> for std::io::Error {
             | E_MP4_INVALID
             | E_MP4_MISSING_CODEC_PRIVATE
             | E_MP4_UNKNOWN_RESOLUTION => std::io::ErrorKind::InvalidData,
+            // Durability, not data validity: the write landed, the flush did
+            // not. TimedOut keeps the std kind a caller might already branch on
+            // while the E-code carries the distinction.
+            E_SYNC_TIMEOUT | E_SYNC_WORKER_LOST => std::io::ErrorKind::TimedOut,
             // 9030 ExtentNotUnitAligned: a malformed/non-AACS-aligned
             // extent was handed to the prefetch producer.
             9030 => std::io::ErrorKind::InvalidInput,
@@ -1708,6 +1729,8 @@ mod tests {
             (Error::Mp4Invalid, E_MP4_INVALID),
             (Error::Mp4MissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),
             (Error::Mp4UnknownResolution, E_MP4_UNKNOWN_RESOLUTION),
+            (Error::SyncTimeout, E_SYNC_TIMEOUT),
+            (Error::SyncWorkerLost, E_SYNC_WORKER_LOST),
             (Error::M2tsPacketMalformed, E_M2TS_PACKET_MALFORMED),
             (Error::ExtentNotUnitAligned, E_EXTENT_NOT_UNIT_ALIGNED),
             (Error::DiscCapacityMalformed, E_DISC_CAPACITY_MALFORMED),
