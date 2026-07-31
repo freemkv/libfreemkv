@@ -839,49 +839,88 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     // reserve sequence recorded at [24:32] is not consulted here.
     let vds_len_bytes = u32::from_le_bytes([avdp[16], avdp[17], avdp[18], avdp[19]]);
     let vds_lba = u32::from_le_bytes([avdp[20], avdp[21], avdp[22], avdp[23]]);
-    let (vds_start, vds_sectors) = match vds_len_bytes.div_ceil(2048) {
-        // ECMA-167 3/10.2.1 requires the extent to be at least 16 sectors
-        // (32 768 bytes); a shorter or absent extent is not a usable VDS.
+    // Candidates in order: the extent the anchor records, then the customary
+    // location. The recorded one is used only when its SHAPE is usable —
+    // ECMA-167 3/10.2.1 requires at least 16 sectors (32 768 bytes), and a zero
+    // location or an address-wrapping length is not a sequence.
+    //
+    // Shape is not enough on its own. An anchor can pass all three checks and
+    // still point somewhere that holds no Volume Descriptor Sequence — a
+    // mastering tool that wrote the reserve location, a stale anchor on a
+    // rewritten volume, or deliberate corruption. Selecting the fallback only
+    // on shape means the branch a damaged disc actually takes has no recovery
+    // path. So the fallback is retried on OUTCOME too: if the recorded extent
+    // yields no Partition Descriptor, sweep the customary location before
+    // giving up.
+    //
+    // This is the same principle the Metadata File Location candidate chain
+    // below uses, and for the same reason.
+    let recorded = match vds_len_bytes.div_ceil(2048) {
         n if n >= VDS_MIN_SECTORS && vds_lba > 0 && vds_lba.checked_add(n).is_some() => {
-            (vds_lba, n.min(VDS_MAX_SECTORS))
+            Some((vds_lba, n.min(VDS_MAX_SECTORS)))
         }
-        _ => (VDS_FALLBACK_START, VDS_MAX_SECTORS),
+        _ => None,
     };
+    let fallback = (VDS_FALLBACK_START, VDS_MAX_SECTORS);
+    let mut candidates = Vec::with_capacity(2);
+    candidates.extend(recorded);
+    if recorded.map(|(s, _)| s) != Some(fallback.0) {
+        candidates.push(fallback);
+    }
 
     let mut partition_start: u32 = 0;
     let mut num_partition_maps: u32 = 0;
     let mut lvd_sector: Option<u32> = None;
     let mut volume_id = String::new();
     let mut metadata_size_bytes: u32 = 0;
+    // A read fault inside a sweep must not abort before the next candidate is
+    // tried, but it must not vanish either: if no candidate yields a partition,
+    // the fault is the honest answer rather than "not a UDF disc".
+    let mut sweep_err = None;
 
-    for i in vds_start..vds_start.saturating_add(vds_sectors) {
-        let mut desc = [0u8; 2048];
-        read_sector(reader, i, &mut desc)?;
+    for (vds_start, vds_sectors) in candidates {
+        for i in vds_start..vds_start.saturating_add(vds_sectors) {
+            let mut desc = [0u8; 2048];
+            if let Err(e) = read_sector(reader, i, &mut desc) {
+                sweep_err = Some(e);
+                break;
+            }
 
-        let desc_tag = u16::from_le_bytes([desc[0], desc[1]]);
-        match desc_tag {
-            // Primary Volume Descriptor — volume identifier at offset 24, 32-byte d-string
-            1 => {
-                volume_id = parse_dstring(&desc[24..56]);
+            let desc_tag = u16::from_le_bytes([desc[0], desc[1]]);
+            match desc_tag {
+                // Primary Volume Descriptor — volume identifier at offset 24, 32-byte d-string
+                1 => {
+                    volume_id = parse_dstring(&desc[24..56]);
+                }
+                // Partition Descriptor — tells us where the physical partition starts
+                5 => {
+                    partition_start =
+                        u32::from_le_bytes([desc[188], desc[189], desc[190], desc[191]]);
+                }
+                // Logical Volume Descriptor — contains FSD location and partition maps
+                6 => {
+                    num_partition_maps =
+                        u32::from_le_bytes([desc[268], desc[269], desc[270], desc[271]]);
+                    lvd_sector = Some(i);
+                }
+                // Terminating Descriptor — end of VDS
+                8 => break,
+                _ => continue,
             }
-            // Partition Descriptor — tells us where the physical partition starts
-            5 => {
-                partition_start = u32::from_le_bytes([desc[188], desc[189], desc[190], desc[191]]);
-            }
-            // Logical Volume Descriptor — contains FSD location and partition maps
-            6 => {
-                num_partition_maps =
-                    u32::from_le_bytes([desc[268], desc[269], desc[270], desc[271]]);
-                lvd_sector = Some(i);
-            }
-            // Terminating Descriptor — end of VDS
-            8 => break,
-            _ => continue,
+        }
+        if partition_start != 0 {
+            break;
         }
     }
 
     if partition_start == 0 {
-        // No Partition Descriptor found in the VDS: structurally not a UDF disc.
+        // No Partition Descriptor in ANY candidate sequence. If a sweep hit a
+        // read fault, that is the honest answer: "could not read" is transient
+        // and retryable, "read fine and the bytes say no" is a verdict about
+        // the disc, and mux::resolve caches the latter for the whole disc.
+        if let Some(e) = sweep_err {
+            return Err(e);
+        }
         return Err(Error::UdfNotFilesystem);
     }
 
@@ -3648,6 +3687,55 @@ mod tests {
             .expect("a volume whose AVDP points its VDS elsewhere must still mount");
         assert_eq!(fs.partition_start(), PART_START);
         assert_eq!(fs.root.entries.len(), 1);
+        assert_eq!(fs.root.entries[0].name, "INDEX.BDMV");
+    }
+
+    /// An anchor whose recorded VDS extent passes every SHAPE check but holds
+    /// no sequence must still mount, by sweeping the customary location.
+    ///
+    /// Length >= 16 sectors, non-zero location, no address wrap — all three
+    /// hold, so the shape test selects the recorded extent and never looks
+    /// again. But shape is a property of the FIELD, not of what is there: a
+    /// mastering tool that wrote the reserve location, a stale anchor on a
+    /// rewritten volume, or deliberate corruption all produce this. Selecting
+    /// the fallback on shape alone means the branch a damaged disc actually
+    /// takes has no recovery path at all.
+    ///
+    /// The sibling Metadata File Location chain in this same function already
+    /// treats its recorded value as a CANDIDATE and falls back on outcome.
+    /// This is that principle applied one level up.
+    #[test]
+    fn a_shape_valid_vds_pointer_that_holds_no_sequence_falls_back_to_the_customary_location() {
+        use fixture::{DirSpec, MemDisc, PART_START, build_udf_skeleton, file, lay_dir};
+
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(
+            &mut disc,
+            &DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: vec![file("INDEX.BDMV", 12, 13, 2048, false)],
+                subdirs: Vec::new(),
+            },
+        );
+
+        // Point the anchor at LBA 500 with a perfectly well-formed extent_ad.
+        // Nothing is written there, so the sweep reads zeroed sectors: tag 0,
+        // no Partition Descriptor. build_udf_skeleton left the real sequence at
+        // the customary location, which is where the fallback must find it.
+        let mut avdp = vec![0u8; 2048];
+        avdp[0..2].copy_from_slice(&2u16.to_le_bytes());
+        avdp[16..20].copy_from_slice(&(16u32 * 2048).to_le_bytes());
+        avdp[20..24].copy_from_slice(&500u32.to_le_bytes());
+        disc.put_bytes(256, &avdp);
+
+        let fs = super::read_filesystem(&mut disc).expect(
+            "a well-formed pointer to nothing must not be the end of the road; \
+             the customary sequence is still there and still valid",
+        );
+        assert_eq!(fs.partition_start(), PART_START);
         assert_eq!(fs.root.entries[0].name, "INDEX.BDMV");
     }
 
