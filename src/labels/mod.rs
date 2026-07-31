@@ -301,11 +301,7 @@ pub fn fill_defaults(titles: &mut [crate::disc::DiscTitle]) {
                     // Unknown resolution: pass (0, 0) so the label omits the
                     // resolution token rather than tagging it a fabricated
                     // 1080p.
-                    let px = if matches!(v.resolution, crate::disc::Resolution::Unknown) {
-                        (0, 0)
-                    } else {
-                        v.resolution.pixels()
-                    };
+                    let px = v.resolution.pixels().unwrap_or((0, 0));
                     v.label = generate_video_label(
                         &v.codec,
                         px,
