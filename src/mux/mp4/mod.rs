@@ -316,7 +316,15 @@ impl<W: Write + Seek> Mp4Sink<W> {
                         .get(i)
                         .and_then(|c| c.clone())
                         .ok_or(crate::error::Error::Mp4MissingCodecPrivate)?;
-                    let (w, h) = v.resolution.pixels();
+                    // ISO/IEC 14496-12 makes width/height mandatory in tkhd
+                    // (8.3.2) and VisualSampleEntry (12.1.3) — unlike Matroska
+                    // there is no element to omit. Writing 0x0 yields a
+                    // structurally complete file no player can render, with no
+                    // error anywhere; refuse instead.
+                    let (w, h) = v
+                        .resolution
+                        .pixels()
+                        .ok_or(crate::error::Error::Mp4UnknownResolution)?;
                     tracks.push(Track {
                         media: Media::Video,
                         track_id,
@@ -1153,6 +1161,46 @@ mod tests {
         let r = fit_report(&t);
         assert!(r.skipped.contains(&(0, Mp4SkipReason::UnmappableVideo)));
         assert_eq!(r.included, vec![1], "only the AC-3 audio is carried");
+    }
+
+    /// A video track whose resolution never resolved must FAIL the mux, not be
+    /// written as a 0x0 track.
+    ///
+    /// ISO/IEC 14496-12 makes width and height mandatory in both `tkhd` (8.3.2)
+    /// and VisualSampleEntry (12.1.3), so unlike Matroska — which simply omits
+    /// the optional PixelWidth/PixelHeight elements — MP4 has nothing to leave
+    /// out. Writing zeros produces a structurally complete file that passes
+    /// every container check and that no player can render, with no error
+    /// anywhere: a wrong answer that looks like a successful rip.
+    ///
+    /// `Resolution::pixels()` returns `Option` for this reason. It used to
+    /// return a fabricated 1920x1080, then `(0, 0)`; the zero pair reads as a
+    /// usable value, so this sink stored it and serialised it, and the guard
+    /// that two of the three sinks have was never needed here and so was never
+    /// written.
+    #[test]
+    fn a_video_track_with_no_resolved_resolution_is_an_error_not_a_zero_sized_track() {
+        let DiscStream::Video(mut v) = hevc_video() else {
+            unreachable!("hevc_video builds a video stream")
+        };
+        v.resolution = Resolution::Unknown;
+        let t = title(
+            vec![DiscStream::Video(v), audio(Codec::Ac3, "eng")],
+            vec![Some(vec![0x01, 0x02, 0x03]), None],
+        );
+
+        let err = match Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t) {
+            Ok(_) => panic!("an unrenderable 0x0 track must not be written silently"),
+            Err(e) => e,
+        };
+        // `From<Error> for io::Error` stringifies as "E<code>[: ...]", so the
+        // code round-trips in the message.
+        assert!(
+            err.to_string()
+                .starts_with(&format!("E{}", crate::error::E_MP4_UNKNOWN_RESOLUTION)),
+            "the failure must name the missing dimensions, not a generic mux \
+             error; got {err}"
+        );
     }
 
     #[test]

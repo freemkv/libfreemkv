@@ -224,7 +224,8 @@ impl MapHeader {
 
         let stream = match video {
             Some(v) => {
-                let (width, height) = v.resolution.pixels();
+                // Informational map; absent dimensions report as 0.
+                let (width, height) = v.resolution.pixels().unwrap_or((0, 0));
                 StreamInfo {
                     codec: fvi_codec_id(v.codec),
                     width,

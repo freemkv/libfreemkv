@@ -137,7 +137,9 @@ fn stream_json(s: &DiscStream) -> serde_json::Value {
     use serde_json::json;
     match s {
         DiscStream::Video(v) => {
-            let (w, h) = v.resolution.pixels();
+            // Absent dimensions serialise as 0 here; the JSON consumer reads
+            // this as informational metadata, not as a mux input.
+            let (w, h) = v.resolution.pixels().unwrap_or((0, 0));
             let (fps_num, fps_den) = v.frame_rate.as_fraction();
             let mut o = json!({
                 "kind": "video",
