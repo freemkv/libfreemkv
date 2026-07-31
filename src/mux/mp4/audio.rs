@@ -917,6 +917,404 @@ mod tests {
         assert_eq!(c.amode, 15);
     }
 
+    // ── (E-)AC-3 bit-field extraction ────────────────────────────────────────
+    //
+    // The fixtures below give every BSI field a DIFFERENT value, which the
+    // channel-count fixtures above deliberately do not: `ac3_frame_5_1` has
+    // fscod=0, bsmod=0 and lfeon=1, so a mask that drops bits, a shift in the
+    // wrong direction, or a field read from its neighbour's lane all still
+    // produce 48 kHz / 6 channels. Field values here are pairwise distinct and
+    // are read back out of the EMITTED dac3/dec3 payload, so the assertions
+    // pin the arithmetic in ETSI TS 102 366 §5.3 / Annex E, not just a derived
+    // channel count.
+
+    /// dac3 payload (3 bytes) out of an emitted AC3SpecificBox.
+    fn dac3_payload(b: &[u8]) -> [u8; 3] {
+        assert_eq!(&b[4..8], b"dac3");
+        [b[8], b[9], b[10]]
+    }
+
+    /// dec3 payload (5 bytes) out of an emitted EC3SpecificBox.
+    fn dec3_payload(b: &[u8]) -> [u8; 5] {
+        assert_eq!(&b[4..8], b"dec3");
+        [b[8], b[9], b[10], b[11], b[12]]
+    }
+
+    /// AC-3 syncframe with every BSI field distinct: fscod=1 (44.1 kHz),
+    /// frmsizecod=37 (bit_rate_code 18), bsid=8, bsmod=5, acmod=6 (2/2),
+    /// lfeon=1 → 4.1 = 5 channels.
+    ///
+    /// byte4 = fscod(2)=01 | frmsizecod(6)=100101      → 0x65
+    /// byte5 = bsid(5)=01000 | bsmod(3)=101            → 0x45
+    /// byte6 = acmod(3)=110 | surmixlev(2)=00 | lfeon=1 | pad 00 → 0xC4
+    /// acmod 6 has surround but no centre, so per §5.4.2 cmixlev is ABSENT and
+    /// surmixlev is present: lfeon lands at bit 5 of byte 6.
+    fn ac3_frame_distinct() -> Vec<u8> {
+        vec![0x0B, 0x77, 0x00, 0x00, 0x65, 0x45, 0xC4, 0x00]
+    }
+
+    #[test]
+    fn ac3_bsi_fields_are_extracted_from_their_own_lanes() {
+        let c = parse_dolby(&ac3_frame_distinct()).expect("parsed");
+        // fscod is byte4 bits 7-6: shifting the other way yields 0 → 48 kHz.
+        assert_eq!(c.fscod, 1, "fscod = byte4 >> 6");
+        assert_eq!(c.sample_rate, 44_100, "FSCOD_RATES[1]");
+        assert_eq!(c.bsid, 8);
+        // bsmod is byte5 bits 2-0, MASKED off bsid: `|` instead of `&` leaks
+        // bsid into it (0x45 | 0x07 = 71, not 5).
+        assert_eq!(c.bsmod, 5, "bsmod = byte5 & 0x07");
+        assert_eq!(c.acmod, 6, "2/2");
+        assert!(c.lfeon);
+        assert_eq!(c.channels, 5, "2/2 + LFE");
+        assert_eq!(c.bit_rate_code, 18, "frmsizecod 37 >> 1");
+    }
+
+    #[test]
+    fn dac3_payload_packs_each_field_at_its_spec_offset() {
+        // ETSI TS 102 366 Annex F.4, AC3SpecificBox = 24 bits:
+        //   fscod(2) bsid(5) bsmod(3) acmod(3) lfeon(1) bit_rate_code(5) rsvd(5)
+        //   01 01000 101 110 1 10010 00000
+        // = 01010001 01110110 01000000 = 51 76 40
+        // Nothing else in this module asserts the dac3 BODY, so the packing
+        // shift/mask was free to change while every channel count still held.
+        let c = parse_dolby(&ac3_frame_distinct()).expect("parsed");
+        assert_eq!(dac3_payload(&dac3_box(&c)), [0x51, 0x76, 0x40]);
+    }
+
+    #[test]
+    fn dac3_truncates_an_oversized_field_instead_of_bleeding_into_its_neighbour() {
+        // Every field `parse_ac3` produces is already masked to its own width,
+        // so this states the packer's own contract: `push` writes `bits` bits
+        // and no more. A mask one bit too wide lets bsmod=8 set the bit that
+        // belongs to bsid, silently renumbering the bit stream identification.
+        let cfg = |bsmod, bit_rate_code| DolbyConfig {
+            fscod: 1,
+            bsid: 8,
+            bsmod,
+            acmod: 6,
+            lfeon: true,
+            bit_rate_code,
+            data_rate_kbps: 0,
+            sample_rate: 44_100,
+            channels: 5,
+        };
+        // bsmod 8 is one past the 3-bit field, bit_rate_code 32 one past the
+        // 5-bit field; both must be written as 0, changing no other field.
+        assert_eq!(
+            dac3_payload(&dac3_box(&cfg(8, 32))),
+            dac3_payload(&dac3_box(&cfg(0, 0))),
+            "an out-of-range field is truncated to its own lane"
+        );
+    }
+
+    #[test]
+    fn ac3_optional_mix_level_fields_are_skipped_exactly_when_present() {
+        // A/52 §5.4.2: cmixlev is present iff (acmod & 0x1) && acmod != 0x1
+        // (a centre channel, but not centre-only); surmixlev iff acmod & 0x4
+        // (surround present). Each wrongly skipped or wrongly kept 2-bit field
+        // moves `lfeon` two bits, so the LFE — and the channel count — is read
+        // out of the wrong lane. Both fixtures place lfeon=1 at its correct
+        // offset with 0 bits on either side of it.
+        //
+        // acmod=3 (3/0): centre, no surround → cmixlev present, surmixlev not.
+        // byte6 = 011 | cmixlev 01 | lfeon 1 | pad 00 = 0x6C
+        let c = parse_dolby(&[0x0B, 0x77, 0x00, 0x00, 0x00, 0x40, 0x6C, 0x00]).expect("parsed");
+        assert_eq!(c.acmod, 3);
+        assert!(c.lfeon, "acmod 3 has no surmixlev to skip");
+        assert_eq!(c.channels, 4, "3/0 + LFE");
+        // acmod=4 (2/1): surround, no centre → surmixlev present, cmixlev not.
+        // byte6 = 100 | surmixlev 01 | lfeon 1 | pad 00 = 0x8C
+        let c = parse_dolby(&[0x0B, 0x77, 0x00, 0x00, 0x00, 0x40, 0x8C, 0x00]).expect("parsed");
+        assert_eq!(c.acmod, 4);
+        assert!(c.lfeon, "acmod 4's surmixlev must be skipped");
+        assert_eq!(c.channels, 4, "2/1 + LFE");
+        // acmod=6 (2/2): surround, no centre — same rule, LFE still found.
+        let c = parse_dolby(&ac3_frame_distinct()).expect("parsed");
+        assert!(c.lfeon);
+    }
+
+    #[test]
+    fn dolby_syncword_needs_both_bytes() {
+        // 0x0B alone is not a syncframe. Matching on either byte anchors the
+        // parse two bytes early, and every BSI field is then read from the
+        // wrong offset — bsid 0 instead of 8, i.e. an entirely different
+        // stream description built from the same buffer.
+        let mut f = vec![0x0B, 0x00];
+        f.extend_from_slice(&ac3_frame_5_1());
+        let c = parse_dolby(&f).expect("parsed at the real syncword");
+        assert_eq!(c.bsid, 8, "sync is 0x0B77, not 0x0B or 0x77");
+        assert_eq!(c.acmod, 7);
+        assert_eq!(c.channels, 6);
+    }
+
+    #[test]
+    fn dolby_frame_shorter_than_the_bsi_is_refused_not_indexed() {
+        // The length guard is `< 6` because byte 5 (bsid) is read immediately
+        // after it. Five bytes must be refused; six must still parse.
+        assert!(
+            parse_dolby(&[0x0B, 0x77, 0x00, 0x00, 0x00]).is_none(),
+            "5 bytes cannot hold the bsid byte"
+        );
+        // Exactly 6 bytes is the smallest E-AC-3 header this can read, and it
+        // must NOT be refused: the guard is `<`, not `<=`.
+        let c = parse_dolby(&eac3_frame_fscod3()).expect("6 bytes is enough for the Annex-E BSI");
+        assert_eq!(c.bsid, 16);
+    }
+
+    #[test]
+    fn parse_eac3_refuses_a_frame_shorter_than_its_own_header() {
+        // `parse_dolby` guards this today, but `parse_eac3` reads f[5] and so
+        // owns the same precondition independently; if the caller's guard ever
+        // moves, this one must still refuse rather than panic.
+        assert!(parse_eac3(&[0x0B, 0x77, 0x00, 0x00, 0x00]).is_none());
+        assert!(parse_eac3(&eac3_frame_fscod3()).is_some(), "6 bytes parses");
+    }
+
+    /// Annex-E syncframe with every field distinct: frmsiz=0x123 (292 words
+    /// → 584 bytes), fscod=1 (44.1 kHz), numblkscod=0 (1 block → 256 samples),
+    /// acmod=5 (3/1), lfeon=1 → 5 channels, bsid=16.
+    ///
+    /// byte2 = strmtyp 00 | substreamid 000 | frmsiz hi 001   → 0x01
+    /// byte3 = frmsiz lo 0x23
+    /// byte4 = fscod 01 | numblkscod 00 | acmod 101 | lfeon 1 → 0x4B
+    /// byte5 = bsid 10000 | dialnorm hi 000                   → 0x80
+    fn eac3_frame_distinct() -> Vec<u8> {
+        vec![0x0B, 0x77, 0x01, 0x23, 0x4B, 0x80, 0x00]
+    }
+
+    /// Annex-E syncframe with fscod=3 — the reduced-sample-rate path, which no
+    /// other fixture reaches. fscod2=2 → 16 kHz, 6 blocks; acmod=2, lfeon=0.
+    /// byte4 = fscod 11 | fscod2 10 | acmod 010 | lfeon 0 = 0xE4.
+    /// Exactly 6 bytes: also the minimum-length Annex-E header.
+    fn eac3_frame_fscod3() -> Vec<u8> {
+        vec![0x0B, 0x77, 0x00, 0x0F, 0xE4, 0x80]
+    }
+
+    #[test]
+    fn eac3_bsi_fields_are_extracted_from_their_own_lanes() {
+        let c = parse_dolby(&eac3_frame_distinct()).expect("parsed");
+        assert_eq!(c.bsid, 16);
+        assert_eq!(c.fscod, 1, "byte4 bits 7-6");
+        assert_eq!(c.sample_rate, 44_100);
+        assert_eq!(c.acmod, 5, "3/1: byte4 bits 3-1");
+        assert!(c.lfeon, "byte4 bit 0");
+        assert_eq!(c.channels, 5, "3/1 + LFE");
+        // data_rate exercises frmsiz (11 bits split across bytes 2-3) and
+        // numblkscod (byte4 bits 5-4) together: 584 B over 256 samples at
+        // 44.1 kHz = 584·8·44100/256/1000 = 804 kbit/s. Dropping frmsiz's high
+        // 3 bits, or reading numblkscod as 3 blocks instead of 1, moves it.
+        assert_eq!(c.data_rate_kbps, 804);
+    }
+
+    #[test]
+    fn dec3_payload_packs_each_field_at_its_spec_offset() {
+        // ETSI TS 102 366 Annex F.6.1, EC3SpecificBox, one independent
+        // substream = 40 bits:
+        //   data_rate(13)=804 num_ind_sub(3)=0 | fscod(2)=1 bsid(5)=16
+        //   reserved(1) asvc(1) bsmod(3)=0 acmod(3)=5 lfeon(1)=1
+        //   reserved(3) num_dep_sub(4)=0 reserved(1)
+        //   0001100100100 000 01 10000 0 0 000 101 1 000 0000 0
+        // = 00011001 00100000 01100000 00001011 00000000
+        let c = parse_dolby(&eac3_frame_distinct()).expect("parsed");
+        assert_eq!(dec3_payload(&dec3_box(&c)), [0x19, 0x20, 0x60, 0x0B, 0x00]);
+    }
+
+    #[test]
+    fn eac3_fscod3_selects_the_reduced_rate_table_by_fscod2() {
+        // ETSI TS 102 366 Annex E.1.3.4: when fscod == 3 the two bits that are
+        // numblkscod otherwise become fscod2, indexing a DIFFERENT rate table
+        // (and the frame is always 6 blocks). fscod2=2 → 16 kHz. Read as
+        // numblkscod, or with the wrong mask, this indexes out of the 4-entry
+        // reduced table or lands on 24 kHz.
+        let c = parse_dolby(&eac3_frame_fscod3()).expect("parsed");
+        assert_eq!(c.fscod, 3);
+        assert_eq!(c.sample_rate, 16_000, "EAC3_REDUCED_RATES[fscod2=2]");
+        assert_eq!(c.acmod, 2);
+        assert!(!c.lfeon);
+        assert_eq!(c.channels, 2);
+        // 6 blocks (1536 samples), 32 bytes → 32·8·16000/1536/1000 = 2 kbit/s.
+        assert_eq!(c.data_rate_kbps, 2, "fscod3 frames are always 6 blocks");
+    }
+
+    // ── DTS core header + ddts arithmetic ────────────────────────────────────
+
+    /// The 56-bit packed tail of an emitted `ddts` box: 8-byte box header, then
+    /// DTSSamplingFrequency(4) + maxBitrate(4) + avgBitrate(4) +
+    /// pcmSampleDepth(1) = 13 bytes.
+    fn ddts_tail(b: &[u8]) -> [u8; 7] {
+        assert_eq!(&b[4..8], b"ddts");
+        let t = &b[8 + 13..];
+        [t[0], t[1], t[2], t[3], t[4], t[5], t[6]]
+    }
+
+    /// maxBitrate / avgBitrate read back out of an emitted `ddts` box.
+    fn ddts_bitrates(b: &[u8]) -> (u32, u32) {
+        assert_eq!(&b[4..8], b"ddts");
+        (
+            u32::from_be_bytes([b[12], b[13], b[14], b[15]]),
+            u32::from_be_bytes([b[16], b[17], b[18], b[19]]),
+        )
+    }
+
+    #[test]
+    fn dts_core_sync_needs_all_four_bytes() {
+        // 0x7FFE8001 is a 32-bit sync. Any partial match — the leading 0x7F, or
+        // the trailing 0x8001 — anchoring the parse means every field after it
+        // is read from the wrong offset: AMODE 4 (2 channels) instead of 9
+        // (5.1) out of the very same buffer.
+        let mut f = vec![0x7F, 0x00, 0x80, 0x01];
+        f.extend_from_slice(&[
+            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x3C, 0x05, 0xF2, 0x77, 0x00, 0x02, 0x00,
+        ]);
+        let c = parse_dts(&f).expect("parsed at the real core sync");
+        assert_eq!(c.amode, 9, "sync is 0x7FFE8001, not a prefix of it");
+        assert_eq!(c.channels, 6);
+        assert_eq!(c.sample_rate, 48_000);
+        assert_eq!(c.core_size, 96);
+    }
+
+    #[test]
+    fn dts_frame_shorter_than_the_core_header_is_refused_not_indexed() {
+        // The guard is `< 11` because byte 10 (LFF) is read after it. Ten bytes
+        // must be refused; eleven — the exact header length — must still parse.
+        let short = vec![0x7F, 0xFE, 0x80, 0x01, 0x01, 0x3F, 0x00, 0x02, 0x74, 0x00];
+        assert_eq!(short.len(), 10);
+        assert!(parse_dts(&short).is_none(), "10 bytes cannot hold LFF");
+        let exact = vec![
+            0x7F, 0xFE, 0x80, 0x01, 0x01, 0x3F, 0x00, 0x02, 0x74, 0x00, 0x0A,
+        ];
+        assert_eq!(exact.len(), 11);
+        let c = parse_dts(&exact).expect("11 bytes is the full core header");
+        assert!(c.lfe, "LFF is the last field the guard covers");
+    }
+
+    /// A DTS core whose split fields all have their high parts SET, so a lost
+    /// high bit is visible: NBLKS bit 6 (byte 4 bit 0) and FSIZE bits 13-12
+    /// (byte 5 bits 1-0). NBLKS=79 → 2560 samples; FSIZE=0x3000 → core 12289.
+    /// AMODE=9, SFREQ=13 (48 kHz), LFF=1 out of byte 10 = 0x0A.
+    fn dts_frame_high_bits_set() -> Vec<u8> {
+        vec![
+            0x7F, 0xFE, 0x80, 0x01, 0x01, 0x3F, 0x00, 0x02, 0x74, 0x00, 0x0A, 0x00,
+        ]
+    }
+
+    #[test]
+    fn dts_split_fields_keep_their_high_bits() {
+        // NBLKS is 7 bits straddling bytes 4-5 and FSIZE is 14 bits straddling
+        // bytes 5-7 (ETSI TS 102 114 §5.3.1). Shifting the high part the wrong
+        // way drops it silently: 79 blocks becomes 15, and a 12289-byte core
+        // becomes 1 — both of which then propagate into the ddts bitrate.
+        let c = parse_dts(&dts_frame_high_bits_set()).expect("parsed");
+        assert_eq!(c.frame_samples, 2560, "NBLKS 79 → (79+1)·32");
+        assert_eq!(c.core_size, 12_289, "FSIZE 0x3000 + 1");
+        assert_eq!(c.amode, 9);
+        assert_eq!(c.sample_rate, 48_000);
+    }
+
+    #[test]
+    fn dts_lff_is_masked_out_of_its_neighbours_not_xored() {
+        // LFF is 2 bits at byte 10 bits 2-1; byte 10 = 0x0A puts a 1 in bit 3
+        // as well, so `>> 1` yields 0b101 and only a MASK isolates LFF = 1
+        // (LFE present). XOR-ing instead yields 0b110 = 2 — also a legal
+        // "LFE present" code, which is why the 5.1 fixtures could not see it —
+        // and here flips it to 0b110 & no-mask = 6, i.e. LFE absent, dropping
+        // a channel from both the count and the ddts speaker mask.
+        let c = parse_dts(&dts_frame_high_bits_set()).expect("parsed");
+        assert!(c.lfe, "LFF = 1");
+        assert_eq!(c.channels, 6, "AMODE 9 (5 ch) + LFE");
+        assert_eq!(c.channel_layout & 0x0008, 0x0008, "LFE bit in the mask");
+    }
+
+    #[test]
+    fn dts_ext_sync_in_the_last_core_byte_is_not_an_extension() {
+        // The EXSS search starts at exactly core_size = FSIZE + 1. Here FSIZE=9
+        // (core_size 10) and the ext-sync pattern begins at byte 9 — the LAST
+        // byte of the core, one before the search window. Off-by-one either
+        // way (start at FSIZE, or at FSIZE-1) tests that byte and mislabels a
+        // plain DTS core as DTS-HD, emitting `dtsh` for a stream with no
+        // extension substream at all.
+        let f = vec![
+            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x00, 0x00, 0x92, 0x74, 0x64, 0x58, 0x20, 0x25,
+        ];
+        let c = parse_dts(&f).expect("parsed");
+        assert_eq!(c.core_size, 10, "FSIZE 9 + 1");
+        assert!(
+            !c.has_extension,
+            "the pattern ends at the core's last byte, inside it"
+        );
+        let e = dolby_sample_entry(Codec::Dts, &f).expect("entry built");
+        assert_eq!(&e[4..8], b"dtsc");
+    }
+
+    #[test]
+    fn ddts_bitrate_is_the_rounded_core_rate() {
+        // core_size · 8 · sample_rate / frame_samples, rounded to nearest.
+        // 8 · 8 · 44100 = 2 822 400 bits per 512 samples → 5512.5 bit/s, which
+        // must round UP to 5513: the +den/2 is what keeps the declared rate
+        // from being systematically low. Every operator in that expression
+        // moves the answer, and nothing else in this module reads maxBitrate
+        // or avgBitrate out of the emitted box.
+        let c = DtsConfig {
+            sample_rate: 44_100,
+            channels: 6,
+            amode: 9,
+            lfe: true,
+            core_size: 8,
+            frame_samples: 512,
+            has_extension: false,
+            channel_layout: dts_channel_layout(9, true),
+        };
+        let (max, avg) = ddts_bitrates(&ddts_box(&c));
+        assert_eq!(max, 5513, "2822400/512 = 5512.5 → 5513");
+        assert_eq!(avg, 5513, "both fields carry the same computed rate");
+    }
+
+    #[test]
+    fn ddts_bitrate_is_zero_rather_than_a_division_by_zero() {
+        // frame_samples is the divisor. A core header that yields 0 samples per
+        // frame must produce a 0 bitrate, not divide by it.
+        let c = DtsConfig {
+            sample_rate: 48_000,
+            channels: 6,
+            amode: 9,
+            lfe: true,
+            core_size: 96,
+            frame_samples: 0,
+            has_extension: false,
+            channel_layout: dts_channel_layout(9, true),
+        };
+        assert_eq!(ddts_bitrates(&ddts_box(&c)), (0, 0));
+    }
+
+    #[test]
+    fn ddts_frame_duration_code_covers_every_band() {
+        // FrameDuration (the tail's top 2 bits) codes the core frame length:
+        // 0 = 512 samples, 1 = 1024, 2 = 2048, 3 = 4096. NBLKS is 7 bits, so
+        // (NBLKS+1)·32 reaches 4096 and every band is live. Declaring the wrong
+        // band tells a decoder the frame is a different duration than it is.
+        let dur = |frame_samples| {
+            let c = DtsConfig {
+                sample_rate: 48_000,
+                channels: 6,
+                amode: 9,
+                lfe: true,
+                core_size: 96,
+                frame_samples,
+                has_extension: false,
+                channel_layout: dts_channel_layout(9, true),
+            };
+            ddts_tail(&ddts_box(&c))[0] >> 6
+        };
+        assert_eq!(dur(512), 0, "512 samples");
+        assert_eq!(dur(1024), 1, "1024 samples");
+        assert_eq!(dur(2048), 2, "2048 samples");
+        assert_eq!(dur(4096), 3, "4096 samples");
+        // Band boundaries, so a band cannot quietly absorb its neighbour.
+        assert_eq!(dur(513), 1);
+        assert_eq!(dur(1025), 2);
+        assert_eq!(dur(2049), 3);
+    }
+
     #[test]
     fn sample_entry_samplerate_does_not_overflow_at_96k() {
         // 96 kHz > 65535: the 16.16 integer part must saturate, not wrap to garbage.
