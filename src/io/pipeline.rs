@@ -1223,20 +1223,6 @@ mod tests {
     /// A sink that records the exact order of items it receives, so we
     /// can prove the channel is FIFO (no reordering). `close` returns
     /// the recorded vector.
-    struct OrderSink {
-        seen: Vec<u64>,
-    }
-    impl Sink<u64> for OrderSink {
-        type Output = Vec<u64>;
-        fn apply(&mut self, item: u64) -> Result<Flow, Error> {
-            self.seen.push(item);
-            Ok(Flow::Continue)
-        }
-        fn close(self) -> Result<Vec<u64>, Error> {
-            Ok(self.seen)
-        }
-    }
-
     /// Zero items sent: closing the pipeline immediately must still
     /// call `close()` exactly once and return its Output. The consumer
     /// loop's `while let Ok = rx.recv()` exits on the dropped tx with
