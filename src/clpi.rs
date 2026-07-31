@@ -31,23 +31,6 @@ pub(crate) struct ClpiStream {
     pub coding_type: u8,
     /// ISO 639-2 3-char language code. Empty for video streams.
     pub language: String,
-    // The CLPI cross-validation consumer (labels/clpi_audit.rs) reads only
-    // pid/coding_type/language. The codec sub-fields below are parsed from
-    // the BD stream_coding_info for completeness but have no reader yet.
-    /// Audio format byte (1=mono, 3=stereo, 6=5.1, 12=7.1).
-    /// Zero for non-audio streams.
-    #[allow(dead_code)]
-    pub audio_format: u8,
-    /// Audio sample rate (1=48kHz, 4=96kHz, 5=192kHz). Zero for non-audio.
-    #[allow(dead_code)]
-    pub audio_rate: u8,
-    /// Video format byte (1=480i, 4=1080i, 5=720p, 6=1080p, 8=2160p).
-    /// Zero for non-video.
-    #[allow(dead_code)]
-    pub video_format: u8,
-    /// Video rate (1=23.976, 2=24, 3=25, 4=29.97, 6=50, 7=59.94).
-    #[allow(dead_code)]
-    pub video_rate: u8,
 }
 
 /// Parse a CLPI file from raw bytes.
@@ -146,36 +129,19 @@ fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
             let sci = &data[pos + 3..sci_end];
             let coding_type = sci[0];
 
-            let mut audio_format = 0u8;
-            let mut audio_rate = 0u8;
-            let mut video_format = 0u8;
-            let mut video_rate = 0u8;
             let mut language = String::new();
 
             match coding_type {
                 // Video — MPEG-2, H.264, HEVC
-                c::MPEG2_VIDEO | c::H264 | c::HEVC => {
-                    if sci.len() >= 2 {
-                        video_format = (sci[1] >> 4) & 0x0F;
-                        video_rate = sci[1] & 0x0F;
-                    }
-                }
+                c::MPEG2_VIDEO | c::H264 | c::HEVC => {}
                 // Primary audio — LPCM, AC-3, DTS, TrueHD, AC-3+, DTS-HD HR, DTS-HD MA
                 c::LPCM..=c::DTS_HD_MA => {
-                    if sci.len() >= 2 {
-                        audio_format = (sci[1] >> 4) & 0x0F;
-                        audio_rate = sci[1] & 0x0F;
-                    }
                     if sci.len() >= 5 {
                         language = String::from_utf8_lossy(&sci[2..5]).to_string();
                     }
                 }
                 // Secondary audio (AC-3+ secondary, DTS-HD secondary)
                 c::AC3_PLUS_SECONDARY | c::DTS_HD_SECONDARY => {
-                    if sci.len() >= 2 {
-                        audio_format = (sci[1] >> 4) & 0x0F;
-                        audio_rate = sci[1] & 0x0F;
-                    }
                     if sci.len() >= 5 {
                         language = String::from_utf8_lossy(&sci[2..5]).to_string();
                     }
@@ -191,10 +157,6 @@ fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
                 pid,
                 coding_type,
                 language,
-                audio_format,
-                audio_rate,
-                video_format,
-                video_rate,
             });
 
             pos = sci_end;
@@ -364,8 +326,6 @@ mod tests {
         assert_eq!(clip.streams.len(), 1);
         assert_eq!(clip.streams[0].pid, 0x1011);
         assert_eq!(clip.streams[0].coding_type, 0x1B);
-        assert_eq!(clip.streams[0].video_format, 6);
-        assert_eq!(clip.streams[0].video_rate, 1);
         assert_eq!(clip.streams[0].language, "");
     }
 
@@ -380,8 +340,6 @@ mod tests {
         let data = build_clpi_with_proginfo(100, &pi, None);
         let clip = parse(&data).expect("should parse");
         assert_eq!(clip.streams[0].coding_type, 0x83);
-        assert_eq!(clip.streams[0].audio_format, 6);
-        assert_eq!(clip.streams[0].audio_rate, 1);
         assert_eq!(clip.streams[0].language, "eng");
     }
 
@@ -398,7 +356,6 @@ mod tests {
         assert_eq!(clip.streams[0].coding_type, 0x90);
         assert_eq!(clip.streams[0].language, "fra");
         // Audio nibbles must NOT be populated for a PG stream.
-        assert_eq!(clip.streams[0].audio_format, 0);
     }
 
     /// ProgramInfo with multiple streams: PID and coding for each must be
@@ -468,15 +425,6 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // get_extents: PTS→SPN resolution and SPN→sector arithmetic.
-    //
-    // Fixture below uses ONE coarse group with spn_coarse = 0 so that
-    // full_spn((0 & 0xFFFE_0000) | spn_fine) == spn_fine exactly, and
-    // full_pts == pts_fine << 8. That makes every (PTS, SPN) pair in the
-    // resolved map an exact, hand-checkable number.
-    // ─────────────────────────────────────────────────────────────────────
-
-    // ─────────────────────────────────────────────────────────────────────
     // Section-offset gates in `parse`.
     // ─────────────────────────────────────────────────────────────────────
 
@@ -526,8 +474,6 @@ mod tests {
             assert_eq!(s.coding_type, coding);
             // 0x61: high nibble 6, low nibble 1 — distinct values, so a
             // swapped/ORed/XORed nibble extraction cannot pass.
-            assert_eq!(s.audio_format, 6, "coding {coding:#04x}");
-            assert_eq!(s.audio_rate, 1, "coding {coding:#04x}");
             assert_eq!(s.language, "deu", "coding {coding:#04x}");
         }
     }
