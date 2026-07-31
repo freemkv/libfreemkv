@@ -62,7 +62,7 @@ use super::class_reader::{
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, jar, vocab};
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     // The real signal is `com/bydeluxe/` inside a top-level jar's central
@@ -268,7 +268,14 @@ const MAX_CANDIDATE_CLASSES: usize = 65536;
 /// [`MAX_CANDIDATE_CLASSES`].
 #[derive(Default)]
 struct CandidatePool {
-    by_class: HashMap<String, Vec<String>>,
+    /// Ordered, NOT a HashMap: `identify_master_enums` iterates this to pick a
+    /// fingerprint's best match, and its tie-break only prefers an exact ldc
+    /// count over an inexact one. Two candidates that are both inexact but
+    /// within `LDC_COUNT_TOLERANCE` are therefore decided by iteration order —
+    /// which for a `HashMap` is seeded per process, so the same disc could
+    /// resolve a different master enum on a second run and emit different
+    /// labels for unchanged input.
+    by_class: BTreeMap<String, Vec<String>>,
     /// Retained bytes: class names plus every retained string.
     bytes: usize,
 }
@@ -1545,6 +1552,62 @@ mod tests {
         assert_eq!(purpose.1.values.len(), 8);
         assert_eq!(purpose.1.values[0], "Normal");
         assert_eq!(purpose.1.values[7], "NoForcedDescriptive");
+    }
+
+    /// Two candidates that BOTH match a fingerprint's prefix and are BOTH
+    /// within `LDC_COUNT_TOLERANCE` but neither exact must resolve the same
+    /// way on every run.
+    ///
+    /// The tie-break only prefers an exact ldc count over an inexact one, so
+    /// between two inexact candidates the winner is whichever the pool yields
+    /// first. Backed by a `HashMap` that is per-process seeded, meaning the
+    /// same disc image could pick a different master enum on a second run and
+    /// emit different commentary/SDH labels for byte-identical input — with
+    /// nothing in the output to say the choice was arbitrary.
+    ///
+    /// Running the whole identification repeatedly is what makes this a test
+    /// rather than a hope: a single run cannot distinguish "deterministic"
+    /// from "got lucky", and the hash seed does not change within one process.
+    #[test]
+    fn identify_master_enums_breaks_a_tie_between_two_inexact_candidates_deterministically() {
+        // Both are prefix-matching Purpose candidates at diff 2 and 3 from the
+        // expected count of 8 — inside LDC_COUNT_TOLERANCE (4), neither exact,
+        // so the exact-count tie-break never fires and only ordering decides.
+        let mut a_vals: Vec<&str> = vec!["Normal", "Commentary", "PiP", "Trivia"];
+        let a_fill: Vec<String> = (0..6).map(|i| format!("Afill{i}")).collect(); // 10, diff 2
+        a_vals.extend(a_fill.iter().map(String::as_str));
+        let mut b_vals: Vec<&str> = vec!["Normal", "Commentary", "PiP", "Trivia"];
+        let b_fill: Vec<String> = (0..7).map(|i| format!("Bfill{i}")).collect(); // 11, diff 3
+        b_vals.extend(b_fill.iter().map(String::as_str));
+
+        let mut winners = std::collections::BTreeSet::new();
+        for _ in 0..16 {
+            let zip = build_zip(&[
+                (
+                    "com/bydeluxe/Alpha.class",
+                    class_with_ldc_strings("AlphaPurpose", &a_vals),
+                ),
+                (
+                    "com/bydeluxe/Beta.class",
+                    class_with_ldc_strings("BetaPurpose", &b_vals),
+                ),
+            ]);
+            let mut archive = open_jar(zip);
+            let enums = identify_master_enums(&mut archive);
+            let purpose = enums
+                .iter()
+                .find(|(label, _)| *label == "Purpose")
+                .expect("both candidates match the Purpose prefix within tolerance");
+            winners.insert(purpose.1.class_name.clone());
+        }
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "the same jar must resolve the same master enum every time; got {winners:?}. \
+             A per-process-seeded map here means one disc can emit different labels on \
+             different runs, with nothing in the output saying the choice was arbitrary"
+        );
     }
 
     #[test]
