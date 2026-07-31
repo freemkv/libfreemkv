@@ -441,9 +441,24 @@ pub(crate) fn decrypt_sectors_mapped(
             return;
         }
         let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
-        // No range covers this LBA → the map keys no content here, so pass the
-        // unit through untouched (clear filesystem / nav on a whole-disc read).
+        // No range covers this LBA. That is expected for clear filesystem / nav
+        // on a whole-disc read — but "the map has no key here" and "there is
+        // nothing to decrypt here" are different statements, and only the
+        // second makes passing the unit through correct.
+        //
+        // An ENCRYPTED unit outside every range is content we cannot key: on a
+        // multi-CPS disc that is an orphan clip referenced by no playlist, so
+        // it sits in no title extent and therefore in no range. Emitting it
+        // verbatim ships ciphertext where plaintext is meant to be, and extract
+        // then counts those bytes as good and reports the file complete.
+        //
+        // The split-unit branch immediately above already draws exactly this
+        // distinction. This one did not, so it was reached before the
+        // `aacs_unit_encrypted` gate below ever ran.
         let Some((key_idx, phase, range_start)) = map.entry_for(unit_lba) else {
+            if aacs::content::aacs_unit_seed_encrypted(chunk, format) {
+                verify_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             return;
         };
         // PHASE GATE (FMTS forensic segment): the segment interleaves two variants
@@ -1401,6 +1416,68 @@ mod tests {
                 sector_count: 1
             }],
             "a sub-unit remnant is ordinary content and is always read"
+        );
+    }
+
+    /// An ENCRYPTED unit that falls outside every key-map range must fail, not
+    /// pass through as ciphertext.
+    ///
+    /// "The map has no key here" and "there is nothing to decrypt here" are
+    /// different statements, and only the second makes passing the unit through
+    /// correct. On a multi-CPS disc an orphan clip — referenced by no playlist,
+    /// so in no title extent and therefore in no range — hits the first and was
+    /// treated as the second. `extract_tree` then counted those bytes as GOOD,
+    /// dropped the `.partial` suffix, and reported `complete: true`, exit 0:
+    /// a scrambled file on disk with a clean bill of health.
+    ///
+    /// A CLEAR unit outside every range is the ordinary case (filesystem and
+    /// nav on a whole-disc read) and must still pass through untouched — so
+    /// this asserts both directions.
+    #[test]
+    fn an_encrypted_unit_outside_every_key_range_fails_instead_of_passing_through() {
+        use crate::disc::ContentFormat;
+        let key = [0xAAu8; 16];
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let usz = (ul / 2048) as u32;
+
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        // The map covers unit 0 only. Unit 1 is the orphan.
+        let map = AacsKeyMap::from_ranges(vec![(0, usz, 0)]);
+
+        // Clear orphan: untouched, no error. This is nav/filesystem.
+        let mut clear_buf = vec![0u8; 2 * ul];
+        let mut u0 = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut u0, &key);
+        clear_buf[..ul].copy_from_slice(&u0);
+        clear_buf[ul..].copy_from_slice(&clear_ts_unit());
+        let orphan_before = clear_buf[ul..].to_vec();
+        decrypt_sectors_mapped(&mut clear_buf, &keys, 0, &map)
+            .expect("a CLEAR unit outside the map is ordinary nav and must pass");
+        assert_eq!(
+            &clear_buf[ul..],
+            &orphan_before[..],
+            "a clear out-of-range unit must be left byte-identical"
+        );
+
+        // Encrypted orphan: must fail loud.
+        let mut enc_buf = vec![0u8; 2 * ul];
+        let mut v0 = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut v0, &key);
+        enc_buf[..ul].copy_from_slice(&v0);
+        let mut orphan = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut orphan, &[0xCCu8; 16]);
+        enc_buf[ul..].copy_from_slice(&orphan);
+
+        let err = decrypt_sectors_mapped(&mut enc_buf, &keys, 0, &map)
+            .expect_err("an encrypted unit we hold no key for must not be emitted");
+        assert_eq!(
+            err.code(),
+            crate::error::Error::DecryptFailed.code(),
+            "same verdict CSS and the split-unit branch give for 'no provable key'"
         );
     }
 
