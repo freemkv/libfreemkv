@@ -2,6 +2,35 @@
 
 ## [1.6.0] — UNRELEASED
 
+### Breaking
+
+- **`Resolution::pixels()` now returns `Option<(u32, u32)>`, not a bare tuple.**
+  The previous sentinel for "unresolved" was `(0, 0)` — a pair every caller
+  could mistake for a usable value, and one did (see `mp4` under Fixed). Every
+  caller now has to choose what an unresolved resolution means for it: the
+  Matroska and metadata sinks take `.unwrap_or((0, 0))` with the reason stated
+  at each site, the VobSub writer degrades to a palette-only `.idx`, and the
+  MP4 sink refuses the track.
+- **`DiscSession::into_drive()` returns `Result<Drive, Error>`, not a bare
+  `Drive`.** The empty-slot state it used to panic on is reachable through
+  ordinary public use (`stage_drive_as_reader` moves the drive out; calling
+  `into_drive()` twice moves it out again), so the panic was not guarding
+  caller error — it was guarding a legitimate second call.
+- **`DiscSession::drive()` / `drive_mut()` removed.** Dead public API with
+  zero callers anywhere in the toolchain, and panicking accessors are not
+  worth preserving the shape of.
+- **`clpi`: the unused EP-map → sector-extent path deleted** (`get_extents`,
+  `resolved_ep_map`, `full_pts`, `full_spn`, `parse_cpi`, `EpCoarse`,
+  `EpFine`, and the `ep_coarse`/`ep_fine`/`version` fields on `ClipInfo`).
+  Crate-internal (`pub(crate)`), so not source-breaking for an external
+  consumer, but listed here because it removes surface: nothing in the
+  toolchain called it, it carried a truncation bug (fixed in a prior commit,
+  then removed with the code it fixed), and `ClipInfo` keeps only
+  `source_packet_count` and `streams`.
+- New error codes: **E9055** (`Mp4UnknownResolution`), **E9056**
+  (`SyncTimeout`), **E9057** (`SyncWorkerLost`). Front-ends rendering error
+  strings need entries for all three.
+
 ### Added
 
 - **High-level orchestration API — a single mux driver and a disc session.**
@@ -91,6 +120,109 @@
   with no key passes through rather than failing), with fail-loud on genuinely
   unresolvable keys; a user Stop mid-read is reported as `completed = false`
   (a stop is not a failure), not a spurious error.
+- **`udf`: deleted files and directories are no longer read as if they still
+  existed.** File-characteristics bit 2 (Deleted, ECMA-167 4/14.4.4) was never
+  decoded, so a deleted File Identifier Descriptor's ICB was followed like any
+  other. A deleted FID is permitted to point at extent length zero — not at a
+  File Entry at all — so following it reads whatever descriptor happens to sit
+  at that LBA: a deleted *directory* landed on the File Set Descriptor and
+  failed enumeration of the **entire volume**; a deleted *file* read back as a
+  genuine zero-byte entry.
+- **`udf`: the Metadata File is now located from the Metadata Partition Map,
+  not assumed to sit at block 0.** UDF 2.50 2.2.10 records a
+  partition-relative Uint32 at offset 40 of the map that is the only
+  authoritative answer to where the file lives; block 0 is merely where most
+  authoring tools happen to put it. A conformant volume that recorded it
+  elsewhere was rejected as not-a-UDF-filesystem, or — on a volume carrying a
+  decoy descriptor at block 0 — silently mounted the wrong filesystem and
+  reported success. Block 0 stays in the candidate chain, so a volume with no
+  map or a wrong one keeps mounting exactly as before; the map is trusted only
+  when its partition type identifier actually reads `*UDF Metadata Partition`
+  (a Virtual or Sparable map is also ECMA-167 Type 2 and records unrelated
+  fields at the same offset).
+- **`udf`: a read fault while locating the Metadata File is now a read error,
+  not "not a UDF disc."** The candidate-loop fix above discarded the
+  distinction between "read fine and the bytes say no" (structural) and
+  "could not read" (transient) — a single marginal-sector fault fell through
+  to the block-0 fallback, mis-tagged, and came back as
+  `Error::UdfNotFilesystem`. `mux::resolve` **memoises that verdict for the
+  whole disc**, so one flaky read silently demoted every remaining title to
+  the base-Unit-Key-only path on an AACS 2.1 forensic disc. The same
+  read-fault-vs-negative-verdict fix is applied to the Volume Descriptor
+  Sequence fallback below.
+- **`udf`: `file_start_lba` no longer returns an unrecorded extent's LBA.**
+  A prior change correctly started retaining ECMA-167 4/14.14.1.1 type-1
+  (allocated-but-not-recorded) extents rather than dropping them — dropping
+  one slides every later extent down by the hole's length — but
+  `file_start_lba` still took the *first* extent unconditionally, so it could
+  hand back a hole's LBA rather than where the file's data actually begins.
+  `ifo.rs` uses this value as the base for every VTS VOB extent
+  (`file_start_lba(IFO) + vtstt_vobs + cell.first_sector`), so a DVD whose IFO
+  opens with a type-1 descriptor read its **entire video title set from the
+  wrong sectors** — no error anywhere, the reads just landed on unrelated
+  data.
+- **`udf`: the Volume Descriptor Sequence fallback now retries on outcome, not
+  on the anchor's declared shape.** The Main VDS was selected from the
+  anchor's declared extent whenever the extent's *shape* was usable (length,
+  location, no address wrap) and the customary fixed location was tried only
+  when the shape itself failed. Shape is a property of the field, not of what
+  is actually there: a stale anchor, a rewritten volume, or deliberate
+  corruption can pass every shape check and point at nothing, in which case
+  the sweep finds no Partition Descriptor and the volume is rejected — on
+  exactly the damaged-disc branch recovery exists for, with no recovery path.
+  Both locations are now candidates and the fallback fires on whether
+  following the anchor actually found anything.
+- **`css`: a sector whose cached title key is proven stale and whose re-crack
+  fails is no longer descrambled with the stale key anyway.** That produced
+  garbage payload behind an intact clear header instead of a hard failure.
+  Raises `Error::DecryptFailed`, matching AACS's behaviour on the same
+  condition.
+- **`decrypt`: an encrypted unit outside every key-map range no longer passes
+  through as ciphertext counted as good bytes.** `extract` could report a
+  scrambled file as complete with exit code 0.
+- **`mux`: frames dropped by the resync gate now reach `errors()`.** The gate
+  zeroes its counter at each resync, so a gap that resolved was previously
+  invisible to the error count even though frames were genuinely lost.
+- **`mux`: a discard by the 8 MiB access-unit backstop now marks the following
+  unit discontinuous.** Previously the resync gate never armed after corrupt
+  input recovered via the backstop, so the discontinuity that should have
+  triggered a resync went undetected.
+- **`mp4`: a video track with no resolved resolution is now refused
+  (`E_MP4_UNKNOWN_RESOLUTION`, E9055) instead of written as a structurally
+  valid, unrenderable 0x0 track.** `Resolution::pixels()`'s old `(0, 0)`
+  sentinel for "unknown" was indistinguishable from a real answer, and MP4 has
+  no optional-element mechanism to omit the field the way Matroska does —
+  `tkhd` and `VisualSampleEntry` both make width/height mandatory. See
+  `pixels()` under Breaking.
+- **`labels`: Deluxe master-enum selection no longer iterates a `HashMap`.**
+  Iteration order over a `HashMap` is unspecified, so the same disc could emit
+  different commentary/SDH labels on different runs. Selection is now
+  deterministic.
+- **`io`: a cancelled rip during the bounded fsync is no longer reported as a
+  hard I/O failure.** The three bounded-fsync failure modes returned bare
+  `io::ErrorKind` values with no `E<code>` prefix, so `is_halt()` — which only
+  recognises that prefix — could not tell a user Stop from a wedged NFS mount
+  from a lost worker thread, and a genuine cancel surfaced as a hard failure
+  at the end of an otherwise-complete mux. They now carry distinct codes:
+  `Error::Halted`, `Error::SyncTimeout` (**E9056**), and
+  `Error::SyncWorkerLost` (**E9057**) — see New error codes under Breaking.
+- **`session`: `into_drive()` is fallible; `drive()` / `drive_mut()` deleted.**
+  See Breaking.
+- **`clpi`: the unused EP-map → sector-extent path deleted**, including a
+  truncation bug it carried (`out_time` past the last EP entry resolved short
+  of EOF). See Breaking.
+
+### Tests
+
+- The suite grew from ~2,570 to **2,994** tests over this cycle.
+- A long-standing intermittent failure (roughly 1 run in 10 under the full
+  parallel suite) was diagnosed and removed. It came from asserting on a
+  `tracing` capture: the capturing subscriber is installed thread-local while
+  `tracing`'s callsite-interest cache is global, so the two could race
+  regardless of how carefully the capture was serialised. The predicate is
+  now a named function tested as a plain value, with no subscriber involved.
+  Measured clean afterward: 14 consecutive full-suite runs, 2,994 passed, 0
+  failed.
 
 ## [1.5.2] — 2026-07-22
 

@@ -1464,71 +1464,45 @@ mod tests {
         );
     }
 
-    /// Counts `tracing` events on target `freemkv::scan`, so a test can prove
-    /// a debug log fires (or doesn't) without depending on any output
-    /// formatting.
-    #[derive(Clone)]
-    struct ScanDebugCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-    impl tracing::Subscriber for ScanDebugCounter {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            metadata.target() == "freemkv::scan"
-        }
-        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            if event.metadata().target() == "freemkv::scan" {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        fn enter(&self, _span: &tracing::span::Id) {}
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    /// Mutation guard for the `!` in `if !conclusive { tracing::debug!(...) }`:
-    /// the "truncated; verdicts limited" log must fire exactly on an
-    /// INCONCLUSIVE run, never on one that reached a designed stop.
+    /// A stop reason decides whether the absence of a display set proves
+    /// anything — and therefore whether the probe reports the run as truncated.
     #[test]
-    fn truncated_run_logs_but_a_conclusive_run_does_not() {
-        let pid = 0x1200u16;
-
-        // Conclusive: one exactly-sized read, extent read to its end, no stall.
-        let conclusive_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        // Serialised crate-wide — see `harness::with_captured_tracing`. These
-        // race the capture in disc/encrypt.rs otherwise: the dispatch is
-        // thread-local but the callsite-interest cache is global.
-        crate::harness::with_captured_tracing(ScanDebugCounter(conclusive_count.clone()), || {
-            let mut reader = TsReader {
-                data: ts_stream(pid, &pcs_display(true)),
-                pos: 0,
-            };
-            let mut title = pgs_title(pid, false);
-            title.extents = vec![Extent {
-                start_lba: 0,
-                sector_count: 1,
-            }];
-            probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
-        });
-        assert_eq!(
-            conclusive_count.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "a conclusive (Exhausted) run must not log the truncation debug message"
+    fn a_stop_reason_decides_whether_absence_is_conclusive() {
+        // The debug line at the end of `probe_and_set_forced` is gated on
+        // `!stop.absence_is_conclusive()`. Assert that PREDICATE rather than
+        // counting emitted events.
+        //
+        // Reading a log line back needs a capturing subscriber, which is
+        // thread-local, while tracing's callsite-interest cache is global.
+        // Those race: the sibling test in disc/encrypt.rs that did this failed
+        // roughly one full-suite run in ten while passing every time in
+        // isolation, and serialising the captures crate-wide was not enough —
+        // the cache can still be re-evaluated against the process default
+        // dispatch. A boolean does not need a subscriber to check.
+        //
+        // ECMA of the decision: a stop that saw everything it was ever going to
+        // see (Exhausted) or stopped by DESIGN at the budget is conclusive, so
+        // the absence of a display set means the track is not forced and there
+        // is nothing to report. A stop that was cut short (Halted, ReadFailed)
+        // is not, and that is exactly what the operator needs told.
+        assert!(
+            StopReason::Exhausted.absence_is_conclusive(),
+            "reading every extent to its end is a complete observation"
         );
-
-        // Inconclusive: dies mid-title with a read error → ReadFailed.
-        let truncated_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        crate::harness::with_captured_tracing(ScanDebugCounter(truncated_count.clone()), || {
-            let mut reader =
-                PartialTsReader::new(ts_stream(pid, &pcs_display(true)), ThenWhat::Error);
-            let mut title = multi_read_pgs_title(pid, false);
-            probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
-        });
-        assert_eq!(
-            truncated_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "a truncated (ReadFailed) run must log the truncation debug message exactly once"
+        assert!(
+            StopReason::Budget.absence_is_conclusive(),
+            "the budget is a DESIGNED stop: a forced track's display sets appear \
+             throughout the title, so a bounded prefix is representative. \
+             Treating it as inconclusive would disable forced detection outright"
+        );
+        assert!(
+            !StopReason::ReadFailed.absence_is_conclusive(),
+            "a read that died mid-title saw less than the whole; absence proves \
+             nothing and the operator must be told"
+        );
+        assert!(
+            !StopReason::Halted.absence_is_conclusive(),
+            "a cancelled probe is cut short, not complete"
         );
     }
 }
