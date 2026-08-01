@@ -525,7 +525,7 @@ fn generate_audio_label_inner(
 }
 
 fn extract(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<StreamLabel> {
-    let mut best: Option<(&'static str, ParseResult)> = None;
+    let mut candidates: Vec<(&'static str, ParseResult)> = Vec::new();
     for (name, detect, parse) in PARSERS {
         if !detect(reader, udf) {
             continue;
@@ -537,14 +537,17 @@ fn extract(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<StreamLabel> {
         if result.labels.is_empty() {
             continue;
         }
-        // Pick highest confidence. Equal confidence → first wins
-        // (array order tiebreaker).
-        match &best {
-            None => best = Some((name, result)),
-            Some((_, b)) if result.confidence > b.confidence => best = Some((name, result)),
-            _ => {}
-        }
+        candidates.push((name, result));
     }
+    // One tie-break rule, one implementation. `select_result` owns it and
+    // carries a regression test for a past bug where the LAST equal-confidence
+    // parser won instead of the first. `extract` — the path that actually
+    // ships — used to re-derive the same rule inline with a hand-rolled `>`
+    // scan and had no test of its own, so that fixed bug could have silently
+    // recurred here. Array order encodes a trust ordering (the hand-vetted
+    // parsers are registered ahead of the ones that detect on any BD-J disc),
+    // so "first wins on a tie" is load-bearing, not incidental.
+    let best = select_result(&candidates).map(|(n, r)| (*n, r.clone()));
     let (name, mut labels) = match best {
         Some((n, r)) => {
             tracing::info!(
@@ -1184,9 +1187,13 @@ mod registry_tests {
     }
 
     /// `select_result` must pick the highest-confidence non-empty result
-    /// and, on a confidence tie, the FIRST in array order — matching
-    /// `extract()`'s strict-`>` first-wins scan (regression for the old
-    /// `analyze()` `max_by(...then(Equal))` no-op that picked the LAST).
+    /// and, on a confidence tie, the FIRST in array order (regression for the
+    /// old `analyze()` `max_by(...then(Equal))` no-op that picked the LAST).
+    ///
+    /// `extract()` — the path that actually ships — used to re-derive this
+    /// same rule with its own inline `>` scan and had no test at all, so the
+    /// bug this test guards against could have recurred there unnoticed. It
+    /// now calls `select_result`, so this test covers both.
     #[test]
     fn select_result_first_wins_on_tie() {
         // Two parsers, equal (Medium) confidence: the first must win.
