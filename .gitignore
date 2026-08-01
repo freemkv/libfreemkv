@@ -19,3 +19,7 @@ CLAUDE.md
 # absolute paths from the machine that ran it — which must never reach a public
 # repo. Ignored rather than relocated so a run from any working copy is safe.
 .nightly/
+
+# cargo-mutants working output: large, machine-specific, never committed
+mutants.out/
+mutants.out.old/
