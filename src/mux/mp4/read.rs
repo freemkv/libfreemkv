@@ -715,6 +715,13 @@ struct StsdInfo {
 /// stsd → codec + dimensions + codec_private + channel count (first entry).
 fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
     // version+flags(4) entry_count(4) then the first sample entry box.
+    //
+    // `< 8` vs `<= 8` is equivalent here, not a coverage gap: at `b.len() ==
+    // 8` this early return and falling through agree. Falling through makes
+    // `entry = &b[8..]` an EMPTY slice, and the very next guard
+    // (`entry.len() < 8`) catches that unconditionally and returns `None`
+    // too. Confirmed by re-running the `<=` mutation against the full test
+    // suite, which still passes.
     if b.len() < 8 {
         return None;
     }
@@ -1864,6 +1871,22 @@ mod tests {
         assert!(parse_stsd(&b).is_none());
     }
 
+    /// Every buffer shorter than the 8-byte version+flags+entry_count header
+    /// must return `None` — never fall through to `&b[8..]`, which would slice
+    /// past the end and panic. `b.len() == 8` is the boundary itself (see the
+    /// equivalence note on `parse_stsd`'s guard); everything strictly below it
+    /// must be rejected by THIS check, not rely on a later one that isn't
+    /// reached yet.
+    #[test]
+    fn parse_stsd_rejects_every_length_below_the_header_size() {
+        for len in 0..8 {
+            assert!(
+                parse_stsd(&vec![0u8; len]).is_none(),
+                "len={len} must be None, not a panic"
+            );
+        }
+    }
+
     #[test]
     fn read_moov_oversize_is_rejected() {
         use std::io::Cursor;
@@ -2731,6 +2754,33 @@ mod tests {
         assert_eq!(mdhd_language(&v1).as_deref(), Some("eng"));
     }
 
+    /// The length guard is `b.len() < off + 2` — reject too SHORT, not
+    /// "not exactly `off + 2`". Pins both edges of that boundary for the
+    /// version-0 offset (`off == 20`):
+    ///   * `b.len() == off` (no room for the packed field at all) must return
+    ///     `None`, not read two bytes past the end;
+    ///   * `b.len() == off + 3` (one byte MORE than the minimum) must still
+    ///     succeed — a `<`→`>` mutant of the guard would reject this case, since
+    ///     `off + 3 > off + 2`.
+    #[test]
+    fn mdhd_language_boundary_rejects_short_not_merely_non_exact() {
+        let short = vec![0u8; 20]; // == off, zero room for the language field
+        assert_eq!(
+            mdhd_language(&short),
+            None,
+            "no room for the packed language field must be None, not a panic"
+        );
+
+        let packed = [0x15u8, 0xC7]; // "eng"
+        let mut longer = vec![0u8; 23]; // == off + 3, one byte past the minimum
+        longer[20..22].copy_from_slice(&packed);
+        assert_eq!(
+            mdhd_language(&longer).as_deref(),
+            Some("eng"),
+            "a buffer LARGER than the minimum must still succeed"
+        );
+    }
+
     // ── Sample-entry field offsets (ISO/IEC 14496-12 §12.1.3, §12.2.3) ────────
 
     /// Build an `stsd` payload holding ONE sample entry of type `fourcc`.
@@ -2818,6 +2868,83 @@ mod tests {
             info.channels, 2,
             "an entry with no readable channelcount defaults to stereo"
         );
+    }
+
+    /// `mp4a`'s codec_private (the AudioSpecificConfig inside a child `esds`
+    /// box) is only read when the entry is `Codec::Aac` AND its body is at
+    /// least the 28-byte fixed AudioSampleEntry part — `find_box(&body[28..],
+    /// ...)` would slice past the end otherwise. No existing test built an
+    /// actual `mp4a` entry, so neither half of that guard (`&&`, or the
+    /// `>= 28` on its right) was constrained: an `&&`→`||` mutant reaches the
+    /// same `&body[28..]` on a codec-only match, and a `>=`→`<` mutant loses a
+    /// real title's AAC CodecPrivate outright by only running on entries too
+    /// short to have one.
+    #[test]
+    fn parse_stsd_extracts_aac_codec_private_only_when_the_body_is_long_enough() {
+        let asc = vec![0x12u8, 0x10]; // AAC-LC 44.1 kHz stereo
+        let esds = vec![
+            0, 0, 0, 0, // version+flags
+            0x03, 0x19, 0x00, 0x00, 0x00, // ES_Descriptor: tag,len, ES_ID(2), flags(0)
+            0x04, 0x11, // DecoderConfigDescriptor: tag,len
+            0x40, // objectTypeIndication (AAC)
+            0x15, 0, 0, 0, // streamType/bufferSizeDB
+            0, 0, 0, 0, // maxBitrate
+            0, 0, 0, 0, // avgBitrate
+            0x05, 0x02, // DecoderSpecificInfo: tag,len
+            0x12, 0x10, // AudioSpecificConfig
+        ];
+
+        // Full-length (28+ byte) AudioSampleEntry: the esds ASC must come back.
+        let stsd = stsd_with(b"mp4a", &audio_entry(2, 0, &mp4_box(b"esds", &esds)));
+        let info = parse_stsd(&stsd).expect("an mp4a entry parses");
+        assert!(matches!(info.codec, Codec::Aac));
+        assert_eq!(
+            info.config,
+            Some(asc),
+            "a full-length mp4a entry must extract its esds AudioSpecificConfig"
+        );
+
+        // A SHORT (< 28 byte) AudioSampleEntry, still AAC: config must be
+        // None without ever touching body[28..] — no panic.
+        let short_stsd = stsd_with(b"mp4a", &[0u8; 12]);
+        let short_info = parse_stsd(&short_stsd).expect("still names a codec");
+        assert_eq!(
+            short_info.config, None,
+            "a short mp4a entry has no room for an esds child box"
+        );
+    }
+
+    /// Every recognised audio fourcc must map to its own `Codec`, checked one
+    /// by one. `ec-3`/`dtsc`/`dtse`/`dtsh`/`dtsl` had no coverage at all before
+    /// this test — a deleted match arm for any of them falls through to the
+    /// catch-all `_ => return None`, silently dropping every E-AC-3 or DTS
+    /// variant track from the title instead of remuxing it.
+    #[test]
+    fn parse_stsd_recognises_every_audio_fourcc() {
+        let cases: &[(&[u8; 4], Codec)] = &[
+            (b"ac-3", Codec::Ac3),
+            (b"ec-3", Codec::Ac3Plus),
+            (b"mp4a", Codec::Aac),
+            (b"dtsc", Codec::Dts),
+            (b"dtse", Codec::Dts),
+            (b"dtsh", Codec::Dts),
+            (b"dtsl", Codec::Dts),
+        ];
+        for (fourcc, want) in cases {
+            let stsd = stsd_with(fourcc, &audio_entry(2, 0, &[]));
+            let info = parse_stsd(&stsd).unwrap_or_else(|| {
+                panic!(
+                    "{:?} must be recognised, not fall through to None",
+                    std::str::from_utf8(*fourcc)
+                )
+            });
+            assert_eq!(
+                info.codec,
+                *want,
+                "{:?} must map to {want:?}",
+                std::str::from_utf8(*fourcc)
+            );
+        }
     }
 
     // ── MPEG-4 expandable descriptors (ISO/IEC 14496-1 §8.3.3) ────────────────
