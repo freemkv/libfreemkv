@@ -149,9 +149,9 @@ fn unescape_ebsp_prefix(ebsp: &[u8]) -> Vec<u8> {
 ///
 /// The zero run-length counter is cumulative across the whole scan and is
 /// reset only when an escape byte is actually dropped — matching the
-/// reference decoding process (ITU-T H.264 §7.3.1 / the libavcodec RBSP
-/// extractor), which discards a 0x03 following ANY run of two-or-more 0x00
-/// bytes, not just an exact `00 00 03` sliding window. A window-based scanner
+/// reference decoding process in ITU-T H.264 §7.3.1, which discards a 0x03
+/// following ANY run of two-or-more 0x00 bytes, not just an exact
+/// `00 00 03` sliding window. A window-based scanner
 /// that advances by 3 on a match and by 1 otherwise disagrees with this on a
 /// run of 3+ real zero bytes ahead of an 0x03: `00 00 00 03` decodes here as
 /// `00 00 00` (the run is escaped, matching every other H.264 decoder), where
@@ -761,8 +761,8 @@ mod tests {
     /// the shared `unescape_ebsp`. On a run of 3+ real 0x00 bytes ahead of an
     /// 0x03 — non-conformant, but this is untrusted disc input, not a
     /// spec-clean encoder — the two disagreed: `unescape_ebsp`'s cumulative
-    /// zero counter (the same rule libavcodec's RBSP extractor and the H.264
-    /// reference decoding process use) drops the 0x03 as an escape, while a
+    /// zero counter (the rule the H.264 reference decoding process in
+    /// §7.3.1 specifies) drops the 0x03 as an escape, while a
     /// fresh 3-byte window starting right after the non-matching first byte
     /// kept it as real payload. Pin the shared function's behaviour here so a
     /// second hand-rolled copy doesn't quietly reappear.
