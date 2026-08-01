@@ -1147,6 +1147,112 @@ mod tests {
         );
     }
 
+    /// `Stream::read`'s own `s.size as u64 > MAX_ALLOC_BYTES` cap — a SEPARATE
+    /// call site from `read_moov`'s (see `read_moov_allows_a_payload_of_exactly_max_alloc_bytes`
+    /// / the module doc's note on the same policy hardened at only one of two
+    /// sites elsewhere in this crate). A `>`↔`>=` mutant here would reject a
+    /// sample of exactly the cap, which must be allowed. Builds an
+    /// `Mp4Reader` directly (its fields are private but visible to this
+    /// module's tests) over a `FakeBigReader` so the 256 MiB sample doesn't
+    /// need a real backing file — only the destination buffer `read()`
+    /// allocates is real.
+    #[test]
+    fn stream_read_allows_a_sample_of_exactly_max_alloc_bytes() {
+        use crate::disc::DiscTitle;
+        use crate::pes::Stream as _;
+
+        let mut rd = Mp4Reader {
+            file: FakeBigReader {
+                prefix: Vec::new(),
+                pos: 0,
+                len: MAX_ALLOC_BYTES + 4096,
+            },
+            file_len: MAX_ALLOC_BYTES + 4096,
+            title: DiscTitle::empty(),
+            samples: vec![SampleRef {
+                track: 0,
+                offset: 0,
+                size: MAX_ALLOC_BYTES as u32,
+                pts_ns: 0,
+                dts_ns: 0,
+                keyframe: true,
+            }],
+            cursor: 0,
+        };
+        let frame = rd
+            .read()
+            .expect("exactly MAX_ALLOC_BYTES must be allowed")
+            .expect("one sample is queued");
+        assert_eq!(frame.data.len() as u64, MAX_ALLOC_BYTES);
+    }
+
+    /// The same cap's other edge: one byte OVER it must still be rejected. A
+    /// `>`↔`==` mutant would only catch a sample of EXACTLY the cap and let
+    /// anything larger through — the worse direction to get wrong, since it
+    /// turns the cap into a no-op for every real oversized/hostile sample.
+    #[test]
+    fn stream_read_rejects_a_sample_one_byte_over_max_alloc_bytes() {
+        use crate::disc::DiscTitle;
+        use crate::pes::Stream as _;
+
+        let mut rd = Mp4Reader {
+            file: FakeBigReader {
+                prefix: Vec::new(),
+                pos: 0,
+                len: MAX_ALLOC_BYTES + 4096,
+            },
+            file_len: MAX_ALLOC_BYTES + 4096,
+            title: DiscTitle::empty(),
+            samples: vec![SampleRef {
+                track: 0,
+                offset: 0,
+                size: (MAX_ALLOC_BYTES + 1) as u32,
+                pts_ns: 0,
+                dts_ns: 0,
+                keyframe: true,
+            }],
+            cursor: 0,
+        };
+        let err = rd.read().unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "one byte over MAX_ALLOC_BYTES must still be rejected, not just \
+             the exact cap value"
+        );
+    }
+
+    /// `Mp4Reader` is a read-only source — `mp4://` is never a mux destination
+    /// — so `write` must always fail, never silently succeed and drop the
+    /// frame on the floor.
+    #[test]
+    fn stream_write_is_always_rejected() {
+        use crate::disc::DiscTitle;
+        use crate::pes::Stream as _;
+        use std::io::Cursor;
+
+        let mut rd = Mp4Reader {
+            file: Cursor::new(Vec::<u8>::new()),
+            file_len: 0,
+            title: DiscTitle::empty(),
+            samples: Vec::new(),
+            cursor: 0,
+        };
+        let frame = PesFrame {
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![1, 2, 3],
+            duration_ns: None,
+            source: None,
+            coding: None,
+        };
+        assert!(
+            rd.write(&frame).is_err(),
+            "Mp4Reader::write must always return an error"
+        );
+    }
+
     #[test]
     // The underscores in these literals mark BITFIELD boundaries in the
     // bitstream header being built (e.g. a 5-bit field then a 3-bit field),
