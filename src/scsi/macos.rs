@@ -76,6 +76,27 @@ fn bsd_name_of(device: &Path) -> Result<&str> {
         .unwrap_or(dev_str))
 }
 
+/// Map a `shim_open_exclusive` failure sentinel (a negative return code, NOT
+/// an `IOReturn`) to the typed [`Error`] variant it represents. Pulled out of
+/// [`MacScsiTransport::open`] as its own callable predicate so the mapping —
+/// otherwise reachable only through a real IOKit FFI call — can be pinned by
+/// a test: collapsing `-4..=-2` or `-5` into the `DeviceNotFound` catch-all
+/// would silently turn "another process holds the drive" into "no such
+/// drive", or "the IOKit plugin chain failed" into the same.
+fn map_shim_open_error(rc: i32, path: String) -> Error {
+    match rc {
+        // -2/-3/-4: IOCreatePlugInInterfaceForService /
+        // QueryInterface MMCDeviceInterface /
+        // GetSCSITaskDeviceInterface failed.
+        -4..=-2 => Error::IoKitPluginFailed { path, kr: 0 },
+        // -5: ObtainExclusiveAccess failed (held by another
+        // process).
+        -5 => Error::DeviceLocked { path, kr: 0 },
+        // -1 and anything else: device not present.
+        _ => Error::DeviceNotFound { path },
+    }
+}
+
 pub struct MacScsiTransport {
     _bsd_name: String,
 }
@@ -103,22 +124,7 @@ impl MacScsiTransport {
             // Release the single-instance lock taken by the OPEN.swap above;
             // a failed open must not leave it held or every later open wedges.
             OPEN.store(false, Ordering::Release);
-            let path = bsd_name.to_string();
-            // The shim returns distinct negative sentinels per failure
-            // stage; map them to the typed variants that already exist
-            // rather than collapsing every failure to DeviceNotFound.
-            // These sentinels are not IOReturn codes, so kr is left 0.
-            return Err(match rc {
-                // -2/-3/-4: IOCreatePlugInInterfaceForService /
-                // QueryInterface MMCDeviceInterface /
-                // GetSCSITaskDeviceInterface failed.
-                -4..=-2 => Error::IoKitPluginFailed { path, kr: 0 },
-                // -5: ObtainExclusiveAccess failed (held by another
-                // process).
-                -5 => Error::DeviceLocked { path, kr: 0 },
-                // -1 and anything else: device not present.
-                _ => Error::DeviceNotFound { path },
-            });
+            return Err(map_shim_open_error(rc, bsd_name.to_string()));
         }
 
         Ok(MacScsiTransport {
@@ -306,7 +312,9 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{K_MAX_CDB_SIZE, OPEN, bsd_name_of, cstr_to_str, drive_has_disc};
+    use super::{
+        K_MAX_CDB_SIZE, OPEN, bsd_name_of, cstr_to_str, drive_has_disc, map_shim_open_error,
+    };
     use crate::error::Error;
     use std::path::Path;
     use std::sync::atomic::Ordering;
@@ -376,6 +384,37 @@ mod tests {
             !OPEN.load(Ordering::Acquire),
             "the probe must not leave the exclusive-transport lock held"
         );
+    }
+
+    /// Every negative sentinel `shim_open_exclusive` can return must map to
+    /// its own distinct typed error, not collapse into the `DeviceNotFound`
+    /// catch-all. `-2..=-4` (IOKit plugin chain) and `-5` (exclusive access
+    /// held elsewhere) are the two that a deleted match arm would silently
+    /// fold into "no such drive".
+    #[test]
+    fn map_shim_open_error_distinguishes_every_sentinel() {
+        for rc in [-2, -3, -4] {
+            match map_shim_open_error(rc, "disk4".into()) {
+                Error::IoKitPluginFailed { path, kr } => {
+                    assert_eq!(path, "disk4");
+                    assert_eq!(kr, 0);
+                }
+                other => panic!("rc={rc}: expected IoKitPluginFailed, got {other:?}"),
+            }
+        }
+        match map_shim_open_error(-5, "disk4".into()) {
+            Error::DeviceLocked { path, kr } => {
+                assert_eq!(path, "disk4");
+                assert_eq!(kr, 0);
+            }
+            other => panic!("expected DeviceLocked, got {other:?}"),
+        }
+        for rc in [-1, -6, i32::MIN] {
+            match map_shim_open_error(rc, "disk4".into()) {
+                Error::DeviceNotFound { path } => assert_eq!(path, "disk4"),
+                other => panic!("rc={rc}: expected DeviceNotFound, got {other:?}"),
+            }
+        }
     }
 
     /// A CDB longer than K_MAX_CDB_SIZE must be rejected with

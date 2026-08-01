@@ -1546,4 +1546,181 @@ mod tests {
         assert_eq!(cf.member_descriptor(&m), Some("()V"));
         assert_ne!(cf.member_descriptor(&m), Some("doStuff"));
     }
+
+    // -----------------------------------------------------------------
+    // Reader::u16/u32/u64 boundary + value correctness
+    //
+    // Mirrors `slice_boundary_is_inclusive_of_the_final_byte`: an
+    // exact-fit read must succeed, one byte short must fail. Plus
+    // positive-value tests so a scrambled byte assembly (not just an
+    // out-of-bounds read) would be caught.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn u16_boundary_is_inclusive_of_the_final_byte() {
+        let data = [0xAB, 0xCD];
+        let mut r = Reader::new(&data);
+        assert_eq!(r.u16("exact fit").expect("2 bytes available"), 0xABCD);
+
+        let data = [0xAB];
+        let mut r = Reader::new(&data);
+        assert!(matches!(
+            r.u16("one byte short"),
+            Err(Error::UnexpectedEof { .. })
+        ));
+    }
+
+    #[test]
+    fn u16_decodes_big_endian_value() {
+        let data = [0x01, 0x02];
+        let mut r = Reader::new(&data);
+        assert_eq!(r.u16("value").unwrap(), 0x0102);
+    }
+
+    #[test]
+    fn u32_boundary_is_inclusive_of_the_final_byte() {
+        let data = [0x00, 0x00, 0x00, 0x2A];
+        let mut r = Reader::new(&data);
+        assert_eq!(r.u32("exact fit").expect("4 bytes available"), 42);
+
+        let data = [0x00, 0x00, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(matches!(
+            r.u32("one byte short"),
+            Err(Error::UnexpectedEof { .. })
+        ));
+    }
+
+    #[test]
+    fn u32_decodes_big_endian_value() {
+        let data = [0x00, 0x00, 0x05, 0x39]; // 1337
+        let mut r = Reader::new(&data);
+        assert_eq!(r.u32("value").unwrap(), 1337);
+    }
+
+    #[test]
+    fn u64_boundary_is_inclusive_of_the_final_byte() {
+        // pos == 0, buffer exactly 8 bytes: must succeed.
+        let data = [0, 0, 0, 0, 0, 0, 0, 0x7B]; // 123
+        let mut r = Reader::new(&data);
+        assert_eq!(r.u64("exact fit").expect("8 bytes available"), 123);
+
+        // pos == 0, buffer one byte short of 8: must fail cleanly, not
+        // panic on the internal self.data[self.pos + 7] index.
+        let data = [0u8; 7];
+        let mut r = Reader::new(&data);
+        assert!(matches!(
+            r.u64("one byte short"),
+            Err(Error::UnexpectedEof { .. })
+        ));
+    }
+
+    #[test]
+    fn u64_decodes_big_endian_value() {
+        let data = [0, 0, 0, 0, 0, 0, 0x05, 0x39]; // 1337
+        let mut r = Reader::new(&data);
+        assert_eq!(r.u64("value").unwrap(), 1337);
+    }
+
+    // -----------------------------------------------------------------
+    // decode_modified_utf8: 3-byte (BMP) decode path
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn modified_utf8_three_byte_cjk() {
+        // U+3042 (hiragana あ) in modified UTF-8: 1110xxxx 10xxxxxx 10xxxxxx
+        // = 0xE3 0x81 0x82.
+        let s = decode_modified_utf8(&[0xE3, 0x81, 0x82]).unwrap();
+        assert_eq!(s, "\u{3042}");
+    }
+
+    #[test]
+    fn modified_utf8_three_byte_rejects_bad_first_continuation() {
+        // Valid lead byte (0xE3), but the first continuation byte is not
+        // 10xxxxxx (0x01 instead) — must be rejected, proving the first
+        // `& 0xC0 != 0x80` check is live.
+        assert!(decode_modified_utf8(&[0xE3, 0x01, 0x82]).is_err());
+    }
+
+    #[test]
+    fn modified_utf8_three_byte_rejects_bad_second_continuation() {
+        // Valid lead + first continuation, but the second continuation
+        // byte is not 10xxxxxx — proves the second check is independently
+        // live (not short-circuited by the first).
+        assert!(decode_modified_utf8(&[0xE3, 0x81, 0x01]).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // read_constant_pool: Long/Double two-slot skip, real byte parsing
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn constant_pool_long_entry_occupies_two_slots_via_real_parse() {
+        // Real class-file bytes (not the `from_entries` synthetic ctor):
+        // magic + minor/major + cp_count=4 + tag=5 (Long, 8-byte payload
+        // at index 1, reserved slot at index 2) + tag=1 (Utf8 at index 3)
+        // + empty access_flags/this/super/interfaces/fields/methods/attrs.
+        let mut buf = vec![
+            0xCA, 0xFE, 0xBA, 0xBE, // magic
+            0x00, 0x00, // minor
+            0x00, 0x34, // major
+            0x00, 0x04, // cp_count = 4 (0=Empty,1=Long,2=Empty tail,3=Utf8)
+            5,    // Long tag
+        ];
+        buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes()); // 8-byte payload
+        buf.push(1); // Utf8 tag
+        let name = b"marker";
+        buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        buf.extend_from_slice(name);
+        // access_flags, this_class, super_class, interfaces_count
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        // fields_count, methods_count, attributes_count
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+
+        let cf = ClassFile::parse(&buf).expect("well-formed synthetic class file");
+        assert_eq!(cf.constant_pool.len(), 4);
+        // The Long occupies indices 1 AND 2 (its reserved tail slot).
+        // The Utf8 must resolve at index 3 = long_index(1) + 2, NOT +1.
+        assert_eq!(cf.constant_pool.utf8(3), Some("marker"));
+        // Index 2 is the reserved tail slot: not a Utf8, must not
+        // resolve as one (guards against the Utf8 landing one slot early).
+        assert_eq!(cf.constant_pool.utf8(2), None);
+        match cf.constant_pool.get(1) {
+            Some(CpInfo::Long(v)) => assert_eq!(*v, 0x1122_3344_5566_7788u64 as i64),
+            other => panic!("expected Long at index 1, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // instruction_size: tableswitch/lookupswitch with non-degenerate
+    // low/high/npairs (the existing tests only cover low==high==0 and
+    // npairs==0, which can't distinguish `-` from `+` in the entry-count
+    // arithmetic).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn instruction_size_tableswitch_non_degenerate_range() {
+        // low=1, high=4 -> 4 entries (high-low+1 = 4). A `-`->`+` mutation
+        // on that arithmetic would instead compute high+low+1 = 6.
+        let mut code = vec![TABLESWITCH];
+        code.extend_from_slice(&[0, 0, 0]); // padding
+        code.extend_from_slice(&[0, 0, 0, 0]); // default offset
+        code.extend_from_slice(&1i32.to_be_bytes()); // low = 1
+        code.extend_from_slice(&4i32.to_be_bytes()); // high = 4
+        code.extend_from_slice(&[0; 16]); // 4 jump entries * 4 bytes
+        // total = 1 (opcode) + 3 (pad) + 12 (default/low/high) + 16 (entries) = 32
+        assert_eq!(instruction_size(&code, 0), Some(32));
+    }
+
+    #[test]
+    fn instruction_size_lookupswitch_non_degenerate_npairs() {
+        // npairs = 3 -> 3 * 8 = 24 bytes of pairs.
+        let mut code = vec![LOOKUPSWITCH];
+        code.extend_from_slice(&[0, 0, 0]); // padding
+        code.extend_from_slice(&[0, 0, 0, 0]); // default
+        code.extend_from_slice(&3i32.to_be_bytes()); // npairs = 3
+        code.extend_from_slice(&[0; 24]); // 3 pairs
+        // total = 1 + 3 + 8 (default/npairs) + 24 = 36
+        assert_eq!(instruction_size(&code, 0), Some(36));
+    }
 }
