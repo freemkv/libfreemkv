@@ -1098,6 +1098,54 @@ mod tests {
         }
     }
 
+    /// `parse_stss` had no direct positive-path test anywhere in this file —
+    /// only its short-buffer safety was pinned. Two real, distinct entries in
+    /// a buffer sized to exactly fit them (`b.len() == 16`, so the second
+    /// entry's `o + 4 == b.len()` exactly) separates every arithmetic mutant
+    /// at once: an `o = 8 + i*4` → `8 - i*4` slip reads the `count` field
+    /// instead of the second entry; an `i*4` → `i/4` slip re-reads the FIRST
+    /// entry for the second (integer division collapses `i=1` back to the
+    /// same offset as `i=0`); and an `o + 4 > b.len()` → `o + 4 < b.len()`
+    /// slip breaks out on the very first entry, because there IS more room
+    /// after it (`12 < 16`) — leaving the set empty instead of holding both.
+    #[test]
+    fn parse_stss_reads_two_distinct_entries_from_their_own_offsets() {
+        let mut b = vec![0u8, 0, 0, 0]; // version+flags
+        b.extend_from_slice(&2u32.to_be_bytes()); // entry_count = 2
+        b.extend_from_slice(&100u32.to_be_bytes());
+        b.extend_from_slice(&200u32.to_be_bytes());
+        assert_eq!(b.len(), 16, "sized to fit exactly 2 entries, no slack");
+        let set = parse_stss(&b);
+        assert_eq!(
+            set,
+            [100u32, 200u32].into_iter().collect(),
+            "both distinct sync sample numbers must be present"
+        );
+    }
+
+    /// A declared `count` larger than the box can hold (a lie, or a truncated
+    /// box) must be bounded by the per-entry guard, not by trusting the
+    /// count — the SAME contract `parse_stco`/`parse_stsc`/`parse_stts` pin
+    /// with their own "count lie" tests. Bounded HERE means the loop must
+    /// stop, not read past the end: an `o + 4 > b.len()` → `o - 4 > b.len()`
+    /// mutant almost never fires (`o - 4` stays small for every realistic
+    /// `o`), so it lets the loop walk straight past a truncated box into an
+    /// out-of-bounds `be32` read.
+    #[test]
+    fn parse_stss_count_lie_is_bounded_by_the_box_not_trusted() {
+        let mut b = vec![0u8, 0, 0, 0];
+        b.extend_from_slice(&3u32.to_be_bytes()); // declares 3, lying
+        b.extend_from_slice(&100u32.to_be_bytes()); // only 2 real entries
+        b.extend_from_slice(&200u32.to_be_bytes());
+        assert_eq!(b.len(), 16, "room for exactly 2 real entries, not 3");
+        let set = parse_stss(&b);
+        assert_eq!(
+            set,
+            [100u32, 200u32].into_iter().collect(),
+            "only the entries the box actually holds, no panic on the lie"
+        );
+    }
+
     #[test]
     fn stsc_offsets_one_sample_per_chunk() {
         // Our writer's layout: 1 sample/chunk, co64 lists every offset.
