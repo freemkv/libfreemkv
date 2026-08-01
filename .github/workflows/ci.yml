@@ -132,3 +132,66 @@ jobs:
       # extra build is the value; running tests is covered by the Linux job.
       - run: cargo build --tests
         working-directory: libfreemkv
+
+  # ── Did this change break anything downstream? ──────────────────────────────
+  #
+  # Every job above proves libfreemkv builds. None proved its DEPENDENTS do,
+  # and that gap is real: an engine signature change broke autorip today and
+  # went unnoticed because consumer CI only fires on a push to that consumer.
+  # libfreemkv sits below all five of them, so a break here is worth strictly
+  # more than a break anywhere else in the project.
+  #
+  # `cargo check --all-targets` only — each dependent owns its own behaviour
+  # and has its own suite. The question here is just "does everything built on
+  # me still compile against this commit".
+  consumers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with: { path: libfreemkv }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/freemkv-unlock, ref: dev, path: freemkv-unlock }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/freemkv-keysources, ref: dev, path: freemkv-keysources }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/freemkv-engine, ref: dev, path: freemkv-engine }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/freemkv-i18n, ref: dev, path: freemkv-i18n }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/freemkv, ref: dev, path: freemkv }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/autorip, ref: dev, path: autorip }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/bdemu, ref: dev, path: bdemu }
+      - name: Point every dependent at THIS libfreemkv commit
+        shell: bash
+        run: |
+          for c in freemkv-keysources freemkv-engine freemkv autorip bdemu; do
+            mkdir -p "$c/.cargo"
+            cat > "$c/.cargo/config.toml" <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          freemkv-engine = { path = "../freemkv-engine" }
+          freemkv-i18n = { path = "../freemkv-i18n" }
+          EOF
+          done
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            freemkv-keysources
+            freemkv-engine
+            freemkv
+            autorip
+            bdemu
+      - run: cargo check --all-targets
+        working-directory: freemkv-keysources
+      - run: cargo check --all-targets
+        working-directory: freemkv-engine
+      - run: cargo check --all-targets
+        working-directory: freemkv
+      - run: cargo check --all-targets
+        working-directory: autorip
+      - run: cargo check --all-targets
+        working-directory: bdemu
