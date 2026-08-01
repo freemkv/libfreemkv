@@ -1871,6 +1871,82 @@ mod tests {
             s.mvc.is_none(),
             "no merge when there is no distinct base view"
         );
+        // And with no merge to fold it into, the dependent is muxed as an
+        // ORDINARY track — it must not be skipped as though a base existed to
+        // carry it, which would leave the title with no video track at all.
+        assert_eq!(
+            pending_tracks(&s).len(),
+            1,
+            "the lone dependent view still gets its own track"
+        );
+    }
+
+    /// The Blu-ray 3D case the merge exists for: a base (left-eye) video and a
+    /// dependent (right-eye) video. The dependent must NOT become a track of its
+    /// own — it is folded into the base as per-frame BlockAdditional — and the
+    /// merge state must be wired to the right stream and track indices.
+    ///
+    /// With the merge silently disabled, the muxer emits the two views as two
+    /// unrelated H.264 tracks: a file that opens, plays, and is not 3D.
+    #[test]
+    fn a_base_and_dependent_video_pair_builds_the_mvc_merge_and_skips_the_dependent_track() {
+        use crate::disc::{
+            AudioStream, ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream,
+            VideoStream,
+        };
+        let view = |mvc_dependent: bool| {
+            Stream::Video(VideoStream {
+                pid: if mvc_dependent { 0x1012 } else { 0x1011 },
+                codec: Codec::H264,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F24,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: mvc_dependent,
+                label: if mvc_dependent {
+                    crate::disc::MVC_DEPENDENT_LABEL.to_string()
+                } else {
+                    String::new()
+                },
+                measured_cicp: None,
+            })
+        };
+        let title = DiscTitle {
+            streams: vec![
+                view(false), // 0: base (left eye)
+                view(true),  // 1: dependent (right eye)
+                Stream::Audio(AudioStream {
+                    pid: 0x1100,
+                    codec: Codec::Ac3,
+                    channels: crate::disc::AudioChannels::Stereo,
+                    language: "eng".into(),
+                    sample_rate: crate::disc::SampleRate::S48,
+                    secondary: false,
+                    purpose: crate::disc::LabelPurpose::Normal,
+                    label: String::new(),
+                }), // 2: audio
+            ],
+            ..DiscTitle::empty()
+        };
+        let s = MkvStream::create(Box::new(Cursor::new(Vec::new())), &title, None).unwrap();
+        let mvc = s
+            .mvc
+            .as_ref()
+            .expect("a base + dependent pair must build the MVC merge");
+        assert_eq!(mvc.base_stream_idx, 0);
+        assert_eq!(mvc.dep_stream_idx, 1);
+        assert_eq!(mvc.base_track_idx, 0);
+        assert_eq!(
+            mvc.stream_to_track,
+            vec![Some(0), None, Some(1)],
+            "the dependent maps to no track; the audio shifts down into its slot"
+        );
+        assert_eq!(
+            pending_tracks(&s).len(),
+            2,
+            "two tracks (base video + audio), not three — the dependent is folded in"
+        );
     }
 
     #[test]
@@ -2522,6 +2598,39 @@ mod tests {
         let bytes = mkv_with_track_and_cluster(65536, 1, &[]);
         let e = open_err(MkvStream::open(Cursor::new(bytes)));
         assert!(is_mkv_source_invalid(&e));
+        // 65537 is the case the guard really exists for: it truncates onto the
+        // PERFECTLY VALID TrackNumber 1, so an over-width number that is merely
+        // "not 65536" would be accepted and its blocks would be routed to another
+        // track's stream. Reject the whole class, not one value.
+        let bytes = mkv_with_track_and_cluster(65537, 1, &[]);
+        let e = open_err(MkvStream::open(Cursor::new(bytes)));
+        assert!(is_mkv_source_invalid(&e));
+        // 65535 fits u16 exactly. It is still rejected — but by the PID guard,
+        // not the width guard, because 0x1100 + 65533 is far outside the 13-bit
+        // TS PID space. Pinning WHICH boundary each guard owns keeps a
+        // widened-by-one width check from silently becoming the load-bearing one.
+        assert!(ts_pid_for_track(65535).is_err());
+        assert_eq!(
+            TrackTable {
+                nums: vec![65535],
+                default_durations: vec![None],
+            }
+            .index_of(65535),
+            Some(0),
+            "65535 is a representable TrackNumber, not an over-width one"
+        );
+        assert_eq!(
+            TrackTable::contiguous(1).index_of(65536),
+            None,
+            "a TrackNumber past u16 resolves to no stream rather than aliasing onto one"
+        );
+        assert_eq!(
+            TrackTable::contiguous(1).index_of(65537),
+            None,
+            "65537 truncates onto TrackNumber 1 — it must be rejected before the cast, \
+             or a block for a track this file does not declare is routed to track 1"
+        );
+        assert_eq!(TrackTable::contiguous(1).index_of(0), None);
     }
 
     #[test]
@@ -2831,6 +2940,32 @@ mod tests {
         let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
         let e = stream.read().unwrap_err();
         assert!(is_mkv_source_invalid(&e));
+
+        // `i64::MAX` itself is the last representable value and must be ACCEPTED
+        // — the guard is against a u64 that would go NEGATIVE on the cast, not
+        // against a large timestamp. Rejecting it too turns the boundary into an
+        // off-by-one that drops a legal cluster.
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        ebml::write_id(&mut cluster, ebml::CLUSTER_TIMESTAMP).unwrap();
+        ebml::write_size(&mut cluster, 8).unwrap();
+        cluster.extend_from_slice(&(i64::MAX as u64).to_be_bytes());
+        let block = [0x81u8, 0x00, 0x00, 0x80, 0xAB];
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, block.len() as u64).unwrap();
+        cluster.extend_from_slice(&block);
+        let bytes = mkv_with_track_and_cluster(1, 1, &cluster);
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let f = stream
+            .read()
+            .expect("a cluster timestamp of exactly i64::MAX is in range")
+            .expect("one frame");
+        assert_eq!(
+            f.pts,
+            i64::MAX,
+            "the tick→ns multiply saturates, never wraps"
+        );
     }
 
     // ============================================================
@@ -3637,6 +3772,877 @@ mod tests {
     /// Pinned as an implication rather than a bare constant: readiness is
     /// asserted TOGETHER with the codec private actually being retrievable, on
     /// a freshly opened stream that has read no frame yet.
+    /// The untrusted-size caps ARE the OOM guard: every EBML element size is
+    /// checked against one before it is used to allocate. Only their existence
+    /// was pinned, never their magnitude — so a cap that collapsed to a few
+    /// kilobytes would still look guarded while rejecting ordinary discs, and one
+    /// that ballooned would allocate whatever a hostile container asks for. Both
+    /// ends need a number.
+    #[test]
+    fn the_untrusted_size_caps_admit_real_discs_and_reject_hostile_ones() {
+        // A UHD HEVC keyframe runs to a few MB — that has to get through.
+        assert_eq!(
+            checked_size(2 * 1024 * 1024, MAX_BLOCK_SIZE).unwrap(),
+            2 * 1024 * 1024
+        );
+        assert!(checked_size(65 * 1024 * 1024, MAX_BLOCK_SIZE).is_err());
+        // hvcC/avcC/setup blobs are a few KB, but the cap must leave real
+        // headroom above them.
+        assert!(checked_size(2 * 1024 * 1024, MAX_CODEC_PRIVATE).is_ok());
+        assert!(checked_size(17 * 1024 * 1024, MAX_CODEC_PRIVATE).is_err());
+        // A 4 KB Title / TrackName is unremarkable; 64 KB is the ceiling.
+        assert!(checked_size(4096, MAX_STRING_LEN).is_ok());
+        assert!(checked_size(65 * 1024, MAX_STRING_LEN).is_err());
+        // An EBML unsigned int is at most 8 octets wide (RFC 8794).
+        assert!(checked_size(8, MAX_UINT_LEN).is_ok());
+        assert!(checked_size(9, MAX_UINT_LEN).is_err());
+    }
+
+    /// Build a header whose Tracks carries one TrackEntry per
+    /// `(TrackNumber, TrackType, CodecID)` triple.
+    fn mkv_with_codec_ids(entries: &[(u64, u64, &str)]) -> Vec<u8> {
+        let mut tracks = Vec::new();
+        for (tnum, ttype, codec_id) in entries {
+            let mut entry = Vec::new();
+            ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, *tnum).unwrap();
+            ebml::write_uint(&mut entry, ebml::TRACK_TYPE, *ttype).unwrap();
+            ebml::write_string(&mut entry, ebml::CODEC_ID, codec_id).unwrap();
+            ebml::write_id(&mut tracks, ebml::TRACK_ENTRY).unwrap();
+            ebml::write_size(&mut tracks, entry.len() as u64).unwrap();
+            tracks.extend_from_slice(&entry);
+        }
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, tracks.len() as u64).unwrap();
+        out.extend_from_slice(&tracks);
+        out
+    }
+
+    fn stream_codec(s: &crate::disc::Stream) -> Codec {
+        match s {
+            crate::disc::Stream::Video(v) => v.codec,
+            crate::disc::Stream::Audio(a) => a.codec,
+            crate::disc::Stream::Subtitle(s) => s.codec,
+        }
+    }
+
+    /// The CodecID string is the only thing in a Matroska TrackEntry that says
+    /// which parser the elementary stream belongs to. One HEVC track was pinned;
+    /// the other ten branches of the ladder were not, so any of them could have
+    /// been mis-wired (or dropped to `Unknown`) and every re-mux of that codec
+    /// would have gone out with the wrong parser and no error raised.
+    #[test]
+    fn every_matroska_codec_id_decodes_to_its_codec_on_read_back() {
+        let cases: &[(u64, &str, Codec)] = &[
+            (1, ebml::CODEC_HEVC, Codec::Hevc),
+            (1, ebml::CODEC_H264, Codec::H264),
+            (1, ebml::CODEC_VC1, Codec::Vc1),
+            (1, ebml::CODEC_MPEG2, Codec::Mpeg2),
+            (2, ebml::CODEC_AC3, Codec::Ac3),
+            (2, ebml::CODEC_EAC3, Codec::Ac3Plus),
+            (2, ebml::CODEC_TRUEHD, Codec::TrueHd),
+            (2, ebml::CODEC_DTS, Codec::Dts),
+            (2, ebml::CODEC_PCM_BE, Codec::Lpcm),
+            (17, ebml::CODEC_PGS, Codec::Pgs),
+            (17, ebml::CODEC_VOBSUB, Codec::DvdSub),
+            // An ID this crate does not carry stays Unknown — never silently
+            // aliased onto a neighbouring codec.
+            (2, "A_VORBIS", Codec::Unknown(0)),
+        ];
+        let entries: Vec<(u64, u64, &str)> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (ttype, codec_id, _))| (i as u64 + 1, *ttype, *codec_id))
+            .collect();
+        let stream = MkvStream::open(Cursor::new(mkv_with_codec_ids(&entries))).unwrap();
+        let streams = &stream.info().streams;
+        assert_eq!(streams.len(), cases.len(), "every TrackEntry kept a stream");
+        for (i, (_, codec_id, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                stream_codec(&streams[i]),
+                *expected,
+                "CodecID {codec_id} must decode to {expected:?}"
+            );
+        }
+    }
+
+    /// A TrackType this crate cannot carry (18 = buttons) is DROPPED, and the
+    /// three it can carry each build the matching stream kind. TrackType 17
+    /// (subtitle) had no coverage at all: losing that arm drops every subtitle
+    /// track from a re-mux, silently.
+    #[test]
+    fn track_types_map_to_stream_kinds_and_unsupported_ones_are_dropped() {
+        let bytes = mkv_with_codec_ids(&[
+            (1, 1, ebml::CODEC_H264),
+            (2, 2, ebml::CODEC_AC3),
+            (3, 17, ebml::CODEC_PGS),
+            (4, 18, "B_BUTTONS"),
+        ]);
+        let stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let streams = &stream.info().streams;
+        assert_eq!(streams.len(), 3, "the buttons track carries no stream");
+        assert!(matches!(streams[0], crate::disc::Stream::Video(_)));
+        assert!(matches!(streams[1], crate::disc::Stream::Audio(_)));
+        assert!(
+            matches!(streams[2], crate::disc::Stream::Subtitle(_)),
+            "TrackType 17 must produce a SubtitleStream, not vanish"
+        );
+    }
+
+    fn three_track_title() -> crate::disc::DiscTitle {
+        use crate::disc::{
+            AudioStream, ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream,
+            SubtitleStream, VideoStream,
+        };
+        DiscTitle {
+            streams: vec![
+                Stream::Video(VideoStream {
+                    pid: 0x1011,
+                    codec: Codec::H264,
+                    resolution: Resolution::R720p,
+                    frame_rate: FrameRate::F24,
+                    hdr: HdrFormat::Sdr,
+                    color_space: ColorSpace::Bt709,
+                    display_aspect: None,
+                    secondary: false,
+                    label: "Feature".into(),
+                    measured_cicp: None,
+                }),
+                Stream::Audio(AudioStream {
+                    pid: 0x1100,
+                    codec: Codec::Ac3,
+                    channels: crate::disc::AudioChannels::Surround51,
+                    language: "eng".into(),
+                    sample_rate: crate::disc::SampleRate::S48,
+                    secondary: false,
+                    purpose: crate::disc::LabelPurpose::Normal,
+                    label: "English (Dolby Digital 5.1)".into(),
+                }),
+                Stream::Subtitle(SubtitleStream {
+                    pid: 0x1200,
+                    codec: Codec::DvdSub,
+                    language: "fra".into(),
+                    forced: true,
+                    qualifier: crate::disc::LabelQualifier::None,
+                    codec_data: None,
+                }),
+            ],
+            ..DiscTitle::empty()
+        }
+    }
+
+    /// Write a real three-track title through this crate's own muxer, then read
+    /// it back through this crate's own reader and check the TrackEntry metadata
+    /// survived. Language, track name, the forced flag, pixel height and channel
+    /// count each had a dedicated arm in `parse_track` and NONE of them was
+    /// asserted — every one could have been deleted and the suite stayed green
+    /// while a re-mux quietly lost the audio language, the subtitle forced flag,
+    /// the track labels, the resolution and the channel layout.
+    #[test]
+    fn track_entry_metadata_survives_a_write_read_round_trip() {
+        let out = SharedOut::new();
+        let title = three_track_title();
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        s.write(&crate::pes::PesFrame {
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xA1; 32],
+            duration_ns: None,
+        })
+        .unwrap();
+        s.finish().unwrap();
+
+        let back = MkvStream::open(Cursor::new(out.bytes())).unwrap();
+        let streams = &back.info().streams;
+        assert_eq!(streams.len(), 3, "all three tracks come back");
+
+        match &streams[0] {
+            crate::disc::Stream::Video(v) => {
+                assert_eq!(v.codec, Codec::H264);
+                // PixelHeight is the only dimension the reader reconstructs from.
+                // Without the Video arm it would read 0 and report R480p.
+                assert_eq!(
+                    v.resolution,
+                    crate::disc::Resolution::R720p,
+                    "the resolution must come from the written PixelHeight (720)"
+                );
+                assert_eq!(v.label, "Feature", "TrackName survives as the label");
+            }
+            other => panic!("expected a video stream, got {other:?}"),
+        }
+        match &streams[1] {
+            crate::disc::Stream::Audio(a) => {
+                assert_eq!(a.codec, Codec::Ac3);
+                assert_eq!(a.language, "eng", "the audio Language must survive");
+                assert_eq!(
+                    a.channels,
+                    crate::disc::AudioChannels::Surround51,
+                    "the Channels element must survive (5.1, not the Matroska default of 1)"
+                );
+                assert_eq!(a.sample_rate, crate::disc::SampleRate::S48);
+                assert_eq!(a.label, "English (Dolby Digital 5.1)");
+            }
+            other => panic!("expected an audio stream, got {other:?}"),
+        }
+        match &streams[2] {
+            crate::disc::Stream::Subtitle(sub) => {
+                assert_eq!(sub.codec, Codec::DvdSub);
+                assert_eq!(sub.language, "fra", "the subtitle Language must survive");
+                assert!(
+                    sub.forced,
+                    "FlagForced must survive — a forced-narrative subtitle that \
+                     round-trips as optional stops being shown at all"
+                );
+            }
+            other => panic!("expected a subtitle stream, got {other:?}"),
+        }
+        // A non-forced subtitle must come back non-forced (the flag is read, not
+        // assumed): rebuild with forced = false and check the other direction.
+        let mut relaxed = three_track_title();
+        if let crate::disc::Stream::Subtitle(sub) = &mut relaxed.streams[2] {
+            sub.forced = false;
+        }
+        let out2 = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out2.clone()), &relaxed, None).unwrap();
+        s.write(&crate::pes::PesFrame {
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xA1; 32],
+            duration_ns: None,
+        })
+        .unwrap();
+        s.finish().unwrap();
+        let back = MkvStream::open(Cursor::new(out2.bytes())).unwrap();
+        match &back.info().streams[2] {
+            crate::disc::Stream::Subtitle(sub) => assert!(!sub.forced),
+            other => panic!("expected a subtitle stream, got {other:?}"),
+        }
+    }
+
+    /// Reach into a still-pending write stream's track list.
+    fn pending_tracks(s: &MkvStream) -> &[MkvTrack] {
+        match &s.mode {
+            Mode::Write(WriteMode::Pending(p)) => &p.tracks,
+            _ => panic!("expected a pending write stream"),
+        }
+    }
+
+    /// FlagDefault says "play this track unless the viewer picks another". Only
+    /// ONE video and ONE audio track may carry it; `MkvTrack::video`/`audio` set
+    /// it from `!secondary` alone, so a disc with two ordinary video angles or
+    /// two ordinary audio tracks arrives here with the flag on all of them and
+    /// this de-duplication is the only thing that fixes it. It lives here and
+    /// nowhere else — the muxer just writes what it is handed — and it had no
+    /// test at all.
+    #[test]
+    fn only_the_first_video_and_first_audio_track_are_default() {
+        use crate::disc::{
+            AudioStream, ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream,
+            VideoStream,
+        };
+        let video = |label: &str| {
+            Stream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::H264,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F24,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: false,
+                label: label.into(),
+                measured_cicp: None,
+            })
+        };
+        let audio = |label: &str| {
+            Stream::Audio(AudioStream {
+                pid: 0x1100,
+                codec: Codec::Ac3,
+                channels: crate::disc::AudioChannels::Stereo,
+                language: "eng".into(),
+                sample_rate: crate::disc::SampleRate::S48,
+                secondary: false,
+                purpose: crate::disc::LabelPurpose::Normal,
+                label: label.into(),
+            })
+        };
+        let title = DiscTitle {
+            streams: vec![
+                video("Angle 1"),
+                video("Angle 2"),
+                audio("English"),
+                audio("French"),
+            ],
+            ..DiscTitle::empty()
+        };
+        let s = MkvStream::create(Box::new(SharedOut::new()), &title, None).unwrap();
+        let flags: Vec<bool> = pending_tracks(&s).iter().map(|t| t.is_default).collect();
+        assert_eq!(
+            flags,
+            vec![true, false, true, false],
+            "exactly the first video and the first audio are default"
+        );
+    }
+
+    /// The deferred-activation machinery waits for the PRIMARY VIDEO track's
+    /// first frame so the header can carry a measured FieldOrder. "Primary video"
+    /// means the first track whose type is video — not the first track. On a
+    /// title whose audio comes first (an M2TS whose PMT lists audio ahead of
+    /// video, routine on Blu-ray), picking track 0 instead means the header is
+    /// built from an audio frame and the measured field order never lands.
+    #[test]
+    fn the_activation_trigger_is_the_first_video_track_not_the_first_track() {
+        use crate::disc::{
+            AudioStream, ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream,
+            VideoStream,
+        };
+        let title = DiscTitle {
+            streams: vec![
+                Stream::Audio(AudioStream {
+                    pid: 0x1100,
+                    codec: Codec::Ac3,
+                    channels: crate::disc::AudioChannels::Stereo,
+                    language: "eng".into(),
+                    sample_rate: crate::disc::SampleRate::S48,
+                    secondary: false,
+                    purpose: crate::disc::LabelPurpose::Normal,
+                    label: String::new(),
+                }),
+                Stream::Video(VideoStream {
+                    pid: 0x1011,
+                    codec: Codec::Mpeg2,
+                    resolution: Resolution::R576i,
+                    frame_rate: FrameRate::F25,
+                    hdr: HdrFormat::Sdr,
+                    color_space: ColorSpace::Bt470bg,
+                    display_aspect: None,
+                    secondary: false,
+                    label: String::new(),
+                    measured_cicp: None,
+                }),
+            ],
+            ..DiscTitle::empty()
+        };
+        let s = MkvStream::create(Box::new(SharedOut::new()), &title, None).unwrap();
+        match &s.mode {
+            Mode::Write(WriteMode::Pending(p)) => assert_eq!(
+                p.video_track,
+                Some(1),
+                "the video track is index 1, not index 0"
+            ),
+            _ => panic!("expected a pending write stream"),
+        }
+    }
+
+    /// Locate the first TrackEntry's `FieldOrder` (0x9D) inside the Video master
+    /// of a muxed file, or `None` when the element was omitted.
+    fn muxed_field_order(data: &[u8]) -> Option<u8> {
+        // FieldOrder is a 1-byte uint child of Video: ID 0x9D, size 0x81, value.
+        data.windows(3)
+            .find(|w| w[0] == 0x9D && w[1] == 0x81)
+            .map(|w| w[2])
+    }
+
+    /// THE deferred-activation contract, end to end: the field order MEASURED
+    /// from the first coded picture has to reach the FILE.
+    ///
+    /// `apply_coding_to_track` was tested in isolation, which proves nothing
+    /// about whether the caller ever reaches it with a real measurement — and
+    /// the route there runs through the pending-buffer cap, the
+    /// "is this the video frame" test and the activation trigger, none of which
+    /// were observed from the outside. Any of them mis-set and the file ships
+    /// FieldOrder omitted: an interlaced DVD that players then deinterlace with
+    /// the fields in the wrong order (visible combing on motion).
+    #[test]
+    fn the_measured_field_order_reaches_the_written_file() {
+        use crate::disc::{
+            AudioStream, ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream,
+            VideoStream,
+        };
+        use crate::mux::codec::coding::{CodingType, Mpeg2Coding, PictureInfo};
+        let title = DiscTitle {
+            streams: vec![
+                Stream::Audio(AudioStream {
+                    pid: 0x1100,
+                    codec: Codec::Ac3,
+                    channels: crate::disc::AudioChannels::Stereo,
+                    language: "eng".into(),
+                    sample_rate: crate::disc::SampleRate::S48,
+                    secondary: false,
+                    purpose: crate::disc::LabelPurpose::Normal,
+                    label: String::new(),
+                }),
+                Stream::Video(VideoStream {
+                    pid: 0x1011,
+                    codec: Codec::Mpeg2,
+                    resolution: Resolution::R576i, // interlaced → FieldOrder matters
+                    frame_rate: FrameRate::F25,
+                    hdr: HdrFormat::Sdr,
+                    color_space: ColorSpace::Bt470bg,
+                    display_aspect: None,
+                    secondary: false,
+                    label: String::new(),
+                    measured_cicp: None,
+                }),
+            ],
+            ..DiscTitle::empty()
+        };
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        // Audio arrives first and carries NO coding — it must be buffered, not
+        // used to build the header.
+        s.write(&crate::pes::PesFrame {
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xAA; 16],
+            duration_ns: None,
+        })
+        .unwrap();
+        // The first coded picture on the VIDEO track measures top-field-first.
+        s.write(&crate::pes::PesFrame {
+            coding: Some(PictureInfo::mpeg2(
+                CodingType::I,
+                Mpeg2Coding {
+                    top_field_first: true,
+                    repeat_first_field: false,
+                    progressive_frame: false,
+                    progressive_sequence: false,
+                    frame_picture: true,
+                },
+            )),
+            source: None,
+            track: 1,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xBB; 16],
+            duration_ns: None,
+        })
+        .unwrap();
+        s.finish().unwrap();
+
+        assert_eq!(
+            muxed_field_order(&out.bytes()),
+            Some(ebml::FIELD_ORDER_TFF),
+            "the MEASURED top-field-first must be written to the file; an omitted \
+             or UNDETERMINED FieldOrder means the measurement never got there"
+        );
+    }
+
+    /// The dependent (right-eye) view is matched to its base frame BY PTS. Any
+    /// other pairing rule attaches the wrong eye to the wrong frame — a 3D title
+    /// that plays with the views swapped on part of the runtime, which no
+    /// structural check on the output can catch.
+    #[test]
+    fn a_dependent_view_pairs_only_with_the_base_frame_of_the_same_pts() {
+        let mut m = empty_merge();
+        let dep = lp(&[&SUBSET_SPS, &DEP_PPS, &DEP_SLICE]);
+        // Two base frames buffered, oldest first.
+        assert!(m.ingest(&mvc_frame(0, 100, true, vec![0x11])).is_empty());
+        assert!(m.ingest(&mvc_frame(0, 200, false, vec![0x22])).is_empty());
+        // A dependent for the SECOND one arrives. It must attach to the pts=200
+        // base — not to the oldest unpaired base it happens to find first.
+        let e = m.ingest(&mvc_frame(2, 200, false, dep.clone()));
+        assert!(
+            e.is_empty(),
+            "the pts=100 base is still unpaired, so nothing drains yet"
+        );
+        assert_eq!(
+            m.pending_base[0].additional, None,
+            "the pts=100 base must NOT have taken the pts=200 dependent"
+        );
+        assert_eq!(
+            m.pending_base[1].additional.as_deref(),
+            Some(dep.as_slice()),
+            "the dependent belongs to the base with the matching PTS"
+        );
+    }
+
+    /// TimestampScale is an untrusted u64 that every frame PTS is multiplied by.
+    /// A value above `i64::MAX` casts to a negative scale and turns the whole
+    /// timeline inside out, so it is clamped back to the 1 ms default — the same
+    /// treatment a declared zero gets. Only the zero half was covered.
+    #[test]
+    fn a_timestamp_scale_above_i64_max_falls_back_to_one_millisecond() {
+        let build = |scale: u64| {
+            let mut info = Vec::new();
+            ebml::write_uint(&mut info, ebml::TIMESTAMP_SCALE, scale).unwrap();
+            let mut out = Vec::new();
+            ebml::write_id(&mut out, ebml::EBML).unwrap();
+            ebml::write_size(&mut out, 0).unwrap();
+            ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+            ebml::write_unknown_size(&mut out).unwrap();
+            ebml::write_id(&mut out, ebml::INFO).unwrap();
+            ebml::write_size(&mut out, info.len() as u64).unwrap();
+            out.extend_from_slice(&info);
+            // One track and a block at cluster tick 5 so the scale is observable
+            // in the frame PTS.
+            let block = [0x81u8, 0x00, 0x00, 0x80, 0xAB];
+            let cluster = cluster_with_simple_block(5, &block);
+            let mut tracks = Vec::new();
+            let mut entry = Vec::new();
+            ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
+            ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 1).unwrap();
+            ebml::write_id(&mut tracks, ebml::TRACK_ENTRY).unwrap();
+            ebml::write_size(&mut tracks, entry.len() as u64).unwrap();
+            tracks.extend_from_slice(&entry);
+            ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+            ebml::write_size(&mut out, tracks.len() as u64).unwrap();
+            out.extend_from_slice(&tracks);
+            out.extend_from_slice(&cluster);
+            out
+        };
+        // A scale that does not fit in i64 is nonsense; fall back to 1 ms so the
+        // block at tick 5 lands at 5 ms, never at a huge negative PTS.
+        let mut s = MkvStream::open(Cursor::new(build(u64::MAX))).unwrap();
+        let f = s.read().unwrap().expect("one frame");
+        assert_eq!(f.pts, 5 * 1_000_000, "clamped to the 1 ms default scale");
+        // `i64::MAX` is the last value that still fits a positive i64, so it is
+        // taken as the scale rather than clamped, and the tick→ns multiply
+        // saturates instead of overflowing. Absurd, but bounded and defined — the
+        // clamp is against values that would go NEGATIVE, not against large ones.
+        let mut s = MkvStream::open(Cursor::new(build(i64::MAX as u64))).unwrap();
+        let f = s.read().unwrap().expect("one frame");
+        assert_eq!(
+            f.pts,
+            i64::MAX,
+            "the tick→ns multiply saturates, never wraps"
+        );
+        // A legal scale is honoured verbatim.
+        let mut s = MkvStream::open(Cursor::new(build(100_000))).unwrap();
+        let f = s.read().unwrap().expect("one frame");
+        assert_eq!(f.pts, 5 * 100_000, "a legal 0.1 ms scale is honoured");
+    }
+
+    /// An EBML lace of exactly TWO frames stores exactly ONE size (the first);
+    /// the second is the Block remainder. Every earlier lacing test used three
+    /// frames, where the "read n-2 more sizes" loop happens to run the same
+    /// number of times whichever way its bound is computed. Two frames is the
+    /// case that separates them, and reading one size too many eats the frame
+    /// payload as a size table.
+    #[test]
+    fn an_ebml_lace_of_exactly_two_frames_stores_one_size() {
+        let mut block = vec![
+            0x81, // TrackNumber 1
+            0x00, 0x00, // rel_ts 0
+            0x86, // KEY | LACING = 11b (EBML)
+            0x01, // Lacing Head: 2 frames minus 1
+            0x83, // first frame size = 3
+        ];
+        block.extend_from_slice(&[0xAA; 3]);
+        block.extend_from_slice(&[0xBB; 5]);
+        let specs = [TrackSpec::new(1, 2)];
+        let bytes = mkv_with_tracks_and_cluster(&specs, &cluster_with_simple_block(0, &block));
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let frames = drain(&mut stream);
+        assert_eq!(frames.len(), 2, "a two-frame lace yields two frames");
+        assert_eq!(frames[0].data, vec![0xAA; 3]);
+        assert_eq!(
+            frames[1].data,
+            vec![0xBB; 5],
+            "the second frame is the whole Block remainder"
+        );
+    }
+
+    /// The shortest usable (Simple)Block is a 1-octet track VINT, a 2-octet
+    /// relative timestamp and a flags octet — four bytes, carrying an empty
+    /// payload. Its length is exactly the boundary of the two short-block
+    /// guards, and a guard one off either way turns a legal (if degenerate)
+    /// block into a dropped frame or an index past the end of the buffer.
+    #[test]
+    fn a_four_byte_block_is_the_shortest_legal_one_and_is_not_dropped() {
+        let tracks = TrackTable::contiguous(1);
+        let four = [0x81u8, 0x00, 0x00, 0x80];
+        let frames = parse_block(&four, 0, 1_000_000, &tracks, None).unwrap();
+        assert_eq!(
+            frames.len(),
+            1,
+            "a header-only block is short, not absent — dropping it loses a frame"
+        );
+        assert!(frames[0].data.is_empty());
+        // Three bytes cannot hold the header at all and must be skipped, not
+        // indexed into.
+        assert!(
+            parse_block(&four[..3], 0, 1_000_000, &tracks, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_block(&[], 0, 1_000_000, &tracks, None)
+                .unwrap()
+                .is_empty()
+        );
+        // The same boundary with a WIDER track VINT: a 2-octet track number
+        // makes the shortest legal block five bytes. Every other block test uses
+        // the 1-octet form, where the header-length check happens to agree with
+        // itself however it is computed.
+        let five = [0x40u8, 0x01, 0x00, 0x00, 0x80];
+        let frames = parse_block(&five, 0, 1_000_000, &tracks, None).unwrap();
+        assert_eq!(
+            frames.len(),
+            1,
+            "a 2-octet track VINT still leaves a legal, if empty, block"
+        );
+        assert_eq!(frames[0].track, 0, "0x4001 is TrackNumber 1 → stream 0");
+    }
+
+    /// The `Video` master's child walk must consume EXACTLY the bytes its
+    /// children declare. This crate's own writer happens to place every other
+    /// TrackEntry field ahead of `Video`, so an over-run there costs nothing —
+    /// but a foreign MKV (mkvmerge orders children differently) puts fields
+    /// after it, and an over-running walk then swallows them: the reader reports
+    /// language `und` for a track that declared one, on a file that is perfectly
+    /// well formed.
+    #[test]
+    fn the_video_master_walk_stops_at_its_own_end_not_inside_the_next_field() {
+        let mut video = Vec::new();
+        ebml::write_uint(&mut video, ebml::PIXEL_HEIGHT, 720).unwrap();
+        // A one-byte value: header 2 bytes, body 1 byte. Any accounting that
+        // mixes up "header plus body" with anything else drifts here.
+        ebml::write_uint(&mut video, ebml::FLAG_INTERLACED, 1).unwrap();
+
+        let mut entry = Vec::new();
+        ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
+        ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 1).unwrap();
+        ebml::write_string(&mut entry, ebml::CODEC_ID, ebml::CODEC_HEVC).unwrap();
+        ebml::write_id(&mut entry, ebml::VIDEO).unwrap();
+        ebml::write_size(&mut entry, video.len() as u64).unwrap();
+        entry.extend_from_slice(&video);
+        // Deliberately AFTER the Video master.
+        ebml::write_string(&mut entry, ebml::TRACK_NAME, "After Video").unwrap();
+
+        let mut tracks = Vec::new();
+        ebml::write_id(&mut tracks, ebml::TRACK_ENTRY).unwrap();
+        ebml::write_size(&mut tracks, entry.len() as u64).unwrap();
+        tracks.extend_from_slice(&entry);
+
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, tracks.len() as u64).unwrap();
+        out.extend_from_slice(&tracks);
+
+        let s = MkvStream::open(Cursor::new(out)).unwrap();
+        match &s.info().streams[0] {
+            crate::disc::Stream::Video(v) => {
+                assert_eq!(v.resolution, crate::disc::Resolution::R720p);
+                assert_eq!(
+                    v.label, "After Video",
+                    "a field following the Video master must still be read"
+                );
+            }
+            other => panic!("expected a video stream, got {other:?}"),
+        }
+    }
+
+    /// A Dolby Vision enhancement layer is marked SECONDARY so it is never
+    /// selected as the default video track. It is recognised by either of two
+    /// label spellings, and only the pair together covers the labels this crate
+    /// and its sources actually emit — matching on both is the policy, so both
+    /// have to hold.
+    #[test]
+    fn a_dolby_vision_enhancement_layer_track_is_marked_secondary_by_either_label() {
+        let build = |name: &str| {
+            let mut entry = Vec::new();
+            ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
+            ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 1).unwrap();
+            ebml::write_string(&mut entry, ebml::CODEC_ID, ebml::CODEC_HEVC).unwrap();
+            ebml::write_string(&mut entry, ebml::TRACK_NAME, name).unwrap();
+            let mut tracks = Vec::new();
+            ebml::write_id(&mut tracks, ebml::TRACK_ENTRY).unwrap();
+            ebml::write_size(&mut tracks, entry.len() as u64).unwrap();
+            tracks.extend_from_slice(&entry);
+            let mut out = Vec::new();
+            ebml::write_id(&mut out, ebml::EBML).unwrap();
+            ebml::write_size(&mut out, 0).unwrap();
+            ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+            ebml::write_unknown_size(&mut out).unwrap();
+            ebml::write_id(&mut out, ebml::INFO).unwrap();
+            ebml::write_size(&mut out, 0).unwrap();
+            ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+            ebml::write_size(&mut out, tracks.len() as u64).unwrap();
+            out.extend_from_slice(&tracks);
+            let s = MkvStream::open(Cursor::new(out)).unwrap();
+            match &s.info().streams[0] {
+                crate::disc::Stream::Video(v) => v.secondary,
+                other => panic!("expected a video stream, got {other:?}"),
+            }
+        };
+        assert!(
+            build("Dolby Vision EL"),
+            "the long spelling marks secondary"
+        );
+        assert!(build("DV EL"), "the short spelling marks secondary too");
+        assert!(
+            !build("Main Feature"),
+            "an ordinary video track is not secondary"
+        );
+    }
+
+    /// `DefaultDuration` is the per-frame period a laced Block's second and later
+    /// frames are spaced by (RFC 9559 §10.3.5). The reader treats 0 and absurd
+    /// values as ABSENT — a zero period would stack every laced frame on one
+    /// timestamp while claiming a real duration, and a nonsense one would smear
+    /// them across minutes. Both ends of that filter were unasserted.
+    #[test]
+    fn a_zero_or_absurd_default_duration_is_treated_as_absent() {
+        // A two-frame EBML lace: frame 2's timestamp comes only from the track's
+        // DefaultDuration, so the filter's verdict is directly observable.
+        let laced = || {
+            let mut block = vec![0x81u8, 0x00, 0x00, 0x86, 0x01, 0x83];
+            block.extend_from_slice(&[0xAA; 3]);
+            block.extend_from_slice(&[0xBB; 3]);
+            block
+        };
+        let spacing = |ns: u64| -> (i64, Option<u64>) {
+            let specs = [TrackSpec::new(1, 2).with_default_duration(ns)];
+            let bytes =
+                mkv_with_tracks_and_cluster(&specs, &cluster_with_simple_block(0, &laced()));
+            let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+            let frames = drain(&mut stream);
+            assert_eq!(frames.len(), 2);
+            (frames[1].pts - frames[0].pts, frames[1].duration_ns)
+        };
+        assert_eq!(
+            spacing(40_000_000),
+            (40_000_000, Some(40_000_000)),
+            "a real 40 ms frame period spaces the lace"
+        );
+        assert_eq!(
+            spacing(0),
+            (0, None),
+            "DefaultDuration 0 is absent, not a zero-length frame period"
+        );
+        assert_eq!(
+            spacing(2_000_000_000),
+            (2_000_000_000, Some(2_000_000_000)),
+            "a long-but-plausible 2 s period is still honoured"
+        );
+        assert_eq!(
+            spacing(61 * 1_000_000_000),
+            (0, None),
+            "a period over a minute is nonsense for a frame and is discarded"
+        );
+    }
+
+    /// A reader that hands back `size` bytes and then fails with a NON-EOF error
+    /// — a bad sector, a dropped network mount, a drive that wedges mid-read.
+    struct FailAfter {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for FailAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Err(io::Error::other("device failure"));
+            }
+            let n = buf.len().min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// Only a CLEAN end of stream ends a read. A disc-read failure partway
+    /// through must PROPAGATE: treating it as end-of-stream truncates the output
+    /// at the bad sector and reports the rip as complete, which is the worst
+    /// outcome this crate has — a short file with an exit code of 0.
+    #[test]
+    fn a_mid_stream_io_failure_propagates_instead_of_ending_the_stream() {
+        // Header parses cleanly, then the cluster read hits a device error.
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        let block = [0x81u8, 0x00, 0x00, 0x80, 0xAB];
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, block.len() as u64).unwrap();
+        cluster.extend_from_slice(&block);
+        let bytes = mkv_with_track_and_cluster(1, 1, &cluster);
+        let mut stream = MkvStream::open(FailAfter {
+            data: bytes,
+            pos: 0,
+        })
+        .expect("the header itself is intact");
+        assert!(stream.read().unwrap().is_some(), "the one good frame");
+        let e = stream
+            .read()
+            .expect_err("a device failure is NOT end of stream");
+        assert_eq!(e.kind(), io::ErrorKind::Other);
+    }
+
+    /// The same distinction while parsing the HEADER: a truncated (clean-EOF)
+    /// Segment stops the scan with whatever was found, but a device failure has
+    /// to surface. Swallowing it yields a title with no tracks that the caller
+    /// then reports as an empty stub.
+    #[test]
+    fn a_header_io_failure_propagates_instead_of_ending_the_scan() {
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        // The stream ends here with a device error rather than cleanly, before
+        // Tracks was ever seen.
+        let e = open_err(MkvStream::open(FailAfter { data: out, pos: 0 }));
+        assert_eq!(
+            e.kind(),
+            io::ErrorKind::Other,
+            "a device failure during the header scan must not look like EOF"
+        );
+
+        // ...whereas a clean truncation at the same point IS end of scan: the
+        // title comes back with no tracks, no error.
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        let s = MkvStream::open(Cursor::new(out)).expect("a clean EOF ends the scan");
+        assert!(s.info().streams.is_empty());
+    }
+
+    /// The first subset SPS and the first PPS win. A dependent access unit that
+    /// repeats a parameter set (routine after a stream discontinuity) must not
+    /// have the later copy overwrite the one already captured — the mvcC record
+    /// is built once, from the set the stream opened with.
+    #[test]
+    fn extract_mvc_params_keeps_the_first_parameter_set_of_each_kind() {
+        const SECOND_SPS: [u8; 5] = [0x6F, 0x99, 0x11, 0x22, 0x33];
+        const SECOND_PPS: [u8; 3] = [0x68, 0x77, 0x66];
+        // The repeat has to appear BEFORE the other kind is found — the scan
+        // stops as soon as it holds one of each.
+        let (s, _) = extract_mvc_params(&lp(&[&SUBSET_SPS, &SECOND_SPS, &DEP_PPS]))
+            .expect("both param sets present");
+        assert_eq!(s, SUBSET_SPS, "the FIRST subset SPS is kept");
+        let (_, p) = extract_mvc_params(&lp(&[&DEP_PPS, &SECOND_PPS, &SUBSET_SPS]))
+            .expect("both param sets present");
+        assert_eq!(p, DEP_PPS, "the FIRST PPS is kept");
+    }
+
     #[test]
     fn headers_are_ready_at_open_because_matroska_front_loads_them() {
         let out = SharedOut::new();
