@@ -998,6 +998,44 @@ fn parse_stss(b: &[u8]) -> std::collections::HashSet<u32> {
 mod tests {
     use super::*;
 
+    /// A `Read + Seek` backed by a small crafted prefix followed by an endless
+    /// run of zeros, reporting `len` bytes total on `seek(End)`. Lets a test
+    /// exercise a hundred-MiB-to-multi-GiB boundary (`MAX_ALLOC_BYTES`, a
+    /// sparse-file-inflated `file_len`) without a real backing allocation of
+    /// that size for the SOURCE side — only the destination buffer the code
+    /// under test allocates is real, which is the point of the test.
+    struct FakeBigReader {
+        prefix: Vec<u8>,
+        pos: u64,
+        len: u64,
+    }
+    impl Read for FakeBigReader {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let remaining = self.len.saturating_sub(self.pos);
+            let n = (out.len() as u64).min(remaining) as usize;
+            for (i, byte) in out[..n].iter_mut().enumerate() {
+                let idx = self.pos + i as u64;
+                *byte = if idx < self.prefix.len() as u64 {
+                    self.prefix[idx as usize]
+                } else {
+                    0 // endless zero fill past the crafted prefix
+                };
+            }
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+    impl Seek for FakeBigReader {
+        fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+            self.pos = match from {
+                SeekFrom::Start(p) => p,
+                SeekFrom::End(off) => (self.len as i64 + off) as u64,
+                SeekFrom::Current(off) => (self.pos as i64 + off) as u64,
+            };
+            Ok(self.pos)
+        }
+    }
+
     #[test]
     fn stsc_offsets_one_sample_per_chunk() {
         // Our writer's layout: 1 sample/chunk, co64 lists every offset.
@@ -1825,6 +1863,70 @@ mod tests {
         b.extend_from_slice(&3u32.to_be_bytes());
         b.extend_from_slice(b"free");
         assert!(read_moov(&mut Cursor::new(b)).is_err());
+    }
+
+    /// `box_size < header_len` rejects a box that cannot even hold its own
+    /// header. A box whose size is EXACTLY `header_len` (8, no 64-bit
+    /// largesize) is the boundary itself: legal (an empty box), so an empty
+    /// `moov` — size 8, zero payload bytes — must parse to `Ok(vec![])`, not
+    /// be rejected by a `<`→`<=`/`==` mutant that also rejects the boundary.
+    #[test]
+    fn read_moov_exactly_header_sized_is_a_valid_empty_box() {
+        use std::io::Cursor;
+        let mut b = Vec::new();
+        b.extend_from_slice(&8u32.to_be_bytes());
+        b.extend_from_slice(b"moov");
+        assert_eq!(
+            read_moov(&mut Cursor::new(b)).unwrap(),
+            Vec::<u8>::new(),
+            "a size-8 moov has an 8-byte header and zero payload bytes"
+        );
+    }
+
+    /// The forward-progress / EOF guard is `box_size < header_len ||
+    /// pos.checked_add(box_size).is_none_or(|end| end > file_end)` — an `||`↔
+    /// `&&` mutant only shows up on an input where EXACTLY ONE side is true.
+    /// A box that claims to run 992 bytes past a file that ends right after
+    /// its header satisfies only the second clause (`box_size >= header_len`,
+    /// so the first is false); under `&&` the guard would not fire, and
+    /// `read_moov` would instead fail later inside `read_exact` with a plain
+    /// `UnexpectedEof` — a different, uncoded `io::Error` rather than this
+    /// crate's `Mp4Invalid` (`ErrorKind::InvalidData`), which the guard exists
+    /// to produce uniformly for every malformed box.
+    #[test]
+    fn read_moov_rejects_a_box_that_overruns_the_file_via_the_or_not_and_guard() {
+        use std::io::Cursor;
+        let mut b = Vec::new();
+        b.extend_from_slice(&1000u32.to_be_bytes()); // claims 1000 bytes total
+        b.extend_from_slice(b"moov");
+        // No more bytes: the file ends right after the 8-byte header, 992
+        // bytes short of the claim.
+        let err = read_moov(&mut Cursor::new(b)).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "an overrunning box must be rejected by the guard itself (Mp4Invalid), \
+             not fall through to a bare EOF error from read_exact"
+        );
+    }
+
+    /// `payload_len > MAX_ALLOC_BYTES` is a SEPARATE, sparse-file-proof cap from
+    /// the EOF check above (see `read_moov_over_cap_rejected_despite_inflated_file_len`).
+    /// A `>`→`>=` mutant would reject a `moov` whose payload is EXACTLY
+    /// `MAX_ALLOC_BYTES`, which must be allowed.
+    #[test]
+    fn read_moov_allows_a_payload_of_exactly_max_alloc_bytes() {
+        let box_size = MAX_ALLOC_BYTES as u32 + 8; // header + exactly the cap
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&box_size.to_be_bytes());
+        prefix.extend_from_slice(b"moov");
+        let mut rd = FakeBigReader {
+            prefix,
+            pos: 0,
+            len: MAX_ALLOC_BYTES + 1024, // real enough bytes to satisfy read_exact
+        };
+        let moov = read_moov(&mut rd).expect("exactly MAX_ALLOC_BYTES must be allowed");
+        assert_eq!(moov.len() as u64, MAX_ALLOC_BYTES);
     }
 
     /// Wrap `payload` in an ISO-BMFF box with the given 4-byte type.
