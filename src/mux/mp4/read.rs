@@ -2457,7 +2457,9 @@ mod tests {
         };
         let mut stbl = Vec::new();
         stbl.extend_from_slice(&stsd);
-        stbl.extend_from_slice(&stsz);
+        if omit != b"stsz" {
+            stbl.extend_from_slice(&stsz);
+        }
         if omit != b"stco" {
             stbl.extend_from_slice(&stco);
         }
@@ -2935,5 +2937,219 @@ mod tests {
         );
         assert_eq!(entries[0].0, 0, "and the entries kept are the LEADING ones");
         assert_eq!(entries[1].0, 1);
+    }
+
+    // ── from_reader: per-track handler routing, PID arithmetic, and the shared
+    // sample budget across tracks. ─────────────────────────────────────────
+
+    /// A minimal-but-complete video `trak` (one H.264 sample), mirroring
+    /// `audio_trak` but for the `vide` handler and an `avc1` sample entry.
+    fn video_trak(timescale: u32) -> Vec<u8> {
+        let mdhd = {
+            let mut p = vec![0u8; 24];
+            p[12..16].copy_from_slice(&timescale.to_be_bytes());
+            mp4_box(b"mdhd", &p)
+        };
+        let hdlr = {
+            let mut p = vec![0u8; 12];
+            p[8..12].copy_from_slice(b"vide");
+            mp4_box(b"hdlr", &p)
+        };
+        let stsd = {
+            // VisualSampleEntry's fixed part is 78 bytes; dimensions don't
+            // matter for this test, so the body is all zero.
+            let entry_body = vec![0u8; 78];
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+            p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+            p.extend_from_slice(&mp4_box(b"avc1", &entry_body));
+            mp4_box(b"stsd", &p)
+        };
+        let stsz = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]);
+            p.extend_from_slice(&10u32.to_be_bytes()); // sample_size (fixed) = 10
+            p.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+            mp4_box(b"stsz", &p)
+        };
+        let stco = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]);
+            p.extend_from_slice(&1u32.to_be_bytes()); // count
+            p.extend_from_slice(&0u32.to_be_bytes()); // chunk offset 0
+            mp4_box(b"stco", &p)
+        };
+        let stsc = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]);
+            p.extend_from_slice(&1u32.to_be_bytes()); // count
+            p.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
+            p.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk
+            p.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx
+            mp4_box(b"stsc", &p)
+        };
+        let stts = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0, 0, 0, 0]);
+            p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+            p.extend_from_slice(&1u32.to_be_bytes()); // sample_count
+            p.extend_from_slice(&1000u32.to_be_bytes()); // sample_delta
+            mp4_box(b"stts", &p)
+        };
+        let mut stbl = Vec::new();
+        stbl.extend_from_slice(&stsd);
+        stbl.extend_from_slice(&stsz);
+        stbl.extend_from_slice(&stco);
+        stbl.extend_from_slice(&stsc);
+        stbl.extend_from_slice(&stts);
+        let minf = mp4_box(b"minf", &mp4_box(b"stbl", &stbl));
+        let mut mdia = Vec::new();
+        mdia.extend_from_slice(&mdhd);
+        mdia.extend_from_slice(&hdlr);
+        mdia.extend_from_slice(&minf);
+        mp4_box(b"trak", &mp4_box(b"mdia", &mdia))
+    }
+
+    /// A `hdlr` of anything other than `vide`/`soun` (e.g. a hint or subtitle
+    /// track) must be dropped, not folded into the audio branch. Before this
+    /// guard existed as a literal `&h == b"soun"` comparison, weakening it to
+    /// "anything that isn't vide" would silently turn a hint track's `stsd`
+    /// entry into a fabricated `AudioStream` — with whatever codec its sample
+    /// entry happened to name.
+    #[test]
+    fn non_av_handler_track_is_dropped_not_folded_into_audio() {
+        use std::io::Cursor;
+        let mut trak = audio_trak(48_000);
+        let pos = trak
+            .windows(4)
+            .position(|w| w == b"soun")
+            .expect("fixture has a soun handler");
+        trak[pos..pos + 4].copy_from_slice(b"hint");
+        let moov = mp4_box(b"moov", &trak);
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "hint".into());
+        assert!(
+            rd.is_err(),
+            "a hint (non-audio/video) handler must not become a stream; \
+             all-dropped → Mp4Invalid"
+        );
+    }
+
+    /// The per-track PID is `0x1011 + track_idx` for video and `0x1100 +
+    /// track_idx` for audio. At `track_idx == 0` a `+`↔`-`/`*` mutant of either
+    /// is invisible (`0x1011 + 0 == 0x1011 - 0 == 0x1011 * 0`… no — `* 0` is 0,
+    /// already different — but `+`↔`-` specifically needs `track_idx != 0` to
+    /// separate). Four tracks (two video, two audio) push `track_idx` to 1 and
+    /// 3 respectively, so every one of `+`→`*`, `+`→`-` is forced to disagree
+    /// with the correct PID on the second track of its kind.
+    #[test]
+    fn per_track_pid_arithmetic_is_exact_past_the_first_track() {
+        use crate::disc::Stream as DiscStreamE;
+        use std::io::Cursor;
+
+        let mut traks = Vec::new();
+        traks.extend_from_slice(&video_trak(25)); // track_idx 0
+        traks.extend_from_slice(&video_trak(25)); // track_idx 1
+        traks.extend_from_slice(&audio_trak(48_000)); // track_idx 2
+        traks.extend_from_slice(&audio_trak(48_000)); // track_idx 3
+        let moov = mp4_box(b"moov", &traks);
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "pids".into()).unwrap();
+        assert_eq!(rd.info().streams.len(), 4);
+
+        let pid = |s: &crate::disc::Stream| -> u16 {
+            match s {
+                DiscStreamE::Video(v) => v.pid,
+                DiscStreamE::Audio(a) => a.pid,
+                DiscStreamE::Subtitle(_) => panic!("mp4 from_reader never emits subtitles"),
+            }
+        };
+        assert_eq!(pid(&rd.info().streams[0]), 0x1011, "video track_idx 0");
+        assert_eq!(
+            pid(&rd.info().streams[1]),
+            0x1011 + 1,
+            "video track_idx 1 — the boundary + vs - vs * separates on"
+        );
+        assert_eq!(
+            pid(&rd.info().streams[2]),
+            0x1100 + 2,
+            "audio track_idx 2 (track_idx is a single counter shared by \
+             every track, video or audio)"
+        );
+        assert_eq!(
+            pid(&rd.info().streams[3]),
+            0x1100 + 3,
+            "audio track_idx 3 — the + vs - boundary"
+        );
+    }
+
+    /// A track whose `stsz` is absent (`n == 0`) still occupies a `track_idx`
+    /// slot and must still advance the counter for the NEXT track — otherwise
+    /// two tracks collide on the same PID, or (worse, if the increment
+    /// direction is reversed) `track_idx` underflows a `usize` and panics on
+    /// the very first sample-less track.
+    #[test]
+    fn track_idx_advances_past_a_sample_less_track() {
+        use crate::disc::Stream as DiscStreamE;
+        use std::io::Cursor;
+
+        let mut traks = audio_trak_missing(b"stsz"); // track_idx 0: no samples
+        traks.extend_from_slice(&audio_trak(48_000)); // track_idx 1: has samples
+        let moov = mp4_box(b"moov", &traks);
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "skip-idx".into()).unwrap();
+        assert_eq!(
+            rd.info().streams.len(),
+            2,
+            "the sample-less track is still kept as a (silent) stream"
+        );
+        match &rd.info().streams[1] {
+            DiscStreamE::Audio(a) => assert_eq!(
+                a.pid,
+                0x1100 + 1,
+                "the second track's PID must reflect track_idx having \
+                 advanced past the sample-less first track"
+            ),
+            _ => panic!("expected an audio stream"),
+        }
+    }
+
+    /// The global `sample_budget` is DECREMENTED by each track's real sample
+    /// count, and it is SHARED across tracks — a track late in the file gets
+    /// only what earlier tracks left behind. Build two tracks that both LIE
+    /// about their sample count (`stsz` fixed-size, count = `u32::MAX`, as in
+    /// `audio_trak_hostile_count`): the file is tiny, so the first track's
+    /// clamped count exactly exhausts the whole initial budget, and the
+    /// second track — clamped against what's left — must come back with
+    /// ZERO samples. An `+=`/`/=` mutant of the decrement either grows the
+    /// budget or leaves it nonzero, letting the second track claim samples it
+    /// must not have.
+    #[test]
+    fn sample_budget_is_shared_and_exhausted_across_tracks() {
+        use std::io::Cursor;
+
+        let mut traks = audio_trak_hostile_count(); // track_idx 0
+        traks.extend_from_slice(&audio_trak_hostile_count()); // track_idx 1
+        let moov = mp4_box(b"moov", &traks);
+        let file_len = moov.len() as u64;
+        let expected_initial_budget =
+            MAX_SAMPLE_COUNT.min((file_len / MIN_FILE_BYTES_PER_SAMPLE) as usize);
+        // The fixture's own stsc/stts windows (0xFFFF) must not be the binding
+        // constraint, or the budget's effect is untestable.
+        assert!(
+            expected_initial_budget < 0xFFFF,
+            "fixture assumption: the shared byte budget must bind before the \
+             per-track stsc/stts window does"
+        );
+
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "budget".into()).unwrap();
+        assert_eq!(
+            rd.samples.len(),
+            expected_initial_budget,
+            "the first track alone must exhaust the whole initial budget"
+        );
+        assert_eq!(
+            rd.samples.iter().filter(|s| s.track == 1).count(),
+            0,
+            "the second track must be left with zero budget, not a grown or \
+             partially-decremented one"
+        );
     }
 }
