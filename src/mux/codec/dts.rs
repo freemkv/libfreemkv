@@ -863,6 +863,54 @@ mod tests {
     // frames advance by. (512 * 1e9 + 24000) / 48000 = 10_666_667 ns.
     const DTS_CORE_DUR_NS: i64 = (512 * 1_000_000_000 + 48_000 / 2) / 48_000;
 
+    // --- stamp_pts: the "same PES, no fresh front timestamp" branch ---
+
+    /// `stamp_pts`'s third arm (`else if front != PTS_UNSET`) is only reached
+    /// once the first arm's `front != self.last_front_pts` has already failed
+    /// (i.e. `front == self.last_front_pts`) and no within-PES running cursor
+    /// is available yet (`next_pts_ns == PTS_UNSET`). In that state the AU must
+    /// still be stamped with its own (repeated) front timestamp, not silently
+    /// collapsed to 0 — a `!=` -> `==` typo on the guard would only take this
+    /// arm when `front` IS the unset sentinel, producing 0 instead here and the
+    /// sentinel value itself if front really were unset.
+    #[test]
+    fn stamp_pts_reuses_front_when_no_running_cursor_yet() {
+        let mut parser = DtsParser::new();
+        parser.last_front_pts = 500;
+        parser.next_pts_ns = PTS_UNSET;
+        assert_eq!(
+            parser.stamp_pts(500, DTS_CORE_DUR_NS),
+            500,
+            "front == last_front_pts and no cursor yet: stamp with front itself"
+        );
+    }
+
+    // --- drain_front: collapsing duplicate offset-0 PTS markers must not leak ---
+
+    /// Every drained access unit that shares its PES with the previous one
+    /// pushes a new `(0, pts)` marker once rebased; `drain_front` must collapse
+    /// those down to the single most-recent one each time, or `pts_marks` grows
+    /// once per access unit for the life of the track — an unbounded allocation
+    /// on a multi-hour disc. `front_pts()` alone can't observe this: it always
+    /// finds the last offset-0 entry regardless of how many duplicates precede
+    /// it, so the leak is invisible unless something checks that the collapse
+    /// actually ran.
+    #[test]
+    fn drain_front_collapses_offset_zero_markers_instead_of_leaking() {
+        let mut parser = DtsParser::new();
+        for i in 0..200i64 {
+            parser.buf.extend_from_slice(&[0u8; 5]);
+            parser.pts_marks.push_back((5, i));
+            parser.pts_marks.push_back((5, i));
+            parser.drain_front(5);
+        }
+        assert!(
+            parser.pts_marks.len() <= 2,
+            "pts_marks must stay bounded across repeated drains, got {}",
+            parser.pts_marks.len()
+        );
+    }
+
     /// A real DTS-HD EXSS substream of `total` bytes (short header form), with an
     /// optional false DTS core syncword embedded in its payload (decoding to a
     /// plausible core size) — to prove precise sizing, not a payload scan, bounds
@@ -1587,6 +1635,78 @@ mod tests {
         d[7] = 0xF0;
         // wait — 0x03<<12 | 0xFF<<4 | 0x0F = 0x3FFF. byte7 high4 0xF0 >> 4 = 0xF.
         assert_eq!(dts_core_frame_size(&d), 0x3FFF + 1);
+    }
+
+    // --- dts_core_samples / dts_core_sample_rate: header-length boundary ---
+
+    #[test]
+    fn dts_core_samples_reads_nblks_high_bit_from_byte4_bit0() {
+        // NBLKS is 7 bits: byte4 bit0 is the HIGH bit (<<6), byte5>>2 the low 6.
+        // With byte4 bit0 set and byte5 = 0, nblks = 64 (not 0), so a `<<` -> `>>`
+        // typo on the byte4 contribution (which always yields 0, since a 1-bit
+        // value has nothing to shift right into) collapses samples from 2080
+        // down to 32.
+        let mut d = vec![0u8; CORE_HEADER_MIN_BYTES];
+        d[4] = 0x01;
+        d[5] = 0x00;
+        assert_eq!(dts_core_samples(&d), (64 + 1) * 32);
+    }
+
+    #[test]
+    fn dts_core_samples_and_sample_rate_decode_at_exact_header_min_length() {
+        // The length guard is `data.len() < CORE_HEADER_MIN_BYTES`; exactly
+        // CORE_HEADER_MIN_BYTES (10) bytes must still be read as a real header
+        // (index 8, SFREQ, is in bounds), not treated as truncated. Use NBLKS
+        // and SFREQ values that differ from the truncated-header fallbacks
+        // (512 samples, 48 kHz) so a `<` -> `<=` typo that takes the fallback
+        // path one byte early is visible in the output, not masked by a
+        // coincidental match.
+        let mut d = vec![0u8; CORE_HEADER_MIN_BYTES];
+        d[4] = 0x00;
+        d[5] = 0x00; // nblks = 0 -> 32 samples, not the 512 fallback
+        d[8] = 6u8 << 2; // SFREQ = 6 -> 11_025 Hz, not the 48_000 fallback
+        assert_eq!(d.len(), CORE_HEADER_MIN_BYTES);
+        assert_eq!(dts_core_samples(&d), 32);
+        assert_eq!(dts_core_sample_rate(&d), 11_025);
+    }
+
+    #[test]
+    fn dts_core_samples_and_sample_rate_decode_past_header_min_length_too() {
+        // A `<` -> `>` typo on the same guard takes the FALLBACK path once
+        // `data.len()` exceeds CORE_HEADER_MIN_BYTES instead of never — i.e.
+        // every real, normally-sized core frame (always well past 10 bytes)
+        // would silently report the 512-sample/48kHz fallback. Use a buffer
+        // twice the minimum with non-fallback NBLKS/SFREQ values.
+        let mut d = vec![0u8; CORE_HEADER_MIN_BYTES * 2];
+        d[4] = 0x00;
+        d[5] = 0x00; // nblks = 0 -> 32 samples
+        d[8] = 6u8 << 2; // SFREQ = 6 -> 11_025 Hz
+        assert!(d.len() > CORE_HEADER_MIN_BYTES);
+        assert_eq!(dts_core_samples(&d), 32);
+        assert_eq!(dts_core_sample_rate(&d), 11_025);
+    }
+
+    // --- next_core_boundary: SYNCWORD_BYTES length guard ---
+
+    /// Only the 4-byte EXSS syncword is buffered after the core frame — no
+    /// header fields at all. The guard `buf.len() < pos + SYNCWORD_BYTES` must
+    /// be strict `<`: at exactly `pos + SYNCWORD_BYTES` the sync bytes ARE
+    /// fully present, so the function proceeds to identify them as an
+    /// extension sync (then fails to size the header and falls back, ending
+    /// in `NextCore::None` here since nothing after it looks like a core sync
+    /// either). A `<=` typo would instead return `NeedMore` at this exact
+    /// length without ever inspecting what the 4 buffered bytes are.
+    #[test]
+    fn next_core_boundary_exact_syncword_length_is_not_need_more() {
+        let core = make_dts_core(MIN_CORE_FRAME_BYTES);
+        let mut buf = core.clone();
+        buf.extend_from_slice(&DTS_HD_EXT_SYNC); // exactly 4 bytes, nothing more
+        let result = next_core_boundary(&buf, core.len());
+        assert!(
+            matches!(result, NextCore::None),
+            "expected None (recognized-but-unsizeable extension sync with \
+             nothing after it), got a different variant"
+        );
     }
 
     // --- find_sync ---
