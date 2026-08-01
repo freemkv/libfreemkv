@@ -2327,18 +2327,17 @@ impl Disc {
             0x00,
         ];
         let mut buf = [0u8; 8];
-        session.scsi_execute(
+        let result = session.scsi_execute(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             &mut buf,
             5_000,
         )?;
-        let lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        // `last_lba + 1` = sector count. Guard the 0xFFFF_FFFF sentinel
-        // (capacity exceeds 32 bits) so it surfaces as an error instead of
-        // wrapping to 0 in release — mirrors the public `decode_read_capacity`.
-        lba.checked_add(1)
-            .ok_or(crate::error::Error::DiscCapacityOverflow)
+        // Share the decoder with `Drive::capacity` rather than re-deriving it.
+        // A hand-rolled copy here previously dropped the short-transfer check:
+        // a drive answering GOOD with an empty data phase leaves `buf` zeroed,
+        // which decodes to a 1-sector disc instead of an error.
+        crate::drive::decode_read_capacity(&buf, result.bytes_transferred)
     }
 }
 
@@ -6395,5 +6394,39 @@ mod tests {
             disc.mapfile_for(std::path::Path::new("/dev/null")),
             std::env::temp_dir().join("VOLUME_ID.mapfile")
         );
+    }
+
+    /// A drive that answers READ CAPACITY (10) with GOOD status but an empty
+    /// data phase leaves the caller's buffer zero-initialised. Decoding that
+    /// blind yields `last_lba = 0` -> a "1 sector" disc, which reads as a
+    /// successful capacity probe of an absurdly small disc rather than as the
+    /// malformed response it is. `Disc::read_capacity` must reject it.
+    #[test]
+    fn read_capacity_rejects_a_short_transfer_instead_of_reporting_one_sector() {
+        use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};
+
+        /// GOOD status, no sense, and *nothing written* to `buf`.
+        struct EmptyDataPhase;
+        impl ScsiTransport for EmptyDataPhase {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _dir: DataDirection,
+                _buf: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::error::Result<ScsiResult> {
+                Ok(ScsiResult {
+                    status: 0,
+                    sense: [0u8; 32],
+                    bytes_transferred: 0,
+                })
+            }
+        }
+
+        let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(EmptyDataPhase));
+        assert!(matches!(
+            Disc::read_capacity(&mut drive),
+            Err(crate::error::Error::DiscCapacityMalformed)
+        ));
     }
 }

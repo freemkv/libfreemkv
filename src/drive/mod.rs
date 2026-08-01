@@ -158,7 +158,7 @@ impl Drive {
     /// fallback) so command-builder/response-parser logic can be exercised
     /// against a scripted mock transport.
     #[cfg(test)]
-    fn from_transport_for_test(scsi: Box<dyn ScsiTransport>) -> Self {
+    pub(crate) fn from_transport_for_test(scsi: Box<dyn ScsiTransport>) -> Self {
         Drive {
             scsi,
             unlocker_name: None,
@@ -1291,7 +1291,7 @@ fn build_error_recovery_select_payload(sense: &[u8]) -> Option<Vec<u8>> {
 /// 32-bit" sentinel, whose `last_lba + 1` overflows `u32`, is reported as the
 /// distinct [`Error::DiscCapacityOverflow`] so callers can tell an unusable
 /// response apart from an over-large disc.
-fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> Result<u32> {
+pub(crate) fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> Result<u32> {
     if bytes_transferred < 4 {
         return Err(Error::DiscCapacityMalformed);
     }
