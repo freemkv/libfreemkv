@@ -298,7 +298,7 @@ impl Disc {
         let chapters: Vec<Chapter> = parsed
             .marks
             .iter()
-            .filter(|m| m.mark_type == 1)
+            .filter(|m| m.is_chapter_mark())
             .filter_map(|m| {
                 let pi_idx = m.play_item_ref as usize;
                 let pi = parsed.play_items.get(pi_idx)?;
