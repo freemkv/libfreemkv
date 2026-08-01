@@ -49,13 +49,30 @@ pub struct DriveId {
     pub raw_gc_010c: Vec<u8>,
 }
 
+/// SPC-4 standard INQUIRY data: 36 bytes through `product_revision`. Anything
+/// shorter cannot populate the identity fields this type promises.
+const INQUIRY_STANDARD_LEN: usize = 36;
+
 impl DriveId {
     /// Probe a real drive via SCSI and build its identity.
     pub fn from_drive(transport: &mut dyn ScsiTransport) -> Result<Self> {
         // INQUIRY — SPC-4 §6.4
         let mut inquiry = vec![0u8; 96];
         let cdb_inq = [0x12, 0x00, 0x00, 0x00, 0x60, 0x00];
-        transport.execute(&cdb_inq, DataDirection::FromDevice, &mut inquiry, 5000)?;
+        let inq = transport.execute(&cdb_inq, DataDirection::FromDevice, &mut inquiry, 5000)?;
+        // `bytes_transferred` is device-reported and untrusted — the same rule
+        // the two GET CONFIGURATION calls below already apply. It was ignored
+        // here, and the buffer is pre-zeroed, so a drive answering GOOD with a
+        // short or empty data phase (a USB-SATA bridge mid-wedge does exactly
+        // this) decoded to blank identity strings and a byte 0 of 0x00. Every
+        // platform enumerator gates on `raw_inquiry[0] & 0x1F == OPTICAL`, so
+        // 0x00 reads as DIRECT ACCESS and the drive silently disappears from
+        // the device list instead of reporting a failed probe.
+        if inq.bytes_transferred < INQUIRY_STANDARD_LEN {
+            return Err(crate::error::Error::DriveInquiryShort);
+        }
+        // Never decode past what the drive actually sent.
+        inquiry.truncate(inq.bytes_transferred.min(inquiry.len()));
 
         // GET CONFIGURATION Feature 010Ch — MMC-6 §6.6.
         // Best-effort: 010Ch (Firmware Information) is an optional feature.
@@ -262,6 +279,54 @@ mod tests {
     /// Spec: SPC-4 §6.4.2 — bytes[8:16] are vendor ID; a truncated buffer
     ///       (e.g. a device that reports fewer than 8 bytes) must not panic.
     /// Mutation: removing the `data.len() > start` guard makes it panic on short inputs.
+    /// A drive that answers INQUIRY with GOOD status but a short or empty
+    /// data phase must fail the probe, not present as a blank drive.
+    ///
+    /// The buffer is pre-zeroed, so decoding it unconditionally yielded empty
+    /// vendor/product/revision strings and a byte 0 of 0x00. Every platform
+    /// enumerator gates on `raw_inquiry[0] & 0x1F == SCSI_PERIPHERAL_TYPE_OPTICAL`,
+    /// and 0x00 is DIRECT ACCESS — so the drive silently vanished from the
+    /// device list rather than reporting that its identity probe failed. A
+    /// USB-SATA bridge mid-wedge does exactly this.
+    ///
+    /// The two GET CONFIGURATION calls in the same function already clamped on
+    /// `bytes_transferred`, with a comment calling it untrusted; INQUIRY, three
+    /// lines above them, discarded it.
+    #[test]
+    fn inquiry_with_a_short_data_phase_fails_instead_of_reporting_a_blank_drive() {
+        /// GOOD status, no sense, and only `n` bytes written.
+        struct ShortInquiry(usize);
+        impl ScsiTransport for ShortInquiry {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _dir: DataDirection,
+                _buf: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                Ok(ScsiResult {
+                    status: 0,
+                    sense: [0u8; 32],
+                    bytes_transferred: self.0,
+                })
+            }
+        }
+
+        // Empty data phase — the case that made a real drive disappear.
+        assert!(matches!(
+            DriveId::from_drive(&mut ShortInquiry(0)),
+            Err(crate::error::Error::DriveInquiryShort)
+        ));
+        // One byte short of the SPC-4 standard 36-byte header.
+        assert!(matches!(
+            DriveId::from_drive(&mut ShortInquiry(35)),
+            Err(crate::error::Error::DriveInquiryShort)
+        ));
+        // Exactly the standard length is acceptable: the optional
+        // vendor-specific tail past byte 36 is allowed to be absent.
+        assert!(DriveId::from_drive(&mut ShortInquiry(36)).is_ok());
+    }
+
     #[test]
     fn ascii_field_short_buffer_returns_empty() {
         // Buffer of length 5: start=8 is beyond the end → empty string.

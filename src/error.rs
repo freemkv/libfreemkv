@@ -223,6 +223,7 @@ pub const E_SYNC_TIMEOUT: u16 = 9056;
 pub const E_SYNC_WORKER_LOST: u16 = 9057;
 /// READ CAPACITY returned a short or overflowing transfer.
 pub const E_DISC_CAPACITY_MALFORMED: u16 = 9047;
+pub const E_DRIVE_INQUIRY_SHORT: u16 = 9058;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -646,6 +647,11 @@ pub enum Error {
     /// last-LBA + 1 overflowed `u32`. Either case means the capacity
     /// response is unusable; no English commentary.
     DiscCapacityMalformed,
+    /// INQUIRY returned GOOD status but transferred fewer bytes than the
+    /// standard 36-byte header, so the identity fields would decode from a
+    /// zero-filled buffer. A drive reporting an empty INQUIRY would otherwise
+    /// present as peripheral type 0x00 and be dropped from enumeration.
+    DriveInquiryShort,
     /// `--raw` was given with a `dir://` destination. An encrypted file
     /// tree is useless; raw bytes belong in `iso://`.
     DirRawRejected,
@@ -779,6 +785,7 @@ impl Error {
             Error::ExtentNotUnitAligned => E_EXTENT_NOT_UNIT_ALIGNED,
             Error::M2tsPacketMalformed => E_M2TS_PACKET_MALFORMED,
             Error::DiscCapacityMalformed => E_DISC_CAPACITY_MALFORMED,
+            Error::DriveInquiryShort => E_DRIVE_INQUIRY_SHORT,
             Error::DirRawRejected => E_DIR_RAW_REJECTED,
             Error::DirMultipassRejected => E_DIR_MULTIPASS_REJECTED,
             Error::DirSourceUnsupported => E_DIR_SOURCE_UNSUPPORTED,
