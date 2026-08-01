@@ -790,6 +790,12 @@ fn read_descriptor_len(b: &[u8], pos: &mut usize) -> usize {
     for _ in 0..4 {
         let Some(&byte) = b.get(*pos) else { break };
         *pos += 1;
+        // `|`↔`^` is equivalent here, the same shape documented at
+        // `audio.rs`'s `BitReader::read`: `len << 7` always has zeros in its
+        // low 7 bits (a left shift shifts zeros in), and `byte & 0x7F` is
+        // masked to exactly those 7 bits, so the two operands never share a
+        // set bit — `|` and `^` agree on every input. Confirmed by re-running
+        // the `^` mutation against the full test suite, which still passes.
         len = (len << 7) | (byte & 0x7F) as usize;
         if byte & 0x80 == 0 {
             break;
@@ -1916,6 +1922,52 @@ mod tests {
         assert_eq!(parse_esds_asc(&esds), Some(vec![0x12, 0x10]));
         // A truncated esds must return None, never panic.
         assert_eq!(parse_esds_asc(&esds[..12]), None);
+    }
+
+    /// The final guard is `asc_len == 0 || end > b.len()` — two independent
+    /// rejection reasons, not one condition that needs both. Pins each half:
+    ///   * `asc_len == 0` must be rejected even though `end == pos` is
+    ///     trivially in bounds (an `||`→`&&` mutant would let a useless
+    ///     zero-length ASC through as `Some(vec![])`);
+    ///   * `end > b.len()` means TRUNCATED, not "anything before the buffer's
+    ///     end" — trailing bytes after a complete ASC (`end < b.len()`) must
+    ///     still succeed (a `>`→`<` mutant rejects exactly this, the common
+    ///     case of an esds embedded inside a larger box with more child boxes
+    ///     or padding after it).
+    #[test]
+    fn parse_esds_asc_boundary_checks_are_independent() {
+        // Shared prefix through the DecoderSpecificInfo tag (byte 24 = 0x05);
+        // the length byte and payload follow.
+        let prefix = || {
+            vec![
+                0, 0, 0, 0, // version+flags
+                0x03, 0x19, 0x00, 0x00, 0x00, // ES_Descriptor: tag,len,ES_ID,flags
+                0x04, 0x11, // DecoderConfigDescriptor: tag,len
+                0x40, // objectTypeIndication (AAC)
+                0x15, 0, 0, 0, // streamType/bufferSizeDB
+                0, 0, 0, 0, // maxBitrate
+                0, 0, 0, 0,    // avgBitrate
+                0x05, // DecoderSpecificInfo tag
+            ]
+        };
+
+        let mut zero_len = prefix();
+        zero_len.push(0x00); // length = 0
+        assert_eq!(
+            parse_esds_asc(&zero_len),
+            None,
+            "a zero-length ASC must be None, not Some(vec![])"
+        );
+
+        let mut with_trailer = prefix();
+        with_trailer.push(0x02); // length = 2
+        with_trailer.extend_from_slice(&[0x12, 0x10]); // the ASC itself
+        with_trailer.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // trailing bytes
+        assert_eq!(
+            parse_esds_asc(&with_trailer),
+            Some(vec![0x12, 0x10]),
+            "bytes AFTER a complete ASC must not cause rejection"
+        );
     }
 
     #[test]
