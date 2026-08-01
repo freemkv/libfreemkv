@@ -873,6 +873,23 @@ fn parse_stsz(b: &[u8], max: usize) -> Vec<u32> {
 
 /// stco (32-bit) / co64 (64-bit) → chunk offsets.
 fn parse_stco(b: &[u8], is64: bool) -> Vec<u64> {
+    // `< 8` vs `<= 8` is equivalent, the same shape as `parse_stsd`'s header
+    // guard: at `b.len() == 8` this early return and falling through agree.
+    // Falling through computes `count = be32(b, 4)` (valid — indices 4..8
+    // exist) but then the per-entry guard `o + stride > b.len()` fails on the
+    // very first entry (`o == 8`, and `stride` is 4 or 8), so the loop body
+    // never runs either way and both paths return an empty Vec. The SAME
+    // pattern recurs in `parse_stsc`, `parse_stts`, `parse_ctts` and
+    // `parse_stss` below — each one's per-entry guard reads the identical
+    // `o` computed from the identical `b.len() == 8`, so all five converge on
+    // "no entries" at this boundary regardless of which side of it the check
+    // falls on. Confirmed by re-running the `<=` mutation against the full
+    // test suite (including `table_parsers_reject_every_length_up_to_the_header_size`,
+    // which exercises exactly this boundary for all five), which still
+    // passes. `< 8` vs `== 8` is NOT equivalent, though: it drops the
+    // rejection for every length strictly below 8, which then falls through
+    // to `be32(b, 4)` and panics out of bounds — that direction has its own
+    // test.
     if b.len() < 8 {
         return Vec::new();
     }
@@ -905,6 +922,7 @@ fn parse_stco(b: &[u8], is64: bool) -> Vec<u64> {
 
 /// stsc → (first_chunk, samples_per_chunk) entries (1-based first_chunk).
 fn parse_stsc(b: &[u8]) -> Vec<(u32, u32)> {
+    // `< 8` vs `<= 8`: equivalent, see the proof at `parse_stco`.
     if b.len() < 8 {
         return Vec::new();
     }
@@ -933,6 +951,11 @@ fn sample_offsets(sizes: &[u32], chunk_offsets: &[u64], stsc: &[(u32, u32)]) -> 
             .map(|&(nf, _)| (nf.saturating_sub(1)) as usize)
             .unwrap_or(n_chunks);
         let end = end.min(n_chunks);
+        // `<` vs `<=` is equivalent: at `start == end`, `spc[start..end]` is a
+        // valid EMPTY slice (Rust allows a range with equal bounds), and
+        // `.fill()` on an empty slice does nothing — identical to skipping the
+        // call entirely. Confirmed by re-running the `<=` mutation against
+        // the full test suite, which still passes.
         if start < end {
             spc[start..end].fill(per);
         }
@@ -964,6 +987,7 @@ fn sample_offsets(sizes: &[u32], chunk_offsets: &[u64], stsc: &[(u32, u32)]) -> 
 /// caps the expansion — the caller passes the track's real sample count, past which
 /// entries are never read (and an untrusted run-length must not grow the Vec).
 fn parse_stts(b: &[u8], max: usize) -> Vec<u32> {
+    // `< 8` vs `<= 8`: equivalent, see the proof at `parse_stco`.
     if b.len() < 8 {
         return Vec::new();
     }
@@ -989,6 +1013,7 @@ fn parse_stts(b: &[u8], max: usize) -> Vec<u32> {
 /// ctts → per-sample composition offsets (version 0 unsigned / version 1 signed).
 /// `max` caps the expansion, as in [`parse_stts`].
 fn parse_ctts(b: &[u8], max: usize) -> Vec<i32> {
+    // `< 8` vs `<= 8`: equivalent, see the proof at `parse_stco`.
     if b.len() < 8 {
         return Vec::new();
     }
@@ -1016,6 +1041,7 @@ fn parse_ctts(b: &[u8], max: usize) -> Vec<i32> {
 /// stss → set of 1-based sync sample numbers.
 fn parse_stss(b: &[u8]) -> std::collections::HashSet<u32> {
     let mut set = std::collections::HashSet::new();
+    // `< 8` vs `<= 8`: equivalent, see the proof at `parse_stco`.
     if b.len() < 8 {
         return set;
     }
@@ -1105,6 +1131,24 @@ mod tests {
         let offs = sample_offsets(&sizes, &chunks, &stsc);
         assert_eq!(offs[0], u64::MAX - 5);
         assert_eq!(offs[1], u64::MAX, "(MAX-5)+10 saturates to MAX");
+    }
+
+    /// `sidx` must advance by exactly one PER SAMPLE PLACED, so the third (and
+    /// every later) sample in a chunk picks up its own size, not the first
+    /// sample's reused over and over. With only two samples in a chunk this
+    /// bug is invisible — the second sample's pushed offset was already
+    /// computed from `sizes[0]` before `sidx` had a chance to matter — so this
+    /// test needs a chunk with THREE distinctly-sized samples to expose it.
+    #[test]
+    fn sample_offsets_advances_through_distinct_sizes_within_one_chunk() {
+        let sizes = [10u32, 20, 30];
+        let chunks = [1000u64];
+        let stsc = [(1u32, 3u32)]; // all 3 samples in the one chunk
+        assert_eq!(
+            sample_offsets(&sizes, &chunks, &stsc),
+            vec![1000, 1010, 1030],
+            "1000, then +10, then +20 — each sample's OWN size, in order"
+        );
     }
 
     #[test]
@@ -1850,6 +1894,53 @@ mod tests {
         stsc.extend_from_slice(&7u32.to_be_bytes());
         stsc.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx (unused)
         assert_eq!(parse_stsc(&stsc), vec![(1, 7)]);
+    }
+
+    /// Every one of these five table parsers opens with `if b.len() < 8 {
+    /// return <empty> }` before reading `count = be32(b, 4)`, which needs
+    /// `b.len() >= 8`. No existing fixture ever called any of them with a
+    /// buffer shorter than 8 bytes — every test builds a complete box — so a
+    /// `<`→`==` mutant of that guard (which only early-returns at EXACTLY
+    /// `b.len() == 8`, letting every length below it fall through to the
+    /// out-of-bounds `be32` read) had nothing to fail against. Pins the
+    /// entire boundary at once, every length from 0 through 8, for all five.
+    #[test]
+    fn table_parsers_reject_every_length_up_to_the_header_size() {
+        for len in 0..=8 {
+            let b = vec![0u8; len];
+            assert!(
+                parse_stco(&b, false).is_empty(),
+                "parse_stco(is64=false) len={len}"
+            );
+            assert!(
+                parse_stco(&b, true).is_empty(),
+                "parse_stco(is64=true) len={len}"
+            );
+            assert!(parse_stsc(&b).is_empty(), "parse_stsc len={len}");
+            assert!(
+                parse_stts(&b, MAX_SAMPLE_COUNT).is_empty(),
+                "parse_stts len={len}"
+            );
+            assert!(
+                parse_ctts(&b, MAX_SAMPLE_COUNT).is_empty(),
+                "parse_ctts len={len}"
+            );
+            assert!(parse_stss(&b).is_empty(), "parse_stss len={len}");
+        }
+    }
+
+    /// `co64`'s 8-byte offsets are decoded byte-by-byte
+    /// (`u64::from_be_bytes([b[o], b[o+1], ..., b[o+7]])`) — a SEPARATE code
+    /// path from the 32-bit `stco` case, which goes through `be32` instead and
+    /// was never itself built with a co64 fixture anywhere in this file. Every
+    /// byte here is distinct, so an index slip (off by one, negated, or
+    /// scaled) that reads the wrong byte cannot agree by coincidence.
+    #[test]
+    fn parse_stco_co64_reads_each_byte_from_its_own_offset() {
+        let mut b = vec![0u8; 4]; // version+flags (unused by this parser)
+        b.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+        b.extend_from_slice(&0x1122334455667788u64.to_be_bytes());
+        assert_eq!(parse_stco(&b, true), vec![0x1122334455667788u64]);
     }
 
     #[test]
