@@ -2048,22 +2048,7 @@ impl Disc {
         // one shared PGS classifier); the rip path leaves it off — the muxer
         // detects forced while muxing, without a second read of the clip.
         if opts.probe_forced_subtitles {
-            // One cache across every title: a disc's playlists overwhelmingly
-            // reference the same handful of clips (main feature, play-all,
-            // seamless-branch variants), so without memoisation the same physical
-            // extents are re-read from the drive once per playlist — 30-150 times
-            // on a typical Blu-ray.
-            let mut cache = pgs_forced_probe::ForcedProbeCache::new();
-            for title in &mut titles {
-                if title.content_format == ContentFormat::BdTs {
-                    pgs_forced_probe::probe_and_set_forced(
-                        reader,
-                        title,
-                        &mut cache,
-                        opts.halt.as_ref(),
-                    );
-                }
-            }
+            Self::probe_forced_subtitles_for_bdts_titles(reader, &mut titles, opts.halt.as_ref());
         }
         crate::labels::fill_defaults(&mut titles);
 
@@ -2183,6 +2168,35 @@ impl Disc {
     /// change this list in the same edit.
     pub const CANONICAL_TITLE_ORDER_KEYS: &'static [&'static str] =
         &["fits-disc", "largest-size", "longest", "richest-audio"];
+
+    /// Content-based forced-subtitle detection, restricted to `BdTs` titles —
+    /// gates on the STREAM CONTAINER, not the disc-tree format, because a
+    /// disc can carry non-`BdTs` titles even under `BDMV/` scanning. Only
+    /// `BdTs` titles carry PES-wrapped PGS the shared classifier
+    /// (`pgs_forced_probe`) understands; running it against an HD-DVD/DVD
+    /// (`MpegPs`) title's extents would demux the wrong container.
+    ///
+    /// Pulled out of `scan_with` as its own callable predicate: the decision
+    /// is otherwise reachable only by driving the full scan pipeline (tree
+    /// dispatch → title parsing → this loop), so a test could not pin the
+    /// gate without also authoring an entire synthetic disc image.
+    fn probe_forced_subtitles_for_bdts_titles(
+        reader: &mut dyn SectorSource,
+        titles: &mut [DiscTitle],
+        halt: Option<&crate::halt::Halt>,
+    ) {
+        // One cache across every title: a disc's playlists overwhelmingly
+        // reference the same handful of clips (main feature, play-all,
+        // seamless-branch variants), so without memoisation the same physical
+        // extents are re-read from the drive once per playlist — 30-150 times
+        // on a typical Blu-ray.
+        let mut cache = pgs_forced_probe::ForcedProbeCache::new();
+        for title in titles.iter_mut() {
+            if title.content_format == ContentFormat::BdTs {
+                pgs_forced_probe::probe_and_set_forced(reader, title, &mut cache, halt);
+            }
+        }
+    }
 
     pub fn canonical_title_order(
         a: &DiscTitle,
@@ -3272,6 +3286,321 @@ mod tests {
         assert_eq!(got[0].sector_count, 100_000);
     }
 
+    // ── scan_image's CSS-crack gate: DVD-only, never AACS/HD-DVD ────────────
+
+    /// Minimal VIDEO_TS.IFO (VMG): one title, VTS 1, title 1. Layout mirrors
+    /// `disc::dvd`'s own IFO builders (magic@0, TT_SRPT ptr@0xC4).
+    fn dvd_vmg_bytes() -> Vec<u8> {
+        let tt_srpt_sector = 1u32;
+        let mut d = vec![0u8; 2 * 2048];
+        d[0..12].copy_from_slice(b"DVDVIDEO-VMG");
+        d[0xC4..0xC8].copy_from_slice(&tt_srpt_sector.to_be_bytes());
+        let base = tt_srpt_sector as usize * 2048;
+        d[base..base + 2].copy_from_slice(&1u16.to_be_bytes()); // num_titles = 1
+        let e = base + 8;
+        d[e + 2..e + 4].copy_from_slice(&1u16.to_be_bytes()); // chapters
+        d[e + 6] = 1; // vts
+        d[e + 7] = 1; // vts_title
+        d
+    }
+
+    /// Minimal VTS_01_0.IFO: one PGC, one cell `[first, last]`, NTSC/4:3, no
+    /// audio/subs. Layout mirrors `disc::dvd`'s own IFO builders.
+    fn dvd_vts_bytes(vob_start: u32, first_sector: u32, last_sector: u32) -> Vec<u8> {
+        let pgcit_sector = 2u32;
+        let mut d = vec![0u8; 4 * 2048];
+        d[0..12].copy_from_slice(b"DVDVIDEO-VTS");
+        d[0xC4..0xC8].copy_from_slice(&vob_start.to_be_bytes()); // vtstt_vobs
+        d[0xCC..0xD0].copy_from_slice(&pgcit_sector.to_be_bytes());
+        d[0x202..0x204].copy_from_slice(&0u16.to_be_bytes()); // num_audio
+        d[0x254..0x256].copy_from_slice(&0u16.to_be_bytes()); // num_subs
+
+        let pg = pgcit_sector as usize * 2048;
+        d[pg..pg + 2].copy_from_slice(&1u16.to_be_bytes()); // num_pgcs = 1
+        let pgc_rel: u32 = 0x100;
+        d[pg + 8 + 4..pg + 8 + 8].copy_from_slice(&pgc_rel.to_be_bytes());
+        let pgc = pg + pgc_rel as usize;
+        d[pgc + 0x02] = 1; // nr_of_programs
+        d[pgc + 0x03] = 1; // nr_of_cells
+        d[pgc + 0x06] = 0x30; // BCD 30s duration
+        d[pgc + 0x07] = 0b0100_0000; // 25fps rate bits
+        let cell_tbl_rel: u16 = 0xF0;
+        let pgm_map_rel: u16 = 0xEC;
+        d[pgc + 0xE6..pgc + 0xE8].copy_from_slice(&pgm_map_rel.to_be_bytes());
+        d[pgc + 0xE8..pgc + 0xEA].copy_from_slice(&cell_tbl_rel.to_be_bytes());
+        d[pgc + pgm_map_rel as usize] = 1; // program 0 -> cell 1
+        let cell_base = pgc + cell_tbl_rel as usize;
+        d[cell_base + 8..cell_base + 12].copy_from_slice(&first_sector.to_be_bytes());
+        d[cell_base + 20..cell_base + 24].copy_from_slice(&last_sector.to_be_bytes());
+        d
+    }
+
+    /// A still-scrambled CSS DVD image must come back from `scan_image` with
+    /// `css.is_some()` and `encrypted == true` — the known-plaintext crack must
+    /// actually run against a `DiscFormat::Dvd` image with titles.
+    #[test]
+    fn scan_image_scrambled_css_dvd_is_cracked_and_marked_encrypted() {
+        use crate::udf::fixture::*;
+
+        let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let crackable = crackable_css_sector(&title_key).to_vec();
+
+        let vmg = dvd_vmg_bytes();
+        // vob_start = 1000, single cell sector [10, 10] -> 1-sector extent.
+        let vts = dvd_vts_bytes(1000, 10, 10);
+
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".into(),
+                icb_lba: 50,
+                dir_data_lba: 51,
+                files: vec![
+                    file_with("VIDEO_TS.IFO", 60, 5000, vmg, true),
+                    file_with("VTS_01_0.IFO", 62, 6000, vts, true),
+                ],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        // IFO absolute LBA = PART_START(2000) + data_lba(6000) = 8000; extent
+        // absolute LBA = 8000 + vob_start(1000) + first_sector(10) = 9010.
+        disc.put_bytes(9010, &crackable);
+
+        let disc_scan = Disc::scan_image(&mut disc, 500_000, &ScanOptions::default())
+            .expect("scan_image must succeed on this synthetic DVD image");
+        assert_eq!(disc_scan.format, DiscFormat::Dvd, "sanity: image is DVD");
+        assert!(!disc_scan.titles.is_empty(), "sanity: a title was parsed");
+        assert!(
+            disc_scan.css.is_some(),
+            "a scrambled CSS DVD image must be cracked, not left in the clear"
+        );
+        assert!(
+            disc_scan.encrypted,
+            "a cracked CSS DVD must be reported encrypted"
+        );
+    }
+
+    /// An HD-DVD image is also MPEG-PS, but must NEVER enter the CSS
+    /// known-plaintext crack — its `.evo` payload can never satisfy the CSS
+    /// attack, and running it wastes a 50_000-sector scan budget in the real
+    /// case. Prove the gate actually keeps the crack away: the HD-DVD clip's
+    /// own extent carries a genuinely Stevenson-crackable CSS sector, so if the
+    /// gate wrongly let the crack run, `disc.css` would come back `Some`.
+    #[test]
+    fn scan_image_hddvd_never_enters_css_crack() {
+        use crate::udf::fixture::*;
+
+        let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let crackable = crackable_css_sector(&title_key).to_vec();
+
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".into(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: vec![file_with("FEATURE.EVO", 30, 9000, crackable, true)],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+
+        let disc_scan = Disc::scan_image(&mut disc, 500_000, &ScanOptions::default())
+            .expect("scan_image must succeed on this synthetic HD-DVD image");
+        assert_eq!(
+            disc_scan.format,
+            DiscFormat::HdDvd,
+            "sanity: image is HD-DVD, not DVD"
+        );
+        assert!(!disc_scan.titles.is_empty(), "sanity: a title was parsed");
+        assert!(
+            disc_scan.css.is_none(),
+            "the CSS crack must never run against a non-DVD (HD-DVD/AACS) image, \
+             even when its content happens to be CSS-crackable"
+        );
+    }
+
+    // ── scan_with's forced-subtitle probe: BdTs-only gate (finding 10) ──────
+
+    /// A `PGS` subtitle title with the given `content_format`, one extent
+    /// starting at `start_lba`, for the `probe_forced_subtitles_for_bdts_titles`
+    /// container gate.
+    fn pgs_title(content_format: ContentFormat, start_lba: u32) -> DiscTitle {
+        DiscTitle {
+            content_format,
+            streams: vec![Stream::Subtitle(SubtitleStream {
+                pid: 0x1200,
+                codec: Codec::Pgs,
+                language: "eng".into(),
+                forced: false,
+                qualifier: LabelQualifier::None,
+                codec_data: None,
+            })],
+            extents: vec![Extent {
+                start_lba,
+                sector_count: 4,
+            }],
+            ..DiscTitle::empty()
+        }
+    }
+
+    /// Records every LBA read — used to prove WHICH title's extents were
+    /// actually touched, not merely that some read happened.
+    struct ForcedProbeSpyReader {
+        lbas: std::cell::RefCell<Vec<u32>>,
+    }
+    impl SectorSource for ForcedProbeSpyReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            self.lbas.borrow_mut().push(lba);
+            let n = (count as usize * 2048).min(buf.len());
+            buf[..n].fill(0);
+            Ok(n)
+        }
+    }
+
+    /// The forced-subtitle probe gates on `content_format == BdTs`, NOT on
+    /// whether a title happens to declare a PGS stream: an HD-DVD/DVD
+    /// (`MpegPs`) title's PES container is not what the shared PGS classifier
+    /// understands, so it must never be probed even if it carries a PGS pid.
+    /// The BdTs title (at LBA 0) must be probed; the MpegPs title (at LBA
+    /// 5000) must never be touched.
+    #[test]
+    fn probe_forced_subtitles_only_touches_bdts_titles() {
+        let mut titles = vec![
+            pgs_title(ContentFormat::BdTs, 0),
+            pgs_title(ContentFormat::MpegPs, 5000),
+        ];
+        let mut reader = ForcedProbeSpyReader {
+            lbas: std::cell::RefCell::new(Vec::new()),
+        };
+        Disc::probe_forced_subtitles_for_bdts_titles(&mut reader, &mut titles, None);
+        let lbas = reader.lbas.borrow();
+        assert!(
+            !lbas.is_empty(),
+            "the BdTs title must be probed (a read must occur)"
+        );
+        assert!(
+            lbas.iter().all(|&l| l < 5000),
+            "the MpegPs title's extent (LBA 5000) must never be read: {lbas:?}"
+        );
+    }
+
+    // ── scan_with's capacity_bytes feeds canonical_title_order (finding 10) ─
+
+    /// Two HD-DVD `.evo` clips (no VTI/playlist, so each is its own title —
+    /// see `scan_hddvd_titles`), with the given DECLARED byte sizes. No real
+    /// content is written; `scan_with`'s capacity-threshold ranking depends
+    /// only on the ICB-declared size, not the bytes at the extent.
+    fn hddvd_two_clip_disc(
+        main_bytes: u32,
+        other_bytes: u32,
+    ) -> (crate::udf::fixture::MemDisc, udf::UdfFs) {
+        use crate::udf::fixture::*;
+        let files = vec![
+            file("MAIN.EVO", 100, 5_000, main_bytes, true),
+            file("OTHER.EVO", 101, 50_000, other_bytes, true),
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".into(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        (disc, udf)
+    }
+
+    /// `scan_with`'s `capacity_bytes = capacity as u64 * 2048` feeds
+    /// `canonical_title_order`'s "bigger than the whole disc = play-all
+    /// composite" threshold. Chosen so `capacity * 2048` clears both titles
+    /// (neither is oversize, so the bigger one — OTHER — ranks first), but
+    /// `capacity + 2048` lands BETWEEN the two sizes: MAIN stays non-oversize
+    /// while OTHER flips to oversize and gets demoted, changing `titles[0]`.
+    /// A `*` → `+` mutation is caught by this ranking flip, not merely a
+    /// wrong numeric threshold value.
+    #[test]
+    fn scan_with_capacity_bytes_uses_multiplication_not_addition() {
+        const CAPACITY_SECTORS: u32 = 3_997_952; // *2048 = 8_187_805_696; +2048 = 4_000_000
+        let (mut disc, udf) = hddvd_two_clip_disc(3_000_000, 5_000_000);
+        let scanned = Disc::scan_with(
+            &mut disc,
+            CAPACITY_SECTORS,
+            None,
+            None,
+            &ScanOptions::default(),
+            udf,
+        )
+        .expect("scan_with must succeed on this synthetic HD-DVD image");
+        assert_eq!(
+            scanned.titles.first().map(|t| t.playlist.as_str()),
+            Some("OTHER.EVO"),
+            "with the real *2048 capacity both titles are non-oversize, so the \
+             bigger clip (OTHER, 5_000_000) must rank first: {:?}",
+            scanned
+                .titles
+                .iter()
+                .map(|t| &t.playlist)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Same mechanism as above, tuned to catch a `*` → `/` mutation instead:
+    /// `capacity * 2048` clears both titles, but `capacity / 2048` collapses
+    /// to a threshold far below MAIN's declared size while still leaving
+    /// MAIN under it, so only OTHER flips to oversize.
+    #[test]
+    fn scan_with_capacity_bytes_uses_multiplication_not_division() {
+        const CAPACITY_SECTORS: u32 = 204_800_000; // *2048 = huge; /2048 = 100_000
+        let (mut disc, udf) = hddvd_two_clip_disc(1_000, 5_000_000);
+        let scanned = Disc::scan_with(
+            &mut disc,
+            CAPACITY_SECTORS,
+            None,
+            None,
+            &ScanOptions::default(),
+            udf,
+        )
+        .expect("scan_with must succeed on this synthetic HD-DVD image");
+        assert_eq!(
+            scanned.titles.first().map(|t| t.playlist.as_str()),
+            Some("OTHER.EVO"),
+            "with the real *2048 capacity both titles are non-oversize, so the \
+             bigger clip (OTHER, 5_000_000) must rank first: {:?}",
+            scanned
+                .titles
+                .iter()
+                .map(|t| &t.playlist)
+                .collect::<Vec<_>>()
+        );
+    }
+
     // ── Unknown must not fabricate a plausible value (finding 2) ────────────
 
     /// `Resolution::Unknown` has no dimensions, so `pixels()` must report none
@@ -3835,6 +4164,201 @@ mod tests {
         assert_eq!(
             Disc::detect_disc_format(&mut disc, &udf, &[]),
             DiscFormat::HdDvd
+        );
+    }
+
+    /// `read_mkb_content` reads a bounded 16 MiB starting prefix and must GROW
+    /// it when the MKB's real record stream runs past that prefix — otherwise
+    /// the caller silently gets a truncated MKB. This fixture's record stream
+    /// is deliberately built so the first 16 records land EXACTLY on the 16
+    /// MiB boundary (so the 16 MiB prefix alone parses as a clean, complete
+    /// record stream — the case a naive "n < buf.len() means done" check would
+    /// wrongly accept) and 4 more MiB of records follow, terminated by the
+    /// explicit `00 000000` end marker. Only a caller that actually grows past
+    /// 16 MiB recovers the true 20 MiB content length.
+    ///
+    /// Run inside a watchdog thread: some mutants of the growth step (e.g.
+    /// `want / 2` instead of `want * 2`) walk `want` to 0 and spin forever
+    /// re-reading a zero-length prefix, which must fail this test rather than
+    /// hang the suite.
+    #[test]
+    fn read_mkb_content_grows_prefix_past_16mib_when_records_run_longer() {
+        use crate::udf::fixture::*;
+
+        const REC_LEN: usize = 1024 * 1024; // 1 MiB, header included
+        const N_RECORDS: usize = 20; // 20 MiB of real record stream
+        const TOTAL: usize = N_RECORDS * REC_LEN;
+
+        let mut mkb = Vec::with_capacity(TOTAL + 4);
+        for _ in 0..N_RECORDS {
+            mkb.push(0x04); // REC_SUBSET_DIFFERENCE — any non-zero, non-terminator type
+            let len = REC_LEN as u32;
+            mkb.push((len >> 16) as u8);
+            mkb.push((len >> 8) as u8);
+            mkb.push(len as u8);
+            mkb.resize(mkb.len() + (REC_LEN - 4), 0xAA);
+        }
+        mkb.extend_from_slice(&[0, 0, 0, 0]); // explicit end-of-records marker
+        assert_eq!(mkb.len(), TOTAL + 4);
+
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "AACS".into(),
+                icb_lba: 12,
+                dir_data_lba: 13,
+                files: vec![file_with("MKB_RO.inf", 14, 1000, mkb, true)],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut disc = disc;
+            let r = Disc::read_mkb_content(&mut disc, &udf).map(|v| v.len());
+            let _ = tx.send(r);
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "read_mkb_content did not terminate — the prefix-growth loop \
+                 spun forever instead of converging on the record-stream length",
+            )
+            .expect("read_mkb_content failed");
+        assert_eq!(
+            got, TOTAL,
+            "must recover the full 20 MiB record stream, not the 16 MiB starting prefix"
+        );
+    }
+
+    // ── identify(): AACS-directory encrypted gate (finding 6) ──────────────
+
+    /// A `ScsiTransport` that serves a synthetic UDF image (built with the
+    /// shared `udf::fixture` helpers) through real READ CAPACITY(10) /
+    /// READ(10) commands, so `Disc::identify` is exercised end-to-end through
+    /// a real `Drive` rather than mocking `identify` itself — proving the
+    /// AACS-directory check is actually what the caller uses, not just that
+    /// `UdfFs::find_dir` works in isolation.
+    struct MemDiscDrive {
+        mem: crate::udf::fixture::MemDisc,
+        last_lba: u32,
+    }
+    impl crate::scsi::ScsiTransport for MemDiscDrive {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: crate::scsi::DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<crate::scsi::ScsiResult> {
+            match cdb.first().copied() {
+                Some(op) if op == crate::scsi::SCSI_READ_CAPACITY => {
+                    data[0..4].copy_from_slice(&self.last_lba.to_be_bytes());
+                    data[4..8].copy_from_slice(&2048u32.to_be_bytes());
+                    Ok(crate::scsi::ScsiResult {
+                        status: 0,
+                        bytes_transferred: 8,
+                        sense: [0u8; 32],
+                    })
+                }
+                Some(op) if op == crate::scsi::SCSI_READ_10 => {
+                    let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+                    let count = u16::from_be_bytes([cdb[7], cdb[8]]);
+                    let n = self.mem.read_sectors(lba, count, data, false)?;
+                    Ok(crate::scsi::ScsiResult {
+                        status: 0,
+                        bytes_transferred: n,
+                        sense: [0u8; 32],
+                    })
+                }
+                _ => Ok(crate::scsi::ScsiResult {
+                    status: 0,
+                    bytes_transferred: 0,
+                    sense: [0u8; 32],
+                }),
+            }
+        }
+    }
+
+    /// Build a synthetic disc with (or without) a root `/AACS` directory
+    /// and/or a nested `/BDMV/AACS` directory, then run the real
+    /// `Disc::identify` end-to-end through a mocked `Drive`.
+    fn identify_with_aacs_dirs(has_aacs: bool, has_bdmv_aacs: bool) -> DiscId {
+        use crate::udf::fixture::*;
+        let mut subdirs = Vec::new();
+        if has_aacs {
+            subdirs.push(DirSpec {
+                name: "AACS".into(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: Vec::new(),
+            });
+        }
+        if has_bdmv_aacs {
+            subdirs.push(DirSpec {
+                name: "BDMV".into(),
+                icb_lba: 30,
+                dir_data_lba: 31,
+                files: Vec::new(),
+                subdirs: vec![DirSpec {
+                    name: "AACS".into(),
+                    icb_lba: 32,
+                    dir_data_lba: 33,
+                    files: Vec::new(),
+                    subdirs: Vec::new(),
+                }],
+            });
+        }
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs,
+        };
+        let mut mem = MemDisc::new();
+        build_udf_skeleton(&mut mem, 10);
+        lay_dir(&mut mem, &root);
+        let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(MemDiscDrive {
+            mem,
+            last_lba: 99_999,
+        }));
+        Disc::identify(&mut drive).expect("identify must succeed on this synthetic image")
+    }
+
+    /// A root `/AACS` directory alone (the near-universal retail BD/UHD
+    /// shape) must report `encrypted == true`.
+    #[test]
+    fn identify_reports_encrypted_for_aacs_dir_alone() {
+        let id = identify_with_aacs_dirs(true, false);
+        assert!(id.encrypted, "/AACS alone must report encrypted");
+    }
+
+    /// A nested `/BDMV/AACS` directory alone must ALSO report
+    /// `encrypted == true` — dropping this side of the `||` (degrading it to
+    /// `&&`) would report virtually every retail BD as unencrypted, since
+    /// real discs almost never carry both paths at once.
+    #[test]
+    fn identify_reports_encrypted_for_bdmv_aacs_dir_alone() {
+        let id = identify_with_aacs_dirs(false, true);
+        assert!(id.encrypted, "/BDMV/AACS alone must report encrypted");
+    }
+
+    /// Neither AACS path present must report `encrypted == false`.
+    #[test]
+    fn identify_reports_unencrypted_when_no_aacs_dir_exists() {
+        let id = identify_with_aacs_dirs(false, false);
+        assert!(
+            !id.encrypted,
+            "no AACS directory at all must report unencrypted"
         );
     }
 
@@ -5453,6 +5977,43 @@ mod tests {
             a.channels,
             AudioChannels::Surround51,
             "an unmapped (Unknown) major-sync channel count must not overwrite a known container value"
+        );
+    }
+
+    /// A major sync whose rate nibble (`format_info` bits 31..28) is `0x3` —
+    /// not one of the six whitelisted rates `truehd_sample_rate_hz` recognises
+    /// — must leave the container's sample rate untouched, mirroring the
+    /// channels guard above ("never write a wrong SamplingFrequency"). Both
+    /// channel-assignment masks are zeroed so `truehd_channels` returns `None`
+    /// too, isolating this to the sample-rate guard alone.
+    #[test]
+    fn correct_truehd_channels_leaves_sample_rate_when_nibble_unrecognized() {
+        let pid = 0x1100u16;
+        let format_info = 0x3u32 << 28; // unrecognised rate nibble; ch8/ch6 masks = 0
+        let es = thd_major_sync_es(format_info, 0);
+        let ts = thd_bd_pes(pid, &es);
+        let mut title = DiscTitle::empty();
+        title.streams = vec![truehd_audio_stream(
+            pid,
+            AudioChannels::Surround51,
+            SampleRate::S48,
+        )];
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 1,
+        }];
+        let mut reader = ThdSpyReader {
+            calls: std::cell::RefCell::new(Vec::new()),
+            data: ts,
+        };
+        correct_truehd_channels(&mut reader, &mut title);
+        let Stream::Audio(a) = &title.streams[0] else {
+            panic!("stream type must be preserved")
+        };
+        assert_eq!(
+            a.sample_rate,
+            SampleRate::S48,
+            "an unrecognised major-sync rate nibble must not overwrite the container's sample rate"
         );
     }
 

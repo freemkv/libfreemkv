@@ -2272,6 +2272,56 @@ mod tests {
         );
     }
 
+    /// The wrap-vs-backstep test above (`cra_after_33bit_pts_wrap_not_rewritten`)
+    /// keeps `high_pts` near the very top of the 33-bit range, which is close
+    /// enough to the `PTS_WRAP_PERIOD / 2` threshold that `high - unwrapped`
+    /// and a hand-flipped `high + unwrapped` land on the SAME side of the
+    /// threshold at every step in that sequence — it does not actually
+    /// distinguish the two. This test uses PTS magnitudes around 3e9 (order
+    /// 2^32, well below the wrap threshold but large enough that a real
+    /// stream reaches it in well under an hour), where the subtraction and
+    /// the addition diverge: ordinary forward progression keeps
+    /// `high - unwrapped` small (no bogus wrap), but `high + unwrapped`
+    /// already exceeds `PTS_WRAP_PERIOD / 2` on the very next frame, which
+    /// pollutes `pts_wrap_offset` by a full period. That pollution then
+    /// masks the GENUINE two-clip splice that follows: the splice's small
+    /// reset PTS gets `+= pts_wrap_offset` and lands ABOVE the (also
+    /// polluted) high-water mark instead of below it, so the backward-step
+    /// detector never fires and the splice CRA is wrongly left as CRA
+    /// instead of being rewritten to BLA_W_LP.
+    #[test]
+    fn cra_splice_detected_at_large_pts_magnitude_not_masked_by_wrap_logic() {
+        let mut parser = HevcParser::new();
+        // Clip 1: two ordinary forward-progressing frames at ~3e9 ticks
+        // (order 2^32, comfortably below PTS_WRAP_PERIOD/2 = 2^32 exactly,
+        // and far from the actual 2^33 wrap point).
+        let clip1_base = 3_000_000_000i64;
+        parser.parse(&make_pes(cra_au(&[0x01]), Some(clip1_base)));
+        let dip = parser.parse(&make_pes(cra_au(&[0x02]), Some(clip1_base + 3750)));
+        assert_eq!(
+            nal_type_of(&nals_of(&dip[0].data)[0]),
+            NAL_CRA_NUT,
+            "ordinary forward progression at large PTS magnitude must not itself \
+             be mistaken for anything"
+        );
+        // Clip 2 splice: PES PTS resets to a small new-clip base — a genuine,
+        // large (~3e9-tick) backward step that is NOT a 2^33 wrap (the
+        // backward delta here is far short of PTS_WRAP_PERIOD/2).
+        let splice = parser.parse(&make_pes(cra_au(&[0x03]), Some(500)));
+        assert_eq!(
+            nal_type_of(&nals_of(&splice[0].data)[0]),
+            NAL_BLA_W_LP,
+            "a genuine large backward PTS reset at this magnitude must still be \
+             detected as a clip splice and rewrite the CRA to BLA_W_LP"
+        );
+        assert_eq!(
+            splice[0].pts_ns,
+            pts_to_ns(500),
+            "the emitted PTS must be the raw splice-clip PTS, unaffected by the \
+             internal unwrap bookkeeping"
+        );
+    }
+
     /// Test 3: non-CRA NALs are never rewritten even when a boundary IS marked.
     /// IDR (19), RASL (8/9), VPS/SPS/PPS, and a trailing slice all pass through
     /// unmodified; the IDR clears the pending boundary so no later CRA is wrongly
@@ -3342,6 +3392,61 @@ mod tests {
         assert!(
             parser.codec_private().is_none(),
             "oversized param set must not produce a (truncated) hvcC"
+        );
+    }
+
+    /// The hvcC array length is a 16-bit big-endian field written as two
+    /// separate `push`es: `(len >> 8) as u8` then `len as u8`. Every VPS/SPS/
+    /// PPS the rest of the suite feeds is well under 256 bytes, so the high
+    /// byte is always 0 and a `>>` -> `<<` mutation (which also always
+    /// truncates to 0 for those inputs, since `(len << 8) as u8` masks off
+    /// exactly the low 8 bits) is unobservable there. A real HEVC SPS with an
+    /// extended VUI/HRD block can exceed 256 bytes, so use a 300+ byte VPS,
+    /// SPS and PPS here and decode the 16-bit length fields back to confirm
+    /// they round-trip to the exact NAL length, not merely a byte that
+    /// happens to be 0.
+    #[test]
+    fn hvcc_array_length_round_trips_above_256_bytes() {
+        let mut parser = HevcParser::new();
+        let mut data = Vec::new();
+        // VPS: 2-byte NAL header + 300 filler bytes -> NAL length 302.
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(32));
+        data.extend_from_slice(&vec![0x11u8; 300]);
+        // SPS: same size.
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(33));
+        data.extend_from_slice(&vec![0x11u8; 300]);
+        // PPS: same size.
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(34));
+        data.extend_from_slice(&vec![0x11u8; 300]);
+        parser.parse(&make_pes(data, Some(0)));
+        let cp = parser.codec_private().expect("hvcC");
+
+        let expected_nal_len = 2 + 300; // NAL header + payload
+        let mut o = 23; // past the 23-byte fixed header
+        assert_eq!(cp[o], 0x20 | 32, "VPS array nal_type byte");
+        let vps_len = u16::from_be_bytes([cp[o + 3], cp[o + 4]]) as usize;
+        assert_eq!(
+            vps_len, expected_nal_len,
+            "VPS length must round-trip above 256 bytes"
+        );
+        o += 5 + vps_len;
+
+        assert_eq!(cp[o], 0x20 | 33, "SPS array nal_type byte");
+        let sps_len = u16::from_be_bytes([cp[o + 3], cp[o + 4]]) as usize;
+        assert_eq!(
+            sps_len, expected_nal_len,
+            "SPS length must round-trip above 256 bytes"
+        );
+        o += 5 + sps_len;
+
+        assert_eq!(cp[o], 0x20 | 34, "PPS array nal_type byte");
+        let pps_len = u16::from_be_bytes([cp[o + 3], cp[o + 4]]) as usize;
+        assert_eq!(
+            pps_len, expected_nal_len,
+            "PPS length must round-trip above 256 bytes"
         );
     }
 
