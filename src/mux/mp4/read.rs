@@ -2938,6 +2938,46 @@ mod tests {
         );
     }
 
+    /// `find_boxes_capped` stops at exactly `cap` matches, not one past it —
+    /// the whole point being that a caller asking for `cap` matches never
+    /// forces the scan to walk (and match-collect) further into a crafted
+    /// payload than it asked for.
+    #[test]
+    fn find_boxes_capped_stops_exactly_at_cap_not_one_past() {
+        let mut payload = Vec::new();
+        for _ in 0..3 {
+            payload.extend_from_slice(&mp4_box(b"test", &[]));
+        }
+        let out = find_boxes_capped(&payload, b"test", 2);
+        assert_eq!(
+            out.len(),
+            2,
+            "three matches exist in the payload; cap=2 must return exactly 2"
+        );
+    }
+
+    /// The declared box size is decoded from four specific bytes
+    /// (`payload[pos..pos+4]`, big-endian). A size deliberately chosen so byte
+    /// 1 differs from byte 0 catches an index slip that rereads byte 0 (or any
+    /// other wrong offset) instead of the byte the field actually occupies —
+    /// with a small size every byte but the last is zero, so such a slip would
+    /// go unnoticed.
+    #[test]
+    fn find_boxes_capped_decodes_the_size_field_from_its_own_bytes() {
+        let want_size: u32 = 0x0001_0010; // byte0=0x00 byte1=0x01 byte2=0x00 byte3=0x10
+        let mut payload = vec![0u8; want_size as usize];
+        payload[0..4].copy_from_slice(&want_size.to_be_bytes());
+        payload[4..8].copy_from_slice(b"test");
+        let out = find_boxes_capped(&payload, b"test", 1);
+        assert_eq!(out.len(), 1, "the declared-size box must be found");
+        assert_eq!(
+            out[0].len() as u32,
+            want_size - 8,
+            "the matched payload slice's length must match the size field \
+             decoded from its own four bytes"
+        );
+    }
+
     /// An `stsc` entry names a `first_chunk` that may exceed the chunk count the
     /// `stco` actually declares (a truncated or crafted table). The run it would
     /// fill has to be clamped to the chunks that exist — indexing `spc` past its
