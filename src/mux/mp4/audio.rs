@@ -44,6 +44,20 @@ impl<'a> BitReader<'a> {
         self.bit += n;
     }
     /// Read `n` bits (n ≤ 32). Returns 0 past end of data (callers pre-check len).
+    ///
+    /// The accumulate step below (`(v << 1) | bit`) is one instance of a
+    /// pattern repeated throughout this file — shift an accumulator left by
+    /// exactly the width of the next field, then OR in that field, mask-limited
+    /// to the same width (the `push` closures in `dac3_box`, `dec3_box` and
+    /// `ddts_box`; the multi-byte bit-field extractions in `parse_eac3` and
+    /// `parse_dts`). Because the shift always vacates precisely the bits the OR
+    /// then fills, and never more, the two operands never share a set bit — so
+    /// `|` and `^` agree on every input, always. Mutation testing flags each of
+    /// these `|` sites as a surviving `|`→`^` mutant; that is expected and is
+    /// not a coverage gap. Don't write tests chasing it and don't "fix" it by
+    /// switching to `^` — either spelling is correct and equally unenforceable
+    /// by a test, so `|` stays because it is the conventional way to write "set
+    /// these bits" in a bitstream packer.
     fn read(&mut self, n: usize) -> u32 {
         let mut v = 0u32;
         for _ in 0..n {
