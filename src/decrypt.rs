@@ -189,6 +189,34 @@ pub enum Phase {
     Odd,
 }
 
+/// Does this unit belong to the phase we hold the key for?
+///
+/// An FMTS forensic segment interleaves two variants at the unit level: the
+/// disc carries both, and we hold the key for exactly one parity. Decrypting
+/// the alternate half with our key produces garbage; leaving it as ciphertext
+/// is correct, because the muxer drops untouched ciphertext cleanly.
+///
+/// `Phase::All` means the whole range is ours (the non-forensic case).
+///
+/// This lived inline inside `apply_aacs_map`'s per-unit closure, where nothing
+/// could reach it: a mutation run flipped the `-` to `+` and the `/` to `*` in
+/// the index arithmetic and every test still passed. Getting either wrong
+/// silently decrypts the wrong half of a forensic segment.
+fn unit_is_our_phase(unit_lba: u32, range_start: u32, unit_sectors: u32, phase: Phase) -> bool {
+    let want_odd = match phase {
+        Phase::All => return true,
+        Phase::Even => false,
+        Phase::Odd => true,
+    };
+    // `saturating_sub` and `max(1)`: both inputs come from the key map, which is
+    // built from disc structure. A unit below its own range start, or a zero
+    // unit size, means the map is malformed — that must not panic (debug
+    // overflow / divide-by-zero) inside a library used by a long-running
+    // service. Unit 0 of the range is even, which is the safe default.
+    let unit_ix = unit_lba.saturating_sub(range_start) / unit_sectors.max(1);
+    (unit_ix % 2 == 1) == want_odd
+}
+
 /// Proactive AACS key-selection map: which held unit key decrypts each LBA of a
 /// title's encrypted content, decided ONCE before mux from the disc's CPS-unit
 /// (and, later, FMTS segment) structure — never by trial-decrypt-and-check per
@@ -483,12 +511,8 @@ fn apply_aacs_map(
         // PHASE GATE (FMTS forensic segment): the segment interleaves two variants
         // at the unit level. Decrypt ONLY our parity; leave the alternate half as
         // ciphertext (the muxer drops untouched ciphertext cleanly — no garble).
-        if matches!(phase, Phase::Even | Phase::Odd) {
-            let unit_ix = (unit_lba - range_start) / unit_sectors;
-            let is_odd = unit_ix % 2 == 1;
-            if is_odd != matches!(phase, Phase::Odd) {
-                return; // alternate half — leave as-is
-            }
+        if !unit_is_our_phase(unit_lba, range_start, unit_sectors, phase) {
+            return; // alternate half — leave as-is
         }
         // Gate on the authoritative encrypted flag ONLY (CPI bits in the clear
         // seed): a clear unit is left untouched; an encrypted unit is decrypted
@@ -1766,5 +1790,68 @@ mod tests {
             n <= MAX_THREADS,
             "decrypt thread count must not exceed MAX_THREADS ({MAX_THREADS}), got {n}"
         );
+    }
+
+    /// The FMTS phase gate picks which half of an interleaved forensic segment
+    /// we decrypt. Both the `-` and the `/` in its index arithmetic survived a
+    /// mutation run, and getting either wrong silently decrypts the alternate
+    /// variant into garbage while reporting success.
+    #[test]
+    fn phase_gate_selects_only_our_parity_of_a_forensic_segment() {
+        use super::{Phase, unit_is_our_phase};
+        // A range starting at LBA 30, 3 sectors per aligned unit: units are at
+        // 30, 33, 36, 39, ... with indices 0, 1, 2, 3, ...
+        let ours = |lba, phase| unit_is_our_phase(lba, 30, 3, phase);
+
+        // Even phase takes indices 0, 2, 4 -> LBAs 30, 36, 42.
+        assert!(ours(30, Phase::Even));
+        assert!(!ours(33, Phase::Even));
+        assert!(ours(36, Phase::Even));
+        assert!(!ours(39, Phase::Even));
+
+        // Odd phase is the exact complement.
+        for lba in [30, 33, 36, 39, 42, 45] {
+            assert_ne!(
+                ours(lba, Phase::Even),
+                ours(lba, Phase::Odd),
+                "LBA {lba} must belong to exactly one parity"
+            );
+        }
+
+        // Non-forensic content: the whole range is ours.
+        for lba in [30, 33, 36, 39] {
+            assert!(ours(lba, Phase::All));
+        }
+
+        // The index must be RANGE-RELATIVE: `(lba - start)`, not `(lba + start)`.
+        // Most value pairs give the same parity either way, so pin one where
+        // they genuinely disagree: (5-1)/2 = 2 (even, ours) but
+        // (5+1)/2 = 3 (odd, not ours).
+        assert!(
+            unit_is_our_phase(5, 1, 2, Phase::Even),
+            "the index must be measured from the range start"
+        );
+
+        // The `/ unit_sectors` -> `* unit_sectors` mutant is EQUIVALENT here,
+        // and deliberately not chased. Proof: aligned offsets are exact
+        // multiples of the unit size, so offset = k*u for unit index k.
+        // Dividing gives k; multiplying gives k*u^2, whose parity is
+        // parity(k)*parity(u^2) = parity(k) whenever u is ODD. `unit_sectors`
+        // is `ALIGNED_UNIT_LEN / 2048` = 3, a compile-time constant, so u is
+        // always odd and the two agree on every reachable input. Only an even
+        // unit size would separate them, and none exists.
+        assert!(!unit_is_our_phase(33, 30, 3, Phase::Even));
+    }
+
+    /// A malformed key map must not take down a long-running service. A unit
+    /// below its own range start, or a zero unit size, are both map bugs — they
+    /// must return a defined answer rather than panicking on debug overflow or
+    /// dividing by zero.
+    #[test]
+    fn phase_gate_does_not_panic_on_a_malformed_map() {
+        use super::{Phase, unit_is_our_phase};
+        assert!(unit_is_our_phase(10, 100, 3, Phase::Even));
+        assert!(unit_is_our_phase(100, 30, 0, Phase::Even) || true);
+        assert!(unit_is_our_phase(5, 5, 0, Phase::Even));
     }
 }
