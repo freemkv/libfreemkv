@@ -713,6 +713,20 @@ const STD_RATES: &[(u32, u32, f64)] = &[
 /// it. Half an fps separates every neighbouring pair in the table (23.976/24 are
 /// 0.024 apart, so both fall inside one another's window — which is exactly why
 /// the match must be nearest-wins, not first-wins).
+///
+/// Two mutants in `detect_rate`'s snapping loop — `d < RATE_TOLERANCE_FPS` and
+/// the tie-break `d < best_d`, each flipped to `<=` — are not closed by any
+/// test here, and are believed unreachable rather than merely untested: both
+/// require an f64 distance computed as `(fps - rate).abs()` to land on EXACTLY
+/// `0.5`, or on an exact tie between two candidate distances, where `fps` is
+/// `1e9 / median` for an INTEGER nanosecond `median`. A brute-force search
+/// (median from 1 to 1e8 ns, every `STD_RATES` entry) found no integer median
+/// whose measured distance is bit-exact `0.5`, nor one producing an exact tie
+/// between neighbouring entries: the target real number (e.g. `1e9 / 24.5`)
+/// is never itself an integer, so no integer median's true quotient rounds to
+/// a double that is bit-identical to the boundary. If a future change makes
+/// either boundary reachable (e.g. by accepting a caller-supplied `median`
+/// directly instead of deriving it from PTS deltas), revisit this.
 const RATE_TOLERANCE_FPS: f64 = 0.5;
 
 /// Detect the constant frame rate from the median presentation delta, snapping
@@ -1739,6 +1753,26 @@ mod tests {
     /// letters other than 'a' so a `-`↔`/` flip on the per-letter offset is
     /// visible: `'a' - 0x60 == 1 == 'a' / 0x60`, so a fixture starting with 'a'
     /// cannot tell subtraction from division apart on that letter.
+    ///
+    /// Three mutants of `pack_language` are NOT killed by this test, or by any
+    /// other — they are equivalent, proven by construction rather than merely
+    /// unobserved:
+    ///
+    /// 1. `(b[0] - 0x60) as u16` → `(b[0] + 0x60) as u16` on the FIRST letter
+    ///    (the one shifted `<< 10`). The two results differ by exactly
+    ///    `0x60 * 2 = 192 = 3 * 64`, and multiplying by `1 << 10` then
+    ///    truncating to `u16` is arithmetic mod `65536`; since `192 * 1024 =
+    ///    196_608 = 3 * 65536`, the `+` and `-` forms land on the identical
+    ///    `u16` for every possible byte, not just the ones this fixture picks.
+    ///    (The same swap on the SECOND letter, shifted only `<< 5`, is very
+    ///    much NOT equivalent — `192 * 32 = 6144` is not a multiple of 65536 —
+    ///    which is why that one IS caught above and only the first letter's
+    ///    `+` survives.)
+    /// 2. Both `|` → `^` mutations that combine the three shifted fields. The
+    ///    three components are each a lowercase letter minus `0x60`, i.e. in
+    ///    `1..=26`, which fits in 5 bits (`0..=31`); shifted by `0`, `5` and
+    ///    `10` they occupy disjoint bit ranges for every valid input, and OR
+    ///    and XOR agree exactly when their operands share no set bit.
     #[test]
     fn pack_language_packs_three_lowercase_letters_into_15_bits() {
         // "bcd": b=2, c=3, d=4 → (2<<10)|(3<<5)|4 = 2048+96+4 = 0x0864.
