@@ -2845,4 +2845,225 @@ mod tests {
             "an undersized PAT section declares no program"
         );
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Mutation-gap hardening (mux-ts pass)
+    // ════════════════════════════════════════════════════════════════════
+
+    /// The buffer-cap constants are read by tests only through their own
+    /// symbol (e.g. `MAX_PES_BUFFER_TOTAL`), so a mutated arithmetic
+    /// expression in the constant's definition changes what that symbol
+    /// itself evaluates to and every self-referential assertion still
+    /// passes. Pin the compiled values against a literal computed
+    /// independently here, so a mutation to the `*` in the definition is
+    /// caught directly.
+    #[test]
+    fn buffer_cap_constants_have_the_documented_values() {
+        assert_eq!(PES_BUFFER_INIT_CAP, 16 * 1024);
+        assert_eq!(MAX_PES_BUFFER, 64 * 1024 * 1024);
+        assert_eq!(MAX_PES_BUFFER_TOTAL, 512 * 1024 * 1024);
+    }
+
+    /// `psi_payload_base` must reject an adaptation field that consumes the
+    /// entire 184-byte payload area (`af_len == 183`, so `base == 192`),
+    /// leaving zero bytes for the pointer_field. `collect_psi_section` reads
+    /// `payload[0]` unconditionally once `psi_payload_base` returns `Some`,
+    /// so admitting this boundary (an off-by-one `<=`) would hand back an
+    /// empty payload slice and the very next line would index-panic on
+    /// disc-derived data instead of the packet being cleanly rejected.
+    #[test]
+    fn psi_payload_base_rejects_af_that_consumes_the_whole_payload() {
+        let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
+        pkt[7] = 0x30; // AFC 0b11 in the TS-header byte at pkt[7] (4+3)
+        pkt[8] = 183; // af_len: base = 9 + 183 = 192, exactly BD_SOURCE_PACKET_BYTES
+        assert_eq!(
+            psi_payload_base(&pkt),
+            None,
+            "an AF that fills the whole payload area leaves no pointer_field byte"
+        );
+        // One less: base = 191, still inside the packet — must be accepted.
+        pkt[8] = 182;
+        assert_eq!(psi_payload_base(&pkt), Some(191));
+    }
+
+    /// The P3/B1 concealment marker on `NULL_PID` requires a NON-ZERO
+    /// adaptation_field_length before it may read `ts[5]` as the
+    /// discontinuity_indicator byte: at `af_len == 0` there is no AF flags
+    /// byte at all, and `ts[5]` is actually the first byte of TS payload (or
+    /// meaningless stuffing) that must never be mistaken for it. Crafting
+    /// that byte with the high bit set must NOT trip the marker.
+    #[test]
+    fn null_pid_marker_requires_nonzero_af_len_to_read_discontinuity_byte() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+
+        let mut start = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        start.extend_from_slice(b"AAAA");
+        demux.feed(&ts_payload_packet(pid, true, 0, &start));
+
+        // NULL_PID (0x1FFF), AFC = 0b11, af_len = 0: ts[5] (packet index 9)
+        // is ordinary payload, crafted here to look like a set
+        // discontinuity_indicator bit.
+        let mut null_pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
+        null_pkt[4] = SYNC_BYTE;
+        null_pkt[5] = 0x1F;
+        null_pkt[6] = 0xFF;
+        null_pkt[7] = 0x30;
+        null_pkt[8] = 0; // af_len = 0 — no flags byte exists
+        null_pkt[9] = 0x80; // this is payload, not a discontinuity flag
+        demux.feed(&null_pkt);
+
+        demux.feed(&ts_payload_packet(pid, false, 1, b"BBBB"));
+        let out = demux.flush();
+        assert_eq!(
+            out.len(),
+            1,
+            "the open PES must survive an af_len==0 NULL-TS packet unharmed"
+        );
+        assert_eq!(&out[0].data[..4], b"AAAA");
+        assert!(
+            !out[0].discontinuity,
+            "af_len==0 must not be read as a discontinuity_indicator"
+        );
+    }
+
+    /// Build a raw BD-TS packet with AFC = 0b11 (AF + payload). `af_flags`
+    /// is `None` for `af_len == 0` (no flags byte at all — `payload` starts
+    /// immediately after the length byte) or `Some(byte)` for `af_len == 1`
+    /// (that byte is the AF flags byte, `payload` follows it).
+    fn ts_af_packet(pid: u16, pusi: bool, cc: u8, af_flags: Option<u8>, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
+        pkt[4] = SYNC_BYTE;
+        pkt[5] = ((pid >> 8) as u8) & 0x1F;
+        if pusi {
+            pkt[5] |= 0x40;
+        }
+        pkt[6] = (pid & 0xFF) as u8;
+        pkt[7] = 0x30 | (cc & 0x0F);
+        match af_flags {
+            None => {
+                pkt[8] = 0;
+                let n = payload.len().min(183);
+                pkt[9..9 + n].copy_from_slice(&payload[..n]);
+            }
+            Some(flags) => {
+                pkt[8] = 1;
+                pkt[9] = flags;
+                let n = payload.len().min(182);
+                pkt[10..10 + n].copy_from_slice(&payload[..n]);
+            }
+        }
+        pkt
+    }
+
+    /// Same guard as the NULL_PID marker (`af_len > 0` before trusting the AF
+    /// flags byte) applies to the PER-PID `discontinuity_flag` used by the
+    /// ordinary continuity check. `af_len == 0` must never be read as a set
+    /// discontinuity_indicator even when the following payload byte happens
+    /// to have the high bit set — that byte is real elementary-stream data.
+    #[test]
+    fn discontinuity_flag_requires_nonzero_af_len() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+
+        let mut start = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        start.extend_from_slice(b"AAAA");
+        demux.feed(&ts_payload_packet(pid, true, 0, &start));
+
+        // Continuation: AFC 0b11, af_len == 0, cc sequential (no CC gap).
+        // The payload's first byte (0x80) must NOT be read as a
+        // discontinuity_indicator.
+        demux.feed(&ts_af_packet(pid, false, 1, None, &[0x80, 0x11, 0x22]));
+        let out = demux.flush();
+        assert_eq!(
+            out.len(),
+            1,
+            "af_len==0 must not falsely trigger a continuity break"
+        );
+        assert_eq!(&out[0].data[..4], b"AAAA");
+        assert!(!out[0].discontinuity);
+    }
+
+    /// The counterpart: a REAL adaptation-field discontinuity_indicator
+    /// (`af_len == 1`, flags byte `0x80`) must still be honoured. Mutating
+    /// `ts[4] > 0` to `ts[4] < 0` (always false for a `u8`) would silently
+    /// disable this path entirely — the dropped partial would instead be
+    /// spliced into the next PES and the resulting stream would carry
+    /// corrupt data with no discontinuity flag raised to warn the codec
+    /// consumer.
+    #[test]
+    fn discontinuity_flag_honours_a_real_af_indicator() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+
+        let mut start = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        start.extend_from_slice(b"AAAA");
+        demux.feed(&ts_payload_packet(pid, true, 0, &start));
+
+        // A genuine AF discontinuity_indicator: af_len == 1, flags == 0x80.
+        // cc is sequential (1), so this is NOT a CC gap — only the AF flag
+        // drives the drop.
+        demux.feed(&ts_af_packet(pid, false, 1, Some(0x80), b"XXXX"));
+
+        // A fresh PUSI (cc == 2, still sequential) starts the next PES. The
+        // dropped partial must not be flushed by it, and the pending
+        // discontinuity must ride onto this new PES.
+        let mut next = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        next.extend_from_slice(b"CCCC");
+        demux.feed(&ts_payload_packet(pid, true, 2, &next));
+
+        let out = demux.flush();
+        assert_eq!(
+            out.len(),
+            1,
+            "the AF-flagged partial must be dropped, not flushed as its own PES"
+        );
+        assert_eq!(&out[0].data[..4], b"CCCC");
+        assert!(
+            out[0].discontinuity,
+            "a real AF discontinuity_indicator must flag the next completed PES"
+        );
+    }
+
+    /// A PES header can spill across MORE THAN ONE continuation packet
+    /// (`header_data_length` up to 255 gives a header up to 264 bytes,
+    /// almost 1.5 TS payloads). `header_remaining` must be decremented by
+    /// exactly the bytes consumed on EACH continuation, not reset or
+    /// corrupted, or the second continuation's real ES bytes get
+    /// misattributed as header spillover (or vice versa).
+    #[test]
+    fn header_remaining_decrements_correctly_across_two_continuations() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+
+        // header_data_length = 255 -> header_len = 9 + 255 = 264.
+        // First (PUSI) packet's payload is entirely header: 184 bytes of it.
+        // header_remaining after packet 1 = 264 - 184 = 80.
+        let mut start = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 255];
+        start.extend(std::iter::repeat_n(0xAAu8, 175)); // 9 + 175 = 184
+        demux.feed(&ts_payload_packet(pid, true, 0, &start));
+
+        // Continuation 1: 80 more header-spillover bytes, then 104 bytes of
+        // real ES. header_remaining must land at exactly 0 afterwards.
+        let mut cont1 = vec![0xAAu8; 80];
+        let es1: Vec<u8> = (0u8..104).collect();
+        cont1.extend_from_slice(&es1);
+        demux.feed(&ts_payload_packet(pid, false, 1, &cont1));
+
+        // Continuation 2: header_remaining is (correctly) already 0, so this
+        // ENTIRE 184-byte payload must be real ES — none of it skipped as
+        // leftover header.
+        let es2: Vec<u8> = (0u8..184).collect();
+        demux.feed(&ts_payload_packet(pid, false, 2, &es2));
+
+        let out = demux.flush();
+        assert_eq!(out.len(), 1);
+        let mut expected = es1.clone();
+        expected.extend_from_slice(&es2);
+        assert_eq!(
+            out[0].data, expected,
+            "every post-header byte from both continuations must survive, \
+             in order, with none mistaken for header spillover"
+        );
+    }
 }
