@@ -315,4 +315,29 @@ mod tests {
         let data = [0x00, 0x01, 0x01, 0x65];
         assert_eq!(skip_start_code(&data, 0), None);
     }
+
+    #[test]
+    fn skip_start_code_three_zeros_no_terminator_is_not_a_code() {
+        // `00 00 00` with nothing after it is neither a 3-byte code (3rd byte
+        // isn't 0x01) nor a complete 4-byte code (there is no 4th byte at all).
+        // Pins the `pos + 3 < data.len()` guard: on a 3-byte all-zero buffer
+        // `pos + 3 == data.len()`, so the guard must be strict `<` and reject
+        // the 4-byte branch before it would index one past the end. A `<=`
+        // (or a `pos * 3` typo, which also evaluates to a value not exceeding
+        // `data.len()` here) lets the 4-byte branch run and read `data[pos+3]`
+        // out of bounds.
+        let data = [0x00, 0x00, 0x00];
+        assert_eq!(skip_start_code(&data, 0), None);
+    }
+
+    #[test]
+    fn read_ue_thirty_one_leading_zeros_is_still_a_valid_code() {
+        // Exactly 31 leading zero bits, a stop bit, then 31 zero info bits:
+        // a legal (if enormous) ue(v) code with code_num = 2^31 - 1. The
+        // truncation guard is `leading_zeros > 31`, so 31 must NOT trip it —
+        // only 32 does. A guard mutated to `>= 31` or `== 31` aborts one bit
+        // early and returns None instead of the real value.
+        let data = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(BitReader::new(&data).read_ue(), Some(u32::MAX >> 1));
+    }
 }

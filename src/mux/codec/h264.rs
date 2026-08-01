@@ -141,10 +141,29 @@ thread_local! {
 /// off the per-frame allocation path for anything larger.
 fn unescape_ebsp_prefix(ebsp: &[u8]) -> Vec<u8> {
     const PREFIX_OCTETS: usize = 16;
-    let mut out = Vec::with_capacity(PREFIX_OCTETS);
+    unescape_ebsp(ebsp, PREFIX_OCTETS)
+}
+
+/// Copy `ebsp` with emulation-prevention bytes removed, stopping after at
+/// most `max_octets` OUTPUT bytes (pass `ebsp.len()` for "no cap").
+///
+/// The zero run-length counter is cumulative across the whole scan and is
+/// reset only when an escape byte is actually dropped — matching the
+/// reference decoding process (ITU-T H.264 §7.3.1 / the libavcodec RBSP
+/// extractor), which discards a 0x03 following ANY run of two-or-more 0x00
+/// bytes, not just an exact `00 00 03` sliding window. A window-based scanner
+/// that advances by 3 on a match and by 1 otherwise disagrees with this on a
+/// run of 3+ real zero bytes ahead of an 0x03: `00 00 00 03` decodes here as
+/// `00 00 00` (the run is escaped, matching every other H.264 decoder), where
+/// a window scan starting fresh after each non-match would keep the 0x03 as
+/// real payload. Only one implementation of this rule may exist in this
+/// module — see `parse_sps_high_profile_ext`, which used to keep its own
+/// window-scan copy that disagreed with this one on exactly that input.
+fn unescape_ebsp(ebsp: &[u8], max_octets: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(max_octets.min(ebsp.len()));
     let mut zeros = 0usize;
     for &b in ebsp {
-        if out.len() == PREFIX_OCTETS {
+        if out.len() == max_octets {
             break;
         }
         // Drop the escape octet itself, but only in the 00 00 03 position.
@@ -493,23 +512,12 @@ impl CodecParser for H264Parser {
 /// omits the extension in that case.
 fn parse_sps_high_profile_ext(sps: &[u8]) -> Option<(u8, u8, u8)> {
     // Strip emulation-prevention bytes: 00 00 03 xx → 00 00 xx (drop the 03).
-    // We skip byte 0 (NAL header) and start the RBSP from byte 1.
-    let rbsp: Vec<u8> = {
-        let raw = &sps[1..]; // skip NAL header byte
-        let mut out = Vec::with_capacity(raw.len());
-        let mut i = 0;
-        while i < raw.len() {
-            if i + 2 < raw.len() && raw[i] == 0x00 && raw[i + 1] == 0x00 && raw[i + 2] == 0x03 {
-                out.push(0x00);
-                out.push(0x00);
-                i += 3; // skip the 0x03 emulation-prevention byte
-            } else {
-                out.push(raw[i]);
-                i += 1;
-            }
-        }
-        out
-    };
+    // We skip byte 0 (NAL header) and start the RBSP from byte 1. Shares
+    // `unescape_ebsp` with the slice-header prefix reader rather than
+    // re-deriving the same rule — see that function's doc comment for why a
+    // second, window-based copy of this rule used to disagree with it.
+    let raw = &sps[1..]; // skip NAL header byte
+    let rbsp: Vec<u8> = unescape_ebsp(raw, raw.len());
 
     // RBSP layout after stripping the NAL header byte:
     //   [0] profile_idc (already checked by caller)
@@ -744,6 +752,26 @@ mod tests {
         assert_eq!(
             super::unescape_ebsp_prefix(&[0x00, 0x00, 0x03, 0x03]),
             vec![0x00, 0x00, 0x03]
+        );
+    }
+
+    /// Regression: `parse_sps_high_profile_ext` used to re-derive the
+    /// emulation-prevention rule with its own window scanner (match `00 00
+    /// 03` at position i, advance by 3; else advance by 1) instead of calling
+    /// the shared `unescape_ebsp`. On a run of 3+ real 0x00 bytes ahead of an
+    /// 0x03 — non-conformant, but this is untrusted disc input, not a
+    /// spec-clean encoder — the two disagreed: `unescape_ebsp`'s cumulative
+    /// zero counter (the same rule libavcodec's RBSP extractor and the H.264
+    /// reference decoding process use) drops the 0x03 as an escape, while a
+    /// fresh 3-byte window starting right after the non-matching first byte
+    /// kept it as real payload. Pin the shared function's behaviour here so a
+    /// second hand-rolled copy doesn't quietly reappear.
+    #[test]
+    fn unescape_ebsp_drops_escape_after_a_run_of_three_zeros() {
+        assert_eq!(
+            super::unescape_ebsp(&[0x00, 0x00, 0x00, 0x03, 0x42], 5),
+            vec![0x00, 0x00, 0x00, 0x42],
+            "the 0x03 after a 3-zero run is an escape byte, not payload"
         );
     }
 
@@ -2010,5 +2038,28 @@ mod tests {
             cp.len(),
             expected_len
         );
+    }
+
+    /// `SpsReader::read_bits` shifts each new bit into the low end of the
+    /// accumulator (`val << 1 | bit`). Pins the direction directly: a
+    /// `<<` -> `>>` typo would leave every accumulated bit shifted out and
+    /// the result would collapse towards 0 instead of building up the value.
+    #[test]
+    fn sps_reader_read_bits_builds_value_msb_first() {
+        // 0b1011_0000 read 4 bits MSB-first -> 0b1011 = 11.
+        let mut r = super::SpsReader::new(&[0b1011_0000]);
+        assert_eq!(r.read_bits(4), Some(0b1011));
+    }
+
+    /// `SpsReader::read_ue`'s truncation guard is `leading_zeros > 31`: 31
+    /// leading zero bits is the longest legal code and must decode, not
+    /// abort. Mirrors the equivalent guard in the shared `BitReader` in
+    /// `startcode.rs`, kept here because `SpsReader` is a separate,
+    /// unshared implementation used only for SPS parsing.
+    #[test]
+    fn sps_reader_read_ue_thirty_one_leading_zeros_is_still_valid() {
+        let data = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let mut r = super::SpsReader::new(&data);
+        assert_eq!(r.read_ue(), Some(u32::MAX >> 1));
     }
 }

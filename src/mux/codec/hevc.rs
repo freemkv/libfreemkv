@@ -1250,6 +1250,76 @@ mod tests {
         assert_eq!(h.max_pic_average_light_level, maxfall);
     }
 
+    /// The `scan_sei` match arms are guarded with `self.sei_mastering.is_none()`
+    /// / `self.sei_content_light.is_none()`, so the FIRST mastering-display and
+    /// content-light SEI a title carries wins and later repeats (every AU of a
+    /// real HDR10 stream repeats both) are ignored. A splice or a corrupt later
+    /// AU that carries different (or garbage) HDR10 numbers must not overwrite
+    /// the value already latched from the title's first AU.
+    ///
+    /// Each AU below carries only ONE of the two messages, so `sei_mastering`
+    /// and `sei_content_light` are never BOTH `Some` at once — the whole-scan
+    /// early return a few lines above these two match arms
+    /// (`if self.sei_mastering.is_some() && self.sei_content_light.is_some()`)
+    /// would otherwise fire on the second AU and make the per-arm guards
+    /// unreachable, proving nothing about them.
+    #[test]
+    fn hevc_hdr10_sei_keeps_the_first_value_and_ignores_later_repeats() {
+        let pps = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(NAL_PPS));
+            v.push(0xC0);
+            v
+        };
+        let idr = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(19));
+            v.push(0xEC);
+            v
+        };
+        let mastering_au = |max_lum: u32| {
+            let mut data = pps.clone();
+            data.extend_from_slice(&sei_nal(&[sei_message(
+                SEI_MASTERING_DISPLAY_COLOUR_VOLUME,
+                &mastering_payload([1, 2, 3], [4, 5, 6], 7, 8, max_lum, 10),
+            )]));
+            data.extend_from_slice(&idr);
+            data
+        };
+        let cll_au = |maxcll: u16, maxfall: u16| {
+            let mut data = pps.clone();
+            data.extend_from_slice(&sei_nal(&[sei_message(
+                SEI_CONTENT_LIGHT_LEVEL_INFO,
+                &cll_payload(maxcll, maxfall),
+            )]));
+            data.extend_from_slice(&idr);
+            data
+        };
+
+        let mut mastering_only = HevcParser::new();
+        mastering_only.parse(&make_pes(mastering_au(10_000_000), Some(0)));
+        mastering_only.parse(&make_pes(mastering_au(1), Some(3750)));
+        assert_eq!(
+            mastering_only
+                .sei_mastering
+                .map(|m| m.max_display_mastering_luminance),
+            Some(10_000_000),
+            "the SECOND AU's mastering-luminance must be ignored, not adopted"
+        );
+
+        let mut cll_only = HevcParser::new();
+        cll_only.parse(&make_pes(cll_au(1000, 400), Some(0)));
+        cll_only.parse(&make_pes(cll_au(9999, 9999), Some(3750)));
+        assert_eq!(
+            cll_only.sei_content_light,
+            Some(ContentLightLevel {
+                max_content_light_level: 1000,
+                max_pic_average_light_level: 400
+            }),
+            "the SECOND AU's content-light numbers must be ignored, not adopted"
+        );
+    }
+
     /// MEASURED, not reasoned: an HDR10 stream carries a prefix SEI per access
     /// unit, and `scan_sei` allocated + byte-copied the whole SEI RBSP through
     /// `strip_emulation_prevention` on EVERY one — including after both HDR10
@@ -2520,6 +2590,26 @@ mod tests {
         assert_eq!(len + 4, fd.len(), "exactly one NAL in frame data");
     }
 
+    /// The trailing-zero strip after the last NAL in the buffer (`while end >
+    /// nal_start && data[end - 1] == 0x00 { end -= 1; }`) must make strictly
+    /// positive progress: this NAL has no start code after it (`next` falls
+    /// back to `data.len()`), so a step in the wrong direction walks `end`
+    /// past the end of `data` and the very next iteration indexes
+    /// `data[end - 1]` out of bounds. Zero-padding after the last NAL is
+    /// exactly what a damaged trailing sector on disc looks like.
+    #[test]
+    fn trailing_zero_strip_on_last_nal_does_not_run_past_the_buffer() {
+        let mut parser = HevcParser::new();
+        let mut data = vec![0x00, 0x00, 0x01];
+        data.extend_from_slice(&hevc_nal_header(NAL_AUD));
+        data.push(0x00); // damaged/zero-padded trailing byte, no start code follows
+        let frames = parser.parse(&make_pes(data, Some(0)));
+        // AUD is dropped and the payload is otherwise empty once the padding
+        // is stripped, so there is nothing to emit — the assertion that
+        // matters is that `parse` returned at all instead of panicking.
+        assert!(frames.is_empty());
+    }
+
     // --- empty PES ---
 
     #[test]
@@ -3187,6 +3277,22 @@ mod tests {
         // parse_sps_chroma returns None (caller falls back to 8-bit 4:2:0).
         assert!(parse_sps_chroma(&[0x42]).is_none());
         assert!(parse_sps_chroma(&[0x42, 0x01]).is_none());
+    }
+
+    /// A mastering-display SEI payload one byte short of the fixed 24-byte
+    /// layout must be rejected, not read out of bounds. This is the guard a
+    /// crafted/truncated SEI on a damaged disc hits directly.
+    #[test]
+    fn parse_mastering_display_one_byte_short_is_none() {
+        assert!(parse_mastering_display(&[0u8; 23]).is_none());
+        assert!(parse_mastering_display(&[0u8; 24]).is_some());
+    }
+
+    /// Same guard, content-light-level's 4-byte layout.
+    #[test]
+    fn parse_content_light_level_one_byte_short_is_none() {
+        assert!(parse_content_light_level(&[0u8; 3]).is_none());
+        assert!(parse_content_light_level(&[0u8; 4]).is_some());
     }
 
     #[test]
