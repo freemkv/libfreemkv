@@ -1639,4 +1639,181 @@ mod tests {
         assert_eq!(p[1].stream_id, 0xC0);
         assert_eq!(p[1].data, vec![0x99, 0x88]);
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Mutation-gap hardening (mux-ts pass)
+    // ════════════════════════════════════════════════════════════════════
+
+    /// `MAX_PS_BUFFER` is read by its own tests only through the same
+    /// symbol, so a mutated arithmetic expression in its definition changes
+    /// what the symbol itself evaluates to and every self-referential
+    /// assertion still passes. Pin the compiled value against a literal
+    /// computed independently.
+    #[test]
+    fn max_ps_buffer_has_the_documented_value() {
+        assert_eq!(MAX_PS_BUFFER, 4 * 1024 * 1024);
+    }
+
+    /// Pack-header framing (`sc + 14 > len`, then `sc + pack_len > len`) must
+    /// accept an EXACT fit — the whole pack (mandatory 14 bytes, or with
+    /// stuffing) present and not one byte more — rather than waiting for
+    /// data that will never come. Both checks are preceded by an unrelated
+    /// start code so `sc != 0`: at `sc == 0` a `sc + pack_len` vs.
+    /// `sc * pack_len` mutant collapses to the same value (`0`) and the
+    /// bound stays unreachable from any input.
+    #[test]
+    fn pack_header_exact_fit_is_consumed_not_awaited() {
+        // Case 1: mandatory 14 bytes, no stuffing, nothing else buffered.
+        let mut demuxer = PsDemuxer::new();
+        let mut data = vec![0x00, 0x00, 0x01, 0xB0]; // unknown SC -> sc == 4 below
+        data.extend_from_slice(&[
+            0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3,
+            0xF8, // stuffing_length = 0
+        ]);
+        assert!(demuxer.feed(&data).is_empty(), "a pack yields no PES");
+        assert!(
+            demuxer.buffer.is_empty(),
+            "an exact-fit pack (no stuffing) must be fully consumed, not held \
+             waiting for bytes that will never arrive"
+        );
+
+        // Case 2: with 3 stuffing bytes — exercises `pack_len = 14 + stuffing`
+        // at a non-zero `sc`, where a `+` -> `*` mutation diverges sharply
+        // from the correct sum.
+        let mut demuxer2 = PsDemuxer::new();
+        let mut data2 = vec![0x00, 0x00, 0x01, 0xB0];
+        data2.extend_from_slice(&[
+            0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3,
+            0xFB, // stuffing_length = 3
+            0xFF, 0xFF, 0xFF,
+        ]);
+        assert!(demuxer2.feed(&data2).is_empty());
+        assert!(
+            demuxer2.buffer.is_empty(),
+            "an exact-fit pack WITH stuffing must be fully consumed"
+        );
+    }
+
+    /// System-header framing needs exactly `6 + header_length` bytes
+    /// (`sc + 6 > len`, then `sc + total > len`). At `header_length == 0`
+    /// both boundaries coincide at `len == 6`, so one buffer exercises both
+    /// checks' `>` vs `==`/`>=` mutants at once.
+    #[test]
+    fn system_header_zero_length_exact_fit_is_consumed_not_awaited() {
+        let mut demuxer = PsDemuxer::new();
+        let data = vec![0x00, 0x00, 0x01, 0xBB, 0x00, 0x00]; // header_length = 0
+        assert!(demuxer.feed(&data).is_empty());
+        assert!(
+            demuxer.buffer.is_empty(),
+            "a zero-length system header, fully present, must not be held awaiting more data"
+        );
+    }
+
+    /// `header_len` is a 16-bit big-endian field (`buffer[sc+4] << 8 |
+    /// buffer[sc+5]`). A `<<` -> `>>` mutation collapses the high byte to
+    /// zero, so any `header_length > 255` is misread as just its low byte —
+    /// here 300 (`0x012C`) misread as 44. A start code embedded 50 bytes in
+    /// (well inside the true 306-byte unit but exactly where the
+    /// mis-parsed 50-byte unit would end) must stay buried in the skipped
+    /// body under correct parsing, and surface as a bogus extra PES under
+    /// the mutant.
+    #[test]
+    fn system_header_length_high_byte_is_not_dropped() {
+        let mut demuxer = PsDemuxer::new();
+        let mut data = vec![0x00, 0x00, 0x01, 0xBB, 0x01, 0x2C]; // header_length = 300
+        let mut body = vec![0xCCu8; 300];
+        // Decoy PES start code at body offset 44 -> absolute offset 50,
+        // exactly where a misread length of 44 (0x2C) would resume scanning
+        // (6 + 44 == 50).
+        let decoy = [
+            0x00, 0x00, 0x01, 0xC0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x99, 0x99,
+        ];
+        body[44..44 + decoy.len()].copy_from_slice(&decoy);
+        data.extend_from_slice(&body);
+        // The real PES follows the full (306-byte) system header.
+        data.extend_from_slice(&[
+            0x00, 0x00, 0x01, 0xC0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x77, 0x88,
+        ]);
+        data.extend_from_slice(&PROGRAM_END);
+
+        let packets = demuxer.feed(&data);
+        assert_eq!(
+            packets.len(),
+            1,
+            "the decoy start code embedded in the system header body must stay \
+             buried in the skipped body, not surface as a second PES"
+        );
+        assert_eq!(packets[0].data, vec![0x77, 0x88]);
+    }
+
+    /// `find_ps_boundary`'s bounds check (`sc + 3 >= data.len()`) must stay
+    /// an ADDITION: a `+` -> `-` mutation at `sc == 0` underflows the `usize`
+    /// subtraction and panics on a plain 3-byte start code with nothing
+    /// after it — exactly the tail a real feed can end on.
+    #[test]
+    fn find_ps_boundary_handles_a_bare_start_code_at_the_buffer_head() {
+        assert_eq!(find_ps_boundary(&[0x00, 0x00, 0x01], 0), None);
+    }
+
+    /// The boundary-ID check is a 4-way `||`; a mutant that turns the FIRST
+    /// `||` into `&&` makes a lone pack-header start code (which can never
+    /// also equal `SYSTEM_HEADER_ID`) fail to register as a boundary at all.
+    #[test]
+    fn find_ps_boundary_recognises_a_lone_pack_header() {
+        let data = [0x00, 0x00, 0x01, PACK_HEADER_ID, 0xAA];
+        assert_eq!(
+            find_ps_boundary(&data, 0),
+            Some(0),
+            "a pack header start code alone must register as a PS-layer boundary"
+        );
+    }
+
+    /// `parse_stream_id_extension` walks every optional PES-header field
+    /// (PTS/DTS, ESCR, ES_rate, DSM_trick_mode, additional_copy_info,
+    /// PES_CRC) and every optional PES_extension sub-field (PES_private_data,
+    /// pack_header_field, program_packet_sequence_counter, P-STD_buffer)
+    /// before reaching `stream_id_extension`. Every one of those skips is a
+    /// `pos +=`; a single mutated increment (`-=`/`*=`) misaligns every read
+    /// after it. This test arms EVERY optional field at once with a known
+    /// byte count, so any single wrong skip anywhere in the chain lands on
+    /// the wrong byte and the assertion fails — one test proving the whole
+    /// walk, rather than one per field.
+    #[test]
+    fn parse_stream_id_extension_walks_every_optional_field_to_the_right_offset() {
+        // flags2: PTS/DTS absent (00), ESCR/ES_rate/DSM_trick_mode/
+        // additional_copy_info/PES_CRC all present, PES_extension present.
+        let flags2 = 0x20 | 0x10 | 0x08 | 0x04 | 0x02 | 0x01; // 0x3F
+        let mut opt = Vec::new();
+        opt.extend_from_slice(&[0u8; 6]); // ESCR
+        opt.extend_from_slice(&[0u8; 3]); // ES_rate
+        opt.push(0); // DSM_trick_mode
+        opt.push(0); // additional_copy_info
+        opt.extend_from_slice(&[0u8; 2]); // PES_CRC
+        // PES_extension: every optional sub-field present + extension_flag_2.
+        let ext_flags = 0x80 | 0x40 | 0x20 | 0x10 | 0x01;
+        opt.push(ext_flags);
+        opt.extend_from_slice(&[0u8; 16]); // PES_private_data
+        opt.push(2); // pack_header_field length
+        opt.extend_from_slice(&[0u8; 2]); // pack_header_field data
+        opt.extend_from_slice(&[0u8; 2]); // program_packet_sequence_counter
+        opt.extend_from_slice(&[0u8; 2]); // P-STD_buffer
+        opt.push(0x81); // PES_extension_field_length (marker + 7 bits, value unused)
+        opt.push(0x55); // stream_id_extension (top bit clear)
+
+        let mut pkt = vec![0x00, 0x00, 0x01, EXTENDED_STREAM_ID];
+        let es = [0xDEu8, 0xAD];
+        let len = (3 + opt.len() + es.len()) as u16;
+        pkt.extend_from_slice(&len.to_be_bytes());
+        pkt.extend_from_slice(&[0x80, flags2, opt.len() as u8]);
+        pkt.extend_from_slice(&opt);
+        pkt.extend_from_slice(&es);
+
+        let parsed = parse_pes_packet(&pkt).expect("parses");
+        assert_eq!(
+            parsed.sub_stream_id,
+            Some(0x55),
+            "stream_id_extension reached correctly after walking every optional field"
+        );
+        assert_eq!(parsed.data, es);
+    }
 }
