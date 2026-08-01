@@ -2744,6 +2744,28 @@ mod tests {
             find_id(&data, ebml::INFO).is_some() && find_id(&data, ebml::TRACKS).is_some(),
             "Info and Tracks must still be present and seekable"
         );
+
+        // Suppressing the CUES fixup must suppress ONLY that one. The remaining
+        // Seek entries still have to be back-patched to their real offsets, or
+        // the SeekHead ships with SeekPosition=0 for Info and Tracks — a
+        // player-visible index pointing at the Segment header instead of the
+        // elements it names.
+        let (_, seg_start) = locate_segment(&data);
+        let entries = parse_seekhead(&data);
+        for target in [ebml::INFO, ebml::TRACKS] {
+            let pos = entries
+                .iter()
+                .find(|(id, _)| *id == target)
+                .map(|(_, pos)| *pos)
+                .unwrap_or_else(|| panic!("SeekHead must still name 0x{target:X}"));
+            assert_ne!(pos, 0, "0x{target:X} SeekPosition must be back-patched");
+            let mut cursor = Cursor::new(&data[seg_start + pos as usize..]);
+            let (id, _, _) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(
+                id, target,
+                "0x{target:X} SeekPosition must resolve to that element"
+            );
+        }
     }
 
     #[test]
@@ -3533,6 +3555,13 @@ mod tests {
         let mut cursor = Cursor::new(sh_body);
         while (cursor.position() as usize) < sh_body.len() {
             let (id, size, _) = ebml::read_element_header(&mut cursor).unwrap();
+            // A Seek entry finish() neutralised (the unused CUES pointer) is
+            // overwritten in place with a Void of the same total width — skip it
+            // rather than treating it as a malformed SeekHead.
+            if id == ebml::VOID {
+                cursor.seek(io::SeekFrom::Current(size as i64)).unwrap();
+                continue;
+            }
             assert_eq!(id, ebml::SEEK);
             let seek_end = cursor.position() + size;
             let mut seek_id_val: u32 = 0;
@@ -3776,7 +3805,7 @@ mod tests {
         let (_, seg_start) = locate_segment(&data);
         let cues = parse_cues(&data);
         assert!(!cues.is_empty());
-        for (_time, _track, pos) in cues {
+        for (_time, track, pos) in cues {
             let abs = seg_start + pos as usize;
             let mut cursor = Cursor::new(&data[abs..]);
             let (id, _size, _hdr_len) = ebml::read_element_header(&mut cursor).unwrap();
@@ -3785,6 +3814,16 @@ mod tests {
                 ebml::CLUSTER,
                 "cue position 0x{:X} did not resolve to a cluster",
                 pos
+            );
+            // CueTrack is a Matroska TrackNumber (1-based), not the muxer's
+            // 0-based track index. Every cluster here is opened by the primary
+            // video track (index 0), so its cues must name track 1. A cue whose
+            // CueTrack is 0 names no track at all and players ignore the whole
+            // seek index.
+            assert_eq!(
+                track, 1,
+                "CueTrack must be the 1-based TrackNumber of the cluster-opening \
+                 video track, not its 0-based index"
             );
         }
     }
@@ -4058,6 +4097,47 @@ mod tests {
             max_cue > MAX_BLOCK_REL,
             "cue coverage must extend past the first i16 boundary, max cue {max_cue}"
         );
+        // The cue a forced split emits must be as usable as a keyframe cue: its
+        // CueClusterPosition is a SEGMENT-RELATIVE offset that has to land on the
+        // cluster it describes, and its CueTrack has to be the 1-based
+        // TrackNumber of the frame that forced the split (audio = track 2 here).
+        // Neither was asserted, so a wrong sign on the offset or a 0 track number
+        // would have shipped as a seek index pointing at nothing.
+        let (_, seg_start) = locate_segment(&data);
+        let cluster_starts: Vec<usize> = clusters
+            .iter()
+            .map(|(body_start, _, _)| {
+                // Walk back from the body to the element start by re-reading the
+                // header at the recorded cluster position instead of guessing.
+                *body_start
+            })
+            .collect();
+        for (_time, track, pos) in &cues {
+            let abs = seg_start + *pos as usize;
+            let mut cursor = Cursor::new(&data[abs..]);
+            let (id, _size, hdr_len) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(
+                id,
+                ebml::CLUSTER,
+                "i16-split cue position 0x{pos:X} must resolve to a Cluster"
+            );
+            assert!(
+                cluster_starts.contains(&(abs + hdr_len)),
+                "cue position 0x{pos:X} must name one of the real clusters"
+            );
+            assert!(
+                *track == 1 || *track == 2,
+                "CueTrack must be a 1-based TrackNumber (1 = video, 2 = audio), got {track}"
+            );
+        }
+        // At least one cue must belong to the AUDIO track: every cluster after the
+        // first is opened by an audio frame, and the cue records that frame's
+        // track. A `track_idx * 1` slip would report 0 (no such track) and a
+        // `track_idx - 1` slip would underflow or report the video track.
+        assert!(
+            cues.iter().any(|(_, track, _)| *track == 2),
+            "the audio-forced splits must emit cues naming the audio TrackNumber (2)"
+        );
     }
 
     #[test]
@@ -4321,6 +4401,10 @@ mod tests {
         /// absent — which is precisely how Matroska signals a keyframe inside a
         /// BlockGroup (RFC 9559 §5.1.3.5).
         reference: Option<i64>,
+        /// The Block's Matroska TrackNumber (1-based), decoded from its leading
+        /// VINT. A block filed under the wrong (or a nonexistent) TrackNumber is
+        /// a dropped track, not a malformed file — players simply ignore it.
+        track: u64,
     }
 
     /// Parse EVERY BlockGroup in the output, in emission order.
@@ -4360,6 +4444,7 @@ mod tests {
                         flags: 0xFF,
                         rel_ts: 0,
                         reference: None,
+                        track: 0,
                     };
                     while (bc.position() as usize) < bg.len() {
                         let (cid, cs, _) = ebml::read_element_header(&mut bc).unwrap();
@@ -4367,6 +4452,11 @@ mod tests {
                         if cid == ebml::BLOCK {
                             let blk = &bg[cstart..cstart + cs as usize];
                             let vl = if blk[0] & 0x80 != 0 { 1 } else { 2 };
+                            info.track = if vl == 1 {
+                                (blk[0] & 0x7F) as u64
+                            } else {
+                                (((blk[0] & 0x3F) as u64) << 8) | blk[1] as u64
+                            };
                             info.rel_ts = i16::from_be_bytes([blk[vl], blk[vl + 1]]);
                             info.flags = blk[vl + 2];
                             info.data = blk[vl + 3..].to_vec();
@@ -5146,21 +5236,85 @@ mod tests {
         );
     }
 
+    /// Parse the `Tags` master into `(TagTrackUID, BPS)` pairs, decoding the
+    /// BPS `TagString` back to a number.
+    ///
+    /// The previous assertion was `String::from_utf8_lossy(&data).contains("800")`
+    /// over the WHOLE file, which a wrong BPS passes trivially — 80000 contains
+    /// "800", and so does any unrelated byte run that happens to spell it. The
+    /// bitrate a media player displays has to be the real one, so decode it.
+    fn parse_bps_tags(data: &[u8]) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let Some((_, tags_start, tags_size)) = segment_children(data)
+            .into_iter()
+            .find(|(id, _, _)| *id == ebml::TAGS)
+        else {
+            return out;
+        };
+        let read_uint = |start: usize, size: u64| -> u64 {
+            ebml::read_uint_val(&mut Cursor::new(&data[start..]), size as usize).unwrap()
+        };
+        let read_str = |start: usize, size: u64| {
+            String::from_utf8(data[start..start + size as usize].to_vec())
+        };
+        for (tag_id, tag_start, tag_size) in master_children(data, tags_start, tags_size as usize) {
+            if tag_id != ebml::TAG {
+                continue;
+            }
+            let mut uid = None;
+            let mut name = None;
+            let mut value = None;
+            for (cid, cstart, csize) in master_children(data, tag_start, tag_size as usize) {
+                match cid {
+                    ebml::TARGETS => {
+                        for (tid, tstart, tsize) in master_children(data, cstart, csize as usize) {
+                            if tid == ebml::TAG_TRACK_UID {
+                                uid = Some(read_uint(tstart, tsize));
+                            }
+                        }
+                    }
+                    ebml::SIMPLE_TAG => {
+                        for (sid, sstart, ssize) in master_children(data, cstart, csize as usize) {
+                            match sid {
+                                ebml::TAG_NAME => name = read_str(sstart, ssize).ok(),
+                                ebml::TAG_STRING => value = read_str(sstart, ssize).ok(),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if name.as_deref() == Some("BPS")
+                && let (Some(uid), Some(value)) = (uid, value)
+            {
+                out.push((uid, value.parse().expect("BPS TagString must be a number")));
+            }
+        }
+        out
+    }
+
     #[test]
     fn finalize_emits_per_track_bps_tags() {
         // At finalize a Tags master with a per-track BPS SimpleTag is written.
-        // BPS = bytes*8/duration_secs. With a 10 s duration and a video frame of
-        // 1000 bytes, video BPS = 1000*8/10 = 800.
+        // BPS = bytes*8/duration_secs, using the duration the SOURCE declared —
+        // the muxed timeline is only consulted when the source gave none. Here
+        // the source declares 10 s while the frames span 2 s, so the two answers
+        // differ and the tag must carry the 10 s one.
         let tracks = [make_video_track(), make_audio_track()];
         let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
         let writer = SharedWriter(shared.clone());
         let mut muxer = MkvMuxer::new(writer, &tracks, None, 10.0, &[]).unwrap();
-        // Video keyframe 1000 bytes; audio frame 500 bytes.
+        // Two video keyframes (1000 bytes each) 2 s apart; one audio frame of
+        // 500 bytes.
         muxer
             .write_frame(0, 0, true, &vec![0xABu8; 1000], None, None)
             .unwrap();
         muxer
             .write_frame(1, 0, false, &vec![0xCDu8; 500], None, None)
+            .unwrap();
+        muxer
+            .write_frame(0, 2_000_000_000, true, &vec![0xABu8; 1000], None, None)
             .unwrap();
         muxer.finish().unwrap();
         let data = shared.lock().unwrap().clone().into_inner();
@@ -5171,14 +5325,66 @@ mod tests {
             children.iter().any(|(id, _, _)| *id == ebml::TAGS),
             "Tags element must be written at finalize"
         );
-        // The BPS values must appear as TagString text. Video: 800, Audio: 400.
-        let text = String::from_utf8_lossy(&data);
-        assert!(text.contains("BPS"), "BPS TagName must be present");
-        assert!(
-            text.contains("800"),
-            "video BPS (1000*8/10) must be present"
+        // TrackUID is `(index + 1) | 0x100_0000` (see MkvMuxer::new).
+        let video_uid = 1u64 | 0x100_0000;
+        let audio_uid = 2u64 | 0x100_0000;
+        let bps = parse_bps_tags(&data);
+        assert_eq!(
+            bps,
+            vec![(video_uid, 1600), (audio_uid, 400)],
+            "BPS = bytes*8/declared_duration: video 2000*8/10 = 1600, \
+             audio 500*8/10 = 400"
         );
-        assert!(text.contains("400"), "audio BPS (500*8/10) must be present");
+    }
+
+    #[test]
+    fn bps_tags_use_the_backpatched_duration_when_the_source_declares_none() {
+        // An HD-DVD title declares no duration, so DURATION is reserved and
+        // back-patched at finish() from the muxed timeline — and the BPS tags are
+        // computed from that derived runtime. Every operator in the chain
+        // (max_block_ticks → seconds → bytes*8/seconds) was unasserted, so a
+        // wrong scale, a wrong sign on the final block's own duration, or a
+        // multiply where a divide belongs all shipped a plausible-looking file
+        // with a bitrate and runtime that are simply wrong.
+        //
+        // Ten 40 ms frames at 0..360 ms, each declaring a 40 ms duration:
+        //   last block start = 360 ms = 3600 ticks (0.1 ms scale)
+        //   its own duration = 40 ms  =  400 ticks
+        //   max_block_ticks  = 4000 ticks = 0.4 s of muxed runtime
+        let tracks = [make_video_track()];
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let writer = SharedWriter(shared.clone());
+        let mut muxer = MkvMuxer::new(writer, &tracks, None, 0.0, &[]).unwrap();
+        for i in 0..10i64 {
+            muxer
+                .write_frame(
+                    0,
+                    i * 40_000_000,
+                    true,
+                    &vec![0xABu8; 500],
+                    Some(40_000_000),
+                    None,
+                )
+                .unwrap();
+        }
+        muxer.finish().unwrap();
+        let data = shared.lock().unwrap().clone().into_inner();
+
+        // The Segment DURATION is the block END of the last frame, in ticks —
+        // not its start (which would understate the runtime by one frame).
+        assert_eq!(
+            find_duration_ticks(&data),
+            Some(4000.0),
+            "DURATION must cover the final frame's full presentation: 3600 + 400 ticks"
+        );
+        // And the BPS tag must use that same 0.4 s: 10 frames * 500 bytes * 8
+        // bits / 0.4 s = 100_000 bps.
+        let video_uid = 1u64 | 0x100_0000;
+        assert_eq!(
+            parse_bps_tags(&data),
+            vec![(video_uid, 100_000)],
+            "BPS = 5000 bytes * 8 / 0.4 s"
+        );
     }
 
     #[test]
@@ -5353,6 +5559,16 @@ mod tests {
         assert_eq!(
             groups[0].reference, None,
             "the MVC keyframe must carry NO ReferenceBlock — that absence IS the keyframe signal"
+        );
+        // The MVC BlockGroup writer takes the track number on its own call path,
+        // separate from every other block writer. It has to be the same 1-based
+        // TrackNumber the TrackEntry declared: a base-view block filed under
+        // track 0 (or 2, on a single-track file) is a 3D title whose left eye
+        // silently vanishes.
+        assert!(
+            groups.iter().all(|g| g.track == 1),
+            "every MVC base-view Block belongs to TrackNumber 1, got {:?}",
+            groups.iter().map(|g| g.track).collect::<Vec<_>>()
         );
         // Assert the OFFSET, not just presence — the sibling non-MVC BlockGroup
         // test pins the exact value, and a mutant emitting a constant or a
@@ -5654,6 +5870,288 @@ mod tests {
             .expect("DefaultDuration present for a known frame rate");
         // EBML uint: big-endian, variable width.
         body.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64)
+    }
+
+    /// The Chapters Seek entry has to be back-patched like every other one. It
+    /// is the only fixup whose offset comes from an `Option`, so it is the only
+    /// one that can quietly fall through to the `_ => 0` arm and ship a
+    /// SeekPosition of 0 — a chapter index a player resolves to the Segment
+    /// header. Only titles WITH chapters exercise it, and every SeekHead test
+    /// until now used a chapterless title.
+    #[test]
+    fn seekhead_chapters_entry_resolves_to_the_chapters_element() {
+        let tracks = [make_video_track()];
+        let chapters = vec![
+            Chapter {
+                time_secs: 0.0,
+                name: "Chapter 1".into(),
+            },
+            Chapter {
+                time_secs: 300.0,
+                name: "Chapter 2".into(),
+            },
+        ];
+        let (data, _) = mux_to_bytes(&tracks, &chapters, &frames_for(10.0, 1.0));
+        let (_, seg_start) = locate_segment(&data);
+        let pos = parse_seekhead(&data)
+            .into_iter()
+            .find(|(id, _)| *id == ebml::CHAPTERS)
+            .map(|(_, pos)| pos)
+            .expect("a title with chapters must carry a CHAPTERS Seek entry");
+        assert_ne!(pos, 0, "the CHAPTERS SeekPosition must be back-patched");
+        let mut cursor = Cursor::new(&data[seg_start + pos as usize..]);
+        let (id, _, _) = ebml::read_element_header(&mut cursor).unwrap();
+        assert_eq!(
+            id,
+            ebml::CHAPTERS,
+            "the CHAPTERS SeekPosition must resolve to the Chapters element"
+        );
+    }
+
+    /// `MkvTrack::video` divides by two disc-supplied numbers: the frame-rate
+    /// numerator and the display-aspect denominator. Both come off an IFO/MPLS
+    /// scan of a damaged disc, and a zero in either one is an arithmetic panic
+    /// that takes down the whole `autorip` service — not a bad file. The guards
+    /// exist; nothing proved they were load-bearing.
+    #[test]
+    fn video_track_survives_a_zero_frame_rate_and_zero_aspect_denominator() {
+        let base = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R576i,
+            frame_rate: crate::disc::FrameRate::Unknown, // numerator 0
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        };
+        // An unknown frame rate has no numerator: DefaultDuration is 0 (element
+        // omitted), NOT a divide by zero.
+        assert_eq!(
+            MkvTrack::video(&base).default_duration_ns,
+            0,
+            "an unknown frame rate must omit DefaultDuration, not divide by zero"
+        );
+
+        // A zero aspect denominator must fall back to the square-pixel display
+        // size rather than dividing by it.
+        let zero_den = VideoStream {
+            frame_rate: crate::disc::FrameRate::F25,
+            display_aspect: Some((16, 0)),
+            ..base.clone()
+        };
+        let t = MkvTrack::video(&zero_den);
+        assert_eq!(
+            (t.display_width, t.display_height),
+            (720, 576),
+            "a zero aspect denominator falls back to display == pixel"
+        );
+        // A zero numerator is equally nonsense and takes the same fallback.
+        let zero_num = VideoStream {
+            frame_rate: crate::disc::FrameRate::F25,
+            display_aspect: Some((0, 9)),
+            ..base.clone()
+        };
+        let t = MkvTrack::video(&zero_num);
+        assert_eq!(
+            (t.display_width, t.display_height),
+            (720, 576),
+            "a zero aspect numerator falls back to display == pixel"
+        );
+        // And an unknown resolution (height 0) cannot derive a display width
+        // from a height it does not have.
+        let no_height = VideoStream {
+            frame_rate: crate::disc::FrameRate::F25,
+            resolution: Resolution::Unknown,
+            display_aspect: Some((16, 9)),
+            ..base.clone()
+        };
+        let t = MkvTrack::video(&no_height);
+        assert_eq!(
+            (t.display_width, t.display_height),
+            (0, 0),
+            "no pixel height → no derived display size"
+        );
+    }
+
+    /// FlagDefault marks the track a player selects with no user input. A
+    /// SECONDARY stream (a Dolby Vision enhancement layer, a director's
+    /// commentary) must never be it: default-selecting the DV EL shows a viewer
+    /// the wrong picture, and default-selecting a commentary track the wrong
+    /// audio. `is_default` is the inverse of `secondary` on both the video and
+    /// the audio builder; neither inversion was asserted.
+    #[test]
+    fn secondary_streams_are_never_the_default_track() {
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Hevc,
+            resolution: Resolution::R2160p,
+            frame_rate: crate::disc::FrameRate::F24,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        };
+        assert!(
+            MkvTrack::video(&v).is_default,
+            "the primary video track is the default"
+        );
+        assert!(
+            !MkvTrack::video(&VideoStream {
+                secondary: true,
+                ..v.clone()
+            })
+            .is_default,
+            "a secondary video track (e.g. a Dolby Vision EL) is NEVER the default"
+        );
+
+        let a = audio_stream(Codec::Ac3);
+        assert!(
+            MkvTrack::audio(&a).is_default,
+            "the primary audio track is the default"
+        );
+        assert!(
+            !MkvTrack::audio(&AudioStream {
+                secondary: true,
+                ..a.clone()
+            })
+            .is_default,
+            "a secondary audio track (e.g. a commentary) is NEVER the default"
+        );
+    }
+
+    /// DVD subtitles are VobSub, Blu-ray subtitles are PGS, and the codec ID is
+    /// what tells a player which parser to hand the bitstream to. The subtitle
+    /// builder's fallback is PGS, so a lost `Codec::DvdSub` arm silently labels
+    /// every DVD subtitle track as PGS — a track that displays nothing.
+    #[test]
+    fn subtitle_codec_id_distinguishes_vobsub_from_pgs() {
+        let s = SubtitleStream {
+            pid: 0x20,
+            codec: Codec::DvdSub,
+            language: "eng".into(),
+            forced: false,
+            qualifier: crate::disc::LabelQualifier::None,
+            codec_data: None,
+        };
+        assert_eq!(
+            MkvTrack::subtitle(&s).codec_id,
+            ebml::CODEC_VOBSUB,
+            "a DVD subtitle track is S_VOBSUB"
+        );
+        assert_eq!(
+            MkvTrack::subtitle(&SubtitleStream {
+                codec: Codec::Pgs,
+                ..s.clone()
+            })
+            .codec_id,
+            ebml::CODEC_PGS,
+            "a Blu-ray subtitle track is S_HDMV/PGS"
+        );
+    }
+
+    /// The HDR transfer override is the only thing that turns the coarse
+    /// `color_space` nibble into a PQ/HLG code point. Every earlier test paired
+    /// HDR10 with BT.2020, whose enum mapping already yields PQ — so the
+    /// override itself was never observed. A disc whose playlist nibble says
+    /// BT.709 while the scan detected HDR10 (an ordinary UHD mis-tag) is the
+    /// case that separates them: without the override it ships transfer 1 (SDR
+    /// gamma) and the picture renders washed out.
+    #[test]
+    fn hdr_format_overrides_the_transfer_even_on_a_non_bt2020_color_space() {
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Hevc,
+            resolution: Resolution::R2160p,
+            frame_rate: crate::disc::FrameRate::F24,
+            hdr: HdrFormat::Hdr10,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        };
+        let (m, t, p, _) = cicp_for_video(&v);
+        assert_eq!(
+            (m, t, p),
+            (CICP_MATRIX_BT709, CICP_TRANSFER_PQ, CICP_PRIMARIES_BT709),
+            "HDR10 forces the PQ transfer; matrix/primaries stay with the enum"
+        );
+        // And the track built from it carries the overridden transfer.
+        assert_eq!(MkvTrack::video(&v).colour_transfer, CICP_TRANSFER_PQ);
+        // HLG takes the HLG transfer, and SDR is left alone.
+        assert_eq!(
+            cicp_for_video(&VideoStream {
+                hdr: HdrFormat::Hlg,
+                ..v.clone()
+            })
+            .1,
+            CICP_TRANSFER_HLG
+        );
+        assert_eq!(
+            cicp_for_video(&VideoStream {
+                hdr: HdrFormat::Sdr,
+                ..v.clone()
+            })
+            .1,
+            CICP_TRANSFER_BT709
+        );
+    }
+
+    /// `mvc_decoder_config_record` frames a Blu-ray 3D parameter set with 16-bit
+    /// length prefixes. Its bounds are exact: 4 bytes is the shortest subset SPS
+    /// it can read `profile`/`compat`/`level` out of, and 0xFFFF is the largest
+    /// length the field can express. Off by one at either end and a valid 3D
+    /// title silently loses its mvcC mapping (no 3D signal) or writes a record
+    /// whose declared length does not match its payload.
+    #[test]
+    fn mvc_decoder_config_record_boundaries_are_inclusive_and_exact() {
+        let sps4 = [0x6F, 0x64, 0x00, 0x1F];
+        let pps = [0x68, 0xEE];
+        let record = mvc_decoder_config_record(&sps4, &pps)
+            .expect("a 4-byte subset SPS is the shortest readable one, not a reject");
+        assert_eq!(
+            &record[1..4],
+            &sps4[1..4],
+            "profile/compat/level come from subset SPS bytes 1..=3"
+        );
+        // Three bytes is genuinely too short — bytes 1..=3 do not exist.
+        assert_eq!(mvc_decoder_config_record(&sps4[..3], &pps), None);
+        // An empty PPS has nothing to frame.
+        assert_eq!(mvc_decoder_config_record(&sps4, &[]), None);
+
+        // 0xFFFF is representable in the 16-bit length field; 0x1_0000 is not.
+        let max_pps = vec![0x68u8; 0xFFFF];
+        assert!(
+            mvc_decoder_config_record(&sps4, &max_pps).is_some(),
+            "a 65535-byte PPS still fits the 16-bit length field"
+        );
+        assert_eq!(
+            mvc_decoder_config_record(&sps4, &vec![0x68u8; 0x1_0000]),
+            None
+        );
+        let max_sps = vec![0x6Fu8; 0xFFFF];
+        assert!(mvc_decoder_config_record(&max_sps, &pps).is_some());
+        assert_eq!(
+            mvc_decoder_config_record(&vec![0x6Fu8; 0x1_0000], &pps),
+            None
+        );
+
+        // The PPS length is written big-endian across two bytes. Every earlier
+        // case used a PPS under 256 bytes, where the high byte is 0 whatever the
+        // shift does — so use one that is not.
+        let pps300 = vec![0xAAu8; 300];
+        let record = mvc_decoder_config_record(&sps4, &pps300).unwrap();
+        let len_hi = record.len() - 300 - 2;
+        assert_eq!(
+            (record[len_hi], record[len_hi + 1]),
+            (1, 44),
+            "300 = 0x012C must be framed as high byte 0x01, low byte 0x2C"
+        );
     }
 
     #[test]
