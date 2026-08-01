@@ -39,6 +39,18 @@ pub(crate) struct PlaylistMark {
     pub timestamp: u32,
 }
 
+impl PlaylistMark {
+    /// Is this mark a chapter entry point?
+    ///
+    /// Only `mark_type == 1` counts. Type 0 is reserved and type 2 is a link
+    /// point, and neither is a chapter. Every chapter filter in the crate goes
+    /// through here: two hand-rolled copies had already drifted, one testing
+    /// `<= 1` and silently counting reserved marks as chapters.
+    pub(crate) fn is_chapter_mark(&self) -> bool {
+        self.mark_type == 1
+    }
+}
+
 /// A play item — one clip reference with in/out times.
 #[derive(Debug)]
 pub(crate) struct PlayItem {
@@ -1697,5 +1709,25 @@ mod tests {
         assert_eq!(entry.pid, 0x1200);
         assert_eq!(entry.coding_type, 0x90);
         assert_eq!(entry.language, "");
+    }
+
+    /// Type 0 is reserved and type 2 is a link point; neither is a chapter.
+    /// `labels::collect_chapter_summary` used to filter on `mark_type <= 1`,
+    /// which counted reserved marks and inflated the public `chapter_count`
+    /// (and let a playlist whose only marks are reserved pass the
+    /// `chapter_count == 0` skip). Both call sites now share this predicate.
+    #[test]
+    fn only_entry_marks_count_as_chapters() {
+        let mk = |mark_type| PlaylistMark {
+            mark_type,
+            play_item_ref: 0,
+            timestamp: 0,
+        };
+        assert!(
+            !mk(0).is_chapter_mark(),
+            "type 0 is reserved, not a chapter"
+        );
+        assert!(mk(1).is_chapter_mark());
+        assert!(!mk(2).is_chapter_mark(), "type 2 is a link point");
     }
 }

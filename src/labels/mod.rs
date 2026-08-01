@@ -865,7 +865,7 @@ pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
 }
 
 /// Scan `/BDMV/PLAYLIST/*.mpls`, parse each, return a row per playlist
-/// with chapter count (mark_type ≤ 1) and total duration. Sorted by
+/// with chapter count (entry marks only) and total duration. Sorted by
 /// playlist filename. Skipped entries (read error, parse error, no
 /// marks) silently dropped — this is a diagnostic field, not a
 /// correctness-critical one.
@@ -890,7 +890,11 @@ fn collect_chapter_summary(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<Ch
         let Ok(playlist) = crate::mpls::parse(&data) else {
             continue;
         };
-        let chapter_count = playlist.marks.iter().filter(|m| m.mark_type <= 1).count();
+        let chapter_count = playlist
+            .marks
+            .iter()
+            .filter(|m| m.is_chapter_mark())
+            .count();
         if chapter_count == 0 {
             continue;
         }
