@@ -1289,4 +1289,162 @@ mod tests {
         }
         mux.finish().unwrap();
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Mutation-gap hardening (mux-ts pass)
+    // ════════════════════════════════════════════════════════════════════
+
+    /// `MAX_BD_PES_PAYLOAD` is read by its own tests (the oversized-split
+    /// tests) only through the same symbol, so a mutated arithmetic
+    /// expression in its definition changes what the symbol itself
+    /// evaluates to and those assertions still pass. Pin the compiled value
+    /// against a literal computed independently.
+    #[test]
+    fn max_bd_pes_payload_has_the_documented_value() {
+        assert_eq!(MAX_BD_PES_PAYLOAD, u16::MAX as usize - 8);
+    }
+
+    /// A video access unit larger than `MAX_BD_PES_PAYLOAD` (the bound that
+    /// exists ONLY because a bounded `private_stream_1` PES can't exceed a
+    /// `u16` length) must still go out as ONE PES using the video-only
+    /// unbounded-length form — never split into several independent PES
+    /// chunks the way an oversized audio/subtitle access unit is. A
+    /// splitting bug here would emit several PUSI packets that each look
+    /// like a complete, independent video access unit (RAI + PTS on each),
+    /// corrupting any large keyframe.
+    #[test]
+    fn oversized_video_frame_is_one_pes_not_split() {
+        let big = fake_hevc_nal(19, MAX_BD_PES_PAYLOAD + 5000);
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            mux.write_frame(0, 0, true, &big).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let pusi_count = packets
+            .iter()
+            .filter(|p| p.pid == VIDEO_PID && p.pusi)
+            .count();
+        assert_eq!(
+            pusi_count, 1,
+            "an oversized video access unit must still be exactly one PES \
+             (one PUSI packet), using the unbounded length form, not split \
+             into several PES the way bounded private_stream_1 data is"
+        );
+    }
+
+    /// The RAI-carrying first packet of a keyframe video PES needs only the
+    /// MINIMUM adaptation field (2 bytes: length + RAI flag) before payload
+    /// resumes — `max_payload = TS_PAYLOAD_BYTES - 2`. A `-` -> `/` mutation
+    /// collapses that to `184 / 2 = 92`, wasting 90 bytes of every keyframe's
+    /// first packet as pointless AF stuffing. Pin the AF to its true minimum
+    /// length when there is enough data to fill the rest as payload.
+    #[test]
+    fn rai_adaptation_field_uses_the_minimum_two_bytes() {
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            // Comfortably larger than one TS payload so the first packet is
+            // entirely full: AF(2) + payload(182) = 184.
+            let idr = fake_hevc_nal(19, 1000);
+            mux.write_frame(0, 0, true, &idr).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let first_pusi = packets
+            .iter()
+            .find(|p| p.pid == VIDEO_PID && p.pusi)
+            .expect("video PUSI packet exists");
+        let af = first_pusi.af.as_ref().expect("AF present on keyframe PES");
+        assert_eq!(
+            af.len(),
+            1,
+            "AF body (length byte stripped) must be exactly [flags] = 1 byte \
+             (2 total with the length byte) when there is enough data to fill \
+             the rest of the packet as payload"
+        );
+        assert_eq!(first_pusi.payload.len(), 182);
+    }
+
+    /// `build_pes_header`'s bounded-length field is big-endian 16-bit
+    /// (`(len >> 8) as u8`, then `len as u8`). A `>>` -> `<<` mutation
+    /// zeroes the high byte for every length (shifting left by 8 then
+    /// truncating to `u8` always yields 0), so any PES longer than 255
+    /// bytes gets a silently wrong (far too small) declared length. Use an
+    /// audio frame comfortably over 255 bytes but under the oversized-split
+    /// threshold so exactly one bounded PES is produced.
+    #[test]
+    fn bounded_pes_length_field_encodes_the_high_byte() {
+        let es: Vec<u8> = vec![0xAB; 2000];
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
+            mux.write_frame(0, 0, false, &es).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let pusi = packets
+            .iter()
+            .find(|p| p.pid == AUDIO_PID && p.pusi)
+            .unwrap();
+        let len = u16::from_be_bytes([pusi.payload[4], pusi.payload[5]]);
+        // pes_data_len = data_len + 8 (3 optional-header bytes + 5 PTS bytes).
+        assert_eq!(
+            len as usize,
+            es.len() + 8,
+            "PES_packet_length high byte must survive the encode"
+        );
+        assert!(
+            pusi.payload[4] != 0,
+            "a length > 255 must set a nonzero high byte"
+        );
+    }
+
+    /// The PTS encoding's top byte carries bits 29..32 of the 33-bit
+    /// timestamp (`(pts >> 29) & 0x0E`). A `>>` -> `<<` mutation there always
+    /// yields 0 regardless of `pts` (shifting left by 29 then masking the
+    /// low 4 bits always sees zeros shifted in), which a small test PTS
+    /// (whose true bits 29..32 are already 0) cannot distinguish from
+    /// correct code. Use a PTS large enough that bits 29..32 are nonzero.
+    #[test]
+    fn pts_high_bits_survive_encoding() {
+        // Choose pts_ns as an exact multiple of 100_000 so `pts_ns * 9 /
+        // 100_000` (the muxer's ns -> 90kHz-tick conversion) is exact, no
+        // truncation to account for. N * 9 lands just above 2^31, so bit 31
+        // of the 33-bit PTS field is set — well above anything a small-PTS
+        // test would exercise.
+        const N: u64 = 238_609_295;
+        let big_pts_ticks: u64 = N * 9;
+        let big_pts_ns = (N * 100_000) as i64;
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            let idr = fake_hevc_nal(19, 50);
+            mux.write_frame(0, 0, true, &idr).unwrap(); // base = 0
+            let p = fake_hevc_nal(1, 50);
+            mux.write_frame(0, big_pts_ns, false, &p).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let video_pusi: Vec<&TsPacket> = packets
+            .iter()
+            .filter(|p| p.pid == VIDEO_PID && p.pusi)
+            .collect();
+        assert!(video_pusi.len() >= 2);
+        let decoded = first_pts_90k(&packets, VIDEO_PID);
+        // first_pts_90k always reads the FIRST pusi packet, which is the
+        // base (0); decode the SECOND PES's PTS by hand instead.
+        let p = &video_pusi[1].payload;
+        let pts = ((((p[9] >> 1) & 0x07) as u64) << 30)
+            | ((p[10] as u64) << 22)
+            | (((p[11] >> 1) as u64) << 15)
+            | ((p[12] as u64) << 7)
+            | ((p[13] >> 1) as u64);
+        assert_eq!(decoded, 0, "base video frame stays at relative PTS 0");
+        assert_eq!(
+            pts, big_pts_ticks,
+            "the high bits (29..32) of a large PTS must round-trip through encoding"
+        );
+    }
 }
