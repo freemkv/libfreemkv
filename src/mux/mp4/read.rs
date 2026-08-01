@@ -524,6 +524,13 @@ type EditListEntry = (u64, i64, i16);
 /// media_rate_integer:i16, media_rate_fraction:i16` (20 bytes); version 0 uses
 /// 32-bit duration/time (12 bytes).
 fn parse_elst(b: &[u8]) -> Vec<EditListEntry> {
+    // `<`↔`<=` here is equivalent, not a coverage gap: at the boundary
+    // `b.len() == 8` this early return and falling through produce the SAME
+    // result. Falling through computes `available = (b.len() - 8) /
+    // entry_size = 0`, which floors `n` to 0 regardless of the declared count,
+    // so the loop never runs and `Vec::new()` comes back either way. Confirmed
+    // by re-running the `<=` mutation against the full test suite, which still
+    // passes.
     if b.len() < 8 {
         return Vec::new();
     }
@@ -607,6 +614,17 @@ fn elst_offset_ticks(
         }
     }
 
+    // `media_edits` and `odd_rate` are read ONLY by this `if` (to decide
+    // whether to log) — neither feeds `delay_media_ticks` or the `saturating_sub`
+    // below, so no mutation of this condition (`>`↔`==`/`<`/`>=`, `||`↔`&&`, or
+    // the `rate != 1` comparison that sets `odd_rate`) can change what this
+    // function returns; it can only change whether this particular warning
+    // fires. Mutation testing flags all five as surviving; that is expected,
+    // not a coverage gap — confirmed by re-running each mutation against the
+    // full test suite (`parse_elst_v1_entry_bytes_come_from_their_own_offsets`
+    // and `parse_elst_and_offset_arithmetic` among them), which still passes
+    // under every one. The same shape recurs below for the `None` arm's
+    // `empty_movie_ticks > 0` log guard.
     if media_edits > 1 || odd_rate {
         tracing::warn!(
             track = track_idx,
@@ -627,6 +645,11 @@ fn elst_offset_ticks(
         }
         Some(_) => 0,
         None => {
+            // Same shape as the `media_edits > 1 || odd_rate` guard above: this
+            // arm returns 0 no matter what, so a `>`↔`==`/`<`/`>=` mutant of
+            // this comparison only changes whether the warning below fires,
+            // never the return value. Confirmed equivalent empirically the
+            // same way.
             if empty_movie_ticks > 0 {
                 tracing::warn!(
                     track = track_idx,
@@ -2164,6 +2187,56 @@ mod tests {
             elst_offset_ticks(&[(u64::MAX, -1, 1)], Some(1), 48_000, 0),
             i64::MAX,
         );
+    }
+
+    /// Every byte of a version-1 entry's `segment_duration` (8 bytes) and
+    /// `media_time` (8 bytes) at its own offset — not a neighbour's. The
+    /// existing fixtures above use `5_000u64` and `-1i64`, which are almost all
+    /// zero/`0xFF` bytes, so an index slip that reads an adjacent byte (or a
+    /// header byte outside the entry) often reads the SAME value and the test
+    /// cannot tell. Every byte here is distinct and nonzero, and the header
+    /// bytes are zero, so any wrong index — off by one, negated, or scaled —
+    /// pulls in a value that cannot match by coincidence.
+    #[test]
+    fn parse_elst_v1_entry_bytes_come_from_their_own_offsets() {
+        let mut v1 = vec![1u8, 0, 0, 0]; // version 1 + flags
+        v1.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1
+        v1.extend_from_slice(&0x1122334455667788u64.to_be_bytes()); // segment_duration
+        v1.extend_from_slice(&0x0102030405060708i64.to_be_bytes()); // media_time
+        v1.extend_from_slice(&0x2A3Bi16.to_be_bytes()); // media_rate_integer
+        v1.extend_from_slice(&0x5C6Di16.to_be_bytes()); // media_rate_fraction (unread)
+        assert_eq!(
+            parse_elst(&v1),
+            vec![(0x1122334455667788u64, 0x0102030405060708i64, 0x2A3Bi16)]
+        );
+    }
+
+    /// `Some(mts) if empty_movie_ticks > 0` and the `None` branch's `if
+    /// empty_movie_ticks > 0` are both guards around a `tracing::warn!`/delay
+    /// computation that, at `empty_movie_ticks == 0`, must produce the exact
+    /// same answer as skipping it (0 ticks of delay — there is no empty edit to
+    /// convert). The one case where the two are NOT interchangeable is
+    /// `movie_timescale == Some(0)`: skipping the arithmetic returns 0, but
+    /// entering it divides by that zero timescale and panics. Real callers
+    /// never pass this — `from_reader` filters `mvhd`'s timescale through
+    /// `.filter(|&t| t != 0)` before it ever reaches this function (see
+    /// `mdhd_timescale_zero_does_not_divide_by_zero` for the sibling guard on
+    /// the media timescale) — but the function itself has to stay panic-free at
+    /// its own boundary, independent of what its one caller happens to do
+    /// today, because `libfreemkv` runs inside the long-lived `autorip`
+    /// service and a panic there is downtime.
+    #[test]
+    fn elst_offset_ticks_stays_safe_at_zero_empty_ticks_even_with_a_zero_movie_timescale() {
+        assert_eq!(
+            elst_offset_ticks(&[], Some(0), 48_000, 0),
+            0,
+            "no empty edit (empty_movie_ticks == 0) must short-circuit before \
+             the timescale is ever used as a divisor"
+        );
+        // Sanity: a REAL empty edit with a zero movie timescale is a separate,
+        // already-latent situation this test does not claim to fix — it is
+        // unreachable from from_reader (see doc comment above) and is outside
+        // the empty_movie_ticks == 0 boundary this test pins.
     }
 
     #[test]
