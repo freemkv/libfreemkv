@@ -70,6 +70,16 @@ fn round_up_grain(x: u64) -> u64 {
     x.div_ceil(RESERVE_GRAIN).saturating_mul(RESERVE_GRAIN)
 }
 
+/// Whether `gap` bytes of leftover reserved-hole slack (after `moov` is
+/// written into it) can be closed: an exact fill (`0`) needs no `free` box at
+/// all, and `8+` bytes is enough to hold one (an ISO-BMFF box header is 8
+/// bytes: 4-byte size + 4-byte type). A gap of 1–7 bytes cannot be expressed as
+/// any box, so [`Mp4Sink::finish`] must fall back to moov-at-end instead of
+/// writing a `free` box that lies about its own size.
+fn faststart_fits(gap: u64) -> bool {
+    gap == 0 || gap >= 8
+}
+
 /// Estimate the faststart hole: `round_up_4MB(bytes_per_sample × est_samples)`
 /// plus a 4 MiB buffer, floored at 8 MiB. `est_samples` comes from the title
 /// duration × each included track's frame rate.
@@ -543,7 +553,7 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
         // room for a valid (≥8-byte) `free` box in the slack. Otherwise fall back
         // to moov-at-end (rare — the +4 MiB buffer makes this near-impossible).
         match gap {
-            Some(g) if g == 0 || g >= 8 => {
+            Some(g) if faststart_fits(g) => {
                 self.writer.seek(SeekFrom::Start(self.hole_start))?;
                 self.writer.write_all(&moov)?;
                 if g >= 8 {
@@ -1274,6 +1284,26 @@ mod tests {
         out
     }
 
+    /// Direct child lookup by box type, one level, returning its payload (bytes
+    /// after the 8-byte size+type header). A minimal box walker duplicated here
+    /// for tests — the reader's own box-walking (`find_box`) lives in `read.rs`
+    /// and is private to that module.
+    fn find_child<'a>(buf: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
+        let mut pos = 0;
+        while pos + 8 <= buf.len() {
+            let size =
+                u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+            if size < 8 || pos + size > buf.len() {
+                break;
+            }
+            if &buf[pos + 4..pos + 8] == want {
+                return Some(&buf[pos + 8..pos + size]);
+            }
+            pos += size;
+        }
+        None
+    }
+
     /// An audio track whose frames never yield a parseable sample entry must be
     /// dropped from moov, NOT written as an stsd declaring entry_count=1 around an
     /// empty entry — that is a structurally invalid mp4 returned as success.
@@ -1701,6 +1731,356 @@ mod tests {
         }
     }
 
+    // ── pack_language ────────────────────────────────────────────────────────
+
+    /// Every bit-twiddle in `pack_language`'s valid-input path (both shift
+    /// amounts, both `-0x60` subtractions on the first two letters, and the OR
+    /// that assembles them) pinned against hand-computed packed values, using
+    /// letters other than 'a' so a `-`↔`/` flip on the per-letter offset is
+    /// visible: `'a' - 0x60 == 1 == 'a' / 0x60`, so a fixture starting with 'a'
+    /// cannot tell subtraction from division apart on that letter.
+    #[test]
+    fn pack_language_packs_three_lowercase_letters_into_15_bits() {
+        // "bcd": b=2, c=3, d=4 → (2<<10)|(3<<5)|4 = 2048+96+4 = 0x0864.
+        assert_eq!(pack_language("bcd"), [0x08, 0x64]);
+        // ISO 639-2 "eng", cross-checked against read.rs's `mdhd_language`
+        // fixture, which decodes the same packed constant back to "eng".
+        assert_eq!(pack_language("eng"), [0x15, 0xC7]);
+    }
+
+    /// Every rejection path falls back to the fixed "und" encoding: wrong
+    /// length (both shorter and longer than 3) and not-all-lowercase (upper
+    /// case, a digit, a non-ASCII byte).
+    #[test]
+    fn pack_language_falls_back_to_und_for_anything_not_three_lowercase_letters() {
+        const UND: [u8; 2] = [0x55, 0xC4];
+        assert_eq!(pack_language("en"), UND, "too short");
+        assert_eq!(pack_language("engl"), UND, "too long");
+        assert_eq!(pack_language("ENG"), UND, "not lowercase");
+        assert_eq!(pack_language("e1g"), UND, "not all letters");
+        assert_eq!(pack_language(""), UND, "empty");
+    }
+
+    // ── faststart reserve sizing constants and guards ──────────────────────────
+
+    #[test]
+    fn reserve_floor_is_8_mebibytes() {
+        // A shifted-the-wrong-way `8 << 20` silently becomes 0, collapsing the
+        // floor. Every other reserve test builds on this constant, so pin it
+        // directly rather than only through their derived numbers.
+        assert_eq!(RESERVE_FLOOR, 8 * 1024 * 1024);
+    }
+
+    /// `estimate_reserve`'s per-stream fps comes from `v.frame_rate.as_fraction()`
+    /// only when BOTH `n > 0 && d > 0`; otherwise it falls back to a flat 24.0.
+    /// `FrameRate::Unknown` is the only variant with `n == 0` (it reports
+    /// `(0, 1)`), so it is the one real input that takes the fallback branch —
+    /// every other variant has `n, d > 0` and must use its OWN fps, not 24.0.
+    ///
+    /// A film-rate title (23.976 fps) is the fixture that can tell "used its own
+    /// fps" apart from "used the 24.0 fallback": at 24 fps flat those two numbers
+    /// coincide, so a guard broken by an operator flip (`&&`→`||`, `>`→`==`/`<`/
+    /// `>=`) would be invisible on it. Duration 76_500 s is chosen so the two
+    /// answers land in different 4 MiB reserve grains, not just differ before
+    /// rounding.
+    #[test]
+    fn estimate_reserve_uses_the_streams_own_fps_not_the_24fps_fallback() {
+        let mut t = title(vec![hevc_video()], vec![]);
+        t.duration_secs = 76_500.0;
+        let r = estimate_reserve(&t, &[0]);
+        assert_eq!(
+            r, 33_554_432,
+            "23.976 fps must be used verbatim, not rounded up to a flat 24.0"
+        );
+    }
+
+    /// The complementary case: `FrameRate::Unknown` (n=0) is the one real input
+    /// meant to take the fallback branch. If the guard's `n > 0` is weakened so
+    /// zero passes it (`==0`, `>=0`) or the `&&` becomes `||`, the code computes
+    /// `0 / 1 = 0.0` fps instead of falling back to 24.0 — collapsing the
+    /// estimate to near-zero samples instead of a reasonable guess.
+    #[test]
+    fn estimate_reserve_unknown_frame_rate_falls_back_to_24fps_not_zero() {
+        let mut vc1 = match hevc_video() {
+            DiscStream::Video(v) => v,
+            _ => unreachable!(),
+        };
+        vc1.frame_rate = FrameRate::Unknown;
+        let mut t = title(vec![DiscStream::Video(vc1)], vec![]);
+        t.duration_secs = 76_500.0;
+        let r = estimate_reserve(&t, &[0]);
+        // Same duration, taking the 24.0 fallback: lands in a DIFFERENT grain
+        // than the 23.976 fps case above (37_748_736 vs 33_554_432), and far
+        // above the floor+buffer a 0-fps collapse would produce (12_582_912).
+        assert_eq!(
+            r, 37_748_736,
+            "an unknown frame rate must estimate as if it were 24 fps, not 0"
+        );
+    }
+
+    /// `estimate_reserve` models a DTS/DTS-HD-MA/DTS-HD-HR audio unit as 512
+    /// samples (a DTS core AU is `(nblks+1)*32`), a THIRD of the 1536-sample
+    /// (E-)AC-3 default the `_` arm uses for everything else. Deleting the DTS
+    /// match arm silently reverts every DTS track to the AC-3 model, which
+    /// under-reserves a DTS-heavy title's sample table 3x and can push a real
+    /// mux onto the moov-at-end fallback.
+    #[test]
+    fn estimate_reserve_models_dts_at_512_samples_per_frame_not_1536() {
+        let t_dts = {
+            let mut t = title(vec![audio(Codec::Dts, "eng")], vec![]);
+            t.duration_secs = 100_000.0;
+            t
+        };
+        let r_dts = estimate_reserve(&t_dts, &[0]);
+        assert_eq!(
+            r_dts, 155_189_248,
+            "a DTS track must be modelled at 512 samples/frame"
+        );
+
+        let t_ac3 = {
+            let mut t = title(vec![audio(Codec::Ac3, "eng")], vec![]);
+            t.duration_secs = 100_000.0;
+            t
+        };
+        let r_ac3 = estimate_reserve(&t_ac3, &[0]);
+        assert_eq!(
+            r_ac3, 54_525_952,
+            "an AC-3 track (the `_` arm) is modelled at 1536 samples/frame"
+        );
+        assert_ne!(
+            r_dts, r_ac3,
+            "DTS and AC-3 must not be modelled identically — one is a third of the other"
+        );
+    }
+
+    // ── track timing arithmetic — every operator with a concrete number ───────
+    //
+    // Nothing above this point pins a NUMBER out of the PTS→ticks / duration /
+    // tkhd_dur / ctts chain: every existing test asserts a box exists or that
+    // gross shape (trak count, mdat size) is right, never that `stts`, `ctts` or
+    // `tkhd.duration` hold a specific value. Every arithmetic operator in that
+    // chain (`*`↔`/`↔`+`↔`-`, even `/`↔`%`) could be flipped with the whole
+    // suite green — a title would mux "successfully" with silently corrupted
+    // A/V sync or a wrong total duration. These pin exact values, chosen so a
+    // flipped operator cannot coincidentally reproduce the right answer (e.g. a
+    // non-zero `min_pts` so `pts - min_pts` and a mutated `pts + min_pts` differ,
+    // a `sample_dur` other than 1 so `*` and `/` by it differ).
+
+    /// `VideoTiming::derive`'s composition ticks are `(pts - min_pts) * ts / NS`.
+    /// `min_pts` is deliberately non-zero: with min_pts == 0 a mutated `+` gives
+    /// the same answer as `-` and the mutant survives for free.
+    #[test]
+    fn video_timing_derive_subtracts_the_minimum_pts_not_adds_it() {
+        let offset = 5_000_000_000i64; // 5 s, so min_pts != 0
+        let d = 40_000_000i64; // 40 ms/frame — exact 25 fps
+        // Decode order carries a classic I-P-B-B reorder (P presents last).
+        let samples = vec![
+            Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: offset,
+                keyframe: true,
+            },
+            Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: offset + 3 * d,
+                keyframe: false,
+            },
+            Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: offset + d,
+                keyframe: false,
+            },
+            Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: offset + 2 * d,
+                keyframe: false,
+            },
+        ];
+        let timing = VideoTiming::derive(&samples);
+        assert_eq!(timing.timescale, 25, "exact 25 fps snaps to timescale 25");
+        assert_eq!(timing.sample_dur, 1);
+        assert_eq!(
+            timing.cts,
+            vec![0, 3, 1, 2],
+            "cts must be (pts - min_pts) * ts / NS, in decode order"
+        );
+    }
+
+    /// `VideoTiming::total_duration` is `sample_count * sample_dur`. `sample_dur`
+    /// is deliberately not 1 — `*` and `/` by 1 are the same function, so a
+    /// mutated `/` would survive a `sample_dur == 1` fixture for free.
+    #[test]
+    fn video_timing_total_duration_multiplies_count_by_sample_duration() {
+        let timing = VideoTiming {
+            timescale: 24_000,
+            sample_dur: 1001,
+            cts: vec![0, 1001, 2002, 3003],
+        };
+        assert_eq!(timing.total_duration(), 4 * 1001);
+    }
+
+    /// `VideoTiming::ctts` is `cts[i] - i * sample_dur`. `sample_dur` is again
+    /// not 1, so `*` and `/` disagree.
+    #[test]
+    fn video_timing_ctts_subtracts_index_times_sample_duration() {
+        let timing = VideoTiming {
+            timescale: 25,
+            sample_dur: 2,
+            cts: vec![10, 5, 20],
+        };
+        // [10 - 0*2, 5 - 1*2, 20 - 2*2] = [10, 3, 16].
+        assert_eq!(timing.ctts(), vec![10, 3, 16]);
+    }
+
+    /// `build_video_trak_full` and `build_audio_trak_full` both compute
+    /// `tkhd.duration = secs * MOVIE_TIMESCALE` — a SEPARATE multiplication from
+    /// the media-timescale duration in `mdhd`, because `tkhd.duration` lives in
+    /// the movie's 90 kHz clock (ISO/IEC 14496-12 §8.3.2). Read it straight out
+    /// of the emitted `tkhd` bytes (offset 28 in a version-1 tkhd: version+flags
+    /// (4) + creation(8) + modification(8) + track_id(4) + reserved(4) =28),
+    /// so the assertion is on what the file says, not a second copy of the
+    /// formula.
+    #[test]
+    fn tkhd_duration_is_seconds_times_movie_timescale_for_both_media_types() {
+        fn tkhd_duration(trak: &[u8]) -> u64 {
+            let tkhd = find_child(&trak[8..], b"tkhd").expect("tkhd");
+            u64::from_be_bytes(tkhd[28..36].try_into().unwrap())
+        }
+
+        // Video: 4 samples at exact 25 fps → total_duration 4 ticks @ ts 25 →
+        // secs = 0.16 → tkhd_dur = 0.16 * 90_000 = 14_400 exactly.
+        let video = Track {
+            media: Media::Video,
+            track_id: 1,
+            stream_idx: 0,
+            codec: Codec::Hevc,
+            codec_private: vec![0xAA, 0xBB],
+            width: 1920,
+            height: 1080,
+            colr: None,
+            language: [0x55, 0xC4],
+            audio_entry: None,
+            audio_timescale: 0,
+            samples: (0..4)
+                .map(|i| Sample {
+                    offset: 0,
+                    size: 1,
+                    pts_ns: i * 40_000_000,
+                    keyframe: i == 0,
+                })
+                .collect(),
+        };
+        let (vtrak, vsecs) = build_trak(&video);
+        assert_eq!(vsecs, 0.16);
+        assert_eq!(
+            tkhd_duration(&vtrak),
+            14_400,
+            "video tkhd.duration must be secs * MOVIE_TIMESCALE"
+        );
+
+        // Audio: 2 samples 32 ms apart at 48 kHz → per-sample duration 1536
+        // ticks (exact), media_dur = 2 * 1536 = 3072, secs = 3072/48000 = 0.064
+        // → tkhd_dur = 0.064 * 90_000 = 5_760 exactly.
+        let audio = Track {
+            media: Media::Audio,
+            track_id: 2,
+            stream_idx: 1,
+            codec: Codec::Ac3,
+            codec_private: Vec::new(),
+            width: 0,
+            height: 0,
+            colr: None,
+            language: [0x55, 0xC4],
+            audio_entry: Some(vec![0x0B, 0x77]),
+            audio_timescale: 48_000,
+            samples: vec![
+                Sample {
+                    offset: 0,
+                    size: 10,
+                    pts_ns: 0,
+                    keyframe: true,
+                },
+                Sample {
+                    offset: 10,
+                    size: 10,
+                    pts_ns: 32_000_000,
+                    keyframe: true,
+                },
+            ],
+        };
+        let (atrak, asecs) = build_trak(&audio);
+        assert_eq!(
+            asecs,
+            3072.0 / 48_000.0,
+            "audio secs must be media_dur / timescale, not any other combination"
+        );
+        assert_eq!(
+            tkhd_duration(&atrak),
+            5_760,
+            "audio tkhd.duration must be secs * MOVIE_TIMESCALE"
+        );
+    }
+
+    /// `audio_sample_durations`'s per-sample ticks are `ns * ts / NS`, and the
+    /// inter-sample delta is `ticks(next) - ticks(prev)` (clamped at 0), with the
+    /// LAST duration repeated for the trailing sample. PTS deltas are chosen so
+    /// every tick value is an exact integer and the two windows differ (32 ms
+    /// then another 32 ms from a non-zero base), so a `-`↔`+` flip on the delta
+    /// is visible on the second window even though it is invisible on the first
+    /// (whose previous tick is 0).
+    #[test]
+    fn audio_sample_durations_computes_exact_tick_deltas_and_repeats_the_last() {
+        let samples = vec![
+            Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: 0,
+                keyframe: true,
+            },
+            Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: 32_000_000, // 1536 ticks @ 48 kHz, exact
+                keyframe: true,
+            },
+            Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: 64_000_000, // 3072 ticks @ 48 kHz, exact
+                keyframe: true,
+            },
+        ];
+        let durs = audio_sample_durations(&samples, 48_000);
+        assert_eq!(
+            durs,
+            vec![1536, 1536, 1536],
+            "two 1536-tick deltas, and the trailing sample repeats the last"
+        );
+    }
+
+    /// The single-sample fallback (`durs.last()` is `None`) pushes
+    /// `timescale / 30`, guarded by `!samples.is_empty()`. A single sample
+    /// exercises both: `windows(2)` yields nothing, so the fallback branch is
+    /// the only source of a duration at all.
+    #[test]
+    fn audio_sample_durations_single_sample_uses_timescale_over_30_fallback() {
+        let samples = vec![Sample {
+            offset: 0,
+            size: 1,
+            pts_ns: 0,
+            keyframe: true,
+        }];
+        assert_eq!(
+            audio_sample_durations(&samples, 48_000),
+            vec![48_000 / 30],
+            "a lone sample gets one fallback duration, timescale/30"
+        );
+    }
+
     #[test]
     fn detect_rate_picks_the_nearest_std_rate_regardless_of_table_order() {
         // Order-independence is the property that keeps this fixed: every entry
@@ -1723,5 +2103,182 @@ mod tests {
                 "{rate} fps must resolve to its own STD_RATES entry"
             );
         }
+    }
+
+    /// Fewer than 2 samples can't measure a delta at all: fixed 90 kHz/3003
+    /// fallback (not 90 kHz/anything else, and not a panic on an empty median).
+    /// EXACTLY 2 samples is the boundary itself, not just "some samples fewer
+    /// than 2" — a `<`→`==`/`<=` mutant on `samples.len() < 2` forces the
+    /// fallback for 2 samples too, even though they carry a perfectly good
+    /// 25 fps delta.
+    #[test]
+    fn detect_rate_needs_at_least_two_samples_not_more() {
+        assert_eq!(detect_rate(&[]), (90_000, 3_003));
+        assert_eq!(
+            detect_rate(&[Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: 0,
+                keyframe: true
+            }]),
+            (90_000, 3_003)
+        );
+        let two = vec![
+            Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: 0,
+                keyframe: true,
+            },
+            Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: 40_000_000, // exact 25 fps
+                keyframe: false,
+            },
+        ];
+        assert_eq!(
+            detect_rate(&two),
+            (25, 1),
+            "exactly 2 samples is enough to measure a real rate, not the fallback"
+        );
+    }
+
+    /// Only POSITIVE deltas are considered (`filter(|&d| d > 0)`). A `>`→`>=`
+    /// mutant lets zero deltas (duplicate/out-of-order PTS) through, which
+    /// shifts which element `deltas[deltas.len() / 2]` lands on. Three
+    /// duplicate timestamps plus one real 25 fps delta make the shift land on
+    /// the zero itself: median becomes 0, `fps` becomes `NS / 0 = inf`, no
+    /// `STD_RATES` entry is within tolerance of infinity, and the fallback
+    /// path's `median` of 0 forces its duration floor of 1 — a completely
+    /// different, clearly-wrong answer from the correct (25, 1).
+    #[test]
+    fn detect_rate_filters_zero_deltas_not_just_negative_ones() {
+        let samples: Vec<Sample> = vec![0, 0, 0, 40_000_000]
+            .into_iter()
+            .map(|pts_ns| Sample {
+                offset: 0,
+                size: 1,
+                pts_ns,
+                keyframe: pts_ns == 0,
+            })
+            .collect();
+        assert_eq!(
+            detect_rate(&samples),
+            (25, 1),
+            "the three duplicate zero deltas must be filtered out entirely, \
+             leaving the one real 25 fps delta as the (only, hence median) value"
+        );
+    }
+
+    /// A rate with no nearby `STD_RATES` entry takes the fallback branch:
+    /// `timescale = 90_000`, `duration = (median * 90_000) / NS`. 5 fps
+    /// (200 ms/frame) is chosen so `median * 90_000` is an exact multiple of
+    /// `NS`, giving a clean expected duration that a `*`↔`+`/`/` flip on either
+    /// operator, or `/`↔`%`, cannot coincidentally reproduce.
+    #[test]
+    fn detect_rate_fallback_duration_is_median_times_90khz_over_ns() {
+        let samples: Vec<Sample> = (0..10)
+            .map(|i| Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: i as i64 * 200_000_000, // 5 fps — far outside every STD_RATES window
+                keyframe: i == 0,
+            })
+            .collect();
+        assert_eq!(
+            detect_rate(&samples),
+            (90_000, 18_000),
+            "median 200_000_000 ns * 90_000 / 1e9 = 18_000 exactly"
+        );
+    }
+
+    // ── build_ftyp ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_ftyp_names_the_codec_specific_compatible_brand() {
+        let hevc = build_ftyp(Codec::Hevc);
+        assert!(
+            hevc.windows(4).any(|w| w == b"hvc1"),
+            "an HEVC title must declare the hvc1 compatible brand"
+        );
+        let h264 = build_ftyp(Codec::H264);
+        assert!(
+            h264.windows(4).any(|w| w == b"avc1"),
+            "an H.264 title must declare the avc1 compatible brand"
+        );
+        assert_ne!(
+            hevc, h264,
+            "the two codec brands must not collapse to the same ftyp"
+        );
+    }
+
+    // ── build_audio_stbl run-length coalescing ─────────────────────────────────
+
+    #[test]
+    fn build_audio_stbl_coalesces_equal_adjacent_durations_only() {
+        let samples: Vec<Sample> = (0..5)
+            .map(|i| Sample {
+                offset: i as u64 * 10,
+                size: 10,
+                pts_ns: 0,
+                keyframe: true,
+            })
+            .collect();
+        // Two distinct adjacent runs: [5,5] then [7,7,7]. If the coalescing
+        // guard always matches (or always mismatches), or `==`/`!=` is
+        // inverted, the run count and/or the runs' (count, value) pairs come
+        // out wrong.
+        let durs = vec![5u32, 5, 7, 7, 7];
+        let stbl = build_audio_stbl(vec![0u8; 4], &samples, &durs);
+        let stts = find_child(&stbl[8..], b"stts").expect("stts");
+        let entry_count = u32::from_be_bytes(stts[4..8].try_into().unwrap());
+        assert_eq!(
+            entry_count, 2,
+            "5,5,7,7,7 must coalesce into exactly two runs"
+        );
+        assert_eq!(
+            &stts[8..16],
+            &[0, 0, 0, 2, 0, 0, 0, 5][..],
+            "first run: count=2 value=5"
+        );
+        assert_eq!(
+            &stts[16..24],
+            &[0, 0, 0, 3, 0, 0, 0, 7][..],
+            "second run: count=3 value=7"
+        );
+    }
+
+    // ── faststart_fits ───────────────────────────────────────────────────────
+
+    #[test]
+    fn faststart_fits_zero_or_at_least_eight_bytes_only() {
+        assert!(faststart_fits(0), "an exact fill needs no free box");
+        for g in 1..8 {
+            assert!(
+                !faststart_fits(g),
+                "{g} bytes cannot be expressed as any box (min header is 8)"
+            );
+        }
+        assert!(faststart_fits(8), "8 bytes is exactly one empty free box");
+        assert!(faststart_fits(1_000_000));
+    }
+
+    // ── Stream::read is write-only ──────────────────────────────────────────
+
+    #[test]
+    fn mp4_sink_read_is_unsupported() {
+        let t = title(
+            vec![hevc_video(), audio(Codec::Ac3, "eng")],
+            vec![Some(vec![1, 2, 3]), None],
+        );
+        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        let err = s.read().unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with(&format!("E{}", crate::error::E_STREAM_WRITE_ONLY)),
+            "an Mp4Sink is write-only; read() must report that, not silently return Ok(None); \
+             got {err}"
+        );
     }
 }
