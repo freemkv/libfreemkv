@@ -456,18 +456,24 @@ impl DiscStream {
     }
 
     fn fill_extents(&mut self) -> io::Result<bool> {
-        if self.current_extent >= self.extents.len() {
-            return Ok(false);
-        }
-        let ext_start = self.extents[self.current_extent].start_lba;
-        let ext_sectors = self.extents[self.current_extent].sector_count;
-
-        let remaining = ext_sectors.saturating_sub(self.current_offset);
-        if remaining == 0 {
+        // Skip exhausted and zero-sector extents iteratively. This was a
+        // self-recursive call, which costs a stack frame per skipped extent:
+        // nothing filters `sector_count == 0` out of a UDF/MPLS extent list, so
+        // a malformed disc declaring thousands of empty extents in a row could
+        // overflow the stack. That aborts the process — uncatchable, and fatal
+        // to a long-running service — rather than surfacing as an io::Error.
+        let (ext_start, ext_sectors, remaining) = loop {
+            if self.current_extent >= self.extents.len() {
+                return Ok(false);
+            }
+            let ext = &self.extents[self.current_extent];
+            let remaining = ext.sector_count.saturating_sub(self.current_offset);
+            if remaining > 0 {
+                break (ext.start_lba, ext.sector_count, remaining);
+            }
             self.current_extent += 1;
             self.current_offset = 0;
-            return self.fill_extents();
-        }
+        };
 
         // start_lba comes from UDF/MPLS extents; a malformed extent near
         // u32::MAX would overflow (debug panic / release wrap to a wrong LBA).
@@ -1229,6 +1235,49 @@ mod tests {
         assert!(
             s.read_buf[2048..16_384].iter().all(|&b| b == 0),
             "the undelivered tail must be zero-filled, not stale bytes"
+        );
+    }
+
+    /// Nothing filters `sector_count == 0` out of a UDF/MPLS extent list, so a
+    /// malformed disc can declare a long run of empty extents. `fill_extents`
+    /// used to skip each one with a self-recursive call, costing a stack frame
+    /// apiece; Rust does not guarantee tail-call elimination, so a few thousand
+    /// of them overflowed the stack. A stack overflow aborts the process — it
+    /// is not catchable and takes the whole `autorip` service down — where the
+    /// iterative form just walks off the end and reports EOF.
+    ///
+    /// Run on a deliberately small stack so the frame cost is unmissable: the
+    /// recursive version dies here, the loop finishes in microseconds.
+    #[test]
+    fn a_long_run_of_empty_extents_does_not_recurse_per_extent() {
+        let title = DiscTitle {
+            extents: (0..50_000)
+                .map(|_| crate::disc::Extent {
+                    start_lba: 0,
+                    sector_count: 0,
+                })
+                .collect(),
+            ..DiscTitle::empty()
+        };
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let mut s = DiscStream::new(
+                    Box::new(ZeroReader { capacity: 0 }),
+                    title,
+                    crate::decrypt::DecryptKeys::None,
+                    8,
+                    ContentFormat::BdTs,
+                    false,
+                    None,
+                )
+                .unwrap();
+                s.fill_extents()
+            })
+            .unwrap();
+        assert!(
+            !handle.join().unwrap().unwrap(),
+            "an all-empty extent list is EOF, not an error"
         );
     }
 
