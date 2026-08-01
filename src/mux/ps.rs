@@ -1816,4 +1816,36 @@ mod tests {
         );
         assert_eq!(parsed.data, es);
     }
+
+    /// A length-bounded PES (`pes_packet_len != 0`) must be emitted the
+    /// moment its declared length is EXACTLY satisfied by the buffer
+    /// (`sc + 6 > len`, then `e = sc + 6 + pes_packet_len; e > len`), not
+    /// held back waiting for a byte that will never arrive. Feed nothing
+    /// after the packet and don't flush — if the boundary checks were
+    /// `>=` instead of `>`, an exact fit would incorrectly be treated as
+    /// "not enough data yet" and the packet would never be produced.
+    #[test]
+    fn length_bounded_pes_exact_fit_is_emitted_not_awaited() {
+        let mut demuxer = PsDemuxer::new();
+        let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+        let mut data = vec![0x00, 0x00, 0x01, 0xC0]; // audio stream id
+        let pes_packet_len = (3 + payload.len()) as u16; // flags+header_len byte + payload
+        data.extend_from_slice(&pes_packet_len.to_be_bytes());
+        data.extend_from_slice(&[0x80, 0x00, 0x00]); // no PTS/DTS, header_data_len = 0
+        data.extend_from_slice(&payload);
+        assert_eq!(data.len(), 6 + pes_packet_len as usize, "sanity: exact fit");
+
+        let packets = demuxer.feed(&data);
+        assert_eq!(
+            packets.len(),
+            1,
+            "an exact-fit length-bounded PES must be emitted immediately, \
+             not held awaiting a byte that will never come"
+        );
+        assert_eq!(packets[0].data, payload);
+        assert!(
+            demuxer.buffer.is_empty(),
+            "the exact-fit PES must be fully consumed, leaving nothing buffered"
+        );
+    }
 }

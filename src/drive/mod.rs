@@ -2458,6 +2458,127 @@ mod command_tests {
         assert_eq!(d.get_config_feature(0x0000), None);
     }
 
+    #[test]
+    fn get_config_feature_encodes_feature_code_be_in_cdb() {
+        // GET CONFIGURATION (0x46), RT field byte 1 = 0x02 (report the
+        // named feature), then the 16-bit feature code big-endian in
+        // bytes 2..4. 0x010D has a nonzero high byte, so a swapped shift
+        // (>> vs <<) or byte order bug asks the drive for the wrong
+        // feature entirely.
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(0));
+        let _ = d.get_config_feature(0x010D);
+        let c = cdb.lock().unwrap();
+        assert_eq!(
+            &c[..4],
+            &[crate::scsi::SCSI_GET_CONFIGURATION, 0x02, 0x01, 0x0D],
+            "feature code must be big-endian in CDB bytes 2..4"
+        );
+    }
+
+    // ── spin_cycle / wait_ready: recovery entry points (LOW finding 8) ──────
+
+    /// Records EVERY CDB issued, in order — unlike `RecordingTransport`
+    /// (used above), which only keeps the last one. Needed to assert a
+    /// multi-command sequence like `spin_cycle`'s STOP-then-START.
+    struct SequenceTransport {
+        cdbs: Arc<Mutex<Vec<Vec<u8>>>>,
+        ok: bool,
+    }
+    impl ScsiTransport for SequenceTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            _data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            self.cdbs.lock().unwrap().push(cdb.to_vec());
+            if self.ok {
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: 0,
+                    sense: [0u8; 32],
+                })
+            } else {
+                Err(Error::ScsiError {
+                    opcode: cdb[0],
+                    status: 2,
+                    sense: None,
+                })
+            }
+        }
+    }
+
+    /// The documented BU40N/Initio wedge recovery: spin the disc down then
+    /// back up WITHOUT ejecting. Exactly two START STOP UNIT (0x1B) commands,
+    /// in order — STOP (START=0) then START (START=1) — both with LOEJ=0
+    /// (byte 4 bit 1 clear): a slot-loading BU40N must never eject during
+    /// unattended recovery. Real time cost (~15s: the validated 5s spin-down
+    /// idle + 10s spin-up settle) is accepted here rather than adding an
+    /// injectable-sleep seam.
+    #[test]
+    fn spin_cycle_issues_stop_then_start_without_ejecting() {
+        let cdbs = Arc::new(Mutex::new(Vec::new()));
+        let t = SequenceTransport {
+            cdbs: cdbs.clone(),
+            ok: true,
+        };
+        let mut d = Drive::from_transport_for_test(Box::new(t));
+        d.spin_cycle()
+            .expect("spin_cycle must succeed when both SCSI commands succeed");
+        let seq = cdbs.lock().unwrap();
+        assert_eq!(
+            seq.len(),
+            2,
+            "spin_cycle must issue exactly two commands: {seq:?}"
+        );
+        assert_eq!(seq[0][0], SCSI_START_STOP_UNIT);
+        assert_eq!(seq[0][4], 0x00, "first command: START=0 (spin down)");
+        assert_eq!(seq[1][0], SCSI_START_STOP_UNIT);
+        assert_eq!(seq[1][4], 0x01, "second command: START=1 (spin up)");
+        for (i, c) in seq.iter().enumerate() {
+            assert_eq!(
+                c[4] & 0x02,
+                0,
+                "LOEJ bit must be clear on command {i} — spin_cycle must never eject"
+            );
+        }
+    }
+
+    /// A drive that never answers TEST UNIT READY successfully must surface
+    /// `Err(DeviceNotReady)`, not silently report ready. Real time cost
+    /// accepted (60 x 500ms = ~30s) rather than adding an injectable-sleep
+    /// seam for the poll backoff.
+    #[test]
+    fn wait_ready_returns_err_when_drive_never_becomes_ready() {
+        struct NeverReady;
+        impl ScsiTransport for NeverReady {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                Err(Error::ScsiError {
+                    opcode: cdb[0],
+                    status: 2,
+                    sense: None,
+                })
+            }
+        }
+        let mut d = Drive::from_transport_for_test(Box::new(NeverReady));
+        let r = d.wait_ready();
+        assert!(
+            matches!(r, Err(Error::DeviceNotReady { .. })),
+            "a drive that never answers TUR successfully must be DeviceNotReady, got {r:?}"
+        );
+    }
+
     // ── report_key / mode_sense / read_buffer empty-vs-some ─────────
 
     #[test]

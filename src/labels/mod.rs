@@ -2363,3 +2363,225 @@ mod fill_gaps_sort_tests {
         assert_eq!(framework[1].stream_number, 1);
     }
 }
+
+// ── append_clpi_orphans ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod clpi_orphan_tests {
+    use super::*;
+    use crate::udf::fixture::*;
+
+    fn label(t: StreamLabelType, n: u16, lang: &str, codec: &str) -> StreamLabel {
+        StreamLabel {
+            stream_number: n,
+            stream_type: t,
+            language: lang.into(),
+            name: String::new(),
+            purpose: LabelPurpose::Normal,
+            qualifier: LabelQualifier::None,
+            codec_hint: codec.into(),
+            variant: String::new(),
+        }
+    }
+
+    /// Build a CLPI ProgramInfo section for one program with the given
+    /// (pid, stream_coding_info) pairs. Layout mirrors
+    /// `crate::clpi::parse_program_info`'s expectations: length(4) +
+    /// reserved(1) + num_programs(1), then per-program
+    /// spn(4)+pmt_pid(2)+num_streams(1)+num_groups(1), then per-stream
+    /// pid(2)+sci_len(1)+sci.
+    fn build_program_info(streams: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(0); // reserved
+        body.push(1); // num_programs = 1
+        body.extend_from_slice(&0u32.to_be_bytes()); // spn_program_sequence_start
+        body.extend_from_slice(&0u16.to_be_bytes()); // program_map_pid
+        body.push(streams.len() as u8); // num_streams
+        body.push(0); // num_groups
+        for (pid, sci) in streams {
+            body.extend_from_slice(&pid.to_be_bytes());
+            body.push(sci.len() as u8);
+            body.extend_from_slice(sci);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Build a full CLPI byte buffer (HDMV header + ProgramInfo) declaring
+    /// the given (pid, coding_type, lang) streams. `sci` layout follows
+    /// `crate::clpi::parse_program_info`'s per-coding-type match arms:
+    /// PG/IG = coding_type + 3-byte lang; audio (primary or secondary) =
+    /// coding_type + format/rate byte + 3-byte lang.
+    fn build_clpi(streams: &[(u16, u8, &str)]) -> Vec<u8> {
+        use crate::consts::coding_type as c;
+        let sci_streams: Vec<(u16, Vec<u8>)> = streams
+            .iter()
+            .map(|(pid, coding, lang)| {
+                let lang_bytes = lang.as_bytes();
+                let sci = match *coding {
+                    c::PG | c::IG => {
+                        let mut v = vec![*coding];
+                        v.extend_from_slice(lang_bytes);
+                        v
+                    }
+                    _ => {
+                        let mut v = vec![*coding, 0x61];
+                        v.extend_from_slice(lang_bytes);
+                        v
+                    }
+                };
+                (*pid, sci)
+            })
+            .collect();
+        let pi = build_program_info(&sci_streams);
+        let mut buf = vec![0u8; 60];
+        buf[0..4].copy_from_slice(b"HDMV");
+        buf[4..8].copy_from_slice(b"0200");
+        let prog_info_start: u32 = 60;
+        buf[12..16].copy_from_slice(&prog_info_start.to_be_bytes());
+        buf[56..60].copy_from_slice(&1000u32.to_be_bytes()); // source_packet_count
+        buf.extend_from_slice(&pi);
+        buf
+    }
+
+    /// Lay a minimal BDMV/CLIPINF/00001.clpi tree on `disc`, with the CLPI
+    /// declaring the given synthetic streams, and return the parsed UdfFs.
+    fn fs_with_clpi(disc: &mut MemDisc, streams: &[(u16, u8, &str)]) -> crate::udf::UdfFs {
+        let clpi_data = build_clpi(streams);
+        let clipinf = DirSpec {
+            name: "CLIPINF".to_string(),
+            icb_lba: 24,
+            dir_data_lba: 25,
+            files: vec![file_with("00001.clpi", 26, 8000, clpi_data, false)],
+            subdirs: vec![],
+        };
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![clipinf],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        build_udf_skeleton(disc, 10);
+        lay_dir(disc, &root);
+        crate::udf::read_filesystem(disc).expect("fs")
+    }
+
+    /// (a) A PG-coded CLPI orphan becomes a Subtitle label.
+    #[test]
+    fn pg_orphan_becomes_subtitle() {
+        let mut disc = MemDisc::new();
+        let udf = fs_with_clpi(
+            &mut disc,
+            &[(0x1200, crate::consts::coding_type::PG, "eng")],
+        );
+        let mut labels: Vec<StreamLabel> = Vec::new();
+        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
+        assert_eq!(added, 1);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].stream_type, StreamLabelType::Subtitle);
+        assert_eq!(labels[0].stream_number, 1);
+    }
+
+    /// (b) An audio-range-coded orphan (here DTS-HD MA, the top of the
+    /// `LPCM..=DTS_HD_MA` primary-audio range) becomes an Audio label.
+    #[test]
+    fn audio_range_orphan_becomes_audio() {
+        let mut disc = MemDisc::new();
+        let udf = fs_with_clpi(
+            &mut disc,
+            &[(0x1100, crate::consts::coding_type::DTS_HD_MA, "eng")],
+        );
+        let mut labels: Vec<StreamLabel> = Vec::new();
+        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
+        assert_eq!(added, 1);
+        assert_eq!(labels[0].stream_type, StreamLabelType::Audio);
+    }
+
+    /// (b, secondary) AC3_PLUS_SECONDARY is outside the primary
+    /// `LPCM..=DTS_HD_MA` range and must be classified through the
+    /// dedicated secondary-audio arm.
+    #[test]
+    fn secondary_audio_orphan_becomes_audio() {
+        let mut disc = MemDisc::new();
+        let udf = fs_with_clpi(
+            &mut disc,
+            &[(
+                0x1A00,
+                crate::consts::coding_type::AC3_PLUS_SECONDARY,
+                "eng",
+            )],
+        );
+        let mut labels: Vec<StreamLabel> = Vec::new();
+        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
+        assert_eq!(added, 1);
+        assert_eq!(labels[0].stream_type, StreamLabelType::Audio);
+    }
+
+    /// (c) IG (0x91, BD-J menu overlay) is not a user-facing subtitle and
+    /// must be skipped entirely, not appended as anything.
+    #[test]
+    fn ig_orphan_is_skipped() {
+        let mut disc = MemDisc::new();
+        let udf = fs_with_clpi(
+            &mut disc,
+            &[(0x1201, crate::consts::coding_type::IG, "eng")],
+        );
+        let mut labels: Vec<StreamLabel> = Vec::new();
+        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
+        assert_eq!(added, 0);
+        assert!(labels.is_empty());
+    }
+
+    /// (d) Numbering continues from `max(existing) + 1` and increments once
+    /// per new orphan stream, independently of PID order.
+    #[test]
+    fn numbering_continues_from_max_existing_and_increments() {
+        let mut disc = MemDisc::new();
+        let udf = fs_with_clpi(
+            &mut disc,
+            &[
+                (0x1100, crate::consts::coding_type::TRUEHD, "eng"),
+                (0x1101, crate::consts::coding_type::AC3, "fra"),
+            ],
+        );
+        let mut labels = vec![label(StreamLabelType::Audio, 3, "jpn", "DTS")];
+        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
+        assert_eq!(added, 2);
+        let mut nums: Vec<u16> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio && l.language != "jpn")
+            .map(|l| l.stream_number)
+            .collect();
+        nums.sort();
+        assert_eq!(
+            nums,
+            vec![4, 5],
+            "orphans must number 4 and 5 after the existing max of 3"
+        );
+    }
+
+    /// (e) A CLPI stream whose (type, language, codec) tuple already exists
+    /// in `existing` is a duplicate and must be skipped, not double-listed.
+    #[test]
+    fn duplicate_type_lang_codec_already_in_existing_is_skipped() {
+        let mut disc = MemDisc::new();
+        let udf = fs_with_clpi(
+            &mut disc,
+            &[(0x1100, crate::consts::coding_type::TRUEHD, "eng")],
+        );
+        let mut labels = vec![label(StreamLabelType::Audio, 1, "eng", "TrueHD")];
+        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
+        assert_eq!(added, 0);
+        assert_eq!(labels.len(), 1);
+    }
+}
