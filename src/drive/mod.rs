@@ -2054,6 +2054,43 @@ mod command_tests {
         }
     }
 
+    /// An undersized caller buffer must be rejected identically whether the
+    /// request fits in one transfer or has to be chunked.
+    ///
+    /// The chunk loop slices `buf` by `count * 2048`, so without the up-front
+    /// length check this PANICKED with "range end index out of range" out of
+    /// the public `read`/`read_fua` — while the single-chunk path tolerated the
+    /// same buffer and returned `Err(DiscRead)`. Behaviour on a caller error
+    /// must not depend on the drive's transfer limit, and a library inside a
+    /// long-running service must not panic on it at all.
+    ///
+    /// Every other read test stays on the single-chunk path, so this guard was
+    /// entirely unasserted and a mutation run flipped its arithmetic freely.
+    #[test]
+    fn an_undersized_buffer_errors_on_the_chunked_path_just_like_the_single_one() {
+        // max_transfer = 4 sectors, so a 10-sector read must chunk.
+        let mut h = chunking(4 * 2048, None);
+        let mut small = vec![0u8; 4096]; // 2 sectors' worth for a 10-sector read
+
+        let chunked = h.drive.read(0, 10, &mut small, false);
+        assert!(
+            matches!(chunked, Err(Error::DiscRead { .. })),
+            "an undersized buffer on the chunked path must be an error, not a panic"
+        );
+
+        // The single-chunk path, same undersized buffer, same verdict.
+        let single = h.drive.read(0, 3, &mut small, false);
+        assert!(
+            matches!(single, Err(Error::DiscRead { .. })),
+            "the single-chunk path must agree"
+        );
+
+        // Exactly-sized still works, so the guard is not simply rejecting
+        // everything on the chunked path.
+        let mut exact = vec![0u8; 10 * 2048];
+        assert!(h.drive.read(0, 10, &mut exact, false).is_ok());
+    }
+
     #[test]
     fn read_chunks_large_request_to_max_transfer() {
         // max_transfer = 4 sectors (4 * 2048 = 8192 bytes). A read of 10
