@@ -101,6 +101,25 @@ pub const E_FMTS_KEY_MISSING: u16 = 7026;
 /// failure reported as success. [`is_disc_level_no_key`] classifies this code, so
 /// a multi-title rip loop fails fast on it.
 pub const E_CSS_NO_DISC_KEY: u16 = 7027;
+/// A key SOURCE could not be reached, or failed on its own side — transport
+/// error, DNS failure, timeout, TLS failure, an HTTP 5xx, or a reply the client
+/// could not read. The source never got as far as answering the question, so
+/// nothing at all is known about whether a key for this disc exists.
+///
+/// Deliberately NOT [`E_NO_DISC_KEY`], which asserts the OPPOSITE — every source
+/// answered and none holds a key. A seven-hour run of HTTP 502s reported as
+/// `E_NO_DISC_KEY` told operators their disc was not in the key database and sent
+/// them hunting for a VUK that was never missing; the correct action was to wait.
+/// Transient: retry later.
+pub const E_KEY_SERVICE_UNAVAILABLE: u16 = 7028;
+/// A key source rejected the configured credentials (HTTP 401/403 from the online
+/// key service). NOT transient and NOT an absent key — the operator action is to
+/// fix the token, not to wait and not to look for a VUK.
+pub const E_KEY_SERVICE_UNAUTHORIZED: u16 = 7029;
+/// A key source rate-limited the request (HTTP 429 from the online key service).
+/// The operator action is to back off and retry more slowly; the disc's key may
+/// well exist.
+pub const E_KEY_SERVICE_RATE_LIMITED: u16 = 7030;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -462,6 +481,21 @@ pub enum Error {
     /// gate once did) makes an undecryptable disc log one "title skipped" notice
     /// per title and exit successfully.
     CssNoDiscKey,
+    /// A key source could not be reached, or failed on its own side — transport
+    /// error, DNS failure, timeout, TLS failure, HTTP 5xx, or an unreadable /
+    /// unparseable reply. See [`E_KEY_SERVICE_UNAVAILABLE`]: the source never
+    /// answered the question, so this is emphatically NOT [`Error::NoDiscKey`]
+    /// (which asserts every source DID answer and none holds a key). Transient.
+    ///
+    /// Carries no detail by design: the key-service URL and the resolved address
+    /// are operator-confidential and must not reach a log or a bug report.
+    KeyServiceUnavailable,
+    /// A key source rejected the configured credentials (HTTP 401/403). See
+    /// [`E_KEY_SERVICE_UNAUTHORIZED`]. Not transient: fix the token.
+    KeyServiceUnauthorized,
+    /// A key source rate-limited the request (HTTP 429). See
+    /// [`E_KEY_SERVICE_RATE_LIMITED`]. Back off and retry more slowly.
+    KeyServiceRateLimited,
     /// The live-drive AACS cert-auth handshake (the OEM/AACS baseline route)
     /// could not run because NO host certificate was available from any key
     /// source. Host certs are keysource-served, never compiled in, so without
@@ -742,6 +776,9 @@ impl Error {
             Error::NoDiscKey { .. } => E_NO_DISC_KEY,
             Error::CssKeyMissing => E_CSS_KEY_MISSING,
             Error::CssNoDiscKey => E_CSS_NO_DISC_KEY,
+            Error::KeyServiceUnavailable => E_KEY_SERVICE_UNAVAILABLE,
+            Error::KeyServiceUnauthorized => E_KEY_SERVICE_UNAUTHORIZED,
+            Error::KeyServiceRateLimited => E_KEY_SERVICE_RATE_LIMITED,
             Error::AacsNoHostCert { .. } => E_AACS_NO_HOST_CERT,
             Error::AacsBusKeyUnavailable => E_AACS_BUS_KEY_UNAVAILABLE,
             Error::FmtsKeyMissing => E_FMTS_KEY_MISSING,
@@ -1139,10 +1176,26 @@ pub fn is_halt(e: &std::io::Error) -> bool {
 /// [`E_CSS_KEY_MISSING`]: an undecryptable CSS disc landed in
 /// [`is_skippable_title_stub`], so the rip loop skipped all N titles with an
 /// "empty stub" notice and exited successfully.
+/// The key-SOURCE failures ([`E_KEY_SERVICE_UNAVAILABLE`],
+/// [`E_KEY_SERVICE_UNAUTHORIZED`], [`E_KEY_SERVICE_RATE_LIMITED`]) are here for
+/// the same fail-fast reason and NOT because they mean "no key": a service that
+/// is down, refusing the token, or throttling is down for every title on the
+/// disc, so iterating N titles re-issues N doomed requests (and, on 429, digs the
+/// rate-limit hole deeper). They are separate CODES precisely so the front-end
+/// can say "retry later" / "fix the token" instead of `E_NO_DISC_KEY`'s "no key
+/// source has a key for this disc".
 pub fn is_disc_level_no_key(e: &std::io::Error) -> bool {
     matches!(
         error_code(e),
-        Some(E_NO_DISC_KEY | E_KEYDB_LOAD | E_AACS_NO_KEYS | E_CSS_NO_DISC_KEY)
+        Some(
+            E_NO_DISC_KEY
+                | E_KEYDB_LOAD
+                | E_AACS_NO_KEYS
+                | E_CSS_NO_DISC_KEY
+                | E_KEY_SERVICE_UNAVAILABLE
+                | E_KEY_SERVICE_UNAUTHORIZED
+                | E_KEY_SERVICE_RATE_LIMITED
+        )
     )
 }
 
@@ -1420,6 +1473,12 @@ mod tests {
             // Both CSS no-key verdicts: numeric-only Display, no English.
             (Error::CssKeyMissing, E_CSS_KEY_MISSING),
             (Error::CssNoDiscKey, E_CSS_NO_DISC_KEY),
+            // Key-SOURCE failures: bare numeric Display. They must carry NO
+            // detail — the service URL and its resolved address are
+            // operator-confidential and must never reach a pasted bug report.
+            (Error::KeyServiceUnavailable, E_KEY_SERVICE_UNAVAILABLE),
+            (Error::KeyServiceUnauthorized, E_KEY_SERVICE_UNAUTHORIZED),
+            (Error::KeyServiceRateLimited, E_KEY_SERVICE_RATE_LIMITED),
         ];
         for (e, want_code) in cases {
             let s = e.to_string();
@@ -1621,6 +1680,9 @@ mod tests {
             E_NO_DISC_KEY,
             E_CSS_KEY_MISSING,
             E_CSS_NO_DISC_KEY,
+            E_KEY_SERVICE_UNAVAILABLE,
+            E_KEY_SERVICE_UNAUTHORIZED,
+            E_KEY_SERVICE_RATE_LIMITED,
             E_AACS_NO_HOST_CERT,
             E_AACS_BUS_KEY_UNAVAILABLE,
             E_FMTS_KEY_MISSING,
