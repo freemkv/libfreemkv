@@ -15,6 +15,23 @@
   `output()` now takes the source provenance explicitly. One of the crate's own
   tests had been asserting the wrong value, which is why the suite never caught
   it.
+- **Vendor stream labels were numbered by parsed entry, not by stream slot.**
+  Label blobs contain entries the parser deliberately does not interpret, but
+  those entries still occupy a stream-number slot. Counting only the parsed
+  ones shifted every later label up by the number skipped, so on discs with an
+  uninterpreted entry early in the list the language, forced, SDH and
+  commentary flags were attached to the wrong tracks — a subtitle track could
+  present as both a plain and a forced variant of the same language, with the
+  forced flag landing on neither or both. Four parsers shared the defect
+  (`pixelogic`, `paramount`, `mpls_universal`, `deluxe`); the rest are now
+  pinned by tests proving they are immune. Three of the crate's own tests had
+  been asserting the shifted numbering.
+- **A forced-narrative subtitle marker went uncatalogued.** The token marking
+  the signs-and-on-screen-text pass that accompanies a dubbed presentation was
+  not in the vocabulary, so that track lost its forced flag while every other
+  language in the same run kept theirs. Vocabulary gaps are also no longer
+  silent: an unrecognized component now produces one aggregated warning per
+  parse naming the distinct components, rather than a bool nobody could see.
 - **A key service that was DOWN was reported as "this disc has no key".** A
   failed lookup and a successful lookup that found nothing shared a match arm,
   so an unreachable service, a rejected token and a rate limit all arrived as
