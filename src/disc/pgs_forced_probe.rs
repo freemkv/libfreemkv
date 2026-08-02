@@ -605,9 +605,12 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                     // Bounded retries are what keep a source that never yields a unit
                     // (including one that claims sectors and returns none) from
                     // spinning here for ever. A retry that re-serves the same bytes
-                    // feeds them twice; the evidence a [`ForcedTracker`] keeps is
-                    // monotone (observed / saw-a-non-forced-set), so a repeat cannot
-                    // change a verdict.
+                    // feeds them twice: the BOOLEAN evidence is monotone (observed /
+                    // saw-a-non-forced-set / saw-a-forced-set), so a repeat cannot
+                    // change it, and the display COUNT can over-count by at most
+                    // [`STALL_RETRY_LIMIT`] repeats of a sub-unit (< 6 KB) read —
+                    // too little to move the shape comparison the demotion gate
+                    // makes, which is against the busiest track on the disc.
                     for pes in demux.feed(&buf[..n.min(want)]) {
                         if let (Some(parser), Some(tracker)) =
                             (parsers.get_mut(&pes.pid), trackers.get_mut(&pes.pid))
