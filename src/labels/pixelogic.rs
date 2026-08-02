@@ -75,6 +75,10 @@ fn assign_labels(strings: &[String], saw_unknown: &mut bool) -> Vec<StreamLabel>
     let mut in_feature = false;
     let mut audio_num: u16 = 0;
     let mut sub_num: u16 = 0;
+    // Which stream list the section is currently enumerating. Sections run
+    // video → audio → PG, so audio is the correct start, and it only matters
+    // for slots whose own type is unknowable (see the loop body).
+    let mut domain = StreamLabelType::Audio;
 
     for s in strings {
         // Detect feature section start
@@ -90,6 +94,7 @@ fn assign_labels(strings: &[String], saw_unknown: &mut bool) -> Vec<StreamLabel>
             in_feature = true;
             audio_num = 0;
             sub_num = 0;
+            domain = StreamLabelType::Audio;
             continue;
         }
 
@@ -102,33 +107,51 @@ fn assign_labels(strings: &[String], saw_unknown: &mut bool) -> Vec<StreamLabel>
             continue;
         }
 
-        // Generic audio-slot placeholder. Pixelogic lists each audio stream
-        // in the playlist as either an editorial `{lang}_{codec}_…` token OR
-        // a bare `Audio Stream N` placeholder when no editorial label was
-        // authored. The placeholder carries nothing to label, but it DOES
-        // occupy an STN slot — so it must advance `audio_num`. Otherwise a
-        // later editorial token (e.g. a lone `eng_ACOM_` commentary sitting
-        // at STN slot 4, behind three unlabelled main tracks) collapses onto
-        // slot 1 and its Commentary purpose lands on the main feature track.
-        //
-        // Only audio is corrected here: subtitle (`PG Stream N`) numbering is
-        // left exactly as-is — the corpus snapshots show forced/commentary
-        // subtitle tokens already align with STN without counting the
-        // placeholders, and counting them regresses several discs.
         // Stop accumulating once both counters reach the sane cap — a
         // crafted blob can't drive them to u16 overflow.
         if audio_num >= MAX_STREAMS_PER_TYPE && sub_num >= MAX_STREAMS_PER_TYPE {
             break;
         }
 
-        if s.starts_with("Audio Stream") {
-            if audio_num < MAX_STREAMS_PER_TYPE {
-                audio_num += 1;
+        // Every entry in the section's stream list occupies one STN slot,
+        // whether or not it carries anything worth labelling. Pixelogic lists
+        // a slot as an editorial `{lang}_{codec|purpose|region}_…` token, or as
+        // a bare `Audio Stream N` / `PG Stream N` placeholder when no editorial
+        // label was authored. Both must advance the per-type counter, and so
+        // must an editorial token the grammar cannot classify — a
+        // region-only token (`fra_CF_`, `spa_LS_`: REGIONS sets `variant` but
+        // neither `is_audio` nor `is_subtitle`, so `parse_token_inner` returns
+        // `None`) or one whose only distinguishing component is uncatalogued
+        // (`jpn_DUB_`). Numbering only the slots that PARSE renumbers the rest
+        // 1..N and lands every surviving label on the wrong stream: on
+        // UHD_Crime101_WW_150728 the seven `*_TXT_FOR_` forced tokens at PG STN
+        // 11-16/18 collapsed onto STN 2-8, flagging the disc's FULL subtitle
+        // tracks `forced` and leaving the real forced-narrative tracks
+        // unflagged.
+        //
+        // A slot the grammar cannot classify carries no stream type either, so
+        // it advances the list currently being enumerated: pixelogic sections
+        // run video → audio → PG, and `domain` follows the last slot whose type
+        // WAS known (a typed token or a typed placeholder), starting at Audio.
+        if let Some(kind) = placeholder_kind(s) {
+            domain = kind;
+            match kind {
+                StreamLabelType::Audio => {
+                    if audio_num < MAX_STREAMS_PER_TYPE {
+                        audio_num += 1;
+                    }
+                }
+                StreamLabelType::Subtitle => {
+                    if sub_num < MAX_STREAMS_PER_TYPE {
+                        sub_num += 1;
+                    }
+                }
             }
             continue;
         }
 
         if let Some(label) = parse_token_inner(s, Some(&mut *saw_unknown)) {
+            domain = label.stream_type;
             match label.stream_type {
                 StreamLabelType::Audio => {
                     if audio_num >= MAX_STREAMS_PER_TYPE {
@@ -151,10 +174,55 @@ fn assign_labels(strings: &[String], saw_unknown: &mut bool) -> Vec<StreamLabel>
                     });
                 }
             }
+        } else if is_stream_token(s) {
+            // Token-shaped but unclassifiable: no label, but the slot is real.
+            match domain {
+                StreamLabelType::Audio => {
+                    if audio_num < MAX_STREAMS_PER_TYPE {
+                        audio_num += 1;
+                    }
+                }
+                StreamLabelType::Subtitle => {
+                    if sub_num < MAX_STREAMS_PER_TYPE {
+                        sub_num += 1;
+                    }
+                }
+            }
         }
     }
 
     labels
+}
+
+/// The bare `Audio Stream N` / `PG Stream N` slot placeholders pixelogic emits
+/// for a stream with no editorial label, and which list they belong to. `None`
+/// for anything else (including the section's `Video Stream 1` / `AR_…`
+/// entries, which are not part of either numbered list).
+fn placeholder_kind(s: &str) -> Option<StreamLabelType> {
+    if s.starts_with("Audio Stream") {
+        Some(StreamLabelType::Audio)
+    } else if s.starts_with("PG Stream") {
+        Some(StreamLabelType::Subtitle)
+    } else {
+        None
+    }
+}
+
+/// Whether a string has the shape of a pixelogic stream token —
+/// `{lang3}_{component}…` — regardless of whether its components are
+/// catalogued. The gate is exactly the one [`parse_token_inner`] applies
+/// before it starts classifying, so every token that parser could ever accept
+/// is recognised here as occupying a stream slot, and nothing else is.
+fn is_stream_token(s: &str) -> bool {
+    let clean = s.trim().trim_start_matches('\t').trim_end_matches('_');
+    let mut parts = clean.split('_');
+    let Some(lang) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_none() {
+        return false;
+    }
+    lang.len() == 3 && lang.chars().all(|c| c.is_ascii_lowercase())
 }
 
 fn parse_token_inner(s: &str, mut saw_unknown: Option<&mut bool>) -> Option<StreamLabel> {
@@ -409,6 +477,81 @@ mod tests {
         assert_eq!(audio[0].stream_number, 4, "commentary is STN slot 4");
         assert_eq!(audio[0].purpose, LabelPurpose::Commentary);
         assert_eq!(audio[0].language, "eng");
+    }
+
+    /// Real disc (UHD_Crime101_WW_150728, `SEG_MainFeature`): the PG list has
+    /// 18 slots, five of them bare `PG Stream N` placeholders and four more
+    /// carrying a token whose only non-language component is a REGION
+    /// (`fra_CF_`, `spa_LS_`, …) — which `parse_token_inner` rejects because
+    /// it signals neither audio nor subtitle. Every one of those still OCCUPIES
+    /// an STN slot, so the seven `*_TXT_FOR_` forced tokens sit at STN 11-16
+    /// and 18. Numbering only the tokens that parse collapsed them onto STN
+    /// 2-8 — the disc's FULL subtitle tracks — so the player offered
+    /// "English (forced)" that renders the whole English dialogue.
+    #[test]
+    fn assign_labels_numbers_subtitles_by_stn_slot_not_by_parsed_token() {
+        let mut flag = false;
+        let tokens = strs(&[
+            "SEG_MainFeature",
+            "Video Stream 1",
+            "AR_169",
+            // Audio list: 9 STN slots.
+            "Audio Stream 1",
+            "eng_ADES_",
+            "fra_CF_",
+            "fra_PF_",
+            "Audio Stream 5",
+            "Audio Stream 6",
+            "spa_CS_",
+            "Audio Stream 8",
+            "spa_LS_",
+            // PG list: 18 STN slots, in order.
+            "PG Stream 1",
+            "eng_SDH_",
+            "fra_CF_",
+            "fra_PF_",
+            "PG Stream 5",
+            "PG Stream 6",
+            "spa_CS_",
+            "PG Stream 8",
+            "PG Stream 9",
+            "spa_LS_",
+            "eng_TXT_FOR_",
+            "fra_CF_TXT_FOR_",
+            "fra_PF_TXT_FOR_",
+            "deu_TXT_FOR_",
+            "ita_TXT_FOR_",
+            "spa_CS_TXT_FOR_",
+            "jpn_DUB_",
+            "spa_LS_TXT_FOR_",
+        ]);
+        let labels = assign_labels(&tokens, &mut flag);
+
+        let sdh: Vec<_> = labels
+            .iter()
+            .filter(|l| l.qualifier == LabelQualifier::Sdh)
+            .map(|l| l.stream_number)
+            .collect();
+        assert_eq!(sdh, vec![2], "eng_SDH_ is PG STN slot 2");
+
+        let forced: Vec<_> = labels
+            .iter()
+            .filter(|l| l.qualifier == LabelQualifier::Forced)
+            .map(|l| l.stream_number)
+            .collect();
+        assert_eq!(
+            forced,
+            vec![11, 12, 13, 14, 15, 16, 18],
+            "the forced-narrative tokens sit at PG STN slots 11-16 and 18"
+        );
+
+        // The lone audio label is unaffected: `eng_ADES_` is audio STN slot 2.
+        let audio: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .map(|l| l.stream_number)
+            .collect();
+        assert_eq!(audio, vec![2], "eng_ADES_ is audio STN slot 2");
     }
 
     #[test]
@@ -719,30 +862,73 @@ mod tests {
         );
     }
 
-    /// Spec: subtitle placeholders (PG Stream N) do NOT advance the subtitle counter.
-    /// Only audio placeholders (`Audio Stream N`) do.
-    /// Mutation: also advance sub counter on PG placeholder → subtitle labels misnumbered.
+    /// Spec: a `PG Stream N` placeholder occupies a PG STN slot, so it advances
+    /// the subtitle counter exactly as `Audio Stream N` advances the audio one,
+    /// and the two counters stay independent.
+    /// Mutation: skip PG placeholders → every later subtitle label shifts down
+    /// by the number of unlabelled PG slots ahead of it.
     #[test]
-    fn assign_labels_pg_placeholder_does_not_advance_sub_counter() {
-        // The spec comment says "Only audio is corrected here: subtitle (PG Stream N) numbering
-        // is left exactly as-is". PG Stream placeholders are not a token the parser recognizes
-        // as placeholders — they would only appear as real subtitle tokens with SDLG/SDH markers.
-        // This test verifies the audio-only correction behavior via a mixed sequence.
+    fn assign_labels_pg_placeholder_advances_sub_counter_only() {
         let mut flag = false;
         let tokens = strs(&[
             "FPL_MainFeature",
             "Audio Stream 1",
             "Audio Stream 2",
-            "eng_SDH_", // subtitle token — sub_num becomes 1
-            "fra_SDH_", // subtitle token — sub_num becomes 2
+            "eng_MLP_",    // audio token — audio_num becomes 3
+            "PG Stream 1", // unlabelled PG slot 1
+            "PG Stream 2", // unlabelled PG slot 2
+            "eng_SDH_",    // subtitle token — PG STN slot 3
+            "fra_SDH_",    // subtitle token — PG STN slot 4
         ]);
         let labels = assign_labels(&tokens, &mut flag);
         let subs: Vec<_> = labels
             .iter()
             .filter(|l| l.stream_type == StreamLabelType::Subtitle)
+            .map(|l| l.stream_number)
             .collect();
-        assert_eq!(subs.len(), 2);
-        assert_eq!(subs[0].stream_number, 1);
-        assert_eq!(subs[1].stream_number, 2);
+        assert_eq!(subs, vec![3, 4], "PG placeholders occupy PG STN slots");
+        let audio: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .map(|l| l.stream_number)
+            .collect();
+        assert_eq!(audio, vec![3], "PG placeholders must not touch audio");
+    }
+
+    /// Spec: a token-shaped entry the grammar cannot classify (`fra_CF_` —
+    /// REGION only; `jpn_DUB_` — uncatalogued component) still occupies an STN
+    /// slot in the list currently being enumerated.
+    /// Mutation: skip unclassifiable tokens → later labels shift down.
+    #[test]
+    fn assign_labels_unclassifiable_token_still_occupies_a_slot() {
+        let mut flag = false;
+        let tokens = strs(&[
+            "FPL_MainFeature",
+            "PG Stream 1", // switches the domain to PG, slot 1
+            "fra_CF_",     // region-only: no label, but PG slot 2
+            "jpn_DUB_",    // uncatalogued: no label, but PG slot 3
+            "eng_SDH_",    // PG slot 4
+        ]);
+        let labels = assign_labels(&tokens, &mut flag);
+        let subs: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Subtitle)
+            .map(|l| l.stream_number)
+            .collect();
+        assert_eq!(subs, vec![4]);
+    }
+
+    /// Spec: `is_stream_token` accepts exactly what `parse_token_inner`'s own
+    /// entry gate accepts — `{lang3}_{component}…` — so the section's
+    /// `Video Stream 1` / `AR_169` entries never consume a stream slot.
+    #[test]
+    fn is_stream_token_matches_the_parser_entry_gate() {
+        assert!(is_stream_token("eng_SDH_"));
+        assert!(is_stream_token("fra_CF_"));
+        assert!(is_stream_token("jpn_DUB_"));
+        assert!(!is_stream_token("eng"), "a bare language is not a token");
+        assert!(!is_stream_token("AR_169"), "AR is not a 3-letter language");
+        assert!(!is_stream_token("Video Stream 1"));
+        assert!(!is_stream_token("entry-markEa9"));
     }
 }
