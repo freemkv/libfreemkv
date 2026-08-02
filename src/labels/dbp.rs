@@ -272,6 +272,44 @@ mod tests {
         assert_eq!(sub.qualifier, LabelQualifier::Sdh);
     }
 
+    /// Immunity pin. Every dbp label states its own slot in the `AudioN` /
+    /// `SubtitleN` token, so the numbering survives gaps and skipped entries
+    /// intact. Nothing here counts positionally, which is what keeps this
+    /// parser out of the failure mode where a skipped entry pulls every later
+    /// label one stream forward.
+    ///
+    /// Mutation: number by iteration order → `Audio4` becomes 2 and
+    /// `Subtitle3` becomes 1, silently rebinding both to other streams.
+    #[test]
+    fn stream_numbers_come_from_the_token_not_iteration_order() {
+        let class_bytes = build_class(&[
+            "LTextField,Audio1,English Dolby Atmos,Fontstrip_Composite,296,763",
+            // Slots 2 and 3 have no menu TextField authored.
+            "LTextField,Audio4,French 5.1 Dolby Digital,Fontstrip_Composite,296,803",
+            // Not a stream: the disable-subtitles button.
+            "ATextField,Subtitle0,None,Fontstrip_Composite,1312,843",
+            // Unparseable slot token — dropped, and must shift nothing.
+            "HTextField,SubtitleX,German,Fontstrip_Composite,1312,883",
+            "HTextField,Subtitle3,English SDH,Fontstrip_Composite,1312,763",
+        ]);
+        let mut archive = build_jar(&[("com/dbp/Menu.class", class_bytes)]);
+
+        let labels = scan_jar(&mut archive);
+        let nums: Vec<(StreamLabelType, u16)> = labels
+            .iter()
+            .map(|l| (l.stream_type, l.stream_number))
+            .collect();
+        assert_eq!(
+            nums,
+            vec![
+                (StreamLabelType::Audio, 1),
+                (StreamLabelType::Audio, 4),
+                (StreamLabelType::Subtitle, 3),
+            ],
+            "unlabelled and unusable slots leave the authored numbers alone"
+        );
+    }
+
     /// A `CONSTANT_Utf8_info` carries a `u16` length (JVMS §4.4.7), so one
     /// crafted constant contributes up to 65535 bytes and the `u16` stream
     /// keyspace admits 65536 slots per type — ~4 GiB of retained `String` per

@@ -1,8 +1,8 @@
 //! Menu-graphic filename language hints.
 //!
 //! Some BD-J discs encode per-language menu artwork with the language in the
-//! filename, e.g. `Dune_UHD01_Eng_Composite1.png`,
-//! `VForVendetta_UHD01_FRE_Composite2.png`. The `_UHD01_{LANG}_Composite`
+//! filename, e.g. `Feature_UHD01_Eng_Composite1.png`,
+//! `AltFeature_UHD01_FRE_Composite2.png`. The `_UHD01_{LANG}_Composite`
 //! marker is authored deliberately, so the set of `{LANG}` tokens is the set
 //! of menu languages the disc ships.
 //!
@@ -91,10 +91,16 @@ mod tests {
 
     #[test]
     fn extracts_confirmed_samples() {
-        assert_eq!(filename_lang("Dune_UHD01_Eng_Composite1.png"), Some("eng"));
-        assert_eq!(filename_lang("Dune_UHD01_Ger_Composite2.png"), Some("deu"));
         assert_eq!(
-            filename_lang("VForVendetta_UHD01_FRE_Composite2.png"),
+            filename_lang("Feature_UHD01_Eng_Composite1.png"),
+            Some("eng")
+        );
+        assert_eq!(
+            filename_lang("Feature_UHD01_Ger_Composite2.png"),
+            Some("deu")
+        );
+        assert_eq!(
+            filename_lang("AltFeature_UHD01_FRE_Composite2.png"),
             Some("fra")
         );
     }
@@ -120,9 +126,9 @@ mod tests {
     #[test]
     fn dedups_and_numbers_distinct_languages() {
         let names = vec![
-            "Dune_UHD01_Eng_Composite1.png".to_string(),
-            "Dune_UHD01_Eng_Composite2.png".to_string(),
-            "Dune_UHD01_Ger_Composite1.png".to_string(),
+            "Feature_UHD01_Eng_Composite1.png".to_string(),
+            "Feature_UHD01_Eng_Composite2.png".to_string(),
+            "Feature_UHD01_Ger_Composite1.png".to_string(),
             "LoadingComposite1.png".to_string(),
         ];
         let labels = labels_from_filenames(&names);

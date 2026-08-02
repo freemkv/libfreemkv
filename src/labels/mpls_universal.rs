@@ -110,14 +110,8 @@ fn build_labels(playlists: &[crate::mpls::Playlist]) -> Vec<StreamLabel> {
 
     for playlist in playlists {
         for entry in &playlist.streams {
-            let label_type = match entry.stream_type {
-                2 | 5 => StreamLabelType::Audio, // primary + secondary audio
-                3 => StreamLabelType::Subtitle,  // PG subtitle
-                // 1 = primary video, 6 = secondary video, 7 = DV EL
-                //     → no StreamLabelType variant for video, skip.
-                // 4 = IG (interactive graphics) — not a user-facing
-                //     stream, skip.
-                _ => continue,
+            let Some(label_type) = label_type_for(entry) else {
+                continue;
             };
 
             let language = normalize_language(&entry.language);
@@ -154,6 +148,37 @@ fn build_labels(playlists: &[crate::mpls::Playlist]) -> Vec<StreamLabel> {
         }
     }
     labels
+}
+
+/// Which per-type numbering list an STN entry belongs to, or `None` when it
+/// is not a labellable stream at all.
+///
+/// This MUST agree with the stream list `disc::bluray` builds from the same
+/// entries, because that list is what `labels::apply_labels` counts against
+/// when it binds `stream_number`. The two counters run over the same STN
+/// entries in the same order, so any entry one side keeps and the other drops
+/// — or files under a different type — shifts every later label of that type
+/// onto the wrong stream. Three rules, all mirroring `disc::bluray`:
+///
+///   * `coding_type == 0` is the STN table's empty/padding slot. Not a
+///     stream on either side.
+///   * a PG coding_type in an audio STN slot is a subtitle, not audio.
+///     `mpls::parse_stream_entry` has a dedicated arm for this layout, so it
+///     is an authored shape rather than a corruption.
+///   * video (1 / 6 / 7 = primary, secondary, Dolby Vision EL) and IG (4)
+///     have no `StreamLabelType`; they are numbered in their own STN lists
+///     and never interleave with the audio or PG lists.
+fn label_type_for(entry: &crate::mpls::StreamEntry) -> Option<StreamLabelType> {
+    use crate::consts::coding_type as c;
+    if entry.coding_type == 0 {
+        return None;
+    }
+    match entry.stream_type {
+        2 | 5 if entry.coding_type == c::PG => Some(StreamLabelType::Subtitle),
+        2 | 5 => Some(StreamLabelType::Audio),
+        3 => Some(StreamLabelType::Subtitle),
+        _ => None,
+    }
 }
 
 fn has_mpls_extension(name: &str) -> bool {
@@ -410,6 +435,72 @@ mod tests {
         assert_eq!(labels[1].name, "Spanish");
         assert_eq!(labels[2].stream_number, 3);
         assert_eq!(labels[2].language, "fra");
+    }
+
+    /// `stream_number` is bound by `labels::apply_labels` against the title's
+    /// own stream list, which `disc::bluray` builds from these same STN
+    /// entries. That builder DROPS an entry whose `coding_type` is 0 — the
+    /// STN table's empty/padding slot — so it must not be counted here
+    /// either. Counting it advances the audio counter past a stream that
+    /// never materializes, and every label behind it binds one stream late.
+    #[test]
+    fn padding_stn_entry_does_not_consume_a_label_slot() {
+        let pl = playlist_with(vec![
+            audio_entry(0x1100, 0x83, 12, 1, "eng"),
+            // coding_type 0: STN padding. Not a stream.
+            audio_entry(0x1101, 0x00, 0, 0, ""),
+            audio_entry(0x1102, 0x81, 6, 1, "fra"),
+        ]);
+        let labels = labels_from_playlists(&[pl]);
+        assert_eq!(labels.len(), 2, "the padding slot yields no label");
+        assert_eq!(labels[0].language, "eng");
+        assert_eq!(labels[0].stream_number, 1);
+        assert_eq!(labels[1].language, "fra");
+        assert_eq!(
+            labels[1].stream_number, 2,
+            "padding is absent from the title's stream list, so `fra` is \
+             audio stream 2"
+        );
+    }
+
+    /// A PG coding_type sitting in an audio STN slot is a real, documented
+    /// shape — `mpls::parse_stream_entry` has an explicit arm for it, and
+    /// `disc::bluray` builds it as a Subtitle stream, not an Audio one. This
+    /// module must classify it the same way, or the audio counter runs one
+    /// ahead and the subtitle counter one behind for every later stream.
+    #[test]
+    fn pg_coding_type_in_an_audio_slot_counts_as_a_subtitle() {
+        let mut misplaced = audio_entry(0x1200, 0x90, 0, 0, "spa");
+        misplaced.stream_type = 2;
+        let pl = playlist_with(vec![
+            audio_entry(0x1100, 0x83, 12, 1, "eng"),
+            misplaced,
+            audio_entry(0x1101, 0x81, 6, 1, "fra"),
+            pg_entry(0x1201, "deu"),
+        ]);
+        let labels = labels_from_playlists(&[pl]);
+
+        let audio: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .map(|l| (l.language.as_str(), l.stream_number))
+            .collect();
+        assert_eq!(
+            audio,
+            vec![("eng", 1), ("fra", 2)],
+            "the PG entry is not an audio stream and must not number one"
+        );
+
+        let sub: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Subtitle)
+            .map(|l| (l.language.as_str(), l.stream_number))
+            .collect();
+        assert_eq!(
+            sub,
+            vec![("spa", 1), ("deu", 2)],
+            "it is subtitle stream 1, ahead of the PG-slot entry"
+        );
     }
 
     #[test]
