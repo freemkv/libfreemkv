@@ -951,11 +951,15 @@ impl MasterEnumTable {
 ///   on Deluxe don't carry a CodingType; their codec is implicit
 ///   PGS via the BD spec).
 /// - Construction has Language but no CodingType → subtitle stream.
-/// - No Language → not a stream (skip).
+/// - Neither, and its binding type never yielded a stream → not a
+///   stream (skip). See [`slot_kind`] for why the binding type is
+///   consulted rather than the language alone.
 fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -> Vec<StreamLabel> {
     let mut audio_idx: u16 = 0;
     let mut sub_idx: u16 = 0;
     let mut out = Vec::new();
+
+    let slot_kinds = slot_kinds(constructions);
 
     for c in constructions {
         let mut lang_ord: Option<u16> = None;
@@ -979,7 +983,26 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
             }
         }
 
-        let Some(lang_ord) = lang_ord else { continue };
+        let Some(lang_ord) = lang_ord else {
+            // No language resolved. If the construction is still recognisably
+            // a stream binding it OCCUPIES its STN slot and must advance the
+            // counter — there is just nothing to label. Numbering only the
+            // slots that resolve renumbers the rest 1..N and lands every
+            // surviving label on the wrong stream.
+            //
+            // `saturating_add` is safe here where it would not be on the
+            // emitting path below: no label is produced, so parking the
+            // counter at `u16::MAX` binds nothing. The next slot that DOES
+            // resolve hits the `checked_add` guard and stops emission.
+            match slot_kind(c, coding_type.is_some(), &slot_kinds) {
+                Some(StreamLabelType::Audio) => audio_idx = audio_idx.saturating_add(1),
+                Some(StreamLabelType::Subtitle) => sub_idx = sub_idx.saturating_add(1),
+                // Not a stream binding (`new StringBuilder` and friends in the
+                // same `<clinit>`): no slot, no counter.
+                None => {}
+            }
+            continue;
+        };
 
         // Audio when a CodingType is present (audio binding type
         // always references org.bluray.ti.CodingType); subtitle
@@ -1055,6 +1078,69 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
     }
 
     out
+}
+
+/// Which stream list each binding type enumerates, learned from the
+/// constructions that DID resolve a language.
+///
+/// A `<clinit>` walk emits a [`Construction`] for every `new X; … ;
+/// invokespecial X.<init>` it sees, so the list mixes real stream bindings
+/// with whatever else the class initializer builds. `binding_type` is the
+/// constructed class name, which is how the two are told apart: the stream
+/// bindings all share one class (Deluxe splits audio and subtitle across two),
+/// and that class is identifiable from the slots that resolved.
+///
+/// A binding type that resolved as both kinds is left out — with no consistent
+/// answer, guessing a list to advance would be worse than not advancing.
+fn slot_kinds(constructions: &[Construction]) -> HashMap<&str, Option<StreamLabelType>> {
+    let mut kinds: HashMap<&str, Option<StreamLabelType>> = HashMap::new();
+    for c in constructions {
+        let mut has_lang = false;
+        let mut has_coding = false;
+        for arg in &c.args {
+            match arg {
+                StackVal::EnumRef {
+                    kind: "Language", ..
+                } => has_lang = true,
+                StackVal::CodingType(_) => has_coding = true,
+                _ => {}
+            }
+        }
+        if !has_lang {
+            continue;
+        }
+        let kind = if has_coding {
+            StreamLabelType::Audio
+        } else {
+            StreamLabelType::Subtitle
+        };
+        kinds
+            .entry(c.binding_type.as_str())
+            .and_modify(|e| {
+                if *e != Some(kind) {
+                    *e = None;
+                }
+            })
+            .or_insert(Some(kind));
+    }
+    kinds
+}
+
+/// The stream list an unresolved construction occupies a slot in, or `None`
+/// when it is not a stream binding.
+///
+/// A `org.bluray.ti.CodingType` argument is decisive on its own: nothing but
+/// an audio stream binding is handed one. Otherwise fall back to what the
+/// binding type's resolved siblings showed (see [`slot_kinds`]).
+fn slot_kind(
+    c: &Construction,
+    has_coding_type: bool,
+    slot_kinds: &HashMap<&str, Option<StreamLabelType>>,
+) -> Option<StreamLabelType> {
+    if has_coding_type {
+        return Some(StreamLabelType::Audio);
+    }
+    slot_kinds.get(c.binding_type.as_str()).copied().flatten()
 }
 
 /// Map a `org.bluray.ti.CodingType` field name (as observed in
@@ -2714,6 +2800,87 @@ mod tests {
         assert_eq!(out[0].stream_type, StreamLabelType::Audio);
         assert_eq!(out[0].codec_hint, "Dolby TrueHD");
         assert_eq!(out[0].language, "eng");
+    }
+
+    /// Each stream binding in a binding class's `<clinit>` is one STN slot,
+    /// in STN order — that is the whole basis for numbering them positionally
+    /// here. Whether the abstract interpreter managed to RESOLVE a slot's
+    /// language does not change how many slots the disc has: a `getstatic`
+    /// whose owning class was not fingerprinted as a master enum, or whose
+    /// field is missing from the resolved ordinal map, arrives as
+    /// `StackVal::Unknown`.
+    ///
+    /// A slot that resolved nothing has no label to emit, but it must still
+    /// consume its number. Skipping it renumbers every slot behind it and
+    /// binds their labels — language, commentary, descriptive-audio — one
+    /// stream early.
+    #[test]
+    fn interpret_streams_unresolved_slot_still_consumes_its_number() {
+        let audio_slot = |lang: Option<u16>| Construction {
+            binding_type: "AudioSlot".into(),
+            args: vec![
+                match lang {
+                    Some(ordinal) => StackVal::EnumRef {
+                        kind: "Language",
+                        ordinal,
+                    },
+                    // Language `getstatic` the decoder could not resolve.
+                    None => StackVal::Unknown,
+                },
+                StackVal::CodingType("DOLBY_AC3_AUDIO".into()),
+            ],
+        };
+        let sub_slot = |lang: Option<u16>| Construction {
+            binding_type: "SubtitleSlot".into(),
+            args: vec![match lang {
+                Some(ordinal) => StackVal::EnumRef {
+                    kind: "Language",
+                    ordinal,
+                },
+                None => StackVal::Unknown,
+            }],
+        };
+
+        let constructions = vec![
+            audio_slot(Some(0)), // audio STN 1 — English
+            audio_slot(None),    // audio STN 2 — unresolved
+            audio_slot(Some(1)), // audio STN 3 — French
+            sub_slot(Some(0)),   // PG STN 1 — English
+            sub_slot(None),      // PG STN 2 — unresolved
+            sub_slot(Some(2)),   // PG STN 3 — Spanish
+            // Not a stream binding at all: no language, no CodingType, and a
+            // binding type that never yielded a stream. Must not take a slot.
+            Construction {
+                binding_type: "java/lang/StringBuilder".into(),
+                args: Vec::new(),
+            },
+            sub_slot(Some(1)), // PG STN 4 — French
+        ];
+
+        let out = interpret_streams(&constructions, &lang_enum_master());
+
+        let audio: Vec<_> = out
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .map(|l| (l.language.as_str(), l.stream_number))
+            .collect();
+        assert_eq!(
+            audio,
+            vec![("eng", 1), ("fra", 3)],
+            "the unresolved audio slot owns STN 2"
+        );
+
+        let sub: Vec<_> = out
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Subtitle)
+            .map(|l| (l.language.as_str(), l.stream_number))
+            .collect();
+        assert_eq!(
+            sub,
+            vec![("eng", 1), ("spa", 3), ("fra", 4)],
+            "the unresolved PG slot owns STN 2; the non-stream construction \
+             owns nothing"
+        );
     }
 
     #[test]

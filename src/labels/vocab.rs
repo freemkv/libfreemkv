@@ -177,7 +177,7 @@ const BARE_LANGS: &[(&str, &str)] = &[
 ];
 
 /// Map a short menu-graphic language token (as embedded in authoring
-/// filenames like `Dune_UHD01_Eng_Composite1.png`) to an ISO-639-2/T code.
+/// filenames like `Feature_UHD01_Eng_Composite1.png`) to an ISO-639-2/T code.
 ///
 /// These filename tokens are compact 2/3-letter abbreviations, NOT the full
 /// language names [`lang`] handles, so they get their own certain table.
