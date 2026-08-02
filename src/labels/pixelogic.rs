@@ -124,10 +124,10 @@ fn assign_labels(strings: &[String], saw_unknown: &mut bool) -> Vec<StreamLabel>
         // `None`) or one whose only distinguishing component is uncatalogued
         // (`jpn_DUB_`). Numbering only the slots that PARSE renumbers the rest
         // 1..N and lands every surviving label on the wrong stream: on
-        // UHD_Crime101_WW_150728 the seven `*_TXT_FOR_` forced tokens at PG STN
-        // 11-16/18 collapsed onto STN 2-8, flagging the disc's FULL subtitle
-        // tracks `forced` and leaving the real forced-narrative tracks
-        // unflagged.
+        // one observed UHD feature the seven `*_TXT_FOR_` forced tokens at PG
+        // STN 11-16/18 collapsed onto STN 2-8, flagging that disc's FULL
+        // subtitle tracks `forced` and leaving the real forced-narrative
+        // tracks unflagged.
         //
         // A slot the grammar cannot classify carries no stream type either, so
         // it advances the list currently being enumerated: pixelogic sections
@@ -479,7 +479,7 @@ mod tests {
         assert_eq!(audio[0].language, "eng");
     }
 
-    /// Real disc (UHD_Crime101_WW_150728, `SEG_MainFeature`): the PG list has
+    /// Taken from a real UHD feature's `SEG_MainFeature`: the PG list has
     /// 18 slots, five of them bare `PG Stream N` placeholders and four more
     /// carrying a token whose only non-language component is a REGION
     /// (`fra_CF_`, `spa_LS_`, …) — which `parse_token_inner` rejects because
