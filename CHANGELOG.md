@@ -2,6 +2,26 @@
 
 ## [1.6.0] — UNRELEASED
 
+### Fixed
+
+- **An `.fvi` index named itself as its own source.** The `fvi://` sink was
+  handed the DESTINATION path as its `source_path`, so every index reported
+  `source.path` as the file it was writing. `source.medium` was always `file`
+  whatever the real source, and `source.title` always `0` whatever title was
+  muxed — `docs/FVI_FORMAT.md` §6 defines all three as describing the input.
+  Beyond the wrong data, it made the format non-reproducible: two machines
+  indexing identical bytes produced different files purely because they wrote
+  to different paths, and a local filesystem path leaked into a shareable file.
+  `output()` now takes the source provenance explicitly. One of the crate's own
+  tests had been asserting the wrong value, which is why the suite never caught
+  it.
+- **A key service that was DOWN was reported as "this disc has no key".** A
+  failed lookup and a successful lookup that found nothing shared a match arm,
+  so an unreachable service, a rejected token and a rate limit all arrived as
+  "no entry". New codes distinguish them: `E7028` service unreachable or 5xx,
+  `E7029` token rejected, `E7030` rate limited. An operator hunting a missing
+  VUK during a transient outage was the actual, observed cost.
+
 ### Breaking
 
 - **`Resolution::pixels()` now returns `Option<(u32, u32)>`, not a bare tuple.**
