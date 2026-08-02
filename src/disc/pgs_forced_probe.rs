@@ -176,7 +176,12 @@ fn plan_windows(sector_count: u32, share: u32) -> Vec<SampleWindow> {
     (0..windows)
         .map(|i| SampleWindow {
             offset: if windows == 1 {
-                0
+                // A title cut into many clips gives each extent a share worth one
+                // window. Putting that window at the extent's head samples every
+                // clip at the same relative position — and for the FIRST clip
+                // that position is the start of the feature, the one stretch a
+                // film reliably has no subtitles in. Take the middle instead.
+                align_down(span / 2)
             } else {
                 // u64: `span * i` overflows u32 for a large extent.
                 align_down((u64::from(span) * u64::from(i) / u64::from(windows - 1)) as u32)
@@ -2506,6 +2511,24 @@ mod tests {
         assert!(
             forced_flag(&title, pid),
             "the run's final display set must still be observed"
+        );
+    }
+
+    /// A title cut into many clips gives each extent a single window's worth of
+    /// budget. That window must not sit at the extent's head: sampled at the head,
+    /// every clip is read at the same relative position, and for the first clip
+    /// that position is the opening of the feature — the one stretch that
+    /// reliably has no subtitles in it, which is the whole defect being fixed.
+    #[test]
+    fn a_single_window_sample_is_taken_from_the_middle_of_the_extent() {
+        let sectors = 524_288u32;
+        let share = 2_439u32; // the shape a 50-clip feature produces
+        let plan = plan_windows(sectors, share);
+        assert_eq!(plan.len(), 1, "one window's worth of share");
+        let w = plan[0];
+        assert!(
+            w.offset > sectors / 4 && w.offset + w.len < sectors / 4 * 3,
+            "the lone window must be taken from the middle, got {w:?} of {sectors}"
         );
     }
 }
