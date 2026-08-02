@@ -6,11 +6,24 @@
 //! streams and feeding them through the one shared classifier
 //! ([`crate::mux::codec::pgs::ForcedTracker`]) — so the two never diverge.
 //!
-//! Cost: a track is only confirmed forced once EVERY display set is seen to be
-//! forced, so a disc that has a forced track is read through — the
-//! accuracy-over-speed tradeoff `info` opts into. Full tracks early-exit as soon
-//! as they show a single non-forced subtitle, and a whole run stops early once
-//! every track has settled.
+//! WHERE it reads is the whole design. A track is forced iff EVERY display set
+//! carries `forced_on_flag`, so one non-forced set disproves forced for good,
+//! while proving forced needs the whole track — and the tracks that are
+//! expensive to prove are the cheap ones to read (a forced-narrative track is
+//! tens of display sets; a full dialogue track is thousands). A bounded budget
+//! spent on the title's HEAD therefore learns nothing at all: a feature's
+//! subtitles begin minutes in, past the end of any affordable prefix. The budget
+//! ([`PROBE_BUDGET_SECTORS`]) is instead SPREAD over each extent as sample
+//! windows ([`plan_windows`]), so every window is an independent chance to catch
+//! a display set.
+//!
+//! Cost: the budget is a hard ceiling per call. A run stops early once no track
+//! can still change its outcome — disproven, and with no wrong forced label left
+//! to correct.
+//!
+//! Contradicting a label: content may CLEAR a vendor forced flag as well as set
+//! one, but only behind [`crate::mux::codec::pgs::demotable`] — an absence of
+//! `forced_on_flag` proves nothing on a disc whose authoring never sets it.
 //!
 //! Encrypted content: the probe reuses whatever [`SectorSource`] the scan holds.
 //! With a decrypting source it sees real PGS; without keys it reads ciphertext
