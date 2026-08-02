@@ -69,6 +69,8 @@ pub fn display_set_is_forced(frame_data: &[u8]) -> Option<bool> {
 pub struct ForcedTracker {
     has_display: bool,
     all_forced: bool,
+    displays: u32,
+    forced_displays: u32,
 }
 
 impl Default for ForcedTracker {
@@ -76,8 +78,85 @@ impl Default for ForcedTracker {
         Self {
             has_display: false,
             all_forced: true,
+            displays: 0,
+            forced_displays: 0,
         }
     }
+}
+
+/// The disc-shaped facts about ONE subtitle track that a demotion decision
+/// rests on — how many display sets were seen, and how many of them carried the
+/// HDMV `forced_on_flag`.
+///
+/// Split out from [`ForcedTracker`] so the two places that can contradict a
+/// vendor label (the scan-time probe, which accumulates per-extent evidence,
+/// and the muxer, which holds a live tracker per track) feed the SAME rule.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct ForcedFacts {
+    /// Display sets observed on this track.
+    pub displays: u32,
+    /// How many of them carried `forced_on_flag`.
+    pub forced_displays: u32,
+}
+
+/// A track must have shown at least this many display sets before "none of them
+/// was forced" is allowed to contradict a vendor forced label.
+///
+/// Absence is weak evidence on a handful of sets: a genuine forced-narrative
+/// track is SMALL (measured shape: tens of display sets for a whole feature), so
+/// a couple of unflagged sets is exactly what one looks like on a disc whose
+/// authoring never sets the flag.
+pub const DEMOTE_MIN_DISPLAY_SETS: u32 = 8;
+
+/// ...and it must carry at least this fraction (1/N) of the display sets of the
+/// BUSIEST subtitle track on the disc.
+///
+/// This is the shape test that separates the two populations. Measured: a
+/// dedicated forced track carries a low-tens count of display sets for a whole
+/// feature, a full dialogue track carries one to two thousand — two orders of
+/// magnitude apart. A track sitting within a quarter of the busiest track's
+/// count is a full track, whatever its label says; a track at one percent of it
+/// is the forced-narrative track its label claims and must keep that label.
+pub const DEMOTE_MIN_DISPLAY_SHARE_DIVISOR: u32 = 4;
+
+/// Whether content evidence is strong enough to CONTRADICT a vendor label that
+/// says a track is forced — i.e. to demote 1 → 0.
+///
+/// Promotion (0 → 1) needs no such gate: it rests on positive evidence (every
+/// display set carried `forced_on_flag`). Demotion rests on an ABSENCE, and an
+/// absence is only meaningful if the flag is in use at all. Measured: discs
+/// exist on which NO track carries `forced_on_flag`; there, "this track has no
+/// forced display sets" is a fact about the authoring house, not about the
+/// track, and demoting on it would strip a correct forced label from every
+/// track on the disc.
+///
+/// So the rule is:
+///   * a track that itself mixes forced and non-forced sets is self-evidently
+///     not a forced-only track — demote, no further evidence needed; otherwise
+///   * some OTHER track must demonstrably use the flag (`disc_uses_forced_flag`),
+///     proving the authoring house sets it, AND this track must have the SHAPE of
+///     a full track ([`DEMOTE_MIN_DISPLAY_SETS`] and
+///     [`DEMOTE_MIN_DISPLAY_SHARE_DIVISOR`]) rather than of a forced-narrative one.
+///
+/// `busiest_displays` is the largest `displays` over every subtitle track judged
+/// together (the same title's tracks for the probe, the same file's tracks for
+/// the muxer).
+pub fn demotable(facts: ForcedFacts, disc_uses_forced_flag: bool, busiest_displays: u32) -> bool {
+    if facts.displays == 0 {
+        return false;
+    }
+    // Mixed: forced sets AND non-forced sets on the same track. The flag is in
+    // use right here, so its absence on the other sets is real evidence.
+    if facts.forced_displays > 0 && facts.forced_displays < facts.displays {
+        return true;
+    }
+    if !disc_uses_forced_flag || facts.displays < DEMOTE_MIN_DISPLAY_SETS {
+        return false;
+    }
+    // `displays >= busiest / DIVISOR`, multiplied out (u64: `displays` is a
+    // disc-derived count, so the product must not be able to wrap).
+    u64::from(facts.displays) * u64::from(DEMOTE_MIN_DISPLAY_SHARE_DIVISOR)
+        >= u64::from(busiest_displays)
 }
 
 impl ForcedTracker {
@@ -91,6 +170,22 @@ impl ForcedTracker {
         if let Some(forced) = display_set_is_forced(frame_data) {
             self.has_display = true;
             self.all_forced &= forced;
+            // Saturating: the counts drive a shape comparison between tracks, so
+            // a pathological stream must pin them, never wrap (and never panic
+            // on an overflow in a debug build).
+            self.displays = self.displays.saturating_add(1);
+            if forced {
+                self.forced_displays = self.forced_displays.saturating_add(1);
+            }
+        }
+    }
+
+    /// The counts behind the verdict: how many display sets were seen and how
+    /// many carried `forced_on_flag`. Feeds [`demotable`].
+    pub fn facts(&self) -> ForcedFacts {
+        ForcedFacts {
+            displays: self.displays,
+            forced_displays: self.forced_displays,
         }
     }
 
@@ -715,5 +810,81 @@ mod tests {
         let _ = parser.parse(&make_pes(display.clone(), Some(90000)));
         let f = parser.parse(&make_pes(pcs_bytes(0), Some(180000)));
         assert_eq!(f[0].data, display, "display PCS data emitted verbatim");
+    }
+
+    // ── the demotion guard ──────────────────────────────────────────────────
+
+    fn facts(displays: u32, forced: u32) -> ForcedFacts {
+        ForcedFacts {
+            displays,
+            forced_displays: forced,
+        }
+    }
+
+    /// The case the guard exists for: a disc whose authoring never sets
+    /// `forced_on_flag`. Nothing about the absence of a flag nobody uses can
+    /// contradict a vendor label, however many display sets confirm the absence.
+    #[test]
+    fn nothing_is_demotable_on_a_disc_that_never_sets_the_flag() {
+        for displays in [1u32, DEMOTE_MIN_DISPLAY_SETS, 2_000, u32::MAX] {
+            assert!(
+                !demotable(facts(displays, 0), false, displays),
+                "{displays} unflagged display sets on a flagless disc prove nothing"
+            );
+        }
+    }
+
+    /// A track that itself mixes forced and non-forced display sets needs no
+    /// corroboration: the flag is demonstrably in use ON THIS TRACK, so it is a
+    /// full track carrying occasional forced signs — not a forced-only track.
+    #[test]
+    fn a_mixed_track_is_demotable_on_its_own_evidence() {
+        assert!(demotable(facts(4, 1), false, 4));
+    }
+
+    /// With the flag in use elsewhere on the disc, the shape decides. Measured:
+    /// a forced-narrative track carries tens of display sets, a full dialogue
+    /// track one to two thousand.
+    #[test]
+    fn shape_decides_once_the_disc_is_known_to_use_the_flag() {
+        assert!(
+            demotable(facts(2_000, 0), true, 2_000),
+            "the busiest track on the disc, with no forced set on it, is a full track"
+        );
+        assert!(
+            !demotable(facts(20, 0), true, 2_000),
+            "a track at one percent of the busiest is the forced track its label claims"
+        );
+        assert!(
+            !demotable(facts(DEMOTE_MIN_DISPLAY_SETS - 1, 0), true, 8),
+            "too few display sets for their absence of flags to mean anything"
+        );
+        assert!(
+            demotable(facts(DEMOTE_MIN_DISPLAY_SETS, 0), true, 8),
+            "at the threshold, with the shape of the busiest track, it is demotable"
+        );
+    }
+
+    /// Never on no evidence at all: a track nobody observed cannot contradict
+    /// anything.
+    #[test]
+    fn an_unobserved_track_is_never_demotable() {
+        assert!(!demotable(facts(0, 0), true, 2_000));
+    }
+
+    /// Saturating counters: a pathological stream must pin the counts, never wrap
+    /// them (and never panic on overflow in a debug build).
+    #[test]
+    fn display_counts_saturate_instead_of_wrapping() {
+        let mut t = ForcedTracker::new();
+        t.displays = u32::MAX;
+        t.forced_displays = u32::MAX;
+        let mut pcs = vec![0u8; 18];
+        pcs[0] = SEGMENT_PCS;
+        pcs[PCS_NUM_OBJECTS_OFFSET] = 1;
+        pcs[PCS_FIRST_OBJECT_FLAGS_OFFSET] = PCS_FORCED_ON_FLAG;
+        t.observe(&pcs);
+        assert_eq!(t.facts().displays, u32::MAX);
+        assert_eq!(t.facts().forced_displays, u32::MAX);
     }
 }
