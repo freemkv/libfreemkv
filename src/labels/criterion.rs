@@ -276,6 +276,48 @@ mod tests {
     ///
     /// Mutation: skip elements with an empty `ID`/`LangInfoID` → the two
     /// real audio streams renumber to 1 and 2.
+    /// Immunity pin, section-boundary half. Each stream here is one closed XML
+    /// element, and every field is read out of `&text[start..end]` — the range
+    /// `xml::find_element` returned — so one element can never absorb the next
+    /// one's fields, however the document is malformed around it. Contrast the
+    /// flat-string walk in pixelogic, where a section whose end marker is
+    /// missing keeps consuming entries as STN slots.
+    ///
+    /// The missing-boundary case fails closed. An element with no close tag of
+    /// its own ends at the NEXT close tag, so it absorbs the element behind it
+    /// — the list comes back SHORTER. It cannot come back longer: nothing
+    /// outside a returned range is ever read as a stream, and `find_element`
+    /// yields `None` rather than a range running to EOF when no close tag
+    /// exists at all. A malformed document can cost this parser a slot; it can
+    /// never invent one.
+    ///
+    /// Mutation: read fields from the document rather than the element's
+    /// range, or let a close-less element run to EOF → the trailing elements
+    /// re-enter the list as extra streams.
+    #[test]
+    fn an_unterminated_stream_element_shortens_the_list_it_cannot_extend_it() {
+        let sp = concat!(
+            "<AudioStreamInfos><ID>a0</ID><LangInfoID>ENG</LangInfoID></AudioStreamInfos>",
+            // No `</AudioStreamInfos>` for this one.
+            "<AudioStreamInfos><ID>a1</ID><LangInfoID>FRA</LangInfoID>",
+            "<AudioStreamInfos><ID>a2</ID><LangInfoID>DEU</LangInfoID></AudioStreamInfos>",
+        );
+        let infos = parse_stream_infos(sp);
+        assert_eq!(
+            infos.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["a0", "a1"],
+            "the close-less element absorbs the one behind it — two slots, not \
+             three, and never four"
+        );
+        assert_eq!(infos[1].language, "fra", "and keeps its own leading fields");
+
+        // With no close tag anywhere behind it, the element is not returned at
+        // all and the walk ends — the tail of the document never becomes a
+        // stream list.
+        let no_close = "<AudioStreamInfos><ID>a0</ID><LangInfoID>ENG</LangInfoID>";
+        assert!(parse_stream_infos(no_close).is_empty());
+    }
+
     #[test]
     fn unusable_stream_element_still_occupies_its_position() {
         let sp = r#"
