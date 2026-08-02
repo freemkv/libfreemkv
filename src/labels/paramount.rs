@@ -59,13 +59,26 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
             .map(|s| s.split(',').filter_map(|i| i.trim().parse().ok()).collect())
             .unwrap_or_default();
 
-        // stream_number must match apply_labels' monotonic 1-based
-        // per-type counter, which increments once per *real* stream — so
-        // it counts only non-empty slots, not the raw CSV index. The
-        // commentary index comparison stays on the raw CSV index `i`,
-        // since aud_com1_idx is positional against the original CSV.
-        let mut audio_num: u16 = 0;
+        // The CSV *is* the STN list: one cell per stream, in stream order,
+        // and `aud_com1_idx` is a 0-based index into those same cells. So
+        // `stream_number` is the cell's own 1-based position — NOT a counter
+        // that only advances on cells carrying a language.
+        //
+        // A cell with an empty language still occupies its STN slot; it just
+        // has nothing to label. Renumbering the surviving cells 1..N shifts
+        // every label behind an empty cell one slot forward, which is how a
+        // marker authored for one stream ends up written onto the stream in
+        // front of it (see the subtitle side, where the marker is `forced`).
+        //
+        // `u16::try_from` rather than `saturating_add`: past the 1-based u16
+        // numbering space every cell would collapse onto `u16::MAX`, binding
+        // several streams to one label. Stop emitting instead. Unreachable on
+        // real media — the BD STN_table admits at most 32 primary audio
+        // streams per playlist.
         for (i, lang) in aud.split(',').enumerate() {
+            let Ok(stream_number) = u16::try_from(i + 1) else {
+                break;
+            };
             let lang = lang.trim();
             if lang.is_empty() {
                 continue;
@@ -75,9 +88,8 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
             } else {
                 LabelPurpose::Normal
             };
-            audio_num = audio_num.saturating_add(1);
             labels.push(StreamLabel {
-                stream_number: audio_num,
+                stream_number,
                 stream_type: StreamLabelType::Audio,
                 language: lang.to_string(),
                 name: String::new(),
@@ -101,10 +113,15 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
             .map(|s| s.split(',').filter_map(|i| i.trim().parse().ok()).collect())
             .unwrap_or_default();
 
-        // As with audio: count only non-empty slots for stream_number,
-        // but keep com/forced lookups on the raw CSV index `i`.
-        let mut sub_num: u16 = 0;
+        // As with audio: the cell position IS the STN slot. `forced_sub` and
+        // `sub_com1_idx` are indexed against those same cells, so an empty
+        // cell must not renumber the cells behind it — a forced marker
+        // authored for one PG slot would otherwise be written onto an
+        // earlier, full-dialogue subtitle track.
         for (i, lang) in sub.split(',').enumerate() {
+            let Ok(stream_number) = u16::try_from(i + 1) else {
+                break;
+            };
             let lang = lang.trim();
             if lang.is_empty() {
                 continue;
@@ -122,9 +139,8 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
                 LabelQualifier::None
             };
 
-            sub_num = sub_num.saturating_add(1);
             labels.push(StreamLabel {
-                stream_number: sub_num,
+                stream_number,
                 stream_type: StreamLabelType::Subtitle,
                 language: lang.to_string(),
                 name: String::new(),
@@ -182,18 +198,26 @@ mod tests {
     /// single attacker-supplied file.
     ///
     /// Proof is by deadline rather than micro-benchmark. With the linear scan
-    /// this fixture (200 000 streams x 1 000 001 indices) measures 31 s in a
-    /// release build and far longer in debug; with a set it measures 0.03 s
-    /// release / 0.56 s debug. A 10 s deadline sits ~18x above the slowest
-    /// passing measurement and ~3x below the fastest failing one, and makes a
-    /// regression fail fast instead of hanging CI.
+    /// the original fixture (200 000 streams x 1 000 001 indices) measured
+    /// 31 s in a release build and far longer in debug; with a set it measured
+    /// 0.03 s release / 0.56 s debug. A 10 s deadline sits ~18x above the
+    /// slowest passing measurement and ~3x below the fastest failing one, and
+    /// makes a regression fail fast instead of hanging CI.
+    ///
+    /// The CSV now stops at the end of the 1-based `u16` stream-numbering
+    /// space, so only the first 65 535 cells are scanned. `INDICES` is raised
+    /// to keep the linear-scan work product (`cells x indices`) at or above
+    /// the original fixture's, preserving that deadline margin.
     ///
     /// Correctness is pinned on fixture-derived literals: indices 0, 2 and 4
     /// are the commentary tracks, 1 and 3 are not.
     #[test]
     fn commentary_index_lookup_is_not_quadratic() {
+        /// Cells offered. Everything past `u16::MAX` is unnumberable and the
+        /// parser stops there, so the scanned prefix is 65 535 cells.
         const STREAMS: usize = 200_000;
-        const INDICES: usize = 1_000_000;
+        const SCANNED: usize = u16::MAX as usize;
+        const INDICES: usize = 3_100_000;
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let mut feature = String::from(r#"<playlist name="Feature" sub=""#);
@@ -210,7 +234,7 @@ mod tests {
         match rx.recv_timeout(std::time::Duration::from_secs(10)) {
             Ok(labels) => {
                 worker.join().expect("worker panicked");
-                assert_eq!(labels.len(), STREAMS);
+                assert_eq!(labels.len(), SCANNED);
                 assert_eq!(labels[0].purpose, LabelPurpose::Commentary);
                 assert_eq!(labels[1].purpose, LabelPurpose::Normal);
                 assert_eq!(labels[2].purpose, LabelPurpose::Commentary);
@@ -259,11 +283,56 @@ mod tests {
             .collect()
     }
 
+    /// The `aud` / `sub` CSVs are the vendor's STN-ordered stream lists: one
+    /// slot per stream, and `aud_com1_idx` / `forced_sub` are indexed against
+    /// those same slot positions. A slot whose language cell is empty carries
+    /// nothing to label but still OCCUPIES its slot, so it must not renumber
+    /// the slots behind it.
+    ///
+    /// Numbering only the slots that carry a language collapsed every later
+    /// label one position forward per empty cell, which is how a forced
+    /// marker authored for one STN slot lands on the full-subtitle track in
+    /// front of it.
     #[test]
-    fn empty_middle_slot_does_not_inflate_stream_number() {
-        // aud="eng,,fra": the empty middle slot is skipped, and the
-        // second real stream (fra) must be numbered 2, matching
-        // apply_labels' monotonic counter — not 3 (its raw CSV index).
+    fn empty_csv_slot_still_occupies_its_stn_slot() {
+        // Audio: slot 2 is empty; `fra` is STN slot 3 and is the commentary
+        // the vendor pointed at with the 0-based CSV index 2.
+        let feature = r#"<playlist name="Feature" aud="eng,,fra" aud_com1_idx="2" />"#;
+        let labels = labels_from_feature(feature);
+        let a = audio(&labels);
+        assert_eq!(a.len(), 2, "the empty slot carries no label");
+        assert_eq!(a[0].language, "eng");
+        assert_eq!(a[0].stream_number, 1);
+        assert_eq!(a[1].language, "fra");
+        assert_eq!(
+            a[1].stream_number, 3,
+            "an empty CSV cell occupies STN slot 2, so `fra` is slot 3"
+        );
+        assert_eq!(a[1].purpose, LabelPurpose::Commentary);
+
+        // Subtitles: same shape, and the consequence is a misplaced forced
+        // flag. `forced_sub` index 2 is the forced-narrative track; with the
+        // empty slot renumbered away it would be written onto STN slot 2.
+        let feature = r#"<playlist name="Feature" sub="eng,,fra" forced_sub="0,0,1" />"#;
+        let labels = labels_from_feature(feature);
+        let s = subs(&labels);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].language, "eng");
+        assert_eq!(s[0].stream_number, 1);
+        assert_eq!(s[0].qualifier, LabelQualifier::None);
+        assert_eq!(s[1].language, "fra");
+        assert_eq!(
+            s[1].stream_number, 3,
+            "the forced marker belongs to STN slot 3, not slot 2"
+        );
+        assert_eq!(s[1].qualifier, LabelQualifier::Forced);
+    }
+
+    #[test]
+    fn empty_middle_slot_carries_no_label_but_keeps_its_slot() {
+        // aud="eng,,fra": the empty middle cell yields no label — there is
+        // nothing to label — but it still owns STN slot 2, so `fra` is slot
+        // 3. (This test previously asserted 2, pinning the renumbering bug.)
         let feature = r#"<playlist name="Feature" aud="eng,,fra" />"#;
         let labels = labels_from_feature(feature);
         let a = audio(&labels);
@@ -271,7 +340,7 @@ mod tests {
         assert_eq!(a[0].language, "eng");
         assert_eq!(a[0].stream_number, 1);
         assert_eq!(a[1].language, "fra");
-        assert_eq!(a[1].stream_number, 2);
+        assert_eq!(a[1].stream_number, 3);
     }
 
     #[test]
@@ -279,7 +348,7 @@ mod tests {
         // Whitespace around the index, and a multi-value list, must both
         // resolve. com index is positional against the raw CSV, so with
         // an empty slot at position 1, " 2 " marks the 'fra' track
-        // (CSV index 2) as commentary.
+        // (CSV index 2, STN slot 3) as commentary.
         let feature = r#"<playlist aud="eng,,fra" aud_com1_idx=" 2 " />"#;
         let labels = labels_from_feature(feature);
         let a = audio(&labels);
@@ -293,7 +362,7 @@ mod tests {
     fn forced_sub_aligns_with_raw_csv_index() {
         // sub="eng,eng,zho,ces" forced_sub="0,0,0,1": the forced flag is
         // positional on the raw CSV, so 'ces' (index 3) is forced; its
-        // stream_number is its non-empty position (4 here, no gaps).
+        // stream_number is its 1-based cell position, 4.
         let feature = r#"<playlist sub="eng,eng,zho,ces" forced_sub="0,0,0,1" />"#;
         let labels = labels_from_feature(feature);
         let s = subs(&labels);
@@ -339,10 +408,12 @@ mod tests {
         assert!(feature.contains(r#"name="MainMovie""#));
     }
 
-    /// Spec: stream_number for audio is 1-based and increments only on non-empty slots.
-    /// Mutation: increment for empty slots too → stream numbers inflate.
+    /// Spec: stream_number for audio is the cell's own 1-based CSV position,
+    /// because the CSV is the STN list and empty cells are slots too.
+    /// Mutation: count only non-empty cells → every label behind an empty
+    /// cell shifts one slot forward.
     #[test]
-    fn audio_stream_numbering_skips_empty_slots() {
+    fn audio_stream_numbering_uses_raw_csv_slot_position() {
         let feature = r#"<playlist name="Feature" aud="eng,,fra,,spa" />"#;
         let labels = labels_from_feature(feature);
         let a = audio(&labels);
@@ -350,9 +421,9 @@ mod tests {
         assert_eq!(a[0].language, "eng");
         assert_eq!(a[0].stream_number, 1);
         assert_eq!(a[1].language, "fra");
-        assert_eq!(a[1].stream_number, 2);
+        assert_eq!(a[1].stream_number, 3);
         assert_eq!(a[2].language, "spa");
-        assert_eq!(a[2].stream_number, 3);
+        assert_eq!(a[2].stream_number, 5);
     }
 
     /// Spec: forced subtitle at the last position with gaps in between.
@@ -361,7 +432,7 @@ mod tests {
     #[test]
     fn forced_sub_uses_raw_csv_index_with_gaps() {
         // sub="eng,,fra,,spa" forced_sub="0,0,0,0,1"
-        // raw CSV index 4 = "spa"; stream_number for spa = 3 (3rd non-empty).
+        // raw CSV index 4 = "spa", i.e. STN slot 5.
         let feature = r#"<playlist name="Feature" sub="eng,,fra,,spa" forced_sub="0,0,0,0,1" />"#;
         let labels = labels_from_feature(feature);
         let s = subs(&labels);
@@ -372,6 +443,7 @@ mod tests {
         assert_eq!(s[1].qualifier, LabelQualifier::None);
         assert_eq!(s[2].language, "spa");
         assert_eq!(s[2].qualifier, LabelQualifier::Forced);
+        assert_eq!(s[2].stream_number, 5);
     }
 
     /// Spec: aud_com1_idx is positional against the raw CSV.
@@ -380,13 +452,14 @@ mod tests {
     /// Mutation: use stream_number instead of raw CSV index → wrong stream is commentary.
     #[test]
     fn audio_commentary_index_raw_csv_position() {
-        // aud="eng,,fra,spa" aud_com1_idx="2" → CSV index 2 = "fra".
-        // "fra" is stream_number 2 (second non-empty slot, skipping the empty).
+        // aud="eng,,fra,spa" aud_com1_idx="2" → CSV index 2 = "fra",
+        // which is STN slot 3.
         let feature = r#"<playlist name="Feature" aud="eng,,fra,spa" aud_com1_idx="2" />"#;
         let labels = labels_from_feature(feature);
         let a = audio(&labels);
         assert_eq!(a.len(), 3);
         assert_eq!(a[1].language, "fra");
+        assert_eq!(a[1].stream_number, 3);
         assert_eq!(a[1].purpose, LabelPurpose::Commentary);
         assert_eq!(a[0].purpose, LabelPurpose::Normal);
         assert_eq!(a[2].purpose, LabelPurpose::Normal);
@@ -429,10 +502,11 @@ mod tests {
         assert!(s.is_empty(), "no subtitle labels when sub is absent");
     }
 
-    /// Spec: audio stream_number uses saturating_add on overflow (per u16 cap).
-    /// Mutation: use wrapping_add → stream numbers wrap to 0, skipping apply.
+    /// Spec: audio stream_number is the cell's 1-based position and never
+    /// wraps; past the u16 space the parser stops emitting.
+    /// Mutation: cast `i + 1` to u16 → stream numbers wrap to 0, skipping apply.
     #[test]
-    fn audio_stream_number_saturates_not_wraps() {
+    fn audio_stream_number_never_wraps() {
         // 65535 audio tracks is impossible on a real disc but the parser must
         // not panic or produce 0. Build a comma-separated list of 65535 "eng"s.
         // We only run the number-assignment logic via labels_from_feature.

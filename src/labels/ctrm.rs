@@ -557,6 +557,72 @@ mod tests {
         assert!(labels.is_empty());
     }
 
+    /// Immunity pin. `language_streams.txt` states each stream's number in
+    /// field 3, so a row the parser cannot use is simply dropped — it can
+    /// never renumber the rows behind it. This is the property that keeps
+    /// this parser out of the STN-slot-shifting failure mode that bites
+    /// parsers which count positionally: there, a skipped entry silently
+    /// pulls every later label one stream forward.
+    ///
+    /// Mutation: replace `parts[2]` with a running per-type counter → the
+    /// three unusable rows here collapse the survivors onto 1/2 and 1.
+    #[test]
+    fn ls_stream_numbers_come_from_the_row_not_a_counter() {
+        let labels = parse_language_streams_text(
+            "id,audio_production,4,eng\n\
+             id,audio_bonus_extended,5,eng\n\
+             id,audio_production,0,fra\n\
+             id,audio_production,7,fra\n\
+             id,subtitle_production\n\
+             id,subtitle_narrative,9,deu\n",
+        );
+        let nums: Vec<(StreamLabelType, u16)> = labels
+            .iter()
+            .map(|l| (l.stream_type, l.stream_number))
+            .collect();
+        assert_eq!(
+            nums,
+            vec![
+                (StreamLabelType::Audio, 4),
+                (StreamLabelType::Audio, 7),
+                (StreamLabelType::Subtitle, 9),
+            ],
+            "an unusable row drops out without shifting the numbering"
+        );
+        assert_eq!(labels[2].qualifier, LabelQualifier::Forced);
+    }
+
+    /// Immunity pin, `menu_base.prop` side: the number comes from the
+    /// entry's own `streamNumber` property, so a skipped entry (commented
+    /// out, `streamNumber=0`, neither audio nor subtitle) leaves the
+    /// surviving entries on their authored slots.
+    ///
+    /// Mutation: number by iteration order → the survivors collapse to 1/2.
+    #[test]
+    fn menu_base_stream_numbers_come_from_the_entry_not_a_counter() {
+        let labels = parse_props(
+            "#audio_0.class=AudioButton\n\
+             #audio_0.streamNumber=1\n\
+             audio_1.class=AudioButton\n\
+             audio_1.streamNumber=0\n\
+             audio_2.class=AudioButton\n\
+             audio_2.streamNumber=6\n\
+             other_1.class=SomeOtherButton\n\
+             other_1.streamNumber=2\n\
+             subtitle_1.class=SubtitleButton\n\
+             subtitle_1.streamNumber=11\n",
+        );
+        let nums: Vec<(StreamLabelType, u16)> = labels
+            .iter()
+            .map(|l| (l.stream_type, l.stream_number))
+            .collect();
+        assert_eq!(
+            nums,
+            vec![(StreamLabelType::Audio, 6), (StreamLabelType::Subtitle, 11),],
+            "skipped entries must not renumber the ones that survive"
+        );
+    }
+
     /// Spec: `eda` variant → `Descriptive` purpose.
     /// Mutation: miss the `eda` branch → purpose stays Normal.
     #[test]

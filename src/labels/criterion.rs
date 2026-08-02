@@ -263,6 +263,41 @@ mod tests {
         assert_eq!(nums, vec![1, 2, 1]);
     }
 
+    /// Immunity pin. `parse_stream_infos` emits one `StreamInfo` per
+    /// `*StreamInfos` element unconditionally — no filter, no `continue` — so
+    /// an element whose fields are missing or unrecognized still occupies its
+    /// position, and `assign_stream_numbers` still spends a number on it.
+    ///
+    /// That is the property that keeps this parser out of the failure mode
+    /// where a skipped entry pulls every later label one stream forward. It
+    /// is load-bearing for the fallback path specifically: with no
+    /// `playbackconfig.xml` the numbers come purely from position in this
+    /// list, so dropping an element there would shift the rest.
+    ///
+    /// Mutation: skip elements with an empty `ID`/`LangInfoID` → the two
+    /// real audio streams renumber to 1 and 2.
+    #[test]
+    fn unusable_stream_element_still_occupies_its_position() {
+        let sp = r#"
+            <AudioStreamInfos><ID>a0</ID><LangInfoID>ENG_US</LangInfoID></AudioStreamInfos>
+            <AudioStreamInfos></AudioStreamInfos>
+            <AudioStreamInfos><ID>a2</ID><LangInfoID>FRA</LangInfoID><Content>COMMENTARY</Content></AudioStreamInfos>
+            <SubtitleStreamInfos><ID>s0</ID><LangInfoID></LangInfoID><Qualifier>WAT</Qualifier></SubtitleStreamInfos>
+            <SubtitleStreamInfos><ID>s1</ID><LangInfoID>ENG</LangInfoID><Qualifier>SDH</Qualifier></SubtitleStreamInfos>
+        "#;
+        let infos = parse_stream_infos(sp);
+        assert_eq!(infos.len(), 5, "every element yields a StreamInfo");
+        let nums =
+            assign_stream_numbers(&infos, &HashMap::new()).expect("numbering space not exhausted");
+        assert_eq!(
+            nums,
+            vec![1, 2, 3, 1, 2],
+            "the blank element owns audio slot 2, so the commentary is slot 3"
+        );
+        assert_eq!(infos[2].purpose, LabelPurpose::Commentary);
+        assert_eq!(infos[4].qualifier, LabelQualifier::Sdh);
+    }
+
     #[test]
     fn fallback_does_not_collide_with_partial_map() {
         // Map claims audio "a1" -> 1. The unmapped audio "a0" must NOT
