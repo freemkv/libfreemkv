@@ -79,15 +79,17 @@ const STALL_RETRY_LIMIT: u32 = 2;
 /// [`plan_windows`]) instead of spent on the title's first 27 seconds.
 const PROBE_BUDGET_SECTORS: u32 = 131_072;
 
-/// One sample window: ~16 MiB, a whole number of AACS aligned units
-/// (8190 = 2730 units).
+/// One sample window: ~32 MiB, a whole number of AACS aligned units
+/// (16_383 = 5461 units).
 ///
-/// Sized in PLAYBACK time, not bytes: a window has to be long enough that a
-/// dialogue track's display sets are likely to fall inside it. At UHD feature
-/// bitrates 16 MiB is a couple of seconds, and a full subtitle track carries a
-/// display set every few seconds, so each window is a fair coin — which is why
-/// the plan takes many of them rather than one big one.
-const WINDOW_SECTORS: u32 = 8_190;
+/// Sized against MEASURED subtitle density, not guessed: across a sample of
+/// feature titles a full dialogue track carries a display set every ~30-50 MB of
+/// clip, so a 32 MiB window is about even money on its own and the plan's eight
+/// of them make an observation near-certain. Halving the window and doubling the
+/// count buys the same expected number of observations for the same bytes — but
+/// twice the seeks, and a measured 6x wall-clock penalty on a source whose
+/// read batching collapses after every jump. Fewer, longer windows.
+const WINDOW_SECTORS: u32 = 16_383;
 
 /// Floor on a window (2 MiB). A window smaller than this is too short to be
 /// likely to contain a display set at all, so it would spend drive time to learn
@@ -96,9 +98,10 @@ const WINDOW_SECTORS: u32 = 8_190;
 /// the run) rather than sampling all of them uselessly.
 const MIN_WINDOW_SECTORS: u32 = CHUNK_SECTORS as u32;
 
-/// Most windows spent on a single extent. Past this, extra windows buy
-/// diminishing spread for the same bytes.
-const MAX_WINDOWS_PER_EXTENT: u32 = 16;
+/// Most windows spent on a single extent. Past this, extra windows buy no extra
+/// expected observations for the same bytes (the expectation depends on total
+/// bytes read, not on how they are cut up) and cost another seek each.
+const MAX_WINDOWS_PER_EXTENT: u32 = 8;
 
 // Windows must start (and, so that every chunk inside them does too, be sized)
 // on the AACS aligned-unit grid — same requirement as CHUNK_SECTORS.
@@ -2289,7 +2292,8 @@ mod tests {
         // Put the small track's handful of display sets inside one sample window,
         // so it is genuinely OBSERVED (several sets, none forced) and the verdict
         // turns on its shape rather than on having seen nothing.
-        let window = plan_windows(ext.sector_count, PROBE_BUDGET_SECTORS)[8];
+        let plan = plan_windows(ext.sector_count, PROBE_BUDGET_SECTORS);
+        let window = plan[plan.len() / 2];
         let mut reader = SyntheticClipReader::new(vec![
             TrackShape {
                 pid: small,
