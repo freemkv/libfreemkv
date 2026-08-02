@@ -192,6 +192,57 @@ fn find_feature_playlist(text: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Immunity pin, section-boundary half. The pixelogic parser walks a flat
+    /// string sequence and recognises its feature section's END by marker
+    /// alone, so a section with no marker behind it runs off into whatever
+    /// follows and counts it as more STN slots. Nothing here can do that: the
+    /// stream list is one attribute of one XML element, so its length is the
+    /// CSV's own cell count and its scope is the element's byte range that
+    /// `xml::find_element` returns. Text after the element — including the
+    /// next playlist's own `aud` — is not reachable from it.
+    ///
+    /// And when the boundary is MISSING the failure is closed, not open:
+    /// `xml::find_element` needs a matching close tag and yields `None`
+    /// without one, so an unterminated element ends the walk rather than
+    /// swallowing the rest of the document.
+    ///
+    /// Mutation: hand `labels_from_feature` the document instead of the
+    /// element, or let an unterminated element run to EOF → the bonus
+    /// playlist's languages join the feature's stream list.
+    #[test]
+    fn a_playlists_stream_list_cannot_run_into_the_next_playlist() {
+        let doc = r#"
+            <playlist name="Feature" aud="eng,fra" sub="eng,spa" forced_sub="0,1"/>
+            <playlist name="Bonus" aud="deu,ita,jpn" sub="deu,ita,jpn"/>
+        "#;
+        let feature = find_feature_playlist(doc).expect("feature playlist found");
+        let labels = labels_from_feature(&feature);
+        let got: Vec<(StreamLabelType, u16, &str)> = labels
+            .iter()
+            .map(|l| (l.stream_type, l.stream_number, l.language.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (StreamLabelType::Audio, 1, "eng"),
+                (StreamLabelType::Audio, 2, "fra"),
+                (StreamLabelType::Subtitle, 1, "eng"),
+                (StreamLabelType::Subtitle, 2, "spa"),
+            ],
+            "the CSV's own cells are the whole stream list"
+        );
+
+        // Same document with the feature element left unterminated.
+        let unterminated = r#"
+            <playlist name="Feature" aud="eng,fra">
+            <playlist name="Bonus" aud="deu,ita,jpn"/>
+        "#;
+        assert!(
+            find_feature_playlist(unterminated).is_none(),
+            "a missing element boundary truncates the walk, never extends it"
+        );
+    }
+
     /// `sub_com1_idx` is an unbounded index list parsed straight out of the
     /// disc's `playlists.xml` and was membership-tested with a linear
     /// `Vec::contains` once per subtitle stream — quadratic in the size of a

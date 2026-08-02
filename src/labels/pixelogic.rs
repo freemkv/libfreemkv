@@ -20,6 +20,13 @@ const AUDIO_CODECS: &[&str] = &["MLP", "AC3", "DTS", "DDL", "WAV", "AC"];
 /// overflowing the u16 STN counters (panic in debug, wrap-to-0 in
 /// release, which would misnumber subsequent labels).
 const MAX_STREAMS_PER_TYPE: u16 = 512;
+/// Sane upper bound on the number of DISTINCT video-slot entries one section
+/// may list before the walk gives up on it. A section's stream list opens with
+/// its video slots, and [`assign_labels`] remembers them to recognise where the
+/// NEXT section starts (see the loop body). The BD STN table admits one primary
+/// video plus at most 32 secondary ones, so a section claiming more than that is
+/// not a stream list — and the memo must not grow without bound on disc bytes.
+const MAX_VIDEO_SLOTS: usize = 33;
 /// Known region tokens
 const REGIONS: &[&str] = &[
     "US", "UK", "CF", "PF", "CS", "LS", "BP", "PP", "SM", "TM", "CAN", "DUM", "FLE",
@@ -152,6 +159,9 @@ fn assign_labels(strings: &[String], unknown: &mut UnknownParts) -> Vec<StreamLa
     // video → audio → PG, so audio is the correct start, and it only matters
     // for slots whose own type is unknowable (see the loop body).
     let mut domain = StreamLabelType::Audio;
+    // The video slots this section has listed so far, in order. Used only to
+    // recognise where the section ENDS — see the `Video Stream` arm below.
+    let mut video_slots: Vec<&str> = Vec::new();
 
     for s in strings {
         // Detect feature section start
@@ -168,6 +178,7 @@ fn assign_labels(strings: &[String], unknown: &mut UnknownParts) -> Vec<StreamLa
             audio_num = 0;
             sub_num = 0;
             domain = StreamLabelType::Audio;
+            video_slots.clear();
             continue;
         }
 
@@ -177,6 +188,35 @@ fn assign_labels(strings: &[String], unknown: &mut UnknownParts) -> Vec<StreamLa
         }
 
         if !in_feature {
+            continue;
+        }
+
+        // Second way a section ends, and the only one some discs give us.
+        //
+        // The `SEG_`/`SF_`/`FPL_` markers above are section NAMES, and not every
+        // section is named: a project's trailing sections (the per-language
+        // notice, disclaimer and dub-credit cards) are emitted with a plain
+        // clip name, or none at all. When the feature playlist is the last
+        // NAMED section in the blob — which it is on most of the corpus — the
+        // name-only rule never fires again and the walk swallows the whole
+        // tail of the file as if it were more of the feature's stream list.
+        // Those trailing clip names are per-language (`{lang3}_{card}`), so
+        // they pass `is_stream_token` and each one silently advances an STN
+        // counter; the ones whose card name collides with a catalogued
+        // component (an `AC` card reads as the AC-3 codec) even emit a label,
+        // for an STN slot the feature playlist does not have.
+        //
+        // What every section does have, named or not, is a stream list that
+        // OPENS with its video slots. So a `Video Stream N` entry that repeats
+        // one this section already listed cannot be another slot in this
+        // section — it is the first entry of the next one, and this section is
+        // over. Distinct video entries are kept (a section may legitimately
+        // list a secondary video stream alongside the primary).
+        if s.starts_with("Video Stream") {
+            if video_slots.contains(&s.as_str()) || video_slots.len() >= MAX_VIDEO_SLOTS {
+                break;
+            }
+            video_slots.push(s);
             continue;
         }
 
@@ -269,8 +309,10 @@ fn assign_labels(strings: &[String], unknown: &mut UnknownParts) -> Vec<StreamLa
 
 /// The bare `Audio Stream N` / `PG Stream N` slot placeholders pixelogic emits
 /// for a stream with no editorial label, and which list they belong to. `None`
-/// for anything else (including the section's `Video Stream 1` / `AR_…`
-/// entries, which are not part of either numbered list).
+/// for anything else (including the section's `AR_…` aspect-ratio entry, which
+/// is not part of either numbered list; the `Video Stream N` entries are
+/// consumed by the section-boundary rule in [`assign_labels`] before they get
+/// here, and belong to neither list either).
 fn placeholder_kind(s: &str) -> Option<StreamLabelType> {
     if s.starts_with("Audio Stream") {
         Some(StreamLabelType::Audio)
@@ -912,6 +954,122 @@ mod tests {
         let labels = assign_labels(&tokens, &mut flag);
         assert_eq!(labels.len(), 1, "only eng from FPL section");
         assert_eq!(labels[0].language, "eng");
+    }
+
+    /// Spec: the feature section also ends where the NEXT section's stream
+    /// list starts, which is the only boundary available when the feature
+    /// playlist is the last NAMED (`SEG_`/`SF_`/`FPL_`) section in the blob.
+    ///
+    /// Shape taken from a corpus disc whose feature playlist is the last named
+    /// section: the trailing per-language notice/disclaimer cards are emitted
+    /// as unnamed sections, each opening with its own `Video Stream 1` /
+    /// `AR_…` pair and titled with a plain clip name. Those clip names are
+    /// `{lang3}_{card}`, so they pass the stream-token gate and each one
+    /// advances an STN counter; a card whose name collides with a catalogued
+    /// component (`AC` reads as the AC-3 codec) even emits a label, for an STN
+    /// slot the feature playlist does not have. On that disc the walk ran 95
+    /// entries past the end of the feature's own list, fabricated five audio
+    /// labels at STN 10-14 (the playlist has 9 audio slots), and reported 94
+    /// uncatalogued components — which also downgraded the whole parse from
+    /// High to Medium confidence.
+    ///
+    /// Mutation: drop the repeated-video-slot boundary → `deu_Warning` and
+    /// `fra_ND` advance the subtitle counter and `eng_AC` emits a phantom
+    /// Dolby Digital label on an audio slot that does not exist.
+    #[test]
+    fn assign_labels_section_ends_at_the_next_sections_video_slot() {
+        let mut flag = UnknownParts::default();
+        let tokens = strs(&[
+            "FPL_MainFeature",
+            "Video Stream 1",
+            "AR_169",
+            // Audio list: 2 STN slots.
+            "Audio Stream 1",
+            "eng_ADES_",
+            // PG list: 2 STN slots.
+            "PG Stream 1",
+            "eng_SDH_",
+            // End of the feature's list. No named section follows — the next
+            // section is a notice card, announced only by its own video slot.
+            "deu_Warning",
+            "Video Stream 1",
+            "AR_169",
+            "fra_ND",
+            "Video Stream 1",
+            "AR_169",
+            "eng_AC",
+        ]);
+        let labels = assign_labels(&tokens, &mut flag);
+
+        let got: Vec<(StreamLabelType, u16, &str)> = labels
+            .iter()
+            .map(|l| (l.stream_type, l.stream_number, l.language.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (StreamLabelType::Audio, 2, "eng"),
+                (StreamLabelType::Subtitle, 2, "eng"),
+            ],
+            "only the feature playlist's own slots are labelled"
+        );
+        // A card's name is emitted BEFORE its own section's video slot, so a
+        // forward-only walk meets the first one while still nominally inside
+        // the feature section and counts it. That residue is one entry, at the
+        // tail of a list nothing follows in — it cannot renumber any label,
+        // only cost the parse its High confidence. Every card behind it is
+        // past the boundary and never seen. Pinned rather than papered over.
+        assert_eq!(
+            flag.seen.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["WARNING"],
+            "only the card sitting between the last slot and the boundary leaks"
+        );
+    }
+
+    /// Companion to the above: the boundary is a video slot the section has
+    /// ALREADY listed, not any video slot. A section may legitimately list a
+    /// secondary video stream alongside the primary, and that must not cut its
+    /// audio and PG lists short.
+    /// Mutation: break on the first `Video Stream` entry seen after the
+    /// section start → the commentary at audio STN 2 disappears.
+    #[test]
+    fn assign_labels_keeps_a_sections_distinct_video_slots() {
+        let mut flag = UnknownParts::default();
+        let tokens = strs(&[
+            "FPL_MainFeature",
+            "Video Stream 1",
+            "Video Stream 2",
+            "AR_169",
+            "Audio Stream 1",
+            "eng_ACOM_",
+        ]);
+        let labels = assign_labels(&tokens, &mut flag);
+        let audio: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .collect();
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].stream_number, 2, "audio list is not cut short");
+        assert_eq!(audio[0].purpose, LabelPurpose::Commentary);
+    }
+
+    /// The memo of a section's video slots is built from disc bytes, so it is
+    /// bounded: past [`MAX_VIDEO_SLOTS`] distinct entries the section is not a
+    /// stream list and the walk stops instead of retaining them all.
+    /// Mutation: drop the length guard → the memo grows with the blob.
+    #[test]
+    fn assign_labels_video_slot_memo_is_bounded() {
+        let mut flag = UnknownParts::default();
+        let mut tokens = vec!["FPL_MainFeature".to_string()];
+        for i in 1..=(MAX_VIDEO_SLOTS + 50) {
+            tokens.push(format!("Video Stream {i}"));
+        }
+        tokens.push("eng_ACOM_".to_string());
+        let labels = assign_labels(&tokens, &mut flag);
+        assert!(
+            labels.is_empty(),
+            "the walk stops once the video-slot memo is full"
+        );
     }
 
     /// Spec: the two per-type caps are independent — the loop only stops

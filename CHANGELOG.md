@@ -26,6 +26,25 @@
   (`pixelogic`, `paramount`, `mpls_universal`, `deluxe`); the rest are now
   pinned by tests proving they are immune. Three of the crate's own tests had
   been asserting the shifted numbering.
+- **A feature's stream list ran on past its end and picked up menu clips as
+  streams.** The parser for one vendor's label blob finds the feature
+  playlist's section by name and ends it at the next named section — but on
+  most discs of that authoring style the feature playlist IS the last named
+  section, and the trailing per-language notice, disclaimer and dub-credit
+  cards carry no name marker at all. The walk therefore swallowed the whole
+  tail of the blob as more of the feature's own stream list. Those cards are
+  named per language, in the same shape as a stream token, so each one silently
+  advanced a stream-number counter, and the ones whose name collided with a
+  catalogued component were labelled as streams outright — on one disc, five
+  audio labels for slots 10 to 14 of a playlist that has nine. The same
+  collisions were being reported as vocabulary gaps and cost that disc's parse
+  its high-confidence rating. A section now also ends where the next one's
+  stream list begins, which is at a video slot the section has already listed.
+  Eight of eleven affected-format discs in the test corpus have no terminating
+  marker; two of them were producing labels for streams their feature playlist
+  does not contain. No other label parser walks a flat entry sequence this way
+  — the rest scope each stream to a structural range or read its number off the
+  entry itself, and two more now carry tests pinning that.
 - **A forced-narrative subtitle marker went uncatalogued.** The token marking
   the signs-and-on-screen-text pass that accompanies a dubbed presentation was
   not in the vocabulary, so that track lost its forced flag while every other
