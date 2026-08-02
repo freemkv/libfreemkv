@@ -579,9 +579,18 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
 }
 
 /// Open a PES output stream (consumes PES frames).
+///
+/// `source` is the provenance of the material being written — the INPUT the
+/// caller is muxing from, not `url`. Only the `fvi://` sink consumes it (it
+/// records the input in the index header, `docs/FVI_FORMAT.md` §6.2); every
+/// other sink ignores it. `None` means "no provenance to declare": the header's
+/// `source` members then carry their neutral defaults and the optional ones are
+/// omitted, rather than being back-filled with the destination path — which is
+/// exactly the bug this parameter exists to prevent.
 pub fn output(
     url: &str,
     title: &crate::disc::DiscTitle,
+    source: Option<&super::videomap::SourceInfo>,
 ) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
     match parsed {
@@ -686,16 +695,19 @@ pub fn output(
             )?))
         }
         // `fvi://` writes the per-picture video index (`docs/FVI_FORMAT.md`).
-        // The bare `output()` arm records the resolver path as the provenance
-        // `source.path` and defaults the title index to 0 (the resolver carries
-        // no title-index context).
+        // The header's `source` object describes the INPUT, so it comes from the
+        // caller-supplied `source` — never from `path`, which is the destination
+        // this sink writes. Passing the destination here made every index name
+        // itself as its own source AND made the output non-reproducible (two
+        // machines indexing identical bytes emitted different files purely from
+        // where they wrote). `None` → the neutral defaults; the optional members
+        // are omitted rather than guessed.
         StreamUrl::Fvi { ref path } => {
             validate_file_path(path, "fvi")?;
             Ok(Box::new(super::fvi_sink::FviSink::create(
                 path,
                 title,
-                path.to_string_lossy().into_owned(),
-                0,
+                source.cloned().unwrap_or_default(),
             )?))
         }
         // `chapters://` and `json://` write the title metadata at construction and
@@ -2223,6 +2235,7 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::videomap::{Medium, SourceInfo};
     use super::StreamUrl;
     use super::parse_url;
     use super::validate_network_addr;
@@ -2347,10 +2360,132 @@ mod tests {
         }
     }
     fn output_err_kind(url: &str, t: &DiscTitle) -> std::io::ErrorKind {
-        match output(url, t) {
+        match output(url, t, None) {
             Ok(_) => panic!("expected output({url}) to error"),
             Err(e) => e.kind(),
         }
+    }
+
+    // ── fvi:// provenance ─────────────────────────────────────────────────
+
+    /// Tiny unique temp dir helper (avoids a dev-dependency on `tempfile`).
+    fn fvi_tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("fmkv_resolve_fvi_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// A minimal single-video-stream title, enough for `FviSink` to build a
+    /// header row.
+    fn fvi_title() -> DiscTitle {
+        use crate::disc::{
+            Codec, ColorSpace, FrameRate, HdrFormat, Resolution, Stream as DiscStream, VideoStream,
+        };
+        let mut t = DiscTitle::empty();
+        t.streams = vec![DiscStream::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R480i,
+            frame_rate: FrameRate::F29_97,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Smpte170m,
+            display_aspect: Some((16, 9)),
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        })];
+        t.content_format = ContentFormat::MpegPs;
+        t
+    }
+
+    /// Read the header row (line 1) of an FVI file as JSON.
+    fn fvi_header(path: &std::path::Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(text.lines().next().unwrap()).unwrap()
+    }
+
+    /// `fvi://` must record the SOURCE in `source.{path,medium,title}`. It used
+    /// to pass the DESTINATION path as `FviSink::create`'s `source_path` (and
+    /// default the medium/title), so every index claimed to be its own source —
+    /// `docs/FVI_FORMAT.md` §6.2 defines `source` as describing the input.
+    #[test]
+    fn fvi_output_records_the_source_not_the_destination() {
+        let dir = fvi_tempdir();
+        let dst = dir.join("out.fvi");
+        let src = SourceInfo {
+            medium: Medium::Iso,
+            path: "iso://m.iso".into(),
+            title: 1,
+            ..SourceInfo::default()
+        };
+        let mut sink = output(
+            &format!("fvi://{}", dst.display()),
+            &fvi_title(),
+            Some(&src),
+        )
+        .expect("fvi sink");
+        sink.finish().unwrap();
+
+        let hdr = fvi_header(&dst);
+        assert_eq!(hdr["source"]["path"], "iso://m.iso");
+        assert_eq!(hdr["source"]["medium"], "iso");
+        assert_eq!(hdr["source"]["title"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The property the destination-as-source defect broke: two runs indexing
+    /// the SAME source must produce byte-identical output regardless of where
+    /// they write. Previously the header embedded the destination path, so the
+    /// two files differed (and differed in length when the paths differed in
+    /// length) purely from where they landed.
+    #[test]
+    fn fvi_output_is_reproducible_across_destination_paths() {
+        let dir = fvi_tempdir();
+        let src = SourceInfo {
+            medium: Medium::Iso,
+            path: "iso://m.iso".into(),
+            title: 1,
+            ..SourceInfo::default()
+        };
+        // Deliberately different lengths — the parity run's byte-count delta
+        // tracked exactly the destination path-length difference.
+        let a = dir.join("a.fvi");
+        let b = dir.join("a-much-longer-destination-name.fvi");
+        for dst in [&a, &b] {
+            let mut sink = output(
+                &format!("fvi://{}", dst.display()),
+                &fvi_title(),
+                Some(&src),
+            )
+            .unwrap();
+            sink.finish().unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "same source, different destinations must produce identical bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No provenance to declare (`None`) must not fabricate one: the header
+    /// carries the neutral `SourceInfo` defaults — an empty path, `file`,
+    /// title 0 — never the destination it happens to be writing to.
+    #[test]
+    fn fvi_output_without_provenance_emits_no_path() {
+        let dir = fvi_tempdir();
+        let dst = dir.join("bare.fvi");
+        let mut sink = output(&format!("fvi://{}", dst.display()), &fvi_title(), None).unwrap();
+        sink.finish().unwrap();
+
+        let hdr = fvi_header(&dst);
+        assert_eq!(hdr["source"]["path"], "");
+        assert_eq!(hdr["source"]["medium"], "file");
+        assert_eq!(hdr["source"]["title"], 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The resolver doc table marks disc:// as input-only via the

@@ -32,7 +32,7 @@
 //! let opts = libfreemkv::InputOptions::default();
 //! let mut input = libfreemkv::input("iso://disc.iso", &opts)?;
 //! let title = input.info().clone();
-//! let mut output = libfreemkv::output("mkv://Movie.mkv", &title)?;
+//! let mut output = libfreemkv::output("mkv://Movie.mkv", &title, None)?;
 //! // Propagate read errors instead of silently stopping on the first one.
 //! while let Some(frame) = input.read()? {
 //!     output.write(&frame)?;
@@ -260,6 +260,7 @@ pub use mux::NullStream;
 pub use mux::StdioStream;
 pub use mux::WriteSeek;
 pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
+pub use mux::{Medium, SourceInfo};
 pub use mux::{Mp4FitReport, Mp4Sink, Mp4SkipReason, mp4_fit_report};
 
 // ─── Lower-level surfaces ───────────────────────────────────────────────────
