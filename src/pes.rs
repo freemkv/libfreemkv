@@ -257,7 +257,7 @@ pub trait Stream: Send {
 /// Wrap the output with `CountingStream`, then query `bytes_written()`.
 ///
 /// ```text
-/// let mut output = CountingStream::new(libfreemkv::output(dest, &title)?);
+/// let mut output = CountingStream::new(libfreemkv::output(dest, &title, None)?);
 /// while let Ok(Some(frame)) = input.read() {
 ///     output.write(&frame)?;
 ///     let pct = output.bytes_written() as f64 / total as f64;
