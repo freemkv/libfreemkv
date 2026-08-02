@@ -658,7 +658,21 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                 }
             }
 
-            // Drain any buffered final display set of THIS window.
+            // Drain the window's tail: the demuxer holds the last PES open until
+            // the next PUSI arrives, and with a sampled read that PUSI is in a
+            // different window (or nowhere), so without this the last display set
+            // of EVERY window is thrown away — 16 lost observations per extent,
+            // exactly where the sample is thinnest.
+            for pes in demux.flush() {
+                if let (Some(parser), Some(tracker)) =
+                    (parsers.get_mut(&pes.pid), trackers.get_mut(&pes.pid))
+                {
+                    for frame in parser.parse(&pes) {
+                        tracker.observe(&frame.data);
+                    }
+                }
+            }
+            // ...then any display set the PARSER still holds pending.
             for (pid, parser) in parsers.iter_mut() {
                 if let Some(tracker) = trackers.get_mut(pid) {
                     for frame in parser.flush() {
@@ -694,14 +708,31 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                 slot.merge(ev);
             }
             if cacheable {
-                cache.insert(
-                    (ext.start_lba, ext.sector_count, pid),
-                    CachedEvidence {
-                        evidence: ev,
-                        covered,
-                        complete: complete_plan && cut_short.is_none(),
-                    },
-                );
+                let fresh = CachedEvidence {
+                    evidence: ev,
+                    covered,
+                    complete: complete_plan && cut_short.is_none(),
+                };
+                // Never replace a richer memo with a thinner one: an extent
+                // re-read under a smaller share would otherwise DOWNGRADE what is
+                // known about it. Facts merge (they are monotone), and the
+                // coverage claimed is the larger of the two — conservative, since
+                // the two samples together cover at least that much.
+                cache
+                    .entry((ext.start_lba, ext.sector_count, pid))
+                    .and_modify(|prev| {
+                        prev.evidence.observed |= fresh.evidence.observed;
+                        prev.evidence.non_forced |= fresh.evidence.non_forced;
+                        prev.evidence.forced_seen |= fresh.evidence.forced_seen;
+                        // MAX, not sum: the two reads overlap on the same extent,
+                        // so adding them would count the same display sets twice
+                        // and inflate the count the demotion shape test reads.
+                        prev.evidence.displays =
+                            prev.evidence.displays.max(fresh.evidence.displays);
+                        prev.covered = prev.covered.max(fresh.covered);
+                        prev.complete |= fresh.complete;
+                    })
+                    .or_insert(fresh);
             }
         }
         if let Some(reason) = cut_short {
@@ -1057,13 +1088,17 @@ mod tests {
         pkt
     }
 
-    /// Two BD-TS PES on `pid`: the FIRST carries `es` (the observed display set);
-    /// the second (a fresh PUSI) exists only to flush the first PES out of the
-    /// demuxer — the probe never calls `TsDemuxer::flush`, so an open PES stays
-    /// buffered until the next PES start arrives.
+    /// Two BD-TS PES on `pid`, both carrying `es`: an open PES only completes
+    /// when the next PES start arrives, so a lone display set needs a follower.
+    ///
+    /// The follower carries the SAME display set deliberately. It used to be a
+    /// hardcoded NON-forced one, which was invisible only because the probe threw
+    /// the last PES of a run away; now that the run's tail is drained, a
+    /// contradicting filler would smuggle an observation the fixture never meant
+    /// to make.
     fn ts_stream(pid: u16, es: &[u8]) -> Vec<u8> {
         let mut s = bd_pes_packet(pid, 0, es);
-        s.extend_from_slice(&bd_pes_packet(pid, 1, &pcs_display(false)));
+        s.extend_from_slice(&bd_pes_packet(pid, 1, es));
         s
     }
 
@@ -2404,6 +2439,70 @@ mod tests {
         assert!(
             whole.answers(u32::MAX),
             "the extent was read end to end; there is nothing left to cover"
+        );
+    }
+
+    /// A playlist may list the SAME clip twice. The second read must merge into
+    /// the extent's memo, not double it: `displays` feeds the demotion shape
+    /// test, and counting the same display sets twice would inflate a track
+    /// towards being demotable on evidence that was only read once.
+    #[test]
+    fn re_reading_one_extent_merges_its_memo_instead_of_doubling_it() {
+        let pid = 0x1200u16;
+        let ext = Extent {
+            start_lba: 0,
+            sector_count: 1,
+        };
+        // Two display sets: the second PUSI is what completes the first PES.
+        let mut reader = SyntheticClipReader::new(vec![TrackShape {
+            pid,
+            first_sector: 0,
+            period_sectors: 3,
+            count: 2,
+            forced: false,
+        }]);
+        let mut title = pgs_title(pid, false);
+        title.extents = vec![ext, ext];
+        let mut cache = ForcedProbeCache::new();
+        probe_and_set_forced(&mut reader, &mut title, &mut cache, None);
+        let entry = cache
+            .get(&(ext.start_lba, ext.sector_count, pid))
+            .copied()
+            .expect("the extent is memoised");
+        assert_eq!(
+            entry.evidence.displays, 1,
+            "one display set read twice is still one display set"
+        );
+        assert_eq!(
+            entry.covered, ext.sector_count,
+            "coverage is the extent, not twice the extent"
+        );
+    }
+
+    /// The tail of a sampled run must not be discarded. The demuxer holds the
+    /// last PES of a run open waiting for the next PUSI, which — with sampling —
+    /// lies in another window or nowhere at all. Unflushed, that is one lost
+    /// display set per window, worst at exactly the places the sample is
+    /// thinnest.
+    #[test]
+    fn the_last_display_set_of_a_run_is_not_thrown_away() {
+        let pid = 0x1200u16;
+        let mut reader = SyntheticClipReader::new(vec![TrackShape {
+            pid,
+            first_sector: 0,
+            period_sectors: 3,
+            count: 1, // a lone PES: nothing follows to complete it
+            forced: true,
+        }]);
+        let mut title = pgs_title(pid, false);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 6,
+        }];
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+        assert!(
+            forced_flag(&title, pid),
+            "the run's final display set must still be observed"
         );
     }
 }
