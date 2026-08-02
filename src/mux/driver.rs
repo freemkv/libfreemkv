@@ -41,6 +41,24 @@ use crate::session::DiscSession;
 use super::resolve::{
     InputOptions, StreamUrl, build_iso_pipeline, input, output, parse_url, resolve_mux_key_map,
 };
+use super::videomap::{Medium, SourceInfo};
+
+/// The source medium a parsed input URL denotes (`docs/FVI_FORMAT.md` §6.2).
+///
+/// Only used for provenance, so the mapping is by what the bytes physically came
+/// FROM: an optical disc, a disc image, a local container file, or a
+/// non-seekable byte stream. A URL that is not a legal input at all
+/// (`input()` rejects it) never reaches a sink, so its arm is immaterial —
+/// it falls to the `File` default.
+fn url_medium(parsed: &StreamUrl) -> Medium {
+    match parsed {
+        StreamUrl::Disc { .. } => Medium::Disc,
+        StreamUrl::Iso { .. } => Medium::Iso,
+        StreamUrl::Mkv { .. } | StreamUrl::M2ts { .. } | StreamUrl::Mp4 { .. } => Medium::File,
+        StreamUrl::Network { .. } | StreamUrl::Stdio => Medium::Stream,
+        _ => Medium::File,
+    }
+}
 
 /// Effectively-unbounded per-frame send deadline used when a consumer passes
 /// `MuxOptions.send_deadline == None` (the CLI's interactive stdout / network
@@ -299,194 +317,265 @@ pub fn mux_stream(
     // into one (`reader_event_fn`) so the highway's producer thread — and the
     // live `DiscStream`'s read loop — forward `BytesRead`/`SectorSkipped`/
     // `BatchSizeChanged`/`ReadError` back to the consumer's handle.
-    let (stream, playlist_name): (Box<dyn Stream>, Option<String>) = match input_src {
-        // The Url path builds its demux INSIDE `input()`, which prunes to the
-        // selected streams via `InputOptions.selection` (which the caller sets).
-        // Note: `MuxOptions.selection` does NOT apply here — that's the File/
-        // Session arms' field; a Url-source caller must set `InputOptions.selection`.
-        MuxInput::Url { url, opts: in_opts } => (input(url, &in_opts)?, None),
-        MuxInput::Iso {
-            path,
-            title,
-            format,
-            keys,
-            key_fetch,
-        } => {
-            // Prune to the selected audio/subtitle streams BEFORE the highway
-            // builds its demux state from `title.streams` (and before
-            // `build_iso_pipeline`'s `probe_and_remap` may rewrite DVD AC-3
-            // PIDs). Video is always kept; a no-op for the default All/All.
-            let mut title = title;
-            opts.selection
-                .apply(&mut title)
-                .map_err(std::io::Error::from)?;
-            let reader = FileSectorSource::open(path)?;
-            let stream = build_iso_pipeline(
-                reader,
+    //
+    // Each arm also derives the run's PROVENANCE (`SourceInfo`) — the facts a
+    // `fvi://` destination records in its header (`docs/FVI_FORMAT.md` §6.2).
+    // `output()` has no access to the source, so the driver is the only place
+    // that can supply it honestly; a member the arm genuinely cannot reach is
+    // left at its default rather than guessed (the sink omits the empty ones).
+    let (stream, playlist_name, mut source): (Box<dyn Stream>, Option<String>, SourceInfo) =
+        match input_src {
+            // The Url path builds its demux INSIDE `input()`, which prunes to the
+            // selected streams via `InputOptions.selection` (which the caller sets).
+            // Note: `MuxOptions.selection` does NOT apply here — that's the File/
+            // Session arms' field; a Url-source caller must set `InputOptions.selection`.
+            MuxInput::Url { url, opts: in_opts } => {
+                // Provenance: the source URL verbatim, its scheme's medium, and the
+                // title `input()` will open (`None` selects title 0, per its doc).
+                // `playlist` is filled in below from the opened stream's scanned
+                // title — it is not known until the scan runs.
+                let source = SourceInfo {
+                    medium: url_medium(&parse_url(url)),
+                    path: url.to_string(),
+                    title: in_opts.title_index.unwrap_or(0),
+                    ..SourceInfo::default()
+                };
+                let stream = input(url, &in_opts)?;
+                let source = SourceInfo {
+                    playlist: stream.info().playlist.clone(),
+                    ..source
+                };
+                (stream, None, source)
+            }
+            MuxInput::Iso {
+                path,
                 title,
-                keys,
-                opts.batch_sectors,
                 format,
-                opts.raw,
-                Some(halt.clone()),
-                Some(reader_event_fn(events.clone())),
+                keys,
                 key_fetch,
-            )?;
-            (Box::new(stream), None)
-        }
-        MuxInput::Session {
-            session,
-            title_index,
-        } => {
-            // Pull everything we need out of the disc as owned values so the
-            // immutable disc borrow is released before the mutable
-            // `take_reader` below.
-            let (mut title, format, mut keys, playlist) = {
-                let disc = session.disc().ok_or_else(|| Error::DeviceNotReady {
+            } => {
+                // Prune to the selected audio/subtitle streams BEFORE the highway
+                // builds its demux state from `title.streams` (and before
+                // `build_iso_pipeline`'s `probe_and_remap` may rewrite DVD AC-3
+                // PIDs). Video is always kept; a no-op for the default All/All.
+                let mut title = title;
+                opts.selection
+                    .apply(&mut title)
+                    .map_err(std::io::Error::from)?;
+                // Provenance: the staged image, in the same `iso://` URL form the
+                // `Url` arm records, plus the title's playlist. The 0-based TITLE
+                // INDEX is genuinely NOT reachable here — `MuxInput::Iso` carries an
+                // already-scanned `DiscTitle`, which has no index, and the caller's
+                // position in `disc.titles` is not passed. It stays 0 rather than
+                // being guessed; adding it would be an additive field on the public
+                // `MuxInput::Iso` variant.
+                let source = SourceInfo {
+                    medium: Medium::Iso,
+                    path: format!("iso://{}", path.display()),
+                    playlist: title.playlist.clone(),
+                    ..SourceInfo::default()
+                };
+                let reader = FileSectorSource::open(path)?;
+                let stream = build_iso_pipeline(
+                    reader,
+                    title,
+                    keys,
+                    opts.batch_sectors,
+                    format,
+                    opts.raw,
+                    Some(halt.clone()),
+                    Some(reader_event_fn(events.clone())),
+                    key_fetch,
+                )?;
+                (Box::new(stream), None, source)
+            }
+            MuxInput::Session {
+                session,
+                title_index,
+            } => {
+                // Pull everything we need out of the disc as owned values so the
+                // immutable disc borrow is released before the mutable
+                // `take_reader` below.
+                let (mut title, format, mut keys, playlist, source) = {
+                    let disc = session.disc().ok_or_else(|| Error::DeviceNotReady {
+                        path: session.device_path().to_string(),
+                    })?;
+                    let title =
+                        disc.titles
+                            .get(title_index)
+                            .cloned()
+                            .ok_or(Error::MuxTrackRange {
+                                track: title_index,
+                                tracks: disc.titles.len(),
+                            })?;
+                    let playlist = disc
+                        .meta_title
+                        .clone()
+                        .unwrap_or_else(|| disc.volume_id.clone());
+                    // Provenance: every member is reachable on this arm — the device
+                    // the session is bound to, the title index the caller named, the
+                    // title's own playlist, and the scanned volume id.
+                    let source = SourceInfo {
+                        medium: Medium::Disc,
+                        path: format!("disc://{}", session.device_path()),
+                        title: title_index,
+                        playlist: title.playlist.clone(),
+                        volume_id: disc.volume_id.clone(),
+                    };
+                    // DVD CSS is per-VTS: resolve the per-title key via the pipeline
+                    // (see `session_mux_keys`), never the whole-disc `decrypt_keys()`.
+                    (
+                        title,
+                        disc.content_format,
+                        session_mux_keys(disc),
+                        playlist,
+                        source,
+                    )
+                };
+                // Prune to the selected streams before `DiscStream::new` builds its
+                // demux tables from `title.streams` (and before its inline
+                // `probe_and_remap`). Only touches the stream list, so the
+                // ciphertext sampling in `resolve_inline_base_map` (keyed on extents)
+                // is unaffected. No-op for the default All/All.
+                opts.selection
+                    .apply(&mut title)
+                    .map_err(std::io::Error::from)?;
+                // A missing staged reader ("already consumed" / never staged) is a
+                // clean error, not a panic (contract Q2).
+                let mut reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
                     path: session.device_path().to_string(),
                 })?;
-                let title = disc
-                    .titles
-                    .get(title_index)
-                    .cloned()
-                    .ok_or(Error::MuxTrackRange {
-                        track: title_index,
-                        tracks: disc.titles.len(),
-                    })?;
-                let playlist = disc
-                    .meta_title
-                    .clone()
-                    .unwrap_or_else(|| disc.volume_id.clone());
-                // DVD CSS is per-VTS: resolve the per-title key via the pipeline
-                // (see `session_mux_keys`), never the whole-disc `decrypt_keys()`.
-                (title, disc.content_format, session_mux_keys(disc), playlist)
-            };
-            // Prune to the selected streams before `DiscStream::new` builds its
-            // demux tables from `title.streams` (and before its inline
-            // `probe_and_remap`). Only touches the stream list, so the
-            // ciphertext sampling in `resolve_inline_base_map` (keyed on extents)
-            // is unaffected. No-op for the default All/All.
-            opts.selection
-                .apply(&mut title)
-                .map_err(std::io::Error::from)?;
-            // A missing staged reader ("already consumed" / never staged) is a
-            // clean error, not a panic (contract Q2).
-            let mut reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
-                path: session.device_path().to_string(),
-            })?;
-            // Resolve the AACS key map off the STAGED reader BEFORE it is moved
-            // into `DiscStream::new` (borrow to sample, then move to construct).
-            // Without this the AACS `DecryptingSectorSource` inside the stream has
-            // no map and fails `DecryptFailed` on the first content unit — the
-            // single-pass live-mux decrypt bug. `session.key_fetch()` (retained by
-            // `resolve_keys`) recovers a multi-CPS/orphan/forensic unit the pool is
-            // missing. DVD/clear/`raw` resolve to `None` (CSS self-cracks in
-            // `DiscStream::new`; raw is ciphertext passthrough) — unchanged.
-            let base_map = resolve_inline_base_map(
-                &mut *reader,
-                &title,
-                &mut keys,
-                session.key_fetch(),
-                format,
-                opts.raw,
-                Some(halt),
-            )?;
-            let mut stream = crate::mux::DiscStream::new(
-                reader,
-                title,
-                keys,
-                opts.batch_sectors,
-                format,
-                opts.raw,
-                Some(halt.clone()),
-            )?;
-            if opts.raw {
-                stream.set_raw();
-            }
-            if let Some(map) = base_map {
-                stream = stream.with_key_map(map);
-            }
-            stream.skip_errors = opts.skip_errors;
-            // Live path: the `DiscStream` emits the full reader-side vocabulary
-            // (`SectorSkipped` on skip-mode zero-fill, `BatchSizeChanged` on the
-            // adaptive sizer, `BytesRead` progress) — forward them all.
-            stream.on_event(reader_event_fn(events.clone()));
-            (Box::new(stream), Some(playlist))
-        }
-        MuxInput::Live {
-            mut reader,
-            title,
-            format,
-            mut keys,
-            key_map,
-        } => {
-            // Prune to the selected streams, exactly as the Iso and Session arms
-            // do. Without this a caller's audio/subtitle selection was silently
-            // ignored on the live-drive path while the field's own doc said it was
-            // applied. Only touches the stream list, so the extent-keyed ciphertext
-            // sampling in `resolve_inline_base_map` below is unaffected. No-op for
-            // the default All/All.
-            let mut title = title;
-            opts.selection
-                .apply(&mut title)
-                .map_err(std::io::Error::from)?;
-            // The map installed BEFORE reads begin. Two sources:
-            // - A caller-supplied `key_map` (autorip's FMTS gate resolved the
-            //   forensic per-segment map and passes it here) is used VERBATIM —
-            //   never re-resolved.
-            // - `None` on an AACS disc means a plain (non-FMTS) single/multi-CPS
-            //   disc that the caller did NOT map. Resolve the base map here off the
-            //   live reader, exactly as the `Session` arm and `build_iso_pipeline`
-            //   do — otherwise the AACS `DecryptingSectorSource` has no map and
-            //   fails `DecryptFailed` on the first content unit (the single-pass
-            //   live-mux decrypt bug). Borrow to sample, then move into the stream.
-            // DVD/clear/`raw` → `None` (unchanged: CSS self-cracks in
-            // `DiscStream::new`; raw is ciphertext passthrough).
-            let base_map = match key_map {
-                Some(map) => Some(map),
-                None => resolve_inline_base_map(
+                // Resolve the AACS key map off the STAGED reader BEFORE it is moved
+                // into `DiscStream::new` (borrow to sample, then move to construct).
+                // Without this the AACS `DecryptingSectorSource` inside the stream has
+                // no map and fails `DecryptFailed` on the first content unit — the
+                // single-pass live-mux decrypt bug. `session.key_fetch()` (retained by
+                // `resolve_keys`) recovers a multi-CPS/orphan/forensic unit the pool is
+                // missing. DVD/clear/`raw` resolve to `None` (CSS self-cracks in
+                // `DiscStream::new`; raw is ciphertext passthrough) — unchanged.
+                let base_map = resolve_inline_base_map(
                     &mut *reader,
                     &title,
                     &mut keys,
-                    None,
+                    session.key_fetch(),
                     format,
                     opts.raw,
                     Some(halt),
-                )?,
-            };
-            // INLINE `DiscStream` — the same constructor the `Session` arm uses,
-            // NOT `build_iso_pipeline` (the prefetch highway). The consumer's
-            // adaptive batch-retry lives in `DiscStream::fill_extents`, which the
-            // highway would bypass; the live single-pass path must keep it.
-            let mut stream = crate::mux::DiscStream::new(
-                reader,
+                )?;
+                let mut stream = crate::mux::DiscStream::new(
+                    reader,
+                    title,
+                    keys,
+                    opts.batch_sectors,
+                    format,
+                    opts.raw,
+                    Some(halt.clone()),
+                )?;
+                if opts.raw {
+                    stream.set_raw();
+                }
+                if let Some(map) = base_map {
+                    stream = stream.with_key_map(map);
+                }
+                stream.skip_errors = opts.skip_errors;
+                // Live path: the `DiscStream` emits the full reader-side vocabulary
+                // (`SectorSkipped` on skip-mode zero-fill, `BatchSizeChanged` on the
+                // adaptive sizer, `BytesRead` progress) — forward them all.
+                stream.on_event(reader_event_fn(events.clone()));
+                (Box::new(stream), Some(playlist), source)
+            }
+            MuxInput::Live {
+                mut reader,
                 title,
-                keys,
-                opts.batch_sectors,
                 format,
-                opts.raw,
-                Some(halt.clone()),
-            )?;
-            if opts.raw {
-                stream.set_raw();
+                mut keys,
+                key_map,
+            } => {
+                // Prune to the selected streams, exactly as the Iso and Session arms
+                // do. Without this a caller's audio/subtitle selection was silently
+                // ignored on the live-drive path while the field's own doc said it was
+                // applied. Only touches the stream list, so the extent-keyed ciphertext
+                // sampling in `resolve_inline_base_map` below is unaffected. No-op for
+                // the default All/All.
+                let mut title = title;
+                opts.selection
+                    .apply(&mut title)
+                    .map_err(std::io::Error::from)?;
+                // Provenance: the medium is certain (a raw physical `SectorSource`),
+                // and the title's playlist is on hand. The device PATH and the title
+                // INDEX are genuinely NOT reachable: `MuxInput::Live` hands over an
+                // opaque `Box<dyn SectorSource>` with no path accessor and an
+                // already-scanned `DiscTitle` with no index. Both stay empty/0 —
+                // the sink omits an empty path rather than inventing one.
+                let source = SourceInfo {
+                    medium: Medium::Disc,
+                    playlist: title.playlist.clone(),
+                    ..SourceInfo::default()
+                };
+                // The map installed BEFORE reads begin. Two sources:
+                // - A caller-supplied `key_map` (autorip's FMTS gate resolved the
+                //   forensic per-segment map and passes it here) is used VERBATIM —
+                //   never re-resolved.
+                // - `None` on an AACS disc means a plain (non-FMTS) single/multi-CPS
+                //   disc that the caller did NOT map. Resolve the base map here off the
+                //   live reader, exactly as the `Session` arm and `build_iso_pipeline`
+                //   do — otherwise the AACS `DecryptingSectorSource` has no map and
+                //   fails `DecryptFailed` on the first content unit (the single-pass
+                //   live-mux decrypt bug). Borrow to sample, then move into the stream.
+                // DVD/clear/`raw` → `None` (unchanged: CSS self-cracks in
+                // `DiscStream::new`; raw is ciphertext passthrough).
+                let base_map = match key_map {
+                    Some(map) => Some(map),
+                    None => resolve_inline_base_map(
+                        &mut *reader,
+                        &title,
+                        &mut keys,
+                        None,
+                        format,
+                        opts.raw,
+                        Some(halt),
+                    )?,
+                };
+                // INLINE `DiscStream` — the same constructor the `Session` arm uses,
+                // NOT `build_iso_pipeline` (the prefetch highway). The consumer's
+                // adaptive batch-retry lives in `DiscStream::fill_extents`, which the
+                // highway would bypass; the live single-pass path must keep it.
+                let mut stream = crate::mux::DiscStream::new(
+                    reader,
+                    title,
+                    keys,
+                    opts.batch_sectors,
+                    format,
+                    opts.raw,
+                    Some(halt.clone()),
+                )?;
+                if opts.raw {
+                    stream.set_raw();
+                }
+                // Apply the key map BEFORE reads begin — for an FMTS forensic map this
+                // rewrites the extent walk to our-phase units only and installs the map
+                // so each unit decrypts with its mapped key; for a plain single/multi-CPS
+                // base map it installs the per-unit content key. `None` leaves the walk
+                // unchanged (CSS / clear / raw). Single-pass FMTS correctness depends on
+                // this: dropping the forensic map reads the alternate device-group units
+                // and mis-decrypts the forensic segment.
+                if let Some(map) = base_map {
+                    stream = stream.with_key_map(map);
+                }
+                stream.skip_errors = opts.skip_errors;
+                // Same reader-side event vocabulary as the `Session` arm
+                // (`SectorSkipped` / `BatchSizeChanged` / `BytesRead`).
+                stream.on_event(reader_event_fn(events.clone()));
+                (Box::new(stream), None, source)
             }
-            // Apply the key map BEFORE reads begin — for an FMTS forensic map this
-            // rewrites the extent walk to our-phase units only and installs the map
-            // so each unit decrypts with its mapped key; for a plain single/multi-CPS
-            // base map it installs the per-unit content key. `None` leaves the walk
-            // unchanged (CSS / clear / raw). Single-pass FMTS correctness depends on
-            // this: dropping the forensic map reads the alternate device-group units
-            // and mis-decrypts the forensic segment.
-            if let Some(map) = base_map {
-                stream = stream.with_key_map(map);
-            }
-            stream.skip_errors = opts.skip_errors;
-            // Same reader-side event vocabulary as the `Session` arm
-            // (`SectorSkipped` / `BatchSizeChanged` / `BytesRead`).
-            stream.on_event(reader_event_fn(events.clone()));
-            (Box::new(stream), None)
-        }
-    };
+        };
+
+    // The consumer-supplied disc name overrides the title's own playlist for the
+    // muxed title (see `drive_mux`); mirror that into the provenance so a
+    // `fvi://` header and its sibling MKV agree on what the playlist was called.
+    if let Some(name) = playlist_name.as_deref() {
+        source.playlist = name.to_string();
+    }
 
     drive_mux(
         stream,
@@ -495,6 +584,7 @@ pub fn mux_stream(
         events.as_ref(),
         playlist_name.as_deref(),
         effective_send_deadline(opts.send_deadline),
+        Some(&source),
     )
 }
 
@@ -621,6 +711,7 @@ fn drive_mux(
     events: &dyn MuxEvents,
     playlist_name: Option<&str>,
     send_deadline: Duration,
+    source: Option<&SourceInfo>,
 ) -> std::io::Result<MuxOutcome> {
     // Title assembled from the scanned metadata; the playlist name (disc name)
     // overrides `info().playlist` where the consumer supplied one.
@@ -640,7 +731,7 @@ fn drive_mux(
         parse_url(dest_url),
         StreamUrl::Chapters { .. } | StreamUrl::Json { .. }
     ) {
-        let mut sink = CountingStream::new(output(dest_url, &out_title)?);
+        let mut sink = CountingStream::new(output(dest_url, &out_title, source)?);
         events.on_output_opened(&out_title);
         sink.finish()?;
         return Ok(MuxOutcome {
@@ -764,7 +855,7 @@ fn drive_mux(
     let num_streams = info.streams.len();
 
     // ── Open the sink, wrap in a byte counter, hand it to the write pipeline ──
-    let output_stream = CountingStream::new(output(dest_url, &out_title)?);
+    let output_stream = CountingStream::new(output(dest_url, &out_title, source)?);
     events.on_output_opened(&out_title);
 
     // The write consumer runs on its own thread so the latency-bound sink write
@@ -1103,6 +1194,63 @@ mod tests {
         (dir, url)
     }
 
+    /// The driver is the ONLY place that can supply a `fvi://` sink its
+    /// provenance — `output()` never sees the source. Pin that the
+    /// `SourceInfo` handed to `drive_mux` reaches the header verbatim, and
+    /// that the destination path is nowhere in it.
+    #[test]
+    fn drive_mux_threads_provenance_into_the_fvi_header() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dst = dir.path().join("index.fvi");
+        let url = format!("fvi://{}", dst.display());
+        let source = SourceInfo {
+            medium: Medium::Iso,
+            path: "iso://m.iso".into(),
+            title: 1,
+            playlist: "00800.mpls".into(),
+            volume_id: "VOL".into(),
+        };
+        let stream = Box::new(FakeStream::new(1).with_frames(2));
+        let halt = Halt::new();
+        let spy = SpyEvents::new();
+        drive_mux(
+            stream,
+            &url,
+            &halt,
+            &spy,
+            None,
+            Duration::from_secs(60),
+            Some(&source),
+        )
+        .expect("fvi mux runs");
+
+        let text = std::fs::read_to_string(&dst).expect("index written");
+        let hdr: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(hdr["source"]["path"], "iso://m.iso");
+        assert_eq!(hdr["source"]["medium"], "iso");
+        assert_eq!(hdr["source"]["title"], 1);
+        assert_eq!(hdr["source"]["playlist"], "00800.mpls");
+        assert_eq!(hdr["source"]["volume_id"], "VOL");
+        assert!(
+            !text.contains("index.fvi"),
+            "the destination path must never appear in the index it names"
+        );
+    }
+
+    /// The provenance medium follows the SOURCE scheme, not the sink's. A disc
+    /// image is `iso`, a container file is `file`, and a socket / stdio is
+    /// `stream` — the header used to report `file` unconditionally.
+    #[test]
+    fn url_medium_follows_the_source_scheme() {
+        assert_eq!(url_medium(&parse_url("iso://d.iso")), Medium::Iso);
+        assert_eq!(url_medium(&parse_url("disc://")), Medium::Disc);
+        assert_eq!(url_medium(&parse_url("mkv://m.mkv")), Medium::File);
+        assert_eq!(url_medium(&parse_url("m2ts://m.m2ts")), Medium::File);
+        assert_eq!(url_medium(&parse_url("mp4://m.mp4")), Medium::File);
+        assert_eq!(url_medium(&parse_url("network://h:9000")), Medium::Stream);
+        assert_eq!(url_medium(&parse_url("stdio://")), Medium::Stream);
+    }
+
     // ── chapters:// / json:// short-circuit runs even when headers never
     //    resolve (the bug fix). Mutation: moving the header gate before the
     //    short-circuit makes this return Err(MkvInvalid) and the test fails.
@@ -1112,8 +1260,16 @@ mod tests {
         let (_dir, url) = tmp("out.xml");
         let halt = Halt::new();
         let spy = SpyEvents::new();
-        let out = drive_mux(stream, &url, &halt, &spy, None, Duration::from_secs(60))
-            .expect("chapters must short-circuit");
+        let out = drive_mux(
+            stream,
+            &url,
+            &halt,
+            &spy,
+            None,
+            Duration::from_secs(60),
+            None,
+        )
+        .expect("chapters must short-circuit");
         assert!(out.completed, "metadata sink completes without headers");
         assert!(out.output_opened);
         assert!(spy.opened.load(Ordering::SeqCst), "sink was opened");
@@ -1133,6 +1289,7 @@ mod tests {
             &NoopEvents,
             None,
             Duration::from_secs(60),
+            None,
         )
         .expect("json must short-circuit");
         assert!(out.completed);
@@ -1152,6 +1309,7 @@ mod tests {
             &NoopEvents,
             None,
             Duration::from_secs(60),
+            None,
         )
         .expect_err("unresolved headers must be refused");
         // This gate is the GENUINE stub case — the pump ended without any video
@@ -1179,6 +1337,7 @@ mod tests {
             &NoopEvents,
             None,
             Duration::from_secs(60),
+            None,
         )
         .expect_err("empty drain must be refused");
         assert_eq!(err.to_string(), format!("E{}", crate::error::E_NO_STREAMS));
@@ -1201,6 +1360,7 @@ mod tests {
             &NoopEvents,
             None,
             Duration::from_secs(60),
+            None,
         )
         .expect("halt is a clean stop, not an error");
         assert!(!out.completed, "an interrupted mux is not complete");
@@ -1224,6 +1384,7 @@ mod tests {
             &NoopEvents,
             None,
             Duration::from_secs(60),
+            None,
         )
         .expect("a halt mid frame-read is a clean stop, not an Err");
         assert!(!out.completed, "interrupted mux is not complete");
@@ -1247,6 +1408,7 @@ mod tests {
             &NoopEvents,
             None,
             Duration::from_secs(60),
+            None,
         )
         .expect("a halt mid header-read is a clean stop, not an Err");
         assert!(!out.completed, "interrupted mux is not complete");
@@ -1269,6 +1431,7 @@ mod tests {
             &spy,
             None,
             Duration::from_secs(60),
+            None,
         )
         .expect("normal mux completes");
         assert!(out.completed);
@@ -2116,6 +2279,7 @@ mod tests {
             &NoopEvents,
             None,
             Duration::from_secs(60),
+            None,
         )
         .expect_err("over-cap header buffer must fail fast, not OOM");
         // The cap overflow must carry its OWN code, not `MkvInvalid`: an
@@ -2176,6 +2340,7 @@ mod tests {
             &events,
             None,
             Duration::from_secs(60),
+            None,
         )
         .expect("K-frame stream muxes cleanly");
         assert!(out.completed);

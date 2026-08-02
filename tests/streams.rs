@@ -136,7 +136,7 @@ fn open_input_bare_path_errors() {
 #[test]
 fn open_output_bare_path_errors() {
     let dt = sample_disc_title();
-    let result = libfreemkv::output("Movie.mkv", &dt);
+    let result = libfreemkv::output("Movie.mkv", &dt, None);
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
@@ -182,7 +182,7 @@ fn open_output_null_input_errors() {
 #[test]
 fn open_output_disc_errors() {
     let dt = sample_disc_title();
-    let result = libfreemkv::output("disc://", &dt);
+    let result = libfreemkv::output("disc://", &dt, None);
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),

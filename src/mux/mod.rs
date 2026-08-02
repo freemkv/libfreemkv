@@ -14,7 +14,7 @@
 //! ```text
 //! let mut input = input("iso://Disc.iso", &opts)?;
 //! let title = input.info().clone();
-//! let mut output = output("mkv://Movie.mkv", &title)?;
+//! let mut output = output("mkv://Movie.mkv", &title, None)?;
 //! while let Ok(Some(frame)) = input.read() {
 //!     output.write(&frame)?;
 //! }
@@ -115,10 +115,15 @@ pub(crate) mod videomap;
 // `demux://` and `fvi://` sinks are constructed internally by `output()` via the
 // direct `super::demux_sink::` / `super::fvi_sink::` paths — no re-export needed,
 // and no consumer names these types, so they are not public API.
+//
+// The provenance types ARE public: `output()` takes a `SourceInfo` so a `fvi://`
+// destination can record the INPUT it was built from (`docs/FVI_FORMAT.md` §6.2)
+// rather than the file it is writing.
 pub use disc::DiscStream;
 pub use driver::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, mux_stream};
 pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
+pub use videomap::{Medium, SourceInfo};
 // `Mp4Sink` is public (like `MkvStream` / `M2tsStream`) so a caller that drives
 // the sink directly can ask `final_report()` what the finished file actually
 // contains — the pre-mux `mp4_fit_report` plan is a prediction, and two of its

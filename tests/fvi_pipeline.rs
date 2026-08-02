@@ -11,7 +11,7 @@ use libfreemkv::disc::{
     VideoStream,
 };
 use libfreemkv::pes::Stream as PesStream;
-use libfreemkv::{DecryptKeys, SectorSource, build_iso_pipeline, output};
+use libfreemkv::{DecryptKeys, Medium, SectorSource, SourceInfo, build_iso_pipeline, output};
 use std::path::PathBuf;
 
 /// DVD video PES stream_id (0xE0).
@@ -182,8 +182,16 @@ fn run_to_fvi(image: Vec<u8>, title: DiscTitle, path: &std::path::Path) {
     )
     .expect("pipeline builds");
 
+    // Real provenance for the run — the header must describe THIS input, not
+    // the `.fvi` it is writing.
+    let source = SourceInfo {
+        medium: Medium::Iso,
+        path: "iso://two-gop.iso".into(),
+        title: 2,
+        ..SourceInfo::default()
+    };
     let url = format!("fvi://{}", path.display());
-    let mut sink = output(&url, &title).expect("fvi sink opens");
+    let mut sink = output(&url, &title, Some(&source)).expect("fvi sink opens");
 
     while let Some(frame) = input.read().expect("read ok") {
         sink.write(&frame).expect("sink write ok");
@@ -217,8 +225,16 @@ fn fvi_sink_indexes_real_mpeg2_pipeline_output() {
     assert_eq!(stream["colour"]["transfer"], 6);
     assert_eq!(stream["colour"]["matrix"], 6);
     assert_eq!(stream["colour"]["range"], "limited");
-    // Provenance root: medium defaults to "file", sector_size present.
+    // Provenance root describes the INPUT the index was built from — never the
+    // destination `.fvi` (which is what the sink used to record).
     assert_eq!(header["source"]["sector_size"], 2048);
+    assert_eq!(header["source"]["medium"], "iso");
+    assert_eq!(header["source"]["path"], "iso://two-gop.iso");
+    assert_eq!(header["source"]["title"], 2);
+    assert!(
+        !header["source"]["path"].as_str().unwrap().contains(".fvi"),
+        "the destination path must never leak into source.path"
+    );
 
     // ── Records ───────────────────────────────────────────────────────────────
     let records: Vec<serde_json::Value> = lines.map(|l| serde_json::from_str(l).unwrap()).collect();
@@ -324,7 +340,7 @@ fn fvi_sink_indexes_non_mpeg2_frames_codec_agnostically() {
     };
 
     let url = format!("fvi://{}", path.display());
-    let mut sink = output(&url, &title).expect("fvi sink opens");
+    let mut sink = output(&url, &title, None).expect("fvi sink opens");
     // IDR (keyframe) with real provenance — must NOT be null/"?".
     sink.write(&mk(1234, true, Some(SourcePos::at_byte(8192))))
         .unwrap();

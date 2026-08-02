@@ -155,21 +155,13 @@ impl FviSink {
     /// Create the sink at `path`, assembling the header from `title`'s primary
     /// video stream.
     ///
-    /// `source_path` / `source_title` record where the index was built from
-    /// (the input URL path + the 0-based title index); they are carried into the
-    /// header's `source` object. The remaining provenance (medium, playlist,
-    /// volume) takes its `SourceInfo` defaults — no caller needs to override them.
-    pub fn create(
-        path: &Path,
-        title: &DiscTitle,
-        source_path: String,
-        source_title: usize,
-    ) -> io::Result<Self> {
-        let source = SourceInfo {
-            path: source_path,
-            title: source_title,
-            ..SourceInfo::default()
-        };
+    /// `source` records where the index was built FROM — the input medium, URL,
+    /// title index and (when known) playlist / volume id. It is carried verbatim
+    /// into the header's `source` object (`docs/FVI_FORMAT.md` §6.2), which
+    /// describes the INPUT, never `path` (the destination this sink writes).
+    /// A caller with no provenance to declare passes `SourceInfo::default()`;
+    /// the empty members are then omitted from the header rather than guessed.
+    pub fn create(path: &Path, title: &DiscTitle, source: SourceInfo) -> io::Result<Self> {
         let file = File::create(path)?;
 
         let video_track = title
@@ -251,6 +243,7 @@ mod tests {
     };
     use crate::mux::codec::PictureInfo;
     use crate::mux::codec::coding::{CodingType, Mpeg2Coding};
+    use crate::mux::videomap::Medium;
     use crate::pes::SourcePos;
     use std::path::PathBuf;
 
@@ -340,7 +333,7 @@ mod tests {
     fn sink_is_write_only() {
         let dir = tempdir();
         let mut sink =
-            FviSink::create(&dir.join("x.fvi"), &mpeg2_title(), String::new(), 0).unwrap();
+            FviSink::create(&dir.join("x.fvi"), &mpeg2_title(), SourceInfo::default()).unwrap();
         let err = Stream::read(&mut sink).expect_err("read must error");
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         let _ = std::fs::remove_dir_all(&dir);
@@ -350,7 +343,17 @@ mod tests {
     fn sink_writes_header_and_only_video_records() {
         let dir = tempdir();
         let path = dir.join("movie.fvi");
-        let mut sink = FviSink::create(&path, &mpeg2_title(), "iso://m.iso".into(), 1).unwrap();
+        let mut sink = FviSink::create(
+            &path,
+            &mpeg2_title(),
+            SourceInfo {
+                medium: Medium::Iso,
+                path: "iso://m.iso".into(),
+                title: 1,
+                ..SourceInfo::default()
+            },
+        )
+        .unwrap();
         // Video frame on track 0 → indexed. Offset 2148 = sector 1, byte 100
         // within that sector (exercises the within-sector `src.byte`, §9).
         sink.write(&vframe(0, Some(i_pic()), Some(SourcePos::at_byte(2148))))
@@ -371,8 +374,11 @@ mod tests {
         assert_eq!(header["stream"]["scan"], "interlaced"); // 480i
         assert_eq!(header["stream"]["codec"], "mpeg2video");
         assert_eq!(header["timescale"], 1_000_000_000u64);
+        // The provenance is carried through verbatim: the caller's medium, not a
+        // default, and the caller's title index.
         assert_eq!(header["source"]["title"], 1);
-        assert_eq!(header["source"]["medium"], "file"); // default medium
+        assert_eq!(header["source"]["medium"], "iso");
+        assert_eq!(header["source"]["path"], "iso://m.iso");
 
         let rec: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(rec["n"], 0);
@@ -397,7 +403,7 @@ mod tests {
     fn empty_title_still_emits_valid_header() {
         let dir = tempdir();
         let path = dir.join("empty.fvi");
-        let mut sink = FviSink::create(&path, &mpeg2_title(), String::new(), 0).unwrap();
+        let mut sink = FviSink::create(&path, &mpeg2_title(), SourceInfo::default()).unwrap();
         sink.finish().unwrap(); // no frames
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1, "header only");
@@ -411,7 +417,7 @@ mod tests {
         // Output is always JSON Lines regardless of extension (one format today).
         let dir = tempdir();
         let path = dir.join("idx.jsonl");
-        let mut sink = FviSink::create(&path, &mpeg2_title(), String::new(), 0).unwrap();
+        let mut sink = FviSink::create(&path, &mpeg2_title(), SourceInfo::default()).unwrap();
         sink.write(&vframe(0, Some(i_pic()), None)).unwrap();
         sink.finish().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -428,7 +434,16 @@ mod tests {
         // pts populated, and NO mpeg2-only field members.
         let dir = tempdir();
         let path = dir.join("uhd.fvi");
-        let mut sink = FviSink::create(&path, &hevc_title(), "disc://".into(), 0).unwrap();
+        let mut sink = FviSink::create(
+            &path,
+            &hevc_title(),
+            SourceInfo {
+                medium: Medium::Disc,
+                path: "disc://".into(),
+                ..SourceInfo::default()
+            },
+        )
+        .unwrap();
         // HEVC IDR (keyframe) with real provenance.
         sink.write(&vframe_kf(0, None, true, Some(SourcePos::at_byte(12288))))
             .unwrap();
