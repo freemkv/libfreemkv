@@ -335,7 +335,7 @@
   any sink (`mp4:// mkv://`, `mp4:// audio://`, `mp4:// json://`, …). The round-trip
   is frame-exact.
 - **Native MP4 output (`mp4://`)** — a disc goes straight to a play-everywhere
-  `.mp4` in one decrypt pass, no ffmpeg. Carries HEVC / H.264 video (with HDR10) and
+  `.mp4` in one decrypt pass, no external transcoder. Carries HEVC / H.264 video (with HDR10) and
   AC-3, E-AC-3, and DTS / DTS-HD audio, and is faststart by default so it plays over
   HTTP without downloading the end first. It's a **compatibility export, not
   archival**: MP4 can't hold TrueHD, LPCM, or bitmap (PGS / VobSub) subtitles, so
