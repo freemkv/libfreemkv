@@ -24,6 +24,74 @@ const MAX_STREAMS_PER_TYPE: u16 = 512;
 const REGIONS: &[&str] = &[
     "US", "UK", "CF", "PF", "CS", "LS", "BP", "PP", "SM", "TM", "CAN", "DUM", "FLE",
 ];
+/// How many DISTINCT uncatalogued token components one parse will retain for
+/// the end-of-parse report. Disc bytes are untrusted, so the set that backs
+/// the report is capped: a crafted blob carrying thousands of distinct
+/// components must not grow it without bound. Past the cap the components are
+/// still counted (and still logged individually at debug), just not retained
+/// by name — the report says so.
+const MAX_REPORTED_UNKNOWN: usize = 16;
+/// Longest retained form of a single uncatalogued component. Components come
+/// from disc bytes and can be arbitrarily long; truncation is by CHARS, not
+/// bytes, so a multi-byte sequence can never be split (which would panic).
+const MAX_UNKNOWN_LEN: usize = 32;
+
+/// Collects the uncatalogued token components one parse ran into, so the run
+/// can report them ONCE at the end instead of either staying silent or
+/// emitting a line per occurrence.
+///
+/// Why aggregate: an unmapped vendor component is how a forced/SDH/commentary
+/// qualifier goes missing, and a per-occurrence `debug!` is invisible in
+/// practice — the gap only surfaces when a user complains about a mislabelled
+/// track. But a per-occurrence `warn!` is unusable in the other direction: a
+/// disc can carry dozens of per-language segment names that merely COLLIDE
+/// with the `{lang3}_{component}` token shape (localized notice/disclaimer
+/// clip names, for instance), and warning on each would bury real signal under
+/// routine noise. One bounded, deduplicated line per parse is loud enough to
+/// notice and quiet enough to live with.
+#[derive(Debug, Default)]
+struct UnknownParts {
+    /// Distinct components, deduplicated and ordered for a stable log line.
+    /// Bounded by [`MAX_REPORTED_UNKNOWN`].
+    seen: std::collections::BTreeSet<String>,
+    /// Total occurrences, including ones past the retention cap.
+    total: usize,
+}
+
+impl UnknownParts {
+    fn record(&mut self, part: &str) {
+        self.total = self.total.saturating_add(1);
+        if self.seen.len() >= MAX_REPORTED_UNKNOWN {
+            return;
+        }
+        // Char-wise truncation: `part` is uppercased disc text, not
+        // guaranteed ASCII, and slicing by byte offset could split a
+        // multi-byte char and panic.
+        self.seen
+            .insert(part.chars().take(MAX_UNKNOWN_LEN).collect());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// Emit the single end-of-parse report, if this parse hit anything.
+    fn report(&self) {
+        if self.is_empty() {
+            return;
+        }
+        let names: Vec<&str> = self.seen.iter().map(String::as_str).collect();
+        tracing::warn!(
+            components = ?names,
+            distinct = self.seen.len(),
+            occurrences = self.total,
+            truncated = self.seen.len() >= MAX_REPORTED_UNKNOWN,
+            "pixelogic: uncatalogued token components in this disc's label blob; \
+             any editorial meaning they carry (forced / SDH / commentary / dub) \
+             was NOT applied to the affected streams"
+        );
+    }
+}
 
 pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "bluray_project.bin")
@@ -36,22 +104,27 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // shortest meaningful run is 4 chars (lang + underscore).
     let strings = text::extract_ascii_strings(&data, 4);
 
-    // Tracked across all parse_token calls in this run: did any stream
-    // hit an unrecognized token component (skip-unknown path)? If yes
-    // we downgrade confidence to Medium — the labels are still valid
-    // but the corpus surfaced something we don't catalogue. Parsing is
-    // single-threaded and sequential, so a plain bool suffices.
-    let mut saw_unknown = false;
+    // Tracked across all parse_token calls in this run: which uncatalogued
+    // token components did the blob contain? If any, we downgrade confidence
+    // to Medium — the labels are still valid but the disc surfaced something
+    // we don't catalogue — and report them once (see `UnknownParts`). Parsing
+    // is single-threaded and sequential, so a plain owned collector suffices.
+    let mut unknown = UnknownParts::default();
 
-    let labels = assign_labels(&strings, &mut saw_unknown);
+    let labels = assign_labels(&strings, &mut unknown);
+
+    // Reported even when the parse yields nothing: "we recognized the format,
+    // couldn't classify its components, and produced no labels" is precisely
+    // the case worth surfacing.
+    unknown.report();
 
     if labels.is_empty() {
         return None;
     }
-    let confidence = if saw_unknown {
-        Confidence::Medium
-    } else {
+    let confidence = if unknown.is_empty() {
         Confidence::High
+    } else {
+        Confidence::Medium
     };
     Some(ParseResult { labels, confidence })
 }
@@ -60,7 +133,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 /// `StreamLabel` per editorial token, numbered in STN order. Split out
 /// from `parse` so the section/numbering logic is unit-testable without
 /// a `SectorSource`/`UdfFs`.
-fn assign_labels(strings: &[String], saw_unknown: &mut bool) -> Vec<StreamLabel> {
+fn assign_labels(strings: &[String], unknown: &mut UnknownParts) -> Vec<StreamLabel> {
     // The authoritative per-feature stream list lives in the `FPL_`
     // (FeaturePLaylist) section, in STN order. `SEG_*` entries are menu
     // segments (intros, logos, disclaimers, previews) that can also carry
@@ -150,7 +223,7 @@ fn assign_labels(strings: &[String], saw_unknown: &mut bool) -> Vec<StreamLabel>
             continue;
         }
 
-        if let Some(label) = parse_token_inner(s, Some(&mut *saw_unknown)) {
+        if let Some(label) = parse_token_inner(s, Some(&mut *unknown)) {
             domain = label.stream_type;
             match label.stream_type {
                 StreamLabelType::Audio => {
@@ -225,7 +298,7 @@ fn is_stream_token(s: &str) -> bool {
     lang.len() == 3 && lang.chars().all(|c| c.is_ascii_lowercase())
 }
 
-fn parse_token_inner(s: &str, mut saw_unknown: Option<&mut bool>) -> Option<StreamLabel> {
+fn parse_token_inner(s: &str, mut unknown: Option<&mut UnknownParts>) -> Option<StreamLabel> {
     let clean = s.trim().trim_start_matches('\t').trim_end_matches('_');
     let parts: Vec<&str> = clean.split('_').collect();
     if parts.len() < 2 {
@@ -285,6 +358,32 @@ fn parse_token_inner(s: &str, mut saw_unknown: Option<&mut bool>) -> Option<Stre
             // a forced marker as a subtitle signal so the stream survives.
             qualifier = LabelQualifier::Forced;
             is_subtitle = true;
+        } else if part == "DUB" {
+            // `DUB` names the forced-narrative subtitle track authored to
+            // accompany that language's DUBBED audio presentation — the
+            // signs/on-screen-text pass a viewer needs when the dialogue is
+            // already dubbed. Same editorial class as `*_TXT_FOR_`, spelled
+            // differently by some authoring runs.
+            //
+            // Evidence (two independent discs in the corpus): the token
+            // appears only inside the PG list, embedded in an otherwise
+            // contiguous run of `{lang}[_{region}]_TXT_FOR_` siblings — one
+            // forced-narrative slot per localized language — and takes the
+            // slot where that language's forced entry belongs. The stream it
+            // lands on is a sparse PG track (sub-megabyte, a few dozen
+            // display sets), the signature of a forced-narrative pass rather
+            // than a full subtitle track.
+            //
+            // Deliberately NOT added to `vocab::qualifier`: that maps
+            // free-form ENGLISH label text, where a bare word "dub" means
+            // dubbed AUDIO. The forced-subtitle reading is specific to this
+            // vendor's token grammar, so it stays token-local here.
+            //
+            // Like `FOR`, this is a subtitle-domain signal: a token whose
+            // only non-language component is `DUB` must still classify as a
+            // subtitle or the `!is_audio && !is_subtitle` guard drops it.
+            qualifier = LabelQualifier::Forced;
+            is_subtitle = true;
         } else if REGIONS.contains(&part) {
             variant = part.to_string();
         } else if part.starts_with("PGSTREAM") {
@@ -299,8 +398,8 @@ fn parse_token_inner(s: &str, mut saw_unknown: Option<&mut bool>) -> Option<Stre
             // but flag the parse as Medium-confidence so callers know
             // some data was elided.
             tracing::debug!(part = %part, "pixelogic: unrecognized token component, skipping");
-            if let Some(flag) = saw_unknown.as_deref_mut() {
-                *flag = true;
+            if let Some(acc) = unknown.as_deref_mut() {
+                acc.record(part);
             }
         }
     }
@@ -460,7 +559,7 @@ mod tests {
         // `eng_ACOM_` commentary at STN slot 4. The commentary must land on
         // audio #4, not collapse onto #1 (which would tag the main feature
         // track as commentary).
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         let tokens = strs(&[
             "FPL_MainFeature",
             "Audio Stream 1",
@@ -484,13 +583,18 @@ mod tests {
     /// carrying a token whose only non-language component is a REGION
     /// (`fra_CF_`, `spa_LS_`, …) — which `parse_token_inner` rejects because
     /// it signals neither audio nor subtitle. Every one of those still OCCUPIES
-    /// an STN slot, so the seven `*_TXT_FOR_` forced tokens sit at STN 11-16
-    /// and 18. Numbering only the tokens that parse collapsed them onto STN
-    /// 2-8 — the disc's FULL subtitle tracks — so the player offered
-    /// "English (forced)" that renders the whole English dialogue.
+    /// an STN slot, so the run of forced-narrative tokens sits at STN 11-18.
+    /// Numbering only the tokens that parse collapsed them onto STN 2-8 — the
+    /// disc's FULL subtitle tracks — so the player offered "English (forced)"
+    /// that renders the whole English dialogue.
+    ///
+    /// The run is also where the vocabulary half of the same bug shows: the
+    /// slot at STN 17 spells its forced-narrative marker `DUB` rather than
+    /// `TXT_FOR`, and until `DUB` was catalogued that one track alone stayed
+    /// unflagged even once the numbering was right.
     #[test]
     fn assign_labels_numbers_subtitles_by_stn_slot_not_by_parsed_token() {
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         let tokens = strs(&[
             "SEG_MainFeature",
             "Video Stream 1",
@@ -541,8 +645,8 @@ mod tests {
             .collect();
         assert_eq!(
             forced,
-            vec![11, 12, 13, 14, 15, 16, 18],
-            "the forced-narrative tokens sit at PG STN slots 11-16 and 18"
+            vec![11, 12, 13, 14, 15, 16, 17, 18],
+            "every forced-narrative token in the run sits at PG STN slots 11-18"
         );
 
         // The lone audio label is unaffected: `eng_ADES_` is audio STN slot 2.
@@ -560,7 +664,7 @@ mod tests {
         // token, but the real playlist is `FPL_MainFeature`. When an FPL_
         // section exists, the SEG_ one must be ignored as an anchor — so we
         // number from the FPL playlist, putting the commentary at slot 2.
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         let tokens = strs(&[
             "SEG_MainFeature",
             "eng_ACOM_", // stray token in the menu segment — must be ignored
@@ -581,7 +685,7 @@ mod tests {
     #[test]
     fn assign_labels_falls_back_to_seg_without_fpl() {
         // Discs with no FPL_ playlist still anchor on SEG_MainFeature.
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         let tokens = strs(&["SEG_MainFeature", "eng_MLP_", "spa_AC3_"]);
         let labels = assign_labels(&tokens, &mut flag);
         let audio: Vec<_> = labels
@@ -710,29 +814,36 @@ mod tests {
         assert_eq!(l.codec_hint, "Dolby Digital");
     }
 
-    /// Spec: an unknown component sets saw_unknown flag.
-    /// Mutation: remove the flag-setting → Medium confidence never triggered.
+    /// Spec: an unknown component is recorded by name, not merely flagged.
+    /// Mutation: drop the `record` call → Medium confidence never triggered
+    /// and the end-of-parse report never names the gap.
     #[test]
-    fn parse_token_unknown_sets_saw_unknown_flag() {
-        let mut flag = false;
-        let _ = parse_token_inner("eng_MLP_FUTURETOKEN_", Some(&mut flag));
-        assert!(flag, "unknown component must set saw_unknown flag");
+    fn parse_token_unknown_is_recorded_by_name() {
+        let mut acc = UnknownParts::default();
+        let _ = parse_token_inner("eng_MLP_FUTURETOKEN_", Some(&mut acc));
+        assert!(!acc.is_empty(), "unknown component must be recorded");
+        assert!(
+            acc.seen.contains("FUTURETOKEN"),
+            "the report must name the component, got {:?}",
+            acc.seen
+        );
     }
 
-    /// Spec: a known-only token leaves saw_unknown=false.
-    /// Mutation: always set the flag → all parses downgrade to Medium.
+    /// Spec: a known-only token records nothing.
+    /// Mutation: always record → all parses downgrade to Medium and every
+    /// normal disc emits the warn.
     #[test]
-    fn parse_token_all_known_leaves_flag_false() {
-        let mut flag = false;
-        let _ = parse_token_inner("eng_MLP_ACOM_US_", Some(&mut flag));
-        assert!(!flag, "all-known token must NOT set saw_unknown flag");
+    fn parse_token_all_known_records_nothing() {
+        let mut acc = UnknownParts::default();
+        let _ = parse_token_inner("eng_MLP_ACOM_US_", Some(&mut acc));
+        assert!(acc.is_empty(), "all-known token must record nothing");
     }
 
     /// Spec: `Audio Stream N` placeholder advances audio_num but emits no label.
     /// Mutation: also emit a label for placeholder → audio#N+1 shifts to N+2.
     #[test]
     fn assign_labels_audio_placeholder_advances_counter_no_label() {
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         let tokens = strs(&["FPL_MainFeature", "Audio Stream 1", "eng_MLP_"]);
         let labels = assign_labels(&tokens, &mut flag);
         let a: Vec<_> = labels
@@ -747,7 +858,7 @@ mod tests {
     /// Mutation: don't end on SEG_ → tokens from a following segment are parsed.
     #[test]
     fn assign_labels_fpl_section_ends_on_seg_boundary() {
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         let tokens = strs(&[
             "FPL_MainFeature",
             "eng_MLP_",
@@ -763,7 +874,7 @@ mod tests {
     /// Mutation: remove the cap check → counter wraps past 512.
     #[test]
     fn assign_labels_max_streams_cap_prevents_overflow() {
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         // Build 520 Audio Stream placeholders inside FPL, then an editorial token.
         let mut tokens = vec!["FPL_MainFeature".to_string()];
         for i in 1..=520 {
@@ -791,7 +902,7 @@ mod tests {
     /// single token), so the section would never end on `SF_` alone.
     #[test]
     fn assign_labels_fpl_section_ends_on_sf_boundary() {
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         let tokens = strs(&[
             "FPL_MainFeature",
             "eng_MLP_",
@@ -812,7 +923,7 @@ mod tests {
     /// a legitimate subtitle stream that comes after audio saturates.
     #[test]
     fn assign_labels_audio_cap_alone_does_not_stop_subtitle_processing() {
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         let mut tokens = vec!["FPL_MainFeature".to_string()];
         for i in 1..=(MAX_STREAMS_PER_TYPE as usize) {
             tokens.push(format!("Audio Stream {}", i));
@@ -842,7 +953,7 @@ mod tests {
     /// this scenario — dropping the trailing audio token.
     #[test]
     fn assign_labels_subtitle_cap_alone_does_not_stop_audio_processing() {
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         let mut tokens = vec!["FPL_MainFeature".to_string()];
         for _ in 1..=(MAX_STREAMS_PER_TYPE as usize) {
             tokens.push("eng_SDH_".to_string());
@@ -869,7 +980,7 @@ mod tests {
     /// by the number of unlabelled PG slots ahead of it.
     #[test]
     fn assign_labels_pg_placeholder_advances_sub_counter_only() {
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         let tokens = strs(&[
             "FPL_MainFeature",
             "Audio Stream 1",
@@ -896,17 +1007,18 @@ mod tests {
     }
 
     /// Spec: a token-shaped entry the grammar cannot classify (`fra_CF_` —
-    /// REGION only; `jpn_DUB_` — uncatalogued component) still occupies an STN
-    /// slot in the list currently being enumerated.
+    /// REGION only, so it signals neither audio nor subtitle; `jpn_ZZQ_` —
+    /// an uncatalogued component) still occupies an STN slot in the list
+    /// currently being enumerated.
     /// Mutation: skip unclassifiable tokens → later labels shift down.
     #[test]
     fn assign_labels_unclassifiable_token_still_occupies_a_slot() {
-        let mut flag = false;
+        let mut flag = UnknownParts::default();
         let tokens = strs(&[
             "FPL_MainFeature",
             "PG Stream 1", // switches the domain to PG, slot 1
             "fra_CF_",     // region-only: no label, but PG slot 2
-            "jpn_DUB_",    // uncatalogued: no label, but PG slot 3
+            "jpn_ZZQ_",    // uncatalogued: no label, but PG slot 3
             "eng_SDH_",    // PG slot 4
         ]);
         let labels = assign_labels(&tokens, &mut flag);
@@ -916,6 +1028,133 @@ mod tests {
             .map(|l| l.stream_number)
             .collect();
         assert_eq!(subs, vec![4]);
+    }
+
+    /// Spec: `DUB` is a subtitle-domain forced-narrative marker — the same
+    /// editorial class as `TXT_FOR`, spelled differently. A token whose ONLY
+    /// non-language component is `DUB` must survive the
+    /// `!is_audio && !is_subtitle` guard and come back flagged Forced.
+    /// Mutation: drop the `DUB` arm → the token falls through to the unknown
+    /// branch, classifies as neither domain, and the whole stream is dropped
+    /// (no label at all, so no forced flag on a genuine forced track).
+    #[test]
+    fn parse_token_dub_is_a_forced_narrative_subtitle() {
+        let l = parse_token_inner("jpn_DUB_", None).expect("DUB must classify as a subtitle");
+        assert_eq!(l.stream_type, StreamLabelType::Subtitle);
+        assert_eq!(l.language, "jpn");
+        assert_eq!(l.qualifier, LabelQualifier::Forced);
+        assert_eq!(l.purpose, LabelPurpose::Normal);
+        // Case-insensitive like every other component.
+        let l = parse_token_inner("jpn_dub_", None).expect("lowercase DUB must classify too");
+        assert_eq!(l.qualifier, LabelQualifier::Forced);
+    }
+
+    /// Spec: now that `DUB` is catalogued it must NOT be reported as an
+    /// uncatalogued component, so a disc that uses it keeps High confidence
+    /// and emits no warn.
+    /// Mutation: leave `DUB` in the unknown branch → the disc is downgraded to
+    /// Medium and warns on every parse.
+    #[test]
+    fn parse_token_dub_is_not_reported_as_uncatalogued() {
+        let mut acc = UnknownParts::default();
+        let _ = parse_token_inner("jpn_DUB_", Some(&mut acc));
+        assert!(acc.is_empty(), "DUB is catalogued, got {:?}", acc.seen);
+    }
+
+    /// Spec: a `DUB` slot sitting inside a run of `*_TXT_FOR_` siblings — the
+    /// shape both corpus discs show — yields a forced label on ITS OWN slot,
+    /// contiguous with its neighbours.
+    /// Mutation: classify DUB as audio → the PG run gains a hole at that slot
+    /// and the audio list gains a spurious entry.
+    #[test]
+    fn assign_labels_dub_slot_is_forced_in_a_forced_run() {
+        let mut flag = UnknownParts::default();
+        let tokens = strs(&[
+            "FPL_MainFeature",
+            "PG Stream 1",
+            "eng_TXT_FOR_", // PG slot 2
+            "fra_CF_TXT_FOR_",
+            "jpn_DUB_", // PG slot 4 — same class, different spelling
+            "spa_TXT_FOR_",
+        ]);
+        let labels = assign_labels(&tokens, &mut flag);
+        let forced: Vec<_> = labels
+            .iter()
+            .filter(|l| l.qualifier == LabelQualifier::Forced)
+            .map(|l| (l.stream_type, l.stream_number, l.language.as_str()))
+            .collect();
+        assert_eq!(
+            forced,
+            vec![
+                (StreamLabelType::Subtitle, 2, "eng"),
+                (StreamLabelType::Subtitle, 3, "fra"),
+                (StreamLabelType::Subtitle, 4, "jpn"),
+                (StreamLabelType::Subtitle, 5, "spa"),
+            ]
+        );
+        assert!(flag.is_empty(), "no uncatalogued components in this run");
+    }
+
+    /// Spec: `UnknownParts` deduplicates, so a disc carrying the SAME
+    /// uncatalogued component on dozens of entries reports it once. This is
+    /// what keeps the warn usable on discs whose per-language segment names
+    /// collide with the token shape.
+    /// Mutation: use a Vec instead of a set → `distinct` grows with occurrences.
+    #[test]
+    fn unknown_parts_dedups_but_counts_every_occurrence() {
+        let mut acc = UnknownParts::default();
+        for _ in 0..50 {
+            acc.record("ZZQ");
+        }
+        acc.record("QQZ");
+        assert_eq!(acc.seen.len(), 2, "two distinct components");
+        assert_eq!(acc.total, 51, "every occurrence counted");
+    }
+
+    /// Spec: the retained set is bounded — a crafted blob with thousands of
+    /// distinct components must not grow it without bound, and must not panic.
+    /// Mutation: drop the cap check → unbounded memory from disc bytes.
+    #[test]
+    fn unknown_parts_retention_is_bounded() {
+        let mut acc = UnknownParts::default();
+        for i in 0..10_000 {
+            acc.record(&format!("PART{}", i));
+        }
+        assert_eq!(acc.seen.len(), MAX_REPORTED_UNKNOWN);
+        assert_eq!(acc.total, 10_000, "occurrences still counted past the cap");
+    }
+
+    /// Spec: an over-long component is truncated by CHARS, so a multi-byte
+    /// sequence is never split. Byte-offset truncation would panic here.
+    /// Mutation: `part[..MAX_UNKNOWN_LEN].to_string()` → panics mid-char.
+    #[test]
+    fn unknown_parts_truncates_on_char_boundaries() {
+        let mut acc = UnknownParts::default();
+        let long: String = "é".repeat(500); // 2 bytes per char
+        acc.record(&long);
+        let stored = acc.seen.iter().next().expect("recorded");
+        assert_eq!(stored.chars().count(), MAX_UNKNOWN_LEN);
+        // Round-trips as valid UTF-8 — no split code point.
+        assert!(stored.chars().all(|c| c == 'é'));
+    }
+
+    /// Spec: the per-language notice/disclaimer clip names some discs carry
+    /// (`{lang}_ND`, `{lang}_Warning`, …) merely COLLIDE with the token shape.
+    /// They are not stream tokens and carry no editorial meaning, so they must
+    /// stay uncatalogued — mapping them would attach a qualifier to a stream
+    /// on the strength of a filename. What they must do is collapse into ONE
+    /// report rather than one line each.
+    /// Mutation: warn per occurrence → dozens of lines on an ordinary disc.
+    #[test]
+    fn unknown_parts_collapses_a_wall_of_segment_name_collisions() {
+        let mut acc = UnknownParts::default();
+        for lang in ["ara", "bul", "ces", "dan", "deu", "ell"] {
+            let _ = lang;
+            acc.record("ND");
+            acc.record("WARNING");
+        }
+        assert_eq!(acc.seen.len(), 2, "one entry per distinct component");
+        assert_eq!(acc.total, 12);
     }
 
     /// Spec: `is_stream_token` accepts exactly what `parse_token_inner`'s own
