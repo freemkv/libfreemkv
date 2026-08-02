@@ -126,8 +126,9 @@ impl Scan {
 
 /// Source `medium` for the header `source.medium` member
 /// (`docs/FVI_FORMAT.md` §6.2). Describes the physical/logical input the index
-/// was built from. The bare resolver path has no input-URL context, so it
-/// defaults to [`Medium::File`]; the CLI follow-up passes the real medium.
+/// was built from — never the destination the index is written to. The driver
+/// derives it from the `MuxInput` arm; [`Medium::File`] is the default only for
+/// a caller that declares no provenance at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Medium {
     Disc,
