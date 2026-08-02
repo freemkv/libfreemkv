@@ -130,13 +130,18 @@ pub const DEMOTE_MIN_DISPLAY_SHARE_DIVISOR: u32 = 4;
 /// track, and demoting on it would strip a correct forced label from every
 /// track on the disc.
 ///
-/// So the rule is:
-///   * a track that itself mixes forced and non-forced sets is self-evidently
-///     not a forced-only track — demote, no further evidence needed; otherwise
-///   * some OTHER track must demonstrably use the flag (`disc_uses_forced_flag`),
-///     proving the authoring house sets it, AND this track must have the SHAPE of
-///     a full track ([`DEMOTE_MIN_DISPLAY_SETS`] and
-///     [`DEMOTE_MIN_DISPLAY_SHARE_DIVISOR`]) rather than of a forced-narrative one.
+/// So the rule is, in order:
+///   * something must have been observed at all;
+///   * the flag must be IN USE — on some other track (`disc_uses_forced_flag`) or
+///     on this very track, which is the stronger form: a track carrying the flag
+///     on some of its sets and not others shows the authoring house making that
+///     distinction deliberately;
+///   * and the track must have the SHAPE of a full dialogue track
+///     ([`DEMOTE_MIN_DISPLAY_SETS`] and [`DEMOTE_MIN_DISPLAY_SHARE_DIVISOR`])
+///     rather than of a forced-narrative one. This applies to the mixed case too:
+///     a SMALL track with a couple of flagged sets is a forced track whose
+///     authoring flagged some of its signs, and demoting it would be exactly the
+///     mistake the shape test exists to prevent.
 ///
 /// `busiest_displays` is the largest `displays` over every subtitle track judged
 /// together (the same title's tracks for the probe, the same file's tracks for
@@ -145,12 +150,8 @@ pub fn demotable(facts: ForcedFacts, disc_uses_forced_flag: bool, busiest_displa
     if facts.displays == 0 {
         return false;
     }
-    // Mixed: forced sets AND non-forced sets on the same track. The flag is in
-    // use right here, so its absence on the other sets is real evidence.
-    if facts.forced_displays > 0 && facts.forced_displays < facts.displays {
-        return true;
-    }
-    if !disc_uses_forced_flag || facts.displays < DEMOTE_MIN_DISPLAY_SETS {
+    let flag_in_use = disc_uses_forced_flag || facts.forced_displays > 0;
+    if !flag_in_use || facts.displays < DEMOTE_MIN_DISPLAY_SETS {
         return false;
     }
     // `displays >= busiest / DIVISOR`, multiplied out (u64: `displays` is a
@@ -835,11 +836,24 @@ mod tests {
     }
 
     /// A track that itself mixes forced and non-forced display sets needs no
-    /// corroboration: the flag is demonstrably in use ON THIS TRACK, so it is a
-    /// full track carrying occasional forced signs — not a forced-only track.
+    /// corroboration from a sibling: the flag is demonstrably in use ON THIS
+    /// TRACK. Measured shape this models: a busy track labelled forced that
+    /// flags one or two of its hundred-odd display sets.
     #[test]
-    fn a_mixed_track_is_demotable_on_its_own_evidence() {
-        assert!(demotable(facts(4, 1), false, 4));
+    fn a_mixed_track_corroborates_the_flag_itself() {
+        assert!(demotable(facts(108, 2), false, 137));
+    }
+
+    /// ...but the shape test still applies to it. A SMALL track with a couple of
+    /// flagged sets is a forced track whose authoring flagged some of its signs —
+    /// demoting that is the exact mistake the shape test exists to prevent.
+    #[test]
+    fn a_small_mixed_track_is_not_demotable_against_a_busy_disc() {
+        assert!(!demotable(facts(30, 1), true, 2_000));
+        assert!(
+            !demotable(facts(4, 1), true, 4),
+            "and too few sets to say anything either way"
+        );
     }
 
     /// With the flag in use elsewhere on the disc, the shape decides. Measured:
