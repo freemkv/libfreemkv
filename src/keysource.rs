@@ -381,6 +381,14 @@ pub fn resolve_and_apply_traced(
 
     let mut trace = crate::aacs::trace::ResolutionTrace::new();
 
+    // The FIRST source failure seen, if any. A source that returns `Err` did not
+    // answer "no key for this disc" — it could not answer at all — and that
+    // reason is stamped onto `disc.aacs_error` below so the decrypt gate reports
+    // THAT instead of the generic `NoDiscKey`. First-wins (not last) so the
+    // ordered sources' most-preferred failure is the one the operator is told
+    // about, matching the first-valid-wins rule for successes.
+    let mut source_failure: Option<crate::error::Error> = None;
+
     // The ctx parses Unit_Key_RO.inf at the stride for `inputs.version` (the
     // disc's own AACS major), so the stride is the disc's single source of truth.
     let ctx = DiscInputsCtx::new(inputs);
@@ -413,46 +421,55 @@ pub fn resolve_and_apply_traced(
                     outcome: KeyOutcome::NoKey,
                 });
             }
-            // Empty (no key here) or a source failure — both are "no key from
-            // this source"; move on to the next.
-            //
-            // NOTE: the `Err` half is currently UNREACHABLE in production, and the
-            // conflation below is therefore latent rather than live. Every shipped
-            // `KeySource` swallows its own failures into `Ok(Vec::new())`:
-            // `KeydbSource::get_unit_keys` maps a load/parse error to an empty vec,
-            // `OnlineSource::get_unit_keys` is `Ok(self.query(ctx))` where `query`
-            // returns empty on transport error, HTTP status, oversize body and bad
-            // JSON alike, and `MultiSource` discards inner `Err`s. Only test doubles
-            // return `Err`.
-            //
-            // Consequence: an unreachable key server arrives here as "no entry",
-            // and an operator is told their disc is not in the database. autorip
-            // works around it by re-probing the service over HTTP
-            // (`probe_online_reachability` / `key_service_transient_status`), whose
-            // own comment names the incident — "the online keysource swallows every
-            // failure (transport error, 502, timeout)".
-            //
-            // Fixing it HERE would change nothing: the fix belongs at the source
-            // boundary in `freemkv-keysources`, so a failure is reported as a
-            // failure, with `Disc::aacs_error` as the channel the operator actually
-            // reads. `FetchOutcome::errored` in `drive_unit_keys` /
-            // `drive_fmts_indexes` never FIRES for the same reason — it is the
-            // right contract, honoured by no shipped source yet. It is NOT dead
-            // code: it is written at both `drive_*` sites and read by the
-            // cache-insert guard `if !keys.is_empty() || !outcome.errored`, the
-            // only thing that stops a transient source outage from being memoised
-            // permanently into the per-fingerprint key cache — pinned by
-            // `errored_empty_is_not_cached_and_retries_when_source_recovers`. Do
-            // not delete it while making a source report failures as `Err`; that
-            // is precisely when it starts to matter.
-            Ok(_) | Err(_) => {
+            // The source ANSWERED and holds nothing for this disc. This — and
+            // only this — is `NoEntry`: the claim "I looked, it is not there".
+            Ok(_) => {
                 trace.keys.push(KeyStep {
                     who,
                     path: vec![KeyNode::NoEntry],
                     outcome: KeyOutcome::NoKey,
                 });
             }
+            // The source could NOT answer — it was unreachable, it errored, or it
+            // refused. Nothing is known about whether a key exists, so the path
+            // is EMPTY: recording `NoEntry` here is exactly the conflation that
+            // made a seven-hour run of HTTP 502s render as
+            // `key: online > no entry > NO KEY` + `E7022 No key source has a
+            // decryption key for this disc`, and sent operators hunting for a VUK
+            // that was never missing.
+            //
+            // The reason itself rides out on `disc.aacs_error` (below), the
+            // channel `Disc::ensure_decryptable_keys` already reads for the
+            // E7017-vs-E7022 split — so the decrypt gate raises the SOURCE's code
+            // (`KeyServiceUnavailable` / `KeyServiceUnauthorized` /
+            // `KeyServiceRateLimited`) instead of the generic `NoDiscKey`.
+            //
+            // `KeyOutcome` deliberately gains no variant: it is matched
+            // exhaustively by every front-end's trace renderer (freemkv's
+            // `pipe::render_resolution_trace`, autorip's
+            // `keysource::render_resolution_trace`), and this fix must not turn
+            // into a breaking change across four repos to say something the error
+            // code already says precisely.
+            Err(e) => {
+                if source_failure.is_none() {
+                    source_failure = Some(e);
+                }
+                trace.keys.push(KeyStep {
+                    who,
+                    path: Vec::new(),
+                    outcome: KeyOutcome::NoKey,
+                });
+            }
         }
+    }
+    // Nothing resolved. If a source FAILED rather than answered, stamp that
+    // reason onto the disc so the decrypt gate can report it — but never clobber
+    // a reason the scan already captured (e.g. `AacsVidUnavailable`), which is
+    // closer to the disc itself than a source outage is.
+    if let Some(e) = source_failure
+        && disc.aacs_error.is_none()
+    {
+        disc.aacs_error = Some(e);
     }
     (false, trace)
 }
