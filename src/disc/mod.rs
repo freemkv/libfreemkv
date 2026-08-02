@@ -2720,10 +2720,28 @@ impl Disc {
                 // material (device / processing keys) but no Volume ID to derive
                 // the unit key, the captured `aacs_error` is `AacsVidUnavailable`
                 // — report THAT (the fix is recovering the VID, not adding keys),
-                // not the generic `NoDiscKey`. Any other (or absent) reason →
-                // `NoDiscKey` naming the disc by hash, unchanged.
-                if matches!(self.aacs_error, Some(Error::AacsVidUnavailable)) {
-                    return Err(Error::AacsVidUnavailable);
+                // not the generic `NoDiscKey`. Any reason NOT listed below (or an
+                // absent one) → `NoDiscKey` naming the disc by hash, unchanged.
+                //
+                // Same split, second axis: when a key SOURCE could not answer
+                // (unreachable / 5xx / bad token / rate-limited) resolution
+                // stamps that reason here, and it must surface as ITSELF.
+                // `NoDiscKey` asserts every source answered and none holds a key
+                // — the opposite of what happened — and reporting a seven-hour
+                // 502 outage that way sent operators looking for a VUK when the
+                // right action was to wait.
+                match self.aacs_error {
+                    Some(Error::AacsVidUnavailable) => return Err(Error::AacsVidUnavailable),
+                    Some(Error::KeyServiceUnavailable) => {
+                        return Err(Error::KeyServiceUnavailable);
+                    }
+                    Some(Error::KeyServiceUnauthorized) => {
+                        return Err(Error::KeyServiceUnauthorized);
+                    }
+                    Some(Error::KeyServiceRateLimited) => {
+                        return Err(Error::KeyServiceRateLimited);
+                    }
+                    _ => {}
                 }
                 return Err(Error::NoDiscKey {
                     disc_hash: self.aacs_disc_hash(),
@@ -4697,6 +4715,140 @@ mod tests {
             .code(),
             "no-material must keep E7022 (NoDiscKey)"
         );
+    }
+
+    /// THE defect: a key SOURCE that could not answer must not be reported as
+    /// "this disc has no key".
+    ///
+    /// Drives the real chain end to end — `KeySource` → `resolve_and_apply_traced`
+    /// → `Disc::aacs_error` → `ensure_decryptable` — twice over the SAME disc, and
+    /// asserts the two operator-visible verdicts differ:
+    ///
+    /// * source returns `Err(KeyServiceUnavailable)` (the HTTP-502 outage) → E7028
+    ///   "the key service could not answer; retry later",
+    /// * source returns `Ok(vec![])` (the service answered, no entry) → E7022
+    ///   "no key source has a decryption key for this disc".
+    ///
+    /// Before the fix both arms produced E7022, which is what sent an operator
+    /// hunting for a VUK through seven hours of 502s. The credential and
+    /// rate-limit verdicts are asserted alongside, since each is a different
+    /// operator action (fix the token / back off).
+    #[test]
+    fn key_source_failure_is_not_reported_as_a_missing_disc_key() {
+        use crate::keysource::{KeySource, ResolveCtx, resolve_and_apply_traced};
+
+        /// A source that fails the way a down / hostile key service fails.
+        struct FailingSource(fn() -> crate::error::Error);
+        impl KeySource for FailingSource {
+            fn get_unit_keys(
+                &self,
+                _ctx: &dyn ResolveCtx,
+            ) -> std::result::Result<Vec<crate::aacs::types::UnitKey>, crate::error::Error>
+            {
+                Err((self.0)())
+            }
+            fn label(&self) -> &'static str {
+                "online"
+            }
+        }
+        /// A source that ANSWERS and holds nothing — the genuine miss.
+        struct AnsweredNoEntry;
+        impl KeySource for AnsweredNoEntry {
+            fn get_unit_keys(
+                &self,
+                _ctx: &dyn ResolveCtx,
+            ) -> std::result::Result<Vec<crate::aacs::types::UnitKey>, crate::error::Error>
+            {
+                Ok(Vec::new())
+            }
+            fn label(&self) -> &'static str {
+                "online"
+            }
+        }
+
+        let inputs = crate::keysource::DiscInputs {
+            disc_hash: "0x422EB".into(),
+            volume_id: [0u8; 16],
+            version: crate::aacs::mkb::AACS_MAJOR_UHD,
+            mkb: Vec::new(),
+            unit_key_ro: Vec::new(),
+            samples: Vec::new(),
+            volume_label: None,
+        };
+        let encrypted_aacs_disc = || {
+            let mut d = make_test_disc(1000, "UHD");
+            d.encrypted = true;
+            d.aacs = Some(aacs_with(Vec::new())); // AACS state, no unit keys
+            d
+        };
+
+        // The genuine miss — the service answered, nothing for this disc.
+        let mut answered = encrypted_aacs_disc();
+        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(AnsweredNoEntry)];
+        let (ok, trace) = resolve_and_apply_traced(&sources, &inputs, &mut answered);
+        assert!(!ok);
+        assert_eq!(
+            trace.keys[0].path,
+            vec![crate::aacs::trace::KeyNode::NoEntry],
+            "a source that ANSWERED and holds nothing is the one true `NoEntry`"
+        );
+        assert!(
+            answered.aacs_error.is_none(),
+            "a genuine miss stamps no failure reason on the disc"
+        );
+        let miss_code = answered
+            .ensure_decryptable(false)
+            .expect_err("no key, !raw must error")
+            .code();
+        assert_eq!(
+            miss_code,
+            crate::error::Error::NoDiscKey {
+                disc_hash: String::new()
+            }
+            .code(),
+            "a genuine miss keeps E7022 — that wording is correct for it"
+        );
+
+        // Each way the service can FAIL to answer, and the code it must produce.
+        type MakeError = fn() -> crate::error::Error;
+        let failures: &[(MakeError, u16)] = &[
+            (
+                || crate::error::Error::KeyServiceUnavailable,
+                crate::error::E_KEY_SERVICE_UNAVAILABLE,
+            ),
+            (
+                || crate::error::Error::KeyServiceUnauthorized,
+                crate::error::E_KEY_SERVICE_UNAUTHORIZED,
+            ),
+            (
+                || crate::error::Error::KeyServiceRateLimited,
+                crate::error::E_KEY_SERVICE_RATE_LIMITED,
+            ),
+        ];
+        for (make, want) in failures {
+            let mut down = encrypted_aacs_disc();
+            let sources: Vec<Box<dyn KeySource>> = vec![Box::new(FailingSource(*make))];
+            let (ok, trace) = resolve_and_apply_traced(&sources, &inputs, &mut down);
+            assert!(!ok);
+            assert!(
+                trace.keys[0].path.is_empty(),
+                "a source that could not ANSWER must not claim `no entry` in the trace"
+            );
+            assert_eq!(
+                down.aacs_error.as_ref().map(crate::error::Error::code),
+                Some(*want),
+                "the source's failure reason must reach the disc"
+            );
+            let code = down
+                .ensure_decryptable(false)
+                .expect_err("no key, !raw must error")
+                .code();
+            assert_eq!(code, *want, "the gate must surface the SOURCE's code");
+            assert_ne!(
+                code, miss_code,
+                "a source that could not answer must NOT render as \"this disc has no key\""
+            );
+        }
     }
 
     /// Same AACS-no-key disc under `--raw` (raw=true) must PROCEED — the user
