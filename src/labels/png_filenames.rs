@@ -50,6 +50,7 @@ fn labels_from_filenames(names: &[String]) -> Vec<StreamLabel> {
     seen.into_iter()
         .enumerate()
         .map(|(i, code)| StreamLabel {
+            stream_id: None,
             stream_number: (i as u16).saturating_add(1),
             stream_type: StreamLabelType::Audio,
             language: code.to_string(),
