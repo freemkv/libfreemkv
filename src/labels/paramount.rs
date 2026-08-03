@@ -3,6 +3,13 @@
 //! Richest structured format. Complete language lists with forced flags
 //! and commentary indices per playlist, all in XML attributes.
 //!
+//! NOT A SPECIFICATION. `/BDMV/JAR/` is application-defined space, so this
+//! file is one authoring house's internal metadata that happens to ship on
+//! the pressing. There is nothing to look up: every field meaning here was
+//! derived by measuring real discs and cross-checking against per-display-set
+//! content. Treat an unfamiliar value as unknown rather than guessing — the
+//! disc's own `forced_on_flag` is the only authoritative forced signal.
+//!
 //! ```xml
 //! <playlist name="Feature" id="00222"
 //!   aud="eng,deu,spa,spa,fra"
@@ -35,8 +42,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     if labels.is_empty() {
         return None;
     }
-    // High confidence: paramount's playlists.xml is fully structured
-    // and we extract every documented field.
+    // High confidence: this format is fully structured and we extract
+    // every field whose meaning the corpus establishes. "Documented" would
+    // be the wrong word — see the module note; nothing about it is.
     Some(ParseResult::high(labels))
 }
 
