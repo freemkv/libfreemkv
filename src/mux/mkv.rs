@@ -741,7 +741,8 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// display set carried the HDMV `forced_on_flag` (a dedicated forced/narrative
     /// track). At `finish()` the reserved byte is promoted to 1 for such tracks —
     /// so forced subs are flagged even on discs without vendor label metadata.
-    /// Only ever promotes (0→1); a scan/vendor forced flag is never demoted.
+    /// A vendor forced flag is cleared only under the cross-track guard in
+    /// `finish()` (see `super::codec::pgs::demotable`).
     pgs_forced_fixups: std::collections::HashMap<usize, PgsForcedFixup>,
     /// `--log-level 3` opening-frame capture: the first ~100 coded frames per
     /// track are written (raw) to a `<output>.opening.bin` side file with a
@@ -767,6 +768,10 @@ struct Ac3ChannelFixup {
 struct PgsForcedFixup {
     /// Absolute file offset of the 1-byte `FlagForced` value in the Tracks element.
     value_offset: u64,
+    /// The value written up-front — the scan/vendor-label flag. Kept so
+    /// `finish()` can tell a promotion from a demotion and rewrite only the byte
+    /// that actually changes.
+    initial_forced: bool,
     /// Shared forced-narrative classifier fed the track's display sets. The same
     /// type drives the `info`-time forced probe, so both classify identically.
     tracker: super::codec::pgs::ForcedTracker,
@@ -1045,6 +1050,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     i,
                     PgsForcedFixup {
                         value_offset,
+                        initial_forced: track.is_forced,
                         tracker: super::codec::pgs::ForcedTracker::new(),
                     },
                 );
@@ -1686,22 +1692,64 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // Close final cluster
         self.end_cluster()?;
 
-        // Promote FlagForced for PGS subtitle tracks that proved to be forced
-        // narrative (displayed subtitles, every one forced). In-place single-byte
-        // rewrite of the reserved value, then restore the append position for the
-        // Cues that follow. Only promotes (0→1); a track already forced from the
-        // scan/vendor flag stays forced.
-        let forced_offsets: Vec<u64> = self
+        // Correct FlagForced for PGS subtitle tracks from what the mux actually
+        // saw. In-place single-byte rewrite of the reserved value, then restore
+        // the append position for the Cues that follow.
+        //
+        // PROMOTE (0→1) a track that proved to be forced narrative: it displayed
+        // subtitles and every one carried `forced_on_flag`. Positive evidence,
+        // no further justification needed.
+        //
+        // DEMOTE (1→0) a track whose vendor label claims forced but whose content
+        // contradicts it — the case a whole-file mux is uniquely entitled to
+        // judge, because unlike the scan-time probe it has seen EVERY display set
+        // on the track. Gated by
+        // [`super::codec::pgs::demotable`]: an absence of `forced_on_flag` proves
+        // nothing on a disc whose authoring never sets it, so the gate demands
+        // that some track here demonstrably does, and that this track have the
+        // shape of a full dialogue track rather than of a forced-narrative one.
+        let disc_uses_forced_flag = self
             .pgs_forced_fixups
             .values()
-            .filter(|f| f.tracker.is_forced())
-            .map(|f| f.value_offset)
+            .any(|f| f.tracker.facts().forced_displays > 0);
+        let busiest = self
+            .pgs_forced_fixups
+            .values()
+            .map(|f| f.tracker.facts().displays)
+            .max()
+            .unwrap_or(0);
+        let rewrites: Vec<(u64, u8)> = self
+            .pgs_forced_fixups
+            .values()
+            .filter_map(|f| {
+                if f.tracker.is_forced() && !f.initial_forced {
+                    return Some((f.value_offset, 1u8));
+                }
+                if f.initial_forced
+                    && !f.tracker.is_forced()
+                    && super::codec::pgs::demotable(
+                        f.tracker.facts(),
+                        disc_uses_forced_flag,
+                        busiest,
+                    )
+                {
+                    tracing::info!(
+                        target: "mux",
+                        displays = f.tracker.facts().displays,
+                        forced_displays = f.tracker.facts().forced_displays,
+                        busiest,
+                        "PGS track labelled forced showed no forced display sets on a disc that uses the flag; clearing FlagForced"
+                    );
+                    return Some((f.value_offset, 0u8));
+                }
+                None
+            })
             .collect();
-        if !forced_offsets.is_empty() {
+        if !rewrites.is_empty() {
             let here = self.writer.stream_position()?;
-            for off in forced_offsets {
+            for (off, value) in rewrites {
                 self.writer.seek(std::io::SeekFrom::Start(off))?;
-                self.writer.write_all(&[1u8])?;
+                self.writer.write_all(&[value])?;
             }
             self.writer.seek(std::io::SeekFrom::Start(here))?;
         }
@@ -3208,6 +3256,132 @@ mod tests {
         pcs[13] = 1; // number_of_composition_objects
         pcs[17] = if forced { 0x40 } else { 0x00 }; // first object flags
         pcs
+    }
+
+    /// Every `FlagForced` value byte in the file, in track order — the two-PGS-track
+    /// tests need per-track values, not just the first.
+    fn all_flag_forced_values(data: &[u8]) -> Vec<u8> {
+        let needle = ebml::FLAG_FORCED.to_be_bytes();
+        let needle = &needle[2..]; // FlagForced is a 2-byte EBML ID
+        data.windows(needle.len())
+            .enumerate()
+            .filter(|(_, w)| *w == needle)
+            .filter_map(|(i, _)| data.get(i + 3).copied())
+            .collect()
+    }
+
+    /// A PGS subtitle track carrying the vendor/scan forced flag `forced`.
+    fn pgs_subtitle_track(pid: u16, forced: bool) -> MkvTrack {
+        MkvTrack::subtitle(&crate::disc::SubtitleStream {
+            pid,
+            codec: Codec::Pgs,
+            language: "eng".into(),
+            forced,
+            qualifier: crate::disc::LabelQualifier::None,
+            codec_data: None,
+        })
+    }
+
+    /// A wrong vendor forced label is CLEARED by the content — but only where the
+    /// content can carry that argument. During a full mux every display set on the
+    /// track is seen, so "this track has hundreds of display sets and not one of
+    /// them is forced" is as complete as evidence gets; and a sibling track that
+    /// does carry `forced_on_flag` proves the authoring house sets it, so the
+    /// absence on this track means something.
+    ///
+    /// Before this, `finish()` only ever promoted 0→1, so a track wrongly labelled
+    /// forced stayed forced in the output no matter what the disc contained.
+    #[test]
+    fn mkv_pgs_wrong_forced_label_is_cleared_when_a_sibling_uses_the_flag() {
+        use std::sync::{Arc, Mutex};
+
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let tracks = [
+            make_video_track(),
+            pgs_subtitle_track(0x1200, true), // mislabelled full track
+            pgs_subtitle_track(0x1201, false), // genuine forced track
+        ];
+        let mut muxer =
+            MkvMuxer::new(SharedWriter(shared.clone()), &tracks, None, 60.0, &[]).unwrap();
+        muxer
+            .write_frame(0, 0, true, &[0u8; 16], Some(40_000_000), None)
+            .unwrap();
+        for i in 0..12 {
+            muxer
+                .write_frame(
+                    1,
+                    1_000_000 * (i + 1),
+                    true,
+                    &pgs_display_set(false),
+                    Some(2_000_000),
+                    None,
+                )
+                .unwrap();
+        }
+        for i in 0..3 {
+            muxer
+                .write_frame(
+                    2,
+                    1_000_000 * (i + 1),
+                    true,
+                    &pgs_display_set(true),
+                    Some(2_000_000),
+                    None,
+                )
+                .unwrap();
+        }
+        muxer.finish().unwrap();
+
+        let data = shared.lock().unwrap().clone().into_inner();
+        assert_eq!(
+            all_flag_forced_values(&data),
+            vec![0, 1],
+            "the mislabelled track loses FlagForced; the genuinely forced one keeps it"
+        );
+    }
+
+    /// ...and the guard that stops that from being reckless. On a disc whose
+    /// authoring never sets `forced_on_flag` — they exist — no track has any
+    /// forced display set, so "no forced display set here" is a fact about the
+    /// authoring, not about the track. The vendor label is then the only
+    /// information there is and must survive.
+    #[test]
+    fn mkv_pgs_forced_label_survives_a_disc_that_never_sets_the_flag() {
+        use std::sync::{Arc, Mutex};
+
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let tracks = [
+            make_video_track(),
+            pgs_subtitle_track(0x1200, true),
+            pgs_subtitle_track(0x1201, false),
+        ];
+        let mut muxer =
+            MkvMuxer::new(SharedWriter(shared.clone()), &tracks, None, 60.0, &[]).unwrap();
+        muxer
+            .write_frame(0, 0, true, &[0u8; 16], Some(40_000_000), None)
+            .unwrap();
+        for track in 1..=2 {
+            for i in 0..12 {
+                muxer
+                    .write_frame(
+                        track,
+                        1_000_000 * (i + 1),
+                        true,
+                        &pgs_display_set(false),
+                        Some(2_000_000),
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+        muxer.finish().unwrap();
+
+        let data = shared.lock().unwrap().clone().into_inner();
+        assert_eq!(
+            all_flag_forced_values(&data),
+            vec![1, 0],
+            "with the flag unused disc-wide, both labels stand as authored"
+        );
     }
 
     #[test]

@@ -4,6 +4,45 @@
 
 ### Fixed
 
+- **Content-based forced-subtitle detection never observed anything on a
+  feature-length disc.** The PGS probe spent its entire 256 MiB budget on the
+  first sectors of a title, where a feature has no subtitles at all — it hit
+  the budget, observed zero display sets, and contributed nothing to any
+  verdict, so the vendor label was always the only input. The same budget is
+  now SPREAD across each extent as ~16 MiB sample windows sized in proportion
+  to the extent (still on the AACS aligned-unit grid, still bounded by the same
+  ceiling): a track is disproven by any single non-forced display set anywhere,
+  and a genuine forced track is small enough to be caught by the spread. Cost
+  is unchanged; placement is not. The probe also stops spending budget on a
+  track the moment it is disproven, and skips an extent that owes evidence only
+  for such tracks.
+- **A partially-read extent's evidence was memoised as if the whole extent had
+  been read.** A budget-cut (and now sampled) read covers a fraction of an
+  extent, but its result was filed under the extent's full key and replayed to
+  every other playlist sharing the clip — turning a prefix into an absence
+  claim about the whole extent. Cache entries now carry the coverage behind
+  them, and an entry only answers for a run that intended to read no more than
+  it did. Positive evidence (a non-forced display set was seen) still answers
+  regardless, being irretractable.
+- **A forced verdict could rest on a single display set.** Calling a track
+  forced is an absence claim — "no display set here was un-flagged" — and a
+  sampled read sees a fraction of a track. Measured on real discs: tracks exist
+  that carry `forced_on_flag` on about a quarter of their display sets and not
+  on the rest, so catching one flagged set and nothing else is exactly what a
+  wrong promotion looks like. A sampled run now needs at least two display sets
+  before it may assert forced; a run that read every extent end to end has no
+  unread gap and may still promote off one (single-sign forced tracks exist).
+- **Content could never correct a wrong vendor forced label.** The muxer only
+  ever promoted `FlagForced` 0 → 1, so a track labelled forced stayed forced in
+  the output even when the mux had seen every one of its two thousand display
+  sets and not one was forced. Content may now clear the flag too — in the
+  muxer and in the scan-time probe — behind a single shared guard: the absence
+  of `forced_on_flag` means nothing on a disc whose authoring never sets it, so
+  a demotion requires that some other track demonstrably uses the flag AND that
+  the track have the shape of a full dialogue track rather than of a
+  forced-narrative one. Where no track on the disc uses the flag, nothing is
+  demotable.
+
 - **An `.fvi` index named itself as its own source.** The `fvi://` sink was
   handed the DESTINATION path as its `source_path`, so every index reported
   `source.path` as the file it was writing. `source.medium` was always `file`
