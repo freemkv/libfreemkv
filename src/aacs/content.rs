@@ -875,7 +875,7 @@ mod tests {
 
     // ── Defect-tolerant "did a key OPEN this unit?" verdict ─────────────────
     //
-    // The Bourne-UHD bug: a commercial disc carries the odd authored-bad TS
+    // The authored-bad-packet bug: a commercial disc carries the odd bad TS
     // packet (a pressing/encoding defect, or an AACS 2.1 forensic-variant frame)
     // — one non-conforming packet inside an otherwise perfectly-decrypted 6144
     // unit. The OLD strict per-packet acceptance rejected the WHOLE unit over

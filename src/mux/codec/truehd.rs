@@ -403,8 +403,7 @@ impl CodecParser for TrueHdParser {
             //    global offset for the new epoch (driven by the video
             //    back-jump) the stranded-high audio PTS is flung ~a whole
             //    clip past the frontier, producing the non-monotonic
-            //    audio-DTS band on multi-clip titles (Dune: Part Two, Top
-            //    Gun). ADOPT the raw reset so the per-track raw PTS that
+            //    audio-DTS band on multi-clip titles. ADOPT the raw reset so the per-track raw PTS that
             //    reaches `TimelineContinuity` carries the true boundary, and
             //    the corrector rebases it exactly as it already does for the
             //    DTS / AC-3 parsers (which never clamp). Same threshold the
@@ -1304,7 +1303,7 @@ mod tests {
         // When the buffer empties exactly on that boundary, an unconditional
         // reset to the PES PTS snapped the next AU's timestamp BELOW the AU just
         // emitted — the non-monotonic block timestamps a muxer rejects (the
-        // Top Gun / Dune: Part Two case). The reset must clamp forward-only.
+        // multi-clip UHD case). The reset must clamp forward-only.
         let mut parser = TrueHdParser::new();
         let au = make_truehd_unit(100);
         // PES1: three complete AUs at pts 90000 — buffer empties, cadence runs
@@ -1329,7 +1328,7 @@ mod tests {
 
     #[test]
     fn clip_boundary_pts_reset_is_adopted_not_clamped() {
-        // Regression (Dune: Part Two / Top Gun non-monotonic audio-DTS band):
+        // Regression (multi-clip non-monotonic audio-DTS band):
         // a title's clips are read as one concatenated stream, so at a
         // non-seamless boundary the source PES PTS resets near zero — a LARGE
         // backward step (> DISCONTINUITY_BACKSTEP_NS), NOT muxer jitter. The
