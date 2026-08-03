@@ -2221,8 +2221,8 @@ impl Disc {
             .then_with(|| b.size_bytes.cmp(&a.size_bytes))
             // Tiebreak for equal-size twins: longer duration, then richer audio —
             // the same feature authored as sibling playlists (a full-audio main
-            // vs an audio-reduced twin, e.g. Fight Club's 00800 [DTS-HD MA + 13
-            // tracks] vs 00004 [stereo AC-3 only]). Prefer lossless-multichannel.
+            // vs an audio-reduced twin: 00800 [DTS-HD MA + 13 tracks] vs
+            // 00004 [stereo AC-3 only]). Prefer lossless-multichannel.
             .then_with(|| b.duration_secs.total_cmp(&a.duration_secs))
             .then_with(|| Self::audio_richness(b).cmp(&Self::audio_richness(a)))
     }
