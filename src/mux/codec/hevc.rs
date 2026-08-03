@@ -1708,7 +1708,7 @@ mod tests {
         );
     }
 
-    /// Regression (Fight Club UHD banded corruption): a stream redefines PPS
+    /// Regression (UHD banded corruption): a stream redefines PPS
     /// id 0 mid-title, then a later keyframe arrives WITHOUT repeating it (the
     /// source relies on the decoder retaining the redefinition — valid for a
     /// raw bitstream). An hvcC player re-applies the FIRST (codecPrivate) PPS
@@ -1856,7 +1856,7 @@ mod tests {
         );
     }
 
-    /// Regression (Fight Club UHD, the real bug): id 0 is body A (→ hvcC), then
+    /// Regression (a UHD title, the real bug): id 0 is body A (→ hvcC), then
     /// redefined to B, then the title switches BACK to A. A streaming decoder
     /// (hvcC at init, in-band updates only) is sitting on B; the switch back to
     /// A must be emitted IN-BAND even though A == codecPrivate, or the whole
@@ -2604,7 +2604,7 @@ mod tests {
         // PES4: back to PPS-A. Even though A == codecPrivate, the ACTIVE set is
         // B, so switching to A is a real change and MUST be emitted in-band — a
         // streaming decoder (hvcC at init, in-band updates only) is sitting on B
-        // and would otherwise never revert. (This is the Fight Club bug: the old
+        // and would otherwise never revert. (This is the PPS revert bug: the old
         // `== codecPrivate → strip` rule dropped exactly this revert.)
         let mut d = pps(0xAA);
         d.extend(slice());

@@ -91,8 +91,8 @@ pub fn is_variant_mkb(records: &[MkbRecord]) -> bool {
 }
 
 /// Body of the `0x2d` record: the `VARIANTS` table followed by the trailing
-/// 16-byte `Kvn` Nonce. Measured `46_100*2 + 16 = 92_216` on Zombieland v70 and
-/// `92_220` on Stand By Me v70 — in both, the leading `body.len() - 16` bytes are
+/// 16-byte `Kvn` Nonce. Measured `46_100*2 + 16 = 92_216` on one v70 disc and
+/// `92_220` on another — in both, the leading `body.len() - 16` bytes are
 /// the big-endian `u16` `VARIANTS` table (one per subset-difference) and the last
 /// 16 bytes are the Nonce, with NO leading header. This does NOT hold the C used
 /// for `Kmp` — that is the per-slot block in `0x0c`
@@ -361,7 +361,7 @@ impl std::error::Error for MediaKeyVariantError {}
 /// Look up the per-slot `VARIANTS` value for the matched subset-difference slot,
 /// keyed by the same index that selected the cvalue ([`ProcessingKeyMatch::cvalue_index`]).
 ///
-/// LAYOUT (fixed against a real 2.1 variant MKB — Zombieland v70, `MKB_RO.inf`):
+/// LAYOUT (fixed against a real 2.1 variant MKB — a v70 `MKB_RO.inf`):
 /// the `0x2d` Encrypted-Media-Key-Variant-Data body is exactly
 /// `46_100*2 + 16 = 92_216` bytes, i.e. one **big-endian u16 `VARIANTS` entry per
 /// subset-difference slot** (1:1 with the `0x0c` variant cvalues and the `0x04`
@@ -378,7 +378,7 @@ fn variants_for_uv(records: &[MkbRecord], sd_slot_index: usize) -> Option<u16> {
     // The VARIANTS table is the leading bytes; the 16-byte Kvn Nonce is packed at
     // the TAIL (see [`variant_nonce`]). Bound the read to the table region so a
     // near-end slot can never read Nonce bytes as a VARIANTS entry. NO leading
-    // header (measured: Zombieland v70 `0x2d` body = 46_100*2 + 16 = 92_216).
+    // header (measured: a v70 `0x2d` body = 46_100*2 + 16 = 92_216).
     const NONCE: usize = 16;
     let table_len = body.len().checked_sub(NONCE)?;
     let off = sd_slot_index.checked_mul(2)?;

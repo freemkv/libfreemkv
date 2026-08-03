@@ -25,7 +25,7 @@
 //!     u32 start_spn | u32 end_spn        (source-packet numbers, inclusive)
 //! ```
 //! `index` is the 1..32 forensic index tag, NOT a sequential segment id: measured
-//! on a retail 2.1 disc (Zombieland) it cycles 1,2,…,32,1,2,… across records in
+//! on a retail 2.1 disc it cycles 1,2,…,32,1,2,… across records in
 //! file order — 24 full cycles of 32 plus a final partial cycle of 24 = 792
 //! records. Source-packet numbers are the 192-byte BDAV packet index: byte offset
 //! = `spn * 192`. Each segment is ~2560 packets (~480 KB) = 80 aligned units,
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn parses_real_disc_layout() {
-        // First three records observed on retail 2.1 (Zombieland): the variant
+        // First three records observed on retail 2.1: the variant
         // field counts 1,2,3,… (it wraps at 32 further into the table — see
         // `index_field_cycles_one_to_thirty_two`), segments are 2560 packets.
         let tbl = build_tbl(&[
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn index_field_cycles_one_to_thirty_two() {
-        // Reality on Zombieland: field@4 is the index, cycling 1..=32 in file
+        // Reality on a retail 2.1 disc: field@4 is the index, cycling 1..=32 in file
         // order (NOT a sequential segment id). Reproduce one-and-a-bit cycles.
         let mut recs = Vec::new();
         let mut spn = 1000u32;
