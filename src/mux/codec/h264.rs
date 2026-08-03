@@ -1168,7 +1168,7 @@ mod tests {
         );
     }
 
-    /// Regression (Fight Club bug, H.264 variant): PPS id 0 = body A (→ avcC),
+    /// Regression (the PPS revert bug, H.264 variant): PPS id 0 = body A (→ avcC),
     /// redefined to B, then switched BACK to A. A streaming decoder is on B; the
     /// revert to A == avcC must still be emitted in-band or the A-segment
     /// decodes against B.
