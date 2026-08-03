@@ -24,6 +24,14 @@
   them, and an entry only answers for a run that intended to read no more than
   it did. Positive evidence (a non-forced display set was seen) still answers
   regardless, being irretractable.
+- **A forced verdict could rest on a single display set.** Calling a track
+  forced is an absence claim — "no display set here was un-flagged" — and a
+  sampled read sees a fraction of a track. Measured on real discs: tracks exist
+  that carry `forced_on_flag` on about a quarter of their display sets and not
+  on the rest, so catching one flagged set and nothing else is exactly what a
+  wrong promotion looks like. A sampled run now needs at least two display sets
+  before it may assert forced; a run that read every extent end to end has no
+  unread gap and may still promote off one (single-sign forced tracks exist).
 - **Content could never correct a wrong vendor forced label.** The muxer only
   ever promoted `FlagForced` 0 → 1, so a track labelled forced stayed forced in
   the output even when the mux had seen every one of its two thousand display

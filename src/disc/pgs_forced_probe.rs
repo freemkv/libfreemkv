@@ -79,6 +79,19 @@ const STALL_RETRY_LIMIT: u32 = 2;
 /// [`plan_windows`]) instead of spent on the title's first 27 seconds.
 const PROBE_BUDGET_SECTORS: u32 = 131_072;
 
+/// How many display sets a SAMPLED run must have seen on a track before "all of
+/// them were forced" may be asserted as a verdict.
+///
+/// A sampled run sees a fraction of a track, so a forced verdict from it is an
+/// absence claim over that fraction. One display set is not an observation of a
+/// track: on a track that flags some of its sets and not others — measured, such
+/// tracks exist, flagging a quarter of their display sets — catching a single
+/// flagged set and calling the track forced is a user-visible mistake (a full
+/// dialogue track that players then force on screen). Two is a low bar, but it
+/// removes the single-hit case that dominates the risk. A run that read every
+/// extent end to end is not sampling and is not subject to this.
+const PROMOTE_MIN_DISPLAY_SETS: u32 = 2;
+
 /// One sample window: ~32 MiB, a whole number of AACS aligned units
 /// (16_383 = 5461 units).
 ///
@@ -223,6 +236,10 @@ pub(crate) struct TrackEvidence {
     /// How many display sets were seen. Saturating, so a pathological stream
     /// pins the count instead of wrapping it.
     displays: u32,
+    /// The bytes behind this evidence are a SAMPLE of the extent, not all of it
+    /// — so "every display set seen was forced" is a claim about the sample.
+    /// Merges by OR: a title is sampled if any part of it was.
+    sampled: bool,
 }
 
 impl TrackEvidence {
@@ -231,6 +248,7 @@ impl TrackEvidence {
         self.non_forced |= other.non_forced;
         self.forced_seen |= other.forced_seen;
         self.displays = self.displays.saturating_add(other.displays);
+        self.sampled |= other.sampled;
     }
 
     fn facts(&self) -> crate::mux::codec::pgs::ForcedFacts {
@@ -257,8 +275,6 @@ pub(crate) struct CachedEvidence {
     evidence: TrackEvidence,
     /// Sectors of the extent actually read and demuxed to produce `evidence`.
     covered: u32,
-    /// The extent was read from end to end — no sampling, no early stop.
-    complete: bool,
 }
 
 impl CachedEvidence {
@@ -271,7 +287,7 @@ impl CachedEvidence {
     /// looked at: honour it only when at least as much of the extent was covered
     /// as this run intended to cover.
     fn answers(&self, wanted: u32) -> bool {
-        self.evidence.non_forced || self.complete || self.covered >= wanted
+        self.evidence.non_forced || !self.evidence.sampled || self.covered >= wanted
     }
 }
 
@@ -446,7 +462,9 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
             .map(|&pid| {
                 let mut e = evidence.get(&pid).copied().unwrap_or_default();
                 if let Some(t) = trackers.get(&pid) {
-                    e.merge(tracker_evidence(t));
+                    // Mid-extent, so whatever this extent yields is by definition
+                    // still partial — the strongest claim available is "sampled".
+                    e.merge(tracker_evidence(t, true));
                 }
                 (pid, e)
             })
@@ -713,8 +731,9 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
         // must not be frozen in as the extent's answer, or one transient fault
         // would be replayed onto every other playlist sharing the clip.
         let cacheable = cut_short.is_none_or(StopReason::absence_is_conclusive);
+        let sampled = !(complete_plan && cut_short.is_none());
         for (&pid, t) in trackers.iter() {
-            let ev = tracker_evidence(t);
+            let ev = tracker_evidence(t, sampled);
             if let Some(slot) = evidence.get_mut(&pid) {
                 slot.merge(ev);
             }
@@ -722,7 +741,6 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                 let fresh = CachedEvidence {
                     evidence: ev,
                     covered,
-                    complete: complete_plan && cut_short.is_none(),
                 };
                 // Never replace a richer memo with a thinner one: an extent
                 // re-read under a smaller share would otherwise DOWNGRADE what is
@@ -740,8 +758,8 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                         // and inflate the count the demotion shape test reads.
                         prev.evidence.displays =
                             prev.evidence.displays.max(fresh.evidence.displays);
+                        prev.evidence.sampled &= fresh.evidence.sampled;
                         prev.covered = prev.covered.max(fresh.covered);
-                        prev.complete |= fresh.complete;
                     })
                     .or_insert(fresh);
             }
@@ -768,13 +786,14 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
 }
 
 /// One tracker's accumulated state as mergeable, memoisable evidence.
-fn tracker_evidence(t: &ForcedTracker) -> TrackEvidence {
+fn tracker_evidence(t: &ForcedTracker, sampled: bool) -> TrackEvidence {
     let facts = t.facts();
     TrackEvidence {
         observed: t.observed(),
         non_forced: t.settled_not_forced(),
         forced_seen: facts.forced_displays > 0,
         displays: facts.displays,
+        sampled,
     }
 }
 
@@ -805,8 +824,22 @@ fn verdicts(evidence: &HashMap<u16, TrackEvidence>, conclusive: bool) -> HashMap
         .iter()
         .filter(|(_, e)| e.observed && (conclusive || e.non_forced))
         .filter(|(_, e)| {
-            !e.non_forced
-                || crate::mux::codec::pgs::demotable(e.facts(), disc_uses_forced_flag, busiest)
+            if e.non_forced {
+                // Clearing a label: the demotion guard.
+                return crate::mux::codec::pgs::demotable(
+                    e.facts(),
+                    disc_uses_forced_flag,
+                    busiest,
+                );
+            }
+            // Calling a track FORCED is also an absence claim — "no display set
+            // here was un-flagged" — and over a SAMPLE of a track that mixes
+            // flagged and un-flagged sets (measured: such tracks exist, flagging
+            // a quarter of their sets), catching one flagged set and nothing else
+            // is exactly what a wrong promotion looks like. A read that covered
+            // every extent end to end has no such gap and may promote off a
+            // single set (measured: single-sign forced tracks exist too).
+            !e.sampled || e.displays >= PROMOTE_MIN_DISPLAY_SETS
         })
         .map(|(&pid, e)| (pid, !e.non_forced))
         .collect()
@@ -2417,9 +2450,9 @@ mod tests {
                 non_forced: false,
                 forced_seen: true,
                 displays: 4,
+                sampled: true,
             },
             covered: 1_000,
-            complete: false,
         };
         assert!(absence.answers(1_000), "as much coverage as asked for");
         assert!(
@@ -2430,10 +2463,10 @@ mod tests {
             evidence: TrackEvidence {
                 observed: true,
                 non_forced: true,
+                sampled: true,
                 ..Default::default()
             },
             covered: 1,
-            complete: false,
         };
         assert!(
             positive.answers(u32::MAX),
@@ -2443,10 +2476,10 @@ mod tests {
         let whole = CachedEvidence {
             evidence: TrackEvidence {
                 observed: true,
+                sampled: false,
                 ..Default::default()
             },
             covered: 10,
-            complete: true,
         };
         assert!(
             whole.answers(u32::MAX),
@@ -2534,5 +2567,57 @@ mod tests {
             w.offset > sectors / 4 && w.offset + w.len < sectors / 4 * 3,
             "the lone window must be taken from the middle, got {w:?} of {sectors}"
         );
+    }
+
+    /// Promotion is an absence claim too, and a SAMPLE cannot support it off a
+    /// single display set. Measured: tracks exist that carry `forced_on_flag` on
+    /// a quarter of their display sets and not on the rest — catch one of the
+    /// flagged ones and nothing else, and a full dialogue track gets flagged
+    /// forced, which players then force on screen.
+    #[test]
+    fn one_display_set_in_a_sampled_run_does_not_prove_a_track_forced() {
+        let pid = 0x1200u16;
+        let ext = feature_extent();
+        let plan = plan_windows(ext.sector_count, PROBE_BUDGET_SECTORS);
+        let window = plan[plan.len() / 2];
+        let mut reader = SyntheticClipReader::new(vec![TrackShape {
+            pid,
+            first_sector: window.offset + 3,
+            period_sectors: 3,
+            count: 1, // the one flagged set of a track that is mostly unflagged
+            forced: true,
+        }]);
+        let mut title = pgs_title(pid, false);
+        title.extents = vec![ext];
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+        assert!(
+            !forced_flag(&title, pid),
+            "a single display set out of a sampled feature is not evidence that \
+             EVERY display set on the track is forced"
+        );
+    }
+
+    /// ...but a run that read every extent end to end has no unread gap to hide a
+    /// non-forced set in, so a genuine single-sign forced track (measured: they
+    /// exist, one display set for the whole feature) is still promoted. Pinned by
+    /// `the_last_display_set_of_a_run_is_not_thrown_away`, which is exactly that
+    /// case; this asserts the two rules do not collide.
+    #[test]
+    fn a_complete_read_may_still_promote_from_one_display_set() {
+        let pid = 0x1200u16;
+        let mut reader = SyntheticClipReader::new(vec![TrackShape {
+            pid,
+            first_sector: 0,
+            period_sectors: 3,
+            count: 1,
+            forced: true,
+        }]);
+        let mut title = pgs_title(pid, false);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 6,
+        }];
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+        assert!(forced_flag(&title, pid), "nothing was left unread");
     }
 }
