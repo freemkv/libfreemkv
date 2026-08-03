@@ -104,6 +104,61 @@
   whose authoring sets `forced_on_flag` at all. Across the disc-image corpus
   this cleared every cross-title label conflict, on both affected vendor
   formats.
+- **Streams borrowed from the playlists were merged into the vendor label list
+  by a number that meant something else, so a bonus clip could be labelled from
+  the feature's tracks.** A vendor label's `stream_number` is a slot in the one
+  stream table its config blob describes. The labels merged in from the
+  playlists to cover streams the vendor named nothing for carried a different
+  number entirely: a dense counter over every distinct stream found while
+  scanning the whole disc in directory order, related to no playlist's slot
+  numbering at all. The merge matched the two by equality, and the binder then
+  counted streams against the result. Measured across the 44-image corpus: 22
+  discs merge such labels, and of the 566 places one lands on a stream, 443
+  (78%) are a stream it does not describe — the label states which PID it read
+  itself from, and it is a different one. 142 of those were already stopped by
+  the language check added alongside the ordinal binding; 301 were applied. The
+  streams-only labels carry no editorial payload, so the direct damage is
+  confined to codec text, but the polluted list is also what the anchor gate
+  reads, and on 11 disc/stream-type pairs it is what decides the anchor — which
+  is how it reaches the vendor's forced and SDH flags. The same defect ran
+  through the clip-info orphan streams, numbered from `max + 1` of a list they
+  share no coordinate system with.
+
+  A label now either NAMES the elementary stream it describes — `(clip, PID)`,
+  read out of the very table the stream itself is built from — or it does not,
+  and only the ones that do not are ever reached by counting. Playlist- and
+  clip-info-derived labels bind by that name and by nothing else; the vendor's
+  bind through the language-sequence anchor as before, over the vendor's own
+  slots only. A named stream outranks a guessed one, so an editorial flag
+  reaches a stream only where the disc's own numbering puts it there. The
+  presence of the name is the provenance marker, which is what the anchor gate
+  was missing: it can now tell the vendor's slots from the borrowed ones, so a
+  slot the vendor never named no longer breaks the sequence, and a title with
+  fewer streams than the list has slots is no longer eligible to hold it. An
+  orphan stream, being in no playlist, is in no title, and now binds to nothing
+  rather than to whatever counted its way.
+
+  Over the corpus, 41 of 44 images are byte-identical and every one of the
+  three that move loses a label it should never have had: a dozen featurette
+  playlists stop reporting a feature subtitle's SDH marking on their own
+  single, unrelated subtitle; eleven menu and bonus titles stop advertising the
+  feature's object-audio format on plain stereo tracks; and on a disc whose
+  every title carries one audio stream, a regional-variant tag that had been
+  asserted on all seventeen titles is asserted on none — that disc's tables are
+  too short to anchor anything, so the tag is no longer claimed anywhere, and
+  in exchange every title now states the codec it actually carries, which none
+  of them did before. No feature title changes on any image. Six of the crate's
+  own tests had been asserting the invented numbering, including one pinning
+  the disc-global counter as a deliberate property.
+- **A subtitle the content probe demoted went on calling itself forced.** The
+  probe writes its verdict to the stream's `forced` flag but left the
+  qualifier alone, and those are two renderings of one fact for two different
+  consumers: the muxer writes Matroska `FlagForced` from the flag, the JSON
+  metadata sidecar writes its qualifier string from the qualifier. A track the
+  probe cleared therefore shipped with a sidecar calling it forced next to a
+  header saying it is not. The demotion now clears the qualifier with the flag.
+  Only a forced claim is cleared — an SDH marking says something the probe
+  neither confirmed nor refuted, and is left alone.
 - **Vendor stream labels were numbered by parsed entry, not by stream slot.**
   Label blobs contain entries the parser deliberately does not interpret, but
   those entries still occupy a stream-number slot. Counting only the parsed

@@ -38,11 +38,42 @@ pub use bdmt::DiscMetadata;
 // AudioStream/SubtitleStream so callers can map purpose/qualifier to display
 // text in their own locale.
 
+/// The one elementary stream a label describes, named the way the disc names
+/// it: a PID inside a clip. A PID is only unique within one clip — two
+/// unrelated `.m2ts` files both open their first audio at 0x1100 — so the clip
+/// is part of the identity, not decoration.
+///
+/// This is the same key [`apply_labels`] already binds anchor facts through, so
+/// a label that carries one needs no ordinal, no sequence and no guess.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StreamId {
+    /// Clip filename without extension (e.g. "00294"), matching
+    /// [`crate::disc::Clip::clip_id`].
+    pub clip_id: String,
+    /// MPEG-TS PID of the elementary stream within that clip.
+    pub pid: u16,
+}
+
 /// A stream label extracted from disc config files.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct StreamLabel {
-    /// STN index (1-based)
+    /// Which elementary stream this label describes, when its source stated
+    /// it outright.
+    ///
+    /// `Some` for MPLS- and CLPI-derived labels: both read a PID out of the
+    /// same table the stream itself is built from, so the label binds exactly.
+    /// `None` for vendor-authored labels — a BD-J config blob names slots, not
+    /// PIDs, and those bind through the language-sequence anchor.
+    ///
+    /// The presence of an id IS the provenance marker. Keeping it on the label
+    /// rather than in a parallel map is deliberate: a side table keyed by slot
+    /// would be a second structure that has to agree with this one and no way
+    /// to make it.
+    pub stream_id: Option<StreamId>,
+    /// STN index (1-based). Meaningful only for vendor labels
+    /// (`stream_id: None`), which is all binding ever reads it for; a
+    /// PID-bearing label carries one for display order alone.
     pub stream_number: u16,
     /// Audio or Subtitle
     pub stream_type: StreamLabelType,
@@ -205,6 +236,12 @@ pub fn apply(reader: &mut dyn SectorSource, udf: &UdfFs, titles: &mut [DiscTitle
 /// disc has some single-audio menu clip whose language matches label #1.
 const MIN_ANCHOR_STREAMS: usize = 2;
 
+/// `stream_number` value meaning "this label states no STN slot". STN slots are
+/// 1-based, so 0 is unused by any real table. Only labels that name their
+/// stream outright (`stream_id`) may carry it — [`label_at`] never returns one,
+/// so it can never be reached by counting.
+const NO_STN_SLOT: u16 = 0;
+
 /// Two ISO 639-2 codes that do NOT contradict each other. Equal (ignoring
 /// case / padding) is agreement; an empty code on either side is "unknown",
 /// which cannot contradict anything. Used to decide whether an ordinal
@@ -221,11 +258,37 @@ fn languages_agree(a: &str, b: &str) -> bool {
     !a.is_empty() && a.eq_ignore_ascii_case(b)
 }
 
-/// The label occupying 1-based STN slot `n` of `stream_type`, if any.
+/// The VENDOR label occupying 1-based STN slot `n` of `stream_type`, if any.
+///
+/// Slot lookup is restricted to labels with no [`StreamId`], and that
+/// restriction is the whole point. `stream_number` is not one coordinate
+/// system, it is two that share a name:
+///
+///   * on a vendor label it is a slot in the one stream table the config blob
+///     describes, which is what this function's callers count against; while
+///   * on a derived label it is that stream's slot in *its own* playlist's
+///     table, which says nothing about any other playlist's numbering.
+///
+/// Reading a derived label out of a slot lookup therefore answers a question
+/// about table A with a fact about table B. A label that carries a `StreamId`
+/// names the stream it describes outright and is bound by that id instead —
+/// see [`apply_labels`].
 fn label_at(labels: &[StreamLabel], stream_type: StreamLabelType, n: u16) -> Option<&StreamLabel> {
     labels
         .iter()
-        .find(|l| l.stream_type == stream_type && l.stream_number == n)
+        .find(|l| l.stream_id.is_none() && l.stream_type == stream_type && l.stream_number == n)
+}
+
+/// The highest STN slot the vendor list names for `stream_type`, or 0 when it
+/// names none. A list whose top slot is 9 is describing a table with at least
+/// nine slots, so a title with six streams cannot be that table.
+fn vendor_extent(labels: &[StreamLabel], stream_type: StreamLabelType) -> usize {
+    labels
+        .iter()
+        .filter(|l| l.stream_id.is_none() && l.stream_type == stream_type)
+        .map(|l| l.stream_number as usize)
+        .max()
+        .unwrap_or(0)
 }
 
 /// The (PID, language) of each stream of `stream_type` in the title, in
@@ -254,72 +317,109 @@ fn slots_of(title: &DiscTitle, stream_type: StreamLabelType) -> Vec<(u16, &str)>
 /// list position for position, and content confirms that title's binding is
 /// the correct one.
 ///
-/// So: the anchor is the title whose every stream of this type sits on a slot
-/// the label list covers with a compatible language. Longest wins (it pins the
-/// most slots); ties fall to title order, which is duration-descending.
-/// `None` means no title matches — the list describes a stream table this disc
-/// scan cannot see, and nothing may be bound authoritatively.
+/// So: the anchor is the title that [`anchor_score`] admits and that confirms
+/// the most of the list. `None` means no title matches — the list describes a
+/// stream table this disc scan cannot see, and nothing may be bound
+/// authoritatively.
+///
+/// Only VENDOR slots take part. Derived labels (MPLS / CLPI) name their own
+/// stream and bind directly, so admitting them here would be asking a title to
+/// agree with a numbering that describes a different playlist — the mistake
+/// that made this gate a coin flip while the merged list was the only list
+/// there was.
 fn find_anchor(
     labels: &[StreamLabel],
     titles: &[DiscTitle],
     stream_type: StreamLabelType,
 ) -> Option<usize> {
-    let mut best: Option<(usize, usize)> = None; // (slot count, title index)
+    let extent = vendor_extent(labels, stream_type);
+    // (confirmed slots, stream count, title index) — most confirmed wins, then
+    // the longest table, then title order (which is duration-descending).
+    let mut best: Option<(usize, usize, usize)> = None;
     for (idx, title) in titles.iter().enumerate() {
         let n = slots_of(title, stream_type).len();
-        if n < MIN_ANCHOR_STREAMS {
+        if n < MIN_ANCHOR_STREAMS || n < extent {
             continue;
         }
-        if sequence_aligned(labels, title, stream_type) && best.is_none_or(|(best, _)| n > best) {
-            best = Some((n, idx));
+        let Some(score) = anchor_score(labels, title, stream_type) else {
+            continue;
+        };
+        if best.is_none_or(|(bs, bn, _)| (score, n) > (bs, bn)) {
+            best = Some((score, n, idx));
         }
     }
-    best.map(|(_, idx)| idx)
+    best.map(|(_, _, idx)| idx)
 }
 
-/// Does every stream of this type sit on a label slot that does not
-/// contradict it? A title that fails this is enumerating some other stream
-/// table than the one the label list describes, whatever the odd slot that
-/// happens to agree might suggest.
-fn sequence_aligned(
+/// How strongly this title's stream sequence matches the vendor label list, or
+/// `None` if the title contradicts it and cannot be the table it describes.
+///
+/// A stream disqualifies the title when the vendor label on its slot states a
+/// different language. A slot the vendor list does not name constrains nothing:
+/// under-yield is the normal shape of these blobs — an authoring layer ships
+/// editorial labels for the streams it considers interesting and leaves the
+/// rest as bare slots — so a hole is the list's silence, not a disagreement.
+///
+/// The score is how much of the list the title positively CONFIRMS: slots where
+/// both sides state a language and state the same one. A list that names no
+/// languages at all scores zero everywhere and the ranking falls through to
+/// table size, which is what it did before this became a fingerprint.
+fn anchor_score(
     labels: &[StreamLabel],
     title: &DiscTitle,
     stream_type: StreamLabelType,
-) -> bool {
-    slots_of(title, stream_type)
-        .iter()
-        .enumerate()
-        .all(|(i, (_, lang))| {
-            label_at(labels, stream_type, (i + 1) as u16)
-                .is_some_and(|l| languages_compatible(&l.language, lang))
-        })
+) -> Option<usize> {
+    let mut confirmed = 0usize;
+    for (i, (_, lang)) in slots_of(title, stream_type).iter().enumerate() {
+        let Some(l) = label_at(labels, stream_type, (i + 1) as u16) else {
+            continue; // slot the vendor list never named
+        };
+        if !languages_compatible(&l.language, lang) {
+            return None;
+        }
+        if languages_agree(&l.language, lang) {
+            confirmed += 1;
+        }
+    }
+    Some(confirmed)
 }
 
 /// Apply a pre-extracted set of labels to titles' streams.
 ///
-/// Binding is two-tier:
+/// Every label either NAMES the stream it describes or it does not, and that
+/// split — not a slot number — decides how it binds. Four tiers, most certain
+/// first:
 ///
-///   1. **PID.** [`find_anchor`] identifies the title whose stream table the
-///      label list is describing. Every slot of that title yields a
+///   1. **This title is the anchor.** [`find_anchor`] identifies the title
+///      whose stream table the vendor list is describing, so its slots are the
+///      list's own slots and bind directly.
+///
+///   2. **An anchor proved this PID.** Every slot of the anchor yields a
 ///      `(clip, PID) -> label` fact, and a PID is the same physical stream in
-///      every playlist that plays that clip. Sibling playlists are bound
-///      through that map, so a label lands on the same elementary stream no
-///      matter which playlist enumerates it, and slots the anchor never showed
-///      us are simply not bound.
+///      every playlist that plays that clip. Sibling playlists bind through
+///      that map, so a vendor label lands on the same elementary stream no
+///      matter which playlist enumerates it, and a slot the anchor never showed
+///      us is not bound at all.
 ///
-///   2. **Ordinal, language-checked.** Streams no anchor fact covers (bonus
-///      clips, discs with no anchor at all) still fall back to the 1-based
-///      per-type STN ordinal — but a label whose language contradicts the
-///      stream it would land on is dropped rather than applied.
+///   3. **The label names this stream.** A derived label carries a
+///      [`StreamId`] read out of the very table the stream itself was built
+///      from, so `(clip, PID)` equality is identity, not inference. This is the
+///      floor that gives every stream its language and codec.
 ///
-/// The policy where a title cannot be bound confidently is to leave the stream
-/// alone: an unlabelled track is a much smaller harm than a full-dialogue track
-/// wearing `forced`, which presents to the user as a duplicate of the track
-/// they wanted, and which the muxer can only undo on discs that state
-/// `forced_on_flag`. A subtitle label carries nothing but the qualifier, so an
-/// unverifiable one has no upside at all to trade against that risk, and the
-/// ordinal path applies one only when the label and the stream both state a
-/// language and it is the same one.
+///   4. **Ordinal, language-checked.** A vendor label with no anchor behind it
+///      falls back to the 1-based per-type STN slot — but only where tier 3 had
+///      nothing to say, and only when the languages do not contradict.
+///
+/// Tier 3 outranking tier 4 is the substance of this ordering: a label that
+/// states which stream it belongs to beats a guess about which stream it might
+/// belong to, even when the guess is the richer label. The policy where a title
+/// cannot be bound confidently is to leave the stream alone: an unlabelled track
+/// is a much smaller harm than a full-dialogue track wearing `forced`, which
+/// presents to the user as a duplicate of the track they wanted, and which the
+/// muxer can only undo on discs that state `forced_on_flag`. A subtitle label
+/// carries nothing but the qualifier, so an unverifiable one has no upside at
+/// all to trade against that risk, and the ordinal path applies one only when
+/// the label and the stream both state a language and it is the same one.
 ///
 /// Audio streams update `purpose` + `label` (codec/variant info; never
 /// English purpose text). Subtitle streams update `qualifier` and the
@@ -343,10 +443,11 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
         anchors[type_tag(stream_type) as usize] = Some(anchor);
         let title = &titles[anchor];
         for (i, (pid, _)) in slots_of(title, stream_type).iter().enumerate() {
-            let Some(pos) = labels
-                .iter()
-                .position(|l| l.stream_type == stream_type && l.stream_number == (i + 1) as u16)
-            else {
+            let Some(pos) = labels.iter().position(|l| {
+                l.stream_id.is_none()
+                    && l.stream_type == stream_type
+                    && l.stream_number == (i + 1) as u16
+            }) else {
                 continue;
             };
             for clip in &title.clips {
@@ -367,6 +468,21 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
         .map(|((c, p), v)| ((c.to_string(), p), v))
         .collect();
 
+    // Labels that name their own stream, indexed by that name. No anchor, no
+    // sequence and no ordinal is involved in reaching one of these: the id was
+    // read from the same STN / ProgramInfo table `disc::bluray` built the
+    // stream from, so equality here is the same elementary stream by
+    // construction. Later duplicates lose, matching the first-wins rule the
+    // rest of this module uses.
+    let by_id: HashMap<&StreamId, usize> = labels
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| l.stream_id.as_ref().map(|id| (id, i)))
+        .fold(HashMap::new(), |mut m, (id, i)| {
+            m.entry(id).or_insert(i);
+            m
+        });
+
     for (title_idx, title) in titles.iter_mut().enumerate() {
         let mut audio_idx: u16 = 0;
         let mut sub_idx: u16 = 0;
@@ -383,14 +499,35 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
                 .collect()
         };
 
-        // Resolve one stream to (label, authoritative). Authoritative means
-        // the binding came from a PID fact rather than a bare ordinal: either
-        // this title IS the anchor, or an anchor told us what this PID is.
+        // The clip whose STN table this title's stream list was built from —
+        // `disc::bluray` takes the streams from the first play item — so it is
+        // the clip half of every id that can match a stream of this title.
+        let clip0 = title
+            .clips
+            .first()
+            .map(|c| c.clip_id.clone())
+            .unwrap_or_default();
+
+        // Resolve one stream to (label, authoritative). Authoritative means the
+        // label is known to belong to THIS stream rather than guessed onto it:
+        // tiers 1-3 of the doc comment above. Only tier 4, the bare ordinal, is
+        // not.
         let resolve = |stream_type: StreamLabelType, idx: u16, pid: u16, lang: &str| {
-            if anchors[type_tag(stream_type) as usize] == Some(title_idx) {
-                return label_at(labels, stream_type, idx).map(|l| (l, true));
+            if anchors[type_tag(stream_type) as usize] == Some(title_idx)
+                && let Some(l) = label_at(labels, stream_type, idx)
+            {
+                return Some((l, true));
             }
             if let Some(pos) = known_pids.get(&pid).copied()
+                && labels[pos].stream_type == stream_type
+            {
+                return Some((&labels[pos], true));
+            }
+            let id = StreamId {
+                clip_id: clip0.clone(),
+                pid,
+            };
+            if let Some(pos) = by_id.get(&id).copied()
                 && labels[pos].stream_type == stream_type
             {
                 return Some((&labels[pos], true));
@@ -758,58 +895,88 @@ fn extract(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<StreamLabel> {
         }
     };
 
-    // Gap-fill: framework parsers often under-yield on multi-track
-    // discs because their authoring layer only ships editorial labels
-    // for "interesting" streams (Director's Cut, Atmos, SDH) and
-    // leaves the rest as plain numbered slots. MPLS sees all streams
-    // the playlist references. If MPLS has entries the framework
-    // didn't cover (by stream_type + stream_number), merge them in
-    // so the user sees every track even when only the "interesting"
-    // ones have editorial names. Skips the merge when mpls_universal
-    // was itself the chosen parser (its labels ARE the labels).
+    // The MPLS floor: framework parsers under-yield on multi-track discs
+    // because their authoring layer only ships editorial labels for
+    // "interesting" streams (Director's Cut, Atmos, SDH) and leaves the rest as
+    // plain numbered slots. MPLS sees every stream a playlist references, and
+    // names each one, so merging it in gives the user every track even when
+    // only the "interesting" ones have editorial names. Skipped when
+    // mpls_universal was itself the chosen parser (its labels ARE the labels).
     if name != "mpls_universal"
         && let Some(mpls_result) = mpls_universal::parse(reader, udf)
     {
-        fill_gaps_from_mpls(&mut labels, &mpls_result.labels);
+        merge_mpls_floor(&mut labels, &mpls_result.labels);
     }
 
-    // CLPI orphan streams: PIDs in /BDMV/CLIPINF/*.clpi ProgramInfo
-    // that no MPLS playlist references. Empirically a small fraction of
-    // streams are CLPI-only — physically on disc, not menu-reachable.
-    // Append them as Low-confidence
-    // labels at the tail of each stream_type (next slot after the
-    // highest existing stream_number).
+    // CLPI orphan streams: PIDs in /BDMV/CLIPINF/*.clpi ProgramInfo that no
+    // MPLS playlist references. Empirically a small fraction of streams are
+    // CLPI-only — physically on disc, not menu-reachable. They too are
+    // appended under the id they name, so a title reaches one only if it
+    // actually carries that stream.
     let _orphans_added = append_clpi_orphans(&mut labels, reader, udf);
 
     labels
 }
 
-/// Append entries from `mpls` whose `(stream_type, stream_number)`
-/// isn't already represented in `framework`. Framework labels are
-/// richer (editorial purpose/qualifier, codec_hint with object-audio
-/// detail like Atmos) so they always win for slots they cover; MPLS
-/// only fills in untaken slots. Stable sort by (type, number) at
-/// the end so callers see a deterministic, ascending list.
-fn fill_gaps_from_mpls(framework: &mut Vec<StreamLabel>, mpls: &[StreamLabel]) {
+/// Merge the MPLS-derived floor into a framework parser's label list.
+///
+/// The two lists do not share a coordinate system, and the merge must not
+/// pretend they do. A framework `stream_number` is a slot in the one stream
+/// table the vendor blob describes; an MPLS label's is that stream's slot in
+/// its own playlist's table. Matching them by number — which is what this
+/// function used to do — merges by an equality that means nothing, and the
+/// merged entries then land on whatever stream happens to sit at that ordinal
+/// in each title.
+///
+/// So nothing is merged BY slot. Every MPLS label whose stream is not already
+/// named in `framework` is appended, keeping its own [`StreamId`], and
+/// [`apply_labels`] decides per stream which of the two reaches it: the
+/// vendor's editorial label where an anchor puts it there, the floor
+/// everywhere else. Framework labels stay richer and stay ahead — they are
+/// simply no longer competing for a slot number.
+///
+/// Sorted at the end (vendor slots first, in slot order, then the named
+/// streams) so callers see a deterministic list.
+fn merge_mpls_floor(framework: &mut Vec<StreamLabel>, mpls: &[StreamLabel]) {
     use std::collections::HashSet;
-    let covered: HashSet<(StreamLabelType, u16)> = framework
+    let named: HashSet<&StreamId> = framework
         .iter()
-        .map(|l| (l.stream_type, l.stream_number))
+        .filter_map(|l| l.stream_id.as_ref())
         .collect();
-    let mut added = 0usize;
+    let mut added: Vec<StreamLabel> = Vec::new();
+    let mut taken: HashSet<&StreamId> = HashSet::new();
     for m in mpls {
-        if !covered.contains(&(m.stream_type, m.stream_number)) {
-            framework.push(m.clone());
-            added += 1;
+        match m.stream_id.as_ref() {
+            Some(id) if !named.contains(id) && taken.insert(id) => added.push(m.clone()),
+            _ => {}
         }
     }
-    if added > 0 {
-        tracing::info!(
-            gap_fill_added = added,
-            "MPLS gap-fill merged streams the framework parser left uncovered"
-        );
-        framework.sort_by_key(|l| (type_tag(l.stream_type), l.stream_number));
+    if added.is_empty() {
+        return;
     }
+    tracing::info!(
+        gap_fill_added = added.len(),
+        "MPLS floor merged: streams the framework parser named no label for"
+    );
+    framework.extend(added);
+    sort_labels(framework);
+}
+
+/// Deterministic display order for a merged label list: audios then subtitles,
+/// vendor slots first in slot order, then the PID-named labels by the stream
+/// they name. Ordering is presentation only — nothing binds through it.
+fn sort_labels(labels: &mut [StreamLabel]) {
+    labels.sort_by(|a, b| {
+        let key = |l: &StreamLabel| {
+            (
+                type_tag(l.stream_type),
+                l.stream_id.is_some(),
+                l.stream_number,
+                l.stream_id.as_ref().map(|i| (i.clip_id.clone(), i.pid)),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
 }
 
 /// Stable sort key for `StreamLabelType`. Audio < Subtitle so the
@@ -821,32 +988,35 @@ fn type_tag(t: StreamLabelType) -> u8 {
     }
 }
 
-/// Append CLPI ProgramInfo streams that NO existing label covers by
-/// PID. These are "orphan" streams — physically present in the .m2ts
-/// per CLPI's clip-authoritative view, but no MPLS playlist references
-/// them, so the framework + MPLS gap-fill missed them. Returns the
-/// number of orphans appended.
+/// Append CLPI ProgramInfo streams that no existing label already names.
+/// These are "orphan" streams — physically present in the .m2ts per CLPI's
+/// clip-authoritative view, but no MPLS playlist references them, so the
+/// framework and the MPLS floor both missed them. Empirically they are
+/// commentary or alternate-version streams the authoring tool left out of the
+/// published playlist. Returns the number appended.
 ///
-/// Numbering: the new entries get `stream_number = max(existing
-/// per type) + 1, +2, …` so the playlist-reachable streams keep their
-/// original positions and orphans sort cleanly at the tail. Empirically
-/// these are commentary or alternate-version streams that the
-/// authoring tool left out of the published playlist.
+/// Each carries the `(clip, PID)` it was read under, so it binds to that
+/// stream and to nothing else. It used to be given `stream_number =
+/// max(existing per type) + 1, +2, …`, an ordinal invented here and shared
+/// with the slot numbering the vendor list uses — which meant a title with
+/// more streams than the list had slots could reach an orphan by counting, and
+/// be labelled from a stream no playlist even plays. There is no ordinal now:
+/// a stream that is in no playlist is in no title, so an orphan label binds to
+/// nothing, which is exactly right and is now structural rather than lucky.
 fn append_clpi_orphans(
     labels: &mut Vec<StreamLabel>,
     reader: &mut dyn SectorSource,
     udf: &UdfFs,
 ) -> usize {
     use crate::consts::coding_type as c;
-    // Index existing labels by PID — but StreamLabel doesn't carry
-    // PID. Index by (type, language, codec_hint) tuple instead; this
-    // is fuzzier than PID matching but the only signal available
-    // here. False positives (a CLPI orphan that happens to share
-    // (type, lang, codec) with an MPLS stream we already have) are
-    // benign — we just skip the duplicate. False negatives (rare)
-    // would cause double-listing, which is the conservative failure
-    // mode.
+    // Two exclusions, one exact and one fuzzy. Exact: a stream some label
+    // already NAMES is not an orphan, whatever it looks like. Fuzzy: the
+    // pre-existing (type, language, codec_hint) test, kept because it is what
+    // bounds this list to a handful of entries per disc rather than one per
+    // stream per clip; it can only ever drop a candidate, and an orphan that
+    // never binds costs nothing when it is dropped.
     use std::collections::HashSet;
+    let named: HashSet<&StreamId> = labels.iter().filter_map(|l| l.stream_id.as_ref()).collect();
     let existing: HashSet<(StreamLabelType, String, String)> = labels
         .iter()
         .map(|l| (l.stream_type, l.language.clone(), l.codec_hint.clone()))
@@ -865,8 +1035,14 @@ fn append_clpi_orphans(
         .map(|e| e.name.clone())
         .collect();
     let mut seen_pids: HashSet<u16> = HashSet::new();
-    let mut candidates: Vec<(StreamLabelType, u16, u8, String)> = Vec::new();
+    let mut candidates: Vec<(StreamLabelType, StreamId, u8, String)> = Vec::new();
     for name in names {
+        // The CLPI filename without its extension IS the clip id, so a stream
+        // read out of this file is identified exactly: `(clip, PID)`.
+        let clip_id = name
+            .rsplit_once('.')
+            .map(|(stem, _)| stem.to_string())
+            .unwrap_or_else(|| name.clone());
         let path = format!("/BDMV/CLIPINF/{}", name);
         let Ok(data) = udf.read_file(reader, &path) else {
             continue;
@@ -896,7 +1072,14 @@ fn append_clpi_orphans(
             if existing.contains(&(stype, lang_norm.clone(), codec_hint.clone())) {
                 continue;
             }
-            candidates.push((stype, s.pid, s.coding_type, lang_norm));
+            let id = StreamId {
+                clip_id: clip_id.clone(),
+                pid: s.pid,
+            };
+            if named.contains(&id) {
+                continue;
+            }
+            candidates.push((stype, id, s.coding_type, lang_norm));
         }
     }
 
@@ -904,40 +1087,15 @@ fn append_clpi_orphans(
         return 0;
     }
 
-    // Find next available stream_number per type.
-    let mut next_audio: u16 = labels
-        .iter()
-        .filter(|l| l.stream_type == StreamLabelType::Audio)
-        .map(|l| l.stream_number)
-        .max()
-        .unwrap_or(0)
-        + 1;
-    let mut next_sub: u16 = labels
-        .iter()
-        .filter(|l| l.stream_type == StreamLabelType::Subtitle)
-        .map(|l| l.stream_number)
-        .max()
-        .unwrap_or(0)
-        + 1;
-
     let added = candidates.len();
-    for (stype, _pid, coding_type, language) in candidates {
+    for (stype, stream_id, coding_type, language) in candidates {
         let codec_hint = mpls_universal::codec_name(coding_type).to_string();
         let name = mpls_universal::language_display_name(&language);
-        let stream_number = match stype {
-            StreamLabelType::Audio => {
-                let n = next_audio;
-                next_audio += 1;
-                n
-            }
-            StreamLabelType::Subtitle => {
-                let n = next_sub;
-                next_sub += 1;
-                n
-            }
-        };
         labels.push(StreamLabel {
-            stream_number,
+            stream_id: Some(stream_id),
+            // NO_STN_SLOT: an orphan is by definition absent from every
+            // playlist's stream table, so there is no slot to state.
+            stream_number: NO_STN_SLOT,
             stream_type: stype,
             language,
             name,
@@ -952,7 +1110,7 @@ fn append_clpi_orphans(
             clpi_orphans_added = added,
             "CLPI-only streams appended (PIDs not referenced by any MPLS playlist)"
         );
-        labels.sort_by_key(|l| (type_tag(l.stream_type), l.stream_number));
+        sort_labels(labels);
     }
     added
 }
@@ -1010,10 +1168,11 @@ pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
         None => (None, None, Vec::new()),
     };
 
-    // Gap-fill: same merge as `extract()`. Framework labels (when
-    // present) win for the slots they cover; MPLS fills in uncovered
-    // stream_numbers. Skipped when MPLS was itself the chosen parser
-    // (no gaps to fill against itself).
+    // The MPLS floor: same merge as `extract()`. Skipped when MPLS was itself
+    // the chosen parser (its labels ARE the labels).
+    //
+    // Note this diagnostic path stops here — `extract()` also appends the CLPI
+    // orphans, which `analyze` has never reported.
     let gap_fill_added = if parser.is_some() && parser != Some("mpls_universal") {
         let before = labels.len();
         // Re-run MPLS unconditionally — we only ran framework parsers
@@ -1021,7 +1180,7 @@ pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
         // common case where MPLS would have detected but wasn't
         // chosen we still need its labels for the merge.
         if let Some(mpls_result) = mpls_universal::parse(reader, udf) {
-            fill_gaps_from_mpls(&mut labels, &mpls_result.labels);
+            merge_mpls_floor(&mut labels, &mpls_result.labels);
         }
         labels.len().saturating_sub(before)
     } else {
@@ -1145,10 +1304,11 @@ pub struct LabelAnalysis {
     /// to per-stream labels; populated independently from the parser
     /// registry.
     pub disc_metadata: Option<bdmt::DiscMetadata>,
-    /// Number of stream slots the MPLS gap-fill merge added on top of
-    /// the framework parser's output. 0 means the framework covered
-    /// every MPLS-known stream slot, or MPLS itself was the chosen
-    /// parser. Diagnostic for the labels-analyze tool.
+    /// Number of MPLS-derived floor labels merged on top of the framework
+    /// parser's output — one per playlist-referenced stream the framework
+    /// named no label for. 0 means the framework already named every one, or
+    /// MPLS itself was the chosen parser. Diagnostic for the labels-analyze
+    /// tool.
     pub gap_fill_added: usize,
     /// Per-playlist chapter summary: `(playlist_filename, chapter_count, duration_secs)`.
     /// Sourced from MPLS PlaylistMark entries with `mark_type ≤ 1`
@@ -1362,6 +1522,7 @@ mod registry_tests {
 
     fn one_label() -> StreamLabel {
         StreamLabel {
+            stream_id: None,
             stream_number: 1,
             stream_type: StreamLabelType::Audio,
             language: "eng".into(),
@@ -1444,14 +1605,16 @@ mod registry_tests {
     }
 }
 
-// ── gap_fill_from_mpls tests ───────────────────────────────────────────────
+// ── MPLS floor merge tests ─────────────────────────────────────────────────
 
 #[cfg(test)]
 mod gap_fill_tests {
     use super::*;
 
+    /// A vendor label: a slot in one stream table, naming no stream.
     fn label(t: StreamLabelType, n: u16, lang: &str, codec: &str) -> StreamLabel {
         StreamLabel {
+            stream_id: None,
             stream_number: n,
             stream_type: t,
             language: lang.into(),
@@ -1463,87 +1626,150 @@ mod gap_fill_tests {
         }
     }
 
+    /// A derived label: names the stream it describes.
+    fn derived(
+        t: StreamLabelType,
+        clip: &str,
+        pid: u16,
+        n: u16,
+        lang: &str,
+        codec: &str,
+    ) -> StreamLabel {
+        StreamLabel {
+            stream_id: Some(StreamId {
+                clip_id: clip.into(),
+                pid,
+            }),
+            ..label(t, n, lang, codec)
+        }
+    }
+
     #[test]
     fn empty_framework_takes_all_mpls() {
         let mut framework: Vec<StreamLabel> = Vec::new();
         let mpls = vec![
-            label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
-            label(StreamLabelType::Audio, 2, "fra", "AC-3"),
-            label(StreamLabelType::Subtitle, 1, "eng", "PG"),
+            derived(StreamLabelType::Audio, "00001", 0x1100, 1, "eng", "TrueHD"),
+            derived(StreamLabelType::Audio, "00001", 0x1101, 2, "fra", "AC-3"),
+            derived(StreamLabelType::Subtitle, "00001", 0x1200, 1, "eng", "PG"),
         ];
-        fill_gaps_from_mpls(&mut framework, &mpls);
+        merge_mpls_floor(&mut framework, &mpls);
         assert_eq!(framework.len(), 3);
     }
 
+    /// Spec: the merge suppresses a floor entry only when the list already
+    /// NAMES that stream. A framework label occupying the same slot number is
+    /// not the same fact — a vendor slot and a playlist STN slot are different
+    /// coordinate systems — so it suppresses nothing.
+    ///
+    /// This is the merge rule inverted from what it used to be: the old key was
+    /// `(stream_type, stream_number)`, which dropped a floor entry whenever
+    /// some unrelated vendor slot happened to share its number, and kept one
+    /// whenever it did not. Both outcomes were decided by an accident of
+    /// counting.
     #[test]
-    fn framework_covers_all_mpls_no_op() {
+    fn suppression_is_by_named_stream_not_by_slot_number() {
+        // Framework claims audio slots 1 and 2 but names no stream.
         let mut framework = vec![
             label(StreamLabelType::Audio, 1, "eng", "Atmos"),
             label(StreamLabelType::Audio, 2, "fra", "Atmos"),
         ];
         let mpls = vec![
-            label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
-            label(StreamLabelType::Audio, 2, "fra", "TrueHD"),
+            derived(StreamLabelType::Audio, "00001", 0x1100, 1, "eng", "TrueHD"),
+            derived(StreamLabelType::Audio, "00001", 0x1101, 2, "fra", "AC-3"),
         ];
-        fill_gaps_from_mpls(&mut framework, &mpls);
-        assert_eq!(framework.len(), 2, "no gaps to fill");
-        // Framework entries kept verbatim — richer codec_hint survives.
-        assert_eq!(framework[0].codec_hint, "Atmos");
-        assert_eq!(framework[1].codec_hint, "Atmos");
+        merge_mpls_floor(&mut framework, &mpls);
+        assert_eq!(
+            framework.len(),
+            4,
+            "slot collision is not stream identity: both floor entries survive"
+        );
+        // The framework's richer hints are untouched — they simply are no
+        // longer competing with the floor for a number.
+        let vendor: Vec<&str> = framework
+            .iter()
+            .filter(|l| l.stream_id.is_none())
+            .map(|l| l.codec_hint.as_str())
+            .collect();
+        assert_eq!(vendor, vec!["Atmos", "Atmos"]);
     }
 
+    /// A floor entry for a stream the framework already named is redundant and
+    /// is dropped; the framework's own (richer) label for that stream stays.
     #[test]
-    fn partial_yield_fills_gaps_keeps_framework() {
-        // Partial-coverage case: framework matched but only labeled 2 of 6 audios.
+    fn floor_entry_for_an_already_named_stream_is_dropped() {
+        let mut framework = vec![derived(
+            StreamLabelType::Audio,
+            "00001",
+            0x1100,
+            1,
+            "eng",
+            "Atmos",
+        )];
+        let mpls = vec![
+            derived(StreamLabelType::Audio, "00001", 0x1100, 1, "eng", "TrueHD"),
+            derived(StreamLabelType::Audio, "00001", 0x1101, 2, "fra", "AC-3"),
+        ];
+        merge_mpls_floor(&mut framework, &mpls);
+        assert_eq!(framework.len(), 2);
+        assert_eq!(framework[0].codec_hint, "Atmos", "framework label survives");
+        assert_eq!(framework[1].codec_hint, "AC-3");
+    }
+
+    /// Partial-yield case: the framework labelled 2 of 6 audios and 1 of 2
+    /// subtitles. The floor supplies all eight streams; the framework's two
+    /// editorial labels are kept alongside, to be preferred at bind time.
+    #[test]
+    fn partial_yield_keeps_framework_and_adds_the_whole_floor() {
         let mut framework = vec![
             label(StreamLabelType::Audio, 1, "eng", "Atmos"),
             label(StreamLabelType::Audio, 4, "eng", "Commentary"),
             label(StreamLabelType::Subtitle, 1, "eng", "PG SDH"),
         ];
-        let mpls = vec![
-            label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
-            label(StreamLabelType::Audio, 2, "fra", "AC-3"),
-            label(StreamLabelType::Audio, 3, "spa", "AC-3"),
-            label(StreamLabelType::Audio, 4, "eng", "AC-3"),
-            label(StreamLabelType::Audio, 5, "deu", "AC-3"),
-            label(StreamLabelType::Audio, 6, "ita", "AC-3"),
-            label(StreamLabelType::Subtitle, 1, "eng", "PG"),
-            label(StreamLabelType::Subtitle, 2, "fra", "PG"),
-        ];
-        fill_gaps_from_mpls(&mut framework, &mpls);
-        assert_eq!(
-            framework.len(),
-            8,
-            "3 framework + 4 audio fills (2,3,5,6) + 1 subtitle fill (2) = 8"
-        );
-        // sort by (type, number) means audios first
-        let audios: Vec<_> = framework
+        let mut mpls = Vec::new();
+        for (i, lang) in ["eng", "fra", "spa", "eng", "deu", "ita"]
             .iter()
-            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .enumerate()
+        {
+            mpls.push(derived(
+                StreamLabelType::Audio,
+                "00001",
+                0x1100 + i as u16,
+                (i + 1) as u16,
+                lang,
+                "AC-3",
+            ));
+        }
+        for (i, lang) in ["eng", "fra"].iter().enumerate() {
+            mpls.push(derived(
+                StreamLabelType::Subtitle,
+                "00001",
+                0x1200 + i as u16,
+                (i + 1) as u16,
+                lang,
+                "PG",
+            ));
+        }
+        merge_mpls_floor(&mut framework, &mpls);
+        assert_eq!(framework.len(), 3 + 8, "3 framework + all 8 floor streams");
+        let vendor_hints: Vec<&str> = framework
+            .iter()
+            .filter(|l| l.stream_id.is_none())
+            .map(|l| l.codec_hint.as_str())
             .collect();
-        assert_eq!(audios.len(), 6, "all 6 audio slots covered");
-        // Slot 1 + 4 retain framework codec_hint
-        assert_eq!(audios[0].codec_hint, "Atmos");
-        assert_eq!(audios[3].codec_hint, "Commentary");
-        // Slots 2, 3, 5, 6 are MPLS-derived
-        assert_eq!(audios[1].codec_hint, "AC-3");
-        assert_eq!(audios[2].codec_hint, "AC-3");
+        assert_eq!(vendor_hints, vec!["Atmos", "Commentary", "PG SDH"]);
     }
 
     #[test]
     fn orphan_append_skips_matching_type_lang_codec_tuples() {
-        // If a "would-be orphan" actually shares (type, lang, codec)
-        // with a label the framework or MPLS already produced, drop
-        // it — the user-facing rendering would be a confusing
-        // duplicate. Stream_number is computed from the EXISTING
-        // labels' max(stream_number) per type so orphans (when they
-        // do fire) sort cleanly at the tail.
+        // If a "would-be orphan" actually shares (type, lang, codec) with a
+        // label we already have, drop it — the user-facing rendering would be a
+        // confusing duplicate. This fuzzy test is what bounds the orphan list
+        // to a handful of entries per disc; it is a population rule only, and
+        // no longer decides where anything binds.
         let labels = [
             label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
             label(StreamLabelType::Audio, 2, "fra", "AC-3"),
         ];
-        // Simulate the orphan dedup: build the existing-tuple set
-        // the way the production function does, then check exclusion.
         use std::collections::HashSet;
         let existing: HashSet<(StreamLabelType, String, String)> = labels
             .iter()
@@ -1560,52 +1786,30 @@ mod gap_fill_tests {
         );
     }
 
+    /// Sort order is presentation only: audios first, vendor slots ahead of the
+    /// PID-named labels, each group in its own ascending order.
     #[test]
-    fn orphan_append_genuine_orphan_assigned_next_stream_number() {
-        // Hypothetical scenario: framework emitted audio 1+2, MPLS
-        // gap-filled 3-5, CLPI has an orphan audio in (lang=jpn,
-        // codec=DTS) that doesn't collide. Expected: append as audio
-        // stream_number=6 (max existing + 1).
+    fn sort_groups_audio_before_subtitle_and_vendor_before_named() {
         let mut labels = vec![
-            label(StreamLabelType::Audio, 1, "eng", "TrueHD 5.1"),
-            label(StreamLabelType::Audio, 2, "fra", "AC-3 5.1"),
-            label(StreamLabelType::Audio, 5, "eng", "AC-3 2.0"),
+            derived(StreamLabelType::Subtitle, "00001", 0x1200, 1, "eng", "PG"),
+            label(StreamLabelType::Subtitle, 1, "eng", "SDH"),
+            derived(StreamLabelType::Audio, "00001", 0x1100, 1, "eng", "TrueHD"),
+            label(StreamLabelType::Audio, 1, "eng", "Atmos"),
         ];
-        let max_audio: u16 = labels
+        sort_labels(&mut labels);
+        let shape: Vec<(StreamLabelType, bool)> = labels
             .iter()
-            .filter(|l| l.stream_type == StreamLabelType::Audio)
-            .map(|l| l.stream_number)
-            .max()
-            .unwrap_or(0);
-        assert_eq!(max_audio, 5);
-        labels.push(label(StreamLabelType::Audio, max_audio + 1, "jpn", "DTS"));
-        labels.sort_by_key(|l| (type_tag(l.stream_type), l.stream_number));
-        let last_audio = labels
-            .iter()
-            .rev()
-            .find(|l| l.stream_type == StreamLabelType::Audio)
-            .unwrap();
-        assert_eq!(last_audio.stream_number, 6);
-        assert_eq!(last_audio.language, "jpn");
-    }
-
-    #[test]
-    fn sort_groups_audio_before_subtitle() {
-        let mut framework: Vec<StreamLabel> = Vec::new();
-        let mpls = vec![
-            label(StreamLabelType::Subtitle, 1, "eng", "PG"),
-            label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
-            label(StreamLabelType::Subtitle, 2, "fra", "PG"),
-            label(StreamLabelType::Audio, 2, "fra", "AC-3"),
-        ];
-        fill_gaps_from_mpls(&mut framework, &mpls);
-        assert_eq!(framework.len(), 4);
-        assert_eq!(framework[0].stream_type, StreamLabelType::Audio);
-        assert_eq!(framework[0].stream_number, 1);
-        assert_eq!(framework[1].stream_type, StreamLabelType::Audio);
-        assert_eq!(framework[1].stream_number, 2);
-        assert_eq!(framework[2].stream_type, StreamLabelType::Subtitle);
-        assert_eq!(framework[3].stream_type, StreamLabelType::Subtitle);
+            .map(|l| (l.stream_type, l.stream_id.is_some()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (StreamLabelType::Audio, false),
+                (StreamLabelType::Audio, true),
+                (StreamLabelType::Subtitle, false),
+                (StreamLabelType::Subtitle, true),
+            ]
+        );
     }
 }
 
@@ -1695,6 +1899,7 @@ mod apply_tests {
 
     fn sub_label(num: u16, lang: &str, qualifier: LabelQualifier) -> StreamLabel {
         StreamLabel {
+            stream_id: None,
             stream_number: num,
             stream_type: StreamLabelType::Subtitle,
             language: lang.into(),
@@ -1720,6 +1925,7 @@ mod apply_tests {
 
     fn audio_label(num: u16, lang: &str, codec_hint: &str, variant: &str) -> StreamLabel {
         StreamLabel {
+            stream_id: None,
             stream_number: num,
             stream_type: StreamLabelType::Audio,
             language: lang.into(),
@@ -1900,6 +2106,7 @@ mod apply_tests {
             "eng",
         )])];
         let labels = vec![StreamLabel {
+            stream_id: None,
             stream_number: 1,
             stream_type: StreamLabelType::Audio,
             language: "eng".into(),
@@ -1931,6 +2138,7 @@ mod apply_tests {
             "eng",
         )])];
         let labels = vec![StreamLabel {
+            stream_id: None,
             stream_number: 1,
             stream_type: StreamLabelType::Audio,
             language: "eng".into(),
@@ -1960,6 +2168,7 @@ mod apply_tests {
             "eng",
         )])];
         let labels = vec![StreamLabel {
+            stream_id: None,
             stream_number: 1,
             stream_type: StreamLabelType::Audio,
             language: "eng".into(),
@@ -1980,6 +2189,7 @@ mod apply_tests {
     fn apply_sets_qualifier_on_subtitle_sdh() {
         let mut titles = vec![title_with(vec![subtitle(0x1200, "eng")])];
         let labels = vec![StreamLabel {
+            stream_id: None,
             stream_number: 1,
             stream_type: StreamLabelType::Subtitle,
             language: "eng".into(),
@@ -2004,6 +2214,7 @@ mod apply_tests {
     fn apply_flips_forced_flag_on_subtitle_forced_qualifier() {
         let mut titles = vec![title_with(vec![subtitle(0x1200, "eng")])];
         let labels = vec![StreamLabel {
+            stream_id: None,
             stream_number: 1,
             stream_type: StreamLabelType::Subtitle,
             language: "eng".into(),
@@ -2035,6 +2246,7 @@ mod apply_tests {
             audio_label(1, "eng", "Dolby Atmos", ""),
             audio_label(2, "fra", "Dolby Digital", ""),
             StreamLabel {
+                stream_id: None,
                 stream_number: 1,
                 stream_type: StreamLabelType::Subtitle,
                 language: "eng".into(),
@@ -2198,6 +2410,7 @@ mod apply_tests {
         let labels = vec![
             audio_label(1, "eng", "", ""),
             StreamLabel {
+                stream_id: None,
                 stream_number: 2,
                 stream_type: StreamLabelType::Audio,
                 language: "fra".into(),
@@ -2708,6 +2921,316 @@ mod apply_tests {
     fn codec_hint_consistent_lpcm_arm_not_bypassed() {
         assert!(!codec_hint_consistent("Dolby Digital", &Codec::Lpcm));
     }
+
+    // ── provenance: which labels may be reached by counting ────────────────
+
+    /// An MPLS/CLPI-derived label naming clip `clip`, PID `pid`, sitting at
+    /// slot `num` of its own playlist's table.
+    fn derived_sub(clip: &str, pid: u16, num: u16, lang: &str) -> StreamLabel {
+        StreamLabel {
+            stream_id: Some(StreamId {
+                clip_id: clip.into(),
+                pid,
+            }),
+            ..sub_label(num, lang, LabelQualifier::None)
+        }
+    }
+
+    fn derived_audio(clip: &str, pid: u16, num: u16, lang: &str, codec: &str) -> StreamLabel {
+        StreamLabel {
+            stream_id: Some(StreamId {
+                clip_id: clip.into(),
+                pid,
+            }),
+            ..audio_label(num, lang, codec, "")
+        }
+    }
+
+    /// Spec: a label that names its own stream is never reachable through the
+    /// slot lookup, whatever number it carries.
+    ///
+    /// The two numbers are different coordinate systems. A derived label's
+    /// `stream_number` is its slot in ITS OWN playlist's table; the vendor's is
+    /// a slot in the one table the config blob describes. `label_at` answers
+    /// questions about the second, so it must not return the first.
+    ///
+    /// Mutation: drop the `l.stream_id.is_none()` term from `label_at` — the
+    /// derived label at slot 1 is found first and shadows the vendor's.
+    #[test]
+    fn slot_lookup_never_returns_a_label_that_names_its_own_stream() {
+        let labels = vec![
+            derived_sub("00002", 0x1200, 1, "fra"),
+            sub_label(1, "eng", LabelQualifier::Sdh),
+        ];
+        let found = label_at(&labels, StreamLabelType::Subtitle, 1).expect("slot 1 is vendor's");
+        assert_eq!(found.language, "eng");
+        assert_eq!(found.qualifier, LabelQualifier::Sdh);
+    }
+
+    /// Spec: the derived floor does not vote on which title anchors the vendor
+    /// list — and in particular cannot VETO the title that does.
+    ///
+    /// The vendor list names two subtitle slots, eng then fra, and the feature
+    /// reproduces them. The feature has a third subtitle the vendor said
+    /// nothing about; the merge dropped a derived label into "slot 3", numbered
+    /// in a different playlist's coordinate system, and it says Spanish. Read
+    /// as part of the vendor sequence that is a contradiction, so the feature
+    /// is rejected, no title anchors, and every flag the list carries is lost.
+    ///
+    /// This is the measured cost of a whole-sequence gate without provenance:
+    /// the vendor's own slots stay correctly positioned while the merged ones
+    /// break the sequence between them.
+    ///
+    /// Mutation: drop the `l.stream_id.is_none()` term from `label_at` — the
+    /// derived "spa" is read as vendor slot 3, `anchor_score` returns `None`,
+    /// and there is no anchor.
+    #[test]
+    fn the_derived_floor_cannot_veto_the_anchor() {
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::Sdh),
+            sub_label(2, "fra", LabelQualifier::Forced),
+            derived_sub("00050", 0x1202, 3, "spa"),
+        ];
+        let titles = vec![title_on_clip(
+            "00800.mpls",
+            "00800",
+            vec![
+                subtitle(0x12A0, "eng"),
+                subtitle(0x12A1, "fra"),
+                subtitle(0x12A2, "deu"),
+            ],
+        )];
+        assert_eq!(
+            find_anchor(&labels, &titles, StreamLabelType::Subtitle),
+            Some(0),
+            "the feature reproduces every slot the VENDOR named"
+        );
+    }
+
+    /// Spec: among titles the vendor list admits, the one that CONFIRMS more of
+    /// it wins — a slot where both sides state a language and state the same
+    /// one is evidence; a slot where either is silent is not.
+    ///
+    /// Here the shorter title matches both named slots outright while the
+    /// longer one states no language at all, so it merely fails to contradict.
+    /// Size alone would hand the anchor to the title that proved nothing.
+    ///
+    /// Mutation: rank on `n` alone (drop `score` from the comparison) — the
+    /// three-stream title with no languages wins.
+    #[test]
+    fn the_anchor_is_the_title_that_confirms_most_of_the_list() {
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::Sdh),
+            sub_label(2, "fra", LabelQualifier::Forced),
+        ];
+        let titles = vec![
+            // Longer, but says nothing: compatible with anything, confirms none.
+            title_on_clip(
+                "00050.mpls",
+                "00050",
+                vec![
+                    subtitle(0x1200, ""),
+                    subtitle(0x1201, ""),
+                    subtitle(0x1202, ""),
+                ],
+            ),
+            // Shorter, but reproduces the list.
+            title_on_clip(
+                "00800.mpls",
+                "00800",
+                vec![subtitle(0x12A0, "eng"), subtitle(0x12A1, "fra")],
+            ),
+        ];
+        assert_eq!(
+            find_anchor(&labels, &titles, StreamLabelType::Subtitle),
+            Some(1)
+        );
+    }
+
+    /// Spec: an editorial qualifier the vendor list states for ONE stream table
+    /// does not leak onto a different physical stream in a title that merely
+    /// counts to the same ordinal.
+    ///
+    /// Measured shape: the feature carries eleven subtitles whose first is SDH;
+    /// a dozen featurettes each carry a single English subtitle, on a different
+    /// clip and a different PID. Both are "subtitle number 1", so the ordinal
+    /// fallback put SDH on all of them — and the languages agree, so the
+    /// language gate could not catch it. What separates them is that the
+    /// featurette's stream is named by the derived floor, and a label that
+    /// names a stream outranks a label guessed onto it.
+    ///
+    /// Mutation: move the `by_id` lookup in `resolve` after the ordinal
+    /// fallback — the guess wins again and the featurette is SDH.
+    #[test]
+    fn a_vendor_qualifier_does_not_leak_onto_a_featurettes_own_stream() {
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::Sdh),
+            sub_label(2, "fra", LabelQualifier::None),
+            // The floor names the featurette's single subtitle.
+            derived_sub("00076", 0x1200, 1, "eng"),
+        ];
+        let mut titles = vec![
+            title_on_clip(
+                "00800.mpls",
+                "00082",
+                vec![subtitle(0x12A0, "eng"), subtitle(0x12A1, "fra")],
+            ),
+            title_on_clip("00451.mpls", "00076", vec![subtitle(0x1200, "eng")]),
+        ];
+        apply_labels(&labels, &mut titles);
+        assert_eq!(
+            sub_state(&titles[0]),
+            vec![
+                (0x12A0, false, LabelQualifier::Sdh),
+                (0x12A1, false, LabelQualifier::None)
+            ],
+            "the feature IS the table the list describes and keeps its SDH"
+        );
+        assert_eq!(
+            sub_state(&titles[1]),
+            vec![(0x1200, false, LabelQualifier::None)],
+            "the featurette's own stream is not the feature's subtitle 1"
+        );
+    }
+
+    /// Spec: a vendor codec/variant claim does not follow the ordinal onto a
+    /// bonus clip that carries a different codec.
+    ///
+    /// Measured shape: the feature's first audio is object audio; a dozen menu
+    /// and bonus titles each carry one plain stereo track. All of them are
+    /// "audio number 1", and the hint names the same codec family as the stream
+    /// it lands on, so the consistency guard passes it through and every bonus
+    /// clip advertises the feature's format.
+    ///
+    /// Mutation: as above — move `by_id` after the ordinal fallback.
+    #[test]
+    fn a_vendor_codec_claim_does_not_follow_the_ordinal_onto_a_bonus_clip() {
+        // The measured shape: this framework states no codec_hint at all and
+        // puts its descriptor in `name`, which `apply_labels` falls back to
+        // verbatim. Nothing about the stream is consulted on that path, so the
+        // codec-consistency guard never runs and cannot catch the mis-binding.
+        let feature_audio = StreamLabel {
+            name: "English Dolby Atmos".into(),
+            ..audio_label(1, "eng", "", "")
+        };
+        let labels = vec![
+            feature_audio,
+            audio_label(2, "eng", "", ""),
+            derived_audio("00020", 0x1100, 1, "eng", "AC-3"),
+        ];
+        let mut titles = vec![
+            title_on_clip(
+                "00001.mpls",
+                "00000",
+                vec![
+                    audio(0x1100, Codec::TrueHd, AudioChannels::Surround51, "eng"),
+                    audio(0x1101, Codec::Ac3, AudioChannels::Stereo, "eng"),
+                ],
+            ),
+            title_on_clip(
+                "00301.mpls",
+                "00020",
+                vec![audio(0x1100, Codec::Ac3, AudioChannels::Stereo, "eng")],
+            ),
+        ];
+        apply_labels(&labels, &mut titles);
+        let label_of = |t: &DiscTitle, i: usize| match &t.streams[i] {
+            Stream::Audio(a) => a.label.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            label_of(&titles[0], 0),
+            "English Dolby Atmos",
+            "the feature keeps the descriptor its own list states"
+        );
+        assert_eq!(
+            label_of(&titles[1], 0),
+            "Dolby Digital 2.0",
+            "the bonus clip describes the stream it actually carries"
+        );
+    }
+
+    /// Spec: a title whose stream count is smaller than the vendor list's
+    /// highest slot cannot be the table that list describes.
+    ///
+    /// Mutation: drop the `n < extent` term from `find_anchor` — the one-stream
+    /// title becomes eligible, and on a disc where it sorts first it takes the
+    /// anchor away from the title that actually has the slots.
+    #[test]
+    fn a_title_shorter_than_the_vendor_list_cannot_anchor_it() {
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::None),
+            sub_label(2, "fra", LabelQualifier::None),
+            sub_label(3, "deu", LabelQualifier::Forced),
+        ];
+        let titles = vec![
+            // Two streams, both confirming their slot: the strongest evidence
+            // on offer, and still not a table with a third slot in it.
+            title_on_clip(
+                "00050.mpls",
+                "00050",
+                vec![subtitle(0x1200, "eng"), subtitle(0x1201, "fra")],
+            ),
+            // Three streams, only the first stating a language — weaker
+            // evidence, but it is the only shape the list can be describing.
+            title_on_clip(
+                "00800.mpls",
+                "00800",
+                vec![
+                    subtitle(0x12A0, "eng"),
+                    subtitle(0x12A1, ""),
+                    subtitle(0x12A2, ""),
+                ],
+            ),
+        ];
+        assert_eq!(
+            find_anchor(&labels, &titles, StreamLabelType::Subtitle),
+            Some(1),
+            "only the three-stream title can hold a list whose top slot is 3"
+        );
+    }
+
+    /// Spec: a slot the vendor list never names constrains nothing.
+    ///
+    /// These blobs under-yield by design — the authoring layer ships editorial
+    /// labels for the streams it finds interesting and leaves the rest as bare
+    /// slots. Treating a hole as a disagreement rejects the very title the list
+    /// describes. (Before provenance the holes were filled with labels numbered
+    /// in an unrelated coordinate system, so the gate neither rejected nor
+    /// admitted on evidence.)
+    ///
+    /// Mutation: make `anchor_score` return `None` for an unnamed slot — no
+    /// title anchors and the forced flag is never delivered.
+    #[test]
+    fn an_unnamed_slot_does_not_disqualify_a_title() {
+        // The vendor names slots 1 and 3 only; slot 2 is its silence.
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::Sdh),
+            sub_label(3, "fra", LabelQualifier::Forced),
+        ];
+        let mut titles = vec![title_on_clip(
+            "00800.mpls",
+            "00800",
+            vec![
+                subtitle(0x12A0, "eng"),
+                subtitle(0x12A1, "deu"),
+                subtitle(0x12A2, "fra"),
+            ],
+        )];
+        assert_eq!(
+            find_anchor(&labels, &titles, StreamLabelType::Subtitle),
+            Some(0)
+        );
+        apply_labels(&labels, &mut titles);
+        assert_eq!(
+            sub_state(&titles[0]),
+            vec![
+                (0x12A0, false, LabelQualifier::Sdh),
+                (0x12A1, false, LabelQualifier::None),
+                (0x12A2, true, LabelQualifier::Forced),
+            ]
+        );
+    }
 }
 
 // ── fill_gaps_from_mpls: no-op-when-nothing-added hardening ────────────────
@@ -2718,6 +3241,7 @@ mod fill_gaps_sort_tests {
 
     fn label(t: StreamLabelType, n: u16, lang: &str, codec: &str) -> StreamLabel {
         StreamLabel {
+            stream_id: None,
             stream_number: n,
             stream_type: t,
             language: lang.into(),
@@ -2748,7 +3272,7 @@ mod fill_gaps_sort_tests {
             label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
             label(StreamLabelType::Audio, 2, "fra", "AC-3"),
         ];
-        fill_gaps_from_mpls(&mut framework, &mpls);
+        merge_mpls_floor(&mut framework, &mpls);
         assert_eq!(
             framework[0].stream_number, 2,
             "no gap-fill happened, so the original (out-of-order) sequence must survive"
@@ -2766,6 +3290,7 @@ mod clpi_orphan_tests {
 
     fn label(t: StreamLabelType, n: u16, lang: &str, codec: &str) -> StreamLabel {
         StreamLabel {
+            stream_id: None,
             stream_number: n,
             stream_type: t,
             language: lang.into(),
@@ -2882,7 +3407,14 @@ mod clpi_orphan_tests {
         assert_eq!(added, 1);
         assert_eq!(labels.len(), 1);
         assert_eq!(labels[0].stream_type, StreamLabelType::Subtitle);
-        assert_eq!(labels[0].stream_number, 1);
+        assert_eq!(
+            labels[0].stream_id,
+            Some(StreamId {
+                clip_id: "00001".into(),
+                pid: 0x1200
+            }),
+            "the orphan names the stream it was read from"
+        );
     }
 
     /// (b) An audio-range-coded orphan (here DTS-HD MA, the top of the
@@ -2935,10 +3467,18 @@ mod clpi_orphan_tests {
         assert!(labels.is_empty());
     }
 
-    /// (d) Numbering continues from `max(existing) + 1` and increments once
-    /// per new orphan stream, independently of PID order.
+    /// (d) An orphan states NO STN slot, and is identified by the stream it
+    /// was read from instead.
+    ///
+    /// This test used to assert the opposite — that orphans continue the slot
+    /// numbering from `max(existing) + 1`. That number was invented here and
+    /// shared with the coordinate system `label_at` counts vendor slots in, so
+    /// a title with more streams of a type than the vendor list had slots could
+    /// reach an orphan by counting and be labelled from a stream no playlist
+    /// plays. An orphan is by definition in no playlist, hence in no title, so
+    /// there is no ordinal to give it.
     #[test]
-    fn numbering_continues_from_max_existing_and_increments() {
+    fn orphans_state_no_stn_slot_and_name_their_stream() {
         let mut disc = MemDisc::new();
         let udf = fs_with_clpi(
             &mut disc,
@@ -2950,17 +3490,27 @@ mod clpi_orphan_tests {
         let mut labels = vec![label(StreamLabelType::Audio, 3, "jpn", "DTS")];
         let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
         assert_eq!(added, 2);
-        let mut nums: Vec<u16> = labels
+        let orphans: Vec<&StreamLabel> = labels
             .iter()
             .filter(|l| l.stream_type == StreamLabelType::Audio && l.language != "jpn")
-            .map(|l| l.stream_number)
             .collect();
-        nums.sort();
-        assert_eq!(
-            nums,
-            vec![4, 5],
-            "orphans must number 4 and 5 after the existing max of 3"
-        );
+        for o in &orphans {
+            assert_eq!(o.stream_number, NO_STN_SLOT, "an orphan holds no slot");
+        }
+        let mut ids: Vec<u16> = orphans
+            .iter()
+            .filter_map(|o| o.stream_id.as_ref().map(|i| i.pid))
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![0x1100, 0x1101]);
+
+        // And the slot lookup cannot reach one, whatever the ordinal.
+        for n in 0..=6u16 {
+            assert!(
+                label_at(&labels, StreamLabelType::Audio, n).is_none_or(|l| l.language == "jpn"),
+                "slot {n} must resolve to the vendor label or to nothing"
+            );
+        }
     }
 
     /// (e) A CLPI stream whose (type, language, codec) tuple already exists
