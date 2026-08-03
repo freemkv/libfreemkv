@@ -4,1534 +4,732 @@
 
 ### Fixed
 
-- **A vendor label's forced-subtitle field was read as a boolean when it is an
-  enumeration, mislabelling full dialogue tracks and discarding the real forced
-  tracks.** One vendor's `playlists.xml` carries a per-subtitle-slot cell that
-  looks like a flag; the parser treated the value `1` as "this track is forced"
-  and every other value as "not forced". Measured across every image in the
-  corpus that uses this format — seven distinct discs — the cell takes four
-  values, and `1` is not the forced one: it marks a FULL dialogue track that
-  additionally contains some forced-narrative signs. Decoding three of those
-  discs and counting every PGS display set: all nine tracks bearing `1` on one
-  disc are full tracks of 949-1411 display sets, all seven on another are full
-  tracks of 1602-1651, and neither disc's `1` tracks are anything but full —
-  which is how a language ended up presenting as two identical full subtitle
-  tracks with one of them flagged forced. The values that DO name a dedicated
-  forced-narrative track, `2` and `3`, were being thrown away: they take their
-  own trailing stream slots, one per localized language, and measure 7 to 59
-  display sets against the 1216-2655 of the full tracks they duplicate. So the
-  reading was wrong in both directions. The cell is now classified as the enumeration it is; only a
-  dedicated forced slot earns the flag, an unrecognised value never does, and
-  the "contains forced signs" value is dropped rather than weakened into a
-  forced label. This is not something content could have corrected afterwards:
-  clearing a wrong forced label requires a disc whose authoring sets
-  `forced_on_flag`, and measured discs in this format do not set it — so on
-  those discs the vendor cell was, and remains, the only evidence there is.
-  Four of the crate's own tests had been asserting the boolean reading. The
-  other two parsers that emit a forced qualifier from vendor metadata were
-  audited and are structurally immune — in both, the forced marker names a slot
-  of its own rather than hanging off a full track's entry — and are now pinned
-  by tests saying so.
-- **Content-based forced-subtitle detection never observed anything on a
-  feature-length disc.** The PGS probe spent its entire 256 MiB budget on the
-  first sectors of a title, where a feature has no subtitles at all — it hit
-  the budget, observed zero display sets, and contributed nothing to any
-  verdict, so the vendor label was always the only input. The same budget is
-  now SPREAD across each extent as ~16 MiB sample windows sized in proportion
-  to the extent (still on the AACS aligned-unit grid, still bounded by the same
-  ceiling): a track is disproven by any single non-forced display set anywhere,
-  and a genuine forced track is small enough to be caught by the spread. Cost
-  is unchanged; placement is not. The probe also stops spending budget on a
-  track the moment it is disproven, and skips an extent that owes evidence only
-  for such tracks.
-- **A partially-read extent's evidence was memoised as if the whole extent had
-  been read.** A budget-cut (and now sampled) read covers a fraction of an
-  extent, but its result was filed under the extent's full key and replayed to
-  every other playlist sharing the clip — turning a prefix into an absence
-  claim about the whole extent. Cache entries now carry the coverage behind
-  them, and an entry only answers for a run that intended to read no more than
-  it did. Positive evidence (a non-forced display set was seen) still answers
-  regardless, being irretractable.
-- **A forced verdict could rest on a single display set.** Calling a track
-  forced is an absence claim — "no display set here was un-flagged" — and a
-  sampled read sees a fraction of a track. Measured on real discs: tracks exist
-  that carry `forced_on_flag` on about a quarter of their display sets and not
-  on the rest, so catching one flagged set and nothing else is exactly what a
-  wrong promotion looks like. A sampled run now needs at least two display sets
-  before it may assert forced; a run that read every extent end to end has no
-  unread gap and may still promote off one (single-sign forced tracks exist).
-- **Content could never correct a wrong vendor forced label.** The muxer only
-  ever promoted `FlagForced` 0 → 1, so a track labelled forced stayed forced in
-  the output even when the mux had seen every one of its two thousand display
-  sets and not one was forced. Content may now clear the flag too — in the
-  muxer and in the scan-time probe — behind a single shared guard: the absence
-  of `forced_on_flag` means nothing on a disc whose authoring never sets it, so
-  a demotion requires that some other track demonstrably uses the flag AND that
-  the track have the shape of a full dialogue track rather than of a
-  forced-narrative one. Where no track on the disc uses the flag, nothing is
-  demotable.
-
-- **An `.fvi` index named itself as its own source.** The `fvi://` sink was
-  handed the DESTINATION path as its `source_path`, so every index reported
-  `source.path` as the file it was writing. `source.medium` was always `file`
-  whatever the real source, and `source.title` always `0` whatever title was
-  muxed — `docs/FVI_FORMAT.md` §6 defines all three as describing the input.
-  Beyond the wrong data, it made the format non-reproducible: two machines
-  indexing identical bytes produced different files purely because they wrote
-  to different paths, and a local filesystem path leaked into a shareable file.
-  `output()` now takes the source provenance explicitly. One of the crate's own
-  tests had been asserting the wrong value, which is why the suite never caught
-  it.
-- **A vendor label list was re-numbered from 1 inside every title, so the same
-  label landed on a different physical stream in each.** A label list describes
-  ONE playlist's stream table, but it was applied to every title on the disc by
-  per-type ordinal. Where sibling playlists cover the identical feature clip
-  and enumerate different subtitle sets — one carrying a full track the other
-  omits — identical ordinals resolve to different PIDs, and the same stream
-  came out flagged forced in one title and not in the other. On the title such
-  a disc actually offers as the rip target, that put `forced` on an
-  873 MB full-dialogue English subtitle track: the user is shown "English" and
-  "English (Forced)", picks either, and gets the same subtitles. Labels are now
-  bound to the stream a PID identifies, not to a position in a list. The title
-  whose per-type stream-language sequence reproduces the label list is treated
-  as the table the list describes; the `(clip, PID)` facts it yields bind every
-  other playlist over that clip, so a flag lands on the same elementary stream
-  whichever playlist enumerates it, and a stream the list never described is
-  left alone. Streams no such fact reaches still bind by ordinal, but a label
-  whose language contradicts the stream it would land on is now dropped rather
-  than applied — an unlabelled track is a far smaller harm than a mislabelled
-  one, all the more since the muxer can only undo a wrong `forced` on discs
-  whose authoring sets `forced_on_flag` at all. Across the disc-image corpus
-  this cleared every cross-title label conflict, on both affected vendor
-  formats.
-- **Streams borrowed from the playlists were merged into the vendor label list
-  by a number that meant something else, so a bonus clip could be labelled from
-  the feature's tracks.** A vendor label's `stream_number` is a slot in the one
-  stream table its config blob describes. The labels merged in from the
-  playlists to cover streams the vendor named nothing for carried a different
-  number entirely: a dense counter over every distinct stream found while
-  scanning the whole disc in directory order, related to no playlist's slot
-  numbering at all. The merge matched the two by equality, and the binder then
-  counted streams against the result. Measured across the 44-image corpus: 22
-  discs merge such labels, and of the 566 places one lands on a stream, 443
-  (78%) are a stream it does not describe — the label states which PID it read
-  itself from, and it is a different one. 142 of those were already stopped by
-  the language check added alongside the ordinal binding; 301 were applied. The
-  streams-only labels carry no editorial payload, so the direct damage is
-  confined to codec text, but the polluted list is also what the anchor gate
-  reads, and on 11 disc/stream-type pairs it is what decides the anchor — which
-  is how it reaches the vendor's forced and SDH flags. The same defect ran
-  through the clip-info orphan streams, numbered from `max + 1` of a list they
-  share no coordinate system with.
-
-  A label now either NAMES the elementary stream it describes — `(clip, PID)`,
-  read out of the very table the stream itself is built from — or it does not,
-  and only the ones that do not are ever reached by counting. Playlist- and
-  clip-info-derived labels bind by that name and by nothing else; the vendor's
-  bind through the language-sequence anchor as before, over the vendor's own
-  slots only. A named stream outranks a guessed one, so an editorial flag
-  reaches a stream only where the disc's own numbering puts it there. The
-  presence of the name is the provenance marker, which is what the anchor gate
-  was missing: it can now tell the vendor's slots from the borrowed ones, so a
-  slot the vendor never named no longer breaks the sequence, and a title with
-  fewer streams than the list has slots is no longer eligible to hold it. An
-  orphan stream, being in no playlist, is in no title, and now binds to nothing
-  rather than to whatever counted its way.
-
-  Over the corpus, 41 of 44 images are byte-identical and every one of the
-  three that move loses a label it should never have had: a dozen featurette
-  playlists stop reporting a feature subtitle's SDH marking on their own
-  single, unrelated subtitle; eleven menu and bonus titles stop advertising the
-  feature's object-audio format on plain stereo tracks; and on a disc whose
-  every title carries one audio stream, a regional-variant tag that had been
-  asserted on all seventeen titles is asserted on none — that disc's tables are
-  too short to anchor anything, so the tag is no longer claimed anywhere, and
-  in exchange every title now states the codec it actually carries, which none
-  of them did before. No feature title changes on any image. Six of the crate's
-  own tests had been asserting the invented numbering, including one pinning
-  the disc-global counter as a deliberate property.
-- **A subtitle the content probe demoted went on calling itself forced.** The
-  probe writes its verdict to the stream's `forced` flag but left the
-  qualifier alone, and those are two renderings of one fact for two different
-  consumers: the muxer writes Matroska `FlagForced` from the flag, the JSON
-  metadata sidecar writes its qualifier string from the qualifier. A track the
-  probe cleared therefore shipped with a sidecar calling it forced next to a
-  header saying it is not. The demotion now clears the qualifier with the flag.
-  Only a forced claim is cleared — an SDH marking says something the probe
-  neither confirmed nor refuted, and is left alone.
-- **Vendor stream labels were numbered by parsed entry, not by stream slot.**
-  Label blobs contain entries the parser deliberately does not interpret, but
-  those entries still occupy a stream-number slot. Counting only the parsed
-  ones shifted every later label up by the number skipped, so on discs with an
-  uninterpreted entry early in the list the language, forced, SDH and
-  commentary flags were attached to the wrong tracks — a subtitle track could
-  present as both a plain and a forced variant of the same language, with the
-  forced flag landing on neither or both. Four parsers shared the defect
-  (`pixelogic`, `paramount`, `mpls_universal`, `deluxe`); the rest are now
-  pinned by tests proving they are immune. Three of the crate's own tests had
-  been asserting the shifted numbering.
-- **A feature's stream list ran on past its end and picked up menu clips as
-  streams.** The parser for one vendor's label blob finds the feature
-  playlist's section by name and ends it at the next named section — but on
-  most discs of that authoring style the feature playlist IS the last named
-  section, and the trailing per-language notice, disclaimer and dub-credit
-  cards carry no name marker at all. The walk therefore swallowed the whole
-  tail of the blob as more of the feature's own stream list. Those cards are
-  named per language, in the same shape as a stream token, so each one silently
-  advanced a stream-number counter, and the ones whose name collided with a
-  catalogued component were labelled as streams outright — on one disc, five
-  audio labels for slots 10 to 14 of a playlist that has nine. The same
-  collisions were being reported as vocabulary gaps and cost that disc's parse
-  its high-confidence rating. A section now also ends where the next one's
-  stream list begins, which is at a video slot the section has already listed.
-  Eight of eleven affected-format discs in the test corpus have no terminating
-  marker; two of them were producing labels for streams their feature playlist
-  does not contain. No other label parser walks a flat entry sequence this way
-  — the rest scope each stream to a structural range or read its number off the
-  entry itself, and two more now carry tests pinning that.
-- **A forced-narrative subtitle marker went uncatalogued.** The token marking
-  the signs-and-on-screen-text pass that accompanies a dubbed presentation was
-  not in the vocabulary, so that track lost its forced flag while every other
-  language in the same run kept theirs. Vocabulary gaps are also no longer
-  silent: an unrecognized component now produces one aggregated warning per
-  parse naming the distinct components, rather than a bool nobody could see.
-- **A key service that was DOWN was reported as "this disc has no key".** A
-  failed lookup and a successful lookup that found nothing shared a match arm,
-  so an unreachable service, a rejected token and a rate limit all arrived as
-  "no entry". New codes distinguish them: `E7028` service unreachable or 5xx,
-  `E7029` token rejected, `E7030` rate limited. An operator hunting a missing
-  VUK during a transient outage was the actual, observed cost.
+- Forced-subtitle labels from one vendor's disc metadata were being read as a
+  plain flag instead of the multi-value field they actually are, causing some
+  full dialogue tracks to be mislabelled "forced" while the real
+  forced-narrative tracks were dropped. The field is now decoded correctly, so
+  only genuine forced tracks are flagged.
+- Content-based forced-subtitle detection previously only sampled the very
+  start of a title, where a feature typically has no subtitles yet, so it
+  never contributed a verdict. Sampling is now spread across the whole title,
+  so a genuine forced track is reliably found.
+- A caching bug could apply a partial read's "no forced subtitles here"
+  result to an entire disc region, incorrectly suppressing detection on other
+  titles that share the same underlying video. Cache entries are now scoped
+  to the coverage they actually observed.
+- Content-based forced detection no longer promotes a track to "forced" from
+  a single flagged subtitle event; it now requires corroborating evidence,
+  reducing false positives on discs where only a fraction of a track's
+  subtitles are flagged.
+- The muxer previously could only add a "forced" flag from vendor metadata,
+  never remove one, so a wrongly-labelled track stayed wrong even after
+  content analysis proved otherwise. Content evidence can now clear an
+  incorrect forced flag as well as set one.
+- A generated `.fvi` sidecar index used to report itself as its own source
+  file rather than the disc or file it was generated from; it now records
+  the real source.
+- Fixed several vendor label-parsing bugs across multiple disc authoring
+  formats that could apply the wrong language, forced, SDH, or commentary
+  flag to a stream — including labels bleeding across titles on discs with
+  differing stream layouts, labels merged in with the wrong numbering, one
+  parser reading past the end of a title's label list and picking up
+  unrelated menu content, and an unrecognized entry silently shifting every
+  later label onto the wrong stream. Streams are now bound by identity rather
+  than position, and an unlabelled track is preferred over a mislabelled one
+  where the correct binding can't be determined.
+- Added a missing vocabulary entry for a forced-narrative subtitle marker
+  that was previously dropped silently; an unrecognized marker now produces
+  one aggregated warning instead of vanishing.
+- A key-service outage was previously indistinguishable from "this disc has
+  no key" in the reported error. Separate error codes now distinguish an
+  unreachable service, a rejected request, and rate limiting from a genuine
+  no-key result.
 
 ### Breaking
 
-- **`Resolution::pixels()` now returns `Option<(u32, u32)>`, not a bare tuple.**
-  The previous sentinel for "unresolved" was `(0, 0)` — a pair every caller
-  could mistake for a usable value, and one did (see `mp4` under Fixed). Every
-  caller now has to choose what an unresolved resolution means for it: the
-  Matroska and metadata sinks take `.unwrap_or((0, 0))` with the reason stated
-  at each site, the VobSub writer degrades to a palette-only `.idx`, and the
-  MP4 sink refuses the track.
-- **`DiscSession::into_drive()` returns `Result<Drive, Error>`, not a bare
-  `Drive`.** The empty-slot state it used to panic on is reachable through
-  ordinary public use (`stage_drive_as_reader` moves the drive out; calling
-  `into_drive()` twice moves it out again), so the panic was not guarding
-  caller error — it was guarding a legitimate second call.
-- **`DiscSession::drive()` / `drive_mut()` removed.** Dead public API with
-  zero callers anywhere in the toolchain, and panicking accessors are not
-  worth preserving the shape of.
-- **`clpi`: the unused EP-map → sector-extent path deleted** (`get_extents`,
-  `resolved_ep_map`, `full_pts`, `full_spn`, `parse_cpi`, `EpCoarse`,
-  `EpFine`, and the `ep_coarse`/`ep_fine`/`version` fields on `ClipInfo`).
-  Crate-internal (`pub(crate)`), so not source-breaking for an external
-  consumer, but listed here because it removes surface: nothing in the
-  toolchain called it, it carried a truncation bug (fixed in a prior commit,
-  then removed with the code it fixed), and `ClipInfo` keeps only
-  `source_packet_count` and `streams`.
-- New error codes: **E9055** (`Mp4UnknownResolution`), **E9056**
-  (`SyncTimeout`), **E9057** (`SyncWorkerLost`). Front-ends rendering error
-  strings need entries for all three.
+- `Resolution::pixels()` now returns `Option<(u32, u32)>` instead of a bare
+  tuple, so "unresolved" can no longer be mistaken for a real 0×0 value.
+  Callers now have to decide what an unresolved resolution means for them.
+- `DiscSession::into_drive()` now returns a `Result` instead of panicking
+  when called on a session whose drive has already been taken.
+- Removed the unused `DiscSession::drive()` / `drive_mut()` accessors.
+- Removed an internal, unused clip-info parsing path with no callers
+  anywhere in the toolchain.
+- Added new error codes **E9055**, **E9056**, **E9057** for unresolved MP4
+  resolution and sync timeout/worker-loss conditions. Front-ends rendering
+  error strings need entries for all three.
 
 ### Added
 
-- **High-level orchestration API — a single mux driver and a disc session.**
-  `mux_stream` drives the whole read → decrypt → demux → write pipeline for any
-  source (`MuxInput::Url` / `Iso` / `Session` / `Live`), so consumers stop
-  hand-rolling the frame pump. `DiscSession` hoists drive open + SCSI bring-up +
-  scan + key resolution behind one type; `scan_iso` does the same for a
-  file-backed ISO; `resolve_keys` / `resolve_keys_for` resolve base AACS keys.
-  These let the CLI and autorip shrink to thin front-ends (and back the new
-  `freemkv-engine` crate).
-- **Per-title stream selection (`StreamSelection`).** A pure primitive that
-  prunes a `DiscTitle`'s audio/subtitle streams to a chosen set of PIDs (video
-  is always kept) before the mux builds its demux state — so track headers,
-  `codec_privates`, and frame routing all follow the pruned list, with no
-  demux-internal filter. Carried on `MuxOptions.selection` /
-  `InputOptions.selection` (both default to keep-everything, a no-op).
-  Languages are the caller's concern; the library speaks PIDs.
-- `DiscTitle::audio_streams()` / `subtitle_streams()` / `video_streams()` —
-  typed iterators over each stream class.
-- `MuxOptions` gains a per-call write-pipeline `send_deadline` and derives
-  `Default`.
+- A new high-level orchestration API (`mux_stream`, `DiscSession`) drives the
+  full read → decrypt → demux → write pipeline behind a single call, so
+  front-ends no longer need to hand-roll it.
+- Per-title stream selection lets a caller prune which audio/subtitle tracks
+  get muxed, by track identity, before the mux runs.
+- New typed iterators for a title's audio, subtitle, and video streams.
+- `MuxOptions` gained a configurable per-call write-pipeline deadline.
 
 ### Changed
 
-- **The recovery strategy moved to the new `freemkv-engine` crate.** Sweep,
-  patch, the retry-decision state machine, mapfile bookkeeping, and damage
-  classification are freemkv's specific recovery *philosophy*, not disc-access
-  primitives — they now live in `freemkv-engine`, which composes libfreemkv's
-  public API. The library keeps the raw single-shot read, SCSI-sense-fact
-  translation (`SenseFamily`, now in `scsi`), decrypt, and the mux highway.
-- Small deliberate `pub` promotions to support the engine as an external
-  consumer: `Disc::resolve_content_key_map` / `encrypted_content_ranges`,
-  `io::WritebackFile`, `drive::extract_scsi_context`, `disc::locate_ranges`.
-- New typed error classifiers re-exported at the crate root — `is_halt`,
-  `is_skippable_title_stub`, `is_disc_level_no_key` — and a new error variant
-  `SelectionPidUnknown` (E6014).
+- The disc-recovery strategy (retry, patch, damage classification) moved out
+  of this library into a new `freemkv-engine` crate; libfreemkv now keeps
+  only the raw read/decrypt primitives and leaves recovery policy to callers.
+- A handful of internal APIs were made public to support the new engine
+  crate as a consumer.
+- New typed error-classification helpers are now exported at the crate root.
 
 ### Fixed
 
-- **An undecryptable CSS disc no longer exits successfully.**
-  `Error::CssKeyMissing` (E7023) carried two conditions needing opposite
-  responses: one title of a multi-VTS DVD failing its own re-crack — correctly
-  skippable, the rest of the disc still rips — and the *whole disc* failing its
-  crack (`Disc::css_error`), where every title fails identically. Both raised
-  E7023, which `is_skippable_title_stub` classifies, so an uncrackable disc
-  iterated all N titles logging "title skipped" and exited 0. The disc-wide gate
-  (`Disc::ensure_decryptable[_keys]`) now raises `Error::CssNoDiscKey`
-  (**E7027**) — the CSS analogue of `NoDiscKey` (E7022), classified by
-  `is_disc_level_no_key`, so a rip loop fails fast. The per-title raise keeps
-  E7023 and stays skippable.
-- **A corrupt `mkv://` input is no longer reported as a title worth silently
-  skipping.** `Error::MkvInvalid` (E6008) carried two unrelated meanings: the
-  genuine "this title produced no muxable frames" stub — which
-  `is_skippable_title_stub` classifies as skippable, so an all-titles rip drops
-  the title and finishes the rest — and *every* malformed-input rejection in the
-  MKV read path. A truncated file, a bad VINT, a cluster timestamp past
-  `i64::MAX`, a BlockGroup child overrunning its group: all of them classified as
-  skippable, so a broken source was passed over by a run that then exited
-  successfully. The read path now raises `Error::MkvSourceInvalid`
-  (**E9053**) — the counterpart of `Mp4Invalid` (E9049) — and the writer's
-  unrepresentable-element-size guards raise `Error::MkvUnencodable` (**E9054**).
-  Neither is skippable. `E6008` now means only the no-muxable-frames stub (the
-  mux driver's headers-never-resolved gate and the MKV muxer's zero-frame
-  `finish()` guard). The `json://` sink's metadata-encoding guard, which also
-  raised `MkvInvalid`, now raises `NoMetadata` (E9008) like `mux::meta`'s.
-  Front-ends rendering error strings need entries for E9053 and E9054 (and for
-  E9051 / E9052, split off `E6008` earlier in this cycle for the same reason).
-- **The FMTS (AACS 2.1) forensic key resolution now runs once per disc, not once
-  per title.** `Disc::resolve_content_key_map` resolves every title, and the FMTS
-  branch ran ahead of everything else — so each playlist re-walked the UDF
-  filesystem to re-read `/AACS/IndividualSegment.tbl`, re-ran the forensic anchor
-  probe and the per-index phase probe, and **re-asked the key service for the
-  disc's index-key set**. On a 60-playlist AACS 2.1 disc that was 60 identical
-  key-service round trips (a key-server storm) and tens of thousands of random
-  6144-byte reads for one disc-wide answer. The UDF walk is now memoised for the
-  whole disc and the index keys + phases per distinct extent list — the only
-  per-title input to the probes. A read-faulted phase probe is deliberately never
-  memoised, so one bad read is not spread across the remaining playlists. The
-  per-title UDF walk was paid on **every** disc, FMTS or not, so a plain BD sweep
-  loses ~59 full-stroke seeks too. The multi-CPS extent memo added in 1.6.0 is
-  also reachable on an FMTS disc for the first time.
-- **Mux correctness pass** (the `v1.4.0..HEAD` 10-phase audit): DTS core-header
-  false-drops that dropped good DTS frames; the TrueHD channel-correction probe
-  now runs correctly on AACS discs (7.1/Atmos no longer understated as 5.1);
-  an FMTS phase-probe read fault is distinguished from a wrong key; multi-CPS
-  and orphan-clip keying; the AACS key map is now a *positive* map (a sector
-  with no key passes through rather than failing), with fail-loud on genuinely
-  unresolvable keys; a user Stop mid-read is reported as `completed = false`
-  (a stop is not a failure), not a spurious error.
-- **`udf`: deleted files and directories are no longer read as if they still
-  existed.** File-characteristics bit 2 (Deleted, ECMA-167 4/14.4.4) was never
-  decoded, so a deleted File Identifier Descriptor's ICB was followed like any
-  other. A deleted FID is permitted to point at extent length zero — not at a
-  File Entry at all — so following it reads whatever descriptor happens to sit
-  at that LBA: a deleted *directory* landed on the File Set Descriptor and
-  failed enumeration of the **entire volume**; a deleted *file* read back as a
-  genuine zero-byte entry.
-- **`udf`: the Metadata File is now located from the Metadata Partition Map,
-  not assumed to sit at block 0.** UDF 2.50 2.2.10 records a
-  partition-relative Uint32 at offset 40 of the map that is the only
-  authoritative answer to where the file lives; block 0 is merely where most
-  authoring tools happen to put it. A conformant volume that recorded it
-  elsewhere was rejected as not-a-UDF-filesystem, or — on a volume carrying a
-  decoy descriptor at block 0 — silently mounted the wrong filesystem and
-  reported success. Block 0 stays in the candidate chain, so a volume with no
-  map or a wrong one keeps mounting exactly as before; the map is trusted only
-  when its partition type identifier actually reads `*UDF Metadata Partition`
-  (a Virtual or Sparable map is also ECMA-167 Type 2 and records unrelated
-  fields at the same offset).
-- **`udf`: a read fault while locating the Metadata File is now a read error,
-  not "not a UDF disc."** The candidate-loop fix above discarded the
-  distinction between "read fine and the bytes say no" (structural) and
-  "could not read" (transient) — a single marginal-sector fault fell through
-  to the block-0 fallback, mis-tagged, and came back as
-  `Error::UdfNotFilesystem`. `mux::resolve` **memoises that verdict for the
-  whole disc**, so one flaky read silently demoted every remaining title to
-  the base-Unit-Key-only path on an AACS 2.1 forensic disc. The same
-  read-fault-vs-negative-verdict fix is applied to the Volume Descriptor
-  Sequence fallback below.
-- **`udf`: `file_start_lba` no longer returns an unrecorded extent's LBA.**
-  A prior change correctly started retaining ECMA-167 4/14.14.1.1 type-1
-  (allocated-but-not-recorded) extents rather than dropping them — dropping
-  one slides every later extent down by the hole's length — but
-  `file_start_lba` still took the *first* extent unconditionally, so it could
-  hand back a hole's LBA rather than where the file's data actually begins.
-  `ifo.rs` uses this value as the base for every VTS VOB extent
-  (`file_start_lba(IFO) + vtstt_vobs + cell.first_sector`), so a DVD whose IFO
-  opens with a type-1 descriptor read its **entire video title set from the
-  wrong sectors** — no error anywhere, the reads just landed on unrelated
-  data.
-- **`udf`: the Volume Descriptor Sequence fallback now retries on outcome, not
-  on the anchor's declared shape.** The Main VDS was selected from the
-  anchor's declared extent whenever the extent's *shape* was usable (length,
-  location, no address wrap) and the customary fixed location was tried only
-  when the shape itself failed. Shape is a property of the field, not of what
-  is actually there: a stale anchor, a rewritten volume, or deliberate
-  corruption can pass every shape check and point at nothing, in which case
-  the sweep finds no Partition Descriptor and the volume is rejected — on
-  exactly the damaged-disc branch recovery exists for, with no recovery path.
-  Both locations are now candidates and the fallback fires on whether
-  following the anchor actually found anything.
-- **`css`: a sector whose cached title key is proven stale and whose re-crack
-  fails is no longer descrambled with the stale key anyway.** That produced
-  garbage payload behind an intact clear header instead of a hard failure.
-  Raises `Error::DecryptFailed`, matching AACS's behaviour on the same
-  condition.
-- **`decrypt`: an encrypted unit outside every key-map range no longer passes
-  through as ciphertext counted as good bytes.** `extract` could report a
-  scrambled file as complete with exit code 0.
-- **`mux`: frames dropped by the resync gate now reach `errors()`.** The gate
-  zeroes its counter at each resync, so a gap that resolved was previously
-  invisible to the error count even though frames were genuinely lost.
-- **`mux`: a discard by the 8 MiB access-unit backstop now marks the following
-  unit discontinuous.** Previously the resync gate never armed after corrupt
-  input recovered via the backstop, so the discontinuity that should have
-  triggered a resync went undetected.
-- **`mp4`: a video track with no resolved resolution is now refused
-  (`E_MP4_UNKNOWN_RESOLUTION`, E9055) instead of written as a structurally
-  valid, unrenderable 0x0 track.** `Resolution::pixels()`'s old `(0, 0)`
-  sentinel for "unknown" was indistinguishable from a real answer, and MP4 has
-  no optional-element mechanism to omit the field the way Matroska does —
-  `tkhd` and `VisualSampleEntry` both make width/height mandatory. See
-  `pixels()` under Breaking.
-- **`labels`: Deluxe master-enum selection no longer iterates a `HashMap`.**
-  Iteration order over a `HashMap` is unspecified, so the same disc could emit
-  different commentary/SDH labels on different runs. Selection is now
-  deterministic.
-- **`io`: a cancelled rip during the bounded fsync is no longer reported as a
-  hard I/O failure.** The three bounded-fsync failure modes returned bare
-  `io::ErrorKind` values with no `E<code>` prefix, so `is_halt()` — which only
-  recognises that prefix — could not tell a user Stop from a wedged NFS mount
-  from a lost worker thread, and a genuine cancel surfaced as a hard failure
-  at the end of an otherwise-complete mux. They now carry distinct codes:
-  `Error::Halted`, `Error::SyncTimeout` (**E9056**), and
-  `Error::SyncWorkerLost` (**E9057**) — see New error codes under Breaking.
-- **`session`: `into_drive()` is fallible; `drive()` / `drive_mut()` deleted.**
-  See Breaking.
-- **`clpi`: the unused EP-map → sector-extent path deleted**, including a
-  truncation bug it carried (`out_time` past the last EP entry resolved short
-  of EOF). See Breaking.
+- An undecryptable CSS DVD previously reported success after silently
+  skipping every title; a disc-wide decrypt failure is now a hard error
+  instead.
+- A corrupt `mkv://` input is no longer treated as a title worth silently
+  skipping — malformed input now reports as an error rather than an empty
+  result.
+- AACS 2.1 forensic key resolution now runs once per disc instead of once
+  per title, removing a large number of redundant key-service requests and
+  disc reads that were previously repeated on every playlist of a
+  multi-title disc.
+- An internal correctness audit fixed several mux issues: incorrect DTS
+  frame drops, TrueHD channel counts understated on AACS discs, a read fault
+  confused with a wrong decryption key, multi-title keying edge cases, and a
+  user-initiated stop being reported as an error instead of a clean
+  cancellation.
+- Fixed several UDF filesystem parsing bugs: deleted files and directories
+  could still be read as if present (in the worst case breaking enumeration
+  of the whole disc volume); the metadata location is now read from its
+  authoritative on-disc field instead of assumed; a transient read glitch
+  while locating it is no longer mistaken for "not a valid disc"; file
+  locations on fragmented files no longer point at unallocated space; and a
+  filesystem-structure fallback now retries based on whether data was
+  actually found.
+- A disc sector known to need re-decryption is no longer decrypted with a
+  stale key that produces silently wrong output; it now fails cleanly
+  instead.
+- An encrypted unit outside every known key range is no longer silently
+  counted as successfully extracted.
+- Frames dropped during a video resync, and discards from the oversized-frame
+  safety net, are now correctly counted and correctly trigger the following
+  unit's resync.
+- An MP4 video track with no resolvable resolution is now refused rather
+  than written as a broken, unplayable track.
+- Subtitle/commentary label selection for one vendor format no longer
+  depends on unordered internal iteration, which could otherwise produce
+  different labels between runs of the same disc.
+- A cancelled rip during the final disk sync is no longer reported as a
+  hard I/O failure.
 
 ### Tests
 
-- The suite grew from ~2,570 to **2,994** tests over this cycle.
-- A long-standing intermittent failure (roughly 1 run in 10 under the full
-  parallel suite) was diagnosed and removed. It came from asserting on a
-  `tracing` capture: the capturing subscriber is installed thread-local while
-  `tracing`'s callsite-interest cache is global, so the two could race
-  regardless of how carefully the capture was serialised. The predicate is
-  now a named function tested as a plain value, with no subscriber involved.
-  Measured clean afterward: 14 consecutive full-suite runs, 2,994 passed, 0
-  failed.
+- The test suite grew to just under 3,000 tests this cycle, and a rare
+  intermittent failure caused by a logging-capture race was fixed.
 
 ## [1.5.2] — 2026-07-22
 
 ### Fixed
 
-- TrueHD 7.1/Atmos channel correction now works on AACS-encrypted (Blu-ray/UHD)
-  discs. The channel-correction probe was built without an AACS key map, so on
-  every AACS disc its first read failed and the correction was silently skipped —
-  a 7.1/Atmos TrueHD track was muxed with its MPLS-declared channel count (often
-  understated 5.1). The probe now resolves and installs the same key map the mux
-  read uses.
-- AACS 2.1 (FMTS) discs: a non-forensic title (menu/extras playlist, or any clip
-  that carries no forensic segments) no longer hard-fails the rip. `resolve_fmts_key_map`
-  now filters segments to those addressable within the title and falls back to the
-  base Unit-Key map when none apply — previously the first non-forensic title
-  aborted the whole-disc decrypt and blocked muxing any non-main title. A
-  forensic phase probe whose sampled units are all source-zero padding (an
-  even/odd tie) no longer aborts the rip either.
-- Multi-CPS AACS `dir://` extraction now decrypts each clip with its own CPS-unit
-  key instead of keying the whole disc with unit key 0 (which silently wrote
-  secondary-CPS files as garbage). A missing key fails loud at resolve. Single-CPS
-  extraction is unchanged (one key opens every unit, orphan clips included).
-- A trailing partial aligned unit that is inside a mapped range AND flagged
-  encrypted now fails loud (a CBC fragment split across a boundary cannot be
-  decrypted) instead of being emitted as ciphertext-as-clear.
-- CSS DVDs no longer mux to garbage. Every DVD read path — the file-backed mux
-  highway (`build_iso_pipeline`) and the live-drive single-pass `DiscStream` —
-  now resolves the per-VTS title key at read time through one shared step
-  (`resolve_dvd_title_key`), cracked keylessly in playback order from the title's
-  own extents. An uncrackable title hard-fails (E7023) instead of passing
-  scrambled sectors through as plaintext; `--raw` skips the crack entirely; a
-  user Stop mid-crack surfaces as `Halted`.
+- TrueHD 7.1/Atmos channel correction now works on AACS-encrypted Blu-ray/UHD
+  discs; it previously silently failed on every such disc and fell back to
+  an understated 5.1 channel count.
+- AACS 2.1 discs no longer hard-fail when ripping a menu/extras title that
+  carries no forensic key segments; such titles now fall back to the disc's
+  base key.
+- Multi-key AACS extraction now decrypts each clip with its own key instead
+  of one key for the whole disc, which previously produced garbage output
+  for secondary content.
+- A trailing partial encrypted block now fails loudly instead of being
+  silently written out as unencrypted-looking garbage.
+- CSS-encrypted DVDs no longer mux to garbage: every read path now resolves
+  the correct per-title key at read time, an uncrackable title now fails
+  loudly instead of passing through scrambled data, and a user-initiated
+  stop during key cracking is reported as a clean stop.
 
 ### Changed
 
-- DVD scan no longer cracks a title key up front (the key is per-VTS, so a single
-  disc key was meaningless). Scan does only the CSS bus-auth read-unlock — hoisted
-  before the UDF prefetch so scrambled small/menu VOBs no longer cost a rejected
-  read each. Cuts a CSS-DVD scan from ~25s to ~6s.
-- Unlocker report: the DVD entry is renamed `CSS` → `DVD`.
+- DVD scanning no longer cracks a title key up front, since the key is
+  per-title rather than per-disc; this also speeds up scanning a CSS DVD
+  from about 25 seconds to about 6.
+- The DVD entry in the unlock report is renamed from "CSS" to "DVD".
 
 ## [1.5.1] — 2026-07-20
 
 ### Fixed
 
-- **TrueHD audio is no longer silently dropped (and no longer sends decoders out
-  of memory).** The previous release added an MLP major-sync checksum gate to drop
-  genuinely-undecodable audio frames, but the checksum was computed with mismatched
-  byte order — the 16-bit CRC result was folded in one endianness and compared in
-  the other — so it never validated a real major sync. The parser then judged every
-  major sync corrupt and dropped every audio frame from the first one onward,
-  flushing the whole TrueHD track at the end of the file: de-interleaved from the
-  video, which sent players and integrity checkers into an unbounded memory spiral
-  ("decoder ran out of memory"). The checksum now matches the reference
-  implementation byte-exact (cross-verified against real 7.1/Atmos and 5.1 discs),
-  so major syncs validate and only genuinely-corrupt frames are dropped; as a
-  safety net, a major sync the parser still can't validate is kept rather than
-  allowed to drop an entire track. TrueHD titles produced after the checksum gate
-  landed need a re-rip.
-- **HD DVD AACS key files are now found on every disc, not just the common
-  layout.** The AACS directory and title-key filename on HD DVD are chosen by
-  the authoring house, and freemkv previously assumed one fixed spelling
-  (`/ANY!/VTKF000.AACS`). Discs that name their AACS directory differently (e.g.
-  `AAC!` instead of `ANY!`) or ship numbered title-key files (`VTKF090.AACS` /
-  `VTKF100.AACS` rather than `VTKF000.AACS`) are now handled: the AACS directory
-  is located by its contents and every title-key file in it is picked up. Blu-ray
-  and UHD are unaffected.
-- **HD DVD multi-title decryption reads the right keys.** The HD DVD title-key
-  file (`VTKF*.AACS`) stores its keys in 36-byte records — per the AACS HD DVD
-  specification, and confirmed byte-exact on real discs. freemkv had been reading
-  them at a 32-byte stride, which lands the first key correctly but drifts off
-  every key after it, so only single-title discs decrypted. Discs with more than
-  one protected title now recover every title's key instead of only the first.
-  (Choosing the correct title-key file when a disc carries several playlists
-  still needs verification against an encrypted HD DVD.)
-- **A dirty disc can no longer "rip clean" but decode with errors.** freemkv now
-  asks the drive to *report* marginal reads instead of silently returning
-  best-effort data as success — on smudged/scratched media a drive can hand back
-  subtly-wrong bytes with a clean status, which used to slip through the rip and
-  surface only as playback/decode errors. A read the drive had to fight for is
-  now distrusted and re-read in the patch pass: a clean re-read wins, and a spot
-  that's genuinely unreadable becomes an honest gap rather than silently-wrong
-  data. Best-effort per drive, and it changes nothing on a clean disc.
+- TrueHD audio was being silently dropped entirely (and could send players
+  into a memory spiral) due to a checksum bug that made the parser reject
+  every audio frame as corrupt. The checksum is fixed; titles ripped while
+  this bug was present need a re-rip.
+- HD DVD AACS key files are now found regardless of the authoring studio's
+  chosen directory/filename convention, instead of only the most common
+  layout.
+- HD DVD multi-title decryption now reads keys at the correct record size,
+  so discs with more than one protected title decrypt all of them instead of
+  just the first.
+- A disc with marginal, borderline-readable sectors could previously "rip
+  clean" while silently containing corrupted data. Such reads are now
+  flagged and retried, so a marginal spot either recovers cleanly or is
+  reported as an honest gap.
 
 ## [1.5.0] — 2026-07-19
 
 ### Added
 
-- **MP4 as a source (`mp4://`)** — read a progressive `.mp4` back in and send it to
-  any sink (`mp4:// mkv://`, `mp4:// audio://`, `mp4:// json://`, …). The round-trip
-  is frame-exact.
-- **Native MP4 output (`mp4://`)** — a disc goes straight to a play-everywhere
-  `.mp4` in one decrypt pass, no external transcoder. Carries HEVC / H.264 video (with HDR10) and
-  AC-3, E-AC-3, and DTS / DTS-HD audio, and is faststart by default so it plays over
-  HTTP without downloading the end first. It's a **compatibility export, not
-  archival**: MP4 can't hold TrueHD, LPCM, or bitmap (PGS / VobSub) subtitles, so
-  those are **excluded with a loud, itemized report — never a silent drop**
-  (`mkv://` stays the keep-everything path).
-- **Five extraction sinks — dissect a title, don't just rip it.** New destinations
-  that pull one part of a title out on its own:
-  - **`video://dir/`** — each video track to its own native elementary-stream file.
-  - **`audio://dir/`** — each audio track to its own file in its native container
-    (`.thd`, `.dts`, `.ac3`, `.eac3`, `.aac`, `.flac`; LPCM as `.pcm`).
-  - **`sub://dir/`** — each subtitle track to its own file (PGS `.sup`, VobSub
-    `.idx` + `.sub`, text `.srt`).
-  - **`chapters://file`** — a title's chapter markers as a sidecar (`.xml` / `.txt`
-    / `.ogm` / `.vtt`).
-  - **`json://file`** — a title's complete structure as JSON.
-
-  `chapters://` and `json://` read nothing of the elementary streams, so they
-  return in seconds.
-- **Damaged audio frames are dropped instead of shipped as glitches.** When a
-  source disc has a corrupt audio frame, freemkv drops that frame rather than muxing
-  it as a decoder-choking glitch — keeping A/V in sync (a drop is a silence gap,
-  never a shift) and logging every drop. Works across DTS, AC-3 / E-AC-3, FLAC,
-  MP2 / MP3, AAC, and TrueHD, each using the format's own integrity check; a track
-  that is mostly undecodable is dropped whole. This catches structurally-broken
-  frames — corruption of the audio *data* inside an otherwise-valid frame is source
-  damage that can't be told from good data without decoding.
-- **Forced subtitles detected from the stream.** A PGS subtitle track is flagged
-  forced when its content is entirely forced/narrative subtitles, read from the
-  stream itself rather than the disc's metadata — so it works on discs that carry
-  none. `info -v` reports the same, so `info` and a rip agree.
+- MP4 can now be used as a source (`mp4://`), for a frame-exact round trip
+  into any other output format.
+- Native MP4 output (`mp4://`) — rip straight to a play-everywhere MP4 with
+  no external transcoder. It's a compatibility export, not an archival
+  format: tracks MP4 can't hold (TrueHD, LPCM, bitmap subtitles) are excluded
+  with an explicit itemized report rather than silently dropped.
+- Five new extraction destinations for pulling one part of a title out on
+  its own: video-only, audio-only, and subtitle-only file exports, a
+  chapter-markers sidecar, and a full title-structure JSON export.
+- Corrupt audio frames are now dropped instead of muxed as decoder-choking
+  glitches, across every supported audio format, while keeping audio/video
+  in sync.
+- Forced subtitles can now be detected directly from subtitle content, not
+  just disc metadata, so discs that don't flag them are handled correctly
+  too.
 
 ### Changed
 
-- **`json://` emits the complete title model** — every field the scan resolved:
-  video resolution / frame rate / HDR / colour, audio channel layout / sample rate /
-  language / purpose, the subtitle forced flag, plus the clip list and chapter names.
+- The JSON export now includes the complete resolved title model — video,
+  audio, and subtitle details, the clip list, and chapter names.
 
 ### Fixed
 
-- **TrueHD: a couple of transient errors no longer discard a whole track.** A
-  corrupt access unit is dropped forward to the next clean sync point, but a short
-  burst of damage no longer trips the whole-track drop, and a corrupt sync point can
-  no longer shift the audio that follows.
-- **Free-format MP2 / MP3** is a legal, decodable mode and is no longer dropped.
+- TrueHD: brief bursts of stream damage no longer discard an entire track or
+  shift the audio that follows.
+- Free-format MP2/MP3 audio, a legal but less common encoding mode, is no
+  longer rejected.
 
 ## [1.4.5] — 2026-07-18
 
 ### Fixed
 
-- **FMTS (AACS 2.1) forensic discs now mux to a clean, single-variant stream.** A
-  forensic segment interleaves the local device group's variant with a foreign
-  group's at the aligned-unit level. The mux decrypted only our half but left the
-  foreign half in the buffer as ciphertext, on the assumption that the demuxer
-  "drops untouched ciphertext cleanly." It does not — a foreign unit's bytes hit a
-  tracked PID at the 192-byte stride, mis-parse, and trip the demux's concealed-gap
-  keyframe resync, which discards good frames of ours around every segment (visible
-  playback glitches). `AacsKeyMap::read_plan` now turns the map into the title's
-  read plan: every default / CPS unit, plus inside a forensic segment **only our
-  phase's units**. The foreign half is never read, decrypted, or handed to the
-  demux. On a retail 4K UHD title this took concealed-gap resyncs from **349 → 0**
-  and recovered ~2 GB of previously-dropped frames. Wired into **both** mux paths —
-  the file-backed highway (`build_iso_pipeline`) and the inline live-drive
-  `DiscStream` (`with_key_map`) — so single- and multi-pass FMTS rips are both clean.
+- AACS 2.1 forensic discs now mux to a clean single-variant stream instead
+  of interleaving foreign forensic data, which previously caused visible
+  playback glitches and dropped good frames around each forensic segment.
 
 ### Changed
 
-- **Key-bearing types redact their `Debug` output.** Every type that carries key
-  material (device keys, processing keys, unit keys, media keys, VUKs, resolved
-  chains, CSS/AACS state, …) now prints a `<redacted>` marker instead of the bytes,
-  so no key can reach a log or panic message. Each is covered by a test asserting no
-  key byte appears.
-- **Hex parsing is centralized and case-insensitive.** A single set of canonical
-  `0x`/`0X`-tolerant hex→integer parsers replaces scattered ad-hoc parsing (this is
-  what silently dropped keydb device keys written with an uppercase `0X` prefix).
-- **Internal-only public surface narrowed to `pub(crate)`, and duplicate
-  `foo_with_X` methods collapsed to one** — no behavioral change, smaller API.
+- Types carrying decryption key material now redact their debug output, so
+  a key can no longer end up in a log or crash message.
+- Hex parsing is now centralized and case-insensitive (previously an
+  uppercase-prefixed key value could be silently dropped).
+- Internal-only APIs were narrowed in visibility; no behavior change.
 
 ## [1.4.4] — 2026-07-17
 
 ### Fixed
 
-- **Online key requests are no longer silently dropped on discs that yield few
-  sample units.** The online key source refuses any request carrying fewer than
-  `MIN_SAMPLE_UNITS` (8) encrypted-content samples — too few can match an
-  incidental unit rather than the one asked about (a false positive, most acute on
-  AACS 2.1 forensic-variant content). autorip gathered only 4, so every online
-  lookup was skipped before it ever reached the key service and surfaced to the
-  user as "key service down." autorip's sample count is now tied to
-  `MIN_SAMPLE_UNITS` with a **compile-time floor**, so it can never regress below
-  the minimum again.
+- Online key lookups were being silently skipped before ever reaching the
+  key service, because too few content samples were gathered. The minimum
+  sample count now has a compile-time floor so this can't regress.
 
 ### Changed
 
-- **The online request is assembled from a proven-sufficient sample set.** New
-  `DecodeSampleSet` (`libfreemkv::keysource`) wraps the content-unit samples and
-  can only be constructed with at least `MIN_SAMPLE_UNITS` of them — so an online
-  key request cannot be built from too few samples. The minimum is validated once,
-  at construction, rather than by a runtime check a caller could forget.
+- The set of samples used to build an online key request is now validated
+  at construction time rather than by a runtime check that could be
+  forgotten.
 
 ## [1.4.3] — 2026-07-17
 
 ### Changed
 
-- **`MIN_SAMPLE_UNITS` moved to the base crate.** The minimum sample count an
-  online key request must carry now has a single definition in
-  `libfreemkv::keysource`; `freemkv-keysources` re-exports it, so the online source
-  and libfreemkv's own forensic query size their requests from one shared value.
-- **The online unit-key reply is parsed as a list.** A response carries either a
-  single Unit Key (ordinary disc) or the full ordered set (an AACS 2.1
-  forensic-variant disc); the client accepts both and maps array position to
-  forensic index.
+- The minimum sample count required for an online key request now has one
+  shared definition across crates.
+- The online key-service reply is now parsed as a list, supporting both an
+  ordinary single key and a full forensic key set.
 
 ### Added
 
-- **Forensic-variant online query samples the anchor segment.** On an AACS 2.1
-  forensic-variant disc the online key query draws its sample from the first
-  forensic segment (index 1) — one canonical, deterministic sample — instead of an
-  arbitrary segment.
+- Forensic-disc online key queries now sample from one consistent,
+  deterministic segment instead of an arbitrary one.
 
 ## [1.4.2] — 2026-07-15
 
 ### Fixed
 
-- **Mux no longer nulls decryptable video or storms the key server on a
-  bad-encoded region.** 1.4.1 relaxed the decrypt gate but left the surrounding
-  machinery in place. On a unit whose key *decrypted* but whose plaintext didn't
-  reassemble to clean MPEG-TS, the read path still restored ciphertext, tallied
-  loss, and re-asked the online key server (forever returning the same correct key)
-  while the mux concealed the unit as NULL TS. The root cause: *"did a key produce
-  clean TS?"* was used as the verdict *"did we decrypt?"* — they are not the same.
-  A correct key can decrypt content with broken encoding; broken TS is a muxer
-  concern, never a decrypt verdict.
+- Fixed a bug where content that decrypted successfully but didn't parse as
+  clean video could cause the mux to null out good video and repeatedly
+  re-query the key server for a key it already had.
 
 ### Changed
 
-- **One decrypt authority; policy at the caller.** `decrypt_sectors` is now a
-  pure decrypt: applies the CPS unit key in place, leaves plaintext, and reports
-  unverified bytes. It never restores ciphertext, nulls, or re-fetches a key.
-  Clean-TS status is only a key-*selection* hint (multi-CPS) or a read-*verify*
-  signal (sweep/patch). Callers own the policy: the mux passes decrypted bytes
-  through unconditionally (the demuxer handles bad TS); sweep/patch treat an
-  unverified unit as a failed read and re-read it. Removes the decrypt-time
-  ciphertext restore, the mux NULL-TS conceal loop, and the per-unit key-server
-  refetch, plus the dead `aacs_unit_still_ciphertext` predicate.
-
-- **Decrypt and TS-structure are now separate primitives.** AACS has no MAC;
-  the only "did it decrypt?" signal is whether plaintext looks like MPEG-TS —
-  a data-quality / key-selection question, not a decrypt verdict. The old
-  `decrypt_unit(...) -> bool` is split into `decrypt_unit_raw` (pure crypto) and
-  `is_clean_ts` (structural check), composed explicitly only where needed. The
-  mux calls only `decrypt_unit_raw`.
-
-- **Key-proof floor replaces the 75% supermajority.** The old proportion
-  (≥75% of content packets synced) conflated *the key worked* with *the content
-  is well-encoded*. `is_clean_ts` now requires `synced >= min(E, 4)` on
-  **encrypted** packets (skipping packet 0 whose `0x47` is in the clear seed):
-  four synced packets ≈ 1-in-4-billion false-positive; `min(E, 4)` scales to
-  short fragment tails so they're never false-rejected. A unit is "opened" when
-  a handful of packets prove the key — bad-encoded packets are the muxer's job.
+- Decryption is now a single, pure operation with no fallback behavior baked
+  in; whether decrypted output "looks like" valid video is now a separate,
+  caller-decided concern rather than conflated with decrypt success.
+- The pass/fail threshold for judging decrypted output as valid was
+  tightened.
 
 ## [1.4.1] — 2026-07-14
 
 ### Fixed
 
-- **Mux no longer discards good video over a single defective packet.** AACS
-  decryption required **every** content packet to be conformant MPEG-TS: one
-  authored-bad packet (encoding defect, AACS 2.1 forensic-variant frame) made
-  the mux conceal the **whole** 6144-byte aligned unit as NULL TS (up to 31/32
-  good packets discarded, tallied as loss). On affected discs this produced
-  false "corruption" over otherwise-perfect video (~466 MB concealed across two
-  UHD titles). The gate is now a padding-aware **≥75% supermajority** of content
-  packets restoring their `0x47` sync — no wrong key reaches this threshold
-  (uniform-AES noise floor ≈ 256⁻ⁿ), but a minority of authored-bad packets
-  still passes. Opened units flow through verbatim; the demuxer drops
-  non-conforming packets on sync-loss. TS-sync conformance is a muxer concern,
-  never a decrypt verdict. (The supermajority threshold is tightened in 1.4.2.)
-- **MVC (Blu-ray 3D) track signals unified and hardened.** The `mvcC`
-  `CodecPrivate` extension, the `BlockAdditionMapping`, and each frame's
-  `BlockAdditional` now all derive from a single `MVCDecoderConfigurationRecord`
-  built once per track, so they can no longer diverge. A track is flagged 3D
-  only when that record actually builds — a malformed dependent-view parameter
-  set no longer emits a mapping with no matching record (previously the flag was
-  taken from `mvc_params.is_some()`, which could orphan a `BlockAddID`). The base
-  track's `CodecPrivate` now carries the `mvcC` extension block
-  (`avcC ‖ u32be(size) ‖ "mvcC" ‖ record`, Matroska-spec size = block − 4) so
-  players and mediainfo detect MVC at the track level.
+- The mux no longer discards an entire block of good video over a single
+  defective packet; a small minority of bad packets in an otherwise-good
+  block is now tolerated instead of blanking the whole block.
+- 3D Blu-ray (MVC) track signals are now derived from one shared source, so
+  they can no longer disagree with each other, and a track is only flagged
+  3D when that data is actually available.
 
 ## [1.4.0] — 2026-07-13
 
 ### Added
 
-- **Blu-ray 3D (MVC) support.** A 3D disc now rips to an MKV that preserves
-  **both eyes** as a single MVC video track — the AVC base (left) view in each
-  Block, and the MVC dependent (right-eye) view as a per-frame `BlockAdditional`
-  under an `mvcC` `BlockAdditionMapping` (`MVCDecoderConfigurationRecord` per
-  ISO/IEC 14496-15 §7.6.2), paired to the base by PTS. Remux only — no
-  transcode, no side-by-side conversion. The Blu-ray scan reads the interleaved
-  `STREAM/SSIF/<clip>.ssif`, enumerates the dependent view (stream_type `0x20`)
-  by the BD-3D PID convention, and parses it in a parameter-set-passthrough mode
-  so every dependent frame is a self-contained access unit. Verified on
-  *300: Rise of an Empire*: one MVC track, ~8.7 GB dependent payload carried in
-  per-frame BlockAdditionals, base view byte-identical to the 2D rip.
+- **Blu-ray 3D (MVC) support.** A 3D disc now rips to a single MKV video
+  track preserving both eyes, remuxed with no transcoding or side-by-side
+  conversion. Verified against a retail 3D Blu-ray disc, with the base (2D)
+  view byte-identical to a standard 2D rip.
 
 ## [1.3.2] — 2026-07-10
 
 ### Added
 
-- **AACS 2.1 (FMTS) variant-decode foundation.** `UnitKey` gains a
-  `variant_number` field (`0` = ordinary content, `1..=32` = a forensic
-  variant) with `UnitKey::new` / `UnitKey::variant` constructors, and a new
-  `aacs::variant_select` module resolves a disc's single forensic variant and
-  classifies each aligned unit — decrypt with the default key, decrypt with the
-  variant key, drop a foreign variant, or conceal a keyless forensic unit. This
-  is the groundwork for selecting one variant's segments and dropping the other
-  31; the decrypt-pipeline wiring lands with the variant key source.
+- Laid groundwork for AACS 2.1 forensic-variant support: the library can now
+  identify a disc's forensic variant and classify each block accordingly,
+  ahead of full decrypt support landing.
 
 ### Fixed
 
-- **`IndividualSegment.tbl`: the per-record field is the variant, not a segment
-  number.** `Segment.number` → `Segment.variant`. Verified against a retail 2.1
-  disc, the field cycles `1..=32` across the table (a per-variant tag) rather
-  than counting up, so variant selection routes on the correct value.
+- Corrected a misread field in the AACS 2.1 segment table that had been
+  treated as a segment number when it actually identifies the forensic
+  variant.
 
 ## [1.3.1] — 2026-07-10
 
 ### Licensing
 
-- **Relicensed to the MIT License, from 1.3.1 onwards** (releases up to and
-  including 1.3.0 remain under AGPL-3.0).
+- Relicensed to the MIT License from 1.3.1 onward (releases through 1.3.0
+  remain AGPL-3.0).
 
 ### Added
 
-- **Authoritative HD-DVD title composition** from the Advanced-Content playlist
-  (`ADV_OBJ/VPLST000.XPL`): each title's clips, real duration, display name, and
-  chapters come from the disc's own playlist instead of a clip-name heuristic. A
-  layer-break split (`FEATURE_1`+`FEATURE_2`, `feature`/`feature_Divide`) composes
-  into ONE title with the two parts as clips and their title-time offsets. Falls
-  back to the clip-name heuristic when no playlist is present.
+- HD-DVD title composition now reads authoritative data from the disc's own
+  playlist (clips, duration, name, chapters) instead of guessing from clip
+  names, with the old heuristic kept as a fallback when no playlist is
+  present.
 
 ## [1.3.0] — 2026-07-08
 
 ### Added
 
-- **AACS 2.1 (FMTS) is a first-class disc format.** FMTS discs are detected,
-  labeled, and scanned as their own format rather than misread as plain UHD. The
-  forensic variant segments are located from `IndividualSegment.tbl` and the
-  `SegmentKey.tbl` container is parsed; the bulk of the title decrypts with the
-  unit key as usual, and the forensic segments (for which no segment-key source
-  exists yet) are skipped as expected loss, so a 2.1 disc rips mostly-complete
-  instead of failing outright.
-- **AACS 2.1 variant Media Key chain runs end to end.** The variant media key is
-  derived as a clean Processing-Key to media-key primitive, with the record
-  layout pinned against reference variant MKBs — the per-slot `C` block from the
-  `0x0c` cvalue table, the `VARIANTS` table plus trailing nonce at `0x2d`, and
-  `VKD` at `0x2f` — so a genuine variant MKB resolves through the ladder.
-- **Partial HD-DVD support.** HD-DVD is detected as its own format and its
-  `HVDVD_TS` `.evo` clips mux through the pipeline: EVO video is demuxed from the
-  MPEG program stream, including VC-1 titles carried on extended stream id `0xFD`
-  (real selector in the PES `stream_id_extension`), with the VC-1 access units
-  reframed so each I-frame keeps its preceding sequence and entry-point headers.
-  Title composition is heuristic for now (authoritative program-chain parsing is
-  planned), so a disc that authors two distinct features under the layer-break
-  naming may present them as one title.
-- **Display-order timestamps for program-stream H.264 / VC-1 / HEVC.** A program
-  stream stamps a PES PTS only once per GOP; the parsers now reconstruct a
-  display-order PTS per frame from the coded picture type and the sparse anchor
-  (duration self-calibrated from anchor spacing), so a decoder no longer sees
-  colliding DTS. Gated to the program-stream path — the BD/UHD transport path
-  (per-frame PTS) is unchanged.
-- **Stream-label parsers: reader-backed detection and a menu-language fallback.**
-  Label detection can inspect a jar's contents, so vendor parsers claim only
-  their own discs; a new last-resort parser reads menu-artwork languages.
-- **keydb round-trips AACS 2.0 host certs** (the `HC2` line) so a load/save cycle
-  no longer drops v2 host credentials.
+- AACS 2.1 (FMTS) is now recognized and scanned as its own disc format
+  rather than misread as plain UHD; the bulk of a 2.1 disc now rips
+  successfully, with only the not-yet-supported forensic segments skipped as
+  expected loss.
+- The AACS 2.1 media-key derivation chain now runs end to end against
+  reference data.
+- Initial HD-DVD support: HD-DVD is now detected as its own format and its
+  video/audio content muxes through the pipeline. Title composition is
+  still heuristic — a disc that authors two features under one naming
+  convention may present as a single title.
+- Program-stream video formats (H.264, VC-1, HEVC on HD-DVD/older discs) now
+  get correctly reconstructed per-frame timestamps instead of colliding
+  decode timestamps.
+- Stream-label detection is now more robust to differing disc authoring,
+  with a last-resort fallback that reads menu-artwork languages.
+- Loading and saving a key database no longer drops AACS 2.0 host
+  credentials on a round trip.
 
 ### Changed
 
-- **MPEG-2 reassembles through the shared `AuAssembler`.** The MPEG-2 parser's
-  hand-rolled PES buffer and offset-keyed mark queues are replaced by the same
-  access-unit assembler the H.264/HEVC/VC-1 parsers use (in a new MPEG-2 mode);
-  the GOP-buffered `temporal_reference` reorder and PTS origin-locking are
-  unchanged, so DVD output is identical.
-- **Generic per-scheme recovery seam.** Decrypt-miss handling is now a
-  scheme-neutral seam the input stream installs (no recovery, or an AACS
-  fresh-key fetch), with CSS self-recovering separately from the data itself. An
-  undecryptable unit is counted the same whatever the scheme, so the separate
-  "undecryptable" loss bucket folds into one loss count.
-- **`aacs` module reorganized.** The former god-module is split into
-  `media_key` / `volume_key` / `inf` / `resolve` / `mkb` / `crypto` / `content`,
-  the `boil` veneer is removed, and module paths (not a `mod.rs` facade) are the
-  public API.
+- MPEG-2 parsing now shares the same frame-reassembly code as the other
+  video codecs, with no change in output.
+- Decrypt-failure handling is now unified across encryption schemes rather
+  than handled separately per scheme.
+- The internal AACS module was reorganized into smaller, focused modules;
+  no behavior change.
 
 ### Fixed
 
-- **Main title is chosen by largest physical size, not clip count**, so a
-  chapter-per-clip disc (e.g. Fast & Furious) is no longer mis-ranked behind a
-  virtual composite.
-- **A fresh-rip ISO `sync_all` failure is no longer swallowed**: `is_regular` is
-  read from the open file handle instead of a pre-create `metadata(path)` that
-  always failed on a path that does not exist yet.
-- **A transient CLIP-info parse failure no longer suppresses a clip's extents**
-  for a later playlist item that references the same clip.
-- **Reverify downgrades that fail to persist are logged, not swallowed**, so a
-  bad unit cannot be silently mismarked good on resume.
-- **The CLI sanitizes on-disc metadata** (title, volume label, playlist, stream
-  labels) before printing, so a crafted disc cannot inject terminal escape
-  sequences.
-- **keydb entry validation matches the parser exactly** — a `0x` line counts only
-  with a ` = ` — so content that parses to zero usable entries can no longer be
-  saved as valid.
-- **autorip** recovers a poisoned config lock in the rip thread instead of
-  panicking it, and corrects the resume pass count.
-- Criterion stream numbering (a map value of 0 no longer shadows stream 1); AACS
-  resolve classifies a media-keys-only source missing the VID as "VID
-  unavailable"; a dropped partial PES flags a discontinuity; the no-demuxer path
-  detects an early consumer disconnect.
+- Main-title selection now picks the largest title by physical size rather
+  than by clip count, so a disc that splits its main feature across many
+  small chapter clips is no longer mis-ranked behind a shorter virtual
+  composite.
+- A fresh-rip ISO write failure at final sync is no longer silently
+  swallowed.
+- A transient read failure while parsing one clip's info no longer
+  suppresses that clip's data for a different title that references it.
+- Reverify downgrades that fail to save are now logged instead of silently
+  discarded.
+- The CLI now sanitizes on-disc metadata (title, labels) before printing
+  it, so a malicious disc can't inject terminal control sequences.
+- A key-database entry is now validated with the same rule the parser uses,
+  so invalid content can no longer be saved as if it were valid.
+- autorip now recovers cleanly from a poisoned lock instead of crashing the
+  rip thread, and correctly counts resume passes.
+- Several smaller fixes: stream numbering, AACS key-source classification,
+  discontinuity flagging on a dropped frame, and early-disconnect detection.
 
 ### Performance
 
-- **Decrypt thread count is resolved once** and cached off the per-buffer hot
-  path (the env var and `available_parallelism` are no longer probed per call).
+- Decrypt thread count is now resolved once and cached, instead of being
+  recomputed on every call.
 
 ## [1.2.2] — 2026-07-04
 
 ### Added
 
-- **AACS 2.1 Media Key Variant support.** The Media Key Variant scheme is now
-  detected and parsed from the real MKB record types found on variant discs —
-  `0x2d` (Encrypted Media Key Variant Data), `0x2f` (Variant Key Data table,
-  65,535 × 16), and `0x0c` (variant cvalues, one per subset-difference slot) —
-  replacing the earlier placeholder `0x82`/`0x83` types, which were a guess and
-  appear on no real MKB. The V2.0→V2.1 upgrade detection and fixtures are updated
-  accordingly, so a genuine AACS 2.1 variant disc now resolves.
-- **`resolve_candidate`** — one composed, pure-derivation boil-down for a
-  candidate key at any ladder rung (DK/PK/MK/VUK → terminal unit keys), parsing
-  `Unit_Key_RO.inf` at the disc's declared AACS version and returning every CPS
-  unit key. Consumers stop re-composing the ladder; every client hardens a single
-  implementation.
+- AACS 2.1 Media Key Variant support is now based on the real record types
+  found on variant discs, replacing an earlier placeholder that matched no
+  real disc.
+- Added a single shared function for deriving any AACS key-ladder rung from
+  device/processing/media keys, so every consumer uses one hardened
+  implementation instead of re-deriving it themselves.
 
 ### Fixed
 
-- **`mk_from_dk` does the real Subset-Difference walk again.** It previously ran
-  the Media-Key-Variant path, which needed an integrator KCD absent in-tree and
-  errored for every real disc — effectively dead for both consumers. It now
-  performs the genuine device-key SD walk; the Volume ID enters at the VUK step
-  (where it belongs), not the MK step. This revives the DK→MK fallback across the
-  toolchain (`freemkv-keysources` adopts the corrected two-argument call).
-- **autorip: a down online key service is no longer reported as a missing key.**
-  When the online key source resolves no key for an encrypted disc, autorip now
-  runs one bounded reachability probe (SSRF-pinned, ~8 s, no redirects) and
-  distinguishes a transient outage (transport error / 502·503·504 → down; 429 →
-  rate-limited) from a genuine no-key (any real HTTP answer → up). A transient
-  verdict triggers a bounded key-resolution retry (3 attempts, 8/16/32 s backoff)
-  and, if the service stays down, parks the disc in a distinct retryable state
-  ("Key service unavailable — temporary outage, not a missing key; will retry.")
-  instead of the permanent "no keys found". Never hammers the drive or service.
+- Fixed AACS device-key fallback derivation, which had been silently broken
+  and unusable for both callers that relied on it.
+- autorip no longer reports a down key service as "no key found": it now
+  probes for a transient outage, retries with backoff, and reports
+  "temporarily unavailable" instead of the permanent no-key state.
 
 ### Performance
 
-- **Processing-Key resolution is ~15× faster on UHD.** A Processing Key is the
-  key at its subset-difference node (one AES-G from the Media Key), so it is now
-  tried directly against the MKB cvalue tables (direct PK × cvalue iteration)
-  instead of BFS-walking the SD tree at unknown depth — which was both wrong for
-  terminal PKs and slow on a large UHD MKB (~181k cvalues). PK derivation on UHD
-  drops from ~37 s to ~2.4 s; the SD tree walk now lives solely in the device-key
-  path.
+- AACS processing-key resolution on UHD discs is roughly 15× faster,
+  dropping from about 37 seconds to about 2.4 seconds.
 
 ### autorip
 
-- **Clear stuck move errors from the System tab.** Each move-queue error now has
-  a ✕ to dismiss it, plus Clear all and Refresh — so a resolved or stale error
-  can be cleared without restarting the container (the mover re-records any that
-  are still genuinely failing on its next tick).
+- Move-queue errors in the System tab can now be dismissed individually or
+  cleared/refreshed in bulk, without restarting the container.
 
 ## [1.2.1] — 2026-07-02
 
 ### Fixed
 
-- **DVD DTS audio no longer muxes with non-monotonic timestamps.** A DVD
-  Program Stream packs several DTS core frames into one PES packet; the parser
-  stamped every access unit with that single PES timestamp and no per-frame
-  duration, so consecutive frames collided on one PTS and a strict decode/remux
-  a standard validator rejected the track — `non monotonically increasing dts to muxer`.
-  The DTS parser now derives each core frame's duration from its header
-  (`(NBLKS+1)*32` samples ÷ the `SFREQ` sample rate) and re-bases to each PES's
-  own container timestamp, advancing by a frame duration only *within* a single
-  PES — so the track stays monotonic and does not drift past its real length on
-  a feature-long title. The UHD DTS-HD MA path (one access unit per PES) is
-  unaffected: each unit keeps its own PES timestamp, preserving the 1.2.0 per-PES
-  attribution. Completes the DVD DTS fix begun in 1.2.0 (which corrected the
-  silent-track routing, exposing this timing bug). Note: genuinely corrupt
-  source DTS frames — valid framing, bad audio blocks — are passed through
-  faithfully; freemkv never fabricates or drops audio it can't prove is bad.
+- DVD DTS audio no longer muxes with non-monotonic timestamps, which some
+  strict validators rejected. Each frame's duration is now derived from its
+  own header instead of sharing one timestamp across multiple frames packed
+  into the same container packet. Genuinely corrupt source audio is still
+  passed through rather than dropped or fabricated.
 
 ## [1.2.0] — 2026-07-01
 
 ### Breaking
 
-The disc's AACS version is now carried through the key-resolution path as the
-single source of truth for the `Unit_Key_RO` stride (AACS-1.0 = 48-byte,
-AACS-2.x = 64-byte), so keys are always read at the disc's own layout. That
-threaded one new value through three public signatures. In-tree consumers
-(`freemkv`, `autorip`, `freemkv-keysources`) are updated; external callers must
-adjust:
-
-- **`DiscInputs` gains a `version: u8` field** (between `volume_id` and `mkb`).
-  Code constructing it with a struct literal must add the field. It is normally
-  obtained from `Disc::inputs()`, not constructed by hand.
-- **`keysource::DiscInputsCtx::new` takes one argument, not two** — the version
-  is now read from `inputs.version` (`new(inputs)` instead of
-  `new(inputs, version)`).
-- **`disc::read_aacs_inputs` / `read_aacs_inputs_from_drive` return a 3-tuple**
-  `(inf, mkb, version)` instead of `(inf, mkb)`.
-- **`PassProgress` is no longer `Copy` and gains a `located: LocatedProgress`
-  field.** It now carries a `Vec` (the rendered bad-range drilldown), so it's
-  `Clone` only — still built once per throttled emission and passed by reference
-  to `Progress::report`. Struct-literal constructors must add the field (empty:
-  `located: Default::default()`). New public types `LocatedRange` /
-  `LocatedProgress`.
-
-These are source-breaking for external crates.io consumers. Shipped under a
-minor bump (1.2.0): libfreemkv's surface is not yet frozen and the only known
-consumers are the in-tree toolchain crates.
+- The disc's AACS version is now threaded through the key-resolution API as
+  an explicit value, since key layout differs by version. This is a
+  source-breaking change for external callers of `DiscInputs`,
+  `DiscInputsCtx::new`, `read_aacs_inputs`, and `PassProgress`. In-tree
+  consumers are already updated.
 
 ### Added
 
-- **Pass-N marginal-sector recovery specialists.** The patch pass gained a
-  roster of parameterized recovery techniques — read speed (max/min), cache
-  bypass (FUA), and traversal (linear fwd/rev, bisect, cache-prime, oscillate,
-  per-sector speed-sweep) — each targeting a distinct physical failure mode of
-  marginal media. A per-rip **decayed (EWMA) scorecard** grades every technique
-  by its recent recovery rate and re-orders them best-first, so the engine
-  hardcodes no conclusion: a technique that fits *this* disc floats to the front
-  and one that doesn't self-deprioritises (but is never dropped). Every read is
-  wedge-safe and deadline-bounded; the existing fast/deep recovery behavior is
-  unchanged (the specialists are additive, tried only on the hardened residue).
-- **Opt-in flat-pool recovery scheduler (`FREEMKV_PATCH_FLAT`).** Collapses the
-  breadth-first recovery tiers into one flat pool so every technique gets a shot
-  at each bad range immediately, scorecard-ordered — a data-driven bandit for a
-  hardened residual (e.g. a late resume) where the tiered ladder would spend a
-  long time on cheap techniques before reaching the specialists. Unset keeps the
-  proven tier ladder as the default.
-- **`PassProgress` is the complete, mapfile-free progress contract.** Every
-  emission now carries the fully-rendered "where is the damage" drilldown
-  (`located`): the bad ranges annotated with chapter + movie-time offset, the
-  main-feature at-risk time, the section count and the largest gap — computed by
-  the library from its in-memory mapfile + title. A client (autorip, a future
-  GUI/CLI) renders the disc map + at-risk time straight from it and never parses
-  the mapfile, so a mapfile→mapdb change is invisible to clients. Adds
-  `disc::locate_ranges`, the one-shot `disc::progress_snapshot_from_mapfile`
-  (builds a snapshot from a mapfile on disk so a boundary/verdict paint stays
-  mapfile-free client-side), and `consts::MILLIS_PER_SEC`.
-
-- **`PatchOptions::fast_capture` — breadth-first patch recovery.** A fast-capture
-  pass reads each bad range once at the full batch and leaves every failed block
-  `NonTrimmed` for a later pass — no bisect, no re-read, no per-sector grind — so
-  a first retry pass grabs the readable blocks (a sweep's good skip-ahead
-  overshoot) of EVERY range before any single range's slow per-sector recovery.
-  No data is dropped: a failed block stays `NonTrimmed` (retried by a granular
-  pass), never `Unreadable`. A transport fault still aborts. `Disc::copy`'s
-  internal patch leaves it `false` (single-call full recovery).
-
-- **Mux loss concealment — a logged gap still produces a decode-clean file.**
-  When a unit genuinely cannot be decrypted on the mux read path (a key the disc
-  never yielded, after the rip's own decrypt-verify already failed loud and
-  re-read), the mux no longer passes ciphertext downstream or emits a broken
-  frame. The undecryptable aligned unit is concealed as NULL transport-stream
-  packets (PID 0x1FFF, invisible to every real stream), and the codec layer
-  **drops forward to the next keyframe** so no frame with a dangling reference
-  reaches the muxer. A deep validator scan of the result is clean — no missing
-  references, no partial frames. The loss is tallied and logged, never silently
-  dropped, and the mux always completes. Audio and subtitle tracks have no
-  cross-frame references, so only the directly-affected frames are dropped there.
-  Decrypt-verify remains a **rip** gate (fail loud → re-read), never a mux gate.
-- **`Disc::unlocker_matrix()` — registry-driven unlocker did-work report.** Returns
-  each registered unlocker's name alongside a `did_work` flag recording whether it
-  performed authentication steps during the current rip. Callers (autorip, the CLI)
-  surface this so an operator can confirm at a glance which unlock paths —
-  LibreDrive firmware, AACS, CSS — actually ran, with no hardcoded names on the
-  caller side.
+- Pass-N marginal-sector recovery gained a roster of specialized recovery
+  techniques (read speed, cache bypass, alternate traversal orders) that are
+  automatically re-ranked per rip based on which ones are actually working
+  on that disc.
+- Added an opt-in flat-pool recovery scheduler as an alternative to the
+  tiered recovery ladder, useful for discs with heavily hardened residual
+  damage.
+- Progress reporting now includes a fully-rendered bad-range drilldown
+  (chapter, movie-time offset, at-risk time) computed by the library, so a
+  client can render the disc map without parsing internal state itself.
+- Added a breadth-first "fast capture" patch mode that grabs all readable
+  blocks across every bad range in one pass before falling back to slower
+  per-sector recovery.
+- Mux loss concealment: a block that genuinely can't be decrypted no longer
+  passes ciphertext through or produces a broken frame — it's concealed
+  cleanly and the codec layer drops forward to the next keyframe, so the
+  loss is logged but the output file still decodes cleanly.
+- Added a report of which unlock mechanisms (firmware, AACS, CSS) actually
+  ran during a given rip.
 
 ### Changed
 
-- **One hex parser.** All hex parsing (keys, IDs, key-source inputs) routes
-  through a single `libfreemkv::hex` parser instead of several ad-hoc decoders,
-  so length/odd-nibble/invalid-digit handling is identical everywhere.
-- **Robust encrypted-unit sampling + a single MKB framing walker.** Up-front
-  AACS sampling tolerates content layouts that previously yielded too few
-  encrypted units to resolve a key, and the Media Key Block is now walked by one
-  framing routine shared across the in-band and out-of-band readers (no
-  divergent record-stride logic). AACS resolution hardened around these paths.
-- **One reader, one `DiscInputs`.** `Disc::inputs()` is now the single, complete
-  source of a disc's AACS inputs (inf, MKB, VID, disc_hash, version), and
-  `read_aacs_inputs*` returns the version alongside inf+MKB. Both the CLI and
-  autorip resolve through `Disc::inputs()`; the duplicate out-of-band readers
-  (autorip's `key_files()`/`volume_id()`) and the stale mapfile-VID read are
-  removed. AACS file paths and the AACS major versions are now named constants
-  (`aacs::PATH_*`, `aacs::AACS_MAJOR_*`, `AacsVersion::major`/`from_major`) so a
-  fallback or stride change lives in exactly one place.
-- **Pass-N recovery rebuilt as a bounded, never-hang handler chain.** The 1.1.0
-  patch loop retried each bad range sector-by-sector until a per-range budget was
-  exhausted, with no escape from a wedged drive short of the watchdog firing after
-  tens of minutes. 1.2.0 replaces that with a two-tier handler chain dispatched
-  breadth-first, largest bad range first:
-  - **Jump** (lead tier): reads each range in large forward-skipping batches to
-    quickly locate readable islands — clearing a multi-gigabyte dead spot in
-    seconds rather than sector-by-sector.
-  - **Bisect** (trailing tier): binary-searches the boundaries of each remaining
-    bad block, converging to within a single sector of the last-readable LBA.
-    Boundary-probe reads are exempt from the early-yield stall so the boundary
-    walk always completes.
-  - **Handler scorecard**: handlers that make progress stay at the front of the
-    rotation per rip; an idle handler is ranked last so proven performers lead.
-  - **Wedge detection**: a pass-level streak counter tracks consecutive
-    wedge-family senses (HARDWARE ERROR / ILLEGAL REQUEST) across section
-    boundaries. At the threshold the pass aborts and a soft un-wedge
-    (`Drive::spin_cycle()` — START STOP UNIT, no eject) runs before the next retry
-    pass, instead of grinding at near-zero throughput until the pass watchdog
-    fires.
-
-  No data is dropped: a block that neither handler recovers in a pass stays
-  `NonTrimmed` for the next pass.
+- All hex parsing (keys, IDs) now goes through one shared parser instead of
+  several ad-hoc ones.
+- AACS sampling and Media Key Block parsing are now more tolerant of
+  unusual disc layouts.
+- `Disc::inputs()` is now the single source of a disc's AACS inputs,
+  replacing several duplicate readers.
+- Pass-N recovery was rebuilt as a bounded handler chain — fast jump-ahead
+  scanning, then bisection to find exact bad-block boundaries — that can no
+  longer hang indefinitely on a wedged drive, with automatic wedge
+  detection and recovery.
 
 ### Fixed
 
-- **DVD DTS/LPCM audio tracks no longer mux silent.** On DVD-Video the
-  `private_stream_1` sub-stream id's low nibble is the audio-stream *number*
-  (shared across codecs), not a per-codec ordinal. A DTS or LPCM track that
-  wasn't the disc's first audio stream got a sub-id one too low, so the demux
-  routing key (`0xBD00 | sub_id`) never matched and every packet was dropped —
-  the track appeared in the container but played silent (AC-3 at position 0
-  worked by coincidence). Audio sub-stream ids are now assigned by positional
-  stream number, so a DTS 5.0 track after an AC-3 5.1 track routes correctly.
-- **ISO mux no longer drops real video at content-fragment tails.** A title's
-  encrypted content can end mid-AACS-unit, with the disc zero-padding the rest
-  of the 6144-byte aligned unit to the next fragment. The decrypt-verify
-  demanded the TS sync byte on *all 32* source packets, so it rejected such a
-  tail unit over its legitimate padding — discarding the real video packets it
-  contained. On a flawless rip this surfaced as a small phantom "loss" at mux
-  (and, once retries were exhausted, a truncated MKV). Unit acceptance is now
-  **padding-aware**: only packets whose *source* (pre-decrypt) bytes are
-  non-zero must restore their TS sync; the zero padding is excluded from the
-  check and emitted as clean zeros. A full content unit still requires all 32
-  (unchanged — no wrong-key relaxation), and a unit whose *non-zero* tail fails
-  to decrypt is still rejected as a genuine bad read.
-- **ISO online key resolution now sends the Media Key Block.** Capturing a
-  disc's AACS inputs at scan read the MKB with a full `read_file` of the
-  ~128 MiB `MKB_RO`/`MKB_RW` allocation, which fails on file-backed readers —
-  leaving the MKB empty, so `Disc::inputs()` shipped `mkb=0` to an online key
-  service and the request was rejected (no key → no decrypt). Scan now reads the
-  MKB through the same bounded prefix-grow + trim reader as the out-of-band
-  path, so `Disc::inputs()` is the single complete source of AACS inputs — one
-  reader for every caller.
-- **Read-time key-fetch parses `Unit_Key_RO.inf` at the disc's own AACS stride.**
-  The on-demand fetch (for a CPS unit not sampled up front) hardcoded the V20
-  64-byte stride, so an AACS-1.0 (V10) disc whose key arrived as a VUK derived
-  the wrong unit keys. `DiscInputs` now carries the disc's `version`, and the
-  context parses at the matching stride — the disc is the single source of truth
-  for its own stride (no separate version argument to drift).
-- **A dry key-fetch for one unit no longer blocks fetching a different unit.**
-  A global "fetch spent" latch meant that once the key service returned nothing
-  for one CPS unit's ciphertext, no further unit was ever asked — so a multi-CPS
-  disc could strand a unit whose key the service *would* have served. Replaced
-  with a per-unit "already-asked-dry" set (still bounded by the fetch budget).
-- **`verify::push_ranges` uses saturating arithmetic** so a corrupt-disc LBA near
-  `u32::MAX` can't panic (matches `udf::merge_ranges`).
-- **Audio no longer corrupts at a stream discontinuity.** At a transport-stream
-  discontinuity — a continuity-counter break, an adaptation-field
-  discontinuity_indicator, or a concealed-loss gap — the AC-3 / DTS / TrueHD
-  parsers held a *truncated* partial access unit and spliced the post-gap bytes
-  onto it, manufacturing a corrupt frame (a validator reports "exponent out of range" /
-  "Failed to decode block code(s)" / "Invalid data found") and, for TrueHD, a
-  non-monotonic timestamp band on multi-segment titles. The video path already
-  resynced via the keyframe gate; the audio parsers now do too — on a
-  discontinuity they drop the un-completable partial and resync on the next
-  syncword, rebasing the timestamp from the post-gap PES. A discontinuity becomes
-  a clean single-frame gap instead of a corrupt splice. Audio has no inter-frame
-  references, so dropping the truncated partial is the complete fix; the approach
-  matches how mainstream transport-stream demuxers behave.
-- **Drive-prep firmware unlock skipped for DVD discs.** An
-  `if disc_is_dvd() { return }` guard in `Drive::init()` (present since
-  1.0.0-rc.1) bypassed the entire drive-prep unlock step for DVDs. That unlock is
-  what removes riplock and raises the drive to maximum read speed — a drive-level,
-  disc-independent feature — so every DVD rip ran at riplock speed (~0.4× rated,
-  multi-hour ETA). The guard is removed; all disc types now go through the full
-  drive-prep sequence. UHD and Blu-ray were unaffected (they already ran through
-  the unlock path).
+- DVD DTS/LPCM audio tracks that weren't the disc's first audio stream no
+  longer mux silent; stream routing is now based on position rather than an
+  incorrect per-codec assumption.
+- ISO muxing no longer drops real video at the end of an encrypted content
+  fragment; padding at a fragment's tail is now handled separately from
+  genuine decrypt failures.
+- ISO online key resolution now correctly sends the Media Key Block with
+  the request; previously a large-file read limitation left it empty,
+  causing every request to be rejected.
+- Read-time key fetches now parse the key file at the correct stride for
+  the disc's own AACS version, instead of assuming the newer layout.
+- A key-service request that returned nothing for one encrypted unit no
+  longer blocks fetching a different unit on a multi-key disc.
+- Fixed a potential crash from non-saturating arithmetic on a corrupt-disc
+  sector address near the numeric limit.
+- Audio decoding no longer corrupts across a stream discontinuity (a
+  channel change, dropped data, or a concealed gap); the audio parsers now
+  resync the same way the video path already did.
+- Drive firmware unlock, which raises read speed to normal, was being
+  skipped for all DVDs, so every DVD rip ran at a throttled speed. It's now
+  applied to every disc type.
 
 ## [1.1.0]
 
 ### Added
 
-- **Post-read decrypt-verify gate.** Every AACS unit read off the disc is now
-  buffered, re-aligned to its clip-file 6144-byte unit grid, and verified
-  (CPI flag → decrypt → strict all-32 TS-sync)
-  before it is signed off as good. A unit that no held or freshly-fetched key
-  decrypts is treated exactly like a bad read — re-read by
-  the patch pass, terminal loss only if truly unrecoverable — closing the
-  "silent bad read" class where a sector reads OK but its ciphertext is subtly
-  wrong. **Fail-safe:** it only ever downgrades a unit it is *confident* is bad;
-  every uncertainty (no keys, a merely-missing key, an unread/zero-filled sector,
-  a non-AACS disc) leaves the read byte-for-byte as before. Gated by a
-  compile-time kill-switch (`POST_READ_VERIFY`), and container-pluggable (BD/UHD
-  transport stream today, with an HD-DVD program-stream seam in place).
-- **Every error is now `Error: E<code> <message>`, with an Error Codes
-  reference.** User-facing errors show their code so you can look it up, and a
-  new **Error Codes** page lists every code with its message, cause, and next
-  steps. A contract test guarantees every error variant has a code, a message in
-  all seven languages, and a Codes-page entry. Messages are source-agnostic
-  ("key source", never a specific database).
+- Added a post-read decrypt-verify gate: every decrypted unit is now
+  checked for validity before being accepted, closing a class of "silent
+  bad read" where a sector reads fine but its decrypted content is subtly
+  wrong. It only ever downgrades a read it's confident is bad — anything
+  uncertain is left untouched.
+- Every user-facing error now shows its error code, with a new Error Codes
+  reference page listing the cause and next steps for each one, in all
+  supported languages.
 
 ### Changed
 
-- **AACS decrypt acceptance is now standards-strict.** A key is accepted only
-  when the decrypted unit has the TS sync byte on *all* 32 source packets
-  (all-32 TS-sync verify), replacing a majority-vote heuristic where a wrong key
-  could coincidentally restore enough syncs to pass and silently corrupt a unit.
-- keydb download/save moved out of the library into freemkv-keysources;
-  libfreemkv no longer has any keydb I/O (it already held no keys).
+- AACS decryption acceptance is now strict (requires all sync markers
+  valid) rather than a majority-vote heuristic, which could let a wrong key
+  coincidentally pass and silently corrupt a unit.
+- Key-database download/save logic moved out of the core library into the
+  keysources crate.
 
 ### Fixed
 
-- **AACS content-certificate bus-encryption flag read from the wrong bit.** The
-  flag is bit 7 of byte 1 (`p[1] >> 7`) but was read as bit 0, so a
-  bus-encrypted disc parsed as *not* bus-encrypted — defeating the fail-loud
-  guard that refuses to decrypt bus-wrapped data to garbage when no bus key was
-  obtained. Also corrected the cc_id offset (byte 14) and the AACS2 type marker
-  (`0x10`). Confirmed against real retail content certificates.
-
-- **DVD rips now start on the movie, not the disc menu.** A VTS title VOB's
-  start sector was read from the IFO as a VTS-relative pointer but used as an
-  absolute disc address, so a DVD title's read extents began `ifo_lba` sectors
-  too early — the rip opened on the disc's menu / VMGI region and only drifted
-  into the feature minutes later (Silence of the Lambs, for example, showed
-  several minutes of the main menu before the movie). The title VOB is now
-  rebased to its absolute on-disc location, so the rip begins at the first frame
-  of the feature. Aspect ratio and chapter timing were already correct; only the
-  starting sector was wrong. (Covered by a new absolute-placement regression
-  test.)
-- **Container metadata correctness.** Unknown colorimetry now emits the CICP
-  "unspecified" code point (2) consistently across the MKV track and the FVI
-  sidecar (previously 0); PGS subtitle wipes use the NORMAL composition state
-  rather than a full epoch reset; and FVI source-byte offsets are written
-  within-sector per the format spec.
-- **Multi-extent AACS alignment in `dir://` extraction.** AACS encrypts in
-  aligned units of 3 sectors (6 KiB), and the decrypt-on-read gate accepts a read
-  only when its LBA is unit-aligned against a base. The `dir://` file-tree
-  extractor set that base once, to the file's first extent. A fragmented file
-  (Long-AD / continuation-ICB allocation) has later extents starting at arbitrary
-  LBAs whose distance from the first extent is generally not a multiple of 3
-  sectors, so the first read of every later extent failed the gate, returned a
-  decrypt error, and the whole extent was written as a zero-filled hole — even
-  though the sectors were readable. The unit base is now re-anchored per extent
-  (matching the mux read paths), so each extent gates on its own unit grid.
-  Decryption math is unchanged. Same class as the rc.5.2 clip-anchor fix.
-- **Distinct "no key" reasons.** When AACS key resolution has usable material
-  (device or processing keys) but cannot obtain the disc's Volume ID — needed to
-  derive the unit key — freemkv now reports a distinct "AACS Volume ID
-  unavailable" error (E7017) instead of collapsing it into the generic "no key"
-  error (E7022), which is now reserved for a genuine absence of any key material.
-  No key derivation or descramble logic changed — only the reason reported on a
-  resolution failure.
-- **autorip keydb writes go to the right path.** Auto-download, daily refresh,
-  the "Update KEYDB" button, and the startup existence-check now resolve to the
-  service's config path (matching where reads look); they previously used the
-  CLI's executable-local default.
-- **Crash-safety hardening** in `dir://` extraction and keydb writes (fsync of
-  files and parent directories around rename).
-- **Windows-reserved filenames** (`CON`, `NUL`, `COM1`…) inside a disc's file
-  tree are safely renamed on extraction instead of aborting the walk.
-- **`--version` now matches the build stamped into MKVs.** The CLI's `--version`
-  string and the `MuxingApp` / `WritingApp` fields written into every MKV now
-  derive from a single libfreemkv constant — the package version plus the git
-  short hash (e.g. `freemkv 1.1.0 (g835cc99)`). The muxer previously kept
-  its own copy of that string, so the two could drift; a binary and the files it
-  produces can no longer report different versions.
-- **DTS-HD Master Audio: a false core-sync inside the lossless extension no
-  longer splits an audio frame.** A byte pattern in the extension substream that
-  resembled the `0x7FFE8001` core sync word could truncate the lossless
-  extension and produce decode errors on the affected frames. The extension
-  substream is now sized exactly from its header, so that pattern is skipped as
-  data.
-- **TrueHD: decode timestamps no longer step backward.** In a case where the
-  source PES timing lagged the audio access-unit cadence, the muxed decode
-  timestamp could regress (non-monotonic-DTS warnings to the muxer); the running
-  timestamp is now clamped so it never goes backward.
+- An AACS content-certificate flag was being read from the wrong bit,
+  which could defeat a safety check meant to refuse decrypting
+  encrypted-bus content with no bus key.
+- DVD rips now start on the actual movie instead of the disc's menu
+  screens, correcting a title-start offset that was applied incorrectly.
+- Several container-metadata correctness fixes: unspecified color info,
+  subtitle wipe behavior, and sidecar byte-offset alignment.
+- Multi-part (fragmented) files in the directory-extraction path no longer
+  have later fragments silently written as zero-filled holes; the alignment
+  base is now recalculated per fragment.
+- Distinguished "AACS key material present but Volume ID unavailable" from
+  a genuine no-key error, so the two are now reported separately.
+- autorip's key-database writes now go to the correct configured path in
+  every code path (auto-download, refresh, manual update, startup check).
+- Hardened crash-safety of directory extraction and key-database writes.
+- Windows-reserved filenames in a disc's file tree are now safely renamed
+  on extraction instead of aborting.
+- `--version` and the app-name fields written into every MKV now always
+  agree, since both derive from one shared value.
+- A rare false frame-split in DTS-HD Master Audio decoding is fixed.
+- TrueHD decode timestamps no longer step backward under certain
+  source-timing conditions.
 
 ### Tests
 
-- 58 new tests across the toolchain (AACS key resolution, the unlocker seam, the
-  key sources, DVD/CSS, `dir://` routing, and autorip keydb resolution).
+- 58 new tests added across the toolchain this cycle.
 
 ## [1.0.0-rc.5.3]
 
 ### Added
 
-- **`dir://` output** — write a decrypted `VIDEO_TS` / `BDMV` file tree straight
-  from a disc or ISO instead of a single muxed file.
+- `dir://` output: write a decrypted file tree straight from a disc or ISO
+  instead of a single muxed file.
 
 ### Changed
 
-- **Source-agnostic key errors** — decryption messages no longer assume a local
-  key database is *the* key source.
-- **The default `keydb.cfg` location is next to the executable** (portable CLI);
-  the autorip service keeps its container path.
-- **Simpler flags** — dropped `-k` (use `--keydb`) and removed `--device` (the
-  drive is named in the source URL, e.g. `disc:///dev/sgN`).
+- Key-source error messages no longer assume a local key database is the
+  only possible key source.
+- The default key-database location is now next to the executable for the
+  CLI (the server keeps its own path).
+- Simplified command-line flags (dropped a short flag alias and a redundant
+  device flag).
 
 ### Fixed
 
-- **Fail loud on missing keys or bad input** instead of silently writing an
-  undecrypted file.
+- The tool now fails loudly on missing keys or bad input instead of
+  silently writing an undecrypted file.
 
 ## [1.0.0-rc.5.2]
 
 ### Fixed
 
-- **Reverted the rc.5.1 `DefaultDecodedFieldDuration` experiment for interlaced
-  SD-DVD.** rc.5.1 added a 20 ms `DefaultDecodedFieldDuration` field element to
-  the 576i/480i track header on the theory that Windows derives fps from it.
-  Captured evidence showed that element made Windows Explorer report 12.5 fps
-  (half) and MediaInfo flip the track to "Frame rate mode: Variable". The
-  element is optional in RFC 9559 and nothing requires it for interlaced SD, so
-  it is no longer written (`MkvTrack::video` now passes `field_duration_ns == 0`);
-  the track keeps `FlagInterlaced=1` + `FieldOrder=TFF` and the full-frame 40 ms
-  `DefaultDuration` (`1/DefaultDuration` = 25 fps), which is the frame rate the
-  source actually carries. How a given player or shell handler chooses to display
-  interlaced fps is not guaranteed.
-- **Correct AC-3 audio track selected on DVDs with non-standard sub-stream
-  ordering.** freemkv assigned each declared audio stream a physical sub-stream
-  by ordinal (`0x80+n`), assuming the IFO's first stream lives at `0x80`. On
-  discs where the 5.1 main mix sits on a different sub-stream and `0x80` carries
-  a 2.0 down-mix (e.g. Silence of the Lambs), the 2.0 was muxed under a "5.1"
-  label. freemkv now probes each physical sub-stream's actual channel count from
-  the disc — scanning every AC-3 frame and taking the maximum, so a brief 2.0
-  logo bed at the feature head can't mask the real 5.1 — and routes each declared
-  stream onto the sub-stream that genuinely matches.
-- **"Decryption failed" on large AACS Blu-ray titles fixed.** AACS encrypts in
-  aligned units of 3 sectors (6 KiB); the unit-alignment gate measured `lba % 3`
-  against absolute disc LBA 0, but the unit grid is actually anchored at each
-  clip's encrypted-region start. A clip whose start is not 3-sector-aligned had
-  its readable units wrongly rejected — failing the feature/large titles of some
-  discs while short clips passed. The gate is now clip-anchored.
-- **Single-pass disc→MKV recovers marginal/transient sectors before failing.**
-  The direct-to-MKV path now gives the drive its full ECC recovery budget on a
-  bad sector (matching the multipass rip) instead of reporting a read failure a
-  multipass rip would have recovered.
-- **4K decode glitches at non-seamless clip joins fixed.**
-  Titles assembled from clips joined at non-seamless boundaries no longer drop
-  reference frames at the join ("Could not find ref" stutter); the splice
-  keyframe is rewritten so the decoder discards only the genuinely-dangling
-  leading pictures.
+- Reverted an experimental interlaced-video timing field that had been
+  added to try to fix frame-rate display on Windows; testing showed it made
+  things worse (some players reported half the actual frame rate), so it's
+  removed. The original interlaced flags remain correct.
+- Fixed audio-track selection on DVDs with non-standard sub-stream
+  ordering, where the main 5.1 mix could be muxed under the label of a
+  quieter down-mix track; each stream's actual channel count is now probed
+  from the disc rather than assumed from position.
+- Fixed a "decryption failed" error on some large AACS Blu-ray titles,
+  caused by measuring encryption alignment from the start of the disc
+  instead of from each clip's own start.
+- The direct disc-to-MKV path now gives a marginal/transient sector its
+  full recovery budget before giving up, matching the more thorough
+  multi-pass rip path.
+- Fixed 4K decode glitches (dropped reference frames) at non-seamless clip
+  joins.
 
 ### Changed
 
-- **`freemkv-keysources` is now a pure key lookup.** The encrypted content-sample
-  reader and the candidate-key resolution loop moved into libfreemkv (they read
-  the disc and validate keys — decryption mechanism, not lookup). A key source
-  now only looks a key up and hands it back. Downstream API: use
-  `libfreemkv::read_encrypted_units` / `libfreemkv::resolve_and_apply` (was
-  `freemkv_keysources::read_sample_units` / `…::resolve_and_apply`).
+- The keysources crate is now a pure key lookup; the disc-reading and
+  key-validation logic that used to live there moved into the core library.
 
 ### Added
 
-- **`--log-level 3` is now self-sufficient for MKV/opening-frame diagnosis.**
-  The diagnostic pass now (a) dumps the ACTUAL MKV `TrackEntry` elements written
-  per track (`tag=mkv.track`: FlagInterlaced, FieldOrder, DefaultDuration,
-  DefaultDecodedFieldDuration via field-duration, Display dims, codecPrivate as
-  hex) so the Windows-fps-class metadata is verifiable from a log alone, and
-  (b) captures the first ~100 coded frames per track (raw bytes) to a
-  `<output>.opening.bin` side file with a per-frame summary line
-  (`tag=mkv.opening.frame`: track, key/delta, size, PTS) so opening-GOP / menu
-  issues are diagnosable from a future log without the disc. Both are gated to
-  log-level 3; a normal run opens no side file and records nothing.
+- Diagnostic logging (`--log-level 3`) now dumps actual written track
+  metadata and the first ~100 frames of a track, to help diagnose
+  player-compatibility issues from a log file alone, without needing the
+  original disc.
 
 ### Verified
 
-- **DVD opening-GOP / still-frame open handling is correct (no change needed).**
-  The hypothesis that the opening pictures get the wrong (last-seen) sequence
-  header or have their PTS floored to t=0 was traced and ruled out: the
-  codecPrivate is the FIRST sequence header (read once at headers-ready, before
-  any later AU), DVD VOBU structure guarantees each title opens on a sequence
-  header + I-frame (no mid-GOP open), the parser back-anchors leading
-  still-frames to the disc's real timeline, and the muxer anchors its timestamp
-  base on the opening keyframe's real PTS so the t=0 floor never corrupts it.
-  Regression tests pin all three.
+- Confirmed, with no code change needed, that DVD opening-frame and
+  still-frame handling was already correct, closing out a suspected bug.
 
 ## [1.0.0-rc.5.1]
 
 ### Fixed
 
-- **CSS reads unlocked on enforcing drives.** CSS-protected DVDs on
-  drives that enforce CSS authentication previously produced an empty MKV
-  at exit 0, or hung indefinitely. The read path now issues the bus-auth
-  handshake (`css::auth::unlock_css_reads`) to unlock scrambled-sector
-  reads before attempting any data transfer, so the drive gates lift
-  correctly.
-- **Keyless title-key recovery always runs.** The Stevenson known-plaintext
-  attack (`css::crack_key` / `src/css/stevenson.rs`) now recovers the
-  title key even when the bus-auth scan detects a CSS drive, removing a
-  code path that fell through to locked reads on certain disc/drive
-  combinations. A wrong key still fails cleanly (confirmed by a sector
-  descramble check) rather than producing silent garbage.
-- **Early bail on undecryptable discs.** When CSS authentication succeeds
-  but no valid title key can be recovered, the mux path now terminates
-  with a clear error code instead of writing an empty (or zero-byte)
-  output file.
-- **DVD audio channel count from AC-3 bitstream.** The audio channel count
-  is now parsed from the AC-3 elementary-stream bitfield rather than from
-  the IFO audio attributes, so the reported channel count always matches the
-  actual muxed audio even when the IFO attribute disagrees. Passthrough only
-  — no downmix is performed. (Selecting the correct audio sub-stream on discs
-  with non-standard ordering is a separate item — see Known issues.)
-- **Interlaced MKV frame rate on Windows.** Interlaced content (576i/480i)
-  now emits a `DefaultDecodedFieldDuration` element in the MKV track
-  header, which Windows Media Foundation and Explorer use to derive the
-  display frame rate. Without it, players reported an incorrect or zero
-  frame rate on interlaced tracks.
-- **Per-track `BPS` bitrate tags populated.** The `BPS` tag is written for
-  each track so players and shell extensions (Windows Explorer, MPC-HC,
-  etc.) can display the per-stream bitrate without reading the full file.
-- **Interlaced field order corrected to TFF.** 576i tracks were written
-  with a bottom-field-first (BFF) container flag that disagreed with the
-  top-field-first order carried in the MPEG-2 stream; the MKV `FieldOrder`
-  element now matches the stream (TFF) so deinterlacers use the correct
-  field parity.
-- **DVD first-play menu no longer prepended to the feature.** The title
-  VOBS base sector was read from the VTS menu-VOBS pointer (`vtsm_vobs`,
-  offset 0xC0) instead of the title-VOBS pointer (`vtstt_vobs`, 0xC4), so on
-  a disc that authors a per-title menu the entire menu VOB — e.g. a studio
-  first-play "the parental level has been set, press yes" prompt — was
-  prepended to the movie and every cell extent shifted back. The rip now
-  opens on the feature's first frame.
+- CSS-protected DVDs on drives that enforce authentication no longer
+  produce an empty file or hang; the drive-unlock handshake now runs before
+  any data read.
+- Keyless CSS title-key recovery now always runs, instead of being skipped
+  on certain drive/disc combinations.
+- A CSS disc that authenticates but yields no valid title key now fails
+  with a clear error instead of writing an empty output file.
+- DVD audio channel count is now read from the actual audio bitstream
+  rather than disc metadata, so the reported channel count always matches
+  what's really there.
+- Interlaced video now emits the field-duration metadata Windows uses to
+  determine frame rate, fixing incorrect frame-rate reporting on Windows.
+- Per-track bitrate tags are now populated so players and file browsers can
+  show them without reading the whole file.
+- Fixed interlaced field order (was reporting bottom-field-first when the
+  source is top-field-first).
+- Fixed a DVD bug where a per-title menu screen (e.g. a ratings notice) was
+  being prepended to the start of the movie.
 
 ### Changed
 
-- **AACS handshake skipped on DVDs.** The AACS authentication sequence is
-  no longer attempted on DVD discs (it never applied to CSS-encrypted
-  media); attempting it on a DVD drive was a no-op at best and surfaced
-  spurious errors at worst.
+- The AACS authentication handshake is no longer attempted on DVDs, since
+  it never applied to CSS-encrypted media.
 
 ### Added
 
-- **Structured disc diagnostics at `--log-level 3`.** A new diagnostic
-  pass emits structured log events at INFO level when the log level is 3
-  or higher: DVD PGC/cell layout and IFO video/audio attributes; BD/UHD
-  playlist, clip, and AACS metadata. Provides a single-command snapshot
-  for diagnosing mux or authentication issues without instrumenting the
-  source.
-- **Reduced per-operation log spam.** Mux-read and seek operations are
-  demoted to TRACE (were DEBUG); benign navigation-packet drops are
-  summarized as a single counter at the end of the title rather than
-  logged per-packet.
+- Structured disc diagnostics available at `--log-level 3`, giving a
+  single-command snapshot of disc structure for troubleshooting.
+- Reduced routine per-operation log volume.
 
 ### Known issues
 
-- **Wrong audio track on discs with non-standard substream ordering.**
-  Audio sub-stream ids are assigned by per-codec ordinal rather than read
-  from the IFO/PGC stream-number table, so a disc whose physical substream
-  order diverges from the convention may select the wrong audio track
-  (e.g. a 2.0 stream in place of 5.1). Diagnose with
-  `freemkv info disc://… --log-level 3`; fix tracked for the next release.
+- Audio track selection can pick the wrong track on discs with
+  non-standard substream ordering (e.g. a stereo track instead of the
+  intended 5.1); a workaround is documented, and a fix is tracked for the
+  next release.
 
 ## [1.0.0-rc.4.2]
 
 ### Fixed
 
-- **Windows durability.** New platform-aware `io::fsync` module: directory
-  fsync is a no-op on Windows (std cannot open a directory there, which
-  logged a spurious warning on every mapfile write — including from the
-  CLI), and a shared `file_durable` helper opens files read+write before
-  `sync_all` so the flush succeeds on Windows, where `FlushFileBuffers`
-  rejects a read-only handle with `ERROR_ACCESS_DENIED`.
+- Improved Windows file-durability handling: directory sync is now a no-op
+  on Windows instead of logging a spurious warning, and file flushes now
+  use a read-write handle so they no longer fail on Windows.
 
 ## [1.0.0-rc.4] — UNRELEASED
 
 An audit-driven round of correctness, durability, and Windows-transport
-fixes. No API changes; behavior is more conservative on damaged media and
-on partial decryption.
+fixes. No API changes.
 
 ### Fixed
 
-- **Decrypt-time loss is accounted for.** A partial AACS/CSS decryption
-  failure can no longer pass as a perfect rip — skipped/undecryptable
-  bytes are folded into the loss total — and partial CPS-unit (per-title)
-  key coverage is rejected in the AACS validation gate instead of
-  producing partly-garbage output.
-- **Durable writes.** `keydb.cfg` is written atomically (temp file +
-  fsync + rename), and the mapfile fsyncs its parent directory after the
-  rename so a resume checkpoint survives a crash.
-- **Truthful error causes.** A server-dropped keydb download is
-  classified as a connection error, not a parse error; a missing home
-  directory maps to "not found" rather than a keydb-parse failure; the
-  I/O error from opening an AACS-inputs ISO is preserved; and a
-  transport failure is preserved through the AACS auth handshake instead
-  of being relabeled.
-- A failed `READ CAPACITY` now warns instead of silently using a
-  zero-sector disc.
-- A leaked pipeline consumer can no longer finalize an abandoned output.
-- **Windows SCSI.** `ScsiPassThroughDirect` is packed to match the
-  `ntddscsi.h` layout, `StorageAdapterDescriptor.BusType` width is
-  corrected (`u8` → `u32`), oversized read batches on non-sysfs
-  (Windows) drives are bounded, `IOCTL_STORAGE_RESET_DEVICE` failures are
-  surfaced, and a device reset only sleeps on success.
-- Mux now tracks skipped bytes so a partly-read title reports accurate
-  loss.
+- Partial decryption failures are now correctly counted as loss instead of
+  appearing as a perfect rip.
+- Key-database and resume-checkpoint writes are now fully durable (atomic
+  write + fsync).
+- Several error-classification fixes so the reported cause of a failure
+  matches what actually happened (connection error vs. parse error, missing
+  directory, preserved underlying I/O errors).
+- A failed capacity check no longer silently falls back to treating the
+  disc as zero-sized.
+- An abandoned pipeline can no longer finalize output for a session that
+  was already given up on.
+- Several Windows SCSI transport fixes (struct layout, field width,
+  oversized batch handling, error surfacing).
+- A partially-read title now reports accurate loss in its byte count.
 
 ### Changed
 
-- The per-read `Drive::read` trace event was demoted to TRACE so a debug
-  log isn't flooded by per-sector reads.
+- Per-read trace logging was demoted to a lower verbosity level so it
+  doesn't flood a debug log.
 
 ## [1.0.0-rc.2]
 
-Second release candidate for 1.0. libfreemkv is the core library: disc scan,
-multipass sector recovery, content decryption (CSS, AACS 1.0/2.0), and the
-threaded mux pipeline that turns a disc or ISO into an MKV. This candidate adds
-keyless DVD/CSS support and correct DVD video, on top of security and recovery
-hardening.
+Second release candidate for 1.0. Adds keyless DVD/CSS support and correct
+DVD video, on top of security and recovery hardening.
 
 ### Added
 
-- **Keyless DVD/CSS title-key recovery.** A CSS-protected DVD decrypts with no
-  key database — the title key is recovered directly from the scrambled disc
-  data via the Stevenson known-plaintext attack and
-  validated by descrambling a sector and confirming the known plaintext
-  reappears, so a wrong key fails cleanly instead of producing silent garbage
-  (`src/css/stevenson.rs`). `Disc::scan_image` recovers the same title key from
-  a raw, still-scrambled CSS ISO, so a raw image can be muxed without
-  pre-decryption.
-- **MPEG-2 Program-Stream access-unit reassembler** (`src/mux/codec/mpeg2.rs`).
-  Buffers elementary-stream bytes across PES packets and emits exactly one
-  coded picture per MKV block, with presentation timestamps reconstructed from
-  the stream — fixing corrupted DVD video. Bounded buffer so a malformed stream
-  cannot exhaust memory.
+- Keyless DVD/CSS title-key recovery: a CSS-protected DVD now decrypts with
+  no key database at all, with a wrong key detected and rejected rather
+  than producing silent garbage.
+- A proper MPEG-2 frame reassembler fixes corrupted DVD video, with correct
+  timestamps reconstructed from the stream.
 
 ### Changed
 
-- Self-contained keyframes: the active param sets (HEVC VPS/SPS/PPS, H.264
-  SPS/PPS, VC-1 sequence/entry headers) are re-asserted at every keyframe and
-  any mid-title param-set change is emitted in-band, fixing whole-segment
-  HEVC/H.264/VC-1 corruption when a source stops repeating or reverts a param
-  set.
-- Block timestamps use presentation order keyed on track type, so B-frame video
-  (including a Dolby Vision enhancement layer) keeps its true presentation
-  timestamps instead of decode-order timecodes.
-- Mux unit alignment is scheme-aware (AACS vs CSS/none), so DVD extents are no
-  longer rejected for unit misalignment.
-- MKV output records `freemkv <version>` in the Muxing/Writing application
-  fields, so every output file is traceable to its build.
-- Subtitle `BlockDuration` values are scaled by the segment timecode scale, so
-  display durations are correct when the scale is not 1 ms.
-- The NOT_READY retry pause in the patch (Pass N) loop is halt-responsive: a
-  stop request interrupts the drive-recovery wait immediately instead of
+- Video keyframes are now fully self-contained, fixing corruption when a
+  source disc doesn't repeat its parameter sets.
+- Timestamps now correctly follow presentation order rather than decode
+  order, fixing playback of B-frame video.
+- Alignment checks are now aware of which encryption scheme is in use, so
+  DVD content is no longer incorrectly rejected.
+- Output files now record the producing app version for traceability.
+- Subtitle display durations are now correctly scaled for non-default
+  timecode precision.
+- A stop request now interrupts drive-recovery waits immediately instead of
   blocking shutdown.
-- Bounded the keydb decompressed-plaintext reader (caps a malformed or
-  zip-bombed download).
+- Bounded a decompression step against a malformed or oversized download.
 
 ### Fixed
 
-- A `READ(10)` that returns GOOD status with a residual underrun is treated as a
-  failed read (routed to retry) instead of committing stale buffer data —
-  closing a silent-corruption hole in the sweep and patch paths.
-- `raw_command` on Linux masks the `DRIVER_SENSE` bit before treating a result
-  as an error, preventing false transport errors on commands that return sense
-  alongside a GOOD response.
-- `READ CAPACITY (10)` rejects the "capacity exceeds 32-bit" sentinel instead of
-  silently wrapping to 0 and misreporting disc size.
+- A drive read that returns a successful status but incomplete data is now
+  treated as a failed read rather than committing corrupt data.
+- Fixed a false transport-error report on Linux for commands that return
+  diagnostic data alongside a normal response.
+- A capacity value that overflows 32 bits is now rejected instead of
+  silently wrapping to zero.
 
 ### Security
 
-- Content keys (CSS disc/title keys, AACS unit/volume keys) are redacted in log
-  output (logged as `<redacted>` with a 1-byte fingerprint); a test guards
-  against any key field being logged with a raw value.
-- The macOS SCSI shim uses `posix_spawn` directly instead of `system()` / `sh
-  -c`, eliminating a command-injection vector on the device-path string.
+- Key material is now redacted from all log output.
+- Fixed a command-injection risk in the macOS device-access shim.
 
 ## [1.0.0-rc.1]
 
-First release candidate for 1.0 — the first tagged 1.0 milestone of the core
-library. Established the full feature set: multipass sector recovery, content
-decryption (CSS, AACS 1.0/2.0) from `keydb.cfg`, disc parsing, and the threaded
-mux pipeline (see "Pre-1.0 development" for the consolidated feature list).
+First release candidate for 1.0 — established the full feature set:
+multipass sector recovery, content decryption (CSS, AACS 1.0/2.0), disc
+parsing, and the threaded mux pipeline.
 
 ## Pre-1.0 development
 
-Versions 0.x were the iterative development series leading up to 1.0. The
-highlights, condensed:
+Versions 0.x were the iterative development series leading up to 1.0.
+Highlights, condensed:
 
-- **Multipass recovery engine.** Pass 1 sweeps the whole disc sequentially,
-  tolerating bad sectors with an adaptive damage-jump algorithm (mark the bad
-  range, keep going). Pass N retries the bad ranges with per-sector recovery
-  timeouts, reverse-direction reads, and range bisection. A mapfile tracks
-  per-sector state across passes so a rip can resume.
-- **Drive and SCSI layer.** Single-shot, synchronous SG_IO transport on Linux
-  (with IOKit on macOS and SPTI on Windows), full SCSI sense decoding, and
-  drive enumeration / presence probes. Single-shot reads by design — recovery
-  lives in the multipass orchestration, not inline in the read path.
-- **Content decryption.** CSS for DVDs and AACS 1.0/2.0 for Blu-ray and UHD,
-  with keys read from `keydb.cfg`. A single decrypting decorator wraps the
-  sector source so decryption is one audited surface, and a resolved key is
-  verified against disc content before it is applied.
-- **Disc parsing.** UDF, MPLS/CLPI (Blu-ray), and IFO (DVD) parsing for title
-  and extent assembly, with bounds checks on values derived from untrusted disc
-  input. Canonical main-title selection picks the real feature over a
-  play-all virtual playlist on branching discs.
-- **Mux pipeline (the "highway").** A three-stage threaded pipeline —
-  read+decrypt, demux, codec parse — with a recycled buffer pool, taking
-  file-backed mux from ~60 MB/s to several hundred MB/s warm-cache. Codec
-  parsers for HEVC, H.264, VC-1, MPEG-2, TrueHD, DTS(-HD), and PGS feed an
-  EBML/Matroska writer.
-- **I/O stack.** Bounded-cache writeback (`sync_file_range` +
-  `posix_fadvise(DONTNEED)`) keeps the kernel dirty-page cache bounded on long
-  sequential writes, and time-batched mapfile persistence keeps NFS-staged rips
-  fast.
-- **Library hygiene.** No user-facing English in the library — all errors are
-  numeric codes handled by the application layer. A large spec-grounded,
-  mutation-verified test suite guards the silent-corruption surfaces. Rust 2024
-  edition; release builds use thin LTO.
+- **Multipass recovery engine.** An initial full-disc sweep tolerates bad
+  sectors, followed by targeted per-sector retry passes; a resume
+  checkpoint lets a rip continue after interruption.
+- **Drive and SCSI layer.** Cross-platform SCSI transport with full
+  sense-code decoding and drive enumeration.
+- **Content decryption.** CSS (DVD) and AACS 1.0/2.0 (Blu-ray/UHD)
+  decryption from a local key database, with every resolved key verified
+  against real disc content before use.
+- **Disc parsing.** UDF, Blu-ray playlist, and DVD IFO parsing for title
+  and extent assembly, with bounds-checking on untrusted disc-derived data,
+  and correct selection of the real feature over a virtual "play-all"
+  title.
+- **Mux pipeline.** A threaded read/decrypt/demux/codec pipeline taking
+  file-backed muxing from roughly 60 MB/s to several hundred MB/s, with
+  codec support for HEVC, H.264, VC-1, MPEG-2, TrueHD, DTS(-HD), and PGS.
+- **I/O stack.** Bounded disk-cache writeback and batched checkpoint
+  persistence keep long sequential rips fast, including over network
+  storage.
+- **Library hygiene.** No user-facing English text in the library (every
+  error is a numeric code), backed by a large spec-grounded test suite.
