@@ -7,10 +7,12 @@
 //! <playlist name="Feature" id="00222"
 //!   aud="eng,deu,spa,spa,fra"
 //!   sub="eng,eng,zho,ces,dan"
-//!   forced_sub="0,0,0,1,0"
+//!   forced_sub="0,0,0,1,3"
 //!   aud_com1_idx="10"
 //!   sub_com1_idx="23,24,25" />
 //! ```
+//!
+//! `forced_sub` is an ENUMERATION, not a boolean — see [`ForcedSub`].
 
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, xml};
 use crate::sector::SectorSource;
@@ -36,6 +38,64 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // High confidence: paramount's playlists.xml is fully structured
     // and we extract every documented field.
     Some(ParseResult::high(labels))
+}
+
+/// One cell of the `forced_sub` CSV.
+///
+/// The attribute reads like a boolean and was parsed as one (`cell == "1"` →
+/// forced). It is not. Every image in the corpus carrying this vendor's
+/// `playlists.xml` — seven distinct discs — uses four values, and decoding
+/// three of those discs' feature subtitle tracks and counting every PGS
+/// display set separates them into two populations two orders of magnitude
+/// apart:
+///
+///   * `0` — a subtitle track with no forced-narrative content. On the two
+///     discs measured that use the flag at all, not one `0` track carried a
+///     single `forced_on_flag` display set.
+///   * `1` — a FULL DIALOGUE track that additionally contains some
+///     forced-narrative signs. On one measured disc, all nine `1` cells are
+///     full tracks of 949-1411 display sets, eight of them carrying 5-14
+///     flagged sets and the ninth none; that disc has no dedicated forced
+///     track at all. On another, all seven `1` cells are full tracks of
+///     1602-1651 display sets carrying 0-31 flagged sets. Reading `1` as
+///     forced is what made one language present as two identical full
+///     subtitle tracks with one of them flagged forced.
+///   * `2` and `3` — a DEDICATED forced-narrative track. These take their own
+///     trailing STN slots, one per localized language, duplicating a language
+///     that already holds a full track earlier in the list. Measured: the two
+///     `2` slots on one disc are 15 and 10 display sets, EVERY one flagged
+///     forced, against ~1600 on that disc's full tracks; the four `3` slots on
+///     another are 7, 14, 23 and 59 display sets against 1216-2655. What
+///     distinguishes `2` from `3` the corpus does not reveal — both sit in the
+///     same trailing position, both measure the same shape, and one disc uses
+///     each for a different language — so both map alike.
+///
+/// So the old reading was wrong in BOTH directions: it flagged full dialogue
+/// tracks forced, and it discarded the cells that name the real forced tracks.
+///
+/// The `1` case is deliberately NOT carried through as a weaker "contains
+/// forced segments" hint. There is no qualifier for that, and the asymmetry
+/// argues against inventing one here: a wrong forced flag on a 30 MB dialogue
+/// track is the user-visible defect, while a missing hint costs nothing.
+///
+/// An unrecognised cell maps to [`ForcedSub::None`] — the conservative
+/// direction, since asserting forced is the expensive mistake.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ForcedSub {
+    /// No forced-narrative content, or an unrecognised cell.
+    None,
+    /// A full dialogue track that also carries forced-narrative segments.
+    ContainsForcedSegments,
+    /// A dedicated forced-narrative track.
+    ForcedNarrative,
+}
+
+fn forced_sub_cell(cell: &str) -> ForcedSub {
+    match cell.trim() {
+        "1" => ForcedSub::ContainsForcedSegments,
+        "2" | "3" => ForcedSub::ForcedNarrative,
+        _ => ForcedSub::None,
+    }
 }
 
 /// Build the stream labels from a single `<playlist .../>` feature
@@ -103,8 +163,8 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
 
     // Parse subtitle streams
     if let Some(sub) = xml::attr(feature, "sub") {
-        let forced: Vec<bool> = xml::attr(feature, "forced_sub")
-            .map(|s| s.split(',').map(|f| f.trim() == "1").collect())
+        let forced: Vec<ForcedSub> = xml::attr(feature, "forced_sub")
+            .map(|s| s.split(',').map(forced_sub_cell).collect())
             .unwrap_or_default();
 
         // HashSet for the same reason as the audio side above: unbounded
@@ -133,10 +193,12 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
                 LabelPurpose::Normal
             };
 
-            let qualifier = if forced.get(i).copied().unwrap_or(false) {
-                LabelQualifier::Forced
-            } else {
-                LabelQualifier::None
+            // Only a DEDICATED forced-narrative slot earns the forced flag.
+            // A cell marking a full track as merely containing forced segments
+            // is dropped, not weakened into a forced label (see [`ForcedSub`]).
+            let qualifier = match forced.get(i).copied().unwrap_or(ForcedSub::None) {
+                ForcedSub::ForcedNarrative => LabelQualifier::Forced,
+                ForcedSub::ContainsForcedSegments | ForcedSub::None => LabelQualifier::None,
             };
 
             labels.push(StreamLabel {
@@ -364,7 +426,7 @@ mod tests {
         // Subtitles: same shape, and the consequence is a misplaced forced
         // flag. `forced_sub` index 2 is the forced-narrative track; with the
         // empty slot renumbered away it would be written onto STN slot 2.
-        let feature = r#"<playlist name="Feature" sub="eng,,fra" forced_sub="0,0,1" />"#;
+        let feature = r#"<playlist name="Feature" sub="eng,,fra" forced_sub="0,0,3" />"#;
         let labels = labels_from_feature(feature);
         let s = subs(&labels);
         assert_eq!(s.len(), 2);
@@ -411,10 +473,10 @@ mod tests {
 
     #[test]
     fn forced_sub_aligns_with_raw_csv_index() {
-        // sub="eng,eng,zho,ces" forced_sub="0,0,0,1": the forced flag is
+        // sub="eng,eng,zho,ces" forced_sub="0,0,0,3": the forced marker is
         // positional on the raw CSV, so 'ces' (index 3) is forced; its
         // stream_number is its 1-based cell position, 4.
-        let feature = r#"<playlist sub="eng,eng,zho,ces" forced_sub="0,0,0,1" />"#;
+        let feature = r#"<playlist sub="eng,eng,zho,ces" forced_sub="0,0,0,3" />"#;
         let labels = labels_from_feature(feature);
         let s = subs(&labels);
         assert_eq!(s.len(), 4);
@@ -482,9 +544,9 @@ mod tests {
     /// Mutation: use stream_number (dense) instead of raw index → wrong subtitle forced.
     #[test]
     fn forced_sub_uses_raw_csv_index_with_gaps() {
-        // sub="eng,,fra,,spa" forced_sub="0,0,0,0,1"
+        // sub="eng,,fra,,spa" forced_sub="0,0,0,0,3"
         // raw CSV index 4 = "spa", i.e. STN slot 5.
-        let feature = r#"<playlist name="Feature" sub="eng,,fra,,spa" forced_sub="0,0,0,0,1" />"#;
+        let feature = r#"<playlist name="Feature" sub="eng,,fra,,spa" forced_sub="0,0,0,0,3" />"#;
         let labels = labels_from_feature(feature);
         let s = subs(&labels);
         assert_eq!(s.len(), 3);
@@ -577,15 +639,92 @@ mod tests {
         assert_eq!(last, 300);
     }
 
-    /// Spec: forced_sub with whitespace around "1" must still parse as true.
-    /// Mutation: use `== "1"` instead of `trim() == "1"` → " 1 " fails.
+    /// Spec: a `forced_sub` cell with surrounding whitespace still classifies.
+    /// Mutation: drop the `trim()` → " 3 " falls through to the unrecognised
+    /// arm and the disc's forced-narrative track loses its label.
     #[test]
-    fn forced_sub_whitespace_around_one() {
-        let feature = r#"<playlist name="Feature" sub="eng,fra" forced_sub="0, 1" />"#;
+    fn forced_sub_cells_are_trimmed_before_classification() {
+        let feature = r#"<playlist name="Feature" sub="eng,fra,spa" forced_sub="0, 3 , 1 " />"#;
         let labels = labels_from_feature(feature);
         let s = subs(&labels);
         assert_eq!(s[0].qualifier, LabelQualifier::None);
         assert_eq!(s[1].qualifier, LabelQualifier::Forced);
+        assert_eq!(s[2].qualifier, LabelQualifier::None);
+    }
+
+    /// `forced_sub` is an enumeration, and `1` is its "full dialogue track that
+    /// also carries forced signs" value — NOT "this track is forced".
+    ///
+    /// Measured on a disc whose feature declares nine `1` cells among 32
+    /// subtitle slots: all nine are full dialogue tracks of 949-1411 display
+    /// sets, and the disc has no dedicated forced track at all. Reading `1` as
+    /// forced is what produced two identical full subtitle tracks for one
+    /// language with one of them flagged forced.
+    ///
+    /// Nothing downstream can undo this on the discs that need it most:
+    /// `mux::codec::pgs::demotable` may only clear a vendor forced label where
+    /// some track on the disc demonstrably sets `forced_on_flag`, and measured
+    /// discs using this label format never set it.
+    ///
+    /// Mutation: `"1" => ForcedNarrative` (the old reading) → red.
+    #[test]
+    fn a_contains_forced_segments_cell_is_not_a_forced_track() {
+        let feature = r#"<playlist name="Feature" sub="eng,ces,deu" forced_sub="0,1,1" />"#;
+        let labels = labels_from_feature(feature);
+        let s = subs(&labels);
+        assert_eq!(s.len(), 3);
+        assert!(
+            s.iter().all(|l| l.qualifier == LabelQualifier::None),
+            "a `1` marks a full track containing forced signs, not a forced track"
+        );
+    }
+
+    /// `2` and `3` are the cells that DO name a dedicated forced-narrative
+    /// track, and the old boolean reading discarded both.
+    ///
+    /// Measured: these cells occupy their own trailing STN slots, one per
+    /// localized language, duplicating a language that already holds a full
+    /// track earlier in the list. On one measured disc the four `3` slots carry
+    /// 7, 14, 23 and 59 display sets against 1216-2655 on the full tracks they
+    /// duplicate — and not one display set anywhere on that disc carries
+    /// `forced_on_flag`, so neither the scan probe nor the muxer can promote
+    /// them from content. The vendor cell is the only evidence there is.
+    ///
+    /// Mutation: drop either arm of the `"2" | "3"` match → red.
+    #[test]
+    fn a_dedicated_forced_narrative_cell_is_a_forced_track() {
+        // The measured shape: full tracks first, their forced companions in
+        // trailing slots of the same languages.
+        let feature =
+            r#"<playlist name="Feature" sub="eng,cat,jpn,cat,jpn" forced_sub="0,0,0,2,3" />"#;
+        let labels = labels_from_feature(feature);
+        let s = subs(&labels);
+        assert_eq!(s.len(), 5);
+        assert_eq!(s[1].qualifier, LabelQualifier::None, "the full cat track");
+        assert_eq!(s[2].qualifier, LabelQualifier::None, "the full jpn track");
+        assert_eq!(s[3].qualifier, LabelQualifier::Forced, "cat forced slot");
+        assert_eq!(s[3].stream_number, 4);
+        assert_eq!(s[4].qualifier, LabelQualifier::Forced, "jpn forced slot");
+        assert_eq!(s[4].stream_number, 5);
+    }
+
+    /// An unrecognised cell must fall to NOT forced. Asserting forced is the
+    /// expensive mistake (a full dialogue track a player then burns on screen),
+    /// so an unknown value from a future authoring revision must not be able to
+    /// make that claim.
+    ///
+    /// Mutation: `_ => ForcedNarrative`, or treating "any non-zero" as forced.
+    #[test]
+    fn an_unrecognised_forced_sub_cell_is_not_forced() {
+        let feature = r#"<playlist name="Feature" sub="eng,fra,spa,ita" forced_sub="4,x,,-1" />"#;
+        let labels = labels_from_feature(feature);
+        let s = subs(&labels);
+        assert_eq!(s.len(), 4);
+        assert!(s.iter().all(|l| l.qualifier == LabelQualifier::None));
+        // ...and so must a cell the CSV simply does not reach.
+        let feature = r#"<playlist name="Feature" sub="eng,fra" forced_sub="0" />"#;
+        let labels = labels_from_feature(feature);
+        assert_eq!(subs(&labels)[1].qualifier, LabelQualifier::None);
     }
 
     /// Spec: `find_feature_playlist` returns None when XML has no `<playlist>` elements.

@@ -565,6 +565,60 @@ mod tests {
         assert_eq!(l.qualifier, LabelQualifier::Forced);
     }
 
+    /// Immunity pin against the defect measured in the `paramount` parser: a
+    /// vendor "forced" marker that sits on a FULL dialogue track's own slot to
+    /// mean "this track also contains forced signs", read as "this track is
+    /// forced" and so flagging full dialogue tracks forced.
+    ///
+    /// This grammar cannot express that. The forced marker is a component of a
+    /// slot's OWN token, so a forced-narrative pass occupies a slot of its own
+    /// (`{lang}_TXT_FOR_`, `{lang}_DUB_`) alongside the language's separate
+    /// full-dialogue slot — it is never a parallel array indexed against the
+    /// full tracks' slots, which is the shape that let one vendor's marker land
+    /// on a dialogue track.
+    ///
+    /// Mutation: give any full-dialogue component (`SDLG`, `TXT`, `SDH`,
+    /// `STRI`, `SCOM`) a forced qualifier of its own.
+    #[test]
+    fn a_full_subtitle_token_is_never_forced_without_its_own_forced_component() {
+        for token in [
+            "eng_SDLG_",
+            "eng_TXT_",
+            "eng_SDH_",
+            "eng_STRI_",
+            "eng_SCOM_",
+        ] {
+            let l = parse_token_inner(token, None)
+                .unwrap_or_else(|| panic!("{token} must classify as a subtitle"));
+            assert_eq!(l.stream_type, StreamLabelType::Subtitle);
+            assert_ne!(
+                l.qualifier,
+                LabelQualifier::Forced,
+                "{token} carries no forced component and must not be forced"
+            );
+        }
+        // And a language's forced pass is a SEPARATE slot from its full track,
+        // never a marker applied to the full track's slot.
+        let mut flag = UnknownParts::default();
+        let tokens = strs(&[
+            "FPL_MainFeature",
+            "PG Stream 1",
+            "eng_SDLG_",    // PG slot 2 — the full dialogue track
+            "eng_TXT_FOR_", // PG slot 3 — its forced-narrative companion
+        ]);
+        let labels = assign_labels(&tokens, &mut flag);
+        let subs: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Subtitle)
+            .map(|l| (l.stream_number, l.qualifier))
+            .collect();
+        assert_eq!(
+            subs,
+            vec![(2, LabelQualifier::None), (3, LabelQualifier::Forced),],
+            "the forced marker belongs to its own slot, not to the full track's"
+        );
+    }
+
     #[test]
     fn parse_token_components_are_case_insensitive() {
         // Regression for the case-sensitive gate: a lowercase codec/
