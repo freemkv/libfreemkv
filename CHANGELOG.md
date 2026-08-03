@@ -54,6 +54,28 @@
   `output()` now takes the source provenance explicitly. One of the crate's own
   tests had been asserting the wrong value, which is why the suite never caught
   it.
+- **A vendor label list was re-numbered from 1 inside every title, so the same
+  label landed on a different physical stream in each.** A label list describes
+  ONE playlist's stream table, but it was applied to every title on the disc by
+  per-type ordinal. Where sibling playlists cover the identical feature clip
+  and enumerate different subtitle sets — one carrying a full track the other
+  omits — identical ordinals resolve to different PIDs, and the same stream
+  came out flagged forced in one title and not in the other. On the title such
+  a disc actually offers as the rip target, that put `forced` on an
+  873 MB full-dialogue English subtitle track: the user is shown "English" and
+  "English (Forced)", picks either, and gets the same subtitles. Labels are now
+  bound to the stream a PID identifies, not to a position in a list. The title
+  whose per-type stream-language sequence reproduces the label list is treated
+  as the table the list describes; the `(clip, PID)` facts it yields bind every
+  other playlist over that clip, so a flag lands on the same elementary stream
+  whichever playlist enumerates it, and a stream the list never described is
+  left alone. Streams no such fact reaches still bind by ordinal, but a label
+  whose language contradicts the stream it would land on is now dropped rather
+  than applied — an unlabelled track is a far smaller harm than a mislabelled
+  one, all the more since the muxer can only undo a wrong `forced` on discs
+  whose authoring sets `forced_on_flag` at all. Across the disc-image corpus
+  this cleared every cross-title label conflict, on both affected vendor
+  formats.
 - **Vendor stream labels were numbered by parsed entry, not by stream slot.**
   Label blobs contain entries the parser deliberately does not interpret, but
   those entries still occupy a stream-number slot. Counting only the parsed
