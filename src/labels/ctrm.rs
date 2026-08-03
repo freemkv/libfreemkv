@@ -514,6 +514,47 @@ mod tests {
         assert_eq!(labels[0].qualifier, LabelQualifier::Forced);
     }
 
+    /// Immunity pin against the defect measured in the `paramount` parser,
+    /// where a vendor `forced_sub` cell hung off a FULL dialogue track's own
+    /// slot to say "this track also contains forced signs", and reading that
+    /// cell as "this track is forced" flagged 30 MB dialogue tracks forced.
+    ///
+    /// This format cannot express that. The forced signal is not a flag beside
+    /// a track's entry — it IS the entry's stream-kind token, drawn from a
+    /// closed vocabulary in which `subtitle_production` (the full dialogue
+    /// track) and `subtitle_narrative` (the forced-narrative track) are
+    /// mutually exclusive alternatives in the same position. A row is one or
+    /// the other; there is no cell a full track can carry to acquire the
+    /// qualifier, so the paramount failure mode has no encoding here.
+    ///
+    /// Mutation: give `subtitle_production` a `Forced` qualifier, or add a
+    /// forced side-flag that both kinds may carry.
+    #[test]
+    fn a_full_subtitle_track_kind_can_never_carry_the_forced_qualifier() {
+        // Every subtitle kind in the vocabulary, one row each.
+        let text = "id1,subtitle_production,1,eng\n\
+                    id2,subtitle_commentary,2,eng\n\
+                    id3,subtitle_dual,3,eng\n\
+                    id4,subtitle_bonus,4,eng\n\
+                    id5,subtitle_ime,5,kor\n\
+                    id6,subtitle_narrative,6,eng\n\
+                    id7,subtitle_ime_narrative,7,kor\n";
+        let labels = parse_language_streams_text(text);
+        let forced: Vec<&str> = labels
+            .iter()
+            .filter(|l| l.qualifier == LabelQualifier::Forced)
+            .map(|l| l.language.as_str())
+            .collect();
+        assert_eq!(
+            forced.len(),
+            2,
+            "only the two narrative kinds are forced, got {forced:?}"
+        );
+        // The full dialogue kind specifically.
+        let production = parse_language_streams_text("id,subtitle_production,1,eng\n");
+        assert_eq!(production[0].qualifier, LabelQualifier::None);
+    }
+
     /// Spec: `subtitle_commentary` → Subtitle / Commentary.
     /// Mutation: treat as Normal → subtitle commentary not flagged.
     #[test]

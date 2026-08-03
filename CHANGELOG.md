@@ -4,6 +4,34 @@
 
 ### Fixed
 
+- **A vendor label's forced-subtitle field was read as a boolean when it is an
+  enumeration, mislabelling full dialogue tracks and discarding the real forced
+  tracks.** One vendor's `playlists.xml` carries a per-subtitle-slot cell that
+  looks like a flag; the parser treated the value `1` as "this track is forced"
+  and every other value as "not forced". Measured across every image in the
+  corpus that uses this format — seven distinct discs — the cell takes four
+  values, and `1` is not the forced one: it marks a FULL dialogue track that
+  additionally contains some forced-narrative signs. Decoding three of those
+  discs and counting every PGS display set: all nine tracks bearing `1` on one
+  disc are full tracks of 949-1411 display sets, all seven on another are full
+  tracks of 1602-1651, and neither disc's `1` tracks are anything but full —
+  which is how a language ended up presenting as two identical full subtitle
+  tracks with one of them flagged forced. The values that DO name a dedicated
+  forced-narrative track, `2` and `3`, were being thrown away: they take their
+  own trailing stream slots, one per localized language, and measure 7 to 59
+  display sets against the 1216-2655 of the full tracks they duplicate. So the
+  reading was wrong in both directions. The cell is now classified as the enumeration it is; only a
+  dedicated forced slot earns the flag, an unrecognised value never does, and
+  the "contains forced signs" value is dropped rather than weakened into a
+  forced label. This is not something content could have corrected afterwards:
+  clearing a wrong forced label requires a disc whose authoring sets
+  `forced_on_flag`, and measured discs in this format do not set it — so on
+  those discs the vendor cell was, and remains, the only evidence there is.
+  Four of the crate's own tests had been asserting the boolean reading. The
+  other two parsers that emit a forced qualifier from vendor metadata were
+  audited and are structurally immune — in both, the forced marker names a slot
+  of its own rather than hanging off a full track's entry — and are now pinned
+  by tests saying so.
 - **Content-based forced-subtitle detection never observed anything on a
   feature-length disc.** The PGS probe spent its entire 256 MiB budget on the
   first sectors of a title, where a feature has no subtitles at all — it hit
