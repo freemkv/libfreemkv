@@ -967,7 +967,7 @@ mod tests {
         // mark this boundary ext_clean=false and the parser must emit the clean
         // 512-byte CORE alone (dropping the garbage), draining to the next core.
         let core = make_dts_core(512);
-        let garbage = vec![0xE4, 0x3F, 0xE3, 0x90, 0xCC, 0x6C]; // real Bourne head bytes
+        let garbage = vec![0xE4, 0x3F, 0xE3, 0x90, 0xCC, 0x6C]; // real head bytes from a damaged stream
         let mut garbage = garbage;
         garbage.extend(std::iter::repeat_n(0xAB, 300));
         let next = make_dts_core(512);
@@ -2222,7 +2222,7 @@ mod tests {
     /// Real-data fixture (ignored). Re-parses a raw `.dts` elementary stream
     /// through `DtsParser` and writes the emitted access units back out, so the
     /// garbage-extension → core-only drop can be validated against an actual
-    /// damaged stream (e.g. the extracted Bourne DTS-HD MA track) end-to-end
+    /// damaged stream (e.g. an extracted DTS-HD MA track) end-to-end
     /// with an external DTS decoder. Env: `DTS_IN` (input), `DTS_OUT` (output).
     ///   cargo test --lib dts::tests::reparse_real_dts_file -- --ignored --nocapture
     #[test]

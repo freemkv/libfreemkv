@@ -1119,7 +1119,7 @@ consumers are the in-tree toolchain crates.
   The direct-to-MKV path now gives the drive its full ECC recovery budget on a
   bad sector (matching the multipass rip) instead of reporting a read failure a
   multipass rip would have recovered.
-- **4K decode glitches at non-seamless clip joins fixed (Top Gun class).**
+- **4K decode glitches at non-seamless clip joins fixed.**
   Titles assembled from clips joined at non-seamless boundaries no longer drop
   reference frames at the join ("Could not find ref" stutter); the splice
   keyframe is rewritten so the decoder discards only the genuinely-dangling

@@ -533,8 +533,8 @@ impl CodecParser for HevcParser {
         // CRA→BLA rewrite (`pending_clip_boundary`) the first IRAP of the new
         // clip then consumes. Without this, the splice CRA's RASL leading
         // pictures reference pre-join frames gone after concatenation and a
-        // linear decoder floods "Could not find ref with POC N" (the Top Gun
-        // UHD defect). Uses the 90 kHz PES PTS (not the rebased mux timeline)
+        // linear decoder floods "Could not find ref with POC N" (the UHD
+        // multi-clip defect). Uses the 90 kHz PES PTS (not the rebased mux timeline)
         // UNWRAPPED onto a monotonic 64-bit timeline first — the raw 33-bit PTS
         // wraps every ~26.5 h, and a single-clip title that crosses 2^33→0 would
         // otherwise false-arm the rewrite (corrupting a legitimate in-clip CRA).
@@ -2197,7 +2197,7 @@ mod tests {
         );
     }
 
-    /// Regression for the "TopGun bug" (Top Gun 1986 UHD, DV P7 dual-layer):
+    /// Regression for a UHD Dolby Vision profile 7 dual-layer title:
     /// a multi-clip title is read as one concatenated stream and the mpls
     /// connection_condition is never plumbed to the parser, so the splice CRA
     /// opening the next clip kept its dangling RASL leading pictures and a
