@@ -199,8 +199,128 @@ pub fn apply(reader: &mut dyn SectorSource, udf: &UdfFs, titles: &mut [DiscTitle
     apply_labels(&labels, titles);
 }
 
-/// Apply a pre-extracted set of labels to titles' streams. Match
-/// labels to streams by (stream_type, 1-based stream_number per type).
+/// Minimum number of streams of one type a title must carry before its
+/// language sequence is strong enough evidence to anchor the label list
+/// (see [`find_anchor`]). A one-stream agreement is a coin flip — every
+/// disc has some single-audio menu clip whose language matches label #1.
+const MIN_ANCHOR_STREAMS: usize = 2;
+
+/// Two ISO 639-2 codes that do NOT contradict each other. Equal (ignoring
+/// case / padding) is agreement; an empty code on either side is "unknown",
+/// which cannot contradict anything. Used to decide whether an ordinal
+/// binding is plausible at all.
+fn languages_compatible(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    a.is_empty() || b.is_empty() || a.eq_ignore_ascii_case(b)
+}
+
+/// Stricter form of [`languages_compatible`]: both sides actually state a
+/// language and they are the same. "Unknown" is not agreement.
+fn languages_agree(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    !a.is_empty() && a.eq_ignore_ascii_case(b)
+}
+
+/// The label occupying 1-based STN slot `n` of `stream_type`, if any.
+fn label_at(labels: &[StreamLabel], stream_type: StreamLabelType, n: u16) -> Option<&StreamLabel> {
+    labels
+        .iter()
+        .find(|l| l.stream_type == stream_type && l.stream_number == n)
+}
+
+/// The (PID, language) of each stream of `stream_type` in the title, in
+/// STN order — i.e. exactly the sequence `apply_labels` numbers against.
+fn slots_of(title: &DiscTitle, stream_type: StreamLabelType) -> Vec<(u16, &str)> {
+    title
+        .streams
+        .iter()
+        .filter_map(|s| match (s, stream_type) {
+            (Stream::Audio(a), StreamLabelType::Audio) => Some((a.pid, a.language.as_str())),
+            (Stream::Subtitle(s), StreamLabelType::Subtitle) => Some((s.pid, s.language.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Find the title the label list is actually describing, for one stream type.
+///
+/// A vendor label list is a single stream table — one playlist's STN slots —
+/// but it is handed to every title on the disc. When sibling playlists cover
+/// the same clip with different stream subsets, per-title ordinal numbering
+/// puts the same label on different physical PIDs in each, and the flags
+/// contradict each other. The list itself carries no playlist id, but it does
+/// carry a language per slot, and that sequence is a fingerprint: on the
+/// corpus, exactly one title's per-type language sequence reproduces the label
+/// list position for position, and content confirms that title's binding is
+/// the correct one.
+///
+/// So: the anchor is the title whose every stream of this type sits on a slot
+/// the label list covers with a compatible language. Longest wins (it pins the
+/// most slots); ties fall to title order, which is duration-descending.
+/// `None` means no title matches — the list describes a stream table this disc
+/// scan cannot see, and nothing may be bound authoritatively.
+fn find_anchor(
+    labels: &[StreamLabel],
+    titles: &[DiscTitle],
+    stream_type: StreamLabelType,
+) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None; // (slot count, title index)
+    for (idx, title) in titles.iter().enumerate() {
+        let n = slots_of(title, stream_type).len();
+        if n < MIN_ANCHOR_STREAMS {
+            continue;
+        }
+        if sequence_aligned(labels, title, stream_type) && best.is_none_or(|(best, _)| n > best) {
+            best = Some((n, idx));
+        }
+    }
+    best.map(|(_, idx)| idx)
+}
+
+/// Does every stream of this type sit on a label slot that does not
+/// contradict it? A title that fails this is enumerating some other stream
+/// table than the one the label list describes, whatever the odd slot that
+/// happens to agree might suggest.
+fn sequence_aligned(
+    labels: &[StreamLabel],
+    title: &DiscTitle,
+    stream_type: StreamLabelType,
+) -> bool {
+    slots_of(title, stream_type)
+        .iter()
+        .enumerate()
+        .all(|(i, (_, lang))| {
+            label_at(labels, stream_type, (i + 1) as u16)
+                .is_some_and(|l| languages_compatible(&l.language, lang))
+        })
+}
+
+/// Apply a pre-extracted set of labels to titles' streams.
+///
+/// Binding is two-tier:
+///
+///   1. **PID.** [`find_anchor`] identifies the title whose stream table the
+///      label list is describing. Every slot of that title yields a
+///      `(clip, PID) -> label` fact, and a PID is the same physical stream in
+///      every playlist that plays that clip. Sibling playlists are bound
+///      through that map, so a label lands on the same elementary stream no
+///      matter which playlist enumerates it, and slots the anchor never showed
+///      us are simply not bound.
+///
+///   2. **Ordinal, language-checked.** Streams no anchor fact covers (bonus
+///      clips, discs with no anchor at all) still fall back to the 1-based
+///      per-type STN ordinal — but a label whose language contradicts the
+///      stream it would land on is dropped rather than applied.
+///
+/// The policy where a title cannot be bound confidently is to leave the stream
+/// alone: an unlabelled track is a much smaller harm than a full-dialogue track
+/// wearing `forced`, which presents to the user as a duplicate of the track
+/// they wanted, and which the muxer can only undo on discs that state
+/// `forced_on_flag`. A subtitle label carries nothing but the qualifier, so an
+/// unverifiable one has no upside at all to trade against that risk, and the
+/// ordinal path applies one only when the label and the stream both state a
+/// language and it is the same one.
+///
 /// Audio streams update `purpose` + `label` (codec/variant info; never
 /// English purpose text). Subtitle streams update `qualifier` and the
 /// `forced` flag.
@@ -208,17 +328,85 @@ pub fn apply(reader: &mut dyn SectorSource, udf: &UdfFs, titles: &mut [DiscTitle
 /// Extracted from `apply()` so the matching logic is unit-testable
 /// without needing a SectorSource / UdfFs.
 pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
-    for title in titles.iter_mut() {
+    use std::collections::HashMap;
+
+    // `(clip id, PID) -> index into `labels``, harvested from the anchor
+    // title of each stream type. Keyed by clip because a PID is only unique
+    // within one clip: two unrelated .m2ts files both open their audio at
+    // 0x1100.
+    let mut pid_map: HashMap<(&str, u16), usize> = HashMap::new();
+    let mut anchors: [Option<usize>; 2] = [None; 2];
+    for stream_type in [StreamLabelType::Audio, StreamLabelType::Subtitle] {
+        let Some(anchor) = find_anchor(labels, titles, stream_type) else {
+            continue;
+        };
+        anchors[type_tag(stream_type) as usize] = Some(anchor);
+        let title = &titles[anchor];
+        for (i, (pid, _)) in slots_of(title, stream_type).iter().enumerate() {
+            let Some(pos) = labels
+                .iter()
+                .position(|l| l.stream_type == stream_type && l.stream_number == (i + 1) as u16)
+            else {
+                continue;
+            };
+            for clip in &title.clips {
+                pid_map.insert((clip.clip_id.as_str(), *pid), pos);
+            }
+        }
+        tracing::info!(
+            stream_type = ?stream_type,
+            playlist = %titles[anchor].playlist,
+            slots = slots_of(&titles[anchor], stream_type).len(),
+            "label list anchored to a title by its stream-language sequence",
+        );
+    }
+    // The map borrows the titles it was built from; copy it out so the
+    // binding pass can take `&mut`.
+    let pid_map: HashMap<(String, u16), usize> = pid_map
+        .into_iter()
+        .map(|((c, p), v)| ((c.to_string(), p), v))
+        .collect();
+
+    for (title_idx, title) in titles.iter_mut().enumerate() {
         let mut audio_idx: u16 = 0;
         let mut sub_idx: u16 = 0;
+        // The anchor facts that reach this title: those recorded against a
+        // clip it plays. Narrowed once per title rather than per stream, so a
+        // title with hundreds of clip references costs one pass over the map.
+        let known_pids: HashMap<u16, usize> = {
+            let clips: std::collections::HashSet<&str> =
+                title.clips.iter().map(|c| c.clip_id.as_str()).collect();
+            pid_map
+                .iter()
+                .filter(|((clip, _), _)| clips.contains(clip.as_str()))
+                .map(|((_, pid), pos)| (*pid, *pos))
+                .collect()
+        };
+
+        // Resolve one stream to (label, authoritative). Authoritative means
+        // the binding came from a PID fact rather than a bare ordinal: either
+        // this title IS the anchor, or an anchor told us what this PID is.
+        let resolve = |stream_type: StreamLabelType, idx: u16, pid: u16, lang: &str| {
+            if anchors[type_tag(stream_type) as usize] == Some(title_idx) {
+                return label_at(labels, stream_type, idx).map(|l| (l, true));
+            }
+            if let Some(pos) = known_pids.get(&pid).copied()
+                && labels[pos].stream_type == stream_type
+            {
+                return Some((&labels[pos], true));
+            }
+            label_at(labels, stream_type, idx)
+                .filter(|l| languages_compatible(&l.language, lang))
+                .map(|l| (l, false))
+        };
 
         for stream in &mut title.streams {
             match stream {
                 Stream::Audio(a) => {
                     audio_idx += 1;
-                    if let Some(label) = labels.iter().find(|l| {
-                        l.stream_type == StreamLabelType::Audio && l.stream_number == audio_idx
-                    }) {
+                    if let Some((label, _authoritative)) =
+                        resolve(StreamLabelType::Audio, audio_idx, a.pid, &a.language)
+                    {
                         // Structured fields — callers translate purpose to UI text.
                         a.purpose = label.purpose;
 
@@ -270,9 +458,15 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
                 }
                 Stream::Subtitle(s) => {
                     sub_idx += 1;
-                    if let Some(label) = labels.iter().find(|l| {
-                        l.stream_type == StreamLabelType::Subtitle && l.stream_number == sub_idx
-                    }) {
+                    if let Some((label, authoritative)) =
+                        resolve(StreamLabelType::Subtitle, sub_idx, s.pid, &s.language)
+                        // A subtitle label carries nothing but the qualifier,
+                        // so an unverifiable one is all risk and no gain: off
+                        // the authoritative path, require the label and the
+                        // stream to state the same language.
+                        && (authoritative
+                            || languages_agree(&label.language, &s.language))
+                    {
                         s.qualifier = label.qualifier;
                         if label.qualifier == LabelQualifier::Forced {
                             s.forced = true;
@@ -1483,6 +1677,47 @@ mod apply_tests {
         }
     }
 
+    /// A title that plays one named clip — the shape that matters for
+    /// cross-playlist binding, where two playlists cover the same clip.
+    fn title_on_clip(playlist: &str, clip_id: &str, streams: Vec<Stream>) -> DiscTitle {
+        DiscTitle {
+            playlist: playlist.into(),
+            clips: vec![crate::disc::Clip {
+                clip_id: clip_id.into(),
+                in_time: 0,
+                out_time: 0,
+                duration_secs: 7200.0,
+                source_packets: 0,
+            }],
+            ..title_with(streams)
+        }
+    }
+
+    fn sub_label(num: u16, lang: &str, qualifier: LabelQualifier) -> StreamLabel {
+        StreamLabel {
+            stream_number: num,
+            stream_type: StreamLabelType::Subtitle,
+            language: lang.into(),
+            name: String::new(),
+            purpose: LabelPurpose::Normal,
+            qualifier,
+            codec_hint: String::new(),
+            variant: String::new(),
+        }
+    }
+
+    /// `(pid, forced, qualifier)` for every subtitle of a title.
+    fn sub_state(title: &DiscTitle) -> Vec<(u16, bool, LabelQualifier)> {
+        title
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Subtitle(s) => Some((s.pid, s.forced, s.qualifier)),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn audio_label(num: u16, lang: &str, codec_hint: &str, variant: &str) -> StreamLabel {
         StreamLabel {
             stream_number: num,
@@ -1842,6 +2077,164 @@ mod apply_tests {
         if let Stream::Audio(a) = &titles[0].streams[0] {
             assert_eq!(a.label, "", "label must be untouched");
         }
+    }
+
+    /// The cross-playlist mis-binding this module's two-tier binding exists to
+    /// stop, in its measured shape: two playlists cover the identical feature
+    /// clip, one of them enumerates one extra subtitle ahead of the forced
+    /// slots, and the vendor label list describes the shorter of the two.
+    /// Numbering the same list from 1 inside each title puts the `Forced`
+    /// label on a different PID in each — in the longer playlist, on the full
+    /// dialogue track. The user then sees two identical-looking English
+    /// subtitle tracks, one of them wrongly flagged forced.
+    ///
+    /// Binding by the PID an anchored title proved, rather than by ordinal,
+    /// puts `forced` on the same two physical streams in both playlists and
+    /// leaves the extra one alone.
+    #[test]
+    fn forced_label_follows_the_pid_not_the_ordinal_across_sibling_playlists() {
+        // Six slots: three plain, a commentary subtitle, then two forced.
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::None),
+            sub_label(2, "spa", LabelQualifier::None),
+            sub_label(3, "fra", LabelQualifier::None),
+            sub_label(4, "eng", LabelQualifier::None),
+            sub_label(5, "spa", LabelQualifier::Forced),
+            sub_label(6, "fra", LabelQualifier::Forced),
+        ];
+        // The default rip target enumerates a seventh stream (0x12A4, a full
+        // English track) in the middle; its sibling does not.
+        let mut titles = vec![
+            title_on_clip(
+                "00801.mpls",
+                "00294",
+                vec![
+                    subtitle(0x12A0, "eng"),
+                    subtitle(0x12A1, "spa"),
+                    subtitle(0x12A2, "fra"),
+                    subtitle(0x12A3, "eng"),
+                    subtitle(0x12A4, "eng"),
+                    subtitle(0x12A5, "spa"),
+                    subtitle(0x12A6, "fra"),
+                ],
+            ),
+            title_on_clip(
+                "00040.mpls",
+                "00294",
+                vec![
+                    subtitle(0x12A0, "eng"),
+                    subtitle(0x12A1, "spa"),
+                    subtitle(0x12A2, "fra"),
+                    subtitle(0x12A3, "eng"),
+                    subtitle(0x12A5, "spa"),
+                    subtitle(0x12A6, "fra"),
+                ],
+            ),
+        ];
+        apply_labels(&labels, &mut titles);
+
+        assert_eq!(
+            sub_state(&titles[0]),
+            vec![
+                (0x12A0, false, LabelQualifier::None),
+                (0x12A1, false, LabelQualifier::None),
+                (0x12A2, false, LabelQualifier::None),
+                (0x12A3, false, LabelQualifier::None),
+                // The extra stream the label list never described: untouched,
+                // and above all NOT forced.
+                (0x12A4, false, LabelQualifier::None),
+                (0x12A5, true, LabelQualifier::Forced),
+                (0x12A6, true, LabelQualifier::Forced),
+            ],
+        );
+        // Same two PIDs forced in the sibling — the flags now agree.
+        assert_eq!(
+            sub_state(&titles[1]),
+            vec![
+                (0x12A0, false, LabelQualifier::None),
+                (0x12A1, false, LabelQualifier::None),
+                (0x12A2, false, LabelQualifier::None),
+                (0x12A3, false, LabelQualifier::None),
+                (0x12A5, true, LabelQualifier::Forced),
+                (0x12A6, true, LabelQualifier::Forced),
+            ],
+        );
+    }
+
+    /// No anchor to work from (nothing on the disc reproduces the label list's
+    /// language sequence), so binding falls back to the STN ordinal — and a
+    /// label that names a different language than the stream it would land on
+    /// is evidence the list is describing some other stream table. Drop it:
+    /// unlabelled beats mislabelled, because the payload here is `forced`.
+    #[test]
+    fn ordinal_binding_drops_a_subtitle_label_that_contradicts_the_stream_language() {
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::None),
+            sub_label(2, "fra", LabelQualifier::Forced),
+        ];
+        let mut titles = vec![title_with(vec![
+            subtitle(0x12A0, "eng"),
+            subtitle(0x12A1, "spa"),
+        ])];
+        apply_labels(&labels, &mut titles);
+        assert_eq!(
+            sub_state(&titles[0]),
+            vec![
+                (0x12A0, false, LabelQualifier::None),
+                (0x12A1, false, LabelQualifier::None),
+            ],
+        );
+    }
+
+    /// The same guard on the audio side: a label whose language contradicts
+    /// the stream is not applied, so a shifted list cannot move `Commentary`
+    /// onto a main dialogue track.
+    #[test]
+    fn ordinal_binding_drops_an_audio_label_that_contradicts_the_stream_language() {
+        let mut titles = vec![title_with(vec![
+            audio(0x1100, Codec::TrueHd, AudioChannels::Surround51, "eng"),
+            audio(0x1101, Codec::Ac3, AudioChannels::Stereo, "spa"),
+        ])];
+        let labels = vec![
+            audio_label(1, "eng", "", ""),
+            StreamLabel {
+                stream_number: 2,
+                stream_type: StreamLabelType::Audio,
+                language: "fra".into(),
+                name: String::new(),
+                purpose: LabelPurpose::Commentary,
+                qualifier: LabelQualifier::None,
+                codec_hint: String::new(),
+                variant: String::new(),
+            },
+        ];
+        apply_labels(&labels, &mut titles);
+        if let Stream::Audio(a) = &titles[0].streams[1] {
+            assert_eq!(a.purpose, LabelPurpose::Normal);
+        } else {
+            panic!("expected audio stream");
+        }
+    }
+
+    /// A single agreeing stream is not evidence of anything — every disc has
+    /// some one-audio menu clip whose language matches label #1. If such a
+    /// title could anchor, its PIDs would be treated as proven and would
+    /// override the language check everywhere else that clip is played.
+    #[test]
+    fn a_single_stream_title_cannot_anchor_the_label_list() {
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::None),
+            sub_label(2, "spa", LabelQualifier::Forced),
+        ];
+        let titles = vec![title_on_clip(
+            "01241.mpls",
+            "00294",
+            vec![subtitle(0x12A4, "eng")],
+        )];
+        assert_eq!(
+            find_anchor(&labels, &titles, StreamLabelType::Subtitle),
+            None,
+        );
     }
 
     #[test]
