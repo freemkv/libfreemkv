@@ -854,6 +854,21 @@ fn apply_verdicts(title: &mut DiscTitle, verdicts: &HashMap<u16, bool>) {
             && let Some(&forced) = verdicts.get(&sub.pid)
         {
             sub.forced = forced;
+            // A demoted track must not go on describing itself as forced. The
+            // flag and the qualifier are two renderings of one fact for
+            // different consumers — the muxer writes `FlagForced` from
+            // `forced`, the JSON sidecar writes its qualifier string from
+            // `qualifier` — so leaving `Forced` behind here published a track
+            // whose sidecar said "forced" and whose Matroska header said it was
+            // not. The probe read the content; it outranks the vendor's claim.
+            //
+            // Only this direction is a contradiction. `qualifier == None` on a
+            // track the probe promoted is not one: `None` is the absence of an
+            // editorial qualifier, not an assertion that the track is ordinary,
+            // and the vendor never claimed otherwise.
+            if !forced && sub.qualifier == crate::disc::LabelQualifier::Forced {
+                sub.qualifier = crate::disc::LabelQualifier::None;
+            }
         }
     }
 }
@@ -2043,6 +2058,52 @@ mod tests {
             qualifier: LabelQualifier::None,
             codec_data: None,
         })
+    }
+
+    /// Spec: a verdict that DEMOTES a track clears a `Forced` qualifier with
+    /// it. The two fields are one fact rendered for two consumers — the muxer
+    /// writes Matroska `FlagForced` from `forced`, the JSON metadata sidecar
+    /// writes its qualifier string from `qualifier` — so leaving the qualifier
+    /// behind publishes a track that calls itself forced next to a header that
+    /// says it is not.
+    ///
+    /// Mutation: delete the qualifier assignment in `apply_verdicts` — the
+    /// track comes out `forced == false, qualifier == Forced`.
+    #[test]
+    fn a_demoted_track_stops_calling_itself_forced() {
+        let mut title = pgs_title(0x1200, true);
+        if let Stream::Subtitle(sub) = &mut title.streams[0] {
+            sub.qualifier = LabelQualifier::Forced;
+        }
+        apply_verdicts(&mut title, &HashMap::from([(0x1200u16, false)]));
+        let Stream::Subtitle(sub) = &title.streams[0] else {
+            unreachable!()
+        };
+        assert!(!sub.forced);
+        assert_eq!(
+            sub.qualifier,
+            LabelQualifier::None,
+            "the content outranks the vendor's claim, and both renderings of it move together"
+        );
+    }
+
+    /// Spec: a qualifier that is not a forced claim is not the probe's to
+    /// touch. `Sdh` says something about the track's content that a
+    /// forced-narrative verdict neither confirms nor refutes.
+    ///
+    /// Mutation: clear the qualifier unconditionally on demotion — the SDH
+    /// marking is lost.
+    #[test]
+    fn a_demoted_track_keeps_a_qualifier_that_is_not_a_forced_claim() {
+        let mut title = pgs_title(0x1200, true);
+        if let Stream::Subtitle(sub) = &mut title.streams[0] {
+            sub.qualifier = LabelQualifier::Sdh;
+        }
+        apply_verdicts(&mut title, &HashMap::from([(0x1200u16, false)]));
+        let Stream::Subtitle(sub) = &title.streams[0] else {
+            unreachable!()
+        };
+        assert_eq!(sub.qualifier, LabelQualifier::Sdh);
     }
 
     fn forced_flag(title: &DiscTitle, pid: u16) -> bool {

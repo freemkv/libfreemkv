@@ -272,6 +272,7 @@ fn assign_labels(strings: &[String], unknown: &mut UnknownParts) -> Vec<StreamLa
                     }
                     audio_num += 1;
                     labels.push(StreamLabel {
+                        stream_id: None,
                         stream_number: audio_num,
                         ..label
                     });
@@ -282,6 +283,7 @@ fn assign_labels(strings: &[String], unknown: &mut UnknownParts) -> Vec<StreamLa
                     }
                     sub_num += 1;
                     labels.push(StreamLabel {
+                        stream_id: None,
                         stream_number: sub_num,
                         ..label
                     });
@@ -464,6 +466,7 @@ fn parse_token_inner(s: &str, mut unknown: Option<&mut UnknownParts>) -> Option<
     };
 
     Some(StreamLabel {
+        stream_id: None,
         stream_number: 0,
         stream_type,
         language: lang.to_string(),
