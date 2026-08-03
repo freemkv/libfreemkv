@@ -32,14 +32,14 @@ pub(crate) const DISCONTINUITY_GAP_NS: i64 = 1_000_000;
 /// boundary resets every stream together by the same delta.
 ///
 /// **Only the VIDEO track drives epoch decisions.** A title carries one video
-/// track plus many interleaved audio + subtitle tracks (Top Gun UHD: 2 video,
+/// track plus many interleaved audio + subtitle tracks (one UHD title: 2 video,
 /// 11 audio, 32 PGS). Those non-video tracks are sparse and lag the video by
 /// seconds, so their raw PTS swing well over the 3 s discontinuity threshold
 /// against a shared frontier even within a SINGLE clip — a late subtitle PTS
 /// would ratchet `high_ns` up, then the next normal video frame would sit >3 s
 /// below it and be misread as a clip boundary, permanently bumping `offset_ns`.
 /// That false-positive ratchet (firing thousands of times on a one-clip title)
-/// inflated Top Gun's cluster/Cue timestamps into the billions of ms and
+/// inflated that title's cluster/Cue timestamps into the billions of ms and
 /// destroyed its seek index. The clip-boundary INFERENCE is therefore keyed on
 /// video PTS alone: video establishes and advances the frontier and is the only
 /// track that can open a new epoch. Non-video frames are remapped under the
@@ -200,7 +200,7 @@ mod tests {
     /// Characterization of the BUG: a BD title's two clips concatenated with a
     /// PTS reset at the boundary. WITHOUT correction the raw VIDEO timeline goes
     /// hard backward at clip 2 (what produced the non-monotonic-DTS band on
-    /// Dune / Top Gun). WITH `TimelineContinuity` the output is monotonic and
+    /// multi-clip UHD titles). WITH `TimelineContinuity` the output is monotonic and
     /// continuous across the boundary. The boundary is driven by VIDEO.
     #[test]
     fn continuity_rebases_clip_boundary_reset() {
@@ -256,7 +256,7 @@ mod tests {
 
     /// PRIMARY rc3 regression: a sparse, lagging NON-VIDEO track (PGS subtitle /
     /// trailing audio) on a SINGLE-clip title must NOT inflate `offset_ns`. This
-    /// is the exact false-positive that destroyed Top Gun's seek index: with a
+    /// is the exact false-positive that destroyed a real title's seek index: with a
     /// shared frontier, a late subtitle PTS ratcheted the frontier up, then the
     /// next normal video frame sat >3s below it and was misread as a clip
     /// boundary, permanently bumping the offset — thousands of times, until the
@@ -307,7 +307,7 @@ mod tests {
     /// PASSIVE rider (drives_epoch == false): if it drove epochs, every EL GOP
     /// would look like a multi-second backward jump against the base-layer
     /// frontier and false-trigger a clip-boundary reset — the exact ratchet that
-    /// inflated Top Gun's 1-clip 1h49m timeline to ~7 h. Here the base layer
+    /// inflated a 1-clip 1h49m timeline to ~7 h. Here the base layer
     /// advances 0..60s while the EL re-emits the SAME 0..60s interleaved; the
     /// timeline must stay at 60s with offset 0.
     #[test]
@@ -363,7 +363,7 @@ mod tests {
         );
     }
 
-    /// Regression for the original Top Gun band: a LARGE, real-magnitude
+    /// Regression for the originally-reported band: a LARGE, real-magnitude
     /// clip-boundary back-jump on VIDEO (clip 1 ≈ 13 min, clip 2 resets to 0)
     /// must STILL be rebased to one continuous monotonic timeline — the genuine
     /// multi-clip seamless behaviour is preserved, now keyed on real video

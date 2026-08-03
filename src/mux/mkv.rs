@@ -1373,7 +1373,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // with the base layer's. The two video PTS sequences overlap, so the EL's
         // frames look like multi-second backward jumps against the base layer's
         // frontier and would false-trigger an epoch reset on every GOP (the exact
-        // ratchet that inflated Top Gun's 1-clip timeline to ~7 h). Only the base
+        // ratchet that inflated a 1-clip timeline to ~7 h). Only the base
         // video layer establishes/advances the frontier and opens epochs; the EL
         // — like audio and subtitles — rides the current offset.
         let drives_epoch = Some(track_idx) == self.primary_video_track;
