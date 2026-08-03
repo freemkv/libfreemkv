@@ -157,6 +157,7 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
                 LabelPurpose::Normal
             };
             labels.push(StreamLabel {
+                stream_id: None,
                 stream_number,
                 stream_type: StreamLabelType::Audio,
                 language: lang.to_string(),
@@ -210,6 +211,7 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
             };
 
             labels.push(StreamLabel {
+                stream_id: None,
                 stream_number,
                 stream_type: StreamLabelType::Subtitle,
                 language: lang.to_string(),

@@ -1066,6 +1066,7 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
         }
 
         out.push(StreamLabel {
+            stream_id: None,
             stream_number,
             stream_type,
             language,

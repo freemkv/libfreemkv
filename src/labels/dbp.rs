@@ -171,6 +171,7 @@ fn make_label(num: u16, label: String, stream_type: StreamLabelType) -> StreamLa
     let qualifier = vocab::qualifier(&label);
     let purpose = vocab::purpose(&label);
     StreamLabel {
+        stream_id: None,
         stream_number: num,
         stream_type,
         language,

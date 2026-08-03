@@ -47,6 +47,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     let mut labels = Vec::new();
     for (info, &stream_num) in stream_infos.iter().zip(stream_nums.iter()) {
         labels.push(StreamLabel {
+            stream_id: None,
             stream_number: stream_num,
             stream_type: info.stream_type,
             language: info.language.clone(),

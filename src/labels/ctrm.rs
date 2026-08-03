@@ -207,6 +207,7 @@ fn parse_language_streams_text(text: &str) -> Vec<StreamLabel> {
         }
 
         labels.push(StreamLabel {
+            stream_id: None,
             stream_number: stream_num,
             stream_type,
             language,
@@ -401,6 +402,7 @@ mod tests {
 
     fn lbl(t: StreamLabelType, n: u16, name: &str) -> StreamLabel {
         StreamLabel {
+            stream_id: None,
             stream_number: n,
             stream_type: t,
             language: String::new(),
@@ -910,6 +912,7 @@ fn parse_menu_base_text(text: &str) -> Vec<StreamLabel> {
             .unwrap_or_default();
 
         labels.push(StreamLabel {
+            stream_id: None,
             stream_number: stream_num,
             stream_type,
             language,

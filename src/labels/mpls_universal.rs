@@ -86,44 +86,50 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     Some(ParseResult::low(labels))
 }
 
-/// Convert every stream entry across `playlists` into deduped
-/// [`StreamLabel`]s. Factored out of [`parse`] so unit tests can drive
-/// the actual conversion logic (stream-type mapping, dedup key, dense
-/// global counters) directly from already-parsed [`crate::mpls::Playlist`]
-/// values, without needing a synthetic on-disc UDF image.
+/// Convert every stream entry across `playlists` into one [`StreamLabel`] per
+/// physical stream. Factored out of [`parse`] so unit tests can drive the
+/// actual conversion logic (stream-type mapping, identity, slot numbering)
+/// directly from already-parsed [`crate::mpls::Playlist`] values, without
+/// needing a synthetic on-disc UDF image.
+///
+/// Identity is `(clip, PID)` — what the STN entry states — and it is both the
+/// dedup key and the label's [`StreamId`]. A stream twenty playlists list is
+/// one label; two clips that both open their first audio at 0x1100 are two.
+/// This replaced a disc-global dense counter that numbered surviving entries
+/// 1, 2, 3, … in playlist-directory order: that number was not an STN slot in
+/// anything, but it was handed to a binder that reads `stream_number` as one.
 fn build_labels(playlists: &[crate::mpls::Playlist]) -> Vec<StreamLabel> {
+    use std::collections::HashSet;
     let mut labels: Vec<StreamLabel> = Vec::new();
-    // (stream_type_tag, language, codec_hint, pid) — PID is the
-    // canonical "same physical stream" key; type+lang+codec round
-    // out the rare case where two distinct logical streams happen
-    // to share a PID across playlists with different metadata.
-    let mut seen: Vec<(StreamLabelType, String, String, u16)> = Vec::new();
-
-    // Global 1-based counters keyed by StreamLabelType. Incremented
-    // only when an entry survives dedup, so stream_numbers are dense
-    // (1, 2, 3, ...) per type across the whole disc — not reset per
-    // playlist. A disc with 2 MPLS files that each list the same
-    // 8 audio streams ends up with audio_1..audio_8, not audio_1..
-    // audio_16 or audio_1..audio_8 with audio_1 duplicated.
-    let mut audio_idx: u16 = 0;
-    let mut sub_idx: u16 = 0;
+    let mut seen: HashSet<super::StreamId> = HashSet::new();
 
     for playlist in playlists {
+        // `Playlist::streams` is the FIRST play item's STN table, so every
+        // entry here is a stream of that play item's clip — the same clip
+        // `disc::bluray` records as the title's `clips[0]`. That pairing is
+        // what makes the PID an identity rather than a 16-bit number.
+        //
+        // Streams cannot be non-empty without a play item to have read them
+        // from, so the empty case is unreachable on a real disc; entries we
+        // cannot identify are skipped rather than emitted as unbindable
+        // labels.
+        let Some(clip_id) = playlist.play_items.first().map(|pi| pi.clip_id.clone()) else {
+            continue;
+        };
+
+        // 1-based STN slot within THIS playlist's table, per type — the
+        // `stream_number` field's documented meaning, counted the same way
+        // `disc::bluray` counts the stream list it builds from these entries.
+        // Nothing binds through it (these labels bind by id); it is stated
+        // truthfully rather than invented so that a reader of the label list
+        // sees where on its own playlist each stream sits.
+        let mut audio_idx: u16 = 0;
+        let mut sub_idx: u16 = 0;
+
         for entry in &playlist.streams {
             let Some(label_type) = label_type_for(entry) else {
                 continue;
             };
-
-            let language = normalize_language(&entry.language);
-            let name = language_display_name(&language);
-            let codec_hint = build_codec_hint(label_type, entry);
-
-            let key = (label_type, language.clone(), codec_hint.clone(), entry.pid);
-            if seen.contains(&key) {
-                continue;
-            }
-            seen.push(key);
-
             let stream_number = match label_type {
                 StreamLabelType::Audio => {
                     audio_idx += 1;
@@ -135,7 +141,20 @@ fn build_labels(playlists: &[crate::mpls::Playlist]) -> Vec<StreamLabel> {
                 }
             };
 
+            let stream_id = super::StreamId {
+                clip_id: clip_id.clone(),
+                pid: entry.pid,
+            };
+            if !seen.insert(stream_id.clone()) {
+                continue;
+            }
+
+            let language = normalize_language(&entry.language);
+            let name = language_display_name(&language);
+            let codec_hint = build_codec_hint(label_type, entry);
+
             labels.push(StreamLabel {
+                stream_id: Some(stream_id),
                 stream_number,
                 stream_type: label_type,
                 language,
@@ -365,10 +384,24 @@ mod tests {
         }
     }
 
+    /// A playlist over clip "00001". `Playlist::streams` is read out of the
+    /// first play item's STN table, so a playlist that has streams always has
+    /// a play item to have read them from — the fixture carries one so tests
+    /// exercise the shape production sees, and so each label gets the
+    /// `(clip, PID)` identity it is bound by.
     fn playlist_with(streams: Vec<StreamEntry>) -> Playlist {
+        playlist_on("00001", streams)
+    }
+
+    fn playlist_on(clip_id: &str, streams: Vec<StreamEntry>) -> Playlist {
         Playlist {
             version: "0200".to_string(),
-            play_items: Vec::new(),
+            play_items: vec![crate::mpls::PlayItem {
+                clip_id: clip_id.to_string(),
+                in_time: 0,
+                out_time: 0,
+                connection_condition: 1,
+            }],
             streams,
             marks: Vec::new(),
         }
@@ -503,31 +536,48 @@ mod tests {
         );
     }
 
+    /// Two playlists over the SAME clip that both list PID 0x1100: one
+    /// physical stream, so one label. Identity is `(clip, PID)`, and each
+    /// label states the STN slot it holds in its own playlist.
     #[test]
-    fn dedup_streams_across_playlists() {
-        // Two playlists, same English TrueHD 7.1 PID 0x1100 in both.
-        // Expect one Audio label, not two.
-        let pl1 = playlist_with(vec![
-            audio_entry(0x1100, 0x83, 12, 1, "eng"),
-            audio_entry(0x1101, 0x81, 6, 1, "fra"),
-        ]);
-        let pl2 = playlist_with(vec![
-            audio_entry(0x1100, 0x83, 12, 1, "eng"), // duplicate
-            audio_entry(0x1102, 0x82, 6, 1, "deu"),  // new
-        ]);
+    fn one_label_per_stream_across_playlists_on_the_same_clip() {
+        let pl1 = playlist_on(
+            "00001",
+            vec![
+                audio_entry(0x1100, 0x83, 12, 1, "eng"),
+                audio_entry(0x1101, 0x81, 6, 1, "fra"),
+            ],
+        );
+        let pl2 = playlist_on(
+            "00001",
+            vec![
+                audio_entry(0x1100, 0x83, 12, 1, "eng"), // same stream
+                audio_entry(0x1102, 0x82, 6, 1, "deu"),  // new
+            ],
+        );
         let labels = labels_from_playlists(&[pl1, pl2]);
-        // Expected: eng@0x1100, fra@0x1101, deu@0x1102 — three uniques.
-        assert_eq!(labels.len(), 3);
-        // PID isn't stored on StreamLabel, so assert on the surviving
-        // language set instead.
-        let mut langs: Vec<String> = labels.iter().map(|l| l.language.clone()).collect();
-        langs.sort();
-        assert_eq!(langs, vec!["deu", "eng", "fra"]);
+        assert_eq!(
+            labels.len(),
+            3,
+            "eng/fra/deu — the duplicate eng is one stream"
+        );
 
-        // Stream numbers must be DENSE and GLOBAL across playlists, not
-        // reset per playlist. eng (pl1) = 1, fra (pl1) = 2, the duplicate
-        // eng in pl2 is deduped (no number consumed), and deu (pl2) = 3.
-        // Regression guard for the per-playlist counter-reset divergence.
+        let id = |lang: &str| {
+            labels
+                .iter()
+                .find(|l| l.language == lang)
+                .and_then(|l| l.stream_id.clone())
+                .map(|i| (i.clip_id, i.pid))
+        };
+        assert_eq!(id("eng"), Some(("00001".into(), 0x1100)));
+        assert_eq!(id("fra"), Some(("00001".into(), 0x1101)));
+        assert_eq!(id("deu"), Some(("00001".into(), 0x1102)));
+
+        // `stream_number` is the entry's slot in ITS OWN playlist's STN table
+        // — deu is pl2's second audio, so 2, not "the third distinct stream
+        // seen while scanning the disc". It used to be the latter: a dense
+        // disc-global counter that named no table anyone could count against,
+        // handed to a binder that reads the field as an STN slot.
         let num = |lang: &str| {
             labels
                 .iter()
@@ -536,7 +586,25 @@ mod tests {
         };
         assert_eq!(num("eng"), Some(1));
         assert_eq!(num("fra"), Some(2));
-        assert_eq!(num("deu"), Some(3));
+        assert_eq!(num("deu"), Some(2), "pl2's second audio slot");
+    }
+
+    /// The same PID in two DIFFERENT clips is two different streams — a PID is
+    /// only unique within one clip. Deduping on the PID alone (as the old
+    /// key's `(type, language, codec_hint, pid)` did across clips) collapses
+    /// them into one label, and the second clip's stream is then described by
+    /// the first clip's.
+    #[test]
+    fn same_pid_in_two_clips_is_two_streams() {
+        let pl1 = playlist_on("00001", vec![audio_entry(0x1100, 0x83, 12, 1, "eng")]);
+        let pl2 = playlist_on("00002", vec![audio_entry(0x1100, 0x83, 12, 1, "eng")]);
+        let labels = labels_from_playlists(&[pl1, pl2]);
+        assert_eq!(labels.len(), 2, "different clips: two distinct streams");
+        let clips: Vec<String> = labels
+            .iter()
+            .filter_map(|l| l.stream_id.as_ref().map(|i| i.clip_id.clone()))
+            .collect();
+        assert_eq!(clips, vec!["00001", "00002"]);
     }
 
     #[test]
