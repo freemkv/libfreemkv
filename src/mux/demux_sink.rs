@@ -742,7 +742,7 @@ impl DemuxSink {
             tracks,
             ref_video_track,
             ref_first_pts_ns: None,
-            timeline: TimelineContinuity::new(),
+            timeline: TimelineContinuity::with_clips(&title.clips),
             finished: false,
         })
     }
@@ -866,7 +866,11 @@ impl Stream for DemuxSink {
         // an audio ES before the video ES, in which case track 0 is audio and a
         // non-video epoch driver would ratchet the frontier on sparse/lagging PTS.
         let drives = Some(frame.track) == self.ref_video_track;
-        let pts = self.timeline.adjust(frame.pts, drives);
+        // See `MkvMuxer::write_frame`: `None` is material outside the
+        // playlist's clip marks and is dropped rather than emitted.
+        let Some(pts) = self.timeline.map(frame.pts, drives) else {
+            return Ok(());
+        };
         if drives {
             // Delay reference: recorded here, not in the track's `TrackOut`, so
             // it survives the `audio://` / `sub://` kind filter dropping the

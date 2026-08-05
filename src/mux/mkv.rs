@@ -1349,6 +1349,22 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// BlockAdditional under the track's `mvcC` mapping. Such a frame is always a
     /// `BlockGroup` (never a SimpleBlock), with a `ReferenceBlock` when it is not
     /// a keyframe. `None` for every non-3D frame.
+    /// Drive seam correction from the title's PlayItem marks instead of
+    /// inferring it from PTS jumps.
+    ///
+    /// A multi-clip Blu-ray playlist joins its clips with overlaps and skips
+    /// that PTS inspection cannot recover: a forward jump is indistinguishable
+    /// from frames lost to damaged media, and an overlap smaller than the
+    /// reorder threshold is invisible. Given the marks, each clip is placed at
+    /// the sum of the earlier clips' durations, so the output runs exactly as
+    /// long as the playlist says the title is.
+    ///
+    /// No-op for a title with fewer than two clips or without usable marks —
+    /// DVD, HD-DVD and file sources keep the inference path.
+    pub fn set_clips(&mut self, clips: &[crate::disc::Clip]) {
+        self.continuity = TimelineContinuity::with_clips(clips);
+    }
+
     pub fn write_frame(
         &mut self,
         track_idx: usize,
@@ -1391,7 +1407,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // band of non-monotonic block timestamps. Only the PRIMARY video track
         // drives the boundary decision; every other track (audio, subtitle, DV
         // EL) rides the current offset. No-op for single-clip titles.
-        let pts_ns = self.continuity.adjust(pts_ns, drives_epoch);
+        // `None` means the playlist does not include this frame — material
+        // outside every clip's IN/OUT marks, which only a seam-plan-driven
+        // title can report. Dropping it is the point: emitting it is what put
+        // duplicate content on the timeline at a join.
+        let Some(pts_ns) = self.continuity.map(pts_ns, drives_epoch) else {
+            return Ok(());
+        };
         let raw_ticks = pts_ns / TIMESTAMP_SCALE_NS;
 
         // Cluster boundaries normally coincide with a video keyframe so every
