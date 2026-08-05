@@ -19,6 +19,175 @@ pub(crate) const DISCONTINUITY_BACKSTEP_NS: i64 = 3_000_000_000;
 /// the new clip lands strictly after the previous timeline high (1 ms).
 pub(crate) const DISCONTINUITY_GAP_NS: i64 = 1_000_000;
 
+/// How close a frame's PTS must be to a clip's IN mark to be recognised as that
+/// clip's opening frame.
+///
+/// At an OVERLAP join the next clip's IN sits inside the current clip's range,
+/// so "past the current OUT" never fires and the two clips share a PTS band.
+/// The clips are concatenated in file order, though, so the new clip opens ON
+/// its IN mark — this window is what tells that opening frame apart from the
+/// old clip's tail. One video frame is ~42 ms at 24 fps; 250 ms allows for a
+/// clip whose first frame sits a few frames past its mark without ever reaching
+/// the next join.
+pub(crate) const CLIP_START_TOLERANCE_NS: i64 = 250_000_000;
+
+/// MPLS 45 kHz tick → nanoseconds. PlayItem `in_time`/`out_time` are 45 kHz
+/// (`disc::Clip`, and `disc/bluray.rs` divides by 45000.0 for the same reason).
+fn mpls_ticks_to_ns(ticks: u32) -> i64 {
+    // 1e9 / 45_000 = 22_222.22…, so scale first and divide once to avoid
+    // accumulating a per-clip rounding error across an 11-clip title.
+    (ticks as i64).saturating_mul(1_000_000_000) / 45_000
+}
+
+/// One clip's placement on the output timeline, derived from its PlayItem marks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeamClip {
+    /// Clip IN mark in the shared source clock (ns).
+    pub(crate) in_ns: i64,
+    /// Clip OUT mark in the shared source clock (ns).
+    pub(crate) out_ns: i64,
+    /// Added to a raw PTS inside this clip to place it on the output timeline.
+    /// Equals (sum of every earlier clip's playable duration) − `in_ns`.
+    pub(crate) offset_ns: i64,
+}
+
+/// The playlist's own answer to "where does each clip belong on the timeline".
+///
+/// A seamless-branching title's PlayItems do NOT chain contiguously in the
+/// shared clock: one clip's OUT may sit *after* the next clip's IN (overlap —
+/// the disc stores the join twice so a player can switch without a gap), or
+/// *before* it (skip — the playlist jumps over material). Measured on one real
+/// UHD title, `00801.mpls`, 11 PlayItems:
+///
+/// ```text
+/// clip 0  in 4199.0000  out 6033.0405   cum_start 0.0000
+/// clip 1  in 6031.2500  out 6308.1933   cum_start 1834.0405   <- 1.79s OVERLAP
+/// clip 2  in 6298.1667  out 6875.0763   cum_start 2110.9839
+/// clip 3  in 6884.2500  out 6948.0220   cum_start 2687.8935   <- 9.17s SKIP
+/// ```
+///
+/// Inferring seams from PTS jumps cannot recover this. A forward jump is
+/// ambiguous — it means "the playlist skipped" OR "we lost frames to damaged
+/// media", and compressing the latter would silently falsify timing on exactly
+/// the rips that most need it faithful. An overlap smaller than the B-frame
+/// reorder threshold is invisible to inference entirely, and its duplicated
+/// content then collides in the muxer.
+///
+/// So the marks are read rather than guessed. Each clip contributes exactly
+/// `out − in` to the output, laid end to end: gaps never become dead timeline,
+/// and material outside a clip's marks is dropped rather than emitted twice.
+pub(crate) struct SeamPlan {
+    clips: Vec<SeamClip>,
+    /// Index of the clip the primary video is currently inside. Only video
+    /// advances it, for the same reason only video drives epochs: the passive
+    /// tracks are sparse and lag, so letting them advance the cursor would
+    /// retire a clip while its audio was still arriving.
+    cursor: usize,
+}
+
+impl SeamPlan {
+    /// Build a plan from a title's clips, or `None` when there is nothing to
+    /// place: no clips (DVD, HD-DVD, `mkv://`/`m2ts://` sources — none of which
+    /// carry PlayItem marks), a single clip (nothing to join), or marks that are
+    /// not usable (a zero/inverted span means the playlist is not telling us
+    /// anything we can act on, and guessing is what this type exists to avoid).
+    ///
+    /// Returning `None` leaves [`TimelineContinuity`] on its PTS-jump inference,
+    /// which is what every non-BD path has always used.
+    pub(crate) fn from_clips(clips: &[crate::disc::Clip]) -> Option<Self> {
+        if clips.len() < 2 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(clips.len());
+        let mut cum: i64 = 0;
+        for c in clips {
+            let in_ns = mpls_ticks_to_ns(c.in_time);
+            let out_ns = mpls_ticks_to_ns(c.out_time);
+            if out_ns <= in_ns {
+                return None;
+            }
+            out.push(SeamClip {
+                in_ns,
+                out_ns,
+                offset_ns: cum.saturating_sub(in_ns),
+            });
+            cum = cum.saturating_add(out_ns - in_ns);
+        }
+        Some(Self {
+            clips: out,
+            cursor: 0,
+        })
+    }
+
+    /// Total playable duration (ns) — the sum of every clip's `out − in`. This
+    /// is the length the title actually is, and what the output timeline must
+    /// end at.
+    #[cfg(test)]
+    pub(crate) fn total_ns(&self) -> i64 {
+        self.clips
+            .iter()
+            .map(|c| c.out_ns - c.in_ns)
+            .fold(0i64, |a, b| a.saturating_add(b))
+    }
+
+    /// Place a raw PTS, advancing the cursor when `drives` (primary video).
+    ///
+    /// `None` means DROP: the frame lies outside every clip's marks, which is
+    /// material the playlist does not include — most often the overlap region a
+    /// disc stores twice. Emitting it is what produced duplicate content and a
+    /// backward DTS step at the join.
+    fn place(&mut self, raw_ns: i64, drives: bool) -> Option<i64> {
+        if drives {
+            // Advance to the next clip when this frame is its opening frame.
+            //
+            // Two signatures, because a join is either a skip or an overlap:
+            //
+            // - SKIP (next IN is after this OUT): the frame is simply past the
+            //   current clip's OUT.
+            // - OVERLAP (next IN is BEFORE this OUT, the disc storing the join
+            //   twice): the frame is still inside the current clip's range, so
+            //   "past OUT" never fires. But the clips are concatenated in file
+            //   order, so the first frame of the new clip lands on its IN mark.
+            //   Recognising that is what distinguishes the new clip's opening
+            //   from the old clip's tail, which share a PTS range.
+            //
+            // Bounded by the clip count, so a wild PTS cannot spin here.
+            while self.cursor + 1 < self.clips.len() {
+                let cur_out = self.clips[self.cursor].out_ns;
+                let next_in = self.clips[self.cursor + 1].in_ns;
+                let past_out = raw_ns > cur_out;
+                let at_next_in = raw_ns >= next_in
+                    && raw_ns <= next_in.saturating_add(CLIP_START_TOLERANCE_NS);
+                if past_out || at_next_in {
+                    self.cursor += 1;
+                } else {
+                    break;
+                }
+            }
+            let c = self.clips[self.cursor];
+            if raw_ns < c.in_ns || raw_ns > c.out_ns {
+                return None;
+            }
+            return Some(raw_ns.saturating_add(c.offset_ns));
+        }
+        // Passive track. Try the clip video is in, then the one before it: at a
+        // join the tracks do not switch on the same frame, so a lagging audio or
+        // subtitle frame from the previous clip can arrive after video has moved
+        // on. Checking both places it correctly instead of dropping it.
+        let cur = self.clips[self.cursor];
+        if raw_ns >= cur.in_ns && raw_ns <= cur.out_ns {
+            return Some(raw_ns.saturating_add(cur.offset_ns));
+        }
+        if self.cursor > 0 {
+            let prev = self.clips[self.cursor - 1];
+            if raw_ns >= prev.in_ns && raw_ns <= prev.out_ns {
+                return Some(raw_ns.saturating_add(prev.offset_ns));
+            }
+        }
+        None
+    }
+}
+
 /// Global timeline-continuity corrector. freemkv reads a BD title's clips as
 /// one concatenated sector stream (clip boundaries / mpls connection_condition
 /// are not plumbed to the mux), so at a non-seamless boundary the source PES
@@ -70,6 +239,10 @@ pub(crate) struct TimelineContinuity {
     /// running frontier. `None` until the first video frame. Only video advances
     /// it; non-video tracks never touch it.
     pub(crate) high_ns: Option<i64>,
+    /// The playlist's clip placement, when the source has one. Present = the
+    /// marks are known and are used verbatim; absent = fall back to inferring
+    /// seams from PTS jumps, which is all any non-BD source has ever had.
+    pub(crate) seams: Option<SeamPlan>,
 }
 
 impl TimelineContinuity {
@@ -78,7 +251,46 @@ impl TimelineContinuity {
             offset_ns: 0,
             prev_offset_ns: 0,
             high_ns: None,
+            seams: None,
         }
+    }
+
+    /// Corrector driven by a title's PlayItem marks where they exist.
+    ///
+    /// Falls back to [`Self::new`]'s inference when the title has fewer than two
+    /// clips or its marks are unusable — so DVD, HD-DVD, `mkv://` and `m2ts://`
+    /// sources behave exactly as before.
+    pub(crate) fn with_clips(clips: &[crate::disc::Clip]) -> Self {
+        Self {
+            offset_ns: 0,
+            prev_offset_ns: 0,
+            high_ns: None,
+            seams: SeamPlan::from_clips(clips),
+        }
+    }
+
+    /// Map a raw PES PTS onto the output timeline, or `None` to drop the frame.
+    ///
+    /// Dropping only ever happens under a [`SeamPlan`]: it is material outside
+    /// the playlist's marks, which the title does not include.
+    pub(crate) fn map(&mut self, raw_pts_ns: i64, drives_epoch: bool) -> Option<i64> {
+        if self.seams.is_some() {
+            // Take the plan out for the call so `place` can borrow `self`
+            // mutably without fighting the borrow checker over the whole struct.
+            let mut plan = self.seams.take().expect("checked is_some");
+            let placed = plan.place(raw_pts_ns, drives_epoch);
+            self.seams = Some(plan);
+            if let Some(p) = placed {
+                // Keep the frontier meaningful for anything that reads it, and
+                // keep `offset_ns` reporting the correction actually applied.
+                if drives_epoch {
+                    self.high_ns = Some(self.high_ns.map_or(p, |h| h.max(p)));
+                }
+                self.offset_ns = p.saturating_sub(raw_pts_ns);
+            }
+            return placed;
+        }
+        Some(self.adjust(raw_pts_ns, drives_epoch))
     }
 
     /// Map a raw PES PTS (ns) onto the continuous output timeline.
@@ -252,6 +464,208 @@ mod tests {
         let out: Vec<i64> = raw.iter().map(|&p| adj_video(&mut tc, p)).collect();
         assert_eq!(out, raw, "forward gap preserved verbatim");
         assert_eq!(tc.offset_ns, 0, "no rebase on forward progression");
+    }
+
+    /// Build a real seamless-branching clip table (`00801.mpls`, 11 PlayItems, marks
+    /// read off the disc) so the arithmetic is pinned to measured ground truth
+    /// rather than to invented numbers.
+    fn seamless_branching_clips() -> Vec<crate::disc::Clip> {
+        // (in_time, out_time) in 45kHz ticks, verbatim from the disc.
+        const MARKS: [(u32, u32); 11] = [
+            (188955000, 271486824),
+            (271406250, 283868700),
+            (283417500, 309378435),
+            (309791250, 312660991),
+            (312219375, 346451698),
+            (346854375, 355985371),
+            (353385000, 429270810),
+            (431786250, 440217172),
+            (437326875, 442467635),
+            (445344375, 451271546),
+            (447946875, 540576286),
+        ];
+        MARKS
+            .iter()
+            .enumerate()
+            .map(|(i, &(in_time, out_time))| crate::disc::Clip {
+                clip_id: format!("{i:05}"),
+                in_time,
+                out_time,
+                duration_secs: (out_time - in_time) as f64 / 45_000.0,
+                source_packets: 0,
+            })
+            .collect()
+    }
+
+    /// The plan's total must equal the title's declared duration.
+    ///
+    /// This is the whole bug in one assertion: the delivered file declared
+    /// 7893.385 s and carried packets to 8029.298 s — 135.91 s of timeline the
+    /// playlist says does not exist.
+    #[test]
+    fn seam_plan_total_matches_the_declared_duration() {
+        let plan = SeamPlan::from_clips(&seamless_branching_clips()).expect("plan");
+        let total = plan.total_ns();
+        // 7893.3854s, the duration freemkv itself reports for this title.
+        assert!(
+            (total - 7_893_385_400_000).abs() < 1_000_000,
+            "plan total {total} ns is not the declared 7893.3854 s"
+        );
+    }
+
+    /// Clips are laid end to end: each starts exactly where the previous ended,
+    /// so a forward skip in the source clock never becomes dead timeline.
+    #[test]
+    fn seam_plan_lays_clips_end_to_end() {
+        let clips = seamless_branching_clips();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let mut expected_start = 0i64;
+        for (i, c) in clips.iter().enumerate() {
+            let in_ns = mpls_ticks_to_ns(c.in_time);
+            let out_ns = mpls_ticks_to_ns(c.out_time);
+            // First frame of the clip lands at the running total.
+            let got = plan.place(in_ns, true).expect("clip start is inside its marks");
+            assert_eq!(got, expected_start, "clip {i} start misplaced");
+            // Last frame lands at the running total plus the clip's length.
+            let end = plan.place(out_ns, true).expect("clip end is inside its marks");
+            assert_eq!(end, expected_start + (out_ns - in_ns), "clip {i} end misplaced");
+            expected_start += out_ns - in_ns;
+        }
+        assert!(
+            (expected_start - 7_893_385_400_000).abs() < 1_000_000,
+            "clips do not sum to the declared duration"
+        );
+    }
+
+    /// The 9.174 s forward skip between clip 2 and clip 3 must vanish.
+    ///
+    /// Measured in the delivered file as a 20 s window holding 257 video packets
+    /// where it should hold 480.
+    #[test]
+    fn seam_plan_closes_the_forward_skip() {
+        let clips = seamless_branching_clips();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let c2_out = mpls_ticks_to_ns(clips[2].out_time);
+        let c3_in = mpls_ticks_to_ns(clips[3].in_time);
+        assert!(
+            c3_in - c2_out > 9_000_000_000,
+            "fixture should contain the ~9.17s skip"
+        );
+        let end_of_2 = plan.place(c2_out, true).expect("in clip 2");
+        let start_of_3 = plan.place(c3_in, true).expect("in clip 3");
+        assert_eq!(
+            start_of_3, end_of_2,
+            "clip 3 must begin exactly where clip 2 ended — the skip is not content"
+        );
+    }
+
+    /// The 1.79 s overlap at seam 1 must JOIN cleanly, not rewind the timeline.
+    ///
+    /// Clip 1's IN (6031.250 s) precedes clip 0's OUT (6033.041 s): the disc
+    /// stores that join twice. Emitting both copies is what collided in the
+    /// muxer and flattened 169 audio packets onto the 0.1 ms tick floor,
+    /// putting audio ~1.8 s ahead of picture for the rest of the film.
+    #[test]
+    fn seam_plan_joins_an_overlap_without_rewinding() {
+        let clips = seamless_branching_clips();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let c0_out = mpls_ticks_to_ns(clips[0].out_time);
+        let c1_in = mpls_ticks_to_ns(clips[1].in_time);
+        assert!(c1_in < c0_out, "fixture should contain the overlap");
+        // Play clip 0 through to its OUT mark.
+        let last_of_0 = plan.place(c0_out, true).expect("clip 0 OUT is inside clip 0");
+        // The next clip opens ON its IN mark. Under the old inference this was a
+        // 1.79s backward step, below the reorder threshold, so no seam was
+        // recognised and the join was emitted as duplicate content whose
+        // timestamps then collided. With the marks known, clip 1 is placed to
+        // continue exactly where clip 0 ended: one monotonic timeline, no
+        // rewind, and no collision for the muxer to flatten.
+        let first_of_1 = plan.place(c1_in, true).expect("clip 1 IN");
+        assert_eq!(
+            first_of_1, last_of_0,
+            "clip 1 must continue from clip 0's end, not rewind by the overlap"
+        );
+        // And the timeline keeps moving forward from there.
+        let into_1 = plan
+            .place(c1_in + 1_000_000_000, true)
+            .expect("1s into clip 1");
+        assert_eq!(into_1, first_of_1 + 1_000_000_000, "clip 1 advances normally");
+    }
+
+    /// A lagging audio/subtitle frame from the clip that just ended is placed in
+    /// that clip, not dropped — the tracks do not switch on the same frame.
+    #[test]
+    fn seam_plan_places_a_lagging_passive_frame_in_the_previous_clip() {
+        let clips = seamless_branching_clips();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let c0_out = mpls_ticks_to_ns(clips[0].out_time);
+        let c1_in = mpls_ticks_to_ns(clips[1].in_time);
+        // Video crosses into clip 1.
+        plan.place(c1_in + 500_000_000, true).expect("in clip 1");
+        // A straggler from clip 0's tail arrives afterwards.
+        let tail = c0_out - 50_000_000; // 50ms before clip 0's OUT
+        let placed = plan.place(tail, false).expect("straggler must be placed");
+        let expected = tail + (0i64 - mpls_ticks_to_ns(clips[0].in_time));
+        assert_eq!(placed, expected, "straggler must ride clip 0's offset");
+    }
+
+    /// Clips whose marks chain contiguously must come out byte-identical to the
+    /// old behaviour: a constant offset, nothing moved, nothing dropped.
+    ///
+    /// This is the no-regression guarantee for every title that is multi-clip
+    /// but not seamless-branching — HD-DVD's feature is chaptered this way (one
+    /// real title measured: 3 clips, each IN equal to the previous OUT).
+    #[test]
+    fn contiguous_clips_produce_a_constant_offset() {
+        // 0..2948.6667s, 2948.6667..6410.8667s, chained exactly.
+        let marks = [(0u32, 132_690_000u32), (132_690_000, 288_489_000)];
+        let clips: Vec<crate::disc::Clip> = marks
+            .iter()
+            .enumerate()
+            .map(|(i, &(in_time, out_time))| crate::disc::Clip {
+                clip_id: format!("{i}"),
+                in_time,
+                out_time,
+                duration_secs: (out_time - in_time) as f64 / 45_000.0,
+                source_packets: 0,
+            })
+            .collect();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        // Every frame maps to itself: offset 0 throughout, no discontinuity.
+        for &t in &[0i64, 1_000_000_000, 2_948_000_000_000, 2_949_000_000_000, 6_410_000_000_000] {
+            assert_eq!(
+                plan.place(t, true),
+                Some(t),
+                "contiguous clips must not move a frame (t={t})"
+            );
+        }
+    }
+
+    /// No plan for sources that have no PlayItem marks — DVD, HD-DVD, and file
+    /// sources keep the inference path they have always used.
+    #[test]
+    fn no_seam_plan_without_usable_marks() {
+        assert!(SeamPlan::from_clips(&[]).is_none(), "no clips");
+        assert!(
+            SeamPlan::from_clips(&seamless_branching_clips()[..1]).is_none(),
+            "a single clip has nothing to join"
+        );
+        let mut bad = seamless_branching_clips();
+        bad[3].out_time = bad[3].in_time; // zero-length span
+        assert!(
+            SeamPlan::from_clips(&bad).is_none(),
+            "unusable marks must fall back to inference, not guess"
+        );
+    }
+
+    /// Without a plan, `map` is exactly the old `adjust` and never drops.
+    #[test]
+    fn map_without_a_plan_is_the_old_behaviour() {
+        let mut tc = TimelineContinuity::new();
+        assert_eq!(tc.map(0, true), Some(0));
+        assert_eq!(tc.map(5 * S, true), Some(5 * S));
+        assert_eq!(tc.map(25 * S, false), Some(25 * S));
+        assert_eq!(tc.offset_ns, 0);
     }
 
     /// PRIMARY rc3 regression: a sparse, lagging NON-VIDEO track (PGS subtitle /
