@@ -4,14 +4,6 @@
 
 ### Added
 
-- **A disc kept as a folder can now be read directly.** An extracted `VIDEO_TS`
-  or `BDMV` folder — the shape most backup tools produce — works anywhere a
-  disc image does: `dir://Movie/ mkv://Movie.mkv`, or to any other destination.
-  Previously a folder could only be written, never read back. Folders that are
-  already decrypted need no key; one that still carries an `AACS` directory is
-  judged by its content rather than by the directory's presence, so a decrypted
-  backup is not refused for a leftover folder. 3D folders are refused for now
-  rather than produce a silently wrong result.
 - **An existing disc image can now be decrypted without the disc.**
   `iso://In.iso iso://Out.iso` writes a decrypted image from an encrypted one;
   previously the only way to get a decrypted image was to rip the disc in a
