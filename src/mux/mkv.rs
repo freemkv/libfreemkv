@@ -1704,6 +1704,20 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 "frames were discarded before the first cluster opened (no track-0 video keyframe had arrived yet); they are absent from the output"
             );
         }
+        // Frames the playlist's clip marks excluded are dropped on purpose — a
+        // join legitimately discards the material a disc stores twice — but the
+        // count must not be write-only. Same reasoning as the pre-cluster
+        // counter above: an unexpected VOLUME here is how a title ends up
+        // quietly short while the run reports success.
+        let seam_dropped = self.continuity.dropped_total();
+        if seam_dropped > 0 {
+            tracing::info!(
+                target: "mux",
+                dropped = seam_dropped,
+                frames_written = self.frame_count,
+                "frames outside the playlist's clip marks were dropped at clip joins"
+            );
+        }
         // The source declared no duration up-front (DURATION was reserved as a
         // placeholder). Derive the real runtime from the muxed timeline so the
         // Segment declares it — and so the BPS tags below can be computed.

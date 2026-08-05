@@ -493,6 +493,14 @@ fn push_fid(buf: &mut Vec<u8>, name: &str, icb_lba: u32, is_dir: bool, is_parent
         chars |= 0x08;
     }
     fid[18] = chars;
+    // The planner refuses any name whose encoding exceeds what this byte can
+    // hold (`layout::MAX_CS0_NAME_BYTES`), so this cannot wrap in practice. The
+    // assert states the invariant where it is relied on rather than trusting a
+    // check three files away; a wrap here would desynchronise the directory.
+    debug_assert!(
+        l_fi <= u8::MAX as usize,
+        "FID name length must fit one byte"
+    );
     fid[19] = l_fi as u8;
     put_long_ad(&mut fid[20..36], SECTOR as u32, icb_lba);
     fid[36..38].copy_from_slice(&0u16.to_le_bytes()); // length of implementation use
@@ -590,7 +598,10 @@ fn write_dir(out: &mut MetaSectors, layout: &Layout, dir: &DirNode) -> Result<()
 
     // A directory's link count is 1 (its own FID in the parent) plus one for
     // each child directory's parent FID pointing back at it.
-    let link_count = 1 + dir.dirs.len() as u16;
+    // The planner caps subdirectory fan-out (`layout::MAX_SUBDIRS`) so this
+    // cannot overflow; saturating rather than wrapping keeps a future change to
+    // that cap from silently producing a wrong count.
+    let link_count = (dir.dirs.len() as u16).saturating_add(1);
     let fe = file_entry(
         true,
         fids.len() as u64,

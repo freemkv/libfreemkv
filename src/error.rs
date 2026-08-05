@@ -195,6 +195,8 @@ pub const E_DIR_IMAGE_FILE_CHANGED: u16 = 9065;
 /// A `dir://` SOURCE folder does not fit a 32-bit sector address space
 /// (> 2^32 sectors ≈ 8 TiB), or holds more entries than a UDF tree can carry.
 pub const E_DIR_IMAGE_TOO_LARGE: u16 = 9066;
+pub const E_DIR_NAME_TOO_LONG: u16 = 9067;
+pub const E_DIR_IMAGE_FANOUT: u16 = 9068;
 pub const E_M2TS_PACKET_MALFORMED: u16 = 9021;
 /// A `network://` output target resolved to no address that is safe to
 /// connect to (every resolved IP was loopback / private / link-local /
@@ -777,6 +779,25 @@ pub enum Error {
     },
     /// A `dir://` SOURCE folder exceeds the addressable image size.
     DirImageTooLarge,
+    /// A name is too long to record in a UDF directory entry.
+    ///
+    /// The File Identifier Descriptor stores the encoded name length in ONE
+    /// byte, so a name whose OSTA CS0 encoding exceeds 254 bytes cannot be
+    /// described. Truncating the length field instead would desynchronise the
+    /// whole directory — every later entry in it would be read from the wrong
+    /// offset — so an over-long name is refused while the tree is still being
+    /// planned.
+    DirNameTooLong {
+        path: String,
+    },
+    /// One directory holds more subdirectories than a UDF link count can express.
+    ///
+    /// A directory's File Entry records its link count in 16 bits, and that
+    /// count is one per child directory plus one for its own entry in its
+    /// parent. Beyond that the count silently wraps, so the tree is refused.
+    DirImageFanout {
+        path: String,
+    },
 }
 
 impl Error {
@@ -898,6 +919,8 @@ impl Error {
             Error::DirImagePlacement { .. } => E_DIR_IMAGE_PLACEMENT,
             Error::DirImageEncrypted => E_DIR_IMAGE_ENCRYPTED,
             Error::DirImageUnsupportedTree => E_DIR_IMAGE_UNSUPPORTED_TREE,
+            Error::DirNameTooLong { .. } => E_DIR_NAME_TOO_LONG,
+            Error::DirImageFanout { .. } => E_DIR_IMAGE_FANOUT,
             Error::DirImageFileChanged { .. } => E_DIR_IMAGE_FILE_CHANGED,
             Error::DirImageTooLarge => E_DIR_IMAGE_TOO_LARGE,
         }

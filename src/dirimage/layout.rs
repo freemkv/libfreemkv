@@ -46,6 +46,22 @@ const MAX_DEPTH: u32 = 8;
 /// `MAX_TOTAL_DIR_ENTRIES`.
 const MAX_ENTRIES: usize = 100_000;
 
+/// Longest OSTA CS0 encoding a File Identifier Descriptor can describe.
+///
+/// The FID's name-length field is one byte, so 255 is the ceiling; 254 leaves
+/// the encoder no way to produce a value that wraps to zero.
+const MAX_CS0_NAME_BYTES: usize = 254;
+
+/// Most subdirectories one directory may hold.
+///
+/// A directory File Entry's link count is `u16` and counts one per child
+/// directory plus one for its own entry in the parent, so the last usable
+/// value is `u16::MAX - 1`.
+const MAX_SUBDIRS: usize = (u16::MAX - 1) as usize;
+
+/// The fan-out cap must bite before the global entry cap, or it never fires.
+const _: () = assert!(MAX_SUBDIRS < MAX_ENTRIES);
+
 /// One contiguous run of a file's bytes at a partition-relative block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Extent {
@@ -158,12 +174,30 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
         // loop, and UDF has no link this maps onto.
         let ft = entry.file_type().map_err(Error::from)?;
         let child_path = format!("{}/{}", disc_path.trim_end_matches('/'), name);
+        // A File Identifier Descriptor records the encoded name length in ONE
+        // byte. A longer name would wrap that field and desynchronise every
+        // later entry in the directory, so refuse while planning rather than
+        // encode something unreadable. 255 ASCII bytes is a legal name on
+        // ext4/APFS/NTFS and already exceeds this once the CS0 compression
+        // byte is added, so it is reachable without anything exotic.
+        if super::encode::encode_cs0(&name).len() > MAX_CS0_NAME_BYTES {
+            return Err(Error::DirNameTooLong { path: child_path });
+        }
         *entries += 1;
         if *entries > MAX_ENTRIES {
             return Err(Error::DirImageTooLarge);
         }
         names.push(name.to_ascii_uppercase());
         if ft.is_dir() {
+            // A directory's File Entry records its link count in 16 bits: one
+            // per child directory plus one for its own entry in the parent.
+            // The global entry cap alone permits a single directory holding
+            // more than that, which would wrap the count.
+            if dirs.len() >= MAX_SUBDIRS {
+                return Err(Error::DirImageFanout {
+                    path: disc_path.to_string(),
+                });
+            }
             dirs.push(walk(&entry.path(), &child_path, depth + 1, entries)?);
         } else {
             let meta = match std::fs::metadata(entry.path()) {
@@ -678,5 +712,54 @@ mod tests {
         assert!(is_excluded("00000.m2ts.partial"));
         assert!(!is_excluded("00000.m2ts"));
         assert!(!is_excluded("VTS_01_1.VOB"));
+    }
+
+    /// A name too long for the FID's one-byte length field is refused while
+    /// planning.
+    ///
+    /// Audit finding: the length was narrowed with `as u8`, so a 255-byte ASCII
+    /// name — legal on ext4/APFS/NTFS — encoded to 256 bytes with the CS0
+    /// compression byte and wrote a length of ZERO. Every later entry in that
+    /// directory would then be read from the wrong offset, losing files with no
+    /// error. The cap must sit below the point where the field wraps.
+    #[test]
+    fn an_over_long_name_is_refused_not_truncated() {
+        let longest_ok = "a".repeat(MAX_CS0_NAME_BYTES - 1);
+        assert_eq!(
+            super::super::encode::encode_cs0(&longest_ok).len(),
+            MAX_CS0_NAME_BYTES,
+            "fixture: the longest accepted name encodes to exactly the cap"
+        );
+        assert!(
+            MAX_CS0_NAME_BYTES < u8::MAX as usize,
+            "the cap must leave the length field unable to wrap"
+        );
+        // The exact case that used to write a length of zero: a 255-byte name
+        // (the POSIX NAME_MAX, so entirely ordinary) encodes to 256 bytes once
+        // the CS0 compression byte is prepended, and 256 narrows to 0 in a u8.
+        let name_max = "a".repeat(255);
+        let encoded = super::super::encode::encode_cs0(&name_max).len();
+        assert_eq!(encoded, 256, "fixture: NAME_MAX encodes to 256 bytes");
+        assert_eq!(
+            encoded as u8, 0,
+            "fixture: this is the narrowing that silently zeroed the field"
+        );
+        assert!(
+            encoded > MAX_CS0_NAME_BYTES,
+            "so the planner must refuse it before the encoder sees it"
+        );
+    }
+
+    /// The subdirectory cap keeps a directory's 16-bit link count from wrapping.
+    ///
+    /// Audit finding: the count was `1 + dirs.len() as u16`, and the global
+    /// entry cap alone permits one directory holding 65,535 subdirectories.
+    #[test]
+    fn the_subdir_cap_keeps_the_link_count_representable() {
+        assert_eq!(
+            (MAX_SUBDIRS as u16).checked_add(1),
+            Some(u16::MAX),
+            "the largest permitted fan-out must still fit the link count"
+        );
     }
 }
