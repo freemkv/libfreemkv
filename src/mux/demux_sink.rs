@@ -868,7 +868,7 @@ impl Stream for DemuxSink {
         let drives = Some(frame.track) == self.ref_video_track;
         // See `MkvMuxer::write_frame`: `None` is material outside the
         // playlist's clip marks and is dropped rather than emitted.
-        let Some(pts) = self.timeline.map(frame.pts, drives) else {
+        let Some(pts) = self.timeline.map(frame.pts, drives, frame.track) else {
             return Ok(());
         };
         if drives {

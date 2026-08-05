@@ -78,11 +78,27 @@ pub(crate) struct SeamClip {
 /// and material outside a clip's marks is dropped rather than emitted twice.
 pub(crate) struct SeamPlan {
     clips: Vec<SeamClip>,
-    /// Index of the clip the primary video is currently inside. Only video
-    /// advances it, for the same reason only video drives epochs: the passive
-    /// tracks are sparse and lag, so letting them advance the cursor would
-    /// retire a clip while its audio was still arriving.
-    cursor: usize,
+    /// Per-track position: (clip index, last raw PTS seen).
+    ///
+    /// Each track crosses a join on ITS OWN frame, not on video's. The demuxer
+    /// interleaves the tracks, so when video enters the next clip the previous
+    /// clip's audio and subtitle tails are still arriving — and at an OVERLAP
+    /// join those tail frames fall inside BOTH clips' mark ranges, so there is
+    /// no way to place them from the PTS alone. Sharing one cursor gave the
+    /// tail the new clip's offset, which threw it forward by the overlap and
+    /// made it collide with the new clip's own frames; the muxer's monotonic
+    /// nudge then flattened the collision onto the tick floor, which is exactly
+    /// the audio-ahead-of-picture symptom this type exists to remove.
+    ///
+    /// Indexed by track; grows on demand.
+    cursors: Vec<TrackPos>,
+}
+
+/// Where one track currently sits in the clip list.
+#[derive(Debug, Clone, Copy)]
+struct TrackPos {
+    clip: usize,
+    last_raw_ns: Option<i64>,
 }
 
 impl SeamPlan {
@@ -115,7 +131,7 @@ impl SeamPlan {
         }
         Some(Self {
             clips: out,
-            cursor: 0,
+            cursors: Vec::new(),
         })
     }
 
@@ -130,61 +146,62 @@ impl SeamPlan {
             .fold(0i64, |a, b| a.saturating_add(b))
     }
 
-    /// Place a raw PTS, advancing the cursor when `drives` (primary video).
+    /// Place a raw PTS for `track`, advancing that track's own clip cursor.
     ///
-    /// `None` means DROP: the frame lies outside every clip's marks, which is
-    /// material the playlist does not include — most often the overlap region a
-    /// disc stores twice. Emitting it is what produced duplicate content and a
-    /// backward DTS step at the join.
-    fn place(&mut self, raw_ns: i64, drives: bool) -> Option<i64> {
-        if drives {
-            // Advance to the next clip when this frame is its opening frame.
-            //
-            // Two signatures, because a join is either a skip or an overlap:
-            //
-            // - SKIP (next IN is after this OUT): the frame is simply past the
-            //   current clip's OUT.
-            // - OVERLAP (next IN is BEFORE this OUT, the disc storing the join
-            //   twice): the frame is still inside the current clip's range, so
-            //   "past OUT" never fires. But the clips are concatenated in file
-            //   order, so the first frame of the new clip lands on its IN mark.
-            //   Recognising that is what distinguishes the new clip's opening
-            //   from the old clip's tail, which share a PTS range.
-            //
-            // Bounded by the clip count, so a wild PTS cannot spin here.
-            while self.cursor + 1 < self.clips.len() {
-                let cur_out = self.clips[self.cursor].out_ns;
-                let next_in = self.clips[self.cursor + 1].in_ns;
-                let past_out = raw_ns > cur_out;
-                let at_next_in =
-                    raw_ns >= next_in && raw_ns <= next_in.saturating_add(CLIP_START_TOLERANCE_NS);
-                if past_out || at_next_in {
-                    self.cursor += 1;
-                } else {
-                    break;
-                }
-            }
-            let c = self.clips[self.cursor];
-            if raw_ns < c.in_ns || raw_ns > c.out_ns {
-                return None;
-            }
-            return Some(raw_ns.saturating_add(c.offset_ns));
+    /// `None` means DROP: the frame lies outside every clip's marks, so the
+    /// playlist does not include it.
+    fn place(&mut self, raw_ns: i64, track: usize) -> Option<i64> {
+        if self.cursors.len() <= track {
+            self.cursors.resize(
+                track + 1,
+                TrackPos {
+                    clip: 0,
+                    last_raw_ns: None,
+                },
+            );
         }
-        // Passive track. Try the clip video is in, then the one before it: at a
-        // join the tracks do not switch on the same frame, so a lagging audio or
-        // subtitle frame from the previous clip can arrive after video has moved
-        // on. Checking both places it correctly instead of dropping it.
-        let cur = self.clips[self.cursor];
-        if raw_ns >= cur.in_ns && raw_ns <= cur.out_ns {
-            return Some(raw_ns.saturating_add(cur.offset_ns));
-        }
-        if self.cursor > 0 {
-            let prev = self.clips[self.cursor - 1];
-            if raw_ns >= prev.in_ns && raw_ns <= prev.out_ns {
-                return Some(raw_ns.saturating_add(prev.offset_ns));
+        let pos = self.cursors[track];
+        let mut clip = pos.clip;
+
+        // Advance this track to the next clip when THIS track's frames say it
+        // has crossed. Two signatures, because a join is either a skip or an
+        // overlap:
+        //
+        // - SKIP (next IN after this OUT): the frame is simply past this clip's
+        //   OUT mark.
+        // - OVERLAP (next IN before this OUT, the disc storing the join twice):
+        //   the frame is still inside this clip's range, so "past OUT" never
+        //   fires. But a track's own PTS only ever runs forward inside a clip,
+        //   so the backward step to the next clip's IN is the crossing — and it
+        //   is per track, which is why the cursor has to be per track too.
+        //
+        // Bounded by the clip count, so a wild PTS cannot spin here.
+        while clip + 1 < self.clips.len() {
+            let cur = self.clips[clip];
+            let next_in = self.clips[clip + 1].in_ns;
+            let past_out = raw_ns > cur.out_ns;
+            // The step must land ON the next clip's IN mark, not merely below
+            // the current position: a bound only from above is satisfied by
+            // every later clip's IN too, and the cursor would run to the end of
+            // the list on a single backward step.
+            let stepped_back = pos.last_raw_ns.is_some_and(|last| raw_ns < last)
+                && (raw_ns.saturating_sub(next_in)).abs() <= CLIP_START_TOLERANCE_NS;
+            if past_out || stepped_back {
+                clip += 1;
+            } else {
+                break;
             }
         }
-        None
+
+        let c = self.clips[clip];
+        self.cursors[track] = TrackPos {
+            clip,
+            last_raw_ns: Some(raw_ns),
+        };
+        if raw_ns < c.in_ns || raw_ns > c.out_ns {
+            return None;
+        }
+        Some(raw_ns.saturating_add(c.offset_ns))
     }
 }
 
@@ -273,12 +290,12 @@ impl TimelineContinuity {
     ///
     /// Dropping only ever happens under a [`SeamPlan`]: it is material outside
     /// the playlist's marks, which the title does not include.
-    pub(crate) fn map(&mut self, raw_pts_ns: i64, drives_epoch: bool) -> Option<i64> {
+    pub(crate) fn map(&mut self, raw_pts_ns: i64, drives_epoch: bool, track: usize) -> Option<i64> {
         if self.seams.is_some() {
             // Take the plan out for the call so `place` can borrow `self`
             // mutably without fighting the borrow checker over the whole struct.
             let mut plan = self.seams.take().expect("checked is_some");
-            let placed = plan.place(raw_pts_ns, drives_epoch);
+            let placed = plan.place(raw_pts_ns, track);
             self.seams = Some(plan);
             if let Some(p) = placed {
                 // Keep the frontier meaningful for anything that reads it, and
@@ -525,13 +542,11 @@ mod tests {
             let out_ns = mpls_ticks_to_ns(c.out_time);
             // First frame of the clip lands at the running total.
             let got = plan
-                .place(in_ns, true)
+                .place(in_ns, 0)
                 .expect("clip start is inside its marks");
             assert_eq!(got, expected_start, "clip {i} start misplaced");
             // Last frame lands at the running total plus the clip's length.
-            let end = plan
-                .place(out_ns, true)
-                .expect("clip end is inside its marks");
+            let end = plan.place(out_ns, 0).expect("clip end is inside its marks");
             assert_eq!(
                 end,
                 expected_start + (out_ns - in_ns),
@@ -559,8 +574,8 @@ mod tests {
             c3_in - c2_out > 9_000_000_000,
             "fixture should contain the ~9.17s skip"
         );
-        let end_of_2 = plan.place(c2_out, true).expect("in clip 2");
-        let start_of_3 = plan.place(c3_in, true).expect("in clip 3");
+        let end_of_2 = plan.place(c2_out, 0).expect("in clip 2");
+        let start_of_3 = plan.place(c3_in, 0).expect("in clip 3");
         assert_eq!(
             start_of_3, end_of_2,
             "clip 3 must begin exactly where clip 2 ended — the skip is not content"
@@ -581,23 +596,21 @@ mod tests {
         let c1_in = mpls_ticks_to_ns(clips[1].in_time);
         assert!(c1_in < c0_out, "fixture should contain the overlap");
         // Play clip 0 through to its OUT mark.
-        let last_of_0 = plan
-            .place(c0_out, true)
-            .expect("clip 0 OUT is inside clip 0");
+        let last_of_0 = plan.place(c0_out, 0).expect("clip 0 OUT is inside clip 0");
         // The next clip opens ON its IN mark. Under the old inference this was a
         // 1.79s backward step, below the reorder threshold, so no seam was
         // recognised and the join was emitted as duplicate content whose
         // timestamps then collided. With the marks known, clip 1 is placed to
         // continue exactly where clip 0 ended: one monotonic timeline, no
         // rewind, and no collision for the muxer to flatten.
-        let first_of_1 = plan.place(c1_in, true).expect("clip 1 IN");
+        let first_of_1 = plan.place(c1_in, 0).expect("clip 1 IN");
         assert_eq!(
             first_of_1, last_of_0,
             "clip 1 must continue from clip 0's end, not rewind by the overlap"
         );
         // And the timeline keeps moving forward from there.
         let into_1 = plan
-            .place(c1_in + 1_000_000_000, true)
+            .place(c1_in + 1_000_000_000, 0)
             .expect("1s into clip 1");
         assert_eq!(
             into_1,
@@ -615,12 +628,60 @@ mod tests {
         let c0_out = mpls_ticks_to_ns(clips[0].out_time);
         let c1_in = mpls_ticks_to_ns(clips[1].in_time);
         // Video crosses into clip 1.
-        plan.place(c1_in + 500_000_000, true).expect("in clip 1");
+        plan.place(c1_in + 500_000_000, 0).expect("in clip 1");
         // A straggler from clip 0's tail arrives afterwards.
         let tail = c0_out - 50_000_000; // 50ms before clip 0's OUT
-        let placed = plan.place(tail, false).expect("straggler must be placed");
+        let placed = plan.place(tail, 1).expect("straggler must be placed");
         let expected = tail + (0i64 - mpls_ticks_to_ns(clips[0].in_time));
         assert_eq!(placed, expected, "straggler must ride clip 0's offset");
+    }
+
+    /// Each track crosses a join on its OWN frame.
+    ///
+    /// This is the regression for the first attempt at this fix, which gave
+    /// every track the cursor the video had moved. At an overlap the previous
+    /// clip's audio tail is still arriving after video has crossed, and those
+    /// tail frames sit inside BOTH clips' ranges — so a shared cursor gave them
+    /// the new clip's offset, threw them forward by the overlap, and made them
+    /// collide with the new clip's own audio. Measured on a real remux: 169
+    /// audio packets flattened onto the 0.1 ms tick floor and a 1.80 s jump,
+    /// i.e. the original symptom, still present after the timeline length was
+    /// already correct.
+    #[test]
+    fn each_track_crosses_a_join_on_its_own_frame() {
+        let clips = seamless_branching_clips();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let c0_in = mpls_ticks_to_ns(clips[0].in_time);
+        let c0_out = mpls_ticks_to_ns(clips[0].out_time);
+        let c1_in = mpls_ticks_to_ns(clips[1].in_time);
+
+        // Audio (track 1) runs up to near clip 0's OUT.
+        let tail = c0_out - 200_000_000;
+        plan.place(c0_in, 1).expect("audio start");
+        let a_tail = plan.place(tail, 1).expect("audio tail");
+
+        // Video (track 0) crosses into clip 1 first.
+        plan.place(c0_out, 0).expect("video at clip 0 OUT");
+        plan.place(c1_in, 0).expect("video at clip 1 IN");
+
+        // Audio's NEXT tail frame still belongs to clip 0 and must stay there —
+        // contiguous with the previous one, not thrown forward by the overlap.
+        let a_tail2 = plan
+            .place(tail + 10_000_000, 1)
+            .expect("audio tail continues");
+        assert_eq!(
+            a_tail2 - a_tail,
+            10_000_000,
+            "audio tail must stay on clip 0's offset while video is already in clip 1"
+        );
+
+        // When audio itself steps back to clip 1's IN, it crosses — and lands
+        // after its own tail, with no rewind and no collision.
+        let a_new = plan.place(c1_in, 1).expect("audio crosses");
+        assert!(
+            a_new > a_tail2,
+            "audio must not rewind at the join (got {a_new} after {a_tail2})"
+        );
     }
 
     /// Clips whose marks chain contiguously must come out byte-identical to the
@@ -654,7 +715,7 @@ mod tests {
             6_410_000_000_000,
         ] {
             assert_eq!(
-                plan.place(t, true),
+                plan.place(t, 0),
                 Some(t),
                 "contiguous clips must not move a frame (t={t})"
             );
@@ -682,9 +743,9 @@ mod tests {
     #[test]
     fn map_without_a_plan_is_the_old_behaviour() {
         let mut tc = TimelineContinuity::new();
-        assert_eq!(tc.map(0, true), Some(0));
-        assert_eq!(tc.map(5 * S, true), Some(5 * S));
-        assert_eq!(tc.map(25 * S, false), Some(25 * S));
+        assert_eq!(tc.map(0, true, 0), Some(0));
+        assert_eq!(tc.map(5 * S, true, 0), Some(5 * S));
+        assert_eq!(tc.map(25 * S, false, 1), Some(25 * S));
         assert_eq!(tc.offset_ns, 0);
     }
 
