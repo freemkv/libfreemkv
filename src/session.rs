@@ -439,6 +439,101 @@ pub fn scan_iso(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorS
     Ok((disc, Box::new(reader)))
 }
 
+/// Sampled 6144-byte aligned units when deciding whether a folder that still
+/// carries `AACS/` actually holds encrypted content. Enough to survive a clip
+/// whose opening units happen to be unflagged (a clear leader), few enough to
+/// stay a handful of reads.
+const AACS_PROBE_UNITS: usize = 8;
+
+/// [`Disc`] together with a [`SectorSource`] over a synthesized image of an
+/// extracted disc FOLDER — the `dir://` counterpart to [`scan_iso`].
+///
+/// The extra step over `scan_iso` is the encryption verdict.
+/// `Disc::scan_with` decides `encrypted` STRUCTURALLY, from the presence of an
+/// `/AACS` or `/BDMV/AACS` directory (`disc/mod.rs:1992-1993`). For the common
+/// case — a MakeMKV-style backup, which strips `AACS/` — that already gives the
+/// right answer, and `DecryptKeys::None` is a pass-through. But a folder copied
+/// verbatim from a decrypted disc keeps `AACS/`, and the tree shape then claims
+/// encryption over content that is already in the clear: the rip would fail
+/// asking for a key it does not need.
+///
+/// So for a folder, tree shape is not the evidence — CONTENT is. Several
+/// aligned units at the largest title's start are sampled and judged by
+/// `aacs_unit_needs_decrypt`, the same authority the mux read path uses:
+///
+/// * none need decryption → the folder is decrypted; `encrypted` is forced
+///   false and the reason is logged.
+/// * any unit does → the folder is a raw encrypted copy, which `dir://` does
+///   not support; [`Error::DirImageEncrypted`].
+///
+/// This lives HERE and not in `Disc::scan_image`, which is shared with the ISO
+/// and drive paths: an ISO that carries `AACS/` and clear content is a
+/// different situation (it may be mid-decrypt, or `--raw` output), and the
+/// verdict must not change underneath those callers.
+pub fn scan_dir(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorSource>)> {
+    let mut reader = crate::dirimage::DirImage::open(path)?;
+    let capacity = reader.capacity_sectors();
+    let mut disc = Disc::scan_image(&mut reader, capacity, &opts)?;
+
+    // `css.is_some()` is the DVD path, and that verdict came from actually
+    // cracking scrambled sectors — real evidence about content, not tree shape.
+    // Only the AACS-by-tree-shape verdict is re-judged here.
+    if disc.encrypted && disc.css.is_none() && disc.css_error.is_none() {
+        match probe_folder_encryption(&mut reader, &disc)? {
+            true => return Err(Error::DirImageEncrypted),
+            false => {
+                tracing::warn!(
+                    target: "freemkv::scan",
+                    phase = "scan_dir",
+                    "folder carries an AACS directory but its sampled content units \
+                     are already in the clear; treating it as decrypted"
+                );
+                disc.encrypted = false;
+                disc.aacs = None;
+                disc.aacs_error = None;
+            }
+        }
+    }
+    Ok((disc, Box::new(reader)))
+}
+
+/// `true` when any sampled content unit still needs decryption.
+///
+/// Anchored at the largest title's first extent, because AACS unit alignment
+/// is measured from the clip FILE's start (`aacs::content::is_unit_aligned`),
+/// not from an absolute `lba % 3` — sampling off a boundary would mis-judge a
+/// perfectly clear unit.
+fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result<bool> {
+    use crate::aacs::content::{aacs_unit_needs_decrypt, is_unit_aligned};
+    use crate::consts::SECTOR_BYTES;
+
+    const UNIT_SECTORS: u32 = 3;
+    let Some(extent) = disc
+        .titles
+        .iter()
+        .flat_map(|t| t.extents.iter())
+        .max_by_key(|e| e.sector_count)
+    else {
+        // No content to judge. A folder with an AACS directory and no titles
+        // has nothing to rip either way; leave the structural verdict alone.
+        return Ok(true);
+    };
+    let base = extent.start_lba;
+    let mut unit = vec![0u8; UNIT_SECTORS as usize * SECTOR_BYTES];
+    for i in 0..AACS_PROBE_UNITS as u32 {
+        let lba = base + i * UNIT_SECTORS;
+        if lba + UNIT_SECTORS > base + extent.sector_count {
+            break;
+        }
+        debug_assert!(is_unit_aligned(lba, base));
+        reader.read_sectors(lba, UNIT_SECTORS as u16, &mut unit, false)?;
+        if aacs_unit_needs_decrypt(&unit, disc.content_format) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
