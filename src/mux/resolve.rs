@@ -55,9 +55,15 @@ pub enum StreamUrl {
     Stdio,
     /// ISO disc image file.
     Iso { path: PathBuf },
-    /// Decrypted file-tree output directory (`dir://`). A sink that writes
-    /// per-file decrypted bytes (not muxed PES frames), so it never flows
-    /// through `output()`; the CLI routes a `Dir` dest to `Disc::extract_tree`.
+    /// An extracted disc file tree (`dir://`) — a source AND a sink.
+    ///
+    /// As a SINK it writes per-file decrypted bytes rather than muxed PES
+    /// frames, so it never flows through `output()`; the CLI routes a `Dir`
+    /// dest to `Disc::extract_tree`.
+    ///
+    /// As a SOURCE (1.6.1) it is an image-level source: `crate::dirimage`
+    /// synthesizes a real UDF volume over the folder, so it reaches the same
+    /// scan/mux path `iso://` does and every destination follows.
     Dir { path: PathBuf },
     /// Null sink (write-only, discards data).
     Null,
@@ -142,9 +148,22 @@ impl StreamUrl {
         }
     }
 
-    /// Whether this URL represents a disc source (disc:// or iso://).
+    /// Whether this URL is an IMAGE-level source — one that carries a UDF
+    /// filesystem, so it can be scanned into a title list, have `-t`/`-a`/`-s`
+    /// applied, and feed either a PES sink or an image sink.
+    ///
+    /// `dir://` joined in 1.6.1, when `crate::dirimage` gave a folder a real
+    /// synthesized UDF volume.
+    ///
+    /// NOT the same predicate as the CLI's `engine::is_disc_source`, which
+    /// means "is a live drive" and drives tray/eject behaviour. That one must
+    /// never gain `Dir` — a directory routed down the live-drive rip path
+    /// would open, lock and eject a drive that has nothing to do with it.
     pub fn is_disc_source(&self) -> bool {
-        matches!(self, StreamUrl::Disc { .. } | StreamUrl::Iso { .. })
+        matches!(
+            self,
+            StreamUrl::Disc { .. } | StreamUrl::Iso { .. } | StreamUrl::Dir { .. }
+        )
     }
 }
 
@@ -371,171 +390,27 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // (so the kernel readahead window widens) and the periodic
             // DONTNEED page-cache eviction that bounds memory pressure
             // when the mux output is being written to the same disk.
-            let mut reader = crate::io::file_sector_source::FileSectorSource::open(path)?;
-            let capacity = reader.capacity_sectors();
-            let mut disc = crate::disc::Disc::scan_image(
-                &mut reader,
-                capacity,
-                &crate::disc::ScanOptions::default(),
-            )
-            .map_err(|e| -> io::Error { e.into() })?;
-            // Apply the caller-resolved keys (lookup-free); decrypt_keys() then
-            // yields them for the stream below. Propagate a failed application
-            // rather than silently muxing an undecryptable stream.
-            if !opts.unit_keys.is_empty() {
-                // These UKs were already resolved AND validated by the caller
-                // (the CLI's keydb loop), so no re-validation sample is needed.
-                disc.decrypt_with(crate::disc::Key::Unit(opts.unit_keys.clone()), &[])
-                    .map_err(|e| -> io::Error { e.into() })?;
-            }
-            // Pre-flight decrypt gate (the single, system-wide verdict — see
-            // `Disc::ensure_decryptable`). Fails fast BEFORE any mux work when
-            // decryption is needed and unavailable: a scrambled-but-uncracked
-            // CSS disc (`css_error` set), or an AACS-encrypted disc with no
-            // usable key (would mux ~100 MB of garbage — encrypted m2ts → no TS
-            // syncs → demuxer emits nothing → empty/garbage output at exit 0).
-            // `--raw` and unencrypted/CSS-keyless-success discs pass. This is the
-            // disc-wide check; the per-title (multi-VTS CSS) check is below, once
-            // the chosen title's key is resolved.
-            disc.ensure_decryptable(opts.raw)
-                .map_err(|e| -> io::Error { e.into() })?;
-            if disc.titles.is_empty() {
-                return Err(crate::error::Error::NoStreams.into());
-            }
-            let idx = opts.title_index.unwrap_or(0);
-            if idx >= disc.titles.len() {
-                return Err(crate::error::Error::DiscTitleRange {
-                    index: idx,
-                    count: disc.titles.len(),
-                }
-                .into());
-            }
-            // Prune to the selected audio/subtitle streams now, on the scanned
-            // (pre-`probe_and_remap`) title, so everything downstream — the
-            // TrueHD channel-correction probe, the final title clone, and
-            // `build_iso_pipeline`'s demux/track construction — sees the pruned
-            // list. Video is always kept; a no-op for the default All/All.
-            opts.selection
-                .apply(&mut disc.titles[idx])
-                .map_err(|e| -> io::Error { e.into() })?;
-            // Per-title key resolution. DVD CSS is resolved at exactly ONE site —
-            // `build_iso_pipeline`'s per-title crack (below), which decrypts a
-            // crackable title, passes a genuinely-clear one through, and
-            // hard-fails an uncrackable one with CssKeyMissing. So for a DVD we do
-            // NOT pre-crack here: pass `None` and let the pipeline own it.
-            // Pre-cracking would re-open the ISO and re-scan every clear title
-            // (`decrypt_keys_for_title` → None → the pipeline re-cracks anyway).
-            // AACS / unencrypted resolve from `decrypt_keys()` with NO read; `--raw`
-            // (any format) is deliberate ciphertext passthrough — also `None`.
-            let is_dvd = disc.format == crate::disc::DiscFormat::Dvd;
-            let (keys, title_is_clear) = if opts.raw || is_dvd {
-                (crate::decrypt::DecryptKeys::None, false)
-            } else {
-                (disc.decrypt_keys(), false)
-            };
-            // Decrypt gate for the AACS / non-DVD path: a None key means no usable
-            // disc key, which would mux scrambled ciphertext verbatim — fail loudly
-            // (NoDiscKey). The DVD path is gated inside `build_iso_pipeline` (its
-            // CSS hard-fail), and `--raw` passes.
-            if !is_dvd {
-                disc.ensure_title_decryptable(opts.raw, &keys, title_is_clear)
-                    .map_err(|e| -> io::Error { e.into() })?;
-            }
-            // FMTS (AACS 2.1) forensic segments are sourced + fail-loud-checked
-            // downstream by `resolve_mux_key_map`/`resolve_fmts_key_map`, which hold
-            // the key-fetch closure and can actually attempt resolution. (An older
-            // upfront blanket-reject gate lived here; it predated the resolver and
-            // rejected every 2.1 disc before a source could be tried.)
-            // Correct TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1)
-            // by probing the first DECRYPTED access units of the chosen title.
-            // A fresh reader avoids disturbing the mux reader below. Skipped in
-            // --raw mode: the probe would re-open + decrypt for nothing (on an
-            // AACS disc with no key the correction is a no-op on ciphertext, and
-            // raw output isn't decoded anyway).
-            if !opts.raw {
-                match crate::io::file_sector_source::FileSectorSource::open(path) {
-                    Ok(mut probe) => {
-                        // The probe DECRYPTS the title head, so it needs the SAME
-                        // up-front key map the mux read installs below. An AACS
-                        // `DecryptingSectorSource` with no map fails loud on the
-                        // first unit (`decrypt_sectors_mapped` is the only AACS
-                        // decrypt path) — without resolving one here the correction
-                        // is silently skipped on every AACS disc and 7.1/Atmos stays
-                        // understated as the MPLS-declared 5.1. Resolution failure is
-                        // non-fatal (`.ok()`): leave channels uncorrected, never
-                        // fail the mux.
-                        let mut probe_keys = keys.clone();
-                        let probe_title = disc.titles[idx].clone();
-                        let probe_map = match &probe_keys {
-                            crate::decrypt::DecryptKeys::Aacs { .. } => resolve_mux_key_map(
-                                &mut probe,
-                                &probe_title,
-                                &mut probe_keys,
-                                opts.key_fetch.as_ref(),
-                                disc.content_format,
-                                // File-backed, bounded probe (best-effort `.ok()`);
-                                // no live drive to protect from a stuck stop here.
-                                None,
-                            )
-                            .ok()
-                            .map(std::sync::Arc::new),
-                            _ => None,
-                        };
-                        let mut dec = crate::sector::DecryptingSectorSource::new(probe, probe_keys);
-                        if let Some(map) = probe_map {
-                            dec = dec.with_key_map(map);
-                        }
-                        crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]);
-                    }
-                    Err(e) => {
-                        // Non-fatal: a failed re-open just leaves MPLS 7.1/Atmos
-                        // channel counts uncorrected (understated as 5.1). Log so
-                        // the uncorrected path is diagnosable rather than silent.
-                        tracing::debug!(
-                            target: "mux",
-                            "TrueHD channel-correction probe re-open failed: {e}"
-                        );
-                    }
-                }
-            }
-            let title = disc.titles[idx].clone();
-            let format = disc.content_format;
-            // ISO file: 8192-sector batch (16 MiB at 2048 B/sector) —
-            // sequential read from fast storage, no bad sectors. Empirically
-            // optimal; bumping to 16384 sectors (32 MiB) regressed (more cache
-            // pressure, longer per-batch latency starves the consumer between
-            // iterations). Physical drives keep smaller batches for adaptive
-            // error handling.
-            const ISO_MUX_BATCH_SECTORS: u16 = 8192;
-
-            // Pass `DecryptKeys::None` to the decrypt decorator when
-            // --raw is set — the read stack still flows through the
-            // same producer+demux+parse pipeline, just without the
-            // AACS / CSS step. Single highway for all ISO reads.
-            let effective_keys = if opts.raw {
-                crate::decrypt::DecryptKeys::None
-            } else {
-                keys
-            };
-            // Install the shared fetch closure (if the app supplied one) so a
-            // unit no held key decrypts is re-tried via the app's key source.
-            // Suppressed in --raw (no decrypt step to recover).
-            let fetch = if opts.raw {
-                None
-            } else {
-                opts.key_fetch.clone()
-            };
-            let stream = build_iso_pipeline(
-                reader,
-                title,
-                effective_keys,
-                ISO_MUX_BATCH_SECTORS,
-                format,
-                opts.raw,
-                None,
-                None,
-                fetch,
-            )?;
+            let reader = crate::io::file_sector_source::FileSectorSource::open(path)?;
+            let probe_path = path.clone();
+            let stream = image_input(reader, opts, move || {
+                crate::io::file_sector_source::FileSectorSource::open(&probe_path).ok()
+            })?;
+            Ok(Box::new(stream))
+        }
+        // `dir://` as a SOURCE: an extracted disc folder, presented as a
+        // synthetic UDF image (`crate::dirimage`). It reaches EXACTLY the same
+        // body as `iso://` above — scan, title select, key resolution, mux —
+        // because by the time `DirImage` exists it is just another
+        // `SectorSource`. That is the point of synthesizing a real filesystem
+        // rather than faking a tree: every destination follows for free, with
+        // no per-scheme mux path to keep in step.
+        StreamUrl::Dir { ref path } => {
+            validate_file_path(path, "dir")?;
+            let reader = crate::dirimage::DirImage::open(path)?;
+            let probe_path = path.clone();
+            let stream = image_input(reader, opts, move || {
+                crate::dirimage::DirImage::open(&probe_path).ok()
+            })?;
             Ok(Box::new(stream))
         }
         StreamUrl::M2ts { ref path } => {
@@ -556,9 +431,6 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             Ok(Box::new(NetworkStream::listen(addr)?))
         }
         StreamUrl::Stdio => Ok(Box::new(StdioStream::input())),
-        // `dir://` is an output-only sink (decrypted file tree); it is never a
-        // PES source. Mirror `null://` → write-only.
-        StreamUrl::Dir { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
         // `mp4://` as a source: demux a progressive MP4 back into PES frames, so
         // `mp4://` flows to every sink (mkv://, audio://, json://, …).
@@ -576,6 +448,192 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
         }
     }
+}
+
+/// Shared body of every IMAGE-level PES source.
+///
+/// `iso://` and `dir://` differ only in how the sectors are produced — a file
+/// versus a synthesized UDF volume over a folder — and not at all in what is
+/// done with them: scan, apply caller-resolved keys, gate on decryptability,
+/// select the title, prune streams, correct TrueHD channel counts, mux. One
+/// body means a `dir://` source cannot drift away from the `iso://` behaviour
+/// that has years of fixes in it.
+///
+/// `reopen` yields a SECOND, independent reader for the TrueHD channel probe,
+/// which must not disturb the mux reader's position. It returns `Option`
+/// because a failed re-open is non-fatal: the correction is skipped, not the
+/// mux.
+fn image_input<S, F>(
+    mut reader: S,
+    opts: &InputOptions,
+    reopen: F,
+) -> io::Result<PipelinedPesStream>
+where
+    S: SectorSource + Send + 'static,
+    F: FnOnce() -> Option<S>,
+{
+    let capacity = reader.capacity_sectors();
+    let mut disc =
+        crate::disc::Disc::scan_image(&mut reader, capacity, &crate::disc::ScanOptions::default())
+            .map_err(|e| -> io::Error { e.into() })?;
+    // Apply the caller-resolved keys (lookup-free); decrypt_keys() then
+    // yields them for the stream below. Propagate a failed application
+    // rather than silently muxing an undecryptable stream.
+    if !opts.unit_keys.is_empty() {
+        // These UKs were already resolved AND validated by the caller
+        // (the CLI's keydb loop), so no re-validation sample is needed.
+        disc.decrypt_with(crate::disc::Key::Unit(opts.unit_keys.clone()), &[])
+            .map_err(|e| -> io::Error { e.into() })?;
+    }
+    // Pre-flight decrypt gate (the single, system-wide verdict — see
+    // `Disc::ensure_decryptable`). Fails fast BEFORE any mux work when
+    // decryption is needed and unavailable: a scrambled-but-uncracked
+    // CSS disc (`css_error` set), or an AACS-encrypted disc with no
+    // usable key (would mux ~100 MB of garbage — encrypted m2ts → no TS
+    // syncs → demuxer emits nothing → empty/garbage output at exit 0).
+    // `--raw` and unencrypted/CSS-keyless-success discs pass. This is the
+    // disc-wide check; the per-title (multi-VTS CSS) check is below, once
+    // the chosen title's key is resolved.
+    disc.ensure_decryptable(opts.raw)
+        .map_err(|e| -> io::Error { e.into() })?;
+    if disc.titles.is_empty() {
+        return Err(crate::error::Error::NoStreams.into());
+    }
+    let idx = opts.title_index.unwrap_or(0);
+    if idx >= disc.titles.len() {
+        return Err(crate::error::Error::DiscTitleRange {
+            index: idx,
+            count: disc.titles.len(),
+        }
+        .into());
+    }
+    // Prune to the selected audio/subtitle streams now, on the scanned
+    // (pre-`probe_and_remap`) title, so everything downstream — the
+    // TrueHD channel-correction probe, the final title clone, and
+    // `build_iso_pipeline`'s demux/track construction — sees the pruned
+    // list. Video is always kept; a no-op for the default All/All.
+    opts.selection
+        .apply(&mut disc.titles[idx])
+        .map_err(|e| -> io::Error { e.into() })?;
+    // Per-title key resolution. DVD CSS is resolved at exactly ONE site —
+    // `build_iso_pipeline`'s per-title crack (below), which decrypts a
+    // crackable title, passes a genuinely-clear one through, and
+    // hard-fails an uncrackable one with CssKeyMissing. So for a DVD we do
+    // NOT pre-crack here: pass `None` and let the pipeline own it.
+    // Pre-cracking would re-open the ISO and re-scan every clear title
+    // (`decrypt_keys_for_title` → None → the pipeline re-cracks anyway).
+    // AACS / unencrypted resolve from `decrypt_keys()` with NO read; `--raw`
+    // (any format) is deliberate ciphertext passthrough — also `None`.
+    let is_dvd = disc.format == crate::disc::DiscFormat::Dvd;
+    let (keys, title_is_clear) = if opts.raw || is_dvd {
+        (crate::decrypt::DecryptKeys::None, false)
+    } else {
+        (disc.decrypt_keys(), false)
+    };
+    // Decrypt gate for the AACS / non-DVD path: a None key means no usable
+    // disc key, which would mux scrambled ciphertext verbatim — fail loudly
+    // (NoDiscKey). The DVD path is gated inside `build_iso_pipeline` (its
+    // CSS hard-fail), and `--raw` passes.
+    if !is_dvd {
+        disc.ensure_title_decryptable(opts.raw, &keys, title_is_clear)
+            .map_err(|e| -> io::Error { e.into() })?;
+    }
+    // FMTS (AACS 2.1) forensic segments are sourced + fail-loud-checked
+    // downstream by `resolve_mux_key_map`/`resolve_fmts_key_map`, which hold
+    // the key-fetch closure and can actually attempt resolution. (An older
+    // upfront blanket-reject gate lived here; it predated the resolver and
+    // rejected every 2.1 disc before a source could be tried.)
+    // Correct TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1)
+    // by probing the first DECRYPTED access units of the chosen title.
+    // A fresh reader avoids disturbing the mux reader below. Skipped in
+    // --raw mode: the probe would re-open + decrypt for nothing (on an
+    // AACS disc with no key the correction is a no-op on ciphertext, and
+    // raw output isn't decoded anyway).
+    if !opts.raw {
+        match reopen() {
+            Some(mut probe) => {
+                // The probe DECRYPTS the title head, so it needs the SAME
+                // up-front key map the mux read installs below. An AACS
+                // `DecryptingSectorSource` with no map fails loud on the
+                // first unit (`decrypt_sectors_mapped` is the only AACS
+                // decrypt path) — without resolving one here the correction
+                // is silently skipped on every AACS disc and 7.1/Atmos stays
+                // understated as the MPLS-declared 5.1. Resolution failure is
+                // non-fatal (`.ok()`): leave channels uncorrected, never
+                // fail the mux.
+                let mut probe_keys = keys.clone();
+                let probe_title = disc.titles[idx].clone();
+                let probe_map = match &probe_keys {
+                    crate::decrypt::DecryptKeys::Aacs { .. } => resolve_mux_key_map(
+                        &mut probe,
+                        &probe_title,
+                        &mut probe_keys,
+                        opts.key_fetch.as_ref(),
+                        disc.content_format,
+                        // File-backed, bounded probe (best-effort `.ok()`);
+                        // no live drive to protect from a stuck stop here.
+                        None,
+                    )
+                    .ok()
+                    .map(std::sync::Arc::new),
+                    _ => None,
+                };
+                let mut dec = crate::sector::DecryptingSectorSource::new(probe, probe_keys);
+                if let Some(map) = probe_map {
+                    dec = dec.with_key_map(map);
+                }
+                crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]);
+            }
+            None => {
+                // Non-fatal: a failed re-open just leaves MPLS 7.1/Atmos
+                // channel counts uncorrected (understated as 5.1). Log so
+                // the uncorrected path is diagnosable rather than silent.
+                tracing::debug!(
+                    target: "mux",
+                    "TrueHD channel-correction probe re-open failed"
+                );
+            }
+        }
+    }
+    let title = disc.titles[idx].clone();
+    let format = disc.content_format;
+    // ISO file: 8192-sector batch (16 MiB at 2048 B/sector) —
+    // sequential read from fast storage, no bad sectors. Empirically
+    // optimal; bumping to 16384 sectors (32 MiB) regressed (more cache
+    // pressure, longer per-batch latency starves the consumer between
+    // iterations). Physical drives keep smaller batches for adaptive
+    // error handling.
+    const ISO_MUX_BATCH_SECTORS: u16 = 8192;
+
+    // Pass `DecryptKeys::None` to the decrypt decorator when
+    // --raw is set — the read stack still flows through the
+    // same producer+demux+parse pipeline, just without the
+    // AACS / CSS step. Single highway for all ISO reads.
+    let effective_keys = if opts.raw {
+        crate::decrypt::DecryptKeys::None
+    } else {
+        keys
+    };
+    // Install the shared fetch closure (if the app supplied one) so a
+    // unit no held key decrypts is re-tried via the app's key source.
+    // Suppressed in --raw (no decrypt step to recover).
+    let fetch = if opts.raw {
+        None
+    } else {
+        opts.key_fetch.clone()
+    };
+    let stream = build_iso_pipeline(
+        reader,
+        title,
+        effective_keys,
+        ISO_MUX_BATCH_SECTORS,
+        format,
+        opts.raw,
+        None,
+        None,
+        fetch,
+    )?;
+    Ok(stream)
 }
 
 /// Open a PES output stream (consumes PES frames).
@@ -2547,9 +2605,12 @@ mod tests {
     }
 
     /// `dir://PATH/` parses to `StreamUrl::Dir` with the raw remainder as the
-    /// path; it is a SINK (not a disc source), so `is_disc_source()` is false.
+    /// path. Unlike the other directory schemes it IS an image-level source
+    /// (1.6.1): `crate::dirimage` synthesizes a UDF volume over the folder, so
+    /// `is_disc_source()` — "has a filesystem to scan" — is true for it and
+    /// false for the write-only `demux://` / `fvi://` directory sinks.
     #[test]
-    fn parse_dir_url_is_sink_not_disc_source() {
+    fn parse_dir_url_is_an_image_source_unlike_the_directory_sinks() {
         match parse_url("dir://out/movie/") {
             StreamUrl::Dir { path } => {
                 assert_eq!(path, PathBuf::from("out/movie/"));
@@ -2565,8 +2626,8 @@ mod tests {
             "demux:// is a sink, never a disc source"
         );
         assert!(
-            !parse_url("dir://x").is_disc_source(),
-            "dir:// is a sink, never a disc source"
+            parse_url("dir://x").is_disc_source(),
+            "dir:// carries a filesystem, so selection flags and image sinks apply"
         );
         // fvi:// parses to Fvi with the raw remainder as the path, and is a
         // sink (never a disc source) — parallel to the demux:// coverage above.
@@ -2594,15 +2655,19 @@ mod tests {
         );
     }
 
-    /// `dir://` is output-only: `input()` rejects it (StreamWriteOnly →
-    /// Unsupported), and `output()` rejects it too (StreamReadOnly →
-    /// Unsupported) because it is NOT a PES sink — the CLI routes it to
-    /// `Disc::extract_tree` before the mux path.
+    /// `dir://` is never a PES SINK — it writes raw decrypted files, not muxed
+    /// frames, so `output()` still rejects it (StreamReadOnly → Unsupported)
+    /// and the CLI routes a `dir://` dest to `Disc::extract_tree`.
+    ///
+    /// As a SOURCE it is no longer rejected out of hand: it is an image source,
+    /// and a missing folder now fails as a missing folder (NotFound) rather
+    /// than as "this scheme cannot be read".
     #[test]
-    fn dir_url_is_not_a_pes_stream_either_direction() {
+    fn dir_url_is_an_input_but_never_a_pes_sink() {
         assert_eq!(
-            input_err_kind("dir://out/"),
-            std::io::ErrorKind::Unsupported
+            input_err_kind("dir://definitely/not/here/"),
+            std::io::ErrorKind::NotFound,
+            "a dir:// source that does not exist must report a missing path"
         );
         let t = DiscTitle::empty();
         assert_eq!(

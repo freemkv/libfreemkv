@@ -170,6 +170,31 @@ pub const E_DIR_INSUFFICIENT_SPACE: u16 = 9027;
 pub const E_DIR_NAME_COLLISION: u16 = 9028;
 /// A `dir://` create_dir_all / file write / rename failed.
 pub const E_DIR_WRITE_FAILED: u16 = 9029;
+/// A `dir://` SOURCE folder carries `BDMV/STREAM/SSIF/` (Blu-ray 3D). The
+/// scanner detects SSIF unconditionally and would rip it as 3D, but the
+/// synthetic-image planner has no extent-aliasing support (an SSIF interleaves
+/// the same sectors as the base/dependent `.m2ts`), so the output would be
+/// silently wrong. Rejected up front instead.
+pub const E_DIR_IMAGE_SSIF_UNSUPPORTED: u16 = 9061;
+/// A `dir://` SOURCE `VIDEO_TS` folder's IFO-declared VOB offsets cannot be
+/// satisfied by any placement: the required start sector of a VOB lies BELOW
+/// the end of the file that must precede it. Carries the offending file's disc
+/// path. A silently misplaced VOB would rip the wrong sectors.
+pub const E_DIR_IMAGE_PLACEMENT: u16 = 9062;
+/// A `dir://` SOURCE folder still carries live AACS-encrypted content: it has
+/// an `AACS/` directory AND the sampled content units are genuinely scrambled.
+/// `dir://` sources are decrypted-folder only.
+pub const E_DIR_IMAGE_ENCRYPTED: u16 = 9063;
+/// A `dir://` SOURCE folder holds no disc structure the image synthesizer
+/// understands (no `BDMV/`, no `VIDEO_TS/`).
+pub const E_DIR_IMAGE_UNSUPPORTED_TREE: u16 = 9064;
+/// A file inside a `dir://` SOURCE folder changed (shrank / was removed)
+/// between planning and reading. Zero-filling the gap would produce corrupt
+/// output at exit 0, so the read fails instead. Carries the disc path.
+pub const E_DIR_IMAGE_FILE_CHANGED: u16 = 9065;
+/// A `dir://` SOURCE folder does not fit a 32-bit sector address space
+/// (> 2^32 sectors ≈ 8 TiB), or holds more entries than a UDF tree can carry.
+pub const E_DIR_IMAGE_TOO_LARGE: u16 = 9066;
 pub const E_M2TS_PACKET_MALFORMED: u16 = 9021;
 /// A `network://` output target resolved to no address that is safe to
 /// connect to (every resolved IP was loopback / private / link-local /
@@ -733,6 +758,25 @@ pub enum Error {
     DirWriteFailed {
         errno: Option<i32>,
     },
+    /// A `dir://` SOURCE folder carries `BDMV/STREAM/SSIF/` (Blu-ray 3D),
+    /// which the synthetic-image planner cannot represent. See
+    /// [`E_DIR_IMAGE_SSIF_UNSUPPORTED`].
+    DirImageSsifUnsupported,
+    /// A `dir://` SOURCE `VIDEO_TS` placement constraint is unsatisfiable.
+    /// `path` is the disc path of the file that could not be placed.
+    DirImagePlacement {
+        path: String,
+    },
+    /// A `dir://` SOURCE folder still carries live AACS-encrypted content.
+    DirImageEncrypted,
+    /// A `dir://` SOURCE folder holds no recognized disc structure.
+    DirImageUnsupportedTree,
+    /// A file in a `dir://` SOURCE folder changed between plan and read.
+    DirImageFileChanged {
+        path: String,
+    },
+    /// A `dir://` SOURCE folder exceeds the addressable image size.
+    DirImageTooLarge,
 }
 
 impl Error {
@@ -850,6 +894,12 @@ impl Error {
             Error::DirInsufficientSpace { .. } => E_DIR_INSUFFICIENT_SPACE,
             Error::DirNameCollision { .. } => E_DIR_NAME_COLLISION,
             Error::DirWriteFailed { .. } => E_DIR_WRITE_FAILED,
+            Error::DirImageSsifUnsupported => E_DIR_IMAGE_SSIF_UNSUPPORTED,
+            Error::DirImagePlacement { .. } => E_DIR_IMAGE_PLACEMENT,
+            Error::DirImageEncrypted => E_DIR_IMAGE_ENCRYPTED,
+            Error::DirImageUnsupportedTree => E_DIR_IMAGE_UNSUPPORTED_TREE,
+            Error::DirImageFileChanged { .. } => E_DIR_IMAGE_FILE_CHANGED,
+            Error::DirImageTooLarge => E_DIR_IMAGE_TOO_LARGE,
         }
     }
 }
@@ -956,6 +1006,9 @@ impl std::fmt::Display for Error {
             },
             Error::Halted => write!(f, "E{}", self.code()),
             Error::UdfNotFound { path } => write!(f, "E{}: {}", self.code(), path),
+            Error::DirImagePlacement { path } | Error::DirImageFileChanged { path } => {
+                write!(f, "E{}: {}", self.code(), path)
+            }
             Error::DiscTitleRange { index, count } => {
                 write!(f, "E{}: {}/{}", self.code(), index, count)
             }
@@ -1107,6 +1160,18 @@ impl From<Error> for std::io::Error {
             // 9027 insufficient space / 9029 write failed: a filesystem-level
             // failure, not bad input.
             E_DIR_INSUFFICIENT_SPACE | E_DIR_WRITE_FAILED => std::io::ErrorKind::Other,
+            // dir:// SOURCE gates (9061–9064, 9066): the folder handed in cannot
+            // be turned into a disc image — a 3D SSIF tree, an unsatisfiable
+            // VIDEO_TS placement, still-encrypted content, an unrecognized tree,
+            // or one too large to address. All are properties of the input.
+            E_DIR_IMAGE_SSIF_UNSUPPORTED
+            | E_DIR_IMAGE_PLACEMENT
+            | E_DIR_IMAGE_ENCRYPTED
+            | E_DIR_IMAGE_UNSUPPORTED_TREE
+            | E_DIR_IMAGE_TOO_LARGE => std::io::ErrorKind::InvalidInput,
+            // 9065: the folder changed underneath a running read. Not bad input
+            // at plan time — a mid-flight mutation of the source.
+            E_DIR_IMAGE_FILE_CHANGED => std::io::ErrorKind::InvalidData,
             _ => std::io::ErrorKind::Other,
         };
         std::io::Error::new(kind, msg)
@@ -1445,6 +1510,12 @@ mod tests {
             .code(),
             Error::DirNameCollision { host: "x".into() }.code(),
             Error::DirWriteFailed { errno: Some(28) }.code(),
+            Error::DirImageSsifUnsupported.code(),
+            Error::DirImagePlacement { path: "x".into() }.code(),
+            Error::DirImageEncrypted.code(),
+            Error::DirImageUnsupportedTree.code(),
+            Error::DirImageFileChanged { path: "x".into() }.code(),
+            Error::DirImageTooLarge.code(),
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();
@@ -1746,6 +1817,12 @@ mod tests {
             E_M2TS_PACKET_MALFORMED,
             E_EXTENT_NOT_UNIT_ALIGNED,
             E_DISC_CAPACITY_MALFORMED,
+            E_DIR_IMAGE_SSIF_UNSUPPORTED,
+            E_DIR_IMAGE_PLACEMENT,
+            E_DIR_IMAGE_ENCRYPTED,
+            E_DIR_IMAGE_UNSUPPORTED_TREE,
+            E_DIR_IMAGE_FILE_CHANGED,
+            E_DIR_IMAGE_TOO_LARGE,
         ];
         let original_len = codes.len();
         codes.sort();

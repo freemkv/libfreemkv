@@ -1,0 +1,682 @@
+//! Layout planner: a host directory tree in, a full block assignment out.
+//!
+//! Two phases, kept apart because they fail for different reasons:
+//!
+//! 1. **Walk** the folder into a tree of names and sizes. Rejects what the
+//!    image model cannot represent (3D SSIF, an unrecognized tree, a
+//!    case-collision inside one directory).
+//! 2. **Assign** blocks. Metadata first (File Set Descriptor, one File Entry
+//!    per node, then the directory FID lists), then file data.
+//!
+//! Data placement is the part with real constraints. For a Blu-ray there are
+//! none — `.mpls`/`.clpi` address clips by name, never by LBA — so files are
+//! packed sequentially. For a DVD the IFOs record VOB positions as sector
+//! offsets from the IFO's own start, and `ifo.rs` re-derives every title extent
+//! from them, so the placement must reproduce those offsets exactly or the rip
+//! reads the wrong sectors. See [`place_video_ts`].
+
+use super::encode::{ANCHOR_LBA, MIN_PART_START, SECTOR};
+use crate::error::{Error, Result};
+use std::path::{Path, PathBuf};
+
+/// First block any FILE DATA may occupy, absolute.
+///
+/// Well clear of the volume-space descriptors, and — the load-bearing part —
+/// far from zero: `disc/bluray.rs:137` drops any clip extent whose LBA is 0,
+/// so a file that landed at block 0 would vanish from the title with no error.
+const DATA_FLOOR: u32 = 4096;
+
+/// Largest byte length a single allocation descriptor may record.
+///
+/// The AD length field is 30 bits (the top two are the ECMA-167 4/14.14.1.1
+/// extent type), so 0x3FFF_FFFF is the arithmetic ceiling — but a non-final
+/// extent must be a whole number of blocks, so the usable ceiling is the
+/// largest multiple of 2048 below it. Files larger than this are split across
+/// several ADs; `udf.rs` reads them back as a multi-extent file, which is the
+/// same shape a dual-layer disc produces.
+pub(super) const MAX_AD_BYTES: u64 = 0x3FFF_F800;
+
+/// Deepest directory nesting represented. Matches `udf.rs`'s `MAX_DIR_DEPTH`:
+/// anything deeper would be recorded but never descended into, so the files
+/// under it would be invisible to every consumer. Refuse instead of silently
+/// dropping.
+const MAX_DEPTH: u32 = 8;
+
+/// Upper bound on entries in the synthesized tree, mirroring `udf.rs`'s
+/// `MAX_TOTAL_DIR_ENTRIES`.
+const MAX_ENTRIES: usize = 100_000;
+
+/// One contiguous run of a file's bytes at a partition-relative block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Extent {
+    pub(super) lba: u32,
+    pub(super) bytes: u32,
+}
+
+/// A planned file: where its bytes come from on the host, and where they live
+/// in the synthesized image.
+#[derive(Debug)]
+pub(super) struct FileNode {
+    pub(super) name: String,
+    /// Disc path (`/BDMV/STREAM/00000.m2ts`) — used only for error reporting.
+    pub(super) disc_path: String,
+    pub(super) host: PathBuf,
+    pub(super) size: u64,
+    pub(super) icb_lba: u32,
+    pub(super) unique_id: u64,
+    pub(super) extents: Vec<Extent>,
+}
+
+/// A planned directory.
+#[derive(Debug)]
+pub(super) struct DirNode {
+    pub(super) name: String,
+    pub(super) icb_lba: u32,
+    pub(super) parent_icb_lba: u32,
+    pub(super) data_lba: u32,
+    pub(super) data_bytes: u32,
+    pub(super) unique_id: u64,
+    pub(super) dirs: Vec<DirNode>,
+    pub(super) files: Vec<FileNode>,
+}
+
+/// A complete image plan.
+#[derive(Debug)]
+pub(super) struct Layout {
+    pub(super) part_start: u32,
+    pub(super) part_sectors: u32,
+    pub(super) total_sectors: u32,
+    pub(super) volume_id: String,
+    pub(super) file_count: u32,
+    pub(super) dir_count: u32,
+    pub(super) next_unique_id: u64,
+    pub(super) root: DirNode,
+}
+
+/// Serialized length of one File Identifier Descriptor, before its 4-byte
+/// alignment padding. Shared with the encoder so the planner's directory size
+/// and the encoder's output cannot drift apart.
+fn fid_len(name: &str, is_parent: bool) -> usize {
+    let l_fi = if is_parent {
+        0
+    } else {
+        super::encode::encode_cs0(name).len()
+    };
+    (38 + l_fi).div_ceil(4) * 4
+}
+
+/// Total FID bytes a directory's data extent must hold.
+fn dir_bytes(dirs: &[DirNode], files: &[FileNode]) -> usize {
+    let mut n = fid_len("", true);
+    for d in dirs {
+        n += fid_len(&d.name, false);
+    }
+    for f in files {
+        n += fid_len(&f.name, false);
+    }
+    n
+}
+
+// ── Phase 1: walk ───────────────────────────────────────────────────────────
+
+/// Whether a host directory entry belongs in the synthesized image.
+///
+/// Dot-files are host artefacts, never disc content: macOS sprays `.DS_Store`
+/// and `._*` resource forks through any folder a Finder window has touched,
+/// and including them would put files on the "disc" that were never on the
+/// disc. `.partial` is freemkv's own in-flight extraction suffix (see
+/// `disc/extract.rs`) — picking one up would mean planning an extent over a
+/// file that is still being written.
+fn is_excluded(name: &str) -> bool {
+    name.starts_with('.') || name.ends_with(".partial")
+}
+
+fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<DirNode> {
+    if depth > MAX_DEPTH {
+        return Err(Error::DirImageTooLarge);
+    }
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+
+    let mut read: Vec<_> = std::fs::read_dir(dir)
+        .map_err(Error::from)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)?;
+    // Deterministic order: the same folder must always produce the same image
+    // (readdir order is filesystem- and even mount-dependent).
+    read.sort_by_key(|e| e.file_name());
+
+    for entry in read {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_excluded(&name) {
+            continue;
+        }
+        // `file_type()` does NOT follow symlinks; `metadata()` does. A symlink
+        // to a file is materialized as that file (a legitimate way to assemble
+        // a folder), a symlink to a directory is skipped — following one can
+        // loop, and UDF has no link this maps onto.
+        let ft = entry.file_type().map_err(Error::from)?;
+        let child_path = format!("{}/{}", disc_path.trim_end_matches('/'), name);
+        *entries += 1;
+        if *entries > MAX_ENTRIES {
+            return Err(Error::DirImageTooLarge);
+        }
+        names.push(name.to_ascii_uppercase());
+        if ft.is_dir() {
+            dirs.push(walk(&entry.path(), &child_path, depth + 1, entries)?);
+        } else {
+            let meta = match std::fs::metadata(entry.path()) {
+                Ok(m) => m,
+                // A broken symlink or a file that vanished between readdir and
+                // stat: skip it rather than plan an extent that cannot be read.
+                Err(_) => continue,
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            files.push(FileNode {
+                name,
+                disc_path: child_path,
+                host: entry.path(),
+                size: meta.len(),
+                icb_lba: 0,
+                unique_id: 0,
+                extents: Vec::new(),
+            });
+        }
+    }
+
+    // `UdfFs::find_dir` / `read_file` match path components case-insensitively,
+    // so two entries in one directory differing only in case are
+    // indistinguishable to every consumer — the second would silently shadow
+    // the first. Only reachable on a case-sensitive host volume.
+    names.sort();
+    for pair in names.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(Error::DirNameCollision {
+                host: format!("{disc_path}/{}", pair[0]),
+            });
+        }
+    }
+
+    Ok(DirNode {
+        name: dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        icb_lba: 0,
+        parent_icb_lba: 0,
+        data_lba: 0,
+        data_bytes: 0,
+        unique_id: 0,
+        dirs,
+        files,
+    })
+}
+
+/// Find a child directory by ASCII-case-insensitive name.
+fn child_dir<'a>(dir: &'a DirNode, name: &str) -> Option<&'a DirNode> {
+    dir.dirs.iter().find(|d| d.name.eq_ignore_ascii_case(name))
+}
+
+// ── Phase 2: block assignment ───────────────────────────────────────────────
+
+/// Assign metadata blocks depth-first: this node's File Entry, then its
+/// children's, then the directory data extents. Returns the next free block.
+fn assign_metadata(dir: &mut DirNode, parent_icb: u32, next: &mut u32, uid: &mut u64) {
+    dir.icb_lba = *next;
+    *next += 1;
+    dir.parent_icb_lba = parent_icb;
+    dir.unique_id = *uid;
+    *uid += 1;
+    for f in &mut dir.files {
+        f.icb_lba = *next;
+        *next += 1;
+        f.unique_id = *uid;
+        *uid += 1;
+    }
+    let icb = dir.icb_lba;
+    for sub in &mut dir.dirs {
+        assign_metadata(sub, icb, next, uid);
+    }
+    // Directory data after every File Entry of this subtree, so a directory's
+    // FIDs can name ICBs that were assigned after it.
+    let bytes = dir_bytes(&dir.dirs, &dir.files);
+    dir.data_bytes = bytes as u32;
+    dir.data_lba = *next;
+    *next += bytes.div_ceil(SECTOR) as u32;
+}
+
+/// Split a file into allocation descriptors and place them starting at `lba`.
+/// Returns the first free block after the file.
+fn place_file(f: &mut FileNode, lba: u32) -> Result<u32> {
+    f.extents.clear();
+    if f.size == 0 {
+        return Ok(lba);
+    }
+    let mut remaining = f.size;
+    let mut cur = lba;
+    while remaining > 0 {
+        let chunk = remaining.min(MAX_AD_BYTES);
+        f.extents.push(Extent {
+            lba: cur,
+            bytes: chunk as u32,
+        });
+        let blocks = chunk.div_ceil(SECTOR as u64);
+        cur = u32::try_from(cur as u64 + blocks).map_err(|_| Error::DirImageTooLarge)?;
+        remaining -= chunk;
+    }
+    Ok(cur)
+}
+
+/// Big-endian u32 at `off`, as every DVD-Video structure field is stored.
+fn be_u32(buf: &[u8], off: usize) -> Option<u32> {
+    let b = buf.get(off..off + 4)?;
+    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Read the first `n` bytes of a host file.
+fn read_head(path: &Path, n: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = vec![0u8; n];
+    match std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)) {
+        Ok(got) => {
+            buf.truncate(got);
+            buf
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Placement order and constraints for a `VIDEO_TS` folder.
+///
+/// DVD-Video records VOB positions INSIDE the IFOs, as sector offsets from the
+/// IFO file's own first sector:
+///
+/// * `VIDEO_TS.IFO` + 0xC0 (`VMGM_VOBS`)  → `VIDEO_TS.VOB`
+/// * `VTS_nn_0.IFO` + 0xC0 (`vtsm_vobs`)  → `VTS_nn_0.VOB` (the VTS menu)
+/// * `VTS_nn_0.IFO` + 0xC4 (`vtstt_vobs`) → `VTS_nn_1.VOB` (the title stream)
+///
+/// `ifo.rs:554-556` re-derives every title extent as
+/// `file_start_lba(IFO) + vtstt_vobs + cell.first_sector`, so only the third
+/// of those is load-bearing for freemkv itself — but the other two are
+/// load-bearing for DVD PLAYERS, which read the menus freemkv ignores. All
+/// three are honoured.
+///
+/// `VTS_nn_1.VOB … VTS_nn_9.VOB` are one logical stream split at the 1 GB
+/// file-size limit, and the cell sector addresses run continuously across the
+/// split, so they are placed back-to-back with no gap. Laying the group out in
+/// its canonical on-disc order gives exactly that for free; the constraint is
+/// then a CHECK, not a search.
+///
+/// The check can fail — a regenerated `.BUP`, a tool that rewrote an IFO, a
+/// folder assembled by hand — and when it does the required position lies
+/// below the end of the file that must precede it. There is no placement that
+/// satisfies it, so it is a typed error naming the file rather than a silent
+/// misplacement.
+fn place_video_ts(vts: &mut DirNode, start: u32) -> Result<u32> {
+    let mut order: Vec<usize> = (0..vts.files.len()).collect();
+    // Canonical on-disc order. Files the naming scheme does not cover (stray
+    // extras) sort last and are placed unconstrained.
+    order.sort_by_key(|&i| {
+        let r = classify(&vts.files[i].name);
+        (
+            r.is_none(),
+            r.map(|c| (c.group, c.order))
+                .unwrap_or((u32::MAX, u32::MAX)),
+            i,
+        )
+    });
+
+    // Required start blocks, resolved as each IFO is placed.
+    let mut menu_req: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut title_req: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+
+    let mut cursor = start;
+    for &i in &order {
+        let class = classify(&vts.files[i].name);
+        let required = match class.map(|c| (c.group, c.role)) {
+            Some((g, Role::MenuVob)) => menu_req.get(&g).copied(),
+            Some((g, Role::TitleVob)) => title_req.get(&g).copied(),
+            _ => None,
+        };
+        let lba = match required {
+            // No placement satisfies this: the VOB must begin below the end of
+            // the file that precedes it. Naming the file is the whole point —
+            // the alternative is an image freemkv reads at the wrong offset.
+            Some(req) if req < cursor => {
+                return Err(Error::DirImagePlacement {
+                    path: vts.files[i].disc_path.clone(),
+                });
+            }
+            Some(req) => req,
+            None => cursor,
+        };
+        cursor = place_file(&mut vts.files[i], lba)?;
+
+        // An IFO just landed: resolve the offsets it declares. Both are
+        // relative to the IFO's own first sector.
+        if let Some(c) = class
+            && c.role == Role::Ifo
+        {
+            let head = read_head(&vts.files[i].host, 0xC8);
+            let menu = be_u32(&head, 0xC0).unwrap_or(0);
+            if menu != 0 {
+                menu_req.insert(c.group, lba.saturating_add(menu));
+            }
+            // Only a VTS IFO carries a title VOBS pointer at 0xC4; the VMG's
+            // 0xC4 is a different field entirely (VMGM_C_ADT).
+            if c.group > 0 {
+                let title = be_u32(&head, 0xC4).unwrap_or(0);
+                if title != 0 {
+                    title_req.insert(c.group, lba.saturating_add(title));
+                }
+            }
+        }
+    }
+    Ok(cursor)
+}
+
+/// What a DVD-Video filename is, for placement purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// `VIDEO_TS.IFO` / `VTS_nn_0.IFO` — the file the offsets are relative to.
+    Ifo,
+    /// `VIDEO_TS.VOB` / `VTS_nn_0.VOB` — constrained by the 0xC0 offset.
+    MenuVob,
+    /// `VTS_nn_1.VOB` — constrained by the 0xC4 offset. `_2 … _9` follow it
+    /// with no gap by virtue of sorting immediately after.
+    TitleVob,
+    /// Backups and continuation VOBs: placed sequentially, no constraint.
+    Sequential,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Class {
+    /// 0 = the Video Manager (`VIDEO_TS.*`), n = title set n.
+    group: u32,
+    /// Sort key within the group.
+    order: u32,
+    role: Role,
+}
+
+fn classify(name: &str) -> Option<Class> {
+    let up = name.to_ascii_uppercase();
+    if let Some(ext) = up.strip_prefix("VIDEO_TS.") {
+        let (order, role) = match ext {
+            "IFO" => (0, Role::Ifo),
+            "VOB" => (1, Role::MenuVob),
+            "BUP" => (2, Role::Sequential),
+            _ => return None,
+        };
+        return Some(Class {
+            group: 0,
+            order,
+            role,
+        });
+    }
+    let rest = up.strip_prefix("VTS_")?;
+    let (num, rest) = rest.split_once('_')?;
+    let set: u32 = num.parse().ok()?;
+    let (part, ext) = rest.split_once('.')?;
+    let part: u32 = part.parse().ok()?;
+    let (order, role) = match (ext, part) {
+        ("IFO", 0) => (0, Role::Ifo),
+        ("VOB", 0) => (1, Role::MenuVob),
+        ("VOB", 1) => (2, Role::TitleVob),
+        ("VOB", n) => (1 + n, Role::Sequential),
+        ("BUP", 0) => (100, Role::Sequential),
+        _ => return None,
+    };
+    Some(Class {
+        group: set + 1,
+        order,
+        role,
+    })
+}
+
+/// Place every file's data, depth-first, packed with no gaps.
+fn place_generic(dir: &mut DirNode, cursor: &mut u32) -> Result<()> {
+    for f in &mut dir.files {
+        *cursor = place_file(f, *cursor)?;
+    }
+    for sub in &mut dir.dirs {
+        place_generic(sub, cursor)?;
+    }
+    Ok(())
+}
+
+fn count_nodes(dir: &DirNode, dirs: &mut u32, files: &mut u32) {
+    *dirs += 1;
+    *files += dir.files.len() as u32;
+    for sub in &dir.dirs {
+        count_nodes(sub, dirs, files);
+    }
+}
+
+/// Total blocks the metadata region needs: File Set Descriptor, its
+/// Terminating Descriptor, one File Entry per node, and each directory's FID
+/// list.
+fn metadata_blocks(dir: &DirNode) -> u64 {
+    let mut n = 1 + dir.files.len() as u64;
+    n += dir_bytes(&dir.dirs, &dir.files).div_ceil(SECTOR) as u64;
+    for sub in &dir.dirs {
+        n += metadata_blocks(sub);
+    }
+    n
+}
+
+/// Reject a Blu-ray 3D tree.
+///
+/// `disc/bluray.rs:124-130` probes `/BDMV/STREAM/SSIF/{clip}.ssif` and sets
+/// `is_3d` the moment one resolves — unconditionally, before any capability
+/// check. On a real 3D disc the `.ssif` and the base/dependent `.m2ts` files
+/// ALIAS the same sectors (the SSIF interleave IS the two m2ts streams), which
+/// this planner cannot express: it would allocate three disjoint copies, so
+/// the clip's extents and the m2ts's extents would disagree and the rip would
+/// read the wrong bytes at exit 0. Reject the folder instead.
+fn reject_ssif(root: &DirNode) -> Result<()> {
+    let Some(bdmv) = child_dir(root, "BDMV") else {
+        return Ok(());
+    };
+    let Some(stream) = child_dir(bdmv, "STREAM") else {
+        return Ok(());
+    };
+    if child_dir(stream, "SSIF").is_some() {
+        return Err(Error::DirImageSsifUnsupported);
+    }
+    Ok(())
+}
+
+/// Plan an image over `root`.
+///
+/// # Capacity, and what it changes
+///
+/// `total_sectors` becomes the `Disc`'s `capacity_sectors` / `capacity_bytes`,
+/// and `capacity_bytes` is not inert: `canonical_title_order`'s oversize gate
+/// (`disc/mod.rs:2039-2040`, body `:2209-2210`) demotes any title whose
+/// `size_bytes` exceeds it, which decides which title sorts first and therefore
+/// what `-t 1` selects.
+///
+/// The capacity reported here is **the synthesized image's own size** — what an
+/// ISO built from this folder would report — and nothing else. Specifically it
+/// is NOT padded up to a media tier (BD25/BD50/…), which was considered and
+/// does not work: a folder does not record the tier of the disc it came from,
+/// so a 22 GB folder off a BD50 would pad to BD25 and diverge anyway, and the
+/// padding would inflate any pre-sized output written from the image.
+///
+/// The consequence, stated plainly: **for a folder that is missing files the
+/// source disc had — a selective MakeMKV backup being the normal case — the
+/// capacity is smaller than the source disc's, the oversize gate is therefore
+/// stricter, and a borderline "play-all" composite title that the ISO kept can
+/// be demoted here. `-t 1` can select a different title from `dir://FOLDER`
+/// than from an `iso://` of the same disc.** For a complete folder the two
+/// agree, because the capacities agree.
+///
+/// This is chosen over the alternatives because it is the only one that is
+/// self-consistent: `dir://X` and an `iso://` built from `X` describe the same
+/// image and must answer the same way.
+pub(super) fn plan(root: &Path) -> Result<Layout> {
+    let mut entries = 0usize;
+    let mut tree = walk(root, "", 0, &mut entries)?;
+    tree.name = String::new();
+
+    if child_dir(&tree, "BDMV").is_none() && child_dir(&tree, "VIDEO_TS").is_none() {
+        return Err(Error::DirImageUnsupportedTree);
+    }
+    reject_ssif(&tree)?;
+
+    // Metadata: block 0 is the FSD, block 1 its Terminating Descriptor.
+    let mut next = 2u32;
+    let mut uid = 0u64;
+    assign_metadata(&mut tree, 0, &mut next, &mut uid);
+    tree.parent_icb_lba = tree.icb_lba; // root's parent FID points at itself
+
+    let part_start = MIN_PART_START;
+    debug_assert!(part_start > ANCHOR_LBA);
+    // Data starts after the metadata region AND above the floor, so nothing
+    // lands at a low LBA a consumer treats as "no extent".
+    let meta_end = part_start as u64 + next as u64;
+    let data_start_abs = meta_end.max(DATA_FLOOR as u64);
+    let mut cursor =
+        u32::try_from(data_start_abs - part_start as u64).map_err(|_| Error::DirImageTooLarge)?;
+
+    if let Some(idx) = tree
+        .dirs
+        .iter()
+        .position(|d| d.name.eq_ignore_ascii_case("VIDEO_TS"))
+    {
+        cursor = place_video_ts(&mut tree.dirs[idx], cursor)?;
+        for f in &mut tree.files {
+            cursor = place_file(f, cursor)?;
+        }
+        for (i, sub) in tree.dirs.iter_mut().enumerate() {
+            if i != idx {
+                place_generic(sub, &mut cursor)?;
+            }
+        }
+    } else {
+        place_generic(&mut tree, &mut cursor)?;
+    }
+
+    let mut dir_count = 0;
+    let mut file_count = 0;
+    count_nodes(&tree, &mut dir_count, &mut file_count);
+
+    let part_sectors = cursor;
+    let total = part_start as u64 + part_sectors as u64 + 1; // + trailing anchor
+    let total_sectors = u32::try_from(total).map_err(|_| Error::DirImageTooLarge)?;
+
+    let volume_id = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "FREEMKV".to_string());
+    // UDF volume identifiers are a 32-byte d-string: one compression byte, the
+    // characters, and a trailing length byte. Trim rather than let
+    // `put_dstring` cut a multi-byte character in half.
+    let volume_id: String = volume_id.chars().take(30).collect();
+
+    Ok(Layout {
+        part_start,
+        part_sectors,
+        total_sectors,
+        volume_id,
+        file_count,
+        dir_count,
+        next_unique_id: uid,
+        root: tree,
+    })
+}
+
+/// Total bytes of file data the plan covers — the honest "how big is this
+/// folder" number, used for progress and for the capacity the scan sees.
+pub(super) fn total_data_bytes(dir: &DirNode) -> u64 {
+    let mut n: u64 = dir.files.iter().map(|f| f.size).sum();
+    for sub in &dir.dirs {
+        n += total_data_bytes(sub);
+    }
+    n
+}
+
+/// Every file in the tree, depth-first, paired with its extents. The read path
+/// turns this into a sorted LBA → (file, offset) map.
+pub(super) fn flatten<'a>(dir: &'a DirNode, out: &mut Vec<&'a FileNode>) {
+    for f in &dir.files {
+        out.push(f);
+    }
+    for sub in &dir.dirs {
+        flatten(sub, out);
+    }
+}
+
+/// Metadata footprint in blocks, for diagnostics.
+pub(super) fn metadata_block_count(root: &DirNode) -> u64 {
+    2 + metadata_blocks(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file above the 30-bit AD ceiling must split into MULTIPLE
+    /// descriptors, and every non-final one must be a whole number of blocks —
+    /// otherwise the next extent's bytes start mid-sector and the file
+    /// reassembles wrong. Kills a mutant that emits one oversized AD (whose
+    /// length would collide with the extent-TYPE bits `udf.rs:642` reads).
+    #[test]
+    fn a_file_past_the_ad_ceiling_splits_on_a_block_boundary() {
+        let mut f = FileNode {
+            name: "BIG.M2TS".into(),
+            disc_path: "/BIG.M2TS".into(),
+            host: PathBuf::new(),
+            size: MAX_AD_BYTES + 4096,
+            icb_lba: 0,
+            unique_id: 0,
+            extents: Vec::new(),
+        };
+        let end = place_file(&mut f, 1000).unwrap();
+        assert_eq!(f.extents.len(), 2);
+        assert_eq!(f.extents[0].bytes as u64, MAX_AD_BYTES);
+        assert_eq!(f.extents[0].bytes % SECTOR as u32, 0, "block multiple");
+        assert!(f.extents[0].bytes <= 0x3FFF_FFFF);
+        assert_eq!(f.extents[1].bytes, 4096);
+        assert_eq!(
+            f.extents[1].lba,
+            1000 + (MAX_AD_BYTES / SECTOR as u64) as u32,
+            "the second extent starts where the first ends"
+        );
+        assert_eq!(end, f.extents[1].lba + 2);
+        assert_eq!(
+            f.extents.iter().map(|e| e.bytes as u64).sum::<u64>(),
+            f.size,
+            "no bytes lost or invented"
+        );
+    }
+
+    /// A zero-byte file records no allocation descriptors at all and consumes
+    /// no blocks.
+    #[test]
+    fn an_empty_file_gets_no_extents() {
+        let mut f = FileNode {
+            name: "EMPTY".into(),
+            disc_path: "/EMPTY".into(),
+            host: PathBuf::new(),
+            size: 0,
+            icb_lba: 0,
+            unique_id: 0,
+            extents: Vec::new(),
+        };
+        assert_eq!(place_file(&mut f, 500).unwrap(), 500);
+        assert!(f.extents.is_empty());
+    }
+
+    #[test]
+    fn host_artefacts_are_not_disc_content() {
+        assert!(is_excluded(".DS_Store"));
+        assert!(is_excluded("._00000.m2ts"));
+        assert!(is_excluded("00000.m2ts.partial"));
+        assert!(!is_excluded("00000.m2ts"));
+        assert!(!is_excluded("VTS_01_1.VOB"));
+    }
+}

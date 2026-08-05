@@ -1553,6 +1553,14 @@ fn parse_dstring(data: &[u8]) -> String {
     }
 }
 
+/// Test-only view of [`parse_dstring`], so the `dirimage` encoder can assert
+/// that the d-strings it writes are the ones this parser reads back rather
+/// than re-implementing the decode in its own tests.
+#[cfg(test)]
+pub(crate) fn parse_dstring_for_test(data: &[u8]) -> String {
+    parse_dstring(data)
+}
+
 /// Buffered sector reader — reduces SCSI round-trips by coalescing
 /// single-sector reads into `batch`-sized SCSI commands. Per-command
 /// latency dominates on USB drives, so serving many adjacent single-sector
