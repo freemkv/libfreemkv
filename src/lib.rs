@@ -191,6 +191,11 @@ pub use io::pipeline::{
 // continuously instead of bursting. General I/O infra, not recovery policy;
 // promoted to `pub` so freemkv-engine's relocated sweep/patch can use it too.
 pub use io::WritebackFile;
+/// Write an image-level source out as a sector image — what an `iso://`
+/// DESTINATION means for any source that is not a physical drive. Drive sources
+/// go through `freemkv_engine::copy`, which is the recovery path; see
+/// [`io::image_writer`] for why the two are deliberately separate.
+pub use io::image_writer::write_image;
 
 // ─── Drive events (low-level callbacks) ─────────────────────────────────────
 pub use event::{BatchSizeReason, Event, EventKind};
