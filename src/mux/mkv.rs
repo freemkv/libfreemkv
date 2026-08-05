@@ -1411,7 +1411,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // outside every clip's IN/OUT marks, which only a seam-plan-driven
         // title can report. Dropping it is the point: emitting it is what put
         // duplicate content on the timeline at a join.
-        let Some(pts_ns) = self.continuity.map(pts_ns, drives_epoch) else {
+        let Some(pts_ns) = self.continuity.map(pts_ns, drives_epoch, track_idx) else {
             return Ok(());
         };
         let raw_ticks = pts_ns / TIMESTAMP_SCALE_NS;
