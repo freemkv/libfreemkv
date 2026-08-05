@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.6.1]
+
+### Fixed
+
+- Chapter marks and title durations on NTSC DVDs ran roughly 0.1% short —
+  about 3.6 seconds per hour — so a mark near the end of a feature could
+  land several seconds before the scene it names. On a 67-minute title the
+  drift reached about 4 seconds. The playback times a DVD stores are
+  timecode, and on an NTSC disc the timecode runs slightly slow against the
+  clock: its seconds field ticks every 30 frames while the video actually
+  runs at 30000/1001 frames per second, so 30 frames take 1.001 real
+  seconds, not 1.000. Those times were being read as if they were plain
+  seconds, which is where the missing 0.1% went. They are now converted
+  through an exact frame count, so every mark lands on a real frame
+  boundary no matter how long the title runs. PAL discs were never affected
+  and their timings are unchanged.
+
+  Reported and fixed by AnimeFN (freemkv#25, libfreemkv#1).
+
 ## [1.6.0] — 2026-08-03
 
 ### Fixed

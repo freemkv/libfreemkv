@@ -272,41 +272,102 @@ fn sub_slice(data: &[u8], offset: usize, len: usize) -> Result<&[u8]> {
 
 // ── BCD time parsing ────────────────────────────────────────────────────────
 
-/// Convert DVD BCD playback time (4 bytes) to seconds.
+/// The nominal (timecode) frame rate and the exact real-time frame duration
+/// implied by a DVD `dvd_time_t` rate flag.
 ///
-/// Format: `[hours_bcd, minutes_bcd, seconds_bcd, frames_and_rate]`
+/// This distinction is the whole point of the type: `nominal_fps` is the rate
+/// at which the BCD *seconds* field advances, while `frame_num / frame_den` is
+/// how long a frame actually lasts. For PAL the two agree (25 frames = 1.000 s).
+/// For NTSC they do not: the seconds field advances every 30 frames, but the
+/// video runs at 30000/1001 fps, so 30 frames occupy 1001/1000 real seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DvdRate {
+    /// Frames per timecode second: 25 (PAL) or 30 (NTSC — *not* 29.97).
+    pub nominal_fps: u32,
+    /// Real seconds per frame as an exact rational, `frame_num / frame_den`.
+    pub frame_num: u32,
+    /// Denominator of the exact frame duration.
+    pub frame_den: u32,
+}
+
+impl DvdRate {
+    /// Decode bits 7-6 of `dvd_time_t.frame_u`.
+    ///
+    /// `0b01` = 25 fps (PAL), `0b11` = 30000/1001 fps (NTSC).
+    /// `0b00` and `0b10` are unspecified/reserved and yield `None`.
+    pub fn from_flag(flag: u8) -> Option<DvdRate> {
+        match flag {
+            0x01 => Some(DvdRate {
+                nominal_fps: 25,
+                frame_num: 1,
+                frame_den: 25,
+            }),
+            0x03 => Some(DvdRate {
+                nominal_fps: 30,
+                frame_num: 1001,
+                frame_den: 30000,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Exact real-time seconds for a count of timecode frames.
+    pub fn frames_to_secs(&self, frames: u64) -> f64 {
+        (frames as f64) * (self.frame_num as f64) / (self.frame_den as f64)
+    }
+}
+
+/// Total non-drop-frame timecode frames in a 4-byte DVD BCD time.
+///
+/// Format: `[hours_bcd, minutes_bcd, seconds_bcd, rate_and_frames]`
 ///   - Byte 0: hours in BCD (e.g. 0x01 = 1 hour, 0x12 = 12 hours)
 ///   - Byte 1: minutes in BCD
 ///   - Byte 2: seconds in BCD
 ///   - Byte 3: bits 7-6 = frame rate flag (01=25fps, 11=29.97fps),
 ///     bits 5-0 = frame count in BCD
 ///
-/// Returns 0.0 for invalid BCD digits rather than erroring,
-/// since some authoring tools produce malformed time fields.
-pub fn bcd_to_secs(bcd: &[u8]) -> f64 {
+/// **`dvd_time_t` is a timecode, not elapsed wall-clock time.** The seconds
+/// field advances once every [`DvdRate::nominal_fps`] frames. On NTSC discs
+/// that is every 30 frames, but 30 frames of 30000/1001 fps video last
+/// 1001/1000 s — so reading H:M:S as literal seconds under-reports real time
+/// by exactly 0.1% (3.6 s per hour). Callers that need real seconds must go
+/// through the frame count, which is what [`bcd_to_secs`] does.
+///
+/// Returns `None` when the slice is short or the rate flag is unspecified,
+/// since without a nominal rate the frame count cannot be interpreted.
+pub fn bcd_to_frames(bcd: &[u8]) -> Option<(u64, DvdRate)> {
     if bcd.len() < 4 {
-        return 0.0;
+        return None;
     }
+    let rate = DvdRate::from_flag((bcd[3] >> 6) & 0x03)?;
+    let hours = bcd_byte(bcd[0]) as u64;
+    let minutes = bcd_byte(bcd[1]) as u64;
+    let seconds = bcd_byte(bcd[2]) as u64;
+    let frames = bcd_byte(bcd[3] & 0x3F) as u64;
+    let tc_secs = hours * 3600 + minutes * 60 + seconds;
+    Some((tc_secs * rate.nominal_fps as u64 + frames, rate))
+}
 
-    let hours = bcd_byte(bcd[0]);
-    let minutes = bcd_byte(bcd[1]);
-    let seconds = bcd_byte(bcd[2]);
-
-    let rate_flag = (bcd[3] >> 6) & 0x03;
-    let frame_count = bcd_byte(bcd[3] & 0x3F);
-
-    let fps: f64 = match rate_flag {
-        0x01 => 25.0,
-        0x03 => 29.97,
-        _ => 0.0, // unknown rate — ignore frame contribution
-    };
-
-    let total = (hours as f64) * 3600.0 + (minutes as f64) * 60.0 + (seconds as f64);
-
-    if fps > 0.0 {
-        total + (frame_count as f64) / fps
-    } else {
-        total
+/// Convert DVD BCD playback time (4 bytes) to real elapsed seconds.
+///
+/// See [`bcd_to_frames`] for the layout and for why the timecode must be
+/// converted through a frame count rather than read as literal seconds.
+///
+/// Returns 0.0 for invalid BCD digits rather than erroring, since some
+/// authoring tools produce malformed time fields. When the rate flag is
+/// unspecified the nominal rate is unknowable, so this falls back to reading
+/// H:M:S as literal seconds and ignoring the frame field.
+pub fn bcd_to_secs(bcd: &[u8]) -> f64 {
+    match bcd_to_frames(bcd) {
+        Some((frames, rate)) => rate.frames_to_secs(frames),
+        None => {
+            if bcd.len() < 4 {
+                return 0.0;
+            }
+            (bcd_byte(bcd[0]) as f64) * 3600.0
+                + (bcd_byte(bcd[1]) as f64) * 60.0
+                + (bcd_byte(bcd[2]) as f64)
+        }
     }
 }
 
@@ -838,15 +899,33 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         let mut times = Vec::new();
         if pgm_map_offset > 0 && nr_of_programs > 0 && cell_playback_offset > 0 {
             let pgm_base = pgc_offset + pgm_map_offset;
-            // Collect cell durations
-            let mut cell_durations = Vec::with_capacity(num_cells);
+            // Collect per-cell durations as exact timecode FRAME counts. Summing
+            // frames (integers) and converting once per chapter keeps every mark
+            // on an exact frame boundary — summing f64 seconds would let rounding
+            // drift accumulate across a two-hour title.
+            //
+            // A cell whose rate flag is unspecified has no frame count, so it
+            // contributes plain seconds instead; that is tracked separately and
+            // added on top. In practice a PGC never mixes rates.
+            let mut cell_frames: Vec<(u64, f64)> = Vec::with_capacity(num_cells);
+            let mut rate: Option<DvdRate> = None;
             let cell_base = pgc_offset + cell_playback_offset;
             for i in 0..num_cells {
                 let co = cell_base + i * 24;
-                if co + 8 <= data.len() {
-                    cell_durations.push(bcd_to_secs(&data[co + 4..co + 8]));
-                } else {
-                    cell_durations.push(0.0);
+                if co + 8 > data.len() {
+                    cell_frames.push((0, 0.0));
+                    continue;
+                }
+                let t = &data[co + 4..co + 8];
+                match bcd_to_frames(t) {
+                    Some((f, r)) => {
+                        // First rate wins; a mixed-rate PGC is malformed, and
+                        // reinterpreting earlier cells would be worse than
+                        // staying on the rate the title started in.
+                        rate.get_or_insert(r);
+                        cell_frames.push((f, 0.0));
+                    }
+                    None => cell_frames.push((0, bcd_to_secs(t))),
                 }
             }
             // Program map: each byte is the first cell number (1-based) for that program
@@ -856,10 +935,12 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
                 }
                 let first_cell = data[pgm_base + p] as usize;
                 // Chapter time = sum of cell durations before this program's first cell.
-                // Clamp to cell_durations.len(): a crafted/corrupt IFO can set first_cell
+                // Clamp to cell_frames.len(): a crafted/corrupt IFO can set first_cell
                 // beyond the actual cell count, which would panic the slice index.
-                let end = first_cell.saturating_sub(1).min(cell_durations.len());
-                let time: f64 = cell_durations[..end].iter().sum();
+                let end = first_cell.saturating_sub(1).min(cell_frames.len());
+                let frames: u64 = cell_frames[..end].iter().map(|&(f, _)| f).sum();
+                let extra: f64 = cell_frames[..end].iter().map(|&(_, s)| s).sum();
+                let time = rate.map_or(0.0, |r| r.frames_to_secs(frames)) + extra;
                 times.push(time);
             }
         }
@@ -982,12 +1063,60 @@ mod tests {
 
     #[test]
     fn bcd_to_secs_with_frames() {
-        // 0 hours, 1 minute, 30 seconds, 15 frames at 29.97fps
+        // 0 hours, 1 minute, 30 seconds, 15 frames of NTSC timecode.
         let bcd = [0x00, 0x01, 0x30, 0b11_010101];
         let secs = bcd_to_secs(&bcd);
-        // 0b010101 = 0x15, BCD = 15 frames
-        let expected = 0.0 + 60.0 + 30.0 + 15.0 / 29.97;
-        assert!((secs - expected).abs() < 0.01, "got {}", secs);
+        // 0b010101 = 0x15, BCD = 15 frames.
+        // Timecode 00:01:30:15 is 90*30 + 15 = 2715 frames, and each frame
+        // lasts 1001/30000 s, so real time is 2715*1001/30000 = 90.5905 s
+        // (NOT 90.5 s — NTSC timecode runs 0.1% slow against the clock).
+        let expected = 2715.0 * 1001.0 / 30000.0;
+        assert!((secs - expected).abs() < 1e-9, "got {}", secs);
+        assert!((secs - 90.5905).abs() < 1e-9, "got {}", secs);
+    }
+
+    /// The NTSC 0.1% pull-down must be applied to the whole timecode, not just
+    /// the frame field. Regression test for issue freemkv#25: a title's chapter marks
+    /// drifted ~3.6 s per hour because H:M:S was read as literal seconds.
+    #[test]
+    fn bcd_ntsc_timecode_is_not_literal_seconds() {
+        // One hour of NTSC timecode = 3603.6 s of real time.
+        let one_hour = [0x01, 0x00, 0x00, 0b11_000000];
+        assert!((bcd_to_secs(&one_hour) - 3603.6).abs() < 1e-6);
+        // 00:01:02:00 -> 1860 frames -> 62.062 s (the issue freemkv#25 chapter 2 value).
+        let ch2 = [0x00, 0x01, 0x02, 0b11_000000];
+        assert!((bcd_to_secs(&ch2) - 62.062).abs() < 1e-9);
+        // A 20-minute NTSC episode cell is 00:19:58:24 = 35964 frames.
+        let ep = [0x00, 0x19, 0x58, 0b11_100100];
+        assert_eq!(bcd_to_frames(&ep).unwrap().0, 35964);
+        assert!((bcd_to_secs(&ep) - 1199.9988).abs() < 1e-6);
+    }
+
+    /// PAL timecode is exact (25 frames = 1.000 s), so the fix must leave every
+    /// PAL value bit-identical.
+    #[test]
+    fn bcd_pal_unaffected_by_ntsc_fix() {
+        let pal = [0x01, 0x23, 0x45, 0b01_000000];
+        assert!((bcd_to_secs(&pal) - (3600.0 + 23.0 * 60.0 + 45.0)).abs() < 1e-9);
+        let pal_frames = [0x00, 0x00, 0x10, 0b01_010010]; // 10 s + 12 frames
+        assert!((bcd_to_secs(&pal_frames) - 10.48).abs() < 1e-9);
+        let r = DvdRate::from_flag(0x01).unwrap();
+        assert_eq!((r.nominal_fps, r.frame_num, r.frame_den), (25, 1, 25));
+    }
+
+    #[test]
+    fn dvd_rate_from_flag_rejects_reserved() {
+        assert!(DvdRate::from_flag(0x00).is_none());
+        assert!(DvdRate::from_flag(0x02).is_none());
+        let n = DvdRate::from_flag(0x03).unwrap();
+        assert_eq!((n.nominal_fps, n.frame_num, n.frame_den), (30, 1001, 30000));
+    }
+
+    #[test]
+    fn bcd_to_frames_none_on_short_or_unknown_rate() {
+        assert!(bcd_to_frames(&[0x00, 0x00]).is_none());
+        assert!(bcd_to_frames(&[0x00, 0x00, 0x00, 0b00_000000]).is_none());
+        assert!(bcd_to_frames(&[0x00, 0x00, 0x00, 0b10_000000]).is_none());
     }
 
     #[test]
@@ -1133,12 +1262,16 @@ mod tests {
         pgc[co + 23] = 144; // last sector = 400
 
         let title = parse_pgc(&pgc, 0, 5).unwrap();
-        let expected = 1.0 * 3600.0 + 59.0 * 60.0 + 30.0;
+        // 01:59:30:00 is NTSC *timecode*, so 7170 timecode seconds = 215100
+        // frames, and the real running time is 215100 * 1001/30000 = 7177.17 s.
+        // Reading the BCD as literal seconds (7170.0) was the issue freemkv#25 bug.
+        let expected = 7170.0 * 30.0 * 1001.0 / 30000.0;
         assert!(
-            (title.duration_secs - expected).abs() < 0.1,
+            (title.duration_secs - expected).abs() < 1e-6,
             "expected ~{expected}s, got {}s",
             title.duration_secs
         );
+        assert!((title.duration_secs - 7177.17).abs() < 1e-6);
         assert_eq!(title.chapters, 5);
         assert_eq!(title.cells.len(), 2);
         assert_eq!(title.cells[0].first_sector, 100);
@@ -1393,7 +1526,7 @@ mod tests {
         // 0h 0m 0s, 12 frames at 25fps → 12/25 = 0.48s.
         let bcd = [0x00, 0x00, 0x00, 0b01_010010]; // frame BCD 0x12 = 12
         let secs = bcd_to_secs(&bcd);
-        assert!((secs - 12.0 / 25.0).abs() < 0.001, "got {secs}");
+        assert!((secs - 12.0 / 25.0).abs() < 1e-9, "got {secs}");
     }
 
     /// BCD rate_flag 0b00 (and 0b10) → fps 0.0 → frame count ignored
@@ -1415,8 +1548,9 @@ mod tests {
     #[test]
     fn bcd_frame_count_masks_rate_bits() {
         let bcd = [0x00, 0x00, 0x00, 0b11_100101]; // 0x25 BCD = 25 frames
+        assert_eq!(bcd_to_frames(&bcd).unwrap().0, 25);
         let secs = bcd_to_secs(&bcd);
-        assert!((secs - 25.0 / 29.97).abs() < 0.001, "got {secs}");
+        assert!((secs - 25.0 * 1001.0 / 30000.0).abs() < 1e-9, "got {secs}");
     }
 
     /// BCD hours can exceed 12 (long titles): 0x12 BCD = 12 → but test a
@@ -1686,6 +1820,93 @@ mod tests {
             "got {}",
             title.chapter_times[1]
         );
+    }
+
+    /// Regression test for issue freemkv#25 (NTSC chapter drift).
+    ///
+    /// Builds a PGC from the real cell table of the DOLL_MASTERS_7 disc in the
+    /// bug report and checks the chapter marks against MakeMKV's values. Before
+    /// the fix, chapter 14 landed 4.019 s early; the drift was proportional to
+    /// elapsed time (0.1%), so a short synthetic fixture would not have caught it.
+    #[test]
+    fn pgc_chapter_times_ntsc_no_pulldown_drift() {
+        // (minutes, seconds, frames) of NTSC non-drop-frame timecode per cell.
+        let cells: [(u8, u8, u8); 13] = [
+            (1, 2, 0),
+            (4, 44, 12),
+            (1, 32, 11),
+            (13, 42, 1),
+            (0, 59, 28),
+            (0, 31, 8),
+            (1, 2, 0),
+            (19, 58, 24),
+            (0, 59, 28),
+            (0, 31, 8),
+            (1, 2, 0),
+            (19, 58, 26),
+            (0, 59, 28),
+        ];
+        // Program map: 14 chapters, one per cell boundary (1-based first cell).
+        let pgm: [u8; 14] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+
+        fn bcd(v: u8) -> u8 {
+            ((v / 10) << 4) | (v % 10)
+        }
+
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x02] = pgm.len() as u8;
+        pgc[0x03] = cells.len() as u8;
+        let pgm_off: u16 = 0xEA;
+        pgc[0xE6] = (pgm_off >> 8) as u8;
+        pgc[0xE7] = pgm_off as u8;
+        let cell_off: u16 = pgm_off + pgm.len() as u16;
+        pgc[0xE8] = (cell_off >> 8) as u8;
+        pgc[0xE9] = cell_off as u8;
+        pgc.resize(cell_off as usize + cells.len() * 24, 0);
+        pgc[pgm_off as usize..pgm_off as usize + pgm.len()].copy_from_slice(&pgm);
+        for (i, &(m, s, f)) in cells.iter().enumerate() {
+            let co = cell_off as usize + i * 24;
+            pgc[co + 4] = 0x00; // hours
+            pgc[co + 5] = bcd(m);
+            pgc[co + 6] = bcd(s);
+            pgc[co + 7] = 0xC0 | bcd(f); // rate flag 0b11 = NTSC
+        }
+
+        let title = parse_pgc(&pgc, 0, pgm.len() as u16).unwrap();
+        // MakeMKV / source truth, in seconds.
+        let expected = [
+            0.0,
+            62.062,
+            346.7464,
+            439.205_433_333,
+            1262.0608,
+            1_322.054_066_666,
+            1353.352,
+            1415.414,
+            2615.4128,
+            2_675.406_066_666,
+            2706.704,
+            2768.766,
+            3_968.831_533_333,
+            4028.8248,
+        ];
+        assert_eq!(title.chapter_times.len(), expected.len());
+        for (i, (&got, &want)) in title.chapter_times.iter().zip(&expected).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "chapter {} drifted: got {got}, want {want}",
+                i + 1
+            );
+        }
+        // Every mark must sit on an exact 30000/1001 frame boundary.
+        for (i, &t) in title.chapter_times.iter().enumerate() {
+            let frames = t * 30000.0 / 1001.0;
+            assert!(
+                (frames - frames.round()).abs() < 1e-6,
+                "chapter {} not frame-aligned: {t}",
+                i + 1
+            );
+        }
     }
 
     /// parse_pgc duration: when the PGC-level BCD time is NON-zero it is
@@ -2065,7 +2286,14 @@ mod tests {
         d
     }
 
-    /// BCD playback time of `secs` seconds (< 60) at the 29.97 fps flag.
+    /// BCD playback time of `secs` TIMECODE seconds (< 60) at the NTSC rate
+    /// flag.
+    ///
+    /// The argument is timecode, not real time: every fixture built from this
+    /// helper carries the 0b11 flag, so `secs` timecode seconds are
+    /// `secs * 30` frames and last `secs * 1.001` real seconds. Expectations
+    /// below are written in real seconds and so read 1.001x the argument —
+    /// `bcd_secs(10)` is 10.01 s, not 10 s.
     fn bcd_secs(secs: u8) -> [u8; 4] {
         assert!(secs < 60);
         [0, 0, ((secs / 10) << 4) | (secs % 10), 0b11_000000]
@@ -2088,12 +2316,13 @@ mod tests {
         );
         let title = parse_pgc(&pgc, 0, 3).unwrap();
         assert_eq!(title.cells.len(), 3);
-        assert_eq!(title.cells[0].duration_secs, 10.0);
-        assert_eq!(title.cells[1].duration_secs, 20.0);
-        assert_eq!(title.cells[2].duration_secs, 31.0);
-        assert_eq!(
-            title.duration_secs, 61.0,
-            "recomputed duration must be the sum of the distinct cell times"
+        assert_eq!(title.cells[0].duration_secs, 10.01);
+        assert_eq!(title.cells[1].duration_secs, 20.02);
+        assert_eq!(title.cells[2].duration_secs, 31.031);
+        assert!(
+            (title.duration_secs - 61.061).abs() < 1e-9,
+            "recomputed duration must be the sum of the distinct cell times, got {}",
+            title.duration_secs
         );
     }
 
@@ -2114,7 +2343,7 @@ mod tests {
             None,
         );
         let title = parse_pgc(&pgc, 0, 3).unwrap();
-        assert_eq!(title.chapter_times, vec![0.0, 10.0, 30.0]);
+        assert_eq!(title.chapter_times, vec![0.0, 10.01, 30.03]);
     }
 
     /// A program map offset of 0 means there is no program map, so no chapter
@@ -2169,7 +2398,7 @@ mod tests {
         let title = parse_pgc(&pgc, 0, 2).unwrap();
         assert_eq!(title.cells.len(), 2, "only the readable cells are kept");
         // Program 2 starts at cell 2, so its time is cell 0's duration.
-        assert_eq!(title.chapter_times, vec![0.0, 10.0]);
+        assert_eq!(title.chapter_times, vec![0.0, 10.01]);
     }
 
     /// A program map that runs past the end of the data must stop at the
@@ -2194,7 +2423,7 @@ mod tests {
             "the program map walk must stop exactly at the buffer end"
         );
         assert_eq!(title.chapter_times[0], 0.0);
-        assert_eq!(title.chapter_times[1], 10.0);
+        assert_eq!(title.chapter_times[1], 10.01);
     }
 
     /// The subtitle palette is 16 entries of 4 bytes at PGC+0xA4, each
@@ -2284,19 +2513,19 @@ mod tests {
         // vts_title_num is 1-based: title 2 → PGC index 1.
         let titles = parse_pgcit(&data, 0, &[(5, 2)]).unwrap();
         assert_eq!(titles.len(), 1);
-        assert_eq!(titles[0].duration_secs, 22.0);
+        assert_eq!(titles[0].duration_secs, 22.022);
         assert_eq!(titles[0].cells[0].first_sector, 50);
 
         let titles = parse_pgcit(&data, 0, &[(5, 1)]).unwrap();
         assert_eq!(titles.len(), 1);
-        assert_eq!(titles[0].duration_secs, 11.0);
+        assert_eq!(titles[0].duration_secs, 11.011);
         assert_eq!(titles[0].cells[0].first_sector, 0);
 
         // Both titles, in order.
         let titles = parse_pgcit(&data, 0, &[(5, 1), (7, 2)]).unwrap();
         assert_eq!(titles.len(), 2);
-        assert_eq!(titles[0].duration_secs, 11.0);
-        assert_eq!(titles[1].duration_secs, 22.0);
+        assert_eq!(titles[0].duration_secs, 11.011);
+        assert_eq!(titles[1].duration_secs, 22.022);
     }
 
     /// A VTS_PGCIT whose 8-byte header ends exactly at the end of the data is
