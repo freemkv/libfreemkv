@@ -4,6 +4,14 @@
 
 ### Added
 
+- **A disc kept as a folder can now be read directly.** An extracted `VIDEO_TS`
+  or `BDMV` folder — the shape most backup tools produce — works anywhere a
+  disc image does: `dir://Movie/ mkv://Movie.mkv`, or to any other destination.
+  Previously a folder could only be written, never read back. Folders that are
+  already decrypted need no key; one that still carries an `AACS` directory is
+  judged by its content rather than by the directory's presence, so a decrypted
+  backup is not refused for a leftover folder. 3D folders are refused for now
+  rather than produce a silently wrong result.
 - **An existing disc image can now be decrypted without the disc.**
   `iso://In.iso iso://Out.iso` writes a decrypted image from an encrypted one;
   previously the only way to get a decrypted image was to rip the disc in a
@@ -13,6 +21,20 @@
 
 ### Fixed
 
+- **Blu-ray titles built from several clips could run minutes longer than the
+  film, with sound drifting ahead of picture.** Many discs store the feature as
+  a chain of clips and use the playlist to say which part of each one to play —
+  the parts overlap or skip, and a player follows the playlist's marks. freemkv
+  never read those marks. It joined the clips by guessing from their internal
+  timestamps, so every skipped stretch became dead time in the output and every
+  overlap put the same moment on the timeline twice, which shoved the audio
+  ahead of the video and left it there. One affected title declared 2h11m and
+  contained 2h13m; the worst ran 13 minutes long. Sound came adrift about half
+  an hour in and stayed adrift. The marks are now read, each clip contributes
+  exactly the span the playlist gives it, and every track crosses a join on its
+  own frame — so a title runs exactly as long as the disc says it does. Titles
+  made of a single clip were never affected and are unchanged, as are DVDs and
+  HD-DVDs.
 - Chapter marks and title durations on NTSC DVDs ran roughly 0.1% short —
   about 3.6 seconds per hour — so a mark near the end of a feature could
   land several seconds before the scene it names. On a 67-minute title the
