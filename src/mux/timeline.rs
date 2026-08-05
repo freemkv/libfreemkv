@@ -1,12 +1,25 @@
-//! Shared clip-boundary timeline-continuity corrector.
+//! Shared clip-boundary timeline corrector.
 //!
-//! A BD/UHD title's clips are read as one concatenated sector stream (clip
-//! boundaries / mpls connection_condition are not plumbed to the mux), so at a
-//! non-seamless boundary the source PES PTS jumps backward. Left uncorrected,
-//! that produces a sustained band of non-monotonic block timestamps. Every
-//! muxer/sink that consumes the interleaved per-track PES stream and emits a
-//! monotonic timeline (the MKV muxer, the `demux://` elementary-stream sink)
-//! uses [`TimelineContinuity`] so the correction lives in exactly one place.
+//! A BD/UHD title's clips are read as one concatenated sector stream, so the
+//! source PES PTS does not run continuously across a clip join. There are two
+//! ways to place them, and this module holds both:
+//!
+//! - **From the playlist's marks** ([`SeamPlan`]) — when the title carries
+//!   PlayItem IN/OUT times, each clip contributes exactly `out - in` and the
+//!   clips are laid end to end. This is exact: it closes forward skips, joins
+//!   overlaps without rewinding, and drops material the playlist excludes.
+//! - **By inference** ([`TimelineContinuity::adjust`]) — when there are no
+//!   usable marks (DVD, HD-DVD, `mkv://` / `m2ts://` sources), a backward PTS
+//!   jump larger than [`DISCONTINUITY_BACKSTEP_NS`] is read as a join and
+//!   rebased. Inference cannot see a forward skip, because a forward gap is
+//!   indistinguishable from frames lost to damaged media, and cannot see an
+//!   overlap smaller than the reorder threshold.
+//!
+//! [`TimelineContinuity::map`] picks between them: marks when present,
+//! inference otherwise. Every muxer/sink that consumes the interleaved per-track
+//! PES stream and emits a monotonic timeline (the MKV muxer, the `demux://`
+//! elementary-stream sink) goes through it, so the correction lives in exactly
+//! one place.
 
 /// A backward PTS step larger than this is treated as a clip-boundary
 /// discontinuity (a non-seamless BD clip / dual-layer-break where the source
@@ -78,6 +91,14 @@ pub(crate) struct SeamClip {
 /// and material outside a clip's marks is dropped rather than emitted twice.
 pub(crate) struct SeamPlan {
     clips: Vec<SeamClip>,
+    /// Frames dropped because they fell outside every clip's marks, per track.
+    ///
+    /// A drop is correct — the playlist does not include that material — but a
+    /// SILENT drop is how this codebase has produced complete-looking, wrong
+    /// output before. Counting them means an unexpected volume shows up in the
+    /// log instead of in someone's file, and gives a caller something to assert
+    /// on. Indexed by track alongside `cursors`.
+    dropped: Vec<u64>,
     /// Per-track position: (clip index, last raw PTS seen).
     ///
     /// Each track crosses a join on ITS OWN frame, not on video's. The demuxer
@@ -132,7 +153,20 @@ impl SeamPlan {
         Some(Self {
             clips: out,
             cursors: Vec::new(),
+            dropped: Vec::new(),
         })
+    }
+
+    /// How many frames this track has had dropped for falling outside every
+    /// clip's marks.
+    #[cfg(test)]
+    pub(crate) fn dropped_for(&self, track: usize) -> u64 {
+        self.dropped.get(track).copied().unwrap_or(0)
+    }
+
+    /// Frames dropped across every track.
+    pub(crate) fn dropped_total(&self) -> u64 {
+        self.dropped.iter().fold(0u64, |a, b| a.saturating_add(*b))
     }
 
     /// Total playable duration (ns) — the sum of every clip's `out − in`. This
@@ -150,7 +184,7 @@ impl SeamPlan {
     ///
     /// `None` means DROP: the frame lies outside every clip's marks, so the
     /// playlist does not include it.
-    fn place(&mut self, raw_ns: i64, track: usize) -> Option<i64> {
+    fn place(&mut self, raw_ns: i64, track: usize, drives: bool) -> Option<i64> {
         if self.cursors.len() <= track {
             self.cursors.resize(
                 track + 1,
@@ -159,6 +193,7 @@ impl SeamPlan {
                     last_raw_ns: None,
                 },
             );
+            self.dropped.resize(track + 1, 0);
         }
         let pos = self.cursors[track];
         let mut clip = pos.clip;
@@ -184,8 +219,32 @@ impl SeamPlan {
             // the current position: a bound only from above is satisfied by
             // every later clip's IN too, and the cursor would run to the end of
             // the list on a single backward step.
+            // A backward step means this track has restarted at the next
+            // clip's IN. What counts as "at" differs by track, and getting it
+            // wrong strands a track on the previous clip's offset:
+            //
+            // - VIDEO is dense (a frame every ~42ms at 24fps), so its first
+            //   frame of the new clip lands ON the mark. Requiring that is what
+            //   keeps a B-frame reorder dip near the end of a clip — which is
+            //   also a backward step, and inside the next clip's range during
+            //   an overlap — from being mistaken for a crossing.
+            // - PASSIVE tracks have no reorder, so ANY backward step is a
+            //   crossing. They can also be sparse: a subtitle may have no event
+            //   near the mark at all, and its first frame after the join can
+            //   land well past it. Holding those to the video window left them
+            //   on the old clip until their PTS passed its OUT, mistiming them
+            //   by the overlap in between.
+            //
+            // Both forms still require the frame to land at or after the next
+            // IN, which is what stops one backward step walking the cursor to
+            // the end of the list.
             let stepped_back = pos.last_raw_ns.is_some_and(|last| raw_ns < last)
-                && (raw_ns.saturating_sub(next_in)).abs() <= CLIP_START_TOLERANCE_NS;
+                && if drives {
+                    (raw_ns.saturating_sub(next_in)).abs() <= CLIP_START_TOLERANCE_NS
+                } else {
+                    raw_ns >= next_in.saturating_sub(CLIP_START_TOLERANCE_NS)
+                        && raw_ns <= self.clips[clip + 1].out_ns
+                };
             if past_out || stepped_back {
                 clip += 1;
             } else {
@@ -199,16 +258,37 @@ impl SeamPlan {
             last_raw_ns: Some(raw_ns),
         };
         if raw_ns < c.in_ns || raw_ns > c.out_ns {
+            self.dropped[track] = self.dropped[track].saturating_add(1);
+            // Once per track, and only on the first drop: a join legitimately
+            // drops a handful of frames, so this must not become per-frame
+            // noise on a normal title. The total is available to callers.
+            if self.dropped[track] == 1 {
+                tracing::debug!(
+                    target: "freemkv::mux",
+                    track,
+                    clip,
+                    raw_ns,
+                    in_ns = c.in_ns,
+                    out_ns = c.out_ns,
+                    "frame outside the playlist's clip marks; dropping"
+                );
+            }
             return None;
         }
         Some(raw_ns.saturating_add(c.offset_ns))
     }
 }
 
-/// Global timeline-continuity corrector. freemkv reads a BD title's clips as
-/// one concatenated sector stream (clip boundaries / mpls connection_condition
-/// are not plumbed to the mux), so at a non-seamless boundary the source PES
-/// PTS jumps backward. Left uncorrected, that produces a sustained band of
+/// Global timeline corrector.
+///
+/// Holds a [`SeamPlan`] when the title's PlayItem marks are usable, and falls
+/// back to the PTS-jump inference described below when they are not. The
+/// inference documentation that follows applies to the FALLBACK path only —
+/// under a plan, placement comes from the marks and none of the epoch/frontier
+/// reasoning below decides anything.
+///
+/// freemkv reads a BD title's clips as one concatenated sector stream, so at a
+/// non-seamless boundary the source PES PTS jumps backward. Left uncorrected, that produces a sustained band of
 /// non-monotonic block timestamps (a downstream muxer then derives
 /// non-monotonic DTS from them).
 ///
@@ -286,6 +366,15 @@ impl TimelineContinuity {
         }
     }
 
+    /// Total frames dropped for falling outside the playlist's clip marks.
+    ///
+    /// Zero for a title without a seam plan. A muxer reports this when it
+    /// finishes so a drop is never invisible: dropping is correct at a join,
+    /// but an unexpected VOLUME of drops is how output ends up quietly short.
+    pub(crate) fn dropped_total(&self) -> u64 {
+        self.seams.as_ref().map_or(0, |p| p.dropped_total())
+    }
+
     /// Map a raw PES PTS onto the output timeline, or `None` to drop the frame.
     ///
     /// Dropping only ever happens under a [`SeamPlan`]: it is material outside
@@ -295,7 +384,7 @@ impl TimelineContinuity {
             // Take the plan out for the call so `place` can borrow `self`
             // mutably without fighting the borrow checker over the whole struct.
             let mut plan = self.seams.take().expect("checked is_some");
-            let placed = plan.place(raw_pts_ns, track);
+            let placed = plan.place(raw_pts_ns, track, drives_epoch);
             self.seams = Some(plan);
             if let Some(p) = placed {
                 // Keep the frontier meaningful for anything that reads it, and
@@ -542,11 +631,13 @@ mod tests {
             let out_ns = mpls_ticks_to_ns(c.out_time);
             // First frame of the clip lands at the running total.
             let got = plan
-                .place(in_ns, 0)
+                .place(in_ns, 0, true)
                 .expect("clip start is inside its marks");
             assert_eq!(got, expected_start, "clip {i} start misplaced");
             // Last frame lands at the running total plus the clip's length.
-            let end = plan.place(out_ns, 0).expect("clip end is inside its marks");
+            let end = plan
+                .place(out_ns, 0, true)
+                .expect("clip end is inside its marks");
             assert_eq!(
                 end,
                 expected_start + (out_ns - in_ns),
@@ -574,8 +665,8 @@ mod tests {
             c3_in - c2_out > 9_000_000_000,
             "fixture should contain the ~9.17s skip"
         );
-        let end_of_2 = plan.place(c2_out, 0).expect("in clip 2");
-        let start_of_3 = plan.place(c3_in, 0).expect("in clip 3");
+        let end_of_2 = plan.place(c2_out, 0, true).expect("in clip 2");
+        let start_of_3 = plan.place(c3_in, 0, true).expect("in clip 3");
         assert_eq!(
             start_of_3, end_of_2,
             "clip 3 must begin exactly where clip 2 ended — the skip is not content"
@@ -596,21 +687,23 @@ mod tests {
         let c1_in = mpls_ticks_to_ns(clips[1].in_time);
         assert!(c1_in < c0_out, "fixture should contain the overlap");
         // Play clip 0 through to its OUT mark.
-        let last_of_0 = plan.place(c0_out, 0).expect("clip 0 OUT is inside clip 0");
+        let last_of_0 = plan
+            .place(c0_out, 0, true)
+            .expect("clip 0 OUT is inside clip 0");
         // The next clip opens ON its IN mark. Under the old inference this was a
         // 1.79s backward step, below the reorder threshold, so no seam was
         // recognised and the join was emitted as duplicate content whose
         // timestamps then collided. With the marks known, clip 1 is placed to
         // continue exactly where clip 0 ended: one monotonic timeline, no
         // rewind, and no collision for the muxer to flatten.
-        let first_of_1 = plan.place(c1_in, 0).expect("clip 1 IN");
+        let first_of_1 = plan.place(c1_in, 0, true).expect("clip 1 IN");
         assert_eq!(
             first_of_1, last_of_0,
             "clip 1 must continue from clip 0's end, not rewind by the overlap"
         );
         // And the timeline keeps moving forward from there.
         let into_1 = plan
-            .place(c1_in + 1_000_000_000, 0)
+            .place(c1_in + 1_000_000_000, 0, true)
             .expect("1s into clip 1");
         assert_eq!(
             into_1,
@@ -628,12 +721,142 @@ mod tests {
         let c0_out = mpls_ticks_to_ns(clips[0].out_time);
         let c1_in = mpls_ticks_to_ns(clips[1].in_time);
         // Video crosses into clip 1.
-        plan.place(c1_in + 500_000_000, 0).expect("in clip 1");
+        plan.place(c1_in + 500_000_000, 0, true).expect("in clip 1");
         // A straggler from clip 0's tail arrives afterwards.
         let tail = c0_out - 50_000_000; // 50ms before clip 0's OUT
-        let placed = plan.place(tail, 1).expect("straggler must be placed");
+        let placed = plan
+            .place(tail, 1, false)
+            .expect("straggler must be placed");
         let expected = tail + (0i64 - mpls_ticks_to_ns(clips[0].in_time));
         assert_eq!(placed, expected, "straggler must ride clip 0's offset");
+    }
+
+    /// `map()`'s seam-plan branch — the glue between `SeamPlan::place` and the
+    /// frontier/offset bookkeeping — was untested. Audit finding: a wrong
+    /// operand in `offset_ns = p - raw_pts_ns`, or a stale `high_ns` across a
+    /// join, would corrupt downstream cluster timing and no test would notice.
+    #[test]
+    fn map_under_a_seam_plan_tracks_offset_and_frontier() {
+        let clips = seamless_branching_clips();
+        let mut tc = TimelineContinuity::with_clips(&clips);
+        assert!(tc.seams.is_some(), "a multi-clip title must get a plan");
+
+        let c0_in = mpls_ticks_to_ns(clips[0].in_time);
+        let c0_out = mpls_ticks_to_ns(clips[0].out_time);
+
+        let first = tc.map(c0_in, true, 0).expect("first frame");
+        assert_eq!(first, 0, "clip 0 starts the output timeline at zero");
+        assert_eq!(
+            tc.offset_ns, -c0_in,
+            "offset is the correction actually applied"
+        );
+        assert_eq!(tc.high_ns, Some(0), "video advances the frontier");
+
+        let later = tc.map(c0_in + 5_000_000_000, true, 0).expect("later frame");
+        assert_eq!(later, 5_000_000_000);
+        assert_eq!(tc.high_ns, Some(5_000_000_000), "frontier follows video");
+
+        // A passive track must NOT advance the frontier.
+        let before = tc.high_ns;
+        tc.map(c0_in + 1_000_000_000, false, 1).expect("audio");
+        assert_eq!(tc.high_ns, before, "passive tracks never move the frontier");
+
+        // Across the join the frontier keeps rising, never rewinds.
+        let across = tc.map(c0_out, true, 0).expect("clip 0 OUT");
+        assert!(
+            across >= 5_000_000_000,
+            "timeline must not rewind at a join"
+        );
+    }
+
+    /// A frame outside every clip's marks is dropped, and the drop is COUNTED.
+    /// Audit finding: an uncounted drop is the silent-wrong-output shape this
+    /// project has shipped before.
+    #[test]
+    fn frames_outside_the_marks_are_dropped_and_counted() {
+        let clips = seamless_branching_clips();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let c0_in = mpls_ticks_to_ns(clips[0].in_time);
+        assert_eq!(plan.place(c0_in - 5_000_000_000, 0, true), None, "dropped");
+        assert_eq!(plan.dropped_for(0), 1, "and counted");
+        assert_eq!(plan.dropped_for(1), 0, "counted per track, not globally");
+        plan.place(c0_in, 0, true).expect("inside");
+        assert_eq!(
+            plan.dropped_for(0),
+            1,
+            "a placed frame must not count as dropped"
+        );
+    }
+
+    /// A SPARSE passive track crosses even when its first frame after the join
+    /// lands well past the mark.
+    ///
+    /// Audit finding. A PGS subtitle track may have no event near a clip's IN
+    /// at all. Holding it to the dense-video window (250ms either side of the
+    /// mark) left it on the PREVIOUS clip's offset until its PTS finally passed
+    /// that clip's OUT — mistiming every subtitle in between by the overlap,
+    /// 1.79s on the measured title.
+    #[test]
+    fn a_sparse_passive_track_crosses_late() {
+        let clips = seamless_branching_clips();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let c0_in = mpls_ticks_to_ns(clips[0].in_time);
+        let c0_out = mpls_ticks_to_ns(clips[0].out_time);
+        let c1_in = mpls_ticks_to_ns(clips[1].in_time);
+
+        // The track's last event in clip 0, near its OUT.
+        let tail = c0_out - 100_000_000;
+        let placed_tail = plan.place(tail, 1, false).expect("clip 0 tail");
+        assert_eq!(placed_tail, tail - c0_in, "tail rides clip 0's offset");
+
+        // Its first event in clip 1 steps BACK (the clips overlap) but lands
+        // 400ms past the IN mark, because the track is sparse and had no event
+        // sitting on the mark. The old window was +/-250ms, so this was missed
+        // and the event stayed on clip 0 — mistimed by the overlap.
+        let late = c1_in + 400_000_000;
+        assert!(late < tail, "fixture: this is a backward step");
+        assert!(
+            (late - c1_in) > CLIP_START_TOLERANCE_NS,
+            "fixture: further past the mark than the video window allows"
+        );
+        let got = plan
+            .place(late, 1, false)
+            .expect("late event must be placed");
+
+        let clip1_offset = (c0_out - c0_in) - c1_in;
+        assert_eq!(
+            got,
+            late + clip1_offset,
+            "sparse track must cross to clip 1"
+        );
+        assert!(got > placed_tail, "and must not rewind the timeline");
+    }
+
+    /// A video reorder dip inside the overlap window must NOT be read as a
+    /// crossing. This is the other side of the sparse-track fix: video keeps
+    /// the tight window precisely because its backward steps are also reorder.
+    #[test]
+    fn a_video_reorder_dip_in_the_overlap_is_not_a_crossing() {
+        let clips = seamless_branching_clips();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let c0_out = mpls_ticks_to_ns(clips[0].out_time);
+        let c1_in = mpls_ticks_to_ns(clips[1].in_time);
+        // Video near the end of clip 0 — inside the overlap, so these PTS are
+        // also inside clip 1's range.
+        let a = c0_out - 300_000_000;
+        let base = plan.place(a, 0, true).expect("in clip 0");
+        // A reorder dip of ~42ms: backward, and >= clip 1's IN.
+        let dip = a - 42_000_000;
+        assert!(
+            dip >= c1_in,
+            "fixture: the dip is inside clip 1's range too"
+        );
+        let got = plan.place(dip, 0, true).expect("dip placed");
+        assert_eq!(
+            got,
+            base - 42_000_000,
+            "a reorder dip must stay on clip 0, not jump to clip 1's offset"
+        );
     }
 
     /// Each track crosses a join on its OWN frame.
@@ -657,17 +880,17 @@ mod tests {
 
         // Audio (track 1) runs up to near clip 0's OUT.
         let tail = c0_out - 200_000_000;
-        plan.place(c0_in, 1).expect("audio start");
-        let a_tail = plan.place(tail, 1).expect("audio tail");
+        plan.place(c0_in, 1, false).expect("audio start");
+        let a_tail = plan.place(tail, 1, false).expect("audio tail");
 
         // Video (track 0) crosses into clip 1 first.
-        plan.place(c0_out, 0).expect("video at clip 0 OUT");
-        plan.place(c1_in, 0).expect("video at clip 1 IN");
+        plan.place(c0_out, 0, true).expect("video at clip 0 OUT");
+        plan.place(c1_in, 0, true).expect("video at clip 1 IN");
 
         // Audio's NEXT tail frame still belongs to clip 0 and must stay there —
         // contiguous with the previous one, not thrown forward by the overlap.
         let a_tail2 = plan
-            .place(tail + 10_000_000, 1)
+            .place(tail + 10_000_000, 1, false)
             .expect("audio tail continues");
         assert_eq!(
             a_tail2 - a_tail,
@@ -677,7 +900,7 @@ mod tests {
 
         // When audio itself steps back to clip 1's IN, it crosses — and lands
         // after its own tail, with no rewind and no collision.
-        let a_new = plan.place(c1_in, 1).expect("audio crosses");
+        let a_new = plan.place(c1_in, 1, false).expect("audio crosses");
         assert!(
             a_new > a_tail2,
             "audio must not rewind at the join (got {a_new} after {a_tail2})"
@@ -715,7 +938,7 @@ mod tests {
             6_410_000_000_000,
         ] {
             assert_eq!(
-                plan.place(t, 0),
+                plan.place(t, 0, true),
                 Some(t),
                 "contiguous clips must not move a frame (t={t})"
             );
