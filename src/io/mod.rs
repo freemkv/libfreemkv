@@ -31,6 +31,7 @@ pub(crate) mod bounded;
 pub mod byte_prefetcher;
 pub mod file_sector_source;
 pub mod fsync;
+pub mod image_writer;
 pub mod sink;
 mod writeback;
 mod writeback_file;

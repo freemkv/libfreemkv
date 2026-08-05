@@ -243,6 +243,8 @@ pub const E_SYNC_WORKER_LOST: u16 = 9057;
 /// READ CAPACITY returned a short or overflowing transfer.
 pub const E_DISC_CAPACITY_MALFORMED: u16 = 9047;
 pub const E_DRIVE_INQUIRY_SHORT: u16 = 9058;
+pub const E_SHORT_IMAGE_READ: u16 = 9059;
+pub const E_EMPTY_IMAGE: u16 = 9060;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -371,6 +373,22 @@ pub enum Error {
         index: usize,
         count: usize,
     },
+    /// An image-level write read fewer bytes than the sector count it asked for.
+    ///
+    /// Distinct from [`Error::IoError`] on purpose: the read SUCCEEDED and simply
+    /// returned less than a whole sector run, which for a file-backed source means
+    /// the source is shorter than its declared capacity. Zero-filling the gap
+    /// would produce an image that looks complete and is not — the worst outcome
+    /// for a copy someone intends to keep — so it is an error instead.
+    ShortImageRead {
+        lba: u32,
+        expected: u32,
+        got: u32,
+    },
+    /// An image-level write was asked for zero sectors. A zero-byte image is
+    /// never the intent, and reporting it here names the problem at the point it
+    /// is knowable rather than leaving an empty file behind.
+    EmptyImage,
     IfoParse,
     /// A title produced NO muxable frames: the mux driver's pump ended without
     /// any video track's `codec_private` resolving, or the MKV muxer reached
@@ -744,6 +762,8 @@ impl Error {
             Error::UdfNotFilesystem => E_UDF_NOT_FILESYSTEM,
             Error::UdfBufferTooSmall => E_UDF_BUFFER_TOO_SMALL,
             Error::DiscTitleRange { .. } => E_DISC_TITLE_RANGE,
+            Error::ShortImageRead { .. } => E_SHORT_IMAGE_READ,
+            Error::EmptyImage => E_EMPTY_IMAGE,
             Error::IfoParse => E_IFO_PARSE,
             Error::MkvInvalid => E_MKV_INVALID,
             Error::MkvSourceInvalid => E_MKV_SOURCE_INVALID,

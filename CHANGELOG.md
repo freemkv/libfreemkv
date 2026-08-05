@@ -2,6 +2,15 @@
 
 ## [1.6.1]
 
+### Added
+
+- **An existing disc image can now be decrypted without the disc.**
+  `iso://In.iso iso://Out.iso` writes a decrypted image from an encrypted one;
+  previously the only way to get a decrypted image was to rip the disc in a
+  drive. Ripping from a drive is unchanged and still uses the recovery path —
+  multi-pass retry, resume, damage handling — because that machinery exists for
+  media that returns read errors, which a file does not.
+
 ### Fixed
 
 - Chapter marks and title durations on NTSC DVDs ran roughly 0.1% short —
