@@ -156,8 +156,8 @@ impl SeamPlan {
                 let cur_out = self.clips[self.cursor].out_ns;
                 let next_in = self.clips[self.cursor + 1].in_ns;
                 let past_out = raw_ns > cur_out;
-                let at_next_in = raw_ns >= next_in
-                    && raw_ns <= next_in.saturating_add(CLIP_START_TOLERANCE_NS);
+                let at_next_in =
+                    raw_ns >= next_in && raw_ns <= next_in.saturating_add(CLIP_START_TOLERANCE_NS);
                 if past_out || at_next_in {
                     self.cursor += 1;
                 } else {
@@ -524,11 +524,19 @@ mod tests {
             let in_ns = mpls_ticks_to_ns(c.in_time);
             let out_ns = mpls_ticks_to_ns(c.out_time);
             // First frame of the clip lands at the running total.
-            let got = plan.place(in_ns, true).expect("clip start is inside its marks");
+            let got = plan
+                .place(in_ns, true)
+                .expect("clip start is inside its marks");
             assert_eq!(got, expected_start, "clip {i} start misplaced");
             // Last frame lands at the running total plus the clip's length.
-            let end = plan.place(out_ns, true).expect("clip end is inside its marks");
-            assert_eq!(end, expected_start + (out_ns - in_ns), "clip {i} end misplaced");
+            let end = plan
+                .place(out_ns, true)
+                .expect("clip end is inside its marks");
+            assert_eq!(
+                end,
+                expected_start + (out_ns - in_ns),
+                "clip {i} end misplaced"
+            );
             expected_start += out_ns - in_ns;
         }
         assert!(
@@ -573,7 +581,9 @@ mod tests {
         let c1_in = mpls_ticks_to_ns(clips[1].in_time);
         assert!(c1_in < c0_out, "fixture should contain the overlap");
         // Play clip 0 through to its OUT mark.
-        let last_of_0 = plan.place(c0_out, true).expect("clip 0 OUT is inside clip 0");
+        let last_of_0 = plan
+            .place(c0_out, true)
+            .expect("clip 0 OUT is inside clip 0");
         // The next clip opens ON its IN mark. Under the old inference this was a
         // 1.79s backward step, below the reorder threshold, so no seam was
         // recognised and the join was emitted as duplicate content whose
@@ -589,7 +599,11 @@ mod tests {
         let into_1 = plan
             .place(c1_in + 1_000_000_000, true)
             .expect("1s into clip 1");
-        assert_eq!(into_1, first_of_1 + 1_000_000_000, "clip 1 advances normally");
+        assert_eq!(
+            into_1,
+            first_of_1 + 1_000_000_000,
+            "clip 1 advances normally"
+        );
     }
 
     /// A lagging audio/subtitle frame from the clip that just ended is placed in
@@ -632,7 +646,13 @@ mod tests {
             .collect();
         let mut plan = SeamPlan::from_clips(&clips).expect("plan");
         // Every frame maps to itself: offset 0 throughout, no discontinuity.
-        for &t in &[0i64, 1_000_000_000, 2_948_000_000_000, 2_949_000_000_000, 6_410_000_000_000] {
+        for &t in &[
+            0i64,
+            1_000_000_000,
+            2_948_000_000_000,
+            2_949_000_000_000,
+            6_410_000_000_000,
+        ] {
             assert_eq!(
                 plan.place(t, true),
                 Some(t),
