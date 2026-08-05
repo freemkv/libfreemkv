@@ -106,6 +106,7 @@ pub mod consts;
 pub mod css;
 pub mod decrypt;
 pub mod diag;
+pub mod dirimage;
 pub mod disc;
 pub mod drive;
 pub mod dvdnav;
@@ -148,7 +149,8 @@ pub use drive::{Drive, DriveStatus, extract_scsi_context, find_drive};
 // Owns the `Drive` by value; forwards consumer-built key material into
 // `ScanOptions` (the library derives no certs — see `KeySpec`).
 pub use session::{
-    DeviceTarget, DiscSession, KeySourceFactory, KeySpec, ResolvedKeys, resolve_keys_for, scan_iso,
+    DeviceTarget, DiscSession, KeySourceFactory, KeySpec, ResolvedKeys, resolve_keys_for, scan_dir,
+    scan_iso,
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -228,6 +230,7 @@ pub use decrypt::{AacsKeyMap, DecryptKeys, decrypt_sectors, decrypt_threads, set
 // — not the `pes::Stream` trait re-exported below as `PesStream`. Two
 // different concepts, the same short name; the trait gets the `Pes`
 // prefix at the crate root to keep both addressable.
+pub use dirimage::DirImage;
 pub use disc::{
     AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, Disc,
     DiscFormat, DiscId, DiscTitle, DriveCredentials, Extent, ExtractOptions, ExtractResult,
