@@ -127,11 +127,28 @@ impl DirImage {
         let mut files = Vec::with_capacity(nodes.len());
         let mut ranges = Vec::new();
         for (idx, node) in nodes.iter().enumerate() {
+            // Carry the plan-time mtime ONLY for files whose CONTENT the plan
+            // read — the DVD IFOs, whose bytes 0xC0/0xC4 decide where every VOB
+            // is placed (`layout::place_video_ts` -> `read_head`).
+            //
+            // For every other file the plan depends on the SIZE alone, and size
+            // is already checked. Comparing mtime on those buys nothing and
+            // costs real false positives: disc backups commonly live on
+            // exFAT/FAT32, which stores local time, so a long rip spanning a
+            // DST transition sees a whole-hour shift on a file nobody touched
+            // and would abort hours in, blaming a change that did not happen.
+            // The multi-gigabyte VOBs are exactly the files a long rip re-opens
+            // after the handle cache evicts them.
+            let content_sensitive = node
+                .disc_path
+                .rsplit('.')
+                .next()
+                .is_some_and(|e| e.eq_ignore_ascii_case("IFO"));
             files.push(FileRef {
                 host: node.host.clone(),
                 disc_path: node.disc_path.clone(),
                 size: node.size,
-                mtime: node.mtime,
+                mtime: content_sensitive.then_some(node.mtime).flatten(),
             });
             let mut offset = 0u64;
             for e in &node.extents {
