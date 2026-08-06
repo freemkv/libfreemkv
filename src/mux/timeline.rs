@@ -120,6 +120,14 @@ pub(crate) struct SeamPlan {
 struct TrackPos {
     clip: usize,
     last_raw_ns: Option<i64>,
+    /// The last OUTPUT timestamp emitted for this track.
+    ///
+    /// The placement rules are heuristics over marks; this is the invariant
+    /// they exist to serve — a track's output must never run backwards. Three
+    /// successive audit rounds found a different hole in the heuristics, each
+    /// silently losing content or rewinding, so the invariant is now checked
+    /// directly rather than inferred from which rule happened to fire.
+    last_out_ns: Option<i64>,
 }
 
 impl SeamPlan {
@@ -210,6 +218,7 @@ impl SeamPlan {
                 TrackPos {
                     clip: 0,
                     last_raw_ns: None,
+                    last_out_ns: None,
                 },
             );
             self.dropped.resize(track + 1, 0);
@@ -229,59 +238,6 @@ impl SeamPlan {
         //   so the backward step to the next clip's IN is the crossing — and it
         //   is per track, which is why the cursor has to be per track too.
         //
-        // A backward step too large to be B-frame reorder is a NEW CLIP'S FILE
-        // starting, and it must be handled before the per-track rules below.
-        //
-        // Those rules require the frame to land at (or just below) the next
-        // clip's IN mark, which is right for the dense case and wrong here:
-        // nothing upstream trims a clip's stream to its marks, so a clip's file
-        // can open with material from BEFORE its IN. Measured on the real
-        // 00801.mpls table in this file: with the cursor on clip 5
-        // (7708.99..7910.79) a frame at 7845.00 — clip 6's pre-mark lead-in,
-        // 8s below clip 6's IN of 7853.00 — is more than the 250ms tolerance
-        // from that mark, so neither rule fires, the cursor stays on clip 5,
-        // and 7845.00 is INSIDE clip 5's range so the frame is placed with clip
-        // 5's offset. Output went BACKWARDS 65s and `dropped` stayed 0: no
-        // counter, no gate, nothing noticed, and the whole overlap band was
-        // emitted a second time on top of clip 5's already-written tail.
-        //
-        // A jump this large cannot be reorder, so advance to the first clip
-        // that could still contain the frame. That terminates on its own — it
-        // stops at containment rather than running to the end of the list,
-        // which is what the `next_in` bound below exists to prevent — and any
-        // frame left before its clip's IN is material the playlist EXCLUDES, so
-        // the containment check at the end drops and counts it.
-        let big_backstep = pos
-            .last_raw_ns
-            .is_some_and(|last| last.saturating_sub(raw_ns) > DISCONTINUITY_BACKSTEP_NS);
-        // A track's own PTS only ever runs forward INSIDE a clip, so a backward
-        // step this large is always a clip change: advance at least one, then
-        // skip any clip the frame is already past. Terminates at the first clip
-        // that could contain it; a frame still below that clip's IN is
-        // pre-mark material and the containment check drops and counts it.
-        // ...and ONLY when the frame would otherwise be wrongly PLACED, i.e. it
-        // falls inside the current clip's marks.
-        //
-        // That qualifier is the whole safety of this branch. Advancing on any
-        // large backstep strands the track permanently: a corrupt PTS, or a
-        // legitimate STC discontinuity inside one clip, is also a >3s backstep,
-        // and once the cursor moves forward nothing moves it back — a forward
-        // step matches neither `past_out` nor `stepped_back`. Every later frame
-        // then sits below the new clip's IN and is dropped, so a track can lose
-        // a clip's worth of content (~17 minutes on the fixture table) while the
-        // only volume gate compares total drops against ALL tracks' frames.
-        //
-        // A frame OUTSIDE the current clip's marks needs no help: the
-        // containment check at the end drops and counts it, and the cursor stays
-        // put so the next good frame is placed normally. Only a frame INSIDE
-        // them would be silently placed at the old offset, which is the rewind.
-        let inside_current = raw_ns >= self.clips[clip].in_ns && raw_ns <= self.clips[clip].out_ns;
-        if big_backstep && inside_current && clip + 1 < self.clips.len() {
-            clip += 1;
-            while clip + 1 < self.clips.len() && raw_ns > self.clips[clip].out_ns {
-                clip += 1;
-            }
-        }
         // Bounded by the clip count, so a wild PTS cannot spin here.
         while clip + 1 < self.clips.len() {
             let cur = self.clips[clip];
@@ -335,12 +291,64 @@ impl SeamPlan {
             }
         }
 
+        // ── The invariant ────────────────────────────────────────────────
+        //
+        // Everything above is a heuristic over marks. THIS is the property they
+        // exist to serve: a track's output must not run backwards. Checking it
+        // directly, rather than trusting whichever rule fired, is what closes
+        // the whole class of defect three audit rounds kept finding here — a
+        // stale cursor placing a frame at the previous clip's offset (measured
+        // once at 65 seconds of rewind, with nothing counting it).
+        //
+        // The tolerance is DISCONTINUITY_BACKSTEP_NS because B-frame reorder
+        // legitimately emits out of order by a fraction of a second; a rewind
+        // that matters is orders of magnitude larger. A candidate that fails it
+        // is not placed on that clip: the scan below looks for a LATER clip
+        // containing this frame that does not rewind — which is exactly what a
+        // genuine overlap crossing looks like — and if none exists the frame is
+        // dropped and counted, because emitting it anywhere would move the
+        // track backwards.
+        let rewinds = |cand: usize| -> bool {
+            match self.cursors[track].last_out_ns {
+                Some(last) => {
+                    let out = raw_ns.saturating_add(self.clips[cand].offset_ns);
+                    last.saturating_sub(out) > DISCONTINUITY_BACKSTEP_NS
+                }
+                None => false,
+            }
+        };
+        if rewinds(clip) {
+            // Move the cursor ONLY if a later clip actually accepts this frame.
+            // Leaving it where it was is what makes a bad frame recoverable:
+            // advancing on a failed search is how a corrupt PTS strands a track
+            // for the rest of a clip, since nothing walks the cursor back.
+            let mut found = None;
+            let mut cand = clip;
+            while cand + 1 < self.clips.len() {
+                cand += 1;
+                let cc = self.clips[cand];
+                if raw_ns >= cc.in_ns && raw_ns <= cc.out_ns && !rewinds(cand) {
+                    found = Some(cand);
+                    break;
+                }
+            }
+            if let Some(c) = found {
+                clip = c;
+            }
+        }
+
         let c = self.clips[clip];
+        let placed = raw_ns >= c.in_ns && raw_ns <= c.out_ns && !rewinds(clip);
         self.cursors[track] = TrackPos {
             clip,
             last_raw_ns: Some(raw_ns),
+            last_out_ns: if placed {
+                Some(raw_ns.saturating_add(c.offset_ns))
+            } else {
+                self.cursors[track].last_out_ns
+            },
         };
-        if raw_ns < c.in_ns || raw_ns > c.out_ns {
+        if !placed {
             self.dropped[track] = self.dropped[track].saturating_add(1);
             // Once per track, and only on the first drop: a join legitimately
             // drops a handful of frames, so this must not become per-frame
@@ -755,6 +763,59 @@ mod tests {
             1_000_000_000,
             "the recovered frame must land 1s after the last good one, on the same clip"
         );
+    }
+
+    /// The three placements audit round 7 enumerated, which the previous
+    /// mark-heuristic guards all got wrong in different ways.
+    ///
+    /// The property asserted is the one that matters and the one the heuristics
+    /// only approximated: a track's output never runs backwards, and a bad
+    /// frame never strands the cursor. Numbers are from the real 00801.mpls
+    /// table below.
+    #[test]
+    fn output_never_rewinds_and_a_bad_frame_never_strands() {
+        let clips = seamless_branching_clips();
+
+        // (1) A clip's own file opening ON its IN mark, after a tail frame past
+        //     the previous clip's OUT already advanced the cursor. The old
+        //     guard read that as a crossing and jumped a clip too far, dropping
+        //     ~28 minutes.
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let tail = plan.place(7_910_830_000_000, 0, true).expect("tail placed");
+        let open = plan.place(7_853_000_000_000, 0, true);
+        if let Some(open) = open {
+            assert!(open >= tail, "clip 6 opening rewound the output");
+        }
+        // Whatever happened to that frame, the clip must still play: a frame
+        // well inside clip 6 has to be placed, not stranded.
+        let mid = plan.place(9_000_000_000_000, 0, true);
+        assert!(mid.is_some(), "clip 6 was stranded and 28 minutes lost");
+
+        // (2) The LAST clip. The old guard skipped itself there (`clip + 1 <
+        //     len`), leaving the rewind completely unguarded at the 9->10 seam.
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let a = plan
+            .place(10_030_000_000_000, 1, false)
+            .expect("clip 9 tail");
+        if let Some(b) = plan.place(9_954_375_000_000, 1, false) {
+            assert!(
+                b >= a,
+                "the last clip rewound the output by {}s",
+                (a - b) as f64 / 1e9
+            );
+        }
+
+        // (3) A glitch in the MIDDLE of a long clip. It satisfies "inside the
+        //     current clip", so the old guard advanced and stranded the rest.
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let good = plan
+            .place(9_000_000_000_000, 0, true)
+            .expect("clip 6 frame");
+        let _ = plan.place(8_995_000_000_000, 0, true); // glitched, may drop
+        let after = plan
+            .place(9_001_000_000_000, 0, true)
+            .expect("the clip must keep playing after one bad timestamp");
+        assert!(after >= good, "a mid-clip glitch rewound the output");
     }
 
     /// Build a real seamless-branching clip table (`00801.mpls`, 11 PlayItems, marks
