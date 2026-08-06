@@ -20,6 +20,10 @@ fn css_descramble_sector_roundtrip_via_public_api() {
     };
 
     let mut sector = vec![0xAAu8; 2048];
+    // Real scrambled DVD sectors are MPEG-2 PS packs, and the public API now
+    // requires the pack start code as well as the flag bits — byte 0x14 means
+    // something else entirely in an IFO or UDF sector.
+    sector[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
     sector[0x14] = 0x30;
     sector[0x54..0x59].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
     let original = sector.clone();

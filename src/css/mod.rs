@@ -339,7 +339,25 @@ fn crack_key_scan(
 }
 
 /// Descramble a single CSS-encrypted sector in place.
+///
+/// A no-op unless the sector is a scrambled MPEG-2 PS PACK. The pack start code
+/// is checked, not just the byte 0x14 flag bits, for the same reason
+/// `descramble_region` checks it: 0x14 only means "scrambling control" inside a
+/// pack, and in an IFO it is whatever that format stores there. A real
+/// `VIDEO_TS.IFO` sector holds 0x15 there while starting `00 26 00 00`;
+/// descrambling it destroyed 1912 of its 2048 bytes, and because that sector
+/// carries TT_SRPT the disc enumerated 38 titles while an image decrypted from
+/// it enumerated 10, silently, at exit 0.
+///
+/// This function has no callers inside the crate, but the module-level example
+/// above prescribes it — so the crate's own documented guidance led straight
+/// into that defect. Making the guard part of the function, rather than
+/// something each caller must remember, is what keeps the safe path the easy
+/// one.
 pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
+    if !is_scrambled_pack(sector) {
+        return;
+    }
     lfsr::descramble_sector(&state.title_key, sector);
 }
 
@@ -868,6 +886,34 @@ mod tests {
     /// that sector carries TT_SRPT the whole title table went with it — the
     /// disc enumerated 38 titles, an image decrypted from it enumerated 10, at
     /// exit 0 with no diagnostic. Guard on the pack start code, not the flag.
+    /// The PUBLIC per-sector entry point must refuse a non-pack sector too.
+    ///
+    /// Audit finding: `descramble_region` was fixed to require the pack start
+    /// code, but `descramble_sector` — which the module-level example tells
+    /// callers to use — still keyed on the 0x14 flag alone, so the crate's own
+    /// documented path reached the same defect.
+    #[test]
+    fn descramble_sector_refuses_a_non_pack_sector() {
+        let mut ifo_like = vec![0u8; 2048];
+        for (i, b) in ifo_like.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        ifo_like[0x00..0x04].copy_from_slice(&[0x00, 0x26, 0x00, 0x00]); // not a pack
+        ifo_like[0x14] = 0x15; // flag bits set — the trap
+        assert!(has_scramble_flag_bits(&ifo_like) && !is_scrambled_pack(&ifo_like));
+
+        let pristine = ifo_like.clone();
+        let state = CssState {
+            title_key: [0x42, 0x13, 0x37, 0xBE, 0xEF],
+            crack_span: None,
+        };
+        descramble_sector(&state, &mut ifo_like);
+        assert_eq!(
+            ifo_like, pristine,
+            "a non-pack sector must survive byte-identical through the public API"
+        );
+    }
+
     #[test]
     fn descramble_region_leaves_a_non_pack_sector_alone_even_with_the_flag_set() {
         let mut ifo_like = vec![0u8; 2048];
