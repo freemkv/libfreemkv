@@ -379,7 +379,21 @@ pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
 /// than apply a neighbouring CPS unit's key.
 pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::error::Result<usize> {
     for chunk in buf.chunks_mut(2048) {
-        if chunk.len() < 2048 || !is_scrambled(chunk) {
+        // `is_scrambled_pack`, NOT the looser `is_scrambled`. The raw flag test
+        // is only safe once a caller has committed to a title's VOB data, where
+        // every sector is a pack and byte 0x14 always means what it says. This
+        // function is handed arbitrary regions of a disc, so it also sees IFO,
+        // UDF and ISO 9660 sectors — raw structures where byte 0x14 is whatever
+        // that format stores there.
+        //
+        // Measured: `VIDEO_TS.IFO` on one disc holds 0x15 at offset 0x14 of its
+        // second sector. The raw test read bits 4-5 as "scrambled", descrambled
+        // it, and destroyed 1912 of 2048 bytes. That sector carries TT_SRPT, so
+        // the title table went with it: the disc enumerated 38 titles and an
+        // image decrypted from it enumerated 10, silently, at exit 0. Requiring
+        // the pack start code first costs nothing — a genuinely scrambled VOB
+        // sector always has it, and no IFO sector does.
+        if chunk.len() < 2048 || !is_scrambled_pack(chunk) {
             continue;
         }
         let crib = stevenson::attack_crib(chunk);
@@ -823,6 +837,75 @@ mod tests {
         // The legacy Option wrapper still collapses this to None (the callers
         // that need the distinction now use crack_key_outcome instead).
         assert!(crack_key(&mut MockSource::new(0x30), &extents, 1).is_none());
+    }
+
+    /// `descramble_region` is handed arbitrary disc regions, so it also sees
+    /// IFO/UDF/ISO-9660 sectors — raw structures where byte 0x14 is whatever
+    /// that format happens to store there, NOT a scrambling-control field.
+    ///
+    /// Measured on a real disc: the second sector of `VIDEO_TS.IFO` holds 0x15
+    /// at offset 0x14 (bits 4-5 set) while starting `00 26 00 00`, which is not
+    /// a pack. Descrambling it destroyed 1912 of its 2048 bytes, and because
+    /// that sector carries TT_SRPT the whole title table went with it — the
+    /// disc enumerated 38 titles, an image decrypted from it enumerated 10, at
+    /// exit 0 with no diagnostic. Guard on the pack start code, not the flag.
+    #[test]
+    fn descramble_region_leaves_a_non_pack_sector_alone_even_with_the_flag_set() {
+        let mut ifo_like = vec![0u8; 2048];
+        for (i, b) in ifo_like.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        ifo_like[0x00..0x04].copy_from_slice(&[0x00, 0x26, 0x00, 0x00]); // not a pack
+        ifo_like[0x14] = 0x15; // bits 4-5 set: reads as "scrambled" to the raw test
+        assert!(
+            is_scrambled(&ifo_like) && !is_scrambled_pack(&ifo_like),
+            "fixture must be exactly the case the two predicates disagree on"
+        );
+
+        let pristine = ifo_like.clone();
+        let mut key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        descramble_region(&mut ifo_like, &mut key).expect("region descramble");
+
+        assert_eq!(
+            ifo_like, pristine,
+            "a non-pack sector must survive byte-identical — descrambling it \
+             corrupts the very structures that enumerate titles"
+        );
+    }
+
+    /// The other half of the contract: the guard must not cost coverage of
+    /// sectors that genuinely ARE scrambled VOB data.
+    #[test]
+    fn descramble_region_still_descrambles_a_real_scrambled_pack() {
+        let mut pack = vec![0u8; 2048];
+        for (i, b) in pack.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(29).wrapping_add(3);
+        }
+        pack[0x00..0x04].copy_from_slice(&PACK_START);
+        pack[0x14] = 0x30;
+        assert!(is_scrambled_pack(&pack));
+
+        let scrambled = pack.clone();
+        let mut key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        descramble_region(&mut pack, &mut key).expect("region descramble");
+
+        assert_ne!(
+            pack[0x80..],
+            scrambled[0x80..],
+            "the encrypted region of a real pack must actually be transformed"
+        );
+        assert_eq!(
+            (pack[0x14] >> 4) & 0x03,
+            0,
+            "the scrambling-control bits must be cleared once descrambled"
+        );
+        assert_eq!(
+            pack[0x15..0x80],
+            scrambled[0x15..0x80],
+            "CSS only scrambles from 0x80 on; the rest of the header, byte 0x14 \
+             aside, must be untouched"
+        );
+        assert_eq!(pack[..0x14], scrambled[..0x14]);
     }
 
     /// Even when every read FAILS, a scan that never managed to observe a

@@ -1288,6 +1288,9 @@ mod tests {
         // mirroring css::mod tests' `crackable_sector`.
         let seed = [0x11u8, 0x22, 0x33, 0x44, 0x55];
         let mut plain = vec![0u8; 2048];
+        // Pack start code: a real scrambled sector is an MPEG-2 PS pack, and
+        // the descrambler requires it before trusting byte 0x14.
+        plain[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         plain[0x14] = 0x10; // scramble flag
         let pat: Vec<u8> = (0..8)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
@@ -1759,6 +1762,9 @@ mod tests {
             // VTS groups regardless of which extents were gathered, masking
             // this exact regression.
             plain[0x00..0x04].copy_from_slice(&crate::css::PACK_START);
+            // Pack start code: a real scrambled sector is an MPEG-2 PS pack, and
+            // the descrambler requires it before trusting byte 0x14.
+            plain[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
             plain[0x14] = 0x10; // scramble flag
             let pat: Vec<u8> = (0..8)
                 .map(|k| (0xA0u8.wrapping_add(k as u8) ^ marker) ^ 0x5A)
