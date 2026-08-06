@@ -433,6 +433,16 @@ fn place_video_ts(vts: &mut DirNode, start: u32) -> Result<u32> {
         {
             let head = read_head(&vts.files[i].host, 0xC8)?;
             let menu = be_u32(&head, 0xC0).unwrap_or(0);
+            // One group per title set. Two files whose names differ only in
+            // how the number is written — `VTS_01_0.IFO` and `VTS_1_0.IFO` —
+            // parse to the same group, and the second insert would overwrite
+            // the first's constraint, placing a VOB at an address the IFO the
+            // reader uses does not point to. Refuse instead of picking one.
+            if menu_req.contains_key(&c.group) || title_req.contains_key(&c.group) {
+                return Err(Error::DirNameCollision {
+                    host: vts.files[i].disc_path.clone(),
+                });
+            }
             if menu != 0 {
                 menu_req.insert(c.group, lba.saturating_add(menu));
             }

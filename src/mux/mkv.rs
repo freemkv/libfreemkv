@@ -1718,6 +1718,22 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // counter above: an unexpected VOLUME here is how a title ends up
         // quietly short while the run reports success.
         let seam_dropped = self.continuity.dropped_total();
+        // Counting a drop is not the same as bounding it. A join legitimately
+        // discards the material a disc stores twice — tens of frames — but if a
+        // title's marks do not line up with its PES clock the plan can discard
+        // most of it, and the only other gate is a GLOBAL zero-frame check
+        // whose error is additionally classified as a skippable stub. Between
+        // them, a title emitting seconds of a two-hour feature exits 0. That is
+        // the defect this change set already shipped once.
+        //
+        // More dropped than kept is never a real join, so it fails.
+        if seam_dropped > self.frame_count {
+            return Err(crate::error::Error::SeamPlanDroppedMost {
+                dropped: seam_dropped,
+                written: self.frame_count,
+            }
+            .into());
+        }
         if seam_dropped > 0 {
             tracing::info!(
                 target: "mux",

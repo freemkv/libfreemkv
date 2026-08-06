@@ -201,6 +201,10 @@ pub const E_DIR_NAME_TOO_LONG: u16 = 9067;
 /// One directory in the folder holds more subdirectories than a UDF link count
 /// can express (it is 16 bits, one per child plus one for its own entry).
 pub const E_DIR_IMAGE_FANOUT: u16 = 9068;
+/// A title's clip marks excluded more frames than they kept.
+pub const E_SEAM_PLAN_DROPPED_MOST: u16 = 9069;
+/// A sink finished having written no frames at all.
+pub const E_SINK_WROTE_NOTHING: u16 = 9070;
 pub const E_M2TS_PACKET_MALFORMED: u16 = 9021;
 /// A `network://` output target resolved to no address that is safe to
 /// connect to (every resolved IP was loopback / private / link-local /
@@ -802,6 +806,20 @@ pub enum Error {
     DirImageFanout {
         path: String,
     },
+    /// A title's PlayItem marks excluded more frames than they kept.
+    ///
+    /// Placing clips by their marks drops whatever falls outside them, which is
+    /// correct at a join — a disc stores the join twice. Discarding the
+    /// majority of a title is not a join; it means the marks do not describe
+    /// the clock the frames are on. Refused rather than written, because the
+    /// result otherwise looks like a complete file containing seconds of a
+    /// feature.
+    SeamPlanDroppedMost {
+        dropped: u64,
+        written: u64,
+    },
+    /// A sink finished having written no frames at all.
+    SinkWroteNothing,
 }
 
 impl Error {
@@ -925,6 +943,8 @@ impl Error {
             Error::DirImageUnsupportedTree => E_DIR_IMAGE_UNSUPPORTED_TREE,
             Error::DirNameTooLong { .. } => E_DIR_NAME_TOO_LONG,
             Error::DirImageFanout { .. } => E_DIR_IMAGE_FANOUT,
+            Error::SeamPlanDroppedMost { .. } => E_SEAM_PLAN_DROPPED_MOST,
+            Error::SinkWroteNothing => E_SINK_WROTE_NOTHING,
             Error::DirImageFileChanged { .. } => E_DIR_IMAGE_FILE_CHANGED,
             Error::DirImageTooLarge => E_DIR_IMAGE_TOO_LARGE,
         }
