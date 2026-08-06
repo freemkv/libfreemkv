@@ -824,3 +824,29 @@ fn dump_titles_for_an_image() {
         }
     }
 }
+
+/// Diagnostic (opt-in): can each VTS IFO be READ from an image?
+///
+/// `parse_vmg` skips a title set whose `parse_vts` fails, and `parse_vts`
+/// begins by reading `/VIDEO_TS/VTS_nn_0.IFO`. This isolates the read.
+#[test]
+#[ignore = "diagnostic: needs FMKV_IMAGE"]
+fn dump_vts_ifo_reads_for_an_image() {
+    let Ok(path) = std::env::var("FMKV_IMAGE") else {
+        return;
+    };
+    let mut img =
+        crate::io::file_sector_source::FileSectorSource::open(std::path::Path::new(&path))
+            .expect("open");
+    let fs = udf::read_filesystem(&mut img).expect("udf");
+    for n in 1..=20u32 {
+        let p = format!("/VIDEO_TS/VTS_{n:02}_0.IFO");
+        match fs.read_file(&mut img, &p) {
+            Ok(b) => {
+                let magic = String::from_utf8_lossy(&b[..12.min(b.len())]).to_string();
+                println!("VTS {n:02}: read ok, {} bytes, magic={magic:?}", b.len());
+            }
+            Err(e) => println!("VTS {n:02}: READ FAILED: {e}"),
+        }
+    }
+}

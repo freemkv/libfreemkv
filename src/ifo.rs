@@ -421,16 +421,40 @@ pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> 
 
     // Parse each VTS IFO
     let mut title_sets = Vec::new();
+    let mut skipped = 0usize;
     for (&vts_number, titles_info) in &title_set_map {
         match parse_vts(reader, udf, vts_number, titles_info) {
             Ok(ts) => title_sets.push(ts),
-            Err(_) => {
-                // Skip unreadable title sets — some DVDs have placeholder entries.
+            Err(e) => {
+                // Some discs carry placeholder TT_SRPT entries for title sets
+                // that are not really there, so one failure is not fatal. But
+                // the failure must not be INVISIBLE: every skipped set is a
+                // title the user will never see, and swallowing the reason made
+                // a disc that enumerated 38 titles from one image and 10 from
+                // another look like a scan difference rather than 28 dropped
+                // reads.
+                skipped += 1;
+                tracing::warn!(
+                    target: "freemkv::scan",
+                    vts = vts_number,
+                    titles = titles_info.len(),
+                    error = %e,
+                    "title set could not be parsed; its titles are omitted"
+                );
                 continue;
             }
         }
     }
 
+    if skipped > 0 {
+        tracing::warn!(
+            target: "freemkv::scan",
+            skipped,
+            kept = title_sets.len(),
+            declared = title_set_map.len(),
+            "some title sets were omitted from the scan"
+        );
+    }
     Ok(DvdInfo { title_sets })
 }
 
