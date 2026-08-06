@@ -1335,8 +1335,12 @@ impl<W: Write + Seek> MkvMuxer<W> {
     ///
     /// No-op for a title with fewer than two clips or without usable marks —
     /// DVD, HD-DVD and file sources keep the inference path.
-    pub fn set_clips(&mut self, clips: &[crate::disc::Clip]) {
-        self.continuity = TimelineContinuity::with_clips(clips);
+    pub fn set_clips(
+        &mut self,
+        clips: &[crate::disc::Clip],
+        content_format: crate::disc::ContentFormat,
+    ) {
+        self.continuity = TimelineContinuity::with_clips(clips, content_format);
     }
 
     /// Write a single frame.

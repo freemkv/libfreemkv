@@ -505,7 +505,7 @@ impl MkvStream {
             &self.disc_title.chapters,
         )?;
         // Seam correction from the playlist's marks where the title has them.
-        muxer.set_clips(&self.disc_title.clips);
+        muxer.set_clips(&self.disc_title.clips, self.disc_title.content_format);
         if let Some(path) = &pending.opening_capture_path {
             muxer.set_opening_capture(crate::diag::OpeningCapture::new(path, pending.tracks.len()));
         }
