@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ['ubuntu-latest', 'macos-latest']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -108,4 +108,26 @@ jobs:
           workspaces: libfreemkv
       - run: rustup target add x86_64-unknown-linux-gnu
       - run: cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+        working-directory: libfreemkv
+
+  # Windows compiles the tests but does not run them, matching the policy
+  # ci.yml already set. The value here is codegen: the #[cfg(windows)] halves
+  # of the SCSI transport and platform layers compile on no other runner, so
+  # without this they are first built at release time.
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: libfreemkv
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: qa
+          path: freemkv-unlock
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: libfreemkv
+      - run: cargo build --release --tests
         working-directory: libfreemkv
