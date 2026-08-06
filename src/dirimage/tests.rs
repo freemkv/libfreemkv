@@ -447,6 +447,32 @@ fn an_oversized_vob_offset_leaves_a_gap_rather_than_failing() {
     assert!(buf.iter().all(|&b| b == 0));
 }
 
+/// A VOBS offset far past the content must be REFUSED, not honoured.
+///
+/// Audit finding. The planner honours a title set's declared VOBS offset
+/// because honouring it is what makes a real backup readable, and nothing
+/// bounded it: a regenerated `.BUP`, a rewritten IFO or a hand-assembled folder
+/// naming a huge offset grew the image to wherever it pointed. A `u32` sector
+/// count reaches roughly 8.8 TB, and writing that to an `iso://` destination
+/// would fill a disk with zeros before anything noticed.
+///
+/// The companion above pins that a MODEST oversize is still honoured as a gap,
+/// so this cap refuses only what it must.
+#[test]
+fn a_vob_offset_past_the_image_cap_is_refused() {
+    let s = Scratch::new("dvdcap");
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    // 100,000,000 sectors is ~200 GB — past the 128 GiB ceiling.
+    s.file("VIDEO_TS/VTS_01_0.IFO", &vts_ifo(SECTOR, 0, 100_000_000));
+    s.file("VIDEO_TS/VTS_01_1.VOB", &pattern(1, SECTOR));
+
+    let err = DirImage::open(s.path()).expect_err("an image this large must be refused");
+    assert!(
+        matches!(err, crate::error::Error::DirImageTooLarge),
+        "expected the size cap to fire, got {err:?}"
+    );
+}
+
 /// End to end through the real scanner: a DVD folder must enumerate titles the
 /// same way an ISO of the same disc would, which is the whole point of
 /// synthesizing a real filesystem rather than faking a tree.
