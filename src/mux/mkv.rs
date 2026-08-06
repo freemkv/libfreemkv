@@ -4452,6 +4452,58 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// A seam-plan clip list whose marks exclude every frame must fail with
+    /// `SinkWroteNothing`, NOT `MkvInvalid`.
+    ///
+    /// Audit finding: both gates in `finish()` were dead code under test —
+    /// `set_clips` was never called anywhere in the suite, so
+    /// `continuity.dropped_total()` was always 0 and neither branch could be
+    /// reached. Swapping the two `frame_count == 0` checks left the whole suite
+    /// green, while a title the seam plan emptied came back as `MkvInvalid` —
+    /// which `is_skippable_title_stub` classifies as an empty nav/menu stub, so
+    /// an all-titles rip would silently omit a real feature and exit 0.
+    #[test]
+    fn a_title_the_seam_plan_emptied_is_not_reported_as_a_skippable_stub() {
+        let tracks = [make_video_track()];
+        // TWO clips (SeamPlan::from_clips requires at least two, with strictly
+        // increasing IN marks), covering 100s..200s and 200s..300s in 45 kHz
+        // ticks. Every frame below sits far before the first IN, so the plan
+        // places none of them and drops them all.
+        let clips = [
+            crate::disc::Clip {
+                clip_id: "00000".into(),
+                in_time: 100 * 45_000,
+                out_time: 200 * 45_000,
+                duration_secs: 100.0,
+                source_packets: 0,
+            },
+            crate::disc::Clip {
+                clip_id: "00001".into(),
+                in_time: 200 * 45_000,
+                out_time: 300 * 45_000,
+                duration_secs: 100.0,
+                source_packets: 0,
+            },
+        ];
+        let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &tracks, None, 100.0, &[]).unwrap();
+        muxer.set_clips(&clips, crate::disc::ContentFormat::BdTs);
+        // 0s and 1s — both before the clip's IN mark.
+        let _ = muxer.write_frame(0, 0, true, &[0x01; 16], None, None);
+        let _ = muxer.write_frame(0, 1_000_000_000, true, &[0x02; 16], None, None);
+
+        let err = muxer.finish().unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_SINK_WROTE_NOTHING),
+            "an emptied seam title must report SinkWroteNothing"
+        );
+        assert!(
+            !crate::error::is_skippable_title_stub(&err),
+            "it must NOT be classified as a skippable stub — that is what makes an \
+             all-titles rip drop a real feature and still exit 0"
+        );
+    }
+
     #[test]
     fn backjumped_audio_handled_by_i16_split_no_wrap() {
         // A NON-VIDEO (audio) frame whose PTS back-jumps far below the open
