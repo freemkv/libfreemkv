@@ -79,6 +79,9 @@ struct FileRef {
     host: PathBuf,
     disc_path: String,
     size: u64,
+    /// Host mtime at plan time — see `layout::FileNode::mtime` for why size
+    /// alone is not enough.
+    mtime: Option<std::time::SystemTime>,
 }
 
 /// A synthesized UDF disc image over a host directory.
@@ -128,6 +131,7 @@ impl DirImage {
                 host: node.host.clone(),
                 disc_path: node.disc_path.clone(),
                 size: node.size,
+                mtime: node.mtime,
             });
             let mut offset = 0u64;
             for e in &node.extents {
@@ -206,8 +210,23 @@ impl DirImage {
             return Ok(&mut self.open[0].1);
         }
         let f = File::open(&self.files[file].host).map_err(Error::from)?;
-        let live = f.metadata().map_err(Error::from)?.len();
-        if live != self.files[file].size {
+        let md = f.metadata().map_err(Error::from)?;
+        // Size AND mtime. Size alone is content-blind, and this plan depends on
+        // content: a DVD's VOB placement comes from bytes 0xC0/0xC4 of its IFO,
+        // and an IFO rewritten in place keeps its length because IFOs occupy a
+        // whole number of sectors. The size check would pass while every title
+        // extent pointed at the wrong sectors — corrupt video behind an intact
+        // structure, reported complete at exit 0.
+        //
+        // Only compared when both sides have a timestamp; a platform or
+        // filesystem that reports none simply falls back to the size check
+        // rather than failing every read.
+        let changed_size = md.len() != self.files[file].size;
+        let changed_mtime = match (self.files[file].mtime, md.modified().ok()) {
+            (Some(planned), Some(live)) => planned != live,
+            _ => false,
+        };
+        if changed_size || changed_mtime {
             return Err(Error::DirImageFileChanged {
                 path: self.files[file].disc_path.clone(),
             });
