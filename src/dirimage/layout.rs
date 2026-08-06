@@ -140,7 +140,7 @@ fn fid_len(name: &str, is_parent: bool) -> usize {
     let l_fi = if is_parent {
         0
     } else {
-        super::encode::encode_cs0(name).len()
+        crate::dirimage::encode::encode_cs0(name).len()
     };
     (38 + l_fi).div_ceil(4) * 4
 }
@@ -204,7 +204,7 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
         // encode something unreadable. 255 ASCII bytes is a legal name on
         // ext4/APFS/NTFS and already exceeds this once the CS0 compression
         // byte is added, so it is reachable without anything exotic.
-        if super::encode::encode_cs0(&name).len() > MAX_CS0_NAME_BYTES {
+        if crate::dirimage::encode::encode_cs0(&name).len() > MAX_CS0_NAME_BYTES {
             return Err(Error::DirNameTooLong { path: child_path });
         }
         *entries += 1;
@@ -760,46 +760,74 @@ mod tests {
         assert!(!is_excluded("VTS_01_1.VOB"));
     }
 
-    /// A name too long for the FID's one-byte length field is refused while
-    /// planning.
+    /// A name too long for the FID's one-byte length field is refused by the
+    /// PLANNER, on a real folder.
     ///
     /// Audit finding: the length was narrowed with `as u8`, so a 255-byte ASCII
-    /// name — legal on ext4/APFS/NTFS — encoded to 256 bytes with the CS0
-    /// compression byte and wrote a length of ZERO. Every later entry in that
-    /// directory would then be read from the wrong offset, losing files with no
-    /// error. The cap must sit below the point where the field wraps.
+    /// name — POSIX NAME_MAX, legal on ext4/APFS/NTFS — encoded to 256 bytes
+    /// with the CS0 compression byte and wrote a length of ZERO, making every
+    /// later entry in that directory read from the wrong offset.
+    ///
+    /// An earlier version of this test asserted arithmetic about the constants
+    /// and never called `plan`, so it would have passed with the guard deleted.
     #[test]
-    fn an_over_long_name_is_refused_not_truncated() {
-        let longest_ok = "a".repeat(MAX_CS0_NAME_BYTES - 1);
+    fn an_over_long_name_is_refused_by_the_planner() {
+        let dir = std::env::temp_dir().join(format!(
+            "fmkv-longname-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("BDMV/STREAM")).expect("mkdir");
+        // 255 bytes: the exact length that used to narrow to zero.
+        let name = "a".repeat(255);
         assert_eq!(
-            super::super::encode::encode_cs0(&longest_ok).len(),
-            MAX_CS0_NAME_BYTES,
-            "fixture: the longest accepted name encodes to exactly the cap"
+            crate::dirimage::encode::encode_cs0(&name).len(),
+            256,
+            "fixture: NAME_MAX encodes to 256 bytes with the compression byte"
         );
+        std::fs::write(dir.join("BDMV/STREAM").join(&name), b"x").expect("write");
+
+        let err = plan(&dir).expect_err("the planner must refuse this folder");
         assert!(
-            MAX_CS0_NAME_BYTES < u8::MAX as usize,
-            "the cap must leave the length field unable to wrap"
+            matches!(err, Error::DirNameTooLong { .. }),
+            "expected DirNameTooLong, got {err:?}"
         );
-        // The exact case that used to write a length of zero: a 255-byte name
-        // (the POSIX NAME_MAX, so entirely ordinary) encodes to 256 bytes once
-        // the CS0 compression byte is prepended, and 256 narrows to 0 in a u8.
-        let name_max = "a".repeat(255);
-        let encoded = super::super::encode::encode_cs0(&name_max).len();
-        assert_eq!(encoded, 256, "fixture: NAME_MAX encodes to 256 bytes");
-        assert_eq!(
-            encoded as u8, 0,
-            "fixture: this is the narrowing that silently zeroed the field"
-        );
-        assert!(
-            encoded > MAX_CS0_NAME_BYTES,
-            "so the planner must refuse it before the encoder sees it"
-        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The subdirectory cap keeps a directory's 16-bit link count from wrapping.
-    ///
-    /// Audit finding: the count was `1 + dirs.len() as u16`, and the global
-    /// entry cap alone permits one directory holding 65,535 subdirectories.
+    /// A name at the cap is accepted, so the guard rejects only what it must.
+    #[test]
+    fn a_name_at_the_cap_is_accepted() {
+        let dir = std::env::temp_dir().join(format!(
+            "fmkv-okname-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("BDMV/STREAM")).expect("mkdir");
+        // One byte of name shorter, so the encoding lands exactly on the cap.
+        let name = "a".repeat(MAX_CS0_NAME_BYTES - 1);
+        assert_eq!(
+            crate::dirimage::encode::encode_cs0(&name).len(),
+            MAX_CS0_NAME_BYTES
+        );
+        std::fs::write(dir.join("BDMV/STREAM").join(&name), b"x").expect("write");
+        assert!(
+            plan(&dir).is_ok(),
+            "a name whose encoding equals the cap must be accepted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The subdirectory cap must keep a directory's 16-bit link count
+    /// representable. Creating 65,535 directories in a test is not reasonable,
+    /// so this pins the arithmetic relationship the guard relies on — and says
+    /// plainly that it does NOT exercise `walk`.
     #[test]
     fn the_subdir_cap_keeps_the_link_count_representable() {
         assert_eq!(
