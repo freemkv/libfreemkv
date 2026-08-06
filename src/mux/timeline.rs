@@ -229,6 +229,42 @@ impl SeamPlan {
         //   so the backward step to the next clip's IN is the crossing — and it
         //   is per track, which is why the cursor has to be per track too.
         //
+        // A backward step too large to be B-frame reorder is a NEW CLIP'S FILE
+        // starting, and it must be handled before the per-track rules below.
+        //
+        // Those rules require the frame to land at (or just below) the next
+        // clip's IN mark, which is right for the dense case and wrong here:
+        // nothing upstream trims a clip's stream to its marks, so a clip's file
+        // can open with material from BEFORE its IN. Measured on the real
+        // 00801.mpls table in this file: with the cursor on clip 5
+        // (7708.99..7910.79) a frame at 7845.00 — clip 6's pre-mark lead-in,
+        // 8s below clip 6's IN of 7853.00 — is more than the 250ms tolerance
+        // from that mark, so neither rule fires, the cursor stays on clip 5,
+        // and 7845.00 is INSIDE clip 5's range so the frame is placed with clip
+        // 5's offset. Output went BACKWARDS 65s and `dropped` stayed 0: no
+        // counter, no gate, nothing noticed, and the whole overlap band was
+        // emitted a second time on top of clip 5's already-written tail.
+        //
+        // A jump this large cannot be reorder, so advance to the first clip
+        // that could still contain the frame. That terminates on its own — it
+        // stops at containment rather than running to the end of the list,
+        // which is what the `next_in` bound below exists to prevent — and any
+        // frame left before its clip's IN is material the playlist EXCLUDES, so
+        // the containment check at the end drops and counts it.
+        let big_backstep = pos
+            .last_raw_ns
+            .is_some_and(|last| last.saturating_sub(raw_ns) > DISCONTINUITY_BACKSTEP_NS);
+        // A track's own PTS only ever runs forward INSIDE a clip, so a backward
+        // step this large is always a clip change: advance at least one, then
+        // skip any clip the frame is already past. Terminates at the first clip
+        // that could contain it; a frame still below that clip's IN is
+        // pre-mark material and the containment check drops and counts it.
+        if big_backstep && clip + 1 < self.clips.len() {
+            clip += 1;
+            while clip + 1 < self.clips.len() && raw_ns > self.clips[clip].out_ns {
+                clip += 1;
+            }
+        }
         // Bounded by the clip count, so a wild PTS cannot spin here.
         while clip + 1 < self.clips.len() {
             let cur = self.clips[clip];
@@ -625,6 +661,46 @@ mod tests {
         let out: Vec<i64> = raw.iter().map(|&p| adj_video(&mut tc, p)).collect();
         assert_eq!(out, raw, "forward gap preserved verbatim");
         assert_eq!(tc.offset_ns, 0, "no rebase on forward progression");
+    }
+
+    /// The output timeline must never go BACKWARDS at a clip join.
+    ///
+    /// Audit finding, measured against the real 00801.mpls marks below: with
+    /// the cursor on clip 5 (7708.99..7910.79) a frame at 7845.00 — clip 6's
+    /// pre-mark lead-in, 8s below clip 6's IN of 7853.00 — was more than the
+    /// 250ms tolerance from that mark, so no crossing rule fired; the cursor
+    /// stayed on clip 5, and 7845.00 IS inside clip 5's range, so the frame was
+    /// PLACED with clip 5's offset. Output went backwards 65s and dropped
+    /// stayed 0 — no counter, no gate, nothing noticed — while the entire
+    /// overlap band was emitted a second time over clip 5's written tail.
+    ///
+    /// A backward step larger than DISCONTINUITY_BACKSTEP_NS cannot be B-frame
+    /// reorder, so it is a new clip's file starting. Such a frame is either
+    /// placed on the clip that contains it, or dropped as pre-mark material the
+    /// playlist excludes — never emitted behind the frame before it.
+    #[test]
+    fn a_clip_join_never_rewinds_the_output_timeline() {
+        let clips = seamless_branching_clips();
+        let mut plan = SeamPlan::from_clips(&clips).expect("the real table must plan");
+        let a = plan
+            .place(7_910_000_000_000, 0, true)
+            .expect("a frame inside clip 5 is placed");
+        // Clip 6's file opens 8s below its own IN mark.
+        let b = plan.place(7_845_000_000_000, 0, true);
+        if let Some(b) = b {
+            assert!(
+                b >= a,
+                "output rewound {}s at a clip join (from {a} to {b})",
+                (a - b) as f64 / 1e9
+            );
+        } else {
+            // Dropped as pre-mark material — correct, and it must be COUNTED so
+            // the volume gates in the sinks can see it.
+            assert!(
+                plan.dropped_total() > 0,
+                "a dropped frame must be counted, or the finish() gates are blind to it"
+            );
+        }
     }
 
     /// Build a real seamless-branching clip table (`00801.mpls`, 11 PlayItems, marks
