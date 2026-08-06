@@ -15,7 +15,7 @@ use std::os::unix::io::AsRawFd;
 /// pipeline depth.
 const RDADVISE_MAX_BYTES: i64 = 64 * 1024 * 1024;
 
-pub(super) fn hint_sequential(file: &File, len_bytes: u64) {
+pub(crate) fn hint_sequential(file: &File, len_bytes: u64) {
     let bytes = (len_bytes as i64).min(RDADVISE_MAX_BYTES);
     let mut ra = libc::radvisory {
         ra_offset: 0,
@@ -33,14 +33,14 @@ pub(super) fn hint_sequential(file: &File, len_bytes: u64) {
 /// approximation: no-op. macOS's unified buffer cache is generally
 /// less prone to the pin-everything pathology that triggers the
 /// regression on Linux NFS clients.
-pub(super) fn drop_window(_file: &File, _start: u64, _len: u64) {}
+pub(crate) fn drop_window(_file: &File, _start: u64, _len: u64) {}
 
 /// Async-prefetch the byte range `[offset, offset+len)`. macOS uses
 /// the same `fcntl(F_RDADVISE, &radvisory)` primitive as the open-
 /// time sequential hint, just targeted at a moving window instead of
 /// the whole file. The kernel queues I/O for the requested range and
 /// returns immediately.
-pub(super) fn prefetch(file: &File, offset: u64, len: u64) {
+pub(crate) fn prefetch(file: &File, offset: u64, len: u64) {
     let bytes = (len as i64).min(RDADVISE_MAX_BYTES);
     let mut ra = libc::radvisory {
         ra_offset: offset as libc::off_t,

@@ -36,6 +36,14 @@ mod encode;
 mod layout;
 
 use crate::error::{Error, Result};
+#[cfg(target_os = "linux")]
+use crate::io::file_sector_source::linux::drop_window;
+#[cfg(target_os = "macos")]
+use crate::io::file_sector_source::macos::drop_window;
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+use crate::io::file_sector_source::other::drop_window;
+#[cfg(target_os = "windows")]
+use crate::io::file_sector_source::windows::drop_window;
 use crate::sector::SectorSource;
 use encode::{MetaSectors, SECTOR};
 use std::fs::File;
@@ -78,6 +86,12 @@ struct FileRef {
 /// Owns everything it reads through (`PathBuf`s and its own file handles), so
 /// it is `Send + 'static` and can be moved into `build_iso_pipeline`, which
 /// hands it to `PrefetchedSectorSource`'s producer thread.
+/// Bytes read between page-cache eviction calls (32 MiB).
+///
+/// Large enough that the hint costs nothing measurable against a rip, small
+/// enough that resident pages stay bounded well below any machine's RAM.
+const DROP_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+
 pub struct DirImage {
     meta: MetaSectors,
     /// Sorted by `start_lba`, non-overlapping.
@@ -87,6 +101,15 @@ pub struct DirImage {
     total_sectors: u32,
     volume_id: String,
     data_bytes: u64,
+    /// Bytes read from host files since the last page-cache eviction.
+    ///
+    /// A rip streams every byte of the folder exactly once. Without eviction
+    /// the kernel keeps all of it resident, which starves the concurrent writer
+    /// — `io::file_sector_source` records the measured cost of exactly this
+    /// omission on the ISO path (2.7 MB/s mux against 70 MB/s isolated reads).
+    /// A folder source reads host files the same way and needs the same
+    /// treatment.
+    bytes_since_drop: u64,
 }
 
 impl std::fmt::Debug for DirImage {
@@ -160,6 +183,7 @@ impl DirImage {
             total_sectors: plan.total_sectors,
             volume_id: plan.volume_id,
             data_bytes,
+            bytes_since_drop: 0,
         })
     }
 
@@ -225,7 +249,21 @@ impl DirImage {
         let file = r.file;
         let h = self.handle(file)?;
         h.seek(SeekFrom::Start(at)).map_err(Error::from)?;
-        match h.read_exact(&mut out[..want]) {
+        let res = h.read_exact(&mut out[..want]);
+        if res.is_ok() {
+            // Evict what we have consumed, per file handle. The window is the
+            // read just completed rather than a running offset, because reads
+            // here jump between files and a single monotonic cursor would name
+            // the wrong pages.
+            self.bytes_since_drop = self.bytes_since_drop.saturating_add(want as u64);
+            if self.bytes_since_drop >= DROP_CHUNK_BYTES {
+                if let Some((_, fh)) = self.open.iter().find(|(i, _)| *i == file) {
+                    drop_window(fh, at, want as u64);
+                }
+                self.bytes_since_drop = 0;
+            }
+        }
+        match res {
             Ok(()) => Ok(()),
             // The file shrank while the handle was open. Same verdict as the
             // size check in `handle`, reached the other way.

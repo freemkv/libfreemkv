@@ -59,6 +59,30 @@ const MAX_CS0_NAME_BYTES: usize = 254;
 /// value is `u16::MAX - 1`.
 const MAX_SUBDIRS: usize = (u16::MAX - 1) as usize;
 
+/// Largest image this planner will synthesize, in sectors (128 GiB).
+///
+/// A DVD title set records where its VOBS begins as an offset in its own IFO,
+/// and that offset is read verbatim out of a file in the folder. A regenerated
+/// `.BUP`, a tool that rewrote an IFO, or a hand-assembled folder can therefore
+/// name an offset far beyond the content — and the planner honours it, because
+/// honouring it is what makes a real backup readable. Without a ceiling the
+/// image grows to wherever that offset points: a `u32` sector count reaches
+/// ~8.8 TB, and writing one to an `iso://` destination would fill a disk with
+/// zeros before anything noticed.
+///
+/// 128 GiB clears the largest real medium (BD-100) with room to spare, so a
+/// genuine disc folder never meets it.
+const MAX_IMAGE_SECTORS: u32 = (128u64 * 1024 * 1024 * 1024 / SECTOR as u64) as u32;
+
+/// Ceiling on the in-memory metadata region (64 MiB).
+///
+/// Every node costs a 2 KiB File Entry sector held for the life of the image,
+/// so the entry cap alone permits ~205 MB of metadata for content of no size at
+/// all — and the mux holds two of these at once while probing. The module
+/// documents a budget of "a few MiB even for a large Blu-ray"; this is what
+/// enforces it rather than merely asserting it.
+const MAX_META_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The fan-out cap must bite before the global entry cap, or it never fires.
 const _: () = assert!(MAX_SUBDIRS < MAX_ENTRIES);
 
@@ -605,6 +629,15 @@ pub(super) fn plan(root: &Path) -> Result<Layout> {
     let part_sectors = cursor;
     let total = part_start as u64 + part_sectors as u64 + 1; // + trailing anchor
     let total_sectors = u32::try_from(total).map_err(|_| Error::DirImageTooLarge)?;
+    if total_sectors > MAX_IMAGE_SECTORS {
+        return Err(Error::DirImageTooLarge);
+    }
+    // Metadata is materialized up front and held for the life of the image, so
+    // its size is bounded here rather than discovered when memory runs out.
+    let meta_bytes = (dir_count as u64 + file_count as u64).saturating_mul(SECTOR as u64);
+    if meta_bytes > MAX_META_BYTES {
+        return Err(Error::DirImageTooLarge);
+    }
 
     let volume_id = root
         .file_name()

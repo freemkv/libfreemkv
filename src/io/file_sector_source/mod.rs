@@ -48,22 +48,25 @@
 //! far smaller than our 16 MiB app-level batch.
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-mod other;
+pub(crate) mod other;
 #[cfg(target_os = "windows")]
-mod windows;
+pub(crate) mod windows;
 
+// The page-cache hints are shared with any other file-backed sector source:
+// `dirimage` reads host files the same way and needs the same eviction, or a
+// large rip pins every byte it has read (see this module's DONTNEED note).
 #[cfg(target_os = "linux")]
-use linux as platform;
+pub(crate) use linux as platform;
 #[cfg(target_os = "macos")]
-use macos as platform;
+pub(crate) use macos as platform;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-use other as platform;
+pub(crate) use other as platform;
 #[cfg(target_os = "windows")]
-use windows as platform;
+pub(crate) use windows as platform;
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
