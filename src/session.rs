@@ -508,11 +508,33 @@ fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result
     use crate::consts::SECTOR_BYTES;
 
     const UNIT_SECTORS: u32 = 3;
+    // Anchor on the largest TITLE's FIRST extent, not on the largest extent
+    // anywhere.
+    //
+    // AACS units are 3 sectors, and a unit boundary is only guaranteed at the
+    // START of a clip. `max_by_key` over every extent picked a mid-file one for
+    // any clip big enough to be split: the planner caps an allocation
+    // descriptor at MAX_AD_BYTES = 524287 sectors, every full piece of a split
+    // file therefore ties on sector_count, and `max_by_key` returns the LAST
+    // tie — an extent starting (k-1)*524287 sectors in. 524287 % 3 == 1, so
+    // that start is off the unit boundary for two file sizes in three.
+    //
+    // The sampling then reads 6144-byte windows that begin mid-source-packet,
+    // so the CPI byte it thinks it is testing is content. Both verdicts are
+    // wrong in a costly direction: a decrypted folder gets rejected as
+    // encrypted (DirImageEncrypted on something perfectly rippable), or
+    // genuine ciphertext reads as clear and the mux writes it out as video at
+    // exit 0. `is_unit_aligned` cannot catch it, because it measures against
+    // this same wrong base.
     let Some(extent) = disc
         .titles
         .iter()
-        .flat_map(|t| t.extents.iter())
-        .max_by_key(|e| e.sector_count)
+        .max_by_key(|t| {
+            t.extents
+                .iter()
+                .fold(0u64, |a, e| a.saturating_add(e.sector_count as u64))
+        })
+        .and_then(|t| t.extents.first())
     else {
         // No content to judge. A folder with an AACS directory and no titles
         // has nothing to rip either way; leave the structural verdict alone.
