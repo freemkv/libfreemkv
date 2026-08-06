@@ -37,30 +37,36 @@ fn css_descramble_sector_roundtrip_via_public_api() {
     assert_ne!(&sector[128..256], &original[128..256]);
 }
 
-/// Test: css_is_scrambled detects scramble flags correctly.
+/// Test: has_scramble_flag_bits detects the raw flag bits correctly.
 #[test]
 fn css_is_scrambled_detection() {
     let mut sector = vec![0u8; 2048];
     assert!(
-        !css::is_scrambled(&sector),
+        !css::has_scramble_flag_bits(&sector),
         "empty sector should not be scrambled"
     );
 
     sector[0x14] = 0x10; // bit 4 set
-    assert!(css::is_scrambled(&sector), "bit 4 set should be detected");
+    assert!(
+        css::has_scramble_flag_bits(&sector),
+        "bit 4 set should be detected"
+    );
 
     sector[0x14] = 0x20; // bit 5 set
-    assert!(css::is_scrambled(&sector), "bit 5 set should be detected");
+    assert!(
+        css::has_scramble_flag_bits(&sector),
+        "bit 5 set should be detected"
+    );
 
     sector[0x14] = 0x30; // both bits set
     assert!(
-        css::is_scrambled(&sector),
+        css::has_scramble_flag_bits(&sector),
         "both bits set should be detected"
     );
 
     sector[0x14] = 0xCF; // bits 4-5 clear, other bits set
     assert!(
-        !css::is_scrambled(&sector),
+        !css::has_scramble_flag_bits(&sector),
         "bits 4-5 clear should not be scrambled"
     );
 }
