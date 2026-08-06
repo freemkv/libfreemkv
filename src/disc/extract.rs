@@ -684,7 +684,53 @@ fn available_space(dir: &Path) -> Option<u64> {
     Some(avail)
 }
 
-#[cfg(not(unix))]
+/// Windows has no `statvfs`. This returned `None` unconditionally, which does
+/// not merely skip a test — it skipped the free-space GATE, so a Windows user
+/// extracting a disc to a full volume got a confusing failure part-way through
+/// instead of a clear refusal up front. libfreemkv ships a Windows GUI, so that
+/// is the platform where the friendly error matters most.
+///
+/// `GetDiskFreeSpaceExW` is declared directly against kernel32, matching how
+/// `scsi::windows` already reaches the Win32 API rather than pulling in a
+/// binding crate for one call.
+#[cfg(windows)]
+fn available_space(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    // Wide, NUL-terminated. An interior NUL cannot reach the API, so reject it
+    // rather than silently truncating the path and measuring the wrong volume.
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return None;
+    }
+    wide.push(0);
+
+    let mut avail: u64 = 0;
+    // FreeBytesAvailableToCaller, not TotalNumberOfFreeBytes: it accounts for
+    // per-user quotas, which is what "can I actually write this much" means and
+    // what `statvfs`'s `f_bavail` gives on the unix side.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut avail,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 { None } else { Some(avail) }
+}
+
+/// Neither unix nor Windows: no way to ask, so the gate is skipped.
+#[cfg(not(any(unix, windows)))]
 fn available_space(_dir: &Path) -> Option<u64> {
     None
 }

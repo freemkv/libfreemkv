@@ -1839,11 +1839,23 @@ mod tests {
         thread::spawn(move || {
             // Past the first grace window (and past the 250 ms poll cadence that
             // bounds when the window is actually observed), inside the second.
-            thread::sleep(Duration::from_millis(600));
+            //
+            // These intervals used to be 600 ms against a 300 ms grace, which
+            // left NO margin: two 300 ms windows end at 600 ms, and the 250 ms
+            // poll cadence can push the observation later still, so on a loaded
+            // runner the second window expired first and the caller abandoned —
+            // failing with Err(Halted) against a race, not a defect.
+            //
+            // Scaled up so the jitter is small relative to the intervals: the
+            // first window ends at ~1.0-1.25 s and the second at ~2.0-2.25 s,
+            // so releasing at 1.6 s sits well inside the second with roughly
+            // 350 ms of slack on either side. The ordering under test is
+            // unchanged; only the margin is.
+            thread::sleep(Duration::from_millis(1600));
             rel.store(true, Ordering::SeqCst);
         });
 
-        let grace = Duration::from_millis(300);
+        let grace = Duration::from_secs(1);
         let res = finish_with_grace(handle, &state, grace, Error::Halted);
         assert!(
             matches!(res, Ok(42)),
