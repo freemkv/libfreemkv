@@ -475,16 +475,35 @@ pub fn scan_dir(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorS
     let capacity = reader.capacity_sectors();
     let mut disc = Disc::scan_image(&mut reader, capacity, &opts)?;
 
+    apply_folder_encryption_verdict(&mut reader, &mut disc)?;
+    Ok((disc, Box::new(reader)))
+}
+
+/// Re-judge a FOLDER's encryption verdict from its CONTENT.
+///
+/// `Disc::scan_with` decides `encrypted` from tree shape — whether an `AACS/`
+/// directory is present. That is right for an image and wrong for a verbatim
+/// copy of an already-decrypted disc that kept the directory: the rip would
+/// fail asking for a key it does not need.
+///
+/// Shared by [`scan_dir`] and by the `dir://` PES input path in
+/// `mux::resolve`. It lives in one place because the two disagreed: a folder
+/// that ripped through `scan_dir` failed through `input()`, which is the exact
+/// failure this probe was written to prevent, reachable by the other door.
+pub(crate) fn apply_folder_encryption_verdict(
+    reader: &mut dyn SectorSource,
+    disc: &mut Disc,
+) -> Result<()> {
     // `css.is_some()` is the DVD path, and that verdict came from actually
     // cracking scrambled sectors — real evidence about content, not tree shape.
     // Only the AACS-by-tree-shape verdict is re-judged here.
     if disc.encrypted && disc.css.is_none() && disc.css_error.is_none() {
-        match probe_folder_encryption(&mut reader, &disc)? {
+        match probe_folder_encryption(reader, disc)? {
             true => return Err(Error::DirImageEncrypted),
             false => {
                 tracing::warn!(
                     target: "freemkv::scan",
-                    phase = "scan_dir",
+                    phase = "folder_verdict",
                     "folder carries an AACS directory but its sampled content units \
                      are already in the clear; treating it as decrypted"
                 );
@@ -494,7 +513,7 @@ pub fn scan_dir(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorS
             }
         }
     }
-    Ok((disc, Box::new(reader)))
+    Ok(())
 }
 
 /// `true` when any sampled content unit still needs decryption.
