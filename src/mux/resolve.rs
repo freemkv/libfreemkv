@@ -392,9 +392,12 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // when the mux output is being written to the same disk.
             let reader = crate::io::file_sector_source::FileSectorSource::open(path)?;
             let probe_path = path.clone();
-            let stream = image_input(reader, opts, move || {
-                crate::io::file_sector_source::FileSectorSource::open(&probe_path).ok()
-            })?;
+            let stream = image_input(
+                reader,
+                opts,
+                move || crate::io::file_sector_source::FileSectorSource::open(&probe_path).ok(),
+                false,
+            )?;
             Ok(Box::new(stream))
         }
         // `dir://` as a SOURCE: an extracted disc folder, presented as a
@@ -408,9 +411,12 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             validate_file_path(path, "dir")?;
             let reader = crate::dirimage::DirImage::open(path)?;
             let probe_path = path.clone();
-            let stream = image_input(reader, opts, move || {
-                crate::dirimage::DirImage::open(&probe_path).ok()
-            })?;
+            let stream = image_input(
+                reader,
+                opts,
+                move || crate::dirimage::DirImage::open(&probe_path).ok(),
+                true,
+            )?;
             Ok(Box::new(stream))
         }
         StreamUrl::M2ts { ref path } => {
@@ -467,6 +473,9 @@ fn image_input<S, F>(
     mut reader: S,
     opts: &InputOptions,
     reopen: F,
+    // A FOLDER's `encrypted` flag comes from tree shape and can be wrong; an
+    // image's cannot. See `session::apply_folder_encryption_verdict`.
+    is_folder: bool,
 ) -> io::Result<PipelinedPesStream>
 where
     S: SectorSource + Send + 'static,
@@ -476,6 +485,13 @@ where
     let mut disc =
         crate::disc::Disc::scan_image(&mut reader, capacity, &crate::disc::ScanOptions::default())
             .map_err(|e| -> io::Error { e.into() })?;
+    // Without this a folder reached here with a tree-shape verdict while
+    // `session::scan_dir` reached the opposite one from its CONTENT, so the
+    // same folder ripped through one door and failed through the other.
+    if is_folder {
+        crate::session::apply_folder_encryption_verdict(&mut reader, &mut disc)
+            .map_err(|e| -> io::Error { e.into() })?;
+    }
     // Apply the caller-resolved keys (lookup-free); decrypt_keys() then
     // yields them for the stream below. Propagate a failed application
     // rather than silently muxing an undecryptable stream.
