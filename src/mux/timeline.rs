@@ -259,7 +259,24 @@ impl SeamPlan {
         // skip any clip the frame is already past. Terminates at the first clip
         // that could contain it; a frame still below that clip's IN is
         // pre-mark material and the containment check drops and counts it.
-        if big_backstep && clip + 1 < self.clips.len() {
+        // ...and ONLY when the frame would otherwise be wrongly PLACED, i.e. it
+        // falls inside the current clip's marks.
+        //
+        // That qualifier is the whole safety of this branch. Advancing on any
+        // large backstep strands the track permanently: a corrupt PTS, or a
+        // legitimate STC discontinuity inside one clip, is also a >3s backstep,
+        // and once the cursor moves forward nothing moves it back — a forward
+        // step matches neither `past_out` nor `stepped_back`. Every later frame
+        // then sits below the new clip's IN and is dropped, so a track can lose
+        // a clip's worth of content (~17 minutes on the fixture table) while the
+        // only volume gate compares total drops against ALL tracks' frames.
+        //
+        // A frame OUTSIDE the current clip's marks needs no help: the
+        // containment check at the end drops and counts it, and the cursor stays
+        // put so the next good frame is placed normally. Only a frame INSIDE
+        // them would be silently placed at the old offset, which is the rewind.
+        let inside_current = raw_ns >= self.clips[clip].in_ns && raw_ns <= self.clips[clip].out_ns;
+        if big_backstep && inside_current && clip + 1 < self.clips.len() {
             clip += 1;
             while clip + 1 < self.clips.len() && raw_ns > self.clips[clip].out_ns {
                 clip += 1;
@@ -701,6 +718,43 @@ mod tests {
                 "a dropped frame must be counted, or the finish() gates are blind to it"
             );
         }
+    }
+
+    /// A glitched PTS must not strand a track on a later clip forever.
+    ///
+    /// Audit finding against the large-backstep branch: advancing on ANY >3s
+    /// backward step also fires for a corrupt PTS, or a legitimate STC
+    /// discontinuity inside one clip. Nothing moves the cursor back — a forward
+    /// step matches neither `past_out` nor `stepped_back` — so every later
+    /// frame sits below the new clip's IN and is dropped. On this table that is
+    /// ~17 minutes of one track, and the only volume gate compares total drops
+    /// against ALL tracks' frames, so it exits 0.
+    ///
+    /// The branch now requires the frame to be INSIDE the current clip's marks,
+    /// which is the only case that would otherwise be wrongly placed.
+    #[test]
+    fn a_glitched_pts_does_not_strand_a_track_on_a_later_clip() {
+        let clips = seamless_branching_clips();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        // Clip 0 is (188955000, 271486824) -> 4199.0s .. 6033.04s
+        let good = plan
+            .place(5_000_000_000_000, 1, false)
+            .expect("a frame inside clip 0 is placed");
+        // A damaged PTS well below clip 0's IN: a >3s backstep that is NOT a
+        // clip change. It should be dropped, and the cursor must not move.
+        assert!(
+            plan.place(4_000_000_000_000, 1, false).is_none(),
+            "a frame before the first clip's IN is not placeable"
+        );
+        // The very next good frame must still be placed, on the same clip.
+        let after = plan
+            .place(5_001_000_000_000, 1, false)
+            .expect("the track must recover on the next good frame, not be stranded");
+        assert_eq!(
+            after - good,
+            1_000_000_000,
+            "the recovered frame must land 1s after the last good one, on the same clip"
+        );
     }
 
     /// Build a real seamless-branching clip table (`00801.mpls`, 11 PlayItems, marks
