@@ -447,15 +447,25 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
     Ok(0)
 }
 
-/// Check if a sector has the CSS scramble flag set.
+/// Whether bits 4-5 of the sub-header byte 0x14 are set. NOTHING MORE.
 ///
-/// This is the RAW flag test — bits 4-5 of the sub-header byte 0x14 — used by
-/// the descramble loop (`decrypt::decrypt_sectors`), which has already committed
-/// to descrambling a known title's VOB data and only needs to skip the clear
-/// NAV packs interleaved in it. For the CRACK SCAN's "did this disc actually
-/// contain scrambled content?" decision (which must not false-positive on a
-/// clear stub), use [`is_scrambled_pack`] instead.
-pub fn is_scrambled(sector: &[u8]) -> bool {
+/// This is deliberately NOT called `is_scrambled`. Byte 0x14 only means "scrambling control" inside an MPEG-2 Program
+/// Stream pack; in an IFO, UDF or ISO 9660 sector it is whatever that format
+/// stores there. Treating the flag alone as proof of scrambling is what
+/// destroyed 1912 bytes of a real disc's `VIDEO_TS.IFO` — the sector carrying
+/// TT_SRPT — so the disc enumerated 38 titles and an image decrypted from it
+/// enumerated 10, silently, at exit 0.
+///
+/// **Callers want [`is_scrambled_pack`].** It asks the same question and also
+/// requires the pack start code, which every genuinely scrambled VOB sector
+/// carries and no IFO sector does.
+///
+/// It stays public only because an integration test asserts the flag
+/// extraction directly. It has no production callers, and its previous doc
+/// comment claimed one (`decrypt::decrypt_sectors`) that did not exist — so
+/// the name was an invitation and the documentation was an argument for
+/// accepting it.
+pub fn has_scramble_flag_bits(sector: &[u8]) -> bool {
     sector.len() >= 2048 && (sector[0x14] >> 4) & 0x03 != 0
 }
 
@@ -524,7 +534,10 @@ mod tests {
         for (i, b) in sector.iter_mut().enumerate().skip(0x80) {
             *b = ((i * 37 + 11) % 251) as u8;
         }
-        assert!(is_scrambled(&sector), "fixture must be a scrambled sector");
+        assert!(
+            has_scramble_flag_bits(&sector),
+            "fixture must be a scrambled sector"
+        );
         assert!(
             stevenson::attack_crib(&sector).is_some(),
             "fixture must yield a crib, or the mismatch branch is never entered"
@@ -580,9 +593,9 @@ mod tests {
     /// 20-byte slice; this test catches it.
     #[test]
     fn is_scrambled_short_buffer_is_false_no_panic() {
-        assert!(!is_scrambled(&[]));
-        assert!(!is_scrambled(&[0u8; 20])); // shorter than 0x14+1 even
-        assert!(!is_scrambled(&[0xFFu8; 2047])); // one byte short of a sector
+        assert!(!has_scramble_flag_bits(&[]));
+        assert!(!has_scramble_flag_bits(&[0u8; 20])); // shorter than 0x14+1 even
+        assert!(!has_scramble_flag_bits(&[0xFFu8; 2047])); // one byte short of a sector
     }
 
     /// is_scrambled keys on bits 4-5 of byte 0x14 (the CSS scramble field).
@@ -607,7 +620,7 @@ mod tests {
         ] {
             s[0x14] = flag;
             assert_eq!(
-                is_scrambled(&s),
+                has_scramble_flag_bits(&s),
                 expected,
                 "flag byte {flag:#04x} scramble detection"
             );
@@ -624,7 +637,10 @@ mod tests {
     fn is_scrambled_exact_sector_length_accepted() {
         let mut s = vec![0u8; 2048];
         s[0x14] = 0x30;
-        assert!(is_scrambled(&s), "exactly 2048 bytes must be eligible");
+        assert!(
+            has_scramble_flag_bits(&s),
+            "exactly 2048 bytes must be eligible"
+        );
     }
 
     /// Fix 3 hardening: `is_scrambled_pack` (the crack-scan evidence gate)
@@ -647,7 +663,10 @@ mod tests {
             "0x14 bits without the MPEG-PS pack-start must NOT count as a scrambled pack"
         );
         // The looser descramble-gate check still sees the raw flag.
-        assert!(is_scrambled(&s), "is_scrambled keys on the 0x14 flag alone");
+        assert!(
+            has_scramble_flag_bits(&s),
+            "has_scramble_flag_bits keys on the 0x14 flag alone"
+        );
         // A near-miss pack-start (wrong final byte) is still rejected.
         s[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBB]);
         assert!(
@@ -858,7 +877,7 @@ mod tests {
         ifo_like[0x00..0x04].copy_from_slice(&[0x00, 0x26, 0x00, 0x00]); // not a pack
         ifo_like[0x14] = 0x15; // bits 4-5 set: reads as "scrambled" to the raw test
         assert!(
-            is_scrambled(&ifo_like) && !is_scrambled_pack(&ifo_like),
+            has_scramble_flag_bits(&ifo_like) && !is_scrambled_pack(&ifo_like),
             "fixture must be exactly the case the two predicates disagree on"
         );
 
