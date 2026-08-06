@@ -1680,6 +1680,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A demux export whose seam plan drops every frame must FAIL, not write a
+    /// directory of empty track files and report success.
+    ///
+    /// Audit finding: this sink builds its timeline with
+    /// `TimelineContinuity::with_clips` but no test ever gave it a title with
+    /// usable PlayItem marks, so `frames_mapped` and `dropped_total()` were
+    /// always zero and BOTH gates in `finish` were unreachable. Deleting either
+    /// left the whole suite green while a `demux://` export of a
+    /// seamless-branching title wrote zero-byte track files beside a populated
+    /// chapters document, at exit 0.
+    #[test]
+    fn a_demux_export_the_seam_plan_emptied_fails() {
+        let dir = tempdir();
+        let mut title = title_with(vec![video_stream(Codec::H264)], vec![None]);
+        // Two clips (SeamPlan needs >= 2 with strictly increasing IN marks)
+        // covering 100s..200s and 200s..300s in 45 kHz ticks.
+        title.clips = vec![
+            crate::disc::Clip {
+                clip_id: "00000".into(),
+                in_time: 100 * 45_000,
+                out_time: 200 * 45_000,
+                duration_secs: 100.0,
+                source_packets: 0,
+            },
+            crate::disc::Clip {
+                clip_id: "00001".into(),
+                in_time: 200 * 45_000,
+                out_time: 300 * 45_000,
+                duration_secs: 100.0,
+                source_packets: 0,
+            },
+        ];
+        let mut sink = DemuxSink::create(&dir, &title, &DemuxOptions::default()).unwrap();
+
+        // Frames far before the first IN mark: the plan places none of them.
+        for (i, pts) in [0i64, 1_000_000_000].iter().enumerate() {
+            let f = PesFrame {
+                coding: None,
+                source: None,
+                track: 0,
+                pts: *pts,
+                keyframe: true,
+                data: vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, i as u8],
+                duration_ns: None,
+            };
+            let _ = Stream::write(&mut sink, &f);
+        }
+
+        let err = Stream::finish(&mut sink).expect_err("an emptied export must fail");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_SINK_WROTE_NOTHING),
+            "a fully-dropped demux export must report SinkWroteNothing, not success"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn sink_read_returns_write_only() {
         let dir = tempdir();
