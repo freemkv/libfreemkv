@@ -203,7 +203,7 @@ impl SeamPlan {
     ///
     /// `None` means DROP: the frame lies outside every clip's marks, so the
     /// playlist does not include it.
-    fn place(&mut self, raw_ns: i64, track: usize, drives: bool) -> Option<i64> {
+    fn place(&mut self, raw_ns: i64, track: usize, has_reorder: bool) -> Option<i64> {
         if self.cursors.len() <= track {
             self.cursors.resize(
                 track + 1,
@@ -242,14 +242,19 @@ impl SeamPlan {
             // clip's IN. What counts as "at" differs by track, and getting it
             // wrong strands a track on the previous clip's offset:
             //
-            // - VIDEO is dense (a frame every ~42ms at 24fps), so its first
-            //   frame of the new clip lands ON the mark. Requiring that is what
-            //   keeps a B-frame reorder dip near the end of a clip — which is
-            //   also a backward step, and inside the next clip's range during
-            //   an overlap — from being mistaken for a crossing.
-            // - PASSIVE tracks have no reorder, so ANY backward step is a
-            //   crossing. They can also be sparse: a subtitle may have no event
-            //   near the mark at all, and its first frame after the join can
+            // - A track WITH B-frame reorder (any video track) is dense — a
+            //   frame every ~42ms at 24fps — so its first frame of the new clip
+            //   lands ON the mark. Requiring that is what keeps a reorder dip
+            //   near the end of a clip, which is also a backward step and lies
+            //   inside the next clip's range during an overlap, from being read
+            //   as a crossing. This is keyed on REORDER, not on driving epochs:
+            //   a Dolby Vision enhancement layer is a second video track that
+            //   does not drive epochs but does reorder, and giving it the
+            //   permissive rule made its reorder dip look like a join and threw
+            //   it out of step with the base layer it must be co-timed with.
+            // - Tracks WITHOUT reorder (audio, subtitles) can take any backward
+            //   step as a crossing. They are also sparse: a subtitle may have
+            //   no event near the mark, so its first frame after the join can
             //   land well past it. Holding those to the video window left them
             //   on the old clip until their PTS passed its OUT, mistiming them
             //   by the overlap in between.
@@ -258,7 +263,7 @@ impl SeamPlan {
             // IN, which is what stops one backward step walking the cursor to
             // the end of the list.
             let stepped_back = pos.last_raw_ns.is_some_and(|last| raw_ns < last)
-                && if drives {
+                && if has_reorder {
                     (raw_ns.saturating_sub(next_in)).abs() <= CLIP_START_TOLERANCE_NS
                 } else {
                     raw_ns >= next_in.saturating_sub(CLIP_START_TOLERANCE_NS)
@@ -417,12 +422,18 @@ impl TimelineContinuity {
     ///
     /// Dropping only ever happens under a [`SeamPlan`]: it is material outside
     /// the playlist's marks, which the title does not include.
-    pub(crate) fn map(&mut self, raw_pts_ns: i64, drives_epoch: bool, track: usize) -> Option<i64> {
+    pub(crate) fn map(
+        &mut self,
+        raw_pts_ns: i64,
+        drives_epoch: bool,
+        track: usize,
+        has_reorder: bool,
+    ) -> Option<i64> {
         if self.seams.is_some() {
             // Take the plan out for the call so `place` can borrow `self`
             // mutably without fighting the borrow checker over the whole struct.
             let mut plan = self.seams.take().expect("checked is_some");
-            let placed = plan.place(raw_pts_ns, track, drives_epoch);
+            let placed = plan.place(raw_pts_ns, track, has_reorder);
             self.seams = Some(plan);
             if let Some(p) = placed {
                 // Keep the frontier meaningful for anything that reads it, and
@@ -782,7 +793,7 @@ mod tests {
         let c0_in = mpls_ticks_to_ns(clips[0].in_time);
         let c0_out = mpls_ticks_to_ns(clips[0].out_time);
 
-        let first = tc.map(c0_in, true, 0).expect("first frame");
+        let first = tc.map(c0_in, true, 0, true).expect("first frame");
         assert_eq!(first, 0, "clip 0 starts the output timeline at zero");
         assert_eq!(
             tc.offset_ns, -c0_in,
@@ -790,17 +801,20 @@ mod tests {
         );
         assert_eq!(tc.high_ns, Some(0), "video advances the frontier");
 
-        let later = tc.map(c0_in + 5_000_000_000, true, 0).expect("later frame");
+        let later = tc
+            .map(c0_in + 5_000_000_000, true, 0, true)
+            .expect("later frame");
         assert_eq!(later, 5_000_000_000);
         assert_eq!(tc.high_ns, Some(5_000_000_000), "frontier follows video");
 
         // A passive track must NOT advance the frontier.
         let before = tc.high_ns;
-        tc.map(c0_in + 1_000_000_000, false, 1).expect("audio");
+        tc.map(c0_in + 1_000_000_000, false, 1, false)
+            .expect("audio");
         assert_eq!(tc.high_ns, before, "passive tracks never move the frontier");
 
         // Across the join the frontier keeps rising, never rewinds.
-        let across = tc.map(c0_out, true, 0).expect("clip 0 OUT");
+        let across = tc.map(c0_out, true, 0, true).expect("clip 0 OUT");
         assert!(
             across >= 5_000_000_000,
             "timeline must not rewind at a join"
@@ -995,6 +1009,40 @@ mod tests {
         );
     }
 
+    /// A second VIDEO track (a Dolby Vision enhancement layer) must get the
+    /// reorder-safe crossing window even though it does not drive epochs.
+    ///
+    /// Audit finding: the rule was keyed on `drives`, so the EL took the branch
+    /// whose premise is "no reorder". Its ordinary reorder dip near the end of a
+    /// clip — a backward step that, during an overlap, also lands inside the
+    /// next clip's range — was then read as a join, and the EL was placed on the
+    /// next clip's offset: out of step with the base-layer frame it must be
+    /// co-timed with, by the width of the overlap.
+    #[test]
+    fn a_second_video_track_keeps_the_reorder_safe_window() {
+        let clips = seamless_branching_clips();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let c0_in = mpls_ticks_to_ns(clips[0].in_time);
+        let c0_out = mpls_ticks_to_ns(clips[0].out_time);
+        let c1_in = mpls_ticks_to_ns(clips[1].in_time);
+
+        // Track 2 is the enhancement layer: video, does not drive epochs.
+        let a = c0_out - 300_000_000;
+        let base = plan.place(a, 2, true).expect("EL in clip 0");
+        let dip = a - 42_000_000;
+        assert!(
+            dip >= c1_in,
+            "fixture: the dip lies inside clip 1's range too"
+        );
+        let got = plan.place(dip, 2, true).expect("dip placed");
+        assert_eq!(
+            got,
+            base - 42_000_000,
+            "an enhancement layer's reorder dip must not be read as a join"
+        );
+        let _ = c0_in;
+    }
+
     /// A clip table that is not one advancing clock must fall back to
     /// inference rather than be placed.
     ///
@@ -1098,9 +1146,9 @@ mod tests {
     #[test]
     fn map_without_a_plan_is_the_old_behaviour() {
         let mut tc = TimelineContinuity::new();
-        assert_eq!(tc.map(0, true, 0), Some(0));
-        assert_eq!(tc.map(5 * S, true, 0), Some(5 * S));
-        assert_eq!(tc.map(25 * S, false, 1), Some(25 * S));
+        assert_eq!(tc.map(0, true, 0, true), Some(0));
+        assert_eq!(tc.map(5 * S, true, 0, true), Some(5 * S));
+        assert_eq!(tc.map(25 * S, false, 1, false), Some(25 * S));
         assert_eq!(tc.offset_ns, 0);
     }
 

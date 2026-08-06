@@ -866,9 +866,18 @@ impl Stream for DemuxSink {
         // an audio ES before the video ES, in which case track 0 is audio and a
         // non-video epoch driver would ratchet the frontier on sparse/lagging PTS.
         let drives = Some(frame.track) == self.ref_video_track;
+        // Keyed on the track KIND, not on driving epochs: a second video track
+        // (a Dolby Vision enhancement layer) does not drive epochs but does
+        // carry B-frame reorder, and the seam-crossing rule differs on exactly
+        // that property.
+        let is_video = self
+            .tracks
+            .get(frame.track)
+            .and_then(|s| s.as_ref())
+            .is_some_and(|t| t.kind == TrackKind::Video);
         // See `MkvMuxer::write_frame`: `None` is material outside the
         // playlist's clip marks and is dropped rather than emitted.
-        let Some(pts) = self.timeline.map(frame.pts, drives, frame.track) else {
+        let Some(pts) = self.timeline.map(frame.pts, drives, frame.track, is_video) else {
             return Ok(());
         };
         if drives {
