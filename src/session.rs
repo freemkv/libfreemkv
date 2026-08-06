@@ -520,16 +520,32 @@ fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result
     };
     let base = extent.start_lba;
     let mut unit = vec![0u8; UNIT_SECTORS as usize * SECTOR_BYTES];
+    let mut sampled = 0u32;
     for i in 0..AACS_PROBE_UNITS as u32 {
-        let lba = base + i * UNIT_SECTORS;
-        if lba + UNIT_SECTORS > base + extent.sector_count {
+        // Saturating: `start_lba` and `sector_count` come off the medium, and a
+        // crafted or corrupt extent must not wrap this bound into a read past
+        // the end of the content.
+        let Some(lba) = base.checked_add(i.saturating_mul(UNIT_SECTORS)) else {
+            break;
+        };
+        let end = base.saturating_add(extent.sector_count);
+        if lba.saturating_add(UNIT_SECTORS) > end {
             break;
         }
         debug_assert!(is_unit_aligned(lba, base));
         reader.read_sectors(lba, UNIT_SECTORS as u16, &mut unit, false)?;
+        sampled += 1;
         if aacs_unit_needs_decrypt(&unit, disc.content_format) {
             return Ok(true);
         }
+    }
+    // Nothing was actually sampled — the largest title is shorter than one
+    // aligned unit, so there is no evidence either way. "Not encrypted" is the
+    // dangerous default here: it would clear the structural verdict an `AACS`
+    // directory raised and rip ciphertext as though it were video, at exit 0.
+    // With no evidence, keep the structural verdict.
+    if sampled == 0 {
+        return Ok(true);
     }
     Ok(false)
 }
