@@ -734,3 +734,93 @@ fn write_and_mount_externally() {
         "the OS mounted the image but read back different bytes"
     );
 }
+
+/// Diagnostic (opt-in): verify the DVD placement invariant for every title set
+/// in a REAL folder. `ifo.rs` derives a title's extents as
+/// `file_start_lba(VTS_nn_0.IFO) + vtstt_vobs`, so that sum must land exactly on
+/// `VTS_nn_1.VOB` or the mux reads the wrong sectors for that title.
+///
+/// Run with: `FMKV_DVD_FOLDER=/path/to/tree cargo test --lib
+/// dvd_placement_invariant_on_a_real_folder -- --ignored --nocapture`
+#[test]
+#[ignore = "diagnostic: needs FMKV_DVD_FOLDER pointing at a real VIDEO_TS tree"]
+fn dvd_placement_invariant_on_a_real_folder() {
+    let Ok(dir) = std::env::var("FMKV_DVD_FOLDER") else {
+        return;
+    };
+    let mut img = DirImage::open(std::path::Path::new(&dir)).expect("open");
+    let fs = udf::read_filesystem(&mut img).expect("udf");
+    let mut bad = 0;
+    for n in 1..=25u32 {
+        let ifo = format!("/VIDEO_TS/VTS_{n:02}_0.IFO");
+        let vob = format!("/VIDEO_TS/VTS_{n:02}_1.VOB");
+        let (Ok(ifo_lba), Ok(vob_lba)) = (
+            fs.file_start_lba(&mut img, &ifo),
+            fs.file_start_lba(&mut img, &vob),
+        ) else {
+            continue;
+        };
+        let head = fs
+            .read_file_prefix(&mut img, &ifo, 0xC8)
+            .unwrap_or_default();
+        if head.len() < 0xC8 {
+            println!("VTS {n:02}: IFO shorter than 0xC8");
+            continue;
+        }
+        let vtstt = u32::from_be_bytes([head[0xC4], head[0xC5], head[0xC6], head[0xC7]]);
+        let want = ifo_lba + vtstt;
+        if want != vob_lba {
+            bad += 1;
+        }
+        println!(
+            "VTS {n:02}: ifo={ifo_lba} vtstt={vtstt} want={want} vob={vob_lba} {}",
+            if want == vob_lba { "ok" } else { "MISMATCH" }
+        );
+    }
+    println!("{bad} title set(s) misplaced");
+    assert_eq!(
+        bad, 0,
+        "the placement invariant must hold for every title set"
+    );
+}
+
+/// Diagnostic (opt-in): dump every title an image scan produces, with the
+/// numbers `canonical_title_order` actually sorts on.
+///
+/// Run: `FMKV_IMAGE=/path/to.iso cargo test --lib dump_titles_for_an_image
+/// -- --ignored --nocapture`
+#[test]
+#[ignore = "diagnostic: needs FMKV_IMAGE"]
+fn dump_titles_for_an_image() {
+    let Ok(path) = std::env::var("FMKV_IMAGE") else {
+        return;
+    };
+    let (disc, _r) = crate::session::scan_iso(
+        std::path::Path::new(&path),
+        crate::disc::ScanOptions::default(),
+    )
+    .expect("scan");
+    println!(
+        "capacity_bytes={} format={:?} css_error={:?} titles={}",
+        disc.capacity_bytes,
+        disc.format,
+        disc.css.as_ref().map(|c| format!("{:?}", c.crack_span)),
+        disc.titles.len()
+    );
+    for (i, t) in disc.titles.iter().enumerate() {
+        println!(
+            "  [{i}] playlist={:<16} dur={:>8.2}s size={:>12} extents={} streams={}",
+            t.playlist,
+            t.duration_secs,
+            t.size_bytes,
+            t.extents.len(),
+            t.streams.len()
+        );
+        for e in t.extents.iter().take(3) {
+            println!(
+                "        extent lba={} sectors={}",
+                e.start_lba, e.sector_count
+            );
+        }
+    }
+}
