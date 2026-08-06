@@ -987,6 +987,12 @@ mod tests {
     /// scramble flag.
     fn make_css_sector(title_key: &[u8; 5], seed: &[u8; 5], body_fill: u8) -> (Vec<u8>, Vec<u8>) {
         let mut sector = vec![body_fill; 2048];
+        // A real scrambled DVD sector is an MPEG-2 PS pack, so it begins with
+        // the pack start code. The descrambler requires it before trusting
+        // byte 0x14 — without it this fixture is a sector shape that cannot
+        // occur on a disc, and the test would pass while the production gate
+        // rejected every sector like it.
+        sector[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         sector[0x14] = 0x30; // scramble flag (bits 4-5)
         sector[0x54..0x59].copy_from_slice(seed);
         let plaintext = sector.clone();
@@ -1064,6 +1070,9 @@ mod tests {
         period: usize,
     ) -> (Vec<u8>, Vec<u8>) {
         let mut plaintext = vec![0u8; 2048];
+        // Real scrambled DVD sectors are MPEG-2 PS packs; the scramble policy
+        // requires the pack start code as well as the flag bits.
+        plaintext[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         plaintext[0x14] = 0x10; // scramble flag
         // Periodic run from 0x59 (just above the seed) through 0x80 and on into
         // the encrypted region; phase anchored to offset 0 so it is continuous
