@@ -682,6 +682,9 @@ mod tests {
         for (i, b) in template.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(29).wrapping_add(3);
         }
+        // Real scrambled DVD sectors are MPEG-2 PS packs; the scramble policy
+        // requires the pack start code as well as the flag bits.
+        template[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         template[0x14] = 0x30; // scramble bits (4-5) set → flags == 0x03
         let pristine = template;
 

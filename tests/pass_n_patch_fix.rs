@@ -42,6 +42,10 @@ fn css_decrypt_of_an_uncrackable_sector_still_descrambles() {
     // unit key either opens a unit or does not, whereas a CSS title key is
     // recovered from data whose recoverability varies sector by sector.
     let mut sector = vec![0xFFu8; 2048];
+    // Scrambled DVD sectors are MPEG-2 PS packs. The descramble policy requires
+    // the pack start code as well as the flag bits, because byte 0x14 means
+    // something else entirely in an IFO, UDF or ISO 9660 sector.
+    sector[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
     sector[0x14] |= 0x30; // CSS scramble flag, bits 4-5
 
     let title_key: [u8; 5] = [0x42, 0x13, 0x37, 0xBE, 0xEF];
