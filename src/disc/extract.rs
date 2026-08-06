@@ -300,15 +300,33 @@ impl Disc {
     ) -> DecryptKeys {
         // Gather the title VOB extents for this VTS (VTS_xx_1.VOB .. _9.VOB;
         // VTS_xx_0.VOB is the menu and is clear, so excluded from the crack).
+        // Gather this VTS's title VOBs BY NAME, ascending.
+        //
+        // `planned` comes from walking the UDF directory, which yields File
+        // Identifier Descriptors in on-disc order — authoring order, with no
+        // guarantee it matches playback order. Relying on it would leave the
+        // crack starting wherever the disc's directory happened to list first.
+        //
+        // DVD-Video numbers a title set's VOBs in playback order by spec
+        // (VTS_xx_1.VOB .. VTS_xx_9.VOB, single digit), so ascending name IS
+        // playback order and it is deterministic regardless of directory
+        // layout. That matters because ORDER decides correctness here: see the
+        // note below on the shared crack budget.
+        let mut files: Vec<&PlannedFile> = planned
+            .iter()
+            .filter(|pf| {
+                vts_group_of(&pf.disc_name).as_deref() == Some(vts) && is_title_vob(&pf.disc_name)
+            })
+            .collect();
+        files.sort_by(|a, b| a.disc_name.cmp(&b.disc_name));
+
         let mut extents: Vec<crate::disc::Extent> = Vec::new();
-        for pf in planned {
-            if vts_group_of(&pf.disc_name).as_deref() == Some(vts) && is_title_vob(&pf.disc_name) {
-                for &(abs_lba, byte_len) in &pf.extents {
-                    extents.push(crate::disc::Extent {
-                        start_lba: abs_lba,
-                        sector_count: (byte_len as u64).div_ceil(SECTOR_BYTES_U64) as u32,
-                    });
-                }
+        for pf in files {
+            for &(abs_lba, byte_len) in &pf.extents {
+                extents.push(crate::disc::Extent {
+                    start_lba: abs_lba,
+                    sector_count: (byte_len as u64).div_ceil(SECTOR_BYTES_U64) as u32,
+                });
             }
         }
         if extents.is_empty() {
@@ -330,8 +348,8 @@ impl Disc {
         // every VOB in the VTS is descrambled with the wrong key: corrupt PES
         // behind an intact header, written out as a complete extract at exit 0.
         //
-        // `planned` is already in playback order (VTS_xx_1.VOB..\_9.VOB, extents
-        // in file order), so the correct action is to leave the vector alone.
+        // The files above are ordered by name and each file's own extents stay
+        // in file order, which together is playback order for a DVD title set.
         // Crack against the raw (still-scrambled) inner reader, NOT the
         // decrypting view — `crack_key` runs the descrambler itself.
         match crate::css::crack_key(dec.inner_mut(), &extents, 64) {
