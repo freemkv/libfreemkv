@@ -277,6 +277,13 @@ fn crack_key_scan(
             }
             let n = (ext.sector_count - i).min(batch);
             let want = n as usize * 2048;
+            // How far the cursor advances. Set from the bytes actually READ on
+            // the Ok path so a short read is RETRIED from where it stopped
+            // rather than skipped: bounding only the inspection (which is what
+            // stops stale buffer bytes being scanned) would otherwise leave
+            // those sectors unexamined, quietly shrinking the crack's coverage
+            // on exactly the damaged media where a key is hardest to find.
+            let mut advance = n;
             match reader.read_sectors(ext.start_lba + i, n as u16, &mut buf[..want], true) {
                 Ok(got) => {
                     // A readable batch: the gate is open — reset the locked run.
@@ -292,6 +299,8 @@ fn crack_key_scan(
                     // installed and its wrong descrambles are only partly caught
                     // by the per-sector crib.
                     let usable = (got / 2048).min(n as usize);
+                    // At least one, so a source returning Ok(0) cannot spin here.
+                    advance = (usable as u32).max(1);
                     for s in 0..usable {
                         tried += 1;
                         let sect = &buf[s * 2048..(s + 1) * 2048];
@@ -330,7 +339,7 @@ fn crack_key_scan(
                     }
                 }
             }
-            i += n;
+            i += advance;
         }
     }
 
