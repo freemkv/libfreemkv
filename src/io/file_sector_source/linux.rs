@@ -23,7 +23,7 @@
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 
-pub(super) fn hint_sequential(file: &File, _len_bytes: u64) {
+pub(crate) fn hint_sequential(file: &File, _len_bytes: u64) {
     // Best-effort: return value ignored. A fadvise failure has no
     // user-observable consequence.
     unsafe {
@@ -34,7 +34,7 @@ pub(super) fn hint_sequential(file: &File, _len_bytes: u64) {
 /// Drop pages in the half-open byte range `[start, start+len)` from
 /// the page cache. Called periodically by `read_sectors` to bound the
 /// read-side page cache pressure.
-pub(super) fn drop_window(file: &File, start: u64, len: u64) {
+pub(crate) fn drop_window(file: &File, start: u64, len: u64) {
     unsafe {
         libc::posix_fadvise(
             file.as_raw_fd(),
@@ -58,7 +58,7 @@ pub(super) fn drop_window(file: &File, start: u64, len: u64) {
 /// can only pre-stage a tiny slice of the next batch. An explicit
 /// `readahead()` of the same size as the current batch tells the
 /// kernel to queue the full next-batch read now.
-pub(super) fn prefetch(file: &File, offset: u64, len: u64) {
+pub(crate) fn prefetch(file: &File, offset: u64, len: u64) {
     unsafe {
         libc::readahead(file.as_raw_fd(), offset as i64, len as usize);
     }
