@@ -2,10 +2,12 @@ name: CI
 
 on:
   push:
-    # `dev` is where work lands and where CI must be green. `main` only ever
-    # moves at release time, to the tagged commit, so a push to it is the
-    # release validation run rather than day-to-day feedback.
-    branches: [main, dev]
+    # dev -> qa -> main. `dev` is where work lands and is meant to be pushed
+    # to often: these are the FAST checks, so a mistake surfaces in minutes.
+    # `qa` is the release candidate — it runs these too, plus the expensive
+    # suite in qa.yml. `main` only ever moves at release time, to a tagged
+    # commit that was already green on qa.
+    branches: [main, dev, qa]
   pull_request:
 
 jobs:
@@ -27,7 +29,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: freemkv/freemkv-unlock
-          ref: dev
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
@@ -65,7 +67,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: freemkv/freemkv-unlock
-          ref: dev
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
@@ -92,7 +94,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: freemkv/freemkv-unlock
-          ref: dev
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
@@ -119,7 +121,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: freemkv/freemkv-unlock
-          ref: dev
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
@@ -150,19 +152,19 @@ jobs:
       - uses: actions/checkout@v5
         with: { path: libfreemkv }
       - uses: actions/checkout@v5
-        with: { repository: freemkv/freemkv-unlock, ref: dev, path: freemkv-unlock }
+        with: { repository: freemkv/freemkv-unlock, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-unlock }
       - uses: actions/checkout@v5
-        with: { repository: freemkv/freemkv-keysources, ref: dev, path: freemkv-keysources }
+        with: { repository: freemkv/freemkv-keysources, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-keysources }
       - uses: actions/checkout@v5
-        with: { repository: freemkv/freemkv-engine, ref: dev, path: freemkv-engine }
+        with: { repository: freemkv/freemkv-engine, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-engine }
       - uses: actions/checkout@v5
-        with: { repository: freemkv/freemkv-i18n, ref: dev, path: freemkv-i18n }
+        with: { repository: freemkv/freemkv-i18n, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-i18n }
       - uses: actions/checkout@v5
-        with: { repository: freemkv/freemkv, ref: dev, path: freemkv }
+        with: { repository: freemkv/freemkv, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv }
       - uses: actions/checkout@v5
-        with: { repository: freemkv/autorip, ref: dev, path: autorip }
+        with: { repository: freemkv/autorip, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: autorip }
       - uses: actions/checkout@v5
-        with: { repository: freemkv/bdemu, ref: dev, path: bdemu }
+        with: { repository: freemkv/bdemu, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: bdemu }
       - name: Point every dependent at THIS libfreemkv commit
         shell: bash
         run: |
