@@ -843,10 +843,39 @@ fn dump_vts_ifo_reads_for_an_image() {
         let p = format!("/VIDEO_TS/VTS_{n:02}_0.IFO");
         match fs.read_file(&mut img, &p) {
             Ok(b) => {
-                let magic = String::from_utf8_lossy(&b[..12.min(b.len())]).to_string();
-                println!("VTS {n:02}: read ok, {} bytes, magic={magic:?}", b.len());
+                // Hash the CONTENT, not just the length: two IFOs of equal
+                // size and magic can still differ, and comparing only length
+                // and magic is what made an earlier pass of this diagnostic
+                // wrongly report the images as identical.
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for byte in &b {
+                    h ^= *byte as u64;
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                println!("VTS {n:02}: {} bytes fnv={h:016x}", b.len());
             }
             Err(e) => println!("VTS {n:02}: READ FAILED: {e}"),
         }
+    }
+}
+
+/// Diagnostic (opt-in): how many title sets survive `parse_vmg`, and how many
+/// titles does each carry? Splits "the set was dropped" from "the set parsed
+/// but yielded fewer titles".
+#[test]
+#[ignore = "diagnostic: needs FMKV_IMAGE"]
+fn dump_title_sets_for_an_image() {
+    let Ok(path) = std::env::var("FMKV_IMAGE") else {
+        return;
+    };
+    let mut img =
+        crate::io::file_sector_source::FileSectorSource::open(std::path::Path::new(&path))
+            .expect("open");
+    let fs = udf::read_filesystem(&mut img).expect("udf");
+    let info = crate::ifo::parse_vmg(&mut img, &fs).expect("parse_vmg");
+    let total: usize = info.title_sets.iter().map(|ts| ts.titles.len()).sum();
+    println!("title_sets={} total_titles={total}", info.title_sets.len());
+    for ts in &info.title_sets {
+        println!("  vts={} titles={}", ts.vts_number, ts.titles.len());
     }
 }
