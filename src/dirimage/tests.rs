@@ -839,6 +839,27 @@ fn dump_vts_ifo_reads_for_an_image() {
         crate::io::file_sector_source::FileSectorSource::open(std::path::Path::new(&path))
             .expect("open");
     let fs = udf::read_filesystem(&mut img).expect("udf");
+    // VIDEO_TS.IFO FIRST: it carries TT_SRPT, which decides the whole
+    // title-set map. Checking only the per-VTS IFOs leaves the input that
+    // actually drives enumeration unverified.
+    match fs.read_file(&mut img, "/VIDEO_TS/VIDEO_TS.IFO") {
+        Ok(b) => {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in &b {
+                h ^= *byte as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            let lba = fs.file_start_lba(&mut img, "/VIDEO_TS/VIDEO_TS.IFO");
+            let ext = fs.file_extents(&mut img, "/VIDEO_TS/VIDEO_TS.IFO");
+            println!(
+                "VMG    : {} bytes fnv={h:016x} start_lba={:?} extents={:?}",
+                b.len(),
+                lba.as_ref().map_err(|e| e.to_string()),
+                ext.as_ref().map(|v| v.to_vec()).map_err(|e| e.to_string())
+            );
+        }
+        Err(e) => println!("VMG    : READ FAILED: {e}"),
+    }
     for n in 1..=20u32 {
         let p = format!("/VIDEO_TS/VTS_{n:02}_0.IFO");
         match fs.read_file(&mut img, &p) {
@@ -852,7 +873,21 @@ fn dump_vts_ifo_reads_for_an_image() {
                     h ^= *byte as u64;
                     h = h.wrapping_mul(0x0000_0100_0000_01b3);
                 }
-                println!("VTS {n:02}: {} bytes fnv={h:016x}", b.len());
+                // The two reader-dependent calls parse_vts makes AFTER this
+                // read are file_start_lba and the PGCIT parse. Report both.
+                let lba = fs.file_start_lba(&mut img, &p);
+                let pgcit = if b.len() >= 0xD0 {
+                    u32::from_be_bytes([b[0xCC], b[0xCD], b[0xCE], b[0xCF]])
+                } else {
+                    0
+                };
+                let pgcit_off = pgcit as usize * 2048;
+                println!(
+                    "VTS {n:02}: {} bytes fnv={h:016x} lba={:?} pgcit_sector={pgcit} pgcit_off={pgcit_off} in_file={}",
+                    b.len(),
+                    lba.as_ref().map_err(|e| e.to_string()),
+                    pgcit_off < b.len()
+                );
             }
             Err(e) => println!("VTS {n:02}: READ FAILED: {e}"),
         }
