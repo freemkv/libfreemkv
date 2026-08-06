@@ -1697,6 +1697,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // would otherwise yield a structurally-empty MKV with no clusters or
         // cues. Surface that as an error rather than writing valid-but-empty
         // output.
+        // Order matters. A title the seam plan dropped ENTIRELY also has a zero
+        // frame count, and `MkvInvalid` is classified by
+        // `is_skippable_title_stub` as an empty nav/menu stub — so reporting it
+        // that way would make an all-titles rip drop a real feature and finish
+        // the rest at exit 0. Decide the seam case FIRST, with a code that is
+        // not skippable.
+        if self.frame_count == 0 && self.continuity.dropped_total() > 0 {
+            return Err(crate::error::Error::SinkWroteNothing.into());
+        }
         if self.frame_count == 0 {
             return Err(crate::error::Error::MkvInvalid.into());
         }

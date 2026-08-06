@@ -447,6 +447,35 @@ fn an_oversized_vob_offset_leaves_a_gap_rather_than_failing() {
     assert!(buf.iter().all(|&b| b == 0));
 }
 
+/// A file inside a SUBDIRECTORY of `VIDEO_TS` must still have its data placed.
+///
+/// Audit finding. The DVD branch places only the files directly inside
+/// `VIDEO_TS`, because only those carry the IFO-relative constraints — and the
+/// follow-up loop skipped that directory entirely, so anything one level deeper
+/// got a File Entry declaring the file's real size with no extents behind it.
+/// It appeared in the tree at full length and read back as nothing, at exit 0.
+/// The identical folder under `BDMV/` was always placed correctly, which is
+/// what made the gap easy to miss.
+#[test]
+fn a_file_below_video_ts_is_placed_not_just_declared() {
+    let s = Scratch::new("dvdsubdir");
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    s.file("VIDEO_TS/VTS_01_0.IFO", &vts_ifo(SECTOR, 0, 2));
+    s.file("VIDEO_TS/VTS_01_1.VOB", &pattern(1, SECTOR));
+    let payload = pattern(7, SECTOR);
+    s.file("VIDEO_TS/EXTRA/notes.bin", &payload);
+
+    let mut img = DirImage::open(s.path()).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let got = fs
+        .read_file(&mut img, "/VIDEO_TS/EXTRA/notes.bin")
+        .expect("the file must be readable");
+    assert_eq!(
+        got, payload,
+        "a file below VIDEO_TS must read back as its real contents, not zeros"
+    );
+}
+
 /// A VOBS offset far past the content must be REFUSED, not honoured.
 ///
 /// Audit finding. The planner honours a title set's declared VOBS offset

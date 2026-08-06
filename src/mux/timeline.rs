@@ -1022,7 +1022,6 @@ mod tests {
     fn a_second_video_track_keeps_the_reorder_safe_window() {
         let clips = seamless_branching_clips();
         let mut plan = SeamPlan::from_clips(&clips).expect("plan");
-        let c0_in = mpls_ticks_to_ns(clips[0].in_time);
         let c0_out = mpls_ticks_to_ns(clips[0].out_time);
         let c1_in = mpls_ticks_to_ns(clips[1].in_time);
 
@@ -1040,7 +1039,6 @@ mod tests {
             base - 42_000_000,
             "an enhancement layer's reorder dip must not be read as a join"
         );
-        let _ = c0_in;
     }
 
     /// A clip table that is not one advancing clock must fall back to
