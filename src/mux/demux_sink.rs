@@ -889,6 +889,18 @@ impl Stream for DemuxSink {
             return Ok(());
         }
         self.finished = true;
+        // Same reporting as the MKV muxer's finish. Frames the playlist's clip
+        // marks exclude are dropped on purpose, but the count must not be
+        // write-only in one sink and reported in the other — an unexpected
+        // volume here is how a demux ends up quietly short.
+        let seam_dropped = self.timeline.dropped_total();
+        if seam_dropped > 0 {
+            tracing::info!(
+                target: "mux",
+                dropped = seam_dropped,
+                "frames outside the playlist's clip marks were dropped at clip joins"
+            );
+        }
         // Flush each track's codec writer, then the buffered file.
         for slot in self.tracks.iter_mut() {
             if let Some(t) = slot.as_mut() {

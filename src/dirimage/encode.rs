@@ -434,8 +434,11 @@ fn file_entry(
     // s[34..36] ICB flags: 0 => short allocation descriptors. `udf.rs:601`
     // reads exactly this word to pick its AD stride.
     s[34..36].copy_from_slice(&0u16.to_le_bytes());
-    s[36..40].copy_from_slice(&0u32.to_le_bytes()); // uid: invalid/none
-    s[40..44].copy_from_slice(&0u32.to_le_bytes()); // gid: invalid/none
+    // UDF's sentinel for "not specified" is 0xFFFFFFFF, not 0 — 0 is a real
+    // uid/gid (root). A synthesized image has no meaningful owner, and a driver
+    // that maps these through would otherwise report every file as root-owned.
+    s[36..40].copy_from_slice(&u32::MAX.to_le_bytes()); // uid: not specified
+    s[40..44].copy_from_slice(&u32::MAX.to_le_bytes()); // gid: not specified
     s[44..48].copy_from_slice(&PERM_R_X.to_le_bytes());
     s[48..50].copy_from_slice(&link_count.to_le_bytes());
     s[56..64].copy_from_slice(&info_len.to_le_bytes());

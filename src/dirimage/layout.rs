@@ -228,7 +228,11 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
                 Ok(m) => m,
                 // A broken symlink or a file that vanished between readdir and
                 // stat: skip it rather than plan an extent that cannot be read.
-                Err(_) => continue,
+                // Anything else — permission denied, an I/O error on the host
+                // volume — is NOT a missing file, and skipping it would drop a
+                // real file out of the image with nothing reported.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::from(e)),
             };
             if !meta.is_file() {
                 continue;
@@ -335,16 +339,21 @@ fn be_u32(buf: &[u8], off: usize) -> Option<u32> {
 }
 
 /// Read the first `n` bytes of a host file.
-fn read_head(path: &Path, n: usize) -> Vec<u8> {
+/// Read the first `n` bytes of an IFO so its placement offsets can be resolved.
+///
+/// Errors propagate. Returning an empty buffer instead would send every offset
+/// through `unwrap_or(0)`, recording NO placement constraint — and a VOB placed
+/// without its constraint yields an image that reads at the wrong offset with
+/// nothing reported. An IFO that cannot be read is a folder that cannot be
+/// planned.
+fn read_head(path: &Path, n: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut buf = vec![0u8; n];
-    match std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)) {
-        Ok(got) => {
-            buf.truncate(got);
-            buf
-        }
-        Err(_) => Vec::new(),
-    }
+    let got = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut buf))
+        .map_err(Error::from)?;
+    buf.truncate(got);
+    Ok(buf)
 }
 
 /// Placement order and constraints for a `VIDEO_TS` folder.
@@ -418,7 +427,7 @@ fn place_video_ts(vts: &mut DirNode, start: u32) -> Result<u32> {
         if let Some(c) = class
             && c.role == Role::Ifo
         {
-            let head = read_head(&vts.files[i].host, 0xC8);
+            let head = read_head(&vts.files[i].host, 0xC8)?;
             let menu = be_u32(&head, 0xC0).unwrap_or(0);
             if menu != 0 {
                 menu_req.insert(c.group, lba.saturating_add(menu));

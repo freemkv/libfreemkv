@@ -195,7 +195,11 @@ pub const E_DIR_IMAGE_FILE_CHANGED: u16 = 9065;
 /// A `dir://` SOURCE folder does not fit a 32-bit sector address space
 /// (> 2^32 sectors ≈ 8 TiB), or holds more entries than a UDF tree can carry.
 pub const E_DIR_IMAGE_TOO_LARGE: u16 = 9066;
+/// A name in the folder is too long to record in a UDF directory entry: the
+/// File Identifier Descriptor stores the encoded length in one byte.
 pub const E_DIR_NAME_TOO_LONG: u16 = 9067;
+/// One directory in the folder holds more subdirectories than a UDF link count
+/// can express (it is 16 bits, one per child plus one for its own entry).
 pub const E_DIR_IMAGE_FANOUT: u16 = 9068;
 pub const E_M2TS_PACKET_MALFORMED: u16 = 9021;
 /// A `network://` output target resolved to no address that is safe to
@@ -1029,7 +1033,10 @@ impl std::fmt::Display for Error {
             },
             Error::Halted => write!(f, "E{}", self.code()),
             Error::UdfNotFound { path } => write!(f, "E{}: {}", self.code(), path),
-            Error::DirImagePlacement { path } | Error::DirImageFileChanged { path } => {
+            Error::DirImagePlacement { path }
+            | Error::DirImageFileChanged { path }
+            | Error::DirNameTooLong { path }
+            | Error::DirImageFanout { path } => {
                 write!(f, "E{}: {}", self.code(), path)
             }
             Error::DiscTitleRange { index, count } => {
@@ -1183,15 +1190,19 @@ impl From<Error> for std::io::Error {
             // 9027 insufficient space / 9029 write failed: a filesystem-level
             // failure, not bad input.
             E_DIR_INSUFFICIENT_SPACE | E_DIR_WRITE_FAILED => std::io::ErrorKind::Other,
-            // dir:// SOURCE gates (9061–9064, 9066): the folder handed in cannot
-            // be turned into a disc image — a 3D SSIF tree, an unsatisfiable
-            // VIDEO_TS placement, still-encrypted content, an unrecognized tree,
-            // or one too large to address. All are properties of the input.
+            // dir:// SOURCE gates (9061–9064, 9066–9068): the folder handed in
+            // cannot be turned into a disc image — a 3D SSIF tree, an
+            // unsatisfiable VIDEO_TS placement, still-encrypted content, an
+            // unrecognized tree, one too large to address, a name too long to
+            // record, or a directory whose fan-out overflows its link count.
+            // All are properties of the input, decided before a byte is read.
             E_DIR_IMAGE_SSIF_UNSUPPORTED
             | E_DIR_IMAGE_PLACEMENT
             | E_DIR_IMAGE_ENCRYPTED
             | E_DIR_IMAGE_UNSUPPORTED_TREE
-            | E_DIR_IMAGE_TOO_LARGE => std::io::ErrorKind::InvalidInput,
+            | E_DIR_IMAGE_TOO_LARGE
+            | E_DIR_NAME_TOO_LONG
+            | E_DIR_IMAGE_FANOUT => std::io::ErrorKind::InvalidInput,
             // 9065: the folder changed underneath a running read. Not bad input
             // at plan time — a mid-flight mutation of the source.
             E_DIR_IMAGE_FILE_CHANGED => std::io::ErrorKind::InvalidData,
@@ -1539,6 +1550,8 @@ mod tests {
             Error::DirImageUnsupportedTree.code(),
             Error::DirImageFileChanged { path: "x".into() }.code(),
             Error::DirImageTooLarge.code(),
+            Error::DirNameTooLong { path: "x".into() }.code(),
+            Error::DirImageFanout { path: "x".into() }.code(),
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();
