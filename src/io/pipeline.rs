@@ -334,8 +334,11 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// Sweep uses [`Pipeline::spawn_named`] directly so the consumer
     /// thread shows up as `freemkv-sweep-consumer`; mux uses
     /// `freemkv-mux-consumer`. `Pipeline::spawn` (this function, with
-    /// the default name) is used by `disc::patch` and by the unit
-    /// tests in this module.
+    /// the default name) is used only by the unit tests in this module.
+    /// It used to name `disc::patch` as a caller; that module does not exist
+    /// here any more — the sweep/patch recovery passes moved to freemkv-engine
+    /// in 1.6.0, so the comment sent readers hunting a caller in this crate
+    /// that had already left it.
     pub fn spawn<S: Sink<I, Output = R>>(depth: usize, sink: S) -> Result<Self, Error> {
         Self::spawn_named("freemkv-pipeline-consumer", depth, sink)
     }

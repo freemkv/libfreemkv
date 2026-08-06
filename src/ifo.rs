@@ -825,16 +825,36 @@ fn parse_pgcit(
     let entries_start = pgcit_offset + 8;
 
     let mut titles = Vec::new();
+    // Every `continue` below drops a title the user will never see. None of
+    // them may be silent: `parse_vmg` already counts and warns per skipped
+    // title SET, and this function was the remaining place where a disc could
+    // quietly report fewer titles than it has.
+    let mut skipped = 0usize;
 
     for &(chapter_count, vts_title_num) in titles_info {
         // VTS title numbers are 1-based; map to PGC index (typically 1:1)
         let pgc_index = vts_title_num.saturating_sub(1) as usize;
         if pgc_index >= num_pgcs as usize {
+            skipped += 1;
+            tracing::warn!(
+                target: "freemkv::scan",
+                pgc_index,
+                num_pgcs,
+                "title points past the end of the PGC table; its title is omitted"
+            );
             continue;
         }
 
         let entry_offset = entries_start + pgc_index * 8;
         if entry_offset + 8 > data.len() {
+            skipped += 1;
+            tracing::warn!(
+                target: "freemkv::scan",
+                pgc_index,
+                entry_offset,
+                len = data.len(),
+                "PGC entry table is truncated; this title is omitted"
+            );
             continue;
         }
 
@@ -846,11 +866,36 @@ fn parse_pgcit(
 
         match parse_pgc(data, pgc_abs, chapter_count) {
             Ok(title) => titles.push(title),
-            // By design: a single unparseable PGC (truncated/corrupt entry,
-            // authoring-tool quirk) must not lose the whole title list.
-            // Skip it and keep collecting the titles that do parse.
-            Err(_) => continue,
+            Err(e) => {
+                // By design a single unparseable PGC (truncated/corrupt entry,
+                // authoring-tool quirk) must not lose the whole title list. But
+                // "not fatal" is not the same as "not worth saying": every PGC
+                // skipped here is a title the user will never see, and this was
+                // the only remaining silent one — `parse_vmg` above already
+                // counts and warns per skipped title SET for exactly this
+                // reason. A disc quietly reporting fewer titles than it has is
+                // the failure this release exists to stop.
+                skipped += 1;
+                tracing::warn!(
+                    target: "freemkv::scan",
+                    pgc = pgc_index + 1,
+                    of = num_pgcs,
+                    error = %e,
+                    "PGC could not be parsed; its title is omitted"
+                );
+                continue;
+            }
         }
+    }
+
+    if skipped > 0 {
+        tracing::warn!(
+            target: "freemkv::scan",
+            skipped,
+            kept = titles.len(),
+            declared = titles_info.len(),
+            "some titles were omitted from this title set"
+        );
     }
 
     Ok(titles)

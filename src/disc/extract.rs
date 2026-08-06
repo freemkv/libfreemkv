@@ -314,8 +314,24 @@ impl Disc {
         if extents.is_empty() {
             return base_keys.clone();
         }
-        // Largest extent first (movie body), matching the scan heuristic.
-        extents.sort_by_key(|e| std::cmp::Reverse(e.sector_count));
+        // PLAYBACK ORDER — do NOT sort. This is the 1.5.1 garbage bug, and it
+        // grew back here in a new code path: the comment this replaced said it
+        // "matched the scan heuristic", but that heuristic WAS the bug and was
+        // already fixed in `Disc::decrypt_keys_for_title`, which documents the
+        // rule ("PLAYBACK ORDER, never largest-cell-first") and pins it with
+        // `decrypt_keys_for_title_scans_playback_order_not_largest_first`.
+        //
+        // Why order decides correctness: a CSS DVD's biggest cell opens with a
+        // long CLEAR run, and `crack_key`'s sector budget is shared across the
+        // whole extent list. Starting at the largest cell can exhaust the budget
+        // without ever MEETING a scrambled sector — and CSS recovers the title
+        // key from scrambled data itself, so the scan has to reach some. The
+        // crack then returns None, this function falls back to `base_keys`, and
+        // every VOB in the VTS is descrambled with the wrong key: corrupt PES
+        // behind an intact header, written out as a complete extract at exit 0.
+        //
+        // `planned` is already in playback order (VTS_xx_1.VOB..\_9.VOB, extents
+        // in file order), so the correct action is to leave the vector alone.
         // Crack against the raw (still-scrambled) inner reader, NOT the
         // decrypting view — `crack_key` runs the descrambler itself.
         match crate::css::crack_key(dec.inner_mut(), &extents, 64) {

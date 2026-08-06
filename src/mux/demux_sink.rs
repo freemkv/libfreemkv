@@ -190,7 +190,13 @@ pub(crate) fn codec_label(codec: Codec) -> &'static str {
 /// to `.sup`, VobSub records `.idx` entries and emits the sidecar at finish.
 trait EsWriter: Send {
     /// Write one frame's payload to `w`. Returns the number of bytes written to
-    /// the main file (used by the VobSub writer for `.idx` filepos tracking).
+    /// the main file.
+    ///
+    /// Nothing in production reads this count: the sole caller discards it with
+    /// `?`, and `VobSubWriter` tracks `.idx` fileposes from its own `pos` field.
+    /// This previously claimed the VobSub writer depended on the return value,
+    /// which would have a maintainer believe a wrong count shows up as broken
+    /// `.idx` output. It does not.
     fn write_frame(&mut self, w: &mut dyn Write, f: &PesFrame, pts_ns: i64) -> io::Result<usize>;
 
     /// Finalize. Default: no-op. The VobSub writer serializes its `.idx` here.
