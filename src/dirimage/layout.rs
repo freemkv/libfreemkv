@@ -399,8 +399,12 @@ fn place_video_ts(vts: &mut DirNode, start: u32) -> Result<u32> {
             if menu != 0 {
                 menu_req.insert(c.group, lba.saturating_add(menu));
             }
-            // Only a VTS IFO carries a title VOBS pointer at 0xC4; the VMG's
-            // 0xC4 is a different field entirely (VMGM_C_ADT).
+            // Only a VTS IFO carries a title VOBS pointer at 0xC4. In the VMG
+            // (`VIDEO_TS.IFO`) that offset is TT_SRPT, the title search pointer
+            // table — a sector offset INSIDE the IFO, not a pointer to another
+            // file, so treating it as one would place `VIDEO_TS.VOB` at a
+            // meaningless address. (`ifo.rs::parse_vmg` reads the same field as
+            // TT_SRPT; the two must not drift.)
             if c.group > 0 {
                 let title = be_u32(&head, 0xC4).unwrap_or(0);
                 if title != 0 {
