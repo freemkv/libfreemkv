@@ -264,7 +264,13 @@ impl SeamPlan {
             // the end of the list.
             let stepped_back = pos.last_raw_ns.is_some_and(|last| raw_ns < last)
                 && if has_reorder {
-                    (raw_ns.saturating_sub(next_in)).abs() <= CLIP_START_TOLERANCE_NS
+                    // saturating_abs, not abs: every other comparison in this
+                    // module is saturating because these timestamps come off a
+                    // disc and are not trusted. `abs()` is the one exception
+                    // and it panics on i64::MIN — which saturating_sub can
+                    // produce exactly — taking down the mux thread on one bad
+                    // frame instead of comparing false like its neighbours.
+                    (raw_ns.saturating_sub(next_in)).saturating_abs() <= CLIP_START_TOLERANCE_NS
                 } else {
                     raw_ns >= next_in.saturating_sub(CLIP_START_TOLERANCE_NS)
                         && raw_ns <= self.clips[clip + 1].out_ns

@@ -680,8 +680,9 @@ pub struct MkvMuxer<W: Write + Seek> {
     cues: Vec<CuePoint>,
     frame_count: u64,
     /// Frames handed to `write_frame` that were dropped because no cluster was
-    /// open yet (a cluster only opens on a track-0 video keyframe). See
-    /// `write_frame` for the track-0 invariant.
+    /// open yet (a cluster only opens on a keyframe from the primary video
+    /// track, whatever index that is — not necessarily track 0). See
+    /// `write_frame` for the cluster-driver invariant.
     ///
     /// The ALL-dropped case is surfaced as an error by `finish()`, but via
     /// `frame_count == 0`, not via this counter. A PARTIAL drop — leading audio /
@@ -1683,11 +1684,17 @@ impl<W: Write + Seek> MkvMuxer<W> {
 
     /// Finish the MKV file: write Cues element.
     ///
-    /// # Track-0 invariant
+    /// # Cluster-driver invariant
     ///
-    /// A cluster only opens on a track-0 video keyframe, so the caller must
-    /// supply track 0 as the video track and deliver a keyframe on it before
-    /// (or alongside) other-track data. If no track-0 keyframe ever arrives,
+    /// A cluster only opens on a keyframe from the PRIMARY VIDEO TRACK — the
+    /// first track whose type is video, at whatever index it occupies (see
+    /// `cluster_driver`, which is `primary_video_track.unwrap_or(0)`; index 0
+    /// is only the fallback for a file with no video track at all). The caller
+    /// must deliver a keyframe on that track before (or alongside) other-track
+    /// data. This said "track-0" and required the caller to place video at
+    /// index 0, which the code has never actually required — so a reader
+    /// debugging dropped frames would suspect track ordering, which is not it.
+    /// If no such keyframe ever arrives,
     /// every `write_frame` is silently dropped; rather than emit a structurally
     /// valid but empty MKV (zero clusters, zero frames), `finish` returns
     /// `Error::MkvInvalid` when frames were submitted but none were written.

@@ -1961,6 +1961,21 @@ impl Disc {
         Self::read_aacs_inputs_from_reader(&mut reader, &udf_fs)
     }
 
+    /// Same as [`Disc::read_aacs_inputs`] but over an extracted disc FOLDER.
+    ///
+    /// `dir://` is an image-level source: `dirimage` synthesizes a real UDF
+    /// volume over the folder, so the AACS inputs are read by exactly the same
+    /// reader path an ISO uses. Without this the online key fetch was silently
+    /// unavailable for folders — the CLI's fetch helper matched only `Iso` and
+    /// returned None for a folder, so the same disc that fetched its key fine
+    /// as an ISO failed as an extracted directory. A sink is a sink: any input
+    /// has to work with any output, and that includes the key path.
+    pub fn read_aacs_inputs_from_dir(dir: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>, u8)> {
+        let mut reader = crate::dirimage::DirImage::open(dir)?;
+        let udf_fs = udf::read_filesystem(&mut reader)?;
+        Self::read_aacs_inputs_from_reader(&mut reader, &udf_fs)
+    }
+
     /// Same as [`Disc::read_aacs_inputs`] but reads from a live drive. The
     /// out-of-band Unit Key path fetches the disc's key files from the drive,
     /// resolves a key from them however it likes, then applies it via
