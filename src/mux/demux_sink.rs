@@ -671,6 +671,11 @@ pub struct DemuxSink {
     ref_first_pts_ns: Option<i64>,
     timeline: TimelineContinuity,
     finished: bool,
+    /// Frames actually placed on the timeline and written.
+    ///
+    /// A sink that wrote nothing must not report success, and a sink that
+    /// dropped more than it kept is not looking at a real join.
+    frames_written: u64,
 }
 
 impl DemuxSink {
@@ -744,6 +749,7 @@ impl DemuxSink {
             ref_first_pts_ns: None,
             timeline: TimelineContinuity::with_clips(&title.clips, title.content_format),
             finished: false,
+            frames_written: 0,
         })
     }
 
@@ -880,6 +886,7 @@ impl Stream for DemuxSink {
         let Some(pts) = self.timeline.map(frame.pts, drives, frame.track, is_video) else {
             return Ok(());
         };
+        self.frames_written = self.frames_written.saturating_add(1);
         if drives {
             // Delay reference: recorded here, not in the track's `TrackOut`, so
             // it survives the `audio://` / `sub://` kind filter dropping the
@@ -903,6 +910,22 @@ impl Stream for DemuxSink {
         // write-only in one sink and reported in the other — an unexpected
         // volume here is how a demux ends up quietly short.
         let seam_dropped = self.timeline.dropped_total();
+        // Frames ARRIVED and every one was dropped. That is a fully-dropped
+        // title, which this sink used to finish cleanly: a directory of
+        // zero-byte track files beside a populated chapters document, at exit
+        // 0. Keyed on frames having been offered, because a sink that is never
+        // given any — a chapters-only export, or a track class the title does
+        // not carry — legitimately writes none.
+        if self.frames_written == 0 && seam_dropped > 0 {
+            return Err(crate::error::Error::SinkWroteNothing.into());
+        }
+        if seam_dropped > self.frames_written {
+            return Err(crate::error::Error::SeamPlanDroppedMost {
+                dropped: seam_dropped,
+                written: self.frames_written,
+            }
+            .into());
+        }
         if seam_dropped > 0 {
             tracing::info!(
                 target: "mux",
