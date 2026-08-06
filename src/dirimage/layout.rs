@@ -349,10 +349,14 @@ fn be_u32(buf: &[u8], off: usize) -> Option<u32> {
 fn read_head(path: &Path, n: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut buf = vec![0u8; n];
-    let got = std::fs::File::open(path)
-        .and_then(|mut f| f.read(&mut buf))
-        .map_err(Error::from)?;
-    buf.truncate(got);
+    // `read_exact`, not `read`: a single `read` may legally return fewer bytes
+    // than asked on a network or FUSE mount — and a NAS-hosted backup is the
+    // normal case for this feature. A short buffer sends every placement offset
+    // through `unwrap_or(0)`, recording NO constraint, so the planner and the
+    // reader disagree about where a VOB begins and the rip reads the wrong
+    // sectors for a whole title at exit 0.
+    let mut f = std::fs::File::open(path).map_err(Error::from)?;
+    f.read_exact(&mut buf).map_err(Error::from)?;
     Ok(buf)
 }
 
@@ -496,12 +500,18 @@ fn classify(name: &str) -> Option<Class> {
         ("IFO", 0) => (0, Role::Ifo),
         ("VOB", 0) => (1, Role::MenuVob),
         ("VOB", 1) => (2, Role::TitleVob),
-        ("VOB", n) => (1 + n, Role::Sequential),
+        // Checked: `n` is parsed verbatim out of a filename, so a folder may
+        // legitimately contain `VTS_01_4294967295.VOB`. Wrapping would sort a
+        // stray VOB ahead of its own title set's IFO.
+        ("VOB", n) => (n.checked_add(1)?, Role::Sequential),
         ("BUP", 0) => (100, Role::Sequential),
         _ => return None,
     };
     Some(Class {
-        group: set + 1,
+        // Checked for the same reason: a wrap here lands on group 0, which is
+        // the Video Manager's, so a stray file would contend for the VMG's
+        // placement slot.
+        group: set.checked_add(1)?,
         order,
         role,
     })

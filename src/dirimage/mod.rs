@@ -86,12 +86,6 @@ struct FileRef {
 /// Owns everything it reads through (`PathBuf`s and its own file handles), so
 /// it is `Send + 'static` and can be moved into `build_iso_pipeline`, which
 /// hands it to `PrefetchedSectorSource`'s producer thread.
-/// Bytes read between page-cache eviction calls (32 MiB).
-///
-/// Large enough that the hint costs nothing measurable against a rip, small
-/// enough that resident pages stay bounded well below any machine's RAM.
-const DROP_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
-
 pub struct DirImage {
     meta: MetaSectors,
     /// Sorted by `start_lba`, non-overlapping.
@@ -101,15 +95,6 @@ pub struct DirImage {
     total_sectors: u32,
     volume_id: String,
     data_bytes: u64,
-    /// Bytes read from host files since the last page-cache eviction.
-    ///
-    /// A rip streams every byte of the folder exactly once. Without eviction
-    /// the kernel keeps all of it resident, which starves the concurrent writer
-    /// — `io::file_sector_source` records the measured cost of exactly this
-    /// omission on the ISO path (2.7 MB/s mux against 70 MB/s isolated reads).
-    /// A folder source reads host files the same way and needs the same
-    /// treatment.
-    bytes_since_drop: u64,
 }
 
 impl std::fmt::Debug for DirImage {
@@ -183,7 +168,6 @@ impl DirImage {
             total_sectors: plan.total_sectors,
             volume_id: plan.volume_id,
             data_bytes,
-            bytes_since_drop: 0,
         })
     }
 
@@ -251,16 +235,21 @@ impl DirImage {
         h.seek(SeekFrom::Start(at)).map_err(Error::from)?;
         let res = h.read_exact(&mut out[..want]);
         if res.is_ok() {
-            // Evict what we have consumed, per file handle. The window is the
-            // read just completed rather than a running offset, because reads
-            // here jump between files and a single monotonic cursor would name
-            // the wrong pages.
-            self.bytes_since_drop = self.bytes_since_drop.saturating_add(want as u64);
-            if self.bytes_since_drop >= DROP_CHUNK_BYTES {
-                if let Some((_, fh)) = self.open.iter().find(|(i, _)| *i == file) {
-                    drop_window(fh, at, want as u64);
-                }
-                self.bytes_since_drop = 0;
+            // Release the window just read, every time.
+            //
+            // The ISO source accumulates and drops in chunks because it reads
+            // one file linearly, so a running start offset always names the
+            // bytes it has consumed. Reads here jump between files, so there is
+            // no single cursor to accumulate against — an accumulated byte
+            // count paired with one read's offset names 1/Nth of what was
+            // actually consumed and leaves the rest pinned, which is how the
+            // first version of this got it wrong.
+            //
+            // Dropping per read costs one advisory syscall per batch (4-16 MiB),
+            // which is nothing against the read itself, and it is correct
+            // regardless of how reads interleave across files.
+            if let Some((_, fh)) = self.open.iter().find(|(i, _)| *i == file) {
+                drop_window(fh, at, want as u64);
             }
         }
         match res {
@@ -300,7 +289,15 @@ impl SectorSource for DirImage {
         // one 16 MiB sequential read.
         let mut i = 0u32;
         while i < count as u32 {
-            let at = lba + i;
+            // Checked: callers saturate their LBAs (`disc/dvd.rs` builds a cell
+            // start as `vob_start_sector.saturating_add(cell.first_sector)`, and
+            // the prefetcher adds an offset the same way), so a crafted IFO can
+            // present a request at the very top of the address space. Wrapping
+            // here would fold `at` back to a LOW sector and hand the muxer a
+            // different file's bytes with nothing reported.
+            let Some(at) = lba.checked_add(i) else {
+                break;
+            };
             let off = i as usize * SECTOR;
             if let Some(s) = self.meta.get(&at) {
                 buf[off..off + SECTOR].copy_from_slice(&s[..]);
