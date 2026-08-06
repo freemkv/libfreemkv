@@ -278,10 +278,21 @@ fn crack_key_scan(
             let n = (ext.sector_count - i).min(batch);
             let want = n as usize * 2048;
             match reader.read_sectors(ext.start_lba + i, n as u16, &mut buf[..want], true) {
-                Ok(_) => {
+                Ok(got) => {
                     // A readable batch: the gate is open — reset the locked run.
                     consecutive_locked = 0;
-                    for s in 0..n as usize {
+                    // Inspect only what was actually READ. The trait returns the
+                    // byte count and a source may return Ok with fewer bytes
+                    // than asked (a recovery read over a damaged region), while
+                    // `buf` is reused across batches — so the tail still holds
+                    // the PREVIOUS batch's sectors. Scanning those means
+                    // cracking a key from data belonging to a different extent,
+                    // and possibly a different VTS, while `crack_span` records
+                    // the CURRENT one: a key that opens nothing here gets
+                    // installed and its wrong descrambles are only partly caught
+                    // by the per-sector crib.
+                    let usable = (got / 2048).min(n as usize);
+                    for s in 0..usable {
                         tried += 1;
                         let sect = &buf[s * 2048..(s + 1) * 2048];
                         // Use the HARDENED pack-gated check (Fix 3): a clear stub
