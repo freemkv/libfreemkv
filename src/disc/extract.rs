@@ -318,7 +318,13 @@ impl Disc {
                 vts_group_of(&pf.disc_name).as_deref() == Some(vts) && is_title_vob(&pf.disc_name)
             })
             .collect();
-        files.sort_by(|a, b| a.disc_name.cmp(&b.disc_name));
+        // Case-INSENSITIVE, matching `vts_group_of`/`is_title_vob`, which
+        // selected these files case-insensitively. A byte-wise sort put
+        // 'V' (0x56) before 'v' (0x76), so a set holding `vts_01_1.vob`
+        // alongside `VTS_01_2.VOB` — reachable on a case-sensitive volume —
+        // started the crack at part 2 and could exhaust the budget in a clear
+        // run, which is the whole failure this ordering exists to prevent.
+        files.sort_by_key(|f| f.disc_name.to_ascii_uppercase());
 
         let mut extents: Vec<crate::disc::Extent> = Vec::new();
         for pf in files {

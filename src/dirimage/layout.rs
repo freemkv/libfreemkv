@@ -233,11 +233,23 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
         // exit 0. Comparing the raw host names cannot see that; deriving the
         // key from the same two functions cannot drift from it.
         let as_read = crate::udf::parse_udf_name(&crate::dirimage::encode::encode_cs0(&name));
-        // Nothing left after the reader is done with it: the entry would exist
-        // in the image and be unaddressable by any name. Refuse rather than
-        // write something no consumer can reach.
+        // Nothing left after the reader is done with it — a name made entirely
+        // of characters `parse_udf_name` drops, e.g. a sidecar folder named
+        // with a single emoji. The entry would exist in the image and be
+        // addressable by nothing.
+        //
+        // SKIP it, do not fail the plan. Failing turned an irrelevant extra
+        // file into an un-rippable folder that 1.6.0 handled fine (the
+        // unreachable entry merely sat there, harming nothing), and reported it
+        // as a collision with a file that does not exist. It is also not
+        // pushed to `names`, so it cannot collide with anything either.
         if as_read.is_empty() {
-            return Err(Error::DirNameCollision { host: child_path });
+            tracing::warn!(
+                target: "freemkv::dirimage",
+                path = %child_path,
+                "name is unrepresentable in UDF after encoding; entry omitted from the image"
+            );
+            continue;
         }
         names.push(as_read.to_ascii_uppercase());
         if ft.is_dir() {
