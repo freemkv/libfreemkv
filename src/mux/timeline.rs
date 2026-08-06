@@ -135,12 +135,31 @@ impl SeamPlan {
         if clips.len() < 2 {
             return None;
         }
-        let mut out = Vec::with_capacity(clips.len());
+        let mut out: Vec<SeamClip> = Vec::with_capacity(clips.len());
         let mut cum: i64 = 0;
         for c in clips {
             let in_ns = mpls_ticks_to_ns(c.in_time);
             let out_ns = mpls_ticks_to_ns(c.out_time);
             if out_ns <= in_ns {
+                return None;
+            }
+            // Every placement rule below assumes the marks are points on ONE
+            // clock that advances across the whole title: a join is recognised
+            // by a frame landing at the next clip's IN, and a frame is assigned
+            // to a clip by falling inside its [in, out].
+            //
+            // Not every title is like that — a playlist whose clips each restart
+            // their own STC has marks that all cover the same low values. Under
+            // such a table a crossing can be missed, and a missed crossing
+            // STRANDS the track on the clip it was on: every later frame then
+            // falls outside that clip's marks and is dropped, silently, for the
+            // rest of the title. That is precisely the truncation this type was
+            // written to fix, so a table we cannot place must not be placed at
+            // all — it falls back to inference, which is the documented safe
+            // path for exactly these titles.
+            if let Some(prev) = out.last()
+                && in_ns <= prev.in_ns
+            {
                 return None;
             }
             out.push(SeamClip {
@@ -357,12 +376,31 @@ impl TimelineContinuity {
     /// Falls back to [`Self::new`]'s inference when the title has fewer than two
     /// clips or its marks are unusable — so DVD, HD-DVD, `mkv://` and `m2ts://`
     /// sources behave exactly as before.
-    pub(crate) fn with_clips(clips: &[crate::disc::Clip]) -> Self {
+    pub(crate) fn with_clips(
+        clips: &[crate::disc::Clip],
+        content_format: crate::disc::ContentFormat,
+    ) -> Self {
+        // ONLY Blu-ray. A PlayItem's IN/OUT are positions in the same 45 kHz
+        // clock the PES PTS runs on, which is what makes placing frames by them
+        // meaningful.
+        //
+        // The other formats' clips carry marks from a different clock entirely:
+        // HD-DVD fills them from the XPL's title-relative `titleTimeBegin` /
+        // `titleTimeEnd`, and a DVD's come from cell tables. Those are elapsed
+        // times within a title, not PES positions — so a plan built from them
+        // is an identity map with a drop filter, it stops the layer-break
+        // rebase `adjust` exists to perform, and it drops whatever falls
+        // outside marks the PTS was never measured against. Those formats keep
+        // the inference path, which is what they have always used.
+        let seams = match content_format {
+            crate::disc::ContentFormat::BdTs => SeamPlan::from_clips(clips),
+            crate::disc::ContentFormat::MpegPs => None,
+        };
         Self {
             offset_ns: 0,
             prev_offset_ns: 0,
             high_ns: None,
-            seams: SeamPlan::from_clips(clips),
+            seams,
         }
     }
 
@@ -738,7 +776,7 @@ mod tests {
     #[test]
     fn map_under_a_seam_plan_tracks_offset_and_frontier() {
         let clips = seamless_branching_clips();
-        let mut tc = TimelineContinuity::with_clips(&clips);
+        let mut tc = TimelineContinuity::with_clips(&clips, crate::disc::ContentFormat::BdTs);
         assert!(tc.seams.is_some(), "a multi-clip title must get a plan");
 
         let c0_in = mpls_ticks_to_ns(clips[0].in_time);
@@ -904,6 +942,100 @@ mod tests {
         assert!(
             a_new > a_tail2,
             "audio must not rewind at the join (got {a_new} after {a_tail2})"
+        );
+    }
+
+    /// Only Blu-ray gets a mark-driven plan.
+    ///
+    /// Audit finding, and a regression this nearly shipped: HD-DVD `Clip` marks
+    /// come from the XPL's title-relative times, and a DVD's from cell tables —
+    /// neither is a position in the PES clock. A plan built from them is an
+    /// identity map with a drop filter: it suppresses the layer-break rebase
+    /// `adjust` performs, and drops whatever falls outside marks the PTS was
+    /// never measured against. Both formats must stay on inference.
+    ///
+    /// An earlier reading of this concluded HD-DVD was safe because its marks
+    /// happen to be contiguous, so the computed offsets were all zero. That is
+    /// true and irrelevant: the offsets were zero in the WRONG CLOCK.
+    #[test]
+    fn only_blu_ray_gets_a_mark_driven_plan() {
+        let clips = seamless_branching_clips();
+        let bd = TimelineContinuity::with_clips(&clips, crate::disc::ContentFormat::BdTs);
+        assert!(bd.seams.is_some(), "Blu-ray marks are PES-clock positions");
+
+        // The same table under the program-stream formats (DVD, HD-DVD).
+        let ps = TimelineContinuity::with_clips(&clips, crate::disc::ContentFormat::MpegPs);
+        assert!(
+            ps.seams.is_none(),
+            "DVD and HD-DVD must keep the inference path"
+        );
+
+        // And an HD-DVD-shaped table — contiguous, title-relative, strictly
+        // increasing, so the shared-clock check alone would have accepted it.
+        let hddvd: Vec<crate::disc::Clip> = [(0u32, 132_690_000u32), (132_690_000, 288_489_000)]
+            .iter()
+            .enumerate()
+            .map(|(i, &(in_time, out_time))| crate::disc::Clip {
+                clip_id: format!("{i}"),
+                in_time,
+                out_time,
+                duration_secs: 0.0,
+                source_packets: 0,
+            })
+            .collect();
+        assert!(
+            SeamPlan::from_clips(&hddvd).is_some(),
+            "fixture: the shared-clock check does NOT reject this table"
+        );
+        assert!(
+            TimelineContinuity::with_clips(&hddvd, crate::disc::ContentFormat::MpegPs)
+                .seams
+                .is_none(),
+            "so the format gate is what keeps HD-DVD off the plan"
+        );
+    }
+
+    /// A clip table that is not one advancing clock must fall back to
+    /// inference rather than be placed.
+    ///
+    /// Audit finding. Each clip is validated in isolation (span > 0) but the
+    /// placement rules assume the marks are points on a single clock. Under a
+    /// table whose clips each restart their own base, a crossing can be missed
+    /// — and a missed crossing STRANDS the track on its current clip, so every
+    /// later frame falls outside that clip's marks and is dropped for the rest
+    /// of the title. Silent truncation, which is what this type exists to
+    /// prevent.
+    #[test]
+    fn a_restarting_clock_falls_back_to_inference() {
+        let mk = |marks: &[(u32, u32)]| -> Vec<crate::disc::Clip> {
+            marks
+                .iter()
+                .enumerate()
+                .map(|(i, &(in_time, out_time))| crate::disc::Clip {
+                    clip_id: format!("{i}"),
+                    in_time,
+                    out_time,
+                    duration_secs: 0.0,
+                    source_packets: 0,
+                })
+                .collect()
+        };
+        // Clip 1 restarts near zero instead of continuing clip 0's clock.
+        let restarting = mk(&[(188_955_000, 271_486_824), (0, 12_462_450)]);
+        assert!(
+            SeamPlan::from_clips(&restarting).is_none(),
+            "a restarting clock must not be placed from marks"
+        );
+        // Equal IN marks are just as unplaceable.
+        let repeated = mk(&[(1_000, 2_000), (1_000, 3_000)]);
+        assert!(
+            SeamPlan::from_clips(&repeated).is_none(),
+            "duplicate IN marks"
+        );
+        // The real advancing table still gets a plan.
+        assert!(
+            SeamPlan::from_clips(&seamless_branching_clips()).is_some(),
+            "an advancing table must still be placed"
         );
     }
 
