@@ -660,6 +660,12 @@ pub struct DemuxSink {
     /// Index = track id; `None` for unselected tracks.
     tracks: Vec<Option<TrackOut>>,
     ref_video_track: Option<usize>,
+    /// Every VIDEO track index, recorded before the kind filter.
+    ///
+    /// The filtered `tracks` slots are `None` for a class this export drops, so
+    /// they cannot answer "is this video" for a frame that still flows through
+    /// `write()`.
+    video_tracks: std::collections::HashSet<usize>,
     /// First PTS observed on `ref_video_track`, recorded in `write()` REGARDLESS
     /// of whether that track has a `TrackOut`. The DELAY reference cannot live in
     /// `TrackOut::first_pts_ns`: `audio://` / `sub://` filter the video track's
@@ -671,11 +677,15 @@ pub struct DemuxSink {
     ref_first_pts_ns: Option<i64>,
     timeline: TimelineContinuity,
     finished: bool,
-    /// Frames actually placed on the timeline and written.
+    /// Frames the timeline PLACED (not necessarily persisted).
     ///
-    /// A sink that wrote nothing must not report success, and a sink that
-    /// dropped more than it kept is not looking at a real join.
-    frames_written: u64,
+    /// A frame for a track this export filters out still flows through
+    /// `write()` and still counts here, so this is "the timeline placed
+    /// something" rather than "a file received bytes". That is the right
+    /// denominator for the drop gate below — it asks whether placement worked
+    /// at all — but it is deliberately NOT a per-track written count, so a
+    /// single lost track among many is not visible to it.
+    frames_mapped: u64,
 }
 
 impl DemuxSink {
@@ -684,6 +694,7 @@ impl DemuxSink {
         std::fs::create_dir_all(dir)?;
         let mut tracks: Vec<Option<TrackOut>> = Vec::with_capacity(title.streams.len());
         let mut ref_video_track = None;
+        let mut video_tracks: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         for (idx, stream) in title.streams.iter().enumerate() {
             let selected = opts
@@ -709,6 +720,15 @@ impl DemuxSink {
             // through write() but are not persisted to disk.
             if kind == TrackKind::Video && ref_video_track.is_none() {
                 ref_video_track = Some(idx);
+            }
+            // Also BEFORE the kind filter, and for the same reason: the seam
+            // crossing rule differs for a track that carries B-frame reorder,
+            // and a video track still flows through write() on an `audio://`
+            // or `sub://` export even though nothing persists it. Reading the
+            // kind back out of the filtered slot would call it non-video and
+            // hand it the permissive rule.
+            if kind == TrackKind::Video {
+                video_tracks.insert(idx);
             }
             // Kind filter: `audio://` / `sub://` keep only their class.
             if opts.kind_filter.is_some_and(|k| k != kind) {
@@ -746,10 +766,11 @@ impl DemuxSink {
             opts: opts.clone(),
             tracks,
             ref_video_track,
+            video_tracks,
             ref_first_pts_ns: None,
             timeline: TimelineContinuity::with_clips(&title.clips, title.content_format),
             finished: false,
-            frames_written: 0,
+            frames_mapped: 0,
         })
     }
 
@@ -876,17 +897,13 @@ impl Stream for DemuxSink {
         // (a Dolby Vision enhancement layer) does not drive epochs but does
         // carry B-frame reorder, and the seam-crossing rule differs on exactly
         // that property.
-        let is_video = self
-            .tracks
-            .get(frame.track)
-            .and_then(|s| s.as_ref())
-            .is_some_and(|t| t.kind == TrackKind::Video);
+        let is_video = self.video_tracks.contains(&frame.track);
         // See `MkvMuxer::write_frame`: `None` is material outside the
         // playlist's clip marks and is dropped rather than emitted.
         let Some(pts) = self.timeline.map(frame.pts, drives, frame.track, is_video) else {
             return Ok(());
         };
-        self.frames_written = self.frames_written.saturating_add(1);
+        self.frames_mapped = self.frames_mapped.saturating_add(1);
         if drives {
             // Delay reference: recorded here, not in the track's `TrackOut`, so
             // it survives the `audio://` / `sub://` kind filter dropping the
@@ -916,13 +933,13 @@ impl Stream for DemuxSink {
         // 0. Keyed on frames having been offered, because a sink that is never
         // given any — a chapters-only export, or a track class the title does
         // not carry — legitimately writes none.
-        if self.frames_written == 0 && seam_dropped > 0 {
+        if self.frames_mapped == 0 && seam_dropped > 0 {
             return Err(crate::error::Error::SinkWroteNothing.into());
         }
-        if seam_dropped > self.frames_written {
+        if seam_dropped > self.frames_mapped {
             return Err(crate::error::Error::SeamPlanDroppedMost {
                 dropped: seam_dropped,
-                written: self.frames_written,
+                written: self.frames_mapped,
             }
             .into());
         }

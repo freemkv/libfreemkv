@@ -1053,6 +1053,12 @@ impl std::fmt::Display for Error {
             },
             Error::Halted => write!(f, "E{}", self.code()),
             Error::UdfNotFound { path } => write!(f, "E{}: {}", self.code(), path),
+            Error::SeamPlanDroppedMost { dropped, written } => {
+                write!(f, "E{} {dropped}/{written}", self.code())
+            }
+            Error::ShortImageRead { lba, expected, got } => {
+                write!(f, "E{} {lba} {expected} {got}", self.code())
+            }
             Error::DirImagePlacement { path }
             | Error::DirImageFileChanged { path }
             | Error::DirNameTooLong { path }
@@ -1572,6 +1578,19 @@ mod tests {
             Error::DirImageTooLarge.code(),
             Error::DirNameTooLong { path: "x".into() }.code(),
             Error::DirImageFanout { path: "x".into() }.code(),
+            Error::SeamPlanDroppedMost {
+                dropped: 1,
+                written: 0,
+            }
+            .code(),
+            Error::SinkWroteNothing.code(),
+            Error::ShortImageRead {
+                lba: 0,
+                expected: 1,
+                got: 0,
+            }
+            .code(),
+            Error::EmptyImage.code(),
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();

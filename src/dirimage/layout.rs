@@ -403,6 +403,11 @@ fn place_video_ts(vts: &mut DirNode, start: u32) -> Result<u32> {
     // Required start blocks, resolved as each IFO is placed.
     let mut menu_req: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut title_req: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    // Groups whose IFO has already been placed. Kept separately from the
+    // constraint maps because an IFO that declares no offsets inserts into
+    // neither, so keying the duplicate check on those maps would miss a second
+    // IFO for the same set — which is the collision the check exists for.
+    let mut seen_ifo: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     let mut cursor = start;
     for &i in &order {
@@ -438,7 +443,7 @@ fn place_video_ts(vts: &mut DirNode, start: u32) -> Result<u32> {
             // parse to the same group, and the second insert would overwrite
             // the first's constraint, placing a VOB at an address the IFO the
             // reader uses does not point to. Refuse instead of picking one.
-            if menu_req.contains_key(&c.group) || title_req.contains_key(&c.group) {
+            if !seen_ifo.insert(c.group) {
                 return Err(Error::DirNameCollision {
                     host: vts.files[i].disc_path.clone(),
                 });
@@ -639,6 +644,16 @@ pub(super) fn plan(root: &Path) -> Result<Layout> {
         .position(|d| d.name.eq_ignore_ascii_case("VIDEO_TS"))
     {
         cursor = place_video_ts(&mut tree.dirs[idx], cursor)?;
+        // `place_video_ts` places only the FILES directly inside VIDEO_TS,
+        // because only those carry the IFO-relative constraints. Anything in a
+        // subdirectory of VIDEO_TS still needs data placed: without this its
+        // File Entry is written with the file's real size but no extents, so it
+        // appears in the tree at full length and reads back as nothing, at
+        // exit 0. The same folder under BDMV/ was always placed correctly,
+        // which is what made the gap easy to miss.
+        for sub in tree.dirs[idx].dirs.iter_mut() {
+            place_generic(sub, &mut cursor)?;
+        }
         for f in &mut tree.files {
             cursor = place_file(f, cursor)?;
         }
