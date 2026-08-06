@@ -102,6 +102,15 @@ pub(super) struct FileNode {
     pub(super) disc_path: String,
     pub(super) host: PathBuf,
     pub(super) size: u64,
+    /// Host mtime at PLAN time, when the platform reports one.
+    ///
+    /// Size alone is content-blind, and the plan depends on CONTENT: a DVD's
+    /// VOB placement is derived from bytes 0xC0/0xC4 of its IFO (`read_head`).
+    /// A re-authoring tool rewriting an IFO in place keeps the length — IFOs
+    /// are a whole number of sectors — so a size check passes while the
+    /// placement the image was built around is stale, and every cell of the
+    /// title then resolves to the wrong sectors at exit 0.
+    pub(super) mtime: Option<std::time::SystemTime>,
     pub(super) icb_lba: u32,
     pub(super) unique_id: u64,
     pub(super) extents: Vec<Extent>,
@@ -211,7 +220,26 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
         if *entries > MAX_ENTRIES {
             return Err(Error::DirImageTooLarge);
         }
-        names.push(name.to_ascii_uppercase());
+        // Key the uniqueness check on the name AS THE READER WILL SEE IT, by
+        // round-tripping through the very encoder and parser that will be used.
+        //
+        // The host name is not that name. `parse_udf_name` trims leading and
+        // trailing whitespace and drops any code unit `char::from_u32` rejects
+        // (a lone surrogate half, i.e. every non-BMP character the encoder
+        // emits as a surrogate pair). So " A.M2TS" and "A.M2TS", or "A<astral>.M2TS"
+        // and "A.M2TS", are distinct hosts that collapse to ONE name on read —
+        // and `find`/`read_file` take the first match, so a title silently
+        // resolves to the wrong file's extents and muxes the wrong bytes at
+        // exit 0. Comparing the raw host names cannot see that; deriving the
+        // key from the same two functions cannot drift from it.
+        let as_read = crate::udf::parse_udf_name(&crate::dirimage::encode::encode_cs0(&name));
+        // Nothing left after the reader is done with it: the entry would exist
+        // in the image and be unaddressable by any name. Refuse rather than
+        // write something no consumer can reach.
+        if as_read.is_empty() {
+            return Err(Error::DirNameCollision { host: child_path });
+        }
+        names.push(as_read.to_ascii_uppercase());
         if ft.is_dir() {
             // A directory's File Entry records its link count in 16 bits: one
             // per child directory plus one for its own entry in the parent.
@@ -242,6 +270,7 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
                 disc_path: child_path,
                 host: entry.path(),
                 size: meta.len(),
+                mtime: meta.modified().ok(),
                 icb_lba: 0,
                 unique_id: 0,
                 extents: Vec::new(),
@@ -746,6 +775,7 @@ mod tests {
             disc_path: "/BIG.M2TS".into(),
             host: PathBuf::new(),
             size: MAX_AD_BYTES + 4096,
+            mtime: None,
             icb_lba: 0,
             unique_id: 0,
             extents: Vec::new(),
@@ -778,6 +808,7 @@ mod tests {
             disc_path: "/EMPTY".into(),
             host: PathBuf::new(),
             size: 0,
+            mtime: None,
             icb_lba: 0,
             unique_id: 0,
             extents: Vec::new(),
@@ -805,6 +836,49 @@ mod tests {
     ///
     /// An earlier version of this test asserted arithmetic about the constants
     /// and never called `plan`, so it would have passed with the guard deleted.
+    /// Two host names that the READER collapses into one must be refused by
+    /// the planner, not written into the image.
+    ///
+    /// Audit finding: the uniqueness check compared raw host names, while
+    /// `parse_udf_name` trims whitespace and drops code units `char::from_u32`
+    /// rejects. So " 00000.m2ts" and "00000.m2ts" were two distinct entries at
+    /// plan time and ONE name at read time; `find`/`read_file` take the first
+    /// match, so a title resolved to the wrong file's extents and muxed the
+    /// wrong bytes at exit 0.
+    ///
+    /// This calls `plan` on a real folder. It fails if the round-trip key is
+    /// reverted to comparing host names.
+    #[test]
+    fn two_names_the_reader_cannot_tell_apart_are_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "fmkv-shadow-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stream = dir.join("BDMV/STREAM");
+        std::fs::create_dir_all(&stream).expect("mkdir");
+        std::fs::write(stream.join("00000.m2ts"), b"a").expect("write");
+        // Same name to the reader: it trims the leading space.
+        std::fs::write(stream.join(" 00000.m2ts"), b"b").expect("write");
+
+        // Precondition — if this stops holding the fixture is wrong, not the code.
+        assert_eq!(
+            crate::udf::parse_udf_name(&crate::dirimage::encode::encode_cs0(" 00000.m2ts")),
+            crate::udf::parse_udf_name(&crate::dirimage::encode::encode_cs0("00000.m2ts")),
+            "fixture: these two host names must read back identically"
+        );
+
+        let got = plan(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(got, Err(Error::DirNameCollision { .. })),
+            "a name the reader cannot distinguish must be refused, got {got:?}"
+        );
+    }
+
     #[test]
     fn an_over_long_name_is_refused_by_the_planner() {
         let dir = std::env::temp_dir().join(format!(
