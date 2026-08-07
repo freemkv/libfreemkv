@@ -207,34 +207,38 @@ impl SeamPlan {
                 );
                 return None;
             }
-            // Inferring a clip from a timestamp assumes the marks are points on
-            // ONE clock that advances across the whole title: a join is
-            // recognised by a frame landing at the next clip's IN, and a frame
-            // is assigned to a clip by falling inside its [in, out].
+            // Marks that do not advance across the title are NORMAL, not a
+            // defect: each clip file carries its own STC, so one clip's IN has
+            // no ordering relationship to the previous clip's at all.
             //
-            // Not every title is like that — a playlist whose clips each restart
-            // their own STC has marks that all cover the same low values. Under
-            // such a table a crossing can be missed, and a missed crossing
-            // STRANDS the track on the clip it was on: every later frame then
-            // falls outside that clip's marks and is dropped, silently, for the
-            // rest of the title.
+            // Inferring a clip from a timestamp cannot read such a table — a
+            // crossing can be missed, and a missed crossing strands the track
+            // on a clip it has already left — so this was refused outright.
+            // That refusal was about INFERENCE, and it cost the titles it was
+            // meant to protect: they fell back to the very path that cannot
+            // read them, with a timeline running minutes past the real length.
             //
-            // That reasoning is entirely about INFERENCE, so the refusal belongs
-            // to inference. With trusted spans the clip comes from the byte
-            // offset and the marks are never read across clips: each clip's
-            // `offset_ns` maps its own private clock onto the output timeline,
-            // which is exactly the right operation for a restarting STC.
-            // Refusing unconditionally turned this type off on most of the
-            // branched discs on hand — the very titles it was written for —
-            // leaving them on the inference path with a timeline running
-            // minutes past the title's real length.
-            if let Some(prev) = out.last()
+            // Provenance does not read the marks across clips. The clip comes
+            // from the byte offset a frame was read at, and each clip's
+            // `offset_ns` maps its own private clock onto the output timeline —
+            // exactly right for an independent STC. Lifting the refusal was
+            // tried once BEFORE every track carried a source offset, and nine
+            // audio and subtitle tracks with nothing to place them by pinned
+            // themselves to clip 0 and dropped most of the title. Now they all
+            // carry one, so the marks keep a single job: deciding whether a
+            // frame lies inside its own clip's [in, out].
+            //
+            // `spans_trusted` still gates it. Without usable spans there is no
+            // byte offset to place by and inference is all that is left, so a
+            // table inference cannot read must still be refused.
+            if !spans_trusted
+                && let Some(prev) = out.last()
                 && in_ns <= prev.in_ns
             {
                 tracing::info!(
                     target: "freemkv::mux",
-                    "no seam plan: the clips' marks do not advance across the \
-                     title, and only the video track carries provenance"
+                    "no seam plan: the clips' marks do not advance and the feed \
+                     spans cannot be trusted, so nothing can place them"
                 );
                 return None;
             }
@@ -434,6 +438,22 @@ impl SeamPlan {
                 return None;
             }
             return Some(raw_ns.saturating_add(c.offset_ns));
+        }
+
+        // Reaching here means this frame carried no byte offset, so it is being
+        // placed by reading the marks ACROSS clips. Every demuxed source now
+        // stamps provenance on every track, so under a plan this is not
+        // expected — and on a table whose marks do not advance the reasoning
+        // below is meaningless and can strand the track for the rest of the
+        // title. Say so once per track rather than let it be silent: a mostly
+        // dropped track already reached a user once this way.
+        if src_byte.is_none() && self.cursors[track].last_raw_ns.is_none() {
+            tracing::info!(
+                target: "freemkv::mux",
+                track,
+                "track has no source offset under a seam plan; placing it from \
+                 timestamps, which is only reliable while the marks advance"
+            );
         }
 
         // Bounded by the clip count, so a wild PTS cannot spin here.
@@ -1349,26 +1369,17 @@ mod tests {
         }
     }
 
-    /// A table whose marks do not advance across the title is REFUSED, and the
-    /// reason is not that the marks are unreadable in principle — it is that
-    /// only the VIDEO parsers stamp a frame's source byte. Every audio and
-    /// subtitle parser hardcodes `source: None`, so those tracks have no
-    /// provenance at all and can only be placed from their timestamps.
+    /// Marks that do not advance across the title are normal — each clip file
+    /// carries its own STC — and are now PLACED, because every track carries a
+    /// source byte offset and the clip comes from that, not from the marks.
     ///
-    /// Accepting such a table therefore places video correctly by byte and
-    /// leaves nine audio/subtitle tracks with nothing to place them by. Tried
-    /// on a real 22-clip title, that pinned every one of them to clip 0 and
-    /// dropped every frame past its OUT mark — most of the title.
-    ///
-    /// Lifting this refusal requires giving the audio and subtitle parsers
-    /// provenance first, stamped from the PES that STARTED each access unit.
+    /// This was refused before, which dropped exactly the branched titles the
+    /// seam plan exists for onto the inference path that cannot read them.
     #[test]
-    fn marks_that_do_not_advance_are_refused_while_provenance_is_video_only() {
+    fn marks_that_do_not_advance_are_placed_by_provenance() {
         const N: u32 = 4;
         const SEG: u32 = 600 * 45_000;
         const CLIP_BYTES: u64 = 4_000_000_000;
-        // Trusted, tiling, distinct spans -- and still refused, because the
-        // spans only help the one track that carries a byte offset.
         let clips: Vec<crate::disc::Clip> = (0..N)
             .map(|i| crate::disc::Clip {
                 clip_id: format!("{i:05}"),
@@ -1379,10 +1390,46 @@ mod tests {
                 feed_span: Some((i as u64 * CLIP_BYTES, (i as u64 + 1) * CLIP_BYTES)),
             })
             .collect();
-        assert!(
-            SeamPlan::from_clips(&clips).is_none(),
-            "a non-advancing table must be refused while only video has provenance"
-        );
+        let mut plan =
+            SeamPlan::from_clips(&clips).expect("a non-advancing table is placeable by byte");
+
+        // The SAME raw timestamp appears in every clip — unresolvable from
+        // timestamps, exact from the byte offset.
+        let seg_ns = mpls_ticks_to_ns(SEG);
+        let raw = mpls_ticks_to_ns(SEG / 2);
+        let mut last: Option<i64> = None;
+        for i in 0..N {
+            let byte = i as u64 * CLIP_BYTES + CLIP_BYTES / 2;
+            let out = plan
+                .place(raw, 0, true, Some(byte))
+                .unwrap_or_else(|| panic!("clip {i} did not place"));
+            assert_eq!(out, i as i64 * seg_ns + seg_ns / 2, "clip {i}");
+            if let Some(l) = last {
+                assert!(out > l, "output moved backwards at clip {i}");
+            }
+            last = Some(out);
+        }
+        assert_eq!(plan.total_ns(), N as i64 * seg_ns);
+    }
+
+    /// Without usable spans there is no byte offset to place by, so inference
+    /// is all that is left — and a table inference cannot read must still be
+    /// refused rather than silently truncating the title.
+    #[test]
+    fn marks_that_do_not_advance_are_still_refused_without_spans() {
+        const N: u32 = 4;
+        const SEG: u32 = 600 * 45_000;
+        let clips: Vec<crate::disc::Clip> = (0..N)
+            .map(|i| crate::disc::Clip {
+                clip_id: format!("{i:05}"),
+                in_time: 0,
+                out_time: SEG,
+                duration_secs: 600.0,
+                source_packets: 0,
+                feed_span: None,
+            })
+            .collect();
+        assert!(SeamPlan::from_clips(&clips).is_none());
     }
 
     /// The refusal must SURVIVE where it is actually load-bearing: a
