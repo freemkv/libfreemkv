@@ -108,18 +108,6 @@ pub(crate) struct SeamPlan {
     /// are at least approximately right. In that case provenance is disabled
     /// and the heuristics are used, which is the 1.6.0 behaviour.
     spans_trusted: bool,
-    /// Whether the clips' marks advance across the title on one shared clock.
-    ///
-    /// False for a playlist whose clips each restart their own STC. Such a
-    /// table cannot be read by the mark heuristics at all — every clip covers
-    /// the same low values, so a crossing can be missed and the track STRANDED
-    /// on a clip it has already left, dropping the rest of the title.
-    ///
-    /// Those tables are accepted only because provenance can place them without
-    /// reading the marks across clips. A frame that arrives WITHOUT a byte
-    /// offset therefore has nothing to be placed by, and must not be handed to
-    /// the heuristics — it stays on its track's current clip instead.
-    marks_orderable: bool,
     clips: Vec<SeamClip>,
     /// Frames dropped because they fell outside every clip's marks, per track.
     ///
@@ -208,7 +196,6 @@ impl SeamPlan {
 
         let mut out: Vec<SeamClip> = Vec::with_capacity(clips.len());
         let mut cum: i64 = 0;
-        let mut marks_orderable = true;
         for c in clips {
             let in_ns = mpls_ticks_to_ns(c.in_time);
             let out_ns = mpls_ticks_to_ns(c.out_time);
@@ -244,15 +231,12 @@ impl SeamPlan {
             if let Some(prev) = out.last()
                 && in_ns <= prev.in_ns
             {
-                if !spans_trusted {
-                    tracing::info!(
-                        target: "freemkv::mux",
-                        "no seam plan: the clips restart their clock and the feed \
-                         spans cannot be trusted, so nothing can place them"
-                    );
-                    return None;
-                }
-                marks_orderable = false;
+                tracing::info!(
+                    target: "freemkv::mux",
+                    "no seam plan: the clips' marks do not advance across the \
+                     title, and only the video track carries provenance"
+                );
+                return None;
             }
             out.push(SeamClip {
                 in_ns,
@@ -287,14 +271,12 @@ impl SeamPlan {
             clips = out.len(),
             distinct_spans,
             spans_trusted,
-            marks_orderable,
             total_ns = cum,
             "seam plan built"
         );
 
         Some(Self {
             spans_trusted,
-            marks_orderable,
             clips: out,
             cursors: Vec::new(),
             dropped: Vec::new(),
@@ -452,44 +434,6 @@ impl SeamPlan {
                 return None;
             }
             return Some(raw_ns.saturating_add(c.offset_ns));
-        }
-
-        // Everything below reads the marks ACROSS clips to work out where this
-        // frame belongs. On a table whose clips restart their own clock that
-        // reasoning is meaningless — the same raw value sits inside every
-        // clip's range — and acting on it strands the track on a clip it has
-        // already left, dropping the remainder of the title.
-        //
-        // Such a table was accepted only because provenance can place it. A
-        // frame that reaches here has no byte offset (or one outside every
-        // span), so there is nothing to place it by. Holding it on the track's
-        // current clip keeps it beside its neighbours, which is the best
-        // available answer and cannot strand: the cursor only ever moves under
-        // provenance, which is never wrong about which clip a byte came from.
-        if !self.marks_orderable {
-            let c = self.clips[clip];
-            if raw_ns < c.in_ns || raw_ns > c.out_ns {
-                self.dropped[track] = self.dropped[track].saturating_add(1);
-                if self.dropped[track] == 1 {
-                    tracing::info!(
-                        target: "freemkv::mux",
-                        track,
-                        clip,
-                        raw_ns,
-                        in_ns = c.in_ns,
-                        out_ns = c.out_ns,
-                        "frame with no provenance outside its track's clip; dropping"
-                    );
-                }
-                return None;
-            }
-            let out = raw_ns.saturating_add(c.offset_ns);
-            self.cursors[track] = TrackPos {
-                clip,
-                last_raw_ns: Some(raw_ns),
-                last_out_ns: Some(out),
-            };
-            return Some(out);
         }
 
         // Bounded by the clip count, so a wild PTS cannot spin here.
@@ -1405,120 +1349,40 @@ mod tests {
         }
     }
 
-    /// A playlist whose clips each restart their own STC is the common case on
-    /// the branched discs in the hoard: every clip's marks cover the same low
-    /// values, so the marks are NOT points on one title-wide clock.
+    /// A table whose marks do not advance across the title is REFUSED, and the
+    /// reason is not that the marks are unreadable in principle — it is that
+    /// only the VIDEO parsers stamp a frame's source byte. Every audio and
+    /// subtitle parser hardcodes `source: None`, so those tracks have no
+    /// provenance at all and can only be placed from their timestamps.
     ///
-    /// Inference cannot read such a table — which is why a non-monotonic table
-    /// is refused. But provenance does not read it: with the feed spans tiling
-    /// the title, the clip is known from the byte offset, and each clip's own
-    /// `offset_ns` maps its private clock onto the output timeline. Refusing
-    /// these tables outright therefore turns the fix off on exactly the discs
-    /// that need it, and leaves them on the inference path this type exists to
-    /// replace.
+    /// Accepting such a table therefore places video correctly by byte and
+    /// leaves nine audio/subtitle tracks with nothing to place them by. Tried
+    /// on a real 22-clip title, that pinned every one of them to clip 0 and
+    /// dropped every frame past its OUT mark — most of the title.
+    ///
+    /// Lifting this refusal requires giving the audio and subtitle parsers
+    /// provenance first, stamped from the PES that STARTED each access unit.
     #[test]
-    fn a_title_whose_clips_restart_their_clock_is_still_placed_by_provenance() {
-        const N: u32 = 6;
-        const CLIP_TICKS: u32 = 600 * 45_000; // 10 min each
-        const CLIP_BYTES: u64 = 4_000_000_000;
-        // Every clip runs 0..10min on its OWN clock: strictly non-monotonic
-        // across the title, and identical from one clip to the next.
-        let clips: Vec<crate::disc::Clip> = (0..N)
-            .map(|i| crate::disc::Clip {
-                clip_id: format!("{i:05}"),
-                in_time: 0,
-                out_time: CLIP_TICKS,
-                duration_secs: 600.0,
-                source_packets: 0,
-                feed_span: Some((i as u64 * CLIP_BYTES, (i as u64 + 1) * CLIP_BYTES)),
-            })
-            .collect();
-
-        let mut plan = SeamPlan::from_clips(&clips)
-            .expect("a restarting-clock table with trusted spans must still yield a plan");
-        assert!(plan.spans_trusted, "contiguous spans must be trusted");
-
-        // The same raw timestamp appears once per clip. Each occurrence must
-        // land in its own clip's slot on the output timeline — this is the
-        // case that is simply unresolvable from timestamps alone.
-        let clip_ns = mpls_ticks_to_ns(CLIP_TICKS);
-        let mut last: Option<i64> = None;
-        for i in 0..N {
-            let raw = mpls_ticks_to_ns(CLIP_TICKS / 2); // identical every clip
-            let byte = i as u64 * CLIP_BYTES + CLIP_BYTES / 2;
-            let out = plan
-                .place(raw, 0, true, Some(byte))
-                .unwrap_or_else(|| panic!("clip {i} did not place"));
-            let want = i as i64 * clip_ns + clip_ns / 2;
-            assert_eq!(out, want, "clip {i} placed at {out}, expected {want}");
-            if let Some(l) = last {
-                assert!(out > l, "output moved backwards at clip {i}");
-            }
-            last = Some(out);
-        }
-
-        // And the total must equal the sum of the marks, not the raw span --
-        // this is the overrun that shows up as a container minutes longer than
-        // the title actually is.
-        assert_eq!(
-            plan.total_ns(),
-            N as i64 * clip_ns,
-            "the plan's total must be the sum of the clips' playable durations"
-        );
-    }
-
-    /// Accepting a restarting-clock table must not let a frame WITHOUT
-    /// provenance reach the mark heuristics — on such a table they are
-    /// meaningless, and acting on them strands the track on a clip it has
-    /// already left, dropping the rest of the title. That is the exact failure
-    /// the old blanket refusal existed to prevent, and it must not come back
-    /// through the no-byte-offset path.
-    #[test]
-    fn on_a_restarting_clock_a_frame_without_provenance_does_not_strand_its_track() {
+    fn marks_that_do_not_advance_are_refused_while_provenance_is_video_only() {
         const N: u32 = 4;
-        const CLIP_TICKS: u32 = 600 * 45_000;
+        const SEG: u32 = 600 * 45_000;
         const CLIP_BYTES: u64 = 4_000_000_000;
+        // Trusted, tiling, distinct spans -- and still refused, because the
+        // spans only help the one track that carries a byte offset.
         let clips: Vec<crate::disc::Clip> = (0..N)
             .map(|i| crate::disc::Clip {
                 clip_id: format!("{i:05}"),
                 in_time: 0,
-                out_time: CLIP_TICKS,
+                out_time: SEG,
                 duration_secs: 600.0,
                 source_packets: 0,
                 feed_span: Some((i as u64 * CLIP_BYTES, (i as u64 + 1) * CLIP_BYTES)),
             })
             .collect();
-        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
         assert!(
-            !plan.marks_orderable,
-            "this table's marks are not orderable"
+            SeamPlan::from_clips(&clips).is_none(),
+            "a non-advancing table must be refused while only video has provenance"
         );
-
-        let clip_ns = mpls_ticks_to_ns(CLIP_TICKS);
-        let mid = mpls_ticks_to_ns(CLIP_TICKS / 2);
-
-        // Walk to clip 2 under provenance, then feed frames with NO byte
-        // offset — the interleaved-tail case. They must stay in clip 2.
-        for i in 0..3u32 {
-            plan.place(mid, 0, true, Some(i as u64 * CLIP_BYTES + 10))
-                .expect("provenance frame places");
-        }
-        for _ in 0..50 {
-            let out = plan
-                .place(mid, 0, true, None)
-                .expect("a frame without provenance must still place");
-            assert_eq!(
-                out,
-                2 * clip_ns + clip_ns / 2,
-                "a frame without provenance must stay on the track's current clip"
-            );
-        }
-
-        // And the track must still be able to move on under provenance.
-        let out = plan
-            .place(mid, 0, true, Some(3 * CLIP_BYTES + 10))
-            .expect("clip 3 places");
-        assert_eq!(out, 3 * clip_ns + clip_ns / 2, "provenance still advances");
     }
 
     /// The refusal must SURVIVE where it is actually load-bearing: a
