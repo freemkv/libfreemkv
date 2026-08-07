@@ -1378,6 +1378,36 @@ impl<W: Write + Seek> MkvMuxer<W> {
         duration_ns: Option<u64>,
         block_additional: Option<&[u8]>,
     ) -> io::Result<()> {
+        self.write_frame_at(
+            track_idx,
+            pts_ns,
+            keyframe,
+            data,
+            duration_ns,
+            block_additional,
+            None,
+        )
+    }
+
+    /// [`Self::write_frame`] with the frame's SOURCE BYTE OFFSET.
+    ///
+    /// Under a seam plan that offset identifies which clip the frame came from
+    /// by lookup rather than by inferring it from the timestamp — which is
+    /// ambiguous inside an overlap, where two clips' mark ranges both contain
+    /// the same instant. Callers that have a `PesFrame` should pass
+    /// `frame.source.map(|s| s.byte)`; `write_frame` is the same call with no
+    /// provenance, which falls back to the mark heuristics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_frame_at(
+        &mut self,
+        track_idx: usize,
+        pts_ns: i64,
+        keyframe: bool,
+        data: &[u8],
+        duration_ns: Option<u64>,
+        block_additional: Option<&[u8]>,
+        src_byte: Option<u64>,
+    ) -> io::Result<()> {
         // --log-level 3: capture the first ~100 coded frames per track to the
         // side file BEFORE any timeline mangling, with the codec parser's own
         // frame PTS — so an opening-GOP / mid-GOP-open / menu issue is
@@ -1420,6 +1450,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             drives_epoch,
             track_idx,
             self.track_is_video.get(track_idx).copied().unwrap_or(false),
+            src_byte,
         ) else {
             return Ok(());
         };
@@ -4471,6 +4502,7 @@ mod tests {
         // places none of them and drops them all.
         let clips = [
             crate::disc::Clip {
+                feed_span: None,
                 clip_id: "00000".into(),
                 in_time: 100 * 45_000,
                 out_time: 200 * 45_000,
@@ -4478,6 +4510,7 @@ mod tests {
                 source_packets: 0,
             },
             crate::disc::Clip {
+                feed_span: None,
                 clip_id: "00001".into(),
                 in_time: 200 * 45_000,
                 out_time: 300 * 45_000,

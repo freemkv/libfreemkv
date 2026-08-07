@@ -642,6 +642,7 @@ mod tests {
             size_bytes,
             clips: (0..n_clips)
                 .map(|i| Clip {
+                    feed_span: None,
                     clip_id: format!("{i:05}"),
                     in_time: 0,
                     out_time: 0,

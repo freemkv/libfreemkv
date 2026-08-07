@@ -1887,6 +1887,7 @@ mod apply_tests {
         DiscTitle {
             playlist: playlist.into(),
             clips: vec![crate::disc::Clip {
+                feed_span: None,
                 clip_id: clip_id.into(),
                 in_time: 0,
                 out_time: 0,

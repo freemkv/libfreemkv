@@ -173,6 +173,17 @@ pub struct Clip {
     pub duration_secs: f64,
     /// Source packet count (from CLPI, 0 if unavailable)
     pub source_packets: u32,
+    /// Byte range this clip's stream occupies within the TITLE'S FEED — the
+    /// concatenation of the title's extents, in the order the mux reads them.
+    /// `None` when it could not be determined.
+    ///
+    /// This is PROVENANCE, and it is what makes clip assignment a lookup
+    /// instead of a guess. During an overlap two clips' mark ranges both
+    /// contain the same timestamp, so no rule over timestamps alone can say
+    /// which clip a frame came from — four audit rounds each fixed one such
+    /// rule and broke another. A frame carries its source byte offset
+    /// (`PesFrame::source`), and that offset falls in exactly one clip's span.
+    pub feed_span: Option<(u64, u64)>,
 }
 
 /// A stream within a title.
@@ -4009,6 +4020,7 @@ mod tests {
         t.size_bytes = size_bytes;
         t.clips = (0..n_clips)
             .map(|i| Clip {
+                feed_span: None,
                 clip_id: format!("{i:05}"),
                 in_time: 0,
                 out_time: 1,
@@ -4409,6 +4421,7 @@ mod tests {
                 size_bytes,
                 clips: (0..n_clips)
                     .map(|i| Clip {
+                        feed_span: None,
                         clip_id: format!("{i:05}"),
                         in_time: 0,
                         out_time: 0,
