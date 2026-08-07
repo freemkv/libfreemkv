@@ -275,6 +275,27 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
                 Err(e) => return Err(Error::from(e)),
             };
             if !meta.is_file() {
+                // Not a plain file after following the link. The common case is
+                // a SYMLINK TO A DIRECTORY — a normal way to keep 40 GB of
+                // streams off the system disk — and `entry.file_type()` above
+                // reports the link, not the target, so such a subtree never
+                // enters `dirs` and is silently absent from the image.
+                //
+                // The result was the worst class this release exists to close:
+                // BDMV/PLAYLIST and CLIPINF still synthesize, so the folder
+                // scans and enumerates titles, every clip resolves to no
+                // extents, and the mux takes its clean-EOF path and writes a
+                // near-empty MKV at exit 0.
+                //
+                // It is still skipped rather than followed — following link
+                // targets invites cycles and escapes from the folder — but it
+                // is now SAID, at the same volume as the name-skip above.
+                tracing::warn!(
+                    target: "freemkv::dirimage",
+                    path = %child_path,
+                    kind = if meta.is_dir() { "directory link" } else { "special file" },
+                    "entry is not a plain file; omitted from the image"
+                );
                 continue;
             }
             files.push(FileNode {
