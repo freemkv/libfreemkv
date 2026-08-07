@@ -430,6 +430,25 @@ impl SeamPlan {
                 // (a clip's file is not trimmed to its marks). Counted, so the
                 // volume gates in the sinks can see it.
                 self.dropped[track] = self.dropped[track].saturating_add(1);
+                // Once per track, on the FIRST drop only — a join legitimately
+                // drops a handful of frames and this must not become per-frame
+                // noise. The heuristic path below has always logged this; the
+                // provenance path did not, so a title that dropped MOST of its
+                // frames here produced a volume-gate failure and not one line
+                // saying which frame, which clip, or which marks it was judged
+                // against. That is not a diagnosable failure.
+                if self.dropped[track] == 1 {
+                    tracing::info!(
+                        target: "freemkv::mux",
+                        track,
+                        clip = found,
+                        byte = b,
+                        raw_ns,
+                        in_ns = c.in_ns,
+                        out_ns = c.out_ns,
+                        "frame outside its clip's marks (by provenance); dropping"
+                    );
+                }
                 return None;
             }
             return Some(raw_ns.saturating_add(c.offset_ns));
@@ -451,6 +470,17 @@ impl SeamPlan {
             let c = self.clips[clip];
             if raw_ns < c.in_ns || raw_ns > c.out_ns {
                 self.dropped[track] = self.dropped[track].saturating_add(1);
+                if self.dropped[track] == 1 {
+                    tracing::info!(
+                        target: "freemkv::mux",
+                        track,
+                        clip,
+                        raw_ns,
+                        in_ns = c.in_ns,
+                        out_ns = c.out_ns,
+                        "frame with no provenance outside its track's clip; dropping"
+                    );
+                }
                 return None;
             }
             let out = raw_ns.saturating_add(c.offset_ns);
@@ -1334,6 +1364,45 @@ mod tests {
             None,
             "a byte past the last clip belongs to no clip"
         );
+    }
+
+    /// A title whose PlayItems all reference ONE clip file: every span is
+    /// identical, so the tiling check's "equal to previous is allowed" arm
+    /// matches every entry and the spans are TRUSTED — while carrying no
+    /// information at all about which PlayItem a byte belongs to.
+    ///
+    /// That combination is the dangerous one: provenance looks authoritative
+    /// and is actually blind, so every frame resolves to the FIRST PlayItem and
+    /// everything past its mark range is dropped.
+    #[test]
+    fn one_clip_file_behind_every_play_item_is_not_distinguishable_by_byte() {
+        const N: u32 = 8;
+        const SPAN: (u64, u64) = (0, 40_000_000_000);
+        const SEG: u32 = 600 * 45_000; // 10 min per sub-range
+        let clips: Vec<crate::disc::Clip> = (0..N)
+            .map(|i| crate::disc::Clip {
+                clip_id: "00001".to_string(), // the SAME file every time
+                in_time: i * SEG,
+                out_time: (i + 1) * SEG,
+                duration_secs: 600.0,
+                source_packets: 0,
+                feed_span: Some(SPAN),
+            })
+            .collect();
+        let plan = SeamPlan::from_clips(&clips).expect("plan");
+        assert!(
+            plan.spans_trusted,
+            "identical spans pass the tiling check -- this is the hazard"
+        );
+        // Every byte in the file resolves to the FIRST play item, so a byte
+        // offset cannot say which of the 8 ranges a frame belongs to.
+        for b in [0u64, 1_000_000, 20_000_000_000, 39_999_999_999] {
+            assert_eq!(
+                plan.clip_at_byte(b),
+                Some(0),
+                "byte {b} resolves to the first play item, always"
+            );
+        }
     }
 
     /// A playlist whose clips each restart their own STC is the common case on
