@@ -6,7 +6,7 @@
 //! are emitted complete.
 
 use super::startcode::BitReader;
-use super::{CodecParser, Frame, PesPacket, pts_to_ns};
+use super::{CodecParser, Frame, PesPacket};
 
 const DTS_CORE_SYNC: [u8; 4] = [0x7F, 0xFE, 0x80, 0x01];
 /// DTS-HD extension substream syncword. An access unit is delimited by the next
@@ -21,23 +21,16 @@ const DTS_HD_EXT_SYNC: [u8; 4] = [0x64, 0x58, 0x20, 0x25];
 /// This preserves the lossless extension data instead of downgrading to lossy
 /// core (the lossy-core downgrade bug).
 pub struct DtsParser {
-    buf: Vec<u8>,
+    /// Bytes assembled across PES packets, each attributable to the packet
+    /// that carried it. An emitted unit takes the facts of the packet covering
+    /// its FIRST byte, so an AU whose core arrived in an earlier PES keeps that
+    /// core's timestamp and source offset when its extensions arrive later.
+    acc: super::pesbuf::PesBuf,
     /// PTS of the access unit currently being assembled in `buf` (the unit
     /// starting at the first buffered core sync). Captured when that core
     /// frame's PES first arrived; the trailing extension-substream PES
     /// packets carry their own (later) PTS which must NOT override it.
     pending_pts: i64,
-    /// PTS markers attributing buffer regions to their source PES. Each entry
-    /// is `(buffer_offset, pts_ns)` for the PES whose bytes begin at that
-    /// offset. When an access unit is emitted from the front of `buf`, its PTS
-    /// is the marker covering offset 0 — NOT the most recent PES's PTS. This is
-    /// what fixes multi-AU-per-call PTS attribution: if a PES carries the
-    /// extension substreams (and possibly the next core) for an AU whose own
-    /// core arrived in an earlier PES, the emitted AU keeps its own core PES's
-    /// timestamp instead of the later PES's. Offsets are kept relative to the
-    /// current `buf` start and rebased whenever bytes are drained from the
-    /// front.
-    pts_marks: std::collections::VecDeque<(usize, i64)>,
     /// The `front_pts` of the PREVIOUS emitted access unit. When the current
     /// AU's `front_pts` differs, it began a new PES → re-base to it. When it is
     /// unchanged, this AU shares the previous AU's PES → advance one frame
@@ -66,9 +59,8 @@ impl Default for DtsParser {
 impl DtsParser {
     pub fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(32768),
+            acc: super::pesbuf::PesBuf::with_capacity(32768),
             pending_pts: 0,
-            pts_marks: std::collections::VecDeque::new(),
             last_front_pts: PTS_UNSET,
             next_pts_ns: PTS_UNSET,
             tally: super::dropgate::DropTally::new("dts"),
@@ -92,7 +84,14 @@ impl DtsParser {
     /// PTS clock (which the caller advances whether or not the AU survives), so
     /// a drop leaves the following audio on its true timeline — a gap, not a
     /// shift. Every drop is logged (fail-loud, never silent).
-    fn emit_or_drop(&mut self, au: Vec<u8>, au_pts: i64, dur_ns: i64, out: &mut Vec<Frame>) {
+    fn emit_or_drop(
+        &mut self,
+        au: Vec<u8>,
+        au_pts: i64,
+        dur_ns: i64,
+        src: Option<crate::pes::SourcePos>,
+        out: &mut Vec<Frame>,
+    ) {
         let verdict = if self.tally.is_poisoned() {
             Err(DropReason::TrackPoisoned)
         } else {
@@ -104,7 +103,9 @@ impl DtsParser {
                 out.push(Frame {
                     discontinuity: false,
                     coding: None,
-                    source: None,
+                    // From the SAME packet as `au_pts` — both are the facts of
+                    // the PES covering this unit's first byte.
+                    source: src,
                     pts_ns: au_pts,
                     keyframe: true,
                     data: au,
@@ -148,40 +149,24 @@ impl DtsParser {
         base
     }
 
-    /// Drop `n` bytes from the front of `buf` and rebase the PTS markers so
-    /// their offsets stay relative to the new buffer start. A marker that now
-    /// sits at or before offset 0 is clamped to 0 (it still covers the front).
-    /// Redundant markers all at offset 0 collapse to the last one.
+    /// Drop `n` bytes from the front, rebasing attribution onto the new front.
     fn drain_front(&mut self, n: usize) {
-        if n == 0 {
-            return;
-        }
-        self.buf.drain(..n);
-        for m in &mut self.pts_marks {
-            m.0 = m.0.saturating_sub(n);
-        }
-        // Collapse all leading markers that now sit at offset 0 to the last
-        // such marker — that is the PES whose data currently begins the buffer.
-        let last_zero = self
-            .pts_marks
-            .iter()
-            .rposition(|&(off, _)| off == 0)
-            .filter(|&i| i > 0);
-        if let Some(i) = last_zero {
-            self.pts_marks.drain(..i);
-        }
+        self.acc.drain(n);
     }
 
-    /// PTS that should be stamped on an access unit currently at the front of
-    /// `buf` (offset 0): the most recent marker at offset 0, falling back to
-    /// `pending_pts`.
+    /// PTS for the access unit at the front of the buffer: the facts of the
+    /// packet covering offset 0, falling back to the unit's captured base.
     fn front_pts(&self) -> i64 {
-        self.pts_marks
-            .iter()
-            .rev()
-            .find(|&&(off, _)| off == 0)
-            .map(|&(_, pts)| pts)
+        self.acc
+            .front()
+            .presentation_ns()
             .unwrap_or(self.pending_pts)
+    }
+
+    /// Source offset for that same unit — from the SAME packet as its PTS,
+    /// which is the property the shared buffer exists to guarantee.
+    fn front_source(&self) -> Option<crate::pes::SourcePos> {
+        self.acc.front().source
     }
 }
 
@@ -227,8 +212,7 @@ impl CodecParser for DtsParser {
         // never be stranded by an empty post-gap PES (defensive; the demuxer only
         // emits non-empty PES today).
         if pes.discontinuity {
-            self.buf.clear();
-            self.pts_marks.clear();
+            self.acc.clear();
             self.pending_pts = PTS_UNSET;
             // A concealed gap is a timeline discontinuity: let the post-gap AU
             // re-base to its own PES PTS rather than the pre-gap cursor.
@@ -242,17 +226,15 @@ impl CodecParser for DtsParser {
         // guard at a post-gap continuation) must NOT reset the timeline to 0;
         // continue from the most recent known base. Defense-in-depth: the
         // discontinuity-carrying PES is a PUSI with a PTS in practice.
-        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or_else(|| {
-            self.pts_marks
-                .back()
-                .map(|&(_, p)| p)
-                .filter(|&p| p >= 0)
-                .unwrap_or(if self.pending_pts >= 0 {
-                    self.pending_pts
-                } else {
-                    0
-                })
-        });
+        // A PES with no PTS (rare for audio, but legal) must NOT reset the
+        // timeline to 0 — continue from the most recent known base.
+        let pts_ns = super::pesbuf::PesFacts::of(pes)
+            .presentation_ns()
+            .unwrap_or(if self.pending_pts >= 0 {
+                self.pending_pts
+            } else {
+                0
+            });
 
         // On Blu-ray, a DTS-HD MA/HRA access unit is a DTS core frame
         // (sync 0x7FFE8001) followed by one or more DTS extension substreams
@@ -272,7 +254,7 @@ impl CodecParser for DtsParser {
         // prior forced (safety-valve) flush left it invalidated — in the
         // forced case the bytes still in `buf` are not a real core frame, so
         // the first PES to arrive after the flush carries the correct base.
-        if self.buf.is_empty() || self.pending_pts == PTS_UNSET {
+        if self.acc.is_empty() || self.pending_pts == PTS_UNSET {
             self.pending_pts = pts_ns;
         }
         // Mark where THIS PES's bytes begin in the buffer, with its PTS. The
@@ -280,21 +262,22 @@ impl CodecParser for DtsParser {
         // (see `front_pts`), so an AU whose core arrived in an earlier PES keeps
         // that core's timestamp even when its extensions / the following core
         // arrive (with a later PTS) in this same parse() call.
-        // (pts_marks is bounded implicitly: an empty PES returns above without
-        // pushing a mark, and a non-empty run grows `buf`, which is cleared —
-        // along with pts_marks — once it exceeds MAX_AU_BYTES.)
-        self.pts_marks.push_back((self.buf.len(), pts_ns));
-        self.buf.extend_from_slice(&pes.data);
+        // `pts_ns` is this packet's own timestamp, or the carried-forward base
+        // when it had none; the source offset is always this packet's.
+        self.acc.push_with(
+            &pes.data,
+            super::pesbuf::PesFacts::of(pes).with_pts_ns(pts_ns),
+        );
 
         let mut frames = Vec::new();
 
         loop {
             // Resync to the first core sync; drop any leading junk.
-            let Some(start) = find_sync(&self.buf, &DTS_CORE_SYNC) else {
+            let Some(start) = find_sync(self.acc.as_slice(), &DTS_CORE_SYNC) else {
                 // No core sync at all yet — keep at most a 3-byte tail so a
                 // sync split across PES packets can still be found next time.
-                if self.buf.len() > 3 {
-                    let tail = self.buf.len() - 3;
+                if self.acc.len() > 3 {
+                    let tail = self.acc.len() - 3;
                     self.drain_front(tail);
                 }
                 break;
@@ -305,17 +288,17 @@ impl CodecParser for DtsParser {
                 // offset 0 by construction, so a re-scan would be a redundant
                 // O(buf_len) walk per iteration; assert the invariant instead.
                 debug_assert_eq!(
-                    find_sync(&self.buf, &DTS_CORE_SYNC),
+                    find_sync(self.acc.as_slice(), &DTS_CORE_SYNC),
                     Some(0),
                     "drain_front(start) must leave the core sync at offset 0"
                 );
             }
 
             // Need the core header to size the core frame.
-            if self.buf.len() < CORE_HEADER_MIN_BYTES {
+            if self.acc.len() < CORE_HEADER_MIN_BYTES {
                 break;
             }
-            let core_size = dts_core_frame_size(&self.buf);
+            let core_size = dts_core_frame_size(self.acc.as_slice());
             // `dts_core_frame_size` returns a 14-bit `fsize + 1`, so it is
             // always in [1, 16384]; the bare `== 0` / `> MAX_AU_BYTES` checks
             // can never fire. A real DTS core frame is at least
@@ -330,7 +313,7 @@ impl CodecParser for DtsParser {
                 self.drain_front(4);
                 continue;
             }
-            if self.buf.len() < core_size {
+            if self.acc.len() < core_size {
                 break; // core frame not fully buffered yet — wait
             }
 
@@ -349,9 +332,9 @@ impl CodecParser for DtsParser {
             // flush is an extension-substream PES, carrying its own later
             // timestamp) must NOT become the next unit's PTS base.
             let mut forced = false;
-            let (au_end, ext_clean) = match next_core_boundary(&self.buf, core_size) {
+            let (au_end, ext_clean) = match next_core_boundary(self.acc.as_slice(), core_size) {
                 NextCore::Found { end, ext_clean } => (end, ext_clean),
-                NextCore::NeedMore if self.buf.len() <= MAX_AU_BYTES => break,
+                NextCore::NeedMore if self.acc.len() <= MAX_AU_BYTES => break,
                 NextCore::NeedMore => {
                     // A candidate boundary exists but is not fully buffered. Normally
                     // we wait for more PES; but once the buffer exceeds the AU cap,
@@ -359,7 +342,7 @@ impl CodecParser for DtsParser {
                     // stream that keeps a boundary perpetually incomplete can't grow
                     // `buf` without bound (the `break` above never reaches it).
                     forced = true;
-                    (self.buf.len(), true)
+                    (self.acc.len(), true)
                 }
                 NextCore::None => {
                     // No next core sync buffered yet. The trailing extension
@@ -367,11 +350,11 @@ impl CodecParser for DtsParser {
                     // them rather than emit a core-only (lossy) frame — unless
                     // the buffer has grown unreasonably large, in which case
                     // emit what we have to guarantee forward progress.
-                    if self.buf.len() <= MAX_AU_BYTES {
+                    if self.acc.len() <= MAX_AU_BYTES {
                         break;
                     }
                     forced = true;
-                    (self.buf.len(), true)
+                    (self.acc.len(), true)
                 }
             };
 
@@ -384,7 +367,7 @@ impl CodecParser for DtsParser {
             // rather than shipping it. A recognized-but-unsizeable extension
             // (`ext_clean == true`) is preserved in full (lossless).
             let emit_end = if ext_clean { au_end } else { core_size };
-            let au: Vec<u8> = self.buf[..emit_end].to_vec();
+            let au: Vec<u8> = self.acc.as_slice()[..emit_end].to_vec();
             // The AU's own core PES PTS (the PES covering its first byte, even if
             // that PES preceded the one(s) carrying its extensions or the next
             // core), stamped monotonically: honored when it advances past the
@@ -396,7 +379,10 @@ impl CodecParser for DtsParser {
             // would: the following AU keeps its true PTS and the drop is a gap,
             // never a shift. `emit_or_drop` decides whether to actually push it.
             let au_pts = self.stamp_pts(self.front_pts(), dur_ns);
-            self.emit_or_drop(au, au_pts, dur_ns, &mut frames);
+            // Read BEFORE draining: after the drain the front is the NEXT
+            // unit's packet, not this one's.
+            let au_src = self.front_source();
+            self.emit_or_drop(au, au_pts, dur_ns, au_src, &mut frames);
             self.drain_front(au_end);
             // After draining, the marker covering the new front (if any) carries
             // the next AU's PTS; `pending_pts` is only the fallback when no
@@ -408,15 +394,14 @@ impl CodecParser for DtsParser {
                 // regardless of buffer state, rather than inheriting this
                 // (non-core) PES's timestamp.
                 self.pending_pts = PTS_UNSET;
-                self.pts_marks.clear();
             }
         }
 
-        // Discard markers that no longer reference live buffer bytes (everything
-        // past the buffer end can't happen, but collapse duplicates at offset 0
-        // and drop a stale empty-buffer marker set).
-        if self.buf.is_empty() {
-            self.pts_marks.clear();
+        // An empty buffer holds no bytes for a mark to attribute, so drop the
+        // marks with them. `drain` deliberately keeps the mark covering the new
+        // front — correct while bytes remain, stale once none do.
+        if self.acc.is_empty() {
+            self.acc.clear();
         }
 
         frames
@@ -440,26 +425,28 @@ impl DtsParser {
     /// streaming), gated through the decodability check. Require a complete core
     /// frame; drop a bare partial sync tail.
     fn flush_tail(&mut self) -> Vec<Frame> {
-        if find_sync(&self.buf, &DTS_CORE_SYNC) != Some(0) || self.buf.len() < CORE_HEADER_MIN_BYTES
+        if find_sync(self.acc.as_slice(), &DTS_CORE_SYNC) != Some(0)
+            || self.acc.len() < CORE_HEADER_MIN_BYTES
         {
-            self.buf.clear();
+            self.acc.clear();
             return Vec::new();
         }
-        let core_size = dts_core_frame_size(&self.buf);
+        let core_size = dts_core_frame_size(self.acc.as_slice());
         // `dts_core_frame_size` returns a 14-bit `fsize + 1` (never 0), so the
         // old `== 0` check was dead; reject a sub-minimum core like `parse()`.
-        if core_size < MIN_CORE_FRAME_BYTES || self.buf.len() < core_size {
-            self.buf.clear();
+        if core_size < MIN_CORE_FRAME_BYTES || self.acc.len() < core_size {
+            self.acc.clear();
             return Vec::new();
         }
         // The final AU's PTS is the PES covering the buffer front (its core's
         // PES). Fall back to pending_pts, clamping the sentinel to 0.
-        let au = std::mem::take(&mut self.buf);
+        let au = self.acc.as_slice().to_vec();
         let dur_ns = dts_core_duration_ns(&au) as i64;
         let pts_ns = self.stamp_pts(self.front_pts(), dur_ns);
-        self.pts_marks.clear();
+        let src = self.front_source();
+        self.acc.clear();
         let mut out = Vec::new();
-        self.emit_or_drop(au, pts_ns, dur_ns, &mut out);
+        self.emit_or_drop(au, pts_ns, dur_ns, src, &mut out);
         out
     }
 }
@@ -824,6 +811,7 @@ fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mux::codec::pts_to_ns;
     use crate::mux::ts::PesPacket;
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
@@ -899,15 +887,19 @@ mod tests {
     fn drain_front_collapses_offset_zero_markers_instead_of_leaking() {
         let mut parser = DtsParser::new();
         for i in 0..200i64 {
-            parser.buf.extend_from_slice(&[0u8; 5]);
-            parser.pts_marks.push_back((5, i));
-            parser.pts_marks.push_back((5, i));
+            parser.acc.append_unattributed(&[0u8; 5]);
+            parser
+                .acc
+                .mark_here(crate::mux::codec::pesbuf::PesFacts::default().with_pts_ns(i));
+            parser
+                .acc
+                .mark_here(crate::mux::codec::pesbuf::PesFacts::default().with_pts_ns(i));
             parser.drain_front(5);
         }
         assert!(
-            parser.pts_marks.len() <= 2,
+            parser.acc.mark_count() <= 2,
             "pts_marks must stay bounded across repeated drains, got {}",
-            parser.pts_marks.len()
+            parser.acc.mark_count()
         );
     }
 
@@ -1579,7 +1571,7 @@ mod tests {
             "NeedMore past the AU cap must force-emit, not stall and balloon the buffer"
         );
         assert!(
-            parser.buf.is_empty(),
+            parser.acc.is_empty(),
             "the forced flush drains the buffer instead of growing it unbounded"
         );
     }
@@ -1751,7 +1743,7 @@ mod tests {
         // The first core's bytes are still buffered awaiting the verdict — not
         // dropped, not emitted.
         assert!(
-            parser.buf.len() >= 512,
+            parser.acc.len() >= 512,
             "core1 retained while candidate boundary is undecided"
         );
     }
@@ -1809,8 +1801,8 @@ mod tests {
         let mut parser = DtsParser::new();
         let f = parser.parse(&make_pes(vec![0x11, 0x22, 0x33, 0x44], Some(90000)));
         assert!(f.is_empty());
-        assert_eq!(parser.buf.len(), 3, "only a 3-byte resync tail retained");
-        assert_eq!(parser.buf, vec![0x22, 0x33, 0x44]);
+        assert_eq!(parser.acc.len(), 3, "only a 3-byte resync tail retained");
+        assert_eq!(parser.acc.as_slice(), &[0x22, 0x33, 0x44]);
     }
 
     #[test]
@@ -1825,7 +1817,7 @@ mod tests {
                 .parse(&make_pes(core[..3].to_vec(), Some(90000)))
                 .is_empty()
         );
-        assert_eq!(parser.buf.len(), 3, "3-byte sync prefix retained");
+        assert_eq!(parser.acc.len(), 3, "3-byte sync prefix retained");
         // PES 2: the 4th sync byte + the rest of core1, then a 2nd core to close.
         let mut rest = core[3..].to_vec();
         rest.extend_from_slice(&make_dts_core(640));
@@ -1847,7 +1839,7 @@ mod tests {
         let mut data = DTS_CORE_SYNC.to_vec();
         data.extend_from_slice(&[0x00, 0x00, 0x00]); // only 7 bytes total < 10
         assert!(parser.parse(&make_pes(data, Some(90000))).is_empty());
-        assert!(!parser.buf.is_empty(), "partial core header retained");
+        assert!(!parser.acc.is_empty(), "partial core header retained");
     }
 
     #[test]
@@ -1859,7 +1851,7 @@ mod tests {
         let mut d = vec![0u8; 17];
         d[0..4].copy_from_slice(&DTS_CORE_SYNC);
         d[6] = 0x01; // fsize → 16 → size 17
-        parser.buf = d;
+        parser.acc.seed(&d);
         assert!(parser.flush().is_empty(), "sub-spec core rejected at flush");
     }
 
@@ -1869,7 +1861,7 @@ mod tests {
         // declared size must be dropped (never emit fewer bytes than declared).
         let mut parser = DtsParser::new();
         let core = make_dts_core(512);
-        parser.buf = core[..300].to_vec(); // header says 512, only 300 present
+        parser.acc.seed(&core[..300]); // header says 512, only 300 present
         assert!(
             parser.flush().is_empty(),
             "incomplete core not emitted truncated"
@@ -1886,9 +1878,9 @@ mod tests {
     fn flush_partial_sync_tail_dropped() {
         // A bare partial-sync tail (not at offset 0 / not a full core) is dropped.
         let mut parser = DtsParser::new();
-        parser.buf = vec![0x7F, 0xFE, 0x80]; // 3 of 4 sync bytes
+        parser.acc.seed(&[0x7F, 0xFE, 0x80]); // 3 of 4 sync bytes
         assert!(parser.flush().is_empty());
-        assert!(parser.buf.is_empty(), "buffer cleared on flush");
+        assert!(parser.acc.is_empty(), "buffer cleared on flush");
     }
 
     #[test]
@@ -2311,13 +2303,13 @@ mod tests {
         let out = parser.parse(&make_pes(d, Some(90_000)));
         assert!(out.is_empty(), "a false sync emits nothing");
         assert_eq!(
-            parser.buf.len(),
+            parser.acc.len(),
             3,
             "the false sync was decoded, drained and resynced past — leaving only \
              the 3-byte split-sync carry-over"
         );
         assert_ne!(
-            find_sync(&parser.buf, &DTS_CORE_SYNC),
+            find_sync(parser.acc.as_slice(), &DTS_CORE_SYNC),
             Some(0),
             "and the bogus sync is no longer at the front of the buffer"
         );
@@ -2331,14 +2323,14 @@ mod tests {
     fn flush_emits_a_core_that_exactly_fills_the_buffer() {
         let mut parser = DtsParser::new();
         let core = make_dts_core(512);
-        parser.buf = core.clone();
+        parser.acc.seed(&core.clone());
         parser.pending_pts = 90_000;
         let out = parser.flush();
         assert_eq!(out.len(), 1, "the final AU is emitted, not dropped");
         assert_eq!(out[0].data, core, "and it is the whole core frame");
         // One byte short is still refused — the bound is not simply absent.
         let mut parser = DtsParser::new();
-        parser.buf = core[..511].to_vec();
+        parser.acc.seed(&core[..511]);
         parser.pending_pts = 90_000;
         assert!(
             parser.flush().is_empty(),
@@ -2368,18 +2360,18 @@ mod tests {
             Some(0),
             "the fixture really has no core sync at the front"
         );
-        parser.buf = broken;
+        parser.acc.seed(&broken);
         parser.pending_pts = 90_000;
         assert!(
             parser.flush().is_empty(),
             "a buffer whose front is not a core sync is discarded, not size-decoded"
         );
-        assert!(parser.buf.is_empty(), "and the junk is dropped");
+        assert!(parser.acc.is_empty(), "and the junk is dropped");
 
         // The other half of the disjunction: a buffer too short to size, whose
         // front IS a core sync, is discarded too.
         let mut parser = DtsParser::new();
-        parser.buf = DTS_CORE_SYNC.to_vec();
+        parser.acc.seed(DTS_CORE_SYNC.as_ref());
         parser.pending_pts = 90_000;
         assert!(parser.flush().is_empty(), "a bare sync tail is not an AU");
     }
@@ -2415,5 +2407,55 @@ mod tests {
             None,
             "the bare sync sizes nothing"
         );
+    }
+
+    /// The whole point of the shared buffer: an access unit whose core arrived
+    /// in an EARLIER packet keeps that packet's source offset, not the offset
+    /// of whichever packet completed it. At a clip boundary the two belong to
+    /// different clips, and taking the later one puts the unit in the wrong
+    /// clip -- which is what left nine audio and subtitle tracks unplaceable.
+    #[test]
+    fn an_access_unit_carries_the_source_of_the_packet_its_core_arrived_in() {
+        let mut parser = DtsParser::new();
+        let core = make_dts_core(512);
+
+        // The core starts here, at byte 1000 of the feed.
+        let mut p1 = make_pes(core[..256].to_vec(), Some(90_000));
+        p1.source = Some(crate::pes::SourcePos::at_byte(1_000));
+        assert!(parser.parse(&p1).is_empty(), "partial core held");
+
+        // The rest arrives later, at byte 9_000, together with the next core
+        // that closes the unit.
+        let mut rest = core[256..].to_vec();
+        rest.extend_from_slice(&make_dts_core(512));
+        let mut p2 = make_pes(rest, Some(180_000));
+        p2.source = Some(crate::pes::SourcePos::at_byte(9_000));
+        let frames = parser.parse(&p2);
+
+        assert!(!frames.is_empty(), "the completed unit is emitted");
+        assert_eq!(
+            frames[0].source.map(|s| s.byte),
+            Some(1_000),
+            "the unit belongs to the packet its FIRST byte came from"
+        );
+        assert_eq!(
+            frames[0].pts_ns,
+            pts_to_ns(90_000),
+            "and its timestamp comes from that same packet"
+        );
+    }
+
+    /// A unit that begins and ends in one packet takes that packet's offset —
+    /// the ordinary case, which must not regress while fixing the spanning one.
+    #[test]
+    fn a_self_contained_access_unit_carries_its_own_packets_source() {
+        let mut parser = DtsParser::new();
+        let mut data = make_dts_core(512);
+        data.extend_from_slice(&make_dts_core(512));
+        let mut p = make_pes(data, Some(90_000));
+        p.source = Some(crate::pes::SourcePos::at_byte(4_242));
+        let frames = parser.parse(&p);
+        assert!(!frames.is_empty());
+        assert_eq!(frames[0].source.map(|s| s.byte), Some(4_242));
     }
 }

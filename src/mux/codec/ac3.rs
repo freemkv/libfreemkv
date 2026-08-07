@@ -62,8 +62,11 @@ const AC3_SAMPLES_PER_FRAME: u32 = 1536;
 const MAX_AC3_BUF: usize = 1024 * 1024;
 
 pub struct Ac3Parser {
-    /// Leftover bytes from previous PES (incomplete frame at end).
-    buf: Vec<u8>,
+    /// Leftover bytes from previous PES (incomplete frame at end), each still
+    /// attributable to the packet that carried it — so an access unit that
+    /// began in an earlier packet takes THAT packet's source offset, not the
+    /// one that happened to complete it.
+    acc: super::pesbuf::PesBuf,
     /// PTS (ns) to stamp on the frame that begins the carry-over `buf` — i.e.
     /// the running per-frame PTS at the point the partial tail was retained.
     /// Used by `flush()` to time the final buffered frame at EOS.
@@ -92,7 +95,7 @@ impl Default for Ac3Parser {
 impl Ac3Parser {
     pub fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(4096),
+            acc: super::pesbuf::PesBuf::with_capacity(4096),
             flush_pts_ns: 0,
             tally: super::dropgate::DropTally::new("ac3"),
             saw_extension: false,
@@ -137,6 +140,7 @@ impl Ac3Parser {
         base_pts_ns: i64,
         anchor: Option<PtsAnchor>,
         at_eos: bool,
+        marks: &[(usize, super::pesbuf::PesFacts)],
     ) -> (Vec<Frame>, usize, i64) {
         let mut frames = Vec::new();
         let mut pos = 0usize;
@@ -219,7 +223,7 @@ impl Ac3Parser {
                 }
             } else {
                 if let Some(au) = pending.take() {
-                    close_access_unit(&mut self.tally, data, &au, &mut frames);
+                    close_access_unit(&mut self.tally, data, &au, marks, &mut frames);
                 }
                 // First access unit that starts in this PES's own bytes: adopt
                 // this PES's timestamp so a genuine PTS jump is followed instead
@@ -264,7 +268,7 @@ impl Ac3Parser {
                 frame_pts_ns = au.pts_ns;
                 hold_from = Some(au.start);
             } else {
-                close_access_unit(&mut self.tally, data, &au, &mut frames);
+                close_access_unit(&mut self.tally, data, &au, marks, &mut frames);
             }
         }
 
@@ -334,6 +338,7 @@ fn close_access_unit(
     tally: &mut super::dropgate::DropTally,
     data: &[u8],
     au: &PendingAu,
+    marks: &[(usize, super::pesbuf::PesFacts)],
     out: &mut Vec<Frame>,
 ) {
     if let Some(reason) = au.drop_reason {
@@ -344,7 +349,9 @@ fn close_access_unit(
     out.push(Frame {
         discontinuity: false,
         coding: None,
-        source: None,
+        // The packet covering this unit's FIRST byte — which is the packet its
+        // PTS came from too, when the unit began in an earlier PES.
+        source: super::pesbuf::facts_for(marks, au.start).source,
         pts_ns: au.pts_ns,
         keyframe: true,
         data: data[au.start..au.end].to_vec(),
@@ -461,7 +468,7 @@ impl CodecParser for Ac3Parser {
         // never be stranded by an empty post-gap PES (the demuxer only emits
         // non-empty PES today; this is defensive for any future caller).
         if pes.discontinuity {
-            self.buf.clear();
+            self.acc.clear();
         }
         if pes.data.is_empty() {
             return Vec::new();
@@ -480,7 +487,7 @@ impl CodecParser for Ac3Parser {
         // no anchor the running cadence simply continues. The discontinuity-
         // carrying PES is a PUSI with a PTS in practice, so this is
         // defense-in-depth.
-        let carry_len = self.buf.len();
+        let carry_len = self.acc.len();
         let anchor = pes.pts.map(|p| PtsAnchor {
             at: carry_len,
             pts_ns: pts_to_ns(p),
@@ -489,11 +496,15 @@ impl CodecParser for Ac3Parser {
         // Prepend leftover from previous PES, then take the whole buffer into a
         // local so the scanner can call `self.tally` (the bytes are no longer
         // borrowed from `self`). The unconsumed tail is written back at the end.
-        self.buf.extend_from_slice(&pes.data);
-        let buf = std::mem::take(&mut self.buf);
+        self.acc.push(pes);
+        // Copy the working bytes out so the scanner can borrow `self.tally`;
+        // the buffer keeps its marks, so the unconsumed tail stays attributed
+        // to the packet that carried it.
+        let buf = self.acc.as_slice().to_vec();
+        let marks = self.acc.marks_snapshot();
         let data = &buf;
         let (frames, keep_from, frame_pts_ns) =
-            self.scan_access_units(data, self.flush_pts_ns, anchor, false);
+            self.scan_access_units(data, self.flush_pts_ns, anchor, false, &marks);
 
         if keep_from < data.len() {
             let tail = &data[keep_from..];
@@ -506,7 +517,7 @@ impl CodecParser for Ac3Parser {
                     "ac3: carry-over buffer exceeded {} bytes without a frame; dropping and resyncing",
                     MAX_AC3_BUF
                 );
-                self.buf.clear();
+                self.acc.clear();
                 // Advance the cadence, as both sibling branches below do, so the
                 // three paths out of this block cannot disagree. Defensive: no
                 // input reaching this parser was found that both parses frames and
@@ -514,7 +525,7 @@ impl CodecParser for Ac3Parser {
                 // prevents is not currently reachable and has no regression test.
                 self.flush_pts_ns = frame_pts_ns;
             } else {
-                self.buf = tail.to_vec();
+                self.acc.drain(keep_from);
                 // The carried bytes, when later completed and emitted (next call
                 // or by flush() at EOS), are timed at the PTS the scanner reached
                 // here: the PTS of the next access unit in presentation order, or
@@ -523,7 +534,7 @@ impl CodecParser for Ac3Parser {
                 self.flush_pts_ns = frame_pts_ns;
             }
         } else {
-            self.buf.clear();
+            self.acc.clear();
             // Nothing carried, but keep the cadence so a following PES with no
             // PTS (no anchor) continues the timeline instead of reusing a stale
             // value.
@@ -539,9 +550,11 @@ impl CodecParser for Ac3Parser {
         // with no following PES to close it, and without this drain the last
         // ~32 ms of audio is lost. `at_eos` closes the trailing access unit
         // instead of holding it; a partial/garbage tail yields nothing.
-        let buf = std::mem::take(&mut self.buf);
+        let buf = self.acc.as_slice().to_vec();
+        let marks = self.acc.marks_snapshot();
+        self.acc.clear();
         let out = self
-            .scan_access_units(&buf, self.flush_pts_ns, None, true)
+            .scan_access_units(&buf, self.flush_pts_ns, None, true, &marks)
             .0;
         // Aggregate drop report at end-of-stream (warn-level, always visible).
         self.tally.log_summary();
@@ -1030,15 +1043,15 @@ mod tests {
             let frames = parser.parse(&pes);
             assert!(frames.is_empty());
             assert!(
-                parser.buf.len() <= MAX_AC3_BUF,
+                parser.acc.len() <= MAX_AC3_BUF,
                 "buffer grew to {} (cap {})",
-                parser.buf.len(),
+                parser.acc.len(),
                 MAX_AC3_BUF
             );
         }
         // After all that garbage the retained tail is at most a single partial
         // syncword byte — never an accumulation of whole PES packets.
-        assert!(parser.buf.len() <= 1, "retained {} bytes", parser.buf.len());
+        assert!(parser.acc.len() <= 1, "retained {} bytes", parser.acc.len());
     }
 
     #[test]
@@ -1057,7 +1070,11 @@ mod tests {
             discontinuity: false,
         };
         assert!(parser.parse(&pes).is_empty());
-        assert_eq!(parser.buf, vec![0x0B], "lone trailing 0x0B retained");
+        assert_eq!(
+            parser.acc.as_slice(),
+            vec![0x0B],
+            "lone trailing 0x0B retained"
+        );
     }
 
     #[test]
@@ -1067,14 +1084,14 @@ mod tests {
         // ac3 inherited the no-op default flush and dropped the last frame.
         let mut parser = Ac3Parser::new();
         let frame_data = make_ac3_frame(0, 2);
-        parser.buf = frame_data.clone();
+        parser.acc.seed(&frame_data.clone());
         parser.flush_pts_ns = pts_to_ns(99000);
         let f = parser.flush();
         assert_eq!(f.len(), 1, "complete buffered frame drained at EOS");
         assert_eq!(f[0].data.len(), 160);
         assert_eq!(f[0].pts_ns, pts_to_ns(99000), "flush uses carried PTS");
         assert!(f[0].duration_ns.is_some(), "flush sets duration");
-        assert!(parser.buf.is_empty(), "buffer consumed by flush");
+        assert!(parser.acc.is_empty(), "buffer consumed by flush");
     }
 
     #[test]
@@ -1107,7 +1124,7 @@ mod tests {
         // emitted truncated.
         let mut parser = Ac3Parser::new();
         let frame_data = make_ac3_frame(0, 2);
-        parser.buf = frame_data[..80].to_vec(); // half a frame
+        parser.acc.seed(&frame_data[..80]); // half a frame
         assert!(parser.flush().is_empty(), "partial tail dropped");
     }
 
@@ -1511,7 +1528,7 @@ mod tests {
         // 100 bytes.
         let mut parser = Ac3Parser::new();
         let frame = make_ac3_frame(0, 2); // sizes to 160
-        parser.buf = frame[..100].to_vec();
+        parser.acc.seed(&frame[..100]);
         assert!(
             parser.flush().is_empty(),
             "incomplete frame must not be emitted truncated at flush"
@@ -1522,7 +1539,7 @@ mod tests {
     fn flush_with_no_sync_is_empty() {
         // flush on a buffer with no syncword yields nothing and clears.
         let mut parser = Ac3Parser::new();
-        parser.buf = vec![0xAA, 0xBB, 0xCC];
+        parser.acc.seed(&[0xAA, 0xBB, 0xCC]);
         assert!(parser.flush().is_empty());
     }
 
@@ -1839,7 +1856,7 @@ mod tests {
             assert_eq!(fr.pts_ns, pts_to_ns(90000) + i as i64 * 32_000_000);
             assert_eq!(fr.duration_ns, Some(32_000_000));
         }
-        assert!(parser.buf.is_empty(), "nothing held back for plain AC-3");
+        assert!(parser.acc.is_empty(), "nothing held back for plain AC-3");
         assert!(parser.flush().is_empty(), "flush has nothing left to drain");
     }
 
@@ -2109,5 +2126,43 @@ mod tests {
             data,
             discontinuity: false,
         }
+    }
+
+    /// An access unit that began in an earlier packet keeps THAT packet's
+    /// source offset. The packet that completes it is a different clip at a
+    /// seam, and taking its offset places the audio in the wrong one.
+    #[test]
+    fn an_access_unit_carries_the_source_of_the_packet_it_began_in() {
+        let mut parser = Ac3Parser::new();
+        let frame = make_ac3_frame(0, 4);
+
+        let mut p1 = PesPacket {
+            pid: 0x1100,
+            pts: Some(90_000),
+            dts: None,
+            data: frame[..frame.len() / 2].to_vec(),
+            source: Some(crate::pes::SourcePos::at_byte(1_000)),
+            discontinuity: false,
+        };
+        p1.data.truncate(frame.len() / 2);
+        assert!(parser.parse(&p1).is_empty(), "partial frame held");
+
+        let mut rest = frame[frame.len() / 2..].to_vec();
+        rest.extend_from_slice(&make_ac3_frame(0, 4));
+        let p2 = PesPacket {
+            pid: 0x1100,
+            pts: Some(180_000),
+            dts: None,
+            data: rest,
+            source: Some(crate::pes::SourcePos::at_byte(9_000)),
+            discontinuity: false,
+        };
+        let frames = parser.parse(&p2);
+        assert!(!frames.is_empty(), "the completed unit is emitted");
+        assert_eq!(
+            frames[0].source.map(|s| s.byte),
+            Some(1_000),
+            "the unit belongs to the packet its FIRST byte came from"
+        );
     }
 }

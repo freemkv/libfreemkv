@@ -34,10 +34,10 @@ use crate::pes::SourcePos;
 /// changed those semantics silently while fixing provenance.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct PesFacts {
-    /// Presentation timestamp in 90kHz ticks, as carried.
-    pub pts: Option<i64>,
-    /// Decode timestamp in 90kHz ticks, as carried.
-    pub dts: Option<i64>,
+    /// Presentation time in NANOSECONDS, already derived (see `of`). Stored
+    /// derived rather than raw so there is one derivation and no caller can
+    /// pick a different one.
+    pub pts_ns: Option<i64>,
     /// Byte offset of this PES's first ES byte within the title's feed — what
     /// identifies the clip a frame came from. `None` when the demuxer was fed
     /// without a base offset.
@@ -56,10 +56,20 @@ impl PesFacts {
     /// for a parser whose unit begins in the packet it is handed.
     pub(crate) fn of(pes: &PesPacket) -> Self {
         Self {
-            pts: pes.pts,
-            dts: pes.dts,
+            pts_ns: pes.pts.or(pes.dts).map(pts_to_ns),
             source: pes.source,
             discontinuity: pes.discontinuity,
+        }
+    }
+
+    /// The same facts with the presentation time replaced by one the parser
+    /// resolved itself — for a packet that carried no timestamp and whose unit
+    /// continues a base established earlier. The attribution is unchanged:
+    /// still this packet's bytes, still its source offset.
+    pub(crate) fn with_pts_ns(self, pts_ns: i64) -> Self {
+        Self {
+            pts_ns: Some(pts_ns),
+            ..self
         }
     }
 
@@ -77,8 +87,23 @@ impl PesFacts {
     /// for a missing field, not a second rule: dvdsub read `pts` alone and
     /// returned 0 for a packet that carried only DTS.
     pub(crate) fn presentation_ns(&self) -> Option<i64> {
-        self.pts.or(self.dts).map(pts_to_ns)
+        self.pts_ns
     }
+}
+
+/// The facts of the packet covering `off` within a [`PesBuf::marks_snapshot`].
+///
+/// The same at-or-before rule as [`PesBuf::facts_at`], for a scanner holding a
+/// snapshot rather than the buffer.
+pub(crate) fn facts_for(marks: &[(usize, PesFacts)], off: usize) -> PesFacts {
+    let mut found = PesFacts::default();
+    for &(at, facts) in marks {
+        if at > off {
+            break;
+        }
+        found = facts;
+    }
+    found
 }
 
 /// Bytes accumulated across PES packets, each byte attributable to the packet
@@ -112,10 +137,14 @@ impl PesBuf {
         self.buf.extend_from_slice(&pes.data);
     }
 
-    /// Append raw bytes attributed to the SAME PES as the bytes already at the
-    /// end of the buffer. For a parser that rewrites or re-frames payload
-    /// in-place rather than appending a packet verbatim.
-    pub(crate) fn push_bytes(&mut self, data: &[u8]) {
+    /// Append a payload under facts the caller resolved — for a parser that
+    /// carries a timestamp forward across a packet that omitted one. Same
+    /// attribution rule; only the timestamp differs from what the packet said.
+    pub(crate) fn push_with(&mut self, data: &[u8], facts: PesFacts) {
+        if data.is_empty() {
+            return;
+        }
+        self.marks.push_back((self.buf.len(), facts));
         self.buf.extend_from_slice(data);
     }
 
@@ -175,6 +204,44 @@ impl PesBuf {
         if self.marks.front().map(|&(at, _)| at) != Some(0) {
             self.marks.push_front((0, covering));
         }
+    }
+
+    /// Seed the buffer directly with bytes carrying no packet attribution —
+    /// for tests that drive a parser's scanner without a demuxer in front of
+    /// it. Facts for these bytes default to absent, which is what an
+    /// unattributed byte honestly is.
+    #[cfg(test)]
+    pub(crate) fn seed(&mut self, data: &[u8]) {
+        self.buf.clear();
+        self.marks.clear();
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Append unattributed bytes, keeping existing content and marks.
+    #[cfg(test)]
+    pub(crate) fn append_unattributed(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+
+    /// How many packet marks are held — a test hook for the bound on marks.
+    #[cfg(test)]
+    pub(crate) fn mark_count(&self) -> usize {
+        self.marks.len()
+    }
+
+    /// Record a mark at the current end without appending bytes — a test hook
+    /// for exercising mark bookkeeping directly.
+    #[cfg(test)]
+    pub(crate) fn mark_here(&mut self, facts: PesFacts) {
+        self.marks.push_back((self.buf.len(), facts));
+    }
+
+    /// The marks, for a scanner that must resolve facts at several offsets
+    /// while the buffer's bytes are borrowed elsewhere. Use with
+    /// [`facts_for`], which applies the same at-or-before rule as
+    /// [`PesBuf::facts_at`].
+    pub(crate) fn marks_snapshot(&self) -> Vec<(usize, PesFacts)> {
+        self.marks.iter().copied().collect()
     }
 
     pub(crate) fn clear(&mut self) {
