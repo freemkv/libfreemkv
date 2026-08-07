@@ -906,7 +906,13 @@ impl Stream for DemuxSink {
         let is_video = self.video_tracks.contains(&frame.track);
         // See `MkvMuxer::write_frame`: `None` is material outside the
         // playlist's clip marks and is dropped rather than emitted.
-        let Some(pts) = self.timeline.map(frame.pts, drives, frame.track, is_video) else {
+        let Some(pts) = self.timeline.map(
+            frame.pts,
+            drives,
+            frame.track,
+            is_video,
+            frame.source.map(|s| s.byte),
+        ) else {
             return Ok(());
         };
         self.frames_mapped = self.frames_mapped.saturating_add(1);
@@ -1698,6 +1704,7 @@ mod tests {
         // covering 100s..200s and 200s..300s in 45 kHz ticks.
         title.clips = vec![
             crate::disc::Clip {
+                feed_span: None,
                 clip_id: "00000".into(),
                 in_time: 100 * 45_000,
                 out_time: 200 * 45_000,
@@ -1705,6 +1712,7 @@ mod tests {
                 source_packets: 0,
             },
             crate::disc::Clip {
+                feed_span: None,
                 clip_id: "00001".into(),
                 in_time: 200 * 45_000,
                 out_time: 300 * 45_000,

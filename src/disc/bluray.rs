@@ -85,6 +85,16 @@ impl Disc {
         // Per-PlayItem Clip entries (differing in/out times) still get
         // recorded.
         let mut seen_clips: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Byte offset of the next extent within the TITLE'S FEED — the
+        // concatenation of `extents` in the order the mux reads them. Each
+        // clip's span is recorded so a frame's source offset identifies its
+        // clip by lookup rather than by guessing from timestamps, which is
+        // ambiguous inside an overlap. A clip referenced a SECOND time pushes
+        // no extents (see `first_ref`), so it reuses the span of its first
+        // reference — the same bytes, read once.
+        let mut feed_pos: u64 = 0;
+        let mut spans: std::collections::HashMap<String, (u64, u64)> =
+            std::collections::HashMap::new();
 
         for play_item in &parsed.play_items {
             let clip_dur = play_item.out_time.saturating_sub(play_item.in_time) as f64 / 45000.0;
@@ -133,19 +143,27 @@ impl Disc {
                         }),
                     };
                     if let Some(file_exts) = file_exts {
+                        let span_start = feed_pos;
                         for (lba, sectors) in file_exts {
                             if sectors > 0 && lba > 0 {
                                 extents.push(Extent {
                                     start_lba: lba,
                                     sector_count: sectors,
                                 });
+                                feed_pos = feed_pos.saturating_add(
+                                    sectors as u64 * crate::consts::SECTOR_BYTES as u64,
+                                );
                             }
+                        }
+                        if feed_pos > span_start {
+                            spans.insert(play_item.clip_id.clone(), (span_start, feed_pos));
                         }
                     }
                 }
             }
 
             clips.push(Clip {
+                feed_span: spans.get(&play_item.clip_id).copied(),
                 clip_id: play_item.clip_id.clone(),
                 in_time: play_item.in_time,
                 out_time: play_item.out_time,
