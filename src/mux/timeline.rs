@@ -267,9 +267,25 @@ impl SeamPlan {
         // title that fell back to inference looked exactly like one the plan
         // handled, and telling them apart meant rebuilding and re-ripping.
         // Both flags, once, at plan construction.
+        // How many DISTINCT feed spans the clips share. A seamlessly branched
+        // title re-references one clip file from several PlayItems with
+        // different mark ranges, and those references share a single span
+        // (the bytes are read once), so a byte offset alone cannot tell them
+        // apart. `distinct < clips` is therefore the fact that decides whether
+        // provenance can identify a clip on its own.
+        let mut distinct_spans = 0usize;
+        let mut seen: Option<(u64, u64)> = None;
+        for c in &out {
+            if c.feed_span != seen {
+                distinct_spans += 1;
+                seen = c.feed_span;
+            }
+        }
+
         tracing::info!(
             target: "freemkv::mux",
             clips = out.len(),
+            distinct_spans,
             spans_trusted,
             marks_orderable,
             total_ns = cum,
