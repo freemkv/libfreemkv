@@ -259,6 +259,35 @@ impl SeamPlan {
 
     /// Place a raw PTS for `track`, advancing that track's own clip cursor.
     ///
+    /// Which clip owns feed byte `b`, by BINARY SEARCH.
+    ///
+    /// `spans_trusted` guarantees the spans tile the feed contiguously in
+    /// order, so this is a partition point rather than a scan. That matters:
+    /// discs in the test hoard reach 900 clips, and this runs once per frame
+    /// per track — a linear scan would be ~900 comparisons on every one of
+    /// millions of frames, which is real time spent for no reason.
+    ///
+    /// A repeated clip reuses its first reference's span, so the search lands
+    /// on the FIRST entry with that span. The bytes are only read once, so the
+    /// material is emitted once, at that entry's offset.
+    fn clip_at_byte(&self, b: u64) -> Option<usize> {
+        let i = self
+            .clips
+            .partition_point(|c| c.feed_span.is_some_and(|(s, _)| s <= b));
+        let cand = i.checked_sub(1)?;
+        // Walk back over any earlier entries sharing this span (a repeated
+        // clip) so the answer is stable and is always the first of them.
+        let (s, e) = self.clips[cand].feed_span?;
+        if b < s || b >= e {
+            return None;
+        }
+        let mut first = cand;
+        while first > 0 && self.clips[first - 1].feed_span == Some((s, e)) {
+            first -= 1;
+        }
+        Some(first)
+    }
+
     /// `None` means DROP: the frame lies outside every clip's marks, so the
     /// playlist does not include it.
     fn place(
@@ -316,10 +345,7 @@ impl SeamPlan {
         // heuristics, which are at least approximately right. Degrade instead.
         if self.spans_trusted
             && let Some(b) = src_byte
-            && let Some(found) = self
-                .clips
-                .iter()
-                .position(|c| c.feed_span.is_some_and(|(s, e)| b >= s && b < e))
+            && let Some(found) = self.clip_at_byte(b)
         {
             let c = self.clips[found];
             let placed = raw_ns >= c.in_ns && raw_ns <= c.out_ns;
@@ -1060,6 +1086,159 @@ mod tests {
         assert!(
             plan.place(7_900_000_000_000, 0, true, None).is_some(),
             "a frame with no source offset must still be placed"
+        );
+    }
+
+    /// On frames that are NOT ambiguous, provenance and the mark heuristics
+    /// must give the SAME answer.
+    ///
+    /// This is the strongest available cross-check. The heuristics are wrong
+    /// only inside an overlap, where two clips' mark ranges both contain the
+    /// timestamp; everywhere else they are the behaviour that shipped and was
+    /// verified on real discs. So for a frame that falls inside exactly one
+    /// clip, the two methods disagreeing means the NEW path is wrong.
+    #[test]
+    fn provenance_agrees_with_marks_wherever_marks_are_unambiguous() {
+        let clips = clips_with_spans();
+        let plain = seamless_branching_clips();
+        let mut disagreements = Vec::new();
+
+        for (i, c) in clips.iter().enumerate() {
+            let in_ns = mpls_ticks_to_ns(c.in_time);
+            let out_ns = mpls_ticks_to_ns(c.out_time);
+            // Sample across the clip.
+            for f in [1u32, 2, 4, 8] {
+                let raw = in_ns + (out_ns - in_ns) / f as i64;
+                // Unambiguous = inside THIS clip's marks and no other's.
+                let owners = clips
+                    .iter()
+                    .filter(|o| {
+                        raw >= mpls_ticks_to_ns(o.in_time) && raw <= mpls_ticks_to_ns(o.out_time)
+                    })
+                    .count();
+                if owners != 1 {
+                    continue;
+                }
+                let (s, _) = c.feed_span.expect("span");
+                let mut a = SeamPlan::from_clips(&clips).expect("plan");
+                let mut b = SeamPlan::from_clips(&plain).expect("plan");
+                let by_bytes = a.place(raw, 0, true, Some(s + 10));
+                let by_marks = b.place(raw, 0, true, None);
+                if by_bytes != by_marks {
+                    disagreements.push((i, raw, by_bytes, by_marks));
+                }
+            }
+        }
+        assert!(
+            disagreements.is_empty(),
+            "provenance and marks disagreed on unambiguous frames: {disagreements:?}"
+        );
+    }
+
+    /// Walk a whole title through the plan with provenance and assert the two
+    /// properties that decide whether a rip is watchable: output never moves
+    /// backwards for a track, and the total span matches the title's declared
+    /// duration.
+    ///
+    /// A title can have the right TOTAL duration while being wrong in the
+    /// middle, which is why monotonicity is checked per frame rather than only
+    /// at the ends.
+    #[test]
+    fn a_full_pass_over_the_real_table_is_monotonic_and_totals_correctly() {
+        let clips = clips_with_spans();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        let declared: i64 = clips
+            .iter()
+            .map(|c| mpls_ticks_to_ns(c.out_time) - mpls_ticks_to_ns(c.in_time))
+            .sum();
+
+        let mut last: Option<i64> = None;
+        let mut first: Option<i64> = None;
+        let mut placed = 0u64;
+        for c in &clips {
+            let (s, e) = c.feed_span.expect("span");
+            let in_ns = mpls_ticks_to_ns(c.in_time);
+            let out_ns = mpls_ticks_to_ns(c.out_time);
+            // 40 frames per clip, evenly spaced, each stamped from its own span.
+            for k in 0..40i64 {
+                let raw = in_ns + (out_ns - in_ns) * k / 40;
+                let byte = s + (e - s) * k as u64 / 40;
+                if let Some(out) = plan.place(raw, 0, true, Some(byte)) {
+                    if let Some(l) = last {
+                        assert!(
+                            out >= l,
+                            "output moved backwards: {l} -> {out} (clip {}, raw {raw})",
+                            c.clip_id
+                        );
+                    }
+                    first.get_or_insert(out);
+                    last = Some(out);
+                    placed += 1;
+                }
+            }
+        }
+        assert!(placed > 400, "most frames must be placed, got {placed}");
+        let span = last.expect("last") - first.expect("first");
+        // Within one clip's frame spacing of the declared duration.
+        let slack = declared / 40;
+        assert!(
+            (span - declared).abs() <= slack,
+            "output span {span} differs from declared {declared} by more than {slack}"
+        );
+    }
+
+    /// A heavily branched title — the hoard has discs with 900 PlayItems —
+    /// must resolve every frame to the right clip, and must do it by binary
+    /// search rather than by scanning 900 entries per frame per track.
+    #[test]
+    fn a_nine_hundred_clip_title_resolves_every_frame_correctly() {
+        const N: u32 = 900;
+        const CLIP_TICKS: u32 = 10 * 45_000; // 10s each
+        const CLIP_BYTES: u64 = 5_000_000;
+        let clips: Vec<crate::disc::Clip> = (0..N)
+            .map(|i| crate::disc::Clip {
+                clip_id: format!("{i:05}"),
+                in_time: i * CLIP_TICKS,
+                out_time: (i + 1) * CLIP_TICKS,
+                duration_secs: 10.0,
+                source_packets: 0,
+                feed_span: Some((i as u64 * CLIP_BYTES, (i as u64 + 1) * CLIP_BYTES)),
+            })
+            .collect();
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        assert!(
+            plan.spans_trusted,
+            "a contiguous 900-clip table must be trusted"
+        );
+
+        // Every clip, sampled at its middle, must place — and monotonically.
+        let mut last: Option<i64> = None;
+        for i in 0..N {
+            let raw = mpls_ticks_to_ns(i * CLIP_TICKS + CLIP_TICKS / 2);
+            let byte = i as u64 * CLIP_BYTES + CLIP_BYTES / 2;
+            let out = plan
+                .place(raw, 0, true, Some(byte))
+                .unwrap_or_else(|| panic!("clip {i} did not place"));
+            if let Some(l) = last {
+                assert!(out >= l, "output moved backwards at clip {i}: {l} -> {out}");
+            }
+            last = Some(out);
+        }
+
+        // The lookup must find the right clip from an arbitrary byte, not just
+        // in ascending order — a track can arrive out of step with another.
+        for i in [0u32, 1, 449, 898, 899] {
+            let byte = i as u64 * CLIP_BYTES + 7;
+            assert_eq!(
+                plan.clip_at_byte(byte),
+                Some(i as usize),
+                "byte {byte} must resolve to clip {i}"
+            );
+        }
+        assert_eq!(
+            plan.clip_at_byte(N as u64 * CLIP_BYTES + 1),
+            None,
+            "a byte past the last clip belongs to no clip"
         );
     }
 
