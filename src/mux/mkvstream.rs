@@ -302,13 +302,15 @@ fn emit_to_muxer(
     frame: &crate::pes::PesFrame,
     additional: Option<&[u8]>,
 ) -> io::Result<()> {
-    m.write_frame(
+    m.write_frame_at(
         frame.track,
         frame.pts,
         frame.keyframe,
         &frame.data,
         frame.duration_ns,
         additional,
+        // Provenance: which clip this frame came from is a lookup, not a guess.
+        frame.source.map(|s| s.byte),
     )
 }
 

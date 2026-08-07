@@ -497,6 +497,7 @@ fn compose_xpl_titles(
             extents.extend_from_slice(exts);
             size_bytes += *size;
             parts.push(Clip {
+                feed_span: None,
                 clip_id: orig
                     .rsplit_once('.')
                     .map(|(b, _)| b)
@@ -639,6 +640,7 @@ impl Disc {
                     extents.extend_from_slice(exts);
                     size_bytes += *size;
                     parts.push(Clip {
+                        feed_span: None,
                         clip_id: orig
                             .rsplit_once('.')
                             .map(|(b, _)| b)
@@ -690,6 +692,7 @@ impl Disc {
                 duration_secs: 0.0,
                 size_bytes: *size,
                 clips: vec![Clip {
+                    feed_span: None,
                     clip_id,
                     in_time: 0,
                     out_time: 0,
