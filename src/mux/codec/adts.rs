@@ -276,4 +276,15 @@ mod tests {
         let f = p.parse(&make_pes(vec![0xFF, 0xF1, 0x50], Some(0)));
         assert_eq!(f.len(), 1, "too short to validate → kept");
     }
+
+    /// One PES is one unit here, so the frame carries that packet's offset.
+    #[test]
+    fn a_frame_carries_its_packets_source() {
+        let mut parser = AdtsParser::new();
+        let mut p = make_pes(adts_frame(64), Some(90_000));
+        p.source = Some(crate::pes::SourcePos::at_byte(4_242));
+        let frames = parser.parse(&p);
+        assert!(!frames.is_empty(), "a valid ADTS frame is emitted");
+        assert_eq!(frames[0].source.map(|s| s.byte), Some(4_242));
+    }
 }

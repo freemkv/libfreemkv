@@ -63,7 +63,10 @@ const AU_DURATION_NS_441: i64 = 907_029;
 const MAX_TRUEHD_BUF: usize = 256 * 1024;
 
 pub struct TrueHdParser {
-    buf: Vec<u8>,
+    /// Bytes assembled across PES packets, each attributable to the packet
+    /// that carried it, so an access unit takes the timestamp AND the source
+    /// offset of the packet covering its first byte.
+    acc: super::pesbuf::PesBuf,
     next_pts_ns: i64,
     /// Per-AU PTS increment. Defaults to the 48 kHz-family value (833_333) and
     /// is refined to the 44.1 kHz-family value once the first major sync reveals
@@ -94,7 +97,7 @@ impl Default for TrueHdParser {
 impl TrueHdParser {
     pub fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(32768),
+            acc: super::pesbuf::PesBuf::with_capacity(32768),
             next_pts_ns: 0,
             au_duration_ns: AU_DURATION_NS,
             tally: DropTally::new("truehd"),
@@ -195,15 +198,15 @@ impl TrueHdParser {
     /// single source of truth shared with the AC-3 parser; a returned `0` there
     /// (reserved fscod or out-of-range frmsizecod) is the unmappable case.
     fn ac3_frame_at_head(&self) -> Ac3Size {
-        if self.buf.len() < 6 {
+        if self.acc.len() < 6 {
             return Ac3Size::NeedMore;
         }
-        let frame_bytes = super::ac3::ac3_frame_size(&self.buf);
+        let frame_bytes = super::ac3::ac3_frame_size(self.acc.as_slice());
         if frame_bytes == 0 {
             // Reserved fscod or out-of-range frmsizecod → unmappable header.
             return Ac3Size::Unmappable;
         }
-        if self.buf.len() < frame_bytes {
+        if self.acc.len() < frame_bytes {
             return Ac3Size::NeedMore;
         }
         Ac3Size::Frame(frame_bytes)
@@ -363,7 +366,7 @@ impl CodecParser for TrueHdParser {
         // never be stranded by an empty post-gap PES (defensive; the demuxer only
         // emits non-empty PES today).
         if pes.discontinuity {
-            self.buf.clear();
+            self.acc.clear();
         }
         if pes.data.is_empty() {
             return Vec::new();
@@ -376,7 +379,7 @@ impl CodecParser for TrueHdParser {
         // mid-AU would snap that AU's PTS backward/forward and break the
         // monotonic +AU_DURATION_NS cadence (A/V drift). Once the buffer is empty
         // the next PES legitimately begins a new AU and seeds the base.
-        if self.buf.is_empty()
+        if self.acc.is_empty()
             && let Some(pts) = pes.pts
         {
             // Resync to the authoritative PES PTS. TrueHD AUs are a fixed
@@ -421,12 +424,12 @@ impl CodecParser for TrueHdParser {
             }
         }
 
-        self.buf.extend_from_slice(&pes.data);
+        self.acc.push(pes);
 
         let mut frames = Vec::new();
 
         loop {
-            if self.buf.len() < 4 {
+            if self.acc.len() < 4 {
                 break;
             }
 
@@ -438,19 +441,19 @@ impl CodecParser for TrueHdParser {
             // when its computed end is corroborated by what follows: end of
             // buffer (frame fills the rest), another AC-3 sync, or a plausible
             // TrueHD AU header. If none holds, this is treated as a TrueHD AU.
-            if self.buf[0] == 0x0B && self.buf[1] == 0x77 {
+            if self.acc.as_slice()[0] == 0x0B && self.acc.as_slice()[1] == 0x77 {
                 match self.ac3_frame_at_head() {
                     Ac3Size::Unmappable => {
                         // Permanently unmappable header at the head would stall
                         // the parser forever; resync by dropping 2 bytes so one
                         // bad frame costs one frame, not the whole buffer.
-                        self.buf.drain(..2);
+                        self.acc.drain(2);
                         continue;
                     }
                     Ac3Size::NeedMore => break, // wait for the rest of the frame
                     Ac3Size::Frame(skip) => {
-                        if ac3_boundary_corroborated(&self.buf, skip) {
-                            self.buf.drain(..skip);
+                        if ac3_boundary_corroborated(self.acc.as_slice(), skip) {
+                            self.acc.drain(skip);
                             continue;
                         }
                         // Not corroborated — fall through and interpret the
@@ -460,19 +463,21 @@ impl CodecParser for TrueHdParser {
             }
 
             // TrueHD access unit: lower 12 bits of first 2 bytes = length in words
-            let unit_words = (((self.buf[0] as usize) << 8) | self.buf[1] as usize) & 0xFFF;
+            let unit_words = (((self.acc.as_slice()[0] as usize) << 8)
+                | self.acc.as_slice()[1] as usize)
+                & 0xFFF;
             if unit_words == 0 {
                 // A zero-length AU is malformed/padding. The AU header is 4 bytes
                 // (length + timing); drain the whole header, not just the length
                 // word, otherwise the timing bytes get misread as the next
                 // length word and produce a spurious parse on the next iteration.
-                self.buf.drain(..4);
+                self.acc.drain(4);
                 continue;
             }
             // unit_words is masked to 12 bits, so unit_bytes <= 4095 * 2 = 8190;
             // no separate oversize-resync guard is reachable.
             let unit_bytes = unit_words * 2;
-            if self.buf.len() < unit_bytes {
+            if self.acc.len() < unit_bytes {
                 break; // incomplete access unit, wait for more data
             }
 
@@ -482,10 +487,10 @@ impl CodecParser for TrueHdParser {
             // gated on 0xBA alone in `au_check`.
             let is_major_sync = unit_bytes >= 8
                 && is_mlp_major_sync(u32::from_be_bytes([
-                    self.buf[4],
-                    self.buf[5],
-                    self.buf[6],
-                    self.buf[7],
+                    self.acc.as_slice()[4],
+                    self.acc.as_slice()[5],
+                    self.acc.as_slice()[6],
+                    self.acc.as_slice()[7],
                 ]));
 
             // Decodability gate. MLP/TrueHD decode state persists across access
@@ -493,8 +498,11 @@ impl CodecParser for TrueHdParser {
             // major sync (the clean re-init point) rather than excised in place.
             // The PTS clock advances across every dropped AU so a drop is a
             // silence gap, never a shift.
-            let au = self.buf[..unit_bytes].to_vec();
+            let au = self.acc.as_slice()[..unit_bytes].to_vec();
             let pts = self.next_pts_ns;
+            // Read BEFORE the drain below: this unit's source is the packet
+            // covering the CURRENT front, not the next unit's.
+            let au_src = self.acc.front().source;
             let mut emit_keyframe: Option<bool> = None; // Some(is_keyframe) => emit
             let mut drop_reason: Option<(&'static str, bool)> = None; // (reason, verified)
 
@@ -560,7 +568,7 @@ impl CodecParser for TrueHdParser {
                 frames.push(Frame {
                     discontinuity: false,
                     coding: None,
-                    source: None,
+                    source: au_src,
                     pts_ns: pts,
                     keyframe,
                     data: au,
@@ -575,14 +583,14 @@ impl CodecParser for TrueHdParser {
                         .record_collateral_drop(pts, self.au_duration_ns, au.len(), reason);
                 }
             }
-            self.buf.drain(..unit_bytes);
+            self.acc.drain(unit_bytes);
             self.next_pts_ns += self.au_duration_ns;
         }
 
         // Bound memory on malformed input: a stream that never yields a
         // complete frame must not grow the buffer without limit.
-        if self.buf.len() > MAX_TRUEHD_BUF {
-            self.buf.clear();
+        if self.acc.len() > MAX_TRUEHD_BUF {
+            self.acc.clear();
         }
 
         frames
@@ -1455,7 +1463,7 @@ mod tests {
             "TrueHD AU behind a bad header is recovered"
         );
         assert_eq!(frames[0].data.len(), 200);
-        assert!(parser.buf.is_empty(), "buffer fully consumed, no stall");
+        assert!(parser.acc.is_empty(), "buffer fully consumed, no stall");
     }
 
     #[test]
@@ -1707,7 +1715,7 @@ mod tests {
             f.is_empty(),
             "must not emit fewer bytes than the length field"
         );
-        assert_eq!(parser.buf.len(), 100, "partial AU retained");
+        assert_eq!(parser.acc.len(), 100, "partial AU retained");
     }
 
     /// Largest AU the 12-bit length field can declare: 0xFFF words × 2.
@@ -1720,7 +1728,7 @@ mod tests {
         //
         // The bound that actually holds is MAX_AU_BYTES, not MAX_TRUEHD_BUF:
         // `parse`'s loop only breaks with data retained when
-        // `self.buf.len() < unit_bytes`, and `unit_bytes` is
+        // `self.acc.len() < unit_bytes`, and `unit_bytes` is
         // `((buf[0] << 8 | buf[1]) & 0xFFF) * 2 <= 8190`. Every other exit
         // drains. So the post-loop `buf.len() > MAX_TRUEHD_BUF` cap (256 KiB) is
         // an unreachable backstop — an exhaustive sweep of all 65536 two-byte
@@ -1740,17 +1748,17 @@ mod tests {
             frag[0] = 0xFF;
             frag[1] = 0xFF;
             let _ = parser.parse(&make_pes(frag, Some(0)));
-            worst = worst.max(parser.buf.len());
+            worst = worst.max(parser.acc.len());
             assert!(
-                parser.buf.len() < MAX_AU_BYTES,
+                parser.acc.len() < MAX_AU_BYTES,
                 "reassembly buffer exceeded the AU-length ceiling: {} >= {}",
-                parser.buf.len(),
+                parser.acc.len(),
                 MAX_AU_BYTES
             );
             assert!(
-                parser.buf.len() <= MAX_TRUEHD_BUF,
+                parser.acc.len() <= MAX_TRUEHD_BUF,
                 "reassembly buffer exceeded cap: {} > {}",
-                parser.buf.len(),
+                parser.acc.len(),
                 MAX_TRUEHD_BUF
             );
         }
@@ -1813,7 +1821,7 @@ mod tests {
     fn ac3_frame_at_head_needs_more_when_buffer_short() {
         // < 6 bytes buffered → NeedMore (can't read the AC-3 header).
         let mut parser = TrueHdParser::new();
-        parser.buf = vec![0x0B, 0x77, 0x00];
+        parser.acc.seed(&[0x0B, 0x77, 0x00]);
         // Drive through parse: a short 0x0B77 head must wait, not emit.
         let f = parser.parse(&make_pes(vec![0x0B, 0x77, 0x00], Some(0)));
         assert!(f.is_empty());
@@ -2013,5 +2021,28 @@ mod tests {
         assert_eq!(truehd_channels(info.format_info), Some(8));
         assert_eq!(truehd_sample_rate_hz(info.format_info), Some(96000));
         assert_eq!(info.is_atmos, Some(true));
+    }
+
+    /// Same rule for TrueHD: a unit spanning two packets belongs to the one
+    /// that carried its first byte.
+    #[test]
+    fn an_access_unit_carries_the_source_of_the_packet_it_began_in() {
+        let mut parser = TrueHdParser::new();
+        let unit = make_truehd_unit(512);
+
+        let mut p1 = make_pes(unit[..200].to_vec(), Some(90_000));
+        p1.source = Some(crate::pes::SourcePos::at_byte(1_000));
+        let first = parser.parse(&p1);
+        assert!(first.is_empty(), "partial unit held");
+
+        let mut p2 = make_pes(unit[200..].to_vec(), Some(180_000));
+        p2.source = Some(crate::pes::SourcePos::at_byte(9_000));
+        let frames = parser.parse(&p2);
+        assert!(!frames.is_empty(), "the completed unit is emitted");
+        assert_eq!(
+            frames[0].source.map(|s| s.byte),
+            Some(1_000),
+            "the unit belongs to the packet its FIRST byte came from"
+        );
     }
 }
