@@ -213,6 +213,11 @@ impl SeamPlan {
             let in_ns = mpls_ticks_to_ns(c.in_time);
             let out_ns = mpls_ticks_to_ns(c.out_time);
             if out_ns <= in_ns {
+                tracing::info!(
+                    target: "freemkv::mux",
+                    in_ns, out_ns,
+                    "no seam plan: a clip's marks are empty or inverted"
+                );
                 return None;
             }
             // Inferring a clip from a timestamp assumes the marks are points on
@@ -240,6 +245,11 @@ impl SeamPlan {
                 && in_ns <= prev.in_ns
             {
                 if !spans_trusted {
+                    tracing::info!(
+                        target: "freemkv::mux",
+                        "no seam plan: the clips restart their clock and the feed \
+                         spans cannot be trusted, so nothing can place them"
+                    );
                     return None;
                 }
                 marks_orderable = false;
@@ -252,6 +262,20 @@ impl SeamPlan {
             });
             cum = cum.saturating_add(out_ns - in_ns);
         }
+        // Which of the two placement strategies a title got is the single most
+        // useful fact about a branched rip, and until now it was invisible: a
+        // title that fell back to inference looked exactly like one the plan
+        // handled, and telling them apart meant rebuilding and re-ripping.
+        // Both flags, once, at plan construction.
+        tracing::info!(
+            target: "freemkv::mux",
+            clips = out.len(),
+            spans_trusted,
+            marks_orderable,
+            total_ns = cum,
+            "seam plan built"
+        );
+
         Some(Self {
             spans_trusted,
             marks_orderable,
