@@ -366,7 +366,10 @@ impl CodecParser for PgsParser {
                     out.push(Frame {
                         discontinuity: false,
                         coding: None,
-                        source: None,
+                        // Emitted straight from THIS packet, so its facts are
+                        // this packet's -- the same rule as a pending set,
+                        // which takes the facts of the packet that opened it.
+                        source: super::pesbuf::PesFacts::of(pes).source,
                         pts_ns: pts.unwrap_or(0),
                         keyframe: true,
                         data: pes.data.clone(),
@@ -913,5 +916,28 @@ mod tests {
         t.observe(&pcs);
         assert_eq!(t.facts().displays, u32::MAX);
         assert_eq!(t.facts().forced_displays, u32::MAX);
+    }
+
+    /// A lone non-PCS segment with a PTS is emitted straight through rather
+    /// than accumulated, and it must still carry provenance. This path was
+    /// missed on the first pass and showed up on a real disc as a subtitle
+    /// track with no source offset -- the one track out of forty that could
+    /// not be placed by byte.
+    #[test]
+    fn a_lone_segment_emitted_directly_still_carries_provenance() {
+        let mut parser = PgsParser::new();
+        // A non-PCS segment (type 0x15 = ODS) with a PTS and no pending set.
+        let mut p = make_pes(vec![0x15, 0x00, 0x00, 0x00, 0x04, 1, 2, 3, 4], Some(90_000));
+        p.source = Some(crate::pes::SourcePos::at_byte(7_777));
+        let frames = parser.parse(&p);
+        assert!(
+            !frames.is_empty(),
+            "a lone segment with a PTS is passed through"
+        );
+        assert_eq!(
+            frames[0].source.map(|s| s.byte),
+            Some(7_777),
+            "emitted straight from this packet, so it carries this packet's offset"
+        );
     }
 }

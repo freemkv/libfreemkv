@@ -154,7 +154,7 @@ impl CodecParser for PassthroughParser {
         // parsers must instead defer the flag to the next emitted frame.)
         vec![Frame {
             coding: None,
-            source: None,
+            source: pesbuf::PesFacts::of(pes).source,
             pts_ns,
             keyframe: self.keyframe,
             discontinuity: pes.discontinuity,

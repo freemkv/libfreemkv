@@ -118,7 +118,7 @@ impl CodecParser for FlacParser {
         vec![Frame {
             discontinuity: pes.discontinuity,
             coding: None,
-            source: None,
+            source: super::pesbuf::PesFacts::of(pes).source,
             pts_ns,
             keyframe: true,
             data: pes.data.clone(),
