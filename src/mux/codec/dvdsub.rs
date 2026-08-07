@@ -25,7 +25,10 @@ pub struct DvdSubParser {
     /// Pre-formatted VobSub .idx palette header for codec_private.
     codec_data: Option<Vec<u8>>,
     /// In-progress SPU reassembly: (head PTS in ns, declared SPU_size, bytes).
-    pending: Option<(i64, usize, Vec<u8>)>,
+    /// The SPU being accumulated, with the facts of the PES that STARTED it.
+    /// An SPU spans PES packets, so its timestamp and source offset are the
+    /// opening packet's — the same rule every other buffering parser applies.
+    pending: Option<(super::pesbuf::PesFacts, usize, Vec<u8>)>,
 }
 
 impl DvdSubParser {
@@ -41,11 +44,12 @@ impl DvdSubParser {
     fn take_if_complete(&mut self, force: bool) -> Option<Frame> {
         let (_, size, buf) = self.pending.as_ref()?;
         if force || buf.len() >= *size {
-            let (pts_ns, _, data) = self.pending.take().unwrap();
+            let (facts, _, data) = self.pending.take().unwrap();
+            let pts_ns = facts.presentation_ns().unwrap_or(0);
             return Some(Frame {
                 discontinuity: false,
                 coding: None,
-                source: None,
+                source: facts.source,
                 pts_ns,
                 keyframe: true,
                 data,
@@ -106,7 +110,7 @@ impl CodecParser for DvdSubParser {
                 out.push(Frame {
                     discontinuity: false,
                     coding: None,
-                    source: None,
+                    source: super::pesbuf::PesFacts::of(pes).source,
                     pts_ns,
                     keyframe: true,
                     data: pes.data.clone(),
@@ -120,7 +124,7 @@ impl CodecParser for DvdSubParser {
             out.push(Frame {
                 discontinuity: false,
                 coding: None,
-                source: None,
+                source: super::pesbuf::PesFacts::of(pes).source,
                 pts_ns,
                 keyframe: true,
                 data: pes.data.clone(),
@@ -133,7 +137,7 @@ impl CodecParser for DvdSubParser {
         if buf.len() > MAX_SPU_BYTES {
             buf.truncate(MAX_SPU_BYTES);
         }
-        self.pending = Some((pts_ns, declared, buf));
+        self.pending = Some((super::pesbuf::PesFacts::of(pes), declared, buf));
         if let Some(frame) = self.take_if_complete(false) {
             out.push(frame);
         }
@@ -671,7 +675,17 @@ mod tests {
         let f = parser.parse(&make_pes(vec![0x00, 0x10, 0xAA], None));
         assert!(f.is_empty(), "incomplete sized segment held, not emitted");
         assert!(parser.pending.is_some(), "started a new pending SPU");
-        assert_eq!(parser.pending.as_ref().unwrap().0, 0, "pts 0 (no PTS)");
+        assert_eq!(
+            parser
+                .pending
+                .as_ref()
+                .unwrap()
+                .0
+                .presentation_ns()
+                .unwrap_or(0),
+            0,
+            "pts 0 (no PTS)"
+        );
     }
 
     #[test]

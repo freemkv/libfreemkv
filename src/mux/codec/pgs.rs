@@ -214,7 +214,12 @@ impl ForcedTracker {
 /// Stateful parser that collapses PGS display/clear PCS pairs into
 /// duration-bearing Matroska frames. Implements [`CodecParser`].
 pub struct PgsParser {
-    pending: Option<(i64, Vec<u8>)>,
+    /// The display set being accumulated, with the facts of the PES that
+    /// STARTED it. A set spans PES packets — it opens on a display PCS and
+    /// closes on the next one — so its timestamp and its source offset are the
+    /// opening packet's, never the closing packet's. Same rule the other
+    /// buffering parsers get from `PesBuf::front`.
+    pending: Option<(super::pesbuf::PesFacts, Vec<u8>)>,
 }
 
 impl Default for PgsParser {
@@ -234,12 +239,13 @@ impl PgsParser {
     /// closes or replaces it), clamped to >= 0. Shared by the clear-PCS and
     /// replace-PCS arms so the Frame shape stays in one place.
     fn emit_pending(&mut self, end_pts_ns: i64) -> Option<Frame> {
-        let (start_pts, data) = self.pending.take()?;
+        let (facts, data) = self.pending.take()?;
+        let start_pts = facts.presentation_ns().unwrap_or(0);
         let duration = end_pts_ns.saturating_sub(start_pts).max(0) as u64;
         Some(Frame {
             discontinuity: false,
             coding: None,
-            source: None,
+            source: facts.source,
             pts_ns: start_pts,
             keyframe: true,
             data,
@@ -271,12 +277,12 @@ impl CodecParser for PgsParser {
             return self
                 .pending
                 .take()
-                .map(|(start_pts, data)| {
+                .map(|(facts, data)| {
                     vec![Frame {
                         discontinuity: false,
                         coding: None,
-                        source: None,
-                        pts_ns: start_pts,
+                        source: facts.source,
+                        pts_ns: facts.presentation_ns().unwrap_or(0),
                         keyframe: true,
                         data,
                         duration_ns: None,
@@ -300,11 +306,11 @@ impl CodecParser for PgsParser {
             Some(0) => {
                 let frame = match pts {
                     Some(end) => self.emit_pending(end),
-                    None => self.pending.take().map(|(start_pts, data)| Frame {
+                    None => self.pending.take().map(|(facts, data)| Frame {
                         discontinuity: false,
                         coding: None,
-                        source: None,
-                        pts_ns: start_pts,
+                        source: facts.source,
+                        pts_ns: facts.presentation_ns().unwrap_or(0),
                         keyframe: true,
                         data,
                         duration_ns: None,
@@ -318,17 +324,24 @@ impl CodecParser for PgsParser {
             Some(_) => match pts {
                 Some(start) => {
                     out.extend(self.emit_pending(start));
-                    self.pending = Some((start, pes.data.clone()));
+                    // The set's facts are THIS packet's — the one that opened
+                    // it. `start` is that packet's PTS by construction.
+                    self.pending = Some((super::pesbuf::PesFacts::of(pes), pes.data.clone()));
+                    debug_assert_eq!(
+                        super::pesbuf::PesFacts::of(pes).presentation_ns(),
+                        Some(start),
+                        "the opening packet's PTS is the set's start"
+                    );
                 }
                 // A display PCS with no PTS has an unknown start time. Don't
                 // store it with a 0 sentinel (wrong start, absurd duration).
                 // Flush any prior pending undurated and skip storing this one.
                 None => {
-                    out.extend(self.pending.take().map(|(start_pts, data)| Frame {
+                    out.extend(self.pending.take().map(|(facts, data)| Frame {
                         discontinuity: false,
                         coding: None,
-                        source: None,
-                        pts_ns: start_pts,
+                        source: facts.source,
+                        pts_ns: facts.presentation_ns().unwrap_or(0),
                         keyframe: true,
                         data,
                         duration_ns: None,
@@ -379,11 +392,11 @@ impl CodecParser for PgsParser {
         // until end of file, which is exactly the desired behavior for
         // the final on-screen subtitle (see the module doc).
         match self.pending.take() {
-            Some((start_pts, data)) => vec![Frame {
+            Some((facts, data)) => vec![Frame {
                 discontinuity: false,
                 coding: None,
-                source: None,
-                pts_ns: start_pts,
+                source: facts.source,
+                pts_ns: facts.presentation_ns().unwrap_or(0),
                 keyframe: true,
                 data,
                 duration_ns: None,

@@ -112,10 +112,14 @@ impl CodecParser for AdtsParser {
         }
 
         self.tally.record_kept();
+        // One PES is one unit here, so the unit's first byte is in THIS packet
+        // and its facts are this packet's -- the same rule the buffering
+        // parsers apply through `PesBuf::front`, with nothing carried over.
+        let facts = super::pesbuf::PesFacts::of(pes);
         vec![Frame {
-            discontinuity: pes.discontinuity,
+            discontinuity: facts.discontinuity,
             coding: None,
-            source: None,
+            source: facts.source,
             pts_ns,
             keyframe: true,
             data: pes.data.clone(),

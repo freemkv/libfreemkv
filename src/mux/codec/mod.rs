@@ -34,6 +34,11 @@ pub mod mpeg2;
 pub mod mpegaudio;
 /// HDMV PGS (Presentation Graphics Stream) subtitle parser.
 pub mod pgs;
+
+/// One accumulation buffer for parsers that assemble access units across PES
+/// packets, so a unit's timestamp and its source offset always come from the
+/// packet that carried its first byte -- and from the SAME packet.
+pub(crate) mod pesbuf;
 /// Display-order PTS reconstruction for sparse-PTS program-stream video.
 pub(crate) mod reorder;
 /// Shared MPEG/Annex-B start-code scanning helpers.
