@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.6.2] — 2026-08-08
+
+### Fixed
+
+- **A stray moment of sound at the end of an HD-DVD title, and a click at every
+  chapter break on a DVD.** Both came from the same thing. A disc's sound and
+  picture do not arrive in lockstep, and where a title is stitched from
+  segments, a few frames of sound can reach the muxer just before or just after
+  the picture that marks the join. Those frames were timed against the wrong
+  segment. On one HD-DVD title a single trailing sound frame was placed at
+  3h33m in a 1h47m film. On a DVD, roughly half a second of sound was squeezed
+  into an instant at each of eight chapter breaks — audible as a click, eight
+  times in an eight-minute title. Sound is now timed against the segment it
+  belongs to. Measured on both discs: the stray frame lands one frame after its
+  neighbour, and the DVD's collapsed runs and jumps are gone, with picture
+  timing unchanged to the millisecond. Blu-ray was never affected.
+
 ## [1.6.1] — 2026-08-07
 
 ### Added
