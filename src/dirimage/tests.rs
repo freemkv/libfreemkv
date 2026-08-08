@@ -914,3 +914,111 @@ fn dump_title_sets_for_an_image() {
         println!("  vts={} titles={}", ts.vts_number, ts.titles.len());
     }
 }
+
+/// Build an MPLS with N PlayItems, each naming its own clip.
+fn multi_item_mpls(clip_ids: &[&[u8; 5]]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"MPLS0200");
+    buf.extend_from_slice(&40u32.to_be_bytes());
+    buf.extend_from_slice(&[0u8; 28]);
+
+    let pl = buf.len();
+    buf.extend_from_slice(&[0u8; 4]);
+    buf.extend_from_slice(&[0u8; 2]);
+    buf.extend_from_slice(&(clip_ids.len() as u16).to_be_bytes());
+    buf.extend_from_slice(&[0u8; 2]);
+
+    for id in clip_ids {
+        let mut item = Vec::new();
+        item.extend_from_slice(*id);
+        item.extend_from_slice(b"M2TS");
+        item.push(0);
+        item.extend_from_slice(&[0u8; 2]);
+        item.extend_from_slice(&0u32.to_be_bytes());
+        item.extend_from_slice(&(45_000u32 * 120).to_be_bytes());
+        item.extend_from_slice(&[0u8; 8]);
+        item.push(0);
+        item.push(0);
+        item.extend_from_slice(&[0u8; 2]);
+        item.extend_from_slice(&16u16.to_be_bytes());
+        item.extend_from_slice(&[0u8; 16]);
+        buf.extend_from_slice(&(item.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&item);
+    }
+
+    let pl_len = (buf.len() - pl - 4) as u32;
+    buf[pl..pl + 4].copy_from_slice(&pl_len.to_be_bytes());
+    let mark_start = buf.len() as u32;
+    buf[12..16].copy_from_slice(&mark_start.to_be_bytes());
+    buf.extend_from_slice(&2u32.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf
+}
+
+/// `Clip::feed_span` is the INPUT to the whole provenance feature — it is what
+/// tells the muxer which clip a byte offset belongs to — and it is produced in
+/// exactly one place, `disc/bluray.rs`. Every `SeamPlan` test synthesizes spans
+/// by hand, so the consumer is thoroughly tested against fixtures written from
+/// the same assumptions as the producer, and nothing checks the producer at all.
+///
+/// That is the shape of the original defect: the placement logic was tested and
+/// correct, and the thing feeding it was wrong. `SeamPlan` only trusts spans
+/// that TILE the feed contiguously from zero, so this asserts exactly that,
+/// against the real scanner reading a real synthesized filesystem.
+#[test]
+fn a_multi_clip_playlist_produces_feed_spans_that_tile_the_feed() {
+    let s = Scratch::new("spans");
+    let packets = 4096u32;
+    let ids: [&[u8; 5]; 3] = [b"00000", b"00001", b"00002"];
+    let mut m2ts = vec![0x5Au8; packets as usize * 192];
+    for p in m2ts.chunks_mut(192) {
+        p[0] = 0x00;
+        p[4] = 0x47;
+    }
+    s.file("BDMV/index.bdmv", &pattern(1, 64));
+    s.file("BDMV/PLAYLIST/00000.mpls", &multi_item_mpls(&ids));
+    for id in ids {
+        let name = std::str::from_utf8(id).unwrap();
+        s.file(&format!("BDMV/CLIPINF/{name}.clpi"), &minimal_clpi(packets));
+        s.file(&format!("BDMV/STREAM/{name}.m2ts"), &m2ts);
+    }
+
+    let (disc, _reader) =
+        crate::session::scan_dir(s.path(), crate::disc::ScanOptions::default()).unwrap();
+    let title = disc.titles.first().expect("the playlist produces a title");
+    assert_eq!(title.clips.len(), 3, "all three PlayItems are kept");
+
+    // Every clip must carry a span, or provenance is simply off for this title.
+    let spans: Vec<(u64, u64)> = title
+        .clips
+        .iter()
+        .map(|c| c.feed_span.expect("every clip carries a feed span"))
+        .collect();
+
+    // They must tile from 0 with no gap and no overlap: `SeamPlan::from_clips`
+    // refuses anything else, so a producer that drifts here silently disables
+    // the feature rather than failing.
+    let mut expect = 0u64;
+    for (i, &(start, end)) in spans.iter().enumerate() {
+        assert_eq!(
+            start,
+            expect,
+            "clip {i} starts where clip {} ended",
+            i.saturating_sub(1)
+        );
+        assert!(end > start, "clip {i} spans no bytes");
+        expect = end;
+    }
+
+    // And the tiling must describe the bytes the muxer will actually be fed:
+    // the concatenation of every clip's extents.
+    let feed_bytes: u64 = title
+        .extents
+        .iter()
+        .map(|e| e.sector_count as u64 * crate::consts::SECTOR_BYTES as u64)
+        .sum();
+    assert_eq!(
+        expect, feed_bytes,
+        "the spans must cover exactly the feed, or a byte offset lands in the wrong clip"
+    );
+}
