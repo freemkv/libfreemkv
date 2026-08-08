@@ -479,6 +479,25 @@ pub struct Extent {
 /// Union a set of extents into sorted, merged, disjoint `(start_lba,
 /// sector_count)` ranges — the pure, testable core of
 /// [`Disc::encrypted_content_ranges`]. Reuses [`crate::udf::merge_ranges`].
+/// Is this disc structurally AACS-encrypted — i.e. does it carry an AACS
+/// directory?
+///
+/// THE ONE definition of that question. `Disc::identify` (the fast path, which
+/// only reads the filesystem) and `Disc::scan_with` (the full scan) both need
+/// it, and both used to spell the same two `find_dir` calls out by hand. They
+/// agreed today; nothing made them agree tomorrow. Adding a third AACS
+/// location, or excluding an empty placeholder directory, to one copy and not
+/// the other would silently desync the fast identify from the full scan — the
+/// same disc reported encrypted by one and clear by the other.
+///
+/// This is STRUCTURAL, not cryptographic: it says the tree looks like an
+/// encrypted disc, not that any sector actually is. A folder copied verbatim
+/// from a decrypted disc keeps its `AACS/` and answers true here (see
+/// `session::scan_dir`, which corrects for exactly that).
+pub(crate) fn aacs_dir_present(udf_fs: &crate::udf::UdfFs) -> bool {
+    udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some()
+}
+
 fn merged_extents<'a>(extents: impl Iterator<Item = &'a Extent>) -> Vec<(u32, u32)> {
     let mut ranges: Vec<(u32, u32)> = extents.map(|e| (e.start_lba, e.sector_count)).collect();
     ranges.sort_by_key(|r| r.0);
@@ -1628,8 +1647,7 @@ impl Disc {
         // (no titles needed: BD/UHD/FMTS come from the MKB generation). It no
         // longer defaults to BluRay or defers UHD/FMTS to the full scan.
         let format = Self::detect_disc_format(&mut buffered, &udf_fs, &[]);
-        let encrypted =
-            udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
+        let encrypted = aacs_dir_present(&udf_fs);
         let layers = if capacity > 24_000_000 { 2 } else { 1 };
 
         Ok(DiscId {
@@ -2015,8 +2033,7 @@ impl Disc {
         let scan_with_t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::scan", phase = "scan_with", "begin");
         // 2. Resolve encryption (AACS, CSS, or none)
-        let encrypted =
-            udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
+        let encrypted = aacs_dir_present(&udf_fs);
 
         let (aacs, aacs_error) = if !encrypted {
             (None, None)
