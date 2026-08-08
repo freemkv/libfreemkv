@@ -649,11 +649,25 @@ pub(crate) struct TimelineContinuity {
     /// marks are known and are used verbatim; absent = fall back to inferring
     /// seams from PTS jumps, which is all any non-BD source has ever had.
     pub(crate) seams: Option<SeamPlan>,
+    /// Every epoch already left behind, oldest first, as
+    /// `(offset, frontier when it closed)`. A straggler carries a raw PTS from
+    /// one of THESE, and a single `prev_offset_ns` cannot name the right one
+    /// once a title has more than two epochs. The closing frontier is what makes
+    /// the test meaningful: a straggler sits at the TAIL of its own epoch, which
+    /// is only recognisable against that epoch's end — not against the current
+    /// frontier, which by then may be a whole title away. Bounded: a source that
+    /// rebases forever must not grow this.
+    epoch_offsets: Vec<(i64, i64)>,
 }
+
+/// Most epochs retained for straggler resolution. A title has a handful; this
+/// only bounds a pathological source that rebases without end.
+const MAX_EPOCHS: usize = 64;
 
 impl TimelineContinuity {
     pub(crate) fn new() -> Self {
         Self {
+            epoch_offsets: Vec::new(),
             offset_ns: 0,
             prev_offset_ns: 0,
             high_ns: None,
@@ -687,6 +701,7 @@ impl TimelineContinuity {
             crate::disc::ContentFormat::MpegPs => None,
         };
         Self {
+            epoch_offsets: Vec::new(),
             offset_ns: 0,
             prev_offset_ns: 0,
             high_ns: None,
@@ -735,6 +750,49 @@ impl TimelineContinuity {
             return placed;
         }
         Some(self.adjust(raw_pts_ns, drives_epoch))
+    }
+
+    /// Retire the current epoch and open a new one continuing just after the
+    /// frontier.
+    ///
+    /// Retiring records the offset AND the frontier the epoch closed at. The
+    /// closing frontier is what later makes a straggler recognisable: it says
+    /// where that epoch's tail was, which the current frontier cannot, since by
+    /// then it may be a whole title further on.
+    fn open_epoch(&mut self, high: i64, mapped_now: i64) {
+        self.prev_offset_ns = self.offset_ns;
+        if self.epoch_offsets.len() == MAX_EPOCHS {
+            self.epoch_offsets.remove(0);
+        }
+        self.epoch_offsets.push((self.offset_ns, high));
+        let bump = high
+            .saturating_sub(mapped_now)
+            .saturating_add(DISCONTINUITY_GAP_NS);
+        self.offset_ns = self.offset_ns.saturating_add(bump);
+    }
+
+    /// The offset of the epoch a straggler actually belongs to.
+    ///
+    /// A frame whose current-epoch mapping flies past the frontier carries a raw
+    /// PTS from an epoch already left behind. Pick the retained epoch that lands
+    /// it CLOSEST BELOW the frontier: that is where the just-ended epoch's tail
+    /// was, and it can never forward-date a cluster. `None` when no retained
+    /// epoch places it sanely, in which case the caller keeps the current
+    /// mapping — which is exactly the pre-existing behaviour, so a title that
+    /// never rebased is unaffected.
+    fn straggler_offset(&self, raw_pts_ns: i64) -> Option<i64> {
+        self.epoch_offsets
+            .iter()
+            .map(|(o, closing)| (raw_pts_ns.saturating_add(*o), *closing))
+            // In the TAIL of that epoch: at or just below where it ended. A
+            // frame landing far below its close is not a straggler at all — it
+            // is a normal frame of a LATER epoch that merely leads a sparse
+            // frontier, and demoting it would mis-time it by a whole clip.
+            .filter(|(m, closing)| {
+                *m <= *closing && *m >= closing.saturating_sub(DISCONTINUITY_BACKSTEP_NS)
+            })
+            .map(|(m, _)| m)
+            .max()
     }
 
     /// Map a raw PES PTS (ns) onto the continuous output timeline.
@@ -798,13 +856,9 @@ impl TimelineContinuity {
             // that fires the straggler clamp on essentially every passive frame.
             if let Some(high) = self.high_ns
                 && mapped > high.saturating_add(DISCONTINUITY_BACKSTEP_NS)
+                && let Some(placed) = self.straggler_offset(raw_pts_ns)
             {
-                let prev_mapped = raw_pts_ns.saturating_add(self.prev_offset_ns);
-                if prev_mapped <= high
-                    && prev_mapped >= high.saturating_sub(DISCONTINUITY_BACKSTEP_NS)
-                {
-                    return prev_mapped;
-                }
+                return placed;
             }
             return mapped;
         }
@@ -819,14 +873,10 @@ impl TimelineContinuity {
             // Clip-boundary reset (real multi-clip seam): continue just after the
             // frontier. Save the previous offset so a lagging non-video tail
             // frame can be recognised and remapped to the seam (see above).
-            self.prev_offset_ns = self.offset_ns;
             // `high - adj` is a backward step, so positive — but both ends are
             // untrusted (`high` up to i64::MAX, `adj` down to i64::MIN), so
-            // saturate rather than panic in a checked build.
-            let bump = high
-                .saturating_sub(adj)
-                .saturating_add(DISCONTINUITY_GAP_NS);
-            self.offset_ns = self.offset_ns.saturating_add(bump);
+            // `open_epoch` saturates rather than panic in a checked build.
+            self.open_epoch(high, adj);
             let adj2 = raw_pts_ns.saturating_add(self.offset_ns);
             self.high_ns = Some(high.max(adj2));
             adj2
@@ -2246,9 +2296,9 @@ mod tests {
 
         // A NORMAL clip-2 audio frame at raw ~5s. Current-offset mapping is
         // ~605s, which IS more than a backstep (3s) past the 600s frontier — but
-        // its previous-offset mapping (~5s) lands ~595s BELOW the frontier, far
-        // outside the seam tail. It is a legitimate new-epoch frame, NOT a tail
-        // straggler, and must ride the current offset.
+        // it lands ~595s BELOW the end of the epoch it would be demoted into,
+        // far outside that epoch's tail. It is a legitimate new-epoch frame, NOT
+        // a straggler, and must ride the current offset.
         let raw = 5 * S;
         let out = adj_other(&mut tc, raw);
         assert_eq!(
@@ -2261,6 +2311,66 @@ mod tests {
         assert!(
             out > frontier,
             "frame must stay in the new epoch (> frontier), got {out}"
+        );
+    }
+
+    /// MEASURED on a real HD-DVD title. Its second audio track's LAST frame
+    /// carries a clip-1 raw PTS but arrives after clip 2's video opened the
+    /// epoch, so it took clip 2's offset and landed at 12834.587 s in a
+    /// 6434.100 s title — one packet, exactly double.
+    ///
+    /// The old remap existed for this and refused it: the frame sits 23 s below
+    /// the CURRENT frontier, outside the 3 s window. Judged against the frontier
+    /// of the epoch it actually belongs to, it is 0.15 s from that epoch's end.
+    #[test]
+    fn a_straggler_is_judged_against_its_own_epochs_end_not_the_frontier() {
+        let mut tc = TimelineContinuity::new();
+        for i in 0..=600 {
+            adj_video(&mut tc, i * S);
+        }
+        adj_video(&mut tc, 0); // clip 2 opens; epoch 0 closed at 600 s
+        for i in 0..=23 {
+            adj_video(&mut tc, i * S);
+        }
+        let frontier = tc.high_ns.expect("frontier");
+
+        // A clip-1 tail frame, 0.2 s before that clip ended, arriving late.
+        let raw = 599 * S + 800_000_000;
+        let out = adj_other(&mut tc, raw);
+        assert_eq!(
+            out, raw,
+            "a tail straggler belongs to the epoch its raw PTS came from"
+        );
+        assert!(
+            out < frontier,
+            "it must never be flung past the frontier, got {out} vs {frontier}"
+        );
+    }
+
+    /// Why the epoch HISTORY is needed and one `prev_offset_ns` is not enough:
+    /// with three epochs, a straggler from the FIRST cannot be named by the
+    /// immediately-previous offset at all.
+    #[test]
+    fn a_straggler_from_an_epoch_before_last_is_still_placed() {
+        let mut tc = TimelineContinuity::new();
+        for i in 0..=600 {
+            adj_video(&mut tc, i * S);
+        }
+        adj_video(&mut tc, 0); // epoch 0 closes at 600 s
+        for i in 0..=300 {
+            adj_video(&mut tc, i * S);
+        }
+        adj_video(&mut tc, 0); // epoch 1 closes at ~900 s
+        for i in 0..=50 {
+            adj_video(&mut tc, i * S);
+        }
+
+        // Tail frame of epoch 0 — two epochs back.
+        let raw = 599 * S + 500_000_000;
+        assert_eq!(
+            adj_other(&mut tc, raw),
+            raw,
+            "the straggler belongs to epoch 0, which `prev_offset_ns` no longer names"
         );
     }
 
