@@ -2639,4 +2639,118 @@ mod tests {
         assert_eq!(map[&1], vec![(7u16, 1u8), (13, 2)]);
         assert_eq!(map[&2], vec![(0x0102u16, 1u8)]);
     }
+
+    // ── TT_SRPT: the title table (`parse_tt_srpt` / `parse_vmg`) ────────────
+    //
+    // This is the table that says which titles a DVD has, and it had no tests
+    // at all until 1.6.2 — while being at the centre of both DVD stories in
+    // 1.6.1. The CSS descramble bug destroyed the sector carrying it, so a disc
+    // enumerating 38 titles produced an image enumerating 10, silently, at exit
+    // 0. And `dir://` was pulled from the release on 2026-08-05 because a
+    // folder produced the wrong title list — the same table, reached through a
+    // synthesized image.
+    //
+    // Both were found on real discs. Nothing hermetic covered the table itself.
+
+    /// Build a VMG with a TT_SRPT at `tt_srpt_sector` declaring `entries`
+    /// of `(num_chapters, vts_number, vts_title_num)`.
+    fn vmg_with_tt_srpt(tt_srpt_sector: u32, entries: &[(u16, u8, u8)]) -> Vec<u8> {
+        let off = tt_srpt_sector as usize * crate::consts::SECTOR_BYTES;
+        let mut v = vec![0u8; off + 8 + entries.len() * 12 + 16];
+        v[0..12].copy_from_slice(b"DVDVIDEO-VMG");
+        v[0xC4..0xC8].copy_from_slice(&tt_srpt_sector.to_be_bytes());
+        v[off..off + 2].copy_from_slice(&(entries.len() as u16).to_be_bytes());
+        for (i, &(chapters, vts, title)) in entries.iter().enumerate() {
+            let b = off + 8 + i * 12;
+            v[b + 2..b + 4].copy_from_slice(&chapters.to_be_bytes());
+            v[b + 6] = vts;
+            v[b + 7] = title;
+        }
+        v
+    }
+
+    #[test]
+    fn tt_srpt_groups_titles_by_their_title_set() {
+        // Three titles: two in VTS 1, one in VTS 2 — the ordinary shape.
+        let vmg = vmg_with_tt_srpt(1, &[(12, 1, 1), (5, 1, 2), (20, 2, 1)]);
+        let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES).expect("parse");
+        assert_eq!(map.len(), 2, "two title sets");
+        assert_eq!(
+            map[&1],
+            vec![(12, 1), (5, 2)],
+            "VTS 1 keeps both titles in order"
+        );
+        assert_eq!(map[&2], vec![(20, 1)], "VTS 2 keeps its one");
+    }
+
+    /// The pointer at 0xC4 is a SECTOR offset from the start of VIDEO_TS.IFO,
+    /// not a byte offset. Reading it as bytes would find the table at 1/2048th
+    /// of its real position — which is a zero-filled region on most discs, so
+    /// it would report a disc with no titles rather than fail loudly.
+    #[test]
+    fn tt_srpt_pointer_is_a_sector_offset_not_a_byte_offset() {
+        for sector in [1u32, 2, 5] {
+            let vmg = vmg_with_tt_srpt(sector, &[(3, 1, 1)]);
+            let at_sector = parse_tt_srpt(&vmg, sector as usize * crate::consts::SECTOR_BYTES)
+                .expect("reading at the sector offset works");
+            assert_eq!(at_sector[&1], vec![(3, 1)], "sector {sector}");
+            // Reading the same pointer as a BYTE offset lands 1/2048th of the
+            // way in — inside the header here — and yields a different table.
+            // It does not error: it silently reports the wrong titles, which is
+            // how 28 dropped titles looked like a scan difference rather than a
+            // failure.
+            let as_bytes = parse_tt_srpt(&vmg, sector as usize).expect("does not error");
+            assert_ne!(
+                as_bytes, at_sector,
+                "sector {sector}: a byte-offset read must not coincidentally \
+                 agree with the correct one, or this test proves nothing"
+            );
+        }
+    }
+
+    /// A VTS number of 0 is not a title set; entries carrying it are padding.
+    #[test]
+    fn tt_srpt_skips_entries_with_no_title_set() {
+        let vmg = vmg_with_tt_srpt(1, &[(9, 0, 1), (4, 3, 1)]);
+        let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES).expect("parse");
+        assert_eq!(map.len(), 1, "the vts=0 entry is dropped");
+        assert_eq!(map[&3], vec![(4, 1)]);
+    }
+
+    /// The same (title set, title) twice is one title, not two. Real discs
+    /// carry duplicate TT_SRPT rows.
+    #[test]
+    fn tt_srpt_collapses_a_duplicate_title() {
+        let vmg = vmg_with_tt_srpt(1, &[(7, 2, 1), (7, 2, 1), (8, 2, 2)]);
+        let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES).expect("parse");
+        assert_eq!(
+            map[&2],
+            vec![(7, 1), (8, 2)],
+            "the repeat is dropped, the distinct one kept"
+        );
+    }
+
+    /// A truncated table parses what is there rather than failing the whole
+    /// disc — one unreadable row should not cost a user every other title.
+    #[test]
+    fn tt_srpt_truncated_keeps_the_entries_it_can_read() {
+        let mut vmg = vmg_with_tt_srpt(1, &[(1, 1, 1), (2, 2, 1), (3, 3, 1)]);
+        vmg.truncate(crate::consts::SECTOR_BYTES + 8 + 12 + 6); // 1 whole entry + a fragment
+        let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES).expect("parse");
+        assert_eq!(map.len(), 1, "the complete entry survives");
+        assert_eq!(map[&1], vec![(1, 1)]);
+    }
+
+    /// The count is an untrusted u16 off the disc. DVD-Video caps a disc at 99
+    /// titles, and each entry re-parses a PGC into a full DvdTitle — so an
+    /// unclamped 65535 is a ~540 MB allocation from a ~800 KB crafted file.
+    #[test]
+    fn tt_srpt_clamps_an_absurd_declared_title_count() {
+        let mut vmg = vmg_with_tt_srpt(1, &[(1, 1, 1)]);
+        let off = crate::consts::SECTOR_BYTES;
+        vmg[off..off + 2].copy_from_slice(&u16::MAX.to_be_bytes());
+        let map = parse_tt_srpt(&vmg, off).expect("parse");
+        let total: usize = map.values().map(|v| v.len()).sum();
+        assert!(total <= 99, "clamped to the format maximum, got {total}");
+    }
 }
