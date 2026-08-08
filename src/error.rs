@@ -62,6 +62,7 @@ pub const E_MAPFILE_INVALID: u16 = 6011;
 pub const E_SELECTION_PID_UNKNOWN: u16 = 6014;
 pub const E_UDF_BUFFER_TOO_SMALL: u16 = 6012;
 pub const E_UDF_NOT_FILESYSTEM: u16 = 6013;
+pub const E_IMAGE_TRUNCATED: u16 = 6015;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -461,6 +462,14 @@ pub enum Error {
     MapfileInvalid {
         kind: &'static str,
     },
+    /// The image a mapfile describes is shorter than the mapfile's own total
+    /// size, so the two no longer agree about the same disc. Resuming against
+    /// it would treat the absent tail as already recovered. `have` and `want`
+    /// are byte lengths; a missing file reports `have == 0`.
+    ImageTruncated {
+        have: u64,
+        want: u64,
+    },
 
     // AACS (7xxx)
     AacsNoKeys,
@@ -859,6 +868,7 @@ impl Error {
             Error::NoStreams => E_NO_STREAMS,
             Error::SelectionPidUnknown { .. } => E_SELECTION_PID_UNKNOWN,
             Error::MapfileInvalid { .. } => E_MAPFILE_INVALID,
+            Error::ImageTruncated { .. } => E_IMAGE_TRUNCATED,
             Error::AacsNoKeys => E_AACS_NO_KEYS,
             Error::AacsCertShort => E_AACS_CERT_SHORT,
             Error::AacsAgidAlloc => E_AACS_AGID_ALLOC,
@@ -1634,6 +1644,13 @@ mod tests {
                 E_PLATFORM_NOT_IMPLEMENTED,
             ),
             (Error::MapfileInvalid { kind: "hex" }, E_MAPFILE_INVALID),
+            (
+                Error::ImageTruncated {
+                    have: 0,
+                    want: 1024,
+                },
+                E_IMAGE_TRUNCATED,
+            ),
             (Error::DiscUrlNotDirect, E_DISC_URL_NOT_DIRECT),
             (Error::ExtentNotUnitAligned, E_EXTENT_NOT_UNIT_ALIGNED),
             // Both CSS no-key verdicts: numeric-only Display, no English.
@@ -1820,6 +1837,7 @@ mod tests {
             E_NO_STREAMS,
             E_HALTED,
             E_MAPFILE_INVALID,
+            E_IMAGE_TRUNCATED,
             E_UDF_BUFFER_TOO_SMALL,
             E_UDF_NOT_FILESYSTEM,
             E_AACS_NO_KEYS,
@@ -1933,6 +1951,7 @@ mod tests {
         assert!((6000..7000).contains(&E_DISC_READ));
         assert!((6000..7000).contains(&E_HALTED));
         assert!((6000..7000).contains(&E_MAPFILE_INVALID));
+        assert!((6000..7000).contains(&E_IMAGE_TRUNCATED));
         // AACS (7xxx)
         assert!((7000..8000).contains(&E_AACS_NO_KEYS));
         assert!((7000..8000).contains(&E_NO_DISC_KEY));
