@@ -717,4 +717,22 @@ mod tests {
         let result = format_palette(&[[0x00, 16, 128, 128]], 0, 0);
         assert_eq!(String::from_utf8(result).unwrap(), "palette: 101010\n");
     }
+
+    /// The text guard in `codec/mod.rs` scans for a literal `source: None` and
+    /// cannot see a parser that writes `source: facts.source` where the facts
+    /// carry no offset. Only a runtime check proves an emitted frame really
+    /// carries the byte it was read from, and without it a multi-clip title
+    /// places this track by timestamp inference instead of by byte.
+    #[test]
+    fn an_emitted_frame_carries_the_packets_source_offset() {
+        let mut parser = DvdSubParser::new(None);
+        let mut pes = make_pes(
+            vec![0x00, 0x0A, 0x00, 0x08, 0x01, 0xFF, 0x02, 0x03, 0x04, 0x05],
+            Some(90_000),
+        );
+        pes.source = Some(crate::pes::SourcePos::at_byte(7_777));
+        let frames = parser.parse(&pes);
+        assert!(!frames.is_empty(), "the segment is emitted");
+        assert_eq!(frames[0].source.map(|s| s.byte), Some(7_777));
+    }
 }
