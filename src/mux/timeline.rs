@@ -658,6 +658,24 @@ pub(crate) struct TimelineContinuity {
     /// frontier, which by then may be a whole title away. Bounded: a source that
     /// rebases forever must not grow this.
     epoch_offsets: Vec<(i64, i64)>,
+    /// Last raw PTS seen per track, for spotting a track's OWN discontinuity.
+    /// Within an epoch a passive track's PTS only advances (audio and subtitles
+    /// do not reorder, and a passive video track's B-frame dip is far under the
+    /// backstep), so a large BACKWARD step is unambiguous. This is a different
+    /// signal from the shared frontier, which is what the old false-positive
+    /// ratchet keyed on.
+    last_raw_ns: Vec<Option<i64>>,
+    /// Per-track provisional offset for frames that arrive BEFORE the video
+    /// frame opening their epoch, as `(epochs retired when it was taken,
+    /// offset)`.
+    ///
+    /// It is deliberately private to one track and never written to
+    /// `offset_ns`, never advances `high_ns`, and never retires an epoch — so
+    /// it cannot move the video timeline. Letting a passive track open a real
+    /// epoch was tried and inflated a 476.776 s title to 656.216 s, because
+    /// every track observes a boundary at its own pace and the video path
+    /// rebased again on top of whatever they had done.
+    provisional: Vec<Option<(usize, i64)>>,
 }
 
 /// Most epochs retained for straggler resolution. A title has a handful; this
@@ -668,6 +686,8 @@ impl TimelineContinuity {
     pub(crate) fn new() -> Self {
         Self {
             epoch_offsets: Vec::new(),
+            last_raw_ns: Vec::new(),
+            provisional: Vec::new(),
             offset_ns: 0,
             prev_offset_ns: 0,
             high_ns: None,
@@ -702,6 +722,8 @@ impl TimelineContinuity {
         };
         Self {
             epoch_offsets: Vec::new(),
+            last_raw_ns: Vec::new(),
+            provisional: Vec::new(),
             offset_ns: 0,
             prev_offset_ns: 0,
             high_ns: None,
@@ -749,7 +771,52 @@ impl TimelineContinuity {
             }
             return placed;
         }
-        Some(self.adjust(raw_pts_ns, drives_epoch))
+        Some(self.adjust(raw_pts_ns, drives_epoch, track))
+    }
+
+    /// The offset a passive frame should ride, and the bookkeeping around it.
+    ///
+    /// Returns the effective offset for THIS frame. Normally that is the
+    /// current epoch's. It differs only for a frame that arrived ahead of the
+    /// video that opens its epoch: such a frame's own raw PTS has just jumped
+    /// backwards AND its current-epoch mapping lands a whole epoch below the
+    /// frontier, which no in-epoch frame ever does.
+    ///
+    /// A provisional is dropped the moment the video actually retires an epoch,
+    /// so the run rejoins the real offset with no seam — the two agree because
+    /// both are `frontier - mapping + gap`.
+    fn passive_offset(&mut self, track: usize, raw_pts_ns: i64) -> i64 {
+        if self.last_raw_ns.len() <= track {
+            self.last_raw_ns.resize(track + 1, None);
+            self.provisional.resize(track + 1, None);
+        }
+        let prev_raw = self.last_raw_ns[track].replace(raw_pts_ns);
+        let retired = self.epoch_offsets.len();
+
+        // A provisional only survives until the video opens the epoch for real.
+        if let Some((taken_at, _)) = self.provisional[track]
+            && taken_at != retired
+        {
+            self.provisional[track] = None;
+        }
+        let effective = self.provisional[track].map_or(self.offset_ns, |(_, o)| o);
+
+        if let Some(high) = self.high_ns
+            && self.provisional[track].is_none()
+            && let Some(pr) = prev_raw
+            && raw_pts_ns < pr.saturating_sub(DISCONTINUITY_BACKSTEP_NS)
+        {
+            let mapped = raw_pts_ns.saturating_add(effective);
+            if mapped < high.saturating_sub(DISCONTINUITY_BACKSTEP_NS) {
+                let off = high
+                    .saturating_sub(mapped)
+                    .saturating_add(DISCONTINUITY_GAP_NS);
+                let off = effective.saturating_add(off);
+                self.provisional[track] = Some((retired, off));
+                return off;
+            }
+        }
+        effective
     }
 
     /// Retire the current epoch and open a new one continuing just after the
@@ -820,12 +887,13 @@ impl TimelineContinuity {
     /// - **Everything else** (normal progression + sub-threshold B-frame reorder
     ///   dips) passes through with the current offset and advances the frontier,
     ///   preserving PTS.
-    pub(crate) fn adjust(&mut self, raw_pts_ns: i64, drives_epoch: bool) -> i64 {
+    pub(crate) fn adjust(&mut self, raw_pts_ns: i64, drives_epoch: bool, track: usize) -> i64 {
         // Passive track: ride the current epoch's offset. Never advance the
         // frontier and never open an epoch — these tracks each run on their own
         // (sparse/laggy/independent) timeline and would false-trigger the ratchet.
         if !drives_epoch {
-            let mapped = raw_pts_ns.saturating_add(self.offset_ns);
+            let effective = self.passive_offset(track, raw_pts_ns);
+            let mapped = raw_pts_ns.saturating_add(effective);
             // Tail-straggler remap: at a REAL (base-video-driven) multi-clip
             // boundary the offset has just jumped forward by ~a whole clip, but a
             // lagging tail frame from the just-ended clip still carries an
@@ -897,10 +965,10 @@ mod tests {
     // Convenience: a video frame drives epoch decisions; non-video rides the
     // current offset. These wrappers make the test intent explicit.
     fn adj_video(tc: &mut TimelineContinuity, p: i64) -> i64 {
-        tc.adjust(p, true)
+        tc.adjust(p, true, 0)
     }
     fn adj_other(tc: &mut TimelineContinuity, p: i64) -> i64 {
-        tc.adjust(p, false)
+        tc.adjust(p, false, 1)
     }
 
     /// Characterization of the BUG: a BD title's two clips concatenated with a
@@ -2311,6 +2379,85 @@ mod tests {
         assert!(
             out > frontier,
             "frame must stay in the new epoch (> frontier), got {out}"
+        );
+    }
+
+    /// MEASURED on a real DVD title with 8 cell boundaries. The demuxer hands
+    /// the muxer ~18 audio frames of the NEXT cell before that cell's first
+    /// video frame. Riding the just-ended epoch's offset put them ~21 s in the
+    /// past, and the MKV writer's strictly-monotonic nudge then crushed the run
+    /// onto one instant 0.1 ms apart — half a second of audio as a click,
+    /// eight times in an 8-minute title.
+    ///
+    /// They must instead continue after the frontier, and must rejoin the real
+    /// offset seamlessly once the video opens the epoch.
+    #[test]
+    fn frames_arriving_before_their_epochs_video_ride_a_provisional_offset() {
+        let mut tc = TimelineContinuity::new();
+        for i in 0..=600 {
+            adj_video(&mut tc, i * S);
+        }
+        let frontier = tc.high_ns.expect("frontier");
+        adj_other(&mut tc, 599 * S);
+
+        // The next cell's audio arrives first, raw restarted at 0.
+        let step = 32_000_000; // 32 ms, the measured cadence
+        let a0 = adj_other(&mut tc, 0);
+        let a1 = adj_other(&mut tc, step);
+        let a2 = adj_other(&mut tc, 2 * step);
+        assert_eq!(
+            a0,
+            frontier + DISCONTINUITY_GAP_NS,
+            "an early frame must continue after the frontier, not land an epoch \
+             in the past where the monotonic nudge crushes it"
+        );
+        assert_eq!(a1 - a0, step, "the run keeps its cadence");
+        assert_eq!(a2 - a1, step);
+
+        // Critically: the video timeline must be untouched. Letting a passive
+        // track open a real epoch inflated a 476.776 s title to 656.216 s.
+        assert_eq!(tc.offset_ns, 0, "a provisional must not move the offset");
+        assert_eq!(tc.high_ns, Some(frontier), "nor the frontier");
+        assert!(tc.epoch_offsets.is_empty(), "nor retire an epoch");
+
+        // Now the video for that cell arrives and opens the epoch for real.
+        let v = adj_video(&mut tc, 0);
+        assert_eq!(v, frontier + DISCONTINUITY_GAP_NS);
+        assert_eq!(
+            tc.epoch_offsets.len(),
+            1,
+            "exactly one epoch, opened by video"
+        );
+
+        // The next audio frame rejoins the real offset with no seam: both are
+        // `frontier - mapping + gap`, so they agree.
+        let a3 = adj_other(&mut tc, 3 * step);
+        assert_eq!(a3 - a2, step, "the run continues across the handover");
+    }
+
+    /// A provisional must not outlive its epoch: once the video has retired an
+    /// epoch, later frames of that track take the real offset. Otherwise a track
+    /// would drift away from every other one for the rest of the title.
+    #[test]
+    fn a_provisional_is_dropped_once_the_epoch_is_real() {
+        let mut tc = TimelineContinuity::new();
+        for i in 0..=600 {
+            adj_video(&mut tc, i * S);
+        }
+        adj_other(&mut tc, 599 * S);
+        adj_other(&mut tc, 0); // takes a provisional
+        assert!(tc.provisional[1].is_some());
+
+        adj_video(&mut tc, 0); // video opens the epoch for real
+        adj_other(&mut tc, S); // next frame of that track
+        assert!(
+            tc.provisional[1].is_none(),
+            "the provisional must be dropped once the real epoch exists"
+        );
+        assert_eq!(
+            adj_other(&mut tc, 2 * S),
+            2 * S + tc.offset_ns,
+            "the track now rides the real offset like every other"
         );
     }
 
