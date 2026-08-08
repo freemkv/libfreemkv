@@ -271,4 +271,19 @@ mod tests {
         );
         assert_eq!(emitted.len() + tail.len(), 2);
     }
+
+    /// The text guard in `codec/mod.rs` scans for a literal `source: None` and
+    /// cannot see a parser that writes `source: facts.source` where the facts
+    /// carry no offset. Only a runtime check proves an emitted frame really
+    /// carries the byte it was read from, and without it a multi-clip title
+    /// places this track by timestamp inference instead of by byte.
+    #[test]
+    fn an_emitted_frame_carries_the_packets_source_offset() {
+        let mut p = FlacParser::new();
+        let mut pes = make_pes(make_flac_frame(100), Some(90_000));
+        pes.source = Some(crate::pes::SourcePos::at_byte(7_777));
+        let f = p.parse(&pes);
+        assert!(!f.is_empty(), "the frame is emitted");
+        assert_eq!(f[0].source.map(|s| s.byte), Some(7_777));
+    }
 }

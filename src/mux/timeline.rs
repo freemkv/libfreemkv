@@ -1044,6 +1044,21 @@ mod tests {
 
     /// Clips with byte spans, built from the real mark table so provenance and
     /// marks can be tested against each other.
+    /// The output offset `from_clips` computes for a clip: the sum of every
+    /// earlier clip's playable duration, minus its own IN.
+    fn plan_offset_for(clips: &[crate::disc::Clip], want: &crate::disc::Clip) -> i64 {
+        let mut cum = 0i64;
+        for c in clips {
+            let in_ns = mpls_ticks_to_ns(c.in_time);
+            let out_ns = mpls_ticks_to_ns(c.out_time);
+            if c.clip_id == want.clip_id && c.in_time == want.in_time {
+                return cum;
+            }
+            cum += out_ns - in_ns;
+        }
+        cum
+    }
+
     fn clips_with_spans() -> Vec<crate::disc::Clip> {
         let mut clips = seamless_branching_clips();
         // Each clip's stream occupies a contiguous run of the feed. Sizes are
@@ -1171,9 +1186,34 @@ mod tests {
     fn no_provenance_still_places_by_marks() {
         let clips = clips_with_spans();
         let mut plan = SeamPlan::from_clips(&clips).expect("plan");
+        // `is_some()` alone was the whole assertion here, which passes for a
+        // frame placed in the WRONG clip — on the one path taken whenever a
+        // source stamps no offset.
+        //
+        // This timestamp sits in the OVERLAP of two clips in the real mark
+        // table, which is precisely the ambiguity provenance exists to settle,
+        // so pinning one specific clip would be asserting the coin-flip. The
+        // invariant that holds either way: the frame is placed with the offset
+        // of a clip whose marks actually contain it — never a clip it does not
+        // belong to, and never at the head of the timeline.
+        let raw = 7_900_000_000_000i64;
+        let placed = plan
+            .place(raw, 0, true, None)
+            .expect("a frame with no source offset must still be placed");
+
+        let candidates: Vec<i64> = clips
+            .iter()
+            .filter(|c| raw >= mpls_ticks_to_ns(c.in_time) && raw <= mpls_ticks_to_ns(c.out_time))
+            .map(|c| raw - mpls_ticks_to_ns(c.in_time) + plan_offset_for(&clips, c))
+            .collect();
         assert!(
-            plan.place(7_900_000_000_000, 0, true, None).is_some(),
-            "a frame with no source offset must still be placed"
+            !candidates.is_empty(),
+            "fixture check: the probe timestamp must sit inside at least one clip"
+        );
+        assert!(
+            candidates.contains(&placed),
+            "placed at {placed}, but no clip containing this timestamp maps it there \
+             (candidates {candidates:?}) — a frame was given a clip it does not belong to"
         );
     }
 

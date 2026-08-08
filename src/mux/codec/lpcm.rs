@@ -279,4 +279,21 @@ mod tests {
         let f = parser.parse(&make_pes(vec![0xAA, 0xBB], None));
         assert_eq!(f[0].pts_ns, 0);
     }
+
+    /// The text guard in `codec/mod.rs` scans for a literal `source: None` and
+    /// cannot see a parser that writes `source: facts.source` where the facts
+    /// carry no offset. Only a runtime check proves an emitted frame really
+    /// carries the byte it was read from, and without it a multi-clip title
+    /// places this track by timestamp inference instead of by byte.
+    #[test]
+    fn an_emitted_frame_carries_the_packets_source_offset() {
+        let mut parser = LpcmParser::new();
+        let mut data = vec![0x00, 0x01, 0x00, 0b1001_0001];
+        data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE]);
+        let mut pes = make_pes(data, Some(90_000));
+        pes.source = Some(crate::pes::SourcePos::at_byte(7_777));
+        let frames = parser.parse(&pes);
+        assert!(!frames.is_empty(), "the frame is emitted");
+        assert_eq!(frames[0].source.map(|s| s.byte), Some(7_777));
+    }
 }
