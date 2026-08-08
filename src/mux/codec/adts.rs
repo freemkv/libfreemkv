@@ -50,7 +50,15 @@ fn adts_verdict(data: &[u8]) -> AdtsVerdict {
     // aac_frame_length: 13 bits = byte3[1:0] | byte4 | byte5[7:5].
     let frame_length =
         ((u32::from(data[3]) & 0x03) << 11) | (u32::from(data[4]) << 3) | (u32::from(data[5]) >> 5);
-    if frame_length < 7 {
+    // The floor is the header the frame SAYS it carries, not a constant.
+    // protection_absent (byte1 bit0) clear means a 16-bit crc_check follows the
+    // 7-byte fixed+variable header, so the frame cannot be shorter than 9 —
+    // aac_frame_length counts the header and the CRC, not just the payload.
+    // Comparing against a flat 7 let a CRC-present frame declaring 7 or 8
+    // through as structurally Valid, and the muxer then carried a frame whose
+    // own header says it is impossible.
+    let header_bytes = if data[1] & 0x01 == 0 { 9 } else { 7 };
+    if frame_length < header_bytes {
         return AdtsVerdict::Invalid;
     }
     AdtsVerdict::Valid
@@ -150,6 +158,51 @@ mod tests {
             data,
             discontinuity: false,
         }
+    }
+
+    /// A header that CLAIMS a CRC (protection_absent = 0) but declares a
+    /// frame length too short to contain one.
+    ///
+    /// `aac_frame_length` counts the header and the CRC, not just the payload,
+    /// so with a CRC present the smallest structurally possible frame is 9
+    /// bytes: the 7-byte fixed+variable header plus the 16-bit crc_check.
+    /// The gate compared against a flat 7 and never read protection_absent at
+    /// all, so a frame whose own header says it is impossible was classified
+    /// Valid and forwarded to the muxer.
+    #[test]
+    fn a_crc_present_header_shorter_than_its_own_crc_is_invalid() {
+        for declared in [7u32, 8] {
+            let mut f = adts_frame(16);
+            f[1] = 0xF0; // sync + MPEG-4, protection_absent = 0 => CRC present
+            f[3] = (f[3] & 0xFC) | ((declared >> 11) & 0x03) as u8;
+            f[4] = ((declared >> 3) & 0xFF) as u8;
+            f[5] = (f[5] & 0x1F) | ((declared & 0x07) << 5) as u8;
+            assert!(
+                matches!(adts_verdict(&f), AdtsVerdict::Invalid),
+                "protection_absent=0 declaring {declared} bytes cannot hold its \
+                 own 7-byte header plus a 2-byte CRC"
+            );
+        }
+
+        // 9 is the smallest length that CAN hold header + CRC, so it must pass
+        // the structural gate — the floor moved, it did not become stricter
+        // than the spec.
+        let mut ok = adts_frame(16);
+        ok[1] = 0xF0;
+        let nine = 9u32;
+        ok[3] = (ok[3] & 0xFC) | ((nine >> 11) & 0x03) as u8;
+        ok[4] = ((nine >> 3) & 0xFF) as u8;
+        ok[5] = (ok[5] & 0x1F) | ((nine & 0x07) << 5) as u8;
+        assert!(matches!(adts_verdict(&ok), AdtsVerdict::Valid));
+
+        // And with NO CRC the floor is still 7, unchanged.
+        let mut no_crc = adts_frame(16);
+        no_crc[1] = 0xF1; // protection_absent = 1
+        let seven = 7u32;
+        no_crc[3] = (no_crc[3] & 0xFC) | ((seven >> 11) & 0x03) as u8;
+        no_crc[4] = ((seven >> 3) & 0xFF) as u8;
+        no_crc[5] = (no_crc[5] & 0x1F) | ((seven & 0x07) << 5) as u8;
+        assert!(matches!(adts_verdict(&no_crc), AdtsVerdict::Valid));
     }
 
     /// A valid ADTS header (AAC-LC, 44.1 kHz, stereo) + payload, with

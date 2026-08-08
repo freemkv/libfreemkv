@@ -67,6 +67,13 @@ pub struct Ac3Parser {
     /// began in an earlier packet takes THAT packet's source offset, not the
     /// one that happened to complete it.
     acc: super::pesbuf::PesBuf,
+    /// Reused working copy of `acc`, kept across calls so the per-PES scan does
+    /// not allocate. `parse` runs once per PES packet on an audio track — of
+    /// the order of 10^5 times per title — and previously built a fresh `Vec`
+    /// each time. The copy itself is unavoidable without restructuring the
+    /// borrow relationship (the scanner needs `&mut self.tally` while it reads
+    /// these bytes); the ALLOCATION is not.
+    scratch: Vec<u8>,
     /// PTS (ns) to stamp on the frame that begins the carry-over `buf` — i.e.
     /// the running per-frame PTS at the point the partial tail was retained.
     /// Used by `flush()` to time the final buffered frame at EOS.
@@ -95,6 +102,7 @@ impl Default for Ac3Parser {
 impl Ac3Parser {
     pub fn new() -> Self {
         Self {
+            scratch: Vec::new(),
             acc: super::pesbuf::PesBuf::with_capacity(4096),
             flush_pts_ns: 0,
             tally: super::dropgate::DropTally::new("ac3"),
@@ -500,7 +508,12 @@ impl CodecParser for Ac3Parser {
         // Copy the working bytes out so the scanner can borrow `self.tally`;
         // the buffer keeps its marks, so the unconsumed tail stays attributed
         // to the packet that carried it.
-        let buf = self.acc.as_slice().to_vec();
+        // Take the scratch OUT of `self` so the scanner can borrow `self.tally`
+        // while reading it; it is put back at the end of the call, keeping its
+        // capacity for the next PES. There is no early return after this point.
+        let mut buf = std::mem::take(&mut self.scratch);
+        buf.clear();
+        buf.extend_from_slice(self.acc.as_slice());
         let marks = self.acc.marks_snapshot();
         let data = &buf;
         let (frames, keep_from, frame_pts_ns) =
@@ -541,6 +554,9 @@ impl CodecParser for Ac3Parser {
             self.flush_pts_ns = frame_pts_ns;
         }
 
+        // Hand the working buffer back so the next PES reuses its capacity.
+        // `data` borrowed it; that borrow ends here, at its last use.
+        self.scratch = buf;
         frames
     }
 
@@ -805,6 +821,53 @@ mod tests {
         let c = crc16_ansi(&frame[2..n - 2]);
         frame[n - 2] = (c >> 8) as u8;
         frame[n - 1] = (c & 0xFF) as u8;
+    }
+
+    /// The per-PES working buffer must be REUSED, not reallocated.
+    ///
+    /// `parse` runs once per PES packet — of the order of 10^5 times on a
+    /// feature's audio track — and used to build a fresh `Vec` every call. The
+    /// copy itself cannot go without restructuring the borrow relationship, but
+    /// the allocation can: the buffer is taken out of `self`, filled, and put
+    /// back with its capacity intact.
+    ///
+    /// Asserting on capacity is deliberately white-box, because that is exactly
+    /// what regresses if someone reverts to `to_vec()` — the behaviour would be
+    /// identical and no other test would notice.
+    #[test]
+    fn the_working_buffer_is_reused_across_packets_not_reallocated() {
+        let mut parser = Ac3Parser::new();
+        let frame = make_ac3_frame(0, 0);
+
+        parser.parse(&PesPacket {
+            source: None,
+            pid: 0x1100,
+            pts: Some(90_000),
+            dts: None,
+            data: frame.clone(),
+            discontinuity: false,
+        });
+        let cap_after_first = parser.scratch.capacity();
+        assert!(
+            cap_after_first > 0,
+            "the buffer must be handed back to the parser, not dropped"
+        );
+
+        for _ in 0..8 {
+            parser.parse(&PesPacket {
+                source: None,
+                pid: 0x1100,
+                pts: None,
+                dts: None,
+                data: frame.clone(),
+                discontinuity: false,
+            });
+        }
+        assert!(
+            parser.scratch.capacity() >= cap_after_first,
+            "capacity must persist across calls; a fresh Vec each time would \
+             show it dropping back to the last packet's size"
+        );
     }
 
     #[test]

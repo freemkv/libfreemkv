@@ -325,20 +325,21 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     ///
     /// The thread is named `freemkv-pipeline-consumer` so it shows up
     /// distinctly in stack traces and `top -H`. Callers that want a
-    /// more specific name (e.g. `freemkv-sweep-consumer`) should use
-    /// [`Pipeline::spawn_named`] instead. Returns an `Error::IoError`
-    /// if the OS refuses the thread spawn (resource exhaustion);
-    /// callers already operate in fallible context, so this is
-    /// propagated rather than panicked.
+    /// more specific name should use [`Pipeline::spawn_named`] instead.
+    /// Returns an `Error::IoError` if the OS refuses the thread spawn
+    /// (resource exhaustion); callers already operate in fallible context, so
+    /// this is propagated rather than panicked.
     ///
-    /// Sweep uses [`Pipeline::spawn_named`] directly so the consumer
-    /// thread shows up as `freemkv-sweep-consumer`; mux uses
-    /// `freemkv-mux-consumer`. `Pipeline::spawn` (this function, with
-    /// the default name) is used only by the unit tests in this module.
-    /// It used to name `disc::patch` as a caller; that module does not exist
-    /// here any more — the sweep/patch recovery passes moved to freemkv-engine
-    /// in 1.6.0, so the comment sent readers hunting a caller in this crate
-    /// that had already left it.
+    /// Inside this crate the only [`Pipeline::spawn_named`] caller is the mux
+    /// driver, which names its thread `freemkv-mux-consumer`. `Pipeline::spawn`
+    /// (this function, with the default name) is used only by the unit tests in
+    /// this module.
+    ///
+    /// This paragraph twice named a caller that had left the crate: first
+    /// `disc::patch`, then Sweep and its `freemkv-sweep-consumer` thread. Both
+    /// went to freemkv-engine with the recovery passes in 1.6.0, and each in
+    /// turn sent readers hunting a component that is not here. Name callers
+    /// that live in THIS crate, or none.
     pub fn spawn<S: Sink<I, Output = R>>(depth: usize, sink: S) -> Result<Self, Error> {
         Self::spawn_named("freemkv-pipeline-consumer", depth, sink)
     }
@@ -346,7 +347,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// Like [`Pipeline::spawn`] but lets the caller supply the
     /// consumer thread's name. Useful when several pipelines run in
     /// the same process and stack traces / `top -H` need to tell them
-    /// apart (e.g. `freemkv-sweep-consumer`, `freemkv-mux-consumer`).
+    /// apart (e.g. `freemkv-mux-consumer`).
     pub fn spawn_named<S: Sink<I, Output = R>>(
         name: &str,
         depth: usize,
@@ -631,6 +632,14 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// wedged inside an unkillable syscall, the producer can still
     /// observe `/api/stop` and unwind within
     /// [`SEND_HALT_CHECK_INTERVAL`].
+    /// NOT a `foo_with_X` variant of [`Pipeline::send`], despite the name.
+    /// The two encode OPPOSITE policies on the same event, each with its own
+    /// test: after the consumer's `apply` has failed, `send` still succeeds
+    /// (the consumer keeps draining, so the channel accepts the item), while
+    /// this one hands the item straight back — so a producer does not read an
+    /// hour of disc for a write that died on the first frame. Collapsing them
+    /// into one Option-parameterised method deletes one of those behaviours;
+    /// it was tried and `apply_error_drains_then_propagates` caught it.
     pub fn send_with_halt(&self, item: I, halt: &Halt, deadline: Duration) -> Result<(), I> {
         use crossbeam_channel::SendTimeoutError;
         let end = Instant::now() + deadline;
@@ -742,6 +751,12 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// Plain [`Pipeline::finish`] is preserved for callers without a
     /// halt-token plumbed through; that path still blocks indefinitely
     /// on `join()`, matching pre-0.20.8 behaviour.
+    /// Also not a `foo_with_X` variant: [`Pipeline::finish`] joins and waits
+    /// however long the consumer needs, while this one gives up after
+    /// `JOIN_TIMEOUT_SECS` and reports halted. Which is right depends on
+    /// whether the caller has a user waiting to cancel — the mux driver does
+    /// and uses this; the unit tests do not and use the plain join. Merging
+    /// them means picking one of those policies for both.
     pub fn finish_with_halt(self, halt: Option<&Halt>) -> Result<R, Error> {
         let Pipeline {
             tx,
