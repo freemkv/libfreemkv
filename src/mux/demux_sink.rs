@@ -1543,14 +1543,14 @@ mod tests {
     fn timeline_track0_drives_epoch_others_ride() {
         let mut tl = TimelineContinuity::new();
         // Clip 1: video 0..10s (track 0 drives the epoch).
-        assert_eq!(tl.adjust(0, true), 0);
-        assert_eq!(tl.adjust(0, false), 0); // audio rides the same offset
-        assert_eq!(tl.adjust(10_000_000_000, true), 10_000_000_000);
+        assert_eq!(tl.adjust(0, true, 0), 0);
+        assert_eq!(tl.adjust(0, false, 1), 0); // audio rides the same offset
+        assert_eq!(tl.adjust(10_000_000_000, true, 0), 10_000_000_000);
         // Clip 2 seam: video PTS jumps back to ~0 (> 3s back) → new epoch.
-        let out = tl.adjust(0, true);
+        let out = tl.adjust(0, true, 0);
         assert!(out >= 10_000_000_000, "epoch must advance past prev high");
         // Audio in clip 2 (non-epoch) gets the SAME offset (A/V sync preserved).
-        let a = tl.adjust(0, false);
+        let a = tl.adjust(0, false, 1);
         assert_eq!(a, out);
     }
 
