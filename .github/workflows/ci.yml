@@ -187,13 +187,17 @@ jobs:
             freemkv
             autorip
             bdemu
-      - run: cargo check --all-targets
+      # `cargo check` alone only proves the dependents still COMPILE against
+      # this commit. It cannot see a behavioural change — the library keeps its
+      # signatures and a dependent's tests start failing. That is the shape of
+      # every defect worth catching here, so run their suites too.
+      - run: cargo test --tests
         working-directory: freemkv-keysources
-      - run: cargo check --all-targets
+      - run: cargo test --tests
         working-directory: freemkv-engine
-      - run: cargo check --all-targets
+      - run: cargo test --tests
         working-directory: freemkv
-      - run: cargo check --all-targets
+      - run: cargo test --tests
         working-directory: autorip
-      - run: cargo check --all-targets
+      - run: cargo test --tests
         working-directory: bdemu
