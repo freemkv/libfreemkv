@@ -14,7 +14,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: libfreemkv
       # libfreemkv path-deps ../freemkv-unlock on the BRANCH tip (release.sh
@@ -26,7 +26,7 @@ jobs:
       # Both repos go into subdirectories because actions/checkout refuses a
       # `path:` outside $GITHUB_WORKSPACE, and `../freemkv-unlock` is outside.
       # With this layout the path dep resolves exactly as it does locally.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
@@ -52,7 +52,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: libfreemkv
       # libfreemkv path-deps ../freemkv-unlock on the BRANCH tip (release.sh
@@ -64,7 +64,7 @@ jobs:
       # Both repos go into subdirectories because actions/checkout refuses a
       # `path:` outside $GITHUB_WORKSPACE, and `../freemkv-unlock` is outside.
       # With this layout the path dep resolves exactly as it does locally.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
@@ -79,7 +79,7 @@ jobs:
   check-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: libfreemkv
       # libfreemkv path-deps ../freemkv-unlock on the BRANCH tip (release.sh
@@ -91,7 +91,7 @@ jobs:
       # Both repos go into subdirectories because actions/checkout refuses a
       # `path:` outside $GITHUB_WORKSPACE, and `../freemkv-unlock` is outside.
       # With this layout the path dep resolves exactly as it does locally.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
@@ -106,7 +106,7 @@ jobs:
   check-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: libfreemkv
       # libfreemkv path-deps ../freemkv-unlock on the BRANCH tip (release.sh
@@ -118,7 +118,7 @@ jobs:
       # Both repos go into subdirectories because actions/checkout refuses a
       # `path:` outside $GITHUB_WORKSPACE, and `../freemkv-unlock` is outside.
       # With this layout the path dep resolves exactly as it does locally.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
@@ -149,21 +149,21 @@ jobs:
   consumers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { path: libfreemkv }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/freemkv-unlock, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-unlock }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/freemkv-keysources, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-keysources }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/freemkv-engine, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-engine }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/freemkv-i18n, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-i18n }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/freemkv, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/autorip, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: autorip }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/bdemu, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: bdemu }
       - name: Point every dependent at THIS libfreemkv commit
         shell: bash

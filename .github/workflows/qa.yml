@@ -43,7 +43,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Stamp the next rc
@@ -71,10 +71,10 @@ jobs:
         os: ['ubuntu-latest', 'macos-latest']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: libfreemkv
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: qa
@@ -92,10 +92,10 @@ jobs:
   cross-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: libfreemkv
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: qa
@@ -117,10 +117,10 @@ jobs:
   windows-build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: libfreemkv
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: qa
