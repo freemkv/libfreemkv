@@ -2746,11 +2746,25 @@ mod tests {
     /// unclamped 65535 is a ~540 MB allocation from a ~800 KB crafted file.
     #[test]
     fn tt_srpt_clamps_an_absurd_declared_title_count() {
-        let mut vmg = vmg_with_tt_srpt(1, &[(1, 1, 1)]);
+        // The fixture must actually CONTAIN more entries than the cap, or the
+        // walk stops when the buffer runs out and the clamp is never what
+        // bounded it. An earlier version of this test declared u16::MAX over a
+        // two-kilobyte fixture: the loop broke on `base + 12 > len` after three
+        // iterations and the assertion held with the clamp deleted entirely.
+        const PRESENT: usize = MAX_TT_SRPT_TITLES + 40;
+        let entries: Vec<(u16, u8, u8)> = (0..PRESENT)
+            .map(|i| (1u16, 1u8, (i % 250 + 1) as u8))
+            .collect();
+        let mut vmg = vmg_with_tt_srpt(1, &entries);
         let off = crate::consts::SECTOR_BYTES;
         vmg[off..off + 2].copy_from_slice(&u16::MAX.to_be_bytes());
+
         let map = parse_tt_srpt(&vmg, off).expect("parse");
         let total: usize = map.values().map(|v| v.len()).sum();
-        assert!(total <= 99, "clamped to the format maximum, got {total}");
+        assert!(
+            total <= MAX_TT_SRPT_TITLES,
+            "a declared count of u16::MAX over {PRESENT} real entries must be \
+             clamped to {MAX_TT_SRPT_TITLES}, got {total}"
+        );
     }
 }
