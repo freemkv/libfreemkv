@@ -695,6 +695,49 @@ mod tests {
     // ── `decrypt_sectors_in_content` (now a legacy alias of `decrypt_sectors`) ──
 
     /// `DecryptKeys::None` is a no-op even with a content map + scrambled bytes.
+    /// A forensic map's read plan is NOT the extents it was given — and that is
+    /// the precondition the mux's provenance guard keys on.
+    ///
+    /// A clip's feed span is measured over the FULL extents at scan time, while
+    /// the mux reads this reduced plan, so the byte offsets stamped on frames
+    /// and the offsets recorded in the spans describe different streams. The
+    /// deficit accumulates, so every frame after the first segment resolves to
+    /// an earlier clip than it came from. The spans still tile each other, so
+    /// the tiling check cannot see it; the mux compares the plan against the
+    /// full extents instead and stops trusting provenance when they differ.
+    #[test]
+    fn a_forensic_read_plan_drops_units_the_full_extents_include() {
+        let full = vec![crate::disc::Extent {
+            start_lba: 1000,
+            sector_count: 60,
+        }];
+
+        // No forensic segment: the plan IS the extents, byte for byte, so
+        // provenance stays trustworthy on an ordinary disc.
+        let plain = AacsKeyMap::from_ranges_phased(vec![(1000, 1060, 5, Phase::All)]);
+        assert_eq!(
+            plain.read_plan(&full, 3),
+            full,
+            "a non-forensic map must return the extents unchanged"
+        );
+
+        // With alternate phases, units are omitted — fewer sectors are read
+        // than the spans describe.
+        let phased = AacsKeyMap::from_ranges_phased(vec![(1000, 1060, 5, Phase::Even)]);
+        let plan = phased.read_plan(&full, 3);
+        let planned: u32 = plan.iter().map(|e| e.sector_count).sum();
+        let whole: u32 = full.iter().map(|e| e.sector_count).sum();
+        assert!(
+            planned < whole,
+            "a forensic segment must drop units: planned {planned} of {whole}"
+        );
+        assert_ne!(
+            plan, full,
+            "the plan differs from the extents, which is exactly what the mux \
+             detects before deciding whether a byte offset means anything"
+        );
+    }
+
     #[test]
     fn content_gate_none_keys_is_noop() {
         let mut keys = DecryptKeys::None;
