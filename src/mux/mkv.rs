@@ -1368,6 +1368,14 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// Block and the dependent (right-eye) access unit rides as the
     /// BlockAdditional under the track's `mvcC` mapping. Such a frame is always a
     /// `BlockGroup` (never a SimpleBlock), with a `ReferenceBlock` when it is not
+    /// TEST-ONLY. Every production path writes through [`MkvMuxer::write_frame_at`]
+    /// and passes the byte offset the frame was read from; the deferred-mux
+    /// replay of buffered frames was the last one that did not, and it now
+    /// does. Keeping this compiled out of the library means there is no
+    /// production API through which a frame can reach the file with its
+    /// provenance discarded — the placement logic stopped relying on
+    /// timestamps precisely so that could not happen silently.
+    #[cfg(test)]
     /// a keyframe. `None` for every non-3D frame.
     pub fn write_frame(
         &mut self,

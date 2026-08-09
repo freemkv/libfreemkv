@@ -512,13 +512,21 @@ impl MkvStream {
             muxer.set_opening_capture(crate::diag::OpeningCapture::new(path, pending.tracks.len()));
         }
         for (f, additional) in pending.buffered.drain(..) {
-            muxer.write_frame(
+            // Provenance must survive the replay. These frames were buffered
+            // before the muxer existed, but each still carries the byte offset
+            // it was read from — dropping it here sent them down the timestamp
+            // heuristic instead, the one path the rest of this change set
+            // exists to stop relying on. They sit at the head of the title, so
+            // clip 0 is usually the right guess and the damage was bounded;
+            // "usually right" is exactly what provenance replaced.
+            muxer.write_frame_at(
                 f.track,
                 f.pts,
                 f.keyframe,
                 &f.data,
                 f.duration_ns,
                 additional.as_deref(),
+                f.source.map(|s| s.byte),
             )?;
         }
         self.mode = Mode::Write(WriteMode::Active(Box::new(muxer)));

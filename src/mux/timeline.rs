@@ -341,6 +341,27 @@ impl SeamPlan {
         Some(first)
     }
 
+    /// Pick the member of a shared-span run whose marks contain `raw_ns`.
+    ///
+    /// `clip_at_byte` deliberately answers with the FIRST entry of a run so the
+    /// lookup is stable. That is the right answer when the run is one clip; when
+    /// several PlayItems reference one file it is only the right STARTING point,
+    /// because they differ solely in their marks. Falls back to the first when
+    /// none contains the timestamp, which keeps the existing drop behaviour for
+    /// material genuinely outside every reference.
+    fn clip_in_run_for(&self, first: usize, raw_ns: i64) -> usize {
+        let span = self.clips[first].feed_span;
+        let mut i = first;
+        while i < self.clips.len() && self.clips[i].feed_span == span {
+            let c = self.clips[i];
+            if raw_ns >= c.in_ns && raw_ns <= c.out_ns {
+                return i;
+            }
+            i += 1;
+        }
+        first
+    }
+
     /// `None` means DROP: the frame lies outside every clip's marks, so the
     /// playlist does not include it.
     fn place(
@@ -400,6 +421,18 @@ impl SeamPlan {
             && let Some(b) = src_byte
             && let Some(found) = self.clip_at_byte(b)
         {
+            // One FILE can be referenced by several PlayItems — a seamless
+            // split, a looped segment, multi-angle — and `bluray.rs` counts its
+            // extents once, so they all share one span. Provenance therefore
+            // narrows the frame to the RUN, not to a member of it: every frame
+            // of the file resolves to the same first index.
+            //
+            // Only the timestamp can say which reference a frame belongs to,
+            // and each carries its own marks. Without this, everything past the
+            // first PlayItem's OUT was judged against marks it was never inside
+            // and dropped — half the file missing from the rip while the
+            // timeline still charged for its duration.
+            let found = self.clip_in_run_for(found, raw_ns);
             let c = self.clips[found];
             let placed = raw_ns >= c.in_ns && raw_ns <= c.out_ns;
             self.cursors[track] = TrackPos {
@@ -1277,6 +1310,50 @@ mod tests {
     /// A playlist may reference the same clip twice (a looped segment). The
     /// bytes are read once, so both entries share one span — that must not be
     /// read as a broken map.
+    /// A clip FILE referenced by two adjacent PlayItems — a seamless split, a
+    /// looped segment, multi-angle — is one file with one set of bytes, so it
+    /// has ONE feed span. But each PlayItem carries its OWN marks, and the two
+    /// cover different halves of it.
+    ///
+    /// Provenance alone cannot tell those halves apart: every frame of the file
+    /// resolves to the same span. `clip_at_byte` answers with the FIRST of the
+    /// run, so without the timestamp to disambiguate, every frame past the
+    /// first PlayItem's OUT is judged against marks it was never inside and
+    /// dropped — the second half of that clip silently missing from the rip,
+    /// with the timeline still charged for its duration.
+    #[test]
+    fn a_clip_split_across_two_play_items_keeps_both_halves() {
+        // One file, one span. Two PlayItems: [0s,10s) then [10s,20s).
+        const SPAN: (u64, u64) = (0, 4_000_000);
+        let mk = |in_t: u32, out_t: u32| crate::disc::Clip {
+            feed_span: Some(SPAN),
+            clip_id: "00001".into(),
+            in_time: in_t,
+            out_time: out_t,
+            duration_secs: 10.0,
+            source_packets: 0,
+        };
+        // 45 kHz ticks: 10 s = 450_000, 20 s = 900_000.
+        let clips = vec![mk(0, 450_000), mk(450_000, 900_000)];
+        let mut plan = SeamPlan::from_clips(&clips).expect("two PlayItems, one file");
+        assert!(plan.spans_trusted, "one file legitimately has one span");
+
+        // A frame from the SECOND PlayItem's range, read from within the file.
+        let raw = mpls_ticks_to_ns(600_000); // 13.33 s — inside [10s, 20s)
+        let placed = plan.place(raw, 0, false, Some(2_000_000));
+        assert!(
+            placed.is_some(),
+            "a frame in the second PlayItem's marks must be kept — it resolves \
+             to the same span as the first, so only its timestamp can say which \
+             half of the file it belongs to"
+        );
+        assert_eq!(
+            plan.dropped_total(),
+            0,
+            "nothing from a legitimately referenced half may be dropped"
+        );
+    }
+
     #[test]
     fn a_repeated_clip_shares_one_span_and_is_still_trusted() {
         let mut clips = clips_with_spans();
@@ -1511,13 +1588,13 @@ mod tests {
                 feed_span: Some(SPAN),
             })
             .collect();
-        let plan = SeamPlan::from_clips(&clips).expect("plan");
+        let mut plan = SeamPlan::from_clips(&clips).expect("plan");
         assert!(
             plan.spans_trusted,
-            "identical spans pass the tiling check -- this is the hazard"
+            "identical spans pass the tiling check -- one file has one span"
         );
-        // Every byte in the file resolves to the FIRST play item, so a byte
-        // offset cannot say which of the 8 ranges a frame belongs to.
+        // A byte offset alone cannot say which of the 8 ranges a frame belongs
+        // to: every byte in the file resolves to the FIRST play item.
         for b in [0u64, 1_000_000, 20_000_000_000, 39_999_999_999] {
             assert_eq!(
                 plan.clip_at_byte(b),
@@ -1525,6 +1602,23 @@ mod tests {
                 "byte {b} resolves to the first play item, always"
             );
         }
+
+        // ...which is why placement must finish the job with the timestamp.
+        // This used to drop 7/8 of the title: every frame past the first
+        // range's OUT was judged against marks it was never inside. Each
+        // range's own frame must now be kept, and land in ITS range.
+        for i in 0..N {
+            let mid = mpls_ticks_to_ns(i * SEG + SEG / 2);
+            let placed = plan
+                .place(mid, 0, false, Some(1_000_000))
+                .unwrap_or_else(|| panic!("a frame in play item {i}'s marks must be kept"));
+            assert!(placed >= 0, "play item {i} placed at {placed}");
+        }
+        assert_eq!(
+            plan.dropped_total(),
+            0,
+            "no range of a legitimately split file may be dropped"
+        );
     }
 
     /// Marks that do not advance across the title are normal — each clip file

@@ -853,20 +853,40 @@ mod tests {
             "the buffer must be handed back to the parser, not dropped"
         );
 
-        for _ in 0..8 {
-            parser.parse(&PesPacket {
-                source: None,
-                pid: 0x1100,
-                pts: None,
-                dts: None,
-                data: frame.clone(),
-                discontinuity: false,
-            });
-        }
+        // The discriminator: a LARGE packet, then a small one. A reused buffer
+        // keeps the large capacity; a fresh `Vec` sized to each packet drops
+        // back to the small one. Feeding equal-sized packets cannot tell those
+        // apart — the first version of this test did exactly that and a
+        // to_vec()-per-call implementation passed it.
+        let big = [frame.clone(), frame.clone(), frame.clone(), frame.clone()].concat();
+        parser.parse(&PesPacket {
+            source: None,
+            pid: 0x1100,
+            pts: None,
+            dts: None,
+            data: big.clone(),
+            discontinuity: false,
+        });
+        let cap_after_big = parser.scratch.capacity();
         assert!(
-            parser.scratch.capacity() >= cap_after_first,
-            "capacity must persist across calls; a fresh Vec each time would \
-             show it dropping back to the last packet's size"
+            cap_after_big >= big.len(),
+            "the buffer must have grown to hold the large packet"
+        );
+
+        parser.parse(&PesPacket {
+            source: None,
+            pid: 0x1100,
+            pts: None,
+            dts: None,
+            data: frame.clone(),
+            discontinuity: false,
+        });
+        assert_eq!(
+            parser.scratch.capacity(),
+            cap_after_big,
+            "after a small packet the buffer must STILL hold the large \
+             capacity — a fresh allocation per call would have shrunk to the \
+             small packet's size"
         );
     }
 
