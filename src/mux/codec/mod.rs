@@ -465,9 +465,23 @@ mod provenance_guard {
                 // `PesFrame` in the tests of other modules is not ours; only
                 // codec `Frame` literals are scanned, and a test fixture that
                 // builds a PesPacket with `source: None` is legitimate.
-                if blk.contains("source: None") {
+                // Two spellings, not one. `source: None` is the obvious way to
+                // lose provenance; OMITTING the field entirely is the quiet
+                // one, because `Frame` derives Default, so
+                // `Frame { pts_ns, .. Default::default() }` compiles and
+                // yields `source: None` while containing no such text. A guard
+                // that only knew the first spelling would have watched a
+                // parser be rewritten into the second and stayed green.
+                let explicit_none = blk.contains("source: None");
+                let no_source_field = !blk.contains("source:");
+                if explicit_none || no_source_field {
                     let line = src[..src.find(blk).unwrap_or(0)].lines().count() + 1;
-                    offenders.push(format!("{name}:{line}"));
+                    let how = if explicit_none {
+                        "source: None"
+                    } else {
+                        "no source field (Default fills in None)"
+                    };
+                    offenders.push(format!("{name}:{line} ({how})"));
                 }
             }
         }
