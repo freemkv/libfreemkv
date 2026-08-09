@@ -57,7 +57,15 @@ const MAX_CS0_NAME_BYTES: usize = 254;
 /// A directory File Entry's link count is `u16` and counts one per child
 /// directory plus one for its own entry in the parent, so the last usable
 /// value is `u16::MAX - 1`.
+/// Lowered under `cfg(test)` ONLY so the guard can actually be executed.
+/// Building a folder with 65534 subdirectories to reach the real cap is not a
+/// test anyone can run, so the previous test asserted arithmetic about the
+/// constant instead and would have passed with the guard deleted. The
+/// production value is unchanged.
+#[cfg(not(test))]
 const MAX_SUBDIRS: usize = (u16::MAX - 1) as usize;
+#[cfg(test)]
+const MAX_SUBDIRS: usize = 4;
 
 /// Largest image this planner will synthesize, in sectors (128 GiB).
 ///
@@ -859,16 +867,6 @@ mod tests {
         assert!(!is_excluded("VTS_01_1.VOB"));
     }
 
-    /// A name too long for the FID's one-byte length field is refused by the
-    /// PLANNER, on a real folder.
-    ///
-    /// Audit finding: the length was narrowed with `as u8`, so a 255-byte ASCII
-    /// name — POSIX NAME_MAX, legal on ext4/APFS/NTFS — encoded to 256 bytes
-    /// with the CS0 compression byte and wrote a length of ZERO, making every
-    /// later entry in that directory read from the wrong offset.
-    ///
-    /// An earlier version of this test asserted arithmetic about the constants
-    /// and never called `plan`, so it would have passed with the guard deleted.
     /// Two host names that the READER collapses into one must be refused by
     /// the planner, not written into the image.
     ///
@@ -912,6 +910,16 @@ mod tests {
         );
     }
 
+    /// A name too long for the FID's one-byte length field is refused by the
+    /// PLANNER, on a real folder.
+    ///
+    /// Audit finding: the length was narrowed with `as u8`, so a 255-byte ASCII
+    /// name — POSIX NAME_MAX, legal on ext4/APFS/NTFS — encoded to 256 bytes
+    /// with the CS0 compression byte and wrote a length of ZERO, making every
+    /// later entry in that directory read from the wrong offset.
+    ///
+    /// An earlier version of this test asserted arithmetic about the constants
+    /// and never called `plan`, so it would have passed with the guard deleted.
     #[test]
     fn an_over_long_name_is_refused_by_the_planner() {
         let dir = std::env::temp_dir().join(format!(
@@ -971,11 +979,30 @@ mod tests {
     /// so this pins the arithmetic relationship the guard relies on — and says
     /// plainly that it does NOT exercise `walk`.
     #[test]
-    fn the_subdir_cap_keeps_the_link_count_representable() {
-        assert_eq!(
-            (MAX_SUBDIRS as u16).checked_add(1),
-            Some(u16::MAX),
-            "the largest permitted fan-out must still fit the link count"
+    fn the_subdir_cap_refuses_a_folder_with_too_many_subdirectories() {
+        // Executes the guard, rather than restating the constant. A directory's
+        // File Entry records its link count in 16 bits — one per child
+        // directory plus one for its own entry in the parent — so exceeding it
+        // would wrap the count and produce an image whose directory structure
+        // lies about itself.
+        let dir = std::env::temp_dir().join(format!("fmkv-fanout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..=MAX_SUBDIRS {
+            std::fs::create_dir_all(dir.join(format!("d{i}"))).unwrap();
+        }
+
+        let err = plan(&dir).expect_err("more subdirectories than the link count can represent");
+        assert!(
+            matches!(err, Error::DirImageFanout { .. }),
+            "expected DirImageFanout, got {err:?}"
         );
+
+        // And the real production value is what ships: one per child plus the
+        // parent's own entry must still fit in the 16-bit field.
+        #[cfg(not(test))]
+        const _: () = assert!(MAX_SUBDIRS + 1 == u16::MAX as usize);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
