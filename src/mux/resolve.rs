@@ -2180,10 +2180,25 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     // decrypted, or handed to the demux, so the demux sees one gapless our-variant
     // stream (no ciphertext to trip a concealed-gap resync). A non-forensic map
     // returns the extents unchanged, so the common disc reads exactly as before.
+    let full_extents = extents.clone();
     let extents = match &key_map {
         Some(map) => map.read_plan(&extents, unit_align as u32),
         None => extents,
     };
+    // The plan and the clips' feed spans must describe the SAME bytes.
+    //
+    // A clip's span was measured over the title's full extents at scan time,
+    // and a frame is placed by the offset it was read from. When a forensic
+    // segment makes the plan drop alternate-phase units, the mux feeds fewer
+    // bytes than the spans describe and the two drift apart cumulatively —
+    // every frame after the first segment looks earlier than it is, and near a
+    // join it is placed in the wrong clip or dropped. The spans still tile each
+    // other perfectly, so the trust check cannot see it.
+    //
+    // Provenance is only meaningful when the feed matches. When it does not,
+    // say so and let placement fall back to timestamps, which is what the
+    // untrusted path exists for.
+    let feed_matches_spans = extents == full_extents;
     let mut decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
     if let Some(map) = key_map {
@@ -2202,6 +2217,17 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     // correct `0x8x` sub-streams. No-op for non-DVD or an empty probe. Reset the
     // unit base afterward so the prefetcher's first batch starts clean.
     let mut title = title;
+    if !feed_matches_spans {
+        tracing::info!(
+            target: "freemkv::mux",
+            planned = extents.len(),
+            full = full_extents.len(),
+            "read plan omits units the clip spans include; placing by timestamps"
+        );
+        for c in &mut title.clips {
+            c.feed_span = None;
+        }
+    }
     crate::disc::dvd_audio_probe::probe_and_remap(&mut decrypting, &mut title);
     decrypting.set_unit_base(0);
 
