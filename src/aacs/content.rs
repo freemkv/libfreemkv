@@ -4,7 +4,7 @@
 #[cfg(test)]
 use aes::Aes128;
 #[cfg(test)]
-use aes::cipher::{KeyInit, generic_array::GenericArray};
+use aes::cipher::{Array, KeyInit};
 
 use super::crypto::{aes_cbc_decrypt, aes_cbc_encrypt, aes_ecb_encrypt};
 // Only this module's test fixtures build CBC ciphertext by hand now — the
@@ -418,7 +418,7 @@ pub(crate) fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
 mod tests {
     use super::super::crypto::aes_ecb_decrypt;
     use super::*;
-    use aes::cipher::BlockEncrypt; // test fixtures build ciphertext directly
+    use aes::cipher::BlockCipherEncrypt; // test fixtures build ciphertext directly
 
     /// [`encrypt_unit`] is the exact inverse of [`decrypt_unit`]: whatever an
     /// authoring caller encrypts, the read path must recover byte-for-byte.
@@ -725,7 +725,7 @@ mod tests {
         }
 
         // CBC encrypt bytes 16..6143
-        let cipher = Aes128::new(GenericArray::from_slice(&encrypt_key));
+        let cipher = Aes128::new(&encrypt_key.into());
         let mut prev = AACS_IV;
         let num_blocks = (ALIGNED_UNIT_LEN - 16) / 16;
         for i in 0..num_blocks {
@@ -733,7 +733,9 @@ mod tests {
             for j in 0..16 {
                 plain[off + j] ^= prev[j];
             }
-            let mut block = GenericArray::clone_from_slice(&plain[off..off + 16]);
+            let mut chunk = [0u8; 16];
+            chunk.copy_from_slice(&plain[off..off + 16]);
+            let mut block: Array<u8, _> = chunk.into();
             cipher.encrypt_block(&mut block);
             plain[off..off + 16].copy_from_slice(&block);
             prev.copy_from_slice(&plain[off..off + 16]);
@@ -1496,7 +1498,7 @@ mod tests {
         let plain = unit.clone();
 
         // Forward: CBC-encrypt unit[s+16 .. s+2048] per sector under AACS IV.
-        let cipher = Aes128::new(GenericArray::from_slice(&rdk));
+        let cipher = Aes128::new(&rdk.into());
         for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES) {
             let mut prev = AACS_IV;
             let body = s + 16;
@@ -1507,7 +1509,9 @@ mod tests {
                 for j in 0..16 {
                     unit[off + j] ^= prev[j];
                 }
-                let mut blk = GenericArray::clone_from_slice(&unit[off..off + 16]);
+                let mut chunk = [0u8; 16];
+                chunk.copy_from_slice(&unit[off..off + 16]);
+                let mut blk: Array<u8, _> = chunk.into();
                 cipher.encrypt_block(&mut blk);
                 unit[off..off + 16].copy_from_slice(&blk);
                 prev.copy_from_slice(&unit[off..off + 16]);

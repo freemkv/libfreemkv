@@ -8,7 +8,7 @@
 //! content / keys / variant modules.
 
 use aes::Aes128;
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
+use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 
 /// Fixed IV used by AACS for all AES-CBC operations. [C] §2.1.2 (default CBC IV, `iv0`).
 pub(crate) const AACS_IV: [u8; 16] = [
@@ -39,13 +39,13 @@ pub(crate) fn new_cipher_for(key: &[u8; 16]) -> Aes128 {
 fn new_cipher(key: &[u8; 16]) -> Aes128 {
     #[cfg(test)]
     KEY_EXPANSIONS.with(|c| c.set(c.get() + 1));
-    Aes128::new(GenericArray::from_slice(key))
+    Aes128::new(&(*key).into())
 }
 
 /// AES-128-ECB encrypt a single 16-byte block. [C] §2.1.1 (`AES-128E`).
 pub(crate) fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
-    let cipher = Aes128::new(GenericArray::from_slice(key));
-    let mut block = GenericArray::clone_from_slice(data);
+    let cipher = Aes128::new(&(*key).into());
+    let mut block: Array<u8, _> = (*data).into();
     cipher.encrypt_block(&mut block);
     let mut out = [0u8; 16];
     out.copy_from_slice(&block);
@@ -54,8 +54,8 @@ pub(crate) fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
 
 /// AES-128-ECB decrypt a single 16-byte block. [C] §2.1.1 (`AES-128D`).
 pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
-    let cipher = Aes128::new(GenericArray::from_slice(key));
-    let mut block = GenericArray::clone_from_slice(data);
+    let cipher = Aes128::new(&(*key).into());
+    let mut block: Array<u8, _> = (*data).into();
     cipher.decrypt_block(&mut block);
     let mut out = [0u8; 16];
     out.copy_from_slice(&block);
@@ -88,7 +88,7 @@ pub(crate) fn aes_cbc_encrypt(key: &[u8; 16], data: &mut [u8]) {
         for j in 0..16 {
             block[j] = data[offset + j] ^ prev[j];
         }
-        let mut ga = GenericArray::clone_from_slice(&block);
+        let mut ga: Array<u8, _> = block.into();
         cipher.encrypt_block(&mut ga);
         data[offset..offset + 16].copy_from_slice(&ga);
         prev.copy_from_slice(&ga);
@@ -140,7 +140,9 @@ pub(crate) fn cbc_decrypt_blocks(cipher: &Aes128, data: &mut [u8]) {
             p.copy_from_slice(&data[(i - 1) * 16..i * 16]);
             p
         };
-        let mut block = GenericArray::clone_from_slice(&data[offset..offset + 16]);
+        let mut chunk = [0u8; 16];
+        chunk.copy_from_slice(&data[offset..offset + 16]);
+        let mut block: Array<u8, _> = chunk.into();
         cipher.decrypt_block(&mut block);
         for j in 0..16 {
             data[offset + j] = block[j] ^ prev[j];
