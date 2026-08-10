@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.6.3] — 2026-08-10
+
+### Changed
+
+- **Six crates that were never used have been removed, and nothing about reading
+  a disc has changed.** They were declared as dependencies but referenced
+  nowhere, so they were compiled into every build for nothing. The rest were
+  aligned with the versions the other freemkv crates use.
+- **Two complete AES implementations were being built into the product.** Two
+  different releases of the cipher crates had been pulled in by different parts
+  of the tree and both were compiled. They are now one.
+
 ## [1.6.2] — 2026-08-08
 
 ### Fixed
