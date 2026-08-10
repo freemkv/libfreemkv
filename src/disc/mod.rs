@@ -5416,7 +5416,7 @@ mod tests {
         use crate::aacs::content::ALIGNED_UNIT_LEN;
         use crate::aacs::crypto::AACS_IV;
         use aes::Aes128;
-        use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+        use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
         let mut unit = clear[..ALIGNED_UNIT_LEN].to_vec();
         // Flag the unit encrypted (CPI bits on byte 0) before key derivation so
         // the recovered plaintext header matches and `decrypt_unit`'s CPI gate
@@ -5424,14 +5424,14 @@ mod tests {
         unit[0] |= 0xC0;
         let mut header = [0u8; 16];
         header.copy_from_slice(&unit[..16]);
-        let cipher = Aes128::new(GenericArray::from_slice(uk));
-        let mut blk = GenericArray::clone_from_slice(&header);
+        let cipher = Aes128::new(&(*uk).into());
+        let mut blk: Array<u8, _> = header.into();
         cipher.encrypt_block(&mut blk);
         let mut dk = [0u8; 16];
         for i in 0..16 {
             dk[i] = blk[i] ^ header[i];
         }
-        let bc = Aes128::new(GenericArray::from_slice(&dk));
+        let bc = Aes128::new(&dk.into());
         let mut prev = AACS_IV;
         let mut i = 16;
         while i + 16 <= ALIGNED_UNIT_LEN {
@@ -5439,7 +5439,7 @@ mod tests {
             for j in 0..16 {
                 b[j] = unit[i + j] ^ prev[j];
             }
-            let mut g = GenericArray::clone_from_slice(&b);
+            let mut g: Array<u8, _> = b.into();
             bc.encrypt_block(&mut g);
             for j in 0..16 {
                 unit[i + j] = g[j];

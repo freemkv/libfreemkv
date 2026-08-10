@@ -85,7 +85,7 @@ fn css_is_scrambled_detection() {
 #[test]
 fn aacs_decrypt_unit_roundtrip() {
     use aes::Aes128;
-    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+    use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 
     let unit_key = [0xAAu8; 16];
     let aacs_iv: [u8; 16] = [
@@ -113,8 +113,8 @@ fn aacs_decrypt_unit_roundtrip() {
     let header: [u8; 16] = plain[..16].try_into().unwrap();
 
     // Step 1: AES-ECB encrypt header with unit key
-    let cipher_header = Aes128::new(GenericArray::from_slice(&unit_key));
-    let mut block = GenericArray::clone_from_slice(&header);
+    let cipher_header = Aes128::new(&unit_key.into());
+    let mut block: Array<u8, _> = header.into();
     cipher_header.encrypt_block(&mut block);
     let mut derived = [0u8; 16];
     derived.copy_from_slice(&block);
@@ -126,7 +126,7 @@ fn aacs_decrypt_unit_roundtrip() {
     }
 
     // Step 3: AES-CBC encrypt bytes 16..6144
-    let cipher = Aes128::new(GenericArray::from_slice(&encrypt_key));
+    let cipher = Aes128::new(&encrypt_key.into());
     let mut prev = aacs_iv;
     let num_blocks = (aacs::content::ALIGNED_UNIT_LEN - 16) / 16;
     for i in 0..num_blocks {
@@ -134,7 +134,9 @@ fn aacs_decrypt_unit_roundtrip() {
         for j in 0..16 {
             plain[off + j] ^= prev[j];
         }
-        let mut blk = GenericArray::clone_from_slice(&plain[off..off + 16]);
+        let mut c_blk = [0u8; 16];
+        c_blk.copy_from_slice(&plain[off..off + 16]);
+        let mut blk: Array<u8, _> = c_blk.into();
         cipher.encrypt_block(&mut blk);
         plain[off..off + 16].copy_from_slice(&blk);
         prev.copy_from_slice(&plain[off..off + 16]);
@@ -215,7 +217,7 @@ fn aacs_disc_hash_deterministic() {
 #[test]
 fn aacs_decrypt_unit_key_roundtrip() {
     use aes::Aes128;
-    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+    use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 
     let vuk = [
         0x11u8, 0x14, 0x36, 0x0B, 0x10, 0xEE, 0x6E, 0xAC, 0x78, 0xAA, 0x4A, 0xC0, 0xB7, 0x52, 0xEA,
@@ -227,8 +229,8 @@ fn aacs_decrypt_unit_key_roundtrip() {
     ];
 
     // Encrypt: AES-ECB encrypt the unit key with VUK
-    let cipher = Aes128::new(GenericArray::from_slice(&vuk));
-    let mut block = GenericArray::clone_from_slice(&original_unit_key);
+    let cipher = Aes128::new(&vuk.into());
+    let mut block: Array<u8, _> = original_unit_key.into();
     cipher.encrypt_block(&mut block);
     let mut encrypted_uk = [0u8; 16];
     encrypted_uk.copy_from_slice(&block);
@@ -340,9 +342,9 @@ fn aacs_clear_unit_reports_not_encrypted() {
 /// Independent AES-128-ECB encrypt (uses `aes` crate directly, NOT our library).
 fn ref_aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     use aes::Aes128;
-    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-    let cipher = Aes128::new(GenericArray::from_slice(key));
-    let mut block = GenericArray::clone_from_slice(data);
+    use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
+    let cipher = Aes128::new(&(*key).into());
+    let mut block: Array<u8, _> = (*data).into();
     cipher.encrypt_block(&mut block);
     let mut out = [0u8; 16];
     out.copy_from_slice(&block);
@@ -352,8 +354,8 @@ fn ref_aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
 /// Independent AES-128-CBC encrypt (uses `aes` crate directly, NOT our library).
 fn ref_aes_cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) {
     use aes::Aes128;
-    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-    let cipher = Aes128::new(GenericArray::from_slice(key));
+    use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
+    let cipher = Aes128::new(&(*key).into());
     let mut prev = *iv;
     let num_blocks = data.len() / 16;
     for i in 0..num_blocks {
@@ -361,7 +363,9 @@ fn ref_aes_cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) {
         for j in 0..16 {
             data[off + j] ^= prev[j];
         }
-        let mut block = GenericArray::clone_from_slice(&data[off..off + 16]);
+        let mut c_block = [0u8; 16];
+        c_block.copy_from_slice(&data[off..off + 16]);
+        let mut block: Array<u8, _> = c_block.into();
         cipher.encrypt_block(&mut block);
         data[off..off + 16].copy_from_slice(&block);
         prev.copy_from_slice(&data[off..off + 16]);
