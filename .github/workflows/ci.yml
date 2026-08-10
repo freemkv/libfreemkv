@@ -77,6 +77,19 @@ jobs:
         working-directory: libfreemkv
 
   check-macos:
+    # dev is the FAST lane: this job still runs, but on the release-candidate
+    # branches rather than on every push to dev. Nothing is deleted and no
+    # platform stops being checked before a release -- qa.yml independently
+    # covers macOS and Windows, and the jobs unique to this file (the Intel
+    # macOS build, the Windows release build) run here on qa and main. A push
+    # to dev is meant to be cheap and frequent; waiting on three runner pools
+    # to agree is what a release candidate is for.
+    #
+    # `if` SKIPS the job (it does not queue). A queued job would be far worse
+    # than a slow one: release.sh's CI gate refuses while any run for the
+    # commit is still in progress, so a never-scheduled job blocks releases
+    # silently -- see the note on real-media in qa.yml.
+    if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -104,6 +117,19 @@ jobs:
         working-directory: libfreemkv
 
   check-windows:
+    # dev is the FAST lane: this job still runs, but on the release-candidate
+    # branches rather than on every push to dev. Nothing is deleted and no
+    # platform stops being checked before a release -- qa.yml independently
+    # covers macOS and Windows, and the jobs unique to this file (the Intel
+    # macOS build, the Windows release build) run here on qa and main. A push
+    # to dev is meant to be cheap and frequent; waiting on three runner pools
+    # to agree is what a release candidate is for.
+    #
+    # `if` SKIPS the job (it does not queue). A queued job would be far worse
+    # than a slow one: release.sh's CI gate refuses while any run for the
+    # commit is still in progress, so a never-scheduled job blocks releases
+    # silently -- see the note on real-media in qa.yml.
+    if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
