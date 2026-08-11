@@ -21,6 +21,7 @@
 //!
 //! So: drive sources get `freemkv_engine::copy`. Everything else gets this.
 
+use crate::consts::SECTOR_BYTES;
 use crate::error::{Error, Result};
 use crate::halt::Halt;
 use crate::sector::SectorSource;
@@ -32,9 +33,6 @@ use std::path::Path;
 /// disappears against a file-backed source, small enough that the buffer is not
 /// a notable allocation and cancellation stays responsive.
 const BATCH_SECTORS: u32 = 2048;
-
-/// Bytes per sector. Fixed for every medium this crate reads.
-const SECTOR_BYTES: usize = 2048;
 
 /// Write `total_sectors` sectors from `reader` to `dest`.
 ///
