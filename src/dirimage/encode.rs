@@ -29,8 +29,12 @@ use super::layout::{DirNode, Layout};
 use crate::error::{Error, Result};
 use std::collections::BTreeMap;
 
-/// Logical block / sector size. Fixed for every optical profile this crate reads.
-pub(super) const SECTOR: usize = 2048;
+/// Logical block / sector size. Fixed for every optical profile this crate
+/// reads, and the same quantity as [`crate::consts::SECTOR_BYTES`] — aliased
+/// rather than re-declared so the two cannot drift apart. The short name is
+/// kept because it appears in ~25 extent and offset expressions across
+/// `dirimage`, where the longer one would bury the arithmetic.
+pub(super) use crate::consts::SECTOR_BYTES as SECTOR;
 
 /// Descriptor version recorded in every tag. 2 = ECMA-167 2nd edition, which
 /// is what UDF revisions up to and including 2.00 require.

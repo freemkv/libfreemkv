@@ -85,7 +85,7 @@ pub fn crack_key(
 ///
 /// - [`CrackOutcome::Cracked`] — a scrambled sector yielded a title key.
 /// - [`CrackOutcome::Unencrypted`] — NO scrambled sector was seen across the
-///   scanned extents (`is_scrambled` never true): the content is genuinely
+///   scanned extents (`is_scrambled_pack` never true): the content is genuinely
 ///   plaintext, so proceeding without a key is correct.
 /// - [`CrackOutcome::ScrambledUncracked`] — scrambled sectors WERE seen but no
 ///   key could be recovered (the Stevenson attack found no crackable crib, or
@@ -515,7 +515,7 @@ pub(crate) const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
 /// Check if a sector is a CSS-scrambled DVD **video pack** — the HARDENED test
 /// the crack scan uses to set its `saw_scrambled` evidence flag (Fix 3).
 ///
-/// [`is_scrambled`] keys solely on bits 4-5 of byte 0x14. That single byte is
+/// [`has_scramble_flag_bits`] keys solely on bits 4-5 of byte 0x14. That byte is
 /// only meaningful inside a real DVD sector — an MPEG-2 Program Stream pack,
 /// which ALWAYS begins with the 32-bit pack-start code `00 00 01 BA` at offset
 /// 0x00. A tiny clear / nav-only stub (a 0.5 s menu loop, an FBI-warning title)
@@ -527,12 +527,15 @@ pub(crate) const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
 /// structurally a DVD video pack can be counted as scramble evidence. This does
 /// NOT weaken the genuine "encrypted but uncrackable" hard-fail: a real
 /// scrambled feature is made of valid PS packs, so its scrambled sectors still
-/// pass this check and still drive `ScrambledUncracked` when no key cracks. (The
-/// descramble loop keeps the looser [`is_scrambled`]: by the time it runs we
-/// already know the title is CSS, and it only needs to skip interleaved clear
-/// NAV packs — a wrongly-skipped or wrongly-included sector there is recoverable
-/// per-sector, whereas a false scramble verdict in the scan poisons the whole
-/// title's outcome.)
+/// pass this check and still drive `ScrambledUncracked` when no key cracks.
+///
+/// The DESCRAMBLE path gates on this same function — [`descramble_sector`] and
+/// [`descramble_region`] both call it, not the raw flag test — because the raw
+/// test does not merely mis-skip a sector there: it descrambles one that was
+/// never scrambled and destroys it. The measured case is written up on
+/// [`descramble_region`]: a `VIDEO_TS.IFO` sector holding 0x15 at offset 0x14
+/// lost 1912 of its 2048 bytes, taking TT_SRPT with it, and the disc's 38
+/// titles became 10 — silently, at exit 0. One gate, both paths.
 pub fn is_scrambled_pack(sector: &[u8]) -> bool {
     sector.len() >= 2048 && sector[0x00..0x04] == PACK_START && (sector[0x14] >> 4) & 0x03 != 0
 }
@@ -618,9 +621,9 @@ mod tests {
         );
     }
 
-    // ── is_scrambled ───────────────────────────────────────────────────────
+    // ── has_scramble_flag_bits ─────────────────────────────────────────────
 
-    /// is_scrambled returns false for any buffer shorter than one sector,
+    /// has_scramble_flag_bits returns false for any buffer shorter than one sector,
     /// WITHOUT indexing byte 0x14 (which would panic on a tiny buffer). The
     /// length guard is short-circuited before the flag read.
     ///
@@ -630,13 +633,13 @@ mod tests {
     /// (`(sector[0x14]...) && sector.len() >= 2048`) -> panics indexing a
     /// 20-byte slice; this test catches it.
     #[test]
-    fn is_scrambled_short_buffer_is_false_no_panic() {
+    fn has_scramble_flag_bits_short_buffer_is_false_no_panic() {
         assert!(!has_scramble_flag_bits(&[]));
         assert!(!has_scramble_flag_bits(&[0u8; 20])); // shorter than 0x14+1 even
         assert!(!has_scramble_flag_bits(&[0xFFu8; 2047])); // one byte short of a sector
     }
 
-    /// is_scrambled keys on bits 4-5 of byte 0x14 (the CSS scramble field).
+    /// has_scramble_flag_bits keys on bits 4-5 of byte 0x14 (the CSS scramble field).
     /// A full sector flagged 0x10/0x20/0x30 is scrambled; 0x00 and the
     /// high-bit-only values 0x40/0x80 are clear.
     ///
@@ -644,7 +647,7 @@ mod tests {
     /// Mutation: widen mask to `& 0x0F` -> 0x40 reports scrambled, the 0x40
     /// assert fails.
     #[test]
-    fn is_scrambled_uses_bits_4_5_only() {
+    fn has_scramble_flag_bits_uses_bits_4_5_only() {
         let mut s = vec![0u8; 2048];
         for (flag, expected) in [
             (0x00u8, false),
@@ -665,14 +668,14 @@ mod tests {
         }
     }
 
-    /// is_scrambled accepts exactly 2048 bytes as the minimum (boundary at the
+    /// has_scramble_flag_bits accepts exactly 2048 bytes as the minimum (boundary at the
     /// inclusive value 2048).
     ///
     /// Grounding: `sector.len() >= 2048`.
     /// Mutation: change `>= 2048` to `> 2048` -> an exact 2048-byte scrambled
     /// sector reports false; this fails.
     #[test]
-    fn is_scrambled_exact_sector_length_accepted() {
+    fn has_scramble_flag_bits_exact_sector_length_accepted() {
         let mut s = vec![0u8; 2048];
         s[0x14] = 0x30;
         assert!(
@@ -686,8 +689,8 @@ mod tests {
     /// bits. A clear / nav-only stub whose bytes happen to set bits 4-5 of 0x14
     /// but lacks the pack-start is NOT counted as scramble evidence — without
     /// this the scan flips `saw_scrambled` and a genuinely unencrypted title
-    /// reports `ScrambledUncracked` (the false E7023). The looser `is_scrambled`
-    /// (descramble gate) still reads the same sector as flagged.
+    /// reports `ScrambledUncracked` (the false E7023). The raw flag test
+    /// `has_scramble_flag_bits` still reads the same sector as flagged.
     ///
     /// Grounding: `sector[0x00..0x04] == 00 00 01 BA && (sector[0x14] >> 4)...`.
     /// Mutation: drop the pack-start clause -> the 0x14-only sector counts as a
@@ -814,7 +817,7 @@ mod tests {
                     }
                     _ => {
                         // Real DVD video sectors always open with the MPEG-PS
-                        // pack-start code; `is_scrambled` (Fix 3) requires it
+                        // pack-start code; `is_scrambled_pack` (Fix 3) requires it
                         // before trusting the 0x14 scramble bits, so the fixture
                         // must include it for a `flag_byte` of 0x30 to register
                         // as scrambled.
@@ -1123,7 +1126,7 @@ mod tests {
     /// budget). With a small failing extent, every sector is attempted and the
     /// function returns None.
     ///
-    /// Grounding: `if reader.read_sectors(...).is_ok() && is_scrambled(...)` —
+    /// Grounding: `if reader.read_sectors(...).is_ok() && is_scrambled_pack(...)` —
     /// an Err simply falls through to `i += 1`.
     /// Mutation: change the read-error handling to `reader.read_sectors(...)?`
     /// (propagate) -> crack_key would stop after the first error and read only

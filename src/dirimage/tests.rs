@@ -650,6 +650,83 @@ fn an_aacs_folder_with_scrambled_content_is_rejected() {
     assert_eq!(err.code(), crate::error::E_DIR_IMAGE_ENCRYPTED);
 }
 
+// ── The OTHER door: `dir://` through the PES input path ─────────────────────
+//
+// `session::scan_dir` (covered above) and `mux::resolve::input("dir://…")` are
+// two doors into the same folder, and they once disagreed: a folder that ripped
+// fine through one failed through the other, because only `scan_dir` re-judged
+// the tree-shape encryption verdict from CONTENT. The fix was to share
+// `session::apply_folder_encryption_verdict` between them — see its doc
+// comment, which names this exact failure. Nothing tested the second door, so
+// dropping the `is_folder` argument at `mux::resolve`'s call site restored the
+// bug silently.
+
+/// The two doors must AGREE. Same folder, same verdict, same extents.
+///
+/// Stated as a differential rather than a bare `is_ok()` so it cannot go
+/// vacuous: if the fixture ever stops producing an AACS state, a one-sided
+/// `Ok` assertion would still pass while guarding nothing, whereas "both doors
+/// see the same title" is the invariant the shared function actually exists to
+/// hold.
+#[test]
+fn both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory() {
+    // `s` MUST outlive `stream`: the pipeline's producer thread is still
+    // reading the folder until the stream is dropped, and `Scratch::drop`
+    // removes the directory out from under it.
+    let s = playable_bdmv("dirdoor", false);
+    s.file("AACS/Unit_Key_RO.inf", &[0u8; 64]);
+    s.file("AACS/MKB_RO.inf", &[0u8; 64]);
+
+    // Door 1 — the scan path.
+    let (disc, _reader) =
+        crate::session::scan_dir(s.path(), crate::disc::ScanOptions::default()).unwrap();
+    assert!(
+        !disc.encrypted,
+        "door 1 must judge the clear folder decrypted"
+    );
+    let scanned_extents = disc.titles[0].extents.clone();
+    assert!(
+        !scanned_extents.is_empty(),
+        "fixture must have real extents"
+    );
+
+    // Door 2 — the PES input path the CLI actually rips through.
+    let url = format!("dir://{}", s.path().display());
+    let stream = crate::input(&url, &crate::InputOptions::default())
+        .expect("dir:// input must open a clear folder, exactly as scan_dir does");
+    assert_eq!(
+        stream.info().extents,
+        scanned_extents,
+        "the two doors selected different titles from the same folder"
+    );
+    drop(stream);
+}
+
+/// The other verdict, through the same door: a folder whose content units are
+/// really scrambled is refused with the TYPED code, not muxed into garbage.
+///
+/// This is the load-bearing half. `E_DIR_IMAGE_ENCRYPTED` is produced at
+/// exactly one site in the crate (`session::apply_folder_encryption_verdict`),
+/// reachable from here only through the `is_folder` argument — so this test
+/// cannot pass if that argument is dropped, whatever else changes.
+#[test]
+fn a_scrambled_folder_is_refused_through_the_dir_url_door_too() {
+    let s = playable_bdmv("dirdoorenc", true);
+    s.file("AACS/Unit_Key_RO.inf", &[0u8; 64]);
+    s.file("AACS/MKB_RO.inf", &[0u8; 64]);
+
+    let url = format!("dir://{}", s.path().display());
+    let err = match crate::input(&url, &crate::InputOptions::default()) {
+        Ok(_) => panic!("a scrambled folder must not open as a PES source"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        crate::error::error_code(&err),
+        Some(crate::error::E_DIR_IMAGE_ENCRYPTED),
+        "expected the typed dir-source-encrypted code, got: {err}"
+    );
+}
+
 // ── External oracle ─────────────────────────────────────────────────────────
 
 /// Write a synthesized image to a real file and ask the OS to mount it.
