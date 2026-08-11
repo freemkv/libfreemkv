@@ -1418,11 +1418,20 @@ mod registry_tests {
     /// straight from the disc's UDF directory records, with attacker-chosen
     /// name lengths to inflate each comparison.
     ///
-    /// Proof is by deadline. With the linear scan this fixture measures well
-    /// past the deadline; with a set it is milliseconds. Bounded so a
-    /// regression fails fast instead of hanging CI.
+    /// This is a HANG GUARD, and the name says so: a return to the linear scan
+    /// makes this fixture run for minutes (120 000² / 2 comparisons over a
+    /// 180-byte shared prefix), which without the deadline would wedge CI
+    /// rather than fail it. It is not a complexity proof — no assertion here
+    /// can distinguish `BTreeSet` from any other sub-quadratic dedup, and the
+    /// clock-free half of the claim (dedup, sort, directory exclusion) belongs
+    /// to `jar_inventory_dedups_sorts_and_skips_dirs` below.
+    ///
+    /// The deadline is a real margin, unlike the 6x one that made
+    /// `paramount.rs`'s wall-clock test flake under a loaded CI box: measured
+    /// at 0.14 s debug / 0.07 s release against 10 s, so ~70x. A shared CPU
+    /// does not close that; a quadratic dedup does not survive it.
     #[test]
-    fn jar_inventory_dedup_is_not_quadratic() {
+    fn jar_inventory_dedup_does_not_hang_on_a_hostile_directory() {
         const FILES: usize = 120_000;
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
