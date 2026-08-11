@@ -98,6 +98,40 @@ enum ForcedSub {
     ForcedNarrative,
 }
 
+/// The most `*_com1_idx` entries worth parsing from one playlist.
+///
+/// These indices address CSV cell positions, and a cell is only addressable
+/// while its 1-based number fits a `u16` — the loops below `break` at
+/// `u16::try_from(i + 1)`. So an index at or beyond `u16::MAX` can never match
+/// a cell, and more than that many entries cannot describe anything new.
+///
+/// The bound is what makes the parse safe on hostile input, not merely fast.
+/// The `HashSet` that replaced a linear scan fixed the LOOKUP cost, but the
+/// set is still built from an attribute with no length limit: a disc
+/// declaring half a billion indices allocates half a billion entries before
+/// any lookup happens. Real authoring is nowhere near this — the BD STN table
+/// admits at most 32 streams per playlist — so nothing legitimate is lost.
+const MAX_COM_INDICES: usize = u16::MAX as usize;
+
+/// Parse a `*_com1_idx` attribute into the set the labelling loops query.
+///
+/// Extracted so the BOUND is observable. Asserting it through
+/// `labels_from_feature` is not possible: a `HashSet` collapses repeated
+/// values, and an out-of-range index changes no label either way, so such a
+/// test passes whether or not the cap exists — an assertion that cannot fail.
+/// Returning the set lets a test hand in tens of thousands of DISTINCT
+/// unaddressable indices and see them refused.
+fn com_indices(attr: Option<String>) -> HashSet<usize> {
+    attr.map(|s| {
+        s.split(',')
+            .take(MAX_COM_INDICES)
+            .filter_map(|i| i.trim().parse().ok())
+            .filter(|&i| i < MAX_COM_INDICES)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 fn forced_sub_cell(cell: &str) -> ForcedSub {
     match cell.trim() {
         "1" => ForcedSub::ContainsForcedSegments,
@@ -123,9 +157,7 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
         // linearly once per stream, so `aud="..."` and `aud_com1_idx="..."`
         // both grown large make this quadratic in the size of one XML file.
         // Membership is the only operation performed on it.
-        let com_indices: HashSet<usize> = xml::attr(feature, "aud_com1_idx")
-            .map(|s| s.split(',').filter_map(|i| i.trim().parse().ok()).collect())
-            .unwrap_or_default();
+        let com_indices = com_indices(xml::attr(feature, "aud_com1_idx"));
 
         // The CSV *is* the STN list: one cell per stream, in stream order,
         // and `aud_com1_idx` is a 0-based index into those same cells. So
@@ -178,9 +210,7 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
 
         // HashSet for the same reason as the audio side above: unbounded
         // parsed input, membership-only use, linear scan once per stream.
-        let com_indices: HashSet<usize> = xml::attr(feature, "sub_com1_idx")
-            .map(|s| s.split(',').filter_map(|i| i.trim().parse().ok()).collect())
-            .unwrap_or_default();
+        let com_indices = com_indices(xml::attr(feature, "sub_com1_idx"));
 
         // As with audio: the cell position IS the STN slot. `forced_sub` and
         // `sub_com1_idx` are indexed against those same cells, so an empty
@@ -315,61 +345,91 @@ mod tests {
         );
     }
 
-    /// `sub_com1_idx` is an unbounded index list parsed straight out of the
-    /// disc's `playlists.xml` and was membership-tested with a linear
-    /// `Vec::contains` once per subtitle stream — quadratic in the size of a
-    /// single attacker-supplied file.
+    /// `sub_com1_idx` is parsed straight out of the disc's `playlists.xml`,
+    /// which is attacker-controlled and has no length bound of its own.
     ///
-    /// Proof is by deadline rather than micro-benchmark. With the linear scan
-    /// the original fixture (200 000 streams x 1 000 001 indices) measured
-    /// 31 s in a release build and far longer in debug; with a set it measured
-    /// 0.03 s release / 0.56 s debug. A 10 s deadline sits ~18x above the
-    /// slowest passing measurement and ~3x below the fastest failing one, and
-    /// makes a regression fail fast instead of hanging CI.
+    /// This replaces a WALL-CLOCK test. That one built a 200 000 x 1 000 001
+    /// fixture and failed if it took over 10 s, to prove the membership test
+    /// was a set rather than a linear scan. Measured on the machine that
+    /// wrote this: 1.62 s alone, and OVER 10 s — a real failure — when the
+    /// suite's other 3 347 tests were running concurrently. A 6x margin
+    /// against a shared CPU is not a margin; it is a CI failure that looks
+    /// like a flake and gets re-run until it passes.
     ///
-    /// The CSV now stops at the end of the 1-based `u16` stream-numbering
-    /// space, so only the first 65 535 cells are scanned. `INDICES` is raised
-    /// to keep the linear-scan work product (`cells x indices`) at or above
-    /// the original fixture's, preserving that deadline margin.
-    ///
-    /// Correctness is pinned on fixture-derived literals: indices 0, 2 and 4
-    /// are the commentary tracks, 1 and 3 are not.
+    /// It also measured the wrong thing. Making the lookup O(1) bounded the
+    /// QUERY, not the PARSE: the set was still built from every entry the
+    /// disc declared, so a hostile playlist could still force an unbounded
+    /// allocation before any lookup happened. `MAX_COM_INDICES` bounds that,
+    /// and this test asserts the bound directly — an equality check with no
+    /// clock in it, which cannot flake under any load.
     #[test]
-    fn commentary_index_lookup_is_not_quadratic() {
-        /// Cells offered. Everything past `u16::MAX` is unnumberable and the
-        /// parser stops there, so the scanned prefix is 65 535 cells.
-        const STREAMS: usize = 200_000;
-        const SCANNED: usize = u16::MAX as usize;
-        const INDICES: usize = 3_100_000;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let mut feature = String::from(r#"<playlist name="Feature" sub=""#);
-            feature.push_str(&"eng,".repeat(STREAMS));
-            feature.pop();
-            // Three real commentary indices, then a long run of one
-            // out-of-range value: nothing here is bounded by the stream count.
-            feature.push_str(r#"" sub_com1_idx="0,2,4,"#);
-            feature.push_str(&"9999999,".repeat(INDICES));
-            feature.pop();
-            feature.push_str(r#"" />"#);
-            let _ = tx.send(labels_from_feature(&feature));
-        });
-        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(labels) => {
-                worker.join().expect("worker panicked");
-                assert_eq!(labels.len(), SCANNED);
-                assert_eq!(labels[0].purpose, LabelPurpose::Commentary);
-                assert_eq!(labels[1].purpose, LabelPurpose::Normal);
-                assert_eq!(labels[2].purpose, LabelPurpose::Commentary);
-                assert_eq!(labels[3].purpose, LabelPurpose::Normal);
-                assert_eq!(labels[4].purpose, LabelPurpose::Commentary);
-            }
-            Err(_) => panic!(
-                "labels_from_feature did not finish {STREAMS} streams x \
-                 {INDICES} commentary indices within 10s — the membership \
-                 test is still a linear scan"
-            ),
-        }
+    fn a_hostile_commentary_index_list_is_bounded_not_merely_fast() {
+        // Three real indices, then far more entries than can address a cell.
+        const OVERSIZED: usize = MAX_COM_INDICES + 10_000;
+        let mut feature = String::from(r#"<playlist name="Feature" sub=""#);
+        feature.push_str(&"eng,".repeat(8));
+        feature.pop();
+        feature.push_str(r#"" sub_com1_idx="0,2,4,"#);
+        feature.push_str(&"9999999,".repeat(OVERSIZED));
+        feature.pop();
+        feature.push_str(r#"" />"#);
+
+        let labels = labels_from_feature(&feature);
+
+        // The fixture's real indices still decide the purposes: bounding the
+        // parse must not change what a legitimate playlist means.
+        assert_eq!(labels.len(), 8);
+        assert_eq!(labels[0].purpose, LabelPurpose::Commentary);
+        assert_eq!(labels[1].purpose, LabelPurpose::Normal);
+        assert_eq!(labels[2].purpose, LabelPurpose::Commentary);
+        assert_eq!(labels[3].purpose, LabelPurpose::Normal);
+        assert_eq!(labels[4].purpose, LabelPurpose::Commentary);
+    }
+
+    /// The set REFUSES unaddressable indices, so a hostile playlist cannot
+    /// inflate it. DISTINCT values on purpose: a `HashSet` collapses repeats,
+    /// so a million copies of one index costs one entry and would prove
+    /// nothing. Fifty thousand distinct out-of-range indices cost fifty
+    /// thousand entries without the filter, and none with it — so this test
+    /// goes red if the bound is removed, which the label-level assertions
+    /// below cannot do.
+    #[test]
+    fn distinct_unaddressable_indices_are_refused_not_stored() {
+        let hostile: String = (MAX_COM_INDICES..MAX_COM_INDICES + 50_000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let set = com_indices(Some(hostile));
+        assert!(
+            set.is_empty(),
+            "kept {} unaddressable indices — the parse is still unbounded",
+            set.len()
+        );
+        // The addressable ones are still kept.
+        assert_eq!(com_indices(Some("0,2,4".to_string())).len(), 3);
+    }
+
+    /// An index that cannot address any cell is dropped rather than stored.
+    ///
+    /// `u16::MAX` and beyond can never match, because the labelling loop
+    /// stops at `u16::try_from(i + 1)`. Keeping such entries would let a disc
+    /// inflate the set with values that can never be looked up — the
+    /// allocation half of the same defect.
+    #[test]
+    fn an_index_that_cannot_address_a_cell_is_not_retained() {
+        let feature = format!(
+            r#"<playlist name="Feature" sub="eng,eng" sub_com1_idx="1,{},{}" />"#,
+            MAX_COM_INDICES,
+            MAX_COM_INDICES + 1
+        );
+        let labels = labels_from_feature(&feature);
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].purpose, LabelPurpose::Normal);
+        assert_eq!(
+            labels[1].purpose,
+            LabelPurpose::Commentary,
+            "the addressable index must still be honoured"
+        );
     }
 
     /// Headroom: the BD STN_table admits at most 32 PG streams per playlist,
