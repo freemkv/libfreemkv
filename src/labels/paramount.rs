@@ -98,19 +98,29 @@ enum ForcedSub {
     ForcedNarrative,
 }
 
-/// The most `*_com1_idx` entries worth parsing from one playlist.
+/// The one number behind every cap in this parser: the highest CSV cell
+/// position that can ever be addressed.
 ///
-/// These indices address CSV cell positions, and a cell is only addressable
-/// while its 1-based number fits a `u16` — the loops below `break` at
-/// `u16::try_from(i + 1)`. So an index at or beyond `u16::MAX` can never match
-/// a cell, and more than that many entries cannot describe anything new.
+/// The labelling loops number cells 1-based into a `u16` and `break` at
+/// `u16::try_from(i + 1)`, so cell `MAX_COM_INDICES` and everything past it is
+/// never visited. Two different things are measured against that, and they are
+/// not the same bound:
 ///
-/// The bound is what makes the parse safe on hostile input, not merely fast.
-/// The `HashSet` that replaced a linear scan fixed the LOOKUP cost, but the
-/// set is still built from an attribute with no length limit: a disc
-/// declaring half a billion indices allocates half a billion entries before
-/// any lookup happens. Real authoring is nowhere near this — the BD STN table
-/// admits at most 32 streams per playlist — so nothing legitimate is lost.
+/// - **A VALUE at or beyond it cannot match any cell.** This is what caps the
+///   set: values are filtered before insertion, so at most `MAX_COM_INDICES`
+///   distinct entries can ever be stored, however long the attribute is. The
+///   `HashSet` that replaced a linear scan fixed the LOOKUP cost; this is what
+///   fixes the ALLOCATION, and a disc declaring half a billion indices no
+///   longer costs half a billion entries.
+/// - **A POSITION at or beyond it describes nothing new.** This caps the WORK,
+///   not the memory — the value filter already made the set small, but without
+///   it every one of those half a billion cells is still split and parsed. It
+///   is an early exit at the first position whose contents provably cannot
+///   matter, and it is why `forced_sub` — which holds no set at all, and so
+///   gets no protection from the value rule — is bounded too.
+///
+/// Real authoring is nowhere near either limit: the BD STN table admits at
+/// most 32 streams per playlist, so nothing legitimate is lost.
 const MAX_COM_INDICES: usize = u16::MAX as usize;
 
 /// Parse a `*_com1_idx` attribute into the set the labelling loops query.
@@ -127,6 +137,30 @@ fn com_indices(attr: Option<String>) -> HashSet<usize> {
             .take(MAX_COM_INDICES)
             .filter_map(|i| i.trim().parse().ok())
             .filter(|&i| i < MAX_COM_INDICES)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Parse the `forced_sub` attribute into the cell list the subtitle loop
+/// queries — the third attacker-controlled CSV in this file, and the last one
+/// that was still unbounded.
+///
+/// Bounded by POSITION, and it has no other choice: a `*_com1_idx` list holds
+/// values that can be filtered, and that filter is what caps its set, but a
+/// `forced_sub` cell is a classification of the position it sits at, so there
+/// is nothing to filter and nothing else would ever cap this. The Vec is read
+/// only as `forced.get(i)` from a loop that stops at `MAX_COM_INDICES`, so
+/// every cell past that is unreachable by construction.
+///
+/// Extracted, like [`com_indices`], so the bound is OBSERVABLE. Through
+/// `labels_from_feature` it is not: the subtitle loop cannot reach those cells
+/// either, so a label-level assertion passes whether or not the cap exists.
+fn forced_subs(attr: Option<String>) -> Vec<ForcedSub> {
+    attr.map(|s| {
+        s.split(',')
+            .take(MAX_COM_INDICES)
+            .map(forced_sub_cell)
             .collect()
     })
     .unwrap_or_default()
@@ -204,9 +238,7 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
 
     // Parse subtitle streams
     if let Some(sub) = xml::attr(feature, "sub") {
-        let forced: Vec<ForcedSub> = xml::attr(feature, "forced_sub")
-            .map(|s| s.split(',').map(forced_sub_cell).collect())
-            .unwrap_or_default();
+        let forced = forced_subs(xml::attr(feature, "forced_sub"));
 
         // HashSet for the same reason as the audio side above: unbounded
         // parsed input, membership-only use, linear scan once per stream.
@@ -416,6 +448,41 @@ mod tests {
         );
         // The addressable ones are still kept.
         assert_eq!(com_indices(Some("0,2,4".to_string())).len(), 3);
+    }
+
+    /// `forced_sub` is bounded too — the third CSV in the same function, and
+    /// the one that had no value filter to hide behind.
+    ///
+    /// Read through `forced_subs` rather than through the labels for the same
+    /// reason the two tests above read the set: the subtitle loop stops at
+    /// `MAX_COM_INDICES`, so a label-level assertion cannot tell a bounded
+    /// parse from an unbounded one.
+    #[test]
+    fn forced_sub_cells_past_the_last_addressable_one_are_not_parsed() {
+        let hostile = "0,".repeat(MAX_COM_INDICES + 50_000);
+        let cells = forced_subs(Some(hostile));
+        assert_eq!(
+            cells.len(),
+            MAX_COM_INDICES,
+            "parsed {} cells — the forced_sub parse is still unbounded",
+            cells.len()
+        );
+    }
+
+    /// Bounding it must not change what a legitimate playlist means: the
+    /// cells that CAN address a stream still classify exactly as before.
+    #[test]
+    fn bounding_forced_sub_leaves_the_addressable_cells_alone() {
+        let cells = forced_subs(Some("0,1,3,2".to_string()));
+        assert_eq!(
+            cells,
+            vec![
+                ForcedSub::None,
+                ForcedSub::ContainsForcedSegments,
+                ForcedSub::ForcedNarrative,
+                ForcedSub::ForcedNarrative,
+            ]
+        );
     }
 
     /// An index that cannot address any cell is dropped rather than STORED.
