@@ -359,11 +359,20 @@ mod tests {
     /// It also measured the wrong thing. Making the lookup O(1) bounded the
     /// QUERY, not the PARSE: the set was still built from every entry the
     /// disc declared, so a hostile playlist could still force an unbounded
-    /// allocation before any lookup happened. `MAX_COM_INDICES` bounds that,
-    /// and this test asserts the bound directly — an equality check with no
-    /// clock in it, which cannot flake under any load.
+    /// allocation before any lookup happened. `MAX_COM_INDICES` bounds that.
+    ///
+    /// What THIS test guards is that bounding did not change what a
+    /// legitimate playlist MEANS: it goes red if the bound is set too LOW
+    /// (verified at 2 — the real indices `0,2,4` stop resolving and the
+    /// purposes change). It does NOT go red if the bound is deleted
+    /// entirely, because the out-of-range filler is unobservable at the
+    /// label level and a `HashSet` collapses the repeats. Enforcement is
+    /// proven separately, by
+    /// `distinct_unaddressable_indices_are_refused_not_stored`, which reads
+    /// the set itself. Two tests, two properties; neither pretends to the
+    /// other's job.
     #[test]
-    fn a_hostile_commentary_index_list_is_bounded_not_merely_fast() {
+    fn bounding_the_parse_does_not_change_a_legitimate_playlist() {
         // Three real indices, then far more entries than can address a cell.
         const OVERSIZED: usize = MAX_COM_INDICES + 10_000;
         let mut feature = String::from(r#"<playlist name="Feature" sub=""#);
@@ -409,27 +418,25 @@ mod tests {
         assert_eq!(com_indices(Some("0,2,4".to_string())).len(), 3);
     }
 
-    /// An index that cannot address any cell is dropped rather than stored.
+    /// An index that cannot address any cell is dropped rather than STORED.
     ///
-    /// `u16::MAX` and beyond can never match, because the labelling loop
-    /// stops at `u16::try_from(i + 1)`. Keeping such entries would let a disc
-    /// inflate the set with values that can never be looked up — the
-    /// allocation half of the same defect.
+    /// Asserted through `com_indices`, not through the labels: the labelling
+    /// loop never queries a cell position that high, so at the label level
+    /// retaining the value is unobservable and the assertion could not fail.
+    /// Reading the set is what makes the claim checkable.
     #[test]
-    fn an_index_that_cannot_address_a_cell_is_not_retained() {
-        let feature = format!(
-            r#"<playlist name="Feature" sub="eng,eng" sub_com1_idx="1,{},{}" />"#,
+    fn an_index_that_cannot_address_any_cell_is_not_retained() {
+        let set = com_indices(Some(format!(
+            "1,{},{}",
             MAX_COM_INDICES,
             MAX_COM_INDICES + 1
-        );
-        let labels = labels_from_feature(&feature);
-        assert_eq!(labels.len(), 2);
-        assert_eq!(labels[0].purpose, LabelPurpose::Normal);
+        )));
         assert_eq!(
-            labels[1].purpose,
-            LabelPurpose::Commentary,
-            "the addressable index must still be honoured"
+            set.len(),
+            1,
+            "only the addressable index belongs in the set, got {set:?}"
         );
+        assert!(set.contains(&1));
     }
 
     /// Headroom: the BD STN_table admits at most 32 PG streams per playlist,
