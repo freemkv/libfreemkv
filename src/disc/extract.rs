@@ -254,7 +254,7 @@ impl Disc {
                     let key = match vts_keys.get(&vts) {
                         Some(k) => k.clone(),
                         None => {
-                            let k = self.resolve_vts_key(&vts, &planned, &mut dec, &base_keys);
+                            let k = self.resolve_vts_key(&vts, &planned, &mut dec, &base_keys)?;
                             vts_keys.insert(vts.clone(), k.clone());
                             k
                         }
@@ -291,13 +291,24 @@ impl Disc {
     /// VOB extents (keyless Stevenson attack). The disc-wide key is reused when
     /// it already covers this VTS (single-VTS discs, or this VTS's span). The
     /// reader is borrowed from the decrypting decorator (its inner source).
+    ///
+    /// FALLIBLE, because the three outcomes of a crack are not two.
+    /// [`crate::css::CrackOutcome`] exists precisely to separate "no scrambled
+    /// sector was seen, so there is nothing to decrypt" from "scrambled sectors
+    /// were seen and no key came out", and its doc says callers MUST surface
+    /// the second as a hard error. This function used the `Option`-returning
+    /// `crack_key`, which collapses both into `None`, and then fell back to the
+    /// disc-wide key — descrambling this VTS with ANOTHER VTS's title key. The
+    /// hazard is described in the ordering note below, which was written about
+    /// the same fallback; ordering makes the crack far more likely to succeed,
+    /// but it cannot make a failed crack safe.
     fn resolve_vts_key<S: SectorSource>(
         &self,
         vts: &str,
         planned: &[PlannedFile],
         dec: &mut DecryptingSectorSource<S>,
         base_keys: &DecryptKeys,
-    ) -> DecryptKeys {
+    ) -> Result<DecryptKeys> {
         // Gather the title VOB extents for this VTS (VTS_xx_1.VOB .. _9.VOB;
         // VTS_xx_0.VOB is the menu and is clear, so excluded from the crack).
         // Gather this VTS's title VOBs BY NAME, ascending.
@@ -336,7 +347,7 @@ impl Disc {
             }
         }
         if extents.is_empty() {
-            return base_keys.clone();
+            return Ok(base_keys.clone());
         }
         // PLAYBACK ORDER — do NOT sort. This is the 1.5.1 garbage bug, and it
         // grew back here in a new code path: the comment this replaced said it
@@ -358,11 +369,20 @@ impl Disc {
         // in file order, which together is playback order for a DVD title set.
         // Crack against the raw (still-scrambled) inner reader, NOT the
         // decrypting view — `crack_key` runs the descrambler itself.
-        match crate::css::crack_key(dec.inner_mut(), &extents, 64) {
-            Some(state) => DecryptKeys::Css {
+        match crate::css::crack_key_outcome(dec.inner_mut(), &extents, 64, None) {
+            crate::css::CrackOutcome::Cracked(state) => Ok(DecryptKeys::Css {
                 title_key: state.title_key,
-            },
-            None => base_keys.clone(),
+            }),
+            // No scrambled sector anywhere in this VTS: the content is clear,
+            // and any key descrambles it as a no-op. The disc-wide key is the
+            // right answer, and this is the ONLY case that ever was.
+            crate::css::CrackOutcome::Unencrypted => Ok(base_keys.clone()),
+            // Scrambled sectors WERE seen and no key came out. Reusing the
+            // disc-wide key here writes corrupt PES behind an intact header and
+            // reports a complete extract at exit 0. Skippable per title, which
+            // is why this is the per-title code and not the disc-level one — a
+            // sibling VTS may still crack.
+            crate::css::CrackOutcome::ScrambledUncracked => Err(Error::CssKeyMissing),
         }
     }
 }
@@ -1916,6 +1936,87 @@ mod tests {
             "VTS_02 must descramble under its OWN cracked key, not VTS_01's"
         );
         assert!(res.complete);
+    }
+
+    /// A VTS that IS scrambled but whose key could not be recovered must
+    /// FAIL, not borrow another VTS's key.
+    ///
+    /// `crack_key` returns `Option`, which collapses "no scrambled sector was
+    /// seen" with "scrambled sectors were seen and no key came out"; the
+    /// fallback then descrambled this VTS under the disc-wide key and
+    /// `extract_tree` reported `complete = true` at exit 0, because no read had
+    /// failed. `CrackOutcome` exists to keep those two apart, and every sibling
+    /// path in the crate already honours it.
+    ///
+    /// The fixture: VTS_01 is crackable, VTS_02 is scrambled with NO periodic
+    /// crib, so its crack genuinely fails.
+    #[test]
+    fn a_scrambled_vts_that_cannot_be_cracked_fails_instead_of_borrowing_a_key() {
+        let key_1 = [0x10u8, 0x20, 0x30, 0x40, 0x50];
+        let (_plain_1, scrambled_1) = {
+            let seed = [0x11u8, 0x22, 0x33, 0x44, 0x01];
+            let mut plain = vec![0u8; 2048];
+            plain[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+            plain[0x14] = 0x10;
+            let pat: Vec<u8> = (0..8)
+                .map(|k| (0xA0u8.wrapping_add(k as u8) ^ 0x01) ^ 0x5A)
+                .collect();
+            for (i, b) in plain.iter_mut().enumerate().skip(0x59) {
+                *b = pat[i % 8];
+            }
+            plain[0x54..0x59].copy_from_slice(&seed);
+            let mut scrambled = plain.clone();
+            lfsr::scramble_sector(&key_1, &mut scrambled);
+            (plain, scrambled)
+        };
+        // Scrambled — the pack header and the 0x14 flag are set, so the scan
+        // SEES ciphertext — but the cleartext region carries no periodic run,
+        // so the Stevenson crib never forms and no key is recoverable.
+        let uncrackable = {
+            let mut sect = vec![0u8; 2048];
+            sect[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+            sect[0x14] = 0x10;
+            for (i, b) in sect.iter_mut().enumerate().skip(0x59) {
+                // Non-repeating, so no run of any period survives to 0x80.
+                *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+            }
+            sect
+        };
+
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: vec![
+                    file("VTS_01_1.VOB", 30, 5000, scrambled_1, false),
+                    file("VTS_02_1.VOB", 32, 6000, uncrackable, false),
+                ],
+                subdirs: vec![],
+            }],
+        };
+        let mut disc = build_disc(root);
+        let out = TmpDir::new("css_uncrackable_vts");
+        let mut d = clear_disc();
+        d.content_format = crate::disc::ContentFormat::MpegPs;
+        d.css = Some(crate::css::CssState {
+            title_key: [0xFFu8; 5],
+            crack_span: None,
+        });
+        let err = d
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect_err(
+                "a VTS whose key could not be recovered must be a hard error, \
+                 not a silent extract under another VTS's key",
+            );
+        assert!(
+            matches!(err, Error::CssKeyMissing),
+            "expected CssKeyMissing, got {err:?}"
+        );
     }
 
     /// `Borrowed` is a thin forwarding wrapper the decrypting decorator uses

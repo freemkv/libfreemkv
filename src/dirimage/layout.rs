@@ -67,6 +67,15 @@ const MAX_SUBDIRS: usize = (u16::MAX - 1) as usize;
 #[cfg(test)]
 const MAX_SUBDIRS: usize = 4;
 
+/// One entry per child plus the parent's own must still fit the 16-bit field.
+///
+/// At MODULE scope, and it has to be. This assertion previously sat inside
+/// `mod tests`, which is `#[cfg(test)]`, while carrying `#[cfg(not(test))]`
+/// itself — so it was compiled in NO configuration and could never fire, which
+/// made it exactly the dead gate the test above it was written to replace.
+#[cfg(not(test))]
+const _: () = assert!(MAX_SUBDIRS + 1 == u16::MAX as usize);
+
 /// Largest image this planner will synthesize, in sectors (128 GiB).
 ///
 /// A DVD title set records where its VOBS begins as an offset in its own IFO,
@@ -997,11 +1006,6 @@ mod tests {
             matches!(err, Error::DirImageFanout { .. }),
             "expected DirImageFanout, got {err:?}"
         );
-
-        // And the real production value is what ships: one per child plus the
-        // parent's own entry must still fit in the 16-bit field.
-        #[cfg(not(test))]
-        const _: () = assert!(MAX_SUBDIRS + 1 == u16::MAX as usize);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

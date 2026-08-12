@@ -738,6 +738,11 @@ mod tests {
         /// instead of the uniform `flag_byte` fill. Lets the scan actually
         /// reach `CrackOutcome::Cracked` from a synthetic ISO.
         crackable: Option<(u32, Vec<u8>)>,
+        /// Sectors actually filled per batch, however many were asked for —
+        /// the SHORT READ a `recovery: true` source is allowed to return over
+        /// a damaged region. `Some(0)` is the degenerate case that must not
+        /// spin the scan.
+        short_read: Option<usize>,
     }
 
     impl MockSource {
@@ -748,6 +753,7 @@ mod tests {
                 fail_all: false,
                 lock_all: false,
                 crackable: None,
+                short_read: None,
             }
         }
     }
@@ -798,14 +804,19 @@ mod tests {
             if self.fail_all {
                 return Err(Error::DecryptFailed);
             }
-            let n = count as usize * 2048;
+            // A short read fills, and reports, fewer sectors than asked.
+            let filled = match self.short_read {
+                Some(k) => (k as u16).min(count),
+                None => count,
+            };
+            let n = filled as usize * 2048;
             let end = n.min(buf.len());
             for b in buf[..end].iter_mut() {
                 *b = 0;
             }
             // Fill each sector in the batch with the uniform flag byte, EXCEPT a
             // designated crackable LBA which gets the full synthetic sector.
-            for s in 0..count as u32 {
+            for s in 0..filled as u32 {
                 let sect_lba = lba + s;
                 let base = s as usize * 2048;
                 if base + 2048 > end {
@@ -828,6 +839,60 @@ mod tests {
             }
             Ok(n)
         }
+    }
+
+    // ── Short reads: the branch nothing exercised ─────────────────────────
+    //
+    // `crack_key_scan` passes `recovery = true`, which is precisely the mode
+    // where a `SectorSource` may return Ok with fewer bytes than asked. Every
+    // source in this module returned the full request, so `usable`, `advance`
+    // and the `.max(1)` anti-spin guard were dead code under test: reverting
+    // `advance` to `n`, or dropping the `.max(1)`, left the whole suite green.
+
+    /// A short batch is RE-READ from where it stopped, not skipped. Skipping
+    /// would quietly shrink the crack's coverage on exactly the damaged media
+    /// where a key is hardest to find.
+    #[test]
+    fn a_short_read_resumes_from_where_it_stopped() {
+        let mut src = MockSource::new(0x00);
+        src.short_read = Some(1);
+        let ext = [crate::disc::Extent {
+            start_lba: 100,
+            sector_count: 4,
+        }];
+        let _ = crack_key_scan(&mut src, &ext, 4, None, false);
+        let reads = src.reads.borrow().clone();
+        assert_eq!(
+            reads,
+            vec![100, 101, 102, 103],
+            "a source that filled one sector per batch must be asked for the \
+             next one, not advanced a whole batch past it"
+        );
+    }
+
+    /// A source that reads NOTHING must terminate. Without the `.max(1)` the
+    /// cursor never moves and `tried` never increments — the budget cannot end
+    /// the loop, so the scan spins forever inside a library whose whole job is
+    /// surviving hostile input.
+    #[test]
+    fn a_source_that_returns_zero_sectors_terminates() {
+        let mut src = MockSource::new(0x00);
+        src.short_read = Some(0);
+        let ext = [crate::disc::Extent {
+            start_lba: 0,
+            sector_count: 8,
+        }];
+        let outcome = crack_key_scan(&mut src, &ext, 4, None, false);
+        assert!(
+            matches!(outcome, CrackOutcome::Unencrypted),
+            "nothing was read, so nothing scrambled was seen"
+        );
+        assert!(
+            src.reads.borrow().len() <= 8,
+            "the cursor must advance even on an empty read; got {} reads over \
+             an 8-sector extent",
+            src.reads.borrow().len()
+        );
     }
 
     /// crack_key caps total scanned sectors at 50_000 even when extents are
