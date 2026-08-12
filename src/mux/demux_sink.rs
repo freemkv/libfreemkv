@@ -637,10 +637,18 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// Replace path-hostile characters in a filename component.
+///
+/// Control characters included, NUL above all. Every string this touches is
+/// disc bytes, and a language code is three raw STN bytes run through
+/// `from_utf8_lossy` with no validation — `00 00 00` is the ordinary
+/// "undefined" encoding on real Blu-rays. A NUL in a path aborts `File::create`
+/// with `InvalidInput`, which took the whole demux export down before a single
+/// track file was opened.
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
             _ => c,
         })
         .collect()
@@ -787,8 +795,11 @@ impl DemuxSink {
             Naming::Pid => format!("{} {:04x}", sanitize(&opts.base), pid),
             Naming::Friendly => {
                 let mut parts = vec![sanitize(&opts.base), format!("t{idx:02}")];
+                // The language is disc bytes too, and got none of the
+                // treatment `opts.base` two lines up already had.
+                let lang = sanitize(lang);
                 if !lang.is_empty() {
-                    parts.push(lang.to_string());
+                    parts.push(lang);
                 }
                 parts.push(codec_label(codec).to_string());
                 parts.join(" ")
@@ -986,6 +997,52 @@ mod tests {
         AudioChannels, AudioStream, ColorSpace, ContentFormat, FrameRate, HdrFormat, LabelPurpose,
         Resolution, SampleRate, VideoStream,
     };
+
+    // ── The language component is disc bytes ──────────────────────────────
+    //
+    // `opts.base` was sanitised and the language beside it was not, though a
+    // language code is three raw STN bytes run through `from_utf8_lossy` with
+    // no validation. `00 00 00` is the ordinary "undefined" encoding on real
+    // Blu-rays, and a NUL in a path fails `File::create` with `InvalidInput` —
+    // which aborted the whole export before a single track file was opened.
+
+    /// The stem stays one usable filename component whatever the disc says.
+    #[test]
+    fn a_hostile_language_code_cannot_break_the_output_filename() {
+        let opts = DemuxOptions {
+            base: "Movie".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(opts.naming, Naming::Friendly), "default naming");
+
+        for lang in ["\u{0}\u{0}\u{0}", "a/b", "..", "a\nb", "e:s"] {
+            let stem = DemuxSink::stem_for(&opts, 1, 0x1100, lang, Codec::Ac3);
+            assert!(
+                !stem.chars().any(|c| c.is_control()),
+                "control character survived into the filename for {lang:?}: {stem:?}"
+            );
+            assert!(
+                !stem.contains('/') && !stem.contains('\\') && !stem.contains(':'),
+                "a path separator survived for {lang:?}: {stem:?}"
+            );
+            assert!(
+                std::path::Path::new(&stem).components().count() == 1,
+                "the stem must stay ONE component for {lang:?}: {stem:?}"
+            );
+        }
+    }
+
+    /// A legitimate language is still carried through untouched — the
+    /// sanitiser must not be so lossy that it stops naming the track.
+    #[test]
+    fn an_ordinary_language_code_survives_sanitising() {
+        let opts = DemuxOptions {
+            base: "Movie".to_string(),
+            ..Default::default()
+        };
+        let stem = DemuxSink::stem_for(&opts, 1, 0x1100, "eng", Codec::Ac3);
+        assert!(stem.contains("eng"), "got {stem:?}");
+    }
 
     fn video_stream(codec: Codec) -> DiscStream {
         DiscStream::Video(VideoStream {
