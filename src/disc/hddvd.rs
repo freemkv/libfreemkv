@@ -392,6 +392,28 @@ fn evo_from_src(src: &str) -> Option<String> {
 /// trivially stack-safe.
 const MAX_XPL_DEPTH: usize = 32;
 
+/// Most `<Title>` elements one playlist may declare.
+///
+/// The depth guard above bounds NESTING; this bounds BREADTH, and they are
+/// separate attacks. A flat playlist passes the depth check trivially and can
+/// still declare a title per 51 bytes, so a 64 MiB `VPLST000.XPL` — exactly
+/// `udf::MAX_FILE_BYTES` — reaches ~1.3 million of them.
+///
+/// That matters here and not on the Blu-ray side because of where the count
+/// comes from: `bluray.rs` learns its playlists from the MPLS files actually
+/// present in the UDF directory, so the medium bounds it. An XPL DECLARES its
+/// titles, so nothing does.
+///
+/// The cost is not memory but drive time. `compose_xpl_titles` runs
+/// `probe_evo_streams` once per title, and each probe reads real sectors — so
+/// an uncapped count turns a `Disc::scan()` the operator expects to take
+/// seconds into tens of terabytes of optical reads on a disc that is only
+/// pretending to be large.
+///
+/// 4096 is far above any real disc (retail HD-DVDs carry tens of titles) and
+/// still bounds the probe work to something a scan can absorb.
+const MAX_XPL_TITLES: usize = 4096;
+
 /// Reject a disc-supplied XML blob whose element nesting exceeds `MAX_XPL_DEPTH`,
 /// BEFORE it reaches the parser. `roxmltree` is recursive-descent and its
 /// depth-10 limit applies only to ENTITY expansion, so element nesting is
@@ -492,7 +514,11 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
         .unwrap_or(60);
 
     let mut titles = Vec::new();
-    for tnode in doc.descendants().filter(|n| local(n, "Title")) {
+    for tnode in doc
+        .descendants()
+        .filter(|n| local(n, "Title"))
+        .take(MAX_XPL_TITLES)
+    {
         let number = tnode
             .attribute("titleNumber")
             .and_then(|s| s.trim().parse::<u16>().ok())
@@ -1444,6 +1470,51 @@ mod tests {
     /// XML, far under the read cap. The correct outcome is the same as any other
     /// unusable playlist: an empty `Vec`, so the caller falls back to the
     /// clip-name heuristic.
+    /// BREADTH, not depth: a flat playlist passes the nesting guard trivially
+    /// and can still declare a title per ~51 bytes, so a 64 MiB XPL (exactly
+    /// `udf::MAX_FILE_BYTES`) reaches ~1.3 million of them.
+    ///
+    /// The cost is drive time, not memory: `compose_xpl_titles` runs
+    /// `probe_evo_streams` once per title and each probe reads real sectors,
+    /// so an uncapped count turns a scan the operator expects to take seconds
+    /// into tens of terabytes of optical reads. `bluray.rs` is not exposed to
+    /// this because its playlist count comes from the MPLS files present in
+    /// the UDF directory; an XPL DECLARES its titles, so nothing bounds them.
+    ///
+    /// Mutation: delete the `.take(MAX_XPL_TITLES)` and this goes red at the
+    /// declared count.
+    #[test]
+    fn parse_xpl_titles_caps_a_playlist_declaring_absurdly_many_titles() {
+        const DECLARED: usize = MAX_XPL_TITLES + 500;
+        let mut xpl = String::with_capacity(DECLARED * 56 + 128);
+        xpl.push_str(r#"<?xml version="1.0" encoding="utf-8"?><Playlist><TitleSet>"#);
+        for _ in 0..DECLARED {
+            xpl.push_str(r#"<Title><PrimaryAudioVideoClip src="A.EVO"/></Title>"#);
+        }
+        xpl.push_str("</TitleSet></Playlist>");
+
+        let titles = parse_xpl_titles(xpl.as_bytes());
+        assert_eq!(
+            titles.len(),
+            MAX_XPL_TITLES,
+            "a playlist declaring {DECLARED} titles must be capped at \
+             {MAX_XPL_TITLES}; each surviving title costs a real probe_evo_streams \
+             pass over the medium"
+        );
+    }
+
+    /// The control: a realistic playlist keeps every title it declares.
+    #[test]
+    fn parse_xpl_titles_keeps_every_title_of_a_realistic_playlist() {
+        let titles = parse_xpl_titles(SYNTH_XPL.as_bytes());
+        assert!(
+            !titles.is_empty() && titles.len() < MAX_XPL_TITLES,
+            "the synthetic real-world playlist must survive the cap untouched, \
+             got {} titles",
+            titles.len()
+        );
+    }
+
     #[test]
     fn parse_xpl_titles_refuses_deeply_nested_playlist() {
         const DEPTH: usize = 50_000;

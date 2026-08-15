@@ -2187,7 +2187,9 @@ impl Disc {
     /// **Sort priority (titles[0] = most likely main feature):**
     /// 1. Real titles (`size_bytes ≤ capacity_bytes`) before virtual
     ///    composites. The capacity check is a hard "physically
-    ///    possible data on this disc" gate.
+    ///    possible data on this disc" gate. `capacity_bytes == 0` means
+    ///    the capacity is UNKNOWN (READ CAPACITY failed), so the gate is
+    ///    skipped entirely rather than demoting every real title.
     /// 2. Among real titles, LARGEST physical size first — the main
     ///    feature is the biggest real title on the disc. (This replaced
     ///    the old clip-count ordering, which mis-ranked chapter-per-clip
@@ -2249,8 +2251,18 @@ impl Disc {
         // A title bigger than the whole disc is a "play-all" composite artifact
         // (its declared size double-counts clips shared with other playlists) —
         // demote it below any real single title.
-        let a_oversize = a.size_bytes > capacity_bytes;
-        let b_oversize = b.size_bytes > capacity_bytes;
+        //
+        // `capacity_bytes == 0` means the capacity is UNKNOWN, not that the
+        // disc holds nothing: `read_udf` substitutes 0 when READ CAPACITY
+        // fails and scans on regardless. Applied literally the gate would
+        // INVERT there — every real title (`size_bytes > 0`) would be
+        // "oversize" and demoted, while a CLPI-less `size_bytes == 0` title
+        // would not, landing at `titles[0]` ahead of the feature. With no
+        // capacity to compare against, the gate is inert and the size /
+        // duration / audio keys decide the order on their own.
+        let capacity_known = capacity_bytes > 0;
+        let a_oversize = capacity_known && a.size_bytes > capacity_bytes;
+        let b_oversize = capacity_known && b.size_bytes > capacity_bytes;
         a_oversize
             .cmp(&b_oversize)
             // PRIMARY: largest physical size = the main feature. Robust where
@@ -6814,6 +6826,55 @@ mod tests {
         assert_eq!(
             Disc::canonical_title_order(&exact, &smaller, CAP),
             Ordering::Less
+        );
+    }
+
+    /// `capacity_bytes == 0` means the disc capacity is UNKNOWN — `read_udf`
+    /// substitutes 0 when READ CAPACITY fails (transient spin-up, SCSI error)
+    /// and proceeds with the scan. It does NOT mean "the disc holds nothing".
+    ///
+    /// With a literal reading of the gate, 0 inverts it: EVERY real title is
+    /// `size_bytes > 0` and therefore "oversize", while a title with no CLPI
+    /// (`size_bytes == 0`) is not — so the empty title sorts to `titles[0]`
+    /// ahead of the feature and `freemkv -t 1` rips garbage. The gate must be
+    /// INERT when the capacity is unknown.
+    #[test]
+    fn canonical_order_unknown_capacity_does_not_demote_every_real_title() {
+        const UNKNOWN: u64 = 0; // READ CAPACITY failed
+        let feature = title_with("00800.mpls", 7_320.0, 57_200_000_000, 1);
+        // A playlist whose CLPI files are missing/unparseable: no declared size.
+        let sizeless = title_with("00001.mpls", 120.0, 0, 1);
+        let mut titles = [sizeless, feature];
+        titles.sort_by(|a, b| Disc::canonical_title_order(a, b, UNKNOWN));
+        assert_eq!(
+            titles[0].playlist, "00800.mpls",
+            "with an UNKNOWN capacity the real feature must still sort first; \
+             a size-0 title must not be promoted ahead of it"
+        );
+        assert_eq!(titles[1].playlist, "00001.mpls");
+    }
+
+    /// Control for [`canonical_order_unknown_capacity_does_not_demote_every_real_title`]:
+    /// making the gate inert on an UNKNOWN capacity must not make it dead. With
+    /// a KNOWN capacity a genuinely oversize play-all composite is still demoted
+    /// below a smaller real title — even though "largest size first" would
+    /// otherwise rank it first. Asserted on the comparator in both argument
+    /// orders so an inconsistent comparator cannot pass.
+    #[test]
+    fn canonical_order_known_capacity_still_demotes_a_genuinely_oversize_title() {
+        use std::cmp::Ordering;
+        const CAP: u64 = 58_500_000_000;
+        let composite = title_with("00020.mpls", 15_180.0, 92_400_000_000, 253);
+        let real = title_with("00800.mpls", 7_320.0, 57_200_000_000, 1);
+        assert_eq!(
+            Disc::canonical_title_order(&real, &composite, CAP),
+            Ordering::Less,
+            "a known capacity must still demote the oversize composite"
+        );
+        assert_eq!(
+            Disc::canonical_title_order(&composite, &real, CAP),
+            Ordering::Greater,
+            "…in either argument order"
         );
     }
 
