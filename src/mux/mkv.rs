@@ -3307,6 +3307,120 @@ mod tests {
         );
     }
 
+    /// Read back the value of the FIRST `Language` element in `data` as a
+    /// UTF-8 string. `LANGUAGE` (0x22B59C) is a 3-byte EBML ID; its size is
+    /// always a 1-byte VINT for the short strings this writer emits.
+    fn first_language_value(data: &[u8]) -> &str {
+        let pos = find_id(data, ebml::LANGUAGE).expect("Language element must be present");
+        let len = (data[pos + 3] & 0x7F) as usize;
+        std::str::from_utf8(&data[pos + 4..pos + 4 + len]).unwrap()
+    }
+
+    /// RFC 9559 §12 / the Matroska `Language` element spec restrict the
+    /// legacy `Language` element to the Matroska language form (ISO 639-2,
+    /// three lowercase letters), never ISO 639-1 (two letters). The DVD
+    /// IFO audio-attribute block itself carries a raw ISO 639-1 code (e.g.
+    /// "en") on disc — `ifo::parse_audio_attr` converts it to ISO 639-2
+    /// before returning, via `ifo::dvd_lang_to_iso639_2`. This mimics the
+    /// real DVD pipeline (`disc/dvd.rs`'s `Stream::Audio` construction) end
+    /// to end: real on-disc IFO bytes -> `ifo::parse_audio_attr` ->
+    /// `disc::AudioStream` -> `MkvTrack::audio` -> the muxer -> the emitted
+    /// `Language` element.
+    #[test]
+    fn dvd_two_letter_language_becomes_iso_639_2_in_language_element() {
+        // AC-3 (coding_mode=0), 48 kHz, 6 channels, on-disc language "en" —
+        // the exact byte layout `ifo::audio_attr_parsing` pins.
+        let mut attr_bytes = vec![0u8; 8];
+        attr_bytes[0] = 0x00;
+        attr_bytes[1] = 0x05;
+        attr_bytes[2] = b'e';
+        attr_bytes[3] = b'n';
+        let attr = crate::ifo::parse_audio_attr(&attr_bytes, 0).unwrap();
+        assert_eq!(
+            attr.language, "eng",
+            "parse_audio_attr must already return the ISO 639-2 form"
+        );
+
+        let audio_stream = crate::disc::AudioStream {
+            pid: 0xBD80,
+            codec: attr.codec,
+            channels: crate::disc::AudioChannels::from_count(attr.channels),
+            language: attr.language,
+            sample_rate: crate::disc::SampleRate::from_hz(attr.sample_rate),
+            secondary: false,
+            purpose: crate::disc::LabelPurpose::Normal,
+            label: String::new(),
+        };
+        let track = MkvTrack::audio(&audio_stream);
+
+        let buf = Cursor::new(Vec::new());
+        let tracks = [track];
+        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+
+        assert_eq!(
+            first_language_value(&data),
+            "eng",
+            "a DVD-sourced ISO 639-1 code must be written as its ISO 639-2 \
+             equivalent in the Matroska Language element, per RFC 9559 §12"
+        );
+    }
+
+    /// An unmapped or absent DVD language code (bytes 0x00 0x00 in the IFO
+    /// attribute block) must degrade to the valid Matroska "undetermined"
+    /// code `und`, never to an empty string or a raw 2-letter code — both of
+    /// which violate the Matroska language form.
+    #[test]
+    fn dvd_unmapped_or_empty_language_becomes_und_in_language_element() {
+        // Empty IFO language bytes (0x00 0x00).
+        let mut empty_bytes = vec![0u8; 8];
+        empty_bytes[0] = 0x00; // AC-3, 48k
+        empty_bytes[1] = 0x05; // 6ch
+        let empty_attr = crate::ifo::parse_audio_attr(&empty_bytes, 0).unwrap();
+        assert_eq!(
+            empty_attr.language, "und",
+            "IFO zero bytes (unspecified) must resolve to 'und', not empty"
+        );
+
+        // An IFO code with no known ISO 639-1 -> 639-2 mapping (e.g. a
+        // fictitious "zz").
+        let mut unmapped_bytes = vec![0u8; 8];
+        unmapped_bytes[0] = 0x00;
+        unmapped_bytes[1] = 0x05;
+        unmapped_bytes[2] = b'z';
+        unmapped_bytes[3] = b'z';
+        let unmapped_attr = crate::ifo::parse_audio_attr(&unmapped_bytes, 0).unwrap();
+        assert_eq!(
+            unmapped_attr.language, "und",
+            "an on-disc code with no known ISO 639-1 -> 639-2 mapping must \
+             degrade to 'und', never pass through raw"
+        );
+
+        for attr in [empty_attr, unmapped_attr] {
+            let audio_stream = crate::disc::AudioStream {
+                pid: 0xBD80,
+                codec: attr.codec,
+                channels: crate::disc::AudioChannels::from_count(attr.channels),
+                language: attr.language,
+                sample_rate: crate::disc::SampleRate::from_hz(attr.sample_rate),
+                secondary: false,
+                purpose: crate::disc::LabelPurpose::Normal,
+                label: String::new(),
+            };
+            let track = MkvTrack::audio(&audio_stream);
+            let buf = Cursor::new(Vec::new());
+            let tracks = [track];
+            let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
+            let data = muxer.writer.into_inner();
+            assert_eq!(
+                first_language_value(&data),
+                "und",
+                "an empty or unmapped DVD language code must degrade to 'und', \
+                 never an empty string or an invalid ISO 639-1 code"
+            );
+        }
+    }
+
     #[test]
     fn mkv_forced_flag_on_forced_subtitle() {
         use crate::disc::SubtitleStream;

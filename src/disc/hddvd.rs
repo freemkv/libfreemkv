@@ -384,12 +384,100 @@ fn evo_from_src(src: &str) -> Option<String> {
     Some(format!("{}.evo", stem.to_ascii_lowercase()))
 }
 
+/// Maximum element nesting depth accepted in an XPL. A real `VPLST000.XPL` is
+/// about six levels deep at its deepest
+/// (`Playlist`/`TitleSet`/`Title`/`PrimaryAudioVideoClip`/`Video`, or
+/// `.../ChapterList/Chapter`); 32 leaves a 5x margin for authoring tools that
+/// wrap extra `ApplicationSegment`/`ObjectMappingList` layers, while staying
+/// trivially stack-safe.
+const MAX_XPL_DEPTH: usize = 32;
+
+/// Reject a disc-supplied XML blob whose element nesting exceeds `MAX_XPL_DEPTH`,
+/// BEFORE it reaches the parser. `roxmltree` is recursive-descent and its
+/// depth-10 limit applies only to ENTITY expansion, so element nesting is
+/// unbounded: a few hundred KB of well-formed XML — far under the read cap —
+/// overflows the thread stack. That is a process ABORT, not an `Err` and not an
+/// unwind, so neither the `Document::parse` fallback nor `catch_unwind` can
+/// contain it; the only fix is to not hand the document over at all. A byte-size
+/// cap is deliberately NOT added: file size is already bounded by the UDF read
+/// path, and a size cap does not close this class (a 180 KB document already
+/// aborts) — depth is the bound that matters.
+///
+/// This is a conservative scan, not a validator: it tracks `<name …>` /
+/// `</name>` while skipping comments, CDATA, processing instructions and
+/// declarations, and treats `<… />` as non-nesting. A miscount can only cost a
+/// pathological document its fast path, and the failure mode is the existing
+/// one — fall back to the clip-name heuristic.
+fn xpl_depth_within_limit(text: &str) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    // Index just past `needle`, or the end of input when unterminated.
+    let after = |from: usize, needle: &[u8]| -> usize {
+        b[from..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map_or(b.len(), |p| from + p + needle.len())
+    };
+    while i < b.len() {
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        match b.get(i + 1) {
+            Some(b'/') => {
+                depth = depth.saturating_sub(1);
+                i = after(i, b">");
+            }
+            Some(b'?') => i = after(i, b"?>"),
+            Some(b'!') if b[i..].starts_with(b"<!--") => i = after(i, b"-->"),
+            Some(b'!') if b[i..].starts_with(b"<![CDATA[") => i = after(i, b"]]>"),
+            // `<!DOCTYPE …>` and friends. An internal subset is not tracked;
+            // `allow_dtd` is off by default, so such a document is rejected by
+            // the parser anyway.
+            Some(b'!') => i = after(i, b">"),
+            _ => {
+                // Element start tag: walk to its `>`, ignoring `>` inside
+                // quoted attribute values, and note whether it self-closes.
+                let mut j = i + 1;
+                let mut quote = 0u8;
+                let mut prev = 0u8;
+                while j < b.len() {
+                    let c = b[j];
+                    if quote != 0 {
+                        if c == quote {
+                            quote = 0;
+                        }
+                    } else if c == b'"' || c == b'\'' {
+                        quote = c;
+                    } else if c == b'>' {
+                        break;
+                    }
+                    prev = c;
+                    j += 1;
+                }
+                if prev != b'/' {
+                    depth += 1;
+                    if depth > MAX_XPL_DEPTH {
+                        return false;
+                    }
+                }
+                i = j + 1;
+            }
+        }
+    }
+    true
+}
+
 /// Parse the Advanced-Content playlist into its titles. Elements are matched by
 /// LOCAL name (the document is in the `HDDVDVideo/Playlist` default namespace).
-/// Returns empty for a non-XML / non-playlist blob so the caller falls back to
-/// the clip-name heuristic.
+/// Returns empty for a non-XML / non-playlist blob, or one nested deeper than
+/// [`MAX_XPL_DEPTH`], so the caller falls back to the clip-name heuristic.
 fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
     let text = String::from_utf8_lossy(xpl);
+    if !xpl_depth_within_limit(&text) {
+        return Vec::new();
+    }
     let Ok(doc) = roxmltree::Document::parse(&text) else {
         return Vec::new();
     };
@@ -490,12 +578,24 @@ fn compose_xpl_titles(
         let mut extents = Vec::new();
         let mut size_bytes = 0u64;
         let mut parts = Vec::new();
+        // A crafted `<PrimaryAudioVideoClip>` list can name the same `.evo`
+        // any number of times (XML has no fixed element count, unlike MPLS's
+        // binary PlayItem count). Mirrors bluray.rs's
+        // `first_ref = seen_clips.insert(...)` gate (`:113`/`:117`): push a
+        // clip's physical extents and size only the first time its key is
+        // seen, so a clip named N times contributes its extent list ONCE
+        // instead of N times over. The analogous key here is the `.evo`
+        // filename — this format has no clip_id, and `.evo` is what
+        // `clip_extents` is already keyed by.
+        let mut seen_evos: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for c in &t.clips {
             let Some((orig, size, exts)) = clip_extents.get(&c.evo) else {
                 continue;
             };
-            extents.extend_from_slice(exts);
-            size_bytes += *size;
+            if seen_evos.insert(c.evo.as_str()) {
+                extents.extend_from_slice(exts);
+                size_bytes += *size;
+            }
             parts.push(Clip {
                 feed_span: None,
                 clip_id: orig
@@ -1336,6 +1436,52 @@ mod tests {
         assert!(parse_xpl_titles(b"<Playlist></Playlist>").is_empty());
     }
 
+    /// A disc-supplied playlist nested far deeper than any real one must be
+    /// REFUSED BEFORE the XML parser sees it. `roxmltree` is recursive-descent
+    /// and its depth-10 limit covers only ENTITY expansion, so unbounded element
+    /// nesting blows the thread stack — an ABORT, which no `catch_unwind` and no
+    /// `Err` fallback can contain. ~50k levels is a few hundred KB of well-formed
+    /// XML, far under the read cap. The correct outcome is the same as any other
+    /// unusable playlist: an empty `Vec`, so the caller falls back to the
+    /// clip-name heuristic.
+    #[test]
+    fn parse_xpl_titles_refuses_deeply_nested_playlist() {
+        const DEPTH: usize = 50_000;
+        let mut xpl = String::with_capacity(DEPTH * 8 + 64);
+        xpl.push_str(r#"<?xml version="1.0" encoding="utf-8"?>"#);
+        for _ in 0..DEPTH {
+            xpl.push_str("<n>");
+        }
+        for _ in 0..DEPTH {
+            xpl.push_str("</n>");
+        }
+        assert!(
+            parse_xpl_titles(xpl.as_bytes()).is_empty(),
+            "a hostile nesting depth must fall back, not abort the process"
+        );
+    }
+
+    /// The depth guard must not reject real discs. A genuine `VPLST000.XPL` is a
+    /// handful of levels deep; this is the same document the parsing test uses,
+    /// plus self-closing tags, a comment and a processing instruction that the
+    /// pre-parse scanner has to account for without inflating its depth count.
+    #[test]
+    fn parse_xpl_titles_accepts_real_world_nesting_depth() {
+        let titles = parse_xpl_titles(SYNTH_XPL.as_bytes());
+        assert_eq!(titles.len(), 2, "a real playlist still parses");
+        assert_eq!(titles[0].clips.len(), 2);
+
+        // Comments and processing instructions carry `<` and `/>` that a naive
+        // scanner would miscount as element nesting.
+        let decl = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
+        let tricky = SYNTH_XPL.replacen(
+            decl,
+            &format!("{decl}\n<!-- <a><a><a><a><a> -->\n<?authoring <b><b><b> ?>"),
+            1,
+        );
+        assert_eq!(parse_xpl_titles(tricky.as_bytes()).len(), 2);
+    }
+
     /// Build a UDF with `HVDVD_TS/` `.evo` clips plus an `ADV_OBJ/VPLST000.XPL`
     /// carrying `xpl`, so `scan_hddvd_titles` takes the playlist path.
     fn make_hddvd_fs_xpl(
@@ -1719,6 +1865,153 @@ mod tests {
             (t.clips[1].duration_secs - 4.0).abs() < 1e-9,
             "second clip's duration is also end - begin: got {}",
             t.clips[1].duration_secs
+        );
+    }
+
+    /// A crafted Advanced-Content playlist can name the SAME `.evo` in
+    /// `<PrimaryAudioVideoClip>` many times over (the XML has no fixed element
+    /// count, unlike MPLS's binary PlayItem count). Each repeat must NOT push
+    /// another copy of that clip's extent list onto the title — mirroring
+    /// bluray.rs's `first_ref = seen_clips.insert(...)` gate (`:113`/`:117`),
+    /// which pushes a clip's extents only the first time its id is seen. Here
+    /// the analogous key is the `.evo` filename (this file has no clip_id;
+    /// `.evo` is what `clip_extents` is keyed by). Without the gate, extents
+    /// grows by the referenced clip's full extent list on EVERY repetition —
+    /// unbounded by the number of on-disc files, bounded only by playlist
+    /// size.
+    #[test]
+    fn compose_xpl_titles_dedups_repeated_clip_references_by_evo() {
+        let clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = [(
+            "a.evo".to_string(),
+            (
+                "A.EVO".to_string(),
+                1000u64,
+                vec![
+                    Extent {
+                        start_lba: 1,
+                        sector_count: 1,
+                    },
+                    Extent {
+                        start_lba: 2,
+                        sector_count: 1,
+                    },
+                    Extent {
+                        start_lba: 3,
+                        sector_count: 1,
+                    },
+                ],
+            ),
+        )]
+        .into_iter()
+        .collect();
+
+        const REPEATS: usize = 5000;
+        let clips: Vec<XplClip> = (0..REPEATS)
+            .map(|i| XplClip {
+                evo: "a.evo".to_string(),
+                begin_secs: i as f64,
+                end_secs: i as f64 + 1.0,
+            })
+            .collect();
+        let xpl_titles = vec![XplTitle {
+            number: 1,
+            name: "T".to_string(),
+            duration_secs: REPEATS as f64,
+            clips,
+            chapters: vec![],
+        }];
+        let mut disc = MemDisc::new();
+        let titles = compose_xpl_titles(&mut disc, &xpl_titles, &clip_extents);
+        assert_eq!(titles.len(), 1);
+        assert_eq!(
+            titles[0].extents.len(),
+            3,
+            "the same .evo named {REPEATS} times must contribute its 3 extents \
+             ONCE, not {REPEATS} times over — got {} extents",
+            titles[0].extents.len()
+        );
+    }
+
+    /// Control for the de-dup above: a playlist naming several DISTINCT
+    /// clips (not repeats of one) must still resolve every one of them —
+    /// the de-dup key must not accidentally collapse different clips
+    /// together. If this test is made to fail by weakening the de-dup key
+    /// to something constant, that proves the key is doing real work rather
+    /// than vacuously deduping everything.
+    #[test]
+    fn compose_xpl_titles_resolves_all_distinct_clips_despite_dedup() {
+        let clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = [
+            (
+                "a.evo".to_string(),
+                (
+                    "A.EVO".to_string(),
+                    1000u64,
+                    vec![Extent {
+                        start_lba: 1,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+            (
+                "b.evo".to_string(),
+                (
+                    "B.EVO".to_string(),
+                    2000u64,
+                    vec![Extent {
+                        start_lba: 2,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+            (
+                "c.evo".to_string(),
+                (
+                    "C.EVO".to_string(),
+                    3000u64,
+                    vec![Extent {
+                        start_lba: 3,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let xpl_titles = vec![XplTitle {
+            number: 1,
+            name: "T".to_string(),
+            duration_secs: 30.0,
+            clips: vec![
+                XplClip {
+                    evo: "a.evo".to_string(),
+                    begin_secs: 0.0,
+                    end_secs: 5.0,
+                },
+                XplClip {
+                    evo: "b.evo".to_string(),
+                    begin_secs: 5.0,
+                    end_secs: 15.0,
+                },
+                XplClip {
+                    evo: "c.evo".to_string(),
+                    begin_secs: 15.0,
+                    end_secs: 30.0,
+                },
+            ],
+            chapters: vec![],
+        }];
+        let mut disc = MemDisc::new();
+        let titles = compose_xpl_titles(&mut disc, &xpl_titles, &clip_extents);
+        assert_eq!(titles.len(), 1);
+        assert_eq!(
+            titles[0].extents.len(),
+            3,
+            "three DISTINCT clips must all resolve — one extent each, not \
+             collapsed by an over-eager de-dup key"
+        );
+        assert_eq!(
+            titles[0].size_bytes, 6000,
+            "all three distinct sizes summed"
         );
     }
 

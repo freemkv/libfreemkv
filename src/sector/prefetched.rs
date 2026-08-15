@@ -486,7 +486,16 @@ impl SectorSource for PrefetchedSectorSource {
                 let _ = self.recycle_tx.send(filled);
                 Ok(n)
             }
-            Ok(Err(e)) => Err(crate::error::Error::IoError { source: e }),
+            // Recover the producer's TYPED error rather than blanket-wrapping
+            // it as `Error::IoError`. That wrapper is a classification, not a
+            // container: `is_scsi_transport_failure` matches `IoError`, so a
+            // wrapped MEDIUM ERROR bad sector reached `fill_extents` looking
+            // like a wedged bridge and aborted the pass instead of being
+            // skipped under `skip_errors`. `From<io::Error> for Error`
+            // downcasts the boxed payload back to the exact variant the
+            // producer sent (status + sense intact); a genuine OS-level
+            // `io::Error` — the real dead-bus case — still becomes `IoError`.
+            Ok(Err(e)) => Err(crate::error::Error::from(e)),
             // Channel closed (producer finished or panicked).
             Err(_) => Ok(0),
         }
@@ -1470,6 +1479,97 @@ mod tests {
             let (got, last) = drain_direct(&mut pf, 3, 64);
             assert_eq!(last.unwrap(), 0);
             assert_eq!(got.len(), 30 * 2048, "all 10 extents must be drained");
+        });
+    }
+
+    /// Source whose every read fails with a `DiscRead` carrying the given
+    /// SCSI status (and optional sense) — an ordinary MEDIUM ERROR bad
+    /// sector (0x02 + 03/11/00) or the transport-failure sentinel (0xFF).
+    struct FailingSource {
+        status: u8,
+        sense: Option<crate::scsi::ScsiSense>,
+    }
+
+    impl SectorSource for FailingSource {
+        fn capacity_sectors(&self) -> u32 {
+            9999
+        }
+
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            Err(crate::error::Error::DiscRead {
+                sector: lba as u64,
+                status: Some(self.status),
+                sense: self.sense,
+            })
+        }
+    }
+
+    fn read_one_err(status: u8, sense: Option<crate::scsi::ScsiSense>) -> crate::error::Error {
+        let extents = vec![Extent {
+            start_lba: 100,
+            sector_count: 9,
+        }];
+        let mut pf = PrefetchedSectorSource::new(FailingSource { status, sense }, extents, 3, None)
+            .expect("spawn");
+        let mut buf = vec![0u8; 3 * 2048];
+        pf.read_sectors(100, 3, &mut buf, false)
+            .expect_err("the producer's read failure must surface")
+    }
+
+    /// REGRESSION: an ordinary MEDIUM ERROR bad sector that crosses the
+    /// prefetch channel must NOT be classified as a SCSI transport failure.
+    ///
+    /// `read_sectors` used to re-wrap EVERY channel error as
+    /// `Error::IoError { source }`, and `is_scsi_transport_failure` matches
+    /// `IoError` (the wedged-USB-bridge arm). So a skippable bad sector
+    /// arrived at `DiscStream::fill_extents` looking like a dead bus and
+    /// aborted the whole pass instead of honouring `skip_errors`.
+    #[test]
+    fn bad_sector_across_channel_is_not_a_transport_failure() {
+        with_watchdog(Duration::from_secs(10), || {
+            let sense = crate::scsi::ScsiSense {
+                sense_key: 0x03,
+                asc: 0x11,
+                ascq: 0x00,
+            };
+            let err = read_one_err(crate::scsi::SCSI_STATUS_CHECK_CONDITION, Some(sense));
+            assert!(
+                !err.is_scsi_transport_failure(),
+                "a MEDIUM ERROR bad sector must stay a bad sector across the \
+                 prefetch channel, got {err:?}"
+            );
+            // The classification survives because the typed variant does.
+            assert!(
+                matches!(err, crate::error::Error::DiscRead { status: Some(s), .. } if s == 0x02),
+                "expected the producer's DiscRead to survive the channel, got {err:?}"
+            );
+            assert_eq!(
+                err.scsi_sense().map(|s| (s.sense_key, s.asc, s.ascq)),
+                Some((0x03, 0x11, 0x00)),
+                "the drive's sense triple must survive the channel"
+            );
+        });
+    }
+
+    /// OPPOSITE-DIRECTION CONTROL: a genuine transport failure (status 0xFF,
+    /// wedged USB bridge) crossing the same channel MUST still classify as a
+    /// transport failure, so `fill_extents` / sweep keep aborting the pass
+    /// instead of zero-filling every read against a dead bus.
+    #[test]
+    fn transport_failure_across_channel_still_classifies() {
+        with_watchdog(Duration::from_secs(10), || {
+            let err = read_one_err(crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE, None);
+            assert!(
+                err.is_scsi_transport_failure(),
+                "a 0xFF transport failure must remain one across the prefetch \
+                 channel, got {err:?}"
+            );
         });
     }
 }

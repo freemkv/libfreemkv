@@ -1859,6 +1859,62 @@ mod tests {
         );
     }
 
+    /// REGRESSION (round-4 audit): the SAME ordinary bad sector, reaching
+    /// `fill_extents` THROUGH a `PrefetchedSectorSource` instead of straight
+    /// off the reader, must still be a skippable bad sector under
+    /// `skip_errors=true` — not a transport failure that aborts the pass.
+    ///
+    /// `PrefetchedSectorSource::read_sectors` re-wrapped every error that
+    /// crossed the producer channel as `Error::IoError`, and
+    /// `is_scsi_transport_failure` matches `IoError` (the wedged-USB-bridge
+    /// arm). So the transport-failure short-circuit above fired on a MEDIUM
+    /// ERROR and killed the title — the exact inverse of the bug that
+    /// short-circuit exists to fix.
+    #[test]
+    fn bad_sector_through_prefetch_source_is_skipped_not_aborted() {
+        const COUNT: u32 = 9;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = RecordingReader {
+            capacity: COUNT,
+            bad_sector: 4,
+            log: log.clone(),
+        };
+        let prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
+            reader,
+            vec![crate::disc::Extent {
+                start_lba: 0,
+                sector_count: COUNT,
+            }],
+            8,
+            1,
+            None,
+            None,
+        )
+        .expect("spawn producer");
+        let mut stream = DiscStream::new(
+            Box::new(prefetched),
+            synthetic_title(COUNT),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::BdTs,
+            false,
+            None,
+        )
+        .unwrap();
+        stream.skip_errors = true;
+
+        let res = stream.fill_extents();
+        assert!(
+            res.is_ok(),
+            "a bad sector crossing the prefetch channel must be skipped under \
+             skip_errors, not abort the pass; got {res:?}"
+        );
+        assert!(
+            stream.errors > 0,
+            "the skipped bad sector must be counted as a skip"
+        );
+    }
+
     /// AACS unit-alignment skip (the #1 coverage gap). With `unit_align=3`
     /// (DecryptKeys::Aacs) and `skip_errors=true`, a single bad mid-extent
     /// sector must NOT desync the rest of the title: every `read_sectors`

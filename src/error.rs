@@ -1128,7 +1128,21 @@ impl std::error::Error for Error {
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::IoError { source: e }
+        // If this `io::Error` is one WE produced (`From<Error> for io::Error`
+        // carries the typed value in its boxed payload), give the original
+        // back instead of burying it in `Error::IoError`. That wrapper is not
+        // neutral: `is_scsi_transport_failure` treats `IoError` as a
+        // transport-layer fault (dead bus / wedged bridge), so re-wrapping a
+        // round-tripped `DiscRead` MEDIUM ERROR turned a skippable bad sector
+        // into a pass-aborting bridge wedge — the exact inverse of what that
+        // arm exists for. Any error that crosses a thread boundary as an
+        // `io::Error` (the prefetch channel's `Batch`) keeps its
+        // classification, its SCSI status, and its sense data.
+        match e.downcast::<Error>() {
+            Ok(typed) => typed,
+            // A genuine OS/`std` error — the `IoError` wrapper is correct here.
+            Err(io) => Error::IoError { source: io },
+        }
     }
 }
 
@@ -1143,7 +1157,6 @@ impl From<Error> for std::io::Error {
             return source;
         }
         let code = e.code();
-        let msg = e.to_string();
         // Map our error categories to io::ErrorKind
         let kind = match code {
             // Device access-denied semantics map to PermissionDenied;
@@ -1244,7 +1257,13 @@ impl From<Error> for std::io::Error {
             E_DIR_IMAGE_FILE_CHANGED => std::io::ErrorKind::InvalidData,
             _ => std::io::ErrorKind::Other,
         };
-        std::io::Error::new(kind, msg)
+        // Carry the typed value itself as the payload rather than its
+        // stringification. `Display` is unchanged (`io::Error` delegates to the
+        // boxed error, whose `Display` is the same `E<code>[: …]` string), so
+        // `error_code` and every consumer built on it are unaffected — but the
+        // typed error now SURVIVES the conversion and `From<io::Error> for
+        // Error` can hand it back intact.
+        std::io::Error::new(kind, e)
     }
 }
 
@@ -1263,13 +1282,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// removing comes back.
 ///
 /// [`From<Error> for io::Error`] is the ONLY path from a typed [`Error`] to an
-/// `io::Error` in this crate, and it stringifies (`io::Error::new(kind, msg)`
-/// where `msg` is the `Error`'s `E<code>[: …]` [`Display`](std::fmt::Display)
-/// string) rather than boxing the typed value — no code path constructs an
-/// `io::Error` that still holds a `crate::error::Error` via `get_ref`. So the
-/// only recognised shape is the round-tripped `E<code>` message prefix.
+/// `io::Error` in this crate. It boxes the typed value as the payload
+/// (`io::Error::new(kind, e)`), whose [`Display`](std::fmt::Display) is the
+/// same `E<code>[: …]` string the stringifying version produced — so this
+/// parse is unaffected, and `From<io::Error> for Error` can additionally
+/// `downcast` the payload back to the exact typed error. Errors that did NOT
+/// come from this crate carry no `E<code>` prefix and yield `None`.
 pub fn error_code(e: &std::io::Error) -> Option<u16> {
-    // Round-tripped: `From<Error> for io::Error` stringifies as "E<code>[: …]".
+    // Round-tripped: `From<Error> for io::Error` renders as "E<code>[: …]".
     let s = e.to_string();
     let digits = s.strip_prefix('E')?;
     let end = digits
