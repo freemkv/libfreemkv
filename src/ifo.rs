@@ -806,16 +806,24 @@ fn parse_raw_dvd_lang_bytes(lang_bytes: &[u8]) -> String {
 /// `disc::SubtitleStream::language`, and in turn Matroska's `Language`
 /// element per RFC 9559 §12 and the MP4 sink's `mdhd` language) requires.
 ///
-/// Reuses `labels::vocab::menu_lang`, the crate's existing certain table for
-/// 2/3-letter language tokens (covers the common retail-DVD languages: en,
-/// de, fr, es, it, pt, ja, ko, zh, ru, nl, pl, cs, da, fi, no, sv, hu, el,
-/// tr, ar, hi, th, uk, ca) rather than hand-rolling a second one.
+/// Uses `labels::vocab::iso639_1_to_iso639_2`, which spans the WHOLE of ISO
+/// 639-1 (plus the withdrawn spellings `iw`/`in`/`ji` that DVD-Video's
+/// frozen-1988 language list still puts on disc). The narrower
+/// `vocab::menu_lang` table is deliberately NOT used here: it exists for
+/// Blu-ray menu-graphic filename tokens and knows only 25 languages, so a
+/// Region-2 disc's Romanian, Bulgarian, Croatian, Serbian, Slovak, Slovenian,
+/// Hebrew, Estonian, Latvian, Lithuanian and Icelandic tracks would all fold
+/// onto `und` together. DVD streams carry an empty `label`, so the language
+/// is the only thing distinguishing one subtitle track from the next — a
+/// valid code that is identical for six tracks is worse for the user than the
+/// invalid one it replaced. Both tables normalize to ISO 639-2/T, so they
+/// agree wherever they overlap.
 ///
 /// An empty or unrecognized code degrades to `"und"` (ISO 639-2 / Matroska's
 /// own "undetermined" value) — a valid element value — rather than passing
 /// through an invalid 2-letter code or an empty string. Never guesses.
 pub(crate) fn dvd_lang_to_iso639_2(raw: &str) -> String {
-    crate::labels::vocab::menu_lang(raw)
+    crate::labels::vocab::iso639_1_to_iso639_2(raw)
         .unwrap_or("und")
         .to_string()
 }

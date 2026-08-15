@@ -219,6 +219,237 @@ pub fn menu_lang(token: &str) -> Option<&'static str> {
     Some(code)
 }
 
+// ── ISO 639-1 → ISO 639-2 ────────────────────────────────────────────────────
+
+/// The complete ISO 639-1 set, paired with its ISO 639-2/**T** (terminological)
+/// code. Every two-letter code ISO 639-1 defines appears exactly once.
+///
+/// /T is the variant the rest of this crate uses — [`lang`] and [`menu_lang`]
+/// both normalize to it (`deu` not `ger`, `fra` not `fre`, `zho` not `chi`,
+/// `ces`, `nld`, `ell`, `ron`, `slk`, `isl`, `eus`, `hrv`) — so the three
+/// tables cannot disagree. `iso639_1_agrees_with_menu_lang` pins that.
+///
+/// For the 165 codes where 639-2/B and /T are identical this distinction does
+/// not arise; it only matters for the 20-odd languages with a distinct
+/// bibliographic code.
+const ISO_639_1_TO_2: &[(&str, &str)] = &[
+    ("aa", "aar"),
+    ("ab", "abk"),
+    ("ae", "ave"),
+    ("af", "afr"),
+    ("ak", "aka"),
+    ("am", "amh"),
+    ("an", "arg"),
+    ("ar", "ara"),
+    ("as", "asm"),
+    ("av", "ava"),
+    ("ay", "aym"),
+    ("az", "aze"),
+    ("ba", "bak"),
+    ("be", "bel"),
+    ("bg", "bul"),
+    ("bh", "bih"),
+    ("bi", "bis"),
+    ("bm", "bam"),
+    ("bn", "ben"),
+    ("bo", "bod"),
+    ("br", "bre"),
+    ("bs", "bos"),
+    ("ca", "cat"),
+    ("ce", "che"),
+    ("ch", "cha"),
+    ("co", "cos"),
+    ("cr", "cre"),
+    ("cs", "ces"),
+    ("cu", "chu"),
+    ("cv", "chv"),
+    ("cy", "cym"),
+    ("da", "dan"),
+    ("de", "deu"),
+    ("dv", "div"),
+    ("dz", "dzo"),
+    ("ee", "ewe"),
+    ("el", "ell"),
+    ("en", "eng"),
+    ("eo", "epo"),
+    ("es", "spa"),
+    ("et", "est"),
+    ("eu", "eus"),
+    ("fa", "fas"),
+    ("ff", "ful"),
+    ("fi", "fin"),
+    ("fj", "fij"),
+    ("fo", "fao"),
+    ("fr", "fra"),
+    ("fy", "fry"),
+    ("ga", "gle"),
+    ("gd", "gla"),
+    ("gl", "glg"),
+    ("gn", "grn"),
+    ("gu", "guj"),
+    ("gv", "glv"),
+    ("ha", "hau"),
+    ("he", "heb"),
+    ("hi", "hin"),
+    ("ho", "hmo"),
+    ("hr", "hrv"),
+    ("ht", "hat"),
+    ("hu", "hun"),
+    ("hy", "hye"),
+    ("hz", "her"),
+    ("ia", "ina"),
+    ("id", "ind"),
+    ("ie", "ile"),
+    ("ig", "ibo"),
+    ("ii", "iii"),
+    ("ik", "ipk"),
+    ("io", "ido"),
+    ("is", "isl"),
+    ("it", "ita"),
+    ("iu", "iku"),
+    ("ja", "jpn"),
+    ("jv", "jav"),
+    ("ka", "kat"),
+    ("kg", "kon"),
+    ("ki", "kik"),
+    ("kj", "kua"),
+    ("kk", "kaz"),
+    ("kl", "kal"),
+    ("km", "khm"),
+    ("kn", "kan"),
+    ("ko", "kor"),
+    ("kr", "kau"),
+    ("ks", "kas"),
+    ("ku", "kur"),
+    ("kv", "kom"),
+    ("kw", "cor"),
+    ("ky", "kir"),
+    ("la", "lat"),
+    ("lb", "ltz"),
+    ("lg", "lug"),
+    ("li", "lim"),
+    ("ln", "lin"),
+    ("lo", "lao"),
+    ("lt", "lit"),
+    ("lu", "lub"),
+    ("lv", "lav"),
+    ("mg", "mlg"),
+    ("mh", "mah"),
+    ("mi", "mri"),
+    ("mk", "mkd"),
+    ("ml", "mal"),
+    ("mn", "mon"),
+    ("mr", "mar"),
+    ("ms", "msa"),
+    ("mt", "mlt"),
+    ("my", "mya"),
+    ("na", "nau"),
+    ("nb", "nob"),
+    ("nd", "nde"),
+    ("ne", "nep"),
+    ("ng", "ndo"),
+    ("nl", "nld"),
+    ("nn", "nno"),
+    ("no", "nor"),
+    ("nr", "nbl"),
+    ("nv", "nav"),
+    ("ny", "nya"),
+    ("oc", "oci"),
+    ("oj", "oji"),
+    ("om", "orm"),
+    ("or", "ori"),
+    ("os", "oss"),
+    ("pa", "pan"),
+    ("pi", "pli"),
+    ("pl", "pol"),
+    ("ps", "pus"),
+    ("pt", "por"),
+    ("qu", "que"),
+    ("rm", "roh"),
+    ("rn", "run"),
+    ("ro", "ron"),
+    ("ru", "rus"),
+    ("rw", "kin"),
+    ("sa", "san"),
+    ("sc", "srd"),
+    ("sd", "snd"),
+    ("se", "sme"),
+    ("sg", "sag"),
+    ("si", "sin"),
+    ("sk", "slk"),
+    ("sl", "slv"),
+    ("sm", "smo"),
+    ("sn", "sna"),
+    ("so", "som"),
+    ("sq", "sqi"),
+    ("sr", "srp"),
+    ("ss", "ssw"),
+    ("st", "sot"),
+    ("su", "sun"),
+    ("sv", "swe"),
+    ("sw", "swa"),
+    ("ta", "tam"),
+    ("te", "tel"),
+    ("tg", "tgk"),
+    ("th", "tha"),
+    ("ti", "tir"),
+    ("tk", "tuk"),
+    ("tl", "tgl"),
+    ("tn", "tsn"),
+    ("to", "ton"),
+    ("tr", "tur"),
+    ("ts", "tso"),
+    ("tt", "tat"),
+    ("tw", "twi"),
+    ("ty", "tah"),
+    ("ug", "uig"),
+    ("uk", "ukr"),
+    ("ur", "urd"),
+    ("uz", "uzb"),
+    ("ve", "ven"),
+    ("vi", "vie"),
+    ("vo", "vol"),
+    ("wa", "wln"),
+    ("wo", "wol"),
+    ("xh", "xho"),
+    ("yi", "yid"),
+    ("yo", "yor"),
+    ("za", "zha"),
+    ("zh", "zho"),
+    ("zu", "zul"),
+];
+
+/// The three two-letter codes ISO 639-1 has since withdrawn, mapped to their
+/// replacements. DVD-Video froze its language list on the 1988 edition, so
+/// discs authored to the spec carry these spellings and no other table sees
+/// them: `iw` Hebrew (now `he`), `in` Indonesian (now `id`), `ji` Yiddish
+/// (now `yi`).
+const ISO_639_1_DEPRECATED: &[(&str, &str)] = &[("iw", "he"), ("in", "id"), ("ji", "yi")];
+
+/// Map an ISO 639-1 two-letter language code to its ISO 639-2/T three-letter
+/// code, accepting the withdrawn DVD-era spellings (`iw`, `in`, `ji`) as
+/// aliases for their replacements.
+///
+/// Covers the WHOLE of ISO 639-1, unlike [`menu_lang`], whose table only spans
+/// the languages that show up in Blu-ray menu-graphic filenames. Callers that
+/// convert a spec field — a DVD IFO attribute block, say — need the whole set:
+/// narrowing it to the menu vocabulary would fold every other language onto
+/// one value and make a disc's tracks indistinguishable from each other.
+///
+/// Case-insensitive and trimmed. Returns `None` for anything that is not an
+/// ISO 639-1 code, so callers decide the fallback rather than getting a guess.
+pub fn iso639_1_to_iso639_2(code: &str) -> Option<&'static str> {
+    let c = code.trim().to_ascii_lowercase();
+    let c = ISO_639_1_DEPRECATED
+        .iter()
+        .find(|(old, _)| *old == c)
+        .map_or(c.as_str(), |(_, new)| new);
+    ISO_639_1_TO_2
+        .iter()
+        .find(|(two, _)| *two == c)
+        .map(|(_, three)| *three)
+}
+
 // ── Purpose ──────────────────────────────────────────────────────────────────
 
 /// Classify a free-form English label string into a [`LabelPurpose`].
@@ -788,5 +1019,100 @@ mod tests {
         // Unrecognized token -> None, never a guess.
         assert_eq!(menu_lang("xyz"), None);
         assert_eq!(menu_lang(""), None);
+    }
+
+    /// Structural invariants of `ISO_639_1_TO_2`: it must hold the complete
+    /// ISO 639-1 set (184 codes), every key a distinct pair of lowercase
+    /// letters and every value three lowercase letters. A typo'd or duplicated
+    /// row fails here rather than silently mislabelling a track.
+    #[test]
+    fn iso639_1_table_is_complete_and_well_formed() {
+        assert_eq!(
+            ISO_639_1_TO_2.len(),
+            184,
+            "ISO 639-1 defines 184 two-letter codes; the table must hold all \
+             of them"
+        );
+        let mut keys: Vec<&str> = ISO_639_1_TO_2.iter().map(|(two, _)| *two).collect();
+        keys.sort_unstable();
+        let unique = keys.len();
+        keys.dedup();
+        assert_eq!(unique, keys.len(), "no ISO 639-1 code may appear twice");
+        for (two, three) in ISO_639_1_TO_2 {
+            assert!(
+                two.len() == 2 && two.bytes().all(|b| b.is_ascii_lowercase()),
+                "{two:?} is not a two-letter lowercase ISO 639-1 code"
+            );
+            assert!(
+                three.len() == 3 && three.bytes().all(|b| b.is_ascii_lowercase()),
+                "{three:?} is not a three-letter lowercase ISO 639-2 code"
+            );
+        }
+        // The withdrawn DVD-era spellings resolve, and are not themselves
+        // rows in the main table (they are aliases, not codes).
+        for (old, new) in ISO_639_1_DEPRECATED {
+            assert!(
+                !ISO_639_1_TO_2.iter().any(|(two, _)| two == old),
+                "withdrawn code {old:?} must not be a table row"
+            );
+            assert_eq!(
+                iso639_1_to_iso639_2(old),
+                iso639_1_to_iso639_2(new),
+                "withdrawn code {old:?} must resolve exactly as {new:?}"
+            );
+        }
+    }
+
+    /// The two tables must not disagree. Every two-letter token `menu_lang`
+    /// accepts has to yield the same ISO 639-2/T code through
+    /// `iso639_1_to_iso639_2`, so a DVD-sourced language and a Blu-ray
+    /// menu-label language for the same tongue never produce different
+    /// `Language` elements.
+    #[test]
+    fn iso639_1_agrees_with_menu_lang() {
+        for (two, three) in ISO_639_1_TO_2 {
+            if let Some(via_menu) = menu_lang(two) {
+                assert_eq!(
+                    via_menu, *three,
+                    "menu_lang({two:?}) = {via_menu:?} disagrees with the ISO \
+                     639-1 table's {three:?}"
+                );
+            }
+        }
+        // Spot-check the /T choice itself, on the languages where /B differs.
+        for (two, t_code) in [
+            ("de", "deu"),
+            ("fr", "fra"),
+            ("zh", "zho"),
+            ("cs", "ces"),
+            ("nl", "nld"),
+            ("el", "ell"),
+            ("ro", "ron"),
+            ("sk", "slk"),
+            ("is", "isl"),
+            ("hy", "hye"),
+            ("ka", "kat"),
+            ("fa", "fas"),
+        ] {
+            assert_eq!(
+                iso639_1_to_iso639_2(two),
+                Some(t_code),
+                "the crate standardises on ISO 639-2/T, so {two:?} is \
+                 {t_code:?} and never the bibliographic form"
+            );
+        }
+    }
+
+    /// Trimming, case-insensitivity, and the no-guess contract.
+    #[test]
+    fn iso639_1_normalizes_input_and_never_guesses() {
+        assert_eq!(iso639_1_to_iso639_2("RO"), Some("ron"));
+        assert_eq!(iso639_1_to_iso639_2("  Ro  "), Some("ron"));
+        assert_eq!(iso639_1_to_iso639_2("IW"), Some("heb"));
+        assert_eq!(iso639_1_to_iso639_2("zz"), None);
+        assert_eq!(iso639_1_to_iso639_2(""), None);
+        assert_eq!(iso639_1_to_iso639_2("e"), None);
+        // A three-letter code is not ISO 639-1 input — that is menu_lang's job.
+        assert_eq!(iso639_1_to_iso639_2("eng"), None);
     }
 }

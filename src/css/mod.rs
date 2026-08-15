@@ -75,7 +75,7 @@ pub fn crack_key(
     extents: &[Extent],
     batch_sectors: u16,
 ) -> Option<CssState> {
-    crack_key_scan(reader, extents, batch_sectors, None, false).into_state()
+    crack_key_scan(reader, extents, batch_sectors, None).into_state()
 }
 
 /// Outcome of a CSS crack scan that distinguishes the THREE cases the bare
@@ -136,7 +136,7 @@ pub fn crack_key_outcome(
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
 ) -> CrackOutcome {
-    crack_key_scan(reader, extents, batch_sectors, halt, true)
+    crack_key_scan(reader, extents, batch_sectors, halt)
 }
 
 /// Resolve a DVD title's CSS descramble key from the reader when the caller
@@ -212,10 +212,6 @@ fn crack_key_scan(
     extents: &[Extent],
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
-    // True only on the INITIAL scan: a fully CSS-locked (`05/6F/03`) result is a
-    // hard `ScrambledUncracked`. False on the per-VTS re-crack so a lapsed-AGID
-    // locked read returns None instead of killing a genuinely crackable title.
-    fail_on_locked: bool,
 ) -> CrackOutcome {
     // Batch the reads: a live optical drive at 1 sector/read is glacial, and the
     // crack only needs to FIND one scrambled sector whose 0x80 plaintext matches
@@ -344,14 +340,29 @@ fn crack_key_scan(
     }
 
     // Budget exhausted / extents walked / early-bailed with no key recovered.
-    // The disc is ENCRYPTED-but-uncracked (a hard failure on the initial scan)
-    // when EITHER a scrambled sector was actually seen, OR — on the initial scan
-    // only (`fail_on_locked`) — every read was CSS-locked (`05/6F/03`), itself
-    // proof of scrambling. A re-crack (`fail_on_locked` false) stays soft: a
-    // lapsed-AGID locked read yields None, not a hard fail, so a crackable title
-    // in another VTS isn't killed. Only a scan that saw neither a scrambled
-    // sector nor a CSS-lock is genuinely unencrypted.
-    if saw_scrambled || (saw_locked && fail_on_locked) {
+    // The disc is ENCRYPTED-but-uncracked (a hard failure) when EITHER a
+    // scrambled sector was actually seen, OR every read was CSS-locked
+    // (`05/6F/03`), itself proof of scrambling. Only a scan that saw neither a
+    // scrambled sector nor a CSS-lock is genuinely unencrypted.
+    //
+    // A prior revision made this conditional on a caller-supplied
+    // `fail_on_locked: bool`, documented as "false on the per-VTS re-crack, so
+    // a lapsed-AGID locked read returns None instead of killing a genuinely
+    // crackable title." That parameter never had an observable effect: its
+    // ONLY non-test caller with `false` was [`crack_key`], whose `Option`
+    // return collapses `ScrambledUncracked` and `Unencrypted` alike to `None`
+    // via [`CrackOutcome::into_state`] — so the branch this comment describes
+    // was unreachable from the moment it was introduced (see the crate's audit
+    // notes for the git-archaeology). The one production caller that DOES
+    // observe the `Cracked` / `Unencrypted` / `ScrambledUncracked` split for a
+    // per-VTS re-crack (`Disc::decrypt_keys_for_title`) has always gone
+    // through [`crack_key_outcome`], which hardcoded this to always-hard-fail.
+    // Reconnecting the soft variant there would mean a locked read on a live
+    // drive gets reported as `Unencrypted` (`title_is_clear = true`) and the
+    // title is muxed with NO key — precisely the silent-garbage failure mode
+    // `CrackOutcome` exists to prevent. So the parameter is removed rather
+    // than revived: the scan is unconditionally hard-fail-on-locked.
+    if saw_scrambled || saw_locked {
         CrackOutcome::ScrambledUncracked
     } else {
         CrackOutcome::Unencrypted
@@ -860,7 +871,7 @@ mod tests {
             start_lba: 100,
             sector_count: 4,
         }];
-        let _ = crack_key_scan(&mut src, &ext, 4, None, false);
+        let _ = crack_key_scan(&mut src, &ext, 4, None);
         let reads = src.reads.borrow().clone();
         assert_eq!(
             reads,
@@ -882,7 +893,7 @@ mod tests {
             start_lba: 0,
             sector_count: 8,
         }];
-        let outcome = crack_key_scan(&mut src, &ext, 4, None, false);
+        let outcome = crack_key_scan(&mut src, &ext, 4, None);
         assert!(
             matches!(outcome, CrackOutcome::Unencrypted),
             "nothing was read, so nothing scrambled was seen"
@@ -1100,12 +1111,17 @@ mod tests {
         );
     }
 
-    /// MISSING #1 guard: the re-crack path (the `Option`-returning `crack_key`,
-    /// `fail_on_locked == false`) must NOT hard-fail on a CSS-locked read — it
-    /// returns `None`. A lapsed-AGID re-crack of another VTS stays soft so a
-    /// genuinely crackable title isn't killed by a transient locked read.
+    /// `crack_key` (the `Option`-returning convenience wrapper) collapses
+    /// `ScrambledUncracked` and `Unencrypted` alike to `None` via
+    /// [`CrackOutcome::into_state`], so an all-locked scan still reads `None`
+    /// here even though the scan itself now treats every CSS-lock as a hard
+    /// `ScrambledUncracked` (see `crack_key_scan`'s removal of the dead
+    /// `fail_on_locked` parameter). Callers that need to tell "locked/
+    /// uncrackable" apart from "genuinely clear" must use `crack_key_outcome`,
+    /// which the `all_locked_synthetic_iso_yields_css_key_missing_signal` test
+    /// pins directly.
     #[test]
-    fn crack_key_recrack_locked_is_none_not_hard_fail() {
+    fn crack_key_all_locked_collapses_to_none() {
         let mut src = MockSource::new(0x30);
         src.lock_all = true;
         let extents = [Extent {
@@ -1595,8 +1611,8 @@ mod tests {
 
     /// PER-VTS RE-CRACK SUCCESS (audit gap "success path missing"): the prior
     /// re-crack test only covered the locked→None path. Here a re-crack
-    /// (`crack_key`, `fail_on_locked == false`) over a DIFFERENT VTS's extents
-    /// finds that VTS's own crackable sector and returns a `CssState` whose
+    /// (`crack_key`) over a DIFFERENT VTS's extents finds that VTS's own
+    /// crackable sector and returns a `CssState` whose
     /// `crack_span` matches the new extents — proving a key cracked for one VTS
     /// is genuinely re-derived (not reused) for another.
     #[test]
