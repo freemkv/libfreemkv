@@ -1,5 +1,44 @@
 # Changelog
 
+## [1.6.4] — UNRELEASED
+
+### Fixed
+
+- **On a few Blu-ray/UHD titles the sound ran on for half a minute after the
+  picture had ended.** A disc stores each part of a film as a clip, and the
+  playlist marks exactly where that clip's content begins and ends. Where a
+  title is a single clip, freemkv trimmed the picture to those marks but not the
+  sound — and some discs leave extra audio in the file past the end mark (a
+  quiet fade authored after the last frame of picture). That trailing audio was
+  copied through, so the file claimed one running time while carrying up to ~36
+  seconds more sound than picture. Measured on `The Bourne Supremacy`: the
+  picture ends at 1:48:26 as declared, but every sound track ran to 1:49:02.
+  Single-clip titles are now trimmed to their playlist marks the same way
+  multi-clip titles already were, so sound and picture end together at the
+  declared duration. A title that had no extra material past its marks is
+  byte-for-byte unchanged. Multi-clip titles were never affected.
+
+- **A multi-title-set CSS DVD could descramble one title set under another
+  set's key.** When a DVD's second title set resisted the keyless title-key
+  recovery, the decrypt fell back to the disc-wide key instead of failing —
+  writing a corrupt title behind an intact header and reporting success at exit
+  0. A failed recovery is now a hard error, the same as every other path in the
+  crate already does; ordering makes the recovery more likely to succeed but
+  cannot make a failed one safe.
+
+- **A disc whose stream language field was all-zero could abort the whole track
+  export.** An all-zero language code (the ordinary "undefined" value on real
+  discs) put a NUL byte into a demux output filename and failed file creation
+  before a single track opened. Control bytes in that field are now sanitised
+  the same way the rest of the name already was.
+
+### Security
+
+- **Bounded the last unbounded attacker-controlled list in the DVD label
+  parser.** A crafted IFO could grow the forced-subtitle index list without
+  limit; it now carries the same positional cap as the neighbouring command
+  lists. No effect on a well-formed disc.
+
 ## [1.6.3] — 2026-08-10
 
 ### Changed
