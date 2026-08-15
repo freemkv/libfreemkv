@@ -1448,7 +1448,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // all tracks, A/V-sync-preserving) keeps the boundary from becoming a
         // band of non-monotonic block timestamps. Only the PRIMARY video track
         // drives the boundary decision; every other track (audio, subtitle, DV
-        // EL) rides the current offset. No-op for single-clip titles.
+        // EL) rides the current offset. A single-clip BD title still trims to
+        // its one clip's [in, out] marks (dropping trailing audio the m2ts
+        // carries past OUT); only a source with no marks at all is a true no-op.
         // `None` means the playlist does not include this frame — material
         // outside every clip's IN/OUT marks, which only a seam-plan-driven
         // title can report. Dropping it is the point: emitting it is what put

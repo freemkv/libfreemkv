@@ -151,14 +151,25 @@ struct TrackPos {
 impl SeamPlan {
     /// Build a plan from a title's clips, or `None` when there is nothing to
     /// place: no clips (DVD, HD-DVD, `mkv://`/`m2ts://` sources — none of which
-    /// carry PlayItem marks), a single clip (nothing to join), or marks that are
-    /// not usable (a zero/inverted span means the playlist is not telling us
-    /// anything we can act on, and guessing is what this type exists to avoid).
+    /// carry PlayItem marks), or marks that are not usable (a zero/inverted span
+    /// means the playlist is not telling us anything we can act on, and guessing
+    /// is what this type exists to avoid).
+    ///
+    /// A **single** clip still gets a plan. Joining is not the marks' only job —
+    /// trimming to `[in, out]` is — and it matters whenever a clip's physical
+    /// extent runs past its OUT mark. Real discs author trailing audio (a fade
+    /// after the last video frame) beyond OUT in the m2ts; without a plan the
+    /// inference path keeps it, leaving audio seconds past the declared duration.
+    /// One clip needs no cross-clip placement, so the loop below reduces to the
+    /// `[in, out]` drop filter plus the standard `offset = −in_ns` rebase — the
+    /// same one clip 0 of a multi-clip title already gets, which the MKV muxer
+    /// then re-anchors, so every KEPT frame is byte-identical to the no-plan
+    /// path. The only change is that out-of-mark frames are now dropped.
     ///
     /// Returning `None` leaves [`TimelineContinuity`] on its PTS-jump inference,
     /// which is what every non-BD path has always used.
     pub(crate) fn from_clips(clips: &[crate::disc::Clip]) -> Option<Self> {
-        if clips.len() < 2 {
+        if clips.is_empty() {
             return None;
         }
         // Trust the spans only if they tile the feed contiguously from 0.
@@ -730,9 +741,10 @@ impl TimelineContinuity {
 
     /// Corrector driven by a title's PlayItem marks where they exist.
     ///
-    /// Falls back to [`Self::new`]'s inference when the title has fewer than two
-    /// clips or its marks are unusable — so DVD, HD-DVD, `mkv://` and `m2ts://`
-    /// sources behave exactly as before.
+    /// Falls back to [`Self::new`]'s inference when the title has no clips or
+    /// its marks are unusable — so DVD, HD-DVD, `mkv://` and `m2ts://` sources
+    /// behave exactly as before. A single BD clip DOES get a plan: its marks
+    /// still trim trailing/pre-roll material outside `[in, out]`.
     pub(crate) fn with_clips(
         clips: &[crate::disc::Clip],
         content_format: crate::disc::ContentFormat,
@@ -2226,15 +2238,57 @@ mod tests {
     #[test]
     fn no_seam_plan_without_usable_marks() {
         assert!(SeamPlan::from_clips(&[]).is_none(), "no clips");
-        assert!(
-            SeamPlan::from_clips(&seamless_branching_clips()[..1]).is_none(),
-            "a single clip has nothing to join"
-        );
         let mut bad = seamless_branching_clips();
         bad[3].out_time = bad[3].in_time; // zero-length span
         assert!(
             SeamPlan::from_clips(&bad).is_none(),
             "unusable marks must fall back to inference, not guess"
+        );
+    }
+
+    /// A SINGLE-clip title still gets a plan: joining is not the marks' only job,
+    /// trimming to `[in, out]` is. Real discs author trailing audio (a fade after
+    /// the last video frame) PAST the OUT mark in the m2ts; the no-plan inference
+    /// path kept it, leaving audio seconds past the declared duration — the
+    /// `The Bourne Supremacy` defect (audio +35.6 s past a single-clip title's
+    /// end). The plan drops it, and every KEPT frame is placed exactly as the
+    /// no-plan path would (raw rebased by `−in_ns`, which the MKV muxer already
+    /// does), so a disc with no out-of-mark content is byte-identical.
+    #[test]
+    fn single_clip_trims_content_outside_its_marks() {
+        let clips = seamless_branching_clips(); // clip 0: in 4199.0s, out 6033.04s
+        let mut plan = SeamPlan::from_clips(&clips[..1]).expect("a single clip is planned");
+
+        let in_ns = mpls_ticks_to_ns(clips[0].in_time);
+        let out_ns = mpls_ticks_to_ns(clips[0].out_time);
+
+        // In-mark frames are kept and rebased to 0 at IN — and drop nothing.
+        assert_eq!(plan.place(in_ns, 0, true, None), Some(0), "IN rebases to 0");
+        assert_eq!(
+            plan.place(in_ns + 10 * S, 1, false, None),
+            Some(10 * S),
+            "a mid-clip audio frame keeps its offset from IN"
+        );
+        assert_eq!(
+            plan.place(out_ns, 2, false, None),
+            Some(out_ns - in_ns),
+            "a frame AT the OUT mark is inside and kept"
+        );
+        assert_eq!(
+            plan.dropped_total(),
+            0,
+            "no in-mark frame may be dropped (output is unchanged for a clean disc)"
+        );
+
+        // Trailing audio past OUT is dropped AND counted, so the finish() gates
+        // in the sinks can see the volume.
+        assert!(
+            plan.place(out_ns + 30 * S, 1, false, None).is_none(),
+            "trailing audio 30s past OUT must be dropped, not emitted past the end"
+        );
+        assert!(
+            plan.dropped_for(1) >= 1,
+            "the dropped tail frame must be counted"
         );
     }
 
