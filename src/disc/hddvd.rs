@@ -414,6 +414,65 @@ const MAX_XPL_DEPTH: usize = 32;
 /// still bounds the probe work to something a scan can absorb.
 const MAX_XPL_TITLES: usize = 4096;
 
+/// Cap on `.evo` clips taken from the `HVDVD_TS/` directory listing.
+///
+/// [`MAX_XPL_TITLES`] bounds what a PLAYLIST may declare, and
+/// [`xpl_depth_within_limit`] bounds how deeply it may nest — but both live on
+/// the `ADV_OBJ/*.XPL` path, and a crafted disc simply OMITS `/ADV_OBJ`. Control
+/// then reaches the clip-name fallback in [`Disc::scan_hddvd_titles`], which
+/// emits one title per DIRECTORY ENTRY and probes each. That is the same
+/// unbounded-probe cost, reached without the playlist.
+///
+/// The directory is the only bound the medium supplies, and `udf::MAX_DIR_BYTES`
+/// (1 MiB) still leaves room for ~24,000 FIDs. Memoizing the probe
+/// ([`EvoProbeCache`]) collapses entries that resolve to the SAME extents, which
+/// closes the many-names-one-File-Entry case — but it cannot close this one: a
+/// File Entry is a single sector, so an attacker can give every FID its own,
+/// each declaring its own extent, for ~48 MiB of image. Every probe then misses
+/// the memo and costs a full [`EVO_PROBE_SECTORS`] (16 MiB) read — hundreds of
+/// GiB on a `Disc::scan()` the operator expects to take seconds.
+///
+/// 4096 matches [`MAX_XPL_TITLES`] and is far above any real disc (retail
+/// HD-DVDs carry tens of `.evo` clips), so it cannot cost a genuine disc a
+/// title, while bounding the probe work to something a scan can absorb.
+const MAX_HDDVD_CLIPS: usize = 4096;
+
+/// Memoized [`probe_evo_streams`], keyed on the RESOLVED extent list.
+///
+/// Probing is the expensive half of title composition: each pass reads up to
+/// [`EVO_PROBE_SECTORS`] (16 MiB) off the medium. Both composition paths can
+/// reach the same physical clip many times over — an XPL naming one `.evo` from
+/// many `<Title>`s, or a directory whose FIDs all point at one File Entry — and
+/// a probe is a pure function of the extents it reads, so the second and later
+/// passes over an identical extent list are re-reads of bytes already seen.
+///
+/// The key is the extent list itself, NOT the clip name or title: two names for
+/// one File Entry share a key (one probe), while two genuinely different clips
+/// have different `start_lba`s and so keep their own probes and their own
+/// streams. Cache size is bounded by the caller's title/clip cap
+/// ([`MAX_XPL_TITLES`] / [`MAX_HDDVD_CLIPS`]).
+#[derive(Default)]
+struct EvoProbeCache {
+    seen: std::collections::HashMap<Vec<(u32, u32)>, Vec<Stream>>,
+}
+
+impl EvoProbeCache {
+    /// Streams for `extents` — probed on first sight, replayed from the memo
+    /// afterwards.
+    fn streams(&mut self, reader: &mut dyn SectorSource, extents: &[Extent]) -> Vec<Stream> {
+        let key: Vec<(u32, u32)> = extents
+            .iter()
+            .map(|e| (e.start_lba, e.sector_count))
+            .collect();
+        if let Some(hit) = self.seen.get(&key) {
+            return hit.clone();
+        }
+        let streams = probe_evo_streams(reader, extents);
+        self.seen.insert(key, streams.clone());
+        streams
+    }
+}
+
 /// Reject a disc-supplied XML blob whose element nesting exceeds `MAX_XPL_DEPTH`,
 /// BEFORE it reaches the parser. `roxmltree` is recursive-descent and its
 /// depth-10 limit applies only to ENTITY expansion, so element nesting is
@@ -600,6 +659,10 @@ fn compose_xpl_titles(
     clip_extents: &BTreeMap<String, (String, u64, Vec<Extent>)>,
 ) -> Vec<DiscTitle> {
     let mut titles = Vec::new();
+    // One memo for the whole playlist: a playlist legitimately carries several
+    // titles over the same clip (angles, a branch, a seamless-join variant), and
+    // a crafted one can name a single `.evo` from all MAX_XPL_TITLES titles.
+    let mut probes = EvoProbeCache::default();
     for t in xpl_titles {
         let mut extents = Vec::new();
         let mut size_bytes = 0u64;
@@ -638,7 +701,7 @@ fn compose_xpl_titles(
         if parts.is_empty() {
             continue;
         }
-        let streams = probe_evo_streams(reader, &extents);
+        let streams = probes.streams(reader, &extents);
         let chapters = t
             .chapters
             .iter()
@@ -698,7 +761,14 @@ impl Disc {
             }
             let lower = e.name.to_ascii_lowercase();
             if lower.ends_with(HDDVD_CLIP_EXT) {
-                clips.push((e.name.clone(), e.size));
+                // Bounded by MAX_HDDVD_CLIPS: each clip taken here costs an ICB
+                // read to resolve its extents and (in the fallback path below) a
+                // full probe_evo_streams pass. Surplus entries are DROPPED rather
+                // than `break`ing the loop, so a crafted disc cannot hide the
+                // `.vti` navigation file behind a wall of `.evo` names.
+                if clips.len() < MAX_HDDVD_CLIPS {
+                    clips.push((e.name.clone(), e.size));
+                }
             } else if lower.ends_with(".vti") && vti_name.is_none() {
                 vti_name = Some(e.name.clone());
             }
@@ -753,6 +823,10 @@ impl Disc {
 
         let mut titles = Vec::new();
         let mut next_id = 0u16;
+        // One memo across the composed feature title and every per-clip title:
+        // nothing de-duplicates a FID's ICB LBA, so any number of directory
+        // entries can name ONE File Entry and resolve to identical extents.
+        let mut probes = EvoProbeCache::default();
 
         // The composed feature title: concatenate its parts' extents in authored
         // order. Streams are probed from the head (the first part). One `Clip` per
@@ -779,7 +853,7 @@ impl Disc {
                     });
                 }
             }
-            let streams = probe_evo_streams(reader, &extents);
+            let streams = probes.streams(reader, &extents);
             titles.push(DiscTitle {
                 playlist: "FEATURE".to_string(),
                 playlist_id: next_id,
@@ -807,7 +881,7 @@ impl Disc {
             };
             // Probe the clip head for its elementary streams so the mux path
             // builds a non-empty `pid_to_track` and actually routes packets.
-            let streams = probe_evo_streams(reader, extents);
+            let streams = probes.streams(reader, extents);
             let clip_id = orig
                 .rsplit_once('.')
                 .map(|(base, _)| base.to_string())
@@ -2276,6 +2350,259 @@ mod tests {
         assert!(
             !has_h264,
             "must not read past the total EVO_PROBE_SECTORS budget across extents"
+        );
+    }
+
+    // ── clip-name fallback: probe amplification ────────────────────────────
+
+    /// A [`SectorSource`] wrapper that counts how many reads START at each
+    /// watched LBA, plus the total sectors pulled off the medium. A probe of a
+    /// clip always issues its first read at the clip's first extent LBA, so the
+    /// hit count for that LBA IS the number of `probe_evo_streams` passes over
+    /// that clip.
+    struct ProbeCounter {
+        inner: MemDisc,
+        watch: Vec<u32>,
+        hits: Vec<u32>,
+        sectors_read: u64,
+    }
+
+    impl ProbeCounter {
+        fn new(inner: MemDisc, watch: Vec<u32>) -> Self {
+            let hits = vec![0; watch.len()];
+            Self {
+                inner,
+                watch,
+                hits,
+                sectors_read: 0,
+            }
+        }
+    }
+
+    impl SectorSource for ProbeCounter {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if let Some(i) = self.watch.iter().position(|w| *w == lba) {
+                self.hits[i] += 1;
+            }
+            self.sectors_read += count as u64;
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    /// Lay an `HVDVD_TS/` holding exactly the given `(name, icb_lba, data_lba,
+    /// size)` clips — unlike `make_hddvd_fs`, the caller chooses each entry's
+    /// ICB, so many names can be pointed at ONE File Entry.
+    fn lay_hddvd_clips(disc: &mut MemDisc, specs: Vec<crate::udf::fixture::FileSpec>) {
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: specs,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(disc, 10);
+        lay_dir(disc, &root);
+    }
+
+    /// THE THIRD AMPLIFICATION AXIS on HD-DVD title composition, past both
+    /// existing guards. `xpl_depth_within_limit` bounds XML NESTING;
+    /// `MAX_XPL_TITLES` + the `.evo` de-dup bound what an XPL can DECLARE. Both
+    /// live on the playlist path — and an attacker simply omits `/ADV_OBJ`, so
+    /// `read_adv_obj_xpl` returns `None` and neither guard is ever consulted.
+    /// Control then reaches the clip-name FALLBACK, which emits one title per
+    /// `.evo` DIRECTORY ENTRY and probes each.
+    ///
+    /// Nothing de-duplicates a FID's ICB LBA, so every name in a 1 MiB
+    /// directory (`udf::MAX_DIR_BYTES`, ~24,000 FIDs) can point at ONE File
+    /// Entry. Each resolves to the SAME extents and each costs a full
+    /// `EVO_PROBE_SECTORS` (16 MiB) probe: ~375 GiB of optical reads from a
+    /// directory that describes a single file.
+    ///
+    /// Memoizing the probe on the resolved extent list collapses that to ONE
+    /// probe, because all of those names resolve to one extent list.
+    ///
+    /// Mutation: drop the memo lookup in `EvoProbeCache::streams` (always
+    /// probe) and this goes red at `ENTRIES` probes.
+    #[test]
+    fn scan_hddvd_titles_probes_once_for_entries_resolving_to_identical_extents() {
+        const ENTRIES: usize = 512;
+        const SHARED_ICB: u32 = 100;
+        const SHARED_DATA: u32 = 5000;
+
+        let mut disc = MemDisc::new();
+        // Every FID names a different file and points at the SAME File Entry.
+        let specs: Vec<_> = (0..ENTRIES)
+            .map(|i| {
+                file(
+                    &format!("C{i:04}.EVO"),
+                    SHARED_ICB,
+                    SHARED_DATA,
+                    4 * 2048,
+                    true,
+                )
+            })
+            .collect();
+        lay_hddvd_clips(&mut disc, specs);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let probe_lba = PART_START + SHARED_DATA;
+        let mut counter = ProbeCounter::new(disc, vec![probe_lba]);
+        let titles = Disc::scan_hddvd_titles(&mut counter, &udf);
+
+        assert_eq!(
+            counter.hits[0], 1,
+            "{ENTRIES} directory entries all resolving to the SAME extents must \
+             cost ONE probe_evo_streams pass, not one per entry; got {} probes",
+            counter.hits[0]
+        );
+        // And the whole scan's read volume stays bounded — the real currency
+        // here is drive time, not title count.
+        assert!(
+            counter.sectors_read < 4 * ENTRIES as u64,
+            "total sectors read must not scale with the entry count, got {}",
+            counter.sectors_read
+        );
+        assert!(!titles.is_empty(), "the clips still enumerate");
+    }
+
+    /// CONTROL: memoization must not silently collapse DISTINCT clips. A
+    /// legitimate disc with several different `.evo` files still probes each
+    /// one, and each title keeps the streams of ITS OWN clip.
+    ///
+    /// Mutation: make `EvoProbeCache`'s key a constant (ignore the extents) and
+    /// this goes red — the junk clip inherits the first clip's H.264 streams.
+    #[test]
+    fn scan_hddvd_titles_still_probes_each_distinct_clip() {
+        let mut disc = MemDisc::new();
+        let evo = synthetic_evo();
+        let junk = vec![0x55u8; 4 * 2048];
+        let (a_data, b_data, c_data) = (5000u32, 6000u32, 7000u32);
+        lay_hddvd_clips(
+            &mut disc,
+            vec![
+                file_with("A_REAL.EVO", 100, a_data, evo.clone(), true),
+                file_with("B_JUNK.EVO", 101, b_data, junk, true),
+                file_with("C_REAL.EVO", 102, c_data, evo, true),
+            ],
+        );
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let watch = vec![
+            PART_START + a_data,
+            PART_START + b_data,
+            PART_START + c_data,
+        ];
+        let mut counter = ProbeCounter::new(disc, watch);
+        let titles = Disc::scan_hddvd_titles(&mut counter, &udf);
+
+        assert_eq!(
+            titles.len(),
+            3,
+            "every distinct clip still resolves a title"
+        );
+
+        // The substantive assertion first: each title carries the streams of ITS
+        // OWN clip. This is what a wrong memo key actually costs.
+        let by_name = |n: &str| titles.iter().find(|t| t.playlist == n).expect(n);
+        assert!(
+            by_name("A_REAL.EVO")
+                .streams
+                .iter()
+                .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
+            "the real clip keeps its own probed streams"
+        );
+        assert!(
+            by_name("B_JUNK.EVO").streams.is_empty(),
+            "the unrecognizable clip must NOT inherit another clip's streams"
+        );
+        assert!(
+            by_name("C_REAL.EVO")
+                .streams
+                .iter()
+                .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
+            "a third distinct clip is probed on its own extents"
+        );
+
+        assert_eq!(
+            counter.hits,
+            vec![1, 1, 1],
+            "each DISTINCT clip is still probed exactly once"
+        );
+    }
+
+    /// Memoization alone is NOT the whole fix. Collapsing identical extent
+    /// lists bounds the one-File-Entry attack, but distinct extent lists are
+    /// only as bounded as the File Entries an attacker cares to lay down — and
+    /// a File Entry is ONE sector. A 1 MiB directory's ~24,000 FIDs can each
+    /// point at their own 1-sector File Entry (a ~48 MiB image) declaring its
+    /// own huge extent, so every probe misses the memo and the amplification is
+    /// back. [`MAX_HDDVD_CLIPS`] is the bound that closes that.
+    ///
+    /// Mutation: drop the `clips.len() < MAX_HDDVD_CLIPS` gate in the directory
+    /// scan and this goes red at `ENTRIES`.
+    #[test]
+    fn scan_hddvd_titles_caps_a_directory_declaring_absurdly_many_clips() {
+        const ENTRIES: usize = MAX_HDDVD_CLIPS + 300;
+
+        let mut disc = MemDisc::new();
+        // Each entry gets its OWN File Entry and its OWN data extent, so no two
+        // resolve to the same extent list and the memo never hits.
+        let specs: Vec<_> = (0..ENTRIES)
+            .map(|i| {
+                // ICBs live far past the directory's own FID data (~230 KB
+                // from LBA 21) so laying the FIDs cannot clobber them.
+                file(
+                    &format!("C{i:05}.EVO"),
+                    100_000 + i as u32,
+                    1_000_000 + i as u32 * 8,
+                    2048,
+                    true,
+                )
+            })
+            .collect();
+        lay_hddvd_clips(&mut disc, specs);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        assert_eq!(
+            titles.len(),
+            MAX_HDDVD_CLIPS,
+            "a directory declaring {ENTRIES} clips must be capped at \
+             {MAX_HDDVD_CLIPS}; each surviving clip costs a real \
+             probe_evo_streams pass over the medium"
+        );
+    }
+
+    /// The control for the cap: a realistic disc keeps every clip it carries.
+    #[test]
+    fn scan_hddvd_titles_keeps_every_clip_of_a_realistic_disc() {
+        let mut disc = MemDisc::new();
+        let udf = make_hddvd_fs(
+            &mut disc,
+            &[
+                ("FEATURE_1.EVO", 2000, 5000),
+                ("FEATURE_2.EVO", 1800, 9000),
+                ("TRAILER.EVO", 300, 12000),
+                ("DELOGO.EVO", 40, 13000),
+            ],
+        );
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        assert_eq!(
+            titles.len(),
+            4,
+            "a real disc's clips must survive the cap untouched"
         );
     }
 }
