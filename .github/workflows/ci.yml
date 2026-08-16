@@ -31,7 +31,7 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -69,7 +69,7 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: libfreemkv
@@ -109,7 +109,7 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: libfreemkv
@@ -149,7 +149,7 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: libfreemkv
@@ -204,7 +204,7 @@ jobs:
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
           done
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
