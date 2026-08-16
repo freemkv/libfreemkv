@@ -45,6 +45,7 @@ pub const E_INVALID_CDB_LENGTH: u16 = 4001;
 
 // I/O (5xxx)
 pub const E_IO_ERROR: u16 = 5000;
+pub const E_SOURCE_TERMINATED: u16 = 5001;
 
 // Disc format (6xxx)
 pub const E_DISC_READ: u16 = 6000;
@@ -63,6 +64,8 @@ pub const E_SELECTION_PID_UNKNOWN: u16 = 6014;
 pub const E_UDF_BUFFER_TOO_SMALL: u16 = 6012;
 pub const E_UDF_NOT_FILESYSTEM: u16 = 6013;
 pub const E_IMAGE_TRUNCATED: u16 = 6015;
+pub const E_UDF_AD_CHAIN_TOO_LONG: u16 = 6016;
+pub const E_UDF_UNRECORDED_EXTENT: u16 = 6017;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -393,6 +396,18 @@ pub enum Error {
     UdfNotFound {
         path: String,
     },
+    /// The file's ICB allocation list contains an unrecorded (ECMA-167
+    /// 4/14.14.1.1 type-1/type-2) extent: space allocated to the file at that
+    /// location but never written, so its true content there is zeros while
+    /// the media holds something else.
+    ///
+    /// Raised by [`crate::udf::UdfFs::file_extents`] because a
+    /// `(lba, sector_count)` read plan cannot express a hole — reading it
+    /// splices undefined sectors into the rip as content, and dropping it
+    /// slides every later extent's byte space.
+    UdfUnrecordedExtent {
+        path: String,
+    },
     /// The reader was addressable but the bytes are structurally NOT a UDF
     /// filesystem — a deterministic tag/format mismatch (e.g. no Anchor Volume
     /// Descriptor Pointer at sector 256, no partition descriptor, no File Set
@@ -405,6 +420,16 @@ pub enum Error {
     /// 2048-byte sector. A contract violation on the public reader API —
     /// returned instead of panicking on the slice.
     UdfBufferTooSmall,
+    /// A file's allocation-descriptor continuation chain did not end within the
+    /// hop budget the UDF reader allows.
+    ///
+    /// The budget exists so a crafted or corrupt disc cannot loop the reader
+    /// forever. Hitting it is NOT the end of the chain: the extents beyond that
+    /// point are unknown, so the extent list in hand describes only part of the
+    /// file. Returning that list would let a caller zero-pad the remainder to
+    /// the declared size and report a mostly-empty file as a complete
+    /// extraction, so the read fails instead.
+    UdfAdChainTooLong,
     DiscTitleRange {
         index: usize,
         count: usize,
@@ -733,6 +758,19 @@ pub enum Error {
     /// it silently leaves encrypted. The producer surfaces this rather
     /// than emit still-encrypted bytes.
     ExtentNotUnitAligned,
+    /// A [`crate::sector::SectorSource`] that feeds its reads from a
+    /// producer thread has terminated for good — the thread exited after
+    /// an error or before delivering the extents it was given — so it can
+    /// never return another byte.
+    ///
+    /// It exists because the alternative answer is a lie: a dead source
+    /// that reports `Ok(0)` is indistinguishable from end-of-stream, and
+    /// `DiscStream::fill_extents` legitimately reads a short count as a
+    /// skippable hole — zero-filling and advancing over every remaining
+    /// sector of the title and still returning success. Unlike a bad
+    /// sector, this condition cannot be retried at a smaller size or
+    /// skipped past, so every consumer must abort the pass on it.
+    SourceTerminated,
     /// An MPEG-TS packet under construction violated the 188-byte fixed
     /// size (over-long adaptation field, overflowing payload, or a
     /// short/mis-assembled packet). Indicates a muxer invariant break,
@@ -850,13 +888,16 @@ impl Error {
             Error::ScsiError { .. } => E_SCSI_ERROR,
             Error::InvalidCdbLength { .. } => E_INVALID_CDB_LENGTH,
             Error::IoError { .. } => E_IO_ERROR,
+            Error::SourceTerminated => E_SOURCE_TERMINATED,
             Error::DiscRead { .. } => E_DISC_READ,
             Error::Halted => E_HALTED,
             Error::MplsParse => E_MPLS_PARSE,
             Error::ClpiParse => E_CLPI_PARSE,
             Error::UdfNotFound { .. } => E_UDF_NOT_FOUND,
+            Error::UdfUnrecordedExtent { .. } => E_UDF_UNRECORDED_EXTENT,
             Error::UdfNotFilesystem => E_UDF_NOT_FILESYSTEM,
             Error::UdfBufferTooSmall => E_UDF_BUFFER_TOO_SMALL,
+            Error::UdfAdChainTooLong => E_UDF_AD_CHAIN_TOO_LONG,
             Error::DiscTitleRange { .. } => E_DISC_TITLE_RANGE,
             Error::ShortImageRead { .. } => E_SHORT_IMAGE_READ,
             Error::EmptyImage => E_EMPTY_IMAGE,
@@ -1063,6 +1104,7 @@ impl std::fmt::Display for Error {
             },
             Error::Halted => write!(f, "E{}", self.code()),
             Error::UdfNotFound { path } => write!(f, "E{}: {}", self.code(), path),
+            Error::UdfUnrecordedExtent { path } => write!(f, "E{}: {}", self.code(), path),
             Error::SeamPlanDroppedMost { dropped, written } => {
                 write!(f, "E{} {dropped}/{written}", self.code())
             }
@@ -1128,7 +1170,21 @@ impl std::error::Error for Error {
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::IoError { source: e }
+        // If this `io::Error` is one WE produced (`From<Error> for io::Error`
+        // carries the typed value in its boxed payload), give the original
+        // back instead of burying it in `Error::IoError`. That wrapper is not
+        // neutral: `is_scsi_transport_failure` treats `IoError` as a
+        // transport-layer fault (dead bus / wedged bridge), so re-wrapping a
+        // round-tripped `DiscRead` MEDIUM ERROR turned a skippable bad sector
+        // into a pass-aborting bridge wedge — the exact inverse of what that
+        // arm exists for. Any error that crosses a thread boundary as an
+        // `io::Error` (the prefetch channel's `Batch`) keeps its
+        // classification, its SCSI status, and its sense data.
+        match e.downcast::<Error>() {
+            Ok(typed) => typed,
+            // A genuine OS/`std` error — the `IoError` wrapper is correct here.
+            Err(io) => Error::IoError { source: io },
+        }
     }
 }
 
@@ -1143,7 +1199,6 @@ impl From<Error> for std::io::Error {
             return source;
         }
         let code = e.code();
-        let msg = e.to_string();
         // Map our error categories to io::ErrorKind
         let kind = match code {
             // Device access-denied semantics map to PermissionDenied;
@@ -1244,7 +1299,13 @@ impl From<Error> for std::io::Error {
             E_DIR_IMAGE_FILE_CHANGED => std::io::ErrorKind::InvalidData,
             _ => std::io::ErrorKind::Other,
         };
-        std::io::Error::new(kind, msg)
+        // Carry the typed value itself as the payload rather than its
+        // stringification. `Display` is unchanged (`io::Error` delegates to the
+        // boxed error, whose `Display` is the same `E<code>[: …]` string), so
+        // `error_code` and every consumer built on it are unaffected — but the
+        // typed error now SURVIVES the conversion and `From<io::Error> for
+        // Error` can hand it back intact.
+        std::io::Error::new(kind, e)
     }
 }
 
@@ -1263,13 +1324,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// removing comes back.
 ///
 /// [`From<Error> for io::Error`] is the ONLY path from a typed [`Error`] to an
-/// `io::Error` in this crate, and it stringifies (`io::Error::new(kind, msg)`
-/// where `msg` is the `Error`'s `E<code>[: …]` [`Display`](std::fmt::Display)
-/// string) rather than boxing the typed value — no code path constructs an
-/// `io::Error` that still holds a `crate::error::Error` via `get_ref`. So the
-/// only recognised shape is the round-tripped `E<code>` message prefix.
+/// `io::Error` in this crate. It boxes the typed value as the payload
+/// (`io::Error::new(kind, e)`), whose [`Display`](std::fmt::Display) is the
+/// same `E<code>[: …]` string the stringifying version produced — so this
+/// parse is unaffected, and `From<io::Error> for Error` can additionally
+/// `downcast` the payload back to the exact typed error. Errors that did NOT
+/// come from this crate carry no `E<code>` prefix and yield `None`.
 pub fn error_code(e: &std::io::Error) -> Option<u16> {
-    // Round-tripped: `From<Error> for io::Error` stringifies as "E<code>[: …]".
+    // Round-tripped: `From<Error> for io::Error` renders as "E<code>[: …]".
     let s = e.to_string();
     let digits = s.strip_prefix('E')?;
     let end = digits
@@ -1396,6 +1458,22 @@ impl Error {
             self,
             Error::IoError { .. } | Error::DeviceNotFound { .. }
         )
+    }
+
+    /// True if the read SOURCE itself is gone, as opposed to one range of
+    /// media being unreadable. Kept separate from
+    /// [`is_scsi_transport_failure`](Self::is_scsi_transport_failure) —
+    /// which is about the bus/bridge and drives "power-cycle the drive"
+    /// advice — because a terminated producer thread is neither a wedged
+    /// bridge nor a bad sector, and reporting it as SCSI status 0xFF would
+    /// be a fabricated status byte.
+    ///
+    /// What it shares with a transport failure is the only thing the read
+    /// loops need to know: retrying smaller or skipping ahead cannot
+    /// recover anything, so the pass must abort rather than fabricate
+    /// zeros for the rest of the title.
+    pub fn is_source_terminated(&self) -> bool {
+        matches!(self, Error::SourceTerminated)
     }
 
     /// True if this error indicates bridge degradation — the SCSI status

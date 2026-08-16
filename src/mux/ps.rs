@@ -169,6 +169,24 @@ pub struct PsDemuxer {
     /// stay byte-identical.
     buffer_base: u64,
     has_base: bool,
+    /// Boundary-scan cursor for an unbounded (length-0) PES still waiting for
+    /// its terminating PS-layer unit: `(buffer offset of the PES start code,
+    /// buffer offset up to which the search has already proved there is no
+    /// boundary)`. Both are buffer-relative and are rebased when the buffer
+    /// drains.
+    ///
+    /// Without it, every `feed` re-searches the WHOLE accumulated payload from
+    /// the PES header: the buffer only stops growing at [`MAX_PS_BUFFER`], so a
+    /// stream that declares an unbounded PES and then never emits a PS-layer
+    /// start code (a corrupt or crafted VOB) makes the demuxer scan up to 4 MiB
+    /// per call, quadratic in the bytes fed. Cleared whenever the PES is
+    /// emitted, so it can never outlive the packet it describes.
+    pending_scan: Option<(usize, usize)>,
+    /// Test-only: total bytes examined by `find_ps_boundary`. Pins the cursor
+    /// above — the property it exists for is a WORK bound, which no
+    /// packet-level assertion can observe.
+    #[cfg(test)]
+    boundary_bytes_scanned: u64,
 }
 
 impl Default for PsDemuxer {
@@ -184,6 +202,9 @@ impl PsDemuxer {
             buffer: Vec::with_capacity(64 * 1024),
             buffer_base: 0,
             has_base: false,
+            pending_scan: None,
+            #[cfg(test)]
+            boundary_bytes_scanned: 0,
         }
     }
 
@@ -220,6 +241,8 @@ impl PsDemuxer {
         // discarded.
         let packets = self.extract_packets(true);
         self.buffer.clear();
+        // The buffer the cursor indexes into is gone.
+        self.pending_scan = None;
         packets
     }
 
@@ -288,11 +311,29 @@ impl PsDemuxer {
                     // start code — the video ES payload is itself full of
                     // 00 00 01 xx codes that would otherwise cut the PES short.
                     let end = if pes_packet_len == 0 {
-                        match find_ps_boundary(&self.buffer, sc + 4) {
-                            Some(next) => next,
+                        // Resume where the last call stopped searching for
+                        // THIS PES's terminating unit; anything before that is
+                        // already proved boundary-free.
+                        let from = match self.pending_scan {
+                            Some((pes_at, searched_to)) if pes_at == sc => searched_to,
+                            _ => sc + 4,
+                        };
+                        let (found, searched_to) = find_ps_boundary(&self.buffer, from);
+                        #[cfg(test)]
+                        {
+                            self.boundary_bytes_scanned += searched_to.saturating_sub(from) as u64;
+                        }
+                        match found {
+                            Some(next) => {
+                                self.pending_scan = None;
+                                next
+                            }
                             // At EOF the rest of the buffer is this PES's
                             // payload — emit it.
-                            None if flushing => self.buffer.len(),
+                            None if flushing => {
+                                self.pending_scan = None;
+                                self.buffer.len()
+                            }
                             None => {
                                 // No boundary buffered yet. Normally wait for
                                 // more data, but a corrupt stream could declare
@@ -301,8 +342,10 @@ impl PsDemuxer {
                                 // stops untrusted input forcing unbounded
                                 // allocation. Past the cap, flush what we have.
                                 if self.buffer.len() - sc > MAX_PS_BUFFER {
+                                    self.pending_scan = None;
                                     self.buffer.len()
                                 } else {
+                                    self.pending_scan = Some((sc, searched_to));
                                     break; // wait for more data
                                 }
                             }
@@ -338,6 +381,13 @@ impl PsDemuxer {
             if self.has_base {
                 self.buffer_base += pos as u64;
             }
+            // The cursor is a BUFFER offset, so it moves with the drain. A
+            // pending PES always starts at or after `pos` (the loop broke on
+            // it, having already consumed everything before it), so neither
+            // component can underflow.
+            self.pending_scan = self
+                .pending_scan
+                .map(|(pes_at, searched_to)| (pes_at - pos, searched_to - pos));
         }
 
         // Trim a start-code-free tail. Every other exit from the loop above
@@ -359,6 +409,10 @@ impl PsDemuxer {
             if self.has_base {
                 self.buffer_base += drop as u64;
             }
+            // A pending PES implies a start code IS in the buffer, so this
+            // branch cannot run while one is open; drop the cursor anyway
+            // rather than leave a stale offset behind this drain.
+            self.pending_scan = None;
         }
 
         packets
@@ -380,11 +434,19 @@ const START_CODE_PREFIX_KEEP: usize = 2;
 /// PES inside its own payload and re-scan the discarded video bytes as bogus PS
 /// units. Restricting the search to PS-layer IDs (>= 0xB9, excluding the video
 /// ES codes below it) frames the unbounded PES at the right boundary.
-fn find_ps_boundary(data: &[u8], from: usize) -> Option<usize> {
+/// Returns `(boundary, searched_to)`. `searched_to` is the offset up to which
+/// every byte has been PROVED not to begin a PS-layer boundary start code, so
+/// a later call over the same buffer (grown at the tail) may resume there
+/// instead of re-scanning the payload from the PES header. When the scan runs
+/// off the end, the last two bytes are NOT proved: a `00 00 01` prefix can
+/// straddle the next feed's boundary by up to two bytes.
+fn find_ps_boundary(data: &[u8], from: usize) -> (Option<usize>, usize) {
     let mut pos = from;
     while let Some(sc) = find_start_code(data, pos) {
         if sc + 3 >= data.len() {
-            return None;
+            // A start code whose ID byte has not arrived yet: undecided, so
+            // the next scan must look at it again.
+            return (None, sc);
         }
         let id = data[sc + 3];
         if id == PACK_HEADER_ID
@@ -392,11 +454,11 @@ fn find_ps_boundary(data: &[u8], from: usize) -> Option<usize> {
             || id == PROGRAM_END_ID
             || is_pes_stream_id(id)
         {
-            return Some(sc);
+            return (Some(sc), sc);
         }
         pos = sc + 4;
     }
-    None
+    (None, data.len().saturating_sub(2).max(from))
 }
 
 /// Check whether a start code byte is a valid PES stream ID that carries payload.
@@ -1752,7 +1814,80 @@ mod tests {
     /// after it — exactly the tail a real feed can end on.
     #[test]
     fn find_ps_boundary_handles_a_bare_start_code_at_the_buffer_head() {
-        assert_eq!(find_ps_boundary(&[0x00, 0x00, 0x01], 0), None);
+        assert_eq!(
+            find_ps_boundary(&[0x00, 0x00, 0x01], 0),
+            (None, 0),
+            "an undecided trailing start code is not proved boundary-free"
+        );
+    }
+
+    /// An unbounded (length-0) PES is terminated by the next PS-LAYER unit, and
+    /// until one arrives the payload accumulates in the buffer. The search for
+    /// that unit must not restart at the PES header on every feed: the buffer
+    /// only stops growing at `MAX_PS_BUFFER` (4 MiB), and a feed is one read
+    /// batch (at most 510 sectors ≈ 1 MiB, 60 sectors ≈ 120 KiB on an optical
+    /// drive), so re-scanning from byte 0 costs work quadratic in the bytes
+    /// fed — up to 4 MiB of scanning per call, for as long as a corrupt or
+    /// crafted VOB withholds the boundary. A conformant DVD ends every pack
+    /// within 2048 bytes and never reaches this state.
+    ///
+    /// Measured directly, because a work bound has no packet-level shadow:
+    /// `boundary_bytes_scanned` counts the bytes `find_ps_boundary` examines.
+    /// 256 chunks x 4 KiB of boundary-free payload is 1 MiB of input;
+    /// re-scanning from the header on every call examines
+    /// 4 KiB * 256*257/2 = ~128 MiB.
+    ///
+    /// Mutation: drop the `Some((pes_at, searched_to)) if pes_at == sc` arm so
+    /// `from` is always `sc + 4`.
+    #[test]
+    fn an_unterminated_pes_is_not_rescanned_from_its_header_every_feed() {
+        const CHUNKS: usize = 256;
+        const CHUNK: usize = 4096;
+
+        let mut demuxer = PsDemuxer::new();
+        // Unbounded PES header (length 0), then payload that carries no start
+        // code at all, so no PS-layer boundary is ever found.
+        demuxer.feed(&[0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00]);
+        for _ in 0..CHUNKS {
+            assert!(
+                demuxer.feed(&[0xFFu8; CHUNK]).is_empty(),
+                "no boundary yet, so no PES can be emitted"
+            );
+        }
+
+        let fed = (CHUNKS * CHUNK) as u64;
+        assert!(
+            demuxer.boundary_bytes_scanned <= 2 * fed,
+            "boundary search examined {} bytes over {fed} bytes of payload — \
+             the scan must advance with the buffer, not restart at the PES header",
+            demuxer.boundary_bytes_scanned
+        );
+
+        // ...and the cursor must not have cost correctness: the PES still ends
+        // at the pack header that finally arrives, with its whole payload.
+        let pack = [
+            0x00,
+            0x00,
+            0x01,
+            PACK_HEADER_ID,
+            0x44,
+            0x00,
+            0x04,
+            0x00,
+            0x04,
+            0x01,
+            0x00,
+            0x00,
+            0x03,
+            0xF8,
+        ];
+        let packets = demuxer.feed(&pack);
+        assert_eq!(packets.len(), 1, "the pack header terminates the PES");
+        assert_eq!(
+            packets[0].data.len(),
+            CHUNKS * CHUNK,
+            "the whole accumulated payload belongs to the PES"
+        );
     }
 
     /// The boundary-ID check is a 4-way `||`; a mutant that turns the FIRST
@@ -1763,7 +1898,7 @@ mod tests {
         let data = [0x00, 0x00, 0x01, PACK_HEADER_ID, 0xAA];
         assert_eq!(
             find_ps_boundary(&data, 0),
-            Some(0),
+            (Some(0), 0),
             "a pack header start code alone must register as a PS-layer boundary"
         );
     }

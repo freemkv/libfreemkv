@@ -450,13 +450,22 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
             }) else {
                 continue;
             };
-            for clip in &title.clips {
+            // ONLY the anchor's first clip. `disc::bluray` builds a title's
+            // stream list from `play_items[0]`'s STN table, so that is the only
+            // clip in which these PIDs were ever observed — the same clip tier 3
+            // keys its derived ids on (`clip0`, below). Recording the fact
+            // against every clip the anchor plays claims knowledge of stream
+            // tables never read: a sibling playlist over a LATER clip then binds
+            // the anchor's editorial label onto whichever stream of that clip
+            // reuses the PID, which is a different physical stream (PIDs are
+            // unique only within a clip).
+            if let Some(clip) = title.clips.first() {
                 pid_map.insert((clip.clip_id.as_str(), *pid), pos);
             }
         }
         tracing::info!(
             stream_type = ?stream_type,
-            playlist = %titles[anchor].playlist,
+            playlist = ?titles[anchor].playlist,
             slots = slots_of(&titles[anchor], stream_type).len(),
             "label list anchored to a title by its stream-language sequence",
         );
@@ -1907,6 +1916,139 @@ mod apply_tests {
         }
     }
 
+    /// Sentinel embedded in the crafted playlist name below. The capture keeps
+    /// ONLY fields whose rendered form contains it, so installing this
+    /// subscriber process-wide costs nothing and cannot accumulate other
+    /// tests' log output.
+    const LOG_INJECTION_SENTINEL: &str = "FMKV-LOG-INJECTION-PROBE";
+
+    fn capture_sink() -> &'static std::sync::Mutex<Vec<(String, String)>> {
+        static SINK: std::sync::OnceLock<std::sync::Mutex<Vec<(String, String)>>> =
+            std::sync::OnceLock::new();
+        SINK.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// Records how a `tracing` field was RENDERED — the question a disc-derived
+    /// log field raises is not whether it is logged but how.
+    ///
+    /// This is installed as the process-wide default rather than scoped with
+    /// `with_default`, because `tracing` caches an `Interest` per callsite
+    /// GLOBALLY: a sibling test running the same code on another thread with no
+    /// subscriber caches the callsite as "never", and a thread-local subscriber
+    /// installed afterwards then receives nothing. That failure mode is silent
+    /// — an empty capture reads as "no raw bytes found" — so the test asserts
+    /// the capture is non-empty as well.
+    ///
+    /// `register_callsite` answers `never` for every callsite outside this
+    /// module, so the rest of the suite keeps its current no-op logging cost.
+    struct CapturedFields;
+
+    struct FieldVisitor(Vec<(String, String)>);
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    fn is_labels_event(meta: &tracing::Metadata<'_>) -> bool {
+        meta.is_event() && meta.target().starts_with("libfreemkv::labels")
+    }
+
+    impl tracing::Subscriber for CapturedFields {
+        fn register_callsite(
+            &self,
+            meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            if is_labels_event(meta) {
+                tracing::subscriber::Interest::always()
+            } else {
+                tracing::subscriber::Interest::never()
+            }
+        }
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            is_labels_event(meta)
+        }
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut v = FieldVisitor(Vec::new());
+            event.record(&mut v);
+            if v.0
+                .iter()
+                .any(|(_, val)| val.contains(LOG_INJECTION_SENTINEL))
+            {
+                capture_sink().lock().unwrap().extend(v.0);
+            }
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A playlist name is a raw UDF directory entry — disc-controlled bytes,
+    /// validated no further than a lossy UTF-8 decode. Logging it through
+    /// tracing's `%` (Display) sigil writes those bytes VERBATIM, so a crafted
+    /// `.mpls` filename carrying ANSI escapes or control characters forges
+    /// terminal output and log structure in any consumer rendering the event
+    /// (CWE-117). `?` (Debug) escapes them, and `str`'s Debug is exactly the
+    /// escaping this needs.
+    ///
+    /// `info!` is not covered by the debug/trace-logging exemption: this fires
+    /// on an ordinary rip of an ordinary disc.
+    ///
+    /// Mutation: put `%` back on `playlist` in `apply_labels` and this goes red.
+    #[test]
+    fn a_disc_derived_playlist_name_is_escaped_in_the_log_not_written_verbatim() {
+        // A name whose bytes would clear the line and repaint it.
+        let evil = format!("\u{1b}[2K\u{1b}[31m{LOG_INJECTION_SENTINEL}\u{7}\u{1b}[0m.mpls");
+        let _ = tracing::subscriber::set_global_default(CapturedFields);
+
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::None),
+            sub_label(2, "spa", LabelQualifier::None),
+            sub_label(3, "fra", LabelQualifier::None),
+        ];
+        let mut titles = vec![title_on_clip(
+            &evil,
+            "00294",
+            vec![
+                subtitle(0x12A0, "eng"),
+                subtitle(0x12A1, "spa"),
+                subtitle(0x12A2, "fra"),
+            ],
+        )];
+        apply_labels(&labels, &mut titles);
+
+        let fields = capture_sink().lock().unwrap().clone();
+        let playlist: Vec<&(String, String)> = fields
+            .iter()
+            .filter(|(k, v)| k == "playlist" && v.contains(LOG_INJECTION_SENTINEL))
+            .collect();
+        assert!(
+            !playlist.is_empty(),
+            "the anchoring event must actually have fired, or this test proves \
+             nothing; captured: {fields:?}"
+        );
+        for (_, rendered) in playlist {
+            assert!(
+                !rendered.contains('\u{1b}') && !rendered.contains('\u{7}'),
+                "a disc-controlled playlist name reached the log with its raw \
+                 control bytes intact: {rendered:?}"
+            );
+            assert!(
+                rendered.contains(LOG_INJECTION_SENTINEL),
+                "the name must still be legible once escaped: {rendered:?}"
+            );
+        }
+    }
+
     fn sub_label(num: u16, lang: &str, qualifier: LabelQualifier) -> StreamLabel {
         StreamLabel {
             stream_id: None,
@@ -3100,6 +3242,79 @@ mod apply_tests {
             sub_state(&titles[1]),
             vec![(0x1200, false, LabelQualifier::None)],
             "the featurette's own stream is not the feature's subtitle 1"
+        );
+    }
+
+    /// A title that plays SEVERAL clips in order — the shape the anchor's
+    /// PID facts are harvested from.
+    fn title_on_clips(playlist: &str, clip_ids: &[&str], streams: Vec<Stream>) -> DiscTitle {
+        DiscTitle {
+            playlist: playlist.into(),
+            clips: clip_ids
+                .iter()
+                .map(|id| crate::disc::Clip {
+                    feed_span: None,
+                    clip_id: (*id).into(),
+                    in_time: 0,
+                    out_time: 0,
+                    duration_secs: 3600.0,
+                    source_packets: 0,
+                })
+                .collect(),
+            ..title_with(streams)
+        }
+    }
+
+    /// Spec: the anchor proves a `(clip, PID)` fact only for the clip its
+    /// stream table was READ FROM — the first play item — never for every clip
+    /// the anchor happens to play.
+    ///
+    /// `disc::bluray` builds a title's stream list from `play_items[0]`'s STN
+    /// table, and tier 3 fifty lines below says exactly that by keying its
+    /// derived ids on `clip0`. Tier 2's harvest contradicted it: it recorded
+    /// the anchor's slot PIDs against EVERY clip the anchor plays, so a sibling
+    /// playlist that plays a LATER clip of the anchor bound the anchor's
+    /// editorial label onto whatever stream in that clip happens to reuse the
+    /// PID — a different physical stream, in a different clip, whose own
+    /// language says so.
+    ///
+    /// Mutation: harvest over `&title.clips` instead of its first clip — the
+    /// featurette wears the feature's SDH again.
+    #[test]
+    fn an_anchor_proves_pids_only_for_the_clip_its_table_came_from() {
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::Sdh),
+            sub_label(2, "fra", LabelQualifier::None),
+        ];
+        let mut titles = vec![
+            // The anchor: its stream table is clip 00082's (the first play
+            // item); it merely CONTINUES into 00090.
+            title_on_clips(
+                "00800.mpls",
+                &["00082", "00090"],
+                vec![subtitle(0x1200, "eng"), subtitle(0x1201, "fra")],
+            ),
+            // A sibling playlist over the anchor's SECOND clip. Its subtitle
+            // reuses PID 0x1200 — PIDs are only unique within a clip — and it
+            // is Spanish, so nothing about the anchor's English SDH slot
+            // describes it.
+            title_on_clips("00451.mpls", &["00090"], vec![subtitle(0x1200, "spa")]),
+        ];
+        apply_labels(&labels, &mut titles);
+
+        assert_eq!(
+            sub_state(&titles[0]),
+            vec![
+                (0x1200, false, LabelQualifier::Sdh),
+                (0x1201, false, LabelQualifier::None)
+            ],
+            "the anchor itself keeps the qualifiers the list states for it"
+        );
+        assert_eq!(
+            sub_state(&titles[1]),
+            vec![(0x1200, false, LabelQualifier::None)],
+            "a PID in a clip the anchor's table never described is not that \
+             table's stream 1"
         );
     }
 

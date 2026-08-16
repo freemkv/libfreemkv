@@ -159,7 +159,13 @@ impl CodecParser for DvdSubParser {
 
 /// Convert a single YCbCr color to RGB, clamping to [0, 255].
 ///
-/// Input: `[padding, Y, Cb, Cr]` (as stored in DVD IFO PGC data).
+/// Input: `[padding, Y, Cr, Cb]` (as stored in DVD IFO PGC data). Note the
+/// chroma order: the on-disc PGC CLUT is **Cr before Cb** — byte 2 is Cr and
+/// byte 3 is Cb. Reading byte 2 as Cb swaps red and blue on every chromatic
+/// entry, and is invisible on the achromatic (white/black/grey, Cb = Cr = 128)
+/// entries that dominate real palettes, which is how it survives casual
+/// inspection. The order is fixed by the DVD-Video PGC format, not by us.
+///
 /// Returns `[R, G, B]`.
 ///
 /// Range convention (deliberate): this uses the **full-range (JFIF) BT.601**
@@ -175,8 +181,8 @@ impl CodecParser for DvdSubParser {
 /// side in lockstep.
 pub fn ycbcr_to_rgb(color: &[u8; 4]) -> [u8; 3] {
     let y = color[1] as f64;
-    let cb = color[2] as f64;
-    let cr = color[3] as f64;
+    let cr = color[2] as f64;
+    let cb = color[3] as f64;
 
     let r = y + 1.402 * (cr - 128.0);
     let g = y - 0.344 * (cb - 128.0) - 0.714 * (cr - 128.0);
@@ -198,7 +204,7 @@ fn clamp_u8(v: f64) -> u8 {
 /// Format a 16-color YCbCr palette as a VobSub `.idx` header for S_VOBSUB
 /// CodecPrivate.
 ///
-/// Each entry is `[padding, Y, Cb, Cr]`. Output is a UTF-8 text block carrying
+/// Each entry is `[padding, Y, Cr, Cb]`. Output is a UTF-8 text block carrying
 /// the two `.idx` header lines mkvmerge / libvobsub expect:
 ///
 /// ```text
@@ -432,24 +438,26 @@ mod tests {
 
     #[test]
     fn ycbcr_to_rgb_clamps_overflow() {
-        // Y=255, Cr=255 → R would be 255 + 1.402*127 = ~433, should clamp to 255
-        let color = [0x00, 255, 128, 255];
+        // Y=255, Cr=255 → R would be 255 + 1.402*127 = ~433, should clamp to 255.
+        // Cr is byte 2 in the on-disc [pad, Y, Cr, Cb] layout.
+        let color = [0x00, 255, 255, 128];
         let [r, _g, _b] = ycbcr_to_rgb(&color);
         assert_eq!(r, 255);
     }
 
     #[test]
     fn ycbcr_to_rgb_clamps_underflow() {
-        // Y=0, Cr=0 → R = 0 + 1.402*(0-128) = -179, should clamp to 0
-        let color = [0x00, 0, 128, 0];
+        // Y=0, Cr=0 → R = 0 + 1.402*(0-128) = -179, should clamp to 0.
+        // Cr is byte 2 in the on-disc [pad, Y, Cr, Cb] layout.
+        let color = [0x00, 0, 0, 128];
         let [r, _g, _b] = ycbcr_to_rgb(&color);
         assert_eq!(r, 0);
     }
 
     #[test]
     fn ycbcr_to_rgb_red() {
-        // Approximate red: Y=82, Cb=90, Cr=240
-        let color = [0x00, 82, 90, 240];
+        // Approximate red: Y=82, Cr=240, Cb=90 — on disc as [pad, Y, Cr, Cb].
+        let color = [0x00, 82, 240, 90];
         let [r, g, b] = ycbcr_to_rgb(&color);
         // R = 82 + 1.402*(240-128) = 82 + 156.9 ≈ 239
         // G = 82 - 0.344*(90-128) - 0.714*(240-128) = 82 + 13.1 - 79.97 ≈ 15
@@ -457,6 +465,46 @@ mod tests {
         assert!(r > 200, "R should be high for red, got {}", r);
         assert!(g < 30, "G should be low for red, got {}", g);
         assert!(b < 30, "B should be low for red, got {}", b);
+    }
+
+    /// On-disc DVD PGC CLUT byte order is `[0, Y, Cr, Cb]` — byte 2 is **Cr**
+    /// and byte 3 is **Cb**, per the DVD-Video PGC format.
+    ///
+    /// This fixture uses a real on-disc red entry, so it fails if the two
+    /// chroma bytes are ever exchanged again. It is deliberately NOT built
+    /// from this crate's own doc comments: those described the order wrongly
+    /// for a long time, and the previous version of this test inherited the
+    /// error from them and therefore could not detect it.
+    ///
+    /// A saturated RED entry therefore appears on disc as Y=76, Cr=255, Cb=85
+    /// (full-range BT.601 encoding of RGB #FF0000), i.e. bytes
+    /// `[0x00, 76, 255, 85]`. Reading byte 2 as Cb and byte 3 as Cr instead
+    /// turns this entry BLUE, which is the exact user-visible symptom.
+    ///
+    /// The pre-existing `_white` / `_black` tests cannot catch this: they use
+    /// Cb = Cr = 128, so exchanging two equal bytes is a literal no-op.
+    #[test]
+    fn ycbcr_to_rgb_reads_byte2_as_cr_and_byte3_as_cb() {
+        // On-disc [pad, Y, Cr, Cb] for saturated red.
+        let on_disc_red = [0x00u8, 76, 255, 85];
+        let [r, g, b] = ycbcr_to_rgb(&on_disc_red);
+
+        assert!(
+            r > 200 && b < 60,
+            "on-disc red [0,Y=76,Cr=255,Cb=85] must render red-dominant, \
+             got R={r} G={g} B={b} (R and B swapped => byte 2/3 are transposed)"
+        );
+        assert_eq!([r, g, b], [254, 0, 0], "exact full-range BT.601 red");
+
+        // And the converse: a saturated BLUE on-disc entry (Y=29, Cr=107, Cb=255)
+        // must not come out red.
+        let on_disc_blue = [0x00u8, 29, 107, 255];
+        let [r2, g2, b2] = ycbcr_to_rgb(&on_disc_blue);
+        assert!(
+            b2 > 200 && r2 < 60,
+            "on-disc blue [0,Y=29,Cr=107,Cb=255] must render blue-dominant, \
+             got R={r2} G={g2} B={b2}"
+        );
     }
 
     // ── Palette formatting tests ──────────────────────────────────────────
@@ -699,7 +747,8 @@ mod tests {
     #[test]
     fn ycbcr_blue_channel_clamps_high() {
         // B = Y + 1.772*(Cb-128). Y=128, Cb=255 → 128 + 1.772*127 ≈ 353 → clamp 255.
-        let [_r, _g, b] = ycbcr_to_rgb(&[0x00, 128, 255, 128]);
+        // Cb is byte 3 in the on-disc [pad, Y, Cr, Cb] layout.
+        let [_r, _g, b] = ycbcr_to_rgb(&[0x00, 128, 128, 255]);
         assert_eq!(b, 255, "blue clamps at 255");
     }
 
