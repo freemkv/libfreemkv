@@ -85,16 +85,16 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         let enums = identify_master_enums(archive);
         if enums.is_empty() {
             tracing::info!(
-                jar = %entry_name,
+                jar = ?entry_name,
                 "deluxe: com/bydeluxe/ present but no master enum fingerprint matched"
             );
             return None;
         }
         for (label, m) in &enums {
             tracing::info!(
-                jar = %entry_name,
+                jar = ?entry_name,
                 enum = %label,
-                class = %m.class_name,
+                class = ?m.class_name,
                 count = m.values.len(),
                 "deluxe master enum identified",
             );
@@ -110,15 +110,15 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         let binding_classes = find_binding_classes(archive, &master_table.class_name_set());
         if binding_classes.is_empty() {
             tracing::info!(
-                jar = %entry_name,
+                jar = ?entry_name,
                 "deluxe: no binding class found (no class has enough getstatic refs to master enums)"
             );
             return None;
         }
         for (name, count) in &binding_classes {
             tracing::info!(
-                jar = %entry_name,
-                binding_class = %name,
+                jar = ?entry_name,
+                binding_class = ?name,
                 getstatic_count = count,
                 "deluxe binding class candidate",
             );
@@ -138,7 +138,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         }
         if streams.is_empty() {
             tracing::info!(
-                jar = %entry_name,
+                jar = ?entry_name,
                 "deluxe: binding classes found but produced 0 decoded streams"
             );
             return None;
@@ -149,7 +149,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
             return None;
         }
         tracing::info!(
-            jar = %entry_name,
+            jar = ?entry_name,
             audio = labels.iter().filter(|l| l.stream_type == StreamLabelType::Audio).count(),
             subtitle = labels.iter().filter(|l| l.stream_type == StreamLabelType::Subtitle).count(),
             "deluxe emitted labels",

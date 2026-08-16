@@ -183,7 +183,17 @@ fn sniff_audio_codec(es: &[u8]) -> Option<Codec> {
 /// dimensions from the H.264 SPS, and E-AC-3 channel counts are not decoded
 /// here). Returns an empty vec when the clip cannot be read or carries no
 /// recognizable stream (e.g. an AACS-encrypted clip probed as ciphertext).
-fn probe_evo_streams(reader: &mut dyn SectorSource, extents: &[Extent]) -> Vec<Stream> {
+///
+/// Cancellation is checked before every chunk read and is the ONE condition
+/// that returns `Err` rather than an empty vec: a probe cut short by a Stop has
+/// not established that the clip carries no streams, and reporting it as if it
+/// had would enumerate a stream-less title as a scanned fact. A read that fails
+/// for any other reason keeps the existing best-effort behaviour.
+fn probe_evo_streams(
+    reader: &mut dyn SectorSource,
+    extents: &[Extent],
+    halt: Option<&crate::halt::Halt>,
+) -> Result<Vec<Stream>> {
     let mut demux = PsDemuxer::new();
     let mut video: Vec<u8> = Vec::new();
     // Routing PID of the video track, captured from the first video PES seen:
@@ -201,10 +211,25 @@ fn probe_evo_streams(reader: &mut dyn SectorSource, extents: &[Extent]) -> Vec<S
         let mut left = ext.sector_count;
         while left > 0 && remaining > 0 {
             // 1 MiB read chunks (512 sectors) keep buffers small.
+            // Poll before every chunk, as the PGS probe does: a clip's probe
+            // budget is 16 MiB of blocking reads, and on marginal media each
+            // one can sit in the drive's retry path, so per-clip granularity
+            // alone would leave a Stop waiting on a dead disc.
+            if halt.is_some_and(|h| h.is_cancelled()) {
+                return Err(crate::error::Error::Halted);
+            }
             let n = left.min(remaining).min(512) as u16;
             let mut buf = vec![0u8; n as usize * crate::consts::SECTOR_BYTES];
-            if reader.read_sectors(lba, n, &mut buf, false).is_err() {
-                break 'outer;
+            match reader.read_sectors(lba, n, &mut buf, false) {
+                Ok(_) => {}
+                // A live-drive Stop surfaces HERE, not through the token:
+                // `Drive::checked_exec` fails every command with `Halted` once
+                // the flag is set. Swallowing it (as any other read error is
+                // swallowed) reports an un-probed clip as a probed one.
+                Err(crate::error::Error::Halted) => {
+                    return Err(crate::error::Error::Halted);
+                }
+                Err(_) => break 'outer,
             }
             for pkt in demux.feed(&buf) {
                 collect_es(&pkt, &mut video, &mut video_pid, &mut audio);
@@ -262,7 +287,7 @@ fn probe_evo_streams(reader: &mut dyn SectorSource, extents: &[Extent]) -> Vec<S
             label: String::new(),
         }));
     }
-    streams
+    Ok(streams)
 }
 
 /// Accumulate a demuxed PES packet's elementary-stream bytes into the video /
@@ -384,12 +409,253 @@ fn evo_from_src(src: &str) -> Option<String> {
     Some(format!("{}.evo", stem.to_ascii_lowercase()))
 }
 
+/// Maximum element nesting depth accepted in an XPL. A real `VPLST000.XPL` is
+/// about six levels deep at its deepest
+/// (`Playlist`/`TitleSet`/`Title`/`PrimaryAudioVideoClip`/`Video`, or
+/// `.../ChapterList/Chapter`); 32 leaves a 5x margin for authoring tools that
+/// wrap extra `ApplicationSegment`/`ObjectMappingList` layers, while staying
+/// trivially stack-safe.
+const MAX_XPL_DEPTH: usize = 32;
+
+/// Most `<Title>` elements one playlist may declare.
+///
+/// The depth guard above bounds NESTING; this bounds BREADTH, and they are
+/// separate attacks. A flat playlist passes the depth check trivially and can
+/// still declare a title per 51 bytes, so a 64 MiB `VPLST000.XPL` — exactly
+/// `udf::MAX_FILE_BYTES` — reaches ~1.3 million of them.
+///
+/// That matters here and not on the Blu-ray side because of where the count
+/// comes from: `bluray.rs` learns its playlists from the MPLS files actually
+/// present in the UDF directory, so the medium bounds it. An XPL DECLARES its
+/// titles, so nothing does.
+///
+/// The cost is not memory but drive time. `compose_xpl_titles` runs
+/// `probe_evo_streams` once per title, and each probe reads real sectors — so
+/// an uncapped count turns a `Disc::scan()` the operator expects to take
+/// seconds into tens of terabytes of optical reads on a disc that is only
+/// pretending to be large.
+///
+/// The bound that matters is `cap x EVO_PROBE_SECTORS`, since each title costs
+/// one probe: `compose_xpl_titles` memoizes on the title's RESOLVED extent list,
+/// and distinct titles built from different combinations of the same clips have
+/// different lists, so each one misses the memo. At 4096 that product was 64 GiB
+/// of optical reads — the same worst case, and the same contradiction with
+/// "seconds", as the sibling [`MAX_HDDVD_CLIPS`] path.
+///
+/// 512 keeps it at 8 GiB and remains far above any real disc (retail HD-DVDs
+/// carry tens of titles).
+const MAX_XPL_TITLES: usize = 512;
+
+/// Cap on `.evo` clips taken from the `HVDVD_TS/` directory listing.
+///
+/// [`MAX_XPL_TITLES`] bounds what a PLAYLIST may declare, and
+/// [`xpl_depth_within_limit`] bounds how deeply it may nest — but both live on
+/// the `ADV_OBJ/*.XPL` path, and a crafted disc simply OMITS `/ADV_OBJ`. Control
+/// then reaches the clip-name fallback in [`Disc::scan_hddvd_titles`], which
+/// emits one title per DIRECTORY ENTRY and probes each. That is the same
+/// unbounded-probe cost, reached without the playlist.
+///
+/// The directory is the only bound the medium supplies, and `udf::MAX_DIR_BYTES`
+/// (1 MiB) still leaves room for ~24,000 FIDs. Memoizing the probe
+/// ([`EvoProbeCache`]) collapses entries that resolve to the SAME extents, which
+/// closes the many-names-one-File-Entry case — but it cannot close this one: a
+/// File Entry is a single sector, so an attacker can give every FID its own,
+/// each declaring its own extent, for ~48 MiB of image. Every probe then misses
+/// the memo and costs a full [`EVO_PROBE_SECTORS`] (16 MiB) read — hundreds of
+/// GiB on a `Disc::scan()` the operator expects to take seconds.
+///
+/// The cap's job is therefore to bound `cap x EVO_PROBE_SECTORS`, and only that
+/// product means anything. It was 4096 — chosen to match [`MAX_XPL_TITLES`],
+/// which bounds a different path with no per-item read cost — and 4096 x 16 MiB
+/// is 64 GiB of optical reads: more than dual-layer HD-DVD media physically
+/// holds (reachable anyway, since distinct extent lists may overlap on the
+/// medium) and tens of minutes to hours at drive speeds. That is not "a scan
+/// the operator expects to take seconds"; the cap stopped literal
+/// unboundedness while permitting a worst case the same doc ruled out.
+///
+/// 512 keeps the product at 8 GiB and still leaves a wide margin over any real
+/// disc — retail HD-DVDs carry TENS of `.evo` clips, so this is ~10x the
+/// real-world maximum, the same sizing convention
+/// [`MAX_XPL_CHAPTERS_PER_TITLE`] uses against the 99-chapter authoring
+/// ceiling. No genuine disc loses a title.
+///
+/// Pinned by `the_clip_cap_and_probe_budget_bound_a_scans_worst_case_read_volume`,
+/// which asserts the PRODUCT rather than either constant, so raising one
+/// without re-examining the other fails.
+const MAX_HDDVD_CLIPS: usize = 512;
+
+/// Most `<PrimaryAudioVideoClip>` elements one `<Title>` may contribute.
+///
+/// The fourth amplification axis on this function, and the one the other three
+/// guards leave open. [`MAX_XPL_DEPTH`] bounds NESTING, [`MAX_XPL_TITLES`]
+/// bounds how many titles a playlist DECLARES, and [`MAX_HDDVD_CLIPS`] bounds
+/// the directory fallback — none of them bounds how many clips a SINGLE title
+/// collects.
+///
+/// Two things multiply here. A 64 MiB XPL (exactly `udf::MAX_FILE_BYTES`) holds
+/// ~1.7 million `<PrimaryAudioVideoClip src="A.EVO"/>` elements at ~38 bytes
+/// each. And the collector below is `descendants()`, not `children()`, so a clip
+/// nested inside N ancestor `<Title>` elements is collected by EVERY one of
+/// them — and the depth cap still permits 32 such ancestors (measured: a bare
+/// `<Title>` root nests 32 deep and still parses, because the guard counts the
+/// self-closing clip element as non-nesting). The product is ~1.7M x 32 ≈ 56
+/// million heap-allocated [`XplClip`]s, each with its own `String`, and then as
+/// many [`Clip`]s again in [`compose_xpl_titles`].
+///
+/// Unlike the title cap, the cost here is MEMORY rather than drive time:
+/// `compose_xpl_titles` de-duplicates by `.evo` name before probing
+/// (`seen_evos`), so repeats cost no extra sector reads — but the `Vec`s are
+/// built and held regardless.
+///
+/// 256 is far above any real disc. A retail HD-DVD title is a handful of clips —
+/// a feature is one, or two across a layer break; even a seamless-branching or
+/// multi-angle title is tens. It also keeps the aggregate bounded: at most
+/// [`MAX_XPL_TITLES`] x 256 clips, rather than the tens of millions above.
+const MAX_XPL_CLIPS_PER_TITLE: usize = 256;
+
+/// Most `<Chapter>` elements one `<Title>` may contribute.
+///
+/// The same `descendants()` amplification as [`MAX_XPL_CLIPS_PER_TITLE`], on the
+/// second unbounded `collect()` in the same loop, and bounded separately so that
+/// capping clips does not simply move the attack next door. A chapter is a bare
+/// `f64` rather than a `String`-carrying struct, so each one is cheaper — but a
+/// `<Chapter titleTimeBegin="…"/>` element is also smaller, so the element count
+/// an XPL can reach is comparable.
+///
+/// 1024 is far above any real disc: the DVD/HD-DVD authoring convention tops out
+/// at 99 chapters per title, so this leaves a 10x margin.
+const MAX_XPL_CHAPTERS_PER_TITLE: usize = 1024;
+
+/// Memoized [`probe_evo_streams`], keyed on the RESOLVED extent list.
+///
+/// Probing is the expensive half of title composition: each pass reads up to
+/// [`EVO_PROBE_SECTORS`] (16 MiB) off the medium. Both composition paths can
+/// reach the same physical clip many times over — an XPL naming one `.evo` from
+/// many `<Title>`s, or a directory whose FIDs all point at one File Entry — and
+/// a probe is a pure function of the extents it reads, so the second and later
+/// passes over an identical extent list are re-reads of bytes already seen.
+///
+/// The key is the extent list itself, NOT the clip name or title: two names for
+/// one File Entry share a key (one probe), while two genuinely different clips
+/// have different `start_lba`s and so keep their own probes and their own
+/// streams. Cache size is bounded by the caller's title/clip cap
+/// ([`MAX_XPL_TITLES`] / [`MAX_HDDVD_CLIPS`]).
+#[derive(Default)]
+struct EvoProbeCache {
+    seen: std::collections::HashMap<Vec<(u32, u32)>, Vec<Stream>>,
+}
+
+impl EvoProbeCache {
+    /// Streams for `extents` — probed on first sight, replayed from the memo
+    /// afterwards.
+    fn streams(
+        &mut self,
+        reader: &mut dyn SectorSource,
+        extents: &[Extent],
+        halt: Option<&crate::halt::Halt>,
+    ) -> Result<Vec<Stream>> {
+        let key: Vec<(u32, u32)> = extents
+            .iter()
+            .map(|e| (e.start_lba, e.sector_count))
+            .collect();
+        if let Some(hit) = self.seen.get(&key) {
+            return Ok(hit.clone());
+        }
+        // A cancelled probe is not memoised: it never established what the
+        // clip holds, so replaying it for the next title that shares these
+        // extents would spread one Stop into a disc-wide "no streams" verdict.
+        let streams = probe_evo_streams(reader, extents, halt)?;
+        self.seen.insert(key, streams.clone());
+        Ok(streams)
+    }
+}
+
+/// Reject a disc-supplied XML blob whose element nesting exceeds `MAX_XPL_DEPTH`,
+/// BEFORE it reaches the parser. `roxmltree` is recursive-descent and its
+/// depth-10 limit applies only to ENTITY expansion, so element nesting is
+/// unbounded: a few hundred KB of well-formed XML — far under the read cap —
+/// overflows the thread stack. That is a process ABORT, not an `Err` and not an
+/// unwind, so neither the `Document::parse` fallback nor `catch_unwind` can
+/// contain it; the only fix is to not hand the document over at all. A byte-size
+/// cap is deliberately NOT added: file size is already bounded by the UDF read
+/// path, and a size cap does not close this class (a 180 KB document already
+/// aborts) — depth is the bound that matters.
+///
+/// This is a conservative scan, not a validator: it tracks `<name …>` /
+/// `</name>` while skipping comments, CDATA, processing instructions and
+/// declarations, and treats `<… />` as non-nesting. A miscount can only cost a
+/// pathological document its fast path, and the failure mode is the existing
+/// one — fall back to the clip-name heuristic.
+fn xpl_depth_within_limit(text: &str) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    // Index just past `needle`, or the end of input when unterminated.
+    let after = |from: usize, needle: &[u8]| -> usize {
+        b[from..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map_or(b.len(), |p| from + p + needle.len())
+    };
+    while i < b.len() {
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        match b.get(i + 1) {
+            Some(b'/') => {
+                depth = depth.saturating_sub(1);
+                i = after(i, b">");
+            }
+            Some(b'?') => i = after(i, b"?>"),
+            Some(b'!') if b[i..].starts_with(b"<!--") => i = after(i, b"-->"),
+            Some(b'!') if b[i..].starts_with(b"<![CDATA[") => i = after(i, b"]]>"),
+            // `<!DOCTYPE …>` and friends. An internal subset is not tracked;
+            // `allow_dtd` is off by default, so such a document is rejected by
+            // the parser anyway.
+            Some(b'!') => i = after(i, b">"),
+            _ => {
+                // Element start tag: walk to its `>`, ignoring `>` inside
+                // quoted attribute values, and note whether it self-closes.
+                let mut j = i + 1;
+                let mut quote = 0u8;
+                let mut prev = 0u8;
+                while j < b.len() {
+                    let c = b[j];
+                    if quote != 0 {
+                        if c == quote {
+                            quote = 0;
+                        }
+                    } else if c == b'"' || c == b'\'' {
+                        quote = c;
+                    } else if c == b'>' {
+                        break;
+                    }
+                    prev = c;
+                    j += 1;
+                }
+                if prev != b'/' {
+                    depth += 1;
+                    if depth > MAX_XPL_DEPTH {
+                        return false;
+                    }
+                }
+                i = j + 1;
+            }
+        }
+    }
+    true
+}
+
 /// Parse the Advanced-Content playlist into its titles. Elements are matched by
 /// LOCAL name (the document is in the `HDDVDVideo/Playlist` default namespace).
-/// Returns empty for a non-XML / non-playlist blob so the caller falls back to
-/// the clip-name heuristic.
+/// Returns empty for a non-XML / non-playlist blob, or one nested deeper than
+/// [`MAX_XPL_DEPTH`], so the caller falls back to the clip-name heuristic.
 fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
     let text = String::from_utf8_lossy(xpl);
+    if !xpl_depth_within_limit(&text) {
+        return Vec::new();
+    }
     let Ok(doc) = roxmltree::Document::parse(&text) else {
         return Vec::new();
     };
@@ -404,7 +670,11 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
         .unwrap_or(60);
 
     let mut titles = Vec::new();
-    for tnode in doc.descendants().filter(|n| local(n, "Title")) {
+    for tnode in doc
+        .descendants()
+        .filter(|n| local(n, "Title"))
+        .take(MAX_XPL_TITLES)
+    {
         let number = tnode
             .attribute("titleNumber")
             .and_then(|s| s.trim().parse::<u16>().ok())
@@ -424,6 +694,19 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             .descendants()
             .filter(|n| local(n, "PrimaryAudioVideoClip"))
         {
+            // Bounded by MAX_XPL_CLIPS_PER_TITLE. `descendants()` is deliberate
+            // — a real playlist wraps its clips in `<PrimaryAudioVideoClipList>`
+            // or an `ApplicationSegment`, so `children()` would miss them — but
+            // it also means a clip nested inside N ancestor `<Title>`s is
+            // collected N times over, and the depth guard still allows 32 such
+            // ancestors. `break` rather than dropping surplus: unlike the
+            // directory scan (which must keep reading to find the `.vti`),
+            // nothing later in THIS loop is needed, and stopping bounds the walk
+            // as well as the allocation. Chapters are collected by a separate
+            // iterator below, so they are unaffected.
+            if clips.len() >= MAX_XPL_CLIPS_PER_TITLE {
+                break;
+            }
             let Some(evo) = c.attribute("src").and_then(evo_from_src) else {
                 continue;
             };
@@ -445,6 +728,8 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             continue;
         }
 
+        // Bounded by MAX_XPL_CHAPTERS_PER_TITLE — the same `descendants()`
+        // amplification as the clip loop above, on the same crafted playlist.
         let chapters = tnode
             .descendants()
             .filter(|n| local(n, "Chapter"))
@@ -452,6 +737,7 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
                 ch.attribute("titleTimeBegin")
                     .and_then(|s| parse_timecode(s, tick_base))
             })
+            .take(MAX_XPL_CHAPTERS_PER_TITLE)
             .collect();
 
         titles.push(XplTitle {
@@ -484,18 +770,43 @@ fn compose_xpl_titles(
     reader: &mut dyn SectorSource,
     xpl_titles: &[XplTitle],
     clip_extents: &BTreeMap<String, (String, u64, Vec<Extent>)>,
-) -> Vec<DiscTitle> {
+    unusable: &std::collections::HashSet<String>,
+    halt: Option<&crate::halt::Halt>,
+) -> Result<Vec<DiscTitle>> {
     let mut titles = Vec::new();
+    // One memo for the whole playlist: a playlist legitimately carries several
+    // titles over the same clip (angles, a branch, a seamless-join variant), and
+    // a crafted one can name a single `.evo` from all MAX_XPL_TITLES titles.
+    let mut probes = EvoProbeCache::default();
     for t in xpl_titles {
+        // A clip that exists but has no truthful read plan poisons every
+        // title that names it: composing around it would emit a title short
+        // by that clip's bytes while its durations and chapter offsets still
+        // assume them.
+        if t.clips.iter().any(|c| unusable.contains(&c.evo)) {
+            continue;
+        }
         let mut extents = Vec::new();
         let mut size_bytes = 0u64;
         let mut parts = Vec::new();
+        // A crafted `<PrimaryAudioVideoClip>` list can name the same `.evo`
+        // any number of times (XML has no fixed element count, unlike MPLS's
+        // binary PlayItem count). Mirrors bluray.rs's
+        // `first_ref = seen_clips.insert(...)` gate (`:113`/`:117`): push a
+        // clip's physical extents and size only the first time its key is
+        // seen, so a clip named N times contributes its extent list ONCE
+        // instead of N times over. The analogous key here is the `.evo`
+        // filename — this format has no clip_id, and `.evo` is what
+        // `clip_extents` is already keyed by.
+        let mut seen_evos: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for c in &t.clips {
             let Some((orig, size, exts)) = clip_extents.get(&c.evo) else {
                 continue;
             };
-            extents.extend_from_slice(exts);
-            size_bytes += *size;
+            if seen_evos.insert(c.evo.as_str()) {
+                extents.extend_from_slice(exts);
+                size_bytes = size_bytes.saturating_add(*size);
+            }
             parts.push(Clip {
                 feed_span: None,
                 clip_id: orig
@@ -512,7 +823,7 @@ fn compose_xpl_titles(
         if parts.is_empty() {
             continue;
         }
-        let streams = probe_evo_streams(reader, &extents);
+        let streams = probes.streams(reader, &extents, halt)?;
         let chapters = t
             .chapters
             .iter()
@@ -541,7 +852,7 @@ fn compose_xpl_titles(
             codec_privates: Vec::new(),
         });
     }
-    titles
+    Ok(titles)
 }
 
 impl Disc {
@@ -555,12 +866,22 @@ impl Disc {
     /// its own title. Falls back to one title per clip when the VTI is absent or
     /// unparseable, so a disc with no readable navigation still enumerates.
     /// `chapters`/duration are left empty pending deeper VTI parsing.
+    /// Cancellation: `halt` is polled once per clip and again before every
+    /// probe chunk, and a read that fails with [`Error::Halted`] — how a live
+    /// drive reports a Stop, since `Drive::checked_exec` fails every command
+    /// once its flag is set — is propagated rather than swallowed. `Halted` is
+    /// the only error this returns; every other read failure keeps its
+    /// best-effort behaviour. It has to be an error and not a short title
+    /// list: a cancelled enumeration that returned `Ok` would be
+    /// indistinguishable from a disc that genuinely holds fewer titles, and
+    /// the caller would cache and act on it.
     pub(super) fn scan_hddvd_titles(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
-    ) -> Vec<DiscTitle> {
+        halt: Option<&crate::halt::Halt>,
+    ) -> Result<Vec<DiscTitle>> {
         let Some(ts_dir) = udf_fs.find_dir("/HVDVD_TS") else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         // Snapshot clips (name, size) and the VTI navigation file. The `ts_dir`
         // borrow must end before the `udf_fs` reads below re-borrow it.
@@ -572,7 +893,14 @@ impl Disc {
             }
             let lower = e.name.to_ascii_lowercase();
             if lower.ends_with(HDDVD_CLIP_EXT) {
-                clips.push((e.name.clone(), e.size));
+                // Bounded by MAX_HDDVD_CLIPS: each clip taken here costs an ICB
+                // read to resolve its extents and (in the fallback path below) a
+                // full probe_evo_streams pass. Surplus entries are DROPPED rather
+                // than `break`ing the loop, so a crafted disc cannot hide the
+                // `.vti` navigation file behind a wall of `.evo` names.
+                if clips.len() < MAX_HDDVD_CLIPS {
+                    clips.push((e.name.clone(), e.size));
+                }
             } else if lower.ends_with(".vti") && vti_name.is_none() {
                 vti_name = Some(e.name.clone());
             }
@@ -586,17 +914,50 @@ impl Disc {
 
         // Resolve each clip's physical extents once, keyed by lower-case name.
         let mut clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = BTreeMap::new();
+        // Clips that EXIST but cannot be given a truthful read plan, because
+        // the file carries an unrecorded (never-written) extent — see
+        // `UdfFs::file_extents`. Kept apart from "did not resolve": a title
+        // built without one of these is short by that clip's runtime while
+        // still claiming its duration and size, which is data loss shaped
+        // like an ordinary rip. Any title naming one is dropped instead.
+        let mut unusable: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (name, size) in &clips {
+            if halt.is_some_and(|h| h.is_cancelled()) {
+                return Err(crate::error::Error::Halted);
+            }
             let mut extents = Vec::new();
-            if let Ok(file_exts) = udf_fs.file_extents(reader, &format!("/HVDVD_TS/{name}")) {
-                for (lba, sectors) in file_exts {
-                    if sectors > 0 && lba > 0 {
-                        extents.push(Extent {
-                            start_lba: lba,
-                            sector_count: sectors,
-                        });
+            match udf_fs.file_extents(reader, &format!("/HVDVD_TS/{name}")) {
+                Ok(file_exts) => {
+                    for (lba, sectors) in file_exts {
+                        if sectors > 0 && lba > 0 {
+                            extents.push(Extent {
+                                start_lba: lba,
+                                sector_count: sectors,
+                            });
+                        }
                     }
                 }
+                Err(crate::error::Error::UdfUnrecordedExtent { .. }) => {
+                    // Say so. Marking the clip unusable drops every title that
+                    // names it, and in the fallback case the OTHER part of a
+                    // split feature is still offered standalone — so half a
+                    // movie is presented as a whole one. Silently returning Ok
+                    // with the feature missing is the shape of data loss this
+                    // refusal exists to prevent, pointed the other way.
+                    //
+                    // The Blu-ray half of this same fix already warns; this
+                    // file had no diagnostics at all. Logging is exempt from
+                    // the crate's no-English rule (errors stay numeric: E6017).
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        clip = ?name,
+                        code = 6017,
+                        "clip carries an unrecorded extent; dropping every title that names it"
+                    );
+                    unusable.insert(name.to_ascii_lowercase());
+                }
+                Err(crate::error::Error::Halted) => return Err(crate::error::Error::Halted),
+                Err(_) => {}
             }
             if !extents.is_empty() {
                 clip_extents.insert(name.to_ascii_lowercase(), (name.clone(), *size, extents));
@@ -609,24 +970,47 @@ impl Disc {
         // clip-name heuristic below is the fallback when the playlist is absent
         // or unparseable (or resolves to no on-disc clips).
         if let Some(xpl) = read_adv_obj_xpl(reader, udf_fs) {
-            let composed = compose_xpl_titles(reader, &parse_xpl_titles(&xpl), &clip_extents);
+            let composed = compose_xpl_titles(
+                reader,
+                &parse_xpl_titles(&xpl),
+                &clip_extents,
+                &unusable,
+                halt,
+            )?;
             if !composed.is_empty() {
-                return composed;
+                return Ok(composed);
             }
         }
 
         // Feature clips, in authored order, that actually resolved to extents.
-        let feature: Vec<String> = order
+        // If ANY authored feature part has no truthful read plan, the composed
+        // feature title would silently omit that part's bytes — emit no
+        // composed feature at all rather than a short one. (The per-clip
+        // titles below are unaffected: each stands alone and an unusable clip
+        // simply yields no title.)
+        let feature: Vec<String> = if order
             .iter()
             .filter(|n| is_feature_clip(n))
-            .filter(|n| clip_extents.contains_key(&n.to_ascii_lowercase()))
-            .cloned()
-            .collect();
+            .any(|n| unusable.contains(&n.to_ascii_lowercase()))
+        {
+            Vec::new()
+        } else {
+            order
+                .iter()
+                .filter(|n| is_feature_clip(n))
+                .filter(|n| clip_extents.contains_key(&n.to_ascii_lowercase()))
+                .cloned()
+                .collect()
+        };
         let feature_set: std::collections::HashSet<String> =
             feature.iter().map(|n| n.to_ascii_lowercase()).collect();
 
         let mut titles = Vec::new();
         let mut next_id = 0u16;
+        // One memo across the composed feature title and every per-clip title:
+        // nothing de-duplicates a FID's ICB LBA, so any number of directory
+        // entries can name ONE File Entry and resolve to identical extents.
+        let mut probes = EvoProbeCache::default();
 
         // The composed feature title: concatenate its parts' extents in authored
         // order. Streams are probed from the head (the first part). One `Clip` per
@@ -638,7 +1022,7 @@ impl Disc {
             for n in &feature {
                 if let Some((orig, size, exts)) = clip_extents.get(&n.to_ascii_lowercase()) {
                     extents.extend_from_slice(exts);
-                    size_bytes += *size;
+                    size_bytes = size_bytes.saturating_add(*size);
                     parts.push(Clip {
                         feed_span: None,
                         clip_id: orig
@@ -653,7 +1037,7 @@ impl Disc {
                     });
                 }
             }
-            let streams = probe_evo_streams(reader, &extents);
+            let streams = probes.streams(reader, &extents, halt)?;
             titles.push(DiscTitle {
                 playlist: "FEATURE".to_string(),
                 playlist_id: next_id,
@@ -672,6 +1056,9 @@ impl Disc {
         // Every remaining clip is its own title (unchanged behaviour). Iterated in
         // directory order; when there is no VTI/feature this emits ALL clips.
         for (name, _size) in &clips {
+            if halt.is_some_and(|h| h.is_cancelled()) {
+                return Err(crate::error::Error::Halted);
+            }
             let key = name.to_ascii_lowercase();
             if feature_set.contains(&key) {
                 continue;
@@ -681,7 +1068,7 @@ impl Disc {
             };
             // Probe the clip head for its elementary streams so the mux path
             // builds a non-empty `pid_to_track` and actually routes packets.
-            let streams = probe_evo_streams(reader, extents);
+            let streams = probes.streams(reader, extents, halt)?;
             let clip_id = orig
                 .rsplit_once('.')
                 .map(|(base, _)| base.to_string())
@@ -707,7 +1094,7 @@ impl Disc {
             });
             next_id = next_id.saturating_add(1);
         }
-        titles
+        Ok(titles)
     }
 }
 
@@ -725,7 +1112,13 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (name, sectors, data_lba))| {
-                file(name, 100 + i as u32, *data_lba, sectors * 2048, true)
+                file(
+                    name,
+                    100 + i as u32,
+                    *data_lba,
+                    u64::from(*sectors) * 2048,
+                    true,
+                )
             })
             .collect();
         let root = DirSpec {
@@ -755,7 +1148,7 @@ mod tests {
             &mut disc,
             &[("FEATURE.EVO", 2000, 5000), ("BLOOP.EVO", 300, 9000)],
         );
-        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(titles.len(), 2, "one title per .evo clip");
         for t in &titles {
             assert_eq!(
@@ -874,6 +1267,58 @@ mod tests {
         assert!(!is_feature_clip("EPK.EVO"));
     }
 
+    /// The SECOND size accumulator. `compose_xpl_titles` sums an XPL's clip
+    /// sizes; this one sums the composed FEATURE title's parts, and it reads
+    /// the same disc-declared `u64` Information Length from the same
+    /// `clip_extents` map. A split feature whose two parts each declare a size
+    /// near `u64::MAX` overflows it exactly as the XPL path did.
+    ///
+    /// Nothing reconciles the declared size against the extents that back it —
+    /// here each part declares `u64::MAX` while occupying ten sectors — because
+    /// the allocation descriptor's length field is only 32 bits wide, so the
+    /// disc can always claim more than it holds.
+    ///
+    /// Mutation: restore `size_bytes += *size` in the feature-composition path
+    /// and this goes red (debug: attempt to add with overflow).
+    #[test]
+    fn scan_hddvd_feature_composition_saturates_absurd_disc_declared_sizes() {
+        let mut disc = MemDisc::new();
+        let vti = synthetic_vti(&["FEATURE_1.EVO", "FEATURE_2.EVO"]);
+        let files = vec![
+            file("FEATURE_1.EVO", 100, 5000, u64::MAX, true),
+            file("FEATURE_2.EVO", 101, 8000, u64::MAX, true),
+            file_with("HVA00001.VTI", 103, 15000, vti, true),
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None)
+            .expect("a hostile size field must not fail the scan");
+        let feat = titles
+            .iter()
+            .find(|t| t.playlist == "FEATURE")
+            .expect("composed feature title");
+        assert_eq!(
+            feat.size_bytes,
+            u64::MAX,
+            "the part sizes must saturate at u64::MAX, never wrap to a small number"
+        );
+    }
+
     #[test]
     fn scan_hddvd_composes_split_feature_into_one_title() {
         // A disc whose feature is FEATURE_1 + FEATURE_2 (a layer-break split), plus
@@ -905,7 +1350,7 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
 
-        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
         // One composed FEATURE title + the trailer.
         assert_eq!(titles.len(), 2, "feature parts merged, trailer separate");
         let feat = titles
@@ -925,6 +1370,73 @@ mod tests {
         let largest = titles.iter().max_by_key(|t| t.size_bytes).unwrap();
         assert_eq!(largest.playlist, "FEATURE");
         assert!(titles.iter().any(|t| t.playlist == "TRAILER.EVO"));
+    }
+
+    /// A split feature (FEATURE_1 + FEATURE_2) where ONE part carries an
+    /// unrecorded extent must not be composed into a FEATURE title at all.
+    ///
+    /// Composing around the unusable part is the dangerous outcome: the
+    /// title would play through as if it were the whole movie while silently
+    /// missing that part's runtime, and its size still counts it. The other
+    /// clips remain available as their own titles — refusing the composition
+    /// is not the same as refusing the disc.
+    #[test]
+    fn scan_hddvd_does_not_compose_a_feature_over_an_unrecorded_part() {
+        let mut disc = MemDisc::new();
+        let vti = synthetic_vti(&["FEATURE_1.EVO", "FEATURE_2.EVO", "TRAILER.EVO"]);
+        let files = vec![
+            file("FEATURE_1.EVO", 100, 5000, 10 * 2048, true),
+            file("FEATURE_2.EVO", 101, 8000, 6 * 2048, true),
+            file("TRAILER.EVO", 102, 12000, 2 * 2048, true),
+            file_with("HVA00001.VTI", 103, 15000, vti, true),
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        // FEATURE_2's ICB (laid at PART_START + 101): an unrecorded 2048-byte
+        // extent at LBA 7999, then its real content at 8000.
+        let mut icb = build_file_icb(6 * 2048, 8000, false);
+        icb[212..216].copy_from_slice(&16u32.to_le_bytes());
+        icb[216..220].copy_from_slice(&0x4000_0800u32.to_le_bytes()); // type 1
+        icb[220..224].copy_from_slice(&7999u32.to_le_bytes());
+        icb[224..228].copy_from_slice(&(6u32 * 2048).to_le_bytes()); // type 0
+        icb[228..232].copy_from_slice(&8000u32.to_le_bytes());
+        disc.put_bytes(PART_START + 101, &icb);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
+        assert!(
+            !titles.iter().any(|t| t.playlist == "FEATURE"),
+            "a feature part with no truthful read plan must not be composed \
+             into a title that silently omits it; got {:?}",
+            titles
+                .iter()
+                .map(|t| (&t.playlist, t.extents.len()))
+                .collect::<Vec<_>>()
+        );
+        // The clips that DID resolve are still offered on their own.
+        assert!(
+            titles.iter().any(|t| t.playlist == "TRAILER.EVO"),
+            "refusing the composition must not refuse the healthy clips"
+        );
+        assert!(
+            titles
+                .iter()
+                .all(|t| t.extents.iter().all(|e| e.start_lba != PART_START + 7999)),
+            "no title may read the unrecorded extent"
+        );
     }
 
     // ── codec sniffing ────────────────────────────────────────────────────
@@ -1067,6 +1579,51 @@ mod tests {
         crate::udf::read_filesystem(disc).expect("fs")
     }
 
+    /// An `.evo` whose ICB declares an UNRECORDED (ECMA-167 4/14.14.1.1
+    /// type-1) extent must yield NO title.
+    ///
+    /// Those sectors were never written, so the clip's real content there is
+    /// zeros while the media holds whatever was left behind. Feeding them to
+    /// the mux as stream bytes splices undefined data into the middle of the
+    /// ripped `.evo`; leaving them out slides the rest of the file. Neither is
+    /// a rip, so the title is not offered at all — data loss must never look
+    /// like success.
+    #[test]
+    fn scan_hddvd_titles_refuses_a_clip_with_an_unrecorded_extent() {
+        let mut disc = MemDisc::new();
+        let udf = make_hddvd_fs_with_evo(&mut disc, &synthetic_evo());
+
+        // Control: unpatched, this fixture really does produce a title — so a
+        // later empty result means the hole was rejected, not that the
+        // fixture was inert.
+        assert_eq!(
+            Disc::scan_hddvd_titles(&mut disc, &udf, None)
+                .expect("scan")
+                .len(),
+            1,
+            "fixture must yield a title before the hole is introduced"
+        );
+
+        // Rewrite FEATURE.EVO's ICB (laid at PART_START + 100) with a
+        // two-descriptor short-AD list: an unrecorded 2048-byte extent at LBA
+        // 4999, then the real 4096-byte content at 5000.
+        let mut icb = build_file_icb(4096, 5000, false);
+        icb[212..216].copy_from_slice(&16u32.to_le_bytes()); // l_ad: two short ADs
+        icb[216..220].copy_from_slice(&0x4000_0800u32.to_le_bytes()); // type 1, 2048 bytes
+        icb[220..224].copy_from_slice(&4999u32.to_le_bytes());
+        icb[224..228].copy_from_slice(&4096u32.to_le_bytes()); // type 0, 4096 bytes
+        icb[228..232].copy_from_slice(&5000u32.to_le_bytes());
+        disc.put_bytes(PART_START + 100, &icb);
+
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
+        assert!(
+            titles.is_empty(),
+            "a clip with an unrecorded extent has no truthful read plan; got \
+             extents {:?}",
+            titles.iter().map(|t| &t.extents).collect::<Vec<_>>()
+        );
+    }
+
     /// End-to-end: scanning an `.evo` whose head carries an H.264 video PES and
     /// two DD+ audio PES yields a title with the video track (canonical
     /// DVD_VIDEO_PID) and both DD+ tracks (0xBDC0 / 0xBDC1) — the non-empty
@@ -1075,7 +1632,7 @@ mod tests {
     fn scan_hddvd_titles_probes_streams_from_evo_head() {
         let mut disc = MemDisc::new();
         let udf = make_hddvd_fs_with_evo(&mut disc, &synthetic_evo());
-        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(titles.len(), 1);
         let t = &titles[0];
 
@@ -1118,7 +1675,7 @@ mod tests {
         // 4 KiB of junk with no PS start codes.
         let junk = vec![0x55u8; 4096];
         let udf = make_hddvd_fs_with_evo(&mut disc, &junk);
-        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(titles.len(), 1);
         assert!(
             titles[0].streams.is_empty(),
@@ -1217,7 +1774,7 @@ mod tests {
     fn scan_hddvd_titles_probes_vc1_on_extended_stream_id() {
         let mut disc = MemDisc::new();
         let udf = make_hddvd_fs_with_evo(&mut disc, &synthetic_evo_vc1());
-        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(titles.len(), 1);
 
         let video: Vec<_> = titles[0]
@@ -1336,6 +1893,227 @@ mod tests {
         assert!(parse_xpl_titles(b"<Playlist></Playlist>").is_empty());
     }
 
+    /// A disc-supplied playlist nested far deeper than any real one must be
+    /// REFUSED BEFORE the XML parser sees it. `roxmltree` is recursive-descent
+    /// and its depth-10 limit covers only ENTITY expansion, so unbounded element
+    /// nesting blows the thread stack — an ABORT, which no `catch_unwind` and no
+    /// `Err` fallback can contain. ~50k levels is a few hundred KB of well-formed
+    /// XML, far under the read cap. The correct outcome is the same as any other
+    /// unusable playlist: an empty `Vec`, so the caller falls back to the
+    /// clip-name heuristic.
+    /// BREADTH, not depth: a flat playlist passes the nesting guard trivially
+    /// and can still declare a title per ~51 bytes, so a 64 MiB XPL (exactly
+    /// `udf::MAX_FILE_BYTES`) reaches ~1.3 million of them.
+    ///
+    /// The cost is drive time, not memory: `compose_xpl_titles` runs
+    /// `probe_evo_streams` once per title and each probe reads real sectors,
+    /// so an uncapped count turns a scan the operator expects to take seconds
+    /// into tens of terabytes of optical reads. `bluray.rs` is not exposed to
+    /// this because its playlist count comes from the MPLS files present in
+    /// the UDF directory; an XPL DECLARES its titles, so nothing bounds them.
+    ///
+    /// Mutation: delete the `.take(MAX_XPL_TITLES)` and this goes red at the
+    /// declared count.
+    #[test]
+    fn parse_xpl_titles_caps_a_playlist_declaring_absurdly_many_titles() {
+        const DECLARED: usize = MAX_XPL_TITLES + 500;
+        let mut xpl = String::with_capacity(DECLARED * 56 + 128);
+        xpl.push_str(r#"<?xml version="1.0" encoding="utf-8"?><Playlist><TitleSet>"#);
+        for _ in 0..DECLARED {
+            xpl.push_str(r#"<Title><PrimaryAudioVideoClip src="A.EVO"/></Title>"#);
+        }
+        xpl.push_str("</TitleSet></Playlist>");
+
+        let titles = parse_xpl_titles(xpl.as_bytes());
+        assert_eq!(
+            titles.len(),
+            MAX_XPL_TITLES,
+            "a playlist declaring {DECLARED} titles must be capped at \
+             {MAX_XPL_TITLES}; each surviving title costs a real probe_evo_streams \
+             pass over the medium"
+        );
+    }
+
+    /// The control: a realistic playlist keeps every title it declares.
+    #[test]
+    fn parse_xpl_titles_keeps_every_title_of_a_realistic_playlist() {
+        let titles = parse_xpl_titles(SYNTH_XPL.as_bytes());
+        assert!(
+            !titles.is_empty() && titles.len() < MAX_XPL_TITLES,
+            "the synthetic real-world playlist must survive the cap untouched, \
+             got {} titles",
+            titles.len()
+        );
+    }
+
+    /// Build a playlist that nests `nesting` `<Title>` elements inside one
+    /// another and puts `clips` self-closing `<PrimaryAudioVideoClip>` elements
+    /// at the innermost level, plus `chapters` `<Chapter>` elements.
+    ///
+    /// `parse_xpl_titles` collects a title's clips with `descendants()`, not
+    /// `children()`, so EVERY one of the `nesting` ancestors collects the SAME
+    /// innermost clip list — the amplification this exercises.
+    fn nested_title_xpl(nesting: usize, clips: usize, chapters: usize) -> String {
+        let mut xpl = String::with_capacity(nesting * 16 + clips * 40 + chapters * 40 + 128);
+        xpl.push_str(r#"<?xml version="1.0" encoding="utf-8"?><Playlist><TitleSet>"#);
+        for _ in 0..nesting {
+            xpl.push_str("<Title>");
+        }
+        for _ in 0..clips {
+            xpl.push_str(r#"<PrimaryAudioVideoClip src="A.EVO"/>"#);
+        }
+        for _ in 0..chapters {
+            xpl.push_str(r#"<Chapter titleTimeBegin="00:00:01:00"/>"#);
+        }
+        for _ in 0..nesting {
+            xpl.push_str("</Title>");
+        }
+        xpl.push_str("</TitleSet></Playlist>");
+        xpl
+    }
+
+    /// CLIPS PER TITLE — the axis the title cap, the depth cap and the
+    /// directory cap all leave open.
+    ///
+    /// `MAX_XPL_TITLES` bounds how many titles a playlist may declare and
+    /// `MAX_XPL_DEPTH` bounds how deeply it may nest, but NEITHER bounds how
+    /// many `<PrimaryAudioVideoClip>` elements a single title collects. Worse,
+    /// the collector is `descendants()`, so one clip nested inside N ancestor
+    /// `<Title>`s is collected N times over — the clip count MULTIPLIES by the
+    /// nesting the depth guard still permits.
+    ///
+    /// A 64 MiB XPL (`udf::MAX_FILE_BYTES`) holds ~1.7M clip elements at ~38
+    /// bytes each; with the 32 `<Title>` ancestors the depth cap still permits,
+    /// that is ~56 million heap-allocated `XplClip`s, and then as many `Clip`s
+    /// again in `compose_xpl_titles`. This uses small numbers that exercise the
+    /// same multiplication without a 64 MiB fixture: pre-fix it collected 756
+    /// clips per title, 18,900 across the 25 nested titles, from a document
+    /// declaring only 756 clip elements — an exact 25x, the nesting count.
+    ///
+    /// Mutation: delete the `clips.len() >= MAX_XPL_CLIPS_PER_TITLE` break and
+    /// this goes red at the unamplified per-title count.
+    #[test]
+    fn parse_xpl_titles_caps_clips_per_title_against_descendant_amplification() {
+        const NESTING: usize = 25;
+        const CLIPS: usize = MAX_XPL_CLIPS_PER_TITLE + 500;
+
+        let xpl = nested_title_xpl(NESTING, CLIPS, 0);
+        let titles = parse_xpl_titles(xpl.as_bytes());
+
+        // The nesting itself must survive the depth guard, or this test would
+        // pass for the wrong reason (an empty fallback).
+        assert_eq!(
+            titles.len(),
+            NESTING,
+            "all {NESTING} nested <Title> elements must parse, so the \
+             amplification is really being exercised"
+        );
+
+        let total: usize = titles.iter().map(|t| t.clips.len()).sum();
+        for t in &titles {
+            assert!(
+                t.clips.len() <= MAX_XPL_CLIPS_PER_TITLE,
+                "a title collected {} clips, above the {MAX_XPL_CLIPS_PER_TITLE} \
+                 cap; total across titles {total} (a 64 MiB XPL scales this to \
+                 tens of millions)",
+                t.clips.len()
+            );
+        }
+        assert!(
+            total <= NESTING * MAX_XPL_CLIPS_PER_TITLE,
+            "aggregate clip count {total} must be bounded by titles x cap"
+        );
+    }
+
+    /// CHAPTERS PER TITLE — the same `descendants()` amplification on the
+    /// second unbounded `collect()` in the same loop. Bounded separately so
+    /// closing the clip axis does not simply move the attack next door.
+    ///
+    /// Mutation: delete the `.take(MAX_XPL_CHAPTERS_PER_TITLE)` and this goes
+    /// red at the declared count.
+    #[test]
+    fn parse_xpl_titles_caps_chapters_per_title() {
+        const NESTING: usize = 25;
+        const CHAPTERS: usize = MAX_XPL_CHAPTERS_PER_TITLE + 500;
+
+        // One clip, so the title is kept (`clips.is_empty()` skips otherwise).
+        let xpl = nested_title_xpl(NESTING, 1, CHAPTERS);
+        let titles = parse_xpl_titles(xpl.as_bytes());
+        assert_eq!(titles.len(), NESTING);
+
+        for t in &titles {
+            assert!(
+                t.chapters.len() <= MAX_XPL_CHAPTERS_PER_TITLE,
+                "a title collected {} chapters, above the \
+                 {MAX_XPL_CHAPTERS_PER_TITLE} cap",
+                t.chapters.len()
+            );
+        }
+    }
+
+    /// The control: a realistic multi-clip title still resolves EVERY one of its
+    /// clips and chapters. `SYNTH_XPL`'s main movie is a layer-break split — two
+    /// clips on one timeline — plus two chapters; losing either to the cap would
+    /// cost a genuine disc half its feature.
+    ///
+    /// Mutation: set `MAX_XPL_CLIPS_PER_TITLE` to 1 and this goes red.
+    #[test]
+    fn parse_xpl_titles_keeps_every_clip_of_a_realistic_title() {
+        let titles = parse_xpl_titles(SYNTH_XPL.as_bytes());
+        assert_eq!(titles.len(), 2);
+        assert_eq!(
+            titles[0].clips.len(),
+            2,
+            "the layer-break split must keep BOTH clips through the cap"
+        );
+        assert_eq!(titles[0].clips[0].evo, "feature_1.evo");
+        assert_eq!(titles[0].clips[1].evo, "feature_2.evo");
+        assert_eq!(
+            titles[0].chapters.len(),
+            2,
+            "both chapters must survive the chapter cap"
+        );
+        assert_eq!(titles[1].clips.len(), 1);
+    }
+
+    #[test]
+    fn parse_xpl_titles_refuses_deeply_nested_playlist() {
+        const DEPTH: usize = 50_000;
+        let mut xpl = String::with_capacity(DEPTH * 8 + 64);
+        xpl.push_str(r#"<?xml version="1.0" encoding="utf-8"?>"#);
+        for _ in 0..DEPTH {
+            xpl.push_str("<n>");
+        }
+        for _ in 0..DEPTH {
+            xpl.push_str("</n>");
+        }
+        assert!(
+            parse_xpl_titles(xpl.as_bytes()).is_empty(),
+            "a hostile nesting depth must fall back, not abort the process"
+        );
+    }
+
+    /// The depth guard must not reject real discs. A genuine `VPLST000.XPL` is a
+    /// handful of levels deep; this is the same document the parsing test uses,
+    /// plus self-closing tags, a comment and a processing instruction that the
+    /// pre-parse scanner has to account for without inflating its depth count.
+    #[test]
+    fn parse_xpl_titles_accepts_real_world_nesting_depth() {
+        let titles = parse_xpl_titles(SYNTH_XPL.as_bytes());
+        assert_eq!(titles.len(), 2, "a real playlist still parses");
+        assert_eq!(titles[0].clips.len(), 2);
+
+        // Comments and processing instructions carry `<` and `/>` that a naive
+        // scanner would miscount as element nesting.
+        let decl = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
+        let tricky = SYNTH_XPL.replacen(
+            decl,
+            &format!("{decl}\n<!-- <a><a><a><a><a> -->\n<?authoring <b><b><b> ?>"),
+            1,
+        );
+        assert_eq!(parse_xpl_titles(tricky.as_bytes()).len(), 2);
+    }
+
     /// Build a UDF with `HVDVD_TS/` `.evo` clips plus an `ADV_OBJ/VPLST000.XPL`
     /// carrying `xpl`, so `scan_hddvd_titles` takes the playlist path.
     fn make_hddvd_fs_xpl(
@@ -1349,7 +2127,13 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (name, sectors, data_lba))| {
-                file(name, 100 + i as u32, *data_lba, sectors * 2048, true)
+                file(
+                    name,
+                    100 + i as u32,
+                    *data_lba,
+                    u64::from(*sectors) * 2048,
+                    true,
+                )
             })
             .collect();
         let root = DirSpec {
@@ -1395,7 +2179,7 @@ mod tests {
             ],
             SYNTH_XPL.as_bytes(),
         );
-        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(
             titles.len(),
             2,
@@ -1643,6 +2427,64 @@ mod tests {
         );
     }
 
+    /// An Advanced-Content playlist title that names a clip with no truthful
+    /// read plan must be dropped whole, not composed from its other clips.
+    ///
+    /// The unusable clip is absent from `clip_extents` (it never resolved),
+    /// which on its own just makes the loop skip it — emitting a title that
+    /// plays short by that clip while its chapter offsets and durations still
+    /// assume it. The `unusable` set is what distinguishes "this clip does not
+    /// exist" from "this clip exists and cannot be ripped truthfully".
+    #[test]
+    fn compose_xpl_titles_drops_a_title_naming_an_unusable_clip() {
+        let clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = [(
+            "a.evo".to_string(),
+            (
+                "A.EVO".to_string(),
+                1000u64,
+                vec![Extent {
+                    start_lba: 1,
+                    sector_count: 1,
+                }],
+            ),
+        )]
+        .into_iter()
+        .collect();
+        // b.evo exists on the disc but carries an unrecorded extent.
+        let unusable: std::collections::HashSet<String> =
+            ["b.evo".to_string()].into_iter().collect();
+        let xpl_titles = vec![XplTitle {
+            number: 1,
+            name: "T".to_string(),
+            duration_secs: 20.0,
+            clips: vec![
+                XplClip {
+                    evo: "a.evo".to_string(),
+                    begin_secs: 0.0,
+                    end_secs: 10.0,
+                },
+                XplClip {
+                    evo: "b.evo".to_string(),
+                    begin_secs: 10.0,
+                    end_secs: 20.0,
+                },
+            ],
+            chapters: vec![],
+        }];
+        let mut disc = MemDisc::new();
+        let titles = compose_xpl_titles(&mut disc, &xpl_titles, &clip_extents, &unusable, None)
+            .expect("compose");
+        assert!(
+            titles.is_empty(),
+            "half of this title's runtime cannot be read, so composing it \
+             would ship a short title as a complete one; got {:?}",
+            titles
+                .iter()
+                .map(|t| (t.clips.len(), t.size_bytes))
+                .collect::<Vec<_>>()
+        );
+    }
+
     // ── compose_xpl_titles: size/offset arithmetic ─────────────────────────
 
     /// Direct unit test of the arithmetic composing a title from its XPL
@@ -1696,7 +2538,14 @@ mod tests {
             chapters: vec![],
         }];
         let mut disc = MemDisc::new();
-        let titles = compose_xpl_titles(&mut disc, &xpl_titles, &clip_extents);
+        let titles = compose_xpl_titles(
+            &mut disc,
+            &xpl_titles,
+            &clip_extents,
+            &std::collections::HashSet::new(),
+            None,
+        )
+        .expect("compose");
         assert_eq!(titles.len(), 1);
         let t = &titles[0];
         assert_eq!(t.size_bytes, 3000, "clip sizes summed, not multiplied");
@@ -1719,6 +2568,242 @@ mod tests {
             (t.clips[1].duration_secs - 4.0).abs() < 1e-9,
             "second clip's duration is also end - begin: got {}",
             t.clips[1].duration_secs
+        );
+    }
+
+    /// A title's `size_bytes` is a running sum of DISC-DECLARED clip sizes: the
+    /// `u64` UDF File Entry Information Length, which nothing cross-checks
+    /// against the extent list that file actually occupies. Two clips can
+    /// therefore each declare a size near `u64::MAX`.
+    ///
+    /// Summed with a plain `+=`, that overflows: a panic in a debug build —
+    /// a crash on untrusted disc content, which this library must never do —
+    /// and a wrap to a small garbage total in release, which misreports the
+    /// title's size while looking entirely normal.
+    ///
+    /// Mutation: restore `size_bytes += *size` in `compose_xpl_titles` and this
+    /// goes red (debug: attempt to add with overflow).
+    #[test]
+    fn compose_xpl_titles_saturates_absurd_disc_declared_clip_sizes() {
+        let clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = [
+            (
+                "a.evo".to_string(),
+                (
+                    "A.EVO".to_string(),
+                    u64::MAX,
+                    vec![Extent {
+                        start_lba: 1,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+            (
+                "b.evo".to_string(),
+                (
+                    "B.EVO".to_string(),
+                    u64::MAX,
+                    vec![Extent {
+                        start_lba: 2,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let xpl_titles = vec![XplTitle {
+            number: 1,
+            name: "T".to_string(),
+            duration_secs: 10.0,
+            clips: vec![
+                XplClip {
+                    evo: "a.evo".to_string(),
+                    begin_secs: 0.0,
+                    end_secs: 5.0,
+                },
+                XplClip {
+                    evo: "b.evo".to_string(),
+                    begin_secs: 5.0,
+                    end_secs: 10.0,
+                },
+            ],
+            chapters: vec![],
+        }];
+        let mut disc = MemDisc::new();
+        let titles = compose_xpl_titles(
+            &mut disc,
+            &xpl_titles,
+            &clip_extents,
+            &std::collections::HashSet::new(),
+            None,
+        )
+        .expect("a hostile size field must not fail the scan either");
+        assert_eq!(titles.len(), 1);
+        assert_eq!(
+            titles[0].size_bytes,
+            u64::MAX,
+            "the sum must saturate at u64::MAX, never wrap to a small number"
+        );
+    }
+
+    /// A crafted Advanced-Content playlist can name the SAME `.evo` in
+    /// `<PrimaryAudioVideoClip>` many times over (the XML has no fixed element
+    /// count, unlike MPLS's binary PlayItem count). Each repeat must NOT push
+    /// another copy of that clip's extent list onto the title — mirroring
+    /// bluray.rs's `first_ref = seen_clips.insert(...)` gate (`:113`/`:117`),
+    /// which pushes a clip's extents only the first time its id is seen. Here
+    /// the analogous key is the `.evo` filename (this file has no clip_id;
+    /// `.evo` is what `clip_extents` is keyed by). Without the gate, extents
+    /// grows by the referenced clip's full extent list on EVERY repetition —
+    /// unbounded by the number of on-disc files, bounded only by playlist
+    /// size.
+    #[test]
+    fn compose_xpl_titles_dedups_repeated_clip_references_by_evo() {
+        let clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = [(
+            "a.evo".to_string(),
+            (
+                "A.EVO".to_string(),
+                1000u64,
+                vec![
+                    Extent {
+                        start_lba: 1,
+                        sector_count: 1,
+                    },
+                    Extent {
+                        start_lba: 2,
+                        sector_count: 1,
+                    },
+                    Extent {
+                        start_lba: 3,
+                        sector_count: 1,
+                    },
+                ],
+            ),
+        )]
+        .into_iter()
+        .collect();
+
+        const REPEATS: usize = 5000;
+        let clips: Vec<XplClip> = (0..REPEATS)
+            .map(|i| XplClip {
+                evo: "a.evo".to_string(),
+                begin_secs: i as f64,
+                end_secs: i as f64 + 1.0,
+            })
+            .collect();
+        let xpl_titles = vec![XplTitle {
+            number: 1,
+            name: "T".to_string(),
+            duration_secs: REPEATS as f64,
+            clips,
+            chapters: vec![],
+        }];
+        let mut disc = MemDisc::new();
+        let titles = compose_xpl_titles(
+            &mut disc,
+            &xpl_titles,
+            &clip_extents,
+            &std::collections::HashSet::new(),
+            None,
+        )
+        .expect("compose");
+        assert_eq!(titles.len(), 1);
+        assert_eq!(
+            titles[0].extents.len(),
+            3,
+            "the same .evo named {REPEATS} times must contribute its 3 extents \
+             ONCE, not {REPEATS} times over — got {} extents",
+            titles[0].extents.len()
+        );
+    }
+
+    /// Control for the de-dup above: a playlist naming several DISTINCT
+    /// clips (not repeats of one) must still resolve every one of them —
+    /// the de-dup key must not accidentally collapse different clips
+    /// together. If this test is made to fail by weakening the de-dup key
+    /// to something constant, that proves the key is doing real work rather
+    /// than vacuously deduping everything.
+    #[test]
+    fn compose_xpl_titles_resolves_all_distinct_clips_despite_dedup() {
+        let clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = [
+            (
+                "a.evo".to_string(),
+                (
+                    "A.EVO".to_string(),
+                    1000u64,
+                    vec![Extent {
+                        start_lba: 1,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+            (
+                "b.evo".to_string(),
+                (
+                    "B.EVO".to_string(),
+                    2000u64,
+                    vec![Extent {
+                        start_lba: 2,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+            (
+                "c.evo".to_string(),
+                (
+                    "C.EVO".to_string(),
+                    3000u64,
+                    vec![Extent {
+                        start_lba: 3,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let xpl_titles = vec![XplTitle {
+            number: 1,
+            name: "T".to_string(),
+            duration_secs: 30.0,
+            clips: vec![
+                XplClip {
+                    evo: "a.evo".to_string(),
+                    begin_secs: 0.0,
+                    end_secs: 5.0,
+                },
+                XplClip {
+                    evo: "b.evo".to_string(),
+                    begin_secs: 5.0,
+                    end_secs: 15.0,
+                },
+                XplClip {
+                    evo: "c.evo".to_string(),
+                    begin_secs: 15.0,
+                    end_secs: 30.0,
+                },
+            ],
+            chapters: vec![],
+        }];
+        let mut disc = MemDisc::new();
+        let titles = compose_xpl_titles(
+            &mut disc,
+            &xpl_titles,
+            &clip_extents,
+            &std::collections::HashSet::new(),
+            None,
+        )
+        .expect("compose");
+        assert_eq!(titles.len(), 1);
+        assert_eq!(
+            titles[0].extents.len(),
+            3,
+            "three DISTINCT clips must all resolve — one extent each, not \
+             collapsed by an over-eager de-dup key"
+        );
+        assert_eq!(
+            titles[0].size_bytes, 6000,
+            "all three distinct sizes summed"
         );
     }
 
@@ -1755,7 +2840,7 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
 
-        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(
             titles.len(),
             2,
@@ -1797,7 +2882,7 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
 
-        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(
             titles.len(),
             1,
@@ -1821,7 +2906,8 @@ mod tests {
             start_lba: 500_000,
             sector_count: 0,
         };
-        let streams = probe_evo_streams(&mut disc, std::slice::from_ref(&extent));
+        let streams =
+            probe_evo_streams(&mut disc, std::slice::from_ref(&extent), None).expect("probe");
         assert!(streams.is_empty(), "a zero-sector extent yields no streams");
     }
 
@@ -1842,7 +2928,8 @@ mod tests {
             sector_count: 512 + (evo.len() as u32).div_ceil(2048),
         };
 
-        let streams = probe_evo_streams(&mut disc, std::slice::from_ref(&extent));
+        let streams =
+            probe_evo_streams(&mut disc, std::slice::from_ref(&extent), None).expect("probe");
         let has_h264 = streams
             .iter()
             .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264));
@@ -1870,7 +2957,8 @@ mod tests {
             sector_count: declared_sectors,
         };
 
-        let streams = probe_evo_streams(&mut disc, std::slice::from_ref(&extent));
+        let streams =
+            probe_evo_streams(&mut disc, std::slice::from_ref(&extent), None).expect("probe");
         let has_h264 = streams
             .iter()
             .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264));
@@ -1905,13 +2993,309 @@ mod tests {
                 sector_count: 10,
             },
         ];
-        let streams = probe_evo_streams(&mut disc, &extents);
+        let streams = probe_evo_streams(&mut disc, &extents, None).expect("probe");
         let has_h264 = streams
             .iter()
             .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264));
         assert!(
             !has_h264,
             "must not read past the total EVO_PROBE_SECTORS budget across extents"
+        );
+    }
+
+    // ── clip-name fallback: probe amplification ────────────────────────────
+
+    /// A [`SectorSource`] wrapper that counts how many reads START at each
+    /// watched LBA, plus the total sectors pulled off the medium. A probe of a
+    /// clip always issues its first read at the clip's first extent LBA, so the
+    /// hit count for that LBA IS the number of `probe_evo_streams` passes over
+    /// that clip.
+    struct ProbeCounter {
+        inner: MemDisc,
+        watch: Vec<u32>,
+        hits: Vec<u32>,
+        sectors_read: u64,
+    }
+
+    impl ProbeCounter {
+        fn new(inner: MemDisc, watch: Vec<u32>) -> Self {
+            let hits = vec![0; watch.len()];
+            Self {
+                inner,
+                watch,
+                hits,
+                sectors_read: 0,
+            }
+        }
+    }
+
+    impl SectorSource for ProbeCounter {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if let Some(i) = self.watch.iter().position(|w| *w == lba) {
+                self.hits[i] += 1;
+            }
+            self.sectors_read += count as u64;
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    /// Lay an `HVDVD_TS/` holding exactly the given `(name, icb_lba, data_lba,
+    /// size)` clips — unlike `make_hddvd_fs`, the caller chooses each entry's
+    /// ICB, so many names can be pointed at ONE File Entry.
+    fn lay_hddvd_clips(disc: &mut MemDisc, specs: Vec<crate::udf::fixture::FileSpec>) {
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: specs,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(disc, 10);
+        lay_dir(disc, &root);
+    }
+
+    /// THE THIRD AMPLIFICATION AXIS on HD-DVD title composition, past both
+    /// existing guards. `xpl_depth_within_limit` bounds XML NESTING;
+    /// `MAX_XPL_TITLES` + the `.evo` de-dup bound what an XPL can DECLARE. Both
+    /// live on the playlist path — and an attacker simply omits `/ADV_OBJ`, so
+    /// `read_adv_obj_xpl` returns `None` and neither guard is ever consulted.
+    /// Control then reaches the clip-name FALLBACK, which emits one title per
+    /// `.evo` DIRECTORY ENTRY and probes each.
+    ///
+    /// Nothing de-duplicates a FID's ICB LBA, so every name in a 1 MiB
+    /// directory (`udf::MAX_DIR_BYTES`, ~24,000 FIDs) can point at ONE File
+    /// Entry. Each resolves to the SAME extents and each costs a full
+    /// `EVO_PROBE_SECTORS` (16 MiB) probe: ~375 GiB of optical reads from a
+    /// directory that describes a single file.
+    ///
+    /// Memoizing the probe on the resolved extent list collapses that to ONE
+    /// probe, because all of those names resolve to one extent list.
+    ///
+    /// Mutation: drop the memo lookup in `EvoProbeCache::streams` (always
+    /// probe) and this goes red at `ENTRIES` probes.
+    #[test]
+    fn scan_hddvd_titles_probes_once_for_entries_resolving_to_identical_extents() {
+        const ENTRIES: usize = 512;
+        const SHARED_ICB: u32 = 100;
+        const SHARED_DATA: u32 = 5000;
+
+        let mut disc = MemDisc::new();
+        // Every FID names a different file and points at the SAME File Entry.
+        let specs: Vec<_> = (0..ENTRIES)
+            .map(|i| {
+                file(
+                    &format!("C{i:04}.EVO"),
+                    SHARED_ICB,
+                    SHARED_DATA,
+                    4 * 2048,
+                    true,
+                )
+            })
+            .collect();
+        lay_hddvd_clips(&mut disc, specs);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let probe_lba = PART_START + SHARED_DATA;
+        let mut counter = ProbeCounter::new(disc, vec![probe_lba]);
+        let titles = Disc::scan_hddvd_titles(&mut counter, &udf, None).expect("scan");
+
+        assert_eq!(
+            counter.hits[0], 1,
+            "{ENTRIES} directory entries all resolving to the SAME extents must \
+             cost ONE probe_evo_streams pass, not one per entry; got {} probes",
+            counter.hits[0]
+        );
+        // And the whole scan's read volume stays bounded — the real currency
+        // here is drive time, not title count.
+        assert!(
+            counter.sectors_read < 4 * ENTRIES as u64,
+            "total sectors read must not scale with the entry count, got {}",
+            counter.sectors_read
+        );
+        assert!(!titles.is_empty(), "the clips still enumerate");
+    }
+
+    /// The clip cap and the per-probe read budget are ONE bound, not two, and
+    /// only their product is meaningful: `MAX_HDDVD_CLIPS` probes each cost up
+    /// to `EVO_PROBE_SECTORS`, so the pair fixes the worst-case drive time of a
+    /// `Disc::scan()`.
+    ///
+    /// `EvoProbeCache` does not help against a crafted disc here: it keys on the
+    /// RESOLVED extent list, and distinct-but-overlapping extent lists all
+    /// reading one physical region miss the memo every time while every read
+    /// succeeds. So the product is genuinely reachable, and it is the number
+    /// that has to stay within what a scan can absorb.
+    ///
+    /// 8 GiB is the ceiling asserted here. It is far above any genuine disc —
+    /// retail HD-DVDs carry tens of `.evo` clips, i.e. well under 1 GiB of
+    /// probing — and far below the 64 GiB the pair used to permit, which
+    /// exceeded the capacity of the dual-layer media this format tops out at
+    /// and took tens of minutes of optical reads.
+    ///
+    /// This is a relationship, not a magic number: raising EITHER constant
+    /// without re-examining the other trips it.
+    #[test]
+    fn the_clip_cap_and_probe_budget_bound_a_scans_worst_case_read_volume() {
+        const CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+        let budget = |cap: usize| {
+            cap as u64 * u64::from(EVO_PROBE_SECTORS) * crate::consts::SECTOR_BYTES as u64
+        };
+        // BOTH title-composition paths pay one probe per item, and a crafted
+        // disc reaches either one: the directory fallback when `/ADV_OBJ` is
+        // omitted, the playlist path when it is present. Capping only one moves
+        // the amplification next door.
+        for (name, cap) in [
+            ("MAX_HDDVD_CLIPS", MAX_HDDVD_CLIPS),
+            ("MAX_XPL_TITLES", MAX_XPL_TITLES),
+        ] {
+            let worst_case = budget(cap);
+            assert!(
+                worst_case <= CEILING_BYTES,
+                "{name} ({cap}) x EVO_PROBE_SECTORS ({EVO_PROBE_SECTORS}) = \
+                 {worst_case} bytes of probe reads, over the {CEILING_BYTES}-byte \
+                 ceiling a scan can absorb"
+            );
+        }
+    }
+
+    /// CONTROL: memoization must not silently collapse DISTINCT clips. A
+    /// legitimate disc with several different `.evo` files still probes each
+    /// one, and each title keeps the streams of ITS OWN clip.
+    ///
+    /// Mutation: make `EvoProbeCache`'s key a constant (ignore the extents) and
+    /// this goes red — the junk clip inherits the first clip's H.264 streams.
+    #[test]
+    fn scan_hddvd_titles_still_probes_each_distinct_clip() {
+        let mut disc = MemDisc::new();
+        let evo = synthetic_evo();
+        let junk = vec![0x55u8; 4 * 2048];
+        let (a_data, b_data, c_data) = (5000u32, 6000u32, 7000u32);
+        lay_hddvd_clips(
+            &mut disc,
+            vec![
+                file_with("A_REAL.EVO", 100, a_data, evo.clone(), true),
+                file_with("B_JUNK.EVO", 101, b_data, junk, true),
+                file_with("C_REAL.EVO", 102, c_data, evo, true),
+            ],
+        );
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let watch = vec![
+            PART_START + a_data,
+            PART_START + b_data,
+            PART_START + c_data,
+        ];
+        let mut counter = ProbeCounter::new(disc, watch);
+        let titles = Disc::scan_hddvd_titles(&mut counter, &udf, None).expect("scan");
+
+        assert_eq!(
+            titles.len(),
+            3,
+            "every distinct clip still resolves a title"
+        );
+
+        // The substantive assertion first: each title carries the streams of ITS
+        // OWN clip. This is what a wrong memo key actually costs.
+        let by_name = |n: &str| titles.iter().find(|t| t.playlist == n).expect(n);
+        assert!(
+            by_name("A_REAL.EVO")
+                .streams
+                .iter()
+                .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
+            "the real clip keeps its own probed streams"
+        );
+        assert!(
+            by_name("B_JUNK.EVO").streams.is_empty(),
+            "the unrecognizable clip must NOT inherit another clip's streams"
+        );
+        assert!(
+            by_name("C_REAL.EVO")
+                .streams
+                .iter()
+                .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
+            "a third distinct clip is probed on its own extents"
+        );
+
+        assert_eq!(
+            counter.hits,
+            vec![1, 1, 1],
+            "each DISTINCT clip is still probed exactly once"
+        );
+    }
+
+    /// Memoization alone is NOT the whole fix. Collapsing identical extent
+    /// lists bounds the one-File-Entry attack, but distinct extent lists are
+    /// only as bounded as the File Entries an attacker cares to lay down — and
+    /// a File Entry is ONE sector. A 1 MiB directory's ~24,000 FIDs can each
+    /// point at their own 1-sector File Entry (a ~48 MiB image) declaring its
+    /// own huge extent, so every probe misses the memo and the amplification is
+    /// back. [`MAX_HDDVD_CLIPS`] is the bound that closes that.
+    ///
+    /// Mutation: drop the `clips.len() < MAX_HDDVD_CLIPS` gate in the directory
+    /// scan and this goes red at `ENTRIES`.
+    #[test]
+    fn scan_hddvd_titles_caps_a_directory_declaring_absurdly_many_clips() {
+        const ENTRIES: usize = MAX_HDDVD_CLIPS + 300;
+
+        let mut disc = MemDisc::new();
+        // Each entry gets its OWN File Entry and its OWN data extent, so no two
+        // resolve to the same extent list and the memo never hits.
+        let specs: Vec<_> = (0..ENTRIES)
+            .map(|i| {
+                // ICBs live far past the directory's own FID data (~230 KB
+                // from LBA 21) so laying the FIDs cannot clobber them.
+                file(
+                    &format!("C{i:05}.EVO"),
+                    100_000 + i as u32,
+                    1_000_000 + i as u32 * 8,
+                    2048,
+                    true,
+                )
+            })
+            .collect();
+        lay_hddvd_clips(&mut disc, specs);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
+        assert_eq!(
+            titles.len(),
+            MAX_HDDVD_CLIPS,
+            "a directory declaring {ENTRIES} clips must be capped at \
+             {MAX_HDDVD_CLIPS}; each surviving clip costs a real \
+             probe_evo_streams pass over the medium"
+        );
+    }
+
+    /// The control for the cap: a realistic disc keeps every clip it carries.
+    #[test]
+    fn scan_hddvd_titles_keeps_every_clip_of_a_realistic_disc() {
+        let mut disc = MemDisc::new();
+        let udf = make_hddvd_fs(
+            &mut disc,
+            &[
+                ("FEATURE_1.EVO", 2000, 5000),
+                ("FEATURE_2.EVO", 1800, 9000),
+                ("TRAILER.EVO", 300, 12000),
+                ("DELOGO.EVO", 40, 13000),
+            ],
+        );
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
+        assert_eq!(
+            titles.len(),
+            4,
+            "a real disc's clips must survive the cap untouched"
         );
     }
 }

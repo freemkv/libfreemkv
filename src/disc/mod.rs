@@ -2061,7 +2061,7 @@ impl Disc {
             )
         } else if udf_fs.find_dir("/HVDVD_TS").is_some() {
             (
-                Self::scan_hddvd_titles(reader, &udf_fs),
+                Self::scan_hddvd_titles(reader, &udf_fs, opts.halt.as_ref())?,
                 ContentFormat::MpegPs,
             )
         } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
@@ -2187,7 +2187,9 @@ impl Disc {
     /// **Sort priority (titles[0] = most likely main feature):**
     /// 1. Real titles (`size_bytes ≤ capacity_bytes`) before virtual
     ///    composites. The capacity check is a hard "physically
-    ///    possible data on this disc" gate.
+    ///    possible data on this disc" gate. `capacity_bytes == 0` means
+    ///    the capacity is UNKNOWN (READ CAPACITY failed), so the gate is
+    ///    skipped entirely rather than demoting every real title.
     /// 2. Among real titles, LARGEST physical size first — the main
     ///    feature is the biggest real title on the disc. (This replaced
     ///    the old clip-count ordering, which mis-ranked chapter-per-clip
@@ -2249,8 +2251,18 @@ impl Disc {
         // A title bigger than the whole disc is a "play-all" composite artifact
         // (its declared size double-counts clips shared with other playlists) —
         // demote it below any real single title.
-        let a_oversize = a.size_bytes > capacity_bytes;
-        let b_oversize = b.size_bytes > capacity_bytes;
+        //
+        // `capacity_bytes == 0` means the capacity is UNKNOWN, not that the
+        // disc holds nothing: `read_udf` substitutes 0 when READ CAPACITY
+        // fails and scans on regardless. Applied literally the gate would
+        // INVERT there — every real title (`size_bytes > 0`) would be
+        // "oversize" and demoted, while a CLPI-less `size_bytes == 0` title
+        // would not, landing at `titles[0]` ahead of the feature. With no
+        // capacity to compare against, the gate is inert and the size /
+        // duration / audio keys decide the order on their own.
+        let capacity_known = capacity_bytes > 0;
+        let a_oversize = capacity_known && a.size_bytes > capacity_bytes;
+        let b_oversize = capacity_known && b.size_bytes > capacity_bytes;
         a_oversize
             .cmp(&b_oversize)
             // PRIMARY: largest physical size = the main feature. Robust where
@@ -3575,8 +3587,8 @@ mod tests {
     ) -> (crate::udf::fixture::MemDisc, udf::UdfFs) {
         use crate::udf::fixture::*;
         let files = vec![
-            file("MAIN.EVO", 100, 5_000, main_bytes, true),
-            file("OTHER.EVO", 101, 50_000, other_bytes, true),
+            file("MAIN.EVO", 100, 5_000, main_bytes as u64, true),
+            file("OTHER.EVO", 101, 50_000, other_bytes as u64, true),
         ];
         let root = DirSpec {
             name: String::new(),
@@ -3596,6 +3608,128 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
         (disc, udf)
+    }
+
+    /// A cancelled [`crate::halt::Halt`] must stop the HD-DVD title scan.
+    ///
+    /// The scan is bounded but big — up to `MAX_HDDVD_CLIPS` clips, each
+    /// costing an ICB resolve plus a 16 MiB `EVO_PROBE_SECTORS` stream probe —
+    /// so on a live drive an operator Stop that only takes effect after the
+    /// whole enumerator returns is no Stop at all. `ScanOptions::halt` is
+    /// already honoured by the CSS crack and the forced-subtitle probe; the
+    /// title enumerator must honour it too.
+    ///
+    /// It must also not report a HALF-ENUMERATED disc as a successful scan:
+    /// a truncated title list is indistinguishable from a disc that genuinely
+    /// holds fewer titles.
+    #[test]
+    fn scan_with_cancelled_halt_stops_the_hddvd_title_scan() {
+        use crate::udf::fixture::PART_START;
+
+        /// Counts reads that land on CLIP DATA (at or past the first clip's
+        /// data extent) — i.e. the per-clip stream probing, the expensive part
+        /// of the scan. Everything below that is filesystem metadata.
+        struct CountingReader<'a> {
+            inner: &'a mut crate::udf::fixture::MemDisc,
+            clip_reads: usize,
+        }
+        impl SectorSource for CountingReader<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> Result<usize> {
+                if lba >= PART_START + 5_000 {
+                    self.clip_reads += 1;
+                }
+                self.inner.read_sectors(lba, count, buf, recovery)
+            }
+        }
+
+        let (mut disc, udf) = hddvd_two_clip_disc(3_000_000, 5_000_000);
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let opts = ScanOptions {
+            halt: Some(halt),
+            ..Default::default()
+        };
+        let mut reader = CountingReader {
+            inner: &mut disc,
+            clip_reads: 0,
+        };
+        let res = Disc::scan_with(&mut reader, 3_997_952, None, None, &opts, udf);
+        let clip_reads = reader.clip_reads;
+
+        assert!(
+            matches!(res, Err(Error::Halted)),
+            "a cancelled scan must say so, not return a partial title list as \
+             a completed scan; got {:?}",
+            res.map(|d| d.titles.len())
+        );
+        assert_eq!(
+            clip_reads, 0,
+            "cancellation must be observed before the per-clip stream probes, \
+             not after all of them"
+        );
+    }
+
+    /// A Stop on a LIVE DRIVE never touches `ScanOptions::halt`: `Drive` has
+    /// its own flag and `checked_exec` fails every SCSI command with
+    /// [`Error::Halted`] once it is set. The HD-DVD enumerator must not
+    /// swallow that into a successful scan.
+    ///
+    /// Measured before this was fixed: the scan returned `Ok` with both
+    /// titles present and ZERO streams on each — a cancelled scan wearing the
+    /// shape of a disc whose clips carry no video or audio. Downstream that is
+    /// a title list to cache, display and rip from.
+    #[test]
+    fn halted_reads_do_not_report_the_hddvd_scan_as_successful() {
+        use crate::udf::fixture::PART_START;
+
+        /// Fails clip-data reads the way a live drive does once Stop is
+        /// pressed; filesystem metadata below the first clip still resolves,
+        /// so the scan gets far enough to enumerate titles.
+        struct HaltingReader<'a> {
+            inner: &'a mut crate::udf::fixture::MemDisc,
+        }
+        impl SectorSource for HaltingReader<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> Result<usize> {
+                if lba >= PART_START + 5_000 {
+                    return Err(Error::Halted);
+                }
+                self.inner.read_sectors(lba, count, buf, recovery)
+            }
+        }
+
+        let (mut disc, udf) = hddvd_two_clip_disc(3_000_000, 5_000_000);
+        let mut reader = HaltingReader { inner: &mut disc };
+        let res = Disc::scan_with(
+            &mut reader,
+            3_997_952,
+            None,
+            None,
+            &ScanOptions::default(),
+            udf,
+        );
+        assert!(
+            matches!(res, Err(Error::Halted)),
+            "reads cancelled by the drive's own halt flag must surface as a \
+             cancelled scan, not as titles that merely look stream-less; got \
+             {:?}",
+            res.map(|d| d
+                .titles
+                .iter()
+                .map(|t| (t.playlist.clone(), t.streams.len()))
+                .collect::<Vec<_>>())
+        );
     }
 
     /// `scan_with`'s `capacity_bytes = capacity as u64 * 2048` feeds
@@ -6814,6 +6948,55 @@ mod tests {
         assert_eq!(
             Disc::canonical_title_order(&exact, &smaller, CAP),
             Ordering::Less
+        );
+    }
+
+    /// `capacity_bytes == 0` means the disc capacity is UNKNOWN — `read_udf`
+    /// substitutes 0 when READ CAPACITY fails (transient spin-up, SCSI error)
+    /// and proceeds with the scan. It does NOT mean "the disc holds nothing".
+    ///
+    /// With a literal reading of the gate, 0 inverts it: EVERY real title is
+    /// `size_bytes > 0` and therefore "oversize", while a title with no CLPI
+    /// (`size_bytes == 0`) is not — so the empty title sorts to `titles[0]`
+    /// ahead of the feature and `freemkv -t 1` rips garbage. The gate must be
+    /// INERT when the capacity is unknown.
+    #[test]
+    fn canonical_order_unknown_capacity_does_not_demote_every_real_title() {
+        const UNKNOWN: u64 = 0; // READ CAPACITY failed
+        let feature = title_with("00800.mpls", 7_320.0, 57_200_000_000, 1);
+        // A playlist whose CLPI files are missing/unparseable: no declared size.
+        let sizeless = title_with("00001.mpls", 120.0, 0, 1);
+        let mut titles = [sizeless, feature];
+        titles.sort_by(|a, b| Disc::canonical_title_order(a, b, UNKNOWN));
+        assert_eq!(
+            titles[0].playlist, "00800.mpls",
+            "with an UNKNOWN capacity the real feature must still sort first; \
+             a size-0 title must not be promoted ahead of it"
+        );
+        assert_eq!(titles[1].playlist, "00001.mpls");
+    }
+
+    /// Control for [`canonical_order_unknown_capacity_does_not_demote_every_real_title`]:
+    /// making the gate inert on an UNKNOWN capacity must not make it dead. With
+    /// a KNOWN capacity a genuinely oversize play-all composite is still demoted
+    /// below a smaller real title — even though "largest size first" would
+    /// otherwise rank it first. Asserted on the comparator in both argument
+    /// orders so an inconsistent comparator cannot pass.
+    #[test]
+    fn canonical_order_known_capacity_still_demotes_a_genuinely_oversize_title() {
+        use std::cmp::Ordering;
+        const CAP: u64 = 58_500_000_000;
+        let composite = title_with("00020.mpls", 15_180.0, 92_400_000_000, 253);
+        let real = title_with("00800.mpls", 7_320.0, 57_200_000_000, 1);
+        assert_eq!(
+            Disc::canonical_title_order(&real, &composite, CAP),
+            Ordering::Less,
+            "a known capacity must still demote the oversize composite"
+        );
+        assert_eq!(
+            Disc::canonical_title_order(&composite, &real, CAP),
+            Ordering::Greater,
+            "…in either argument order"
         );
     }
 

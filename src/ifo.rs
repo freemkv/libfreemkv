@@ -49,7 +49,7 @@ pub struct DvdTitle {
     pub cells: Vec<DvdCell>,
     /// Chapter start times in seconds (derived from program map + cell times)
     pub chapter_times: Vec<f64>,
-    /// Subtitle palette from PGC: 16 entries of [padding, Y, Cb, Cr].
+    /// Subtitle palette from PGC: 16 entries of [padding, Y, Cr, Cb].
     pub palette: Option<Vec<[u8; 4]>>,
 }
 
@@ -691,7 +691,16 @@ fn parse_video_attr(data: &[u8]) -> Result<DvdVideoAttr> {
 }
 
 /// Parse one audio stream attribute block (8 bytes at `offset`).
-fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
+/// `pub(crate)` for the CROSS-MODULE tests only. The sole production caller is
+/// `parse_vts_attributes` in this file; `src/mux/mkv.rs`'s `#[cfg(test)]` block
+/// calls it directly so its language-mapping tests run the real parser over real
+/// on-disc IFO bytes end to end, instead of a hand-built `DvdAudioAttr` that
+/// could agree with the muxer while both disagree with the disc. Narrowing this
+/// would mean either a `#[cfg(test)]`/`#[cfg(not(test))]` pair of signatures
+/// that can drift apart, or moving those tests away from the code they exist to
+/// pin — both worse than the widened crate-internal visibility, which reaches no
+/// public API.
+pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
     let b0 = byte_at(data, offset)?;
     let b1 = byte_at(data, offset + 1)?;
 
@@ -718,25 +727,9 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
 
     let channels = (b1 & 0x07) + 1; // (channels - 1) in low 3 bits of byte 1
 
-    // Language code: bytes 2-3 as ISO 639
+    // Language code: bytes 2-3 as ISO 639-1 (the DVD-Video spec's form).
     let lang_bytes = sub_slice(data, offset + 2, 2)?;
-    let language = if lang_bytes[0] >= b'a'
-        && lang_bytes[0] <= b'z'
-        && lang_bytes[1] >= b'a'
-        && lang_bytes[1] <= b'z'
-    {
-        String::from_utf8_lossy(lang_bytes).to_string()
-    } else if lang_bytes[0] == 0 && lang_bytes[1] == 0 {
-        String::new()
-    } else {
-        // Try to interpret as printable ASCII
-        let s: String = lang_bytes
-            .iter()
-            .filter(|&&b| b.is_ascii_alphanumeric())
-            .map(|&b| b as char)
-            .collect();
-        s
-    };
+    let language = dvd_lang_to_iso639_2(&parse_raw_dvd_lang_bytes(lang_bytes));
 
     Ok(DvdAudioAttr {
         codec,
@@ -785,9 +778,27 @@ fn assign_audio_sub_stream_ids(streams: &mut [DvdAudioAttr]) {
 
 /// Parse one subtitle stream attribute block (6 bytes at `offset`).
 fn parse_subtitle_attr(data: &[u8], offset: usize) -> Result<DvdSubtitleAttr> {
-    // Language code: bytes 2-3 as ISO 639
+    // Language code: bytes 2-3 as ISO 639-1 (the DVD-Video spec's form).
     let lang_bytes = sub_slice(data, offset + 2, 2)?;
-    let language = if lang_bytes[0] >= b'a'
+    let language = dvd_lang_to_iso639_2(&parse_raw_dvd_lang_bytes(lang_bytes));
+
+    Ok(DvdSubtitleAttr { language })
+}
+
+/// Decode the raw 2-byte on-disc language code shared by the audio and
+/// subtitle attribute blocks. A pair of lowercase a-z bytes is taken
+/// verbatim (the ISO 639-1 code the DVD-Video spec puts there); an all-zero
+/// pair means unspecified (empty string); anything else falls through to an
+/// ASCII-alphanumeric salvage — letters (either case) and digits are kept,
+/// everything else (control bytes, punctuation, high bytes from a corrupt or
+/// hostile disc) is dropped.
+///
+/// The salvage is deliberately not narrowed to a-z: whatever survives is only
+/// ever a lookup key for [`dvd_lang_to_iso639_2`], which degrades anything it
+/// does not recognize to `und`, so a stray `X` or `5` costs nothing and cannot
+/// reach an output stream as a language code.
+fn parse_raw_dvd_lang_bytes(lang_bytes: &[u8]) -> String {
+    if lang_bytes[0] >= b'a'
         && lang_bytes[0] <= b'z'
         && lang_bytes[1] >= b'a'
         && lang_bytes[1] <= b'z'
@@ -796,15 +807,40 @@ fn parse_subtitle_attr(data: &[u8], offset: usize) -> Result<DvdSubtitleAttr> {
     } else if lang_bytes[0] == 0 && lang_bytes[1] == 0 {
         String::new()
     } else {
-        let s: String = lang_bytes
+        lang_bytes
             .iter()
             .filter(|&&b| b.is_ascii_alphanumeric())
             .map(|&b| b as char)
-            .collect();
-        s
-    };
+            .collect()
+    }
+}
 
-    Ok(DvdSubtitleAttr { language })
+/// Convert a DVD IFO audio/subtitle attribute's language code — ISO 639-1
+/// (2 lowercase letters) per the DVD-Video spec, or empty when unspecified —
+/// to the ISO 639-2 form every downstream consumer (`disc::AudioStream` /
+/// `disc::SubtitleStream::language`, and in turn Matroska's `Language`
+/// element per RFC 9559 §12 and the MP4 sink's `mdhd` language) requires.
+///
+/// Uses `labels::vocab::iso639_1_to_iso639_2`, which spans the WHOLE of ISO
+/// 639-1 (plus the withdrawn spellings `iw`/`in`/`ji` that DVD-Video's
+/// frozen-1988 language list still puts on disc). The narrower
+/// `vocab::menu_lang` table is deliberately NOT used here: it exists for
+/// Blu-ray menu-graphic filename tokens and knows only 25 languages, so a
+/// Region-2 disc's Romanian, Bulgarian, Croatian, Serbian, Slovak, Slovenian,
+/// Hebrew, Estonian, Latvian, Lithuanian and Icelandic tracks would all fold
+/// onto `und` together. DVD streams carry an empty `label`, so the language
+/// is the only thing distinguishing one subtitle track from the next — a
+/// valid code that is identical for six tracks is worse for the user than the
+/// invalid one it replaced. Both tables normalize to ISO 639-2/T, so they
+/// agree wherever they overlap.
+///
+/// An empty or unrecognized code degrades to `"und"` (ISO 639-2 / Matroska's
+/// own "undetermined" value) — a valid element value — rather than passing
+/// through an invalid 2-letter code or an empty string. Never guesses.
+fn dvd_lang_to_iso639_2(raw: &str) -> String {
+    crate::labels::vocab::iso639_1_to_iso639_2(raw)
+        .unwrap_or("und")
+        .to_string()
 }
 
 // ── PGC parser ──────────────────────────────────────────────────────────────
@@ -1016,7 +1052,7 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         times
     };
 
-    // Extract subtitle palette at PGC offset 0xA4: 16 colors × 4 bytes [padding, Y, Cb, Cr]
+    // Extract subtitle palette at PGC offset 0xA4: 16 colors × 4 bytes [padding, Y, Cr, Cb]
     let palette = if pgc_offset + 0xA4 + 64 <= data.len() {
         let mut colors = Vec::with_capacity(16);
         for i in 0..16 {
@@ -1441,7 +1477,7 @@ mod tests {
         data[0] = 0x00;
         // b1: bits 2-0=101 (channels-1=5) => 0x05
         data[1] = 0x05;
-        // language "en"
+        // on-disc language "en" (ISO 639-1) -> parsed as ISO 639-2 "eng"
         data[2] = b'e';
         data[3] = b'n';
 
@@ -1449,7 +1485,7 @@ mod tests {
         assert_eq!(attr.codec, Codec::Ac3);
         assert_eq!(attr.sample_rate, 48000);
         assert_eq!(attr.channels, 6);
-        assert_eq!(attr.language, "en");
+        assert_eq!(attr.language, "eng");
     }
 
     #[test]
@@ -1579,7 +1615,7 @@ mod tests {
         assert_eq!(attr.codec, Codec::Dts);
         assert_eq!(attr.sample_rate, 96000);
         assert_eq!(attr.channels, 2);
-        assert_eq!(attr.language, "fr");
+        assert_eq!(attr.language, "fra");
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1693,15 +1729,17 @@ mod tests {
     }
 
     /// Audio language bytes [offset+2..+4]: when both bytes are 0x00 the
-    /// language is the empty string (unspecified), per source.
+    /// on-disc code is unspecified, and `dvd_lang_to_iso639_2` maps that to
+    /// the valid ISO 639-2 "und" (undetermined) rather than an empty string,
+    /// which is not a legal Matroska `Language` element value.
     #[test]
-    fn audio_attr_zero_language_is_empty() {
+    fn audio_attr_zero_language_becomes_und() {
         let mut data = vec![0u8; 8];
         data[0] = 0x00;
         data[2] = 0x00;
         data[3] = 0x00;
         let attr = parse_audio_attr(&data, 0).unwrap();
-        assert_eq!(attr.language, "");
+        assert_eq!(attr.language, "und");
     }
 
     /// Audio sample_rate flag (b0>>3 & 0x03): 0=48kHz, 1=96kHz, else 48kHz.
@@ -1722,11 +1760,11 @@ mod tests {
         data[2] = b'd';
         data[3] = b'e';
         let attr = parse_subtitle_attr(&data, 0).unwrap();
-        assert_eq!(attr.language, "de");
+        assert_eq!(attr.language, "deu");
 
         let zero = vec![0u8; 6];
         let attr2 = parse_subtitle_attr(&zero, 0).unwrap();
-        assert_eq!(attr2.language, "");
+        assert_eq!(attr2.language, "und");
     }
 
     /// assign_audio_sub_stream_ids: MP1/MP2 and other non-private-stream-1
@@ -1812,8 +1850,8 @@ mod tests {
         assert_eq!(title.cells[1].first_sector, 20);
     }
 
-    /// parse_pgc palette: at PGC+0xA4, 16 colors × 4 bytes [pad, Y, Cb, Cr].
-    /// A palette with at least one non-zero Y/Cb/Cr is returned as Some;
+    /// parse_pgc palette: at PGC+0xA4, 16 colors × 4 bytes [pad, Y, Cr, Cb].
+    /// A palette with at least one non-zero Y/Cr/Cb is returned as Some;
     /// an all-zero palette returns None (source filters empty palettes).
     #[test]
     fn pgc_palette_present_and_empty() {
@@ -1833,14 +1871,14 @@ mod tests {
         assert!(title2.palette.is_none());
     }
 
-    /// parse_pgc palette layout: each color is [padding, Y, Cb, Cr] and the
+    /// parse_pgc palette layout: each color is [padding, Y, Cr, Cb] and the
     /// "non-empty" test ignores the padding byte (index 0). A palette whose
     /// ONLY non-zero bytes are padding must still be treated as empty (None).
     #[test]
     fn pgc_palette_padding_only_is_empty() {
         let mut pgc = vec![0u8; 0xEA];
         pgc[0x03] = 0;
-        // Set padding byte (index 0) of color 0 non-zero, but Y/Cb/Cr zero.
+        // Set padding byte (index 0) of color 0 non-zero, but Y/Cr/Cb zero.
         pgc[0xA4] = 0xFF;
         let title = parse_pgc(&pgc, 0, 1).unwrap();
         assert!(
@@ -2278,10 +2316,13 @@ mod tests {
     /// two bytes at +2. Only a pair of lowercase a-z bytes is taken verbatim;
     /// anything else falls through to the ASCII-alphanumeric salvage, which
     /// keeps only the usable characters. A byte outside a-z must never end up
-    /// in the language string.
+    /// in the raw salvaged string. This exercises `parse_raw_dvd_lang_bytes`
+    /// directly — the byte-level salvage step — separately from the ISO
+    /// 639-1 -> 639-2 mapping `parse_audio_attr`/`parse_subtitle_attr` apply
+    /// on top (see `dvd_two_letter_and_malformed_language_becomes_iso639_2`).
     #[test]
     fn language_code_rejects_non_lowercase_bytes() {
-        // (byte0, byte1, expected language)
+        // (byte0, byte1, expected raw salvage)
         let cases: [(u8, u8, &str); 8] = [
             (b'e', b'n', "en"), // both in range → verbatim
             (0x21, b'n', "n"),  // '!' is below 'a'
@@ -2291,6 +2332,31 @@ mod tests {
             (b'E', 0x00, "E"),  // only the second byte is zero
             (0x00, b'E', "E"),  // only the first byte is zero
             (0x00, 0x00, ""),   // both zero → unset
+        ];
+        for (b0, b1, want) in cases {
+            assert_eq!(
+                parse_raw_dvd_lang_bytes(&[b0, b1]),
+                want,
+                "raw language salvage for ({b0:#04x}, {b1:#04x})"
+            );
+        }
+    }
+
+    /// The full pipeline `parse_audio_attr`/`parse_subtitle_attr` apply on
+    /// top of the raw salvage: a valid ISO 639-1 code maps to its ISO 639-2
+    /// equivalent, and anything the raw salvage does NOT produce a mapped
+    /// code for (empty, or a single leftover letter from a malformed byte
+    /// pair) degrades to "und" — never an invalid 2-letter/1-letter code and
+    /// never an empty string, both of which are illegal Matroska `Language`
+    /// element values (RFC 9559 §12).
+    #[test]
+    fn dvd_two_letter_and_malformed_language_becomes_iso639_2() {
+        // (byte0, byte1, expected final language)
+        let cases: [(u8, u8, &str); 4] = [
+            (b'e', b'n', "eng"), // valid ISO 639-1 → mapped
+            (0x21, b'n', "und"), // malformed → salvage "n", unmapped → und
+            (b'E', 0x00, "und"), // malformed → salvage "E", unmapped → und
+            (0x00, 0x00, "und"), // unspecified → und
         ];
         for (b0, b1, want) in cases {
             let mut audio = vec![0u8; 8];
@@ -2496,7 +2562,7 @@ mod tests {
     }
 
     /// The subtitle palette is 16 entries of 4 bytes at PGC+0xA4, each
-    /// `[padding, Y, Cb, Cr]`. Every byte of every entry is distinct here, so
+    /// `[padding, Y, Cr, Cb]`. Every byte of every entry is distinct here, so
     /// a wrong stride, a wrong base or a shifted component shows up.
     #[test]
     // The loop variable is the DOMAIN VALUE being checked (a palette entry number), not a
@@ -2524,7 +2590,7 @@ mod tests {
         }
     }
 
-    /// A palette is "present" when ANY of Y, Cb or Cr is non-zero in ANY
+    /// A palette is "present" when ANY of Y, Cr or Cb is non-zero in ANY
     /// entry — a single non-zero chroma component is enough. Only the
     /// padding byte [0] is ignored.
     #[test]
