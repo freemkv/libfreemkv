@@ -2380,6 +2380,59 @@ mod tests {
         );
     }
 
+    /// A concealed gap must drop the HELD access unit, not just the byte
+    /// buffer.
+    ///
+    /// `parse` clears `self.acc` on a discontinuity because the buffered bytes
+    /// are a truncated frame. The held access unit is described by OFFSETS into
+    /// exactly those bytes, so it has to go with them. Without
+    /// `self.held = None`, the next packet resumes a HeldAu whose `start`/`end`
+    /// were computed against the pre-gap buffer but are applied to the
+    /// unrelated post-gap bytes — splicing audio across the gap at best, and
+    /// indexing past the end of the new, shorter buffer at worst.
+    ///
+    /// The two existing discontinuity tests use plain AC-3 (bsid < 11), which
+    /// never holds an access unit open, so neither of them reaches this reset.
+    #[test]
+    fn a_discontinuity_drops_the_held_access_unit_with_its_bytes() {
+        let mut parser = Ac3Parser::new();
+
+        // Open an access unit and extend it, so a HeldAu exists describing
+        // offsets into a large buffer.
+        assert!(
+            parser
+                .parse(&make_eac3_pes(eac3_substream_frame(0, 0)))
+                .is_empty(),
+            "the access unit is held open, not emitted"
+        );
+        for _ in 0..8 {
+            assert!(
+                parser
+                    .parse(&make_eac3_pes(eac3_substream_frame(1, 0)))
+                    .is_empty(),
+                "a dependent substream extends the open unit"
+            );
+        }
+
+        // The gap. Its post-gap payload is deliberately far SHORTER than the
+        // held unit's bytes, so a stale HeldAu indexes past its end.
+        let mut gap = make_eac3_pes(eac3_substream_frame(0, 0));
+        gap.discontinuity = true;
+        let _ = parser.parse(&gap);
+
+        // Whatever comes out, nothing may carry pre-gap bytes: the truncated
+        // unit was dropped, so the only access unit that can be emitted is the
+        // one opened after the gap.
+        let out = parser.flush();
+        let total: usize = out.iter().map(|f| f.data.len()).sum();
+        assert!(
+            total <= 256,
+            "a post-gap access unit must not be spliced onto the 9 frames held \
+             before the gap; got {total} bytes across {} frame(s)",
+            out.len()
+        );
+    }
+
     // helper: PES with a generic pts for E-AC-3 tests
     fn make_eac3_pes(data: Vec<u8>) -> PesPacket {
         PesPacket {

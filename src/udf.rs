@@ -691,7 +691,16 @@ impl UdfFs {
                     // caller reads those sectors): dropping it slid every later
                     // extent's data down by this hole's length, silently
                     // corrupting the file with no error anywhere.
-                    1 => extents.push(IcbExtent {
+                    // Type 2 ("not recorded and not allocated") is the other
+                    // sparse-hole encoding and has the SAME byte-space
+                    // semantics: no on-disc data, but the extent is part of the
+                    // file and occupies `data_len` bytes of it. It used to fall
+                    // into the catch-all below, which exits the descriptor loop
+                    // WITHOUT setting a continuation pointer — so `chain_ended`
+                    // was then set true and the function returned Ok with a
+                    // silently truncated list, defeating the UdfAdChainTooLong
+                    // gate and delivering a short file as a complete one.
+                    1 | 2 => extents.push(IcbExtent {
                         lba: data_lba,
                         len: data_len,
                         recorded: false,
@@ -705,6 +714,17 @@ impl UdfFs {
                         }
                         break;
                     }
+                    // Unreachable: `extent_type` is `raw_len >> 30`, a 2-bit
+                    // value, and 0/1/2/3 are now all handled above. Kept as a
+                    // conservative stop rather than a panic, because a library
+                    // must not crash on disc content.
+                    //
+                    // Do not add a new extent type here without handling it
+                    // properly: reaching this `break` leaves `next_block` unset,
+                    // so the loop below takes its `None` arm and sets
+                    // `chain_ended = true` — the list is then returned as Ok,
+                    // silently truncated, with the UdfAdChainTooLong gate
+                    // satisfied. That is exactly how type 2 was being dropped.
                     _ => break,
                 }
             }
@@ -2734,6 +2754,56 @@ mod tests {
                     recorded: true
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn icb_extents_short_ad_type2_sparse_extent_is_kept_and_flagged_unrecorded() {
+        // ECMA-167 4/14.14.1.1 extent type 2 = "not recorded and not
+        // allocated" — the other sparse-hole encoding alongside type 1. It has
+        // the SAME byte-space semantics as type 1: no on-disc data, but it is
+        // part of the file and occupies its declared length, so it must be
+        // returned flagged unrecorded rather than dropped.
+        //
+        // Before this was handled it fell into the descriptor loop's catch-all
+        // `_ => break`, which exits mid-list WITHOUT setting a continuation
+        // pointer — so `chain_ended` was then set true and the function
+        // returned Ok with a silently truncated extent list. That defeats the
+        // very completeness gate (`UdfAdChainTooLong`) added alongside it, and
+        // delivers a short file as a verified complete extraction.
+        let icb = build_efe(
+            6144,
+            &[
+                (0, 2048, 10), // recorded
+                (2, 2048, 20), // not recorded, not allocated
+                (0, 2048, 30), // recorded, after the hole
+            ],
+        );
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        let fs = fs_with(0, 0, file_entry("SP", 5, 6144));
+        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        assert_eq!(
+            extents,
+            vec![
+                IcbExtent {
+                    lba: 10,
+                    len: 2048,
+                    recorded: true
+                },
+                IcbExtent {
+                    lba: 20,
+                    len: 2048,
+                    recorded: false
+                },
+                IcbExtent {
+                    lba: 30,
+                    len: 2048,
+                    recorded: true
+                },
+            ],
+            "a type-2 hole must not truncate the list: the type-0 extent after \
+             it is part of the file"
         );
     }
 
