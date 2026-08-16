@@ -12,8 +12,19 @@ use super::{WriteSeek, ebml};
 type MkvHeaderResult = io::Result<(crate::disc::DiscTitle, Vec<(u16, Vec<u8>)>, i64, TrackTable)>;
 
 /// Skip `n` bytes on a forward-only reader (no Seek required).
+///
+/// A skip that runs out of input before `n` bytes is a TRUNCATED element, and is
+/// reported the same way `ebml::read_binary_val` reports a truncated body: as
+/// `MkvSourceInvalid`. Discarding `io::copy`'s byte count instead made a skip
+/// that hit EOF look like a success, so one corrupt size field mid-Clusters
+/// drained the rest of the file, the next element header raised
+/// `UnexpectedEof`, and `Stream::read` mapped that to `Ok(None)` — half the
+/// title missing, `errors = 0`, `completed = true`.
 fn skip_bytes(r: &mut impl Read, n: u64) -> io::Result<()> {
-    io::copy(&mut r.take(n), &mut io::sink())?;
+    let skipped = io::copy(&mut r.take(n), &mut io::sink())?;
+    if skipped != n {
+        return Err(crate::error::Error::MkvSourceInvalid.into());
+    }
     Ok(())
 }
 
@@ -3191,6 +3202,78 @@ mod tests {
         let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
         assert!(stream.read().unwrap().is_some(), "first frame");
         assert!(stream.read().unwrap().is_none(), "clean EOF → None");
+    }
+
+    /// A skipped element whose declared size runs PAST the end of the file is a
+    /// truncated element, exactly like a truncated `read_binary_val` body — and
+    /// must be reported the same way, as `MkvSourceInvalid`.
+    ///
+    /// `skip_bytes` used to discard `io::copy`'s returned count, so the skip
+    /// "succeeded" having drained the rest of the file. The next element header
+    /// then hit `UnexpectedEof`, which `read()` maps to `Ok(None)` — a clean end
+    /// of stream. One corrupt size field mid-Clusters therefore threw away every
+    /// remaining frame of the title and reported `errors = 0`, `complete = true`.
+    #[test]
+    fn a_skip_past_eof_is_an_error_not_a_clean_end_of_stream() {
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        // Frame 1 — read normally.
+        let block = [0x81u8, 0x00, 0x00, 0x80, 0xAA];
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, block.len() as u64).unwrap();
+        cluster.extend_from_slice(&block);
+        // A VOID whose size field is corrupt: it claims 1 MiB, and the file
+        // holds only the handful of bytes below. This is the "corrupt size
+        // field mid-Clusters" case.
+        ebml::write_id(&mut cluster, ebml::VOID).unwrap();
+        ebml::write_size(&mut cluster, 1024 * 1024).unwrap();
+        // Frame 2 — the rest of the title, swallowed by the bad skip.
+        let block2 = [0x81u8, 0x00, 0x01, 0x80, 0xBB];
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, block2.len() as u64).unwrap();
+        cluster.extend_from_slice(&block2);
+
+        let bytes = mkv_with_track_and_cluster(1, 1, &cluster);
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert!(stream.read().unwrap().is_some(), "first frame reads");
+        let e = match stream.read() {
+            Err(e) => e,
+            Ok(None) => panic!(
+                "a skip that hit EOF was reported as a CLEAN END OF STREAM: the \
+                 rest of the title is gone and the caller sees errors = 0, \
+                 complete = true"
+            ),
+            Ok(Some(_)) => panic!("the truncated skip must not yield a frame"),
+        };
+        assert!(is_mkv_source_invalid(&e), "{e:?}");
+    }
+
+    /// The honest path this fix must not break: a skipped element whose declared
+    /// size is exactly satisfied by the bytes present is still skipped cleanly,
+    /// and the genuine EOF that follows is still `Ok(None)`.
+    #[test]
+    fn a_fully_satisfied_skip_still_ends_at_a_clean_eof() {
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        // A VOID that is fully present.
+        ebml::write_id(&mut cluster, ebml::VOID).unwrap();
+        ebml::write_size(&mut cluster, 8).unwrap();
+        cluster.extend_from_slice(&[0u8; 8]);
+        let block = [0x81u8, 0x00, 0x00, 0x80, 0xAA];
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, block.len() as u64).unwrap();
+        cluster.extend_from_slice(&block);
+
+        let bytes = mkv_with_track_and_cluster(1, 1, &cluster);
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let f = stream.read().unwrap().expect("the frame after the VOID");
+        assert_eq!(f.data, vec![0xAA]);
+        assert!(
+            stream.read().unwrap().is_none(),
+            "a genuine EOF at a record boundary is still a clean end"
+        );
     }
 
     // ============================================================

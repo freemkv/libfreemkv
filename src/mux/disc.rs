@@ -566,6 +566,20 @@ impl DiscStream {
                 .into());
             }
 
+            // The read SOURCE is gone (a prefetch producer thread that
+            // terminated), not one range of media. Shrinking and retrying at
+            // the same LBA asks a dead source for data it can never produce,
+            // and the `skip_errors` branch below would then zero-fill and
+            // advance over every remaining sector of the title and still
+            // return success. Abort with the terminal error itself — a
+            // fabricated SCSI status would be a lie, so this is deliberately
+            // NOT folded into the transport-failure arm above.
+            if let Some(e) = res.as_ref().err()
+                && e.is_source_terminated()
+            {
+                return Err(crate::error::Error::SourceTerminated.into());
+            }
+
             if (sectors as u32) <= align {
                 // Bottomed out at one unit (AACS) / one sector (CSS) / the
                 // extent tail. This is single-pass disc→MKV, which has NO Pass N
@@ -619,6 +633,16 @@ impl DiscStream {
                         sense,
                     }
                     .into());
+                }
+
+                // Same rule as after the first-attempt read: the 60s recovery
+                // read goes through the same source, so it can be the call
+                // that discovers the source is dead. Skipping the unit would
+                // zero-fill the rest of the title as fabricated content.
+                if let Some(e) = rec.as_ref().err()
+                    && e.is_source_terminated()
+                {
+                    return Err(crate::error::Error::SourceTerminated.into());
                 }
 
                 // Recovery read also failed. Skip the WHOLE failed unit or bail.
@@ -1856,6 +1880,130 @@ mod tests {
             1,
             "transport failure must abort after the first failed read with no \
              shrink/retry/skip-ahead; got reads {reads:?}"
+        );
+    }
+
+    /// REGRESSION (round-4 audit): an ordinary MEDIUM ERROR bad sector must
+    /// keep its identity when it crosses the prefetch producer channel — the
+    /// same `DiscRead` with its SCSI status, NOT a transport failure.
+    ///
+    /// `PrefetchedSectorSource::read_sectors` re-wrapped every error that
+    /// crossed the channel as `Error::IoError`, and `is_scsi_transport_failure`
+    /// matches `IoError` (the wedged-USB-bridge arm). So a bad sector reached
+    /// `fill_extents` looking like a dead bus and aborted the pass with a
+    /// fabricated status 0xFF — the exact inverse of what that short-circuit
+    /// exists for, and it told the user to power-cycle a healthy drive.
+    ///
+    /// Asserted on the source, not on a `fill_extents` skip: the producer
+    /// thread exits for good after sending an error, so nothing downstream of
+    /// it can genuinely recover the rest of the title (see
+    /// `dead_prefetch_producer_does_not_silently_zero_fill_the_title`). An
+    /// assertion that the pass continues could only ever have been satisfied
+    /// by fabricated zeros.
+    #[test]
+    fn bad_sector_keeps_its_identity_across_the_prefetch_channel() {
+        const COUNT: u32 = 9;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = RecordingReader {
+            capacity: COUNT,
+            bad_sector: 4,
+            log: log.clone(),
+        };
+        let mut prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
+            reader,
+            vec![crate::disc::Extent {
+                start_lba: 0,
+                sector_count: COUNT,
+            }],
+            8,
+            1,
+            None,
+            None,
+        )
+        .expect("spawn producer");
+
+        let mut buf = vec![0u8; 8 * 2048];
+        let err = crate::sector::SectorSource::read_sectors(&mut prefetched, 0, 8, &mut buf, false)
+            .expect_err("the batch covering the bad sector must fail");
+        assert!(
+            !err.is_scsi_transport_failure(),
+            "a MEDIUM ERROR bad sector is not a dead bus; got {err:?}"
+        );
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::DiscRead {
+                    sector: 4,
+                    status: Some(0x02),
+                    ..
+                }
+            ),
+            "the producer's typed error must survive the channel intact; got {err:?}"
+        );
+    }
+
+    /// The prefetch producer thread terminates PERMANENTLY on its first read
+    /// error, so once one bad sector has crossed the channel the source can
+    /// never deliver another byte. Driving `fill_extents` to exhaustion after
+    /// that must NOT look like a completed pass: every remaining sector would
+    /// be fabricated zeros, and DATA LOSS MUST NEVER LOOK LIKE SUCCESS.
+    ///
+    /// The expectation is the product rule, not the code: a source that is
+    /// permanently out of data must report that, not answer `Ok(0)` forever —
+    /// which `commit_read` legitimately reads as an ordinary short read and
+    /// zero-fills.
+    #[test]
+    fn dead_prefetch_producer_does_not_silently_zero_fill_the_title() {
+        const COUNT: u32 = 30;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = RecordingReader {
+            capacity: COUNT,
+            bad_sector: 4,
+            log: log.clone(),
+        };
+        let prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
+            reader,
+            vec![crate::disc::Extent {
+                start_lba: 0,
+                sector_count: COUNT,
+            }],
+            8,
+            1,
+            None,
+            None,
+        )
+        .expect("spawn producer");
+        let mut stream = DiscStream::new(
+            Box::new(prefetched),
+            synthetic_title(COUNT),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::BdTs,
+            false,
+            None,
+        )
+        .unwrap();
+        stream.skip_errors = true;
+
+        // Drive the whole title. Bounded so a regression cannot hang the suite.
+        let mut completed_clean = false;
+        for _ in 0..(COUNT as usize * 4) {
+            match stream.fill_extents() {
+                Ok(true) => continue,
+                Ok(false) => {
+                    completed_clean = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !completed_clean,
+            "the producer died at sector 4, so sectors 4..{COUNT} were never \
+             read — reporting the pass as complete zero-fills {} of {} bytes \
+             and calls it success",
+            stream.lost_bytes,
+            COUNT as u64 * 2048
         );
     }
 

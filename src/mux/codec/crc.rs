@@ -29,10 +29,17 @@ pub(crate) fn crc16_ansi(data: &[u8]) -> u16 {
 }
 
 /// CRC-16 with polynomial 0x002D, init 0, MSB-first, used by the MLP / Dolby
-/// TrueHD major-sync header checksum. NOTE: MLP's checksum is the "reversed"
-/// scheme — the stored trailer word is the little-endian-read CRC, so this
-/// standard CRC must be compared against the stored bytes read big-endian.
-/// The caller handles that comparison (see `truehd::mlp_major_sync_ok`).
+/// TrueHD major-sync header checksum.
+///
+/// NOTE: MLP's checksum is the "reversed" scheme. This function emits its two
+/// bytes in the OPPOSITE order to a standard little-endian CRC readout, so the
+/// caller swaps them back and compares against the stored trailer word read
+/// LITTLE-endian — see `truehd::mlp_major_sync_crc_ok`, which is authoritative.
+///
+/// Comparing big-endian instead is precisely the bug that function was fixed
+/// for: it could never validate a real extended major sync, so whole TrueHD
+/// tracks were dropped silently. This comment used to prescribe exactly that,
+/// and to point at a `truehd::mlp_major_sync_ok` that does not exist.
 /// Verified against real MLP/TrueHD bitstreams (225/225 major-sync AUs).
 pub(crate) fn crc16_mlp(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
@@ -103,8 +110,13 @@ mod tests {
 
     #[test]
     fn crc16_mlp_residue_property_holds() {
-        // Appending the big-endian CRC zeroes the residue over message+crc — the
-        // scheme `truehd::mlp_major_sync_ok` relies on.
+        // Appending the big-endian CRC zeroes the residue over message+crc.
+        // This is a property of the CRC itself, pinned here so a change to the
+        // polynomial or the bit order is caught. It is NOT how the TrueHD
+        // caller validates a major sync: `truehd::mlp_major_sync_crc_ok` does a
+        // swap-and-XOR compare against the little-endian trailer word. (This
+        // comment used to claim the caller relied on the residue, and named a
+        // `truehd::mlp_major_sync_ok` that does not exist.)
         let msg = [0xF8u8, 0x72, 0x6F, 0xBA];
         let c = crc16_mlp(&msg);
         let mut framed = msg.to_vec();

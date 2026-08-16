@@ -911,7 +911,7 @@ mod tests {
             .collect();
         assert_eq!(audios.len(), 2);
         assert_eq!(audios[0].codec, Codec::Ac3);
-        assert_eq!(audios[0].language, "en");
+        assert_eq!(audios[0].language, "eng");
         assert_eq!(audios[1].codec, Codec::Dts);
         // Real channel layouts survive the scan (not a 1ch placeholder): the
         // AC-3 is 5.1 (6ch), the DTS is 2.0 (2ch).
@@ -1040,7 +1040,7 @@ mod tests {
         // Languages preserved in order.
         assert_eq!(
             subs.iter().map(|s| s.language.as_str()).collect::<Vec<_>>(),
-            vec!["en", "fr", "de"]
+            vec!["eng", "fra", "deu"]
         );
         // PIDs are 0x20 + ordinal, all distinct.
         let pids: Vec<u16> = subs.iter().map(|s| s.pid).collect();
@@ -1097,7 +1097,7 @@ mod tests {
             })
             .expect("subtitle stream");
         assert_eq!(sub.codec, Codec::DvdSub);
-        assert_eq!(sub.language, "en");
+        assert_eq!(sub.language, "eng");
         assert!(
             sub.codec_data.is_some(),
             "non-zero palette must yield codec_data"

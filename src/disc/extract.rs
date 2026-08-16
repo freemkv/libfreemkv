@@ -107,8 +107,10 @@ struct PlannedFile {
     size: u64,
     /// Inline (ICB-embedded) data, if any. When `Some`, `extents` is empty.
     inline: Option<Vec<u8>>,
-    /// Absolute disc extents `(abs_lba, byte_len)`.
-    extents: Vec<(u32, u32)>,
+    /// Absolute disc extents, each carrying whether it was ever RECORDED (an
+    /// ECMA-167 4/14.14.1.1 type-1 extent is allocated but not recorded: it
+    /// occupies the file's byte space and its contents are zeros).
+    extents: Vec<crate::udf::AbsExtent>,
 }
 
 impl Disc {
@@ -144,7 +146,7 @@ impl Disc {
         let fs = udf::read_filesystem(reader)?;
         let mut planned: Vec<PlannedFile> = Vec::new();
         let mut dirs: Vec<PathBuf> = Vec::new();
-        let mut seen_hosts: std::collections::HashMap<PathBuf, String> =
+        let mut seen_hosts: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         plan_tree(
             reader,
@@ -339,10 +341,14 @@ impl Disc {
 
         let mut extents: Vec<crate::disc::Extent> = Vec::new();
         for pf in files {
-            for &(abs_lba, byte_len) in &pf.extents {
+            // Unrecorded extents hold no bytes the VOB ever wrote, so they can
+            // carry no scrambled sector for the crack to work from — feeding
+            // them in spends the shared sector budget on media that is not part
+            // of the title.
+            for ext in pf.extents.iter().filter(|e| e.recorded) {
                 extents.push(crate::disc::Extent {
-                    start_lba: abs_lba,
-                    sector_count: (byte_len as u64).div_ceil(SECTOR_BYTES_U64) as u32,
+                    start_lba: ext.lba,
+                    sector_count: (ext.len as u64).div_ceil(SECTOR_BYTES_U64) as u32,
                 });
             }
         }
@@ -379,9 +385,22 @@ impl Disc {
             crate::css::CrackOutcome::Unencrypted => Ok(base_keys.clone()),
             // Scrambled sectors WERE seen and no key came out. Reusing the
             // disc-wide key here writes corrupt PES behind an intact header and
-            // reports a complete extract at exit 0. Skippable per title, which
-            // is why this is the per-title code and not the disc-level one — a
-            // sibling VTS may still crack.
+            // reports a complete extract at exit 0.
+            //
+            // `CssKeyMissing` is the per-TITLE code rather than the disc-level
+            // `CssNoDiscKey` because the two are treated differently elsewhere:
+            // it is what `error::is_skippable_title_stub` matches, and the MUX
+            // path really does skip a title on it and carry on with the rest of
+            // the disc.
+            //
+            // EXTRACT does not skip. This error is `?`-propagated by the only
+            // caller, out of the loop over every planned file, so one
+            // uncrackable VTS aborts the whole extract — including files from
+            // sibling VTS groups that would have cracked. That is deliberate:
+            // aborting loudly is the safe failure here, and pinned by
+            // `a_scrambled_vts_that_cannot_be_cracked_fails_instead_of_borrowing_a_key`.
+            // Do not read the code choice as a promise that extraction
+            // continues past this point.
             crate::css::CrackOutcome::ScrambledUncracked => Err(Error::CssKeyMissing),
         }
     }
@@ -429,7 +448,7 @@ fn plan_tree(
     is_root: bool,
     files: &mut Vec<PlannedFile>,
     dirs: &mut Vec<PathBuf>,
-    seen_hosts: &mut std::collections::HashMap<PathBuf, String>,
+    seen_hosts: &mut std::collections::HashMap<String, String>,
 ) -> Result<()> {
     for entry in &dir.entries {
         if entry.name.is_empty() {
@@ -447,13 +466,48 @@ fn plan_tree(
         let safe = sanitize_component(&entry.name)?;
         let child_rel = host_rel.join(&safe);
         let child_disc = format!("{disc_path}/{}", entry.name);
-        // Collision: two distinct disc paths → same host path.
-        if let Some(prev) = seen_hosts.insert(child_rel.clone(), child_disc.clone())
-            && prev != child_disc
-        {
-            return Err(Error::DirNameCollision {
-                host: child_rel.to_string_lossy().into_owned(),
-            });
+        // Collision: two distinct disc paths → same host FILE. The key must
+        // model the HOST's namespace, not the disc's, and the two differ twice
+        // over:
+        //
+        //  * CASE. macOS APFS and Windows NTFS are case-insensitive by default,
+        //    so `Movie` and `movie` are one file there. Keyed by the
+        //    case-preserving path they were two entries, nothing collided, and
+        //    the second extraction overwrote the first with both files still
+        //    reported `complete: true`.
+        //  * The `.partial` SUFFIX. `extract_one_file` streams through
+        //    `<final>.partial` before renaming, so a file's temp path lives in
+        //    the same namespace as every other file's final path: a disc
+        //    holding both `X` and `X.partial` planned two distinct final names,
+        //    and extracting `X` then truncated the real `X.partial`.
+        //
+        // Only files get the `.partial` alias — directories are created
+        // directly and never stream through a temp name — but it is checked
+        // against every entry's primary key, so a directory `X.partial` beside
+        // a file `X` is caught too. The alias stores the OWNING file's disc
+        // path, so the `prev != child_disc` test keeps its meaning: a repeated
+        // identical disc path is not a collision, two different ones are.
+        //
+        // The fold is `to_lowercase`, which closes the ASCII and simple-Unicode
+        // case classes. It is NOT full case folding, and it does NOT normalize:
+        // APFS also unifies NFC/NFD, so `é` recorded as U+00E9 and as
+        // `e`+U+0301 remain two keys here and one file there. That residual is
+        // a false NEGATIVE (a missed collision, never a spurious one), so this
+        // is a strict improvement rather than a complete model of the host.
+        let mut register = |key: PathBuf| -> Result<()> {
+            let folded = key.to_string_lossy().to_lowercase();
+            if let Some(prev) = seen_hosts.insert(folded, child_disc.clone())
+                && prev != child_disc
+            {
+                return Err(Error::DirNameCollision {
+                    host: key.to_string_lossy().into_owned(),
+                });
+            }
+            Ok(())
+        };
+        register(child_rel.clone())?;
+        if !entry.is_dir {
+            register(with_partial_suffix(&child_rel))?;
         }
         if entry.is_dir {
             dirs.push(child_rel.clone());
@@ -534,9 +588,46 @@ fn extract_one_file<S: SectorSource>(
 
     let mut written: u64 = 0;
     let mut buf = vec![0u8; READ_BATCH_SECTORS as usize * SECTOR_BYTES];
-    'extents: for &(abs_lba, byte_len) in &pf.extents {
+    'extents: for &crate::udf::AbsExtent {
+        lba: abs_lba,
+        len: byte_len,
+        recorded,
+    } in &pf.extents
+    {
         if written >= pf.size {
             break;
+        }
+        // ECMA-167 4/14.14.1.1 type 1: allocated but NOT recorded. The extent
+        // is part of the file's byte space and its contents are defined to be
+        // zeros, so write the zeros WITHOUT reading the media — those sectors
+        // hold nothing this file ever wrote (on an AACS disc, ciphertext that
+        // decrypts to noise). This mirrors `UdfFs::read_file_limited`, which
+        // takes the same decision from the same flag. Skipping the extent
+        // entirely instead would slide every later extent's bytes down by the
+        // hole's length.
+        if !recorded {
+            let sectors = (byte_len as u64).div_ceil(SECTOR_BYTES_U64);
+            let hole_bytes = (sectors * SECTOR_BYTES_U64).min(pf.size.saturating_sub(written));
+            let mut left = hole_bytes;
+            for b in buf.iter_mut() {
+                *b = 0;
+            }
+            while left > 0 {
+                let n = left.min(buf.len() as u64) as usize;
+                write_all(&mut writer, &buf[..n], &partial_path)?;
+                written = written.saturating_add(n as u64);
+                *done_bytes = done_bytes.saturating_add(n as u64);
+                left -= n as u64;
+            }
+            fr.bytes_good = fr.bytes_good.saturating_add(hole_bytes);
+            let cont = report(opts, *done_bytes, total_bytes);
+            if opts.cancelled(cont) {
+                return Ok((fr, true));
+            }
+            if written >= pf.size {
+                break 'extents;
+            }
+            continue;
         }
         // Anchor AACS unit alignment at THIS extent's start (clip-anchored
         // gate, not absolute LBA 0 and NOT the file's first extent). A file
@@ -1185,6 +1276,17 @@ mod tests {
         s
     }
 
+    /// Build a file ICB whose FIRST short AD is an ECMA-167 4/14.14.1.1 type-1
+    /// (allocated, NOT recorded) extent and whose second is ordinary recorded
+    /// data. Both are `sectors_each` sectors long.
+    fn build_hole_then_data_icb(sectors_each: u32, hole_lba: u32, data_lba: u32) -> [u8; 2048] {
+        let mut s = build_two_extent_icb(sectors_each, hole_lba, data_lba);
+        let len = sectors_each * SECTOR_BYTES as u32;
+        // Re-stamp AD #0 with extent type 1 in bits 30..31 of the length field.
+        s[216..220].copy_from_slice(&(0x4000_0000u32 | (len & 0x3FFF_FFFF)).to_le_bytes());
+        s
+    }
+
     /// Encrypt the clear unit from `clear_aacs_unit(tag)` under `unit_key` so
     /// `aacs::content::decrypt_unit` recovers it cleanly (zero decrypt loss).
     /// `tag` distinguishes two units' payloads.
@@ -1598,6 +1700,62 @@ mod tests {
         assert!(matches!(err, Error::DirNameCollision { .. }));
     }
 
+    /// Two disc names differing only by CASE are one host file on macOS APFS
+    /// and Windows NTFS, both case-insensitive by default. Keyed by the
+    /// case-preserving path, the collision map sees two entries, raises
+    /// nothing, and the second file extracted overwrites the first — while both
+    /// `PlannedFile`s report `complete: true`. Silent data loss reported as a
+    /// clean extract is the one outcome this crate must never produce, so the
+    /// host-equivalence key has to model the host's namespace, not the disc's.
+    #[test]
+    fn names_differing_only_by_case_are_a_collision() {
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: vec![
+                file("Movie", 30, 31, b"a".to_vec(), false),
+                file("movie", 32, 33, b"b".to_vec(), false),
+            ],
+            subdirs: vec![],
+        };
+        let mut disc = build_disc(root);
+        let out = TmpDir::new("case_collision");
+        let err = clear_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect_err("two names that fold to one host file must collide");
+        assert!(matches!(err, Error::DirNameCollision { .. }), "got {err:?}");
+    }
+
+    /// A file's in-flight `.partial` path shares the host namespace with every
+    /// other planned file's FINAL path. A disc carrying both `X` and
+    /// `X.partial` plans two distinct final names, so nothing collides — but
+    /// extracting `X` writes through `X.partial`, the same host path the other
+    /// file owns. Whichever lands second truncates the other, and both entries
+    /// are still reported complete.
+    #[test]
+    fn a_files_partial_path_colliding_with_another_files_final_name_is_an_error() {
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: vec![
+                file("X", 30, 31, b"aaaa".to_vec(), false),
+                file("X.partial", 32, 33, b"bbbb".to_vec(), false),
+            ],
+            subdirs: vec![],
+        };
+        let mut disc = build_disc(root);
+        let out = TmpDir::new("partial_collision");
+        let err = clear_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect_err(
+                "X's temp path IS X.partial's final path — one host file for two \
+                 disc files, so it must be refused up front",
+            );
+        assert!(matches!(err, Error::DirNameCollision { .. }), "got {err:?}");
+    }
+
     /// A non-empty target dir is refused without `--force`, and accepted with.
     #[test]
     fn non_empty_target_requires_force() {
@@ -1725,6 +1883,63 @@ mod tests {
             res.complete,
             "a clean multi-extent AACS file extracts complete"
         );
+    }
+
+    /// An ECMA-167 4/14.14.1.1 type-1 extent is ALLOCATED BUT NOT RECORDED:
+    /// the space belongs to the file and occupies its byte range, but nothing
+    /// was ever written there, and the standard defines its contents as zeros.
+    /// `read_icb_extents` keeps the flag (`IcbExtent::recorded`) and
+    /// `read_file_limited` honours it by emitting zeros WITHOUT touching the
+    /// media. The tree extractor reads the same ICBs and must agree: reading
+    /// those sectors returns whatever the media happens to hold there — on an
+    /// AACS disc, ciphertext that decrypts to noise — and writes it into the
+    /// extracted file as if the disc had recorded it.
+    ///
+    /// The hole here is filled with a recognisable non-zero pattern, so
+    /// "emitted zeros" and "read the media" are told apart by CONTENT.
+    #[test]
+    fn extract_tree_zero_fills_an_unrecorded_extent_instead_of_reading_it() {
+        const SECTORS_EACH: u32 = 1;
+        const HOLE: u32 = 5000;
+        const DATA: u32 = 5004;
+
+        let hole_bytes = vec![0xEEu8; SECTOR_BYTES];
+        let data_bytes = vec![0x5Au8; SECTOR_BYTES];
+        // The file's byte space: the hole's zeros FIRST, then the real data.
+        let mut expect = vec![0u8; SECTOR_BYTES];
+        expect.extend_from_slice(&data_bytes);
+
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+
+        let mut root_fids = Vec::new();
+        push_fid(&mut root_fids, "", 10, true, true);
+        push_fid(&mut root_fids, "INDEX.BDMV", 42, false, false);
+        disc.put(
+            PART_START + 42,
+            build_hole_then_data_icb(SECTORS_EACH, HOLE, DATA),
+        );
+        disc.put_bytes(PART_START + HOLE, &hole_bytes);
+        disc.put_bytes(PART_START + DATA, &data_bytes);
+        disc.put(PART_START + 10, build_dir_icb(11, root_fids.len() as u32));
+        disc.put_bytes(PART_START + 11, &root_fids);
+
+        let out = TmpDir::new("unrecorded_extent");
+        let res = clear_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect("extract");
+
+        let got = read_out(out.path(), "INDEX.BDMV").expect("file written");
+        assert_eq!(
+            got, expect,
+            "an unrecorded extent contributes zeros to the file, never the \
+             bytes that happen to sit on those sectors"
+        );
+        assert_eq!(
+            res.bytes_unreadable, 0,
+            "a hole is not a read failure — nothing was attempted"
+        );
+        assert!(res.complete);
     }
 
     /// Focused alignment-computation check underpinning the per-extent fix:

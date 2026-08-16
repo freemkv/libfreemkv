@@ -1899,11 +1899,24 @@ mod tests {
     /// below its own range start, or a zero unit size, are both map bugs — they
     /// must return a defined answer rather than panicking on debug overflow or
     /// dividing by zero.
+    ///
+    /// Every case here asserts the DEFINED answer, not merely the absence of a
+    /// panic. The zero-unit-size case used to be written
+    /// `assert!(unit_is_our_phase(100, 30, 0, Phase::Even) || true)`, which
+    /// accepts both answers and so pinned nothing at all: the guards could
+    /// invert and it would still pass. The answer is knowable —
+    /// `saturating_sub` gives 70, `max(1)` makes the divisor 1, unit index 70
+    /// is even — so pin it.
     #[test]
     fn phase_gate_does_not_panic_on_a_malformed_map() {
         use super::{Phase, unit_is_our_phase};
+        // Unit below its own range start: saturating_sub clamps to 0, and unit
+        // 0 is even.
         assert!(unit_is_our_phase(10, 100, 3, Phase::Even));
-        assert!(unit_is_our_phase(100, 30, 0, Phase::Even) || true);
+        // Zero unit size: max(1) makes the divisor 1, so the index is the raw
+        // offset 70 — even.
+        assert!(unit_is_our_phase(100, 30, 0, Phase::Even));
+        // Both malformations at once: offset 0 over divisor 1 is unit 0, even.
         assert!(unit_is_our_phase(5, 5, 0, Phase::Even));
     }
 }

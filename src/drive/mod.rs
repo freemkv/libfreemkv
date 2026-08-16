@@ -8,6 +8,17 @@ pub fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
     match e {
         Error::ScsiError { status, sense, .. } => (*status, *sense),
         Error::DiscRead { status, sense, .. } => (status.unwrap_or(0), *sense),
+        // A failed `ioctl(SG_IO)` and a vanished device never produced a SCSI
+        // reply at all — they are dead-bus faults, not recoverable bad sectors.
+        // `Error::is_scsi_transport_failure` (error.rs) already declares both
+        // variants transport failures so sweep / patch / fill_extents abort the
+        // pass instead of zero-filling against a wedged device; callers that
+        // flatten an error through here (Drive::read_one, DiscStream::fill_extents,
+        // freemkv-engine's recovery sweep/patch) would otherwise collapse them to
+        // status 0 and silently destroy that classification.
+        Error::IoError { .. } | Error::DeviceNotFound { .. } => {
+            (crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE, None)
+        }
         _ => (0, None),
     }
 }
@@ -1934,6 +1945,90 @@ mod command_tests {
         let err = d.read(7, 1, &mut buf, false).unwrap_err();
         assert!(err.is_scsi_transport_failure());
         assert!(err.scsi_sense().is_none());
+    }
+
+    /// `extract_scsi_context` must map the two non-SCSI dead-bus faults
+    /// (a failed `ioctl(SG_IO)` → `Error::IoError`, a vanished fd →
+    /// `Error::DeviceNotFound`) to the 0xFF TRANSPORT_FAILURE sentinel, not
+    /// to 0x00. Everything else keeps the (0, None) catch-all.
+    /// Spec: `Error::is_scsi_transport_failure` (error.rs) declares both
+    ///       variants transport failures so sweep/patch/fill_extents abort
+    ///       the pass instead of zero-filling against a wedged device.
+    /// Mutation: returning (0, None) here flattens IoError into
+    ///           `DiscRead { status: Some(0) }`, which is_scsi_transport_failure
+    ///           rejects — a wedged USB bridge zero-fills the whole title.
+    #[test]
+    fn extract_scsi_context_maps_dead_bus_faults_to_transport_failure() {
+        let (status, sense) = extract_scsi_context(&Error::IoError {
+            source: std::io::Error::from(std::io::ErrorKind::NotConnected),
+        });
+        assert_eq!(
+            status,
+            crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+            "a failed ioctl(SG_IO) is a transport-layer fault"
+        );
+        assert!(sense.is_none(), "no SCSI reply means no sense data");
+
+        let (status, sense) = extract_scsi_context(&Error::DeviceNotFound {
+            path: "/dev/sg9".into(),
+        });
+        assert_eq!(
+            status,
+            crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+            "a vanished device is a transport-layer fault"
+        );
+        assert!(sense.is_none());
+
+        // Control: the catch-all still yields (0, None) for unrelated errors,
+        // so the two asserts above are about these variants specifically.
+        assert_eq!(extract_scsi_context(&Error::Halted), (0, None));
+
+        // Control: real SCSI replies still pass their own status through.
+        let s = crate::scsi::ScsiSense {
+            sense_key: 3,
+            asc: 0x11,
+            ascq: 0x00,
+        };
+        assert_eq!(
+            extract_scsi_context(&Error::ScsiError {
+                opcode: 0x28,
+                status: 0x02,
+                sense: Some(s),
+            }),
+            (0x02, Some(s))
+        );
+    }
+
+    /// End-to-end: an `Error::IoError` raised by the transport must still be
+    /// classified as a transport failure after `Drive::read` flattens it into
+    /// `Error::DiscRead`. Without the `extract_scsi_context` mapping the
+    /// variant is destroyed (status becomes `Some(0)`) and the caller treats a
+    /// dead bus as a recoverable bad sector.
+    #[test]
+    fn read_io_error_surfaces_as_transport_failure_not_a_bad_sector() {
+        let mut d = Drive::from_transport_for_test(Box::new(AlwaysErr {
+            err: || Error::IoError {
+                source: std::io::Error::from(std::io::ErrorKind::NotConnected),
+            },
+        }));
+        let mut buf = vec![0u8; 2048];
+        let err = d.read(42, 1, &mut buf, false).unwrap_err();
+        assert!(
+            err.is_scsi_transport_failure(),
+            "a wedged bus must abort the pass, not zero-fill: got {err:?}"
+        );
+
+        // The same for a device that vanished mid-read.
+        let mut d = Drive::from_transport_for_test(Box::new(AlwaysErr {
+            err: || Error::DeviceNotFound {
+                path: "/dev/sg9".into(),
+            },
+        }));
+        let err = d.read(42, 1, &mut buf, false).unwrap_err();
+        assert!(
+            err.is_scsi_transport_failure(),
+            "a vanished device must abort the pass: got {err:?}"
+        );
     }
 
     #[test]

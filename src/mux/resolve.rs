@@ -1521,8 +1521,11 @@ fn forensic_clip_extents(
         tracing::warn!(target: "freemkv::keysource", "fmts: more than one forensic clip on the disc — segment byte space is ambiguous");
         return Ok(None);
     }
+    // Addressing variant: these extents are a byte-space map for the forensic
+    // segment table (`clip_byte_to_lba`), not a read plan — an unrecorded
+    // extent must stay in place here or every later segment offset shifts.
     let exts: Vec<crate::disc::Extent> = udf
-        .file_extents(reader, &format!("/BDMV/STREAM/{name}"))
+        .file_extents_addressing(reader, &format!("/BDMV/STREAM/{name}"))
         .map_err(io::Error::from)?
         .into_iter()
         .filter(|&(lba, sectors)| lba > 0 && sectors > 0)
@@ -4440,7 +4443,7 @@ mod tests {
                             "00001.fmts",
                             20,
                             FMTS_CONTENT_LBA - PART_START,
-                            FMTS_CONTENT_SECTORS * 2048,
+                            u64::from(FMTS_CONTENT_SECTORS) * 2048,
                             true,
                         )],
                         subdirs: Vec::new(),
