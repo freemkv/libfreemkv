@@ -45,6 +45,7 @@ pub const E_INVALID_CDB_LENGTH: u16 = 4001;
 
 // I/O (5xxx)
 pub const E_IO_ERROR: u16 = 5000;
+pub const E_SOURCE_TERMINATED: u16 = 5001;
 
 // Disc format (6xxx)
 pub const E_DISC_READ: u16 = 6000;
@@ -64,6 +65,7 @@ pub const E_UDF_BUFFER_TOO_SMALL: u16 = 6012;
 pub const E_UDF_NOT_FILESYSTEM: u16 = 6013;
 pub const E_IMAGE_TRUNCATED: u16 = 6015;
 pub const E_UDF_AD_CHAIN_TOO_LONG: u16 = 6016;
+pub const E_UDF_UNRECORDED_EXTENT: u16 = 6017;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -392,6 +394,18 @@ pub enum Error {
     MplsParse,
     ClpiParse,
     UdfNotFound {
+        path: String,
+    },
+    /// The file's ICB allocation list contains an unrecorded (ECMA-167
+    /// 4/14.14.1.1 type-1/type-2) extent: space allocated to the file at that
+    /// location but never written, so its true content there is zeros while
+    /// the media holds something else.
+    ///
+    /// Raised by [`crate::udf::UdfFs::file_extents`] because a
+    /// `(lba, sector_count)` read plan cannot express a hole — reading it
+    /// splices undefined sectors into the rip as content, and dropping it
+    /// slides every later extent's byte space.
+    UdfUnrecordedExtent {
         path: String,
     },
     /// The reader was addressable but the bytes are structurally NOT a UDF
@@ -744,6 +758,19 @@ pub enum Error {
     /// it silently leaves encrypted. The producer surfaces this rather
     /// than emit still-encrypted bytes.
     ExtentNotUnitAligned,
+    /// A [`crate::sector::SectorSource`] that feeds its reads from a
+    /// producer thread has terminated for good — the thread exited after
+    /// an error or before delivering the extents it was given — so it can
+    /// never return another byte.
+    ///
+    /// It exists because the alternative answer is a lie: a dead source
+    /// that reports `Ok(0)` is indistinguishable from end-of-stream, and
+    /// `DiscStream::fill_extents` legitimately reads a short count as a
+    /// skippable hole — zero-filling and advancing over every remaining
+    /// sector of the title and still returning success. Unlike a bad
+    /// sector, this condition cannot be retried at a smaller size or
+    /// skipped past, so every consumer must abort the pass on it.
+    SourceTerminated,
     /// An MPEG-TS packet under construction violated the 188-byte fixed
     /// size (over-long adaptation field, overflowing payload, or a
     /// short/mis-assembled packet). Indicates a muxer invariant break,
@@ -861,11 +888,13 @@ impl Error {
             Error::ScsiError { .. } => E_SCSI_ERROR,
             Error::InvalidCdbLength { .. } => E_INVALID_CDB_LENGTH,
             Error::IoError { .. } => E_IO_ERROR,
+            Error::SourceTerminated => E_SOURCE_TERMINATED,
             Error::DiscRead { .. } => E_DISC_READ,
             Error::Halted => E_HALTED,
             Error::MplsParse => E_MPLS_PARSE,
             Error::ClpiParse => E_CLPI_PARSE,
             Error::UdfNotFound { .. } => E_UDF_NOT_FOUND,
+            Error::UdfUnrecordedExtent { .. } => E_UDF_UNRECORDED_EXTENT,
             Error::UdfNotFilesystem => E_UDF_NOT_FILESYSTEM,
             Error::UdfBufferTooSmall => E_UDF_BUFFER_TOO_SMALL,
             Error::UdfAdChainTooLong => E_UDF_AD_CHAIN_TOO_LONG,
@@ -1075,6 +1104,7 @@ impl std::fmt::Display for Error {
             },
             Error::Halted => write!(f, "E{}", self.code()),
             Error::UdfNotFound { path } => write!(f, "E{}: {}", self.code(), path),
+            Error::UdfUnrecordedExtent { path } => write!(f, "E{}: {}", self.code(), path),
             Error::SeamPlanDroppedMost { dropped, written } => {
                 write!(f, "E{} {dropped}/{written}", self.code())
             }
@@ -1428,6 +1458,22 @@ impl Error {
             self,
             Error::IoError { .. } | Error::DeviceNotFound { .. }
         )
+    }
+
+    /// True if the read SOURCE itself is gone, as opposed to one range of
+    /// media being unreadable. Kept separate from
+    /// [`is_scsi_transport_failure`](Self::is_scsi_transport_failure) —
+    /// which is about the bus/bridge and drives "power-cycle the drive"
+    /// advice — because a terminated producer thread is neither a wedged
+    /// bridge nor a bad sector, and reporting it as SCSI status 0xFF would
+    /// be a fabricated status byte.
+    ///
+    /// What it shares with a transport failure is the only thing the read
+    /// loops need to know: retrying smaller or skipping ahead cannot
+    /// recover anything, so the pass must abort rather than fabricate
+    /// zeros for the rest of the title.
+    pub fn is_source_terminated(&self) -> bool {
+        matches!(self, Error::SourceTerminated)
     }
 
     /// True if this error indicates bridge degradation — the SCSI status

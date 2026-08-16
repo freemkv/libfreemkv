@@ -822,16 +822,47 @@ impl UdfFs {
         Ok(out)
     }
 
-    /// Get all absolute disc sector extents for a file.
-    /// Returns Vec of (absolute_lba, sector_count) covering the entire file,
-    /// including any unrecorded (ECMA-167 4/14.14.1.1 type-1) extent — the
-    /// space is allocated to the file and occupies its byte space, so omitting
-    /// it would misplace every later extent.
+    /// Absolute disc extents `(absolute_lba, sector_count)` for a file, for a
+    /// caller that will READ those sectors as the file's content — a title's
+    /// play plan.
+    ///
+    /// Refuses, with [`Error::UdfUnrecordedExtent`], a file that contains an
+    /// unrecorded (ECMA-167 4/14.14.1.1 type-1/type-2) extent. Such an extent
+    /// occupies the file's byte space but was never written, so the file's
+    /// true content there is zeros while the media holds something else
+    /// entirely. A `(lba, sector_count)` pair cannot say "this range is a
+    /// hole", and both ways of pretending otherwise corrupt the rip: reading
+    /// it splices undefined sectors into the stream as content, and dropping
+    /// it slides every later extent's byte space. Until an extent can carry
+    /// the flag end-to-end, refusing is the only truthful answer at this
+    /// signature — and a title that is not offered is not a title that was
+    /// silently mis-ripped.
+    ///
+    /// Callers that only need the list as a byte-space ADDRESS MAP (never
+    /// reading the sectors as content) want
+    /// [`file_extents_addressing`](Self::file_extents_addressing), which keeps
+    /// the hole in place so offsets stay correct.
     pub fn file_extents(
         &self,
         reader: &mut dyn SectorSource,
         path: &str,
     ) -> Result<Vec<(u32, u32)>> {
+        let meta_lba = self.entry_at(path)?.meta_lba;
+        let abs = self.extents_abs_at(reader, meta_lba)?;
+        if abs.iter().any(|e| !e.recorded) {
+            return Err(Error::UdfUnrecordedExtent {
+                path: path.to_string(),
+            });
+        }
+        Ok(abs
+            .iter()
+            .map(|e| (e.lba, (e.len as u64).div_ceil(2048) as u32))
+            .collect())
+    }
+
+    /// Resolve `path` to its directory entry. Shared by both extent
+    /// resolvers so they cannot drift apart on lookup semantics.
+    fn entry_at(&self, path: &str) -> Result<&DirEntry> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
         for part in &parts[..parts.len() - 1] {
@@ -851,29 +882,39 @@ impl UdfFs {
                 });
             }
         };
-        let entry = current
+        current
             .entries
             .iter()
             .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(filename))
             .ok_or_else(|| Error::UdfNotFound {
                 path: path.to_string(),
-            })?;
+            })
+    }
 
-        let alloc_extents = self.read_icb_extents(reader, entry.meta_lba)?;
-        let mut disc_extents = Vec::with_capacity(alloc_extents.len());
-        for ext in alloc_extents {
-            let abs_lba = self
-                .partition_start
-                .checked_add(ext.lba)
-                .ok_or(Error::DiscRead {
-                    sector: self.partition_start as u64,
-                    status: None,
-                    sense: None,
-                })?;
-            let sectors = (ext.len as u64).div_ceil(2048) as u32;
-            disc_extents.push((abs_lba, sectors));
-        }
-        Ok(disc_extents)
+    /// Absolute disc extents `(absolute_lba, sector_count)` for a file, for a
+    /// caller that uses the list purely as a BYTE-SPACE ADDRESS MAP — mapping
+    /// a file offset onto an LBA (see
+    /// [`crate::aacs::segment::clip_byte_to_lba`]) — and never reads the
+    /// sectors as the file's content.
+    ///
+    /// Unrecorded (ECMA-167 4/14.14.1.1 type-1/type-2) extents are INCLUDED
+    /// here, unflagged: they occupy the file's byte space, so omitting one
+    /// would slide every later offset by the hole's length and misaddress the
+    /// rest of the file. That is the right trade only because nothing on this
+    /// path treats the returned sectors as stream bytes. Anything that will
+    /// read them must call [`file_extents`](Self::file_extents), which refuses
+    /// the file instead.
+    pub fn file_extents_addressing(
+        &self,
+        reader: &mut dyn SectorSource,
+        path: &str,
+    ) -> Result<Vec<(u32, u32)>> {
+        let meta_lba = self.entry_at(path)?.meta_lba;
+        Ok(self
+            .extents_abs_at(reader, meta_lba)?
+            .iter()
+            .map(|e| (e.lba, (e.len as u64).div_ceil(2048) as u32))
+            .collect())
     }
 }
 
@@ -2804,6 +2845,48 @@ mod tests {
             ],
             "a type-2 hole must not truncate the list: the type-0 extent after \
              it is part of the file"
+        );
+    }
+
+    /// `file_extents` builds the extent list a Blu-ray / HD-DVD TITLE is
+    /// actually ripped through (`disc/bluray.rs`, `disc/hddvd.rs`,
+    /// `mux/resolve.rs`). Its `(lba, sector_count)` tuple cannot say "this
+    /// range is a hole", and both ways of pretending otherwise are wrong:
+    ///
+    /// * folding an unrecorded extent in makes the mux read undefined sectors
+    ///   and splice whatever the media holds there into the stream as content;
+    /// * dropping it slides every later extent's byte space, and that list IS
+    ///   a byte-space map (`aacs::segment::clip_byte_to_lba`).
+    ///
+    /// So at this signature the only truthful answer is refusal.
+    #[test]
+    fn file_extents_refuses_a_file_with_an_unrecorded_extent() {
+        let icb = build_efe(
+            6144,
+            &[
+                (0, 2048, 10), // recorded
+                (1, 2048, 20), // allocated, NOT recorded — undefined sectors
+                (0, 2048, 30), // recorded, after the hole
+            ],
+        );
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        let fs = fs_with(
+            0,
+            0,
+            DirEntry {
+                name: String::new(),
+                is_dir: true,
+                meta_lba: 0,
+                size: 0,
+                entries: vec![file_entry("SP", 5, 6144)],
+            },
+        );
+        let res = fs.file_extents(&mut reader, "/SP");
+        assert!(
+            res.is_err(),
+            "an unrecorded extent must never reach the title's extent list as \
+             readable content; got {res:?}"
         );
     }
 

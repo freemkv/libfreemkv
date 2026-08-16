@@ -2061,7 +2061,7 @@ impl Disc {
             )
         } else if udf_fs.find_dir("/HVDVD_TS").is_some() {
             (
-                Self::scan_hddvd_titles(reader, &udf_fs),
+                Self::scan_hddvd_titles(reader, &udf_fs, opts.halt.as_ref())?,
                 ContentFormat::MpegPs,
             )
         } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
@@ -3608,6 +3608,128 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
         (disc, udf)
+    }
+
+    /// A cancelled [`crate::halt::Halt`] must stop the HD-DVD title scan.
+    ///
+    /// The scan is bounded but big — up to `MAX_HDDVD_CLIPS` clips, each
+    /// costing an ICB resolve plus a 16 MiB `EVO_PROBE_SECTORS` stream probe —
+    /// so on a live drive an operator Stop that only takes effect after the
+    /// whole enumerator returns is no Stop at all. `ScanOptions::halt` is
+    /// already honoured by the CSS crack and the forced-subtitle probe; the
+    /// title enumerator must honour it too.
+    ///
+    /// It must also not report a HALF-ENUMERATED disc as a successful scan:
+    /// a truncated title list is indistinguishable from a disc that genuinely
+    /// holds fewer titles.
+    #[test]
+    fn scan_with_cancelled_halt_stops_the_hddvd_title_scan() {
+        use crate::udf::fixture::PART_START;
+
+        /// Counts reads that land on CLIP DATA (at or past the first clip's
+        /// data extent) — i.e. the per-clip stream probing, the expensive part
+        /// of the scan. Everything below that is filesystem metadata.
+        struct CountingReader<'a> {
+            inner: &'a mut crate::udf::fixture::MemDisc,
+            clip_reads: usize,
+        }
+        impl SectorSource for CountingReader<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> Result<usize> {
+                if lba >= PART_START + 5_000 {
+                    self.clip_reads += 1;
+                }
+                self.inner.read_sectors(lba, count, buf, recovery)
+            }
+        }
+
+        let (mut disc, udf) = hddvd_two_clip_disc(3_000_000, 5_000_000);
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let opts = ScanOptions {
+            halt: Some(halt),
+            ..Default::default()
+        };
+        let mut reader = CountingReader {
+            inner: &mut disc,
+            clip_reads: 0,
+        };
+        let res = Disc::scan_with(&mut reader, 3_997_952, None, None, &opts, udf);
+        let clip_reads = reader.clip_reads;
+
+        assert!(
+            matches!(res, Err(Error::Halted)),
+            "a cancelled scan must say so, not return a partial title list as \
+             a completed scan; got {:?}",
+            res.map(|d| d.titles.len())
+        );
+        assert_eq!(
+            clip_reads, 0,
+            "cancellation must be observed before the per-clip stream probes, \
+             not after all of them"
+        );
+    }
+
+    /// A Stop on a LIVE DRIVE never touches `ScanOptions::halt`: `Drive` has
+    /// its own flag and `checked_exec` fails every SCSI command with
+    /// [`Error::Halted`] once it is set. The HD-DVD enumerator must not
+    /// swallow that into a successful scan.
+    ///
+    /// Measured before this was fixed: the scan returned `Ok` with both
+    /// titles present and ZERO streams on each — a cancelled scan wearing the
+    /// shape of a disc whose clips carry no video or audio. Downstream that is
+    /// a title list to cache, display and rip from.
+    #[test]
+    fn halted_reads_do_not_report_the_hddvd_scan_as_successful() {
+        use crate::udf::fixture::PART_START;
+
+        /// Fails clip-data reads the way a live drive does once Stop is
+        /// pressed; filesystem metadata below the first clip still resolves,
+        /// so the scan gets far enough to enumerate titles.
+        struct HaltingReader<'a> {
+            inner: &'a mut crate::udf::fixture::MemDisc,
+        }
+        impl SectorSource for HaltingReader<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> Result<usize> {
+                if lba >= PART_START + 5_000 {
+                    return Err(Error::Halted);
+                }
+                self.inner.read_sectors(lba, count, buf, recovery)
+            }
+        }
+
+        let (mut disc, udf) = hddvd_two_clip_disc(3_000_000, 5_000_000);
+        let mut reader = HaltingReader { inner: &mut disc };
+        let res = Disc::scan_with(
+            &mut reader,
+            3_997_952,
+            None,
+            None,
+            &ScanOptions::default(),
+            udf,
+        );
+        assert!(
+            matches!(res, Err(Error::Halted)),
+            "reads cancelled by the drive's own halt flag must surface as a \
+             cancelled scan, not as titles that merely look stream-less; got \
+             {:?}",
+            res.map(|d| d
+                .titles
+                .iter()
+                .map(|t| (t.playlist.clone(), t.streams.len()))
+                .collect::<Vec<_>>())
+        );
     }
 
     /// `scan_with`'s `capacity_bytes = capacity as u64 * 2048` feeds

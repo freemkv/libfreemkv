@@ -132,16 +132,48 @@ impl Disc {
                     // so muxing it captures the full 3D. 2D clips fall back to
                     // the base .m2ts / .fmts as before.
                     let ssif = format!("/BDMV/STREAM/SSIF/{}.ssif", play_item.clip_id);
+                    // A clip stream that carries an unrecorded (never-written)
+                    // extent cannot be turned into a truthful read plan — see
+                    // `UdfFs::file_extents`. Track it separately from an
+                    // ordinary "file absent" error: absence is what the
+                    // extension fallback exists for, whereas a hole means the
+                    // bytes this title needs do not exist on the disc.
+                    let mut unrecorded = false;
                     let file_exts = match udf_fs.file_extents(reader, &ssif) {
                         Ok(exts) => {
                             is_3d = true;
                             Some(exts)
                         }
-                        Err(_) => CLIP_STREAM_EXTS.iter().find_map(|ext| {
-                            let path = format!("/BDMV/STREAM/{}.{}", play_item.clip_id, ext);
-                            udf_fs.file_extents(reader, &path).ok()
-                        }),
+                        Err(e) => {
+                            unrecorded |= matches!(e, Error::UdfUnrecordedExtent { .. });
+                            CLIP_STREAM_EXTS.iter().find_map(|ext| {
+                                let path = format!("/BDMV/STREAM/{}.{}", play_item.clip_id, ext);
+                                match udf_fs.file_extents(reader, &path) {
+                                    Ok(exts) => Some(exts),
+                                    Err(e) => {
+                                        unrecorded |=
+                                            matches!(e, Error::UdfUnrecordedExtent { .. });
+                                        None
+                                    }
+                                }
+                            })
+                        }
                     };
+                    // Nothing resolved AND a hole was the reason: drop the
+                    // whole title. Letting the clip contribute no extents
+                    // (the ordinary not-found path) would emit a title whose
+                    // feed is silently missing this clip's runtime while its
+                    // durations, spans and size still count it — data loss
+                    // wearing the shape of a normal rip.
+                    if file_exts.is_none() && unrecorded {
+                        tracing::warn!(
+                            target: "freemkv::disc",
+                            playlist = %filename,
+                            clip = %play_item.clip_id,
+                            "E{}", crate::error::E_UDF_UNRECORDED_EXTENT
+                        );
+                        return None;
+                    }
                     if let Some(file_exts) = file_exts {
                         let span_start = feed_pos;
                         for (lba, sectors) in file_exts {
@@ -1029,14 +1061,22 @@ mod tests {
         assert_eq!(t.clips[0].source_packets, 0);
     }
 
-    /// `file_extents` filters extents with `lba == 0` or `sectors == 0`
-    /// (bluray.rs: `if sectors > 0 && lba > 0`). A clip whose data lands at
-    /// partition-relative LBA 0 would produce abs LBA == PART_START (> 0),
-    /// so to exercise the lba==0 guard we'd need partition_start 0; instead
-    /// verify a zero-length declared file produces no extent. A 0-byte
-    /// m2ts → sectors == 0 → dropped.
+    /// A clip stream whose ICB declares an UNRECORDED (ECMA-167 4/14.14.1.1
+    /// type-1) extent must not yield a title at all.
+    ///
+    /// The extent is allocated to the file but was never written, so the
+    /// file's content there is zeros while the media holds whatever was left
+    /// at those sectors. Neither answer a `(lba, sector_count)` read plan can
+    /// give is true — reading it splices undefined sectors into the rip as
+    /// content, dropping it slides every later extent's byte space — so the
+    /// title is refused rather than mis-ripped. This fixture is the shape a
+    /// crafted disc uses to get such a range into a title's extent list.
+    ///
+    /// (The `sectors > 0 && lba > 0` filter below the resolver stays as
+    /// defence in depth; a zero-length AD is only reachable as an unrecorded
+    /// descriptor, since a zero-length TYPE 0 one terminates the AD list.)
     #[test]
-    fn parse_playlist_zero_length_extent_is_filtered() {
+    fn parse_playlist_unrecorded_extent_yields_no_title() {
         let mut disc = MemDisc::new();
         // The m2ts ICB is rewritten below to carry TWO short ADs: a
         // zero-length one (0 sectors) followed by a real 4096-byte one.
@@ -1092,13 +1132,22 @@ mod tests {
             disc.put_bytes(PART_START + 100, &icb);
             udf::read_filesystem(&mut disc).expect("fs")
         };
-        // The ICB above must actually deliver a zero-sector extent to
-        // `parse_playlist`, or the filter under test is never reached.
+        // The fixture must really carry the unrecorded descriptor, or the
+        // behaviour under test is never reached. `file_extents_addressing`
+        // shows what is there: the hole in its byte-space position, followed
+        // by the real content.
         assert_eq!(
-            udf.file_extents(&mut disc, "/BDMV/STREAM/00001.m2ts")
+            udf.file_extents_addressing(&mut disc, "/BDMV/STREAM/00001.m2ts")
                 .expect("extents"),
             vec![(PART_START + 4999, 0), (PART_START + 5000, 2)],
-            "fixture must present one zero-sector extent and one real one"
+            "fixture must present one unrecorded extent and one real one"
+        );
+        assert!(
+            matches!(
+                udf.file_extents(&mut disc, "/BDMV/STREAM/00001.m2ts"),
+                Err(Error::UdfUnrecordedExtent { .. })
+            ),
+            "a read plan over an unrecorded extent must be refused"
         );
         let mpls = build_mpls(
             &[PiSpec {
@@ -1110,16 +1159,12 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
-        // size still counted (from clpi packets) but the empty extent dropped.
-        assert_eq!(t.size_bytes, 4000 * 192);
-        assert_eq!(
-            t.extents,
-            vec![Extent {
-                start_lba: PART_START + 5000,
-                sector_count: 2,
-            }],
-            "the zero-sector extent must be filtered and the real one kept"
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls);
+        assert!(
+            t.is_none(),
+            "the only clip has no truthful read plan, so offering the title \
+             would mean ripping undefined sectors as content; got {:?}",
+            t.map(|t| t.extents)
         );
     }
 

@@ -85,6 +85,12 @@ pub struct PrefetchedSectorSource {
     ///
     /// [`capacity_sectors`]: SectorSource::capacity_sectors
     total_sectors: u32,
+    /// Latched the moment a terminal error crosses the channel. The
+    /// producer NEVER resumes after sending one (every error arm
+    /// `return`s), so the closed channel that follows is a dead source,
+    /// not end-of-stream — and `read_sectors` must keep saying so instead
+    /// of answering `Ok(0)` for the rest of the title.
+    producer_failed: bool,
 }
 
 impl PrefetchedSectorSource {
@@ -300,6 +306,22 @@ impl PrefetchedSectorSource {
                                     return;
                                 }
                                 let sectors_read = (n / 2048) as u32;
+                                // A genuine zero-byte read with no error
+                                // would otherwise spin this loop forever.
+                                // It is not end-of-stream either: the
+                                // extent list still has `remaining`
+                                // sectors to serve, so the inner source
+                                // has quit early. Send a terminal
+                                // sentinel — dropping `tx` here instead
+                                // would reach the consumer as a clean EOF
+                                // and finalize a TRUNCATED title as
+                                // success, exactly as the panic sentinel
+                                // below exists to prevent.
+                                if sectors_read == 0 {
+                                    let _ =
+                                        tx.send(Err(crate::error::Error::SourceTerminated.into()));
+                                    return;
+                                }
                                 buf.truncate(n);
                                 bytes_read_total = bytes_read_total.saturating_add(n as u64);
                                 if let Some(ref f) = event_fn {
@@ -312,12 +334,6 @@ impl PrefetchedSectorSource {
                                 }
                                 if tx.send(Ok(buf)).is_err() {
                                     return; // consumer dropped
-                                }
-                                // A genuine zero-byte read with no error would
-                                // otherwise spin this loop forever; treat it
-                                // as end-of-source.
-                                if sectors_read == 0 {
-                                    return;
                                 }
                                 offset = offset.saturating_add(sectors_read);
                             }
@@ -344,6 +360,7 @@ impl PrefetchedSectorSource {
             recycle_tx,
             producer: Some(producer),
             total_sectors,
+            producer_failed: false,
         })
     }
 
@@ -495,8 +512,20 @@ impl SectorSource for PrefetchedSectorSource {
             // downcasts the boxed payload back to the exact variant the
             // producer sent (status + sense intact); a genuine OS-level
             // `io::Error` — the real dead-bus case — still becomes `IoError`.
-            Ok(Err(e)) => Err(crate::error::Error::from(e)),
-            // Channel closed (producer finished or panicked).
+            Ok(Err(e)) => {
+                // The producer `return`s after every error it sends, so
+                // this is also the moment the source dies. Latch it: the
+                // closed channel that follows must not read as EOF.
+                self.producer_failed = true;
+                Err(crate::error::Error::from(e))
+            }
+            // Channel closed. Clean EOF only if the producer never
+            // signalled a failure — otherwise it exited without
+            // delivering the rest of the extents, and answering `Ok(0)`
+            // would let `fill_extents` mistake a dead source for a short
+            // read, zero-fill every remaining sector of the title and
+            // still report the pass as complete.
+            Err(_) if self.producer_failed => Err(crate::error::Error::SourceTerminated),
             Err(_) => Ok(0),
         }
     }
@@ -1240,6 +1269,63 @@ mod tests {
                 io.kind(),
                 std::io::ErrorKind::PermissionDenied,
                 "underlying ErrorKind must survive the channel round-trip"
+            );
+        });
+    }
+
+    /// An inner source that answers a mid-extent read with `Ok(0)` has quit
+    /// early: the extent list still has sectors to serve. The producer must
+    /// say so, not simply drop `tx` — a closed channel reads as clean
+    /// end-of-stream, and `DiscStream::fill_extents` then fabricates zeros
+    /// for every remaining sector of the title and reports the pass
+    /// complete. Same rule as the panic sentinel: a truncated title must
+    /// never be finalized as success.
+    struct QuitsEarlySource;
+    impl SectorSource for QuitsEarlySource {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            Ok(0)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            9
+        }
+    }
+
+    #[test]
+    fn inner_source_quitting_early_is_not_reported_as_end_of_stream() {
+        with_watchdog(Duration::from_secs(10), || {
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 9,
+            }];
+            let mut pf =
+                PrefetchedSectorSource::new(QuitsEarlySource, extents, 3, None).expect("spawn");
+            let mut buf = vec![0u8; 3 * 2048];
+            let mut last = pf.read_sectors(0, 3, &mut buf, false);
+            // Whatever the first answer, no call may ever settle on a clean
+            // `Ok(0)`: 9 sectors were promised and none were delivered.
+            for _ in 0..4 {
+                if last.is_err() {
+                    break;
+                }
+                assert_eq!(
+                    *last.as_ref().unwrap(),
+                    0,
+                    "the source delivered no bytes, so nothing can be Ok(n>0)"
+                );
+                last = pf.read_sectors(0, 3, &mut buf, false);
+            }
+            let err =
+                last.expect_err("an undelivered extent list must surface as an error, not as EOF");
+            assert!(
+                err.is_source_terminated(),
+                "the source is gone for good — retrying or skipping cannot \
+                 recover anything; got {err:?}"
             );
         });
     }
