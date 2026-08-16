@@ -437,6 +437,48 @@ const MAX_XPL_TITLES: usize = 4096;
 /// title, while bounding the probe work to something a scan can absorb.
 const MAX_HDDVD_CLIPS: usize = 4096;
 
+/// Most `<PrimaryAudioVideoClip>` elements one `<Title>` may contribute.
+///
+/// The fourth amplification axis on this function, and the one the other three
+/// guards leave open. [`MAX_XPL_DEPTH`] bounds NESTING, [`MAX_XPL_TITLES`]
+/// bounds how many titles a playlist DECLARES, and [`MAX_HDDVD_CLIPS`] bounds
+/// the directory fallback — none of them bounds how many clips a SINGLE title
+/// collects.
+///
+/// Two things multiply here. A 64 MiB XPL (exactly `udf::MAX_FILE_BYTES`) holds
+/// ~1.7 million `<PrimaryAudioVideoClip src="A.EVO"/>` elements at ~38 bytes
+/// each. And the collector below is `descendants()`, not `children()`, so a clip
+/// nested inside N ancestor `<Title>` elements is collected by EVERY one of
+/// them — and the depth cap still permits 32 such ancestors (measured: a bare
+/// `<Title>` root nests 32 deep and still parses, because the guard counts the
+/// self-closing clip element as non-nesting). The product is ~1.7M x 32 ≈ 56
+/// million heap-allocated [`XplClip`]s, each with its own `String`, and then as
+/// many [`Clip`]s again in [`compose_xpl_titles`].
+///
+/// Unlike the title cap, the cost here is MEMORY rather than drive time:
+/// `compose_xpl_titles` de-duplicates by `.evo` name before probing
+/// (`seen_evos`), so repeats cost no extra sector reads — but the `Vec`s are
+/// built and held regardless.
+///
+/// 256 is far above any real disc. A retail HD-DVD title is a handful of clips —
+/// a feature is one, or two across a layer break; even a seamless-branching or
+/// multi-angle title is tens. It also keeps the aggregate bounded: at most
+/// [`MAX_XPL_TITLES`] x 256 clips, rather than the tens of millions above.
+const MAX_XPL_CLIPS_PER_TITLE: usize = 256;
+
+/// Most `<Chapter>` elements one `<Title>` may contribute.
+///
+/// The same `descendants()` amplification as [`MAX_XPL_CLIPS_PER_TITLE`], on the
+/// second unbounded `collect()` in the same loop, and bounded separately so that
+/// capping clips does not simply move the attack next door. A chapter is a bare
+/// `f64` rather than a `String`-carrying struct, so each one is cheaper — but a
+/// `<Chapter titleTimeBegin="…"/>` element is also smaller, so the element count
+/// an XPL can reach is comparable.
+///
+/// 1024 is far above any real disc: the DVD/HD-DVD authoring convention tops out
+/// at 99 chapters per title, so this leaves a 10x margin.
+const MAX_XPL_CHAPTERS_PER_TITLE: usize = 1024;
+
 /// Memoized [`probe_evo_streams`], keyed on the RESOLVED extent list.
 ///
 /// Probing is the expensive half of title composition: each pass reads up to
@@ -597,6 +639,19 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             .descendants()
             .filter(|n| local(n, "PrimaryAudioVideoClip"))
         {
+            // Bounded by MAX_XPL_CLIPS_PER_TITLE. `descendants()` is deliberate
+            // — a real playlist wraps its clips in `<PrimaryAudioVideoClipList>`
+            // or an `ApplicationSegment`, so `children()` would miss them — but
+            // it also means a clip nested inside N ancestor `<Title>`s is
+            // collected N times over, and the depth guard still allows 32 such
+            // ancestors. `break` rather than dropping surplus: unlike the
+            // directory scan (which must keep reading to find the `.vti`),
+            // nothing later in THIS loop is needed, and stopping bounds the walk
+            // as well as the allocation. Chapters are collected by a separate
+            // iterator below, so they are unaffected.
+            if clips.len() >= MAX_XPL_CLIPS_PER_TITLE {
+                break;
+            }
             let Some(evo) = c.attribute("src").and_then(evo_from_src) else {
                 continue;
             };
@@ -618,6 +673,8 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             continue;
         }
 
+        // Bounded by MAX_XPL_CHAPTERS_PER_TITLE — the same `descendants()`
+        // amplification as the clip loop above, on the same crafted playlist.
         let chapters = tnode
             .descendants()
             .filter(|n| local(n, "Chapter"))
@@ -625,6 +682,7 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
                 ch.attribute("titleTimeBegin")
                     .and_then(|s| parse_timecode(s, tick_base))
             })
+            .take(MAX_XPL_CHAPTERS_PER_TITLE)
             .collect();
 
         titles.push(XplTitle {
@@ -1587,6 +1645,136 @@ mod tests {
              got {} titles",
             titles.len()
         );
+    }
+
+    /// Build a playlist that nests `nesting` `<Title>` elements inside one
+    /// another and puts `clips` self-closing `<PrimaryAudioVideoClip>` elements
+    /// at the innermost level, plus `chapters` `<Chapter>` elements.
+    ///
+    /// `parse_xpl_titles` collects a title's clips with `descendants()`, not
+    /// `children()`, so EVERY one of the `nesting` ancestors collects the SAME
+    /// innermost clip list — the amplification this exercises.
+    fn nested_title_xpl(nesting: usize, clips: usize, chapters: usize) -> String {
+        let mut xpl = String::with_capacity(nesting * 16 + clips * 40 + chapters * 40 + 128);
+        xpl.push_str(r#"<?xml version="1.0" encoding="utf-8"?><Playlist><TitleSet>"#);
+        for _ in 0..nesting {
+            xpl.push_str("<Title>");
+        }
+        for _ in 0..clips {
+            xpl.push_str(r#"<PrimaryAudioVideoClip src="A.EVO"/>"#);
+        }
+        for _ in 0..chapters {
+            xpl.push_str(r#"<Chapter titleTimeBegin="00:00:01:00"/>"#);
+        }
+        for _ in 0..nesting {
+            xpl.push_str("</Title>");
+        }
+        xpl.push_str("</TitleSet></Playlist>");
+        xpl
+    }
+
+    /// CLIPS PER TITLE — the axis the title cap, the depth cap and the
+    /// directory cap all leave open.
+    ///
+    /// `MAX_XPL_TITLES` bounds how many titles a playlist may declare and
+    /// `MAX_XPL_DEPTH` bounds how deeply it may nest, but NEITHER bounds how
+    /// many `<PrimaryAudioVideoClip>` elements a single title collects. Worse,
+    /// the collector is `descendants()`, so one clip nested inside N ancestor
+    /// `<Title>`s is collected N times over — the clip count MULTIPLIES by the
+    /// nesting the depth guard still permits.
+    ///
+    /// A 64 MiB XPL (`udf::MAX_FILE_BYTES`) holds ~1.7M clip elements at ~38
+    /// bytes each; with the 32 `<Title>` ancestors the depth cap still permits,
+    /// that is ~56 million heap-allocated `XplClip`s, and then as many `Clip`s
+    /// again in `compose_xpl_titles`. This uses small numbers that exercise the
+    /// same multiplication without a 64 MiB fixture: pre-fix it collected 756
+    /// clips per title, 18,900 across the 25 nested titles, from a document
+    /// declaring only 756 clip elements — an exact 25x, the nesting count.
+    ///
+    /// Mutation: delete the `clips.len() >= MAX_XPL_CLIPS_PER_TITLE` break and
+    /// this goes red at the unamplified per-title count.
+    #[test]
+    fn parse_xpl_titles_caps_clips_per_title_against_descendant_amplification() {
+        const NESTING: usize = 25;
+        const CLIPS: usize = MAX_XPL_CLIPS_PER_TITLE + 500;
+
+        let xpl = nested_title_xpl(NESTING, CLIPS, 0);
+        let titles = parse_xpl_titles(xpl.as_bytes());
+
+        // The nesting itself must survive the depth guard, or this test would
+        // pass for the wrong reason (an empty fallback).
+        assert_eq!(
+            titles.len(),
+            NESTING,
+            "all {NESTING} nested <Title> elements must parse, so the \
+             amplification is really being exercised"
+        );
+
+        let total: usize = titles.iter().map(|t| t.clips.len()).sum();
+        for t in &titles {
+            assert!(
+                t.clips.len() <= MAX_XPL_CLIPS_PER_TITLE,
+                "a title collected {} clips, above the {MAX_XPL_CLIPS_PER_TITLE} \
+                 cap; total across titles {total} (a 64 MiB XPL scales this to \
+                 tens of millions)",
+                t.clips.len()
+            );
+        }
+        assert!(
+            total <= NESTING * MAX_XPL_CLIPS_PER_TITLE,
+            "aggregate clip count {total} must be bounded by titles x cap"
+        );
+    }
+
+    /// CHAPTERS PER TITLE — the same `descendants()` amplification on the
+    /// second unbounded `collect()` in the same loop. Bounded separately so
+    /// closing the clip axis does not simply move the attack next door.
+    ///
+    /// Mutation: delete the `.take(MAX_XPL_CHAPTERS_PER_TITLE)` and this goes
+    /// red at the declared count.
+    #[test]
+    fn parse_xpl_titles_caps_chapters_per_title() {
+        const NESTING: usize = 25;
+        const CHAPTERS: usize = MAX_XPL_CHAPTERS_PER_TITLE + 500;
+
+        // One clip, so the title is kept (`clips.is_empty()` skips otherwise).
+        let xpl = nested_title_xpl(NESTING, 1, CHAPTERS);
+        let titles = parse_xpl_titles(xpl.as_bytes());
+        assert_eq!(titles.len(), NESTING);
+
+        for t in &titles {
+            assert!(
+                t.chapters.len() <= MAX_XPL_CHAPTERS_PER_TITLE,
+                "a title collected {} chapters, above the \
+                 {MAX_XPL_CHAPTERS_PER_TITLE} cap",
+                t.chapters.len()
+            );
+        }
+    }
+
+    /// The control: a realistic multi-clip title still resolves EVERY one of its
+    /// clips and chapters. `SYNTH_XPL`'s main movie is a layer-break split — two
+    /// clips on one timeline — plus two chapters; losing either to the cap would
+    /// cost a genuine disc half its feature.
+    ///
+    /// Mutation: set `MAX_XPL_CLIPS_PER_TITLE` to 1 and this goes red.
+    #[test]
+    fn parse_xpl_titles_keeps_every_clip_of_a_realistic_title() {
+        let titles = parse_xpl_titles(SYNTH_XPL.as_bytes());
+        assert_eq!(titles.len(), 2);
+        assert_eq!(
+            titles[0].clips.len(),
+            2,
+            "the layer-break split must keep BOTH clips through the cap"
+        );
+        assert_eq!(titles[0].clips[0].evo, "feature_1.evo");
+        assert_eq!(titles[0].clips[1].evo, "feature_2.evo");
+        assert_eq!(
+            titles[0].chapters.len(),
+            2,
+            "both chapters must survive the chapter cap"
+        );
+        assert_eq!(titles[1].clips.len(), 1);
     }
 
     #[test]
