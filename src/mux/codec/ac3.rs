@@ -91,6 +91,18 @@ pub struct Ac3Parser {
     /// across the PES boundary because it may be the core of an AC-3-core +
     /// E-AC-3-dependent frame set whose remaining substreams are in the next PES.
     saw_extension: bool,
+    /// The access unit held open across the last PES boundary, ALREADY
+    /// scanned. The carry-over begins at its first byte, so without this the
+    /// next call re-scans and re-CRCs every syncframe of it from byte 0 — and
+    /// an access unit that keeps gaining substreams grows to [`MAX_AC3_BUF`]
+    /// (1 MiB) before the resync guard drops it, which on a ~2 KiB DVD PES is
+    /// three orders of magnitude of repeated work per packet.
+    held: Option<HeldAu>,
+    /// Test-only: syncframes examined (sized + CRC-gated) by
+    /// `scan_access_units`. Pins the resume above — the property it exists for
+    /// is a WORK bound, which no frame-level assertion can observe.
+    #[cfg(test)]
+    frames_scanned: u64,
 }
 
 impl Default for Ac3Parser {
@@ -107,6 +119,9 @@ impl Ac3Parser {
             flush_pts_ns: 0,
             tally: super::dropgate::DropTally::new("ac3"),
             saw_extension: false,
+            held: None,
+            #[cfg(test)]
+            frames_scanned: 0,
         }
     }
 
@@ -149,20 +164,56 @@ impl Ac3Parser {
         anchor: Option<PtsAnchor>,
         at_eos: bool,
         marks: &[(usize, super::pesbuf::PesFacts)],
-    ) -> (Vec<Frame>, usize, i64) {
+        held: Option<HeldAu>,
+    ) -> ScanOut {
         let mut frames = Vec::new();
         let mut pos = 0usize;
         // Running PTS for the next access unit to emit in this call.
         let mut frame_pts_ns = base_pts_ns;
         let mut anchor = anchor;
         let mut pending: Option<PendingAu> = None;
+        // How far this call has proved there is no further syncframe to
+        // process; carried over so the held access unit's own bytes (and the
+        // junk after them) are not searched again next call.
+        let mut scanned_to = 0usize;
+
+        // Resume a held access unit instead of re-deriving it. `keep_from` was
+        // its first byte, so it starts at 0 of this buffer, and every frame in
+        // it was sized and CRC-gated on the call that built it.
+        if let Some(h) = held {
+            let mut drop_reason = h.drop_reason;
+            // The one verdict that can have changed since: the track may have
+            // become poisoned while this access unit was held, and a re-scan
+            // would have picked that up.
+            if drop_reason.is_none() && self.tally.is_poisoned() {
+                drop_reason = Some("track-poisoned");
+            }
+            pending = Some(PendingAu {
+                start: 0,
+                end: h.end,
+                pts_ns: base_pts_ns,
+                duration_ns: h.duration_ns,
+                drop_reason,
+                bsid: h.bsid,
+            });
+            frame_pts_ns = base_pts_ns + h.duration_ns as i64;
+            pos = h.scanned_to;
+            scanned_to = h.scanned_to;
+        }
 
         while pos < data.len() {
             let sync = find_ac3_sync(&data[pos..]);
             let start = match sync {
                 Some(offset) => pos + offset,
-                None => break,
+                None => {
+                    // No syncword in `data[pos..]` at all: every byte but the
+                    // last is proved sync-free (a syncword is two bytes and the
+                    // second may still arrive).
+                    scanned_to = data.len().saturating_sub(1).max(pos);
+                    break;
+                }
             };
+            scanned_to = start;
 
             let remaining = &data[start..];
 
@@ -182,6 +233,7 @@ impl Ac3Parser {
                 // Invalid/sub-header frame size (e.g. an E-AC-3 frmsiz of 0/1
                 // sizing to a 2/4-byte fragment) — skip this sync word.
                 pos = start + 2;
+                scanned_to = pos;
                 continue;
             }
 
@@ -191,6 +243,10 @@ impl Ac3Parser {
             }
 
             let frame = &data[start..start + frame_size];
+            #[cfg(test)]
+            {
+                self.frames_scanned += 1;
+            }
             // Decodability gate: a syncframe with an out-of-range bsid (> 16) or
             // a failed native CRC (payload corruption) poisons the access unit it
             // belongs to — a dependent substream is useless without its parent and
@@ -258,6 +314,7 @@ impl Ac3Parser {
             }
 
             pos = start + frame_size;
+            scanned_to = pos;
         }
 
         // Close or HOLD the trailing access unit. The rest of its frame set — its
@@ -271,10 +328,22 @@ impl Ac3Parser {
         // substream that extends an access unit — a plain AC-3 track keeps
         // emitting every frame in-call.
         let mut hold_from = None;
+        let mut held_out = None;
         if let Some(au) = pending {
             if !at_eos && (au.bsid >= 11 || self.saw_extension) {
                 frame_pts_ns = au.pts_ns;
                 hold_from = Some(au.start);
+                // Everything below `scanned_to` has been searched already, and
+                // the access unit's own frames have been sized and CRC-gated;
+                // record both, rebased onto the carry-over (which starts at
+                // `au.start`), so the next call resumes instead of redoing it.
+                held_out = Some(HeldAu {
+                    end: au.end - au.start,
+                    scanned_to: scanned_to.max(au.end) - au.start,
+                    duration_ns: au.duration_ns,
+                    drop_reason: au.drop_reason,
+                    bsid: au.bsid,
+                });
             } else {
                 close_access_unit(&mut self.tally, data, &au, marks, &mut frames);
             }
@@ -306,7 +375,12 @@ impl Ac3Parser {
             None => data.len(),
         };
 
-        (frames, keep_from, frame_pts_ns)
+        ScanOut {
+            frames,
+            keep_from,
+            frame_pts_ns,
+            held: held_out,
+        }
     }
 }
 
@@ -317,6 +391,36 @@ impl Ac3Parser {
 struct PtsAnchor {
     at: usize,
     pts_ns: i64,
+}
+
+/// What one `scan_access_units` pass produced: the access units it emitted,
+/// the offset in the scanned buffer from which bytes must be carried over to
+/// the next call, the PTS to stamp on the access unit that begins that
+/// carry-over, and — when the trailing access unit was HELD — the state that
+/// lets the next call resume rather than re-derive it.
+struct ScanOut {
+    frames: Vec<Frame>,
+    keep_from: usize,
+    frame_pts_ns: i64,
+    held: Option<HeldAu>,
+}
+
+/// A trailing access unit held across the PES boundary, already scanned.
+/// Offsets are relative to the carry-over, which begins at the access unit's
+/// first byte — so the access unit occupies `0..end`.
+#[derive(Clone, Copy)]
+struct HeldAu {
+    /// End of the access unit's bytes.
+    end: usize,
+    /// How far the scan that built it had searched (`>= end`). Bytes below it
+    /// hold no further syncframe to process.
+    scanned_to: usize,
+    /// Duration contributed by the access unit's `substreamid`-0 substream.
+    duration_ns: u64,
+    /// Decodability verdict reached for it so far.
+    drop_reason: Option<&'static str>,
+    /// bsid of the substream that opened it.
+    bsid: u8,
 }
 
 /// An access unit (frame set) under construction: `data[start..end]` is the
@@ -477,6 +581,8 @@ impl CodecParser for Ac3Parser {
         // non-empty PES today; this is defensive for any future caller).
         if pes.discontinuity {
             self.acc.clear();
+            // The held access unit's bytes went with it.
+            self.held = None;
         }
         if pes.data.is_empty() {
             return Vec::new();
@@ -516,8 +622,13 @@ impl CodecParser for Ac3Parser {
         buf.extend_from_slice(self.acc.as_slice());
         let marks = self.acc.marks_snapshot();
         let data = &buf;
-        let (frames, keep_from, frame_pts_ns) =
-            self.scan_access_units(data, self.flush_pts_ns, anchor, false, &marks);
+        let held = self.held.take();
+        let ScanOut {
+            frames,
+            keep_from,
+            frame_pts_ns,
+            held: still_held,
+        } = self.scan_access_units(data, self.flush_pts_ns, anchor, false, &marks, held);
 
         if keep_from < data.len() {
             let tail = &data[keep_from..];
@@ -531,6 +642,7 @@ impl CodecParser for Ac3Parser {
                     MAX_AC3_BUF
                 );
                 self.acc.clear();
+                self.held = None;
                 // Advance the cadence, as both sibling branches below do, so the
                 // three paths out of this block cannot disagree. Defensive: no
                 // input reaching this parser was found that both parses frames and
@@ -539,6 +651,7 @@ impl CodecParser for Ac3Parser {
                 self.flush_pts_ns = frame_pts_ns;
             } else {
                 self.acc.drain(keep_from);
+                self.held = still_held;
                 // The carried bytes, when later completed and emitted (next call
                 // or by flush() at EOS), are timed at the PTS the scanner reached
                 // here: the PTS of the next access unit in presentation order, or
@@ -548,6 +661,7 @@ impl CodecParser for Ac3Parser {
             }
         } else {
             self.acc.clear();
+            self.held = None;
             // Nothing carried, but keep the cadence so a following PES with no
             // PTS (no anchor) continues the timeline instead of reusing a stale
             // value.
@@ -569,9 +683,10 @@ impl CodecParser for Ac3Parser {
         let buf = self.acc.as_slice().to_vec();
         let marks = self.acc.marks_snapshot();
         self.acc.clear();
+        let held = self.held.take();
         let out = self
-            .scan_access_units(&buf, self.flush_pts_ns, None, true, &marks)
-            .0;
+            .scan_access_units(&buf, self.flush_pts_ns, None, true, &marks, held)
+            .frames;
         // Aggregate drop report at end-of-stream (warn-level, always visible).
         self.tally.log_summary();
         out
@@ -2196,6 +2311,72 @@ mod tests {
             f[0].pts_ns,
             pts_to_ns(90000) + 32_000_000,
             "survivor keeps its true timeline"
+        );
+    }
+
+    /// A 256-byte E-AC-3 syncframe with a valid CRC. `strmtyp`/`substreamid`
+    /// go into byte 2 (A/52 Annex E), which is what `substream_role` reads:
+    /// (0, 0) OPENS an access unit, (1, 0) is a dependent substream that
+    /// EXTENDS the open one.
+    fn eac3_substream_frame(strmtyp: u8, substreamid: u8) -> Vec<u8> {
+        const SIZE: usize = 256;
+        let frmsiz = SIZE / 2 - 1; // (frmsiz + 1) * 2 == SIZE
+        let mut f = vec![0u8; SIZE];
+        f[0] = 0x0B;
+        f[1] = 0x77;
+        f[2] = (strmtyp << 6) | (substreamid << 3) | ((frmsiz >> 8) as u8 & 0x07);
+        f[3] = (frmsiz & 0xFF) as u8;
+        f[5] = 16 << 3; // bsid 16 → E-AC-3
+        finalize_ac3_crc(&mut f);
+        f
+    }
+
+    /// An access unit closes only at the next `substreamid`-0 independent
+    /// substream, so one that keeps gaining dependent substreams stays OPEN
+    /// across PES boundaries and its bytes stay in the carry-over. The
+    /// carry-over must not be re-scanned — and re-CRCed — from the access
+    /// unit's first byte on every packet: the buffer only stops growing at
+    /// MAX_AC3_BUF (1 MiB), and a PES on a DVD is about 2 KiB, so re-deriving
+    /// the held access unit costs work quadratic in the packets fed.
+    ///
+    /// Measured directly, because a work bound has no frame-level shadow:
+    /// `frames_scanned` counts the syncframes the scanner sizes and CRC-gates.
+    /// Re-scanning from byte 0 examines 1 + 2 + ... + (N+1) frames.
+    ///
+    /// Mutation: pass `None` for `held` in `parse` (or drop the `if let
+    /// Some(h) = held` resume) — the count returns to the quadratic figure.
+    #[test]
+    fn a_held_access_unit_is_not_rescanned_from_its_first_frame_every_packet() {
+        const DEPENDENTS: usize = 200;
+
+        let mut parser = Ac3Parser::new();
+        // Opens the access unit.
+        let emitted = parser.parse(&make_eac3_pes(eac3_substream_frame(0, 0)));
+        assert!(
+            emitted.is_empty(),
+            "the access unit is held open, not emitted"
+        );
+        for _ in 0..DEPENDENTS {
+            let f = parser.parse(&make_eac3_pes(eac3_substream_frame(1, 0)));
+            assert!(f.is_empty(), "a dependent substream extends the open unit");
+        }
+
+        let fed = (DEPENDENTS + 1) as u64;
+        assert!(
+            parser.frames_scanned <= 2 * fed,
+            "the scanner examined {} syncframes for {fed} fed — a held access \
+             unit must be resumed, not re-derived",
+            parser.frames_scanned
+        );
+
+        // ...and the resume must not have cost correctness: the whole frame
+        // set is still one access unit, emitted intact at EOS.
+        let out = parser.flush();
+        assert_eq!(out.len(), 1, "the frame set is a single access unit");
+        assert_eq!(
+            out[0].data.len(),
+            256 * (DEPENDENTS + 1),
+            "every substream of the frame set belongs to it"
         );
     }
 

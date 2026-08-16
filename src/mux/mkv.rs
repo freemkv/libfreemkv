@@ -359,6 +359,22 @@ fn write_hdr10<W: Write + Seek>(w: &mut W, h: &crate::mux::codec::Hdr10Metadata)
     Ok(())
 }
 
+/// The Matroska `Language` element the muxer writes for a stream whose source
+/// reported `lang`. RFC 9559 §12 defines the element as an ISO 639-2 code and
+/// gives no meaning to an empty one; the code for "no language stated" is
+/// `und`, and that is what a source with no language table (the HD-DVD EVO
+/// stream probe, a Blu-ray STN slot with no language bytes) has to emit. The
+/// element is written unconditionally by `MkvMuxer::new`, so this is the one
+/// place that decides it — a source-side default would have to be repeated in
+/// every scanner and would still leave the muxer able to ship an invalid file.
+fn language_or_und(lang: &str) -> String {
+    if lang.is_empty() {
+        "und".to_string()
+    } else {
+        lang.to_string()
+    }
+}
+
 impl MkvTrack {
     /// Build a video track from a [`VideoStream`]. Language defaults to `"und"`;
     /// colour metadata is derived from the stream's colour space and HDR format
@@ -530,7 +546,7 @@ impl MkvTrack {
         Self {
             track_type: ebml::TRACK_TYPE_AUDIO,
             codec_id,
-            language: a.language.clone(),
+            language: language_or_und(&a.language),
             name,
             codec_private: None,
             is_default: !a.secondary,
@@ -587,7 +603,7 @@ impl MkvTrack {
         Self {
             track_type: ebml::TRACK_TYPE_SUBTITLE,
             codec_id,
-            language: s.language.clone(),
+            language: language_or_und(&s.language),
             name: String::new(),
             codec_private: s.codec_data.clone(),
             is_default: false,
@@ -3364,6 +3380,58 @@ mod tests {
             "a DVD-sourced ISO 639-1 code must be written as its ISO 639-2 \
              equivalent in the Matroska Language element, per RFC 9559 §12"
         );
+    }
+
+    /// A source that knows no language at all leaves `language` EMPTY, and the
+    /// muxer writes the `Language` element unconditionally — so an empty
+    /// string becomes a zero-length `Language` in the shipped file, which is
+    /// not a Matroska language form (RFC 9559 §12 wants three ISO 639-2
+    /// letters) and is not the ISO 639-2 code for "unknown" either.
+    ///
+    /// This is the state every HD-DVD rip is in: `disc::hddvd`'s EVO stream
+    /// probe has no language table to read and sets `language: String::new()`
+    /// on every audio stream it finds. The DVD path normalises to "und" in
+    /// `ifo::parse_audio_attr`; the guard has to exist at the muxer too, which
+    /// is the one place every source funnels through.
+    #[test]
+    fn a_source_with_no_language_emits_und_not_an_empty_language_element() {
+        // Exactly what `disc::hddvd::probe_evo_streams` builds.
+        let audio_stream = crate::disc::AudioStream {
+            pid: 0xBD80,
+            codec: Codec::Ac3Plus,
+            channels: crate::disc::AudioChannels::Surround51,
+            language: String::new(),
+            sample_rate: crate::disc::SampleRate::S48,
+            secondary: false,
+            purpose: crate::disc::LabelPurpose::Normal,
+            label: String::new(),
+        };
+        let subtitle_stream = crate::disc::SubtitleStream {
+            pid: 0x1200,
+            codec: Codec::Pgs,
+            language: String::new(),
+            forced: false,
+            qualifier: crate::disc::LabelQualifier::None,
+            codec_data: None,
+        };
+
+        for track in [
+            MkvTrack::audio(&audio_stream),
+            MkvTrack::subtitle(&subtitle_stream),
+        ] {
+            let track_type = track.track_type;
+            let buf = Cursor::new(Vec::new());
+            let tracks = [track];
+            let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
+            let data = muxer.writer.into_inner();
+            assert_eq!(
+                first_language_value(&data),
+                "und",
+                "track type {track_type}: a stream with no known language must \
+                 emit the ISO 639-2 'undetermined' code, never a zero-length \
+                 Language element"
+            );
+        }
     }
 
     /// An unmapped or absent DVD language code (bytes 0x00 0x00 in the IFO

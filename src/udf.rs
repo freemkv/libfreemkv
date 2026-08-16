@@ -100,6 +100,22 @@ pub struct IcbExtent {
     pub recorded: bool,
 }
 
+/// One extent of a file resolved to an ABSOLUTE disc LBA — [`IcbExtent`] with
+/// the partition offset already applied. The `recorded` flag travels with it:
+/// an unrecorded extent occupies the file's byte space but holds no bytes the
+/// file wrote, so a caller must emit `len` zeros for it rather than read those
+/// sectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbsExtent {
+    /// Absolute disc LBA of the extent.
+    pub lba: u32,
+    /// Declared length of the extent in bytes.
+    pub len: u32,
+    /// `false` for an ECMA-167 4/14.14.1.1 type-1 (allocated, not recorded)
+    /// extent — see [`IcbExtent::recorded`].
+    pub recorded: bool,
+}
+
 /// A directory or file entry.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -755,12 +771,17 @@ impl UdfFs {
     /// Unrecorded (ECMA-167 4/14.14.1.1 type-1) extents are included: their
     /// space is allocated to the file at that location and occupies its byte
     /// space, so dropping them would slide every later extent's bytes down by
-    /// the hole's length in a sequential extraction.
+    /// the hole's length in a sequential extraction. They are RETURNED FLAGGED
+    /// (`AbsExtent::recorded == false`), because keeping the extent while
+    /// losing the flag is the same bug the other way round: the caller then
+    /// reads sectors the file never wrote and ships whatever the media holds
+    /// there. `read_file_limited` emits zeros for such an extent; every
+    /// consumer of this list has to be able to do the same.
     pub fn extents_abs_at(
         &self,
         reader: &mut dyn SectorSource,
         meta_lba: u32,
-    ) -> Result<Vec<(u32, u32)>> {
+    ) -> Result<Vec<AbsExtent>> {
         let alloc = self.read_icb_extents(reader, meta_lba)?;
         let mut out = Vec::with_capacity(alloc.len());
         for ext in alloc {
@@ -772,7 +793,11 @@ impl UdfFs {
                     status: None,
                     sense: None,
                 })?;
-            out.push((abs, ext.len));
+            out.push(AbsExtent {
+                lba: abs,
+                len: ext.len,
+                recorded: ext.recorded,
+            });
         }
         Ok(out)
     }
@@ -1211,55 +1236,27 @@ fn read_directory(
 
     let tag = u16::from_le_bytes([icb[0], icb[1]]);
 
-    // Get allocation extent: where the directory data lives
-    let (ad_len, ad_pos) = match tag {
+    // ECMA-167 4/14.6.8 ICB Tag flags: a Uint16 at offset 34 whose low 3 bits
+    // say how this entry stores its data — 0 short_ad, 1 long_ad, 2
+    // extended_ad, 3 EMBEDDED (the data sits in the entry itself, where the
+    // allocation descriptors would otherwise be). The field is disc-controlled,
+    // so the layout below is chosen from it rather than assumed; the same flags
+    // already drive `read_icb_extents` and `read_inline_data`.
+    let ad_type = u16::from_le_bytes([icb[34], icb[35]]) & 0x07;
+
+    // Where the allocation-descriptor field of this entry begins, and its
+    // declared length. ECMA-167 4/14.17 (266): L_EA at 208, L_AD at 212, field
+    // at 216 + L_EA. 4/14.9 (261): L_EA at 168, L_AD at 172, field at 176 + L_EA.
+    let (ad_off, l_ad) = match tag {
         266 => {
             let l_ea = u32::from_le_bytes([icb[208], icb[209], icb[210], icb[211]]) as usize;
-            let ad_off = 216 + l_ea;
-            if ad_off + 8 > icb.len() {
-                return Err(Error::DiscRead {
-                    sector: icb_abs as u64,
-                    status: None,
-                    sense: None,
-                });
-            }
-            let len = u32::from_le_bytes([
-                icb[ad_off],
-                icb[ad_off + 1],
-                icb[ad_off + 2],
-                icb[ad_off + 3],
-            ]) & 0x3FFF_FFFF;
-            let pos = u32::from_le_bytes([
-                icb[ad_off + 4],
-                icb[ad_off + 5],
-                icb[ad_off + 6],
-                icb[ad_off + 7],
-            ]);
-            (len, pos)
+            let l_ad = u32::from_le_bytes([icb[212], icb[213], icb[214], icb[215]]) as usize;
+            (216 + l_ea, l_ad)
         }
         261 => {
             let l_ea = u32::from_le_bytes([icb[168], icb[169], icb[170], icb[171]]) as usize;
-            let ad_off = 176 + l_ea;
-            if ad_off + 8 > icb.len() {
-                return Err(Error::DiscRead {
-                    sector: icb_abs as u64,
-                    status: None,
-                    sense: None,
-                });
-            }
-            let len = u32::from_le_bytes([
-                icb[ad_off],
-                icb[ad_off + 1],
-                icb[ad_off + 2],
-                icb[ad_off + 3],
-            ]) & 0x3FFF_FFFF;
-            let pos = u32::from_le_bytes([
-                icb[ad_off + 4],
-                icb[ad_off + 5],
-                icb[ad_off + 6],
-                icb[ad_off + 7],
-            ]);
-            (len, pos)
+            let l_ad = u32::from_le_bytes([icb[172], icb[173], icb[174], icb[175]]) as usize;
+            (176 + l_ea, l_ad)
         }
         // ECMA-167 4/14.9 (File Entry, tag 261) and 4/14.17 (Extended File
         // Entry, tag 266) are the only descriptors that can be a directory's
@@ -1283,39 +1280,89 @@ fn read_directory(
         }
     };
 
-    // Reject an oversized directory before allocating: ad_len is the
-    // disc-controlled 30-bit ICB allocation length, so a corrupt value
-    // could otherwise force a ~1 GiB zeroed allocation (amplified by
-    // recursion). Real directories are a few KiB; the 1 MiB cap still
-    // covers a large STREAM/ dir with thousands of .m2ts FIDs.
-    if ad_len > MAX_DIR_BYTES {
-        return Err(Error::DiscRead {
+    // An EMBEDDED directory (AD type 3) has no out-of-line extent at all: its
+    // FIDs are the descriptor field itself. Decoding that field as a
+    // length/LBA pair would read the first FID's own bytes as an extent and
+    // enumerate an unrelated sector, which yields a silently EMPTY directory
+    // (no error, no titles).
+    let (dir_data, ad_len) = if ad_type == 3 {
+        if ad_off > icb.len() || ad_off + l_ad > icb.len() {
+            return Err(Error::DiscRead {
+                sector: icb_abs as u64,
+                status: None,
+                sense: None,
+            });
+        }
+        (icb[ad_off..ad_off + l_ad].to_vec(), l_ad as u32)
+    } else {
+        // Out-of-line: read the FIRST allocation descriptor. A short_ad
+        // (4/14.14.1) and a long_ad (4/14.14.2) both begin with the 4-byte
+        // extent length followed by the 4-byte logical block number, so one
+        // decode serves both; an extended_ad (4/14.14.3) puts two further
+        // length fields first and its lb_num at offset 12. Any other flag
+        // value is reserved by 4/14.6.8 — decode it as a short_ad, matching
+        // the documented fallback in `read_icb_extents` rather than failing a
+        // volume over a byte no real disc sets.
+        let lba_at = if ad_type == 2 {
+            ad_off + 12
+        } else {
+            ad_off + 4
+        };
+        if lba_at + 4 > icb.len() {
+            return Err(Error::DiscRead {
+                sector: icb_abs as u64,
+                status: None,
+                sense: None,
+            });
+        }
+        let ad_len = u32::from_le_bytes([
+            icb[ad_off],
+            icb[ad_off + 1],
+            icb[ad_off + 2],
+            icb[ad_off + 3],
+        ]) & 0x3FFF_FFFF;
+        let ad_pos = u32::from_le_bytes([
+            icb[lba_at],
+            icb[lba_at + 1],
+            icb[lba_at + 2],
+            icb[lba_at + 3],
+        ]);
+
+        // Reject an oversized directory before allocating: ad_len is the
+        // disc-controlled 30-bit ICB allocation length, so a corrupt value
+        // could otherwise force a ~1 GiB zeroed allocation (amplified by
+        // recursion). Real directories are a few KiB; the 1 MiB cap still
+        // covers a large STREAM/ dir with thousands of .m2ts FIDs.
+        if ad_len > MAX_DIR_BYTES {
+            return Err(Error::DiscRead {
+                sector: meta_start as u64,
+                status: None,
+                sense: None,
+            });
+        }
+
+        // Read directory data
+        let dir_abs = meta_start.checked_add(ad_pos).ok_or(Error::DiscRead {
             sector: meta_start as u64,
             status: None,
             sense: None,
-        });
-    }
-
-    // Read directory data
-    let dir_abs = meta_start.checked_add(ad_pos).ok_or(Error::DiscRead {
-        sector: meta_start as u64,
-        status: None,
-        sense: None,
-    })?;
-    let sector_count = ad_len.div_ceil(2048);
-    let mut dir_data = vec![0u8; sector_count as usize * 2048];
-    for i in 0..sector_count {
-        let abs = dir_abs.checked_add(i).ok_or(Error::DiscRead {
-            sector: dir_abs as u64,
-            status: None,
-            sense: None,
         })?;
-        read_sector(
-            reader,
-            abs,
-            &mut dir_data[(i as usize) * 2048..(i as usize + 1) * 2048],
-        )?;
-    }
+        let sector_count = ad_len.div_ceil(2048);
+        let mut dir_data = vec![0u8; sector_count as usize * 2048];
+        for i in 0..sector_count {
+            let abs = dir_abs.checked_add(i).ok_or(Error::DiscRead {
+                sector: dir_abs as u64,
+                status: None,
+                sense: None,
+            })?;
+            read_sector(
+                reader,
+                abs,
+                &mut dir_data[(i as usize) * 2048..(i as usize + 1) * 2048],
+            )?;
+        }
+        (dir_data, ad_len)
+    };
 
     // Parse File Identifier Descriptors
     let mut entries = Vec::new();
@@ -4190,13 +4237,49 @@ mod tests {
             "the metadata partition begins at the Metadata File's extent"
         );
         assert_eq!(
+            spec.meta_bytes, 16_910_336,
+            "the sector count below is computed from this byte length by hand"
+        );
+        assert_eq!(
             fs.metadata_sectors(),
-            spec.meta_bytes.div_ceil(2048),
+            8257, // 16 910 336 / 2048, exactly
             "the metadata partition is as long as the Metadata File's extent"
         );
         assert_eq!(fs.volume_id, MV_VOLUME_ID);
         assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
         assert_eq!(fs.root.entries[0].size, MV_FILE_SIZE);
+    }
+
+    #[test]
+    fn read_filesystem_counts_a_partial_final_metadata_sector() {
+        // The Metadata File's extent length is a BYTE count (ECMA-167 4/14.14.1
+        // extent_length) and nothing requires it to be a whole multiple of the
+        // 2048-byte logical sector. `metadata_sectors` is consumed as a sector
+        // COUNT (`metadata_sector_ranges` ends the UDF-structure range at
+        // metadata_start + metadata_sectors), so a length with a remainder must
+        // round UP: truncating instead leaves the final, partly-used sector of
+        // the metadata partition outside the range, and the AACS/disc-info
+        // caller then never reads the directory bytes living in it.
+        //
+        // Every other fixture on this volume uses an exact multiple, where
+        // rounding up and truncating agree — this is the only case that tells
+        // them apart. The expected count is worked out by hand:
+        //   16 910 337 = 8257 * 2048 + 1  ->  8258 sectors.
+        let spec = MetaVol {
+            meta_bytes: 16_910_337,
+            ..conformant_meta_vol()
+        };
+        let (mut disc, meta_start) = build_meta_vol(&spec);
+
+        let fs = super::read_filesystem(&mut disc)
+            .expect("a metadata extent that is not a whole number of sectors must still mount");
+
+        assert_eq!(fs.metadata_start(), meta_start);
+        assert_eq!(
+            fs.metadata_sectors(),
+            8258,
+            "the sector holding the final partial 1 byte belongs to the metadata partition"
+        );
     }
 
     #[test]
@@ -4283,7 +4366,7 @@ mod tests {
         let fs = super::read_filesystem(&mut disc)
             .expect("an allocation descriptor flush with the end of the File Entry is in bounds");
         assert_eq!(fs.metadata_start(), meta_start);
-        assert_eq!(fs.metadata_sectors(), spec.meta_bytes.div_ceil(2048));
+        assert_eq!(fs.metadata_sectors(), 8257); // 16 910 336 / 2048, exactly
         assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
     }
 
@@ -4553,6 +4636,84 @@ mod tests {
             parsed.entries[0].size, 4096,
             "the child's size must come from its own ICB info_length"
         );
+    }
+
+    /// Build a directory ICB whose ICB Tag flags (ECMA-167 4/14.6.8, Uint16 at
+    /// offset 34) select `ad_type`, with `body` written where the allocation
+    /// descriptors live (216 + L_EA for a 266) and L_AD set to its length.
+    fn build_dir_icb_flagged(ad_type: u16, body: &[u8]) -> [u8; 2048] {
+        let mut icb = [0u8; 2048];
+        icb[0..2].copy_from_slice(&266u16.to_le_bytes());
+        icb[34..36].copy_from_slice(&ad_type.to_le_bytes());
+        icb[56..64].copy_from_slice(&(body.len() as u64).to_le_bytes());
+        icb[208..212].copy_from_slice(&0u32.to_le_bytes()); // L_EA
+        icb[212..216].copy_from_slice(&(body.len() as u32).to_le_bytes()); // L_AD
+        icb[216..216 + body.len()].copy_from_slice(body);
+        icb
+    }
+
+    #[test]
+    fn read_directory_reads_a_directory_whose_fids_are_embedded_in_the_icb() {
+        // ECMA-167 4/14.6.8 ICB Tag flags bits 0-2 select how the entry stores
+        // its data; 3 means EMBEDDED — the bytes sit in the entry itself, in
+        // the field where allocation descriptors would otherwise be. There is
+        // then no out-of-line extent at all.
+        //
+        // Decoding that field as a short_ad reads the first FID's own bytes as
+        // a length/LBA pair: the FID's tag identifier (257) becomes a 257-byte
+        // "extent" and its tag-header bytes become the LBA, so the walk reads
+        // an unrelated sector, finds no FID tag there and returns an EMPTY
+        // directory — a disc whose BDMV enumerates no titles, with no error.
+        //
+        // `read_inline_data` already honours these flags for FILES; a
+        // directory cannot be laxer.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "", 5, true, true, 0); // parent (..)
+        push_fid_iu(&mut fids, "INDEX.BDMV", 7, false, false, 0);
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_flagged(3, &fids));
+        reader.put(7, build_efe_icb(1024, 1024, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("an embedded (AD type 3) directory is valid and must be readable");
+        assert_eq!(child_names(&parsed), vec!["INDEX.BDMV".to_string()]);
+        assert_eq!(parsed.entries[0].size, 1024);
+    }
+
+    #[test]
+    fn read_directory_reads_an_extended_ad_directorys_extent_location() {
+        // ECMA-167 4/14.14.3 extended_ad is 20 bytes: extent_length (4),
+        // recorded_length (4), information_length (4), then the extent_location
+        // lb_addr at offset 12 — NOT at offset 4 where a short_ad/long_ad keeps
+        // it. ICB Tag flags = 2 selects it (4/14.6.8).
+        //
+        // Reading the LBA from offset 4 picks up the RECORDED LENGTH instead,
+        // so the walk reads whatever sector that number names. Here that is
+        // sector 2048, which holds nothing: the directory comes back empty.
+        //
+        // `read_icb_extents` already reads an extended_ad's location at +12;
+        // this is the same descriptor in the directory path.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "", 5, true, true, 0);
+        push_fid_iu(&mut fids, "INDEX.BDMV", 7, false, false, 0);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+
+        let mut ext_ad = [0u8; 20];
+        ext_ad[0..4].copy_from_slice(&(fids.len() as u32).to_le_bytes()); // extent_length
+        ext_ad[4..8].copy_from_slice(&2048u32.to_le_bytes()); // recorded_length
+        ext_ad[8..12].copy_from_slice(&(fids.len() as u32).to_le_bytes()); // information_length
+        ext_ad[12..16].copy_from_slice(&60u32.to_le_bytes()); // extent_location
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_flagged(2, &ext_ad));
+        reader.put(60, dir);
+        reader.put(7, build_efe_icb(1024, 1024, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("an extended_ad directory must be readable");
+        assert_eq!(child_names(&parsed), vec!["INDEX.BDMV".to_string()]);
     }
 
     #[test]

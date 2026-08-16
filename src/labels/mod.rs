@@ -450,7 +450,16 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
             }) else {
                 continue;
             };
-            for clip in &title.clips {
+            // ONLY the anchor's first clip. `disc::bluray` builds a title's
+            // stream list from `play_items[0]`'s STN table, so that is the only
+            // clip in which these PIDs were ever observed — the same clip tier 3
+            // keys its derived ids on (`clip0`, below). Recording the fact
+            // against every clip the anchor plays claims knowledge of stream
+            // tables never read: a sibling playlist over a LATER clip then binds
+            // the anchor's editorial label onto whichever stream of that clip
+            // reuses the PID, which is a different physical stream (PIDs are
+            // unique only within a clip).
+            if let Some(clip) = title.clips.first() {
                 pid_map.insert((clip.clip_id.as_str(), *pid), pos);
             }
         }
@@ -3100,6 +3109,79 @@ mod apply_tests {
             sub_state(&titles[1]),
             vec![(0x1200, false, LabelQualifier::None)],
             "the featurette's own stream is not the feature's subtitle 1"
+        );
+    }
+
+    /// A title that plays SEVERAL clips in order — the shape the anchor's
+    /// PID facts are harvested from.
+    fn title_on_clips(playlist: &str, clip_ids: &[&str], streams: Vec<Stream>) -> DiscTitle {
+        DiscTitle {
+            playlist: playlist.into(),
+            clips: clip_ids
+                .iter()
+                .map(|id| crate::disc::Clip {
+                    feed_span: None,
+                    clip_id: (*id).into(),
+                    in_time: 0,
+                    out_time: 0,
+                    duration_secs: 3600.0,
+                    source_packets: 0,
+                })
+                .collect(),
+            ..title_with(streams)
+        }
+    }
+
+    /// Spec: the anchor proves a `(clip, PID)` fact only for the clip its
+    /// stream table was READ FROM — the first play item — never for every clip
+    /// the anchor happens to play.
+    ///
+    /// `disc::bluray` builds a title's stream list from `play_items[0]`'s STN
+    /// table, and tier 3 fifty lines below says exactly that by keying its
+    /// derived ids on `clip0`. Tier 2's harvest contradicted it: it recorded
+    /// the anchor's slot PIDs against EVERY clip the anchor plays, so a sibling
+    /// playlist that plays a LATER clip of the anchor bound the anchor's
+    /// editorial label onto whatever stream in that clip happens to reuse the
+    /// PID — a different physical stream, in a different clip, whose own
+    /// language says so.
+    ///
+    /// Mutation: harvest over `&title.clips` instead of its first clip — the
+    /// featurette wears the feature's SDH again.
+    #[test]
+    fn an_anchor_proves_pids_only_for_the_clip_its_table_came_from() {
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::Sdh),
+            sub_label(2, "fra", LabelQualifier::None),
+        ];
+        let mut titles = vec![
+            // The anchor: its stream table is clip 00082's (the first play
+            // item); it merely CONTINUES into 00090.
+            title_on_clips(
+                "00800.mpls",
+                &["00082", "00090"],
+                vec![subtitle(0x1200, "eng"), subtitle(0x1201, "fra")],
+            ),
+            // A sibling playlist over the anchor's SECOND clip. Its subtitle
+            // reuses PID 0x1200 — PIDs are only unique within a clip — and it
+            // is Spanish, so nothing about the anchor's English SDH slot
+            // describes it.
+            title_on_clips("00451.mpls", &["00090"], vec![subtitle(0x1200, "spa")]),
+        ];
+        apply_labels(&labels, &mut titles);
+
+        assert_eq!(
+            sub_state(&titles[0]),
+            vec![
+                (0x1200, false, LabelQualifier::Sdh),
+                (0x1201, false, LabelQualifier::None)
+            ],
+            "the anchor itself keeps the qualifiers the list states for it"
+        );
+        assert_eq!(
+            sub_state(&titles[1]),
+            vec![(0x1200, false, LabelQualifier::None)],
+            "a PID in a clip the anchor's table never described is not that \
+             table's stream 1"
         );
     }
 

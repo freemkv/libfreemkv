@@ -1038,7 +1038,8 @@ mod tests {
     #[test]
     fn parse_playlist_zero_length_extent_is_filtered() {
         let mut disc = MemDisc::new();
-        // m2ts declared 0 bytes → file_extents sectors = div_ceil(0,2048)=0.
+        // The m2ts ICB is rewritten below to carry TWO short ADs: a
+        // zero-length one (0 sectors) followed by a real 4096-byte one.
         let udf = {
             let bdmv = DirSpec {
                 name: "BDMV".to_string(),
@@ -1050,7 +1051,7 @@ mod tests {
                         name: "STREAM".to_string(),
                         icb_lba: 22,
                         dir_data_lba: 23,
-                        files: vec![file("00001.m2ts", 100, 5000, 0, true)],
+                        files: vec![file("00001.m2ts", 100, 5000, 4096, false)],
                         subdirs: vec![],
                     },
                     DirSpec {
@@ -1071,8 +1072,34 @@ mod tests {
             };
             build_udf_skeleton(&mut disc, 10);
             lay_dir(&mut disc, &root);
+            // Rewrite the .m2ts ICB (laid at PART_START + 100 by `lay_dir`)
+            // with a two-descriptor short-AD list:
+            //   AD0: ECMA-167 4/14.14.1.1 type 1 (allocated, NOT recorded),
+            //        length 0, at LBA 4999 — a zero-length descriptor that
+            //        SURVIVES `read_icb_extents` (only a zero-length TYPE 0
+            //        descriptor is the AD-list terminator), so it reaches
+            //        `file_extents` as an extent of div_ceil(0, 2048) = 0
+            //        sectors. This is the shape a crafted disc uses to put a
+            //        readable-looking but empty range into a title's extent
+            //        list.
+            //   AD1: type 0, 4096 bytes at LBA 5000 — the real content.
+            let mut icb = build_file_icb(4096, 5000, false);
+            icb[212..216].copy_from_slice(&16u32.to_le_bytes()); // l_ad: two short ADs
+            icb[216..220].copy_from_slice(&0x4000_0000u32.to_le_bytes()); // type 1, len 0
+            icb[220..224].copy_from_slice(&4999u32.to_le_bytes());
+            icb[224..228].copy_from_slice(&4096u32.to_le_bytes()); // type 0, 4096 bytes
+            icb[228..232].copy_from_slice(&5000u32.to_le_bytes());
+            disc.put_bytes(PART_START + 100, &icb);
             udf::read_filesystem(&mut disc).expect("fs")
         };
+        // The ICB above must actually deliver a zero-sector extent to
+        // `parse_playlist`, or the filter under test is never reached.
+        assert_eq!(
+            udf.file_extents(&mut disc, "/BDMV/STREAM/00001.m2ts")
+                .expect("extents"),
+            vec![(PART_START + 4999, 0), (PART_START + 5000, 2)],
+            "fixture must present one zero-sector extent and one real one"
+        );
         let mpls = build_mpls(
             &[PiSpec {
                 clip_id: *b"00001",
@@ -1086,7 +1113,14 @@ mod tests {
         let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
         // size still counted (from clpi packets) but the empty extent dropped.
         assert_eq!(t.size_bytes, 4000 * 192);
-        assert!(t.extents.is_empty(), "zero-sector extent must be filtered");
+        assert_eq!(
+            t.extents,
+            vec![Extent {
+                start_lba: PART_START + 5000,
+                sector_count: 2,
+            }],
+            "the zero-sector extent must be filtered and the real one kept"
+        );
     }
 
     // ---------------------------------------------------------------
