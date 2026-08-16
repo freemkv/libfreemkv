@@ -4443,7 +4443,7 @@ mod tests {
                             "00001.fmts",
                             20,
                             FMTS_CONTENT_LBA - PART_START,
-                            FMTS_CONTENT_SECTORS * 2048,
+                            u64::from(FMTS_CONTENT_SECTORS) * 2048,
                             true,
                         )],
                         subdirs: Vec::new(),

@@ -168,8 +168,8 @@ impl Disc {
                     if file_exts.is_none() && unrecorded {
                         tracing::warn!(
                             target: "freemkv::disc",
-                            playlist = %filename,
-                            clip = %play_item.clip_id,
+                            playlist = ?filename,
+                            clip = ?play_item.clip_id,
                             "E{}", crate::error::E_UDF_UNRECORDED_EXTENT
                         );
                         return None;
@@ -714,7 +714,7 @@ mod tests {
             let m2ts = format!("{name}.{stream_ext}");
             // Size in bytes — file_extents derives sectors via div_ceil(2048).
             let size = sectors * 2048;
-            stream_files.push(file(&m2ts, icb, *data_lba, size, true));
+            stream_files.push(file(&m2ts, icb, *data_lba, size as u64, true));
             icb += 1;
             let clpi = format!("{name}.clpi");
             clipinf_files.push(file_with(
@@ -779,7 +779,7 @@ mod tests {
         for (name, sectors, packets, data_lba) in clips {
             let ssif = format!("{name}.ssif");
             let size = sectors * 2048;
-            ssif_files.push(file(&ssif, icb, *data_lba, size, true));
+            ssif_files.push(file(&ssif, icb, *data_lba, size as u64, true));
             icb += 1;
             let clpi = format!("{name}.clpi");
             clipinf_files.push(file_with(

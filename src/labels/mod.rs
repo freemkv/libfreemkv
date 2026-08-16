@@ -465,7 +465,7 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
         }
         tracing::info!(
             stream_type = ?stream_type,
-            playlist = %titles[anchor].playlist,
+            playlist = ?titles[anchor].playlist,
             slots = slots_of(&titles[anchor], stream_type).len(),
             "label list anchored to a title by its stream-language sequence",
         );
@@ -1913,6 +1913,139 @@ mod apply_tests {
                 source_packets: 0,
             }],
             ..title_with(streams)
+        }
+    }
+
+    /// Sentinel embedded in the crafted playlist name below. The capture keeps
+    /// ONLY fields whose rendered form contains it, so installing this
+    /// subscriber process-wide costs nothing and cannot accumulate other
+    /// tests' log output.
+    const LOG_INJECTION_SENTINEL: &str = "FMKV-LOG-INJECTION-PROBE";
+
+    fn capture_sink() -> &'static std::sync::Mutex<Vec<(String, String)>> {
+        static SINK: std::sync::OnceLock<std::sync::Mutex<Vec<(String, String)>>> =
+            std::sync::OnceLock::new();
+        SINK.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// Records how a `tracing` field was RENDERED — the question a disc-derived
+    /// log field raises is not whether it is logged but how.
+    ///
+    /// This is installed as the process-wide default rather than scoped with
+    /// `with_default`, because `tracing` caches an `Interest` per callsite
+    /// GLOBALLY: a sibling test running the same code on another thread with no
+    /// subscriber caches the callsite as "never", and a thread-local subscriber
+    /// installed afterwards then receives nothing. That failure mode is silent
+    /// — an empty capture reads as "no raw bytes found" — so the test asserts
+    /// the capture is non-empty as well.
+    ///
+    /// `register_callsite` answers `never` for every callsite outside this
+    /// module, so the rest of the suite keeps its current no-op logging cost.
+    struct CapturedFields;
+
+    struct FieldVisitor(Vec<(String, String)>);
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    fn is_labels_event(meta: &tracing::Metadata<'_>) -> bool {
+        meta.is_event() && meta.target().starts_with("libfreemkv::labels")
+    }
+
+    impl tracing::Subscriber for CapturedFields {
+        fn register_callsite(
+            &self,
+            meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            if is_labels_event(meta) {
+                tracing::subscriber::Interest::always()
+            } else {
+                tracing::subscriber::Interest::never()
+            }
+        }
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            is_labels_event(meta)
+        }
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut v = FieldVisitor(Vec::new());
+            event.record(&mut v);
+            if v.0
+                .iter()
+                .any(|(_, val)| val.contains(LOG_INJECTION_SENTINEL))
+            {
+                capture_sink().lock().unwrap().extend(v.0);
+            }
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A playlist name is a raw UDF directory entry — disc-controlled bytes,
+    /// validated no further than a lossy UTF-8 decode. Logging it through
+    /// tracing's `%` (Display) sigil writes those bytes VERBATIM, so a crafted
+    /// `.mpls` filename carrying ANSI escapes or control characters forges
+    /// terminal output and log structure in any consumer rendering the event
+    /// (CWE-117). `?` (Debug) escapes them, and `str`'s Debug is exactly the
+    /// escaping this needs.
+    ///
+    /// `info!` is not covered by the debug/trace-logging exemption: this fires
+    /// on an ordinary rip of an ordinary disc.
+    ///
+    /// Mutation: put `%` back on `playlist` in `apply_labels` and this goes red.
+    #[test]
+    fn a_disc_derived_playlist_name_is_escaped_in_the_log_not_written_verbatim() {
+        // A name whose bytes would clear the line and repaint it.
+        let evil = format!("\u{1b}[2K\u{1b}[31m{LOG_INJECTION_SENTINEL}\u{7}\u{1b}[0m.mpls");
+        let _ = tracing::subscriber::set_global_default(CapturedFields);
+
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::None),
+            sub_label(2, "spa", LabelQualifier::None),
+            sub_label(3, "fra", LabelQualifier::None),
+        ];
+        let mut titles = vec![title_on_clip(
+            &evil,
+            "00294",
+            vec![
+                subtitle(0x12A0, "eng"),
+                subtitle(0x12A1, "spa"),
+                subtitle(0x12A2, "fra"),
+            ],
+        )];
+        apply_labels(&labels, &mut titles);
+
+        let fields = capture_sink().lock().unwrap().clone();
+        let playlist: Vec<&(String, String)> = fields
+            .iter()
+            .filter(|(k, v)| k == "playlist" && v.contains(LOG_INJECTION_SENTINEL))
+            .collect();
+        assert!(
+            !playlist.is_empty(),
+            "the anchoring event must actually have fired, or this test proves \
+             nothing; captured: {fields:?}"
+        );
+        for (_, rendered) in playlist {
+            assert!(
+                !rendered.contains('\u{1b}') && !rendered.contains('\u{7}'),
+                "a disc-controlled playlist name reached the log with its raw \
+                 control bytes intact: {rendered:?}"
+            );
+            assert!(
+                rendered.contains(LOG_INJECTION_SENTINEL),
+                "the name must still be legible once escaped: {rendered:?}"
+            );
         }
     }
 

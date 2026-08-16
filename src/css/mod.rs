@@ -297,6 +297,18 @@ fn crack_key_scan(
                     let usable = (got / 2048).min(n as usize);
                     // At least one, so a source returning Ok(0) cannot spin here.
                     advance = (usable as u32).max(1);
+                    if usable == 0 {
+                        // Nothing was inspected, so the per-sector `tried`
+                        // charge below never runs — but the cursor still moves
+                        // one sector (the `.max(1)` above). Charge that sector
+                        // to the budget, or `tried` stays frozen and the loop
+                        // is bounded only by the disc-declared
+                        // `ext.sector_count`: the anti-grind budget stops
+                        // applying to exactly the misbehaving source it exists
+                        // for. Mirrors the `Err` arm's `tried += n`, which
+                        // likewise charges an uninspected advance.
+                        tried += 1;
+                    }
                     for s in 0..usable {
                         tried += 1;
                         let sect = &buf[s * 2048..(s + 1) * 2048];
@@ -413,19 +425,16 @@ pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
 ///
 /// # Errors
 ///
-/// [`Error::DecryptFailed`] when a sector's own crib proves the cached key stale
-/// and the re-crack from that same sector also fails. CSS has no external key
-/// source — the title key comes only from cracking the data — so on a readable
-/// sector this is not a missing input, it is recovery failing on data we can
-/// see. Emitting the sector anyway means one of two bad outcomes: descrambled
-/// with the key its crib just rejected, which yields garbage behind an intact
-/// clear header (valid pack start, passes every structural check the PS demuxer
-/// applies, corruption confined to the PES payload where nothing looks); or
-/// passed through still scrambled, which is ciphertext delivered where plaintext
-/// is meant to be. Both are bad data reported as success.
+/// Never returns `Err` — the signature is `Result` only to match the decrypt
+/// seam it is dispatched from, and the `usize` is that seam's legacy
+/// always-zero loss count (see [`crate::decrypt::decrypt_sectors`]).
 ///
-/// This matches the AACS sibling, which returns [`Error::DecryptFailed`] rather
-/// than apply a neighbouring CPS unit's key.
+/// This section used to document an [`Error::DecryptFailed`] for the case where
+/// a sector's crib rejects the cached key and the re-crack from that sector also
+/// fails. That behaviour was tried and REVERTED, for the reason set out at the
+/// `None =>` arm below: crib mismatch plus crack failure is the signature of a
+/// crib FALSE POSITIVE, not of a stale key, and failing there made real discs
+/// unrippable. The arm descrambles with the cached key and returns `Ok`.
 pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::error::Result<usize> {
     for chunk in buf.chunks_mut(2048) {
         // `is_scrambled_pack`, NOT the looser `is_scrambled`. The raw flag test
@@ -604,7 +613,22 @@ mod tests {
         let out = descramble_region(&mut sector, &mut key)
             .expect("a crib false positive must NOT fail the rip");
 
-        assert_eq!(out, 0, "CSS reports no loss term of its own");
+        // The "no loss term" contract belongs to the SEAM, not to this
+        // function: `decrypt_sectors`' `usize` is a legacy always-zero count
+        // that the CSS arm feeds from here. Asserting `out == 0` on
+        // `descramble_region` alone only restates its single `Ok(0)` return —
+        // a body replaced by `Ok(0)` satisfies it just as well. Assert it one
+        // level up, where the value is actually assembled and returned, so the
+        // arm dispatch and the plumbing are exercised too.
+        assert_eq!(out, 0);
+        let mut seam_sector = sector;
+        let mut seam_keys = crate::decrypt::DecryptKeys::Css { title_key: key };
+        assert_eq!(
+            crate::decrypt::decrypt_sectors(&mut seam_sector, &mut seam_keys, 0)
+                .expect("a crib false positive must NOT fail the rip at the seam either"),
+            0,
+            "CSS reports no loss term of its own through decrypt_sectors"
+        );
         assert_eq!(
             key, key_before,
             "a failed re-crack must leave the cached key in place — it is still \
@@ -903,6 +927,39 @@ mod tests {
             "the cursor must advance even on an empty read; got {} reads over \
              an 8-sector extent",
             src.reads.borrow().len()
+        );
+    }
+
+    /// The 50_000-sector budget must hold whatever the source returns, not
+    /// only when the source delivers sectors.
+    ///
+    /// `tried` is incremented ONLY per inspected sector, inside
+    /// `for s in 0..usable`. An `Ok(0)` inspects nothing, so that loop never
+    /// runs — yet `advance` is forced to 1 to stop the scan spinning, so the
+    /// cursor keeps walking. The budget is then never consulted and the scan
+    /// runs for the extent's full, disc-declared `sector_count`: a misbehaving
+    /// or adversarial source (an emulated drive, a bridge answering short)
+    /// converts the anti-grind bound into no bound at all.
+    ///
+    /// Mutation: delete the `tried` charge in the `usable == 0` arm and this
+    /// goes red at 60_000 reads.
+    #[test]
+    fn a_source_that_returns_zero_sectors_still_obeys_the_scan_budget() {
+        const MAX_TRIES: usize = 50_000;
+        let mut src = MockSource::new(0x00);
+        src.short_read = Some(0);
+        // Deliberately LARGER than the budget: if the budget is what stops the
+        // scan, the extent's own length is never reached.
+        let ext = [crate::disc::Extent {
+            start_lba: 0,
+            sector_count: 60_000,
+        }];
+        let _ = crack_key_scan(&mut src, &ext, 4, None);
+        let reads = src.reads.borrow().len();
+        assert!(
+            reads <= MAX_TRIES,
+            "an Ok(0)-returning source must be stopped by the {MAX_TRIES}-sector \
+             budget, not by the disc-declared extent length; got {reads} reads"
         );
     }
 

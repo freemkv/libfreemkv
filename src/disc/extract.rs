@@ -146,7 +146,7 @@ impl Disc {
         let fs = udf::read_filesystem(reader)?;
         let mut planned: Vec<PlannedFile> = Vec::new();
         let mut dirs: Vec<PathBuf> = Vec::new();
-        let mut seen_hosts: std::collections::HashMap<PathBuf, String> =
+        let mut seen_hosts: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         plan_tree(
             reader,
@@ -385,9 +385,22 @@ impl Disc {
             crate::css::CrackOutcome::Unencrypted => Ok(base_keys.clone()),
             // Scrambled sectors WERE seen and no key came out. Reusing the
             // disc-wide key here writes corrupt PES behind an intact header and
-            // reports a complete extract at exit 0. Skippable per title, which
-            // is why this is the per-title code and not the disc-level one — a
-            // sibling VTS may still crack.
+            // reports a complete extract at exit 0.
+            //
+            // `CssKeyMissing` is the per-TITLE code rather than the disc-level
+            // `CssNoDiscKey` because the two are treated differently elsewhere:
+            // it is what `error::is_skippable_title_stub` matches, and the MUX
+            // path really does skip a title on it and carry on with the rest of
+            // the disc.
+            //
+            // EXTRACT does not skip. This error is `?`-propagated by the only
+            // caller, out of the loop over every planned file, so one
+            // uncrackable VTS aborts the whole extract — including files from
+            // sibling VTS groups that would have cracked. That is deliberate:
+            // aborting loudly is the safe failure here, and pinned by
+            // `a_scrambled_vts_that_cannot_be_cracked_fails_instead_of_borrowing_a_key`.
+            // Do not read the code choice as a promise that extraction
+            // continues past this point.
             crate::css::CrackOutcome::ScrambledUncracked => Err(Error::CssKeyMissing),
         }
     }
@@ -435,7 +448,7 @@ fn plan_tree(
     is_root: bool,
     files: &mut Vec<PlannedFile>,
     dirs: &mut Vec<PathBuf>,
-    seen_hosts: &mut std::collections::HashMap<PathBuf, String>,
+    seen_hosts: &mut std::collections::HashMap<String, String>,
 ) -> Result<()> {
     for entry in &dir.entries {
         if entry.name.is_empty() {
@@ -453,13 +466,48 @@ fn plan_tree(
         let safe = sanitize_component(&entry.name)?;
         let child_rel = host_rel.join(&safe);
         let child_disc = format!("{disc_path}/{}", entry.name);
-        // Collision: two distinct disc paths → same host path.
-        if let Some(prev) = seen_hosts.insert(child_rel.clone(), child_disc.clone())
-            && prev != child_disc
-        {
-            return Err(Error::DirNameCollision {
-                host: child_rel.to_string_lossy().into_owned(),
-            });
+        // Collision: two distinct disc paths → same host FILE. The key must
+        // model the HOST's namespace, not the disc's, and the two differ twice
+        // over:
+        //
+        //  * CASE. macOS APFS and Windows NTFS are case-insensitive by default,
+        //    so `Movie` and `movie` are one file there. Keyed by the
+        //    case-preserving path they were two entries, nothing collided, and
+        //    the second extraction overwrote the first with both files still
+        //    reported `complete: true`.
+        //  * The `.partial` SUFFIX. `extract_one_file` streams through
+        //    `<final>.partial` before renaming, so a file's temp path lives in
+        //    the same namespace as every other file's final path: a disc
+        //    holding both `X` and `X.partial` planned two distinct final names,
+        //    and extracting `X` then truncated the real `X.partial`.
+        //
+        // Only files get the `.partial` alias — directories are created
+        // directly and never stream through a temp name — but it is checked
+        // against every entry's primary key, so a directory `X.partial` beside
+        // a file `X` is caught too. The alias stores the OWNING file's disc
+        // path, so the `prev != child_disc` test keeps its meaning: a repeated
+        // identical disc path is not a collision, two different ones are.
+        //
+        // The fold is `to_lowercase`, which closes the ASCII and simple-Unicode
+        // case classes. It is NOT full case folding, and it does NOT normalize:
+        // APFS also unifies NFC/NFD, so `é` recorded as U+00E9 and as
+        // `e`+U+0301 remain two keys here and one file there. That residual is
+        // a false NEGATIVE (a missed collision, never a spurious one), so this
+        // is a strict improvement rather than a complete model of the host.
+        let mut register = |key: PathBuf| -> Result<()> {
+            let folded = key.to_string_lossy().to_lowercase();
+            if let Some(prev) = seen_hosts.insert(folded, child_disc.clone())
+                && prev != child_disc
+            {
+                return Err(Error::DirNameCollision {
+                    host: key.to_string_lossy().into_owned(),
+                });
+            }
+            Ok(())
+        };
+        register(child_rel.clone())?;
+        if !entry.is_dir {
+            register(with_partial_suffix(&child_rel))?;
         }
         if entry.is_dir {
             dirs.push(child_rel.clone());
@@ -1650,6 +1698,62 @@ mod tests {
             .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
             .expect_err("collision must error");
         assert!(matches!(err, Error::DirNameCollision { .. }));
+    }
+
+    /// Two disc names differing only by CASE are one host file on macOS APFS
+    /// and Windows NTFS, both case-insensitive by default. Keyed by the
+    /// case-preserving path, the collision map sees two entries, raises
+    /// nothing, and the second file extracted overwrites the first — while both
+    /// `PlannedFile`s report `complete: true`. Silent data loss reported as a
+    /// clean extract is the one outcome this crate must never produce, so the
+    /// host-equivalence key has to model the host's namespace, not the disc's.
+    #[test]
+    fn names_differing_only_by_case_are_a_collision() {
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: vec![
+                file("Movie", 30, 31, b"a".to_vec(), false),
+                file("movie", 32, 33, b"b".to_vec(), false),
+            ],
+            subdirs: vec![],
+        };
+        let mut disc = build_disc(root);
+        let out = TmpDir::new("case_collision");
+        let err = clear_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect_err("two names that fold to one host file must collide");
+        assert!(matches!(err, Error::DirNameCollision { .. }), "got {err:?}");
+    }
+
+    /// A file's in-flight `.partial` path shares the host namespace with every
+    /// other planned file's FINAL path. A disc carrying both `X` and
+    /// `X.partial` plans two distinct final names, so nothing collides — but
+    /// extracting `X` writes through `X.partial`, the same host path the other
+    /// file owns. Whichever lands second truncates the other, and both entries
+    /// are still reported complete.
+    #[test]
+    fn a_files_partial_path_colliding_with_another_files_final_name_is_an_error() {
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: vec![
+                file("X", 30, 31, b"aaaa".to_vec(), false),
+                file("X.partial", 32, 33, b"bbbb".to_vec(), false),
+            ],
+            subdirs: vec![],
+        };
+        let mut disc = build_disc(root);
+        let out = TmpDir::new("partial_collision");
+        let err = clear_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect_err(
+                "X's temp path IS X.partial's final path — one host file for two \
+                 disc files, so it must be refused up front",
+            );
+        assert!(matches!(err, Error::DirNameCollision { .. }), "got {err:?}");
     }
 
     /// A non-empty target dir is refused without `--force`, and accepted with.

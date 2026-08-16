@@ -1252,7 +1252,12 @@ mod tests {
     /// an error (not Ok(0)/EOF), and its ErrorKind must survive the
     /// round-trip through the channel. Grounding: the producer's
     /// `Err(e) => tx.send(Err(e.into()))` arm, and `read_sectors`'
-    /// `Ok(Err(e)) => Err(IoError{source:e})`.
+    /// `Ok(Err(e)) => { self.producer_failed = true; Err(Error::from(e)) }`.
+    ///
+    /// That arm recovers the producer's TYPED error by downcast rather than
+    /// blanket-wrapping it as `Error::IoError`, so the kind survives; the
+    /// `producer_failed` latch it also sets is what turns the channel close
+    /// that follows into `SourceTerminated` instead of a clean EOF.
     #[test]
     fn reader_error_propagates_with_kind() {
         with_watchdog(Duration::from_secs(10), || {

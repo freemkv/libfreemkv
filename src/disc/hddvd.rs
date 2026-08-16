@@ -435,9 +435,16 @@ const MAX_XPL_DEPTH: usize = 32;
 /// seconds into tens of terabytes of optical reads on a disc that is only
 /// pretending to be large.
 ///
-/// 4096 is far above any real disc (retail HD-DVDs carry tens of titles) and
-/// still bounds the probe work to something a scan can absorb.
-const MAX_XPL_TITLES: usize = 4096;
+/// The bound that matters is `cap x EVO_PROBE_SECTORS`, since each title costs
+/// one probe: `compose_xpl_titles` memoizes on the title's RESOLVED extent list,
+/// and distinct titles built from different combinations of the same clips have
+/// different lists, so each one misses the memo. At 4096 that product was 64 GiB
+/// of optical reads — the same worst case, and the same contradiction with
+/// "seconds", as the sibling [`MAX_HDDVD_CLIPS`] path.
+///
+/// 512 keeps it at 8 GiB and remains far above any real disc (retail HD-DVDs
+/// carry tens of titles).
+const MAX_XPL_TITLES: usize = 512;
 
 /// Cap on `.evo` clips taken from the `HVDVD_TS/` directory listing.
 ///
@@ -457,10 +464,25 @@ const MAX_XPL_TITLES: usize = 4096;
 /// the memo and costs a full [`EVO_PROBE_SECTORS`] (16 MiB) read — hundreds of
 /// GiB on a `Disc::scan()` the operator expects to take seconds.
 ///
-/// 4096 matches [`MAX_XPL_TITLES`] and is far above any real disc (retail
-/// HD-DVDs carry tens of `.evo` clips), so it cannot cost a genuine disc a
-/// title, while bounding the probe work to something a scan can absorb.
-const MAX_HDDVD_CLIPS: usize = 4096;
+/// The cap's job is therefore to bound `cap x EVO_PROBE_SECTORS`, and only that
+/// product means anything. It was 4096 — chosen to match [`MAX_XPL_TITLES`],
+/// which bounds a different path with no per-item read cost — and 4096 x 16 MiB
+/// is 64 GiB of optical reads: more than dual-layer HD-DVD media physically
+/// holds (reachable anyway, since distinct extent lists may overlap on the
+/// medium) and tens of minutes to hours at drive speeds. That is not "a scan
+/// the operator expects to take seconds"; the cap stopped literal
+/// unboundedness while permitting a worst case the same doc ruled out.
+///
+/// 512 keeps the product at 8 GiB and still leaves a wide margin over any real
+/// disc — retail HD-DVDs carry TENS of `.evo` clips, so this is ~10x the
+/// real-world maximum, the same sizing convention
+/// [`MAX_XPL_CHAPTERS_PER_TITLE`] uses against the 99-chapter authoring
+/// ceiling. No genuine disc loses a title.
+///
+/// Pinned by `the_clip_cap_and_probe_budget_bound_a_scans_worst_case_read_volume`,
+/// which asserts the PRODUCT rather than either constant, so raising one
+/// without re-examining the other fails.
+const MAX_HDDVD_CLIPS: usize = 512;
 
 /// Most `<PrimaryAudioVideoClip>` elements one `<Title>` may contribute.
 ///
@@ -783,7 +805,7 @@ fn compose_xpl_titles(
             };
             if seen_evos.insert(c.evo.as_str()) {
                 extents.extend_from_slice(exts);
-                size_bytes += *size;
+                size_bytes = size_bytes.saturating_add(*size);
             }
             parts.push(Clip {
                 feed_span: None,
@@ -984,7 +1006,7 @@ impl Disc {
             for n in &feature {
                 if let Some((orig, size, exts)) = clip_extents.get(&n.to_ascii_lowercase()) {
                     extents.extend_from_slice(exts);
-                    size_bytes += *size;
+                    size_bytes = size_bytes.saturating_add(*size);
                     parts.push(Clip {
                         feed_span: None,
                         clip_id: orig
@@ -1074,7 +1096,13 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (name, sectors, data_lba))| {
-                file(name, 100 + i as u32, *data_lba, sectors * 2048, true)
+                file(
+                    name,
+                    100 + i as u32,
+                    *data_lba,
+                    u64::from(*sectors) * 2048,
+                    true,
+                )
             })
             .collect();
         let root = DirSpec {
@@ -1221,6 +1249,58 @@ mod tests {
         assert!(!is_feature_clip("TRAILER.EVO"));
         assert!(!is_feature_clip("DLS_01.EVO"));
         assert!(!is_feature_clip("EPK.EVO"));
+    }
+
+    /// The SECOND size accumulator. `compose_xpl_titles` sums an XPL's clip
+    /// sizes; this one sums the composed FEATURE title's parts, and it reads
+    /// the same disc-declared `u64` Information Length from the same
+    /// `clip_extents` map. A split feature whose two parts each declare a size
+    /// near `u64::MAX` overflows it exactly as the XPL path did.
+    ///
+    /// Nothing reconciles the declared size against the extents that back it —
+    /// here each part declares `u64::MAX` while occupying ten sectors — because
+    /// the allocation descriptor's length field is only 32 bits wide, so the
+    /// disc can always claim more than it holds.
+    ///
+    /// Mutation: restore `size_bytes += *size` in the feature-composition path
+    /// and this goes red (debug: attempt to add with overflow).
+    #[test]
+    fn scan_hddvd_feature_composition_saturates_absurd_disc_declared_sizes() {
+        let mut disc = MemDisc::new();
+        let vti = synthetic_vti(&["FEATURE_1.EVO", "FEATURE_2.EVO"]);
+        let files = vec![
+            file("FEATURE_1.EVO", 100, 5000, u64::MAX, true),
+            file("FEATURE_2.EVO", 101, 8000, u64::MAX, true),
+            file_with("HVA00001.VTI", 103, 15000, vti, true),
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None)
+            .expect("a hostile size field must not fail the scan");
+        let feat = titles
+            .iter()
+            .find(|t| t.playlist == "FEATURE")
+            .expect("composed feature title");
+        assert_eq!(
+            feat.size_bytes,
+            u64::MAX,
+            "the part sizes must saturate at u64::MAX, never wrap to a small number"
+        );
     }
 
     #[test]
@@ -2031,7 +2111,13 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (name, sectors, data_lba))| {
-                file(name, 100 + i as u32, *data_lba, sectors * 2048, true)
+                file(
+                    name,
+                    100 + i as u32,
+                    *data_lba,
+                    u64::from(*sectors) * 2048,
+                    true,
+                )
             })
             .collect();
         let root = DirSpec {
@@ -2466,6 +2552,81 @@ mod tests {
             (t.clips[1].duration_secs - 4.0).abs() < 1e-9,
             "second clip's duration is also end - begin: got {}",
             t.clips[1].duration_secs
+        );
+    }
+
+    /// A title's `size_bytes` is a running sum of DISC-DECLARED clip sizes: the
+    /// `u64` UDF File Entry Information Length, which nothing cross-checks
+    /// against the extent list that file actually occupies. Two clips can
+    /// therefore each declare a size near `u64::MAX`.
+    ///
+    /// Summed with a plain `+=`, that overflows: a panic in a debug build —
+    /// a crash on untrusted disc content, which this library must never do —
+    /// and a wrap to a small garbage total in release, which misreports the
+    /// title's size while looking entirely normal.
+    ///
+    /// Mutation: restore `size_bytes += *size` in `compose_xpl_titles` and this
+    /// goes red (debug: attempt to add with overflow).
+    #[test]
+    fn compose_xpl_titles_saturates_absurd_disc_declared_clip_sizes() {
+        let clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = [
+            (
+                "a.evo".to_string(),
+                (
+                    "A.EVO".to_string(),
+                    u64::MAX,
+                    vec![Extent {
+                        start_lba: 1,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+            (
+                "b.evo".to_string(),
+                (
+                    "B.EVO".to_string(),
+                    u64::MAX,
+                    vec![Extent {
+                        start_lba: 2,
+                        sector_count: 1,
+                    }],
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let xpl_titles = vec![XplTitle {
+            number: 1,
+            name: "T".to_string(),
+            duration_secs: 10.0,
+            clips: vec![
+                XplClip {
+                    evo: "a.evo".to_string(),
+                    begin_secs: 0.0,
+                    end_secs: 5.0,
+                },
+                XplClip {
+                    evo: "b.evo".to_string(),
+                    begin_secs: 5.0,
+                    end_secs: 10.0,
+                },
+            ],
+            chapters: vec![],
+        }];
+        let mut disc = MemDisc::new();
+        let titles = compose_xpl_titles(
+            &mut disc,
+            &xpl_titles,
+            &clip_extents,
+            &std::collections::HashSet::new(),
+            None,
+        )
+        .expect("a hostile size field must not fail the scan either");
+        assert_eq!(titles.len(), 1);
+        assert_eq!(
+            titles[0].size_bytes,
+            u64::MAX,
+            "the sum must saturate at u64::MAX, never wrap to a small number"
         );
     }
 
@@ -2948,6 +3109,49 @@ mod tests {
             counter.sectors_read
         );
         assert!(!titles.is_empty(), "the clips still enumerate");
+    }
+
+    /// The clip cap and the per-probe read budget are ONE bound, not two, and
+    /// only their product is meaningful: `MAX_HDDVD_CLIPS` probes each cost up
+    /// to `EVO_PROBE_SECTORS`, so the pair fixes the worst-case drive time of a
+    /// `Disc::scan()`.
+    ///
+    /// `EvoProbeCache` does not help against a crafted disc here: it keys on the
+    /// RESOLVED extent list, and distinct-but-overlapping extent lists all
+    /// reading one physical region miss the memo every time while every read
+    /// succeeds. So the product is genuinely reachable, and it is the number
+    /// that has to stay within what a scan can absorb.
+    ///
+    /// 8 GiB is the ceiling asserted here. It is far above any genuine disc —
+    /// retail HD-DVDs carry tens of `.evo` clips, i.e. well under 1 GiB of
+    /// probing — and far below the 64 GiB the pair used to permit, which
+    /// exceeded the capacity of the dual-layer media this format tops out at
+    /// and took tens of minutes of optical reads.
+    ///
+    /// This is a relationship, not a magic number: raising EITHER constant
+    /// without re-examining the other trips it.
+    #[test]
+    fn the_clip_cap_and_probe_budget_bound_a_scans_worst_case_read_volume() {
+        const CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+        let budget = |cap: usize| {
+            cap as u64 * u64::from(EVO_PROBE_SECTORS) * crate::consts::SECTOR_BYTES as u64
+        };
+        // BOTH title-composition paths pay one probe per item, and a crafted
+        // disc reaches either one: the directory fallback when `/ADV_OBJ` is
+        // omitted, the playlist path when it is present. Capping only one moves
+        // the amplification next door.
+        for (name, cap) in [
+            ("MAX_HDDVD_CLIPS", MAX_HDDVD_CLIPS),
+            ("MAX_XPL_TITLES", MAX_XPL_TITLES),
+        ] {
+            let worst_case = budget(cap);
+            assert!(
+                worst_case <= CEILING_BYTES,
+                "{name} ({cap}) x EVO_PROBE_SECTORS ({EVO_PROBE_SECTORS}) = \
+                 {worst_case} bytes of probe reads, over the {CEILING_BYTES}-byte \
+                 ceiling a scan can absorb"
+            );
+        }
     }
 
     /// CONTROL: memoization must not silently collapse DISTINCT clips. A

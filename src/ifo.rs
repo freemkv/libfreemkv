@@ -691,6 +691,15 @@ fn parse_video_attr(data: &[u8]) -> Result<DvdVideoAttr> {
 }
 
 /// Parse one audio stream attribute block (8 bytes at `offset`).
+/// `pub(crate)` for the CROSS-MODULE tests only. The sole production caller is
+/// `parse_vts_attributes` in this file; `src/mux/mkv.rs`'s `#[cfg(test)]` block
+/// calls it directly so its language-mapping tests run the real parser over real
+/// on-disc IFO bytes end to end, instead of a hand-built `DvdAudioAttr` that
+/// could agree with the muxer while both disagree with the disc. Narrowing this
+/// would mean either a `#[cfg(test)]`/`#[cfg(not(test))]` pair of signatures
+/// that can drift apart, or moving those tests away from the code they exist to
+/// pin — both worse than the widened crate-internal visibility, which reaches no
+/// public API.
 pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
     let b0 = byte_at(data, offset)?;
     let b1 = byte_at(data, offset + 1)?;
@@ -780,8 +789,14 @@ fn parse_subtitle_attr(data: &[u8], offset: usize) -> Result<DvdSubtitleAttr> {
 /// subtitle attribute blocks. A pair of lowercase a-z bytes is taken
 /// verbatim (the ISO 639-1 code the DVD-Video spec puts there); an all-zero
 /// pair means unspecified (empty string); anything else falls through to an
-/// ASCII-alphanumeric salvage that keeps only usable characters — a byte
-/// outside a-z (a corrupt/hostile disc) never ends up in the result.
+/// ASCII-alphanumeric salvage — letters (either case) and digits are kept,
+/// everything else (control bytes, punctuation, high bytes from a corrupt or
+/// hostile disc) is dropped.
+///
+/// The salvage is deliberately not narrowed to a-z: whatever survives is only
+/// ever a lookup key for [`dvd_lang_to_iso639_2`], which degrades anything it
+/// does not recognize to `und`, so a stray `X` or `5` costs nothing and cannot
+/// reach an output stream as a language code.
 fn parse_raw_dvd_lang_bytes(lang_bytes: &[u8]) -> String {
     if lang_bytes[0] >= b'a'
         && lang_bytes[0] <= b'z'
@@ -822,7 +837,7 @@ fn parse_raw_dvd_lang_bytes(lang_bytes: &[u8]) -> String {
 /// An empty or unrecognized code degrades to `"und"` (ISO 639-2 / Matroska's
 /// own "undetermined" value) — a valid element value — rather than passing
 /// through an invalid 2-letter code or an empty string. Never guesses.
-pub(crate) fn dvd_lang_to_iso639_2(raw: &str) -> String {
+fn dvd_lang_to_iso639_2(raw: &str) -> String {
     crate::labels::vocab::iso639_1_to_iso639_2(raw)
         .unwrap_or("und")
         .to_string()

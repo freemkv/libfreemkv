@@ -980,7 +980,16 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     let fallback = (VDS_FALLBACK_START, VDS_MAX_SECTORS);
     let mut candidates = Vec::with_capacity(2);
     candidates.extend(recorded);
-    if recorded.map(|(s, _)| s) != Some(fallback.0) {
+    // Compare the whole extent, not just its start. The two candidates are two
+    // SWEEPS: an anchor may record the customary LBA and still declare a
+    // narrower window than the fallback's (16 sectors is the ECMA-167 3/10.2.1
+    // minimum, and passes every shape check above). Matching on start alone
+    // suppressed the fallback as a duplicate and threw the WIDER sweep away, so
+    // a sequence lying past the declared window — or a Terminating Descriptor
+    // beyond it — was never reached. `n` is already capped at
+    // `VDS_MAX_SECTORS`, so tuple equality is exactly "the recorded sweep
+    // already covers the fallback sweep".
+    if recorded != Some(fallback) {
         candidates.push(fallback);
     }
 
@@ -1620,7 +1629,14 @@ pub(crate) fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
         // LBAs/lengths, so a corrupt disc could otherwise overflow u32
         // (panic in debug, wrap in release).
         let last_end = last.0.saturating_add(last.1);
-        if start <= last_end.saturating_add(1) {
+        // `(start, count)` is HALF-OPEN, so `last_end` is the EXCLUSIVE end and
+        // two ranges touch exactly when `start == last_end`. Accepting
+        // `last_end + 1` as well merged across a genuine one-sector hole and
+        // reported coverage of a sector neither input described — and this
+        // output is a boundary, not a hint (`disc::merged_extents` ->
+        // `Disc::encrypted_content_ranges` decides what the decrypting source
+        // treats as content, where a nav/padding sector must stay outside).
+        if start <= last_end {
             // Overlapping or adjacent — extend
             let new_end = start.saturating_add(count).max(last_end);
             last.1 = new_end - last.0;
@@ -2466,6 +2482,33 @@ mod tests {
             b"DVD_HD_V_TKF",
             "inf must be the HD DVD VTKF (its magic), sourced from /ANY!/ via the \
              candidate fall-through — not /AACS/Unit_Key_RO.inf"
+        );
+    }
+
+    /// `merge_ranges` takes HALF-OPEN `(start, count)` ranges, so `start +
+    /// count` is the EXCLUSIVE end and two ranges touch exactly when the next
+    /// `start` equals the previous end. A range that starts one sector LATER
+    /// than that has a genuine, untouched sector between them, and merging
+    /// across it claims coverage of a sector neither input ever described.
+    ///
+    /// That matters because the merged output is a boundary, not a hint:
+    /// `disc::merged_extents` feeds `Disc::encrypted_content_ranges`, which
+    /// decides which sectors the decrypting source treats as content. A sector
+    /// in a real gap belongs to no title extent — it is nav/UDF/padding — and
+    /// must stay outside the content gate, not be folded into it.
+    #[test]
+    fn merge_ranges_keeps_a_genuine_one_sector_gap() {
+        // [0,5) and [6,9): sector 5 is in neither. The ranges are NOT adjacent.
+        assert_eq!(
+            merge_ranges(&[(0, 5), (6, 3)]),
+            vec![(0, 5), (6, 3)],
+            "sector 5 is in neither input range, so the two must stay disjoint"
+        );
+        // Exactly touching ([0,5) then [5,3)) still merges — that is adjacency.
+        assert_eq!(
+            merge_ranges(&[(0, 5), (5, 3)]),
+            vec![(0, 8)],
+            "start == exclusive end is a true touch and must still merge"
         );
     }
 
@@ -3655,17 +3698,37 @@ mod tests {
             .expect("the plan is built");
 
         // (0, 1004)  structure through the end of the metadata partition
-        // (1010, 5)  the ICBs of INDEX.BDMV, EXACT.BIN, HUGE.BIN, SPARSE.BIN,
-        //            merged with the adjacent LBAs between them
+        // (1010, 1)  INDEX.BDMV's ICB, alone — 1011 is NOT collected, so the
+        //            run stops here rather than reaching across the hole
+        // (1012, 3)  the ICBs of EXACT.BIN, HUGE.BIN, SPARSE.BIN — genuinely
+        //            consecutive, so these do merge
         // (1500, 2)  INDEX.BDMV's 4096-byte extent
         // (1800, 1)  EXACT.BIN's extent — at the ceiling, so still cached
         // (1900, 1)  SPARSE.BIN's recorded extent only
         // Absent: 1011 alone (STREAM is not descended at all, not even for
         // its ICB), 1600 (00000.M2TS), 1850 (HUGE.BIN's data), 1700
         // (SPARSE.BIN's unrecorded extent).
+        //
+        // 1011's absence is asserted, not merely commented. This expectation
+        // used to read `(1010, 5)` — a single run SPANNING 1011 — which
+        // contradicted the "Absent: 1011" line above it: `merge_ranges` closed
+        // one-sector holes, so the plan prefetched the very sector the skip
+        // policy exists to leave alone.
         assert_eq!(
             ranges,
-            vec![(0, 1004), (1010, 5), (1500, 2), (1800, 1), (1900, 1)]
+            vec![
+                (0, 1004),
+                (1010, 1),
+                (1012, 3),
+                (1500, 2),
+                (1800, 1),
+                (1900, 1)
+            ]
+        );
+        assert!(
+            !ranges.iter().any(|&(s, c)| (s..s + c).contains(&1011)),
+            "STREAM's ICB at 1011 is deliberately not descended, so no range \
+             may cover it: {ranges:?}"
         );
     }
 
@@ -4056,6 +4119,64 @@ mod tests {
         let fs = super::read_filesystem(&mut disc).expect(
             "a well-formed pointer to nothing must not be the end of the road; \
              the customary sequence is still there and still valid",
+        );
+        assert_eq!(fs.partition_start(), PART_START);
+        assert_eq!(fs.root.entries[0].name, "INDEX.BDMV");
+    }
+
+    /// The recorded extent and the customary fallback are two SWEEPS, not two
+    /// locations: an anchor may point at the customary LBA and still declare a
+    /// window narrower than the fallback's. De-duplicating them on start LBA
+    /// alone then throws the wider sweep away and the sequence is never
+    /// reached, even though it is exactly where the fallback would have looked.
+    ///
+    /// Fixture: the anchor records `(LBA 32, 16 sectors)` — the minimum
+    /// ECMA-167 3/10.2.1 permits, so it passes every shape check — while the
+    /// Partition and Logical Volume Descriptors sit at 50/51, inside the
+    /// customary 32-sector window but past the declared 16. No Terminating
+    /// Descriptor lies in 32..48, or both sweeps would stop at the same sector
+    /// and the wider one would buy nothing.
+    #[test]
+    fn a_recorded_vds_narrower_than_the_customary_window_still_gets_the_wider_sweep() {
+        use fixture::{DirSpec, MemDisc, PART_START, build_udf_skeleton, file, lay_dir};
+
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(
+            &mut disc,
+            &DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: vec![file("INDEX.BDMV", 12, 13, 2048, false)],
+                subdirs: Vec::new(),
+            },
+        );
+
+        // Move the sequence the skeleton wrote at 32/33/34 out to 50/51, past
+        // the declared 16-sector window. 32..48 is left as zeroed sectors:
+        // tag 0, no descriptor of any kind, and crucially no tag-8 Terminating
+        // Descriptor to stop the wider sweep early.
+        disc.put_bytes(32, &[0u8; 3 * 2048]);
+        let mut pd = [0u8; 2048];
+        pd[0..2].copy_from_slice(&5u16.to_le_bytes());
+        pd[188..192].copy_from_slice(&PART_START.to_le_bytes());
+        disc.put_bytes(50, &pd);
+        let mut lvd = [0u8; 2048];
+        lvd[0..2].copy_from_slice(&6u16.to_le_bytes());
+        lvd[268..272].copy_from_slice(&1u32.to_le_bytes());
+        disc.put_bytes(51, &lvd);
+
+        let mut avdp = vec![0u8; 2048];
+        avdp[0..2].copy_from_slice(&2u16.to_le_bytes());
+        avdp[16..20].copy_from_slice(&(VDS_MIN_SECTORS * 2048).to_le_bytes());
+        avdp[20..24].copy_from_slice(&VDS_FALLBACK_START.to_le_bytes());
+        disc.put_bytes(256, &avdp);
+
+        let fs = super::read_filesystem(&mut disc).expect(
+            "an anchor whose window is narrower than the customary one must \
+             still get the customary sweep — it is a different sweep, not a \
+             duplicate of the one already tried",
         );
         assert_eq!(fs.partition_start(), PART_START);
         assert_eq!(fs.root.entries[0].name, "INDEX.BDMV");
@@ -5481,7 +5602,7 @@ pub(crate) mod fixture {
         pub(crate) name: String,
         pub(crate) icb_lba: u32,
         pub(crate) data_lba: u32,
-        pub(crate) size: u32,
+        pub(crate) size: u64,
         pub(crate) long_ad: bool,
         pub(crate) contents: Vec<u8>,
     }
@@ -5496,23 +5617,28 @@ pub(crate) mod fixture {
     }
 
     /// Build an Extended File Entry ICB (tag 266) with one allocation descriptor.
-    pub(crate) fn build_file_icb(size: u32, data_lba: u32, long_ad: bool) -> [u8; 2048] {
+    pub(crate) fn build_file_icb(size: u64, data_lba: u32, long_ad: bool) -> [u8; 2048] {
         let mut s = [0u8; 2048];
         s[0..2].copy_from_slice(&266u16.to_le_bytes()); // Extended File Entry
         if long_ad {
             s[34..36].copy_from_slice(&1u16.to_le_bytes()); // ICB flags → Long AD
         }
-        s[56..64].copy_from_slice(&(size as u64).to_le_bytes()); // info_length
+        s[56..64].copy_from_slice(&size.to_le_bytes()); // info_length
         s[208..212].copy_from_slice(&0u32.to_le_bytes()); // l_ea
         let ad_size: u32 = if long_ad { 16 } else { 8 };
         s[212..216].copy_from_slice(&ad_size.to_le_bytes()); // l_ad
-        s[216..220].copy_from_slice(&(size & 0x3FFF_FFFF).to_le_bytes());
+        // The allocation descriptor's length field is 32-bit, so a
+        // declared info_length beyond u32 simply cannot be backed by it —
+        // which is exactly the disc-vs-reality mismatch a hostile size field
+        // creates, and what the fixture must be able to express.
+        let ad_len = (size.min(u32::MAX as u64) as u32) & 0x3FFF_FFFF;
+        s[216..220].copy_from_slice(&ad_len.to_le_bytes());
         s[220..224].copy_from_slice(&data_lba.to_le_bytes());
         s
     }
 
     fn build_dir_icb(dir_data_lba: u32, dir_data_len: u32) -> [u8; 2048] {
-        build_file_icb(dir_data_len, dir_data_lba, false)
+        build_file_icb(dir_data_len as u64, dir_data_lba, false)
     }
 
     /// Append one File Identifier Descriptor (tag 257) to `buf`.
@@ -5604,7 +5730,7 @@ pub(crate) mod fixture {
         name: &str,
         icb_lba: u32,
         data_lba: u32,
-        size: u32,
+        size: u64,
         long_ad: bool,
     ) -> FileSpec {
         FileSpec {
@@ -5628,7 +5754,7 @@ pub(crate) mod fixture {
             name: name.to_string(),
             icb_lba,
             data_lba,
-            size: contents.len() as u32,
+            size: contents.len() as u64,
             long_ad,
             contents,
         }

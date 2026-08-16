@@ -3587,8 +3587,8 @@ mod tests {
     ) -> (crate::udf::fixture::MemDisc, udf::UdfFs) {
         use crate::udf::fixture::*;
         let files = vec![
-            file("MAIN.EVO", 100, 5_000, main_bytes, true),
-            file("OTHER.EVO", 101, 50_000, other_bytes, true),
+            file("MAIN.EVO", 100, 5_000, main_bytes as u64, true),
+            file("OTHER.EVO", 101, 50_000, other_bytes as u64, true),
         ];
         let root = DirSpec {
             name: String::new(),
