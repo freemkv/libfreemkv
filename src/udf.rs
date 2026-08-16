@@ -622,6 +622,11 @@ impl UdfFs {
         let mut ad_start = ad_offset;
         let mut ad_bytes = l_ad;
         const MAX_AD_BLOCKS: usize = 256;
+        // Set only when a block ends the chain (no continuation pointer). Running
+        // out of hops instead means the rest of the descriptor list was never
+        // read, so `extents` describes only PART of the file — see the error's
+        // own documentation for why handing that back is worse than failing.
+        let mut chain_ended = false;
 
         for _ in 0..MAX_AD_BLOCKS {
             let num_descriptors = ad_bytes / ad_size;
@@ -713,8 +718,15 @@ impl UdfFs {
                     ad_start = 24;
                     ad_bytes = aed_l_ad.min(block.len().saturating_sub(24));
                 }
-                None => break,
+                None => {
+                    chain_ended = true;
+                    break;
+                }
             }
+        }
+
+        if !chain_ended {
+            return Err(Error::UdfAdChainTooLong);
         }
 
         Ok(extents)
@@ -2703,27 +2715,60 @@ mod tests {
         );
     }
 
+    /// Hostile input: a type-3 continuation descriptor whose continuation block
+    /// points back at itself (a cycle). The `MAX_AD_BLOCKS` bound must make this
+    /// TERMINATE rather than loop forever — and terminating by exhausting the
+    /// budget is not the same as reaching the end of the chain.
+    ///
+    /// It used to fall through to `Ok(extents)` with the list silently cut short
+    /// at whatever the 256th hop had collected. `disc/extract.rs` then zero-pads
+    /// the missing tail out to the entry's declared size, sets `complete = true`
+    /// with `bytes_unreadable = 0`, and renames off `.partial` — a mostly-zero
+    /// file delivered as a verified complete extraction. Exhausting the budget
+    /// means "I do not know the rest of this file", and the only honest answer
+    /// is an error.
     #[test]
-    fn icb_extents_continuation_loop_terminates_without_hang_or_panic() {
-        // Hostile input: a type-3 continuation descriptor whose continuation
-        // block points back at itself (a cycle). The MAX_AD_BLOCKS bound must
-        // make this terminate rather than loop forever. We assert it returns
-        // a finite Vec and does not panic. The continuation block at meta-rel
-        // lba 50 contains a recorded extent + a type-3 AD pointing to lba 50.
+    fn icb_extents_exhausted_continuation_budget_is_an_error_not_a_short_list() {
         let icb = build_efe(2048, &[(0, 2048, 10), (3, 2048, 50)]);
         let cont = build_cont_block(&[(0, 2048, 20), (3, 2048, 50)]);
         let mut reader = MapReader::new();
         reader.put(5, icb);
         reader.put(50, cont);
         let fs = fs_with(0, 0, file_entry("LOOP", 5, 2048));
-        // Must return Ok (bounded), not hang or panic.
-        let extents = tuples(&fs.read_icb_extents(&mut reader, 5).expect("extents"));
-        // First block contributes extent (10,2048); each revisit of the
-        // self-referential cont block adds (20,2048). The hop bound caps the
-        // total, so the Vec is finite. (256 blocks max → < 600 extents.)
-        assert!(extents.len() < 1024, "continuation chain must be bounded");
-        assert_eq!(extents[0], (10, 2048));
-        assert_eq!(extents[1], (20, 2048));
+        // Bounded: must not hang or panic. And must not report success.
+        match fs.read_icb_extents(&mut reader, 5) {
+            Err(e) => assert!(
+                matches!(e, Error::UdfAdChainTooLong),
+                "the hop budget must report itself with its own code: {e:?}"
+            ),
+            Ok(extents) => panic!(
+                "an unterminated AD chain returned Ok with {} extents — a \
+                 SHORT extent list reported as the whole file; the caller \
+                 zero-pads the tail and calls the result complete",
+                extents.len()
+            ),
+        }
+    }
+
+    /// The honest path this fix must not break: a continuation chain that ENDS
+    /// within the budget still returns its full extent list, in file order.
+    #[test]
+    fn a_terminating_continuation_chain_still_returns_every_extent() {
+        // ICB → cont block at 50 → cont block at 51 → end.
+        let icb = build_efe(2048, &[(0, 2048, 10), (3, 2048, 50)]);
+        let cont_a = build_cont_block(&[(0, 2048, 20), (3, 2048, 51)]);
+        let cont_b = build_cont_block(&[(0, 2048, 30), (0, 4096, 40)]);
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        reader.put(50, cont_a);
+        reader.put(51, cont_b);
+        let fs = fs_with(0, 0, file_entry("CHAIN", 5, 2048));
+        let got = tuples(&fs.read_icb_extents(&mut reader, 5).expect("extents"));
+        assert_eq!(
+            got,
+            vec![(10, 2048), (20, 2048), (30, 2048), (40, 4096)],
+            "a chain under the hop budget is a normal file, not an error"
+        );
     }
 
     #[test]

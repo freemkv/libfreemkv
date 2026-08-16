@@ -63,6 +63,7 @@ pub const E_SELECTION_PID_UNKNOWN: u16 = 6014;
 pub const E_UDF_BUFFER_TOO_SMALL: u16 = 6012;
 pub const E_UDF_NOT_FILESYSTEM: u16 = 6013;
 pub const E_IMAGE_TRUNCATED: u16 = 6015;
+pub const E_UDF_AD_CHAIN_TOO_LONG: u16 = 6016;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -405,6 +406,16 @@ pub enum Error {
     /// 2048-byte sector. A contract violation on the public reader API —
     /// returned instead of panicking on the slice.
     UdfBufferTooSmall,
+    /// A file's allocation-descriptor continuation chain did not end within the
+    /// hop budget the UDF reader allows.
+    ///
+    /// The budget exists so a crafted or corrupt disc cannot loop the reader
+    /// forever. Hitting it is NOT the end of the chain: the extents beyond that
+    /// point are unknown, so the extent list in hand describes only part of the
+    /// file. Returning that list would let a caller zero-pad the remainder to
+    /// the declared size and report a mostly-empty file as a complete
+    /// extraction, so the read fails instead.
+    UdfAdChainTooLong,
     DiscTitleRange {
         index: usize,
         count: usize,
@@ -857,6 +868,7 @@ impl Error {
             Error::UdfNotFound { .. } => E_UDF_NOT_FOUND,
             Error::UdfNotFilesystem => E_UDF_NOT_FILESYSTEM,
             Error::UdfBufferTooSmall => E_UDF_BUFFER_TOO_SMALL,
+            Error::UdfAdChainTooLong => E_UDF_AD_CHAIN_TOO_LONG,
             Error::DiscTitleRange { .. } => E_DISC_TITLE_RANGE,
             Error::ShortImageRead { .. } => E_SHORT_IMAGE_READ,
             Error::EmptyImage => E_EMPTY_IMAGE,
