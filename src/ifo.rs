@@ -425,6 +425,13 @@ pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> 
     for (&vts_number, titles_info) in &title_set_map {
         match parse_vts(reader, udf, vts_number, titles_info) {
             Ok(ts) => title_sets.push(ts),
+            // The operator's Stop is not a placeholder title set. Once the
+            // drive's halt flag is set EVERY command fails with `Halted`, so
+            // swallowing it here would skip every REMAINING title set in turn
+            // and return `Ok` with a truncated list — a cancelled scan that
+            // is indistinguishable from a disc genuinely holding fewer
+            // titles. `scan_dvd_titles` propagates it to the caller.
+            Err(Error::Halted) => return Err(Error::Halted),
             Err(e) => {
                 // Some discs carry placeholder TT_SRPT entries for title sets
                 // that are not really there, so one failure is not fatal. But

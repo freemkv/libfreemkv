@@ -2056,7 +2056,7 @@ impl Disc {
         //    derived below from the AACS MKB generation, not the tree.
         let (mut titles, content_format) = if udf_fs.find_dir("/BDMV").is_some() {
             (
-                Self::scan_bluray_titles(reader, &udf_fs),
+                Self::scan_bluray_titles(reader, &udf_fs, opts.halt.as_ref())?,
                 ContentFormat::BdTs,
             )
         } else if udf_fs.find_dir("/HVDVD_TS").is_some() {
@@ -2066,7 +2066,7 @@ impl Disc {
             )
         } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
             (
-                Self::scan_dvd_titles(reader, &udf_fs),
+                Self::scan_dvd_titles(reader, &udf_fs, opts.halt.as_ref())?,
                 ContentFormat::MpegPs,
             )
         } else {
