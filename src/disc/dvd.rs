@@ -7,13 +7,32 @@ use crate::udf;
 
 impl Disc {
     /// Scan DVD titles from IFO files (VIDEO_TS.IFO + VTS_XX_0.IFO).
+    ///
+    /// Cancellation: `halt` is polled before the IFO tree is read, and an IFO
+    /// read that fails with [`Error::Halted`] — how a live drive reports a
+    /// Stop, since `Drive::checked_exec` fails EVERY command once its flag is
+    /// set — is propagated rather than swallowed. Every other IFO failure
+    /// keeps its best-effort `Ok(vec![])`.
+    ///
+    /// It has to be an error and not an empty title list, for the same reason
+    /// spelled out on [`Disc::scan_hddvd_titles`]: a cancelled enumeration
+    /// that returned `Ok` would be indistinguishable from a disc that
+    /// genuinely holds fewer titles. This one was the worst of the three
+    /// enumerators — a bare `Err(_) => return Vec::new()` turned an operator
+    /// Stop into ZERO titles at rc=0, a disc reported as carrying no video at
+    /// all.
     pub(super) fn scan_dvd_titles(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
-    ) -> Vec<DiscTitle> {
+        halt: Option<&crate::halt::Halt>,
+    ) -> Result<Vec<DiscTitle>> {
+        if halt.is_some_and(|h| h.is_cancelled()) {
+            return Err(Error::Halted);
+        }
         let dvd_info = match ifo::parse_vmg(reader, udf_fs) {
             Ok(info) => info,
-            Err(_) => return Vec::new(),
+            Err(Error::Halted) => return Err(Error::Halted),
+            Err(_) => return Ok(Vec::new()),
         };
 
         let mut titles = Vec::new();
@@ -243,7 +262,14 @@ impl Disc {
             }
         }
 
-        titles
+        // Polled again AFTER the loop: a cancel raised during the IFO reads
+        // that `parse_vmg` performs per title set has nothing left to poll,
+        // so without this a partially enumerated disc could still be handed
+        // back as success.
+        if halt.is_some_and(|h| h.is_cancelled()) {
+            return Err(Error::Halted);
+        }
+        Ok(titles)
     }
 }
 
@@ -528,6 +554,118 @@ mod tests {
     // Tests
     // ---------------------------------------------------------------
 
+    /// A `SectorSource` that fails every read at or above `halt_at` with
+    /// [`Error::Halted`] — how a LIVE DRIVE behaves once the operator presses
+    /// Stop: `Drive::checked_exec` fails every SCSI command with `Halted` from
+    /// then on, and `Drive::read` deliberately preserves the variant. Reads
+    /// below the threshold still succeed, so the scan gets far enough to have
+    /// something to truncate.
+    struct HaltingReader<'a> {
+        inner: &'a mut MemDisc,
+        halt_at: u32,
+    }
+    impl SectorSource for HaltingReader<'_> {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if lba >= self.halt_at {
+                return Err(crate::error::Error::Halted);
+            }
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    /// A Stop on a LIVE DRIVE never touches `ScanOptions::halt`: `Drive` has
+    /// its own flag and `checked_exec` fails every SCSI command with
+    /// [`Error::Halted`] once it is set. The DVD enumerator must not swallow
+    /// that into a successful scan.
+    ///
+    /// This was the worst of the three enumerators. RED BEFORE GREEN, two
+    /// distinct swallows, both measured with the fix reverted:
+    ///   * `ifo::parse_vmg` treats a failed title set as a placeholder entry
+    ///     and continues, so a cancel landing on VTS_02's IFO returned
+    ///     `Ok([VTS_01_1.VOB])` — one title from a two-title disc.
+    ///   * `scan_dvd_titles`'s `Err(_) => return Vec::new()` turned a cancel
+    ///     landing on VIDEO_TS.IFO itself into ZERO titles at rc=0 — a disc
+    ///     reported as holding no video at all.
+    ///
+    /// Both are indistinguishable from a real disc, and both are now
+    /// `Err(Error::Halted)`.
+    #[test]
+    fn halted_ifo_read_is_not_reported_as_a_shorter_disc() {
+        // Two title sets: VTS_01's IFO data at PART_START+6000, VTS_02's at
+        // PART_START+7000. Both ICBs sit far below, so the filesystem
+        // metadata resolves and only the second title set's CONTENT is
+        // cancelled — the truncation case.
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(1, 1, 1), (1, 2, 1)]);
+        let vts1 = build_vts(100, 0x00, &[], &[], &[(0, 9)], false);
+        let vts2 = build_vts(200, 0x00, &[], &[], &[(0, 19)], false);
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts1,
+                },
+                FileSpec {
+                    name: "VTS_02_0.IFO".into(),
+                    icb_lba: 64,
+                    data_lba: 7000,
+                    contents: vts2,
+                },
+            ],
+        );
+        // Sanity: both title sets enumerate when nothing is cancelled, so a
+        // short list below can only be the cancel.
+        assert_eq!(
+            Disc::scan_dvd_titles(&mut disc, &udf, None)
+                .expect("scan")
+                .len(),
+            2,
+            "fixture must offer two title sets"
+        );
+
+        let mut reader = HaltingReader {
+            inner: &mut disc,
+            halt_at: PART_START + 7000, // VTS_02_0.IFO's data extent
+        };
+        let res = Disc::scan_dvd_titles(&mut reader, &udf, None);
+        assert!(
+            matches!(res, Err(crate::error::Error::Halted)),
+            "a cancelled title-set read must surface as a cancelled scan, not \
+             as a disc with fewer titles; got {:?}",
+            res.map(|ts| ts.iter().map(|t| t.playlist.clone()).collect::<Vec<_>>())
+        );
+
+        // The same cancel one level up: VIDEO_TS.IFO itself. This is the
+        // `Err(_) => Vec::new()` path — a cancel that used to report a DVD as
+        // carrying no titles whatsoever.
+        let mut reader = HaltingReader {
+            inner: &mut disc,
+            halt_at: PART_START + 5000,
+        };
+        let res = Disc::scan_dvd_titles(&mut reader, &udf, None);
+        assert!(
+            matches!(res, Err(crate::error::Error::Halted)),
+            "a cancelled VMG read must surface as a cancelled scan, not as an \
+             empty disc; got {:?}",
+            res.map(|ts| ts.len())
+        );
+    }
+
     /// scan_dvd_titles returns empty when VIDEO_TS.IFO can't be parsed
     /// (dvd.rs: `parse_vmg(...) Err → return Vec::new()`). Never panics.
     #[test]
@@ -535,7 +673,11 @@ mod tests {
         let mut disc = MemDisc::new();
         // VIDEO_TS exists but VIDEO_TS.IFO is missing.
         let udf = build_video_ts_fs(&mut disc, &[]);
-        assert!(Disc::scan_dvd_titles(&mut disc, &udf).is_empty());
+        assert!(
+            Disc::scan_dvd_titles(&mut disc, &udf, None)
+                .expect("scan")
+                .is_empty()
+        );
     }
 
     /// Single VTS, single title, one cell. Extent absolute LBA =
@@ -571,7 +713,7 @@ mod tests {
                 },
             ],
         );
-        let titles = Disc::scan_dvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(titles.len(), 1);
         let t = &titles[0];
         assert_eq!(t.extents.len(), 1);
@@ -627,7 +769,7 @@ mod tests {
                 },
             ],
         );
-        let titles = Disc::scan_dvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(titles.len(), 1);
         let t = &titles[0];
         assert_eq!(t.extents.len(), 1);
@@ -685,7 +827,7 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
         assert_eq!(t.extents.len(), 1);
         let got = t.extents[0].start_lba;
         // The one correct answer: all three terms summed (9000 + 700 + 33).
@@ -743,7 +885,7 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
         assert_eq!(t.extents.len(), 2);
         assert_eq!(t.extents[0].start_lba, 9500); // ifo_lba(9000) + 500 + 0
         assert_eq!(t.extents[0].sector_count, 100);
@@ -784,7 +926,7 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
         let v = t
             .streams
             .iter()
@@ -839,7 +981,7 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
         let v = t
             .streams
             .iter()
@@ -900,7 +1042,7 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
         let audios: Vec<_> = t
             .streams
             .iter()
@@ -970,7 +1112,7 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
         let audios: Vec<_> = t
             .streams
             .iter()
@@ -1027,7 +1169,7 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
         let subs: Vec<_> = t
             .streams
             .iter()
@@ -1087,7 +1229,7 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
         let sub = t
             .streams
             .iter()
@@ -1141,7 +1283,7 @@ mod tests {
                 },
             ],
         );
-        let titles = Disc::scan_dvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(titles.len(), 2);
         // title_number is a running counter across all title sets.
         assert_eq!(titles[0].playlist_id, 1);
@@ -1178,7 +1320,7 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
         // One program in the program map → one chapter time (0.0 for the
         // first program). Name is the ordinal from chapter_name(0).
         assert_eq!(t.chapters.len(), 1);
@@ -1263,7 +1405,7 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
         // The leading 0x90 cell is dropped: 2 feature extents, not 3.
         assert_eq!(t.extents.len(), 2, "leading angle sub-block cell dropped");
         // First extent starts at the feature cell (vob 1000 + 100), not at 1000+0.
@@ -1315,7 +1457,7 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
         // Nothing dropped: both cells become extents, starting at the very head.
         assert_eq!(t.extents.len(), 2);
         assert_eq!(t.extents[0].start_lba, 9000 + 1000); // ifo_lba + vtstt + 0, head intact
@@ -1358,7 +1500,7 @@ mod tests {
                 },
             ],
         );
-        let titles = Disc::scan_dvd_titles(&mut disc, &udf);
+        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
         let t = &titles[0];
         let audio_pids: Vec<u16> = t
             .streams

@@ -20,40 +20,85 @@ const CLIP_STREAM_EXTS: [&str; 3] = ["m2ts", "fmts", "ssif"];
 
 impl Disc {
     /// Scan Blu-ray titles from MPLS playlists.
+    ///
+    /// Cancellation: `halt` is polled between playlists and once more after
+    /// the loop, and a read that fails with [`Error::Halted`] — how a live
+    /// drive reports a Stop, since `Drive::checked_exec` fails EVERY command
+    /// once its flag is set and `Drive::read` preserves the variant — is
+    /// propagated rather than swallowed. `Halted` is the only error this
+    /// returns from the enumeration itself; an unreadable or unparseable
+    /// playlist keeps its best-effort skip.
+    ///
+    /// It has to be an error and not a short title list, for the same reason
+    /// spelled out on [`Disc::scan_hddvd_titles`]: a cancelled enumeration
+    /// that returned `Ok` would be indistinguishable from a disc that
+    /// genuinely holds fewer titles, and the caller would cache and act on
+    /// it. Before this, a Stop pressed mid-scan failed every REMAINING
+    /// `.mpls` read in turn, each one silently skipped, and the scan returned
+    /// `Ok(truncated)` at rc=0.
     pub(super) fn scan_bluray_titles(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
-    ) -> Vec<DiscTitle> {
+        halt: Option<&crate::halt::Halt>,
+    ) -> Result<Vec<DiscTitle>> {
         let mut titles = Vec::new();
         if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
             for entry in &playlist_dir.entries {
+                if halt.is_some_and(|h| h.is_cancelled()) {
+                    return Err(Error::Halted);
+                }
                 if !entry.is_dir && entry.name.to_lowercase().ends_with(".mpls") {
                     let path = format!("/BDMV/PLAYLIST/{}", entry.name);
-                    if let Ok(mpls_data) = udf_fs.read_file(reader, &path)
-                        && let Some(title) =
-                            Self::parse_playlist(reader, udf_fs, &entry.name, &mpls_data)
+                    let mpls_data = match udf_fs.read_file(reader, &path) {
+                        Ok(data) => data,
+                        // A cancel that lands on the LAST `.mpls` used to end
+                        // the loop with nothing to show for it and still
+                        // return `Ok`, so the truncation was invisible.
+                        Err(Error::Halted) => return Err(Error::Halted),
+                        // Every other read failure keeps the pre-existing
+                        // best-effort skip: one unreadable playlist is not a
+                        // reason to abandon the disc.
+                        Err(_) => continue,
+                    };
+                    if let Some(title) =
+                        Self::parse_playlist(reader, udf_fs, &entry.name, &mpls_data)?
                     {
                         titles.push(title);
                     }
                 }
             }
         }
-        titles
+        // Polled again AFTER the loop: a cancel raised during the final
+        // iteration's reads has nothing left to poll, so without this the
+        // last playlist could still slip a truncated list through as success.
+        if halt.is_some_and(|h| h.is_cancelled()) {
+            return Err(Error::Halted);
+        }
+        Ok(titles)
     }
 
     /// Parse one MPLS playlist into a [`DiscTitle`].
     ///
-    /// Sums PlayItem durations; returns `None` if the playlist is under
-    /// 30 seconds (skips menu / clip-info stub playlists) or fails to
-    /// parse. Physical sector extents are pulled from the UDF allocation
-    /// descriptors of each referenced `.m2ts` (deduplicated by clip_id).
+    /// Sums PlayItem durations; returns `Ok(None)` if the playlist is under
+    /// 30 seconds (skips menu / clip-info stub playlists), fails to
+    /// parse, or names a clip that cannot be resolved. Physical sector
+    /// extents are pulled from the UDF allocation descriptors of each
+    /// referenced `.m2ts` (deduplicated by clip_id).
+    ///
+    /// `Ok(None)` keeps its two benign meanings (unparseable MPLS, sub-30 s
+    /// playlist) plus the deliberate "drop this title" outcomes below. `Err`
+    /// means the SCAN is over: today that is only [`Error::Halted`], the
+    /// operator's Stop, which must not be reported as a disc that simply
+    /// holds fewer titles.
     pub(super) fn parse_playlist(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
         filename: &str,
         data: &[u8],
-    ) -> Option<DiscTitle> {
-        let parsed = mpls::parse(data).ok()?;
+    ) -> Result<Option<DiscTitle>> {
+        let Ok(parsed) = mpls::parse(data) else {
+            return Ok(None);
+        };
 
         // Calculate duration from play items
         let duration_ticks: u64 = parsed
@@ -65,7 +110,7 @@ impl Disc {
 
         // Skip very short playlists (< 30 seconds)
         if duration_secs < 30.0 {
-            return None;
+            return Ok(None);
         }
 
         // Parse each clip for size, duration, and sector extents
@@ -98,130 +143,190 @@ impl Disc {
 
         for play_item in &parsed.play_items {
             let clip_dur = play_item.out_time.saturating_sub(play_item.in_time) as f64 / 45000.0;
-            let mut pkt_count: u32 = 0;
 
             let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
-            if let Ok(clpi_data) = udf_fs.read_file(reader, &clpi_path)
-                && let Ok(clip_info) = clpi::parse(&clpi_data)
+            // A `.clpi` that cannot be read or parsed is NOT a benign miss.
+            // `duration_ticks` was already summed from the PlayItems above, so
+            // the title keeps claiming its full runtime; skipping this block
+            // (what the old `if let Ok(..) && let Ok(..)` did) pushed no
+            // extents and added nothing to `total_size`, so the title shipped
+            // with the clip's bytes silently absent — and, because the `if let`
+            // DISCARDED the error, without a single log line to say so. Same
+            // classification as the extent resolver below: drop the title, and
+            // log the error's OWN code.
+            let clip_info = match udf_fs
+                .read_file(reader, &clpi_path)
+                .and_then(|clpi_data| clpi::parse(&clpi_data))
             {
-                pkt_count = clip_info.source_packet_count;
+                Ok(info) => info,
+                // The operator's Stop, not a disc defect. Every remaining
+                // command fails the same way once the drive's flag is set, so
+                // classifying it as an unresolvable clip would drop each
+                // remaining playlist in turn and hand back a truncated title
+                // list at success.
+                Err(Error::Halted) => return Err(Error::Halted),
+                Err(e) => {
+                    // The REAL code, not a fixed one: a scratched CLIPINF
+                    // sector (DiscRead), a missing `.clpi` (UdfNotFound) and a
+                    // malformed one (ClpiParse) are different populations, and
+                    // flattening them would send anyone triaging the first
+                    // after the third.
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        playlist = ?filename,
+                        clip = ?play_item.clip_id,
+                        "E{}", e.code()
+                    );
+                    return Ok(None);
+                }
+            };
+            let pkt_count: u32 = clip_info.source_packet_count;
 
-                // Mark the clip seen ONLY after its .clpi parses — a transient
-                // read/parse failure on the first PlayItem referencing a clip
-                // must not permanently suppress its extents/size for a later
-                // PlayItem referencing the same clip that succeeds.
-                let first_ref = seen_clips.insert(play_item.clip_id.clone());
+            // The clip is marked seen only after its .clpi parses. That
+            // ordering used to matter because a transient failure on the first
+            // PlayItem referencing a clip must not permanently suppress its
+            // extents/size for a later PlayItem referencing the same clip;
+            // a failure now drops the whole title, so the ordering is kept
+            // simply because it is still the correct place for it.
+            let first_ref = seen_clips.insert(play_item.clip_id.clone());
 
-                // Only fetch/push the physical extents and add to the
-                // total size the first time this clip_id is seen.
-                if first_ref {
-                    total_size += pkt_count as u64 * 192;
+            // Only fetch/push the physical extents and add to the
+            // total size the first time this clip_id is seen.
+            if first_ref {
+                total_size += pkt_count as u64 * 192;
 
-                    // Get stream file extents from UDF allocation descriptors.
-                    // Dual-layer discs split files across layers — UDF knows the real layout.
-                    //
-                    // The clip's stream file is normally `.m2ts`, but AACS 2.1
-                    // (FMTS) discs name the main feature `.fmts` and 3D discs
-                    // use `.ssif` (see [`CLIP_STREAM_EXTS`]). A normal `.m2ts`
-                    // clip is unchanged — the fallback only runs when `.m2ts`
-                    // is absent, which is exactly when `file_extents` errors.
-                    // 3D discs interleave the left (base) and right (MVC
-                    // dependent) views in STREAM/SSIF/<clip>.ssif — note the
-                    // SSIF/ subdir. Prefer it when present: the SSIF is one
-                    // transport stream carrying BOTH eyes on distinct PIDs,
-                    // so muxing it captures the full 3D. 2D clips fall back to
-                    // the base .m2ts / .fmts as before.
-                    let ssif = format!("/BDMV/STREAM/SSIF/{}.ssif", play_item.clip_id);
-                    // A clip stream that carries an unrecorded (never-written)
-                    // extent cannot be turned into a truthful read plan — see
-                    // `UdfFs::file_extents`. Track it separately from an
-                    // ordinary "file absent" error: absence is what the
-                    // extension fallback exists for, whereas a hole means the
-                    // bytes this title needs do not exist on the disc.
-                    //
-                    // ABSENCE is the only benign failure. A missing `.ssif` is
-                    // the ordinary case (every 2D disc), and the extension
-                    // fallback below exists precisely for it. Every OTHER
-                    // error means the bytes this title needs could not be
-                    // resolved: a scratched sector under the clip's ICB
-                    // (DiscRead), an allocation-descriptor chain that never
-                    // terminated (UdfAdChainTooLong), a file whose data is
-                    // embedded rather than extent-mapped (UdfEmbeddedData).
-                    // Those used to fall through to the not-found path, so the
-                    // clip contributed zero extents while `total_size` and the
-                    // play-item timing still counted it — a title advertising
-                    // its full runtime with a piece silently missing, and no
-                    // log line anywhere.
-                    //
-                    // `Halted` is NOT a disc defect and must not be treated as
-                    // one. It is the operator cancelling: once the flag is
-                    // set, EVERY drive command returns it, so classifying it
-                    // here would drop each remaining playlist in turn and hand
-                    // back a truncated title list at success — the same shape
-                    // this refusal exists to prevent, wearing a cancel. This
-                    // function returns Option and has no channel to propagate
-                    // a halt, so the pre-existing behaviour is preserved
-                    // deliberately rather than made worse.
-                    let mut unresolved: Option<u16> = None;
-                    let mut note = |e: &Error| {
-                        if !matches!(e, Error::UdfNotFound { .. } | Error::Halted) {
-                            unresolved.get_or_insert(e.code());
-                        }
-                    };
-                    let file_exts = match udf_fs.file_extents(reader, &ssif) {
-                        Ok(exts) => {
-                            is_3d = true;
-                            Some(exts)
-                        }
-                        Err(e) => {
-                            note(&e);
-                            CLIP_STREAM_EXTS.iter().find_map(|ext| {
-                                let path = format!("/BDMV/STREAM/{}.{}", play_item.clip_id, ext);
-                                match udf_fs.file_extents(reader, &path) {
-                                    Ok(exts) => Some(exts),
-                                    Err(e) => {
-                                        note(&e);
-                                        None
-                                    }
-                                }
-                            })
-                        }
-                    };
-                    // Nothing resolved AND a hole was the reason: drop the
-                    // whole title. Letting the clip contribute no extents
-                    // (the ordinary not-found path) would emit a title whose
-                    // feed is silently missing this clip's runtime while its
-                    // durations, spans and size still count it — data loss
-                    // wearing the shape of a normal rip.
-                    if let (None, Some(code)) = (&file_exts, unresolved) {
-                        // The REAL code, not a fixed one. A scratched sector
-                        // (E6000) and an over-long AD chain (E6016) logged as
-                        // E6017 would send anyone triaging them after authoring
-                        // holes and hide the population that actually exists.
-                        tracing::warn!(
-                            target: "freemkv::disc",
-                            playlist = ?filename,
-                            clip = ?play_item.clip_id,
-                            "E{}", code
-                        );
-                        return None;
+                // Get stream file extents from UDF allocation descriptors.
+                // Dual-layer discs split files across layers — UDF knows the real layout.
+                //
+                // The clip's stream file is normally `.m2ts`, but AACS 2.1
+                // (FMTS) discs name the main feature `.fmts` and 3D discs
+                // use `.ssif` (see [`CLIP_STREAM_EXTS`]). A normal `.m2ts`
+                // clip is unchanged — the fallback only runs when `.m2ts`
+                // is absent, which is exactly when `file_extents` errors.
+                // 3D discs interleave the left (base) and right (MVC
+                // dependent) views in STREAM/SSIF/<clip>.ssif — note the
+                // SSIF/ subdir. Prefer it when present: the SSIF is one
+                // transport stream carrying BOTH eyes on distinct PIDs,
+                // so muxing it captures the full 3D. 2D clips fall back to
+                // the base .m2ts / .fmts as before.
+                let ssif = format!("/BDMV/STREAM/SSIF/{}.ssif", play_item.clip_id);
+                // A clip stream that carries an unrecorded (never-written)
+                // extent cannot be turned into a truthful read plan — see
+                // `UdfFs::file_extents`. Track it separately from an
+                // ordinary "file absent" error: absence is what the
+                // extension fallback exists for, whereas a hole means the
+                // bytes this title needs do not exist on the disc.
+                //
+                // ABSENCE is the only benign failure. A missing `.ssif` is
+                // the ordinary case (every 2D disc), and the extension
+                // fallback below exists precisely for it. Every OTHER
+                // error means the bytes this title needs could not be
+                // resolved: a scratched sector under the clip's ICB
+                // (DiscRead), an allocation-descriptor chain that never
+                // terminated (UdfAdChainTooLong), a file whose data is
+                // embedded rather than extent-mapped (UdfEmbeddedData).
+                // Those used to fall through to the not-found path, so the
+                // clip contributed zero extents while `total_size` and the
+                // play-item timing still counted it — a title advertising
+                // its full runtime with a piece silently missing, and no
+                // log line anywhere.
+                //
+                // `Halted` is NOT a disc defect and must not be treated as
+                // one either. It is the operator cancelling: once the flag is
+                // set, EVERY drive command returns it, so classifying it here
+                // would drop each remaining playlist in turn and hand back a
+                // truncated title list at success — the same shape this
+                // refusal exists to prevent, wearing a cancel. It used to be
+                // merely EXEMPTED (neither classified nor propagated, because
+                // this function returned `Option`); exempting it is no longer
+                // enough now that there is a channel. A cancel landing on
+                // `file_extents` would otherwise return a title with this
+                // clip's bytes silently missing — the flagship defect shape,
+                // wearing a cancel. It is propagated below instead.
+                let mut unresolved: Option<u16> = None;
+                let mut halted = false;
+                let mut note = |e: &Error| {
+                    if matches!(e, Error::Halted) {
+                        halted = true;
+                    } else if !matches!(e, Error::UdfNotFound { .. }) {
+                        unresolved.get_or_insert(e.code());
                     }
-                    if let Some(file_exts) = file_exts {
-                        let span_start = feed_pos;
-                        for (lba, sectors) in file_exts {
-                            if sectors > 0 && lba > 0 {
-                                extents.push(Extent {
-                                    start_lba: lba,
-                                    sector_count: sectors,
-                                });
-                                feed_pos = feed_pos.saturating_add(
-                                    sectors as u64 * crate::consts::SECTOR_BYTES as u64,
-                                );
+                };
+                let file_exts = match udf_fs.file_extents(reader, &ssif) {
+                    Ok(exts) => {
+                        is_3d = true;
+                        Some(exts)
+                    }
+                    Err(e) => {
+                        note(&e);
+                        CLIP_STREAM_EXTS.iter().find_map(|ext| {
+                            let path = format!("/BDMV/STREAM/{}.{}", play_item.clip_id, ext);
+                            match udf_fs.file_extents(reader, &path) {
+                                Ok(exts) => Some(exts),
+                                Err(e) => {
+                                    note(&e);
+                                    None
+                                }
                             }
+                        })
+                    }
+                };
+                // Propagate the cancel BEFORE the classification below: a
+                // halted `file_extents` resolves nothing, so the title would
+                // otherwise be dropped (or, with a partial resolve, emitted
+                // short) and the scan would carry on as if the disc were at
+                // fault.
+                if halted {
+                    return Err(Error::Halted);
+                }
+                // Nothing resolved AND a hole was the reason: drop the
+                // whole title. Letting the clip contribute no extents
+                // (the ordinary not-found path) would emit a title whose
+                // feed is silently missing this clip's runtime while its
+                // durations, spans and size still count it — data loss
+                // wearing the shape of a normal rip.
+                if let (None, Some(code)) = (&file_exts, unresolved) {
+                    // The REAL code, not a fixed one. A scratched sector
+                    // (E6000) and an over-long AD chain (E6016) logged as
+                    // E6017 would send anyone triaging them after authoring
+                    // holes and hide the population that actually exists.
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        playlist = ?filename,
+                        clip = ?play_item.clip_id,
+                        "E{}", code
+                    );
+                    return Ok(None);
+                }
+                // KNOWN GAP, deliberately left open: `file_extents` can also
+                // return `Ok(vec![])`, or a vector every entry of which the
+                // `sectors > 0 && lba > 0` filter below discards (zero-length
+                // placeholder ADs — see `UdfFs::file_extents`). That clip then
+                // contributes no extents and no span while `total_size` and
+                // the play-item timing still count it: the same shape the
+                // refusal above exists to prevent, reached by a different
+                // route. It is NOT closed with a post-loop "every unique
+                // clip_id must appear in `spans`" invariant because it is not
+                // settled that an empty-but-Ok resolve is always a defect
+                // rather than a legitimate healthy-disc state, and dropping
+                // healthy titles is a worse failure than the residual gap.
+                // Recorded here so the next audit finds the decision instead
+                // of re-deriving it.
+                if let Some(file_exts) = file_exts {
+                    let span_start = feed_pos;
+                    for (lba, sectors) in file_exts {
+                        if sectors > 0 && lba > 0 {
+                            extents.push(Extent {
+                                start_lba: lba,
+                                sector_count: sectors,
+                            });
+                            feed_pos = feed_pos.saturating_add(
+                                sectors as u64 * crate::consts::SECTOR_BYTES as u64,
+                            );
                         }
-                        if feed_pos > span_start {
-                            spans.insert(play_item.clip_id.clone(), (span_start, feed_pos));
-                        }
+                    }
+                    if feed_pos > span_start {
+                        spans.insert(play_item.clip_id.clone(), (span_start, feed_pos));
                     }
                 }
             }
@@ -412,7 +517,7 @@ impl Disc {
             .unwrap_or(filename);
         let playlist_id = playlist_num.parse::<u16>().unwrap_or(0);
 
-        Some(DiscTitle {
+        Ok(Some(DiscTitle {
             playlist: filename.to_string(),
             playlist_id,
             duration_secs,
@@ -423,7 +528,7 @@ impl Disc {
             extents,
             content_format: ContentFormat::BdTs,
             codec_privates: Vec::new(),
-        })
+        }))
     }
 
     /// Read disc title from META/DL/bdmt_eng.xml (Blu-ray Disc Meta Table).
@@ -651,12 +756,21 @@ mod tests {
         );
         let udf = make_min_fs(&mut disc);
         assert!(
-            Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).is_none(),
+            Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+                .expect("scan")
+                .is_none(),
             "playlists shorter than 30s must be skipped"
         );
     }
 
     /// At exactly 30 s the playlist is kept (`< 30.0` is strict).
+    ///
+    /// The fixture is a FULLY WIRED BDMV (`make_bdmv_fs`), not the bare
+    /// `make_min_fs` this used to use. `make_min_fs` lays no STREAM/CLIPINF,
+    /// so the play item's `.clpi` read now fails and the title drops — which
+    /// is correct behaviour for an unresolvable clip but has nothing to do
+    /// with the 30-second boundary this test exists to pin. Wiring the clip
+    /// keeps the test measuring exactly one thing.
     #[test]
     fn parse_playlist_keeps_exactly_30_seconds() {
         let mut disc = MemDisc::new();
@@ -670,8 +784,9 @@ mod tests {
             &[],
             &[],
         );
-        let udf = make_min_fs(&mut disc);
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
         let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
             .expect("30s playlist must be kept");
         assert!((t.duration_secs - 30.0).abs() < 1e-6);
     }
@@ -683,7 +798,11 @@ mod tests {
         let mut disc = MemDisc::new();
         let udf = make_min_fs(&mut disc);
         let junk = vec![0u8; 100];
-        assert!(Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &junk).is_none());
+        assert!(
+            Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &junk)
+                .expect("scan")
+                .is_none()
+        );
     }
 
     /// Build a full BDMV tree with one STREAM/.m2ts (Long-AD ICB) and one
@@ -881,7 +1000,9 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         // BD source packet = 192 bytes (188 TS + 4-byte timestamp header).
         assert_eq!(t.size_bytes, 4000 * 192);
         assert_eq!(t.extents.len(), 1, "one m2ts → one extent");
@@ -910,7 +1031,9 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         assert_eq!(t.clips.len(), 1);
         assert!(
             (t.clips[0].duration_secs - 75.0).abs() < 1e-6,
@@ -939,7 +1062,9 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         assert_eq!(t.size_bytes, 4000 * 192, "size from .clpi source packets");
         assert_eq!(
             t.extents.len(),
@@ -978,7 +1103,9 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         // Extent and size counted ONCE despite two PlayItems.
         assert_eq!(
             t.extents.len(),
@@ -1022,19 +1149,33 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         assert_eq!(t.extents.len(), 2);
         assert_eq!(t.extents[0].start_lba, PART_START + 5000);
         assert_eq!(t.extents[1].start_lba, PART_START + 9000);
         assert_eq!(t.size_bytes, (4000 + 2000) * 192);
     }
 
-    /// A clip whose .clpi is missing contributes NO size and NO extent
-    /// (bluray.rs only fetches extents inside the `if let Ok(clpi_data)`
-    /// and `if let Ok(clip_info)` blocks), but the Clip entry is still
-    /// recorded with packet count 0. Never panics on the missing read.
+    /// A clip whose `.clpi` is missing must yield NO TITLE.
+    ///
+    /// This test used to assert the opposite — a title with `size_bytes == 0`
+    /// and empty extents — and its docstring quoted the buggy control flow
+    /// ("bluray.rs only fetches extents inside the `if let Ok(clpi_data)`")
+    /// as if it were the specification. It was blessing the defect: the
+    /// title's `duration_secs` is summed from the PlayItems BEFORE the clip is
+    /// resolved, so the returned title advertised the movie's full runtime
+    /// while carrying none of its bytes, and the discarded error meant not one
+    /// log line said so. That is the flagship failure class of this crate — a
+    /// failure that looks like success — reached through an ordinary missing
+    /// or scratched CLIPINF file.
+    ///
+    /// The correct behaviour is the same as for a clip whose extents cannot be
+    /// resolved (see `parse_playlist_unreadable_clip_icb_yields_no_title`):
+    /// drop the title and log the read's OWN error code.
     #[test]
-    fn parse_playlist_missing_clpi_yields_no_extent_no_size() {
+    fn parse_playlist_missing_clpi_yields_no_title() {
         let mut disc = MemDisc::new();
         // STREAM has the m2ts but CLIPINF is empty for this clip.
         let udf = make_bdmv_fs(&mut disc, &[]); // no clips wired
@@ -1086,11 +1227,14 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00009.mpls", &mpls).expect("title");
-        assert_eq!(t.size_bytes, 0, "no clpi → no size contribution");
-        assert!(t.extents.is_empty(), "no clpi → no extent fetched");
-        assert_eq!(t.clips.len(), 1);
-        assert_eq!(t.clips[0].source_packets, 0);
+        let t = Disc::parse_playlist(&mut disc, &udf, "00009.mpls", &mpls).expect("scan");
+        assert!(
+            t.is_none(),
+            "a clip with no .clpi cannot be sized or resolved, so offering the \
+             title would advertise the full play-item runtime with none of the \
+             clip's bytes behind it; got {:?}",
+            t.map(|t| (t.size_bytes, t.extents))
+        );
     }
 
     /// A clip stream whose ICB declares an UNRECORDED (ECMA-167 4/14.14.1.1
@@ -1192,7 +1336,7 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls);
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("scan");
         assert!(
             t.is_none(),
             "the only clip has no truthful read plan, so offering the title \
@@ -1276,7 +1420,7 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls);
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("scan");
         assert!(
             t.is_none(),
             "a clip whose extents could not be resolved must drop the title, \
@@ -1306,7 +1450,9 @@ mod tests {
             &[se_video(0x1011, 0x24)],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         let videos: Vec<_> = t
             .streams
             .iter()
@@ -1338,7 +1484,9 @@ mod tests {
             &[se_video_hevc(0x1011, 1, 2)],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         let v = t
             .streams
             .iter()
@@ -1367,7 +1515,9 @@ mod tests {
             &[se_video_hevc(0x1011, 2, 1)],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         let v = t
             .streams
             .iter()
@@ -1400,7 +1550,9 @@ mod tests {
             &[se_pg(0x1100, 0x90, b"eng")],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         assert!(
             t.streams.iter().all(|s| !matches!(s, Stream::Audio(_))),
             "PGS in audio slot must NOT become an audio stream"
@@ -1428,7 +1580,9 @@ mod tests {
             &[se_audio(0x1100, 0x81, b"eng")],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         let audios: Vec<_> = t
             .streams
             .iter()
@@ -1463,7 +1617,9 @@ mod tests {
             &[se_audio(0x1a00, 0x83, b"eng")],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         let audios: Vec<_> = t
             .streams
             .iter()
@@ -1494,7 +1650,9 @@ mod tests {
             &[se_pg(0x1200, 0x90, b"fra")],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         let subs: Vec<_> = t
             .streams
             .iter()
@@ -1531,7 +1689,9 @@ mod tests {
             &[se_video(0x1011, 0x1B)],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         let videos: Vec<_> = t
             .streams
             .iter()
@@ -1575,7 +1735,9 @@ mod tests {
             &[se_video(0x1011, 0x1B), se_video(0x1012, 0x1B)],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         let dep_count = t
             .streams
             .iter()
@@ -1629,7 +1791,9 @@ mod tests {
                 }, // reserved → drop
             ],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         assert_eq!(
             t.chapters.len(),
             2,
@@ -1668,7 +1832,9 @@ mod tests {
                 timestamp: pi1_in, // at the very start of PI1
             }],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         assert_eq!(t.chapters.len(), 1);
         // preceding (PI0 = 60s) + within (timestamp - pi1.in_time = 0) = 60s.
         assert!(
@@ -1710,7 +1876,9 @@ mod tests {
                 timestamp: pi1_in + within_ticks,
             }],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         assert_eq!(t.chapters.len(), 1);
         assert!(
             (t.chapters[0].time_secs - 65.0).abs() < 1e-6,
@@ -1740,7 +1908,9 @@ mod tests {
                 timestamp: 0, // before in_time → would be negative
             }],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         assert_eq!(t.chapters.len(), 1);
         assert_eq!(t.chapters[0].time_secs, 0.0);
     }
@@ -1765,7 +1935,9 @@ mod tests {
                 timestamp: 0,
             }],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         assert!(
             t.chapters.is_empty(),
             "out-of-range mark ref must be dropped"
@@ -1793,7 +1965,9 @@ mod tests {
             &[],
         );
         // Uppercase suffix must still parse the numeric stem.
-        let t = Disc::parse_playlist(&mut disc, &udf, "00800.MPLS", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00800.MPLS", &mpls)
+            .expect("scan")
+            .expect("title");
         assert_eq!(t.playlist_id, 800);
         assert_eq!(
             t.playlist, "00800.MPLS",
@@ -1817,7 +1991,9 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "MENU.mpls", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "MENU.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
         assert_eq!(t.playlist_id, 0);
     }
 
@@ -1843,7 +2019,9 @@ mod tests {
         // "00800zzzzz": stripping the last 5 bytes would leave "00800" (a
         // valid u16), but the suffix isn't ".mpls" so nothing may be
         // stripped -- the whole (non-numeric) string must fail to parse.
-        let t = Disc::parse_playlist(&mut disc, &udf, "00800zzzzz", &mpls).expect("title");
+        let t = Disc::parse_playlist(&mut disc, &udf, "00800zzzzz", &mpls)
+            .expect("scan")
+            .expect("title");
         assert_eq!(
             t.playlist_id, 0,
             "a filename not ending in .mpls must not have its last 5 bytes stripped"
@@ -1923,7 +2101,7 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = udf::read_filesystem(&mut disc).expect("fs");
 
-        let titles = Disc::scan_bluray_titles(&mut disc, &udf);
+        let titles = Disc::scan_bluray_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(titles.len(), 1, "only the 2h playlist should survive");
         assert_eq!(titles[0].playlist_id, 800);
     }
@@ -1971,7 +2149,7 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = udf::read_filesystem(&mut disc).expect("fs");
 
-        let titles = Disc::scan_bluray_titles(&mut disc, &udf);
+        let titles = Disc::scan_bluray_titles(&mut disc, &udf, None).expect("scan");
         assert!(
             titles.is_empty(),
             "a PLAYLIST entry not ending in .mpls must be skipped regardless of content"
@@ -1984,7 +2162,216 @@ mod tests {
     fn scan_bluray_titles_no_playlist_dir_is_empty() {
         let mut disc = MemDisc::new();
         let udf = make_min_fs(&mut disc); // BDMV exists, no PLAYLIST
-        assert!(Disc::scan_bluray_titles(&mut disc, &udf).is_empty());
+        assert!(
+            Disc::scan_bluray_titles(&mut disc, &udf, None)
+                .expect("scan")
+                .is_empty()
+        );
+    }
+
+    /// A `SectorSource` that fails every read in `halt_range` with
+    /// [`Error::Halted`] — exactly how a LIVE DRIVE behaves once the operator
+    /// presses Stop: `Drive::checked_exec` fails every SCSI command with
+    /// `Halted` from then on, and `Drive::read` deliberately preserves the
+    /// variant. Reads outside the range still succeed, so a test can aim the
+    /// cancel at ONE structure and leave the scan far enough along to have
+    /// something to truncate.
+    struct HaltingReader<'a> {
+        inner: &'a mut MemDisc,
+        halt_range: std::ops::Range<u32>,
+    }
+    impl SectorSource for HaltingReader<'_> {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> Result<usize> {
+            if self.halt_range.contains(&lba) {
+                return Err(Error::Halted);
+            }
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    /// Lay a BDMV holding TWO 2-hour playlists (00800.mpls at data LBA 30000,
+    /// 00801.mpls at 40000) over one fully wired clip. Both playlists are
+    /// keepable, so a scan that returns fewer than two titles has LOST one.
+    fn two_playlist_bd_fs(disc: &mut MemDisc) -> udf::UdfFs {
+        let long_mpls = || {
+            build_mpls(
+                &[PiSpec {
+                    clip_id: *b"00001",
+                    in_time: 0,
+                    out_time: 7200 * 45000, // 2 h
+                }],
+                (0, 0, 0, 0, 0, 0, 0, 0),
+                &[],
+                &[],
+            )
+        };
+        let stream = DirSpec {
+            name: "STREAM".to_string(),
+            icb_lba: 22,
+            dir_data_lba: 23,
+            files: vec![file("00001.m2ts", 100, 5000, 1000 * 2048, true)],
+            subdirs: vec![],
+        };
+        let clipinf = DirSpec {
+            name: "CLIPINF".to_string(),
+            icb_lba: 24,
+            dir_data_lba: 25,
+            files: vec![file_with("00001.clpi", 102, 8000, build_clpi(4000), false)],
+            subdirs: vec![],
+        };
+        let playlist = DirSpec {
+            name: "PLAYLIST".to_string(),
+            icb_lba: 26,
+            dir_data_lba: 27,
+            files: vec![
+                file_with("00800.mpls", 104, 30000, long_mpls(), false),
+                file_with("00801.mpls", 110, 40000, long_mpls(), false),
+            ],
+            subdirs: vec![],
+        };
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![stream, clipinf, playlist],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        build_udf_skeleton(disc, 10);
+        lay_dir(disc, &root);
+        udf::read_filesystem(disc).expect("fs")
+    }
+
+    /// A Stop on a LIVE DRIVE never touches `ScanOptions::halt`: `Drive` has
+    /// its own flag and `checked_exec` fails every SCSI command with
+    /// [`Error::Halted`] once it is set. The Blu-ray enumerator must not
+    /// swallow that into a successful scan.
+    ///
+    /// RED BEFORE GREEN: with the propagation reverted this returned
+    /// `Ok([00800])` — the `if let Ok(mpls_data)` skipped the cancelled read
+    /// of 00801.mpls, the loop ended, and a HALF-ENUMERATED disc came back at
+    /// success. One title from a two-title disc is indistinguishable from a
+    /// disc that genuinely holds one title, and the caller caches and rips
+    /// from it.
+    ///
+    /// The halt lands on the SECOND playlist deliberately: it is the last
+    /// iteration, so nothing after it would poll a flag — only propagating
+    /// the read's own error catches it.
+    #[test]
+    fn halted_playlist_read_is_not_reported_as_a_shorter_disc() {
+        let mut disc = MemDisc::new();
+        let udf = two_playlist_bd_fs(&mut disc);
+        // Sanity: both playlists enumerate when nothing is cancelled, so a
+        // truncated result below can only be the cancel.
+        assert_eq!(
+            Disc::scan_bluray_titles(&mut disc, &udf, None)
+                .expect("scan")
+                .len(),
+            2,
+            "fixture must offer two keepable playlists"
+        );
+        let mut reader = HaltingReader {
+            inner: &mut disc,
+            halt_range: PART_START + 40000..u32::MAX, // 00801.mpls's data extent
+        };
+        let res = Disc::scan_bluray_titles(&mut reader, &udf, None);
+        assert!(
+            matches!(res, Err(Error::Halted)),
+            "a read cancelled by the drive's own halt flag must surface as a \
+             cancelled scan, not as a shorter title list; got {:?}",
+            res.map(|ts| ts.iter().map(|t| t.playlist.clone()).collect::<Vec<_>>())
+        );
+    }
+
+    /// The same cancel landing on a `.clpi` read must not be classified as an
+    /// unresolvable clip either.
+    ///
+    /// RED BEFORE GREEN: with the `Err(Error::Halted)` arm removed from the
+    /// CLIPINF match, the cancel fell into the generic "clip could not be
+    /// resolved" arm, which logs a disc-defect code and drops the title —
+    /// accounting an operator Stop as a scratched disc, and (in the scan loop)
+    /// dropping every remaining playlist in turn for a truncated `Ok`. With
+    /// the fix the cancel is propagated with its own variant intact.
+    #[test]
+    fn halted_clpi_read_is_not_accounted_as_an_unresolvable_clip() {
+        let mut disc = MemDisc::new();
+        let udf = two_playlist_bd_fs(&mut disc);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 7200 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        // Only the CLIPINF data extent is cancelled; the MPLS bytes are
+        // already in hand and every other structure reads normally.
+        let mut reader = HaltingReader {
+            inner: &mut disc,
+            halt_range: PART_START + 8000..PART_START + 8001,
+        };
+        let res = Disc::parse_playlist(&mut reader, &udf, "00800.mpls", &mpls);
+        assert!(
+            matches!(res, Err(Error::Halted)),
+            "a cancelled .clpi read must propagate, not drop the title as a \
+             disc defect; got {:?}",
+            res.map(|t| t.map(|t| (t.size_bytes, t.extents)))
+        );
+    }
+
+    /// And the same cancel landing on `file_extents` — the clip's ICB, not its
+    /// CLIPINF — must propagate too.
+    ///
+    /// RED BEFORE GREEN: `note` used to EXEMPT `Halted` from the unresolved
+    /// classification (correctly — a cancel is not an authoring hole) but had
+    /// no way to propagate it, so the resolver simply produced no extents and
+    /// `parse_playlist` returned a title with the clip's runtime counted, its
+    /// `size_bytes` counted from the .clpi, and ZERO bytes behind it. Measured
+    /// with the propagation reverted: `Ok(Some((768000, [])))` — the flagship
+    /// defect shape, wearing a cancel.
+    #[test]
+    fn halted_extent_resolve_is_not_a_title_missing_its_clip() {
+        let mut disc = MemDisc::new();
+        let udf = two_playlist_bd_fs(&mut disc);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 7200 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        // ONE sector is cancelled: the .m2ts ICB (metadata LBA 100), which is
+        // precisely and only where `file_extents` looks. The .clpi (ICB 102,
+        // data 8000) still reads, so the clip is sized and the earlier
+        // CLIPINF arm is not the thing under test here.
+        let mut reader = HaltingReader {
+            inner: &mut disc,
+            halt_range: PART_START + 100..PART_START + 101,
+        };
+        let res = Disc::parse_playlist(&mut reader, &udf, "00800.mpls", &mpls);
+        assert!(
+            matches!(res, Err(Error::Halted)),
+            "a cancelled extent resolve must propagate, not yield a title \
+             claiming its full runtime with none of the clip's bytes; got {:?}",
+            res.map(|t| t.map(|t| (t.size_bytes, t.extents)))
+        );
     }
 
     // ---------------------------------------------------------------
