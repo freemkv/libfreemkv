@@ -2482,4 +2482,88 @@ mod tests {
             "the unit belongs to the packet its FIRST byte came from"
         );
     }
+    /// A track that becomes POISONED while an access unit is held open across a
+    /// PES boundary must not emit that access unit when it resumes.
+    ///
+    /// Mutation this catches: deleting (or inverting) the resume-path re-check
+    /// `if drop_reason.is_none() && self.tally.is_poisoned()` at the top of
+    /// `scan_access_units`. The verdict on a held access unit is frozen at the
+    /// moment it was OPENED, and `ac3_drop_reason` reads the tally BEFORE the
+    /// previous access unit is closed — so the very drop that crosses the
+    /// poison threshold lands after the next unit's verdict was already taken
+    /// as `None`. Without the re-check that unit is emitted as an ordinary
+    /// frame after the track has been judged too damaged to mux: corrupt audio
+    /// passed through as success, and worse, it is the ONE frame that escapes
+    /// a whole-track fallback whose entire point is that nothing after the
+    /// verdict ships.
+    ///
+    /// Neither existing held-AU test reaches this: both keep a pristine tally.
+    ///
+    /// The fixture drives the exact interleaving above. `DropTally` poisons
+    /// once `verified_dropped * 2 > kept + dropped` past the 200-AU gate, so
+    /// one PES carries 200 CRC-failing `substreamid`-0 syncframes followed by a
+    /// clean one. Closing corrupt unit #200 (which happens only when the clean
+    /// frame is reached) latches the poison — after that clean frame's own
+    /// verdict was computed. Being an E-AC-3 unit that can still gain
+    /// substreams, it is then HELD across the boundary with `drop_reason:
+    /// None`, which is precisely the state the re-check exists for.
+    #[test]
+    fn a_held_access_unit_is_dropped_when_the_track_poisons_before_it_resumes() {
+        // One more than the verdict gate: the Nth close is what poisons.
+        const CORRUPT_AUS: usize = 200;
+
+        let mut parser = Ac3Parser::new();
+        let mut data = Vec::new();
+        for _ in 0..CORRUPT_AUS {
+            let mut f = eac3_substream_frame(0, 0);
+            // Corrupt a payload byte AFTER the CRC was finalized: the header
+            // (sizing, strmtyp/substreamid, bsid) stays intact so the frame is
+            // still parsed as a whole access unit and fails only the CRC —
+            // a VERIFIED drop, the only kind that feeds the poison verdict.
+            f[100] ^= 0xFF;
+            assert!(!frame_crc_ok(&f), "the fixture frame must fail its CRC");
+            data.extend_from_slice(&f);
+        }
+        // The clean access unit. Last in the PES, so it is held open.
+        let clean = eac3_substream_frame(0, 0);
+        assert!(
+            frame_crc_ok(&clean),
+            "the held unit is individually decodable"
+        );
+        data.extend_from_slice(&clean);
+
+        let emitted = parser.parse(&make_eac3_pes(data));
+        assert!(
+            emitted.is_empty(),
+            "every corrupt unit is dropped and the clean one is held; got {} frame(s)",
+            emitted.len()
+        );
+        // The state the re-check depends on: the track IS poisoned, and the
+        // held unit was opened before that verdict existed.
+        assert!(
+            parser.tally.is_poisoned(),
+            "fixture must actually cross the whole-track poison threshold"
+        );
+
+        // Resume. The next PES opens a new unit, which closes the held one.
+        let out = parser.parse(&make_eac3_pes(eac3_substream_frame(0, 0)));
+        assert!(
+            out.is_empty(),
+            "an access unit held across the boundary must not be emitted once \
+             the track is poisoned; got {} frame(s) totalling {} bytes",
+            out.len(),
+            out.iter().map(|f| f.data.len()).sum::<usize>()
+        );
+        // ...and nothing may leak at end of stream either.
+        let tail = parser.flush();
+        assert!(
+            tail.is_empty(),
+            "a poisoned track emits nothing at EOS; got {} frame(s)",
+            tail.len()
+        );
+        assert!(
+            parser.dropped_frames() > CORRUPT_AUS as u64,
+            "the held unit must be ACCOUNTED as a drop, not silently discarded"
+        );
+    }
 }
