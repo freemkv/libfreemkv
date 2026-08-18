@@ -957,7 +957,31 @@ impl Disc {
                     unusable.insert(name.to_ascii_lowercase());
                 }
                 Err(crate::error::Error::Halted) => return Err(crate::error::Error::Halted),
-                Err(_) => {}
+                // EVERY other failure means the same thing: no truthful read
+                // plan for this clip. A scratched sector under its ICB
+                // (DiscRead), an allocation-descriptor chain that never
+                // terminated (UdfAdChainTooLong), a file whose data is
+                // embedded rather than extent-mapped (UdfEmbeddedData) — all
+                // of them used to land in a bare `Err(_) => {}`: no log, and
+                // the clip NOT marked unusable, so a split feature still
+                // composed from FEATURE_1 alone and presented half a movie as
+                // a whole one. That is the very outcome the arm above was
+                // written to prevent, reachable through every error but one.
+                //
+                // The code logged is the error's own. Reusing 6017 here would
+                // account a scratched disc as an authoring hole.
+                //
+                // (`UdfNotFound` needs no special case: these names came from
+                // `ts_dir.entries`, so the lookup cannot miss.)
+                Err(e) => {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        clip = ?name,
+                        code = e.code(),
+                        "clip extents could not be resolved; dropping every title that names it"
+                    );
+                    unusable.insert(name.to_ascii_lowercase());
+                }
             }
             if !extents.is_empty() {
                 clip_extents.insert(name.to_ascii_lowercase(), (name.clone(), *size, extents));
@@ -2845,6 +2869,90 @@ mod tests {
             titles.len(),
             2,
             "no real .vti present -> no VTI-driven composition, one title per clip"
+        );
+    }
+
+    /// A clip whose extents cannot be resolved must drop the SPLIT FEATURE.
+    ///
+    /// Catches reverting the `Err(e) => { warn; unusable.insert(..) }` arm in
+    /// `Disc::scan_hddvd_titles` back to the bare `Err(_) => {}` it replaced.
+    ///
+    /// RED BEFORE GREEN, and TWO earlier attempts at this test did NOT go red.
+    /// The first asserted "no title names the broken clip" — that passes either
+    /// way, because a clip that resolves to no extents is never inserted into
+    /// `clip_extents` and so yields no per-clip title regardless. The second
+    /// fixed that but shipped no `.vti`: `order` is built solely from
+    /// `parse_vti_clip_order` of the navigation file, so with no `.vti` it is
+    /// EMPTY, `feature` is empty, and no composed title is ever built — the
+    /// assertion held vacuously with the fix reverted. Hence the synthetic
+    /// `HVA00001.VTI` below: it is what makes the composer run at all.
+    ///
+    /// The defect lives one level up from the per-clip titles, in the composed
+    /// feature: `unusable` is what tells the composer that a part is MISSING
+    /// rather than merely absent, and the old bare `Err(_) => {}` populated it
+    /// for nothing but an unrecorded extent. So a scratched sector under
+    /// FEATURE_2's ICB (`Error::DiscRead`) left FEATURE_1 composing a title
+    /// named "FEATURE" by itself — half a movie offered as the whole one.
+    #[test]
+    fn scan_hddvd_titles_drops_a_split_feature_whose_part_cannot_be_read() {
+        let mut disc = MemDisc::new();
+        // The VTI clip table is the ONLY source of authored order, and the
+        // composed feature title exists only for clips it names. Without it
+        // this test cannot distinguish the fix from its absence.
+        let vti_bytes = synthetic_vti(&["FEATURE_1.EVO", "FEATURE_2.EVO"]);
+        let files = vec![
+            file_with("HVA00001.VTI", 90, 20000, vti_bytes, true),
+            file("FEATURE_1.EVO", 100, 5000, 4 * 2048, true),
+            file("FEATURE_2.EVO", 101, 9000, 4 * 2048, true),
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        // Blank FEATURE_2's ICB (laid at PART_START + 101). Its descriptor tag
+        // is then 0, neither 261 nor 266 — what the parser sees when the sector
+        // holding an ICB cannot be read back intact. Deliberately NOT an
+        // unrecorded extent: that class was already handled.
+        disc.put_bytes(PART_START + 101, &[0u8; 2048]);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        assert!(
+            matches!(
+                udf.file_extents(&mut disc, "/HVDVD_TS/FEATURE_2.EVO"),
+                Err(crate::error::Error::DiscRead { .. })
+            ),
+            "fixture must fail with DiscRead, not UdfUnrecordedExtent"
+        );
+        // Guard the guard: if the VTI ever stopped parsing, `order` would be
+        // empty and the assertion below would hold for the wrong reason.
+        assert_eq!(
+            parse_vti_clip_order(&synthetic_vti(&["FEATURE_1.EVO", "FEATURE_2.EVO"])),
+            vec!["FEATURE_1.EVO".to_string(), "FEATURE_2.EVO".to_string()],
+            "fixture VTI must yield both feature parts in authored order"
+        );
+
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
+        // FEATURE_1 alone must not be offered as the feature. It may still
+        // appear as its own standalone clip title — that stands alone and is
+        // honest — but nothing may present it as the composed whole.
+        let composed: Vec<_> = titles
+            .iter()
+            .filter(|t| t.clips.len() > 1 || t.playlist.eq_ignore_ascii_case("FEATURE"))
+            .map(|t| &t.playlist)
+            .collect();
+        assert!(
+            composed.is_empty(),
+            "a split feature missing one part must not compose; got {composed:?}"
         );
     }
 

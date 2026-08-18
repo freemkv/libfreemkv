@@ -1890,6 +1890,117 @@ mod tests {
         );
     }
 
+    /// The resume cursor is a BUFFER offset, so it must be rebased when the
+    /// buffer drains — and this is the only test in which a drain actually
+    /// happens while a cursor is live.
+    ///
+    /// Mutations this catches, both halves of
+    /// `self.pending_scan.map(|(pes_at, searched_to)| (pes_at - pos, searched_to - pos))`
+    /// in `extract_packets`:
+    ///   * `searched_to - pos` -> `searched_to`: the next call resumes `pos`
+    ///     bytes PAST where the previous scan actually stopped, so that window
+    ///     is never examined. Here the terminating pack header lands inside it
+    ///     and is missed outright — the unbounded PES runs on past its real
+    ///     end, swallowing the following unit. That is a CORRECTNESS failure,
+    ///     not a slow path, and the assertion on the emitted packet catches it.
+    ///   * `pes_at - pos` -> `pes_at`: the stale offset no longer equals the
+    ///     PES's post-drain `sc`, the resume arm stops matching and the search
+    ///     restarts at the PES header. Caught by `boundary_bytes_scanned`,
+    ///     which is why the fixture puts 64 KiB of payload in the SAME chunk
+    ///     that opens the PES: that is exactly the span a restart re-examines,
+    ///     so the mutant roughly doubles the bytes scanned.
+    ///
+    /// `an_unterminated_pes_is_not_rescanned_from_its_header_every_feed` cannot
+    /// reach either: it opens the unbounded PES as the very FIRST bytes of the
+    /// very first feed, so nothing ever drains ahead of it, `pos` stays 0 and
+    /// the subtraction is a no-op. The comment above it asserts neither
+    /// component can underflow; nothing exercised the arithmetic at all.
+    ///
+    /// So this fixture puts COMPLETE PS units — a pack header and a
+    /// length-bounded PES — ahead of the unbounded video PES *in the same
+    /// chunk*. The loop consumes them, breaks on the unbounded PES, and drains
+    /// `pos` bytes with `pending_scan` live: exactly the real DVD shape, where
+    /// a video PES opens partway through a read batch.
+    #[test]
+    fn a_resume_cursor_survives_the_drain_of_units_ahead_of_the_unbounded_pes() {
+        // Payload fed in the SAME chunk that opens the PES. Large enough that
+        // re-scanning it is unmistakable in `boundary_bytes_scanned`, and it is
+        // the exact span the un-rebased `pes_at` mutant re-examines.
+        const PAYLOAD: usize = 64 * 1024;
+
+        // A 14-byte MPEG-2 pack header with pack_stuffing_length 0.
+        const PACK: [u8; 14] = [
+            0x00,
+            0x00,
+            0x01,
+            PACK_HEADER_ID,
+            0x44,
+            0x00,
+            0x04,
+            0x00,
+            0x04,
+            0x01,
+            0x00,
+            0x00,
+            0x03,
+            0xF8,
+        ];
+        // A length-BOUNDED PES — a complete unit, so the loop consumes it and
+        // `pos` advances past it before breaking on the unbounded PES.
+        const BOUNDED_PES: [u8; 11] = [
+            0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0xAA, 0xBB,
+        ];
+        // The unbounded (length-0) video PES whose scan must be resumed.
+        const OPEN_PES: [u8; 9] = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        // Bytes drained ahead of the unbounded PES on the first feed — the
+        // `pos` the cursor must be rebased by.
+        const DRAINED: usize = PACK.len() + BOUNDED_PES.len();
+
+        let mut demuxer = PsDemuxer::new();
+        let mut first = PACK.to_vec();
+        first.extend_from_slice(&BOUNDED_PES);
+        first.extend_from_slice(&OPEN_PES);
+        first.extend_from_slice(&[0xFFu8; PAYLOAD]);
+        let head = demuxer.feed(&first);
+        assert_eq!(
+            head.len(),
+            1,
+            "the bounded PES ahead of the open one is emitted immediately, \
+             which is what makes the buffer drain with a cursor live"
+        );
+
+        // The terminating pack arrives at the head of the next feed — i.e.
+        // within `DRAINED` bytes of where the previous scan stopped, which is
+        // precisely the window an un-rebased `searched_to` skips over.
+        assert!(
+            PACK.len() <= DRAINED,
+            "the terminating pack must fit inside the window a stale \
+             `searched_to` would skip, or the mutant survives"
+        );
+        let packets = demuxer.feed(&PACK);
+        assert_eq!(
+            packets.len(),
+            1,
+            "the pack header terminates the open PES; a scan resumed past it \
+             never sees it and the PES runs on"
+        );
+        assert_eq!(
+            packets[0].data.len(),
+            PAYLOAD,
+            "exactly the payload fed belongs to the PES"
+        );
+
+        // Work bound: the payload is proved boundary-free ONCE. Re-scanning it
+        // after the drain roughly doubles this.
+        assert!(
+            demuxer.boundary_bytes_scanned <= (PAYLOAD + 1024) as u64,
+            "boundary search examined {} bytes over {PAYLOAD} bytes of payload — \
+             a cursor left un-rebased across the drain never matches the PES's \
+             new offset, so the scan restarts at the header",
+            demuxer.boundary_bytes_scanned
+        );
+    }
+
     /// The boundary-ID check is a 4-way `||`; a mutant that turns the FIRST
     /// `||` into `&&` makes a lone pack-header start code (which can never
     /// also equal `SYSTEM_HEADER_ID`) fail to register as a boundary at all.

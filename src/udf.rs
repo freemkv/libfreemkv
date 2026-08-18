@@ -106,7 +106,12 @@ pub struct IcbExtent {
 /// file wrote, so a caller must emit `len` zeros for it rather than read those
 /// sectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AbsExtent {
+/// `pub(crate)`: reachable only through `extents_abs_at`, which is itself
+/// internal. The crate's public surface is Drive / Disc / ScanOptions /
+/// input() / output() / numeric errors, and leaking this type would make any
+/// future reshape of its fields a breaking change for consumers that never
+/// needed it.
+pub(crate) struct AbsExtent {
     /// Absolute disc LBA of the extent.
     pub lba: u32,
     /// Declared length of the extent in bytes.
@@ -616,14 +621,38 @@ impl UdfFs {
         // every multi-extent title at its first extent (~973 MB-1 GiB).
         let icb_flags = u16::from_le_bytes([icb[34], icb[35]]);
         let ad_type = (icb_flags & 0x07) as usize;
+        // Type 3 is EMBEDDED data: the descriptor field holds the file's own
+        // content, not allocation descriptors. Reading it as a run of
+        // (length, LBA) pairs manufactures extents out of arbitrary file
+        // bytes and sends the reader to unrelated sectors, which a rip then
+        // emits as this title's stream at rc=0. `read_directory` refuses
+        // exactly this shape a few hundred lines below; this is the file half
+        // of that same decision, and it must be an ERROR rather than an empty
+        // list — an empty list reaches the caller as a clip that contributed
+        // nothing while its declared duration and size still count it, which
+        // is the silent loss pointed the other way.
+        //
+        // A real disc CAN store a file this way, but only a tiny one: an ICB
+        // caps embedded content at well under 2 KiB, and the callers that
+        // expect such a file (the AACS `*.inf` key files) read it through
+        // `read_inline_data` before any extent is requested. No .m2ts, .ssif
+        // or .evo can physically fit, so no retail stream file reaches here.
+        if ad_type == 3 {
+            // ...except a zero-length file, which is legally encodable as
+            // embedded-with-nothing-embedded. It has no extents and no
+            // content, so it is not a failure — and returning the empty list
+            // matches what a zero-length file already produces today.
+            if l_ad == 0 {
+                return Ok(Vec::new());
+            }
+            return Err(Error::UdfEmbeddedData);
+        }
         let ad_size: usize = match ad_type {
             0 => 8,  // Short AD
             1 => 16, // Long AD
             2 => 20, // Extended AD
-            // 3 = inline/embedded data (no out-of-line extents) — never
-            // used for large stream files. Anything else is unexpected;
-            // fall back to the historical 8-byte stride rather than fail
-            // the whole title.
+            // Anything else is reserved by 4/14.6.8; fall back to the
+            // historical 8-byte stride rather than fail the whole title.
             _ => 8,
         };
 
@@ -797,7 +826,10 @@ impl UdfFs {
     /// reads sectors the file never wrote and ships whatever the media holds
     /// there. `read_file_limited` emits zeros for such an extent; every
     /// consumer of this list has to be able to do the same.
-    pub fn extents_abs_at(
+    /// `pub(crate)`: returns `AbsExtent`, which is internal — a public fn
+    /// handing back a crate-private type would not compile, and neither is
+    /// part of the crate's published surface.
+    pub(crate) fn extents_abs_at(
         &self,
         reader: &mut dyn SectorSource,
         meta_lba: u32,
@@ -915,7 +947,12 @@ impl UdfFs {
     /// path treats the returned sectors as stream bytes. Anything that will
     /// read them must call [`file_extents`](Self::file_extents), which refuses
     /// the file instead.
-    pub fn file_extents_addressing(
+    /// `pub(crate)`: this returns unrecorded (never-written) extents
+    /// UNFLAGGED, in a shape identical to `file_extents`'s safe return. An
+    /// external consumer reaching for the more general-sounding name would
+    /// silently obtain a read plan over a hole. The doc below says so, but a
+    /// doc comment is not a guard — scoping makes the misuse a compile error.
+    pub(crate) fn file_extents_addressing(
         &self,
         reader: &mut dyn SectorSource,
         path: &str,
@@ -2849,6 +2886,52 @@ mod tests {
                     recorded: true
                 },
             ]
+        );
+    }
+
+    /// AD type 3 is EMBEDDED data, not a descriptor list.
+    ///
+    /// RED BEFORE GREEN: with the old `_ => 8` fallback this returned
+    /// `Ok([IcbExtent { lba: 999, len: 2048 }])` — an extent decoded out of
+    /// the file's own CONTENT bytes. A rip would then read sector 999, which
+    /// holds something else entirely, and emit it as this title's stream at
+    /// rc=0. That is the failure this refusal exists to prevent, so the
+    /// fixture deliberately makes the content decode as a PLAUSIBLE extent
+    /// rather than as garbage: garbage would have been caught by the
+    /// terminator check anyway, and would prove nothing.
+    #[test]
+    fn icb_extents_embedded_data_is_refused_not_decoded_as_descriptors() {
+        let mut icb = build_efe(2048, &[(0, 2048, 999)]);
+        // ICB Tag flags at abs offset 34: low 3 bits = 3 (embedded).
+        icb[34..36].copy_from_slice(&3u16.to_le_bytes());
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        let fs = fs_with(0, 0, file_entry("EMB", 5, 2048));
+        let err = fs
+            .read_icb_extents(&mut reader, 5)
+            .expect_err("an embedded ICB has no extents to hand out");
+        assert!(
+            matches!(err, Error::UdfEmbeddedData),
+            "expected UdfEmbeddedData, got {err:?}"
+        );
+        assert_eq!(err.code(), crate::error::E_UDF_EMBEDDED_DATA);
+    }
+
+    /// ...but a ZERO-LENGTH file may legally be encoded as embedded-with-
+    /// nothing-embedded. It has no content and no extents, so it is not a
+    /// failure — refusing it would fail a rip over a legal empty file.
+    #[test]
+    fn icb_extents_embedded_but_empty_is_not_an_error() {
+        let mut icb = build_efe(0, &[]);
+        icb[34..36].copy_from_slice(&3u16.to_le_bytes());
+        icb[212..216].copy_from_slice(&0u32.to_le_bytes()); // l_ad = 0
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        let fs = fs_with(0, 0, file_entry("EMPTY", 5, 0));
+        assert_eq!(
+            fs.read_icb_extents(&mut reader, 5)
+                .expect("legal empty file"),
+            vec![]
         );
     }
 

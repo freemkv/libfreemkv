@@ -138,21 +138,49 @@ impl Disc {
                     // ordinary "file absent" error: absence is what the
                     // extension fallback exists for, whereas a hole means the
                     // bytes this title needs do not exist on the disc.
-                    let mut unrecorded = false;
+                    //
+                    // ABSENCE is the only benign failure. A missing `.ssif` is
+                    // the ordinary case (every 2D disc), and the extension
+                    // fallback below exists precisely for it. Every OTHER
+                    // error means the bytes this title needs could not be
+                    // resolved: a scratched sector under the clip's ICB
+                    // (DiscRead), an allocation-descriptor chain that never
+                    // terminated (UdfAdChainTooLong), a file whose data is
+                    // embedded rather than extent-mapped (UdfEmbeddedData).
+                    // Those used to fall through to the not-found path, so the
+                    // clip contributed zero extents while `total_size` and the
+                    // play-item timing still counted it — a title advertising
+                    // its full runtime with a piece silently missing, and no
+                    // log line anywhere.
+                    //
+                    // `Halted` is NOT a disc defect and must not be treated as
+                    // one. It is the operator cancelling: once the flag is
+                    // set, EVERY drive command returns it, so classifying it
+                    // here would drop each remaining playlist in turn and hand
+                    // back a truncated title list at success — the same shape
+                    // this refusal exists to prevent, wearing a cancel. This
+                    // function returns Option and has no channel to propagate
+                    // a halt, so the pre-existing behaviour is preserved
+                    // deliberately rather than made worse.
+                    let mut unresolved: Option<u16> = None;
+                    let mut note = |e: &Error| {
+                        if !matches!(e, Error::UdfNotFound { .. } | Error::Halted) {
+                            unresolved.get_or_insert(e.code());
+                        }
+                    };
                     let file_exts = match udf_fs.file_extents(reader, &ssif) {
                         Ok(exts) => {
                             is_3d = true;
                             Some(exts)
                         }
                         Err(e) => {
-                            unrecorded |= matches!(e, Error::UdfUnrecordedExtent { .. });
+                            note(&e);
                             CLIP_STREAM_EXTS.iter().find_map(|ext| {
                                 let path = format!("/BDMV/STREAM/{}.{}", play_item.clip_id, ext);
                                 match udf_fs.file_extents(reader, &path) {
                                     Ok(exts) => Some(exts),
                                     Err(e) => {
-                                        unrecorded |=
-                                            matches!(e, Error::UdfUnrecordedExtent { .. });
+                                        note(&e);
                                         None
                                     }
                                 }
@@ -165,12 +193,16 @@ impl Disc {
                     // feed is silently missing this clip's runtime while its
                     // durations, spans and size still count it — data loss
                     // wearing the shape of a normal rip.
-                    if file_exts.is_none() && unrecorded {
+                    if let (None, Some(code)) = (&file_exts, unresolved) {
+                        // The REAL code, not a fixed one. A scratched sector
+                        // (E6000) and an over-long AD chain (E6016) logged as
+                        // E6017 would send anyone triaging them after authoring
+                        // holes and hide the population that actually exists.
                         tracing::warn!(
                             target: "freemkv::disc",
                             playlist = ?filename,
                             clip = ?play_item.clip_id,
-                            "E{}", crate::error::E_UDF_UNRECORDED_EXTENT
+                            "E{}", code
                         );
                         return None;
                     }
@@ -1166,6 +1198,91 @@ mod tests {
             "the only clip has no truthful read plan, so offering the title \
              would mean ripping undefined sectors as content; got {:?}",
             t.map(|t| t.extents)
+        );
+    }
+
+    /// An unrecorded extent was never the only way a clip fails to resolve.
+    ///
+    /// RED BEFORE GREEN: this fixture gives the .m2ts an ICB whose descriptor
+    /// tag is neither 261 nor 266, so `file_extents` returns `DiscRead` — the
+    /// same variant a SCRATCHED SECTOR under a real clip's ICB produces, which
+    /// is the ordinary way this happens on real media. Before the fix only
+    /// `UdfUnrecordedExtent` set the drop flag, so this fell through to the
+    /// "file absent" path and `parse_playlist` returned a title: full declared
+    /// duration from the play item, `total_size` already counted from the
+    /// .clpi, and ZERO extents — a movie advertising its runtime with the
+    /// content missing, and not one log line. The clip must drop the title
+    /// exactly as an unrecorded extent does.
+    #[test]
+    fn parse_playlist_unreadable_clip_icb_yields_no_title() {
+        let mut disc = MemDisc::new();
+        let udf = {
+            let bdmv = DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![
+                    DirSpec {
+                        name: "STREAM".to_string(),
+                        icb_lba: 22,
+                        dir_data_lba: 23,
+                        files: vec![file("00001.m2ts", 100, 5000, 4096, false)],
+                        subdirs: vec![],
+                    },
+                    DirSpec {
+                        name: "CLIPINF".to_string(),
+                        icb_lba: 24,
+                        dir_data_lba: 25,
+                        files: vec![file_with("00001.clpi", 102, 8000, build_clpi(4000), false)],
+                        subdirs: vec![],
+                    },
+                ],
+            };
+            let root = DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: Vec::new(),
+                subdirs: vec![bdmv],
+            };
+            build_udf_skeleton(&mut disc, 10);
+            lay_dir(&mut disc, &root);
+            // Corrupt ONLY the descriptor tag, leaving a structurally valid
+            // ICB behind it. That is what an unreadable/garbled sector looks
+            // like to the parser, and it is deliberately NOT an unrecorded
+            // extent — the point is the error class the old code ignored.
+            let mut icb = build_file_icb(4096, 5000, false);
+            icb[0..2].copy_from_slice(&999u16.to_le_bytes());
+            disc.put_bytes(PART_START + 100, &icb);
+            udf::read_filesystem(&mut disc).expect("fs")
+        };
+        // The fixture must really produce a non-unrecorded error, or the
+        // behaviour under test is never reached.
+        assert!(
+            matches!(
+                udf.file_extents(&mut disc, "/BDMV/STREAM/00001.m2ts"),
+                Err(Error::DiscRead { .. })
+            ),
+            "fixture must fail with DiscRead, not UdfUnrecordedExtent"
+        );
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls);
+        assert!(
+            t.is_none(),
+            "a clip whose extents could not be resolved must drop the title, \
+             not yield one that counts the clip's runtime and ships none of \
+             its bytes; got {:?}",
+            t.map(|t| (t.size_bytes, t.extents))
         );
     }
 
