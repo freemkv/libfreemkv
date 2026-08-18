@@ -66,6 +66,7 @@ pub const E_UDF_NOT_FILESYSTEM: u16 = 6013;
 pub const E_IMAGE_TRUNCATED: u16 = 6015;
 pub const E_UDF_AD_CHAIN_TOO_LONG: u16 = 6016;
 pub const E_UDF_UNRECORDED_EXTENT: u16 = 6017;
+pub const E_UDF_EMBEDDED_DATA: u16 = 6018;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -430,6 +431,22 @@ pub enum Error {
     /// the declared size and report a mostly-empty file as a complete
     /// extraction, so the read fails instead.
     UdfAdChainTooLong,
+    /// A file's ICB declares its data EMBEDDED inline (ECMA-167 4/14.6.8
+    /// allocation-descriptor type 3), so it has no out-of-line extents at all.
+    ///
+    /// Returned only when a caller asked for a read plan over such a file.
+    /// The bytes in the allocation-descriptor field are then the file's own
+    /// CONTENT, not descriptors, so decoding them as (length, LBA) pairs
+    /// manufactures extents out of arbitrary data and points the reader at
+    /// unrelated sectors — a rip that completes at rc=0 carrying whatever
+    /// happened to be there. `read_directory` already refuses the same shape
+    /// for directories; this is the file half of that decision.
+    ///
+    /// A file that legitimately stores its data this way is tiny (an ICB caps
+    /// it at well under 2 KiB — the AACS `*.inf` key files are the usual
+    /// case), and the callers that expect one read it via `read_inline_data`
+    /// long before extents are ever requested. A stream file cannot be one.
+    UdfEmbeddedData,
     DiscTitleRange {
         index: usize,
         count: usize,
@@ -898,6 +915,7 @@ impl Error {
             Error::UdfNotFilesystem => E_UDF_NOT_FILESYSTEM,
             Error::UdfBufferTooSmall => E_UDF_BUFFER_TOO_SMALL,
             Error::UdfAdChainTooLong => E_UDF_AD_CHAIN_TOO_LONG,
+            Error::UdfEmbeddedData => E_UDF_EMBEDDED_DATA,
             Error::DiscTitleRange { .. } => E_DISC_TITLE_RANGE,
             Error::ShortImageRead { .. } => E_SHORT_IMAGE_READ,
             Error::EmptyImage => E_EMPTY_IMAGE,
@@ -1918,6 +1936,13 @@ mod tests {
             E_IMAGE_TRUNCATED,
             E_UDF_BUFFER_TOO_SMALL,
             E_UDF_NOT_FILESYSTEM,
+            // These four were absent, so the "every published code is unique"
+            // claim above did not actually cover them: a new variant reusing
+            // 6014, 6016 or 6017 would have passed this test.
+            E_SELECTION_PID_UNKNOWN,
+            E_UDF_AD_CHAIN_TOO_LONG,
+            E_UDF_UNRECORDED_EXTENT,
+            E_UDF_EMBEDDED_DATA,
             E_AACS_NO_KEYS,
             E_AACS_CERT_SHORT,
             E_AACS_AGID_ALLOC,
