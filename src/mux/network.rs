@@ -627,16 +627,36 @@ mod tests {
     /// accept_from() must reject a connection whose first bytes are NOT the
     /// FMKV magic — there is no metadata to drive muxing, so it surfaces
     /// NoMetadata rather than proceeding with an empty/garbage title.
+    ///
+    /// FLAKE FIXED, not the behaviour under test: this used to
+    /// `shutdown(Shutdown::Both)` the instant the bytes were written. Closing
+    /// the READ half while the server had not yet read makes the kernel answer
+    /// the server's in-flight data with an RST, so `accept_from` came back
+    /// `ConnectionReset` instead of the `InvalidInput` this asserts — rarely
+    /// when run alone, reproducibly under the loaded concurrent suite, where
+    /// the server thread is descheduled long enough for the race to open. A
+    /// logging/protocol assertion that fails at random teaches the next person
+    /// to re-run until green, which is how a real regression gets waved
+    /// through.
+    ///
+    /// Half-closing (`Shutdown::Write`) delivers the same EOF the test needs
+    /// while leaving the read half open, and blocking on a read until the
+    /// server drops its end keeps the socket alive for as long as the server
+    /// is looking at it. The port was already ephemeral (`:0`), so it was
+    /// never a port collision.
     #[test]
     fn accept_from_rejects_stream_without_fmkv_header() {
+        use std::io::Read as _;
         use std::io::Write as _;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
-            // Raw non-FMKV bytes (not starting with 'F') then close.
+            // Raw non-FMKV bytes (not starting with 'F') then EOF.
             let mut s = TcpStream::connect(addr).unwrap();
             s.write_all(&[0x47u8; 64]).unwrap(); // TS sync bytes, no FMKV magic
-            s.shutdown(std::net::Shutdown::Both).unwrap();
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            // Park until the server closes, so no RST can overtake the data.
+            let _ = s.read(&mut [0u8; 1]);
         });
         let err = match NetworkStream::accept_from(listener) {
             Ok(_) => panic!("missing FMKV header must error, not silently accept"),

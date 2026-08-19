@@ -129,6 +129,8 @@ pub mod progress;
 pub mod scsi;
 pub mod sector;
 pub mod session;
+#[cfg(test)]
+pub(crate) mod testlog;
 pub(crate) mod udf;
 pub(crate) mod unlock_bridge;
 
