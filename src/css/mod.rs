@@ -146,14 +146,7 @@ pub fn crack_key_outcome(
 /// ("reading is reading"). CSS keys are per-VTS and crackable from the scrambled
 /// data itself, so a `None`/MPEG-PS title cracks its own key here, in playback
 /// order over `extents`. Everything else is left untouched:
-/// - a disc format that cannot carry CSS (`!disc_format.may_have_css()`, i.e.
-///   HD-DVD and the BD families) — no CSS exists there to crack. This is the
-///   DISC-FORMAT axis and it is separate from `format`, the container: HD-DVD
-///   `.evo` is MPEG-PS exactly like DVD `.vob`, so the container alone cannot
-///   tell them apart. `DiscFormat::Unknown` counts as "may have CSS" — see
-///   [`crate::disc::DiscFormat::may_have_css`] for why the safe default is to
-///   crack.
-/// - AACS keys (an encrypted HD-DVD `.evo` also arrives as `Aacs`) — no CSS.
+/// - AACS keys (HD-DVD `.evo` is also MPEG-PS but arrives as `Aacs`) — no CSS.
 /// - a title that already carries a key — nothing to resolve.
 /// - a genuinely clear DVD (no scrambled sector) — stays `None`, a mux no-op.
 ///
@@ -164,18 +157,12 @@ pub fn crack_key_outcome(
 /// yield its key, so an all-titles rip skips this title and finishes the rest.
 /// The whole-disc failure is [`crate::error::Error::CssNoDiscKey`], raised by
 /// `Disc::ensure_decryptable_keys` from the scan's `css_error`.
-// Eight reader/extent/key/format/mode params is inherent to a shared step that
-// must be callable identically from both read paths; the two format params are
-// the whole point of this function's contract (container vs disc family) and
-// bundling them into a struct would only move the same fields around.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_dvd_title_key(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
     keys: &mut crate::decrypt::DecryptKeys,
     batch_sectors: u16,
     format: crate::disc::ContentFormat,
-    disc_format: crate::disc::DiscFormat,
     raw: bool,
     halt: Option<&crate::halt::Halt>,
 ) -> std::io::Result<()> {
@@ -186,23 +173,8 @@ pub(crate) fn resolve_dvd_title_key(
     if raw {
         return Ok(());
     }
-    // The crack is gated on TWO axes, and both are load-bearing:
-    //   * `format == MpegPs` — the CONTAINER, i.e. "CSS descrambles 2048-byte
-    //     program-stream sectors, not BD transport packets";
-    //   * `disc_format.may_have_css()` — the DISC FORMAT, i.e. "this family can
-    //     carry CSS at all".
-    // Keying on the container ALONE was the defect: `ContentFormat::MpegPs`
-    // covers HD-DVD `.evo` as well as DVD `.vob` (both arms of the tree
-    // dispatch in `Disc::scan_with` set it), and HD-DVD is AACS — it has no CSS
-    // to find. Every HD-DVD title therefore paid a 50_000-sector crack scan
-    // that could not succeed, and a scan that came back `ScrambledUncracked`
-    // hard-failed a good disc with `CssKeyMissing` (E7023). `may_have_css` is
-    // deliberately false ONLY for the families proven CSS-free, so `Unknown`
-    // still cracks: skipping the crack on a real DVD would mux ciphertext as
-    // plaintext at exit 0, which is far worse than a wasted scan.
     if matches!(keys, crate::decrypt::DecryptKeys::None)
         && format == crate::disc::ContentFormat::MpegPs
-        && disc_format.may_have_css()
     {
         // `halt` threads the caller's cancellation token so /api/stop can
         // interrupt a long crack scan (the old scan-time crack honored it too).
@@ -227,19 +199,6 @@ pub(crate) fn resolve_dvd_title_key(
             }
             CrackOutcome::Unencrypted => {}
         }
-    } else if matches!(keys, crate::decrypt::DecryptKeys::None)
-        && format == crate::disc::ContentFormat::MpegPs
-    {
-        // The skip is the interesting event, so it must not be silent: an
-        // MPEG-PS title with no key that does NOT get cracked is precisely the
-        // shape of the catastrophic bug (scrambled passthrough), so the log
-        // records WHICH disc format bought the skip. On an HD-DVD this line is
-        // the proof the 50_000-sector scan was avoided on purpose.
-        tracing::debug!(
-            target: "mux",
-            disc_format = ?disc_format,
-            "css crack skipped: disc format cannot carry CSS"
-        );
     }
     Ok(())
 }
@@ -590,6 +549,35 @@ pub(crate) const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
 /// scrambled feature is made of valid PS packs, so its scrambled sectors still
 /// pass this check and still drive `ScrambledUncracked` when no key cracks.
 ///
+/// The pack-start check alone is not enough, and the sector's PES `stream_id`
+/// (offset 0x11, the byte after the 14-byte pack header's `00 00 01` PES
+/// prefix) is the second load-bearing gate. CSS scrambles ONLY elementary
+/// streams — video (`0xE0..=0xEF`) and private_stream_1 audio/subpicture
+/// (`0xBD`) — and it never touches the clear header, so byte 0x11 is the TRUE
+/// stream_id even on a scrambled sector. The MPEG-PS structural packets that
+/// are never CSS-scrambled — system_header (`0xBB`), padding (`0xBE`) and
+/// private_stream_2 (`0xBF`, DVD PCI/DSI navigation) — must be excluded,
+/// because on those the byte at 0x14 is NOT a PES scrambling-control field but
+/// raw payload/structure whose bits 4-5 land set by chance.
+///
+/// This is the DETECTION defect a decrypted HD-DVD tripped: an HD-DVD `.evo` is
+/// MPEG-PS exactly like a DVD `.vob`, and its RDI navigation packs are
+/// private_stream_2 (`0xBF`) whose payload byte at 0x14 routinely has bits 4-5
+/// set. With no `0x11` gate those nav packs flipped the crack scan's
+/// `saw_scrambled` flag on a disc that carries no CSS at all; the crack then
+/// found no key (there is none) and the scan returned `ScrambledUncracked`,
+/// hard-failing a perfectly good HD-DVD with `CssKeyMissing` — E7023. Excluding
+/// `0xBB/0xBE/0xBF` at 0x11 makes the evidence gate match what the crack itself
+/// can act on (the Stevenson attack only recovers a key from a scrambled ES
+/// pack), so a decrypted HD-DVD now scans to `Unencrypted` and muxes cleanly.
+///
+/// This does NOT weaken the genuine "encrypted but uncrackable" hard-fail on a
+/// real DVD: a scrambled DVD feature is made of video (`0xE0..`) and
+/// private_stream_1 (`0xBD`) packs, none of which are excluded, so its
+/// scrambled sectors still set `saw_scrambled` and still drive
+/// `ScrambledUncracked` when no key cracks. Byte 0x11 is in the clear header,
+/// so a scrambled DVD pack can never masquerade as `0xBB/0xBE/0xBF`.
+///
 /// The DESCRAMBLE path gates on this same function — [`descramble_sector`] and
 /// [`descramble_region`] both call it, not the raw flag test — because the raw
 /// test does not merely mis-skip a sector there: it descrambles one that was
@@ -598,7 +586,14 @@ pub(crate) const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
 /// lost 1912 of its 2048 bytes, taking TT_SRPT with it, and the disc's 38
 /// titles became 10 — silently, at exit 0. One gate, both paths.
 pub fn is_scrambled_pack(sector: &[u8]) -> bool {
-    sector.len() >= 2048 && sector[0x00..0x04] == PACK_START && (sector[0x14] >> 4) & 0x03 != 0
+    use crate::consts::pes_stream_id::{PADDING_STREAM, PRIVATE_STREAM_2, SYSTEM_HEADER};
+    sector.len() >= 2048
+        && sector[0x00..0x04] == PACK_START
+        && !matches!(
+            sector[0x11],
+            SYSTEM_HEADER | PADDING_STREAM | PRIVATE_STREAM_2
+        )
+        && (sector[0x14] >> 4) & 0x03 != 0
 }
 
 #[cfg(test)]
@@ -798,6 +793,52 @@ mod tests {
         );
     }
 
+    /// Detection fix: `is_scrambled_pack` must EXCLUDE the MPEG-PS structural
+    /// packets that CSS never scrambles — system_header (0xBB), padding (0xBE)
+    /// and private_stream_2 (0xBF, DVD PCI/DSI and HD-DVD `.evo` RDI nav) — by
+    /// their `stream_id` at offset 0x11. On those packets byte 0x14 is raw
+    /// payload/structure, not a PES scrambling-control field, so its bits 4-5
+    /// land set by chance.
+    ///
+    /// This is the exact decrypted-HD-DVD defect: an `.evo` RDI pack is
+    /// private_stream_2 (0xBF) with the pack-start code and bits set at 0x14, so
+    /// the old gate flipped `saw_scrambled` on a CSS-free disc → the crack found
+    /// no key → `ScrambledUncracked` → E7023 on a good HD-DVD.
+    ///
+    /// Grounding: `!matches!(sector[0x11], SYSTEM_HEADER | PADDING_STREAM |
+    /// PRIVATE_STREAM_2)`. Mutation: drop the 0x11 exclusion → the 0xBF nav pack
+    /// counts as scrambled evidence and the first assert fails. The video and
+    /// private_stream_1 packs prove the gate does NOT reject a real scrambled
+    /// DVD sector (the catastrophic direction).
+    #[test]
+    fn is_scrambled_pack_excludes_nav_and_structural_stream_ids() {
+        use crate::consts::pes_stream_id::{
+            PADDING_STREAM, PRIVATE_STREAM_1, PRIVATE_STREAM_2, SYSTEM_HEADER, VIDEO, VIDEO_MAX,
+        };
+        // A pack-start pack with 0x14 scramble bits set, varying only 0x11.
+        let mut s = vec![0u8; 2048];
+        s[0x00..0x04].copy_from_slice(&PACK_START);
+        s[0x14] = 0x30;
+        for excluded in [SYSTEM_HEADER, PADDING_STREAM, PRIVATE_STREAM_2] {
+            s[0x11] = excluded;
+            assert!(
+                !is_scrambled_pack(&s),
+                "stream_id {excluded:#04x} is a structural/nav pack CSS never scrambles — \
+                 it must NOT count as scramble evidence (else a decrypted HD-DVD RDI pack → E7023)"
+            );
+        }
+        // A genuinely scramblable elementary-stream pack must STILL register —
+        // proving the exclusion did not weaken real-DVD CSS detection.
+        for scramblable in [VIDEO, VIDEO_MAX, PRIVATE_STREAM_1, 0xE2] {
+            s[0x11] = scramblable;
+            assert!(
+                is_scrambled_pack(&s),
+                "stream_id {scramblable:#04x} is a scramblable ES pack — a real CSS DVD's \
+                 scrambled sector must still be counted, never passed through as plaintext"
+            );
+        }
+    }
+
     // ── crack_key scanning over a mock SectorSource ────────────────────────
 
     /// Records every (lba, count) read; returns a caller-supplied flag byte at
@@ -819,6 +860,11 @@ mod tests {
         /// a damaged region. `Some(0)` is the degenerate case that must not
         /// spin the scan.
         short_read: Option<usize>,
+        /// PES `stream_id` written at offset 0x11 of each uniform-fill sector.
+        /// `0x00` (the default) is a scramblable-looking pack; set to
+        /// private_stream_2 (`0xBF`) to model an HD-DVD `.evo` RDI nav pack,
+        /// which carries the pack-start code and 0x14 bits but no CSS.
+        stream_id: u8,
     }
 
     impl MockSource {
@@ -830,6 +876,7 @@ mod tests {
                 lock_all: false,
                 crackable: None,
                 short_read: None,
+                stream_id: 0x00,
             }
         }
     }
@@ -904,11 +951,14 @@ mod tests {
                     }
                     _ => {
                         // Real DVD video sectors always open with the MPEG-PS
-                        // pack-start code; `is_scrambled_pack` (Fix 3) requires it
-                        // before trusting the 0x14 scramble bits, so the fixture
-                        // must include it for a `flag_byte` of 0x30 to register
-                        // as scrambled.
+                        // pack-start code; `is_scrambled_pack` requires it before
+                        // trusting the 0x14 scramble bits, so the fixture must
+                        // include it for a `flag_byte` of 0x30 to register as
+                        // scrambled. `stream_id` (byte 0x11) defaults to 0x00 (a
+                        // scramblable pack); an HD-DVD RDI nav pack sets it to
+                        // private_stream_2 (0xBF), which the 0x11 exclusion drops.
                         buf[base..base + 4].copy_from_slice(&PACK_START);
+                        buf[base + 0x11] = self.stream_id;
                         buf[base + 0x14] = self.flag_byte;
                     }
                 }
@@ -1496,7 +1546,6 @@ mod tests {
             &mut keys,
             4,
             crate::disc::ContentFormat::MpegPs,
-            crate::disc::DiscFormat::Dvd,
             false,
             None,
         )
@@ -1527,7 +1576,6 @@ mod tests {
             &mut keys,
             4,
             crate::disc::ContentFormat::MpegPs,
-            crate::disc::DiscFormat::Dvd,
             false,
             None,
         )
@@ -1543,6 +1591,44 @@ mod tests {
         assert!(
             matches!(keys, crate::decrypt::DecryptKeys::None),
             "keys must stay None on hard-fail (never a scrambled-passthrough key)"
+        );
+    }
+
+    /// The decrypted-HD-DVD regression, end to end through `resolve_dvd_title_key`.
+    /// An `.evo` is MPEG-PS (`ContentFormat::MpegPs`) exactly like a DVD `.vob`
+    /// and carries `None` keys once decrypted, so it reaches the CSS crack. Its
+    /// RDI navigation packs are private_stream_2 (0xBF) with the pack-start code
+    /// and bits set at offset 0x14 — but HD-DVD carries no CSS at all. The 0x11
+    /// exclusion in `is_scrambled_pack` keeps those nav packs from flipping the
+    /// scan's `saw_scrambled` gate, so the scan returns `Unencrypted` and the
+    /// title muxes cleanly instead of hard-failing.
+    ///
+    /// Catches the mutation of dropping the 0x11 exclusion: without it every 0xBF
+    /// RDI pack counts as scramble evidence, the crack finds no key (there is
+    /// none), and the scan returns `ScrambledUncracked` → `CssKeyMissing` (E7023)
+    /// on a perfectly good HD-DVD — the exact defect a real CI run produced.
+    #[test]
+    fn resolve_dvd_title_key_decrypted_hddvd_rdi_packs_scan_clean_no_e7023() {
+        let mut src = MockSource::new(0x30); // 0x14 bits set…
+        src.stream_id = crate::consts::pes_stream_id::PRIVATE_STREAM_2; // …but a 0xBF nav pack
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 64,
+        }];
+        let mut keys = crate::decrypt::DecryptKeys::None;
+        resolve_dvd_title_key(
+            &mut src,
+            &extents,
+            &mut keys,
+            8,
+            crate::disc::ContentFormat::MpegPs,
+            false,
+            None,
+        )
+        .expect("a decrypted HD-DVD's RDI nav packs are not CSS — the scan must not hard-fail");
+        assert!(
+            matches!(keys, crate::decrypt::DecryptKeys::None),
+            "no CSS key exists on an HD-DVD; keys must stay None and the title mux clean"
         );
     }
 
@@ -1564,7 +1650,6 @@ mod tests {
             &mut keys,
             4,
             crate::disc::ContentFormat::MpegPs,
-            crate::disc::DiscFormat::Dvd,
             true, // raw
             None,
         )
@@ -1601,7 +1686,6 @@ mod tests {
             &mut keys,
             4,
             crate::disc::ContentFormat::MpegPs,
-            crate::disc::DiscFormat::Dvd,
             false,
             None,
         )
@@ -1614,91 +1698,6 @@ mod tests {
             src.reads.borrow().is_empty(),
             "must not read for a crack when keys are already Aacs"
         );
-    }
-
-    /// HD-DVD: `.evo` is MPEG-PS exactly like DVD `.vob`, so the CONTAINER
-    /// cannot tell the two apart — the disc-format axis must. HD-DVD is an AACS
-    /// family and carries no CSS at all, yet the old container-only gate sent
-    /// every HD-DVD title into a 50_000-sector crack scan and, when the scan
-    /// came back `ScrambledUncracked`, refused a good disc with `CssKeyMissing`
-    /// (E7023) — what a real CI run produced on the HD-DVD fixture.
-    ///
-    /// Catches the mutation of dropping `disc_format.may_have_css()` from the
-    /// gate (or listing HD-DVD as CSS-capable): the source here is `lock_all`,
-    /// so ANY read the crack performs drives `ScrambledUncracked` → the call
-    /// returns `Err`. The zero-reads assertion is the stronger claim: the scan
-    /// must not merely survive, it must never start.
-    #[test]
-    fn resolve_dvd_title_key_hddvd_never_enters_css_crack() {
-        let mut src = MockSource::new(0x00);
-        src.lock_all = true; // would hard-fail E7023 IF the crack ran
-        let extents = [Extent {
-            start_lba: 0,
-            sector_count: 4,
-        }];
-        let mut keys = crate::decrypt::DecryptKeys::None;
-        resolve_dvd_title_key(
-            &mut src,
-            &extents,
-            &mut keys,
-            4,
-            crate::disc::ContentFormat::MpegPs,
-            crate::disc::DiscFormat::HdDvd,
-            false,
-            None,
-        )
-        .expect("an HD-DVD carries no CSS — it must never be refused for a missing CSS key");
-        assert!(
-            matches!(keys, crate::decrypt::DecryptKeys::None),
-            "no CSS key may be installed on an AACS-family disc"
-        );
-        assert!(
-            src.reads.borrow().is_empty(),
-            "the crack scan must not read a single sector on an HD-DVD"
-        );
-    }
-
-    /// The safety valve, and the reason the gate is a NEGATIVE test rather than
-    /// `disc_format == DiscFormat::Dvd`: a caller that cannot name the disc
-    /// (`DiscFormat::Unknown` — e.g. a bare reader with no scan behind it) must
-    /// STILL reach the crack. The two failure directions are asymmetric — a
-    /// needless scan is recoverable, while skipping the crack on a real DVD
-    /// muxes ciphertext as plaintext at exit 0.
-    ///
-    /// Catches the mutation of "simplifying" `may_have_css()` into a positive
-    /// `== DiscFormat::Dvd` allow-list, which would silently strand every
-    /// unknown-format DVD in scrambled passthrough: the crackable sector here
-    /// stops being cracked and `keys` stays `None`.
-    #[test]
-    fn resolve_dvd_title_key_unknown_disc_format_still_cracks() {
-        let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
-        let seed = [0x11, 0x22, 0x33, 0x44, 0x55];
-        let crackable = crackable_sector(&title_key, &seed, 8);
-        let mut src = MockSource::new(0x00);
-        src.crackable = Some((1003, crackable));
-        let extents = [Extent {
-            start_lba: 1000,
-            sector_count: 50,
-        }];
-        let mut keys = crate::decrypt::DecryptKeys::None;
-        resolve_dvd_title_key(
-            &mut src,
-            &extents,
-            &mut keys,
-            4,
-            crate::disc::ContentFormat::MpegPs,
-            crate::disc::DiscFormat::Unknown,
-            false,
-            None,
-        )
-        .expect("an unknown disc format must still resolve a crackable CSS title");
-        match keys {
-            crate::decrypt::DecryptKeys::Css { title_key: got } => assert_eq!(
-                got, title_key,
-                "an unknown-format MPEG-PS title must be cracked, not passed through"
-            ),
-            _ => panic!("expected Css key: Unknown must default to CSS-capable, never skip"),
-        }
     }
 
     /// Clear DVD: a `None`-keyed MPEG-PS title with no scrambled sector stays
@@ -1717,7 +1716,6 @@ mod tests {
             &mut keys,
             4,
             crate::disc::ContentFormat::MpegPs,
-            crate::disc::DiscFormat::Dvd,
             false,
             None,
         )
@@ -1749,7 +1747,6 @@ mod tests {
             &mut keys,
             4,
             crate::disc::ContentFormat::MpegPs,
-            crate::disc::DiscFormat::Dvd,
             false,
             Some(&halt),
         )

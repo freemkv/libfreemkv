@@ -112,47 +112,6 @@ pub enum DiscFormat {
     Unknown,
 }
 
-impl DiscFormat {
-    /// Can a disc of this format carry CSS (DVD Content Scramble System)?
-    ///
-    /// This is the axis the CSS crack MUST be gated on. It is NOT
-    /// [`ContentFormat`]: `ContentFormat::MpegPs` is the CONTAINER (MPEG
-    /// program stream) and the tree dispatch in [`Disc::scan_with`] assigns it
-    /// to the HD-DVD (`/HVDVD_TS`, `.evo`) arm exactly as it does to the DVD
-    /// (`/VIDEO_TS`, `.vob`) arm. HD-DVD is an AACS family and carries no CSS
-    /// whatsoever, so gating on the container sent every HD-DVD title into a
-    /// 50_000-sector CSS crack scan it could never satisfy — and when that scan
-    /// reported `ScrambledUncracked`, refused a perfectly good HD-DVD with
-    /// `Error::CssKeyMissing` (E7023). That is what a real CI run produced on
-    /// the HD-DVD fixture. `Disc::scan_image`'s eager image crack had already
-    /// learned this lesson and gates on `DiscFormat::Dvd`; the mux-side gate in
-    /// [`crate::css::resolve_dvd_title_key`] had not.
-    ///
-    /// The test is deliberately NEGATIVE — "everything except the families
-    /// proven CSS-free" — rather than a positive `== DiscFormat::Dvd`, because
-    /// the two failure directions are wildly asymmetric:
-    ///
-    /// * running CSS on a disc that has none costs a wasted scan (and, at
-    ///   worst, a false refusal): loud, visible, recoverable;
-    /// * NOT running CSS on a real DVD makes the mux pass SCRAMBLED bytes
-    ///   through as plaintext and exit 0 with garbage — a failure that looks
-    ///   like success. That one already shipped once (~9 MB of ciphertext
-    ///   inside a main-movie m2ts at rc=0).
-    ///
-    /// So the safe default is "attempt the crack". [`DiscFormat::Unknown`] —
-    /// the value a caller that never scanned the disc supplies — therefore
-    /// answers `true`, and any variant added to this enum in future answers
-    /// `true` until someone deliberately proves it CSS-free and adds it to the
-    /// exclusion list. A positive `matches!` list would default the other way,
-    /// i.e. toward the catastrophic direction.
-    pub fn may_have_css(self) -> bool {
-        !matches!(
-            self,
-            DiscFormat::HdDvd | DiscFormat::BluRay | DiscFormat::Uhd | DiscFormat::Fmts
-        )
-    }
-}
-
 /// Disc playback region.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DiscRegion {

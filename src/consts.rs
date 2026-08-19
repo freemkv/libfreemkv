@@ -114,6 +114,10 @@ pub mod coding_type {
 pub mod pes_stream_id {
     /// Video stream (`110x xxxx`; freemkv emits the base id `0xE0`).
     pub const VIDEO: u8 = 0xE0;
+    /// system_header start code — the MPEG-PS `00 00 01 BB` structural header
+    /// (rate/bound bounds), never an elementary stream. On a DVD NAV pack it
+    /// follows the pack header, so it lands at sector offset 0x11.
+    pub const SYSTEM_HEADER: u8 = 0xBB;
     /// private_stream_1 — AC-3 / DTS / LPCM / PGS subtitle payloads.
     pub const PRIVATE_STREAM_1: u8 = 0xBD;
     /// padding_stream — stuffing bytes only, no payload to demux.
