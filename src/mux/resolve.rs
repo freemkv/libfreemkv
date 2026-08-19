@@ -613,6 +613,12 @@ where
     }
     let title = disc.titles[idx].clone();
     let format = disc.content_format;
+    // The CSS-eligibility axis handed to the pipeline below. `content_format`
+    // above is only the container and cannot carry this decision: HD-DVD `.evo`
+    // is MPEG-PS exactly like DVD `.vob`, and gating the crack on the container
+    // is what sent every HD-DVD through a CSS scan it could never satisfy.
+    // Same value `is_dvd` was derived from further up.
+    let disc_format = disc.format;
     // ISO file: 8192-sector batch (16 MiB at 2048 B/sector) —
     // sequential read from fast storage, no bad sectors. Empirically
     // optimal; bumping to 16384 sectors (32 MiB) regressed (more cache
@@ -644,6 +650,7 @@ where
         effective_keys,
         ISO_MUX_BATCH_SECTORS,
         format,
+        disc_format,
         opts.raw,
         None,
         None,
@@ -2109,6 +2116,11 @@ pub(crate) fn resolve_mux_key_map_cached(
 /// - `batch_sectors`: read batch size in logical (2048-byte) sectors — a
 ///   throughput/latency tuning knob, not a correctness parameter.
 /// - `format`: container format (`BdTs` → TS demuxer, `MpegPs` → PS demuxer).
+/// - `disc_format`: the disc FAMILY, a separate axis from `format` — DVD and
+///   HD-DVD are both `MpegPs`, but only DVD can carry CSS. Gates the per-title
+///   CSS crack below. A caller with no scanned disc passes
+///   [`crate::disc::DiscFormat::Unknown`], which still cracks (the safe
+///   direction — see [`crate::disc::DiscFormat::may_have_css`]).
 /// - `raw`: ciphertext passthrough. When `true`, the per-title CSS crack
 ///   (`resolve_dvd_title_key`) is skipped entirely — no key is resolved and a
 ///   scrambled title is neither descrambled nor hard-failed.
@@ -2128,6 +2140,7 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     mut keys: crate::decrypt::DecryptKeys,
     batch_sectors: u16,
     format: ContentFormat,
+    disc_format: crate::disc::DiscFormat,
     raw: bool,
     halt: Option<crate::halt::Halt>,
     event_fn: Option<crate::sector::prefetched::EventFn>,
@@ -2135,17 +2148,20 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
 ) -> io::Result<PipelinedPesStream> {
     let extents = title.extents.clone();
     // CSS (DVD) key resolution — the shared per-title step (also used by the
-    // live-drive single-pass `DiscStream`). A `None`/MPEG-PS title cracks its own
-    // key from the reader in playback order; AACS `.evo` (also MPEG-PS) arrives as
-    // `Aacs` and is untouched; a clear DVD stays `None`; `raw` skips it entirely.
-    // Without this a detection-miss CSS DVD would mux scrambled sectors as corrupt
-    // video. `halt` lets /api/stop interrupt the crack scan.
+    // live-drive single-pass `DiscStream`). A `None`/MPEG-PS title on a
+    // CSS-capable DISC FORMAT cracks its own key from the reader in playback
+    // order; an HD-DVD (also MPEG-PS, but AACS — no CSS exists to find) is
+    // skipped on the `disc_format` axis; AACS keys are untouched; a clear DVD
+    // stays `None`; `raw` skips it entirely. Without this a detection-miss CSS
+    // DVD would mux scrambled sectors as corrupt video. `halt` lets /api/stop
+    // interrupt the crack scan.
     crate::css::resolve_dvd_title_key(
         &mut reader,
         &extents,
         &mut keys,
         batch_sectors,
         format,
+        disc_format,
         raw,
         halt.as_ref(),
     )?;
@@ -2991,6 +3007,7 @@ mod tests {
             DecryptKeys::None,
             8192,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
             None,
@@ -3033,6 +3050,7 @@ mod tests {
             DecryptKeys::None,
             8192,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
             None,
@@ -3130,6 +3148,7 @@ mod tests {
             DecryptKeys::None,
             8192,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
             None,
@@ -3169,6 +3188,7 @@ mod tests {
             DecryptKeys::None,
             0,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
             None,
@@ -3211,6 +3231,7 @@ mod tests {
             DecryptKeys::None,
             8192,
             ContentFormat::MpegPs,
+            crate::disc::DiscFormat::Dvd,
             false,
             None,
             None,

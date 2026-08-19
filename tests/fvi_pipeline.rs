@@ -175,6 +175,10 @@ fn run_to_fvi(image: Vec<u8>, title: DiscTitle, path: &std::path::Path) {
         DecryptKeys::None,
         3, // 3-sector (one AACS unit) batches → one source stamp per GOP region
         ContentFormat::MpegPs,
+        // A DVD-family fixture: the disc-format axis must keep the CSS crack
+        // reachable here exactly as it is in production (the image is clear, so
+        // the crack finds nothing and the mux proceeds).
+        libfreemkv::DiscFormat::Dvd,
         false,
         None,
         None,
