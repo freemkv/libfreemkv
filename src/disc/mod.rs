@@ -3716,6 +3716,115 @@ mod tests {
         );
     }
 
+    /// `scan_with` must hand `ScanOptions::halt` to the BLU-RAY enumerator.
+    ///
+    /// Every BD and DVD cancellation test in this crate calls
+    /// `scan_bluray_titles` / `scan_dvd_titles` DIRECTLY, so the three-line
+    /// wiring in `scan_with` that connects the operator's Stop to them was
+    /// covered by nothing at all: replacing `opts.halt.as_ref()` with `None`
+    /// on either branch left the whole suite green while a Stop during a BD
+    /// or DVD scan silently did nothing. Only the HD-DVD branch was pinned.
+    ///
+    /// The fixture is deliberately the smallest disc that takes the BD branch
+    /// — a bare `/BDMV` with no PLAYLIST — because the point under test is the
+    /// ARGUMENT, not the enumerator's own (separately tested) halt polling.
+    /// Nothing between `scan_with`'s entry and the enumerator reads the flag
+    /// (the disc is unencrypted, so the AACS path is skipped), so a green here
+    /// can only mean the flag arrived.
+    ///
+    /// Mutation: `Self::scan_bluray_titles(reader, &udf_fs, None)?` fails here.
+    #[test]
+    fn scan_with_passes_the_halt_flag_to_the_bluray_enumerator() {
+        use crate::udf::fixture::*;
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".into(),
+                icb_lba: 12,
+                dir_data_lba: 13,
+                files: Vec::new(),
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        // Sanity: the same disc scans clean when nothing is cancelled, so a
+        // pass below cannot be some unrelated failure wearing Halted.
+        assert!(
+            Disc::scan_with(&mut disc, 500_000, None, None, &ScanOptions::default(), udf).is_ok(),
+            "fixture must scan successfully when not cancelled"
+        );
+
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let opts = ScanOptions {
+            halt: Some(halt),
+            ..Default::default()
+        };
+        let res = Disc::scan_with(&mut disc, 500_000, None, None, &opts, udf);
+        assert!(
+            matches!(res, Err(Error::Halted)),
+            "a cancelled BD scan must say so; returning a title list built \
+             after Stop reports a truncated enumeration as a completed one. \
+             Got {:?}",
+            res.map(|d| d.titles.len())
+        );
+    }
+
+    /// The DVD half of the same wiring, and the same reasoning.
+    ///
+    /// Mutation: `Self::scan_dvd_titles(reader, &udf_fs, None)?` fails here.
+    #[test]
+    fn scan_with_passes_the_halt_flag_to_the_dvd_enumerator() {
+        use crate::udf::fixture::*;
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".into(),
+                icb_lba: 50,
+                dir_data_lba: 51,
+                files: vec![
+                    file_with("VIDEO_TS.IFO", 60, 5000, dvd_vmg_bytes(), true),
+                    file_with("VTS_01_0.IFO", 62, 6000, dvd_vts_bytes(1000, 10, 10), true),
+                ],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        assert!(
+            Disc::scan_with(&mut disc, 500_000, None, None, &ScanOptions::default(), udf).is_ok(),
+            "fixture must scan successfully when not cancelled"
+        );
+
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let opts = ScanOptions {
+            halt: Some(halt),
+            ..Default::default()
+        };
+        let res = Disc::scan_with(&mut disc, 500_000, None, None, &opts, udf);
+        assert!(
+            matches!(res, Err(Error::Halted)),
+            "a cancelled DVD scan must say so, not hand back whatever it had \
+             enumerated so far as a finished scan. Got {:?}",
+            res.map(|d| d.titles.len())
+        );
+    }
+
     /// A Stop on a LIVE DRIVE never touches `ScanOptions::halt`: `Drive` has
     /// its own flag and `checked_exec` fails every SCSI command with
     /// [`Error::Halted`] once it is set. The HD-DVD enumerator must not

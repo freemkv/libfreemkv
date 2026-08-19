@@ -290,22 +290,33 @@ impl Drive {
         for attempt in 0..60u64 {
             hb.tick(attempt, 60);
             let mut buf = [0u8; 0];
-            if self
-                .scsi
-                .as_mut()
-                .execute(&tur, crate::scsi::DataDirection::None, &mut buf, 5_000)
-                .is_ok()
-            {
-                tracing::info!(
-                    target: "freemkv::drive",
-                    phase = "wait_ready",
-                    attempts = attempt + 1,
-                    elapsed_ms = t0.elapsed().as_millis() as u64,
-                    "end"
-                );
-                return Ok(());
+            // `checked_exec`, not a bare `execute`. This poll was the ONE
+            // drive path that talked to the transport directly, and it is the
+            // longest-running one: 60 x 500 ms = ~30 s. It never read
+            // `self.halt`, so an operator Stop pressed while a cold drive spun
+            // up was ignored for up to half a minute while every other path in
+            // this file returned `Halted` at its next command boundary. A Stop
+            // that does nothing for 30 s is indistinguishable from a hung app.
+            //
+            // A TUR that FAILS is the ordinary not-ready-yet answer and must
+            // keep the loop going — only `Halted` aborts it.
+            match self.checked_exec(&tur, crate::scsi::DataDirection::None, &mut buf, 5_000) {
+                Ok(_) => {
+                    tracing::info!(
+                        target: "freemkv::drive",
+                        phase = "wait_ready",
+                        attempts = attempt + 1,
+                        elapsed_ms = t0.elapsed().as_millis() as u64,
+                        "end"
+                    );
+                    return Ok(());
+                }
+                Err(Error::Halted) => return Err(Error::Halted),
+                Err(_) => {}
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            // Halt-aware backoff: the flag can also flip DURING the 500 ms
+            // gap, which is where most of the 30 s is actually spent.
+            sleep_until_halted(&self.halt, std::time::Duration::from_millis(500))?;
         }
         tracing::warn!(
             target: "freemkv::drive",
@@ -937,11 +948,34 @@ impl Drive {
             // range NonTrimmed and retries (a loud miss, never a silent commit).
             // The sector/file path enforces the same invariant in
             // sector/prefetched.rs; this is the live-drive counterpart.
-            Ok(_) => Err(Error::DiscRead {
-                sector: lba as u64,
-                status: None,
-                sense: None,
-            }),
+            //
+            // SAY SO. The refusal was correct and completely silent: the
+            // sibling `Err(e)` arm below warns with lba/count/status, this one
+            // logged nothing at all, so a drive that residual-underruns on
+            // GOOD status was indistinguishable in the logs from a scratched
+            // disc — two different populations (replace the drive vs. clean
+            // the disc) collapsed into one. Absence of a log is itself the
+            // defect here; the read still fails either way.
+            //
+            // `scsi_status`/`sense` are deliberately absent from the line
+            // rather than faked: the command SUCCEEDED, so there is no sense
+            // data to report. `transferred` vs `expected` is the whole signal.
+            Ok(result) => {
+                tracing::warn!(
+                    target: "freemkv::drive",
+                    lba,
+                    count,
+                    transferred = result.bytes_transferred,
+                    expected = count as usize * 2048,
+                    code = crate::error::E_DISC_READ,
+                    "READ(10) returned GOOD status with a residual underrun; refusing the short transfer"
+                );
+                Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: None,
+                    sense: None,
+                })
+            }
             Err(Error::Halted) => Err(Error::Halted),
             Err(e) => {
                 let (status, sense) = extract_scsi_context(&e);
@@ -1097,14 +1131,25 @@ impl Drive {
         let stop = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x00, 0]; // START=0, LOEJ=0 → spin down
         let start = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x01, 0]; // START=1, LOEJ=0 → spin up
         let mut buf = [0u8; 0];
-        self.scsi
-            .as_mut()
-            .execute(&stop, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
-        std::thread::sleep(std::time::Duration::from_secs(SPIN_DOWN_IDLE_SECS));
-        self.scsi
-            .as_mut()
-            .execute(&start, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
-        std::thread::sleep(std::time::Duration::from_secs(SPIN_UP_SETTLE_SECS));
+        // `checked_exec` + `sleep_until_halted`, not `execute` + a blind
+        // `thread::sleep`. This routine is ~15 s of deliberate waiting
+        // (`SPIN_DOWN_IDLE_SECS` + `SPIN_UP_SETTLE_SECS`) issued from the
+        // recovery path, i.e. exactly when a run is going badly and the
+        // operator is most likely to press Stop. Both commands bypassed the
+        // halt flag and both sleeps were unconditional, so the whole cycle was
+        // deaf: Stop appeared to hang. Nothing here is un-interruptible — a
+        // half-finished spin cycle leaves the drive spun down, which the next
+        // command spins back up.
+        self.checked_exec(&stop, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
+        sleep_until_halted(
+            &self.halt,
+            std::time::Duration::from_secs(SPIN_DOWN_IDLE_SECS),
+        )?;
+        self.checked_exec(&start, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
+        sleep_until_halted(
+            &self.halt,
+            std::time::Duration::from_secs(SPIN_UP_SETTLE_SECS),
+        )?;
         Ok(())
     }
 
@@ -1310,11 +1355,18 @@ pub(crate) fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> R
     last_lba.checked_add(1).ok_or(Error::DiscCapacityOverflow)
 }
 
-/// Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping
-/// to true. Kept for the unit tests that cover the slicing behaviour;
-/// production code paths no longer sleep on the recovery hot path
-/// (recovery loop removed in 0.13.6).
-#[cfg(test)]
+/// Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping to
+/// true, returning [`Error::Halted`].
+///
+/// This was `#[cfg(test)]` for two releases, kept alive only by the four unit
+/// tests below, while the two production paths that actually sleep — the
+/// `wait_ready` poll backoff (60 x 500 ms) and `spin_cycle`'s spin-down/settle
+/// pauses (`SPIN_DOWN_IDLE_SECS` + `SPIN_UP_SETTLE_SECS`) — used a plain
+/// `std::thread::sleep` and so were DEAF to the operator's Stop for ~30 s and
+/// ~15 s respectively. Every other drive path returns `Halted` at the next
+/// `checked_exec` boundary; a Stop pressed during spin-up simply did nothing
+/// visible until the poll ran out. The primitive existed; the sleeping code
+/// just did not call it. It is production code again.
 fn sleep_until_halted(halt: &AtomicBool, total: std::time::Duration) -> Result<()> {
     const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
     let deadline = std::time::Instant::now() + total;
@@ -2681,6 +2733,231 @@ mod command_tests {
         assert!(
             matches!(r, Err(Error::DeviceNotReady { .. })),
             "a drive that never answers TUR successfully must be DeviceNotReady, got {r:?}"
+        );
+    }
+
+    /// A Stop pressed before the poll starts must be answered at once.
+    ///
+    /// `wait_ready` was the ONE drive path that called
+    /// `self.scsi.as_mut().execute(..)` instead of `checked_exec`, and its
+    /// 60 x 500 ms loop never read `self.halt`. A cancel during spin-up was
+    /// therefore ignored for ~30 s — the test above measures exactly how long
+    /// — while every other drive path returns `Halted` at its next command
+    /// boundary. Thirty seconds of a dead Stop button is indistinguishable
+    /// from a hung application.
+    ///
+    /// Mutation: restoring the bare `execute` makes this run the full poll and
+    /// return `DeviceNotReady`, failing both assertions.
+    #[test]
+    fn wait_ready_returns_halted_when_stopped_before_the_poll() {
+        struct NeverReady;
+        impl ScsiTransport for NeverReady {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                Err(Error::ScsiError {
+                    opcode: cdb[0],
+                    status: 2,
+                    sense: None,
+                })
+            }
+        }
+        let mut d = Drive::from_transport_for_test(Box::new(NeverReady));
+        d.halt();
+        let t0 = std::time::Instant::now();
+        let r = d.wait_ready();
+        assert!(
+            matches!(r, Err(Error::Halted)),
+            "a Stop is the operator, not a drive that failed to spin up: {r:?}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "the poll must abandon immediately, not run its ~30 s course"
+        );
+    }
+
+    /// ...and a Stop pressed PART WAY THROUGH the poll must be answered at the
+    /// next command boundary, not at the end of the 30 s.
+    ///
+    /// The flag is flipped by the transport itself on its third TEST UNIT
+    /// READY, which is deterministic (no wall-clock race): `checked_exec`
+    /// re-reads the flag after the command completes, so the loop must exit on
+    /// attempt three of sixty.
+    #[test]
+    fn wait_ready_returns_halted_when_stopped_during_the_poll() {
+        struct StopsOnThirdPoll {
+            halt: Arc<AtomicBool>,
+            seen: usize,
+        }
+        impl ScsiTransport for StopsOnThirdPoll {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                self.seen += 1;
+                if self.seen == 3 {
+                    self.halt.store(true, Ordering::Relaxed);
+                }
+                Err(Error::ScsiError {
+                    opcode: cdb[0],
+                    status: 2,
+                    sense: None,
+                })
+            }
+        }
+        let mut d = Drive::from_transport_for_test(Box::new(StopsOnThirdPoll {
+            halt: Arc::new(AtomicBool::new(false)),
+            seen: 0,
+        }));
+        // Hand the transport the drive's OWN flag, so setting it is exactly
+        // what an operator's Stop does.
+        let flag = d.halt_flag();
+        d.scsi = Box::new(StopsOnThirdPoll {
+            halt: flag,
+            seen: 0,
+        });
+        let t0 = std::time::Instant::now();
+        let r = d.wait_ready();
+        assert!(
+            matches!(r, Err(Error::Halted)),
+            "a mid-poll Stop must surface as Halted, not as DeviceNotReady \
+             after the full 30 s: {r:?}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "must exit on the third poll, not the sixtieth"
+        );
+    }
+
+    /// `spin_cycle` must not be deaf to Stop for its ~15 s of deliberate
+    /// waiting.
+    ///
+    /// Both START STOP UNIT commands went out through a bare `execute` and
+    /// both pauses (`SPIN_DOWN_IDLE_SECS` + `SPIN_UP_SETTLE_SECS`) were plain
+    /// `std::thread::sleep`, so the whole routine ignored the halt flag. It
+    /// runs from the RECOVERY path — precisely when a run is going badly and
+    /// the operator is most likely to press Stop.
+    ///
+    /// The flag is set BEFORE the call, so this is deterministic: the very
+    /// first `checked_exec` must refuse.
+    ///
+    /// Mutation: restoring either bare `execute` lets the first command
+    /// through and the test then waits out a real 5 s sleep, failing the
+    /// elapsed bound.
+    #[test]
+    fn spin_cycle_returns_halted_when_stopped_before_it_starts() {
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(0));
+        d.halt();
+        let t0 = std::time::Instant::now();
+        let r = d.spin_cycle();
+        assert!(
+            matches!(r, Err(Error::Halted)),
+            "a Stop must abort the spin cycle: {r:?}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "no sleep may run after the flag is set"
+        );
+        assert!(
+            cdb.lock().unwrap().is_empty(),
+            "not one START STOP UNIT may be issued after Stop"
+        );
+    }
+
+    /// ...and a Stop that lands DURING the spin-down pause must wake it.
+    ///
+    /// This is the half a `checked_exec` alone cannot fix: the flag flips
+    /// while the thread is parked inside the 5 s `SPIN_DOWN_IDLE_SECS` sleep,
+    /// so only a halt-aware sleep can observe it. `sleep_until_halted` — which
+    /// already lived in this file with four tests, marked `#[cfg(test)]` and
+    /// called from nowhere — wakes within ~100 ms.
+    ///
+    /// The margin is deliberately enormous (≈0.3 s against 5 s) so the bound
+    /// is not a wall-clock race: a plain `thread::sleep` cannot come in under
+    /// two seconds, and the halt-aware one cannot take that long.
+    #[test]
+    fn spin_cycle_wakes_from_its_spin_down_pause_when_stopped() {
+        let RecordingHarness {
+            drive: mut d,
+            cdb: _cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(0));
+        let flag = d.halt_flag();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let t0 = std::time::Instant::now();
+        let r = d.spin_cycle();
+        stopper.join().expect("stopper thread");
+        assert!(
+            matches!(r, Err(Error::Halted)),
+            "a Stop during the spin-down pause must surface as Halted: {r:?}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "the pause must be halt-aware, not a blind {SPIN_DOWN_IDLE_SECS}s \
+             thread::sleep; took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// A READ(10) that completes with GOOD status but a residual underrun is
+    /// correctly refused — and must SAY SO.
+    ///
+    /// The refusal itself already existed and is right: the tail of the buffer
+    /// still holds stale bytes, so committing them would be silent
+    /// corruption. What was missing is any trace of it. The sibling `Err(e)`
+    /// arm warns with lba/count/status; this arm logged NOTHING, so a drive
+    /// that residual-underruns on GOOD status produced exactly the same
+    /// journal as a scratched disc — two populations with opposite remedies
+    /// (replace the drive vs. clean the disc) collapsed into one, with the
+    /// operator sent after the wrong one.
+    ///
+    /// Mutation: deleting the `tracing::warn!` leaves no event; logging a
+    /// different code, or dropping the transferred/expected pair that is the
+    /// entire signal, fails the field assertions.
+    #[test]
+    fn read_logs_a_good_status_short_transfer() {
+        let RecordingHarness {
+            drive: mut d,
+            cdb: _cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(1024)); // half of one sector
+        let mut buf = vec![0u8; 2048];
+        let (r, events) = crate::testlog::capture(|| d.read(7, 1, &mut buf, false));
+        assert!(
+            matches!(r, Err(Error::DiscRead { sector: 7, .. })),
+            "a short transfer stays a failed read: {r:?}"
+        );
+        let line = events
+            .iter()
+            .find(|e| e.target == "freemkv::drive" && e.field("transferred").is_some())
+            .unwrap_or_else(|| {
+                panic!("a silently refused short transfer is the defect; got {events:?}")
+            });
+        assert_eq!(line.level, tracing::Level::WARN);
+        assert_eq!(line.field("lba"), Some("7"));
+        assert_eq!(line.field("transferred"), Some("1024"));
+        assert_eq!(
+            line.field("expected"),
+            Some("2048"),
+            "the underrun is only legible as transferred-vs-expected"
+        );
+        assert_eq!(
+            line.field("code"),
+            Some(crate::error::E_DISC_READ.to_string().as_str())
         );
     }
 
