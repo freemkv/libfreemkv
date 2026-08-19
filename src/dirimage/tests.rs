@@ -17,17 +17,30 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "freemkv-dirimage-{tag}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let p = Self::unique_path(tag);
         std::fs::create_dir_all(&p).unwrap();
         Self(p)
+    }
+
+    /// The path a scratch dir takes — kept separate from directory creation so
+    /// its uniqueness is testable without a syscall between draws. A monotonic
+    /// counter, NOT a timestamp, is what guarantees it: `SystemTime::now()`
+    /// resolves to only a MICROSECOND on macOS, so two of the seven parallel
+    /// tests that share the "bdmv" tag routinely read the same value within one
+    /// microsecond, collide on the same directory, and the first to finish
+    /// `remove_dir_all`s it out from under the others' reads — an intermittent
+    /// `read_sectors` ENOENT. The counter is unique regardless of clock
+    /// granularity; pairing it with the pid keeps it unique across test-binary
+    /// processes.
+    fn unique_path(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "freemkv-dirimage-{tag}-{}-{uniq}",
+            std::process::id()
+        ));
+        p
     }
     fn path(&self) -> &Path {
         &self.0
@@ -67,6 +80,28 @@ fn bdmv_scratch() -> (Scratch, Vec<u8>, Vec<u8>) {
     s.file("BDMV/CLIPINF/00000.clpi", &pattern(5, 700));
     s.file("BDMV/STREAM/00000.m2ts", &clip);
     (s, index, clip)
+}
+
+/// Every `Scratch` must own a DISTINCT directory. Seven tests share the "bdmv"
+/// tag and run in parallel; if two land the same path, the first to drop
+/// `remove_dir_all`s it out from under the other's reads, which surfaced as an
+/// intermittent `read_sectors` failure. Regression: with the old
+/// `SystemTime::now()` name this is RED, because macOS's clock advances only
+/// per microsecond, so a tight loop of pure draws — no `create_dir_all` syscall
+/// between them to nudge the clock, mirroring the real cross-thread collision —
+/// hands back the same value many times over. The counter-based name is unique
+/// regardless of clock granularity.
+#[test]
+fn scratch_paths_are_unique_even_at_clock_resolution() {
+    let paths: Vec<PathBuf> = (0..1000).map(|_| Scratch::unique_path("uniq")).collect();
+    let distinct: std::collections::HashSet<&PathBuf> = paths.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        paths.len(),
+        "every Scratch must own a distinct path; a timestamp-based name collides \
+         under macOS's microsecond clock and lets one parallel test delete \
+         another's files mid-read"
+    );
 }
 
 // ── The de-risking spike ────────────────────────────────────────────────────

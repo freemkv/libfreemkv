@@ -85,11 +85,37 @@ impl tracing::field::Visit for Visitor {
     }
 }
 
-struct Capture(Arc<Mutex<Vec<CapturedEvent>>>);
+type Sink = Arc<Mutex<Vec<CapturedEvent>>>;
+
+thread_local! {
+    /// The sink for a capture ACTIVE ON THIS THREAD, if any. Thread-local so
+    /// concurrent captures across `cargo test`'s parallel harness never see
+    /// each other's events, and so a non-capturing thread simply has `None`.
+    static SINK: std::cell::RefCell<Option<Sink>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The ONE process-wide subscriber. Installed once and left installed; it is
+/// offered every event and records into whichever thread's sink is active,
+/// dropping the event when none is.
+struct Capture;
 
 impl tracing::Subscriber for Capture {
+    // `sometimes`, deliberately NOT the default `always`/`never`. A cacheable
+    // interest lets `tracing`'s GLOBAL per-callsite cache short-circuit a
+    // callsite to "off", and under `cargo test`'s parallel harness a cache
+    // rebuild triggered by ANY other thread can leave it there while a capture
+    // is live — the capture then observes NOTHING. That is the race that made
+    // `parse_playlist_unreadable_clip_icb_yields_no_title` flake ~1 run in 15.
+    // `sometimes` forces `enabled` to be consulted on the emitting thread for
+    // every event, so a capture always sees its own.
+    fn register_callsite(
+        &self,
+        _meta: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
     fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
+        SINK.with(|s| s.borrow().is_some())
     }
     // Spans are irrelevant here — nothing in this crate asserts on span
     // structure, only on events — so they get a constant id and no storage.
@@ -99,56 +125,62 @@ impl tracing::Subscriber for Capture {
     fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
-        let mut v = Visitor::default();
-        event.record(&mut v);
-        let meta = event.metadata();
-        self.0.lock().expect("capture mutex").push(CapturedEvent {
-            target: meta.target().to_string(),
-            level: *meta.level(),
-            fields: v.0,
+        SINK.with(|s| {
+            if let Some(sink) = s.borrow().as_ref() {
+                let mut v = Visitor::default();
+                event.record(&mut v);
+                let meta = event.metadata();
+                sink.lock().expect("capture mutex").push(CapturedEvent {
+                    target: meta.target().to_string(),
+                    level: *meta.level(),
+                    fields: v.0,
+                });
+            }
         });
     }
     fn enter(&self, _span: &tracing::span::Id) {}
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
-/// Process-wide lock serialising captures. See [`capture`].
-static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+/// Install the single global capturing subscriber, exactly once.
+fn install() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        // This is the crate's ONLY `set_global_default`; a second call cannot
+        // happen. Tolerate it via `.ok()` rather than panic if that ever
+        // changes — capture then no-ops, which the non-empty assertions catch.
+        let _ = tracing::subscriber::set_global_default(Capture);
+    });
+}
 
-/// Run `f` with every `tracing` event emitted on THIS thread captured.
+/// Run `f` with every `tracing` event it emits ON THIS THREAD captured.
 ///
 /// Returns `f`'s value alongside the events, in emission order.
 ///
-/// # Why captures are serialised across the whole test binary
+/// # Why one global subscriber, not scoped `with_default`
 ///
-/// `tracing`'s per-callsite INTEREST CACHE is global, while
-/// `with_default` is thread-local, and the two race under `cargo test`'s
-/// parallel harness. `tracing_core` rebuilds that cache only on the 0 -> 1 and
-/// 1 -> 0 transitions of its scoped-dispatcher count: entering the first
-/// capture flips every callsite to "ask the subscriber", leaving the last one
-/// flips them back to "never" (there being no global subscriber in tests).
-/// With two capturing tests on two threads, the exiting one's rebuild can land
-/// AFTER the entering one's, leaving the cache at "never" while a capture is
-/// live — so the callsite is short-circuited and the capture observes NOTHING.
+/// `tracing`'s per-callsite INTEREST CACHE is GLOBAL, but `with_default` is
+/// thread-local. Under `cargo test`'s parallel harness a rebuild of that cache
+/// — triggered by ANY other thread registering any callsite for the first time
+/// — re-evaluates the target callsite against the global dispatcher, which a
+/// scoped subscriber is NOT part of, and can leave it cached "off" while a
+/// capture is live, so the capture observes NOTHING. Serialising captures
+/// against each other does not help: the poisoning thread is not itself
+/// capturing. `parse_playlist_unreadable_clip_icb_yields_no_title` flaked ~1
+/// run in 15 on exactly this — an empty event list.
 ///
-/// That was not theoretical: `parse_playlist_unreadable_clip_icb_yields_no_title`
-/// passed alone and failed in the full suite, with an empty event list, the
-/// first time two capturing tests existed in one module. A logging assertion
-/// that fails at random is worse than none — it teaches the next person to
-/// re-run until green, which is how a real regression gets waved through.
-///
-/// Holding this lock across the whole of `with_default` — including the
-/// guard's drop, which is where the exiting rebuild happens — orders the
-/// transitions strictly. Captures are few and short, so the serialisation
-/// costs nothing measurable.
-///
-/// The lock is deliberately taken through the poison, not `expect`ed: a
-/// capturing test that panics (i.e. a genuine assertion failure) must not
-/// convert every other capturing test into a confusing secondary failure.
+/// The robust shape is a single subscriber installed globally for the whole
+/// run, whose `register_callsite` returns `sometimes` (so no callsite is ever
+/// hard-cached) and which routes each event to the emitting thread's own sink.
+/// No scoped-dispatcher transitions, no cross-thread cache race, and concurrent
+/// captures on different threads stay isolated by the thread-local sink.
 pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
-    let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::default();
-    let out = tracing::subscriber::with_default(Capture(sink.clone()), f);
+    install();
+    let sink: Sink = Arc::default();
+    // Save/restore any outer sink so a nested capture on one thread still works.
+    let prev = SINK.with(|s| s.borrow_mut().replace(sink.clone()));
+    let out = f();
+    SINK.with(|s| *s.borrow_mut() = prev);
     let events = std::mem::take(&mut *sink.lock().expect("capture mutex"));
     (out, events)
 }
