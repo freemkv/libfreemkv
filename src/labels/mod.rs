@@ -1952,14 +1952,15 @@ mod apply_tests {
                 subtitle(0x12A2, "fra"),
             ],
         )];
-        // Capture through the crate's ONE serialised sink. A process-wide
-        // `set_global_default` here would poison every other test's callsite
-        // interest cache for the rest of the binary — `tracing` caches interest
-        // GLOBALLY, and a global subscriber that answers `never` for foreign
-        // callsites hard-disables them, so `testlog::capture`'s scoped captures
-        // (e.g. the `freemkv::disc` log-accounting tests) then see nothing and
-        // flake. `testlog::capture` serialises every capture under one lock and
-        // installs no global default, which is the invariant those tests rely on.
+        // Capture through the crate's ONE global `tracing` subscriber:
+        // `testlog::capture` installs it exactly once and routes each event to a
+        // thread-local sink. A process-wide `set_global_default` HERE instead
+        // would poison every other test's callsite interest cache for the rest of
+        // the binary — `tracing` caches interest GLOBALLY — and only the first
+        // `set_global_default` in a process takes effect anyway. The shared
+        // subscriber answers interest for every callsite and isolates concurrent
+        // captures per thread, which is the invariant these log-accounting
+        // assertions rely on.
         let ((), events) = crate::testlog::capture(|| {
             apply_labels(&labels, &mut titles);
         });
