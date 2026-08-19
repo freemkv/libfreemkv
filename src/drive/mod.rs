@@ -35,6 +35,15 @@ pub(crate) mod macos;
 #[cfg(windows)]
 pub(crate) mod windows;
 
+// Pick the platform module ONCE, here, so the cross-platform entry points below
+// dispatch through `platform::…` with no per-function `#[cfg]` in their bodies.
+#[cfg(target_os = "linux")]
+pub(crate) use linux as platform;
+#[cfg(target_os = "macos")]
+pub(crate) use macos as platform;
+#[cfg(windows)]
+pub(crate) use windows as platform;
+
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::identity::DriveId;
@@ -1385,18 +1394,7 @@ fn sleep_until_halted(halt: &AtomicBool, total: std::time::Duration) -> Result<(
 
 /// Internal: discover drive paths + IDs without opening full Drive objects.
 fn discover_drives() -> Vec<(String, DriveId)> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::find_drives()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos::find_drives()
-    }
-    #[cfg(windows)]
-    {
-        windows::find_drives()
-    }
+    platform::find_drives()
 }
 
 /// Structured outcome of [`resolve_device`] — a machine-readable signal
@@ -1416,20 +1414,14 @@ pub enum DeviceResolution {
 /// Resolve a device path to its raw SCSI device. Returns the resolved
 /// path plus a structured [`DeviceResolution`] signal describing whether
 /// any substitution happened; the application layer maps that to UX text.
+///
+/// Staged, not yet wired: the cross-platform dispatch is kept ready for the
+/// caller that will consume it, so the per-platform implementations below it
+/// (and their tests) stay live. `allow(dead_code)` marks that deliberately —
+/// this is not an accidental orphan.
 #[allow(dead_code)]
 pub(crate) fn resolve_device(path: &str) -> Result<(String, DeviceResolution)> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::resolve_device(path)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos::resolve_device(path)
-    }
-    #[cfg(windows)]
-    {
-        windows::resolve_device(path)
-    }
+    platform::resolve_device(path)
 }
 
 #[cfg(test)]
