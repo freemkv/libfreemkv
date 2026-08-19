@@ -947,11 +947,16 @@ impl Disc {
                     //
                     // The Blu-ray half of this same fix already warns; this
                     // file had no diagnostics at all. Logging is exempt from
-                    // the crate's no-English rule (errors stay numeric: E6017).
+                    // the crate's no-English rule (errors stay numeric).
+                    //
+                    // Named constant, not the literal 6017 this used to carry:
+                    // a hardcoded code in the very file whose sibling arm was
+                    // changed to stop doing that is the next drift waiting to
+                    // happen, and the literal cannot follow a renumbering.
                     tracing::warn!(
                         target: "freemkv::disc",
                         clip = ?name,
-                        code = 6017,
+                        code = crate::error::E_UDF_UNRECORDED_EXTENT,
                         "clip carries an unrecorded extent; dropping every title that names it"
                     );
                     unusable.insert(name.to_ascii_lowercase());
@@ -983,7 +988,55 @@ impl Disc {
                     unusable.insert(name.to_ascii_lowercase());
                 }
             }
-            if !extents.is_empty() {
+            // A clip that resolved with NO usable extent is unusable too, and
+            // for exactly the same reason as the `Err` arms above.
+            //
+            // Round 1 accounted for every `Err` from `file_extents` and left
+            // this route open: `Ok` can still yield an empty AD list, or a list
+            // every entry of which the `sectors > 0 && lba > 0` filter above
+            // discards (a zero-length placeholder AD, or one pointing at LBA
+            // 0 — see `UdfFs::file_extents`). The clip then entered NEITHER
+            // `clip_extents` NOR `unusable`, and nothing was logged. The
+            // composer's `any(|n| unusable.contains(..))` guard below therefore
+            // missed it and the `filter(|n| clip_extents.contains_key(..))`
+            // beside it quietly deleted the part: a `FEATURE_2.EVO` of size 0
+            // next to a healthy `FEATURE_1.EVO` composed a FEATURE title out of
+            // part one alone, still advertising the whole runtime, at rc=0,
+            // silently. That is strictly WORSE than the `Err` case this guard
+            // was built for — half a movie presented as a whole one — and it is
+            // reachable from an ordinary zero-byte file, no crafting needed.
+            //
+            // WHY THE BLU-RAY HALF DELIBERATELY DIFFERS. `bluray.rs` documents
+            // this same `Ok`-but-empty hole as a KNOWN GAP and leaves it open,
+            // and that decision still stands there — not here. Two things are
+            // different. (1) Cost: BD has no `unusable` set, so closing it
+            // there means a post-loop "every clip_id must appear in `spans`"
+            // invariant that DROPS the title, and it is not settled that an
+            // empty-but-Ok resolve is always a defect rather than a legitimate
+            // healthy-disc state; dropping healthy titles is worse than the
+            // gap. Here the set already exists, so refusing costs nothing new.
+            // (2) Consequence: on BD the clip is one PlayItem of a title that
+            // is otherwise whole; on HD-DVD the authored feature is COMPOSED
+            // from parts, so the missing one is silently spliced out of a title
+            // that keeps claiming the full runtime. Same hole, different price.
+            // The asymmetry is deliberate; it is written down here so the next
+            // audit reads a decision instead of finding an oversight.
+            //
+            // `insert` returning false means an `Err` arm above already logged
+            // this clip — no second line for one clip.
+            if extents.is_empty() {
+                if unusable.insert(name.to_ascii_lowercase()) {
+                    // Not the neighbouring 6017: an empty AD list is not an
+                    // unrecorded extent, and flattening the two would account a
+                    // zero-byte file as an authoring hole.
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        clip = ?name,
+                        code = crate::error::E_UDF_NO_USABLE_EXTENT,
+                        "clip resolved to no usable extent; dropping every title that names it"
+                    );
+                }
+            } else {
                 clip_extents.insert(name.to_ascii_lowercase(), (name.clone(), *size, extents));
             }
         }
@@ -1460,6 +1513,161 @@ mod tests {
                 .iter()
                 .all(|t| t.extents.iter().all(|e| e.start_lba != PART_START + 7999)),
             "no title may read the unrecorded extent"
+        );
+    }
+
+    /// The refusal above must also be ACCOUNTED, with the unrecorded extent's
+    /// own code.
+    ///
+    /// This warn site carried a hardcoded `code = 6017` literal — in the very
+    /// file whose sibling arm was changed to stop doing exactly that — and
+    /// nothing tested it, so neither the literal nor its absence broke
+    /// anything. Refusing a feature and saying nothing leaves the operator
+    /// with a disc that scanned "fine" and is quietly missing its main title.
+    ///
+    /// Mutations: deleting the `tracing::warn!` (no event to find); restoring
+    /// the literal `6017` still passes here BY VALUE, which is the point —
+    /// what is pinned is `E_UDF_UNRECORDED_EXTENT`'s value reaching the log,
+    /// so a renumbering that the literal could not follow goes red; logging a
+    /// neighbouring code (e.g. `E_UDF_NO_USABLE_EXTENT`) goes red immediately.
+    #[test]
+    fn scan_hddvd_logs_an_unrecorded_feature_part_with_its_own_code() {
+        let mut disc = MemDisc::new();
+        let vti = synthetic_vti(&["FEATURE_1.EVO", "FEATURE_2.EVO"]);
+        let files = vec![
+            file("FEATURE_1.EVO", 100, 5000, 10 * 2048, true),
+            file("FEATURE_2.EVO", 101, 8000, 6 * 2048, true),
+            file_with("HVA00001.VTI", 103, 15000, vti, true),
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        // Same crafted ICB as the test above: an unrecorded (type 1) extent
+        // ahead of FEATURE_2's real content.
+        let mut icb = build_file_icb(6 * 2048, 8000, false);
+        icb[212..216].copy_from_slice(&16u32.to_le_bytes());
+        icb[216..220].copy_from_slice(&0x4000_0800u32.to_le_bytes());
+        icb[220..224].copy_from_slice(&7999u32.to_le_bytes());
+        icb[224..228].copy_from_slice(&(6u32 * 2048).to_le_bytes());
+        icb[228..232].copy_from_slice(&8000u32.to_le_bytes());
+        disc.put_bytes(PART_START + 101, &icb);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let (_titles, events) = crate::testlog::capture(|| {
+            Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan")
+        });
+        let line = events
+            .iter()
+            .find(|e| e.field("clip") == Some("\"FEATURE_2.EVO\""))
+            .unwrap_or_else(|| panic!("the refused clip must be logged; got {events:?}"));
+        assert_eq!(line.target, "freemkv::disc");
+        assert_eq!(line.level, tracing::Level::WARN);
+        assert_eq!(
+            line.field("code"),
+            Some(crate::error::E_UDF_UNRECORDED_EXTENT.to_string().as_str()),
+            "{line:?}"
+        );
+    }
+
+    /// The `Ok`-but-empty twin of the test above, and the one that actually
+    /// bites on an ordinary disc: a feature part whose `file_extents` call
+    /// SUCCEEDS and yields nothing usable — here a zero-byte `FEATURE_2.EVO`,
+    /// no crafted ICB required — must refuse the composition too, and must say
+    /// so in the log.
+    ///
+    /// Before this, the empty-`Ok` clip entered neither `clip_extents` nor
+    /// `unusable`, so the `any(|n| unusable.contains(..))` guard missed it and
+    /// the `filter(|n| clip_extents.contains_key(..))` beside it quietly
+    /// DELETED the part: the scan composed a `FEATURE` title out of part one
+    /// alone, still advertising itself as the feature, at rc=0, with no
+    /// diagnostic anywhere. Half a movie presented as a whole one — strictly
+    /// worse than the `Err` case the guard was built for, and reachable
+    /// without a hostile disc.
+    ///
+    /// Mutations this catches, all of which the pre-fix code exhibited:
+    ///   * dropping the `extents.is_empty()` branch entirely -> a `FEATURE`
+    ///     title appears with one extent;
+    ///   * inserting into `clip_extents` anyway -> same;
+    ///   * marking the clip unusable but NOT logging -> the log assertion
+    ///     fails (absence of a log is itself the defect: nothing else in the
+    ///     system records that a part of the feature went missing);
+    ///   * logging the neighbouring `E_UDF_UNRECORDED_EXTENT` instead of
+    ///     `E_UDF_NO_USABLE_EXTENT` -> the code assertion fails, because a
+    ///     zero-length file is not an authoring hole and triaging the two
+    ///     together sends whoever reads it at the wrong population.
+    #[test]
+    fn scan_hddvd_does_not_compose_a_feature_over_a_part_with_no_usable_extent() {
+        let mut disc = MemDisc::new();
+        let vti = synthetic_vti(&["FEATURE_1.EVO", "FEATURE_2.EVO", "TRAILER.EVO"]);
+        let files = vec![
+            file("FEATURE_1.EVO", 100, 5000, 10 * 2048, true),
+            // Size 0 -> `file_extents` returns Ok with a zero-sector AD, which
+            // the `sectors > 0 && lba > 0` filter discards. No error is ever
+            // returned; the clip simply resolves to nothing.
+            file("FEATURE_2.EVO", 101, 8000, 0, true),
+            file("TRAILER.EVO", 102, 12000, 2 * 2048, true),
+            file_with("HVA00001.VTI", 103, 15000, vti, true),
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let (titles, events) = crate::testlog::capture(|| {
+            Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan")
+        });
+
+        assert!(
+            !titles.iter().any(|t| t.playlist == "FEATURE"),
+            "a feature part that resolved to no usable extent must not be \
+             composed into a title that silently omits it while claiming the \
+             whole feature; got {:?}",
+            titles
+                .iter()
+                .map(|t| (&t.playlist, t.extents.len(), t.size_bytes))
+                .collect::<Vec<_>>()
+        );
+        // Refusing the composition is not refusing the disc.
+        assert!(
+            titles.iter().any(|t| t.playlist == "FEATURE_1.EVO"),
+            "the part that DID resolve is still offered standalone"
+        );
+        assert!(titles.iter().any(|t| t.playlist == "TRAILER.EVO"));
+
+        // ...and it is accounted, with its own code, naming the clip.
+        let line = events
+            .iter()
+            .find(|e| e.target == "freemkv::disc" && e.field("clip") == Some("\"FEATURE_2.EVO\""))
+            .unwrap_or_else(|| panic!("the dropped clip must be logged; got {events:?}"));
+        assert_eq!(line.level, tracing::Level::WARN);
+        assert_eq!(
+            line.field("code"),
+            Some(crate::error::E_UDF_NO_USABLE_EXTENT.to_string().as_str()),
+            "the condition's OWN code, not a neighbouring one: {line:?}"
         );
     }
 

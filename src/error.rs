@@ -67,6 +67,19 @@ pub const E_IMAGE_TRUNCATED: u16 = 6015;
 pub const E_UDF_AD_CHAIN_TOO_LONG: u16 = 6016;
 pub const E_UDF_UNRECORDED_EXTENT: u16 = 6017;
 pub const E_UDF_EMBEDDED_DATA: u16 = 6018;
+/// A file that EXISTS and whose allocation descriptors resolved without error,
+/// yet yields not one usable extent: an empty AD list, or a list every entry of
+/// which is zero-length or points at LBA 0. Reported by the HD-DVD clip
+/// resolver (`disc::hddvd`).
+///
+/// It has no [`Error`] variant on purpose. `UdfFs::file_extents` returns
+/// `Ok(vec![])` here rather than failing — the emptiness is only a defect in
+/// the eye of a caller that needs bytes — so the condition is DETECTED by the
+/// caller, not returned to it. The code exists so that detection can be
+/// accounted in the log with something other than a neighbouring error's code:
+/// logging it as E6017 would file a zero-length AD list as an authoring hole
+/// and send whoever triages it at the wrong population.
+pub const E_UDF_NO_USABLE_EXTENT: u16 = 6019;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -1900,133 +1913,129 @@ mod tests {
 
     // ── New comprehensive tests ────────────────────────────────────────────────
 
+    /// Every `pub const E_*` code declared in this file, as
+    /// `(name, value)`, PARSED OUT OF THE SOURCE at compile time.
+    ///
+    /// WHY THIS IS PARSED AND NOT LISTED. The uniqueness test below used to
+    /// carry a hand-maintained `vec![]` of the constants, with a doc comment
+    /// claiming it "pins all code assignments". It did not. At the time this
+    /// was written the file declared **127** `pub const E_*` and the vector
+    /// named **109** of them: eighteen codes — `E_DIR_IMAGE_FANOUT`,
+    /// `E_DIR_INSUFFICIENT_SPACE`, `E_DIR_MULTIPASS_REJECTED`,
+    /// `E_DIR_NAME_COLLISION`, `E_DIR_NAME_TOO_LONG`, `E_DIR_NOT_EMPTY`,
+    /// `E_DIR_RAW_REJECTED`, `E_DIR_SOURCE_UNSUPPORTED`, `E_DIR_WRITE_FAILED`,
+    /// `E_DRIVE_INQUIRY_SHORT`, `E_EMPTY_IMAGE`, `E_MP4_UNKNOWN_RESOLUTION`,
+    /// `E_SEAM_PLAN_DROPPED_MOST`, `E_SHORT_IMAGE_READ`, `E_SINK_WROTE_NOTHING`,
+    /// `E_SOURCE_TERMINATED`, `E_SYNC_TIMEOUT`, `E_SYNC_WORKER_LOST` — were
+    /// outside the guarantee entirely, so a new variant colliding with any of
+    /// them passed green. Worse, an earlier audit READ that doc comment and
+    /// trusted it while assigning new codes.
+    ///
+    /// The defect is not the eighteen omissions, it is that the list is
+    /// hand-maintained at all: adding a constant and forgetting the vector is
+    /// a silent no-op, which is the definition of a guarantee that decays.
+    /// Deriving the list from the declarations makes forgetting impossible —
+    /// the only way to escape the check is to stop declaring the constant.
+    ///
+    /// `include_str!` of this very file is the cheapest seam that does that:
+    /// no `build.rs`, no proc macro, no dependency, and — being `#[cfg(test)]`
+    /// — not one byte of the source embedded in a release build.
+    fn declared_error_codes() -> Vec<(&'static str, u16)> {
+        const SRC: &str = include_str!("error.rs");
+        SRC.lines()
+            .filter_map(|line| {
+                // Only real declarations at column 0. A retired code is
+                // recorded as `// 2001: burned/retired`, which carries no `pub
+                // const` and is therefore correctly invisible here.
+                let decl = line.strip_prefix("pub const ")?;
+                let (name, value) = decl.split_once(": u16 = ")?;
+                if !name.starts_with("E_") {
+                    return None;
+                }
+                let value = value.strip_suffix(';')?;
+                Some((
+                    name,
+                    value
+                        .parse::<u16>()
+                        .unwrap_or_else(|_| panic!("non-literal error code for `{name}`")),
+                ))
+            })
+            .collect()
+    }
+
+    /// The parser above must actually FIND the declarations, and read their
+    /// values correctly. Without this, a `declared_error_codes` that returned
+    /// an empty vector would make the uniqueness test below pass vacuously —
+    /// exactly the failure mode (a guarantee that is really a no-op) this
+    /// whole change exists to remove.
+    ///
+    /// Mutation: a `strip_prefix` typo, an off-by-one in the name slice, or a
+    /// parser that drops the last line fails here.
+    #[test]
+    fn declared_error_codes_parses_the_declarations_it_claims_to() {
+        let declared = declared_error_codes();
+        // Independent count of the declarations, computed a different way
+        // from the parser under test.
+        let expected = include_str!("error.rs")
+            .lines()
+            .filter(|l| l.starts_with("pub const E_"))
+            .count();
+        assert_eq!(
+            declared.len(),
+            expected,
+            "the parser must see every `pub const E_*` line"
+        );
+        assert!(
+            expected >= 120,
+            "sanity floor: this file declares well over a hundred codes, got {expected}"
+        );
+        // Names and values must match the compiled constants, so a parser that
+        // mis-slices the name or mis-reads the digits cannot pass.
+        for (name, value) in [
+            ("E_DEVICE_NOT_FOUND", E_DEVICE_NOT_FOUND),
+            ("E_UDF_UNRECORDED_EXTENT", E_UDF_UNRECORDED_EXTENT),
+            ("E_KEYDB_PARSE", E_KEYDB_PARSE),
+        ] {
+            assert!(
+                declared.contains(&(name, value)),
+                "`{name}` = {value} not parsed out of the source; got {:?}",
+                declared
+                    .iter()
+                    .filter(|(n, _)| *n == name)
+                    .collect::<Vec<_>>()
+            );
+        }
+        // A comment-only retired code must NOT be picked up as a constant.
+        assert!(
+            !declared.iter().any(|(n, _)| n.is_empty()),
+            "no empty names"
+        );
+    }
+
     /// Every published error code constant must be unique.
-    /// This pins all code assignments: a new variant that accidentally reuses
-    /// an existing code will make this test fail.
-    /// Mutation: changing E_KEYDB_PARSE from 8004 to 8000 (duplicating E_KEYDB_CONNECT) fails here.
+    ///
+    /// The set is derived from the declarations by
+    /// [`declared_error_codes`], so — unlike the hand-kept vector this
+    /// replaced — a newly added constant is covered the moment it is
+    /// written, with no second edit to remember.
+    ///
+    /// Mutation: changing E_KEYDB_PARSE from 8004 to 8000 (duplicating
+    /// E_KEYDB_CONNECT) fails here, and so now does the same collision on any
+    /// of the eighteen codes the old hand-kept list had never heard of.
     #[test]
     fn all_error_code_constants_are_unique() {
-        let mut codes = vec![
-            E_DEVICE_NOT_FOUND,
-            E_DEVICE_PERMISSION,
-            E_DEVICE_NOT_READY,
-            E_DEVICE_RESET_FAILED,
-            E_SCSI_INTERFACE_UNAVAILABLE,
-            E_DEVICE_LOCKED,
-            E_IOKIT_PLUGIN_FAILED,
-            E_UNSUPPORTED_DRIVE,
-            E_PROFILE_PARSE,
-            E_UNSUPPORTED_PLATFORM,
-            E_PLATFORM_NOT_IMPLEMENTED,
-            E_UNLOCK_FAILED,
-            E_SIGNATURE_MISMATCH,
-            E_SCSI_ERROR,
-            E_INVALID_CDB_LENGTH,
-            E_IO_ERROR,
-            E_DISC_READ,
-            E_MPLS_PARSE,
-            E_CLPI_PARSE,
-            E_UDF_NOT_FOUND,
-            E_DISC_TITLE_RANGE,
-            E_IFO_PARSE,
-            E_MKV_INVALID,
-            E_NO_STREAMS,
-            E_HALTED,
-            E_MAPFILE_INVALID,
-            E_IMAGE_TRUNCATED,
-            E_UDF_BUFFER_TOO_SMALL,
-            E_UDF_NOT_FILESYSTEM,
-            // These four were absent, so the "every published code is unique"
-            // claim above did not actually cover them: a new variant reusing
-            // 6014, 6016 or 6017 would have passed this test.
-            E_SELECTION_PID_UNKNOWN,
-            E_UDF_AD_CHAIN_TOO_LONG,
-            E_UDF_UNRECORDED_EXTENT,
-            E_UDF_EMBEDDED_DATA,
-            E_AACS_NO_KEYS,
-            E_AACS_CERT_SHORT,
-            E_AACS_AGID_ALLOC,
-            E_AACS_CERT_REJECTED,
-            E_AACS_CERT_READ,
-            E_AACS_CERT_VERIFY,
-            E_AACS_KEY_READ,
-            E_AACS_KEY_REJECTED,
-            E_AACS_KEY_VERIFY,
-            E_AACS_VID_READ,
-            E_AACS_VID_MAC,
-            E_AACS_DATA_KEY,
-            E_DECRYPT_FAILED,
-            E_CSS_AUTH_FAILED,
-            E_AACS_HOST_CERT_REJECTED,
-            E_AACS_RAW_READ_UNSUPPORTED,
-            E_AACS_VID_UNAVAILABLE,
-            E_AACS_MK_UNAVAILABLE,
-            E_AACS_VUK_NOT_IN_KEYDB,
-            E_DRIVE_PROFILE_MISSING,
-            E_VID_CDB_UNAVAILABLE,
-            E_NO_DISC_KEY,
-            E_CSS_KEY_MISSING,
-            E_CSS_NO_DISC_KEY,
-            E_KEY_SERVICE_UNAVAILABLE,
-            E_KEY_SERVICE_UNAUTHORIZED,
-            E_KEY_SERVICE_RATE_LIMITED,
-            E_AACS_NO_HOST_CERT,
-            E_AACS_BUS_KEY_UNAVAILABLE,
-            E_FMTS_KEY_MISSING,
-            E_KEYDB_CONNECT,
-            E_KEYDB_HTTP,
-            E_KEYDB_INVALID,
-            E_KEYDB_WRITE,
-            E_KEYDB_PARSE,
-            E_KEYDB_LOAD,
-            E_KEYDB_UNSUPPORTED_SCHEME,
-            E_KEYDB_TOO_MANY_REDIRECTS,
-            E_STREAM_READ_ONLY,
-            E_STREAM_WRITE_ONLY,
-            E_STREAM_URL_INVALID,
-            E_STREAM_URL_MISSING_PATH,
-            E_STREAM_URL_MISSING_PORT,
-            E_NETWORK_ADDR_BLOCKED,
-            E_MUX_EMPTY,
-            E_MUX_HEADER_BUFFER_EXCEEDED,
-            E_MKV_LACING_INVALID,
-            E_MKV_SOURCE_INVALID,
-            E_MKV_UNENCODABLE,
-            E_MP4_NO_VIDEO_TRACK,
-            E_MP4_INVALID,
-            E_MP4_MISSING_CODEC_PRIVATE,
-            E_PES_FRAME_TOO_LARGE,
-            E_PES_INVALID_MAGIC,
-            E_PES_TRACK_TOO_LARGE,
-            E_ISO_TOO_LARGE,
-            E_NO_METADATA,
-            E_DISC_URL_NOT_DIRECT,
-            E_HEVC_PARAM_PARSE,
-            E_MUX_TRACK_RANGE,
-            E_FMP4_UNIMPLEMENTED,
-            E_DEMUX_THREAD_PANICKED,
-            E_PIPELINE_JOIN_TIMEOUT,
-            E_PIPELINE_CONSUMER_PANICKED,
-            E_SWEEP_CONSUMER_GONE,
-            E_PIPELINE_CONSUMER_GONE,
-            E_DISC_CAPACITY_OVERFLOW,
-            E_M2TS_PACKET_MALFORMED,
-            E_EXTENT_NOT_UNIT_ALIGNED,
-            E_DISC_CAPACITY_MALFORMED,
-            E_DIR_IMAGE_SSIF_UNSUPPORTED,
-            E_DIR_IMAGE_PLACEMENT,
-            E_DIR_IMAGE_ENCRYPTED,
-            E_DIR_IMAGE_UNSUPPORTED_TREE,
-            E_DIR_IMAGE_FILE_CHANGED,
-            E_DIR_IMAGE_TOO_LARGE,
-        ];
-        let original_len = codes.len();
-        codes.sort();
-        codes.dedup();
-        assert_eq!(
-            codes.len(),
-            original_len,
-            "duplicate error code constants detected — check error.rs"
+        let mut by_code: std::collections::BTreeMap<u16, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for (name, value) in declared_error_codes() {
+            by_code.entry(value).or_default().push(name);
+        }
+        let dupes: Vec<_> = by_code
+            .iter()
+            .filter(|(_, names)| names.len() > 1)
+            .collect();
+        assert!(
+            dupes.is_empty(),
+            "duplicate error code constants detected — check error.rs: {dupes:?}"
         );
     }
 

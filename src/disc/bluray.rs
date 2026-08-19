@@ -285,18 +285,57 @@ impl Disc {
                 // feed is silently missing this clip's runtime while its
                 // durations, spans and size still count it — data loss
                 // wearing the shape of a normal rip.
-                if let (None, Some(code)) = (&file_exts, unresolved) {
-                    // The REAL code, not a fixed one. A scratched sector
-                    // (E6000) and an over-long AD chain (E6016) logged as
-                    // E6017 would send anyone triaging them after authoring
-                    // holes and hide the population that actually exists.
-                    tracing::warn!(
-                        target: "freemkv::disc",
-                        playlist = ?filename,
-                        clip = ?play_item.clip_id,
-                        "E{}", code
-                    );
-                    return Ok(None);
+                match (&file_exts, unresolved) {
+                    (None, Some(code)) => {
+                        // The REAL code, not a fixed one. A scratched sector
+                        // (E6000) and an over-long AD chain (E6016) logged as
+                        // E6017 would send anyone triaging them after authoring
+                        // holes and hide the population that actually exists.
+                        tracing::warn!(
+                            target: "freemkv::disc",
+                            playlist = ?filename,
+                            clip = ?play_item.clip_id,
+                            "E{}", code
+                        );
+                        return Ok(None);
+                    }
+                    // A non-absence failure that the FALLBACK then papered
+                    // over. `unresolved` was recorded and then thrown away:
+                    // the `if let (None, Some(code))` above is the only reader
+                    // of it, so when `/BDMV/STREAM/SSIF/<clip>.ssif` failed
+                    // with `DiscRead` / `UdfAdChainTooLong` / `UdfEmbeddedData`
+                    // but the `.m2ts` beside it resolved, the code was dropped
+                    // on the floor. The title then shipped BASE-VIEW 2D off a
+                    // disc that carries 3D, at rc=0, with not one log line —
+                    // the operator gets a rip that looks complete and is
+                    // missing the dependent view, and there is nothing in the
+                    // journal to explain it or to distinguish it from a disc
+                    // that was only ever 2D.
+                    //
+                    // This site's own doctrine, three paragraphs up, is
+                    // "ABSENCE is the only benign failure" — `note()` already
+                    // filters `UdfNotFound` out, so anything left in
+                    // `unresolved` is by construction NOT benign. Reaching
+                    // here means it was silently tolerated anyway.
+                    //
+                    // It is LOGGED, not refused. The fallback genuinely
+                    // produced a truthful read plan for the base view, so the
+                    // title is complete as 2D; dropping it would trade a
+                    // degraded rip for no rip, which is the worse of the two
+                    // and is not what the refusal above is for. The line
+                    // carries the error's OWN code for the same reason as
+                    // every other site in this file.
+                    (Some(_), Some(code)) => {
+                        tracing::warn!(
+                            target: "freemkv::disc",
+                            playlist = ?filename,
+                            clip = ?play_item.clip_id,
+                            fell_back = true,
+                            code = code,
+                            "E{}", code
+                        );
+                    }
+                    _ => {}
                 }
                 // KNOWN GAP, deliberately left open: `file_extents` can also
                 // return `Ok(vec![])`, or a vector every entry of which the
@@ -312,6 +351,18 @@ impl Disc {
                 // healthy titles is a worse failure than the residual gap.
                 // Recorded here so the next audit finds the decision instead
                 // of re-deriving it.
+                //
+                // ASYMMETRY, DELIBERATE: `disc::hddvd` CLOSES this same hole.
+                // Two things differ there. It already keeps an `unusable` set,
+                // so refusing costs nothing new (here it would mean inventing
+                // a post-loop "every clip_id must appear in `spans`"
+                // invariant). And the consequence is worse: an HD-DVD feature
+                // is COMPOSED from parts, so a missing part is spliced out of
+                // a title that keeps claiming the full runtime, whereas here
+                // the clip is one PlayItem of an otherwise whole title. Same
+                // hole, different price — see the long note at the
+                // `extents.is_empty()` branch in `hddvd.rs`. If BD ever grows
+                // an equivalent set, revisit this together with that one.
                 if let Some(file_exts) = file_exts {
                     let span_start = feed_pos;
                     for (lba, sectors) in file_exts {
@@ -1174,6 +1225,15 @@ mod tests {
     /// The correct behaviour is the same as for a clip whose extents cannot be
     /// resolved (see `parse_playlist_unreadable_clip_icb_yields_no_title`):
     /// drop the title and log the read's OWN error code.
+    ///
+    /// That last clause is now ASSERTED, not merely asked for. The site's
+    /// comment insists on `e.code()` because a missing `.clpi` (E6003), a
+    /// scratched one (E6000) and a malformed one (E6002) are different
+    /// populations, but nothing checked it: putting a literal back compiled
+    /// and passed. Mutation: `"E6017"` (or any fixed code) in place of
+    /// `"E{}", e.code()` fails here, and so does dropping the warn entirely —
+    /// a silent drop is the same invisible title loss this test was written
+    /// for, one step later.
     #[test]
     fn parse_playlist_missing_clpi_yields_no_title() {
         let mut disc = MemDisc::new();
@@ -1227,13 +1287,27 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00009.mpls", &mpls).expect("scan");
+        let (t, events) = crate::testlog::capture(|| {
+            Disc::parse_playlist(&mut disc, &udf, "00009.mpls", &mpls).expect("scan")
+        });
         assert!(
             t.is_none(),
             "a clip with no .clpi cannot be sized or resolved, so offering the \
              title would advertise the full play-item runtime with none of the \
              clip's bytes behind it; got {:?}",
             t.map(|t| (t.size_bytes, t.extents))
+        );
+        let line = events
+            .iter()
+            .find(|e| e.target == "freemkv::disc")
+            .unwrap_or_else(|| panic!("a dropped title must be accounted; got {events:?}"));
+        assert_eq!(line.field("clip"), Some("\"00009\""));
+        assert_eq!(
+            line.message(),
+            format!("E{}", crate::error::E_UDF_NOT_FOUND),
+            "the read's OWN code — an absent .clpi is not a scratched or \
+             malformed one, and triaging them together hides the population \
+             that actually exists: {line:?}"
         );
     }
 
@@ -1420,13 +1494,142 @@ mod tests {
             &[],
             &[],
         );
-        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("scan");
+        let (t, events) = crate::testlog::capture(|| {
+            Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("scan")
+        });
         assert!(
             t.is_none(),
             "a clip whose extents could not be resolved must drop the title, \
              not yield one that counts the clip's runtime and ships none of \
              its bytes; got {:?}",
             t.map(|t| (t.size_bytes, t.extents))
+        );
+        // ...and the refusal is accounted with the SCRATCH's own code.
+        // Mutation: a fixed `"E6017"` here files a scratched sector as an
+        // authoring hole and fails this assertion.
+        let line = events
+            .iter()
+            .find(|e| e.target == "freemkv::disc")
+            .unwrap_or_else(|| panic!("a dropped title must be accounted; got {events:?}"));
+        assert_eq!(
+            line.message(),
+            format!("E{}", crate::error::E_DISC_READ),
+            "the error's OWN code: {line:?}"
+        );
+    }
+
+    /// A non-absence SSIF failure that the `.m2ts` fallback then papers over
+    /// must be LOGGED, with its own code.
+    ///
+    /// `unresolved` had exactly one reader — `if let (None, Some(code))` — so
+    /// a code recorded for `/BDMV/STREAM/SSIF/<clip>.ssif` was thrown away
+    /// whenever the fallback succeeded. The disc here IS a 3D disc: the SSIF
+    /// is present and carries both eyes, and only its ICB is unreadable (a
+    /// scratched sector, the ordinary way this happens). The title shipped
+    /// base-view 2D at rc=0 with `is_3d` false and NOT ONE LOG LINE, so the
+    /// operator's rip is silently missing the dependent view and the journal
+    /// cannot tell this disc apart from one that was only ever 2D.
+    ///
+    /// The title is deliberately still RETURNED — the base view resolved, so
+    /// refusing would trade a degraded rip for no rip. The defect being fixed
+    /// is the silence, not the fallback.
+    ///
+    /// Mutations this catches: deleting the new `(Some(_), Some(code))` arm,
+    /// or restoring the `if let (None, Some(code))` shape, leaves no event to
+    /// find; logging a fixed code instead of `e.code()` fails the code
+    /// assertion; making the arm `return Ok(None)` fails the title assertion.
+    #[test]
+    fn parse_playlist_logs_a_non_absence_ssif_failure_the_m2ts_fallback_hid() {
+        let mut disc = MemDisc::new();
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![
+                DirSpec {
+                    name: "STREAM".to_string(),
+                    icb_lba: 22,
+                    dir_data_lba: 23,
+                    // The base view is healthy and resolves normally.
+                    files: vec![file("00001.m2ts", 100, 5000, 1000 * 2048, true)],
+                    subdirs: vec![DirSpec {
+                        name: "SSIF".to_string(),
+                        icb_lba: 26,
+                        dir_data_lba: 27,
+                        files: vec![file("00001.ssif", 104, 6000, 4096, false)],
+                        subdirs: vec![],
+                    }],
+                },
+                DirSpec {
+                    name: "CLIPINF".to_string(),
+                    icb_lba: 24,
+                    dir_data_lba: 25,
+                    files: vec![file_with("00001.clpi", 102, 8000, build_clpi(4000), false)],
+                    subdirs: vec![],
+                },
+            ],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        // Corrupt ONLY the SSIF's descriptor tag: structurally valid ICB
+        // behind a tag the parser rejects, i.e. what a garbled sector looks
+        // like. Not an absence — the directory entry is still there.
+        let mut icb = build_file_icb(4096, 6000, false);
+        icb[0..2].copy_from_slice(&999u16.to_le_bytes());
+        disc.put_bytes(PART_START + 104, &icb);
+        let udf = udf::read_filesystem(&mut disc).expect("fs");
+
+        // The fixture must really produce a NON-ABSENCE error on the SSIF and
+        // a clean resolve on the .m2ts, or the behaviour under test is never
+        // reached and the test would pass for the wrong reason.
+        assert!(
+            matches!(
+                udf.file_extents(&mut disc, "/BDMV/STREAM/SSIF/00001.ssif"),
+                Err(Error::DiscRead { .. })
+            ),
+            "fixture must fail the SSIF with DiscRead, not UdfNotFound"
+        );
+        assert!(
+            udf.file_extents(&mut disc, "/BDMV/STREAM/00001.m2ts")
+                .is_ok()
+        );
+
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let (t, events) = crate::testlog::capture(|| {
+            Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("scan")
+        });
+        let t = t.expect("the base view resolved, so the 2D title still ships");
+        assert_eq!(t.extents.len(), 1, "base-view extents present");
+
+        let line = events
+            .iter()
+            .find(|e| e.target == "freemkv::disc")
+            .unwrap_or_else(|| {
+                panic!("silently shipping 2D off a 3D disc must be logged; got {events:?}")
+            });
+        assert_eq!(line.level, tracing::Level::WARN);
+        assert_eq!(line.field("clip"), Some("\"00001\""));
+        assert_eq!(
+            line.message(),
+            format!("E{}", crate::error::E_DISC_READ),
+            "the SSIF failure's OWN code, not a fixed one: {line:?}"
         );
     }
 
