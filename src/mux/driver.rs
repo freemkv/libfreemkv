@@ -129,15 +129,6 @@ pub enum MuxInput<'a> {
         title: DiscTitle,
         /// Container format of the title (TS vs PS demuxer selection).
         format: crate::disc::ContentFormat,
-        /// The scanned disc's FAMILY (`disc.format`) — a different axis from
-        /// `format`, which is only the container. DVD and HD-DVD are both
-        /// `ContentFormat::MpegPs`, yet only DVD can carry CSS, so this is what
-        /// gates the per-title CSS crack in [`build_iso_pipeline`]. Pass
-        /// [`crate::disc::DiscFormat::Unknown`] only when the disc was genuinely
-        /// never scanned: that value still runs the crack, which is the safe
-        /// direction (skipping it on a real DVD would mux ciphertext as
-        /// plaintext at exit 0).
-        disc_format: crate::disc::DiscFormat,
         /// Decryption keys for the title (`DecryptKeys::None` for raw/clear).
         keys: DecryptKeys,
         /// Optional read-time key fetch closure (banked by `resolve_keys`).
@@ -160,12 +151,6 @@ pub enum MuxInput<'a> {
         title: DiscTitle,
         /// Container format (TS vs PS demux selection).
         format: crate::disc::ContentFormat,
-        /// The scanned disc's FAMILY (`disc.format`), the CSS-eligibility axis
-        /// — see [`MuxInput::Iso::disc_format`]. Without it the inline
-        /// `DiscStream` cannot tell an HD-DVD `.evo` from a DVD `.vob` (both
-        /// are `ContentFormat::MpegPs`) and would run a CSS crack that an
-        /// AACS-family disc can never satisfy.
-        disc_format: crate::disc::DiscFormat,
         /// Decryption keys the consumer already banked (`DecryptKeys::None` for
         /// raw/clear). The driver consumes them as-is — never re-resolves.
         keys: DecryptKeys,
@@ -366,7 +351,6 @@ pub fn mux_stream(
                 path,
                 title,
                 format,
-                disc_format,
                 keys,
                 key_fetch,
             } => {
@@ -398,7 +382,6 @@ pub fn mux_stream(
                     keys,
                     opts.batch_sectors,
                     format,
-                    disc_format,
                     opts.raw,
                     Some(halt.clone()),
                     Some(reader_event_fn(events.clone())),
@@ -413,7 +396,7 @@ pub fn mux_stream(
                 // Pull everything we need out of the disc as owned values so the
                 // immutable disc borrow is released before the mutable
                 // `take_reader` below.
-                let (mut title, format, disc_format, mut keys, playlist, source) = {
+                let (mut title, format, mut keys, playlist, source) = {
                     let disc = session.disc().ok_or_else(|| Error::DeviceNotReady {
                         path: session.device_path().to_string(),
                     })?;
@@ -441,15 +424,9 @@ pub fn mux_stream(
                     };
                     // DVD CSS is per-VTS: resolve the per-title key via the pipeline
                     // (see `session_mux_keys`), never the whole-disc `decrypt_keys()`.
-                    // `disc.content_format` is the container; `disc.format` is
-                    // the disc FAMILY. Both are carried out of the borrow: the
-                    // first picks the demuxer, the second decides whether a CSS
-                    // crack is even meaningful (an HD-DVD is MPEG-PS too, and
-                    // has no CSS).
                     (
                         title,
                         disc.content_format,
-                        disc.format,
                         session_mux_keys(disc),
                         playlist,
                         source,
@@ -491,7 +468,6 @@ pub fn mux_stream(
                     keys,
                     opts.batch_sectors,
                     format,
-                    disc_format,
                     opts.raw,
                     Some(halt.clone()),
                 )?;
@@ -512,7 +488,6 @@ pub fn mux_stream(
                 mut reader,
                 title,
                 format,
-                disc_format,
                 mut keys,
                 key_map,
             } => {
@@ -571,7 +546,6 @@ pub fn mux_stream(
                     keys,
                     opts.batch_sectors,
                     format,
-                    disc_format,
                     opts.raw,
                     Some(halt.clone()),
                 )?;
@@ -1657,7 +1631,6 @@ mod tests {
                 path: &iso_path,
                 title,
                 format: crate::disc::ContentFormat::BdTs,
-                disc_format: crate::disc::DiscFormat::BluRay,
                 keys: DecryptKeys::None,
                 key_fetch: None,
             },
@@ -1769,7 +1742,6 @@ mod tests {
                 reader,
                 title,
                 format: crate::disc::ContentFormat::BdTs,
-                disc_format: crate::disc::DiscFormat::BluRay,
                 keys: DecryptKeys::None,
                 key_map: Some(map),
             },
@@ -1892,7 +1864,6 @@ mod tests {
                 reader,
                 title,
                 format: crate::disc::ContentFormat::BdTs,
-                disc_format: crate::disc::DiscFormat::BluRay,
                 keys,
                 key_map: None, // plain AACS disc: the driver must resolve the base map
             },
