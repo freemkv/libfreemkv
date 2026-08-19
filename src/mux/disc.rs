@@ -208,12 +208,25 @@ impl DiscStream {
     /// Works with physical drives and ISO files — both implement SectorSource.
     /// The caller opens the source, scans for titles/keys, and passes them in.
     /// The stream handles demuxing, decryption, and codec parsing internally.
+    ///
+    /// `content_format` is the CONTAINER (TS vs PS demuxer). `disc_format` is
+    /// the DISC FAMILY, and it exists as its own parameter because the two are
+    /// not interchangeable: DVD and HD-DVD are both `ContentFormat::MpegPs`,
+    /// yet only DVD can carry CSS. It gates the per-title CSS crack below. A
+    /// caller that genuinely does not know the disc passes
+    /// [`crate::disc::DiscFormat::Unknown`], which still attempts the crack —
+    /// the safe direction (see [`crate::disc::DiscFormat::may_have_css`]).
+    // Eight params is inherent to a constructor that takes the source, the
+    // title, the keys, both format axes (container and disc family) and the
+    // read-mode flags; grouping them would only relocate the same fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mut reader: Box<dyn SectorSource>,
         title: DiscTitle,
         mut decrypt_keys: crate::decrypt::DecryptKeys,
         batch_sectors: u16,
         content_format: crate::disc::ContentFormat,
+        disc_format: crate::disc::DiscFormat,
         raw: bool,
         halt: Option<Halt>,
     ) -> std::io::Result<Self> {
@@ -223,17 +236,20 @@ impl DiscStream {
         // Resolve this title's CSS key from the reader if the caller supplied
         // none — the SAME shared step the file-backed mux highway
         // (`build_iso_pipeline`) uses, so single-pass and multi-pass descramble a
-        // DVD identically. No-op for AACS / already-keyed / genuinely-clear input
-        // or `raw`; a scrambled-but-uncrackable DVD is a hard `CssKeyMissing`.
-        // `halt` is passed here (not deferred to `with_halt`) so a Stop during the
-        // crack scan is honored — the scan runs at construction, before the caller
-        // can attach a token.
+        // DVD identically. No-op for a disc format that cannot carry CSS (HD-DVD
+        // and the BD families — `disc_format`, NOT the MPEG-PS container, which
+        // DVD and HD-DVD share), for AACS / already-keyed / genuinely-clear
+        // input, and for `raw`; a scrambled-but-uncrackable DVD is a hard
+        // `CssKeyMissing`. `halt` is passed here (not deferred to `with_halt`)
+        // so a Stop during the crack scan is honored — the scan runs at
+        // construction, before the caller can attach a token.
         crate::css::resolve_dvd_title_key(
             &mut *reader,
             &extents,
             &mut decrypt_keys,
             batch_sectors,
             content_format,
+            disc_format,
             raw,
             halt.as_ref(),
         )?;
@@ -1202,6 +1218,7 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8, // request 8 sectors (16384 B); the source delivers 1 (2048 B)
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -1292,6 +1309,7 @@ mod tests {
                     crate::decrypt::DecryptKeys::None,
                     8,
                     ContentFormat::BdTs,
+                    crate::disc::DiscFormat::BluRay,
                     false,
                     None,
                 )
@@ -1328,6 +1346,7 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -1440,6 +1459,7 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -1483,6 +1503,7 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             crate::disc::ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -1518,6 +1539,7 @@ mod tests {
             aacs,
             8,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -1680,6 +1702,7 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -1796,6 +1819,7 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -1859,6 +1883,7 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -1979,6 +2004,7 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -2038,6 +2064,7 @@ mod tests {
             keys,
             8,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -2137,6 +2164,7 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -2181,6 +2209,7 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             crate::disc::ContentFormat::BdTs,
+            crate::disc::DiscFormat::BluRay,
             false,
             None,
         )
@@ -2238,12 +2267,43 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::MpegPs,
+            crate::disc::DiscFormat::Dvd,
             false,
             None,
         );
         assert!(
             res.is_err(),
             "single-pass DiscStream must hard-fail on a scrambled, keyless CSS DVD"
+        );
+    }
+
+    /// The HD-DVD counterpart of the test above, pinned at the SAME boundary so
+    /// the disc-format axis is proven to reach the shared CSS step through this
+    /// constructor and not just inside `css::resolve_dvd_title_key`.
+    ///
+    /// Byte-for-byte identical input to `disc_stream_new_dvd_none_scrambled_hard_fails`
+    /// — same `LockedReader`, same MPEG-PS title, same `None` keys — with only
+    /// the disc format changed. The DVD case must still be refused (E7023) and
+    /// the HD-DVD case must construct: an HD-DVD is AACS and has no CSS, so
+    /// there is no CSS key for it to be missing. Catches the mutation of
+    /// dropping `disc_format` from `DiscStream::new`'s plumbing (or hardcoding
+    /// a CSS-capable value there), which is exactly the shape of the shipped
+    /// defect: E7023 on a perfectly good HD-DVD.
+    #[test]
+    fn disc_stream_new_hddvd_none_scrambled_does_not_hard_fail() {
+        let res = DiscStream::new(
+            Box::new(LockedReader),
+            mpegps_title(8),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::MpegPs,
+            crate::disc::DiscFormat::HdDvd,
+            false,
+            None,
+        );
+        assert!(
+            res.is_ok(),
+            "an HD-DVD must never be refused for a missing CSS key — it carries no CSS"
         );
     }
 
@@ -2258,6 +2318,7 @@ mod tests {
             crate::decrypt::DecryptKeys::None,
             8,
             ContentFormat::MpegPs,
+            crate::disc::DiscFormat::Dvd,
             true, // raw
             None,
         );
@@ -2471,6 +2532,7 @@ mod tests {
                 crate::decrypt::DecryptKeys::None,
                 8,
                 ContentFormat::MpegPs,
+                crate::disc::DiscFormat::Dvd,
                 false,
                 None,
             )
@@ -2592,6 +2654,7 @@ mod tests {
                 },
                 3,
                 ContentFormat::BdTs,
+                crate::disc::DiscFormat::BluRay,
                 false,
                 None,
             )
