@@ -237,6 +237,9 @@ impl Disc {
         let mut result = ExtractResult::default();
         let total_bytes = required;
         let mut done_bytes: u64 = 0;
+        // Cumulative zero-filled-unreadable bytes, so the live progress channel
+        // can report the good/unreadable split instead of pinning unreadable at 0.
+        let mut done_unreadable: u64 = 0;
 
         // CSS per-VTS key cache; only consulted for CSS discs.
         let is_css = matches!(base_keys, DecryptKeys::Css { .. });
@@ -271,8 +274,15 @@ impl Disc {
             // non-tolerate), so extract_one_file already zero-filled it and
             // counted it in bytes_unreadable — one 'lost' bucket covers both
             // media damage and decrypt failure.
-            let (fr, halted) =
-                extract_one_file(&mut dec, dest, pf, total_bytes, &mut done_bytes, opts)?;
+            let (fr, halted) = extract_one_file(
+                &mut dec,
+                dest,
+                pf,
+                total_bytes,
+                &mut done_bytes,
+                &mut done_unreadable,
+                opts,
+            )?;
 
             result.bytes_good = result.bytes_good.saturating_add(fr.bytes_good);
             result.bytes_unreadable = result.bytes_unreadable.saturating_add(fr.bytes_unreadable);
@@ -553,6 +563,7 @@ fn extract_one_file<S: SectorSource>(
     pf: &PlannedFile,
     total_bytes: u64,
     done_bytes: &mut u64,
+    done_unreadable: &mut u64,
     opts: &ExtractOptions,
 ) -> Result<(FileResult, bool)> {
     let final_path = dest.join(&pf.host_rel);
@@ -582,7 +593,7 @@ fn extract_one_file<S: SectorSource>(
         finalize_file(writer, &partial_path, pf.size, &final_path)?;
         fr.complete = true;
         *done_bytes = done_bytes.saturating_add(pf.size);
-        report(opts, *done_bytes, total_bytes);
+        report(opts, *done_bytes, *done_unreadable, total_bytes);
         return Ok((fr, false));
     }
 
@@ -620,7 +631,7 @@ fn extract_one_file<S: SectorSource>(
                 left -= n as u64;
             }
             fr.bytes_good = fr.bytes_good.saturating_add(hole_bytes);
-            let cont = report(opts, *done_bytes, total_bytes);
+            let cont = report(opts, *done_bytes, *done_unreadable, total_bytes);
             if opts.cancelled(cont) {
                 return Ok((fr, true));
             }
@@ -668,10 +679,11 @@ fn extract_one_file<S: SectorSource>(
                 }
                 write_all(&mut writer, &buf[..usable], &partial_path)?;
                 fr.bytes_unreadable = fr.bytes_unreadable.saturating_add(usable as u64);
+                *done_unreadable = done_unreadable.saturating_add(usable as u64);
             }
             written = written.saturating_add(usable as u64);
             *done_bytes = done_bytes.saturating_add(usable as u64);
-            let cont = report(opts, *done_bytes, total_bytes);
+            let cont = report(opts, *done_bytes, *done_unreadable, total_bytes);
             sector_off += batch;
             if opts.cancelled(cont) {
                 // Leave the `.partial`; do NOT rename. The aggregate run
@@ -784,15 +796,20 @@ fn finalize_file(
 
 /// Emit a progress report. Returns `true` to continue, `false` if the sink
 /// requested an early stop (or there is no sink — always continue).
-fn report(opts: &ExtractOptions, done: u64, total: u64) -> bool {
+fn report(opts: &ExtractOptions, done: u64, unreadable: u64, total: u64) -> bool {
     match opts.progress {
         Some(p) => {
             let pp = crate::progress::PassProgress {
                 kind: crate::progress::PassKind::Mux,
                 work_done: done,
                 work_total: total,
-                bytes_good_total: done,
-                bytes_unreadable_total: 0,
+                // `done` counts good AND zero-filled-unreadable bytes together;
+                // split them so a consumer driven only by the live progress
+                // channel sees a holed extraction as holed rather than as a clean
+                // climb to 100%. The final ExtractResult already carries the true
+                // split — this used to pin unreadable at 0 and call every byte good.
+                bytes_good_total: done.saturating_sub(unreadable),
+                bytes_unreadable_total: unreadable,
                 bytes_pending_total: 0,
                 bytes_retryable_total: 0,
                 bytes_total_disc: total,

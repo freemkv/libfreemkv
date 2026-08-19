@@ -17,7 +17,7 @@ use super::codec::startcode::find_start_code;
 const PACK_HEADER_ID: u8 = 0xBA;
 
 /// System header start code suffix.
-const SYSTEM_HEADER_ID: u8 = 0xBB;
+const SYSTEM_HEADER_ID: u8 = crate::consts::pes_stream_id::SYSTEM_HEADER;
 
 /// Program end start code suffix.
 const PROGRAM_END_ID: u8 = 0xB9;

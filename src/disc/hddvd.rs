@@ -907,10 +907,32 @@ impl Disc {
         }
 
         // Authored clip order from the VTI clip table (empty if no VTI).
-        let order: Vec<String> = vti_name
-            .and_then(|n| udf_fs.read_file(reader, &format!("/HVDVD_TS/{n}")).ok())
-            .map(|b| parse_vti_clip_order(&b))
-            .unwrap_or_default();
+        //
+        // The VTI name came from `ts_dir.entries`, so a failed read here is a
+        // real I/O error (a scratched sector under the `.vti`), never an absent
+        // file. `.ok()` used to flatten the two — dropping the authored order
+        // with no diagnostic, so a split feature then composed from the per-clip
+        // heuristic and the operator was never told the authored order existed
+        // but could not be read. The clip-extent arms below log every read
+        // failure with its own code; this one now does too. The fallback itself
+        // is unchanged (no order => per-clip, exactly as an unauthored disc),
+        // because there is nothing to compose from without the table. Logging is
+        // exempt from the no-English rule (errors stay numeric).
+        let order: Vec<String> = match vti_name {
+            None => Vec::new(),
+            Some(n) => match udf_fs.read_file(reader, &format!("/HVDVD_TS/{n}")) {
+                Ok(bytes) => parse_vti_clip_order(&bytes),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        vti = ?n,
+                        code = e.code(),
+                        "authored clip order unreadable; falling back to the per-clip heuristic"
+                    );
+                    Vec::new()
+                }
+            },
+        };
 
         // Resolve each clip's physical extents once, keyed by lower-case name.
         let mut clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = BTreeMap::new();
