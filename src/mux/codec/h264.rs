@@ -1,7 +1,8 @@
 //! H.264 (AVC) elementary stream parser.
 //!
 //! Extracts SPS and PPS NAL units for MKV codecPrivate.
-//! Detects keyframes (IDR slices).
+//! Detects keyframes: IDR slices, and open-GOP intra-coded access units (the
+//! non-IDR recovery points BD titles use — see the intra promotion in `parse`).
 //! Each PES packet = one access unit = one frame.
 
 use super::coding::{CodingType, PictureInfo};
@@ -351,6 +352,26 @@ impl CodecParser for H264Parser {
             return Vec::new();
         }
 
+        // Open-GOP resync anchor: an intra-coded access unit is a keyframe even
+        // when it is NOT an IDR. BD H.264 titles use open GOPs whose only
+        // random-access point is a non-IDR I-frame (the recovery point, which an
+        // encoder MAY additionally tag with a recovery_point SEI). Keying off the
+        // already-measured picture coding type covers every signalling — a
+        // recovery_point SEI, or a disc that marks the recovery point only by GOP
+        // structure with no SEI at all — where SEI parsing alone would miss the
+        // latter. Without this, the B1 resync gate (`mux/resync.rs`), once armed
+        // by a concealed-gap / clip-seam discontinuity, never sees a keyframe on
+        // such a tail and drops every frame to EOF, truncating the video. HEVC
+        // does not hit this: its open-GOP IRAP (CRA) is a distinct NAL type
+        // already flagged a keyframe (`mux/codec/hevc.rs`); H.264 has no such NAL
+        // tag, so the intra coding type is the equivalent signal. Consistent with
+        // `videomap.rs`'s model that a keyframe IS the intra decode-restart point.
+        // IDR is still flagged by NAL type in the loop above, so a slice whose
+        // header failed to parse (`coding_type == None`) is unaffected here.
+        if coding_type == Some(CodingType::I) {
+            keyframe = true;
+        }
+
         // Every keyframe is self-contained: re-assert the active SPS/PPS in-band
         // ahead of the slices (even when unchanged vs codecPrivate) so a decoder
         // that dropped the set at a reset recovers, and a stale avcC re-apply
@@ -692,6 +713,57 @@ mod tests {
             data,
             discontinuity: false,
         }
+    }
+
+    /// Open-GOP resync fix: a non-IDR intra-coded access unit MUST be flagged a
+    /// keyframe so the B1 resync gate (`mux/resync.rs`) can disarm on a BD open-
+    /// GOP tail instead of dropping every frame to EOF and truncating the video.
+    /// BD H.264 titles reach random access at a non-IDR I-frame (the recovery
+    /// point); HEVC gets this free from the CRA NAL type, H.264 does not, so the
+    /// measured intra coding type is the signal. Red before the intra promotion
+    /// in `parse` — a non-IDR I-slice used to yield `keyframe == false`.
+    #[test]
+    fn open_gop_intra_access_unit_is_a_keyframe() {
+        // Annex B AU: one non-IDR coded slice (NAL type 1, nal_ref_idc 3 → 0x61)
+        // whose header decodes first_mb_in_slice = 0 (ue = "1") and slice_type = 7
+        // (ue = "0001000"), i.e. an all-I slice. The two ue(v) fields pack into
+        // one byte: "1" + "0001000" = 0b1000_1000 = 0x88.
+        let au = vec![0x00, 0x00, 0x01, 0x61, 0x88, 0x00];
+        let mut parser = H264Parser::new();
+        let frames = parser.parse(&make_pes(au, Some(0)));
+        assert_eq!(frames.len(), 1, "one PES access unit → one frame");
+        assert_eq!(
+            frames[0].coding.map(|c| c.coding_type()),
+            Some(CodingType::I),
+            "the slice header measures an I picture",
+        );
+        assert!(
+            frames[0].keyframe,
+            "an open-GOP intra access unit is a resync-safe keyframe even without an IDR",
+        );
+    }
+
+    /// Guard the promotion's precision: a non-intra (P) access unit must NOT be
+    /// promoted to a keyframe, or the resync gate would resume on a frame that
+    /// carries inter-references to dropped data and the MKV cue index would gain
+    /// bogus random-access points.
+    #[test]
+    fn inter_coded_access_unit_is_not_a_keyframe() {
+        // Same NAL type 1, but slice_type = 0 (P): ue "1", so with first_mb = 0
+        // the byte is "1" + "1" padded = 0b1100_0000 = 0xC0.
+        let au = vec![0x00, 0x00, 0x01, 0x61, 0xC0, 0x00];
+        let mut parser = H264Parser::new();
+        let frames = parser.parse(&make_pes(au, Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].coding.map(|c| c.coding_type()),
+            Some(CodingType::P),
+            "the slice header measures a P picture",
+        );
+        assert!(
+            !frames[0].keyframe,
+            "an inter-coded access unit must never be a keyframe",
+        );
     }
 
     /// The slice-header parse must remove emulation-prevention bytes first
