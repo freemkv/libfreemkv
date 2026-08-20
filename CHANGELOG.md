@@ -1,5 +1,120 @@
 # Changelog
 
+## [1.6.5] — 2026-08-20
+
+### Fixed
+
+- **On some Blu-ray/UHD titles the picture stopped short of the declared
+  end.** When a title is stitched across a clip seam, freemkv drops video
+  after the join until it sees a fresh keyframe it can restart decoding
+  from. It only recognised one kind of keyframe (an IDR frame), but a
+  Blu-ray's final segment can open on a different kind of self-contained
+  frame instead — so on those discs the restart point was never
+  recognised and every remaining frame to the end of the film was
+  dropped, losing up to a group-of-pictures-plus tail of picture. That
+  kind of frame is now recognised as a valid restart point, matching how
+  the HEVC path already worked, so the tail is kept. HEVC and DVD titles
+  were never affected.
+
+- **A split HD-DVD feature could be exported as half the film while still
+  claiming the full running time.** A feature stored across parts (for
+  example `FEATURE_1.EVO` + `FEATURE_2.EVO`) is composed back into one
+  title. If a part resolved with no usable data — a zero-length file, or
+  an extent map that yielded nothing — that part was neither used nor
+  flagged, so the feature was quietly composed from the surviving parts
+  alone, still advertising the whole runtime, and exited success with no
+  log. The missing part is now marked unusable and logged under its own
+  code (E6019), so half a movie can no longer be presented as a whole one.
+
+- **A Blu-ray title with an unreadable clip could be exported short while
+  still reporting the full running time.** A scratched or malformed
+  clip-info (`.clpi`) sector, or a clip whose extents could not be
+  resolved (a bad sector, a broken allocation chain, an embedded-data
+  file), was silently skipped — but the title's duration had already been
+  counted from the playlist, so it shipped short of the runtime it claimed
+  at exit success, with nothing logged. Previously only one narrow failure
+  kind counted; now every unresolvable clip drops the title and warns with
+  the read's own error code. A truly absent optional file (such as the 3D
+  `.ssif` on a 2D disc) is still treated as benign.
+
+- **Pressing Stop during a disc scan could leave the disc looking like it
+  holds fewer titles than it does — or none at all.** Once cancelled,
+  every remaining drive command fails, but the Blu-ray and DVD title
+  enumerators treated those failures as ordinary skips: the Blu-ray scan
+  returned a truncated title list and the DVD scan returned zero titles,
+  both at exit success, so a cancelled scan was indistinguishable from a
+  disc that simply held that many titles. A cancel is now propagated as an
+  error out of every enumerator and at every read site, so it can never be
+  cached, displayed, or ripped from as if it were the real disc. HD-DVD
+  already behaved this way and is the model the others now follow.
+
+- **A decrypted HD-DVD could be refused with a DVD copy-protection error
+  (E7023).** HD-DVD and DVD share the same MPEG program-stream container,
+  and the scramble detector mistook an HD-DVD navigation packet for a
+  CSS-scrambled sector — so a good, already-decrypted HD-DVD was reported
+  as carrying an unrecoverable CSS key and hard-failed, sending anyone
+  triaging it hunting for a missing DVD key on a disc that never had one.
+  The detector now excludes the structural packet types that CSS never
+  scrambles, identified from a field that is readable even on ciphertext,
+  so a decrypted HD-DVD scans clean. The DVD CSS crack is unchanged and a
+  genuinely scrambled, uncrackable DVD still hard-fails as before, so
+  ciphertext can never be muxed as plaintext.
+
+- **A file with an allocated-but-never-written region could splice
+  undefined sectors into the rip.** The UDF reader treated an
+  allocated-but-unrecorded extent as ordinary content and read whatever
+  happened to be on those sectors into the output, and it decoded
+  embedded-data files (which store their content inline, not as a sector
+  map) as if their bytes were an extent list, pointing the reader at
+  unrelated sectors. Such extents are now refused when they actually
+  occupy space, and embedded files are handled as their own case; a
+  legitimately zero-length file still reads as empty rather than dropping
+  its title.
+
+- **Audio and subtitle tracks in many languages were all labelled
+  "undefined."** The language mapping recognised only a handful of codes
+  and collapsed fifteen others to `und`. Every ISO 639-1 language code is
+  now mapped, so those tracks carry their real language. The DVD subtitle
+  colour palette, which was written in the wrong order, is also corrected.
+
+- **If the disc read-ahead thread died mid-rip, a whole title could be
+  fabricated and reported complete.** A prefetch producer that terminated
+  returned an end-of-data signal that the reader legitimately read as a
+  short read and zero-filled, so a failed read could be papered over with
+  zeros and the pass still reported as successful. It now reports a
+  distinct source-terminated error instead. Dead-bus drive faults are
+  likewise classified rather than flattened, so the wedged-drive recovery
+  path can see them, and the drive now responds to Stop during spin-up and
+  spin-down instead of staying deaf for up to ~30 seconds.
+
+- **A holed extraction could climb to a clean 100% on the live progress
+  channel.** The progress feed hardcoded its unreadable-byte count to zero
+  and counted every zero-filled hole as good data, so a progress-only
+  consumer saw a damaged extraction finish spotless — even though the
+  authoritative result was already truthful. The real good/unreadable
+  split is now threaded through the live channel. Separately, an
+  unreadable HD-DVD authored clip order is now logged with its error code
+  instead of being silently discarded before falling back to the
+  per-clip heuristic.
+
+### Security
+
+- **Bounded several unbounded amplification axes in the HD-DVD and Blu-ray
+  scanners.** A crafted disc could drive the playlist nesting depth, the
+  title count, and the clips and chapters per title without limit, and
+  could force a repeated clip-name fallback probe — each of which alone
+  left the worst-case scan unbounded. All now carry positional caps (512
+  titles and clips, roughly ten times any retail disc) and the fallback
+  probe is memoized. No effect on a well-formed disc.
+
+### Changed
+
+- **How freemkv picks the per-platform drive code was consolidated, with
+  no change to reading a disc.** The drive layer chose its
+  operating-system-specific module separately inside each entry point; it
+  now selects that module once, so a new entry point cannot silently
+  forget a platform. Purely internal.
+
 ## [1.6.4] — 2026-08-15
 
 ### Fixed
