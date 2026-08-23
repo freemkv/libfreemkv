@@ -367,6 +367,28 @@ impl CodecParser for TrueHdParser {
         // emits non-empty PES today).
         if pes.discontinuity {
             self.acc.clear();
+            // Unlike AC-3/DTS (independent frames), MLP/TrueHD carries filter +
+            // predictor + restart state ACROSS access units. A demux-signalled
+            // discontinuity (lost TS packets / a concealed source gap) leaves that
+            // state stale, so resuming mid-stream on the next parity-OK AU decodes
+            // against broken state and desyncs a conformant decoder ("restart header
+            // sync incorrect" / "Invalid blocksize"). Arm the same drop-forward the
+            // corruption path uses: keep dropping until the next CRC-valid major sync
+            // (a clean re-init point), then resume. This mirrors the video path's
+            // "resync on the next keyframe" after a gap — the gapped audio can't be
+            // recovered either way, but the output stays decoder-clean instead of
+            // shipping a decoder-choking seam.
+            //
+            // Only once a validated major sync has established a baseline: before
+            // that there is no CRC-validatable re-init point to resume on, so arming
+            // here would collateral-drop the WHOLE track waiting for a major sync we
+            // cannot yet validate — the exact stream-head catastrophe `au_check`
+            // guards (a checksum-failed head major sync is kept, not nuked). At
+            // stream head we therefore keep the current behaviour: drop the truncated
+            // partial (above) and let the fresh post-gap unit through.
+            if self.num_substreams.is_some() {
+                self.resync_pending = true;
+            }
         }
         if pes.data.is_empty() {
             return Vec::new();
@@ -910,6 +932,73 @@ mod tests {
             parser.dropped_frames(),
             2,
             "corrupt MS + poisoned normal AU"
+        );
+    }
+
+    #[test]
+    fn discontinuity_resyncs_forward_to_next_major_sync() {
+        // A source-signalled discontinuity (lost TS packets / a concealed gap)
+        // leaves MLP's cross-AU predictor + restart state stale. Resuming
+        // mid-stream on the next parity-OK AU decodes against broken state and
+        // desyncs a conformant decoder ("restart header sync incorrect" /
+        // "Invalid blocksize"). So a discontinuity must arm the SAME drop-forward
+        // the corruption path uses: drop every post-gap AU until the next
+        // CRC-valid major sync (the clean re-init point), then resume there.
+        //
+        // Regression for a real disc (John Wick: Chapter 2) whose transport
+        // stream has a multi-PID continuity-counter gap at ~6:49: before this
+        // fix the TrueHD path cleared its buffer and resumed on the next NON-major
+        // AU, shipping a decoder-choking seam (559 `restart header sync` errors),
+        // while AC-3/DTS on the same disc were fine because THEIR frames are
+        // independently decodable. Video already resyncs to a keyframe after a
+        // gap (see `mux::resync`); this gives TrueHD the equivalent, keyed on the
+        // codec's own re-init point (a major-sync AU).
+        let mut parser = TrueHdParser::new();
+
+        // Establish a baseline so num_substreams is known and the gate is live.
+        let mut pre = valid_major_sync();
+        pre.extend_from_slice(&valid_normal_au());
+        let pre_frames = parser.parse(&make_pes(pre, Some(90000)));
+        assert_eq!(pre_frames.len(), 2, "baseline: major sync + one normal AU");
+
+        // Post-gap PES: two normal AUs, then a valid major sync, then a normal AU.
+        // `discontinuity: true` says packets were lost before this PES.
+        let mut post = valid_normal_au();
+        post.extend_from_slice(&valid_normal_au());
+        post.extend_from_slice(&valid_major_sync());
+        post.extend_from_slice(&valid_normal_au());
+        let post_pes = PesPacket {
+            source: None,
+            pid: 0x1100,
+            pts: Some(90000 + 4 * 900),
+            dts: None,
+            data: post,
+            discontinuity: true,
+        };
+        let mut frames = parser.parse(&post_pes);
+        frames.extend(parser.flush());
+
+        // Only the major sync and the AU after it survive; the two leading
+        // post-gap normal AUs are dropped for lack of a re-init point.
+        assert_eq!(
+            frames.len(),
+            2,
+            "resume only at the major sync + what follows it (got {})",
+            frames.len()
+        );
+        assert!(
+            frames[0].keyframe,
+            "the first surviving post-gap frame MUST be a major sync (re-init \
+             point), never a mid-stream AU"
+        );
+        assert!(
+            !frames[1].keyframe,
+            "the AU after the re-init point is a normal AU"
+        );
+        assert_eq!(
+            parser.dropped_frames(),
+            2,
+            "the two post-gap AUs before the major sync are dropped as collateral"
         );
     }
 

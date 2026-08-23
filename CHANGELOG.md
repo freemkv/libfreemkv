@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.6.10] — 2026-08-23
+
+### Fixed
+
+- TrueHD/MLP audio: on a source transport-stream discontinuity (lost or gapped
+  packets, signalled by a continuity-counter break), the parser now drops forward
+  to the next major-sync access unit before resuming, instead of splicing the
+  post-gap audio mid-stream. MLP carries predictor + restart state across access
+  units, so resuming mid-stream decoded against stale state and produced a
+  decoder-choking seam — streaming decoders emitted a burst of "restart header
+  sync incorrect" / "Invalid blocksize" errors and could flag the whole track
+  corrupt. This mirrors the video path (resync to the next keyframe after a gap)
+  and how the independent-frame audio codecs (AC-3, DTS, FLAC, AAC) already
+  recover; the fix is guarded so it never arms before a validated major-sync
+  baseline exists (no whole-track drop at stream head). The gapped instant itself
+  is in the source and cannot be recovered, but the muxed track is now
+  decoder-clean.
+
 ## [1.6.9] — 2026-08-22
 
 ### Changed
