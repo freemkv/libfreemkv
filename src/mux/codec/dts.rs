@@ -205,8 +205,12 @@ impl CodecParser for DtsParser {
         // TRUNCATED. Splicing post-gap bytes onto it corrupts the core/extension
         // framing (→ "Failed to decode block code(s)" / "Invalid data found").
         // Drop the partial AU and its PTS marks; the next PES re-bases a fresh
-        // unit. (Audio has no inter-frame refs — dropping the spliced partial is
-        // the whole fix; the video ResyncGate handles video.)
+        // unit. (DTS core/extension frames are independently decodable — every
+        // frame re-inits on its own syncword — so dropping the truncated partial
+        // and resuming on the next frame is sufficient here. This is NOT true of
+        // every audio codec: TrueHD/MLP carries predictor + restart state across
+        // access units and must additionally drop forward to its next major sync;
+        // see `codec::truehd`. The video ResyncGate handles inter-coded video.)
         //
         // Handle the discontinuity BEFORE the empty-data guard so the signal can
         // never be stranded by an empty post-gap PES (defensive; the demuxer only
