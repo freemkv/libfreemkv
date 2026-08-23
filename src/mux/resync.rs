@@ -11,9 +11,15 @@
 //! and resume cleanly there. The gap rounds up to (at most) one GOP — the price
 //! of never emitting a dangling reference; it is logged.
 //!
-//! Audio and subtitle frames are independent (no inter-frame references), so a
-//! gap there costs only the single already-dropped frame; the gate is a no-op
-//! for non-video tracks (it always admits).
+//! Most audio and all subtitle frames are independently decodable (each frame
+//! re-inits on its own header), so a gap there costs only the single already-
+//! dropped frame and this gate is a no-op for them (it always admits). The one
+//! exception is TrueHD/MLP, whose predictor + restart state spans access units:
+//! its re-init point is a codec-specific major-sync AU (not a generic keyframe),
+//! so it runs the equivalent drop-forward-to-major-sync inside `codec::truehd`
+//! rather than through this gate. In short: this gate is NOT keyed on "audio vs
+//! video" but on "needs a re-init point after a gap" — video here, TrueHD in its
+//! own parser, everything else genuinely independent.
 
 /// Per-track keyframe-resync state. One gate per elementary stream; a video
 /// track's gate stays "armed" from a discontinuity until the next keyframe.
