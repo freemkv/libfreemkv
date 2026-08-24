@@ -190,6 +190,9 @@ pub struct DiscStream {
     /// timestamp cost or `prof_active()` env-var lookup (which takes a
     /// process-wide lock).
     profiling: bool,
+    /// Cumulative bytes fed to the demuxer across all read buffers,
+    /// used to stamp byte-exact provenance (`SourcePos`) onto demuxed packets.
+    fed_bytes: u64,
     /// B1 drop-to-keyframe resync gate, one per stream — mirrors
     /// `PipelinedPesStream`. After an AACS-concealed (undecryptable) gap stamps
     /// a frame `discontinuity`, the gate drops forward inter-coded video frames
@@ -331,6 +334,7 @@ impl DiscStream {
             pid_to_track,
             skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
             profiling: std::env::var_os("FREEMKV_PROFILE").is_some(),
+            fed_bytes: 0,
             resync,
             is_video,
         })
@@ -849,7 +853,7 @@ impl crate::pes::Stream for DiscStream {
                             continue;
                         };
                         let pes = super::ts::PesPacket {
-                            source: None,
+                            source: ps.source,
                             pid,
                             pts: ps.pts.map(|p| p as i64),
                             dts: ps.dts.map(|d| d as i64),
@@ -923,8 +927,11 @@ impl crate::pes::Stream for DiscStream {
             // read_sectors call. The pre-0.18 inline decrypt step
             // lived here.
 
+            let buf_base = self.fed_bytes;
+            self.fed_bytes = self.fed_bytes.saturating_add(bytes as u64);
+
             if let Some(ref mut demuxer) = self.ts_demuxer {
-                let packets = demuxer.feed(&self.read_buf[..bytes]);
+                let packets = demuxer.feed_at(buf_base, &self.read_buf[..bytes]);
                 let t2 = self.profiling.then(std::time::Instant::now);
                 if let (Some(t1), Some(t2)) = (t1, t2) {
                     prof_tick("feed", t2.duration_since(t1).as_nanos(), 0);
@@ -986,7 +993,7 @@ impl crate::pes::Stream for DiscStream {
                     prof_tick("consume", t3.duration_since(t2).as_nanos(), 0);
                 }
             } else if let Some(ref mut demuxer) = self.ps_demuxer {
-                let packets = demuxer.feed(&self.read_buf[..bytes]);
+                let packets = demuxer.feed_at(buf_base, &self.read_buf[..bytes]);
                 for ps in &packets {
                     // Route by the REAL DVD PID (see consume_ps in
                     // pipelined_stream.rs); the old (sub_id & 0x1F)+1
@@ -1022,7 +1029,7 @@ impl crate::pes::Stream for DiscStream {
                     };
 
                     let pes = super::ts::PesPacket {
-                        source: None,
+                        source: ps.source,
                         pid,
                         pts: ps.pts.map(|p| p as i64),
                         dts: ps.dts.map(|d| d as i64),
@@ -2624,6 +2631,82 @@ mod tests {
                 2048,
                 "the wrapped reader must stop decrypting, not just the mirror"
             );
+        }
+
+        #[test]
+        fn disc_stream_stamps_source_provenance() {
+            use crate::disc::{Codec, ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
+            use crate::pes::Stream;
+
+            // Build 1 TS packet containing a complete PES for PID 0x1011
+            // 4-byte BD prefix + 188-byte TS packet (PUSI=1, PID=0x1011)
+            let mut ts_pkt = vec![0x00, 0x00, 0x00, 0x00, 0x47, 0x50, 0x11, 0x10];
+            // PES header: 00 00 01 E0, length 0x000E (14 bytes), flags 0x80 0x80 (PTS present), header_len 5, PTS 0
+            ts_pkt.extend_from_slice(&[
+                0x00, 0x00, 0x01, 0xE0, 0x00, 0x0E, 0x80, 0x80, 0x05, 0x21, 0x00, 0x01, 0x00, 0x01,
+            ]);
+            // Annex B AU: SPS + PPS + IDR slice
+            ts_pkt.extend_from_slice(&[
+                0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A, // SPS
+                0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80, // PPS
+                0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x80, // IDR slice
+            ]);
+            ts_pkt.resize(192, 0xFF);
+
+            let mut sector = ts_pkt;
+            sector.resize(2048, 0xFF);
+
+            struct SectorPayloadReader(Vec<u8>);
+            impl crate::sector::SectorSource for SectorPayloadReader {
+                fn read_sectors(
+                    &mut self,
+                    _lba: u32,
+                    count: u16,
+                    buf: &mut [u8],
+                    _recovery: bool,
+                ) -> crate::error::Result<usize> {
+                    let n = (count as usize * 2048).min(self.0.len()).min(buf.len());
+                    buf[..n].copy_from_slice(&self.0[..n]);
+                    Ok(n)
+                }
+                fn capacity_sectors(&self) -> u32 {
+                    1
+                }
+            }
+
+            let mut title = synthetic_title(1);
+            title.streams = vec![crate::disc::Stream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::H264,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F23_976,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })];
+            title.content_format = ContentFormat::BdTs;
+
+            let reader = SectorPayloadReader(sector);
+            let mut s = DiscStream::new(
+                Box::new(reader),
+                title,
+                crate::decrypt::DecryptKeys::None,
+                1,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap();
+
+            let frame = s.read().unwrap().expect("expected 1 frame");
+            assert!(
+                frame.source.is_some(),
+                "DiscStream must stamp byte provenance (source) on demuxed frames"
+            );
+            assert_eq!(frame.source.unwrap().byte, 0);
         }
 
         // ── AdaptiveBatch ─────────────────────────────────────────────────
