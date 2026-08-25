@@ -230,7 +230,10 @@ jobs:
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
           done
-      - uses: dtolnay/rust-toolchain@1.94.0
+      # The consumers span a higher MSRV than libfreemkv itself (the bins are
+      # 1.98, keysources 1.97), so build them with a toolchain that satisfies the
+      # HIGHEST dependent floor — libfreemkv's own 1.94 cannot compile them.
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
