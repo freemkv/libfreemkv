@@ -472,13 +472,31 @@ pub fn dump_disc(disc: &Disc) {
         tracing::debug!(
             target: DIAG,
             "tag=decision pick=main_feature title_idx=0 playlist={:?} dur={:.1}s \
-        size={}B clips={} reason={}",
+        size={}B clips={} video={} reason={}",
             main.playlist,
             main.duration_secs,
             main.size_bytes,
             main.clips.len(),
+            main.video_streams().count(),
             main_feature_reason(),
         );
+    }
+
+    // Titles disqualified from main-feature candidacy for carrying no video —
+    // the streamless obfuscation decoys the `has-video` gate demotes. Logged so
+    // a field bug report shows WHY a long/large playlist was not picked (the
+    // gap that let an undiagnosable E6008 loop on Spider-Man 3 UHD `00245`).
+    for (ti, t) in disc.titles.iter().enumerate() {
+        if !t.has_video() {
+            tracing::debug!(
+                target: DIAG,
+                "tag=decision.demoted title_idx={} playlist={:?} dur={:.1}s size={}B reason=no-video",
+                ti,
+                t.playlist,
+                t.duration_secs,
+                t.size_bytes,
+            );
+        }
     }
 }
 
@@ -491,10 +509,12 @@ pub fn dump_disc(disc: &Disc) {
 /// explain the pick with a rule the code does not apply. A diagnostic that
 /// disagrees with the decision it documents is worse than no diagnostic.
 fn main_feature_reason() -> String {
-    format!(
-        "canonical_title_order({})",
-        Disc::CANONICAL_TITLE_ORDER_KEYS.join(", ")
-    )
+    let keys: Vec<&str> = Disc::MAIN_FEATURE_ORDER_KEYS
+        .iter()
+        .chain(Disc::CANONICAL_TITLE_ORDER_KEYS.iter())
+        .copied()
+        .collect();
+    format!("main_feature_order({})", keys.join(", "))
 }
 
 fn dump_aacs(disc: &Disc) {
@@ -670,8 +690,9 @@ mod tests {
             "the reason must not advertise a clip-count key the comparator dropped: {reason}"
         );
         assert_eq!(
-            reason, "canonical_title_order(fits-disc, largest-size, longest, richest-audio)",
-            "the reason must name the comparator's four keys in priority order"
+            reason,
+            "main_feature_order(authoring-feature, has-video, fits-disc, largest-size, longest, richest-audio)",
+            "the reason must name the selection keys (authoring + has-video gates, then the physical keys) in priority order"
         );
     }
 
