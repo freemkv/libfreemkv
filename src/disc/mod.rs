@@ -2109,6 +2109,11 @@ impl Disc {
         //    tree-level peers, each with its own enumerator; FMTS shares the BD
         //    tree (a `.fmts` stream variant). Disc FORMAT is a separate axis
         //    derived below from the AACS MKB generation, not the tree.
+        // The DVD scanner resolves its own main feature by following the disc's
+        // First-Play navigation (issue #40); it hands that title's `playlist_id`
+        // back here to use as the `nav_feature` ranking signal, mirroring the BD
+        // path's `bdnav::resolve_feature`. `None` for every other tree.
+        let mut dvd_nav_feature: Option<u16> = None;
         let (mut titles, content_format) = if udf_fs.find_dir("/BDMV").is_some() {
             (
                 Self::scan_bluray_titles(reader, &udf_fs, opts.halt.as_ref())?,
@@ -2120,10 +2125,9 @@ impl Disc {
                 ContentFormat::MpegPs,
             )
         } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
-            (
-                Self::scan_dvd_titles(reader, &udf_fs, opts.halt.as_ref())?,
-                ContentFormat::MpegPs,
-            )
+            let (dvd_titles, nav) = Self::scan_dvd_titles(reader, &udf_fs, opts.halt.as_ref())?;
+            dvd_nav_feature = nav;
+            (dvd_titles, ContentFormat::MpegPs)
         } else {
             (Vec::new(), ContentFormat::BdTs)
         };
@@ -2164,7 +2168,11 @@ impl Disc {
                 .collect();
             crate::bdnav::resolve_feature(reader, &udf_fs, |id| candidates.contains(&id))
         } else {
-            None
+            // DVD: the First-Play nav pick resolved during `scan_dvd_titles`.
+            // Restrict it to a video-bearing title, the same guard the BD path
+            // applies, so a nav result pointing at a streamless entry cannot win.
+            dvd_nav_feature
+                .filter(|id| titles.iter().any(|t| t.playlist_id == *id && t.has_video()))
         };
 
         // Authoritative main-feature ordering. The physical `canonical_title_order`
