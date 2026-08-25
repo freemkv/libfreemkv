@@ -1723,4 +1723,75 @@ mod tests {
         // total = 1 + 3 + 8 (default/npairs) + 24 = 36
         assert_eq!(instruction_size(&code, 0), Some(36));
     }
+
+    // ── Malformed-input hardening: every count/length/index is attacker- ──────
+    // controlled, so an oversized or lying field must yield Err/None, never a
+    // panic or an unbounded allocation.
+
+    /// A `constant_pool_count` far larger than the data behind it must fail
+    /// cleanly (running out of bytes), not pre-allocate gigabytes or panic. The
+    /// count is a u16, so `Vec::with_capacity` is bounded at 65535 regardless.
+    #[test]
+    fn parse_rejects_oversized_constant_pool_count() {
+        let bytes = [
+            0xCA, 0xFE, 0xBA, 0xBE, // magic
+            0x00, 0x00, 0x00, 0x00, // minor / major
+            0xFF, 0xFF, // constant_pool_count = 65535, but no entries follow
+        ];
+        assert!(matches!(
+            ClassFile::parse(&bytes),
+            Err(Error::UnexpectedEof { .. })
+        ));
+    }
+
+    /// An oversized `interfaces_count` / `fields_count` with no data behind it
+    /// must fail on the first missing element, not panic.
+    #[test]
+    fn parse_rejects_oversized_interface_count() {
+        let bytes = [
+            0xCA, 0xFE, 0xBA, 0xBE, // magic
+            0x00, 0x00, 0x00, 0x00, // minor / major
+            0x00, 0x01, // constant_pool_count = 1 (no entries)
+            0x00, 0x00, // access_flags
+            0x00, 0x00, // this_class
+            0x00, 0x00, // super_class
+            0xFF, 0xFF, // interfaces_count = 65535, none follow
+        ];
+        assert!(matches!(
+            ClassFile::parse(&bytes),
+            Err(Error::UnexpectedEof { .. })
+        ));
+    }
+
+    /// Out-of-range constant-pool indices resolve to `None` from every
+    /// accessor a label parser drives — no slice panic.
+    #[test]
+    fn constant_pool_out_of_range_index_is_none_everywhere() {
+        let pool = sample_pool();
+        let oob = 9999u16;
+        assert!(pool.get(oob).is_none());
+        assert!(pool.utf8(oob).is_none());
+        assert!(pool.class_name(oob).is_none());
+        assert!(pool.string(oob).is_none());
+        assert!(pool.integer(oob).is_none());
+        assert!(pool.member_ref(oob).is_none());
+        assert!(pool.load_constant_display(oob).is_none());
+    }
+
+    /// A `Code` attribute whose declared `code_length` runs past the attribute
+    /// body must be rejected, not read out of bounds.
+    #[test]
+    fn code_attribute_rejects_length_past_its_body() {
+        // max_stack(2) + max_locals(2) + code_length(4) then a code_length that
+        // exceeds the remaining bytes.
+        let mut info = Vec::new();
+        info.extend_from_slice(&0u16.to_be_bytes()); // max_stack
+        info.extend_from_slice(&0u16.to_be_bytes()); // max_locals
+        info.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // code_length: absurd
+        info.extend_from_slice(&[0x00, 0x01]); // only 2 code bytes present
+        assert!(matches!(
+            parse_code_attribute(&info),
+            Err(Error::UnexpectedEof { .. })
+        ));
+    }
 }
