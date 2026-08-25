@@ -1,5 +1,5 @@
 //! Parse `/BDMV/index.bdmv` — the BD navigation index (First Play, Top Menu,
-//! and the title table), mirroring libbluray `index_parse.c`. This is read as a
+//! and the title table), per its documented binary layout. This is read as a
 //! documented binary format, never executed: every field is bounds-checked and
 //! any malformed input yields `None` (the nav resolver then abstains).
 //!

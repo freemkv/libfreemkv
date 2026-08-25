@@ -1,5 +1,5 @@
-//! Parse `/BDMV/MovieObject.bdmv` — the HDMV navigation programs, mirroring
-//! libbluray `mobj_parse.c`. Read as a documented format, never executed here:
+//! Parse `/BDMV/MovieObject.bdmv` — the HDMV navigation programs, per their
+//! documented binary layout. Read as a documented format, never executed here:
 //! bounds-checked, never panics.
 //!
 //! Layout: `"MOBJ"` + version(4) + reserved… ; `MovieObjects()` at byte 40 is
