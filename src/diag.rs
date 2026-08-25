@@ -691,7 +691,7 @@ mod tests {
         );
         assert_eq!(
             reason,
-            "main_feature_order(authoring-feature, standalone, has-video, fits-disc, largest-size, longest, richest-audio)",
+            "main_feature_order(nav-feature, authoring-feature, standalone, has-video, fits-disc, largest-size, longest, richest-audio)",
             "the reason must name the selection keys (authoring, standalone-over-composite, and has-video gates, then the physical keys) in priority order"
         );
     }
