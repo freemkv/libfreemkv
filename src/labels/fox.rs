@@ -89,26 +89,17 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         return None;
     }
 
-    // Surface the feature playlist's authoring id (e.g. "00800"). On this
-    // branch `ParseResult` carries no `feature_playlist` field — that
-    // `FeaturePlaylistHint` slot was added on the `selection-hardening` branch
-    // and does not exist on `dev` — so we record the id in the trace stream for
-    // now rather than clashing with that type. AT RECONCILIATION: populate
-    // `ParseResult.feature_playlist = Some(FeaturePlaylistHint { playlist_id:
-    // digits.parse(), filename: Some("<id>.mpls") })` here, exactly as
-    // `paramount::parse` does, so title selection can prefer the authoring
-    // feature over a size-inflated decoy.
-    if let Some(id) = feature_playlist_id(text) {
-        tracing::debug!(
-            target: "freemkv::labels",
-            fox_feature_playlist = %id,
-            "Fox dcx.xml feature playlist id (wire to FeaturePlaylistHint at reconciliation)",
-        );
-    }
-
     // High confidence: the manifest is fully structured and every field
     // extracted here has its meaning fixed by real discs.
-    Some(ParseResult::high(labels))
+    let mut result = ParseResult::high(labels);
+    // Surface the feature playlist's authoring id (e.g. "00800") so title
+    // selection can prefer the disc's own feature over a size-inflated decoy —
+    // the same signal `paramount::parse` provides.
+    result.feature_playlist = feature_playlist_id(text).map(|id| super::FeaturePlaylistHint {
+        playlist_id: id.parse::<u16>().ok(),
+        filename: Some(format!("{id}.mpls")),
+    });
+    Some(result)
 }
 
 /// Build the stream labels from a `dcx.xml` document. Split out from [`parse`]
