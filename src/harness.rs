@@ -181,6 +181,20 @@ fn clpi_parse_never_panics() {
 }
 
 #[test]
+fn bdnav_index_parse_never_panics() {
+    sweep("bdnav_index", b"INDX", |b| {
+        let _ = crate::bdnav::index::parse(b);
+    });
+}
+
+#[test]
+fn bdnav_mobj_parse_never_panics() {
+    sweep("bdnav_mobj", b"MOBJ", |b| {
+        let _ = crate::bdnav::mobj::parse(b);
+    });
+}
+
+#[test]
 fn udf_name_parse_never_panics() {
     // No magic: the compression ID is the first byte and every value is legal
     // input to reject, so the "magic" is a byte the sweep will mutate anyway.
