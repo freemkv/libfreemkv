@@ -42,10 +42,28 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     if labels.is_empty() {
         return None;
     }
+
+    // Surface the feature playlist's identity (e.g. `id="00222"`) so title
+    // selection can prefer it over a size-inflated decoy. The id is 5-digit
+    // zero-padded on BD (matching the `NNNNN.mpls` filename); keep only the
+    // digits so a stray attribute quote/space can't poison the parse.
+    let feature_playlist = super::xml::attr(&feature, "id").and_then(|id| {
+        let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        Some(super::FeaturePlaylistHint {
+            playlist_id: digits.parse::<u16>().ok(),
+            filename: Some(format!("{digits}.mpls")),
+        })
+    });
+
     // High confidence: this format is fully structured and we extract
     // every field whose meaning the corpus establishes. "Documented" would
     // be the wrong word — see the module note; nothing about it is.
-    Some(ParseResult::high(labels))
+    let mut result = ParseResult::high(labels);
+    result.feature_playlist = feature_playlist;
+    Some(result)
 }
 
 /// One cell of the `forced_sub` CSV.
