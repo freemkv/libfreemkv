@@ -100,7 +100,7 @@ pub fn resolve_keys_for(
         match disc
             .titles
             .iter()
-            .filter(|t| t.has_video())
+            .filter(|t| t.has_probable_video())
             .max_by_key(|t| t.size_bytes)
             .or_else(|| disc.titles.iter().max_by_key(|t| t.size_bytes))
             .cloned()
@@ -566,7 +566,7 @@ fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result
     let Some(extent) = disc
         .titles
         .iter()
-        .filter(|t| t.has_video())
+        .filter(|t| t.has_probable_video())
         .max_by_key(|t| {
             t.extents
                 .iter()
