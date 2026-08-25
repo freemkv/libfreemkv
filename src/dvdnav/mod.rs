@@ -9,10 +9,13 @@
 //! verified against real discs.
 //!
 //! Current contents: [`vmcmd`] — the VM command decoder (proven against the
-//! SOTL/Greenland test discs). The IFO/PCI parsing and the navigation executor
-//! that resolves the start cell build on top of this.
+//! SOTL/Greenland test discs); [`nav`] — the First-Play navigation executor
+//! that resolves which title the disc's own navigation selects as the feature.
 
+pub mod nav;
 pub mod vmcmd;
+
+pub use nav::{ResolvedTitle, resolve_main_title};
 
 use crate::sector::SectorSource;
 
