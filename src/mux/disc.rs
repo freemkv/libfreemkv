@@ -2709,6 +2709,177 @@ mod tests {
             assert_eq!(frame.source.unwrap().byte, 0);
         }
 
+        // ── PS-path provenance ────────────────────────────────────────────
+
+        /// A 14-byte MPEG-2 PS pack header (`00 00 01 BA …`), no stuffing.
+        fn ps_pack_header() -> Vec<u8> {
+            let mut p = vec![0x00, 0x00, 0x01, 0xBAu8];
+            p.extend_from_slice(&[0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3]);
+            p.push(0xF8); // pack_stuffing_length = 0 (low 3 bits)
+            p
+        }
+
+        /// One coded MPEG-2 picture: picture header (coding_type, temporal_ref) +
+        /// a picture-coding extension + slice padding, so the real `Mpeg2Parser`
+        /// treats it as a complete picture.
+        fn ps_pic(coding_type: u8, tr: u16) -> Vec<u8> {
+            let b4 = ((tr >> 2) & 0xFF) as u8;
+            let b5 = (((tr & 0x03) as u8) << 6) | ((coding_type & 0x07) << 3);
+            let mut au = vec![0x00, 0x00, 0x01, 0x00u8, b4, b5, 0x00, 0x00];
+            au.extend_from_slice(&[0x00, 0x00, 0x01, 0xB5u8, 0x80, 0x00, 0x03, 0x80, 0x00]);
+            au.extend_from_slice(&[0xAA; 32]);
+            au
+        }
+
+        /// One GOP's ES: seq header + GOP + I/P/B pictures.
+        fn ps_gop_es() -> Vec<u8> {
+            let mut es = seq_header(720, 480);
+            es.extend_from_slice(&[0x00, 0x00, 0x01, 0xB8u8, 0x00, 0x00, 0x00, 0x00]); // GOP header
+            es.extend_from_slice(&ps_pic(1, 0)); // I (keyframe)
+            es.extend_from_slice(&ps_pic(2, 2)); // P
+            es.extend_from_slice(&ps_pic(3, 1)); // B
+            es
+        }
+
+        /// A bounded video PES (stream_id 0xE0) carrying `es` with a 90 kHz PTS.
+        fn ps_video_pes(es: &[u8], pts: u64) -> Vec<u8> {
+            let mut pes = vec![0x00, 0x00, 0x01, 0xE0u8];
+            let mut body = vec![0x80u8, 0x80, 0x05]; // flags1, flags2 (PTS only), header_data_len
+            let p = pts & 0x1_FFFF_FFFF;
+            body.push(0x21 | (((p >> 30) & 0x07) << 1) as u8);
+            body.push(((p >> 22) & 0xFF) as u8);
+            body.push((0x01 | (((p >> 15) & 0x7F) << 1)) as u8);
+            body.push(((p >> 7) & 0xFF) as u8);
+            body.push((0x01 | ((p & 0x7F) << 1)) as u8);
+            body.extend_from_slice(es);
+            let len = body.len() as u16;
+            pes.extend_from_slice(&len.to_be_bytes());
+            pes.extend_from_slice(&body);
+            pes
+        }
+
+        /// Serves a fixed byte image sector-by-sector, mapping LBA to its slice.
+        struct ImageReader(Vec<u8>);
+        impl crate::sector::SectorSource for ImageReader {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> crate::error::Result<usize> {
+                let start = lba as usize * 2048;
+                let want = count as usize * 2048;
+                for (i, b) in buf[..want].iter_mut().enumerate() {
+                    *b = self.0.get(start + i).copied().unwrap_or(0);
+                }
+                Ok(want)
+            }
+            fn capacity_sectors(&self) -> u32 {
+                (self.0.len() / 2048) as u32
+            }
+        }
+
+        fn mpeg2_video_title(sector_count: u32) -> DiscTitle {
+            use crate::disc::{Codec, ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
+            let mut t = synthetic_title(sector_count);
+            t.content_format = ContentFormat::MpegPs;
+            t.streams = vec![crate::disc::Stream::Video(VideoStream {
+                pid: 0xE0, // DVD video stream id
+                codec: Codec::Mpeg2,
+                resolution: Resolution::R480i,
+                frame_rate: FrameRate::F29_97,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Smpte170m,
+                display_aspect: Some((4, 3)),
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })];
+            t
+        }
+
+        /// The PS path (`ps_demuxer` + `Mpeg2Parser`) must forward `ps.source`
+        /// onto the `PesPacket` so demuxed frames carry byte provenance — the
+        /// second half of commit a0d4dd3 (the first half is the TS path above).
+        #[test]
+        fn ps_stream_stamps_source_provenance() {
+            use crate::pes::Stream;
+
+            let mut sector = ps_pack_header();
+            sector.extend_from_slice(&ps_video_pes(&ps_gop_es(), 0));
+            sector.resize(2048, 0xFF);
+
+            let mut s = DiscStream::new(
+                Box::new(ImageReader(sector)),
+                mpeg2_video_title(1),
+                crate::decrypt::DecryptKeys::None,
+                8,
+                ContentFormat::MpegPs,
+                false,
+                None,
+            )
+            .unwrap();
+
+            let frame = s
+                .read()
+                .unwrap()
+                .expect("expected a frame from the PS path");
+            assert!(
+                frame.source.is_some(),
+                "PS path must forward ps.source so demuxed frames carry provenance"
+            );
+        }
+
+        /// The feed base offset accumulates ACROSS read buffers: it is not reset
+        /// per read. With one GOP in sector 0 and another in sector 1, read
+        /// sector-by-sector (`batch_sectors = 1`), a frame decoded out of the
+        /// second sector must carry `source.byte >= 2048` — proof the running
+        /// `fed_bytes` base carried over from the first read rather than restarting
+        /// at 0. (A per-read reset would stamp both GOPs' frames below 2048.)
+        #[test]
+        fn ps_stream_carries_feed_base_across_reads() {
+            use crate::pes::Stream;
+
+            let mut image = ps_pack_header();
+            image.extend_from_slice(&ps_video_pes(&ps_gop_es(), 0));
+            image.resize(2048, 0xFF); // sector 0
+            let mut sector1 = ps_pack_header();
+            sector1.extend_from_slice(&ps_video_pes(&ps_gop_es(), 3003));
+            sector1.resize(2048, 0xFF);
+            image.extend_from_slice(&sector1); // sector 1
+
+            let mut s = DiscStream::new(
+                Box::new(ImageReader(image)),
+                mpeg2_video_title(2),
+                crate::decrypt::DecryptKeys::None,
+                1, // one sector per read → separate feed_at calls per sector
+                ContentFormat::MpegPs,
+                false,
+                None,
+            )
+            .unwrap();
+
+            let mut max_byte = 0u64;
+            let mut min_byte = u64::MAX;
+            while let Some(frame) = s.read().unwrap() {
+                if let Some(src) = frame.source {
+                    max_byte = max_byte.max(src.byte);
+                    min_byte = min_byte.min(src.byte);
+                }
+            }
+
+            assert!(
+                min_byte < 2048,
+                "a frame from the first sector must be stamped below one sector"
+            );
+            assert!(
+                max_byte >= 2048,
+                "a frame from the second sector must carry the carried-over base \
+                 (source.byte >= 2048), not a per-read-reset offset"
+            );
+        }
+
         // ── AdaptiveBatch ─────────────────────────────────────────────────
 
         /// AACS decrypts whole 3-sector (6144 B) units, so every batch size at or
