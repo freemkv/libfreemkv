@@ -137,10 +137,8 @@ fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Opti
             return None;
         }
         let obj = vm.mobjs.get(obj_id)?;
-        let c = match obj.cmds.get(pc) {
-            Some(c) => *c,
-            None => return None, // ran off the end without a feature PlayPL
-        };
+        // Ran off the end without a feature PlayPL → abstain.
+        let c = *obj.cmds.get(pc)?;
         let mut npc = pc + 1;
         let dst = if c.op_cnt > 0 {
             vm.fetch(c.imm_op1, c.dst)
@@ -223,35 +221,33 @@ fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Opti
             }
             // SET (sub_grp 0). SETSYSTEM (sub_grp 1) only mutates system PSRs
             // whose values the feature path does not branch on — skip it.
-            2 => {
-                if c.sub_grp == 0 {
-                    let r: Option<u32> = match c.set_opt {
-                        0x01 => Some(src), // MOVE
-                        0x02 => {
-                            vm.wr(c.dst, src); // SWAP
-                            vm.wr(c.src, dst);
-                            None
-                        }
-                        0x03 => Some(dst.wrapping_add(src)),
-                        0x04 => Some(dst.saturating_sub(src)),
-                        0x05 => Some(dst.wrapping_mul(src)),
-                        0x06 => Some(if src > 0 { dst / src } else { 0xffff_ffff }),
-                        0x07 => Some(if src > 0 { dst % src } else { 0xffff_ffff }),
-                        0x08 => Some(dst), // RND — deterministic stand-in
-                        0x09 => Some(dst & src),
-                        0x0a => Some(dst | src),
-                        0x0b => Some(dst ^ src),
-                        0x0c => Some(dst | (1u32 << (src & 31))),
-                        0x0d => Some(dst & !(1u32 << (src & 31))),
-                        0x0e => Some(dst.wrapping_shl(src & 31)),
-                        0x0f => Some(dst.wrapping_shr(src & 31)),
-                        _ => None,
-                    };
-                    if let Some(r) = r
-                        && !c.imm_op1
-                    {
-                        vm.wr(c.dst, r);
+            2 if c.sub_grp == 0 => {
+                let r: Option<u32> = match c.set_opt {
+                    0x01 => Some(src), // MOVE
+                    0x02 => {
+                        vm.wr(c.dst, src); // SWAP
+                        vm.wr(c.src, dst);
+                        None
                     }
+                    0x03 => Some(dst.wrapping_add(src)),
+                    0x04 => Some(dst.saturating_sub(src)),
+                    0x05 => Some(dst.wrapping_mul(src)),
+                    0x06 => Some(dst.checked_div(src).unwrap_or(0xffff_ffff)),
+                    0x07 => Some(dst.checked_rem(src).unwrap_or(0xffff_ffff)),
+                    0x08 => Some(dst), // RND — deterministic stand-in
+                    0x09 => Some(dst & src),
+                    0x0a => Some(dst | src),
+                    0x0b => Some(dst ^ src),
+                    0x0c => Some(dst | (1u32 << (src & 31))),
+                    0x0d => Some(dst & !(1u32 << (src & 31))),
+                    0x0e => Some(dst.wrapping_shl(src & 31)),
+                    0x0f => Some(dst.wrapping_shr(src & 31)),
+                    _ => None,
+                };
+                if let Some(r) = r
+                    && !c.imm_op1
+                {
+                    vm.wr(c.dst, r);
                 }
             }
             _ => {}

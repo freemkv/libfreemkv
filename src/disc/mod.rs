@@ -2453,6 +2453,23 @@ impl Disc {
             .filter(|t| t.has_probable_video())
             .map(|t| t.duration_secs)
             .fold(0.0_f64, f64::max);
+        // Largest video-bearing title's byte size, used as a plausibility floor
+        // below. A nav/authoring signal can legitimately resolve a seamless-branch
+        // or Dolby-Vision presentation playlist that a player navigates to but
+        // that carries almost no unique payload (e.g. a 0.4 GB / 102-clip branch
+        // sitting beside the 91.5 GB single-clip feature). Those are correct for
+        // playback but wrong as a RIP target, so a promoted title must also hold a
+        // meaningful fraction of this size; otherwise it falls through to the
+        // composite/size ranking, which recovers the substantial feature.
+        let max_video_size = titles
+            .iter()
+            .filter(|t| t.has_probable_video())
+            .map(|t| t.size_bytes)
+            .max()
+            .unwrap_or(0);
+        let carries_feature_payload = |t: &DiscTitle| {
+            max_video_size == 0 || t.size_bytes as f64 >= 0.10 * max_video_size as f64
+        };
         titles
             .iter()
             .enumerate()
@@ -2480,11 +2497,16 @@ impl Disc {
                 let authoring = !composite
                     && hint.is_some_and(|h| h.matches(p.playlist_id, &p.playlist))
                     && p.has_video()
-                    && (longest_video_dur <= 0.0 || p.duration_secs >= 0.5 * longest_video_dur);
+                    && (longest_video_dur <= 0.0 || p.duration_secs >= 0.5 * longest_video_dur)
+                    && carries_feature_payload(p);
                 // The nav result is video-gated exactly like the authoring hint,
                 // so a mis-resolved playlist that happens to be streamless can
-                // never win (and thus cannot reopen the decoy hole).
-                let nav = nav_feature == Some(p.playlist_id) && p.has_video();
+                // never win (and thus cannot reopen the decoy hole). It is also
+                // payload-gated: a player may navigate to a low-byte branch/DV
+                // presentation, but that is never the rip target.
+                let nav = nav_feature == Some(p.playlist_id)
+                    && p.has_video()
+                    && carries_feature_payload(p);
                 TitleRank {
                     nav,
                     authoring,
@@ -5164,6 +5186,31 @@ mod tests {
         assert_eq!(
             titles[0].playlist_id, 1,
             "a streamless nav target is ignored (video-gated), so the real feature wins"
+        );
+    }
+
+    /// Regression (Spotlight 2015 UHD): the disc navigates to a Dolby-Vision
+    /// seamless-branch playlist (`00001` = 102 tiny clips, 0.4 GB) that has real
+    /// video streams but carries almost no payload, sitting beside the 91.5 GB
+    /// single-clip feature (`00002`). A player plays the branch; a RIP wants the
+    /// feature. The nav pick is video-gated but must ALSO clear the payload floor,
+    /// so it falls through to size ranking and the substantial feature wins.
+    #[test]
+    fn nav_feature_ignored_when_target_is_a_low_payload_branch() {
+        let branch = bd_title("00001.mpls", 1, 7500.0, 400_000_000, &["b01", "b02", "b03"]);
+        let feature = bd_title("00002.mpls", 2, 7680.0, 91_500_000_000, &["00002"]);
+        let capacity = 100_000_000_000u64;
+
+        assert!(
+            branch.has_probable_video(),
+            "the DV branch has video streams (only its payload is tiny)"
+        );
+        let mut titles = vec![branch, feature];
+        // Nav resolves the branch (1) like a real player — must be payload-gated.
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None, Some(1));
+        assert_eq!(
+            titles[0].playlist_id, 2,
+            "the 91.5 GB feature wins; the 0.4 GB nav-picked branch is not a rip target"
         );
     }
 
