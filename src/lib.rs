@@ -101,6 +101,7 @@ pub const VERSION_LABEL: &str = concat!(env!("FREEMKV_VERSION"), env!("GIT_SUFFI
 pub(crate) const MUX_APP: &str = concat!("freemkv ", env!("FREEMKV_VERSION"), env!("GIT_SUFFIX"));
 
 pub mod aacs;
+pub(crate) mod bdnav;
 pub(crate) mod clpi;
 pub mod consts;
 pub mod css;
