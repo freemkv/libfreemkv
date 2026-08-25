@@ -2,7 +2,7 @@
 name = "libfreemkv"
 version = "1.6.9"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.94"
 license = "MIT"
 description = "Open source raw disc access library for optical drives"
 repository = "https://github.com/freemkv/libfreemkv"

@@ -217,9 +217,7 @@ impl PsDemuxer {
     /// Like [`feed`](Self::feed) but records the absolute source byte offset of
     /// `data[0]`, so every PES this call completes is stamped with a
     /// [`crate::pes::SourcePos`]. The provenance-stamping entry point; the
-    /// highway calls this with each batch's known source offset. The base must
-    /// be the offset of the FIRST byte appended (i.e. of `data[0]`), which lines
-    /// up with the current buffer tail.
+    /// highway calls this with each batch's known source offset.
     pub fn feed_at(&mut self, base_offset: u64, data: &[u8]) -> Vec<PsPacket> {
         if !self.has_base {
             // First base seen: the offset of data[0] is base_offset, and data[0]
