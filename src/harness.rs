@@ -215,6 +215,50 @@ fn udf_name_parse_never_panics() {
 }
 
 #[test]
+fn class_reader_parse_never_panics() {
+    // Java `.class` files are a documented format we READ (never execute) to
+    // recover BD-J stream labels — a peer of mpls/clpi here. Every count,
+    // length and constant-pool index in the file is attacker-controlled disc
+    // metadata, so the parser must reject malformed input with `Err`, never
+    // panic. Magic is the class-file magic `0xCAFEBABE`.
+    sweep("class_reader", &[0xCA, 0xFE, 0xBA, 0xBE], |b| {
+        if let Ok(class) = crate::labels::class_reader::ClassFile::parse(b) {
+            // Exercise the accessors a label parser drives, so their indexing
+            // is fuzzed too, not just the structural parse.
+            let _ = class.this_class_name();
+            let _ = class.super_class_name();
+            for m in &class.methods {
+                let _ = class.member_name(m);
+                if let Some(code) = m.code(&class.constant_pool) {
+                    for insn in code.instructions() {
+                        let _ = insn.cp_index();
+                        if let Some(idx) = insn.cp_index() {
+                            let _ = class.constant_pool.get(idx);
+                            let _ = class.constant_pool.member_ref(idx);
+                            let _ = class.constant_pool.load_constant_display(idx);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn jar_class_walk_never_panics() {
+    // The jar layer opens a `/BDMV/JAR/<x>.jar` (a zip) and walks every
+    // `.class` inside it, handing each to the class reader. Feed the sweep's
+    // bytes as a zip archive; when they parse as one, walk the classes exactly
+    // as `deluxe`/`dbp` do. Neither the zip open nor the class walk may panic.
+    // Magic is the zip local-file-header signature `PK\x03\x04`.
+    sweep("jar", &[0x50, 0x4B, 0x03, 0x04], |b| {
+        if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(b.to_vec())) {
+            crate::labels::jar::for_each_class(&mut archive, |_name, _class| {});
+        }
+    });
+}
+
+#[test]
 fn ps_demuxer_feed_never_panics() {
     // Stateful, unlike the others: the demuxer carries a buffer across feeds, so
     // each case is fed to a FRESH demuxer and then a shared one. The shared pass
