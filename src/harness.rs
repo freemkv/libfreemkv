@@ -195,6 +195,17 @@ fn bdnav_mobj_parse_never_panics() {
 }
 
 #[test]
+fn dvd_nav_resolve_never_panics() {
+    // The DVD First-Play navigation resolver parses VMGI (`VIDEO_TS.IFO`) —
+    // FP_PGC command table + TT_SRPT, all attacker-controlled offsets/counts —
+    // and executes an untrusted command list on a bounded VM. Magic is the VMGI
+    // signature so the sweep reaches past the header guard into the executor.
+    sweep("dvd_nav", b"DVDVIDEO-VMG", |b| {
+        let _ = crate::dvdnav::nav::resolve_from_vmg(b);
+    });
+}
+
+#[test]
 fn udf_name_parse_never_panics() {
     // No magic: the compression ID is the first byte and every value is legal
     // input to reject, so the "magic" is a byte the sweep will mutate anyway.
