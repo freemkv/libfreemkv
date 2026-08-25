@@ -186,6 +186,20 @@ pub struct Clip {
     pub feed_span: Option<(u64, u64)>,
 }
 
+/// Per-title classification for [`Disc::main_feature_order`]. Both fields are
+/// GLOBAL properties (they depend on the whole title list, not on a pairwise
+/// comparison), so they are precomputed once by [`Disc::rank_titles`] and
+/// threaded into the comparator.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TitleRank {
+    /// The disc's authoring names this (video-bearing, non-composite,
+    /// duration-corroborated) title as the feature.
+    pub authoring: bool,
+    /// This title is a play-all / wrapper composite of another substantial
+    /// video title (see the `standalone` key in [`Disc::MAIN_FEATURE_ORDER_KEYS`]).
+    pub composite: bool,
+}
+
 /// A stream within a title.
 #[derive(Debug, Clone)]
 pub enum Stream {
@@ -1481,6 +1495,29 @@ impl DiscTitle {
     pub fn has_video(&self) -> bool {
         self.video_streams().next().is_some()
     }
+
+    /// Whether this title PLAUSIBLY carries feature video content — a real
+    /// primary video stream, OR a size/duration profile only video explains
+    /// (at least 2 GB and 5 minutes).
+    ///
+    /// The exposed `streams` come from the title's FIRST PlayItem only, so a
+    /// feature whose first PlayItem is a non-video bumper reports
+    /// `has_video() == false` and would be wrongly disqualified (audit R6).
+    /// This predicate is deliberately MORE permissive than [`Self::has_video`]
+    /// — it only ever ADMITS a title the stricter gate would reject — so it
+    /// cannot reopen the decoy hole (a size-inflated streamless decoy is demoted
+    /// STRUCTURALLY by composite detection in [`Disc::rank_titles`], not by this
+    /// gate), while it still rejects tiny streamless menu/metadata playlists.
+    /// It is the `has-video` key used by [`Disc::main_feature_order`]. The size
+    /// fallback requires at least one clip, so a clip-less pure-metadata decoy
+    /// (which cannot be a real bumper-lead feature — that has the feature clip)
+    /// is still rejected.
+    pub fn has_probable_video(&self) -> bool {
+        self.has_video()
+            || (!self.clips.is_empty()
+                && self.size_bytes >= 2_000_000_000
+                && self.duration_secs >= 300.0)
+    }
 }
 
 // ─── Encryption ─────────────────────────────────────────────────────────────
@@ -1842,7 +1879,7 @@ impl Disc {
         // first title with extents (unchanged behaviour) when none has video.
         titles
             .iter()
-            .find(|t| t.has_video() && !t.extents.is_empty())
+            .find(|t| t.has_probable_video() && !t.extents.is_empty())
             .or_else(|| titles.iter().find(|t| !t.extents.is_empty()))
             .map(|t| t.extents.as_slice())
             .unwrap_or(&[])
@@ -2101,15 +2138,15 @@ impl Disc {
         let feature_hint = crate::labels::apply(reader, &udf_fs, &mut titles);
 
         // Authoritative main-feature ordering. The physical `canonical_title_order`
-        // sort above is refined once labels have run: a streamless decoy playlist
-        // (long/large but zero-video, e.g. Spider-Man 3 UHD `00245`) is demoted
-        // below every title that has video, and a feature the disc's own menu
-        // authoring designates (`feature_hint`) is promoted outright. After this,
-        // `titles[0]` is the selected main feature. The `canonical_title_order`
-        // sort is kept first because label ANCHORING (`labels::apply`, above)
-        // reads titles in duration-descending order.
-        titles
-            .sort_by(|a, b| Self::main_feature_order(a, b, capacity_bytes, feature_hint.as_ref()));
+        // sort above is refined once labels have run: a play-all / wrapper COMPOSITE
+        // (e.g. Spider-Man 3 UHD `00245` = `[bumper][00001 feature clip][outro]`) is
+        // demoted below the standalone title it wraps, a title with no plausible
+        // video is dropped, and a feature the disc's own menu authoring designates
+        // (`feature_hint`) is promoted outright. After this, `titles[0]` is the
+        // selected main feature. The `canonical_title_order` sort is kept first
+        // because label ANCHORING (`labels::apply`, above) reads titles in
+        // duration-descending order.
+        Self::sort_titles_by_main_feature(&mut titles, capacity_bytes, feature_hint.as_ref());
 
         // Optional content-based forced-subtitle detection. `info` opts in so its
         // forced flags match what the muxer derives during a rip (both use the
@@ -2313,36 +2350,127 @@ impl Disc {
     /// decision row can NAME the ordering instead of restating it (same
     /// anti-drift contract as `CANONICAL_TITLE_ORDER_KEYS`).
     ///
+    /// (A future `nav-feature` key — the BD navigation resolver's own play-path
+    /// pick — is reserved as the top slot ABOVE `authoring-feature`; it is not
+    /// yet wired, so it is absent from this list rather than named-but-inert.)
+    ///
     /// - `authoring-feature`: a title the disc's own menu authoring designates
-    ///   as the feature (and which has video) outranks everything else — a
-    ///   size-independent signal an obfuscation decoy cannot forge.
-    /// - `has-video`: a title with no decodable video can never be the main
-    ///   feature, so it is demoted below every title that has one. This is the
-    ///   gate that stops a streamless, size-inflated decoy playlist from
-    ///   winning the physical-size key (the Spider-Man 3 UHD `00245` case).
+    ///   as the feature (has video, is not itself a composite, and is within a
+    ///   sane fraction of the longest title's duration) outranks everything
+    ///   else — a size-independent signal an obfuscation decoy cannot forge.
+    /// - `standalone`: a title that is a play-all / wrapper COMPOSITE — its clip
+    ///   set properly contains another substantial video title's whole clip set
+    ///   (the Spider-Man 3 UHD `00245` = `[bumper][00001 feature clip][outro]`
+    ///   case) — is demoted below the standalone title it wraps. This is the
+    ///   STRUCTURAL anti-decoy signal; it does not depend on stream counts,
+    ///   physical size, or disc capacity, so it survives where those are spoofed
+    ///   or unknown.
+    /// - `has-video`: a title with no plausible video content (see
+    ///   [`DiscTitle::has_probable_video`]) is demoted below every title that
+    ///   has some — a floor that drops streamless menu/metadata playlists.
     pub const MAIN_FEATURE_ORDER_KEYS: &'static [&'static str] =
-        &["authoring-feature", "has-video"];
+        &["authoring-feature", "standalone", "has-video"];
 
-    /// Total order over titles for MAIN-FEATURE selection: authoring-designated
-    /// feature first, then any title with video ahead of any without, then the
-    /// physical [`Self::canonical_title_order`] keys. `scan_with` sorts with
-    /// this (after labels have run, so the authoring hint is available) so
-    /// `titles[0]` is the selected main feature.
+    /// Precompute the [`TitleRank`] for every title, in the same index order.
+    ///
+    /// Composite detection: title `P` is a composite when some OTHER title `Q`
+    /// has a non-empty clip-id set that is a PROPER SUBSET of `P`'s
+    /// (`Q ⊊ P` — `P` re-uses all of `Q`'s clips plus extra), `Q` has plausible
+    /// video, and `Q` accounts for at least half of `P`'s declared size (so `Q`
+    /// is a real feature `P` merely wraps/aggregates, not an incidental short
+    /// clip). This catches both the wrapper decoy (`00245 ⊋ 00001`) and the
+    /// oversize play-all — independent of capacity, which the `fits-disc` gate
+    /// needs and which is `0`/unknown on drives that fail READ CAPACITY.
+    ///
+    /// Known residual: a real feature that has a separate "resume from the
+    /// middle" branch playlist reusing most of its clips could be mis-flagged;
+    /// this is rare on BD/UHD, and the (higher-precedence) nav and authoring
+    /// signals override it when present. The corpus title-selection gate is the
+    /// backstop across the disc hoard.
+    pub fn rank_titles(
+        titles: &[DiscTitle],
+        hint: Option<&crate::labels::FeaturePlaylistHint>,
+    ) -> Vec<TitleRank> {
+        let clip_sets: Vec<std::collections::BTreeSet<&str>> = titles
+            .iter()
+            .map(|t| t.clips.iter().map(|c| c.clip_id.as_str()).collect())
+            .collect();
+        let longest_video_dur = titles
+            .iter()
+            .filter(|t| t.has_probable_video())
+            .map(|t| t.duration_secs)
+            .fold(0.0_f64, f64::max);
+        titles
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let pi = &clip_sets[i];
+                let composite = !pi.is_empty()
+                    && p.size_bytes > 0
+                    && titles.iter().enumerate().any(|(j, q)| {
+                        j != i && {
+                            let qj = &clip_sets[j];
+                            !qj.is_empty()
+                                && qj.len() < pi.len()
+                                && qj.is_subset(pi)
+                                && q.has_probable_video()
+                                && q.size_bytes as f64 >= 0.5 * p.size_bytes as f64
+                        }
+                    });
+                // The authoring hint is honoured only when the hinted title has
+                // REAL video streams (strict `has_video`, not the permissive
+                // `has_probable_video` floor — so a hint at a large streamless
+                // entry cannot resurrect the decoy), is NOT itself a composite (a
+                // mis-authored id pointing at a wrapper can't win), and runs at
+                // least half as long as the longest title (audit R4 — a hint at a
+                // short trailer/branch must not override the real 2h feature).
+                let authoring = !composite
+                    && hint.is_some_and(|h| h.matches(p.playlist_id, &p.playlist))
+                    && p.has_video()
+                    && (longest_video_dur <= 0.0 || p.duration_secs >= 0.5 * longest_video_dur);
+                TitleRank {
+                    authoring,
+                    composite,
+                }
+            })
+            .collect()
+    }
+
+    /// Pairwise order over titles for MAIN-FEATURE selection, given each title's
+    /// precomputed [`TitleRank`]: authoring-designated feature first, then a
+    /// standalone title ahead of any composite that wraps it, then plausible
+    /// video ahead of none, then the physical [`Self::canonical_title_order`]
+    /// keys. [`Self::sort_titles_by_main_feature`] drives it so `titles[0]` is
+    /// the selected main feature.
     pub fn main_feature_order(
         a: &DiscTitle,
         b: &DiscTitle,
         capacity_bytes: u64,
-        hint: Option<&crate::labels::FeaturePlaylistHint>,
+        ra: &TitleRank,
+        rb: &TitleRank,
     ) -> std::cmp::Ordering {
-        // Authoring feature wins outright — but ONLY when it actually has video,
-        // so a mis-authored hint pointing at a streamless entry can't reopen the
-        // decoy hole the `has-video` gate closes.
-        let a_auth = hint.is_some_and(|h| h.matches(a.playlist_id, &a.playlist)) && a.has_video();
-        let b_auth = hint.is_some_and(|h| h.matches(b.playlist_id, &b.playlist)) && b.has_video();
-        b_auth
-            .cmp(&a_auth)
-            .then_with(|| b.has_video().cmp(&a.has_video()))
+        rb.authoring
+            .cmp(&ra.authoring)
+            .then_with(|| ra.composite.cmp(&rb.composite))
+            .then_with(|| b.has_probable_video().cmp(&a.has_probable_video()))
             .then_with(|| Self::canonical_title_order(a, b, capacity_bytes))
+    }
+
+    /// Sort `titles` so `titles[0]` is the main feature: precompute the global
+    /// [`TitleRank`]s, then order by [`Self::main_feature_order`]. Used by
+    /// `scan_with` (after labels, so the authoring hint is available) and by the
+    /// selection tests.
+    pub fn sort_titles_by_main_feature(
+        titles: &mut Vec<DiscTitle>,
+        capacity_bytes: u64,
+        hint: Option<&crate::labels::FeaturePlaylistHint>,
+    ) {
+        let ranks = Self::rank_titles(titles, hint);
+        let mut decorated: Vec<(TitleRank, DiscTitle)> =
+            ranks.into_iter().zip(std::mem::take(titles)).collect();
+        decorated
+            .sort_by(|(ra, a), (rb, b)| Self::main_feature_order(a, b, capacity_bytes, ra, rb));
+        *titles = decorated.into_iter().map(|(_, t)| t).collect();
     }
 
     /// Audio-richness rank for `canonical_title_order`'s same-length tiebreak.
@@ -4771,61 +4899,133 @@ mod tests {
         );
     }
 
-    /// Regression for the Spider-Man 3 UHD hang: a STREAMLESS decoy playlist
-    /// that is the LONGEST and LARGEST title must not be selected. `00245.mpls`
-    /// (dur 8350s, 78.4 GB, v=0) beat the real `00001.mpls` (dur 8038s,
-    /// 76.5 GB, v=1) on the physical size key, and muxing a title with zero
-    /// streams produced zero frames → E6008 forever. The `has-video` gate
-    /// demotes it. The in-test contrast proves the gate flips the result the
-    /// pre-gate physical comparator would give.
-    #[test]
-    fn main_feature_order_demotes_streamless_decoy() {
-        let mut decoy = DiscTitle::empty();
-        decoy.playlist = "00245.mpls".into();
-        decoy.playlist_id = 245;
-        decoy.duration_secs = 8350.3;
-        decoy.size_bytes = 78_427_502_592;
-        // streams: none — the obfuscation decoy.
-
-        let feature = DiscTitle {
-            playlist: "00001.mpls".into(),
-            playlist_id: 1,
-            duration_secs: 8038.4,
-            size_bytes: 76_525_627_392,
+    /// A BD title carrying video, `id`, `dur`/`size`, and the given clip ids.
+    fn bd_title(playlist: &str, id: u16, dur: f64, size: u64, clip_ids: &[&str]) -> DiscTitle {
+        DiscTitle {
+            playlist: playlist.into(),
+            playlist_id: id,
+            duration_secs: dur,
+            size_bytes: size,
+            clips: clip_ids
+                .iter()
+                .map(|c| Clip {
+                    feed_span: None,
+                    clip_id: (*c).into(),
+                    in_time: 0,
+                    out_time: 1,
+                    duration_secs: 1.0,
+                    source_packets: 0,
+                })
+                .collect(),
             ..title_with_video(Codec::Hevc, Resolution::R2160p)
-        };
+        }
+    }
 
+    /// Same, but with an empty STN stream list — models a title whose FIRST
+    /// PlayItem is a non-video bumper (`has_video()` is false; `streams` reflect
+    /// PlayItem 0 only).
+    fn bd_title_no_stn_video(
+        playlist: &str,
+        id: u16,
+        dur: f64,
+        size: u64,
+        clip_ids: &[&str],
+    ) -> DiscTitle {
+        DiscTitle {
+            streams: Vec::new(),
+            ..bd_title(playlist, id, dur, size, clip_ids)
+        }
+    }
+
+    /// Regression for the Spider-Man 3 UHD hang: the decoy `00245.mpls` is a
+    /// WRAPPER COMPOSITE — `[00339 2s bumper][00001 the whole feature clip][00336
+    /// outro]` — so its first-PlayItem STN reports v=0, and it is the LONGEST and
+    /// LARGEST title (8350s / 78.4 GB vs the feature's 8038s / 76.5 GB). Muxing
+    /// its zero frames produced E6008 forever. It must be demoted STRUCTURALLY
+    /// (its clip set properly contains the feature's), not by the fragile
+    /// first-PlayItem stream count — this is what makes the fix robust to the
+    /// video-bearing-composite variant (see `main_feature_order_demotes_video_composite`).
+    #[test]
+    fn main_feature_order_demotes_wrapper_composite_decoy() {
+        let decoy = bd_title_no_stn_video(
+            "00245.mpls",
+            245,
+            8350.3,
+            78_427_502_592,
+            &["00339", "00001", "00336"],
+        );
+        let feature = bd_title("00001.mpls", 1, 8038.4, 76_525_627_392, &["00001"]);
+        let extra = bd_title("00248.mpls", 248, 794.2, 60_000_000_000, &["00248"]);
         let capacity = 88_000_000_000u64;
 
-        // Pre-gate: the physical comparator ranks the larger/longer decoy FIRST
-        // (`a < b` ⇒ `Less`) — this is exactly the bug.
+        // Pre-gate: the physical comparator ranks the larger/longer decoy FIRST.
         assert_eq!(
             Disc::canonical_title_order(&decoy, &feature, capacity),
             std::cmp::Ordering::Less,
-            "pre-gate physical order would pick the streamless decoy"
+            "pre-gate physical order would pick the wrapper composite decoy"
         );
-        // Post-gate: the has-video gate demotes the decoy below the real feature.
-        assert_eq!(
-            Disc::main_feature_order(&decoy, &feature, capacity, None),
-            std::cmp::Ordering::Greater,
-            "has-video gate demotes the streamless decoy below the real feature"
-        );
+        // The decoy is classified a composite; the feature is standalone.
+        let ranks = Disc::rank_titles(&[decoy.clone(), feature.clone()], None);
+        assert!(ranks[0].composite, "the wrapper decoy is a composite");
+        assert!(!ranks[1].composite, "the feature it wraps is standalone");
 
-        let mut extra = title_with_video(Codec::Hevc, Resolution::R2160p);
-        extra.playlist = "00248.mpls".into();
-        extra.playlist_id = 248;
-        extra.duration_secs = 794.2;
-        extra.size_bytes = 60_000_000_000;
-
-        let mut titles = [decoy, feature, extra];
-        titles.sort_by(|a, b| Disc::main_feature_order(a, b, capacity, None));
+        let mut titles = vec![decoy, feature, extra];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None);
         assert_eq!(
             titles[0].playlist_id, 1,
-            "the real feature (has video) is selected as titles[0]"
+            "the standalone feature is selected as titles[0]"
         );
         assert_eq!(
             titles[2].playlist_id, 245,
-            "the streamless decoy is demoted to the back"
+            "the wrapper composite decoy is demoted to the back"
+        );
+    }
+
+    /// Audit T2: a composite that ALSO carries video (its first PlayItem is the
+    /// feature clip, so v>0) — the case the old `has-video` gate could not see —
+    /// is still demoted below the standalone feature it wraps, by clip-set
+    /// containment alone.
+    #[test]
+    fn main_feature_order_demotes_video_composite() {
+        let composite = bd_title(
+            "00245.mpls",
+            245,
+            8350.3,
+            78_427_502_592,
+            &["00001", "00336"],
+        );
+        let feature = bd_title("00001.mpls", 1, 8038.4, 76_525_627_392, &["00001"]);
+        let capacity = 88_000_000_000u64;
+
+        let mut titles = vec![composite, feature];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None);
+        assert_eq!(
+            titles[0].playlist_id, 1,
+            "a video-bearing composite must still lose to the standalone feature it contains"
+        );
+    }
+
+    /// Audit T3: capacity unknown (`0` — READ CAPACITY failed) disables the
+    /// `fits-disc` oversize gate, so a video-bearing OVERSIZE play-all composite
+    /// would win on size. Clip-set composite detection demotes it regardless of
+    /// capacity.
+    #[test]
+    fn main_feature_order_demotes_oversize_composite_when_capacity_unknown() {
+        let playall = bd_title(
+            "00099.mpls",
+            99,
+            15_180.0,
+            92_400_000_000,
+            &["00800", "00801", "00802", "00803"],
+        );
+        let feature = bd_title("00800.mpls", 800, 7320.0, 57_200_000_000, &["00800"]);
+        let capacity = 0u64; // unknown → oversize gate inert
+
+        let mut titles = vec![playall, feature];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None);
+        assert_eq!(
+            titles[0].playlist_id, 800,
+            "the standalone feature wins even when the oversize gate is disabled"
         );
     }
 
@@ -4837,45 +5037,30 @@ mod tests {
             playlist_id: Some(222),
             filename: Some("00222.mpls".into()),
         };
-        let authored = DiscTitle {
-            playlist: "00222.mpls".into(),
-            playlist_id: 222,
-            duration_secs: 6000.0,
-            size_bytes: 40_000_000_000,
-            ..title_with_video(Codec::Hevc, Resolution::R2160p)
-        };
-        let generic = DiscTitle {
-            playlist: "00001.mpls".into(),
-            playlist_id: 1,
-            duration_secs: 8000.0,
-            size_bytes: 80_000_000_000,
-            ..title_with_video(Codec::Hevc, Resolution::R2160p)
-        };
+        let authored = bd_title("00222.mpls", 222, 6000.0, 40_000_000_000, &["00222"]);
+        let generic = bd_title("00001.mpls", 1, 8000.0, 80_000_000_000, &["00001"]);
         let capacity = 100_000_000_000u64;
 
         // No hint: the larger generic title wins on size.
+        let mut no_hint = vec![authored.clone(), generic.clone()];
+        Disc::sort_titles_by_main_feature(&mut no_hint, capacity, None);
         assert_eq!(
-            Disc::main_feature_order(&authored, &generic, capacity, None),
-            std::cmp::Ordering::Greater,
-            "without a hint the larger generic title outranks the authored one"
-        );
-        // With the hint: the authored feature wins outright.
-        assert_eq!(
-            Disc::main_feature_order(&authored, &generic, capacity, Some(&hint)),
-            std::cmp::Ordering::Less,
-            "the authoring hint promotes the designated feature above the larger title"
+            no_hint[0].playlist_id, 1,
+            "without a hint the larger generic title wins"
         );
 
-        let mut titles = [generic, authored];
-        titles.sort_by(|a, b| Disc::main_feature_order(a, b, capacity, Some(&hint)));
+        // With the hint: the authored feature wins outright despite being smaller.
+        let mut titles = vec![generic, authored];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, Some(&hint));
         assert_eq!(
             titles[0].playlist_id, 222,
-            "the authored feature is selected as titles[0]"
+            "the authoring hint promotes the designated feature above the larger title"
         );
     }
 
     /// A hint pointing at a STREAMLESS entry must not resurrect the decoy bug:
-    /// the authoring preference requires the designated title to have video.
+    /// the authoring preference requires the designated title to have real video
+    /// streams, and a clip-less streamless title fails the `has-video` floor too.
     #[test]
     fn authoring_hint_never_promotes_a_streamless_title() {
         let hint = crate::labels::FeaturePlaylistHint {
@@ -4887,19 +5072,121 @@ mod tests {
         streamless.playlist_id = 245;
         streamless.duration_secs = 9000.0;
         streamless.size_bytes = 90_000_000_000;
-        let feature = DiscTitle {
-            playlist: "00001.mpls".into(),
-            playlist_id: 1,
-            duration_secs: 8000.0,
-            size_bytes: 76_000_000_000,
-            ..title_with_video(Codec::Hevc, Resolution::R2160p)
-        };
+        let feature = bd_title("00001.mpls", 1, 8000.0, 76_000_000_000, &["00001"]);
         let capacity = 100_000_000_000u64;
+
+        let mut titles = vec![streamless, feature];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, Some(&hint));
         assert_eq!(
-            Disc::main_feature_order(&streamless, &feature, capacity, Some(&hint)),
-            std::cmp::Ordering::Greater,
-            "a hint at a streamless title must not override the has-video gate"
+            titles[0].playlist_id, 1,
+            "a hint at a streamless title must not override the has-video floor"
         );
+    }
+
+    /// Audit T4: an authoring hint pointing at a SHORT video branch/trailer must
+    /// not override the real feature — the hint is corroborated by duration.
+    #[test]
+    fn authoring_hint_not_honoured_for_short_branch() {
+        let hint = crate::labels::FeaturePlaylistHint {
+            playlist_id: Some(250),
+            filename: None,
+        };
+        let feature = bd_title("00001.mpls", 1, 8038.4, 76_000_000_000, &["00001"]);
+        let branch = bd_title("00250.mpls", 250, 561.0, 5_000_000_000, &["00250"]);
+        let capacity = 100_000_000_000u64;
+
+        let mut titles = vec![branch, feature];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, Some(&hint));
+        assert_eq!(
+            titles[0].playlist_id, 1,
+            "a hint at a 9-minute branch must not beat the 2h13m feature"
+        );
+    }
+
+    /// Audit T6: a REAL feature whose first PlayItem is a non-video bumper
+    /// (so its first-PlayItem STN reports v=0) must NOT be disqualified — the
+    /// permissive `has-video` floor keeps it, and the smaller bonus does not win.
+    #[test]
+    fn feature_with_non_video_first_playitem_not_disqualified() {
+        let feature =
+            bd_title_no_stn_video("00001.mpls", 1, 8038.4, 76_000_000_000, &["00339", "00001"]);
+        let bonus = bd_title("00050.mpls", 50, 600.0, 5_000_000_000, &["00050"]);
+        let capacity = 88_000_000_000u64;
+
+        assert!(
+            !feature.has_video() && feature.has_probable_video(),
+            "the bumper-lead feature has no first-PlayItem video but IS probable video"
+        );
+        let mut titles = vec![bonus, feature];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None);
+        assert_eq!(
+            titles[0].playlist_id, 1,
+            "the bumper-lead feature is selected, not the small bonus"
+        );
+    }
+
+    /// Audit T7: when every title is streamless (whole-disc parse failure), the
+    /// pick is still deterministic (largest) and the three pickers agree —
+    /// `titles[0]` after the sort, `image_crack_extents`, and the diag `pick`
+    /// (also `titles[0]`) name the same title (audit R9 single-source-of-truth).
+    #[test]
+    fn all_streamless_fallback_is_deterministic_and_consistent() {
+        let mut a = DiscTitle::empty();
+        a.playlist = "00010.mpls".into();
+        a.playlist_id = 10;
+        a.duration_secs = 600.0;
+        a.size_bytes = 500_000_000;
+        a.extents = vec![Extent {
+            start_lba: 10,
+            sector_count: 100,
+        }];
+        let mut b = DiscTitle::empty();
+        b.playlist = "00020.mpls".into();
+        b.playlist_id = 20;
+        b.duration_secs = 400.0;
+        b.size_bytes = 300_000_000;
+        b.extents = vec![Extent {
+            start_lba: 200,
+            sector_count: 50,
+        }];
+        let capacity = 50_000_000_000u64;
+
+        let mut titles = vec![b, a];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None);
+        assert_eq!(
+            titles[0].playlist_id, 10,
+            "the largest title is the deterministic fallback pick"
+        );
+        // image_crack_extents must agree with titles[0] (R9).
+        assert_eq!(
+            Disc::image_crack_extents(&titles),
+            titles[0].extents.as_slice(),
+            "image-crack extents must be the selected title's (single source of truth)"
+        );
+    }
+
+    /// Equal-clip TWINS (seamless-branching siblings) are NOT composites — a
+    /// composite requires a PROPER subset — so both stay eligible and the
+    /// physical tiebreak (here size) decides.
+    #[test]
+    fn equal_clip_twins_are_not_composite() {
+        let t0 = bd_title("00800.mpls", 800, 7200.0, 57_000_000_000, &["00001"]);
+        let t1 = bd_title("00801.mpls", 801, 7200.0, 56_000_000_000, &["00001"]);
+        let ranks = Disc::rank_titles(&[t0, t1], None);
+        assert!(
+            !ranks[0].composite && !ranks[1].composite,
+            "identical-clip twins must not be flagged composite"
+        );
+    }
+
+    /// A video-only title (no audio tracks) is a valid feature — the gate keys
+    /// on video, not audio — so it is not disqualified.
+    #[test]
+    fn video_only_title_is_probable_video() {
+        let t = bd_title("00001.mpls", 1, 7200.0, 60_000_000_000, &["00001"]);
+        assert!(t.video_streams().next().is_some());
+        assert!(t.streams.iter().all(|s| !matches!(s, Stream::Audio(_))));
+        assert!(t.has_probable_video());
     }
 
     #[test]
