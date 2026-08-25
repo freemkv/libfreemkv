@@ -875,11 +875,10 @@ mod tests {
     #[test]
     fn normalize_language_lowercases_and_trims() {
         assert_eq!(
-            super::super::mpls_universal::language_display_name(&{
-                let trimmed = "  ENG  ".trim().to_ascii_lowercase();
-                // feed through production normalize_language logic
-                trimmed
-            }),
+            // trim + lowercase, mirroring production normalize_language
+            super::super::mpls_universal::language_display_name(
+                &"  ENG  ".trim().to_ascii_lowercase(),
+            ),
             "English"
         );
     }

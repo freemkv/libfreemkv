@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Lowered the minimum supported Rust version (MSRV) from 1.97 to 1.94. This is
+  the lowest toolchain on which `cargo build`, `cargo clippy --all-targets
+  -D warnings`, and `cargo test --tests` all pass clean; CI toolchain pins were
+  moved to match. (The crate's dependencies floor `cargo build` at 1.90, but
+  clippy is only warning-clean from 1.94.)
+
+### Fixed
+
+- Direct disc reads (`disc://…`): `DiscStream` now threads a cumulative feed
+  base offset into the demuxer (`feed_at`) for both the TS and PS paths and
+  forwards it onto each `PesPacket`, so demuxed frames carry byte-exact source
+  provenance (`SourcePos`). Without it, `SeamPlan::place` fell back to a PTS
+  heuristic that a B-frame PTS reorder dip could misread as a `stepped_back`
+  clip transition, dropping all subsequent video frames in multi-clip playlists.
+
 ## [1.6.10] — 2026-08-23
 
 ### Fixed
