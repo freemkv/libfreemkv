@@ -21,19 +21,35 @@ impl Disc {
     /// enumerators — a bare `Err(_) => return Vec::new()` turned an operator
     /// Stop into ZERO titles at rc=0, a disc reported as carrying no video at
     /// all.
+    ///
+    /// Returns the scanned titles plus, when the disc's own First-Play
+    /// navigation deterministically dispatches to a title, that title's
+    /// `playlist_id` — the nav-resolved main feature. The caller feeds it into
+    /// `sort_titles_by_main_feature` as the DVD `nav_feature`, the same seam the
+    /// BD path uses. It is `None` (→ existing ranking heuristics stand) whenever
+    /// the navigation is menu-only, malformed, or does not converge.
     pub(super) fn scan_dvd_titles(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
         halt: Option<&crate::halt::Halt>,
-    ) -> Result<Vec<DiscTitle>> {
+    ) -> Result<(Vec<DiscTitle>, Option<u16>)> {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
         let dvd_info = match ifo::parse_vmg(reader, udf_fs) {
             Ok(info) => info,
             Err(Error::Halted) => return Err(Error::Halted),
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => return Ok((Vec::new(), None)),
         };
+
+        // Follow the disc's First-Play navigation the way a player would, to see
+        // which title it selects as the feature (issue #40). Read-only, and any
+        // parse error / interactive-menu entry / non-convergence returns `None`
+        // — a strict improvement: it never removes a title, only re-ranks toward
+        // the nav-chosen one. The `(vtsn, vts_ttn)` it yields is matched to the
+        // scanned title below to recover its `playlist_id`.
+        let nav_target = crate::dvdnav::resolve_main_title(reader, udf_fs);
+        let mut nav_feature: Option<u16> = None;
 
         let mut titles = Vec::new();
         let mut title_number: u16 = 0;
@@ -127,6 +143,17 @@ impl Disc {
 
             for (vts_title_idx, dvd_title) in ts.titles.iter().enumerate() {
                 title_number += 1;
+
+                // If the nav executor picked this title (identified by its VTS
+                // number and 1-based position within the set — the same
+                // `vts_ttn` convention used below), remember its global
+                // `playlist_id` so the caller can promote it in ranking.
+                if let Some(rt) = nav_target
+                    && rt.vtsn == ts.vts_number
+                    && rt.vts_ttn as usize == vts_title_idx + 1
+                {
+                    nav_feature = Some(title_number);
+                }
 
                 // Diagnostic dump (--log-level 3): per-cell category table +
                 // chapter map for this title, BEFORE lowering drops the
@@ -269,7 +296,7 @@ impl Disc {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
-        Ok(titles)
+        Ok((titles, nav_feature))
     }
 }
 
@@ -633,6 +660,7 @@ mod tests {
         assert_eq!(
             Disc::scan_dvd_titles(&mut disc, &udf, None)
                 .expect("scan")
+                .0
                 .len(),
             2,
             "fixture must offer two title sets"
@@ -647,7 +675,7 @@ mod tests {
             matches!(res, Err(crate::error::Error::Halted)),
             "a cancelled title-set read must surface as a cancelled scan, not \
              as a disc with fewer titles; got {:?}",
-            res.map(|ts| ts.iter().map(|t| t.playlist.clone()).collect::<Vec<_>>())
+            res.map(|(ts, _)| ts.iter().map(|t| t.playlist.clone()).collect::<Vec<_>>())
         );
 
         // The same cancel one level up: VIDEO_TS.IFO itself. This is the
@@ -662,7 +690,7 @@ mod tests {
             matches!(res, Err(crate::error::Error::Halted)),
             "a cancelled VMG read must surface as a cancelled scan, not as an \
              empty disc; got {:?}",
-            res.map(|ts| ts.len())
+            res.map(|(ts, _)| ts.len())
         );
     }
 
@@ -676,6 +704,7 @@ mod tests {
         assert!(
             Disc::scan_dvd_titles(&mut disc, &udf, None)
                 .expect("scan")
+                .0
                 .is_empty()
         );
     }
@@ -713,7 +742,9 @@ mod tests {
                 },
             ],
         );
-        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0;
         assert_eq!(titles.len(), 1);
         let t = &titles[0];
         assert_eq!(t.extents.len(), 1);
@@ -769,7 +800,9 @@ mod tests {
                 },
             ],
         );
-        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0;
         assert_eq!(titles.len(), 1);
         let t = &titles[0];
         assert_eq!(t.extents.len(), 1);
@@ -827,7 +860,9 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
         assert_eq!(t.extents.len(), 1);
         let got = t.extents[0].start_lba;
         // The one correct answer: all three terms summed (9000 + 700 + 33).
@@ -885,7 +920,9 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
         assert_eq!(t.extents.len(), 2);
         assert_eq!(t.extents[0].start_lba, 9500); // ifo_lba(9000) + 500 + 0
         assert_eq!(t.extents[0].sector_count, 100);
@@ -926,7 +963,9 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
         let v = t
             .streams
             .iter()
@@ -981,7 +1020,9 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
         let v = t
             .streams
             .iter()
@@ -1042,7 +1083,9 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
         let audios: Vec<_> = t
             .streams
             .iter()
@@ -1112,7 +1155,9 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
         let audios: Vec<_> = t
             .streams
             .iter()
@@ -1169,7 +1214,9 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
         let subs: Vec<_> = t
             .streams
             .iter()
@@ -1229,7 +1276,9 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
         let sub = t
             .streams
             .iter()
@@ -1283,7 +1332,9 @@ mod tests {
                 },
             ],
         );
-        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0;
         assert_eq!(titles.len(), 2);
         // title_number is a running counter across all title sets.
         assert_eq!(titles[0].playlist_id, 1);
@@ -1320,7 +1371,9 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
         // One program in the program map → one chapter time (0.0 for the
         // first program). Name is the ordinal from chapter_name(0).
         assert_eq!(t.chapters.len(), 1);
@@ -1405,7 +1458,9 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
         // The leading 0x90 cell is dropped: 2 feature extents, not 3.
         assert_eq!(t.extents.len(), 2, "leading angle sub-block cell dropped");
         // First extent starts at the feature cell (vob 1000 + 100), not at 1000+0.
@@ -1457,7 +1512,9 @@ mod tests {
                 },
             ],
         );
-        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan")[0];
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
         // Nothing dropped: both cells become extents, starting at the very head.
         assert_eq!(t.extents.len(), 2);
         assert_eq!(t.extents[0].start_lba, 9000 + 1000); // ifo_lba + vtstt + 0, head intact
@@ -1500,7 +1557,9 @@ mod tests {
                 },
             ],
         );
-        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+        let titles = Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0;
         let t = &titles[0];
         let audio_pids: Vec<u16> = t
             .streams
