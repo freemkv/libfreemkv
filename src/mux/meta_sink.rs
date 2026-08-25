@@ -6,7 +6,7 @@
 //! through [`super::resolve::output`] like the other write-only sinks; the
 //! ISO/disc scan that builds the title is all they need.
 
-use crate::disc::{Chapter, DiscTitle, Stream as DiscStream};
+use crate::disc::{Chapter, DiscTitle, TitleProfile};
 use crate::pes::{PesFrame, Stream};
 use std::fs::File;
 use std::io::{self, Write};
@@ -105,150 +105,59 @@ impl Stream for ChaptersSink {
 
 // ── json:// ──────────────────────────────────────────────────────────────────
 
-/// Serialization id for an audio stream's editorial purpose.
-fn purpose_id(p: crate::labels::LabelPurpose) -> &'static str {
-    use crate::labels::LabelPurpose::*;
-    match p {
-        Normal => "normal",
-        Commentary => "commentary",
-        Descriptive => "descriptive",
-        Score => "score",
-        Ime => "ime",
-    }
-}
-
-/// Serialization id for a subtitle stream's qualifier.
-fn qualifier_id(q: crate::labels::LabelQualifier) -> &'static str {
-    use crate::labels::LabelQualifier::*;
-    match q {
-        None => "none",
-        Sdh => "sdh",
-        DescriptiveService => "descriptive_service",
-        Forced => "forced",
-    }
-}
-
-/// One stream as JSON — every field the scan resolved, nothing dropped. This is
-/// the complete per-stream model (`disc::Stream`), not a summary: consumers get
-/// resolution/HDR/aspect for video, channels/sample-rate/purpose for audio, and
-/// the qualifier for subtitles, all in machine-readable form.
-fn stream_json(s: &DiscStream) -> serde_json::Value {
-    use super::demux_sink::codec_label;
-    use serde_json::json;
-    match s {
-        DiscStream::Video(v) => {
-            // Absent dimensions serialise as 0 here; the JSON consumer reads
-            // this as informational metadata, not as a mux input.
-            let (w, h) = v.resolution.pixels().unwrap_or((0, 0));
-            let (fps_num, fps_den) = v.frame_rate.as_fraction();
-            let mut o = json!({
-                "kind": "video",
-                "codec": codec_label(v.codec),
-                "pid": v.pid,
-                "resolution": v.resolution.to_string(),
-                "width": w,
-                "height": h,
-                "interlaced": v.resolution.is_interlaced(),
-                "frame_rate": v.frame_rate.to_string(),
-                "frame_rate_num": fps_num,
-                "frame_rate_den": fps_den,
-                "hdr": v.hdr.id(),
-                "color_space": v.color_space.id(),
-                "secondary": v.secondary,
-                "mvc_dependent": v.is_mvc_dependent(),
-            });
-            if let Some((num, den)) = v.display_aspect {
-                o["display_aspect"] = json!(format!("{num}:{den}"));
-            }
-            if let Some(c) = v.measured_cicp {
-                o["measured_cicp"] = json!({
-                    "matrix": c.matrix,
-                    "transfer": c.transfer,
-                    "primaries": c.primaries,
-                    "range": c.range,
-                });
-            }
-            if !v.label.is_empty() {
-                o["label"] = json!(v.label);
-            }
-            o
-        }
-        DiscStream::Audio(a) => {
-            let mut o = json!({
-                "kind": "audio",
-                "codec": codec_label(a.codec),
-                "pid": a.pid,
-                "language": a.language,
-                "channels": a.channels.to_string(),
-                "sample_rate": a.sample_rate.to_string(),
-                "secondary": a.secondary,
-                "purpose": purpose_id(a.purpose),
-            });
-            // `AudioChannels::count()` and `SampleRate::hz()` FABRICATE a concrete
-            // value for the `Unknown` variant (6 channels / 48000 Hz), so calling
-            // them unconditionally reported a confident 5.1 / 48 kHz for audio
-            // whose format is genuinely unknown — contradicting the neighbouring
-            // `channels` / `sample_rate` strings, which honestly say "unknown".
-            // Omit the numeric key entirely instead: the same guard `mkv.rs`
-            // applies before writing Channels / SamplingFrequency (there it emits
-            // 0 so the EBML serializer drops the element). Kept as a guard here
-            // rather than fixed in `count()`/`hz()` because those return
-            // non-optional scalars that other callers rely on.
-            if !matches!(a.channels, crate::disc::AudioChannels::Unknown) {
-                o["channel_count"] = json!(a.channels.count());
-            }
-            if !matches!(a.sample_rate, crate::disc::SampleRate::Unknown) {
-                o["sample_rate_hz"] = json!(a.sample_rate.hz());
-            }
-            if !a.label.is_empty() {
-                o["label"] = json!(a.label);
-            }
-            o
-        }
-        DiscStream::Subtitle(t) => json!({
-            "kind": "subtitle",
-            "codec": codec_label(t.codec),
-            "pid": t.pid,
-            "language": t.language,
-            "forced": t.forced,
-            "qualifier": qualifier_id(t.qualifier),
-        }),
-    }
-}
-
-/// The `json://` document for one title: identity, duration/size, its clips,
-/// its complete stream models, and its chapter points. A stable, machine-
-/// readable view of one title — the same information the scan resolved, no loss.
+/// The `json://` document for one title.
+///
+/// SINGLE SERIALIZATION SOURCE OF TRUTH: the per-title / per-stream schema comes
+/// from the normalized [`TitleProfile`] (the same typed view `Disc::profile`
+/// exposes), serialized directly — `json://` and any downstream consumer share
+/// one schema rather than a hand-built one that can drift.
+///
+/// SCHEMA NOTE. This replaces the previous hand-built `streams` array. The
+/// stable editorial meaning is preserved, but the shape is normalized: the one
+/// `streams` array (tagged with `kind`) becomes three typed arrays (`video` /
+/// `audio` / `subtitles`); subtitle `qualifier` becomes the booleans `forced` +
+/// `sdh`; audio `purpose` becomes `commentary` + `descriptive`; and per-track
+/// `default` is now hoisted (first non-secondary video/audio). Per-stream fields
+/// the normalized profile intentionally omits (`pid`, `width`/`height`,
+/// `color_space`, `measured_cicp`, `sample_rate`, `channel_count`,
+/// `mvc_dependent`) are no longer emitted; they live on the richer scan model,
+/// not on this format-agnostic view.
+///
+/// `json://`-only extras that are NOT part of the normalized profile — the
+/// title's `clips` and the full `chapter_marks` list — are spliced back on so
+/// those consumers do not regress. (`chapters` from the profile is the marker
+/// COUNT; the full list is under `chapter_marks`.) `json://` is a per-title sink
+/// with no disc context, so `index` is `0` and `is_main` is `false`; the
+/// disc-level [`crate::disc::DiscProfile`] populates those correctly.
 pub(crate) fn title_json(title: &DiscTitle) -> serde_json::Value {
     use serde_json::json;
-    let streams: Vec<_> = title.streams.iter().map(stream_json).collect();
-    let clips: Vec<_> = title
-        .clips
-        .iter()
-        .map(|c| {
-            json!({
+    let profile = TitleProfile::from_title(title, 0, false);
+    // Serializing a plain-scalar struct is infallible; fall back to an empty
+    // object rather than panic if that ever changes (the create() path then
+    // surfaces the empty doc as a NoMetadata error).
+    let mut doc = serde_json::to_value(&profile).unwrap_or_else(|_| json!({}));
+    doc["format"] = json!(format!("{:?}", title.content_format));
+    doc["playlist_id"] = json!(title.playlist_id);
+    doc["clips"] = json!(
+        title
+            .clips
+            .iter()
+            .map(|c| json!({
                 "clip_id": c.clip_id,
                 "duration_secs": c.duration_secs,
                 "source_packets": c.source_packets,
-            })
-        })
-        .collect();
-    let chapters: Vec<_> = title
-        .chapters
-        .iter()
-        .enumerate()
-        .map(|(i, c)| json!({ "n": i + 1, "start_secs": c.time_secs, "name": c.name }))
-        .collect();
-    json!({
-        "playlist": title.playlist,
-        "playlist_id": title.playlist_id,
-        "duration_secs": title.duration_secs,
-        "size_bytes": title.size_bytes,
-        "format": format!("{:?}", title.content_format),
-        "clips": clips,
-        "streams": streams,
-        "chapters": chapters,
-    })
+            }))
+            .collect::<Vec<_>>()
+    );
+    doc["chapter_marks"] = json!(
+        title
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(i, c)| json!({ "n": i + 1, "start_secs": c.time_secs, "name": c.name }))
+            .collect::<Vec<_>>()
+    );
+    doc
 }
 
 /// `json://` sink: writes the title's structured metadata at construction; the
@@ -347,28 +256,28 @@ mod tests {
         })];
         let v = title_json(&t);
         assert_eq!(v["playlist"], "MAIN");
-        let a = &v["streams"][0];
-        assert_eq!(a["kind"], "audio");
-        assert_eq!(a["codec"], "TrueHD");
+        // Normalized profile schema: streams split into typed arrays.
+        let a = &v["audio"][0];
+        assert_eq!(a["codec"], "truehd");
         assert_eq!(a["language"], "eng");
-        // Completeness: audio carries channels + sample rate + purpose, not just codec.
         assert_eq!(a["channels"], "stereo");
-        assert_eq!(a["channel_count"], 2);
-        assert_eq!(a["sample_rate"], "48kHz");
-        assert_eq!(a["sample_rate_hz"], 48000.0);
-        assert_eq!(a["purpose"], "normal");
-        assert_eq!(v["chapters"][1]["n"], 2);
-        assert_eq!(v["chapters"][1]["start_secs"], 62.5);
-        assert_eq!(v["chapters"][1]["name"], "2");
+        // Editorial purpose is decomposed into booleans.
+        assert!(!a["commentary"].as_bool().unwrap());
+        assert!(!a["descriptive"].as_bool().unwrap());
+        // First non-secondary audio is the hoisted default.
+        assert!(a["default"].as_bool().unwrap());
+        // Chapter COUNT from the profile; full list under chapter_marks.
+        assert_eq!(v["chapters"], 2);
+        assert_eq!(v["chapter_marks"][1]["n"], 2);
+        assert_eq!(v["chapter_marks"][1]["start_secs"], 62.5);
+        assert_eq!(v["chapter_marks"][1]["name"], "2");
     }
 
-    /// An audio stream whose channel layout / sample rate are genuinely unknown
-    /// must not be reported with a fabricated 5.1 / 48 kHz. `AudioChannels::count()`
-    /// maps `Unknown` to 6 and `SampleRate::hz()` maps `Unknown` to 48000, so the
-    /// numeric fields must be omitted rather than computed — otherwise the JSON
-    /// contradicts its own `channels` / `sample_rate` strings ("unknown").
+    /// An audio stream whose channel layout is genuinely unknown reports the
+    /// honest `"unknown"` string (the normalized profile carries the layout label,
+    /// not a fabricated numeric channel count).
     #[test]
-    fn unknown_audio_layout_omits_fabricated_numeric_fields() {
+    fn unknown_audio_layout_reports_unknown_channels() {
         use crate::disc::{AudioChannels, AudioStream, Codec, DiscTitle};
         use crate::disc::{LabelPurpose, SampleRate, Stream as DiscStream};
         let mut t = DiscTitle::empty();
@@ -383,21 +292,10 @@ mod tests {
             label: String::new(),
         })];
         let v = title_json(&t);
-        let a = &v["streams"][0];
-        // The honest string fields.
+        let a = &v["audio"][0];
         assert_eq!(a["channels"], "unknown");
-        assert_eq!(a["sample_rate"], "unknown");
-        // The numeric fields must not assert a value the scan never resolved.
-        assert!(
-            a["channel_count"].is_null(),
-            "unknown channel layout must not report a channel_count, got {}",
-            a["channel_count"]
-        );
-        assert!(
-            a["sample_rate_hz"].is_null(),
-            "unknown sample rate must not report a sample_rate_hz, got {}",
-            a["sample_rate_hz"]
-        );
+        // No fabricated numeric channel count is emitted in the profile schema.
+        assert!(a["channel_count"].is_null());
     }
 
     #[test]
@@ -420,15 +318,12 @@ mod tests {
             label: String::new(),
             measured_cicp: None,
         })];
-        let vid = &title_json(&t)["streams"][0];
-        assert_eq!(vid["kind"], "video");
+        let vid = &title_json(&t)["video"][0];
+        assert_eq!(vid["codec"], "hevc");
         assert_eq!(vid["resolution"], "2160p");
-        assert_eq!(vid["width"], 3840);
-        assert_eq!(vid["height"], 2160);
         assert_eq!(vid["frame_rate"], "23.976");
-        assert_eq!(vid["frame_rate_num"], 24000);
         assert_eq!(vid["hdr"], "hdr10");
-        assert_eq!(vid["color_space"], "bt2020");
+        assert!(vid["default"].as_bool().unwrap());
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {

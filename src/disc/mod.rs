@@ -15,6 +15,7 @@ mod encrypt;
 mod extract;
 mod hddvd;
 pub(crate) mod pgs_forced_probe;
+pub mod profile;
 
 use crate::drive::Drive;
 use crate::error::{Error, Result};
@@ -28,6 +29,7 @@ use encrypt::HandshakeResult;
 // these to display text in their own locale.
 pub use crate::labels::{LabelPurpose, LabelQualifier};
 pub use extract::{ExtractOptions, ExtractResult, FileResult};
+pub use profile::{AudioTrack, DiscProfile, SubtitleTrack, TitleProfile, VideoTrack};
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
