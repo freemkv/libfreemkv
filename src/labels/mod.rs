@@ -16,6 +16,7 @@ mod criterion;
 mod ctrm;
 mod dbp;
 mod deluxe;
+mod fox;
 pub(crate) mod jar;
 mod mpls_universal;
 mod paramount;
@@ -239,6 +240,13 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
     // walking).
     ("dbp", dbp::detect, dbp::parse),
     ("deluxe", deluxe::detect, deluxe::parse),
+    // Fox — older discs ship a loose plain-XML `/BDMV/JAR/<id>/dcx.xml`
+    // manifest (root `<dcx>`) with per-stream language/purpose/qualifier.
+    // High confidence: fully structured, no guessing. Registered ahead of
+    // the universal MPLS fallback so its editorial labels win. Newer Fox
+    // wraps the same data in `com/foxbd` bytecode (see fox.rs Phase 2 note),
+    // which this parser detects but does not yet decode.
+    ("fox", fox::detect, fox::parse),
     // Universal MPLS fallback. Returns Confidence::Low so framework
     // parsers always win when they match. Closes the "no framework
     // matched" gap (e.g. HDMV-only discs) with spec-derived language
@@ -1575,15 +1583,16 @@ mod registry_tests {
                 "ctrm",
                 "dbp",
                 "deluxe",
+                "fox",
                 "mpls_universal",
                 "png_filenames",
             ],
             "PARSERS array order changed — file-presence/reader-gated High \
              parsers (paramount/criterion/pixelogic/ctrm) stay first; dbp + \
-             deluxe (now real com/<vendor>/ prefix detect) stay before \
-             mpls_universal; mpls_universal stays the universal Low fallback; \
-             png_filenames (Low, language-only hint) stays LAST so MPLS wins \
-             the Low tie whenever it produces anything."
+             deluxe (now real com/<vendor>/ prefix detect) and fox (dcx.xml / \
+             com/foxbd) stay before mpls_universal; mpls_universal stays the \
+             universal Low fallback; png_filenames (Low, language-only hint) \
+             stays LAST so MPLS wins the Low tie whenever it produces anything."
         );
     }
 
