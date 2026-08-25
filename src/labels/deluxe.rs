@@ -48,16 +48,34 @@
 //!
 //! ## Confidence
 //!
-//! [`parse`] returns `Some(ParseResult::medium(labels))` when Phases A
-//! through D produce at least one stream — `Medium` because the
-//! signal-to-label mapping is heuristic. `None` when the disc isn't
-//! Deluxe-authored or when decoding produces zero streams (a
-//! recognized-but-broken state that the analyzer still surfaces via
-//! `parsers_detected`).
+//! [`parse`] returns `Some(ParseResult::high(labels))` when Phases A
+//! through D produce at least one stream: the master enums matched their
+//! framework-stable fingerprints (a strong ordered-prefix signature), the
+//! binding class decoded, and at least one per-stream binding resolved to a
+//! real (language, purpose, codec) tuple — the schema was fully recovered,
+//! not guessed. `None` when the disc isn't Deluxe-authored or when decoding
+//! produces zero streams (a recognized-but-broken state that the analyzer
+//! still surfaces via `parsers_detected`).
+//!
+//! ## Confirmed studio variants
+//!
+//! - **Universal** (`studio="uni"`): Language enum `pd` (65 values,
+//!   `English, French, Spanish, Dutch, …`), Purpose enum `lp`
+//!   (`Normal, Commentary, PiP, Trivia, Descriptive, Score`), audio binding
+//!   `np.<init>(I, Lpd;, Llp;, Lorg/bluray/ti/CodingType;)`, subtitle binding
+//!   `wb.<init>(I, Lpd;, Llp;, Lmi;)`, all built in one binding class's
+//!   `<clinit>` alongside a title-wrapper object whose constructor takes the
+//!   per-stream arrays (filtered out by the array-parameter guard in the
+//!   decoder). SDH/RNIB is encoded as a distinct Language VALUE
+//!   ("English SDH", "English RNIB"), recovered into the qualifier from the
+//!   name. Grounded on the F&F cluster (fixtures from *Fast Five*).
+//! - **Disney/Warner**: 70-value Language enum, same binding shape; the
+//!   original corpus this parser was written against.
 
 use super::class_reader::{
     AASTORE, BIPUSH, ClassFile, CodeAttribute, ConstantPool, CpInfo, GETSTATIC, ICONST_0, ICONST_1,
-    ICONST_2, ICONST_3, ICONST_4, ICONST_5, ICONST_M1, INVOKESPECIAL, LDC, LDC_W, NEW, SIPUSH,
+    ICONST_2, ICONST_3, ICONST_4, ICONST_5, ICONST_M1, INVOKESPECIAL, LDC, LDC_W, NEW, PUTSTATIC,
+    SIPUSH,
 };
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, jar, vocab};
 use crate::sector::SectorSource;
@@ -76,6 +94,13 @@ pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
 }
 
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
+    // Per-studio dispatch signal. Deluxe authored the framework for several
+    // studios (Universal `studio="uni"`, Fox, WB, Disney/Pixar); each ships a
+    // `/BDMV/JAR/<n>/config.xml` naming the studio. The structural enum/binding
+    // matching below is studio-agnostic, so this is currently informational
+    // (logged, and available for future per-studio special-casing), not a gate.
+    let studio = detect_studio(reader, udf);
+
     jar::for_each_jar(reader, udf, |entry_name, archive| {
         if !jar::has_path_prefix(archive, "com/bydeluxe/") {
             return None;
@@ -150,15 +175,63 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         }
         tracing::info!(
             jar = ?entry_name,
+            studio = ?studio,
             audio = labels.iter().filter(|l| l.stream_type == StreamLabelType::Audio).count(),
             subtitle = labels.iter().filter(|l| l.stream_type == StreamLabelType::Subtitle).count(),
             "deluxe emitted labels",
         );
-        // Medium confidence: Phase D's signal-to-label mapping is a
-        // documented heuristic until corpus-disc bytecode confirms
-        // the exact binding pattern.
-        Some(ParseResult::medium(labels))
+        // High confidence: the master enums matched their framework-stable
+        // fingerprints, the binding class decoded its `<clinit>`, and at least
+        // one per-stream binding resolved to a real (language, purpose, codec)
+        // tuple. Un-named STN slots are still back-filled from the MPLS floor
+        // by the registry (`merge_mpls_floor`).
+        Some(ParseResult::high(labels))
     })
+}
+
+/// Read the studio identifier from a Deluxe disc's `config.xml`
+/// (`<TitleConfig studio="uni"…>`), if present. The file lives under a
+/// numbered subdirectory of `/BDMV/JAR/` (e.g. `/BDMV/JAR/99999/config.xml`),
+/// so this scans the subdirectories for the first one that carries it.
+///
+/// Returns the lowercased studio token (`"uni"`, `"fox"`, `"wb"`, …) or `None`
+/// when no readable `config.xml` names a studio.
+fn detect_studio(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<String> {
+    let dir = udf.find_dir("/BDMV/JAR")?;
+    for entry in &dir.entries {
+        if !entry.is_dir {
+            continue;
+        }
+        let path = format!("/BDMV/JAR/{}/config.xml", entry.name);
+        let Ok(bytes) = udf.read_file(reader, &path) else {
+            continue;
+        };
+        if let Some(studio) = parse_studio_attr(&bytes) {
+            return Some(studio);
+        }
+    }
+    None
+}
+
+/// Extract the `studio="…"` attribute value from a `config.xml` byte buffer.
+/// Deliberately a tolerant substring scan rather than a full XML parse: the
+/// file is tiny attacker-controlled disc metadata and the only field of
+/// interest is this one attribute. Rejects an empty or implausibly long value.
+fn parse_studio_attr(xml: &[u8]) -> Option<String> {
+    const MAX_STUDIO_LEN: usize = 32;
+    let text = std::str::from_utf8(xml).ok()?;
+    let anchor = text.find("studio")?;
+    let after_key = &text[anchor + "studio".len()..];
+    // Skip whitespace / '=' up to the opening quote.
+    let open = after_key.find(['"', '\''])?;
+    let quote = after_key.as_bytes()[open];
+    let rest = &after_key[open + 1..];
+    let close = rest.find(quote as char)?;
+    let val = rest[..close].trim();
+    if val.is_empty() || val.len() > MAX_STUDIO_LEN {
+        return None;
+    }
+    Some(val.to_ascii_lowercase())
 }
 
 /// One identified master enum class.
@@ -166,8 +239,18 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 pub(crate) struct MasterEnum {
     /// Obfuscated class name (e.g. `be.class`, `aw.class`).
     pub class_name: String,
-    /// Ordinal → string-value mapping, in declaration order.
+    /// Ordinal → string-value mapping, in declaration order (the `ldc`
+    /// operands of each enum constant's construction).
     pub values: Vec<String>,
+    /// Ordinal → static-field name, in declaration order (the `putstatic`
+    /// target that stores each enum constant). These are the obfuscated
+    /// names (`a`, `b`, `c`, …) that the binding class references via
+    /// `getstatic`, so Phase D resolves a `getstatic <enum>.<field>` by
+    /// looking the field name up here. Empty (falls back to value-keyed
+    /// resolution) only for synthetically-built test enums; real enums
+    /// captured from bytecode always populate it. See
+    /// [`clinit_enum_field_names`] and [`MasterEnumTable::from`].
+    pub fields: Vec<String>,
 }
 
 /// Fingerprints we use to identify each master enum class. The
@@ -180,6 +263,14 @@ struct Fingerprint {
     label: &'static str,
     prefix: &'static [&'static str],
     expected_count: usize,
+    /// Half-width of the accepted count window around `expected_count`.
+    /// The ordered `prefix` is the real discriminator (four-plus exact
+    /// display strings in declaration order is not something a non-enum
+    /// class reproduces), so the count check only guards against a wildly
+    /// different class; the window is per-fingerprint because studios ship
+    /// different-sized enums (Universal's Language enum has 65 values,
+    /// Disney/Warner's has 70).
+    count_tolerance: usize,
 }
 
 const FINGERPRINTS: &[Fingerprint] = &[
@@ -187,26 +278,32 @@ const FINGERPRINTS: &[Fingerprint] = &[
         label: "Language",
         prefix: &["English", "French", "Spanish", "Dutch"],
         expected_count: 70,
+        // Universal = 65, Disney/Warner = 70; widen to span both plus drift.
+        count_tolerance: 8,
     },
     Fingerprint {
         label: "Purpose",
         prefix: &["Normal", "Commentary", "PiP", "Trivia"],
         expected_count: 8,
+        count_tolerance: LDC_COUNT_TOLERANCE,
     },
     Fingerprint {
         label: "VideoFormat",
         prefix: &["HD", "HDR10 Plus", "HD Dolby"],
         expected_count: 7,
+        count_tolerance: LDC_COUNT_TOLERANCE,
     },
     Fingerprint {
         label: "Region",
         prefix: &["USA_D1", "LIC1", "LIC2", "LIC3"],
         expected_count: 22,
+        count_tolerance: LDC_COUNT_TOLERANCE,
     },
     Fingerprint {
         label: "Studio",
         prefix: &["Disney", "Marvel", "Pixar"],
         expected_count: 6,
+        count_tolerance: LDC_COUNT_TOLERANCE,
     },
 ];
 
@@ -302,18 +399,25 @@ impl CandidatePool {
 /// enums by `<clinit>` ldc-sequence fingerprint. Returns a vector of
 /// `(label, MasterEnum)` — at most one match per fingerprint label.
 pub(crate) fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnum)> {
-    // First pass: collect every class's <clinit> ldc string sequence.
+    // First pass: collect every class's <clinit> ldc string sequence, keyed by
+    // the class's JVM INTERNAL name (`this_class`), NOT the zip entry name.
+    // The binding class references an enum constant as `getstatic <internal>.f`
+    // (e.g. `pd`, or `com/foo/pd`), so the master enum has to be identified by
+    // that same internal name or Phase C's getstatic count never matches it.
+    // The zip entry name (`pd.class`) is a different namespace, used only to
+    // locate a class for decoding.
     let mut pool = CandidatePool::default();
-    jar::for_each_class(archive, |class_name, class| {
+    jar::for_each_class(archive, |zip_name, class| {
         let Some(ldcs) = clinit_ldc_strings(class) else {
             return;
         };
         if ldcs.is_empty() {
             return;
         }
-        if !pool.insert(class_name, ldcs) {
+        let key = class.this_class_name().unwrap_or(zip_name);
+        if !pool.insert(key, ldcs) {
             tracing::debug!(
-                class = class_name,
+                class = key,
                 classes = pool.by_class.len(),
                 bytes = pool.bytes,
                 "deluxe: candidate pool aggregate cap hit, dropping class"
@@ -331,7 +435,7 @@ pub(crate) fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str
                 continue;
             }
             let count = ldcs.len();
-            if count.abs_diff(fp.expected_count) > LDC_COUNT_TOLERANCE {
+            if count.abs_diff(fp.expected_count) > fp.count_tolerance {
                 continue;
             }
             // Prefer exact-count match; otherwise first hit wins.
@@ -345,7 +449,85 @@ pub(crate) fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str
             }
         }
         if let Some((class_name, values)) = best {
-            out.push((fp.label, MasterEnum { class_name, values }));
+            out.push((fp.label, class_name, values));
+        }
+    }
+    if out.is_empty() {
+        return Vec::new();
+    }
+
+    // Second pass: capture the obfuscated `putstatic` field names for the
+    // classes we matched, so Phase D can resolve `getstatic <enum>.<field>`
+    // to an ordinal. This is a targeted re-walk of only the matched enum
+    // classes (at most one per fingerprint), not the whole jar again.
+    let want: HashSet<&str> = out.iter().map(|(_, name, _)| name.as_str()).collect();
+    let mut fields_by_class: HashMap<String, Vec<String>> = HashMap::new();
+    jar::for_each_class(archive, |zip_name, class| {
+        let iname = class.this_class_name().unwrap_or(zip_name);
+        if want.contains(iname) && !fields_by_class.contains_key(iname) {
+            fields_by_class.insert(iname.to_string(), clinit_enum_field_names(class));
+        }
+    });
+
+    out.into_iter()
+        .map(|(label, class_name, values)| {
+            let fields = fields_by_class.remove(&class_name).unwrap_or_default();
+            (
+                label,
+                MasterEnum {
+                    class_name,
+                    values,
+                    fields,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Collect the static-field names an enum class's `<clinit>` stores its
+/// own instances into, in declaration order — the ordinal → field-name
+/// mapping that mirrors [`clinit_ldc_strings`]'s ordinal → value mapping.
+///
+/// An obfuscated Deluxe enum constant compiles to
+/// `new E; dup; ldc "Value"; invokespecial E.<init>(…); putstatic E.<field>`,
+/// so the `putstatic` whose owning class AND field descriptor are both this
+/// class's own type names the field that ordinal. The binding class then
+/// references that constant as `getstatic E.<field>`; without this mapping
+/// the resolver in [`MasterEnumTable`] cannot turn the obfuscated field name
+/// back into an ordinal.
+///
+/// Bounded by [`MAX_CLINIT_LDC_STRINGS`] like the value walk: a `.class`
+/// gated only by a path prefix can inflate to the read ceiling, and each
+/// retained field name is a heap `String`.
+fn clinit_enum_field_names(class: &super::class_reader::ClassFile) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(self_name) = class.this_class_name() else {
+        return out;
+    };
+    let self_descriptor = format!("L{self_name};");
+    for m in &class.methods {
+        if class.member_name(m) != Some("<clinit>") {
+            continue;
+        }
+        let Some(code) = m.code(&class.constant_pool) else {
+            continue;
+        };
+        for insn in code.instructions() {
+            if insn.opcode != PUTSTATIC {
+                continue;
+            }
+            let Some(idx) = insn.cp_index() else { continue };
+            let Some(member) = class.constant_pool.member_ref(idx) else {
+                continue;
+            };
+            // Only the enum's own singleton fields (`Lself;` typed, owned by
+            // this class) — skip auxiliary statics (`$VALUES` arrays, counters).
+            if member.class_name == self_name && member.descriptor == self_descriptor {
+                if out.len() >= MAX_CLINIT_LDC_STRINGS {
+                    break;
+                }
+                out.push(member.name.to_string());
+            }
         }
     }
     out
@@ -752,6 +934,17 @@ impl<'a> BindingDecoder<'a> {
                 let Some(idx) = insn.cp_index() else { return };
                 let Some(member) = self.pool.member_ref(idx) else { return };
                 let arg_count = parse_method_arg_count(member.descriptor);
+                // A per-stream binding constructor takes only scalars and enum
+                // references — never an array. A constructor with an array
+                // parameter is a container/title wrapper (e.g. Universal's
+                // title object `oq.<init>(…, [Lnp;, [Lwb;, [Loq;, [J)`, which
+                // holds the per-stream arrays) and must NOT be recorded as a
+                // stream binding: it carries a Language (the title's primary
+                // language) but is not itself a stream, and emitting it would
+                // land a spurious label in the subtitle list. The stack is
+                // still unwound below so the following real bindings stay in
+                // sync; only the `Construction` push is suppressed.
+                let is_container = member.descriptor.contains('[');
                 // Pop args off the symbolic stack.
                 if self.stack.len() < arg_count + 1 {
                     // Stack-machine drift — bail on this construction
@@ -767,7 +960,8 @@ impl<'a> BindingDecoder<'a> {
                 // operates on. For our pattern it's NewObj(X).
                 let receiver = self.stack.pop().unwrap_or(StackVal::Unknown);
                 if let StackVal::NewObj(name) = receiver
-                    && name == member.class_name {
+                    && name == member.class_name
+                    && !is_container {
                         // Bounded by MAX_CONSTRUCTIONS: an unbounded push here
                         // is ~1 GiB reachable from a crafted `<clinit>`.
                         if self.constructions.len() >= MAX_CONSTRUCTIONS {
@@ -805,6 +999,15 @@ impl<'a> BindingDecoder<'a> {
             0x58 /* pop2 */ => {
                 self.stack.pop();
                 self.stack.pop();
+            }
+            // anewarray / newarray — pop the count, push the array reference.
+            // Modelled (rather than left to the `_` no-op) so the array
+            // constructions inside a container's argument list keep the
+            // symbolic stack aligned for the per-stream bindings built
+            // alongside them.
+            0xBD /* anewarray */ | 0xBC /* newarray */ => {
+                self.stack.pop();
+                self.push(StackVal::Unknown);
             }
             // aastore — array store consumes 3 slots (arrayref, index, value).
             AASTORE => {
@@ -890,8 +1093,18 @@ impl MasterEnumTable {
         let mut by_class = HashMap::new();
         let mut by_kind = HashMap::new();
         for (kind, m) in enums {
-            let field_map: HashMap<String, u16> = m
-                .values
+            // The binding class references enum constants by their obfuscated
+            // static-field name (`getstatic <enum>.a`), so the resolver map is
+            // keyed on the `putstatic` field names captured alongside the
+            // values (`m.fields`), NOT on the value strings. A synthetic test
+            // enum with no captured field names falls back to keying on the
+            // values themselves, which is how those tests reference it.
+            let keys: &[String] = if m.fields.is_empty() {
+                &m.values
+            } else {
+                &m.fields
+            };
+            let field_map: HashMap<String, u16> = keys
                 .iter()
                 .enumerate()
                 .map(|(i, v)| (v.clone(), i as u16))
@@ -1051,10 +1264,18 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
             None => (String::new(), String::new()),
         };
 
-        let (purpose, qualifier) = match purpose_ord {
+        let (purpose, mut qualifier) = match purpose_ord {
             Some(o) => deluxe_purpose_to_label(o),
             None => (LabelPurpose::Normal, LabelQualifier::None),
         };
+        // Some frameworks (notably Universal) do not carry SDH/RNIB in the
+        // Purpose enum at all — they encode it as a distinct Language enum
+        // VALUE ("English SDH", "English RNIB"). When the purpose left the
+        // qualifier unset, recover it from the language display name so those
+        // tracks are still flagged.
+        if qualifier == LabelQualifier::None {
+            qualifier = vocab::qualifier(&lang_value);
+        }
 
         if let Some(hint) = stream_idx_hint {
             tracing::debug!(
@@ -1635,7 +1856,10 @@ mod tests {
             .iter()
             .find(|(label, _)| *label == "Purpose")
             .unwrap_or_else(|| panic!("Purpose fingerprint not matched: {enums:?}"));
-        assert_eq!(purpose.1.class_name, "com/bydeluxe/Good.class");
+        // The identified class is keyed by its JVM INTERNAL name (`this_class`,
+        // here "GoodPurpose"), NOT the zip entry name — that internal name is
+        // what the binding class's `getstatic` operands reference.
+        assert_eq!(purpose.1.class_name, "GoodPurpose");
         assert_eq!(purpose.1.values.len(), 8);
         assert_eq!(purpose.1.values[0], "Normal");
         assert_eq!(purpose.1.values[7], "NoForcedDescriptive");
@@ -2290,6 +2514,10 @@ mod tests {
         let m = MasterEnum {
             class_name: "LanguageEnum".into(),
             values: vec!["English".into(), "French".into(), "Spanish".into()],
+            // Empty: this synthetic enum resolves by value (the fallback in
+            // `MasterEnumTable::from`), so the resolve tests below key on
+            // "English"/"French"/"Spanish" directly.
+            fields: Vec::new(),
         };
         MasterEnumTable::from(&[("Language", m)])
     }
@@ -2981,5 +3209,145 @@ mod tests {
         let set = table.class_name_set();
         assert!(set.contains("LanguageEnum"));
         assert_eq!(set.len(), 1);
+    }
+
+    // ── Real-disc fixtures: Universal (studio="uni"), Fast Five ──────────────
+    //
+    // Captured from `FastFive.iso` `/BDMV/JAR/00000.jar` (`com/bydeluxe/…`).
+    // These are verbatim, unmodified `.class` files — the format we READ, never
+    // execute — exercising the full Phase A→D pipeline against real obfuscated
+    // Deluxe bytecode rather than synthetic fixtures.
+    //
+    //   pd.class = Language enum (65 values: English, French, Spanish, Dutch …)
+    //   lp.class = Purpose enum  (Normal, Commentary, PiP, Trivia, Descriptive, Score)
+    //   tl.class = binding class: audio `np.<init>(I,Lpd;,Llp;,LCodingType;)`,
+    //              subtitle `wb.<init>(I,Lpd;,Llp;,Lmi;)`, and a title-wrapper
+    //              `oq.<init>(…,[Lnp;,[Lwb;,[Loq;,[J)` that must NOT leak a label.
+    const UNI_PD_CLASS: &[u8] = include_bytes!("testdata/deluxe_uni/pd.class");
+    const UNI_LP_CLASS: &[u8] = include_bytes!("testdata/deluxe_uni/lp.class");
+    const UNI_TL_CLASS: &[u8] = include_bytes!("testdata/deluxe_uni/tl.class");
+
+    fn parse_fixture(bytes: &[u8]) -> super::super::class_reader::ClassFile {
+        super::super::class_reader::ClassFile::parse(bytes).expect("fixture .class parses")
+    }
+
+    #[test]
+    fn universal_language_enum_pd_matches_the_language_fingerprint() {
+        let pd = parse_fixture(UNI_PD_CLASS);
+        let values = clinit_ldc_strings(&pd).expect("pd has a <clinit>");
+        // 65-value Universal Language enum — the count the old 70±4 window
+        // wrongly rejected.
+        assert_eq!(values.len(), 65);
+        assert_eq!(&values[..4], &["English", "French", "Spanish", "Dutch"]);
+        assert!(
+            ldcs_match_prefix(&values, FINGERPRINTS[0].prefix),
+            "pd must match the Language prefix"
+        );
+        assert!(
+            values.len().abs_diff(FINGERPRINTS[0].expected_count)
+                <= FINGERPRINTS[0].count_tolerance,
+            "65 must fall inside the Language count window (regression guard on \
+             the widened tolerance)"
+        );
+    }
+
+    #[test]
+    fn universal_enum_field_names_map_ordinals_to_obfuscated_fields() {
+        let pd = parse_fixture(UNI_PD_CLASS);
+        let fields = clinit_enum_field_names(&pd);
+        // One putstatic per enum constant, in declaration order: a,b,c,d,…
+        assert_eq!(fields.len(), 65);
+        assert_eq!(&fields[..4], &["a", "b", "c", "d"]);
+    }
+
+    /// Build the master table the way `parse` would, but from the fixtures.
+    fn universal_master() -> MasterEnumTable {
+        let pd = parse_fixture(UNI_PD_CLASS);
+        let lp = parse_fixture(UNI_LP_CLASS);
+        let pd_enum = MasterEnum {
+            class_name: pd.this_class_name().unwrap().to_string(),
+            values: clinit_ldc_strings(&pd).unwrap(),
+            fields: clinit_enum_field_names(&pd),
+        };
+        let lp_enum = MasterEnum {
+            class_name: lp.this_class_name().unwrap().to_string(),
+            values: clinit_ldc_strings(&lp).unwrap(),
+            fields: clinit_enum_field_names(&lp),
+        };
+        MasterEnumTable::from(&[("Language", pd_enum), ("Purpose", lp_enum)])
+    }
+
+    #[test]
+    fn universal_binding_class_decodes_real_per_stream_labels() {
+        let tl = parse_fixture(UNI_TL_CLASS);
+        let master = universal_master();
+        let constructions = decode_binding_class(&tl, &master);
+        assert!(
+            !constructions.is_empty(),
+            "tl.<clinit> must yield per-stream constructions"
+        );
+        // The title-wrapper `oq` takes array parameters and must be filtered:
+        // every retained construction is a scalar/enum-only binding.
+        // (np = 4 args incl. CodingType; wb = 4-5 args incl. `mi`.)
+
+        let labels = interpret_streams(&constructions, &master);
+        assert!(!labels.is_empty(), "must emit at least one stream label");
+
+        let audio: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .collect();
+        let subs: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Subtitle)
+            .collect();
+        assert!(!audio.is_empty(), "expected audio labels");
+        assert!(!subs.is_empty(), "expected subtitle labels");
+
+        // Real languages recovered via the obfuscated-field-name resolver.
+        let langs: std::collections::HashSet<&str> =
+            labels.iter().map(|l| l.language.as_str()).collect();
+        assert!(langs.contains("eng"), "English audio/subtitle expected");
+        assert!(
+            langs.contains("spa") || langs.contains("fra"),
+            "expected at least one non-English language (Spanish/French)"
+        );
+
+        // The display name is the disc's OWN label, not just an ISO code.
+        assert!(
+            labels.iter().any(|l| l.name == "English"),
+            "expected the disc-authored display name 'English'"
+        );
+
+        // Audio bindings carry a decoded BD-J CodingType → codec hint.
+        assert!(
+            audio.iter().any(|l| l.codec_hint == "Dolby Digital"),
+            "DOLBY_AC3_AUDIO must translate to 'Dolby Digital'; got {:?}",
+            audio.iter().map(|l| &l.codec_hint).collect::<Vec<_>>()
+        );
+
+        // Subtitle bindings (`wb`, no CodingType) carry no codec hint.
+        assert!(
+            subs.iter().all(|l| l.codec_hint.is_empty()),
+            "subtitle codec hints should be empty (PG implied)"
+        );
+    }
+
+    #[test]
+    fn universal_config_xml_studio_attribute_is_parsed() {
+        // The real config.xml from FastFive.iso /BDMV/JAR/99999/config.xml.
+        let xml = br#"<TitleConfig studio="uni" >
+  <Type><Rental>-</Rental><Single>-</Single></Type>
+</TitleConfig>"#;
+        assert_eq!(parse_studio_attr(xml).as_deref(), Some("uni"));
+        // Single-quoted and whitespace-padded variants.
+        assert_eq!(
+            parse_studio_attr(b"<TitleConfig studio = 'fox'>").as_deref(),
+            Some("fox")
+        );
+        // Missing / empty attribute → None (never panics).
+        assert_eq!(parse_studio_attr(b"<TitleConfig>"), None);
+        assert_eq!(parse_studio_attr(b"studio=\"\""), None);
+        assert_eq!(parse_studio_attr(&[0xff, 0xfe, 0x00]), None);
     }
 }
