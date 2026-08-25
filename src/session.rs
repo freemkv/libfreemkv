@@ -91,7 +91,20 @@ pub fn resolve_keys_for(
     inputs.samples = if src_vec.is_empty() {
         Vec::new()
     } else {
-        match disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() {
+        // Sample encrypted units from the LARGEST title that has video — the
+        // main feature carries the most units to validate a key against, while a
+        // size-inflated STREAMLESS decoy (the biggest title on some obfuscated
+        // UHDs) would waste the read on the wrong title. Falls back to the
+        // largest title outright when none has video (title-less/empty discs and
+        // the pre-scan sampling path).
+        match disc
+            .titles
+            .iter()
+            .filter(|t| t.has_video())
+            .max_by_key(|t| t.size_bytes)
+            .or_else(|| disc.titles.iter().max_by_key(|t| t.size_bytes))
+            .cloned()
+        {
             Some(title) => read_encrypted_units(reader, &title, MIN_SAMPLE_UNITS),
             None => Vec::new(),
         }
@@ -545,13 +558,26 @@ fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result
     // genuine ciphertext reads as clear and the mux writes it out as video at
     // exit 0. `is_unit_aligned` cannot catch it, because it measures against
     // this same wrong base.
+    // Probe the first extent of the LARGEST title that has video — the movie —
+    // not merely the largest-by-sector-count title, which on an obfuscated disc
+    // can be a streamless decoy whose base would mismeasure the ciphertext
+    // alignment for the actual feature. Falls back to the largest title when
+    // none has video.
     let Some(extent) = disc
         .titles
         .iter()
+        .filter(|t| t.has_video())
         .max_by_key(|t| {
             t.extents
                 .iter()
                 .fold(0u64, |a, e| a.saturating_add(e.sector_count as u64))
+        })
+        .or_else(|| {
+            disc.titles.iter().max_by_key(|t| {
+                t.extents
+                    .iter()
+                    .fold(0u64, |a, e| a.saturating_add(e.sector_count as u64))
+            })
         })
         .and_then(|t| t.extents.first())
     else {

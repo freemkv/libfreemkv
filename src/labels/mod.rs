@@ -149,6 +149,38 @@ pub enum Confidence {
     High,
 }
 
+/// The disc's own authoring-designated main-feature playlist, surfaced by a
+/// parser that reads the menu/authoring metadata (e.g. Paramount `playlists.xml`
+/// carries `<playlist name="Feature" id="00222"/>`). Consumed by title
+/// selection (`Disc::main_feature_order`) as a size-independent anti-decoy
+/// signal — a playlist obfuscation trick can inflate a streamless decoy past
+/// the real feature on size/duration, but it can't forge the authoring id.
+/// Best-effort: an unknown field is `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeaturePlaylistHint {
+    /// Playlist number (e.g. 222 for `00222.mpls`) when the authoring id parses.
+    pub playlist_id: Option<u16>,
+    /// Playlist filename (e.g. "00222.mpls") when derivable.
+    pub filename: Option<String>,
+}
+
+impl FeaturePlaylistHint {
+    /// Whether this hint designates the playlist a title carries. Matches on
+    /// the numeric id OR the filename (case-insensitive), so a hint that pins
+    /// only one still binds.
+    pub fn matches(&self, title_playlist_id: u16, title_playlist: &str) -> bool {
+        if self.playlist_id == Some(title_playlist_id) {
+            return true;
+        }
+        matches!(&self.filename, Some(f) if f.eq_ignore_ascii_case(title_playlist))
+    }
+
+    /// Whether the hint carries no usable identity.
+    pub fn is_empty(&self) -> bool {
+        self.playlist_id.is_none() && self.filename.is_none()
+    }
+}
+
 /// Successful parser result. `None` from `parse()` still means "this
 /// isn't my disc" (no labels at all); `Some(ParseResult { labels, .. })`
 /// with `labels.is_empty()` is also a "no labels" case but reachable
@@ -158,6 +190,9 @@ pub enum Confidence {
 pub struct ParseResult {
     pub labels: Vec<StreamLabel>,
     pub confidence: Confidence,
+    /// The disc's authoring-named feature playlist, when this parser read it
+    /// from the menu metadata. `None` for parsers that don't expose one.
+    pub feature_playlist: Option<FeaturePlaylistHint>,
 }
 
 impl ParseResult {
@@ -167,6 +202,7 @@ impl ParseResult {
         ParseResult {
             labels,
             confidence: Confidence::High,
+            feature_playlist: None,
         }
     }
 
@@ -175,6 +211,7 @@ impl ParseResult {
         ParseResult {
             labels,
             confidence: Confidence::Medium,
+            feature_playlist: None,
         }
     }
 
@@ -185,6 +222,7 @@ impl ParseResult {
         ParseResult {
             labels,
             confidence: Confidence::Low,
+            feature_playlist: None,
         }
     }
 }
@@ -221,13 +259,21 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
 
 /// Search disc for config files, extract labels, apply to streams.
 /// This is 100% optional — if anything fails, streams are untouched.
-pub fn apply(reader: &mut dyn SectorSource, udf: &UdfFs, titles: &mut [DiscTitle]) {
-    let labels = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract(reader, udf)))
-        .unwrap_or_default();
-    if labels.is_empty() {
-        return;
+/// Returns the disc's authoring-designated feature playlist when a parser
+/// surfaced one (`None` otherwise), so the caller can bias title selection
+/// toward it. Label binding onto streams is a side effect on `titles`.
+pub fn apply(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    titles: &mut [DiscTitle],
+) -> Option<FeaturePlaylistHint> {
+    let (labels, feature_playlist) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract(reader, udf)))
+            .unwrap_or_default();
+    if !labels.is_empty() {
+        apply_labels(&labels, titles);
     }
-    apply_labels(&labels, titles);
+    feature_playlist.filter(|h| !h.is_empty())
 }
 
 /// Minimum number of streams of one type a title must carry before its
@@ -864,7 +910,10 @@ fn generate_audio_label_inner(
     }
 }
 
-fn extract(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<StreamLabel> {
+fn extract(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+) -> (Vec<StreamLabel>, Option<FeaturePlaylistHint>) {
     let mut candidates: Vec<(&'static str, ParseResult)> = Vec::new();
     for (name, detect, parse) in PARSERS {
         if !detect(reader, udf) {
@@ -888,7 +937,7 @@ fn extract(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<StreamLabel> {
     // parsers are registered ahead of the ones that detect on any BD-J disc),
     // so "first wins on a tie" is load-bearing, not incidental.
     let best = select_result(&candidates).map(|(n, r)| (*n, r.clone()));
-    let (name, mut labels) = match best {
+    let (name, mut labels, feature_playlist) = match best {
         Some((n, r)) => {
             tracing::info!(
                 parser = n,
@@ -896,11 +945,11 @@ fn extract(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<StreamLabel> {
                 label_count = r.labels.len(),
                 "label parser selected",
             );
-            (n, r.labels)
+            (n, r.labels, r.feature_playlist)
         }
         None => {
             tracing::info!("no label parser matched");
-            return Vec::new();
+            return (Vec::new(), None);
         }
     };
 
@@ -924,7 +973,7 @@ fn extract(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<StreamLabel> {
     // actually carries that stream.
     let _orphans_added = append_clpi_orphans(&mut labels, reader, udf);
 
-    labels
+    (labels, feature_playlist)
 }
 
 /// Merge the MPLS-derived floor into a framework parser's label list.
@@ -1556,7 +1605,35 @@ mod registry_tests {
         ParseResult {
             labels: vec![one_label()],
             confidence: conf,
+            feature_playlist: None,
         }
+    }
+
+    #[test]
+    fn feature_playlist_hint_matches_on_id_or_filename() {
+        let h = FeaturePlaylistHint {
+            playlist_id: Some(222),
+            filename: Some("00222.mpls".into()),
+        };
+        assert!(h.matches(222, "99999.mpls"), "numeric id match");
+        assert!(
+            h.matches(1, "00222.MPLS"),
+            "filename match is case-insensitive"
+        );
+        assert!(
+            !h.matches(1, "00001.mpls"),
+            "neither id nor filename → no match"
+        );
+
+        let id_only = FeaturePlaylistHint {
+            playlist_id: Some(5),
+            filename: None,
+        };
+        assert!(id_only.matches(5, "anything.mpls"));
+        assert!(!id_only.matches(6, "00005.mpls"));
+
+        assert!(FeaturePlaylistHint::default().is_empty());
+        assert!(!h.is_empty());
     }
 
     /// `select_result` must pick the highest-confidence non-empty result
@@ -1592,6 +1669,7 @@ mod registry_tests {
         let empty = ParseResult {
             labels: Vec::new(),
             confidence: Confidence::High,
+            feature_playlist: None,
         };
         // High-confidence but empty must be skipped in favour of a
         // non-empty lower-confidence result.

@@ -133,7 +133,11 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     } else {
         Confidence::Medium
     };
-    Some(ParseResult { labels, confidence })
+    Some(ParseResult {
+        labels,
+        confidence,
+        feature_playlist: None,
+    })
 }
 
 /// Walk the extracted token strings of the feature section and emit a

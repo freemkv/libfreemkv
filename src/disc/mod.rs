@@ -1472,6 +1472,15 @@ impl DiscTitle {
             _ => None,
         })
     }
+
+    /// Whether this title carries at least one primary video stream. A title
+    /// with no video can never mux a feature — a playlist-obfuscation "decoy"
+    /// (long/large but streamless) is the canonical case — so main-feature
+    /// selection demotes it below every title that has video
+    /// (see [`Disc::main_feature_order`]).
+    pub fn has_video(&self) -> bool {
+        self.video_streams().next().is_some()
+    }
 }
 
 // ─── Encryption ─────────────────────────────────────────────────────────────
@@ -1827,9 +1836,14 @@ impl Disc {
     /// disc cracked from the drive, which is precisely what the duplicate was
     /// free to do. Keep the derivation here, shared, so it cannot recur.
     fn image_crack_extents(titles: &[DiscTitle]) -> &[Extent] {
+        // Prefer the first title that has BOTH video and extents — the main
+        // feature after `main_feature_order` — so the CSS crack scans the movie,
+        // not a streamless decoy that happens to carry extents. Falls back to the
+        // first title with extents (unchanged behaviour) when none has video.
         titles
             .iter()
-            .find(|t| !t.extents.is_empty())
+            .find(|t| t.has_video() && !t.extents.is_empty())
+            .or_else(|| titles.iter().find(|t| !t.extents.is_empty()))
             .map(|t| t.extents.as_slice())
             .unwrap_or(&[])
     }
@@ -2084,7 +2098,18 @@ impl Disc {
 
         // 4. Metadata + labels
         let meta_title = Self::read_meta_title(reader, &udf_fs);
-        crate::labels::apply(reader, &udf_fs, &mut titles);
+        let feature_hint = crate::labels::apply(reader, &udf_fs, &mut titles);
+
+        // Authoritative main-feature ordering. The physical `canonical_title_order`
+        // sort above is refined once labels have run: a streamless decoy playlist
+        // (long/large but zero-video, e.g. Spider-Man 3 UHD `00245`) is demoted
+        // below every title that has video, and a feature the disc's own menu
+        // authoring designates (`feature_hint`) is promoted outright. After this,
+        // `titles[0]` is the selected main feature. The `canonical_title_order`
+        // sort is kept first because label ANCHORING (`labels::apply`, above)
+        // reads titles in duration-descending order.
+        titles
+            .sort_by(|a, b| Self::main_feature_order(a, b, capacity_bytes, feature_hint.as_ref()));
 
         // Optional content-based forced-subtitle detection. `info` opts in so its
         // forced flags match what the muxer derives during a rip (both use the
@@ -2280,6 +2305,44 @@ impl Disc {
             // 00004 [stereo AC-3 only]). Prefer lossless-multichannel.
             .then_with(|| b.duration_secs.total_cmp(&a.duration_secs))
             .then_with(|| Self::audio_richness(b).cmp(&Self::audio_richness(a)))
+    }
+
+    /// The keys [`Self::main_feature_order`] layers ON TOP of
+    /// [`Self::CANONICAL_TITLE_ORDER_KEYS`], highest priority first, as
+    /// diagnostic tokens. Kept beside the comparator so the `freemkv::diag`
+    /// decision row can NAME the ordering instead of restating it (same
+    /// anti-drift contract as `CANONICAL_TITLE_ORDER_KEYS`).
+    ///
+    /// - `authoring-feature`: a title the disc's own menu authoring designates
+    ///   as the feature (and which has video) outranks everything else — a
+    ///   size-independent signal an obfuscation decoy cannot forge.
+    /// - `has-video`: a title with no decodable video can never be the main
+    ///   feature, so it is demoted below every title that has one. This is the
+    ///   gate that stops a streamless, size-inflated decoy playlist from
+    ///   winning the physical-size key (the Spider-Man 3 UHD `00245` case).
+    pub const MAIN_FEATURE_ORDER_KEYS: &'static [&'static str] =
+        &["authoring-feature", "has-video"];
+
+    /// Total order over titles for MAIN-FEATURE selection: authoring-designated
+    /// feature first, then any title with video ahead of any without, then the
+    /// physical [`Self::canonical_title_order`] keys. `scan_with` sorts with
+    /// this (after labels have run, so the authoring hint is available) so
+    /// `titles[0]` is the selected main feature.
+    pub fn main_feature_order(
+        a: &DiscTitle,
+        b: &DiscTitle,
+        capacity_bytes: u64,
+        hint: Option<&crate::labels::FeaturePlaylistHint>,
+    ) -> std::cmp::Ordering {
+        // Authoring feature wins outright — but ONLY when it actually has video,
+        // so a mis-authored hint pointing at a streamless entry can't reopen the
+        // decoy hole the `has-video` gate closes.
+        let a_auth = hint.is_some_and(|h| h.matches(a.playlist_id, &a.playlist)) && a.has_video();
+        let b_auth = hint.is_some_and(|h| h.matches(b.playlist_id, &b.playlist)) && b.has_video();
+        b_auth
+            .cmp(&a_auth)
+            .then_with(|| b.has_video().cmp(&a.has_video()))
+            .then_with(|| Self::canonical_title_order(a, b, capacity_bytes))
     }
 
     /// Audio-richness rank for `canonical_title_order`'s same-length tiebreak.
@@ -4705,6 +4768,137 @@ mod tests {
         assert_eq!(
             v[0].size_bytes, 57_000_000_000,
             "the largest real title is the main feature"
+        );
+    }
+
+    /// Regression for the Spider-Man 3 UHD hang: a STREAMLESS decoy playlist
+    /// that is the LONGEST and LARGEST title must not be selected. `00245.mpls`
+    /// (dur 8350s, 78.4 GB, v=0) beat the real `00001.mpls` (dur 8038s,
+    /// 76.5 GB, v=1) on the physical size key, and muxing a title with zero
+    /// streams produced zero frames → E6008 forever. The `has-video` gate
+    /// demotes it. The in-test contrast proves the gate flips the result the
+    /// pre-gate physical comparator would give.
+    #[test]
+    fn main_feature_order_demotes_streamless_decoy() {
+        let mut decoy = DiscTitle::empty();
+        decoy.playlist = "00245.mpls".into();
+        decoy.playlist_id = 245;
+        decoy.duration_secs = 8350.3;
+        decoy.size_bytes = 78_427_502_592;
+        // streams: none — the obfuscation decoy.
+
+        let feature = DiscTitle {
+            playlist: "00001.mpls".into(),
+            playlist_id: 1,
+            duration_secs: 8038.4,
+            size_bytes: 76_525_627_392,
+            ..title_with_video(Codec::Hevc, Resolution::R2160p)
+        };
+
+        let capacity = 88_000_000_000u64;
+
+        // Pre-gate: the physical comparator ranks the larger/longer decoy FIRST
+        // (`a < b` ⇒ `Less`) — this is exactly the bug.
+        assert_eq!(
+            Disc::canonical_title_order(&decoy, &feature, capacity),
+            std::cmp::Ordering::Less,
+            "pre-gate physical order would pick the streamless decoy"
+        );
+        // Post-gate: the has-video gate demotes the decoy below the real feature.
+        assert_eq!(
+            Disc::main_feature_order(&decoy, &feature, capacity, None),
+            std::cmp::Ordering::Greater,
+            "has-video gate demotes the streamless decoy below the real feature"
+        );
+
+        let mut extra = title_with_video(Codec::Hevc, Resolution::R2160p);
+        extra.playlist = "00248.mpls".into();
+        extra.playlist_id = 248;
+        extra.duration_secs = 794.2;
+        extra.size_bytes = 60_000_000_000;
+
+        let mut titles = [decoy, feature, extra];
+        titles.sort_by(|a, b| Disc::main_feature_order(a, b, capacity, None));
+        assert_eq!(
+            titles[0].playlist_id, 1,
+            "the real feature (has video) is selected as titles[0]"
+        );
+        assert_eq!(
+            titles[2].playlist_id, 245,
+            "the streamless decoy is demoted to the back"
+        );
+    }
+
+    /// The disc's own authoring-designated feature wins even when it is NOT the
+    /// longest/largest title — a size-independent signal a decoy cannot forge.
+    #[test]
+    fn main_feature_order_honours_authoring_hint() {
+        let hint = crate::labels::FeaturePlaylistHint {
+            playlist_id: Some(222),
+            filename: Some("00222.mpls".into()),
+        };
+        let authored = DiscTitle {
+            playlist: "00222.mpls".into(),
+            playlist_id: 222,
+            duration_secs: 6000.0,
+            size_bytes: 40_000_000_000,
+            ..title_with_video(Codec::Hevc, Resolution::R2160p)
+        };
+        let generic = DiscTitle {
+            playlist: "00001.mpls".into(),
+            playlist_id: 1,
+            duration_secs: 8000.0,
+            size_bytes: 80_000_000_000,
+            ..title_with_video(Codec::Hevc, Resolution::R2160p)
+        };
+        let capacity = 100_000_000_000u64;
+
+        // No hint: the larger generic title wins on size.
+        assert_eq!(
+            Disc::main_feature_order(&authored, &generic, capacity, None),
+            std::cmp::Ordering::Greater,
+            "without a hint the larger generic title outranks the authored one"
+        );
+        // With the hint: the authored feature wins outright.
+        assert_eq!(
+            Disc::main_feature_order(&authored, &generic, capacity, Some(&hint)),
+            std::cmp::Ordering::Less,
+            "the authoring hint promotes the designated feature above the larger title"
+        );
+
+        let mut titles = [generic, authored];
+        titles.sort_by(|a, b| Disc::main_feature_order(a, b, capacity, Some(&hint)));
+        assert_eq!(
+            titles[0].playlist_id, 222,
+            "the authored feature is selected as titles[0]"
+        );
+    }
+
+    /// A hint pointing at a STREAMLESS entry must not resurrect the decoy bug:
+    /// the authoring preference requires the designated title to have video.
+    #[test]
+    fn authoring_hint_never_promotes_a_streamless_title() {
+        let hint = crate::labels::FeaturePlaylistHint {
+            playlist_id: Some(245),
+            filename: None,
+        };
+        let mut streamless = DiscTitle::empty();
+        streamless.playlist = "00245.mpls".into();
+        streamless.playlist_id = 245;
+        streamless.duration_secs = 9000.0;
+        streamless.size_bytes = 90_000_000_000;
+        let feature = DiscTitle {
+            playlist: "00001.mpls".into(),
+            playlist_id: 1,
+            duration_secs: 8000.0,
+            size_bytes: 76_000_000_000,
+            ..title_with_video(Codec::Hevc, Resolution::R2160p)
+        };
+        let capacity = 100_000_000_000u64;
+        assert_eq!(
+            Disc::main_feature_order(&streamless, &feature, capacity, Some(&hint)),
+            std::cmp::Ordering::Greater,
+            "a hint at a streamless title must not override the has-video gate"
         );
     }
 
