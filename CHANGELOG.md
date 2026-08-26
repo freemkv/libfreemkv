@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+## [1.6.11] — 2026-08-26
+
+### Added
+
+- Navigation-driven main-feature selection: selection now follows the disc's
+  own on-disc menu/navigation logic — a Blu-ray HDMV navigation VM and a DVD
+  First-Play resolver — to reach the main feature, instead of guessing by
+  title size alone.
+- Clip-set composite/decoy detection, so a title assembled from a composite
+  or decoy clip set is recognized as such during selection.
+- A feature-payload floor, giving main-feature selection a minimum-size
+  sanity check.
+- Normalized `DiscProfile` output.
+- Vendor navigation-label parsing.
+- Substantially expanded unit-test coverage across the navigation and
+  clip-selection paths.
+
+### Fixed
+
+- Main-feature selection no longer picks an obfuscated decoy playlist over
+  the real feature.
+- Two rounds of code-audit hardening: navigation VM operand/field-offset
+  conformance, navigation now abstains rather than guessing on an
+  undecidable system-parameter branch, panic-safety fixes, log-escaping
+  fixes, and expanded fuzz/test coverage.
+- Direct disc reads (`disc://…`): `DiscStream` now threads a cumulative feed
+  base offset into the demuxer (`feed_at`) for both the TS and PS paths and
+  forwards it onto each `PesPacket`, so demuxed frames carry byte-exact source
+  provenance (`SourcePos`). Without it, `SeamPlan::place` fell back to a PTS
+  heuristic that a B-frame PTS reorder dip could misread as a `stepped_back`
+  clip transition, dropping all subsequent video frames in multi-clip playlists.
+
 ### Changed
 
 - Lowered the minimum supported Rust version (MSRV) from 1.97 to 1.94. This is
@@ -9,15 +41,6 @@
   -D warnings`, and `cargo test --tests` all pass clean; CI toolchain pins were
   moved to match. (The crate's dependencies floor `cargo build` at 1.90, but
   clippy is only warning-clean from 1.94.)
-
-### Fixed
-
-- Direct disc reads (`disc://…`): `DiscStream` now threads a cumulative feed
-  base offset into the demuxer (`feed_at`) for both the TS and PS paths and
-  forwards it onto each `PesPacket`, so demuxed frames carry byte-exact source
-  provenance (`SourcePos`). Without it, `SeamPlan::place` fell back to a PTS
-  heuristic that a B-frame PTS reorder dip could misread as a `stepped_back`
-  clip transition, dropping all subsequent video frames in multi-clip playlists.
 
 ## [1.6.10] — 2026-08-23
 
