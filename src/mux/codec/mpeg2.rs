@@ -1183,7 +1183,7 @@ mod tests {
 
     #[test]
     fn opening_au_keeps_disc_pts_and_opening_seq_header_no_zero_floor() {
-        // SOTL SUB-TASK 2 regression (opening-GOP / still-frame open). A DVD
+        // Opening-GOP / still-frame open regression. A DVD
         // title opens on a VOBU that begins with a sequence header + I-frame; the
         // disc stamps that opening I-frame at its REAL (non-zero) timeline PTS,
         // not 0. The parser must (a) emit the opening I-frame with that real PTS

@@ -297,16 +297,16 @@ mod tests {
         v.try_into().unwrap()
     }
 
-    // KATs taken from the real SOTL / Greenland discs (decoded in the PoC).
+    // KATs taken from real-world First-Play command streams.
     #[test]
-    fn greenland_first_play_is_jumptt_1() {
+    fn first_play_jumptt_1_decodes() {
         let c = decode(&h("3002000000010000"));
         assert_eq!(c.instr, Instr::JumpTt { ttn: 1 });
         assert!(c.compare.is_none());
     }
 
     #[test]
-    fn sotl_first_play_is_jumpss_vtsm_root() {
+    fn first_play_jumpss_vtsm_root_decodes() {
         // 30 06 ... byte5=0x83 -> sub 2 (VTSM), vts=byte4=1, menu=byte5&0xF=3 (root)
         let c = decode(&h("3006000101830000"));
         assert_eq!(
@@ -320,8 +320,9 @@ mod tests {
     }
 
     #[test]
-    fn sotl_title_dispatch_is_conditional_linkpgn_2() {
-        // 20 a6 ... CmpLink: if GPRM0 == 2 -> LinkPGN 2  (cell 2 = the 5:02 start)
+    fn title_dispatch_is_conditional_linkpgn_2() {
+        // 20 a6 ... CmpLink: if GPRM0 == 2 -> LinkPGN 2 (the cell where the
+        // feature begins).
         let c = decode(&h("20a6000000020002"));
         assert_eq!(c.instr, Instr::LinkPgn { pgn: 2 });
         let cmp = c.compare.expect("conditional");
@@ -332,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn sotl_root_button_is_linkpgcn_37() {
+    fn root_button_is_linkpgcn_37() {
         assert_eq!(
             decode(&h("2004000000000025")).instr,
             Instr::LinkPgcn { pgcn: 37 }
@@ -340,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn greenland_scene_button_is_linkpgn() {
+    fn scene_button_is_linkpgn() {
         assert_eq!(
             decode(&h("2006000000001401")).instr,
             Instr::LinkPgn { pgn: 1 }
@@ -356,7 +357,7 @@ mod tests {
 
     #[test]
     fn setgprm_immediate_mov() {
-        // SOTL First-Play pre[0]: 71 00 | reg=byte3=6 | imm(bytes4-5)=0x03e8 -> g6 = 1000
+        // First-Play pre[0]: 71 00 | reg=byte3=6 | imm(bytes4-5)=0x03e8 -> g6 = 1000
         match decode(&h("7100000603e80000")).instr {
             Instr::SetGprm {
                 reg,

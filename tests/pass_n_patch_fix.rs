@@ -38,7 +38,7 @@ fn css_decrypt_of_an_uncrackable_sector_still_descrambles() {
     // and the cached key stays the best available evidence.
     //
     // This test previously asserted DecryptFailed, matching a round-9 change
-    // that made real DVDs unrippable (Greenland.iso). CSS is not AACS: an AACS
+    // that made real DVDs unrippable. CSS is not AACS: an AACS
     // unit key either opens a unit or does not, whereas a CSS title key is
     // recovered from data whose recoverability varies sector by sector.
     let mut sector = vec![0xFFu8; 2048];

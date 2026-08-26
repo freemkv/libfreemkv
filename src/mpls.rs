@@ -4,7 +4,7 @@
 //! Contains play items (clips) with in/out timestamps,
 //! stream info (video, audio, subtitle tracks).
 //!
-//! Reference: https://github.com/lw/BluRay/wiki/MPLS
+//! Format is documented in the BD-ROM PlayList (MPLS) specification.
 
 use crate::error::{Error, Result};
 
@@ -1028,8 +1028,8 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Added hardening tests below. Grounded in the BD-ROM MPLS spec
-    // (https://github.com/lw/BluRay/wiki/MPLS) byte layout.
+    // Added hardening tests below, grounded in the BD-ROM MPLS spec byte
+    // layout.
     // ─────────────────────────────────────────────────────────────────────
 
     /// Header guard: parse() requires `playlist_start + 10 <= data.len()`

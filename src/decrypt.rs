@@ -849,10 +849,10 @@ mod tests {
         );
     }
 
-    /// Build a Stevenson-crackable scrambled CSS sector for `title_key` (mirrors
+    /// Build a crackable scrambled CSS sector for `title_key` (mirrors
     /// `crackable_sector` in the css::mod tests): a periodic run in the clear
     /// header continues past 0x80 into the encrypted region, so
-    /// `stevenson::crack_title_key` recovers the key. Distinct `seed` values give
+    /// `keyless::crack_title_key` recovers the key. Distinct `seed` values give
     /// two sectors different cribs, standing in for two VOB regions.
     fn crackable_css_sector(title_key: &[u8; 5], seed: &[u8; 5]) -> Vec<u8> {
         const RUN_START: usize = 0x59;
@@ -1157,12 +1157,12 @@ mod tests {
         // Precondition: each sector must be crackable on its own (the rekey
         // depends on it). If this fails the fixture, not the path, is at fault.
         assert_eq!(
-            crate::css::stevenson::crack_title_key(&s0),
+            crate::css::keyless::crack_title_key(&s0),
             Some(key_a),
             "fixture s0 must crack to key_a standalone"
         );
         assert_eq!(
-            crate::css::stevenson::crack_title_key(&s1),
+            crate::css::keyless::crack_title_key(&s1),
             Some(key_b),
             "fixture s1 must crack to key_b standalone"
         );

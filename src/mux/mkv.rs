@@ -456,7 +456,7 @@ impl MkvTrack {
             //
             // rc.5.1 added it (= half the frame period, 20 ms for 576i25) to try
             // to fix the Windows-fps report, on the theory that Windows derives
-            // fps from it. The captured SOTL evidence proves the opposite: with
+            // fps from it. The captured real-media evidence proves the opposite: with
             // FlagInterlaced=1 + DefaultDuration=40 ms + DefaultDecodedFieldDuration=20 ms,
             // Windows Explorer reports 12.5 fps (half), and a media analyzer
             // flips the track to "Frame rate mode: Variable" with no clean rate. A
@@ -1111,7 +1111,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             // `field_duration_ns == 0` (see `MkvTrack::video`) so this element is
             // NOT written: emitting it (20 ms for 576i25) is exactly what made
             // Windows Explorer report 12.5 fps and a media analyzer flip to VFR on
-            // the captured SOTL rip, while a known-correct rip — which omits it —
+            // the captured rip, while a known-correct rip — which omits it —
             // shows the full 25 fps. The guard below is retained so a non-zero
             // value still emits
             // a well-formed element for any future caller / round-trip test, but
@@ -4442,7 +4442,7 @@ mod tests {
 
     #[test]
     fn opening_keyframe_with_nonzero_disc_pts_anchors_base_not_corrupted() {
-        // SOTL SUB-TASK 2 regression (opening-GOP PTS handling). A DVD title
+        // Opening-GOP PTS handling regression. A DVD title
         // opens on an I-frame the disc stamps at its REAL timeline PTS (here
         // ~10 s, a large non-zero value — NOT 0). The muxer must anchor `base` on
         // that first kept keyframe so the first cluster's timestamp is 0 (the
@@ -5556,11 +5556,11 @@ mod tests {
 
     #[test]
     fn interlaced_576i_omits_default_decoded_field_duration_keeps_full_frame_duration() {
-        // SOTL SUB-TASK 1 regression. The Windows-fps fix: a 576i25 track must
+        // Interlaced-fps signalling regression. The Windows-fps fix: a 576i25 track must
         // carry the FULL-FRAME DefaultDuration (40 ms → `1/DefaultDuration` = 25
         // fps, the only rate every tool trusts) and must NOT emit
         // DefaultDecodedFieldDuration. rc.5.1 emitted the 20 ms field duration to
-        // try to fix Windows; the captured SOTL evidence proved it did the
+        // try to fix Windows; the captured real-media evidence proved it did the
         // opposite (Explorer 12.5 fps, analyzer VFR). A known-correct rip omits
         // it (Explorer 25 fps, analyzer CFR). So: frame duration present = 40 ms,
         // field duration ABSENT, interlace signalling (FlagInterlaced/FieldOrder)

@@ -1,9 +1,8 @@
 //! CSS content cipher — an independent implementation of the publicly
 //! documented Content Scramble System stream cipher.
 //!
-//! The algorithm is the one recovered and published in Frank A. Stevenson's
-//! 1999 cryptanalysis ("Cryptanalysis of Contents Scrambling System") and
-//! described in the open CSS literature. It is implemented here from that public
+//! The algorithm is the publicly documented CSS stream cipher, described in the
+//! open CSS cryptanalysis literature. It is implemented here from that public
 //! description; its constants (see [`super::tables`]) are the cipher's own
 //! defined values. Nothing in this file is copied or translated from any
 //! particular CSS software.

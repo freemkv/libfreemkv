@@ -162,7 +162,7 @@ impl Disc {
 
                 // Feature start cell. Prefer the DVD nav-VM resolver, which
                 // PARKED (#40, menu-at-start playback). The "menu at the start"
-                // symptom (e.g. SOTL) was a sector-mapping fault — the absolute
+                // symptom (seen on a real disc) was a sector-mapping fault — the absolute
                 // VOB rebase in `ifo::parse_vts` (`vob_start_sector =
                 // file_start_lba + vtstt_vobs`) — NOT a navigation problem, so
                 // feature-start resolution is unnecessary for correct rips. The
@@ -770,7 +770,7 @@ mod tests {
     /// before the title VOB. Cell `first_sector` values are relative to
     /// `vtstt_vobs`; reading 0xC0 prepended the menu and shifted every extent
     /// back by `vtstt_vobs - vtsm_vobs`, so the rip opened on the parental
-    /// prompt instead of the movie (Greenland NTSC R1: vtsm=44, vtstt=3640).
+    /// prompt instead of the movie (one real NTSC R1 disc: vtsm=44, vtstt=3640).
     ///
     /// Here `build_vts` stamps `vtstt_vobs = 3640` (0xC4); we additionally stamp
     /// a *different* `vtsm_vobs = 44` (0xC0). The extent must resolve from 3640.
@@ -822,7 +822,7 @@ mod tests {
         );
     }
 
-    /// ABSOLUTE-REBASE regression (THESILENCEOFTHELAMBS / Greenland fix):
+    /// ABSOLUTE-REBASE regression (real-disc menu-at-start fix):
     /// `ifo::parse_vts` now sets `vob_start_sector = file_start_lba(IFO) +
     /// vtstt_vobs`, so an extent's `start_lba` must equal the sum of THREE
     /// independent terms — the IFO file's absolute on-disc LBA, the

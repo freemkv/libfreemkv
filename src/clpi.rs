@@ -4,7 +4,7 @@
 //! The EP (Entry Point) map provides timestamp → SPN mapping.
 //! SPN × 192 = byte offset in the m2ts file.
 //!
-//! Reference: https://github.com/lw/BluRay/wiki/CLPI
+//! Format is documented in the BD-ROM Clip Information (CLPI) specification.
 
 use crate::error::{Error, Result};
 
@@ -230,8 +230,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Added hardening tests. Grounded in the BD-ROM CLPI spec
-    // (https://github.com/lw/BluRay/wiki/CLPI).
+    // Added hardening tests, grounded in the BD-ROM CLPI spec byte layout.
     // ─────────────────────────────────────────────────────────────────────
 
     /// Build a ProgramInfo section. `streams` = Vec<(pid, sci_bytes)>.

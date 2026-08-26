@@ -476,12 +476,12 @@ mod tests {
 
     // ── Executor: convergence to a title ────────────────────────────────────
 
-    /// The Greenland shape: First-Play is an unconditional `JumpTT 1`, and
-    /// TT_SRPT maps title 1 to the feature title set (here VTS_02, title 1).
+    /// Unconditional-dispatch shape: First-Play is an unconditional `JumpTT 1`,
+    /// and TT_SRPT maps title 1 to the feature title set (here VTS_02, title 1).
     /// The resolver must return that title.
     #[test]
     fn first_play_jumptt_1_resolves_to_its_title_set() {
-        // 3002...0001 = JumpTT ttn=1 (the exact Greenland First-Play command).
+        // 3002...0001 = JumpTT ttn=1.
         let vmgi = build_vmgi(&[h("3002000000010000")], 1, &[(2, 1), (3, 1)]);
         assert_eq!(
             resolve_from_vmg(&vmgi),
@@ -553,12 +553,12 @@ mod tests {
 
     // ── Executor: abstention (→ caller falls back) ──────────────────────────
 
-    /// The SOTL shape: First-Play jumps into a VTS menu (`JumpSS VTSM root`).
+    /// Menu-entry shape: First-Play jumps into a VTS menu (`JumpSS VTSM root`).
     /// That is an interactive menu, not a static dispatch — the resolver must
     /// abstain so the caller keeps the leading-cell heuristic.
     #[test]
     fn first_play_into_menu_abstains() {
-        // 3006...0183 = JumpSS VTSM root (the exact SOTL First-Play command).
+        // 3006...0183 = JumpSS VTSM root.
         let vmgi = build_vmgi(&[h("3006000101830000")], 1, &[(3, 1)]);
         assert_eq!(resolve_from_vmg(&vmgi), None);
     }
