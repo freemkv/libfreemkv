@@ -1280,8 +1280,8 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
         if let Some(hint) = stream_idx_hint {
             tracing::debug!(
                 disc_stream_idx = hint,
-                lang = %language,
-                binding = %c.binding_type,
+                lang = ?language,
+                binding = ?c.binding_type,
                 "deluxe interpret_streams: disc-authored stream index (not used for stream_number; preserved for diagnostic)"
             );
         }

@@ -259,6 +259,56 @@ fn jar_class_walk_never_panics() {
 }
 
 #[test]
+fn deluxe_bytecode_decode_never_panics() {
+    // The Deluxe BD-J label parser runs a symbolic stack machine over `<clinit>`
+    // bytecode in `com/bydeluxe/` classes inside a JAR. Feed the sweep bytes as a
+    // zip; when they parse, drive the full enum-fingerprint → binding-class →
+    // bytecode-decode path exactly as `deluxe::parse` does. None may panic on
+    // crafted/corrupt bytecode. Magic is the zip local-file-header signature.
+    sweep("deluxe", &[0x50, 0x4B, 0x03, 0x04], |b| {
+        if let Ok(mut jar) = zip::ZipArchive::new(std::io::Cursor::new(b.to_vec())) {
+            let enums = crate::labels::deluxe::identify_master_enums(&mut jar);
+            let table = crate::labels::deluxe::MasterEnumTable::from(&enums);
+            let binding =
+                crate::labels::deluxe::find_binding_classes(&mut jar, &table.class_name_set());
+            for (name, _) in &binding {
+                let _ = crate::labels::deluxe::decode_binding(&mut jar, name, &table);
+            }
+        }
+    });
+}
+
+#[test]
+fn fox_dcx_labels_never_panics() {
+    // Fox's `dcx.xml` is untrusted disc-authored XML; `labels_from_dcx` scans it
+    // with byte-offset XML helpers documented as UTF-8-boundary-prone. No magic —
+    // feed lossy UTF-8 so multi-byte boundaries inside tags/attributes are hit.
+    sweep("fox_dcx", b"<", |b| {
+        let text = String::from_utf8_lossy(b);
+        let _ = crate::labels::fox::labels_from_dcx(&text);
+    });
+}
+
+#[test]
+fn bdnav_vm_resolve_never_panics() {
+    // The HDMV navigation VM executes an untrusted `MovieObject.bdmv` command
+    // list on a bounded VM. Parse the sweep bytes as a MovieObject set and run
+    // the VM from a First-Play entry — the combined parse+execute path a real
+    // disc drives, which the per-parser index/mobj sweeps never reach.
+    use crate::bdnav::index::{Index, PlaybackObj};
+    sweep("bdnav_vm", b"MOBJ", |b| {
+        if let Some(mobjs) = crate::bdnav::mobj::parse(b) {
+            let index = Index {
+                first_play: PlaybackObj::Hdmv { id_ref: 0 },
+                top_menu: PlaybackObj::Hdmv { id_ref: 0 },
+                titles: Vec::new(),
+            };
+            let _ = crate::bdnav::vm::resolve(&index, &mobjs, &|_| false);
+        }
+    });
+}
+
+#[test]
 fn ps_demuxer_feed_never_panics() {
     // Stateful, unlike the others: the demuxer carries a buffer across feeds, so
     // each case is fed to a FRESH demuxer and then a shared one. The shared pass

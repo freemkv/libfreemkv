@@ -108,7 +108,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 /// Scoped to ONE feature playlist element (see the module note): the richest
 /// `<playlist name="feature">`. Its nested `<audio>`/`<subtitle>` children are
 /// the vendor's STN table for that title.
-fn labels_from_dcx(text: &str) -> Vec<StreamLabel> {
+pub(crate) fn labels_from_dcx(text: &str) -> Vec<StreamLabel> {
     let Some(feature) = select_feature_playlist(text) else {
         return Vec::new();
     };

@@ -228,8 +228,16 @@ fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Opti
                 let r: Option<u32> = match c.set_opt {
                     0x01 => Some(src), // MOVE
                     0x02 => {
-                        vm.wr(c.dst, src); // SWAP
-                        vm.wr(c.src, dst);
+                        // SWAP exchanges the two operands; a store to an operand
+                        // flagged immediate is refused (libbluray `_store_result`
+                        // honours imm_op1/imm_op2), and `wr` already drops PSR
+                        // stores.
+                        if !c.imm_op1 {
+                            vm.wr(c.dst, src);
+                        }
+                        if !c.imm_op2 {
+                            vm.wr(c.src, dst);
+                        }
                         None
                     }
                     0x03 => Some(dst.wrapping_add(src)),
