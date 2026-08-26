@@ -104,7 +104,7 @@ pub(crate) fn map_host_certs(certs: &[crate::aacs::types::HostCert]) -> Vec<fu::
 
 /// Result of a capability dispatch: `(matched_name, result)`. `matched_name` is
 /// the unlocker that handled it (or `""` if none did) — lets the caller record
-/// WHICH unlocker ran (e.g. `LibreDrive` vs `Renesas`), distinct from the ld-only
+/// WHICH unlocker ran (e.g. `MT1959` vs `Renesas`), distinct from the ld-only
 /// identity lookup [`unlocker_name`]. Iterating stops at the first unlocker whose
 /// capability method returns anything other than `NotApplicable` — i.e. an actual
 /// unlock (`Ok`) OR a real failure such as a dead bus (`Err(Transport)`), which
