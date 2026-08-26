@@ -76,9 +76,10 @@ impl Vm<'_> {
         }
     }
     fn wr(&mut self, val: u32, x: u32) {
-        if val & PSR_FLAG != 0 {
-            self.psr[(val & 0x7f) as usize] = x;
-        } else {
+        // A store to a PSR-tagged register is refused (libbluray `_store_reg`
+        // returns -1); only GPR writes take effect. PSR values come from the
+        // system (power-on `psr_init`), never from a nav SET/SWAP operand.
+        if val & PSR_FLAG == 0 {
             self.gpr[(val & 0xfff) as usize] = x;
         }
     }
@@ -86,14 +87,16 @@ impl Vm<'_> {
         if imm { raw } else { self.rd(raw) }
     }
     /// Resolve a JumpTitle target: title 0 = Top Menu, `1..=N` = `titles[i-1]`,
-    /// `N+1` = First Play (BD spec title numbering).
+    /// `0xFFFF` = First Play (BD-ROM title numbering, per libbluray
+    /// `_is_valid_title`). Any other value is an invalid title reference and
+    /// abstains (`None`).
     fn title_obj(&self, title: u32) -> Option<PlaybackObj> {
         let n = self.index.titles.len() as u32;
         if title == 0 {
             Some(self.index.top_menu)
         } else if title <= n {
             self.index.titles.get((title - 1) as usize).copied()
-        } else if title == n + 1 {
+        } else if title == 0xFFFF {
             Some(self.index.first_play)
         } else {
             None
@@ -334,6 +337,57 @@ mod tests {
         let mobjs = mobj::parse(&d).unwrap();
         let index = idx(PlaybackObj::BdJ, vec![]);
         assert_eq!(resolve(&index, &mobjs, &|_| true), None);
+    }
+
+    #[test]
+    fn jumptitle_first_play_is_0xffff_not_n_plus_1() {
+        // BD-ROM title numbering (libbluray `_is_valid_title`): 0 = Top Menu,
+        // 0xFFFF = First Play, 1..=N = titles. `N+1` is an INVALID title ref.
+        let index = idx(
+            PlaybackObj::Hdmv { id_ref: 7 },
+            vec![PlaybackObj::Hdmv { id_ref: 1 }],
+        );
+        let vm = Vm {
+            mobjs: &[],
+            index: &index,
+            gpr: [0; 4096],
+            psr: psr_init(),
+        };
+        assert_eq!(vm.title_obj(0), Some(index.top_menu), "title 0 = Top Menu");
+        assert_eq!(
+            vm.title_obj(1),
+            Some(PlaybackObj::Hdmv { id_ref: 1 }),
+            "title 1 = titles[0]"
+        );
+        assert_eq!(
+            vm.title_obj(0xFFFF),
+            Some(PlaybackObj::Hdmv { id_ref: 7 }),
+            "0xFFFF = First Play (abstained wrongly before the fix)"
+        );
+        assert_eq!(
+            vm.title_obj(2),
+            None,
+            "N+1 is an invalid title ref, not First Play (resolved wrongly before the fix)"
+        );
+    }
+
+    #[test]
+    fn set_to_psr_is_refused() {
+        // A SET MOVE to PSR6 must be a no-op (libbluray `_store_reg` refuses PSR
+        // stores). Program: MOVE PSR6 <- 5; CMP PSR6 == 5; PlayPL 100 else 200.
+        // With the write refused, PSR6 stays at its power-on 0, so the compare is
+        // false and control skips to PlayPL 200. If the illegal PSR write took
+        // effect, the compare would be true and PlayPL 100 would win.
+        let set_psr6 = cmd((2 << 5) | (2 << 3), 0x40, 0, 0x01, 0x8000_0006, 5);
+        let cmp_psr6_eq_5 = cmd((2 << 5) | (1 << 3), 0x40, 0x02, 0, 0x8000_0006, 5);
+        let d = build(&[&[set_psr6, cmp_psr6_eq_5, play_pl(100), play_pl(200)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        assert_eq!(
+            resolve(&index, &mobjs, &|id| id == 100 || id == 200),
+            Some(200),
+            "PSR store must be refused, so the compare is false and 200 is reached"
+        );
     }
 
     #[test]
