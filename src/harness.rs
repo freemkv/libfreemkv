@@ -261,19 +261,20 @@ fn jar_class_walk_never_panics() {
 #[test]
 fn deluxe_bytecode_decode_never_panics() {
     // The Deluxe BD-J label parser runs a symbolic stack machine over `<clinit>`
-    // bytecode in `com/bydeluxe/` classes inside a JAR. Feed the sweep bytes as a
-    // zip; when they parse, drive the full enum-fingerprint → binding-class →
-    // bytecode-decode path exactly as `deluxe::parse` does. None may panic on
-    // crafted/corrupt bytecode. Magic is the zip local-file-header signature.
-    sweep("deluxe", &[0x50, 0x4B, 0x03, 0x04], |b| {
-        if let Ok(mut jar) = zip::ZipArchive::new(std::io::Cursor::new(b.to_vec())) {
-            let enums = crate::labels::deluxe::identify_master_enums(&mut jar);
-            let table = crate::labels::deluxe::MasterEnumTable::from(&enums);
-            let binding =
-                crate::labels::deluxe::find_binding_classes(&mut jar, &table.class_name_set());
-            for (name, _) in &binding {
-                let _ = crate::labels::deluxe::decode_binding(&mut jar, name, &table);
-            }
+    // bytecode (`decode_binding_class`). Fuzzing it THROUGH a zip is vacuous —
+    // `zip::ZipArchive::new` validates the end-of-central-directory record at the
+    // buffer's end, which the generators (front magic + noise) cannot synthesize,
+    // so the archive open always fails and the decoder is never reached. Drive
+    // the decoder DIRECTLY instead: parse the sweep bytes as a `.class` (they also
+    // exercise the class parser) and run the bytecode decoder over it with an
+    // empty master-enum table. None may panic on crafted/corrupt bytecode.
+    let master = crate::labels::deluxe::MasterEnumTable::from(&[] as &[(
+        &'static str,
+        crate::labels::deluxe::MasterEnum,
+    )]);
+    sweep("deluxe_decode", &[0xCA, 0xFE, 0xBA, 0xBE], |b| {
+        if let Ok(class) = crate::labels::class_reader::ClassFile::parse(b) {
+            let _ = crate::labels::deluxe::decode_binding_class(&class, &master);
         }
     });
 }
