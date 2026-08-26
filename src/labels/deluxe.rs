@@ -68,7 +68,7 @@
 //!   per-stream arrays (filtered out by the array-parameter guard in the
 //!   decoder). SDH/RNIB is encoded as a distinct Language VALUE
 //!   ("English SDH", "English RNIB"), recovered into the qualifier from the
-//!   name. Grounded on the F&F cluster (fixtures from *Fast Five*).
+//!   name. Grounded on fixtures captured from a real Universal Blu-ray release.
 //! - **Disney/Warner**: 70-value Language enum, same binding shape; the
 //!   original corpus this parser was written against.
 
@@ -3211,9 +3211,10 @@ mod tests {
         assert_eq!(set.len(), 1);
     }
 
-    // ── Real-disc fixtures: Universal (studio="uni"), Fast Five ──────────────
+    // ── Real-disc fixtures: Universal (studio="uni") ─────────────────────────
     //
-    // Captured from `FastFive.iso` `/BDMV/JAR/00000.jar` (`com/bydeluxe/…`).
+    // Captured from a real Universal Blu-ray release's `/BDMV/JAR/00000.jar`
+    // (`com/bydeluxe/…`).
     // These are verbatim, unmodified `.class` files — the format we READ, never
     // execute — exercising the full Phase A→D pipeline against real obfuscated
     // Deluxe bytecode rather than synthetic fixtures.
@@ -3335,7 +3336,8 @@ mod tests {
 
     #[test]
     fn universal_config_xml_studio_attribute_is_parsed() {
-        // The real config.xml from FastFive.iso /BDMV/JAR/99999/config.xml.
+        // A real config.xml from a Universal Blu-ray release's
+        // /BDMV/JAR/99999/config.xml.
         let xml = br#"<TitleConfig studio="uni" >
   <Type><Rental>-</Rental><Single>-</Single></Type>
 </TitleConfig>"#;

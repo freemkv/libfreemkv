@@ -1,9 +1,9 @@
-//! CSS title-key recovery — Frank A. Stevenson's divide-and-conquer attack
-//! (1999), implemented from his published cryptanalysis ("Cryptanalysis of
-//! Contents Scrambling System"). It recovers the 5-byte CSS title key from a
-//! single scrambled DVD sector with no player keys and no disc-key crack, using
-//! only known plaintext. Implemented from that public description; nothing here
-//! is copied or translated from any particular CSS software.
+//! CSS title-key recovery — a divide-and-conquer known-plaintext attack,
+//! implemented from the openly published CSS cryptanalysis literature. It
+//! recovers the 5-byte CSS title key from a single scrambled DVD sector with no
+//! player keys and no disc-key crack, using only known plaintext. Implemented
+//! from that public description; nothing here is copied or translated from any
+//! particular CSS software.
 //!
 //! # The cipher this attacks
 //!
@@ -41,8 +41,8 @@ const ENCRYPTED_START: usize = 0x80; // byte 128
 const SEED_OFFSET: usize = 0x54; // sector seed at bytes 0x54-0x58
 const FLAG_BYTE: usize = 0x14;
 
-/// Recover the title key from cipher + known plaintext (the core of Stevenson's
-/// attack). `crypted` is the ciphertext starting at sector byte 0x80;
+/// Recover the title key from cipher + known plaintext (the core of the
+/// recovery). `crypted` is the ciphertext starting at sector byte 0x80;
 /// `decrypted` is the matching known plaintext; `seed` is `sector[0x54..0x59]`.
 /// On success returns the recovered 5-byte title key; `None` if no LFSR seed
 /// reproduces the keystream.
@@ -210,8 +210,8 @@ fn descramble_matches(sector: &[u8], title: &[u8; 5], plain: &[u8]) -> bool {
 }
 
 /// Find a repeating pattern just before the encrypted region and assume the
-/// plaintext at 0x80 continues it — the known-plaintext step of Stevenson's
-/// attack. Scans cleartext `sec[0x00..0x80]` for the longest run that repeats
+/// plaintext at 0x80 continues it — the known-plaintext step of the recovery.
+/// Scans cleartext `sec[0x00..0x80]` for the longest run that repeats
 /// with a cycle length in 2..0x2F. If the run is long enough (`plen > 3` and at
 /// least two full cycles), the known plaintext at 0x80 is taken to be the
 /// periodic run continuing forward, and [`recover_title_key_from_plain`] is

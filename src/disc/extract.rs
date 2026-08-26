@@ -299,8 +299,8 @@ impl Disc {
         Ok(result)
     }
 
-    /// Resolve the CSS title key for a VTS group by cracking from its title
-    /// VOB extents (keyless Stevenson attack). The disc-wide key is reused when
+    /// Resolve the CSS title key for a VTS group by recovering it from the
+    /// group's scrambled title-VOB sectors. The disc-wide key is reused when
     /// it already covers this VTS (single-VTS discs, or this VTS's span). The
     /// reader is borrowed from the decrypting decorator (its inner source).
     ///
@@ -1505,7 +1505,8 @@ mod tests {
     }
 
     /// A CSS-scrambled title VOB is descrambled on extraction: the producer
-    /// cracks the per-VTS key (keyless Stevenson) and the output VOB is plain.
+    /// recovers the per-VTS key from the scrambled sectors and the output VOB
+    /// is plain.
     #[test]
     fn css_title_vob_is_descrambled() {
         let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
@@ -2094,8 +2095,8 @@ mod tests {
             let seed = [0x11u8, 0x22, 0x33, 0x44, marker];
             let mut plain = vec![0u8; 2048];
             // The crack scan's hardened `is_scrambled_pack` gate requires the
-            // MPEG-PS pack-start signature before it will even ATTEMPT a
-            // Stevenson crack (see `css::is_scrambled_pack`) -- without it,
+            // MPEG-PS pack-start signature before it will even ATTEMPT a key
+            // crack (see `css::is_scrambled_pack`) -- without it,
             // `resolve_vts_key` silently falls back to `base_keys` for BOTH
             // VTS groups regardless of which extents were gathered, masking
             // this exact regression.
@@ -2203,7 +2204,8 @@ mod tests {
         };
         // Scrambled — the pack header and the 0x14 flag are set, so the scan
         // SEES ciphertext — but the cleartext region carries no periodic run,
-        // so the Stevenson crib never forms and no key is recoverable.
+        // so the repeating crib the key recovery relies on never forms and no
+        // key is recoverable.
         let uncrackable = {
             let mut sect = vec![0u8; 2048];
             sect[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);

@@ -559,18 +559,18 @@ fn css_roundtrip_multiple_keys() {
     }
 }
 
-// ── CSS Stevenson attack tests ─────────────────────────────────────────────
+// ── CSS keyless recovery tests ─────────────────────────────────────────────
 
-/// Attempt the Stevenson attack on synthetically scrambled sectors.
+/// Attempt the keyless recovery on synthetically scrambled sectors.
 ///
 /// The CSS cipher on real DVDs stores ciphertext through a TAB1 output
-/// layer that the Stevenson attack depends on. Synthetically scrambled
+/// layer that the keyless recovery depends on. Synthetically scrambled
 /// sectors (produced by calling descramble_sector on plaintext) may not
 /// exhibit this relationship, so the attack is not guaranteed to converge
 /// on synthetic data. This test verifies that when the attack DOES return
 /// a key, that key correctly descrambles the sector.
 #[test]
-fn css_stevenson_attack_validates_cracked_key() {
+fn css_keyless_recovery_validates_cracked_key() {
     let candidates: &[([u8; 5], [u8; 5])] = &[
         (
             [0x42, 0x13, 0x37, 0xBE, 0xEF],
@@ -617,7 +617,7 @@ fn css_stevenson_attack_validates_cracked_key() {
         css::lfsr::descramble_sector(key, &mut sector);
         sector[0x14] = 0x30;
 
-        let cracked = css::stevenson::crack_title_key(&sector);
+        let cracked = css::keyless::crack_title_key(&sector);
 
         if let Some(cracked_key) = cracked {
             let mut test = sector.clone();
@@ -635,7 +635,7 @@ fn css_stevenson_attack_validates_cracked_key() {
 
             any_cracked = true;
             eprintln!(
-                "Stevenson attack succeeded: key={:02X?} seed={:02X?} cracked={:02X?}",
+                "keyless recovery succeeded: key={:02X?} seed={:02X?} cracked={:02X?}",
                 key, seed, cracked_key
             );
         }
@@ -643,7 +643,7 @@ fn css_stevenson_attack_validates_cracked_key() {
 
     if !any_cracked {
         eprintln!(
-            "Stevenson attack did not converge on any synthetic key/seed pair. \
+            "keyless recovery did not converge on any synthetic key/seed pair. \
              This is expected: synthetic sectors lack the TAB1 output encoding \
              present in real CSS-encrypted DVD sectors."
         );
@@ -696,7 +696,7 @@ fn css_recover_title_key_with_exact_plaintext() {
     sector[0x14] = 0x30;
 
     // Recover with exact known plaintext
-    let recovered = css::stevenson::recover_title_key(&sector, &pes_header);
+    let recovered = css::keyless::recover_title_key(&sector, &pes_header);
 
     if let Some(rkey) = recovered {
         let mut test = sector.clone();

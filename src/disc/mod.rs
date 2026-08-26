@@ -2300,8 +2300,8 @@ impl Disc {
     ///    skipped entirely rather than demoting every real title.
     /// 2. Among real titles, LARGEST physical size first — the main
     ///    feature is the biggest real title on the disc. (This replaced
-    ///    the old clip-count ordering, which mis-ranked chapter-per-clip
-    ///    discs like Fast & Furious.)
+    ///    the old clip-count ordering, which mis-ranked heavily
+    ///    chapter-per-clip discs.)
     /// 3. Tiebreak on longer duration first.
     ///
     /// **Effect on non-branching discs:** unchanged — the main movie
@@ -2378,9 +2378,9 @@ impl Disc {
             // long (e.g. 1h31m) but is tiny (0.4 GB of reused/junk clips), and the
             // real feature is often chaptered into MANY clips (one per chapter),
             // which the old clip-count-ascending key wrongly demoted below 1-clip
-            // bonus reels. Validated across 23 UHD/BD discs — fixes F9 / Fast Five
-            // / Fast & Furious 6 / Furious 7 (feature was ranked ~#13–36), no
-            // regressions on the 19 already correct.
+            // bonus reels. Validated across 23 UHD/BD discs — fixes several
+            // heavily-chaptered features (each ranked ~#13–36 before the fix),
+            // no regressions on the 19 already correct.
             .then_with(|| b.size_bytes.cmp(&a.size_bytes))
             // Tiebreak for equal-size twins: longer duration, then richer audio —
             // the same feature authored as sibling playlists (a full-audio main
@@ -3104,7 +3104,7 @@ impl Disc {
     /// Resolve decryption keys for muxing a *specific* title.
     ///
     /// For a **DVD** the CSS title key MUST be recovered before descrambling: a
-    /// scrambled sector without a Stevenson crib cannot self-crack, and CSS leaves
+    /// scrambled sector without a recoverable crib cannot self-crack, and CSS leaves
     /// the pack/PES header clear, so a sector left un-descrambled would mux as a
     /// structurally-valid but corrupt PES packet with no loss reported. Two ways
     /// to get it:
@@ -3755,7 +3755,7 @@ mod tests {
     /// known-plaintext crack — its `.evo` payload can never satisfy the CSS
     /// attack, and running it wastes a 50_000-sector scan budget in the real
     /// case. Prove the gate actually keeps the crack away: the HD-DVD clip's
-    /// own extent carries a genuinely Stevenson-crackable CSS sector, so if the
+    /// own extent carries a genuinely crackable CSS sector, so if the
     /// gate wrongly let the crack run, `disc.css` would come back `Some`.
     #[test]
     fn scan_image_hddvd_never_enters_css_crack() {
@@ -4960,7 +4960,7 @@ mod tests {
     }
 
     /// Title selection is by largest physical size, NOT clip count or duration.
-    /// Real-disc shape (Fast Five): a 57 GB / 11-clip feature must outrank both a
+    /// Real-disc shape: a 57 GB / 11-clip feature must outrank both a
     /// small 1-clip bonus reel and a long-but-tiny decoy "play-all" (91 reused
     /// clips, 1h31m, 0.4 GB). The old clip-count-ascending key put the bonus t1.
     #[test]
@@ -6453,7 +6453,7 @@ mod tests {
         disc
     }
 
-    /// Build a Stevenson-crackable scrambled CSS sector (a periodic run in the
+    /// Build a crackable scrambled CSS sector (a periodic run in the
     /// clear header continuing past 0x80), mirroring the css-module fixture.
     fn crackable_css_sector(title_key: &[u8; 5]) -> [u8; 2048] {
         const RUN_START: usize = 0x59;

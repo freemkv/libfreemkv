@@ -2,8 +2,8 @@
 //!
 //! CSS uses a weak 40-bit LFSR stream cipher (broken since 1999).
 //!
-//! The title key is recovered keylessly: [`crack_key`] runs the Stevenson
-//! known-plaintext attack (see the [`stevenson`] module) on the scrambled
+//! The title key is recovered keylessly: [`crack_key`] runs a known-plaintext
+//! attack (see the [`keyless`] module) on the scrambled
 //! data, needing no player keys, disc-key crack, or external key file.
 //! Sectors are then decrypted with [`descramble_sector`].
 //!
@@ -14,8 +14,8 @@
 //! }
 //! ```
 
+pub mod keyless;
 pub mod lfsr;
-pub mod stevenson;
 pub(crate) mod tables;
 
 use crate::disc::Extent;
@@ -56,7 +56,7 @@ impl std::fmt::Debug for CssState {
 }
 
 /// Recover the CSS title key with no keys, by scanning scrambled sectors and
-/// running the Stevenson known-plaintext attack (see the [`stevenson`] module).
+/// running the known-plaintext attack (see the [`keyless`] module).
 ///
 /// The crib comes from the periodic-run detector: a scrambled sector's cleartext region
 /// (bytes 0x00..0x80) often ends in a short-period repeating run (stuffing /
@@ -88,7 +88,7 @@ pub fn crack_key(
 ///   scanned extents (`is_scrambled_pack` never true): the content is genuinely
 ///   plaintext, so proceeding without a key is correct.
 /// - [`CrackOutcome::ScrambledUncracked`] — scrambled sectors WERE seen but no
-///   key could be recovered (the Stevenson attack found no crackable crib, or
+///   key could be recovered (the recovery found no crackable crib, or
 ///   the scrambled region was unreadable). The content is encrypted; muxing it
 ///   as plaintext would emit garbage, so callers MUST surface a hard error
 ///   instead of falling through to "unencrypted" — the per-title
@@ -318,7 +318,7 @@ fn crack_key_scan(
                         // would falsely report ScrambledUncracked (a false E7023).
                         if is_scrambled_pack(sect) {
                             saw_scrambled = true;
-                            if let Some(key) = stevenson::crack_title_key(sect) {
+                            if let Some(key) = keyless::crack_title_key(sect) {
                                 return CrackOutcome::Cracked(CssState {
                                     title_key: key,
                                     crack_span,
@@ -454,7 +454,7 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
         if chunk.len() < 2048 || !is_scrambled_pack(chunk) {
             continue;
         }
-        let crib = stevenson::attack_crib(chunk);
+        let crib = keyless::attack_crib(chunk);
         // Snapshot the ciphertext (chunk is exactly 2048 here) only when there is
         // a crib to validate against, so the common cache-hit path costs no
         // per-sector heap allocation.
@@ -469,7 +469,7 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
             // Cached key is stale for this region — restore the ciphertext and
             // crack this sector's own key.
             chunk.copy_from_slice(&original);
-            match stevenson::crack_title_key(chunk) {
+            match keyless::crack_title_key(chunk) {
                 Some(fresh) => {
                     *title_key = fresh;
                     lfsr::descramble_sector(title_key, chunk);
@@ -495,7 +495,7 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
                     // either opens a unit or does not, whereas a CSS title key
                     // is recovered from data whose recoverability varies sector
                     // by sector. Real DVDs hit this constantly; the change made
-                    // Greenland.iso unrippable and was caught by the real-media
+                    // a real disc unrippable and was caught by the real-media
                     // acceptance gate, not by any unit test.
                     lfsr::descramble_sector(title_key, chunk);
                 }
@@ -568,7 +568,7 @@ pub(crate) const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
 /// found no key (there is none) and the scan returned `ScrambledUncracked`,
 /// hard-failing a perfectly good HD-DVD with `CssKeyMissing` — E7023. Excluding
 /// `0xBB/0xBE/0xBF` at 0x11 makes the evidence gate match what the crack itself
-/// can act on (the Stevenson attack only recovers a key from a scrambled ES
+/// can act on (the recovery only recovers a key from a scrambled ES
 /// pack), so a decrypted HD-DVD now scans to `Unencrypted` and muxes cleanly.
 ///
 /// This does NOT weaken the genuine "encrypted but uncrackable" hard-fail on a
@@ -615,7 +615,7 @@ mod tests {
     /// This test exists because round 9 read the same code as "descrambling
     /// with a key we just proved stale" and made it `DecryptFailed` to match
     /// the AACS path. Real DVDs hit this constantly — the change made
-    /// Greenland.iso unrippable, and no unit test caught it; the real-media
+    /// a real disc unrippable, and no unit test caught it; the real-media
     /// acceptance gate did. CSS is not AACS: an AACS unit key either opens a
     /// unit or does not, whereas a CSS title key is recovered from data whose
     /// recoverability varies sector by sector.
@@ -636,11 +636,11 @@ mod tests {
             "fixture must be a scrambled sector"
         );
         assert!(
-            stevenson::attack_crib(&sector).is_some(),
+            keyless::attack_crib(&sector).is_some(),
             "fixture must yield a crib, or the mismatch branch is never entered"
         );
         assert!(
-            stevenson::crack_title_key(&sector).is_none(),
+            keyless::crack_title_key(&sector).is_none(),
             "fixture must be uncrackable, or the failure branch is never entered"
         );
 
@@ -851,7 +851,7 @@ mod tests {
         /// scrambled reads because the bus-auth gate isn't open).
         lock_all: bool,
         /// When set, the sector at `crackable.0` is served as a full
-        /// Stevenson-crackable scrambled sector (`crackable.1`, 2048 bytes)
+        /// crackable scrambled sector (`crackable.1`, 2048 bytes)
         /// instead of the uniform `flag_byte` fill. Lets the scan actually
         /// reach `CrackOutcome::Cracked` from a synthetic ISO.
         crackable: Option<(u32, Vec<u8>)>,
@@ -881,11 +881,11 @@ mod tests {
         }
     }
 
-    /// Build a Stevenson-crackable scrambled sector for `(title_key, seed)`:
+    /// Build a crackable scrambled sector for `(title_key, seed)`:
     /// the cleartext header (0x59..0x80) carries a periodic run that continues
     /// across the 0x80 boundary into the encrypted region — the crib
-    /// `stevenson::crack_title_key` recovers a key from. Mirrors the
-    /// `synth_periodic_sector` fixture in the stevenson tests but built here
+    /// `keyless::crack_title_key` recovers a key from. Mirrors the
+    /// `synth_periodic_sector` fixture in the keyless tests but built here
     /// from the crate-internal `scramble_sector`.
     fn crackable_sector(title_key: &[u8; 5], seed: &[u8; 5], period: usize) -> Vec<u8> {
         const RUN_START: usize = 0x59;
@@ -1102,7 +1102,7 @@ mod tests {
     }
 
     /// THE Fix 6 regression: a scan that SEES scrambled sectors (flag set) but
-    /// recovers no key (the mock's zeroed data has no Stevenson crib) must
+    /// recovers no key (the mock's zeroed data has no recoverable crib) must
     /// return `ScrambledUncracked` — a HARD failure — NOT `Unencrypted`. The
     /// old code conflated this with "unencrypted" and muxed scrambled MPEG as
     /// plaintext (garbage at exit 0).
@@ -1416,7 +1416,7 @@ mod tests {
 
     /// SCAN-LEVEL CRACKED (audit gap "MockSource never yields a crackable
     /// sector"): drive the full `crack_key_scan` over a synthetic ISO whose
-    /// scan hits a Stevenson-crackable scrambled sector. The outcome must be
+    /// scan hits a crackable scrambled sector. The outcome must be
     /// `CrackOutcome::Cracked` with a key that round-trips the sector, AND the
     /// `crack_span` must be recorded as the half-open extent span (the per-VTS
     /// routing key the mux path needs). Previously only the leaf crack and the
@@ -1480,7 +1480,7 @@ mod tests {
             sector_count: 50,
         }];
 
-        // Cracked: a real Stevenson-crackable sector in an otherwise clear scan.
+        // Cracked: a real crackable sector in an otherwise clear scan.
         let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
         let seed = [0x11, 0x22, 0x33, 0x44, 0x55];
         let mut cracked_src = MockSource::new(0x00);
