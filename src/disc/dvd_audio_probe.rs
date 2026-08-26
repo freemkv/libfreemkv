@@ -1,6 +1,6 @@
 //! Physical AC-3 sub-stream probing for DVD audio routing.
 //!
-//! ## Why this exists (Silence-of-the-Lambs wrong-substream bug)
+//! ## Why this exists (a real-disc wrong-substream bug)
 //!
 //! A DVD VTS IFO declares its audio streams in a fixed table, and freemkv's
 //! scan assigns each declared stream a `private_stream_1` sub-stream id purely
@@ -8,7 +8,7 @@
 //! `0x81`, and so on (`ifo::assign_audio_sub_stream_ids`). That assumes the
 //! physical sub-stream order on the wire matches the IFO declaration order.
 //!
-//! On some discs it does NOT. The R2 PAL "The Silence of the Lambs" feature
+//! On some discs it does NOT. A real R2 PAL DVD release's feature
 //! declares ONE AC-3 audio stream the IFO nibble marks as 5.1 (6 channels), but
 //! the physical VOB carries the 5.1 main mix and a 2.0 down-mix on DIFFERENT
 //! `0x8x` sub-stream ids, and the 2.0 is the one that happens to land at the
@@ -590,7 +590,7 @@ mod tests {
         }
     }
 
-    /// End-to-end `probe_and_remap`: a Silence-of-the-Lambs-shaped MpegPs
+    /// End-to-end `probe_and_remap`: a real-disc-shaped MpegPs
     /// title (one declared 5.1 AC-3 stream ordinally assigned 0x80) whose
     /// physical VOB bytes carry the 2.0 down-mix on 0x80 and the real 5.1 on
     /// 0x81. This must reach the `remap_audio_pids` call and re-route the
@@ -603,7 +603,7 @@ mod tests {
     /// its untouched ordinal value (0xBD80), which the assertion below would
     /// catch.
     #[test]
-    fn probe_and_remap_reroutes_silence_of_the_lambs_scenario_end_to_end() {
+    fn probe_and_remap_reroutes_swapped_substream_scenario_end_to_end() {
         let mut bytes = ps_ac3(0x80, 2, false); // physical 0x80 = 2.0 down-mix
         bytes.extend(ps_ac3(0x81, 7, true)); // physical 0x81 = 5.1 main mix
         let mut title = DiscTitle {

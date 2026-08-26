@@ -2180,7 +2180,7 @@ impl Disc {
         // Authoritative main-feature ordering. The physical `canonical_title_order`
         // sort above is refined once labels have run: the disc's own navigation
         // pick (`nav_feature`) wins outright when present; otherwise a play-all /
-        // wrapper COMPOSITE (e.g. Spider-Man 3 UHD `00245` =
+        // wrapper COMPOSITE (e.g. a real UHD title's decoy playlist `00245` =
         // `[bumper][00001 feature clip][outro]`) is demoted below the standalone
         // title it wraps, a title with no plausible video is dropped, and a
         // feature the disc's own menu authoring designates (`feature_hint`) is
@@ -2408,7 +2408,7 @@ impl Disc {
     ///   else — a size-independent signal an obfuscation decoy cannot forge.
     /// - `standalone`: a title that is a play-all / wrapper COMPOSITE — its clip
     ///   set properly contains another substantial video title's whole clip set
-    ///   (the Spider-Man 3 UHD `00245` = `[bumper][00001 feature clip][outro]`
+    ///   (a real UHD title's decoy playlist `00245` = `[bumper][00001 feature clip][outro]`
     ///   case) — is demoted below the standalone title it wraps. This is the
     ///   STRUCTURAL anti-decoy signal; it does not depend on stream counts,
     ///   physical size, or disc capacity, so it survives where those are spoofed
@@ -5038,7 +5038,7 @@ mod tests {
         }
     }
 
-    /// Regression for the Spider-Man 3 UHD hang: the decoy `00245.mpls` is a
+    /// Regression for a real UHD title's decoy-playlist hang: the decoy `00245.mpls` is a
     /// WRAPPER COMPOSITE — `[00339 2s bumper][00001 the whole feature clip][00336
     /// outro]` — so its first-PlayItem STN reports v=0, and it is the LONGEST and
     /// LARGEST title (8350s / 78.4 GB vs the feature's 8038s / 76.5 GB). Muxing
@@ -5240,7 +5240,7 @@ mod tests {
         );
     }
 
-    /// Regression (Spotlight 2015 UHD): the disc navigates to a Dolby-Vision
+    /// Regression (a real UHD title): the disc navigates to a Dolby-Vision
     /// seamless-branch playlist (`00001` = 102 tiny clips, 0.4 GB) that has real
     /// video streams but carries almost no payload, sitting beside the 91.5 GB
     /// single-clip feature (`00002`). A player plays the branch; a RIP wants the

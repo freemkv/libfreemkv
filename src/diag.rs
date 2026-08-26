@@ -485,7 +485,8 @@ pub fn dump_disc(disc: &Disc) {
     // Titles disqualified from main-feature candidacy for carrying no video —
     // the streamless obfuscation decoys the `has-video` gate demotes. Logged so
     // a field bug report shows WHY a long/large playlist was not picked (the
-    // gap that let an undiagnosable E6008 loop on Spider-Man 3 UHD `00245`).
+    // gap that let an undiagnosable E6008 loop on a real UHD title's decoy
+    // playlist `00245`).
     for (ti, t) in disc.titles.iter().enumerate() {
         if !t.has_video() {
             tracing::debug!(
