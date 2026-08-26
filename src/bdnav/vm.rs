@@ -422,4 +422,55 @@ mod tests {
         );
         assert_eq!(resolve(&index, &mobjs, &|id| id == 42), Some(42));
     }
+
+    #[test]
+    fn swap_exchanges_two_registers() {
+        // MOVE g0=11; MOVE g1=22; SWAP g0<->g1; PlayPL GPR[0]. SWAP: grp=SET(2),
+        // sub_grp=SET(0), set_opt=SWAP(2), both operands registers (imm_op*=0).
+        let swap01 = cmd((2 << 5) | (2 << 3), 0x00, 0, 0x02, 0, 1);
+        let d = build(&[&[
+            set_move_gpr(0, 11),
+            set_move_gpr(1, 22),
+            swap01,
+            play_pl_reg(0),
+        ]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        let mut vm = Vm {
+            mobjs: &mobjs,
+            index: &index,
+            gpr: [0; 4096],
+            psr: psr_init(),
+        };
+        // After the swap GPR0 holds the old GPR1 (22) and PlayPL plays it.
+        assert_eq!(run(&mut vm, 0, &|id| id == 22), Some(22));
+        // Full exchange: GPR1 now holds the old GPR0 (11).
+        assert_eq!(vm.gpr[1], 11);
+    }
+
+    #[test]
+    fn swap_immediate_operand_is_not_written_back() {
+        // Seed GPR[5]=77, then SWAP dst=GPR0 (register) with src=IMMEDIATE 5
+        // (imm_op1=0, imm_op2=1). The imm gate must refuse using the immediate
+        // as a write target, so GPR[5] — the register the literal 5 would alias
+        // — keeps 77; only GPR0 receives the immediate. Dropping either
+        // `if !c.imm_op1` / `if !c.imm_op2` guard makes an assertion fail.
+        let swap_imm = cmd((2 << 5) | (2 << 3), 0x40, 0, 0x02, 0, 5);
+        let d = build(&[&[set_move_gpr(5, 77), swap_imm]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        let mut vm = Vm {
+            mobjs: &mobjs,
+            index: &index,
+            gpr: [0; 4096],
+            psr: psr_init(),
+        };
+        // No PlayPL → program runs off the end (None); inspect registers after.
+        assert_eq!(run(&mut vm, 0, &|_| false), None);
+        assert_eq!(
+            vm.gpr[5], 77,
+            "immediate operand must not be a write target"
+        );
+        assert_eq!(vm.gpr[0], 5, "register operand receives the immediate");
+    }
 }

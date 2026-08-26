@@ -1347,6 +1347,79 @@ mod tests {
         assert_eq!(titles[1].extents[0].start_lba, 10200); // 10000 + 200
     }
 
+    /// Stamp a First-Play PGC into a VMG whose pre-command list is a single
+    /// unconditional `JumpTT ttn`, so `dvdnav::resolve_main_title` resolves that
+    /// title through TT_SRPT. Placed in sector 0, clear of the magic / FP_PGC /
+    /// TT_SRPT pointers `build_vmg` already writes.
+    fn stamp_first_play_jumptt(vmg: &mut [u8], ttn: u8) {
+        const FP_PGC_PTR: usize = 0x84; // u32 byte offset of the First-Play PGC
+        const CMD_TBL_PTR: usize = 0xE4; // u16 cmd-table offset (rel to PGC)
+        let fp_pgc: u32 = 0x200;
+        let cmd_tbl_rel: u16 = 0x100;
+        vmg[FP_PGC_PTR..FP_PGC_PTR + 4].copy_from_slice(&fp_pgc.to_be_bytes());
+        let pgc = fp_pgc as usize;
+        vmg[pgc + CMD_TBL_PTR..pgc + CMD_TBL_PTR + 2].copy_from_slice(&cmd_tbl_rel.to_be_bytes());
+        let tbl = pgc + cmd_tbl_rel as usize;
+        vmg[tbl..tbl + 2].copy_from_slice(&1u16.to_be_bytes()); // nr_of_pre = 1
+        // JumpTT command (type 1, direct=1, cmd=2): ttn in byte 5.
+        vmg[tbl + 8..tbl + 16].copy_from_slice(&[0x30, 0x02, 0, 0, 0, ttn, 0, 0]);
+    }
+
+    /// The DVD First-Play nav promotion branch (issue #40): when
+    /// `resolve_main_title` returns a `(vtsn, vts_ttn)` target, `scan_dvd_titles`
+    /// must map it — via the 1-based `vts_ttn == vts_title_idx + 1` join within
+    /// the matching `vts_number` — to the running `title_number`, and surface it
+    /// as the `nav_feature`. TT_SRPT here maps title 2 → (VTS 2, title-in-set 1);
+    /// the First-Play unconditionally `JumpTT 2`, so the promoted feature must be
+    /// the SECOND scanned title (VTS_02 → title_number 2). An off-by-one on the
+    /// join or a vtsn/vts_ttn field swap would promote the wrong title or none.
+    #[test]
+    fn scan_dvd_titles_nav_promotes_first_play_target() {
+        let mut disc = MemDisc::new();
+        // TT_SRPT: title 1 → VTS 1 (in-set title 1); title 2 → VTS 2 (in-set 1).
+        let mut vmg = build_vmg(&[(1, 1, 1), (1, 2, 1)]);
+        stamp_first_play_jumptt(&mut vmg, 2); // First-Play → JumpTT title 2
+        let vts1 = build_vts(100, 0x00, &[], &[], &[(0, 9)], false);
+        let vts2 = build_vts(200, 0x00, &[], &[], &[(0, 19)], false);
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts1,
+                },
+                FileSpec {
+                    name: "VTS_02_0.IFO".into(),
+                    icb_lba: 64,
+                    data_lba: 7000,
+                    contents: vts2,
+                },
+            ],
+        );
+        let (titles, nav_feature) = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+        assert_eq!(titles.len(), 2);
+        // Sanity: the resolver reached the branch with the VTS-2 target.
+        assert_eq!(
+            crate::dvdnav::resolve_main_title(&mut disc, &udf),
+            Some(crate::dvdnav::nav::ResolvedTitle {
+                title: 2,
+                vtsn: 2,
+                vts_ttn: 1,
+            })
+        );
+        // The promotion mapped that target to the second scanned title.
+        assert_eq!(nav_feature, Some(2));
+        assert_eq!(titles[1].playlist_id, 2);
+    }
+
     /// chapter_times from the IFO become Chapter entries with ordinal
     /// names (dvd.rs maps chapter_times → Chapter{time_secs, chapter_name}).
     #[test]

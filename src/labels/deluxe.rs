@@ -398,7 +398,7 @@ impl CandidatePool {
 /// Phase A. Walk every `.class` in `archive`, identify the master
 /// enums by `<clinit>` ldc-sequence fingerprint. Returns a vector of
 /// `(label, MasterEnum)` — at most one match per fingerprint label.
-pub(crate) fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnum)> {
+fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnum)> {
     // First pass: collect every class's <clinit> ldc string sequence, keyed by
     // the class's JVM INTERNAL name (`this_class`), NOT the zip entry name.
     // The binding class references an enum constant as `getstatic <internal>.f`
@@ -417,7 +417,7 @@ pub(crate) fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str
         let key = class.this_class_name().unwrap_or(zip_name);
         if !pool.insert(key, ldcs) {
             tracing::debug!(
-                class = key,
+                class = ?key,
                 classes = pool.by_class.len(),
                 bytes = pool.bytes,
                 "deluxe: candidate pool aggregate cap hit, dropping class"
@@ -578,7 +578,7 @@ fn clinit_ldc_strings(class: &super::class_reader::ClassFile) -> Option<Vec<Stri
                     || out_bytes.saturating_add(s.len()) > MAX_CLINIT_LDC_BYTES
                 {
                     tracing::debug!(
-                        class = class.this_class_name().unwrap_or(""),
+                        class = ?class.this_class_name().unwrap_or(""),
                         strings = out.len(),
                         bytes = out_bytes,
                         "deluxe: clinit ldc collection hit cap, truncating"
@@ -629,7 +629,7 @@ fn ldcs_match_prefix(ldcs: &[String], prefix: &[&str]) -> bool {
 /// A disc that splits the table commonly has one audio binding class
 /// with the most getstatic refs and a subtitle binding class with
 /// somewhat fewer; both share the master Language + Purpose enums.
-pub(crate) fn find_binding_classes(
+fn find_binding_classes(
     archive: &mut jar::Jar,
     master_enum_classes: &HashSet<&str>,
 ) -> Vec<(String, usize)> {
@@ -745,7 +745,7 @@ const MAX_CONSTRUCTIONS: usize = 4096;
 /// Phase D entry point: find the binding class in `archive`, run the
 /// bytecode walker against its `<clinit>`, return one `Construction`
 /// per `new X / invokespecial X.<init>` sequence.
-pub(crate) fn decode_binding(
+fn decode_binding(
     archive: &mut jar::Jar,
     binding_class_name: &str,
     master: &MasterEnumTable,
@@ -1115,7 +1115,7 @@ impl MasterEnumTable {
         MasterEnumTable { by_class, by_kind }
     }
 
-    pub(crate) fn class_name_set(&self) -> HashSet<&str> {
+    fn class_name_set(&self) -> HashSet<&str> {
         self.by_class.keys().map(String::as_str).collect()
     }
 

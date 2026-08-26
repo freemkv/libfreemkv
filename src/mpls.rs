@@ -146,7 +146,10 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
         }
 
         let clip_id = String::from_utf8_lossy(&item[0..5]).to_string();
-        let connection_condition = item[9] & 0x0F;
+        // After clip_id[0..5] and codec_id[5..9], item[9] is fully reserved;
+        // item[10] holds is_multi_angle (bit 4) plus connection_condition in its
+        // low nibble. stc_id follows at item[11] and in_time at item[12..16].
+        let connection_condition = item[10] & 0x0F;
         let in_time = u32::from_be_bytes([item[12], item[13], item[14], item[15]]);
         let out_time = u32::from_be_bytes([item[16], item[17], item[18], item[19]]);
 
@@ -533,10 +536,12 @@ mod tests {
             item.extend_from_slice(*clip_id);
             // [5..9] codec_id ("M2TS")
             item.extend_from_slice(b"M2TS");
-            // [9] connection_condition in low nibble
+            // [9] fully reserved
+            item.push(0);
+            // [10] is_multi_angle (bit 4) + connection_condition (low nibble)
             item.push(*conn & 0x0F);
-            // [10..12] reserved
-            item.extend_from_slice(&[0u8; 2]);
+            // [11] stc_id / reserved
+            item.push(0);
             // [12..16] in_time
             item.extend_from_slice(&in_time.to_be_bytes());
             // [16..20] out_time
@@ -1039,22 +1044,24 @@ mod tests {
         assert!(parse(&data).is_err());
     }
 
-    /// Spec: connection_condition is the LOW nibble of PlayItem byte[9]
-    /// (high nibble is reserved/flags). A byte 0xF5 must yield 5, not 0xF5.
+    /// connection_condition is the LOW nibble of PlayItem byte[10] (the high
+    /// nibble carries reserved bits and the is_multi_angle flag at bit 4).
+    /// byte[9] is entirely reserved and must NOT be read. A byte[10] of 0xF5
+    /// must yield 5, and a non-zero byte[9] must not leak into the value.
     #[test]
     fn connection_condition_is_low_nibble_only() {
-        // Build a custom item where byte[9] = 0xF5 (high nibble set).
-        // build_mpls masks with &0x0F when writing, so write raw to verify
-        // the PARSER masks. We patch the item byte directly after building.
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
         let mut data = build_mpls(
             &[(b"00001", 0, 0, 9000000)],
             (1, 0, 0, 0, 0, 0, 0, 0),
             &[video],
         );
-        // Locate PlayItem byte[9]: header(40) + pl_header(10) + item_len(2) + 9.
-        let conn_idx = 40 + 10 + 2 + 9;
-        data[conn_idx] = 0xF5;
+        // PlayItem base: header(40) + pl_header(10) + item_len(2).
+        let item_base = 40 + 10 + 2;
+        // byte[9] fully reserved — set it to prove it does not leak in.
+        data[item_base + 9] = 0xFF;
+        // byte[10] high nibble set — parser must mask to the low nibble.
+        data[item_base + 10] = 0xF5;
         let pl = parse(&data).expect("should parse");
         assert_eq!(pl.play_items[0].connection_condition, 0x05);
     }
@@ -1399,8 +1406,9 @@ mod tests {
         let mut item = Vec::new();
         item.extend_from_slice(b"00009");
         item.extend_from_slice(b"M2TS");
-        item.push(0x01); // connection_condition
-        item.extend_from_slice(&[0u8; 2]);
+        item.push(0); // [9] reserved
+        item.push(0x01); // [10] connection_condition (low nibble)
+        item.push(0); // [11] stc_id / reserved
         item.extend_from_slice(&90000u32.to_be_bytes()); // in_time
         item.extend_from_slice(&180000u32.to_be_bytes()); // out_time
         item.resize(32, 0); // pad through STN_OFFSET; item.len()==32 so no STN
@@ -1456,13 +1464,15 @@ mod tests {
     }
 
     /// The 20 bytes a PlayItem needs for clip_id(5) + codec_id(4) +
-    /// connection_condition(1) + reserved(2) + IN_time(4) + OUT_time(4).
+    /// reserved(1) + connection_condition byte(1) + stc_id/reserved(1) +
+    /// IN_time(4) + OUT_time(4).
     fn play_item_20(clip: &[u8; 5], cc: u8, in_t: u32, out_t: u32) -> Vec<u8> {
         let mut it = Vec::new();
         it.extend_from_slice(clip);
         it.extend_from_slice(b"M2TS");
-        it.push(cc);
-        it.extend_from_slice(&[0u8; 2]);
+        it.push(0); // [9] reserved
+        it.push(cc); // [10] connection_condition (low nibble)
+        it.push(0); // [11] stc_id / reserved
         it.extend_from_slice(&in_t.to_be_bytes());
         it.extend_from_slice(&out_t.to_be_bytes());
         assert_eq!(it.len(), 20);
