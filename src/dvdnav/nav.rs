@@ -80,6 +80,15 @@ fn u32_at(b: &[u8], o: usize) -> Option<u32> {
     ]))
 }
 
+/// A register operand index names a system parameter (SPRM) when it carries the
+/// `0x80` bias — matching [`Vm::reg`]'s split of GPRM (`< 128`) vs SPRM
+/// (`>= 128`). Only SPRM reads are session-specific and therefore taint a
+/// compare; GPRM reads do not.
+#[inline]
+fn is_sprm(idx: u8) -> bool {
+    idx >= 128
+}
+
 // ── Minimal navigation register machine ──────────────────────────────────────
 
 /// The subset of the DVD-Video VM register file the First-Play resolver needs:
@@ -116,15 +125,23 @@ impl Vm {
         }
     }
 
-    /// Evaluate a compare predicate (op codes per [`Compare`]).
-    fn eval(&self, c: &Compare) -> bool {
+    /// Evaluate a compare predicate (op codes per [`Compare`]). Returns the
+    /// predicate result together with a *taint* flag that is set when either
+    /// operand read a system parameter (SPRM). An SPRM's value is
+    /// player-/session-specific (region, parental level, language) and unknown
+    /// at scan time, so a branch decision that depends on one is undecidable —
+    /// the caller abstains rather than commit to the cold-power-on arm. GPRM
+    /// reads never taint (their values are established by the program itself).
+    fn eval(&self, c: &Compare) -> (bool, bool) {
+        let mut tainted = is_sprm(c.lhs_reg);
         let l = self.reg(c.lhs_reg);
         let r = if c.immediate {
             c.imm
         } else {
+            tainted |= is_sprm(c.rhs_reg);
             self.reg(c.rhs_reg)
         };
-        match c.op {
+        let result = match c.op {
             1 => (l & r) != 0,
             2 => l == r,
             3 => l != r,
@@ -133,7 +150,8 @@ impl Vm {
             6 => l <= r,
             7 => l < r,
             _ => false,
-        }
+        };
+        (result, tainted)
     }
 
     /// Apply a `SetGPRM`. Only the arithmetic/logic set-ops that a First-Play
@@ -229,12 +247,20 @@ fn run_first_play(cmds: &[[u8; 8]]) -> Option<u8> {
 
         let cmd = vmcmd::decode(&cmds[pc]);
 
-        // A false predicate falls through to the next command line.
-        if let Some(cmp) = cmd.compare
-            && !vm.eval(&cmp)
-        {
-            pc += 1;
-            continue;
+        // A guarded command's predicate decides the branch. If that decision
+        // read a system parameter (SPRM), it is undecidable at scan time —
+        // abstain so the caller keeps the structural fallback rather than
+        // committing to the cold-power-on arm. Otherwise a false predicate
+        // falls through to the next command line.
+        if let Some(cmp) = cmd.compare {
+            let (taken, tainted) = vm.eval(&cmp);
+            if tainted {
+                return None;
+            }
+            if !taken {
+                pc += 1;
+                continue;
+            }
         }
 
         match cmd.instr {
@@ -468,6 +494,37 @@ mod tests {
         // 3006...0183 = JumpSS VTSM root (the exact SOTL First-Play command).
         let vmgi = build_vmgi(&[h("3006000101830000")], 1, &[(3, 1)]);
         assert_eq!(resolve_from_vmg(&vmgi), None);
+    }
+
+    /// A dispatch gated on a system parameter (SPRM) is undecidable at scan
+    /// time — the resolver must abstain rather than commit to the cold-power-on
+    /// arm. Here `if SPRM0 == g0 -> JumpTT 1` is *true* on the cold machine
+    /// (both read 0), so without SPRM taint-tracking the resolver would wrongly
+    /// return title 1; with it, the SPRM read taints the branch and it abstains.
+    #[test]
+    fn sprm_gated_dispatch_abstains() {
+        // 30 22: jump with EQ compare (op=2); if_v2 operands are registers
+        // b6/b7. b6=0x80 = SPRM0 (session-specific), b7=0x00 = g0. ttn=b5=1.
+        let vmgi = build_vmgi(&[h("3022000000018000")], 1, &[(2, 1)]);
+        assert_eq!(resolve_from_vmg(&vmgi), None);
+    }
+
+    /// The mirror of the SPRM case: a compare that reads only GPRMs is decidable
+    /// and must NOT over-abstain. `if g0 == g1 -> JumpTT 1` is true on the cold
+    /// machine and resolves to title 1 (no SPRM operand → no taint).
+    #[test]
+    fn gprm_only_compare_does_not_taint() {
+        // 30 22: jump EQ; b6=0x00 = g0, b7=0x01 = g1 (both 0 on the cold
+        // machine → equal). ttn=b5=1.
+        let vmgi = build_vmgi(&[h("3022000000010001")], 1, &[(6, 1)]);
+        assert_eq!(
+            resolve_from_vmg(&vmgi),
+            Some(ResolvedTitle {
+                title: 1,
+                vtsn: 6,
+                vts_ttn: 1
+            })
+        );
     }
 
     /// An empty First-Play pre list selects no title.
