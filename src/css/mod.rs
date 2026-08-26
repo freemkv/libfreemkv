@@ -2,9 +2,9 @@
 //!
 //! CSS uses a weak 40-bit LFSR stream cipher (broken since 1999).
 //!
-//! The title key is recovered keylessly: [`crack_key`] runs a known-plaintext
-//! attack (see the [`keyless`] module) on the scrambled
-//! data, needing no player keys, disc-key crack, or external key file.
+//! The title key is recovered keylessly: [`crack_key`] recovers it directly
+//! from the scrambled data (see the [`keyless`] module),
+//! needing no player keys, disc-key recovery, or external key file.
 //! Sectors are then decrypted with [`descramble_sector`].
 //!
 //! Usage:
