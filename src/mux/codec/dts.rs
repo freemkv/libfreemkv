@@ -938,7 +938,7 @@ mod tests {
         // AU = core(512) + a REAL EXSS substream whose XLL payload embeds a DTS
         // core syncword decoding to a plausible size (512). The heuristic-only
         // framer would split here and truncate the lossless extension (the
-        // Dunkirk "Failed to decode block code(s)" decoder-failure class).
+        // real-disc "Failed to decode block code(s)" decoder-failure class).
         // Precise EXSS sizing spans the whole extension to the REAL next core.
         let core = make_dts_core(512);
         let exss = make_exss(600, Some(40));
@@ -1046,7 +1046,7 @@ mod tests {
         // B1: a partial DTS core is buffered, then a concealed gap (PES marked
         // discontinuity) carries a fresh core. The truncated partial must be
         // DROPPED — splicing it makes the framer emit a corrupt sub-core-length
-        // AU (the Dunkirk "Failed to decode block code(s)" decoder-failure
+        // AU (the real-disc "Failed to decode block code(s)" decoder-failure
         // class) and strands the rest. With the fix the post-gap core is the
         // only AU, and it carries the post-gap PTS (not the stale pre-gap one).
         let mut parser = DtsParser::new();

@@ -149,8 +149,8 @@ impl DvdTitle {
     /// - As a final guard it never returns past the last cell, and never drops
     ///   when that would leave zero cells.
     ///
-    /// For "The Silence of the Lambs" (every feature cell category `0x00`,
-    /// chapter 1 at 00:00:00) this returns 0 — a no-op — which is the correct
+    /// For a real disc where every feature cell category is `0x00` and
+    /// chapter 1 sits at 00:00:00, this returns 0 — a no-op — which is the correct
     /// result: the disc's scene-index lives in a separate menu/title PGC, not
     /// in leading cells of the feature PGC, so there is nothing to drop here.
     pub fn feature_start_cell(&self) -> usize {
@@ -2115,7 +2115,7 @@ mod tests {
 
     /// A normal single-angle feature (every cell category 0x00) is never
     /// filtered: feature_start_cell == 0, feature_cells == all cells. This is
-    /// the "Silence of the Lambs" case — the filter must be a no-op.
+    /// the plain-single-angle-feature case — the filter must be a no-op.
     #[test]
     fn feature_filter_noop_on_plain_feature() {
         let t = DvdTitle {

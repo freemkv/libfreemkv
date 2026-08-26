@@ -945,7 +945,7 @@ mod tests {
         // the corruption path uses: drop every post-gap AU until the next
         // CRC-valid major sync (the clean re-init point), then resume there.
         //
-        // Regression for a real disc (John Wick: Chapter 2) whose transport
+        // Regression for a real disc whose transport
         // stream has a multi-PID continuity-counter gap at ~6:49: before this
         // fix the TrueHD path cleared its buffer and resumed on the next NON-major
         // AU, shipping a decoder-choking seam (559 `restart header sync` errors),

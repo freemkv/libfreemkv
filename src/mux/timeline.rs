@@ -2250,7 +2250,7 @@ mod tests {
     /// trimming to `[in, out]` is. Real discs author trailing audio (a fade after
     /// the last video frame) PAST the OUT mark in the m2ts; the no-plan inference
     /// path kept it, leaving audio seconds past the declared duration — the
-    /// `The Bourne Supremacy` defect (audio +35.6 s past a single-clip title's
+    /// audio-drift defect found on a real disc (audio +35.6 s past a single-clip title's
     /// end). The plan drops it, and every KEPT frame is placed exactly as the
     /// no-plan path would (raw rebased by `−in_ns`, which the MKV muxer already
     /// does), so a disc with no out-of-mark content is byte-identical.

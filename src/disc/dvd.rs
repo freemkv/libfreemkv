@@ -1557,7 +1557,7 @@ mod tests {
 
     /// Conservative guard end-to-end: a normal feature (every cell category
     /// 0x00) is muxed in full — the filter drops nothing and chapters are
-    /// unshifted. This is the "Silence of the Lambs" case.
+    /// unshifted. This is the plain-single-angle-feature case.
     #[test]
     fn scan_dvd_titles_plain_feature_untouched() {
         let mut disc = MemDisc::new();
