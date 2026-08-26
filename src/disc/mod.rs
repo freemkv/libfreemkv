@@ -2470,21 +2470,40 @@ impl Disc {
         let carries_feature_payload = |t: &DiscTitle| {
             max_video_size == 0 || t.size_bytes as f64 >= 0.10 * max_video_size as f64
         };
+        // The composite scan below is O(n^2 · clip-set-size). BOTH the title count
+        // and the per-title clip count are untrusted disc metadata (playlist count
+        // and PlayItem count — the latter a u16 the mpls parser does not otherwise
+        // cap), so a crafted image can inflate either dimension into a multi-second
+        // uncancellable stall. Bound the total pair work to a sub-second budget;
+        // above it, skip composite classification (every real disc is orders of
+        // magnitude under it) and let the has-video + canonical tiers order the
+        // titles. Bounding the PRODUCT covers both the many-tiny-titles and the
+        // few-clip-heavy-titles attack shapes.
+        let max_clips = clip_sets.iter().map(|s| s.len()).max().unwrap_or(0);
+        let composite_scan_ok = titles
+            .len()
+            .saturating_mul(titles.len())
+            .saturating_mul(max_clips.max(1))
+            <= 50_000_000;
         titles
             .iter()
             .enumerate()
             .map(|(i, p)| {
                 let pi = &clip_sets[i];
-                let composite = !pi.is_empty()
+                let composite = composite_scan_ok
+                    && !pi.is_empty()
                     && p.size_bytes > 0
                     && titles.iter().enumerate().any(|(j, q)| {
                         j != i && {
                             let qj = &clip_sets[j];
+                            // Cheap gates (length, video, size) before the O(len)
+                            // `is_subset` traversal, so the expensive check runs
+                            // only on genuinely plausible wrapper candidates.
                             !qj.is_empty()
                                 && qj.len() < pi.len()
-                                && qj.is_subset(pi)
                                 && q.has_probable_video()
                                 && q.size_bytes as f64 >= 0.5 * p.size_bytes as f64
+                                && qj.is_subset(pi)
                         }
                     });
                 // The authoring hint is honoured only when the hinted title has
@@ -5060,6 +5079,38 @@ mod tests {
         assert_eq!(
             titles[2].playlist_id, 245,
             "the wrapper composite decoy is demoted to the back"
+        );
+    }
+
+    /// The O(n^2 · clips) composite scan is work-bounded: a crafted disc with a
+    /// pathological title/clip count must skip the scan (degrade to has-video +
+    /// canonical order) instead of stalling uncancellably. At a normal count the
+    /// wrapper is still detected.
+    #[test]
+    fn composite_scan_is_work_bounded() {
+        let decoy = bd_title(
+            "00245.mpls",
+            245,
+            8350.0,
+            78_000_000_000,
+            &["dead", "00001"],
+        );
+        let feature = bd_title("00001.mpls", 1, 8000.0, 76_000_000_000, &["00001"]);
+        let small = vec![decoy.clone(), feature.clone()];
+        assert!(
+            Disc::rank_titles(&small, None, None)[0].composite,
+            "at a normal title count the wrapper is detected as composite"
+        );
+        // n^2 * max_clips over the budget (6000^2 * 2 = 7.2e7 > 5e7): the scan is
+        // skipped and nothing is flagged composite.
+        let mut many = vec![decoy, feature];
+        while many.len() < 6000 {
+            let i = many.len() as u16;
+            many.push(bd_title("00099.mpls", i, 100.0, 1_000_000, &["x"]));
+        }
+        assert!(
+            !Disc::rank_titles(&many, None, None)[0].composite,
+            "above the work budget the composite scan is skipped, not run"
         );
     }
 

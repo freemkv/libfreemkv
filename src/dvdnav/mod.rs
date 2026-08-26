@@ -12,10 +12,10 @@
 //! SOTL/Greenland test discs); [`nav`] — the First-Play navigation executor
 //! that resolves which title the disc's own navigation selects as the feature.
 
-pub mod nav;
-pub mod vmcmd;
+pub(crate) mod nav;
+pub(crate) mod vmcmd;
 
-pub use nav::{ResolvedTitle, resolve_main_title};
+pub(crate) use nav::resolve_main_title;
 
 use crate::sector::SectorSource;
 
