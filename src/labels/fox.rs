@@ -1,6 +1,6 @@
 //! Fox — loose `/BDMV/JAR/<id>/dcx.xml` plain-XML manifest.
 //!
-//! Older Fox authoring (e.g. *Life of Pi*, `/BDMV/JAR/05001/dcx.xml`) ships a
+//! Older Fox authoring (e.g. a real Fox release, `/BDMV/JAR/05001/dcx.xml`) ships a
 //! human-readable XML manifest alongside the BD-J jar. Its root is `<dcx>`, and
 //! under `<disc>` it lists every playlist the disc plays. The main-feature
 //! playlists carry nested per-stream `<audio>`/`<subtitle>` elements naming
@@ -12,7 +12,7 @@
 //! disc. Every field meaning below was read off a real disc; treat an
 //! unfamiliar value as unknown rather than guessing.
 //!
-//! Confirmed schema (Life of Pi, `/BDMV/JAR/05001/dcx.xml`):
+//! Confirmed schema (a real Fox release, `/BDMV/JAR/05001/dcx.xml`):
 //!
 //! ```xml
 //! <dcx>
@@ -65,7 +65,7 @@ use crate::udf::UdfFs;
 /// directory walk with no sector reads.
 ///
 /// Secondary signal: a `com/foxbd/` prefix in a top-level BD-J jar, which newer
-/// Fox discs (Deadpool et al.) carry instead of a loose `dcx.xml`. Recognising
+/// Fox discs (later franchise sequels) carry instead of a loose `dcx.xml`. Recognising
 /// it attributes the disc to Fox rather than the generic deluxe stub even
 /// though [`parse`] cannot decode that bytecode form yet (see the Phase 2 note
 /// at the bottom of this file); such a disc detects here but yields no labels,
@@ -279,7 +279,7 @@ fn normalize_language(raw: &str) -> String {
 
 // ── Phase 2 (design only, not implemented here) ─────────────────────────────
 //
-// Newer Fox discs (Deadpool, etc., surveyed as 11 discs currently mis-owned by
+// Newer Fox discs (later franchise sequels, surveyed as 11 discs currently mis-owned by
 // the deluxe stub) ship NO loose `dcx.xml`. They wrap the same per-stream data
 // inside `com/foxbd` BD-J `.class` bytecode. The follow-on parser would reuse
 // `super::class_reader` the way `dbp`/`deluxe` already do:
@@ -300,13 +300,13 @@ fn normalize_language(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The real Life of Pi manifest, reduced only by truncating the giant
+    /// A real Fox-release manifest, reduced only by truncating the giant
     /// chapter-mark `<properties>` blocks (which carry no stream labels). Every
     /// `<audio>`/`<subtitle>` element and both regional feature playlists are
-    /// verbatim from `/BDMV/JAR/05001/dcx.xml`, so this fixture exercises the
+    /// verbatim from a real disc's `/BDMV/JAR/05001/dcx.xml`, so this fixture exercises the
     /// exact bytes production sees: feature selection across two `name="feature"`
     /// playlists, the nested-scope rule, and the rnib/sdh/embed flags.
-    const LIFE_OF_PI_DCX: &str = r#"<dcx>
+    const FOX_DCX_SAMPLE: &str = r#"<dcx>
 	<disc>
 		<properties region="ABC" regioncheckon="false" parentallevel="PG" hdronlydisc="true" bootstrap.bdjo="88888"
 		            vstaskenabled="false" defaultversion="1" topmenushowmarkid="0" topmenuloopmarkid="0"/>
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn selects_richest_feature_playlist_and_its_id() {
         assert_eq!(
-            feature_playlist_id(LIFE_OF_PI_DCX),
+            feature_playlist_id(FOX_DCX_SAMPLE),
             Some("00800".to_string())
         );
     }
@@ -387,8 +387,8 @@ mod tests {
     /// Full real-disc parse: the 00800 audio table. Eleven tracks, id order =
     /// STN slot, and slot 2 (`eng rnib`) is the descriptive/narration track.
     #[test]
-    fn life_of_pi_audio_labels() {
-        let labels = labels_from_dcx(LIFE_OF_PI_DCX);
+    fn fox_dcx_audio_labels() {
+        let labels = labels_from_dcx(FOX_DCX_SAMPLE);
         let a = audio(&labels);
         assert_eq!(
             a.len(),
@@ -424,8 +424,8 @@ mod tests {
     /// Full real-disc parse: the 00800 subtitle table. `form="sdh"` → Sdh,
     /// `type="embed"` → Forced, `feature`/`text` → no qualifier.
     #[test]
-    fn life_of_pi_subtitle_labels() {
-        let labels = labels_from_dcx(LIFE_OF_PI_DCX);
+    fn fox_dcx_subtitle_labels() {
+        let labels = labels_from_dcx(FOX_DCX_SAMPLE);
         let s = subs(&labels);
         assert_eq!(s.len(), 11, "00800 has eleven subtitle tracks");
 
@@ -457,7 +457,7 @@ mod tests {
     /// twice and the count would jump past 11.
     #[test]
     fn does_not_merge_regional_feature_playlists() {
-        let labels = labels_from_dcx(LIFE_OF_PI_DCX);
+        let labels = labels_from_dcx(FOX_DCX_SAMPLE);
         let a = audio(&labels);
         // Exactly one audio label per STN slot 1..=11.
         let slot1: Vec<_> = a.iter().filter(|l| l.stream_number == 1).collect();
@@ -466,7 +466,7 @@ mod tests {
     }
 
     /// The `rnib` described-video mapping in isolation, plus the commentary
-    /// path (no real Life of Pi track uses it, so it is pinned synthetically).
+    /// path (no track in the sample manifest uses it, so it is pinned synthetically).
     #[test]
     fn audio_purpose_mapping() {
         assert_eq!(audio_purpose("feature"), LabelPurpose::Normal);

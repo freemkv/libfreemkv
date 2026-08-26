@@ -258,7 +258,7 @@ pub fn ts_packet_total(unit: &[u8]) -> usize {
 /// the freebie `is_clean_ts` skips at packet 0); packs 1 and 2 (offsets 2048 and
 /// 4096) are in the encrypted region, so a wrong key garbles them and this returns
 /// false (64 bits of discrimination). Validated against real decrypted HD-DVD
-/// `.evo` (ANCHORMAN / SHAUN_OF_THE_DEAD): pack starts are exactly 2048-aligned,
+/// `.evo` (two real retail titles): pack starts are exactly 2048-aligned,
 /// three per aligned unit, at offsets 0 / 2048 / 4096.
 ///
 /// UNVERIFIED-HDDVD-DECRYPT (2 of 2): the pack STRUCTURE here is confirmed on
@@ -799,7 +799,7 @@ mod tests {
     // ── Padding-aware IsDecryptable (fragment-tail recovery) ───────────────
     //
     // A content fragment can end mid-unit, with the disc zero-padding the rest
-    // of the aligned unit to the next fragment (proven on Dunkirk: ~11 real
+    // of the aligned unit to the next fragment (proven on a real disc: ~11 real
     // video packets + source-zero pad). `decrypt_unit` must accept such a unit
     // — its real packets decrypt; the source-zero tail is padding, not content
     // — while still REJECTING a unit whose undecryptable tail is non-zero (a
@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn fragment_tail_with_source_zero_pad_is_decryptable() {
-        // 11 real content packets, then source-zero padding (the Dunkirk shape).
+        // 11 real content packets, then source-zero padding (a real-disc fragment shape).
         let key = [0x5Au8; 16];
         let mut unit = tail_filled_unit(&key, 11, 0x00);
         decrypt_unit(&mut unit, &key);
@@ -1000,7 +1000,7 @@ mod tests {
         use crate::disc::ContentFormat;
         // Clean HD-DVD `.evo` Program-Stream unit: pack_start_code `00 00 01 BA`
         // at each 2048-byte pack boundary (0/2048/4096) — the layout validated
-        // against real decrypted ANCHORMAN / SHAUN_OF_THE_DEAD `.evo`. Offset 0 is
+        // against real decrypted retail HD-DVD `.evo`. Offset 0 is
         // the clear-seed freebie; the packs at 2048/4096 are encrypted and are
         // what actually discriminate a key.
         let mut ps = vec![0u8; ALIGNED_UNIT_LEN];

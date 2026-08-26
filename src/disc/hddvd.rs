@@ -166,7 +166,7 @@ fn sniff_video_codec(es: &[u8]) -> Option<Codec> {
 
 /// Sniff an audio codec from a `private_stream_1` sub-stream sample. Today only
 /// Dolby Digital Plus (E-AC-3) is recognized — its `0x0B77` syncword — which is
-/// what ANCHORMAN / SHAUN carry on sub-ids `0xC0..=0xC7`. Returns `None` for an
+/// what real retail HD-DVD titles carry on sub-ids `0xC0..=0xC7`. Returns `None` for an
 /// unrecognized sample so the caller drops the stream rather than mislabeling it.
 fn sniff_audio_codec(es: &[u8]) -> Option<Codec> {
     let has_sync = es.windows(2).any(|w| w[0] == 0x0B && w[1] == 0x77);
@@ -197,9 +197,9 @@ fn probe_evo_streams(
     let mut demux = PsDemuxer::new();
     let mut video: Vec<u8> = Vec::new();
     // Routing PID of the video track, captured from the first video PES seen:
-    // `DVD_VIDEO_PID` for a plain 0xE0-0xEF stream (Anchorman's H.264 on 0xE2),
+    // `DVD_VIDEO_PID` for a plain 0xE0-0xEF stream (a real disc's H.264 on 0xE2),
     // or `0xFD00 | stream_id_extension` for an HD-DVD extended-stream-id video
-    // (Shaun's VC-1 on 0xFD ext 0x55). Kept in lockstep with `PsPacket::dvd_pid`
+    // (a real disc's VC-1 on 0xFD ext 0x55). Kept in lockstep with `PsPacket::dvd_pid`
     // so the emitted `Stream` PID matches what the demuxer routes at mux time.
     let mut video_pid: Option<u16> = None;
     // sub_id -> ES sample, ordered so audio tracks surface in sub-id order.
@@ -1355,7 +1355,7 @@ mod tests {
 
     #[test]
     fn is_feature_clip_matches_the_feature_naming_variants() {
-        // Layer-break split (Shaun / Anchorman) and the divide form (Harry Potter).
+        // Layer-break split (seen on real discs) and the divide form (also seen on real discs).
         assert!(is_feature_clip("FEATURE_1.EVO"));
         assert!(is_feature_clip("FEATURE_2.EVO"));
         assert!(is_feature_clip("feature.EVO"));
@@ -1784,7 +1784,7 @@ mod tests {
     }
 
     /// Synthetic EVO program-stream: pack header, a video PES (H.264 SPS+IDR on
-    /// stream_id 0xE2, exactly as ANCHORMAN carries it), two DD+ audio PES
+    /// stream_id 0xE2, exactly as a real retail disc carries it), two DD+ audio PES
     /// (sub-ids 0xC0/0xC1, each with the 4-byte sub-header + E-AC-3 syncword),
     /// then program-end.
     fn synthetic_evo() -> Vec<u8> {
@@ -1793,7 +1793,7 @@ mod tests {
         d.extend_from_slice(&[
             0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3, 0xF8,
         ]);
-        // Video PES on stream_id 0xE2 (Anchorman's H.264 sub-id in the 0xE0-0xEF
+        // Video PES on stream_id 0xE2 (a real disc's H.264 sub-id in the 0xE0-0xEF
         // range): SPS (type 7) + IDR (type 5) Annex-B.
         let video_es = [
             0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, 0xAB, 0xCD, // SPS
@@ -1954,7 +1954,7 @@ mod tests {
     }
 
     /// Synthetic EVO carrying VC-1 video on the extended-stream-id 0xFD (ext
-    /// 0x55), as SHAUN OF THE DEAD does, plus one DD+ audio PES.
+    /// 0x55), as a real retail HD-DVD title does, plus one DD+ audio PES.
     fn synthetic_evo_vc1() -> Vec<u8> {
         let mut d = Vec::new();
         d.extend_from_slice(&[

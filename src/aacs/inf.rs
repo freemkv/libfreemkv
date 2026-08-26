@@ -228,7 +228,7 @@ const VTKF_AV_FLG: u8 = 0x80;
 /// The prior parser used a 32-byte stride (a 12-byte pad instead of the 16-byte
 /// binding MAC). That reads entry #1 correctly but drifts +4 bytes per entry
 /// after it, so it only decrypted single-CPS-unit discs; every multi-key VTKF
-/// (Freedom, Harry Potter) yielded garbage keys for CPS unit ≥2.
+/// (real multi-CPS-unit HD-DVD titles) yielded garbage keys for CPS unit ≥2.
 pub fn parse_vtkf(data: &[u8]) -> Option<UnitKeyFile> {
     if data.len() < VTKF_HEADER_LEN || &data[..12] != VTKF_MAGIC {
         return None;

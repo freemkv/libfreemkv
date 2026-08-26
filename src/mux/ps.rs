@@ -29,7 +29,7 @@ const PRIVATE_STREAM_1: u8 = crate::consts::pes_stream_id::PRIVATE_STREAM_1;
 const PRIVATE_STREAM_2: u8 = crate::consts::pes_stream_id::PRIVATE_STREAM_2;
 /// Extended stream id (0xFD) — the H.222.0 escape whereby the real stream id is
 /// the `stream_id_extension` carried in the PES extension. HD-DVD `.evo` puts its
-/// VC-1 video (and HD audio) here (Shaun of the Dead: VC-1 on `0xFD` ext `0x55`);
+/// VC-1 video (and HD audio) here (a real HD-DVD title: VC-1 on `0xFD` ext `0x55`);
 /// a transport stream never uses it. The elementary-stream bytes follow the PES
 /// header exactly like any other PES — only the routing key differs.
 const EXTENDED_STREAM_ID: u8 = 0xFD;
@@ -611,8 +611,8 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
             0x80..=0x8F => 4, // AC3/DTS: sub_id + frame_count + access_unit_ptr(2)
             // HD-DVD Dolby Digital Plus (E-AC-3): the sub-header is the same
             // 4-byte shape as DVD AC-3 — sub_id + number_of_frames(1) +
-            // first_access_unit_pointer(2). Verified empirically on ANCHORMAN
-            // EVO: across every 0xC0..=0xC7 packet the 0x0B77 E-AC-3 syncword
+            // first_access_unit_pointer(2). Verified empirically on a real
+            // HD-DVD EVO: across every 0xC0..=0xC7 packet the 0x0B77 E-AC-3 syncword
             // sits `first_access_unit_pointer` bytes past this 4-byte header
             // (the leading bytes are the tail of the previous frame). Stripping
             // exactly these 4 bytes on EVERY packet yields a clean, continuous
@@ -1581,7 +1581,7 @@ mod tests {
         // Just outside the range.
         assert_eq!(dvd_audio_pid(0xBF), None);
         assert_eq!(dvd_audio_pid(0xC8), None);
-        // Four DD+ tracks (ANCHORMAN) get four distinct PIDs.
+        // Four DD+ tracks (as seen on a real disc) get four distinct PIDs.
         let pids: Vec<u16> = (0xC0u8..=0xC3).map(|s| dvd_audio_pid(s).unwrap()).collect();
         assert_eq!(pids, vec![0xBDC0, 0xBDC1, 0xBDC2, 0xBDC3]);
         // And route through dvd_pid on a private_stream_1 packet.
