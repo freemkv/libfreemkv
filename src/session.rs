@@ -464,7 +464,7 @@ const AACS_PROBE_UNITS: usize = 8;
 /// The extra step over `scan_iso` is the encryption verdict.
 /// `Disc::scan_with` decides `encrypted` STRUCTURALLY, from the presence of an
 /// `/AACS` or `/BDMV/AACS` directory (see `disc::aacs_dir_present`). For the common
-/// case — a MakeMKV-style backup, which strips `AACS/` — that already gives the
+/// case — a typical disc backup, which strips `AACS/` — that already gives the
 /// right answer, and `DecryptKeys::None` is a pass-through. But a folder copied
 /// verbatim from a decrypted disc keeps `AACS/`, and the tree shape then claims
 /// encryption over content that is already in the clear: the rip would fail

@@ -1938,8 +1938,8 @@ mod tests {
 
     /// Regression test for issue freemkv#25 (NTSC chapter drift).
     ///
-    /// Builds a PGC from the real cell table of the DOLL_MASTERS_7 disc in the
-    /// bug report and checks the chapter marks against MakeMKV's values. Before
+    /// Builds a PGC from the real cell table of the disc in the
+    /// bug report and checks the chapter marks against the reference tool's values. Before
     /// the fix, chapter 14 landed 4.019 s early; the drift was proportional to
     /// elapsed time (0.1%), so a short synthetic fixture would not have caught it.
     #[test]
@@ -1987,7 +1987,7 @@ mod tests {
         }
 
         let title = parse_pgc(&pgc, 0, pgm.len() as u16).unwrap();
-        // MakeMKV / source truth, in seconds.
+        // Reference / source truth, in seconds.
         let expected = [
             0.0,
             62.062,
