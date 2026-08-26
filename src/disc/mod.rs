@@ -2949,24 +2949,26 @@ impl Disc {
     /// current report; the per-unlocker runtime signal is computed here because
     /// the library owns unlock semantics AND the disc/drive state.
     ///
-    /// The distinction matters: on a LibreDrive drive, LibreDrive's firmware route
-    /// removes the AACS bus and reads the VID, so the AACS host-cert unlocker
-    /// never runs — it "matched" (AACS disc) but did nothing. `did-work` reports
-    /// that honestly (`AACS: no`), and on a *stock* drive that fell back to the
-    /// cert route it reports `LibreDrive: no, AACS: yes` — the real diagnostic.
+    /// The distinction matters: on a drive taken by the firmware bus-unlock
+    /// route, that route removes the AACS bus and reads the VID, so the AACS
+    /// host-cert unlocker never runs — it "matched" (AACS disc) but did nothing.
+    /// `did-work` reports that honestly (`AACS: no`), and on a *stock* drive that
+    /// fell back to the cert route it reports `MT1959: no, AACS: yes` — the real
+    /// diagnostic.
     pub fn unlocker_matrix(&self, drive: &crate::Drive) -> Vec<(&'static str, bool)> {
         // The drive-prep unlocker that actually ran (recorded on init):
-        // "LibreDrive" (MediaTek) or "Renesas" — mutually exclusive per drive.
+        // "MT1959" (drive-firmware bus-unlock route) or "Renesas" (cert route) —
+        // mutually exclusive per drive.
         let prep = drive.unlocker_name();
-        // Only LibreDrive (MediaTek) removes AACS bus encryption AT THE DRIVE;
-        // Renesas unlocks features but leaves the bus to the cert.
-        let ld_removed_bus = prep == Some("LibreDrive");
+        // Only the firmware bus-unlock route removes AACS bus encryption AT THE
+        // DRIVE; the Renesas route unlocks features but leaves the bus to the cert.
+        let ld_removed_bus = prep == Some("MT1959");
         crate::unlock_bridge::unlocker_names()
             .into_iter()
             .map(|name| {
                 let did_work = match name {
                     // Each firmware unlocker did work iff it was the one that ran.
-                    "LibreDrive" => ld_removed_bus,
+                    "MT1959" => ld_removed_bus,
                     "Renesas" => prep == Some("Renesas"),
                     // The AACS host-cert route removed the bus ONLY when the
                     // firmware didn't (stock or Renesas drive) AND AACS state was

@@ -1211,7 +1211,7 @@ mod tests {
     /// 2048-byte sector, and each call built its own AES-128 key schedule, so a
     /// 6144-byte aligned unit performed THREE key expansions under the same
     /// loop-invariant `read_data_key`. On a 90 GB UHD read on a stock (non-
-    /// LibreDrive) drive — ~14.6 million aligned units — that is ~29 million
+    /// firmware-unlocked) drive — ~14.6 million aligned units — that is ~29 million
     /// redundant expansions on the per-unit decrypt hot path, for a key that is
     /// constant for the whole disc. The counter is incremented inside
     /// `crypto::new_cipher`, the single construction site.

@@ -535,9 +535,10 @@ impl Drive {
             crate::unlock_bridge::run_features(self.scsi.as_mut(), &self.drive_id);
         let r: Result<()> = match unlock_res {
             Ok(unlocked) => {
-                // Record WHICH drive-prep unlocker actually ran — "LibreDrive"
-                // (MediaTek) or "Renesas" — not the ld-only identity lookup, so a
-                // Renesas drive reports itself honestly rather than as nothing.
+                // Record WHICH drive-prep unlocker actually ran — "MT1959" (the
+                // drive-firmware bus-unlock route) or "Renesas" (the cert route) —
+                // not the ld-only identity lookup, so a Renesas drive reports
+                // itself honestly rather than as nothing.
                 self.unlocker_name = Some(matched.to_string());
                 // Stash the OEM Volume ID the unlocker returned for the AACS
                 // handshake phase (do_handshake reads it via `oem_vid()`). A
