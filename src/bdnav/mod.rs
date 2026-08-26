@@ -1,13 +1,13 @@
 //! BD/UHD HDMV navigation resolver — "mimic a real player" for main-feature
 //! title selection. It reads `/BDMV/index.bdmv` + `/BDMV/MovieObject.bdmv` and
-//! runs a faithful, bounded HDMV navigation VM (libbluray semantics) to find the
-//! playlist the disc's own First-Play navigation plays as the feature.
+//! runs a faithful, bounded HDMV navigation VM to find the playlist the disc's
+//! own First-Play navigation plays as the feature.
 //!
-//! There is NO vendor special-casing: one correctly-booted VM resolves the
-//! obfuscated Sony dispatcher and every other HDMV disc alike. The honest
-//! boundary is BD-J (the feature is chosen by a Java Xlet, not by the HDMV VM);
-//! there — and on any malformed data or non-convergence — the resolver ABSTAINS
-//! (`None`) and selection falls back to the structural/heuristic order.
+//! There is no per-disc special-casing: one correctly-booted VM resolves
+//! densely-branched dispatchers as well as simple ones. The honest boundary is
+//! BD-J (the feature is chosen by a Java Xlet, not by the HDMV VM); there — and
+//! on any malformed data or non-convergence — the resolver ABSTAINS (`None`)
+//! and selection falls back to the structural/heuristic order.
 //!
 //! Contract: read-only, bounded, and never panics or hard-fails.
 

@@ -32,8 +32,8 @@ pub(crate) struct MovieObject {
 }
 
 const CMD_LEN: usize = 12;
-/// Sanity caps (real discs are far under these; the Sony dispatcher is ~2253
-/// commands in one object).
+/// Sanity caps (real discs are far under these; some densely-branched
+/// dispatchers run several thousand commands in one object).
 const MAX_OBJECTS: usize = 4096;
 const MAX_CMDS: usize = 200_000;
 

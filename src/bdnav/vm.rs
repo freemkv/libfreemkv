@@ -1,29 +1,29 @@
 //! The HDMV navigation VM — a faithful, bounded re-implementation of the subset
-//! of libbluray's `hdmv_vm.c` needed to follow First-Play to the feature
-//! `PlayPlayList`. It "mimics a real player": correct power-on register state
-//! (libbluray `register.c` `bd_psr_init`) is what makes an obfuscated dispatcher
-//! (e.g. Sony's) converge rather than loop. Never panics; hard step/switch caps.
+//! of HDMV navigation semantics needed to follow First-Play to the feature
+//! `PlayPlayList`. It "mimics a real player": correct power-on register state is
+//! what lets a densely-branched dispatcher converge on the feature rather than
+//! loop. Never panics; hard step/switch caps.
 //!
-//! It resolves generically — there is no vendor special-casing. When First-Play
-//! is a BD-J title (the feature is chosen by a Java Xlet), or the program does
-//! not reach a `PlayPL` on a caller-approved feature candidate, it abstains
-//! (`None`) and selection falls back to the structural/heuristic order.
+//! It resolves generically — there is no per-disc special-casing. When
+//! First-Play is a BD-J title (the feature is chosen by a Java Xlet), or the
+//! program does not reach a `PlayPL` on a caller-approved feature candidate, it
+//! abstains (`None`) and selection falls back to the structural/heuristic order.
 
 use super::index::{Index, PlaybackObj};
 use super::mobj::MovieObject;
 
 /// Top bit of an operand selects PSR (else GPR).
 const PSR_FLAG: u32 = 0x8000_0000;
-/// Mirror of libbluray `MAX_LOOP`.
+/// Upper bound on VM steps before declaring non-convergence.
 const MAX_STEPS: usize = 1_000_000;
-/// Cap on object/title switches — the obfuscated dispatcher runs in one object;
-/// this only bounds pathological jump chains.
+/// Cap on object/title switches — a dispatcher runs in one object; this only
+/// bounds pathological jump chains.
 const MAX_SWITCHES: usize = 1024;
 
-/// libbluray `bd_psr_init` power-on defaults (indices 0..=61); unlisted = 0. The
+/// BD player power-on register defaults (indices 0..=61); unlisted = 0. The
 /// load-bearing values are PSR4/5 = `0xffff` ("no title/chapter selected") and
-/// PSR6/7/8 = 0, which steer the dispatcher's compares; the rest are copied for
-/// fidelity.
+/// PSR6/7/8 = 0, which steer dispatcher compares; the rest are set for fidelity
+/// with real player behavior.
 fn psr_init() -> [u32; 128] {
     let mut p = [0u32; 128];
     let vals: &[(usize, u32)] = &[
@@ -76,9 +76,9 @@ impl Vm<'_> {
         }
     }
     fn wr(&mut self, val: u32, x: u32) {
-        // A store to a PSR-tagged register is refused (libbluray `_store_reg`
-        // returns -1); only GPR writes take effect. PSR values come from the
-        // system (power-on `psr_init`), never from a nav SET/SWAP operand.
+        // Per the HDMV nav spec, a store to a PSR-tagged register is refused;
+        // only GPR writes take effect. PSR values come only from power-on init,
+        // never from a nav SET/SWAP operand.
         if val & PSR_FLAG == 0 {
             self.gpr[(val & 0xfff) as usize] = x;
         }
@@ -87,9 +87,8 @@ impl Vm<'_> {
         if imm { raw } else { self.rd(raw) }
     }
     /// Resolve a JumpTitle target: title 0 = Top Menu, `1..=N` = `titles[i-1]`,
-    /// `0xFFFF` = First Play (BD-ROM title numbering, per libbluray
-    /// `_is_valid_title`). Any other value is an invalid title reference and
-    /// abstains (`None`).
+    /// `0xFFFF` = First Play (BD-ROM title numbering). Any other value is an
+    /// invalid title reference and abstains (`None`).
     fn title_obj(&self, title: u32) -> Option<PlaybackObj> {
         let n = self.index.titles.len() as u32;
         if title == 0 {
@@ -229,9 +228,8 @@ fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Opti
                     0x01 => Some(src), // MOVE
                     0x02 => {
                         // SWAP exchanges the two operands; a store to an operand
-                        // flagged immediate is refused (libbluray `_store_result`
-                        // honours imm_op1/imm_op2), and `wr` already drops PSR
-                        // stores.
+                        // flagged immediate is refused, and `wr` already drops
+                        // PSR stores.
                         if !c.imm_op1 {
                             vm.wr(c.dst, src);
                         }
@@ -324,8 +322,8 @@ mod tests {
 
     #[test]
     fn abstains_when_first_play_jumps_to_bdj_title() {
-        // SM3 shape: First-Play HDMV computes a title number in a GPR and
-        // JumpTitles to it; the target title is BD-J → abstain (None).
+        // Computed-title-number shape: First-Play computes a title number in a
+        // GPR and JumpTitles to it; the target title is BD-J → abstain (None).
         let d = build(&[&[set_move_gpr(0xFEB & 0xfff, 2), {
             // JumpTitle with dst = GPR[0xFEB].
             cmd((1 << 5) | 1, 0x01, 0, 0, 0x0000_0FEB, 0)
@@ -349,8 +347,8 @@ mod tests {
 
     #[test]
     fn jumptitle_first_play_is_0xffff_not_n_plus_1() {
-        // BD-ROM title numbering (libbluray `_is_valid_title`): 0 = Top Menu,
-        // 0xFFFF = First Play, 1..=N = titles. `N+1` is an INVALID title ref.
+        // BD-ROM title numbering: 0 = Top Menu, 0xFFFF = First Play,
+        // 1..=N = titles. `N+1` is an INVALID title ref.
         let index = idx(
             PlaybackObj::Hdmv { id_ref: 7 },
             vec![PlaybackObj::Hdmv { id_ref: 1 }],
@@ -381,8 +379,8 @@ mod tests {
 
     #[test]
     fn set_to_psr_is_refused() {
-        // A SET MOVE to PSR6 must be a no-op (libbluray `_store_reg` refuses PSR
-        // stores). Program: MOVE PSR6 <- 5; CMP PSR6 == 5; PlayPL 100 else 200.
+        // A SET MOVE to PSR6 must be a no-op (PSR stores are refused by spec).
+        // Program: MOVE PSR6 <- 5; CMP PSR6 == 5; PlayPL 100 else 200.
         // With the write refused, PSR6 stays at its power-on 0, so the compare is
         // false and control skips to PlayPL 200. If the illegal PSR write took
         // effect, the compare would be true and PlayPL 100 would win.

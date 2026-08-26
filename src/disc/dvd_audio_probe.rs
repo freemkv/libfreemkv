@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 /// a DVD feature opens with logos/warnings whose audio is frequently a thin 2.0
 /// bed on the FIRST sub-stream only — the other physical `0x8x` sub-streams and
 /// the main 5.1 mix do not appear until a sector or two further in. 512 sectors
-/// (1 MiB) was too short: on Greenland it saw ONLY `0x80`, and only its opening
+/// (1 MiB) was too short: on one real disc it saw ONLY `0x80`, and only its opening
 /// 2.0 frames. 1024 sectors (2 MiB) reliably contains at least one frame of
 /// every physical AC-3 sub-stream AND enough of `0x80` to reach its 5.1 frames.
 /// Still bounded so a live drive is never hammered (see the project "don't
@@ -54,7 +54,7 @@ const PROBE_SECTORS: u16 = 1024;
 /// The first frame of a sub-stream at the head of a feature is NOT
 /// representative. A DVD opens with logos/warnings, and the main `0x80`
 /// sub-stream there frequently carries a thin 2.0 bed before transitioning to
-/// its real 5.1 main mix a fraction of a second later (observed on Greenland:
+/// its real 5.1 main mix a fraction of a second later (observed on a real disc:
 /// `0x80`'s first frames are acmod=2 → 2 channels, then it becomes acmod=7+lfe →
 /// 6 channels within the same 2 MiB window). Recording only the FIRST frame read
 /// `0x80=2` and missed the 5.1 entirely, defeating the channel-match routing.
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(probed.get(&0x81), Some(&6), "0x81 is the 5.1 main mix");
     }
 
-    /// GREENLAND regression — the probe must read each sub-stream's TRUE
+    /// Real-disc regression — the probe must read each sub-stream's TRUE
     /// (max-mix) channel count, not be poisoned by an unrepresentative head
     /// frame, and must NOT cross-contaminate between sub-streams.
     ///

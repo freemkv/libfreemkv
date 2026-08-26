@@ -8,9 +8,9 @@
 //! PGC/cell tables, PCI/HLI button packets); the VM command decoder is
 //! verified against real discs.
 //!
-//! Current contents: [`vmcmd`] — the VM command decoder (proven against the
-//! SOTL/Greenland test discs); [`nav`] — the First-Play navigation executor
-//! that resolves which title the disc's own navigation selects as the feature.
+//! Current contents: [`vmcmd`] — the VM command decoder; [`nav`] — the
+//! First-Play navigation executor that resolves which title the disc's own
+//! navigation selects as the feature.
 
 pub(crate) mod nav;
 pub(crate) mod vmcmd;
