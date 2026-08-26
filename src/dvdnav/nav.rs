@@ -104,6 +104,11 @@ fn is_sprm(idx: u8) -> bool {
 struct Vm {
     gprm: [u16; 16],
     sprm: [u16; 24],
+    /// Per-GPRM taint: set when the register holds a value derived from a system
+    /// parameter (SPRM). An SPRM read taints a compare directly ([`is_sprm`]);
+    /// this bit tracks an SPRM *laundered through* a GPRM store so a later
+    /// GPRM-only compare that reads it is still recognised as undecidable.
+    gprm_tainted: [bool; 16],
 }
 
 impl Vm {
@@ -111,7 +116,26 @@ impl Vm {
         Self {
             gprm: [0; 16],
             sprm: [0; 24],
+            gprm_tainted: [false; 16],
         }
+    }
+
+    /// Whether a register *operand read* is session-specific: an SPRM read is
+    /// always undecidable at scan time; a GPRM read is undecidable only when the
+    /// register currently holds an SPRM-derived (tainted) value.
+    fn reg_tainted(&self, idx: u8) -> bool {
+        if is_sprm(idx) {
+            true
+        } else {
+            self.gprm_tainted[(idx & 0x0F) as usize]
+        }
+    }
+
+    /// Mark a GPRM's post-state as unknown. Used when a store to it was guarded
+    /// by an undecidable (tainted) predicate: whether the write happened is
+    /// itself unknown, so the destination is conservatively tainted.
+    fn taint_gprm(&mut self, reg: u8) {
+        self.gprm_tainted[(reg & 0x0F) as usize] = true;
     }
 
     /// Read a register operand. Per the VM command model, indices `< 16` are
@@ -130,15 +154,17 @@ impl Vm {
     /// operand read a system parameter (SPRM). An SPRM's value is
     /// player-/session-specific (region, parental level, language) and unknown
     /// at scan time, so a branch decision that depends on one is undecidable —
-    /// the caller abstains rather than commit to the cold-power-on arm. GPRM
-    /// reads never taint (their values are established by the program itself).
+    /// the caller abstains rather than commit to the cold-power-on arm. A GPRM
+    /// read taints only when that register was itself loaded from an SPRM
+    /// (tracked by [`Vm::gprm_tainted`]); a GPRM holding a program-established
+    /// value does not taint.
     fn eval(&self, c: &Compare) -> (bool, bool) {
-        let mut tainted = is_sprm(c.lhs_reg);
+        let mut tainted = self.reg_tainted(c.lhs_reg);
         let l = self.reg(c.lhs_reg);
         let r = if c.immediate {
             c.imm
         } else {
-            tainted |= is_sprm(c.rhs_reg);
+            tainted |= self.reg_tainted(c.rhs_reg);
             self.reg(c.rhs_reg)
         };
         let result = match c.op {
@@ -160,19 +186,36 @@ impl Vm {
     fn set(&mut self, reg: u8, op: u8, immediate: bool, imm: u16, src: u8) {
         let idx = (reg & 0x0F) as usize;
         let v = if immediate { imm } else { self.reg(src) };
+        // The value's taint follows its inputs: an immediate is concrete
+        // (untainted); a register source carries its own taint ([`reg_tainted`]
+        // covers both a direct SPRM read and a laundered GPRM).
+        let src_tainted = !immediate && self.reg_tainted(src);
         let cur = self.gprm[idx];
-        self.gprm[idx] = match op {
-            1 => v,                                 // mov
-            3 => cur.wrapping_add(v),               // add
-            4 => cur.wrapping_sub(v),               // sub
-            5 => cur.wrapping_mul(v),               // mul
-            6 => cur.checked_div(v).unwrap_or(cur), // div (÷0 → unchanged)
-            7 => cur.checked_rem(v).unwrap_or(cur), // mod (÷0 → unchanged)
-            9 => cur & v,                           // and
-            10 => cur | v,                          // or
-            11 => cur ^ v,                          // xor
-            _ => cur,                               // swap/rnd/unmodelled
+        let cur_tainted = self.gprm_tainted[idx];
+        // Each arm sets (new value, new taint). `mov` overwrites, so its taint is
+        // the source's alone — this is what CLEARS a prior taint on a concrete
+        // store. The accumulating ops fold the source into the current value, so
+        // their taint is the union. Unmodelled ops leave value and taint intact.
+        let (nv, nt) = match op {
+            1 => (v, src_tainted),                                  // mov
+            3 => (cur.wrapping_add(v), cur_tainted || src_tainted), // add
+            4 => (cur.wrapping_sub(v), cur_tainted || src_tainted), // sub
+            5 => (cur.wrapping_mul(v), cur_tainted || src_tainted), // mul
+            6 => (
+                cur.checked_div(v).unwrap_or(cur),
+                cur_tainted || src_tainted,
+            ), // div (÷0 → unchanged)
+            7 => (
+                cur.checked_rem(v).unwrap_or(cur),
+                cur_tainted || src_tainted,
+            ), // mod (÷0 → unchanged)
+            9 => (cur & v, cur_tainted || src_tainted),             // and
+            10 => (cur | v, cur_tainted || src_tainted),            // or
+            11 => (cur ^ v, cur_tainted || src_tainted),            // xor
+            _ => (cur, cur_tainted),                                // swap/rnd/unmodelled
         };
+        self.gprm[idx] = nv;
+        self.gprm_tainted[idx] = nt;
     }
 }
 
@@ -247,28 +290,40 @@ fn run_first_play(cmds: &[[u8; 8]]) -> Option<u8> {
 
         let cmd = vmcmd::decode(&cmds[pc]);
 
-        // A guarded command's predicate decides the branch. If that decision
-        // read a system parameter (SPRM), it is undecidable at scan time —
-        // abstain so the caller keeps the structural fallback rather than
-        // committing to the cold-power-on arm. Otherwise a false predicate
-        // falls through to the next command line.
-        if let Some(cmp) = cmd.compare {
-            let (taken, tainted) = vm.eval(&cmp);
-            if tainted {
-                return None;
-            }
-            if !taken {
-                pc += 1;
-                continue;
-            }
+        // A guarded command's predicate decides whether its instruction runs.
+        // `taken` is the predicate result; `tainted` marks it undecidable at scan
+        // time (it read a system parameter, directly or laundered through a
+        // GPRM). A command with no predicate always runs and is never tainted.
+        let (taken, tainted) = match cmd.compare {
+            Some(cmp) => vm.eval(&cmp),
+            None => (true, false),
+        };
+
+        // A decidable false predicate skips this line — no effect, taint
+        // unchanged. When the predicate is tainted we cannot decide `taken`, so
+        // we do not skip; the per-instruction handling below is conservative.
+        if !tainted && !taken {
+            pc += 1;
+            continue;
         }
 
         match cmd.instr {
-            // Title dispatch: the answer we are looking for.
-            Instr::JumpTt { ttn } => return Some(ttn),
+            // Title dispatch — a control transfer, the answer we are looking for.
+            // Abstain only when an undecidable predicate gates it: committing
+            // would pick the cold-power-on arm of an SPRM-dependent decision.
+            Instr::JumpTt { ttn } => {
+                if tainted {
+                    return None;
+                }
+                return Some(ttn);
+            }
 
-            // Control flow within the pre list (Goto lines are 1-based).
+            // Control flow within the pre list (Goto lines are 1-based) — also a
+            // control transfer, so an undecidable guard abstains.
             Instr::Goto { line } => {
+                if tainted {
+                    return None;
+                }
                 let l = line as usize;
                 if l == 0 || l > cmds.len() {
                     return None;
@@ -277,16 +332,28 @@ fn run_first_play(cmds: &[[u8; 8]]) -> Option<u8> {
                 continue;
             }
 
-            // Register preparation before a dispatch.
+            // Register preparation before a dispatch — a store, not a control
+            // transfer, so a tainted guard does NOT abstain. If the guard is
+            // undecidable we do not know whether the store ran, so the
+            // destination's post-state is unknown → taint it. Otherwise apply the
+            // store (which itself propagates or clears the destination's taint).
             Instr::SetGprm {
                 reg,
                 op,
                 immediate,
                 imm,
                 src,
-            } => vm.set(reg, op, immediate, imm, src),
+            } => {
+                if tainted {
+                    vm.taint_gprm(reg);
+                } else {
+                    vm.set(reg, op, immediate, imm, src);
+                }
+            }
 
-            // No-effect (for resolution) instructions: keep executing.
+            // No-effect (for resolution) instructions: keep executing. SetSystem
+            // writes an SPRM (never a GPRM in this decoder), and SPRM reads are
+            // caught at read time, so no GPRM taint is needed here.
             Instr::Nop | Instr::SetSystem => {}
 
             // Everything else leaves the deterministically-followable path:
@@ -522,6 +589,98 @@ mod tests {
             Some(ResolvedTitle {
                 title: 1,
                 vtsn: 6,
+                vts_ttn: 1
+            })
+        );
+    }
+
+    /// Defect-1 regression (over-abstention): a store guarded by an SPRM-tainted
+    /// compare does NOT gate a control transfer, so it must not abstain. Here
+    /// `if SPRM0 == g0 -> g0 = 5` (a guarded store) is followed by an
+    /// UNCONDITIONAL `JumpTT 1`. The tainted predicate only decides whether the
+    /// store runs; the dispatch that follows is SPRM-independent, so the resolver
+    /// must resolve to title 1.
+    #[test]
+    fn sprm_guarded_store_then_unconditional_dispatch_resolves() {
+        // line 0: 71 20 | lhs=b2=0x80 (SPRM0), cmp EQ(op=2, register), rhs=b7=0
+        //         (g0)  → tainted guard; SetGPRM g0 = imm(bytes4-5)=5 (mov).
+        // line 1: unconditional JumpTT 1.
+        let vmgi = build_vmgi(
+            &[h("7120800000050000"), h("3002000000010000")],
+            1,
+            &[(2, 1)],
+        );
+        assert_eq!(
+            resolve_from_vmg(&vmgi),
+            Some(ResolvedTitle {
+                title: 1,
+                vtsn: 2,
+                vts_ttn: 1
+            })
+        );
+    }
+
+    /// Defect-2 regression (under-abstention): an SPRM laundered through a GPRM
+    /// must still taint a later branch. `SetGPRM g0 = SPRM20` (register source,
+    /// index >= 128) followed by `if g0 == g1 -> JumpTT 1` — the compare reads
+    /// only GPRMs, but g0 now holds an SPRM-derived value, so the decision is
+    /// undecidable and the resolver must abstain.
+    #[test]
+    fn sprm_laundered_through_gprm_abstains() {
+        // line 0: 61 00 | SetGPRM g0 = SPRM20 (mov, register src=b5=0x94).
+        // line 1: 30 22 | if g0 == g1 -> JumpTT 1 (both 0 on cold machine).
+        let vmgi = build_vmgi(
+            &[h("6100000000940000"), h("3022000000010001")],
+            1,
+            &[(2, 1)],
+        );
+        assert_eq!(resolve_from_vmg(&vmgi), None);
+    }
+
+    /// Guard: an unconditional immediate store CLEARS a prior taint (no sticky
+    /// latch). Taint g0 from an SPRM, overwrite it with an immediate, then branch
+    /// on g0 — the branch is now decidable and must resolve, not abstain.
+    #[test]
+    fn unconditional_immediate_store_clears_taint() {
+        // line 0: SetGPRM g0 = SPRM20 (taints g0).
+        // line 1: SetGPRM g0 = imm 0 (mov, immediate) → clears taint, g0 = 0.
+        // line 2: if g0 == g1 -> JumpTT 1 (both 0) → resolves.
+        let vmgi = build_vmgi(
+            &[
+                h("6100000000940000"),
+                h("7100000000000000"),
+                h("3022000000010001"),
+            ],
+            1,
+            &[(2, 1)],
+        );
+        assert_eq!(
+            resolve_from_vmg(&vmgi),
+            Some(ResolvedTitle {
+                title: 1,
+                vtsn: 2,
+                vts_ttn: 1
+            })
+        );
+    }
+
+    /// Guard: copying an UNtainted GPRM does not taint the destination. `g0 = g1`
+    /// (register source, g1 untainted) then `if g0 == g2 -> JumpTT 1` must
+    /// resolve (no SPRM ever entered g0).
+    #[test]
+    fn gprm_copy_of_untainted_gprm_does_not_taint() {
+        // line 0: 61 00 | SetGPRM g0 = g1 (mov, register src=b5=1).
+        // line 1: 30 22 | if g0 == g2 -> JumpTT 1 (both 0) → resolves.
+        let vmgi = build_vmgi(
+            &[h("6100000000010000"), h("3022000000010002")],
+            1,
+            &[(2, 1)],
+        );
+        assert_eq!(
+            resolve_from_vmg(&vmgi),
+            Some(ResolvedTitle {
+                title: 1,
+                vtsn: 2,
                 vts_ttn: 1
             })
         );
