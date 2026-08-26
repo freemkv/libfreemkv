@@ -163,9 +163,11 @@ fn be16(b: &[u8; 8], o: usize) -> u16 {
 // nibble is always `byte1` bits 6-4; the immediate flag is `byte1` bit 7. The
 // operand *offsets* differ by command family.
 //
-// v1 (special + link): lhs reg = b[3]; rhs imm = bytes4-5 / rhs reg = b[4].
+// v1 (special + link): lhs reg = b[3]; rhs imm = bytes4-5 / rhs reg = b[5]
+//   (the register operand is the low byte of the reg-or-immediate field).
 // v2 (jump + system-set): lhs reg = b[6]; rhs reg = b[7] (registers only).
-// v3 (set-GPRM): lhs reg = b[2]; rhs imm = bytes6-7 / rhs reg = b[6].
+// v3 (set-GPRM): lhs reg = b[2]; rhs imm = bytes6-7 / rhs reg = b[7]
+//   (the register operand is the low byte of the reg-or-immediate field).
 fn if_v1(b: &[u8; 8]) -> Option<Compare> {
     let op = (b[1] >> 4) & 7;
     (op != 0).then(|| Compare {
@@ -173,7 +175,7 @@ fn if_v1(b: &[u8; 8]) -> Option<Compare> {
         lhs_reg: b[3],
         immediate: b[1] >> 7 != 0,
         imm: be16(b, 4),
-        rhs_reg: b[4],
+        rhs_reg: b[5],
     })
 }
 fn if_v2(b: &[u8; 8]) -> Option<Compare> {
@@ -193,7 +195,7 @@ fn if_v3(b: &[u8; 8]) -> Option<Compare> {
         lhs_reg: b[2],
         immediate: b[1] >> 7 != 0,
         imm: be16(b, 6),
-        rhs_reg: b[6],
+        rhs_reg: b[7],
     })
 }
 
@@ -382,16 +384,32 @@ mod tests {
         );
     }
 
-    // if_version_1 register compare: rhs register is byte4 (not byte5).
+    // if_version_1 register compare: the register operand is the LOW byte of the
+    // reg-or-immediate field (byte5), NOT the high byte (byte4). Distinct values
+    // in byte4 (0xAA) vs byte5 (0x05) pin the field down.
     #[test]
-    fn link_register_compare_rhs_is_byte4() {
-        // 20 26: link, cmp=EQ(2), dircmp=0(register) ; cmd=6 LinkPGN
-        let c = decode(&h("2026000304000002"));
+    fn link_register_compare_rhs_is_low_byte() {
+        // 20 26: link, cmp=EQ(2), dircmp=0(register) ; cmd=6 LinkPGN (pgn=byte7=2)
+        let c = decode(&h("20260003aa050002"));
         assert_eq!(c.instr, Instr::LinkPgn { pgn: 2 });
         let cmp = c.compare.expect("conditional");
         assert!(!cmp.immediate);
         assert_eq!(cmp.lhs_reg, 3);
-        assert_eq!(cmp.rhs_reg, 4);
+        assert_eq!(cmp.rhs_reg, 5); // low byte of bytes4-5, not the 0xAA high byte
+    }
+
+    // if_version_3 (set-GPRM) register compare: the register operand is the LOW
+    // byte of the reg-or-immediate field (byte7), NOT the high byte (byte6).
+    // Distinct values in byte6 (0xBB) vs byte7 (0x07) pin the field down.
+    #[test]
+    fn setgprm_register_compare_rhs_is_low_byte() {
+        // 71 20: set-GPRM (type 3), cmp=EQ(2), dircmp=0(register); lhs=byte2=2.
+        let c = decode(&h("712002000000bb07"));
+        let cmp = c.compare.expect("conditional");
+        assert_eq!(cmp.op, 2);
+        assert!(!cmp.immediate);
+        assert_eq!(cmp.lhs_reg, 2);
+        assert_eq!(cmp.rhs_reg, 7); // low byte of bytes6-7, not the 0xBB high byte
     }
 
     // if_version_2 jump compare: both operands are registers in byte6 / byte7.

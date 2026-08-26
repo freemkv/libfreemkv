@@ -719,8 +719,9 @@ mod tests {
             let mut item = Vec::new();
             item.extend_from_slice(&pi.clip_id); // [0..5]
             item.extend_from_slice(b"M2TS"); // [5..9] codec_id
-            item.push(0); // [9] connection_condition
-            item.extend_from_slice(&[0u8; 2]); // [10..12] reserved
+            item.push(0); // [9] reserved
+            item.push(0); // [10] is_multi_angle (bit 4) + connection_condition (low nibble)
+            item.push(0); // [11] stc_id / reserved
             item.extend_from_slice(&pi.in_time.to_be_bytes()); // [12..16]
             item.extend_from_slice(&pi.out_time.to_be_bytes()); // [16..20]
             item.extend_from_slice(&[0u8; 8]); // [20..28] UO_mask
