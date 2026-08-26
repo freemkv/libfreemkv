@@ -1,4 +1,5 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Coverage](https://codecov.io/gh/freemkv/libfreemkv/branch/dev/graph/badge.svg)](https://codecov.io/gh/freemkv/libfreemkv)
 
 # libfreemkv
 

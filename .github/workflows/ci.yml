@@ -256,3 +256,40 @@ jobs:
         working-directory: autorip
       - run: cargo test --tests
         working-directory: bdemu
+
+  # ── Coverage (non-required, additive) ───────────────────────────────────────
+  #
+  # Reports line coverage to Codecov. Deliberately NOT wired into any release
+  # gate: it is informational only (see codecov.yml) and no other job `needs:`
+  # it. Mirrors the `test` job's layout exactly — same pinned 1.94 toolchain,
+  # same dual checkout so the `../freemkv-unlock` path dep resolves, same cache
+  # workspace and working-directory. cargo-llvm-cov comes as a prebuilt binary
+  # from taiki-e/install-action, so it is toolchain-independent.
+  #
+  # No `--locked`: like the fmt/clippy/test jobs above, this crate's Cargo.lock
+  # is gitignored, so there is nothing to lock against on a fresh runner.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: libfreemkv
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-unlock
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: libfreemkv
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        working-directory: libfreemkv
+      - uses: codecov/codecov-action@v5
+        with:
+          files: libfreemkv/lcov.info
+          slug: freemkv/libfreemkv
+          fail_ci_if_error: false
