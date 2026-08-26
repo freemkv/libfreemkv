@@ -13,7 +13,7 @@
 
 pub(crate) mod index;
 pub(crate) mod mobj;
-mod vm;
+pub(crate) mod vm;
 
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;

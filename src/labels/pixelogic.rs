@@ -445,7 +445,7 @@ fn parse_token_inner(s: &str, mut unknown: Option<&mut UnknownParts>) -> Option<
             // what we know than discard a whole stream over one part,
             // but flag the parse as Medium-confidence so callers know
             // some data was elided.
-            tracing::debug!(part = %part, "pixelogic: unrecognized token component, skipping");
+            tracing::debug!(part = ?part, "pixelogic: unrecognized token component, skipping");
             if let Some(acc) = unknown.as_deref_mut() {
                 acc.record(part);
             }

@@ -110,7 +110,7 @@ pub mod diag;
 pub mod dirimage;
 pub mod disc;
 pub mod drive;
-pub mod dvdnav;
+pub(crate) mod dvdnav;
 pub mod error;
 pub mod event;
 pub mod halt;
