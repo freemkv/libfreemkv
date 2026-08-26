@@ -290,6 +290,7 @@ jobs:
         working-directory: libfreemkv
       - uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: libfreemkv/lcov.info
           slug: freemkv/libfreemkv
           fail_ci_if_error: false
