@@ -268,10 +268,12 @@ impl DiscProfile {
         }
     }
 
-    /// The selected main-feature title. Panics only on an empty disc (no
-    /// titles), which the scan never produces for a real disc.
-    pub fn main_title(&self) -> &TitleProfile {
-        &self.titles[self.main_title]
+    /// The selected main-feature title, or `None` when the disc scanned to zero
+    /// titles (a data-only image with no /BDMV, /HVDVD_TS or /VIDEO_TS). Never
+    /// panics — mirrors the `Option`-returning main-feature accessors elsewhere
+    /// (`titles.first()`, `dvdnav::resolve_main_title`).
+    pub fn main_title(&self) -> Option<&TitleProfile> {
+        self.titles.get(self.main_title)
     }
 }
 
@@ -314,6 +316,15 @@ mod tests {
             css_error: None,
             content_format: ContentFormat::BdTs,
         }
+    }
+
+    #[test]
+    fn main_title_is_none_on_empty_disc() {
+        // A data-only image (no /BDMV, /HVDVD_TS, /VIDEO_TS) scans to zero
+        // titles; main_title() must return None, not panic on titles[0].
+        let profile = DiscProfile::from_disc(&test_disc());
+        assert!(profile.titles.is_empty());
+        assert!(profile.main_title().is_none());
     }
 
     fn video(codec: Codec, res: Resolution, secondary: bool) -> Stream {
@@ -469,7 +480,7 @@ mod tests {
         assert!(profile.titles[0].is_main, "titles[0] is the main feature");
         assert!(!profile.titles[1].is_main);
         assert_eq!(profile.titles[1].index, 1);
-        assert_eq!(profile.main_title().playlist, "00800.mpls");
+        assert_eq!(profile.main_title().unwrap().playlist, "00800.mpls");
     }
 
     #[test]
