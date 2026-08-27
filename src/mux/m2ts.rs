@@ -22,11 +22,9 @@ impl M2tsStream {
     /// Create for writing PES frames → BD-TS output.
     /// Writes FMKV metadata header, then muxes PES frames into BD transport stream.
     pub fn create(mut writer: impl Write + Send + 'static, title: &DiscTitle) -> io::Result<Self> {
-        // Write FMKV metadata header unconditionally. An empty streams
-        // array is valid JSON and round-trips fine; skipping the header
-        // for a zero-stream title would make the output indistinguishable
-        // from a non-FMKV file on read-back (read_header returns
-        // Ok(None) → PMT fallback) even though M2tsStream produced it.
+        // Write FMKV header unconditionally: skipping it for a zero-stream title
+        // would make the output indistinguishable from a non-FMKV file on
+        // read-back (read_header → Ok(None) → PMT fallback). Empty array is valid.
         let m = meta::M2tsMeta::from_title(title);
         meta::write_header(&mut writer, &m)?;
         let pids: Vec<u16> = title
@@ -40,21 +38,17 @@ impl M2tsStream {
             .collect();
         let boxed: Box<dyn Write + Send> = Box::new(writer);
         let mut muxer = super::tsmux::TsMuxer::new(boxed, &pids);
-        // Declare each video track's codec. This one call decides both the ES
-        // framing (HEVC/H.264 arrive length-prefixed and need Annex-B conversion;
-        // MPEG-2 and VC-1 are already start-code ES and would be mangled by it)
-        // and which parameter-set record parser applies (avcC vs hvcC). Passing
-        // the codec rather than a NAL-or-not flag is deliberate: the two facts
-        // must never be able to disagree.
+        // Declaring the codec decides both ES framing (HEVC/H.264 are length-
+        // prefixed → need Annex-B conversion; MPEG-2/VC-1 are already start-code
+        // ES) and which param-set parser applies (avcC vs hvcC) — kept as one fact.
         for (i, s) in title.streams.iter().enumerate() {
             if let DiscStream::Video(v) = s {
                 muxer.set_video_codec(i, v.codec)?;
             }
         }
         for (i, cp) in title.codec_privates.iter().enumerate() {
-            // codec_privates is parallel to streams/pids; ignore any
-            // trailing entries that exceed the track count rather than
-            // surfacing a track-range error for a benign metadata overrun.
+            // codec_privates is parallel to streams/pids; ignore trailing entries
+            // beyond the track count rather than error on a benign metadata overrun.
             if i >= pids.len() {
                 break;
             }
@@ -72,9 +66,8 @@ impl M2tsStream {
 impl crate::pes::Stream for M2tsStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         // Write-only sink. The m2ts:// read direction is served by
-        // `super::resolve::build_m2ts_pipeline` →
-        // `PipelinedPesStream`; routing through this type for reads
-        // was removed when the highway became the only ingress.
+        // `super::resolve::build_m2ts_pipeline` → `PipelinedPesStream`; routing
+        // reads through this type was removed when the highway became sole ingress.
         Err(crate::error::Error::StreamWriteOnly.into())
     }
 
@@ -309,9 +302,8 @@ mod tests {
         let ts_bytes = &buf[header_end..];
 
         // Find first PUSI packet on VIDEO_PID; verify RAI in AF flags.
-        // chunks_exact drops any partial trailing chunk — only whole
-        // 192-byte BD-TS packets are valid, and it avoids OOB indexing on a
-        // short final chunk.
+        // chunks_exact drops a partial trailing chunk — only whole 192-byte
+        // BD-TS packets are valid, and it avoids OOB indexing on a short chunk.
         let pkt = ts_bytes
             .chunks_exact(192)
             .find(|p| {

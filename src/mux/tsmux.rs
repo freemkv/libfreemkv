@@ -180,24 +180,9 @@ impl<W: Write> TsMuxer<W> {
         let base = self.base_pts_ns.unwrap_or(pts_ns);
         let pts_ns = pts_ns.saturating_sub(base);
 
-        // For NAL-based video (HEVC, H.264): convert length-prefixed NALUs to
-        // Annex B (start codes) and prepend codec_private parameter sets on
-        // the FIRST keyframe only.
-        //
-        // Arm `params_written` on the first video keyframe regardless of
-        // whether it carries data: an empty-data keyframe still anchors
-        // the stream, and leaving the flag unset would make every later
-        // non-key frame fail the drop guard above and silently vanish.
-        // For non-video AND for non-NAL video (MPEG-2, VC-1 — already
-        // start-code ES, never length-prefixed) the bytes pass through
-        // unchanged, so borrow `data` directly rather than copying it; only
-        // NAL video needs an owned Annex-B conversion buffer.
-        // Take the reusable conversion buffer out of `self` for the duration of
-        // this frame: that frees the `&mut self` the writer needs below while the
-        // converted bytes are still borrowed, and keeps the allocation across
-        // frames instead of making (and dropping) a whole-frame one per picture.
-        // It is put back at the end of the function, so a mid-frame error path
-        // costs only the buffer's capacity, never correctness.
+        // NAL video (HEVC/H.264): convert length-prefixed NALUs to Annex B and prepend
+        // codec_private params on the first keyframe only (arm `params_written` even if
+        // data is empty, else later non-key frames fail the drop guard). Others pass through.
         let mut annex_b = std::mem::take(&mut self.annex_b);
         let convert = is_video && self.is_nal_video(track);
         if convert {
@@ -208,22 +193,17 @@ impl<W: Write> TsMuxer<W> {
             annex_b.reserve(data.len() + 1024);
             if keyframe && !self.params_written[track] {
                 if let Some(ref cp) = self.codec_privates[track] {
-                    // avcC and hvcC are DIFFERENT box layouts; parsing one with
-                    // the other's parser yields no parameter sets at all, and the
-                    // stream is then undecodable. Dispatch on the declared codec,
-                    // matching `demux_sink::annexb_param_sets`.
+                    // avcC/hvcC are different box layouts; parsing one with the other's
+                    // parser yields no params. Dispatch matches `demux_sink::annexb_param_sets`.
                     let params = match self.video_codec[track] {
                         Codec::H264 => avcc_to_annex_b(cp),
                         _ => hvcc_to_annex_b(cp),
                     };
                     match params {
                         Some(params) => annex_b.extend_from_slice(&params),
-                        // A codec_private that EXISTS but will not parse means no
-                        // VPS/SPS/PPS reaches the stream and it is undecodable.
-                        // Arming the flag below is still right — retrying the same
-                        // bytes on the next keyframe cannot succeed — but it must
-                        // not be silent, which is what it was: the mux reported
-                        // success while emitting parameter-set-free video.
+                        // A codec_private that exists but won't parse leaves the stream
+                        // undecodable; still arm the flag (retrying can't succeed) but warn
+                        // instead of silently reporting success on parameter-set-free video.
                         None => tracing::warn!(
                             track,
                             codec = ?self.video_codec[track],
@@ -236,15 +216,8 @@ impl<W: Write> TsMuxer<W> {
                 }
                 self.params_written[track] = true;
             }
-            // Write the conversion STRAIGHT into the destination.
-            // `length_prefixed_to_annex_b` allocates a whole-frame Vec of its own
-            // and we then copied it in, so every video frame cost two full-frame
-            // allocations and two full-frame copies. At ~200k frames averaging
-            // ~310 KB of ES on a UHD, that is ~124 GB of pointless memcpy.
-            // The prefix width is whatever the source's avcC/hvcC declares
-            // (ISO/IEC 14496-15 `lengthSizeMinusOne + 1`), NOT an assumed 4:
-            // a 1- or 2-octet-prefixed source read as u32-BE parses no NALs at
-            // all and its raw bytes are passed through with no start codes.
+            // Write straight into the destination (avoids ~124 GB of memcpy at UHD frame
+            // rates). Prefix width comes from the source's avcC/hvcC, not an assumed 4.
             let length_size = nal_length_size(
                 self.video_codec[track],
                 self.codec_privates[track].as_deref(),
@@ -263,22 +236,9 @@ impl<W: Write> TsMuxer<W> {
             0
         };
 
-        // Video PES may be unbounded (length 0); a 0xBD private_stream_1
-        // PES must carry a bounded length, so split oversized audio/sub
-        // access units into multiple PES packets.
-        //
-        // ONLY THE FIRST emitted PES carries the PTS. ISO/IEC 13818-1 §2.4.3.7
-        // puts the PTS in the header of the PES packet containing the FIRST byte of
-        // the access unit; every chunk used to repeat it, so on read-back a demuxer
-        // (which treats each PUSI as a new access unit) received the second half of
-        // e.g. an oversized full-screen PGS display set as an independent segment at
-        // the SAME timestamp, and the display set was emitted as two blocks with
-        // identical timestamps instead of one. Each PES still necessarily starts on
-        // its own PUSI packet — that is what delimits a PES — but only the keyframe
-        // RAI rides the first packet of the first PES.
-        //
-        // The write result is held rather than `?`-propagated so the conversion
-        // buffer goes back into `self` on every path.
+        // 0xBD private_stream_1 needs a bounded length, so oversized audio/sub units
+        // split into multiple PES packets; only the first carries the PTS (§2.4.3.7) —
+        // repeating it made a demuxer read one display set as two same-timestamp blocks.
         let res = if is_video || es_data.len() <= MAX_BD_PES_PAYLOAD {
             self.write_pes_chain(track, pid, Some(pts_90k), is_video, keyframe, es_data)
         } else {
@@ -468,10 +428,8 @@ fn build_pes_header(pid: u16, pts_90k: Option<u64>, data_len: usize) -> Vec<u8> 
     header.push(0x01);
     header.push(stream_id);
 
-    // PES packet length. The unbounded form (0) is only spec-legal for
-    // video; `write_frame` splits oversized 0xBD access units so a private
-    // stream always fits a bounded u16 length here. The `> 65535` arm
-    // remains a defensive fallback for video only.
+    // Unbounded length (0) is spec-legal only for video; `write_frame` splits
+    // oversized 0xBD units so a private stream always fits a bounded u16 here.
     if stream_id == pes_stream_id::VIDEO || pes_data_len > u16::MAX as usize {
         header.push(0x00);
         header.push(0x00);
@@ -729,10 +687,8 @@ mod tests {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
             let p = fake_hevc_nal(1, 80);
             mux.write_frame(0, 0, false, &p).unwrap();
-            // The single non-key frame was dropped (no keyframe to anchor),
-            // so finish() now reports MuxEmpty rather than producing a
-            // header-only "success". The drop behaviour itself is still
-            // verified by the empty packet list below.
+            // The single non-key frame was dropped (no keyframe to anchor), so
+            // finish() reports MuxEmpty instead of a header-only "success".
             let err = mux.finish().unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         }
@@ -746,10 +702,8 @@ mod tests {
 
     #[test]
     fn finish_with_zero_frames_errors_mux_empty() {
-        // Fix 4: a TsMuxer that never emitted a frame must NOT report a
-        // clean finish — an m2ts:// sink that wrote only the FMKV header
-        // (undecryptable ciphertext → no demuxable frames) would otherwise
-        // be a header-only file published as a successful rip.
+        // Fix 4: a TsMuxer that never emitted a frame must not report a clean finish,
+        // or an undecryptable m2ts:// source publishes a header-only file as success.
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
         let err = mux.finish().unwrap_err();
@@ -758,10 +712,8 @@ mod tests {
             std::io::ErrorKind::InvalidData,
             "zero-frame finish must surface MuxEmpty (E9023 → InvalidData)"
         );
-        // The MuxEmpty variant carries the E9023 code, and its io::Error
-        // mapping is InvalidData (matching the kind above). Asserting both
-        // pins the variant ⇄ code ⇄ kind wiring without a lossy round-trip
-        // (From<Error> for io::Error → from-io goes back to IoError/E5000).
+        // Pins the variant/code/kind wiring directly, since the io::Error round-trip
+        // (From<Error> for io::Error → from-io) loses fidelity back to IoError/E5000.
         assert_eq!(
             crate::error::Error::MuxEmpty.code(),
             crate::error::E_MUX_EMPTY
@@ -803,10 +755,8 @@ mod tests {
 
     #[test]
     fn av_offset_preserved_with_audio_before_first_video() {
-        // Audio at t=0 arrives BEFORE the first video keyframe at t=1s.
-        // The global base must be seeded from the VIDEO frame so the
-        // audio/video PTS offset is preserved (audio earlier ⇒ saturates to
-        // 0, video lands at +1s = 90000 ticks), not both collapsed to 0.
+        // Audio at t=0 arrives before the first video keyframe at t=1s; the base
+        // must seed from video, not both collapsing to 0.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
@@ -843,10 +793,8 @@ mod tests {
 
     #[test]
     fn oversized_bd_audio_pes_is_split_and_bounded() {
-        // A private_stream_1 (0xBD) audio frame larger than the bounded PES
-        // limit must be split into multiple PES, each with a non-zero
-        // PES_packet_length (never the unbounded 0 form, which is illegal
-        // for 0xBD).
+        // An oversized 0xBD audio frame must split into multiple PES, each with a
+        // non-zero length (the unbounded 0 form is illegal for 0xBD).
         let mut sink: Vec<u8> = Vec::new();
         let big: Vec<u8> = (0..(MAX_BD_PES_PAYLOAD + 5000))
             .map(|i| (i & 0xFF) as u8)
@@ -885,12 +833,8 @@ mod tests {
         let mut out = Vec::new();
         for p in packets.iter().filter(|p| p.pid == pid) {
             if p.pusi {
-                // Read the PES header's own length rather than assuming one:
-                // 6 bytes (startcode + stream_id + length) + 3 optional-header
-                // bytes + PES_header_data_length. A CONTINUATION PES carries no PTS
-                // (ISO/IEC 13818-1 §2.4.3.7), so its header is 9 bytes, not 14 —
-                // this helper used to hardcode 14 and so silently depended on every
-                // split chunk repeating the PTS.
+                // Read the PES header's own length rather than assuming 14: a
+                // continuation PES carries no PTS (§2.4.3.7), so its header is 9 bytes.
                 assert!(p.payload.len() >= 9, "PUSI payload holds a PES header");
                 let hdr = 9 + p.payload[8] as usize;
                 out.extend_from_slice(&p.payload[hdr..]);
@@ -1177,10 +1121,8 @@ mod tests {
 
     #[test]
     fn no_base_seeded_by_audio_only_stream() {
-        // If only audio frames are written (no video), base_pts_ns is never
-        // seeded by them; each frame rebases to itself via unwrap_or(pts_ns),
-        // so the first audio frame lands at relative 0. Proves audio never
-        // seeds the global base (which would corrupt later A/V offsets).
+        // Audio-only never seeds base_pts_ns; each frame rebases to itself via
+        // unwrap_or(pts_ns), proving audio can't corrupt later A/V offsets.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
@@ -1409,11 +1351,8 @@ mod tests {
     /// correct code. Use a PTS large enough that bits 29..32 are nonzero.
     #[test]
     fn pts_high_bits_survive_encoding() {
-        // Choose pts_ns as an exact multiple of 100_000 so `pts_ns * 9 /
-        // 100_000` (the muxer's ns -> 90kHz-tick conversion) is exact, no
-        // truncation to account for. N * 9 lands just above 2^31, so bit 31
-        // of the 33-bit PTS field is set — well above anything a small-PTS
-        // test would exercise.
+        // pts_ns is an exact multiple of 100_000 so the ns->90kHz conversion is exact;
+        // N * 9 lands just above 2^31, setting bit 31 of the 33-bit PTS field.
         const N: u64 = 238_609_295;
         let big_pts_ticks: u64 = N * 9;
         let big_pts_ns = (N * 100_000) as i64;

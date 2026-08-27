@@ -75,18 +75,15 @@ impl BytePrefetcher {
         chunk_bytes: usize,
         halt: Option<Halt>,
     ) -> std::io::Result<Self> {
-        // A zero-length chunk makes every recycled buffer an empty
-        // slice; `reader.read(&mut [])` returns Ok(0), which the loop
-        // below treats as EOF — the consumer would see a clean,
-        // silent zero-byte stream. Callers pass the downstream
-        // demuxer's batch size, which is always > 0.
+        // A zero-length chunk makes every recycled buffer empty; `reader.read(&mut [])`
+        // returns Ok(0), which the loop below treats as EOF, producing a silent
+        // zero-byte stream. Callers must pass the downstream demuxer's batch size (> 0).
         debug_assert!(chunk_bytes > 0, "BytePrefetcher chunk_bytes must be > 0");
         let (tx, rx) = bounded::<Batch>(FORWARD_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(RECYCLE_DEPTH);
 
-        // Seed the recycle pool. Without these the first
-        // `recycle_rx.recv()` would block forever (no consumer has
-        // returned a buffer yet).
+        // Seed the recycle pool; otherwise the first `recycle_rx.recv()` blocks
+        // forever since no consumer has returned a buffer yet.
         for _ in 0..RECYCLE_DEPTH {
             let _ = recycle_tx.send(vec![0u8; chunk_bytes]);
         }
@@ -94,21 +91,13 @@ impl BytePrefetcher {
         let producer = std::thread::Builder::new()
             .name("freemkv-byte-prefetch".into())
             .spawn(move || {
-                // Wrap the feed loop in catch_unwind so a panic in the inner
-                // `reader.read` (e.g. a decrypt-on-read slice/arith bug) is NOT
-                // indistinguishable from a clean finish at the demux boundary. A
-                // clean exit (EOF, halt, consumer disconnect) returns and drops
-                // `tx` → the demux loop reads RecvError as EOF (correct). A PANIC
-                // sends an explicit error sentinel first so the demux loop's
-                // `Ok(Err(_))` arm fires and propagates a typed error instead of
-                // converting the dropped channel into a clean `DemuxBatch::Eof`
-                // that would finalize a TRUNCATED mux while reporting success.
+                // catch_unwind: a clean exit drops `tx` (demux reads RecvError as EOF),
+                // but a panic sends an error sentinel first so demux gets a typed error
+                // instead of finalizing a truncated mux as success.
                 let body = std::panic::AssertUnwindSafe(|| {
                     let cancelled = || halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false);
-                    // Liveness heartbeat: the producer blocks on the recycle and
-                    // forward channels; a stalled consumer or a wedged reader shows
-                    // up as the beat going silent. Total is unknown, so `pos` is
-                    // cumulative bytes read.
+                    // Liveness heartbeat: a stalled consumer or wedged reader shows up
+                    // as the beat going silent. Total is unknown, so `pos` is cumulative.
                     let mut hb = crate::progress::Heartbeat::new("byte_prefetch");
                     let mut produced_bytes: u64 = 0;
                     loop {
@@ -116,10 +105,9 @@ impl BytePrefetcher {
                         if cancelled() {
                             return;
                         }
-                        // Park on the recycle channel, but re-poll halt
-                        // every POLL_INTERVAL: a pure-AtomicBool Halt does
-                        // not disconnect the channel, so a blocking recv()
-                        // would never re-reach the cancel check.
+                        // Re-poll halt every POLL_INTERVAL: a pure-AtomicBool Halt does
+                        // not disconnect the channel, so a blocking recv() would never
+                        // re-reach the cancel check.
                         let mut buf = loop {
                             match recycle_rx.recv_timeout(POLL_INTERVAL) {
                                 Ok(b) => break b,
@@ -132,11 +120,9 @@ impl BytePrefetcher {
                                 Err(RecvTimeoutError::Disconnected) => return,
                             }
                         };
-                        // Re-expose the full extent. After a short read the
-                        // prior iteration truncated to n < chunk_bytes, so
-                        // this regrows the length back to chunk_bytes
-                        // without reallocating (capacity was fixed at
-                        // construction and never shrinks).
+                        // Regrow to chunk_bytes: a prior short read truncated len to
+                        // n < chunk_bytes. No realloc — capacity was fixed at
+                        // construction and never shrinks.
                         if buf.len() < chunk_bytes {
                             buf.resize(chunk_bytes, 0);
                         } else {
@@ -196,27 +182,12 @@ impl BytePrefetcher {
     /// drains `rx`, runs the demuxer in place on each filled buffer,
     /// and recycles back through `recycle_tx`.
     pub fn into_channels(self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
-        // MOVE the three fields out cleanly — never clone. Each of
-        // `rx` and `recycle_tx` ends up with exactly ONE live copy:
-        // the one in the returned tuple. The pre-1.0.0 implementation
-        // cloned both and then `mem::forget`-ed `self`, leaking the
-        // originals so an extra live receiver + sender survived
-        // forever. That defeated the channel-disconnection shutdown:
-        // when the demux consumer exited early (halt, or a `tx.send`
-        // error in `demux_thread`), the producer's `recycle_rx.recv()`
-        // and `tx.send()` never saw all-peers-dropped, so the producer
-        // never returned and `PrefetchShell::drop`'s `join()` hung.
-        //
-        // `ManuallyDrop` + `ptr::read` reads each field out by value
-        // and suppresses `self`'s own `Drop` (which would otherwise
-        // double-`join`), leaving NO extra live endpoint behind. This
-        // is the panic-free equivalent of the `Option::take` approach
-        // and mirrors `sector::prefetched::into_channels`.
+        // MOVE the fields out, never clone: the pre-1.0.0 impl cloned + `mem::forget`-ed
+        // `self`, leaking endpoints that defeated disconnection shutdown (producer join
+        // hung forever). `ManuallyDrop` + `ptr::read` moves fields out cleanly instead.
         let me = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `me` is `ManuallyDrop`, so none of these fields will
-        // be dropped by `me`. Each `ptr::read` performs exactly one
-        // bitwise move out; every field is read exactly once and never
-        // touched again, so there are no double-frees and no aliasing.
+        // SAFETY: `me` is `ManuallyDrop`, so none of these fields are dropped by `me`.
+        // Each `ptr::read` is one bitwise move, read exactly once — no double-frees.
         let producer = unsafe { std::ptr::read(&me.producer) };
         // SAFETY: `rx` and `recycle_tx` are always `Some` here —
         // `into_channels` is the only way to consume a live
@@ -230,13 +201,9 @@ impl BytePrefetcher {
 
 impl Drop for BytePrefetcher {
     fn drop(&mut self) {
-        // Drop channel endpoints BEFORE joining the producer so the
-        // producer observes SendTimeoutError::Disconnected (forward tx)
-        // or RecvTimeoutError::Disconnected (recycle rx) and exits
-        // promptly. Without this, a non-EOF source fills the depth-2
-        // forward channel and then spins in send_timeout(POLL_INTERVAL)
-        // forever because rx is never drained, causing join() to
-        // deadlock.
+        // Drop channel endpoints BEFORE joining so the producer observes Disconnected
+        // (send/recv) and exits promptly. Otherwise a non-EOF source fills the forward
+        // channel and spins in send_timeout forever since rx is never drained.
         drop(self.rx.take());
         drop(self.recycle_tx.take());
         if let Some(h) = self.producer.take() {

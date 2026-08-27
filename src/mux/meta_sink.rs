@@ -168,16 +168,9 @@ pub struct JsonSink {
 
 impl JsonSink {
     pub fn create(path: &Path, title: &DiscTitle) -> io::Result<Self> {
-        // Serializing our own `Value` is infallible in practice (serde_json maps
-        // any non-finite float to `null` at Value construction, so `title_json`
-        // never holds an unencodable value); still, propagate rather than silently
-        // writing "{}" if that ever changes — an empty metadata file must not
-        // masquerade as a successful json:// export.
-        //
-        // `NoMetadata` (E9008), matching `mux::meta`'s serialize guard: this is a
-        // metadata-encoding failure with no MKV involved. It was `MkvInvalid`,
-        // which `error::is_skippable_title_stub` reports as a skippable empty
-        // nav/menu stub — a json:// export that failed to encode is not that.
+        // Infallible in practice, but propagate rather than silently write "{}".
+        // `NoMetadata` (E9008), not `MkvInvalid` — the latter's skippable-stub
+        // ruling would wrongly swallow a real encode failure as an empty nav stub.
         let doc = serde_json::to_string_pretty(&title_json(title))
             .map_err(|_| crate::error::Error::NoMetadata)?;
         let mut f = File::create(path)?;

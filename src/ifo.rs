@@ -173,7 +173,7 @@ impl DvdTitle {
         if idx >= n { 0 } else { idx }
     }
 
-    /// The feature cells after the leading-cell filter ([`feature_start_cell`]).
+    /// The feature cells after the leading-cell filter ([`Self::feature_start_cell`]).
     pub fn feature_cells(&self) -> &[DvdCell] {
         &self.cells[self.feature_start_cell()..]
     }
@@ -425,21 +425,14 @@ pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> 
     for (&vts_number, titles_info) in &title_set_map {
         match parse_vts(reader, udf, vts_number, titles_info) {
             Ok(ts) => title_sets.push(ts),
-            // The operator's Stop is not a placeholder title set. Once the
-            // drive's halt flag is set EVERY command fails with `Halted`, so
-            // swallowing it here would skip every REMAINING title set in turn
-            // and return `Ok` with a truncated list — a cancelled scan that
-            // is indistinguishable from a disc genuinely holding fewer
-            // titles. `scan_dvd_titles` propagates it to the caller.
+            // Halted means the drive itself stopped, not that this title set is a
+            // placeholder — once set, every later parse_vts call also fails, so
+            // swallowing it here would silently truncate the scan. Propagate it.
             Err(Error::Halted) => return Err(Error::Halted),
             Err(e) => {
-                // Some discs carry placeholder TT_SRPT entries for title sets
-                // that are not really there, so one failure is not fatal. But
-                // the failure must not be INVISIBLE: every skipped set is a
-                // title the user will never see, and swallowing the reason made
-                // a disc that enumerated 38 titles from one image and 10 from
-                // another look like a scan difference rather than 28 dropped
-                // reads.
+                // Some discs carry placeholder TT_SRPT entries for title sets that
+                // aren't really there, so one failure isn't fatal — but it must not
+                // be silent, since swallowing it can hide many dropped titles.
                 skipped += 1;
                 tracing::warn!(
                     target: "freemkv::scan",
@@ -563,25 +556,9 @@ fn parse_vts(
     // VTS_PGCIT sector pointer
     let pgcit_sector = be_u32(&vts_data, VTS_PGCIT_OFFSET)?;
 
-    // First sector of the VTS **Title** VOBS (`vtstt_vobs`, VTSTT_VOBS_OFFSET).
-    // The cell `first_sector` / `last_sector` values in the title PGCs are
-    // relative to this. Offset 0xC0 is `vtsm_vobs` — the VTS *menu* VOBS
-    // (VTS_xx_0.VOB), which on discs with a per-title menu (e.g. a Universal
-    // "the parental level has been set, press yes" first-play still) holds that
-    // interactive prompt. Reading the menu base instead prepended the menu VOB
-    // to the feature and shifted every cell extent back by
-    // `vtstt_vobs - vtsm_vobs` sectors, so the rip opened on the parental
-    // prompt instead of the movie. The title content lives at `vtstt_vobs`.
-    //
-    // `vtstt_vobs` is a sector address **relative to the start of this VTS_xx_0.IFO
-    // file**, not an absolute disc LBA. The cell `first_sector`/`last_sector`
-    // values are in turn relative to `vtstt_vobs`. To turn them into the absolute
-    // disc LBAs the reader needs, add the IFO file's own on-disc location (from
-    // the UDF FS). Without this rebase every extent started `ifo_lba` sectors too
-    // early — on one real disc the feature began at LBA 126 (the VMGI /
-    // VIDEO_TS.VOB main-menu region) instead of 132886 (VTS_03_1.VOB), so the
-    // first ~4.5 min of muxed video was the disc's main menu before the stream
-    // drifted into the movie.
+    // First sector of the VTS **Title** VOBS (`vtstt_vobs`), which PGC cell extents
+    // are relative to (offset 0xC0/`vtsm_vobs` is the *menu* VOBS, not the movie).
+    // It's relative to this IFO file, so rebase by the IFO's on-disc LBA (UDF FS).
     let vtstt_vobs = be_u32(&vts_data, VTSTT_VOBS_OFFSET)?;
     let ifo_lba = udf.file_start_lba(reader, &path)?;
     let vob_start_sector = ifo_lba.saturating_add(vtstt_vobs);
@@ -600,11 +577,9 @@ fn parse_vts(
         }
         audio_streams.push(parse_audio_attr(&vts_data, aoff)?);
     }
-    // Assign each audio stream its on-wire private_stream_1 sub-stream id
-    // by per-codec ordinal — the same convention DVD authoring uses (AC-3
-    // 0x80+, DTS 0x88+, LPCM 0xA0+). This is the routing key shared with
-    // the muxer; per-codec ordinals (not the positional index) are what
-    // keep mixed-codec titles from colliding.
+    // Assign each stream its on-wire private_stream_1 id by per-codec ordinal
+    // (AC-3 0x80+, DTS 0x88+, LPCM 0xA0+), the DVD authoring convention the
+    // muxer routes on — the positional index would collide in mixed-codec titles.
     assign_audio_sub_stream_ids(&mut audio_streams);
 
     // Subtitle streams: count at 0x254 (u16 BE), then 6 bytes each starting at 0x256
@@ -641,12 +616,9 @@ fn parse_vts(
 
 // ── Attribute parsers ───────────────────────────────────────────────────────
 
-// ── VTS_V_ATR byte 0 bitfield layout (DVD-Video spec, MSB first) ──────────
-//   bits 7-6 mpeg_version | bits 5-4 video_format | bits 3-2 display_aspect
-//   | bits 1-0 permitted_df
-// Naming the positions is the guard against the original bug: video_format is
-// bits 5-4, NOT bits 1-0 (those are the pan&scan/letterbox permission). Reading
-// the low two bits mis-detected every PAL disc as NTSC → 720x480 not 720x576.
+// VTS_V_ATR byte 0 (MSB first): bits 7-6 mpeg_version | bits 5-4 video_format |
+// bits 3-2 display_aspect | bits 1-0 permitted_df. video_format is bits 5-4, NOT
+// bits 1-0 (pan&scan/letterbox permission) — the earlier bug misread PAL as NTSC.
 const V_ATR_VIDEO_FORMAT_SHIFT: u8 = 4;
 const V_ATR_ASPECT_SHIFT: u8 = 2;
 const V_ATR_FIELD_MASK: u8 = 0x03;
@@ -712,11 +684,9 @@ pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAtt
     let b1 = byte_at(data, offset + 1)?;
 
     let coding_mode = (b0 >> 5) & 0x07;
-    // DVD-Video audio_coding_mode. Modes 2 and 3 are both MPEG audio Layer II
-    // (3 adds the MPEG-2 multichannel extension), so both are Codec::Mp2.
-    // Mode 2 previously mapped to Codec::Mpeg1 — a VIDEO variant, so
-    // Codec::kind() reported Video and the audio stream was classified and
-    // handled as video everywhere downstream.
+    // Modes 2 and 3 are both MPEG audio Layer II (3 adds the multichannel
+    // extension), so both map to Codec::Mp2. Mode 2 previously mapped to the
+    // video codec Codec::Mpeg1, so the audio stream was classified as video.
     let codec = match coding_mode {
         0 => Codec::Ac3,
         2 | 3 => Codec::Mp2,
@@ -868,10 +838,9 @@ fn parse_pgcit(
     let entries_start = pgcit_offset + 8;
 
     let mut titles = Vec::new();
-    // Every `continue` below drops a title the user will never see. None of
-    // them may be silent: `parse_vmg` already counts and warns per skipped
-    // title SET, and this function was the remaining place where a disc could
-    // quietly report fewer titles than it has.
+    // Every `continue` below drops a title the user will never see and must not
+    // be silent: `parse_vmg` warns per skipped title SET, but this was the
+    // remaining place a disc could quietly report fewer titles than it has.
     let mut skipped = 0usize;
 
     for &(chapter_count, vts_title_num) in titles_info {
@@ -910,14 +879,9 @@ fn parse_pgcit(
         match parse_pgc(data, pgc_abs, chapter_count) {
             Ok(title) => titles.push(title),
             Err(e) => {
-                // By design a single unparseable PGC (truncated/corrupt entry,
-                // authoring-tool quirk) must not lose the whole title list. But
-                // "not fatal" is not the same as "not worth saying": every PGC
-                // skipped here is a title the user will never see, and this was
-                // the only remaining silent one — `parse_vmg` above already
-                // counts and warns per skipped title SET for exactly this
-                // reason. A disc quietly reporting fewer titles than it has is
-                // the failure this release exists to stop.
+                // A single unparseable PGC (truncated/corrupt entry, authoring quirk)
+                // must not lose the whole title list, but must not be silent either:
+                // a disc quietly reporting fewer titles than it has is what this warns.
                 skipped += 1;
                 tracing::warn!(
                     target: "freemkv::scan",
@@ -951,11 +915,8 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         return Err(Error::IfoParse);
     }
 
-    // PGC layout:
-    //   0x00-0x01: misc flags
-    //   0x02:      nr_of_programs
-    //   0x03:      nr_of_cells
-    //   0x04-0x07: playback_time (4 BCD bytes)
+    // PGC layout: 0x00-0x01 misc flags, 0x02 nr_of_programs,
+    // 0x03 nr_of_cells, 0x04-0x07 playback_time (4 BCD bytes).
     let num_cells = byte_at(data, pgc_offset + 0x03)? as usize;
     let time_bytes = sub_slice(data, pgc_offset + 0x04, 4)?;
     let duration_secs = bcd_to_secs(time_bytes);
@@ -1011,14 +972,9 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         let mut times = Vec::new();
         if pgm_map_offset > 0 && nr_of_programs > 0 && cell_playback_offset > 0 {
             let pgm_base = pgc_offset + pgm_map_offset;
-            // Collect per-cell durations as exact timecode FRAME counts. Summing
-            // frames (integers) and converting once per chapter keeps every mark
-            // on an exact frame boundary — summing f64 seconds would let rounding
-            // drift accumulate across a two-hour title.
-            //
-            // A cell whose rate flag is unspecified has no frame count, so it
-            // contributes plain seconds instead; that is tracked separately and
-            // added on top. In practice a PGC never mixes rates.
+            // Collect durations as exact FRAME counts, converting once per chapter so
+            // marks stay on frame boundaries (summing f64 seconds would drift). Cells
+            // with no rate flag fall back to plain seconds, tracked separately.
             let mut cell_frames: Vec<(u64, f64)> = Vec::with_capacity(num_cells);
             let mut rate: Option<DvdRate> = None;
             let cell_base = pgc_offset + cell_playback_offset;
@@ -1108,29 +1064,18 @@ mod tests {
 
     #[test]
     fn tt_srpt_title_count_is_capped_and_deduplicated() {
-        // The TT_SRPT count is an untrusted u16. A ~800 KB crafted IFO declares
-        // 65535 entries, and each one re-parses a PGC into another full DvdTitle.
-        //
-        // The entries are DISTINCT, which matters: with 65535 identical entries
-        // the de-duplication collapses them to one title on its own and the count
-        // cap is never what bounds the result — the test would then pass with the
-        // cap removed entirely, proving only that dedup works. Distinct entries
-        // defeat dedup, so the cap is the only thing left holding the line.
-        // De-duplication gets its own assertion below, on its own fixture.
-        // Both title fields are u8, so vary each within its own range to get
-        // ~65025 distinct pairs out of the 65535 entries.
+        // The TT_SRPT count is an untrusted u16. Entries must be DISTINCT: identical
+        // entries would let dedup alone collapse them to one title, so the cap would
+        // never be exercised — vary both u8 fields for ~65025 distinct pairs.
         let entries: Vec<(u16, u8, u8)> = (0..u16::MAX)
             .map(|i| (5u16, (i % 255) as u8 + 1, ((i / 255) % 255) as u8 + 1))
             .collect();
         let data = tt_srpt_bytes(u16::MAX, &entries);
         let map = parse_tt_srpt(&data, 0).expect("well-formed TT_SRPT");
         let total: usize = map.values().map(|v| v.len()).sum();
-        // Asserted against the DVD-Video format maximum as a LITERAL, not against
-        // MAX_TT_SRPT_TITLES. Comparing a result to the very constant under test
-        // passes vacuously the moment someone raises that constant, which is the
-        // most likely regression here — and is the tautology class this audit has
-        // now found six times. 99 is the format's own ceiling, so this pins the
-        // cap to the spec rather than to whatever the code currently says.
+        // Asserted against the DVD-Video max as a LITERAL, not MAX_TT_SRPT_TITLES:
+        // comparing to the constant under test would pass vacuously if that constant
+        // were raised. 99 is the format's own ceiling, pinning the cap to the spec.
         assert!(
             total <= 99,
             "TT_SRPT produced {total} titles from a crafted 65535-entry table; \
@@ -1178,10 +1123,8 @@ mod tests {
         // 0 hours, 1 minute, 30 seconds, 15 frames of NTSC timecode.
         let bcd = [0x00, 0x01, 0x30, 0b11_010101];
         let secs = bcd_to_secs(&bcd);
-        // 0b010101 = 0x15, BCD = 15 frames.
-        // Timecode 00:01:30:15 is 90*30 + 15 = 2715 frames, and each frame
-        // lasts 1001/30000 s, so real time is 2715*1001/30000 = 90.5905 s
-        // (NOT 90.5 s — NTSC timecode runs 0.1% slow against the clock).
+        // 0b010101 = 0x15 BCD = 15 frames. Timecode 00:01:30:15 = 2715 frames at
+        // 1001/30000 s each = 90.5905 s (NOT 90.5 s — NTSC runs 0.1% slow).
         let expected = 2715.0 * 1001.0 / 30000.0;
         assert!((secs - expected).abs() < 1e-9, "got {}", secs);
         assert!((secs - 90.5905).abs() < 1e-9, "got {}", secs);
@@ -1438,15 +1381,9 @@ mod tests {
     /// bit positions drift, these fail.
     #[test]
     fn video_attr_absolute_bytes_pin_real_layout() {
-        // (byte @0x200, expected standard, expected aspect, expected resolution).
-        // PAL 16:9 anamorphic = mpeg(00) format(01=PAL) aspect(11=16:9) df(00)
-        //   = 0b0001_1100 = 0x1C  (e.g. a PAL 16:9 R2 feature disc).
-        // PAL 4:3          = 0b0001_0000 = 0x10.
-        // NTSC 16:9        = 0b0000_1100 = 0x0C.
-        // NTSC 4:3         = 0b0000_0000 = 0x00.
-        // A real disc also sets mpeg_version=01 (MPEG-2) in bits 7-6, which the
-        // parser must IGNORE; OR it in (|0x40) to prove it doesn't leak into the
-        // video_format read.
+        // (byte @0x200, expected standard, expected aspect, expected resolution):
+        // PAL 16:9=0x1C, PAL 4:3=0x10, NTSC 16:9=0x0C, NTSC 4:3=0x00. A real disc
+        // also sets mpeg_version=01 in bits 7-6 (|0x40), which the parser must ignore.
         let cases: &[(u8, TvSystem, DvdAspect, Resolution)] = &[
             (0x1C, TvSystem::Pal, DvdAspect::R16x9, Resolution::R576i),
             (0x10, TvSystem::Pal, DvdAspect::R4x3, Resolution::R576i),
@@ -1463,10 +1400,9 @@ mod tests {
             assert_eq!(attr.aspect, aspect, "byte {b0:#04x} → aspect");
             assert_eq!(attr.resolution, res, "byte {b0:#04x} → resolution");
         }
-        // Anti-bug anchor: the original bug read the TV system from bits 1-0
-        // (permitted_df). A PAL byte whose low 2 bits are 0 (0x1C) must NOT be
-        // misread as NTSC — and a byte with low bits set but format=NTSC
-        // (0x03 = NTSC, df=11) must stay NTSC, proving the low bits are ignored.
+        // Anti-bug anchor: the original bug read TV system from bits 1-0
+        // (permitted_df). A byte with low bits set but format=NTSC (0x03, df=11)
+        // must stay NTSC here, proving the low bits are ignored.
         let mut df = vec![0u8; 0x204];
         df[0x200] = 0x03; // format=NTSC(00), df=11
         assert_eq!(
@@ -1497,10 +1433,9 @@ mod tests {
 
     #[test]
     fn mixed_codec_sub_stream_ids_are_distinct() {
-        // A title mixing AC-3, DTS and LPCM: the sub-id low nibble is the
-        // POSITIONAL audio-stream number (shared across codecs), OR'd with the
-        // codec base. So idx 1 (DTS) → 0x89, idx 3 (AC-3) → 0x83 — the real
-        // wire ids the demux routes on. All distinct (positions are unique).
+        // A title mixing AC-3, DTS and LPCM: sub-id low nibble is the positional
+        // audio-stream number OR'd with the codec base (idx 1 DTS → 0x89, idx 3
+        // AC-3 → 0x83) — the real wire ids the demux routes on, all distinct.
         let mut streams = vec![
             DvdAudioAttr {
                 codec: Codec::Ac3,
@@ -1625,10 +1560,8 @@ mod tests {
         assert_eq!(attr.language, "fra");
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Added hardening tests. Grounded in the DVD-Video IFO spec
-    // (DVD-Video IFO format; http://dvd.sourceforge.net).
-    // ─────────────────────────────────────────────────────────────────────
+    // Added hardening tests, grounded in the DVD-Video IFO spec
+    // (http://dvd.sourceforge.net).
 
     /// BCD frame-rate flag: bits 7-6 of byte[3]. 0b01 = 25fps (PAL),
     /// 0b11 = 29.97fps (NTSC). 0b00/0b10 are "unknown" → frames ignored.
@@ -2259,10 +2192,8 @@ mod tests {
         );
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // Added: cell-category bit isolation, palette/program-map arithmetic,
     // and the malformed-language salvage paths.
-    // ─────────────────────────────────────────────────────────────────────
 
     /// Each low flag of the cell-category byte comes from its OWN bit and no
     /// other: bit3 seamless_play, bit2 interleaved, bit1 stc_discontinuity,
@@ -2572,10 +2503,9 @@ mod tests {
     /// `[padding, Y, Cr, Cb]`. Every byte of every entry is distinct here, so
     /// a wrong stride, a wrong base or a shifted component shows up.
     #[test]
-    // The loop variable is the DOMAIN VALUE being checked (a palette entry number), not a
-    // cursor into a collection: it is what the assertion message names and
-    // what the table is keyed by. `.iter().enumerate()` would rename the
-    // thing under test to `i` and read worse.
+    // The loop variable is the DOMAIN VALUE under test (a palette entry number),
+    // not a collection cursor — it's what the assertion message names, so
+    // `.iter().enumerate()` would rename the thing under test and read worse.
     #[allow(clippy::needless_range_loop)]
     fn pgc_palette_entries_read_at_correct_stride() {
         let mut pal = [[0u8; 4]; 16];
@@ -2714,16 +2644,8 @@ mod tests {
     }
 
     // ── TT_SRPT: the title table (`parse_tt_srpt` / `parse_vmg`) ────────────
-    //
-    // This is the table that says which titles a DVD has, and it had no tests
-    // at all until 1.6.2 — while being at the centre of both DVD stories in
-    // 1.6.1. The CSS descramble bug destroyed the sector carrying it, so a disc
-    // enumerating 38 titles produced an image enumerating 10, silently, at exit
-    // 0. And `dir://` was pulled from the release on 2026-08-05 because a
-    // folder produced the wrong title list — the same table, reached through a
-    // synthesized image.
-    //
-    // Both were found on real discs. Nothing hermetic covered the table itself.
+    // This table says which titles a DVD has and had no tests until 1.6.2, despite
+    // two real-disc 1.6.1 bugs that silently mis-enumerated titles through it.
 
     /// Build a VMG with a TT_SRPT at `tt_srpt_sector` declaring `entries`
     /// of `(num_chapters, vts_number, vts_title_num)`.
@@ -2767,11 +2689,9 @@ mod tests {
             let at_sector = parse_tt_srpt(&vmg, sector as usize * crate::consts::SECTOR_BYTES)
                 .expect("reading at the sector offset works");
             assert_eq!(at_sector[&1], vec![(3, 1)], "sector {sector}");
-            // Reading the same pointer as a BYTE offset lands 1/2048th of the
-            // way in — inside the header here — and yields a different table.
-            // It does not error: it silently reports the wrong titles, which is
-            // how 28 dropped titles looked like a scan difference rather than a
-            // failure.
+            // Reading the same pointer as a BYTE offset lands 1/2048th of the way
+            // in and yields a different table without erroring — silently wrong
+            // titles, which is how dropped titles looked like a scan difference.
             let as_bytes = parse_tt_srpt(&vmg, sector as usize).expect("does not error");
             assert_ne!(
                 as_bytes, at_sector,
@@ -2819,11 +2739,9 @@ mod tests {
     /// unclamped 65535 is a ~540 MB allocation from a ~800 KB crafted file.
     #[test]
     fn tt_srpt_clamps_an_absurd_declared_title_count() {
-        // The fixture must actually CONTAIN more entries than the cap, or the
-        // walk stops when the buffer runs out and the clamp is never what
-        // bounded it. An earlier version of this test declared u16::MAX over a
-        // two-kilobyte fixture: the loop broke on `base + 12 > len` after three
-        // iterations and the assertion held with the clamp deleted entirely.
+        // The fixture must actually CONTAIN more entries than the cap, or the walk
+        // stops when the buffer runs out and the clamp is never exercised — an
+        // earlier version declared u16::MAX over a 2KB fixture and passed vacuously.
         const PRESENT: usize = MAX_TT_SRPT_TITLES + 40;
         let entries: Vec<(u16, u8, u8)> = (0..PRESENT)
             .map(|i| (1u16, 1u8, (i % 250 + 1) as u8))

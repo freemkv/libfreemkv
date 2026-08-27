@@ -378,18 +378,9 @@ fn resolve_encryption_no_aacs_dir() {
     assert!(disc.aacs.is_none(), "aacs should be None without /AACS dir");
 }
 
-// ── Batch count arithmetic tests ──────────────────────────────────────────
-// Regression tests for the u16 truncation bug in the prefetch producer's
-// per-batch sector count (`src/sector/prefetched.rs`): when
-// `(remaining as u16).min(batch_sectors)` was used instead of
-// `remaining.min(batch_sectors as u32) as u16`, any remaining count that is a
-// multiple of 65536 truncated to 0.
-//
-// These tests used to assert against `safe_batch_count`/`buggy_batch_count`
-// copies defined in THIS file, so the production expression could be reverted
-// with every one of them staying green. They now drive the real producer
-// through the public `PrefetchedSectorSource` API and assert on the sector
-// count of the batch it actually emits.
+// ── Batch count arithmetic: regression for a u16 truncation bug where
+// `(remaining as u16).min(batch_sectors)` truncated to 0 when remaining was a
+// multiple of 65536. Drives the real producer via the public API, not a local copy.
 
 /// Endless zero-filled source: every read succeeds with the full requested
 /// span, so the producer's batch size is the only thing the returned byte
@@ -458,10 +449,9 @@ fn batch_count_exact_boundary() {
 
 #[test]
 fn batch_count_u16_overflow_regression() {
-    // THE BUG: remaining is a multiple of 65536 → `remaining as u16` is 0, so
-    // the batch collapses (the unit-alignment clamp below it then floors the
-    // batch at one 3-sector AACS unit — a 20x throughput cliff on exactly the
-    // disc sizes that hit it, and an outright stall before that clamp existed).
+    // THE BUG: remaining a multiple of 65536 → `remaining as u16` is 0, so the
+    // batch collapses (a 20x throughput cliff post-clamp, an outright stall
+    // before the unit-alignment clamp existed).
     let remaining: u32 = 47533152 - 19552; // = 47513600 = 725 * 65536
     assert_eq!(remaining, 47513600);
     assert_eq!(
@@ -572,12 +562,9 @@ fn scan_encrypted_resolves_no_keys() {
 
 #[test]
 fn aacs_dir_alone_marks_the_disc_encrypted_and_reports_the_capture_error() {
-    // Encryption detection is an OR over the two on-disc AACS locations:
-    // `/AACS` (Blu-ray / UHD, ECMA-167 root) and `/BDMV/AACS` (the BDMV-nested
-    // variant). This fixture carries ONLY `/AACS`, the standard retail layout,
-    // so a detector that required BOTH would call a genuinely encrypted disc
-    // clear — the worst possible failure here, because a "clear" disc is muxed
-    // straight through and ships ciphertext as if it were video, at exit 0.
+    // Detection is an OR over `/AACS` and `/BDMV/AACS`. This fixture carries
+    // only `/AACS` (the standard retail layout); requiring BOTH would call it
+    // clear — the worst failure, since a "clear" disc muxes ciphertext as video.
     let mut reader = MockSectorReader::new();
     build_udf_with_aacs_dir(&mut reader);
 
@@ -587,10 +574,9 @@ fn aacs_dir_alone_marks_the_disc_encrypted_and_reports_the_capture_error() {
         disc.encrypted,
         "a disc carrying /AACS is encrypted even though /BDMV/AACS is absent"
     );
-    // Encrypted => the scan attempts the (lookup-free) AACS input capture. This
-    // fixture's /AACS is empty, so that capture fails and the failure must be
-    // PRESERVED on the disc: callers render it, and its absence is what a scan
-    // that never attempted the capture at all would look like.
+    // Encrypted => scan attempts the AACS input capture. This fixture's /AACS
+    // is empty, so capture fails and the failure must be PRESERVED on the disc
+    // (its absence would look identical to never having attempted capture).
     assert!(
         disc.aacs_error.is_some(),
         "the failed AACS capture on an encrypted disc must be surfaced, not dropped"

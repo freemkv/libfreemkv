@@ -72,14 +72,9 @@ static DECRYPT_POOL: RwLock<Option<Arc<rayon::ThreadPool>>> = RwLock::new(None);
 pub fn set_decrypt_threads(n: usize) {
     let clamped = n.min(MAX_THREADS);
     DECRYPT_THREADS.store(clamped, Ordering::Relaxed);
-    // Drop the existing pool. Next decrypt_pool() call rebuilds with
-    // the new resolved thread count.
-    //
-    // Recover the guard on poisoning, exactly as `decrypt_pool` does. Skipping
-    // the swap on a poisoned lock silently kept the STALE pool alive while the
-    // atomic above already reported the new thread count, so the setting appeared
-    // to take effect and never did. The pool Arc is immutable once stored, so a
-    // prior panic cannot have left it half-written.
+    // Drop the existing pool so the next decrypt_pool() call rebuilds with the
+    // new thread count. Recover the guard on poisoning like `decrypt_pool` does —
+    // skipping the swap would keep the STALE pool alive, making the setting no-op.
     let mut guard = DECRYPT_POOL.write().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
@@ -100,10 +95,9 @@ fn decrypt_pool() -> Option<Arc<rayon::ThreadPool>> {
             return Some(Arc::clone(pool));
         }
     }
-    // Slow path: build a new one under the write lock. Recover the guard
-    // on poisoning (a prior panic) rather than propagating a secondary
-    // panic — we simply rebuild. Double-check after acquiring in case
-    // another caller built it first.
+    // Slow path: build a new one under the write lock, recovering the guard on
+    // poisoning (a prior panic) rather than propagating a secondary panic — we
+    // simply rebuild. Double-check after acquiring in case another caller won.
     let mut guard = DECRYPT_POOL.write().unwrap_or_else(|e| e.into_inner());
     if let Some(pool) = guard.as_ref() {
         return Some(Arc::clone(pool));
@@ -128,10 +122,9 @@ pub fn decrypt_threads() -> usize {
     if explicit > 0 {
         return explicit;
     }
-    // Resolve the `FREEMKV_THREADS` env var + `available_parallelism()` ONCE and
-    // cache it — this runs on the per-buffer decrypt hot path, and a getenv +
-    // String alloc + parallelism syscall per call is pure overhead. The explicit
-    // `set_decrypt_threads` override above still takes effect dynamically.
+    // Resolve `FREEMKV_THREADS` + `available_parallelism()` ONCE and cache it:
+    // this runs on the per-buffer decrypt hot path, so a getenv/alloc/syscall
+    // per call is pure overhead (the `set_decrypt_threads` override still works).
     static DEFAULT_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *DEFAULT_THREADS.get_or_init(|| {
         let env = std::env::var("FREEMKV_THREADS")
@@ -208,11 +201,9 @@ fn unit_is_our_phase(unit_lba: u32, range_start: u32, unit_sectors: u32, phase: 
         Phase::Even => false,
         Phase::Odd => true,
     };
-    // `saturating_sub` and `max(1)`: both inputs come from the key map, which is
-    // built from disc structure. A unit below its own range start, or a zero
-    // unit size, means the map is malformed — that must not panic (debug
-    // overflow / divide-by-zero) inside a library used by a long-running
-    // service. Unit 0 of the range is even, which is the safe default.
+    // `saturating_sub`/`max(1)` guard against a malformed key map (unit below its
+    // range start, or zero unit size) — must not panic (overflow/div-by-zero) in
+    // a long-running service. Unit 0 of the range is even, the safe default.
     let unit_ix = unit_lba.saturating_sub(range_start) / unit_sectors.max(1);
     (unit_ix % 2 == 1) == want_odd
 }
@@ -402,18 +393,6 @@ impl AacsKeyMap {
     }
 }
 
-/// Decrypt a buffer of sectors in-place using a resolved [`AacsKeyMap`] — the
-/// mux's TRUSTED decrypt. `base_lba` is the absolute LBA of `buf`'s first sector;
-/// each aligned unit (3 sectors) is decrypted with the key the map assigns to its
-/// LBA. There is NO key trial and NO `is_clean` verdict: the map already decided
-/// the key from disc structure, so we apply it and move on — a unit that decrypts
-/// to authored-bad TS passes through for the muxer to drop, never re-fetched.
-///
-/// Only [`DecryptKeys::Aacs`] uses a map (CSS self-cracks per region inside
-/// [`decrypt_sectors`]; `None` is clear) — other variants are a no-op here so the
-/// decorator can dispatch uniformly. A map index outside the held pool is a
-/// fail-loud [`Error::DecryptFailed`]: the resolver's job is to guarantee every
-/// selectable index is present, so a gap here is a resolver bug, not silent loss.
 /// Decrypt `buf` with a resolved AACS key map. Thin wrapper over
 /// [`decrypt_span`] — the map is the AACS scheme's input, not a second
 /// orchestrator.
@@ -427,12 +406,20 @@ pub(crate) fn decrypt_sectors_mapped(
     decrypt_span(buf, &mut keys, base_lba, Some(map), None).map(|_| ())
 }
 
-/// AACS scheme step: apply `map`'s per-unit keys to `buf`.
+/// AACS scheme step: apply `map`'s per-unit keys to `buf`, in-place. `base_lba`
+/// is the absolute LBA of `buf`'s first sector; each aligned unit (3 sectors) is
+/// decrypted with the key the map assigns to its LBA. There is NO key trial and
+/// NO `is_clean` verdict: the map already decided the key from disc structure,
+/// so this applies it and moves on — a unit that decrypts to authored-bad TS
+/// passes through for the muxer to drop, never re-fetched.
 ///
 /// A SCHEME, not a policy. It reports what it could not open by returning
 /// `Err(DecryptFailed)`; the decision that an unopenable unit must never be
 /// emitted belongs to [`decrypt_span`], which is the one place that decides it
-/// for every scheme.
+/// for every scheme. A map index outside the held pool is likewise a fail-loud
+/// [`Error::DecryptFailed`](crate::Error::DecryptFailed): the resolver's job is
+/// to guarantee every selectable index is present, so a gap here is a resolver
+/// bug, not silent loss.
 fn apply_aacs_map(
     buf: &mut [u8],
     keys: &DecryptKeys,
@@ -462,23 +449,16 @@ fn apply_aacs_map(
         }
     }
 
-    // Cheap safety net for the "map must be right" model: with a correct
-    // phase-aware map, every CORRECT-PHASE forensic unit decrypts to clean TS, so
-    // this never fires in the happy path — but a map bug (wrong phase/key for a
-    // segment) surfaces as a loud DecryptFailed instead of silent corruption. Only
-    // forensic (Even/Odd) ranges are verified; base / multi-CPS (All) stays
-    // trust-only, so the common disc is byte-for-byte unchanged.
+    // Cheap safety net: a correct map always decrypts CORRECT-PHASE forensic
+    // units to clean TS, so this never fires happy-path — a map bug surfaces as
+    // loud DecryptFailed, not silent corruption. Only forensic ranges are verified.
     let verify_failed = std::sync::atomic::AtomicBool::new(false);
 
     let decrypt_one = |idx_in_buf: usize, chunk: &mut [u8]| {
         if chunk.len() != unit_len {
-            // Trailing partial unit (buffer/region tail shorter than a whole unit).
-            // Normally a genuinely-clear content tail (source-zero padding or a
-            // short final fragment) — leave as-is. But a partial that is BOTH inside
-            // a mapped (encrypted) range AND flagged encrypted in its clear seed is
-            // an encrypted unit split across a boundary: a CBC fragment we cannot
-            // decrypt, so emitting it verbatim would ship ciphertext as clear. Fail
-            // loud instead (restores the guard the removed `decrypt_sectors` had).
+            // Trailing partial unit: normally a genuinely-clear tail, left as-is. But
+            // one that is BOTH inside a mapped range AND flagged encrypted is a CBC
+            // fragment we cannot decrypt — fail loud instead of shipping it as clear.
             let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
             if map.entry_for(unit_lba).is_some()
                 && aacs::content::aacs_unit_seed_encrypted(chunk, format)
@@ -488,20 +468,9 @@ fn apply_aacs_map(
             return;
         }
         let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
-        // No range covers this LBA. That is expected for clear filesystem / nav
-        // on a whole-disc read — but "the map has no key here" and "there is
-        // nothing to decrypt here" are different statements, and only the
-        // second makes passing the unit through correct.
-        //
-        // An ENCRYPTED unit outside every range is content we cannot key: on a
-        // multi-CPS disc that is an orphan clip referenced by no playlist, so
-        // it sits in no title extent and therefore in no range. Emitting it
-        // verbatim ships ciphertext where plaintext is meant to be, and extract
-        // then counts those bytes as good and reports the file complete.
-        //
-        // The split-unit branch immediately above already draws exactly this
-        // distinction. This one did not, so it was reached before the
-        // `aacs_unit_encrypted` gate below ever ran.
+        // No range covers this LBA — expected for clear filesystem/nav, but an
+        // ENCRYPTED unit outside every range is an orphan clip we cannot key;
+        // emitting it verbatim would ship ciphertext as clear content.
         let Some((key_idx, phase, range_start)) = map.entry_for(unit_lba) else {
             if aacs::content::aacs_unit_seed_encrypted(chunk, format) {
                 verify_failed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -568,8 +537,8 @@ fn apply_aacs_map(
 /// reader was built without installing its map (a bug), so it fails loud rather
 /// than apply a guessed key.
 ///
-/// `unit_key_idx` and `content` are legacy parameters kept so the CSS / `None`
-/// wrapper signatures stay stable; they are ignored (the CSS arm self-gates on its
+/// `unit_key_idx` is a legacy parameter kept so the CSS / `None` wrapper
+/// signature stays stable; it is ignored (the CSS arm self-gates on its
 /// per-sector scramble flag). Returns `Err` if decryption was expected but
 /// impossible; never produces silently corrupted output. The `usize` return is a
 /// legacy unverified-byte count that is always `0` for the CSS / `None` arms.
@@ -629,12 +598,9 @@ fn decrypt_span(
     let dropped: usize = match keys {
         DecryptKeys::None => 0,
         DecryptKeys::Aacs { .. } => {
-            // AACS decrypts EXCLUSIVELY through a resolved key map: the map keys
-            // every content unit up front and a missing key fails at RESOLVE
-            // time. No map here means an AACS reader was built without
-            // installing one — the old trial-decrypt path (try each held key,
-            // keep the first-tried plaintext on a miss) is gone precisely
-            // because it silently applied wrong keys.
+            // AACS decrypts EXCLUSIVELY via a resolved key map (missing key fails at
+            // RESOLVE time). No map here means the reader was built without one — the
+            // old trial-decrypt path is gone: it silently applied wrong keys on a miss.
             let Some(map) = map else {
                 return Err(crate::error::Error::DecryptFailed);
             };
@@ -642,12 +608,9 @@ fn decrypt_span(
             0
         }
         DecryptKeys::Css { title_key } => {
-            // CSS SELF-recovers: the title key changes per VOB region and is
-            // re-cracked constantly, but always FROM THE DATA ITSELF — no external
-            // input. So the whole descramble-and-rekey is self-contained here (see
-            // `css::descramble_region`), and CSS does not need the post-decrypt
-            // recovery seam that AACS key-fetch / FMTS segment-skip use (those DO
-            // consume external inputs a `decrypt_sectors` caller cannot supply).
+            // CSS SELF-recovers: the title key changes per VOB region and is re-cracked
+            // constantly, but always FROM THE DATA ITSELF (see `css::descramble_region`),
+            // so it needs none of the external-input recovery seam AACS key-fetch uses.
             css::descramble_region(buf, title_key)?
         }
     };
@@ -1030,11 +993,9 @@ mod tests {
     /// scramble flag.
     fn make_css_sector(title_key: &[u8; 5], seed: &[u8; 5], body_fill: u8) -> (Vec<u8>, Vec<u8>) {
         let mut sector = vec![body_fill; 2048];
-        // A real scrambled DVD sector is an MPEG-2 PS pack, so it begins with
-        // the pack start code. The descrambler requires it before trusting
-        // byte 0x14 — without it this fixture is a sector shape that cannot
-        // occur on a disc, and the test would pass while the production gate
-        // rejected every sector like it.
+        // A real scrambled DVD sector is an MPEG-2 PS pack starting with the pack
+        // start code; the descrambler requires it before trusting byte 0x14. Without
+        // it the fixture is a shape that can't occur on disc, masking a rejecting gate.
         sector[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         sector[0x14] = 0x30; // scramble flag (bits 4-5)
         sector[0x54..0x59].copy_from_slice(seed);
@@ -1437,10 +1398,9 @@ mod tests {
         use crate::disc::Extent;
         let us = (aacs::content::ALIGNED_UNIT_LEN / 2048) as u32; // 3
 
-        // Case A — range_start is itself unaligned (1001 % 3 == 2) and the extent
-        // begins on it, so unit offsets are 0, 3, 6, ... Under this shape the
-        // formula `(lba + range_start) / us` shifts every index by an ODD amount
-        // and inverts the kept half.
+        // Case A — range_start is itself unaligned (1001 % 3 == 2), so unit offsets
+        // are 0, 3, 6, ... Under this shape `(lba + range_start) / us` shifts every
+        // index by an ODD amount and inverts the kept half.
         let ext = vec![Extent {
             start_lba: 1001,
             sector_count: 12,
@@ -1462,11 +1422,9 @@ mod tests {
              units are the even-indexed ones counting from the range start"
         );
 
-        // Case B — the extent begins one unit-remainder away from the range start
-        // (1001 - 1000 = 1), so offsets are 1, 4, 7, 10. Here `(lba - range_start)
-        // * us` inverts the halves instead: the division is what maps a byte
-        // offset onto a unit index, and multiplying happens to preserve parity
-        // only when the offset is already a multiple of the unit size.
+        // Case B — the extent begins one unit-remainder from the range start (1001 -
+        // 1000 = 1), so offsets are 1, 4, 7, 10. Here `(lba - range_start) * us`
+        // inverts the halves: multiplying only preserves parity for aligned offsets.
         let ext = vec![Extent {
             start_lba: 1001,
             sector_count: 12,
@@ -1876,22 +1834,16 @@ mod tests {
         }
 
         // The index must be RANGE-RELATIVE: `(lba - start)`, not `(lba + start)`.
-        // Most value pairs give the same parity either way, so pin one where
-        // they genuinely disagree: (5-1)/2 = 2 (even, ours) but
+        // Pin a case where they genuinely disagree: (5-1)/2 = 2 (even, ours) but
         // (5+1)/2 = 3 (odd, not ours).
         assert!(
             unit_is_our_phase(5, 1, 2, Phase::Even),
             "the index must be measured from the range start"
         );
 
-        // The `/ unit_sectors` -> `* unit_sectors` mutant is EQUIVALENT here,
-        // and deliberately not chased. Proof: aligned offsets are exact
-        // multiples of the unit size, so offset = k*u for unit index k.
-        // Dividing gives k; multiplying gives k*u^2, whose parity is
-        // parity(k)*parity(u^2) = parity(k) whenever u is ODD. `unit_sectors`
-        // is `ALIGNED_UNIT_LEN / 2048` = 3, a compile-time constant, so u is
-        // always odd and the two agree on every reachable input. Only an even
-        // unit size would separate them, and none exists.
+        // The `/ unit_sectors` -> `* unit_sectors` mutant is EQUIVALENT here and
+        // deliberately not chased: aligned offsets are k*u, and dividing vs.
+        // multiplying give the same parity since `unit_sectors` (=3) is always odd.
         assert!(!unit_is_our_phase(33, 30, 3, Phase::Even));
     }
 

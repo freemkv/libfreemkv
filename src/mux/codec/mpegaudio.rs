@@ -51,10 +51,9 @@ fn mpa_verdict(data: &[u8]) -> MpaVerdict {
     {
         return MpaVerdict::Invalid;
     }
-    // NOTE: bitrate_index == 0 (free format) is NOT rejected. It is a legal,
-    // decodable MPEG-audio mode (the spec permits it and a decoder derives the
-    // frame size from the sync spacing). Dropping it would be a false positive on
-    // a clean stream, so it passes the gate.
+    // bitrate_index == 0 (free format) is NOT rejected: it's a legal, decodable
+    // mode (decoder derives frame size from sync spacing); rejecting it would
+    // be a false positive on a clean stream.
     MpaVerdict::Valid
 }
 

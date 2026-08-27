@@ -545,10 +545,8 @@ fn scan_image_enumerates_a_bdmv_folder() {
     let (s, _, _) = bdmv_scratch();
     let mut img = DirImage::open(s.path()).unwrap();
     let cap = img.capacity_sectors();
-    // The playlist here is filler, so no titles are expected — what is being
-    // asserted is that the scan reaches the BD enumerator at all (it would
-    // return `UdfNotFilesystem` if the synthesized volume did not parse) and
-    // reports the structure it found.
+    // Playlist is filler, no titles expected; this asserts the scan reaches the
+    // BD enumerator at all (would return `UdfNotFilesystem` if unparseable).
     let disc = crate::disc::Disc::scan_image(&mut img, cap, &crate::disc::ScanOptions::default())
         .expect("scan_image must accept a synthesized BDMV image");
     assert!(!disc.encrypted, "a decrypted folder has no AACS directory");
@@ -686,15 +684,8 @@ fn an_aacs_folder_with_scrambled_content_is_rejected() {
 }
 
 // ── The OTHER door: `dir://` through the PES input path ─────────────────────
-//
-// `session::scan_dir` (covered above) and `mux::resolve::input("dir://…")` are
-// two doors into the same folder, and they once disagreed: a folder that ripped
-// fine through one failed through the other, because only `scan_dir` re-judged
-// the tree-shape encryption verdict from CONTENT. The fix was to share
-// `session::apply_folder_encryption_verdict` between them — see its doc
-// comment, which names this exact failure. Nothing tested the second door, so
-// dropping the `is_folder` argument at `mux::resolve`'s call site restored the
-// bug silently.
+// `scan_dir` and `mux::resolve::input("dir://…")` once disagreed: only `scan_dir`
+// re-judged the verdict from CONTENT. Fixed via `apply_folder_encryption_verdict`.
 
 /// The two doors must AGREE. Same folder, same verdict, same extents.
 ///
@@ -976,10 +967,9 @@ fn dump_vts_ifo_reads_for_an_image() {
         let p = format!("/VIDEO_TS/VTS_{n:02}_0.IFO");
         match fs.read_file(&mut img, &p) {
             Ok(b) => {
-                // Hash the CONTENT, not just the length: two IFOs of equal
-                // size and magic can still differ, and comparing only length
-                // and magic is what made an earlier pass of this diagnostic
-                // wrongly report the images as identical.
+                // Hash the CONTENT, not just length: two IFOs of equal size and
+                // magic can still differ, which is why an earlier pass of this
+                // diagnostic wrongly reported the images as identical.
                 let mut h: u64 = 0xcbf2_9ce4_8422_2325;
                 for byte in &b {
                     h ^= *byte as u64;

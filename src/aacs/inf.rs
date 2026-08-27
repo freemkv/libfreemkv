@@ -67,6 +67,7 @@ pub fn disc_hash_hex(hash: &[u8; 20]) -> String {
 /// Parse Unit_Key_RO.inf from raw bytes.
 ///
 /// Format (from AACS spec):
+/// ```text
 ///   [0..4]   BE32: offset to key storage area (uk_pos)
 ///   [16]     app_type (1 = BD-ROM)
 ///   [17]     num_bdmv_dir
@@ -81,6 +82,7 @@ pub fn disc_hash_hex(hash: &[u8; 20]) -> String {
 ///   [uk_pos+48..]        encrypted keys, 16 bytes each
 ///                         AACS 1.0: 48-byte stride
 ///                         AACS 2.0 / 2.1: 64-byte stride (48 + 16 extra)
+/// ```
 pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFile> {
     if data.len() < 20 {
         return None;
@@ -135,18 +137,16 @@ pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFil
         pos += stride;
     }
 
-    // The loop above `break`s if the buffer runs out mid-key. A short list
-    // means the .inf is malformed/truncated — reject it rather than silently
-    // accepting fewer keys than the header declared, which would later map
-    // title CPS units to nonexistent keys.
+    // The loop `break`s if the buffer runs out mid-key; a short list means the .inf
+    // is malformed/truncated — reject rather than silently mapping title CPS units
+    // to fewer keys than the header declared.
     if encrypted_keys.len() != num_uk {
         return None;
     }
 
-    // Title → CPS unit mapping (AACS Unit_Key_RO format): each on-disc CPS
-    // value is in `1..=num_uk` (else zeroes it) and converts the 1-based on-disc
-    // index to a 0-based key index. We mirror that so the stored value is a safe,
-    // ready-to-use key index rather than a raw 1-based number.
+    // Title → CPS unit mapping (AACS Unit_Key_RO format): validates the on-disc
+    // CPS value is in `1..=num_uk` (else zeroes it) and converts it from 1-based
+    // to a safe, ready-to-use 0-based key index.
     let to_key_idx = |cps: u16| -> u16 {
         if cps >= 1 && cps as usize <= num_uk {
             cps - 1
@@ -382,10 +382,8 @@ pub fn parse_content_cert(data: &[u8]) -> Option<ContentCert> {
         return None;
     }
 
-    // Content Certificate layout (per the AACS content-cert format):
-    //   [0]      certificate type (0x00 = AACS1, 0x10 = AACS2)
-    //   [1] bit7 bus_encryption_enabled_flag  (`p[1] >> 7`)
-    //   [14..20] cc_id (6 bytes)             (`p + 14`)
+    // Content Certificate layout: [0] cert type (0x00 AACS1/0x10 AACS2),
+    // [1] bit7 bus_encryption_enabled_flag, [14..20] cc_id (6 bytes).
     let version = if data[0] == 0x00 {
         AacsVersion::V10
     } else {
@@ -444,10 +442,9 @@ mod vtkf_tests {
         let data = synth_vtkf(&[k1, k2, k3]);
 
         let ukf = parse_vtkf(&data).expect("valid VTKF must parse");
-        // Exactly the three present entries — the empty slots and the trailing
-        // 16-byte TKF MAC are NOT mistaken for keys. Critically, k2/k3 are read
-        // at the 36-byte stride (offsets 0xA4, 0xC8); the old 32-byte stride
-        // misread them from inside the previous entry's binding MAC.
+        // Exactly the three present entries — empty slots and the trailing 16-byte
+        // TKF MAC are not mistaken for keys. k2/k3 are read at the 36-byte stride
+        // (0xA4, 0xC8); the old 32-byte stride misread them from the prior MAC.
         assert_eq!(ukf.encrypted_keys.len(), 3);
         assert_eq!(
             ukf.encrypted_keys[0],

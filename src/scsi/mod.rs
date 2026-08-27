@@ -214,11 +214,8 @@ mod cdb_len_tests {
 }
 
 // ── SPC-4 sense keys (§4.5.6 Table 28) ─────────────────────────────────────
-//
-// Broad failure category returned in a CHECK CONDITION reply's sense data.
-// Names match the SCSI spec; predicate methods on [`ScsiSense`] (e.g.
-// `is_medium_error`, `is_unit_attention`) read more fluently than raw
-// constant comparisons at call sites.
+// Names match the SCSI spec; predicate methods on [`ScsiSense`] read more
+// fluently than raw constant comparisons at call sites.
 
 pub const SENSE_KEY_NO_SENSE: u8 = 0x00;
 pub const SENSE_KEY_RECOVERED_ERROR: u8 = 0x01;
@@ -558,49 +555,17 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
     }
 }
 
-// Note: a top-level `scsi::reset()` used to live here, wrapping a
-// platform reset in a thread+recv_timeout so a kernel-wedged ioctl
-// couldn't hang the caller. Removed in 0.13.6 along with the
-// SG_SCSI_RESET / STOP+START UNIT escalation that needed it. The
-// remaining platform reset (Linux: SgIoTransport::reset, available
-// for explicit opt-in) does pure userspace state cleanup with bounded
-// sleeps — no escape-hatch wrapper required.
+// Note: a top-level `scsi::reset()` wrapping platform reset in a
+// thread+recv_timeout used to live here; removed in 0.13.6 along with the
+// SG_SCSI_RESET / STOP+START UNIT escalation it existed to guard.
 
-// ── USB-layer recovery: rolled back in 0.13.4 ───────────────────────────────
-//
-// 0.13.1 – 0.13.3 exposed `scsi::usb_reset()` (`USBDEVFS_RESET` on Linux,
-// `IOUSBDeviceInterface::ResetDevice` on macOS) and chained it into
-// `drive_has_disc` recovery. Production testing on the LG BU40N USB BD-RE
-// confirmed the USB stack resets succeed — dmesg logs
-// `usb 3-2: reset high-speed USB device` and the device re-authorises —
-// but the drive firmware below the USB bridge stays locked: LUN never
-// re-enumerates, TUR still times out, the drive is unusable until
-// physical unplug-replug or host reboot. Additional approaches tried
-// and discarded: `authorized` 0→1 toggle, usb-storage driver
-// unbind/rebind, forced SCSI host rescan, `STOP` + `START UNIT`.
-//
-// The APIs were removed so no caller can be misled into thinking a
-// software-only recovery exists for this class of wedge. If a future
-// hardware class surfaces where USB-layer recovery actually helps, the
-// code should live here again, gated on a wedge signature — see git
-// tag `v0.13.3` for the full implementation.
+// USB-layer recovery (`scsi::usb_reset()`) was rolled back in 0.13.4: on
+// the LG BU40N the USB reset itself succeeds but firmware below the
+// bridge stays locked until unplug-replug. See git tag `v0.13.3`.
 
-// ── Lightweight discovery + presence probes ─────────────────────────────────
-//
-// These two are the *only* hardware-touching APIs autorip + freemkv CLI use
-// outside the rip path itself. They're intentionally cheap:
-//
-// - `list_drives()` is a one-shot enumeration: filesystem walk for sg/cdrom
-//   nodes, type-5 filter, single INQUIRY per candidate. No firmware, no
-//   reset-on-open, no init. Caller caches the result.
-// - `drive_has_disc(path)` is a single TEST UNIT READY (six-byte CDB, no
-//   data transfer) with internal wedge-recovery escalation. Callers in a
-//   poll loop don't need any other primitive to detect "disc inserted /
-//   removed" — and they never see the SCSI-vs-USB-reset escalation.
-//
-// `Drive::open` + `drive.init()` + `Disc::scan` remain heavy and on-demand;
-// callers only invoke them once they've decided to actually rip / verify a
-// specific drive.
+// The only hardware-touching APIs autorip + freemkv CLI use outside the
+// rip path: a one-shot `list_drives()` enumeration and a single-TUR
+// `drive_has_disc(path)`. `Drive::open`/`init()`/`Disc::scan` stay heavy.
 
 /// One optical drive on the system. Returned by [`list_drives`]. The
 /// fields are populated from a single INQUIRY at enumeration time —
@@ -1005,10 +970,9 @@ mod parse_sense_tests {
 
     #[test]
     fn descriptor_format_key_nibble_masked() {
-        // Descriptor byte 1 low nibble is the sense key. Even though the
-        // upper nibble of byte 1 is reserved in descriptor format, the
-        // parser masks &0x0F unconditionally; set the high nibble and
-        // confirm it doesn't leak.
+        // Byte 1's upper nibble is reserved in descriptor format; the
+        // parser masks &0x0F unconditionally, so set garbage there and
+        // confirm it doesn't leak into the decoded sense key.
         let mut s = buf32();
         s[0] = 0x72;
         s[1] = 0xF3; // upper nibble garbage + key 3 (MEDIUM ERROR)
@@ -1052,10 +1016,9 @@ mod parse_sense_tests {
 
     #[test]
     fn fixed_format_short_buffer_asc_ascq_default_zero() {
-        // Fixed format needs n>=13 for ASC, n>=14 for ASCQ. A reply that
-        // only has the key byte (e.g. an 8-byte sense reply, common from
-        // some bridges) must yield asc=ascq=0, never read past the
-        // written region. Sense key must still decode.
+        // Fixed format needs n>=13 for ASC, n>=14 for ASCQ. A short reply
+        // (e.g. an 8-byte sense, common from some bridges) must yield
+        // asc=ascq=0, never read past the written region.
         let mut s = buf32();
         s[0] = 0x70;
         s[2] = 0x04; // HARDWARE ERROR
@@ -1325,9 +1288,8 @@ mod cdb_builder_tests {
     #[test]
     fn read_buffer_offset_truncates_to_24_bits_low() {
         // The CDB offset field is 24-bit; the builder takes the low three
-        // bytes of the u32. A value with a non-zero top byte must encode
-        // only the low 24 bits (matching the wire field width). This
-        // documents the actual contract, not a guess.
+        // bytes of the u32, so a non-zero top byte must not leak into
+        // the encoded field. Documents the actual wire contract.
         let cdb = build_read_buffer(0, 0, 0xFF01_0203, 0);
         assert_eq!(&cdb[3..6], &[0x01, 0x02, 0x03]);
     }

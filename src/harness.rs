@@ -136,11 +136,9 @@ fn sweep_n<F: FnMut(&[u8])>(target: &str, magic: &[u8], n: usize, mut f: F) {
         run(target, "magic+noise", s, i, &buf, &mut f);
     }
 
-    // 3. Structured mutation of a plausible record: a valid magic, then mostly
-    //    zeroes, with a handful of bytes corrupted and a truncation. Length and
-    //    offset fields live in those early bytes, so this is what reaches the
-    //    arithmetic — the offsets, counts and sizes a hostile image would lie
-    //    about.
+    // 3. Structured mutation: valid magic, mostly zeroes, a handful of bytes
+    //    corrupted plus truncation. Length/offset fields live in those early
+    //    bytes, so this reaches the arithmetic a hostile image would lie about.
     let mut rng = Rng::new(s ^ 0x1234_5678_9ABC_DEF0);
     for i in 0..n {
         let mut buf = vec![0u8; 512];
@@ -196,10 +194,9 @@ fn bdnav_mobj_parse_never_panics() {
 
 #[test]
 fn dvd_nav_resolve_never_panics() {
-    // The DVD First-Play navigation resolver parses VMGI (`VIDEO_TS.IFO`) —
-    // FP_PGC command table + TT_SRPT, all attacker-controlled offsets/counts —
-    // and executes an untrusted command list on a bounded VM. Magic is the VMGI
-    // signature so the sweep reaches past the header guard into the executor.
+    // The DVD First-Play resolver parses VMGI (FP_PGC + TT_SRPT, all
+    // attacker-controlled) and executes an untrusted command list on a bounded
+    // VM. Magic is the VMGI signature, so the sweep reaches the executor.
     sweep("dvd_nav", b"DVDVIDEO-VMG", |b| {
         let _ = crate::dvdnav::nav::resolve_from_vmg(b);
     });
@@ -216,11 +213,9 @@ fn udf_name_parse_never_panics() {
 
 #[test]
 fn class_reader_parse_never_panics() {
-    // Java `.class` files are a documented format we READ (never execute) to
-    // recover BD-J stream labels — a peer of mpls/clpi here. Every count,
-    // length and constant-pool index in the file is attacker-controlled disc
-    // metadata, so the parser must reject malformed input with `Err`, never
-    // panic. Magic is the class-file magic `0xCAFEBABE`.
+    // Java `.class` files are READ (never executed) to recover BD-J stream
+    // labels. Every count/length/constant-pool index is attacker-controlled
+    // disc metadata, so the parser must reject malformed input, never panic.
     sweep("class_reader", &[0xCA, 0xFE, 0xBA, 0xBE], |b| {
         if let Ok(class) = crate::labels::class_reader::ClassFile::parse(b) {
             // Exercise the accessors a label parser drives, so their indexing
@@ -246,11 +241,9 @@ fn class_reader_parse_never_panics() {
 
 #[test]
 fn jar_class_walk_never_panics() {
-    // The jar layer opens a `/BDMV/JAR/<x>.jar` (a zip) and walks every
-    // `.class` inside it, handing each to the class reader. Feed the sweep's
-    // bytes as a zip archive; when they parse as one, walk the classes exactly
-    // as `deluxe`/`dbp` do. Neither the zip open nor the class walk may panic.
-    // Magic is the zip local-file-header signature `PK\x03\x04`.
+    // The jar layer opens a `/BDMV/JAR/<x>.jar` zip and walks every `.class`
+    // inside, handing each to the class reader (as `deluxe`/`dbp` do). Neither
+    // the zip open nor the class walk may panic. Magic: `PK\x03\x04`.
     sweep("jar", &[0x50, 0x4B, 0x03, 0x04], |b| {
         if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(b.to_vec())) {
             crate::labels::jar::for_each_class(&mut archive, |_name, _class| {});
@@ -260,14 +253,9 @@ fn jar_class_walk_never_panics() {
 
 #[test]
 fn deluxe_bytecode_decode_never_panics() {
-    // The Deluxe BD-J label parser runs a symbolic stack machine over `<clinit>`
-    // bytecode (`decode_binding_class`). Fuzzing it THROUGH a zip is vacuous —
-    // `zip::ZipArchive::new` validates the end-of-central-directory record at the
-    // buffer's end, which the generators (front magic + noise) cannot synthesize,
-    // so the archive open always fails and the decoder is never reached. Drive
-    // the decoder DIRECTLY instead: parse the sweep bytes as a `.class` (they also
-    // exercise the class parser) and run the bytecode decoder over it with an
-    // empty master-enum table. None may panic on crafted/corrupt bytecode.
+    // Deluxe's BD-J parser runs a symbolic stack machine over `<clinit>`
+    // bytecode. Fuzzing THROUGH a zip is vacuous (generators can't fake a valid
+    // end-of-central-directory), so drive the decoder DIRECTLY on a `.class`.
     let master = crate::labels::deluxe::MasterEnumTable::from(&[] as &[(
         &'static str,
         crate::labels::deluxe::MasterEnum,
@@ -292,10 +280,9 @@ fn fox_dcx_labels_never_panics() {
 
 #[test]
 fn bdnav_vm_resolve_never_panics() {
-    // The HDMV navigation VM executes an untrusted `MovieObject.bdmv` command
-    // list on a bounded VM. Parse the sweep bytes as a MovieObject set and run
-    // the VM from a First-Play entry — the combined parse+execute path a real
-    // disc drives, which the per-parser index/mobj sweeps never reach.
+    // The HDMV nav VM executes an untrusted MovieObject.bdmv command list.
+    // Parse sweep bytes as a MovieObject set and run the VM from First-Play —
+    // the combined parse+execute path the per-parser index/mobj sweeps miss.
     use crate::bdnav::index::{Index, PlaybackObj};
     sweep("bdnav_vm", b"MOBJ", |b| {
         if let Some(mobjs) = crate::bdnav::mobj::parse(b) {
@@ -311,10 +298,9 @@ fn bdnav_vm_resolve_never_panics() {
 
 #[test]
 fn ps_demuxer_feed_never_panics() {
-    // Stateful, unlike the others: the demuxer carries a buffer across feeds, so
-    // each case is fed to a FRESH demuxer and then a shared one. The shared pass
-    // is what exercises cross-feed state — a start code split over a boundary,
-    // a held PES completed by later bytes, the carry-over cap.
+    // Stateful, unlike the others: the demuxer carries a buffer across feeds.
+    // Each case is fed to a FRESH demuxer, then a shared one — the shared pass
+    // exercises cross-feed state: split start codes, held PES, the carry cap.
     let mut shared = crate::mux::ps::PsDemuxer::new();
     sweep("ps_demux", &[0x00, 0x00, 0x01, 0xBA], |b| {
         let mut fresh = crate::mux::ps::PsDemuxer::new();

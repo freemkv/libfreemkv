@@ -352,14 +352,9 @@ fn read_filesystem_with_subdirectory() {
     let mut reader = MockSectorReader::new();
     let partition_start: u32 = 512;
 
-    // Layout (all relative to partition_start which equals metadata_start):
-    //   meta LBA 0 = FSD
-    //   meta LBA 1 = root ICB
-    //   meta LBA 2 = root dir data
-    //   meta LBA 3 = BDMV ICB
-    //   meta LBA 4 = BDMV dir data
-    //   meta LBA 5 = test.mpls file ICB
-    //   meta LBA 10 = test.mpls file data (partition-relative)
+    // Layout, meta LBAs relative to partition_start (== metadata_start): 0=FSD,
+    // 1=root ICB, 2=root dir data, 3=BDMV ICB, 4=BDMV dir data, 5=test.mpls
+    // ICB, 10=test.mpls file data.
 
     reader.set_sector(256, make_avdp_sector(32));
     reader.set_sector(32, make_pvd_sector("DISC_WITH_BDMV"));

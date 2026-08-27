@@ -83,20 +83,16 @@ pub fn resolve_keys_for(
         };
     };
 
-    // Build the ordered sources once for the up-front resolve. Sampling reads the
-    // disc, so skip it when there is no source to validate against (a dropped /
-    // SSRF-rejected online-only source) — resolution is a miss regardless and the
-    // read would be pure waste.
+    // Build the ordered sources once for the up-front resolve. Skip the disc-reading
+    // sample step when there is no source to validate against (a dropped / SSRF-
+    // rejected online-only source) — resolution is a miss regardless; the read is waste.
     let src_vec = sources();
     inputs.samples = if src_vec.is_empty() {
         Vec::new()
     } else {
-        // Sample encrypted units from the LARGEST title that has video — the
-        // main feature carries the most units to validate a key against, while a
-        // size-inflated STREAMLESS decoy (the biggest title on some obfuscated
-        // UHDs) would waste the read on the wrong title. Falls back to the
-        // largest title outright when none has video (title-less/empty discs and
-        // the pre-scan sampling path).
+        // Sample from the LARGEST title that HAS video — the main feature carries the
+        // most validation units, avoiding a size-inflated STREAMLESS decoy on some
+        // obfuscated UHDs. Falls back to largest title outright when none has video.
         match disc
             .titles
             .iter()
@@ -162,7 +158,7 @@ pub struct KeySpec {
 ///
 /// Owns the [`Drive`] by value. Consumers that still need the raw drive (e.g.
 /// to sample ciphertext for key validation, or to move it into a
-/// `DiscStream`) reach it via [`Self::drive_mut`] / [`Self::into_drive`]; the
+/// `DiscStream`) reach it via [`Self::into_drive`]; the
 /// scanned [`Disc`] comes out via [`Self::disc`] / [`Self::take_disc`].
 pub struct DiscSession {
     /// The opened drive. `Some` from [`Self::open`] until
@@ -221,10 +217,9 @@ impl DiscSession {
             })?,
         };
 
-        // Advisory bring-up — non-fatal in every consumer today. Preserve that:
-        // log and continue, never propagate. (The CLI printed these to stderr /
-        // discarded them; autorip `tracing::warn`'d them. The advisory SEMANTICS
-        // are what matter and are preserved identically; the sink is now here.)
+        // Advisory bring-up — non-fatal in every consumer today. Preserve that: log
+        // and continue, never propagate (CLI discarded these, autorip warned) — the
+        // advisory semantics are preserved identically; only the sink moved here.
         if let Err(e) = drive.wait_ready() {
             tracing::warn!(target: "freemkv::session", error = %e, "wait_ready advisory failed (continuing)");
         }
@@ -249,12 +244,9 @@ impl DiscSession {
     /// Fast disc identification — name/format only, no playlist parse. Wraps
     /// [`Disc::identify`].
     pub fn identify(&mut self) -> Result<DiscId> {
-        // Same reachability as `scan` / `resolve_keys` below: the PUBLIC
-        // `stage_drive_as_reader` / `into_drive` move the drive out of the
-        // session, so this slot can legitimately be empty when a caller reaches
-        // here. A library must not panic from public API — going through
-        // `drive_mut` would hit its `.expect("drive present")`. Return the same
-        // typed `DeviceNotReady` its two siblings already do.
+        // Same reachability as `scan`/`resolve_keys`: public `stage_drive_as_reader`/
+        // `into_drive` move the drive out, so this slot can legitimately be empty.
+        // A library must not panic from public API, so return typed `DeviceNotReady`.
         let drive = self.drive.as_mut().ok_or_else(|| Error::DeviceNotReady {
             path: self.device.clone(),
         })?;
@@ -266,11 +258,9 @@ impl DiscSession {
     /// set), runs [`Disc::scan`], stores the result, and returns a borrow.
     pub fn scan(&mut self, opts: ScanOptions) -> Result<&Disc> {
         let opts = forward_key_material(&mut self.spec, opts);
-        // `stage_drive_as_reader` is PUBLIC and moves the drive into the reader
-        // slot, so this slot can legitimately be empty when a caller reaches
-        // here. A library must not panic from public API, and "no shipped
-        // consumer calls it in that order" is not the same as "cannot happen" —
-        // the public surface permits it, so it must be an error.
+        // `stage_drive_as_reader` is PUBLIC and moves the drive out, so this slot can
+        // legitimately be empty here. "No shipped consumer calls it in that order" is
+        // not "cannot happen" — the public surface permits it, so it must be an error.
         let drive = self.drive.as_mut().ok_or_else(|| Error::DeviceNotReady {
             path: self.device.clone(),
         })?;
@@ -540,29 +530,9 @@ fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result
     use crate::consts::SECTOR_BYTES;
 
     const UNIT_SECTORS: u32 = 3;
-    // Anchor on the largest TITLE's FIRST extent, not on the largest extent
-    // anywhere.
-    //
-    // AACS units are 3 sectors, and a unit boundary is only guaranteed at the
-    // START of a clip. `max_by_key` over every extent picked a mid-file one for
-    // any clip big enough to be split: the planner caps an allocation
-    // descriptor at MAX_AD_BYTES = 524287 sectors, every full piece of a split
-    // file therefore ties on sector_count, and `max_by_key` returns the LAST
-    // tie — an extent starting (k-1)*524287 sectors in. 524287 % 3 == 1, so
-    // that start is off the unit boundary for two file sizes in three.
-    //
-    // The sampling then reads 6144-byte windows that begin mid-source-packet,
-    // so the CPI byte it thinks it is testing is content. Both verdicts are
-    // wrong in a costly direction: a decrypted folder gets rejected as
-    // encrypted (DirImageEncrypted on something perfectly rippable), or
-    // genuine ciphertext reads as clear and the mux writes it out as video at
-    // exit 0. `is_unit_aligned` cannot catch it, because it measures against
-    // this same wrong base.
-    // Probe the first extent of the LARGEST title that has video — the movie —
-    // not merely the largest-by-sector-count title, which on an obfuscated disc
-    // can be a streamless decoy whose base would mismeasure the ciphertext
-    // alignment for the actual feature. Falls back to the largest title when
-    // none has video.
+    // Anchor on the largest TITLE's FIRST extent (video preferred, skipping an
+    // obfuscated decoy), never the largest extent anywhere: AACS units are 3 sectors,
+    // aligned only at a clip's START — misalignment risks a false clean/encrypted verdict.
     let Some(extent) = disc
         .titles
         .iter()
@@ -606,11 +576,9 @@ fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result
             return Ok(true);
         }
     }
-    // Nothing was actually sampled — the largest title is shorter than one
-    // aligned unit, so there is no evidence either way. "Not encrypted" is the
-    // dangerous default here: it would clear the structural verdict an `AACS`
-    // directory raised and rip ciphertext as though it were video, at exit 0.
-    // With no evidence, keep the structural verdict.
+    // Nothing was sampled (title shorter than one aligned unit) — no evidence either
+    // way. "Not encrypted" is the dangerous default: it would clear an `AACS`-directory
+    // verdict and rip ciphertext as video at exit 0. Keep the structural verdict instead.
     if sampled == 0 {
         return Ok(true);
     }

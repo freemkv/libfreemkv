@@ -153,13 +153,9 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
         let in_time = u32::from_be_bytes([item[12], item[13], item[14], item[15]]);
         let out_time = u32::from_be_bytes([item[16], item[17], item[18], item[19]]);
 
-        // Parse STN table from the first play item
-        // PlayItem layout after out_time:
-        //   [20:28] UO_mask_table (8 bytes)
-        //   [28]    misc flags (1 byte)
-        //   [29]    still_mode (1 byte)
-        //   [30:32] still_time (2 bytes)
-        //   [32:]   STN_table
+        // Parse STN table from the first play item. PlayItem layout after out_time:
+        // UO_mask_table(8) + misc flags(1) + still_mode(1) + still_time(2), then
+        // STN_table starting at STN_OFFSET.
         const STN_OFFSET: usize = 32;
         if item_idx == 0 && item.len() > STN_OFFSET + 16 {
             // STN header: length(2) + reserved(2) + counts(8) + reserved(4) = 16 bytes
@@ -238,11 +234,9 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                     entry.stream_type = 6;
                     entry.secondary = true;
                     streams.push(entry);
-                    // Skip extra ref bytes (audio refs + PG refs).
-                    // Use `next < item.len()` to match the sibling secondary
-                    // blocks; the inner `after_arefs < item.len()` re-guards
-                    // the second read, so the stricter `+2` only mis-aligned
-                    // spos when the aref count sits in the last 1-2 bytes.
+                    // Skip extra ref bytes (audio refs + PG refs). `next < item.len()`
+                    // matches the sibling secondary blocks; the inner
+                    // `after_arefs < item.len()` re-guards the second read near the end.
                     if next < item.len() {
                         let n_arefs = item[next] as usize;
                         let after_arefs = next + 2 + n_arefs + (n_arefs % 2);
@@ -370,13 +364,9 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
         return None;
     }
 
-    // PID location depends on the stream-entry type (BD spec stream_entry()):
-    //   type 1 (stream in the PlayItem's Clip):          PID at +2
-    //   type 2 (stream in a SubPath SubClip):            +subpath_id(1)+subclip_id(1) → PID at +4
-    //   type 3 / 4 (SubPath clip; type 4 = Dolby Vision  +subpath_id(1)              → PID at +3
-    //              enhancement layer, e.g. PID 0x1015):
-    // Previously only type 1 was handled, so the DV EL (type 4) and any
-    // sub-path stream fell through to PID 0 and were dropped by the mux.
+    // PID location depends on stream-entry type (BD spec stream_entry()): type 1
+    // (PlayItem's Clip) → +2; type 2 (SubPath SubClip) → +4; type 3/4 (SubPath
+    // clip / DV enhancement layer) → +3. Previously only type 1 was handled.
     let pid_off = match item[pos + 1] {
         STREAM_ENTRY_PLAYITEM_CLIP => 2,
         STREAM_ENTRY_SUBPATH_SUBCLIP => 4,
@@ -413,11 +403,9 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
     let mut color_space_val = 0u8;
     let mut language = String::new();
 
-    // `stream_type` here is the STN category passed by the caller, which is
-    // only ever a primary category (VIDEO/AUDIO/PG_SUBTITLE/IG). Secondary
-    // audio/video and the DV enhancement layer are parsed through their
-    // matching primary category (identical attribute layout) and re-tagged by
-    // the caller after this returns, so there are no secondary arms here.
+    // `stream_type` is the STN category from the caller — always a primary category
+    // (VIDEO/AUDIO/PG_SUBTITLE/IG). Secondary audio/video and the DV enhancement layer
+    // share the primary's attribute layout and are re-tagged by the caller afterward.
     match stream_type {
         STREAM_CATEGORY_VIDEO => {
             // Video: coding_type(1) + format_rate(1) + [hdr_info(1) if HEVC]
@@ -969,12 +957,9 @@ mod tests {
 
     #[test]
     fn mark_type_read_from_correct_offset() {
-        // Regression for the mark_type off-by-one: each PlayListMark entry is
-        // reserved(1) + mark_type(1) + .... The parser must read byte[1], not
-        // byte[0]. build_mpls_with_marks writes reserved=0 at byte[0] and the
-        // mark_type at byte[1], so a parser that read byte[0] would see 0 for
-        // every mark. Use distinct non-zero, non-1 types to make the offset
-        // error unmistakable.
+        // Regression for the mark_type off-by-one: PlayListMark is reserved(1)+mark_type(1)+...,
+        // so the parser must read byte[1], not byte[0]. build_mpls_with_marks sets reserved=0
+        // and mark_type=byte[1]; distinct non-zero/non-1 types make an offset error unmistakable.
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
         let marks = vec![
             TestMark {
@@ -1027,10 +1012,7 @@ mod tests {
         assert_eq!(playlist.marks.len(), 0);
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Added hardening tests below, grounded in the BD-ROM MPLS spec byte
-    // layout.
-    // ─────────────────────────────────────────────────────────────────────
+    // ─── Added hardening tests below, grounded in the BD-ROM MPLS spec byte layout ───
 
     /// Header guard: parse() requires `playlist_start + 10 <= data.len()`
     /// before reading the PlayList header (num_play_items at pl[6..8]).
@@ -1210,11 +1192,9 @@ mod tests {
     /// PG, and the PG must keep its correct PID (proving IG advanced spos).
     #[test]
     fn ig_consumed_but_not_retained_and_dv_after_aligned() {
-        // STN parse order is video, audio, PG, IG, sec_audio, sec_video,
-        // pip_pg, DV. The IG entry must be consumed (advancing spos) but
-        // never retained. To PROVE IG advanced the cursor, place a Dolby
-        // Vision EL after the IG: if IG didn't advance spos, the DV parse
-        // would land on the IG bytes and read the wrong PID.
+        // STN parse order is video, audio, PG, IG, sec_audio, sec_video, pip_pg, DV.
+        // The IG entry must be consumed (advancing spos) but never retained; placing
+        // a DV EL right after IG proves this — a wrong spos would misread the DV PID.
         let video = build_stream_entry_video(0x1011, 0x24, 8, 1, Some(0x12));
         let ig = build_stream_entry_pg(0x1400, 0x91, b"eng"); // IG entry bytes
         let dv = build_stream_entry_video(0x1015, 0x24, 8, 1, Some(0x12)); // DV EL

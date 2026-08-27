@@ -146,12 +146,9 @@ impl ScsiTransport for MacScsiTransport {
         cdb: &[u8],
         direction: DataDirection,
         data: &mut [u8],
-        // NOTE: timeout_ms is currently ignored on macOS. The C shim
-        // (`macos_shim.c`) hardcodes `SetTimeoutDuration(task, 30000)`, so
-        // every command uses a fixed 30 s budget regardless of the
-        // caller's READ_TIMEOUT_MS / READ_RECOVERY_TIMEOUT_MS / TUR value.
-        // Plumbing it through the shim signature is tracked separately;
-        // macOS is dev/test-only per the project rules.
+        // NOTE: timeout_ms is ignored on macOS — the C shim hardcodes a
+        // fixed 30s `SetTimeoutDuration`, tracked separately since macOS
+        // is dev/test-only per project rules.
         _timeout_ms: u32,
     ) -> Result<ScsiResult> {
         // Match the Linux guard: a >=4 GiB buffer would wrap when cast to
@@ -175,10 +172,9 @@ impl ScsiTransport for MacScsiTransport {
         let mut task_status: u8 = 0xFF;
         let mut transfer_count: u64 = 0;
 
-        // Reject an over-length CDB rather than truncating it. The guard now
-        // lives in `scsi::checked_cdb_len`, shared with the Linux and Windows
-        // backends (which used to truncate here instead of erroring) so it
-        // cannot drift per platform again.
+        // Reject an over-length CDB rather than truncating it; the guard
+        // lives in `scsi::checked_cdb_len`, shared with Linux and Windows
+        // so it cannot drift per platform again.
         let cdb_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
         let kr = unsafe {
             shim_execute(
@@ -195,14 +191,9 @@ impl ScsiTransport for MacScsiTransport {
         };
 
         if kr != 0 {
-            // Log the IOKit return before collapsing it. `open()` above decodes
-            // the shim's sentinel into typed variants rather than flattening
-            // every failure, but `execute()` discarded `kr` entirely — and this
-            // file had no tracing at all, where the Linux and Windows backends
-            // both log their execute failures. That left resource contention
-            // (another process taking exclusive access mid-rip) and a real
-            // hardware wedge indistinguishable, with no diagnostic trail on
-            // either.
+            // Log the IOKit return before collapsing it — `execute()` used
+            // to discard `kr` with no tracing, unlike Linux/Windows, leaving
+            // resource contention and a real hardware wedge indistinguishable.
             tracing::warn!(
                 target: "freemkv::scsi",
                 opcode = cdb.first().copied().unwrap_or(0),
@@ -227,9 +218,8 @@ impl ScsiTransport for MacScsiTransport {
 
         Ok(ScsiResult {
             status: 0,
-            // Clamp to the buffer length, matching the Linux transport's
-            // structural bound (data.len().saturating_sub(resid)). A lying
-            // drive/shim can't then produce a bytes_transferred that
+            // Clamp to the buffer length (matches Linux's structural bound)
+            // so a lying drive/shim can't produce a bytes_transferred that
             // exceeds the buffer a future caller might slice with.
             bytes_transferred: (transfer_count as usize).min(data.len()),
             sense,

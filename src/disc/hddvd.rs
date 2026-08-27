@@ -107,10 +107,9 @@ fn parse_vti_clip_order(vti: &[u8]) -> Vec<String> {
             count += 1;
         }
     }
-    // Pick the largest residue bucket (the clip table). On a size tie, break
-    // deterministically by the bucket's smallest offset — `HashMap` iteration
-    // order is randomized, so `max_by_key` alone could pick a different bucket
-    // run-to-run on identical bytes.
+    // Pick the largest residue bucket (the clip table). On a size tie, break by the
+    // bucket's smallest offset, since `HashMap` iteration order is randomized and
+    // `max_by_key` alone could pick a different bucket run-to-run on identical bytes.
     let Some(mut best) = buckets
         .into_values()
         .max_by_key(|g| (g.len(), std::cmp::Reverse(g.iter().map(|(o, _)| *o).min())))
@@ -175,8 +174,10 @@ fn sniff_audio_codec(es: &[u8]) -> Option<Codec> {
 
 /// Demux the head of an `.evo` clip (through the disc's [`SectorSource`]) and
 /// build one [`Stream`] per distinct elementary stream found: the video track
-/// (mapped to the canonical [`DVD_VIDEO_PID`]) and every DD+ audio sub-stream
-/// (mapped via [`dvd_audio_pid`]). Codec is sniffed from the demuxed ES bytes.
+/// (mapped to the canonical [`DVD_VIDEO_PID`](crate::mux::ps::DVD_VIDEO_PID) for
+/// plain 0xE0-0xEF video, or the extended-stream-id PID for HD-DVD VC-1) and
+/// every DD+ audio sub-stream (mapped via [`dvd_audio_pid`]). Codec is sniffed
+/// from the demuxed ES bytes.
 ///
 /// Mirrors the stream construction in `Disc::scan_dvd_titles`; resolution /
 /// language / channels use sane HD-DVD defaults (the muxer reads the true pixel
@@ -196,11 +197,9 @@ fn probe_evo_streams(
 ) -> Result<Vec<Stream>> {
     let mut demux = PsDemuxer::new();
     let mut video: Vec<u8> = Vec::new();
-    // Routing PID of the video track, captured from the first video PES seen:
-    // `DVD_VIDEO_PID` for a plain 0xE0-0xEF stream (a real disc's H.264 on 0xE2),
-    // or `0xFD00 | stream_id_extension` for an HD-DVD extended-stream-id video
-    // (a real disc's VC-1 on 0xFD ext 0x55). Kept in lockstep with `PsPacket::dvd_pid`
-    // so the emitted `Stream` PID matches what the demuxer routes at mux time.
+    // Routing PID of the video track, from the first video PES seen: `DVD_VIDEO_PID`
+    // for a plain 0xE0-0xEF stream, or `0xFD00 | stream_id_extension` for HD-DVD
+    // extended-stream-id video. Kept in lockstep with `PsPacket::dvd_pid`.
     let mut video_pid: Option<u16> = None;
     // sub_id -> ES sample, ordered so audio tracks surface in sub-id order.
     let mut audio: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
@@ -210,11 +209,9 @@ fn probe_evo_streams(
         let mut lba = ext.start_lba;
         let mut left = ext.sector_count;
         while left > 0 && remaining > 0 {
-            // 1 MiB read chunks (512 sectors) keep buffers small.
-            // Poll before every chunk, as the PGS probe does: a clip's probe
-            // budget is 16 MiB of blocking reads, and on marginal media each
-            // one can sit in the drive's retry path, so per-clip granularity
-            // alone would leave a Stop waiting on a dead disc.
+            // 1 MiB chunks (512 sectors). Poll every chunk, not just per-clip:
+            // a 16 MiB probe can sit in the drive's retry path on marginal
+            // media, and per-clip granularity alone would leave a Stop waiting.
             if halt.is_some_and(|h| h.is_cancelled()) {
                 return Err(crate::error::Error::Halted);
             }
@@ -222,10 +219,9 @@ fn probe_evo_streams(
             let mut buf = vec![0u8; n as usize * crate::consts::SECTOR_BYTES];
             match reader.read_sectors(lba, n, &mut buf, false) {
                 Ok(_) => {}
-                // A live-drive Stop surfaces HERE, not through the token:
-                // `Drive::checked_exec` fails every command with `Halted` once
-                // the flag is set. Swallowing it (as any other read error is
-                // swallowed) reports an un-probed clip as a probed one.
+                // A live-drive Stop surfaces HERE, via `Drive::checked_exec`
+                // failing with `Halted`. Swallowing it like other read errors
+                // would report an un-probed clip as probed.
                 Err(crate::error::Error::Halted) => {
                     return Err(crate::error::Error::Halted);
                 }
@@ -244,12 +240,9 @@ fn probe_evo_streams(
     }
 
     let mut streams = Vec::new();
-    // Emit the video stream only when the codec was actually identified from the
-    // sampled head. Guessing (e.g. defaulting to H.264) would tag a VC-1 — or a
-    // still-encrypted — clip with the wrong codec, so the mux applies the wrong
-    // parser and produces a corrupt track; dropping it is the honest outcome
-    // (matches the audio path below), and a real clear clip always carries its
-    // sequence header / SPS at the head, so this never fires on a normal disc.
+    // Only emit video once the codec is actually identified from the sampled
+    // head; guessing would tag a VC-1 (or still-encrypted) clip wrong and feed
+    // it the wrong parser. A real clear clip always carries its header early.
     if let (Some(pid), Some(codec)) = (video_pid, sniff_video_codec(&video)) {
         streams.push(Stream::Video(VideoStream {
             pid,
@@ -343,18 +336,9 @@ fn collect_es(
     }
 }
 
-// ─────────────────────── Advanced-Content playlist (XPL) ──────────────────
-//
-// HD-DVD Advanced Content ships an authoritative playlist at
-// `ADV_OBJ/VPLST000.XPL` (DVD-Forum `HDDVDVideo/Playlist` XML). It is the real
-// player playlist: a `<TitleSet>` of `<Title>`s, each naming its
-// `<PrimaryAudioVideoClip>` clips (an EVO, via its `.MAP` sidecar) in playback
-// order with title-time in/out points, a `titleDuration`, a `displayName`, and a
-// `<ChapterList>`. Parsing it gives authoritative title composition — clips,
-// duration, name, chapters — instead of the `feature*` clip-name heuristic, plus
-// the per-clip title-time offsets needed to splice a layer-break split
-// (`FEATURE_1` + `FEATURE_2`) onto one continuous timeline. Parsed with a real
-// XML parser (`roxmltree`), not a hand-rolled scanner — the XPL is genuine XML.
+// ─── Advanced-Content playlist (XPL) ───
+// `ADV_OBJ/VPLST000.XPL` is the real player playlist: `<Title>`s naming clips
+// in order with in/out points, duration, name, chapters — parsed as real XML.
 
 /// One clip reference inside an XPL `<Title>`: the resolved `.evo` name (lower
 /// case) and the clip's placement on the title timeline, in seconds.
@@ -694,16 +678,9 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             .descendants()
             .filter(|n| local(n, "PrimaryAudioVideoClip"))
         {
-            // Bounded by MAX_XPL_CLIPS_PER_TITLE. `descendants()` is deliberate
-            // — a real playlist wraps its clips in `<PrimaryAudioVideoClipList>`
-            // or an `ApplicationSegment`, so `children()` would miss them — but
-            // it also means a clip nested inside N ancestor `<Title>`s is
-            // collected N times over, and the depth guard still allows 32 such
-            // ancestors. `break` rather than dropping surplus: unlike the
-            // directory scan (which must keep reading to find the `.vti`),
-            // nothing later in THIS loop is needed, and stopping bounds the walk
-            // as well as the allocation. Chapters are collected by a separate
-            // iterator below, so they are unaffected.
+            // Bounded by MAX_XPL_CLIPS_PER_TITLE. `descendants()`, not
+            // `children()`, is needed to reach wrapped clips, but that also
+            // means nested `<Title>`s multiply hits, so `break` bounds the walk.
             if clips.len() >= MAX_XPL_CLIPS_PER_TITLE {
                 break;
             }
@@ -779,25 +756,18 @@ fn compose_xpl_titles(
     // a crafted one can name a single `.evo` from all MAX_XPL_TITLES titles.
     let mut probes = EvoProbeCache::default();
     for t in xpl_titles {
-        // A clip that exists but has no truthful read plan poisons every
-        // title that names it: composing around it would emit a title short
-        // by that clip's bytes while its durations and chapter offsets still
-        // assume them.
+        // A clip with no truthful read plan poisons every title naming it:
+        // composing around it emits a title short by that clip's bytes while
+        // its durations and chapter offsets still assume them.
         if t.clips.iter().any(|c| unusable.contains(&c.evo)) {
             continue;
         }
         let mut extents = Vec::new();
         let mut size_bytes = 0u64;
         let mut parts = Vec::new();
-        // A crafted `<PrimaryAudioVideoClip>` list can name the same `.evo`
-        // any number of times (XML has no fixed element count, unlike MPLS's
-        // binary PlayItem count). Mirrors bluray.rs's
-        // `first_ref = seen_clips.insert(...)` gate (`:113`/`:117`): push a
-        // clip's physical extents and size only the first time its key is
-        // seen, so a clip named N times contributes its extent list ONCE
-        // instead of N times over. The analogous key here is the `.evo`
-        // filename — this format has no clip_id, and `.evo` is what
-        // `clip_extents` is already keyed by.
+        // A crafted clip list can name the same `.evo` any number of times.
+        // Mirrors bluray.rs's `seen_clips.insert(...)` gate: push a clip's
+        // extents/size only the first time its `.evo` key is seen.
         let mut seen_evos: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for c in &t.clips {
             let Some((orig, size, exts)) = clip_extents.get(&c.evo) else {
@@ -893,11 +863,9 @@ impl Disc {
             }
             let lower = e.name.to_ascii_lowercase();
             if lower.ends_with(HDDVD_CLIP_EXT) {
-                // Bounded by MAX_HDDVD_CLIPS: each clip taken here costs an ICB
-                // read to resolve its extents and (in the fallback path below) a
-                // full probe_evo_streams pass. Surplus entries are DROPPED rather
-                // than `break`ing the loop, so a crafted disc cannot hide the
-                // `.vti` navigation file behind a wall of `.evo` names.
+                // Bounded by MAX_HDDVD_CLIPS. Surplus entries are DROPPED, not
+                // `break`ed on, so a crafted disc can't hide the `.vti` behind
+                // a wall of `.evo` names (each clip costs an ICB read + probe).
                 if clips.len() < MAX_HDDVD_CLIPS {
                     clips.push((e.name.clone(), e.size));
                 }
@@ -906,18 +874,9 @@ impl Disc {
             }
         }
 
-        // Authored clip order from the VTI clip table (empty if no VTI).
-        //
-        // The VTI name came from `ts_dir.entries`, so a failed read here is a
-        // real I/O error (a scratched sector under the `.vti`), never an absent
-        // file. `.ok()` used to flatten the two — dropping the authored order
-        // with no diagnostic, so a split feature then composed from the per-clip
-        // heuristic and the operator was never told the authored order existed
-        // but could not be read. The clip-extent arms below log every read
-        // failure with its own code; this one now does too. The fallback itself
-        // is unchanged (no order => per-clip, exactly as an unauthored disc),
-        // because there is nothing to compose from without the table. Logging is
-        // exempt from the no-English rule (errors stay numeric).
+        // Authored clip order from the VTI clip table (empty if no VTI). The
+        // name came from `ts_dir.entries`, so a failed read is a real I/O
+        // error, not an absent file — log it rather than silently falling back.
         let order: Vec<String> = match vti_name {
             None => Vec::new(),
             Some(n) => match udf_fs.read_file(reader, &format!("/HVDVD_TS/{n}")) {
@@ -936,12 +895,9 @@ impl Disc {
 
         // Resolve each clip's physical extents once, keyed by lower-case name.
         let mut clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = BTreeMap::new();
-        // Clips that EXIST but cannot be given a truthful read plan, because
-        // the file carries an unrecorded (never-written) extent — see
-        // `UdfFs::file_extents`. Kept apart from "did not resolve": a title
-        // built without one of these is short by that clip's runtime while
-        // still claiming its duration and size, which is data loss shaped
-        // like an ordinary rip. Any title naming one is dropped instead.
+        // Clips that EXIST but have no truthful read plan (unrecorded extent,
+        // see `UdfFs::file_extents`). Composing around one silently shorts a
+        // title's runtime, so any title naming one is dropped instead.
         let mut unusable: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (name, size) in &clips {
             if halt.is_some_and(|h| h.is_cancelled()) {
@@ -960,21 +916,9 @@ impl Disc {
                     }
                 }
                 Err(crate::error::Error::UdfUnrecordedExtent { .. }) => {
-                    // Say so. Marking the clip unusable drops every title that
-                    // names it, and in the fallback case the OTHER part of a
-                    // split feature is still offered standalone — so half a
-                    // movie is presented as a whole one. Silently returning Ok
-                    // with the feature missing is the shape of data loss this
-                    // refusal exists to prevent, pointed the other way.
-                    //
-                    // The Blu-ray half of this same fix already warns; this
-                    // file had no diagnostics at all. Logging is exempt from
-                    // the crate's no-English rule (errors stay numeric).
-                    //
-                    // Named constant, not the literal 6017 this used to carry:
-                    // a hardcoded code in the very file whose sibling arm was
-                    // changed to stop doing that is the next drift waiting to
-                    // happen, and the literal cannot follow a renumbering.
+                    // Marking unusable drops every title naming this clip;
+                    // silently composing without it would present half a movie
+                    // as a whole one. Named constant, not the old literal 6017.
                     tracing::warn!(
                         target: "freemkv::disc",
                         clip = ?name,
@@ -984,22 +928,9 @@ impl Disc {
                     unusable.insert(name.to_ascii_lowercase());
                 }
                 Err(crate::error::Error::Halted) => return Err(crate::error::Error::Halted),
-                // EVERY other failure means the same thing: no truthful read
-                // plan for this clip. A scratched sector under its ICB
-                // (DiscRead), an allocation-descriptor chain that never
-                // terminated (UdfAdChainTooLong), a file whose data is
-                // embedded rather than extent-mapped (UdfEmbeddedData) — all
-                // of them used to land in a bare `Err(_) => {}`: no log, and
-                // the clip NOT marked unusable, so a split feature still
-                // composed from FEATURE_1 alone and presented half a movie as
-                // a whole one. That is the very outcome the arm above was
-                // written to prevent, reachable through every error but one.
-                //
-                // The code logged is the error's own. Reusing 6017 here would
-                // account a scratched disc as an authoring hole.
-                //
-                // (`UdfNotFound` needs no special case: these names came from
-                // `ts_dir.entries`, so the lookup cannot miss.)
+                // EVERY other failure (scratched ICB, dead AD chain, embedded
+                // data, ...) means no truthful read plan; used to fall through
+                // a bare `Err(_) => {}`, unmarked and unlogged.
                 Err(e) => {
                     tracing::warn!(
                         target: "freemkv::disc",
@@ -1010,42 +941,9 @@ impl Disc {
                     unusable.insert(name.to_ascii_lowercase());
                 }
             }
-            // A clip that resolved with NO usable extent is unusable too, and
-            // for exactly the same reason as the `Err` arms above.
-            //
-            // Round 1 accounted for every `Err` from `file_extents` and left
-            // this route open: `Ok` can still yield an empty AD list, or a list
-            // every entry of which the `sectors > 0 && lba > 0` filter above
-            // discards (a zero-length placeholder AD, or one pointing at LBA
-            // 0 — see `UdfFs::file_extents`). The clip then entered NEITHER
-            // `clip_extents` NOR `unusable`, and nothing was logged. The
-            // composer's `any(|n| unusable.contains(..))` guard below therefore
-            // missed it and the `filter(|n| clip_extents.contains_key(..))`
-            // beside it quietly deleted the part: a `FEATURE_2.EVO` of size 0
-            // next to a healthy `FEATURE_1.EVO` composed a FEATURE title out of
-            // part one alone, still advertising the whole runtime, at rc=0,
-            // silently. That is strictly WORSE than the `Err` case this guard
-            // was built for — half a movie presented as a whole one — and it is
-            // reachable from an ordinary zero-byte file, no crafting needed.
-            //
-            // WHY THE BLU-RAY HALF DELIBERATELY DIFFERS. `bluray.rs` documents
-            // this same `Ok`-but-empty hole as a KNOWN GAP and leaves it open,
-            // and that decision still stands there — not here. Two things are
-            // different. (1) Cost: BD has no `unusable` set, so closing it
-            // there means a post-loop "every clip_id must appear in `spans`"
-            // invariant that DROPS the title, and it is not settled that an
-            // empty-but-Ok resolve is always a defect rather than a legitimate
-            // healthy-disc state; dropping healthy titles is worse than the
-            // gap. Here the set already exists, so refusing costs nothing new.
-            // (2) Consequence: on BD the clip is one PlayItem of a title that
-            // is otherwise whole; on HD-DVD the authored feature is COMPOSED
-            // from parts, so the missing one is silently spliced out of a title
-            // that keeps claiming the full runtime. Same hole, different price.
-            // The asymmetry is deliberate; it is written down here so the next
-            // audit reads a decision instead of finding an oversight.
-            //
-            // `insert` returning false means an `Err` arm above already logged
-            // this clip — no second line for one clip.
+            // `Ok` with NO usable extent (empty/filtered AD list) is unusable
+            // too: else a zero-byte `FEATURE_2.EVO` beside a healthy part one
+            // silently composed a whole-runtime title missing half the movie.
             if extents.is_empty() {
                 if unusable.insert(name.to_ascii_lowercase()) {
                     // Not the neighbouring 6017: an empty AD list is not an
@@ -1063,11 +961,9 @@ impl Disc {
             }
         }
 
-        // Authoritative composition from the Advanced-Content playlist
-        // (`ADV_OBJ/VPLST*.XPL`): real per-title clip lists, durations, names,
-        // chapters, and title-time offsets. This is the primary path; the
-        // clip-name heuristic below is the fallback when the playlist is absent
-        // or unparseable (or resolves to no on-disc clips).
+        // Authoritative composition from `ADV_OBJ/VPLST*.XPL`, if present and
+        // parseable. The clip-name heuristic below is the fallback when it's
+        // absent, unparseable, or resolves to no on-disc clips.
         if let Some(xpl) = read_adv_obj_xpl(reader, udf_fs) {
             let composed = compose_xpl_titles(
                 reader,
@@ -1081,12 +977,9 @@ impl Disc {
             }
         }
 
-        // Feature clips, in authored order, that actually resolved to extents.
-        // If ANY authored feature part has no truthful read plan, the composed
-        // feature title would silently omit that part's bytes — emit no
-        // composed feature at all rather than a short one. (The per-clip
-        // titles below are unaffected: each stands alone and an unusable clip
-        // simply yields no title.)
+        // Feature clips, in authored order, that resolved to extents. If ANY
+        // authored feature part has no truthful read plan, emit no composed
+        // feature at all rather than one silently short that part's bytes.
         let feature: Vec<String> = if order
             .iter()
             .filter(|n| is_feature_clip(n))
@@ -1325,11 +1218,9 @@ mod tests {
 
     #[test]
     fn parse_vti_clip_order_is_deterministic_on_a_bucket_size_tie() {
-        // Two residue buckets of EQUAL size must resolve to the SAME winner every
-        // call — `HashMap` iteration is randomized, so a `max_by_key` without a
-        // deterministic tie-break could pick a different bucket run-to-run on
-        // identical bytes. Build a VTI whose stray `.EVO` names tie the real
-        // table's bucket count, then assert the result is stable across calls.
+        // Two equal-size buckets must resolve to the SAME winner every call:
+        // `HashMap` iteration is randomized, so `max_by_key` without a
+        // deterministic tie-break could pick a different bucket run-to-run.
         let mut vti = vec![0u8; 0x600];
         vti[..HDDVD_VTI_MAGIC.len()].copy_from_slice(HDDVD_VTI_MAGIC);
         let put = |v: &mut Vec<u8>, off: usize, name: &str| {
@@ -1420,10 +1311,9 @@ mod tests {
 
     #[test]
     fn scan_hddvd_composes_split_feature_into_one_title() {
-        // A disc whose feature is FEATURE_1 + FEATURE_2 (a layer-break split), plus
-        // a TRAILER extra. The VTI names them in authored order; the scan must
-        // JOIN the two feature parts into one title (so the largest-title pick is
-        // the whole movie) and keep the trailer as its own title.
+        // FEATURE_1 + FEATURE_2 (a layer-break split) plus a TRAILER extra;
+        // the scan must JOIN the feature parts into one title and keep the
+        // trailer separate.
         let mut disc = MemDisc::new();
         let vti = synthetic_vti(&["FEATURE_1.EVO", "FEATURE_2.EVO", "TRAILER.EVO"]);
         let files = vec![
@@ -1720,11 +1610,9 @@ mod tests {
         assert_eq!(sniff_video_codec(&[0x00, 0x00, 0x01, 0x61, 0x9A]), None);
         assert_eq!(sniff_video_codec(&[0xDE, 0xAD, 0xBE, 0xEF]), None);
 
-        // Overlap regression: a picture_start_code (0x00) whose payload begins
-        // with 00 00 must advance a full 4 bytes so the code byte isn't re-read
-        // as the start of a new marker. Here the picture is followed by a real
-        // MPEG-2 sequence header — the scan must reach it cleanly and return
-        // Mpeg2 (and, critically, not be confused by the 1-byte overlap).
+        // Overlap regression: a picture_start_code (0x00) with payload 00 00
+        // must advance a full 4 bytes so the code byte isn't re-read as a new
+        // marker; the real MPEG-2 sequence header after it must still be found.
         assert_eq!(
             sniff_video_codec(&[0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xB3, 0x2D]),
             Some(Codec::Mpeg2)
@@ -1987,10 +1875,9 @@ mod tests {
     #[test]
     fn collect_es_routes_only_vc1_0xfd_to_video() {
         use crate::mux::ps::hddvd_extended_pid;
-        // The 0xFD guard: only the VC-1 extension (0x55) is video. An HD-audio
-        // 0xFD sub-stream (e.g. 0x72) that arrives FIRST must NOT stamp video_pid
-        // with its PID or pollute the video sample — else the real video track is
-        // lost. (Routing 0xFD audio to its own track is deferred.)
+        // The 0xFD guard: only VC-1 (ext 0x55) is video. An HD-audio 0xFD
+        // sub-stream (e.g. 0x72) arriving FIRST must not stamp video_pid or
+        // pollute the video sample, else the real video track is lost.
         let mut video = Vec::new();
         let mut video_pid: Option<u16> = None;
         let mut audio = BTreeMap::new();
@@ -3150,10 +3037,9 @@ mod tests {
         };
         build_udf_skeleton(&mut disc, 10);
         lay_dir(&mut disc, &root);
-        // Blank FEATURE_2's ICB (laid at PART_START + 101). Its descriptor tag
-        // is then 0, neither 261 nor 266 — what the parser sees when the sector
-        // holding an ICB cannot be read back intact. Deliberately NOT an
-        // unrecorded extent: that class was already handled.
+        // Blank FEATURE_2's ICB: descriptor tag becomes 0 (neither 261 nor
+        // 266), what the parser sees when an ICB sector can't be read back
+        // intact. Deliberately not an unrecorded extent — that's covered elsewhere.
         disc.put_bytes(PART_START + 101, &[0u8; 2048]);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
         assert!(
@@ -3490,10 +3376,9 @@ mod tests {
         let budget = |cap: usize| {
             cap as u64 * u64::from(EVO_PROBE_SECTORS) * crate::consts::SECTOR_BYTES as u64
         };
-        // BOTH title-composition paths pay one probe per item, and a crafted
-        // disc reaches either one: the directory fallback when `/ADV_OBJ` is
-        // omitted, the playlist path when it is present. Capping only one moves
-        // the amplification next door.
+        // Both paths pay one probe per item, and a crafted disc reaches
+        // either: the directory fallback when `/ADV_OBJ` is omitted, the
+        // playlist path when present. Capping only one moves the amplification.
         for (name, cap) in [
             ("MAX_HDDVD_CLIPS", MAX_HDDVD_CLIPS),
             ("MAX_XPL_TITLES", MAX_XPL_TITLES),

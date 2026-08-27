@@ -629,9 +629,8 @@ fn mkvstream_meta_sets_title() {
 #[test]
 fn mkvstream_roundtrip_bdts() {
     // Write BD-TS packets through MkvStream and verify the pipeline works.
-    // Without real codec headers (SPS/PPS), the muxer stays in scanning phase.
-    // With a title that has no video streams (audio-only), codec scanning is
-    // skipped and the muxer enters streaming mode immediately, producing EBML output.
+    // Without real codec headers (SPS/PPS) the muxer would stay in scanning
+    // phase, but an audio-only title skips codec scanning and streams EBML output immediately.
 
     let dt = DiscTitle {
         playlist: "Audio Only".into(),

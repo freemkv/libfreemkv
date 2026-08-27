@@ -137,11 +137,9 @@ mod tests {
 
     #[test]
     fn dvd_lpcm_preserves_all_pcm_bytes() {
-        // DVD-PS LPCM: PsDemuxer already removed the 7-byte private sub-header,
-        // so the payload handed to this parser is raw PCM. The DVD parser must
-        // NOT strip any further bytes — applying the BD 4-byte strip to a DVD
-        // payload would drop one sample pair per PES and progressively drift
-        // the audio.
+        // DVD-PS LPCM: PsDemuxer already removed the 7-byte private sub-header, so
+        // the payload here is raw PCM. Must NOT strip further — applying the BD
+        // 4-byte strip would drop one sample pair per PES and drift the audio.
         let mut parser = LpcmParser::new_dvd();
         let pcm = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0x01, 0x02];
         let frames = parser.parse(&make_pes(pcm.clone(), Some(90000)));

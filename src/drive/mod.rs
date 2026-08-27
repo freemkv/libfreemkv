@@ -8,14 +8,9 @@ pub fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
     match e {
         Error::ScsiError { status, sense, .. } => (*status, *sense),
         Error::DiscRead { status, sense, .. } => (status.unwrap_or(0), *sense),
-        // A failed `ioctl(SG_IO)` and a vanished device never produced a SCSI
-        // reply at all — they are dead-bus faults, not recoverable bad sectors.
-        // `Error::is_scsi_transport_failure` (error.rs) already declares both
-        // variants transport failures so sweep / patch / fill_extents abort the
-        // pass instead of zero-filling against a wedged device; callers that
-        // flatten an error through here (Drive::read_one, DiscStream::fill_extents,
-        // freemkv-engine's recovery sweep/patch) would otherwise collapse them to
-        // status 0 and silently destroy that classification.
+        // A failed `ioctl(SG_IO)` or vanished device is a dead-bus fault, not a
+        // recoverable bad sector — map to SCSI_STATUS_TRANSPORT_FAILURE so sweep /
+        // patch / fill_extents abort the pass instead of zero-filling a wedged device.
         Error::IoError { .. } | Error::DeviceNotFound { .. } => {
             (crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE, None)
         }
@@ -299,16 +294,9 @@ impl Drive {
         for attempt in 0..60u64 {
             hb.tick(attempt, 60);
             let mut buf = [0u8; 0];
-            // `checked_exec`, not a bare `execute`. This poll was the ONE
-            // drive path that talked to the transport directly, and it is the
-            // longest-running one: 60 x 500 ms = ~30 s. It never read
-            // `self.halt`, so an operator Stop pressed while a cold drive spun
-            // up was ignored for up to half a minute while every other path in
-            // this file returned `Halted` at its next command boundary. A Stop
-            // that does nothing for 30 s is indistinguishable from a hung app.
-            //
-            // A TUR that FAILS is the ordinary not-ready-yet answer and must
-            // keep the loop going — only `Halted` aborts it.
+            // `checked_exec`, not bare `execute`: this poll (60 x 500 ms = ~30 s) must
+            // see `self.halt`, or a Stop during cold spin-up is ignored for half a
+            // minute. A TUR that FAILS is just not-ready-yet and keeps the loop going.
             match self.checked_exec(&tur, crate::scsi::DataDirection::None, &mut buf, 5_000) {
                 Ok(_) => {
                     tracing::info!(
@@ -362,21 +350,9 @@ impl Drive {
             5_000,
         );
 
-        // MMC-6 §6.7: byte 5 is a Media Status only when the Event Header
-        // actually announces a Media Event Descriptor behind it. The header is
-        // Event Descriptor Length (big-endian, bytes 0-1), then byte 2 = NEA
-        // (bit 7) + Notification Class (bits 2-0), then byte 3 = Supported
-        // Event Classes. With NEA set the drive is telling us there is NO event
-        // to report and returns the header alone; with a different Notification
-        // Class the descriptor that follows is not a media one and its second
-        // byte means something else entirely.
-        //
-        // Decoding byte 5 unconditionally turns both of those into Media Status
-        // 0 == "tray closed, no disc" — a drive with a disc loaded reported as
-        // empty, from a reply that said nothing about the media at all. The
-        // drive is untrusted input here, so an event-less or foreign-class reply
-        // yields no media state and the TEST UNIT READY fallback answers
-        // instead.
+        // MMC-6 §6.7: byte 5 is Media Status only when the Event Header (NEA flag +
+        // Notification Class) announces a Media Event Descriptor. Otherwise decoding
+        // it reads as "no disc" for untrusted input, so fall back to TUR instead.
         const NEA: u8 = 0x80;
         const NOTIFICATION_CLASS_MASK: u8 = 0x07;
         const NOTIFICATION_CLASS_MEDIA: u8 = 0x04;
@@ -416,10 +392,9 @@ impl Drive {
                     0x00 => DriveStatus::NoDisc,      // tray closed, no disc
                     0x01 => DriveStatus::TrayOpen,    // tray open, no media
                     0x02 => DriveStatus::DiscPresent, // tray closed, disc present
-                    // 0x03 = tray-open bit AND media-present bit both set:
-                    // a contradictory/transient state. Don't report it as
-                    // ready — autorip must not start a rip on a drive that
-                    // is still settling. Treat as tray-open.
+                    // 0x03 = tray-open AND media-present both set: a contradictory,
+                    // transient state. Don't report ready — autorip must not start on
+                    // a drive that's still settling — so treat as tray-open.
                     0x03 => DriveStatus::TrayOpen,
                     _ => DriveStatus::Unknown,
                 }
@@ -518,27 +493,17 @@ impl Drive {
     pub fn init(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "init", "begin");
-        // Drive-prep runs for EVERY disc, DVD INCLUDED. The drive-level firmware
-        // unlock lifts riplock and readies max read speed regardless of disc type
-        // — drive features are disc-independent. At init the disc kind is not yet
-        // probed (Unknown), so only the identity-keyed DRIVE unlocker matches
-        // here; the AACS host-cert handshake and the CSS bus-auth handshake run
-        // LATER, each gated on the actual disc kind, on TOP of the already-
-        // unlocked drive. A genuine transport fault means the bus is dead — abort
-        // init (the v1.1.0 invariant; `if let Ok` was silently swallowing it).
-        // Every other error (NotApplicable / no match) is "nothing applied" —
-        // fall through to stock mode. NOTE: the `if disc_is_dvd() { return }` skip
-        // that used to sit here was the v1.0.0-rc.1 regression — it skipped the
-        // drive-prep for DVD, leaving DVDs riplocked at stock speed.
+        // Drive-prep runs for EVERY disc, DVD INCLUDED — drive features are
+        // disc-independent; AACS/CSS handshakes run LATER, gated on disc kind. A
+        // transport fault aborts init (v1.1.0 invariant); other errors fall through.
         self.init_ran = true;
         let (matched, unlock_res) =
             crate::unlock_bridge::run_features(self.scsi.as_mut(), &self.drive_id);
         let r: Result<()> = match unlock_res {
             Ok(unlocked) => {
-                // Record WHICH drive-prep unlocker actually ran — "MT1959" (the
-                // drive-firmware bus-unlock route) or "Renesas" (the cert route) —
-                // not the ld-only identity lookup, so a Renesas drive reports
-                // itself honestly rather than as nothing.
+                // Record WHICH drive-prep unlocker ran ("MT1959" bus-unlock or
+                // "Renesas" cert route), not the id-only lookup, so a Renesas
+                // drive reports itself honestly rather than as nothing.
                 self.unlocker_name = Some(matched.to_string());
                 // Stash the OEM Volume ID the unlocker returned for the AACS
                 // handshake phase (do_handshake reads it via `oem_vid()`). A
@@ -555,19 +520,14 @@ impl Drive {
             }),
             Err(_) => Ok(()),
         };
-        // Raise the drive to its maximum read speed — UNCONDITIONALLY whenever
-        // the bus is alive (init didn't transport-fault), whether or not an
-        // unlocker matched, and for ANY disc type (DVD now flows through here too,
-        // so it gets max speed on the freshly firmware-unlocked drive instead of
-        // the stock riplock). A stock-mode drive with no firmware unlocker still
-        // wants max speed. Best-effort: a failure here must NOT fail the rip.
+        // Raise to max read speed UNCONDITIONALLY whenever the bus is alive, for
+        // ANY disc type — DVD included, and even a stock-mode drive with no
+        // firmware unlocker still wants it. Best-effort: failure must NOT fail the rip.
         if r.is_ok() {
             self.set_speed(Self::SPEED_MAX_KBPS);
-            // Ask the drive to REPORT recovered/marginal reads rather than
-            // silently commit best-effort data as GOOD (the dirty-disc
-            // "passed-clean-but-decodes-with-errors" trap). Best-effort: a drive
-            // that doesn't honor it just keeps its defaults — no regression, and
-            // on a clean disc it changes nothing.
+            // Ask the drive to REPORT recovered/marginal reads instead of silently
+            // committing best-effort data as GOOD (the dirty-disc "passed-clean-but-
+            // decodes-with-errors" trap). Best-effort: unsupported drives keep defaults.
             self.enable_recovered_error_reporting();
         }
         tracing::info!(
@@ -844,29 +804,20 @@ impl Drive {
             "Drive::read enter"
         );
 
-        // Cap each CDB to the transport's max data-in transfer. A single
-        // READ larger than the adapter limit fails outright on some
-        // backends (notably Windows SPTI, where a 16 MiB read exceeds the
-        // adapter MaximumTransferLength → DeviceIoControl fails → we'd
-        // mis-read it as a transport failure and spam tiny-read fallbacks).
-        // For the common small read (count <= max_sectors) this is a single
-        // read_one call with no behavior change.
+        // Cap each CDB to the transport's max data-in transfer: a single READ past the
+        // adapter limit fails outright on some backends (e.g. Windows SPTI, where a
+        // 16 MiB read exceeds MaximumTransferLength and we'd mis-read it as transport failure).
         let max_sectors = (self.scsi.max_transfer_bytes() / 2048).max(1) as u32;
         if count as u32 <= max_sectors {
             return self.read_one(lba, count, buf, timeout_ms, recovery, fua);
         }
 
-        // Large read: split into chunks of at most `max_sectors` sectors,
-        // each a self-contained READ(10) with the same validation. Any
-        // chunk error reports that chunk's LBA (more precise than the whole
-        // request's base LBA).
+        // Large read: split into `max_sectors`-sized chunks, each a self-contained
+        // READ(10). Any chunk error reports that chunk's LBA, not the base LBA.
         let count = count as u32;
-        // Check the caller's buffer ONCE, up front. The chunk loop slices `buf`
-        // by `count * 2048`; without this an undersized buffer PANICKED ('range
-        // end index out of range') out of the public `read`/`read_fua`, while the
-        // single-chunk path above tolerates the same undersized buffer and returns
-        // `Err(DiscRead)` from `checked_exec`. Behaviour on an undersized buffer
-        // must not depend on the transport's transfer limit.
+        // Check the caller's buffer ONCE, up front: the chunk loop slices `buf` by
+        // `count * 2048`, and without this an undersized buffer PANICKED out of the
+        // public `read`/`read_fua` instead of returning `Err(DiscRead)` like the single-chunk path.
         if buf.len() < count as usize * 2048 {
             return Err(Error::DiscRead {
                 sector: lba as u64,
@@ -874,11 +825,9 @@ impl Drive {
                 sense: None,
             });
         }
-        // The whole range must be addressable: SBC-3 READ(10) carries a 32-bit
-        // LOGICAL BLOCK ADDRESS, so a request whose last chunk crosses `u32::MAX`
-        // has no valid CDB. `lba + done` below was unchecked — a debug panic out
-        // of the public API, and in release a wrap to a low LBA that was read and
-        // returned as if it were the requested one.
+        // The whole range must be addressable: READ(10) carries a 32-bit LBA, so a
+        // request crossing `u32::MAX` has no valid CDB. `lba + done` was unchecked —
+        // a debug panic, or in release a wrap to a low LBA read and returned as requested.
         if lba.checked_add(count.saturating_sub(1)).is_none() {
             return Err(Error::DiscRead {
                 sector: lba as u64,
@@ -921,13 +870,9 @@ impl Drive {
         // re-fetch the medium past its cache.
         fua: bool,
     ) -> Result<usize> {
-        // FUA is OFF on the bulk path — unconditionally forcing every READ(10)
-        // past the cache disabled the drive's readahead/streaming cache on the
-        // sequential sweep and collapsed throughput ~10x (UHD 15-25 → ~2 MB/s,
-        // DVD → ~0.5 MB/s), disc-type-agnostic — the cache IS the streaming
-        // throughput. It is set ONLY when a Pass-N recovery handler (FuaRetry)
-        // asks for it per marginal-sector re-read, where cache-masking of a
-        // stochastic sector actually matters (#55).
+        // FUA is OFF on the bulk path: forcing every READ(10) past the cache disabled
+        // readahead on the sequential sweep and collapsed throughput ~10x (UHD → ~2
+        // MB/s, DVD → ~0.5 MB/s). Set ONLY per marginal-sector re-read by FuaRetry (#55).
         let cdb = [
             crate::scsi::SCSI_READ_10,
             if fua { 0x08 } else { 0x00 },
@@ -950,26 +895,9 @@ impl Drive {
             Ok(result) if result.bytes_transferred == count as usize * 2048 => {
                 Ok(result.bytes_transferred)
             }
-            // A READ(10) that completes with GOOD status but a residual
-            // underrun (bytes_transferred < requested) is a SHORT transfer:
-            // the tail of `buf` still holds stale bytes from a prior read.
-            // Committing those as recovered/Good is silent data corruption, so
-            // treat a short transfer as a failed read — the caller marks the
-            // range NonTrimmed and retries (a loud miss, never a silent commit).
-            // The sector/file path enforces the same invariant in
-            // sector/prefetched.rs; this is the live-drive counterpart.
-            //
-            // SAY SO. The refusal was correct and completely silent: the
-            // sibling `Err(e)` arm below warns with lba/count/status, this one
-            // logged nothing at all, so a drive that residual-underruns on
-            // GOOD status was indistinguishable in the logs from a scratched
-            // disc — two different populations (replace the drive vs. clean
-            // the disc) collapsed into one. Absence of a log is itself the
-            // defect here; the read still fails either way.
-            //
-            // `scsi_status`/`sense` are deliberately absent from the line
-            // rather than faked: the command SUCCEEDED, so there is no sense
-            // data to report. `transferred` vs `expected` is the whole signal.
+            // GOOD status with a residual underrun is a SHORT transfer: `buf`'s tail
+            // holds stale bytes, so fail (NonTrimmed, retried) rather than commit stale
+            // data — and log it, so it isn't indistinguishable from a scratched disc.
             Ok(result) => {
                 tracing::warn!(
                     target: "freemkv::drive",
@@ -998,11 +926,9 @@ impl Drive {
                     "Drive::read checked_exec failed"
                 );
 
-                // /dev/sr0 pread fallback (Linux only). The kernel
-                // sr_mod driver auto-retries failed reads (~5× per
-                // command). Empirically (BU40N + a UHD disc,
-                // 2026-05-08) dd via /dev/sr0 recovers ~50% of bad
-                // sectors that a single-shot SG_IO READ misses.
+                // /dev/sr0 pread fallback (Linux only): sr_mod auto-retries reads
+                // (~5x). Empirically (BU40N + UHD disc, 2026-05-08) this recovers
+                // ~50% of bad sectors that a single-shot SG_IO READ misses.
                 #[cfg(target_os = "linux")]
                 if recovery
                     && let Some(fd) = self.block_dev_fd
@@ -1141,15 +1067,9 @@ impl Drive {
         let stop = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x00, 0]; // START=0, LOEJ=0 → spin down
         let start = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x01, 0]; // START=1, LOEJ=0 → spin up
         let mut buf = [0u8; 0];
-        // `checked_exec` + `sleep_until_halted`, not `execute` + a blind
-        // `thread::sleep`. This routine is ~15 s of deliberate waiting
-        // (`SPIN_DOWN_IDLE_SECS` + `SPIN_UP_SETTLE_SECS`) issued from the
-        // recovery path, i.e. exactly when a run is going badly and the
-        // operator is most likely to press Stop. Both commands bypassed the
-        // halt flag and both sleeps were unconditional, so the whole cycle was
-        // deaf: Stop appeared to hang. Nothing here is un-interruptible — a
-        // half-finished spin cycle leaves the drive spun down, which the next
-        // command spins back up.
+        // `checked_exec` + `sleep_until_halted`, not blind `thread::sleep`: this ~15 s
+        // wait runs from the recovery path, exactly when Stop is likely pressed. A
+        // half-finished spin cycle is fine — the next command spins the drive back up.
         self.checked_exec(&stop, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
         sleep_until_halted(
             &self.halt,
@@ -1462,17 +1382,9 @@ mod halt_tests {
         let r = sleep_until_halted(&flag, Duration::from_secs(10));
         assert!(matches!(r, Err(Error::Halted)));
         let waited = t0.elapsed();
-        // What this test is for: the sleep must end because the flag flipped,
-        // NOT because the 10 s timeout expired. Anything comfortably under
-        // that proves it, and the lower bound proves it did not return early
-        // for some other reason.
-        //
-        // The upper bound used to be 350 ms — flag at ~150 ms plus one 100 ms
-        // poll slice, with a little slack. That measures the SCHEDULER, not
-        // this function: a loaded CI runner took 377 ms and failed, which says
-        // nothing about whether the wake worked. Bound it well below the
-        // timeout instead, so the assertion still distinguishes the two
-        // outcomes it exists to distinguish.
+        // The sleep must end because the flag flipped, not the 10 s timeout; the lower
+        // bound rules out returning early otherwise. Upper bound was 350 ms but that
+        // measures the scheduler: a loaded CI runner hit 377 ms and failed for no reason.
         assert!(waited < Duration::from_secs(2), "waited {waited:?}");
         assert!(waited >= Duration::from_millis(140), "waited {waited:?}");
     }
@@ -1848,11 +1760,9 @@ mod command_tests {
 
     #[test]
     fn read_builds_read10_cdb_with_be_lba_and_count() {
-        // Drive::read issues READ(10) (0x28). LBA bytes 2..5 big-endian,
-        // transfer length bytes 7..8 big-endian (MMC-6). FUA is DISABLED (byte 1
-        // == 0x00) so the drive cache/readahead is allowed — forcing FUA on the
-        // bulk sweep collapsed throughput ~10x. Distinct nibbles catch a swapped
-        // shift.
+        // READ(10) (0x28): LBA bytes 2..5 BE, length bytes 7..8 BE (MMC-6). FUA is
+        // DISABLED (byte 1 == 0x00) — forcing FUA on the bulk sweep collapsed
+        // throughput ~10x. Distinct nibbles catch a swapped shift.
         let RecordingHarness {
             drive: mut d,
             cdb,
@@ -2436,10 +2346,9 @@ mod command_tests {
 
     #[test]
     fn select_drive_falls_back_to_first_when_none_have_media() {
-        // No drive reports a disc → fall back to the FIRST opened drive so
-        // single-drive / quirky setups still get a drive (historical
-        // behavior preserved). Tag drive #1 distinctly (TrayOpen 0x01) and
-        // confirm it, not #2 (NoDisc 0x00), is returned.
+        // No drive reports a disc → fall back to the FIRST opened drive so single-drive
+        // / quirky setups still get one (historical behavior). Tag drive #1 distinctly
+        // (TrayOpen 0x01) and confirm it, not #2 (NoDisc 0x00), is returned.
         let drives = vec![drive_with_media_byte(0x01), drive_with_media_byte(0x00)];
         let mut picked = select_drive_with_media(drives.into_iter()).expect("a fallback drive");
         assert_eq!(
@@ -2507,10 +2416,9 @@ mod command_tests {
 
     #[test]
     fn drive_status_short_transfer_falls_back_to_tur() {
-        // bytes_transferred < 6 means the GET EVENT reply is unusable;
-        // the code falls back to a TUR. FixedTransport always returns
-        // Ok, so the TUR "succeeds" → DiscPresent. (Buffer length 8 but
-        // payload only 4 bytes → bytes_transferred = 4.)
+        // bytes_transferred < 6 (buffer len 8, payload 4) means the GET EVENT reply
+        // is unusable, so code falls back to a TUR; FixedTransport always returns
+        // Ok, so the TUR "succeeds" → DiscPresent.
         let mut d = drive_with(vec![0u8; 4]);
         assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
     }
@@ -2610,11 +2518,9 @@ mod command_tests {
 
     #[test]
     fn get_config_feature_encodes_feature_code_be_in_cdb() {
-        // GET CONFIGURATION (0x46), RT field byte 1 = 0x02 (report the
-        // named feature), then the 16-bit feature code big-endian in
-        // bytes 2..4. 0x010D has a nonzero high byte, so a swapped shift
-        // (>> vs <<) or byte order bug asks the drive for the wrong
-        // feature entirely.
+        // GET CONFIGURATION (0x46), RT byte 1 = 0x02, feature code big-endian in
+        // bytes 2..4. 0x010D has a nonzero high byte, so a swapped shift (>> vs <<)
+        // or byte order bug would ask the drive for the wrong feature.
         let RecordingHarness {
             drive: mut d,
             cdb,
@@ -3004,10 +2910,9 @@ mod command_tests {
 
     #[test]
     fn init_without_unlocker_is_ok_oem_fallback() {
-        // The test transport's identity matches no registered unlocker, so
-        // route_unlock returns None. init() must succeed (leaving the drive
-        // in stock mode for the host-cert handshake), not error — the OEM
-        // route is the no-match fallback, not a failure.
+        // No registered unlocker matches, so route_unlock returns None. init() must
+        // still succeed (stock mode for the host-cert handshake) — no-match is the
+        // OEM fallback, not a failure.
         let mut d = drive_with(vec![]);
         assert!(
             d.init().is_ok(),

@@ -64,15 +64,9 @@ impl StreamSelection {
             return Ok(());
         }
 
-        // Validate every listed PID exists in the title before mutating, so an
-        // unknown PID leaves the title untouched (no partial prune).
-        //
-        // Validate PER CLASS. Scanning both classes let a PID listed in the WRONG
-        // filter pass validation — an audio filter naming a subtitle PID, say —
-        // and `keeps` then matches it against the audio streams only, so the
-        // requested track is silently absent from the output. That is exactly the
-        // "fail loud rather than silently emit an MKV missing a requested track"
-        // contract this validation exists to enforce.
+        // Validate every listed PID before mutating (unknown PID → no partial prune),
+        // PER CLASS: scanning both classes let a PID in the WRONG filter pass, then
+        // `keeps` matched it only against its own class, silently dropping the track.
         if let PidFilter::Only(pids) = &self.audio {
             for &pid in pids {
                 let present = title
@@ -109,21 +103,9 @@ impl StreamSelection {
             i += 1;
             k
         });
-        // Prune `codec_privates` by the SAME index decision, whatever its length.
-        //
-        // This used to run only when `codec_privates.len() == streams.len()`, and
-        // do nothing otherwise. `codec_privates` is consumed positionally
-        // (`codec_privates[i]` describes `streams[i]` — see
-        // `TsMuxer::set_codec_private` / `Mp4Sink::create`), and `m2ts.rs::create`
-        // documents a longer-than-streams vec as benign ("ignore any trailing
-        // entries that exceed the track count"). So a title carrying one trailing
-        // extra entry skipped the prune entirely and every retained stream after
-        // the first dropped one silently got the PREVIOUS stream's
-        // codec_private — wrong SPS/PPS on the track, no error, no log.
-        //
-        // Indices at or past `keep`'s length can only be entries that already
-        // exceeded the stream count, i.e. describe no stream; drop them rather
-        // than leave them dangling behind the pruned list.
+        // Prune `codec_privates` by the SAME index decision, whatever its length. Old
+        // bug: guarding on `len == streams.len()` let a trailing extra entry skip the
+        // prune, so streams after a dropped one got the PREVIOUS codec_private (wrong SPS).
         let extra = title.codec_privates.len().saturating_sub(keep.len());
         if extra > 0 {
             tracing::debug!(

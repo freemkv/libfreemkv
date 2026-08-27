@@ -59,7 +59,7 @@ impl DropTally {
     }
 
     /// Whether the track has been judged too damaged to mux. Once `true`, the
-    /// caller should drop every remaining AU (passing them to [`record_drop`]
+    /// caller should drop every remaining AU (passing them to [`Self::record_drop`]
     /// with a poison reason) rather than emit them.
     pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned

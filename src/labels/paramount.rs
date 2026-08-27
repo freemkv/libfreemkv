@@ -43,10 +43,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         return None;
     }
 
-    // Surface the feature playlist's identity (e.g. `id="00222"`) so title
-    // selection can prefer it over a size-inflated decoy. The id is 5-digit
-    // zero-padded on BD (matching the `NNNNN.mpls` filename); keep only the
-    // digits so a stray attribute quote/space can't poison the parse.
+    // Surface the feature playlist's identity so title selection can prefer
+    // it over a size-inflated decoy. The id is 5-digit zero-padded on BD
+    // (matching `NNNNN.mpls`); keep only digits to resist a stray quote/space.
     let feature_playlist = super::xml::attr(&feature, "id").and_then(|id| {
         let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
         if digits.is_empty() {
@@ -201,32 +200,14 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
 
     // Parse audio streams
     if let Some(aud) = xml::attr(feature, "aud") {
-        // aud_com1_idx is a trimmed, comma-separated list of CSV positions
-        // (some authoring tools emit whitespace, and multiple commentary
-        // tracks are possible) — symmetric with sub_com1_idx below.
-        // A HashSet, not a Vec: `com_indices` is parsed straight out of an
-        // attacker-controlled attribute with no length bound and was scanned
-        // linearly once per stream, so `aud="..."` and `aud_com1_idx="..."`
-        // both grown large make this quadratic in the size of one XML file.
-        // Membership is the only operation performed on it.
+        // aud_com1_idx: trimmed CSV positions, symmetric with sub_com1_idx.
+        // HashSet not Vec: parsed from an attacker-controlled attribute and
+        // only membership-tested; a Vec would make large inputs quadratic.
         let com_indices = com_indices(xml::attr(feature, "aud_com1_idx"));
 
-        // The CSV *is* the STN list: one cell per stream, in stream order,
-        // and `aud_com1_idx` is a 0-based index into those same cells. So
-        // `stream_number` is the cell's own 1-based position — NOT a counter
-        // that only advances on cells carrying a language.
-        //
-        // A cell with an empty language still occupies its STN slot; it just
-        // has nothing to label. Renumbering the surviving cells 1..N shifts
-        // every label behind an empty cell one slot forward, which is how a
-        // marker authored for one stream ends up written onto the stream in
-        // front of it (see the subtitle side, where the marker is `forced`).
-        //
-        // `u16::try_from` rather than `saturating_add`: past the 1-based u16
-        // numbering space every cell would collapse onto `u16::MAX`, binding
-        // several streams to one label. Stop emitting instead. Unreachable on
-        // real media — the BD STN_table admits at most 32 primary audio
-        // streams per playlist.
+        // The CSV *is* the STN list, so `stream_number` is each cell's 1-based
+        // position, not a counter over labeled cells (empty cells still occupy
+        // their slot). `u16::try_from`: stop rather than wrap onto `u16::MAX`.
         for (i, lang) in aud.split(',').enumerate() {
             let Ok(stream_number) = u16::try_from(i + 1) else {
                 break;
@@ -262,11 +243,9 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
         // parsed input, membership-only use, linear scan once per stream.
         let com_indices = com_indices(xml::attr(feature, "sub_com1_idx"));
 
-        // As with audio: the cell position IS the STN slot. `forced_sub` and
-        // `sub_com1_idx` are indexed against those same cells, so an empty
-        // cell must not renumber the cells behind it — a forced marker
-        // authored for one PG slot would otherwise be written onto an
-        // earlier, full-dialogue subtitle track.
+        // As with audio: the cell position IS the STN slot, indexed by
+        // `forced_sub`/`sub_com1_idx`, so an empty cell must not renumber
+        // the rest — else a forced marker lands on the wrong subtitle track.
         for (i, lang) in sub.split(',').enumerate() {
             let Ok(stream_number) = u16::try_from(i + 1) else {
                 break;
@@ -620,10 +599,9 @@ mod tests {
 
     #[test]
     fn aud_com1_idx_trimmed_and_multivalue() {
-        // Whitespace around the index, and a multi-value list, must both
-        // resolve. com index is positional against the raw CSV, so with
-        // an empty slot at position 1, " 2 " marks the 'fra' track
-        // (CSV index 2, STN slot 3) as commentary.
+        // Whitespace and multi-value lists must both resolve; com index is
+        // positional against the raw CSV, so with an empty slot at position 1,
+        // " 2 " marks 'fra' (CSV index 2, STN slot 3) as commentary.
         let feature = r#"<playlist aud="eng,,fra" aud_com1_idx=" 2 " />"#;
         let labels = labels_from_feature(feature);
         let a = audio(&labels);
@@ -782,10 +760,9 @@ mod tests {
     /// Mutation: cast `i + 1` to u16 → stream numbers wrap to 0, skipping apply.
     #[test]
     fn audio_stream_number_never_wraps() {
-        // 65535 audio tracks is impossible on a real disc but the parser must
-        // not panic or produce 0. Build a comma-separated list of 65535 "eng"s.
-        // We only run the number-assignment logic via labels_from_feature.
-        // Limit: CSV with 300 slots is sufficient to test the counter.
+        // 65535 tracks is impossible on a real disc but must not panic/produce 0.
+        // 300 slots is sufficient to exercise the number-assignment logic
+        // via labels_from_feature without building the full 65535-entry CSV.
         let aud: String = (0..300).map(|_| "eng").collect::<Vec<_>>().join(",");
         let feature = format!(r#"<playlist name="Feature" aud="{}" />"#, aud);
         let labels = labels_from_feature(&feature);

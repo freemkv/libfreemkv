@@ -150,10 +150,9 @@ mod tests {
 
     #[test]
     fn mask_string_preserves_non_ascii_chars() {
-        // is_ascii_alphabetic/is_ascii_digit are false for non-ASCII, so
-        // multibyte chars pass through unchanged (no mojibake, no panic).
-        // 'c','a','f' are ASCII letters → 'A'; 'é' is non-ASCII →
-        // preserved; '9' → '0'.
+        // is_ascii_alphabetic/is_ascii_digit are false for non-ASCII, so multibyte
+        // chars pass through unchanged (no mojibake, no panic): ASCII letters → 'A',
+        // digits → '0', 'é' preserved.
         assert_eq!(mask_string("café9"), "AAAé0");
     }
 

@@ -76,19 +76,15 @@ impl<W: Write> HevcMux<W> {
     /// — Annex B has no timing layer.
     pub fn write_frame(&mut self, _pts_ns: i64, data: &[u8]) -> io::Result<()> {
         if !self.params_written {
-            // Mark written *before* the write: a partial write that then
-            // errors must not cause a later re-entry to re-emit the full
-            // parameter set on top of the bytes the sink already
-            // received (duplicate/split VPS/SPS/PPS). Callers discard the
-            // mux on any write error.
+            // Mark written *before* the write: on a write error, a later
+            // re-entry must not re-emit VPS/SPS/PPS on top of bytes the sink
+            // already received. Callers discard the mux on any write error.
             self.params_written = true;
             if let Some(cp) = &self.codec_private {
                 match hvcc_to_annex_b(cp) {
                     Some(params) => self.writer.write_all(&params)?,
-                    // A non-empty hvcC that yields no NAL is a caller
-                    // contract violation: emitting the stream without
-                    // VPS/SPS/PPS produces undecodable output. Surface it
-                    // rather than dropping the parameter sets silently.
+                    // A non-empty hvcC yielding no NAL is a caller contract
+                    // violation: emitting without VPS/SPS/PPS is undecodable.
                     None if !cp.is_empty() => {
                         return Err(crate::error::Error::HevcParamParse.into());
                     }
@@ -268,10 +264,9 @@ pub(crate) fn append_length_prefixed_as_annex_b_sized(
         DEFAULT_NAL_LENGTH_SIZE
     };
     let mut offset = 0;
-    // True once we've consumed at least one well-formed length prefix
-    // (even a zero-length one). Distinguishes "parsed as length-prefixed,
-    // all NALs empty" (emit nothing) from "not length-prefixed at all"
-    // (pass through as already-Annex B).
+    // True once at least one well-formed length prefix is consumed (even a
+    // zero-length one): distinguishes "all NALs empty" (emit nothing) from
+    // "not length-prefixed at all" (pass through as already-Annex B).
     let mut parsed_any = false;
     while offset + length_size <= data.len() {
         // Big-endian over exactly `length_size` octets (ISO/IEC 14496-15: the
@@ -281,19 +276,16 @@ pub(crate) fn append_length_prefixed_as_annex_b_sized(
             .fold(0usize, |acc, &b| (acc << 8) | b as usize);
         offset += length_size;
         if offset + len > data.len() {
-            // Mid-NAL truncation (e.g. a NAL cut by a bad disc sector) —
-            // drop the truncated trailing NAL and emit only the valid
-            // Annex-B prefix accumulated so far. We never emit a half-NAL
-            // nor leak raw length-prefixed bytes into the Annex-B stream.
+            // Mid-NAL truncation (e.g. bad disc sector): drop the trailing
+            // NAL, emit only the valid Annex-B prefix so far — never leak
+            // raw length-prefixed bytes into the Annex-B stream.
             break;
         }
         parsed_any = true;
         if len == 0 {
-            // A zero-length prefix (e.g. pad bytes read off a damaged
-            // sector) would otherwise emit a bare start code with no
-            // RBSP — an invalid empty Annex B NAL. Skip it, mirroring
-            // the `nal_len == 0` guard in `hvcc_to_annex_b` (ISO/IEC
-            // 14496-15).
+            // Zero-length prefix (e.g. damaged-sector padding) would emit an
+            // invalid empty NAL; skip it (mirrors `hvcc_to_annex_b`'s
+            // `nal_len == 0` guard, ISO/IEC 14496-15).
             continue;
         }
         out.extend_from_slice(&START_CODE);
@@ -301,11 +293,9 @@ pub(crate) fn append_length_prefixed_as_annex_b_sized(
         offset += len;
     }
     if !parsed_any && !data.is_empty() {
-        // No length prefixes parsed at all and no leading start code:
-        // pass the bytes through rather than discard them (recover-100%
-        // goal — a decoder can attempt its own resync; dropping them
-        // guarantees loss). This is distinct from "parsed as length-
-        // prefixed but every NAL was zero-length", which emits nothing.
+        // Nothing parsed and no leading start code: pass bytes through
+        // rather than discard them (recover-100% goal; a decoder can
+        // resync). Distinct from "parsed but every NAL was zero-length".
         out.extend_from_slice(data);
     }
 }
@@ -342,10 +332,9 @@ pub(crate) fn avcc_to_annex_b(avcc: &[u8]) -> Option<Vec<u8>> {
     let mut offset = AVCC_HEADER_LEN + 1;
     let mut out = Vec::new();
 
-    // Extract `count` length-prefixed NALs starting at `*offset` into `out`.
-    // Returns `false` (truncated) if a length field or NAL body runs past the
-    // end — the caller then stops, so it never reads further length fields out
-    // of mid-NAL bytes (mirrors `hvcc_to_annex_b`).
+    // Extract `count` length-prefixed NALs into `out`. Returns `false` if a
+    // length field or NAL body runs past the end, so the caller stops rather
+    // than reading further length fields out of mid-NAL bytes.
     fn take(avcc: &[u8], count: usize, offset: &mut usize, out: &mut Vec<u8>) -> bool {
         for _ in 0..count {
             if *offset + 2 > avcc.len() {
@@ -443,10 +432,9 @@ mod tests {
 
     #[test]
     fn mid_nal_truncation_drops_trailing_nal_keeps_prefix() {
-        // First NAL is valid (2-byte payload), second has a length prefix
-        // claiming 100 bytes with only 3 present. Policy: emit the valid
-        // first NAL as Annex B, drop the truncated trailing NAL — never
-        // leak raw length-prefixed bytes into the Annex B stream.
+        // Second NAL's length prefix claims 100 bytes with only 3 present.
+        // Policy: emit the valid first NAL, drop the truncated trailing one
+        // — never leak raw length-prefixed bytes into the Annex B stream.
         let mut raw = Vec::new();
         raw.extend_from_slice(&2u32.to_be_bytes());
         raw.extend_from_slice(&[0x11, 0x22]);
@@ -682,10 +670,8 @@ mod tests {
 
     #[test]
     fn non_length_prefixed_three_plus_bytes_passes_through() {
-        // A 4+ byte buffer that does NOT parse as length-prefixed (the first
-        // u32 length exceeds the remaining bytes on the very first NAL, parsing
-        // nothing) is passed through unchanged (parsed_any == false branch).
-        // 0xFFFFFFFF length with no body → parsed_any stays false → pass-through.
+        // 0xFFFFFFFF length with no body: exceeds remaining bytes on the very
+        // first NAL, so parsed_any stays false and the buffer passes through.
         let raw = [0xFF, 0xFF, 0xFF, 0xFF, 0x11, 0x22];
         let got = length_prefixed_to_annex_b(&raw);
         assert_eq!(&got[..], &raw[..], "unparseable → passed through verbatim");
