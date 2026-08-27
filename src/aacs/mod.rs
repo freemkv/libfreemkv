@@ -122,18 +122,9 @@ pub(crate) fn role_paths(udf: &crate::udf::UdfFs, role: AacsRole) -> Vec<String>
             AacsRole::Mkb => v.push(format!("/{d}/MKBROM.AACS")),
             AacsRole::ContentCert => v.push(format!("/{d}/CONTENT_CERT.AACS")),
             AacsRole::UnitKey => {
-                // Glob VTKF*.AACS — the title-key filename is not fixed at
-                // VTKF000 (Freedom ships VTKF090 + VTKF100). Sorted for a
-                // deterministic try order.
-                //
-                // Each VTKF%%%.AACS is bound to ONE playlist (VPLST%%%.XPL): the
-                // TKF's 12-byte PLAYLIST_NAME field (bytes 0x10..0x1C) names the
-                // playlist whose Title Keys it carries, and keys from a TKF whose
-                // name does not match the title's playlist must not be used. The
-                // caller resolves this by trying candidates in sorted order and
-                // decrypting with the one whose keys verify — correct for a
-                // single-playlist disc; a name-matched selection keyed on the
-                // active playlist is the precise form for multi-playlist discs.
+                // Glob VTKF*.AACS (not fixed at VTKF000; Freedom ships VTKF090 +
+                // VTKF100), sorted for a deterministic try order. Each is bound to
+                // ONE playlist; caller tries in order, uses whichever's keys verify.
                 let mut names: Vec<&str> = dir
                     .entries
                     .iter()
@@ -157,7 +148,7 @@ pub(crate) fn role_paths(udf: &crate::udf::UdfFs, role: AacsRole) -> Vec<String>
 ///
 /// `read` performs the actual per-path read (full file or bounded prefix), so
 /// callers share the same first-present walk regardless of read style. Returns
-/// [`Error::AacsNoKeys`] if no candidate is present. Generic over the path
+/// [`Error::AacsNoKeys`](crate::Error::AacsNoKeys) if no candidate is present. Generic over the path
 /// element (`&str` or owned `String`) so it accepts the `Vec<String>` that
 /// [`role_paths`] builds from the discovered HD DVD directory.
 pub(crate) fn read_first<S, F>(candidates: &[S], mut read: F) -> crate::error::Result<Vec<u8>>
@@ -173,15 +164,9 @@ where
     Err(crate::error::Error::AacsNoKeys)
 }
 
-// The module structure IS the public API — consumers import from the owning
-// module directly (e.g. `aacs::content::decrypt_unit`, `aacs::mkb::MkbType`,
-// `aacs::derive::{derive_vuk, resolve_candidate}`, `aacs::resolve::resolve_keys_v2`).
-// The `derive::probe` reproduction harness stays reachable via its module path.
-//
-// A small set of flat re-exports is kept for the typed key primitives and the
-// content-decrypt entry points that downstream key-source crates import through
-// the `aacs::` path. These are the stable, load-bearing names; keeping them here
-// lets those crates track the module refactor without a lockstep re-pin.
+// The module structure IS the public API — consumers import from the owning module
+// (e.g. `aacs::content::decrypt_unit`). A small set of flat re-exports below is kept
+// for typed key primitives and content-decrypt entry points that downstream crates rely on.
 pub use content::ALIGNED_UNIT_LEN;
 pub use derive::derive_vuk;
 pub use types::{DeviceKey, HostCert, MediaKey, ProcessingKey, UnitKey, Vid, Vuk};
@@ -199,19 +184,16 @@ mod tests {
 
     #[test]
     fn aligned_unit_len_is_three_2048_byte_sectors() {
-        // ALIGNED_UNIT_LEN is the AACS aligned-unit size: 3 × 2048 = 6144.
-        // Re-exported from decrypt; pin the value here so the public constant
-        // and the spec stay in lockstep.
+        // ALIGNED_UNIT_LEN is the AACS aligned-unit size (3 × 2048 = 6144);
+        // pin it here so the public constant tracks the spec.
         assert_eq!(ALIGNED_UNIT_LEN, 6144);
         assert_eq!(ALIGNED_UNIT_LEN, 3 * 2048);
     }
 
     #[test]
     fn version_strides_are_reexported_and_distinct() {
-        // The three AACS generations are part of the public surface, and the
-        // V10 (48) vs V20/V21 (64) stride distinction is the load-bearing
-        // difference. Confirm the enum re-export is usable and the variants
-        // are distinct values.
+        // V10 (48) vs V20/V21 (64) stride is the load-bearing distinction;
+        // confirm the enum re-export is usable and variants are distinct.
         assert_ne!(AacsVersion::V10, AacsVersion::V20);
         assert_ne!(AacsVersion::V20, AacsVersion::V21);
     }
@@ -236,11 +218,8 @@ mod tests {
     }
 
     // ── HD DVD AACS directory / filename discovery ────────────────────────
-    //
-    // The HD DVD AACS dir name and title-key filename are authoring-specific
-    // and were previously hardcoded to `/ANY!/VTKF000.AACS`. These verify the
-    // discovery replacement against both real-disc shapes: Freedom (`AAC!` +
-    // `VTKF090`/`VTKF100`) and a BD/UHD disc (no HD DVD dir).
+    // Dir/filename are authoring-specific (previously hardcoded to `/ANY!/VTKF000.AACS`);
+    // verify against Freedom (`AAC!` + `VTKF090`/`VTKF100`) and a BD/UHD disc (no HD DVD dir).
 
     #[test]
     fn role_paths_discovers_hddvd_dir_and_globs_all_vtkf_variants() {

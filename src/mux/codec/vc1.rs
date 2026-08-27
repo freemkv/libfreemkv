@@ -85,20 +85,14 @@ fn vc1_frame_coding_type(frame_rbsp: &[u8], seq_header: Option<&[u8]>) -> Option
 }
 
 pub struct Vc1Parser {
-    // First-seen seq_header + entry_point seed the MKV codecPrivate
-    // (BITMAPINFOHEADER extra data). These are the only out-of-band copies
-    // the player gets. A stream may redefine either header mid-title; any
-    // occurrence whose body DIFFERS from the active value must be emitted
-    // IN-BAND at each point it appears, and at every keyframe (RAP) if the
-    // active value differs from the codecPrivate copy, so seek points carry
-    // valid decoder state (SMPTE 421M requires seq+entry before every RAP).
+    // First-seen seq_header + entry_point seed MKV codecPrivate. A redefined
+    // body must be emitted IN-BAND at each occurrence, and at every keyframe
+    // when it differs from codecPrivate (SMPTE 421M requirement).
     seq_header: Option<Vec<u8>>,
     entry_point: Option<Vec<u8>>,
-    // Currently-ACTIVE body of each type — the most recent the bitstream
-    // defined. Distinct from the fixed codecPrivate copies above. The
-    // strip/emit decision is made against `cur_*`, not the first-seen copy:
-    // a switch BACK to the first-seen body (== codecPrivate) is still a
-    // change a streaming decoder must be told about.
+    // Currently-ACTIVE body of each type, distinct from the fixed codecPrivate
+    // copies above. Strip/emit is decided against `cur_*`, not the first-seen
+    // copy: switching BACK to the first-seen body is still a change to signal.
     cur_seq_header: Option<Vec<u8>>,
     cur_entry_point: Option<Vec<u8>>,
     width: u32,
@@ -188,20 +182,17 @@ impl CodecParser for Vc1Parser {
             return Vec::new();
         }
 
-        // MKV block timecodes are PRESENTATION timestamps; frames are stored in
-        // decode order and the player reorders by timecode. Use PTS, not DTS —
-        // DTS presents B-frames in decode order (visible judder) and breaks
-        // PTS-based seeking. Fall back to DTS only if PTS is absent.
+        // MKV block timecodes are PRESENTATION timestamps; use PTS, not DTS —
+        // DTS presents B-frames in decode order (judder, broken seeking).
+        // Fall back to DTS only if PTS is absent.
         let explicit_pts = pes.pts.or(pes.dts).map(pts_to_ns);
         let ts_ns = explicit_pts.unwrap_or(0);
         let mut has_seq_header = false;
         let mut has_entry_point = false;
         let mut frame_start: Option<usize> = None;
         // Track whether this AU carried a redefined (in-band) copy of each
-        // header type.  These are collected into separate temporaries so the
-        // final keyframe prefix can be assembled in the canonical SMPTE 421M
-        // order (seq_header then entry_point) regardless of bitstream scan
-        // order.
+        // header type, in separate temporaries so the keyframe prefix can be
+        // assembled in canonical SMPTE 421M order regardless of scan order.
         let mut redefined_seq: Option<Vec<u8>> = None;
         let mut redefined_ep: Option<Vec<u8>> = None;
 
@@ -265,21 +256,9 @@ impl CodecParser for Vc1Parser {
         // Keyframe = this PES contains a sequence header (I-frame indicator in BD)
         let keyframe = has_seq_header;
 
-        // Build the in-band prefix in the canonical SMPTE 421M order:
-        //   sequence_header (0x0F) THEN entry_point (0x0E).
-        //
-        // For each header type, use the in-band-redefined body when the AU
-        // carried a change; otherwise re-assert the active body (unchanged
-        // repeat) so every RAP is self-contained.  At non-keyframes only
-        // genuine redefinitions are emitted.
-        //
-        // Assembling into separate seq/ep slots and concatenating in fixed
-        // order avoids the ordering hazard that arose when the scan loop
-        // appended headers in bitstream order and reassert() later appended
-        // to whatever was already there: if seq was unchanged (stripped) but
-        // entry_point was redefined (appended), the old code would produce
-        // [entry_point] then reassert seq AFTER it → [entry_point,
-        // seq_header], inverting the required order.
+        // Build the in-band prefix in canonical SMPTE 421M order — seq_header
+        // (0x0F) then entry_point (0x0E) — using each header's redefined body if
+        // changed else the active one, to avoid the scan-order-dependent [ep, seq] hazard.
         let mut prefix: Vec<u8> = Vec::new();
         if keyframe {
             // seq_header slot: prefer the in-band-redefined body, else active.
@@ -323,12 +302,9 @@ impl CodecParser for Vc1Parser {
                 }
             }
             None => {
-                // No frame start code. If this PES carried only parameter sets
-                // (sequence header / entry point, captured above into
-                // codecPrivate), there is no coded picture to emit — drop it
-                // rather than passing parameter bytes through as a bogus
-                // keyframe. Mirrors how the H.264/HEVC parsers skip
-                // parameter-set-only access units.
+                // No frame start code: if this PES carried only parameter sets
+                // (already captured into codecPrivate above), drop it rather than
+                // pass through as a bogus keyframe (mirrors H.264/HEVC).
                 if has_seq_header || has_entry_point {
                     return Vec::new();
                 }
@@ -413,20 +389,15 @@ fn parse_vc1_resolution(sh: &[u8]) -> Option<(u32, u32)> {
         // Simple/Main profile: resolution not in sequence header
         return None;
     }
-    // Advanced profile sequence-header layout (SMPTE 421M, bit-level from sh[4]):
-    // PROFILE(2) + LEVEL(3) + COLORDIFF_FORMAT(2) + FRMRTQ_POSTPROC(3) +
-    // BITRTQ_POSTPROC(5) + POSTPROCFLAG(1) + MAX_CODED_WIDTH(12) +
-    // MAX_CODED_HEIGHT(12) ...
-    // Total bits before MAX_CODED_WIDTH: 2+3+2+3+5+1 = 16 bits.
-    // We need 16+12+12 = 40 bits = 5 de-escaped bytes from sh[4..].
+    // Advanced profile seq-header layout (SMPTE 421M, from sh[4]): PROFILE(2)+
+    // LEVEL(3)+COLORDIFF_FORMAT(2)+FRMRTQ_POSTPROC(3)+BITRTQ_POSTPROC(5)+
+    // POSTPROCFLAG(1)=16 bits, then MAX_CODED_WIDTH(12)+HEIGHT(12) = 40 bits total = 5 bytes.
     if sh.len() < 9 {
         return None;
     }
-    // VC-1 Annex-B EBDU payload may carry emulation-prevention bytes (an
-    // inserted 0x03 after a 00 00 run). De-escape the payload before bit
-    // extraction so an EP byte landing within the first few bytes can't shift
-    // every subsequent bit and corrupt MAX_CODED_WIDTH/HEIGHT. Collect just the
-    // 5 de-escaped bytes the bit fields need.
+    // VC-1 Annex-B EBDU may carry emulation-prevention bytes (0x03 after 00 00).
+    // De-escape before bit extraction so an EP byte doesn't shift subsequent
+    // bits and corrupt MAX_CODED_WIDTH/HEIGHT; collect just the 5 bytes needed.
     let payload = &sh[4..];
     let mut deesc = Vec::with_capacity(5);
     let mut zeros = 0u8;
@@ -449,10 +420,8 @@ fn parse_vc1_resolution(sh: &[u8]) -> Option<(u32, u32)> {
     for &b in &deesc {
         bits = (bits << 8) | b as u64;
     }
-    // bits holds 40 significant bits laid out as:
-    //   [16 leading bits][MAX_CODED_WIDTH:12][MAX_CODED_HEIGHT:12]
-    // so MAX_CODED_WIDTH starts 12 bits from the LSB end and MAX_CODED_HEIGHT
-    // occupies the low 12 bits (shift 0).
+    // bits holds 40 significant bits: [16 leading][WIDTH:12][HEIGHT:12], so
+    // WIDTH starts 12 bits from the LSB end and HEIGHT occupies the low 12 (shift 0).
     const WIDTH_SHIFT: u64 = 12; // 40 - 16 - 12
     let coded_width = ((bits >> WIDTH_SHIFT) & 0xFFF) as u32 + 1;
     let coded_height = (bits & 0xFFF) as u32 + 1;
@@ -697,10 +666,9 @@ mod tests {
         let frames = parser.parse(&pes);
 
         assert_eq!(frames.len(), 1);
-        // Seq+entry seed codecPrivate on first occurrence, but because this is a
-        // keyframe (RAP) they are re-asserted in-band so the RAP is
-        // self-contained. Frame data therefore STARTS with the seq_header start
-        // code, and the SC_FRAME picture data follows.
+        // Seq+entry seed codecPrivate on first occurrence, but as a keyframe (RAP)
+        // they're re-asserted in-band, so frame data STARTS with the seq_header
+        // start code, then the SC_FRAME picture data.
         let fd = &frames[0].data;
         assert!(fd.len() >= 4);
         assert_eq!(&fd[0..4], &[0x00, 0x00, 0x01, SC_SEQUENCE_HEADER]);
@@ -832,10 +800,9 @@ mod tests {
 
     #[test]
     fn advanced_profile_resolution_uses_16bit_offset() {
-        // Regression: the parser skipped 11 bits (omitting BITRTQ_POSTPROC's 5
-        // bits) instead of 16, reading width/height 5 bits too early. Encode a
-        // non-default 1280x720 and confirm it round-trips, proving the 16-bit
-        // pre-width offset.
+        // Regression: parser skipped 11 bits (omitting BITRTQ_POSTPROC's 5) instead
+        // of 16, reading width/height 5 bits early. Round-trip a non-default
+        // 1280x720 to confirm the 16-bit pre-width offset.
         let mut parser = Vc1Parser::new();
         let mut data = make_ap_seq_header(1280, 720);
         // A frame so the parser emits and stores the header.
@@ -903,12 +870,9 @@ mod tests {
 
     #[test]
     fn resolution_max_encodable_is_8192_within_bound() {
-        // MAX_CODED_WIDTH/HEIGHT are 12-bit fields (max 4095). The decoded
-        // dimension is (coded + 1) * 2, so the largest representable value is
-        // (4095 + 1) * 2 = 8192 — exactly the `<= 8192` accept bound. A real
-        // header therefore always satisfies the bound; the guard exists for
-        // corrupt input but the field width makes 8192 the ceiling. Encoding
-        // 8192x8192 (coded = 4095) must round-trip.
+        // MAX_CODED_WIDTH/HEIGHT are 12-bit (max 4095); decoded dim = (coded+1)*2,
+        // so (4095+1)*2 = 8192 is the ceiling and exactly the `<= 8192` accept
+        // bound (guard exists for corrupt input). 8192x8192 (coded=4095) must round-trip.
         let sh = make_ap_seq_header(8192, 8192);
         assert_eq!(parse_vc1_resolution(&sh), Some((8192, 8192)));
     }
@@ -1208,10 +1172,9 @@ mod tests {
             .collect();
         parser.parse(&make_pes(au1, Some(0)));
 
-        // AU2: keyframe — seq_header UNCHANGED (same bytes as AU1), entry_point
-        // REDEFINED to B. This is the bug trigger: the scan emits ep_b into the
-        // accumulator but strips sh; the keyframe reassert must then prepend sh
-        // BEFORE ep_b, not after.
+        // AU2: keyframe, seq_header UNCHANGED, entry_point REDEFINED to B. Bug
+        // trigger: scan emits ep_b but strips sh, so the keyframe reassert must
+        // prepend sh BEFORE ep_b, not after.
         let au2: Vec<u8> = sh
             .iter()
             .chain(ep_b.iter())

@@ -25,22 +25,9 @@ fn decrypt_sectors_with_none_keys_is_noop() {
 /// Test: decrypt_sectors with CSS keys descrambles sectors.
 #[test]
 fn css_decrypt_of_an_uncrackable_sector_still_descrambles() {
-    // A scrambled sector whose header is uniformly periodic yields a crib, so
-    // the supplied key IS checked — and this arbitrary key is not the right
-    // one, so the crib check rejects it and the re-crack from this synthetic
-    // body finds nothing.
-    //
-    // That combination does NOT fail the rip. `attack_crib` is a heuristic: it
-    // predicts that a periodic header run continues past 0x80, and when that
-    // prediction does not hold it reports a mismatch even for a CORRECT key —
-    // whereupon the re-crack fails because the crib was never valid. Crib
-    // mismatch plus crack failure is the signature of a crib false positive,
-    // and the cached key stays the best available evidence.
-    //
-    // This test previously asserted DecryptFailed, matching a round-9 change
-    // that made real DVDs unrippable. CSS is not AACS: an AACS
-    // unit key either opens a unit or does not, whereas a CSS title key is
-    // recovered from data whose recoverability varies sector by sector.
+    // Wrong key: the header crib rejects it and re-crack finds nothing, but that
+    // is not a rip failure — `attack_crib` is a heuristic, so this mismatch just
+    // means the cached key stands (CSS recoverability varies per sector, unlike AACS).
     let mut sector = vec![0xFFu8; 2048];
     // Scrambled DVD sectors are MPEG-2 PS packs. The descramble policy requires
     // the pack start code as well as the flag bits, because byte 0x14 means

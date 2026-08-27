@@ -17,19 +17,19 @@ use crate::scsi::{DataDirection, ScsiTransport};
 ///   - MMC-6 §5.3.10 for Firmware Information
 #[derive(Debug, Clone)]
 pub struct DriveId {
-    /// T10 VENDOR IDENTIFICATION — INQUIRY bytes [8:16]
+    /// T10 VENDOR IDENTIFICATION — INQUIRY bytes `[8:16]`
     /// SPC-4 §6.4.2
     pub vendor_id: String,
 
-    /// PRODUCT IDENTIFICATION — INQUIRY bytes [16:32]
+    /// PRODUCT IDENTIFICATION — INQUIRY bytes `[16:32]`
     /// SPC-4 §6.4.2
     pub product_id: String,
 
-    /// PRODUCT REVISION LEVEL — INQUIRY bytes [32:36]
+    /// PRODUCT REVISION LEVEL — INQUIRY bytes `[32:36]`
     /// SPC-4 §6.4.2
     pub product_revision: String,
 
-    /// VENDOR SPECIFIC — INQUIRY bytes [36:43]
+    /// VENDOR SPECIFIC — INQUIRY bytes `[36:43]`
     /// SPC-4 §6.4.2
     /// Content varies by vendor: firmware type code (MTK), date (Pioneer), etc.
     pub vendor_specific: String,
@@ -60,26 +60,18 @@ impl DriveId {
         let mut inquiry = vec![0u8; 96];
         let cdb_inq = [0x12, 0x00, 0x00, 0x00, 0x60, 0x00];
         let inq = transport.execute(&cdb_inq, DataDirection::FromDevice, &mut inquiry, 5000)?;
-        // `bytes_transferred` is device-reported and untrusted — the same rule
-        // the two GET CONFIGURATION calls below already apply. It was ignored
-        // here, and the buffer is pre-zeroed, so a drive answering GOOD with a
-        // short or empty data phase (a USB-SATA bridge mid-wedge does exactly
-        // this) decoded to blank identity strings and a byte 0 of 0x00. Every
-        // platform enumerator gates on `raw_inquiry[0] & 0x1F == OPTICAL`, so
-        // 0x00 reads as DIRECT ACCESS and the drive silently disappears from
-        // the device list instead of reporting a failed probe.
+        // `bytes_transferred` is device-reported and untrusted. Unchecked, a
+        // GOOD status with a short/empty data phase decoded to blank identity +
+        // byte0 0x00 — which reads as DIRECT ACCESS, so the drive vanishes silently.
         if inq.bytes_transferred < INQUIRY_STANDARD_LEN {
             return Err(crate::error::Error::DriveInquiryShort);
         }
         // Never decode past what the drive actually sent.
         inquiry.truncate(inq.bytes_transferred.min(inquiry.len()));
 
-        // GET CONFIGURATION Feature 010Ch — MMC-6 §6.6.
-        // Best-effort: 010Ch (Firmware Information) is an optional feature.
-        // A drive that lacks it may CHECK CONDITION rather than return an
-        // empty descriptor, so a failure here is treated as feature-absent
-        // (empty firmware date + empty raw bytes) instead of aborting the
-        // whole identity probe.
+        // GET CONFIGURATION Feature 010Ch — MMC-6 §6.6. Best-effort: an optional
+        // feature a drive may lack (CHECK CONDITION), so failure here is
+        // feature-absent (empty firmware date + raw bytes), not a probe abort.
         let mut gc = vec![0u8; 256];
         let cdb_gc = [0x46, 0x02, 0x01, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
         // `bytes_transferred` is device-reported and untrusted; clamp every
@@ -100,11 +92,9 @@ impl DriveId {
                 Err(_) => (String::new(), Vec::new()),
             };
 
-        // GET CONFIGURATION Feature 0108h — Serial Number.
-        // Best-effort, like 010Ch above: the serial-number feature is
-        // optional, so a drive that lacks it (CHECK CONDITION) or reports
-        // too few bytes deliberately yields an empty serial rather than
-        // failing the identity probe.
+        // GET CONFIGURATION Feature 0108h — Serial Number. Best-effort like
+        // 010Ch: optional feature, so lacking it (CHECK CONDITION) or too few
+        // bytes deliberately yields an empty serial rather than failing.
         let mut gc_serial = vec![0u8; 256];
         let cdb_serial = [0x46, 0x02, 0x01, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
         let serial_number = if let Ok(r) =

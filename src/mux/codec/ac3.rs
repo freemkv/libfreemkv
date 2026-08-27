@@ -33,12 +33,12 @@ use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 /// Sample rates indexed by fscod (0=48kHz, 1=44.1kHz, 2=32kHz). fscod=3 is
 /// reserved in AC-3; in E-AC-3 it signals "fscod2" (reduced rates: 24/22.05/16
-/// kHz, selected by byte-4 bits [5:4]). `frame_sample_rate` decodes fscod2 in
+/// kHz, selected by byte-4 bits `[5:4]`). `frame_sample_rate` decodes fscod2 in
 /// the E-AC-3 case; this table's index-3 entry (48 kHz) is only the fallback
 /// when the header is too short to read fscod2.
 const SAMPLE_RATES: [u32; 4] = [48_000, 44_100, 32_000, 48_000];
 
-/// E-AC-3 reduced sample rates indexed by fscod2 (byte-4 bits [5:4]), used when
+/// E-AC-3 reduced sample rates indexed by fscod2 (byte-4 bits `[5:4]`), used when
 /// fscod==3. Index 3 is reserved; we fall back to 48 kHz for it.
 const EAC3_REDUCED_RATES: [u32; 4] = [24_000, 22_050, 16_000, 48_000];
 
@@ -247,18 +247,16 @@ impl Ac3Parser {
             {
                 self.frames_scanned += 1;
             }
-            // Decodability gate: a syncframe with an out-of-range bsid (> 16) or
-            // a failed native CRC (payload corruption) poisons the access unit it
-            // belongs to — a dependent substream is useless without its parent and
-            // vice versa, so the whole access unit is dropped as one silence gap.
+            // Decodability gate: an out-of-range bsid (> 16) or a failed native CRC
+            // poisons the whole access unit — a dependent substream is useless
+            // without its parent and vice versa — so it's dropped as one silence gap.
             let reason = ac3_drop_reason(&self.tally, frame, bsid);
 
             if substream_role(remaining, bsid) == SubstreamRole::Extends {
                 match pending.as_mut() {
-                    // A dependent substream — or an additional independent
-                    // substream (`substreamid` 1..7) — extends the frame set it
-                    // directly follows. Requiring byte contiguity keeps skipped
-                    // junk out of the emitted access unit.
+                    // A dependent (or additional independent, substreamid 1..7)
+                    // substream extending the frame set it directly follows; byte
+                    // contiguity is required to keep skipped junk out of the AU.
                     Some(au) if au.end == start => {
                         au.end = start + frame_size;
                         if au.drop_reason.is_none() {
@@ -266,18 +264,9 @@ impl Ac3Parser {
                         }
                         self.saw_extension = true;
                     }
-                    // A substream with no open access unit — a mid-frame-set
-                    // resync, or a stream whose first syncframe is not
-                    // `substreamid` 0 (Annex E orders a frame set independent
-                    // substream 0 first, so joining mid-set is exactly the case
-                    // here). It belongs to a frame set whose mandatory
-                    // `substreamid`-0 substream was never seen, so it is neither
-                    // decodable on its own (a dependent substream) nor timeable
-                    // (an additional independent substream carries the frame set's
-                    // time period, not its own PTS). Skip it rather than ship a
-                    // fragment a decoder cannot use and re-time the whole
-                    // timeline around; resync at the next `substreamid`-0
-                    // substream. No PTS advance: it carries no duration.
+                    // No open access unit: mid-frame-set resync, or a stream whose
+                    // mandatory substreamid-0 substream was never seen. Neither
+                    // decodable alone nor timeable, so skip it with no PTS advance.
                     _ => {
                         tracing::debug!(
                             target: "mux",
@@ -289,9 +278,8 @@ impl Ac3Parser {
                 if let Some(au) = pending.take() {
                     close_access_unit(&mut self.tally, data, &au, marks, &mut frames);
                 }
-                // First access unit that starts in this PES's own bytes: adopt
-                // this PES's timestamp so a genuine PTS jump is followed instead
-                // of the running cadence drifting past it.
+                // First AU starting in this PES's own bytes: adopt its timestamp so
+                // a genuine PTS jump is followed, not drifted past.
                 if let Some(a) = &anchor
                     && start >= a.at
                 {
@@ -317,26 +305,18 @@ impl Ac3Parser {
             scanned_to = pos;
         }
 
-        // Close or HOLD the trailing access unit. The rest of its frame set — its
-        // dependent substreams and any additional independent substreams — may
-        // still be in the next PES, so an access unit that can still grow is
-        // held: the carry-over rewinds to its first byte and the whole access
-        // unit is re-scanned (and only then counted/emitted) next call. An
-        // E-AC-3 `substreamid`-0 substream can always gain more of its frame set;
-        // a legacy AC-3 syncframe only in the AC-3-core + E-AC-3-dependent
-        // arrangement, so it is held only once this track has actually shown a
-        // substream that extends an access unit — a plain AC-3 track keeps
-        // emitting every frame in-call.
+        // Close or HOLD the trailing access unit: its frame set may still continue
+        // in the next PES, so a growable AU is held and re-scanned next call, but
+        // only once this track has shown a substream extending an AU (E-AC-3).
         let mut hold_from = None;
         let mut held_out = None;
         if let Some(au) = pending {
             if !at_eos && (au.bsid >= 11 || self.saw_extension) {
                 frame_pts_ns = au.pts_ns;
                 hold_from = Some(au.start);
-                // Everything below `scanned_to` has been searched already, and
-                // the access unit's own frames have been sized and CRC-gated;
-                // record both, rebased onto the carry-over (which starts at
-                // `au.start`), so the next call resumes instead of redoing it.
+                // Everything below `scanned_to` is already searched and CRC-gated;
+                // record it rebased onto the carry-over (starting at `au.start`)
+                // so the next call resumes instead of redoing the work.
                 held_out = Some(HeldAu {
                     end: au.end - au.start,
                     scanned_to: scanned_to.max(au.end) - au.start,
@@ -349,23 +329,15 @@ impl Ac3Parser {
             }
         }
 
-        // Keep unconsumed data for the next call. `pos` is the start of the
-        // last unprocessed search region. On the `start + frame_size > len`
-        // break it sits exactly at the straddling frame's syncword; on the
-        // `remaining.len() < 6` break it is the value from the top of that
-        // iteration, with the syncword possibly sitting after some pre-sync
-        // junk — so the re-scan below (from `pos`, NOT a recomputed sync) is
-        // required to locate the carry-over syncword. Carry from `pos`, NOT
-        // from the next syncword: discarding bytes between `pos` and the next
-        // sync would drop the partial frame we are deliberately keeping across
-        // the boundary. A held access unit wins: it starts before `pos`.
+        // Keep unconsumed data for the next call: re-scan from `pos`, not a
+        // recomputed sync, to avoid dropping the partial frame kept across the
+        // PES boundary. Held AU wins (its start is before `pos`).
         let keep_from = match hold_from {
             Some(h) => h,
             None if pos < data.len() => {
-                // A syncword at/after `pos` marks the carry-over start (anything
-                // before it is junk with no sync). With no full sync, retain the
-                // whole tail — including a lone trailing 0x0B that may be the first
-                // half of a syncword split across the PES boundary.
+                // A syncword at/after `pos` marks the carry-over start. With no full
+                // sync, retain the whole tail, including a lone trailing 0x0B that
+                // may be the first half of a syncword split across the boundary.
                 match find_ac3_sync(&data[pos..]) {
                     Some(o) => pos + o,
                     None if data.last() == Some(&0x0B) => data.len() - 1,
@@ -568,17 +540,9 @@ fn ac3_drop_reason(
 
 impl CodecParser for Ac3Parser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        // B1: a concealed/lost gap means the bytes held in `buf` are a TRUNCATED
-        // frame. Appending the post-gap bytes would splice them into one corrupt
-        // frame (wrong frame_size, bad CRC → "exponent out of range" / garbage).
-        // Drop the partial and resync on the next syncword — a clean single-frame
-        // gap instead of a frankenstein frame. (The video parsers carry this via
-        // the ResyncGate; audio has no inter-frame refs, so dropping the spliced
-        // partial is the whole fix.)
-        //
-        // Handle the discontinuity BEFORE the empty-data guard so the signal can
-        // never be stranded by an empty post-gap PES (the demuxer only emits
-        // non-empty PES today; this is defensive for any future caller).
+        // B1: a concealed/lost gap means `buf` holds a TRUNCATED frame; appending
+        // post-gap bytes would splice a corrupt frame, so drop the partial and
+        // resync on the next syncword. Handled before the empty-data guard.
         if pes.discontinuity {
             self.acc.clear();
             // The held access unit's bytes went with it.
@@ -588,35 +552,19 @@ impl CodecParser for Ac3Parser {
             return Vec::new();
         }
 
-        // This PES's timestamp applies to the first access unit that STARTS in
-        // its own bytes; anything already buffered began in an earlier PES and
-        // keeps the running cadence (`flush_pts_ns`). Each subsequent access unit
-        // in the same call advances by the previous one's duration, so a PES that
-        // carries several access units stamps a monotonically increasing PTS
-        // instead of the same PES timestamp on all of them (which collapses their
-        // timecodes and drifts A/V).
-        //
-        // A PES with no PTS (rare for audio, but legal — and the case demuxers
-        // guard at a post-gap continuation) must NOT reset the timeline to 0: with
-        // no anchor the running cadence simply continues. The discontinuity-
-        // carrying PES is a PUSI with a PTS in practice, so this is
-        // defense-in-depth.
+        // This PES's timestamp applies to the first AU that STARTS in its own bytes;
+        // later AUs advance by the previous one's duration (avoiding A/V drift). A
+        // PES with no PTS must NOT reset the timeline: `flush_pts_ns` just continues.
         let carry_len = self.acc.len();
         let anchor = pes.pts.map(|p| PtsAnchor {
             at: carry_len,
             pts_ns: pts_to_ns(p),
         });
 
-        // Prepend leftover from previous PES, then take the whole buffer into a
-        // local so the scanner can call `self.tally` (the bytes are no longer
-        // borrowed from `self`). The unconsumed tail is written back at the end.
+        // Prepend leftover from the previous PES, then take the scratch buffer out
+        // of `self` so the scanner can borrow `self.tally`; it's put back at the
+        // end, keeping its capacity. There is no early return after this point.
         self.acc.push(pes);
-        // Copy the working bytes out so the scanner can borrow `self.tally`;
-        // the buffer keeps its marks, so the unconsumed tail stays attributed
-        // to the packet that carried it.
-        // Take the scratch OUT of `self` so the scanner can borrow `self.tally`
-        // while reading it; it is put back at the end of the call, keeping its
-        // capacity for the next PES. There is no early return after this point.
         let mut buf = std::mem::take(&mut self.scratch);
         buf.clear();
         buf.extend_from_slice(self.acc.as_slice());
@@ -643,20 +591,16 @@ impl CodecParser for Ac3Parser {
                 );
                 self.acc.clear();
                 self.held = None;
-                // Advance the cadence, as both sibling branches below do, so the
-                // three paths out of this block cannot disagree. Defensive: no
-                // input reaching this parser was found that both parses frames and
-                // leaves a residue this large, so the stale-cadence bug this
-                // prevents is not currently reachable and has no regression test.
+                // Advance the cadence, as the other two paths out of this block do,
+                // so all three cannot disagree. Defensive: no input parsing frames
+                // and leaving a residue this large is currently reachable.
                 self.flush_pts_ns = frame_pts_ns;
             } else {
                 self.acc.drain(keep_from);
                 self.held = still_held;
-                // The carried bytes, when later completed and emitted (next call
-                // or by flush() at EOS), are timed at the PTS the scanner reached
-                // here: the PTS of the next access unit in presentation order, or
-                // — for a HELD access unit — that access unit's own PTS, so the
-                // hold never shifts it.
+                // Carried bytes, when later completed and emitted, are timed at the
+                // PTS the scanner reached here — the next AU's PTS, or for a HELD
+                // AU, its own PTS, so the hold never shifts it.
                 self.flush_pts_ns = frame_pts_ns;
             }
         } else {
@@ -675,11 +619,9 @@ impl CodecParser for Ac3Parser {
     }
 
     fn flush(&mut self) -> Vec<Frame> {
-        // Drain the carry-over buffer at EOS: a complete access unit (including
-        // one held back waiting for a possible dependent substream) may sit there
-        // with no following PES to close it, and without this drain the last
-        // ~32 ms of audio is lost. `at_eos` closes the trailing access unit
-        // instead of holding it; a partial/garbage tail yields nothing.
+        // Drain the carry-over at EOS: an AU (possibly held for a dependent
+        // substream) may sit there with no following PES to close it, else the
+        // last ~32ms of audio is lost. `at_eos` closes it instead of holding.
         let buf = self.acc.as_slice().to_vec();
         let marks = self.acc.marks_snapshot();
         self.acc.clear();
@@ -720,7 +662,7 @@ fn eac3_samples_per_frame(data: &[u8]) -> u32 {
 
 /// Sample rate (Hz) of an AC-3/E-AC-3 frame from its fscod field (byte 4 bits
 /// 7-6). For E-AC-3 (`bsid >= 11`) an fscod of 3 selects a reduced rate via
-/// fscod2 (byte 4 bits [5:4]); decoding it keeps the frame duration correct
+/// fscod2 (byte 4 bits `[5:4]`); decoding it keeps the frame duration correct
 /// instead of mistiming reduced-rate frames at 48 kHz (A/V drift).
 fn frame_sample_rate(data: &[u8], bsid: u8) -> u32 {
     if data.len() < 5 {
@@ -867,7 +809,7 @@ pub(crate) fn ac3_frame_size(data: &[u8]) -> usize {
     }
 }
 
-/// AC-3 frame size table: [frmsizecod] -> [48kHz words, 44.1kHz words, 32kHz words]
+/// AC-3 frame size table: `[frmsizecod]` -> `[48kHz words, 44.1kHz words, 32kHz words]`
 const AC3_FRAME_SIZES: [[usize; 3]; 38] = [
     [64, 69, 96],
     [64, 70, 96],
@@ -968,11 +910,9 @@ mod tests {
             "the buffer must be handed back to the parser, not dropped"
         );
 
-        // The discriminator: a LARGE packet, then a small one. A reused buffer
-        // keeps the large capacity; a fresh `Vec` sized to each packet drops
-        // back to the small one. Feeding equal-sized packets cannot tell those
-        // apart — the first version of this test did exactly that and a
-        // to_vec()-per-call implementation passed it.
+        // Discriminator: LARGE packet then small. A reused buffer keeps the large
+        // capacity; a fresh `Vec` drops to the small size. Equal-sized packets
+        // can't tell those apart — an earlier to_vec()-per-call bug passed that test.
         let big = [frame.clone(), frame.clone(), frame.clone(), frame.clone()].concat();
         parser.parse(&PesPacket {
             source: None,
@@ -1070,11 +1010,9 @@ mod tests {
 
     #[test]
     fn discontinuity_drops_truncated_partial() {
-        // B1: a partial AC-3 frame is buffered, then a concealed gap arrives
-        // (PES marked discontinuity) carrying a fresh complete frame. The
-        // truncated partial must be DROPPED, not spliced — otherwise the parser
-        // emits one corrupt frame built from [stale partial | head of fresh] and
-        // strands the tail (decoders report "incomplete frame" / wrong sync).
+        // B1: a partial frame is buffered, then a discontinuity-marked PES brings a
+        // fresh complete frame. The partial must be DROPPED, not spliced, or the
+        // parser emits one corrupt frame from [stale partial | head of fresh].
         let mut parser = Ac3Parser::new();
         let frame_data = make_ac3_frame(0, 2); // 160 bytes, starts with 0x0B77
 
@@ -1218,11 +1156,9 @@ mod tests {
 
     #[test]
     fn buffer_stays_bounded_across_many_garbage_pes() {
-        // The carry-over buffer must never grow without bound. Feed
-        // many large PES packets that contain no usable frame and assert the
-        // retained buffer stays tiny — carry-from-`pos` drops all pre-sync junk,
-        // and a never-completing frame is bounded by the 8192-byte frame cap and
-        // the MAX_AC3_BUF resync guard.
+        // The carry-over buffer must never grow without bound: carry-from-`pos`
+        // drops pre-sync junk, and a never-completing frame is bounded by the
+        // 8192-byte frame cap and the MAX_AC3_BUF resync guard.
         let mut parser = Ac3Parser::new();
         for i in 0..256 {
             // Vary the trailing byte so we also exercise the lone-0x0B retain.
@@ -1393,10 +1329,9 @@ mod tests {
 
     #[test]
     fn eac3_fscod2_reduced_rate_duration() {
-        // E-AC-3 with fscod==3 (reduced rate) and fscod2==0 → 24 kHz, not 48.
-        // bsid>=11 selects the E-AC-3 path. When fscod==3 the block count is
-        // fixed at 6 → 1536 samples. Byte 4 layout: fscod(2)|fscod2(2)|...
-        // fscod=3 (0b11), fscod2=0 (0b00) → byte4 = 0b1100_0000 = 0xC0.
+        // E-AC-3 with fscod==3 (reduced rate) and fscod2==0 → 24 kHz, not 48; block
+        // count is then fixed at 6 → 1536 samples. Byte 4: fscod(2)|fscod2(2)|...,
+        // so fscod=3 (0b11), fscod2=0 (0b00) → byte4 = 0b1100_0000 = 0xC0.
         let data = [0x0B, 0x77, 0x00, 0x00, 0xC0, 16 << 3];
         let bsid = get_bsid(&data);
         assert!(bsid >= 11, "test frame is E-AC-3");
@@ -1637,11 +1572,9 @@ mod tests {
 
     #[test]
     fn eac3_frame_at_min_frame_bytes_passes_sizing_then_crc_gate() {
-        // The smallest frame the SIZING layer accepts is MIN_FRAME_BYTES = 6
-        // (frmsiz=2). A synthetic all-zero 6-byte frame passes sizing (so it
-        // reaches the decodability gate — proven by it being COUNTED as a drop,
-        // not silently size-skipped) but fails the CRC gate and is dropped; the
-        // following real AC-3 frame (valid CRC) is emitted.
+        // Smallest frame SIZING accepts is MIN_FRAME_BYTES = 6 (frmsiz=2). An
+        // all-zero 6-byte frame passes sizing (proven COUNTED as a drop, not
+        // size-skipped) but fails CRC; the following real AC-3 frame is emitted.
         let mut parser = Ac3Parser::new();
         // 0x0B 0x77 | byte2=0 byte3=2 (frmsiz=2 → 6 bytes) | byte4=0 | byte5 bsid
         let mut data = vec![0x0B, 0x77, 0x00, 0x02, 0x00, 16 << 3];
@@ -1659,10 +1592,9 @@ mod tests {
 
     #[test]
     fn eac3_max_frmsiz_frame_within_window_accepted() {
-        // E-AC-3 frmsiz is an 11-bit field (3 bits of byte2 + 8 bits of byte3),
-        // so its maximum value is 0x7FF = 2047 → (2048)*2 = 4096 bytes, which is
-        // inside the MIN_FRAME_BYTES..=8192 accept window and, with a valid CRC,
-        // must be emitted.
+        // E-AC-3 frmsiz is an 11-bit field, so its max value 0x7FF = 2047 →
+        // (2048)*2 = 4096 bytes, inside the MIN_FRAME_BYTES..=8192 accept window
+        // and, with a valid CRC, must be emitted.
         let mut parser = Ac3Parser::new();
         let mut frame = vec![0u8; 4096];
         frame[0] = 0x0B;
@@ -1671,9 +1603,8 @@ mod tests {
         frame[3] = 0xFF; // frmsiz low → 0x7FF = 2047 → 4096 bytes
         frame[5] = 16 << 3; // bsid 16 (E-AC-3)
         finalize_ac3_crc(&mut frame); // pass the decodability gate
-        // The trailing E-AC-3 access unit is HELD at the end of the call (a
-        // dependent substream may follow in the next PES), so it is closed by
-        // flush() at EOS rather than in-call. Content and size are unchanged.
+        // Trailing E-AC-3 AU is HELD at end of call (a dependent substream may
+        // follow), so it's closed by flush() at EOS, not in-call.
         let mut f = parser.parse(&make_eac3_pes(frame));
         f.extend(parser.flush());
         assert_eq!(f.len(), 1, "4096-byte E-AC-3 frame within window accepted");
@@ -1720,10 +1651,9 @@ mod tests {
 
     #[test]
     fn flush_rejects_frame_extending_past_buffer() {
-        // A buffered sync whose decoded frame size exceeds the buffered bytes
-        // must be dropped by flush (never emit fewer bytes than the size field
-        // declares). Build a real AC-3 header (160-byte frame) but only buffer
-        // 100 bytes.
+        // A buffered sync whose decoded frame size exceeds the buffered bytes must
+        // be dropped by flush (never emit fewer bytes than declared). Build a real
+        // 160-byte AC-3 frame but only buffer 100 bytes.
         let mut parser = Ac3Parser::new();
         let frame = make_ac3_frame(0, 2); // sizes to 160
         parser.acc.seed(&frame[..100]);
@@ -1784,11 +1714,9 @@ mod tests {
 
     #[test]
     fn acmod_channels_stereo_2_0_no_lfe() {
-        // acmod=2 (2/0 L,R), no LFE → 2 channels. Verifies the channel count is
-        // read from the AC-3 bitstream's acmod, independent of any IFO claim.
-        // (A disc whose IFO lists 5.1 but where the wrong physical substream is
-        // selected is a separate stream-SELECTION bug, not this label path —
-        // tracked for rc.5.2.)
+        // acmod=2 (2/0 L,R), no LFE → 2 channels; verifies the channel count comes
+        // from the AC-3 bitstream's acmod, independent of any IFO claim (a disc
+        // IFO/substream mismatch is a separate SELECTION bug, tracked for rc.5.2).
         assert_eq!(acmod_channels(&make_bsi(2, false)), Some(2));
     }
 
@@ -1896,9 +1824,8 @@ mod tests {
     #[test]
     fn crc_drop_preserves_pts_sync_no_shift() {
         // THE INVARIANT: dropping a corrupt frame must not shift the audio after
-        // it. good / corrupt / good in one PES — the corrupt frame is dropped but
-        // the trailing clean frame keeps the EXACT PTS it would have had with no
-        // drop (base + 2 frame durations): a silence gap, not a shift.
+        // it. good/corrupt/good in one PES — the trailing clean frame keeps the
+        // EXACT PTS it would have had with no drop: a silence gap, not a shift.
         let mut parser = Ac3Parser::new();
         let mut data = make_ac3_frame(0, 2); // f0
         data.extend_from_slice(&make_corrupt_ac3_frame(0, 2)); // dropped
@@ -1968,13 +1895,9 @@ mod tests {
 
     #[test]
     fn eac3_independent_plus_dependent_is_one_access_unit() {
-        // THE FIX: per ETSI TS 102 366 Annex E an access unit is the independent
-        // substream (strmtyp 0) plus every dependent substream (strmtyp 1) that
-        // follows it — the 7.1 Dolby Digital Plus arrangement. Both syncframes
-        // must emerge as ONE frame carrying the INDEPENDENT substream's PTS and
-        // exactly ONE frame duration (previously each syncframe was emitted as
-        // its own access unit and each advanced the clock, doubling the timeline
-        // and handing decoders a parentless dependent substream).
+        // THE FIX: per ETSI TS 102 366 Annex E an AU is the independent substream
+        // plus every dependent substream that follows it — both must emerge as ONE
+        // frame with the independent PTS and ONE duration (not double it).
         let mut parser = Ac3Parser::new();
         let indep = make_eac3_frame(0, 0, 160);
         let dep = make_eac3_frame(1, 0, 96);
@@ -2014,10 +1937,9 @@ mod tests {
 
     #[test]
     fn eac3_grouped_timeline_is_not_doubled() {
-        // Two complete access units (independent + dependent each) in one PES,
-        // followed by a third independent substream that closes the second.
-        // The emitted PTS cadence must be one frame duration per access unit —
-        // the 2x-runtime / A-V-drift symptom of ungrouped substreams.
+        // Two complete access units (independent + dependent each) in one PES, plus
+        // a third independent substream closing the second. PTS cadence must be
+        // one frame duration per AU — else the 2x-runtime / A-V-drift symptom.
         let mut parser = Ac3Parser::new();
         let mut data = Vec::new();
         for _ in 0..2 {
@@ -2038,10 +1960,9 @@ mod tests {
 
     #[test]
     fn plain_ac3_frames_are_not_grouped_or_delayed() {
-        // NO REGRESSION for legacy AC-3 (bsid < 11): it has no substream
-        // structure (byte 2 is crc1, not strmtyp), so every syncframe is a
-        // complete access unit, emitted in the SAME call — never merged with its
-        // neighbour and never held back for a dependent that cannot exist.
+        // NO REGRESSION for legacy AC-3 (bsid < 11): it has no substream structure
+        // (byte 2 is crc1, not strmtyp), so every syncframe is a complete AU,
+        // emitted in the SAME call — never merged, never held for a dependent.
         let mut parser = Ac3Parser::new();
         let mut data = Vec::new();
         for _ in 0..3 {
@@ -2060,10 +1981,9 @@ mod tests {
 
     #[test]
     fn eac3_access_unit_split_across_pes_is_grouped() {
-        // The access unit boundary is only known at the NEXT independent
-        // substream, so a trailing independent substream is held across the PES
-        // boundary: the dependent half arriving in the next PES still joins it,
-        // and the AU keeps the FIRST PES's PTS (its independent substream's).
+        // The AU boundary is only known at the NEXT independent substream, so a
+        // trailing one is held across the PES boundary: the dependent half in the
+        // next PES still joins it, keeping the FIRST PES's PTS.
         let mut parser = Ac3Parser::new();
         let indep = make_eac3_frame(0, 0, 160);
         let dep = make_eac3_frame(1, 0, 96);
@@ -2174,14 +2094,9 @@ mod tests {
 
     #[test]
     fn eac3_additional_independent_substream_stays_in_the_frame_set() {
-        // THE FIX: an Annex E frame set is independent substream 0 (mandatory,
-        // first) with its dependents, then the OPTIONAL additional independent
-        // substreams 1..7 with theirs — ALL covering the SAME time period. An
-        // additional independent substream (an associated / commentary service)
-        // therefore belongs to the frame set already open; keying the access-unit
-        // boundary on `strmtyp` alone made it close the AU and advance the running
-        // PTS a SECOND time over the same 32 ms, doubling the timeline (~1 s of
-        // A/V drift per second of audio).
+        // THE FIX: a frame set is substream 0 plus dependents, then OPTIONAL
+        // additional independent substreams 1..7 — ALL the SAME time period.
+        // Keying the AU boundary on `strmtyp` alone doubled the PTS advance.
         let mut parser = Ac3Parser::new();
         let ind0 = make_eac3_frame(0, 0, 160); // main programme
         let dep0 = make_eac3_frame(1, 0, 96); // its dependent (7.1 extension)
@@ -2228,13 +2143,9 @@ mod tests {
 
     #[test]
     fn eac3_stream_joined_mid_frame_set_resyncs_at_substreamid_0() {
-        // A stream whose first syncframe is an ADDITIONAL independent substream
-        // (here substreamid 3) joined a frame set whose mandatory substreamid-0
-        // substream was never seen. Mirroring the orphan-dependent rule, it is
-        // skipped: it carries the frame set's time period rather than its own, so
-        // emitting it as an access unit would invent a period for audio whose
-        // main programme is missing. Grouping resyncs at the next substreamid-0
-        // substream, and the orphan consumes none of the timeline.
+        // A stream whose first syncframe is ADDITIONAL substream (substreamid 3)
+        // joined a set whose mandatory substreamid-0 was never seen. It's skipped
+        // (carries the set's time period, not its own); resyncs at substreamid-0.
         let mut parser = Ac3Parser::new();
         let orphan = make_eac3_frame(0, 3, 128);
         let orphan_dep = make_eac3_frame(1, 3, 96);
@@ -2291,10 +2202,9 @@ mod tests {
 
     #[test]
     fn corrupt_dependent_substream_drops_the_whole_access_unit() {
-        // A dependent substream that fails its native CRC poisons the access unit
-        // it belongs to: emitting the independent half alone would ship an AU a
-        // decoder must reassemble from a corrupt pair. The drop accounts for one
-        // frame duration, so the following AU keeps its true PTS (gap, not shift).
+        // A dependent substream failing its native CRC poisons the whole AU:
+        // emitting the independent half alone ships a pair no decoder can
+        // reassemble. The drop still accounts for one duration (gap, not shift).
         let mut parser = Ac3Parser::new();
         let mut dep = make_eac3_frame(1, 0, 96);
         dep[20] ^= 0xFF; // break the dependent substream's CRC
@@ -2516,10 +2426,9 @@ mod tests {
         let mut data = Vec::new();
         for _ in 0..CORRUPT_AUS {
             let mut f = eac3_substream_frame(0, 0);
-            // Corrupt a payload byte AFTER the CRC was finalized: the header
-            // (sizing, strmtyp/substreamid, bsid) stays intact so the frame is
-            // still parsed as a whole access unit and fails only the CRC —
-            // a VERIFIED drop, the only kind that feeds the poison verdict.
+            // Corrupt a payload byte AFTER CRC finalization: header stays intact so
+            // the frame is still parsed whole and fails only CRC — a VERIFIED
+            // drop, the only kind that feeds the poison verdict.
             f[100] ^= 0xFF;
             assert!(!frame_crc_ok(&f), "the fixture frame must fail its CRC");
             data.extend_from_slice(&f);

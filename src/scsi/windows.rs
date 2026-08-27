@@ -109,12 +109,9 @@ struct StorageAdapterDescriptor {
     AdapterScansDown: u8,
     CommandQueueing: u8,
     AcceleratedTransfer: u8,
-    // STORAGE_BUS_TYPE is an `int`-sized enum (4 bytes), not a byte. With the
-    // four preceding `BOOLEAN`s filling offsets 20..24, `BusType` sits at
-    // offset 24 and the two `USHORT` version fields follow at 28 and 30 —
-    // matching winioctl.h. (Declaring this `u8` total-sized to 32 by luck but
-    // pushed BusMajor/BusMinorVersion to offsets 26/28, so any reader of those
-    // fields got garbage.)
+    // STORAGE_BUS_TYPE is an `int`-sized enum (4 bytes), not a byte: with
+    // the preceding BOOLEANs filling 20..24, `BusType` sits at offset 24
+    // and the USHORT version fields follow at 28/30, matching winioctl.h.
     BusType: u32,
     BusMajorVersion: u16,
     BusMinorVersion: u16,
@@ -266,12 +263,9 @@ impl SptiTransport {
             return Ok(()); // can't open — skip reset, not fatal
         }
 
-        // Send device reset. The result must be checked: a wrong/unsupported
-        // IOCTL code fails with ERROR_INVALID_FUNCTION (0x1) and no-ops
-        // silently — exactly the regression class the doc block above records
-        // for the two earlier (incorrect) code values. Surface failures so a
-        // non-functional reset is observable rather than masked by the
-        // unconditional settle sleep below.
+        // Send device reset. Result must be checked: a wrong/unsupported
+        // IOCTL fails with ERROR_INVALID_FUNCTION and no-ops silently —
+        // surface failures so a non-functional reset isn't masked below.
         let mut returned: u32 = 0;
         let ok = unsafe {
             DeviceIoControl(
@@ -290,10 +284,8 @@ impl SptiTransport {
             tracing::debug!("IOCTL_STORAGE_RESET_DEVICE succeeded");
         } else {
             let err = unsafe { GetLastError() };
-            // Not fatal — the caller treats reset as best-effort — but a
-            // failing reset (especially ERROR_INVALID_FUNCTION = 1) means the
-            // device was NOT reset, so there is nothing to settle and we must
-            // not pay the settle-sleep penalty below.
+            // Not fatal — reset is best-effort — but a failing reset means
+            // the device was NOT reset, so skip the settle-sleep below.
             tracing::warn!(
                 last_error = err,
                 ioctl = format_args!("{IOCTL_STORAGE_RESET_DEVICE:#010x}"),
@@ -436,13 +428,9 @@ impl ScsiTransport for SptiTransport {
 
         let mut sptwb: SptwbDirect = unsafe { std::mem::zeroed() };
 
-        // Reject an over-length CDB rather than truncating it. This used to be
-        // `cdb.len().min(K_MAX_CDB_SIZE)`, and the copy into `sptwb.spt.Cdb`
-        // below then took only the first 16 bytes: SPC-4 fixes a command's
-        // length by its opcode group code, so the shortened CDB is a DIFFERENT
-        // command, which the drive executes and answers with GOOD status and
-        // data for a request nobody made. Matches the Linux and macOS backends
-        // (all three call the same helper).
+        // Reject an over-length CDB rather than truncating it: SPC-4 fixes
+        // a command's length by opcode group code, so a truncated CDB is a
+        // DIFFERENT command the drive would execute and answer as GOOD.
         let cdb_len = usize::from(super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?);
         sptwb.spt.Length = std::mem::size_of::<ScsiPassThroughDirect>() as u16;
         sptwb.spt.CdbLength = cdb_len as u8;
@@ -463,29 +451,14 @@ impl ScsiTransport for SptiTransport {
             });
         }
         sptwb.spt.DataTransferLength = data.len() as u32;
-        // Round up to the next whole second so a 1500ms request gets at
-        // least 2s, not 1s. SPTI's TimeOutValue is u32 seconds with no
-        // sub-second resolution; biasing toward "more time" is safer than
-        // truncating (truncation broke 1500ms fast-reads on Drive::read).
+        // Round up to the next whole second (SPTI's TimeOutValue has no
+        // sub-second resolution) rather than truncating — truncation
+        // broke 1500ms fast-reads on Drive::read.
         sptwb.spt.TimeOutValue = ((timeout_ms + 999) / 1000).max(1);
 
-        // AlignmentMask bounce buffer.
-        //
-        // IOCTL_SCSI_PASS_THROUGH_DIRECT requires `DataBuffer` to satisfy
-        // the adapter's `AlignmentMask` (`(ptr & mask) == 0`). On USB
-        // optical bridges the mask is 0, so the caller's buffer is always
-        // acceptable and we point straight at it (zero-copy fast path).
-        // On SCSI/SAS HBAs the mask can be 3/7/… ; if the caller's buffer
-        // happens to be misaligned the IOCTL fails outright (status 0xFF /
-        // all reads fail). In that case we transfer through an aligned
-        // scratch buffer: over-allocate by `mask` extra bytes so an aligned
-        // base is guaranteed to exist inside it, align the base with
-        // [`crate::scsi::align_up`], and use that as `DataBuffer`. For a
-        // FROM-device transfer the result is copied back into `data` after
-        // the IOCTL; for a TO-device transfer `data` is copied in before.
-        //
-        // `bounce` is kept alive for the whole `execute()` body so the
-        // aligned pointer we hand the driver stays valid across the IOCTL.
+        // AlignmentMask bounce buffer: `DataBuffer` must satisfy the
+        // adapter's `AlignmentMask` (0 on USB — zero-copy; nonzero on
+        // SCSI/SAS HBAs, where misalignment fails the IOCTL outright).
         let mask = self.alignment_mask as usize;
         let needs_bounce =
             !data.is_empty() && mask != 0 && (data.as_mut_ptr() as usize) & mask != 0;
@@ -531,17 +504,9 @@ impl ScsiTransport for SptiTransport {
         };
 
         if ok == 0 {
-            // Capture the Win32 error before returning. `open()` and `reset()`
-            // in this file both do; `execute()` did not, and it is the hot path
-            // — every READ(10) of a rip goes through here. Without it
-            // ERROR_INVALID_PARAMETER (a struct-layout regression, the very
-            // class this file's SDK-layout tests exist to catch),
-            // ERROR_ACCESS_DENIED and ERROR_GEN_FAILURE (a genuinely wedged
-            // drive) all collapse to the same status-0xFF transport failure
-            // with nothing in the log to tell a code bug from a hardware one.
-            // Logged rather than added to the error type: the typed variant is
-            // public API and the recovery classification is deliberately the
-            // same for all of them.
+            // Capture the Win32 error before returning — this hot path used
+            // to omit it, collapsing struct-layout bugs, access-denied, and
+            // a genuinely wedged drive into the same status-0xFF with no log.
             let last_error = unsafe { GetLastError() };
             tracing::warn!(
                 target: "freemkv::scsi",
@@ -549,13 +514,9 @@ impl ScsiTransport for SptiTransport {
                 last_error,
                 "DeviceIoControl(IOCTL_SCSI_PASS_THROUGH_DIRECT) failed"
             );
-            // Driver-level failure (timeout, handle gone, etc.). Bubble
-            // up; in-library handle recovery was removed in 0.13.20 along
-            // with Linux's async fd-recovery and macOS's `try_recover` —
-            // the kernel mid-layer already did its escalation by the time
-            // DeviceIoControl returned, and re-issuing reset/reopen here
-            // is at best redundant and at worst deepens the wedge. Caller
-            // surfaces the failure to UX.
+            // Driver-level failure. Bubble up; in-library handle recovery
+            // was removed in 0.13.20 — the kernel mid-layer already escalated
+            // by the time DeviceIoControl returned. Caller surfaces to UX.
             return Err(Error::ScsiError {
                 opcode: cdb.first().copied().unwrap_or(0),
                 status: super::SCSI_STATUS_TRANSPORT_FAILURE,
@@ -564,14 +525,9 @@ impl ScsiTransport for SptiTransport {
         }
 
         if sptwb.spt.ScsiStatus != 0 {
-            // SPTI doesn't surface a "bytes written into sense buffer"
-            // count separate from SenseInfoLength (input). Pass the full
-            // K_SENSE_SIZE; parse_sense keys off byte 0's response code
-            // to handle descriptor (0x72/0x73) vs fixed (0x70/0x71).
-            //
-            // 0.13.23: carry the full SPC-4 sense triple in
-            // `Error::ScsiError::sense` so callers can route on
-            // `ScsiSense::is_medium_error()` etc.
+            // SPTI doesn't surface a written-bytes count separate from
+            // SenseInfoLength; pass the full K_SENSE_SIZE and let
+            // parse_sense key off byte 0's response code (fixed vs descriptor).
             let parsed = super::parse_sense(&sptwb.sense, K_SENSE_SIZE as u8);
             return Err(Error::ScsiError {
                 opcode: cdb.first().copied().unwrap_or(0),

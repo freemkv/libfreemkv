@@ -338,10 +338,8 @@ fn test_healthy_short_transfer_reports_partial_bytes() {
 }
 
 // ── 13. Error::Display does not leak English in the SCSI variant ──────────
-//
-// Library rule (project docs): no English in error display, only "E{code}"
-// + structured data. Regression guard for the SCSI variant specifically
-// because it's the most-emitted error in the rip path.
+// Library rule: no English in error display, only "E{code}" + structured data.
+// Guards the SCSI variant since it's the most-emitted error in the rip path.
 
 #[test]
 fn test_scsi_error_display_format_is_codes_only() {

@@ -240,17 +240,9 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         recovery: bool,
         fua: bool,
     ) -> Result<usize> {
-        // Defense-in-depth: AACS aligned units are 3 sectors (6144 bytes) and
-        // `decrypt_sectors` anchors units at buffer offset 0. A read that does
-        // not begin a whole number of units past the encrypted region's base
-        // (`unit_base`, the clip/extent start_lba) would decrypt every unit
-        // under the wrong CBC/unit alignment and silently mis-decrypt. Reject
-        // loud (DecryptFailed) BEFORE reading rather than ever mis-decrypting.
-        // The gate is measured RELATIVE to `unit_base` (set per-extent by the
-        // mux read paths via `set_unit_base`), never absolute `lba % 3` — a clip
-        // whose start_lba is not itself 3-aligned must still gate on its own
-        // units (else its readable units are wrongly rejected → "Decryption
-        // failed" on exactly those titles).
+        // Defense-in-depth: AACS units are 3-sector aligned; misalignment would
+        // silently mis-decrypt, so reject loud (DecryptFailed) before reading.
+        // Gated relative to `unit_base` (per-extent), not raw `lba % 3`.
         if matches!(self.keys, DecryptKeys::Aacs { .. })
             && !crate::aacs::content::is_unit_aligned(lba, self.unit_base)
         {
@@ -260,35 +252,23 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             .inner
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
 
-        // PROACTIVE MAP PATH (the storm-free mux): when a key map is installed the
-        // mux resolved one key per CPS unit / segment up front, so decrypt each
-        // aligned unit with its MAPPED key and trust it — no per-unit `is_clean`
-        // verdict, no reactive key-fetch. A resolver gap surfaces loud from
-        // `decrypt_sectors_mapped` (DecryptFailed); authored-bad TS just passes
-        // through for the muxer to drop.
+        // Proactive map path (storm-free mux): keys were resolved per unit up
+        // front, so decrypt with the mapped key and trust it, no per-unit
+        // `is_clean` check. A resolver gap fails loud; bad TS passes through.
         if let Some(map) = self.key_map.clone() {
             crate::decrypt::decrypt_sectors_mapped(&mut buf[..n], &self.keys, lba, &map)?;
             return Ok(n);
         }
 
-        // Decrypt the bytes just read IN PLACE. Scheme-agnostic (None / CSS / AACS).
-        // With a content map installed the `*_in_content` entry skips units OUTSIDE
-        // the encrypted extents (clear filesystem / nav pass through untouched); the
-        // mux installs no map (it reads title extents only). A genuine can't-decrypt
-        // (no key / misaligned unit) surfaces as `Err` and propagates; otherwise
-        // every unit gets its key applied and the bytes pass through — a unit that
-        // decrypts to broken TS is the consumer's concern (the muxer drops it),
-        // never a read failure. (The decrypt-verify read gate was removed: bad
-        // sectors are marked by physical read success, not by TS structure.)
+        // Decrypt `buf` in place (None / CSS / AACS); with a content map, units
+        // outside the encrypted extents pass through untouched. A can't-decrypt
+        // fails loud; broken-TS output is the muxer's concern, not a read failure.
         let content = self.content_ranges.clone(); // cheap Arc bump; frees the &self borrow
         let content_ref = content.as_deref();
 
-        // No map installed → CSS self-descramble / clear pass-through. A genuine
-        // can't-decrypt (misaligned unit, or an AACS source reaching here without
-        // a map — a bug, since AACS decrypts only via the mapped path) surfaces as
-        // `Err` and propagates; otherwise every unit gets its key applied and the
-        // bytes pass through — a unit that decrypts to broken TS is the consumer's
-        // concern (the muxer drops it), never a read failure.
+        // No map installed: CSS self-descramble / clear pass-through. A can't-
+        // decrypt (misalignment, or mapless AACS reaching here — a bug) fails
+        // loud; otherwise units pass through, same as above.
         Self::decrypt_buf(&mut buf[..n], &mut self.keys, lba, content_ref)?;
         Ok(n)
     }
@@ -387,11 +367,9 @@ mod tests {
         assert_eq!(wrapped.inner().last, Some(7200));
     }
 
-    // TODO: AACS round-trip test — needs a fixture-encrypted unit
-    // (6144-byte aligned) plus the matching unit key. The cipher
-    // path itself is exercised by `crate::aacs` unit tests; here
-    // we only assert the decorator wires the existing helper, not
-    // that AES-128 is correct.
+    // TODO: AACS round-trip test needs a fixture-encrypted unit + matching key.
+    // `crate::aacs` unit tests already exercise the cipher; this would only
+    // assert the decorator wires the existing helper, not that AES-128 is correct.
 
     // ---------------------------------------------------------------
     // Additional coverage.
@@ -532,11 +510,9 @@ mod tests {
     /// `decrypt_sectors(&mut buf[..n], ...)`.
     #[test]
     fn decrypt_span_bounded_by_reported_n() {
-        // Inner fills a CSS-scrambled-FLAGGED sector but reports n=0, so
-        // the decrypt span is empty and the buffer must come back
-        // byte-identical to what the inner source wrote. A whole-`buf`
-        // decrypt would clear byte 0x14's scramble bits and XOR the data
-        // region — this asserts that does NOT happen for the n=0 span.
+        // Inner fills a CSS-scrambled-FLAGGED sector but reports n=0, so the
+        // decrypt span is empty and the buffer must come back byte-identical.
+        // A whole-`buf` decrypt would clear the scramble bits / XOR the data.
         let mut wrapped = DecryptingSectorSource::new(
             ShortReportSource { report_n: 0 },
             DecryptKeys::Css {

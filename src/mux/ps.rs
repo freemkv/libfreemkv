@@ -2,7 +2,7 @@
 //!
 //! DVDs use MPEG-2 Program Stream, which has:
 //! - Pack headers (00 00 01 BA) with SCR timestamps
-//! - PES packets (00 00 01 [stream_id]) with variable length
+//! - PES packets (00 00 01 `[stream_id]`) with variable length
 //! - System headers (00 00 01 BB)
 //! - Program end code (00 00 01 B9)
 //!
@@ -136,11 +136,9 @@ impl PsPacket {
                 let sub = self.sub_stream_id?;
                 dvd_audio_pid(sub).or_else(|| dvd_subtitle_pid(sub))
             }
-            // HD-DVD extended-stream-id (0xFD): route by the stream_id_extension
-            // (carried in `sub_stream_id`) to a distinct `0xFD00 | ext` PID, so a
-            // disc that puts several elementary streams on 0xFD keeps them apart.
-            // The codec (VC-1 etc.) is decided by the scanner's head probe, not
-            // here — this only assigns a stable routing key.
+            // HD-DVD extended-stream-id (0xFD): route by stream_id_extension (in
+            // `sub_stream_id`) to a distinct `0xFD00 | ext` PID so several elementary
+            // streams on 0xFD stay apart. Routing key only — scanner's probe picks codec.
             EXTENDED_STREAM_ID => self.sub_stream_id.map(hddvd_extended_pid),
             _ => None,
         }
@@ -232,11 +230,9 @@ impl PsDemuxer {
 
     /// Flush remaining buffered data, returning any final PES packets.
     pub fn flush(&mut self) -> Vec<PsPacket> {
-        // At EOF, an unbounded (length 0) PES with no trailing start code is
-        // a complete-but-unterminated final packet — emit it rather than
-        // dropping the tail of the last frame. Genuinely incomplete packets
-        // (a length-bounded PES short of its declared size) are still
-        // discarded.
+        // At EOF, an unbounded (length 0) PES with no trailing start code is a
+        // complete-but-unterminated final packet — emit it rather than dropping the last
+        // frame's tail. Length-bounded PES short of its declared size is still discarded.
         let packets = self.extract_packets(true);
         self.buffer.clear();
         // The buffer the cursor indexes into is gone.
@@ -270,10 +266,9 @@ impl PsDemuxer {
                     if sc + 14 > self.buffer.len() {
                         break; // wait for more data
                     }
-                    // DVD-Video is always MPEG-2 PS, so every 0xBA is treated
-                    // as a 14-byte MPEG-2 pack: the low 3 bits of byte 13 are
-                    // pack_stuffing_length. (An MPEG-1 pack would be 12 bytes
-                    // with no stuffing field, but DVD never emits one.)
+                    // DVD-Video is always MPEG-2 PS, so every 0xBA is a 14-byte MPEG-2
+                    // pack: low 3 bits of byte 13 are pack_stuffing_length. (An MPEG-1
+                    // pack is 12 bytes with no stuffing field, but DVD never emits one.)
                     let stuffing = (self.buffer[sc + 13] & 0x07) as usize;
                     let pack_len = 14 + stuffing;
                     if sc + pack_len > self.buffer.len() {
@@ -302,12 +297,9 @@ impl PsDemuxer {
                     let pes_packet_len =
                         ((self.buffer[sc + 4] as usize) << 8) | self.buffer[sc + 5] as usize;
 
-                    // Total bytes = 6 (start code + stream_id + length) + pes_packet_len.
-                    // A length of 0 means unbounded (video streams); in that
-                    // case the packet runs to the next PS-LAYER boundary (pack /
-                    // system header / program end / next PES), NOT the next raw
-                    // start code — the video ES payload is itself full of
-                    // 00 00 01 xx codes that would otherwise cut the PES short.
+                    // Length 0 means unbounded (video): the packet runs to the next PS-LAYER
+                    // boundary (pack / system header / program end / next PES), NOT the next
+                    // raw start code — the video ES payload is full of 00 00 01 xx codes.
                     let end = if pes_packet_len == 0 {
                         // Resume where the last call stopped searching for
                         // THIS PES's terminating unit; anything before that is
@@ -333,12 +325,9 @@ impl PsDemuxer {
                                 self.buffer.len()
                             }
                             None => {
-                                // No boundary buffered yet. Normally wait for
-                                // more data, but a corrupt stream could declare
-                                // an unbounded PES followed by endless non-
-                                // boundary bytes — bounding the buffer here
-                                // stops untrusted input forcing unbounded
-                                // allocation. Past the cap, flush what we have.
+                                // No boundary buffered yet — normally wait for more data, but
+                                // a corrupt unbounded PES could stream endless non-boundary
+                                // bytes; cap the buffer to stop unbounded alloc, then flush.
                                 if self.buffer.len() - sc > MAX_PS_BUFFER {
                                     self.pending_scan = None;
                                     self.buffer.len()
@@ -379,27 +368,17 @@ impl PsDemuxer {
             if self.has_base {
                 self.buffer_base += pos as u64;
             }
-            // The cursor is a BUFFER offset, so it moves with the drain. A
-            // pending PES always starts at or after `pos` (the loop broke on
-            // it, having already consumed everything before it), so neither
-            // component can underflow.
+            // The cursor is a BUFFER offset, so it moves with the drain. A pending PES
+            // always starts at or after `pos` (the loop broke on it, having consumed
+            // everything before it), so neither component can underflow.
             self.pending_scan = self
                 .pending_scan
                 .map(|(pes_at, searched_to)| (pes_at - pos, searched_to - pos));
         }
 
-        // Trim a start-code-free tail. Every other exit from the loop above
-        // leaves the buffer bounded (a pack, system header or length-bounded
-        // PES is at most ~64 KiB; a length-0 PES is force-flushed at
-        // MAX_PS_BUFFER), but a buffer that holds no `00 00 01` at all never
-        // reaches any of those branches: `find_start_code` returns None, `pos`
-        // stays 0 and nothing drains. Input that never contains a start code —
-        // a zero-filled VOB extent, or an AACS-encrypted clip probed as
-        // ciphertext — would then grow the buffer to the size of the whole
-        // title. Nothing in such a buffer can begin a PS unit except a 2-byte
-        // `00 00` prefix of a start code straddling the feed boundary, so keep
-        // exactly that and drop the rest. Lossless: the retained bytes are the
-        // only ones a later feed could complete into a start code.
+        // Trim a start-code-free tail: a buffer holding no `00 00 01` never drains, so
+        // zero-filled VOB or AACS ciphertext would grow it to whole-title size. Only a
+        // 2-byte `00 00` prefix straddling the feed boundary can start a unit — keep it.
         if self.buffer.len() > START_CODE_PREFIX_KEEP && find_start_code(&self.buffer, 0).is_none()
         {
             let drop = self.buffer.len() - START_CODE_PREFIX_KEEP;
@@ -580,11 +559,9 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
     let mut pts = None;
     let mut dts = None;
 
-    // The PTS (5 bytes at data[9..14]) and DTS (5 bytes at data[14..19])
-    // live INSIDE the PES header, so gate on header_data_len covering them
-    // (>=5 for PTS, >=10 for PTS+DTS), not merely on total length. A
-    // non-conformant packet that sets the flags but declares a too-short
-    // header would otherwise read payload bytes as a bogus timestamp.
+    // PTS (data[9..14]) and DTS (data[14..19]) live INSIDE the PES header, so gate on
+    // header_data_len covering them (>=5 PTS, >=10 PTS+DTS), not total length: a packet
+    // setting the flags with a too-short header would read payload as a bogus timestamp.
     if pts_dts_flags >= 2 && header_data_len >= 5 && data.len() >= 14 {
         pts = parse_pts(&data[9..14]);
     }
@@ -597,10 +574,9 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
     // For private stream 1, the first payload byte is the sub-stream ID,
     // followed by a sub-header whose length depends on the sub-stream type.
     let (sub_stream_id, es_data) = if stream_id == EXTENDED_STREAM_ID {
-        // HD-DVD extended-stream-id: the real stream id lives in the
-        // stream_id_extension inside the PES extension. There is no leading
-        // sub-header byte on the payload (unlike private_stream_1), so the ES
-        // is the payload verbatim.
+        // HD-DVD extended-stream-id: real stream id is the stream_id_extension inside
+        // the PES extension. No leading sub-header byte on the payload (unlike
+        // private_stream_1), so the ES is the payload verbatim.
         (
             parse_stream_id_extension(data, data[7], header_end),
             payload.to_vec(),
@@ -609,16 +585,9 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
         let sub_id = payload[0];
         let skip = match sub_id {
             0x80..=0x8F => 4, // AC3/DTS: sub_id + frame_count + access_unit_ptr(2)
-            // HD-DVD Dolby Digital Plus (E-AC-3): the sub-header is the same
-            // 4-byte shape as DVD AC-3 — sub_id + number_of_frames(1) +
-            // first_access_unit_pointer(2). Verified empirically on a real
-            // HD-DVD EVO: across every 0xC0..=0xC7 packet the 0x0B77 E-AC-3 syncword
-            // sits `first_access_unit_pointer` bytes past this 4-byte header
-            // (the leading bytes are the tail of the previous frame). Stripping
-            // exactly these 4 bytes on EVERY packet yields a clean, continuous
-            // E-AC-3 elementary stream that the ac3 parser reassembles across
-            // PES boundaries; a shorter skip would splice the sub-header bytes
-            // into a straddling frame and corrupt it.
+            // HD-DVD E-AC-3: 4-byte sub-header like DVD AC-3 (sub_id + num_frames(1) +
+            // first_access_unit_pointer(2)), verified on a real HD-DVD EVO. Strip exactly 4
+            // bytes/packet for a clean ES; a shorter skip splices sub-header into a frame.
             0xC0..=0xC7 => 4,
             0xA0..=0xA7 => 7, // LPCM: sub_id + frames + ptr(2) + emphasis + quant_freq + channels
             _ => 1,
@@ -730,18 +699,8 @@ mod tests {
     fn pes_header_with_pts() {
         let mut demuxer = PsDemuxer::new();
 
-        // PTS = 90000 (1 second at 90kHz)
-        // 90000 = 0x15F90
-        // bit32=0, bits 29-15 = 0x0002BF, bits 14-0 = 0x1F90
-        // byte0: 0010_0_1 = 0x21 ... actually let's encode properly:
-        //
-        // pts = 90000
-        // byte0: (0010 << 4) | ((pts >> 29) & 0x0E) | 1
-        //      = 0x20 | ((90000 >> 29) & 0x0E) | 1 = 0x20 | 0 | 1 = 0x21
-        // byte1: (pts >> 22) & 0xFF = (90000 >> 22) & 0xFF = 0
-        // byte2: ((pts >> 14) & 0xFE) | 1 = ((90000 >> 14) & 0xFE) | 1 = (0x0A & 0xFE) | 1 = 0x0B
-        // byte3: (pts >> 7) & 0xFF = (90000 >> 7) & 0xFF = (703) & 0xFF = 0xBF
-        // byte4: ((pts & 0x7F) << 1) | 1 = ((90000 & 0x7F) << 1) | 1 = (0x10 << 1) | 1 = 0x21
+        // PTS = 90000 (1 second at 90kHz), encoded via encode_pts with prefix 0x20;
+        // expected 5 bytes are 0x21,0x00,0x0B,0xBF,0x21 (marker bits set in bytes 0/2/4).
 
         let pts_bytes = encode_pts(90000, 0x20);
 
@@ -941,10 +900,9 @@ mod tests {
 
     #[test]
     fn unbounded_video_pes_not_cut_by_embedded_start_codes() {
-        // A length-0 video PES whose ES payload contains embedded MPEG start
-        // codes (picture 0x00, slice 0x01, GOP 0xB8, sequence 0xB3) must be
-        // delimited by the NEXT PS-layer boundary (here a program-end 0xB9),
-        // not by the first embedded 00 00 01 inside the payload.
+        // A length-0 video PES whose ES payload has embedded MPEG start codes (picture,
+        // slice, GOP, sequence) must be delimited by the NEXT PS-layer boundary (here a
+        // program-end 0xB9), not by the first embedded 00 00 01 inside the payload.
         let mut demuxer = PsDemuxer::new();
 
         let mut data = vec![
@@ -983,11 +941,9 @@ mod tests {
 
     #[test]
     fn input_with_no_start_code_at_all_is_bounded() {
-        // An extent that never contains a 00 00 01 start code — a zero-filled
-        // VOB extent, or an AACS-encrypted clip probed as ciphertext (see
-        // src/disc/hddvd.rs) — must not accumulate. The whole-title feed in
-        // src/mux/disc.rs would otherwise grow the buffer to the size of the
-        // title (up to ~90 GB for UHD).
+        // An extent with no 00 00 01 start code — zero-filled VOB, or AACS ciphertext
+        // probed raw (see src/disc/hddvd.rs) — must not accumulate. The whole-title feed
+        // in src/mux/disc.rs would otherwise grow the buffer to title size (~90 GB UHD).
         let mut demuxer = PsDemuxer::new();
         let chunk = vec![0u8; 1024 * 1024];
         for _ in 0..(MAX_PS_BUFFER / chunk.len() + 8) {
@@ -1024,11 +980,9 @@ mod tests {
 
     #[test]
     fn unbounded_video_pes_over_cap_is_force_flushed() {
-        // A corrupt stream declaring an unbounded PES followed by endless
-        // non-boundary bytes must not grow the buffer without limit.
-        // NOTE: this case feeds a real start code first, so it exercises only
-        // the in-PES cap; the no-start-code path is covered by
-        // `input_with_no_start_code_at_all_is_bounded`.
+        // A corrupt unbounded PES followed by endless non-boundary bytes must not grow
+        // the buffer without limit. This feeds a real start code first, exercising only
+        // the in-PES cap; no-start-code path → `input_with_no_start_code_at_all_is_bounded`.
         let mut demuxer = PsDemuxer::new();
         let header = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
         let packets = demuxer.feed(&header);
@@ -1082,10 +1036,9 @@ mod tests {
 
     #[test]
     fn parse_extended_stream_id_extracts_stream_id_extension() {
-        // SHAUN's VC-1 video PES: stream_id 0xFD, flags2=0x01 (PES_extension
-        // only), header_data_length=3, optional bytes 0x0F/... — build the
-        // minimal well-formed variant: ext_flags=0x01 (PES_extension_flag_2),
-        // field_len=0x81, stream_id_extension=0x55. Payload is the ES.
+        // SHAUN's VC-1 video PES: stream_id 0xFD, flags2=0x01 (PES_extension only),
+        // header_data_length=3. Minimal well-formed variant: ext_flags=0x01
+        // (PES_extension_flag_2), field_len=0x81, stream_id_extension=0x55. Payload is ES.
         let mut pkt = vec![0x00, 0x00, 0x01, EXTENDED_STREAM_ID];
         let opt = [0x01u8, 0x81, 0x55];
         let es = [0xDEu8, 0xAD, 0xBE, 0xEF];
@@ -1111,11 +1064,9 @@ mod tests {
 
     #[test]
     fn parse_extended_stream_id_skips_pts_and_dts_before_the_extension() {
-        // The common real case: an AU-opening 0xFD VC-1 video PES carries a PTS
-        // (and often DTS) in the optional-header region, which the parser must
-        // SKIP (PTS +5, DTS +5) to reach the PES_extension → stream_id_extension.
-        // Both branches were previously untested (flags2 there was 0x01, skipping
-        // everything), so an off-by-one in the skip would silently misroute video.
+        // Common real case: an AU-opening 0xFD VC-1 PES carries PTS (often DTS) in the
+        // optional-header region, which the parser must SKIP (PTS +5, DTS +5) to reach
+        // PES_extension → stream_id_extension. An off-by-one here silently misroutes video.
         let build = |flags2: u8, skip: usize| {
             let mut pkt = vec![0x00, 0x00, 0x01, EXTENDED_STREAM_ID];
             // optional region: `skip` bytes (PTS/DTS placeholders) then
@@ -1184,10 +1135,9 @@ mod tests {
 
     #[test]
     fn mixed_codec_audio_does_not_collide() {
-        // The core regression: a title mixing AC-3 (0x80), DTS (0x88) and
-        // LPCM (0xA0) audio. The old per-codec relative arithmetic mapped
-        // all three to 0xBD00. They must now get distinct PIDs that match
-        // what dvd.rs assigns from the same dvd_audio_pid() table.
+        // Core regression: a title mixing AC-3 (0x80), DTS (0x88) and LPCM (0xA0) audio.
+        // The old per-codec relative arithmetic mapped all three to 0xBD00; they must now
+        // get distinct PIDs matching what dvd.rs assigns from the same dvd_audio_pid().
         let ac3 = mk(0xBD, Some(0x80)).dvd_pid().unwrap();
         let dts = mk(0xBD, Some(0x88)).dvd_pid().unwrap();
         let lpcm = mk(0xBD, Some(0xA0)).dvd_pid().unwrap();
@@ -1322,12 +1272,9 @@ mod tests {
 
     #[test]
     fn pack_header_stuffing_length_consumed() {
-        // pack_stuffing_length = low 3 bits of byte 13 (ISO 13818-1
-        // §2.5.3.4). The demuxer must skip exactly 14 + stuffing bytes. The
-        // stuffing region here holds a DECOY PES start code (00 00 01 E0…);
-        // if the stuffing count is under-consumed the scanner would re-sync
-        // onto that decoy and emit a bogus PES. Correct skip lands directly
-        // on the REAL PES.
+        // pack_stuffing_length = low 3 bits of byte 13 (ISO 13818-1 §2.5.3.4); skip
+        // exactly 14 + stuffing bytes. The stuffing holds a DECOY PES start code
+        // (00 00 01 E0…): under-consuming it re-syncs onto the decoy and emits a bogus PES.
         let mut demuxer = PsDemuxer::new();
         let mut data = vec![
             0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3,
@@ -1591,10 +1538,9 @@ mod tests {
 
     #[test]
     fn hddvd_ddplus_pes_strips_4byte_subheader_to_syncword() {
-        // A private_stream_1 PES carrying DD+ (sub-id 0xC0) has a 4-byte
-        // sub-header (sub_id + num_frames(1) + access_unit_ptr(2)); the demuxer
-        // must strip exactly those 4 bytes so es_data begins at the E-AC-3
-        // payload — here the 0x0B77 syncword sits right after the sub-header.
+        // A private_stream_1 PES carrying DD+ (sub-id 0xC0) has a 4-byte sub-header
+        // (sub_id + num_frames(1) + access_unit_ptr(2)); the demuxer must strip exactly
+        // those 4 so es_data begins at the E-AC-3 payload (0x0B77 syncword right after).
         let mut demuxer = PsDemuxer::new();
         let mut data = vec![
             0x00, 0x00, 0x01, 0xBD, // private stream 1
@@ -1676,10 +1622,9 @@ mod tests {
 
     #[test]
     fn unbounded_video_pes_framed_by_next_pes_not_embedded_audio_code() {
-        // An unbounded (length 0) video PES must be delimited by the next
-        // PS-layer unit. A following AUDIO PES (0xC0) is a valid boundary,
-        // so the video ES must include its embedded 00 00 01 00 picture
-        // code but stop at the audio PES start.
+        // An unbounded (length 0) video PES must be delimited by the next PS-layer unit.
+        // A following AUDIO PES (0xC0) is a valid boundary, so the video ES keeps its
+        // embedded 00 00 01 00 picture code but stops at the audio PES start.
         let mut demuxer = PsDemuxer::new();
         let mut data = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
         let video_payload = [0x11, 0x00, 0x00, 0x01, 0x00, 0x22]; // embedded picture SC

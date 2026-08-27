@@ -134,10 +134,9 @@ impl SgIoTransport {
         hdr.flags = SG_FLAG_Q_AT_HEAD;
 
         let ret = unsafe { libc::ioctl(fd, SG_IO as _, &mut hdr as *mut sg_io_hdr) };
-        // Mask DRIVER_SENSE (0x08): it only signals "sense data present", not a
-        // failure, and a command can complete-with-sense. Matches execute()'s
-        // `driver_status_real` handling (0.13.23) so a benign sense response
-        // here is not misread as a transport error.
+        // Mask DRIVER_SENSE (0x08): it only flags "sense data present", not
+        // a failure — matches execute()'s driver_status_real handling so a
+        // benign CHECK CONDITION isn't misread as a transport error.
         let driver_status_real = hdr.driver_status & !super::DRIVER_SENSE;
         if ret < 0 || hdr.status != 0 || hdr.host_status != 0 || driver_status_real != 0 {
             Err(())
@@ -188,16 +187,13 @@ impl Drop for SgIoTransport {
             let _ = Self::raw_command(self.fd, &[0x1E, 0, 0, 0, 0, 0], 3_000);
             unsafe { libc::close(self.fd) };
         }
-        // Signal the recovery thread that this transport is gone. Must
-        // be set before the fd_recovery swap so the recovery thread
-        // cannot observe dead=false and then store into an fd_recovery
-        // slot that Drop is no longer going to drain.
+        // Signal the recovery thread this transport is gone. Must be set
+        // before the fd_recovery swap so it can't observe dead=false and
+        // store into a slot Drop is no longer going to drain.
         self.dead.store(true, std::sync::atomic::Ordering::Release);
-        // A failed execute() spawns a detached thread that opens a fresh
-        // fd into fd_recovery; that slot is normally drained at the top of
-        // the next execute(). If the transport is dropped before another
-        // execute() runs (the common abort-on-wedge path), the recovered
-        // fd would otherwise leak. Claim and close it here.
+        // A failed execute() spawns a thread that opens a fresh fd into
+        // fd_recovery, normally drained at the top of the next execute().
+        // If dropped first (abort-on-wedge), claim and close it here.
         let recovered = self
             .fd_recovery
             .swap(-1, std::sync::atomic::Ordering::Acquire);
@@ -242,13 +238,9 @@ impl ScsiTransport for SgIoTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
-        // Validate the CDB length at the entry point, BEFORE `cdb[0]` below.
-        // `ScsiTransport` is a pub trait, so an external caller could pass an
-        // empty CDB and indexing it would panic; an over-length CDB must be
-        // rejected rather than truncated (see `checked_cdb_len`). Both checks
-        // live in the shared helper so they cannot drift per platform — this
-        // backend used to carry its own bespoke empty-CDB guard, which macOS
-        // and Windows never had.
+        // Validate CDB length before indexing `cdb[0]`: `ScsiTransport` is
+        // pub, so an external caller could pass an empty or over-length
+        // CDB. Shared helper keeps the check identical across platforms.
         let cmd_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
         let exec_t0 = std::time::Instant::now();
         let opcode = cdb[0];
@@ -304,12 +296,9 @@ impl ScsiTransport for SgIoTransport {
         hdr.timeout = timeout_ms;
         hdr.flags = SG_FLAG_Q_AT_HEAD;
 
-        // The single blocking syscall. Returns when the device responds,
-        // when the kernel's timeout fires, or when the kernel's error
-        // recovery completes its escalation. On a healthy read this is
-        // <100 ms; on a slow-recovery bad sector it can be tens of
-        // seconds; on a hung drive it returns at `timeout_ms` with
-        // `host_status` flagged.
+        // The single blocking syscall: returns on response, kernel timeout,
+        // or after the kernel's own error-recovery escalation. <100ms on a
+        // healthy read; up to `timeout_ms` on a hung drive (host_status set).
         let ret = unsafe { libc::ioctl(self.fd, SG_IO as _, &mut hdr as *mut sg_io_hdr) };
         let exec_elapsed_ms = exec_t0.elapsed().as_millis() as u64;
 
@@ -326,18 +315,9 @@ impl ScsiTransport for SgIoTransport {
             return Err(Error::IoError { source: errno });
         }
 
-        // Transport-level failure (kernel timeout, USB bridge wedge,
-        // bus error). `hdr.status` may still be zero — the SCSI device
-        // never got to send a status byte. Surface as 0xFF so callers
-        // (e.g. `drive_has_disc`) can detect the wedge signature.
-        //
-        // 0.13.23: mask out `DRIVER_SENSE` (0x08) before treating
-        // `driver_status` as a transport failure. That bit is set on
-        // *every* CHECK CONDITION reply just to flag "sense data is
-        // attached in `sbp`" — it's not an error of its own. Pre-fix
-        // we collapsed every drive-reported error into a synthetic
-        // 0xFF wedge signature and discarded the sense data, which
-        // killed the rip's classification logic on damaged discs.
+        // Transport-level failure (timeout, bridge wedge, bus error);
+        // status may be 0, so surface 0xFF for `drive_has_disc` to detect.
+        // Mask DRIVER_SENSE (0x08) first — it only flags sense-present.
         let driver_status_real = hdr.driver_status & !super::DRIVER_SENSE;
         if hdr.host_status != 0 || driver_status_real != 0 {
             tracing::trace!(
@@ -400,12 +380,9 @@ impl ScsiTransport for SgIoTransport {
                     unsafe { libc::close(new_fd) };
                     return;
                 }
-                // We stored new_fd into fd_recovery. Check whether Drop
-                // raced us: if the transport is already dead it won't
-                // drain fd_recovery, so we must close new_fd ourselves.
-                // Use a swap to atomically claim the slot we just stored;
-                // if Drop already swapped it to -1 the swap returns -1
-                // and Drop already closed it, so we do nothing.
+                // Check whether Drop raced us: if the transport is already
+                // dead it won't drain fd_recovery, so swap to atomically
+                // claim new_fd and close it; a -1 result means Drop won.
                 if dead.load(std::sync::atomic::Ordering::Acquire) {
                     let claimed = recovery.swap(-1, std::sync::atomic::Ordering::AcqRel);
                     if claimed >= 0 {
@@ -421,10 +398,9 @@ impl ScsiTransport for SgIoTransport {
             });
         }
 
-        // SCSI-level failure: device responded, returned non-zero status
-        // (typically 0x02 CHECK CONDITION). Parse the full SPC-4 sense
-        // triple so callers can route on `ScsiSense::is_medium_error()`
-        // etc.
+        // SCSI-level failure: non-zero status (typically CHECK CONDITION).
+        // Parse the full SPC-4 sense triple so callers can route on
+        // `ScsiSense::is_medium_error()` etc.
         if hdr.status != 0 {
             let parsed = super::parse_sense(&sense, hdr.sb_len_wr);
             tracing::trace!(
@@ -445,9 +421,8 @@ impl ScsiTransport for SgIoTransport {
             });
         }
 
-        // Compute in usize so transfers in the 2–4 GiB range (permitted by
-        // the `> u32::MAX` guard above) don't wrap through an i32 cast and
-        // report a large successful read as ~0 bytes. A negative resid is
+        // Compute in usize so 2-4 GiB transfers don't wrap through an i32
+        // cast and report a large read as ~0 bytes. Negative resid is
         // clamped to 0 before subtracting.
         let resid = hdr.resid.max(0) as usize;
         let bytes_transferred = data.len().saturating_sub(resid);
@@ -467,17 +442,9 @@ impl ScsiTransport for SgIoTransport {
     }
 }
 
-// ── Lightweight discovery + presence (Linux) ────────────────────────────────
-//
-// `list_drives` walks `/sys/class/scsi_generic/`, filters to type-5 (CD/DVD/BD),
-// and runs one INQUIRY each for vendor/model/firmware. Falls back to a
-// `/dev/sg0..15` probe when sysfs is unreadable (minimal containers).
-//
-// `drive_has_disc` issues a single TEST UNIT READY. On the wedge signature
-// (kernel returns status `0xff` with no sense — synthesised by `execute()`
-// from a non-zero `host_status`) the error bubbles directly to the caller;
-// no in-library reset escalation. See the rationale block on
-// `drive_has_disc` below.
+// Lightweight discovery + presence (Linux): `list_drives` walks sysfs
+// type-5 nodes with an INQUIRY each. `drive_has_disc` sends TEST UNIT
+// READY; on the wedge signature (status `0xff`, no sense) it bubbles up.
 
 /// SCSI peripheral type 5 = "CD-ROM device" (covers DVD, BD-ROM, BD-RE, etc.).
 /// Stored in `/sys/class/scsi_generic/sgN/device/type` as ASCII decimal.
@@ -497,12 +464,9 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
             continue;
         }
 
-        // Read sysfs-cached identity first. The kernel runs its own INQUIRY
-        // at device probe time and stashes vendor/model/rev under
-        // `/sys/class/scsi_generic/sgN/device/`. Those values survive even
-        // when the drive firmware is wedged below the USB bridge (our own
-        // INQUIRY times out but sysfs still has the pre-wedge answer), so
-        // the UI always has a human-readable identity to show.
+        // Read sysfs-cached identity first: the kernel's own INQUIRY at
+        // probe time, stashed under `.../sgN/device/`. Survives even when
+        // the drive is wedged below the USB bridge and our INQUIRY times out.
         let (sysfs_vendor, sysfs_model, sysfs_firmware) = sysfs_identity(&name);
 
         // INQUIRY-only probe — open transport, run INQUIRY, drop. No
@@ -571,11 +535,9 @@ fn enumerate_sg_names() -> Vec<String> {
                 continue;
             }
             let type_path = format!("/sys/class/scsi_generic/{name}/device/type");
-            // By design: only type-5 (optical) sg nodes are collected.
-            // A non-optical `type` value, or an unreadable `type` file
-            // (race against device teardown, restricted sysfs in a minimal
-            // container), is silently skipped — neither is a fatal
-            // enumeration error, the node simply is not an optical target.
+            // By design: only type-5 (optical) sg nodes are collected. A
+            // non-optical or unreadable `type` file (teardown race,
+            // restricted sysfs) is silently skipped, not a fatal error.
             match std::fs::read_to_string(&type_path) {
                 Ok(s) if s.trim() == SCSI_TYPE_OPTICAL => names.push(name),
                 Ok(_) => {}  // not optical

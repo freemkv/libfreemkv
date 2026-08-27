@@ -67,11 +67,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 }
 
 fn scan_jar(archive: &mut jar::Jar) -> Vec<StreamLabel> {
-    // BTreeMap so we keep the highest-numbered (last-written) label
-    // for each stream slot deterministic across runs. The same
-    // TextField,Audio1,... string can appear in multiple classes
-    // (button-state variants, localization fallbacks). Last write
-    // wins — they should all agree, but the structure is defensive.
+    // BTreeMap keeps the last-written label per stream slot deterministic.
+    // The same TextField,Audio1,... string can appear in multiple classes
+    // (button-state variants, fallbacks); last write should agree, but wins defensively.
     let mut audios: BTreeMap<u16, String> = BTreeMap::new();
     let mut subs: BTreeMap<u16, String> = BTreeMap::new();
 

@@ -74,12 +74,12 @@ pub fn has_path_prefix(archive: &Jar, prefix: &str) -> bool {
 }
 
 /// Iterate every `.class` entry in the jar, parse it with
-/// [`class_reader`], and call `f` with `(entry_name, &ClassFile)`.
+/// [`class_reader`](super::class_reader), and call `f` with `(entry_name, &ClassFile)`.
 ///
 /// Entries that fail to read or parse are silently skipped — this is
 /// label-extraction code, robustness matters more than completeness.
 /// Callers that need to know which classes failed should use the
-/// lower-level [`class_reader`] API directly.
+/// lower-level [`class_reader`](super::class_reader) API directly.
 pub fn for_each_class<F>(archive: &mut Jar, mut f: F)
 where
     F: FnMut(&str, &ClassFile),

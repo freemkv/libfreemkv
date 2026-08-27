@@ -45,27 +45,13 @@ impl fu::scsi::ScsiTransport for ScsiAdapter<'_> {
                 bytes_transferred: r.bytes_transferred,
                 sense: r.sense,
             }),
-            // libfreemkv's transport returns Err for ANY non-zero SCSI status —
-            // i.e. a normal drive CHECK CONDITION (ILLEGAL_REQUEST, etc.), NOT
-            // only a transport-layer fault. Preserve the real status AND the
-            // parsed sense across the seam: the AACS handshake's wedge guard
-            // bails on an ILLEGAL_REQUEST sense (so it stops hammering the drive),
-            // and its diagnosis distinguishes a cert rejection from a dead bus by
-            // the same status/sense. Collapsing everything to 0xFF/None defeated
-            // both. Reconstruct the 32-byte sense buffer at the offsets the
-            // unlock crate reads (sense_key@2 low-nibble, asc@12, ascq@13); a
-            // genuine transport fault (status 0xFF, no sense) maps through
-            // unchanged.
+            // Transport Err covers both real faults and a normal CHECK CONDITION
+            // status; preserve status+sense so AACS's wedge guard and diagnosis can
+            // tell a cert rejection from a dead bus (sense_key@2, asc@12, ascq@13).
             Err(e) => {
-                // A SCSI status (CHECK CONDITION or a 0xFF transport fault the
-                // drive layer already tagged) carries its real status + sense via
-                // extract_scsi_context. Any OTHER error variant is a non-SCSI
-                // transport/IO-layer fault — ioctl(SG_IO) == -1 (ENODEV/EIO on an
-                // unplugged bridge) or the fd is gone — i.e. a DEAD BUS, not a
-                // drive rejection; surface the transport-failure status so the
-                // unlock crate bails instead of hammering a wedged device.
-                // (Keying off `sense.is_none()` would be wrong: a CHECK CONDITION
-                // whose sense didn't parse is a rejection, not a transport fault.)
+                // ScsiError/DiscRead carry real status+sense via extract_scsi_context;
+                // any other variant is a non-SCSI transport/IO fault (dead bus, not a
+                // drive rejection) — surface transport-failure status so unlock bails.
                 let (status, sense) = match &e {
                     crate::error::Error::ScsiError { .. }
                     | crate::error::Error::DiscRead { .. } => {

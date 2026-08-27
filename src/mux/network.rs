@@ -106,20 +106,18 @@ impl NetworkStream {
     /// for in-crate tests, which must connect to `127.0.0.1` ephemeral
     /// listeners that the production vet would (correctly) reject.
     fn connect_vetted(addr: &str, vet: bool) -> io::Result<Self> {
-        // Resolve + vet the target before connecting. Connect to the
-        // vetted IP literal (not the raw name) so a DNS rebind between
-        // settings-save validation and now can't redirect us to a
-        // loopback/private/link-local host (SSRF).
+        // Connect to the vetted IP literal (not the raw name) so a DNS rebind between
+        // settings-save validation and now can't redirect us to a loopback/private/
+        // link-local host (SSRF).
         let stream = if vet {
             let vetted = resolve_allowed_addr(addr)?;
             TcpStream::connect(vetted)?
         } else {
             TcpStream::connect(addr)?
         };
-        // The sender is the latency-sensitive side; set nodelay here too
-        // (the listen side already does) so the final sub-MSS flush after
-        // finish() isn't held by Nagle. The 256 KB BufWriter coalesces
-        // bulk writes, so this only affects the tail.
+        // Sender is latency-sensitive; set nodelay here too (listen side already does)
+        // so the final sub-MSS flush after finish() isn't held by Nagle — the 256 KB
+        // BufWriter coalesces bulk writes, so this only affects the tail.
         stream.set_nodelay(true)?;
         Ok(Self {
             disc_title: DiscTitle::empty(),
@@ -215,10 +213,9 @@ impl crate::pes::Stream for NetworkStream {
             header_written,
         } = &mut self.mode
         {
-            // Always emit the FMKV header before shutdown, even for a
-            // zero-frame stream (e.g. a title that produced no PES frames).
-            // Without it the receiver's read_header() sees a clean EOF and
-            // rejects the stream with NoMetadata.
+            // Always emit the FMKV header before shutdown, even for a zero-frame stream,
+            // or the receiver's read_header() sees a clean EOF and rejects the stream
+            // with NoMetadata.
             ensure_header_written(writer, header_written, &self.disc_title)?;
             writer.flush()?;
             writer.get_ref().shutdown(std::net::Shutdown::Write)?;
@@ -380,10 +377,9 @@ mod tests {
         use crate::pes;
         use std::sync::mpsc;
 
-        // The listener thread owns the bound socket and reports its actual
-        // local address back over a channel before accept(). The main thread
-        // connects only after receiving the address — no bind/drop/re-bind
-        // window, no sleep-as-synchronisation.
+        // Listener thread reports its actual bound address over a channel before
+        // accept(); main thread connects only after receiving it — no bind/drop/
+        // re-bind window, no sleep-as-synchronisation.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (addr_tx, addr_rx) = mpsc::channel();

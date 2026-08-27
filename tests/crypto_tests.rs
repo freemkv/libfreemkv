@@ -100,10 +100,9 @@ fn aacs_decrypt_unit_roundtrip() {
         plain[offset] = 0x47; // TS sync byte
         offset += 192;
     }
-    // Flag the unit encrypted via the CPI bits (byte 0) — the authoritative gate
-    // `decrypt_unit` consults. Set BEFORE snapshotting `expected`: decrypt
-    // preserves the plaintext header, so the round-tripped unit carries these
-    // bits too.
+    // Flag the unit encrypted via the CPI bits (byte 0), the gate `decrypt_unit`
+    // consults. Set before snapshotting `expected`: decrypt preserves the
+    // plaintext header, so the round-tripped unit carries these bits too.
     plain[0] |= 0xC0;
 
     // Save original plaintext for comparison
@@ -514,10 +513,9 @@ fn css_roundtrip_with_snapshot() {
 /// Multiple key/seed combinations produce different outputs.
 #[test]
 fn css_roundtrip_multiple_keys() {
-    // The content cipher (dvdcss_unscramble) seeds its LFSRs from
-    // `key XOR seed`, so the cases must have DISTINCT `key XOR seed` values to
-    // produce distinct keystreams. (key=0/seed=0 and key=FF/seed=FF both give
-    // key^seed=0 and are correctly identical — excluded here.)
+    // The cipher seeds its LFSRs from `key XOR seed`, so cases need DISTINCT
+    // key^seed values to produce distinct keystreams (key=0/seed=0 and
+    // key=FF/seed=FF both give key^seed=0 and are excluded here).
     let cases: &[([u8; 5], [u8; 5])] = &[
         (
             [0x00, 0x00, 0x00, 0x00, 0x00],
@@ -647,11 +645,9 @@ fn css_keyless_recovery_validates_cracked_key() {
              This is expected: synthetic sectors lack the TAB1 output encoding \
              present in real CSS-encrypted DVD sectors."
         );
-        // Never let this test pass vacuously: when the attack can't converge on
-        // synthetic data, still assert always-true properties of the CSS keystream
-        // so a real regression is caught on every run — descramble_sector is
-        // DETERMINISTIC (same key/seed/data → same output) and NON-TRIVIAL (it
-        // actually transforms the payload, not a silent no-op).
+        // Don't pass vacuously: if the attack can't converge on synthetic data,
+        // still assert descramble_sector is deterministic and non-trivial
+        // (transforms the payload) so a real regression is still caught.
         for (key, seed) in candidates {
             let mut base = vec![0x00u8; 2048];
             base[0x14] = 0x30;
@@ -713,10 +709,8 @@ fn css_recover_title_key_with_exact_plaintext() {
              The LFSR0 recovery phase may not converge for this combination.",
             title_key, seed
         );
-        // Never pass vacuously: when LFSR0 recovery can't converge on this
-        // synthetic sector, still assert always-true properties of the cipher so
-        // a real regression is caught on every run — descramble_sector is
-        // DETERMINISTIC and NON-TRIVIAL (actually transforms the payload).
+        // Don't pass vacuously: if recovery didn't converge, still assert
+        // descramble_sector is deterministic and non-trivial (transforms payload).
         let mut a = original.clone();
         let mut b = original.clone();
         css::lfsr::descramble_sector(&title_key, &mut a);

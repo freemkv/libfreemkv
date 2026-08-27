@@ -179,7 +179,7 @@ impl Mpeg2Parser {
         parse_aspect_ratio(hdr)
     }
 
-    /// Process one reassembled access unit (from [`AuAssembler`]): decode its
+    /// Process one reassembled access unit (from [`AuAssembler`](crate::mux::au_assembly::AuAssembler)): decode its
     /// per-picture coding info, capture a new sequence header, and buffer the
     /// picture into the current GOP for display-order timestamping. The AU's
     /// timing / source / discontinuity were already attributed by the assembler.
@@ -220,12 +220,9 @@ impl Mpeg2Parser {
         } else {
             0
         };
-        // Decode the picture coding extension ONCE here and fold every
-        // per-picture datum (coding type + tff/rff/progressive_frame/
-        // frame_picture, plus the sequence's progressive flag) into one
-        // codec-agnostic `PictureInfo`. `nb_fields()`, `keyframe()`, and
-        // `field_order()` all derive from it; nothing downstream re-parses the
-        // elementary stream.
+        // Decode the picture coding extension ONCE here and fold every per-picture
+        // datum into one codec-agnostic `PictureInfo`; `nb_fields()`, `keyframe()`,
+        // and `field_order()` all derive from it, so nothing re-parses the stream.
         let (tff, rff, progressive_frame, frame_picture) = picture_coding_flags(&data);
         let info = PictureInfo::mpeg2(
             coding_type_from_raw(raw_coding_type),
@@ -239,10 +236,9 @@ impl Mpeg2Parser {
         );
         let keyframe = info.keyframe();
 
-        // A GOP boundary means the buffered run is a COMPLETE GOP (all its
-        // pictures display before the next GOP's), so flush it before starting
-        // the new one. `temporal_reference` resets to 0 at the boundary, keeping
-        // each GOP's display order self-contained.
+        // A GOP boundary means the buffered run is a COMPLETE GOP, so flush it
+        // before starting the new one; `temporal_reference` resets to 0 there,
+        // keeping each GOP's display order self-contained.
         if gop_boundary && !self.gop_buf.is_empty() {
             self.flush_gop(out);
         }
@@ -264,10 +260,9 @@ impl Mpeg2Parser {
                 source: au.source,
             },
         });
-        // Safety cap: a stream with no GOP/sequence boundaries would buffer
-        // unbounded. Force-flush a pathologically long run as its own GOP —
-        // bounded by BOTH the frame count and the total buffered bytes, so a
-        // crafted stream of few-but-huge pictures cannot over-allocate either.
+        // Safety cap: force-flush a pathologically long run as its own GOP,
+        // bounded by BOTH frame count and total bytes, so a crafted stream of
+        // few-but-huge pictures cannot over-allocate either.
         if self.gop_buf.len() >= MAX_PENDING_FRAMES || self.gop_bytes >= MAX_PENDING_BYTES {
             self.flush_gop(out);
         }
@@ -333,11 +328,9 @@ impl CodecParser for Mpeg2Parser {
         if pes.data.is_empty() {
             return Vec::new();
         }
-        // Feed the fragment to the assembler, which reframes the elementary
-        // stream on picture boundaries and hands back each complete access unit
-        // with its start timing. MKV block timecodes are presentation timestamps;
-        // prefer PTS (DTS shows B-frames in decode order — judder and broken
-        // seeking), falling back to DTS only when PTS is absent.
+        // Feed the fragment to the assembler, which reframes on picture boundaries.
+        // MKV block timecodes are presentation timestamps; prefer PTS (DTS shows
+        // B-frames in decode order — judder/broken seeking), DTS only as fallback.
         let pts = pes.pts.or(pes.dts).map(pts_to_ns);
         let aus = self
             .au_asm
@@ -594,16 +587,9 @@ mod tests {
     #[test]
     fn parser_populates_full_pictureinfo_and_source() {
         use crate::mux::codec::coding::FieldOrder;
-        // Drive the REAL parser over three pictures that exercise EVERY facet of
-        // PictureInfo the parser measures (not just field order):
-        //   I: tff=1 rff=0 pf=0 → type I, TFF, 2 fields, !progressive, keyframe
-        //   P: tff=0 rff=0 pf=0 → type P, BFF, 2 fields, !progressive, !keyframe
-        //   B: tff=0 rff=1 pf=1 → type B, Progressive, 3 fields (2:3 pulldown),
-        //                         progressive, !keyframe
-        // ...and assert the byte-exact source provenance rides every frame.
-        // Each picture in its OWN PES with its OWN source stamp — the realistic
-        // shape (real DVD video is one picture across many PES, each stamped), so
-        // every picture's frame carries the provenance of its packet.
+        // Drive the REAL parser over I/P/B pictures exercising every PictureInfo
+        // facet, each in its OWN PES with its OWN source stamp (realistic DVD
+        // shape), asserting byte-exact provenance rides every frame.
         let mk_pes = |data: Vec<u8>, byte: u64| PesPacket {
             source: Some(crate::pes::SourcePos::at_byte(byte)),
             pid: 0x1011,
@@ -875,10 +861,9 @@ mod tests {
 
     #[test]
     fn two_pictures_in_one_gop_emit_both_on_flush() {
-        // Two pictures with no GOP/sequence boundary between them are ONE GOP.
-        // The VFR timeline needs the whole GOP (a P-frame's PTS depends on its
-        // later B-frames), so they buffer until the GOP closes / EOF, then emit
-        // in DECODE order, each containing exactly its own picture.
+        // Two pictures with no GOP/sequence boundary between them are ONE GOP; the
+        // VFR timeline needs the whole GOP (a P-frame's PTS depends on later
+        // B-frames), so they buffer until close/EOF, then emit in DECODE order.
         let mut parser = Mpeg2Parser::new();
 
         let mut pic1 = make_picture_header(PICTURE_TYPE_I);
@@ -1047,10 +1032,9 @@ mod tests {
 
     #[test]
     fn telecine_pts_accumulates_by_field_durations_not_a_fixed_grid() {
-        // NTSC film, frame_rate_code 4 = 29.97 → field_period ≈ 16.683 ms. A 2:3
-        // frame (rff=1) occupies 3 fields, a 2:2 frame 2 fields. PTS must
-        // accumulate by ACTUAL field durations so the next frame starts exactly
-        // when this one ends — closing the fixed-29.97-grid gap that judders.
+        // NTSC film 29.97: a 2:3 frame (rff=1) occupies 3 fields, 2:2 occupies 2.
+        // PTS must accumulate by ACTUAL field durations so the next frame starts
+        // exactly when this one ends — closing the fixed-grid gap that judders.
         let mut p = Mpeg2Parser::new();
         let field = 1_000_000_000i64 * 1001 / 30000 / 2;
 
@@ -1143,11 +1127,9 @@ mod tests {
 
     #[test]
     fn leading_frames_buffered_until_first_pts_anchor() {
-        // A DVD title can open with a still-frame/first-play sequence whose PTS
-        // lands a few frames in (the disc stamps the opening I-frames at one real
-        // PES PTS, not 0). Leading frames must be held and then anchored to that
-        // real timeline — never zero-stamped. 25 fps = 40 ms. PTS (2 s) arrives
-        // only on the THIRD picture.
+        // A DVD title can open with a still-frame sequence whose PTS lands a few
+        // frames in. Leading frames must be held and anchored to that real
+        // timeline, never zero-stamped. 25fps=40ms; PTS (2s) arrives on picture 3.
         let mut p = Mpeg2Parser::new();
 
         let mut a = make_seq_header(720, 480, 3, 3);
@@ -1183,14 +1165,9 @@ mod tests {
 
     #[test]
     fn opening_au_keeps_disc_pts_and_opening_seq_header_no_zero_floor() {
-        // Opening-GOP / still-frame open regression. A DVD
-        // title opens on a VOBU that begins with a sequence header + I-frame; the
-        // disc stamps that opening I-frame at its REAL (non-zero) timeline PTS,
-        // not 0. The parser must (a) emit the opening I-frame with that real PTS
-        // — never floored to 0 — and (b) capture THAT opening sequence header as
-        // codec_private (read at headers-ready, before any later AU). Proves the
-        // opening pictures are emitted with the correct seq header + PTS, ruling
-        // out the "wrong/last seq header" and "PTS floored to t=0" hypotheses.
+        // Opening-GOP regression: a DVD VOBU opens with a seq header + I-frame
+        // stamped at its REAL non-zero PTS. Emit that PTS (never floored to 0)
+        // and capture THAT opening seq header as codec_private.
         let mut p = Mpeg2Parser::new();
 
         // Opening AU: seq header (the codecPrivate) + GOP + I-frame TR0 carrying

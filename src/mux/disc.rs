@@ -169,11 +169,9 @@ pub struct DiscStream {
     // a percent without a separate API call.
     bytes_total_extents: u64,
 
-    // PES output — single-threaded inline demux + codec parse. The
-    // pipeline-mode mux (3-stage threaded) lives in
-    // [`super::pipelined_stream::PipelinedPesStream`]; this type is
-    // the legacy in-thread path for live-disc reads where adaptive
-    // batch retry on bad sectors lives in `fill_extents`.
+    // PES output — single-threaded inline demux + codec parse. Pipeline-mode
+    // mux lives in [`super::pipelined_stream::PipelinedPesStream`]; this is
+    // the legacy in-thread path where bad-sector adaptive retry lives.
     ts_demuxer: Option<super::ts::TsDemuxer>,
     ps_demuxer: Option<super::ps::PsDemuxer>,
     parsers: Vec<(u16, Box<dyn super::codec::CodecParser>)>,
@@ -223,14 +221,9 @@ impl DiscStream {
         let mut title = title;
         let extents = title.extents.clone();
 
-        // Resolve this title's CSS key from the reader if the caller supplied
-        // none — the SAME shared step the file-backed mux highway
-        // (`build_iso_pipeline`) uses, so single-pass and multi-pass descramble a
-        // DVD identically. No-op for AACS / already-keyed / genuinely-clear input
-        // or `raw`; a scrambled-but-uncrackable DVD is a hard `CssKeyMissing`.
-        // `halt` is passed here (not deferred to `with_halt`) so a Stop during the
-        // crack scan is honored — the scan runs at construction, before the caller
-        // can attach a token.
+        // Resolve this title's CSS key here (same step build_iso_pipeline uses,
+        // so passes descramble identically); no-op for AACS/clear/raw. `halt` is
+        // passed now, not via `with_halt`, since the scan runs before attach.
         crate::css::resolve_dvd_title_key(
             &mut *reader,
             &extents,
@@ -242,11 +235,9 @@ impl DiscStream {
         )?;
         let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
-        // Debug log reader type at construction — critical for diagnosing mux
-        // reading from drive instead of ISO. `type_name_of_val(&*reader)`
-        // resolves the CONCRETE type behind the box (Drive / FileSectorSource),
-        // unlike `type_name::<dyn SectorSource>()` which always prints the
-        // trait-object name regardless of the underlying source.
+        // Debug log reader type — helps diagnose mux reading from drive instead
+        // of ISO. `type_name_of_val` resolves the CONCRETE type behind the box,
+        // unlike `type_name::<dyn SectorSource>()` which prints the trait name.
         tracing::debug!(
             target: "mux",
             "DiscStream constructed with reader type: {}",
@@ -254,45 +245,32 @@ impl DiscStream {
         );
 
         // CSS/unencrypted content needs a decrypting wrapper to yield plaintext
-        // VOB bytes before the AC-3 sub-stream probe can read real `acmod`s.
-        // MUX path (read > decrypt > mux): decrypt every unit in place and pass the
-        // bytes to the muxer; a unit that decrypts to broken TS is the muxer's
-        // concern, never conceal / re-fetch / count as loss (fail loud only on a
-        // genuine can't-decrypt). DiscStream is a decode/mux stream (live-drive
-        // single-pass / direct), never the ciphertext-preserving sweep.
+        // VOB bytes before the AC-3 probe reads real `acmod`s. A unit that
+        // decrypts to broken TS is the muxer's concern, not loss to conceal.
         let mut reader = DecryptingSectorSource::new(reader, decrypt_keys.clone());
 
         // Wrong-substream fix (Silence-of-the-Lambs): re-route the title's
-        // declared AC-3 audio onto the physically-correct `0x8x` sub-streams by
-        // probing their real channel counts off the head of the feature. No-op
-        // for non-DVD or when the probe yields nothing.
+        // declared AC-3 audio onto the physically-correct `0x8x` sub-streams
+        // by probing real channel counts off the feature's head. No-op otherwise.
         crate::disc::dvd_audio_probe::probe_and_remap(&mut reader, &mut title);
 
-        // Parser table + PID map + demuxer come from the CANONICAL builder shared
-        // with the file-backed highway (`resolve::build_demux_state`). This used
-        // to be an open-coded copy of the same loop, which drifted: it built every
-        // parser with plain `parser_for_codec` and so never routed a Blu-ray 3D
-        // MVC dependent (right-eye) view to the param-set-passthrough parser
-        // (ISO/IEC 14496-10 Annex H) — the same 3D disc muxed correctly from an
-        // ISO and incorrectly from a live drive. Call the canonical builder rather
-        // than repeating its dispatch, so a future rule added there cannot go
-        // missing on the `disc://` path again.
+        // Use the CANONICAL builder shared with the file-backed highway
+        // (`resolve::build_demux_state`): an open-coded copy of this once
+        // drifted and mis-routed Blu-ray 3D MVC dependent views on this path.
         let (parsers, pid_to_track, ts_demuxer, ps_demuxer) =
             super::resolve::build_demux_state(&title, content_format);
 
         // AACS decrypts whole 6144-byte (3-sector) units keyed off each read
-        // buffer's first 16 bytes, so reads/skips must stay 3-sector aligned.
-        // CSS and unencrypted content are per-2048-byte and self-synchronizing
-        // (align 1). Same rule the file-backed highway applies in resolve.rs.
+        // buffer's first bytes, so reads/skips must stay 3-sector aligned; CSS/
+        // unencrypted is per-2048-byte, self-sync (align 1). Same rule as resolve.rs.
         let unit_align: u16 = match &decrypt_keys {
             crate::decrypt::DecryptKeys::Aacs { .. } => 3,
             _ => 1,
         };
 
-        // `reader` is already wrapped in DecryptingSectorSource above (so the
-        // internal fill_extents path sees plaintext bytes; for DecryptKeys::None
-        // the decorator is a pass-through). Reset the unit base the probe read
-        // advanced so the first fill_extents read starts cleanly.
+        // `reader` is already wrapped above (DecryptKeys::None makes it a
+        // pass-through). Reset the unit base the probe read advanced so the
+        // first fill_extents read starts cleanly.
         reader.set_unit_base(0);
 
         // B1 resync gates: one per stream, video flagged so the gate only
@@ -460,12 +438,9 @@ impl DiscStream {
     }
 
     fn fill_extents(&mut self) -> io::Result<bool> {
-        // Skip exhausted and zero-sector extents iteratively. This was a
-        // self-recursive call, which costs a stack frame per skipped extent:
-        // nothing filters `sector_count == 0` out of a UDF/MPLS extent list, so
-        // a malformed disc declaring thousands of empty extents in a row could
-        // overflow the stack. That aborts the process — uncatchable, and fatal
-        // to a long-running service — rather than surfacing as an io::Error.
+        // Skip exhausted/zero-sector extents iteratively, not recursively: a
+        // malformed disc can declare thousands of empty extents, and a
+        // self-recursive version overflowed the stack, aborting the process.
         let (ext_start, ext_sectors, remaining) = loop {
             if self.current_extent >= self.extents.len() {
                 return Ok(false);
@@ -489,14 +464,9 @@ impl DiscStream {
         // disc LBA 0. No-op for CSS / None.
         self.reader.set_unit_base(ext_start);
 
-        // Adaptive sizer: start at current (preferred until a failure), shrink
-        // on failure, advance on success. One 5s read attempt per try — no
-        // retry loops, no sleeps. On size-1 failure, skip or error.
-        //
-        // Halt is checked at the top of every iteration — in a dense bad zone
-        // this loop can spend minutes shrinking and skipping sectors; without
-        // the check, Stop wouldn't take effect until the outer PES read() loop
-        // finally emits a frame, which may never happen.
+        // Adaptive sizer shrinks on failure, grows on success; one 5s attempt
+        // per try, no retry loops. Halt is checked every iteration since a bad
+        // zone can spend minutes here, else Stop waits for the outer read() loop.
 
         let start_time = std::time::Instant::now();
 
@@ -510,13 +480,9 @@ impl DiscStream {
                 tracing::debug!(target: "mux", "fill_extents waiting at LBA {} ({}s elapsed, sectors={})", lba, start_time.elapsed().as_secs(), remaining);
             }
 
-            // Keep every read buffer starting on a real on-disc unit boundary.
-            // AACS (unit_align=3) decrypts whole 6144-byte units keyed off the
-            // buffer's first bytes, so a sub-unit read mid-extent desyncs the
-            // rest of the title; always read at least one full unit. Only the
-            // final partial unit at the extent tail (remaining < align) is read
-            // short — nothing follows it to desync. CSS/raw (align=1) is
-            // per-sector and self-synchronizing, so this is a no-op there.
+            // Every read buffer must start on a real on-disc unit boundary: AACS
+            // (align=3) decrypts whole units keyed off the buffer's first bytes,
+            // so a sub-unit mid-extent read would desync the rest of the title.
             let align = self.unit_align.max(1) as u32;
             let want = remaining.min(self.adaptive.current() as u32);
             let sectors: u16 = if align <= 1 {
@@ -536,10 +502,9 @@ impl DiscStream {
                 .read_sectors(lba, sectors, &mut self.read_buf[..bytes], false);
 
             if let Ok(&got) = res.as_ref() {
-                // SectorSource::read_sectors returns the number of bytes
-                // written into buf. All in-tree sources return full-or-error,
-                // but a short count would leave the stale/zeroed tail of
-                // read_buf in place.
+                // read_sectors returns bytes written into buf. All in-tree
+                // sources are full-or-error, but a short count would leave
+                // stale/zeroed tail bytes in read_buf.
                 debug_assert!(got <= bytes, "read_sectors over-reported byte count");
                 if let Some(ev) = self.adaptive.on_success(sectors) {
                     self.emit(ev);
@@ -549,15 +514,9 @@ impl DiscStream {
                 break;
             }
 
-            // Transport failure (status=0xFF: USB-bridge crash / disconnect) is
-            // NOT a skippable bad sector. The bridge is wedged and every
-            // subsequent read fails identically, so shrinking + skipping past it
-            // — even under `skip_errors` — just marches the whole disc at one
-            // ~15s bridge-recovery per probe, producing no usable output (the
-            // "runs forever, no MKV" report). Abort immediately, highest
-            // priority, mirroring the multipass sweep's transport-failure rule
-            // in `read_error::handle_read_error`. The CLI/UX surfaces this so the
-            // user power-cycles the drive (or switches to multipass recovery).
+            // Transport failure (status=0xFF: bridge crash/disconnect) is NOT a
+            // skippable bad sector — the bridge is wedged and every subsequent
+            // read fails, so skipping just marches the disc producing no MKV.
             if let Some(e) = res.as_ref().err()
                 && e.is_scsi_transport_failure()
             {
@@ -570,14 +529,9 @@ impl DiscStream {
                 .into());
             }
 
-            // The read SOURCE is gone (a prefetch producer thread that
-            // terminated), not one range of media. Shrinking and retrying at
-            // the same LBA asks a dead source for data it can never produce,
-            // and the `skip_errors` branch below would then zero-fill and
-            // advance over every remaining sector of the title and still
-            // return success. Abort with the terminal error itself — a
-            // fabricated SCSI status would be a lie, so this is deliberately
-            // NOT folded into the transport-failure arm above.
+            // The read SOURCE is gone (e.g. a terminated prefetch thread), not
+            // bad media — skip_errors would zero-fill the rest of the title and
+            // report success. Abort with the terminal error, not a fake status.
             if let Some(e) = res.as_ref().err()
                 && e.is_source_terminated()
             {
@@ -585,18 +539,9 @@ impl DiscStream {
             }
 
             if (sectors as u32) <= align {
-                // Bottomed out at one unit (AACS) / one sector (CSS) / the
-                // extent tail. This is single-pass disc→MKV, which has NO Pass N
-                // to come back and recover later — so before we skip or bail,
-                // give the drive its full ECC recovery budget ONCE
-                // (`recovery=true` → READ_RECOVERY_TIMEOUT_MS, ~60s), exactly as
-                // the multipass patch does on its bad ranges. A single bounded
-                // read, never a loop (hard rule #2: tight retry loops on one LBA
-                // push the BU40N into fast-fail). On success we USE the recovered
-                // data, so the old "transient retry returns a bogus status for
-                // readable data" hole cannot reopen; the earlier 10s-timeout read
-                // gave the drive no chance to recover a marginal sector that a
-                // 60s ECC read can.
+                // Bottomed out with no later pass to recover — give the drive one
+                // full ECC recovery read (~60s) before skip/bail. A single bounded
+                // read, never a loop (hard rule #2: retry loops fast-fail the BU40N).
                 tracing::debug!(
                     target: "mux",
                     "fill_extents last-chance recovery read at LBA {} ({} sectors, 60s ECC)",
@@ -618,15 +563,9 @@ impl DiscStream {
                     break;
                 }
 
-                // Recovery read also failed. A transport failure here (status
-                // 0xFF: USB-bridge crash / disconnect) is NOT a skippable bad
-                // unit — same as the original 10s read above. The line-442
-                // short-circuit only inspected `res`; the 60s recovery read
-                // (`rec`) can wedge the bridge on its own, and falling into the
-                // `skip_errors` branch below would zero-fill + advance, treating
-                // a dead bridge as a skippable unit and marching the whole disc
-                // at one bridge-recovery per probe (hard rule #2, "runs forever,
-                // no MKV"). Re-check `rec` and abort, mirroring line 442.
+                // Recovery read also failed: re-check `rec` for a transport
+                // failure (bridge crash) same as `res` above — the 60s recovery
+                // read can wedge the bridge on its own; abort rather than skip.
                 if let Some(e) = rec.as_ref().err()
                     && e.is_scsi_transport_failure()
                 {
@@ -639,31 +578,27 @@ impl DiscStream {
                     .into());
                 }
 
-                // Same rule as after the first-attempt read: the 60s recovery
-                // read goes through the same source, so it can be the call
-                // that discovers the source is dead. Skipping the unit would
-                // zero-fill the rest of the title as fabricated content.
+                // Same rule as the first-attempt read: the recovery read can
+                // also be the call that discovers the source is dead. Skipping
+                // would zero-fill the rest of the title as fabricated content.
                 if let Some(e) = rec.as_ref().err()
                     && e.is_source_terminated()
                 {
                     return Err(crate::error::Error::SourceTerminated.into());
                 }
 
-                // Recovery read also failed. Skip the WHOLE failed unit or bail.
-                // Zero-filling and advancing by the full unit keeps
-                // current_offset unit-aligned, so the next read still begins on a
-                // real AACS unit boundary (a 1-sector skip here would desync the
-                // rest of the title — the bug this guards).
+                // Recovery read also failed. Skip the WHOLE failed unit, not one
+                // sector: advancing by the full unit keeps current_offset
+                // AACS-aligned (a partial skip here would desync the rest).
                 if self.skip_errors {
                     let zb = sectors as usize * 2048;
                     self.read_buf.resize(zb, 0);
                     self.read_buf[..zb].fill(0);
                     self.buf_valid = zb;
                     self.errors += 1;
-                    // `errors` counts skip events; `lost_bytes` counts the
-                    // bytes actually zero-filled. For AACS (unit_align=3) a
-                    // single event skips a whole 6144-byte unit, so loss
-                    // estimates must use this, not `errors * 2048`.
+                    // `errors` counts skip events, `lost_bytes` the bytes
+                    // zero-filled. One AACS event can skip a whole 6144-byte
+                    // unit, so loss estimates must use lost_bytes, not errors*2048.
                     self.lost_bytes = self.lost_bytes.saturating_add(zb as u64);
                     self.emit(EventKind::SectorSkipped { sector: lba as u64 });
                     self.current_offset += sectors as u32;
@@ -882,11 +817,9 @@ impl crate::pes::Stream for DiscStream {
                     let Some(&(_, track)) = pid_to_track.iter().find(|(p, _)| p == pid) else {
                         continue;
                     };
-                    // Flush frames carry their own per-frame `discontinuity` (a
-                    // post-gap picture buffered at EOF was stamped by the parser),
-                    // so route them through the SAME B1 gate the in-stream path
-                    // uses — otherwise a trailing dangling-reference frame would
-                    // bypass the resync.
+                    // Flush frames carry their own per-frame `discontinuity`, so
+                    // route them through the SAME B1 gate as the in-stream path —
+                    // otherwise a trailing dangling-reference frame bypasses resync.
                     for frame in parser.flush() {
                         let emit = match resync.get_mut(track) {
                             Some(gate) => gate.admit(
@@ -922,10 +855,9 @@ impl crate::pes::Stream for DiscStream {
             if let (Some(t0), Some(t1)) = (t0, t1) {
                 prof_tick("fill", t1.duration_since(t0).as_nanos(), bytes as u64);
             }
-            // Plaintext: the wrapped reader (DecryptingSectorSource)
-            // applied AACS / CSS in-place during fill_extents'
-            // read_sectors call. The pre-0.18 inline decrypt step
-            // lived here.
+            // Plaintext already: DecryptingSectorSource applied AACS/CSS
+            // in-place during fill_extents' read_sectors call (the pre-0.18
+            // inline decrypt step used to live here).
 
             let buf_base = self.fed_bytes;
             self.fed_bytes = self.fed_bytes.saturating_add(bytes as u64);
@@ -945,11 +877,9 @@ impl crate::pes::Stream for DiscStream {
                         .copied()
                     {
                         if skip_parse {
-                            // Profiling escape hatch — bypass the codec
-                            // parser and pass the raw PES bytes straight
-                            // through as a single PesFrame. Lets us
-                            // attribute consumer-thread time to
-                            // "demux + framing" vs "codec parse".
+                            // Profiling escape hatch — bypass the codec parser,
+                            // pass raw PES bytes through as one PesFrame, so we
+                            // can attribute time to demux+framing vs codec parse.
                             self.pending_frames.push_back(crate::pes::PesFrame {
                                 coding: None,
                                 source: None,
@@ -1080,10 +1010,9 @@ impl crate::pes::Stream for DiscStream {
     }
 
     fn headers_ready(&self) -> bool {
-        // FREEMKV_SKIP_PARSE bypasses codec parsers entirely for
-        // bottleneck profiling, so codec_private is never populated.
-        // Pretend headers are ready immediately in that mode so the
-        // CLI loop doesn't hang waiting for them.
+        // FREEMKV_SKIP_PARSE bypasses codec parsers entirely, so
+        // codec_private is never populated — pretend headers are ready
+        // immediately in that mode so the CLI loop doesn't hang.
         if self.skip_parse {
             return true;
         }
@@ -1099,14 +1028,9 @@ impl crate::pes::Stream for DiscStream {
     }
 
     fn errors(&self) -> u64 {
-        // Read errors PLUS every frame the B1 resync gates discarded.
-        //
-        // Summed from the gates here rather than counted at each of the three
-        // `admit` call sites: one place cannot drift, three can, and a frame
-        // dropped by the demuxer flush is the same loss as one dropped on the
-        // main path. `ResyncGate::dropped` is zeroed at every resync, so only
-        // `dropped_total` sees a gap that RESOLVES — which is most of them, and
-        // was the whole reason concealed video loss reached no caller.
+        // Read errors PLUS every frame the B1 resync gates discarded. Summed
+        // here rather than at each of three `admit` call sites (one place can't
+        // drift); `dropped_total` catches gaps that RESOLVE, which most do.
         self.errors
             + self
                 .resync
@@ -1116,11 +1040,9 @@ impl crate::pes::Stream for DiscStream {
     }
 
     fn lost_bytes(&self) -> u64 {
-        // Read-error zero-fill loss (counted in fill_extents) — real missing
-        // content the abort gate must see. There is no decrypt-loss term: the
-        // decrypt path passes bad-encoded/undecryptable units through (a broken-TS
-        // unit is the muxer's concern, and a missing key is indistinguishable from
-        // bad authoring here), so only physical read loss is reported.
+        // Read-error zero-fill loss only — the abort gate needs real missing
+        // content. No decrypt-loss term: undecryptable units pass through as
+        // broken TS (the muxer's concern), indistinguishable from bad authoring.
         self.lost_bytes
     }
 }
@@ -1809,10 +1731,9 @@ mod tests {
         .unwrap();
         stream.skip_errors = true;
 
-        // Drive fill_extents across batches: the good leading sectors mux fine,
-        // and the batch covering the bad sector shrinks to size 1, fails the
-        // fast read (0x02), then the bottom-out recovery read returns the
-        // transport failure (0xFF) — which must abort.
+        // Drive fill_extents across batches: the batch covering the bad sector
+        // shrinks to size 1, fails the fast read (0x02), then the bottom-out
+        // recovery read returns the transport failure (0xFF), which must abort.
         let mut res = Ok(true);
         for _ in 0..1000 {
             res = stream.fill_extents();
@@ -2079,10 +2000,8 @@ mod tests {
                 lba - ext_start
             );
             // Non-tail reads must be a whole number of units; the only permitted
-            // short read is a final partial unit (below one unit). Assert it
-            // rather than documenting it — a mid-stream non-unit-multiple read
-            // would straddle AACS unit boundaries and decrypt under the wrong
-            // alignment.
+            // short read is a final partial unit. A mid-stream non-unit-multiple
+            // read would straddle AACS unit boundaries and decrypt wrong.
             assert!(
                 (count as u32).is_multiple_of(ALIGN) || (count as u32) < ALIGN,
                 "read count {count} is neither a whole number of units nor a sub-unit tail"
@@ -2094,10 +2013,8 @@ mod tests {
         assert!(stream.errors >= 1, "expected the bad unit to be skipped");
 
         // Regression: `lost_bytes` must account for the WHOLE skipped unit
-        // (3 sectors = 6144 bytes), not a single sector. A loss estimate
-        // built from `errors * 2048` would undercount AACS loss ~3x — the
-        // single-pass abort-gate bug this guards against. Exactly one unit
-        // is bad in this fixture, so lost_bytes == errors * ALIGN * 2048.
+        // (3 sectors = 6144 bytes), not one sector — `errors * 2048` would
+        // undercount AACS loss ~3x, the single-pass abort-gate bug this guards.
         assert_eq!(
             stream.lost_bytes,
             stream.errors * ALIGN as u64 * 2048,
@@ -2110,8 +2027,7 @@ mod tests {
 
         // Crucial anti-desync assertion: the read that bottomed out and was
         // skipped must have been a single 3-sector unit starting at offset 12
-        // (the unit boundary at or below the bad sector 13), NOT a 1-sector
-        // read at 13. Find a recorded read of (12, 3).
+        // (the unit boundary at/below bad sector 13), NOT a 1-sector read at 13.
         assert!(
             reads
                 .iter()
@@ -2347,9 +2263,8 @@ mod tests {
             assert_eq!(PesStream::errors(&s), 0, "clean before anything happens");
 
             // Drive a gate directly: a discontinuity, two dropped inter-coded
-            // frames, then a keyframe that resyncs and zeroes the per-run count.
-            // The short-read fixture's title carries no streams, so give it a
-            // gate to drive.
+            // frames, then a keyframe that resyncs and zeroes the per-run count
+            // (the short-read fixture's title has no streams, so give it a gate).
             s.resync.push(crate::mux::resync::ResyncGate::new());
             let gate = s.resync.last_mut().expect("just pushed");
             assert!(!gate.admit(true, true, false));
@@ -2609,9 +2524,8 @@ mod tests {
             );
 
             // Behavioural witness for the WRAPPED reader's keys: while AACS keys
-            // are installed the decorator refuses a read that does not begin on a
-            // 6144-byte aligned unit (it would mis-decrypt every following unit),
-            // so a mid-unit LBA hard-fails.
+            // are installed, a read not starting on a 6144-byte unit boundary
+            // hard-fails (it would mis-decrypt every following unit).
             let mut buf = vec![0u8; 2048];
             let before = s.reader.read_sectors(1, 1, &mut buf, false);
             assert!(

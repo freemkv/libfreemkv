@@ -42,12 +42,9 @@ impl Disc {
             Err(_) => return Ok((Vec::new(), None)),
         };
 
-        // Follow the disc's First-Play navigation the way a player would, to see
-        // which title it selects as the feature (issue #40). Read-only, and any
-        // parse error / interactive-menu entry / non-convergence returns `None`
-        // — a strict improvement: it never removes a title, only re-ranks toward
-        // the nav-chosen one. The `(vtsn, vts_ttn)` it yields is matched to the
-        // scanned title below to recover its `playlist_id`.
+        // Follow the disc's First-Play navigation like a player would, to find the
+        // nav-chosen feature title (issue #40). Read-only; any failure/non-convergence
+        // yields `None`, so this only re-ranks, never removes, a title.
         let nav_target = crate::dvdnav::resolve_main_title(reader, udf_fs);
         let mut nav_feature: Option<u16> = None;
 
@@ -74,50 +71,27 @@ impl Disc {
                     crate::ifo::TvSystem::Pal => ColorSpace::Bt470bg,
                     crate::ifo::TvSystem::Ntsc => ColorSpace::Smpte170m,
                 },
-                // DVD pixels are anamorphic 720x480/576; the real display shape
-                // is the IFO aspect flag, not the pixel grid. Carry it so the
-                // MKV muxer writes a correct 16:9 / 4:3 DisplayWidth/Height
-                // instead of the square-pixel 3:2 / 5:4 it would otherwise emit.
+                // DVD pixels are anamorphic 720x480/576; real display shape comes from the
+                // IFO aspect flag, not the pixel grid. Carry it so the MKV muxer emits correct
+                // 16:9/4:3 DisplayWidth/Height instead of the wrong square-pixel 3:2/5:4.
                 display_aspect: Some(match ts.video.aspect {
                     crate::ifo::DvdAspect::R16x9 => (16, 9),
                     crate::ifo::DvdAspect::R4x3 => (4, 3),
                 }),
                 secondary: false,
                 label: String::new(),
-                // TODO(spec): populate from the MPEG-2 picture coding extension
-                // once the codec parser surfaces it. `Mpeg2Parser` already reads
-                // `top_field_first` (mux/codec/mpeg2.rs `picture_nb_fields`) but
-                // tracks are built from the IFO scan BEFORE any frame is parsed;
-                // wiring it requires a CodecParser accessor surfaced through
-                // PipelinedPesStream/DiscStream into the output title (mirroring
-                // the existing `codec_private` handshake). Until then `None`
-                // means the muxer falls back to TFF (correct for ~all DVDs).
-                // TODO(spec): DVD MPEG-2 carries no VUI; the colour signalling is
-                // the sequence_display_extension colour_description when present.
-                // Surface it from `Mpeg2Parser` (same handshake as above) and set
-                // this so a disc that states e.g. BT.601-625 colour overrides the
-                // PAL/NTSC guess in `color_space`. `None` uses the enum fallback.
+                // TODO(spec): populate top_field_first + measured colour from Mpeg2Parser once
+                // tracks are built after frame parsing -- needs a CodecParser->title channel
+                // like `codec_private`. Until wired, `None` falls back to TFF / PAL-NTSC guess.
                 measured_cicp: None,
             });
-            // TODO(spec): DefaultDuration is derived from the declared IFO
-            // frame_rate (25 / 29.97). A soft-telecined 23.976-in-29.97 DVD then
-            // reports 29.97 fps instead of the true 23.976 film rate. The pulldown
-            // cadence is detectable from the parser's per-picture `nb_fields`
-            // (repeat_first_field) — when most frames are 3-field-then-2-field
-            // 2:3 pulldown the film rate is frame_rate × 4/5. Emitting the film
-            // DefaultDuration needs the parser to report the measured cadence
-            // through the same parser→title channel as `top_field_first` above;
-            // left as a follow-up to avoid a speculative rate change here.
+            // TODO(spec): DefaultDuration comes from IFO frame_rate, so a soft-telecined
+            // 23.976-in-29.97 DVD reports 29.97 instead of true film rate. Cadence is
+            // detectable via nb_fields (2:3 pulldown); needs same channel as top_field_first above.
 
-            // Map DvdAudioAttr to Stream::Audio. The PID is derived from the
-            // stream's REAL on-wire private_stream_1 sub-stream id (assigned
-            // by per-codec ordinal in the IFO scan) via the same
-            // `dvd_audio_pid` table the demuxer's `PsPacket::dvd_pid` uses,
-            // so a mixed-codec title (AC-3 + DTS + LPCM) routes correctly
-            // instead of colliding on 0xBD00. Streams carried as a regular
-            // MPEG-audio PES (MP1/MP2, no sub-id) fall back to a distinct
-            // 0xBD00+ordinal PID — disjoint from the 0xBD80+ canonical audio
-            // space — though they are not routed via `dvd_pid` today.
+            // Map DvdAudioAttr to Stream::Audio. PID derives from the on-wire private_stream_1
+            // sub-id via the same `dvd_audio_pid` table the demuxer uses, so mixed-codec
+            // titles route correctly instead of colliding; MP1/MP2 (no sub-id) use 0xBD00+ordinal.
             let audio_streams: Vec<Stream> = ts
                 .audio_streams
                 .iter()
@@ -144,9 +118,8 @@ impl Disc {
             for (vts_title_idx, dvd_title) in ts.titles.iter().enumerate() {
                 title_number += 1;
 
-                // If the nav executor picked this title (identified by its VTS
-                // number and 1-based position within the set — the same
-                // `vts_ttn` convention used below), remember its global
+                // If the nav executor picked this title (by VTS number + 1-based position,
+                // the same `vts_ttn` convention used below), remember its global
                 // `playlist_id` so the caller can promote it in ranking.
                 if let Some(rt) = nav_target
                     && rt.vtsn == ts.vts_number
@@ -160,19 +133,9 @@ impl Disc {
                 // per-cell IFO detail. No-op unless freemkv::diag is enabled.
                 crate::diag::dump_dvd_cells(ts.vts_number, title_number, dvd_title);
 
-                // Feature start cell. Prefer the DVD nav-VM resolver, which
-                // PARKED (#40, menu-at-start playback). The "menu at the start"
-                // symptom (seen on a real disc) was a sector-mapping fault — the absolute
-                // VOB rebase in `ifo::parse_vts` (`vob_start_sector =
-                // file_start_lba + vtstt_vobs`) — NOT a navigation problem, so
-                // feature-start resolution is unnecessary for correct rips. The
-                // nav resolver + verified VM decoder (`dvdnav`) are kept compiled
-                // but deliberately bypassed; flip `USE_NAV_RESOLVER` to re-enable
-                // once the nav executor is finished. The fallback is the
-                // structural leading-cell filter (`feature_start_cell`), which
-                // drops leading scene-index / interleaved-angle sub-block cells
-                // and is a no-op for a normal feature (category 0x00 on cell 0).
-                // See `dvdnav::resolve_feature_start`.
+                // Feature-start nav resolution is PARKED (#40): the "menu at start" symptom
+                // was actually a sector-mapping fault in `ifo::parse_vts`'s VOB rebase, not
+                // navigation. Bypassed via `USE_NAV_RESOLVER = false`; fallback is the filter.
                 const USE_NAV_RESOLVER: bool = false;
                 let feature_start = if USE_NAV_RESOLVER {
                     crate::dvdnav::resolve_feature_start(
@@ -220,14 +183,9 @@ impl Disc {
 
                 let size_bytes: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
-                // Build pre-formatted VobSub `.idx` codec_data (size: + palette:
-                // lines) for VobSub subtitle streams. The `size:` line carries
-                // the coded video frame the subpicture was authored against
-                // (720x480 NTSC / 720x576 PAL) so players place and scale the
-                // bitmap correctly.
-                // format_palette guards on (0, 0) and omits its `size:` line,
-                // so an unresolved resolution degrades to a palette-only .idx
-                // rather than one claiming a 0x0 frame.
+                // Build pre-formatted VobSub `.idx` codec_data. The `size:` line carries the
+                // coded video frame (720x480 NTSC / 720x576 PAL) so players place/scale the
+                // subpicture correctly; format_palette omits it on unresolved (0,0).
                 let (vid_w, vid_h) = ts.video.resolution.pixels().unwrap_or((0, 0));
                 let codec_data = dvd_title
                     .palette
@@ -260,10 +218,9 @@ impl Disc {
                 streams.extend(audio_streams.iter().cloned());
                 streams.extend(subtitle_streams);
 
-                // Chapter times are absolute from the PGC start. When leading
-                // cells are dropped the muxed video shifts earlier by exactly
-                // their total duration, so shift the chapter marks too (clamping
-                // any that fell inside the dropped head to 0).
+                // Chapter times are absolute from the PGC start. When leading cells are
+                // dropped, the muxed video shifts earlier by their total duration, so shift
+                // chapter marks too (clamping any that fell inside the dropped head to 0).
                 let chapters: Vec<Chapter> = dvd_title
                     .chapter_times
                     .iter()
@@ -289,10 +246,9 @@ impl Disc {
             }
         }
 
-        // Polled again AFTER the loop: a cancel raised during the IFO reads
-        // that `parse_vmg` performs per title set has nothing left to poll,
-        // so without this a partially enumerated disc could still be handed
-        // back as success.
+        // Polled again AFTER the loop: a cancel raised during per-title-set IFO reads in
+        // `parse_vmg` has nothing left to poll otherwise, so without this a partially
+        // enumerated disc could still be handed back as success.
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
@@ -306,11 +262,9 @@ mod tests {
     use crate::sector::SectorSource;
     use std::collections::HashMap;
 
-    // ---------------------------------------------------------------
     // In-memory disc + minimal UDF image (single physical partition,
     // metadata_start == partition_start). Offsets cited against
     // udf.rs::read_filesystem / ECMA-167.
-    // ---------------------------------------------------------------
 
     const PART_START: u32 = 3000;
 
@@ -624,10 +578,9 @@ mod tests {
     /// `Err(Error::Halted)`.
     #[test]
     fn halted_ifo_read_is_not_reported_as_a_shorter_disc() {
-        // Two title sets: VTS_01's IFO data at PART_START+6000, VTS_02's at
-        // PART_START+7000. Both ICBs sit far below, so the filesystem
-        // metadata resolves and only the second title set's CONTENT is
-        // cancelled — the truncation case.
+        // Two title sets: VTS_01's IFO at PART_START+6000, VTS_02's at PART_START+7000.
+        // Both ICBs sit far below, so filesystem metadata resolves fine and only the
+        // second title set's CONTENT read is cancelled — the truncation case.
         let mut disc = MemDisc::new();
         let vmg = build_vmg(&[(1, 1, 1), (1, 2, 1)]);
         let vts1 = build_vts(100, 0x00, &[], &[], &[(0, 9)], false);
@@ -1052,12 +1005,9 @@ mod tests {
     fn scan_dvd_titles_mixed_audio_codecs_distinct_pids() {
         let mut disc = MemDisc::new();
         let vmg = build_vmg(&[(1, 1, 1)]);
-        // audio b0: coding_mode is (b0 >> 5) & 7. AC-3 = 0 → b0=0x00.
-        // DTS = 6 → b0 = 6<<5 = 0xC0. b1 channels nibble = (channels-1) in bits
-        // 2-0: a REAL 5.1 layout is 5 (0x05), a REAL 2.0 is 1 (0x01). The old
-        // fixture used 0x10/0x50 (both decode to 1 channel) — a placeholder that
-        // would pass even against code mishandling channel counts. Pin real
-        // layouts: AC-3 5.1 eng, DTS 2.0 fra.
+        // audio b0: coding_mode = (b0>>5)&7 (AC-3=0->0x00, DTS=6->0xC0). b1 channels nibble
+        // = (channels-1) in bits 2-0 (5.1=0x05, 2.0=0x01). Old fixture used 0x10/0x50
+        // (both -> 1ch), a placeholder that passed even with broken channel handling.
         let vts = build_vts(
             0,
             0x00,
@@ -1110,10 +1060,9 @@ mod tests {
             2,
             "DTS 2.0 nibble must decode to 2 channels"
         );
-        // PIDs route via the positional sub-id table: AC-3 @ pos 0 → 0x80 →
-        // 0xBD80, DTS @ pos 1 → 0x89 → 0xBD89 (the shared audio-stream number
-        // in the low nibble, NOT a per-codec ordinal). Distinct AND the exact
-        // canonical wire PIDs the demux routes on.
+        // PIDs route via the positional sub-id table: AC-3 @ pos 0 -> 0x80 -> 0xBD80, DTS @
+        // pos 1 -> 0x89 -> 0xBD89 (shared audio-stream number in the low nibble, NOT a
+        // per-codec ordinal). Distinct AND the exact canonical wire PIDs the demux routes on.
         assert_eq!(audios[0].pid, 0xBD80, "AC-3 @ pos 0 → 0xBD80");
         assert_eq!(audios[1].pid, 0xBD89, "DTS @ pos 1 → 0xBD89");
         assert_ne!(audios[0].pid, audios[1].pid);
@@ -1301,11 +1250,9 @@ mod tests {
     #[test]
     fn scan_dvd_titles_numbering_increments_per_title() {
         let mut disc = MemDisc::new();
-        // Two titles in VTS 1 (title nums 1 and 2). num_pgcs must cover
-        // pgc_index = vts_title - 1, so we need >=2 PGC entries; our
-        // build_vts only emits 1 PGC. So the second title's PGC index (1)
-        // exceeds num_pgcs (1) and is skipped. To exercise numbering we use
-        // two separate VTS sets instead.
+        // Two titles in VTS 1 (nums 1,2): pgc_index = vts_title-1 needs >=2 PGC entries, but
+        // build_vts only emits 1, so the second title's PGC index (1) exceeds num_pgcs (1)
+        // and is skipped. Use two separate VTS sets instead to exercise numbering.
         let vmg = build_vmg(&[(1, 1, 1), (1, 2, 1)]);
         let vts1 = build_vts(100, 0x00, &[], &[], &[(0, 9)], false);
         let vts2 = build_vts(200, 0x00, &[], &[], &[(0, 19)], false);
@@ -1501,9 +1448,8 @@ mod tests {
         let mut disc = MemDisc::new();
         let vmg = build_vmg(&[(2, 1, 1)]);
         // Cell 0: leading scene-index/angle sub-block (cat 0x90), 5s, sectors 0..9.
-        // Cell 1: feature start (cat 0x00), 59s, sectors 100..199.
-        // Cell 2: feature (cat 0x00), 59s, sectors 300..399.
-        // Programs: prog0 → cell 1 (feature start), prog1 → cell 3.
+        // Cell 1: feature start (cat 0x00), 59s, 100..199. Cell 2: feature, 59s, 300..399.
+        // Programs: prog0 -> cell 1 (feature start), prog1 -> cell 3.
         let vts = build_vts_cells(
             1000,
             0x00,

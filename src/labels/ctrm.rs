@@ -56,11 +56,9 @@ fn merge(ls: Vec<StreamLabel>, mb: Vec<StreamLabel>) -> Vec<StreamLabel> {
             label.name = mb_match.name.clone();
         }
     }
-    // Append any menu_base-only stream (present in mb but not in ls by
-    // (stream_type, stream_number)). Without this the both-files path
-    // silently drops streams the menu_base-only path would have emitted:
-    // language_streams is authoritative for type/purpose but is not
-    // necessarily a superset of menu_base.
+    // Append menu_base-only streams (present in mb but not in ls by
+    // (stream_type, stream_number)); language_streams is authoritative for
+    // type/purpose but not necessarily a superset of menu_base.
     for mb_label in mb {
         let already = result.iter().any(|l| {
             l.stream_type == mb_label.stream_type && l.stream_number == mb_label.stream_number
@@ -197,11 +195,9 @@ fn parse_language_streams_text(text: &str) -> Vec<StreamLabel> {
                 "csp" | "cs" | "lsp" | "ls" | "cf" | "pf" | "bp" | "pp" => {
                     variant_code = variant.clone();
                 }
-                // Everything else: defer to vocab::codec as the single
-                // source of codec-name truth. If it recognizes the token
-                // (returns something other than the input) it's a known
-                // codec — store the canonical name. Otherwise it's an
-                // unknown token, stored as-is.
+                // Everything else: defer to vocab::codec as the single source of
+                // codec-name truth — a known token gets its canonical name,
+                // otherwise it's stored as-is.
                 _ => codec_hint = vocab::codec(&variant).to_string(),
             }
         }
@@ -222,10 +218,9 @@ fn parse_language_streams_text(text: &str) -> Vec<StreamLabel> {
     labels
 }
 
-// NOTE: `parse_menu_base` / `parse_menu_base_text` are defined just below this
-// module and structurally belong above it. They are left in place (with the
-// lint allowed) rather than relocated here — a ~120-line block move that is
-// safer to do as its own focused change than inline.
+// NOTE: `parse_menu_base` / `parse_menu_base_text` structurally belong above this
+// module but are left below (lint allowed) — a ~120-line move is safer as its
+// own focused change.
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
@@ -311,10 +306,9 @@ mod tests {
 
     #[test]
     fn dual_flag_entry_resolves_to_audio_with_no_subtitle_qualifier() {
-        // An entry tripping BOTH flags (audio_ prefix sets is_audio,
-        // class "SubtitleButton" sets is_subtitle). Audio wins the type,
-        // and the subtitle qualifier (SDH) must NOT be carried onto the
-        // resulting Audio label. Regression for the type/qualifier split.
+        // An entry tripping BOTH flags (audio_ prefix sets is_audio, class
+        // "SubtitleButton" sets is_subtitle): audio wins the type, and the
+        // subtitle qualifier (SDH) must NOT carry onto the Audio label.
         let labels = parse_props(
             "audio_1.class=SubtitleButton\n\
              audio_1.streamNumber=6\n\
@@ -885,11 +879,9 @@ fn parse_menu_base_text(text: &str) -> Vec<StreamLabel> {
 
         let name = props.get("name").cloned().unwrap_or_default();
 
-        // Purpose: ask vocab first (word-boundary matched — avoids the
-        // "Commenter" false positive the prior `name.contains("comment")`
-        // had). Then fall back to the structural prefix check
-        // (`audio_commentary.foo`-style keys group commentary streams
-        // regardless of display name).
+        // Ask vocab first (word-boundary matched, avoiding the "Commenter"
+        // false positive of the old `name.contains("comment")`), then fall
+        // back to the structural prefix check (`audio_commentary.foo`-style).
         let purpose = match vocab::purpose(&name) {
             LabelPurpose::Normal if prefix_is_commentary(prefix) => LabelPurpose::Commentary,
             p => p,

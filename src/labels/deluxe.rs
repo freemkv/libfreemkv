@@ -83,10 +83,9 @@ use crate::udf::UdfFs;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
-    // The real signal is `com/bydeluxe/` inside a top-level jar's central
-    // directory. With a reader in detect we check it directly (cheap
-    // central-directory scan, no bytecode walk) so this parser claims only
-    // Deluxe discs; `parse()` repeats the check.
+    // Real signal is `com/bydeluxe/` in a jar's central directory: a cheap
+    // scan, no bytecode walk, so this parser claims only Deluxe discs.
+    // `parse()` repeats the check.
     jar::for_each_jar(reader, udf, |_entry, archive| {
         jar::has_path_prefix(archive, "com/bydeluxe/").then_some(())
     })
@@ -94,11 +93,9 @@ pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
 }
 
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
-    // Per-studio dispatch signal. Deluxe authored the framework for several
-    // studios (Universal `studio="uni"`, Fox, WB, Disney/Pixar); each ships a
-    // `/BDMV/JAR/<n>/config.xml` naming the studio. The structural enum/binding
-    // matching below is studio-agnostic, so this is currently informational
-    // (logged, and available for future per-studio special-casing), not a gate.
+    // Per-studio dispatch signal: Deluxe authored the framework for several
+    // studios, each shipping `/BDMV/JAR/<n>/config.xml` naming the studio.
+    // Matching below is studio-agnostic, so this is informational only (logged).
     let studio = detect_studio(reader, udf);
 
     jar::for_each_jar(reader, udf, |entry_name, archive| {
@@ -128,10 +125,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         // Build a fast-lookup table for Phase D's bytecode decoder.
         let master_table = MasterEnumTable::from(&enums);
 
-        // Phase C — find ALL binding-class candidates (audio + subtitle
-        // are often split across two classes on Deluxe). Each gets its
-        // own `<clinit>` walk; constructions union into a single
-        // stream list for interpret_streams.
+        // Phase C — find ALL binding-class candidates (audio + subtitle often
+        // split across two classes on Deluxe). Each gets its own `<clinit>`
+        // walk; constructions union into a single stream list.
         let binding_classes = find_binding_classes(archive, &master_table.class_name_set());
         if binding_classes.is_empty() {
             tracing::info!(
@@ -180,11 +176,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
             subtitle = labels.iter().filter(|l| l.stream_type == StreamLabelType::Subtitle).count(),
             "deluxe emitted labels",
         );
-        // High confidence: the master enums matched their framework-stable
-        // fingerprints, the binding class decoded its `<clinit>`, and at least
-        // one per-stream binding resolved to a real (language, purpose, codec)
-        // tuple. Un-named STN slots are still back-filled from the MPLS floor
-        // by the registry (`merge_mpls_floor`).
+        // High confidence: master enums matched, binding class decoded, and at
+        // least one binding resolved to a real (language, purpose, codec) tuple.
+        // Un-named STN slots are back-filled from the MPLS floor by the registry.
         Some(ParseResult::high(labels))
     })
 }
@@ -399,13 +393,9 @@ impl CandidatePool {
 /// enums by `<clinit>` ldc-sequence fingerprint. Returns a vector of
 /// `(label, MasterEnum)` — at most one match per fingerprint label.
 fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnum)> {
-    // First pass: collect every class's <clinit> ldc string sequence, keyed by
-    // the class's JVM INTERNAL name (`this_class`), NOT the zip entry name.
-    // The binding class references an enum constant as `getstatic <internal>.f`
-    // (e.g. `pd`, or `com/foo/pd`), so the master enum has to be identified by
-    // that same internal name or Phase C's getstatic count never matches it.
-    // The zip entry name (`pd.class`) is a different namespace, used only to
-    // locate a class for decoding.
+    // First pass: collect every class's <clinit> ldc strings, keyed by the JVM
+    // INTERNAL name (`this_class`), not the zip entry name — binding classes
+    // reference enum constants as `getstatic <internal>.f`.
     let mut pool = CandidatePool::default();
     jar::for_each_class(archive, |zip_name, class| {
         let Some(ldcs) = clinit_ldc_strings(class) else {
@@ -456,10 +446,9 @@ fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnu
         return Vec::new();
     }
 
-    // Second pass: capture the obfuscated `putstatic` field names for the
-    // classes we matched, so Phase D can resolve `getstatic <enum>.<field>`
-    // to an ordinal. This is a targeted re-walk of only the matched enum
-    // classes (at most one per fingerprint), not the whole jar again.
+    // Second pass: capture obfuscated `putstatic` field names for matched
+    // classes so Phase D can resolve `getstatic <enum>.<field>` to an ordinal.
+    // Targeted re-walk of only the matched classes, not the whole jar again.
     let want: HashSet<&str> = out.iter().map(|(_, name, _)| name.as_str()).collect();
     let mut fields_by_class: HashMap<String, Vec<String>> = HashMap::new();
     jar::for_each_class(archive, |zip_name, class| {
@@ -607,12 +596,6 @@ fn ldcs_match_prefix(ldcs: &[String], prefix: &[&str]) -> bool {
 
 // ── Phase C: find the binding class ─────────────────────────────────────────
 
-/// Phase C: identify the class that builds the per-stream label table.
-/// That class has the highest count of `getstatic` operations whose
-/// owning class is one of the master enum classes we identified in
-/// Phase A. Returns the class name + the count (useful for the
-/// analyzer / corpus regression).
-///
 /// Threshold: requires at least `MIN_GETSTATIC` matches to consider a
 /// class a binding candidate. Empirically the binding class on a
 /// typical disc has 50+ such getstatic references (one per slot ×
@@ -751,10 +734,9 @@ fn decode_binding(
     master: &MasterEnumTable,
 ) -> Vec<Construction> {
     let target_name = binding_class_name.to_string();
-    // Short-circuit on the name match: try_each_class stops iterating
-    // (and stops decompressing/parsing remaining .class entries) as soon
-    // as the closure returns Some, instead of walking the whole jar past
-    // the target.
+    // Short-circuit on the name match: try_each_class stops iterating (and
+    // decompressing/parsing remaining .class entries) once the closure
+    // returns Some, instead of walking the whole jar past the target.
     jar::try_each_class(archive, |class_name, class| {
         if class_name != target_name {
             return None;
@@ -910,10 +892,8 @@ impl<'a> BindingDecoder<'a> {
                     .cp_index()
                     .and_then(|i| self.pool.member_ref(i))
                     .map(|m| {
-                        // Three-way resolution:
-                        //   1. org.bluray.ti.CodingType.X → CodingType(X)
-                        //   2. master-enum classname.X → EnumRef(kind, ord)
-                        //   3. anything else → Unknown
+                        // Resolution: CodingType.X → CodingType(X); master-enum
+                        // classname.X → EnumRef(kind, ord); else Unknown.
                         if m.class_name == BD_CODING_TYPE_CLASS {
                             StackVal::CodingType(m.name.to_string())
                         } else if let Some((kind, ord)) = self.master.resolve(m.class_name, m.name)
@@ -926,30 +906,20 @@ impl<'a> BindingDecoder<'a> {
                     .unwrap_or(StackVal::Unknown);
                 self.push(val);
             }
-            // invokespecial X.<init>(...) — pop args per descriptor.
-            // If the object on the stack underneath the args is a
-            // NewObj of class X (set by an earlier `new X / dup`),
-            // emit a Construction.
+            // invokespecial X.<init>(...) — pop args per descriptor. If the
+            // object underneath the args is a NewObj of class X (set by an
+            // earlier `new X / dup`), emit a Construction.
             INVOKESPECIAL => {
                 let Some(idx) = insn.cp_index() else { return };
                 let Some(member) = self.pool.member_ref(idx) else { return };
                 let arg_count = parse_method_arg_count(member.descriptor);
-                // A per-stream binding constructor takes only scalars and enum
-                // references — never an array. A constructor with an array
-                // parameter is a container/title wrapper (e.g. Universal's
-                // title object `oq.<init>(…, [Lnp;, [Lwb;, [Loq;, [J)`, which
-                // holds the per-stream arrays) and must NOT be recorded as a
-                // stream binding: it carries a Language (the title's primary
-                // language) but is not itself a stream, and emitting it would
-                // land a spurious label in the subtitle list. The stack is
-                // still unwound below so the following real bindings stay in
-                // sync; only the `Construction` push is suppressed.
+                // A per-stream binding ctor takes only scalars/enum refs, never an
+                // array; a ctor with an array param is a container/title wrapper and
+                // must not be recorded as a stream binding (stack still unwinds below).
                 let is_container = member.descriptor.contains('[');
-                // Pop args off the symbolic stack.
                 if self.stack.len() < arg_count + 1 {
-                    // Stack-machine drift — bail on this construction
-                    // (but don't panic; the walker tolerates malformed
-                    // input by best-effort).
+                    // Stack-machine drift: bail on this construction without
+                    // panicking; the walker tolerates malformed input best-effort.
                     self.stack.clear();
                     return;
                 }
@@ -1000,11 +970,9 @@ impl<'a> BindingDecoder<'a> {
                 self.stack.pop();
                 self.stack.pop();
             }
-            // anewarray / newarray — pop the count, push the array reference.
-            // Modelled (rather than left to the `_` no-op) so the array
-            // constructions inside a container's argument list keep the
-            // symbolic stack aligned for the per-stream bindings built
-            // alongside them.
+            // anewarray / newarray — pop count, push array ref. Modelled (not
+            // left to `_`) so array constructions inside a container's arg list
+            // keep the symbolic stack aligned for per-stream bindings built alongside.
             0xBD /* anewarray */ | 0xBC /* newarray */ => {
                 self.stack.pop();
                 self.push(StackVal::Unknown);
@@ -1023,10 +991,9 @@ impl<'a> BindingDecoder<'a> {
                 self.stack.pop();
                 self.stack.pop();
             }
-            // Branches / returns / unhandled — clear stack as a
-            // conservative resync. Binding `<clinit>` is straight-
-            // line code in practice, so we rarely hit these on the
-            // verified pattern.
+            // Branches/returns/unhandled — clear stack as a conservative resync.
+            // Binding `<clinit>` is straight-line code in practice, so these
+            // are rarely hit on the verified pattern.
             0xA7 /* goto */ | 0xB1 /* return */ => {
                 self.stack.clear();
             }
@@ -1093,12 +1060,9 @@ impl MasterEnumTable {
         let mut by_class = HashMap::new();
         let mut by_kind = HashMap::new();
         for (kind, m) in enums {
-            // The binding class references enum constants by their obfuscated
-            // static-field name (`getstatic <enum>.a`), so the resolver map is
-            // keyed on the `putstatic` field names captured alongside the
-            // values (`m.fields`), NOT on the value strings. A synthetic test
-            // enum with no captured field names falls back to keying on the
-            // values themselves, which is how those tests reference it.
+            // Binding classes reference constants by obfuscated field name
+            // (`getstatic <enum>.a`), so the resolver keys on captured `putstatic`
+            // field names (`m.fields`); a synthetic test enum falls back to values.
             let keys: &[String] = if m.fields.is_empty() {
                 &m.values
             } else {
@@ -1197,16 +1161,9 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
         }
 
         let Some(lang_ord) = lang_ord else {
-            // No language resolved. If the construction is still recognisably
-            // a stream binding it OCCUPIES its STN slot and must advance the
-            // counter — there is just nothing to label. Numbering only the
-            // slots that resolve renumbers the rest 1..N and lands every
-            // surviving label on the wrong stream.
-            //
-            // `saturating_add` is safe here where it would not be on the
-            // emitting path below: no label is produced, so parking the
-            // counter at `u16::MAX` binds nothing. The next slot that DOES
-            // resolve hits the `checked_add` guard and stops emission.
+            // A recognisable stream binding still occupies its STN slot and must
+            // advance the counter, or renumbering skews every surviving label.
+            // `saturating_add` is safe here since no label is produced.
             match slot_kind(c, coding_type.is_some(), &slot_kinds) {
                 Some(StreamLabelType::Audio) => audio_idx = audio_idx.saturating_add(1),
                 Some(StreamLabelType::Subtitle) => sub_idx = sub_idx.saturating_add(1),
@@ -1226,13 +1183,9 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
             .map(str::to_string)
             .unwrap_or_default();
 
-        // Neither `+= 1` (panics in debug, wraps in release) nor
-        // `saturating_add` is correct here. Saturation is what turned an
-        // overflow guard into a non-terminating loop in `criterion`, and here
-        // it would peg every stream past 65535 at the SAME number — silently
-        // mislabelling tracks, since `apply_labels` binds on
-        // `(type, stream_number)`. The 1-based u16 numbering space is a hard
-        // ceiling, so exhausting it stops label emission instead.
+        // Neither `+= 1` nor `saturating_add` is correct: saturation caused a
+        // non-terminating loop in `criterion` and would peg every overflowing
+        // stream at the SAME number. Exhausting the 1-based u16 space stops emission.
         let (stream_type, stream_number) = if coding_type.is_some() {
             let Some(n) = audio_idx.checked_add(1) else {
                 tracing::warn!(
@@ -1268,11 +1221,9 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
             Some(o) => deluxe_purpose_to_label(o),
             None => (LabelPurpose::Normal, LabelQualifier::None),
         };
-        // Some frameworks (notably Universal) do not carry SDH/RNIB in the
-        // Purpose enum at all — they encode it as a distinct Language enum
-        // VALUE ("English SDH", "English RNIB"). When the purpose left the
-        // qualifier unset, recover it from the language display name so those
-        // tracks are still flagged.
+        // Some frameworks (Universal) encode SDH/RNIB as a distinct Language
+        // VALUE ("English SDH") rather than in the Purpose enum. When the
+        // purpose left the qualifier unset, recover it from the language name.
         if qualifier == LabelQualifier::None {
             qualifier = vocab::qualifier(&lang_value);
         }
@@ -1421,14 +1372,9 @@ fn deluxe_purpose_to_label(ordinal: u16) -> (LabelPurpose, LabelQualifier) {
 mod tests {
     use super::*;
 
-    // ── Raw .class / .jar fixture builders ──────────────────────────────────
-    //
-    // `identify_master_enums`, `find_binding_classes` and `decode_binding`
-    // operate on `jar::Jar` (a real `ZipArchive`), not on the in-memory
-    // `ClassFile` struct the rest of this module's tests build directly (see
-    // `class_with_clinit`). To exercise them we need real serialized
-    // `.class` bytes inside a real (stored, uncompressed) zip — this is the
-    // inverse of `ClassFile::parse` / JVMS §4.
+    // Raw .class/.jar fixture builders: `identify_master_enums`, `find_binding_classes`
+    // and `decode_binding` operate on `jar::Jar` (a real `ZipArchive`), not the
+    // in-memory `ClassFile` struct other tests build, so these need real `.class` bytes.
 
     /// Serialize a constant pool (no Long/Double entries — those need the
     /// post-slot `Empty` padding this helper doesn't handle) to the on-disk
@@ -1789,10 +1735,8 @@ mod tests {
 
     #[test]
     fn fingerprints_cover_documented_enums() {
-        // Lock the fingerprint roster — if someone adds/removes a
-        // fingerprint, this test forces them to think about it. The
-        // 5 documented enums (Language, Purpose, VideoFormat, Region,
-        // Studio) all need to be here. Codec is structural (separate
+        // Lock the fingerprint roster so adding/removing one is deliberate.
+        // All 5 documented enums must be here; Codec is structural (separate
         // path), not fingerprinted by ldc prefix.
         let labels: Vec<&str> = FINGERPRINTS.iter().map(|fp| fp.label).collect();
         assert_eq!(
@@ -1803,10 +1747,9 @@ mod tests {
 
     #[test]
     fn fingerprint_prefixes_nonempty_and_under_expected_count() {
-        // Each prefix must be non-empty and shorter than expected_count
-        // (so the count gives ADDITIONAL signal beyond the prefix
-        // match). If a prefix is as long as expected_count there's no
-        // counting benefit.
+        // Each prefix must be non-empty and shorter than expected_count so the
+        // count gives additional signal beyond the prefix match; a prefix as
+        // long as expected_count has no counting benefit.
         for fp in FINGERPRINTS {
             assert!(!fp.prefix.is_empty(), "{} has empty prefix", fp.label);
             assert!(
@@ -1821,10 +1764,9 @@ mod tests {
 
     #[test]
     fn identify_master_enums_matches_purpose_fingerprint() {
-        // Exact match: 8 ldcs, first 4 = the Purpose prefix, count ==
-        // expected_count exactly (abs_diff == 0). A decoy class with the
-        // same prefix but a wildly different count must be rejected and
-        // must NOT win over the exact match.
+        // Exact match: 8 ldcs, first 4 = Purpose prefix, count == expected_count
+        // exactly. A decoy class with the same prefix but a wildly different
+        // count must be rejected and must NOT win over the exact match.
         let good = class_with_ldc_strings(
             "GoodPurpose",
             &[
@@ -1923,10 +1865,9 @@ mod tests {
 
     #[test]
     fn identify_master_enums_accepts_count_at_the_tolerance_boundary() {
-        // abs_diff(expected_count, count) == LDC_COUNT_TOLERANCE (4) exactly
-        // must still be accepted (`> tolerance` rejects, so `== tolerance`
-        // is the last accepted value). This is the boundary `327:50`
-        // mutants (`>` -> `==`/`<`/`>=`) disagree on.
+        // abs_diff(expected_count, count) == LDC_COUNT_TOLERANCE (4) exactly must
+        // still be accepted (`> tolerance` rejects, so `== tolerance` is the last
+        // accepted value) — the boundary `>` vs `==`/`<`/`>=` mutants disagree on.
         let mut values: Vec<&str> = vec!["Normal", "Commentary", "PiP", "Trivia"];
         let filler: Vec<String> = (0..8).map(|i| format!("Filler{i}")).collect(); // 4+8=12, diff=4
         values.extend(filler.iter().map(String::as_str));
@@ -1943,9 +1884,8 @@ mod tests {
 
     #[test]
     fn identify_master_enums_finds_nothing_without_com_bydeluxe_signal() {
-        // No FINGERPRINTS-matching class in the jar at all -> empty result
-        // (kills the `vec![]` mutant only vacuously if paired with the
-        // positive tests above proving non-emptiness on a real match).
+        // No FINGERPRINTS-matching class in the jar -> empty result (kills the
+        // `vec![]` mutant only vacuously, paired with positive tests above).
         let unrelated = class_with_ldc_strings("Unrelated", &["Foo", "Bar"]);
         let zip = build_zip(&[("x/Unrelated.class", unrelated)]);
         let mut archive = open_jar(zip);
@@ -1972,16 +1912,8 @@ mod tests {
 
     #[test]
     fn find_binding_classes_picks_top_candidates_above_threshold() {
-        // Class A: 100 getstatic refs (the top / binding class). B: 45
-        // (>40% of top, kept). F: 40 (EXACTLY the 40% threshold — pins
-        // both the `(top_count * 2) / 5` arithmetic and the `>=`
-        // comparison: any of the `460`/`461` arithmetic mutants shift
-        // the threshold away from exactly 40, and a `>= -> <` mutant at
-        // 461 would drop this exact-boundary entry). E: 39 (just BELOW
-        // the true 40% threshold — a mutant that shrinks the threshold
-        // below 39 would wrongly keep this). C: 10 (well below, always
-        // dropped). D: 3 — below MIN_GETSTATIC(4), never even a raw
-        // candidate.
+        // A: 100 refs (top). B: 45 (>40% of top, kept). F: 40 (EXACTLY the 40%
+        // threshold). E: 39 (just below, dropped). D: 3 (below MIN_GETSTATIC(4)).
         let master_classes: HashSet<&str> = ["LanguageEnum"].into_iter().collect();
         let a = class_with_getstatic_refs("A", "LanguageEnum", 100);
         let b = class_with_getstatic_refs("B", "LanguageEnum", 45);
@@ -2027,15 +1959,9 @@ mod tests {
 
     #[test]
     fn decode_binding_finds_named_class_and_stops_at_first_match() {
-        // `decode_binding` matches by the Jar entry path (the same string
-        // `find_binding_classes` returns), not by the class's own
-        // `this_class` name. Two entries: the target path carries a real
-        // `new AudioSlot; dup; getstatic; invokespecial` construction; a
-        // decoy at a different path carries none (and, being pure
-        // getstatic/pop, would also match nothing if walked). If the name
-        // comparison is broken (`!=` mutated to `==`), decode_binding would
-        // either never match the real target (empty result) or would match
-        // and decode the WRONG entry.
+        // Matches by Jar entry path, not `this_class` name. Target path has a
+        // real construction; decoy has none. A broken path comparison would
+        // match nothing or decode the WRONG entry.
         let target = class_with_simple_construction("Ignored");
         let decoy = class_with_getstatic_refs("Ignored2", "LanguageEnum", 2);
         let zip = build_zip(&[
@@ -2141,12 +2067,9 @@ mod tests {
 
     #[test]
     fn clinit_ldc_string_count_is_capped() {
-        // A `.class` gated only by a `com/bydeluxe/` path prefix deflates from
-        // ~100 KB up to the 64 MiB MAX_CLASS_BYTES ceiling, giving ~33M 2-byte
-        // `ldc` instructions. Every resolved operand is retained as an owned
-        // String, and identify_master_enums keeps the whole vector per class in
-        // a HashMap — so the allocation scales with the DECOMPRESSED size while
-        // the only byte cap is on the compressed disc file.
+        // A `.class` gated only by path prefix deflates up to the 64 MiB
+        // MAX_CLASS_BYTES ceiling (~33M 2-byte `ldc` instructions, each retained
+        // as an owned String), so allocation scales with decompressed size.
         const N: usize = 200_000;
         let mut code = Vec::with_capacity(N * 2);
         for _ in 0..N {
@@ -2155,12 +2078,9 @@ mod tests {
         }
         let class = class_with_clinit(ldc_pool("English"), 2, &code);
         let ldcs = clinit_ldc_strings(&class).expect("<clinit> present");
-        // Asserted against a LITERAL, not against MAX_CLINIT_LDC_STRINGS. A test
-        // that compares the result to the very constant under test passes
-        // vacuously the moment someone raises that constant — which is the most
-        // likely future regression here, and exactly the tautology class this
-        // audit has now found six times. 8192 is double the current cap, so this
-        // still allows the cap to be tuned, but not removed.
+        // Asserted against a LITERAL, not MAX_CLINIT_LDC_STRINGS: comparing to the
+        // constant under test passes vacuously once someone raises it. 8192 is
+        // double the current cap, allowing the cap to be tuned but not removed.
         assert!(
             ldcs.len() <= 8192,
             "retained {} ldc strings from {N} ldc instructions — the cap is not \
@@ -2197,12 +2117,9 @@ mod tests {
 
     #[test]
     fn clinit_ldc_string_bytes_boundary_matches_256kib_not_1280() {
-        // `MAX_CLINIT_LDC_BYTES = 256 * 1024` (262144). A `* -> +` mutant at
-        // that computation collapses the cap to `256 + 1024` (1280) — 205x
-        // smaller. 1000-byte strings make the two cap values discriminate
-        // sharply: correct code retains 262 of them (262000 bytes, the
-        // 263rd would push to 263000 > 262144); the mutant retains only 1
-        // (the 2nd would push to 2000 > 1280).
+        // `MAX_CLINIT_LDC_BYTES = 256 * 1024`. A `* -> +` mutant collapses the
+        // cap to `256 + 1024` (1280), 205x smaller. 1000-byte strings discriminate
+        // sharply: correct code retains 262 (262000 bytes); mutant retains only 1.
         const N: usize = 400;
         let one = "x".repeat(1000);
         let mut code = Vec::with_capacity(N * 2);
@@ -2442,10 +2359,9 @@ mod tests {
 
     #[test]
     fn binding_decoder_stack_is_bounded_by_max_stack() {
-        // ~67M single-byte `iconst_0` fit in a 64 MiB decompressed class, and
-        // each pushes a StackVal onto a Vec with no depth limit (~2 GiB). The
-        // Code attribute's own max_stack is parsed and must be honoured: JVMS
-        // 4.7.3 requires the operand stack never exceed it.
+        // ~67M single-byte `iconst_0` fit in a 64 MiB decompressed class, each
+        // pushing a StackVal with no depth limit (~2 GiB). Code's max_stack must
+        // be honoured: JVMS 4.7.3 requires the operand stack never exceed it.
         const MAX_STACK: u16 = 4;
         let code = vec![ICONST_0; 200_000];
         let pool = build_simple_pool();
@@ -2524,24 +2440,9 @@ mod tests {
 
     #[test]
     fn decode_binding_class_finds_the_clinit_method_and_emits_its_construction() {
-        // decode_binding_class wraps BindingDecoder over every method literally
-        // named "<clinit>" on the class. Exercises the method-selection
-        // (`member_name(m) != Some("<clinit>")`) and per-method-union
-        // truncation (`room == 0`) logic that decode_binding_class adds on
-        // top of the already-tested BindingDecoder::step/run.
-        //
-        // Pool layout (must hold "<clinit>"/"()V"/"Code" at 1/2/3 per
-        // `class_with_clinit`'s contract, while ALSO matching the fixed cp
-        // indices — 6/8/12 — the reused `new AudioSlot; dup; getstatic;
-        // invokespecial` bytecode below references):
-        //   1 Utf8 "<clinit>"          2 Utf8 "()V"            3 Utf8 "Code"
-        //   4 Utf8 "LanguageEnum"      5 Class->4
-        //   6 Fieldref{class:5,nat:9}  7 Utf8 "English"
-        //   8 Class->10 (AudioSlot)    9 NameAndType{name:7,desc:11}
-        //  10 Utf8 "AudioSlot"        11 Utf8 "LLanguageEnum;"
-        //  12 Methodref{class:8,nat:13}
-        //  13 NameAndType{name:14,desc:15}
-        //  14 Utf8 "<init>"           15 Utf8 "(LLanguageEnum;)V"
+        // Exercises method-selection and per-method-union truncation logic.
+        // Pool must hold "<clinit>"/"()V"/"Code" at 1/2/3 per `class_with_clinit`,
+        // and match cp indices 6/8/12 used by the reused construction bytecode.
         let pool = ConstantPool::from_entries(vec![
             CpInfo::Empty,
             CpInfo::Utf8("<clinit>".into()),
@@ -2598,11 +2499,8 @@ mod tests {
 
     #[test]
     fn binding_decoder_recognizes_simple_construction() {
-        // Synthetic <clinit>:
-        //   new AudioSlot       (cp idx 8 -> Class -> Utf8 "AudioSlot")
-        //   dup
-        //   getstatic Lang.Eng  (cp idx 6 -> Fieldref)
-        //   invokespecial AS.<init>(LLanguageEnum;)V  (cp idx 12)
+        // Synthetic <clinit>: new AudioSlot (cp 8); dup; getstatic Lang.Eng (cp
+        // 6); invokespecial AS.<init>(LLanguageEnum;)V (cp 12).
         let code: Vec<u8> = vec![
             NEW,
             0,
@@ -2640,12 +2538,8 @@ mod tests {
 
     #[test]
     fn binding_decoder_handles_iconst_and_bipush() {
-        // <clinit> with an int push before the construction:
-        //   iconst_1
-        //   new AudioSlot; dup; getstatic Lang.Eng; invokespecial AS.<init>(LLanguageEnum;)V
-        //   pop  (drops the constructed object)
-        //   bipush 42
-        //   pop
+        // <clinit>: iconst_1; new AudioSlot; dup; getstatic Lang.Eng;
+        // invokespecial AS.<init>(LLanguageEnum;)V; pop; bipush 42; pop.
         let code: Vec<u8> = vec![
             ICONST_1,
             NEW,
@@ -2679,13 +2573,9 @@ mod tests {
 
     #[test]
     fn binding_decoder_dup_duplicates_top_of_stack() {
-        // JVMS §3.11.7 `dup` (0x59): duplicate the top stack value. Checked
-        // directly on `decoder.stack` (not via emitted Constructions, which
-        // a single `new X; dup; invokespecial` sequence can satisfy either
-        // way — the leftover copy `dup` is responsible for only matters
-        // once something ELSE consumes it afterward). `new AudioSlot; dup`
-        // with no invokespecial must leave exactly two NewObj("AudioSlot")
-        // entries.
+        // JVMS §3.11.7 `dup` (0x59): duplicate top stack value, checked directly
+        // on `decoder.stack`. `new AudioSlot; dup` with no invokespecial must
+        // leave exactly two NewObj entries.
         let pool = build_simple_pool();
         let master = lang_enum_master();
         let code: Vec<u8> = vec![NEW, 0, 8, 0x59 /* dup */];
@@ -2732,12 +2622,9 @@ mod tests {
 
     #[test]
     fn binding_decoder_invokevirtual_pops_receiver_plus_args() {
-        // JVMS §6.5 `invokevirtual`/`invokeinterface` pop the receiver
-        // PLUS the descriptor's args (`extra = 1` for opcodes 0xB6/0xB9);
-        // `invokestatic` (0xB8) pops ONLY the args (no receiver). Each
-        // case below pushes exactly `to_pop` placeholder ints and checks
-        // the stack is fully drained — a wrong `extra`/`arg_count+extra`
-        // computation leaves a wrong number of leftovers.
+        // JVMS §6.5: invokevirtual/invokeinterface pop receiver PLUS args
+        // (`extra = 1` for 0xB6/0xB9); invokestatic (0xB8) pops ONLY args. Each
+        // case pushes exactly `to_pop` placeholders and checks full drain.
         let master = lang_enum_master();
         let run_stack_len = |opcode: u8, descriptor: &str, n_pushes: usize| -> usize {
             let pool = call_ref_pool(descriptor);
@@ -2783,10 +2670,9 @@ mod tests {
             0,
             "invokestatic must pop exactly the arg count, no receiver"
         );
-        // invokestatic with a leftover value UNDER the args: only the args
-        // are popped, the leftover survives. Distinguishes a `>` mutant at
-        // the `len < to_pop` guard (which would incorrectly `clear()` the
-        // whole stack here instead of leaving the leftover).
+        // invokestatic with a leftover value UNDER the args: only the args pop,
+        // the leftover survives. Distinguishes a `>` mutant at the `len < to_pop`
+        // guard (which would wrongly `clear()` the whole stack).
         assert_eq!(
             run_stack_len(0xB8, "(I)V", 2), // 1 leftover + 1 real arg pushed
             1,
@@ -2796,11 +2682,9 @@ mod tests {
 
     #[test]
     fn binding_decoder_invoke_family_defensively_clears_on_stack_underflow() {
-        // If the symbolic stack has FEWER entries than the call needs to
-        // pop (malformed/adversarial bytecode, or earlier drift), the
-        // decoder must defensively clear rather than underflow-subtract
-        // (`len - to_pop` with `len < to_pop` would panic on the `usize`
-        // subtraction).
+        // If the symbolic stack has FEWER entries than the call needs to pop
+        // (malformed bytecode or earlier drift), the decoder must defensively
+        // clear rather than underflow-subtract (`len - to_pop` would panic).
         let pool = call_ref_pool("(II)V"); // needs to_pop = 2
         let code: Vec<u8> = vec![ICONST_0, 0xB8, 0, 6]; // only 1 value on stack
         let master = lang_enum_master();
@@ -2844,13 +2728,9 @@ mod tests {
 
     #[test]
     fn binding_decoder_int_push_opcodes_produce_the_right_value() {
-        // JVMS §3.11.3: iconst_<i> pushes exactly i (i in -1..=5); bipush
-        // sign-extends its i8 operand; sipush sign-extends its i16 operand;
-        // ldc of a CONSTANT_Integer pushes that constant. Each is checked
-        // as the sole arg of `new AudioSlot; dup; <push>; invokespecial
-        // AudioSlot.<init>(I)V` so a wrong (or absent, if the opcode's match
-        // arm were deleted) push shows up as a wrong (or missing/Unknown)
-        // arg value, not just "some construction happened".
+        // JVMS §3.11.3: iconst_<i> pushes exactly i; bipush/sipush sign-extend
+        // their operand; ldc of a CONSTANT_Integer pushes that constant. Each is
+        // checked as the sole ctor arg so a wrong/missing push arm is visible.
         let cases: Vec<(&str, Vec<u8>, i32)> = vec![
             ("iconst_m1", vec![ICONST_M1], -1),
             ("iconst_0", vec![ICONST_0], 0),
@@ -3211,19 +3091,9 @@ mod tests {
         assert_eq!(set.len(), 1);
     }
 
-    // ── Real-disc fixtures: Universal (studio="uni") ─────────────────────────
-    //
-    // Captured from a real Universal Blu-ray release's `/BDMV/JAR/00000.jar`
-    // (`com/bydeluxe/…`).
-    // These are verbatim, unmodified `.class` files — the format we READ, never
-    // execute — exercising the full Phase A→D pipeline against real obfuscated
-    // Deluxe bytecode rather than synthetic fixtures.
-    //
-    //   pd.class = Language enum (65 values: English, French, Spanish, Dutch …)
-    //   lp.class = Purpose enum  (Normal, Commentary, PiP, Trivia, Descriptive, Score)
-    //   tl.class = binding class: audio `np.<init>(I,Lpd;,Llp;,LCodingType;)`,
-    //              subtitle `wb.<init>(I,Lpd;,Llp;,Lmi;)`, and a title-wrapper
-    //              `oq.<init>(…,[Lnp;,[Lwb;,[Loq;,[J)` that must NOT leak a label.
+    // ── Real-disc fixtures: Universal (studio="uni") — verbatim `.class` files from
+    // a real `/BDMV/JAR/00000.jar`, exercising Phase A→D against real obfuscated
+    // bytecode: pd=Language enum, lp=Purpose enum, tl=binding class (np/wb/oq).
     const UNI_PD_CLASS: &[u8] = include_bytes!("testdata/deluxe_uni/pd.class");
     const UNI_LP_CLASS: &[u8] = include_bytes!("testdata/deluxe_uni/lp.class");
     const UNI_TL_CLASS: &[u8] = include_bytes!("testdata/deluxe_uni/tl.class");

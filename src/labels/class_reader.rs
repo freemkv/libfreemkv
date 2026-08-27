@@ -10,10 +10,9 @@
 //! for any label parser that needs structured access to .class files
 //! inside a `/BDMV/JAR/<x>.jar`.
 
-// Foundation module — public API is staged for `labels::deluxe` (which
-// will exercise the bytecode walker) and `labels::dbp`'s refactor onto
-// the constant-pool iterator. The dead-code allow comes off as those
-// callers land. Tests below cover the API in isolation.
+// Foundation module — public API is staged for `labels::deluxe` (bytecode
+// walker) and `labels::dbp`'s refactor onto the constant-pool iterator.
+// The dead-code allow comes off once those callers land.
 #![allow(dead_code)]
 
 const CLASS_MAGIC: u32 = 0xCAFEBABE;
@@ -32,10 +31,9 @@ pub enum Error {
     BadInstruction { pc: usize, opcode: u8 },
 }
 
-// No Display/std::error::Error impl: this is a crate-internal, typed error
-// used only for `match`/`?` within the label parsers (callers discard it via
-// `let Ok(_) = ... else continue`). Per the library's zero-English rule there
-// is no user-facing text; the variant fields carry the structured detail.
+// No Display/std::error::Error impl: crate-internal typed error for `match`/`?`
+// within label parsers. Per the zero-English rule there is no user-facing
+// text; variant fields carry the structured detail.
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -155,7 +153,8 @@ impl ConstantPool {
     }
 
     /// For `ldc` / `ldc_w` operands: resolve a constant-pool index to a
-    /// best-effort string. Supports Utf8, String, Integer, Class.
+    /// best-effort string. Supports Utf8, String, Integer, Float, Long,
+    /// Double, and Class.
     pub fn load_constant_display(&self, index: u16) -> Option<String> {
         Some(match self.get(index)? {
             CpInfo::Utf8(s) => format!("utf8:{:?}", s),
@@ -588,7 +587,7 @@ impl Instruction<'_> {
     /// ldc_w, ldc2_w, new, getstatic, putstatic, getfield, putfield,
     /// invokevirtual, invokespecial, invokestatic, invokeinterface,
     /// invokedynamic, checkcast, instanceof, anewarray, multianewarray,
-    /// ldc with cp index in operands[0] — return the index. Returns
+    /// ldc with cp index in `operands[0]` — return the index. Returns
     /// None for opcodes whose operand is not a CP index.
     pub fn cp_index(&self) -> Option<u16> {
         match self.opcode {
@@ -657,10 +656,9 @@ fn instruction_size(code: &[u8], pc: usize) -> Option<usize> {
             if high < low {
                 return None;
             }
-            // `high - low + 1` can overflow i32 for adversarial bytecode
-            // (e.g. low=i32::MIN/high=0, or low=0/high=i32::MAX), so widen
-            // to i64 before adding. The product and final sum are saturating
-            // so they cannot overflow usize on a 32-bit target either.
+            // `high - low + 1` can overflow i32 for adversarial bytecode, so widen
+            // to i64 before adding; the product/sum below saturate so they can't
+            // overflow usize on a 32-bit target either.
             let entries = (high as i64 - low as i64 + 1) as u64;
             let table_bytes = entries.saturating_mul(4);
             let base = (padded_start - pc + 12) as u64;
@@ -989,14 +987,9 @@ impl<'a> Reader<'a> {
     }
 
     fn slice(&mut self, n: usize, needed: &'static str) -> Result<&'a [u8]> {
-        // `n` is attacker-supplied: it comes from a JVMS `u4` attribute_length
-        // / code_length (§4.7, §4.7.3) or a `u2` Utf8 length (§4.4.7). Unlike
-        // the fixed-width readers above, whose `self.pos + k` cannot leave the
-        // buffer's own address range, `self.pos + n` can wrap — on a 32-bit
-        // target a `u4` length near 0xFFFF_FFFF plus a non-zero `pos` panics
-        // in debug and in release wraps to a SMALL end offset that passes the
-        // bounds check, after which the slice index itself panics. Checked, so
-        // an out-of-range length is the EOF error it always should have been.
+        // `n` is attacker-supplied (a JVMS u4/u2 length), so unlike the fixed-width
+        // readers above, `self.pos + n` can wrap on a 32-bit target and pass a naive
+        // bounds check. checked_add turns an out-of-range length into an EOF error.
         let Some(end) = self.pos.checked_add(n) else {
             return Err(Error::UnexpectedEof { needed });
         };
@@ -1130,10 +1123,9 @@ mod tests {
 
     #[test]
     fn instruction_size_tableswitch_overflow_does_not_panic() {
-        // Adversarial low/high spanning the full i32 range. `high - low + 1`
-        // overflows i32; the widened i64 count then saturates the byte
-        // products. Must return a value (possibly None on a 32-bit usize)
-        // without panicking.
+        // Adversarial low/high spanning the full i32 range overflows `high - low + 1`
+        // in i32; the widened i64 count then saturates the byte products. Must
+        // return a value (possibly None on a 32-bit usize) without panicking.
         for (low, high) in [
             (i32::MIN, 0i32),
             (0i32, i32::MAX),
@@ -1225,14 +1217,9 @@ mod tests {
         assert_eq!(i.cp_index(), None);
     }
 
-    // ── Robustness smoke tests ──────────────────────────────────────────────
-    //
-    // ClassFile::parse must NEVER panic on adversarial input, only
-    // return Err. These tests feed a battery of malformed byte
-    // sequences and assert Err results — they're the lightweight
-    // alternative to a full cargo-fuzz target (which would need
-    // nightly + separate crate). If we adopt cargo-fuzz later, these
-    // tests stay as deterministic regression cases.
+    // ── Robustness smoke tests ── ClassFile::parse must NEVER panic on
+    // adversarial input, only return Err. Lightweight alternative to a full
+    // cargo-fuzz target; stays useful as deterministic regression cases.
 
     /// Tiny pseudo-random byte generator — deterministic + reproducible
     /// without needing a `rand` dep. xorshift64*; good enough for
@@ -1306,10 +1293,9 @@ mod tests {
 
     #[test]
     fn parse_does_not_panic_on_random_bytes() {
-        // 200 deterministic-pseudo-random byte buffers of varying
-        // lengths. The contract: never panic, only return Err (or in
-        // the vanishingly unlikely case of a coincidentally-valid
-        // buffer, Ok — we don't assert one or the other).
+        // 200 deterministic pseudo-random buffers of varying lengths.
+        // Contract: never panic, only return Err (or Ok in the vanishingly
+        // unlikely coincidentally-valid case — we don't assert which).
         let mut state: u64 = 0xDEADBEEF_DEADBEEF;
         for _ in 0..200 {
             let len = (xorshift(&mut state) % 256) as usize;
@@ -1325,10 +1311,9 @@ mod tests {
 
     #[test]
     fn parse_does_not_panic_on_valid_magic_random_tail() {
-        // 100 buffers that start with the magic + plausible
-        // minor/major but have garbage afterwards. These are the
-        // most adversarial — they pass the magic check and then
-        // exercise every other parser path.
+        // 100 buffers with valid magic + plausible minor/major but garbage
+        // afterwards — the most adversarial, passing the magic check then
+        // exercising every other parser path.
         let mut state: u64 = 0xCAFEBABE_DEADBEEF;
         for _ in 0..100 {
             let mut buf = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34];
@@ -1389,14 +1374,9 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
-    // ConstantPool / ClassFile accessor correctness
-    //
-    // These exercise plain data accessors on an already-parsed pool
-    // (built via the test-only `from_entries` constructor) — not the
-    // untrusted-bytes parsing path, just "does the right variant map to
-    // the right Option value."
-    // -----------------------------------------------------------------
+    // ConstantPool / ClassFile accessor correctness: exercise data accessors
+    // on an already-parsed pool (test-only `from_entries` ctor), checking each
+    // variant maps to the right Option value.
 
     fn sample_pool() -> ConstantPool {
         // index: 0=Empty (reserved), 1=Utf8("Hello"), 2=Integer(42),
@@ -1547,14 +1527,9 @@ mod tests {
         assert_ne!(cf.member_descriptor(&m), Some("doStuff"));
     }
 
-    // -----------------------------------------------------------------
-    // Reader::u16/u32/u64 boundary + value correctness
-    //
-    // Mirrors `slice_boundary_is_inclusive_of_the_final_byte`: an
-    // exact-fit read must succeed, one byte short must fail. Plus
-    // positive-value tests so a scrambled byte assembly (not just an
-    // out-of-bounds read) would be caught.
-    // -----------------------------------------------------------------
+    // Reader::u16/u32/u64 boundary + value correctness: an exact-fit read
+    // succeeds, one byte short fails, plus positive-value tests so a
+    // scrambled byte assembly (not just OOB) is caught.
 
     #[test]
     fn u16_boundary_is_inclusive_of_the_final_byte() {
@@ -1656,10 +1631,9 @@ mod tests {
 
     #[test]
     fn constant_pool_long_entry_occupies_two_slots_via_real_parse() {
-        // Real class-file bytes (not the `from_entries` synthetic ctor):
-        // magic + minor/major + cp_count=4 + tag=5 (Long, 8-byte payload
-        // at index 1, reserved slot at index 2) + tag=1 (Utf8 at index 3)
-        // + empty access_flags/this/super/interfaces/fields/methods/attrs.
+        // Real class-file bytes (not the from_entries ctor): magic, minor/major,
+        // cp_count=4, tag=5 (Long, payload at index 1, reserved slot 2),
+        // tag=1 (Utf8 at index 3), then empty header tail sections.
         let mut buf = vec![
             0xCA, 0xFE, 0xBA, 0xBE, // magic
             0x00, 0x00, // minor
@@ -1691,12 +1665,9 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // instruction_size: tableswitch/lookupswitch with non-degenerate
-    // low/high/npairs (the existing tests only cover low==high==0 and
-    // npairs==0, which can't distinguish `-` from `+` in the entry-count
-    // arithmetic).
-    // -----------------------------------------------------------------
+    // low/high/npairs — existing tests only cover the all-zero case, which
+    // can't distinguish `-` from `+` in the entry-count arithmetic.
 
     #[test]
     fn instruction_size_tableswitch_non_degenerate_range() {

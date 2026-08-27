@@ -261,13 +261,9 @@ impl EsWriter for AnnexBWriter {
             }
             self.wrote_params = true;
         }
-        // Reframe via the canonical length-prefixed→Annex-B converter (single
-        // source of truth across all muxers — see `crate::mux::hevc`). It skips
-        // zero-length NALs and drops a truncated trailing NAL without panicking,
-        // rather than `break`ing on the first zero-length NAL.
-        // Reuse the writer's buffer rather than allocating per frame; clear()
-        // keeps the capacity, so steady state costs no allocation at all. The
-        // prefix width still comes from the record, never a hardcoded 4.
+        // Reframe via the canonical length-prefixed->Annex-B converter (see
+        // `crate::mux::hevc`), which skips zero-length NALs and drops a truncated
+        // trailing NAL without panicking. Reuse `self.scratch` to avoid per-frame allocation.
         self.scratch.clear();
         self.scratch.reserve(f.data.len() + (f.data.len() / 32) + 4);
         let mut scratch = std::mem::take(&mut self.scratch);
@@ -291,10 +287,9 @@ fn annexb_param_sets(codec: Codec, record: &[u8]) -> Vec<u8> {
         _ => return Vec::new(),
     };
     converted.unwrap_or_else(|| {
-        // A malformed hvcC/avcC record yields no parameter sets. Returning empty
-        // means keyframes ship WITHOUT in-band SPS/PPS — playable from the first
-        // keyframe but broken for seek-to-arbitrary-point and hardware decoders.
-        // Surface it rather than silently degrading the output.
+        // A malformed hvcC/avcC record yields no parameter sets, so keyframes ship
+        // without in-band SPS/PPS (breaks seek and hardware decoders); warn rather
+        // than silently degrading.
         tracing::warn!(
             target: "mux",
             ?codec,
@@ -316,9 +311,8 @@ fn annexb_param_sets(codec: Codec, record: &[u8]) -> Vec<u8> {
 struct PgsSupWriter;
 
 // ── PGS / HDMV segment framing constants ─────────────────────────────────────
-// HDMV Presentation Graphics Stream, as published in the Blu-ray Disc
-// Read-Only Format (BD-ROM) Part 3 graphics-stream specification (and the
-// public US 2009/0185789 A1 application that documents the segment layout).
+// HDMV Presentation Graphics Stream, per BD-ROM Part 3 graphics-stream spec
+// (and public US 2009/0185789 A1, which documents the segment layout).
 
 /// `.sup` per-segment magic: ASCII "PG" (0x50 0x47) starting each segment's
 /// 13-byte header (magic | PTS u32 BE | DTS u32 BE) in a PGStream `.sup` file.
@@ -385,7 +379,7 @@ impl PgsSupWriter {
     /// the segment well-formed.
     ///
     /// Returned bytes are concatenated `type(1)+size(2 BE)+payload` segments,
-    /// the same shape [`emit_segments`] consumes.
+    /// the same shape [`Self::emit_segments`] consumes.
     fn synthetic_clear_display_set(width: u16, height: u16) -> Vec<u8> {
         // Empty PCS payload (HDMV PGS, BD-ROM Part 3): width(2) height(2)
         // frame_rate(1) composition_number(2) composition_state(1)
@@ -435,10 +429,8 @@ impl EsWriter for PgsSupWriter {
     fn write_frame(&mut self, w: &mut dyn Write, f: &PesFrame, pts_ns: i64) -> io::Result<usize> {
         let pts90 = ns_to_90k(pts_ns);
         let mut written = Self::emit_segments(&f.data, pts90, pts90, w)?;
-        // The parser folds the display/clear PCS pair's wipe time into
-        // `duration_ns` and drops the clear bytes. Re-emit a synthetic clear
-        // display set at `pts + duration` so the subtitle is timed out instead
-        // of lingering to EOF.
+        // The parser folds the wipe time into `duration_ns` and drops the clear
+        // bytes; re-emit a synthetic clear at `pts + duration` so it times out.
         if let Some(dur) = f.duration_ns {
             let clear_pts = ns_to_90k(pts_ns.saturating_add(dur as i64));
             let (w_px, h_px) = Self::pcs_dimensions(&f.data);
@@ -728,19 +720,14 @@ impl DemuxSink {
                     (TrackKind::Subtitle, s.codec, s.pid, s.language.clone())
                 }
             };
-            // Record the primary-video reference BEFORE the kind filter: the video
-            // track drives multi-clip PTS-continuity rebasing and the audio DELAY
-            // tag even for `audio://` / `sub://` outputs, where its frames flow
-            // through write() but are not persisted to disk.
+            // Before the kind filter: the video track drives multi-clip PTS-continuity
+            // rebasing and the audio DELAY tag even on `audio://`/`sub://` outputs.
             if kind == TrackKind::Video && ref_video_track.is_none() {
                 ref_video_track = Some(idx);
             }
-            // Also BEFORE the kind filter, and for the same reason: the seam
-            // crossing rule differs for a track that carries B-frame reorder,
-            // and a video track still flows through write() on an `audio://`
-            // or `sub://` export even though nothing persists it. Reading the
-            // kind back out of the filtered slot would call it non-video and
-            // hand it the permissive rule.
+            // Also before the kind filter: the seam-crossing rule differs for a
+            // B-frame-reorder track; reading kind from the filtered slot would
+            // misclassify a video track on an `audio://`/`sub://` export.
             if kind == TrackKind::Video {
                 video_tracks.insert(idx);
             }
@@ -812,12 +799,9 @@ impl DemuxSink {
         if self.opts.delay_mode == DelayMode::None {
             return Ok(());
         }
-        // No video reference (audio-only title, or the reference track never
-        // produced a frame) → there is nothing to measure a delay against.
-        // OMIT the delay entirely rather than fall back to a reference of zero:
-        // a filename claiming `DELAY 600ms` when the real offset is unknown is a
-        // silently wrong number that downstream muxers will act on, while a
-        // missing tag is simply "no delay information", which is the truth.
+        // No reference PTS: omit the delay rather than default to zero. A filename
+        // claiming `DELAY 600ms` when the offset is unknown is silently wrong; a
+        // missing tag correctly says "no delay information".
         let Some(ref_pts) = self.ref_first_pts_ns else {
             tracing::warn!(
                 target: "mux",
@@ -902,18 +886,13 @@ impl Stream for DemuxSink {
     }
 
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
-        // The PRIMARY VIDEO track (`ref_video_track`, the first DiscStream::Video)
-        // drives epoch decisions; every other track is a passive rider on the same
-        // global offset — see `TimelineContinuity`. Drive epochs off the same
-        // dynamically-resolved video reference used for the audio-delay
-        // computation, NOT the literal stream index 0 — an M2TS/PMT title can list
-        // an audio ES before the video ES, in which case track 0 is audio and a
-        // non-video epoch driver would ratchet the frontier on sparse/lagging PTS.
+        // Use the dynamically-resolved video reference, not literal stream index 0:
+        // an M2TS/PMT title can list audio before video, so a non-video epoch
+        // driver would ratchet the frontier on sparse/lagging PTS.
         let drives = Some(frame.track) == self.ref_video_track;
-        // Keyed on the track KIND, not on driving epochs: a second video track
-        // (a Dolby Vision enhancement layer) does not drive epochs but does
-        // carry B-frame reorder, and the seam-crossing rule differs on exactly
-        // that property.
+        // Keyed on track kind, not on driving epochs: a Dolby Vision enhancement
+        // layer doesn't drive epochs but carries B-frame reorder, which is what
+        // the seam-crossing rule keys on.
         let is_video = self.video_tracks.contains(&frame.track);
         // See `MkvMuxer::write_frame`: `None` is material outside the
         // playlist's clip marks and is dropped rather than emitted.
@@ -945,17 +924,12 @@ impl Stream for DemuxSink {
             return Ok(());
         }
         self.finished = true;
-        // Same reporting as the MKV muxer's finish. Frames the playlist's clip
-        // marks exclude are dropped on purpose, but the count must not be
-        // write-only in one sink and reported in the other — an unexpected
-        // volume here is how a demux ends up quietly short.
+        // Same reporting as the MKV muxer's finish: an unexpected drop volume is
+        // how a demux quietly comes up short, so surface it here too.
         let seam_dropped = self.timeline.dropped_total();
-        // Frames ARRIVED and every one was dropped. That is a fully-dropped
-        // title, which this sink used to finish cleanly: a directory of
-        // zero-byte track files beside a populated chapters document, at exit
-        // 0. Keyed on frames having been offered, because a sink that is never
-        // given any — a chapters-only export, or a track class the title does
-        // not carry — legitimately writes none.
+        // Frames arrived and all were dropped: previously finished cleanly as
+        // zero-byte track files. Keyed on frames-offered so a legitimately empty
+        // sink (chapters-only export, absent track class) still writes none.
         if self.frames_mapped == 0 && seam_dropped > 0 {
             return Err(crate::error::Error::SinkWroteNothing.into());
         }
@@ -999,12 +973,8 @@ mod tests {
     };
 
     // ── The language component is disc bytes ──────────────────────────────
-    //
-    // `opts.base` was sanitised and the language beside it was not, though a
-    // language code is three raw STN bytes run through `from_utf8_lossy` with
-    // no validation. `00 00 00` is the ordinary "undefined" encoding on real
-    // Blu-rays, and a NUL in a path fails `File::create` with `InvalidInput` —
-    // which aborted the whole export before a single track file was opened.
+    // Language is three raw STN bytes via `from_utf8_lossy`, unsanitised. `00 00 00`
+    // (real Blu-ray "undefined") put a NUL in the path, failing `File::create`.
 
     /// The stem stays one usable filename component whatever the disc says.
     #[test]
@@ -1214,13 +1184,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── Annex-B reframing ────────────────────────────────────────────────────
-    //
-    // The length-prefixed → Annex-B conversion and the hvcC/avcC param-set
-    // extraction are exercised canonically in `crate::mux::hevc`; the sink
-    // delegates to those helpers. Here we only assert the sink-level wiring:
-    // param-set prepend and (crucially) that a zero-length NAL mid-frame no
-    // longer truncates the rest of the access unit.
+    // ── Annex-B reframing: covered in `crate::mux::hevc`; here we only assert
+    // sink-level wiring — param-set prepend and that a zero-length NAL mid-frame
+    // no longer truncates the rest of the AU.
 
     #[test]
     fn zero_length_nal_midframe_does_not_truncate_access_unit() {
@@ -1590,11 +1556,9 @@ mod tests {
         assert!(plain.contains("<ChapterString>Opening Credits</ChapterString>"));
     }
 
-    // ── Timeline continuity ──────────────────────────────────────────────────
-    //
-    // The corrector itself is tested verbatim in `crate::mux::timeline`. Here we
-    // only confirm the sink drives it with the right `drives_epoch`: track 0 is
-    // the epoch driver, every other track is a passive rider on the same offset.
+    // ── Timeline continuity: the corrector itself is tested in `crate::mux::timeline`.
+    // Here we only confirm the sink drives it with the right `drives_epoch`: track 0
+    // is the epoch driver, every other track rides the same offset.
 
     #[test]
     fn timeline_track0_drives_epoch_others_ride() {

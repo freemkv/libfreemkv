@@ -245,11 +245,8 @@ impl AuAssembler {
                 dts,
                 source,
             });
-            // Backstop: the `buf`-size cap prunes marks only when bytes accumulate.
-            // A run of zero-length (or start-code-free) timed fragments grows no
-            // bytes, so bound the deque directly — drop the oldest (stalest) mark,
-            // which belongs to an already-emitted or lost AU. A real AU spans far
-            // fewer fragments than this cap.
+            // Backstop: zero-length/start-code-free fragments grow no bytes, so the
+            // `buf`-size cap never prunes marks. Bound the deque directly instead.
             if self.marks.len() > MAX_MARKS {
                 self.marks.pop_front();
             }
@@ -318,12 +315,9 @@ impl AuAssembler {
             }
             let end_abs = self.base + end as u64;
 
-            // The AU's own timing/source: take the FIRST Some of each field
-            // across every mark in this AU's range [base, end_abs), independently
-            // — one PES fragment may carry the source while a later fragment of
-            // the same AU carries the PTS (and vice versa), so reading only the
-            // front mark would drop the other field. This restores the semantics
-            // of the pre-consolidation separate pts/source mark deques.
+            // Take the first Some of each field independently across marks in
+            // [base, end_abs): one fragment may carry source while another carries
+            // PTS, so reading only the front mark would drop a field.
             let (mut pts, mut dts, mut source) = (None, None, None);
             while self.marks.front().is_some_and(|m| m.off < end_abs) {
                 let m = self.marks.pop_front().unwrap();
@@ -399,10 +393,8 @@ impl AuAssembler {
             }
             let data = self.buf[..end].to_vec();
             self.buf.drain(..end);
-            // Shrink toward what this AU actually needed (the tail plus room for
-            // another AU of about this size). Only the short tail is copied, and it
-            // brings `cap` back under the `2*end` threshold so the next AU of this
-            // size hands over instead of copying.
+            // Shrink toward this AU's actual need so `cap` drops under the `2*end`
+            // threshold and the next similarly-sized AU hands over instead of copying.
             self.buf.shrink_to(end.max(tail_len));
             return data;
         }
@@ -447,10 +439,9 @@ impl AuAssembler {
     fn au_boundary_resumable(&mut self) -> Option<usize> {
         match self.mode {
             Mode::StartCode(marker) => {
-                // Stateless: the AU ends at the next delimiter after the opener at
-                // buf[0]. Resume from the furthest searched offset (never before 4,
-                // to skip the opening delimiter). find_start_code needs 4 bytes, so
-                // back up 3 to catch a code straddling the previous buffer end.
+                // Resume from the furthest searched offset (never before 4, to skip the
+                // opening delimiter at buf[0]); find_start_code needs 4 bytes, so back
+                // up 3 to catch a code straddling the previous buffer end.
                 let from = self.scan_pos.max(4);
                 match find_start_code(&self.buf, from, marker) {
                     Some(e) => Some(e),
@@ -683,10 +674,8 @@ mod tests {
 
     #[test]
     fn au_merges_pts_and_source_from_different_fragments() {
-        // One fragment of an AU may carry the source stamp while a later fragment
-        // of the SAME AU carries the PTS (each PES gets a source; only the anchor
-        // gets a PTS). The AU must keep BOTH — reading only the front mark would
-        // drop whichever field the first fragment lacked.
+        // One fragment may carry the source stamp while a later fragment of the same
+        // AU carries the PTS; the AU must keep both, not just the front mark's field.
         let src = crate::pes::SourcePos::at_byte(4242);
         let mut a = AuAssembler::for_codec(Codec::H264);
         let full = au(0xAB, 80);
@@ -745,10 +734,8 @@ mod tests {
 
     #[test]
     fn vc1_i_frame_keeps_its_preceding_seq_and_entry_headers() {
-        // An I-frame AU is [seq 0x0F][entry 0x0E][frame 0x0D][slices]; a following
-        // P-frame is just [frame 0x0D][slices]. A plain 0x0D split would strand the
-        // seq/entry headers on the P-frame's AU — the decode bug. The VC-1 mode must
-        // group them with the I-frame that follows them.
+        // A plain 0x0D split would strand the seq/entry headers on the following
+        // P-frame's AU (a decode bug); VC-1 mode must group them with the I-frame.
         let mut a = AuAssembler::for_codec(Codec::Vc1);
         let mut iframe = bdu(VC1_SEQ, 0xAA, 8);
         iframe.extend(bdu(VC1_ENTRY, 0xBB, 6));
@@ -875,11 +862,8 @@ mod tests {
 
     #[test]
     fn resumable_boundary_matches_from_scratch_across_all_fragmentations() {
-        // The incremental scan_pos cursor must produce byte-identical AUs to a
-        // whole-buffer rescan, at EVERY fragment granularity (this is what makes
-        // the O(n) resume equivalent to the old O(n^2) from-scratch scan). Build a
-        // multi-AU stream per codec, reassemble it fed 1 byte at a time up to
-        // whole, and require one canonical result.
+        // The incremental scan_pos cursor must match a whole-buffer rescan at every
+        // fragment granularity, from 1 byte at a time up to whole (O(n) vs O(n^2)).
         let h264 = {
             let mut s = au(0x11, 40); // AU1 (AUD + payload)
             s.extend(au(0x22, 70)); // AU2
@@ -971,11 +955,9 @@ mod tests {
             "an ordinary AU at the head of a clean run is continuous"
         );
 
-        // Now start-code-free junk past the cap. The FIRST over-cap run still
-        // has the next AU's delimiter at buf[0], so it is force-flushed as an
-        // (over-long) access unit — nothing is discarded and nothing is lost.
-        // Only once the buffer holds no opener at all does the backstop throw
-        // bytes away, which is the case this test is about.
+        // The first over-cap run still has a delimiter at buf[0], so it force-flushes
+        // as an over-long AU with nothing lost. Only once no opener remains does the
+        // backstop discard bytes, which is what this test covers.
         let junk = vec![0xAB; MAX_AU_BUFFER + 4096];
         a.push(&junk, Some(2000), None, None, false);
         a.push(&junk, Some(2100), None, None, false);
@@ -1118,10 +1100,8 @@ mod tests {
             before,
             "the emitted AU must own the buffer's allocation (no whole-frame copy)"
         );
-        // The replacement buffer keeps room for another AU of about this size, so
-        // the next AU does not re-grow — but it is NOT pinned to the OLD capacity,
-        // which would make `buf` a permanent high-water mark and send every later
-        // smaller AU down the copy path (see
+        // Must not pin to the old capacity, or `buf` becomes a permanent high-water
+        // mark sending every later smaller AU down the copy path (see
         // `handover_survives_a_large_au_instead_of_copying_every_later_one`).
         assert!(
             a.buf.capacity() >= au1.len(),
@@ -1149,10 +1129,9 @@ mod tests {
     #[test]
     fn handover_survives_a_large_au_instead_of_copying_every_later_one() {
         let mut a = AuAssembler::for_codec(Codec::H264);
-        // Production shape: BD-TS aligns one access unit per PES, so each `push`
-        // carries about one AU and the buffer holds ~one AU at a time. One large AU
-        // (the IDR) followed by a run of much smaller ones (P/B frames). Each AU is
-        // pushed with the NEXT AU's opener so the previous one closes.
+        // BD-TS aligns one AU per PES, so each `push` carries about one AU. One large
+        // AU (IDR) is followed by smaller ones (P/B); each push includes the next
+        // AU's opener so the previous one closes.
         const SMALL: usize = 64 * 1024;
         let mut pending = au(0x11, 2 * 1024 * 1024);
         for i in 0..20u8 {
@@ -1172,12 +1151,8 @@ mod tests {
     }
 
     // ── AU-opener detection: the per-mode start-code rule ─────────────────
-    //
-    // `au_opener_from` is the SECOND implementation of a rule each codec parser
-    // also encodes (h264 `NAL_AUD`, hevc `NAL_AUD`, vc1 `SC_*`, mpeg2
-    // `PICTURE_CODE`/`SEQ_HEADER_CODE`/`GOP_CODE`). Two independent copies of one
-    // rule drift; these cases pin this copy to the normative byte values and to
-    // the codes that are explicitly NOT openers, so a drift shows up here.
+    // `au_opener_from` duplicates a rule each codec parser also encodes; these
+    // cases pin it to the normative byte values so a drift between copies shows up.
 
     /// The opener offset must be the position of the real start code, never a
     /// fixed 0. A constant `Some(0)` makes every pre-sync run of junk bytes look

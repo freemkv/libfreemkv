@@ -98,10 +98,9 @@ impl CodecParser for FlacParser {
             .unwrap_or(self.last_pts_ns);
         self.last_pts_ns = pts_ns;
 
-        // Gate: a packet that begins with a FLAC frame sync but whose whole-frame
-        // CRC-16 residue is nonzero is corrupt → drop. Anything else passes
-        // through (a non-sync packet is not a frame we can validate; a poisoned
-        // track drops everything).
+        // Gate: a packet with a FLAC frame sync but nonzero whole-frame CRC-16
+        // residue is corrupt → drop. Non-sync packets pass through unvalidated;
+        // a poisoned track drops everything.
         let corrupt = has_flac_sync(&pes.data) && crc16_ansi(&pes.data) != 0;
         if self.tally.is_poisoned() || corrupt {
             let reason = if self.tally.is_poisoned() {

@@ -111,11 +111,9 @@ pub(crate) fn resolve(
     mobjs: &[MovieObject],
     is_feature: &dyn Fn(u16) -> bool,
 ) -> Option<u16> {
-    // Enter at First-Play when it is an HDMV object that exists; otherwise
-    // abstain (BD-J boundary, or a `0xffff` "no object"). We deliberately do not
-    // chase the Top-Menu program here — its "Play Movie" target usually lives in
-    // the IG-stream button navigation commands inside the menu `.m2ts`, not in
-    // `MovieObject.bdmv` (future work).
+    // Enter at First-Play when it is an HDMV object that exists; otherwise abstain
+    // (BD-J boundary, or `0xffff` "no object"). We don't chase Top-Menu's "Play
+    // Movie" target here — it lives in menu .m2ts IG button commands (future work).
     let start = match index.first_play {
         PlaybackObj::Hdmv { id_ref } if (id_ref as usize) < mobjs.len() => id_ref as usize,
         _ => return None,
@@ -379,11 +377,9 @@ mod tests {
 
     #[test]
     fn set_to_psr_is_refused() {
-        // A SET MOVE to PSR6 must be a no-op (PSR stores are refused by spec).
-        // Program: MOVE PSR6 <- 5; CMP PSR6 == 5; PlayPL 100 else 200.
-        // With the write refused, PSR6 stays at its power-on 0, so the compare is
-        // false and control skips to PlayPL 200. If the illegal PSR write took
-        // effect, the compare would be true and PlayPL 100 would win.
+        // SET MOVE to PSR6 must be a no-op (PSR stores are refused by spec).
+        // Program: MOVE PSR6<-5; CMP PSR6==5; PlayPL 100 else 200. Refused write
+        // keeps PSR6 at 0 -> PlayPL 200; an illegal write would wrongly pick 100.
         let set_psr6 = cmd((2 << 5) | (2 << 3), 0x40, 0, 0x01, 0x8000_0006, 5);
         let cmp_psr6_eq_5 = cmd((2 << 5) | (1 << 3), 0x40, 0x02, 0, 0x8000_0006, 5);
         let d = build(&[&[set_psr6, cmp_psr6_eq_5, play_pl(100), play_pl(200)]]);
@@ -448,11 +444,9 @@ mod tests {
 
     #[test]
     fn swap_immediate_operand_is_not_written_back() {
-        // Seed GPR[5]=77, then SWAP dst=GPR0 (register) with src=IMMEDIATE 5
-        // (imm_op1=0, imm_op2=1). The imm gate must refuse using the immediate
-        // as a write target, so GPR[5] — the register the literal 5 would alias
-        // — keeps 77; only GPR0 receives the immediate. Dropping either
-        // `if !c.imm_op1` / `if !c.imm_op2` guard makes an assertion fail.
+        // SWAP dst=GPR0 with src=IMMEDIATE 5 (imm_op1=0, imm_op2=1) must refuse
+        // writing to the aliased register: GPR[5] stays 77, only GPR0 gets 5.
+        // Dropping the `imm_op1`/`imm_op2` guard makes this assertion fail.
         let swap_imm = cmd((2 << 5) | (2 << 3), 0x40, 0, 0x02, 0, 5);
         let d = build(&[&[set_move_gpr(5, 77), swap_imm]]);
         let mobjs = mobj::parse(&d).unwrap();

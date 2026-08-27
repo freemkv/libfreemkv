@@ -136,65 +136,43 @@ pub(crate) mod udf;
 pub(crate) mod unlock_bridge;
 
 // ─── Drive lifecycle ────────────────────────────────────────────────────────
-//
-// `Drive::open(path)` → `wait_ready()` → `init()` → `Disc::scan()`. `Drive`
-// owns the SCSI session; `DriveCapture` etc. let advanced callers introspect
-// drive identity / profile data for sharing.
+// `Drive::open(path)` → `wait_ready()` → `init()` → `Disc::scan()`. `Drive` owns
+// the SCSI session; `DriveCapture` etc. expose drive identity/profile data.
 pub use drive::capture::{
     CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string,
 };
 pub use drive::{Drive, DriveStatus, extract_scsi_context, find_drive};
 
 // ─── Disc session (drive open + SCSI bring-up hoist) ─────────────────────────
-//
-// One entry point that opens a drive and brings the transport up, so consumers
-// stop hand-rolling `open → wait_ready → init → probe_disc → identify → scan`.
-// Owns the `Drive` by value; forwards consumer-built key material into
-// `ScanOptions` (the library derives no certs — see `KeySpec`).
+// One entry point opens a drive, brings transport up, and forwards caller-built
+// key material into `ScanOptions` (the library derives no certs; see `KeySpec`).
 pub use session::{
     DeviceTarget, DiscSession, KeySourceFactory, KeySpec, ResolvedKeys, resolve_keys_for, scan_dir,
     scan_iso,
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
-//
-// All fallible APIs return `Result<T, Error>`. `Error` is a typed enum with a
-// numeric `code()`; **no English text in the library** — applications map
-// codes to localized messages. See `error.rs` for the full taxonomy.
+// All fallible APIs return `Result<T, Error>`; `Error` is a typed enum with a
+// numeric `code()` — no English text in the library; see `error.rs` for taxonomy.
 pub use error::{
     Error, Result, error_code, is_disc_level_no_key, is_halt, is_skippable_title_stub,
 };
 
 // ─── Cooperative cancellation ───────────────────────────────────────────────
-//
-// One-bit cooperative cancellation token, shared by every long-running loop —
-// libfreemkv's mux, and the recovery passes (sweep/patch) that now live in the
-// freemkv-engine crate. Clone it cheaply; pass it by value into each component;
-// poll `is_cancelled()` inside the loop body.
+// One-bit cancellation token shared by every long-running loop (mux, and the
+// engine's sweep/patch passes); clone cheaply, poll `is_cancelled()` in loops.
 pub use halt::Halt;
 
-// Generic bounded producer/consumer primitive used by the mux pipeline (and,
-// via this re-export, by the engine's sweep/patch recovery passes) to overlap
-// reads with writes via a dedicated consumer thread.
-// `Pipeline::spawn(name, depth, sink)` spawns a named consumer; `pipe.send(item)`
-// pushes one item with back-pressure; `pipe.finish()` joins the
-// consumer and surfaces its `close()` output. Callers implement `Sink`
-// to define per-item behaviour and end-of-stream finalisation.
-//
-// `DEFAULT_PIPELINE_DEPTH` (=4) is for callers without specific needs;
-// most should use WRITE_PIPELINE_DEPTH instead.
-// Patch uses `WRITE_THROUGH_DEPTH` (=1). Returning `Flow::Stop` from
-// `apply` ends the consumer cleanly (still calls `close()`).
+// Bounded producer/consumer primitive used by mux (and engine's sweep/patch) to
+// overlap reads with writes via a consumer thread. `Sink::apply` defines
+// per-item behavior; `Flow::Stop` ends the consumer cleanly, still calling `close()`.
 pub use io::pipeline::{
     DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, Sink, WRITE_PIPELINE_DEPTH, WRITE_THROUGH_DEPTH,
 };
 
 // ─── Bounded-cache buffered file writer ─────────────────────────────────────
-//
-// Drop-in `std::fs::File` replacement used everywhere the lib writes large
-// sequential output (mux, extract, sweep, patch) — drains dirty pages
-// continuously instead of bursting. General I/O infra, not recovery policy;
-// promoted to `pub` so freemkv-engine's relocated sweep/patch can use it too.
+// Drop-in `std::fs::File` replacement for large sequential output (mux, extract,
+// sweep, patch); drains dirty pages continuously. `pub` for freemkv-engine reuse.
 pub use io::WritebackFile;
 /// Write an image-level source out as a sector image — what an `iso://`
 /// DESTINATION means for any source that is not a physical drive. Drive sources
@@ -207,32 +185,17 @@ pub use event::{BatchSizeReason, Event, EventKind};
 pub use identity::DriveId;
 
 // ─── Unlock seam ────────────────────────────────────────────────────────────
-//
-// Drive/disc unlocking (removing bus encryption — firmware, AACS cert, CSS
-// bus-auth) lives entirely in the `freemkv-unlock` crate. libfreemkv consumes
-// it through the private `unlock_bridge` and exposes nothing of it: clients are
-// oblivious to unlockers, exactly as they are to the SCSI layer. There is no
-// public unlock surface to import.
+// Drive/disc unlocking (firmware, AACS cert, CSS bus-auth) lives entirely in
+// `freemkv-unlock`; libfreemkv consumes it via `unlock_bridge` and exposes nothing.
 
 // ─── Decryption (AACS / CSS) ────────────────────────────────────────────────
-//
-// `Disc::scan()` resolves keys and stores them on `Disc`; in most flows you
-// don't touch `DecryptKeys` directly — `DiscStream::new(reader, title, keys, …)`
-// accepts whatever `Disc::decrypt_keys()` returned. `decrypt_sectors()` is
-// for callers that operate on raw sector buffers (e.g. ISO patching).
+// `Disc::scan()` resolves keys onto `Disc`; `DiscStream::new(...)` consumes
+// them directly. `decrypt_sectors()` is for raw sector buffers (ISO patching).
 pub use decrypt::{AacsKeyMap, DecryptKeys, decrypt_sectors, decrypt_threads, set_decrypt_threads};
 
 // ─── Disc structure ─────────────────────────────────────────────────────────
-//
-// `Disc::scan()` produces a fully-populated `Disc` (titles, streams, AACS
-// state). `Disc::identify()` is the fast path — UDF only, no playlist parse,
-// for displaying disc name + format quickly while a full scan runs in the
-// background. The codec / channel / resolution enums are the canonical
-// structured representation; never compare against display strings.
-// Note: `disc::Stream` here is the codec enum (audio / video / sub kind)
-// — not the `pes::Stream` trait re-exported below as `PesStream`. Two
-// different concepts, the same short name; the trait gets the `Pes`
-// prefix at the crate root to keep both addressable.
+// `Disc::scan()` fully populates `Disc`; `Disc::identify()` is a UDF-only fast path
+// for name/format display. Codec enums are canonical; never compare display strings.
 pub use dirimage::DirImage;
 pub use disc::{
     AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, Disc,
@@ -243,23 +206,8 @@ pub use disc::{
 pub use keysource::{DiscInputs, KeySource, read_encrypted_units, resolve_and_apply};
 
 // ─── Streams ────────────────────────────────────────────────────────────────
-//
-// All stream types implement `pes::Stream` — read PES frames from a source,
-// write PES frames to a sink. Pick the right type at construction:
-//
-// - `DiscStream` — physical drive or ISO (any `SectorSource`). Read-only.
-// - `MkvStream`  — Matroska container. Read on `open()`, write on `create()`.
-// - `M2tsStream` — Blu-ray Transport Stream. Write-only sink (`create()`).
-// - `NetworkStream` — TCP. Read on `listen()`, write on `connect()`.
-// - `NullStream` — write-only black-hole sink. Useful for benchmarks.
-// - `StdioStream` — pipe to/from stdin/stdout. Read or write.
-//
-// Most consumers use the URL resolvers (`input()` / `output()`) which pick
-// the right type from a scheme:// URL. Direct construction is for callers
-// that need to wire custom readers (e.g. autorip's drive-session reuse).
-// The trait is re-exported as `PesStream` here to disambiguate from
-// `disc::Stream` (the codec-kind enum re-exported above), which would
-// otherwise collide at the crate root.
+// All types implement `pes::Stream` (re-exported `PesStream` to avoid colliding
+// with `disc::Stream`). Prefer `input()`/`output()` URL resolvers over direct construction.
 pub use pes::PesFrame;
 pub use pes::Stream as PesStream;
 
@@ -275,13 +223,8 @@ pub use mux::{Medium, SourceInfo};
 pub use mux::{Mp4FitReport, Mp4Sink, Mp4SkipReason, mp4_fit_report};
 
 // ─── Lower-level surfaces ───────────────────────────────────────────────────
-//
-// `ScsiTransport` is the platform-abstraction trait Drive uses; expose for
-// out-of-tree platform backends. `SectorSource` / `SectorSink` are the
-// direction-typed read/write traits; `FileSectorSource` and `FileSectorSink`
-// are the ISO-on-disk implementations. [`DecryptingSectorSource`] is the
-// single decrypt-on-read decorator (AACS / CSS / none) — wrap any
-// `SectorSource` to get plaintext sectors out.
+// `ScsiTransport` is the platform trait Drive uses, exposed for out-of-tree
+// backends. `DecryptingSectorSource` wraps any `SectorSource` to decrypt (AACS/CSS).
 pub use mux::build_iso_pipeline;
 pub use mux::resolve_mux_key_map;
 pub use mux::select::{PidFilter, StreamSelection};

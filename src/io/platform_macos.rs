@@ -3,7 +3,7 @@
 //! The `libc` crate doesn't expose these symbols across all macOS SDK
 //! versions, so we define them locally with values from
 //! `/usr/include/sys/fcntl.h`. Two call sites (
-//! [`crate::io::writeback_file`] and [`crate::io::sink::preallocate`])
+//! [`crate::io::writeback_file`] and `crate::io::sink::preallocate`)
 //! need the same constants and `fstore_t` layout — keeping a single
 //! source of truth here prevents the two copies from drifting.
 //!
@@ -16,8 +16,9 @@ pub(crate) const F_PREALLOCATE: libc::c_int = 42;
 /// Anchor preallocation at the current physical EOF.
 pub(crate) const F_PEOFPOSMODE: libc::c_int = 3;
 
-/// Prefer a contiguous allocation. Try this first; on `EINVAL` (no
-/// contiguous run of that size), fall back to `F_ALLOCATEALL`.
+/// Prefer a contiguous allocation. Call sites OR this together with
+/// `F_ALLOCATEALL` on the first attempt; on failure they fall back to
+/// `F_ALLOCATEALL` alone.
 pub(crate) const F_ALLOCATECONTIG: libc::c_uint = 0x0000_0002;
 
 /// Allow non-contiguous allocation. Stronger guarantee than just

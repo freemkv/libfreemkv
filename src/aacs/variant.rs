@@ -54,11 +54,9 @@ use super::crypto::{aes_ecb_decrypt, aes_g};
 use super::mkb::*;
 use super::types::DeviceKey;
 
-// The MKB record types this chain selects — `REC_MEDIA_KEY_VARIANT_DATA`
-// (`0x0c`, the per-slot C table), `REC_VARIANT_DATA_AND_NONCE` (`0x2d`, VARIANTS
-// + tail Nonce), `REC_VKD_TABLE` (`0x2f`), the subset-difference / cvalue records
-// (`0x04` / `0x05` / `0x07`), and the verify records (`0x81` / `0x86`) — are the
-// canonical set in [`super::mkb`], in scope here via the `use super::mkb::*` glob.
+// MKB record types this chain selects: `REC_MEDIA_KEY_VARIANT_DATA` (`0x0c`),
+// `REC_VARIANT_DATA_AND_NONCE` (`0x2d`), `REC_VKD_TABLE` (`0x2f`), the
+// subset-difference/cvalue and verify records — canonical set in [`super::mkb`].
 
 // ── Public constants ──────────────────────────────────────────────────────
 
@@ -137,10 +135,9 @@ pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
 
 // ── Subset-difference walk that exposes (Kp, uv) ──────────────────────────
 
-// `calc_v_mask` and `calc_pk_from_dk` (and the AES-G3 seed step they ride
-// on) are shared with the classical walk in [`super::derive`] — a single
-// definition keeps the variant SD tree byte-identical to the classical one.
-// (`aesg3` itself is imported separately in the test module.)
+// `calc_v_mask`/`calc_pk_from_dk` (and the AES-G3 seed step) are shared with
+// the classical walk in [`super::derive`], keeping the variant SD tree
+// byte-identical. `aesg3` itself is imported separately in the test module.
 use super::derive::{calc_pk_from_dk, calc_v_mask};
 
 /// Outcome of a subset-difference walk against an MKB. Carries the
@@ -190,10 +187,11 @@ fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
 /// separate on purpose and select MKB records in DELIBERATELY different
 /// order:
 ///
-///   - cvalues: this variant walk tries record `0x07`-then-`0x05`; the
-///     classical walk tries `0x05`-then-`0x07`. On a variant MKB the
-///     small `0x07` Explicit-Subset-Difference record carries the
-///     cvalue the Precursor chain consumes, whereas a classical UHD MKB
+///   - cvalues: this variant walk tries record `0x0c`-then-`0x07`-then-`0x05`
+///     (`0x0c` is the real-disc per-uv cvalue source; `0x07`/`0x05` are
+///     fixture fallbacks); the classical walk tries `0x05`-then-`0x07`. On a
+///     variant MKB the small `0x07` Explicit-Subset-Difference record carries
+///     the cvalue the Precursor chain consumes, whereas a classical UHD MKB
 ///     keeps its 1:1 cvalue table in the large `0x05` record (see the
 ///     note on [`super::derive::probe::mkb_cvalues`]). They must NOT be
 ///     unified to one order — each is correct for its own MKB shape.
@@ -211,10 +209,8 @@ pub fn walk_processing_key(
 ) -> Option<ProcessingKeyMatch> {
     let mk_dv = mkb_find_mk_dv(records)?;
     let uvs = mkb_find_body(records, REC_SUBSET_DIFFERENCE)?;
-    // Variant cvalue source: a real variant MKB carries its per-uv cvalue table
-    // in record `0x0c` (confirmed 46,101×16, one per `0x04` subset-difference
-    // slot). Fall back to `0x07`/`0x05` for the synthetic fixtures and any MKB
-    // shape that keeps its cvalues there.
+    // Real variant MKBs carry per-uv cvalues in record `0x0c` (46,101x16, one
+    // per `0x04` slot); fall back to `0x07`/`0x05` for synthetic fixtures.
     let cvalues = mkb_find_body(records, REC_MEDIA_KEY_VARIANT_DATA)
         .or_else(|| mkb_find_body(records, REC_EXPLICIT_SUBSET_DIFF))
         .or_else(|| mkb_find_body(records, REC_MEDIA_KEY_DATA))?;
@@ -229,17 +225,13 @@ pub fn walk_processing_key(
 
         for uvs_idx in 0..num_uvs {
             let p_uv = &uvs[1 + 5 * uvs_idx..];
-            // `num_uvs` was computed by `take_while(.. (c[0] & 0xC0) == 0)`, so
-            // every chunk in `0..num_uvs` already has its revoked-marker bits
-            // clear — that `take_while` is the single authoritative place the
-            // parse stops, no inner re-check needed.
+            // `num_uvs` came from `take_while(.. (c[0] & 0xC0) == 0)`, so every
+            // chunk in `0..num_uvs` already has clear revoked-marker bits.
             let u_mask_shift = uvs[5 * uvs_idx];
 
-            // 0x20..=0x3F (32..=63) have their revoked-marker bits clear (so they
-            // pass the take_while above) but are out of range for a u32 shift.
-            // `wrapping_shl` would silently compute shift % 32 (e.g. 32 → no shift
-            // → 0xFFFF_FFFF), matching a wrong uv slot and deriving a wrong key.
-            // Disc-controlled byte: skip the slot instead.
+            // 0x20..=0x3F pass the take_while but are out of range for a u32
+            // shift; `wrapping_shl` would silently wrap (shift % 32) and match
+            // a wrong uv slot. Disc-controlled byte: skip the slot instead.
             if u_mask_shift >= 32 {
                 continue;
             }
@@ -281,12 +273,9 @@ pub fn walk_processing_key(
                     }
                     let dec_vd = aes_ecb_decrypt(&km_candidate, &mk_dv);
                     const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
-                    // On a classical (non-variant) MKB this magic must
-                    // match. On a variant MKB it won't — `km_candidate`
-                    // is really Kmp and the magic check is moot. We
-                    // still gate the walk on cvalue indexing being
-                    // sane; the chain itself enforces the variant
-                    // semantics downstream.
+                    // On classical MKBs this magic must match. On variant MKBs
+                    // it won't — `km_candidate` is really Kmp, so the magic
+                    // check is moot; the chain enforces semantics downstream.
                     let classical_ok = dec_vd[..8] == VERIFY_MAGIC;
                     let variant_present = is_variant_mkb(records);
                     if !(classical_ok || variant_present) {
@@ -375,10 +364,9 @@ impl std::error::Error for MediaKeyVariantError {}
 /// silent bad key).
 fn variants_for_uv(records: &[MkbRecord], sd_slot_index: usize) -> Option<u16> {
     let body = variant_data_record(records)?;
-    // The VARIANTS table is the leading bytes; the 16-byte Kvn Nonce is packed at
-    // the TAIL (see [`variant_nonce`]). Bound the read to the table region so a
-    // near-end slot can never read Nonce bytes as a VARIANTS entry. NO leading
-    // header (measured: a v70 `0x2d` body = 46_100*2 + 16 = 92_216).
+    // VARIANTS table is the leading bytes; the 16-byte Kvn Nonce is packed at the
+    // TAIL (see [`variant_nonce`]). Bound reads to the table region so a near-end
+    // slot never reads Nonce bytes (no header: v70 `0x2d` body = 46_100*2+16).
     const NONCE: usize = 16;
     let table_len = body.len().checked_sub(NONCE)?;
     let off = sd_slot_index.checked_mul(2)?;
@@ -532,10 +520,9 @@ pub fn derive_media_key_variant(
     }
     let nonce = variant_nonce(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let vkd_table = variant_key_data(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
-    // C for the Kmp step is the per-subset-difference `0x0c` table (one 16-byte
-    // C per slot) — the SAME source and index `walk_processing_key` uses. `0x2d`
-    // holds VARIANTS + Nonce, NOT C. Fall back to `0x07`/`0x05` for the synthetic
-    // fixtures that keep a single cvalue there.
+    // C for Kmp is the per-slot `0x0c` table, same source/index as
+    // `walk_processing_key` uses; `0x2d` holds VARIANTS + Nonce, not C. Fall
+    // back to `0x07`/`0x05` for synthetic fixtures with a single cvalue.
     let cvalues = mkb_find_body(mkb_records, REC_MEDIA_KEY_VARIANT_DATA)
         .or_else(|| mkb_find_body(mkb_records, REC_EXPLICIT_SUBSET_DIFF))
         .or_else(|| mkb_find_body(mkb_records, REC_MEDIA_KEY_DATA))
@@ -672,11 +659,9 @@ mod tests {
 
     #[test]
     fn calc_pk_from_dk_terminates_on_nonconvergent_mask() {
-        // Regression for the unbounded-loop hang: pick a (dev_key_v_mask,
-        // v_mask) pair the arithmetic `>> 1` walk can never reconcile.
-        // dev_key_v_mask has the MSB set, so `>> 1` sign-extends and the
-        // mask saturates at 0xFFFF_FFFF, never reaching a coarser v_mask.
-        // The 32-step bound must let this return rather than spin forever.
+        // Regression for the unbounded-loop hang: dev_key_v_mask has the MSB
+        // set, so the `>> 1` walk sign-extends and saturates at 0xFFFF_FFFF,
+        // never reaching v_mask. The 32-step bound must still return.
         let dk = [0x11u8; 16];
         let pk = calc_pk_from_dk(&dk, 0x0000_0002, 0x0000_0000, 0xFFFF_FFFE);
         // Bounded exit yields *some* key; we only assert it terminated.
@@ -844,9 +829,8 @@ mod tests {
         mkb.extend_from_slice(&[0x04, 0x00, 0x00, 0x09]);
         mkb.extend_from_slice(&[0x03, 0x00, 0x00, 0x00, 0x02]);
 
-        // Pick a known DK; with dk.uv == MKB.uv (==2) and
-        // dk.u_mask_shift == MKB.u_mask_shift (==3), dev_key_v_mask
-        // equals the MKB's v_mask and the calc_pk_from_dk loop is a
+        // Known DK with dk.uv == MKB.uv (==2) and dk.u_mask_shift == MKB's
+        // (==3): dev_key_v_mask == MKB's v_mask, so calc_pk_from_dk is a
         // no-op — Kp = aesg3(dk, 1).
         let dk_bytes: [u8; 16] = [
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
@@ -862,12 +846,9 @@ mod tests {
         aes_d_result[15] ^= 0x02;
         let c_block = aes_ecb_encrypt(&kp, &aes_d_result);
 
-        // cvalues record (0x07): the per-SD C the chain reads for `Kmp`. This
-        // fixture has no `0x0c`, so both the walk and the chain fall back to
-        // `0x07` — plant the computed `c_block` HERE so `AES-D(Kp, C) XOR uv ==
-        // Kmp` and the chosen `kmp15` bit lands. On a variant MKB the per-match
-        // magic check fails, but `variant_present` is true, so the walk still
-        // returns the match.
+        // cvalues record (0x07): no `0x0c` here, so walk and chain both fall
+        // back to `0x07` — plant `c_block` so AES-D(Kp,C)^uv == Kmp. Magic
+        // check fails on variant MKBs, but `variant_present` lets it match.
         mkb.extend_from_slice(&[0x07, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&c_block);
 
@@ -939,14 +920,9 @@ mod tests {
 
     #[test]
     fn walk_mkb_be24_middle_byte_is_honored() {
-        // A record longer than 255 bytes needs the MIDDLE BE24 byte: total
-        // length 0x00_0110 (272) is `[0x00, 0x01, 0x10]`, so a parser reading
-        // only the low byte sees 0x10. The HIGH byte of this length is zero, so
-        // this test says nothing about the `<< 16` term — that is pinned
-        // separately by `mkb::tests::mkb_records_honors_the_high_byte_of_the_be24_length`,
-        // which uses a 0x01_0004 record. (Renamed from
-        // `walk_mkb_be24_high_byte_is_honored`, which claimed coverage this body
-        // does not deliver.)
+        // Needs the MIDDLE BE24 byte: length 0x00_0110 (272) is [0x00,0x01,0x10],
+        // so a low-byte-only reader sees 0x10. HIGH byte is zero here; that term
+        // is pinned by `mkb::tests::mkb_records_honors_the_high_byte_of_the_be24_length`.
         let total = 0x0110usize; // 272
         let mut mkb = vec![0x10, 0x00, 0x01, 0x10];
         mkb.resize(total, 0xAB);
@@ -1049,10 +1025,9 @@ mod tests {
 
     #[test]
     fn chain_yields_no_key_for_non_covering_pk() {
-        // A complete variant MKB but a Processing Key that covers no slot → no
-        // Km verifies → an error (never a key). A non-covering key resolves to
-        // ProcessingKeyUnavailable, or to a correction-mode classification if its
-        // Kmp happens to set the soft/online bit — either way, no key is emitted.
+        // Complete variant MKB, but PK covers no slot → no Km verifies → error.
+        // Resolves to ProcessingKeyUnavailable, or a correction-mode
+        // classification if Kmp sets the soft/online bit; either way, no key.
         let (recs, _dk, _, _) = synthetic_variant_setup(0x00);
         let out = derive_media_key_variant(&recs, &[0x11; 16]);
         assert!(out.is_err(), "non-covering PK must not yield a Media Key");
@@ -1062,9 +1037,8 @@ mod tests {
 
     #[test]
     fn chain_reports_mkb_incomplete_when_nonce_missing() {
-        // Build a variant MKB (still variant via 0x2f, and a DK can walk it)
-        // but WITHOUT the 0x2d record that carries C + the trailing Nonce →
-        // MkbIncomplete at the variant_nonce `?`.
+        // Variant MKB (still variant via 0x2f, DK can walk it) but WITHOUT the
+        // 0x2d record carrying C + Nonce → MkbIncomplete at variant_nonce `?`.
         let (recs, _dk, kp, _) = synthetic_variant_setup(0x00);
         // Reconstruct bytes without the 0x2d record.
         let mut mkb = Vec::new();
@@ -1088,10 +1062,9 @@ mod tests {
 
     #[test]
     fn walk_processing_key_skips_shift_32_to_63_without_panic() {
-        // A subset-difference u_mask_shift in 0x20..=0x3F passes the 0xC0
-        // revoke check but is out of range for a u32 shift. The walk must skip
-        // the slot (continue) and not panic / not match a wrong uv. With only
-        // that one bad slot, no match → None.
+        // u_mask_shift in 0x20..=0x3F passes the 0xC0 revoke check but is out
+        // of u32-shift range. Walk must skip the slot without panicking; with
+        // only this bad slot present, result is None.
         let mut mkb = vec![
             0x10, 0x00, 0x00, 0x0C, 0x48, 0x14, 0x10, 0x03, 0x00, 0x00, 0x00, 0x4D,
         ];
@@ -1211,22 +1184,9 @@ mod tests {
         assert_eq!(err, MediaKeyVariantError::SoftCorrectionRequired);
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // A COMPLETE variant MKB — the AACS 2.1 happy path
-    //
-    // Every other test in this module asserts an ERROR classification, so
-    // until now no test ever drove `derive_media_key_variant` to a Media
-    // Key. That left the whole success path — the VARIANTS lookup, the VKD
-    // selection, the final `Km` unwrap and the verify gate — pinned by
-    // nothing: a body that answered a constant for any of those steps still
-    // produced the same errors these tests expect.
-    //
-    // No real key material is involved. Every AACS 2.1 relation in the chain
-    // is invertible, so the fixture below picks a Media Key and a Processing
-    // Key and computes the MKB records that connect them, exactly as
-    // `derive::position_recovery_tests::plant_mkb` does for the classical
-    // chain.
-    // ════════════════════════════════════════════════════════════════════
+    // A COMPLETE variant MKB — the AACS 2.1 happy path. Every other test here
+    // asserts an ERROR, leaving the success path (VARIANTS/VKD lookup, Km
+    // unwrap, verify gate) unpinned; fixture inverts the chain, no real keys.
 
     /// A planted variant MKB and the values it was built from.
     struct PlantedVariant {
@@ -1278,11 +1238,9 @@ mod tests {
             0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6, 0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF,
             0x4F, 0x3C,
         ];
-        // `uv = 2` puts its only non-zero byte at index 15, so byte 15 is the ONE
-        // position where the `Km`/`Kmp` uv-XOR is observable. Its 0x02 bit is
-        // deliberately CLEAR: with the bit set, `km[15] ^= 2` and `km[15] |= 2`
-        // agree (the XOR would only be clearing a bit the OR re-sets) and an
-        // OR-for-XOR substitution in the final step would be invisible.
+        // `uv = 2` has its only non-zero byte at index 15, the one position where
+        // the uv-XOR is observable. Its 0x02 bit is deliberately CLEAR: if set,
+        // `^= 2` and `|= 2` would agree, hiding an OR-for-XOR substitution bug.
         let km: [u8; 16] = [
             0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD,
             0xCE, 0xCD,
@@ -1613,9 +1571,8 @@ mod tests {
         );
 
         // Wrong C block: EVERY one-bit neighbour must fail to produce a key.
-        // (Which classification it lands in depends on the two condition bits
-        // the perturbed Kmp happens to carry — the property being pinned is
-        // that none of the 128 reaches `Ok`.)
+        // Classification varies with the perturbed Kmp's condition bits; the
+        // property pinned here is that none of the 128 reaches `Ok`.
         for byte in 0..16usize {
             for bit in 0..8u32 {
                 let mut c_bad = p.c_block;
@@ -1687,20 +1644,9 @@ mod tests {
         );
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // A MULTI-SLOT variant MKB driven by a real DEVICE KEY
-    //
-    // `walk_processing_key` is the DK -> Kp step that feeds the whole 2.1
-    // chain. Every existing test of it either asserts `None` (out-of-range
-    // shift, uv == 0) or asserts only that SOME match came back — none pins
-    // WHICH Processing Key, cvalue or slot index it returns. And every one of
-    // them uses a SINGLE-slot MKB, where the slot index is 0: all the
-    // `uvs[1 + 5*idx]` / `cvalues[idx*16..]` stride arithmetic multiplies by
-    // zero and any stride at all gives the same answer.
-    //
-    // This fixture puts the covering slot at index 1, behind a decoy at
-    // index 0, so the strides are load-bearing.
-    // ════════════════════════════════════════════════════════════════════
+    // A MULTI-SLOT variant MKB driven by a real DEVICE KEY. Prior tests used
+    // single-slot MKBs (index 0), where stride arithmetic multiplies by zero;
+    // this puts the covering slot at index 1 behind a decoy, so strides matter.
 
     /// A two-slot variant MKB whose SECOND slot is opened by a device key.
     struct PlantedWalk {
@@ -1718,7 +1664,7 @@ mod tests {
     /// Positions follow the same reasoning as the classical
     /// `derive::position_recovery_tests::plant_mkb`: `uv = 0x0400`
     /// (`u_mask_shift = 12`) with a device node of `0x0C00` satisfies the
-    /// [C] §3.2.4 gate — equal under `u_mask = 0xFFFF_F000`, different under
+    /// `[C]` §3.2.4 gate — equal under `u_mask = 0xFFFF_F000`, different under
     /// `v_mask = 0xFFFF_F800`. The device key's own `uv` equals the slot's, so
     /// `dev_key_v_mask == v_mask` and [`calc_pk_from_dk`] descends zero levels:
     /// `Kp = AES-G3(dk, 1)`, written out explicitly below rather than taken from
@@ -1763,10 +1709,9 @@ mod tests {
         vd[..8].copy_from_slice(&VERIFY_MAGIC);
         let mk_dv = aes_ecb_encrypt(&km, &vd);
 
-        // ── C blocks. Both are built so `Kmp[15]` has the 0x02 / 0x04 condition
-        // bits CLEAR, so both slots run the default-KCD path to completion and
-        // the decoy is rejected by the terminal verify gate rather than
-        // short-circuiting into a correction-mode classification.
+        // C blocks: both keep `Kmp[15]`'s 0x02/0x04 bits CLEAR, so both slots
+        // run the default-KCD path and the decoy is rejected by the terminal
+        // verify gate instead of short-circuiting into correction-mode.
         let c_for = |kmp: &[u8; 16], uv: u32| -> [u8; 16] {
             let mut c_plain = *kmp;
             for (b, u) in c_plain[12..16].iter_mut().zip(uv.to_be_bytes()) {
@@ -1864,7 +1809,7 @@ mod tests {
     /// them — and produced a Processing Key that opens nothing.
     ///
     /// The expected `Kp` is written as the explicit `AES-G3(dk, 1)` zero-descent
-    /// relation from [C] §3.2.4, not taken from the walk's own output.
+    /// relation from `[C]` §3.2.4, not taken from the walk's own output.
     #[test]
     fn walk_processing_key_returns_the_covering_slots_key_cvalue_and_index() {
         let p = plant_walk_variant_mkb();
@@ -1893,7 +1838,7 @@ mod tests {
         );
     }
 
-    /// The gate the walk applies is [C] §3.2.4's subset-difference test, and a
+    /// The gate the walk applies is `[C]` §3.2.4's subset-difference test, and a
     /// device key that fails it must get NO match. Pinned across all four
     /// coordinates the gate reads — node, uv, u_mask_shift and the key bytes —
     /// because a body that dropped any half of the gate would hand back a
@@ -2000,7 +1945,7 @@ mod tests {
     }
 
     /// The classical-magic escape hatch. On a NON-variant MKB the walk must
-    /// return a match only when `AES-D(Kmp, mk_dv)` opens with the [C] §3.2.5.1.4
+    /// return a match only when `AES-D(Kmp, mk_dv)` opens with the `[C]` §3.2.5.1.4
     /// verify magic; on a variant MKB that relation does not hold (the walk
     /// yields a Precursor) and the presence of `0x2d`/`0x2f` is what lets the
     /// match through to the chain's own terminal gate.
@@ -2036,7 +1981,7 @@ mod tests {
 
     /// The OTHER half of `classical_ok || variant_present`: a non-variant MKB
     /// whose cvalue really does open the Verify-Media-Key magic must yield a
-    /// match, and the [C] §3.2.4 relation that produces the candidate — AES-D(Kp,
+    /// match, and the `[C]` §3.2.4 relation that produces the candidate — AES-D(Kp,
     /// cvalue) with `uv` XORed into the LOW FOUR BYTES — must be computed
     /// exactly.
     ///
@@ -2059,11 +2004,9 @@ mod tests {
         ];
         // Zero descent ([C] §3.2.4), written out as the primitive relation.
         let kp = aesg3(&dkey, 1);
-        // `uv = 0x0400` puts its only non-zero byte at index 14, so byte 14 is
-        // the ONE position where the `uv` XOR is observable at all. Its 0x04 bit
-        // is deliberately CLEAR here: with the bit set, `km_candidate[14] |=
-        // 0x04` and `^= 0x04` agree (the XOR would only be clearing a bit the OR
-        // re-sets), and an OR-for-XOR substitution would be invisible.
+        // `uv = 0x0400` has its only non-zero byte at index 14, the one position
+        // where the uv XOR is observable. Its 0x04 bit is CLEAR: if set, `|= 0x04`
+        // and `^= 0x04` would agree, hiding an OR-for-XOR substitution bug.
         let mk: [u8; 16] = [
             0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D,
             0x7A, 0x7F,

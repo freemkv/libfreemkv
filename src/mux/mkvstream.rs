@@ -29,13 +29,8 @@ fn skip_bytes(r: &mut impl Read, n: u64) -> io::Result<()> {
 }
 
 // ── Sanity caps for untrusted EBML element sizes ──────────────
-//
-// Sizes come straight from the EBML stream (file or network) and are
-// otherwise cast to `usize` and used to allocate/read. An adversarial
-// or corrupt container can claim a multi-GB element and trigger an OOM
-// allocation, or claim an integer element wider than 8 bytes and panic
-// the fixed 8-byte reader. Every untrusted size is validated against
-// one of these caps before allocation.
+// Sizes are cast to `usize` for alloc/read; a corrupt container can claim a multi-GB
+// element (OOM) or one wider than 8 bytes (panic) — every size is checked against a cap.
 
 /// Largest accepted SIMPLE_BLOCK payload. A block is a small vint track
 /// header + 2-byte rel-ts + 1-byte flags + one frame of elementary data.
@@ -234,11 +229,9 @@ impl MvcMerge {
             {
                 pb.additional = Some(frame.data.clone());
             } else {
-                // Bound the orphan map BEFORE inserting: if dependents pile up
-                // unpaired (pairing badly drifted), drop the drifted buffer so it
-                // stays bounded — but keep THIS just-arrived dependent, whose base
-                // frame commonly arrives next. Clearing after the insert would
-                // discard it and overcount orphans by one.
+                // Bound the orphan map BEFORE inserting: drop a badly-drifted buffer
+                // but keep THIS just-arrived dependent, whose base frame commonly
+                // arrives next — clearing after insert would discard it too.
                 if self.dep_by_pts.len() >= MVC_PAIR_WINDOW * 4 {
                     self.orphan_deps += self.dep_by_pts.len() as u64;
                     self.dep_by_pts.clear();
@@ -373,18 +366,16 @@ impl MkvStream {
         title: &DiscTitle,
         output_path: Option<&std::path::Path>,
     ) -> io::Result<Self> {
-        // Blu-ray 3D (MVC): a dependent (right-eye) view stream is NOT emitted as
-        // its own track — it is folded into the base track as per-frame
-        // BlockAdditional. Detect it so we skip building a track for it and set up
-        // the merge. `base_stream_idx` is the first video stream.
+        // Blu-ray 3D (MVC): a dependent (right-eye) view is NOT its own track — it's
+        // folded into the base track as per-frame BlockAdditional. Detect it here so
+        // we skip building a track for it and set up the merge.
         let dep_stream_idx = title
             .streams
             .iter()
             .position(|s| matches!(s, crate::disc::Stream::Video(v) if v.is_mvc_dependent()));
-        // The base is the first NON-dependent video. Excluding the dependent here
-        // means a (malformed / hand-built) title whose only video IS the dependent
-        // yields `base_stream_idx == None` → no merge (the dependent is muxed as an
-        // ordinary track) instead of `base == dep` and a panic on the skipped slot.
+        // Base is the first NON-dependent video; excluding the dependent means a
+        // malformed title whose only video IS the dependent yields `None` (muxed
+        // as an ordinary track) instead of `base == dep` and a panic on the skipped slot.
         let base_stream_idx = title
             .streams
             .iter()
@@ -446,10 +437,9 @@ impl MkvStream {
             _ => None,
         };
 
-        // Defer muxer construction (and the TrackEntry dump) until the first
-        // coded picture arrives, so the primary video track's FieldOrder is set
-        // from the parser's MEASURED value before the header is written — never
-        // a guess. The dump moves to activation so it reflects the final track.
+        // Defer muxer construction until the first coded picture arrives, so the
+        // primary video track's FieldOrder is set from the parser's MEASURED value
+        // before the header is written — never a guess.
         let video_track = tracks.iter().position(|t| t.track_type == 1);
 
         Ok(Self {
@@ -488,11 +478,9 @@ impl MkvStream {
         if let Some(vt) = pending.video_track {
             apply_coding_to_track(&mut pending.tracks[vt], coding, video_picture_seen);
         }
-        // Blu-ray 3D: set the base video track's `mvc_params` from the dependent
-        // view's captured subset-SPS/PPS BEFORE the header is written, so the
-        // TrackEntry carries the `mvcC` BlockAdditionMapping. Captured from the
-        // first dependent AU (which arrives right after the first base AU in the
-        // SSIF), so it is available by the time the first base frame activates.
+        // Blu-ray 3D: set base track's `mvc_params` from the dependent view's captured
+        // subset-SPS/PPS BEFORE the header is written (so TrackEntry carries `mvcC`);
+        // captured from the first dependent AU, which arrives right after the base AU.
         if let Some(mvc) = &self.mvc {
             if let Some(params) = &mvc.captured_params {
                 if let Some(t) = pending.tracks.get_mut(mvc.base_track_idx) {
@@ -523,13 +511,9 @@ impl MkvStream {
             muxer.set_opening_capture(crate::diag::OpeningCapture::new(path, pending.tracks.len()));
         }
         for (f, additional) in pending.buffered.drain(..) {
-            // Provenance must survive the replay. These frames were buffered
-            // before the muxer existed, but each still carries the byte offset
-            // it was read from — dropping it here sent them down the timestamp
-            // heuristic instead, the one path the rest of this change set
-            // exists to stop relying on. They sit at the head of the title, so
-            // clip 0 is usually the right guess and the damage was bounded;
-            // "usually right" is exactly what provenance replaced.
+            // Provenance must survive the replay: these pre-muxer frames still carry
+            // the byte offset they were read from — dropping it here would fall back
+            // to the timestamp heuristic this change set exists to stop relying on.
             muxer.write_frame_at(
                 f.track,
                 f.pts,
@@ -632,10 +616,9 @@ fn apply_coding_to_track(
     coding: Option<crate::mux::codec::PictureInfo>,
     video_picture_seen: bool,
 ) {
-    // HDR10 static metadata measured from the bitstream (HEVC SEI). Applied for
-    // ANY track type that carries it (independent of interlace): the first coded
-    // picture's PictureInfo holds it once both HDR10 SEI messages were seen.
-    // `None` (SDR / no-SEI) leaves the track's `hdr10` untouched → omitted.
+    // HDR10 static metadata measured from the bitstream (HEVC SEI), applied for any
+    // track type once both HDR10 SEI messages were seen. `None` (SDR/no-SEI) leaves
+    // the track's `hdr10` untouched -> omitted.
     if let Some(h) = coding.and_then(|c| c.hdr10()) {
         track.hdr10 = Some(h);
     }
@@ -691,10 +674,9 @@ impl crate::pes::Stream for MkvStream {
         loop {
             let (id, size, _) = match ebml::read_element_header(&mut rs.reader) {
                 Ok(h) => h,
-                // Only a genuine premature/clean EOF ends the stream. Any other
-                // error (disc read failure, corrupt sector, network drop) must
-                // propagate, or a mid-mux I/O failure would silently truncate
-                // the output with no error signal.
+                // Only a genuine premature/clean EOF ends the stream; any other error
+                // must propagate, or a mid-mux I/O failure (disc/sector/network)
+                // would silently truncate the output with no error signal.
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
                 Err(e) => return Err(e),
             };
@@ -703,10 +685,9 @@ impl crate::pes::Stream for MkvStream {
                 ebml::CLUSTER => continue,
                 ebml::CLUSTER_TIMESTAMP => {
                     let raw = read_uint_bounded(&mut rs.reader, size)?;
-                    // The cluster timestamp is an untrusted u64; a value above
-                    // i64::MAX would cast to a large negative i64 and poison
-                    // every block PTS in the cluster. Reject it, mirroring the
-                    // EBML-size guard in parse_mkv_header.
+                    // Untrusted u64: a value above i64::MAX would cast to a large
+                    // negative i64 and poison every block PTS in the cluster; reject
+                    // it, mirroring the EBML-size guard in parse_mkv_header.
                     if raw > i64::MAX as u64 {
                         return Err(crate::error::Error::MkvSourceInvalid.into());
                     }
@@ -730,35 +711,26 @@ impl crate::pes::Stream for MkvStream {
                     continue;
                 }
                 ebml::BLOCK_GROUP => {
-                    // MkvMuxer emits a BlockGroup (BLOCK + BLOCK_DURATION) for
-                    // every frame carrying a duration — i.e. all AC3 audio and
-                    // PGS subtitle frames. Descend into the group, read the
-                    // inner BLOCK (0xA1) and BLOCK_DURATION (0x9B), and yield a
-                    // frame so a round-trip through this muxer does not silently
-                    // drop those tracks. A non-u64::MAX size bounds the children.
+                    // MkvMuxer emits a BlockGroup (BLOCK + BLOCK_DURATION) for every
+                    // frame with a duration (AC3 audio, PGS subtitles); descend and
+                    // read both children so a round-trip doesn't silently drop them.
                     if size == u64::MAX {
                         return Err(crate::error::Error::MkvSourceInvalid.into());
                     }
                     let mut remaining = size;
                     let mut block: Option<Vec<u8>> = None;
                     let mut duration_ms: Option<u64> = None;
-                    // Keyframe-ness of a BlockGroup is carried ONLY by the
-                    // presence/absence of a ReferenceBlock child: inside a
-                    // BlockGroup the SimpleBlock 0x80 keyframe bit is reserved
-                    // and the writer always emits it as 0. Reading that bit
-                    // (as this arm used to) makes EVERY BlockGroup frame look
-                    // like a non-keyframe — which silently broke every re-mux
-                    // of MPEG-2 video, whose parser stamps a per-frame duration
-                    // so all of its frames take the BlockGroup path.
+                    // Keyframe-ness of a BlockGroup is carried ONLY by ReferenceBlock's
+                    // presence — SimpleBlock's 0x80 bit is reserved (always 0) here,
+                    // so reading it broke every MPEG-2 frame (always this path).
                     let mut has_reference = false;
                     while remaining > 0 {
                         let (cid, cs, hlen) = ebml::read_element_header(&mut rs.reader)?;
                         if cs == u64::MAX {
                             return Err(crate::error::Error::MkvSourceInvalid.into());
                         }
-                        // A child whose header + body exceeds the bytes left in
-                        // the BlockGroup is malformed — reject it rather than
-                        // saturating `remaining` to 0 and reading past the group.
+                        // A child whose header+body exceeds bytes left in the group
+                        // is malformed — reject rather than saturating `remaining` to 0.
                         let consumed = (hlen as u64).saturating_add(cs);
                         if consumed > remaining {
                             return Err(crate::error::Error::MkvSourceInvalid.into());
@@ -782,28 +754,9 @@ impl crate::pes::Stream for MkvStream {
                                 skip_bytes(&mut rs.reader, cs)?;
                             }
                             ebml::BLOCK_ADDITIONS => {
-                                // A `BlockAdditions > BlockMore > BlockAdditional`
-                                // subtree is a per-frame SIDE payload. For a
-                                // Blu-ray 3D title written by this crate it is the
-                                // MVC dependent-view (right-eye) access unit,
-                                // BlockAddID=2, described by the track's `mvcC`
-                                // BlockAdditionMapping.
-                                //
-                                // `PesFrame` has no side-payload field and the
-                                // read-side stream table (built by
-                                // `parse_mkv_header`, which does not parse
-                                // BlockAdditionMapping) has no dependent-view
-                                // track to hand it to, so this reader CANNOT
-                                // reconstruct it — re-muxing a 3D MKV yields a
-                                // base-view-only (2D) file. Reconstruction needs
-                                // header-parse plumbing well beyond this arm.
-                                //
-                                // What it must NOT be is silent: this used to fall
-                                // into the `_` skip arm below, so an
-                                // `mkv://` → `mkv://` re-mux of a 3D rip dropped
-                                // one whole eye with no error, no warning and
-                                // `lost_bytes == 0`. Account for it so the loss
-                                // reaches `MuxOutcome.lost_bytes` / `errors`.
+                                // Carries the MVC dependent-view AU for 3D titles; `PesFrame`
+                                // has no side-payload field so it can't be reconstructed, and a
+                                // 3D re-mux silently became 2D. Must NOT be silent: account it.
                                 if rs.additions_dropped == 0 {
                                     tracing::warn!(
                                         target: "mux",
@@ -823,10 +776,9 @@ impl crate::pes::Stream for MkvStream {
                         }
                     }
                     if let Some(block) = block {
-                        // BLOCK_DURATION is expressed in TimestampScale ticks,
-                        // not milliseconds. Scale by the segment's ts_scale_ns
-                        // (1_000_000 for freemkv's own 1 ms scale; non-default
-                        // in foreign MKVs) — same scaling PTS uses.
+                        // BLOCK_DURATION is TimestampScale ticks, not ms — scale by
+                        // ts_scale_ns (1_000_000 for our own 1ms scale, non-default
+                        // in foreign MKVs), same scaling PTS uses.
                         let dur_ns =
                             duration_ms.map(|ticks| ticks.saturating_mul(rs.ts_scale_ns as u64));
                         let frames = parse_block(
@@ -871,10 +823,9 @@ impl crate::pes::Stream for MkvStream {
         if self.mvc.is_none() {
             return self.emit(frame, None);
         }
-        // Blu-ray 3D: run the frame through the MVC merge, which remaps track
-        // indices, folds the dependent view into the base as BlockAdditional
-        // (paired by PTS), and yields 0+ frames ready to emit. `ingest` returns
-        // owned pairs so the `self.mvc` borrow is released before `emit`.
+        // Blu-ray 3D: fold the dependent view into the base as BlockAdditional
+        // (paired by PTS) and yield 0+ frames; `ingest` returns owned pairs so the
+        // `self.mvc` borrow is released before `emit`.
         let emits = self.mvc.as_mut().unwrap().ingest(frame);
         for (f, additional) in emits {
             self.emit(&f, additional.as_deref())?;
@@ -920,10 +871,9 @@ impl crate::pes::Stream for MkvStream {
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
         if let Mode::Read(ref rs) = self.mode {
-            // `track` is a stream index; `codec_privates` is keyed by Matroska
-            // TrackNumber. Those are NOT the same space (RFC 9559 §5.1.4.1.1
-            // requires only a non-zero TrackNumber), so translate through the
-            // real map instead of assuming `track + 1`.
+            // `track` is a stream index but `codec_privates` is keyed by Matroska
+            // TrackNumber (RFC 9559 §5.1.4.1.1 requires only non-zero) — translate
+            // through the real map instead of assuming `track + 1`.
             let track_num = rs.tracks.num_of(track)?;
             rs.codec_privates
                 .iter()
@@ -1192,9 +1142,8 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
                     arem = arem.saturating_sub(ahlen as u64 + as_);
                     match aid {
                         ebml::SAMPLING_FREQUENCY => sr = ebml::read_float_val(r, as_ as usize)?,
-                        // Clamp instead of `as u8`: a foreign/corrupt MKV with a
-                        // CHANNELS value that is a multiple of 256 would truncate to
-                        // 0 (an invalid channel count) on a bare cast. Saturate to
+                        // Clamp instead of `as u8`: a CHANNELS value that's a multiple of
+                        // 256 would truncate to 0 (invalid) on a bare cast; saturate to
                         // u8::MAX so an absurd count degrades to "many", never to 0.
                         ebml::CHANNELS => ch = read_uint_bounded(r, as_)?.min(u8::MAX as u64) as u8,
                         _ => {
@@ -1252,21 +1201,15 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     } else if sr >= 48000.0 {
         SampleRate::S48
     } else {
-        // Anything below the lowest rate this enum maps is UNKNOWN, not 48 kHz.
-        // The ladder's final `else` used to be S48, so a legal 32000 Hz AC-3 or
-        // DTS track — common in broadcast-sourced content — was recorded as
-        // 48 kHz, and the wrong rate then propagated into the reconstructed
-        // AudioStream. `SampleRate::from_hz` in disc/mod.rs is the crate's
-        // canonical mapping and returns Unknown here; this ladder exists only
-        // because the MKV element is a float and needs tolerance rather than
-        // exact equality.
+        // Below the lowest mapped rate is UNKNOWN, not 48kHz: the ladder's final
+        // `else` used to be S48, so a legal 32kHz AC-3/DTS track was misrecorded as
+        // 48kHz. This float ladder exists only for tolerance vs. `SampleRate::from_hz`.
         SampleRate::Unknown
     };
 
-    // Map MKV track numbers to BD-TS PIDs. A 13-bit TS PID tops out at
-    // 0x1FFF; compute in u32 so the `0x1100 + (tnum - 2)` arithmetic can't
-    // wrap u16 for large track numbers, and reject anything that would land
-    // outside the valid PID space.
+    // Map MKV track numbers to BD-TS PIDs, computed in u32 so `0x1100 + (tnum - 2)`
+    // can't wrap u16 for large track numbers (a 13-bit PID tops out at 0x1FFF);
+    // reject anything landing outside the valid PID space.
     let ts_pid = ts_pid_for_track(tnum)?;
 
     let stream = match ttype {
@@ -1441,13 +1384,9 @@ pub(crate) fn split_lacing(lacing: u8, body: &[u8]) -> Option<Vec<&[u8]>> {
                 return None;
             }
             let each = rest.len() / n;
-            // A zero-size frame carries no data and cannot be a valid frame, so
-            // `each == 0` is malformed rather than "n empty frames". It has to be
-            // rejected explicitly: 0 % n == 0 passes the divisibility check above,
-            // and `chunks` on an empty slice yields nothing whatever its argument,
-            // so clamping the chunk width instead returned Some(vec![]) — zero
-            // frames where the Lacing Head declared n, dropping the whole lace
-            // silently with no error raised.
+            // `each == 0` is malformed, not "n empty frames" — 0 % n == 0 passes the
+            // divisibility check above, and `chunks` on an empty slice yields nothing,
+            // so unrejected this silently dropped the whole lace with no error.
             if each == 0 {
                 return None;
             }
@@ -1547,9 +1486,8 @@ fn parse_block(
     let keyframe = flags & 0x80 != 0;
     let body = &block[vl + 3..];
     // saturating_add: a hostile CLUSTER_TIMESTAMP near i64::MAX plus a positive
-    // rel_ts would overflow this add (panic in debug/test, wrap to a large
-    // negative PTS in release) — one operation BEFORE the saturating_mul below.
-    // rel_ts as i64 is exact, so this fully bounds the sum on adversarial input.
+    // rel_ts would overflow (panic in debug, wrap in release) — done before the
+    // saturating_mul below so the sum is fully bounded on adversarial input.
     let pts_ticks = cluster_ts_ticks.saturating_add(rel_ts as i64);
     // saturating_mul: a hostile CLUSTER_TIMESTAMP could push pts_ticks near
     // i64::MAX, where ticks→ns would overflow and panic in debug builds.
@@ -1585,20 +1523,15 @@ fn parse_block(
              boundaries are unknowable, so the block is rejected rather than passed \
              downstream as one mangled frame"
         );
-        // Its own code, not the generic `MkvSourceInvalid`: a laced Block names a
-        // specific RFC 9559 §10.3 feature whose header is self-inconsistent, which
-        // is a distinct diagnosis from "the container is corrupt somewhere".
-        // Neither is `MkvInvalid` — `error::is_skippable_title_stub` classifies
-        // that code as an empty nav/menu stub, so a real track with unseparable
-        // frames would be dropped by the caller while the run reported success.
+        // Its own code, not `MkvSourceInvalid` (generic corruption) or `MkvInvalid`
+        // (`error::is_skippable_title_stub` treats that as an empty nav/menu stub,
+        // which would drop a real unseparable track while reporting success).
         return Err(crate::error::Error::MkvLacingInvalid.into());
     };
 
-    // RFC 9559 §10.3.5: a Block carries a single timestamp, which applies to the
-    // FIRST frame of the lace; every later frame has an "underdetermined"
-    // timestamp but MUST be contiguous with its predecessor. Recover the spacing
-    // from the track's DefaultDuration (§5.1.4.1.13, already nanoseconds) when
-    // declared, else by dividing this Block's BlockDuration across the lace.
+    // RFC 9559 §10.3.5: a Block's timestamp applies to the FIRST laced frame only;
+    // later frames are "underdetermined" but contiguous. Recover spacing from the
+    // track's DefaultDuration when declared, else BlockDuration divided across the lace.
     let count = laced.len().max(1) as u64;
     let per_frame_ns = tracks
         .default_durations
@@ -2233,10 +2166,8 @@ mod tests {
 
     #[test]
     fn simple_block_oversized_size_is_rejected() {
-        // Cluster containing a SIMPLE_BLOCK that claims a 2 GiB payload.
-        // The reader must reject it (MkvSourceInvalid) rather than attempt a
-        // multi-GB allocation. Header parse stops at CLUSTER, so the
-        // SIMPLE_BLOCK is hit on the first read().
+        // Cluster with a SIMPLE_BLOCK claiming a 2 GiB payload: must be rejected
+        // (MkvSourceInvalid), not trigger a multi-GB allocation.
         let mut cluster = Vec::new();
         ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
         ebml::write_unknown_size(&mut cluster).unwrap();
@@ -2293,10 +2224,8 @@ mod tests {
     }
     #[test]
     fn truncated_simple_block_body_errors_not_panics() {
-        // A SIMPLE_BLOCK that declares a 64-byte payload but supplies none.
-        // read_exact_bounded must surface a clean typed MkvSourceInvalid error
-        // (a truncated declared element is malformed input), never panic,
-        // and never allocate the full declared size up front.
+        // A SIMPLE_BLOCK declaring a 64-byte payload but supplying none must surface
+        // a clean typed MkvSourceInvalid, never panic, never allocate the full size.
         let mut cluster = Vec::new();
         ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
         ebml::write_unknown_size(&mut cluster).unwrap();
@@ -2373,19 +2302,9 @@ mod tests {
 
     #[test]
     fn block_group_frame_round_trips_with_duration() {
-        // MkvMuxer emits AC3/PGS frames — and every MPEG-2 video frame — as a
-        // BlockGroup (BLOCK + BLOCK_DURATION [+ REFERENCE_BLOCK]). The reader
-        // must descend into the group and yield the frame (with its duration)
-        // rather than skipping it — otherwise every such frame this muxer writes
-        // is lost on read-back.
-        //
-        // Keyframe-ness: inside a BlockGroup the SimpleBlock 0x80 bit is
-        // RESERVED (always 0 here); a Block with NO ReferenceBlock child is a
-        // keyframe. This group has none, so the frame is a keyframe — which is
-        // also the truth for the AC-3/PGS frames this path was written for
-        // (they are self-contained). The `!keyframe` this test used to assert
-        // came from reading the reserved bit; see
-        // `reference_block_marks_block_group_frame_as_non_keyframe`.
+        // MkvMuxer emits AC3/PGS and every MPEG-2 frame as a BlockGroup; the reader
+        // must descend and yield it, not skip it. Inside a BlockGroup the SimpleBlock
+        // 0x80 bit is RESERVED (always 0), so keyframe-ness is ReferenceBlock's absence.
         let block = [0x82u8, 0x00, 0x05, 0x00, 0x11, 0x22, 0x33]; // track 2, rel 5, reserved bit 0, 3 data
         let mut bg_body = Vec::new();
         ebml::write_id(&mut bg_body, ebml::BLOCK).unwrap();
@@ -2622,16 +2541,14 @@ mod tests {
         let e = open_err(MkvStream::open(Cursor::new(bytes)));
         assert!(is_mkv_source_invalid(&e));
         // 65537 is the case the guard really exists for: it truncates onto the
-        // PERFECTLY VALID TrackNumber 1, so an over-width number that is merely
-        // "not 65536" would be accepted and its blocks would be routed to another
-        // track's stream. Reject the whole class, not one value.
+        // PERFECTLY VALID TrackNumber 1, so a check for merely "not 65536" would
+        // route its blocks to another track's stream. Reject the whole class.
         let bytes = mkv_with_track_and_cluster(65537, 1, &[]);
         let e = open_err(MkvStream::open(Cursor::new(bytes)));
         assert!(is_mkv_source_invalid(&e));
-        // 65535 fits u16 exactly. It is still rejected — but by the PID guard,
-        // not the width guard, because 0x1100 + 65533 is far outside the 13-bit
-        // TS PID space. Pinning WHICH boundary each guard owns keeps a
-        // widened-by-one width check from silently becoming the load-bearing one.
+        // 65535 fits u16 exactly; it's rejected by the PID guard, not the width
+        // guard (0x1100 + 65533 is outside the 13-bit TS PID space). Pinning WHICH
+        // boundary each guard owns keeps a widened width check from becoming load-bearing.
         assert!(ts_pid_for_track(65535).is_err());
         assert_eq!(
             TrackTable {
@@ -2658,10 +2575,8 @@ mod tests {
 
     #[test]
     fn unknown_size_inner_child_in_tracks_is_rejected() {
-        // A TRACK_ENTRY child declaring EBML unknown size (cs == u64::MAX) must
-        // be rejected, not used in `hlen + cs` (which would overflow → debug
-        // panic). Hand-build a TRACK_ENTRY whose first child carries the
-        // unknown-size marker.
+        // A TRACK_ENTRY child declaring EBML unknown size (cs == u64::MAX) must be
+        // rejected, not used in `hlen + cs` (overflow -> debug panic).
         let mut entry = Vec::new();
         ebml::write_id(&mut entry, ebml::TRACK_NUMBER).unwrap();
         ebml::write_unknown_size(&mut entry).unwrap(); // child size = unknown
@@ -2773,10 +2688,7 @@ mod tests {
     }
 
     // ============================================================
-    // block_vint — the (Simple)Block track-number VINT. Matroska §6.2:
-    // the leading-1 bit position selects the width (1-4 bytes here), and
-    // the value occupies the remaining bits. A width-selection bug would
-    // mis-attribute every block to the wrong track.
+    // block_vint — Block track-number VINT (§6.2); a width bug mis-attributes blocks.
     // ============================================================
 
     #[test]
@@ -2810,10 +2722,7 @@ mod tests {
     }
 
     // ============================================================
-    // parse_block — turns a (Simple)Block payload into PesFrames.
-    // Layout: [track VINT][rel_ts i16 BE][flags u8][data...].
-    // Guards: len<4 → none; vl+3 > len → none; track 0 → none;
-    // unknown TrackNumber → none.
+    // parse_block — Block payload into PesFrames; guards len<4, track 0, unknown track.
     // ============================================================
 
     /// `parse_block` for an UNLACED block on a file whose TrackNumbers are
@@ -2922,11 +2831,9 @@ mod tests {
 
     #[test]
     fn parse_block_cluster_ts_plus_rel_ts_saturates_no_overflow() {
-        // Regression: a hostile CLUSTER_TIMESTAMP near i64::MAX plus a POSITIVE
-        // rel_ts overflows the `cluster_ts + rel_ts` ADD — one step before the
-        // saturating_mul. With a plain `+` this panics in debug/test (overflow
-        // checks on) and silently wraps to a large negative PTS in release.
-        // rel_ts = +0x7FFF = 32767 (max positive signed 16-bit).
+        // Regression: CLUSTER_TIMESTAMP near i64::MAX plus a POSITIVE rel_ts overflows
+        // `cluster_ts + rel_ts`; a plain `+` panics in debug and wraps negative in
+        // release. rel_ts = +0x7FFF = 32767 (max positive signed 16-bit).
         let block = [0x81u8, 0x7F, 0xFF, 0x80, 0xAA];
         let f = parse_block_one(&block, i64::MAX, 1_000_000, 1, None).unwrap();
         // The add saturates at i64::MAX, then the mul saturates too.
@@ -2937,17 +2844,10 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // ts_pid_for_track — mid-range mapping (the existing test covers the
-    // edges; this fills in a representative middle value to lock the
-    // 0x1100 + (tnum-2) formula).
-    // ============================================================
+    // ts_pid_for_track — mid-range mapping locking the 0x1100 + (tnum-2) formula.
 
-    // ============================================================
-    // CLUSTER_TIMESTAMP overflow guard — a value above i64::MAX would cast
-    // to a large negative i64 and poison every block PTS in the cluster.
-    // The reader must reject it.
-    // ============================================================
+    // CLUSTER_TIMESTAMP overflow guard: a value above i64::MAX would cast to a large
+    // negative i64 and poison every block PTS in the cluster; the reader must reject it.
 
     #[test]
     fn cluster_timestamp_above_i64_max_is_rejected() {
@@ -2964,10 +2864,9 @@ mod tests {
         let e = stream.read().unwrap_err();
         assert!(is_mkv_source_invalid(&e));
 
-        // `i64::MAX` itself is the last representable value and must be ACCEPTED
-        // — the guard is against a u64 that would go NEGATIVE on the cast, not
-        // against a large timestamp. Rejecting it too turns the boundary into an
-        // off-by-one that drops a legal cluster.
+        // `i64::MAX` itself is the last representable value and must be ACCEPTED —
+        // the guard is against a u64 that goes NEGATIVE on the cast, not against a
+        // large timestamp; rejecting it too would drop a legal cluster.
         let mut cluster = Vec::new();
         ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
         ebml::write_unknown_size(&mut cluster).unwrap();
@@ -2991,20 +2890,15 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // A malformed mkv:// SOURCE must never be classified as a skippable
-    // title stub. The read path used to raise `Error::MkvInvalid` for every
-    // malformed-input rejection, and `error::is_skippable_title_stub` reports
-    // that code as an empty nav/menu stub — so an all-titles rip silently
-    // passed over a corrupt input and exited reporting success.
-    // ============================================================
+    // A malformed mkv:// SOURCE must never be classified as a skippable title stub:
+    // raising `Error::MkvInvalid` here made `is_skippable_title_stub` treat it as an
+    // empty nav/menu stub, so an all-titles rip silently passed over corrupt input.
 
     #[test]
     fn corrupt_source_is_not_classified_as_a_skippable_title_stub() {
-        // Same corrupt fixture as above (CLUSTER_TIMESTAMP > i64::MAX) driven
-        // through the real reader, asserted against the public classifier.
-        // Mutation: raising `Error::MkvInvalid` instead of
-        // `Error::MkvSourceInvalid` at that guard turns this red.
+        // Same corrupt fixture as above, driven through the real reader and asserted
+        // against the public classifier. Mutation: raising `MkvInvalid` instead of
+        // `MkvSourceInvalid` at that guard turns this red.
         let mut cluster = Vec::new();
         ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
         ebml::write_unknown_size(&mut cluster).unwrap();
@@ -3032,11 +2926,8 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // parse_mkv_header — TimestampScale threading and clamping. The frame
-    // PTS path multiplies by ts_scale_ns; a zero or absurd scale must
-    // clamp to the 1ms default rather than zero out / overflow PTS.
-    // ============================================================
+    // parse_mkv_header — TimestampScale threading/clamping: PTS multiplies by
+    // ts_scale_ns, so a zero or absurd scale must clamp to the 1ms default.
 
     #[test]
     fn zero_timestamp_scale_clamps_to_default() {
@@ -3276,10 +3167,7 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // Block LACING (RFC 9559 §10.3) and TrackNumber→stream routing
-    // (RFC 9559 §5.1.4.1.1).
-    // ============================================================
+    // Block LACING (RFC 9559 §10.3) and TrackNumber->stream routing (§5.1.4.1.1).
 
     /// One TrackEntry description for `mkv_with_tracks_and_cluster`:
     /// (TrackNumber, TrackType, DefaultDuration ns, CodecPrivate).
@@ -4406,10 +4294,9 @@ mod tests {
         let mut s = MkvStream::open(Cursor::new(build(u64::MAX))).unwrap();
         let f = s.read().unwrap().expect("one frame");
         assert_eq!(f.pts, 5 * 1_000_000, "clamped to the 1 ms default scale");
-        // `i64::MAX` is the last value that still fits a positive i64, so it is
-        // taken as the scale rather than clamped, and the tick→ns multiply
-        // saturates instead of overflowing. Absurd, but bounded and defined — the
-        // clamp is against values that would go NEGATIVE, not against large ones.
+        // `i64::MAX` still fits a positive i64, so it's taken as the scale (the
+        // multiply saturates rather than overflows) — the clamp is against values
+        // that go NEGATIVE, not against large ones.
         let mut s = MkvStream::open(Cursor::new(build(i64::MAX as u64))).unwrap();
         let f = s.read().unwrap().expect("one frame");
         assert_eq!(
@@ -4481,10 +4368,8 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // The same boundary with a WIDER track VINT: a 2-octet track number
-        // makes the shortest legal block five bytes. Every other block test uses
-        // the 1-octet form, where the header-length check happens to agree with
-        // itself however it is computed.
+        // Same boundary with a WIDER track VINT: a 2-octet track number makes the
+        // shortest legal block five bytes, unlike every other test's 1-octet form.
         let five = [0x40u8, 0x01, 0x00, 0x00, 0x80];
         let frames = parse_block(&five, 0, 1_000_000, &tracks, None).unwrap();
         assert_eq!(

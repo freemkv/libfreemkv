@@ -241,7 +241,7 @@ pub struct TsDemuxer {
     /// Advanced by each `feed` by the bytes consumed; `feed` (no base) leaves
     /// it at 0 so non-provenance callers stamp `None`.
     feed_base: u64,
-    /// True once a caller has threaded a source base via [`feed_at`]. Until
+    /// True once a caller has threaded a source base via [`Self::feed_at`]. Until
     /// then no `SourcePos` is stamped (keeps existing callers byte-identical).
     has_base: bool,
 }
@@ -249,20 +249,17 @@ pub struct TsDemuxer {
 impl TsDemuxer {
     /// Create a new demuxer tracking the given PIDs.
     ///
-    /// Allocates a flat lookup table of `i16` slots — one per possible PID
+    /// Allocates a flat lookup table of `i32` slots — one per possible PID
     /// up to `max(8192, max_pid + 1)`. The 8192 floor matches the BD-TS
     /// 13-bit PID space (0..0x1FFF); the variable upper bound exists for
     /// DVD program streams which may use 16-bit stream IDs above 8191.
-    /// Worst-case allocation is `u16::MAX × 2 bytes ≈ 128 KB` — bounded by
+    /// Worst-case allocation is `u16::MAX × 4 bytes ≈ 256 KB` — bounded by
     /// the type, so adversarial input can't drive this beyond predictable
     /// limits. Empty `pids` yields max_pid 0; the floor still produces a
     /// valid (wholly-unused) table.
     pub fn new(pids: &[u16]) -> Self {
-        // The PID→assembler index is stored as i32 (-1 = untracked). PIDs are
-        // u16 (≤ 65535) and the assembler index `i` is bounded by the number of
-        // distinct PIDs (≤ 65536), both far below i32::MAX, so `i as i32` can
-        // never truncate to a negative value and be mis-read as untracked —
-        // unlike an i16 table, this is safe in RELEASE, not just under debug.
+        // PID→assembler index is i32 (-1 = untracked); both PID count and index are
+        // far below i32::MAX, so `i as i32` can never wrap negative and be misread as untracked.
         let max_pid = pids.iter().copied().max().unwrap_or(0) as usize;
         let table_size = (max_pid + 1).max(8192);
         let mut pid_index = vec![-1i32; table_size];
@@ -297,10 +294,8 @@ impl TsDemuxer {
     /// `data` in place. Zero-copy on the bulk path; one 192-byte copy
     /// on the boundary.
     pub fn feed(&mut self, data: &[u8]) -> Vec<PesPacket> {
-        // A plain feed carries no provenance. Reset any base a prior
-        // `feed_at` left behind so mixing the two entry points is safe:
-        // after this call no `SourcePos` is stamped, and the stale running
-        // base can't leak a wrong offset into the boundary packet.
+        // Reset any base a prior `feed_at` left behind, so mixing the two entry
+        // points is safe and a stale running base can't leak into the next packet.
         self.feed_base = 0;
         self.has_base = false;
         self.feed_inner(data)
@@ -403,34 +398,18 @@ impl TsDemuxer {
         let pusi = ts[1] & 0x40 != 0; // Payload Unit Start Indicator
         let adaptation = (ts[3] >> 4) & 0x03;
 
-        // P3/B1 CONCEALMENT MARKER: a NULL-TS packet (PID 0x1FFF) carrying an
-        // adaptation-field discontinuity_indicator. NOTE: the in-tree writer that
-        // laid these down on an undecryptable unit was removed with the pure-decrypt
-        // passthrough change (the mux no longer conceals), so this recognition now
-        // only fires on externally-authored markers — a candidate for removal with
-        // the rest of the retired concealment path.
-        // As a loss signal it is CC-INDEPENDENT — unlike a tracked PID's 4-bit
-        // continuity_counter it is CC-INDEPENDENT, so it survives a loss that is
-        // an exact multiple of 16 packets and a loss at the very start of a PID
-        // (no prior CC to diff against). The decrypt layer cannot know which
-        // elementary PID(s) the lost unit carried (the data was undecryptable),
-        // so force a pending discontinuity on EVERY tracked assembler: the next
-        // completed PES of each resyncs. Harmless for audio/subtitle (the codec
-        // gate is a no-op there) and at most one extra GOP on a video track that
-        // did not actually lose packets — bounded, and only on a degraded disc.
+        // P3/B1 concealment marker: NULL-TS (0x1FFF) with a discontinuity indicator.
+        // Only fires on externally-authored markers now (in-tree writer removed with
+        // pure-decrypt passthrough). Lost unit's PID is unknowable, so force pending discontinuity on every assembler.
         if pid == NULL_PID
             && (adaptation == 0x02 || adaptation == 0x03)
             && (ts[4] as usize) > 0
             && (ts[5] & 0x80) != 0
         {
             for a in &mut self.assemblers {
-                // A concealed unit may have dropped packets belonging to a PES
-                // currently open on any PID — so that partial is potentially
-                // TRUNCATED (a hole in the middle of its access unit). Drop it
-                // like a mid-PES continuity break, and flag pending so the NEXT
-                // completed PES (the first frame whose data is entirely post-gap)
-                // resyncs. Mirrors the non-PUSI cc_gap path, applied to every PID
-                // because the lost unit's PID(s) are unknowable (undecryptable).
+                // A concealed unit may have dropped packets from any open PES, leaving a
+                // hole mid-access-unit. Drop it like a mid-PES continuity break and flag
+                // pending so the next completed PES resyncs (mirrors the non-PUSI cc_gap path).
                 a.buffer.clear();
                 a.active = false;
                 a.header_remaining = 0;
@@ -476,37 +455,26 @@ impl TsDemuxer {
 
         let payload = &ts[payload_start..];
 
-        // Continuity check. The 4-bit continuity_counter increments by 1 on
-        // every payload-bearing packet of a PID; a gap means dropped TS
-        // packets. The adaptation field's discontinuity_indicator (first AF
-        // byte, bit 0x80) explicitly flags an intentional break. On a non-PUSI
-        // continuation that is discontinuous, the partial PES has a hole in it
-        // — splicing the new payload would corrupt the elementary stream — so
-        // drop the partial and resync on the next PUSI.
+        // Continuity check: the 4-bit CC increments per payload packet, so a gap means
+        // dropped packets. On a discontinuous non-PUSI continuation the partial PES has
+        // a hole, so splicing would corrupt the ES — drop it and resync on the next PUSI.
         let cc = ts[3] & 0x0f;
         // adaptation == 0x02 (AF only) already returned above, so only 0x03
         // (AF + payload) can carry an adaptation field here.
         let discontinuity_flag = adaptation == 0x03 && ts[4] > 0 && (ts[5] & 0x80) != 0;
         let cc_gap = cc_is_gap(asm.last_cc, cc);
         asm.last_cc = Some(cc);
-        // A continuity gap means packets for THIS PID were lost (a damaged source,
-        // or — for the conceal path — a loss that the CC-independent NULL-TS marker
-        // above did not already flag). The flag is sticky and rides to the FIRST
-        // post-gap PES so the codec consumer drops forward to the next keyframe
-        // (B1). Attribution differs by where the gap lands (see below).
+        // A gap means packets for this PID were lost. Sticky flag rides to the first
+        // post-gap PES so the codec consumer drops forward to the next keyframe (B1).
         let gap = discontinuity_flag || cc_gap;
 
         if pusi {
             // `header_len` is the FULL (uncapped) PES-header length:
             // 0 = malformed (payload is not a PES start), else 6/9+N.
             let (pts, dts, header_len) = parse_pes_header(payload);
-            // Flush the previous PES FIRST — a gap detected on this PUSI packet
-            // belongs to the PES STARTING now (its data begins after the lost
-            // packets), NOT the one just completing. So set `pending_discontinuity`
-            // AFTER start(): it rides the new PES to its own completion. (Setting
-            // it before would stamp the pre-gap frame; if that frame were a
-            // keyframe the gate would arm-then-disarm on it and admit the real
-            // post-gap inter frame with a dangling reference.)
+            // Flush the previous PES first — a gap on this PUSI packet belongs to
+            // the PES starting now, not the one completing. Set `pending_discontinuity`
+            // after start(), else it wrongly stamps the pre-gap frame instead.
             if let Some(prev) = asm.start(pts, dts, source) {
                 completed.push(prev);
             }
@@ -532,10 +500,8 @@ impl TsDemuxer {
         } else {
             // Non-PUSI continuation.
             if gap {
-                // Mid-PES hole: the open partial has a gap, so splicing this
-                // payload would corrupt the ES. Flag pending (consumed at the
-                // NEXT completed PES — the first post-gap frame) and drop the
-                // open partial; resync on the next PUSI.
+                // Mid-PES hole: splicing this payload would corrupt the ES. Flag
+                // pending (consumed at the next completed PES) and drop the partial.
                 asm.pending_discontinuity = true;
                 if asm.active {
                     tracing::trace!(
@@ -764,10 +730,8 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
                 continue;
             };
             let payload = &data[offset + payload_off..offset + BD_SOURCE_PACKET_BYTES];
-            // pointer_field is the FIRST payload byte; the section starts
-            // pointer_field bytes after it. Bound the start to within
-            // THIS packet's payload — a pointer that runs into the next
-            // packet is malformed.
+            // pointer_field is the first payload byte; bound the section start to
+            // within this packet's payload — a pointer into the next packet is malformed.
             let pointer = payload[0] as usize;
             let sec_start = 1 + pointer;
             if sec_start + 3 > payload.len() || payload[sec_start] != table_id {
@@ -783,25 +747,15 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
                 section.truncate(total);
                 return Some(section);
             }
-            // Need continuation packets: same PID, no PUSI. Continuity is
-            // checked with the CANONICAL `cc_is_gap` (ISO/IEC 13818-1 §2.4.3.3)
-            // shared with `process_packet`, NOT a local `cc != expected` test:
-            // that copy rejected a legal duplicate packet and counted
-            // adaptation-field-only packets (which do not increment the CC)
-            // as gaps, so a spec-conformant PMT was misdiagnosed as desync and
-            // the title's stream list came back empty. A real CC gap means a
-            // dropped/reordered packet → the assembled section is corrupt, so
-            // abandon it rather than splicing in misordered payload. The CC
-            // lives in the low nibble of the 4th TS-header byte (offset+7 here:
-            // the BD-TS 4-byte prefix precedes the sync byte).
+            // Need continuation packets: same PID, no PUSI. Use the canonical `cc_is_gap`
+            // (§2.4.3.3) shared with `process_packet`, not a local test — a prior local
+            // `cc != expected` rejected legal duplicates and miscounted AF-only packets as gaps.
             let mut last_cc = Some(data[offset + 7] & 0x0F);
             let mut scan = offset + BD_SOURCE_PACKET_BYTES;
             let mut desync = false;
             while scan + BD_SOURCE_PACKET_BYTES <= data.len() && section.len() < total {
-                // Require a corroborated resync point (this sync byte plus the
-                // follower one packet ahead) before trusting the header. A
-                // stray 0x47 in corrupt payload would otherwise misread the CC
-                // and fire a false desync.
+                // Require a corroborated resync point before trusting the header — a
+                // stray 0x47 in corrupt payload could otherwise misread the CC.
                 if !is_resync_point(data, scan) {
                     scan += 1;
                     continue;
@@ -809,11 +763,8 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
                 let cpid = (((data[scan + 5] & 0x1F) as u16) << 8) | data[scan + 6] as u16;
                 let cpusi = data[scan + 5] & 0x40 != 0;
                 if cpid == target_pid && !cpusi {
-                    // Continuation packets may also carry an adaptation field;
-                    // compute their payload base the same way. `None` = the
-                    // packet carries NO payload (adaptation field only, or a
-                    // malformed AF): §2.4.3.3 does not increment the CC for
-                    // those, so they take no part in the continuity check.
+                    // `None` = no payload (AF-only or malformed AF): §2.4.3.3 doesn't
+                    // increment the CC for those, so they skip the continuity check.
                     let Some(cbase) = psi_payload_base(&data[scan..scan + BD_SOURCE_PACKET_BYTES])
                     else {
                         scan += BD_SOURCE_PACKET_BYTES;
@@ -898,10 +849,8 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
         // Clamp the section end to the reassembled bytes; a malformed
         // section_len must never drive reads past `pmt`.
         let end = (3 + section_len - 4).min(pmt.len());
-        // Clamp prog_info_len so it cannot push `pos` past `end`.
-        // ISO 13818-1 requires program_info to fit within the PMT section;
-        // a crafted value larger than the remaining section would skip all
-        // ES entries and, in pathological cases, wrap or mis-index.
+        // Clamp prog_info_len so it can't push `pos` past `end`: a crafted value
+        // larger than the remaining section would skip all ES entries or mis-index.
         let prog_info_len =
             ((((pmt[10] & 0x0F) as usize) << 8) | pmt[11] as usize).min(end.saturating_sub(12));
         let mut pos = 12 + prog_info_len;
@@ -911,11 +860,8 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
             let es_pid = (((pmt[pos + 1] & 0x1F) as u16) << 8) | pmt[pos + 2] as u16;
             let es_info_len = (((pmt[pos + 3] & 0x0F) as usize) << 8) | pmt[pos + 4] as usize;
 
-            // Single source of truth for stream_type → Codec: reuse
-            // `Codec::from_coding_type` (the same table the BD STN /
-            // disc scanner uses) so the two mappings can never drift.
-            // We only retain the category (video/audio/subtitle) and
-            // per-kind default attribute logic here.
+            // Single source of truth for stream_type → Codec: reuse `Codec::from_coding_type`
+            // (same table the BD STN/disc scanner uses) so the two mappings can't drift.
             let codec = Codec::from_coding_type(stream_type);
             let stream = match codec.kind() {
                 CodecKind::Video => {
@@ -1499,18 +1445,13 @@ mod tests {
 
     #[test]
     fn short_pes_payload_injects_no_header_bytes() {
-        // A PUSI packet whose payload is NOT a valid PES start
-        // (no 00 00 01 start code / too short) must contribute ZERO bytes to
-        // the assembled elementary stream — otherwise a stray 00 00 01 in the
-        // garbage masquerades as an Annex-B NAL / PES start code in the codec
-        // parser. Only the following well-formed continuation bytes survive.
+        // A PUSI packet with no valid PES start must contribute zero bytes, or a
+        // stray 00 00 01 in the garbage masquerades as an Annex-B/PES start code.
         let pid = 0x1011;
         let mut demux = TsDemuxer::new(&[pid]);
 
-        // Garbage PUSI payload with NO valid PES start code (no leading
-        // 00 00 01). It must parse as malformed → header_len 0 → nothing
-        // pushed. The bytes include a 00 00 01 03 sequence mid-payload that,
-        // if leaked, would masquerade as an Annex-B NAL / PES start code.
+        // Garbage PUSI payload with no leading 00 00 01: must parse as malformed
+        // (header_len 0). Includes a 00 00 01 03 sequence mid-payload to catch leaks.
         let mut garbage = vec![0xAAu8; 32];
         garbage[8] = 0x00;
         garbage[9] = 0x00;
@@ -1638,10 +1579,8 @@ mod tests {
         assert!(!tail.is_empty(), "test must actually span two packets");
         p1[..tail.len()].copy_from_slice(tail);
         let mut pkt1 = bdts_packet(p1, pmt_pid, false);
-        // Continuity counter must increment from the PUSI packet (CC=0) to its
-        // continuation (CC=1) — `collect_psi_section` rejects a CC gap as a
-        // desync. The CC lives in the low nibble of TS-header byte 4 (offset 7
-        // here, after the 4-byte BD-TS timecode prefix).
+        // CC must increment from PUSI (CC=0) to continuation (CC=1), or
+        // `collect_psi_section` rejects it as a desync.
         pkt1[7] = (pkt1[7] & 0xF0) | 0x01;
 
         let mut out = pkt0;
@@ -1981,10 +1920,8 @@ mod tests {
 
     #[test]
     fn parse_pes_header_extension_less_stream_ids_report_len_6() {
-        // ISO 13818-1 Table 2-22: program_stream_map(0xBC), padding(0xBE),
-        // private_stream_2(0xBF), ECM(0xF0), EMM(0xF1), DSMCC(0xF2),
-        // H.222.1 type E(0xF8), program_stream_directory(0xFF) carry NO
-        // standard PES header extension → header_len 6, no PTS/DTS.
+        // ISO 13818-1 Table 2-22: these stream IDs carry no PES header
+        // extension → header_len 6, no PTS/DTS.
         for sid in [0xBCu8, 0xBE, 0xBF, 0xF0, 0xF1, 0xF2, 0xF8, 0xFF] {
             let buf = [0x00, 0x00, 0x01, sid, 0x00, 0x00, 0x80, 0xC0, 0x0A];
             let (pts, dts, hl) = parse_pes_header(&buf);
@@ -2031,10 +1968,8 @@ mod tests {
 
     #[test]
     fn parse_pes_header_len_is_uncapped() {
-        // header_len must be the FULL 9 + header_data_length even when it
-        // exceeds the slice — the caller relies on this to skip header bytes
-        // that spill into continuation packets. A capped length would leak
-        // header bytes into the ES.
+        // header_len must be the full 9 + header_data_length even past the slice,
+        // so the caller can skip header bytes spilling into continuation packets.
         let buf = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 200];
         let (_, _, hl) = parse_pes_header(&buf);
         assert_eq!(
@@ -2145,10 +2080,8 @@ mod tests {
             0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00, // PES header (hdr_len 0)
             0x77, 0x88,
         ];
-        // TS payload area is 184 bytes. Size the AF so it consumes exactly
-        // everything except the PES, leaving no zero padding for the
-        // length-0 (unbounded) video PES to absorb. AF stuffing = 0xBB to
-        // prove it never leaks into the ES.
+        // Size the AF to consume exactly everything except the PES (no zero padding
+        // for the length-0 video PES to absorb). AF stuffing = 0xBB to catch leaks.
         let payload_area = 184usize;
         let af_total = payload_area - pes.len(); // bytes incl. length byte
         let af_field_len = af_total - 1; // bytes after the length byte
@@ -2214,10 +2147,8 @@ mod tests {
 
     #[test]
     fn pes_header_spanning_two_packets_is_fully_skipped() {
-        // A PES header (9 + header_data_length) can exceed the 184-byte
-        // payload of one TS packet. The spillover header bytes on the next
-        // continuation packet must be skipped, NOT appended as ES — else a
-        // bogus 00 00 01 start code corrupts the codec stream.
+        // A PES header can exceed one TS packet's payload; spillover header bytes on
+        // the continuation packet must be skipped, not appended, or the ES corrupts.
         let pid = 0x1011;
         let mut demux = TsDemuxer::new(&[pid]);
         // header_data_length = 184 → header_len = 193 > 184 payload.
@@ -2438,19 +2369,15 @@ mod tests {
 
     #[test]
     fn scan_streams_oversized_prog_info_len_does_not_panic() {
-        // Regression: a PMT with prog_info_len larger than the section body
-        // must not panic, index out of bounds, or silently corrupt `pos`.
-        // The parser must clamp it and still return None (no valid ES entries
-        // past the inflated descriptor region).
+        // Regression: a PMT with prog_info_len larger than the section body must
+        // not panic or index OOB; the parser must clamp it and return None.
         let pmt_pid = 0x0100u16;
 
         // Build a minimal PAT pointing at pmt_pid.
         let mut data = pat_packet(pmt_pid);
 
-        // Craft a raw PMT TS packet with prog_info_len = 0x0FFF (4095),
-        // which is far larger than the actual section content.  The section
-        // itself only holds a single H.264 ES entry (5 bytes) so the real
-        // prog_info_len must be 0.
+        // Craft a raw PMT with prog_info_len = 0x0FFF (4095), far larger than the
+        // actual section (a single 5-byte H.264 ES entry; real prog_info_len is 0).
         let mut body = [0xFFu8; 184];
         body[0] = 0x00; // pointer_field
         let s = 1;
@@ -2541,15 +2468,9 @@ mod tests {
 
     #[test]
     fn pes_buffer_cap_resets_on_overflow_and_recovers_on_next_pusi() {
-        // Feed continuation-only packets that would exceed MAX_PES_BUFFER if
-        // allowed to accumulate, then verify:
-        //   (a) the assembler buffer never grows past the cap,
-        //   (b) a subsequent valid PUSI + continuation produces a correct PES.
-        //
-        // Each continuation packet carries 184 ES bytes.  We need enough packets
-        // to exceed MAX_PES_BUFFER even after the cap resets the buffer between
-        // overflows.  Sending (MAX_PES_BUFFER / 184) + 2 packets guarantees at
-        // least one cap-trigger regardless of internal doubling.
+        // Feed continuation-only packets past MAX_PES_BUFFER, then verify the buffer
+        // never exceeds the cap and a later PUSI + continuation still produces a
+        // correct PES. (MAX_PES_BUFFER / 184) + 2 packets guarantees a cap-trigger.
         let pid = 0x1011u16;
         let mut demux = TsDemuxer::new(&[pid]);
 

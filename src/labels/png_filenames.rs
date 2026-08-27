@@ -7,7 +7,7 @@
 //! of menu languages the disc ships.
 //!
 //! This is a language-only hint (no per-stream purpose/codec), so it runs at
-//! [`Confidence::Low`] — it never displaces a real framework parser, and it
+//! [`Confidence::Low`](super::Confidence::Low) — it never displaces a real framework parser, and it
 //! sits at the same tier as the MPLS floor. It is here so the pattern is a
 //! first-class, testable parser that keeps picking up discs as the corpus
 //! grows, rather than lost logic. Detection is precise: it fires only on the

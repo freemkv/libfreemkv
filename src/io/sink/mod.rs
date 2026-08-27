@@ -94,11 +94,9 @@ pub(crate) fn open_for_mkv(
             return Ok(Box::new(wf));
         }
     }
-    // Only Linux differentiates the sink by filesystem type (NFS gets
-    // the WritebackFile machinery); every other OS always uses
-    // `LocalFileSink`. Reference `detect` as a value (no call, no
-    // `statfs` syscall) so it isn't flagged dead on non-Linux while
-    // still avoiding the wasted probe whose result we'd discard.
+    // Only Linux differentiates the sink by filesystem type; other OSes always use
+    // `LocalFileSink`. Reference `detect` as a value (no call/syscall) so it isn't
+    // flagged dead on non-Linux while avoiding a wasted probe.
     #[cfg(not(target_os = "linux"))]
     let _ = crate::platform::fs_type::detect;
 
