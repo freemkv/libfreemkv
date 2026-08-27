@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS: hold a DiskArbitration claim (plus a mount-approval dissenter) for the SCSI transport's lifetime so `diskarbitrationd` can't remount the disc mid-rip — the cause of the E1000 "disc stolen mid-rip" failure on macOS.
+
+### Changed
+
+- Comment and documentation cleanup.
+
 ## [1.6.11] — 2026-08-26
 
 ### Added
