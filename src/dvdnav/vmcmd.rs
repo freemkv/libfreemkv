@@ -159,15 +159,9 @@ fn be16(b: &[u8; 8], o: usize) -> u16 {
     ((b[o] as u16) << 8) | b[o + 1] as u16
 }
 
-// Compare-operand layouts ("if_version"s) per the DVD-Video VM. The op
-// nibble is always `byte1` bits 6-4; the immediate flag is `byte1` bit 7. The
-// operand *offsets* differ by command family.
-//
-// v1 (special + link): lhs reg = b[3]; rhs imm = bytes4-5 / rhs reg = b[5]
-//   (the register operand is the low byte of the reg-or-immediate field).
-// v2 (jump + system-set): lhs reg = b[6]; rhs reg = b[7] (registers only).
-// v3 (set-GPRM): lhs reg = b[2]; rhs imm = bytes6-7 / rhs reg = b[7]
-//   (the register operand is the low byte of the reg-or-immediate field).
+// Compare-operand layouts ("if_version"s): op nibble = byte1 bits 6-4, imm
+// flag = byte1 bit 7; offsets differ by family: v1(special/link) lhs=b[3],
+// rhs=b[4:6]/b[5]; v2(jump/sys-set) lhs=b[6],rhs=b[7]; v3(set-GPRM) lhs=b[2],rhs=b[6:8]/b[7].
 fn if_v1(b: &[u8; 8]) -> Option<Compare> {
     let op = (b[1] >> 4) & 7;
     (op != 0).then(|| Compare {

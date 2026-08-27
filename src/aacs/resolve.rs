@@ -5,10 +5,9 @@ use super::derive::*;
 use super::inf::*;
 use super::mkb::*;
 
-//
 // Canonical form is `<category>1003` (low 16 bits `0x1003` is a fixed marker).
 // Types 3/4/10 are from the AACS Common Cryptographic Elements spec (0.953,
-// §3.2.5.1.1); the Category-C 2.0/2.1 values are the standard MKB type constants.
+// §3.2.5.1.1); Category-C 2.0/2.1 values are the standard MKB type constants.
 
 // ── Full VUK resolution chain ───────────────────────────────────────────────
 
@@ -136,13 +135,13 @@ pub(crate) fn classify_resolve_failure(ctx: &ResolveContext<'_>) -> ResolveFailu
 }
 
 /// AACS 1.0 key resolution. Parses `Unit_Key_RO.inf` with 48-byte
-/// stride. Tries paths 1 → 4 in order.
+/// stride. Tries paths 1 → 5 in order (via `resolve_keys_classical`).
 pub fn resolve_keys_v1(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
     resolve_keys_classical(ctx, AacsVersion::V10)
 }
 
 /// AACS 2.0 key resolution. Parses `Unit_Key_RO.inf` with 64-byte
-/// stride. Tries paths 1 → 4 in order. When paths 3/4 succeed against
+/// stride. Tries paths 1 → 5 in order. When paths 3/4 succeed against
 /// an MKB carrying Variant records (`0x2d` / `0x2f`), the result's
 /// `version` is upgraded to [`AacsVersion::V21`] — derivation still
 /// runs through the classical V2 path; the V21-specific Variant chain
@@ -210,9 +209,8 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
 
     if has_vid {
         // Path 1: Variant chain (V21's analogue of classical Path 1's DK
-        // derivation). Derive the Processing Key from device keys first (DK → PK
-        // via the variant walk), then run the PK → Km variant primitive and
-        // derive the per-disc VUK from Km + VID.
+        // derivation): DK → PK via variant walk, then PK → Km, then VUK
+        // from Km + VID.
         if let Some(mkb) = ctx.mkb {
             let recs = super::mkb::walk_mkb(mkb);
             let all_dks = providers.device_keys();
@@ -242,10 +240,9 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
         // Path 3: pre-computed MK + matching VID → derived VUK.
         // Short-circuit: first provider with a matching VID wins.
         if let Some(entry) = providers.lookup_disc_by_vid(ctx.volume_id) {
-            // The entry already matched by VID and derive_vuk needs only mk +
-            // ctx.volume_id, so a provider that matches by VID without
-            // populating disc_id (e.g. a webservice) must not have its MK
-            // dropped — gate on the MK alone.
+            // Already matched by VID and derive_vuk needs only mk + volume_id, so a
+            // provider matching by VID without disc_id (e.g. a webservice) must not
+            // lose its MK — gate on the MK alone.
             if let Some(mk) = entry.media_key {
                 let vuk = derive_vuk(&mk, ctx.volume_id);
                 tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_v21_path3_hit", "MK+VID entry matched volume_id");
@@ -371,13 +368,9 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
             }
             tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path2_miss", pk_count = all_pks.len(), "PK derivation failed");
 
-            // Path 2.5: MK-pool brute. keydb stores Media Keys per-disc, but an
-            // MK is MKB-scoped (shared across a pressing/MKB-family). A disc
-            // whose own hash/VID isn't keyed can still resolve if ANY stored MK
-            // verifies against its MKB. Try every distinct MK via km_verifies;
-            // a UNIQUE pass is this disc's Km → derive VUK (needs VID) → UK.
-            // One AES-D + magic check per candidate (cheap). mk_dv is hoisted
-            // out of the loop so the MKB is not re-walked per candidate.
+            // Path 2.5: MK-pool brute. An MK is MKB-scoped, so a disc whose own
+            // hash/VID isn't keyed can still resolve if ANY stored MK verifies (a
+            // UNIQUE pass via km_verifies is this disc's Km); mk_dv is hoisted out.
             let mks = providers.media_keys();
             let chosen_mk = mkb_find_mk_dv(mkb).and_then(|mk_dv| {
                 unique_verifying_mk(&mks, |mk| {
@@ -398,10 +391,9 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
         // Path 3: pre-computed MK + matching VID → derived VUK.
         // Short-circuit: first provider with a matching VID wins.
         if let Some(entry) = providers.lookup_disc_by_vid(ctx.volume_id) {
-            // The entry already matched by VID and derive_vuk needs only mk +
-            // ctx.volume_id, so a provider that matches by VID without
-            // populating disc_id (e.g. a webservice) must not have its MK
-            // dropped — gate on the MK alone.
+            // Already matched by VID and derive_vuk needs only mk + volume_id, so a
+            // provider matching by VID without disc_id (e.g. a webservice) must not
+            // lose its MK — gate on the MK alone.
             if let Some(mk) = entry.media_key {
                 let vuk = derive_vuk(&mk, ctx.volume_id);
                 tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path3_hit", "MK+VID entry matched volume_id");
@@ -586,11 +578,9 @@ mod tests {
 
     #[test]
     fn derive_media_key_from_dk_survives_out_of_range_u_mask_shift() {
-        // Regression: a crafted/corrupt MKB with a Subset-Difference
-        // u_mask_shift of 32..=63 (passes the 0xC0 revoked-marker check but
-        // overflows `0xFFFF_FFFF << shift`) used to panic in debug / compute a
-        // wrong mask in release. The walk must now skip the bad slot and
-        // return cleanly (no panic) on disc-controlled bytes.
+        // Regression: a u_mask_shift of 32..=63 (passes the 0xC0 revoked-marker
+        // check but overflows `0xFFFF_FFFF << shift`) used to panic in debug /
+        // compute a wrong mask in release. The walk must skip the bad slot.
         let mut mkb: Vec<u8> = Vec::new();
         // 0x81 record: 4-byte header + 16-byte mk_dv body (rec_len = 20).
         mkb.extend_from_slice(&[0x81, 0x00, 0x00, 0x14]);
@@ -616,14 +606,9 @@ mod tests {
 
     #[test]
     fn test_decrypt_unit_key_from_vuk() {
-        // VUK → encrypted unit key → unit key roundtrip. The keydb-sourced
-        // variant of this test (which scanned a real KEYDB for VUK + unit
-        // keys) moved to freemkv-keysources; this rebuilt version exercises
-        // the same AES-G primitive (decrypt_unit_key ∘ aes_ecb_encrypt under a
-        // VUK) with directly-constructed material, so it needs no parser and
-        // keeps the crypto covered in libfreemkv. `aes_ecb_encrypt` is
-        // pub(crate), reachable here but not from keysources — the reason this
-        // half stays.
+        // VUK → encrypted unit key → unit key roundtrip. The keydb-sourced variant
+        // moved to freemkv-keysources; this exercises the same AES-G primitive
+        // with directly-constructed material — `aes_ecb_encrypt` is pub(crate).
         use super::super::crypto::aes_ecb_encrypt;
         let vuk = [0x5Au8; 16];
         // A few representative "decrypted" unit keys.
@@ -743,11 +728,9 @@ mod tests {
 
     #[test]
     fn trim_mkb_never_zeroes_an_unrecognised_mkb() {
-        // Regression: the 0.31.0 read_aacs_inputs path truncated the MKB to
-        // mkb_content_len() unconditionally. For an MKB whose first record the
-        // parser can't read, mkb_content_len() returns 0 → an unconditional
-        // truncate zeroed the MKB, so autorip sent an EMPTY MKB to the key
-        // service (or skipped the request). trim_mkb must leave it intact.
+        // Regression: 0.31.0 truncated the MKB to mkb_content_len() unconditionally.
+        // For an unparseable first record, mkb_content_len() returns 0, so autorip
+        // sent an EMPTY MKB to the key service. trim_mkb must leave it intact.
         let unrecognised = vec![0xFFu8; 4096]; // first "rec_type" 0xFF, rec_len huge → content_len 0
         assert_eq!(
             mkb_content_len(&unrecognised),
@@ -809,11 +792,9 @@ mod tests {
 
     #[test]
     fn probe_try_pk_against_tables_accepts_planted_pk_rejects_corrupt() {
-        // Lock in the terminal PK scan (`try_pk_against_tables`) used by the
-        // production PK path (`derive_media_key_from_pk`). Plant a terminal PK
-        // whose derived Media Key satisfies a synthetic verify record; confirm
-        // the scan ACCEPTS it against caller-supplied SD/cvalue tables and
-        // REJECTS a 1-byte corruption.
+        // Lock in the terminal PK scan (`try_pk_against_tables`) used by
+        // `derive_media_key_from_pk`: a planted PK whose derived MK satisfies a
+        // synthetic verify record must be ACCEPTED; a 1-byte corruption REJECTED.
         use super::super::crypto::aes_ecb_encrypt as enc;
 
         let pk: [u8; 16] = [
@@ -855,11 +836,9 @@ mod tests {
 
     #[test]
     fn validate_processing_key_round_trip_with_nonzero_uv() {
-        // Synthesise a (pk, uv, mk, cvalue, mk_dv) tuple that satisfies the
-        // AACS PK-validation relation, then confirm validate_processing_key
-        // recovers mk. Catches the bugs that landed pre-fix:
-        //   * uv XOR step was missing → mk wrong whenever uv != 0
-        //   * AES-128E + 12-zero check instead of AES-128D + magic
+        // Synthesise a (pk, uv, mk, cvalue, mk_dv) tuple satisfying the AACS
+        // PK-validation relation; confirms validate_processing_key recovers mk.
+        // Catches pre-fix bugs: missing uv XOR, and AES-128E+zero-check vs 128D+magic.
         use super::super::crypto::{aes_ecb_decrypt as dec, aes_ecb_encrypt as enc};
 
         let pk: [u8; 16] = [
@@ -872,10 +851,8 @@ mod tests {
         ];
         let uv: [u8; 4] = [0x00, 0x00, 0x04, 0x00];
 
-        // cvalue is what AES-128E(pk, mk') gives, where mk' = mk with the
-        // last-4-bytes-uv XOR pre-undone:
-        //   mk_raw[12..16] = mk[12..16] XOR uv  (so the validate step XORs
-        //   uv back in and recovers mk).
+        // cvalue is AES-128E(pk, mk') where mk' = mk with last-4-bytes-uv XOR
+        // pre-undone, so the validate step XORs uv back in and recovers mk.
         let mut mk_raw = mk;
         for a in 0..4 {
             mk_raw[12 + a] ^= uv[a];
@@ -907,16 +884,9 @@ mod tests {
         assert!(validate_processing_key(&pk, &cvalue, &wrong_uv, &mk_dv).is_none());
     }
 
-    // ── MKB cvalue-record selection (issue #259 / #281) ─────────────────
-    //
-    // The cvalue (Media Key Data) table is record 0x05; the
-    // Subset-Difference index is record 0x04 (the standard AACS MKB layout:
-    // 0x05 = cvalues, 0x04 = subset-difference index). Record 0x07
-    // (Explicit Subset-Difference Record) is NOT the cvalue table. On real
-    // in-drive AACS 2.x UHD MKBs 0x07 is small (~96 entries) while the 0x05
-    // table is large (181270 entries, 1:1 with 0x04). An earlier
-    // `mkb_find_cvalues` preferred 0x07, which under-tested the SD walk and
-    // broke the DK→walk path. The selector must prefer 0x05.
+    // ── MKB cvalue-record selection (issue #259 / #281): cvalue (Media Key Data)
+    // is record 0x05, not 0x07 (Explicit SD, small ~96 entries vs 0x05's 181270).
+    // An earlier `mkb_find_cvalues` wrongly preferred 0x07, breaking DK→walk.
 
     /// Build a 4-byte MKB record header (type + 3-byte big-endian total
     /// length, header included) and append `body`.
@@ -1012,12 +982,9 @@ mod tests {
 
     #[test]
     fn real_aacs2_samples_select_large_0x05_not_small_0x07() {
-        // Real in-drive AACS 2.x UHD MKBs carry BOTH a small 0x07
-        // Explicit-Subset-Difference record (96 16-byte entries) AND the
-        // large 0x05 Media Key Data / cvalue table (181270 entries, 1:1
-        // with the 0x04 index). The production selector must return the
-        // LARGE 0x05 body, not the small 0x07 one. This is the exact
-        // regression #259 found. Skips when no sample dir is present.
+        // Real AACS 2.x UHD MKBs carry BOTH a small 0x07 record (96 entries) AND
+        // the large 0x05 cvalue table (181270 entries); selector must return the
+        // LARGE 0x05 body — the exact regression #259. Skips if no sample dir.
         let samples = [
             "sample-a/MKB_RO.inf",
             "sample-b/MKB_RO.inf",
@@ -1116,19 +1083,15 @@ mod tests {
 
     #[test]
     fn resolve_keys_skips_paths_2_through_4_when_vid_is_zero() {
-        // No VID -> paths 2/3/4 cannot succeed. The function must
-        // return None WITHOUT touching the MKB / device keys, so we
-        // can pass an MKB that would otherwise cause expensive
-        // derivation work — it must not be consumed.
+        // No VID -> paths 2/3/4 cannot succeed. Must return None WITHOUT touching
+        // the MKB/device keys, so an MKB that would cause expensive derivation
+        // work can be passed here and must not be consumed.
         let uk_ro = minimal_unit_key_ro();
         let zero_vid = [0u8; 16];
 
-        // A provider carrying a dummy processing key but NO disc entry that
-        // matches this disc. `disc_entry: None` preserves the negative-miss
-        // the test asserts: with VID=0, paths 1/2/3 are skipped and the
-        // path-4/5 hash lookup must MISS (a SuppliedKey returns its
-        // disc_entry unconditionally, so the planted entry would WRONGLY hit
-        // path 4 — None keeps the miss).
+        // Dummy processing key, NO matching disc entry: `disc_entry: None` keeps
+        // the path-4/5 hash lookup a miss (SuppliedKey returns disc_entry
+        // unconditionally, so a planted entry would WRONGLY hit path 4).
         let keydb = SuppliedKey {
             device_keys: Vec::new(),
             processing_keys: vec![[0u8; 16]],
@@ -1153,10 +1116,9 @@ mod tests {
 
     #[test]
     fn resolve_keys_path4_still_runs_when_vid_is_zero() {
-        // Path 4 (disc-hash → VUK) doesn't need VID. Confirm the
-        // short-circuit doesn't block it: install a keydb entry whose
-        // disc_hash matches the fixture's hash, with a known VUK, and
-        // verify resolve_keys returns it with key_source = 4.
+        // Path 4 (disc-hash → VUK) doesn't need VID; confirm the short-circuit
+        // doesn't block it: install a keydb entry whose disc_hash matches the
+        // fixture with a known VUK, verify resolve_keys returns key_source = 4.
         let uk_ro = minimal_unit_key_ro();
         let hash = disc_hash(&uk_ro);
         // `find_disc` lowercases the incoming hash; the entry map is
@@ -1195,10 +1157,9 @@ mod tests {
 
     #[test]
     fn resolve_keys_path5_uses_keydb_unit_keys_when_vuk_absent() {
-        // Path 5: an entry with no VUK but with pre-decrypted unit
-        // keys matching the disc's CPS-unit numbering decrypts the
-        // disc directly. Covers the ~4,572 U-only KEYDB entries
-        // (mostly MKBv76+ UHDs) that the resolver previously ignored.
+        // Path 5: an entry with no VUK but pre-decrypted unit keys matching the
+        // disc's CPS-unit numbering decrypts directly. Covers the ~4,572 U-only
+        // KEYDB entries (mostly MKBv76+ UHDs) the resolver previously ignored.
         let uk_ro = minimal_unit_key_ro();
         let hash = disc_hash(&uk_ro);
         let hash_hex = disc_hash_hex(&hash).to_lowercase();
@@ -1237,11 +1198,9 @@ mod tests {
     }
     #[test]
     fn resolve_keys_path5_rejects_partial_unit_key_coverage() {
-        // If the disc declares a CPS unit that's not in the KEYDB
-        // entry's unit_keys, path 5 must NOT half-decrypt the disc.
-        // The match function returns None and the resolver falls
-        // through to None overall (no other paths available in this
-        // setup).
+        // If the disc declares a CPS unit not in the KEYDB entry's unit_keys, path
+        // 5 must NOT half-decrypt: match returns None and the resolver falls
+        // through to None overall (no other paths available here).
         let uk_ro = minimal_unit_key_ro();
         let hash = disc_hash(&uk_ro);
         let hash_hex = disc_hash_hex(&hash).to_lowercase();
@@ -1295,13 +1254,9 @@ mod tests {
         );
         // This disc's inf (its hash will NOT be in keydb).
         let uk_ro = minimal_unit_key_ro();
-        // The sibling's MK is lifted directly into the MK pool: a KeyDb
-        // aggregated per-disc media_keys into media_keys(), but SuppliedKey
-        // does NOT harvest its disc_entry's media_key — it has an explicit
-        // media_keys field. `disc_entry: None` preserves the miss on this
-        // disc's own hash/VID (the sibling matches neither), so ONLY the
-        // MK-pool brute (km_verifies) can resolve it — exactly the path under
-        // test.
+        // The sibling's MK is lifted into the MK pool via SuppliedKey's explicit
+        // media_keys field; `disc_entry: None` keeps this disc's own hash/VID a
+        // miss, so ONLY the MK-pool brute (km_verifies) can resolve it.
         let keydb = SuppliedKey {
             device_keys: Vec::new(),
             processing_keys: Vec::new(),
@@ -1407,9 +1362,7 @@ mod tests {
         data[1] = 0x01;
         assert!(!parse_content_cert(&data).unwrap().bus_encryption);
     }
-    // ════════════════════════════════════════════════════════════════════
-    // Hardening additions
-    // ════════════════════════════════════════════════════════════════════
+    // ════════════════ Hardening additions ════════════════
     // ── VUK derivation: spec relation VUK = AES-D(MK, VID) XOR VID ─────────
     #[test]
     fn derive_vuk_matches_spec_relation_explicitly() {
@@ -1467,11 +1420,9 @@ mod tests {
     }
     #[test]
     fn stride_v10_is_48_v20_is_64_and_picks_distinct_keys() {
-        // AACS 1.0 stride = 48, AACS 2.0/2.1 stride = 64 (aacs/inf.rs).
-        // Lay keys at 64-byte stride. Parsing at V20 stride must pick exactly
-        // those keys; parsing the SAME bytes at V10 (48) stride would read the
-        // wrong (intermediate) bytes for key 2 onward — proving the stride
-        // selector matters.
+        // AACS 1.0 stride = 48, 2.0/2.1 = 64. Keys laid at 64-byte stride: V20
+        // parsing must pick exactly those keys, while V10 (48) parsing the SAME
+        // bytes would read wrong intermediate bytes for key 2 onward.
         let data = build_unit_key_ro(2, 64);
         let v20 = parse_unit_key_ro(&data, AacsVersion::V20).unwrap();
         assert_eq!(v20.encrypted_keys.len(), 2);
@@ -1533,11 +1484,9 @@ mod tests {
     }
     #[test]
     fn parse_unit_key_ro_rejects_when_keys_run_off_end() {
-        // Finding #5: 3 keys declared but the buffer holds only 2 strides plus
-        // 8 trailing bytes (not a full 3rd 16-byte key). The extraction loop
-        // breaks at the buffer end (never reading OOB), and the post-loop
-        // length check rejects the short list with None — a truncated/malformed
-        // .inf must NOT be silently accepted with fewer keys than declared.
+        // Finding #5: 3 keys declared but buffer holds only 2 strides + 8 spare
+        // bytes. Extraction loop breaks at buffer end (never OOB), and the
+        // post-loop length check rejects the short list rather than accepting fewer.
         let uk_pos = 0x60usize;
         let stride = 48usize;
         // Room for keys at uk_pos+48 and uk_pos+48+48, then only 8 spare bytes
@@ -1579,10 +1528,9 @@ mod tests {
     }
     #[test]
     fn parse_unit_key_ro_title_cps_mapping_first_play_top_menu_then_titles() {
-        // [20..22] first_play, [22..24] top_menu, [24..26] num_titles, then
-        // per-title 2-byte pad + 2-byte CPS unit at 26 + i*4 + 2. Each on-disc
-        // 1-based CPS number in `1..=num_uk` is validated and converted to a
-        // 0-based key index (per the AACS Unit_Key_RO format); an out-of-range number → 0.
+        // [20..22] first_play, [22..24] top_menu, [24..26] num_titles, then per-title
+        // 2-byte pad + 2-byte CPS unit at 26 + i*4 + 2. Each on-disc 1-based CPS
+        // number in `1..=num_uk` converts to a 0-based key index; out-of-range → 0.
         let mut data = build_unit_key_ro(4, 64); // num_uk = 4 → CPS 1..=4 valid
         data[20..22].copy_from_slice(&1u16.to_be_bytes()); // first_play CPS 1
         data[22..24].copy_from_slice(&2u16.to_be_bytes()); // top_menu  CPS 2
@@ -2046,17 +1994,9 @@ mod tests {
 
     #[test]
     fn derive_media_key_and_pk_from_dk_returns_intermediate_pk() {
-        // Regression: a classical DK boil must yield the intermediate
-        // Processing Key, not just the Media Key. The key service banks the
-        // PK lineage (DK·PK·MK·VUK·UK); before the `_and_pk_` form existed it
-        // recovered the MK here but lost the PK silently.
-        //
-        // Build a minimal classical MKB (no 0x82/0x83) with:
-        //   - 0x04 Subset-Difference: u_mask_shift=3, uv=0x00000002
-        //   - 0x05 cvalues: one cvalue C planted so AES-D(Kp, C) XOR uv == mk
-        //   - 0x86 Verify Media Key: mk_dv = AES-E(mk, magic || pad)
-        // and a DK with node=4, uv=2, u_mask_shift=3 so dev_key_v_mask ==
-        // v_mask: the calc_pk_from_dk loop is a no-op and Kp == aesg3(dk, 1).
+        // Regression: a classical DK boil must yield the intermediate PK too
+        // (key service banks DK·PK·MK·VUK·UK; before `_and_pk_` it lost the PK).
+        // Builds a minimal MKB with a DK whose calc_pk_from_dk walk is a no-op.
         use super::super::crypto::aes_ecb_encrypt as enc;
 
         let dk_bytes: [u8; 16] = [
@@ -2126,12 +2066,8 @@ mod tests {
     }
 
     // ── resolve_keys_with_reason / classify_resolve_failure ────────────────
-    //
-    // The rc.6 E7017/E7022 split is also exercised end-to-end through the
-    // `ensure_decryptable` gate in `disc/mod.rs`. These tests pin the
-    // *classifier* directly at the aacs::resolve seam and cover the branches the
-    // gate test does not: VID-present (must never be VidUnavailable), the
-    // processing-keys-only material path, and the version dispatch / Ok path.
+    // Also exercised end-to-end via `ensure_decryptable` in `disc/mod.rs`; these
+    // pin the *classifier* directly, covering branches that gate test doesn't.
 
     /// A `SuppliedKey` provider with the given derivation material and no
     /// disc-keyed entry. Mirrors the construction the gate test uses, lifted to

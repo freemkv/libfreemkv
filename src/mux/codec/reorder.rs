@@ -9,7 +9,7 @@
 //! this by reconstructing per-picture PTS from `temporal_reference`; these three
 //! codecs carry no such field.)
 //!
-//! [`SparsePtsReorder`] reconstructs a display-order PTS for every frame from two
+//! [`SparsePtsReorder`](crate::mux::codec::reorder::SparsePtsReorder) reconstructs a display-order PTS for every frame from two
 //! signals the parsers already provide — the coded picture type (I/P/B) and the
 //! sparse anchor PTS — plus a per-frame duration self-calibrated from the spacing
 //! between consecutive GOP anchors (no external frame-rate needed). It mirrors
@@ -110,12 +110,9 @@ impl SparsePtsReorder {
             .coding
             .map(|c| c.coding_type())
             .unwrap_or(CodingType::P);
-        // A keyframe opens a new GOP: the picture already accumulated in `cur` is
-        // a complete GOP. Complete it (this frame belongs to the NEW GOP). Also
-        // force-complete a pathologically long run that never signalled a
-        // keyframe — bounded by BOTH frame count and total buffered bytes, so a
-        // crafted/corrupt stream of few-but-huge access units cannot buffer
-        // without bound.
+        // A keyframe opens a new GOP: whatever is in `cur` is a complete GOP, so
+        // complete it. Also force-complete a run with no keyframe, bounded by
+        // frame count AND bytes, so few-but-huge access units can't buffer unbounded.
         let mut out = Vec::new();
         let over_cap = self.cur.len() >= MAX_GOP_FRAMES || self.cur_bytes >= MAX_GOP_BYTES;
         if (frame.keyframe || over_cap) && !self.cur.is_empty() {
@@ -163,11 +160,9 @@ impl SparsePtsReorder {
         let mut out = Vec::new();
         match self.held.take() {
             Some(held) => {
-                // Calibrate a per-frame duration from the two anchors' spacing,
-                // spread across the held GOP's display-frame count. Approximate
-                // (assumes both anchors sit at a similar relative display slot),
-                // but each GOP re-locks its own origin, so the estimate only sets
-                // intra-GOP spacing.
+                // Calibrate a per-frame duration from the two anchors' spacing over
+                // the held GOP's frame count. Approximate, but each GOP re-locks
+                // its own origin, so this only sets intra-GOP spacing.
                 if self.dur_ns == 0
                     && let (Some((p_held, _)), Some((p_next, _))) = (held.anchor, gop.anchor)
                 {

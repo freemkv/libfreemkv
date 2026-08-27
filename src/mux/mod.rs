@@ -30,17 +30,9 @@ pub mod pipelined_stream;
 pub mod resolve;
 pub mod select;
 
-// Internal-only modules. Every reference is via `crate::mux::…` /
-// `super::…` from inside the crate; nothing in the downstream crates or
-// integration tests imports them and lib.rs re-exports nothing from
-// them, so they are not part of the stable public API.
-//
-// `#[allow(dead_code)]`: narrowing these from `pub` to `pub(crate)`
-// surfaces a handful of helpers/accessors that were only ever reachable
-// as (unused) public API — e.g. the MPEG-2 resolution/frame-rate
-// accessors and an alternate `DemuxThread` spawn path. They are kept as
-// part of the parser/demux surface and covered by unit tests; allow the
-// dead-code lint rather than delete still-relevant scaffolding.
+// Internal-only modules (referenced only via `crate::mux::…`; not public API).
+// `#[allow(dead_code)]`: narrowing `pub`→`pub(crate)` surfaces helpers only
+// reachable as unused public API — kept as tested scaffolding, not deleted.
 pub(crate) mod au_assembly;
 #[allow(dead_code)]
 pub(crate) mod codec;
@@ -48,12 +40,9 @@ pub(crate) mod demux_sink;
 #[allow(dead_code)]
 pub(crate) mod demux_thread;
 
-// Internal modules — implementation details. Their *types* are re-exported
-// where appropriate (`MkvStream`, `M2tsStream`, etc. surface from `lib.rs`),
-// but the module paths themselves are not part of the API. Pre-0.13 these
-// were `pub`, leaking low-level EBML primitives, TS muxer internals, and
-// network/stdio implementations that no external caller had business
-// reaching for.
+// Internal modules — implementation details. Their *types* are re-exported where
+// appropriate (`MkvStream`/`M2tsStream` from `lib.rs`), but the paths are not API.
+// Pre-0.13 these were `pub`, leaking EBML/TS/network/stdio internals.
 pub(crate) mod ebml;
 /// `fvi://` sink — freemkv's native per-picture video index (see
 /// `docs/FVI_FORMAT.md`). A write-only PES sink that emits one JSON-Lines record
@@ -66,24 +55,9 @@ pub(crate) mod m2ts;
 pub mod meta;
 pub(crate) mod meta_sink;
 
-// ── Sequential-sink muxers ──────────────────────────────────────────────────
-//
-// Container muxers that consume PES frames and write to a
-// `SequentialSink`. They are NOT the bidirectional `MkvStream` /
-// `M2tsStream` (which round-trip via the `Stream` trait + BD-TS
-// framing); these are write-only and sequential.
-//
-// `pub(crate)`: these have no external callers and are not re-exported
-// from lib.rs. `fmp4` is an explicit STUB (`Fmp4Mux::write_video`
-// accumulates and discards) — shipping it as `pub` would lock a
-// half-built type into the v1.0 stability contract via the
-// `libfreemkv::mux::fmp4::Fmp4Mux` path. `m2ts_mux` is the plain
-// MPEG-TS sequential muxer and `hevc` is its Annex-B helper; both are
-// staged scaffolding for the sink split and are not yet wired into a
-// live pipeline (the production paths use `tsmux` / `mkv`).
-// `#[allow(dead_code)]`: retained intentionally until the sink split
-// lands; they are exercised by their own unit tests. If any becomes a
-// public muxer, re-export its concrete type from lib.rs instead.
+// ── Sequential-sink muxers ── write-only PES → `SequentialSink`. `pub(crate)`+
+// `allow(dead_code)`: `fmp4` is a STUB (pub would lock a half-built type into
+// v1.0); `m2ts_mux`/`hevc` are sink-split scaffolding (production: `tsmux`/`mkv`).
 #[allow(dead_code)]
 pub(crate) mod fmp4;
 #[allow(dead_code)]
@@ -112,22 +86,17 @@ pub(crate) mod tsmux;
 #[allow(dead_code)]
 pub(crate) mod videomap;
 
-// `demux://` and `fvi://` sinks are constructed internally by `output()` via the
-// direct `super::demux_sink::` / `super::fvi_sink::` paths — no re-export needed,
-// and no consumer names these types, so they are not public API.
-//
-// The provenance types ARE public: `output()` takes a `SourceInfo` so a `fvi://`
-// destination can record the INPUT it was built from (`docs/FVI_FORMAT.md` §6.2)
-// rather than the file it is writing.
+// `demux://`/`fvi://` sinks are built internally by `output()`; not public API.
+// The provenance types ARE public: `output()` takes a `SourceInfo` so an `fvi://`
+// destination records the INPUT it was built from (§6.2), not the file written.
 pub use disc::DiscStream;
 pub use driver::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, mux_stream};
 pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
 pub use videomap::{Medium, SourceInfo};
-// `Mp4Sink` is public (like `MkvStream` / `M2tsStream`) so a caller that drives
-// the sink directly can ask `final_report()` what the finished file actually
-// contains — the pre-mux `mp4_fit_report` plan is a prediction, and two of its
-// inclusions can still be dropped at `finish()`.
+// `Mp4Sink` is public so a caller driving the sink can ask `final_report()` what
+// the finished file contains — the pre-mux `mp4_fit_report` is only a prediction,
+// and two of its inclusions can still be dropped at `finish()`.
 pub use mp4::{Mp4FitReport, Mp4Sink, Mp4SkipReason, fit_report as mp4_fit_report};
 pub use network::NetworkStream;
 pub use null::NullStream;
@@ -155,10 +124,9 @@ mod tests {
     use super::resolve::{StreamUrl, parse_url};
     use std::path::PathBuf;
 
-    // The scheme table is the public contract documented at the top of
-    // resolve.rs: `scheme://path`. These tests pin the round-trip
-    // (parse_url → scheme()/path_str()) against that table, not against
-    // whatever the parser happens to emit.
+    // The scheme table is the public contract documented at the top of resolve.rs
+    // (`scheme://path`). These tests pin the round-trip (parse_url →
+    // scheme()/path_str()) against that table, not whatever the parser emits.
 
     #[test]
     fn scheme_names_match_the_documented_table() {

@@ -285,11 +285,9 @@ mod tests {
 
     #[test]
     fn skip_4byte_with_01_as_last_byte_returns_one_past_end() {
-        // `00 00 00 01` of length exactly 4: the 4-byte branch guard is
-        // `pos + 3 < data.len()` (3 < 4 = true) AND data[2]==0x00, data[3]==0x01
-        // → 4-byte code recognised → returns pos+4 = 4 (one past the buffer, the
-        // position where the NAL body would begin). The caller treats len as the
-        // empty-NAL boundary, so this is in-bounds-safe.
+        // `00 00 00 01` len 4: guard `pos + 3 < data.len()` (3<4) with data[2]=0x00,
+        // data[3]=0x01 recognises the 4-byte code and returns pos+4=4, one past the
+        // buffer; the caller treats len as the empty-NAL boundary (in-bounds-safe).
         let data = [0x00, 0x00, 0x00, 0x01];
         assert_eq!(skip_start_code(&data, 0), Some(4));
     }
@@ -318,25 +316,18 @@ mod tests {
 
     #[test]
     fn skip_start_code_three_zeros_no_terminator_is_not_a_code() {
-        // `00 00 00` with nothing after it is neither a 3-byte code (3rd byte
-        // isn't 0x01) nor a complete 4-byte code (there is no 4th byte at all).
-        // Pins the `pos + 3 < data.len()` guard: on a 3-byte all-zero buffer
-        // `pos + 3 == data.len()`, so the guard must be strict `<` and reject
-        // the 4-byte branch before it would index one past the end. A `<=`
-        // (or a `pos * 3` typo, which also evaluates to a value not exceeding
-        // `data.len()` here) lets the 4-byte branch run and read `data[pos+3]`
-        // out of bounds.
+        // `00 00 00` is neither a 3-byte code (3rd byte isn't 0x01) nor a complete
+        // 4-byte code (no 4th byte). Pins `pos + 3 < data.len()`: here it equals
+        // len, so the guard must be strict `<`, or the 4-byte branch reads OOB.
         let data = [0x00, 0x00, 0x00];
         assert_eq!(skip_start_code(&data, 0), None);
     }
 
     #[test]
     fn read_ue_thirty_one_leading_zeros_is_still_a_valid_code() {
-        // Exactly 31 leading zero bits, a stop bit, then 31 zero info bits:
-        // a legal (if enormous) ue(v) code with code_num = 2^31 - 1. The
-        // truncation guard is `leading_zeros > 31`, so 31 must NOT trip it —
-        // only 32 does. A guard mutated to `>= 31` or `== 31` aborts one bit
-        // early and returns None instead of the real value.
+        // 31 leading zero bits, a stop bit, 31 zero info bits: a legal ue(v) code
+        // with code_num = 2^31 - 1. The truncation guard `leading_zeros > 31` must
+        // NOT trip on 31 — only 32; a `>= 31` mutant aborts one bit early.
         let data = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
         assert_eq!(BitReader::new(&data).read_ue(), Some(u32::MAX >> 1));
     }

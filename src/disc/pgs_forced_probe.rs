@@ -192,11 +192,9 @@ fn plan_windows(sector_count: u32, share: u32) -> Vec<SampleWindow> {
     (0..windows)
         .map(|i| SampleWindow {
             offset: if windows == 1 {
-                // A title cut into many clips gives each extent a share worth one
-                // window. Putting that window at the extent's head samples every
-                // clip at the same relative position — and for the FIRST clip
-                // that position is the start of the feature, the one stretch a
-                // film reliably has no subtitles in. Take the middle instead.
+                // A single window per extent placed at the head would sample the
+                // first clip's start — the one span a film reliably lacks subtitles.
+                // Use the middle instead.
                 align_down(span / 2)
             } else {
                 // u64: `span * i` overflows u32 for a large extent.
@@ -267,8 +265,8 @@ impl TrackEvidence {
 /// The coverage is the whole point. Evidence from a sampled (or budget-cut) read
 /// describes the sectors that were actually fed to the demuxer, not the extent —
 /// memoising it under the extent's full key and replaying it to another playlist
-/// asserts a completeness the read never had. Recording `covered` and `complete`
-/// lets a later run decide whether the entry answers ITS question or whether the
+/// asserts a completeness the read never had. Recording `covered` alongside the
+/// evidence's own `sampled` flag lets a later run decide whether the entry answers ITS question or whether the
 /// extent has to be read again.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct CachedEvidence {
@@ -296,7 +294,7 @@ impl CachedEvidence {
 ///
 /// Many playlists on one disc reference the same clips (main feature, play-all,
 /// seamless-branch variants) but rarely with byte-identical extent LISTS: 00800
-/// = [A, B], 00801 = [A], 00802 = [B] are three different lists over two clips.
+/// = `[A, B]`, 00801 = `[A]`, 00802 = `[B]` are three different lists over two clips.
 /// Keying on the whole list de-duplicated only exactly-identical playlists and
 /// re-read every shared clip once per list — up to `PROBE_BUDGET_SECTORS`
 /// (256 MiB) of optical-drive time each. Per-extent keying reads each physical
@@ -398,11 +396,9 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
         })
         .collect();
 
-    // Budget allocation: each extent gets a share of the sector budget in
-    // proportion to its size, computed over the title's WHOLE extent list rather
-    // than over the extents that happen to be uncached. That keeps an extent's
-    // sampling plan — and therefore the coverage its cache entry claims — a
-    // function of the title alone, not of cache state or probe order.
+    // Each extent's share of the sector budget is proportional to its size,
+    // computed over the title's whole extent list (not just uncached ones), so the
+    // sampling plan is a function of the title alone, not cache state or order.
     let total_sectors: u64 = title
         .extents
         .iter()
@@ -439,10 +435,9 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                         slot.merge(hit.evidence);
                     }
                 }
-                // No entry, or one whose coverage does not support the claim this
-                // run needs from it. (A playlist that declares a PGS PID a
-                // previous playlist did not also lands here, so the extra track is
-                // genuinely probed.)
+                // No entry, or one whose coverage doesn't support this run's claim —
+                // includes a PGS PID a previous playlist didn't declare, so it's
+                // genuinely probed.
                 _ => fresh.push(pid),
             }
         }
@@ -471,10 +466,8 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
             .collect()
     }
 
-    // Whether ANY declared track could still have its outcome changed by reading
-    // more. This is the per-track early exit: the moment a track is disproven
-    // (and there is nothing left for its evidence to correct) it stops asking for
-    // budget, and when no track is asking, the run stops.
+    // Per-track early exit: once a track is disproven with nothing left to
+    // correct, it stops asking for budget; when no track is asking, the run stops.
     let anything_left_to_learn = |live: &[(u16, TrackEvidence)]| -> bool {
         let disc_uses_forced_flag = live.iter().any(|(_, e)| e.forced_seen);
         let busiest = live.iter().map(|(_, e)| e.displays).max().unwrap_or(0);
@@ -488,19 +481,15 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
             if !vendor_forced.get(pid).copied().unwrap_or(false) {
                 return false;
             }
-            // Disproven but labelled forced: keep reading only while the evidence
-            // a demotion needs is still incomplete (see `demotable`) — otherwise
-            // the run would stop one window short of being ALLOWED to act on what
-            // it has already seen.
+            // Disproven but labelled forced: keep reading only while the evidence a
+            // demotion needs (see `demotable`) is still incomplete.
             !crate::mux::codec::pgs::demotable(e.facts(), disc_uses_forced_flag, busiest)
         })
     };
 
     if todo.is_empty() {
-        // Every extent's evidence came from a run that reached a designed stop and
-        // covered at least as much as this run planned to, so an absence claim
-        // over the composed evidence is as sound as the run that produced each
-        // part.
+        // Every extent's evidence reached a designed stop and covered at least as
+        // much as planned, so an absence claim over it is as sound as its source.
         apply_verdicts(title, &verdicts(&evidence, true));
         return;
     }
@@ -512,10 +501,9 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
     // asserted from what was observed.
     let mut stop = StopReason::Exhausted;
     'outer: for (ext, fresh_pids) in &todo {
-        // Trackers are PER EXTENT and only for the tracks this extent still owes
-        // evidence for — a track the cache already answered is not demuxed again,
-        // so no observation is ever counted twice, and budget is not spent on
-        // tracks that have nothing left to say.
+        // Trackers are per-extent, for tracks this extent still owes evidence for;
+        // an already-answered track isn't demuxed again, so no observation is
+        // double-counted and no budget is spent on tracks with nothing left to say.
         let mut trackers: HashMap<u16, ForcedTracker> = fresh_pids
             .iter()
             .map(|&p| (p, ForcedTracker::new()))
@@ -531,21 +519,16 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
         // Sectors of this extent actually fed to the demuxer — the coverage the
         // memo will claim, never more.
         let mut covered: u32 = 0;
-        // AACS aligned units are anchored at THIS extent's start LBA, so tell a
-        // decrypt-on-read source to gate relative to it rather than absolute disc
-        // LBA 0 — without this the very first read of a clip whose start_lba is
-        // not itself 3-aligned is rejected. Mirrors the mux read paths. Every
-        // window offset is a whole number of units from that base, so sampling
-        // does not disturb the gate.
+        // AACS units are anchored at this extent's start LBA, so gate a decrypt-
+        // on-read source relative to it (not disc LBA 0), or the first read of a
+        // non-3-aligned clip is rejected. Mirrors the mux read paths.
         reader.set_unit_base(ext.start_lba);
         // `None` = the extent's whole plan ran. `Some(reason)` = it stopped early.
         let mut cut_short: Option<StopReason> = None;
         for window in &plan {
-            // Demux/parse state is PER WINDOW, because a window is a
-            // DISCONTIGUOUS run of the clip: carrying a demuxer across the gap
-            // would splice two unrelated byte runs into one PES. The cost is at
-            // most a display set straddling a window edge — the same trade the
-            // per-extent reset already made at extent edges.
+            // Demux/parse state is per-window: a window is a discontiguous run of
+            // the clip, so carrying a demuxer across the gap would splice unrelated
+            // byte runs into one PES (same trade as the per-extent reset).
             let mut demux = TsDemuxer::new(fresh_pids);
             let mut parsers: HashMap<u16, PgsParser> =
                 fresh_pids.iter().map(|&p| (p, PgsParser::new())).collect();
@@ -585,58 +568,22 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                         break;
                     }
                 };
-                // Advance by what was actually READ, not by what was requested. A
-                // short-but-nonzero read (a source whose batch is smaller than the
-                // request — `PrefetchedSectorSource` returns its producer's batch)
-                // used to advance `lba`/`remaining`/`sectors_read` by the full
-                // `count`, silently SKIPPING the unread tail of the chunk while
-                // `stop` stayed `Exhausted` — so an absence-based forced verdict was
-                // asserted (and memoised) over data that was never seen.
+                // Advance by what was actually READ, not requested: a short-but-
+                // nonzero read (e.g. `PrefetchedSectorSource`) used to advance by
+                // the full `count`, silently skipping the unread tail as `Exhausted`.
                 let served = (n.min(want) / SECTOR_BYTES) as u32;
-                // ...but advancing by the raw sector count breaks the OTHER invariant
-                // this loop rests on: with a decrypting source every read must BEGIN a
-                // whole number of AACS aligned units past `ext.start_lba`, which is why
-                // `CHUNK_SECTORS` is a multiple of `ALIGNED_UNIT_SECTORS` (see the
-                // const-assert above). A short read of, say, 64 sectors is not a whole
-                // number of units, so the next `lba` would be off the unit grid,
-                // `DecryptingSectorSource` would reject it with `DecryptFailed` before
-                // reading, and the run would end `ReadFailed` — inconclusive, nothing
-                // memoised, forced detection silently back to the vendor label on
-                // exactly the encrypted discs the aligned chunk size was chosen for.
-                //
-                // So a read that did NOT satisfy the whole request advances only by
-                // whole aligned units, and the residue sectors are simply RE-READ from
-                // the next unit boundary on the following pass: at most two sectors of
-                // duplicated drive work, no gap, no double-feed of any byte to the
-                // demuxer (only the aligned prefix is fed), and no trailing partial
-                // unit — whose plaintext a unit-anchored decrypt cannot produce anyway
-                // — is ever handed to the parsers.
-                //
-                // A read that satisfied the whole request advances by all of it even
-                // when `count` itself was not unit-aligned: `count` is only ever below
-                // `CHUNK_SECTORS` on the extent's final chunk or at the sector budget,
-                // and both end the loop before another read of this extent.
+                // Advancing by raw sector count would break unit-alignment (every
+                // read must begin on an AACS aligned unit), so short reads advance only
+                // by whole units; the residue sectors are simply re-read next pass.
                 let got = if served >= u32::from(count) {
                     u32::from(count)
                 } else {
                     served - served % crate::aacs::content::ALIGNED_UNIT_SECTORS
                 };
                 if got == 0 {
-                    // Less than one whole aligned unit came back, so the read position
-                    // cannot move: the next aligned boundary IS the one just read. The
-                    // bytes are real, so feed them (never lose an observation), then
-                    // RETRY the same aligned lba — a source that short-changed one call
-                    // commonly satisfies the next, and only when it repeatedly cannot
-                    // yield a whole unit is the run the truncated prefix an error is.
-                    // Bounded retries are what keep a source that never yields a unit
-                    // (including one that claims sectors and returns none) from
-                    // spinning here for ever. A retry that re-serves the same bytes
-                    // feeds them twice: the BOOLEAN evidence is monotone (observed /
-                    // saw-a-non-forced-set / saw-a-forced-set), so a repeat cannot
-                    // change it, and the display COUNT can over-count by at most
-                    // [`STALL_RETRY_LIMIT`] repeats of a sub-unit (< 6 KB) read —
-                    // too little to move the shape comparison the demotion gate
-                    // makes, which is against the busiest track on the disc.
+                    // Less than one aligned unit came back: feed the real bytes (never
+                    // lose an observation), then retry the same lba, bounded by
+                    // [`STALL_RETRY_LIMIT`] since boolean evidence is monotone to repeats.
                     for pes in demux.feed(&buf[..n.min(want)]) {
                         if let (Some(parser), Some(tracker)) =
                             (parsers.get_mut(&pes.pid), trackers.get_mut(&pes.pid))
@@ -670,10 +617,9 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                         }
                     }
                 }
-                // Saturating: a malformed extent can put the window's last chunk at
-                // the top of the 32-bit LBA space, and `remaining` has already
-                // reached 0 by then, so pinning the position is harmless — wrapping
-                // (or panicking in a debug build) is not.
+                // Saturating: a malformed extent can put the last chunk at the top of
+                // the 32-bit LBA space; `remaining` is already 0 by then, so pinning is
+                // harmless — wrapping (or a debug-build panic) is not.
                 lba = lba.saturating_add(got);
                 remaining -= got;
                 sectors_read += got;
@@ -687,11 +633,9 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                 }
             }
 
-            // Drain the window's tail: the demuxer holds the last PES open until
-            // the next PUSI arrives, and with a sampled read that PUSI is in a
-            // different window (or nowhere), so without this the last display set
-            // of EVERY window is thrown away — 16 lost observations per extent,
-            // exactly where the sample is thinnest.
+            // Drain the window's tail: the demuxer holds the last PES open until the
+            // next PUSI, which a sampled read may put in another window (or nowhere),
+            // so without this every window loses its last display set.
             for pes in demux.flush() {
                 if let (Some(parser), Some(tracker)) =
                     (parsers.get_mut(&pes.pid), trackers.get_mut(&pes.pid))
@@ -714,22 +658,9 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
             }
         }
 
-        // Fold this extent's evidence in, and memoise it if the read reached a
-        // DESIGNED stop — the whole plan ran, the sector budget was hit, or every
-        // track had already settled. The budget is a designed stop for exactly the
-        // reason [`StopReason`] documents, and it is the stop that fires on every
-        // disc that HAS a forced track — excluding it from the cache would mean
-        // nothing is ever memoised on precisely those discs.
-        //
-        // What makes THAT sound is the coverage stored alongside: the entry says
-        // how much of the extent was actually read, so a later playlist that
-        // intended to read more of it will re-read instead of inheriting an
-        // absence claim from a prefix (see [`CachedEvidence::answers`]).
-        //
-        // A halt or a read fault is different: the cut-off point is arbitrary, so
-        // its evidence is real for THIS title (nothing observed is retracted) but
-        // must not be frozen in as the extent's answer, or one transient fault
-        // would be replayed onto every other playlist sharing the clip.
+        // Fold in this extent's evidence; memoise only on a DESIGNED stop (plan
+        // done, budget hit, or all tracks settled), with coverage stored so a later
+        // playlist re-reads rather than inherits a halt/fault's arbitrary cutoff.
         let cacheable = cut_short.is_none_or(StopReason::absence_is_conclusive);
         let sampled = !(complete_plan && cut_short.is_none());
         for (&pid, t) in trackers.iter() {
@@ -742,11 +673,9 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
                     evidence: ev,
                     covered,
                 };
-                // Never replace a richer memo with a thinner one: an extent
-                // re-read under a smaller share would otherwise DOWNGRADE what is
-                // known about it. Facts merge (they are monotone), and the
-                // coverage claimed is the larger of the two — conservative, since
-                // the two samples together cover at least that much.
+                // Never replace a richer memo with a thinner one (a re-read under a
+                // smaller share would downgrade it): facts merge monotonically, and
+                // the coverage claimed is the larger of the two, which is conservative.
                 cache
                     .entry((ext.start_lba, ext.sector_count, pid))
                     .and_modify(|prev| {
@@ -800,7 +729,7 @@ fn tracker_evidence(t: &ForcedTracker, sampled: bool) -> TrackEvidence {
 /// Compose the per-track verdicts a run is ENTITLED to assert from the evidence
 /// it gathered. A track absent from the result keeps its vendor-derived flag.
 ///
-/// Three gates, all PER TRACK, because the evidence is per track:
+/// Four gates, all PER TRACK, because the evidence is per track:
 ///   * `observed` — saw no display set at all, so nothing is known. (Never assert
 ///     "not forced" from having seen nothing.)
 ///   * on a truncated run, `non_forced` — the track saw an actual non-forced
@@ -814,6 +743,9 @@ fn tracker_evidence(t: &ForcedTracker, sampled: bool) -> TrackEvidence {
 ///     that flag. Discs like that exist (measured: not one track on the disc
 ///     carries it), and without this gate the probe would strip the correct
 ///     forced label off every track on every one of them.
+///   * for the FORCED verdict, a minimum display-set count (`PROMOTE_MIN_DISPLAY_SETS`)
+///     unless the read was complete — over a SAMPLE of a mixed track, one flagged
+///     set alone is not enough to promote the whole track to forced.
 fn verdicts(evidence: &HashMap<u16, TrackEvidence>, conclusive: bool) -> HashMap<u16, bool> {
     // Disc-level facts the demotion gate rests on, over the tracks judged
     // together: does the authoring house set the flag at all, and how busy is the
@@ -832,13 +764,9 @@ fn verdicts(evidence: &HashMap<u16, TrackEvidence>, conclusive: bool) -> HashMap
                     busiest,
                 );
             }
-            // Calling a track FORCED is also an absence claim — "no display set
-            // here was un-flagged" — and over a SAMPLE of a track that mixes
-            // flagged and un-flagged sets (measured: such tracks exist, flagging
-            // a quarter of their sets), catching one flagged set and nothing else
-            // is exactly what a wrong promotion looks like. A read that covered
-            // every extent end to end has no such gap and may promote off a
-            // single set (measured: single-sign forced tracks exist too).
+            // Calling a track FORCED is also an absence claim ("no set here was
+            // un-flagged"); over a SAMPLE of a mixed track, one flagged set alone
+            // is a wrong promotion, so require a minimum unless the read was complete.
             !e.sampled || e.displays >= PROMOTE_MIN_DISPLAY_SETS
         })
         .map(|(&pid, e)| (pid, !e.non_forced))
@@ -854,18 +782,9 @@ fn apply_verdicts(title: &mut DiscTitle, verdicts: &HashMap<u16, bool>) {
             && let Some(&forced) = verdicts.get(&sub.pid)
         {
             sub.forced = forced;
-            // A demoted track must not go on describing itself as forced. The
-            // flag and the qualifier are two renderings of one fact for
-            // different consumers — the muxer writes `FlagForced` from
-            // `forced`, the JSON sidecar writes its qualifier string from
-            // `qualifier` — so leaving `Forced` behind here published a track
-            // whose sidecar said "forced" and whose Matroska header said it was
-            // not. The probe read the content; it outranks the vendor's claim.
-            //
-            // Only this direction is a contradiction. `qualifier == None` on a
-            // track the probe promoted is not one: `None` is the absence of an
-            // editorial qualifier, not an assertion that the track is ordinary,
-            // and the vendor never claimed otherwise.
+            // A demoted track must not go on describing itself as forced: flag and
+            // qualifier render one fact for different consumers, so leaving `Forced`
+            // behind contradicts the header. The probe outranks the vendor's claim.
             if !forced && sub.qualifier == crate::disc::LabelQualifier::Forced {
                 sub.qualifier = crate::disc::LabelQualifier::None;
             }
@@ -969,11 +888,9 @@ mod tests {
             "the probe must never read past the budget, got {}",
             reader.served
         );
-        // ...and must actually SPEND it: a plan that quietly reads a fraction of
-        // the budget would look "safe" while observing even less than the
-        // head-first read it replaced. One window's slack is allowed (windows are
-        // whole numbers of aligned units, so 16 of them need not divide the
-        // budget exactly).
+        // ...and must actually SPEND it: quietly reading a fraction would look
+        // "safe" while observing less than the head-first read it replaced.
+        // One window's slack is allowed (windows need not divide the budget exactly).
         assert!(
             reader.served + WINDOW_SECTORS > PROBE_BUDGET_SECTORS,
             "the probe must spend the budget it is given, got {}",
@@ -1096,10 +1013,9 @@ mod tests {
         }
     }
 
-    // PGS PCS layout (matches the private constants in mux::codec::pgs): a
-    // display-set frame begins with a PCS (segment type 0x16); byte 13 is
-    // number_of_composition_objects; byte 17 is the first object's flags, whose
-    // 0x40 bit is forced_on_flag.
+    // PGS PCS layout (matches mux::codec::pgs): a display-set frame begins with a
+    // PCS (segment type 0x16); byte 13 is number_of_composition_objects; byte 17
+    // is the first object's flags, whose 0x40 bit is forced_on_flag.
     const PCS_SEG: u8 = 0x16;
     const PCS_NUM_OBJECTS_OFF: usize = 13;
     const PCS_FLAGS_OFF: usize = 17;
@@ -1172,10 +1088,8 @@ mod tests {
             pos: 0,
         };
         let mut title = pgs_title(pid, false); // vendor label says NOT forced
-        // One sector, which is exactly what the reader serves: an extent that
-        // claims more sectors than the source yields is a SHORT read, and a short
-        // read is (correctly) inconclusive — see
-        // `read_error_after_partial_content_preserves_vendor_forced`.
+        // One sector, exactly what the reader serves: an extent claiming more
+        // sectors than the source yields is a SHORT read, correctly inconclusive.
         title.extents = vec![Extent {
             start_lba: 0,
             sector_count: 1,
@@ -1193,9 +1107,8 @@ mod tests {
     #[test]
     fn nonforced_display_sets_clear_a_not_yet_forced_track() {
         // A non-forced display set observed on the wire settles the track as
-        // not-forced. The vendor label here already agrees, so this pins the
-        // verdict itself (the track must not come back FORCED off one non-forced
-        // set) without engaging the demotion guard — that gets its own tests.
+        // not-forced; this pins the verdict itself (must not come back FORCED off
+        // one non-forced set) without engaging the demotion guard.
         let pid = 0x1200u16;
         let mut reader = TsReader {
             data: ts_stream(pid, &pcs_display(false)),
@@ -1288,10 +1201,9 @@ mod tests {
 
     #[test]
     fn read_error_after_partial_content_preserves_vendor_forced() {
-        // The defect: a forced verdict rests on the ABSENCE of a non-forced
-        // display set. When the read dies mid-title that absence means nothing —
-        // the rest of the track was never seen — yet the probe used to apply it as
-        // authoritative, overwriting the vendor flag from a fraction of the data.
+        // The defect: a forced verdict rests on the ABSENCE of a non-forced set.
+        // When the read dies mid-title that absence means nothing, yet the probe
+        // used to apply it as authoritative, overwriting the vendor flag.
         let pid = 0x1200u16;
         let mut reader = PartialTsReader::new(ts_stream(pid, &pcs_display(true)), ThenWhat::Error);
         let mut title = multi_read_pgs_title(pid, false); // vendor label: NOT forced
@@ -1304,9 +1216,8 @@ mod tests {
             !s.forced,
             "a forced verdict from a read-truncated prefix must not overwrite the vendor flag"
         );
-        // And it must not be memoised: the cache is keyed on the extent list, so a
-        // cached inconclusive result would spread this one read fault across every
-        // playlist sharing these clips and block any later re-read.
+        // And it must not be memoised: caching an inconclusive result would spread
+        // this one read fault across every playlist sharing these clips.
         assert!(
             cache.is_empty(),
             "an inconclusive probe must not be cached against these extents"
@@ -1315,12 +1226,9 @@ mod tests {
 
     #[test]
     fn read_error_keeps_a_track_that_already_settled_not_forced() {
-        // Per-track, not per-title: "not forced" is POSITIVE evidence — a
-        // non-forced display set was actually seen — and no amount of unread data
-        // could retract it. That verdict survives the truncation even though a
-        // forced verdict would not. The vendor label already says not-forced, so
-        // what is pinned here is that the truncation does not let the track come
-        // back FORCED.
+        // Per-track, not per-title: "not forced" is POSITIVE evidence (a non-forced
+        // set was actually seen), so no amount of unread data retracts it — that
+        // verdict survives truncation even though a forced verdict would not.
         let pid = 0x1200u16;
         let mut reader = PartialTsReader::new(ts_stream(pid, &pcs_display(false)), ThenWhat::Error);
         let mut title = multi_read_pgs_title(pid, false);
@@ -1339,9 +1247,8 @@ mod tests {
     #[test]
     fn budget_stop_still_applies_the_forced_verdict() {
         // The budget is a DESIGNED stop, not a failure: the probe's natural exit
-        // never fires for a genuinely forced track, so the budget is exactly the
-        // mechanism by which a forced verdict gets accepted from a bounded prefix.
-        // Classifying it as inconclusive would disable forced detection.
+        // never fires for a genuinely forced track, so the budget is how a forced
+        // verdict gets accepted from a bounded prefix; inconclusive would disable it.
         let pid = 0x1200u16;
         let mut reader = PartialTsReader::new(ts_stream(pid, &pcs_display(true)), ThenWhat::Zeros);
         let mut title = multi_read_pgs_title(pid, false); // vendor label: NOT forced
@@ -1355,9 +1262,8 @@ mod tests {
             "a forced verdict from a budget-bounded prefix must still be applied"
         );
         // One entry per (extent, PGS track): both extents reached a designed stop
-        // (the first was read to its end, the second stopped at the budget), so
-        // both are memoised — the budget is the stop that fires on every disc that
-        // HAS a forced track, so excluding it would memoise nothing there.
+        // (first read to end, second stopped at budget), so both are memoised —
+        // excluding the budget stop would memoise nothing on forced-track discs.
         assert_eq!(cache.len(), 2, "a conclusive probe is memoised per extent");
         assert!(cache.contains_key(&(0, 4, pid)));
         assert!(cache.contains_key(&(100, u32::MAX, pid)));
@@ -1367,9 +1273,7 @@ mod tests {
     fn cancelled_probe_is_neither_asserted_nor_cached() {
         // A halt lands at an arbitrary chunk boundary, so an absence claim from it
         // is worth no more than one from a read fault. Here the cancel arrives
-        // AFTER a forced display set has been observed — the same setup that,
-        // uncancelled, reaches the budget and legitimately asserts forced (see
-        // budget_stop_still_applies_the_forced_verdict).
+        // AFTER a forced set was observed, unlike the uncancelled budget case.
         let pid = 0x1200u16;
         let halt = crate::halt::Halt::new();
         let mut reader = PartialTsReader {
@@ -1386,11 +1290,9 @@ mod tests {
             !s.forced,
             "a verdict from a cancelled probe must not overwrite the vendor flag"
         );
-        // The cancel landed inside the SECOND extent, whose read is therefore an
-        // arbitrary prefix: that extent must not be memoised, or the one
-        // cancellation would be replayed onto every other playlist sharing the
-        // clip. (The first extent WAS read to its end before the cancel, so its
-        // own evidence is sound and keeping it is the point of per-extent keying.)
+        // The cancel landed inside the SECOND extent, an arbitrary prefix that must
+        // not be memoised, or the cancellation replays onto every playlist sharing
+        // the clip. (The first extent read to its end, so it stays cached.)
         assert!(
             !cache.contains_key(&(100, u32::MAX, pid)),
             "a cancelled probe must not poison the cancelled extent's cache entry"
@@ -1898,23 +1800,9 @@ mod tests {
     /// anything — and therefore whether the probe reports the run as truncated.
     #[test]
     fn a_stop_reason_decides_whether_absence_is_conclusive() {
-        // The debug line at the end of `probe_and_set_forced` is gated on
-        // `!stop.absence_is_conclusive()`. Assert that PREDICATE rather than
-        // counting emitted events.
-        //
-        // Reading a log line back needs a capturing subscriber, which is
-        // thread-local, while tracing's callsite-interest cache is global.
-        // Those race: the sibling test in disc/encrypt.rs that did this failed
-        // roughly one full-suite run in ten while passing every time in
-        // isolation, and serialising the captures crate-wide was not enough —
-        // the cache can still be re-evaluated against the process default
-        // dispatch. A boolean does not need a subscriber to check.
-        //
-        // ECMA of the decision: a stop that saw everything it was ever going to
-        // see (Exhausted) or stopped by DESIGN at the budget is conclusive, so
-        // the absence of a display set means the track is not forced and there
-        // is nothing to report. A stop that was cut short (Halted, ReadFailed)
-        // is not, and that is exactly what the operator needs told.
+        // Assert the PREDICATE directly rather than counting log events (capturing
+        // a tracing log line is racy — see the sibling test in disc/encrypt.rs).
+        // Exhausted/Budget stops are conclusive; Halted/ReadFailed are not.
         assert!(
             StopReason::Exhausted.absence_is_conclusive(),
             "reading every extent to its end is a complete observation"
@@ -1936,15 +1824,9 @@ mod tests {
         );
     }
 
-    // ── sampling: reading where the subtitles actually are ──────────────────
-    //
-    // SYNTHETIC FIXTURES. The clips below are generated, not captured: they
-    // reproduce the measured SHAPE of real discs — a feature's subtitles begin
-    // minutes into the title, a full dialogue track carries one to two thousand
-    // display sets spread over the whole runtime, a forced-narrative track
-    // carries tens — and nothing else. They prove the probe's LOGIC over that
-    // shape. They do not prove the shape itself; that comes from measurement on
-    // real discs, and if the shape is wrong these fixtures are wrong with it.
+    // ── sampling: reading where the subtitles actually are ──────────
+    // SYNTHETIC FIXTURES reproducing the measured SHAPE of real discs; they
+    // prove the probe's LOGIC over that shape, not the shape itself.
 
     /// One synthetic PGS track: `count` display sets, the first at
     /// `first_sector`, then every `period_sectors`.

@@ -35,22 +35,14 @@ fn h264_slice_coding_type(slice_type: u32) -> Option<CodingType> {
 /// codecPrivate, detects IDR keyframes, and converts each PES access unit into
 /// length-prefixed NAL units. Implements [`CodecParser`].
 pub struct H264Parser {
-    // First-seen SPS/PPS seed the MKV codecPrivate (avcC) — the only out-of-band
-    // copy the player gets. BD H.264 repeats the parameter sets at every IDR;
-    // a player re-applies the avcC copy at each keyframe. A stream may redefine
-    // a parameter set mid-title under the SAME id with a different body. Any
-    // occurrence whose body DIFFERS from the codecPrivate copy must therefore be
-    // emitted IN-BAND at each point it appears so it overrides the re-applied
-    // avcC set; otherwise those frames decode against the wrong parameter set.
-    // (Same defect class as the HEVC PPS-redefinition bug — fixed identically.)
+    // First-seen SPS/PPS seed the MKV codecPrivate (avcC). A stream may redefine
+    // a set mid-title under the same id with a different body; that occurrence
+    // must be emitted in-band, or it decodes against the stale avcC copy.
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
-    // Currently-ACTIVE body of each type (most recent the bitstream defined),
-    // distinct from the fixed `sps`/`pps` codecPrivate copy. See the HEVC
-    // parser for the full rationale: the strip/emit decision must be made
-    // against the active set, and the active set must be re-asserted in-band at
-    // every keyframe that doesn't carry it, or a streaming decoder reverts to
-    // the stale avcC copy after a mid-title redefinition.
+    // Currently-active body of each type, distinct from the fixed `sps`/`pps`
+    // codecPrivate copy. Must be re-asserted in-band at every keyframe that
+    // doesn't carry it, or a decoder reverts to the stale avcC copy.
     cur_sps: Option<Vec<u8>>,
     cur_pps: Option<Vec<u8>>,
     /// Display-order PTS reconstruction, enabled only on the program-stream
@@ -114,20 +106,13 @@ impl H264Parser {
 }
 
 // Bytes reserved at the front of every assembled access unit so the keyframe
-// parameter-set re-assert can be spliced in without reallocating. An SPS + PPS
-// re-assert is a couple hundred bytes (each a 4-byte length prefix plus a NAL
-// that is tens to low hundreds of bytes on real BD/UHD streams); 1 KiB covers it
-// with margin, and costs 1 KiB of slack per in-flight frame. If a stream's
-// parameter sets ever exceed this the splice still produces correct output — it
-// just reallocates once, exactly as it always did. Mirrors the HEVC parser.
+// param-set re-assert (SPS+PPS) can splice in without reallocating. Oversized
+// sets just reallocate once — correctness is unaffected. Mirrors HEVC parser.
 const PARAM_REASSERT_HEADROOM: usize = 1024;
 
-// Per-thread count of keyframe re-asserts that had to reallocate the frame
-// buffer. Test-only instrumentation: the whole point of
-// `PARAM_REASSERT_HEADROOM` is that the splice is in-place, so that is MEASURED
-// rather than reasoned about. See
-// `keyframe_param_reassert_does_not_reallocate_the_frame`. Mirrors the HEVC
-// parser.
+// Per-thread count of keyframe re-asserts that had to reallocate. Test-only:
+// proves the splice stays in-place rather than reasoning about it. See
+// `keyframe_param_reassert_does_not_reallocate_the_frame`. Mirrors HEVC.
 #[cfg(test)]
 thread_local! {
     static PARAM_REASSERT_REALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -254,10 +239,9 @@ impl CodecParser for H264Parser {
             return Vec::new();
         }
 
-        // MKV block timecodes are PRESENTATION timestamps; frames are stored in
-        // decode order and the player reorders by timecode. Use PTS, not DTS —
-        // DTS presents B-frames in decode order (visible judder) and breaks
-        // PTS-based seeking. Fall back to DTS only if PTS is absent.
+        // MKV block timecodes are presentation timestamps (decode order stored,
+        // player reorders). Use PTS not DTS: DTS presents B-frames in decode
+        // order (visible judder) and breaks PTS-based seeking; fall back only if absent.
         let explicit_pts = pes.pts.or(pes.dts).map(pts_to_ns);
         let pts_ns = explicit_pts.unwrap_or(0);
 
@@ -270,13 +254,9 @@ impl CodecParser for H264Parser {
         // Did this access unit already carry each param-set type in-band?
         let mut emitted_sps = false;
         let mut emitted_pps = false;
-        // Pre-size: output is ~input bytes plus a few 4-byte NAL length prefixes.
-        // The unsized Vec growth chain otherwise reallocs several times per
-        // frame in the mux hot path (mirrors the HEVC parser).
-        //
-        // Plus `PARAM_REASSERT_HEADROOM` so the keyframe parameter-set re-assert
-        // below can be spliced in FRONT of the frame without reallocating. See
-        // that site.
+        // Pre-sized to input length plus PARAM_REASSERT_HEADROOM so the mux hot
+        // path avoids repeated reallocs and the keyframe param-set re-assert
+        // below can be spliced in front without reallocating (see that site).
         let mut frame_data = Vec::with_capacity(pes.data.len() + 64 + PARAM_REASSERT_HEADROOM);
 
         // MVC dependent-view passthrough: keep ALL param sets in-band (the frame
@@ -287,10 +267,9 @@ impl CodecParser for H264Parser {
             let nal_type = nal[0] & 0x1F;
 
             match nal_type {
-                // Param sets: seed avcC, strip if unchanged vs the active set,
-                // emit in-band on any change (incl. reverting to the avcC copy).
-                // In MVC passthrough these fall through to the default arm so the
-                // subset SPS / PPS stay in-band (self-contained dependent AU).
+                // Param sets: seed avcC, strip if unchanged vs active set, emit
+                // in-band on any change. In MVC passthrough these fall through to
+                // the default arm so subset SPS/PPS stay in-band (self-contained AU).
                 NAL_SPS if !mvc => {
                     emitted_sps |=
                         handle_param_set(&mut self.sps, &mut self.cur_sps, nal, &mut frame_data)
@@ -299,34 +278,17 @@ impl CodecParser for H264Parser {
                     emitted_pps |=
                         handle_param_set(&mut self.pps, &mut self.cur_pps, nal, &mut frame_data)
                 }
-                // Access unit delimiters: drop. Intentional and spec-correct —
-                // Matroska H.264 frame data omits AUDs (the container delimits
-                // access units), so keeping them in-band is redundant. Mirrors
-                // the HEVC parser.
+                // Access unit delimiters: drop. Matroska H.264 frame data omits
+                // AUDs (the container delimits access units), so keeping them
+                // in-band is redundant. Mirrors the HEVC parser.
                 NAL_AUD => {}
                 _ => {
                     if nal_type == NAL_SLICE_IDR {
                         keyframe = true;
                     }
-                    // Measure the coding type from the FIRST coded slice's header
-                    // (ISO/IEC 14496-10 §7.3.3: first_mb_in_slice ue(v), then
-                    // slice_type ue(v)). Populates PictureInfo so a consumer reads
-                    // a MEASURED I/P/B, never a keyframe-only guess. Only the first
-                    // slice of the access unit is read.
-                    //
-                    // The bytes after the 1-byte NAL header are EBSP, not RBSP, so
-                    // emulation-prevention bytes must come out first (§7.4.1: the
-                    // encoder inserts 0x03 after any 0x00 0x00, and §7.3.1 removes
-                    // it before parsing). This used to read the raw NAL on the
-                    // reasoning that slice_type is too early for one to intervene.
-                    // That holds only up to a point: first_mb_in_slice is ue(v), so
-                    // a value of 65535 or more needs sixteen leading zero bits and
-                    // puts 0x00 0x00 at the very start of the payload, which an
-                    // encoder must then escape. A UHD frame is ~32,400 macroblocks
-                    // so a conforming Blu-ray never reaches it, but 8K does, and
-                    // the disc is untrusted input — a stream declaring a large
-                    // first_mb_in_slice made slice_type decode against a byte the
-                    // encoder inserted, yielding a wrong picture type.
+                    // Measure coding type from the first slice header (§7.3.3:
+                    // first_mb_in_slice, slice_type, both ue(v)) after unescaping
+                    // EBSP (§7.3.1) — large first_mb_in_slice needs escaped 0x00 0x00.
                     if (nal_type == NAL_SLICE_NON_IDR || nal_type == NAL_SLICE_IDR)
                         && coding_type.is_none()
                     {
@@ -352,54 +314,24 @@ impl CodecParser for H264Parser {
             return Vec::new();
         }
 
-        // Open-GOP resync anchor: an intra-coded access unit is a keyframe even
-        // when it is NOT an IDR. BD H.264 titles use open GOPs whose only
-        // random-access point is a non-IDR I-frame (the recovery point, which an
-        // encoder MAY additionally tag with a recovery_point SEI). Keying off the
-        // already-measured picture coding type covers every signalling — a
-        // recovery_point SEI, or a disc that marks the recovery point only by GOP
-        // structure with no SEI at all — where SEI parsing alone would miss the
-        // latter. Without this, the B1 resync gate (`mux/resync.rs`), once armed
-        // by a concealed-gap / clip-seam discontinuity, never sees a keyframe on
-        // such a tail and drops every frame to EOF, truncating the video. HEVC
-        // does not hit this: its open-GOP IRAP (CRA) is a distinct NAL type
-        // already flagged a keyframe (`mux/codec/hevc.rs`); H.264 has no such NAL
-        // tag, so the intra coding type is the equivalent signal. Consistent with
-        // `videomap.rs`'s model that a keyframe IS the intra decode-restart point.
-        // IDR is still flagged by NAL type in the loop above, so a slice whose
-        // header failed to parse (`coding_type == None`) is unaffected here.
+        // Open-GOP resync anchor: BD titles use open GOPs whose random-access
+        // point is a non-IDR I-frame, not always SEI-tagged. Without treating it
+        // as a keyframe, the resync gate (`mux/resync.rs`) can miss it and drop frames to EOF.
         if coding_type == Some(CodingType::I) {
             keyframe = true;
         }
 
-        // Every keyframe is self-contained: re-assert the active SPS/PPS in-band
-        // ahead of the slices (even when unchanged vs codecPrivate) so a decoder
-        // that dropped the set at a reset recovers, and a stale avcC re-apply
-        // can't revert it. Skipped per-type only when this AU already carried it.
+        // Every keyframe is self-contained: re-assert active SPS/PPS in-band so a
+        // decoder that dropped the set recovers, and a stale avcC re-apply can't
+        // revert it. Skipped per-type only when this AU already carried it.
         if keyframe && !mvc {
             let mut prefix = Vec::with_capacity(PARAM_REASSERT_HEADROOM);
             reassert_active(&mut prefix, &self.cur_sps, emitted_sps);
             reassert_active(&mut prefix, &self.cur_pps, emitted_pps);
             if !prefix.is_empty() {
-                // SPLICE the couple hundred prefix bytes into the front of the
-                // already-assembled frame, in place.
-                //
-                // This used to be `prefix.extend_from_slice(&frame_data)` followed
-                // by `frame_data = prefix`: that grew `prefix` from a couple hundred
-                // bytes to the FULL access-unit size (a fresh multi-hundred-KB
-                // allocation), memcpy'd the whole frame into it, and dropped the
-                // presized `frame_data` buffer — one extra whole-frame allocation
-                // plus one extra whole-frame copy per keyframe. A UHD title is
-                // ~200,000 frames of 150-400 KB with a keyframe every 1-2 s, so
-                // that is thousands of avoidable multi-hundred-KB copies per title,
-                // each large enough to go through mmap.
-                //
-                // `frame_data` was reserved with `PARAM_REASSERT_HEADROOM` to spare
-                // precisely so this splice fits without reallocating; what remains
-                // is one in-place memmove inside the existing buffer. Byte-identical
-                // output either way — pinned by
-                // `keyframe_param_reassert_emits_exact_bytes`. Mirrors the HEVC
-                // parser's fix so the two stay consistent.
+                // Splice prefix into frame_data in place, sized via
+                // PARAM_REASSERT_HEADROOM to avoid the extra whole-frame alloc+copy
+                // per keyframe this used to cost. Mirrors the HEVC parser's fix.
                 #[cfg(test)]
                 let cap_before = frame_data.capacity();
                 frame_data.splice(0..0, prefix);
@@ -442,27 +374,16 @@ impl CodecParser for H264Parser {
             return None;
         }
 
-        // avcC encodes each NAL's length in a 16-bit field. A param set larger
-        // than 65535 bytes would truncate the length while the full bytes are
-        // appended → mis-framed record. Refuse rather than emit a corrupt avcC
-        // (param sets this large are non-conforming anyway).
+        // avcC encodes each NAL's length in a 16-bit field; a param set over
+        // 65535 bytes would truncate the length while full bytes are appended,
+        // mis-framing the record. Refuse rather than emit a corrupt avcC.
         if sps.len() > 0xFFFF || pps.len() > 0xFFFF {
             return None;
         }
 
-        // AVCDecoderConfigurationRecord (ISO 14496-15):
-        // configurationVersion = 1
-        // AVCProfileIndication = SPS[1]
-        // profile_compatibility = SPS[2]
-        // AVCLevelIndication = SPS[3]
-        // lengthSizeMinusOne = 3 (4-byte length prefix)
-        // numOfSequenceParameterSets = 1
-        // sequenceParameterSetLength = sps.len()
-        // sequenceParameterSetNALUnit = sps
-        // numOfPictureParameterSets = 1
-        // pictureParameterSetLength = pps.len()
-        // pictureParameterSetNALUnit = pps
-        // [High Profile extension per ISO 14496-15 §5.3.3.1.2, when applicable]
+        // AVCDecoderConfigurationRecord (ISO 14496-15): fields built below are
+        // configurationVersion, profile/compatibility/level from SPS[1..4],
+        // lengthSizeMinusOne=3, then one SPS and one PPS, length-prefixed.
 
         let mut record = vec![
             1,      // configurationVersion
@@ -480,14 +401,9 @@ impl CodecParser for H264Parser {
         record.push(pps.len() as u8);
         record.extend_from_slice(pps);
 
-        // ISO 14496-15 §5.3.3.1.2: for High-Profile and the related
-        // chroma/bit-depth-extended profiles the record has 4 trailing extension
-        // bytes carrying chroma_format_idc and the luma/chroma bit depths. The
-        // full set that mandates the extension is profile_idc ∈ {100, 110, 122,
-        // 144, 244 (High 4:4:4 Predictive), 44, 83, 86, 118, 128, 138, 139, 134,
-        // 135}. Older parsers expect the record to END after the PPS for
-        // Baseline/Main/Extended — do NOT append for those (strict parsers
-        // reject the extra bytes).
+        // ISO 14496-15 §5.3.3.1.2: High-Profile and related chroma/bit-depth
+        // profiles get 4 trailing extension bytes (chroma_format_idc, luma/chroma
+        // bit depths). Do NOT append for Baseline/Main/Extended: strict parsers reject them.
         let profile_idc = sps[1];
         const HIGH_PROFILES: [u8; 14] = [
             100, 110, 122, 144, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135,
@@ -532,19 +448,15 @@ impl CodecParser for H264Parser {
 /// overflows 32 bits, leading-zero count > 31, etc.). The caller silently
 /// omits the extension in that case.
 fn parse_sps_high_profile_ext(sps: &[u8]) -> Option<(u8, u8, u8)> {
-    // Strip emulation-prevention bytes: 00 00 03 xx → 00 00 xx (drop the 03).
-    // We skip byte 0 (NAL header) and start the RBSP from byte 1. Shares
-    // `unescape_ebsp` with the slice-header prefix reader rather than
-    // re-deriving the same rule — see that function's doc comment for why a
-    // second, window-based copy of this rule used to disagree with it.
+    // Strip emulation-prevention bytes (00 00 03 xx -> 00 00 xx), skipping the
+    // NAL header. Shares `unescape_ebsp` with the slice-header prefix reader —
+    // see its doc comment for why a second, re-derived copy used to disagree.
     let raw = &sps[1..]; // skip NAL header byte
     let rbsp: Vec<u8> = unescape_ebsp(raw, raw.len());
 
-    // RBSP layout after stripping the NAL header byte:
-    //   [0] profile_idc (already checked by caller)
-    //   [1] constraint flags
-    //   [2] level_idc
-    //   [3..] seq_parameter_set_id ue(v), then High-Profile fields
+    // RBSP layout after stripping the NAL header byte: [0] profile_idc (already
+    // checked by caller), [1] constraint flags, [2] level_idc, [3..]
+    // seq_parameter_set_id ue(v) then High-Profile fields.
     if rbsp.len() < 4 {
         return None;
     }
@@ -568,11 +480,9 @@ fn parse_sps_high_profile_ext(sps: &[u8]) -> Option<(u8, u8, u8)> {
     // bit_depth_chroma_minus8
     let bit_depth_chroma_minus8 = reader.read_ue()?;
 
-    // Clamp to the 2- and 3-bit fields in the avcC extension bytes.
-    // Valid H.264 values are 0..=6; the spec guarantees ≤ 6, so no real
-    // content should be truncated. Out-of-spec values are clamped rather
-    // than rejected so a corrupt-but-decodable SPS still produces a
-    // reasonable avcC.
+    // Clamp to the 2- and 3-bit avcC extension fields. Valid H.264 values are
+    // 0..=6 so no real content is truncated; out-of-spec values are clamped
+    // rather than rejected so a corrupt-but-decodable SPS still yields an avcC.
     Some((
         (chroma_format_idc & 0x03) as u8,
         (bit_depth_luma_minus8 & 0x07) as u8,
@@ -585,7 +495,7 @@ struct SpsReader<'a> {
     data: &'a [u8],
     /// Current byte index.
     byte: usize,
-    /// Number of bits remaining in data[byte] (0 means fully consumed, advance).
+    /// Number of bits remaining in `data[byte]` (0 means fully consumed, advance).
     bits_left: u8,
 }
 
@@ -663,11 +573,9 @@ impl<'a> Iterator for NalIterator<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<&'a [u8]> {
-        // Loop (not tail-recursion) over empty NALs: a crafted/garbled Annex B
-        // stream with many adjacent start codes (e.g. 00 00 01 00 00 01 ...)
-        // yields empty NALs back-to-back; recursing once per empty NAL would
-        // overflow the stack. `self.pos` advances to `nal_end` each iteration,
-        // so the loop always terminates. Mirrors the HEVC parser's while-scan.
+        // Loop (not tail-recursion): a garbled Annex B stream with many adjacent
+        // start codes yields empty NALs back-to-back, and recursing once per one
+        // would overflow the stack. Mirrors the HEVC parser's while-scan.
         loop {
             if self.pos >= self.data.len() {
                 return None;
@@ -679,11 +587,9 @@ impl<'a> Iterator for NalIterator<'a> {
             // Find next start code (or end of data)
             let nal_end = find_start_code(self.data, nal_start).unwrap_or(self.data.len());
 
-            // Strip the leading zeros of the following start code. For a
-            // conforming bitstream this is lossless: rbsp_trailing_bits() sets a
-            // stop-one bit, so the final byte of any RBSP is never 0x00 — the only
-            // trailing zeros here belong to the next 00 00 (00) 01 prefix, never to
-            // the NAL's RBSP payload. (Mirrors the HEVC parser.)
+            // Strip leading zeros of the following start code: lossless since
+            // rbsp_trailing_bits() sets a stop-one bit, so an RBSP's final byte
+            // is never 0x00 — these zeros belong to the next prefix. Mirrors HEVC.
             let mut end = nal_end;
             while end > nal_start && self.data[end - 1] == 0x00 {
                 end -= 1;
@@ -724,10 +630,9 @@ mod tests {
     /// in `parse` — a non-IDR I-slice used to yield `keyframe == false`.
     #[test]
     fn open_gop_intra_access_unit_is_a_keyframe() {
-        // Annex B AU: one non-IDR coded slice (NAL type 1, nal_ref_idc 3 → 0x61)
-        // whose header decodes first_mb_in_slice = 0 (ue = "1") and slice_type = 7
-        // (ue = "0001000"), i.e. an all-I slice. The two ue(v) fields pack into
-        // one byte: "1" + "0001000" = 0b1000_1000 = 0x88.
+        // Annex B AU: one non-IDR coded slice (NAL type 1, nal_ref_idc 3 -> 0x61)
+        // whose header decodes first_mb_in_slice=0 (ue="1"), slice_type=7 (I,
+        // ue="0001000"); packed into one byte: "1"+"0001000" = 0x88.
         let au = vec![0x00, 0x00, 0x01, 0x61, 0x88, 0x00];
         let mut parser = H264Parser::new();
         let frames = parser.parse(&make_pes(au, Some(0)));
@@ -778,12 +683,9 @@ mod tests {
     /// the wrong picture type.
     #[test]
     fn slice_header_parse_removes_emulation_prevention_bytes() {
-        // first_mb_in_slice = 65535: ue(v) is 16 zero bits, a 1, then 16 bits of
-        // (v+1) below the leading bit — 33 bits total. slice_type = 2 (I) is
-        // ue(v) = 011. Bit string, before escaping:
-        //   0000000000000000 1 0000000000000000 011
-        // = 36 bits, padded to octets 00 00 80 00 30 — and the leading 00 00
-        // obliges the encoder to insert 0x03, giving 00 00 03 80 00 30.
+        // first_mb_in_slice=65535 needs 16 zero bits (ue(v)); combined with
+        // slice_type=2 (I, ue="011") the bits pack to 00 00 80 00 30 RBSP,
+        // and the leading 00 00 forces the encoder to escape it: 00 00 03 80 00 30.
         let rbsp = [0x00u8, 0x00, 0x80, 0x00, 0x30];
         let ebsp = [0x00u8, 0x00, 0x03, 0x80, 0x00, 0x30];
 
@@ -924,15 +826,9 @@ mod tests {
             v
         }
         let mut parser = H264Parser::new();
-        // AU1 seeds the active SPS/PPS. The SPS is deliberately ~200 bytes rather
-        // than a handful: `frame_data` is presized to `pes.data.len() + 64 +
-        // PARAM_REASSERT_HEADROOM` and a bare keyframe uses slightly less than
-        // `pes.data.len()`, so a tiny parameter set fits in the incidental `+64`
-        // slack and the test would pass with `PARAM_REASSERT_HEADROOM` set to
-        // zero — proving only that this fixture does not realloc, not that the
-        // headroom is what prevents it. At ~200 bytes the prefix exceeds the
-        // incidental slack, so the constant is load-bearing and zeroing it makes
-        // this test fail.
+        // AU1 seeds the active SPS/PPS. The SPS is deliberately ~200 bytes so the
+        // re-assert prefix exceeds the incidental `+64` slack in `frame_data`'s
+        // capacity — a tiny SPS would pass even with PARAM_REASSERT_HEADROOM zeroed.
         let mut big_sps = vec![0x42, 0x00, 0x1E];
         big_sps.extend(std::iter::repeat_n(0xAB, 200));
         let au1 = [
@@ -1131,9 +1027,7 @@ mod tests {
     fn h264_populates_measured_coding_type_and_source() {
         use super::super::coding::CodingType;
         // Slice-header body = first_mb_in_slice=0 ('1') then slice_type ue(v):
-        //   0x88 = '1 0001000' → slice_type 7 (I)
-        //   0x98 = '1 00110..' → slice_type 5 (P)
-        //   0x9C = '1 00111..' → slice_type 6 (B)
+        // 0x88='1 0001000'->I (7); 0x98='1 00110..'->P (5); 0x9C='1 00111..'->B (6).
         let src = crate::pes::SourcePos::at_byte(8192);
         let parse = |nal_type: u8, body: u8| {
             let mut p = H264Parser::new();
@@ -1595,10 +1489,9 @@ mod tests {
         au.extend_from_slice(&[0x68, 0x11]);
         au.extend_from_slice(&[0x00, 0x00, 0x01]);
         au.extend_from_slice(&[0x65, 0x10]);
-        // Two identical AUs. Each is a keyframe, so each re-asserts the active
-        // SPS/PPS in-band (self-contained keyframe) even though the bodies are
-        // unchanged — a decoder that dropped them at a reset recovers at every
-        // IDR. Frame = SPS, PPS, IDR.
+        // Two identical AUs, each a keyframe: each re-asserts the active SPS/PPS
+        // in-band even though unchanged, so a decoder that dropped them at a
+        // reset recovers at every IDR. Frame = SPS, PPS, IDR.
         parser.parse(&make_pes(au.clone(), Some(0)));
         let f = parser.parse(&make_pes(au, Some(90000)));
         assert_eq!(
@@ -1611,9 +1504,8 @@ mod tests {
     #[test]
     fn many_empty_nals_do_not_overflow_stack() {
         // Regression: NalIterator::next must iterate, not recurse, over empty
-        // NALs. A crafted Annex B stream of tens of thousands of adjacent start
-        // codes (each producing an empty NAL) would blow the stack under the old
-        // tail-recursive implementation. Iterating handles it in bounded stack.
+        // NALs, or tens of thousands of adjacent start codes (each an empty NAL)
+        // would blow the stack under the old tail-recursive implementation.
         let mut data = Vec::new();
         // 50_000 back-to-back 3-byte start codes → 50_000 empty NALs.
         for _ in 0..50_000 {
@@ -1637,14 +1529,9 @@ mod tests {
 
     #[test]
     fn avcc_exact_length_fields_and_payload() {
-        // The AVCDecoderConfigurationRecord must encode SPS length and PPS length
-        // as 16-bit big-endian fields, followed by the verbatim NAL bodies.
-        // Uses a Main-Profile SPS (profile_idc=0x4D=77) so no High-Profile
-        // extension bytes are appended — the test validates the fixed-header
-        // layout only. High-Profile extension is covered by
-        // avcc_high_profile_appends_extension_bytes.
-        // SPS = 0x67,profile,compat,level + 2 payload bytes (6 bytes total).
-        // PPS = 0x68 + 2 payload bytes (3 bytes total).
+        // Validates the fixed AVCDecoderConfigurationRecord header/length-field
+        // layout using a Main-Profile SPS (profile_idc=0x4D=77) so no High-Profile
+        // extension bytes are appended (see avcc_high_profile_appends_extension_bytes).
         let mut parser = H264Parser::new();
         let mut data = Vec::new();
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
@@ -1708,10 +1595,9 @@ mod tests {
 
     #[test]
     fn nal_type_masks_high_three_bits() {
-        // nal_type = byte0 & 0x1F. The forbidden_zero_bit (bit 7) and
-        // nal_ref_idc (bits 6-5) must not affect type detection. An IDR (type 5)
-        // header is 0x65 (nal_ref_idc=3) or 0x25 (nal_ref_idc=1) — both type 5,
-        // both keyframes.
+        // nal_type = byte0 & 0x1F. forbidden_zero_bit (bit 7) and nal_ref_idc
+        // (bits 6-5) must not affect type detection: 0x65 (ref_idc=3) and 0x25
+        // (ref_idc=1) are both IDR (type 5), both keyframes.
         for idr_hdr in [0x65u8, 0x25, 0x05, 0x85] {
             let mut parser = H264Parser::new();
             let data = vec![0x00, 0x00, 0x01, idr_hdr, 0x10, 0x20];
@@ -1758,8 +1644,7 @@ mod tests {
     fn trailing_zeros_of_next_start_code_stripped_from_nal() {
         // The byte(s) before a following 4-byte start code (00 00 00 01) are
         // leading zeros of that start code, not RBSP, and must be stripped from
-        // the current NAL. Two NALs separated by a 4-byte start code: NAL 1 must
-        // not absorb the extra 00.
+        // the current NAL — NAL 1 must not absorb the extra 00.
         let mut parser = H264Parser::new();
         let mut data = vec![0x00, 0x00, 0x01, 0x41, 0xAA]; // NAL1 = 0x41 0xAA
         data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x41, 0xBB]); // 4-byte SC
@@ -1978,10 +1863,9 @@ mod tests {
 
         let cp = parser.codec_private().expect("avcC must be present");
 
-        // Walk to the end of the fixed record to locate the extension bytes.
-        // Fixed header: 6 bytes. SPS length field: 2 bytes. SPS body. numPPS: 1.
-        // PPS length: 2. PPS body (0x68, 0xCE, 0x01 = 3 bytes).
-        // Fixed tail offset = 6 + 2 + sps.len() + 1 + 2 + 3 = sps.len() + 14.
+        // Locate extension bytes past the fixed record: 6-byte header + 2-byte
+        // SPS length + SPS body + 1-byte numPPS + 2-byte PPS length + 3-byte PPS
+        // body (0x68,0xCE,0x01) = sps.len() + 14.
         let ext_off = sps.len() + 14;
         assert!(
             cp.len() == ext_off + 4,

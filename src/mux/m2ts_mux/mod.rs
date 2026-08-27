@@ -212,12 +212,9 @@ impl<W: Write> M2tsMux<W> {
         // first keyframe can't carry params usefully).
         let mut es = Vec::with_capacity(data.len() + 64);
         if keyframe && !self.params_attempted {
-            // Arming the latch below is right either way — the same codec_private
-            // bytes cannot parse better on a later keyframe — but it must not be
-            // SILENT, which is what it was: no parameter sets reached the stream,
-            // every later keyframe skipped the prepend, and `finish()` returned Ok
-            // on a TS whose video cannot be decoded. Mirrors the same fix in the
-            // BD-TS sibling (`tsmux.rs`).
+            // Must not fail SILENT: if params don't parse, warn loudly rather than
+            // letting `finish()` return Ok on an undecodable TS. Mirrors the same
+            // fix in the BD-TS sibling (`tsmux.rs`).
             match self.video_codec_private.as_deref() {
                 Some(cp) => match super::hevc::hvcc_to_annex_b(cp) {
                     Some(params) => {
@@ -240,8 +237,6 @@ impl<W: Write> M2tsMux<W> {
             }
             self.params_attempted = true;
         }
-        // Append the Annex-B form directly into the pre-sized `es`
-        // buffer rather than materializing an intermediate Vec.
         // The source's hvcC declares the NAL length-prefix width (ISO/IEC
         // 14496-15 §8.3.3.1.2 `lengthSizeMinusOne + 1`); assuming 4 mangles a
         // legal 1- or 2-octet-prefixed source into a start-code-free stream.
@@ -293,17 +288,9 @@ impl<W: Write> M2tsMux<W> {
             self.base_pts_90k.get_or_insert(raw_90k);
         }
         let base = self.base_pts_90k.unwrap_or(raw_90k);
-        // Modular 33-bit subtraction. The 90 kHz PTS clock is a 33-bit field
-        // that wraps every 2^33 ticks (~26.5 h). A plain `saturating_sub` would
-        // collapse ANY frame whose (33-bit-masked) tick lands below `base` to
-        // PTS 0 — including a frame across a legitimate clock wrap (raw wraps
-        // past 0 and lands far below base), flat-lining timing for that span.
-        // Wrap the difference into the 33-bit range, then interpret it as a
-        // signed 33-bit delta: a small magnitude in the LOWER half is genuine
-        // forward progression (incl. across a wrap) and is kept; a value in the
-        // UPPER half means the frame is truly BEFORE the base (a small backward
-        // step — e.g. a leading audio frame ahead of the first video keyframe),
-        // which still floors to 0 per the documented behavior.
+        // Modular 33-bit subtraction: the PTS clock wraps every 2^33 ticks
+        // (~26.5 h), so plain `saturating_sub` would flat-line timing across a
+        // wrap. Wrap the delta into 33 bits and treat it as signed instead.
         let delta = raw_90k.wrapping_sub(base) & 0x1_FFFF_FFFF;
         // Signed 33-bit: the sign bit is bit 32 (value 2^32), so the entire
         // upper half [2^32, 2^33) is negative (frame before base) and floors
@@ -333,24 +320,17 @@ impl<W: Write> M2tsMux<W> {
         pcr: Option<u64>,
         is_keyframe_video: bool,
     ) -> io::Result<()> {
-        // PSI cadence is enforced per TS packet — interleave a fresh
-        // PAT+PMT into the packet stream every PSI_INTERVAL_PACKETS so
-        // long single-PES emissions (e.g. one 60 KB video frame) don't
+        // Interleave fresh PAT+PMT every PSI_INTERVAL_PACKETS so long
+        // single-PES emissions (e.g. one 60 KB video frame) don't
         // starve receivers tuning in mid-stream.
         let mut offset = 0;
         let mut first = true;
         while offset < pes.len() {
             self.maybe_emit_psi()?;
 
-            // PCR cadence is enforced per VIDEO TS packet, NOT per PES. A single
-            // UHD HEVC I-frame is one PES spanning thousands of TS packets; if
-            // PCR could only ride the PES's first packet, the clock would go
-            // un-restamped for the whole frame — a multi-second gap far beyond
-            // the 40-packet / ~100 ms bound, which strict T-STD validators treat
-            // as a clock discontinuity. So re-stamp whenever the per-packet
-            // counter reaches the interval (or on the very first video packet of
-            // the stream), regardless of whether this is the PES start. Re-using
-            // the PES's own `pcr` for a mid-PES packet keeps the gap bounded.
+            // PCR cadence is per VIDEO TS packet, NOT per PES: a single UHD HEVC
+            // I-frame spans thousands of packets, so re-stamping only at PES
+            // start risks a multi-second T-STD clock-discontinuity violation.
             let attach_pcr = (pid == PID_VIDEO)
                 && (pcr.is_some())
                 && (!self.first_video_written
@@ -373,17 +353,9 @@ impl<W: Write> M2tsMux<W> {
             }
 
             let remaining = pes.len() - offset;
-            // Capacity for payload given AF body and 1-byte AF length.
-            // When AF body is empty we can still skip the AF entirely
-            // and get the full 184 B; only invoke the AF when we'd
-            // otherwise need stuffing.
-            //
-            // Per ISO/IEC 13818-1 Table 2-6, when an adaptation field is
-            // present its first body byte is the mandatory 8-bit flags
-            // byte. A stuffing-only field still needs that flags byte
-            // (all flags 0) — omitting it would make a strict decoder
-            // read the first 0xFF stuffing byte as flags (PCR_flag=1,
-            // …) and parse a phantom PCR out of the stuffing/payload.
+            // Per ISO/IEC 13818-1 Table 2-6, an adaptation field's first body byte
+            // is the mandatory 8-bit flags byte, even when stuffing-only (all 0) —
+            // omitting it lets a decoder misread the 0xFF stuffing as flags.
             let (af_present, payload_len, stuffing): (bool, usize, usize) = if !af_body.is_empty() {
                 // AF is mandatory (PCR, RAI, …). 1 byte length + body +
                 // stuffing + payload = 184.
@@ -487,11 +459,9 @@ fn build_video_pes(pts_90k: u64, es: &[u8]) -> Vec<u8> {
 
 /// Build a PES packet for an audio access unit.
 fn build_audio_pes(pts_90k: u64, es: &[u8]) -> Vec<u8> {
-    // Audio PES: a bounded length is written whenever the PES fits in a
-    // u16 (the common case), so receivers don't have to scan for the next
-    // start code. For an access unit larger than ~64 KiB (rare — e.g. a
-    // large TrueHD frame) the length field falls back to the unbounded
-    // (0x0000) form, which most demuxers tolerate for private_stream_1.
+    // A bounded length is written whenever the PES fits a u16; larger units
+    // (rare — e.g. a large TrueHD frame) fall back to the unbounded (0x0000)
+    // form, which most demuxers tolerate for private_stream_1.
     build_pes_packet(
         crate::consts::pes_stream_id::PRIVATE_STREAM_1,
         pts_90k,
@@ -533,10 +503,9 @@ fn build_pes_packet(stream_id: u8, pts_90k: u64, es: &[u8], length_in_header: bo
 fn build_pat(pmt_pid: u16) -> Vec<u8> {
     let mut section = Vec::new();
     section.push(0x00); // table_id = PAT
-    // section_syntax_indicator(1) | '0'(1) | reserved(2) | section_length(12)
-    // section_length covers from end of this field through CRC.
-    // Body: transport_stream_id(2) + version/cni(1) + section/last_section(2) + program(4) = 9 bytes,
-    // plus CRC(4) = 13. Encoded big-endian.
+    // section_length covers from end of this field through CRC: body
+    // (transport_stream_id 2 + version/cni 1 + section/last_section 2 +
+    // program 4 = 9 bytes) plus CRC(4) = 13.
     section.extend_from_slice(&[0xB0, 13]);
     section.extend_from_slice(&[0x00, 0x01]); // transport_stream_id = 1
     section.push(0xC1); // reserved | version=0 | current_next=1
@@ -604,13 +573,9 @@ fn build_pmt(audio: Option<AudioCodec>) -> Vec<u8> {
 
 /// Build the adaptation field carrying a PCR (no other flags).
 fn build_pcr_adaptation(pcr_90k: u64) -> Vec<u8> {
-    // adaptation_field_length is set by `Packet::append_adaptation`
-    // — this function returns just the field body.
-    //
-    // Layout: discontinuity_indicator(1) | random_access(1) |
-    // elementary_stream_priority(1) | PCR_flag(1) | OPCR_flag(1) |
-    // splicing_point_flag(1) | transport_private_data_flag(1) |
-    // adaptation_field_extension_flag(1) | PCR(48b).
+    // adaptation_field_length is set by `Packet::append_adaptation` —
+    // this function returns just the field body: flags byte (PCR_flag
+    // etc.) followed by the 48-bit PCR (33b base | 6b reserved | 9b ext).
     let mut af = vec![0x10]; // PCR_flag=1; RAI is OR'd in by the caller when applicable
     let pcr_base = pcr_90k & 0x1_FFFF_FFFF; // 33-bit
     let pcr_ext: u16 = 0; // 9-bit, we keep it zero (no sub-tick precision)
@@ -726,12 +691,9 @@ mod tests {
 
     #[test]
     fn crc32_is_self_validating() {
-        // The MPEG-TS CRC has the property that prepending a single
-        // bit-flip changes the output; running it over its own input +
-        // CRC yields a fixed magic constant (the CRC residue). Rather
-        // than hardcoding sample bytes, verify the underlying algorithm
-        // by checking that two distinct inputs produce distinct CRCs
-        // and that the same input is deterministic.
+        // Rather than hardcoding sample bytes and a magic CRC residue,
+        // verify the algorithm behaviorally: distinct inputs produce
+        // distinct CRCs and the same input is deterministic.
         let a = [
             0u8, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xE1, 0x00,
         ];
@@ -741,10 +703,8 @@ mod tests {
         let crc_b = mpegts_crc32(&b);
         assert_ne!(crc_a, crc_b);
         assert_eq!(crc_a, mpegts_crc32(&a)); // deterministic
-        // Sanity: all-zero input ⇒ CRC = 0 (init XORs but the
-        // shift/feedback cancels for zero data after init drains).
-        // We don't assert exact value — that depends on poly choice —
-        // but check it's not the same as for non-zero data.
+        // Sanity check for all-zero input: don't assert an exact value
+        // (depends on poly choice), just that it differs from non-zero data.
         let crc_zero = mpegts_crc32(&[0u8; 12]);
         assert_ne!(crc_zero, crc_a);
     }
@@ -878,14 +838,9 @@ mod tests {
 
     #[test]
     fn stuffing_only_tail_packet_is_spec_valid() {
-        // A short final PES packet must stuff via an adaptation field
-        // whose first body byte is the mandatory zero-flags byte (per
-        // ISO/IEC 13818-1 Table 2-6), never a bare 0xFF stuffing byte
-        // that a decoder would misread as PCR/OPCR/etc. flags.
-        //
-        // Use an AUDIO PES (no PCR, no RAI on its tail) so the only AF on
-        // the last packet is the stuffing-only field under test. The PES
-        // is sized so its final TS packet is short (< 184 payload bytes).
+        // A short final PES packet must stuff via an AF whose first body byte is
+        // the mandatory zero-flags byte (ISO/IEC 13818-1 Table 2-6), never a bare
+        // 0xFF a decoder could misread as flags. Uses an AUDIO PES (no PCR/RAI).
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = M2tsMux::new(&mut sink);
         mux.set_audio(AudioCodec::Ac3);
@@ -1060,12 +1015,9 @@ mod tests {
         mux.finish().unwrap();
         drop(mux);
 
-        // The first video packet carries PCR + RAI (keyframe PES start). RAI
-        // rides only the FIRST packet of a KEYFRAME PES; every OTHER PCR-bearing
-        // video packet — the mid-PES re-stamps and the non-keyframe PES starts —
-        // must have RAI clear. Skip the very first video packet (the keyframe
-        // RAI carrier) and assert the first remaining PCR-bearing packet is RAI
-        // clear.
+        // RAI rides only the FIRST packet of a KEYFRAME PES; every other
+        // PCR-bearing video packet must have RAI clear. Skip that first
+        // (keyframe RAI carrier) packet and check the rest.
         let video_pkts: Vec<&[u8]> = sink
             .chunks(188)
             .filter(|p| u16::from_be_bytes([p[1] & 0x1F, p[2]]) == PID_VIDEO)
@@ -1116,10 +1068,9 @@ mod tests {
 
         assert_ts_well_formed(&sink);
 
-        // Walk every video TS packet in order; record which ones carry a PCR
-        // (AF present with PCR_flag 0x10). The packet INDEX (among video
-        // packets) of consecutive PCR carriers must never advance by more than
-        // PCR_INTERVAL_PACKETS.
+        // Walk every video TS packet; record which carry a PCR (AF present with
+        // PCR_flag 0x10). The video-packet index of consecutive PCR carriers must
+        // never advance by more than PCR_INTERVAL_PACKETS.
         let mut video_idx = 0usize;
         let mut pcr_indices: Vec<usize> = Vec::new();
         let mut total_video = 0usize;
@@ -1151,10 +1102,9 @@ mod tests {
         );
         // First PCR is on the first video packet.
         assert_eq!(pcr_indices[0], 0, "first video packet must carry PCR");
-        // No gap between consecutive PCRs exceeds the interval. The counter is
-        // post-incremented and PCR attaches on `>= PCR_INTERVAL_PACKETS`, so the
-        // packet index gap is `PCR_INTERVAL_PACKETS + 1` (40 packets carrying no
-        // PCR, then the re-stamp packet) — the spec "every 40 packets" bound.
+        // Counter is post-incremented and PCR attaches on `>= PCR_INTERVAL_PACKETS`,
+        // so the max index gap is `PCR_INTERVAL_PACKETS + 1` — the spec's
+        // "every 40 packets" bound.
         let max_gap = PCR_INTERVAL_PACKETS + 1;
         for w in pcr_indices.windows(2) {
             assert!(
@@ -1173,13 +1123,9 @@ mod tests {
 
     #[test]
     fn keyframe_video_with_pcr_combines_flags() {
-        // The FIRST video PES is always a keyframe carrying BOTH a PCR (forced
-        // at stream start so the receiver has the clock the PMT promises) AND a
-        // RAI (keyframe) — exercising the flag-OR path that combines RAI into the
-        // PCR adaptation-field flags byte (0x10 | 0x40 = 0x50). (PCR cadence is
-        // now enforced per video packet, NOT per PES boundary, so a LATER
-        // keyframe PES start no longer deterministically lands on a PCR-due
-        // packet; the combine path is pinned here on the guaranteed first PES.)
+        // The FIRST video PES always carries both PCR (forced at stream start)
+        // and RAI, exercising the flag-OR path (0x10 | 0x40 = 0x50). Pinned on
+        // the first PES since PCR is now per-packet, not per-PES-boundary.
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = M2tsMux::new(&mut sink);
         let mut small = Vec::new();
@@ -1231,19 +1177,16 @@ mod tests {
 
     #[test]
     fn crc32_residue_over_section_plus_crc_is_zero() {
-        // Defining property of the MPEG-TS CRC (ISO 13818-1 Annex B): running
-        // the CRC over a message WITH its appended 4-byte CRC yields a fixed
-        // residue. For this poly/init (no final XOR) the residue over
-        // [data || crc(data)] is 0. This pins the algorithm independent of
-        // any sample vector.
+        // Defining property of the MPEG-TS CRC (ISO 13818-1 Annex B): for this
+        // poly/init (no final XOR), running it over [data || crc(data)] yields
+        // residue 0 — this pins the algorithm independent of any sample vector.
         let data = [
             0x00u8, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xE1, 0x00,
         ];
         let crc = mpegts_crc32(&data);
-        // Known-answer vector for CRC-32/MPEG-2 (poly 0x04C11DB7, init
-        // 0xFFFFFFFF, no reflection, no final XOR — ISO/IEC 13818-1 Annex B),
-        // independently computed. This pins the polynomial, not just internal
-        // consistency.
+        // Known-answer vector for CRC-32/MPEG-2 (poly 0x04C11DB7, init 0xFFFFFFFF,
+        // no reflection, no final XOR — ISO/IEC 13818-1 Annex B), independently
+        // computed. Pins the polynomial, not just internal consistency.
         assert_eq!(crc, 0xE8F9_5E7D, "CRC-32/MPEG-2 known-answer vector");
         let mut with_crc = data.to_vec();
         with_crc.extend_from_slice(&crc.to_be_bytes());
@@ -1423,26 +1366,9 @@ mod tests {
 
     #[test]
     fn extreme_pts_does_not_overflow_and_clamps_to_33bit() {
-        // `base_relative_pts` widens to u128 then wraps the delta into 33 bits. An
-        // adversarial i64::MAX ns must not overflow, and the encoded PES PTS must be
-        // the EXACT wrapped value.
-        //
-        // The old version of this test wrote a single video frame, which by its own
-        // admission rebases to relative PTS 0 — so its only assertion was
-        // `0 < 2^33`, which cannot fail: widening the 33-bit mask (or deleting it)
-        // left the one test named for 33-bit clamping green. Two frames are needed
-        // so the second has a non-zero delta to pin, and the expected value is
-        // computed here from the spec formula rather than read back from the code
-        // under test.
-        //
-        // NOTE on the test's name: bit 32 of the PES PTS field is UNREACHABLE from
-        // this path. `base_relative_pts` interprets the delta as a signed 33-bit
-        // value and floors the entire upper half [2^32, 2^33) to 0, so anything the
-        // encoder ever receives is < 2^32. "Clamping to 33 bits" is therefore a
-        // structural property of the delta rule, not something a test can exercise;
-        // what IS pinned below is the exact encoding of the largest reachable value
-        // and the documented i64::MAX outcome.
-        // Decode the 33-bit PTS out of a PUSI video packet's PES header.
+        // Two frames are required: a single frame always rebases to PTS 0, making
+        // the only assertion the vacuous `0 < 2^33`. Bit 32 is unreachable (the
+        // signed-33-bit delta rule floors the upper half to 0), so this pins encoding.
         let decode_pts = |pkt: &[u8]| -> u64 {
             // Payload after the AF: AF area = 1 (length byte) + af_len.
             let af_len = pkt[4] as usize;
@@ -1458,13 +1384,9 @@ mod tests {
         frame.extend_from_slice(&4u32.to_be_bytes());
         frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
 
-        // (a) A LARGE but forward delta: exact-value assertion across all 33 bits.
-        //
-        // Frame 1 at PTS 0 seeds the base to 0, so frame 2's relative PTS is its own
-        // tick value. 477_218_477 x 100_000 ns divides exactly by the 100_000/9
-        // conversion, giving 4_294_966_293 ticks — just under 2^32, i.e. the largest
-        // magnitude the signed-33-bit delta rule treats as forward progression, and
-        // a value that needs the full 3+15+15-bit PES PTS field to survive.
+        // (a) A LARGE but forward delta, exact-value assertion. 477_218_477 x
+        // 100_000 ns divides exactly, giving 4_294_966_293 ticks — just under
+        // 2^32, the largest magnitude the signed-33-bit rule treats as forward.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = M2tsMux::new(&mut sink);
@@ -1483,12 +1405,9 @@ mod tests {
             "the encoded PES PTS must be the exact tick value, not a truncated one"
         );
 
-        // (b) The adversarial i64::MAX: no overflow, no panic, and the documented
-        // signed-33-bit outcome. Its tick count masks to 6_564_084_417, which is in
-        // the UPPER half of the 33-bit range, so the delta rule reads it as a frame
-        // BEFORE the base and floors it to 0 (the same rule that floors leading
-        // audio). Asserted explicitly so this is a pinned decision, not the vacuous
-        // `0 < 2^33` the old single-frame version checked.
+        // (b) The adversarial i64::MAX: no overflow/panic. Its tick count masks to
+        // 6_564_084_417, in the UPPER half of the 33-bit range, so the delta rule
+        // reads it as a frame BEFORE the base and floors it to 0 — pinned explicitly.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = M2tsMux::new(&mut sink);
@@ -1513,11 +1432,9 @@ mod tests {
 
     #[test]
     fn base_relative_pts_wraps_across_33bit_clock_rollover() {
-        // Regression: a real 90 kHz clock wrap must NOT collapse to PTS 0.
-        // Seed base near the top of the 33-bit range; a later frame whose tick
-        // has wrapped past 0 lands far below base. The OLD `saturating_sub`
-        // returned 0 (flat-lining timing); modular subtraction must return the
-        // true small forward delta.
+        // Regression: a real 90 kHz clock wrap must NOT collapse to PTS 0. The OLD
+        // `saturating_sub` returned 0 here (flat-lining timing); modular subtraction
+        // must return the true small forward delta instead.
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = M2tsMux::new(&mut sink);
         // Force the base to 2^33 - 100 directly (a value reachable only after

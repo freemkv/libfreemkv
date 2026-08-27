@@ -63,11 +63,9 @@ pub fn unit_disposition(
         None => UnitDisposition::Default,
         // In a forensic segment → decide by whether it is our index.
         Some(seg) => {
-            // `seg.index` is an untrusted u16 from IndividualSegment.tbl; a real
-            // forensic index is 1..=32. Compare in u16 space so a corrupt/crafted
-            // index above 255 can't truncate into a valid u8 and alias our index.
-            // The disposition carries a u8 for diagnostics (saturated — an
-            // out-of-range index is never ours anyway).
+            // `seg.index` is untrusted (real range 1..=32); compare in u16 space so a
+            // crafted index above 255 can't truncate into a valid u8 and alias ours.
+            // Diagnostics carry a saturated u8 since out-of-range is never ours.
             let seg_index = seg.index;
             let diag = seg_index.min(u8::MAX as u16) as u8;
             match disc_index {
@@ -169,10 +167,9 @@ mod tests {
 
     #[test]
     fn out_of_range_index_does_not_truncate_into_ours() {
-        // A crafted/corrupt segment index of 288 (0x0120) truncates to 32 in a
-        // u8. With our disc index resolved as 32, the old `seg.index as u8`
-        // compare would alias it to OUR index and decrypt with the wrong key.
-        // The u16 compare must instead classify it as foreign.
+        // Index 288 (0x0120) truncates to 32 in a u8, which would alias our
+        // resolved index 32 under the old `as u8` compare; u16 compare must
+        // classify it as foreign instead.
         let segs = tbl(&[(288, 100, 200)]);
         let off = 120u64 * SOURCE_PACKET_LEN;
         assert_eq!(

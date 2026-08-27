@@ -42,14 +42,9 @@ const NS: i64 = 1_000_000_000;
 /// (ISO/IEC 14496-12 §8.3.2), not the track's own media timescale.
 const MOVIE_TIMESCALE: u32 = 90_000;
 
-// ── faststart reserve sizing ─────────────────────────────────────────────────
-//
-// Faststart is on by default: reserve a `moov`-sized hole between `ftyp` and
-// `mdat`, then write `moov` into it at finish and pad the slack with a `free`
-// box. Because the hole precedes `mdat`, sample offsets are fixed from the start
-// — no rewrite, no offset patch. `moov` is dominated by the per-sample tables
-// (`stsz` 4 B + `co64` 8 B + `ctts`/`stts`/`stss` ~4 B, one-sample-per-chunk), so
-// its size scales with the total sample count.
+// Faststart reserve sizing: reserve a `moov`-sized hole between `ftyp` and `mdat`
+// so sample offsets are fixed up front (no rewrite/offset patch at finish).
+// `moov` size scales with sample count (stsz/co64/ctts/stts/stss per sample).
 
 /// Estimated `moov` bytes per sample (calibrated against real discs; bias high).
 const BYTES_PER_SAMPLE: u64 = 16;
@@ -98,12 +93,8 @@ fn estimate_reserve(title: &DiscTitle, included: &[usize]) -> u64 {
                 est_samples += dur * fps;
             }
             DiscStream::Audio(a) => {
-                // Samples per frame differs sharply by codec, and 1.6.0 added DTS
-                // to the carried set (audio_fits now admits Dts | DtsHdMa |
-                // DtsHdHr). A DTS core AU is (nblks+1)*32 — commonly 512 samples,
-                // a third of an (E-)AC-3 frame's 1536 — so modelling every audio
-                // track as AC-3 under-reserved a DTS track's sample table 3x and
-                // pushed the mux onto the moov-at-end fallback.
+                // A DTS core AU is ~512 samples vs 1536 for (E-)AC-3; modelling every
+                // audio track as AC-3 under-reserved DTS tracks 3x and forced fallback.
                 let samples_per_frame = match a.codec {
                     Codec::Dts | Codec::DtsHdMa | Codec::DtsHdHr => 512.0,
                     _ => 1536.0,
@@ -117,12 +108,9 @@ fn estimate_reserve(title: &DiscTitle, included: &[usize]) -> u64 {
     let reserve = round_up_grain(est)
         .max(RESERVE_FLOOR)
         .saturating_add(RESERVE_BUFFER);
-    // The hole is a `free` box with a 32-bit size field, so a reserve at or above
-    // u32::MAX cannot be expressed: writing it truncated the size and left mdat
-    // beyond a box that claimed to be far shorter. Clamp to the largest
-    // grain-aligned value the field can hold. No real title comes near this —
-    // a 90 GB UHD title estimates a few MiB — but truncating silently produces an
-    // unreadable file, so it is bounded rather than trusted.
+    // The hole is a `free` box with a 32-bit size field; a reserve >= u32::MAX
+    // would truncate and leave mdat beyond a box claiming to be far shorter.
+    // Clamp to the largest grain-aligned value the field can hold.
     reserve.min(RESERVE_CAP)
 }
 
@@ -311,10 +299,8 @@ impl<W: Write + Seek> Mp4Sink<W> {
         let mut tracks = Vec::new();
         let mut route = vec![None; title.streams.len()];
         let mut video_codec = Codec::Hevc;
-        // Track ids are 1-based and assigned in inclusion order. `moov`'s
-        // next_track_id is NOT derived from this counter — it is max(track_id) + 1
-        // computed after the sample-less retain, since ids are handed out here
-        // before any track is dropped.
+        // Track ids are 1-based, assigned in inclusion order. `moov`'s next_track_id
+        // is max(track_id) + 1 computed after the sample-less retain, not this counter.
         for (n, &i) in report.included.iter().enumerate() {
             let track_id = n as u32 + 1;
             route[i] = Some(tracks.len());
@@ -326,11 +312,9 @@ impl<W: Write + Seek> Mp4Sink<W> {
                         .get(i)
                         .and_then(|c| c.clone())
                         .ok_or(crate::error::Error::Mp4MissingCodecPrivate)?;
-                    // ISO/IEC 14496-12 makes width/height mandatory in tkhd
-                    // (8.3.2) and VisualSampleEntry (12.1.3) — unlike Matroska
-                    // there is no element to omit. Writing 0x0 yields a
-                    // structurally complete file no player can render, with no
-                    // error anywhere; refuse instead.
+                    // ISO/IEC 14496-12 §8.3.2/§12.1.3 make width/height mandatory;
+                    // writing 0x0 yields a structurally valid file no player can
+                    // render, with no error anywhere, so refuse instead.
                     let (w, h) = v
                         .resolution
                         .pixels()
@@ -374,11 +358,9 @@ impl<W: Write + Seek> Mp4Sink<W> {
         writer.write_all(&ftyp)?;
         let hole_start = ftyp.len() as u64;
 
-        // Faststart: reserve a `moov`-sized hole (a `free` box) between `ftyp`
-        // and `mdat`. Only the 8-byte `free` header is written now; the body is
-        // left as a hole (sparse) and overwritten at finish() by moov + a smaller
-        // `free`. `mdat` therefore starts at a fixed offset, so co64 offsets are
-        // correct as written — no rewrite, no patch.
+        // Faststart: write only the 8-byte `free` header now; the body is left as a
+        // hole, overwritten at finish() by moov + a smaller `free`. mdat therefore
+        // starts at a fixed offset, so co64 offsets are correct as written.
         let reserve = estimate_reserve(title, &report.included);
         writer.write_all(&(reserve as u32).to_be_bytes())?;
         writer.write_all(b"free")?;
@@ -439,11 +421,9 @@ impl<W: Write + Seek> Mp4Sink<W> {
             traks.push(trak);
             movie_dur = movie_dur.max((secs * movie_ts as f64) as u64);
         }
-        // `next_track_id` must EXCEED every track_ID in use (ISO/IEC 14496-12
-        // §8.2.2). Deriving it from the retained COUNT broke that whenever
-        // `finish()` dropped a track: ids [1, 3] retained → count 2 → 3, which
-        // names a live track, so a tool appending a track with it creates a
-        // duplicate id. Take the real maximum.
+        // `next_track_id` must EXCEED every track_ID in use (ISO/IEC 14496-12 §8.2.2).
+        // Deriving it from the retained count breaks if finish() drops a track (e.g.
+        // ids [1, 3] retained → count 2 → 3 collides), so take the real maximum.
         let next_id = self
             .tracks
             .iter()
@@ -469,12 +449,9 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
         let Some(slot) = self.route.get(frame.track).copied().flatten() else {
             return Ok(()); // excluded track (or out of range)
         };
-        // Derive the audio sample entry opportunistically from whichever frame
-        // parses first. The entry is only needed at finish(), when build_moov runs
-        // — nothing on this path consumes it — so an unparseable frame must NOT
-        // cost us the frame. Dropping leading frames here lost audio silently, and
-        // a track whose frames never parsed vanished from the output entirely with
-        // no report; finish() now decides that case loudly instead.
+        // Derive the audio sample entry opportunistically from whichever frame parses
+        // first; it's only needed at finish(). Dropping unparseable leading frames
+        // here used to lose audio silently — finish() now reports that case loudly.
         if self.tracks[slot].media == Media::Audio
             && self.tracks[slot].audio_entry.is_none()
             && let Some(entry) = audio::dolby_sample_entry(self.tracks[slot].codec, &frame.data)
@@ -499,10 +476,9 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
             return Ok(());
         }
         self.finished = true;
-        // Every drop below is recorded in `self.dropped` so `final_report()` — the
-        // structured answer to "what is in this file" — cannot keep claiming a
-        // track the file does not have. A `tracing::warn` alone left the crate's
-        // own public report lying about the output.
+        // Every drop below is recorded in `self.dropped` so `final_report()` cannot
+        // keep claiming a track the file doesn't have; a `tracing::warn` alone left
+        // the crate's own public report lying about the output.
         let mut dropped = Vec::new();
         // Drop tracks that never received a sample so moov carries no empty trak.
         self.tracks.retain(|t| {
@@ -517,12 +493,9 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
             }
             kept
         });
-        // An audio track with samples but no sample entry cannot be DESCRIBED: the
-        // moov would carry an stsd declaring entry_count=1 around an empty entry,
-        // i.e. a structurally invalid mp4 returned as success. Drop it instead, and
-        // say so — this crate's policy is that a skipped track is never silent.
-        // Its bytes stay in mdat unreferenced, which is harmless (wasted space in a
-        // valid file) and preferable to failing an export whose video is fine.
+        // An audio track with samples but no sample entry can't be described: stsd
+        // would declare entry_count=1 around an empty entry, a structurally invalid
+        // mp4. Drop and report it; unreferenced mdat bytes are harmless waste.
         self.tracks.retain(|t| {
             let describable = t.media != Media::Audio || t.audio_entry.is_some();
             if !describable {
@@ -749,14 +722,9 @@ fn detect_rate(samples: &[Sample]) -> (u32, u32) {
     deltas.sort_unstable();
     let median = deltas[deltas.len() / 2];
     let fps = NS as f64 / median as f64;
-    // Snap to the NEAREST standard rate inside the tolerance window, not the
-    // first one inside it. First-match made the answer depend on table order:
-    // every 1000/1001 rate sits within 0.5 fps of its integer twin and precedes
-    // it, so an exact 24.000 / 30.000 / 60.000 fps source was always declared
-    // 24000/1001, 30000/1001, 60000/1001 — a 0.1% timing error over the whole
-    // track. Nearest-match is order-independent, so the fix cannot be undone by
-    // someone appending a rate to STD_RATES (which is why it is preferred over
-    // simply reordering the table).
+    // Snap to the NEAREST standard rate inside the tolerance window, not the first
+    // one: first-match depended on table order, so exact 24/30/60 fps sources were
+    // always declared as their 1000/1001 twin (a 0.1% timing error track-wide).
     let mut best: Option<(u32, u32, f64)> = None;
     for &(ts, dur, rate) in STD_RATES {
         let d = (fps - rate).abs();
@@ -910,10 +878,8 @@ fn video_colr(stream: &DiscStream) -> Option<(u16, u16, u16, bool)> {
     let DiscStream::Video(v) = stream else {
         return None;
     };
-    // No measured CICP and no colorimetry from the playlist → nothing usable to
-    // signal. The shared resolver returns the CICP "unspecified" triple (2/2/2)
-    // for that case; an ABSENT `colr` box already means exactly that, so omit the
-    // box rather than write it (unchanged behaviour for this sink).
+    // Nothing usable to signal: the resolver returns CICP "unspecified" (2/2/2)
+    // here, but an absent `colr` box already means that, so omit it instead.
     if v.measured_cicp.is_none() && v.color_space == crate::disc::ColorSpace::Unknown {
         return None;
     }
@@ -1249,11 +1215,9 @@ mod tests {
         }
     }
 
-    // A minimal AC-3 5.1 frame the audio parser accepts.
-    // The underscores in these literals mark BITFIELD boundaries in the
-    // bitstream header being built (e.g. a 5-bit field then a 3-bit field),
-    // not thousands-style digit groups. Regrouping them uniformly would
-    // satisfy the lint by destroying the only thing they encode.
+    // A minimal AC-3 5.1 frame the audio parser accepts. Underscores mark
+    // BITFIELD boundaries in the header (e.g. 5-bit then 3-bit fields), not
+    // thousands-grouping; regrouping them uniformly would destroy that meaning.
     #[allow(clippy::unusual_byte_groupings)]
     fn ac3_frame() -> Vec<u8> {
         vec![
@@ -1531,11 +1495,9 @@ mod tests {
 
     #[test]
     fn reserve_rounds_to_4mb_plus_buffer() {
-        // round_up_4MB(x) + 4 MiB, floored at 8 MiB.
-        // Saturates rather than wrapping. div_ceil(GRAIN) * GRAIN overflows within
-        // one grain of u64::MAX, and the wrapped product is SMALL — which would
-        // turn the largest possible estimate into a negligible reserve, the exact
-        // opposite of the intent. Only the no-wrap property matters here.
+        // round_up_4MB(x) + 4 MiB, floored at 8 MiB. Must saturate rather than wrap:
+        // div_ceil(GRAIN) * GRAIN overflows within one grain of u64::MAX, and a
+        // wrapped product is SMALL, turning the largest estimate into a tiny reserve.
         assert!(
             round_up_grain(u64::MAX) >= u64::MAX - (4 << 20),
             "round_up_grain must saturate near u64::MAX, not wrap to a small value"
@@ -1560,17 +1522,9 @@ mod tests {
             "≈12-16 MB for a 2h feature, got {r}"
         );
 
-        // The case above is dominated by RESERVE_FLOOR + RESERVE_BUFFER: its
-        // per-sample term is ~6.4 MB, under the 8 MiB floor, so setting
-        // BYTES_PER_SAMPLE to 0 would leave it green. Pin a case where the
-        // per-sample estimate is what the result is MADE of.
-        //
-        // 2 hr, 23.976 fps HEVC + EIGHT AC-3 tracks (a commentary-heavy disc):
-        //   video  7200 × 24000/1001            = 172_627 samples
-        //   audio  8 × 7200 × (48000 / 1536)    = 1_800_000 samples
-        //   total  1_972_627 × 16 B             = 31_562_032 B (30.1 MiB)
-        // → round up to 8 grains = 32 MiB, + 4 MiB buffer = 36 MiB exactly.
-        // With BYTES_PER_SAMPLE = 0 this collapses to the 12 MiB floor+buffer.
+        // The case above is dominated by the floor+buffer (per-sample term ~6.4 MB
+        // is under the floor), so BYTES_PER_SAMPLE=0 stays green there. Pin a case
+        // (2h HEVC + 8 AC-3 tracks) where per-sample dominates: ~30.1 MiB → 36 MiB.
         let mut streams = vec![hevc_video()];
         streams.extend((0..8).map(|_| audio(Codec::Ac3, "eng")));
         let mut t = title(streams, vec![]);
@@ -1636,10 +1590,8 @@ mod tests {
 
     #[test]
     fn colr_transfer_is_hlg_for_an_hlg_title_not_pq() {
-        // ITU-T H.273 Table 3: transfer 18 = ARIB STD-B67 (HLG), 16 = SMPTE
-        // ST 2084 (PQ). `video_colr` hardcoded 16 for every BT.2020 stream, so an
-        // HLG title got the PQ EOTF applied to it — while the MKV sink of the same
-        // rip correctly wrote 18.
+        // ITU-T H.273 Table 3: transfer 18 = HLG, 16 = PQ. `video_colr` used to
+        // hardcode 16 for every BT.2020 stream, wrongly applying PQ EOTF to HLG.
         let mut v = video_stream();
         v.hdr = HdrFormat::Hlg;
         v.color_space = ColorSpace::Bt2020;
@@ -1723,10 +1675,9 @@ mod tests {
 
     #[test]
     fn exact_integer_frame_rates_are_not_declared_as_their_fractional_twins() {
-        // `detect_rate` returned the FIRST STD_RATES entry within 0.5 fps, and each
-        // 1000/1001 rate precedes its integer twin, so 24.000 / 30.000 / 60.000
-        // were always written as 24000/1001, 30000/1001 and 60000/1001. The
-        // declared timescale/sample_delta is read back out of the muxed file.
+        // `detect_rate` used to return the FIRST STD_RATES entry within 0.5 fps, so
+        // 24/30/60 fps were always written as their 1000/1001 twins. Read the
+        // declared timescale/sample_delta back out of the muxed file to check.
         for (delta_ns, want) in [
             (41_666_667i64, (24u32, 1u32)), // 24.000
             (33_333_333, (30, 1)),          // 30.000
@@ -1887,18 +1838,9 @@ mod tests {
         );
     }
 
-    // ── track timing arithmetic — every operator with a concrete number ───────
-    //
-    // Nothing above this point pins a NUMBER out of the PTS→ticks / duration /
-    // tkhd_dur / ctts chain: every existing test asserts a box exists or that
-    // gross shape (trak count, mdat size) is right, never that `stts`, `ctts` or
-    // `tkhd.duration` hold a specific value. Every arithmetic operator in that
-    // chain (`*`↔`/`↔`+`↔`-`, even `/`↔`%`) could be flipped with the whole
-    // suite green — a title would mux "successfully" with silently corrupted
-    // A/V sync or a wrong total duration. These pin exact values, chosen so a
-    // flipped operator cannot coincidentally reproduce the right answer (e.g. a
-    // non-zero `min_pts` so `pts - min_pts` and a mutated `pts + min_pts` differ,
-    // a `sample_dur` other than 1 so `*` and `/` by it differ).
+    // Track timing arithmetic: tests above never pin a NUMBER out of the
+    // PTS→ticks/duration/tkhd_dur/ctts chain, so any operator there (`+`↔`-`,
+    // `*`↔`/`) could flip with the suite green. These pin exact chosen values.
 
     /// `VideoTiming::derive`'s composition ticks are `(pts - min_pts) * ts / NS`.
     /// `min_pts` is deliberately non-zero: with min_pts == 0 a mutated `+` gives
@@ -2117,10 +2059,8 @@ mod tests {
 
     #[test]
     fn detect_rate_picks_the_nearest_std_rate_regardless_of_table_order() {
-        // Order-independence is the property that keeps this fixed: every entry
-        // must resolve to itself when its own exact rate is measured, no matter
-        // where it sits in STD_RATES. A first-match rule can only satisfy this if
-        // the table happens to be ordered, which is what broke.
+        // Order-independence: every entry must resolve to itself when its own exact
+        // rate is measured, regardless of position in STD_RATES (unlike first-match).
         for &(ts, dur, rate) in STD_RATES {
             let d = (NS as f64 / rate).round() as i64;
             let samples: Vec<Sample> = (0..10)
@@ -2259,10 +2199,8 @@ mod tests {
                 keyframe: true,
             })
             .collect();
-        // Two distinct adjacent runs: [5,5] then [7,7,7]. If the coalescing
-        // guard always matches (or always mismatches), or `==`/`!=` is
-        // inverted, the run count and/or the runs' (count, value) pairs come
-        // out wrong.
+        // Two distinct adjacent runs: [5,5] then [7,7,7]. Catches a coalescing
+        // guard that always (mis)matches or an inverted `==`/`!=`.
         let durs = vec![5u32, 5, 7, 7, 7];
         let stbl = build_audio_stbl(vec![0u8; 4], &samples, &durs);
         let stts = find_child(&stbl[8..], b"stts").expect("stts");

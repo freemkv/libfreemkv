@@ -276,11 +276,9 @@ fn build_dinf() -> Vec<u8> {
 }
 
 fn build_stbl() -> Vec<u8> {
-    // Stub stsd: empty sample description (zero entries). Replace with
-    // hvc1+hvcC once the fragmenting path lands so the init segment is
-    // actually decodable. Must be populated together with build_mvex:
-    // when the hvc1+hvcC sample entry lands and entry_count becomes 1,
-    // the trex default_sample_description_index=1 becomes valid.
+    // Stub stsd: zero entries. Must land together with build_mvex's trex —
+    // once hvc1+hvcC is added here (entry_count=1), trex's
+    // default_sample_description_index=1 becomes valid.
     let mut stsd_body = Vec::new();
     stsd_body.extend_from_slice(&[0, 0, 0, 0]);
     stsd_body.extend_from_slice(&0u32.to_be_bytes()); // entry_count
@@ -306,9 +304,8 @@ fn build_stbl() -> Vec<u8> {
 
 fn build_mvex() -> Vec<u8> {
     // trex: track_ID=1, default_sample_description_index=1, others=0.
-    // dsdi=1 only becomes valid once build_stbl's stsd carries the
-    // matching hvc1 sample entry (entry_count=1) — keep the two in sync
-    // when fragment emission lands.
+    // dsdi=1 is only valid once build_stbl's stsd has the matching hvc1
+    // entry (entry_count=1) — keep the two in sync.
     let mut trex_body = Vec::new();
     trex_body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
     trex_body.extend_from_slice(&VIDEO_TRACK_ID.to_be_bytes());
@@ -411,15 +408,9 @@ mod tests {
         assert!(has_mvex, "moov missing mvex");
     }
 
-    // ============================================================
-    // ISO/IEC 14496-12 box-tree structural invariants
-    //
-    // Every box is [size:u32-BE][type:4][body]. `size` covers the full
-    // box including the 8-byte header. The init segment must be a clean
-    // sequence of well-sized boxes — a wrong size silently desyncs every
-    // ISO BMFF / DASH parser. These tests walk the tree byte-exactly
-    // rather than scanning for fourCCs.
-    // ============================================================
+    // ISO/IEC 14496-12 box-tree invariants: every box is [size:u32-BE][type:4]
+    // [body], size covers the header too. A wrong size silently desyncs every
+    // ISO BMFF/DASH parser, so these tests walk the tree byte-exactly.
 
     /// Walk a flat sequence of top-level boxes, returning
     /// (type, box_start, box_total_size). Asserts each declared size lands
@@ -482,10 +473,8 @@ mod tests {
 
     #[test]
     fn ftyp_major_brand_and_compatible_brands() {
-        // ISO/IEC 14496-12 §4.3: ftyp = major_brand(4) + minor_version(4) +
-        // compatible_brands[]. The stub declares iso6 / minor 1 / {iso6, dash,
-        // msdh, hvc1}. A regression that dropped a brand or mis-ordered the
-        // header would break DASH brand negotiation.
+        // ISO/IEC 14496-12 §4.3 ftyp layout: major_brand(4)+minor_version(4)+
+        // compatible_brands[]. A dropped/reordered brand breaks DASH negotiation.
         let buf = init_segment();
         let (ftyp_size, _) = read_box_header(&buf);
         let body = &buf[8..ftyp_size as usize];
@@ -521,10 +510,9 @@ mod tests {
 
     #[test]
     fn mvhd_timescale_and_next_track_id() {
-        // §8.2.2 mvhd (version 0): after 4-byte version+flags, the fields are
-        // creation(4) modification(4) timescale(4) duration(4) ... and the box
-        // ends with next_track_ID(4). The stub uses 90000 Hz timescale and
-        // next_track_ID = 2 (track 1 reserved for video).
+        // §8.2.2 mvhd v0: version+flags(4) creation(4) modification(4)
+        // timescale(4) duration(4) ... next_track_ID(4). Stub uses 90000 Hz
+        // and next_track_ID=2 (track 1 reserved for video).
         let buf = init_segment();
         let boxes = walk_boxes(&buf);
         let (_, moov_start, moov_size) = boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
@@ -584,12 +572,9 @@ mod tests {
 
     #[test]
     fn stbl_present_with_empty_sample_tables() {
-        // The fragmented init segment carries no samples in moov, so stsd has
-        // entry_count 0 and stts/stsc/stsz/stco are all empty. Walk down
-        // moov.trak.mdia.minf.stbl and assert the stsd entry_count is 0
-        // (current stub state). If stsd ever gains an hvc1 entry, trex's
-        // default_sample_description_index=1 becomes meaningful — this test
-        // documents the coupling the source comment calls out.
+        // Fragmented init segment carries no samples in moov: stsd entry_count
+        // is 0 and stts/stsc/stsz/stco are empty (current stub state). If stsd
+        // ever gains an hvc1 entry, trex's dsdi=1 becomes meaningful — see build_mvex.
         let buf = init_segment();
         let boxes = walk_boxes(&buf);
         let (_, moov_start, moov_size) = boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
@@ -758,10 +743,9 @@ mod tests {
 
     #[test]
     fn write_video_after_init_still_unimplemented_and_no_media() {
-        // Even after the init segment is already emitted, write_video must keep
-        // returning Unimplemented and must not append any media bytes (no
-        // moof/mdat), so a caller can't be fooled into thinking the second call
-        // succeeded.
+        // Even after init segment emission, write_video must keep returning
+        // Unimplemented and append no media bytes (no moof/mdat), so a caller
+        // can't be fooled into thinking the call succeeded.
         let mut buf: Vec<u8> = Vec::new();
         let mut mux = Fmp4Mux::new(&mut buf);
         mux.write_init_segment().unwrap();

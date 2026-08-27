@@ -47,7 +47,9 @@ pub struct DiscMetadata {
     pub titles: BTreeMap<String, String>,
     /// First-line / short description, per lang
     pub descriptions: BTreeMap<String, String>,
-    /// Disc N of M for box sets (None if not a box set)
+    /// Disc N of M, returned whenever both `<di:discNumber>` and
+    /// `<di:numSets>` are present and sane (including `(1, 1)` for a
+    /// single-disc release); `None` if either is missing or invalid.
     pub disc_number: Option<(u32, u32)>,
 }
 
@@ -76,10 +78,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<DiscMetadata>
         let Some(lang) = lang_code_from_filename(&entry.name) else {
             continue;
         };
-        // entry.size is attacker-controlled UDF metadata and flows into
-        // a Vec::with_capacity in read_file. A real BDMV bdmt XML is a
-        // few KB; cap well above that so a crafted multi-GB size can't
-        // trigger a huge allocation before any parsing.
+        // entry.size is attacker-controlled and flows into a Vec::with_capacity
+        // in read_file. Cap well above a real few-KB bdmt XML so a crafted
+        // multi-GB size can't trigger a huge allocation before parsing.
         if !bdmt_size_acceptable(entry.size) {
             continue;
         }
@@ -178,11 +179,9 @@ fn looks_like_xml(s: &str) -> bool {
 /// helpers are case- and namespace-insensitive, so callers pass the
 /// bare local name (no `di:` prefix).
 fn extract_title(xml_text: &str) -> Option<String> {
-    // Order matches the module-level convention: <di:name> first
-    // (Paramount-style), then <di:title>, then the nested
-    // tableOfContents/titleName form.
-    // xml::text already trims its result, so an empty string after
-    // extraction means a genuinely empty element.
+    // Priority: <di:name> (Paramount-style), then <di:title>, then nested
+    // tableOfContents/titleName. xml::text trims, so an empty string here
+    // means a genuinely empty element.
     for tag in ["name", "title"] {
         if let Some(s) = xml::text(xml_text, tag)
             && !s.is_empty()
@@ -351,10 +350,9 @@ mod tests {
 
     #[test]
     fn multiple_languages_keyed_correctly() {
-        // Simulate driving parse_bdmt_xml from two synthetic XML
-        // blobs and aggregating into DiscMetadata the same way parse()
-        // would. This exercises the BTreeMap key handling without
-        // needing a UdfFs.
+        // Drive parse_bdmt_xml from two synthetic XML blobs and aggregate
+        // into DiscMetadata like parse() would, exercising BTreeMap key
+        // handling without needing a UdfFs.
         let eng_xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
   <di:name>Aurora Drift</di:name>
 </discInfo>"#;
@@ -395,12 +393,9 @@ mod tests {
 
     #[test]
     fn malformed_xml_returns_none() {
-        // Random gibberish has no recognizable title element. We
-        // document the contract: parse_bdmt_xml returns None, and
-        // parse() (the caller) skips the file. Aggregating across
-        // zero files leaves DiscMetadata::default() — which parse()
-        // surfaces as None to its caller. Either is documented as
-        // acceptable per the module spec.
+        // Gibberish has no recognizable title element: parse_bdmt_xml returns
+        // None and parse() skips the file. Zero files aggregated leaves
+        // DiscMetadata::default(), which parse() surfaces as None.
         let bad = "this is not xml &&& <<< nope";
         assert!(parse_bdmt_xml(bad).is_none());
 
@@ -411,11 +406,9 @@ mod tests {
 
     #[test]
     fn description_with_only_child_xml_is_dropped() {
-        // Real-world bug: <di:description> contained only
-        // <di:thumbnail/> child elements with no actual prose. The
-        // previous parser surfaced the raw XML fragment as the
-        // description string. Now we reject candidates that begin
-        // with `<`.
+        // Real-world bug: <di:description> contained only <di:thumbnail/>
+        // children with no prose, and the old parser surfaced the raw XML
+        // fragment as the description. Now candidates starting with `<` are rejected.
         let xml = r#"<discInfo>
             <di:name>Skyline Run</di:name>
             <di:description>

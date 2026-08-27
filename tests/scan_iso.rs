@@ -145,11 +145,9 @@ fn scan_iso_matches_manual_scan_image_path() {
     assert_eq!(disc.encrypted, manual.encrypted, "encrypted flag");
     assert_eq!(disc.format, manual.format, "disc format");
 
-    // Independent expectations (not parity against a re-run of the same
-    // composition): the scanned Disc must match KNOWN properties of the fixture
-    // itself — its capacity (max LBA + 1), its PVD volume id ("TEST_DISC"), and
-    // that a UDF with no /AACS directory is unencrypted. These would fail even if
-    // scan_iso and the manual path drifted together.
+    // Independent expectations, not parity against a re-run: the scanned Disc
+    // must match KNOWN fixture properties (capacity, PVD volume id, unencrypted
+    // with no /AACS) — these would fail even if both scan paths drifted together.
     assert_eq!(disc.capacity_sectors, expected_capacity, "capacity value");
     assert_eq!(
         disc.volume_id, "TEST_DISC",

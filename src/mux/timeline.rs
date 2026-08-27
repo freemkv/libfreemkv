@@ -4,18 +4,18 @@
 //! source PES PTS does not run continuously across a clip join. There are two
 //! ways to place them, and this module holds both:
 //!
-//! - **From the playlist's marks** ([`SeamPlan`]) — when the title carries
+//! - **From the playlist's marks** ([`SeamPlan`](crate::mux::timeline::SeamPlan)) — when the title carries
 //!   PlayItem IN/OUT times, each clip contributes exactly `out - in` and the
 //!   clips are laid end to end. This is exact: it closes forward skips, joins
 //!   overlaps without rewinding, and drops material the playlist excludes.
-//! - **By inference** ([`TimelineContinuity::adjust`]) — when there are no
+//! - **By inference** ([`TimelineContinuity::adjust`](crate::mux::timeline::TimelineContinuity::adjust)) — when there are no
 //!   usable marks (DVD, HD-DVD, `mkv://` / `m2ts://` sources), a backward PTS
-//!   jump larger than [`DISCONTINUITY_BACKSTEP_NS`] is read as a join and
+//!   jump larger than [`DISCONTINUITY_BACKSTEP_NS`](crate::mux::timeline::DISCONTINUITY_BACKSTEP_NS) is read as a join and
 //!   rebased. Inference cannot see a forward skip, because a forward gap is
 //!   indistinguishable from frames lost to damaged media, and cannot see an
 //!   overlap smaller than the reorder threshold.
 //!
-//! [`TimelineContinuity::map`] picks between them: marks when present,
+//! [`TimelineContinuity::map`](crate::mux::timeline::TimelineContinuity::map) picks between them: marks when present,
 //! inference otherwise. Every muxer/sink that consumes the interleaved per-track
 //! PES stream and emits a monotonic timeline (the MKV muxer, the `demux://`
 //! elementary-stream sink) goes through it, so the correction lives in exactly
@@ -172,16 +172,9 @@ impl SeamPlan {
         if clips.is_empty() {
             return None;
         }
-        // Trust the spans only if they tile the feed contiguously from 0.
-        //
-        // A clip referenced twice reuses its first reference's span (the bytes
-        // are read once), so equal-to-previous is allowed; anything else — a
-        // gap, an overlap, a missing span, or a start that is not 0 — means the
-        // scan's view of the extents and the mux's differ, and a byte offset
-        // would then select a confidently WRONG clip for every frame.
-        //
-        // This is decided BEFORE the marks are read, because it decides whether
-        // the marks have to be readable at all.
+        // Trust the spans only if they tile the feed contiguously from 0 (a repeated
+        // clip reusing its first span is fine). Any gap/overlap/missing span/nonzero
+        // start means scan and mux disagree, so a byte offset would pick the wrong clip.
         let mut spans_trusted = true;
         let mut expect: u64 = 0;
         let mut prev_span: Option<(u64, u64)> = None;
@@ -218,30 +211,9 @@ impl SeamPlan {
                 );
                 return None;
             }
-            // Marks that do not advance across the title are NORMAL, not a
-            // defect: each clip file carries its own STC, so one clip's IN has
-            // no ordering relationship to the previous clip's at all.
-            //
-            // Inferring a clip from a timestamp cannot read such a table — a
-            // crossing can be missed, and a missed crossing strands the track
-            // on a clip it has already left — so this was refused outright.
-            // That refusal was about INFERENCE, and it cost the titles it was
-            // meant to protect: they fell back to the very path that cannot
-            // read them, with a timeline running minutes past the real length.
-            //
-            // Provenance does not read the marks across clips. The clip comes
-            // from the byte offset a frame was read at, and each clip's
-            // `offset_ns` maps its own private clock onto the output timeline —
-            // exactly right for an independent STC. Lifting the refusal was
-            // tried once BEFORE every track carried a source offset, and nine
-            // audio and subtitle tracks with nothing to place them by pinned
-            // themselves to clip 0 and dropped most of the title. Now they all
-            // carry one, so the marks keep a single job: deciding whether a
-            // frame lies inside its own clip's [in, out].
-            //
-            // `spans_trusted` still gates it. Without usable spans there is no
-            // byte offset to place by and inference is all that is left, so a
-            // table inference cannot read must still be refused.
+            // Non-advancing marks across clips are normal (each clip has its own STC), so
+            // timestamp inference refuses them, but provenance places by byte offset +
+            // each clip's `offset_ns`, needing marks only to test `[in, out]` membership.
             if !spans_trusted
                 && let Some(prev) = out.last()
                 && in_ns <= prev.in_ns
@@ -261,17 +233,9 @@ impl SeamPlan {
             });
             cum = cum.saturating_add(out_ns - in_ns);
         }
-        // Which of the two placement strategies a title got is the single most
-        // useful fact about a branched rip, and until now it was invisible: a
-        // title that fell back to inference looked exactly like one the plan
-        // handled, and telling them apart meant rebuilding and re-ripping.
-        // Both flags, once, at plan construction.
-        // How many DISTINCT feed spans the clips share. A seamlessly branched
-        // title re-references one clip file from several PlayItems with
-        // different mark ranges, and those references share a single span
-        // (the bytes are read once), so a byte offset alone cannot tell them
-        // apart. `distinct < clips` is therefore the fact that decides whether
-        // provenance can identify a clip on its own.
+        // Log both flags once here: which placement strategy a title got was
+        // previously invisible, and `distinct < clips` reveals when clips share a
+        // feed span (a seamlessly branched title re-referencing one clip file).
         let mut distinct_spans = 0usize;
         let mut seen: Option<(u64, u64)> = None;
         for c in &out {
@@ -321,8 +285,6 @@ impl SeamPlan {
             .fold(0i64, |a, b| a.saturating_add(b))
     }
 
-    /// Place a raw PTS for `track`, advancing that track's own clip cursor.
-    ///
     /// Which clip owns feed byte `b`, by BINARY SEARCH.
     ///
     /// `spans_trusted` guarantees the spans tile the feed contiguously in
@@ -373,6 +335,7 @@ impl SeamPlan {
         first
     }
 
+    /// Place a raw PTS for `track`, advancing that track's own clip cursor.
     /// `None` means DROP: the frame lies outside every clip's marks, so the
     /// playlist does not include it.
     fn place(
@@ -396,53 +359,16 @@ impl SeamPlan {
         let pos = self.cursors[track];
         let mut clip = pos.clip;
 
-        // Advance this track to the next clip when THIS track's frames say it
-        // has crossed. Two signatures, because a join is either a skip or an
-        // overlap:
-        //
-        // - SKIP (next IN after this OUT): the frame is simply past this clip's
-        //   OUT mark.
-        // - OVERLAP (next IN before this OUT, the disc storing the join twice):
-        //   the frame is still inside this clip's range, so "past OUT" never
-        //   fires. But a track's own PTS only ever runs forward inside a clip,
-        //   so the backward step to the next clip's IN is the crossing — and it
-        //   is per track, which is why the cursor has to be per track too.
-        //
-        // ── Provenance beats inference ────────────────────────────────────
-        //
-        // If the frame carries the byte offset it was read from, the clip it
-        // came from is a LOOKUP, not a guess: the feed is the clips' streams
-        // concatenated in order, so the offset falls in exactly one span.
-        //
-        // This is the whole answer to the problem four audit rounds could not
-        // close by reasoning over timestamps. Inside an overlap, clip k's OUT
-        // is AFTER clip k+1's IN, so a single timestamp is legitimately inside
-        // both — and every rule that picked one of them was right for some
-        // discs and silently wrong for others, losing minutes of content or
-        // rewinding the output by over a minute.
-        //
-        // The heuristics below are kept for sources that stamp no provenance
-        // (a `mkv://` remux, the deserialize hop), which is also where they
-        // have always worked: those have no overlap to be ambiguous about.
-        // `self.spans_trusted` gates this: see `from_clips`. If the recorded
-        // spans do not tile the feed exactly, an offset means nothing and every
-        // frame would map to a confidently wrong clip — far worse than the
-        // heuristics, which are at least approximately right. Degrade instead.
+        // Advance on a SKIP (past this OUT) or an OVERLAP (backward PTS step to next
+        // clip's IN, since PTS only runs forward within a clip) — per track. Provenance
+        // (byte offset) beats inference for overlaps; heuristics below are the fallback.
         if self.spans_trusted
             && let Some(b) = src_byte
             && let Some(found) = self.clip_at_byte(b)
         {
-            // One FILE can be referenced by several PlayItems — a seamless
-            // split, a looped segment, multi-angle — and `bluray.rs` counts its
-            // extents once, so they all share one span. Provenance therefore
-            // narrows the frame to the RUN, not to a member of it: every frame
-            // of the file resolves to the same first index.
-            //
-            // Only the timestamp can say which reference a frame belongs to,
-            // and each carries its own marks. Without this, everything past the
-            // first PlayItem's OUT was judged against marks it was never inside
-            // and dropped — half the file missing from the rip while the
-            // timeline still charged for its duration.
+            // One FILE can be referenced by several PlayItems sharing one feed span, so
+            // provenance narrows only to the RUN; timestamp then picks the reference —
+            // without it, frames past the first PlayItem's OUT were wrongly dropped.
             let found = self.clip_in_run_for(found, raw_ns);
             let c = self.clips[found];
             let placed = raw_ns >= c.in_ns && raw_ns <= c.out_ns;
@@ -460,13 +386,9 @@ impl SeamPlan {
                 // (a clip's file is not trimmed to its marks). Counted, so the
                 // volume gates in the sinks can see it.
                 self.dropped[track] = self.dropped[track].saturating_add(1);
-                // Once per track, on the FIRST drop only — a join legitimately
-                // drops a handful of frames and this must not become per-frame
-                // noise. The heuristic path below has always logged this; the
-                // provenance path did not, so a title that dropped MOST of its
-                // frames here produced a volume-gate failure and not one line
-                // saying which frame, which clip, or which marks it was judged
-                // against. That is not a diagnosable failure.
+                // Log only the first drop per track, not per-frame noise; the
+                // provenance path previously logged nothing here, leaving a
+                // volume-gate failure with no clue which frame/clip/marks caused it.
                 if self.dropped[track] == 1 {
                     tracing::info!(
                         target: "freemkv::mux",
@@ -484,13 +406,9 @@ impl SeamPlan {
             return Some(raw_ns.saturating_add(c.offset_ns));
         }
 
-        // Reaching here means this frame carried no byte offset, so it is being
-        // placed by reading the marks ACROSS clips. Every demuxed source now
-        // stamps provenance on every track, so under a plan this is not
-        // expected — and on a table whose marks do not advance the reasoning
-        // below is meaningless and can strand the track for the rest of the
-        // title. Say so once per track rather than let it be silent: a mostly
-        // dropped track already reached a user once this way.
+        // No byte offset means placing by marks across clips, which isn't expected
+        // under a plan (every demuxed source stamps provenance) and can strand a
+        // track if the marks don't advance. Log once per track, not silently.
         if src_byte.is_none() && self.cursors[track].last_raw_ns.is_none() {
             tracing::info!(
                 target: "freemkv::mux",
@@ -505,42 +423,14 @@ impl SeamPlan {
             let cur = self.clips[clip];
             let next_in = self.clips[clip + 1].in_ns;
             let past_out = raw_ns > cur.out_ns;
-            // The step must land ON the next clip's IN mark, not merely below
-            // the current position: a bound only from above is satisfied by
-            // every later clip's IN too, and the cursor would run to the end of
-            // the list on a single backward step.
-            // A backward step means this track has restarted at the next
-            // clip's IN. What counts as "at" differs by track, and getting it
-            // wrong strands a track on the previous clip's offset:
-            //
-            // - A track WITH B-frame reorder (any video track) is dense — a
-            //   frame every ~42ms at 24fps — so its first frame of the new clip
-            //   lands ON the mark. Requiring that is what keeps a reorder dip
-            //   near the end of a clip, which is also a backward step and lies
-            //   inside the next clip's range during an overlap, from being read
-            //   as a crossing. This is keyed on REORDER, not on driving epochs:
-            //   a Dolby Vision enhancement layer is a second video track that
-            //   does not drive epochs but does reorder, and giving it the
-            //   permissive rule made its reorder dip look like a join and threw
-            //   it out of step with the base layer it must be co-timed with.
-            // - Tracks WITHOUT reorder (audio, subtitles) can take any backward
-            //   step as a crossing. They are also sparse: a subtitle may have
-            //   no event near the mark, so its first frame after the join can
-            //   land well past it. Holding those to the video window left them
-            //   on the old clip until their PTS passed its OUT, mistiming them
-            //   by the overlap in between.
-            //
-            // Both forms still require the frame to land at or after the next
-            // IN, which is what stops one backward step walking the cursor to
-            // the end of the list.
+            // Must land ON/after next IN or a backward step walks the cursor to the
+            // list's end. Reorder tracks (e.g. a DV enhancement layer) require landing
+            // ON the mark so a reorder dip isn't misread as a crossing; sparse tracks accept any step.
             let stepped_back = pos.last_raw_ns.is_some_and(|last| raw_ns < last)
                 && if has_reorder {
-                    // saturating_abs, not abs: every other comparison in this
-                    // module is saturating because these timestamps come off a
-                    // disc and are not trusted. `abs()` is the one exception
-                    // and it panics on i64::MIN — which saturating_sub can
-                    // produce exactly — taking down the mux thread on one bad
-                    // frame instead of comparing false like its neighbours.
+                    // saturating_abs, not abs: `abs()` panics on i64::MIN, which
+                    // saturating_sub can produce exactly, taking down the mux
+                    // thread on one bad frame instead of comparing false.
                     (raw_ns.saturating_sub(next_in)).saturating_abs() <= CLIP_START_TOLERANCE_NS
                 } else {
                     raw_ns >= next_in.saturating_sub(CLIP_START_TOLERANCE_NS)
@@ -553,23 +443,9 @@ impl SeamPlan {
             }
         }
 
-        // ── The invariant ────────────────────────────────────────────────
-        //
-        // Everything above is a heuristic over marks. THIS is the property they
-        // exist to serve: a track's output must not run backwards. Checking it
-        // directly, rather than trusting whichever rule fired, is what closes
-        // the whole class of defect three audit rounds kept finding here — a
-        // stale cursor placing a frame at the previous clip's offset (measured
-        // once at 65 seconds of rewind, with nothing counting it).
-        //
-        // The tolerance is DISCONTINUITY_BACKSTEP_NS because B-frame reorder
-        // legitimately emits out of order by a fraction of a second; a rewind
-        // that matters is orders of magnitude larger. A candidate that fails it
-        // is not placed on that clip: the scan below looks for a LATER clip
-        // containing this frame that does not rewind — which is exactly what a
-        // genuine overlap crossing looks like — and if none exists the frame is
-        // dropped and counted, because emitting it anywhere would move the
-        // track backwards.
+        // Invariant enforced directly, not just via heuristics: output must never run
+        // backwards (a stale cursor once caused 65s of uncounted rewind). Tolerance is
+        // DISCONTINUITY_BACKSTEP_NS (B-frame jitter); a failing candidate is rejected, or dropped.
         let rewinds = |cand: usize| -> bool {
             match self.cursors[track].last_out_ns {
                 Some(last) => {
@@ -580,10 +456,8 @@ impl SeamPlan {
             }
         };
         if rewinds(clip) {
-            // Move the cursor ONLY if a later clip actually accepts this frame.
-            // Leaving it where it was is what makes a bad frame recoverable:
-            // advancing on a failed search is how a corrupt PTS strands a track
-            // for the rest of a clip, since nothing walks the cursor back.
+            // Move the cursor only if a later clip actually accepts this frame; leaving
+            // it in place keeps a bad frame recoverable instead of stranding the track.
             let mut found = None;
             let mut cand = clip;
             while cand + 1 < self.clips.len() {
@@ -749,18 +623,9 @@ impl TimelineContinuity {
         clips: &[crate::disc::Clip],
         content_format: crate::disc::ContentFormat,
     ) -> Self {
-        // ONLY Blu-ray. A PlayItem's IN/OUT are positions in the same 45 kHz
-        // clock the PES PTS runs on, which is what makes placing frames by them
-        // meaningful.
-        //
-        // The other formats' clips carry marks from a different clock entirely:
-        // HD-DVD fills them from the XPL's title-relative `titleTimeBegin` /
-        // `titleTimeEnd`, and a DVD's come from cell tables. Those are elapsed
-        // times within a title, not PES positions — so a plan built from them
-        // is an identity map with a drop filter, it stops the layer-break
-        // rebase `adjust` exists to perform, and it drops whatever falls
-        // outside marks the PTS was never measured against. Those formats keep
-        // the inference path, which is what they have always used.
+        // Only Blu-ray: its PlayItem IN/OUT share the 45 kHz clock the PES PTS runs on.
+        // HD-DVD/DVD marks come from a different clock (XPL times, cell tables) — a
+        // plan from those would drop content the PTS wasn't measured against, so they keep inference.
         let seams = match content_format {
             crate::disc::ContentFormat::BdTs => SeamPlan::from_clips(clips),
             crate::disc::ContentFormat::MpegPs => None,
@@ -896,10 +761,8 @@ impl TimelineContinuity {
         self.epoch_offsets
             .iter()
             .map(|(o, closing)| (raw_pts_ns.saturating_add(*o), *closing))
-            // In the TAIL of that epoch: at or just below where it ended. A
-            // frame landing far below its close is not a straggler at all — it
-            // is a normal frame of a LATER epoch that merely leads a sparse
-            // frontier, and demoting it would mis-time it by a whole clip.
+            // In the TAIL of that epoch (at/just below where it ended); far below
+            // is a later epoch's normal frame, and demoting it mis-times it by a clip.
             .filter(|(m, closing)| {
                 *m <= *closing && *m >= closing.saturating_sub(DISCONTINUITY_BACKSTEP_NS)
             })
@@ -939,34 +802,9 @@ impl TimelineContinuity {
         if !drives_epoch {
             let effective = self.passive_offset(track, raw_pts_ns);
             let mapped = raw_pts_ns.saturating_add(effective);
-            // Tail-straggler remap: at a REAL (base-video-driven) multi-clip
-            // boundary the offset has just jumped forward by ~a whole clip, but a
-            // lagging tail frame from the just-ended clip still carries an
-            // OLD-epoch raw PTS. Adding the NEW offset flings it ~a clip past the
-            // frontier and would force a forward-dated split cluster (breaking
-            // cluster monotonicity). Such a straggler is recognised precisely: its
-            // current-offset mapping lands more than a backstep PAST the frontier
-            // AND its PREVIOUS-offset mapping lands in the seam TAIL — at/below the
-            // frontier but no more than one backstep below it (i.e. it ended just
-            // before the seam, in the prior epoch). The lower bound is essential:
-            // a NORMAL new-epoch frame that merely leads the sparse (video-only)
-            // frontier by >3s ALSO has `prev_mapped <= high` (its prev-offset
-            // mapping lands ~a whole clip below the frontier), and clamping it
-            // would demote it into the just-ended clip's epoch, mis-timing that
-            // audio/subtitle by a whole clip. Requiring `prev_mapped` to sit
-            // within a backstep below the frontier keeps the remap to genuine
-            // tail stragglers; a long audio-only tail, a sparse subtitle, or an
-            // EL frame that simply runs ahead is left on the current offset.
-            //
-            // Every comparison below saturates. `high` is derived from an
-            // untrusted container timestamp (an `mkv://` source's
-            // CLUSTER_TIMESTAMP × TimestampScale is clamped only against
-            // `i64::MAX`, so a hostile file can put the frontier AT `i64::MAX`),
-            // and `raw_pts_ns` can be negative (a SimpleBlock's signed relative
-            // timestamp). Plain `high + BACKSTEP` / `high - BACKSTEP` would then
-            // overflow: a panic out of the public `Stream::write` path in an
-            // overflow-checked build, and in release a wrap to the opposite sign
-            // that fires the straggler clamp on essentially every passive frame.
+            // Tail-straggler remap: a lagging old-epoch frame under the new offset would
+            // fling past the frontier, breaking monotonicity; recognised by current mapping
+            // past frontier + prev mapping in a bounded seam tail (bound avoids wrongly demoting a normal sparse-leading frame). All ops saturate: `high`/`raw_pts_ns` can be adversarial/negative.
             if let Some(high) = self.high_ns
                 && mapped > high.saturating_add(DISCONTINUITY_BACKSTEP_NS)
                 && let Some(placed) = self.straggler_offset(raw_pts_ns)
@@ -983,12 +821,9 @@ impl TimelineContinuity {
         };
         let adj = raw_pts_ns.saturating_add(self.offset_ns);
         if adj < high.saturating_sub(DISCONTINUITY_BACKSTEP_NS) {
-            // Clip-boundary reset (real multi-clip seam): continue just after the
-            // frontier. Save the previous offset so a lagging non-video tail
-            // frame can be recognised and remapped to the seam (see above).
-            // `high - adj` is a backward step, so positive — but both ends are
-            // untrusted (`high` up to i64::MAX, `adj` down to i64::MIN), so
-            // `open_epoch` saturates rather than panic in a checked build.
+            // Clip-boundary reset: continue past the frontier, saving the previous
+            // offset so a lagging tail frame can be remapped (see above). Both `high`
+            // and `adj` are untrusted, so `open_epoch` saturates rather than panic.
             self.open_epoch(high, adj);
             let adj2 = raw_pts_ns.saturating_add(self.offset_ns);
             self.high_ns = Some(high.max(adj2));
@@ -1161,10 +996,8 @@ mod tests {
     fn output_never_rewinds_and_a_bad_frame_never_strands() {
         let clips = seamless_branching_clips();
 
-        // (1) A clip's own file opening ON its IN mark, after a tail frame past
-        //     the previous clip's OUT already advanced the cursor. The old
-        //     guard read that as a crossing and jumped a clip too far, dropping
-        //     ~28 minutes.
+        // (1) A clip opening ON its IN mark after a tail frame past the previous
+        //     clip's OUT: the old guard misread this as a crossing, dropping ~28 min.
         let mut plan = SeamPlan::from_clips(&clips).expect("plan");
         let tail = plan
             .place(7_910_830_000_000, 0, true, None)
@@ -1393,16 +1226,9 @@ mod tests {
     fn no_provenance_still_places_by_marks() {
         let clips = clips_with_spans();
         let mut plan = SeamPlan::from_clips(&clips).expect("plan");
-        // `is_some()` alone was the whole assertion here, which passes for a
-        // frame placed in the WRONG clip — on the one path taken whenever a
-        // source stamps no offset.
-        //
-        // This timestamp sits in the OVERLAP of two clips in the real mark
-        // table, which is precisely the ambiguity provenance exists to settle,
-        // so pinning one specific clip would be asserting the coin-flip. The
-        // invariant that holds either way: the frame is placed with the offset
-        // of a clip whose marks actually contain it — never a clip it does not
-        // belong to, and never at the head of the timeline.
+        // `is_some()` alone would pass even for the WRONG clip. This timestamp sits
+        // in a real OVERLAP, so pinning one clip would assert a coin-flip; the
+        // invariant checked instead is that the placement matches SOME clip whose marks contain it.
         let raw = 7_900_000_000_000i64;
         let placed = plan
             .place(raw, 0, true, None)
@@ -1615,10 +1441,8 @@ mod tests {
             );
         }
 
-        // ...which is why placement must finish the job with the timestamp.
-        // This used to drop 7/8 of the title: every frame past the first
-        // range's OUT was judged against marks it was never inside. Each
-        // range's own frame must now be kept, and land in ITS range.
+        // ...which is why placement must finish the job with the timestamp: this
+        // used to drop 7/8 of the title (frames judged against the wrong range's marks).
         for i in 0..N {
             let mid = mpls_ticks_to_ns(i * SEG + SEG / 2);
             let placed = plan
@@ -1839,12 +1663,9 @@ mod tests {
         let last_of_0 = plan
             .place(c0_out, 0, true, None)
             .expect("clip 0 OUT is inside clip 0");
-        // The next clip opens ON its IN mark. Under the old inference this was a
-        // 1.79s backward step, below the reorder threshold, so no seam was
-        // recognised and the join was emitted as duplicate content whose
-        // timestamps then collided. With the marks known, clip 1 is placed to
-        // continue exactly where clip 0 ended: one monotonic timeline, no
-        // rewind, and no collision for the muxer to flatten.
+        // Old inference saw this 1.79s backward step as below the reorder threshold,
+        // missing the seam and emitting colliding duplicate content. With marks known,
+        // clip 1 continues exactly where clip 0 ended: monotonic, no rewind or collision.
         let first_of_1 = plan.place(c1_in, 0, true, None).expect("clip 1 IN");
         assert_eq!(
             first_of_1, last_of_0,
@@ -1966,10 +1787,8 @@ mod tests {
         let placed_tail = plan.place(tail, 1, false, None).expect("clip 0 tail");
         assert_eq!(placed_tail, tail - c0_in, "tail rides clip 0's offset");
 
-        // Its first event in clip 1 steps BACK (the clips overlap) but lands
-        // 400ms past the IN mark, because the track is sparse and had no event
-        // sitting on the mark. The old window was +/-250ms, so this was missed
-        // and the event stayed on clip 0 — mistimed by the overlap.
+        // First event in clip 1 steps back (overlap) but lands 400ms past IN (sparse
+        // track). The old +/-250ms window missed this, mistiming it on clip 0.
         let late = c1_in + 400_000_000;
         assert!(late < tail, "fixture: this is a backward step");
         assert!(
@@ -2316,11 +2135,8 @@ mod tests {
     #[test]
     fn single_clip_late_subtitle_does_not_inflate_offset() {
         let mut tc = TimelineContinuity::new();
-        // One continuous clip: video advances steadily 0..60s.
-        // Interleaved, a subtitle track is sparse — it emits a cue at 0s, then
-        // nothing for a long stretch, then a late cue, then jumps around. Each
-        // subtitle PTS swings many seconds against the video frontier.
-        // Drive a realistic interleave.
+        // One continuous clip: video advances steadily 0..60s, interleaved with a
+        // sparse subtitle track whose PTS swings many seconds against the frontier.
         let mut max_out = i64::MIN;
         for sec in 0..=60 {
             // Video frame every second.
@@ -2365,10 +2181,8 @@ mod tests {
         for sec in 0..=60 {
             // Base layer (track 0) drives the epoch.
             let bl = adj_video(&mut tc, sec * S);
-            // EL (track 1) re-emits the same time — a passive rider. Its raw PTS
-            // equals the base layer's, but it arrives just AFTER the base frame
-            // for the NEXT second sometimes; simulate the overlap by feeding the
-            // PREVIOUS second's time, which is a backward swing vs the frontier.
+            // EL (track 1) is a passive rider re-emitting the base layer's PTS but
+            // arriving late; simulate by feeding the previous second's time (a backward swing).
             let el_raw = if sec > 0 { (sec - 1) * S } else { 0 };
             let el = adj_other(&mut tc, el_raw);
             assert_eq!(el, el_raw, "EL rides current offset, true PTS preserved");
@@ -2481,11 +2295,8 @@ mod tests {
             c2,
             "straggler must not move the frontier"
         );
-        // A NORMAL clip2 audio frame (raw ~1s, current epoch) is NOT remapped —
-        // it rides the new offset to ~601s, just past the frontier but within a
-        // backstep (its previous-offset mapping ~1s is below the frontier but the
-        // current-offset mapping is not a backstep past it, so it is not treated
-        // as a straggler).
+        // A normal clip2 audio frame (raw ~1s) rides the new offset to ~601s, within
+        // a backstep of the frontier, so it is not misclassified as a straggler.
         let normal = adj_other(&mut tc, S);
         assert_eq!(normal, S + 600 * S + DISCONTINUITY_GAP_NS);
     }
@@ -2510,11 +2321,9 @@ mod tests {
         let c2 = adj_video(&mut tc, 0);
         assert_eq!(c2, 600 * S + DISCONTINUITY_GAP_NS);
 
-        // A NORMAL clip-2 audio frame at raw ~5s. Current-offset mapping is
-        // ~605s, which IS more than a backstep (3s) past the 600s frontier — but
-        // it lands ~595s BELOW the end of the epoch it would be demoted into,
-        // far outside that epoch's tail. It is a legitimate new-epoch frame, NOT
-        // a straggler, and must ride the current offset.
+        // Raw ~5s frame maps to ~605s, >backstep past the 600s frontier, but its
+        // prev-offset mapping (~595s) is far outside the epoch's tail, so it's a
+        // legitimate new-epoch frame, not a straggler, and must ride the current offset.
         let raw = 5 * S;
         let out = adj_other(&mut tc, raw);
         assert_eq!(

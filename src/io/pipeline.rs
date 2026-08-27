@@ -1,13 +1,12 @@
 //! Generic bounded producer/consumer pipeline.
 //!
 //! `Pipeline<I, R>` spawns a single consumer thread, hands it items
-//! through a bounded `mpsc::sync_channel`, and joins it on `finish()`.
+//! through a bounded `crossbeam_channel`, and joins it on `finish()`.
 //! The consumer's behaviour is supplied by a [`Sink`] implementation:
 //! `apply` is called once per item, `close` is called once at the end.
 //!
-//! Call sites in libfreemkv that want a producer/consumer split —
-//! sweep (`disc/sweep.rs::SweepSink`) and the file-backed mux highway
-//! — are built on this primitive.
+//! The file-backed mux highway is built on this primitive. (An earlier
+//! sweep sink also used it; sweep moved to freemkv-engine in 1.6.0.)
 //!
 //! ## Cancellation and error semantics
 //!
@@ -170,19 +169,9 @@ fn finish_with_grace<R: Send + 'static>(
         }
         thread::sleep(POLL_INTERVAL);
     }
-    // Grace expired. CLAIM abandonment, then log and leak. Claiming BEFORE
-    // dropping the handle guarantees the leaked consumer observes it the moment
-    // its wedged syscall returns: it then skips any further `apply` and skips
-    // `close()`, rather than running on to finalise the abandoned output file.
-    //
-    // A compare-exchange, not a store, because the consumer may have committed to
-    // `close()` in the instant between our last `is_finished()` poll and now. It
-    // then cannot be stopped — the finalise IS happening — so abandoning it would
-    // report the rip as interrupted while a valid, fully finalised container
-    // lands on disk. Losing the race means waiting for the result the consumer is
-    // already producing instead. `AcqRel` pairs with the consumer's own
-    // compare-exchange and with the `Acquire` loads in its drain loop, so the flag
-    // is reliably observed even on weak memory models (ARM64/POWER).
+    // Grace expired. CLAIM abandonment before dropping the handle so the leaked consumer
+    // skips further `apply`/`close()` once its wedged syscall returns. Compare-exchange,
+    // not a store: if it already committed to `close()`, wait for its result instead.
     if state
         .compare_exchange(
             state::RUNNING,
@@ -221,11 +210,9 @@ fn finish_with_grace<R: Send + 'static>(
          (output will not be finalised)",
         FINISH_GRACE_SECS
     );
-    // Dropping `handle` without joining detaches from the thread — the
-    // consumer keeps running until its kernel call returns or the process
-    // exits. This is the intentional "leak" documented in
-    // `finish_with_halt`'s contract; the `abandoned` flag bounds what the
-    // leaked thread is allowed to do to the output before it exits.
+    // Dropping `handle` without joining detaches the thread; the consumer keeps
+    // running until its kernel call returns or the process exits. This is the
+    // intentional "leak" from `finish_with_halt`'s contract, bounded by `abandoned`.
     drop(handle);
     Err(leak_err)
 }
@@ -365,11 +352,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                 let mut first_err: Option<Error> = None;
                 let mut stopped = false;
 
-                // Rolling apply-throughput summary. The per-item "apply: OK"
-                // line was 99% of the mux log; collapse it into a periodic
-                // summary (count, avg ms, items/s) emitted ~every 5 s while
-                // debug tracing is on. The individual slow-apply ("took … s")
-                // STALL events below stay visible — those are signal, not noise.
+                // Rolling apply-throughput summary: the per-item "apply: OK" line was
+                // 99% of the mux log, so collapse it into a periodic summary (count,
+                // avg ms, items/s) every ~5s. Slow-apply STALL events stay visible below.
                 let mut summary_count: u64 = 0;
                 let mut summary_nanos: u128 = 0;
                 let mut summary_since = Instant::now();
@@ -381,13 +366,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                         tracing::debug!("Pipeline receive: item={}", std::any::type_name::<I>());
                     }
 
-                    // If the caller has abandoned us (grace period expired
-                    // after a halt/timeout and the JoinHandle was dropped),
-                    // stop applying items. We keep draining so the producer
-                    // — if it is somehow still alive — never blocks on a
-                    // dead receiver, but we touch the output no further. The
-                    // final post-loop abandonment check returns the error
-                    // and skips `close()`.
+                    // Abandoned (grace expired, JoinHandle dropped): keep draining so a
+                    // still-alive producer never blocks on a dead receiver, but touch
+                    // the output no further. Post-loop check returns error, skips close().
                     if state_consumer.load(Ordering::Acquire) == state::ABANDONED {
                         continue;
                     }
@@ -417,11 +398,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                                 tracing::debug!("Pipeline: apply error, stopping, err={:?}", e);
                             }
                             first_err = Some(e);
-                            // Publish the failure so the producer can stop
-                            // FEEDING a dead write side instead of only learning
-                            // about it at `finish()` — by which time it has read
-                            // the rest of the disc. `Release` pairs with the
-                            // `Acquire` load in `send_with_halt`.
+                            // Publish the failure so the producer stops feeding a dead
+                            // write side instead of learning at `finish()`, after reading
+                            // the rest of the disc. `Release` pairs with `send_with_halt`.
                             failed_consumer.store(true, Ordering::Release);
                         }
                     }
@@ -473,16 +452,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     );
                 }
 
-                // Final abandonment check: the common leak case is a
-                // consumer wedged inside `apply` (a blocking write
-                // syscall). When that syscall finally returns, the
-                // producer has long since dropped `tx`, so `recv`
-                // yields `Err` and we fall through to here. If the
-                // caller abandoned us in the meantime, skip `close()`
-                // entirely — finalising the output (e.g. writing the
-                // MKV Cues + patching the segment header) on a file the
-                // caller already reported as failed is exactly the
-                // write race we must not run.
+                // Final abandonment check: a consumer wedged in a blocking `apply` write
+                // can outlive the producer dropping `tx`, landing here via `recv -> Err`.
+                // Skip `close()` if abandoned meanwhile — it would race the write.
                 match first_err {
                     // No `close()` on this path, so there is nothing to claim —
                     // just report, unless the caller has already given up on us.
@@ -493,14 +465,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                             Err(e)
                         }
                     }
-                    // CLAIM the finalise. A plain load here left a window in which
-                    // the caller stored `abandoned` AFTER we read it as clear, so
-                    // `close()` ran anyway and finalised (Cues + Segment-size
-                    // patch) an output the caller had already reported as
-                    // interrupted — a truncated rip indistinguishable from a
-                    // complete one. The compare-exchange closes that window: if the
-                    // caller got there first we skip `close()`, and if we get there
-                    // first the caller waits for us instead of abandoning.
+                    // CLAIM the finalise: a plain load could race the caller marking
+                    // `abandoned`, letting `close()` finalise output already reported
+                    // interrupted. Compare-exchange: loser skips `close()`, waits for winner.
                     None => {
                         if state_consumer
                             .compare_exchange(
@@ -645,12 +612,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         let end = Instant::now() + deadline;
         let mut pending = item;
         loop {
-            // The consumer's `apply` has failed fatally: everything sent from here
-            // is drained and discarded, so hand the item back at once. Without this
-            // the producer saw every send succeed (the channel is always being
-            // drained) and went on reading the whole remaining title — an hour of
-            // drive time on a UHD — for a write that died on the first frame, only
-            // learning about it at `finish()`.
+            // The consumer's `apply` failed fatally: hand the item back now, since
+            // otherwise sends keep succeeding and the producer reads a whole UHD
+            // title before learning at `finish()` the write died on frame one.
             if self.consumer_failed() {
                 if debug_enabled() {
                     tracing::debug!(
@@ -680,9 +644,8 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                 }
                 return Err(pending);
             }
-            // Wait for space-available or halt-check tick, whichever
-            // is sooner. Crossbeam's send_timeout is kernel-wakeup
-            // based: the consumer's recv on a saturated channel
+            // Wait for space-available or halt-check tick, whichever is sooner.
+            // send_timeout is kernel-wakeup based: recv on a saturated channel
             // signals this thread the moment a slot opens up.
             let slice = SEND_HALT_CHECK_INTERVAL.min(end.saturating_duration_since(now));
             match self.tx.send_timeout(pending, slice) {
@@ -857,14 +820,9 @@ mod tests {
 
     #[test]
     fn back_pressure_blocks_sender() {
-        // depth=2 + 5 sends + 50ms/apply: with the consumer pinned at
-        // 50 ms per item, the producer can buffer 2 (channel cap) +
-        // 1 (consumer in flight) = 3 items before sends 4 and 5 must
-        // block on consumer progress. Wall-clock floor across all 5
-        // sends is therefore ~2 * 50ms = 100ms (sends 4 and 5 each
-        // wait roughly one apply-cycle). Use 80 ms as the assertion
-        // floor to stay above the 50ms-per-item progress floor while
-        // tolerating CI jitter — it still proves blocking is real.
+        // depth=2 + 5 sends + 50ms/apply: producer buffers 3 items (2 channel cap +
+        // 1 in flight) before sends 4 and 5 must block, giving a ~100ms wall-clock
+        // floor. Assert 80ms to tolerate CI jitter while still proving blocking.
         let count = Arc::new(AtomicUsize::new(0));
         let sink = SlowSink {
             delay: Duration::from_millis(50),
@@ -985,10 +943,9 @@ mod tests {
         )
         .expect("spawn should succeed");
 
-        // Send 10 items. After Stop, subsequent sends may either
-        // succeed (already buffered) or fail with Err(I) (channel
-        // closed). Both are valid — we don't assert on the send
-        // results.
+        // Send 10 items. After Stop, subsequent sends may either succeed (already
+        // buffered) or fail with Err(I) (channel closed); both are valid, so we
+        // don't assert on the send results.
         for i in 0..10u64 {
             let _ = pipe.send(i);
         }
@@ -1087,14 +1044,9 @@ mod tests {
 
     #[test]
     fn send_with_halt_returns_item_on_deadline() {
-        // depth=1 + consumer wedged in apply on the first item, AND
-        // the channel buffer already loaded with a second item, means
-        // any further `try_send` sees Full; with a 200 ms deadline and
-        // no halt fired, send_with_halt must return `Err(item)` within
-        // roughly the deadline. Synchronising on `started` ensures the
-        // consumer has actually started its wedged apply BEFORE we
-        // load the channel-buffer slot — without that, the consumer
-        // could still drain in a race window.
+        // depth=1 + wedged consumer + a loaded buffer slot means further `try_send`
+        // sees Full, so send_with_halt must return `Err(item)` around the 200ms
+        // deadline. Sync on `started` first so the consumer is wedged before we load the slot.
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pipe = Pipeline::spawn(
@@ -1208,13 +1160,9 @@ mod tests {
             matches!(res, Err(Error::Halted)),
             "expected Err(Halted), got {res:?}"
         );
-        // Bailed out within the grace period plus a healthy margin.
-        // The grace spin-poll adds up to FINISH_GRACE_SECS (5s) of
-        // extra wait for a truly wedged consumer; the test's consumer
-        // is deliberately never released before this assert so we
-        // exercise the "grace expires → leak" path. 15s is well under
-        // the 10-minute JOIN_TIMEOUT backstop and proves the new code
-        // doesn't block forever.
+        // Bailed within the grace period plus margin: grace spin-poll adds up to
+        // FINISH_GRACE_SECS (5s) for the deliberately-unreleased, wedged consumer.
+        // 15s stays well under the 10-minute JOIN_TIMEOUT, proving it doesn't block forever.
         assert!(
             elapsed < Duration::from_secs(15),
             "halt observation took too long: {elapsed:?}"
@@ -1571,10 +1519,9 @@ mod tests {
         halt.cancel();
 
         let start = Instant::now();
-        // finish_with_halt drops tx (signalling EOF), then observes the
-        // pre-cancelled halt and enters the grace spin. The consumer
-        // finishes close() within 500ms, so finish_with_halt must join
-        // cleanly and return Ok with the correct total.
+        // finish_with_halt drops tx (EOF), observes the pre-cancelled halt, and
+        // enters the grace spin; the consumer finishes close() within 500ms, so
+        // it must join cleanly and return Ok with the correct total.
         let res = pipe.finish_with_halt(Some(&halt));
         let elapsed = start.elapsed();
 
@@ -1855,20 +1802,9 @@ mod tests {
         // caller genuinely reaches the abandon decision with a close in flight.
         let rel = release.clone();
         thread::spawn(move || {
-            // Past the first grace window (and past the 250 ms poll cadence that
-            // bounds when the window is actually observed), inside the second.
-            //
-            // These intervals used to be 600 ms against a 300 ms grace, which
-            // left NO margin: two 300 ms windows end at 600 ms, and the 250 ms
-            // poll cadence can push the observation later still, so on a loaded
-            // runner the second window expired first and the caller abandoned —
-            // failing with Err(Halted) against a race, not a defect.
-            //
-            // Scaled up so the jitter is small relative to the intervals: the
-            // first window ends at ~1.0-1.25 s and the second at ~2.0-2.25 s,
-            // so releasing at 1.6 s sits well inside the second with roughly
-            // 350 ms of slack on either side. The ordering under test is
-            // unchanged; only the margin is.
+            // Release inside the second grace window. Old 600ms/300ms-grace intervals
+            // left no margin and flaked on loaded runners; scaled up so windows end
+            // at ~1.0-1.25s and ~2.0-2.25s, releasing at 1.6s for ~350ms slack.
             thread::sleep(Duration::from_millis(1600));
             rel.store(true, Ordering::SeqCst);
         });

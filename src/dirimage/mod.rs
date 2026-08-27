@@ -127,18 +127,9 @@ impl DirImage {
         let mut files = Vec::with_capacity(nodes.len());
         let mut ranges = Vec::new();
         for (idx, node) in nodes.iter().enumerate() {
-            // Carry the plan-time mtime ONLY for files whose CONTENT the plan
-            // read — the DVD IFOs, whose bytes 0xC0/0xC4 decide where every VOB
-            // is placed (`layout::place_video_ts` -> `read_head`).
-            //
-            // For every other file the plan depends on the SIZE alone, and size
-            // is already checked. Comparing mtime on those buys nothing and
-            // costs real false positives: disc backups commonly live on
-            // exFAT/FAT32, which stores local time, so a long rip spanning a
-            // DST transition sees a whole-hour shift on a file nobody touched
-            // and would abort hours in, blaming a change that did not happen.
-            // The multi-gigabyte VOBs are exactly the files a long rip re-opens
-            // after the handle cache evicts them.
+            // Carry plan-time mtime ONLY for files whose CONTENT the plan read (DVD
+            // IFOs, whose 0xC0/0xC4 bytes place every VOB); others depend only on
+            // SIZE, and comparing mtime there false-positives on exFAT/FAT32 + DST.
             let content_sensitive = node
                 .disc_path
                 .rsplit('.')
@@ -228,16 +219,9 @@ impl DirImage {
         }
         let f = File::open(&self.files[file].host).map_err(Error::from)?;
         let md = f.metadata().map_err(Error::from)?;
-        // Size AND mtime. Size alone is content-blind, and this plan depends on
-        // content: a DVD's VOB placement comes from bytes 0xC0/0xC4 of its IFO,
-        // and an IFO rewritten in place keeps its length because IFOs occupy a
-        // whole number of sectors. The size check would pass while every title
-        // extent pointed at the wrong sectors — corrupt video behind an intact
-        // structure, reported complete at exit 0.
-        //
-        // Only compared when both sides have a timestamp; a platform or
-        // filesystem that reports none simply falls back to the size check
-        // rather than failing every read.
+        // Size AND mtime: size alone is content-blind, and VOB placement depends on
+        // IFO bytes 0xC0/0xC4 — an IFO rewritten in place keeps its sector-aligned
+        // length, so size alone would miss it. mtime only compared if both present.
         let changed_size = md.len() != self.files[file].size;
         let changed_mtime = match (self.files[file].mtime, md.modified().ok()) {
             (Some(planned), Some(live)) => planned != live,
@@ -271,19 +255,9 @@ impl DirImage {
         h.seek(SeekFrom::Start(at)).map_err(Error::from)?;
         let res = h.read_exact(&mut out[..want]);
         if res.is_ok() {
-            // Release the window just read, every time.
-            //
-            // The ISO source accumulates and drops in chunks because it reads
-            // one file linearly, so a running start offset always names the
-            // bytes it has consumed. Reads here jump between files, so there is
-            // no single cursor to accumulate against — an accumulated byte
-            // count paired with one read's offset names 1/Nth of what was
-            // actually consumed and leaves the rest pinned, which is how the
-            // first version of this got it wrong.
-            //
-            // Dropping per read costs one advisory syscall per batch (4-16 MiB),
-            // which is nothing against the read itself, and it is correct
-            // regardless of how reads interleave across files.
+            // Release the window just read, every time (unlike the ISO source's
+            // accumulate-and-drop, which relies on one linear cursor — reads here
+            // jump between files, so an accumulated count would leave bytes pinned).
             if let Some((_, fh)) = self.open.iter().find(|(i, _)| *i == file) {
                 drop_window(fh, at, want as u64);
             }
@@ -319,18 +293,14 @@ impl SectorSource for DirImage {
             return Err(Error::UdfBufferTooSmall);
         }
         buf[..need].fill(0);
-        // Walk the request in RUNS, not sector by sector. A mux batch is 8192
-        // sectors and almost always lands entirely inside one stream file's
-        // extent; per-sector seek+read would issue 8192 syscalls for what is
-        // one 16 MiB sequential read.
+        // Walk the request in RUNS, not sector by sector: a mux batch (8192
+        // sectors) almost always lands in one extent, so per-sector seek+read
+        // would cost 8192 syscalls for what is one 16 MiB sequential read.
         let mut i = 0u32;
         while i < count as u32 {
-            // Checked: callers saturate their LBAs (`disc/dvd.rs` builds a cell
-            // start as `vob_start_sector.saturating_add(cell.first_sector)`, and
-            // the prefetcher adds an offset the same way), so a crafted IFO can
-            // present a request at the very top of the address space. Wrapping
-            // here would fold `at` back to a LOW sector and hand the muxer a
-            // different file's bytes with nothing reported.
+            // Checked: callers saturate their LBAs, so a crafted IFO can present a
+            // request at the top of the address space. Wrapping here would fold
+            // `at` to a LOW sector, handing the muxer a different file's bytes.
             let Some(at) = lba.checked_add(i) else {
                 break;
             };

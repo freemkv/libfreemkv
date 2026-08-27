@@ -92,13 +92,9 @@ impl DemuxThread {
         let mut ts = ts;
         let mut ps = ps;
 
-        // SAFETY (no teardown deadlock on spawn failure): the worker closure is
-        // `move`, so it OWNS `prefetch_rx` and `recycle_tx`. If `spawn` fails it
-        // consumes and drops the closure, which drops those channel ends — so the
-        // upstream producer observes disconnection and exits on its own BEFORE we
-        // join it. `producer_shell` (whose Drop joins the producer) is NOT captured
-        // by the closure, so dropping it on the Err path below joins a producer that
-        // has already exited → non-blocking.
+        // SAFETY: on `spawn` failure the dropped `move` closure drops `prefetch_rx`/
+        // `recycle_tx`, so the producer disconnects and exits before `producer_shell`
+        // (uncaptured, joins on Drop) is dropped on the Err path — non-blocking.
         let spawn_result = std::thread::Builder::new()
             .name("freemkv-demux".into())
             .spawn(move || {
@@ -108,10 +104,8 @@ impl DemuxThread {
                 let mut prof_read_ns: u128 = 0;
                 let mut prof_feed_ns: u128 = 0;
                 let mut prof_bytes: u64 = 0;
-                // Liveness heartbeat: the feed loop blocks on prefetch_rx.recv()
-                // and on tx.send(); a stuck upstream/downstream shows up as the
-                // beat going silent. Total is unknown for a stream, so `pos` is
-                // cumulative bytes fed.
+                // Liveness heartbeat: a stuck upstream/downstream shows up as the beat
+                // going silent. Total is unknown, so `pos` is cumulative bytes fed.
                 let mut hb = crate::progress::Heartbeat::new("demux_feed");
                 let mut fed_bytes: u64 = 0;
                 loop {
@@ -142,9 +136,8 @@ impl DemuxThread {
                         None
                     };
                     let n = buf.len();
-                    // Source byte offset of this buffer's first byte = bytes fed
-                    // so far. Threaded into the demuxer so every PES it cuts is
-                    // stamped with its SourcePos (carried, not reconstructed).
+                    // Source byte offset of this buffer's first byte, threaded into the
+                    // demuxer so every PES it cuts carries its SourcePos.
                     let buf_base = fed_bytes;
                     fed_bytes += n as u64;
                     if let Some(ref mut d) = ts {
@@ -154,18 +147,12 @@ impl DemuxThread {
                         } else {
                             None
                         };
-                        // Recycle the buffer back to the producer
-                        // before pushing the demuxed packets. If the
-                        // recycle channel is closed the producer has
-                        // exited; we drop the buffer and continue.
+                        // Recycle before pushing the packets. A closed recycle channel
+                        // means the producer exited; drop the buffer and continue.
                         let _ = recycle_tx.send(buf);
-                        // Always send the batch — even when empty (null /
-                        // untracked PIDs only). send() is how we detect an early
-                        // consumer disconnect; on mostly-null extents spanning
-                        // gigabytes of disc the batch can stay empty for a long
-                        // time, and skipping empty sends would hide the
-                        // disconnect until a (possibly never-arriving) non-empty
-                        // batch. An empty batch yields no frames downstream.
+                        // Always send, even empty batches: send() is how an early
+                        // consumer disconnect is detected, and skipping empty sends on
+                        // mostly-null extents could hide it for a long time.
                         if tx.send(DemuxBatch::Ts(pkts)).is_err() {
                             return;
                         }
@@ -204,11 +191,9 @@ impl DemuxThread {
                         }
                     } else {
                         let _ = recycle_tx.send(buf);
-                        // No demuxer (a BdTs title with zero streams): still send
-                        // an empty batch so an early consumer disconnect is
-                        // detected here too, exactly like the ts/ps branches above.
-                        // Without it this worker reads the whole disc even after
-                        // the consumer has dropped.
+                        // No demuxer (zero-stream title): still send an empty batch to
+                        // detect an early consumer disconnect, or this worker reads
+                        // the whole disc even after the consumer has dropped.
                         if tx.send(DemuxBatch::Ts(Vec::new())).is_err() {
                             return;
                         }
@@ -226,10 +211,8 @@ impl DemuxThread {
                         let _ = tx.send(DemuxBatch::Ps(tail));
                     }
                 }
-                // Clean end-of-stream sentinel. Reaching here means no
-                // panic occurred; a panic during `feed`/`flush` skips
-                // this and drops `tx`, which the consumer reads as an
-                // error rather than a clean EOF.
+                // Clean EOF sentinel. A panic during `feed`/`flush` skips this and
+                // drops `tx`, which the consumer reads as an error, not clean EOF.
                 let _ = tx.send(DemuxBatch::Eof);
             });
 
@@ -512,13 +495,9 @@ mod tests {
 
     #[test]
     fn empty_batches_are_forwarded_for_disconnect_detection() {
-        // The worker forwards EVERY batch, including empty ones, so an early
-        // consumer disconnect is detected promptly via `send()` (crossbeam's
-        // Sender has no non-destructive disconnect check). An empty batch is
-        // harmless downstream: `pump_one_batch` consumes 0 packets and returns
-        // Ok(true) — only the explicit `Eof` sentinel ends the stream. A buffer
-        // that yields no complete PES therefore produces an empty Ts batch
-        // followed by Eof.
+        // The worker forwards every batch, including empty ones, so disconnect is
+        // detected promptly via `send()`. Only the explicit `Eof` sentinel ends the
+        // stream, so a no-PES buffer produces an empty Ts batch followed by Eof.
         let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
         let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
         let pid = 0x1011;
@@ -625,11 +604,9 @@ mod tests {
     /// sender is disconnected, which is the property the fix relies on.
     #[test]
     fn channels_disconnected_before_producer_join_on_spawn_failure() {
-        // Build a prefetch channel pair. The producer "thread" is simulated by
-        // holding prefetch_tx; we verify it observes disconnection after we
-        // drop prefetch_rx (and only after — not before).
-        // crossbeam channels expose disconnection only through send/recv
-        // results (there is no is_disconnected()), so we probe it that way.
+        // The producer "thread" is simulated by holding prefetch_tx; verify it
+        // observes disconnection only after dropping prefetch_rx, since crossbeam
+        // exposes disconnection only through send/recv results.
         let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(1);
         let (rc_tx, rc_rx) = bounded::<Vec<u8>>(1);
 

@@ -50,13 +50,9 @@ fn adts_verdict(data: &[u8]) -> AdtsVerdict {
     // aac_frame_length: 13 bits = byte3[1:0] | byte4 | byte5[7:5].
     let frame_length =
         ((u32::from(data[3]) & 0x03) << 11) | (u32::from(data[4]) << 3) | (u32::from(data[5]) >> 5);
-    // The floor is the header the frame SAYS it carries, not a constant.
-    // protection_absent (byte1 bit0) clear means a 16-bit crc_check follows the
-    // 7-byte fixed+variable header, so the frame cannot be shorter than 9 —
-    // aac_frame_length counts the header and the CRC, not just the payload.
-    // Comparing against a flat 7 let a CRC-present frame declaring 7 or 8
-    // through as structurally Valid, and the muxer then carried a frame whose
-    // own header says it is impossible.
+    // Floor depends on protection_absent: CRC-present (byte1 bit0 clear) adds a
+    // 16-bit crc_check after the 7-byte header, so the min is 9, not a flat 7 —
+    // else a CRC frame declaring length 7-8 wrongly passed as Valid.
     let header_bytes = if data[1] & 0x01 == 0 { 9 } else { 7 };
     if frame_length < header_bytes {
         return AdtsVerdict::Invalid;

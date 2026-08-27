@@ -33,7 +33,7 @@
 //!
 //! On `open()` each platform issues its "sequential access expected"
 //! hint so OS-level readahead widens. The hint and the DONTNEED call
-//! live in per-OS sibling modules ([`linux::hint_sequential`] et al.)
+//! live in per-OS sibling modules (`linux::hint_sequential` et al.)
 //! — no inline `#[cfg]` in this file.
 //!
 //! ## Read-ahead prefetch
@@ -190,13 +190,9 @@ impl SectorSource for FileSectorSource {
     ) -> Result<usize> {
         let count = count as u32;
         let bytes = count as usize * SECTOR_BYTES;
-        // A real check, not a debug_assert: this is a public `SectorSource` impl,
-        // so an undersized `out` is caller input, and `out[..bytes]` below would
-        // panic with 'range end index out of range' in release where the assert is
-        // compiled away. `Drive::read_fua` already carries exactly this guard, with
-        // a comment recording the same panic being fixed there — this impl was
-        // simply never given it, and `PrefetchedSectorSource` has a regression test
-        // for the case that this one lacked.
+        // A real check, not debug_assert: `out` is caller input to a public
+        // `SectorSource` impl, and `out[..bytes]` below would panic in release
+        // where the assert is compiled away. `Drive::read_fua` carries this guard.
         if out.len() < bytes {
             return Err(Error::DiscRead {
                 sector: lba as u64,
@@ -215,18 +211,14 @@ impl SectorSource for FileSectorSource {
             .read_exact(&mut out[..bytes])
             .map_err(|e| Error::IoError { source: e })?;
 
-        // Queue the next batch's read with the kernel before the
-        // caller starts processing what we just returned. readahead()
-        // is non-blocking — it queues I/O and returns, so the kernel
-        // pulls those pages into cache while the consumer (decrypt +
-        // demux + mux) runs. Next read_sectors call hits a warm cache.
+        // Queue the next batch's read before the caller processes what we returned.
+        // readahead() is non-blocking; the kernel pulls pages into cache while the
+        // consumer runs, so the next read_sectors call hits a warm cache.
         platform::prefetch(&self.file, offset + bytes as u64, bytes as u64);
 
-        // Periodic page-cache eviction on the read side. Without
-        // this, an 85 GB streaming ISO read pins the entire file in
-        // the kernel page cache, which starves concurrent writes and
-        // collapses mux throughput. Mirrors the write-side
-        // WritebackPipeline's DONTNEED policy.
+        // Periodic page-cache eviction on the read side: an 85 GB streaming ISO
+        // read would otherwise pin the whole file in cache, starving concurrent
+        // writes. Mirrors WritebackPipeline's DONTNEED policy on the write side.
         self.bytes_read_since_drop += bytes as u64;
         if self.bytes_read_since_drop >= self.drop_chunk_bytes {
             let drop_start = self.drop_window_start;
@@ -407,12 +399,9 @@ mod tests {
 
     #[test]
     fn drop_chunk_size_env_override() {
-        // Explicit 8 MiB via env var.
-        // SAFETY: tests in this crate are single-threaded per the
-        // default cargo test harness, but std::env::set_var is
-        // declared `unsafe` since Rust 2024 (it can race with other
-        // threads / TLS). For a test that runs in-process before any
-        // FileSectorSource construction this is safe in practice.
+        // Explicit 8 MiB via env var. SAFETY: set_var is `unsafe` since Rust 2024
+        // (can race with other threads/TLS), but this test runs single-threaded
+        // and in-process before any FileSectorSource construction.
         unsafe {
             std::env::set_var("FREEMKV_READ_DROP_CHUNK_MIB", "8");
         }

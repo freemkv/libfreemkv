@@ -143,8 +143,9 @@ impl WritebackFile {
 
     /// Like [`Self::create`] but pre-reserves `size_bytes` of disk
     /// space via the platform's extent-preallocation primitive (Linux
-    /// `fallocate(KEEP_SIZE)`, macOS `F_PREALLOCATE`, Windows
-    /// `SetFileValidData` stub). The reported file size is unchanged
+    /// `fallocate(KEEP_SIZE)`, macOS `F_PREALLOCATE`; Windows has no
+    /// equivalent, so it is a debug-logged no-op there). The reported
+    /// file size is unchanged
     /// (writes still grow the file naturally) — only the on-disk extent
     /// allocation is preallocated, which reduces extent fragmentation
     /// on large sequential writes (mux output, especially on slow
@@ -228,18 +229,13 @@ impl Write for WritebackFile {
 impl Seek for WritebackFile {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
         let p = self.file.seek(from)?;
-        // Only treat seeks that actually move the position as
-        // boundaries — sweep does a redundant `seek(Current(pos))`
-        // before every write, and we don't want that to drain the
-        // pipeline on every iteration.
+        // Only treat seeks that actually move the position as boundaries — sweep does
+        // a redundant `seek(Current(pos))` before every write, which shouldn't drain
+        // the pipeline on every iteration.
         if p != self.pos {
-            // Diagnostic for the NFS mux hang: the MKV format requires
-            // the muxer to seek back occasionally (cluster size
-            // patching, Cues index write, Segment header backpatch).
-            // Each such seek invalidates the writeback chunk tracking
-            // and forces a finalize → WAIT_AFTER on the in-flight
-            // chunk. Logging the seek delta lets us correlate hang
-            // offsets with specific muxer operations.
+            // Diagnostic for the NFS mux hang: MKV requires occasional backward seeks
+            // (cluster patching, Cues, Segment backpatch), each invalidating writeback
+            // chunk tracking. Logging the delta correlates hang offsets with muxer ops.
             let from_pos = self.pos;
             let to_pos = p;
             let delta: i64 = (to_pos as i64).wrapping_sub(from_pos as i64);
@@ -274,17 +270,9 @@ impl super::sink::RandomAccessSink for WritebackFile {}
 
 impl Drop for WritebackFile {
     fn drop(&mut self) {
-        // Run the pipeline's tail finalize so the last in-flight chunk
-        // gets its `WAIT_AFTER` + `posix_fadvise(DONTNEED)`. Without
-        // this, callers that drop a `WritebackFile` without calling
-        // `sync_all` (panic, early-return, idiomatic `let _ = w;`)
-        // leave the trailing chunk in cache; the kernel still flushes
-        // on close, but the bounded-cache invariant fails at the tail.
-        // We deliberately do *not* call `self.file.sync_all()` here —
-        // close already triggers a flush, and an `fsync` from `Drop`
-        // would silently swallow its `io::Error` anyway. `finalize` is
-        // idempotent so an explicit `sync_all` followed by drop is
-        // still safe.
+        // Run the pipeline's tail finalize (WAIT_AFTER + DONTNEED); otherwise a drop
+        // without `sync_all` leaves the trailing chunk in cache. No `self.file.sync_all()`
+        // here — `Drop`-triggered fsync would swallow errors; `finalize` is idempotent.
         self.pipeline.finalize();
     }
 }

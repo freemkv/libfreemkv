@@ -1,4 +1,4 @@
-//! AACS common cryptographic primitives — [C] Chapter 2 / §3.2.2.
+//! AACS common cryptographic primitives — `[C]` Chapter 2 / §3.2.2.
 //!
 //! Source: `[C]` = AACS Introduction and Common Cryptographic Elements Book,
 //! Rev 0.953. The shared low-level building blocks — AES-128 ECB E/D, AES-G,
@@ -10,19 +10,14 @@
 use aes::Aes128;
 use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 
-/// Fixed IV used by AACS for all AES-CBC operations. [C] §2.1.2 (default CBC IV, `iv0`).
+/// Fixed IV used by AACS for all AES-CBC operations. `[C]` §2.1.2 (default CBC IV, `iv0`).
 pub(crate) const AACS_IV: [u8; 16] = [
     0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3, 0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05, 0x0F, 0x78,
 ];
 
 // Per-thread count of AES-128 key schedules built through `new_cipher`.
-// Test-only instrumentation: an AES-128 key expansion is 10 round-key
-// derivations, and the CBC helpers here run on the per-aligned-unit decrypt hot
-// path of a whole disc read, so "how many times was the schedule built for one
-// loop-invariant key" is a property worth asserting rather than reasoning about.
-// THREAD-LOCAL, not a global atomic: `cargo test` runs tests concurrently, so a
-// shared counter would see every other test's expansions. See
-// `content::tests::decrypt_bus_expands_the_read_data_key_once_per_unit`.
+// Test-only: lets tests assert the CBC decrypt hot path builds one schedule
+// per loop-invariant key. Thread-local, not atomic, since `cargo test` runs concurrently.
 #[cfg(test)]
 thread_local! {
     pub(crate) static KEY_EXPANSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -35,14 +30,14 @@ pub(crate) fn new_cipher_for(key: &[u8; 16]) -> Aes128 {
 }
 
 /// Build an AES-128 key schedule. The single construction site for the CBC
-/// helpers, so [`KEY_EXPANSIONS`] can count them under test.
+/// helpers, so `KEY_EXPANSIONS` can count them under test.
 fn new_cipher(key: &[u8; 16]) -> Aes128 {
     #[cfg(test)]
     KEY_EXPANSIONS.with(|c| c.set(c.get() + 1));
     Aes128::new(&(*key).into())
 }
 
-/// AES-128-ECB encrypt a single 16-byte block. [C] §2.1.1 (`AES-128E`).
+/// AES-128-ECB encrypt a single 16-byte block. `[C]` §2.1.1 (`AES-128E`).
 pub(crate) fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let cipher = Aes128::new(&(*key).into());
     let mut block: Array<u8, _> = (*data).into();
@@ -52,7 +47,7 @@ pub(crate) fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     out
 }
 
-/// AES-128-ECB decrypt a single 16-byte block. [C] §2.1.1 (`AES-128D`).
+/// AES-128-ECB decrypt a single 16-byte block. `[C]` §2.1.1 (`AES-128D`).
 pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let cipher = Aes128::new(&(*key).into());
     let mut block: Array<u8, _> = (*data).into();
@@ -63,7 +58,7 @@ pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
 }
 
 /// AES-128-CBC ENCRYPT in place under the fixed [`AACS_IV`] — the forward
-/// direction of [`aes_cbc_decrypt`], and its exact inverse. [C] §2.1.2
+/// direction of [`aes_cbc_decrypt`], and its exact inverse. `[C]` §2.1.2
 /// (`AES-128CBCE`).
 ///
 /// Precondition: `data.len()` is a multiple of 16; the assert
@@ -95,7 +90,7 @@ pub(crate) fn aes_cbc_encrypt(key: &[u8; 16], data: &mut [u8]) {
     }
 }
 
-/// AES-128-CBC DECRYPT in-place with the fixed AACS IV. [C] §2.1.2
+/// AES-128-CBC DECRYPT in-place with the fixed AACS IV. `[C]` §2.1.2
 /// (`AES-128CBCD`).
 ///
 /// Precondition: `data.len()` is a multiple of 16. Any trailing partial
@@ -124,7 +119,7 @@ pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
 /// Split out of [`aes_cbc_decrypt`] so a caller that decrypts several regions
 /// under one loop-invariant key expands the schedule once. `decrypt_bus`
 /// ([`super::content::decrypt_bus`]) is that caller: bus encryption
-/// ([C] §4.2 / the AACS 2.0 Read Data Key) covers bytes 16..2048 of EVERY
+/// (`[C]` §4.2 / the AACS 2.0 Read Data Key) covers bytes 16..2048 of EVERY
 /// 2048-byte sector, so a 6144-byte aligned unit is three regions under one
 /// `read_data_key` — three key schedules where one suffices, on the per-unit
 /// decrypt hot path of a whole 90 GB read.
@@ -150,7 +145,7 @@ pub(crate) fn cbc_decrypt_blocks(cipher: &Aes128, data: &mut [u8]) {
     }
 }
 
-/// AES-G(x1, x2) = AES-128D(x1, x2) XOR x2. [C] §2.1.3 (note: uses AES-128**D**).
+/// AES-G(x1, x2) = AES-128D(x1, x2) XOR x2. `[C]` §2.1.3 (note: uses AES-128**D**).
 ///
 /// The Media Key Variant chain uses AES-G to derive both the variant
 /// number (`Kvn = AES-G(Kp, Nonce)`) and the Volume Unique Key
@@ -165,14 +160,14 @@ pub(crate) fn aes_g(x1: &[u8; 16], x2: &[u8; 16]) -> [u8; 16] {
     out
 }
 
-/// AACS-G3 seed constant (`s0`). [C] §3.2.2.
+/// AACS-G3 seed constant (`s0`). `[C]` §3.2.2.
 pub(crate) const AESG3_SEED: [u8; 16] = [
     0x7B, 0x10, 0x3C, 0x5D, 0xCB, 0x08, 0xC4, 0xE5, 0x1A, 0x27, 0xB0, 0x17, 0x99, 0x05, 0x3B, 0xD9,
 ];
 
-/// AACS-G3: derive a subkey from a parent key. [C] §3.2.2 (Triple AES Generator:
+/// AACS-G3: derive a subkey from a parent key. `[C]` §3.2.2 (Triple AES Generator:
 /// left=`D(k,s0)⊕s0` inc 0, pk=`D(k,s0+1)⊕(s0+1)` inc 1, right=`D(k,s0+2)⊕(s0+2)` inc 2).
-/// seed[15] += inc, then AES-DEC(key, seed) XOR seed.
+/// `seed[15] += inc`, then AES-DEC(key, seed) XOR seed.
 ///
 /// Shared with [`super::variant`] (its variant chain runs the same SD
 /// tree); a single definition keeps the two walks byte-identical.
@@ -190,7 +185,7 @@ pub(crate) fn aesg3(key: &[u8; 16], inc: u8) -> [u8; 16] {
 mod tests {
     use super::*;
 
-    /// The AACS-G3 seed `s0`, transcribed independently from [C] §3.2.2 rather
+    /// The AACS-G3 seed `s0`, transcribed independently from `[C]` §3.2.2 rather
     /// than read from [`AESG3_SEED`] — a test that sourced the seed from the
     /// production constant would assert that constant against itself and would
     /// still pass if it were edited.
@@ -216,7 +211,7 @@ mod tests {
     /// finding Media Keys, with no error to say why.
     ///
     /// Pinned through the spec relation rather than a re-implementation:
-    /// [C] §3.2.2 defines `AES-G3` as `AES-128D(k, s) XOR s` for
+    /// `[C]` §3.2.2 defines `AES-G3` as `AES-128D(k, s) XOR s` for
     /// `s = s0 + inc` (added into the last seed byte), so applying the
     /// FORWARD primitive [`aes_ecb_encrypt`] — a different function from the
     /// one under test — to `aesg3(k, inc) XOR s` must reproduce `s` exactly.
@@ -242,7 +237,7 @@ mod tests {
         }
     }
 
-    /// The Triple Generator's three outputs ([C] §3.2.2: left = inc 0, the
+    /// The Triple Generator's three outputs (`[C]` §3.2.2: left = inc 0, the
     /// Processing Key = inc 1, right = inc 2) are the two child node keys and
     /// the Processing Key of ONE tree node. They must be three different keys —
     /// if `inc` were ignored, a descent would revisit its own parent and the

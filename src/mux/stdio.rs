@@ -70,13 +70,9 @@ impl StdioStream {
         }
         self.header_read = true;
         if let Some(ref mut r) = self.reader {
-            // Propagate real header errors. read_header consumes bytes
-            // from the unbuffered stdin BEFORE it can fail (oversized
-            // length, bad JSON, partial read), so swallowing the Err
-            // would leave the stream misaligned and PesFrame::deserialize
-            // would then read garbage. `?` surfaces the true error;
-            // Ok(None) (genuine magic mismatch / clean EOF) stays a
-            // non-error and leaves the empty default title in place.
+            // Propagate real header errors: read_header consumes stdin bytes BEFORE it can
+            // fail, so swallowing the Err would misalign the stream and make deserialize read
+            // garbage. Ok(None) (magic mismatch / clean EOF) stays non-error (default title).
             if let Some(m) = meta::read_header(r)? {
                 self.disc_title = m.to_title();
                 self.meta_parsed = true;
@@ -129,13 +125,9 @@ impl crate::pes::Stream for StdioStream {
     }
 
     fn headers_ready(&self) -> bool {
-        // Write side: caller supplied the title up front, so headers are
-        // always ready. Read side: ready only once an FMKV header was
-        // actually parsed — gating on `header_read` alone would claim
-        // readiness for a headerless stream whose codec_private() is None
-        // for every track, starving the downstream MKV writer of init
-        // data. A genuinely headerless stream never flips ready (the
-        // caller must then fall back to its own codec detection).
+        // Write side: title supplied up front, always ready. Read side: ready only once an
+        // FMKV header was parsed — gating on `header_read` alone would claim readiness for a
+        // headerless stream (codec_private() all None), starving the MKV writer of init data.
         self.writer.is_some() || self.meta_parsed
     }
 }

@@ -3,7 +3,7 @@
 //! [`PictureInfo`] is the single per-frame carrier of coding signals that the
 //! muxer (and any downstream index/diagnostic) reads WITHOUT branching on the
 //! codec. Each codec's parser decodes its own bitstream once and folds the raw
-//! signals into a [`CodingDetail`] variant; consumers then call ONLY the
+//! signals into a [`CodingDetail`](crate::mux::codec::coding::CodingDetail) variant; consumers then call ONLY the
 //! codec-agnostic accessors ([`coding_type`](PictureInfo::coding_type),
 //! [`field_order`](PictureInfo::field_order), [`nb_fields`](PictureInfo::nb_fields),
 //! [`progressive`](PictureInfo::progressive)). The accessor surface is fixed:
@@ -181,13 +181,9 @@ impl PictureInfo {
         match self.detail {
             CodingDetail::Mpeg2(m) => {
                 if !m.frame_picture {
-                    // A single field picture is inherently interlaced. Which
-                    // field it actually codes is given by picture_structure
-                    // (top/bottom), not by top_field_first — §6.3.10 constrains
-                    // top_field_first to 0 for field pictures, so it is not the
-                    // spec source here. picture_structure is not retained on
-                    // this carrier, so top_field_first is used only as the lone
-                    // field hint available (best-effort, not spec-derived).
+                    // Field pictures are coded top/bottom by picture_structure, not
+                    // top_field_first (§6.3.10 forces it to 0 here). picture_structure
+                    // isn't retained on this carrier, so this is a best-effort hint.
                     Some(if m.top_field_first {
                         FieldOrder::Tff
                     } else {

@@ -181,7 +181,8 @@ pub fn clip_byte_to_lba(extents: &[crate::disc::Extent], clip_byte: u64) -> Opti
 /// to clean TS and garbles the other ~40 (the second interleaved half), which the
 /// demux then drops — yielding one coherent stream. Ranges outside every segment
 /// are left for the map's default (the ordinary Unit Key). A segment that straddles
-/// a UDF extent boundary is emitted as one range per whole-sector slice it covers.
+/// a UDF extent boundary is skipped entirely, falling back to the Unit Key rather
+/// than emitting a wrong span.
 ///
 /// The result feeds [`AacsKeyMap::from_ranges`](crate::decrypt::AacsKeyMap::from_ranges)
 /// with the Unit-Key index as the default — the same structure the CPS map uses,
@@ -200,12 +201,9 @@ pub fn fmts_key_ranges(
         }
         let start_byte = s.start_spn as u64 * SOURCE_PACKET_LEN;
         let end_byte = (s.end_spn as u64 + 1) * SOURCE_PACKET_LEN; // exclusive
-        // A segment is unit-aligned and contiguous in clip bytes; map its first
-        // and last sector to LBAs. Segments are ~480 KB and extents are GB-sized,
-        // so a segment almost never crosses an extent boundary — but if the two
-        // ends land in different extents (non-contiguous LBAs), skip rather than
-        // emit a wrong span; the units there fall to the Unit Key (garble+drop),
-        // never a mis-decrypt.
+        // Map first/last sector to LBAs. Segments (~480 KB) rarely cross the
+        // GB-sized extent boundary, but if the two ends land in different
+        // extents, skip rather than emit a wrong span (falls back to Unit Key).
         let (Some(a), Some(b)) = (
             clip_byte_to_lba(extents, start_byte),
             clip_byte_to_lba(extents, end_byte - 1),

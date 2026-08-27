@@ -65,7 +65,7 @@ pub fn detect(path: &Path) -> FsType {
 
 /// fd-based classification. Same return semantics as [`detect`], but
 /// takes a `RawFd` so callers that only have an open file (notably
-/// [`crate::io::writeback::WritebackPipeline`]) don't have to
+/// the writeback pipeline) don't have to
 /// round-trip through the path.
 ///
 /// Only implemented on Linux; other platforms return

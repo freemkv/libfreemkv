@@ -224,10 +224,9 @@ pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
         return None;
     }
 
-    // Runaway guard: a single sector's crack is a bounded 2^16 LFSR search and
-    // should finish in well under a second on any modern CPU. If it ever
-    // exceeds ~2s wall-clock, something pathological is happening — log it so a
-    // hang is never silent.
+    // Runaway guard: this crack is a bounded 2^16 LFSR search, done well under 1s
+    // on any modern CPU. If it ever exceeds ~2s, something pathological is
+    // happening — log it so a hang is never silent.
     let crack_t0 = std::time::Instant::now();
 
     let result = crack_title_key_inner(sector);
@@ -280,21 +279,13 @@ pub(crate) fn attack_crib(sector: &[u8]) -> Option<[u8; 10]> {
 
     // Need at least a few repeated bytes and at least one full cycle.
     if best_plen > 3 && best_p > 0 && best_plen / best_p >= 2 {
-        // The known plaintext is the periodic run continuing past 0x80. The
-        // crib starts at `0x80 - (best_plen/best_p)*best_p` and continues
-        // through the encrypted region; the bytes at and after 0x80 are the
-        // predicted plaintext (the pattern repeats with period best_p).
+        // Crib starts at `0x80 - cycles*best_p`; bytes at/after 0x80 are
+        // predicted by the run repeating with period best_p.
         let cycles = best_plen / best_p;
         let plain_start = 0x80 - cycles * best_p;
 
-        // Each predicted byte is the run sample one or more periods back:
-        // `sec[plain_start + (i % best_p)]`. For in-run offsets
-        // (`plain_start + i < 0x80`) the run is exactly periodic, so this
-        // equals `sec[plain_start + i]`; for offsets at/after 0x80 the raw
-        // byte is ciphertext, so we MUST wrap within the period rather than
-        // read it. (Reading `&sec[plain_start..+10]` directly — as before —
-        // pulled ciphertext into the crib whenever the run covered fewer than
-        // 10 bytes before 0x80, producing false-negative key recovery.)
+        // Must wrap within the period (not read `&sec[plain_start..+10]`
+        // directly), since past 0x80 the raw byte is ciphertext, not plaintext.
         let mut plain = [0u8; 10];
         for (i, p) in plain.iter_mut().enumerate() {
             *p = sector[plain_start + (i % best_p)];
@@ -359,14 +350,9 @@ mod tests {
         let mut plaintext = vec![0u8; SECTOR_BYTES];
         plaintext[FLAG_BYTE] = 0x10;
 
-        // A clean periodic run occupying the tail of the cleartext header
-        // (RUN_START..0x80) and continuing into the encrypted region. This
-        // mirrors a real VOB: a periodic data run just before the scrambled
-        // part. The run must NOT overlap the seed bytes (0x54..0x59), or the
-        // the crib detector would break mid-run. The phase is anchored to
-        // offset 0 so the run is consistent across the 0x80 boundary.
-        // Just above the seed (0x54..0x59); gives a 39-byte run (0x59..0x80)
-        // — enough for >=2 cycles of every tested period (<=19).
+        // Periodic run over the cleartext header tail (RUN_START..0x80) into
+        // the encrypted region, mirroring a real VOB. Must not overlap the seed
+        // bytes (0x54..0x59); RUN_START=0x59 gives >=2 cycles of every period.
         const RUN_START: usize = 0x59;
         let pat: Vec<u8> = (0..period)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
@@ -754,11 +740,9 @@ mod tests {
             None,
             "scramble bits clear → no crack, even though one would succeed"
         );
-        // `attack_crib` carries its own copy of the same gate, and it is the one
-        // that actually stops the crack (`crack_title_key`'s is defensive
-        // duplication). The crib doubles as the decrypt path's cached-key
-        // oracle, so a widened mask there would hand that path a "predicted
-        // plaintext" for sectors that were never scrambled.
+        // `attack_crib` carries its own copy of the same gate and is the one that
+        // actually stops the crack (`crack_title_key`'s is defensive duplication);
+        // it also doubles as the decrypt path's cached-key oracle.
         assert_eq!(
             attack_crib(&periodic),
             None,
@@ -845,14 +829,9 @@ mod tests {
         );
     }
 
-    // ── attack_crib: known-answer vectors ──────────────────────────────────
-    //
-    // `attack_crib` is BOTH the cracker's known plaintext and the decrypt
-    // path's "did the cached key descramble correctly?" oracle. Until now it
-    // was only ever exercised end-to-end through `crack_title_key`, on a
-    // fixture whose periodic run covered 39 bytes (0x59..0x80) — long enough
-    // that the run start, the cycle count and the `i % best_p` wrap were all
-    // slack. A crib that silently drifts costs a rip its title key.
+    // ── attack_crib: known-answer vectors ──────────────────────
+    // Both the cracker's known plaintext and the decrypt path's cached-key
+    // oracle; was only exercised indirectly, leaving run/cycle/wrap slack.
 
     /// Build a sector whose clear header ends in a `period`-length repeating
     /// run of exactly `run_len` bytes immediately before 0x80.
@@ -1011,10 +990,8 @@ mod tests {
         for b in sector[ENCRYPTED_START..].iter_mut() {
             *b = 0xFF;
         }
-        // The FLAG byte sits inside the header at 0x14, so it interrupts the
-        // pattern there; re-lay it and accept that 0x14 breaks the run — the
-        // scan still reaches offset 0x15 - 1 = 0x14 going backwards, i.e.
-        // j = 0x7f - 0x14 = 0x6b, well short of the bound. Instead put the
+        // The FLAG byte at 0x14 would interrupt the pattern, but j only needs to
+        // reach 0x7f - 0x14 = 0x6b, well short of the bound. So instead put the
         // scramble flag bits into a byte value that IS the pattern's.
         sector[FLAG_BYTE] = pat[FLAG_BYTE % period];
         assert_ne!(
@@ -1081,11 +1058,9 @@ mod tests {
                 "{n} plaintext bytes is fewer than the ten the cipher iterates"
             );
         }
-        // Exactly ten of each is ACCEPTED as far as the search — the boundary is
-        // `< 10`, not `<= 10`. (Whether this particular keystream has a seed is
-        // immaterial; what must not happen is an early `None` from the guard.)
-        // Proven through the round-trip fixture, whose inputs are exactly ten
-        // bytes and which does recover its key.
+        // Exactly ten of each is ACCEPTED — the boundary is `< 10`, not `<= 10`.
+        // What must not happen is an early `None` from the guard; proven via the
+        // round-trip fixture, whose inputs are exactly ten bytes.
         let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
         let (sector, _) = synth_sector(&title_key, &seed, &PES);
         assert_eq!(

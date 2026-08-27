@@ -111,17 +111,9 @@ pub struct DiscEntry {
     pub unit_keys: Vec<(u32, [u8; 16])>,
 }
 
-// ── Redacting `Debug` impls ──────────────────────────────────────────────────
-//
-// Every type above carries AACS secret material (device keys, host PRIVATE keys,
-// media/volume/processing/unit keys). `#[derive(Debug)]` would print those bytes
-// verbatim, so a stray `debug!("{:?}", …)` or a panic message would leak the
-// keys. These hand-written impls print only NON-secret shape (presence, lengths,
-// tree coordinates, indices) — never key bytes. `decrypt::DecryptKeys` follows
-// the same policy by omitting `Debug` entirely; here we keep `Debug` because
-// these are `PartialEq`/`Eq` value types used in `assert_eq!` and nested inside
-// other `#[derive(Debug)]` structs, so the trait must exist — just not leak.
-// Guarded by `redaction_tests` below.
+// ── Redacting `Debug` impls: types above carry AACS secrets; derived `Debug`
+// would leak key bytes via `debug!`/panics. These print only non-secret shape,
+// kept (not omitted) since used in `assert_eq!`. See `redaction_tests`.
 
 impl std::fmt::Debug for DeviceKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -270,11 +262,9 @@ mod unit_key_tests {
 mod redaction_tests {
     use super::*;
 
-    // Sentinel key byte 0xD5 = decimal 213. A derived `Debug` prints `[u8;N]`
-    // as decimal, so a leaked key surfaces the substring "213"; the redacting
-    // impls must not. No non-secret field below is 213, so "213" appearing means
-    // key bytes leaked. Each type must also carry a "redacted" marker (or omit
-    // the secret entirely) so re-adding `#[derive(Debug)]` fails this test.
+    // Sentinel byte 0xD5 = decimal 213: a derived `Debug` prints `[u8;N]` as
+    // decimal, so a leak surfaces "213" (no non-secret field is 213). Each type
+    // must also carry a "redacted" marker so re-adding `#[derive(Debug)]` fails.
     const S: u8 = 0xD5;
 
     fn assert_redacted(what: &str, dbg: &str) {

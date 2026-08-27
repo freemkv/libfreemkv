@@ -215,11 +215,9 @@ mod tests {
             "a halted F_FULLFSYNC must not be reported as a completed sync"
         );
 
-        // The three arms must be DISTINGUISHABLE, not merely non-Ok. Each
-        // carries its own numeric code through the "E<code>" prefix that
-        // `From<Error> for io::Error` mints — the only shape `error_code`
-        // recognises. A bare `ErrorKind` cannot be classified, which is how a
-        // user cancel here used to read as a hard I/O failure.
+        // The three arms must be DISTINGUISHABLE, not merely non-Ok. Each carries its
+        // own numeric code via the "E<code>" prefix `From<Error> for io::Error` mints —
+        // a bare `ErrorKind` can't be classified, so a user cancel used to read as I/O failure.
         let lost = bounded_failure_to_result(BoundedError::WorkerLost)
             .expect_err("a lost F_FULLFSYNC worker must be an error");
         assert!(

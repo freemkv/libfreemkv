@@ -4,8 +4,8 @@
 //! into a container, emits one machine-readable *video-index* record per coded
 //! picture of the title's primary video track. It is a thin consumer of the
 //! reusable, pure-data [`VideoMap`](crate::mux::videomap) model
-//! ([`MapHeader`]/[`PictureRecord`]): the sink builds the header from the title,
-//! then writes one record per video [`PesFrame`] straight to disk — nothing here
+//! ([`MapHeader`](crate::mux::videomap::MapHeader)/[`PictureRecord`](crate::mux::videomap::PictureRecord)): the sink builds the header from the title,
+//! then writes one record per video [`PesFrame`](crate::pes::PesFrame) straight to disk — nothing here
 //! re-parses the elementary stream, and the whole index is never buffered.
 //!
 //! The on-disk shape is the freemkv FVI format (normative public spec
@@ -79,14 +79,9 @@ fn write_fvi_header(w: &mut dyn Write, h: &MapHeader) -> io::Result<()> {
 /// members (`field_order`, `progressive`, `nb_fields`) are emitted ONLY when the
 /// codec actually measured them — an honest absence, never a guessed default.
 fn write_fvi_record(w: &mut dyn Write, r: &PictureRecord) -> io::Result<()> {
-    // `src` is REQUIRED by the record schema (Appendix A); when provenance is
-    // absent the member is still emitted as null — a reader treats null as
-    // "position unknown".
-    //
-    // Per `docs/FVI_FORMAT.md` §9, `src.byte` is the offset of the AU's first
-    // byte WITHIN its `sector` (not the absolute source offset). `SourcePos.byte`
-    // is the absolute offset, so reduce it modulo the sector size; `sector`
-    // already carries the whole-sector count.
+    // `src` is REQUIRED (Appendix A); null when provenance absent = "position
+    // unknown". Per §9, `src.byte` is the offset WITHIN the sector, so reduce the
+    // absolute `SourcePos.byte` modulo sector size; `sector` is the whole count.
     let src = match r.source {
         Some(s) => serde_json::json!({
             "sector": s.sector,
@@ -107,18 +102,12 @@ fn write_fvi_record(w: &mut dyn Write, r: &PictureRecord) -> io::Result<()> {
         obj["pts"] = serde_json::json!(pts);
     }
     // dts is MAY — the highway carries no DTS on a frame, so it is omitted.
-    // TODO(provenance→recovery join): a `recovered` MAY member belongs here,
-    // sourced from the sweep/patch mapfile's bad-range overlap with this AU's
-    // `src`. Not reachable at the PesFrame today; omitted (spec MAY).
+    // TODO(provenance→recovery join): a `recovered` MAY member (sweep/patch
+    // mapfile overlap with this AU's `src`) belongs here; unreachable at PesFrame.
 
-    // Coding-derived members (§7.1), emitted as top-level members for ANY frame
-    // whose parser decoded the signal — derived through the codec-agnostic
-    // `PictureInfo` accessors, never the raw bitstream:
-    //   - `field_order` only when measured (TFF/BFF/Progressive); OMITTED on a
-    //     codec-type-only codec (HEVC/H.264/VC-1) — honest absence.
-    //   - `progressive` only when the codec signalled it (Option<bool>).
-    //   - `nb_fields` (displayed field periods, soft-telecine basis) when coding
-    //     is present.
+    // Coding-derived members (§7.1) via codec-agnostic `PictureInfo` accessors,
+    // never the raw bitstream: `field_order` only when measured (OMITTED on
+    // codec-type-only HEVC/H.264/VC-1), `progressive` only when signalled.
     if let Some(c) = r.coding {
         if let Some(fo) = field_order_label(r.coding) {
             obj["field_order"] = serde_json::json!(fo);

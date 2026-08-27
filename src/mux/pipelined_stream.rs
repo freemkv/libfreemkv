@@ -77,7 +77,7 @@ pub struct PipelinedPesStream {
     au_asm: Vec<super::au_assembly::AuAssembler>,
 }
 
-/// The `Codec` of a stream, for configuring its [`AuAssembler`].
+/// The `Codec` of a stream, for configuring its [`AuAssembler`](crate::mux::au_assembly::AuAssembler).
 fn stream_codec(s: &crate::disc::Stream) -> crate::disc::Codec {
     use crate::disc::Stream;
     match s {
@@ -150,11 +150,9 @@ impl PipelinedPesStream {
             Ok(DemuxBatch::Err(e)) => Err(e),
             // Explicit clean-completion sentinel from the demux worker.
             Ok(DemuxBatch::Eof) => Ok(false),
-            // The channel disconnected WITHOUT the worker first sending
-            // an `Eof` (or `Err`) sentinel — the worker panicked or was
-            // dropped mid-stream. Surface this as an error so a parser /
-            // demux panic is never reported to the caller as a clean
-            // end-of-stream (which would silently truncate output).
+            // Channel disconnected WITHOUT an `Eof`/`Err` sentinel — the worker
+            // panicked or was dropped mid-stream. Surface as an error so a parser/demux
+            // panic is never reported as a clean end-of-stream (silent truncation).
             Err(_) => Err(crate::error::Error::DemuxThreadPanicked.into()),
         }
     }
@@ -184,14 +182,9 @@ impl PipelinedPesStream {
                 {
                     let is_video = self.is_video.get(track).copied().unwrap_or(false);
                     for frame in parser.parse(&pes) {
-                        // B1: after a concealed/lost gap, drop forward to the next
-                        // keyframe on a video track so no frame with a dangling
-                        // reference is emitted. The signal is read PER-FRAME
-                        // (`frame.discontinuity`), not per-PES: buffering parsers
-                        // (MPEG-2 GOPs, H.264/HEVC AU lag) stamp the exact post-gap
-                        // picture, so only it arms the gate — not a whole PES of
-                        // frames. Audio/subtitle always admit (independent frames);
-                        // a track with no gate (out-of-range index) emits as-is.
+                        // B1: after a concealed/lost gap, drop forward to the next video
+                        // keyframe so no dangling-reference frame is emitted. Read PER-FRAME
+                        // (post-gap picture); audio/subtitle admit, no-gate track emits as-is.
                         let emit = match self.resync.get_mut(track) {
                             Some(gate) => {
                                 let was_armed = gate.is_armed();
@@ -223,11 +216,9 @@ impl PipelinedPesStream {
 
     fn consume_ps(&mut self, packets: Vec<super::ps::PsPacket>) {
         for ps in packets {
-            // Route by the REAL DVD PID (matching the PIDs that
-            // `scan_dvd_titles` assigns) rather than a synthetic track
-            // index. The old `(sub_id & 0x1F) + 1` heuristic collided
-            // subtitle sub-id 0x20+j with audio track j+1, feeding
-            // VobSub PES into the AC-3 parser.
+            // Route by the REAL DVD PID (matching `scan_dvd_titles`) not a synthetic
+            // track index. The old `(sub_id & 0x1F) + 1` heuristic collided subtitle
+            // sub-id 0x20+j with audio track j+1, feeding VobSub PES into the AC-3 parser.
             let Some(pid) = ps.dvd_pid() else {
                 if ps.is_nav() {
                     // Expected DVD navigation packet (PCI/DSI) — tally, no WARN.
@@ -255,22 +246,17 @@ impl PipelinedPesStream {
                 );
                 continue;
             };
-            // Carry the PS demuxer's byte-exact source stamp through to the codec
-            // parser, exactly as the TS path does — provenance must survive the
-            // PsPacket → PesPacket seam so the frame's `source` reaches the
-            // mux/index (FVI `src`), never reconstructed.
+            // Carry the PS demuxer's byte-exact source stamp through to the codec parser
+            // as the TS path does — provenance must survive the PsPacket → PesPacket seam
+            // so the frame's `source` reaches the mux/index (FVI `src`), never rebuilt.
             let (pts_i64, dts_i64, src) = (
                 ps.pts.map(|p| p as i64),
                 ps.dts.map(|d| d as i64),
                 ps.source,
             );
-            // Reassemble the PS fragments into AU-complete PES for this track
-            // (passthrough for self-framing codecs — MPEG-2/audio), so the parser
-            // sees exactly the AU-complete shape a transport stream delivers. The
-            // AU-start PTS/source survive the reassembly. A track with no assembler
-            // (only reachable via a hand-built `pid_to_track` outrunning the stream
-            // list) passes the fragment straight through. (PS path: no AACS conceal
-            // → no continuity-gap flag.)
+            // Reassemble PS fragments into AU-complete PES (passthrough for self-framing
+            // MPEG-2/audio) so the parser sees the same shape a TS delivers; AU-start PTS/
+            // source survive, no assembler → passthrough. (PS: no AACS conceal, no gap.)
             let pkts: Vec<PesPacket> = match self.au_asm.get_mut(track) {
                 Some(asm) => asm
                     .push_owned(ps.data, pts_i64, dts_i64, src, false)
@@ -330,15 +316,9 @@ impl Stream for PipelinedPesStream {
                             self.dropped_nav_packets
                         );
                     }
-                    // Drain any access unit a parser buffered past the last
-                    // PES (e.g. DTS-HD's final core+extension unit, or MPEG-2's
-                    // final GOP). These flush frames carry their own per-frame
-                    // `discontinuity` (a post-gap picture buffered at EOF was
-                    // stamped by the parser), so route them through the SAME B1
-                    // gate the in-stream path uses — otherwise a trailing
-                    // dangling-reference frame (MPEG-2 final-GOP corner) would
-                    // bypass the resync. Disjoint field borrows so the gate +
-                    // is_video reads coexist with the mutable parser drain.
+                    // Drain any AU a parser buffered past the last PES (DTS-HD tail, MPEG-2
+                    // final GOP), routing through the SAME B1 gate — flush frames carry their
+                    // own `discontinuity`, so a trailing dangling-ref frame must not bypass it.
                     let pid_to_track = &self.pid_to_track;
                     let pending = &mut self.pending_frames;
                     let resync = &mut self.resync;
@@ -348,10 +328,9 @@ impl Stream for PipelinedPesStream {
                         let Some(&(_, track)) = pid_to_track.iter().find(|(p, _)| p == pid) else {
                             continue;
                         };
-                        // First: the trailing access unit(s) the PS assembler
-                        // buffered past the final fragment (the last AU has no
-                        // following boundary). Parse them, THEN drain the parser's
-                        // own internal buffer (MPEG-2 final GOP, DTS-HD tail).
+                        // First the trailing AU(s) the PS assembler buffered past the
+                        // final fragment (last AU has no following boundary); THEN drain
+                        // the parser's own buffer (MPEG-2 final GOP, DTS-HD tail).
                         let mut frames = Vec::new();
                         let tail = au_asm.get_mut(track).map(|a| a.flush()).unwrap_or_default();
                         for au in tail {
@@ -412,10 +391,9 @@ impl Stream for PipelinedPesStream {
     }
 
     fn headers_ready(&self) -> bool {
-        // Match the previous DiscStream semantics: video tracks need
-        // codec_private before the consumer can write the container
-        // header. FREEMKV_SKIP_PARSE forces ready (no parser ever
-        // populates codec_private in that mode).
+        // Match DiscStream semantics: video tracks need codec_private before the
+        // consumer can write the container header. FREEMKV_SKIP_PARSE forces ready
+        // (no parser populates codec_private in that mode).
         if self.skip_parse {
             return true;
         }

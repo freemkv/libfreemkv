@@ -92,12 +92,9 @@ pub fn hdr_str(h: HdrFormat) -> &'static str {
     }
 }
 
-// `channel_count` and `sample_rate_hz` lived here as a third copy of the
-// AudioChannels/SampleRate mappings. They were the only HONEST copy — returning
-// 0 for Unknown where the canonical accessors fabricated 6 channels at 48 kHz —
-// and their only caller was the trace line below, in this same file. The
-// canonical accessors are honest now, so the duplicates are gone rather than
-// left to drift a fourth time.
+// `channel_count`/`sample_rate_hz` used to live here as a third, HONEST copy of
+// the AudioChannels/SampleRate mappings (returning 0 for Unknown where the
+// canonical accessors fabricated 6ch/48kHz). Canonical accessors are honest now.
 
 // ── DVD cell-category dump (from the IFO scan, pre-lowering) ─────────────────
 
@@ -110,9 +107,8 @@ pub fn hdr_str(h: HdrFormat) -> &'static str {
 pub fn dvd_cell_row(idx: usize, cell: &crate::ifo::DvdCell, dropped: bool) -> String {
     let c = CellCategory::decode(cell.category);
     // Per-cell keep/skip REASON (self-sufficient bug log): a dropped cell is a
-    // leading secondary angle/interleave block piece; a kept cell is either the
-    // first feature cell or genuine feature content. This makes the
-    // leading-cell-filter decision auditable from the log without the disc.
+    // leading secondary angle/interleave piece; a kept cell is the first feature
+    // cell or genuine content. Makes the leading-cell-filter decision auditable.
     let verdict = if dropped {
         "DROP(leading-secondary-block-piece)"
     } else if c.is_secondary_block_piece() {
@@ -482,11 +478,9 @@ pub fn dump_disc(disc: &Disc) {
         );
     }
 
-    // Titles disqualified from main-feature candidacy for carrying no video —
-    // the streamless obfuscation decoys the `has-video` gate demotes. Logged so
-    // a field bug report shows WHY a long/large playlist was not picked (the
-    // gap that let an undiagnosable E6008 loop on a real UHD title's decoy
-    // playlist `00245`).
+    // Titles disqualified from main-feature candidacy for carrying no video — the
+    // streamless obfuscation decoys the `has-video` gate demotes. Logged so a field
+    // bug report shows WHY a playlist wasn't picked (the gap behind E6008 on `00245`).
     for (ti, t) in disc.titles.iter().enumerate() {
         if !t.has_video() {
             tracing::debug!(
@@ -673,10 +667,9 @@ mod tests {
                 .collect(),
             ..DiscTitle::empty()
         };
-        // A 40-clip 8 GB title beats a 1-clip 1 GB title: the comparator's
-        // primary key among disc-fitting titles is LARGEST SIZE. "fewest clips"
-        // would predict the opposite, so the drifted string described a rule
-        // the comparator does not implement.
+        // A 40-clip 8 GB title beats a 1-clip 1 GB title: the comparator's primary
+        // key among disc-fitting titles is LARGEST SIZE, not "fewest clips" (the
+        // drifted string described a rule the comparator does not implement).
         let many_clips_big = sized(8_000_000_000, 40);
         let one_clip_small = sized(1_000_000_000, 1);
         assert_eq!(

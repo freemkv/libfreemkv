@@ -379,7 +379,7 @@ pub enum Error {
     /// fields):
     ///   - [`Error::is_scsi_transport_failure`] — bail; bridge/transport wedge
     ///   - [`Error::is_marginal_read`] — drive said this read was marginal; smaller block may recover
-    ///   - [`Error::scsi_sense`] — borrow the sense triple for finer routing ([`ScsiSense::is_medium_error`] etc.)
+    ///   - [`Error::scsi_sense`] — borrow the sense triple for finer routing ([`ScsiSense::is_medium_error`](crate::scsi::ScsiSense::is_medium_error) etc.)
     ScsiError {
         opcode: u8,
         status: u8,
@@ -1201,16 +1201,9 @@ impl std::error::Error for Error {
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        // If this `io::Error` is one WE produced (`From<Error> for io::Error`
-        // carries the typed value in its boxed payload), give the original
-        // back instead of burying it in `Error::IoError`. That wrapper is not
-        // neutral: `is_scsi_transport_failure` treats `IoError` as a
-        // transport-layer fault (dead bus / wedged bridge), so re-wrapping a
-        // round-tripped `DiscRead` MEDIUM ERROR turned a skippable bad sector
-        // into a pass-aborting bridge wedge — the exact inverse of what that
-        // arm exists for. Any error that crosses a thread boundary as an
-        // `io::Error` (the prefetch channel's `Batch`) keeps its
-        // classification, its SCSI status, and its sense data.
+        // If this `io::Error` is ours, unwrap to the original typed `Error` rather
+        // than re-wrapping as `IoError` (which `is_scsi_transport_failure` reads as
+        // a bridge wedge) — preserves classification, SCSI status, and sense data.
         match e.downcast::<Error>() {
             Ok(typed) => typed,
             // A genuine OS/`std` error — the `IoError` wrapper is correct here.
@@ -1221,11 +1214,9 @@ impl From<std::io::Error> for Error {
 
 impl From<Error> for std::io::Error {
     fn from(e: Error) -> Self {
-        // An `Error::IoError` is just a wrapper around an underlying
-        // `io::Error` that entered via `From<io::Error> for Error`.
-        // Round-trip it back unchanged so the original `ErrorKind` and
-        // raw OS error code survive instead of being flattened to
-        // `Other` with a stringified message.
+        // `Error::IoError` just wraps an `io::Error` that entered via
+        // `From<io::Error> for Error` — round-trip it back unchanged so the
+        // original `ErrorKind`/OS code survive instead of flattening to `Other`.
         if let Error::IoError { source } = e {
             return source;
         }
@@ -1312,12 +1303,9 @@ impl From<Error> for std::io::Error {
             // 9027 insufficient space / 9029 write failed: a filesystem-level
             // failure, not bad input.
             E_DIR_INSUFFICIENT_SPACE | E_DIR_WRITE_FAILED => std::io::ErrorKind::Other,
-            // dir:// SOURCE gates (9061–9064, 9066–9068): the folder handed in
-            // cannot be turned into a disc image — a 3D SSIF tree, an
-            // unsatisfiable VIDEO_TS placement, still-encrypted content, an
-            // unrecognized tree, one too large to address, a name too long to
-            // record, or a directory whose fan-out overflows its link count.
-            // All are properties of the input, decided before a byte is read.
+            // dir:// SOURCE gates (9061-9064, 9066-9068): the folder can't become a
+            // disc image (3D SSIF, bad VIDEO_TS placement, encrypted, unrecognized
+            // tree, too large, name too long, fan-out overflow) — input properties.
             E_DIR_IMAGE_SSIF_UNSUPPORTED
             | E_DIR_IMAGE_PLACEMENT
             | E_DIR_IMAGE_ENCRYPTED
@@ -1330,12 +1318,9 @@ impl From<Error> for std::io::Error {
             E_DIR_IMAGE_FILE_CHANGED => std::io::ErrorKind::InvalidData,
             _ => std::io::ErrorKind::Other,
         };
-        // Carry the typed value itself as the payload rather than its
-        // stringification. `Display` is unchanged (`io::Error` delegates to the
-        // boxed error, whose `Display` is the same `E<code>[: …]` string), so
-        // `error_code` and every consumer built on it are unaffected — but the
-        // typed error now SURVIVES the conversion and `From<io::Error> for
-        // Error` can hand it back intact.
+        // Carry the typed value itself as the payload, not its stringification.
+        // `Display` is unchanged (same `E<code>[: …]` string), so `error_code` is
+        // unaffected — but the typed error now SURVIVES and can round-trip back.
         std::io::Error::new(kind, e)
     }
 }
@@ -1480,12 +1465,9 @@ impl Error {
                 ..
             }
         ) || matches!(
-            // A failed `ioctl(SG_IO)` (Error::IoError, e.g. ENODEV/EIO on an
-            // unplugged USB bridge) and a vanished device (Error::DeviceNotFound,
-            // fd gone) are dead-bus / transport-layer faults too — NOT recoverable
-            // bad sectors. Treat them as transport failures so sweep / patch /
-            // fill_extents abort the pass and re-enumerate the bridge instead of
-            // zero-filling every read against a wedged device.
+            // A failed ioctl (IoError, e.g. ENODEV/EIO) or vanished device
+            // (DeviceNotFound) is a dead-bus fault too, not a bad sector — treat
+            // as transport failure so the pass aborts instead of zero-filling.
             self,
             Error::IoError { .. } | Error::DeviceNotFound { .. }
         )
@@ -1559,24 +1541,17 @@ mod tests {
 
     #[test]
     fn is_skippable_title_stub_excludes_malformed_mkv_input() {
-        // The two skippable per-title codes, round-tripped through io::Error
-        // exactly as `mux_stream` returns them. `MkvInvalid` now means ONLY the
-        // no-muxable-frames stub (the driver's headers-never-resolved gate and the
-        // MKV muxer's zero-frame `finish()` guard) — the meaning the doc on this
-        // predicate has always described.
+        // The two skippable per-title codes, round-tripped through io::Error as
+        // `mux_stream` returns them. `MkvInvalid` now means ONLY the no-muxable-
+        // frames stub, matching this predicate's documented meaning.
         let mkv: std::io::Error = Error::MkvInvalid.into();
         let css: std::io::Error = Error::CssKeyMissing.into();
         assert!(is_skippable_title_stub(&mkv));
         assert!(is_skippable_title_stub(&css));
 
-        // A malformed / truncated `mkv://` SOURCE is a FAILURE, not a stub. Every
-        // read-path rejection in `mux::mkvstream` and `mux::ebml`'s read
-        // primitives used to be raised as `MkvInvalid`, so a bad VINT, a cluster
-        // timestamp past i64::MAX or a BlockGroup child overrunning its group all
-        // landed in the skippable set above: an all-titles rip would pass silently
-        // over a corrupt input and exit reporting success. Reverting
-        // `Error::MkvSourceInvalid` back to `Error::MkvInvalid` at those raise
-        // sites turns this assertion red.
+        // A malformed/truncated mkv:// SOURCE is a FAILURE, not a stub. It used to
+        // be raised as `MkvInvalid`, so a corrupt source landed in the skippable
+        // set and an all-titles rip silently passed over it, exiting successfully.
         let corrupt: std::io::Error = Error::MkvSourceInvalid.into();
         assert!(
             !is_skippable_title_stub(&corrupt),
@@ -1599,11 +1574,9 @@ mod tests {
         let plain = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
         assert!(!is_skippable_title_stub(&plain));
 
-        // A header-buffer cap overflow is a REAL title whose codec init data
-        // never resolved — hundreds of MiB of frames, not an empty nav/menu
-        // stub. It used to be reported as `MkvInvalid`, which lands in the
-        // skippable set above, so an all-titles rip dropped a main feature and
-        // still exited successfully. It must have its own, non-skippable code.
+        // A header-buffer cap overflow is a REAL title whose codec init data never
+        // resolved, not an empty stub. Reported as `MkvInvalid` it would land in
+        // the skippable set, so an all-titles rip would drop a main feature silently.
         let cap: std::io::Error = Error::MuxHeaderBufferExceeded {
             bytes: 512 * 1024 * 1024 + 1,
         }
@@ -1780,10 +1753,9 @@ mod tests {
                 e,
                 s
             );
-            // Crude English filter — `Display` should never emit ASCII words
-            // longer than 4 chars (codes/paths/identifiers like `/dev/sg4`,
-            // `renesas`, `freebsd` all pass; "exclusive access denied" would
-            // not).
+            // Crude English filter — `Display` should never emit ASCII words longer
+            // than 4 chars (identifiers like `/dev/sg4`, `renesas` pass;
+            // "exclusive access denied" would not).
             for word in s.split(|c: char| !c.is_ascii_alphabetic()) {
                 assert!(
                     word.len() <= 8,

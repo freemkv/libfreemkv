@@ -117,26 +117,17 @@ impl Disc {
         let mut extents = Vec::new();
         let mut total_size: u64 = 0;
         // Set when any clip resolves to a STREAM/SSIF/<clip>.ssif — a Blu-ray 3D
-        // interleaved stream carrying both the base (left) and MVC dependent
-        // (right) views. Drives reading the SSIF for both eyes and adding the
-        // dependent-view stream below.
+        // interleaved stream carrying both base and MVC dependent views. Drives
+        // reading the SSIF for both eyes and adding the dependent-view below.
         let mut is_3d = false;
         let mut clips = Vec::with_capacity(parsed.play_items.len());
-        // BD playlists legally reference the same .m2ts clip_id from
-        // multiple PlayItems (multi-angle, seamless splits, looped
-        // segments). The physical extents and packet count must be
-        // counted ONCE per unique clip — mux reads extents in order, so
-        // a duplicate would mux the A/V twice and inflate size_bytes.
-        // Per-PlayItem Clip entries (differing in/out times) still get
-        // recorded.
+        // BD playlists legally reference the same .m2ts clip_id from multiple
+        // PlayItems; extents/packet count must be counted ONCE per unique clip
+        // (mux reads in order) or a duplicate mux's the A/V twice, inflating size.
         let mut seen_clips: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Byte offset of the next extent within the TITLE'S FEED — the
-        // concatenation of `extents` in the order the mux reads them. Each
-        // clip's span is recorded so a frame's source offset identifies its
-        // clip by lookup rather than by guessing from timestamps, which is
-        // ambiguous inside an overlap. A clip referenced a SECOND time pushes
-        // no extents (see `first_ref`), so it reuses the span of its first
-        // reference — the same bytes, read once.
+        // Byte offset of the next extent within the TITLE'S FEED (the concatenation
+        // of `extents` in read order). Each clip's span is recorded so a frame's
+        // source offset identifies its clip by lookup, not by ambiguous timestamps.
         let mut feed_pos: u64 = 0;
         let mut spans: std::collections::HashMap<String, (u64, u64)> =
             std::collections::HashMap::new();
@@ -145,32 +136,22 @@ impl Disc {
             let clip_dur = play_item.out_time.saturating_sub(play_item.in_time) as f64 / 45000.0;
 
             let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
-            // A `.clpi` that cannot be read or parsed is NOT a benign miss.
-            // `duration_ticks` was already summed from the PlayItems above, so
-            // the title keeps claiming its full runtime; skipping this block
-            // (what the old `if let Ok(..) && let Ok(..)` did) pushed no
-            // extents and added nothing to `total_size`, so the title shipped
-            // with the clip's bytes silently absent — and, because the `if let`
-            // DISCARDED the error, without a single log line to say so. Same
-            // classification as the extent resolver below: drop the title, and
-            // log the error's OWN code.
+            // A `.clpi` that cannot be read or parsed is NOT a benign miss:
+            // `duration_ticks` already claims the full runtime, so drop the
+            // title instead of silently shipping it missing bytes.
             let clip_info = match udf_fs
                 .read_file(reader, &clpi_path)
                 .and_then(|clpi_data| clpi::parse(&clpi_data))
             {
                 Ok(info) => info,
-                // The operator's Stop, not a disc defect. Every remaining
-                // command fails the same way once the drive's flag is set, so
-                // classifying it as an unresolvable clip would drop each
-                // remaining playlist in turn and hand back a truncated title
-                // list at success.
+                // The operator's Stop, not a disc defect: every remaining command
+                // fails the same way once the drive's flag is set, so classifying
+                // it as unresolvable would truncate the title list at success.
                 Err(Error::Halted) => return Err(Error::Halted),
                 Err(e) => {
-                    // The REAL code, not a fixed one: a scratched CLIPINF
-                    // sector (DiscRead), a missing `.clpi` (UdfNotFound) and a
-                    // malformed one (ClpiParse) are different populations, and
-                    // flattening them would send anyone triaging the first
-                    // after the third.
+                    // The REAL code, not a fixed one: DiscRead, UdfNotFound and
+                    // ClpiParse are different populations, and flattening them
+                    // would send anyone triaging the first after the third.
                     tracing::warn!(
                         target: "freemkv::disc",
                         playlist = ?filename,
@@ -182,12 +163,9 @@ impl Disc {
             };
             let pkt_count: u32 = clip_info.source_packet_count;
 
-            // The clip is marked seen only after its .clpi parses. That
-            // ordering used to matter because a transient failure on the first
-            // PlayItem referencing a clip must not permanently suppress its
-            // extents/size for a later PlayItem referencing the same clip;
-            // a failure now drops the whole title, so the ordering is kept
-            // simply because it is still the correct place for it.
+            // The clip is marked seen only after its .clpi parses. That ordering
+            // used to matter because a transient failure must not permanently
+            // suppress extents for a later PlayItem; kept as still-correct.
             let first_ref = seen_clips.insert(play_item.clip_id.clone());
 
             // Only fetch/push the physical extents and add to the
@@ -195,54 +173,13 @@ impl Disc {
             if first_ref {
                 total_size += pkt_count as u64 * 192;
 
-                // Get stream file extents from UDF allocation descriptors.
-                // Dual-layer discs split files across layers — UDF knows the real layout.
-                //
-                // The clip's stream file is normally `.m2ts`, but AACS 2.1
-                // (FMTS) discs name the main feature `.fmts` and 3D discs
-                // use `.ssif` (see [`CLIP_STREAM_EXTS`]). A normal `.m2ts`
-                // clip is unchanged — the fallback only runs when `.m2ts`
-                // is absent, which is exactly when `file_extents` errors.
-                // 3D discs interleave the left (base) and right (MVC
-                // dependent) views in STREAM/SSIF/<clip>.ssif — note the
-                // SSIF/ subdir. Prefer it when present: the SSIF is one
-                // transport stream carrying BOTH eyes on distinct PIDs,
-                // so muxing it captures the full 3D. 2D clips fall back to
-                // the base .m2ts / .fmts as before.
+                // Get stream file extents from UDF allocation descriptors (dual-
+                // layer discs split files across layers). Normally `.m2ts`; AACS 2.1
+                // uses `.fmts`, 3D interleaves both eyes in STREAM/SSIF/<clip>.ssif.
                 let ssif = format!("/BDMV/STREAM/SSIF/{}.ssif", play_item.clip_id);
-                // A clip stream that carries an unrecorded (never-written)
-                // extent cannot be turned into a truthful read plan — see
-                // `UdfFs::file_extents`. Track it separately from an
-                // ordinary "file absent" error: absence is what the
-                // extension fallback exists for, whereas a hole means the
-                // bytes this title needs do not exist on the disc.
-                //
-                // ABSENCE is the only benign failure. A missing `.ssif` is
-                // the ordinary case (every 2D disc), and the extension
-                // fallback below exists precisely for it. Every OTHER
-                // error means the bytes this title needs could not be
-                // resolved: a scratched sector under the clip's ICB
-                // (DiscRead), an allocation-descriptor chain that never
-                // terminated (UdfAdChainTooLong), a file whose data is
-                // embedded rather than extent-mapped (UdfEmbeddedData).
-                // Those used to fall through to the not-found path, so the
-                // clip contributed zero extents while `total_size` and the
-                // play-item timing still counted it — a title advertising
-                // its full runtime with a piece silently missing, and no
-                // log line anywhere.
-                //
-                // `Halted` is NOT a disc defect and must not be treated as
-                // one either. It is the operator cancelling: once the flag is
-                // set, EVERY drive command returns it, so classifying it here
-                // would drop each remaining playlist in turn and hand back a
-                // truncated title list at success — the same shape this
-                // refusal exists to prevent, wearing a cancel. It used to be
-                // merely EXEMPTED (neither classified nor propagated, because
-                // this function returned `Option`); exempting it is no longer
-                // enough now that there is a channel. A cancel landing on
-                // `file_extents` would otherwise return a title with this
-                // clip's bytes silently missing — the flagship defect shape,
-                // wearing a cancel. It is propagated below instead.
+                // ABSENCE (`UdfNotFound`) is the only benign failure — the fallback
+                // exists for it. DiscRead/UdfAdChainTooLong/UdfEmbeddedData mean
+                // bytes are unresolved; `Halted` is the operator cancelling, propagated.
                 let mut unresolved: Option<u16> = None;
                 let mut halted = false;
                 let mut note = |e: &Error| {
@@ -271,26 +208,19 @@ impl Disc {
                         })
                     }
                 };
-                // Propagate the cancel BEFORE the classification below: a
-                // halted `file_extents` resolves nothing, so the title would
-                // otherwise be dropped (or, with a partial resolve, emitted
-                // short) and the scan would carry on as if the disc were at
-                // fault.
+                // Propagate the cancel BEFORE the classification below, or the
+                // title is dropped (or emitted short) and the scan carries on
+                // as if the disc were at fault.
                 if halted {
                     return Err(Error::Halted);
                 }
-                // Nothing resolved AND a hole was the reason: drop the
-                // whole title. Letting the clip contribute no extents
-                // (the ordinary not-found path) would emit a title whose
-                // feed is silently missing this clip's runtime while its
-                // durations, spans and size still count it — data loss
-                // wearing the shape of a normal rip.
+                // Nothing resolved AND a hole was the reason: drop the whole
+                // title, or the clip contributes no extents while durations/size
+                // still count it — data loss wearing the shape of a normal rip.
                 match (&file_exts, unresolved) {
                     (None, Some(code)) => {
-                        // The REAL code, not a fixed one. A scratched sector
-                        // (E6000) and an over-long AD chain (E6016) logged as
-                        // E6017 would send anyone triaging them after authoring
-                        // holes and hide the population that actually exists.
+                        // The REAL code, not a fixed one: e.g. E6000 vs E6016
+                        // logged as E6017 would hide the population that exists.
                         tracing::warn!(
                             target: "freemkv::disc",
                             playlist = ?filename,
@@ -299,32 +229,9 @@ impl Disc {
                         );
                         return Ok(None);
                     }
-                    // A non-absence failure that the FALLBACK then papered
-                    // over. `unresolved` was recorded and then thrown away:
-                    // the `if let (None, Some(code))` above is the only reader
-                    // of it, so when `/BDMV/STREAM/SSIF/<clip>.ssif` failed
-                    // with `DiscRead` / `UdfAdChainTooLong` / `UdfEmbeddedData`
-                    // but the `.m2ts` beside it resolved, the code was dropped
-                    // on the floor. The title then shipped BASE-VIEW 2D off a
-                    // disc that carries 3D, at rc=0, with not one log line —
-                    // the operator gets a rip that looks complete and is
-                    // missing the dependent view, and there is nothing in the
-                    // journal to explain it or to distinguish it from a disc
-                    // that was only ever 2D.
-                    //
-                    // This site's own doctrine, three paragraphs up, is
-                    // "ABSENCE is the only benign failure" — `note()` already
-                    // filters `UdfNotFound` out, so anything left in
-                    // `unresolved` is by construction NOT benign. Reaching
-                    // here means it was silently tolerated anyway.
-                    //
-                    // It is LOGGED, not refused. The fallback genuinely
-                    // produced a truthful read plan for the base view, so the
-                    // title is complete as 2D; dropping it would trade a
-                    // degraded rip for no rip, which is the worse of the two
-                    // and is not what the refusal above is for. The line
-                    // carries the error's OWN code for the same reason as
-                    // every other site in this file.
+                    // A non-absence failure the FALLBACK papered over: `.ssif` failed
+                    // non-benignly but `.m2ts` resolved. LOGGED, not refused — the
+                    // fallback IS a truthful 2D read plan; dropping trades it for none.
                     (Some(_), Some(code)) => {
                         tracing::warn!(
                             target: "freemkv::disc",
@@ -337,32 +244,9 @@ impl Disc {
                     }
                     _ => {}
                 }
-                // KNOWN GAP, deliberately left open: `file_extents` can also
-                // return `Ok(vec![])`, or a vector every entry of which the
-                // `sectors > 0 && lba > 0` filter below discards (zero-length
-                // placeholder ADs — see `UdfFs::file_extents`). That clip then
-                // contributes no extents and no span while `total_size` and
-                // the play-item timing still count it: the same shape the
-                // refusal above exists to prevent, reached by a different
-                // route. It is NOT closed with a post-loop "every unique
-                // clip_id must appear in `spans`" invariant because it is not
-                // settled that an empty-but-Ok resolve is always a defect
-                // rather than a legitimate healthy-disc state, and dropping
-                // healthy titles is a worse failure than the residual gap.
-                // Recorded here so the next audit finds the decision instead
-                // of re-deriving it.
-                //
-                // ASYMMETRY, DELIBERATE: `disc::hddvd` CLOSES this same hole.
-                // Two things differ there. It already keeps an `unusable` set,
-                // so refusing costs nothing new (here it would mean inventing
-                // a post-loop "every clip_id must appear in `spans`"
-                // invariant). And the consequence is worse: an HD-DVD feature
-                // is COMPOSED from parts, so a missing part is spliced out of
-                // a title that keeps claiming the full runtime, whereas here
-                // the clip is one PlayItem of an otherwise whole title. Same
-                // hole, different price — see the long note at the
-                // `extents.is_empty()` branch in `hddvd.rs`. If BD ever grows
-                // an equivalent set, revisit this together with that one.
+                // KNOWN GAP, deliberately left open: an empty-but-Ok `file_extents`
+                // leaves the clip with no extents while size/timing still count it —
+                // not closed since it's unclear that's always a defect (see hddvd.rs).
                 if let Some(file_exts) = file_exts {
                     let span_start = feed_pos;
                     for (lba, sectors) in file_exts {
@@ -423,21 +307,13 @@ impl Disc {
                         // not special-cased here.
                         display_aspect: None,
                         secondary: s.secondary,
-                        // No user-facing English in the library (numeric-code
-                        // rule): the Dolby Vision enhancement layer is signalled
-                        // structurally (secondary video + DolbyVision hdr) and
-                        // the CLI/UI render the localized descriptor. `label`
-                        // stays empty for disc video streams.
+                        // No user-facing English (numeric-code rule): Dolby Vision
+                        // is signalled structurally (secondary + DolbyVision hdr);
+                        // `label` stays empty for disc video streams.
                         label: String::new(),
-                        // TODO(spec): for 1080i HEVC/H.264/VC-1 titles, surface
-                        // the measured field order (H.264/HEVC pic_struct, VC-1
-                        // pulldown) from the codec parser instead of the TFF
-                        // fallback; needs the parser→title channel (see dvd.rs).
-                        // TODO(spec): prefer the HEVC/H.264 VUI colour_description
-                        // (measured CICP) over this MPLS playlist-nibble guess
-                        // once the parser surfaces it through the output title.
-                        // `None` keeps the enum fallback. (HDR MaxCLL/Mastering
-                        // metadata is a separate task and intentionally not here.)
+                        // TODO(spec): surface measured field order instead of the TFF
+                        // fallback (needs a parser→title channel, see dvd.rs); prefer
+                        // measured VUI CICP over this MPLS nibble guess once surfaced.
                         measured_cicp: None,
                     })),
                     2 | 5 => {
@@ -487,22 +363,9 @@ impl Disc {
             })
             .collect();
 
-        // 3D: add the MVC dependent (right-eye) video stream. The base STN table
-        // lists only the left-eye video; the dependent view is a second video
-        // PID (stream_type 0x20) carried in the SSIF. The on-disc PAT/PMT are
-        // AACS-encrypted (unreadable pre-key) and the base STN omits the
-        // dependent view (it lives in the MPLS STN_table_SS), so we use the
-        // BD-3D PID convention: dependent = base-view video PID + 1
-        // (e.g. 0x1011 -> 0x1012). Reading the SSIF (above) provides its packets.
-        //
-        // Limitation: `is_3d` latches per PLAYLIST, not per clip. A playlist that
-        // mixed a 3D clip (has an SSIF) with a 2D clip (no SSIF) would tag the
-        // whole title 3D; the 2D clip's frames then mux as plain Blocks (no
-        // dependent PID → no BlockAdditional) under a track that still advertises
-        // the mvcC mapping. That output is valid (per-frame BlockAdditional is
-        // optional) but over-claims 3D for those frames. Real 3D main-feature
-        // playlists are single-clip or uniformly 3D, so this is not exercised;
-        // per-clip 3D would need per-clip stream sets (a larger change).
+        // 3D: add the MVC dependent (right-eye) stream, PID = base PID + 1 (base
+        // STN omits it; lives in MPLS STN_table_SS). `is_3d` latches per
+        // PLAYLIST, so a mixed 3D/2D playlist over-claims 3D for 2D frames.
         if is_3d
             && let Some(base) = streams.iter().find_map(|s| match s {
                 Stream::Video(v) => Some(v.clone()),
@@ -523,16 +386,9 @@ impl Disc {
             }
         }
 
-        // Convert marks to chapters. mark_type == 1 is an entry-mark
-        // (chapter); type 2 is a link point and type 0 is reserved, so
-        // neither is a chapter.
-        //
-        // Each mark's timestamp is in the timebase of the PlayItem it
-        // references (play_item_ref). The chapter's position on the
-        // muxed timeline is the summed duration of every preceding
-        // PlayItem plus the mark's offset within its own PlayItem. Using
-        // play_items[0].in_time for every mark would misplace chapters in
-        // multi-PlayItem playlists.
+        // Convert marks to chapters: mark_type 1 is an entry-mark; 2/0 aren't.
+        // Each mark's timestamp is in its own PlayItem's timebase, so position
+        // sums preceding durations plus offset (not play_items[0].in_time).
         let chapters: Vec<Chapter> = parsed
             .marks
             .iter()
@@ -632,11 +488,8 @@ impl Disc {
 mod tests {
     use super::*;
     use crate::udf::fixture::*;
-    // ---------------------------------------------------------------
-    // MPLS builder (BD-ROM PlayList spec). Mirrors the layout the
-    // `mpls::parse` consumer reads (header@0, PlayList@playlist_start,
-    // PlayListMark@mark_start). Offsets cited against mpls.rs.
-    // ---------------------------------------------------------------
+    // MPLS builder (BD-ROM PlayList spec). Mirrors the layout `mpls::parse`
+    // reads (header@0, PlayList@playlist_start, PlayListMark@mark_start).
 
     struct PiSpec {
         clip_id: [u8; 5],
@@ -771,11 +624,8 @@ mod tests {
         buf
     }
 
-    // ---------------------------------------------------------------
     // CLPI builder. `clpi::parse` reads "HDMV" magic, prog_info_start@12,
-    // cpi_start@16, source_packet_count@56. Zeroing prog_info/cpi starts
-    // disables those sections cleanly.
-    // ---------------------------------------------------------------
+    // cpi_start@16, source_packet_count@56. Zeroing prog_info/cpi disables them.
 
     fn build_clpi(source_packet_count: u32) -> Vec<u8> {
         let mut d = vec![0u8; 60];
@@ -857,9 +707,8 @@ mod tests {
         );
     }
 
-    /// Build a full BDMV tree with one STREAM/.m2ts (Long-AD ICB) and one
-    /// CLPINF/.clpi, returning the navigable UdfFs plus a populated disc.
-    /// This is the canonical 0.31.0 extent-assembly fixture.
+    /// Build the minimal fixture: an empty `BDMV/` directory (no STREAM,
+    /// no CLPINF), returning the navigable UdfFs plus a populated disc.
     fn make_min_fs(disc: &mut MemDisc) -> udf::UdfFs {
         // Empty BDMV/PLAYLIST so directory navigation in parse_playlist's
         // clip lookups still works even when no clip files exist.
@@ -1363,17 +1212,9 @@ mod tests {
             };
             build_udf_skeleton(&mut disc, 10);
             lay_dir(&mut disc, &root);
-            // Rewrite the .m2ts ICB (laid at PART_START + 100 by `lay_dir`)
-            // with a two-descriptor short-AD list:
-            //   AD0: ECMA-167 4/14.14.1.1 type 1 (allocated, NOT recorded),
-            //        length 0, at LBA 4999 — a zero-length descriptor that
-            //        SURVIVES `read_icb_extents` (only a zero-length TYPE 0
-            //        descriptor is the AD-list terminator), so it reaches
-            //        `file_extents` as an extent of div_ceil(0, 2048) = 0
-            //        sectors. This is the shape a crafted disc uses to put a
-            //        readable-looking but empty range into a title's extent
-            //        list.
-            //   AD1: type 0, 4096 bytes at LBA 5000 — the real content.
+            // Rewrite the .m2ts ICB with a two-descriptor short-AD list: AD0 is
+            // a type-1 (allocated, not recorded) zero-length descriptor at LBA
+            // 4999 that survives `read_icb_extents`; AD1 is the real content.
             let mut icb = build_file_icb(4096, 5000, false);
             icb[212..216].copy_from_slice(&16u32.to_le_bytes()); // l_ad: two short ADs
             icb[216..220].copy_from_slice(&0x4000_0800u32.to_le_bytes()); // type 1, 2048 bytes
@@ -1384,9 +1225,8 @@ mod tests {
             udf::read_filesystem(&mut disc).expect("fs")
         };
         // The fixture must really carry the unrecorded descriptor, or the
-        // behaviour under test is never reached. `file_extents_addressing`
-        // shows what is there: the hole in its byte-space position, followed
-        // by the real content.
+        // behaviour under test is never reached: the hole's byte-space position,
+        // then the real content.
         assert_eq!(
             udf.file_extents_addressing(&mut disc, "/BDMV/STREAM/00001.m2ts")
                 .expect("extents"),
@@ -1467,10 +1307,9 @@ mod tests {
             };
             build_udf_skeleton(&mut disc, 10);
             lay_dir(&mut disc, &root);
-            // Corrupt ONLY the descriptor tag, leaving a structurally valid
-            // ICB behind it. That is what an unreadable/garbled sector looks
-            // like to the parser, and it is deliberately NOT an unrecorded
-            // extent — the point is the error class the old code ignored.
+            // Corrupt ONLY the descriptor tag, leaving a structurally valid ICB
+            // behind it: an unreadable/garbled sector, deliberately NOT an
+            // unrecorded extent — the point is the error class the old code ignored.
             let mut icb = build_file_icb(4096, 5000, false);
             icb[0..2].copy_from_slice(&999u16.to_le_bytes());
             disc.put_bytes(PART_START + 100, &icb);
@@ -2561,10 +2400,9 @@ mod tests {
             &[],
             &[],
         );
-        // ONE sector is cancelled: the .m2ts ICB (metadata LBA 100), which is
-        // precisely and only where `file_extents` looks. The .clpi (ICB 102,
-        // data 8000) still reads, so the clip is sized and the earlier
-        // CLIPINF arm is not the thing under test here.
+        // ONE sector is cancelled: the .m2ts ICB (LBA 100), exactly where
+        // `file_extents` looks. The .clpi still reads, so the earlier CLIPINF
+        // arm is not the thing under test here.
         let mut reader = HaltingReader {
             inner: &mut disc,
             halt_range: PART_START + 100..PART_START + 101,

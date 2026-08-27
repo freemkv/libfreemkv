@@ -294,11 +294,9 @@ fn fvi_sink_indexes_real_mpeg2_pipeline_output() {
         vec![0, 3],
         "stamped src sectors must reach the .fvi in arrival order; got {src_sectors:?}"
     );
-    // Per FVI_FORMAT.md §9, `src.byte` is the offset of the AU's first byte
-    // WITHIN its 2048-byte `src.sector`, so it is always < 2048. The two
-    // stamped sources sit 14 bytes into their sector (just past the pack
-    // header), so the within-sector byte is exact (14) — provenance is
-    // byte-exact, carried unchanged from demux.
+    // Per FVI_FORMAT.md §9, `src.byte` is the AU's offset WITHIN its 2048-byte
+    // `src.sector` (always < 2048). These sources sit 14 bytes into their
+    // sector (past the pack header), so byte must be exactly 14.
     for r in &records {
         if let Some(byte) = r["src"]["byte"].as_u64() {
             assert!(

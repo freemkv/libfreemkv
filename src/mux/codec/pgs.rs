@@ -18,17 +18,13 @@
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 const SEGMENT_PCS: u8 = 0x16;
-// Upper bound on a pending display set's accumulated bytes. Real PGS
-// display sets are small (a 1080p RLE bitmap plus palette is well under
-// 1 MB); a stream that keeps appending non-PCS segments without ever
-// emitting a PCS is malformed. Cap accumulation to bound memory and
-// drop further appends until the next PCS resyncs the parser. Mirrors
-// the MAX_*_BYTES / MAX_*_BUF caps in the DTS and AC-3 parsers.
+// Upper bound on a pending display set's bytes (real sets are well under 1 MB).
+// Caps a malformed stream that appends non-PCS segments forever without a PCS,
+// dropping further appends until the next PCS resyncs — mirrors DTS/AC-3 caps.
 const MAX_PGS_PENDING_BYTES: usize = 4 * 1024 * 1024;
-// Offset within the PES payload at which number_of_composition_objects
-// lives in a PCS: 3-byte segment header + 10 bytes of PCS fields
-// (video_w/h, frame_rate, comp_num, comp_state, palette_update,
-// palette_id_ref) = 13.
+// Offset of number_of_composition_objects in a PCS: 3-byte segment header +
+// 10 bytes of PCS fields (video_w/h, frame_rate, comp_num, comp_state,
+// palette_update, palette_id_ref) = 13.
 const PCS_NUM_OBJECTS_OFFSET: usize = 13;
 // Offset of the first composition_object's flags byte within a PCS PES payload:
 // PCS header(13) + number_of_composition_objects(1) + object_id_ref(2) +
@@ -259,20 +255,16 @@ impl CodecParser for PgsParser {
         if pes.data.is_empty() {
             return Vec::new();
         }
-        // Keep PTS as Option: a PCS with no PTS has an UNKNOWN start/clear time.
-        // Collapsing it to a 0 sentinel produces a frame with a wrong start time
-        // and an absurd duration (the full elapsed time of the disc). PGS PCS
-        // packets carry a PTS on well-formed BD streams, so a missing PTS is a
-        // malformed-stream path that we skip cleanly rather than corrupt.
+        // Keep PTS as Option: collapsing a missing PTS to 0 gives a wrong start
+        // and an absurd duration (full disc runtime). Well-formed BD PCS packets
+        // always carry a PTS, so a missing one is a malformed-stream path we skip.
         let pts = pes.pts.map(pts_to_ns);
 
         let is_pcs = pes.data[0] == SEGMENT_PCS;
 
-        // A PCS too short to carry number_of_composition_objects is malformed.
-        // Don't let it fall through to the non-PCS arm (where it would pollute
-        // the pending display set or pass through as a lone frame): close any
-        // pending set undurated (mirroring the no-PTS display path) and drop
-        // the truncated header so the parser resyncs on the next PCS.
+        // A PCS too short for number_of_composition_objects is malformed. Don't
+        // let it fall to the non-PCS arm (would pollute the pending set): close
+        // any pending set undurated and drop the header to resync on next PCS.
         if is_pcs && pes.data.len() <= PCS_NUM_OBJECTS_OFFSET {
             return self
                 .pending
@@ -299,10 +291,9 @@ impl CodecParser for PgsParser {
 
         let mut out = Vec::new();
         match pcs_num_objects {
-            // Clear/empty PCS — closes any pending display. Drop the
-            // clear segment itself; BlockDuration covers the screen
-            // wipe. A clear PCS with no PTS can't time the duration, so
-            // emit the pending set with no duration (it lingers to EOF).
+            // Clear/empty PCS closes any pending display; drop the segment
+            // itself (BlockDuration covers the wipe). No PTS means no
+            // duration, so the pending set is emitted lingering to EOF.
             Some(0) => {
                 let frame = match pts {
                     Some(end) => self.emit_pending(end),
@@ -377,9 +368,8 @@ impl CodecParser for PgsParser {
                     });
                 }
                 // No pending set AND no PTS: drop it. Emitting at pts_ns=0 would
-                // place a stray bitmap at 00:00:00.000 with no timing reference;
-                // the no-PTS PCS arms above avoid the 0 sentinel for the same
-                // reason.
+                // place a stray bitmap at 00:00:00.000 with no timing reference
+                // — same reason the no-PTS PCS arms above avoid the 0 sentinel.
             }
         }
 
@@ -387,13 +377,9 @@ impl CodecParser for PgsParser {
     }
 
     fn flush(&mut self) -> Vec<Frame> {
-        // A display set is only emitted when the *next* PCS arrives
-        // (either an empty clear PCS or a replacing display PCS). At
-        // end-of-stream there is no follower, so without this the last
-        // subtitle of every PGS track would be silently dropped. Emit
-        // the pending set with no duration — the trailing block lingers
-        // until end of file, which is exactly the desired behavior for
-        // the final on-screen subtitle (see the module doc).
+        // A display set is only emitted when the next PCS arrives; at EOS there
+        // is no follower, so without this the last subtitle would be silently
+        // dropped. Emit it with no duration — it lingers to EOF (see module doc).
         match self.pending.take() {
             Some((facts, data)) => vec![Frame {
                 discontinuity: false,
@@ -600,10 +586,9 @@ mod tests {
 
     #[test]
     fn display_pcs_without_pts_is_not_stored_with_zero_start() {
-        // A display PCS with no PTS has an unknown start time. It must NOT be
-        // stored with a 0 sentinel — otherwise a later clear PCS at real PTS T
-        // would emit a frame with pts_ns=0 and duration_ns=T (hours of ns for a
-        // mid-disc subtitle). The malformed display PCS is skipped instead.
+        // A display PCS with no PTS has an unknown start time; must NOT store it
+        // with a 0 sentinel, or a later clear PCS at real PTS T would emit
+        // pts_ns=0, duration_ns=T. The malformed display PCS is skipped instead.
         let mut parser = PgsParser::new();
         let frames = parser.parse(&make_pes(pcs_bytes(1), None));
         assert!(frames.is_empty(), "no-PTS display PCS emits nothing");

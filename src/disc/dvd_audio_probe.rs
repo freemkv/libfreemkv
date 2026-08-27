@@ -75,11 +75,9 @@ pub fn probe_ac3_substream_channels(ps_bytes: &[u8]) -> BTreeMap<u8, u8> {
         if !(0x80..=0x87).contains(&sub) {
             continue;
         }
-        // The PS demux strips the 4-byte AC-3 sub-header but does not align to a
-        // frame. Walk EVERY 0x0B77 sync in this sub-stream's payload, decode
-        // each frame's channel count, and keep the largest — the sub-stream's
-        // real (main-mix) channel capability. See the doc comment above for why
-        // the first frame alone is unreliable.
+        // The PS demux strips the AC-3 sub-header but doesn't align to a frame, so
+        // walk every 0x0B77 sync in the payload and keep the largest decoded
+        // channel count — the sub-stream's real main-mix capability (see doc above).
         if let Some(ch) = max_substream_channels(&p.data) {
             let slot = found.entry(sub).or_insert(0);
             *slot = (*slot).max(ch);
@@ -202,7 +200,7 @@ pub fn remap_audio_pids(streams: &mut [Stream], probed: &BTreeMap<u8, u8>) -> us
 ///
 /// `reader` MUST yield PLAINTEXT VOB bytes (i.e. a `DecryptingSectorSource` on a
 /// CSS disc) — probing scrambled sectors yields no AC-3 syncs and is a safe
-/// no-op. Returns the number of audio streams whose PID changed.
+/// no-op. Remaps `title`'s AC-3 streams in place; returns nothing.
 pub fn probe_and_remap<S: SectorSource + ?Sized>(
     reader: &mut S,
     title: &mut crate::disc::DiscTitle,
@@ -500,12 +498,9 @@ mod tests {
     #[test]
     fn max_substream_channels_unmappable_size_steps_forward_by_two() {
         let mut real = ac3_frame(2, false);
-        // Overwrite the (unchecked) CRC bytes of the real frame — these double
-        // as byte4/byte5 of the bogus header 2 bytes earlier, at absolute
-        // offset 4: byte4 = 0xC0 (fscod=3 reserved -> ac3_frame_size == 0,
-        // unmappable), byte5 = 0xF8 (bsid=31 >= 11 -> acmod_channels == None,
-        // so the bogus header itself never contributes a spurious channel
-        // count).
+        // Overwrite the real frame's (unchecked) CRC bytes, which double as byte4/5
+        // of the bogus header at offset 4: 0xC0 (fscod=3 -> ac3_frame_size == 0,
+        // unmappable) and 0xF8 (bsid=31 -> acmod_channels == None, no spurious count).
         real[2] = 0xC0;
         real[3] = 0xF8;
         let mut data = vec![0xAA, 0xAA, 0xAA, 0xAA]; // offsets 0..4, no sync

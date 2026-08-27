@@ -277,24 +277,9 @@ fn normalize_language(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-// ── Phase 2 (design only, not implemented here) ─────────────────────────────
-//
-// Newer Fox discs (later franchise sequels, surveyed as 11 discs currently mis-owned by
-// the deluxe stub) ship NO loose `dcx.xml`. They wrap the same per-stream data
-// inside `com/foxbd` BD-J `.class` bytecode. The follow-on parser would reuse
-// `super::class_reader` the way `dbp`/`deluxe` already do:
-//
-//   * `detect` already recognises the `com/foxbd/` central-directory prefix
-//     (above), so Phase 2 only adds a parse path.
-//   * Iterate the jar's classes via `super::jar::for_each_class` and read the
-//     constant pool (`ClassFile`), which holds the authored strings verbatim:
-//       - `FeatureIntroPlaylist.play: PLAYLIST ID:` → the feature playlist id
-//         (→ the same `FeaturePlaylistHint` the dcx path should wire up),
-//       - `RNIB` → a descriptive/narration audio track (→ Descriptive),
-//       - `primaryAudioId=` and the parallel subtitle-id constants → the STN
-//         slot numbering, mirroring the `id="NN"` mapping here.
-//   * Emit the identical `StreamLabel` shape at High confidence so the two Fox
-//     forms are indistinguishable downstream.
+// Phase 2 (design only, not implemented): newer Fox discs ship no loose `dcx.xml`,
+// wrapping the same per-stream data in `com/foxbd` BD-J `.class` bytecode instead. A
+// follow-on parser would reuse `super::class_reader`/`jar` (as `dbp`/`deluxe` do).
 
 #[cfg(test)]
 mod tests {

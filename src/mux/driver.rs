@@ -217,7 +217,7 @@ pub struct MuxOptions {
 ///
 /// `Send + Sync + 'static` because [`mux_stream`] takes the handle as an
 /// [`Arc<dyn MuxEvents>`] and clones it into the constructors' `'static`
-/// [`EventFn`] (via [`reader_event_fn`]) so the reader-side events fire from the
+/// [`EventFn`](crate::sector::prefetched::EventFn) (via [`reader_event_fn`]) so the reader-side events fire from the
 /// highway's producer thread / the live `DiscStream`'s read loop. The driver
 /// fires [`Self::on_output_opened`] and the write-side [`Self::on_write_progress`]
 /// from the driving thread; the reader-side events
@@ -310,30 +310,18 @@ pub fn mux_stream(
     halt: &Halt,
     events: std::sync::Arc<dyn MuxEvents>,
 ) -> std::io::Result<MuxOutcome> {
-    // Construct the source stream. The file/ISO path calls the untouched
-    // `build_iso_pipeline` highway (zero added copies); the live path builds a
-    // `DiscStream`; a URL source goes through `input()`. The reader-side
-    // constructors take a `'static` `EventFn`; we clone the `Arc<dyn MuxEvents>`
-    // into one (`reader_event_fn`) so the highway's producer thread — and the
-    // live `DiscStream`'s read loop — forward `BytesRead`/`SectorSkipped`/
-    // `BatchSizeChanged`/`ReadError` back to the consumer's handle.
-    //
-    // Each arm also derives the run's PROVENANCE (`SourceInfo`) — the facts a
-    // `fvi://` destination records in its header (`docs/FVI_FORMAT.md` §6.2).
-    // `output()` has no access to the source, so the driver is the only place
-    // that can supply it honestly; a member the arm genuinely cannot reach is
-    // left at its default rather than guessed (the sink omits the empty ones).
+    // Construct the source stream (ISO/live/URL) — reader constructors need a
+    // `'static` EventFn, so we clone `Arc<dyn MuxEvents>` into `reader_event_fn`.
+    // Each arm also derives SourceInfo since `output()` has no access to source.
     let (stream, playlist_name, mut source): (Box<dyn Stream>, Option<String>, SourceInfo) =
         match input_src {
-            // The Url path builds its demux INSIDE `input()`, which prunes to the
-            // selected streams via `InputOptions.selection` (which the caller sets).
-            // Note: `MuxOptions.selection` does NOT apply here — that's the File/
-            // Session arms' field; a Url-source caller must set `InputOptions.selection`.
+            // The Url path builds its demux INSIDE `input()`, pruned via
+            // `InputOptions.selection`. `MuxOptions.selection` does NOT apply
+            // here — that's the File/Session arms' field.
             MuxInput::Url { url, opts: in_opts } => {
-                // Provenance: the source URL verbatim, its scheme's medium, and the
-                // title `input()` will open (`None` selects title 0, per its doc).
-                // `playlist` is filled in below from the opened stream's scanned
-                // title — it is not known until the scan runs.
+                // Provenance: source URL verbatim, scheme's medium, and the title
+                // `input()` will open. `playlist` fills in below from the opened
+                // stream's scanned title — not known until the scan runs.
                 let source = SourceInfo {
                     medium: url_medium(&parse_url(url)),
                     path: url.to_string(),
@@ -354,21 +342,16 @@ pub fn mux_stream(
                 keys,
                 key_fetch,
             } => {
-                // Prune to the selected audio/subtitle streams BEFORE the highway
-                // builds its demux state from `title.streams` (and before
-                // `build_iso_pipeline`'s `probe_and_remap` may rewrite DVD AC-3
-                // PIDs). Video is always kept; a no-op for the default All/All.
+                // Prune to selected audio/subtitle streams BEFORE the highway
+                // builds demux state (and before probe_and_remap rewrites DVD
+                // AC-3 PIDs). Video is always kept; no-op for default All/All.
                 let mut title = title;
                 opts.selection
                     .apply(&mut title)
                     .map_err(std::io::Error::from)?;
-                // Provenance: the staged image, in the same `iso://` URL form the
-                // `Url` arm records, plus the title's playlist. The 0-based TITLE
-                // INDEX is genuinely NOT reachable here — `MuxInput::Iso` carries an
-                // already-scanned `DiscTitle`, which has no index, and the caller's
-                // position in `disc.titles` is not passed. It stays 0 rather than
-                // being guessed; adding it would be an additive field on the public
-                // `MuxInput::Iso` variant.
+                // Provenance: staged image as an `iso://` URL, plus playlist. Title
+                // INDEX is NOT reachable here — `MuxInput::Iso` carries an already-
+                // scanned `DiscTitle` with no index, so it stays 0 rather than guessed.
                 let source = SourceInfo {
                     medium: Medium::Iso,
                     path: format!("iso://{}", path.display()),
@@ -432,11 +415,9 @@ pub fn mux_stream(
                         source,
                     )
                 };
-                // Prune to the selected streams before `DiscStream::new` builds its
-                // demux tables from `title.streams` (and before its inline
-                // `probe_and_remap`). Only touches the stream list, so the
-                // ciphertext sampling in `resolve_inline_base_map` (keyed on extents)
-                // is unaffected. No-op for the default All/All.
+                // Prune to selected streams before `DiscStream::new` builds demux
+                // tables (and before inline probe_and_remap). Only touches the
+                // stream list; ciphertext sampling in resolve_inline_base_map unaffected.
                 opts.selection
                     .apply(&mut title)
                     .map_err(std::io::Error::from)?;
@@ -445,14 +426,9 @@ pub fn mux_stream(
                 let mut reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
                     path: session.device_path().to_string(),
                 })?;
-                // Resolve the AACS key map off the STAGED reader BEFORE it is moved
-                // into `DiscStream::new` (borrow to sample, then move to construct).
-                // Without this the AACS `DecryptingSectorSource` inside the stream has
-                // no map and fails `DecryptFailed` on the first content unit — the
-                // single-pass live-mux decrypt bug. `session.key_fetch()` (retained by
-                // `resolve_keys`) recovers a multi-CPS/orphan/forensic unit the pool is
-                // missing. DVD/clear/`raw` resolve to `None` (CSS self-cracks in
-                // `DiscStream::new`; raw is ciphertext passthrough) — unchanged.
+                // Resolve the AACS key map off the STAGED reader BEFORE it moves into
+                // `DiscStream::new` (borrow to sample, then move). Without this the
+                // AACS reader has no map and fails `DecryptFailed` on the first unit.
                 let base_map = resolve_inline_base_map(
                     &mut *reader,
                     &title,
@@ -491,39 +467,24 @@ pub fn mux_stream(
                 mut keys,
                 key_map,
             } => {
-                // Prune to the selected streams, exactly as the Iso and Session arms
-                // do. Without this a caller's audio/subtitle selection was silently
-                // ignored on the live-drive path while the field's own doc said it was
-                // applied. Only touches the stream list, so the extent-keyed ciphertext
-                // sampling in `resolve_inline_base_map` below is unaffected. No-op for
-                // the default All/All.
+                // Prune to selected streams, exactly as the Iso/Session arms do —
+                // without this, selection was silently ignored on the live-drive
+                // path despite the field's doc saying it was applied.
                 let mut title = title;
                 opts.selection
                     .apply(&mut title)
                     .map_err(std::io::Error::from)?;
-                // Provenance: the medium is certain (a raw physical `SectorSource`),
-                // and the title's playlist is on hand. The device PATH and the title
-                // INDEX are genuinely NOT reachable: `MuxInput::Live` hands over an
-                // opaque `Box<dyn SectorSource>` with no path accessor and an
-                // already-scanned `DiscTitle` with no index. Both stay empty/0 —
-                // the sink omits an empty path rather than inventing one.
+                // Provenance: medium is certain, playlist is on hand. Device PATH
+                // and title INDEX are NOT reachable — `MuxInput::Live` hands an
+                // opaque reader/title with neither, so both stay empty/0.
                 let source = SourceInfo {
                     medium: Medium::Disc,
                     playlist: title.playlist.clone(),
                     ..SourceInfo::default()
                 };
-                // The map installed BEFORE reads begin. Two sources:
-                // - A caller-supplied `key_map` (autorip's FMTS gate resolved the
-                //   forensic per-segment map and passes it here) is used VERBATIM —
-                //   never re-resolved.
-                // - `None` on an AACS disc means a plain (non-FMTS) single/multi-CPS
-                //   disc that the caller did NOT map. Resolve the base map here off the
-                //   live reader, exactly as the `Session` arm and `build_iso_pipeline`
-                //   do — otherwise the AACS `DecryptingSectorSource` has no map and
-                //   fails `DecryptFailed` on the first content unit (the single-pass
-                //   live-mux decrypt bug). Borrow to sample, then move into the stream.
-                // DVD/clear/`raw` → `None` (unchanged: CSS self-cracks in
-                // `DiscStream::new`; raw is ciphertext passthrough).
+                // Map installed BEFORE reads begin: a caller-supplied `key_map`
+                // (autorip's FMTS gate) is used VERBATIM; `None` on AACS resolves
+                // the base map here (else `DecryptFailed` on first unit); DVD/raw → None.
                 let base_map = match key_map {
                     Some(map) => Some(map),
                     None => resolve_inline_base_map(
@@ -536,10 +497,9 @@ pub fn mux_stream(
                         Some(halt),
                     )?,
                 };
-                // INLINE `DiscStream` — the same constructor the `Session` arm uses,
-                // NOT `build_iso_pipeline` (the prefetch highway). The consumer's
-                // adaptive batch-retry lives in `DiscStream::fill_extents`, which the
-                // highway would bypass; the live single-pass path must keep it.
+                // INLINE `DiscStream`, same constructor as the `Session` arm, NOT
+                // `build_iso_pipeline` — the highway would bypass the adaptive
+                // batch-retry that lives in `DiscStream::fill_extents`.
                 let mut stream = crate::mux::DiscStream::new(
                     reader,
                     title,
@@ -552,13 +512,9 @@ pub fn mux_stream(
                 if opts.raw {
                     stream.set_raw();
                 }
-                // Apply the key map BEFORE reads begin — for an FMTS forensic map this
-                // rewrites the extent walk to our-phase units only and installs the map
-                // so each unit decrypts with its mapped key; for a plain single/multi-CPS
-                // base map it installs the per-unit content key. `None` leaves the walk
-                // unchanged (CSS / clear / raw). Single-pass FMTS correctness depends on
-                // this: dropping the forensic map reads the alternate device-group units
-                // and mis-decrypts the forensic segment.
+                // Apply the key map BEFORE reads begin: for FMTS it rewrites the
+                // extent walk to our-phase units and installs the mapped key; `None`
+                // leaves it unchanged. Dropping the map mis-decrypts the segment.
                 if let Some(map) = base_map {
                     stream = stream.with_key_map(map);
                 }
@@ -608,11 +564,11 @@ fn session_mux_keys(disc: &crate::disc::Disc) -> DecryptKeys {
 }
 
 /// Resolve the base AACS key map for an INLINE live-drive mux (the `Session` /
-/// `Live` arms) BEFORE the reader is moved into [`DiscStream::new`] — the
+/// `Live` arms) BEFORE the reader is moved into [`DiscStream::new`](crate::mux::DiscStream::new) — the
 /// counterpart to the map resolution [`build_iso_pipeline`] performs internally
 /// for the file highway.
 ///
-/// Under the map-only decrypt model an AACS [`DecryptingSectorSource`] decrypts
+/// Under the map-only decrypt model an AACS [`DecryptingSectorSource`](crate::sector::decrypting::DecryptingSectorSource) decrypts
 /// NOTHING until a key map is installed: with no map the AACS arm of the decrypt
 /// path fails loud with [`Error::DecryptFailed`] on the first content unit (the
 /// deliberate "a reader built without its map is a bug" guard). Both inline arms
@@ -620,21 +576,21 @@ fn session_mux_keys(disc: &crate::disc::Disc) -> DecryptKeys {
 /// only a caller-supplied forensic FMTS map (`None` for a plain AACS disc) — so
 /// EVERY plain AACS Blu-ray/UHD muxed via the live single-pass path failed
 /// `DecryptFailed` on the first content read. This resolves + returns the map so
-/// the caller can install it via [`DiscStream::with_key_map`].
+/// the caller can install it via [`DiscStream::with_key_map`](crate::mux::DiscStream::with_key_map).
 ///
 /// - AACS keys → resolve (`resolve_mux_key_map`: single-CPS content map,
 ///   multi-CPS per-extent key selection, or FMTS per-segment map) and return
 ///   `Some(map)`. Resolution failure propagates (fail loud), matching the ISO
 ///   path's decrypt gate.
 /// - CSS / clear / `None` → `Ok(None)`: CSS self-cracks per title inside
-///   [`DiscStream::new`], and a genuinely-clear disc needs no map.
+///   [`DiscStream::new`](crate::mux::DiscStream::new), and a genuinely-clear disc needs no map.
 /// - `raw` → `Ok(None)`: ciphertext passthrough, no decrypt step to key.
 ///
 /// The `reader` is borrowed only to SAMPLE ciphertext here (the UDF/FMTS probe
 /// and any multi-CPS unit samples); a single-CPS disc — the overwhelming
 /// majority, including every single-key UHD — resolves its map with NO content
 /// read beyond the one-time UDF filesystem probe. The caller then moves the same
-/// reader into [`DiscStream::new`]; reads are by absolute LBA, so the sampling
+/// reader into [`DiscStream::new`](crate::mux::DiscStream::new); reads are by absolute LBA, so the sampling
 /// leaves no read-position state behind.
 fn resolve_inline_base_map(
     reader: &mut dyn SectorSource,
@@ -648,11 +604,9 @@ fn resolve_inline_base_map(
     if raw || !matches!(keys, DecryptKeys::Aacs { .. }) {
         return Ok(None);
     }
-    // Thread the driver's cancel token into the live-drive key resolution: the
-    // resolve chain samples ciphertext off the LIVE reader (the FMTS probe can do
-    // hundreds of reads, each able to stall to the SCSI recovery timeout), so an
-    // operator `/api/stop` mid-resolution must be honored here — not only once the
-    // read loop starts.
+    // Thread the driver's cancel token into key resolution: the resolve chain
+    // samples ciphertext off the LIVE reader (FMTS can do hundreds of reads,
+    // each able to stall), so `/api/stop` must be honored here too.
     let map = resolve_mux_key_map(reader, title, keys, fetch, format, halt)?;
     Ok(Some(Arc::new(map)))
 }
@@ -721,12 +675,8 @@ fn drive_mux(
     }
 
     // ── chapters:// / json:// short-circuit — BEFORE the header pump/gate ──
-    //
-    // These sinks write their whole file from the scanned title at `output()`
-    // time and consume no PES frames, so they need no codec headers. Running
-    // the header pump/gate first (the CLI's ordering) would false-fail a
-    // metadata export on a title whose video headers never resolve. Do it here
-    // by construction instead.
+    // These sinks write their whole file at `output()` time and consume no PES
+    // frames — running the header gate first could false-fail a metadata export.
     if matches!(
         parse_url(dest_url),
         StreamUrl::Chapters { .. } | StreamUrl::Json { .. }
@@ -745,11 +695,9 @@ fn drive_mux(
         });
     }
 
-    // ── Header pump ──
-    //
-    // Buffer frames until every video track's codec_private has resolved; MKV
-    // can't write a track header without codec init data. The loop breaks on
-    // EOF/None too, so the gate below re-checks.
+    // ── Header pump ── Buffer frames until every video track's codec_private
+    // has resolved; MKV can't write a track header without codec init data.
+    // The loop breaks on EOF/None too, so the gate below re-checks.
     let mut buffered: Vec<PesFrame> = Vec::new();
     let mut buffered_bytes: usize = 0;
     while !stream.headers_ready() {
@@ -767,10 +715,8 @@ fn drive_mux(
         let read = match stream.read() {
             Ok(r) => r,
             // A halt landing DURING a blocking read surfaces as `Error::Halted`
-            // (reads dominate wall-clock, so an operator stop most often lands
-            // here, not at the between-reads check above). A clean stop is not a
-            // failure — yield `completed = false`, matching the finish stage and
-            // the highway path, so the consumer's stop-preserves-staging path runs.
+            // (reads dominate wall-clock, so a stop usually lands here). Not a
+            // failure — yield `completed = false` so stop-preserves-staging runs.
             Err(e) if crate::error::is_halt(&e) => {
                 return Ok(MuxOutcome {
                     completed: false,
@@ -788,17 +734,9 @@ fn drive_mux(
             Some(frame) => {
                 buffered_bytes = buffered_bytes.saturating_add(frame.data.len());
                 buffered.push(frame);
-                // Bounded header buffer: a title whose codec_private never
-                // resolves would otherwise buffer the entire (tens-of-GB)
-                // stream into RAM until OOM. Fail fast instead of swapping the
-                // box to death.
-                //
-                // NOT `Error::MkvInvalid` — that code is what an empty nav/menu
-                // PGC stub yields and `error::is_skippable_title_stub`
-                // classifies it as skippable, so an all-titles rip DROPPED a
-                // title that had produced half a gigabyte of real frames and
-                // then exited reporting success. A cap overflow gets its own
-                // non-skippable code so it can never be mistaken for a stub.
+                // Bounded header buffer: a title whose codec_private never resolves
+                // would otherwise buffer the whole stream into RAM until OOM. NOT
+                // `Error::MkvInvalid` — that's skippable-stub, and this must not be.
                 if buffered_bytes > HEADER_BUFFER_CAP_BYTES {
                     tracing::error!(
                         target: "mux",
@@ -818,18 +756,13 @@ fn drive_mux(
         }
     }
 
-    // ── Header gate ──
-    //
-    // The pump can break on EOF (or a read error re-surfaced as `?`) without
-    // headers ever resolving. Finalising then writes a track header with no
-    // CODEC_PRIVATE — a structurally-invalid MKV the zero-output guard does not
-    // catch. Refuse.
+    // ── Header gate ── The pump can break on EOF without headers resolving.
+    // Finalising then would write a track header with no CODEC_PRIVATE — a
+    // structurally-invalid MKV the zero-output guard does not catch. Refuse.
     if !stream.headers_ready() {
-        // Re-check halt FIRST. On the prefetch-highway path a halt landing while
-        // the pump is blocked in a read can end the stream as `Ok(None)` rather
-        // than `Err(Halted)`, so the loop breaks with headers unresolved through no
-        // fault of the data. Reporting that as MkvInvalid tells the consumer its
-        // disc is malformed and skips the stop-preserves-staging path.
+        // Re-check halt FIRST: on the highway path a halt can end the stream as
+        // `Ok(None)` rather than `Err(Halted)`, breaking the loop with headers
+        // unresolved through no fault of the data — not a malformed disc.
         if halt.is_cancelled() {
             return Ok(MuxOutcome {
                 completed: false,
@@ -869,12 +802,9 @@ fn drive_mux(
     let pipe = Pipeline::spawn_named("freemkv-mux-consumer", WRITE_PIPELINE_DEPTH, sink)
         .map_err(std::io::Error::from)?;
 
-    // ── Frame pump ──
-    // Per-frame send deadline resolved from `MuxOptions.send_deadline` at the
-    // driver entry: a hard bound (autorip) or the effectively-unbounded
-    // [`NO_SEND_DEADLINE`] (CLI interactive path). Either way `send_with_halt`
-    // re-checks the halt token every `POLL_INTERVAL`, so Ctrl-C / `/api/stop`
-    // stays responsive regardless of this value.
+    // ── Frame pump ── Per-frame send deadline is a hard bound (autorip) or
+    // effectively unbounded (CLI). Either way `send_with_halt` re-checks halt
+    // every `POLL_INTERVAL`, so Ctrl-C / `/api/stop` stays responsive.
     let deadline = send_deadline;
     let mut interrupted = false;
 
@@ -885,10 +815,8 @@ fn drive_mux(
             break;
         }
         // Feed write-side progress during the drain exactly as the steady-state
-        // loop below does. The watchdog is fed only from `on_write_progress`;
-        // no `stream.read()` runs here (reads finished in the header pump), so
-        // omitting this leaves the watchdog unfed for the whole header-drain
-        // phase and it can false-escalate on a long/slow drain.
+        // loop below does — the watchdog is fed only from `on_write_progress`,
+        // and no `stream.read()` runs here to do it for us.
         events.on_write_progress(bytes.load(Ordering::Relaxed), total_bytes);
     }
 
@@ -909,30 +837,16 @@ fn drive_mux(
                 }
                 Ok(None) => break,
                 // A halt landing mid-read is a clean operator stop, not a read
-                // failure: drain the consumer and fall through to the
-                // `completed = false` interrupt path, matching the header pump,
-                // the finish stage, and the highway (which returns Ok(None) on halt).
+                // failure: fall through to the `completed = false` interrupt path,
+                // matching the header pump, finish stage, and highway.
                 Err(e) if crate::error::is_halt(&e) => {
                     interrupted = true;
                     break;
                 }
                 Err(e) => {
-                    // Drain + join the consumer so its output file handle is
-                    // released, then report the ROOT cause.
-                    //
-                    // The consumer's result used to be discarded with `let _`. A
-                    // write-side `WriteSink::apply` failure that had ALREADY killed
-                    // the output — the destination volume filling, say — was thrown
-                    // away, and only the read error surfaced: the caller diagnosed a
-                    // damaged disc and retried the rip onto the same full volume
-                    // instead of being told it was out of space. A hard write
-                    // failure precedes and explains the read error here (the
-                    // producer only reaches the next `read()` because its previous
-                    // `send` did not block on a dead consumer), so prefer it.
-                    // Halt/join-timeout are NOT root causes — those are the clean
-                    // operator-stop and wedge paths the finish stage below
-                    // translates to `completed = false` — so the read error still
-                    // wins over them.
+                    // Drain + join the consumer, then report the ROOT cause: a
+                    // write failure (e.g. volume full) precedes and explains the
+                    // read error, so prefer it — except Halt/join-timeout, not root causes.
                     match pipe.finish_with_halt(Some(halt)) {
                         Err(w @ (Error::Halted | Error::PipelineJoinTimeout)) => {
                             tracing::debug!(
@@ -959,12 +873,9 @@ fn drive_mux(
         }
     }
 
-    // ── Finish ──
-    //
-    // Drop the producer side and join the consumer; its `close()` finalises the
-    // container and returns the payload-byte count. On halt/wedge this returns
-    // an error variant; we translate that to `completed = false` rather than
-    // surfacing it as a hard failure (a clean operator stop is not an error).
+    // ── Finish ── Drop the producer, join the consumer; `close()` finalises
+    // the container. On halt/wedge this returns an error variant, translated
+    // to `completed = false` rather than a hard failure.
     let (bytes_written, undelivered_streams, finalize_failed) =
         match pipe.finish_with_halt(Some(halt)) {
             Ok((b, undelivered)) => (b, undelivered, false),
@@ -993,10 +904,9 @@ fn drive_mux(
         });
     }
 
-    // ── Zero-output / NoStreams gate ──
-    //
-    // A natural drain that wrote no streams or not a single payload byte is the
-    // empty/undecryptable-input silent failure — refuse to report it complete.
+    // ── Zero-output / NoStreams gate ── A natural drain that wrote no streams
+    // or not a single payload byte is the empty/undecryptable-input silent
+    // failure — refuse to report it complete.
     if num_streams == 0 || bytes_written == 0 {
         return Err(Error::NoStreams.into());
     }
@@ -1312,11 +1222,9 @@ mod tests {
             None,
         )
         .expect_err("unresolved headers must be refused");
-        // This gate is the GENUINE stub case — the pump ended without any video
-        // track's codec_private resolving, so the title produced no muxable
-        // frames. `MkvInvalid` now means only this (malformed `mkv://` input is
-        // `MkvSourceInvalid`, E9053), and it must stay skippable so an all-titles
-        // rip drops the empty nav/menu PGC and finishes the rest.
+        // This gate is the GENUINE stub case: no video track's codec_private
+        // resolved. `MkvInvalid` now means only this (bad `mkv://` input is
+        // `MkvSourceInvalid`), and must stay skippable for all-titles rips.
         assert!(
             crate::error::is_skippable_title_stub(&err),
             "MkvInvalid is a skippable stub, got {err}"
@@ -1367,11 +1275,9 @@ mod tests {
         assert!(out.output_opened, "the sink was opened before the halt");
     }
 
-    // ── A halt landing mid-read (Err(Halted) from the stream, the common
-    //    operator-stop case since reads dominate wall-clock) is a clean stop,
-    //    NOT a mux failure. Both the frame pump and the header pump must yield
-    //    completed=false. Mutation: propagating the read-arm Err instead of
-    //    mapping Halted → completed=false makes these `.expect` calls panic. ──
+    // ── A halt landing mid-read (Err(Halted), the common operator-stop case)
+    //    is a clean stop, NOT a failure — both pumps must yield completed=false.
+    //    Mutation: propagating the read-arm Err instead of mapping it panics. ──
     #[test]
     fn halt_err_during_frame_read_yields_completed_false() {
         let halt = Halt::new();
@@ -2238,18 +2144,8 @@ mod tests {
     }
 
     // ── Regression A: header-buffer cap fails fast instead of OOM ───────────
-    //
-    // A stream whose headers never resolve but that keeps yielding frames must
-    // be refused once the pre-headers buffer passes `HEADER_BUFFER_CAP_BYTES`,
-    // BEFORE draining the whole (unbounded, OOM-inducing) stream. Frames are
-    // zero-filled `Vec`s (`alloc_zeroed`, lazily paged) so the nominal size is
-    // cheap in RSS. We hand the pump FAR more frames than the cap needs and
-    // assert both that it fails with the same `MkvInvalid` outcome AND that it
-    // stopped EARLY (bounded read count) — the latter is what distinguishes the
-    // capped path from the un-capped one.
-    //
-    // Mutation: removing the cap makes the pump drain all `MANY` frames (reads
-    // == MANY) before failing at the header gate → the `reads_seen` bound fails.
+    // Must refuse once the buffer passes `HEADER_BUFFER_CAP_BYTES`, BEFORE
+    // draining the whole stream — asserted via a bounded read count.
     #[test]
     fn header_buffer_cap_fails_fast_instead_of_oom() {
         use std::sync::atomic::AtomicUsize;
@@ -2282,10 +2178,9 @@ mod tests {
             None,
         )
         .expect_err("over-cap header buffer must fail fast, not OOM");
-        // The cap overflow must carry its OWN code, not `MkvInvalid`: an
-        // all-titles rip asks `is_skippable_title_stub` whether to move on, and
-        // `MkvInvalid` answers "yes, an empty nav/menu stub" — which silently
-        // dropped a title that had just produced 512 MiB of real frames.
+        // The cap overflow must carry its OWN code, not `MkvInvalid`: that code
+        // means "skippable empty stub" and would silently drop a title that
+        // had just produced 512 MiB of real frames.
         assert_eq!(
             err.to_string(),
             format!("E{}: {}", crate::error::E_MUX_HEADER_BUFFER_EXCEEDED, {
@@ -2306,14 +2201,8 @@ mod tests {
     }
 
     // ── Regression B: watchdog fed during the buffered header drain ─────────
-    //
-    // Headers resolve only after K frames are buffered; those K frames are then
-    // flushed to the sink in the drain loop. Every flushed frame must fire
-    // `on_write_progress` (the sole watchdog feed) — with exactly K frames and
-    // no remainder, ALL `on_write_progress` calls come from the drain.
-    //
-    // Mutation: dropping the `events.on_write_progress(...)` call in the drain
-    // loop leaves the count at 0 → this fails.
+    // Headers resolve only after K frames buffer, then flush to the sink.
+    // Every flushed frame must fire `on_write_progress`, the sole watchdog feed.
     #[test]
     fn write_progress_fed_during_header_drain() {
         const K: usize = 6;
@@ -2352,15 +2241,8 @@ mod tests {
     }
 
     // ── Regression C: Session key selection special-cases DVD ───────────────
-    //
-    // `session_mux_keys` is the seam the `MuxInput::Session` arm uses to pick
-    // decrypt keys. A DVD must get `None` (so DiscStream cracks the correct
-    // per-title/per-VTS CSS key); a non-DVD passes `decrypt_keys()` through.
-    // Building a full multi-VTS DiscSession fixture is infeasible in a unit
-    // test, so this asserts the is_dvd→None DECISION at the tightest seam.
-    //
-    // Mutation: reverting to unconditional `disc.decrypt_keys()` returns
-    // `Css{..}` for the DVD case → the `None` assertion fails.
+    // A DVD must get `None` (so DiscStream cracks the correct per-title/VTS
+    // CSS key); a non-DVD passes `decrypt_keys()` through unconditionally.
     fn disc_with_css(format: crate::disc::DiscFormat) -> crate::disc::Disc {
         crate::disc::Disc {
             volume_id: "TEST".into(),
@@ -2399,17 +2281,8 @@ mod tests {
     }
 
     // ── Regression E: send_deadline routing (Some vs None) ──────────────────
-    //
-    // `effective_send_deadline` is the tightest seam of the write-pipeline send
-    // decision. autorip passes `Some(60s)` (bounded, watchdog-backed file mux);
-    // the CLI's interactive stdout/network path passes `None`, which must map to
-    // an effectively-unbounded deadline so a slow-but-alive downstream is never
-    // spuriously reported as an interrupted mux. Ctrl-C stays responsive under
-    // `None` because `send_with_halt` re-checks the halt token every
-    // `POLL_INTERVAL` regardless of the deadline (see `NO_SEND_DEADLINE`).
-    //
-    // Mutation: reverting `None` to a fixed `Duration::from_secs(60)` (the
-    // pre-fix behaviour) makes the None-case assertions fail.
+    // autorip passes `Some(60s)`; CLI passes `None`, which must map to an
+    // unbounded deadline so a slow-but-alive downstream isn't reported interrupted.
     #[test]
     fn effective_send_deadline_routes_some_and_none() {
         // Some(d) → exactly d.

@@ -202,9 +202,8 @@ pub fn parser_for_codec(
 ) -> Box<dyn CodecParser> {
     match codec {
         // `is_dvd_ps` marks a program-stream source (DVD VOB / HD-DVD EVO), whose
-        // video is timestamped only at GOP granularity. On that path the H.264 /
-        // HEVC / VC-1 parsers reconstruct a display-order PTS per frame; on the
-        // BD/UHD transport path (per-frame PTS) they leave timestamps untouched.
+        // video is timestamped only at GOP granularity: H.264/HEVC/VC-1 reconstruct
+        // a display-order PTS per frame there; on BD/UHD (per-frame PTS) they don't.
         Codec::H264 => Box::new(h264::H264Parser::new().with_ps_reorder(is_dvd_ps)),
         Codec::Hevc => Box::new(hevc::HevcParser::new().with_ps_reorder(is_dvd_ps)),
         Codec::Mpeg2 => Box::new(mpeg2::Mpeg2Parser::new()),
@@ -219,12 +218,9 @@ pub fn parser_for_codec(
         Codec::Lpcm if is_dvd_ps => Box::new(lpcm::LpcmParser::new_dvd()),
         Codec::Lpcm => Box::new(lpcm::LpcmParser::new()),
         Codec::DvdSub => Box::new(dvdsub::DvdSubParser::new(codec_data)),
-        // Video codecs with no dedicated parser. There is no frame-boundary
-        // detection here, so a PES carrying multiple access units is emitted as
-        // one oversized block — but marking every frame a keyframe (as the
-        // audio passthrough does) would explode Cues density and mislead
-        // seeking. Use the non-keyframe passthrough and warn that framing is
-        // approximate. Mpeg1/Av1 are real Codec variants without a parser yet.
+        // Video codecs with no dedicated parser (Mpeg1/Av1 are real, just unparsed):
+        // multi-AU PES becomes one oversized block. Use non-keyframe passthrough,
+        // not all-keyframe (would explode Cues density); warn framing is approximate.
         Codec::Mpeg1 | Codec::Av1 => {
             tracing::warn!(
                 target: "mux",
@@ -462,16 +458,9 @@ mod provenance_guard {
         for (name, src) in PARSER_SOURCES {
             let src = &code_only(src);
             for blk in frame_literals(src) {
-                // `PesFrame` in the tests of other modules is not ours; only
-                // codec `Frame` literals are scanned, and a test fixture that
-                // builds a PesPacket with `source: None` is legitimate.
-                // Two spellings, not one. `source: None` is the obvious way to
-                // lose provenance; OMITTING the field entirely is the quiet
-                // one, because `Frame` derives Default, so
-                // `Frame { pts_ns, .. Default::default() }` compiles and
-                // yields `source: None` while containing no such text. A guard
-                // that only knew the first spelling would have watched a
-                // parser be rewritten into the second and stayed green.
+                // Only codec `Frame` literals are scanned (not `PesFrame`, whose
+                // `source: None` fixtures are fine). Two loss spellings: explicit
+                // `source: None`, or omitting it (Frame derives Default, so `..` yields None).
                 let explicit_none = blk.contains("source: None");
                 let no_source_field = !blk.contains("source:");
                 if explicit_none || no_source_field {

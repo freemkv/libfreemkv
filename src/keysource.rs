@@ -381,12 +381,9 @@ pub fn resolve_and_apply_traced(
 
     let mut trace = crate::aacs::trace::ResolutionTrace::new();
 
-    // The FIRST source failure seen, if any. A source that returns `Err` did not
-    // answer "no key for this disc" — it could not answer at all — and that
-    // reason is stamped onto `disc.aacs_error` below so the decrypt gate reports
-    // THAT instead of the generic `NoDiscKey`. First-wins (not last) so the
-    // ordered sources' most-preferred failure is the one the operator is told
-    // about, matching the first-valid-wins rule for successes.
+    // The FIRST source failure seen, if any. An `Err` means the source could not
+    // answer at all (not "no key"), so its reason is stamped onto `disc.aacs_error`
+    // below, reporting the ordered sources' most-preferred failure to the operator.
     let mut source_failure: Option<crate::error::Error> = None;
 
     // The ctx parses Unit_Key_RO.inf at the stride for `inputs.version` (the
@@ -430,26 +427,9 @@ pub fn resolve_and_apply_traced(
                     outcome: KeyOutcome::NoKey,
                 });
             }
-            // The source could NOT answer — it was unreachable, it errored, or it
-            // refused. Nothing is known about whether a key exists, so the path
-            // is EMPTY: recording `NoEntry` here is exactly the conflation that
-            // made a seven-hour run of HTTP 502s render as
-            // `key: online > no entry > NO KEY` + `E7022 No key source has a
-            // decryption key for this disc`, and sent operators hunting for a VUK
-            // that was never missing.
-            //
-            // The reason itself rides out on `disc.aacs_error` (below), the
-            // channel `Disc::ensure_decryptable_keys` already reads for the
-            // E7017-vs-E7022 split — so the decrypt gate raises the SOURCE's code
-            // (`KeyServiceUnavailable` / `KeyServiceUnauthorized` /
-            // `KeyServiceRateLimited`) instead of the generic `NoDiscKey`.
-            //
-            // `KeyOutcome` deliberately gains no variant: it is matched
-            // exhaustively by every front-end's trace renderer (freemkv's
-            // `pipe::render_resolution_trace`, autorip's
-            // `keysource::render_resolution_trace`), and this fix must not turn
-            // into a breaking change across four repos to say something the error
-            // code already says precisely.
+            // The source could NOT answer (unreachable/errored/refused), so path is
+            // EMPTY, not `NoEntry` — conflating the two once rendered 502s as "no
+            // key" and misled operators. The real reason rides on `disc.aacs_error`.
             Err(e) => {
                 if source_failure.is_none() {
                     source_failure = Some(e);
@@ -462,10 +442,9 @@ pub fn resolve_and_apply_traced(
             }
         }
     }
-    // Nothing resolved. If a source FAILED rather than answered, stamp that
-    // reason onto the disc so the decrypt gate can report it — but never clobber
-    // a reason the scan already captured (e.g. `AacsVidUnavailable`), which is
-    // closer to the disc itself than a source outage is.
+    // Nothing resolved. If a source FAILED rather than answered, stamp that reason
+    // onto the disc for the decrypt gate — but never clobber a reason the scan
+    // already captured (e.g. `AacsVidUnavailable`), which is closer to the disc.
     if let Some(e) = source_failure
         && disc.aacs_error.is_none()
     {
@@ -573,22 +552,9 @@ pub fn key_fetch(
     inputs: DiscInputs,
     make_sources: std::sync::Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>,
 ) -> crate::sector::KeyFetch {
-    // One driver behind both operations: rebuild the sources, inject `samples`
-    // as the ctx's content samples, run `drive` (the per-kind fetch), map the
-    // resolved UnitKeys to raw keys. Memoized by the fingerprint of the sample
-    // batch: the resolved keys are disc-level (a clip's index / CPS keys are
-    // identical for every title that references it), so the first batch resolves
-    // over the network and every repeat is answered from the cache with no
-    // request. A GENUINELY-empty reply (every source ran and none held the key)
-    // is cached too — the key the service lacks for a batch won't appear on a
-    // re-ask, so re-hitting the network buys nothing. But an empty reply caused
-    // by a source FAILURE (network down, source unreachable) is NOT cached: that
-    // is a transient miss, and caching it would permanently drop a unit that
-    // could be recovered once the source recovers — the `errored` flag on
-    // `FetchOutcome` draws exactly that line. Each operation gets its OWN cache:
-    // a base batch and a forensic anchor never collide, and the same bytes could
-    // legitimately resolve differently per op.
-    // The per-kind driver: `drive_unit_keys` or `drive_fmts_indexes`.
+    // One driver behind both operations, memoized per sample-batch fingerprint
+    // (keys are disc-level, so repeats hit cache). A genuinely-empty reply is
+    // cached, but a source FAILURE is not — a transient miss (see `errored`).
     type FetchDriver = fn(&[Box<dyn KeySource>], &dyn ResolveCtx) -> FetchOutcome;
     fn make_op(
         inputs: DiscInputs,
@@ -614,9 +580,8 @@ pub fn key_fetch(
             let mut di = inputs.clone();
             di.samples = samples.to_vec();
             // Parse Unit_Key_RO.inf at the disc's OWN stride (carried on `inputs`):
-            // an online /decode reply that returns a VUK (not a terminal UK) then
-            // derives unit keys from `enc_title_keys`, which a V10 disc parses at
-            // the 48-byte stride — hardcoding the V20 stride here corrupted them.
+            // a V10 disc parses `enc_title_keys` at the 48-byte stride, so
+            // hardcoding the V20 stride here would corrupt the derived unit keys.
             let ctx = DiscInputsCtx::new(&di);
             let outcome = drive(&sources, &ctx);
             let keys: Vec<[u8; 16]> = outcome.keys.into_iter().map(|u| u.key).collect();
@@ -666,11 +631,9 @@ pub fn read_encrypted_units(
 ) -> Vec<Vec<u8>> {
     use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
     const CHUNK_UNITS: u32 = 15; // 45 sectors/read — under the drive transfer cap
-    // Probe several evenly-spaced points across EACH extent rather than only the
-    // midpoint-and-forward: a title whose encrypted feature starts late, or whose
-    // midpoint lands in a clear nav stretch, must STILL yield scrambled samples.
-    // Empty samples make `Disc::decrypt_with` skip wrong-key validation, so a
-    // real encrypted title returning nothing here is a silent wrong-key hazard.
+    // Probe several evenly-spaced points across EACH extent, not just midpoint
+    // forward: a title starting late or landing in a clear nav stretch must still
+    // yield samples — empty samples make `decrypt_with` skip wrong-key validation.
     const PROBES_PER_EXTENT: u32 = 8;
 
     let mut out: Vec<Vec<u8>> = Vec::new();
@@ -687,20 +650,17 @@ pub fn read_encrypted_units(
                 continue;
             }
             let units_this = CHUNK_UNITS.min(total_units - unit);
-            // Saturate: start_lba comes from attacker-controlled UDF/MPLS
-            // extents; a malformed extent near u32::MAX would otherwise panic
-            // (debug) or wrap to a wrong LBA (release). An over-capacity LBA then
-            // fails cleanly via the read_sectors().is_err() skip below.
+            // Saturate: start_lba comes from attacker-controlled UDF/MPLS extents;
+            // near u32::MAX it would otherwise panic (debug) or wrap (release).
+            // An over-capacity LBA fails cleanly via the is_err() skip below.
             let lba = ext
                 .start_lba
                 .saturating_add(unit.saturating_mul(ALIGNED_UNIT_SECTORS));
             let count = (units_this * ALIGNED_UNIT_SECTORS) as u16;
             let mut buf = vec![0u8; count as usize * 2048];
-            // `false` = no recovery retries; the reader is the raw drive/file
-            // (no decrypt decorator), so these are the on-disc encrypted bytes. A
-            // read error at one probe skips THAT probe only — it must not abandon
-            // the rest of the extent (the old `break` blinded the sampler on a
-            // single transient miss).
+            // `false` = no recovery retries; reader is the raw drive/file (no
+            // decrypt decorator). A read error skips only THAT probe — it must not
+            // abandon the rest of the extent (the old `break` blinded the sampler).
             if reader.read_sectors(lba, count, &mut buf, false).is_err() {
                 continue;
             }
@@ -1298,10 +1258,9 @@ mod tests {
         use crate::error::Result;
         use crate::sector::SectorSource;
 
-        // Even units: CPI-clear (byte0 & 0xC0 == 0) AND sync-destroyed (no 0x47).
-        // Odd units:  CPI-set (byte0 = 0xC0) with a scrambled body.
-        // Neither has clean TS syncs, so `is_clean` is FALSE for BOTH;
-        // `aacs_unit_encrypted` flags only the odd units.
+        // Even units: CPI-clear, sync-destroyed. Odd units: CPI-set, scrambled body.
+        // Neither has clean TS syncs (`is_clean` is FALSE for both), but
+        // `aacs_unit_encrypted` must flag only the odd (CPI-set) units.
         struct MixSource {
             ext_start: u32,
             total_units: u32,

@@ -78,11 +78,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         return None;
     }
 
-    // MPLS gives language + codec but never editorial info (no
-    // commentary/SDH/director's cut). Low confidence means framework
-    // parsers (paramount, criterion, pixelogic, ctrm, dbp, deluxe) always
-    // win when they match. MPLS only gets chosen as the parser when
-    // nothing else fired — exactly the universal-fallback role we want.
+    // MPLS gives language + codec but never editorial info. Low confidence
+    // means framework parsers always win when they match; MPLS is only
+    // chosen when nothing else fired — the universal-fallback role we want.
     Some(ParseResult::low(labels))
 }
 
@@ -93,7 +91,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 /// needing a synthetic on-disc UDF image.
 ///
 /// Identity is `(clip, PID)` — what the STN entry states — and it is both the
-/// dedup key and the label's [`StreamId`]. A stream twenty playlists list is
+/// dedup key and the label's [`StreamId`](super::StreamId). A stream twenty playlists list is
 /// one label; two clips that both open their first audio at 0x1100 are two.
 /// This replaced a disc-global dense counter that numbered surviving entries
 /// 1, 2, 3, … in playlist-directory order: that number was not an STN slot in
@@ -104,25 +102,16 @@ fn build_labels(playlists: &[crate::mpls::Playlist]) -> Vec<StreamLabel> {
     let mut seen: HashSet<super::StreamId> = HashSet::new();
 
     for playlist in playlists {
-        // `Playlist::streams` is the FIRST play item's STN table, so every
-        // entry here is a stream of that play item's clip — the same clip
-        // `disc::bluray` records as the title's `clips[0]`. That pairing is
-        // what makes the PID an identity rather than a 16-bit number.
-        //
-        // Streams cannot be non-empty without a play item to have read them
-        // from, so the empty case is unreachable on a real disc; entries we
-        // cannot identify are skipped rather than emitted as unbindable
-        // labels.
+        // `Playlist::streams` is the FIRST play item's STN table, so every entry
+        // here is a stream of that play item's clip, matching `disc::bluray`'s
+        // `clips[0]` — that pairing is what makes the PID an identity.
         let Some(clip_id) = playlist.play_items.first().map(|pi| pi.clip_id.clone()) else {
             continue;
         };
 
-        // 1-based STN slot within THIS playlist's table, per type — the
-        // `stream_number` field's documented meaning, counted the same way
-        // `disc::bluray` counts the stream list it builds from these entries.
-        // Nothing binds through it (these labels bind by id); it is stated
-        // truthfully rather than invented so that a reader of the label list
-        // sees where on its own playlist each stream sits.
+        // 1-based STN slot within THIS playlist's table, per type — matches how
+        // `disc::bluray` counts the same entries. Nothing binds through it (labels
+        // bind by id); it's stated truthfully so the label list shows real slots.
         let mut audio_idx: u16 = 0;
         let mut sub_idx: u16 = 0;
 
@@ -201,13 +190,9 @@ fn label_type_for(entry: &crate::mpls::StreamEntry) -> Option<StreamLabelType> {
 }
 
 fn has_mpls_extension(name: &str) -> bool {
-    // Case-insensitive ".mpls" suffix. Some discs use uppercase,
-    // some lowercase; UDF filenames preserve case but we don't.
-    //
-    // UDF names are decoded via from_utf8_lossy, so a multi-byte
-    // replacement char (EF BF BD) can straddle byte index n-5; a raw
-    // byte slice there panics on a non-char-boundary. `ends_with` on a
-    // lowercased copy is char-boundary-safe and still case-insensitive.
+    // Case-insensitive ".mpls" suffix (discs use both cases). UDF names are
+    // decoded via from_utf8_lossy, so a multi-byte replacement char can straddle
+    // byte index n-5; `ends_with` on a lowercased copy avoids that boundary panic.
     name.len() >= 5 && name.to_ascii_lowercase().ends_with(".mpls")
 }
 
@@ -573,11 +558,9 @@ mod tests {
         assert_eq!(id("fra"), Some(("00001".into(), 0x1101)));
         assert_eq!(id("deu"), Some(("00001".into(), 0x1102)));
 
-        // `stream_number` is the entry's slot in ITS OWN playlist's STN table
-        // — deu is pl2's second audio, so 2, not "the third distinct stream
-        // seen while scanning the disc". It used to be the latter: a dense
-        // disc-global counter that named no table anyone could count against,
-        // handed to a binder that reads the field as an STN slot.
+        // `stream_number` is the entry's slot in ITS OWN playlist's STN table —
+        // deu is pl2's second audio, so 2, not "third distinct stream on disc".
+        // (Used to be a dense disc-global counter fed to a binder expecting a slot.)
         let num = |lang: &str| {
             labels
                 .iter()
@@ -735,10 +718,8 @@ mod tests {
 
     #[test]
     fn secondary_audio_becomes_audio_label() {
-        // stream_type 5 = secondary audio. The conversion should
-        // still produce an Audio label (the registry's apply path
-        // can ignore secondary if it wants — this module just
-        // surfaces what's there).
+        // stream_type 5 = secondary audio; conversion still produces an Audio
+        // label (the registry's apply path can ignore secondary if it wants).
         let mut sec = audio_entry(0x1A00, 0x83, 3, 1, "eng");
         sec.stream_type = 5;
         sec.secondary = true;

@@ -110,10 +110,9 @@ pub fn attr(element: &str, name: &str) -> Option<String> {
 /// prior behavior in criterion.rs).
 pub fn text(xml: &str, tag: &str) -> Option<String> {
     let (_open_end, body_start) = find_open_tag(xml, tag, 0)?;
-    // For self-closing tags, body_start is past `/>` and there is no
-    // content. Detect with a *byte* comparison: slicing `&xml[..]` two
-    // bytes back can land inside a multi-byte UTF-8 char and panic
-    // (untrusted on-disc XML), but indexing the byte slice never does.
+    // For self-closing tags, body_start is past `/>` with no content. Detect via
+    // a *byte* comparison: slicing `&xml[..]` two bytes back can land inside a
+    // multi-byte UTF-8 char and panic on untrusted XML; byte indexing never does.
     let b = xml.as_bytes();
     if body_start >= 2 && b[body_start - 2] == b'/' && b[body_start - 1] == b'>' {
         return Some(String::new());
@@ -462,10 +461,9 @@ mod tests {
 
     #[test]
     fn text_multibyte_before_self_close_does_not_panic() {
-        // A multi-byte UTF-8 char ending right before the `/>` used to
-        // panic on a non-char-boundary str slice in `text()`. The
-        // byte-level self-closing check must handle it cleanly.
-        // 'é' (0xC3 0xA9) directly precedes the `/>`.
+        // A multi-byte UTF-8 char ('é' = 0xC3 0xA9) right before `/>` used to
+        // panic on a non-char-boundary str slice in `text()`; the byte-level
+        // self-closing check must handle it cleanly.
         assert_eq!(text("<x>é</x>", "x"), Some("é".into()));
         // Self-closing form with a multi-byte char in an attr value.
         assert_eq!(text(r#"<x a="é"/>"#, "x"), Some("".into()));
@@ -636,11 +634,8 @@ mod tests {
     }
 
     // ── Malformed / truncated input (untrusted on-disc XML) ────────────────
-    //
-    // These scrapers run on XML lifted out of BD-J jar entries, which is
-    // attacker-controllable. Every scan in this module must terminate and
-    // stay in bounds on truncated or unbalanced input rather than panic.
-    // XML 1.0 §2.3 defines the Name production these boundary rules model.
+    // These scrapers run on attacker-controllable BD-J jar XML, so every scan
+    // must terminate and stay in bounds on truncated input (XML 1.0 §2.3).
 
     /// A quoted attribute value that is never closed must terminate the
     /// scan at EOF rather than reading past the end of the buffer.

@@ -109,19 +109,14 @@ where
         return Err(BoundedError::Halted);
     }
 
-    // Rendezvous channel: the worker sends exactly one value (the
-    // op's return) and then exits. Capacity-0 means the send blocks
-    // until we receive — fine on the happy path; on the timeout /
-    // halt path the receiver is dropped and the worker's send
-    // returns Err, which the worker ignores.
+    // Rendezvous channel: worker sends one value then exits. On timeout/halt
+    // the receiver is dropped, so the worker's send returns Err (ignored).
     let (tx, rx) = sync_channel::<R>(0);
     let _ = thread::Builder::new()
         .name("freemkv-bounded-syscall".into())
         .spawn(move || {
-            // Ignore the send error: if we time out (or get halted)
-            // before the worker finishes, the receiver is dropped
-            // and `tx.send` returns Err. Either way, the worker has
-            // nothing more to do.
+            // Ignore send error: if we time out/halt before the worker finishes,
+            // the receiver is dropped and `tx.send` returns Err — nothing more to do.
             let _ = tx.send(op());
         });
 
@@ -179,10 +174,8 @@ mod tests {
     fn halt_fires_during_wait() {
         let halt = Halt::new();
         let halt2 = halt.clone();
-        // Flip the halt from a side thread after ~300 ms — long
-        // enough that the receive loop has rolled at least one
-        // 250 ms slice and is sitting in `recv_timeout` again when
-        // the bit flips.
+        // Flip halt after ~300ms, long enough that the receive loop has rolled
+        // at least one 250ms slice and is back in `recv_timeout`.
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(300));
             halt2.cancel();
@@ -196,11 +189,9 @@ mod tests {
 
     #[test]
     fn worker_panics() {
-        // Worker panics → sender drops without sending → recv sees
-        // Disconnected → WorkerLost. We use an explicit panic in the
-        // op closure rather than `panic!()` from inside the channel
-        // machinery; the spawned thread's panic is contained (no
-        // process abort) because we don't `.join()` it.
+        // Worker panics → sender drops without sending → recv sees Disconnected →
+        // WorkerLost. Panic is in the op closure, not the channel machinery; it's
+        // contained (no process abort) because we don't `.join()` the thread.
         let r = bounded_syscall(None, Duration::from_secs(2), || -> u32 {
             panic!("intentional test panic");
         });

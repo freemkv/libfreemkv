@@ -16,12 +16,8 @@ use crate::disc::Resolution;
 use std::io::{self, Seek, Write};
 
 // ── CICP colour codes (ITU-T H.273) ──────────────────────────────────────────
-//
-// The Matroska Colour element (RFC 9559) carries MatrixCoefficients,
-// TransferCharacteristics and Primaries verbatim as the integer code-points
-// defined by ITU-T H.273 ("Coding-independent code points", CICP). Hoisting the
-// codes to named constants keeps the colour match arms self-documenting and the
-// values traceable to the public spec table that defines each.
+// Matroska's Colour element (RFC 9559) carries Matrix/Transfer/Primaries verbatim as
+// ITU-T H.273 CICP code-points; named constants keep each value traceable to the spec table.
 
 /// ColourPrimaries = 1 (BT.709 / sRGB) — ITU-T H.273 Table 2.
 const CICP_PRIMARIES_BT709: u8 = 1;
@@ -87,7 +83,7 @@ const BLOCK_ADD_ID_VALUE_MVC: u64 = 2;
 /// `BlockAddIDExtraData` for the `mvcC` BlockAdditionMapping (and, in the ISO
 /// container, the `MVCConfigurationBox('mvcC')` payload).
 ///
-/// Layout mirrors the AVCDecoderConfigurationRecord except byte[4] repurposes
+/// Layout mirrors the AVCDecoderConfigurationRecord except `byte[4]` repurposes
 /// the AVC record's `bit(6) reserved` as
 /// `complete_representation(1) | explicit_au_track(1) | reserved '1111'(4)`.
 /// `profile`/`compat`/`level` describe the WHOLE MVC stream and come from the
@@ -191,10 +187,9 @@ pub(crate) fn cicp_for_video(v: &VideoStream) -> (u8, u8, u8, u8) {
             CICP_PRIMARIES_BT601_525,
             COLOUR_RANGE_LIMITED,
         ),
-        // Unknown colorimetry → CICP "unspecified" (code point 2) for matrix,
-        // transfer, and primaries, with limited range (the disc norm). Both the
-        // MKV sink and the FVI sidecar emit 2 so the two sinks of one title
-        // agree (matches `Colour::from_color_space`'s Unknown mapping).
+        // Unknown colorimetry → CICP "unspecified" (2) for matrix/transfer/primaries,
+        // limited range (disc norm); MKV and the FVI sidecar both emit 2 so the two
+        // sinks of one title agree (matches `Colour::from_color_space`'s Unknown mapping).
         ColorSpace::Unknown => (
             CICP_MATRIX_UNSPECIFIED,
             CICP_TRANSFER_UNSPECIFIED,
@@ -389,20 +384,14 @@ impl MkvTrack {
             Codec::Mpeg2 => ebml::CODEC_MPEG2,
             Codec::Mpeg1 => ebml::CODEC_MPEG1,
             Codec::Av1 => ebml::CODEC_AV1,
-            // Every video codec this crate can produce is named above. The
-            // remaining arm is reached only by a non-video or Unknown codec
-            // routed here in error — see the audio counterpart for why this
-            // keeps a fallback rather than erroring.
+            // Every video codec this crate can produce is named above; the remaining
+            // arm is reached only by a non-video/Unknown codec routed here in error
+            // (see the audio counterpart — no error channel exists here either).
             _ => ebml::CODEC_MPEG2,
         };
-        // An Unknown resolution has no real dimensions — `pixels()` reports
-        // (0, 0) for it, and the serializer then omits PixelWidth/PixelHeight
-        // (Matroska marks them optional). The local `matches!(Unknown)` guard
-        // that used to sit here existed only because `pixels()` fabricated a
-        // 1920x1080 default; it does not any more, so the check belongs in the
-        // one accessor rather than in each caller that remembered to write it.
-        // None -> 0, and the writer already omits the optional
-        // PixelWidth/PixelHeight elements on 0 (RFC 9559 5.1.4.1.28-29).
+        // Unknown resolution -> `pixels()` reports (0, 0) (it no longer fabricates a
+        // 1920x1080 default), and the writer omits the optional PixelWidth/PixelHeight
+        // on 0 per RFC 9559 5.1.4.1.28-29.
         let (w, h) = v.resolution.pixels().unwrap_or((0, 0));
         let (num, den) = v.frame_rate.as_fraction();
         let default_duration_ns = if num > 0 {
@@ -414,13 +403,9 @@ impl MkvTrack {
         // Derived by the single shared resolver so every sink (this muxer, the
         // FVI sidecar in `videomap.rs`) reports identical code points.
         let (matrix, transfer, primaries, range) = cicp_for_video(v);
-        // Display dimensions. For square-pixel video (HD/UHD/BD) the display
-        // aspect equals the pixel grid, so display == pixel. For anamorphic
-        // content (DVD: 720x480/576 pixels shown as 16:9 or 4:3) the coded
-        // pixels are NOT square — keep the coded height and derive the width so
-        // DisplayWidth:DisplayHeight carries the intended DAR (e.g. 720x576
-        // 16:9 → 1024x576). Without this, players use the square-pixel ratio
-        // and show the disc as 5:4 / 3:2 instead of 16:9.
+        // HD/UHD/BD is square-pixel so display == pixel. DVD (720x480/576) is
+        // anamorphic — coded pixels aren't square, so derive width from the DAR
+        // (e.g. 720x576 16:9 -> 1024x576) or players show 5:4/3:2 instead of 16:9.
         let (display_width, display_height) = match v.display_aspect {
             Some((an, ad)) if an > 0 && ad > 0 && h > 0 => ((h * an + ad / 2) / ad, h),
             _ => (w, h),
@@ -443,40 +428,13 @@ impl MkvTrack {
             colour_primaries: primaries,
             colour_range: range,
             interlaced: v.resolution.is_interlaced(),
-            // FieldOrder (Matroska 0x9D) is a bitstream property
-            // (`top_field_first`) the IFO/MPLS scan cannot know, so it is NOT set
-            // here — it would only ever be a guess. Default to UNDETERMINED; the
-            // mux stream (`MkvStream`) sets the MEASURED value from the first
-            // coded picture's `PictureInfo` before the muxer writes the header.
-            // If an interlaced track ever reaches the muxer still UNDETERMINED,
-            // that is a parser/source gap and is logged loudly — never faked.
+            // FieldOrder is a bitstream property the IFO/MPLS scan can't know, so it
+            // defaults to UNDETERMINED here; `MkvStream` sets the MEASURED value from
+            // the first coded picture. Still UNDETERMINED at mux time = logged, never faked.
             field_order: ebml::FIELD_ORDER_UNDETERMINED,
-            // DefaultDecodedFieldDuration is DELIBERATELY NOT emitted (0 here
-            // suppresses the element; see the writer in `MkvMuxer::new`).
-            //
-            // rc.5.1 added it (= half the frame period, 20 ms for 576i25) to try
-            // to fix the Windows-fps report, on the theory that Windows derives
-            // fps from it. The captured real-media evidence proves the opposite: with
-            // FlagInterlaced=1 + DefaultDuration=40 ms + DefaultDecodedFieldDuration=20 ms,
-            // Windows Explorer reports 12.5 fps (half), and a media analyzer
-            // flips the track to "Frame rate mode: Variable" with no clean rate. A
-            // known-correct rip of the same disc OMITS DefaultDecodedFieldDuration,
-            // keeps FlagInterlaced=1 + FieldOrder=TFF + DefaultDuration=40 ms, and
-            // Explorer reports the full 25 fps with the analyzer showing "Constant".
-            // A conformant Matroska muxer does the same (full-frame DefaultDuration,
-            // no field duration). The lone frame-rate signal every tool actually
-            // trusts is
-            // `1 / DefaultDuration`; that full-frame value (40 ms → 25 fps) is kept
-            // below. Dropping the field-duration element removes the per-field
-            // signal that made Explorer halve the rate.
-            //
-            // Trade-off: the container no longer carries an explicit per-field
-            // decoded duration. Nothing is lost in practice — the interlace
-            // signaling that deinterlacers and media analyzers rely on lives in the
-            // MPEG-2 elementary stream's picture_coding_extension (picture_structure /
-            // top_field_first), which analyzers read directly (so they still report
-            // "Interlaced / Top Field First"), and the container still flags
-            // FlagInterlaced=1 + FieldOrder=TFF so players keep deinterlacing.
+            // DefaultDecodedFieldDuration DELIBERATELY NOT emitted (0 suppresses it):
+            // setting it made Windows Explorer report half fps / "Variable" instead of
+            // "Constant" (a known-good rip omits it); the ES already signals interlace.
             field_duration_ns: 0,
             sample_rate: 0.0,
             channels: 0,
@@ -488,10 +446,9 @@ impl MkvTrack {
             } else {
                 None
             },
-            // HDR10 static metadata is measured from the HEVC SEI at mux time,
-            // not known at construction. The mux stream sets it from the first
-            // coded picture's PictureInfo before the header is written (the same
-            // deferred path FieldOrder uses). `None` here → omitted unless seen.
+            // HDR10 static metadata is measured from the HEVC SEI at mux time, not known
+            // at construction; the mux stream sets it before the header is written
+            // (same deferred path FieldOrder uses). `None` here -> omitted unless seen.
             hdr10: None,
             mvc_params: None,
         }
@@ -501,17 +458,9 @@ impl MkvTrack {
     /// Matroska registry; every DTS family member (core, DTS-HD HR, DTS-HD MA)
     /// maps to the single registered `A_DTS` ID (see the note below).
     pub fn audio(a: &AudioStream) -> Self {
-        // The Matroska codec-ID registry defines `A_DTS` for the entire
-        // DTS family — the spec text for `A_DTS` explicitly states it
-        // "Supports DTS, DTS-ES, DTS-96/26, DTS-HD High Resolution Audio
-        // and DTS-HD Master Audio." Players distinguish core vs HD-HRA vs
-        // HD-MA by parsing the DTS bitstream extension substreams, not by
-        // the container codec ID. The previously-emitted `A_DTS/MA` and
-        // `A_DTS/HR` suffixes are NOT registered codec IDs; strict Matroska
-        // parsers and some hardware renderers fail to recognise the
-        // track at all. Emit plain `A_DTS` for every DTS variant — the
-        // lossless MA / HRA payload bytes are unchanged, only the
-        // container codec-ID string differs.
+        // `A_DTS` is the sole registered codec ID for the whole DTS family; players
+        // distinguish core/HD-HRA/HD-MA from the bitstream itself. The old `A_DTS/MA`
+        // and `A_DTS/HR` suffixes aren't registered and some strict parsers reject them.
         let codec_id = match a.codec {
             Codec::Ac3 => ebml::CODEC_AC3,
             Codec::Ac3Plus => ebml::CODEC_EAC3,
@@ -523,21 +472,14 @@ impl MkvTrack {
             Codec::Mp3 => ebml::CODEC_MP3,
             Codec::Flac => ebml::CODEC_FLAC,
             Codec::Opus => ebml::CODEC_OPUS,
-            // Every audio codec this crate can produce is named above. The
-            // remaining arm is reached only by a non-audio or Unknown codec
-            // routed here in error; A_AC3 is the historical fallback and is
-            // wrong for such a track, but MkvTrack::audio has no error channel —
-            // `every_audio_codec_gets_its_own_registered_codec_id` pins the real
-            // codecs so a newly-added one cannot silently land here instead.
+            // Every audio codec this crate can produce is named above; the remaining
+            // arm (A_AC3, wrong for such a track) is reached only in error, since
+            // `MkvTrack::audio` has no error channel — a test pins each real codec ID.
             _ => ebml::CODEC_AC3,
         };
-        // Unknown sample rate / channel layout: emit 0 so the serializer omits
-        // the SamplingFrequency / Channels element (Matroska supplies its own
-        // spec default) rather than writing a fabricated 48000 Hz / 6-channel
-        // value into the file.
-        // No guard needed: the accessors return 0 for Unknown, which is exactly
-        // what this wants. They used to fabricate 6 channels at 48 kHz, so every
-        // caller had to remember to check the variant first.
+        // Unknown sample rate/channels -> accessors return 0, so the serializer omits
+        // SamplingFrequency/Channels rather than writing a fabricated 48kHz/6ch value
+        // (they used to fabricate that default, forcing every caller to guard it).
         let sr = a.sample_rate.hz();
         let ch = a.channels.count();
 
@@ -565,25 +507,9 @@ impl MkvTrack {
             field_duration_ns: 0,
             sample_rate: sr,
             channels: ch,
-            // KNOWN GAP, not a deliberate omission. The Matroska Codec
-            // Specifications say of `A_PCM/INT/BIG` and `A_PCM/INT/LIT` that "the
-            // audio bit depth MUST be read and set from the `BitDepth` element",
-            // and raw PCM has no in-band header left to recover it from once
-            // `LpcmParser` has stripped the BD/DVD framing — so a `Codec::Lpcm`
-            // track written with 0 here (the serializer then omits BitDepth
-            // entirely) has no recoverable sample width.
-            //
-            // The value is NOT available at this call site: [`AudioStream`] has no
-            // bit-depth member, and neither of the two places that know it reaches
-            // here. BD LPCM signals it in the 4-byte ES header (byte 3 bits 7-6)
-            // that `LpcmParser` discards, and the Blu-ray clip info does not carry
-            // it at all; DVD LPCM signals it in the IFO audio-attribute block
-            // (byte 1 bits 7-6, quantization: 16/20/24-bit), which `parse_audio_attr`
-            // does not read. Closing it means carrying the depth on `AudioStream`
-            // for the DVD path and a deferred setter fed from the first PES for the
-            // BD path (the route `hdr10` and `field_order` already take). Guessing
-            // 16 here would be worse than omitting: it turns a track a player may
-            // probe or reject into one it confidently misdecodes.
+            // KNOWN GAP, not deliberate: Matroska requires BitDepth for `A_PCM/INT/*`,
+            // but `LpcmParser` strips the BD/DVD framing that carries it and
+            // `AudioStream` has no bit-depth field; guessing 16 would be worse than 0.
             bit_depth: 0,
             dv_config: None,
             hdr10: None,
@@ -955,11 +881,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let seek_id_be = (ebml::SEEK as u16).to_be_bytes();
         let seek_inner_id_be = (ebml::SEEK_ID as u16).to_be_bytes();
         let seek_pos_id_be = (ebml::SEEK_POSITION as u16).to_be_bytes();
-        // Absolute file offset where the CUES Seek entry begins, so that — if no
-        // Cues element is ultimately written (zero cue points) — the entry can be
-        // overwritten with a Void at finish() instead of leaving a SeekHead
-        // pointer that resolves to whatever element (Tags / EOF) happens to land
-        // at the Cues offset. See `cues_seek_entry_pos` / `finish`.
+        // Offset of the CUES Seek entry, so that if no Cues element is written (zero
+        // cue points) it can be overwritten with a Void at finish() instead of a
+        // SeekHead pointer resolving to whatever element happens to land there.
         let mut cues_seek_entry_pos: Option<u64> = None;
         for target_id in &targets {
             let entry_pos = writer.stream_position()?;
@@ -994,11 +918,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
             ebml::write_float(&mut writer, ebml::DURATION, duration_ticks)?;
             None
         } else {
-            // The source declared no duration (e.g. HD-DVD — its `.MAP` timemaps
-            // are not parsed). Reserve a DURATION placeholder now and back-patch
-            // it at finish() from the muxed timeline, so the file still declares a
-            // runtime instead of showing "unknown". The 8-byte float payload sits
-            // 3 bytes in (2-byte ID `0x4489` + 1-byte size `0x88`).
+            // No declared duration (e.g. HD-DVD `.MAP` timemaps aren't parsed): reserve
+            // a DURATION placeholder and back-patch it at finish() from the muxed
+            // timeline. Payload sits 3 bytes in (2-byte ID `0x4489` + 1-byte size).
             let pos = writer.stream_position()?;
             ebml::write_float(&mut writer, ebml::DURATION, 0.0)?;
             Some(pos + 3)
@@ -1029,11 +951,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         for (i, track) in tracks.iter().enumerate() {
             let track_uid = (i + 1) as u64 | 0x100_0000;
             track_uids.push(track_uid);
-            // Build the MVC (Blu-ray 3D) MVCDecoderConfigurationRecord ONCE per
-            // track from the dependent view's subset-SPS/PPS. `None` for every
-            // non-3D track (and if the params are malformed) — the single source
-            // of truth for the CodecPrivate mvcC extension, the
-            // BlockAdditionMapping, and whether BlockAdditionals are conforming.
+            // Build the MVC (Blu-ray 3D) MVCDecoderConfigurationRecord ONCE per track;
+            // `None` for non-3D or malformed params. Single source of truth for the
+            // CodecPrivate mvcC extension, BlockAdditionMapping, and conformance flag.
             let mvc_record = track
                 .mvc_params
                 .as_ref()
@@ -1054,11 +974,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 ebml::write_uint(&mut writer, ebml::FLAG_DEFAULT, 0)?;
             }
             if track.track_type == ebml::TRACK_TYPE_SUBTITLE && track.codec_id == ebml::CODEC_PGS {
-                // Reserve a 1-byte FlagForced (initial value = the scan/vendor
-                // flag) and record its offset, so PGS content can promote it to 1
-                // at finish() if the track proves to be forced narrative. Written
-                // explicitly (ID + size + value) so the value is a single,
-                // in-place-patchable byte — same idiom as the Channels fixup.
+                // Reserve a 1-byte FlagForced (initial = scan/vendor flag) and record
+                // its offset, so PGS content can promote it to 1 at finish() if the
+                // track proves forced narrative — same patchable-byte idiom as Channels.
                 ebml::write_id(&mut writer, ebml::FLAG_FORCED)?;
                 ebml::write_size(&mut writer, 1)?;
                 let value_offset = writer.stream_position()?;
@@ -1077,25 +995,20 @@ impl<W: Write + Seek> MkvMuxer<W> {
 
             if let Some(ref cp) = track.codec_private {
                 match mvc_record.as_ref() {
-                    // MVC (Blu-ray 3D) base track: CodecPrivate = base-view avcC
-                    // followed by the `mvcC` extension block. This is the
-                    // track-level signal decoders/analyzers read to recognise the
-                    // stereoscopic MVC track (the per-frame dependent view rides
-                    // in BlockAdditional under the mapping below).
+                    // MVC (Blu-ray 3D) base track: CodecPrivate = base-view avcC + `mvcC`
+                    // extension, the track-level signal decoders read to recognise the
+                    // stereoscopic track (dependent view rides in BlockAdditional below).
                     Some(record) => {
                         let cp_mvc = mvc_codec_private(cp, record);
                         ebml::write_binary(&mut writer, ebml::CODEC_PRIVATE, &cp_mvc)?;
                     }
-                    // Non-MVC (2D/UHD/audio/…): write the codec_private verbatim —
-                    // the unchanged path, byte-identical to a 2D mux.
+                    // Non-MVC (2D/UHD/audio/…): write codec_private verbatim, unchanged.
                     None => ebml::write_binary(&mut writer, ebml::CODEC_PRIVATE, cp)?,
                 }
             }
-            // Pre-0.13 a deferred codecPrivate path existed for video tracks
-            // (placeholder reserve + later seek-back fill via
-            // `fill_codec_private`). The PES pipeline hands codec_private
-            // up-front via the DiscTitle, so the deferred path was never
-            // exercised — removed in the 0.13 dead-code sweep.
+            // Pre-0.13 had a deferred codecPrivate path (placeholder + seek-back fill)
+            // for video, but the PES pipeline hands it up-front via DiscTitle, so that
+            // path was never exercised — removed in the 0.13 dead-code sweep.
 
             // DefaultDuration — frame duration in nanoseconds
             if track.default_duration_ns > 0 {
@@ -1106,16 +1019,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 )?;
             }
 
-            // DefaultDecodedFieldDuration (one FIELD = half a frame), a DIRECT
-            // child of TrackEntry. The production video path now ALWAYS passes
-            // `field_duration_ns == 0` (see `MkvTrack::video`) so this element is
-            // NOT written: emitting it (20 ms for 576i25) is exactly what made
-            // Windows Explorer report 12.5 fps and a media analyzer flip to VFR on
-            // the captured rip, while a known-correct rip — which omits it —
-            // shows the full 25 fps. The guard below is retained so a non-zero
-            // value still emits
-            // a well-formed element for any future caller / round-trip test, but
-            // the muxer's own callers no longer trigger it.
+            // DefaultDecodedFieldDuration: production video always passes 0 here
+            // (emitting it made Windows Explorer report half fps / VFR, see
+            // `MkvTrack::video`); the guard still emits a valid element for other callers.
             if track.track_type == ebml::TRACK_TYPE_VIDEO
                 && track.interlaced
                 && track.field_duration_ns > 0
@@ -1132,10 +1038,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 let vid_pos = ebml::start_master(&mut writer, ebml::VIDEO)?;
                 ebml::write_uint(&mut writer, ebml::PIXEL_WIDTH, track.pixel_width as u64)?;
                 ebml::write_uint(&mut writer, ebml::PIXEL_HEIGHT, track.pixel_height as u64)?;
-                // Scan type. FlagInterlaced: 1 = interlaced, 2 = progressive.
-                // FieldOrder (0x9D) is only written for interlaced content with a
-                // determined order: TFF = 1, BFF = 6, 0 = progressive, and the
-                // element is omitted entirely when undetermined (RFC 9559).
+                // FlagInterlaced: 1 = interlaced, 2 = progressive. FieldOrder (0x9D) is
+                // written only for interlaced content with a determined order (TFF=1,
+                // BFF=6); omitted entirely when undetermined (RFC 9559).
                 ebml::write_uint(
                     &mut writer,
                     ebml::FLAG_INTERLACED,
@@ -1146,10 +1051,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     },
                 )?;
                 if track.interlaced && track.field_order != ebml::FIELD_ORDER_UNDETERMINED {
-                    // `track.field_order` was set CORRECTLY before construction
-                    // (the mux stream reads the first coded picture's measured
-                    // field order and sets it on the track), so this writes the
-                    // right value the first time — no later rewrite.
+                    // `track.field_order` was set correctly before construction (the mux
+                    // stream reads the first coded picture's measured field order), so
+                    // this writes the right value the first time — no later rewrite.
                     ebml::write_uint(&mut writer, ebml::FIELD_ORDER, track.field_order as u64)?;
                 }
                 if track.display_width > 0 && track.display_height > 0 {
@@ -1186,9 +1090,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 ebml::end_master(&mut writer, vid_pos)?;
             }
 
-            // Blu-ray 3D (MVC) signaling — BlockAdditionMapping (sibling of
-            // Video) carries the mvcC MVCDecoderConfigurationRecord so players /
-            // analyzers recognise the dependent (right-eye) view that rides as a
+            // Blu-ray 3D (MVC) signaling: BlockAdditionMapping carries the mvcC record
+            // so players recognise the dependent (right-eye) view riding as a
             // per-frame BlockAdditional under this mapping (BlockAddIDValue = 2).
             match mvc_record.as_ref() {
                 Some(record) => {
@@ -1202,10 +1105,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     ebml::write_binary(&mut writer, ebml::BLOCK_ADD_ID_EXTRA_DATA, record)?;
                     ebml::end_master(&mut writer, map_pos)?;
                 }
-                // `mvc_params` present but the record failed to build (malformed
-                // parameter sets): no mapping, and `track_has_mvc_mapping` above
-                // is already `false`, so BlockAdditionals are dropped — the file
-                // stays conforming rather than carrying an orphaned BlockAddID.
+                // `mvc_params` present but the record failed to build (malformed params):
+                // no mapping, `track_has_mvc_mapping` is already `false`, so
+                // BlockAdditionals are dropped — file stays conforming, no orphan BlockAddID.
                 None if track.mvc_params.is_some() => {
                     let (s, p) = track.mvc_params.as_ref().unwrap();
                     tracing::warn!(
@@ -1238,15 +1140,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 // Omit Channels when unknown (0) — Matroska defaults it to 1
                 // rather than us fabricating a 6-channel count.
                 if track.channels > 0 {
-                    // Capture the ACTUAL file offset of the 1-byte Channels value
-                    // so an AC-3 track can correct it from the bitstream acmod on
-                    // its first frame (the IFO nibble is unreliable). Rather than
-                    // assume write_uint's encoding (ID + size widths), write the
-                    // element's ID and size explicitly, then record the position
-                    // immediately before the value byte. Channels is 1..=255 so
-                    // the value is exactly one byte (Size = 1), and the acmod
-                    // correction is likewise 1..=255 — the width never changes, so
-                    // the in-place single-byte rewrite stays valid.
+                    // Capture the offset of the 1-byte Channels value so an AC-3 track can
+                    // correct it from the bitstream acmod (IFO nibble is unreliable);
+                    // written explicitly so the in-place single-byte rewrite stays valid.
                     ebml::write_id(&mut writer, ebml::CHANNELS)?;
                     ebml::write_size(&mut writer, 1)?;
                     let value_offset = writer.stream_position()?;
@@ -1367,32 +1263,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// when to remove the on-screen artifact (the practical case is
     /// PGS subtitles — without it, the last bitmap lingers until the
     /// next display set replaces it). Otherwise a plain `SimpleBlock`.
-    /// Rewrite a video track's `FieldOrder` value in place from the MEASURED
-    /// field order carried on the first coded picture, replacing the scan-time
-    /// guess written at construction. This is the fix for the "we parsed
-    /// `top_field_first` then ignored it" red flag: the muxer now stamps the
-    /// field order the bitstream actually states, not an assumption.
     ///
-    /// Idempotent — only the first call per track patches (later calls and
-    /// non-interlaced / non-video tracks are no-ops). `Progressive` / unknown
-    /// (`None`) leaves the written value untouched: an interlaced track keeps
-    /// its guess rather than being cleared via a multi-element change. The byte
-    /// width is fixed (FieldOrder is 0..=14), so the in-place rewrite is valid.
-    ///
-    /// `block_additional`, when `Some`, is attached to the frame as a Matroska
-    /// `BlockAdditional` (BlockAddID=2) — Blu-ray 3D (MVC): the base view is the
-    /// Block and the dependent (right-eye) access unit rides as the
-    /// BlockAdditional under the track's `mvcC` mapping. Such a frame is always a
-    /// `BlockGroup` (never a SimpleBlock), with a `ReferenceBlock` when it is not
-    /// TEST-ONLY. Every production path writes through [`MkvMuxer::write_frame_at`]
-    /// and passes the byte offset the frame was read from; the deferred-mux
-    /// replay of buffered frames was the last one that did not, and it now
-    /// does. Keeping this compiled out of the library means there is no
-    /// production API through which a frame can reach the file with its
-    /// provenance discarded — the placement logic stopped relying on
-    /// timestamps precisely so that could not happen silently.
+    /// TEST-ONLY convenience wrapper over [`MkvMuxer::write_frame_at`] (no byte
+    /// offset, no source provenance). Every production path writes through
+    /// `write_frame_at` directly.
     #[cfg(test)]
-    /// a keyframe. `None` for every non-3D frame.
     pub fn write_frame(
         &mut self,
         track_idx: usize,
@@ -1413,7 +1288,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         )
     }
 
-    /// [`Self::write_frame`] with the frame's SOURCE BYTE OFFSET.
+    /// `write_frame` (test-only convenience wrapper) with the frame's SOURCE BYTE OFFSET.
     ///
     /// Under a seam plan that offset identifies which clip the frame came from
     /// by lookup rather than by inferring it from the timestamp — which is
@@ -1421,6 +1296,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// the same instant. Callers that have a `PesFrame` should pass
     /// `frame.source.map(|s| s.byte)`; `write_frame` is the same call with no
     /// provenance, which falls back to the mark heuristics.
+    ///
+    /// `block_additional`, when `Some`, is attached to the frame as a Matroska
+    /// `BlockAdditional` (BlockAddID=2) — Blu-ray 3D (MVC): the base view is the
+    /// Block and the dependent (right-eye) access unit rides as the
+    /// BlockAdditional under the track's `mvcC` mapping. Such a frame is always a
+    /// `BlockGroup` (never a SimpleBlock), with a `ReferenceBlock` when it is not
+    /// a keyframe. `None` for every non-3D frame.
     #[allow(clippy::too_many_arguments)]
     pub fn write_frame_at(
         &mut self,
@@ -1432,11 +1314,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         block_additional: Option<&[u8]>,
         src_byte: Option<u64>,
     ) -> io::Result<()> {
-        // --log-level 3: capture the first ~100 coded frames per track to the
-        // side file BEFORE any timeline mangling, with the codec parser's own
-        // frame PTS — so an opening-GOP / mid-GOP-open / menu issue is
-        // reconstructable from the log + side file alone (no disc). No-op (and
-        // no allocation) on normal runs; the capture is `None`.
+        // --log-level 3: capture the first ~100 coded frames per track to the side file
+        // BEFORE any timeline mangling, with the parser's own PTS, so an opening-GOP
+        // issue is reconstructable offline. No-op/no alloc normally (capture = `None`).
         if let Some(cap) = self.opening_capture.as_mut() {
             cap.record(track_idx, pts_ns, keyframe, data);
         }
@@ -1445,32 +1325,14 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // below, which must exempt EVERY video track (incl. a Dolby Vision EL).
         let is_video = self.track_is_video.get(track_idx).copied().unwrap_or(false);
 
-        // The clip-boundary epoch decision is driven by the PRIMARY video track
-        // ONLY (the first video track, NOT the literal index 0 — the M2TS/PMT
-        // path can list an audio ES before the video ES, so streams[0] may be
-        // audio). A title can carry a SECOND video track — a Dolby Vision
-        // enhancement layer — whose PTS runs on its OWN timeline, interleaved
-        // with the base layer's. The two video PTS sequences overlap, so the EL's
-        // frames look like multi-second backward jumps against the base layer's
-        // frontier and would false-trigger an epoch reset on every GOP (the exact
-        // ratchet that inflated a 1-clip timeline to ~7 h). Only the base
-        // video layer establishes/advances the frontier and opens epochs; the EL
-        // — like audio and subtitles — rides the current offset.
+        // Clip-boundary epochs are driven by the PRIMARY video track only (not literal
+        // index 0 — M2TS/PMT can list audio first): a Dolby Vision EL's overlapping PTS
+        // would false-trigger a reset every GOP otherwise (once inflated a 1-clip title to ~7h).
         let drives_epoch = Some(track_idx) == self.primary_video_track;
 
-        // Map the raw PES PTS onto the continuous output timeline FIRST, before
-        // any base/cluster math: at a non-seamless clip / layer-break boundary
-        // the source PES PTS jumps backward. Rebasing it (a global offset across
-        // all tracks, A/V-sync-preserving) keeps the boundary from becoming a
-        // band of non-monotonic block timestamps. Only the PRIMARY video track
-        // drives the boundary decision; every other track (audio, subtitle, DV
-        // EL) rides the current offset. A single-clip BD title still trims to
-        // its one clip's [in, out] marks (dropping trailing audio the m2ts
-        // carries past OUT); only a source with no marks at all is a true no-op.
-        // `None` means the playlist does not include this frame — material
-        // outside every clip's IN/OUT marks, which only a seam-plan-driven
-        // title can report. Dropping it is the point: emitting it is what put
-        // duplicate content on the timeline at a join.
+        // Map the raw PES PTS onto the continuous timeline FIRST: source PTS jumps
+        // backward at a clip boundary, so rebasing avoids non-monotonic timestamps.
+        // `None` = outside clip IN/OUT marks; dropping avoids duplicate content at a join.
         let Some(pts_ns) = self.continuity.map(
             pts_ns,
             drives_epoch,
@@ -1482,23 +1344,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
         };
         let raw_ticks = pts_ns / TIMESTAMP_SCALE_NS;
 
-        // Cluster boundaries normally coincide with a video keyframe so every
-        // Cues entry resolves to a seekable IDR at the cluster start. Keyed on
-        // the primary video track (first video index) when the title HAS video;
-        // for an audio-only / subtitle-only title (no video track) fall back to
-        // the first track (index 0) so its keyframes still open clusters —
-        // otherwise no cluster would ever open and every frame would be dropped.
+        // Clusters normally open on a video keyframe so Cues resolve to a seekable
+        // IDR. For an audio/subtitle-only title (no video track) fall back to track
+        // 0's keyframes, or no cluster would ever open and every frame would drop.
         let cluster_driver = self.primary_video_track.unwrap_or(0);
         let is_video_key = keyframe && track_idx == cluster_driver;
 
-        // Derive the timestamp base from the first *kept* keyframe (the frame
-        // that opens the first cluster), NOT the first frame merely seen. The
-        // first frame seen can have a higher display PTS than the subsequent
-        // I-frame (B-frame reordering / a PTS discontinuity), which would make
-        // later cluster/cue timestamps negative and wrap to ~u64::MAX on the
-        // `as u64` cast in `start_cluster`/`finish`. Anchoring on the first kept
-        // keyframe guarantees the open cluster's timestamp is 0 and all later
-        // relative offsets are computed from a frame we actually wrote.
+        // Base is the first *kept* keyframe, NOT the first frame seen: with B-frame
+        // reordering the first frame seen can have a higher PTS, which would make
+        // later timestamps negative and wrap to ~u64::MAX on the `as u64` cast.
         let base = match self.base_pts_ticks {
             Some(b) => b,
             None => {
@@ -1513,26 +1367,14 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 raw_ticks
             }
         };
-        // Floor at 0: base is the first kept keyframe, so any frame with an
-        // earlier PTS (audio/subtitle arriving with a pre-keyframe timestamp, or
-        // a back-jump on a stream discontinuity) would compute negative here,
-        // which would wrap to ~u64::MAX on the `as u64` cluster/cue write and
-        // could overflow the i16 block-relative cast. Frames before the first
-        // kept keyframe are clamped to t=0 rather than corrupting the timeline.
+        // Floor at 0: a frame earlier than base (pre-keyframe audio, or a stream
+        // discontinuity back-jump) would compute negative and wrap to ~u64::MAX on
+        // the `as u64` write; clamp to t=0 instead of corrupting the timeline.
         let pts_ticks = (raw_ticks - base).max(0);
 
-        // Strictly-monotonic block timestamps — AUDIO/SUBTITLE ONLY. Some audio
-        // PES PTS truncate to the same tick as the previous frame (or tick back
-        // one); nudge those to prev+1 tick (sub-frame, inaudible).
-        //
-        // VIDEO is EXEMPT: with B-frames, presentation PTS is legitimately
-        // non-monotonic in decode/storage order (a B-frame's PTS sits between its
-        // anchors, below the frame stored before it). Forcing it
-        // strictly-increasing clobbers those PTS, which a `copy` remux preserves
-        // but a decoder rejects — it derives DTS from the HEVC POC and finds them
-        // colliding ("non monotonically increasing dts"). Matroska SimpleBlock
-        // permits non-monotonic block timestamps (negative block-relative
-        // offsets), so leave the true PES PTS intact for video.
+        // Strictly-monotonic timestamps — AUDIO/SUBTITLE ONLY: nudge a truncated/
+        // backward PES tick to prev+1 (inaudible). VIDEO is EXEMPT: B-frame PTS is
+        // legitimately non-monotonic and forcing it makes decoders reject the DTS.
         let pts_ticks = block_ts(
             is_video,
             self.last_pts_ticks.get(&track_idx).copied(),
@@ -1561,29 +1403,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         } else {
             let rel = pts_ticks - self.cluster_ts_ticks;
             if !(MIN_BLOCK_REL..=MAX_BLOCK_REL).contains(&rel) {
-                // The block-relative timestamp is a signed 16-bit value, so a
-                // frame whose offset from the current cluster's timestamp falls
-                // outside i16::MIN..=i16::MAX ticks (~±3.27 s at the 0.1 ms
-                // scale) would silently wrap on the `as i16` cast, corrupting A/V
-                // sync. The keyframe-driven boundary above only fires on a video
-                // keyframe — a long audio-only stretch, a very long GOP with no
-                // intervening keyframe (positive direction), or an
-                // audio/subtitle PES whose PTS back-jumps below the open cluster
-                // (negative direction) can drift past the i16 range. Force a
-                // fresh cluster here even without a keyframe to keep the cast in
-                // range. pts_ticks is already floored at 0 above, so the new
-                // cluster timestamp never wraps on the `as u64` write in
-                // start_cluster.
-                //
-                // This split cluster is NOT keyframe-aligned, but it MUST still
-                // carry a Cue entry: at the finer 0.1 ms scale these forced
-                // splits are routine (any GOP/audio run over ~3.27 s triggers
-                // one), so omitting them would leave multi-second gaps in the
-                // seek index where a player's `-ss` lands at the wrong cluster.
-                // The Cue points at this cluster's start; a player seeking here
-                // resumes decode from the first block (it back-references the
-                // prior keyframe via the codec, as players already do for
-                // non-IDR cue targets). Cue track is the current frame's track.
+                // Block-relative timestamp is signed 16-bit (~±3.27s at 0.1ms scale); a
+                // long GOP/audio stretch or PTS back-jump can wrap it, so force a fresh
+                // cluster with its own Cue entry, or seeking lands in multi-second gaps.
                 self.start_cluster(pts_ticks)?;
                 self.cues.push(CuePoint {
                     timestamp_ticks: pts_ticks,
@@ -1596,11 +1418,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // Committed to writing this frame — record its (monotonic) timestamp so
         // the next block on this track is forced strictly later.
         self.last_pts_ticks.insert(track_idx, pts_ticks);
-        // Track the highest block timestamp so a missing source duration can be
-        // back-patched from the real muxed runtime at finish().
-        // Track the block END (start + its own duration when known), not just
-        // the start, so a back-patched Segment Duration covers the final frame's
-        // full presentation instead of understating the runtime by one frame.
+        // Track the highest block END (start + duration when known), not just start,
+        // so a back-patched Segment Duration (for a missing source duration) covers
+        // the final frame's full presentation instead of understating the runtime.
         let block_end_ticks =
             pts_ticks + duration_ns.map_or(0, |d| (d as i64 / TIMESTAMP_SCALE_NS).max(1));
         self.max_block_ticks = self.max_block_ticks.max(block_end_ticks);
@@ -1608,11 +1428,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let relative_ts = (pts_ticks - self.cluster_ts_ticks) as i16;
         let duration_ticks =
             duration_ns.map(|dur_ns| (dur_ns as i64 / TIMESTAMP_SCALE_NS).max(1) as u64);
-        // A BlockAdditional with BlockAddID=2 is only conforming when the track
-        // declared the matching mvcC BlockAdditionMapping. If it did not (the
-        // dependent view's parameter sets were never captured before the header
-        // was written), drop the additional and emit a plain block rather than a
-        // non-conforming file with an orphaned BlockAddID.
+        // A BlockAdditional with BlockAddID=2 conforms only when the track declared
+        // the matching mvcC mapping; if not (dependent-view params never captured
+        // before the header was written), drop it and emit a plain block instead.
         let block_additional = match block_additional {
             Some(a)
                 if self
@@ -1626,21 +1444,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
             Some(_) => None,
             None => None,
         };
-        // Offset (ticks) of the referenced keyframe relative to this block, for
-        // any BlockGroup Block that is NOT a keyframe. Inside a BlockGroup the
-        // SimpleBlock 0x80 keyframe bit is reserved and MUST be 0, so
-        // keyframe-ness is carried ONLY by the presence/absence of a
-        // ReferenceBlock. A non-keyframe that omits it is indistinguishable from
-        // an intra frame — which is how every MPEG-2 P/B frame used to be written
-        // (the MPEG-2 parser stamps a per-frame duration, so ALL its frames take
-        // the BlockGroup path, not just the intra ones this path was written for).
-        // Gated to video: audio/subtitle frames on this path are self-contained
-        // (keyframe==true), and referencing a video keyframe from a non-video
-        // track would be a bogus cross-track reference.
-        //
-        // Fall back to 0 (self-relative) in the pre-first-keyframe corner
-        // (unreachable in practice — such frames are dropped before a cluster
-        // opens) so the marker is never absent.
+        // Offset of the referenced keyframe for a non-keyframe BlockGroup: inside a
+        // BlockGroup the SimpleBlock keyframe bit is reserved/0, so keyframe-ness is
+        // carried only by presence of a ReferenceBlock (gated to video; falls back to 0).
         let reference = if keyframe || !is_video {
             None
         } else {
@@ -1654,10 +1460,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
             )
         };
         match block_additional {
-            // MVC: base view Block + dependent-view BlockAdditional, always a
-            // BlockGroup. Non-keyframe base frames get a ReferenceBlock to the
-            // last keyframe (a keyframe carries none), so a player never treats a
-            // P/B frame as a seek point.
+            // MVC: base view Block + dependent-view BlockAdditional, always a BlockGroup;
+            // non-keyframe base frames get a ReferenceBlock so a player never treats
+            // a P/B frame as a seek point.
             Some(additional) => {
                 self.write_block_group_mvc(
                     track_idx + 1,
@@ -1679,11 +1484,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 }
             },
         }
-        // Remember this VIDEO track's last keyframe tick, so a later non-keyframe
-        // on the same track references a keyframe on its own track. Recorded per
-        // track: the ReferenceBlock above is emitted for any video track, so a
-        // single global slot produced cross-track references on a multi-video-track
-        // title (MVC base + secondary view, or a disc with two angles).
+        // Recorded per track (not a single global slot) so a later non-keyframe
+        // references a keyframe on its OWN track — a shared slot produced cross-track
+        // references on a multi-video-track title (MVC base+EL, or a two-angle disc).
         if keyframe
             && is_video
             && let Some(slot) = self.last_video_keyframe_ticks.get_mut(track_idx)
@@ -1697,11 +1500,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
             *b += data.len() as u64;
         }
 
-        // Correct the AC-3 track's Channels element from the bitstream acmod on
-        // the FIRST frame of the track. The DVD IFO audio nibble is unreliable
-        // (it claims 5.1 on a 2.0 stream); the bitstream acmod is authoritative.
-        // Only the first frame triggers it; the byte width is unchanged so the
-        // patch is a single-byte in-place rewrite (then restore position).
+        // Correct AC-3 Channels from the bitstream acmod on the first frame: the DVD
+        // IFO nibble is unreliable (claims 5.1 on a 2.0 stream); acmod is authoritative.
+        // Byte width is unchanged, so the patch is a single-byte in-place rewrite.
         if let Some(fixup) = self.ac3_channel_fixups.get_mut(&track_idx)
             && !fixup.corrected
         {
@@ -1728,10 +1529,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             }
         }
 
-        // Accumulate PGS forced-subtitle state: a display set marks the track as
-        // having shown a subtitle, and clears `all_forced` the moment a
-        // non-forced set appears. `finish()` promotes FlagForced only for a track
-        // that displayed subtitles and had every one forced.
+        // Accumulate PGS forced-subtitle state; `finish()` promotes FlagForced only
+        // for a track that displayed subtitles and had every one forced.
         if let Some(fixup) = self.pgs_forced_fixups.get_mut(&track_idx) {
             fixup.tracker.observe(data);
         }
@@ -1756,27 +1555,18 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// valid but empty MKV (zero clusters, zero frames), `finish` returns
     /// `Error::MkvInvalid` when frames were submitted but none were written.
     pub fn finish(mut self) -> io::Result<()> {
-        // A title that produced no frames (e.g. fully unreadable, or every
-        // frame dropped before the first track-0 keyframe opened a cluster)
-        // would otherwise yield a structurally-empty MKV with no clusters or
-        // cues. Surface that as an error rather than writing valid-but-empty
-        // output.
-        // Order matters. A title the seam plan dropped ENTIRELY also has a zero
-        // frame count, and `MkvInvalid` is classified by
-        // `is_skippable_title_stub` as an empty nav/menu stub — so reporting it
-        // that way would make an all-titles rip drop a real feature and finish
-        // the rest at exit 0. Decide the seam case FIRST, with a code that is
-        // not skippable.
+        // Order matters: a title the seam plan dropped ENTIRELY also has zero frames,
+        // and `MkvInvalid` is classified as a skippable empty nav/menu stub — so that
+        // case must be decided FIRST, or a real feature silently drops at exit 0.
         if self.frame_count == 0 && self.continuity.dropped_total() > 0 {
             return Err(crate::error::Error::SinkWroteNothing.into());
         }
         if self.frame_count == 0 {
             return Err(crate::error::Error::MkvInvalid.into());
         }
-        // Partial pre-cluster drops do not fail the mux (leading audio ahead of the
-        // first video IDR is normal), but they MUST leave a record: this counter
-        // was write-only, so frames silently vanished from the output while the run
-        // reported success. See the field's doc.
+        // Partial pre-cluster drops don't fail the mux (leading audio ahead of the
+        // first video IDR is normal), but must leave a record — this counter was
+        // write-only, so frames silently vanished while the run reported success.
         if self.dropped_pre_cluster > 0 {
             tracing::warn!(
                 target: "mux",
@@ -1785,21 +1575,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 "frames were discarded before the first cluster opened (no track-0 video keyframe had arrived yet); they are absent from the output"
             );
         }
-        // Frames the playlist's clip marks excluded are dropped on purpose — a
-        // join legitimately discards the material a disc stores twice — but the
-        // count must not be write-only. Same reasoning as the pre-cluster
-        // counter above: an unexpected VOLUME here is how a title ends up
-        // quietly short while the run reports success.
+        // Frames excluded by the playlist's clip marks are dropped on purpose (a join
+        // legitimately discards material a disc stores twice), but the count must not
+        // be write-only — same reasoning as the pre-cluster counter above.
         let seam_dropped = self.continuity.dropped_total();
-        // Counting a drop is not the same as bounding it. A join legitimately
-        // discards the material a disc stores twice — tens of frames — but if a
-        // title's marks do not line up with its PES clock the plan can discard
-        // most of it, and the only other gate is a GLOBAL zero-frame check
-        // whose error is additionally classified as a skippable stub. Between
-        // them, a title emitting seconds of a two-hour feature exits 0. That is
-        // the defect this change set already shipped once.
-        //
-        // More dropped than kept is never a real join, so it fails.
+        // Counting isn't bounding: if marks don't line up with the PES clock, the plan
+        // can discard most of a title, and the only other gate (zero-frame check) is a
+        // skippable stub — a title emitting seconds of a feature exiting 0 shipped once.
         if seam_dropped > self.frame_count {
             return Err(crate::error::Error::SeamPlanDroppedMost {
                 dropped: seam_dropped,
@@ -1825,22 +1607,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // Close final cluster
         self.end_cluster()?;
 
-        // Correct FlagForced for PGS subtitle tracks from what the mux actually
-        // saw. In-place single-byte rewrite of the reserved value, then restore
-        // the append position for the Cues that follow.
-        //
-        // PROMOTE (0→1) a track that proved to be forced narrative: it displayed
-        // subtitles and every one carried `forced_on_flag`. Positive evidence,
-        // no further justification needed.
-        //
-        // DEMOTE (1→0) a track whose vendor label claims forced but whose content
-        // contradicts it — the case a whole-file mux is uniquely entitled to
-        // judge, because unlike the scan-time probe it has seen EVERY display set
-        // on the track. Gated by
-        // [`super::codec::pgs::demotable`]: an absence of `forced_on_flag` proves
-        // nothing on a disc whose authoring never sets it, so the gate demands
-        // that some track here demonstrably does, and that this track have the
-        // shape of a full dialogue track rather than of a forced-narrative one.
+        // Correct FlagForced for PGS tracks from what the mux saw (in-place rewrite).
+        // PROMOTE (0->1) a track whose displays all carry `forced_on_flag`. DEMOTE
+        // (1->0) a vendor-labelled track that contradicts it, per [`super::codec::pgs::demotable`].
         let disc_uses_forced_flag = self
             .pgs_forced_fixups
             .values()
@@ -1909,18 +1678,14 @@ impl<W: Write + Seek> MkvMuxer<W> {
             ebml::end_master(&mut self.writer, cues_pos)?;
         }
 
-        // Per-track BPS statistics tags (mkvmerge convention). A reader that
-        // reads the container `BPS` tag (Windows Explorer's MKV property
-        // handler) rather than computing bitrate from stream size shows a
-        // bitrate for EVERY track this way, not just CBR audio.
+        // Per-track BPS statistics tags (mkvmerge convention): a reader that shows
+        // container `BPS` (Windows Explorer) rather than computing it from stream
+        // size gets a bitrate for EVERY track this way, not just CBR audio.
         self.write_bps_tags()?;
 
-        // Back-patch SeekHead SeekPosition values now that all element offsets
-        // are known. When no Cues element was written (zero cue points), the
-        // CUES entry's SeekPosition would otherwise be back-patched to
-        // `cues_offset`, which now holds Tags / EOF — a dangling pointer to a
-        // non-Cues element. Skip that fixup and instead Void the whole CUES Seek
-        // entry (below) so the SeekHead carries no false pointer.
+        // Back-patch SeekHead SeekPosition values now offsets are known. If no Cues
+        // were written, skip the CUES fixup (else it'd point at whatever now sits at
+        // `cues_offset` — Tags/EOF) and Void the whole entry below instead.
         for fixup in &self.seek_fixups {
             if fixup.target_id == ebml::CUES && !have_cues {
                 continue;
@@ -1947,14 +1712,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 self.writer
                     .write_all(&(self.max_block_ticks as f64).to_be_bytes())?;
             } else {
-                // The timeline never advanced past tick 0 (a degenerate
-                // single-frame recovery at t=0 with no per-frame duration): we
-                // can't derive a runtime, so DON'T leave a literal DURATION=0.0
-                // (players read that as a zero-length/corrupt file). Void the
-                // whole 11-byte DURATION element (ID 2 + size 1 + 8-byte payload)
-                // so the Segment simply omits it, as an unknown-duration source
-                // did before the back-patch. `pos` is the payload start (+3 from
-                // the element start), so back up 3.
+                // Timeline never advanced past tick 0 (degenerate single-frame recovery):
+                // can't derive a runtime, so DON'T leave DURATION=0.0 (reads as corrupt).
+                // Void the whole 11-byte element instead; `pos` is payload start (+3), back up 3.
                 self.writer.seek(std::io::SeekFrom::Start(pos - 3))?;
                 ebml::write_id(&mut self.writer, ebml::VOID)?;
                 ebml::write_size(&mut self.writer, 9)?; // 11 - 1 (Void id) - 1 (size)
@@ -1962,12 +1722,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
             }
         }
 
-        // Neutralise the unused CUES Seek entry. The entry is a fixed 21-byte
-        // Seek master: SEEK(2 ID + 1 size) + SEEK_ID(2+1) + 4-byte target id +
-        // SEEK_POSITION(2+1) + 8-byte value = 21 bytes. A Void (0xEC, 1-byte ID)
-        // with a 1-byte size VINT covering the remaining 19 bytes occupies
-        // exactly 1 + 1 + 19 = 21 bytes, overwriting the entry in place without
-        // shifting any following element.
+        // Neutralise the unused CUES Seek entry: it's a fixed 21-byte Seek master, and
+        // a 1-byte Void ID + 1-byte size VINT covering the remaining 19 bytes occupies
+        // exactly 21 bytes too, overwriting it in place without shifting later elements.
         if !have_cues && let Some(entry_pos) = self.cues_seek_entry_pos {
             self.writer.seek(std::io::SeekFrom::Start(entry_pos))?;
             ebml::write_id(&mut self.writer, ebml::VOID)?;
@@ -2229,11 +1986,9 @@ mod tests {
         };
         // ── BlockGroup path: every frame carries a duration (the MPEG-2 shape).
         let t = MkvTrack::video(&v);
-        // Write through SharedWriter and call finish(), so the buffer is a WELL-FORMED
-        // Matroska file whose cluster sizes are back-patched. The previous form took
-        // `muxer.writer.into_inner()` without finishing, leaving cluster sizes unwritten
-        // — which is why this test could only byte-scan for a ReferenceBlock instead of
-        // parsing the structure it actually cares about.
+        // Write through SharedWriter and call finish() so cluster sizes are back-patched
+        // (the previous form skipped finish(), leaving sizes unwritten, so this test could
+        // only byte-scan for a ReferenceBlock instead of parsing the real structure).
         use std::sync::{Arc, Mutex};
         let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
         let mut muxer = MkvMuxer::new(SharedWriter(shared.clone()), &[t], None, 0.0, &[]).unwrap();
@@ -2251,11 +2006,9 @@ mod tests {
         muxer.finish().unwrap();
         let data = shared.lock().unwrap().clone().into_inner();
 
-        // Assert PER BLOCK, not "a ReferenceBlock exists somewhere". Keyframe-ness
-        // inside a BlockGroup is signalled by the ABSENCE of ReferenceBlock, so the
-        // I-frame must carry none and each non-keyframe must carry one pointing back
-        // at the keyframe. A mutant that emits one on every block satisfies a
-        // presence check while making the whole file read as non-keyframe.
+        // Assert PER BLOCK: keyframe-ness in a BlockGroup is signalled by ABSENCE of
+        // ReferenceBlock, so the I-frame must carry none and each non-keyframe exactly
+        // one. A blanket presence check would pass a mutant that emits one on every block.
         let groups = all_block_groups(&data);
         assert_eq!(
             groups.len(),
@@ -2651,10 +2404,9 @@ mod tests {
 
     #[test]
     fn dts_variants_map_to_registered_a_dts_codec_id() {
-        // The Matroska codec-ID registry defines `A_DTS` for the whole DTS
-        // family (core, DTS-HD HRA, DTS-HD MA). The `/MA` and `/HR` suffixes
-        // are not registered and break strict parsers, so every DTS variant
-        // must emit plain `A_DTS`.
+        // `A_DTS` is the sole registered ID for the whole DTS family; the `/MA` and
+        // `/HR` suffixes aren't registered and break strict parsers, so every DTS
+        // variant must emit plain `A_DTS`.
         for codec in [Codec::Dts, Codec::DtsHdMa, Codec::DtsHdHr] {
             let track = MkvTrack::audio(&audio_stream(codec));
             assert_eq!(
@@ -2673,15 +2425,9 @@ mod tests {
 
     #[test]
     fn every_audio_codec_gets_its_own_registered_codec_id() {
-        // A CodecID names the payload. Falling through to A_AC3 for a codec the
-        // match had no arm for writes a track declaring AC-3 while carrying
-        // something else entirely — a player either refuses the track or decodes
-        // noise. Every audio codec this crate can produce must map to its own
-        // registered Matroska ID.
-        //
-        // Reachable: ifo.rs maps DVD audio_coding_mode 3 to Codec::Mp2, and
-        // mp4/read.rs maps the `mp4a` sample entry to Codec::Aac, so a DVD with
-        // MPEG audio and an mp4:// AAC source both hit this path.
+        // A CodecID names the payload: falling through to A_AC3 for an unmatched codec
+        // writes a track declaring AC-3 but carrying something else, which players refuse
+        // or decode as noise. Every producible codec must map to its own registered ID.
         for (codec, want) in [
             (Codec::Ac3, "A_AC3"),
             (Codec::Ac3Plus, "A_EAC3"),
@@ -2918,19 +2664,15 @@ mod tests {
         );
 
         // Defensively confirm no Seek entry's SeekPosition resolves to the (now
-        // Tags/EOF) cues offset: scan all 8-byte SeekPosition values in the
-        // SeekHead and ensure none equals the offset where Cues would have been.
-        // (Sanity: the file must still parse its real elements.)
+        // Tags/EOF) cues offset, and that the file still parses its real elements.
         assert!(
             find_id(&data, ebml::INFO).is_some() && find_id(&data, ebml::TRACKS).is_some(),
             "Info and Tracks must still be present and seekable"
         );
 
-        // Suppressing the CUES fixup must suppress ONLY that one. The remaining
-        // Seek entries still have to be back-patched to their real offsets, or
-        // the SeekHead ships with SeekPosition=0 for Info and Tracks — a
-        // player-visible index pointing at the Segment header instead of the
-        // elements it names.
+        // Suppressing the CUES fixup must suppress ONLY that one: the other Seek entries
+        // still need back-patching to real offsets, or the SeekHead ships SeekPosition=0
+        // for Info/Tracks — an index pointing at the Segment header, not the elements.
         let (_, seg_start) = locate_segment(&data);
         let entries = parse_seekhead(&data);
         for target in [ebml::INFO, ebml::TRACKS] {
@@ -2978,10 +2720,9 @@ mod tests {
 
     #[test]
     fn block_ts_exempts_video_from_monotonic_nudge() {
-        // VIDEO keeps its true PTS even when non-monotonic in storage order — a
-        // B-frame whose presentation PTS sits below the frame stored before it
-        // must NOT be nudged to prev+1ms (that clobbering is what produced the
-        // "non monotonically increasing dts" flood on decode).
+        // VIDEO keeps its true PTS even when non-monotonic in storage order: a B-frame
+        // whose PTS sits below the prior stored frame must NOT be nudged to prev+1ms
+        // (that clobbering produced the "non monotonically increasing dts" decode flood).
         assert_eq!(
             block_ts(true, Some(1040), 1000),
             1000,
@@ -3205,10 +2946,8 @@ mod tests {
         let kf_region = &data[pos_before_kf as usize..pos_after_kf as usize];
         let nkf_region = &data[pos_after_kf as usize..pos_after_nkf as usize];
 
-        // In a SimpleBlock, after ID + size + track_vint + 2-byte timestamp,
-        // the next byte is flags. Keyframe flag = 0x80, non-keyframe = 0x00.
-        // Find the flags byte in each region: it's the byte after the 2-byte timestamp.
-        // SimpleBlock ID is 0xA3. Find it and walk past ID + size + vint + ts.
+        // In a SimpleBlock (ID 0xA3), the flags byte follows ID + size + track_vint +
+        // 2-byte timestamp. Keyframe flag = 0x80, non-keyframe = 0x00.
         fn extract_flags(region: &[u8]) -> u8 {
             // Find 0xA3 (SimpleBlock ID)
             let sb_pos = region.iter().position(|&b| b == 0xA3).unwrap();
@@ -4174,12 +3913,9 @@ mod tests {
 
     #[test]
     fn keyframe_driven_clusters_start_on_video_keyframe() {
-        // The COMMON case: a keyframe-driven cluster (opened because a video
-        // keyframe crossed the cluster-duration boundary) must begin with the
-        // video keyframe. With a 1 s GOP and 3 s clusters, keyframe spacing keeps
-        // every keyframe-driven cluster well within the i16 block span, so no
-        // forced i16-split clusters appear here and EVERY cluster is
-        // keyframe-aligned.
+        // COMMON case: a keyframe-driven cluster (opened when a video keyframe crosses
+        // the cluster-duration boundary) must begin with that keyframe. With a 1s GOP and
+        // 3s clusters, no forced i16-split clusters appear, so EVERY cluster is aligned.
         let tracks = [make_video_track(), make_audio_track()];
         let frames = frames_for(30.0, 1.0);
         let (data, _) = mux_to_bytes(&tracks, &[], &frames);
@@ -4209,10 +3945,9 @@ mod tests {
 
     #[test]
     fn cue_count_equals_cluster_count() {
-        // Regression for the cluster-split Cue gap: EVERY cluster — whether
-        // opened by a video keyframe OR forced by the i16 block-relative split —
-        // must carry a Cue, so cluster count always equals cue count and the
-        // seek index has no multi-second holes.
+        // Regression for the cluster-split Cue gap: EVERY cluster (keyframe-opened OR
+        // forced by the i16 block-relative split) must carry a Cue, so cluster count
+        // equals cue count and the seek index has no multi-second holes.
         let tracks = [make_video_track(), make_audio_track()];
         let frames = frames_for(30.0, 1.0);
         let (data, _) = mux_to_bytes(&tracks, &[], &frames);
@@ -4235,18 +3970,9 @@ mod tests {
 
     #[test]
     fn cue_count_equals_cluster_count_blockgroup_vfr() {
-        // DVD (MPEG-2) seek-index regression. Unlike UHD/HEVC — which emits
-        // SimpleBlocks (`duration_ns = None`) — DVD video is VFR: every coded
-        // picture carries a per-frame `duration_ns = Some(..)`, so it is written
-        // as a BlockGroup, NOT a SimpleBlock. The Cues index must still get one
-        // cue per cluster on this path exactly like the SimpleBlock path; a DVD
-        // MKV with thousands of clusters and ZERO cues lets players chapter-seek
-        // but never scrub. The pre-existing cue tests all feed `None` (SimpleBlock
-        // only), leaving this BlockGroup path unguarded — this test covers it.
-        //
-        // Drives the REAL `Mpeg2Parser` end-to-end (decode-order frames,
-        // non-monotonic B-frame display PTS, telecine field durations) into the
-        // muxer, so it exercises the genuine DVD frame shape, not a hand-built one.
+        // DVD (MPEG-2) seek-index regression: VFR frames are BlockGroups (not the
+        // SimpleBlocks prior cue tests cover), which must still emit one cue per cluster
+        // or a DVD MKV scrubs nowhere. Driven by the REAL `Mpeg2Parser` end-to-end.
         use crate::mux::codec::CodecParser;
         use crate::mux::codec::mpeg2::Mpeg2Parser;
         use crate::mux::ts::PesPacket;
@@ -4330,10 +4056,9 @@ mod tests {
         muxer.finish().unwrap();
         let data = shared.lock().unwrap().clone().into_inner();
 
-        // The muxer branches on `duration_ns`: Some → BlockGroup, None →
-        // SimpleBlock. Every frame above carries Some, so this output is wholly
-        // the BlockGroup path — confirmed structurally by walking the first
-        // cluster's children (a BlockGroup present, no SimpleBlock).
+        // The muxer branches on `duration_ns` (Some -> BlockGroup, None -> SimpleBlock).
+        // Every frame above carries Some, so confirm the BlockGroup path structurally by
+        // walking the first cluster's children (a BlockGroup present, no SimpleBlock).
         let clusters = find_clusters(&data);
         {
             let (c0_start, c0_size, _) = clusters[0];
@@ -4401,11 +4126,9 @@ mod tests {
                 "cue position 0x{:X} did not resolve to a cluster",
                 pos
             );
-            // CueTrack is a Matroska TrackNumber (1-based), not the muxer's
-            // 0-based track index. Every cluster here is opened by the primary
-            // video track (index 0), so its cues must name track 1. A cue whose
-            // CueTrack is 0 names no track at all and players ignore the whole
-            // seek index.
+            // CueTrack is a 1-based Matroska TrackNumber, not the muxer's 0-based index.
+            // Clusters here are opened by video (index 0), so cues must name track 1;
+            // CueTrack=0 names no track and players ignore the whole seek index.
             assert_eq!(
                 track, 1,
                 "CueTrack must be the 1-based TrackNumber of the cluster-opening \
@@ -4442,14 +4165,9 @@ mod tests {
 
     #[test]
     fn opening_keyframe_with_nonzero_disc_pts_anchors_base_not_corrupted() {
-        // Opening-GOP PTS handling regression. A DVD title
-        // opens on an I-frame the disc stamps at its REAL timeline PTS (here
-        // ~10 s, a large non-zero value — NOT 0). The muxer must anchor `base` on
-        // that first kept keyframe so the first cluster's timestamp is 0 (the
-        // `.max(0)` floor must NOT corrupt it into a huge value or wrap), and the
-        // following frame must land exactly one frame interval (40 ms = 400 ticks
-        // at the 0.1 ms scale) later — proving the opening pictures keep their
-        // relative timeline and aren't garbled.
+        // Opening-GOP PTS regression: a DVD title opens on an I-frame at its REAL PTS
+        // (~10s, non-zero). The muxer must anchor `base` there so cluster 0 is timestamp 0
+        // (the `.max(0)` floor must not wrap it) and the next frame lands one interval later.
         let tracks = [make_video_track()];
         const OPEN_PTS: i64 = 10_000_000_000; // 10 s opening anchor
         let frames = vec![
@@ -4509,11 +4227,9 @@ mod tests {
 
     #[test]
     fn duration_placeholder_voided_when_timeline_never_advances() {
-        // Degenerate recovery: a source with no declared duration muxes exactly
-        // one keyframe at tick 0 with no per-frame duration, so max_block_ticks
-        // stays 0. The reserved DURATION placeholder must be VOIDED (element
-        // omitted) rather than left as a bogus 0.0 that players read as a
-        // zero-length file.
+        // Degenerate recovery: one keyframe at tick 0 with no duration leaves
+        // max_block_ticks at 0, so the reserved DURATION placeholder must be VOIDED
+        // (omitted) rather than left as a bogus 0.0 that players read as zero-length.
         let tracks = [make_video_track()];
         let one_frame = vec![(0usize, 0i64, true, vec![0xAAu8; 16])];
         let (data, _) = mux_to_bytes(&tracks, &[], &one_frame);
@@ -4612,14 +4328,9 @@ mod tests {
 
     #[test]
     fn long_audio_gap_forces_cluster_no_i16_overflow() {
-        // Regression for the `(pts_ms - cluster_ts_ms) as i16` truncation:
-        // a single video keyframe at t=0 opens one cluster, then a long
-        // audio-only stretch (no further video keyframe) drifts well past
-        // i16::MAX ms (~32.767 s). Without the overflow guard the audio
-        // blocks past 32.767 s would write a wrapped (negative) relative
-        // timestamp into the SimpleBlock. With the guard a fresh cluster is
-        // forced so every relative_ts stays in range and reconstructs to the
-        // true absolute timestamp.
+        // Regression for `(pts_ms - cluster_ts_ms) as i16` truncation: one keyframe at
+        // t=0 opens a cluster, then an audio-only stretch drifts past i16::MAX ms
+        // (~32.767s); without the overflow guard blocks would write a wrapped relative ts.
         let tracks = [make_video_track(), make_audio_track()];
         let mut frames: Vec<(usize, i64, bool, Vec<u8>)> = Vec::new();
         // One video keyframe at t=0 (opens the first cluster).
@@ -4664,10 +4375,9 @@ mod tests {
             "expected the i16 guard to force extra clusters, got {}",
             clusters.len()
         );
-        // CLUSTER-SPLIT CUE REGRESSION: each i16-forced split cluster is NOT
-        // keyframe-aligned (the only video keyframe is at t=0), yet it MUST carry
-        // a Cue — otherwise a player seeking into the long audio stretch lands in
-        // a multi-second seek-index hole. Every cluster must have a matching cue.
+        // CLUSTER-SPLIT CUE REGRESSION: an i16-forced split cluster is NOT
+        // keyframe-aligned, yet MUST still carry a Cue or a player seeking into
+        // the long audio stretch lands in a multi-second seek-index hole.
         let cues = parse_cues(&data);
         assert_eq!(
             cues.len(),
@@ -4683,12 +4393,9 @@ mod tests {
             max_cue > MAX_BLOCK_REL,
             "cue coverage must extend past the first i16 boundary, max cue {max_cue}"
         );
-        // The cue a forced split emits must be as usable as a keyframe cue: its
-        // CueClusterPosition is a SEGMENT-RELATIVE offset that has to land on the
-        // cluster it describes, and its CueTrack has to be the 1-based
-        // TrackNumber of the frame that forced the split (audio = track 2 here).
-        // Neither was asserted, so a wrong sign on the offset or a 0 track number
-        // would have shipped as a seek index pointing at nothing.
+        // A forced-split cue must be as usable as a keyframe cue: CueClusterPosition is
+        // SEGMENT-RELATIVE and must land on its cluster, and CueTrack must be the
+        // 1-based TrackNumber that forced the split — else the seek index points at nothing.
         let (_, seg_start) = locate_segment(&data);
         let cluster_starts: Vec<usize> = clusters
             .iter()
@@ -4716,10 +4423,9 @@ mod tests {
                 "CueTrack must be a 1-based TrackNumber (1 = video, 2 = audio), got {track}"
             );
         }
-        // At least one cue must belong to the AUDIO track: every cluster after the
-        // first is opened by an audio frame, and the cue records that frame's
-        // track. A `track_idx * 1` slip would report 0 (no such track) and a
-        // `track_idx - 1` slip would underflow or report the video track.
+        // At least one cue must belong to the AUDIO track: every cluster after the first
+        // is opened by an audio frame. A `track_idx * 1` slip would report 0 (no track)
+        // and a `track_idx - 1` slip would underflow or report the video track.
         assert!(
             cues.iter().any(|(_, track, _)| *track == 2),
             "the audio-forced splits must emit cues naming the audio TrackNumber (2)"
@@ -4801,10 +4507,8 @@ mod tests {
     #[test]
     fn a_title_the_seam_plan_emptied_is_not_reported_as_a_skippable_stub() {
         let tracks = [make_video_track()];
-        // TWO clips (SeamPlan::from_clips requires at least two, with strictly
-        // increasing IN marks), covering 100s..200s and 200s..300s in 45 kHz
-        // ticks. Every frame below sits far before the first IN, so the plan
-        // places none of them and drops them all.
+        // TWO clips (SeamPlan::from_clips requires >=2, strictly increasing IN marks);
+        // every frame below sits far before the first IN, so the plan drops them all.
         let clips = [
             crate::disc::Clip {
                 feed_span: None,
@@ -4844,13 +4548,9 @@ mod tests {
 
     #[test]
     fn backjumped_audio_handled_by_i16_split_no_wrap() {
-        // A NON-VIDEO (audio) frame whose PTS back-jumps far below the open
-        // cluster does NOT drive an epoch (only video does — that is the rc3
-        // fix), so it is not rebased forward. Instead the i16 block-relative
-        // guard catches the out-of-range negative offset and forces a fresh,
-        // Cue-carrying cluster floored at t=0 — no negative i16 relative, no
-        // wrapped `as u64` cluster timestamp. Build: video kf at 0, video kf at
-        // 40s, then audio at raw t=0 (a 40s back-jump).
+        // A NON-VIDEO frame back-jumping below the open cluster does NOT drive an
+        // epoch (only video does, per the rc3 fix); instead the i16 block-relative
+        // guard forces a fresh Cue-carrying cluster floored at t=0, avoiding wrap.
         let tracks = [make_video_track(), make_audio_track()];
         let frames = vec![
             (0usize, 0i64, true, vec![0x01; 16]),
@@ -4885,11 +4585,9 @@ mod tests {
 
     #[test]
     fn negative_pts_audio_after_keyframe_does_not_wrap() {
-        // Stream order: video keyframe at 5s (anchors base=5000ms, opens cluster
-        // at ts 0), then an audio frame with raw PTS 4s — earlier than base.
-        // raw_ms - base = -1000ms (negative). It must be floored to 0 rather
-        // than wrapping the `as u64` cluster/cue write or overflowing the i16
-        // relative cast.
+        // Video keyframe at 5s anchors base=5000ms; audio at raw 4s gives
+        // raw_ms - base = -1000ms, which must floor to 0 rather than wrapping the
+        // `as u64` cluster/cue write or overflowing the i16 relative cast.
         let tracks = [make_video_track(), make_audio_track()];
         let frames_in_order = [
             (0usize, 5_000_000_000i64, true, vec![0xBB; 16]), // video kf at 5s
@@ -4932,12 +4630,9 @@ mod tests {
         assert_eq!(&b[..n], &[0x3F, 0xFF, 0xFF]);
     }
 
-    // ============================================================
-    // SimpleBlock byte layout (Matroska §6.2.3): the element's declared
-    // size must equal track_vint_len + 2 (rel ts) + 1 (flags) + data, and
-    // the rel-ts is a signed 16-bit big-endian field. A wrong size desyncs
-    // every following element; a wrong ts byte order corrupts A/V sync.
-    // ============================================================
+    // SimpleBlock byte layout (Matroska §6.2.3): declared size must equal
+    // track_vint_len + 2 (rel ts) + 1 (flags) + data, with rel-ts a signed 16-bit
+    // big-endian field. A wrong size desyncs elements; wrong byte order corrupts A/V sync.
 
     /// Locate the first SimpleBlock and return (declared_size, track_vint_len,
     /// rel_ts, flags, data_slice) by decoding its header inline.
@@ -5020,12 +4715,9 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // BlockGroup (Matroska §6.2.4): a Block inside a BlockGroup carries
-    // BlockDuration, and the Block's keyframe flag bit (0x80) MUST be 0
-    // (keyframe-ness is signalled by absence of ReferenceBlock). PGS
-    // subtitle frames take this path.
-    // ============================================================
+    // BlockGroup (Matroska §6.2.4): a Block inside a BlockGroup carries BlockDuration,
+    // and its keyframe flag bit (0x80) MUST be 0 (keyframe-ness is signalled by
+    // absence of ReferenceBlock). PGS subtitle frames take this path.
 
     /// One parsed BlockGroup.
     struct BlockGroupInfo {
@@ -5064,10 +4756,9 @@ mod tests {
             assert_eq!(tid, ebml::CLUSTER_TIMESTAMP);
             cursor.seek(io::SeekFrom::Current(tsize as i64)).unwrap();
             while (cursor.position() as usize) < body.len() {
-                // Stop at a tail that is not a whole element (padding, or a cluster
-                // body that runs to the end of the buffer) rather than unwrapping.
-                // Callers assert the expected BlockGroup COUNT, so a desync that
-                // truncated this walk would fail there rather than pass quietly.
+                // Stop at a non-whole-element tail (padding/buffer end) rather than
+                // unwrapping; callers assert the BlockGroup COUNT, so a desync here
+                // fails there instead of passing quietly.
                 let Ok((id, size, _)) = ebml::read_element_header(&mut cursor) else {
                     break;
                 };
@@ -5176,12 +4867,9 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // Cluster boundary (CLUSTER_DURATION_TICKS): a new cluster opens on a
-    // video keyframe once >= the cluster duration has elapsed since the open
-    // cluster's timestamp. A keyframe exactly at the boundary opens a new
-    // cluster; one just under stays in the current cluster.
-    // ============================================================
+    // Cluster boundary (CLUSTER_DURATION_TICKS): a new cluster opens on a video
+    // keyframe once >= the cluster duration has elapsed since the open cluster's
+    // timestamp; one just under the boundary stays in the current cluster.
 
     #[test]
     fn keyframe_at_cluster_boundary_opens_new_cluster() {
@@ -5220,11 +4908,8 @@ mod tests {
         );
     }
 
-    // ============================================================
     // monotonic_ts saturating add — at i64::MAX the +1 must saturate, not
-    // overflow-panic. (The strictly-monotonic invariant relies on
-    // saturating_add.)
-    // ============================================================
+    // overflow-panic; the strictly-monotonic invariant relies on saturating_add.
 
     #[test]
     fn monotonic_ts_saturates_at_i64_max() {
@@ -5235,19 +4920,13 @@ mod tests {
         assert_eq!(monotonic_ts(Some(10), 100), 100);
     }
 
-    // ============================================================
-    // SeekHead encoding (Matroska §7.1): the muxer writes fixed-width
-    // entries — SeekID as a 4-byte binary element (size 0x84) and
-    // SeekPosition as an 8-byte uint (size 0x88) so they can be
-    // back-patched in place. Verify the declared SeekID matches the target
-    // element ID bytes.
-    // ============================================================
+    // SeekHead encoding (Matroska §7.1): the muxer writes fixed-width entries —
+    // SeekID as a 4-byte binary element (0x84) and SeekPosition as an 8-byte
+    // uint (0x88) — so they can be back-patched in place.
 
-    // ============================================================
-    // dolby_vision_config (dvcC / DOVIDecoderConfigurationRecord) bit
-    // packing. Byte 2: profile(7 bits) << 1 | level high bit. Byte 3:
-    // level low 5 bits << 3 | rpu | el | bl. Byte 4: bl_compat_id << 4.
-    // ============================================================
+    // dolby_vision_config (dvcC) bit packing: byte 2 = profile(7 bits) << 1 |
+    // level high bit; byte 3 = level low 5 bits << 3 | rpu | el | bl; byte 4 =
+    // bl_compat_id << 4.
 
     #[test]
     fn dolby_vision_config_packs_level_and_compat_id() {
@@ -5276,12 +4955,9 @@ mod tests {
         assert_eq!(c[3] >> 3, 0);
     }
 
-    // ============================================================
-    // Full round-trip: mux frames → MKV bytes → MkvStream reader → frames.
-    // This is the strongest "never silently truncate" property: every
-    // written frame must be readable back with the same track, keyframe
-    // flag and data.
-    // ============================================================
+    // Full round-trip: mux frames -> MKV bytes -> MkvStream reader -> frames. The
+    // strongest "never silently truncate" property: every written frame must be
+    // readable back with the same track, keyframe flag and data.
 
     #[test]
     fn muxed_frames_round_trip_through_reader() {
@@ -5529,10 +5205,9 @@ mod tests {
 
     #[test]
     fn video_576i_field_order_undetermined_at_track_build() {
-        // Field order is a bitstream property the IFO/MPLS scan cannot know, so
-        // the track is built with FieldOrder=UNDETERMINED — never a scan-time
-        // guess. The mux stream sets the MEASURED value from the first coded
-        // picture before the header is written (mkvstream::apply_coding_to_track).
+        // Field order is a bitstream property the IFO/MPLS scan cannot know, so the
+        // track is built UNDETERMINED — never a scan-time guess; the mux stream sets
+        // the MEASURED value from the first coded picture (apply_coding_to_track).
         let v = VideoStream {
             pid: 0xE0,
             codec: Codec::Mpeg2,
@@ -5556,15 +5231,9 @@ mod tests {
 
     #[test]
     fn interlaced_576i_omits_default_decoded_field_duration_keeps_full_frame_duration() {
-        // Interlaced-fps signalling regression. The Windows-fps fix: a 576i25 track must
-        // carry the FULL-FRAME DefaultDuration (40 ms → `1/DefaultDuration` = 25
-        // fps, the only rate every tool trusts) and must NOT emit
-        // DefaultDecodedFieldDuration. rc.5.1 emitted the 20 ms field duration to
-        // try to fix Windows; the captured real-media evidence proved it did the
-        // opposite (Explorer 12.5 fps, analyzer VFR). A known-correct rip omits
-        // it (Explorer 25 fps, analyzer CFR). So: frame duration present = 40 ms,
-        // field duration ABSENT, interlace signalling (FlagInterlaced/FieldOrder)
-        // retained.
+        // Windows-fps regression: a 576i25 track must carry FULL-FRAME DefaultDuration
+        // (40ms -> 25fps) and NOT emit DefaultDecodedFieldDuration. rc.5.1's 20ms field
+        // duration made Explorer report 12.5fps/VFR; a known-good rip omits it (25fps/CFR).
         let v = VideoStream {
             pid: 0xE0,
             codec: Codec::Mpeg2,
@@ -5625,15 +5294,9 @@ mod tests {
 
     #[test]
     fn field_duration_when_set_is_direct_trackentry_child_not_in_video() {
-        // GUARDS the element nesting for the retained (now non-default) writer
-        // path: if a caller DOES set field_duration_ns > 0,
-        // DefaultDecodedFieldDuration (0x234E7A) must be emitted as a DIRECT child
-        // of TrackEntry — NOT nested inside the Video master (which only holds
-        // FlagInterlaced / FieldOrder), per the Matroska schema. The production
-        // video path passes 0 (so the element is suppressed — see
-        // interlaced_576i_omits_default_decoded_field_duration_keeps_full_frame_duration);
-        // this test builds a track with a non-zero field duration to exercise the
-        // writer guard and pin its (correct) nesting depth.
+        // GUARDS nesting for the retained (now non-default) writer path: if a caller
+        // sets field_duration_ns > 0, DefaultDecodedFieldDuration must be a DIRECT
+        // child of TrackEntry, NOT nested in Video, per the Matroska schema.
         let mut t = make_video_track();
         t.interlaced = true;
         t.field_order = ebml::FIELD_ORDER_TFF;
@@ -5705,11 +5368,9 @@ mod tests {
 
     #[test]
     fn pal_576i_emits_bt470bg_colour_codes() {
-        // GUARDS audit §2 colour-code gap: the dvd.rs tests assert at the stream
-        // layer (ColorSpace::Bt470bg); nothing asserted the actual CICP tuple
-        // emitted in the MKV. PAL SD must emit matrix/transfer/primaries =
-        // (5,5,5) with range=1 (BT.470BG). A swap with NTSC's (6,6,6) goes
-        // uncaught by the stream-layer tests alone.
+        // GUARDS audit §2 colour-code gap: dvd.rs only asserts at the stream layer
+        // (ColorSpace::Bt470bg), not the actual CICP tuple emitted in the MKV, so
+        // a swap with NTSC's (6,6,6) would go uncaught without this test.
         let v = VideoStream {
             pid: 0xE0,
             codec: Codec::Mpeg2,
@@ -5826,12 +5487,9 @@ mod tests {
 
     #[test]
     fn ntsc_480i_duration_metadata_and_field_order_undetermined_at_build() {
-        // NTSC 480i duration metadata (Windows-fps fix) PLUS field-order honesty.
-        // Field order is a bitstream property the IFO/MPLS scan cannot know, so a
+        // NTSC 480i duration metadata (Windows-fps fix) PLUS field-order honesty: a
         // track built without a measured picture carries FieldOrder=UNDETERMINED
-        // and the element is OMITTED — never a hardcoded TFF guess. The MEASURED
-        // value is set by the mux stream from the first coded picture (see
-        // mkvstream::apply_coding_to_track and its dedicated test).
+        // (omitted), never a hardcoded TFF guess — see apply_coding_to_track.
         let v = VideoStream {
             pid: 0xE0,
             codec: Codec::Mpeg2,
@@ -5936,11 +5594,9 @@ mod tests {
 
     #[test]
     fn finalize_emits_per_track_bps_tags() {
-        // At finalize a Tags master with a per-track BPS SimpleTag is written.
-        // BPS = bytes*8/duration_secs, using the duration the SOURCE declared —
-        // the muxed timeline is only consulted when the source gave none. Here
-        // the source declares 10 s while the frames span 2 s, so the two answers
-        // differ and the tag must carry the 10 s one.
+        // At finalize a Tags master carries per-track BPS = bytes*8/duration_secs,
+        // using the SOURCE-declared duration (muxed timeline only used if none given).
+        // Here the source declares 10s while frames span 2s, so the tag must use 10s.
         let tracks = [make_video_track(), make_audio_track()];
         let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
         let writer = SharedWriter(shared.clone());
@@ -5979,18 +5635,9 @@ mod tests {
 
     #[test]
     fn bps_tags_use_the_backpatched_duration_when_the_source_declares_none() {
-        // An HD-DVD title declares no duration, so DURATION is reserved and
-        // back-patched at finish() from the muxed timeline — and the BPS tags are
-        // computed from that derived runtime. Every operator in the chain
-        // (max_block_ticks → seconds → bytes*8/seconds) was unasserted, so a
-        // wrong scale, a wrong sign on the final block's own duration, or a
-        // multiply where a divide belongs all shipped a plausible-looking file
-        // with a bitrate and runtime that are simply wrong.
-        //
-        // Ten 40 ms frames at 0..360 ms, each declaring a 40 ms duration:
-        //   last block start = 360 ms = 3600 ticks (0.1 ms scale)
-        //   its own duration = 40 ms  =  400 ticks
-        //   max_block_ticks  = 4000 ticks = 0.4 s of muxed runtime
+        // No declared duration -> DURATION is back-patched from the muxed timeline at
+        // finish(), and BPS derives from that runtime (the max_block_ticks -> seconds ->
+        // bytes*8/seconds chain was previously unasserted). Ten 40ms frames -> 0.4s runtime.
         let tracks = [make_video_track()];
         let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
         let writer = SharedWriter(shared.clone());
@@ -6144,10 +5791,9 @@ mod tests {
 
     #[test]
     fn mvc_frame_emits_blockgroup_additional_and_reference() {
-        // A track declaring an mvcC mapping: a keyframe base frame carrying a
-        // dependent AU emits BlockGroup > BlockAdditions > BlockMore
-        // {BlockAddID=2, BlockAdditional=dep}; a following non-keyframe adds a
-        // ReferenceBlock so it is not mistaken for a seek point.
+        // A track declaring an mvcC mapping: a keyframe with a dependent AU emits
+        // BlockGroup > BlockAdditions > BlockMore {BlockAddID=2, BlockAdditional=dep};
+        // a following non-keyframe adds a ReferenceBlock so it's not mistaken for a seek point.
         let mut v = make_video_track();
         v.mvc_params = Some((
             vec![0x6F, 0x80, 0x00, 0x33, 0x11, 0x22],
@@ -6186,10 +5832,9 @@ mod tests {
             data.windows(2).any(|w| w == dep_p),
             "non-keyframe dependent AU present"
         );
-        // Per-block, not a byte scan. ReferenceBlock's ID is the single byte 0xFB, so
-        // "one exists somewhere in the file" says nothing about WHICH block carries it:
-        // a mutant emitting one on every BlockGroup — the keyframe included — passed
-        // the old presence check while making every frame read back as a non-keyframe.
+        // Per-block, not a byte scan: "one exists somewhere in the file" says nothing
+        // about WHICH block carries ReferenceBlock — a mutant emitting it on every
+        // BlockGroup (keyframe included) passed the old presence-only check.
         let groups = all_block_groups(&data);
         assert_eq!(
             groups.len(),
@@ -6200,20 +5845,17 @@ mod tests {
             groups[0].reference, None,
             "the MVC keyframe must carry NO ReferenceBlock — that absence IS the keyframe signal"
         );
-        // The MVC BlockGroup writer takes the track number on its own call path,
-        // separate from every other block writer. It has to be the same 1-based
-        // TrackNumber the TrackEntry declared: a base-view block filed under
-        // track 0 (or 2, on a single-track file) is a 3D title whose left eye
-        // silently vanishes.
+        // The MVC BlockGroup writer takes the track number on its own call path; it
+        // must be the same 1-based TrackNumber the TrackEntry declared, or a base-view
+        // block filed under the wrong track is a 3D title whose left eye silently vanishes.
         assert!(
             groups.iter().all(|g| g.track == 1),
             "every MVC base-view Block belongs to TrackNumber 1, got {:?}",
             groups.iter().map(|g| g.track).collect::<Vec<_>>()
         );
-        // Assert the OFFSET, not just presence — the sibling non-MVC BlockGroup
-        // test pins the exact value, and a mutant emitting a constant or a
-        // wrong-signed offset would pass a presence-only check. The keyframe sits
-        // at tick 0, so the offset is the negated block-relative timestamp.
+        // Assert the OFFSET, not just presence — a mutant emitting a constant or
+        // wrong-signed offset would pass a presence-only check; the keyframe sits at
+        // tick 0, so the offset is the negated block-relative timestamp.
         let off = groups[1]
             .reference
             .expect("the non-keyframe MVC base frame must carry a ReferenceBlock");
@@ -6338,17 +5980,9 @@ mod tests {
         );
     }
 
-    // ---- CodecPrivate emission (avcC / hvcC / VC-1 / MPEG-2) -------------
-    //
-    // `MkvTrack::video` always builds with `codec_private: None`; the PES mux
-    // pipeline fills it in up-front from the DiscTitle (avcC for H.264, hvcC for
-    // HEVC, the VFW BITMAPINFOHEADER for VC-1, etc.). Nothing previously asserted
-    // that the muxer EMITS the supplied codecPrivate as a well-formed
-    // CodecPrivate element. These tests build a real `MkvMuxer` per representative
-    // video codec, set the codecPrivate the pipeline would hand over, and read
-    // the EMITTED bytes back: the element must be a DIRECT child of TrackEntry
-    // (never nested in Video), carry the registered CODEC_ID, and reproduce the
-    // exact codecPrivate payload byte-for-byte.
+    // CodecPrivate emission (avcC/hvcC/VC-1/MPEG-2): `MkvTrack::video` builds with
+    // `codec_private: None`, filled in later by the PES pipeline. Verify the muxer
+    // emits it as a DIRECT TrackEntry child (never nested in Video), byte-for-byte.
 
     /// Build a representative video track for `codec` whose codecPrivate is set
     /// to `cp` (mirroring what the mux pipeline supplies up-front).
@@ -6381,10 +6015,9 @@ mod tests {
 
     #[test]
     fn codec_private_emitted_verbatim_for_each_video_codec() {
-        // A distinctive payload per codec so a mix-up (wrong track / truncation)
-        // is caught. These stand in for avcC / hvcC / VFW-header / MPEG-2 seq
-        // header blobs — the muxer treats codecPrivate as opaque binary, so the
-        // contract under test is "emit exactly what you were given, intact."
+        // A distinctive payload per codec so a mix-up (wrong track/truncation) is
+        // caught. The muxer treats codecPrivate as opaque binary, so the contract
+        // under test is "emit exactly what you were given, intact."
         let cases: [(Codec, &str, Vec<u8>); 4] = [
             // avcC (H.264): configurationVersion=1, AVCProfileIndication=0x64
             // (High), profile_compat=0x00, AVCLevelIndication=0x28 (4.0), then
@@ -6481,13 +6114,9 @@ mod tests {
         );
     }
 
-    // ---- DefaultDuration ns by frame rate (emitted bytes) ---------------
-    //
-    // Existing tests pin the EMITTED DefaultDuration only for 25 fps (40 ms) and
-    // 29.97 fps (33.366 ms). This fills the gap for the remaining film/PAL/NTSC
-    // and high-frame-rate rates, asserting the value read back out of the muxer —
-    // not just the track field — so a regression in the serializer's uint
-    // encoding (or the element being dropped/nested) is caught too.
+    // DefaultDuration ns by frame rate (emitted bytes): existing tests only pin
+    // 25/29.97 fps. This fills the remaining rates, asserting the value read back
+    // from the muxer (not just the track field) to catch serializer regressions too.
 
     /// Read the DefaultDuration value (ns) emitted for a single-video-track mux.
     fn emitted_default_duration_ns(frame_rate: crate::disc::FrameRate) -> u64 {
@@ -6797,10 +6426,8 @@ mod tests {
     #[test]
     fn default_duration_ns_matches_frame_rate_for_all_rates() {
         use crate::disc::FrameRate;
-        // Expected ns/frame = 1e9 * den / num for each (num, den) fraction.
-        // 23.976 = 24000/1001 → 41_708_333; 24 → 41_666_666; 25 → 40_000_000;
-        // 29.97 = 30000/1001 → 33_366_666; 30 → 33_333_333; 50 → 20_000_000;
-        // 59.94 = 60000/1001 → 16_683_333; 60 → 16_666_666.
+        // Expected ns/frame = 1e9 * den / num for each (num, den) fraction, e.g.
+        // 23.976 = 24000/1001 -> 41_708_333, 29.97 = 30000/1001 -> 33_366_666.
         let cases = [
             (FrameRate::F23_976, 41_708_333u64),
             (FrameRate::F24, 41_666_666),

@@ -100,14 +100,9 @@ thread_local! {
 struct Capture;
 
 impl tracing::Subscriber for Capture {
-    // `sometimes`, deliberately NOT the default `always`/`never`. A cacheable
-    // interest lets `tracing`'s GLOBAL per-callsite cache short-circuit a
-    // callsite to "off", and under `cargo test`'s parallel harness a cache
-    // rebuild triggered by ANY other thread can leave it there while a capture
-    // is live — the capture then observes NOTHING. That is the race that made
-    // `parse_playlist_unreadable_clip_icb_yields_no_title` flake ~1 run in 15.
-    // `sometimes` forces `enabled` to be consulted on the emitting thread for
-    // every event, so a capture always sees its own.
+    // `sometimes`, not `always`/`never`: a cacheable interest lets tracing's global
+    // per-callsite cache latch to "off" if another thread's rebuild races a live
+    // capture. `sometimes` forces `enabled` to run per-event, so captures always see their own.
     fn register_callsite(
         &self,
         _meta: &'static tracing::Metadata<'static>,

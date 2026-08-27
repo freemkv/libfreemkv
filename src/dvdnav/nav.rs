@@ -24,9 +24,8 @@ use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 
 // ── VMGI management-table byte offsets into VIDEO_TS.IFO (DVD-Video spec) ─────
-//
-// The VMGI_MAT header carries these fixed offsets. The values they hold are
-// per-disc; the offsets are constant.
+// The VMGI_MAT header carries these fixed offsets: per-disc values live at
+// disc-constant offsets.
 const VMGI_MAGIC: &[u8; 12] = b"DVDVIDEO-VMG";
 /// u32 **byte** offset (from the start of VIDEO_TS.IFO) of the First-Play PGC.
 const VMGI_FP_PGC_PTR: usize = 0x84;
@@ -192,10 +191,9 @@ impl Vm {
         let src_tainted = !immediate && self.reg_tainted(src);
         let cur = self.gprm[idx];
         let cur_tainted = self.gprm_tainted[idx];
-        // Each arm sets (new value, new taint). `mov` overwrites, so its taint is
-        // the source's alone — this is what CLEARS a prior taint on a concrete
-        // store. The accumulating ops fold the source into the current value, so
-        // their taint is the union. Unmodelled ops leave value and taint intact.
+        // Each arm sets (new value, new taint). `mov` overwrites with the source's
+        // taint alone (clearing prior taint); accumulating ops union current and
+        // source taint. Unmodelled ops leave value and taint intact.
         let (nv, nt) = match op {
             1 => (v, src_tainted),                                  // mov
             3 => (cur.wrapping_add(v), cur_tainted || src_tainted), // add
@@ -290,10 +288,9 @@ fn run_first_play(cmds: &[[u8; 8]]) -> Option<u8> {
 
         let cmd = vmcmd::decode(&cmds[pc]);
 
-        // A guarded command's predicate decides whether its instruction runs.
-        // `taken` is the predicate result; `tainted` marks it undecidable at scan
-        // time (it read a system parameter, directly or laundered through a
-        // GPRM). A command with no predicate always runs and is never tainted.
+        // A guarded command's predicate decides whether its instruction runs. `taken`
+        // is the predicate result; `tainted` marks it undecidable (read a system
+        // parameter, directly or via GPRM). No predicate = always runs, never tainted.
         let (taken, tainted) = match cmd.compare {
             Some(cmp) => vm.eval(&cmp),
             None => (true, false),
@@ -332,11 +329,9 @@ fn run_first_play(cmds: &[[u8; 8]]) -> Option<u8> {
                 continue;
             }
 
-            // Register preparation before a dispatch — a store, not a control
-            // transfer, so a tainted guard does NOT abstain. If the guard is
-            // undecidable we do not know whether the store ran, so the
-            // destination's post-state is unknown → taint it. Otherwise apply the
-            // store (which itself propagates or clears the destination's taint).
+            // Register prep before dispatch is a store, not a control transfer, so a
+            // tainted guard does NOT abstain. Undecidable guard -> unknown post-state
+            // -> taint the destination; otherwise apply the store normally.
             Instr::SetGprm {
                 reg,
                 op,
@@ -356,11 +351,9 @@ fn run_first_play(cmds: &[[u8; 8]]) -> Option<u8> {
             // caught at read time, so no GPRM taint is needed here.
             Instr::Nop | Instr::SetSystem => {}
 
-            // Everything else leaves the deterministically-followable path:
-            // Break/Exit end the pre list with no title selected; the JumpSS
-            // sub-domain jumps and the intra-domain Link ops land in a menu or
-            // depend on an interactive button selection that cannot be resolved
-            // statically. Abstain → caller falls back.
+            // Everything else leaves the deterministically-followable path: Break/Exit
+            // end the pre list with no title; JumpSS/Link land in a menu or depend on
+            // an interactive button selection that can't be resolved statically.
             _ => return None,
         }
 

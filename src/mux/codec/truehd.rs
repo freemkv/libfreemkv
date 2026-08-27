@@ -134,21 +134,9 @@ impl TrueHdParser {
                 return AuCheck::Unverifiable;
             };
             if !mlp_major_sync_crc_ok(ms, mshdr) {
-                // A failing major-sync checksum is only a TRUSTWORTHY corruption
-                // signal once we already hold a validated baseline (num_substreams
-                // captured from a PRIOR checksum-clean major sync). Before that — at
-                // stream head, when no major sync has validated yet — a checksum
-                // mismatch is far more likely a limitation of our own major-sync
-                // header-size parse than real corruption. Arming the drop-forward
-                // there is catastrophic: every following AU is collateral-dropped
-                // waiting for a "validated" major sync that (if our parse is the
-                // problem) NEVER comes, so the WHOLE TrueHD track is silently dropped
-                // — the AUs are physically emitted late (empty until the mux end),
-                // de-interleaving the track and sending decoders into an unbounded
-                // memory spiral. So until we have a baseline to protect, treat a
-                // checksum-failed major sync as UNVERIFIABLE (keep it) rather than
-                // Corrupt. Once a clean major sync HAS established the baseline, a
-                // later failure is a real re-sync trigger and still drops forward.
+                // A failing checksum is only trustworthy once a validated baseline
+                // (num_substreams from a prior clean major sync) exists — before
+                // that, arming drop-forward risks silently dropping the whole track.
                 if self.num_substreams.is_some() {
                     return AuCheck::Corrupt; // real corruption vs a proven baseline
                 }
@@ -156,13 +144,9 @@ impl TrueHdParser {
             }
             self.num_substreams = mlp_num_substreams(ms);
             header_size += mshdr;
-            // The rate nibble is only trustworthy once the major sync's CRC has
-            // validated (above), so capture format_info here and refine the PTS
-            // cadence from it ONLY on this validated path.
-            // ONLY for stream type 0xBA. An MLP (0xBB) major sync's following word
-            // is not the TrueHD `format_info` layout, so decoding it as one gave a
-            // wrong rate and channel count; leaving it `None` keeps the
-            // container-derived rate, which is the honest answer.
+            // format_info is only trustworthy once the major sync's CRC has
+            // validated (above), and only for stream type 0xBA: an MLP (0xBB)
+            // major sync's next word isn't the TrueHD layout, so leave it `None` there.
             if au.len() >= 12
                 && is_truehd_major_sync(u32::from_be_bytes([au[4], au[5], au[6], au[7]]))
             {
@@ -296,18 +280,9 @@ fn mlp_major_sync_crc_ok(ms: &[u8], mshdr: usize) -> bool {
     if mshdr < 4 || ms.len() < mshdr {
         return false;
     }
-    // The MLP major-sync checksum, `checksum16(buf, buf_size)`, is defined as
-    //     crc16_2D(buf, buf_size - 2) ^ read_le16(buf + buf_size - 2)
-    // evaluated with `buf_size = mshdr - 2` and its result compared to
-    // `read_le16(buf + mshdr - 2)` — i.e. the 16-bit CRC (poly 0x2D, MSB-first)
-    // over `ms[..mshdr-4]`, XORed with the LITTLE-ENDIAN word just before the
-    // trailer, must equal the LITTLE-ENDIAN trailer word. `crc16_mlp` uses that
-    // same poly-0x2D MSB-first table but yields its two bytes in the OPPOSITE
-    // order to a standard little-endian CRC readout, so swap them back to match.
-    // (The previous code mixed endianness —
-    // little-endian XOR word but big-endian compare — so the checksum could never
-    // validate any real extended major sync, silently dropping the whole track;
-    // cross-verified byte-exact against real 7.1/Atmos and 5.1 discs.)
+    // checksum16(buf,n) = crc16_2D(buf,n-2) ^ read_le16(buf+n-2), evaluated with
+    // n=mshdr-2 against read_le16(buf+mshdr-2). `crc16_mlp` yields bytes in the
+    // opposite order to a standard LE CRC, so swap_bytes() before XOR/compare.
     let checksum = crc16_mlp(&ms[..mshdr - 4]).swap_bytes()
         ^ u16::from_le_bytes([ms[mshdr - 4], ms[mshdr - 3]]);
     checksum == u16::from_le_bytes([ms[mshdr - 2], ms[mshdr - 1]])
@@ -356,36 +331,13 @@ fn mlp_parity_ok(au: &[u8], header_size: usize, substr_header_size: usize) -> bo
 impl CodecParser for TrueHdParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
         // B1: a concealed/lost gap means the buffered TrueHD AU is TRUNCATED.
-        // Splicing post-gap bytes onto it corrupts the AU framing (→ "Invalid
-        // data found") and strands the PTS cadence (the non-monotonic audio-DTS
-        // band at gaps). Drop the partial; with `buf` now empty the PTS-base block
-        // below re-seeds the cadence from the post-gap PES, monotonic across the
-        // gap. (Audio has no inter-frame refs — this is the whole audio fix.)
-        //
-        // Handle the discontinuity BEFORE the empty-data guard so the signal can
-        // never be stranded by an empty post-gap PES (defensive; the demuxer only
-        // emits non-empty PES today).
+        // Splicing post-gap bytes onto it corrupts framing; drop the partial so
+        // PTS re-seeds from the post-gap PES. Handled before the empty-data guard (defensive).
         if pes.discontinuity {
             self.acc.clear();
-            // Unlike AC-3/DTS (independent frames), MLP/TrueHD carries filter +
-            // predictor + restart state ACROSS access units. A demux-signalled
-            // discontinuity (lost TS packets / a concealed source gap) leaves that
-            // state stale, so resuming mid-stream on the next parity-OK AU decodes
-            // against broken state and desyncs a conformant decoder ("restart header
-            // sync incorrect" / "Invalid blocksize"). Arm the same drop-forward the
-            // corruption path uses: keep dropping until the next CRC-valid major sync
-            // (a clean re-init point), then resume. This mirrors the video path's
-            // "resync on the next keyframe" after a gap — the gapped audio can't be
-            // recovered either way, but the output stays decoder-clean instead of
-            // shipping a decoder-choking seam.
-            //
-            // Only once a validated major sync has established a baseline: before
-            // that there is no CRC-validatable re-init point to resume on, so arming
-            // here would collateral-drop the WHOLE track waiting for a major sync we
-            // cannot yet validate — the exact stream-head catastrophe `au_check`
-            // guards (a checksum-failed head major sync is kept, not nuked). At
-            // stream head we therefore keep the current behaviour: drop the truncated
-            // partial (above) and let the fresh post-gap unit through.
+            // Unlike AC-3/DTS, MLP/TrueHD carries state across AUs, so resuming
+            // stale state after a gap desyncs a decoder. Arm drop-forward to the
+            // next CRC-valid major sync, only once a baseline exists (see au_check).
             if self.num_substreams.is_some() {
                 self.resync_pending = true;
             }
@@ -394,48 +346,15 @@ impl CodecParser for TrueHdParser {
             return Vec::new();
         }
 
-        // Capture the PTS base ONLY at an access-unit boundary, i.e. when no AU
-        // is mid-assembly in `buf`. TrueHD access units span PES packets; a PES
-        // that merely continues an AU already in progress carries its own (later)
-        // PTS, which must NOT override the running per-AU timestamp. Adopting it
-        // mid-AU would snap that AU's PTS backward/forward and break the
-        // monotonic +AU_DURATION_NS cadence (A/V drift). Once the buffer is empty
-        // the next PES legitimately begins a new AU and seeds the base.
+        // Capture the PTS base only at an AU boundary (buf empty): a PES that
+        // merely continues an AU in progress carries a later PTS that must not
+        // override the running timestamp, or it breaks the monotonic +AU_DURATION_NS cadence.
         if self.acc.is_empty()
             && let Some(pts) = pes.pts
         {
-            // Resync to the authoritative PES PTS. TrueHD AUs are a fixed
-            // sample count (40 @ 48 kHz), so the per-AU `+AU_DURATION_NS`
-            // cadence is sample-accurate — more so than the disc's per-PES
-            // PTS, which carries the source muxer's own rounding jitter.
-            //
-            // Two distinct backward steps must be handled OPPOSITELY:
-            //
-            // 1. Small backward jitter (sub-second PES rounding): when the
-            //    buffer empties exactly on a PES boundary and that PES's PTS
-            //    lands a few ticks *below* the running cadence, an
-            //    unconditional reset would set the next AU's timestamp below
-            //    the AU just emitted, producing non-monotonic block
-            //    timestamps a muxer rejects. CLAMP to the running position so
-            //    output stays strictly monotonic.
-            //
-            // 2. Large backward step (> DISCONTINUITY_BACKSTEP_NS): this is a
-            //    clip-boundary PTS reset — the title's clips are read as one
-            //    concatenated stream and a non-seamless boundary resets the
-            //    source PES PTS near zero. This is NOT jitter and must NOT be
-            //    clamped: clamping strands the audio at the previous clip's
-            //    tail cadence, so when `TimelineContinuity` later bumps the
-            //    global offset for the new epoch (driven by the video
-            //    back-jump) the stranded-high audio PTS is flung ~a whole
-            //    clip past the frontier, producing the non-monotonic
-            //    audio-DTS band on multi-clip titles. ADOPT the raw reset so the per-track raw PTS that
-            //    reaches `TimelineContinuity` carries the true boundary, and
-            //    the corrector rebases it exactly as it already does for the
-            //    DTS / AC-3 parsers (which never clamp). Same threshold the
-            //    timeline corrector uses to classify a discontinuity.
-            //
-            // A genuine forward gap/discontinuity is always adopted by the
-            // `.max()`.
+            // Resync to the authoritative PES PTS (sample-accurate vs the source
+            // muxer's rounding jitter). Small backward jitter clamps to stay
+            // monotonic; a large backward step (clip boundary) is adopted raw.
             let new = pts_to_ns(pts);
             if new < self.next_pts_ns - DISCONTINUITY_BACKSTEP_NS {
                 // Clip-boundary reset: take the raw PTS, restart the cadence.
@@ -455,14 +374,9 @@ impl CodecParser for TrueHdParser {
                 break;
             }
 
-            // AC-3 frame (interleaved): starts with sync word 0x0B77.
-            //
-            // 0x0B 0x77 is also a legal TrueHD AU header (check-nibble 0,
-            // length-high-bits 0xB → length 0xB77 words). To avoid an AC-3
-            // misread stealing a real TrueHD AU, an AC-3 frame is only accepted
-            // when its computed end is corroborated by what follows: end of
-            // buffer (frame fills the rest), another AC-3 sync, or a plausible
-            // TrueHD AU header. If none holds, this is treated as a TrueHD AU.
+            // AC-3 frame (interleaved): starts with sync 0x0B77, which is also a
+            // legal TrueHD AU header. To avoid stealing a real TrueHD AU, an AC-3
+            // frame is accepted only when its end is corroborated by what follows.
             if self.acc.as_slice()[0] == 0x0B && self.acc.as_slice()[1] == 0x77 {
                 match self.ac3_frame_at_head() {
                     Ac3Size::Unmappable => {
@@ -489,10 +403,9 @@ impl CodecParser for TrueHdParser {
                 | self.acc.as_slice()[1] as usize)
                 & 0xFFF;
             if unit_words == 0 {
-                // A zero-length AU is malformed/padding. The AU header is 4 bytes
-                // (length + timing); drain the whole header, not just the length
-                // word, otherwise the timing bytes get misread as the next
-                // length word and produce a spurious parse on the next iteration.
+                // A zero-length AU is malformed/padding. Drain the whole 4-byte
+                // header, not just the length word, or the timing bytes get
+                // misread as the next length word — a spurious parse next iteration.
                 self.acc.drain(4);
                 continue;
             }
@@ -503,10 +416,9 @@ impl CodecParser for TrueHdParser {
                 break; // incomplete access unit, wait for more data
             }
 
-            // Restart-point question — either stream type (0xBA TrueHD, 0xBB MLP)
-            // is a decoder re-init point, so both count as a major sync here.
-            // DECODING format_info with the TrueHD layout is a separate question,
-            // gated on 0xBA alone in `au_check`.
+            // Restart-point question: either stream type (0xBA TrueHD, 0xBB MLP)
+            // is a decoder re-init point, so both count as major sync here.
+            // Decoding format_info with the TrueHD layout is gated on 0xBA alone.
             let is_major_sync = unit_bytes >= 8
                 && is_mlp_major_sync(u32::from_be_bytes([
                     self.acc.as_slice()[4],
@@ -515,11 +427,9 @@ impl CodecParser for TrueHdParser {
                     self.acc.as_slice()[7],
                 ]));
 
-            // Decodability gate. MLP/TrueHD decode state persists across access
-            // units, so a corrupt AU is dropped FORWARD to the next VALIDATED
-            // major sync (the clean re-init point) rather than excised in place.
-            // The PTS clock advances across every dropped AU so a drop is a
-            // silence gap, never a shift.
+            // Decodability gate: MLP/TrueHD decode state persists across AUs, so
+            // a corrupt AU is dropped FORWARD to the next validated major sync
+            // rather than excised in place: a drop is a silence gap, never a shift.
             let au = self.acc.as_slice()[..unit_bytes].to_vec();
             let pts = self.next_pts_ns;
             // Read BEFORE the drain below: this unit's source is the packet
@@ -908,10 +818,8 @@ mod tests {
     #[test]
     fn corrupt_major_sync_drops_forward_to_next_valid() {
         // MLP state carries across AUs, so a corrupt AU is dropped FORWARD to the
-        // next valid major sync (the clean re-init point). Sequence: valid MS,
-        // corrupt MS (bad CRC), a normal AU, then a valid MS. Only the two valid
-        // major syncs survive; the corrupt MS and the intervening normal AU are
-        // dropped (the latter because decode state is poisoned until re-init).
+        // next valid major sync. Sequence: valid MS, corrupt MS, normal AU, valid
+        // MS — only the two valid syncs survive (the normal AU is poisoned collateral).
         let mut parser = TrueHdParser::new();
         let ms1 = valid_major_sync();
         let mut ms_bad = valid_major_sync();
@@ -937,22 +845,9 @@ mod tests {
 
     #[test]
     fn discontinuity_resyncs_forward_to_next_major_sync() {
-        // A source-signalled discontinuity (lost TS packets / a concealed gap)
-        // leaves MLP's cross-AU predictor + restart state stale. Resuming
-        // mid-stream on the next parity-OK AU decodes against broken state and
-        // desyncs a conformant decoder ("restart header sync incorrect" /
-        // "Invalid blocksize"). So a discontinuity must arm the SAME drop-forward
-        // the corruption path uses: drop every post-gap AU until the next
-        // CRC-valid major sync (the clean re-init point), then resume there.
-        //
-        // Regression for a real disc whose transport
-        // stream has a multi-PID continuity-counter gap at ~6:49: before this
-        // fix the TrueHD path cleared its buffer and resumed on the next NON-major
-        // AU, shipping a decoder-choking seam (559 `restart header sync` errors),
-        // while AC-3/DTS on the same disc were fine because THEIR frames are
-        // independently decodable. Video already resyncs to a keyframe after a
-        // gap (see `mux::resync`); this gives TrueHD the equivalent, keyed on the
-        // codec's own re-init point (a major-sync AU).
+        // A discontinuity leaves MLP's cross-AU state stale, so it arms the same
+        // drop-forward the corruption path uses: drop post-gap AUs until the next
+        // CRC-valid major sync. Fixed 559 "restart header sync" errors on a real disc.
         let mut parser = TrueHdParser::new();
 
         // Establish a baseline so num_substreams is known and the gate is live.
@@ -1004,15 +899,9 @@ mod tests {
 
     #[test]
     fn crc_failed_head_major_sync_is_kept_not_track_killed() {
-        // REGRESSION (every TrueHD title muxed after the checksum gate landed): a
-        // real-world major sync whose checksum our own header-size parse can't
-        // validate must NOT, at stream head — before ANY major sync has validated —
-        // arm the drop-forward. Doing so latched `resync_pending` on the very first
-        // AU and collateral-dropped EVERY following AU forever (no "validated" major
-        // sync ever came), silently dropping the entire TrueHD track: its AUs were
-        // emitted only at mux end, de-interleaving the track and spiralling decoders
-        // into unbounded memory ("decoder ran out of memory"). With no baseline to
-        // protect, a checksum-failed major sync is KEPT and the audio flows.
+        // REGRESSION (every TrueHD title after the checksum gate landed): a
+        // checksum-failed major sync at stream head (no baseline yet) must NOT
+        // arm drop-forward, or it silently drops the whole track (OOM decoder).
         let mut parser = TrueHdParser::new();
         let mut ms_bad = valid_major_sync();
         ms_bad[10] ^= 0xFF; // break a checksum-covered header byte → checksum fails
@@ -1061,14 +950,9 @@ mod tests {
 
     #[test]
     fn extended_major_sync_crc_validates_and_rejects() {
-        // COVERAGE GAP (the endianness bug that once "silently dropped the whole
-        // track" on real 7.1/Atmos): the EXTENDED major-sync header path
-        // (ms[25]&1 set, mshdr = 28 + 2 + 2*n) had ZERO test coverage — every
-        // other fixture builds only the basic 28-byte header. Build an extended
-        // header whose trailer is an INDEPENDENTLY-computed oracle (ref_crc16_2d,
-        // NOT crc16_mlp) stored LITTLE-ENDIAN, and assert the validator accepts
-        // it, rejects a body corruption, and rejects the same trailer stored
-        // big-endian (which is exactly the endianness-mix regression).
+        // COVERAGE GAP: the extended major-sync header path (ms[25]&1 set) had
+        // zero test coverage — every other fixture builds only the basic header.
+        // Build one with an independent oracle (ref_crc16_2d) to catch the regression.
         assert_eq!(
             ref_crc16_2d(b"123456789"),
             0x4FF7,
@@ -1154,10 +1038,9 @@ mod tests {
         frames.extend(parser.flush());
         assert_eq!(frames.len(), 2, "the parity-broken AU is dropped");
         assert_eq!(parser.dropped_frames(), 1);
-        // The drop is a SILENCE GAP, and its length is what the CLI reports as
-        // lost audio. One TrueHD access unit is 40 samples; at the 48 kHz base
-        // rate that is 40/48000 s = 833_333 ns. A count without a duration (or a
-        // duration that ignores the AU rate) understates or invents the loss.
+        // The drop is a SILENCE GAP whose length is what the CLI reports as lost
+        // audio: one AU = 40 samples at 48 kHz = 40/48000s = 833_333 ns. A count
+        // without a rate-aware duration understates or invents the loss.
         assert_eq!(
             parser.dropped_duration_ns(),
             833_333,
@@ -1192,10 +1075,9 @@ mod tests {
 
     #[test]
     fn transient_corruptions_do_not_poison_whole_track() {
-        // Regression (audit HIGH): TrueHD drop-forward must NOT amplify a couple
-        // of transient errors into a false whole-track poison. Two corruptions,
-        // each forcing a long collateral resync run past 200 total AUs, must
-        // leave the track un-poisoned and keep the good audio that follows.
+        // Regression (audit HIGH): drop-forward must not amplify a couple of
+        // transient errors into a false whole-track poison — even resync runs
+        // past 200 AUs must leave the track un-poisoned and keep good audio after.
         let mut parser = TrueHdParser::new();
         let mut data = valid_major_sync();
         // Corruption #1 then a long run of normal AUs (all collateral-dropped
@@ -1230,10 +1112,9 @@ mod tests {
 
     #[test]
     fn corrupt_major_sync_rate_nibble_does_not_shift_pts() {
-        // Regression (audit MED): a corrupt major sync whose rate nibble decodes
-        // to the 44.1 kHz family must NOT refine au_duration_ns — the rate is only
-        // trustworthy after the CRC validates. Otherwise the resumed 48 kHz audio
-        // is shifted (not gapped).
+        // Regression (audit MED): a corrupt major sync's rate nibble must NOT
+        // refine au_duration_ns — the rate is only trustworthy after the CRC
+        // validates, else the resumed 48kHz audio is shifted (not gapped).
         let mut parser = TrueHdParser::new();
         let ms1 = valid_major_sync(); // 48 kHz
         let mut ms_bad = valid_major_sync();
@@ -1340,10 +1221,7 @@ mod tests {
     fn discontinuity_drops_truncated_partial() {
         // B1: a partial TrueHD unit is buffered, then a concealed gap (PES marked
         // discontinuity) carries a fresh unit. The truncated partial must be
-        // DROPPED — splicing it makes the length-prefixed framer emit a
-        // wrong-size unit (corrupt AU framing) and re-seeds the PTS cadence from
-        // the post-gap PES rather than stranding it (the non-monotonic audio-DTS
-        // band at gaps).
+        // dropped — splicing it corrupts AU framing; PTS re-seeds from the post-gap PES.
         let mut parser = TrueHdParser::new();
 
         // PES 1: first 150 bytes of a 300-byte unit (length prefix says 300, only
@@ -1396,11 +1274,8 @@ mod tests {
     #[test]
     fn pes_pts_lagging_the_au_cadence_never_emits_backward() {
         // Regression: the per-AU cadence is sample-accurate, but a PES boundary
-        // can carry a PTS that lags it slightly (source-muxer rounding jitter).
-        // When the buffer empties exactly on that boundary, an unconditional
-        // reset to the PES PTS snapped the next AU's timestamp BELOW the AU just
-        // emitted — the non-monotonic block timestamps a muxer rejects (the
-        // multi-clip UHD case). The reset must clamp forward-only.
+        // can carry a PTS that lags it slightly (muxer rounding jitter). An
+        // unconditional reset snapped the next AU below the prior one — clamp forward-only.
         let mut parser = TrueHdParser::new();
         let au = make_truehd_unit(100);
         // PES1: three complete AUs at pts 90000 — buffer empties, cadence runs
@@ -1425,17 +1300,9 @@ mod tests {
 
     #[test]
     fn clip_boundary_pts_reset_is_adopted_not_clamped() {
-        // Regression (multi-clip non-monotonic audio-DTS band):
-        // a title's clips are read as one concatenated stream, so at a
-        // non-seamless boundary the source PES PTS resets near zero — a LARGE
-        // backward step (> DISCONTINUITY_BACKSTEP_NS), NOT muxer jitter. The
-        // parser must ADOPT that reset (restart the cadence at the raw PTS), the
-        // same way the DTS / AC-3 parsers pass raw PTS through, so the per-track
-        // raw PTS reaching TimelineContinuity carries the true boundary and the
-        // corrector can rebase it. Clamping it forward (the old `.max()`) stranded
-        // the audio at the previous clip's tail; when the global offset later
-        // bumped for the new epoch the stranded audio was flung ~a clip past the
-        // frontier — the non-monotonic band.
+        // Regression (multi-clip non-monotonic audio-DTS band): a non-seamless
+        // clip boundary resets PES PTS near zero (large backward step, not
+        // jitter) and must be ADOPTED raw, like DTS/AC-3, or audio strands at the prior tail.
         let mut parser = TrueHdParser::new();
         let au = make_truehd_unit(100);
         // Clip 1: an AU at PES PTS = 10s (90000 ticks/s → 900_000 ticks). Buffer
@@ -1476,10 +1343,9 @@ mod tests {
 
     #[test]
     fn continuation_pes_pts_does_not_override_au_in_progress() {
-        // An AU split across two PES packets: the FIRST PES (pts 90000) begins
-        // the AU; the SECOND PES (pts 99999, a later timestamp) merely continues
-        // it. The emitted AU must keep the first PES's PTS, not adopt the
-        // continuation PES's later timestamp.
+        // An AU split across two PES packets: the first PES (pts 90000) begins
+        // it, the second (pts 99999) merely continues it. The emitted AU must
+        // keep the first PES's PTS, not the continuation's.
         let mut parser = TrueHdParser::new();
         let unit = make_truehd_unit(200);
         let mid = 100;
@@ -1519,12 +1385,9 @@ mod tests {
 
     #[test]
     fn zero_length_au_drains_full_header() {
-        // A zero-length AU header (4 bytes: length=0 + timing) must be skipped
-        // whole. If only 2 bytes were drained the timing bytes would be misread
-        // as a bogus length word. Here the timing bytes are 0x01 0x90 (= 0x190 =
-        // 400 words = 800 bytes) which, if misread, would stall the parser
-        // waiting for 800 bytes that never come. Draining 4 lets the following
-        // real unit parse.
+        // A zero-length AU header (4 bytes) must be skipped whole. Draining only
+        // 2 would misread the timing bytes (0x01 0x90 = 400 words = 800 bytes) as
+        // a bogus length, stalling the parser waiting for bytes that never come.
         let mut parser = TrueHdParser::new();
         let mut data = vec![0x00, 0x00, 0x01, 0x90]; // length=0, timing=0x0190
         data.extend_from_slice(&make_truehd_unit(200));
@@ -1535,11 +1398,9 @@ mod tests {
 
     #[test]
     fn unmappable_ac3_header_resyncs_not_stalls() {
-        // A permanently unmappable 0x0B77 header at the buffer head (reserved
-        // fscod==3) must NOT stall the parser. It used to be treated as
-        // "incomplete, wait" and break forever, dropping every following AU.
-        // Now it resyncs (drains 2 bytes) so a clean TrueHD unit behind it is
-        // eventually emitted.
+        // A permanently unmappable 0x0B77 header (reserved fscod==3) must NOT
+        // stall the parser — it used to be treated as "incomplete, wait" and
+        // break forever. Now it resyncs (drains 2 bytes) so a clean unit behind it is emitted.
         let mut parser = TrueHdParser::new();
         // Unmappable AC-3-looking head: 0x0B77, byte4 fscod=3 (0xC0).
         let mut data = vec![0x0B, 0x77, 0x00, 0x00, 0xC0, 0x00];
@@ -1557,11 +1418,9 @@ mod tests {
 
     #[test]
     fn truehd_au_with_0b77_head_not_stolen_by_ac3() {
-        // A TrueHD AU whose first two bytes are 0x0B 0x77 (length 0xB77 = 2935
-        // words = 5870 bytes) must NOT be misrouted to the AC-3 path. The AC-3
-        // size for this header (fscod from byte4) would close the boundary in
-        // the wrong place; the secondary corroboration rejects it because the
-        // computed AC-3 end is not followed by another AC-3 sync / TrueHD AU.
+        // A TrueHD AU whose first two bytes are 0x0B 0x77 must NOT be misrouted
+        // to the AC-3 path — the AC-3 size closes the boundary wrong; secondary
+        // corroboration rejects it since the computed end isn't followed by a real sync.
         let mut parser = TrueHdParser::new();
         // 5870-byte AU starting with 0x0B 0x77. Byte 4 = 0x00 → AC-3 would
         // size it as fscod=0, frmsizecod=0 → 128 bytes. The bytes at offset 128
@@ -1660,14 +1519,9 @@ mod tests {
 
     #[test]
     fn channels_from_stream_rejects_mlp_sync_0xfb() {
-        // 0xF8726FBB is the MLP stream type, NOT TrueHD (0xF8726FBA). The word
-        // after an MLP major sync holds quantization word lengths and the MLP
-        // group sample-rate fields, not TrueHD's rate nibble plus the 6ch/8ch
-        // presentation channel-assignment masks. Decoding it with the TrueHD
-        // layout (the scan used to mask the low sync bit) reported channels out of
-        // unrelated bits; the honest answer is None so the caller keeps its
-        // container-derived count. Byte pattern below decodes as 8 channels ONLY
-        // under the TrueHD layout, so this test fails if the mask comes back.
+        // 0xF8726FBB is the MLP stream type, NOT TrueHD (0xF8726FBA). Its next
+        // word holds quantization/MLP rate fields, not TrueHD's rate nibble +
+        // channel masks; decoding it as TrueHD reads channels from unrelated bits.
         let mut data = vec![0x00];
         data.extend_from_slice(&0xF872_6FBBu32.to_be_bytes());
         data.extend_from_slice(&0x0000_001Fu32.to_be_bytes());
@@ -1776,10 +1630,9 @@ mod tests {
 
     #[test]
     fn major_sync_variant_bit_also_keyframe() {
-        // The RESTART-POINT check masks the low sync bit, so 0xF8726FBB (MLP)
-        // counts as a major sync too — both stream types re-init the decoder, so
-        // both are keyframes. (Only the format_info DECODE is 0xBA-only; see
-        // `channels_from_stream_rejects_mlp_sync_0xfb`.)
+        // The restart-point check masks the low sync bit, so 0xF8726FBB (MLP)
+        // counts as a major sync too — both types re-init the decoder, so both
+        // are keyframes (format_info decode alone is 0xBA-only; see the sibling test).
         let mut parser = TrueHdParser::new();
         let mut unit = make_truehd_unit(200);
         unit[4..8].copy_from_slice(&0xF872_6FBBu32.to_be_bytes());
@@ -1812,24 +1665,9 @@ mod tests {
 
     #[test]
     fn buffer_stays_bounded_across_many_partial_pes() {
-        // Malformed/never-completing input must keep the reassembly buffer
-        // bounded across an unbounded number of PES packets.
-        //
-        // The bound that actually holds is MAX_AU_BYTES, not MAX_TRUEHD_BUF:
-        // `parse`'s loop only breaks with data retained when
-        // `self.acc.len() < unit_bytes`, and `unit_bytes` is
-        // `((buf[0] << 8 | buf[1]) & 0xFFF) * 2 <= 8190`. Every other exit
-        // drains. So the post-loop `buf.len() > MAX_TRUEHD_BUF` cap (256 KiB) is
-        // an unreachable backstop — an exhaustive sweep of all 65536 two-byte
-        // AU heads × fragment sizes {3, 5, 100, 4096, 8189, 65535} over 20 PES
-        // each peaks at 8189 bytes. Asserting only `<= MAX_TRUEHD_BUF` is
-        // therefore vacuous; assert the reachable ceiling instead.
-        //
-        // Fixture: heads of 0xFF 0xFF (masked to 0xFFF words = 8190 bytes
-        // declared — this also exercises the 12-bit mask) with 8189 bytes
-        // present, so each PES leaves the buffer one byte short of a complete
-        // AU. The previous fixture used 4096-byte fragments, which completed an
-        // AU every second call and never loaded the buffer past ~4 KiB.
+        // Malformed/never-completing input must keep the buffer bounded. The
+        // bound that actually holds is MAX_AU_BYTES (8190), not MAX_TRUEHD_BUF —
+        // asserting only `<= MAX_TRUEHD_BUF` is vacuous; assert the reachable ceiling instead.
         let mut parser = TrueHdParser::new();
         let mut worst = 0usize;
         for _ in 0..200 {
@@ -1938,10 +1776,9 @@ mod tests {
 
     #[test]
     fn sample_rate_unknown_rate_falls_back_to_none() {
-        // 0xF is the explicit invalid code; 0x3/0xB are formula-only and not
-        // whitelisted; 0x7/0xE are reserved. None of them may produce a rate —
-        // the host must fall back to its container value, never write a wrong
-        // SamplingFrequency.
+        // 0xF is the explicit invalid code; 0x3/0xB are formula-only, not
+        // whitelisted; 0x7/0xE are reserved. None may produce a rate — the host
+        // must fall back to its container value, never write a wrong SamplingFrequency.
         for bad in [0x3u32, 0x7, 0xB, 0xC, 0xD, 0xE, 0xF] {
             assert_eq!(
                 truehd_sample_rate_hz(format_info_with(bad)),
@@ -1953,10 +1790,9 @@ mod tests {
 
     #[test]
     fn sample_rate_nibble_does_not_disturb_channel_decode() {
-        // Internal-consistency guard: with the 96 kHz nibble AND a 7.1 mask in
-        // the same word, the rate reads 96000 and the channels still read 8 —
-        // proving the rate nibble (bits 31..28) and the channel masks
-        // (bits 19..0) do not collide.
+        // Internal-consistency guard: with the 96kHz nibble AND a 7.1 mask in
+        // the same word, rate reads 96000 and channels still read 8 — proving
+        // the rate nibble (bits 31..28) and channel masks (bits 19..0) don't collide.
         let fi = format_info_with(0x1);
         assert_eq!(truehd_sample_rate_hz(fi), Some(96000));
         assert_eq!(truehd_channels(fi), Some(8));

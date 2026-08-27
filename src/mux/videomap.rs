@@ -1,15 +1,15 @@
 //! `VideoMap` — freemkv's reusable, pure-data per-picture video index ("the
 //! FVI object").
 //!
-//! A [`VideoMap`] is a header (per-title video facts + provenance root) plus an
+//! A [`VideoMap`](crate::mux::videomap::VideoMap) is a header (per-title video facts + provenance root) plus an
 //! ordered list of per-picture records. Each record carries the per-picture
-//! coding truth ([`PictureInfo`], off `frame.coding`) and the byte-exact source
-//! provenance ([`SourcePos`], off `frame.source`) that the highway already
+//! coding truth ([`PictureInfo`](crate::mux::codec::PictureInfo), off `frame.coding`) and the byte-exact source
+//! provenance ([`SourcePos`](crate::pes::SourcePos), off `frame.source`) that the highway already
 //! stamps — this module never re-parses the elementary stream.
 //!
 //! It is a STANDALONE PRIMITIVE, deliberately decoupled from any one sink:
 //! - The `fvi://` sink ([`crate::mux::fvi_sink`]) owns a `VideoMap`, appends
-//!   each video [`PesFrame`], and serializes it.
+//!   each video [`PesFrame`](crate::pes::PesFrame), and serializes it.
 //! - The same `VideoMap` can later be populated as a side-channel during ANY
 //!   mux (e.g. `iso → mkv` while ALSO emitting a `.fvi` sidecar), and reused
 //!   for seek-indexing, recovery loss-mapping, and diagnostics.

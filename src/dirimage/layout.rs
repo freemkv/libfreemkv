@@ -218,18 +218,14 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
         if is_excluded(&name) {
             continue;
         }
-        // `file_type()` does NOT follow symlinks; `metadata()` does. A symlink
-        // to a file is materialized as that file (a legitimate way to assemble
-        // a folder), a symlink to a directory is skipped — following one can
-        // loop, and UDF has no link this maps onto.
+        // `file_type()` does NOT follow symlinks; `metadata()` does. A symlink to
+        // a file is materialized as that file; a symlink to a directory is
+        // skipped — following one can loop, and UDF has no link this maps onto.
         let ft = entry.file_type().map_err(Error::from)?;
         let child_path = format!("{}/{}", disc_path.trim_end_matches('/'), name);
-        // A File Identifier Descriptor records the encoded name length in ONE
-        // byte. A longer name would wrap that field and desynchronise every
-        // later entry in the directory, so refuse while planning rather than
-        // encode something unreadable. 255 ASCII bytes is a legal name on
-        // ext4/APFS/NTFS and already exceeds this once the CS0 compression
-        // byte is added, so it is reachable without anything exotic.
+        // A FID records the encoded name length in ONE byte; a longer name would
+        // wrap it and desynchronise the directory, so refuse while planning. 255
+        // ASCII bytes (legal on ext4/APFS/NTFS) already exceeds it with CS0 added.
         if crate::dirimage::encode::encode_cs0(&name).len() > MAX_CS0_NAME_BYTES {
             return Err(Error::DirNameTooLong { path: child_path });
         }
@@ -237,29 +233,13 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
         if *entries > MAX_ENTRIES {
             return Err(Error::DirImageTooLarge);
         }
-        // Key the uniqueness check on the name AS THE READER WILL SEE IT, by
-        // round-tripping through the very encoder and parser that will be used.
-        //
-        // The host name is not that name. `parse_udf_name` trims leading and
-        // trailing whitespace and drops any code unit `char::from_u32` rejects
-        // (a lone surrogate half, i.e. every non-BMP character the encoder
-        // emits as a surrogate pair). So " A.M2TS" and "A.M2TS", or "A<astral>.M2TS"
-        // and "A.M2TS", are distinct hosts that collapse to ONE name on read —
-        // and `find`/`read_file` take the first match, so a title silently
-        // resolves to the wrong file's extents and muxes the wrong bytes at
-        // exit 0. Comparing the raw host names cannot see that; deriving the
-        // key from the same two functions cannot drift from it.
+        // Key uniqueness on the name AS THE READER WILL SEE IT (round-trip through
+        // the same encoder/parser it uses): `parse_udf_name` trims/drops chars, so
+        // distinct hosts (" A.M2TS" vs "A.M2TS") can collapse and `find` mismatches.
         let as_read = crate::udf::parse_udf_name(&crate::dirimage::encode::encode_cs0(&name));
-        // Nothing left after the reader is done with it — a name made entirely
-        // of characters `parse_udf_name` drops, e.g. a sidecar folder named
-        // with a single emoji. The entry would exist in the image and be
-        // addressable by nothing.
-        //
-        // SKIP it, do not fail the plan. Failing turned an irrelevant extra
-        // file into an un-rippable folder that 1.6.0 handled fine (the
-        // unreachable entry merely sat there, harming nothing), and reported it
-        // as a collision with a file that does not exist. It is also not
-        // pushed to `names`, so it cannot collide with anything either.
+        // Nothing left after the reader drops it (e.g. a name of a single emoji):
+        // it would exist in the image but be addressable by nothing. SKIP rather
+        // than fail the plan (1.6.0 handled such extras fine); not pushed to `names`.
         if as_read.is_empty() {
             tracing::warn!(
                 target: "freemkv::dirimage",
@@ -270,10 +250,9 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
         }
         names.push(as_read.to_ascii_uppercase());
         if ft.is_dir() {
-            // A directory's File Entry records its link count in 16 bits: one
-            // per child directory plus one for its own entry in the parent.
-            // The global entry cap alone permits a single directory holding
-            // more than that, which would wrap the count.
+            // Link count (child dirs + 1) is stored in 16 bits; the global entry
+            // cap alone permits a single directory holding more than that, which
+            // would wrap the count.
             if dirs.len() >= MAX_SUBDIRS {
                 return Err(Error::DirImageFanout {
                     path: disc_path.to_string(),
@@ -283,30 +262,16 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
         } else {
             let meta = match std::fs::metadata(entry.path()) {
                 Ok(m) => m,
-                // A broken symlink or a file that vanished between readdir and
-                // stat: skip it rather than plan an extent that cannot be read.
-                // Anything else — permission denied, an I/O error on the host
-                // volume — is NOT a missing file, and skipping it would drop a
-                // real file out of the image with nothing reported.
+                // A broken symlink or a file gone between readdir and stat: skip it
+                // rather than plan an unreadable extent. Anything else (e.g. perm
+                // denied) is NOT a missing file, so skipping it would drop it silently.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(Error::from(e)),
             };
             if !meta.is_file() {
-                // Not a plain file after following the link. The common case is
-                // a SYMLINK TO A DIRECTORY — a normal way to keep 40 GB of
-                // streams off the system disk — and `entry.file_type()` above
-                // reports the link, not the target, so such a subtree never
-                // enters `dirs` and is silently absent from the image.
-                //
-                // The result was the worst class this release exists to close:
-                // BDMV/PLAYLIST and CLIPINF still synthesize, so the folder
-                // scans and enumerates titles, every clip resolves to no
-                // extents, and the mux takes its clean-EOF path and writes a
-                // near-empty MKV at exit 0.
-                //
-                // It is still skipped rather than followed — following link
-                // targets invites cycles and escapes from the folder — but it
-                // is now SAID, at the same volume as the name-skip above.
+                // Not a plain file after following the link: commonly a SYMLINK TO A
+                // DIRECTORY, silently vanishing before (clips → no extents, near-empty
+                // MKV at exit 0). Still skipped, not followed, but now SAID.
                 tracing::warn!(
                     target: "freemkv::dirimage",
                     path = %child_path,
@@ -328,10 +293,9 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
         }
     }
 
-    // `UdfFs::find_dir` / `read_file` match path components case-insensitively,
-    // so two entries in one directory differing only in case are
-    // indistinguishable to every consumer — the second would silently shadow
-    // the first. Only reachable on a case-sensitive host volume.
+    // `find_dir`/`read_file` match path components case-insensitively, so two
+    // entries differing only in case are indistinguishable to every consumer —
+    // the second would silently shadow the first. Only on a case-sensitive host.
     names.sort();
     for pair in names.windows(2) {
         if pair[0] == pair[1] {
@@ -428,12 +392,9 @@ fn be_u32(buf: &[u8], off: usize) -> Option<u32> {
 fn read_head(path: &Path, n: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut buf = vec![0u8; n];
-    // `read_exact`, not `read`: a single `read` may legally return fewer bytes
-    // than asked on a network or FUSE mount — and a NAS-hosted backup is the
-    // normal case for this feature. A short buffer sends every placement offset
-    // through `unwrap_or(0)`, recording NO constraint, so the planner and the
-    // reader disagree about where a VOB begins and the rip reads the wrong
-    // sectors for a whole title at exit 0.
+    // `read_exact`, not `read`: a single `read` may legally return fewer bytes on
+    // a network/FUSE mount (a NAS-hosted backup is normal here). A short buffer
+    // records NO constraint, so the rip reads the wrong sectors at exit 0.
     let mut f = std::fs::File::open(path).map_err(Error::from)?;
     f.read_exact(&mut buf).map_err(Error::from)?;
     Ok(buf)
@@ -482,10 +443,9 @@ fn place_video_ts(vts: &mut DirNode, start: u32) -> Result<u32> {
     // Required start blocks, resolved as each IFO is placed.
     let mut menu_req: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut title_req: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    // Groups whose IFO has already been placed. Kept separately from the
-    // constraint maps because an IFO that declares no offsets inserts into
-    // neither, so keying the duplicate check on those maps would miss a second
-    // IFO for the same set — which is the collision the check exists for.
+    // Groups whose IFO has already been placed, kept separately from the
+    // constraint maps: an IFO declaring no offsets inserts into neither, so
+    // keying the duplicate check on those maps would miss the collision.
     let mut seen_ifo: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     let mut cursor = start;
@@ -517,11 +477,9 @@ fn place_video_ts(vts: &mut DirNode, start: u32) -> Result<u32> {
         {
             let head = read_head(&vts.files[i].host, 0xC8)?;
             let menu = be_u32(&head, 0xC0).unwrap_or(0);
-            // One group per title set. Two files whose names differ only in
-            // how the number is written — `VTS_01_0.IFO` and `VTS_1_0.IFO` —
-            // parse to the same group, and the second insert would overwrite
-            // the first's constraint, placing a VOB at an address the IFO the
-            // reader uses does not point to. Refuse instead of picking one.
+            // One group per title set: `VTS_01_0.IFO` and `VTS_1_0.IFO` parse to
+            // the same group, and a second insert would overwrite the first's
+            // constraint, placing a VOB where the reader's IFO doesn't point.
             if !seen_ifo.insert(c.group) {
                 return Err(Error::DirNameCollision {
                     host: vts.files[i].disc_path.clone(),
@@ -530,12 +488,9 @@ fn place_video_ts(vts: &mut DirNode, start: u32) -> Result<u32> {
             if menu != 0 {
                 menu_req.insert(c.group, lba.saturating_add(menu));
             }
-            // Only a VTS IFO carries a title VOBS pointer at 0xC4. In the VMG
-            // (`VIDEO_TS.IFO`) that offset is TT_SRPT, the title search pointer
-            // table — a sector offset INSIDE the IFO, not a pointer to another
-            // file, so treating it as one would place `VIDEO_TS.VOB` at a
-            // meaningless address. (`ifo.rs::parse_vmg` reads the same field as
-            // TT_SRPT; the two must not drift.)
+            // Only a VTS IFO carries a title VOBS pointer at 0xC4; in the VMG that
+            // offset is TT_SRPT (a sector offset INSIDE the IFO, not a file
+            // pointer). `ifo.rs::parse_vmg` reads the same field; must not drift.
             if c.group > 0 {
                 let title = be_u32(&head, 0xC4).unwrap_or(0);
                 if title != 0 {
@@ -723,13 +678,9 @@ pub(super) fn plan(root: &Path) -> Result<Layout> {
         .position(|d| d.name.eq_ignore_ascii_case("VIDEO_TS"))
     {
         cursor = place_video_ts(&mut tree.dirs[idx], cursor)?;
-        // `place_video_ts` places only the FILES directly inside VIDEO_TS,
-        // because only those carry the IFO-relative constraints. Anything in a
-        // subdirectory of VIDEO_TS still needs data placed: without this its
-        // File Entry is written with the file's real size but no extents, so it
-        // appears in the tree at full length and reads back as nothing, at
-        // exit 0. The same folder under BDMV/ was always placed correctly,
-        // which is what made the gap easy to miss.
+        // `place_video_ts` places only the FILES directly inside VIDEO_TS (the ones
+        // with IFO-relative constraints); subdirectories still need placing, or
+        // their File Entry has real size but no extents and reads as nothing.
         for sub in tree.dirs[idx].dirs.iter_mut() {
             place_generic(sub, &mut cursor)?;
         }
@@ -989,11 +940,9 @@ mod tests {
     /// plainly that it does NOT exercise `walk`.
     #[test]
     fn the_subdir_cap_refuses_a_folder_with_too_many_subdirectories() {
-        // Executes the guard, rather than restating the constant. A directory's
-        // File Entry records its link count in 16 bits — one per child
-        // directory plus one for its own entry in the parent — so exceeding it
-        // would wrap the count and produce an image whose directory structure
-        // lies about itself.
+        // Executes the guard rather than restating the constant: link count (child
+        // dirs + 1) is 16 bits, so exceeding it wraps and the image lies about
+        // its own directory structure.
         let dir = std::env::temp_dir().join(format!("fmkv-fanout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

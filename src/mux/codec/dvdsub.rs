@@ -68,17 +68,9 @@ impl CodecParser for DvdSubParser {
 
         let mut out = Vec::new();
 
-        // A PES carrying a real PTS is the START of a new SPU; continuations of
-        // an in-progress SPU carry no PTS (the PS demuxer leaves `pts` None when
-        // the PES has no PTS field — see the module doc). PTS is therefore the
-        // authoritative SPU-boundary signal, NOT merely `pending.is_some()`.
-        //
-        // Append-as-continuation ONLY when this PES has no PTS. When it has a
-        // PTS but a stale `pending` is still open (a lost continuation, or a
-        // corrupt/oversized declared SPU_size that real data never reaches),
-        // force-emit the stuck unit truncated and fall through to start a fresh
-        // SPU from this PES. Without this, one bad SPU_size would swallow every
-        // later subtitle until EOF — exactly the damaged-disc case we target.
+        // PTS present == start of a new SPU (continuations carry none); a PTS
+        // while `pending` is still open (lost continuation/corrupt SPU_size)
+        // force-emits it truncated rather than swallowing all later SPUs.
         if pes.pts.is_none() {
             if self.pending.is_some() {
                 // Continuation: append, bounded by MAX_SPU_BYTES.
@@ -715,10 +707,9 @@ mod tests {
 
     #[test]
     fn no_pts_sized_segment_without_pending_starts_new_spu() {
-        // A no-PTS segment with no pending but a valid SPU_size (>= 2) and an
-        // incomplete length begins a fresh pending SPU (the demuxer may have
-        // dropped the PTS, but the size field is authoritative for boundary).
-        // declared = 16, only 3 bytes present → held pending, no emit.
+        // No-PTS segment, no pending, valid SPU_size (>= 2), incomplete length:
+        // starts a fresh pending SPU (size field is authoritative for boundary
+        // even if the demuxer dropped the PTS). declared=16, 3 bytes → held.
         let mut parser = DvdSubParser::new(None);
         let f = parser.parse(&make_pes(vec![0x00, 0x10, 0xAA], None));
         assert!(f.is_empty(), "incomplete sized segment held, not emitted");

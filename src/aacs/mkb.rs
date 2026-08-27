@@ -1,4 +1,4 @@
-//! AACS Media Key Block — [C] Chapter 3.
+//! AACS Media Key Block — `[C]` Chapter 3.
 //!
 //! The MKB record format (framing walker, the `MkbRecord` view, record-body
 //! finders), the MKBType / AACS-generation classification, and MKB-file
@@ -7,10 +7,8 @@
 //! still live side by side pending a follow-up that collapses them.
 
 // ── MKB record types ([C] Chapter 3) ──────────────────────────────────────
-// The ONE canonical set. Every record-type comparison in the `aacs` module
-// references these, so a type byte is never a bare literal scattered across
-// files (the `0x0c` variant-data record in particular used to appear in several
-// hand-rolled forms).
+// The ONE canonical set; every record-type comparison in `aacs` references these
+// so a type byte is never a bare literal scattered across files.
 
 /// Type-and-Version — carries the 32-bit MKBType / AACS generation.
 pub(crate) const REC_TYPE_AND_VERSION: u8 = 0x10;
@@ -157,7 +155,7 @@ impl AacsVersion {
 }
 
 /// Find Verify Media Key Record (type 0x81 for AACS 1.0, 0x86 for AACS 2.0/2.1) in MKB.
-/// 0x81: [C] §3.2.5.1.4. 0x86 (AACS 2.x): [RE] — not in the public spec (from real 2.x MKBs).
+/// 0x81: `[C]` §3.2.5.1.4. 0x86 (AACS 2.x): `[RE]` — not in the public spec (from real 2.x MKBs).
 pub(crate) fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
     // Verify-Media-Key record (0x81 for AACS 1.0, 0x86 for AACS 2.x): mk_dv is
     // the 16 bytes at record offset 4 (body offset 0). Needs rec_len >= 20.
@@ -189,12 +187,12 @@ pub(crate) fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
     }
 }
 
-/// Find Subset-Difference records (type 0x04) in MKB. [C] §3.2.5.1.5.
+/// Find Subset-Difference records (type 0x04) in MKB. `[C]` §3.2.5.1.5.
 pub(crate) fn mkb_find_subdiff_records(mkb: &[u8]) -> Option<Vec<u8>> {
     find_record_body(mkb, 0x04)
 }
 
-/// Find the Media Key Data Record (cvalues table) in an MKB. [C] §3.2.4 / §3.2.5.1.7.
+/// Find the Media Key Data Record (cvalues table) in an MKB. `[C]` §3.2.4 / §3.2.5.1.7.
 ///
 /// The cvalue table is record type `0x05` (Media Key Data) on BOTH AACS
 /// 1.0 and AACS 2.x MKBs — its 16-byte cvalue entries are 1:1 with the
@@ -331,7 +329,7 @@ impl MkbType {
 }
 
 /// The raw 32-bit MKBType field from the Type-and-Version record (0x10), bytes
-/// 4-7. `None` if no 0x10 record is present. [C] §3.2.5.1.1 Table 3-2.
+/// 4-7. `None` if no 0x10 record is present. `[C]` §3.2.5.1.1 Table 3-2.
 pub fn mkb_type_raw(mkb: &[u8]) -> Option<u32> {
     // Type-and-Version record (0x10): the 32-bit MKBType is bytes 4-7 (body
     // offset 0). Needs rec_len >= 8 (4 header + 4 type).
@@ -516,7 +514,7 @@ mod tests {
         assert_eq!(recs[1].body, vec![0x55; 16]);
     }
 
-    /// `mkb_type_raw` reports the 32-bit MKBType field verbatim ([C] §3.2.5.1.1
+    /// `mkb_type_raw` reports the 32-bit MKBType field verbatim (`[C]` §3.2.5.1.1
     /// Table 3-2), including a value this build does not recognise — the caller
     /// uses it to tell "unknown MKB generation" from "no Type record at all".
     /// All four bytes must come from the record body; reading any of them from

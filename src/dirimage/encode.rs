@@ -459,10 +459,9 @@ fn file_entry(
     s[160..168].copy_from_slice(&unique_id.to_le_bytes());
     s[168..172].copy_from_slice(&0u32.to_le_bytes()); // length of EAs
     let l_ad = extents.len() * 8;
-    // A short AD is 8 bytes and the entry has 2048 - 176 = 1872 bytes for
-    // them, i.e. 234 extents — over 200 GiB at the per-AD ceiling. Beyond
-    // that an Allocation Extent Descriptor chain would be required; refuse
-    // rather than write a truncated list.
+    // A short AD is 8 bytes, leaving room for 234 extents (~200 GiB) before an
+    // Allocation Extent Descriptor chain would be needed; refuse rather than
+    // write a truncated list.
     if 176 + l_ad > SECTOR {
         return Err(Error::DirImageTooLarge);
     }
@@ -500,10 +499,9 @@ fn push_fid(buf: &mut Vec<u8>, name: &str, icb_lba: u32, is_dir: bool, is_parent
         chars |= 0x08;
     }
     fid[18] = chars;
-    // The planner refuses any name whose encoding exceeds what this byte can
-    // hold (`layout::MAX_CS0_NAME_BYTES`), so this cannot wrap in practice. The
-    // assert states the invariant where it is relied on rather than trusting a
-    // check three files away; a wrap here would desynchronise the directory.
+    // Planner enforces `layout::MAX_CS0_NAME_BYTES` so this can't wrap in
+    // practice; the assert states that invariant where it's relied on
+    // instead of trusting a check three files away.
     debug_assert!(
         l_fi <= u8::MAX as usize,
         "FID name length must fit one byte"
@@ -603,11 +601,9 @@ fn write_dir(out: &mut MetaSectors, layout: &Layout, dir: &DirNode) -> Result<()
     fix_fid_tag_locations(&mut fids, dir.data_lba);
     debug_assert_eq!(fids.len(), dir.data_bytes as usize);
 
-    // A directory's link count is 1 (its own FID in the parent) plus one for
-    // each child directory's parent FID pointing back at it.
-    // The planner caps subdirectory fan-out (`layout::MAX_SUBDIRS`) so this
-    // cannot overflow; saturating rather than wrapping keeps a future change to
-    // that cap from silently producing a wrong count.
+    // Link count is 1 (own FID in parent) plus one per child dir's parent FID.
+    // `layout::MAX_SUBDIRS` bounds fan-out so this can't overflow; saturating
+    // guards against a future change to that cap silently miscounting.
     let link_count = (dir.dirs.len() as u16).saturating_add(1);
     let fe = file_entry(
         true,

@@ -41,11 +41,8 @@ pub fn write_size(w: &mut impl Write, size: u64) -> io::Result<()> {
             size as u8,
         ])
     } else if size >= 0x00FF_FFFF_FFFF_FFFF {
-        // 0x00FF_FFFF_FFFF_FFFF (max 56-bit) encodes byte-for-byte
-        // identical to write_unknown_size (the EBML all-ones
-        // "unknown/open-ended" sentinel), and anything larger doesn't fit
-        // the 7-byte payload. Reject so a finite size can never be emitted
-        // as the unknown-size marker.
+        // Max 56-bit value encodes identical to write_unknown_size's all-ones
+        // sentinel; reject so a finite size can never be mistaken for it.
         Err(crate::error::Error::MkvUnencodable.into())
     } else {
         // 8-byte size for large elements
@@ -363,11 +360,8 @@ pub fn read_size(r: &mut impl Read) -> io::Result<(u64, usize)> {
         }
         Ok((val, 8))
     } else {
-        // b0 == 0x00: no length marker in the first byte. A VINT wider than
-        // 8 bytes is not representable by Matroska's size encoding, so this
-        // is a malformed/over-long size field rather than a valid 8-byte
-        // length. Reject it instead of silently building a size from the
-        // following 7 bytes (which would desync the parse).
+        // b0 == 0x00: no length marker, meaning a VINT wider than 8 bytes, which
+        // Matroska can't represent. Reject rather than desync the parse.
         Err(crate::error::Error::MkvSourceInvalid.into())
     }
 }
@@ -381,10 +375,8 @@ pub fn read_element_header(r: &mut impl Read) -> io::Result<(u32, u64, usize)> {
 
 /// Read an unsigned integer value of `len` bytes.
 pub fn read_uint_val(r: &mut impl Read, len: usize) -> io::Result<u64> {
-    // An EBML unsigned integer is at most 8 bytes. A malformed element
-    // claiming `len > 8` would index past this stack buffer and panic
-    // (DoS on untrusted input) — reject it at the source so every caller
-    // is safe, not just the ones that pre-check.
+    // len > 8 would index past this stack buffer and panic (DoS on untrusted
+    // input); reject at the source so every caller is safe, not just pre-checked ones.
     if len > 8 {
         return Err(crate::error::Error::MkvSourceInvalid.into());
     }
@@ -398,7 +390,7 @@ pub fn read_uint_val(r: &mut impl Read, len: usize) -> io::Result<u64> {
 }
 
 /// Read a float value. EBML floats are exactly 0, 4, or 8 bytes; any other
-/// length is rejected as [`Error::MkvSourceInvalid`] and exactly the float width is
+/// length is rejected as [`Error::MkvSourceInvalid`](crate::Error::MkvSourceInvalid) and exactly the float width is
 /// consumed (so a malformed element never under- or over-reads and desyncs the
 /// rest of the parent element).
 pub fn read_float_val(r: &mut impl Read, len: usize) -> io::Result<f64> {
@@ -519,10 +511,8 @@ pub const FIELD_ORDER: u32 = 0x9D;
 // FlagInterlaced values: 1 = interlaced, 2 = progressive (0 = undetermined).
 pub const INTERLACED_INTERLACED: u64 = 1;
 pub const INTERLACED_PROGRESSIVE: u64 = 2;
-// FieldOrder values (Matroska / RFC 9559, element 0x9D): 1 = top-field-first,
-// 6 = bottom-field-first, 0 = progressive. The muxer derives TFF vs BFF from the
-// bitstream's measured top_field_first when available, falling back to TFF for
-// interlaced content (NTSC 480i / PAL 576i / HD 1080i are overwhelmingly TFF).
+// FieldOrder (RFC 9559 element 0x9D): 1 = TFF, 6 = BFF, 0 = progressive. Falls
+// back to TFF when top_field_first isn't measured (most interlaced content is TFF).
 // 0xFF is our sentinel for "undetermined / omit the element".
 pub const FIELD_ORDER_TFF: u8 = 1;
 /// Bottom-field-first (RFC 9559 element 0x9D = 6). Emitted when the bitstream's
@@ -566,9 +556,8 @@ pub const BLOCK_ADD_ID_EXTRA_DATA: u32 = 0x41ED;
 /// BlockAdditional). Used by the MVC (`mvcC`) mapping for Blu-ray 3D.
 pub const BLOCK_ADD_ID_VALUE: u32 = 0x41F0;
 
-// Block additions carried inside a BlockGroup — per-frame side data. For
-// Blu-ray 3D (MVC) the dependent (right-eye) view NAL units for an access unit
-// ride here as a BlockAdditional under the track's `mvcC` mapping (RFC 9559
+// Block additions inside a BlockGroup — per-frame side data. For Blu-ray 3D (MVC),
+// dependent (right-eye) NAL units ride as a BlockAdditional under `mvcC` (RFC 9559
 // §5.1.4.1.4; Matroska Codec Specifications §4.1.5).
 pub const BLOCK_ADDITIONS: u32 = 0x75A1;
 pub const BLOCK_MORE: u32 = 0xA6;
@@ -603,10 +592,9 @@ pub const CUE_TRACK_POSITIONS: u32 = 0xB7;
 pub const CUE_TRACK: u32 = 0xF7;
 pub const CUE_CLUSTER_POSITION: u32 = 0xF1;
 
-// Tags — per-track statistics tags. mkvmerge convention: a `BPS` SimpleTag
-// per track carries the bits-per-second so readers (Windows Explorer's MKV
-// property handler) that read the container tag rather than computing from
-// stream size show a bitrate for every track, not just CBR audio.
+// Tags — mkvmerge convention: a `BPS` SimpleTag per track carries bits-per-second
+// so readers relying on the container tag (e.g. Explorer's MKV handler) show a
+// bitrate for every track, not just CBR audio.
 pub const TAGS: u32 = 0x1254_C367;
 pub const TAG: u32 = 0x7373;
 pub const TARGETS: u32 = 0x63C0;
@@ -969,13 +957,8 @@ mod tests {
         assert_eq!(consumed, 8);
     }
 
-    // ============================================================
-    // write_id — exact width selection per EBML element-ID ranges
-    // (Matroska/EBML spec: an element ID is written verbatim; its
-    // declared width is implied by the position of the leading 1 bit.
-    // write_id must pick the minimal whole-byte encoding so the ID
-    // round-trips and parsers see the same width.)
-    // ============================================================
+    // write_id — exact width selection per EBML element-ID ranges. write_id must
+    // pick the minimal whole-byte encoding so the ID round-trips at the same width.
 
     #[test]
     fn write_id_exact_bytes_per_width() {
@@ -1019,22 +1002,15 @@ mod tests {
 
     #[test]
     fn read_id_rejects_zero_first_byte() {
-        // A first byte of 0x00 has no length marker in any of bits 7..4, so
-        // read_id falls through to the else branch and must reject it (an
-        // EBML ID wider than 4 bytes is not representable here). Otherwise the
-        // parser would desync.
+        // 0x00 has no length marker, meaning an ID wider than 4 bytes, which isn't
+        // representable here; reject or the parser desyncs.
         let mut c = Cursor::new(&[0x00u8, 0x11, 0x22, 0x33]);
         let e = read_id(&mut c).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
-    // ============================================================
-    // write_uint — the SIZE byte must reflect the minimal big-endian
-    // value width (1/2/3/4/8). The Matroska spec stores unsigned ints
-    // big-endian with no leading-zero bytes; the declared element size
-    // is exactly that width. A boundary bug would write the wrong size
-    // and desync every following element.
-    // ============================================================
+    // write_uint — the SIZE byte must reflect the minimal big-endian value width
+    // (1/2/3/4/8, no leading-zero bytes); a boundary bug desyncs every following element.
 
     #[test]
     fn write_uint_size_byte_matches_value_width() {
@@ -1101,10 +1077,8 @@ mod tests {
         assert_eq!(&mn[2..], &i64::MIN.to_be_bytes());
     }
 
-    // ============================================================
     // write_float — EBML floats here are always 8-byte IEEE-754 doubles,
     // big-endian (Matroska SamplingFrequency/Duration). size byte = 0x88.
-    // ============================================================
 
     #[test]
     fn write_float_is_8_byte_big_endian_double() {
@@ -1120,11 +1094,8 @@ mod tests {
         assert_eq!(got.to_bits(), 48000.0f64.to_bits());
     }
 
-    // ============================================================
-    // write_string / write_binary — declared size must equal the byte
-    // length (UTF-8 byte count, not char count) so the reader consumes
-    // exactly the payload and no more.
-    // ============================================================
+    // write_string / write_binary — declared size must equal the byte length
+    // (UTF-8 byte count, not char count) so the reader consumes exactly the payload.
 
     #[test]
     fn write_string_size_is_utf8_byte_count_not_char_count() {
@@ -1147,11 +1118,8 @@ mod tests {
         assert_eq!(&buf[3..], &data);
     }
 
-    // ============================================================
-    // read_string_val — Matroska strings may be null-padded; the reader
-    // strips trailing NULs but must preserve interior content and the
-    // payload byte-count consumed.
-    // ============================================================
+    // read_string_val — Matroska strings may be null-padded; the reader strips
+    // trailing NULs but must preserve interior content and bytes consumed.
 
     #[test]
     fn read_string_val_strips_only_trailing_nulls() {
@@ -1170,10 +1138,8 @@ mod tests {
         assert_eq!(s.as_bytes(), b"a\0b");
     }
 
-    // ============================================================
-    // read_uint_val — big-endian assembly; an EBML uint never exceeds 8
-    // bytes (the reader rejects len>8 to avoid a stack OOB).
-    // ============================================================
+    // read_uint_val — big-endian assembly; an EBML uint never exceeds 8 bytes
+    // (the reader rejects len>8 to avoid a stack OOB).
 
     #[test]
     fn read_uint_val_big_endian_and_len_zero() {
@@ -1197,10 +1163,8 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
-    // ============================================================
-    // read_float_val — exactly 0/4/8 byte widths; 4-byte is an f32
-    // promoted to f64, 8-byte is an exact f64.
-    // ============================================================
+    // read_float_val — exactly 0/4/8 byte widths; 4-byte is an f32 promoted to
+    // f64, 8-byte is an exact f64.
 
     #[test]
     fn read_float_val_4_byte_is_f32_promoted() {
@@ -1225,11 +1189,8 @@ mod tests {
         }
     }
 
-    // ============================================================
-    // read_binary_val / read_exact_bounded — a declared length that
-    // exceeds the bytes actually present is a truncated (malformed)
-    // element and must error without allocating the full declared size.
-    // ============================================================
+    // read_binary_val / read_exact_bounded — a declared length exceeding bytes
+    // present is a truncated element; must error without allocating the full size.
 
     #[test]
     fn read_binary_val_short_read_errors() {
@@ -1241,10 +1202,8 @@ mod tests {
         assert_eq!(v, vec![1, 2, 3, 4]);
     }
 
-    // ============================================================
-    // read_element_header — header_bytes is id_len + size_len, and a
-    // truncated header (EOF mid-size) surfaces as an error.
-    // ============================================================
+    // read_element_header — header_bytes is id_len + size_len, and a truncated
+    // header (EOF mid-size) surfaces as an error.
 
     #[test]
     fn read_element_header_reports_total_header_len() {
@@ -1275,12 +1234,8 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
     }
 
-    // ============================================================
-    // write_size — every declared width-boundary, asserting the exact
-    // VINT bytes (length marker + payload). Grounded in the EBML VINT
-    // spec: width W encodes 7*W payload bits, the highest value of each
-    // width being reserved as the unknown-size sentinel.
-    // ============================================================
+    // write_size — every declared width-boundary, asserting the exact VINT bytes.
+    // Width W encodes 7*W payload bits; the highest value of each width is reserved.
 
     #[test]
     fn write_size_exact_bytes_at_width_boundaries() {
@@ -1310,13 +1265,9 @@ mod tests {
         assert_eq!(b, [0x01, 0, 0, 0, 0x0F, 0xFF, 0xFF, 0xFF]);
     }
 
-    // ============================================================
-    // start_master / end_master — the size placeholder is an 8-byte VINT
-    // (0x01 + 7 payload bytes), and end_master must back-patch the exact
-    // body byte count (end - start - 8). This is the core of every nested
-    // Matroska master element; a wrong subtraction silently corrupts the
-    // declared size of EVERY master element in the file.
-    // ============================================================
+    // start_master / end_master — the placeholder is an 8-byte VINT and end_master
+    // must back-patch the exact body size (end - start - 8); a wrong subtraction
+    // corrupts every nested master element's declared size.
 
     #[test]
     fn end_master_backpatches_exact_body_size() {
@@ -1479,10 +1430,8 @@ mod tests {
     /// end_master without a multi-terabyte buffer, which is why this is
     /// tested at the encoder.
     #[test]
-    // The underscores in these literals mark BITFIELD boundaries in the
-    // bitstream header being built (e.g. a 5-bit field then a 3-bit field),
-    // not thousands-style digit groups. Regrouping them uniformly would
-    // satisfy the lint by destroying the only thing they encode.
+    // Underscores mark bitfield boundaries (e.g. 5-bit then 3-bit), not digit
+    // groups; regrouping uniformly would destroy the only thing they encode.
     #[allow(clippy::unusual_byte_groupings)]
     fn fixed_width_vint8_is_big_endian_over_the_full_payload() {
         assert_eq!(

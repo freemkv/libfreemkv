@@ -84,14 +84,9 @@ pub fn resolve_device(path: &str) -> Result<(String, DeviceResolution)> {
         let sr_id = DriveId::from_drive(sr_transport.as_mut())?;
         drop(sr_transport);
         for (sg_path, sg_id) in find_drives() {
-            // Require a non-empty serial before treating vendor/product/
-            // serial as a unique match. serial_number falls back to an
-            // empty string when GET CONFIGURATION 0108h is unavailable
-            // (common on OEM drives); two same-model drives would then
-            // both compare equal and the first in enumeration order would
-            // win silently, resolving sr1 to sr0's sg node. An empty
-            // serial can't disambiguate, so fall through to the no-match
-            // path instead.
+            // Require a non-empty serial before treating vendor/product/serial as a unique
+            // match: serial_number falls back to "" when GET CONFIGURATION 0108h is
+            // unavailable (OEM drives), which would let same-model drives collide silently.
             if !sr_id.serial_number.is_empty()
                 && sg_id.vendor_id == sr_id.vendor_id
                 && sg_id.product_id == sr_id.product_id

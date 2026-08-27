@@ -454,7 +454,8 @@ pub fn iso639_1_to_iso639_2(code: &str) -> Option<&'static str> {
 
 /// Classify a free-form English label string into a [`LabelPurpose`].
 ///
-/// Recognized keywords (case-insensitive, word-boundary matched):
+/// Recognized keywords (case-insensitive; single-word keywords are
+/// word-boundary matched, multi-word phrases are substring matched):
 /// - "commentary", "director's commentary" → `Commentary`
 /// - "descriptive", "description", "audio description", "described" → `Descriptive`
 /// - "score", "music only" → `Score`
@@ -462,7 +463,8 @@ pub fn iso639_1_to_iso639_2(code: &str) -> Option<&'static str> {
 /// - anything else → `Normal`
 ///
 /// Word-boundary matching means "Commentary track" matches but
-/// "Commenter Pro audio" does not.
+/// "Commenter Pro audio" does not. Multi-word phrases like "audio
+/// description" and "music only" are matched as plain substrings.
 pub fn purpose(text: &str) -> LabelPurpose {
     let lower = text.to_lowercase();
     // Multi-word compounds first — they're more specific.
@@ -531,12 +533,9 @@ fn has_word(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    // Boundary check is char-aware (not byte-level): a non-ASCII letter
-    // adjacent to the match (e.g. an accented or CJK char, which is
-    // multiple UTF-8 bytes) is alphanumeric and so is NOT a boundary,
-    // preventing false positives like "sdh" inside "cafésch". Needles
-    // are ASCII tokens, so a byte-offset match aligns with char
-    // boundaries in `haystack`.
+    // Char-aware, not byte-level: an accented/CJK char adjacent to the match is
+    // alphanumeric and so NOT a boundary, preventing false positives like "sdh"
+    // inside "cafésch". Needles are ASCII, so byte offsets align with char bounds.
     for (idx, _) in haystack.match_indices(needle) {
         // Char immediately before the match.
         let before_is_alnum = haystack[..idx]

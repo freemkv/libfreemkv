@@ -101,10 +101,8 @@ fn assign_stream_numbers(
     const NUMBER_SPACE_END: u32 = u16::MAX as u32 + 1;
 
     // Numbers already claimed by the map, per type. A map value of 0 is NOT a
-    // claim: apply_labels binds on 1-based stream numbers, so 0 is unmatchable.
-    // Treat 0 as "unmapped" here (defense in depth — parse_playback_config also
-    // filters it) so such a stream gets a real synthesized number instead of an
-    // orphan 0 that collides with / shadows a genuine stream 1.
+    // claim (apply_labels binds 1-based numbers, so 0 is unmatchable); treat it
+    // as unmapped so the stream gets a real number instead of colliding with 1.
     let mut taken_audio: Vec<u16> = Vec::new();
     let mut taken_sub: Vec<u16> = Vec::new();
     for info in infos {
@@ -646,9 +644,8 @@ mod tests {
         assert_eq!(map.get("sub1").copied(), Some(3));
     }
 
-    /// Spec: high confidence is returned when streamproperties.xml is fully
-    /// structured (no fallback). This is the Criterion parser's claim.
-    /// Mutation: change to ParseResult::medium → confidence assertion fails.
+    /// Spec: `LangInfoID` values are lowercased so they match
+    /// `apply_labels`' lookup (an uppercase "ENG" must parse as "eng").
     #[test]
     fn parse_stream_infos_language_lowercased() {
         // LangInfoID values must be lowercased so they match apply_labels' lookup.

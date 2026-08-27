@@ -3,7 +3,7 @@
 //! queue bounded. On macOS and Windows, a no-op stub.
 //!
 //! The platform decision lives entirely in this file (the cfg-gated
-//! `pub use` below). Callers — and `DiskWriter` itself — are
+//! `pub use` below). Callers — and `WritebackFile` itself — are
 //! platform-independent.
 
 #[cfg(target_os = "linux")]

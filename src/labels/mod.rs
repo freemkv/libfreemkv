@@ -119,15 +119,12 @@ pub enum LabelQualifier {
 }
 
 // ── Parser registry ────────────────────────────────────────────────────────
-//
-// Each entry: (name, detect_fn, parse_fn). Order = tiebreaker only —
-// the registry picks the highest-confidence parse result, falling back
-// to array order on confidence ties.
+// Each entry: (name, detect_fn, parse_fn). Order = tiebreaker only — the
+// registry picks the highest-confidence parse result, falling back to order.
 
 // `detect` takes the reader too, so a parser can look INSIDE a jar's central
 // directory (real vendor-prefix / project-file check) rather than firing on
-// "any jar present". Precise detection is what lets the registry scale to many
-// parsers without cross-parser collisions.
+// "any jar present", letting the registry scale without cross-parser collisions.
 type DetectFn = fn(&mut dyn SectorSource, &UdfFs) -> bool;
 type ParseFn = fn(&mut dyn SectorSource, &UdfFs) -> Option<ParseResult>;
 
@@ -233,26 +230,18 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
     ("criterion", criterion::detect, criterion::parse),
     ("pixelogic", pixelogic::detect, pixelogic::parse),
     ("ctrm", ctrm::detect, ctrm::parse),
-    // dbp and deluxe now detect via the real `com/<vendor>/` central-directory
-    // prefix (reader-backed), so they claim only their own discs. Order between
-    // them is the tiebreaker on equal confidence; dbp goes first because its
-    // parse path is cheaper (constant-pool iteration vs. deluxe's bytecode
-    // walking).
+    // dbp and deluxe detect via the real `com/<vendor>/` central-directory
+    // prefix (reader-backed), so they claim only their own discs. dbp goes
+    // first on ties: its parse path is cheaper (constant-pool vs. bytecode).
     ("dbp", dbp::detect, dbp::parse),
     ("deluxe", deluxe::detect, deluxe::parse),
-    // Fox — older discs ship a loose plain-XML `/BDMV/JAR/<id>/dcx.xml`
-    // manifest (root `<dcx>`) with per-stream language/purpose/qualifier.
-    // High confidence: fully structured, no guessing. Registered ahead of
-    // the universal MPLS fallback so its editorial labels win. Newer Fox
-    // wraps the same data in `com/foxbd` bytecode (see fox.rs Phase 2 note),
-    // which this parser detects but does not yet decode.
+    // Fox — older discs ship a loose plain-XML `/BDMV/JAR/<id>/dcx.xml` manifest
+    // with per-stream language/purpose/qualifier (High confidence). Newer Fox
+    // wraps this in `com/foxbd` bytecode (fox.rs Phase 2); detected, not yet decoded.
     ("fox", fox::detect, fox::parse),
-    // Universal MPLS fallback. Returns Confidence::Low so framework
-    // parsers always win when they match. Closes the "no framework
-    // matched" gap (e.g. HDMV-only discs) with spec-derived language
-    // + base codec for every stream the playlist references. Runs
-    // last in registry order so it's only the chosen parser when
-    // nothing else fired.
+    // Universal MPLS fallback. Returns Confidence::Low so framework parsers
+    // always win when they match. Closes the "no framework matched" gap (e.g.
+    // HDMV-only discs) with spec-derived language + codec for every stream.
     (
         "mpls_universal",
         mpls_universal::detect,
@@ -260,8 +249,7 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
     ),
     // Menu-graphic filename language hints (Low). AFTER mpls_universal so the
     // richer spec-derived floor wins the Low tie whenever it produces anything;
-    // this only becomes the chosen parser when even MPLS yields nothing but the
-    // menu artwork still names its languages. A last-resort language source.
+    // only chosen when even MPLS yields nothing but the menu art still names languages.
     ("png_filenames", png_filenames::detect, png_filenames::parse),
 ];
 
@@ -484,10 +472,9 @@ fn anchor_score(
 pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
     use std::collections::HashMap;
 
-    // `(clip id, PID) -> index into `labels``, harvested from the anchor
-    // title of each stream type. Keyed by clip because a PID is only unique
-    // within one clip: two unrelated .m2ts files both open their audio at
-    // 0x1100.
+    // `(clip id, PID) -> index into `labels``, harvested from the anchor title
+    // of each stream type. Keyed by clip because a PID is only unique within
+    // one clip: two unrelated .m2ts files both open their audio at 0x1100.
     let mut pid_map: HashMap<(&str, u16), usize> = HashMap::new();
     let mut anchors: [Option<usize>; 2] = [None; 2];
     for stream_type in [StreamLabelType::Audio, StreamLabelType::Subtitle] {
@@ -504,15 +491,9 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
             }) else {
                 continue;
             };
-            // ONLY the anchor's first clip. `disc::bluray` builds a title's
-            // stream list from `play_items[0]`'s STN table, so that is the only
-            // clip in which these PIDs were ever observed — the same clip tier 3
-            // keys its derived ids on (`clip0`, below). Recording the fact
-            // against every clip the anchor plays claims knowledge of stream
-            // tables never read: a sibling playlist over a LATER clip then binds
-            // the anchor's editorial label onto whichever stream of that clip
-            // reuses the PID, which is a different physical stream (PIDs are
-            // unique only within a clip).
+            // ONLY the anchor's first clip: `disc::bluray` builds streams from
+            // `play_items[0]`'s STN table, the only clip these PIDs were seen in.
+            // A later clip could reuse the PID for a different stream otherwise.
             if let Some(clip) = title.clips.first() {
                 pid_map.insert((clip.clip_id.as_str(), *pid), pos);
             }
@@ -531,12 +512,9 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
         .map(|((c, p), v)| ((c.to_string(), p), v))
         .collect();
 
-    // Labels that name their own stream, indexed by that name. No anchor, no
-    // sequence and no ordinal is involved in reaching one of these: the id was
-    // read from the same STN / ProgramInfo table `disc::bluray` built the
-    // stream from, so equality here is the same elementary stream by
-    // construction. Later duplicates lose, matching the first-wins rule the
-    // rest of this module uses.
+    // Labels that name their own stream, indexed by that name. The id was read
+    // from the same STN / ProgramInfo table `disc::bluray` built the stream
+    // from, so equality here is the same elementary stream by construction.
     let by_id: HashMap<&StreamId, usize> = labels
         .iter()
         .enumerate()
@@ -572,9 +550,8 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
             .unwrap_or_default();
 
         // Resolve one stream to (label, authoritative). Authoritative means the
-        // label is known to belong to THIS stream rather than guessed onto it:
-        // tiers 1-3 of the doc comment above. Only tier 4, the bare ordinal, is
-        // not.
+        // label is known to belong to THIS stream rather than guessed onto it
+        // (tiers 1-3 of the doc comment above); only tier 4, the bare ordinal, isn't.
         let resolve = |stream_type: StreamLabelType, idx: u16, pid: u16, lang: &str| {
             if anchors[type_tag(stream_type) as usize] == Some(title_idx)
                 && let Some(l) = label_at(labels, stream_type, idx)
@@ -610,15 +587,9 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
                         // Structured fields — callers translate purpose to UI text.
                         a.purpose = label.purpose;
 
-                        // Codec descriptor: trust the parser's `codec_hint` ONLY
-                        // when it's consistent with the stream's actual codec — it
-                        // may legitimately be richer (e.g. "Dolby Atmos" on a TrueHD
-                        // stream, which the raw spec codec can't express). If the
-                        // hint CONTRADICTS the stream (a mis-bound / shuffled label,
-                        // e.g. "AC-3 2.0" on a TrueHD track, or "TrueHD" on a DD+
-                        // track), discard it and derive the descriptor from the
-                        // stream itself — that's correct per-stream and can never be
-                        // shuffled. An empty hint is left for `fill_defaults`.
+                        // Trust the parser's `codec_hint` ONLY when consistent with the
+                        // stream's actual codec (it may be richer, e.g. "Dolby Atmos" on
+                        // TrueHD); if it CONTRADICTS, derive from the stream itself.
                         let codec_desc = if label.codec_hint.is_empty() {
                             // No codec hint — leave for fill_defaults.
                             String::new()
@@ -660,10 +631,9 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
                     sub_idx += 1;
                     if let Some((label, authoritative)) =
                         resolve(StreamLabelType::Subtitle, sub_idx, s.pid, &s.language)
-                        // A subtitle label carries nothing but the qualifier,
-                        // so an unverifiable one is all risk and no gain: off
-                        // the authoritative path, require the label and the
-                        // stream to state the same language.
+                        // A subtitle label carries nothing but the qualifier, so an
+                        // unverifiable one is all risk, no gain: off the authoritative
+                        // path, require the label and stream to state the same language.
                         && (authoritative
                             || languages_agree(&label.language, &s.language))
                     {
@@ -798,19 +768,17 @@ fn codec_hint_consistent(hint: &str, codec: &crate::disc::Codec) -> bool {
     let says_dts = !says_dts_ma && !says_dts_hr && h.contains("dts");
     let says_lpcm = h.contains("lpcm") || h.contains("pcm");
     let says_atmos = h.contains("atmos");
-    // DTS:X is an object-audio extension carried on a DTS-HD MA (or HR)
-    // core, exactly as Atmos rides TrueHD / DD+. The spec Codec enum has
-    // no DtsX variant, so a correctly-authored DTS:X hint must be judged
-    // consistent with its DtsHdMa/DtsHdHr carrier rather than discarded.
+    // DTS:X is an object-audio extension carried on a DTS-HD MA (or HR) core,
+    // as Atmos rides TrueHD/DD+. The spec Codec enum has no DtsX variant, so a
+    // correctly-authored hint must be judged consistent with its carrier.
     let says_dtsx = h.contains("dts:x") || h.contains("dts-x") || h.contains("dtsx");
 
     let names_family =
         says_truehd || says_ddp || says_ac3 || says_dts_ma || says_dts_hr || says_dts || says_lpcm;
 
-    // Pure-editorial hint (no codec family named) isn't asserting a codec →
-    // consistent. "Atmos" alone implies a lossless carrier (TrueHD or DD+).
-    // ("DTS:X" always also matches the "dts" family above, so it never
-    // reaches this branch — it is handled in the DtsHdMa/DtsHdHr arms.)
+    // Pure-editorial hint (no codec family named) isn't asserting a codec, so
+    // it's consistent. "Atmos" alone implies a lossless carrier (TrueHD/DD+).
+    // ("DTS:X" always matches "dts" above, so it never reaches this branch.)
     if !names_family {
         return if says_atmos {
             matches!(codec, Codec::TrueHd | Codec::Ac3Plus)
@@ -936,14 +904,9 @@ fn extract(
         }
         candidates.push((name, result));
     }
-    // One tie-break rule, one implementation. `select_result` owns it and
-    // carries a regression test for a past bug where the LAST equal-confidence
-    // parser won instead of the first. `extract` — the path that actually
-    // ships — used to re-derive the same rule inline with a hand-rolled `>`
-    // scan and had no test of its own, so that fixed bug could have silently
-    // recurred here. Array order encodes a trust ordering (the hand-vetted
-    // parsers are registered ahead of the ones that detect on any BD-J disc),
-    // so "first wins on a tie" is load-bearing, not incidental.
+    // One tie-break rule, one implementation. `select_result` regression-tests a
+    // past bug where the LAST equal-confidence parser won instead of the first.
+    // Array order encodes trust (hand-vetted parsers before generic BD-J ones).
     let best = select_result(&candidates).map(|(n, r)| (*n, r.clone()));
     let (name, mut labels, feature_playlist) = match best {
         Some((n, r)) => {
@@ -961,24 +924,18 @@ fn extract(
         }
     };
 
-    // The MPLS floor: framework parsers under-yield on multi-track discs
-    // because their authoring layer only ships editorial labels for
-    // "interesting" streams (Director's Cut, Atmos, SDH) and leaves the rest as
-    // plain numbered slots. MPLS sees every stream a playlist references, and
-    // names each one, so merging it in gives the user every track even when
-    // only the "interesting" ones have editorial names. Skipped when
-    // mpls_universal was itself the chosen parser (its labels ARE the labels).
+    // The MPLS floor: framework parsers under-yield on multi-track discs, only
+    // shipping editorial labels for "interesting" streams (Atmos, SDH). MPLS
+    // names every stream a playlist references, filling the gaps.
     if name != "mpls_universal"
         && let Some(mpls_result) = mpls_universal::parse(reader, udf)
     {
         merge_mpls_floor(&mut labels, &mpls_result.labels);
     }
 
-    // CLPI orphan streams: PIDs in /BDMV/CLIPINF/*.clpi ProgramInfo that no
-    // MPLS playlist references. Empirically a small fraction of streams are
-    // CLPI-only — physically on disc, not menu-reachable. They too are
-    // appended under the id they name, so a title reaches one only if it
-    // actually carries that stream.
+    // CLPI orphan streams: PIDs in /BDMV/CLIPINF/*.clpi ProgramInfo that no MPLS
+    // playlist references (physically on disc, not menu-reachable). Appended
+    // under the id they name, so a title reaches one only if it carries it.
     let _orphans_added = append_clpi_orphans(&mut labels, reader, udf);
 
     (labels, feature_playlist)
@@ -1075,12 +1032,9 @@ fn append_clpi_orphans(
     udf: &UdfFs,
 ) -> usize {
     use crate::consts::coding_type as c;
-    // Two exclusions, one exact and one fuzzy. Exact: a stream some label
-    // already NAMES is not an orphan, whatever it looks like. Fuzzy: the
-    // pre-existing (type, language, codec_hint) test, kept because it is what
-    // bounds this list to a handful of entries per disc rather than one per
-    // stream per clip; it can only ever drop a candidate, and an orphan that
-    // never binds costs nothing when it is dropped.
+    // Two exclusions: exact (a stream some label already NAMES is not an orphan)
+    // and fuzzy (the pre-existing (type, language, codec_hint) test, kept to
+    // bound this list to a handful of entries per disc, not one per stream).
     use std::collections::HashSet;
     let named: HashSet<&StreamId> = labels.iter().filter_map(|l| l.stream_id.as_ref()).collect();
     let existing: HashSet<(StreamLabelType, String, String)> = labels
@@ -1120,10 +1074,9 @@ fn append_clpi_orphans(
             if !seen_pids.insert(s.pid) {
                 continue;
             }
-            // Translate CLPI coding_type → label stream_type.
-            // 0x90 = Presentation Graphics (PG subtitle). 0x91 =
-            // Interactive Graphics (BD-J menu overlay), NOT a user-facing
-            // subtitle — skip it, matching the MPLS path which drops IG.
+            // Translate CLPI coding_type → label stream_type. 0x90 = Presentation
+            // Graphics (PG subtitle); 0x91 = Interactive Graphics (BD-J menu
+            // overlay), NOT a user-facing subtitle — skip it, matching MPLS.
             let stype = match s.coding_type {
                 c::LPCM..=c::DTS_HD_MA | c::AC3_PLUS_SECONDARY | c::DTS_HD_SECONDARY => {
                     StreamLabelType::Audio
@@ -1235,16 +1188,13 @@ pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
     };
 
     // The MPLS floor: same merge as `extract()`. Skipped when MPLS was itself
-    // the chosen parser (its labels ARE the labels).
-    //
-    // Note this diagnostic path stops here — `extract()` also appends the CLPI
-    // orphans, which `analyze` has never reported.
+    // the chosen parser (its labels ARE the labels). This diagnostic path stops
+    // here — `extract()` also appends the CLPI orphans, which `analyze` never does.
     let gap_fill_added = if parser.is_some() && parser != Some("mpls_universal") {
         let before = labels.len();
-        // Re-run MPLS unconditionally — we only ran framework parsers
-        // above (we want to know which one to pick), and in the
-        // common case where MPLS would have detected but wasn't
-        // chosen we still need its labels for the merge.
+        // Re-run MPLS unconditionally: we only ran framework parsers above (to
+        // know which to pick), and in the common case where MPLS would have
+        // detected but wasn't chosen we still need its labels for the merge.
         if let Some(mpls_result) = mpls_universal::parse(reader, udf) {
             merge_mpls_floor(&mut labels, &mpls_result.labels);
         }
@@ -1262,10 +1212,9 @@ pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
         );
     }
 
-    // bdmt runs independently of the parser registry: it's disc-level
-    // metadata (localized titles, box-set position), not per-stream
-    // labels, so the "highest confidence wins" logic doesn't apply.
-    // Always run if detected; surface result as a separate field.
+    // bdmt runs independently of the parser registry: it's disc-level metadata
+    // (localized titles, box-set position), not per-stream labels, so "highest
+    // confidence wins" doesn't apply. Always run if detected, as a separate field.
     let disc_metadata = if bdmt::detect(udf) {
         bdmt::parse(reader, udf)
     } else {
@@ -1320,10 +1269,9 @@ fn collect_chapter_summary(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<Ch
         if chapter_count == 0 {
             continue;
         }
-        // Duration: sum of (out_time - in_time) across play items,
-        // each in 45kHz PTS ticks → seconds. Approximates the disc
-        // module's per-title duration; we don't claim sample accuracy
-        // here, just enough to identify "the long one" (main movie).
+        // Duration: sum of (out_time - in_time) across play items, in 45kHz PTS
+        // ticks. Approximates the disc module's per-title duration; not
+        // sample-accurate, just enough to identify "the long one" (main movie).
         let duration_ticks: u64 = playlist
             .play_items
             .iter()
@@ -1377,7 +1325,7 @@ pub struct LabelAnalysis {
     /// tool.
     pub gap_fill_added: usize,
     /// Per-playlist chapter summary: `(playlist_filename, chapter_count, duration_secs)`.
-    /// Sourced from MPLS PlaylistMark entries with `mark_type ≤ 1`
+    /// Sourced from MPLS PlaylistMark entries with `mark_type == 1`
     /// (chapter entries). Ordered by playlist filename. Empty if no
     /// MPLS files have parseable marks, or the disc isn't Blu-ray.
     pub chapter_summary: Vec<ChapterSummary>,
@@ -1695,18 +1643,14 @@ mod registry_tests {
     #[test]
     fn parsers_registry_all_entries_populated() {
         for (name, detect, parse) in PARSERS {
-            // Function pointers can't be Null in safe Rust, so the
-            // assertion is just that the array entry was constructed
-            // — which the iter above already implies. The test
-            // exists to fail compile if someone changes the tuple
-            // shape (e.g. adds a 4th field) without updating callers,
-            // and as a marker for "these parsers exist."
+            // Function pointers can't be null in safe Rust, so this just fails to
+            // compile if the tuple shape changes (e.g. a 4th field is added)
+            // without updating callers; it also marks "these parsers exist."
             let _ = (name, detect, parse);
         }
-        // The loop above touches every registry entry. The non-empty
-        // invariant is covered separately by `parsers_registry_order_locked`,
-        // whose assert_eq! on the expected order fails if PARSERS is empty.
-        // This test fails to compile if the tuple shape changes.
+        // Non-empty invariant is covered separately by
+        // `parsers_registry_order_locked`, whose assert_eq! on the expected
+        // order fails if PARSERS is empty.
     }
 }
 
@@ -1866,11 +1810,9 @@ mod gap_fill_tests {
 
     #[test]
     fn orphan_append_skips_matching_type_lang_codec_tuples() {
-        // If a "would-be orphan" actually shares (type, lang, codec) with a
-        // label we already have, drop it — the user-facing rendering would be a
-        // confusing duplicate. This fuzzy test is what bounds the orphan list
-        // to a handful of entries per disc; it is a population rule only, and
-        // no longer decides where anything binds.
+        // If a "would-be orphan" shares (type, lang, codec) with a label we
+        // already have, drop it to avoid a confusing duplicate. This fuzzy
+        // test bounds the orphan list; it's a population rule, not a binding rule.
         let labels = [
             label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
             label(StreamLabelType::Audio, 2, "fra", "AC-3"),
@@ -1919,10 +1861,8 @@ mod gap_fill_tests {
 }
 
 // ── apply() integration tests ──────────────────────────────────────────────
-//
-// End-to-end coverage for the apply_labels + fill_defaults pipeline
-// without needing a SectorSource / UdfFs. Synthetic DiscTitle +
-// StreamLabel inputs, assert on the resulting Stream field values.
+// End-to-end coverage for apply_labels + fill_defaults without needing a
+// SectorSource / UdfFs. Synthetic DiscTitle + StreamLabel inputs.
 
 #[cfg(test)]
 mod apply_tests {
@@ -2039,15 +1979,9 @@ mod apply_tests {
                 subtitle(0x12A2, "fra"),
             ],
         )];
-        // Capture through the crate's ONE global `tracing` subscriber:
-        // `testlog::capture` installs it exactly once and routes each event to a
-        // thread-local sink. A process-wide `set_global_default` HERE instead
-        // would poison every other test's callsite interest cache for the rest of
-        // the binary — `tracing` caches interest GLOBALLY — and only the first
-        // `set_global_default` in a process takes effect anyway. The shared
-        // subscriber answers interest for every callsite and isolates concurrent
-        // captures per thread, which is the invariant these log-accounting
-        // assertions rely on.
+        // `testlog::capture` installs the crate's ONE global `tracing` subscriber,
+        // routing events to a thread-local sink; `tracing` caches interest
+        // globally, so a per-test subscriber would poison other tests' callsites.
         let ((), events) = crate::testlog::capture(|| {
             apply_labels(&labels, &mut titles);
         });
@@ -2218,10 +2152,9 @@ mod apply_tests {
 
     #[test]
     fn apply_keeps_consistent_dtsx_hint_on_dts_hd_ma() {
-        // DTS:X rides a DTS-HD MA core just as Atmos rides TrueHD. A
-        // correctly-authored "DTS:X" hint on a DtsHdMa stream is richer
-        // than the spec codec yet consistent, so it's kept verbatim —
-        // not discarded and regenerated to "DTS-HD Master Audio".
+        // DTS:X rides a DTS-HD MA core just as Atmos rides TrueHD. A correctly
+        // authored "DTS:X" hint on a DtsHdMa stream is richer than the spec
+        // codec yet consistent, so it's kept verbatim, not regenerated.
         let mut titles = vec![title_with(vec![audio(
             0x1100,
             Codec::DtsHdMa,
@@ -2256,10 +2189,9 @@ mod apply_tests {
 
     #[test]
     fn apply_normalizes_plain_consistent_hint_to_marketing() {
-        // A French DD+ track: a DD+ stream whose hint "AC-3+ 5.1" is correct
-        // but short-form. A sibling DD+ track that fell back uses the marketing
-        // form — keeping the short form here would read inconsistently, so a
-        // plain (non-richer) consistent hint is normalized to the stream's own.
+        // A DD+ stream whose hint "AC-3+ 5.1" is correct but short-form; a sibling
+        // fallback track uses the marketing form, so a plain (non-richer)
+        // consistent hint is normalized to the stream's own to stay consistent.
         let mut titles = vec![title_with(vec![audio(
             0x1100,
             Codec::Ac3Plus,
@@ -3005,13 +2937,8 @@ mod apply_tests {
     }
 
     // ── codec_hint_consistent: chained-OR boundary hardening ────────────────
-    //
-    // The family-detection booleans are built from chains of `h.contains(..)
-    // || h.contains(..) || ...` synonym checks. Each test below isolates ONE
-    // synonym clause (a hint string that matches that clause and NO other
-    // clause in the same chain) so a `||` -> `&&` flip at that specific
-    // position changes the family verdict — and, downstream, whether the
-    // codec match arm returns the spec-correct answer.
+    // The family-detection booleans chain `h.contains(..) || ...` synonym checks.
+    // Each test isolates ONE clause so a `||` -> `&&` flip there changes the verdict.
 
     /// Isolates the `"true hd"` (space form) synonym in `says_truehd`,
     /// which mutant testing hit at 396:44's `||`. If that `||` is
@@ -3320,10 +3247,9 @@ mod apply_tests {
                 &["00082", "00090"],
                 vec![subtitle(0x1200, "eng"), subtitle(0x1201, "fra")],
             ),
-            // A sibling playlist over the anchor's SECOND clip. Its subtitle
-            // reuses PID 0x1200 — PIDs are only unique within a clip — and it
-            // is Spanish, so nothing about the anchor's English SDH slot
-            // describes it.
+            // Sibling playlist over the anchor's SECOND clip; reuses PID 0x1200
+            // (PIDs are only unique within a clip) but is Spanish, so the
+            // anchor's English SDH slot doesn't describe it.
             title_on_clips("00451.mpls", &["00090"], vec![subtitle(0x1200, "spa")]),
         ];
         apply_labels(&labels, &mut titles);
@@ -3356,10 +3282,9 @@ mod apply_tests {
     /// Mutation: as above — move `by_id` after the ordinal fallback.
     #[test]
     fn a_vendor_codec_claim_does_not_follow_the_ordinal_onto_a_bonus_clip() {
-        // The measured shape: this framework states no codec_hint at all and
-        // puts its descriptor in `name`, which `apply_labels` falls back to
-        // verbatim. Nothing about the stream is consulted on that path, so the
-        // codec-consistency guard never runs and cannot catch the mis-binding.
+        // This framework states no codec_hint and puts its descriptor in `name`,
+        // which `apply_labels` falls back to verbatim, so the codec-consistency
+        // guard never runs and cannot catch the mis-binding.
         let feature_audio = StreamLabel {
             name: "English Dolby Atmos".into(),
             ..audio_label(1, "eng", "", "")

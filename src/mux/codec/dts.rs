@@ -45,7 +45,7 @@ pub struct DtsParser {
     /// Keep/drop bookkeeping for the decodability gate: counts, per-drop and
     /// aggregate logging, and the whole-track poison fallback. A dropped AU is
     /// NEVER emitted, but the PTS clock is still advanced across it (see
-    /// [`stamp_pts`] usage) so every SURVIVING AU keeps the exact timestamp it
+    /// [`Self::stamp_pts`] usage) so every SURVIVING AU keeps the exact timestamp it
     /// would have had — a drop becomes a silence gap, never a shift.
     tally: super::dropgate::DropTally,
 }
@@ -120,7 +120,7 @@ impl DtsParser {
     }
 
     /// Stamp an access unit's PTS. `front` is the AU's own core-PES PTS (from
-    /// [`front_pts`]); `dur_ns` its decoded duration.
+    /// [`Self::front_pts`]); `dur_ns` its decoded duration.
     ///
     /// The model matches the (correct) AC-3 path: **re-base to each PES's own
     /// container timestamp, and advance by one frame duration ONLY within a run
@@ -201,20 +201,9 @@ const PTS_UNSET: i64 = -1;
 
 impl CodecParser for DtsParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        // B1: a concealed/lost gap means the buffered DTS access unit is
-        // TRUNCATED. Splicing post-gap bytes onto it corrupts the core/extension
-        // framing (→ "Failed to decode block code(s)" / "Invalid data found").
-        // Drop the partial AU and its PTS marks; the next PES re-bases a fresh
-        // unit. (DTS core/extension frames are independently decodable — every
-        // frame re-inits on its own syncword — so dropping the truncated partial
-        // and resuming on the next frame is sufficient here. This is NOT true of
-        // every audio codec: TrueHD/MLP carries predictor + restart state across
-        // access units and must additionally drop forward to its next major sync;
-        // see `codec::truehd`. The video ResyncGate handles inter-coded video.)
-        //
-        // Handle the discontinuity BEFORE the empty-data guard so the signal can
-        // never be stranded by an empty post-gap PES (defensive; the demuxer only
-        // emits non-empty PES today).
+        // B1: a concealed/lost gap means the buffered DTS AU is TRUNCATED; splicing
+        // post-gap bytes onto it corrupts the framing. Drop the partial AU and its
+        // PTS marks (DTS frames independently resync, unlike TrueHD/MLP).
         if pes.discontinuity {
             self.acc.clear();
             self.pending_pts = PTS_UNSET;
@@ -226,10 +215,6 @@ impl CodecParser for DtsParser {
         if pes.data.is_empty() {
             return Vec::new();
         }
-        // A PES with no PTS (rare for audio, but legal — the case demuxers
-        // guard at a post-gap continuation) must NOT reset the timeline to 0;
-        // continue from the most recent known base. Defense-in-depth: the
-        // discontinuity-carrying PES is a PUSI with a PTS in practice.
         // A PES with no PTS (rare for audio, but legal) must NOT reset the
         // timeline to 0 — continue from the most recent known base.
         let pts_ns = super::pesbuf::PesFacts::of(pes)
@@ -240,34 +225,15 @@ impl CodecParser for DtsParser {
                 0
             });
 
-        // On Blu-ray, a DTS-HD MA/HRA access unit is a DTS core frame
-        // (sync 0x7FFE8001) followed by one or more DTS extension substreams
-        // (sync 0x64582025). The m2ts demuxer hands those out as SEPARATE PES
-        // packets on the same PID — the core in one PES, then the extension
-        // substreams in following PES packets (with their own, later PTS). The
-        // lossless audio lives entirely in the extension substreams, so an
-        // access unit is only complete once all of its trailing extensions
-        // have been buffered. We assemble across PES boundaries here: an access
-        // unit runs from its core sync up to (but not including) the NEXT core
-        // sync. Emitting on the core boundary keeps the core + every following
-        // extension substream together (the lossless data), instead of the
-        // old per-PES emit that dropped the extension PES packets and
-        // downgraded the track to lossy DTS core (the lossy-core
-        // downgrade bug). The PTS is the core frame's PTS, captured when the unit began.
-        // Capture the access unit's PTS base on a fresh buffer, or whenever a
-        // prior forced (safety-valve) flush left it invalidated — in the
-        // forced case the bytes still in `buf` are not a real core frame, so
-        // the first PES to arrive after the flush carries the correct base.
+        // Blu-ray DTS-HD MA/HRA: core frame + extension substreams (lossless data)
+        // arrive in SEPARATE, later PES packets, so assemble core-to-next-core
+        // (else extensions get dropped = lossy core) and capture PTS base fresh.
         if self.acc.is_empty() || self.pending_pts == PTS_UNSET {
             self.pending_pts = pts_ns;
         }
-        // Mark where THIS PES's bytes begin in the buffer, with its PTS. The
-        // emitted access unit takes the PTS of the PES covering its first byte
-        // (see `front_pts`), so an AU whose core arrived in an earlier PES keeps
-        // that core's timestamp even when its extensions / the following core
-        // arrive (with a later PTS) in this same parse() call.
-        // `pts_ns` is this packet's own timestamp, or the carried-forward base
-        // when it had none; the source offset is always this packet's.
+        // Mark where THIS PES's bytes begin, with its PTS: the emitted AU takes
+        // the PTS of the PES covering its first byte (see `front_pts`), so an AU
+        // whose core arrived earlier keeps that timestamp over later extensions.
         self.acc.push_with(
             &pes.data,
             super::pesbuf::PesFacts::of(pes).with_pts_ns(pts_ns),
@@ -303,15 +269,9 @@ impl CodecParser for DtsParser {
                 break;
             }
             let core_size = dts_core_frame_size(self.acc.as_slice());
-            // `dts_core_frame_size` returns a 14-bit `fsize + 1`, so it is
-            // always in [1, 16384]; the bare `== 0` / `> MAX_AU_BYTES` checks
-            // can never fire. A real DTS core frame is at least
-            // MIN_CORE_FRAME_BYTES (96, the ETSI spec floor), so any decoded
-            // size below that came from a false/corrupt sync. Reject it (drain
-            // the 4 syncword bytes and resync) instead of letting a tiny bogus
-            // size close the current access unit at a junk boundary and drop the
-            // trailing extension substreams. The `> MAX_AU_BYTES` upper bound is
-            // kept as a harmless guard.
+            // A real core frame is at least MIN_CORE_FRAME_BYTES (96, ETSI floor);
+            // a smaller size came from a false sync, so reject it (drain 4 bytes,
+            // resync) rather than close the AU at a junk boundary.
             if !(MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&core_size) {
                 // Bogus core sync — skip past it and resync.
                 self.drain_front(4);
@@ -321,39 +281,24 @@ impl CodecParser for DtsParser {
                 break; // core frame not fully buffered yet — wait
             }
 
-            // The access unit ends at the next *valid* core sync. The search
-            // begins after this core's syncword so we don't re-match it.
-            // Anything between the core and that next sync is this unit's
-            // extension substream(s) — which can themselves contain byte
-            // sequences matching the core syncword, so a raw `find_sync` match
-            // is not enough: a candidate is only a real boundary if its decoded
-            // core size is plausible. `next_core_boundary` skips bogus matches.
-            //
-            // `forced` distinguishes a real next-core boundary from a forced
-            // safety-valve flush. On a forced flush the access unit was NOT
-            // closed by a new core sync, so the bytes following it are not a
-            // fresh core frame and the current PES's PTS (which on a forced
-            // flush is an extension-substream PES, carrying its own later
-            // timestamp) must NOT become the next unit's PTS base.
+            // The AU ends at the next *valid* core sync; extension bytes can contain
+            // false syncword matches, so `next_core_boundary` validates decoded size.
+            // `forced` marks a safety-valve flush whose PTS must NOT become the base.
             let mut forced = false;
             let (au_end, ext_clean) = match next_core_boundary(self.acc.as_slice(), core_size) {
                 NextCore::Found { end, ext_clean } => (end, ext_clean),
                 NextCore::NeedMore if self.acc.len() <= MAX_AU_BYTES => break,
                 NextCore::NeedMore => {
-                    // A candidate boundary exists but is not fully buffered. Normally
-                    // we wait for more PES; but once the buffer exceeds the AU cap,
-                    // apply the same force-flush safety valve as `None` so a crafted
-                    // stream that keeps a boundary perpetually incomplete can't grow
-                    // `buf` without bound (the `break` above never reaches it).
+                    // A candidate boundary isn't fully buffered; normally wait, but
+                    // past the AU cap apply the same force-flush as `None` so a
+                    // crafted stream can't grow `buf` without bound.
                     forced = true;
                     (self.acc.len(), true)
                 }
                 NextCore::None => {
-                    // No next core sync buffered yet. The trailing extension
-                    // substream PES packets may still be arriving, so WAIT for
-                    // them rather than emit a core-only (lossy) frame — unless
-                    // the buffer has grown unreasonably large, in which case
-                    // emit what we have to guarantee forward progress.
+                    // No next core sync yet: trailing extension PES packets may
+                    // still arrive, so WAIT rather than emit a lossy core-only
+                    // frame, unless the buffer has grown unreasonably large.
                     if self.acc.len() <= MAX_AU_BYTES {
                         break;
                     }
@@ -362,26 +307,18 @@ impl CodecParser for DtsParser {
                 }
             };
 
-            // Damaged source encoding: when the extension boundary was GARBAGE
-            // (not any DTS sync — `ext_clean == false`), the extension bytes for
-            // this AU are corrupt and would make the decoder cascade "DSYNC check
-            // failed" / "Read past end of XLL band data". Emit the clean DTS core
-            // ALONE (a decodable, lossy frame) and still drain past the garbage to
-            // the next core — a perfect mux drops the bad frame's corrupt part
-            // rather than shipping it. A recognized-but-unsizeable extension
-            // (`ext_clean == true`) is preserved in full (lossless).
+            // When the extension boundary is GARBAGE (`ext_clean == false`), emit
+            // the clean core ALONE (lossy) and drain past it to the next core; an
+            // unsizeable-but-recognized extension is kept in full (lossless).
             let emit_end = if ext_clean { au_end } else { core_size };
             let au: Vec<u8> = self.acc.as_slice()[..emit_end].to_vec();
-            // The AU's own core PES PTS (the PES covering its first byte, even if
-            // that PES preceded the one(s) carrying its extensions or the next
-            // core), stamped monotonically: honored when it advances past the
-            // running clock (UHD one-AU-per-PES), but never allowed to collide
-            // with the previous AU when several cores share ONE PES (DVD).
+            // The AU's own core PES PTS, stamped monotonically: honored when it
+            // advances past the running clock (UHD, one AU per PES), but never
+            // allowed to collide with the previous AU (DVD, several cores per PES).
             let dur_ns = dts_core_duration_ns(&au) as i64;
-            // Advance the PTS clock for this AU BEFORE the decodability gate, so
-            // a dropped AU still advances the timeline exactly as an emitted one
-            // would: the following AU keeps its true PTS and the drop is a gap,
-            // never a shift. `emit_or_drop` decides whether to actually push it.
+            // Advance the PTS clock BEFORE the decodability gate, so a dropped AU
+            // still advances the timeline like an emitted one (gap, not shift).
+            // `emit_or_drop` decides whether to actually push it.
             let au_pts = self.stamp_pts(self.front_pts(), dur_ns);
             // Read BEFORE draining: after the drain the front is the NEXT
             // unit's packet, not this one's.
@@ -393,10 +330,8 @@ impl CodecParser for DtsParser {
             // marker survives. Track it so the fallback stays sensible.
             self.pending_pts = self.front_pts();
             if forced {
-                // Safety-valve flush: the next access unit's real core PES has
-                // not arrived. Invalidate the PTS so the next PES sets it
-                // regardless of buffer state, rather than inheriting this
-                // (non-core) PES's timestamp.
+                // Safety-valve flush: the next AU's real core PES hasn't arrived,
+                // so invalidate the PTS rather than inherit this non-core PES's.
                 self.pending_pts = PTS_UNSET;
             }
         }
@@ -557,10 +492,8 @@ fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
                     }
                     pos += sz; // skip the whole extension substream precisely
                 }
-                // A real extension sync we couldn't size (truncated header /
-                // unsupported sub-form) — heuristic fallback, but the region IS a
-                // recognized extension, so keep it (ext_clean = true). This path
-                // is load-bearing for valid streams.
+                // A real extension sync we couldn't size (truncated/unsupported):
+                // heuristic fallback, but the region IS recognized, so keep it.
                 _ => return scan_for_next_core(buf, pos, true),
             }
         } else if buf[pos..].starts_with(&DTS_CORE_SYNC) {
@@ -578,10 +511,9 @@ fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
             }
             return scan_for_next_core(buf, pos, true); // implausible core — recognized sync, keep
         } else {
-            // GARBAGE at the extension boundary — neither a core sync nor a
-            // DTS-HD extension sync. This is damaged source encoding: the
-            // extension region is corrupt. Mark ext_clean = false so the caller
-            // emits the clean core alone and drops the garbage.
+            // GARBAGE at the extension boundary — neither a core nor extension
+            // sync, so the extension region is corrupt: mark ext_clean = false so
+            // the caller emits the clean core alone and drops the garbage.
             return scan_for_next_core(buf, pos, false);
         }
     }
@@ -752,14 +684,9 @@ impl DropReason {
 fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
     let mut r = BitReader::new(au.get(SYNCWORD_BYTES..)?);
 
-    // FTYPE: 1 = NORMAL frame, 0 = TERMINATION frame (the last frame of the
-    // stream). Per ETSI TS 102 114: a normal frame must carry a full 32-sample
-    // PCM block, so a DEFICIT_SAMPLE_COUNT other than the full block marks a
-    // terminating/short frame (the spec's deficit semantics, which
-    // on `normal_frame`) — the deficit-sample field must equal 32 ONLY for a
-    // normal frame. A termination frame legitimately carries fewer samples and
-    // is fully decodable; dropping it would silence the last frame of every
-    // stream that ends on one (a guaranteed per-track loss on real discs).
+    // FTYPE: 1 = NORMAL frame, 0 = TERMINATION frame. Per ETSI TS 102 114 the
+    // deficit-sample field must equal 32 ONLY for a normal frame; gating a
+    // termination frame on it would silence the last frame of every stream.
     let normal_frame = r.read_bit()? == 1;
     let deficit_samples = r.read_bits(5)? + 1;
     if normal_frame && deficit_samples != DTS_PCMBLOCK_SAMPLES {
@@ -783,11 +710,9 @@ fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
         return Some(DropReason::SampleRate);
     }
     let _br_code = r.read_bits(5)?;
-    // Reserved bit. Both reference decoders SKIP this field rather than reject
-    // on it — the field is reserved in ETSI TS 102 114 and skipped ("Reserved
-    // field"). A frame that sets it is still fully decodable, so rejecting it
-    // was a false-drop that silenced any real stream whose encoder set the bit.
-    // Read past it without gating (never reject a decodable frame).
+    // Reserved bit (ETSI TS 102 114): both reference decoders SKIP it rather
+    // than reject on it, so read past without gating — a frame setting it is
+    // still fully decodable.
     let _reserved = r.read_bit()?;
     // drc, ts, aux, hdcd (1 each) → ext_audio_type (3) → ext_present, aspf (1 each).
     r.skip_bits(4)?;
@@ -833,11 +758,9 @@ mod tests {
         let fsize = size - 1;
         let mut data = vec![0u8; size];
         data[0..4].copy_from_slice(&DTS_CORE_SYNC);
-        // byte4: FTYPE(1) SHORT(5) CPF(0) NBLKS-high(0). FTYPE = 1 = a NORMAL
-        // frame (the common real-stream case); SHORT = 31 makes deficit_samples
-        // = 32 = DTS_PCMBLOCK_SAMPLES, which the decodability gate (per ETSI TS
-        // 102 114) requires of a normal frame. NBLKS high bit (byte4 bit0) stays
-        // 0 for NBLKS = 15. (0x80 | (31 << 2) = 0xFC.)
+        // byte4: FTYPE(1) SHORT(5) CPF(0) NBLKS-high(0). FTYPE=1 (NORMAL frame);
+        // SHORT=31 makes deficit_samples=32=DTS_PCMBLOCK_SAMPLES, required by the
+        // decodability gate for a normal frame. (0x80 | (31 << 2) = 0xFC.)
         data[4] = 0x80 | (31u8 << 2);
         // NBLKS = 15 → (15+1)*32 = 512 samples/frame (the DVD/UHD DTS-core norm).
         // NBLKS is byte4 bit0 + byte5 bits7-2; here byte4 bit0 = 0, byte5 = 15<<2.
@@ -935,11 +858,9 @@ mod tests {
         // EXSS size parse round-trips.
         assert_eq!(exss_frame_size(&make_exss(600, None)), Some(600));
 
-        // AU = core(512) + a REAL EXSS substream whose XLL payload embeds a DTS
-        // core syncword decoding to a plausible size (512). The heuristic-only
-        // framer would split here and truncate the lossless extension (the
-        // real-disc "Failed to decode block code(s)" decoder-failure class).
-        // Precise EXSS sizing spans the whole extension to the REAL next core.
+        // AU = core(512) + a REAL EXSS substream whose XLL payload embeds a false
+        // DTS core syncword (plausible size 512). Precise EXSS sizing must span
+        // the whole extension to the REAL next core, or the extension gets split.
         let core = make_dts_core(512);
         let exss = make_exss(600, Some(40));
         let next = make_dts_core(512);
@@ -958,10 +879,9 @@ mod tests {
 
     #[test]
     fn garbage_extension_emits_core_only_but_valid_ext_is_kept() {
-        // Damaged source: a valid core, then GARBAGE (no core sync, no extension
-        // sync) where the extension belongs, then the next core. The framer must
-        // mark this boundary ext_clean=false and the parser must emit the clean
-        // 512-byte CORE alone (dropping the garbage), draining to the next core.
+        // Damaged source: valid core, then GARBAGE (no core/extension sync) where
+        // the extension belongs, then the next core. Must mark ext_clean=false and
+        // emit the clean 512-byte CORE alone, draining past the garbage.
         let core = make_dts_core(512);
         let garbage = vec![0xE4, 0x3F, 0xE3, 0x90, 0xCC, 0x6C]; // real head bytes from a damaged stream
         let mut garbage = garbage;
@@ -1043,12 +963,9 @@ mod tests {
 
     #[test]
     fn discontinuity_drops_truncated_partial() {
-        // B1: a partial DTS core is buffered, then a concealed gap (PES marked
-        // discontinuity) carries a fresh core. The truncated partial must be
-        // DROPPED — splicing it makes the framer emit a corrupt sub-core-length
-        // AU (the real-disc "Failed to decode block code(s)" decoder-failure
-        // class) and strands the rest. With the fix the post-gap core is the
-        // only AU, and it carries the post-gap PTS (not the stale pre-gap one).
+        // B1: a partial core is buffered, then a discontinuity-marked PES carries
+        // a fresh one. The partial must be DROPPED, not spliced; the post-gap
+        // core is the only AU emitted, with the post-gap PTS.
         let mut parser = DtsParser::new();
 
         // PES 1: first half of a 512-byte core (no boundary marker).
@@ -1086,10 +1003,9 @@ mod tests {
 
     #[test]
     fn two_cores_back_to_back_advance_within_one_pes() {
-        // Both cores arrive in ONE PES — the DVD layout. AU1 keeps the PES PTS;
-        // AU2 must ADVANCE by one frame duration to stay monotonic. Reusing the
-        // single PES PTS for both was the "non monotonically increasing dts to
-        // muxer" bug (fixed for 1.2.1).
+        // Both cores arrive in ONE PES (DVD layout). AU1 keeps the PES PTS; AU2
+        // must ADVANCE by one frame duration to stay monotonic — reusing the same
+        // PES PTS for both was the "non monotonically increasing dts" bug (1.2.1).
         let mut parser = DtsParser::new();
         let mut stream = make_dts_core(512);
         stream.extend_from_slice(&make_dts_core(640));
@@ -1114,12 +1030,9 @@ mod tests {
 
     #[test]
     fn two_aus_flushed_in_one_call_keep_their_own_pts() {
-        // The real-stream trigger: core1 in PES A (pts 100), then core2 + core3
-        // arrive in a LATER PES B (pts 200). Processing PES B closes both AU1
-        // (core1) and AU2 (core2) in a single parse() call. AU2's core arrived
-        // in PES A region? No — here AU2 (core2) is in PES B, so it should be
-        // 200. The defect to guard is AU1 NOT being overwritten to 200, and AU2
-        // not inheriting an unrelated timestamp.
+        // core1 in PES A (pts 100), then core2 + core3 in a LATER PES B (pts 200).
+        // Processing PES B closes both AU1 (core1) and AU2 (core2, in PES B, so
+        // 200) in one parse() call. Guard: AU1 must NOT be overwritten to 200.
         let mut parser = DtsParser::new();
 
         // PES A: just core1 (held — no following core yet).
@@ -1154,10 +1067,9 @@ mod tests {
 
     #[test]
     fn second_au_with_core_in_earlier_pes_keeps_that_pts() {
-        // core1 + core2 both arrive in PES A (pts 100); core3 arrives in PES B
-        // (pts 200). When PES B closes AU2 (core2, whose core was in PES A), AU2
-        // must keep PES A's 100 — the bug was AU2 inheriting the closing PES's
-        // 200.
+        // core1+core2 arrive in PES A (pts 100); core3 in PES B (pts 200). When PES
+        // B closes AU2 (core2, whose core was in PES A), AU2 must keep PES A's
+        // 100 — the bug was AU2 inheriting the closing PES's 200.
         let mut parser = DtsParser::new();
 
         // PES A: core1 + core2. AU1 (core1) emits immediately (core2 boundary);
@@ -1168,10 +1080,9 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].pts_ns, pts_to_ns(90000), "AU1 PES A PTS");
 
-        // PES B (realistically later): core3 — closes AU2 (core2). AU2's core
-        // was in PES A, so it is PES A's 2nd frame: it advances one frame
-        // duration from AU1 (still on PES A's timeline, and monotonic) — it does
-        // NOT inherit the closing PES B PTS.
+        // PES B: core3 closes AU2 (core2). AU2's core was in PES A, so it's PES
+        // A's 2nd frame — advances one duration from AU1, and does NOT inherit
+        // the closing PES B PTS.
         let f2 = parser.parse(&make_pes(make_dts_core(640), Some(190000)));
         assert_eq!(f2.len(), 1);
         assert_eq!(f2[0].data.len(), 600, "AU2 = core2");
@@ -1193,10 +1104,9 @@ mod tests {
 
     #[test]
     fn dvd_many_cores_one_pes_are_strictly_monotonic() {
-        // Punisher-DVD reproduction: a single PES carrying SEVERAL DTS core
-        // frames (the DVD packing) must emit STRICTLY-increasing PTSs. The old
-        // code stamped every AU with the one PES PTS, which a muxer rejects as
-        // "non monotonically increasing dts to muxer: X >= X".
+        // Punisher-DVD repro: a PES with SEVERAL DTS cores must emit STRICTLY
+        // increasing PTSs; the old code stamped every AU with the one PES PTS,
+        // rejected by muxers as "non monotonically increasing dts: X >= X".
         let mut parser = DtsParser::new();
         let mut stream = Vec::new();
         for _ in 0..6 {
@@ -1242,11 +1152,9 @@ mod tests {
 
     #[test]
     fn dts_core_sfreq_table_matches_the_dca_spec() {
-        // Lock the SFREQ → sample-rate table to the authoritative values in
-        // ETSI TS 102 114 Table 6-4. The high-rate triad in particular —
-        // 48 k / 96 k / 192 k at indices 13/14/15 — must not
-        // be shifted; a wrong entry would compute an N× frame duration and
-        // reintroduce PTS drift on a 96/192 kHz DTS stream.
+        // Lock the SFREQ → sample-rate table to ETSI TS 102 114 Table 6-4. The
+        // high-rate triad (48/96/192k at indices 13/14/15) must not shift; a wrong
+        // entry computes an N× frame duration, reintroducing PTS drift.
         let mut core = make_dts_core(512);
         let set_sfreq = |c: &mut [u8], idx: u8| c[8] = (c[8] & !0x3C) | ((idx & 0x0F) << 2);
         for (idx, want) in [
@@ -1273,19 +1181,9 @@ mod tests {
 
     #[test]
     fn new_pes_rebases_to_its_own_pts_no_drift() {
-        // Regression for the drift bug: a global running clock overshot a
-        // feature-long DTS track by minutes (2h44 for a 2h03 film). When a NEW
-        // PES arrives whose PTS is BEHIND where accumulated frame durations
-        // would put a running clock, the AU must re-base to that PES's OWN
-        // timestamp — tracking the container, not drifting ahead of it.
-        //
-        // The re-base can make one emitted PTS sit just below the previous AU's
-        // (a fresh PES whose PTS lands under the within-PES cursor). That is
-        // CORRECT here and is NOT a muxer defect: the parser reports the true
-        // container timestamps, and the mkv muxer applies the strictly-monotonic
-        // per-track nudge to AUDIO at emit time (`mkv::block_ts` / `monotonic_ts`,
-        // tested in `mkv.rs`), so the written block DTS is always monotonic. The
-        // alternative — clamping in the parser — is what reintroduced the drift.
+        // Drift-bug regression: a global running clock overshot a track by minutes.
+        // A NEW PES BEHIND the running clock must re-base to its OWN timestamp;
+        // the mkv muxer nudges AUDIO monotonic at emit — clamping here caused it.
         let mut parser = DtsParser::new();
         // PES A: core1 + core2 (2 frames), pts 90000.
         let mut pes_a = make_dts_core(512);
@@ -1329,12 +1227,9 @@ mod tests {
 
     #[test]
     fn keeps_dts_hd_extension_in_separate_pes_packets() {
-        // The real Blu-ray layout (ground-truthed on real UHD discs): the DTS core
-        // arrives in one PES, then its DTS-HD MA extension substreams arrive
-        // in SEPARATE following PES packets on the same PID. The parser must
-        // stitch core + all trailing extensions into one access unit — not
-        // emit a core-only (lossy) frame and drop the extension PES packets
-        // (the lossy-core downgrade bug).
+        // Real Blu-ray layout: the DTS core arrives in one PES, then its DTS-HD MA
+        // extensions arrive in SEPARATE following PES packets. Must stitch core +
+        // all trailing extensions into one AU, not emit lossy core-only frames.
         let mut parser = DtsParser::new();
 
         // Frame 1: core (512) + two extension substreams (256 + 200).
@@ -1415,11 +1310,9 @@ mod tests {
 
     #[test]
     fn bogus_tiny_core_sync_does_not_split_or_drop_real_au() {
-        // A real core frame followed by an extension substream that happens to
-        // contain a false core sync whose fsize decodes tiny. The bogus sync
-        // must NOT close the real access unit early (dropping the rest of the
-        // extension) nor emit a junk few-byte frame — it must be skipped, and
-        // the whole core + extension preserved as one access unit.
+        // A real core followed by an extension containing a false core sync whose
+        // fsize decodes tiny. The bogus sync must NOT close the AU early or emit
+        // a junk frame — skip it and preserve core + extension as one AU.
         let mut parser = DtsParser::new();
 
         // Frame 1: core(512) + an extension whose body embeds a bogus tiny
@@ -1456,10 +1349,8 @@ mod tests {
     #[test]
     fn sub_spec_core_size_is_rejected_as_false_sync() {
         // A core sync whose decoded fsize+1 lands in [CORE_HEADER_MIN_BYTES,
-        // MIN_CORE_FRAME_BYTES) — i.e. a "frame" smaller than the 96-byte ETSI
-        // spec minimum — is a false sync inside extension payload and must NOT
-        // close an access unit. Pick a decoded size of 64 (well inside the old
-        // 10..96 false-positive window the raised floor now rejects).
+        // MIN_CORE_FRAME_BYTES) — smaller than the 96-byte ETSI spec minimum — is
+        // a false sync and must NOT close an AU. 64 sits in the raised reject window.
         let false_size = 64usize;
         assert!(
             (CORE_HEADER_MIN_BYTES..MIN_CORE_FRAME_BYTES).contains(&false_size),
@@ -1492,10 +1383,9 @@ mod tests {
 
     #[test]
     fn forced_emit_does_not_corrupt_next_au_pts() {
-        // When the buffer exceeds MAX_AU_BYTES with no next core sync, the
-        // parser force-emits for forward progress. The current PES at that
-        // point is an extension-substream PES (later PTS). The forced path must
-        // NOT make that extension PTS the base of the NEXT access unit.
+        // When the buffer exceeds MAX_AU_BYTES with no next core sync, the parser
+        // force-emits for forward progress; the current PES is an extension PES
+        // (later PTS). The forced path must NOT base the NEXT AU on that PTS.
         let mut parser = DtsParser::new();
 
         // Core PES at the real PTS, then a giant extension (no next core) that
@@ -1537,13 +1427,9 @@ mod tests {
 
     #[test]
     fn needmore_past_cap_force_flushes_to_bound_buffer() {
-        // A crafted DTS-HD stream whose extension substream declares a size
-        // larger than what is (ever) buffered keeps `next_core_boundary` in a
-        // sustained NeedMore state (a candidate boundary that is never fully
-        // buffered). Once `buf` exceeds MAX_AU_BYTES the NeedMore force-flush
-        // safety valve must fire — mirroring the None arm — so the buffer can't
-        // grow without bound. WITHOUT the guard the parser would `break` and
-        // retain everything, emitting nothing.
+        // A crafted stream whose extension declares a size larger than ever
+        // buffered keeps `next_core_boundary` in sustained NeedMore; past
+        // MAX_AU_BYTES the force-flush valve must fire, or `buf` grows forever.
         let mut parser = DtsParser::new();
 
         let core = make_dts_core(512);
@@ -1590,10 +1476,9 @@ mod tests {
 
     #[test]
     fn core_frame_size_bit_layout() {
-        // fsize is 14 bits at bits 46-59: byte5[1:0] (high 2), byte6 (mid 8),
-        // byte7[7:4] (low 4). Returned value is fsize + 1 (on-wire length-1).
-        // Set fsize = 0x1FFF (= 8191): byte5 low2 = 0b01, byte6 = 0xFF,
-        // byte7 high4 = 0xF (0xF0). (1<<12)|(0xFF<<4)|0xF = 0x1FFF → size 8192.
+        // fsize is 14 bits at bits 46-59: byte5[1:0] (high2), byte6 (mid8),
+        // byte7[7:4] (low4); returned value is fsize + 1 (on-wire length-1).
+        // (1<<12)|(0xFF<<4)|0xF = 0x1FFF → size 8192.
         let mut d = vec![0u8; CORE_HEADER_MIN_BYTES];
         d[5] = 0x01;
         d[6] = 0xFF;
@@ -1638,10 +1523,8 @@ mod tests {
     #[test]
     fn dts_core_samples_reads_nblks_high_bit_from_byte4_bit0() {
         // NBLKS is 7 bits: byte4 bit0 is the HIGH bit (<<6), byte5>>2 the low 6.
-        // With byte4 bit0 set and byte5 = 0, nblks = 64 (not 0), so a `<<` -> `>>`
-        // typo on the byte4 contribution (which always yields 0, since a 1-bit
-        // value has nothing to shift right into) collapses samples from 2080
-        // down to 32.
+        // With byte4 bit0 set and byte5 = 0, nblks = 64 (not 0); a `<<` -> `>>`
+        // typo on byte4 (always 0) would collapse samples from 2080 to 32.
         let mut d = vec![0u8; CORE_HEADER_MIN_BYTES];
         d[4] = 0x01;
         d[5] = 0x00;
@@ -1650,13 +1533,9 @@ mod tests {
 
     #[test]
     fn dts_core_samples_and_sample_rate_decode_at_exact_header_min_length() {
-        // The length guard is `data.len() < CORE_HEADER_MIN_BYTES`; exactly
-        // CORE_HEADER_MIN_BYTES (10) bytes must still be read as a real header
-        // (index 8, SFREQ, is in bounds), not treated as truncated. Use NBLKS
-        // and SFREQ values that differ from the truncated-header fallbacks
-        // (512 samples, 48 kHz) so a `<` -> `<=` typo that takes the fallback
-        // path one byte early is visible in the output, not masked by a
-        // coincidental match.
+        // The guard is `data.len() < CORE_HEADER_MIN_BYTES`; exactly 10 bytes must
+        // still read as a real header (index 8, SFREQ, is in bounds). Use non-
+        // fallback NBLKS/SFREQ so a `<` -> `<=` typo is visible, not masked.
         let mut d = vec![0u8; CORE_HEADER_MIN_BYTES];
         d[4] = 0x00;
         d[5] = 0x00; // nblks = 0 -> 32 samples, not the 512 fallback
@@ -1668,11 +1547,9 @@ mod tests {
 
     #[test]
     fn dts_core_samples_and_sample_rate_decode_past_header_min_length_too() {
-        // A `<` -> `>` typo on the same guard takes the FALLBACK path once
-        // `data.len()` exceeds CORE_HEADER_MIN_BYTES instead of never — i.e.
-        // every real, normally-sized core frame (always well past 10 bytes)
-        // would silently report the 512-sample/48kHz fallback. Use a buffer
-        // twice the minimum with non-fallback NBLKS/SFREQ values.
+        // A `<` -> `>` typo on the same guard takes the FALLBACK path once len
+        // exceeds CORE_HEADER_MIN_BYTES — every real core frame would silently
+        // report the 512-sample/48kHz fallback. Use a buffer twice the minimum.
         let mut d = vec![0u8; CORE_HEADER_MIN_BYTES * 2];
         d[4] = 0x00;
         d[5] = 0x00; // nblks = 0 -> 32 samples
@@ -1732,10 +1609,8 @@ mod tests {
     #[test]
     fn next_core_needs_more_when_candidate_header_truncated() {
         // A second core sync appears but fewer than CORE_HEADER_MIN_BYTES follow
-        // it, so its size can't be judged → the access unit can't be closed yet
-        // (NeedMore → parse() breaks and waits). Build core(512) + a bare 2nd
-        // sync with only the 4 syncword bytes buffered (< CORE_HEADER_MIN_BYTES
-        // after it), so the candidate can't be validated.
+        // it, so its size can't be judged (NeedMore → parse() breaks and waits).
+        // Build core(512) + a bare 2nd sync with only the 4 syncword bytes.
         let mut parser = DtsParser::new();
         let mut data = make_dts_core(512);
         data.extend_from_slice(&DTS_CORE_SYNC); // 2nd sync, header truncated
@@ -1754,9 +1629,8 @@ mod tests {
 
     #[test]
     fn multiple_false_syncs_in_extension_all_skipped() {
-        // An extension body containing SEVERAL byte sequences that match the core
-        // syncword but decode to sub-spec sizes must ALL be skipped; the AU is
-        // closed only at the next real core. Guards the loop in
+        // An extension body with SEVERAL byte sequences matching the core syncword
+        // but decoding to sub-spec sizes must ALL be skipped; guards the loop in
         // next_core_boundary that advances `from = pos + 4` past each false sync.
         let mut parser = DtsParser::new();
         let mut ext = make_dts_ext(400);
@@ -1981,10 +1855,8 @@ mod tests {
     #[test]
     fn drop_preserves_av_sync_no_shift() {
         // THE INVARIANT: dropping an undecodable AU must never shift the audio
-        // that follows. A good/bad/good run in ONE PES — the bad middle core is
-        // dropped, but the trailing good core must keep the EXACT PTS it would
-        // have had with no drop (base + 2 frame durations), so the drop is a
-        // silence gap, not a shift.
+        // that follows. good/bad/good in ONE PES: the trailing good core keeps
+        // the EXACT PTS it would have had with no drop — a gap, not a shift.
         let mut parser = DtsParser::new();
         let mut stream = make_dts_core(512); // c1: good
         stream.extend_from_slice(&make_bad_dts_core(512)); // c2: undecodable
@@ -2047,10 +1919,8 @@ mod tests {
     }
 
     #[test]
-    // The loop variable is the DOMAIN VALUE being checked (a DTS SFREQ code), not a
-    // cursor into a collection: it is what the assertion message names and
-    // what the table is keyed by. `.iter().enumerate()` would rename the
-    // thing under test to `i` and read worse.
+    // The loop variable is the DOMAIN VALUE checked (a DTS SFREQ code), not a
+    // collection cursor: `.iter().enumerate()` would rename it to `i` and read worse.
     #[allow(clippy::needless_range_loop)]
     fn sr_validity_table_marks_reserved_codes() {
         // The core-header sample-rate validity table must have ZERO (reject) at
@@ -2087,11 +1957,9 @@ mod tests {
         d[5] = (d[5] & 0x03) | (14u8 << 2);
         assert_eq!(core_header_drop_reason(&d), Some(DropReason::PcmBlocks));
 
-        // audio_mode reserved (>= 16): AMODE = byte7 bits3-0 (high 4) + byte8
-        // bits7-6. Set AMODE high nibble to 0xF → audio_mode = 60, a genuinely
-        // RESERVED code (16-63) a decoder rejects. (Codes 10-15 are LEGAL
-        // multichannel layouts and must NOT be dropped — see
-        // legal_multichannel_amode_is_not_dropped.)
+        // audio_mode reserved (>= 16): AMODE = byte7 bits3-0 + byte8 bits7-6. Set
+        // high nibble to 0xF → audio_mode = 60, a genuinely RESERVED code a
+        // decoder rejects (10-15 are LEGAL, see legal_multichannel_amode_is_not_dropped).
         let mut d = good.clone();
         d[7] |= 0x0F;
         assert_eq!(core_header_drop_reason(&d), Some(DropReason::Amode));
@@ -2116,12 +1984,9 @@ mod tests {
 
     #[test]
     fn legal_multichannel_amode_is_not_dropped() {
-        // ETSI TS 102 114 §5.3.1: AMODE is a 6-bit field with 16 LEGAL
-        // channel-arrangement codes (0-15); only 16-63 are reserved. ETSI TS 102
-        // 114 §5.3.1's per-AMODE channel counts cover all 16, confirming codes
-        // 10-15 are decodable 6/7/8-channel layouts. The decodability gate must
-        // KEEP them — dropping a spec-legal multichannel core silences audio the
-        // recover-100% goal must preserve.
+        // ETSI TS 102 114 §5.3.1: AMODE is 6 bits with 16 LEGAL codes (0-15), only
+        // 16-63 reserved; codes 10-15 are decodable 6/7/8-channel layouts. The
+        // gate must KEEP them — dropping a legal multichannel core silences audio.
         fn set_amode(core: &mut [u8], amode: u32) {
             // audio_mode = (byte7 & 0x0F) << 2 | (byte8 >> 6).
             core[7] = (core[7] & 0xF0) | ((amode >> 2) & 0x0F) as u8;
@@ -2160,10 +2025,9 @@ mod tests {
 
     #[test]
     fn termination_frame_with_small_deficit_is_kept() {
-        // ETSI TS 102 114 (a normal frame carries a full 32-sample PCM block):
-        // a TERMINATION frame (FTYPE=0) may legally carry fewer than 32 deficit
-        // samples and is fully decodable. It must NOT be dropped — dropping the
-        // last frame of a stream silences real audio (recover-100% violation).
+        // ETSI TS 102 114: a normal frame carries a full 32-sample PCM block, but
+        // a TERMINATION frame (FTYPE=0) may legally carry fewer and is decodable.
+        // It must NOT be dropped — that would silence the last frame of a stream.
         let mut core = make_dts_core(512);
         set_ftype_short(&mut core, false, 10); // termination, deficit = 11 (< 32)
         assert_eq!(
@@ -2200,11 +2064,9 @@ mod tests {
 
     #[test]
     fn reserved_bit_set_is_not_dropped() {
-        // The bit after RATE is a RESERVED field that both reference decoders
-        // SKIP (a reserved field per ETSI TS 102 114) — they
-        // never reject a frame that sets it. Rejecting was a false-drop that
-        // silenced any real stream whose encoder set the bit. Setting it (byte9
-        // bit4) on an otherwise-valid core must leave it KEPT.
+        // The bit after RATE is RESERVED (ETSI TS 102 114); both reference
+        // decoders SKIP it and never reject on it. Setting it (byte9 bit4) on an
+        // otherwise-valid core must leave it KEPT.
         let mut core = make_dts_core(512);
         assert_eq!(core_header_drop_reason(&core), None, "baseline decodable");
         core[9] |= 0x10; // set the reserved bit

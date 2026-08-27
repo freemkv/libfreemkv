@@ -106,10 +106,9 @@ impl PesFrame {
     /// error (`UnexpectedEof`), not silently treated as EOF — otherwise
     /// truncated `.pes` data would be accepted as a graceful end.
     pub fn deserialize(r: &mut dyn std::io::Read) -> std::io::Result<Option<Self>> {
-        // Probe one byte first to distinguish clean EOF from a truncated
-        // header. Loop on EINTR so back-to-back signals don't fail a
-        // recoverable read — symmetric with read_exact's internal retry
-        // on the rest of the header and the data below.
+        // Probe one byte first to distinguish clean EOF from a truncated header.
+        // Loop on EINTR so a recoverable interrupted read doesn't fail — symmetric
+        // with read_exact's internal retry for the rest of the header and data.
         let mut first = [0u8; 1];
         loop {
             match r.read(&mut first) {

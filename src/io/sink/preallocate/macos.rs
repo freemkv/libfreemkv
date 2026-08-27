@@ -18,11 +18,9 @@ pub(super) fn preallocate_impl(file: &File, size_bytes: u64) {
     // would wrap a >= 2^63 size to a negative length.
     let len = i64::try_from(size_bytes).unwrap_or(i64::MAX) as libc::off_t;
     let mut store = Fstore {
-        // Prefer a contiguous run but accept scattered extents to
-        // satisfy the full length. Without F_ALLOCATEALL the first
-        // attempt is best-effort and can return rc=0 with a partial
-        // allocation, so the fallback below would never fire. Matches
-        // writeback_file/macos.rs.
+        // Prefer contiguous but accept scattered extents. Without F_ALLOCATEALL
+        // the first attempt is best-effort and can return rc=0 with a partial
+        // allocation, so the fallback below would never fire. Matches writeback_file/macos.rs.
         fst_flags: F_ALLOCATECONTIG | F_ALLOCATEALL,
         fst_posmode: F_PEOFPOSMODE,
         fst_offset: 0,

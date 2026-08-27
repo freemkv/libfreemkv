@@ -123,7 +123,7 @@ impl PrefetchedSectorSource {
         Self::new_with_events(reader, extents, batch_sectors, SECTOR_ALIGNMENT, halt, None)
     }
 
-    /// Same as [`new`] but with a callback fired from the producer
+    /// Same as [`Self::new`] but with a callback fired from the producer
     /// thread after each successful batch — used by autorip's mux
     /// path to surface `BytesRead` progress to the UI without the
     /// consumer thread having to poll.
@@ -138,32 +138,25 @@ impl PrefetchedSectorSource {
     where
         S: SectorSource + Send + 'static,
     {
-        // A zero batch would make the producer loop forever emitting
-        // empty batches (sectors = remaining.min(0) = 0, offset never
-        // advances). All production callers pass a nonzero constant; a
-        // public-API caller passing 0 is a programming error, so reject
-        // it rather than spin a thread that never makes progress.
+        // A zero batch loops forever (sectors = remaining.min(0) = 0, offset
+        // never advances). All production callers pass nonzero; a 0 here is
+        // a caller bug, so reject rather than spin a thread with no progress.
         if batch_sectors == 0 {
             return Err(crate::error::Error::IoError {
                 source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
             });
         }
-        // A zero alignment is the sibling programming error, and it is worse: the
-        // producer thread reaches `remaining % unit_align` and panics with a
-        // divide-by-zero, which `catch_unwind` then reports as
-        // `DemuxThreadPanicked` — a panic printed through the process hook and a
-        // misleading error, out of a public constructor that returned `Ok`. Reject
-        // it here, exactly as `batch_sectors == 0` is rejected.
+        // A zero alignment is worse: the producer hits `remaining % unit_align`
+        // and panics divide-by-zero, surfacing as a misleading DemuxThreadPanicked
+        // from a constructor that returned `Ok`. Reject it here too.
         if unit_align == 0 {
             return Err(crate::error::Error::IoError {
                 source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
             });
         }
-        // Accumulate in u64 then clamp: extents can derive from
-        // untrusted nav/MPLS/UDF data, so a naive u32 `sum()` could
-        // panic in debug / wrap in release on a hostile total. The
-        // clamp only affects the advisory `capacity_sectors` figure;
-        // the producer walks each extent independently below.
+        // Accumulate in u64 then clamp: extents come from untrusted nav/MPLS/UDF
+        // data, so a naive u32 sum could panic/wrap. Only affects the advisory
+        // capacity_sectors figure; the producer walks each extent independently.
         let total_sectors: u32 = extents
             .iter()
             .map(|e| e.sector_count as u64)
@@ -174,10 +167,8 @@ impl PrefetchedSectorSource {
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 1);
         let batch_bytes = batch_sectors as usize * 2048;
 
-        // Seed the recycle pool so the producer always has a buffer
-        // to fill on the first iteration. Without these, the first
-        // `recycle_rx.recv()` would block forever (no consumer has
-        // returned a buffer yet).
+        // Seed the recycle pool so the producer has a buffer on the first
+        // iteration; otherwise the first recycle_rx.recv() blocks forever.
         for _ in 0..(PREFETCH_CHANNEL_DEPTH + 1) {
             let _ = recycle_tx.send(vec![0u8; batch_bytes]);
         }
@@ -185,18 +176,9 @@ impl PrefetchedSectorSource {
         let producer = std::thread::Builder::new()
             .name("freemkv-prefetch".into())
             .spawn(move || {
-                // Wrap the whole feed loop in catch_unwind so a panic inside a
-                // decrypt-on-read SectorSource, the read path, or a panicking
-                // `event_fn` callback is NOT indistinguishable from a clean
-                // finish at the demux boundary. On a clean exit (input
-                // exhausted, halt cancelled, consumer disconnect) the body
-                // returns and `tx` is dropped → the demux loop reads RecvError
-                // as EOF, which is correct. On a PANIC we send an explicit error
-                // sentinel FIRST so the demux loop's `Ok(Err(_))` arm fires and
-                // propagates a typed error instead of converting the dropped
-                // channel into a clean `DemuxBatch::Eof` (which would finalize a
-                // TRUNCATED mux while reporting success). `tx`/`reader`/locals
-                // are only touched on this thread, so AssertUnwindSafe is sound.
+                // catch_unwind so a panic (decrypt source, read path, event_fn) isn't
+                // mistaken for clean EOF: a dropped `tx` alone would finalize a
+                // TRUNCATED mux as success. Locals are thread-local, so this is sound.
                 let body = std::panic::AssertUnwindSafe(|| {
                     let mut ext_idx = 0usize;
                     let mut offset: u32 = 0;
@@ -206,10 +188,9 @@ impl PrefetchedSectorSource {
                             return;
                         }
                         let extent = &extents[ext_idx];
-                        // AACS aligned units are anchored at THIS extent's start
-                        // LBA, so tell the decrypt-on-read source to gate relative
-                        // to it (clip-anchored), not absolute disc LBA 0. A no-op
-                        // for non-decrypting / CSS / None sources.
+                        // AACS aligned units anchor at THIS extent's start LBA, so gate
+                        // relative to it, not absolute disc LBA 0. No-op for
+                        // non-decrypting / CSS / None sources.
                         reader.set_unit_base(extent.start_lba);
                         let remaining = extent.sector_count.saturating_sub(offset);
                         if remaining == 0 {
@@ -217,22 +198,9 @@ impl PrefetchedSectorSource {
                             offset = 0;
                             continue;
                         }
-                        // The AACS aligned unit is SECTOR_ALIGNMENT (3)
-                        // sectors / 6144 bytes; the decrypt step only
-                        // processes full units and silently leaves a
-                        // shorter trailing chunk encrypted. So a batch must
-                        // be a whole number of units — except for the final
-                        // batch of an extent whose `sector_count` is itself
-                        // unit-aligned (then the remaining tail is exactly
-                        // 0 mod 3 and forms full units on its own).
-                        //
-                        // If the trailing sectors of this extent cannot fill
-                        // a complete unit (`remaining < SECTOR_ALIGNMENT`
-                        // with nothing more to read, or a 1-2 sector
-                        // leftover after the last full unit), there is no
-                        // way to hand the decrypt step an aligned chunk —
-                        // surface a typed error instead of emitting
-                        // still-encrypted bytes.
+                        // AACS units are SECTOR_ALIGNMENT (3) sectors; decrypt only
+                        // processes full units, leaving a short tail encrypted. If the
+                        // tail can't fill a unit, error instead of emitting encrypted bytes.
                         if !remaining.is_multiple_of(unit_align as u32)
                             && remaining < unit_align as u32
                         {
@@ -240,23 +208,18 @@ impl PrefetchedSectorSource {
                             return;
                         }
                         let mut sectors = remaining.min(batch_sectors as u32) as u16;
-                        // Trim to a whole number of units. Once trimmed to 0
-                        // here it means `remaining >= SECTOR_ALIGNMENT` but
-                        // the *batch window* landed on a sub-unit boundary —
-                        // never the trailing-tail case, which the guard
-                        // above already rejected. Clamp to one unit so we
-                        // always make forward progress.
+                        // Trim to a whole number of units. A trim to 0 here means the
+                        // batch window landed on a sub-unit boundary (not the
+                        // trailing-tail case, rejected above); clamp to one unit.
                         if sectors >= unit_align {
                             sectors -= sectors % unit_align;
                         } else {
                             sectors = unit_align;
                         }
                         let bytes = sectors as usize * 2048;
-                        // Park on the recycle channel, but re-poll halt every
-                        // POLL_INTERVAL: a pure-AtomicBool Halt does not
-                        // disconnect the channel, so a blocking recv() would
-                        // never re-reach the cancel check at the loop top.
-                        // Mirrors the BytePrefetcher pattern exactly.
+                        // Re-poll halt every POLL_INTERVAL: a pure-AtomicBool Halt
+                        // doesn't disconnect the channel, so a blocking recv() would
+                        // never re-reach the cancel check. Mirrors BytePrefetcher.
                         let mut buf = loop {
                             match recycle_rx.recv_timeout(POLL_INTERVAL) {
                                 Ok(b) => break b,
@@ -270,15 +233,9 @@ impl PrefetchedSectorSource {
                             }
                         };
                         if bytes <= buf.capacity() {
-                            // Re-expose `bytes` without zero-filling pages that
-                            // `read_sectors` is about to overwrite. Sound because the
-                            // enclosing `bytes <= capacity` guard bounds the length,
-                            // and every byte below `capacity` is physically
-                            // initialised: buffers are born `vec![0u8; batch_bytes]`
-                            // and only ever grown via `resize(_, 0)`, so a recycled
-                            // buffer that came back shorter (consumer `truncate`)
-                            // still has initialised backing storage under `set_len`,
-                            // which `read_sectors` then overwrites before any read.
+                            // Re-expose `bytes` without zero-filling; sound because
+                            // buffers are born `vec![0u8; batch_bytes]` and only grown
+                            // via `resize(_, 0)`, so bytes below `capacity` are init'd.
                             unsafe { buf.set_len(bytes) };
                         } else {
                             buf.resize(bytes, 0);
@@ -289,16 +246,9 @@ impl PrefetchedSectorSource {
                         let lba = extent.start_lba.saturating_add(offset);
                         match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {
                             Ok(n) => {
-                                // A short read must not silently desync the
-                                // stream: advance the extent cursor by the
-                                // sectors actually read, not the requested
-                                // count, and reject a byte count that isn't a
-                                // whole number of sectors (it would split a
-                                // sector and leave the decrypt step a partial
-                                // unit). The sole production inner source
-                                // (FileSectorSource) read_exact's the full
-                                // request, so this is belt-and-braces against
-                                // a future short-reading source.
+                                // A short read must not desync the stream: advance by
+                                // sectors actually read, and reject a non-whole-sector
+                                // count (belt-and-braces; FileSectorSource read_exact's).
                                 if n % 2048 != 0 {
                                     let _ = tx.send(Err(
                                         crate::error::Error::ExtentNotUnitAligned.into()
@@ -306,17 +256,9 @@ impl PrefetchedSectorSource {
                                     return;
                                 }
                                 let sectors_read = (n / 2048) as u32;
-                                // A genuine zero-byte read with no error
-                                // would otherwise spin this loop forever.
-                                // It is not end-of-stream either: the
-                                // extent list still has `remaining`
-                                // sectors to serve, so the inner source
-                                // has quit early. Send a terminal
-                                // sentinel — dropping `tx` here instead
-                                // would reach the consumer as a clean EOF
-                                // and finalize a TRUNCATED title as
-                                // success, exactly as the panic sentinel
-                                // below exists to prevent.
+                                // A zero-byte read isn't EOF (extents still have
+                                // `remaining`) and would spin forever; send a terminal
+                                // sentinel instead of a clean EOF that reports success.
                                 if sectors_read == 0 {
                                     let _ =
                                         tx.send(Err(crate::error::Error::SourceTerminated.into()));
@@ -346,10 +288,9 @@ impl PrefetchedSectorSource {
                     // Drop tx implicitly — consumer sees RecvError → EOF.
                 });
                 if std::panic::catch_unwind(body).is_err() {
-                    // Producer panicked mid-stream — surface a typed terminal
-                    // error so the demux thread does NOT read the dropped channel
-                    // as a clean EOF and truncate output. Ignore the send result:
-                    // if the consumer is already gone there is nothing to report.
+                    // Panicked mid-stream — surface a typed error so the demux
+                    // doesn't read the dropped channel as clean EOF and truncate.
+                    // Ignore send failure: consumer already gone, nothing to report.
                     let _ = tx.send(Err(crate::error::Error::DemuxThreadPanicked.into()));
                 }
             })
@@ -376,26 +317,13 @@ impl PrefetchedSectorSource {
     /// queries; its `SectorSource` impl becomes invalid after this
     /// call (data has been moved out).
     pub fn into_channels(self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
-        // MOVE the three fields out cleanly — never clone. Each of
-        // `rx` and `recycle_tx` ends up with exactly ONE live copy:
-        // the one in the returned tuple. The pre-1.0.0 implementation
-        // cloned both and then `mem::forget`-ed `self`, leaking the
-        // originals so an extra live receiver + sender survived
-        // forever. That defeated the channel-disconnection shutdown:
-        // when the demux consumer exited early (halt, or a `tx.send`
-        // error in `demux_thread`), the producer's `recycle_rx.recv()`
-        // and `tx.send()` never saw all-peers-dropped, so the producer
-        // never returned and `PrefetchShell::drop`'s `join()` hung.
-        //
-        // `ManuallyDrop` + `ptr::read` reads each field out by value
-        // and suppresses `self`'s own `Drop` (which would otherwise
-        // double-`join`), leaving NO extra live endpoint behind. This
-        // is the panic-free equivalent of the `Option::take` approach.
+        // MOVE the fields out, never clone: pre-1.0.0 code cloned + `forget`-ed
+        // `self`, leaking endpoints that defeated disconnection shutdown and
+        // hung `PrefetchShell::drop`'s `join()`. `ManuallyDrop` avoids that.
         let me = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `me` is `ManuallyDrop`, so none of these fields will
-        // be dropped by `me`. Each `ptr::read` performs exactly one
-        // bitwise move out; every field is read exactly once and never
-        // touched again, so there are no double-frees and no aliasing.
+        // SAFETY: `me` is `ManuallyDrop` so it drops none of these fields;
+        // each `ptr::read` moves exactly one field out exactly once, so
+        // there are no double-frees and no aliasing.
         let producer = unsafe { std::ptr::read(&me.producer) };
         let rx = unsafe { std::ptr::read(&me.rx) };
         let recycle = unsafe { std::ptr::read(&me.recycle_tx) };
@@ -420,23 +348,9 @@ impl Drop for PrefetchShell {
 
 impl Drop for PrefetchedSectorSource {
     fn drop(&mut self) {
-        // Drop the channel endpoints BEFORE joining the producer.
-        //
-        // `rx` and `recycle_tx` are sibling fields, so they are dropped only
-        // AFTER this `Drop::drop` body returns. Joining first therefore joined
-        // while both endpoints were still alive: a producer parked in the plain
-        // blocking `tx.send(Ok(buf))` (no timeout, so the `Halt` is never
-        // re-polled) never observed a disconnect and never returned, and the
-        // dropping thread blocked in `join()` forever. Any source dropped before
-        // its extents were drained — an error path, an operator stop, or a
-        // consuming crate using the public `new` + direct `read_sectors` — hit a
-        // permanent two-thread deadlock. `BytePrefetcher::drop` already had this
-        // shape; see `drop_undrained_source_joins_cleanly`.
-        //
-        // The endpoints are moved out via `mem::replace` with already-disconnected
-        // stand-ins (each stand-in's peer is dropped immediately), which drops the
-        // real ones here and needs neither `Option` fields nor `unsafe` — and
-        // leaves `into_channels`'s `ptr::read` moves untouched.
+        // Drop endpoints BEFORE joining: siblings drop only after this body
+        // returns, and joining first left a producer blocked forever in
+        // `tx.send`. Swap in disconnected stand-ins to drop the real ones.
         let (dead_tx, dead_rx) = bounded::<Batch>(0);
         drop(dead_tx);
         drop(std::mem::replace(&mut self.rx, dead_rx));
@@ -464,27 +378,18 @@ impl SectorSource for PrefetchedSectorSource {
         buf: &mut [u8],
         _recovery: bool,
     ) -> Result<usize> {
-        // The producer has already decided the next batch. lba/count
-        // are advisory; the consumer's fill_extents will advance its
-        // own bookkeeping using the returned byte count, not the
-        // requested count.
+        // The producer already decided the next batch. lba/count are
+        // advisory; fill_extents advances its own bookkeeping using the
+        // returned byte count, not the requested count.
         match self.rx.recv() {
             Ok(Ok(filled)) => {
-                // Precondition: the caller's buffer must be large
-                // enough to hold the producer's batch. If it is not we
-                // would silently drop `filled[buf.len()..]`, desyncing
-                // the stream. The production zero-copy path never uses
-                // this method (it consumes the channel directly via
-                // `into_channels`), so a too-small buffer here is a
-                // caller bug — surface it instead of corrupting data.
+                // Precondition: buf must hold the whole batch, else we'd
+                // silently drop the tail and desync the stream. Production
+                // uses `into_channels` directly, so this is a caller bug.
                 if filled.len() > buf.len() {
-                    // Recycle the buffer before returning the error so the
-                    // pool invariant is preserved on every code path. Without
-                    // this, every too-small-buffer error permanently removes
-                    // one buffer from the pool; after PREFETCH_CHANNEL_DEPTH+1
-                    // such errors the pool is exhausted and the producer
-                    // blocks forever on recycle_rx.recv() while the consumer
-                    // blocks on rx.recv() — permanent deadlock.
+                    // Recycle before erroring, or the pool loses one buffer per
+                    // error; after PREFETCH_CHANNEL_DEPTH+1 errors it's exhausted
+                    // and producer/consumer deadlock on recycle_rx/rx.recv().
                     let _ = self.recycle_tx.send(filled);
                     return Err(crate::error::Error::IoError {
                         source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
@@ -492,26 +397,15 @@ impl SectorSource for PrefetchedSectorSource {
                 }
                 let n = filled.len();
                 buf[..n].copy_from_slice(&filled[..n]);
-                // Return the buffer to the recycle pool so the producer
-                // can re-fill it. Without this the pool (seeded with
-                // PREFETCH_CHANNEL_DEPTH+1 buffers) drains after that
-                // many reads and the producer blocks forever on
-                // `recycle_rx.recv()` while the consumer blocks on the
-                // next `rx.recv()` — a permanent deadlock. The
-                // `into_channels` zero-copy path recycles explicitly;
-                // this direct-read path must do the same.
+                // Recycle so the producer can re-fill: without it the seeded pool
+                // drains after PREFETCH_CHANNEL_DEPTH+1 reads and both sides
+                // deadlock on recycle_rx/rx.recv(), same as `into_channels`.
                 let _ = self.recycle_tx.send(filled);
                 Ok(n)
             }
-            // Recover the producer's TYPED error rather than blanket-wrapping
-            // it as `Error::IoError`. That wrapper is a classification, not a
-            // container: `is_scsi_transport_failure` matches `IoError`, so a
-            // wrapped MEDIUM ERROR bad sector reached `fill_extents` looking
-            // like a wedged bridge and aborted the pass instead of being
-            // skipped under `skip_errors`. `From<io::Error> for Error`
-            // downcasts the boxed payload back to the exact variant the
-            // producer sent (status + sense intact); a genuine OS-level
-            // `io::Error` — the real dead-bus case — still becomes `IoError`.
+            // Recover the producer's TYPED error, not a blanket `Error::IoError`:
+            // that also matches `is_scsi_transport_failure`, so a wrapped MEDIUM
+            // ERROR bad sector looked like a wedged bridge instead of skippable.
             Ok(Err(e)) => {
                 // The producer `return`s after every error it sends, so
                 // this is also the moment the source dies. Latch it: the
@@ -519,12 +413,9 @@ impl SectorSource for PrefetchedSectorSource {
                 self.producer_failed = true;
                 Err(crate::error::Error::from(e))
             }
-            // Channel closed. Clean EOF only if the producer never
-            // signalled a failure — otherwise it exited without
-            // delivering the rest of the extents, and answering `Ok(0)`
-            // would let `fill_extents` mistake a dead source for a short
-            // read, zero-fill every remaining sector of the title and
-            // still report the pass as complete.
+            // Channel closed. Clean EOF only if the producer never signalled a
+            // failure — else `Ok(0)` would let fill_extents mistake a dead
+            // source for a short read and zero-fill the rest as "complete".
             Err(_) if self.producer_failed => Err(crate::error::Error::SourceTerminated),
             Err(_) => Ok(0),
         }
@@ -1098,11 +989,9 @@ mod tests {
             let pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
             // 9 + 6 + 3 = 18, independent of inner source capacity.
             assert_eq!(pf.capacity_sectors(), 18);
-            // Release the producer without draining via the production
-            // zero-copy path: peel the channels and drop them so the
-            // producer observes disconnection. (A direct `drop(pf)` is
-            // also safe now — see `drop_undrained_source_joins_cleanly`
-            // — but the mux always uses into_channels.)
+            // Release without draining via the production zero-copy path: peel
+            // channels and drop them so the producer observes disconnection
+            // (a direct `drop(pf)` is also safe; see the test below).
             let (rx, recycle_tx, shell) = pf.into_channels();
             drop(rx);
             drop(recycle_tx);
@@ -1410,18 +1299,9 @@ mod tests {
             // Caller buffer holds only 1 sector — far too small for a 3-sector batch.
             let mut tiny = vec![0u8; 2048];
 
-            // 5 > pool depth of 3: without the fix the pool exhausts by
-            // iteration 4 and both threads deadlock.
-            // 8 >> pool depth (3): WITHOUT the recycle-on-error fix the pool
-            // is drained after the 3rd error and the 4th read deadlocks
-            // (producer blocks on recycle_rx, consumer on rx). WITH the fix the
-            // buffer is returned to the pool on every error path, so the pool
-            // never drains and all reads complete. Reaching this loop's end is
-            // the regression assertion. (read_sectors is a non-production
-            // direct path; the production mux uses the zero-copy into_channels
-            // path. A correctly-sized read afterward is intentionally NOT
-            // asserted — that would couple the test to exact producer EOF/tx
-            // pacing, which is unrelated to the pool-exhaustion invariant.)
+            // 8 >> pool depth (3): WITHOUT recycle-on-error the pool drains by
+            // the 3rd error and read 4 deadlocks. WITH the fix every error
+            // recycles its buffer, so reaching loop end is the regression check.
             for i in 0..8 {
                 let r = pf.read_sectors(0, 1, &mut tiny, false);
                 assert!(

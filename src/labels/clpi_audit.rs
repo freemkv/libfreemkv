@@ -116,10 +116,9 @@ impl ClpiVsMplsAudit {
 /// merged view. Missing files (read errors, parse failures) are
 /// silently skipped — this is diagnostic, not correctness-critical.
 pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
-    // Aggregate by PID across all CLPI files. If a PID appears in
-    // multiple clips (typical — main movie clip + trailers reference
-    // the same audio stream PIDs), first encountered wins (they should
-    // all agree per BD spec).
+    // Aggregate by PID across all CLPI files. A PID commonly repeats across
+    // clips (main movie + trailers sharing audio PIDs); first encountered
+    // wins, since they should all agree per BD spec.
     let mut clpi_by_pid: BTreeMap<u16, (u8, String)> = BTreeMap::new();
     if let Some(dir) = udf.find_dir("/BDMV/CLIPINF") {
         let names: Vec<String> = dir

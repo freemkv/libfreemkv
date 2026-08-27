@@ -1,6 +1,6 @@
 //! M2TS metadata header — embeds title/stream info in raw m2ts files.
 //!
-//! Format: [8B magic] [4B json_len] [JSON] [padding to 192B boundary] [BD-TS data...]
+//! Format: `[8B magic] [4B json_len] [JSON] [padding to 192B boundary] [BD-TS data...]`
 //! Other tools skip the header during TS sync recovery (scan for 0x47).
 
 use crate::disc::{
@@ -186,10 +186,9 @@ impl M2tsMeta {
                     codec_private: _,
                 } => {
                     let hdr_fmt = hdr.parse().unwrap_or(crate::disc::HdrFormat::Sdr);
-                    // Prefer the explicitly stored color space. Pre-0.30.7
-                    // metadata has none, so derive it from the HDR format:
-                    // every HDR variant (HDR10/HDR10+/HLG/Dolby Vision) is
-                    // BT.2020; SDR is BT.709.
+                    // Prefer the stored color space; pre-0.30.7 metadata has none,
+                    // so derive from HDR format: every HDR variant (HDR10/HDR10+/
+                    // HLG/Dolby Vision) is BT.2020, SDR is BT.709.
                     let cs = if color_space.is_empty() {
                         color_space_from_hdr(hdr_fmt)
                     } else {
@@ -303,10 +302,9 @@ pub fn write_header(w: &mut impl Write, meta: &M2tsMeta) -> io::Result<()> {
     // English string into an io::Error (no-English rule).
     let json = serde_json::to_vec(meta).map_err(|_| crate::error::Error::NoMetadata)?;
 
-    // Guard the length field against truncation: the read side rejects
-    // anything over MAX_JSON_SIZE, and `as u32` would silently wrap a
-    // >=4 GiB JSON into a wrong, smaller length. Near-impossible for
-    // real stream metadata, but a v1.0 primitive shouldn't truncate.
+    // Guard the length field against truncation: `as u32` would silently wrap a
+    // >=4 GiB JSON into a wrong, smaller length. Near-impossible for real
+    // metadata, but a v1.0 primitive shouldn't truncate.
     let json_len = u32::try_from(json.len()).map_err(|_| crate::error::Error::NoMetadata)?;
     let raw_len = 8 + 4 + json.len(); // magic + len + json
     let padded_len = raw_len.div_ceil(BD_SOURCE_PACKET_BYTES) * BD_SOURCE_PACKET_BYTES;
@@ -329,16 +327,14 @@ pub fn write_header(w: &mut impl Write, meta: &M2tsMeta) -> io::Result<()> {
 pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
     const MAX_JSON_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
-    // Read the first byte alone so a zero-byte stream (a legitimate
-    // headerless file) stays Ok(None), while a stream that begins with some
-    // magic bytes then truncates mid-magic surfaces as an error rather than
-    // being masked as "no header".
+    // Read the first byte alone so a zero-byte stream (legitimate headerless
+    // file) stays Ok(None), while a stream that truncates mid-magic surfaces as
+    // an error rather than being masked as "no header".
     let mut first = [0u8; 1];
     if let Err(e) = r.read_exact(&mut first) {
-        // A clean EOF (no header at all) means "no FMKV header" — the caller
-        // falls back to a PMT scan. Any OTHER I/O failure (broken pipe,
-        // permission denied, mid-read disc error) is a real error and must
-        // propagate, not masquerade as a headerless stream.
+        // A clean EOF means "no FMKV header" — caller falls back to a PMT scan.
+        // Any OTHER I/O failure (broken pipe, permission denied, disc error) is
+        // real and must propagate, not masquerade as a headerless stream.
         if e.kind() == io::ErrorKind::UnexpectedEof {
             return Ok(None);
         }
@@ -619,15 +615,9 @@ mod tests {
         }
     }
 
-    // ============================================================
-    // Header byte-layout invariants
-    //
-    // Format: [8B magic][4B json_len BE][JSON][padding to 192B].
-    // The header MUST end on a 192-byte (BD-TS packet) boundary so the
-    // following TS data stays packet-aligned and other tools can resync
-    // by scanning for 0x47. A wrong padding calc silently misaligns the
-    // entire m2ts payload.
-    // ============================================================
+    // Header byte-layout invariants. Format: [8B magic][4B json_len BE][JSON]
+    // [pad to 192B]. MUST end on a 192-byte (BD-TS packet) boundary so following
+    // TS stays aligned (tools resync on 0x47); wrong padding misaligns the payload.
 
     #[test]
     fn magic_bytes_exact_layout() {
@@ -739,10 +729,9 @@ mod tests {
 
     #[test]
     fn second_magic_byte_mismatch_is_none_not_error() {
-        // First byte matches MAGIC[0] ('F') so we commit to reading 7 more,
-        // but the resulting 4-byte magic differs from "FMKV". Per the reader
-        // contract this is "not an FMKV stream" → Ok(None), letting the caller
-        // fall back to a PMT scan. (Only a truncated read after 'F' errors.)
+        // First byte matches MAGIC[0] ('F') so we read 7 more, but the 4-byte
+        // magic differs from "FMKV": per the reader contract this is "not FMKV"
+        // → Ok(None), not an error. (Only a truncated read after 'F' errors.)
         let mut buf = vec![b'F', b'X', b'X', b'X', 0, 0, 0, 0];
         // pad so the 8-byte magic read succeeds.
         buf.extend_from_slice(&[0u8; 8]);
@@ -753,10 +742,9 @@ mod tests {
 
     #[test]
     fn read_header_consumes_exactly_one_packet_boundary() {
-        // After a successful read_header, the reader must be positioned exactly
-        // at a 192-byte boundary AND nothing of the following data consumed.
-        // Append a sentinel TS sync byte (0x47) right after the header and
-        // confirm it is the very next byte available.
+        // After read_header the reader must sit exactly at a 192-byte boundary
+        // with none of the following data consumed. Append a sentinel TS sync
+        // byte (0x47) after the header and confirm it is the very next byte.
         let meta = M2tsMeta::from_title(&video_title(HdrFormat::Hdr10, ColorSpace::Bt2020));
         let mut buf = Vec::new();
         write_header(&mut buf, &meta).unwrap();
@@ -793,10 +781,9 @@ mod tests {
 
     #[test]
     fn video_codec_private_round_trips_through_header() {
-        // A video stream's HEVCDecoderConfigurationRecord must survive
-        // from_title → write_header → read_header → codec_privates(). Without
-        // this, an FMKV-driven remux loses the hvcC and the MKV video track is
-        // undecodable.
+        // A video stream's HEVCDecoderConfigurationRecord must survive from_title
+        // → write_header → read_header → codec_privates(); otherwise an FMKV-driven
+        // remux loses the hvcC and the MKV video track is undecodable.
         let mut t = video_title(HdrFormat::Hdr10, ColorSpace::Bt2020);
         t.codec_privates = vec![Some(vec![0x01, 0x02, 0x20, 0x00])]; // fake hvcC
         let meta = M2tsMeta::from_title(&t);

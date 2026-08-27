@@ -190,28 +190,9 @@ impl Disc {
         // disc-wide keys for every file.
         let mut base_keys = self.decrypt_keys();
 
-        // AACS key map for the extract, chosen by CPS-unit count:
-        //
-        // * SINGLE CPS (the overwhelming majority, incl. every single-key UHD): one
-        //   Unit Key opens EVERY encrypted unit on the disc — content in a parsed
-        //   title AND an orphan clip that no playlist references. A blanket key-0
-        //   map over the whole LBA space is exact and covers orphans; clear
-        //   filesystem/nav (encrypted-flag off) passes through untouched.
-        //
-        // * MULTI-CPS: each clip is protected by a different Unit Key, so a blanket
-        //   key-0 map would mis-decrypt every secondary-CPS file into garbage
-        //   (silently, since Phase::All is trust-only). Build the EXACT per-CPS
-        //   content map instead (each title's extents → the CPS key that opens a
-        //   real sample from it), up front before the decorator takes the reader. A
-        //   content unit whose key the pool lacks fails loud at resolve (extract has
-        //   no CPS/forensic fetch source), never emits a wrong-key garble.
-        //
-        //   KNOWN LIMITATION (by design): an orphan encrypted clip on a multi-CPS
-        //   disc — referenced by no playlist, so in no title extent — is in no range
-        //   and passes through as ciphertext. There is no correct key to apply (its
-        //   CPS unit is unknown without a playlist reference), and blind trial-decrypt
-        //   is exactly what this keymap-only model removes. Single-CPS is unaffected
-        //   (the blanket key-0 map above covers orphans).
+        // AACS key map, by CPS-unit count. Single-CPS: one Unit Key opens
+        // everything, so a blanket key-0 map covers even orphan clips. Multi-CPS
+        // builds an exact per-title map instead (a blanket map would mis-decrypt).
         let key_map =
             match &base_keys {
                 DecryptKeys::Aacs { unit_keys, .. } if unit_keys.len() <= 1 => {
@@ -225,10 +206,9 @@ impl Disc {
                 _ => None,
             };
 
-        // ── Phase 2: stream each file through the decrypting decorator ────
-        // The decorator owns its inner source for its lifetime. We hand it a
-        // borrowing wrapper (so the caller keeps `reader`), swap keys per CSS
-        // VTS group via `set_keys`; AACS/None keep `base_keys` throughout.
+        // Phase 2: stream each file through the decrypting decorator, which owns a
+        // borrowing wrapper so the caller keeps `reader`. Keys swap per CSS VTS
+        // group via `set_keys`; AACS/None keep `base_keys` throughout.
         let mut dec = DecryptingSectorSource::new(Borrowed(reader), base_keys.clone());
         if let Some(map) = key_map {
             dec = dec.with_key_map(map);
@@ -270,10 +250,8 @@ impl Disc {
                 }
             }
 
-            // A unit that fails to decrypt fails the read loud (extract runs
-            // non-tolerate), so extract_one_file already zero-filled it and
-            // counted it in bytes_unreadable — one 'lost' bucket covers both
-            // media damage and decrypt failure.
+            // A unit that fails to decrypt fails the read loud; extract_one_file
+            // zero-fills it into bytes_unreadable, the same bucket as media damage.
             let (fr, halted) = extract_one_file(
                 &mut dec,
                 dest,
@@ -321,40 +299,24 @@ impl Disc {
         dec: &mut DecryptingSectorSource<S>,
         base_keys: &DecryptKeys,
     ) -> Result<DecryptKeys> {
-        // Gather the title VOB extents for this VTS (VTS_xx_1.VOB .. _9.VOB;
-        // VTS_xx_0.VOB is the menu and is clear, so excluded from the crack).
-        // Gather this VTS's title VOBs BY NAME, ascending.
-        //
-        // `planned` comes from walking the UDF directory, which yields File
-        // Identifier Descriptors in on-disc order — authoring order, with no
-        // guarantee it matches playback order. Relying on it would leave the
-        // crack starting wherever the disc's directory happened to list first.
-        //
-        // DVD-Video numbers a title set's VOBs in playback order by spec
-        // (VTS_xx_1.VOB .. VTS_xx_9.VOB, single digit), so ascending name IS
-        // playback order and it is deterministic regardless of directory
-        // layout. That matters because ORDER decides correctness here: see the
-        // note below on the shared crack budget.
+        // Gather this VTS's title VOBs (VTS_xx_1..9.VOB, _0.VOB menu excluded) BY
+        // NAME, ascending. Directory order is authoring order not playback order,
+        // but DVD-Video numbers VOBs in playback order, so name-sort is correct.
         let mut files: Vec<&PlannedFile> = planned
             .iter()
             .filter(|pf| {
                 vts_group_of(&pf.disc_name).as_deref() == Some(vts) && is_title_vob(&pf.disc_name)
             })
             .collect();
-        // Case-INSENSITIVE, matching `vts_group_of`/`is_title_vob`, which
-        // selected these files case-insensitively. A byte-wise sort put
-        // 'V' (0x56) before 'v' (0x76), so a set holding `vts_01_1.vob`
-        // alongside `VTS_01_2.VOB` — reachable on a case-sensitive volume —
-        // started the crack at part 2 and could exhaust the budget in a clear
-        // run, which is the whole failure this ordering exists to prevent.
+        // Case-INSENSITIVE, matching the selection above. A byte-wise sort could
+        // start the crack at the wrong part on a case-sensitive volume, exhausting
+        // the budget in a clear run — the exact failure this ordering prevents.
         files.sort_by_key(|f| f.disc_name.to_ascii_uppercase());
 
         let mut extents: Vec<crate::disc::Extent> = Vec::new();
         for pf in files {
-            // Unrecorded extents hold no bytes the VOB ever wrote, so they can
-            // carry no scrambled sector for the crack to work from — feeding
-            // them in spends the shared sector budget on media that is not part
-            // of the title.
+            // Unrecorded extents hold no bytes the VOB ever wrote and carry no
+            // scrambled sector, so feeding them in wastes the shared crack budget.
             for ext in pf.extents.iter().filter(|e| e.recorded) {
                 extents.push(crate::disc::Extent {
                     start_lba: ext.lba,
@@ -365,26 +327,9 @@ impl Disc {
         if extents.is_empty() {
             return Ok(base_keys.clone());
         }
-        // PLAYBACK ORDER — do NOT sort. This is the 1.5.1 garbage bug, and it
-        // grew back here in a new code path: the comment this replaced said it
-        // "matched the scan heuristic", but that heuristic WAS the bug and was
-        // already fixed in `Disc::decrypt_keys_for_title`, which documents the
-        // rule ("PLAYBACK ORDER, never largest-cell-first") and pins it with
-        // `decrypt_keys_for_title_scans_playback_order_not_largest_first`.
-        //
-        // Why order decides correctness: a CSS DVD's biggest cell opens with a
-        // long CLEAR run, and `crack_key`'s sector budget is shared across the
-        // whole extent list. Starting at the largest cell can exhaust the budget
-        // without ever MEETING a scrambled sector — and CSS recovers the title
-        // key from scrambled data itself, so the scan has to reach some. The
-        // crack then returns None, this function falls back to `base_keys`, and
-        // every VOB in the VTS is descrambled with the wrong key: corrupt PES
-        // behind an intact header, written out as a complete extract at exit 0.
-        //
-        // The files above are ordered by name and each file's own extents stay
-        // in file order, which together is playback order for a DVD title set.
-        // Crack against the raw (still-scrambled) inner reader, NOT the
-        // decrypting view — `crack_key` runs the descrambler itself.
+        // PLAYBACK ORDER — do NOT sort (the 1.5.1 garbage bug: see
+        // `Disc::decrypt_keys_for_title`'s "never largest-cell-first" rule).
+        // Crack against the raw inner reader, NOT the decrypting view.
         match crate::css::crack_key_outcome(dec.inner_mut(), &extents, 64, None) {
             crate::css::CrackOutcome::Cracked(state) => Ok(DecryptKeys::Css {
                 title_key: state.title_key,
@@ -393,24 +338,9 @@ impl Disc {
             // and any key descrambles it as a no-op. The disc-wide key is the
             // right answer, and this is the ONLY case that ever was.
             crate::css::CrackOutcome::Unencrypted => Ok(base_keys.clone()),
-            // Scrambled sectors WERE seen and no key came out. Reusing the
-            // disc-wide key here writes corrupt PES behind an intact header and
-            // reports a complete extract at exit 0.
-            //
-            // `CssKeyMissing` is the per-TITLE code rather than the disc-level
-            // `CssNoDiscKey` because the two are treated differently elsewhere:
-            // it is what `error::is_skippable_title_stub` matches, and the MUX
-            // path really does skip a title on it and carry on with the rest of
-            // the disc.
-            //
-            // EXTRACT does not skip. This error is `?`-propagated by the only
-            // caller, out of the loop over every planned file, so one
-            // uncrackable VTS aborts the whole extract — including files from
-            // sibling VTS groups that would have cracked. That is deliberate:
-            // aborting loudly is the safe failure here, and pinned by
-            // `a_scrambled_vts_that_cannot_be_cracked_fails_instead_of_borrowing_a_key`.
-            // Do not read the code choice as a promise that extraction
-            // continues past this point.
+            // Scrambled sectors WERE seen and no key came out. `CssKeyMissing`
+            // (unlike MUX, which skips on it) is `?`-propagated here, aborting
+            // the whole extract rather than reusing the wrong key silently.
             crate::css::CrackOutcome::ScrambledUncracked => Err(Error::CssKeyMissing),
         }
     }
@@ -476,34 +406,9 @@ fn plan_tree(
         let safe = sanitize_component(&entry.name)?;
         let child_rel = host_rel.join(&safe);
         let child_disc = format!("{disc_path}/{}", entry.name);
-        // Collision: two distinct disc paths → same host FILE. The key must
-        // model the HOST's namespace, not the disc's, and the two differ twice
-        // over:
-        //
-        //  * CASE. macOS APFS and Windows NTFS are case-insensitive by default,
-        //    so `Movie` and `movie` are one file there. Keyed by the
-        //    case-preserving path they were two entries, nothing collided, and
-        //    the second extraction overwrote the first with both files still
-        //    reported `complete: true`.
-        //  * The `.partial` SUFFIX. `extract_one_file` streams through
-        //    `<final>.partial` before renaming, so a file's temp path lives in
-        //    the same namespace as every other file's final path: a disc
-        //    holding both `X` and `X.partial` planned two distinct final names,
-        //    and extracting `X` then truncated the real `X.partial`.
-        //
-        // Only files get the `.partial` alias — directories are created
-        // directly and never stream through a temp name — but it is checked
-        // against every entry's primary key, so a directory `X.partial` beside
-        // a file `X` is caught too. The alias stores the OWNING file's disc
-        // path, so the `prev != child_disc` test keeps its meaning: a repeated
-        // identical disc path is not a collision, two different ones are.
-        //
-        // The fold is `to_lowercase`, which closes the ASCII and simple-Unicode
-        // case classes. It is NOT full case folding, and it does NOT normalize:
-        // APFS also unifies NFC/NFD, so `é` recorded as U+00E9 and as
-        // `e`+U+0301 remain two keys here and one file there. That residual is
-        // a false NEGATIVE (a missed collision, never a spurious one), so this
-        // is a strict improvement rather than a complete model of the host.
+        // Collision: two distinct disc paths → same host FILE (case-insensitive
+        // fold of `Movie`/`movie`, or `.partial` sharing the final-name namespace
+        // so `X`/`X.partial` collide too). Fold is ASCII/simple-Unicode only.
         let mut register = |key: PathBuf| -> Result<()> {
             let folded = key.to_string_lossy().to_lowercase();
             if let Some(prev) = seen_hosts.insert(folded, child_disc.clone())
@@ -608,14 +513,9 @@ fn extract_one_file<S: SectorSource>(
         if written >= pf.size {
             break;
         }
-        // ECMA-167 4/14.14.1.1 type 1: allocated but NOT recorded. The extent
-        // is part of the file's byte space and its contents are defined to be
-        // zeros, so write the zeros WITHOUT reading the media — those sectors
-        // hold nothing this file ever wrote (on an AACS disc, ciphertext that
-        // decrypts to noise). This mirrors `UdfFs::read_file_limited`, which
-        // takes the same decision from the same flag. Skipping the extent
-        // entirely instead would slide every later extent's bytes down by the
-        // hole's length.
+        // ECMA-167 4/14.14.1.1 type 1: allocated but NOT recorded. Write zeros
+        // WITHOUT reading the media (mirrors `UdfFs::read_file_limited`) — skipping
+        // the extent entirely would slide every later extent's bytes down.
         if !recorded {
             let sectors = (byte_len as u64).div_ceil(SECTOR_BYTES_U64);
             let hole_bytes = (sectors * SECTOR_BYTES_U64).min(pf.size.saturating_sub(written));
@@ -640,26 +540,16 @@ fn extract_one_file<S: SectorSource>(
             }
             continue;
         }
-        // Anchor AACS unit alignment at THIS extent's start (clip-anchored
-        // gate, not absolute LBA 0 and NOT the file's first extent). A file
-        // may span multiple extents (fragmented / Long-AD / continuation ICB
-        // allocation); each extent's start LBA is arbitrary and generally not
-        // a multiple of 3 sectors from the previous extent. The decrypt-on-
-        // read gate (`is_unit_aligned(lba, unit_base)`) measures every read's
-        // LBA relative to `unit_base`, so the base MUST be re-anchored per
-        // extent — otherwise the first read of every later extent fails the
-        // gate and the whole extent is zero-filled as a (false) hole. Matches
-        // the per-extent re-anchoring in the mux read paths
-        // (`mux/disc.rs`, `sector/prefetched.rs`). No-op for CSS / None.
+        // Anchor AACS unit alignment at THIS extent's start, not LBA 0 or the
+        // file's first extent: a fragmented extent's start LBA is arbitrary, so
+        // the gate must re-anchor per extent or a later read false-holes. No-op for CSS/None.
         dec.set_unit_base(abs_lba);
         let sectors = (byte_len as u64).div_ceil(SECTOR_BYTES_U64) as u32;
         let mut sector_off: u32 = 0;
         while sector_off < sectors {
-            // AACS: read whole units (see `whole_unit_batch`). The tail batch may
-            // be a 1–2 sector partial unit, which `decrypt_sectors` handles via
-            // its trailing-partial contract: a clear partial stays clear (AACS
-            // leaves the final short unit unencrypted on disc), a scrambled
-            // partial fails loud as DecryptFailed.
+            // AACS: read whole units (see `whole_unit_batch`). A 1-2 sector tail
+            // partial is handled by `decrypt_sectors`'s trailing-partial contract:
+            // clear stays clear, scrambled fails loud as DecryptFailed.
             let batch = whole_unit_batch(sectors - sector_off);
             let lba = abs_lba + sector_off;
             let want = batch as usize * SECTOR_BYTES;
@@ -686,8 +576,7 @@ fn extract_one_file<S: SectorSource>(
             let cont = report(opts, *done_bytes, *done_unreadable, total_bytes);
             sector_off += batch;
             if opts.cancelled(cont) {
-                // Leave the `.partial`; do NOT rename. The aggregate run
-                // records the halt and this file stays incomplete.
+                // Leave the `.partial`; do NOT rename — this file stays incomplete.
                 return Ok((fr, true));
             }
             if written >= pf.size {
@@ -709,9 +598,8 @@ fn extract_one_file<S: SectorSource>(
 /// [`READ_BATCH_SECTORS`] and rounded DOWN to a whole number of 3-sector units
 /// UNLESS it is the extent's final (possibly short) tail — the tail always
 /// begins on a unit boundary, so a 1–2 sector partial there is handled by
-/// `decrypt_sectors`' trailing-partial contract. Shared by `extract_one_file`
-/// (write) and `verify_one_clip` (dead-range) so this rounding rule lives in
-/// exactly one place.
+/// `decrypt_sectors`' trailing-partial contract. Used by `extract_one_file`
+/// so this rounding rule lives in exactly one place.
 fn whole_unit_batch(remaining: u32) -> u32 {
     let mut batch = remaining.min(READ_BATCH_SECTORS);
     if batch >= AACS_UNIT_SECTORS && batch < remaining {
@@ -773,11 +661,9 @@ fn finalize_file(
     f.set_len(size).map_err(|e| Error::DirWriteFailed {
         errno: e.raw_os_error(),
     })?;
-    // `set_len` is a separate kernel op on this second handle (opened solely to
-    // truncate); the content fsync above was on the now-dropped writer handle.
-    // Without an fsync here, a crash between `set_len` and the rename can leave
-    // the file at its pre-truncation length — e.g. a sparse/over-read tail keeps
-    // its oversized form. Sync the new metadata (length) before publishing.
+    // `set_len` is a separate kernel op on this second handle; without an fsync
+    // here, a crash between `set_len` and the rename can leave the file at its
+    // pre-truncation length. Sync the new metadata (length) before publishing.
     f.sync_all().map_err(|e| Error::DirWriteFailed {
         errno: e.raw_os_error(),
     })?;
@@ -803,11 +689,9 @@ fn report(opts: &ExtractOptions, done: u64, unreadable: u64, total: u64) -> bool
                 kind: crate::progress::PassKind::Mux,
                 work_done: done,
                 work_total: total,
-                // `done` counts good AND zero-filled-unreadable bytes together;
-                // split them so a consumer driven only by the live progress
-                // channel sees a holed extraction as holed rather than as a clean
-                // climb to 100%. The final ExtractResult already carries the true
-                // split — this used to pin unreadable at 0 and call every byte good.
+                // `done` counts good AND unreadable bytes together; split them so a
+                // live-progress-only consumer sees a holed extraction as holed,
+                // not a clean climb to 100% (this used to pin unreadable at 0).
                 bytes_good_total: done.saturating_sub(unreadable),
                 bytes_unreadable_total: unreadable,
                 bytes_pending_total: 0,
@@ -843,10 +727,8 @@ fn available_space(dir: &Path) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    // `statvfs` field integer widths differ by platform (e.g. macOS `u64`,
-    // Linux glibc `u64`/`c_ulong`); cast both to `u64` for the product. The
-    // cast is a no-op where the field is already `u64` — allow the lint so the
-    // same source stays portable.
+    // `statvfs` field integer widths differ by platform; cast both to `u64`
+    // for the product (no-op where already `u64` — allow lint for portability).
     #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
     let avail = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
     Some(avail)
@@ -946,13 +828,9 @@ fn sanitize_component(name: &str) -> Result<String> {
             host: name.to_string(),
         });
     }
-    // Windows reserved device names (case-insensitive, base name before any
-    // extension). `NUL` silently discards all writes on Windows, so a disc file
-    // literally named `NUL.cfg` (legal on UDF/Linux) must NOT pass through
-    // verbatim — but it also must not abort the whole extraction. Substitute by
-    // prefixing `_`, which can never itself collide with another reserved name
-    // and is host-legal everywhere. The substituted name still flows through the
-    // caller's host-path collision check.
+    // Windows reserved device names (case-insensitive, base before extension).
+    // `NUL` silently discards writes on Windows, so `NUL.cfg` (legal on
+    // UDF/Linux) must not pass through verbatim; prefix `_` instead of aborting.
     let base = trimmed.split('.').next().unwrap_or(trimmed);
     if is_windows_reserved(base) {
         return Ok(format!("_{trimmed}"));
@@ -1016,14 +894,9 @@ mod tests {
     use crate::css::lfsr;
     use std::collections::HashMap;
 
-    // ── Self-contained in-memory UDF fixture toolkit ──────────────────────
-    // Modeled on the bluray.rs / dvd.rs test fixtures: a `MemDisc` SectorSource
-    // backed by an explicit absolute-LBA map, plus recursive UDF builders.
-    // PART_START == metadata_start so file/ICB LBAs share one address space
-    // (single partition map). Encrypted content is faked at the buffer level
-    // (CSS via `lfsr::scramble_sector`); AACS-content tests use clear bytes
-    // through `DecryptKeys::None`, since per-unit AACS decrypt is already
-    // exhaustively tested in `decrypt.rs` / `decrypting.rs`.
+    // ── Self-contained in-memory UDF fixture toolkit ──────────────────
+    // Modeled on the bluray.rs / dvd.rs fixtures: a `MemDisc` SectorSource
+    // backed by an absolute-LBA map; AACS tests use clear bytes.
 
     const PART_START: u32 = 2000;
 
@@ -2094,12 +1967,9 @@ mod tests {
         fn scrambled_vob(title_key: [u8; 5], marker: u8) -> (Vec<u8>, Vec<u8>) {
             let seed = [0x11u8, 0x22, 0x33, 0x44, marker];
             let mut plain = vec![0u8; 2048];
-            // The crack scan's hardened `is_scrambled_pack` gate requires the
-            // MPEG-PS pack-start signature before it will even ATTEMPT a key
-            // crack (see `css::is_scrambled_pack`) -- without it,
-            // `resolve_vts_key` silently falls back to `base_keys` for BOTH
-            // VTS groups regardless of which extents were gathered, masking
-            // this exact regression.
+            // The crack scan's `is_scrambled_pack` gate requires the MPEG-PS pack-
+            // start signature before attempting a crack; without it, `resolve_vts_key`
+            // falls back to `base_keys` for both groups, masking this regression.
             plain[0x00..0x04].copy_from_slice(&crate::css::PACK_START);
             // Pack start code: a real scrambled sector is an MPEG-2 PS pack, and
             // the descrambler requires it before trusting byte 0x14.
@@ -2142,10 +2012,8 @@ mod tests {
         let out = TmpDir::new("css_two_vts");
         let mut d = clear_disc();
         d.content_format = crate::disc::ContentFormat::MpegPs;
-        // Disc-wide key deliberately matches NEITHER VTS's real key: if the
-        // per-VTS group filter is broken and a crack attempt fails (or is
-        // skipped), falling back to this key must still mismatch, so the
-        // fallback path can never accidentally mask a broken filter.
+        // Disc-wide key deliberately matches NEITHER VTS's real key, so a
+        // broken filter falling back to it can never accidentally mask itself.
         d.css = Some(crate::css::CssState {
             title_key: [0xFFu8; 5],
             crack_span: None,
@@ -2202,10 +2070,8 @@ mod tests {
             lfsr::scramble_sector(&key_1, &mut scrambled);
             (plain, scrambled)
         };
-        // Scrambled — the pack header and the 0x14 flag are set, so the scan
-        // SEES ciphertext — but the cleartext region carries no periodic run,
-        // so the repeating crib the key recovery relies on never forms and no
-        // key is recoverable.
+        // Scrambled — pack header and 0x14 flag set, so the scan SEES ciphertext —
+        // but the cleartext region has no periodic run, so no key is recoverable.
         let uncrackable = {
             let mut sect = vec![0u8; 2048];
             sect[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
@@ -2322,10 +2188,8 @@ mod tests {
         // with sector_off > 0.
         const SECTORS_A: u32 = 1600;
         const LBA_A: u32 = 5000;
-        // The disc region immediately following extent A's true end. Must
-        // NEVER be read as part of extent A: sized to cover a full erroneous
-        // READ_BATCH_SECTORS second batch starting right after extent A's
-        // real tail.
+        // The disc region immediately following extent A's true end. Must NEVER
+        // be read as part of extent A: sized to cover a full erroneous second batch.
         const LBA_FILLER: u32 = LBA_A + SECTORS_A;
         const SECTORS_FILLER: u32 = 1472;
         // Extent B: the file's real second extent, at a completely different

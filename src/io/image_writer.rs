@@ -101,17 +101,9 @@ pub fn write_image(
         on_progress(written);
     }
 
-    // flush() only pushes the BufWriter's bytes into the kernel via write(2).
-    // It makes no durability promise at all, so returning Ok here would report
-    // a finished image while up to several gigabytes of it still sit in the
-    // page cache. A crash, a power loss, or yanking the removable/network
-    // volume the image was written to then leaves a truncated or empty file
-    // that the caller was told was complete.
-    //
-    // For a 6-90 GB image that is exactly the failure this crate treats as
-    // worst: success reported over wrong output. `into_inner` is used rather
-    // than `flush` so a buffered-write error is surfaced instead of being
-    // dropped on the floor by BufWriter's Drop.
+    // flush() only pushes bytes into the kernel via write(2), no durability promise —
+    // a crash or yanked volume could leave a truncated file reported as complete.
+    // `into_inner` (not `flush`) also surfaces buffered-write errors, not silently drop them.
     let file = out.into_inner().map_err(|e| Error::IoError {
         source: e.into_error(),
     })?;

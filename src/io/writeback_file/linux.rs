@@ -17,10 +17,9 @@ use std::time::Duration;
 /// Best-effort: a non-zero rc is logged but not propagated, since the
 /// caller would just continue with the unreserved file anyway.
 pub(super) fn preallocate(file: &File, size_bytes: u64) {
-    // FALLOC_FL_KEEP_SIZE = 0x01 — keep the reported file size at 0
-    // (writes grow it normally) while still pre-reserving the extents.
-    // Clamp to the signed `off_t` range; an unchecked `as i64` cast
-    // would wrap a >= 2^63 size to a negative length (EINVAL no-op).
+    // FALLOC_FL_KEEP_SIZE keeps the reported file size at 0 (writes grow it normally)
+    // while pre-reserving extents. Clamp to `off_t` range; an unchecked `as i64`
+    // cast would wrap a >= 2^63 size to a negative length (EINVAL no-op).
     let len = i64::try_from(size_bytes).unwrap_or(i64::MAX);
     let rc = unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len) };
     tracing::debug!(

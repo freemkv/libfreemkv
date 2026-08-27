@@ -56,12 +56,9 @@ impl SocketSink {
     /// `("host", 1234)`, a `SocketAddr`, etc.
     pub fn connect<A: ToSocketAddrs>(addr: A, sndbuf_bytes: Option<usize>) -> io::Result<Self> {
         let stream = TcpStream::connect(addr)?;
-        // `set_nodelay(true)` keeps small writes (TS packet trains, fMP4
-        // moof headers) from sitting in Nagle's algorithm until the buffer
-        // fills. The BufWriter already absorbs syscall overhead; Nagle
-        // would just add latency without coalescing more. It is a latency
-        // hint, not a correctness requirement, so a platform that rejects
-        // TCP_NODELAY must not fail the connect — demote the error.
+        // `set_nodelay(true)` keeps small writes (TS packet trains, fMP4 moof headers)
+        // from sitting in Nagle's algorithm; BufWriter already absorbs syscall overhead.
+        // A latency hint, not a correctness requirement — a rejecting platform must not fail connect.
         let _ = stream.set_nodelay(true);
         if let Some(n) = sndbuf_bytes {
             set_send_buffer(&stream, n)?;
@@ -119,10 +116,9 @@ impl UdpSocketSink {
     ///
     /// `sndbuf_bytes`, when present, is a hint to `SO_SNDBUF`.
     pub fn connect<A: ToSocketAddrs>(peer: A, sndbuf_bytes: Option<usize>) -> io::Result<Self> {
-        // Resolve the peer first so the local bind matches its address
-        // family. Binding `0.0.0.0:0` (IPv4) and then connecting to an
-        // IPv6 peer fails with EAFNOSUPPORT, so pick the wildcard that
-        // matches the resolved family.
+        // Resolve the peer first so the local bind matches its address family:
+        // binding `0.0.0.0:0` (IPv4) then connecting to an IPv6 peer fails
+        // with EAFNOSUPPORT.
         let peer_addr = peer
             .to_socket_addrs()?
             .next()
@@ -164,12 +160,9 @@ impl SequentialSink for UdpSocketSink {
     }
 }
 
-// ── Platform `SO_SNDBUF` tuning ────────────────────────────────────────────
-//
-// std's `TcpStream` / `UdpSocket` don't expose `SO_SNDBUF`. We drop to
-// libc on Linux + macOS (the libc-dep targets in Cargo.toml). On other
-// targets the hint is silently ignored — the socket still works, the
-// kernel just picks its own send-buffer size.
+// ── Platform `SO_SNDBUF` tuning ─────────────────────────────────────────
+// std doesn't expose `SO_SNDBUF`; drop to libc on Linux + macOS. Other
+// targets silently ignore the hint — socket still works, kernel picks its own size.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn set_send_buffer(stream: &TcpStream, bytes: usize) -> io::Result<()> {
@@ -185,10 +178,9 @@ fn set_udp_send_buffer(socket: &UdpSocket, bytes: usize) -> io::Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn set_send_buffer(_stream: &TcpStream, _bytes: usize) -> io::Result<()> {
-    // Non-Linux-non-macOS targets aren't in Cargo.toml's libc dep list;
-    // silently ignore the hint rather than failing the connect. Callers
-    // can detect via the lack of an explicit "sndbuf applied" signal
-    // (not provided, intentionally — this is a hint, not a guarantee).
+    // Non-Linux-non-macOS targets aren't in Cargo.toml's libc dep list; silently
+    // ignore the hint rather than failing the connect (intentionally no
+    // "sndbuf applied" signal — this is a hint, not a guarantee).
     Ok(())
 }
 
@@ -265,11 +257,9 @@ mod tests {
         });
         let mut sink = SocketSink::connect(addr, None).unwrap();
         _assert_seq(&mut sink);
-        // The negative is harder to assert directly (no `is_not<T>`),
-        // but `SocketSink` does not impl `Seek`, so it can't unify with
-        // `RandomAccessSink`'s super-bound. The Phase 2 blanket impl
-        // `impl<T: SequentialSink + Seek> RandomAccessSink for T {}` thus
-        // excludes it by construction.
+        // No `is_not<T>` to assert the negative directly, but `SocketSink` doesn't
+        // impl `Seek`, so it can't unify with `RandomAccessSink`'s super-bound —
+        // the blanket `impl<T: SequentialSink + Seek> RandomAccessSink for T {}` excludes it.
     }
 
     #[test]

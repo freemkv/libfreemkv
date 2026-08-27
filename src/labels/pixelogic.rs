@@ -111,11 +111,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // shortest meaningful run is 4 chars (lang + underscore).
     let strings = text::extract_ascii_strings(&data, 4);
 
-    // Tracked across all parse_token calls in this run: which uncatalogued
-    // token components did the blob contain? If any, we downgrade confidence
-    // to Medium — the labels are still valid but the disc surfaced something
-    // we don't catalogue — and report them once (see `UnknownParts`). Parsing
-    // is single-threaded and sequential, so a plain owned collector suffices.
+    // Collects uncatalogued token components; if any, confidence downgrades to Medium
+    // and they're reported once (see `UnknownParts`). Sequential parse, so a plain
+    // owned collector suffices.
     let mut unknown = UnknownParts::default();
 
     let labels = assign_labels(&strings, &mut unknown);
@@ -145,14 +143,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 /// from `parse` so the section/numbering logic is unit-testable without
 /// a `SectorSource`/`UdfFs`.
 fn assign_labels(strings: &[String], unknown: &mut UnknownParts) -> Vec<StreamLabel> {
-    // The authoritative per-feature stream list lives in the `FPL_`
-    // (FeaturePLaylist) section, in STN order. `SEG_*` entries are menu
-    // segments (intros, logos, disclaimers, previews) that can also carry
-    // stray stream tokens — e.g. a `SEG_MainFeature` preview segment that
-    // lists only a commentary track. Anchoring on such a segment grabs the
-    // wrong streams and misnumbers them. So when the project ships any
-    // `FPL_` playlist, anchor exclusively on it; only fall back to
-    // `SEG_MainFeature` on discs that have no `FPL_` section at all.
+    // The authoritative per-feature stream list lives in `FPL_` (FeaturePlaylist), in
+    // STN order. `SEG_*` menu segments can carry stray tokens, so anchor on `FPL_` when
+    // present; fall back to `SEG_MainFeature` only if no `FPL_` section exists.
     let has_fpl = strings.iter().any(|s| s.starts_with("FPL_"));
 
     let mut labels = Vec::new();
@@ -195,27 +188,9 @@ fn assign_labels(strings: &[String], unknown: &mut UnknownParts) -> Vec<StreamLa
             continue;
         }
 
-        // Second way a section ends, and the only one some discs give us.
-        //
-        // The `SEG_`/`SF_`/`FPL_` markers above are section NAMES, and not every
-        // section is named: a project's trailing sections (the per-language
-        // notice, disclaimer and dub-credit cards) are emitted with a plain
-        // clip name, or none at all. When the feature playlist is the last
-        // NAMED section in the blob — which it is on most of the corpus — the
-        // name-only rule never fires again and the walk swallows the whole
-        // tail of the file as if it were more of the feature's stream list.
-        // Those trailing clip names are per-language (`{lang3}_{card}`), so
-        // they pass `is_stream_token` and each one silently advances an STN
-        // counter; the ones whose card name collides with a catalogued
-        // component (an `AC` card reads as the AC-3 codec) even emit a label,
-        // for an STN slot the feature playlist does not have.
-        //
-        // What every section does have, named or not, is a stream list that
-        // OPENS with its video slots. So a `Video Stream N` entry that repeats
-        // one this section already listed cannot be another slot in this
-        // section — it is the first entry of the next one, and this section is
-        // over. Distinct video entries are kept (a section may legitimately
-        // list a secondary video stream alongside the primary).
+        // Second section-end signal (the only one some discs give): every section's stream
+        // list OPENS with its video slots, so a `Video Stream N` repeating one this section
+        // listed marks the next section's start. Guards against swallowing trailing cards.
         if s.starts_with("Video Stream") {
             if video_slots.contains(&s.as_str()) || video_slots.len() >= MAX_VIDEO_SLOTS {
                 break;
@@ -230,26 +205,9 @@ fn assign_labels(strings: &[String], unknown: &mut UnknownParts) -> Vec<StreamLa
             break;
         }
 
-        // Every entry in the section's stream list occupies one STN slot,
-        // whether or not it carries anything worth labelling. Pixelogic lists
-        // a slot as an editorial `{lang}_{codec|purpose|region}_…` token, or as
-        // a bare `Audio Stream N` / `PG Stream N` placeholder when no editorial
-        // label was authored. Both must advance the per-type counter, and so
-        // must an editorial token the grammar cannot classify — a
-        // region-only token (`fra_CF_`, `spa_LS_`: REGIONS sets `variant` but
-        // neither `is_audio` nor `is_subtitle`, so `parse_token_inner` returns
-        // `None`) or one whose only distinguishing component is uncatalogued
-        // (`jpn_DUB_`). Numbering only the slots that PARSE renumbers the rest
-        // 1..N and lands every surviving label on the wrong stream: on
-        // one observed UHD feature the seven `*_TXT_FOR_` forced tokens at PG
-        // STN 11-16/18 collapsed onto STN 2-8, flagging that disc's FULL
-        // subtitle tracks `forced` and leaving the real forced-narrative
-        // tracks unflagged.
-        //
-        // A slot the grammar cannot classify carries no stream type either, so
-        // it advances the list currently being enumerated: pixelogic sections
-        // run video → audio → PG, and `domain` follows the last slot whose type
-        // WAS known (a typed token or a typed placeholder), starting at Audio.
+        // Every stream-list entry occupies one STN slot (editorial token, bare placeholder,
+        // or unclassifiable token) and ALL must advance the per-type counter, else labels
+        // renumber onto wrong streams. Unclassifiable slots follow `domain` (video→audio→PG).
         if let Some(kind) = placeholder_kind(s) {
             domain = kind;
             match kind {
@@ -369,12 +327,9 @@ fn parse_token_inner(s: &str, mut unknown: Option<&mut UnknownParts>) -> Option<
         if raw_part.is_empty() {
             continue;
         }
-        // Token components are spec-uppercase (codec IDs, ADES/ACOM/SDH,
-        // region codes). vocab elsewhere is deliberately case-insensitive,
-        // so normalize each component to uppercase before the gate to
-        // avoid silently dropping a lowercase-authored token (which would
-        // fall through to the unknown branch and, with no is_audio/
-        // is_subtitle set, get the whole stream discarded below).
+        // Token components are spec-uppercase (codec IDs, ADES/ACOM/SDH, region codes).
+        // Normalize each to uppercase before the gate so a lowercase-authored token isn't
+        // silently dropped through the unknown branch (no is_audio/is_subtitle set).
         let part_up = raw_part.to_ascii_uppercase();
         let part = part_up.as_str();
         if AUDIO_CODECS.contains(&part) {
@@ -399,37 +354,15 @@ fn parse_token_inner(s: &str, mut unknown: Option<&mut UnknownParts>) -> Option<
         } else if part == "STRI" || part == "TXT" {
             is_subtitle = true;
         } else if part == "FOR" {
-            // `FOR` (forced) is a subtitle-domain qualifier. A token whose
-            // only non-language component is FOR (e.g. `eng_FOR_`) would
-            // otherwise classify as neither audio nor subtitle and be
-            // dropped at the `!is_audio && !is_subtitle` guard below. Treat
-            // a forced marker as a subtitle signal so the stream survives.
+            // `FOR` (forced) is a subtitle-domain qualifier. Treat it as a subtitle signal
+            // so a token whose only non-language component is FOR (e.g. `eng_FOR_`) isn't
+            // dropped at the `!is_audio && !is_subtitle` guard below.
             qualifier = LabelQualifier::Forced;
             is_subtitle = true;
         } else if part == "DUB" {
-            // `DUB` names the forced-narrative subtitle track authored to
-            // accompany that language's DUBBED audio presentation — the
-            // signs/on-screen-text pass a viewer needs when the dialogue is
-            // already dubbed. Same editorial class as `*_TXT_FOR_`, spelled
-            // differently by some authoring runs.
-            //
-            // Evidence (two independent discs in the corpus): the token
-            // appears only inside the PG list, embedded in an otherwise
-            // contiguous run of `{lang}[_{region}]_TXT_FOR_` siblings — one
-            // forced-narrative slot per localized language — and takes the
-            // slot where that language's forced entry belongs. The stream it
-            // lands on is a sparse PG track (sub-megabyte, a few dozen
-            // display sets), the signature of a forced-narrative pass rather
-            // than a full subtitle track.
-            //
-            // Deliberately NOT added to `vocab::qualifier`: that maps
-            // free-form ENGLISH label text, where a bare word "dub" means
-            // dubbed AUDIO. The forced-subtitle reading is specific to this
-            // vendor's token grammar, so it stays token-local here.
-            //
-            // Like `FOR`, this is a subtitle-domain signal: a token whose
-            // only non-language component is `DUB` must still classify as a
-            // subtitle or the `!is_audio && !is_subtitle` guard drops it.
+            // `DUB` = forced-narrative subtitle for a language's dubbed audio (same class as
+            // `*_TXT_FOR_`). Token-local, NOT in `vocab::qualifier` (English "dub" = dubbed
+            // AUDIO). Like FOR, a subtitle-domain signal so the guard keeps the stream.
             qualifier = LabelQualifier::Forced;
             is_subtitle = true;
         } else if REGIONS.contains(&part) {
@@ -437,14 +370,9 @@ fn parse_token_inner(s: &str, mut unknown: Option<&mut UnknownParts>) -> Option<
         } else if part.starts_with("PGSTREAM") {
             is_subtitle = true;
         } else {
-            // Unknown token component — skip this single part rather
-            // than discarding the entire stream record. Pre-refactor
-            // behavior was `return None` here, which silently dropped
-            // any stream containing a single uncatalogued token (e.g.
-            // a new codec ID or framework variant). Better to surface
-            // what we know than discard a whole stream over one part,
-            // but flag the parse as Medium-confidence so callers know
-            // some data was elided.
+            // Unknown token component — skip this single part rather than discarding the
+            // whole stream record (pre-refactor `return None` dropped streams over one
+            // uncatalogued token). Recorded so the parse downgrades to Medium confidence.
             tracing::debug!(part = ?part, "pixelogic: unrecognized token component, skipping");
             if let Some(acc) = unknown.as_deref_mut() {
                 acc.record(part);
@@ -456,12 +384,9 @@ fn parse_token_inner(s: &str, mut unknown: Option<&mut UnknownParts>) -> Option<
         return None;
     }
 
-    // Tie-break for tokens that signal both domains (e.g. `eng_MLP_SDH_`
-    // sets is_audio via the codec and is_subtitle via SDH). An audio
-    // codec hint is the stronger, audio-domain signal, so prefer Audio
-    // when one is present (keeps the parsed codec_hint instead of
-    // discarding it); otherwise file as Subtitle. Pure-subtitle and
-    // pure-audio tokens are unaffected.
+    // Tie-break for tokens signalling both domains (e.g. `eng_MLP_SDH_`: is_audio via codec,
+    // is_subtitle via SDH). An audio codec is the stronger signal, so prefer Audio when
+    // present (keeps codec_hint); otherwise Subtitle. Pure tokens are unaffected.
     let has_audio_codec = is_audio && !codec.is_empty();
     let stream_type = if is_subtitle && !has_audio_codec {
         StreamLabelType::Subtitle
@@ -628,11 +553,9 @@ mod tests {
 
     #[test]
     fn parse_token_components_are_case_insensitive() {
-        // Regression for the case-sensitive gate: a lowercase codec/
-        // qualifier component must classify identically to uppercase
-        // rather than falling through to the unknown branch and getting
-        // the whole stream dropped. The ISO 639-2 lang prefix is still
-        // required lowercase.
+        // Regression for the case-sensitive gate: a lowercase codec/qualifier component must
+        // classify identically to uppercase, not fall through to the unknown branch and drop
+        // the stream. The ISO 639-2 lang prefix is still required lowercase.
         let l = parse_token_inner("eng_mlp_", None).unwrap();
         assert_eq!(l.stream_type, StreamLabelType::Audio);
         assert_eq!(l.codec_hint, "TrueHD");
@@ -657,11 +580,9 @@ mod tests {
 
     #[test]
     fn assign_labels_numbers_commentary_behind_placeholders() {
-        // Observed case: the FPL_MainFeature playlist lists three unlabelled main
-        // audio tracks as `Audio Stream N` placeholders, then a lone
-        // `eng_ACOM_` commentary at STN slot 4. The commentary must land on
-        // audio #4, not collapse onto #1 (which would tag the main feature
-        // track as commentary).
+        // Observed case: FPL_MainFeature lists three unlabelled `Audio Stream N`
+        // placeholders, then a lone `eng_ACOM_` commentary at STN slot 4. It must land on
+        // audio #4, not collapse onto #1 (which would tag the main track as commentary).
         let mut flag = UnknownParts::default();
         let tokens = strs(&[
             "FPL_MainFeature",
@@ -763,10 +684,9 @@ mod tests {
 
     #[test]
     fn assign_labels_prefers_fpl_over_seg_mainfeature() {
-        // A `SEG_MainFeature` menu/preview segment carries a stray commentary
-        // token, but the real playlist is `FPL_MainFeature`. When an FPL_
-        // section exists, the SEG_ one must be ignored as an anchor — so we
-        // number from the FPL playlist, putting the commentary at slot 2.
+        // A `SEG_MainFeature` segment carries a stray commentary token, but the real
+        // playlist is `FPL_MainFeature`. When an FPL_ section exists the SEG_ one is ignored
+        // as anchor, so numbering comes from the FPL playlist (commentary at slot 2).
         let mut flag = UnknownParts::default();
         let tokens = strs(&[
             "SEG_MainFeature",
@@ -907,8 +827,8 @@ mod tests {
     }
 
     /// Spec: is_audio wins over is_subtitle when codec explicitly identified.
-    /// Tests the commentary audio case — `ACOM` sets both is_audio purpose and SDH-only-is-subtitle:
-    /// MLP codec wins → Audio.
+    /// `SDH` alone would suggest a subtitle, but an explicit `AC3` codec token
+    /// wins the tiebreak → Audio.
     /// Mutation: flip the tie-break → Subtitle returned when codec present.
     #[test]
     fn parse_token_codec_always_wins_type_tiebreak() {
@@ -1074,12 +994,9 @@ mod tests {
             ],
             "only the feature playlist's own slots are labelled"
         );
-        // A card's name is emitted BEFORE its own section's video slot, so a
-        // forward-only walk meets the first one while still nominally inside
-        // the feature section and counts it. That residue is one entry, at the
-        // tail of a list nothing follows in — it cannot renumber any label,
-        // only cost the parse its High confidence. Every card behind it is
-        // past the boundary and never seen. Pinned rather than papered over.
+        // A card's name is emitted BEFORE its section's video slot, so a forward-only walk
+        // counts the first one while still nominally inside the feature section. That lone
+        // tail entry can't renumber any label, only cost High confidence. Pinned, not hidden.
         assert_eq!(
             flag.seen.iter().map(String::as_str).collect::<Vec<_>>(),
             vec!["WARNING"],

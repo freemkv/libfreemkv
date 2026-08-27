@@ -55,10 +55,9 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
         0
     };
 
-    // Parse ProgramInfo (per-stream language + codec). Best-effort:
-    // malformed program_info doesn't fail the parse, just gives an
-    // empty streams list. EP map is unaffected — sector-range lookups
-    // continue to work.
+    // Parse ProgramInfo (per-stream language + codec), best-effort: malformed
+    // program_info doesn't fail the parse, just yields an empty streams list.
+    // EP map is unaffected — sector-range lookups still work.
     let streams = if prog_info_start > 0 && prog_info_start + 6 < data.len() {
         parse_program_info(&data[prog_info_start..])
     } else {
@@ -172,16 +171,9 @@ mod tests {
     /// Build a minimal CLPI binary.
     /// `cpi_data` is the raw CPI section bytes (starting with the 4-byte CPI length).
     fn build_clpi(source_packet_count: u32, cpi_data: Option<&[u8]>) -> Vec<u8> {
-        // We need at least 60 bytes for the header area.
-        // Offsets:
-        //   0..4:   "HDMV"
-        //   4..8:   "0200"
-        //   8..12:  seq_info_start (unused, set to 0)
-        //   12..16: prog_info_start (unused, set to 0)
-        //   16..20: cpi_start
-        //   20..40: reserved/padding
-        //   40..56: ClipInfo section area (length + stuff before source_packet_count)
-        //   56..60: source_packet_count
+        // Need at least 60 bytes for the header area: "HDMV"/"0200" magic,
+        // seq_info_start/prog_info_start (unused here), cpi_start, reserved
+        // padding, then the ClipInfo section ending in source_packet_count.
 
         let cpi_start: u32 = if cpi_data.is_some() { 60 } else { 0 };
 

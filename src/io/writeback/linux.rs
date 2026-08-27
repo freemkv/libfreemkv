@@ -179,18 +179,16 @@ impl WritebackPipeline {
         if pos < self.last_flush_pos.saturating_add(self.chunk_bytes) {
             return;
         }
-        // Byte offsets are unsigned throughout; the signed cast happens
-        // only at the libc call boundary where the kernel ABI requires
-        // `i64`. `saturating_sub` documents and hardens the line-above
-        // guard that `pos >= last_flush_pos`.
+        // Byte offsets are unsigned throughout; the signed cast happens only at the
+        // libc call boundary where the kernel ABI requires `i64`. `saturating_sub`
+        // hardens the line-above guard that `pos >= last_flush_pos`.
         let chunk_off: u64 = self.last_flush_pos;
         let chunk_len: u64 = pos.saturating_sub(self.last_flush_pos);
         let mut wait_ms: u64 = 0;
         let mut fadvise_ms: u64 = 0;
-        // Async kickoff for the just-completed chunk runs on every
-        // path (NFS, degraded, normal) — it's nominally non-blocking
-        // by spec and gives the kernel an early hint that this range
-        // is ready to flush.
+        // Async kickoff for the just-completed chunk runs on every path (NFS,
+        // degraded, normal) — non-blocking by spec, an early hint that this
+        // range is ready to flush.
         let kickoff_rc = unsafe {
             libc::sync_file_range(
                 self.fd,
@@ -211,16 +209,13 @@ impl WritebackPipeline {
         }
         if let Some((prev_off, prev_len)) = self.pending.take() {
             if self.skip_wait() {
-                // NFS branch (or degraded fallback after a prior
-                // timeout): the WAIT_AFTER + DONTNEED dance is what
-                // hangs on NFS — skip it. We still advance `pending`
-                // so the next call has a stable cycle.
+                // NFS branch (or degraded fallback after a prior timeout): the
+                // WAIT_AFTER + DONTNEED dance hangs on NFS — skip it, but still
+                // advance `pending` so the next call has a stable cycle.
             } else {
-                // Normal local-storage branch with belt-and-braces
-                // timeout. If WAIT_AFTER hangs > WAIT_AFTER_TIMEOUT
-                // we mark the pipeline degraded, log a loud error,
-                // and fall through to the skip path on subsequent
-                // calls.
+                // Normal local-storage branch with belt-and-braces timeout: if
+                // WAIT_AFTER hangs > WAIT_AFTER_TIMEOUT, mark degraded, log loudly,
+                // and fall through to the skip path on subsequent calls.
                 match wait_after_with_timeout(self.clone_for_worker(), self.fd, prev_off, prev_len)
                 {
                     Some(ms) => {
@@ -238,17 +233,13 @@ impl WritebackPipeline {
                         self.record_wait(wait_ms);
                     }
                     None => {
-                        // Timeout branch: switch to NFS-style skip
-                        // for the rest of the pipeline's life. Do
-                        // NOT call DONTNEED — if WAIT_AFTER hasn't
+                        // Timeout branch: switch to NFS-style skip for the rest of the
+                        // pipeline's life. Do NOT call DONTNEED — if WAIT_AFTER hasn't
                         // returned, the pages aren't safely flushed.
                         self.degraded.store(true, Ordering::Relaxed);
-                        // Once degraded we skip DONTNEED, so every subsequent
-                        // chunk's pages stay resident until close — the same
-                        // page-cache exposure profile as NFS. Shrink to the
-                        // floor so that exposure window is as small as the NFS
-                        // path keeps it, instead of whatever the adaptive sizing
-                        // had grown chunk_bytes to (up to 256 MiB).
+                        // Skipping DONTNEED leaves pages resident until close (same
+                        // exposure as NFS), so shrink chunk_bytes to the floor rather
+                        // than whatever adaptive sizing had grown it to (up to 256 MiB).
                         self.chunk_bytes = CHUNK_BYTES_MIN;
                         tracing::error!(
                             target: "mux",
@@ -294,10 +285,9 @@ impl WritebackPipeline {
         if self.wait_after_window.len() < ADAPTIVE_WINDOW {
             return;
         }
-        // p95 index, derived from the window size so it stays valid if
-        // ADAPTIVE_WINDOW changes (a hard-coded `[14]` would panic OOB
-        // for a window <= 14). For the default 16 this is index 15
-        // (ceil(16 * 95 / 100) - 1 = 15), i.e. the top sample.
+        // p95 index, derived from window size so it stays valid if ADAPTIVE_WINDOW
+        // changes (a hard-coded `[14]` would panic OOB for a window <= 14). For the
+        // default 16 this is index 15, i.e. the top sample.
         let mut sorted: Vec<u64> = self.wait_after_window.iter().copied().collect();
         sorted.sort_unstable();
         let p95_idx = (ADAPTIVE_WINDOW * 95).div_ceil(100).min(ADAPTIVE_WINDOW) - 1;
@@ -442,10 +432,8 @@ fn wait_after_with_timeout(
         Err(crate::io::bounded::BoundedError::Timeout)
         | Err(crate::io::bounded::BoundedError::Halted) => None,
         Err(crate::io::bounded::BoundedError::WorkerLost) => {
-            // Worker thread spawn failed or panicked before sending.
-            // Treat as a benign success (no syscall ran) rather than
-            // a degrade trigger — falling through with elapsed_ms=0
-            // matches the no-op behaviour.
+            // Worker thread spawn failed or panicked before sending. Treat as benign
+            // success (no syscall ran), not a degrade trigger — elapsed_ms=0 matches no-op.
             Some(0)
         }
     }

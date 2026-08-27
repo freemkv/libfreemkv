@@ -292,10 +292,9 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
         }
         .into());
     }
-    // A bare IPv6 literal ("::1", "2001:db8::1") contains ':' yet has no port,
-    // so the simple `contains(':')` check would wrongly pass it and TcpListener
-    // would later return an untyped io::Error. Treat anything that parses as a
-    // bare IpAddr (v4 or v6) as port-less.
+    // A bare IPv6 literal ("::1") contains ':' but has no port, so the plain
+    // `contains(':')` check would wrongly pass it and yield an untyped
+    // io::Error later; treat anything parsing as IpAddr as port-less.
     if addr.parse::<std::net::IpAddr>().is_ok() {
         return Err(crate::error::Error::StreamUrlMissingPort {
             addr: addr.to_string(),
@@ -308,10 +307,9 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
         }
         .into());
     }
-    // Split host:port on the LAST ':' so a bracketed IPv6 literal
-    // (`[2001:db8::1]:9000`) splits at the port colon, not an address colon.
-    // Require the port substring to be a non-empty u16 — `host:` (empty) and
-    // `host:abc` (non-numeric) are invalid, despite containing ':'.
+    // Split on the LAST ':' so a bracketed IPv6 literal (`[::1]:9000`) splits
+    // at the port colon, not an address colon. Port must be a non-empty u16 —
+    // `host:` and `host:abc` are invalid despite containing ':'.
     let port = match addr.rsplit_once(':') {
         Some((_host, port)) => port,
         None => {
@@ -379,17 +377,14 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         StreamUrl::Disc { .. } => {
             // Disc sources require live SCSI state — caller must use
             // `Drive::open() + Disc::scan() + DiscStream::new()` directly.
-            // Surfaced as a typed error (no English commentary in the
-            // library; the CLI/UI explains the right entry point).
+            // Typed error only; the CLI/UI explains the entry point.
             Err(crate::error::Error::DiscUrlNotDirect.into())
         }
         StreamUrl::Iso { ref path } => {
             validate_file_path(path, "iso")?;
-            // FileSectorSource is the sole file-backed sector source.
-            // It carries the platform-tuned SEQUENTIAL fadvise hint
-            // (so the kernel readahead window widens) and the periodic
-            // DONTNEED page-cache eviction that bounds memory pressure
-            // when the mux output is being written to the same disk.
+            // Sole file-backed sector source: carries the platform SEQUENTIAL
+            // fadvise hint (widens kernel readahead) plus periodic DONTNEED
+            // eviction bounding memory pressure during same-disk mux output.
             let reader = crate::io::file_sector_source::FileSectorSource::open(path)?;
             let probe_path = path.clone();
             let stream = image_input(
@@ -400,13 +395,9 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             )?;
             Ok(Box::new(stream))
         }
-        // `dir://` as a SOURCE: an extracted disc folder, presented as a
-        // synthetic UDF image (`crate::dirimage`). It reaches EXACTLY the same
-        // body as `iso://` above — scan, title select, key resolution, mux —
-        // because by the time `DirImage` exists it is just another
-        // `SectorSource`. That is the point of synthesizing a real filesystem
-        // rather than faking a tree: every destination follows for free, with
-        // no per-scheme mux path to keep in step.
+        // `dir://` as a SOURCE: an extracted disc folder presented as a
+        // synthetic UDF image (`crate::dirimage`), reaching the exact same
+        // body as `iso://` since `DirImage` is just another `SectorSource`.
         StreamUrl::Dir { ref path } => {
             validate_file_path(path, "dir")?;
             let reader = crate::dirimage::DirImage::open(path)?;
@@ -501,15 +492,9 @@ where
         disc.decrypt_with(crate::disc::Key::Unit(opts.unit_keys.clone()), &[])
             .map_err(|e| -> io::Error { e.into() })?;
     }
-    // Pre-flight decrypt gate (the single, system-wide verdict — see
-    // `Disc::ensure_decryptable`). Fails fast BEFORE any mux work when
-    // decryption is needed and unavailable: a scrambled-but-uncracked
-    // CSS disc (`css_error` set), or an AACS-encrypted disc with no
-    // usable key (would mux ~100 MB of garbage — encrypted m2ts → no TS
-    // syncs → demuxer emits nothing → empty/garbage output at exit 0).
-    // `--raw` and unencrypted/CSS-keyless-success discs pass. This is the
-    // disc-wide check; the per-title (multi-VTS CSS) check is below, once
-    // the chosen title's key is resolved.
+    // Pre-flight decrypt gate (see `Disc::ensure_decryptable`): fails fast
+    // on a scrambled-but-uncracked CSS disc or keyless AACS disc (else
+    // muxes garbage). Disc-wide only; per-title CSS check is below.
     disc.ensure_decryptable(opts.raw)
         .map_err(|e| -> io::Error { e.into() })?;
     if disc.titles.is_empty() {
@@ -523,60 +508,41 @@ where
         }
         .into());
     }
-    // Prune to the selected audio/subtitle streams now, on the scanned
-    // (pre-`probe_and_remap`) title, so everything downstream — the
-    // TrueHD channel-correction probe, the final title clone, and
-    // `build_iso_pipeline`'s demux/track construction — sees the pruned
-    // list. Video is always kept; a no-op for the default All/All.
+    // Prune to selected audio/subtitle streams now, pre-`probe_and_remap`,
+    // so all downstream consumers (TrueHD probe, title clone,
+    // `build_iso_pipeline`) see the pruned list. Video always kept.
     opts.selection
         .apply(&mut disc.titles[idx])
         .map_err(|e| -> io::Error { e.into() })?;
-    // Per-title key resolution. DVD CSS is resolved at exactly ONE site —
-    // `build_iso_pipeline`'s per-title crack (below), which decrypts a
-    // crackable title, passes a genuinely-clear one through, and
-    // hard-fails an uncrackable one with CssKeyMissing. So for a DVD we do
-    // NOT pre-crack here: pass `None` and let the pipeline own it.
-    // Pre-cracking would re-open the ISO and re-scan every clear title
-    // (`decrypt_keys_for_title` → None → the pipeline re-cracks anyway).
-    // AACS / unencrypted resolve from `decrypt_keys()` with NO read; `--raw`
-    // (any format) is deliberate ciphertext passthrough — also `None`.
+    // DVD CSS resolves at exactly one site, `build_iso_pipeline`'s per-title
+    // crack below, so a DVD passes `None` here. AACS/unencrypted resolve
+    // via `decrypt_keys()`; `--raw` is deliberate passthrough — also `None`.
     let is_dvd = disc.format == crate::disc::DiscFormat::Dvd;
     let (keys, title_is_clear) = if opts.raw || is_dvd {
         (crate::decrypt::DecryptKeys::None, false)
     } else {
         (disc.decrypt_keys(), false)
     };
-    // Decrypt gate for the AACS / non-DVD path: a None key means no usable
-    // disc key, which would mux scrambled ciphertext verbatim — fail loudly
-    // (NoDiscKey). The DVD path is gated inside `build_iso_pipeline` (its
-    // CSS hard-fail), and `--raw` passes.
+    // Decrypt gate for AACS/non-DVD: a None key means no usable disc key,
+    // which would mux ciphertext verbatim — fail loudly (NoDiscKey). DVD
+    // is gated inside `build_iso_pipeline`'s CSS hard-fail; `--raw` passes.
     if !is_dvd {
         disc.ensure_title_decryptable(opts.raw, &keys, title_is_clear)
             .map_err(|e| -> io::Error { e.into() })?;
     }
-    // FMTS (AACS 2.1) forensic segments are sourced + fail-loud-checked
-    // downstream by `resolve_mux_key_map`/`resolve_fmts_key_map`, which hold
-    // the key-fetch closure and can actually attempt resolution. (An older
-    // upfront blanket-reject gate lived here; it predated the resolver and
-    // rejected every 2.1 disc before a source could be tried.)
-    // Correct TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1)
-    // by probing the first DECRYPTED access units of the chosen title.
-    // A fresh reader avoids disturbing the mux reader below. Skipped in
-    // --raw mode: the probe would re-open + decrypt for nothing (on an
-    // AACS disc with no key the correction is a no-op on ciphertext, and
-    // raw output isn't decoded anyway).
+    // FMTS (AACS 2.1) segments are sourced + checked downstream by
+    // `resolve_mux_key_map`/`resolve_fmts_key_map`, which hold the
+    // key-fetch closure and can actually attempt resolution.
+
+    // Correct TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1) by
+    // probing decrypted access units via a fresh reader; skipped in --raw
+    // since the probe would re-open + decrypt for nothing.
     if !opts.raw {
         match reopen() {
             Some(mut probe) => {
-                // The probe DECRYPTS the title head, so it needs the SAME
-                // up-front key map the mux read installs below. An AACS
-                // `DecryptingSectorSource` with no map fails loud on the
-                // first unit (`decrypt_sectors_mapped` is the only AACS
-                // decrypt path) — without resolving one here the correction
-                // is silently skipped on every AACS disc and 7.1/Atmos stays
-                // understated as the MPLS-declared 5.1. Resolution failure is
-                // non-fatal (`.ok()`): leave channels uncorrected, never
-                // fail the mux.
+                // The probe decrypts the title head, so it needs the same
+                // key map the mux read installs below, or an AACS source
+                // fails loud on the first unit. `.ok()`: non-fatal.
                 let mut probe_keys = keys.clone();
                 let probe_title = disc.titles[idx].clone();
                 let probe_map = match &probe_keys {
@@ -586,8 +552,7 @@ where
                         &mut probe_keys,
                         opts.key_fetch.as_ref(),
                         disc.content_format,
-                        // File-backed, bounded probe (best-effort `.ok()`);
-                        // no live drive to protect from a stuck stop here.
+                        // Bounded, file-backed probe; no live drive here.
                         None,
                     )
                     .ok()
@@ -601,9 +566,8 @@ where
                 crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]);
             }
             None => {
-                // Non-fatal: a failed re-open just leaves MPLS 7.1/Atmos
-                // channel counts uncorrected (understated as 5.1). Log so
-                // the uncorrected path is diagnosable rather than silent.
+                // Non-fatal: a failed re-open leaves MPLS 7.1/Atmos counts
+                // uncorrected (as 5.1). Log so it's diagnosable, not silent.
                 tracing::debug!(
                     target: "mux",
                     "TrueHD channel-correction probe re-open failed"
@@ -613,26 +577,21 @@ where
     }
     let title = disc.titles[idx].clone();
     let format = disc.content_format;
-    // ISO file: 8192-sector batch (16 MiB at 2048 B/sector) —
-    // sequential read from fast storage, no bad sectors. Empirically
-    // optimal; bumping to 16384 sectors (32 MiB) regressed (more cache
-    // pressure, longer per-batch latency starves the consumer between
-    // iterations). Physical drives keep smaller batches for adaptive
-    // error handling.
+    // ISO file: 8192-sector batch (16 MiB) — sequential read from fast
+    // storage, no bad sectors. Empirically optimal; 16384 sectors regressed
+    // (more cache pressure, longer per-batch latency starves the consumer).
     const ISO_MUX_BATCH_SECTORS: u16 = 8192;
 
-    // Pass `DecryptKeys::None` to the decrypt decorator when
-    // --raw is set — the read stack still flows through the
-    // same producer+demux+parse pipeline, just without the
-    // AACS / CSS step. Single highway for all ISO reads.
+    // Pass `DecryptKeys::None` to the decrypt decorator when --raw is set —
+    // the read stack still flows through the same producer+demux+parse
+    // pipeline, just without the AACS/CSS step. One highway for ISO reads.
     let effective_keys = if opts.raw {
         crate::decrypt::DecryptKeys::None
     } else {
         keys
     };
-    // Install the shared fetch closure (if the app supplied one) so a
-    // unit no held key decrypts is re-tried via the app's key source.
-    // Suppressed in --raw (no decrypt step to recover).
+    // Install the shared fetch closure (if supplied) so a unit no held key
+    // decrypts is re-tried via the app's key source. Suppressed in --raw.
     let fetch = if opts.raw {
         None
     } else {
@@ -670,13 +629,9 @@ pub fn output(
     match parsed {
         StreamUrl::Mkv { ref path } => {
             validate_file_path(path, "mkv")?;
-            // Wrap the output in `crate::io::WritebackFile` (bounded-cache
-            // writeback) so a UHD-scale MKV mux to slow / network-attached
-            // staging doesn't hit the dirty-page burst pathology that
-            // sweep already side-steps. BufWriter sits on top to coalesce
-            // mux's many small EBML element writes. Pre-reserve the
-            // target's worth of extents on Linux via fallocate(KEEP_SIZE)
-            // to reduce extent fragmentation during the mux.
+            // Wrap in `WritebackFile` (bounded-cache) so a UHD mux to slow/
+            // network staging avoids dirty-page bursts. BufWriter coalesces
+            // small EBML writes; Linux fallocate(KEEP_SIZE) cuts fragmentation.
             let writer: Box<dyn super::WriteSeek + Send> =
                 Box::new(std::io::BufWriter::with_capacity(
                     IO_BUF_SIZE,
@@ -686,10 +641,9 @@ pub fn output(
         }
         StreamUrl::Mp4 { ref path } => {
             validate_file_path(path, "mp4")?;
-            // Bounded-cache writeback (like mkv://) so a UHD-scale mux to slow /
-            // network-attached staging doesn't hit the dirty-page burst
-            // pathology; the mdat backpatch is an ordinary seek WritebackFile
-            // handles. BufWriter coalesces the many small moov box-header writes.
+            // Bounded-cache writeback (like mkv://) avoids dirty-page bursts
+            // on slow/network staging; the mdat backpatch is an ordinary
+            // seek WritebackFile handles. BufWriter coalesces moov writes.
             let writer = std::io::BufWriter::with_capacity(
                 IO_BUF_SIZE,
                 crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
@@ -705,13 +659,9 @@ pub fn output(
             Ok(Box::new(M2tsStream::create(writer, title)?))
         }
         StreamUrl::Network { ref addr } => {
-            // Format-validate, then connect. `NetworkStream::connect`
-            // re-resolves the host and refuses any address that is
-            // loopback / private / link-local / multicast — this is the
-            // SSRF / DNS-rebinding guard, applied at the actual connect
-            // (not just at settings-save time). It is deliberately NOT in
-            // `validate_network_addr`, which is shared with the listen
-            // (receiver) path where binding loopback is legitimate.
+            // `NetworkStream::connect` re-resolves the host and refuses
+            // loopback/private/link-local/multicast — the SSRF/rebinding
+            // guard, not in `validate_network_addr` (shared with listen).
             validate_network_addr(addr)?;
             Ok(Box::new(NetworkStream::connect(addr)?.meta(title)))
         }
@@ -719,22 +669,18 @@ pub fn output(
         StreamUrl::Null => Ok(Box::new(NullStream::new(title))),
         StreamUrl::Disc { .. } => Err(crate::error::Error::StreamReadOnly.into()),
         StreamUrl::Iso { .. } => Err(crate::error::Error::StreamReadOnly.into()),
-        // `dir://` is NOT a PES sink — it writes raw decrypted files, not muxed
-        // frames. A stray `dir://` routed into the mux/PES path fails loudly,
-        // exactly the category the crate already rejects for `iso://`. The CLI
-        // routes a `dir://` dest to `Disc::extract_tree` before reaching here.
+        // `dir://` is NOT a PES sink — it writes raw decrypted files, not
+        // muxed frames. A stray `dir://` here fails loudly, like `iso://`.
+        // The CLI routes a `dir://` dest to `Disc::extract_tree` first.
         StreamUrl::Dir { .. } => Err(crate::error::Error::StreamReadOnly.into()),
         // `demux://` with default options. The CLI constructs `DemuxSink`
-        // directly (with parsed flags) before reaching here, mirroring how a
-        // `dir://` dest is special-cased; this arm covers the bare
-        // `output()` call with the default option set.
+        // directly (with parsed flags) before reaching here; this arm
+        // covers the bare `output()` call with the default option set.
         StreamUrl::Demux { ref dir } => {
             validate_file_path(dir, "demux")?;
-            // The full `--demux/--naming/--delay/--container/--chapters` flag
-            // surface is parsed in the CLI, which constructs `DemuxSink` directly.
-            // This bare `output()` arm uses defaults but still seeds the filename
-            // `base` from the title's playlist name when present (the default
-            // "title" stem is only a last resort for an unnamed title).
+            // Full `--demux/--naming/--delay/--container/--chapters` flags
+            // are parsed in the CLI, which builds `DemuxSink` directly. This
+            // bare arm uses defaults but seeds `base` from the playlist name.
             let mut opts = super::demux_sink::DemuxOptions::default();
             if !title.playlist.is_empty() {
                 opts.base = title.playlist.clone();
@@ -743,10 +689,9 @@ pub fn output(
                 dir, title, &opts,
             )?))
         }
-        // `video://`, `audio://`, and `sub://` are `demux://` restricted to one
-        // track class — video as native elementary streams, audio in native
-        // containers, or subtitles as `.sup`/`.idx+.sub`/`.srt`. No chapters
-        // sidecar (that's a `demux://` / `chapters://` concern).
+        // `video://`, `audio://`, `sub://` are `demux://` restricted to one
+        // track class. No chapters sidecar (that's a `demux://`/`chapters://`
+        // concern).
         StreamUrl::Video { ref dir }
         | StreamUrl::Audio { ref dir }
         | StreamUrl::Sub { ref dir } => {
@@ -769,13 +714,8 @@ pub fn output(
             )?))
         }
         // `fvi://` writes the per-picture video index (`docs/FVI_FORMAT.md`).
-        // The header's `source` object describes the INPUT, so it comes from the
-        // caller-supplied `source` — never from `path`, which is the destination
-        // this sink writes. Passing the destination here made every index name
-        // itself as its own source AND made the output non-reproducible (two
-        // machines indexing identical bytes emitted different files purely from
-        // where they wrote). `None` → the neutral defaults; the optional members
-        // are omitted rather than guessed.
+        // The header's `source` describes the INPUT, from caller-supplied
+        // `source` — never `path`, which previously broke reproducibility.
         StreamUrl::Fvi { ref path } => {
             validate_file_path(path, "fvi")?;
             Ok(Box::new(super::fvi_sink::FviSink::create(
@@ -784,7 +724,7 @@ pub fn output(
                 source.cloned().unwrap_or_default(),
             )?))
         }
-        // `chapters://` and `json://` write the title metadata at construction and
+        // `chapters://`/`json://` write title metadata at construction and
         // ignore the PES stream (see `meta_sink`).
         StreamUrl::Chapters { ref path } => {
             validate_file_path(path, "chapters")?;
@@ -829,9 +769,8 @@ pub(crate) fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> Dem
         pid_to_track.push((pid, idx));
         let is_dvd_ps = matches!(format, ContentFormat::MpegPs);
         // The Blu-ray 3D MVC dependent (right-eye) view uses a param-set-
-        // passthrough H.264 parser so each frame is a self-contained dependent
-        // access unit for a BlockAdditional; every other stream uses the
-        // ordinary parser for its codec.
+        // passthrough H.264 parser so each frame is a self-contained
+        // dependent access unit for a BlockAdditional.
         let parser = match s {
             crate::disc::Stream::Video(v) if v.is_mvc_dependent() => {
                 super::codec::parser_for_mvc_dependent(codec, is_dvd_ps)
@@ -1057,37 +996,23 @@ fn resolve_fmts_key_map(
     } = cache;
     use crate::aacs::segment::{clip_byte_to_lba, parse_individual_segments};
 
-    // Cooperative cancel: this probes the LIVE drive across up to a few hundred
-    // `read_sectors` (the anchor + per-index probe loops), each able to stall to
-    // the SCSI recovery timeout. An operator `/api/stop` during forensic key
-    // resolution must be honored at each loop boundary rather than blocking until
-    // the whole probe completes (hard rule: don't hammer a struggling live drive).
+    // Cooperative cancel: probes the LIVE drive across up to a few hundred
+    // `read_sectors`, each able to stall to the SCSI timeout. `/api/stop`
+    // must be honored at each loop boundary, not just after completion.
     let check_halt = || -> io::Result<()> {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(crate::error::Error::Halted.into());
         }
         Ok(())
     };
-    // Poll once on ENTRY as well as inside the probe loops: with both memos warm a
-    // title can reach the finished map without touching a single loop, so a
-    // 60-playlist sweep would otherwise run to completion after an operator Stop.
+    // Poll on ENTRY too: with both memos warm a title can reach the finished
+    // map without touching a loop, so a 60-playlist sweep would otherwise
+    // run to completion after an operator Stop.
     check_halt()?;
 
-    // Load the segment map. Distinguish a genuine "not an FMTS disc" negative
-    // from a transient live-drive I/O fault: swallowing the latter into Ok(None)
-    // would fall through to a base-Unit-Key-only map, garble the forensic units,
-    // let the demux drop them, and complete the mux with NO error — silently
-    // losing forensic content, contradicting this function's fail-loud contract.
-    //   - `UdfNotFilesystem`: bytes read fine but are not a UDF disc (deterministic
-    //     tag/format mismatch) → genuinely not FMTS → Ok(None).
-    //   - `UdfNotFound`: the disc is UDF but has no `IndividualSegment.tbl`
-    //     → genuinely not FMTS → Ok(None).
-    //   - any other error (notably `DiscRead`): a read fault → propagate so the
-    //     rip fails loud / can be retried rather than dropping forensic content.
-    // …and memoise the outcome for the whole disc: the walk reads the same fixed low
-    // LBAs and the same file for every title (see `FmtsTableCache`). Only the two
-    // DETERMINISTIC negatives are cached; a read fault propagates uncached so a
-    // later title still retries.
+    // Load the segment map. Distinguish "not FMTS" (`UdfNotFilesystem`/
+    // `UdfNotFound` → Ok(None)) from a transient I/O fault (propagates, else
+    // silently loses forensic content). Only the two negatives are memoised.
     if table.is_none() {
         let udf = match crate::udf::read_filesystem(reader) {
             Ok(u) => Some(u),
@@ -1106,10 +1031,9 @@ fn resolve_fmts_key_map(
             .as_deref()
             .and_then(parse_individual_segments)
             .filter(|s| !s.is_empty());
-        // Locate the forensic feature clip in the SAME walk — the byte space the
-        // segment SPNs are relative to (see `FmtsClipCache`). Only an FMTS disc pays
-        // for the lookup. Assigned before `*table` so a read fault on the clip's ICB
-        // leaves NEITHER memo filled and a later title retries the whole thing.
+        // Locate the forensic feature clip in the SAME walk — the byte space
+        // segment SPNs are relative to (`FmtsClipCache`). Assigned before
+        // `*table` so a read fault leaves NEITHER memo filled and retries.
         *clip = Some(match (&parsed, udf.as_ref()) {
             (Some(_), Some(u)) => forensic_clip_extents(u, reader)?,
             _ => None,
@@ -1120,69 +1044,48 @@ fn resolve_fmts_key_map(
         return Ok(None); // not an FMTS disc
     };
     let segments = segments.clone();
-    // ── ANCHOR the segment byte space. The SPNs are offsets into the FORENSIC
-    //    FEATURE clip, NOT into this title's extent concatenation: a playlist that
-    //    plays a trailer before the feature has the trailer's sectors FIRST in
-    //    `title.extents`, so mapping clip byte 0 to `title.extents[0]` puts every
-    //    segment in the wrong clip — the anchor probe then samples the trailer (no
-    //    index key anchors ⇒ `FmtsKeyMissing` aborts the whole disc) or, worse, index
-    //    keys get applied to non-forensic sectors while the real forensic units keep
-    //    the base key: silent garble, no error. So the arithmetic is anchored on the
-    //    forensic clip's OWN extents, which are a disc fact read from UDF. ─────────
+    // ANCHOR the segment byte space: SPNs are offsets into the FORENSIC clip,
+    // not this title's extents (a trailer-first playlist would else map
+    // segments to the wrong clip). Anchored on the clip's own UDF extents.
     let Some(Some(clip_extents)) = clip.as_ref() else {
-        // The disc carries a non-empty `IndividualSegment.tbl` — it HAS forensic
-        // content — but the clip that content lives in could not be identified, so
-        // there is no defensible anchor for the SPNs. Fail loud: a hard, retryable
-        // error beats silently mapping index keys onto the wrong clip's sectors.
+        // Disc has a non-empty `IndividualSegment.tbl` but its clip could not
+        // be identified, so there's no defensible SPN anchor. Fail loud: a
+        // retryable error beats silently mapping keys onto wrong sectors.
         tracing::warn!(target: "freemkv::keysource", segments = segments.len(), "fmts: forensic feature clip not identifiable — refusing an unanchored segment map");
         return Err(crate::error::Error::FmtsKeyMissing.into());
     };
     let clip_extents = clip_extents.clone();
-    // A title that does not read the forensic clip's sectors carries no forensic
-    // content (a menu/extras playlist, or simply a different clip): its base Unit
-    // Key/CPS map applies and there is nothing forensic to resolve — fall back
-    // (`Ok(None)`) rather than hard-failing. Without this, `resolve_content_key_map`
-    // — which resolves EVERY title for the whole-disc sweep — aborts the entire
-    // decrypt on the first non-forensic title (a menu playlist), and
-    // `build_iso_pipeline` aborts muxing any non-main title.
+    // A title not overlapping the forensic clip (menu/extras, or a
+    // different clip) has nothing forensic to resolve — fall back to
+    // `Ok(None)` rather than hard-failing every non-main title's mux.
     if !extents_overlap(&title.extents, &clip_extents) {
         return Ok(None);
     }
-    // Keep only the segments the forensic clip actually contains: a record whose
-    // clip bytes run past the clip's end belongs to no readable sector (a stale or
-    // foreign table entry) and must not be mapped.
+    // Keep only segments the clip actually contains: bytes running past the
+    // clip's end belong to a stale/foreign table entry, must not be mapped.
     let segments = filter_addressable_segments(segments, &clip_extents);
     if segments.is_empty() {
         return Ok(None);
     }
-    // This title HAS forensic content, so the forensic index keys are REQUIRED —
-    // exactly like a Unit Key. Without a configured key source we cannot obtain
-    // them, so we cannot produce a complete rip: fail loud rather than silently
-    // drop the forensic segments. (The caller may still choose `--raw`, which never
-    // reaches this path.)
+    // This title HAS forensic content, so the index keys are REQUIRED, like
+    // a Unit Key. No key source means no complete rip: fail loud rather than
+    // silently drop segments (`--raw` never reaches this path).
     let Some(fetch) = fetch else {
         return Err(crate::error::Error::FmtsKeyMissing.into());
     };
 
-    // ── The expensive half — the anchor probe, the per-index phase probe and the
-    //    ONE key-service round trip — reads only the FORENSIC CLIP's sectors, so it is
-    //    resolved at most once per disc; it stays keyed on the title's extent list
-    //    (`FmtsKeyCache`), a key FINER than the answer needs, so each distinct extent
-    //    list keeps its own verdict rather than inheriting another's. Without this,
-    //    `resolve_content_key_map` re-ran the whole probe AND re-asked the key service
-    //    once per playlist: on a 60-playlist disc that is 60 identical key-service
-    //    round trips (the storm) and tens of thousands of random 6144-byte reads for
-    //    one disc-wide answer. ───────────────────────────────────────────────────────
+    // The expensive half (anchor + phase probes, ONE key-service round trip)
+    // reads only the forensic clip's sectors, resolved at most once per disc
+    // via `FmtsKeyCache` — else a 60-playlist disc repeats it 60x.
     let ek = extent_key(format, title);
     let (index_keys, phase_of_index) = match memo.get(&ek) {
         Some((k, p)) => (k.clone(), p.clone()),
         None => {
             let probed =
                 probe_fmts_index_keys(reader, &clip_extents, &segments, fetch, format, halt)?;
-            // Only memoise a run whose every index reached a DEFINITE phase. A
-            // read-faulted index defaulted to `Phase::All` is a property of a
-            // transient live-drive fault, not of these extents — caching it would
-            // spread one bad read across every remaining title.
+            // Only memoise a run whose every index reached a DEFINITE phase —
+            // a read-faulted index defaulting to `Phase::All` is a transient
+            // fault, not a property of these extents; caching it would spread.
             if probed.all_phases_definite {
                 memo.insert(ek, (probed.keys.clone(), probed.phases.clone()));
             }
@@ -1190,11 +1093,9 @@ fn resolve_fmts_key_map(
         }
     };
 
-    // Map array position → forensic index (element i = index i+1); add each key to
-    // the pool and remember its slot by tag. Per TITLE, and deliberately so: the
-    // pool is the caller's and grows across titles, so a title reached with the keys
-    // already banked finds them by value at the same slots instead of appending
-    // duplicates.
+    // Map array position → forensic index (element i = index i+1); add each
+    // key to the pool and remember its slot by tag. Per TITLE, deliberately:
+    // the pool grows across titles, so already-banked keys reuse their slots.
     let mut tag_slot: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
     if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
         for (i, k) in index_keys.iter().enumerate() {
@@ -1203,10 +1104,9 @@ fn resolve_fmts_key_map(
                 Some(s) => s,
                 None => {
                     let s = unit_keys.len();
-                    // CPS-unit id is cosmetic for the mapped decrypt (it indexes by
-                    // slot), so it carries the forensic TAG instead: it is what tells
-                    // the single-CPS short-circuit these are not base CPS unit keys
-                    // (see `FMTS_POOL_TAG_BASE` / `single_base_key_slot`).
+                    // CPS-unit id is cosmetic here (mapped decrypt indexes by
+                    // slot), so it carries the forensic TAG instead, telling
+                    // the single-CPS short-circuit these aren't base keys.
                     unit_keys.push((FMTS_POOL_TAG_BASE.saturating_add(s as u32), *k));
                     s
                 }
@@ -1215,18 +1115,16 @@ fn resolve_fmts_key_map(
         }
     }
 
-    // ── Build the per-segment LBA ranges: each forensic segment → its tag's key
-    //    AND its index's phase. The mapped decrypt opens only that half and leaves
-    //    the alternate as ciphertext (the muxer drops untouched ciphertext) —
-    //    clean by construction, no garble. A segment straddling an extent boundary
-    //    is left unmapped and tallied (a hard failure below). ────────────────────
+    // Build per-segment LBA ranges: each segment → its tag's key and index's
+    // phase, leaving the alternate as ciphertext. A boundary-straddling
+    // segment is unmapped and tallied (hard failure below).
     let mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)> =
         Vec::with_capacity(segments.len());
     let mut unresolved = 0usize;
     for seg in &segments {
-        // SPNs are untrusted (from IndividualSegment.tbl); an inverted record
-        // (start_spn > end_spn) would underflow `end_byte - 1 - start_byte` below.
-        // (Mirrors the guard in `aacs::segment::fmts_key_ranges`.)
+        // SPNs are untrusted; an inverted record (start_spn > end_spn) would
+        // underflow `end_byte - 1 - start_byte` below (mirrors the guard in
+        // `aacs::segment::fmts_key_ranges`).
         if seg.start_spn > seg.end_spn {
             unresolved += 1;
             continue;
@@ -1241,8 +1139,8 @@ fn resolve_fmts_key_map(
             .unwrap_or(crate::decrypt::Phase::All);
         let start_byte = seg.start_spn as u64 * 192;
         let end_byte = (seg.end_spn as u64 + 1) * 192;
-        // Clip bytes → LBAs through the FORENSIC CLIP's extents (see the anchor note
-        // above), never the title's.
+        // Clip bytes → LBAs through the FORENSIC CLIP's extents, never the
+        // title's.
         let (Some(a), Some(b)) = (
             clip_byte_to_lba(&clip_extents, start_byte),
             clip_byte_to_lba(&clip_extents, end_byte - 1),
@@ -1250,43 +1148,31 @@ fn resolve_fmts_key_map(
             unresolved += 1;
             continue;
         };
-        // Only emit a contiguous within-extent range (segments are ~480 KB; a rare
-        // extent-straddle is left unresolved rather than given a wrong span).
+        // Only emit a contiguous within-extent range (segments are ~480 KB;
+        // a rare extent-straddle is left unresolved, not given a wrong span).
         if b >= a && (b - a) as u64 == (end_byte - 1 - start_byte) / 2048 {
             ranges.push((a, b + 1, slot, phase));
         } else {
             unresolved += 1;
         }
     }
-    // Every forensic segment must map to an index key. Any that did not is a hole
-    // in the rip — with the full 32-key set in hand this should never happen, so
-    // treat it as a hard failure rather than silently emitting a garbled segment.
+    // Every forensic segment must map to an index key. A hole here should
+    // never happen with the full 32-key set — treat it as a hard failure.
     if unresolved != 0 {
         return Err(crate::error::Error::FmtsKeyMissing.into());
     }
 
-    // Cover the NON-segment content with the base Unit Key OF THE CPS UNIT THAT LBA
-    // BELONGS TO: the forensic segments (added above with their index keys) carve
-    // holes out of the title's content extents; every other content unit uses its own
-    // CPS unit's base UK. Fill the gaps so the map is a complete positive list — an
-    // LBA in no range is nav and passes through.
-    //
-    // "The" base key is only well defined when the disc has ONE base CPS Unit Key.
-    // Hardcoding pool slot 0 keyed every non-forensic LBA of every OTHER CPS unit
-    // with the first unit's key — and that does not fail loudly, it decrypts to
-    // garbage with `lost_bytes == 0`. `resolve_mux_key_map_cached` reaches this
-    // resolver BEFORE its own `single_base_key_slot` short-circuit, so that guard
-    // never gets to make slot 0 correct here. Resolve it per extent instead, the same
-    // way the multi-CPS path does: from the extent's own ciphertext.
+    // Cover NON-segment content with each LBA's CPS unit's base key. "The"
+    // base key is only well defined with ONE base unit — hardcoding slot 0
+    // would garble others, since this runs before `single_base_key_slot`.
     let base_slots: Vec<usize> = match keys {
         crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => base_key_slots(unit_keys),
         _ => Vec::new(),
     };
     if base_slots.len() <= 1 {
-        // One base CPS unit (the overwhelming majority, incl. every single-key UHD):
-        // its key covers every non-forensic LBA and NO extent sampling is needed —
-        // an FMTS disc stays at the anchor + phase probes it already pays for. An
-        // empty pool keeps slot 0, which is what an empty map keys nothing with.
+        // One base CPS unit (the majority, incl. single-key UHD): its key
+        // covers every non-forensic LBA, no sampling needed. Empty pool
+        // keeps slot 0, which an empty map keys nothing with anyway.
         let base_idx = base_slots.first().copied().unwrap_or(0);
         let base_gaps = fill_base_key_gaps(&title.extents, &ranges, base_idx);
         ranges.extend(base_gaps);
@@ -1360,22 +1246,9 @@ fn probe_fmts_index_keys(
             reader.read_sectors(lba, 3, &mut c, false).ok()?;
             Some(c)
         };
-    // ── ANCHOR — fetch the whole 32-key set from ONE index-1 batch. The key
-    //    service returns ALL forensic index keys ordered (element i = index i+1)
-    //    only for a canonical INDEX-1 sample that decrypts under the index-1 key.
-    //    A forensic segment interleaves TWO variants at the aligned-unit level, so
-    //    index-1's real content is one PHASE (even or odd units) and the alternate
-    //    is a different variant that won't decrypt. We don't know the phase a
-    //    priori, so try PHASE A (even) then PHASE B (odd): whichever is index-1's
-    //    content comes back with the full set. Both phases failing (across the
-    //    read-fault fallback over index-1 segments) ⇒ this disc has no FMTS keys.
-    //
-    //    The set's SIZE is whatever the source returns (≥ 1) — never assumed. 32
-    //    is all we have seen, but a disc with a different forensic index count is
-    //    not ruled out, so the map is sized to the returned `len()`, not a const.
-    //    ─────────────────────────────────────────────────────────────────────────
-    // Batch size = the key service's minimum-samples floor (same as the online
-    // source), drawn from ONE phase to land a clean single-variant half.
+    // ANCHOR — fetch the whole key set from ONE index-1 batch (phase
+    // unknown a priori, so try PHASE A then B). Size is whatever the source
+    // returns (≥ 1, not assumed 32). Batch = key service's samples floor.
     const BATCH_UNITS: usize = crate::keysource::MIN_SAMPLE_UNITS;
     // Read-fault fallback: how many index-1 segments to attempt if the leading one
     // is unreadable. The 2 phase requests happen per readable segment.
@@ -1422,26 +1295,18 @@ fn probe_fmts_index_keys(
         return Err(crate::error::Error::FmtsKeyMissing.into());
     }
 
-    // ── PROBE each index's phase. A forensic segment interleaves two variants at
-    //    the aligned-unit level; only ONE parity is this index's real content (the
-    //    other is the alternate variant — a different key, garbles under ours). For
-    //    each index, read a representative tagged segment and count clean decrypts
-    //    of its EVEN vs ODD units under that index's key: the clean half is the
-    //    index's phase. This is the ONE place `is_clean` runs — "the map must be
-    //    right", verified here, once — so the mux decrypt can then trust the map.
-    //    Phase is per-index and shared by every segment carrying that index. ──────
+    // PROBE each index's phase: only ONE parity is real content, found by
+    // counting clean EVEN vs ODD decrypts under its key. The ONE place
+    // `is_clean` runs, so the mux decrypt can trust the map afterward.
     let mut phase_of_index: std::collections::HashMap<u16, crate::decrypt::Phase> =
         std::collections::HashMap::new();
     let mut all_phases_definite = true;
     for (i, k) in index_keys.iter().enumerate() {
         check_halt()?;
         let tag = (i + 1) as u16;
-        // Probe this index's parity with the anchor loop's read-fault tolerance:
-        // try up to MAX_ANCHOR_ATTEMPTS same-index segments (not a single `.find`),
-        // skipping any whose reads all fault. The outcome distinguishes a genuine
-        // wrong key (reads succeeded, no clean parity) from a transient live-drive
-        // read fault (zero decrypt evidence) — the load-bearing distinction so a
-        // recoverable fault never hard-aborts a rip whose index keys are valid.
+        // Read-fault-tolerant across up to MAX_ANCHOR_ATTEMPTS segments;
+        // distinguishes a wrong key (no clean parity) from a transient
+        // fault (zero evidence), so a recoverable fault never aborts.
         match probe_index_phase(
             segments,
             tag,
@@ -1455,23 +1320,16 @@ fn probe_fmts_index_keys(
                 phase_of_index.insert(tag, phase);
             }
             IndexProbe::WrongKey => {
-                // Reads SUCCEEDED but NEITHER parity decrypts clean under this index's
-                // key on any same-index segment: the key is wrong (or the sample isn't
-                // this index's real content). The map would be wrong — fail loud rather
-                // than emit a broken segment. (Preserves the genuine-wrong-key path.)
+                // Reads SUCCEEDED but NEITHER parity decrypts clean: the key
+                // is wrong (or the sample isn't this index's content). Fail
+                // loud rather than emit a broken segment.
                 tracing::warn!(target: "freemkv::keysource", index = tag, "fmts: no clean phase under index key — refusing broken map");
                 return Err(crate::error::Error::FmtsKeyMissing.into());
             }
             IndexProbe::ReadFault => {
-                // EVERY probe read of EVERY same-index segment faulted (a transient
-                // live-drive read fault — e.g. NOT READY 2/04/3E, the common bad-sector
-                // sense on the BU40N). There is ZERO decrypt evidence, so this is NOT a
-                // wrong key: the index key is valid and already in hand. Do NOT abort a
-                // rip whose forensic keys are good. Leave this index's phase unresolved
-                // so the range-builder below defaults it to `Phase::All` — decrypt BOTH
-                // parities and let the demux drop the garbled alternate half (the
-                // coherent-stream outcome the module doc describes for whole-range key
-                // application). Degraded but complete; never a wrong-key abort.
+                // EVERY probe read faulted (transient drive fault). Zero
+                // evidence ⇒ not a wrong key. Leave phase unresolved so the
+                // range-builder defaults to `Phase::All`. Degraded, never abort.
                 tracing::warn!(target: "freemkv::keysource", index = tag, "fmts: index phase probe read-faulted on every segment — defaulting Phase::All (recoverable read fault, not a wrong key)");
                 all_phases_definite = false;
             }
@@ -1663,10 +1521,9 @@ fn probe_index_phase(
             continue; // every read of this segment faulted — try the next same-index one
         }
         any_read = true;
-        // A clean parity (even != odd) or a padding tie (even == odd > 0) resolves the
-        // phase; even == odd == 0 is this segment's wrong-key signature, but a DIFFERENT
-        // same-index segment could still anchor (this one's sampled units may all be the
-        // alternate variant), so keep trying rather than concluding immediately.
+        // A clean parity or padding tie (even == odd > 0) resolves the phase;
+        // even == odd == 0 is this segment's wrong-key signature, but a
+        // different same-index segment could still anchor, so keep trying.
         if let Ok(phase) = resolve_tie_phase(even, odd) {
             return IndexProbe::Phase(phase);
         }
@@ -1972,34 +1829,24 @@ pub(crate) fn resolve_mux_key_map_cached(
     // multi-CPS loop below needs the CPS one.
     let DiscKeyCache { cps: cache, fmts } = cache;
 
-    // The base Unit Key pool is always resolved and banked by the caller before mux
-    // (autorip's pre-rip gate; the ISO path's `decrypt_keys()`), so an AACS title
-    // reaches here with a non-empty pool — an empty pool is reported as
-    // `DecryptKeys::None` and takes the CSS/clear arm above.
+    // The base Unit Key pool is always resolved and banked before mux
+    // (autorip's pre-rip gate; the ISO path's `decrypt_keys()`), so an AACS
+    // title reaches here with a non-empty pool.
     if !matches!(keys, crate::decrypt::DecryptKeys::Aacs { .. }) {
         // CSS / clear: the AACS map keys nothing here — an empty map passes every
         // unit through (CSS self-descrambles on its own path).
         return Ok(crate::decrypt::AacsKeyMap::from_ranges(Vec::new()));
     }
-    // FMTS (AACS 2.1): if the disc carries `IndividualSegment.tbl`, the forensic
-    // segments need per-index keys the base Unit Key can't open. Resolve them up
-    // front from the configured source and build a per-segment map. Returns `None`
-    // when the disc is not FMTS, or no key source is configured (then the base UK
-    // path below applies and the forensic units garble → demux drops them).
+    // FMTS (AACS 2.1): forensic segments need per-index keys the base Unit
+    // Key can't open. `None` if not FMTS or no key source (base UK path
+    // below applies and forensic units garble/get dropped).
     if let Some(map) = resolve_fmts_key_map(reader, title, keys, fetch, format, halt, fmts, cache)?
     {
         return Ok(map);
     }
-    // The single-CPS short-circuit asks about the BASE CPS unit keys only. It must not
-    // read the pool's LENGTH: on an FMTS disc `resolve_fmts_key_map` APPENDS this
-    // disc's forensic index keys to the same caller-owned pool, so once ANY forensic
-    // title has resolved the pool is `1 + n_index` long for every later title. Keying
-    // off the length there dropped every subsequent single-CPS title into the
-    // multi-CPS sampling path (8 random 6144-byte reads per extent, and a
-    // `DecryptFailed` abort of the WHOLE-disc map for any extent no pooled key opens)
-    // — making the outcome depend on which playlist happened to resolve FIRST, the
-    // exact order-independence this function's docs promise. The forensic keys are
-    // tagged in the pool ([`FMTS_POOL_TAG_BASE`]), so the base count is exact.
+    // Single-CPS short-circuit asks about BASE keys only, and must not read
+    // pool LENGTH: FMTS appends forensic keys, making length order-dependent.
+    // Forensic keys are tagged ([`FMTS_POOL_TAG_BASE`]), so count stays exact.
     if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys
         && let Some(slot) = single_base_key_slot(unit_keys)
     {
@@ -2062,13 +1909,9 @@ pub(crate) fn resolve_mux_key_map_cached(
                 idx = pick(&samples, unit_keys);
             }
         }
-        // `sample_units` draws REAL content (not authored-bad units), so a sample
-        // no held or fetched key decrypts to clean means this extent's CPS-unit key
-        // is genuinely absent. Building a map that silently assigns a WRONG key
-        // (the neighbour's) would corrupt the whole extent with lost_bytes==0 — so
-        // fail loud instead: the keymap is built ONLY when every extent with
-        // encrypted content is classified. An extent with no sampleable encrypted
-        // units (nothing to mis-decrypt) carries the previous index harmlessly.
+        // `sample_units` draws REAL content, so no key decrypting clean
+        // means the key is genuinely absent — fail loud rather than
+        // silently assign a WRONG key (corrupts with lost_bytes==0).
         let idx = match idx {
             // A real decision from this extent's own ciphertext — memoise it.
             Some(i) => {
@@ -2134,12 +1977,9 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     fetch: Option<crate::sector::KeyFetch>,
 ) -> io::Result<PipelinedPesStream> {
     let extents = title.extents.clone();
-    // CSS (DVD) key resolution — the shared per-title step (also used by the
-    // live-drive single-pass `DiscStream`). A `None`/MPEG-PS title cracks its own
-    // key from the reader in playback order; AACS `.evo` (also MPEG-PS) arrives as
-    // `Aacs` and is untouched; a clear DVD stays `None`; `raw` skips it entirely.
-    // Without this a detection-miss CSS DVD would mux scrambled sectors as corrupt
-    // video. `halt` lets /api/stop interrupt the crack scan.
+    // CSS (DVD) key resolution — shared per-title step. A `None`/MPEG-PS
+    // title cracks its own key; AACS arrives as `Aacs` untouched; `raw`
+    // skips it. `halt` lets /api/stop interrupt the crack scan.
     crate::css::resolve_dvd_title_key(
         &mut reader,
         &extents,
@@ -2149,21 +1989,16 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         raw,
         halt.as_ref(),
     )?;
-    // Unit alignment is an AACS concept: AACS decrypts whole 6144-byte (3-sector)
-    // units, so the producer must hand the decrypt step 3-sector-aligned batches.
-    // CSS (DVD) and unencrypted content decrypt per 2048-byte sector — forcing
-    // 3-sector alignment there rejects any extent whose sector count isn't a
-    // multiple of 3 (DVD IFO cells routinely aren't) with ExtentNotUnitAligned.
+    // Unit alignment is an AACS concept (whole 3-sector units); forcing it
+    // on CSS/unencrypted (per-2048-byte-sector) would reject any extent
+    // whose sector count isn't a multiple of 3.
     let unit_align: u16 = match &keys {
         crate::decrypt::DecryptKeys::Aacs { .. } => 3,
         _ => 1,
     };
-    // MUX path: read > decrypt > mux. Resolve the proactive AACS key map UP FRONT
-    // — one key per CPS unit / segment, secured from the configured source and
-    // recorded against the LBA ranges it covers. The mux then decrypts each unit
-    // with its KNOWN key and trusts it: no per-unit `is_clean` verdict, no reactive
-    // key-fetch, no key-server storm. A unit that decrypts to broken TS is the
-    // muxer's problem, exactly as before. AACS-only; CSS self-cracks per region.
+    // MUX path: resolve the AACS key map UP FRONT — one key per CPS unit/
+    // segment against its LBA ranges — so the mux decrypts with a KNOWN key,
+    // no per-unit verdict or key-server storm. AACS-only; CSS self-cracks.
     let key_map = match &keys {
         crate::decrypt::DecryptKeys::Aacs { .. } => Some(std::sync::Arc::new(resolve_mux_key_map(
             &mut reader,
@@ -2175,50 +2010,30 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         )?)),
         _ => None,
     };
-    // The map IS the title's read plan: it says which CPS unit / forensic segment
-    // each LBA belongs to. Walk ONLY the units it marks as ours — every default /
-    // CPS unit, and inside an FMTS forensic segment only our-phase units. The
-    // alternate-phase units are a different device group's variant; a licensed
-    // player never reads them, and neither do we — they are never fetched,
-    // decrypted, or handed to the demux, so the demux sees one gapless our-variant
-    // stream (no ciphertext to trip a concealed-gap resync). A non-forensic map
-    // returns the extents unchanged, so the common disc reads exactly as before.
+    // The map IS the title's read plan. Walk ONLY units it marks as ours —
+    // inside an FMTS segment, only our-phase units (alternate phase is a
+    // different device group's variant). A non-forensic map is unchanged.
     let full_extents = extents.clone();
     let extents = match &key_map {
         Some(map) => map.read_plan(&extents, unit_align as u32),
         None => extents,
     };
-    // The plan and the clips' feed spans must describe the SAME bytes.
-    //
-    // A clip's span was measured over the title's full extents at scan time,
-    // and a frame is placed by the offset it was read from. When a forensic
-    // segment makes the plan drop alternate-phase units, the mux feeds fewer
-    // bytes than the spans describe and the two drift apart cumulatively —
-    // every frame after the first segment looks earlier than it is, and near a
-    // join it is placed in the wrong clip or dropped. The spans still tile each
-    // other perfectly, so the trust check cannot see it.
-    //
-    // Provenance is only meaningful when the feed matches. When it does not,
-    // say so and let placement fall back to timestamps, which is what the
-    // untrusted path exists for.
+    // The plan and clip feed spans must describe the SAME bytes: if the plan
+    // drops alternate-phase units, frames drift out of place near a join —
+    // undetectable by the tile check. Fall back to timestamps if mismatched.
     let feed_matches_spans = extents == full_extents;
     let mut decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
     if let Some(map) = key_map {
         decrypting = decrypting.with_key_map(map);
     }
-    // Loss-counter handle. The mux does NOT tally decrypt-quality misses: a
-    // broken-TS unit is the muxer's concern, and a missing key is an up-front
-    // resolve failure — indistinguishable from bad authoring at this seam, so
-    // counting it would false-abort a bad-encoded-but-decryptable disc. A genuine
-    // can't-decrypt surfaces as `Err`; `lost_bytes()` reflects physical read loss
-    // only (there is no decrypt-loss term to fold in).
+    // The mux does NOT tally decrypt-quality misses: a broken-TS unit is the
+    // muxer's concern, a missing key is an up-front resolve failure (`Err`).
+    // `lost_bytes()` reflects physical read loss only.
 
-    // Wrong-substream fix (Silence-of-the-Lambs): before the prefetcher takes
-    // the reader, probe the feature head through the (plaintext) decrypting
-    // source and re-route the title's declared AC-3 audio onto the physically
-    // correct `0x8x` sub-streams. No-op for non-DVD or an empty probe. Reset the
-    // unit base afterward so the prefetcher's first batch starts clean.
+    // Wrong-substream fix (Silence-of-the-Lambs): probe the feature head and
+    // re-route declared AC-3 audio onto the correct `0x8x` sub-streams.
+    // No-op for non-DVD/empty probe; reset unit base for a clean first batch.
     let mut title = title;
     if !feed_matches_spans {
         tracing::info!(
@@ -2283,10 +2098,9 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
     };
     head.truncate(head_len);
 
-    // Try FMKV metadata header first; fall back to PMT scan. Only a
-    // genuine absence of the FMKV magic (`Ok(None)`) falls through to
-    // the PMT path — a corrupt/truncated FMKV header (`Err`) propagates
-    // instead of being misreported as a PMT-derived title or NoStreams.
+    // Try FMKV metadata header first; fall back to PMT scan. Only a genuine
+    // absence of the FMKV magic (`Ok(None)`) falls through; a corrupt header
+    // propagates rather than being misreported as PMT-derived.
     let mut cursor = io::Cursor::new(&head);
     let (title, head_consumed) = match meta::read_header(&mut cursor)? {
         Some(m) => {
@@ -2447,9 +2261,8 @@ mod tests {
         assert!(validate_network_addr("host:65535").is_ok());
     }
 
-    // The decrypt-verdict matrix (raw / unencrypted / AACS-no-key /
-    // CSS-no-key / css_error) is owned by `Disc::ensure_decryptable[_keys]` and
-    // tested in `crate::disc` — `input()` now delegates to it, so the matrix is
+    // The decrypt-verdict matrix is owned by `Disc::ensure_decryptable[_keys]`
+    // and tested in `crate::disc`; `input()` delegates to it, so it's
     // asserted once at the source of truth rather than re-tested here.
 
     // ── input()/output() routing + validation ─────────────────────────────
@@ -3046,11 +2859,9 @@ mod tests {
             .expect("one frame emitted from the single PES");
         // PassthroughParser routes the audio stream (PID 0x1100) to track 0.
         assert_eq!(frame.track, 0);
-        // The TS PesAssembler delivers every payload byte AFTER the 9-byte PES
-        // header to the end of the 184-byte TS payload region (the bounded
-        // PES_packet_length is not used to trim within a single packet — the
-        // PES is closed by the next PUSI or by flush at EOF). So the frame is
-        // the ES bytes followed by the packet's zero padding: total = 184 - 9.
+        // TS PesAssembler delivers every byte after the 9-byte PES header to
+        // the end of the 184-byte TS payload (PES is closed by next PUSI or
+        // flush at EOF, not by PES_packet_length). Frame = ES + zero padding.
         assert_eq!(
             frame.data.len(),
             184 - 9,
@@ -4275,15 +4086,9 @@ mod tests {
         assert!(got.is_none(), "not a UDF/FMTS disc → Ok(None)");
     }
 
-    // ── FMTS index-key resolution is memoised per DISC, not per title ─────────
-    //
-    // A synthetic AACS 2.1 disc: a real UDF tree (so `read_filesystem` walks it
-    // for real) carrying `/AACS/IndividualSegment.tbl`, plus a content region whose
-    // aligned units are genuinely encrypted — the EVEN units of a segment under its
-    // index key and the ODD units under the alternate interleaved variant's key,
-    // exactly the layout the phase probe exists to discover. The reader COUNTS its
-    // reads (metadata vs probe) and the `KeyFetch` double COUNTS its calls, so the
-    // tests can state the cost of N titles rather than assume it.
+    // FMTS index-key resolution is memoised per DISC, not per title: EVEN
+    // units under the index key, ODD under the alternate; the doubles
+    // COUNT calls so tests can state exact cost.
 
     /// First LBA of the synthetic disc's content. Everything below is UDF metadata.
     const FMTS_CONTENT_LBA: u32 = 10_000;
@@ -4425,11 +4230,9 @@ mod tests {
                 subdirs: Vec::new(),
             }];
             if clip {
-                // The forensic FEATURE clip, as a real AACS 2.1 disc names it:
-                // `BDMV/STREAM/<clip>.fmts`, whose extents are the byte space the
-                // segment SPNs are relative to. Declared in UDF only (the reader
-                // synthesises its content), at exactly the content region:
-                // partition-relative data LBA + PART_START = FMTS_CONTENT_LBA.
+                // The forensic FEATURE clip: `BDMV/STREAM/<clip>.fmts`, whose
+                // extents are the byte space segment SPNs are relative to
+                // (UDF-declared, at partition-relative LBA = FMTS_CONTENT_LBA).
                 subdirs.push(DirSpec {
                     name: "BDMV".to_string(),
                     icb_lba: 16,
@@ -5175,12 +4978,9 @@ mod tests {
         );
         let probes_after_forensic = reader.probe_reads;
 
-        // 2) A NON-forensic title of the same disc (a menu playlist: its extents lie
-        //    outside the forensic clip) still has exactly ONE base CPS Unit Key, so it
-        //    must take the single-CPS short-circuit — no sampling reads at all.
-        // (+9_000 keeps the extent on the fixture's 3-sector aligned-unit grid, so
-        // the multi-CPS path WOULD succeed here — the test is about it not running at
-        // all, not about it failing.)
+        // 2) A NON-forensic title (menu playlist, extents outside the forensic
+        //    clip) still has ONE base CPS Unit Key, so it takes the single-CPS
+        //    short-circuit — no sampling reads (multi-CPS WOULD succeed if run).
         let menu = multi_cps_title(FMTS_CONTENT_LBA + 9_000, 300);
         let map = super::resolve_mux_key_map_cached(
             &mut reader,
@@ -5590,19 +5390,8 @@ mod tests {
     }
 
     // ── An unmappable forensic record is a HOLE, and a hole is a hard failure ──
-    //
-    // `resolve_fmts_key_map`'s range builder has four independent arms that refuse
-    // to emit a range for a record: inverted SPNs, an index with no key, clip bytes
-    // past the clip's end, and a span that is not one contiguous run of sectors.
-    // Each one tallies `unresolved`, and a non-zero tally aborts the disc.
-    //
-    // The tally is what makes those refusals SAFE. Drop it (or the `unresolved != 0`
-    // check) and the `continue` still fires — so the record's LBAs fall through to
-    // `fill_base_key_gaps`, which covers them with the BASE Unit Key. The forensic
-    // units then decrypt to garbage under a key that was never theirs, the map
-    // reports no error, and the rip completes with `lost_bytes == 0`. That is the
-    // exact silent-wrong-key shape this module's comments call out; the four tests
-    // below drive one arm each so no single tally can be deleted unnoticed.
+    // Four arms refuse to emit a range and tally `unresolved`; drop the tally
+    // and those LBAs decrypt as garbage under the wrong key, `lost_bytes == 0`.
 
     fn fmts_missing_err() -> String {
         std::io::Error::from(crate::error::Error::FmtsKeyMissing).to_string()
@@ -5933,18 +5722,9 @@ mod tests {
         }
     }
 
-    // ── An operator Stop that lands MID-probe ────────────────────────────────
-    //
-    // The FMTS probes are the heaviest thing this crate does to a live drive:
-    // hundreds of random 6144-byte reads, each able to stall to the SCSI recovery
-    // timeout on a marginal disc. The module's hard rule is that `/api/stop` is
-    // honored at every loop boundary rather than after the whole probe completes.
-    //
-    // The existing halt tests all pre-cancel, so the ENTRY poll alone satisfies
-    // them and the two polls inside the probe loops are unconstrained. Cancelling
-    // by OUTCOME is not enough either — a later poll still returns `Halted`, so a
-    // deleted poll looks identical. What distinguishes them is what the drive was
-    // asked to do after the Stop, so both tests below count reads.
+    // An operator Stop mid-probe: `/api/stop` must be honored at every loop
+    // boundary since FMTS probes are the heaviest thing this crate does to a
+    // live drive; these tests count reads since outcome alone can't tell.
 
     fn halted_err() -> String {
         std::io::Error::from(crate::error::Error::Halted).to_string()
@@ -6021,10 +5801,9 @@ mod tests {
         )
         .expect_err("a Stop during the anchor batch must abort the resolve");
         assert_eq!(err.to_string(), halted_err(), "the verdict is Halted");
-        // The anchor completed (it is one uninterruptible batch by construction);
-        // the phase probes must NOT have started. Each phase probe reads
-        // 2 * MIN_SAMPLE_UNITS units per attempted segment, so anything beyond the
-        // anchor's own reads is the phase loop running past the Stop.
+        // The anchor completed (uninterruptible by construction); phase
+        // probes must NOT have started — any reads beyond the anchor's is a
+        // Stop overrun (each probe reads 2*MIN_SAMPLE_UNITS per segment).
         let anchor_cost = crate::keysource::MIN_SAMPLE_UNITS as u32;
         assert!(
             reader.probe_reads > 0,
