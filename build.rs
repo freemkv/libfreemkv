@@ -5,6 +5,7 @@ fn main() {
     if target == "macos" {
         println!("cargo:rustc-link-lib=framework=IOKit");
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rustc-link-lib=framework=DiskArbitration");
 
         let out_dir = std::env::var("OUT_DIR").unwrap();
         let obj = format!("{out_dir}/macos_shim.o");

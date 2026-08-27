@@ -2,6 +2,8 @@
 #include <IOKit/IOCFPlugIn.h>
 #include <IOKit/scsi/SCSITaskLib.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <DiskArbitration/DiskArbitration.h>
+#include <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -19,6 +21,13 @@ typedef struct {
     MMCDeviceInterface       **mmc;
     SCSITaskDeviceInterface  **scsi;
     int                        exclusive;
+    // DiskArbitration claim held for the whole session so diskarbitrationd
+    // cannot remount the disc out from under an in-progress rip (the mount
+    // approval callback dissents while claimed).
+    DASessionRef               da_session;
+    DADiskRef                  da_disk;
+    dispatch_queue_t           da_queue;
+    int                        da_claimed;
 } ShimHandle;
 
 typedef struct {
@@ -232,6 +241,95 @@ static io_service_t find_bdsvc_from_iomedia(mach_port_t mp, const char *bsd_name
     return result;
 }
 
+// ── DiskArbitration claim ──────────────────────────────────────────────────
+//
+// ObtainExclusiveAccess reserves the SCSI passthrough but says nothing to
+// diskarbitrationd, which stays free to remount the disc mid-rip (Spotlight
+// re-probe, etc.), yanking the media out from under an in-progress read. We
+// hold a DADiskClaim + a mount-approval dissenter for the session so the OS
+// cannot remount our disc until shim_close().
+
+static char g_da_bsd[32];
+
+// Dissent a remount only for OUR disk; every other disk is approved so we
+// never block the rest of the system's volumes.
+static DADissenterRef da_mount_approval(DADiskRef disk, void *ctx) {
+    (void)ctx;
+    const char *n = DADiskGetBSDName(disk);
+    if (!n || strcmp(n, g_da_bsd) != 0) return NULL;
+    return DADissenterCreate(kCFAllocatorDefault, kDAReturnBusy,
+        CFSTR("freemkv is reading this disc"));
+}
+
+// Refuse an involuntary claim release; we give it back only in shim_close().
+static DADissenterRef da_claim_release(DADiskRef disk, void *ctx) {
+    (void)disk; (void)ctx;
+    return DADissenterCreate(kCFAllocatorDefault, kDAReturnBusy,
+        CFSTR("freemkv still holds this disc"));
+}
+
+typedef struct { dispatch_semaphore_t sem; int ok; } DAClaimResult;
+
+static void da_claim_done(DADiskRef disk, DADissenterRef dissenter, void *ctx) {
+    (void)disk;
+    DAClaimResult *r = (DAClaimResult *)ctx;
+    r->ok = (dissenter == NULL);
+    dispatch_semaphore_signal(r->sem);
+}
+
+// Best-effort: claim the disk and register the mount-approval dissenter.
+// Returns 1 if claimed. The caller proceeds either way — ObtainExclusiveAccess
+// remains the hard gate; the claim is what keeps DA from remounting after it.
+static int da_hold(const char *bsd_name) {
+    strncpy(g_da_bsd, bsd_name, sizeof(g_da_bsd) - 1);
+    g_da_bsd[sizeof(g_da_bsd) - 1] = 0;
+
+    g_handle.da_queue = dispatch_queue_create("io.freemkv.da", DISPATCH_QUEUE_SERIAL);
+    if (!g_handle.da_queue) return 0;
+    g_handle.da_session = DASessionCreate(kCFAllocatorDefault);
+    if (!g_handle.da_session) return 0;
+    DASessionSetDispatchQueue(g_handle.da_session, g_handle.da_queue);
+    g_handle.da_disk =
+        DADiskCreateFromBSDName(kCFAllocatorDefault, g_handle.da_session, bsd_name);
+    if (!g_handle.da_disk) return 0;
+
+    DARegisterDiskMountApprovalCallback(g_handle.da_session, NULL, da_mount_approval, NULL);
+
+    DAClaimResult r = {dispatch_semaphore_create(0), 0};
+    DADiskClaim(g_handle.da_disk, kDADiskClaimOptionDefault,
+        da_claim_release, NULL, da_claim_done, &r);
+    // Bounded wait for the async claim callback (5 s), so a wedged DA can't
+    // hang open() forever.
+    if (dispatch_semaphore_wait(r.sem,
+            dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC)) != 0) {
+        g_handle.da_claimed = 0;
+    } else {
+        g_handle.da_claimed = r.ok;
+    }
+    return g_handle.da_claimed;
+}
+
+static void da_release(void) {
+    if (g_handle.da_session) {
+        DAUnregisterCallback(g_handle.da_session, (void *)da_mount_approval, NULL);
+    }
+    if (g_handle.da_disk) {
+        if (g_handle.da_claimed) DADiskUnclaim(g_handle.da_disk);
+        CFRelease(g_handle.da_disk);
+        g_handle.da_disk = NULL;
+    }
+    if (g_handle.da_session) {
+        DASessionSetDispatchQueue(g_handle.da_session, NULL);
+        CFRelease(g_handle.da_session);
+        g_handle.da_session = NULL;
+    }
+    if (g_handle.da_queue) {
+        dispatch_release(g_handle.da_queue);
+        g_handle.da_queue = NULL;
+    }
+    g_handle.da_claimed = 0;
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 int shim_open_exclusive(const char *bsd_name) {
@@ -362,10 +460,17 @@ int shim_open_exclusive(const char *bsd_name) {
     }
 
     g_handle.exclusive = 1;
+
+    // Claim the disk now that we hold the drive, so DA can't remount it during
+    // the read. Best-effort: a failed claim does not fail the open (we already
+    // have exclusive SCSI access and the disc is unmounted).
+    da_hold(bsd_name);
+
     return 0;
 }
 
 void shim_close(void) {
+    da_release();
     if (g_handle.exclusive && g_handle.scsi) {
         (*g_handle.scsi)->ReleaseExclusiveAccess(g_handle.scsi);
     }
