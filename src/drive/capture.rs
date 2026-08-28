@@ -20,6 +20,12 @@ pub struct DriveCapture {
     pub rb_f1: Option<Vec<u8>>,
     /// READ_BUFFER mode 6 (MTK vendor data)
     pub rb_mode6: Option<Vec<u8>>,
+    /// READ_BUFFER 0xB0 @0x04 (Renesas signature only)
+    pub rb_b0_04: Option<Vec<u8>>,
+    /// WRITE_BUFFER 0x41 @0xA5AAAA (Renesas signature only)
+    pub wb_41: Option<Vec<u8>>,
+    /// READ_BUFFER 0xB0 @0x500000 (Renesas signature only)
+    pub rb_b0_500000: Option<Vec<u8>>,
 }
 
 /// A single GET CONFIGURATION feature response from the drive.
@@ -76,6 +82,33 @@ pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
     let rb_f1 = session.read_buffer(0x02, 0xF1, 48); // Pioneer
     let rb_mode6 = session.read_buffer(0x06, 0x00, 32); // MTK
 
+    // Renesas signature: RB 0xF1 bytes [16..19] == "SAT".
+    let (mut rb_b0_04, mut wb_41, mut rb_b0_500000) = (None, None, None);
+    if rb_f1
+        .as_ref()
+        .is_some_and(|f| f.len() >= 19 && &f[16..19] == b"SAT")
+    {
+        use crate::scsi::{DataDirection as D, build_read_buffer};
+        rb_b0_04 = raw(
+            session,
+            &build_read_buffer(0x02, 0xB0, 0x04, 164),
+            D::FromDevice,
+            164,
+        );
+        wb_41 = raw(
+            session,
+            &[0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0, 0, 0, 0],
+            D::None,
+            0,
+        );
+        rb_b0_500000 = raw(
+            session,
+            &build_read_buffer(0x02, 0xB0, 0x500000, 164),
+            D::FromDevice,
+            164,
+        );
+    }
+
     // Standard queries
     let rpc_state = session.report_key_rpc_state();
     let mode_2a = session.mode_sense_page(0x2A);
@@ -88,7 +121,22 @@ pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
         mode_2a,
         rb_f1,
         rb_mode6,
+        rb_b0_04,
+        wb_41,
+        rb_b0_500000,
     })
+}
+
+/// Run a raw CDB; `Some(data)` on GOOD status (empty for a write), else `None`.
+fn raw(
+    session: &mut Drive,
+    cdb: &[u8],
+    dir: crate::scsi::DataDirection,
+    len: usize,
+) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let r = session.scsi_execute(cdb, dir, &mut buf, 5_000).ok()?;
+    (r.status == 0).then(|| buf[..r.bytes_transferred.min(buf.len())].to_vec())
 }
 
 /// Mask a string for privacy (letters->A, digits->0).
