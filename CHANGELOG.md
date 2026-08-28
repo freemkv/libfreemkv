@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [1.6.13] — 2026-08-28
+
+### Added
+
+- Capture a few additional drive buffers during `info --share` collection on supported drives.
+
 ## [1.6.12] — 2026-08-27
 
 ### Fixed
