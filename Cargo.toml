@@ -59,7 +59,7 @@ aes = { version = "0.9", optional = true }
 # Interim path dep for local cross-repo dev; the release script re-pins this to
 # `{ git = ".../freemkv-unlock", tag = "vX.Y.Z" }` before tagging libfreemkv (so
 # the released tag resolves freemkv-unlock from git, not a sibling path).
-freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.6.14", optional = true }
+freemkv-unlock = { path = "../freemkv-unlock", optional = true }
 rand = { version = "0.10", optional = true }
 zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
 base64 = { version = "0.23", optional = true }
