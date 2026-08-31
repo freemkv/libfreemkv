@@ -36,7 +36,15 @@ impl Disc {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
-        let dvd_info = match ifo::parse_vmg(reader, udf_fs) {
+        // Read VIDEO_TS.IFO once and reuse for both the VMG parse and the nav
+        // resolver below; otherwise the VTS reads in parse_vmg evict the single
+        // sector-cache window, forcing a duplicate physical read of the same file.
+        let vmg_bytes = match udf_fs.read_file(reader, "/VIDEO_TS/VIDEO_TS.IFO") {
+            Ok(bytes) => bytes,
+            Err(Error::Halted) => return Err(Error::Halted),
+            Err(_) => return Ok((Vec::new(), None)),
+        };
+        let dvd_info = match ifo::parse_vmg_with(reader, udf_fs, Some(&vmg_bytes)) {
             Ok(info) => info,
             Err(Error::Halted) => return Err(Error::Halted),
             Err(_) => return Ok((Vec::new(), None)),
@@ -45,7 +53,7 @@ impl Disc {
         // Follow the disc's First-Play navigation like a player would, to find the
         // nav-chosen feature title (issue #40). Read-only; any failure/non-convergence
         // yields `None`, so this only re-ranks, never removes, a title.
-        let nav_target = crate::dvdnav::resolve_main_title(reader, udf_fs);
+        let nav_target = crate::dvdnav::resolve_main_title(reader, udf_fs, Some(&vmg_bytes));
         let mut nav_feature: Option<u16> = None;
 
         let mut titles = Vec::new();
@@ -1355,7 +1363,7 @@ mod tests {
         assert_eq!(titles.len(), 2);
         // Sanity: the resolver reached the branch with the VTS-2 target.
         assert_eq!(
-            crate::dvdnav::resolve_main_title(&mut disc, &udf),
+            crate::dvdnav::resolve_main_title(&mut disc, &udf, None),
             Some(crate::dvdnav::nav::ResolvedTitle {
                 title: 2,
                 vtsn: 2,

@@ -61,6 +61,17 @@ const FEATURES: &[(u16, &str)] = &[
     (0x010D, "AACS"),
 ];
 
+// Renesas vendor-probe fields (signature-gated in `capture_drive_data`).
+const SCSI_WRITE_BUFFER: u8 = 0x3B; // WRITE BUFFER opcode (SPC-4)
+const RENESAS_RB_MODE: u8 = 0x02; // READ BUFFER mode: vendor-specific data
+const RENESAS_RB_BUFFER_ID: u8 = 0xB0; // vendor buffer id for the RB0x04 / RB0x500000 probes
+const RENESAS_RB_ADDR_04: u32 = 0x04; // vendor buffer offset for the `rb_b0_04` probe
+const RENESAS_RB_ADDR_500000: u32 = 0x500000; // vendor buffer offset for the `rb_b0_500000` probe
+const RENESAS_RB_LEN: u32 = 164; // vendor probe response length (bytes)
+const RENESAS_WB_MODE: u8 = 0x02; // WRITE BUFFER mode: vendor-specific data
+const RENESAS_WB_BUFFER_ID: u8 = 0x41; // vendor buffer id for the `wb_41` probe
+const RENESAS_WB_OFFSET: [u8; 3] = [0xA5, 0xAA, 0xAA]; // vendor magic offset for the `wb_41` probe
+
 /// Capture all available drive data via SCSI commands.
 /// Returns raw responses — no formatting, no zipping, no presentation.
 pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
@@ -91,21 +102,42 @@ pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
         use crate::scsi::{DataDirection as D, build_read_buffer};
         rb_b0_04 = raw(
             session,
-            &build_read_buffer(0x02, 0xB0, 0x04, 164),
+            &build_read_buffer(
+                RENESAS_RB_MODE,
+                RENESAS_RB_BUFFER_ID,
+                RENESAS_RB_ADDR_04,
+                RENESAS_RB_LEN,
+            ),
             D::FromDevice,
-            164,
+            RENESAS_RB_LEN as usize,
         );
         wb_41 = raw(
             session,
-            &[0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0, 0, 0, 0],
+            &[
+                SCSI_WRITE_BUFFER,
+                RENESAS_WB_MODE,
+                RENESAS_WB_BUFFER_ID,
+                RENESAS_WB_OFFSET[0],
+                RENESAS_WB_OFFSET[1],
+                RENESAS_WB_OFFSET[2],
+                0,
+                0,
+                0,
+                0,
+            ],
             D::None,
             0,
         );
         rb_b0_500000 = raw(
             session,
-            &build_read_buffer(0x02, 0xB0, 0x500000, 164),
+            &build_read_buffer(
+                RENESAS_RB_MODE,
+                RENESAS_RB_BUFFER_ID,
+                RENESAS_RB_ADDR_500000,
+                RENESAS_RB_LEN,
+            ),
             D::FromDevice,
-            164,
+            RENESAS_RB_LEN as usize,
         );
     }
 
@@ -238,6 +270,110 @@ mod tests {
         assert!(
             FEATURES.iter().any(|&(c, _)| c == 0x010D),
             "AACS feature 0x010D must be captured"
+        );
+    }
+
+    // ── Renesas signature gate ──────────────────────────────────────────
+
+    /// Mock transport that answers READ_BUFFER/WRITE_BUFFER the way a real
+    /// Renesas-family drive would: the Pioneer RB 0xF1 probe carries the
+    /// "SAT" signature (or not, per `signature`), and the two RB 0xB0
+    /// offsets each return a distinct marker byte so the test can tell them
+    /// apart. Every other command reports GOOD with a zeroed reply.
+    struct RenesasProbeTransport {
+        signature: bool,
+    }
+
+    impl crate::scsi::ScsiTransport for RenesasProbeTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _direction: crate::scsi::DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<crate::scsi::ScsiResult> {
+            let mut payload = vec![0u8; data.len()];
+            match cdb[0] {
+                crate::scsi::SCSI_READ_BUFFER => {
+                    let buffer_id = cdb[2];
+                    let offset = ((cdb[3] as u32) << 16) | ((cdb[4] as u32) << 8) | cdb[5] as u32;
+                    const PIONEER_RB_BUFFER_ID: u8 = 0xF1;
+                    if buffer_id == PIONEER_RB_BUFFER_ID && payload.len() >= 19 {
+                        // Pioneer probe: plant the Renesas signature at
+                        // [16..19] only when `signature` is set.
+                        if self.signature {
+                            payload[16..19].copy_from_slice(b"SAT");
+                        }
+                    } else if buffer_id == RENESAS_RB_BUFFER_ID {
+                        payload[0] = if offset == RENESAS_RB_ADDR_04 {
+                            0xAA
+                        } else if offset == RENESAS_RB_ADDR_500000 {
+                            0xBB
+                        } else {
+                            0x00
+                        };
+                    }
+                }
+                SCSI_WRITE_BUFFER => {}
+                _ => {}
+            }
+            let n = payload.len().min(data.len());
+            data[..n].copy_from_slice(&payload[..n]);
+            Ok(crate::scsi::ScsiResult {
+                status: 0,
+                bytes_transferred: n,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    fn drive_with_renesas_signature(signature: bool) -> Drive {
+        Drive::from_transport_for_test(Box::new(RenesasProbeTransport { signature }))
+    }
+
+    #[test]
+    fn renesas_gate_captures_the_vendor_probes_when_the_signature_matches() {
+        // rb_f1[16..19] == "SAT" must open the gate: all three Renesas-only
+        // fields come back populated, and the two RB 0xB0 probes must have
+        // hit the offsets this test planted markers at (not been swapped).
+        let mut drive = drive_with_renesas_signature(true);
+        let capture = capture_drive_data(&mut drive).expect("capture_drive_data failed");
+
+        assert_eq!(
+            capture.rb_b0_04.as_deref().map(|d| d[0]),
+            Some(0xAA),
+            "RB 0xB0 @0x04 must be captured when the signature matches"
+        );
+        assert_eq!(
+            capture.rb_b0_500000.as_deref().map(|d| d[0]),
+            Some(0xBB),
+            "RB 0xB0 @0x500000 must be captured when the signature matches"
+        );
+        assert!(
+            capture.wb_41.is_some(),
+            "WB 0x41 must be issued when the signature matches"
+        );
+    }
+
+    #[test]
+    fn renesas_gate_skips_the_vendor_probes_when_the_signature_is_absent() {
+        // No "SAT" at rb_f1[16..19] → the gate must not fire: all three
+        // Renesas-only fields stay None, and no marker from the mock's
+        // gate-only RB 0xB0 branch leaks through.
+        let mut drive = drive_with_renesas_signature(false);
+        let capture = capture_drive_data(&mut drive).expect("capture_drive_data failed");
+
+        assert!(
+            capture.rb_b0_04.is_none(),
+            "RB 0xB0 @0x04 must not be captured without the signature"
+        );
+        assert!(
+            capture.rb_b0_500000.is_none(),
+            "RB 0xB0 @0x500000 must not be captured without the signature"
+        );
+        assert!(
+            capture.wb_41.is_none(),
+            "WB 0x41 must not be issued without the signature"
         );
     }
 }
