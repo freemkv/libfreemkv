@@ -603,7 +603,10 @@ impl MkvStream {
 /// picture — the parser's value, the first time, never a guess.
 ///
 /// A progressive track — or a progressive picture on an interlaced-flagged track
-/// — has no field order (left UNDETERMINED — expected). An INTERLACED track that
+/// — has no field order (left UNDETERMINED — expected); the latter case ALSO
+/// clears the track's `interlaced` flag, since the declared scan type came from
+/// the IFO/MPLS resolution and the measurement supersedes it. An INTERLACED
+/// track that
 /// reaches here WITH a video picture but no measured field order is a
 /// parser/source gap (MPEG-2 carries `top_field_first` on every interlaced
 /// picture, so it should never be missing): LOG it loudly so the source can be
@@ -629,10 +632,17 @@ fn apply_coding_to_track(
     match coding.and_then(|c| c.field_order()) {
         Some(FieldOrder::Tff) => track.field_order = ebml::FIELD_ORDER_TFF,
         Some(FieldOrder::Bff) => track.field_order = ebml::FIELD_ORDER_BFF,
-        // A progressive picture on an interlaced-flagged track carries no field
-        // order. Leave UNDETERMINED (not a guess) — there is no parser gap here.
+        // Measured progressive: no field order (UNDETERMINED, not a guess), and
+        // the track is not interlaced — the DECLARED 480i/576i from the IFO is
+        // superseded by the coded picture, exactly as TFF/BFF override it above.
         Some(FieldOrder::Progressive) => {
             track.field_order = ebml::FIELD_ORDER_UNDETERMINED;
+            tracing::debug!(
+                target: "mux",
+                "video track declared interlaced by the source scan but the first \
+                 coded picture measures PROGRESSIVE; writing FlagInterlaced=progressive"
+            );
+            track.interlaced = false;
         }
         None if video_picture_seen => {
             tracing::warn!(
@@ -1982,11 +1992,17 @@ mod tests {
             "empty title → UNDETERMINED, never a guess"
         );
 
-        // Progressive picture on an interlaced-flagged track → UNDETERMINED (no
-        // field order applies; not faked to TFF/BFF).
+        // Progressive picture on an interlaced-flagged track → UNDETERMINED (not
+        // faked to TFF/BFF) AND the declared 480i/576i scan type is corrected.
         let mut t = interlaced_track();
+        assert!(t.interlaced, "the resolution declared it interlaced");
         apply_coding_to_track(&mut t, Some(pic(true, true)), true);
         assert_eq!(t.field_order, ebml::FIELD_ORDER_UNDETERMINED);
+        assert!(
+            !t.interlaced,
+            "a MEASURED progressive picture must clear the DECLARED interlaced \
+             flag — leaving it set makes players deinterlace progressive frames"
+        );
 
         // A PROGRESSIVE track is never touched — field order stays UNDETERMINED.
         let mut prog = MkvTrack::video(&VideoStream {
@@ -4136,6 +4152,93 @@ mod tests {
         data.windows(3)
             .find(|w| w[0] == 0x9D && w[1] == 0x81)
             .map(|w| w[2])
+    }
+
+    /// Locate the first TrackEntry's `FlagInterlaced` (0x9A) inside the Video
+    /// master of a muxed file. Always written, so `None` means the element is
+    /// missing entirely.
+    fn muxed_flag_interlaced(data: &[u8]) -> Option<u64> {
+        data.windows(3)
+            .find(|w| w[0] == 0x9A && w[1] == 0x81)
+            .map(|w| w[2] as u64)
+    }
+
+    /// A DVD whose IFO declares 480i/576i but whose pictures are CODED
+    /// progressive — film and animation on NTSC discs routinely are — must ship
+    /// `FlagInterlaced=progressive`, because that is what the bitstream says.
+    ///
+    /// `MkvTrack::video` sets `interlaced` from the DECLARED resolution, which
+    /// on a DVD is 480i essentially always. Shipping that unchecked marks
+    /// progressive content interlaced, and every player that honours the flag
+    /// then runs a deinterlacer over progressive frames — softening every frame
+    /// of an otherwise bit-exact remux. Measured against a real disc: `idet`
+    /// reports 100% progressive on titles this shipped as `FlagInterlaced=1`.
+    ///
+    /// The sibling test above pins the interlaced direction, so together they
+    /// constrain both: a measurement of TFF keeps the track interlaced, and a
+    /// measurement of progressive corrects it.
+    #[test]
+    fn a_progressive_picture_on_a_declared_interlaced_disc_ships_as_progressive() {
+        use crate::disc::{
+            ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream, VideoStream,
+        };
+        use crate::mux::codec::coding::{CodingType, Mpeg2Coding, PictureInfo};
+        let title = DiscTitle {
+            streams: vec![Stream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::Mpeg2,
+                // What the IFO declares. The bitstream below disagrees, and the
+                // bitstream is the source of truth.
+                resolution: Resolution::R576i,
+                frame_rate: FrameRate::F25,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt470bg,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })],
+            ..DiscTitle::empty()
+        };
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        s.write(&crate::pes::PesFrame {
+            coding: Some(PictureInfo::mpeg2(
+                CodingType::I,
+                Mpeg2Coding {
+                    top_field_first: true,
+                    repeat_first_field: false,
+                    // The measurement that matters — exactly what a real
+                    // animation DVD carries (progressive_frame set on every
+                    // picture while progressive_sequence stays 0).
+                    progressive_frame: true,
+                    progressive_sequence: false,
+                    frame_picture: true,
+                },
+            )),
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xBB; 16],
+            duration_ns: None,
+        })
+        .unwrap();
+        s.finish().unwrap();
+
+        let data = out.bytes();
+        assert_eq!(
+            muxed_flag_interlaced(&data),
+            Some(ebml::INTERLACED_PROGRESSIVE),
+            "measured-progressive content must ship FlagInterlaced=progressive; \
+             shipping the IFO's declared 576i makes players deinterlace it"
+        );
+        assert_eq!(
+            muxed_field_order(&data),
+            None,
+            "progressive content has no field order — the element must be omitted, \
+             not written as TFF from the (meaningless) top_field_first bit"
+        );
     }
 
     /// THE deferred-activation contract, end to end: the field order MEASURED
