@@ -174,11 +174,7 @@ pub(crate) mod unlock_bridge;
 
 // ─── Drive lifecycle ────────────────────────────────────────────────────────
 // `Drive::open(path)` → `wait_ready()` → `init()` → `Disc::scan()`. `Drive` owns
-// the SCSI session; `DriveCapture` etc. expose drive identity/profile data.
-#[cfg(feature = "rip")]
-pub use drive::capture::{
-    CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string,
-};
+// the SCSI session.
 #[cfg(feature = "rip")]
 pub use drive::{Drive, DriveStatus, extract_scsi_context, find_drive};
 
