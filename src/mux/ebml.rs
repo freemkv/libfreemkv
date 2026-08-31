@@ -470,6 +470,20 @@ pub const SEEK: u32 = 0x4DBB;
 /// reserved-but-unused region (e.g. the CUES SeekHead entry when no Cues element
 /// is written) so it carries no meaning to a parser.
 pub const VOID: u32 = 0xEC;
+
+/// A Void element (0xEC) that occupies EXACTLY `total_len` bytes in place: 1-byte
+/// id + 1-byte size VINT + zeroed payload. Used to neutralise a fixed element
+/// without shifting the bytes after it. `total_len` must be in `2..=129` (the
+/// 1-byte-size range, which covers every fixed element the muxer voids in place).
+pub fn void_element(total_len: usize) -> Vec<u8> {
+    assert!(
+        (2..=129).contains(&total_len),
+        "void_element: total_len {total_len} outside the 1-byte-size range 2..=129"
+    );
+    let mut v = vec![VOID as u8, 0x80 | (total_len - 2) as u8];
+    v.resize(total_len, 0);
+    v
+}
 pub const SEEK_ID: u32 = 0x53AB;
 pub const SEEK_POSITION: u32 = 0x53AC;
 

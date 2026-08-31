@@ -482,7 +482,10 @@ pub fn dump_disc(disc: &Disc) {
     // streamless obfuscation decoys the `has-video` gate demotes. Logged so a field
     // bug report shows WHY a playlist wasn't picked (the gap behind E6008 on `00245`).
     for (ti, t) in disc.titles.iter().enumerate() {
-        if !t.has_video() {
+        // Match the ACTUAL has-video gate used by `main_feature_order`
+        // (`has_probable_video`, deliberately more permissive than `has_video`),
+        // so the diagnostic doesn't report a title as demoted that was in fact kept.
+        if !t.has_probable_video() {
             tracing::debug!(
                 target: DIAG,
                 "tag=decision.demoted title_idx={} playlist={:?} dur={:.1}s size={}B reason=no-video",

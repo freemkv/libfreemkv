@@ -118,12 +118,12 @@ impl Disc {
             for (vts_title_idx, dvd_title) in ts.titles.iter().enumerate() {
                 title_number += 1;
 
-                // If the nav executor picked this title (by VTS number + 1-based position,
-                // the same `vts_ttn` convention used below), remember its global
-                // `playlist_id` so the caller can promote it in ranking.
+                // Match the nav target by VTS number + the REAL vts_title_num, not
+                // by position (a dropped sibling PGC or non-monotonic TT_SRPT
+                // desyncs position from vts_ttn); remember its playlist for ranking.
                 if let Some(rt) = nav_target
                     && rt.vtsn == ts.vts_number
-                    && rt.vts_ttn as usize == vts_title_idx + 1
+                    && rt.vts_ttn == dvd_title.vts_title_num
                 {
                     nav_feature = Some(title_number);
                 }

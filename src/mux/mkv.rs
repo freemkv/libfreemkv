@@ -749,9 +749,16 @@ struct FlagInterlacedFixup {
     interlaced_pics: u64,
 }
 
-/// One `finish()`-time FlagInterlaced correction: `(value_offset,
-/// final_interlaced, field_order_span_to_void_on_demotion)`.
-type InterlacedRewrite = (u64, bool, Option<(u64, u64)>);
+/// One `finish()`-time FlagInterlaced correction, resolved from the whole-stream
+/// scan majority.
+struct InterlacedRewrite {
+    /// File offset of the 1-byte FlagInterlaced value to overwrite.
+    value_offset: u64,
+    /// The corrected scan (`true` = interlaced) the majority resolved to.
+    final_interlaced: bool,
+    /// `(offset, len)` of the up-front FieldOrder element, Void'd on a demotion.
+    field_order_span: Option<(u64, u64)>,
+}
 
 /// TimestampScale: nanoseconds per Matroska timestamp tick. 0.1 ms (100_000 ns).
 ///
@@ -1601,6 +1608,23 @@ impl<W: Write + Seek> MkvMuxer<W> {
         Ok(())
     }
 
+    /// Apply deferred in-place byte patches in `finish()`: overwrite the bytes at
+    /// each `offset` with the given bytes, then restore the write cursor. Offsets
+    /// are disjoint fixed-size regions reserved up-front, so nothing shifts. Shared
+    /// by the PGS-forced and FlagInterlaced fixups.
+    fn patch_bytes(&mut self, patches: &[(u64, Vec<u8>)]) -> io::Result<()> {
+        if patches.is_empty() {
+            return Ok(());
+        }
+        let here = self.writer.stream_position()?;
+        for (off, bytes) in patches {
+            self.writer.seek(std::io::SeekFrom::Start(*off))?;
+            self.writer.write_all(bytes)?;
+        }
+        self.writer.seek(std::io::SeekFrom::Start(here))?;
+        Ok(())
+    }
+
     /// Finish the MKV file: write Cues element.
     ///
     /// # Cluster-driver invariant
@@ -1710,14 +1734,12 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 None
             })
             .collect();
-        if !rewrites.is_empty() {
-            let here = self.writer.stream_position()?;
-            for (off, value) in rewrites {
-                self.writer.seek(std::io::SeekFrom::Start(off))?;
-                self.writer.write_all(&[value])?;
-            }
-            self.writer.seek(std::io::SeekFrom::Start(here))?;
-        }
+        self.patch_bytes(
+            &rewrites
+                .into_iter()
+                .map(|(off, value)| (off, vec![value]))
+                .collect::<Vec<_>>(),
+        )?;
 
         // Correct FlagInterlaced from the WHOLE-stream scan majority: the header
         // value came from only the FIRST coded picture. Rewrite the byte to the
@@ -1730,42 +1752,42 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 if f.progressive_pics == 0 && f.interlaced_pics == 0 {
                     return None;
                 }
-                // Interlaced only when it is the strict majority — a tie stays
-                // progressive so a mostly-progressive title is not deinterlaced.
-                let majority_interlaced = f.interlaced_pics > f.progressive_pics;
-                if majority_interlaced == f.initial_interlaced {
+                // Interlaced only on a strict majority — a tie stays progressive so
+                // a mostly-progressive title is not needlessly deinterlaced.
+                let final_interlaced = f.interlaced_pics > f.progressive_pics;
+                if final_interlaced == f.initial_interlaced {
                     return None; // the first picture already matched the majority
                 }
-                Some((f.value_offset, majority_interlaced, f.field_order_span))
+                Some(InterlacedRewrite {
+                    value_offset: f.value_offset,
+                    final_interlaced,
+                    field_order_span: f.field_order_span,
+                })
             })
             .collect();
-        if !interlaced_rewrites.is_empty() {
-            let here = self.writer.stream_position()?;
-            for (off, majority_interlaced, field_order_span) in interlaced_rewrites {
-                let value = if majority_interlaced {
-                    ebml::INTERLACED_INTERLACED
-                } else {
-                    ebml::INTERLACED_PROGRESSIVE
-                } as u8;
-                self.writer.seek(std::io::SeekFrom::Start(off))?;
-                self.writer.write_all(&[value])?;
-                // Demotion to progressive: the up-front FieldOrder element is now
-                // contradictory. Overwrite it with a Void of identical length
-                // (id + size + zeroed payload) so no later element shifts.
-                if !majority_interlaced && let Some((fo_off, fo_len)) = field_order_span {
-                    self.writer.seek(std::io::SeekFrom::Start(fo_off))?;
-                    ebml::write_id(&mut self.writer, ebml::VOID)?;
-                    ebml::write_size(&mut self.writer, fo_len - 2)?;
-                    self.writer.write_all(&vec![0u8; (fo_len - 2) as usize])?;
-                }
-                tracing::warn!(
-                    target: "mux",
-                    interlaced = majority_interlaced,
-                    "FlagInterlaced corrected from the whole-stream scan majority; the first coded picture did not represent the title"
-                );
+        let mut interlaced_patches: Vec<(u64, Vec<u8>)> = Vec::new();
+        for rw in &interlaced_rewrites {
+            let value = if rw.final_interlaced {
+                ebml::INTERLACED_INTERLACED
+            } else {
+                ebml::INTERLACED_PROGRESSIVE
+            } as u8;
+            interlaced_patches.push((rw.value_offset, vec![value]));
+            // Demotion to progressive: the up-front FieldOrder element is now
+            // contradictory — overwrite it with a same-length Void so no later
+            // element shifts.
+            if !rw.final_interlaced
+                && let Some((fo_off, fo_len)) = rw.field_order_span
+            {
+                interlaced_patches.push((fo_off, ebml::void_element(fo_len as usize)));
             }
-            self.writer.seek(std::io::SeekFrom::Start(here))?;
+            tracing::warn!(
+                target: "mux",
+                interlaced = rw.final_interlaced,
+                "FlagInterlaced corrected from the whole-stream scan majority; the first coded picture did not represent the title"
+            );
         }
+        self.patch_bytes(&interlaced_patches)?;
 
         // Write Cues
         let cues_start = self.writer.stream_position()?;

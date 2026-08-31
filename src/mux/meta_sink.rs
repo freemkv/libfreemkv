@@ -286,9 +286,10 @@ mod tests {
         })];
         let v = title_json(&t);
         let a = &v["audio"][0];
+        // Unknown layout must serialize as the string "unknown" — never a
+        // fabricated numeric layout. (The schema has no separate channel_count
+        // field; `channels` is the only channel signal, so this is the guard.)
         assert_eq!(a["channels"], "unknown");
-        // No fabricated numeric channel count is emitted in the profile schema.
-        assert!(a["channel_count"].is_null());
     }
 
     #[test]

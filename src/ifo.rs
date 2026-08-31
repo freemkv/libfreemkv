@@ -51,6 +51,10 @@ pub struct DvdTitle {
     pub chapter_times: Vec<f64>,
     /// Subtitle palette from PGC: 16 entries of [padding, Y, Cr, Cb].
     pub palette: Option<Vec<[u8; 4]>>,
+    /// This title's 1-based `vts_title_num` (TTN within its VTS). Carried so nav
+    /// resolution joins on the REAL title number rather than the position in the
+    /// titles vec, which desyncs when a sibling PGC is dropped as unparseable.
+    pub vts_title_num: u8,
 }
 
 /// A cell — contiguous sector range within a VOB.
@@ -877,7 +881,12 @@ fn parse_pgcit(
             .ok_or(Error::IfoParse)?;
 
         match parse_pgc(data, pgc_abs, chapter_count) {
-            Ok(title) => titles.push(title),
+            Ok(mut title) => {
+                // Stamp the REAL title number so downstream nav joins survive a
+                // dropped sibling PGC (position in `titles` is not vts_title_num).
+                title.vts_title_num = vts_title_num;
+                titles.push(title);
+            }
             Err(e) => {
                 // A single unparseable PGC (truncated/corrupt entry, authoring quirk)
                 // must not lose the whole title list, but must not be silent either:
@@ -1038,6 +1047,8 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         cells,
         chapter_times,
         palette,
+        // Set by the caller (parse_pgcit) which knows the TT_SRPT title number.
+        vts_title_num: 0,
     })
 }
 
@@ -1238,6 +1249,7 @@ mod tests {
             cells: vec![cell.clone()],
             chapter_times: Vec::new(),
             palette: None,
+            vts_title_num: 0,
         };
         assert_eq!(title.chapters, 5);
         assert!((title.duration_secs - 3600.0).abs() < 0.01);
@@ -2061,6 +2073,7 @@ mod tests {
             ],
             chapter_times: vec![0.0, 100.0, 200.0],
             palette: None,
+            vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert_eq!(t.feature_cells().len(), 3);
@@ -2082,6 +2095,7 @@ mod tests {
             ],
             chapter_times: vec![0.0, 50.0],
             palette: None,
+            vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 2);
         let fc = t.feature_cells();
@@ -2101,6 +2115,7 @@ mod tests {
             cells: vec![cell(0, 9, 0b1001_0000), cell(10, 19, 0b1101_0000)],
             chapter_times: vec![0.0],
             palette: None,
+            vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert_eq!(t.feature_cells().len(), 2);
@@ -2115,6 +2130,7 @@ mod tests {
             cells: vec![],
             chapter_times: vec![],
             palette: None,
+            vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert!(t.feature_cells().is_empty());

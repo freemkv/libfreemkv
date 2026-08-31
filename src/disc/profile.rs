@@ -403,11 +403,11 @@ mod tests {
 
     #[test]
     fn splits_streams_into_typed_vectors_across_formats() {
-        for title in [bdts_title(), dvd_title()] {
+        for (title, expect_subs) in [(bdts_title(), 2), (dvd_title(), 1)] {
             let p = TitleProfile::from_title(&title, 0, true);
             assert_eq!(p.video.len(), 1, "one video track");
             assert_eq!(p.audio.len(), 2, "two audio tracks");
-            assert_eq!(p.subtitles.len(), 1.max(p.subtitles.len()));
+            assert_eq!(p.subtitles.len(), expect_subs, "subtitle count per format");
             // Accessors return the same vectors.
             assert_eq!(p.video(), p.video.as_slice());
             assert_eq!(p.audio(), p.audio.as_slice());

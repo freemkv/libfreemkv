@@ -1,10 +1,11 @@
-//! CLPI clip info parser — maps clips to sector ranges on disc.
+//! CLPI clip info parser (BD-ROM Clip Information).
 //!
-//! Each .clpi file in BDMV/CLIPINF/ describes one M2TS clip.
-//! The EP (Entry Point) map provides timestamp → SPN mapping.
-//! SPN × 192 = byte offset in the m2ts file.
-//!
-//! Format is documented in the BD-ROM Clip Information (CLPI) specification.
+//! Each .clpi file in BDMV/CLIPINF/ describes one M2TS clip. This parser reads
+//! two things from it: `source_packet_count` (the clip's total 192-byte packet
+//! count) and the ProgramInfo stream table (PID/coding-type/language), which
+//! cross-validates the MPLS STN view (see `labels/clpi_audit.rs`). The CPI/EP
+//! map is NOT parsed — reading is whole-clip via UDF and trimming is done at the
+//! playlist/timeline (PTS) level, not by EP-map SPN→sector seeking.
 
 use crate::error::{Error, Result};
 
