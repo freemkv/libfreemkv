@@ -268,13 +268,26 @@ static DADissenterRef da_claim_release(DADiskRef disk, void *ctx) {
         CFSTR("freemkv still holds this disc"));
 }
 
-typedef struct { dispatch_semaphore_t sem; int ok; } DAClaimResult;
+// Heap-allocated and reference-counted (rc=2: one ref for da_hold, one for the
+// async callback) so neither the struct nor its semaphore is freed while the
+// other side may still touch it. This matters on the 5 s timeout path, where
+// da_hold returns but da_claim_done can still fire later — a stack DAClaimResult
+// would be a use-after-free, and never releasing the semaphore would leak it.
+typedef struct { dispatch_semaphore_t sem; int ok; volatile int rc; } DAClaimResult;
+
+static void da_claim_result_release(DAClaimResult *r) {
+    if (__sync_sub_and_fetch(&r->rc, 1) == 0) {
+        dispatch_release(r->sem);
+        free(r);
+    }
+}
 
 static void da_claim_done(DADiskRef disk, DADissenterRef dissenter, void *ctx) {
     (void)disk;
     DAClaimResult *r = (DAClaimResult *)ctx;
     r->ok = (dissenter == NULL);
     dispatch_semaphore_signal(r->sem);
+    da_claim_result_release(r);
 }
 
 // Best-effort: claim the disk and register the mount-approval dissenter.
@@ -295,17 +308,24 @@ static int da_hold(const char *bsd_name) {
 
     DARegisterDiskMountApprovalCallback(g_handle.da_session, NULL, da_mount_approval, NULL);
 
-    DAClaimResult r = {dispatch_semaphore_create(0), 0};
+    DAClaimResult *r = malloc(sizeof(DAClaimResult));
+    if (!r) return 0;
+    r->sem = dispatch_semaphore_create(0);
+    r->ok = 0;
+    r->rc = 2; // one ref held here, one for the async da_claim_done callback
     DADiskClaim(g_handle.da_disk, kDADiskClaimOptionDefault,
-        da_claim_release, NULL, da_claim_done, &r);
+        da_claim_release, NULL, da_claim_done, r);
     // Bounded wait for the async claim callback (5 s), so a wedged DA can't
-    // hang open() forever.
-    if (dispatch_semaphore_wait(r.sem,
+    // hang open() forever. On timeout the callback may still fire later, so we
+    // must NOT read r->ok or free r here — releasing our ref hands ownership to
+    // whichever side finishes last (see da_claim_result_release).
+    if (dispatch_semaphore_wait(r->sem,
             dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC)) != 0) {
         g_handle.da_claimed = 0;
     } else {
-        g_handle.da_claimed = r.ok;
+        g_handle.da_claimed = r->ok;
     }
+    da_claim_result_release(r);
     return g_handle.da_claimed;
 }
 
