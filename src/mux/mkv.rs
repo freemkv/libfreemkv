@@ -687,6 +687,15 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// A vendor forced flag is cleared only under the cross-track guard in
     /// `finish()` (see `super::codec::pgs::demotable`).
     pgs_forced_fixups: std::collections::HashMap<usize, PgsForcedFixup>,
+    /// Deferred `FlagInterlaced` correction. A video track's scan type is written
+    /// up-front from the FIRST coded picture, but MPEG-2 `progressive_frame` is a
+    /// PER-picture flag (§6.3.10): the first picture (a progressive leader/logo on
+    /// an interlaced feature, or an interlaced leader on a progressive one) can
+    /// misrepresent the whole title. Each entry records the `FlagInterlaced` byte
+    /// offset and the `FieldOrder` element's span, then counts progressive vs
+    /// interlaced pictures across the WHOLE track; at `finish()` the byte is
+    /// rewritten to the MAJORITY scan (and a now-wrong FieldOrder Void'd).
+    flag_interlaced_fixups: std::collections::HashMap<usize, FlagInterlacedFixup>,
     /// `--log-level 3` opening-frame capture: the first ~100 coded frames per
     /// track are written (raw) to a `<output>.opening.bin` side file with a
     /// per-frame summary logged, so an opening-GOP / menu / mid-GOP-open issue is
@@ -719,6 +728,30 @@ struct PgsForcedFixup {
     /// type drives the `info`-time forced probe, so both classify identically.
     tracker: super::codec::pgs::ForcedTracker,
 }
+
+/// Deferred `FlagInterlaced` correction state for one video track. The provisional
+/// value comes from the first coded picture; the true scan type is a whole-stream
+/// property, so every picture's `progressive()` verdict is tallied and the header
+/// byte is corrected to the majority at `finish()`.
+struct FlagInterlacedFixup {
+    /// Absolute file offset of the 1-byte `FlagInterlaced` value in the Tracks element.
+    value_offset: u64,
+    /// `(offset, len)` of the `FieldOrder` element, present only when one was
+    /// written up-front (interlaced provisional with a determined order). On a
+    /// demotion to progressive it is overwritten with a Void of identical length.
+    field_order_span: Option<(u64, u64)>,
+    /// The value written up-front (`true` = interlaced), so `finish()` rewrites
+    /// only when the majority actually disagrees.
+    initial_interlaced: bool,
+    /// Pictures measured progressive / interlaced across the whole track. Pictures
+    /// with no scan signal (e.g. H.264/HEVC `CodingTypeOnly`) count toward neither.
+    progressive_pics: u64,
+    interlaced_pics: u64,
+}
+
+/// One `finish()`-time FlagInterlaced correction: `(value_offset,
+/// final_interlaced, field_order_span_to_void_on_demotion)`.
+type InterlacedRewrite = (u64, bool, Option<(u64, u64)>);
 
 /// TimestampScale: nanoseconds per Matroska timestamp tick. 0.1 ms (100_000 ns).
 ///
@@ -944,6 +977,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             std::collections::HashMap::new();
         let mut pgs_forced_fixups: std::collections::HashMap<usize, PgsForcedFixup> =
             std::collections::HashMap::new();
+        let mut flag_interlaced_fixups: std::collections::HashMap<usize, FlagInterlacedFixup> =
+            std::collections::HashMap::new();
         // Per track: whether it emitted a conforming `mvcC` BlockAdditionMapping.
         // Filled below from the SAME built record that drives the CodecPrivate
         // mvcC extension, so the three MVC signals never diverge.
@@ -1038,24 +1073,37 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 let vid_pos = ebml::start_master(&mut writer, ebml::VIDEO)?;
                 ebml::write_uint(&mut writer, ebml::PIXEL_WIDTH, track.pixel_width as u64)?;
                 ebml::write_uint(&mut writer, ebml::PIXEL_HEIGHT, track.pixel_height as u64)?;
-                // FlagInterlaced: 1 = interlaced, 2 = progressive. FieldOrder (0x9D) is
-                // written only for interlaced content with a determined order (TFF=1,
-                // BFF=6); omitted entirely when undetermined (RFC 9559).
-                ebml::write_uint(
-                    &mut writer,
-                    ebml::FLAG_INTERLACED,
-                    if track.interlaced {
-                        ebml::INTERLACED_INTERLACED
+                // FlagInterlaced (1=interlaced, 2=progressive) and FieldOrder are
+                // written by hand (id+size+value) so their file offsets can be
+                // captured for the whole-stream majority correction at finish().
+                ebml::write_id(&mut writer, ebml::FLAG_INTERLACED)?;
+                ebml::write_size(&mut writer, 1)?;
+                let flag_offset = writer.stream_position()?;
+                writer.write_all(&[if track.interlaced {
+                    ebml::INTERLACED_INTERLACED as u8
+                } else {
+                    ebml::INTERLACED_PROGRESSIVE as u8
+                }])?;
+                let field_order_span =
+                    if track.interlaced && track.field_order != ebml::FIELD_ORDER_UNDETERMINED {
+                        // `track.field_order` was set correctly before construction (the mux
+                        // stream reads the first coded picture's measured field order).
+                        let start = writer.stream_position()?;
+                        ebml::write_uint(&mut writer, ebml::FIELD_ORDER, track.field_order as u64)?;
+                        Some((start, writer.stream_position()? - start))
                     } else {
-                        ebml::INTERLACED_PROGRESSIVE
+                        None
+                    };
+                flag_interlaced_fixups.insert(
+                    i,
+                    FlagInterlacedFixup {
+                        value_offset: flag_offset,
+                        field_order_span,
+                        initial_interlaced: track.interlaced,
+                        progressive_pics: 0,
+                        interlaced_pics: 0,
                     },
-                )?;
-                if track.interlaced && track.field_order != ebml::FIELD_ORDER_UNDETERMINED {
-                    // `track.field_order` was set correctly before construction (the mux
-                    // stream reads the first coded picture's measured field order), so
-                    // this writes the right value the first time — no later rewrite.
-                    ebml::write_uint(&mut writer, ebml::FIELD_ORDER, track.field_order as u64)?;
-                }
+                );
                 if track.display_width > 0 && track.display_height > 0 {
                     ebml::write_uint(&mut writer, ebml::DISPLAY_WIDTH, track.display_width as u64)?;
                     ebml::write_uint(
@@ -1225,6 +1273,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             last_video_keyframe_ticks: vec![None; tracks.len()],
             ac3_channel_fixups,
             pgs_forced_fixups,
+            flag_interlaced_fixups,
             opening_capture: None,
         })
     }
@@ -1285,6 +1334,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             duration_ns,
             block_additional,
             None,
+            None,
         )
     }
 
@@ -1313,6 +1363,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         duration_ns: Option<u64>,
         block_additional: Option<&[u8]>,
         src_byte: Option<u64>,
+        scan_progressive: Option<bool>,
     ) -> io::Result<()> {
         // --log-level 3: capture the first ~100 coded frames per track to the side file
         // BEFORE any timeline mangling, with the parser's own PTS, so an opening-GOP
@@ -1342,6 +1393,18 @@ impl<W: Write + Seek> MkvMuxer<W> {
         ) else {
             return Ok(());
         };
+        // Tally this KEPT picture's measured scan type for the whole-stream
+        // FlagInterlaced majority (dropped-by-mark frames must not count). A
+        // picture with no scan signal (`None`) counts toward neither.
+        if let Some(prog) = scan_progressive
+            && let Some(fixup) = self.flag_interlaced_fixups.get_mut(&track_idx)
+        {
+            if prog {
+                fixup.progressive_pics += 1;
+            } else {
+                fixup.interlaced_pics += 1;
+            }
+        }
         let raw_ticks = pts_ns / TIMESTAMP_SCALE_NS;
 
         // Clusters normally open on a video keyframe so Cues resolve to a seekable
@@ -1652,6 +1715,54 @@ impl<W: Write + Seek> MkvMuxer<W> {
             for (off, value) in rewrites {
                 self.writer.seek(std::io::SeekFrom::Start(off))?;
                 self.writer.write_all(&[value])?;
+            }
+            self.writer.seek(std::io::SeekFrom::Start(here))?;
+        }
+
+        // Correct FlagInterlaced from the WHOLE-stream scan majority: the header
+        // value came from only the FIRST coded picture. Rewrite the byte to the
+        // dominant scan; on a demotion to progressive, Void the stale FieldOrder.
+        let interlaced_rewrites: Vec<InterlacedRewrite> = self
+            .flag_interlaced_fixups
+            .values()
+            .filter_map(|f| {
+                // No scan signal at all (e.g. H.264/HEVC): keep the provisional value.
+                if f.progressive_pics == 0 && f.interlaced_pics == 0 {
+                    return None;
+                }
+                // Interlaced only when it is the strict majority — a tie stays
+                // progressive so a mostly-progressive title is not deinterlaced.
+                let majority_interlaced = f.interlaced_pics > f.progressive_pics;
+                if majority_interlaced == f.initial_interlaced {
+                    return None; // the first picture already matched the majority
+                }
+                Some((f.value_offset, majority_interlaced, f.field_order_span))
+            })
+            .collect();
+        if !interlaced_rewrites.is_empty() {
+            let here = self.writer.stream_position()?;
+            for (off, majority_interlaced, field_order_span) in interlaced_rewrites {
+                let value = if majority_interlaced {
+                    ebml::INTERLACED_INTERLACED
+                } else {
+                    ebml::INTERLACED_PROGRESSIVE
+                } as u8;
+                self.writer.seek(std::io::SeekFrom::Start(off))?;
+                self.writer.write_all(&[value])?;
+                // Demotion to progressive: the up-front FieldOrder element is now
+                // contradictory. Overwrite it with a Void of identical length
+                // (id + size + zeroed payload) so no later element shifts.
+                if !majority_interlaced && let Some((fo_off, fo_len)) = field_order_span {
+                    self.writer.seek(std::io::SeekFrom::Start(fo_off))?;
+                    ebml::write_id(&mut self.writer, ebml::VOID)?;
+                    ebml::write_size(&mut self.writer, fo_len - 2)?;
+                    self.writer.write_all(&vec![0u8; (fo_len - 2) as usize])?;
+                }
+                tracing::warn!(
+                    target: "mux",
+                    interlaced = majority_interlaced,
+                    "FlagInterlaced corrected from the whole-stream scan majority; the first coded picture did not represent the title"
+                );
             }
             self.writer.seek(std::io::SeekFrom::Start(here))?;
         }
