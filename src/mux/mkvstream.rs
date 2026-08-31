@@ -315,6 +315,8 @@ fn emit_to_muxer(
         additional,
         // Provenance: which clip this frame came from is a lookup, not a guess.
         frame.source.map(|s| s.byte),
+        // This picture's measured scan type, tallied for the FlagInterlaced majority.
+        frame.coding.as_ref().and_then(|c| c.progressive()),
     )
 }
 
@@ -522,6 +524,7 @@ impl MkvStream {
                 f.duration_ns,
                 additional.as_deref(),
                 f.source.map(|s| s.byte),
+                f.coding.as_ref().and_then(|c| c.progressive()),
             )?;
         }
         self.mode = Mode::Write(WriteMode::Active(Box::new(muxer)));
@@ -606,8 +609,7 @@ impl MkvStream {
 /// — has no field order (left UNDETERMINED — expected); the latter case ALSO
 /// clears the track's `interlaced` flag, since the declared scan type came from
 /// the IFO/MPLS resolution and the measurement supersedes it. An INTERLACED
-/// track that
-/// reaches here WITH a video picture but no measured field order is a
+/// track that reaches here WITH a video picture but no measured field order is a
 /// parser/source gap (MPEG-2 carries `top_field_first` on every interlaced
 /// picture, so it should never be missing): LOG it loudly so the source can be
 /// debugged, and leave UNDETERMINED — a muxer never fabricates a source fact.
@@ -4241,6 +4243,158 @@ mod tests {
         );
     }
 
+    /// Whole-stream FlagInterlaced correction, PROMOTE direction: a genuinely
+    /// interlaced 576i feature whose FIRST coded picture is a progressive leader
+    /// (black/logo). One unrepresentative picture must NOT flip the whole track —
+    /// the majority scan (interlaced) wins at finish(). Without the correction the
+    /// first-picture verdict ships FlagInterlaced=progressive for the whole file.
+    #[test]
+    fn a_progressive_first_picture_on_a_mostly_interlaced_title_ships_interlaced() {
+        use crate::disc::{
+            ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream, VideoStream,
+        };
+        use crate::mux::codec::coding::{CodingType, Mpeg2Coding, PictureInfo};
+        let title = DiscTitle {
+            streams: vec![Stream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::Mpeg2,
+                resolution: Resolution::R576i,
+                frame_rate: FrameRate::F25,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt470bg,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })],
+            ..DiscTitle::empty()
+        };
+        let pic = |progressive: bool, ct: CodingType| {
+            Some(PictureInfo::mpeg2(
+                ct,
+                Mpeg2Coding {
+                    top_field_first: true,
+                    repeat_first_field: false,
+                    progressive_frame: progressive,
+                    progressive_sequence: false,
+                    frame_picture: true,
+                },
+            ))
+        };
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        // First picture: a lone progressive leader.
+        s.write(&crate::pes::PesFrame {
+            coding: pic(true, CodingType::I),
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xBB; 16],
+            duration_ns: None,
+        })
+        .unwrap();
+        // The feature itself: genuinely interlaced pictures dominate.
+        for i in 1..6 {
+            s.write(&crate::pes::PesFrame {
+                coding: pic(false, CodingType::P),
+                source: None,
+                track: 0,
+                pts: i * 40_000_000,
+                keyframe: false,
+                data: vec![0xCC; 16],
+                duration_ns: None,
+            })
+            .unwrap();
+        }
+        s.finish().unwrap();
+        assert_eq!(
+            muxed_flag_interlaced(&out.bytes()),
+            Some(ebml::INTERLACED_INTERLACED),
+            "a progressive FIRST picture on a mostly-interlaced title must not flip \
+             the whole track to progressive — the majority scan wins"
+        );
+    }
+
+    /// Whole-stream FlagInterlaced correction, DEMOTE direction — which also
+    /// extends the original fix: progressive film mis-declared 576i whose FIRST
+    /// coded picture is interlaced-coded. The majority (progressive) wins, so the
+    /// track ships progressive AND the up-front FieldOrder is Void'd (a progressive
+    /// track carries none).
+    #[test]
+    fn an_interlaced_first_picture_on_a_mostly_progressive_title_ships_progressive() {
+        use crate::disc::{
+            ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream, VideoStream,
+        };
+        use crate::mux::codec::coding::{CodingType, Mpeg2Coding, PictureInfo};
+        let title = DiscTitle {
+            streams: vec![Stream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::Mpeg2,
+                resolution: Resolution::R576i,
+                frame_rate: FrameRate::F25,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt470bg,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })],
+            ..DiscTitle::empty()
+        };
+        let pic = |progressive: bool, ct: CodingType| {
+            Some(PictureInfo::mpeg2(
+                ct,
+                Mpeg2Coding {
+                    top_field_first: true,
+                    repeat_first_field: false,
+                    progressive_frame: progressive,
+                    progressive_sequence: false,
+                    frame_picture: true,
+                },
+            ))
+        };
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        // First picture: interlaced (TFF) → provisional interlaced + FieldOrder written.
+        s.write(&crate::pes::PesFrame {
+            coding: pic(false, CodingType::I),
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xBB; 16],
+            duration_ns: None,
+        })
+        .unwrap();
+        // The feature itself: progressive pictures dominate.
+        for i in 1..6 {
+            s.write(&crate::pes::PesFrame {
+                coding: pic(true, CodingType::P),
+                source: None,
+                track: 0,
+                pts: i * 40_000_000,
+                keyframe: false,
+                data: vec![0xCC; 16],
+                duration_ns: None,
+            })
+            .unwrap();
+        }
+        s.finish().unwrap();
+        let data = out.bytes();
+        assert_eq!(
+            muxed_flag_interlaced(&data),
+            Some(ebml::INTERLACED_PROGRESSIVE),
+            "a mostly-progressive title must ship progressive even when its first \
+             picture was interlaced-coded"
+        );
+        assert_eq!(
+            muxed_field_order(&data),
+            None,
+            "a track demoted to progressive must not keep its provisional FieldOrder"
+        );
+    }
+
     /// THE deferred-activation contract, end to end: the field order MEASURED
     /// from the first coded picture has to reach the FILE.
     ///
@@ -4326,6 +4480,14 @@ mod tests {
             Some(ebml::FIELD_ORDER_TFF),
             "the MEASURED top-field-first must be written to the file; an omitted \
              or UNDETERMINED FieldOrder means the measurement never got there"
+        );
+        // Pin the interlaced direction at the muxed-byte level too: a swap of the
+        // INTERLACED_INTERLACED/INTERLACED_PROGRESSIVE constants in the writer
+        // would otherwise pass every other test in this file.
+        assert_eq!(
+            muxed_flag_interlaced(&out.bytes()),
+            Some(ebml::INTERLACED_INTERLACED),
+            "a MEASURED-interlaced track must ship FlagInterlaced=interlaced"
         );
     }
 
