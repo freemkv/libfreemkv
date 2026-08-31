@@ -490,6 +490,7 @@ fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnu
 /// retained field name is a heap `String`.
 fn clinit_enum_field_names(class: &super::class_reader::ClassFile) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut out_bytes = 0usize;
     let Some(self_name) = class.this_class_name() else {
         return out;
     };
@@ -512,9 +513,15 @@ fn clinit_enum_field_names(class: &super::class_reader::ClassFile) -> Vec<String
             // Only the enum's own singleton fields (`Lself;` typed, owned by
             // this class) — skip auxiliary statics (`$VALUES` arrays, counters).
             if member.class_name == self_name && member.descriptor == self_descriptor {
-                if out.len() >= MAX_CLINIT_LDC_STRINGS {
+                // Cap retained bytes too, not just the count — a CONSTANT_Utf8 name
+                // is an attacker-controlled u2 length (JVMS 4.4.7), like the sibling
+                // `clinit_ldc_strings` guards with MAX_CLINIT_LDC_BYTES.
+                if out.len() >= MAX_CLINIT_LDC_STRINGS
+                    || out_bytes.saturating_add(member.name.len()) > MAX_CLINIT_LDC_BYTES
+                {
                     break;
                 }
+                out_bytes += member.name.len();
                 out.push(member.name.to_string());
             }
         }
