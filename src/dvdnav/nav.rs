@@ -48,8 +48,9 @@ const STEP_BUDGET: usize = 1024;
 const MAX_CMDS: usize = 128;
 
 /// Maximum TT_SRPT entries honoured — the DVD-Video 99-title format maximum
-/// (mirrors `ifo::MAX_TT_SRPT_TITLES`; the on-disc count is an untrusted u16).
-const MAX_TT_SRPT_TITLES: usize = 99;
+/// (the on-disc count is an untrusted u16). Shared with the IFO parser so the
+/// two can never diverge.
+use crate::ifo::MAX_TT_SRPT_TITLES;
 
 /// The title the First-Play navigation selects, in VMG coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
