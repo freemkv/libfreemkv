@@ -18,45 +18,79 @@ publish = false
 lto = "thin"
 codegen-units = 1
 
+# ── Feature layout ───────────────────────────────────────────────────────────
+# `scsi`  — the SCSI passthrough transport layer ONLY (`src/scsi/` + `error`):
+#           ScsiTransport/execute, ScsiResult/ScsiSense/parse_sense, DriveInfo,
+#           list_drives, drive_has_disc, CDB builders, the per-OS backends and
+#           the raw-`cc` macOS shim (built by build.rs). Pulls only `tracing`
+#           (transport instrumentation) plus the always-on `libc` target dep —
+#           none of the ripping dependency tree.
+# `rip`   — the full ripping tree (drive lifecycle, disc/UDF/MPLS/CLPI parsing,
+#           AACS/CSS decrypt, PES/mux pipeline, keydb, freemkv-unlock seam). All
+#           heavy deps (serde, zip, rayon, roxmltree, rand, crossbeam, memchr,
+#           sha1, aes, base64, freemkv-unlock, serde_json) live here.
+# `default = ["rip", "scsi"]` preserves today's full build byte-for-byte;
+# consumers wanting transport only use `default-features = false, features =
+# ["scsi"]`. `rip` implies `scsi` because the ripping tree reads through it.
+[features]
+default = ["rip", "scsi"]
+scsi = ["dep:tracing"]
+rip = [
+    "scsi",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha1",
+    "dep:aes",
+    "dep:freemkv-unlock",
+    "dep:rand",
+    "dep:zip",
+    "dep:base64",
+    "dep:roxmltree",
+    "dep:crossbeam-channel",
+    "dep:rayon",
+    "dep:memchr",
+]
+
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha1 = "0.10"
-aes = "0.9"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+sha1 = { version = "0.10", optional = true }
+aes = { version = "0.9", optional = true }
 # Interim path dep for local cross-repo dev; the release script re-pins this to
 # `{ git = ".../freemkv-unlock", tag = "vX.Y.Z" }` before tagging libfreemkv (so
 # the released tag resolves freemkv-unlock from git, not a sibling path).
-freemkv-unlock = { path = "../freemkv-unlock" }
-rand = "0.10"
-zip = { version = "8", default-features = false, features = ["deflate"] }
-base64 = "0.23"
+freemkv-unlock = { path = "../freemkv-unlock", optional = true }
+rand = { version = "0.10", optional = true }
+zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
+base64 = { version = "0.23", optional = true }
 # Read-only XML DOM parser (pure Rust, forbid(unsafe_code), entity-expansion
 # bounded). Parses the HD-DVD Advanced-Content playlist `ADV_OBJ/VPLST000.XPL`
 # — untrusted disc bytes — into authoritative titles/clips/chapters. A real
 # parser, not a hand-rolled scanner: the XPL is genuine XML (comments, varied
 # attribute order, self-closing tags).
-roxmltree = "0.20"
+roxmltree = { version = "0.20", optional = true }
 # Trace-level instrumentation for the read/transport path (SgIoTransport::execute
-# and friends). Permitted
+# and friends). Part of the `scsi` feature — the transport layer traces here.
+# Permitted
 # under CLAUDE.md ("Acceptable strings: debug/trace logging"). Consumers (autorip)
 # wire a tracing subscriber and pipe events into the JSONL debug log.
-tracing = "0.1"
+tracing = { version = "0.1", optional = true }
 # Bounded MPSC channel with kernel-wakeup send_timeout. Used by `io::pipeline`
 # so the halt-aware send/finish loops can BLOCK on consumer drain instead of
 # polling — the 50 ms poll cadence of the previous mpsc-based impl capped mux
 # throughput at ~1 MB/s (0.21.7).
-crossbeam-channel = "0.5"
+crossbeam-channel = { version = "0.5", optional = true }
 # Persistent work-stealing thread pool for parallel AACS unit
 # decryption. Per-call std::thread::scope spawned fresh OS threads
 # and that overhead dominated for typical batch sizes (60 units).
 # rayon's global pool initialises once on first use.
-rayon = "1"
+rayon = { version = "1", optional = true }
 # SIMD-accelerated bytestring search. Drives the HEVC/H.264 start-code
 # scan in `mux::codec::h264::find_start_code` — naive byte-by-byte
 # walk is ~500 MB/s single-thread on x86_64; memchr's vectorised
 # `memmem::find` for the 3-byte `00 00 01` needle hits ~5 GB/s on
 # AVX2-capable hosts.
-memchr = "2"
+memchr = { version = "2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
