@@ -470,7 +470,7 @@ pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> 
 ///
 /// Headroom: this IS the format maximum, so it clips no conformant disc — a
 /// real DVD cannot address a 100th title through TT_SRPT.
-const MAX_TT_SRPT_TITLES: usize = 99;
+pub(crate) const MAX_TT_SRPT_TITLES: usize = 99;
 
 /// Parse the VMG TT_SRPT into a per-title-set map of
 /// `(chapter_count, vts_title_number)`.
