@@ -144,4 +144,21 @@ pub(crate) mod tests {
         assert!(parse(&d[..d.len() - 3]).is_none());
         assert!(parse(b"NOPE").is_none());
     }
+
+    #[test]
+    fn rejects_object_count_over_the_cap() {
+        // A real (non-truncated) buffer declaring MAX_OBJECTS + 1 empty objects:
+        // if the cap were removed, this would parse fine (nothing to truncate on),
+        // so only the cap itself can reject it.
+        let empty: Vec<&[[u8; 12]]> = vec![&[]; MAX_OBJECTS + 1];
+        let d = build(&empty);
+        assert!(
+            parse(&d).is_none(),
+            "object count over MAX_OBJECTS must be rejected"
+        );
+    }
+
+    // NOTE: no "rejects_cmd_count_over_the_cap" test — `num_cmds` is a u16
+    // field (max 65535), always < MAX_CMDS, so that branch is unreachable via
+    // honest bytes; a test for it would be tautological. Flagged, not faked.
 }

@@ -1754,7 +1754,7 @@ mod tests {
                 s
             );
             // Crude English filter — `Display` should never emit ASCII words longer
-            // than 4 chars (identifiers like `/dev/sg4`, `renesas` pass;
+            // than 8 chars (identifiers like `/dev/sg4`, `renesas` pass;
             // "exclusive access denied" would not).
             for word in s.split(|c: char| !c.is_ascii_alphabetic()) {
                 assert!(

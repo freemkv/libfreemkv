@@ -73,9 +73,9 @@
 //!   original corpus this parser was written against.
 
 use super::class_reader::{
-    AASTORE, BIPUSH, ClassFile, CodeAttribute, ConstantPool, CpInfo, GETSTATIC, ICONST_0, ICONST_1,
-    ICONST_2, ICONST_3, ICONST_4, ICONST_5, ICONST_M1, INVOKESPECIAL, LDC, LDC_W, NEW, PUTSTATIC,
-    SIPUSH,
+    AASTORE, ANEWARRAY, BIPUSH, ClassFile, CodeAttribute, ConstantPool, CpInfo, GETSTATIC,
+    ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5, ICONST_M1, INVOKESPECIAL, LDC,
+    LDC_W, NEW, NEWARRAY, PUTSTATIC, SIPUSH,
 };
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, jar, vocab};
 use crate::sector::SectorSource;
@@ -980,7 +980,7 @@ impl<'a> BindingDecoder<'a> {
             // anewarray / newarray — pop count, push array ref. Modelled (not
             // left to `_`) so array constructions inside a container's arg list
             // keep the symbolic stack aligned for per-stream bindings built alongside.
-            0xBD /* anewarray */ | 0xBC /* newarray */ => {
+            ANEWARRAY | NEWARRAY => {
                 self.stack.pop();
                 self.push(StackVal::Unknown);
             }

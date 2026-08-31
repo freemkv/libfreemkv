@@ -171,6 +171,9 @@ impl Disc {
             // Only fetch/push the physical extents and add to the
             // total size the first time this clip_id is seen.
             if first_ref {
+                // WHOLE-clip size/extents on purpose (no EP-map seek): out-of-mark
+                // bytes are dropped downstream by PTS at the SeamPlan — see
+                // `SeamPlan::place` (src/mux/timeline.rs) `raw_ns >= in_ns && <= out_ns`.
                 total_size += pkt_count as u64 * 192;
 
                 // Get stream file extents from UDF allocation descriptors (dual-

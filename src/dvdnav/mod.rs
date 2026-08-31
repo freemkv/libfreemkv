@@ -29,10 +29,12 @@ use crate::sector::SectorSource;
 /// Returns `None` when navigation cannot be resolved, so the caller falls back
 /// to the structural leading-cell filter (today's behaviour, ≈ cell 0 / 0:00).
 ///
-/// TODO(#40): the IFO/PCI parsing + nav executor (built on [`vmcmd`]) land
-/// incrementally. Until the executor is complete this returns `None`, so wiring
-/// it in is behaviour-neutral; improvements to the resolver take effect here
-/// without touching the call site.
+/// PARKED (issue #40, `USE_NAV_RESOLVER=false`): this is intentionally a stub,
+/// not an accidental dead one. It unconditionally returns `None` and ignores
+/// `reader`/`udf` on purpose — the IFO/PCI parsing + nav executor (built on
+/// [`vmcmd`]) land incrementally behind that flag. Until wired in, calling this
+/// is behaviour-neutral (the caller always falls back); improvements to the
+/// resolver take effect here without touching the call site. Do not delete.
 pub fn resolve_feature_start(
     reader: &mut dyn SectorSource,
     udf: &crate::udf::UdfFs,

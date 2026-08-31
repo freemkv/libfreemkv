@@ -388,12 +388,34 @@ fn bcd_byte(b: u8) -> u32 {
 
 // ── Top-level entry point ───────────────────────────────────────────────────
 
+/// Read-and-parse convenience over [`parse_vmg_with`] (reads VIDEO_TS.IFO
+/// itself). Retained for the diagnostic image tests; production callers reuse
+/// already-read bytes via `parse_vmg_with`.
+#[cfg(test)]
+pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> {
+    parse_vmg_with(reader, udf, None)
+}
+
 /// Parse VIDEO_TS.IFO and all VTS_XX_0.IFO files to build a complete DvdInfo.
 ///
-/// Reads the VMG (Video Manager) to discover title sets, then reads each
-/// VTS IFO to extract PGC chains, cell addresses, and stream attributes.
-pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> {
-    let vmg_data = udf.read_file(reader, "/VIDEO_TS/VIDEO_TS.IFO")?;
+/// Reads the VMG (Video Manager) to discover title sets, then reads each VTS
+/// IFO to extract PGC chains, cell addresses, and stream attributes. When
+/// `vmg_bytes` is `Some`, reuses those already-read VIDEO_TS.IFO bytes instead
+/// of reading the file again; `None` reads it. Only the source of the VMG bytes
+/// changes — the parse is byte-for-byte identical.
+pub(crate) fn parse_vmg_with(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    vmg_bytes: Option<&[u8]>,
+) -> Result<DvdInfo> {
+    let read;
+    let vmg_data: &[u8] = match vmg_bytes {
+        Some(bytes) => bytes,
+        None => {
+            read = udf.read_file(reader, "/VIDEO_TS/VIDEO_TS.IFO")?;
+            &read
+        }
+    };
 
     // Validate VMG magic
     if vmg_data.len() < 12 || &vmg_data[0..12] != VMG_MAGIC {
@@ -407,7 +429,7 @@ pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> 
 
     // The TT_SRPT pointer is at 0xC4 per the DVD-Video VMGI spec.
     // (An informal '62-65' / 0x3E note seen elsewhere is wrong — do not use it.)
-    let tt_srpt_sector = be_u32(&vmg_data, 0xC4)?;
+    let tt_srpt_sector = be_u32(vmg_data, 0xC4)?;
 
     // Read TT_SRPT — it's at the given sector offset relative to the start of VIDEO_TS.IFO.
     // In the IFO file data we already have, sector offsets are relative to the IFO start.
@@ -421,7 +443,7 @@ pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> 
         return Err(Error::IfoParse);
     }
 
-    let title_set_map = parse_tt_srpt(&vmg_data, tt_srpt_offset)?;
+    let title_set_map = parse_tt_srpt(vmg_data, tt_srpt_offset)?;
 
     // Parse each VTS IFO
     let mut title_sets = Vec::new();

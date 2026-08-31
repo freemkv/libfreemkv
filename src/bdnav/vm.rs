@@ -443,6 +443,18 @@ mod tests {
     }
 
     #[test]
+    fn non_convergent_self_goto_bails_via_max_steps() {
+        // An unconditional GOTO to its own line never reaches a PlayPL: the
+        // MAX_STEPS guard must bail (None) rather than loop forever. If the
+        // guard were removed this would hang instead of returning.
+        let self_goto = cmd(1 << 5, 0x81, 0, 0, 0, 0);
+        let d = build(&[&[self_goto]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        assert_eq!(resolve(&index, &mobjs, &|_| true), None);
+    }
+
+    #[test]
     fn swap_immediate_operand_is_not_written_back() {
         // SWAP dst=GPR0 with src=IMMEDIATE 5 (imm_op1=0, imm_op2=1) must refuse
         // writing to the aliased register: GPR[5] stays 77, only GPR0 gets 5.

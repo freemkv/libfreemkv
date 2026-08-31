@@ -395,9 +395,21 @@ pub fn resolve_from_vmg(vmg: &[u8]) -> Option<ResolvedTitle> {
 /// First-Play navigation. Returns `None` (→ caller keeps the heuristic) when the
 /// IFO cannot be read or the navigation does not deterministically reach a
 /// title.
-pub fn resolve_main_title(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ResolvedTitle> {
-    let vmg = udf.read_file(reader, "/VIDEO_TS/VIDEO_TS.IFO").ok()?;
-    let resolved = resolve_from_vmg(&vmg)?;
+pub fn resolve_main_title(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    vmg_bytes: Option<&[u8]>,
+) -> Option<ResolvedTitle> {
+    // Reuse caller-supplied VIDEO_TS.IFO bytes when present, else read them.
+    let read;
+    let vmg: &[u8] = match vmg_bytes {
+        Some(bytes) => bytes,
+        None => {
+            read = udf.read_file(reader, "/VIDEO_TS/VIDEO_TS.IFO").ok()?;
+            &read
+        }
+    };
+    let resolved = resolve_from_vmg(vmg)?;
     tracing::debug!(
         target: "freemkv::dvdnav",
         title = resolved.title,
