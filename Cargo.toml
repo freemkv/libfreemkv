@@ -2,7 +2,7 @@
 name = "libfreemkv"
 version = "1.6.13"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.88"
 license = "MIT"
 description = "Open source raw disc access library for optical drives"
 repository = "https://github.com/freemkv/libfreemkv"
@@ -105,3 +105,6 @@ tempfile = "3"
 name = "sgio_read"
 harness = false
 
+
+[lints.clippy]
+uninlined_format_args = "allow"
