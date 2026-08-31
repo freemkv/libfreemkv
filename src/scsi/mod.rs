@@ -69,6 +69,9 @@ pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 /// kept submitting fresh reads. The Initio bridge couldn't drain the
 /// resulting command queue and entered a wedge state that only physical
 /// replug recovered — proven by the v0.13.18 + v0.13.20 live tests.
+// Consumed only by the ripping read path (`drive::read`); gated so a
+// transport-only build doesn't warn on an unused const.
+#[cfg(feature = "rip")]
 pub(crate) const READ_TIMEOUT_MS: u32 = 10_000;
 
 /// Timeout for content READ commands on the recovery path —
@@ -91,6 +94,7 @@ pub(crate) const READ_TIMEOUT_MS: u32 = 10_000;
 /// at 60 s, since that at least visited every range). Reverted; the
 /// kernel-auto-retry approach is being pursued via a `/dev/sr0` pread
 /// fallback instead.
+#[cfg(feature = "rip")]
 pub(crate) const READ_RECOVERY_TIMEOUT_MS: u32 = 60_000;
 
 // ── SCSI status bytes (SPC-4 §4.5.5) ────────────────────────────────────────
