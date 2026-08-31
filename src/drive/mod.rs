@@ -18,8 +18,6 @@ pub fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
     }
 }
 
-pub mod capture;
-
 // Per-platform discovery helpers (the `pub(crate)` `find_drives` /
 // equivalents). Crate-public so `scsi/{linux,macos,windows}.rs` can
 // reuse the existing enumeration logic when shaping `DriveInfo`.
