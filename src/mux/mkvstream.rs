@@ -4147,11 +4147,22 @@ mod tests {
         }
     }
 
+    /// The bytes before the first Cluster — where the Tracks header (and thus
+    /// FlagInterlaced/FieldOrder) lives. Bounding the scans below to this region
+    /// stops a coincidental 0x9A/0x9D byte pair in SimpleBlock payload from
+    /// spoofing a match. Cluster ID = 0x1F 0x43 0xB6 0x75 (RFC 9559).
+    fn tracks_region(data: &[u8]) -> &[u8] {
+        data.windows(4)
+            .position(|w| w == [0x1F, 0x43, 0xB6, 0x75])
+            .map_or(data, |p| &data[..p])
+    }
+
     /// Locate the first TrackEntry's `FieldOrder` (0x9D) inside the Video master
     /// of a muxed file, or `None` when the element was omitted.
     fn muxed_field_order(data: &[u8]) -> Option<u8> {
         // FieldOrder is a 1-byte uint child of Video: ID 0x9D, size 0x81, value.
-        data.windows(3)
+        tracks_region(data)
+            .windows(3)
             .find(|w| w[0] == 0x9D && w[1] == 0x81)
             .map(|w| w[2])
     }
@@ -4160,7 +4171,8 @@ mod tests {
     /// master of a muxed file. Always written, so `None` means the element is
     /// missing entirely.
     fn muxed_flag_interlaced(data: &[u8]) -> Option<u64> {
-        data.windows(3)
+        tracks_region(data)
+            .windows(3)
             .find(|w| w[0] == 0x9A && w[1] == 0x81)
             .map(|w| w[2] as u64)
     }
@@ -4392,6 +4404,68 @@ mod tests {
             muxed_field_order(&data),
             None,
             "a track demoted to progressive must not keep its provisional FieldOrder"
+        );
+    }
+
+    /// Whole-stream FlagInterlaced correction, TIE case: equal progressive and
+    /// interlaced picture counts must resolve to PROGRESSIVE (a tie is not a
+    /// majority, so the track is not deinterlaced). Pins the strict-`>` tie-break
+    /// so a future flip to `>=` (interlaced wins ties) is caught.
+    #[test]
+    fn an_even_split_of_scan_types_ships_progressive_not_interlaced() {
+        use crate::disc::{
+            ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream, VideoStream,
+        };
+        use crate::mux::codec::coding::{CodingType, Mpeg2Coding, PictureInfo};
+        let title = DiscTitle {
+            streams: vec![Stream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::Mpeg2,
+                resolution: Resolution::R576i,
+                frame_rate: FrameRate::F25,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt470bg,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })],
+            ..DiscTitle::empty()
+        };
+        let pic = |progressive: bool, ct: CodingType| {
+            Some(PictureInfo::mpeg2(
+                ct,
+                Mpeg2Coding {
+                    top_field_first: true,
+                    repeat_first_field: false,
+                    progressive_frame: progressive,
+                    progressive_sequence: false,
+                    frame_picture: true,
+                },
+            ))
+        };
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        // First picture progressive (provisional progressive), then an exact 2:2
+        // split → a tie.
+        let scans = [true, true, false, false];
+        for (i, prog) in scans.iter().enumerate() {
+            s.write(&crate::pes::PesFrame {
+                coding: pic(*prog, if i == 0 { CodingType::I } else { CodingType::P }),
+                source: None,
+                track: 0,
+                pts: i as i64 * 40_000_000,
+                keyframe: i == 0,
+                data: vec![0xBB; 16],
+                duration_ns: None,
+            })
+            .unwrap();
+        }
+        s.finish().unwrap();
+        assert_eq!(
+            muxed_flag_interlaced(&out.bytes()),
+            Some(ebml::INTERLACED_PROGRESSIVE),
+            "a 2:2 tie is not a majority — the track must stay progressive"
         );
     }
 
