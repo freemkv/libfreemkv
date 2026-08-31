@@ -188,8 +188,8 @@ pub struct Clip {
     pub feed_span: Option<(u64, u64)>,
 }
 
-/// Per-title classification for [`Disc::main_feature_order`]. Both fields are
-/// GLOBAL properties (they depend on the whole title list, not on a pairwise
+/// Per-title classification for [`Disc::main_feature_order`]. All three fields
+/// are GLOBAL properties (they depend on the whole title list, not on a pairwise
 /// comparison), so they are precomputed once by [`Disc::rank_titles`] and
 /// threaded into the comparator.
 #[derive(Debug, Clone, Copy, Default)]
@@ -2082,6 +2082,9 @@ impl Disc {
                 .filter(|t| t.has_probable_video())
                 .map(|t| t.duration_secs)
                 .fold(0.0_f64, f64::max);
+            // Candidates: real-video titles at least half as long as the longest
+            // probable-video title; the `<= 0.0` arm admits all when no duration
+            // is known, so a bare tree still yields a candidate set for the nav.
             let candidates: std::collections::HashSet<u16> = titles
                 .iter()
                 .filter(|t| {

@@ -4,6 +4,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <DiskArbitration/DiskArbitration.h>
 #include <dispatch/dispatch.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -40,6 +41,11 @@ typedef struct {
 // ── Global handle (single-drive, same as before) ──────────────────────────
 
 static ShimHandle g_handle = {NULL, NULL, NULL, 0};
+
+// Serializes read-modify-write of the process-global g_handle fields and the
+// g_da_bsd buffer so concurrent/re-entrant open+close can't interleave a check
+// with a mutate. NOT held across the bounded 5 s async-claim wait (would serialize).
+static pthread_mutex_t g_handle_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // ── Registry helpers ──────────────────────────────────────────────────────
 
@@ -242,12 +248,10 @@ static io_service_t find_bdsvc_from_iomedia(mach_port_t mp, const char *bsd_name
 }
 
 // ── DiskArbitration claim ──────────────────────────────────────────────────
-//
-// ObtainExclusiveAccess reserves the SCSI passthrough but says nothing to
-// diskarbitrationd, which stays free to remount the disc mid-rip (Spotlight
-// re-probe, etc.), yanking the media out from under an in-progress read. We
-// hold a DADiskClaim + a mount-approval dissenter for the session so the OS
-// cannot remount our disc until shim_close().
+
+// ObtainExclusiveAccess gates SCSI but not diskarbitrationd, which can remount
+// the disc mid-rip. We hold a DADiskClaim + mount-approval dissenter for the
+// session so nothing remounts our disc until shim_close().
 
 static char g_da_bsd[32];
 
@@ -256,7 +260,10 @@ static char g_da_bsd[32];
 static DADissenterRef da_mount_approval(DADiskRef disk, void *ctx) {
     (void)ctx;
     const char *n = DADiskGetBSDName(disk);
-    if (!n || strcmp(n, g_da_bsd) != 0) return NULL;
+    pthread_mutex_lock(&g_handle_lock);
+    int ours = (n && strcmp(n, g_da_bsd) == 0);
+    pthread_mutex_unlock(&g_handle_lock);
+    if (!ours) return NULL;
     return DADissenterCreate(kCFAllocatorDefault, kDAReturnBusy,
         CFSTR("freemkv is reading this disc"));
 }
@@ -294,42 +301,54 @@ static void da_claim_done(DADiskRef disk, DADissenterRef dissenter, void *ctx) {
 // Returns 1 if claimed. The caller proceeds either way — ObtainExclusiveAccess
 // remains the hard gate; the claim is what keeps DA from remounting after it.
 static int da_hold(const char *bsd_name) {
+    // Hold the lock only for the g_da_bsd / g_handle field mutations below; it
+    // is dropped before the bounded 5 s wait so legit claim waits aren't
+    // serialized behind it (and re-taken just to publish g_handle.da_claimed).
+    pthread_mutex_lock(&g_handle_lock);
     strncpy(g_da_bsd, bsd_name, sizeof(g_da_bsd) - 1);
     g_da_bsd[sizeof(g_da_bsd) - 1] = 0;
 
     g_handle.da_queue = dispatch_queue_create("io.freemkv.da", DISPATCH_QUEUE_SERIAL);
-    if (!g_handle.da_queue) return 0;
+    if (!g_handle.da_queue) { pthread_mutex_unlock(&g_handle_lock); return 0; }
     g_handle.da_session = DASessionCreate(kCFAllocatorDefault);
-    if (!g_handle.da_session) return 0;
+    if (!g_handle.da_session) { pthread_mutex_unlock(&g_handle_lock); return 0; }
     DASessionSetDispatchQueue(g_handle.da_session, g_handle.da_queue);
     g_handle.da_disk =
         DADiskCreateFromBSDName(kCFAllocatorDefault, g_handle.da_session, bsd_name);
-    if (!g_handle.da_disk) return 0;
+    if (!g_handle.da_disk) { pthread_mutex_unlock(&g_handle_lock); return 0; }
 
     DARegisterDiskMountApprovalCallback(g_handle.da_session, NULL, da_mount_approval, NULL);
 
     DAClaimResult *r = malloc(sizeof(DAClaimResult));
-    if (!r) return 0;
+    if (!r) { pthread_mutex_unlock(&g_handle_lock); return 0; }
     r->sem = dispatch_semaphore_create(0);
     r->ok = 0;
     r->rc = 2; // one ref held here, one for the async da_claim_done callback
     DADiskClaim(g_handle.da_disk, kDADiskClaimOptionDefault,
         da_claim_release, NULL, da_claim_done, r);
+    pthread_mutex_unlock(&g_handle_lock);
+
     // Bounded wait for the async claim callback (5 s), so a wedged DA can't
     // hang open() forever. On timeout the callback may still fire later, so we
     // must NOT read r->ok or free r here — releasing our ref hands ownership to
     // whichever side finishes last (see da_claim_result_release).
+    int claimed;
     if (dispatch_semaphore_wait(r->sem,
             dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC)) != 0) {
-        g_handle.da_claimed = 0;
+        claimed = 0;
     } else {
-        g_handle.da_claimed = r->ok;
+        claimed = r->ok;
     }
     da_claim_result_release(r);
-    return g_handle.da_claimed;
+
+    pthread_mutex_lock(&g_handle_lock);
+    g_handle.da_claimed = claimed;
+    pthread_mutex_unlock(&g_handle_lock);
+    return claimed;
 }
 
 static void da_release(void) {
+    pthread_mutex_lock(&g_handle_lock);
     if (g_handle.da_session) {
         DAUnregisterCallback(g_handle.da_session, (void *)da_mount_approval, NULL);
     }
@@ -348,6 +367,7 @@ static void da_release(void) {
         g_handle.da_queue = NULL;
     }
     g_handle.da_claimed = 0;
+    pthread_mutex_unlock(&g_handle_lock);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -357,7 +377,13 @@ int shim_open_exclusive(const char *bsd_name) {
     HRESULT hr;
     SInt32 score = 0;
 
+    // Serialize the whole g_handle read-modify-write below: the entry guard is a
+    // check-then-act TOCTOU, and a concurrent shim_close must not tear down scsi/
+    // mmc/plugin mid-setup. Released before the self-locking da_hold (5 s wait).
+    pthread_mutex_lock(&g_handle_lock);
+
     if (g_handle.exclusive && g_handle.scsi) {
+        pthread_mutex_unlock(&g_handle_lock);
         return 0;
     }
 
@@ -422,7 +448,10 @@ int shim_open_exclusive(const char *bsd_name) {
     // Check the return before using the port. On failure IOMainPort leaves `mp`
     // untouched, so every IOKit call below would run against an uninitialised
     // mach port. shim_list_drives does check it; this path did not.
-    if (IOMainPort(0, &mp) != kIOReturnSuccess) return -1;
+    if (IOMainPort(0, &mp) != kIOReturnSuccess) {
+        pthread_mutex_unlock(&g_handle_lock);
+        return -1;
+    }
 
     io_service_t svc = find_bdsvc_by_bsd_name(mp, bsd_name);
     if (!svc) {
@@ -438,20 +467,27 @@ int shim_open_exclusive(const char *bsd_name) {
             svc = IOServiceGetMatchingService(mp, matching);
         }
     }
-    if (!svc) return -1;
+    if (!svc) {
+        pthread_mutex_unlock(&g_handle_lock);
+        return -1;
+    }
 
     kr = IOCreatePlugInInterfaceForService(svc,
         kIOMMCDeviceUserClientTypeID, kIOCFPlugInInterfaceID,
         &g_handle.plugin, &score);
     IOObjectRelease(svc);
 
-    if (kr != KERN_SUCCESS || !g_handle.plugin) return -2;
+    if (kr != KERN_SUCCESS || !g_handle.plugin) {
+        pthread_mutex_unlock(&g_handle_lock);
+        return -2;
+    }
 
     hr = (*g_handle.plugin)->QueryInterface(g_handle.plugin,
         CFUUIDGetUUIDBytes(kIOMMCDeviceInterfaceID), (LPVOID *)&g_handle.mmc);
     if (hr != S_OK || !g_handle.mmc) {
         IODestroyPlugInInterface(g_handle.plugin);
         g_handle.plugin = NULL;
+        pthread_mutex_unlock(&g_handle_lock);
         return -3;
     }
 
@@ -461,6 +497,7 @@ int shim_open_exclusive(const char *bsd_name) {
         IODestroyPlugInInterface(g_handle.plugin);
         g_handle.mmc = NULL;
         g_handle.plugin = NULL;
+        pthread_mutex_unlock(&g_handle_lock);
         return -4;
     }
 
@@ -476,10 +513,12 @@ int shim_open_exclusive(const char *bsd_name) {
         g_handle.scsi = NULL;
         g_handle.mmc = NULL;
         g_handle.plugin = NULL;
+        pthread_mutex_unlock(&g_handle_lock);
         return -5;
     }
 
     g_handle.exclusive = 1;
+    pthread_mutex_unlock(&g_handle_lock);
 
     // Claim the disk now that we hold the drive, so DA can't remount it during
     // the read. Best-effort: a failed claim does not fail the open (we already
@@ -490,7 +529,8 @@ int shim_open_exclusive(const char *bsd_name) {
 }
 
 void shim_close(void) {
-    da_release();
+    da_release(); // takes g_handle_lock on its own; keep it out of the region below
+    pthread_mutex_lock(&g_handle_lock);
     if (g_handle.exclusive && g_handle.scsi) {
         (*g_handle.scsi)->ReleaseExclusiveAccess(g_handle.scsi);
     }
@@ -507,6 +547,7 @@ void shim_close(void) {
         g_handle.plugin = NULL;
     }
     g_handle.exclusive = 0;
+    pthread_mutex_unlock(&g_handle_lock);
 }
 
 int shim_execute(const unsigned char *cdb, unsigned char cdb_len,

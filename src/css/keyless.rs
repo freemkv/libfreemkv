@@ -41,6 +41,13 @@ const ENCRYPTED_START: usize = 0x80; // byte 128
 const SEED_OFFSET: usize = 0x54; // sector seed at bytes 0x54-0x58
 const FLAG_BYTE: usize = 0x14;
 
+/// LFSR0's output tap: the 24-bit register folded down to the byte it feeds
+/// into TAB4. Used both to validate a candidate against the keystream and to
+/// re-derive the byte shifted in during the backward-clocking search.
+fn lfsr0_output_tap(x: u32) -> u32 {
+    (((((((x >> 3) ^ x) >> 1) ^ x) >> 8) ^ x) >> 5) & 0xff
+}
+
 /// Recover the title key from cipher + known plaintext (the core of the
 /// recovery). `crypted` is the ciphertext starting at sector byte 0x80;
 /// `decrypted` is the matching known plaintext; `seed` is `sector[0x54..0x59]`.
@@ -105,7 +112,7 @@ fn recover_title_key_from_plain(
             i_t2 = i_t1 >> 1;
             i_t1 = ((i_t1 & 1) << 8) ^ i_t4;
             let i_t4 = TAB5[i_t4 as usize] as u32;
-            let mut i_t6 = (((((((i_t3 >> 3) ^ i_t3) >> 1) ^ i_t3) >> 8) ^ i_t3) >> 5) & 0xff;
+            let mut i_t6 = lfsr0_output_tap(i_t3);
             i_t3 = (i_t3 << 8) | i_t6;
             i_t6 = TAB4[i_t6 as usize] as u32;
             i_t5 += i_t6 + i_t4;
@@ -128,7 +135,7 @@ fn recover_title_key_from_plain(
             // Brute-force the byte shifted in (top byte of the 24-bit reg).
             for j in 0u32..256 {
                 i_t3 = (i_t3 & 0x1_ffff) | (j << 17);
-                let i_t6 = (((((((i_t3 >> 3) ^ i_t3) >> 1) ^ i_t3) >> 8) ^ i_t3) >> 5) & 0xff;
+                let i_t6 = lfsr0_output_tap(i_t3);
                 if i_t6 == i_t1_byte {
                     break;
                 }

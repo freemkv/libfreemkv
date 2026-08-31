@@ -16,7 +16,7 @@
 /// A decoded navigation instruction. Only the variants freemkv's start-point
 /// resolver needs are modelled explicitly; everything else is [`Instr::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Instr {
+pub(crate) enum Instr {
     Nop,
     /// Stop executing the current command list (resume cell playback).
     Break,
@@ -96,7 +96,7 @@ pub enum Instr {
 
 /// A compare predicate carried by a command (`byte1` bits 6-4). `None` = always.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Compare {
+pub(crate) struct Compare {
     /// Compare op: 1=&,2===,3=!=,4=>=,5=>,6=<=,7=<.
     pub op: u8,
     /// Left register index (GPRM 0-15, SPRM 128+).
@@ -109,7 +109,7 @@ pub struct Compare {
 
 /// A fully decoded command: its predicate (if any) and the instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Command {
+pub(crate) struct Command {
     pub compare: Option<Compare>,
     pub instr: Instr,
 }
@@ -194,7 +194,7 @@ fn if_v3(b: &[u8; 8]) -> Option<Compare> {
 }
 
 /// Decode an 8-byte VM command.
-pub fn decode(b: &[u8; 8]) -> Command {
+pub(crate) fn decode(b: &[u8; 8]) -> Command {
     let typ = b[0] >> 5;
     let direct = (b[0] >> 4) & 1;
     let setop = b[0] & 0x0F;

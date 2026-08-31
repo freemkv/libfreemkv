@@ -38,6 +38,17 @@ pub struct DiscProfile {
     pub main_title: usize,
     /// Every title, in the scan's main-feature order.
     pub titles: Vec<TitleProfile>,
+    /// Whether the source disc is encrypted (AACS or CSS). A clear disc and a
+    /// disc whose key resolution FAILED would otherwise serialize identically;
+    /// this and [`Self::key_error`] disambiguate them.
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Numeric code of the key-resolution failure, or `None` when keys resolved
+    /// (or the disc is unencrypted): the `aacs_error` code if present, else the
+    /// `css_error` code. Numeric per the project's no-English error convention
+    /// (see [`crate::error::Error::code`]).
+    #[serde(default)]
+    pub key_error: Option<u32>,
 }
 
 /// One title's normalized profile: identity, duration/size, chapter count, the
@@ -265,6 +276,14 @@ impl DiscProfile {
             disc_id: disc.volume_id.clone(),
             main_title,
             titles,
+            encrypted: disc.encrypted,
+            // AACS takes precedence over CSS: a disc is one format or the other,
+            // and `from_disc` mirrors the same aacs-then-css order callers use.
+            key_error: disc
+                .aacs_error
+                .as_ref()
+                .or(disc.css_error.as_ref())
+                .map(|e| u32::from(e.code())),
         }
     }
 
@@ -489,6 +508,41 @@ mod tests {
         disc.meta_title = None;
         disc.volume_id = "PLAIN_VOLUME".into();
         assert_eq!(disc.profile().disc_name, "PLAIN_VOLUME");
+    }
+
+    #[test]
+    fn encryption_status_and_key_error_surface_numerically() {
+        // Encrypted disc whose key resolution FAILED: the encrypted flag is set
+        // and the numeric aacs_error code surfaces (never English text), so it
+        // no longer serializes identically to a rippable disc.
+        let mut disc = test_disc();
+        disc.encrypted = true;
+        let err = crate::error::Error::AacsVidUnavailable;
+        let aacs_code = u32::from(err.code());
+        disc.aacs_error = Some(err);
+        let p = disc.profile();
+        assert!(p.encrypted);
+        assert_eq!(p.key_error, Some(aacs_code));
+
+        // AACS takes precedence: with BOTH errors set, the aacs code wins.
+        let mut both = test_disc();
+        both.encrypted = true;
+        both.aacs_error = Some(crate::error::Error::AacsVidUnavailable);
+        both.css_error = Some(crate::error::Error::CssKeyMissing);
+        assert_eq!(both.profile().key_error, Some(aacs_code));
+
+        // A CSS-only failure surfaces the css code.
+        let mut css = test_disc();
+        css.encrypted = true;
+        let css_err = crate::error::Error::CssKeyMissing;
+        let css_code = u32::from(css_err.code());
+        css.css_error = Some(css_err);
+        assert_eq!(css.profile().key_error, Some(css_code));
+
+        // A clean, rippable disc: not encrypted, no key error.
+        let clean = test_disc().profile();
+        assert!(!clean.encrypted);
+        assert_eq!(clean.key_error, None);
     }
 
     #[test]
