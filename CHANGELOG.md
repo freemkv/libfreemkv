@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [1.6.14] — UNRELEASED
+
+### Changed
+
+- Version aligned to 1.6.14 for the unified release.
 
 ## [1.6.13] — 2026-08-28
 
