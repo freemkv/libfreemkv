@@ -103,18 +103,14 @@ pub const VERSION_LABEL: &str = concat!(env!("FREEMKV_VERSION"), env!("GIT_SUFFI
 pub(crate) const MUX_APP: &str = concat!("freemkv ", env!("FREEMKV_VERSION"), env!("GIT_SUFFIX"));
 
 // ─── Always compiled ────────────────────────────────────────────────────────
-// `error` and `scsi` form the transport-only surface (`--features scsi`,
-// `default-features = false`). `error` carries the SCSI error variants the
-// transport layer returns; `scsi` is the SCSI passthrough layer itself. Neither
-// pulls the ripping dependency tree. Everything below is gated behind `rip`.
+// Transport-only surface (`--features scsi`, `default-features = false`): `error`
+// = SCSI error variants, `scsi` = passthrough. Rip tree (heavy deps) gated below.
 pub mod error;
 pub mod scsi;
 
 // ─── Ripping tree (feature = "rip") ─────────────────────────────────────────
-// Drive lifecycle, disc/UDF/MPLS/CLPI parsing, AACS/CSS decrypt, PES/mux
-// pipeline, keydb, and the freemkv-unlock seam — plus their heavy deps (serde,
-// zip, rayon, roxmltree, rand, crossbeam, memchr, …). Gated so a transport-only
-// consumer compiles `scsi` alone.
+// Drive lifecycle, disc/UDF/MPLS/CLPI parsing, AACS/CSS decrypt, PES/mux, keydb,
+// and the freemkv-unlock seam (plus heavy deps). Gated so `scsi`-only stays lean.
 #[cfg(feature = "rip")]
 pub mod aacs;
 #[cfg(feature = "rip")]
