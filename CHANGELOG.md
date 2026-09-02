@@ -2,6 +2,10 @@
 
 ## [1.6.15] — unreleased
 
+### Fixed
+
+- Linux: `SgIoTransport::raw_command` clamped an over-length CDB with `cdb.len().min(16)` instead of routing it through the shared `checked_cdb_len` guard that `execute()` uses. Under SPC-4 a CDB's length is fixed by its opcode, so truncating one does not shorten the command — it sends a descriptor the drive will read as something else. An empty CDB was likewise unguarded, and went to the sg driver as a zero-length command descriptor. Unreachable — `raw_command` is private and its one caller passes a fixed 6-byte ALLOW MEDIUM REMOVAL — but it was the one transport path that did the thing the guard exists to prevent.
+
 ### Security
 
 - Fixed a soundness bug (GHSA-j8ww-f5fg-9pmh, low severity): `PrefetchedSectorSource::into_channels` handed out a `Sender<Vec<u8>>` recycle channel whose buffers the producer re-exposed with `unsafe { Vec::set_len }` guarded only by capacity, so a downstream caller recycling a `Vec::with_capacity(n)` (len 0) could drive `set_len` over uninitialized memory — undefined behaviour reachable from safe code. The producer now uses `Vec::resize`, removing the `unsafe`; buffer pooling (the real cross-thread alloc/free win) is unchanged. No in-tree caller triggered it.

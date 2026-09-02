@@ -33,6 +33,10 @@ const SG_FLAG_Q_AT_HEAD: u32 = 0x10;
 /// 16 bytes. Matches `K_MAX_CDB_SIZE` in the macOS and Windows backends.
 const K_MAX_CDB_SIZE: usize = 16;
 
+/// SPC-4 PREVENT ALLOW MEDIUM REMOVAL (0x1E) with PREVENT=0. Sent by `Drop` so
+/// the tray is not left locked; a six-byte group-0 CDB.
+const ALLOW_MEDIUM_REMOVAL: [u8; 6] = [0x1E, 0, 0, 0, 0, 0];
+
 #[repr(C)]
 #[allow(non_camel_case_types)]
 struct sg_io_hdr {
@@ -117,14 +121,30 @@ impl SgIoTransport {
         })
     }
 
-    /// Send a raw SCSI command on an fd. Used by reset() before the
-    /// transport is constructed.
-    fn raw_command(fd: i32, cdb: &[u8], timeout_ms: u32) -> std::result::Result<(), ()> {
+    /// Send a raw SCSI command on a bare fd, for the one caller that has no
+    /// live `&mut self` to route through `execute()`: `Drop`, unlocking the
+    /// tray on its way out.
+    ///
+    /// The CDB goes through the shared [`super::checked_cdb_len`] guard, so an
+    /// empty or over-length CDB is REJECTED here exactly as it is in
+    /// `execute()`. It used to be clamped with `cdb.len().min(16)`, which is
+    /// the one thing that guard exists to prevent: under SPC-4 the group code
+    /// in byte 0 fixes the CDB length, so dropping the tail bytes does not
+    /// shorten the command, it issues a different one. See `checked_cdb_len`
+    /// for the full argument.
+    ///
+    /// Returns a typed [`Error`] rather than `()` so a rejected CDB is
+    /// distinguishable from an I/O failure. That is not decoration: `Drop`
+    /// discards the result either way, and telling the two apart is the only
+    /// way to test the guard without a real `/dev/sg*` device — see
+    /// `raw_command_cdb_guard_tests`.
+    fn raw_command(fd: i32, cdb: &[u8], timeout_ms: u32) -> Result<()> {
+        let cmd_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
         let mut sense = [0u8; 32];
         let mut hdr: sg_io_hdr = unsafe { std::mem::zeroed() };
         hdr.interface_id = b'S' as i32;
         hdr.dxfer_direction = SG_DXFER_NONE;
-        hdr.cmd_len = cdb.len().min(16) as u8;
+        hdr.cmd_len = cmd_len;
         hdr.mx_sb_len = sense.len() as u8;
         hdr.dxfer_len = 0;
         hdr.dxferp = std::ptr::null_mut();
@@ -134,15 +154,32 @@ impl SgIoTransport {
         hdr.flags = SG_FLAG_Q_AT_HEAD;
 
         let ret = unsafe { libc::ioctl(fd, SG_IO as _, &mut hdr as *mut sg_io_hdr) };
+        if ret < 0 {
+            return Err(Error::IoError {
+                source: std::io::Error::last_os_error(),
+            });
+        }
         // Mask DRIVER_SENSE (0x08): it only flags "sense data present", not
         // a failure — matches execute()'s driver_status_real handling so a
         // benign CHECK CONDITION isn't misread as a transport error.
         let driver_status_real = hdr.driver_status & !super::DRIVER_SENSE;
-        if ret < 0 || hdr.status != 0 || hdr.host_status != 0 || driver_status_real != 0 {
-            Err(())
-        } else {
-            Ok(())
+        if hdr.host_status != 0 || driver_status_real != 0 {
+            // No SCSI status was delivered: same synthesised sentinel and same
+            // `sense: None` that `execute()` reports for a transport wedge.
+            return Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: super::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
+            });
         }
+        if hdr.status != 0 {
+            return Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: hdr.status,
+                sense: Some(super::parse_sense(&sense, hdr.sb_len_wr)),
+            });
+        }
+        Ok(())
     }
 
     fn to_c_path(device: &Path) -> Vec<u8> {
@@ -184,7 +221,7 @@ impl Drop for SgIoTransport {
     fn drop(&mut self) {
         if self.fd >= 0 {
             // Unlock tray before closing — don't leave it locked.
-            let _ = Self::raw_command(self.fd, &[0x1E, 0, 0, 0, 0, 0], 3_000);
+            let _ = Self::raw_command(self.fd, &ALLOW_MEDIUM_REMOVAL, 3_000);
             unsafe { libc::close(self.fd) };
         }
         // Signal the recovery thread this transport is gone. Must be set
@@ -619,5 +656,106 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
             status: hdr.status,
             sense: Some(parsed),
         })
+    }
+}
+
+// ── CDB guard wiring ───────────────────────────────────────────────────────
+#[cfg(test)]
+mod raw_command_cdb_guard_tests {
+    use super::*;
+
+    /// `ioctl()` on this fails with `EBADF` before touching any device, so the
+    /// tests below need no `/dev/sg*` and have no side effects — they run in
+    /// ordinary CI. Any error that is NOT `InvalidCdbLength` therefore means
+    /// the CDB cleared the guard and the syscall was reached.
+    const NO_FD: i32 = -1;
+
+    fn reached_the_ioctl(err: &Error) -> bool {
+        !matches!(err, Error::InvalidCdbLength { .. })
+    }
+
+    // ── Negative: CDBs the guard must reject ──────────────────────────────
+
+    /// The regression this module exists for. `raw_command` used to set
+    /// `cmd_len = cdb.len().min(16)`, silently shortening an over-length CDB
+    /// into a *different* SPC-4 command and issuing it. It must fail the
+    /// caller instead, with the same error `execute()` gives.
+    ///
+    /// Before the fix this test fails by reaching the `ioctl` and returning
+    /// `IoError(EBADF)` — the guard never ran.
+    #[test]
+    fn over_length_cdb_is_rejected_not_truncated() {
+        let cdb = [0u8; K_MAX_CDB_SIZE + 1];
+        match SgIoTransport::raw_command(NO_FD, &cdb, 3_000) {
+            Err(Error::InvalidCdbLength { len, max }) => {
+                assert_eq!(len, K_MAX_CDB_SIZE + 1);
+                assert_eq!(max, K_MAX_CDB_SIZE);
+            }
+            other => panic!(
+                "over-length CDB must be rejected with InvalidCdbLength, got {other:?} — \
+                 a non-guard error means it was truncated to {K_MAX_CDB_SIZE} bytes and sent"
+            ),
+        }
+    }
+
+    /// Well past the field width, to show the guard is a bound and not a
+    /// one-off check at `max + 1`.
+    #[test]
+    fn far_over_length_cdb_is_rejected() {
+        let cdb = [0u8; 260];
+        assert!(matches!(
+            SgIoTransport::raw_command(NO_FD, &cdb, 3_000),
+            Err(Error::InvalidCdbLength {
+                len: 260,
+                max: K_MAX_CDB_SIZE
+            })
+        ));
+    }
+
+    /// An empty CDB must be rejected rather than handed to the sg driver as a
+    /// zero-length command descriptor, which under SPC-4 is not a command at
+    /// all. (The pre-fix code did not panic on this — it never read the opcode
+    /// — it just issued `cmd_len = 0`. The two error paths added here DO read
+    /// `cdb[0]`, so the guard is now load-bearing for that too.)
+    #[test]
+    fn empty_cdb_is_rejected_before_the_opcode_is_read() {
+        assert!(matches!(
+            SgIoTransport::raw_command(NO_FD, &[], 3_000),
+            Err(Error::InvalidCdbLength {
+                len: 0,
+                max: K_MAX_CDB_SIZE
+            })
+        ));
+    }
+
+    // ── Positive: CDBs the guard must let through ─────────────────────────
+
+    /// The only CDB `raw_command` is called with in the crate. It must still
+    /// reach the syscall — a guard that rejected this would silently stop
+    /// unlocking the tray on `Drop`.
+    #[test]
+    fn drops_allow_medium_removal_still_reaches_the_ioctl() {
+        let err = SgIoTransport::raw_command(NO_FD, &ALLOW_MEDIUM_REMOVAL, 3_000)
+            .expect_err("EBADF on fd -1");
+        assert!(
+            reached_the_ioctl(&err),
+            "the 6-byte CDB Drop sends must pass the guard, got {err:?}"
+        );
+    }
+
+    /// Every real SPC-4 CDB length (groups 0-5: 6, 10, 12, 16), plus the
+    /// shortest a caller could legally construct, plus the boundary case — a
+    /// CDB of exactly `K_MAX_CDB_SIZE` must not be caught by an off-by-one.
+    #[test]
+    fn in_range_cdb_lengths_reach_the_ioctl() {
+        for len in [1usize, 6, 10, 12, K_MAX_CDB_SIZE] {
+            let cdb = vec![0x1Eu8; len];
+            let err = SgIoTransport::raw_command(NO_FD, &cdb, 3_000).expect_err("EBADF on fd -1");
+            assert!(
+                reached_the_ioctl(&err),
+                "a {len}-byte CDB is within the {K_MAX_CDB_SIZE}-byte field and must \
+                 pass the guard, got {err:?}"
+            );
+        }
     }
 }
