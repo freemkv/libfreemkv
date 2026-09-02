@@ -66,8 +66,9 @@ pub(crate) mod null;
 pub(crate) mod ps;
 pub(crate) mod resync;
 pub(crate) mod stdio;
-/// Shared clip-boundary timeline-continuity corrector (used by the MKV muxer
-/// and the `demux://` sink).
+// Shared clip-boundary timeline-continuity corrector (used by the MKV muxer
+// and the `demux://` sink). Own `//!` docs live in timeline.rs; keep this a
+// plain `//` so rustdoc resolves those links in the module's own scope.
 pub(crate) mod timeline;
 pub(crate) mod ts;
 pub(crate) mod tsmux;
