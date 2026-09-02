@@ -70,8 +70,9 @@
 //!   [`Ordering::Release`] docs, it "leads to a `Relaxed` load operation" — so
 //!   even against a proper release store it would establish no edge.
 //!
-//! Upgrading only one side therefore fixes nothing — neither half alone
-//! establishes the edge. Both are `AcqRel` below.
+//! Upgrading only one side therefore fixes nothing; the loom models in this
+//! file still report the leak with either half applied alone. Both are
+//! `AcqRel` below.
 //!
 //! [`take_recovered_fd`] is deliberately left at `Acquire`, which makes its
 //! store half relaxed. That is harmless precisely because of the release-
@@ -80,14 +81,37 @@
 //! break the edge. It needs no release half of its own — it is called from
 //! `execute()`, which cannot run concurrently with `Drop` (both need the
 //! transport), so it never has anything of its own to publish to a teardown.
-//!
+//! `loom_drain_does_not_break_the_release_sequence` is the check on that.
 //!
 //! `dead`'s `Release` store is belt-and-braces: it is sequenced before the
 //! `AcqRel` swap, and the swap is what carries the edge. Downgrading it to
-//! `Relaxed` would leave the protocol correct.
+//! `Relaxed` leaves all three models passing.
 //!
+//! # Building the model
+//!
+//! ```text
+//! RUSTFLAGS="--cfg loom" cargo test --lib --no-default-features \
+//!     --features scsi fd_handoff
+//! ```
+//!
+//! Under those flags the protocol runs on loom's instrumented atomics, so the
+//! models check the code the transport actually calls rather than a
+//! transcription that could drift from it. The alias below is gated on `test`
+//! as well as `loom`, because `loom` is a DEV-dependency and so is not in the
+//! graph of a non-test target: `cfg(loom)` alone would break `cargo build`,
+//! `cargo check` and `cargo clippy --all-targets` under those flags with an
+//! unresolved-crate error. Non-test targets keep std's atomics.
+//!
+//! One consequence to know about: under `all(loom, test)`, `SgIoTransport`'s
+//! atomics are loom's, and those panic outside a `loom::model`. No unit test
+//! constructs a transport today — `raw_command` is a free-standing `fn` that
+//! touches none — but the first one that does must live behind
+//! `cfg(not(loom))`.
 
-// Re-exported so `linux.rs` names its atomics through this module.
+// See "Building the model" above for why this is gated on `test` too.
+#[cfg(all(loom, test))]
+pub(crate) use loom::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+#[cfg(not(all(loom, test)))]
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// The empty slot. Not a valid fd; `open()` never returns a negative value.
@@ -172,7 +196,8 @@ pub(crate) fn claim_for_teardown(slot: &AtomicI32, dead: &AtomicBool) -> Option<
 ///
 /// They cover the ownership protocol, NOT the memory orderings — those compile
 /// to the same instructions on x86_64, so these pass against the wrong ones.
-#[cfg(test)]
+/// [`loom_tests`] is what covers the orderings.
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
@@ -278,7 +303,7 @@ mod tests {
     /// Sequences, not interleavings — each function is the atomic unit here, so
     /// this cannot express the case the ordering bug lives in (a teardown swap
     /// landing between `publish_recovered_fd`'s CAS and its `dead` load). That
-    /// landing between `publish_recovered_fd`'s CAS and its `dead` load.
+    /// one is only reachable in the loom models below.
     #[test]
     fn every_sequence_closes_the_fd_exactly_once() {
         // Each sequence returns how many callers were handed the fd across the
@@ -313,8 +338,8 @@ mod tests {
     /// The real race, run for real: a teardown thread against a recovery
     /// thread, many times over. This exercises the protocol under a genuine
     /// scheduler — it does NOT prove the memory orderings (x86 and, in
-    /// practice, AArch64 will happily pass the weaker ones). It covers the
-    /// ownership logic.
+    /// practice, AArch64 will happily pass the weaker ones). The loom model
+    /// below is what covers those; this covers the ownership logic.
     #[test]
     fn concurrent_teardown_and_publish_close_each_fd_exactly_once() {
         use std::sync::Arc;
@@ -344,5 +369,147 @@ mod tests {
                 "round {round}: slot must not be left holding an fd nobody owns"
             );
         }
+    }
+}
+
+/// Memory-ordering models. `cargo test` cannot observe a missing release edge:
+/// the orderings compile to the same instructions on x86_64, and on AArch64 the
+/// window is far too narrow to hit by chance. loom enumerates the executions
+/// the C++20 model permits instead, and reports the stale `dead` load directly.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::Arc;
+    use loom::sync::atomic::AtomicUsize;
+
+    /// `Drop` against a recovery thread: the execution this file exists for.
+    ///
+    /// With `swap(.., Acquire)` in [`claim_for_teardown`], or with
+    /// `compare_exchange(.., Release, ..)` in [`publish_recovered_fd`] — either
+    /// one alone, not just both — loom finds an execution where teardown
+    /// drains the empty slot, the recovery thread's CAS then fills it, and the
+    /// `dead` load still reads `false`. Nobody closes the fd.
+    #[test]
+    fn loom_teardown_racing_publish_closes_the_fd_exactly_once() {
+        loom::model(|| {
+            let slot = Arc::new(AtomicI32::new(EMPTY));
+            let dead = Arc::new(AtomicBool::new(false));
+            let closes = Arc::new(AtomicUsize::new(0));
+
+            let (s, d, c) = (slot.clone(), dead.clone(), closes.clone());
+            let teardown = loom::thread::spawn(move || {
+                if claim_for_teardown(&s, &d).is_some() {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+
+            let (s, d, c) = (slot.clone(), dead.clone(), closes.clone());
+            let recovery = loom::thread::spawn(move || {
+                if publish_recovered_fd(&s, &d, 7).is_some() {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+
+            teardown.join().unwrap();
+            recovery.join().unwrap();
+
+            assert_eq!(
+                closes.load(Ordering::Relaxed),
+                1,
+                "fd must be closed exactly once (0 = leaked, 2 = double close)"
+            );
+            assert_eq!(slot.load(Ordering::Relaxed), EMPTY, "slot left non-empty");
+        });
+    }
+
+    /// Two recovery threads against a teardown. `execute()` spawns a thread on
+    /// every transport-level failure and an earlier one may still be blocked in
+    /// `open()`, so this is reachable, and it is the case where a CAS lands
+    /// behind an intervening slot operation rather than reading the teardown
+    /// swap's value directly — the release-sequence half of the module docs.
+    ///
+    /// Bounded rather than exhaustive: unbounded, this model runs for many
+    /// minutes, which is too slow for the CI step. Three preemptions is enough
+    /// to reach the leaking schedule — the old orderings fail this test.
+    #[test]
+    fn loom_two_publishers_racing_teardown_close_each_fd_exactly_once() {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(|| {
+            let slot = Arc::new(AtomicI32::new(EMPTY));
+            let dead = Arc::new(AtomicBool::new(false));
+            let closes = Arc::new(AtomicUsize::new(0));
+
+            let publishers: Vec<_> = [7, 9]
+                .into_iter()
+                .map(|fd| {
+                    let (s, d, c) = (slot.clone(), dead.clone(), closes.clone());
+                    loom::thread::spawn(move || {
+                        if publish_recovered_fd(&s, &d, fd).is_some() {
+                            c.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                })
+                .collect();
+
+            let (s, d, c) = (slot.clone(), dead.clone(), closes.clone());
+            let teardown = loom::thread::spawn(move || {
+                if claim_for_teardown(&s, &d).is_some() {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+
+            for p in publishers {
+                p.join().unwrap();
+            }
+            teardown.join().unwrap();
+
+            assert_eq!(
+                closes.load(Ordering::Relaxed),
+                2,
+                "both fds must be closed, exactly once each"
+            );
+            assert_eq!(slot.load(Ordering::Relaxed), EMPTY, "slot left non-empty");
+        });
+    }
+
+    /// The check on leaving [`take_recovered_fd`] at `Acquire` — i.e. with a
+    /// relaxed store half. A drain landing between the teardown swap and a
+    /// recovery CAS must not break the release sequence the edge rides on.
+    #[test]
+    fn loom_drain_does_not_break_the_release_sequence() {
+        loom::model(|| {
+            let slot = Arc::new(AtomicI32::new(EMPTY));
+            let dead = Arc::new(AtomicBool::new(false));
+            let closes = Arc::new(AtomicUsize::new(0));
+
+            // execute() drains, then (later, same transport) Drop tears down.
+            let (s, d, c) = (slot.clone(), dead.clone(), closes.clone());
+            let transport = loom::thread::spawn(move || {
+                if take_recovered_fd(&s).is_some() {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+                if claim_for_teardown(&s, &d).is_some() {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+
+            let (s, d, c) = (slot.clone(), dead.clone(), closes.clone());
+            let recovery = loom::thread::spawn(move || {
+                if publish_recovered_fd(&s, &d, 7).is_some() {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+
+            transport.join().unwrap();
+            recovery.join().unwrap();
+
+            assert_eq!(
+                closes.load(Ordering::Relaxed),
+                1,
+                "fd must be closed exactly once (0 = leaked, 2 = double close)"
+            );
+            assert_eq!(slot.load(Ordering::Relaxed), EMPTY, "slot left non-empty");
+        });
     }
 }
