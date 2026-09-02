@@ -18,9 +18,13 @@
 //! the drive could drain its internal queue, deepening the wedge
 //! pattern on the LG BU40N. Reverted in 0.13.20.
 
+use super::fd_handoff::{
+    AtomicBool, AtomicI32, claim_for_teardown, publish_recovered_fd, take_recovered_fd,
+};
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
 use std::path::Path;
+use std::sync::Arc;
 
 const SG_IO: u32 = 0x2285;
 const SG_DXFER_NONE: i32 = -1;
@@ -74,12 +78,15 @@ const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 64);
 pub struct SgIoTransport {
     pub fd: i32,
     device_path: std::path::PathBuf,
-    pub fd_recovery: std::sync::Arc<std::sync::atomic::AtomicI32>,
-    /// Set to `true` by `Drop` before the transport is torn down. The
-    /// recovery thread checks this after a successful `compare_exchange`
-    /// and closes `new_fd` itself when the transport is already gone,
-    /// preventing an fd leak when Drop races the recovery thread.
-    dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Single-slot mailbox a background recovery thread publishes a freshly
+    /// opened fd into. Drained by `execute()`, or claimed by `Drop` if the
+    /// transport dies first. The protocol — and the memory ordering that makes
+    /// it leak-free — lives in [`super::fd_handoff`].
+    pub fd_recovery: Arc<AtomicI32>,
+    /// Set to `true` by `Drop` before it claims the slot. A recovery thread
+    /// that publishes after that point sees it and closes its own fd, since
+    /// nothing will ever drain the slot again.
+    dead: Arc<AtomicBool>,
 }
 
 impl SgIoTransport {
@@ -99,8 +106,8 @@ impl SgIoTransport {
         Ok(SgIoTransport {
             fd,
             device_path: device,
-            fd_recovery: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
-            dead: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fd_recovery: Arc::new(AtomicI32::new(super::fd_handoff::EMPTY)),
+            dead: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -224,17 +231,10 @@ impl Drop for SgIoTransport {
             let _ = Self::raw_command(self.fd, &ALLOW_MEDIUM_REMOVAL, 3_000);
             unsafe { libc::close(self.fd) };
         }
-        // Signal the recovery thread this transport is gone. Must be set
-        // before the fd_recovery swap so it can't observe dead=false and
-        // store into a slot Drop is no longer going to drain.
-        self.dead.store(true, std::sync::atomic::Ordering::Release);
         // A failed execute() spawns a thread that opens a fresh fd into
-        // fd_recovery, normally drained at the top of the next execute().
-        // If dropped first (abort-on-wedge), claim and close it here.
-        let recovered = self
-            .fd_recovery
-            .swap(-1, std::sync::atomic::Ordering::Acquire);
-        if recovered >= 0 {
+        // fd_recovery, normally drained at the top of the next execute(). If
+        // dropped first (abort-on-wedge), claim and close it here.
+        if let Some(recovered) = claim_for_teardown(&self.fd_recovery, &self.dead) {
             unsafe { libc::close(recovered) };
         }
     }
@@ -292,10 +292,7 @@ impl ScsiTransport for SgIoTransport {
         );
 
         // Check if a background recovery has produced a new fd.
-        let recovered = self
-            .fd_recovery
-            .swap(-1, std::sync::atomic::Ordering::Acquire);
-        if recovered >= 0 {
+        if let Some(recovered) = take_recovered_fd(&self.fd_recovery) {
             // Close the old fd if it's still valid.
             if self.fd >= 0 {
                 unsafe { libc::close(self.fd) };
@@ -400,31 +397,11 @@ impl ScsiTransport for SgIoTransport {
                 if new_fd < 0 {
                     return;
                 }
-                // Publish only into an empty (-1) slot. If two recovery
-                // threads race, the loser closes its own fd rather than
-                // overwriting (and leaking) the winner's.
-                if recovery
-                    .compare_exchange(
-                        -1,
-                        new_fd,
-                        std::sync::atomic::Ordering::Release,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_err()
-                {
-                    // Another recovery thread already stored its fd; ours
-                    // was not stored so it's our responsibility to close it.
-                    unsafe { libc::close(new_fd) };
-                    return;
-                }
-                // Check whether Drop raced us: if the transport is already
-                // dead it won't drain fd_recovery, so swap to atomically
-                // claim new_fd and close it; a -1 result means Drop won.
-                if dead.load(std::sync::atomic::Ordering::Acquire) {
-                    let claimed = recovery.swap(-1, std::sync::atomic::Ordering::AcqRel);
-                    if claimed >= 0 {
-                        unsafe { libc::close(claimed) };
-                    }
+                // Hand the fd to the transport. Comes back to us only if
+                // nobody there will ever close it: another recovery thread
+                // won the slot, or Drop already tore the transport down.
+                if let Some(orphan) = publish_recovered_fd(&recovery, &dead, new_fd) {
+                    unsafe { libc::close(orphan) };
                 }
             });
 
