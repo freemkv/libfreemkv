@@ -3,17 +3,11 @@
 //! PGS segments: PCS, WDS, PDS, ODS, END. Each PES packet starts with
 //! one of those (segment_type byte at offset 0).
 //!
-//! Subtitle display lifecycle (BD spec):
-//! - A "display" PCS (number_of_composition_objects > 0) starts a
-//!   visible subtitle. Its WDS/PDS/ODS follow.
-//! - A later "empty" PCS (number_of_composition_objects == 0) clears
-//!   the screen.
-//!
-//! For Matroska output we collapse that pair into one block with
-//! `BlockDuration` set to (clear_pts - display_pts). Without a
-//! duration, hardware players linger on the last bitmap until the
-//! next subtitle replaces it — which can be many seconds, and on a
-//! disc where the final subtitle has no follower, until end of file.
+//! Subtitle display lifecycle (BD spec): a "display" PCS
+//! (number_of_composition_objects > 0) starts a visible subtitle, and a
+//! later "empty" PCS (== 0) clears it. For Matroska output we collapse that
+//! pair into one block with `BlockDuration` set to (clear_pts - display_pts).
+// See docs/pgs.md — why a missing BlockDuration makes hardware players linger.
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
@@ -33,15 +27,13 @@ const PCS_FIRST_OBJECT_FLAGS_OFFSET: usize = 17;
 const PCS_FORCED_ON_FLAG: u8 = 0x40;
 
 /// Whether an emitted PGS display-set frame is a FORCED subtitle — the
-/// `forced_on_flag` (0x40) on its first composition object. The frame data an
-/// emitted PGS block carries begins with the display PCS (segment type 0x16), so
-/// the flag is read directly from it. Returns `None` when the block is not a
-/// display PCS with a composition object (nothing to classify — a clear PCS, a
-/// non-PCS segment, or a truncated header).
+/// `forced_on_flag` (0x40) on its first composition object. The frame data
+/// begins with the display PCS (segment type 0x16), so the flag is read
+/// directly from it. Returns `None` when the block is not a display PCS with
+/// a composition object (clear PCS, non-PCS segment, or truncated header).
 ///
-/// The mux uses this to detect a *forced-narrative track* (every displayed
-/// subtitle forced) without relying on the disc's vendor label metadata, so
-/// forced subs are flagged `FlagForced` even on discs that carry no such blob.
+/// See `docs/pgs.md` for why the mux uses this for forced-narrative-track
+/// detection.
 pub fn display_set_is_forced(frame_data: &[u8]) -> Option<bool> {
     if frame_data.first() != Some(&SEGMENT_PCS) {
         return None;
@@ -116,32 +108,13 @@ pub const DEMOTE_MIN_DISPLAY_SETS: u32 = 8;
 pub const DEMOTE_MIN_DISPLAY_SHARE_DIVISOR: u32 = 4;
 
 /// Whether content evidence is strong enough to CONTRADICT a vendor label that
-/// says a track is forced — i.e. to demote 1 → 0.
-///
-/// Promotion (0 → 1) needs no such gate: it rests on positive evidence (every
-/// display set carried `forced_on_flag`). Demotion rests on an ABSENCE, and an
-/// absence is only meaningful if the flag is in use at all. Measured: discs
-/// exist on which NO track carries `forced_on_flag`; there, "this track has no
-/// forced display sets" is a fact about the authoring house, not about the
-/// track, and demoting on it would strip a correct forced label from every
-/// track on the disc.
-///
-/// So the rule is, in order:
-///   * something must have been observed at all;
-///   * the flag must be IN USE — on some other track (`disc_uses_forced_flag`) or
-///     on this very track, which is the stronger form: a track carrying the flag
-///     on some of its sets and not others shows the authoring house making that
-///     distinction deliberately;
-///   * and the track must have the SHAPE of a full dialogue track
-///     ([`DEMOTE_MIN_DISPLAY_SETS`] and [`DEMOTE_MIN_DISPLAY_SHARE_DIVISOR`])
-///     rather than of a forced-narrative one. This applies to the mixed case too:
-///     a SMALL track with a couple of flagged sets is a forced track whose
-///     authoring flagged some of its signs, and demoting it would be exactly the
-///     mistake the shape test exists to prevent.
-///
-/// `busiest_displays` is the largest `displays` over every subtitle track judged
-/// together (the same title's tracks for the probe, the same file's tracks for
-/// the muxer).
+/// says a track is forced — i.e. to demote 1 → 0. Promotion needs no such
+/// gate; demotion requires, in order: something observed at all; the flag IN
+/// USE (`disc_uses_forced_flag`, or on this very track); and the track's
+/// SHAPE ([`DEMOTE_MIN_DISPLAY_SETS`], [`DEMOTE_MIN_DISPLAY_SHARE_DIVISOR`])
+/// matching a full dialogue track rather than a forced-narrative one.
+/// `busiest_displays` is the largest `displays` over every subtitle track
+/// judged together. See `docs/pgs.md` for the full rationale and shapes.
 pub fn demotable(facts: ForcedFacts, disc_uses_forced_flag: bool, busiest_displays: u32) -> bool {
     if facts.displays == 0 {
         return false;
@@ -230,10 +203,9 @@ impl PgsParser {
         Self { pending: None }
     }
 
-    /// Take the pending display set (if any) and emit it as a Frame whose
-    /// duration runs from its start PTS to `end_pts_ns` (the PTS of the PCS that
-    /// closes or replaces it), clamped to >= 0. Shared by the clear-PCS and
-    /// replace-PCS arms so the Frame shape stays in one place.
+    // Emit the pending display set as a Frame from its start PTS to
+    // `end_pts_ns`, clamped to >= 0. Shared by the clear-PCS and replace-PCS
+    // arms so the Frame shape stays in one place.
     fn emit_pending(&mut self, end_pts_ns: i64) -> Option<Frame> {
         let (facts, data) = self.pending.take()?;
         let start_pts = facts.presentation_ns().unwrap_or(0);
@@ -439,13 +411,9 @@ mod tests {
         assert_eq!(display_set_is_forced(&[]), None);
     }
 
-    /// `observed()` is the probe's "did I actually see any PGS content?" signal.
-    /// When it is false the track's forced state is UNKNOWN, and the probe leaves
-    /// whatever flag the disc's own metadata supplied alone; when it is true the
-    /// probe overwrites that flag with its own verdict. A tracker that always
-    /// claims to have observed something therefore lets an unread or undecrypted
-    /// subtitle track — where `is_forced()` is vacuously false — overwrite a
-    /// correct vendor "forced" flag with "not forced".
+    // `observed()` distinguishes "unknown" (leave the vendor flag alone) from a
+    // settled verdict, so an unread/undecrypted track can't overwrite a correct
+    // vendor "forced" flag with "not forced". See docs/pgs.md for detail.
     #[test]
     fn observed_stays_false_until_a_real_display_set_is_seen() {
         let mut t = ForcedTracker::new();
@@ -836,10 +804,8 @@ mod tests {
         }
     }
 
-    /// A track that itself mixes forced and non-forced display sets needs no
-    /// corroboration from a sibling: the flag is demonstrably in use ON THIS
-    /// TRACK. Measured shape this models: a busy track labelled forced that
-    /// flags one or two of its hundred-odd display sets.
+    // A track that mixes forced and non-forced sets needs no sibling
+    // corroboration: the flag is in use ON THIS TRACK. See docs/pgs.md.
     #[test]
     fn a_mixed_track_corroborates_the_flag_itself() {
         assert!(demotable(facts(108, 2), false, 137));
@@ -903,11 +869,8 @@ mod tests {
         assert_eq!(t.facts().forced_displays, u32::MAX);
     }
 
-    /// A lone non-PCS segment with a PTS is emitted straight through rather
-    /// than accumulated, and it must still carry provenance. This path was
-    /// missed on the first pass and showed up on a real disc as a subtitle
-    /// track with no source offset -- the one track out of forty that could
-    /// not be placed by byte.
+    // A lone non-PCS segment with a PTS is emitted straight through rather
+    // than accumulated, and must still carry provenance. See docs/pgs.md.
     #[test]
     fn a_lone_segment_emitted_directly_still_carries_provenance() {
         let mut parser = PgsParser::new();

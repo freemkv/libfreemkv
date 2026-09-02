@@ -58,13 +58,9 @@ pub fn resolve_device(path: &str) -> Result<(String, DeviceResolution)> {
     Ok((normalize_path(path), DeviceResolution::Direct))
 }
 
-/// Normalize a device path to Windows \\.\X: format.
-///
-/// Accepts: "D:", "D:\\", "\\.\D:", "\\.\CdRom0"
-///
-/// NOTE: A near-identical `normalize_device_path` exists in `scsi::windows`.
-/// Both are kept because they live in separate `cfg(windows)` modules that
-/// cannot easily share a helper without introducing cross-module coupling.
+// Normalize a device path ("D:", "D:\\", "\\.\D:", "\\.\CdRom0") to
+// Windows \\.\X: format. See docs/drive-access.md — Windows Path
+// Normalization.
 fn normalize_path(path: &str) -> String {
     if path.starts_with("\\\\.\\") {
         return path.to_string();

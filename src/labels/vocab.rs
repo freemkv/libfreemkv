@@ -1,29 +1,13 @@
 //! Shared label vocabulary — canonical mappings used by ≥1 label parser.
 //!
-//! Labels come from BD-J authoring tool files (bluray_project.bin,
-//! playlists.xml, menu_base.prop, .class string pools, etc.) — NOT
-//! from BD spec fields. This module is the central, regression-tested
-//! source of truth for:
+//! Labels come from BD-J authoring tool files, NOT BD spec fields. Central,
+//! regression-tested source of truth for: codec brand aliases, English /
+//! multi-word language name → ISO 639-2, and English text →
+//! [`LabelPurpose`] / [`LabelQualifier`].
 //!
-//! - Codec brand name aliases (`MLP` → `TrueHD`).
-//! - English / multi-word language name → ISO 639-2 code.
-//! - English text → [`LabelPurpose`] (Commentary / Descriptive / etc.).
-//! - English text → [`LabelQualifier`] (SDH / Forced / Descriptive Service).
-//!
-//! Rules of engagement:
-//!
-//! 1. Only map values we are 100% certain about — published codec
-//!    names, well-known ISO 639-2 mappings, vendor-documented purpose
-//!    keywords.
-//! 2. Unknown codes / unrecognized phrases pass through raw or return
-//!    `None`. We never guess.
-//! 3. Matching is case-insensitive and word-boundary-aware where
-//!    relevant (so "Commenter" doesn't match "commentary"). Anchoring
-//!    on whole tokens is the responsibility of this module — callers
-//!    pass raw text, we handle it.
-//!
-//! This module is NOT for BD spec STN codec IDs; those decode in
-//! `mpls.rs` separately.
+//! Only maps values we are 100% certain about; unknown input passes through
+//! raw or returns `None` — never guesses. Not for BD spec STN codec IDs;
+//! those decode in `mpls.rs`. See docs/vocab.md for full rules of engagement.
 
 use super::{LabelPurpose, LabelQualifier};
 
@@ -69,30 +53,12 @@ pub struct LangInfo {
 /// Map a free-form language label fragment to an ISO 639-2 code AND
 /// (where applicable) its regional variant.
 ///
-/// Handles both bare English names ("English", "Spanish") and the
-/// multi-word vendor variants we've seen in the corpus ("Brazilian
-/// Portuguese", "Castilian Spanish", "Canadian French"). Match is
-/// case-insensitive. Compound phrases are scanned BEFORE bare names, so
-/// "Brazilian Portuguese" returns
-/// `LangInfo { code: "por", variant: "Brazilian" }` rather than being
-/// consumed by the bare "Portuguese" entry. Within `COMPOUND_LANGS` the
-/// scan is positional (first `contains` hit wins), so that table MUST be
-/// maintained longest-first — a longer phrase must precede any shorter
-/// phrase it contains (e.g. "latin american spanish" before
-/// "latin spanish").
-///
-/// Bare-name matches return `variant: ""`.
-///
-/// Returns `None` for unrecognized input — callers decide whether to
-/// fall back to MPLS spec codes, pass through raw, or drop the stream.
-/// Never guesses.
-///
-/// Why the variant: returning only the ISO code would silently drop
-/// regional dialect info — "Brazilian Portuguese 5.1" would become
-/// `language="por", variant=""` and the UI would display plain
-/// "Portuguese" even though the disc explicitly labeled the stream
-/// Brazilian. Returning the variant lets callers populate
-/// [`StreamLabel::variant`](super::StreamLabel) with the dialect.
+/// Handles bare English names ("English") and multi-word vendor variants
+/// ("Brazilian Portuguese"); compounds are checked before bare names, so
+/// the latter returns `variant: "Brazilian"` rather than a bare
+/// "Portuguese" match. Bare matches return `variant: ""`; `None` means
+/// unrecognized input (never a guess). See docs/vocab.md for the
+/// `COMPOUND_LANGS` ordering rule and the [`StreamLabel::variant`](super::StreamLabel) rationale.
 pub fn lang(text: &str) -> Option<LangInfo> {
     let lower = text.to_lowercase();
     // Multi-word compounds first. Scan is positional (first hit wins),
@@ -182,10 +148,8 @@ const BARE_LANGS: &[(&str, &str)] = &[
 /// These filename tokens are compact 2/3-letter abbreviations, NOT the full
 /// language names [`lang`] handles, so they get their own certain table.
 /// Accepts the ISO-639-2/B spellings some tools emit (`ger`, `fre`, `chi`)
-/// and normalizes them to the /T code the rest of the pipeline uses (`deu`,
-/// `fra`, `zho`). Case-insensitive. Returns `None` for anything not in the
-/// table — never guesses, so an unrecognized token drops rather than
-/// mislabels.
+/// and normalizes to /T (`deu`, `fra`, `zho`). Case-insensitive. Returns
+/// `None` for anything not in the table — never guesses.
 pub fn menu_lang(token: &str) -> Option<&'static str> {
     let t = token.trim().to_ascii_lowercase();
     let code = match t.as_str() {
@@ -221,17 +185,8 @@ pub fn menu_lang(token: &str) -> Option<&'static str> {
 
 // ── ISO 639-1 → ISO 639-2 ────────────────────────────────────────────────────
 
-/// The complete ISO 639-1 set, paired with its ISO 639-2/**T** (terminological)
-/// code. Every two-letter code ISO 639-1 defines appears exactly once.
-///
-/// /T is the variant the rest of this crate uses — [`lang`] and [`menu_lang`]
-/// both normalize to it (`deu` not `ger`, `fra` not `fre`, `zho` not `chi`,
-/// `ces`, `nld`, `ell`, `ron`, `slk`, `isl`, `eus`, `hrv`) — so the three
-/// tables cannot disagree. `iso639_1_agrees_with_menu_lang` pins that.
-///
-/// For the 165 codes where 639-2/B and /T are identical this distinction does
-/// not arise; it only matters for the 20-odd languages with a distinct
-/// bibliographic code.
+// Complete ISO 639-1 set, paired with its ISO 639-2/T code (each code once).
+// See docs/vocab.md#iso639_1_to_iso639_2--the-whole-iso-639-1-set for why /T.
 const ISO_639_1_TO_2: &[(&str, &str)] = &[
     ("aa", "aar"),
     ("ab", "abk"),
@@ -419,25 +374,19 @@ const ISO_639_1_TO_2: &[(&str, &str)] = &[
     ("zu", "zul"),
 ];
 
-/// The three two-letter codes ISO 639-1 has since withdrawn, mapped to their
-/// replacements. DVD-Video froze its language list on the 1988 edition, so
-/// discs authored to the spec carry these spellings and no other table sees
-/// them: `iw` Hebrew (now `he`), `in` Indonesian (now `id`), `ji` Yiddish
-/// (now `yi`).
+// Withdrawn ISO 639-1 codes DVD-Video still carries (frozen at the 1988
+// edition). See docs/vocab.md#iso639_1_to_iso639_2--the-whole-iso-639-1-set.
 const ISO_639_1_DEPRECATED: &[(&str, &str)] = &[("iw", "he"), ("in", "id"), ("ji", "yi")];
 
 /// Map an ISO 639-1 two-letter language code to its ISO 639-2/T three-letter
 /// code, accepting the withdrawn DVD-era spellings (`iw`, `in`, `ji`) as
 /// aliases for their replacements.
 ///
-/// Covers the WHOLE of ISO 639-1, unlike [`menu_lang`], whose table only spans
-/// the languages that show up in Blu-ray menu-graphic filenames. Callers that
-/// convert a spec field — a DVD IFO attribute block, say — need the whole set:
-/// narrowing it to the menu vocabulary would fold every other language onto
-/// one value and make a disc's tracks indistinguishable from each other.
-///
-/// Case-insensitive and trimmed. Returns `None` for anything that is not an
-/// ISO 639-1 code, so callers decide the fallback rather than getting a guess.
+/// Covers the WHOLE of ISO 639-1, unlike [`menu_lang`], whose table only
+/// spans the languages seen in Blu-ray menu-graphic filenames. Case-
+/// insensitive and trimmed. Returns `None` for anything that is not an ISO
+/// 639-1 code — callers decide the fallback. See docs/vocab.md for why the
+/// full set matters.
 pub fn iso639_1_to_iso639_2(code: &str) -> Option<&'static str> {
     let c = code.trim().to_ascii_lowercase();
     let c = ISO_639_1_DEPRECATED
@@ -453,18 +402,13 @@ pub fn iso639_1_to_iso639_2(code: &str) -> Option<&'static str> {
 // ── Purpose ──────────────────────────────────────────────────────────────────
 
 /// Classify a free-form English label string into a [`LabelPurpose`].
-///
-/// Recognized keywords (case-insensitive; single-word keywords are
-/// word-boundary matched, multi-word phrases are substring matched):
+/// Case-insensitive; single words word-boundary matched, phrases substring
+/// matched:
 /// - "commentary", "director's commentary" → `Commentary`
 /// - "descriptive", "description", "audio description", "described" → `Descriptive`
 /// - "score", "music only" → `Score`
 /// - "ime" (alternate music for closing themes etc.) → `Ime`
 /// - anything else → `Normal`
-///
-/// Word-boundary matching means "Commentary track" matches but
-/// "Commenter Pro audio" does not. Multi-word phrases like "audio
-/// description" and "music only" are matched as plain substrings.
 pub fn purpose(text: &str) -> LabelPurpose {
     let lower = text.to_lowercase();
     // Multi-word compounds first — they're more specific.
@@ -502,9 +446,7 @@ pub fn purpose(text: &str) -> LabelPurpose {
 /// - "rnib", "descriptive service" → `DescriptiveService`
 /// - anything else → `None`
 ///
-/// SDH (Subtitles for the Deaf and Hard of hearing) wins over Forced
-/// when both keywords are present, because an SDH track is its own
-/// stream regardless of whether the player flags it as "forced".
+/// SDH wins over Forced when both are present. See docs/vocab.md for why.
 pub fn qualifier(text: &str) -> LabelQualifier {
     let lower = text.to_lowercase();
     if has_word(&lower, "sdh") || has_word(&lower, "captions") {
@@ -521,14 +463,8 @@ pub fn qualifier(text: &str) -> LabelQualifier {
 
 // ── Internal: word-boundary matching ────────────────────────────────────────
 
-/// True if `needle` appears in `haystack` surrounded by non-alphanumeric
-/// boundaries (or string ends). `haystack` is assumed lowercase already.
-///
-/// This is the load-bearing primitive for `lang` / `purpose` /
-/// `qualifier`: bare-token matchers MUST use it, otherwise we match
-/// "english" inside "englishman" and "sdh" inside "lambdash". The
-/// existing parsers used `.contains()` and got lucky on the corpus;
-/// vocab guarantees the boundary.
+// True if `needle` appears in `haystack` at non-alphanumeric boundaries
+// (`haystack` assumed lowercase). See docs/vocab.md#has_word--word-boundary-primitive.
 fn has_word(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -916,19 +852,9 @@ mod tests {
         assert_eq!(codec(""), "");
     }
 
-    /// `purpose()`'s multi-word-compound fast path ORs two independent
-    /// phrase checks ("audio description" / "descriptive service"). Each
-    /// phrase, when it appears as a *word*-bounded match, is independently
-    /// caught by the has_word fallback further down — so the OR only
-    /// matters when a phrase appears as a *substring inside a larger word*
-    /// (no boundary), which .contains() still catches but has_word() would
-    /// reject.
-    ///
-    /// Mutation: replace `||` with `&&` at line 238 → since "audio
-    /// description" is absent here, the AND fails, the fast path doesn't
-    /// fire, and the fallback has_word("descriptive") also fails (no word
-    /// boundary before "descriptive" in "nondescriptive"), so purpose()
-    /// wrongly returns Normal instead of Descriptive.
+    // Guards the `||` (not `&&`) in purpose()'s compound-phrase fast path:
+    // catches a substring match with no word boundary that has_word() would miss.
+    // See docs/vocab.md#test-rationale-mutation-testing-notes for the mutation trace.
     #[test]
     fn purpose_descriptive_service_substring_without_word_boundary() {
         assert_eq!(
@@ -937,11 +863,8 @@ mod tests {
         );
     }
 
-    /// `menu_lang()` maps every authoring-filename token in its table
-    /// (ISO-639-2/B and /T spellings, plus ISO-639-1) to the canonical
-    /// /T code used by the rest of the pipeline. Exhaustive per-arm check:
-    /// deleting any single match arm makes that arm's tokens return None
-    /// instead of the documented code.
+    // Exhaustive per-arm check: every menu_lang() table token maps to its
+    // canonical /T code; deleting any arm makes that arm's tokens return None.
     #[test]
     fn menu_lang_covers_every_table_entry() {
         let cases: &[(&str, &str)] = &[
@@ -1020,10 +943,8 @@ mod tests {
         assert_eq!(menu_lang(""), None);
     }
 
-    /// Structural invariants of `ISO_639_1_TO_2`: it must hold the complete
-    /// ISO 639-1 set (184 codes), every key a distinct pair of lowercase
-    /// letters and every value three lowercase letters. A typo'd or duplicated
-    /// row fails here rather than silently mislabelling a track.
+    // `ISO_639_1_TO_2` structural invariants: complete 184-code set, distinct
+    // keys, well-formed values. See docs/vocab.md for the full rationale.
     #[test]
     fn iso639_1_table_is_complete_and_well_formed() {
         assert_eq!(
@@ -1062,11 +983,9 @@ mod tests {
         }
     }
 
-    /// The two tables must not disagree. Every two-letter token `menu_lang`
-    /// accepts has to yield the same ISO 639-2/T code through
-    /// `iso639_1_to_iso639_2`, so a DVD-sourced language and a Blu-ray
-    /// menu-label language for the same tongue never produce different
-    /// `Language` elements.
+    // The two tables must not disagree: every token menu_lang() accepts must
+    // yield the same code as iso639_1_to_iso639_2(), so DVD and Blu-ray never
+    // produce different `Language` elements for the same tongue.
     #[test]
     fn iso639_1_agrees_with_menu_lang() {
         for (two, three) in ISO_639_1_TO_2 {

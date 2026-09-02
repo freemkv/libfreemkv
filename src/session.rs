@@ -4,14 +4,10 @@
 //!
 //! The session owns the [`Drive`] by value (tray unlock stays guaranteed via
 //! `Drive::drop`) and, after [`DiscSession::scan`], the resulting [`Disc`].
-//! Lifecycle is intentionally SPLIT — `open` does transport mechanics only,
-//! `identify` / `scan` are separate — so a consumer can fetch a poster off a
-//! fast `identify` and update its UI before committing to a full `scan`.
+//! libfreemkv resolves no keys and reads no keydb: the consumer supplies its
+//! own key material via [`KeySpec`], forwarded to [`ScanOptions`] at scan time.
 //!
-//! libfreemkv resolves no keys and reads no keydb: the consumer builds the
-//! host credentials / key-source layer (from `freemkv_keysources`) and hands
-//! them in via [`KeySpec`]; the session merely FORWARDS them into
-//! [`ScanOptions`] at scan time. No cert derivation happens here.
+//! See docs/session.md for the lifecycle-split rationale and key-forwarding contract.
 
 use crate::aacs::trace::ResolutionTrace;
 use crate::disc::{Disc, DiscId, DriveCredentials, ScanOptions};
@@ -54,21 +50,12 @@ pub struct ResolvedKeys {
 /// read-time [`KeyFetch`] — the one place the sampling / ordered-apply / banking
 /// / fetch-construction glue lives, so the CLI and autorip stop hand-rolling it.
 ///
-/// Steps, identical to what the consumers did inline:
-/// 1. Take the disc's public AACS inputs ([`Disc::inputs`]); a non-AACS disc has
-///    none, so this is a no-op returning an empty trace and no fetch.
-/// 2. Sample up to [`MIN_SAMPLE_UNITS`] encrypted content units from the LARGEST
-///    title via `reader` ([`read_encrypted_units`]) so a candidate key is
-///    validated against real ciphertext. Skipped (no wasted read) when the
-///    factory yields no sources — resolution is then a guaranteed miss anyway.
-/// 3. Run the ordered sources first-valid-wins ([`resolve_and_apply_traced`]),
-///    which banks the winning unit keys onto `disc`'s AACS state.
-/// 4. Build the read-time [`KeyFetch`] from the disc's inputs (its per-call
-///    samples are swapped in by the closure) using the same source factory.
+/// Samples ciphertext from the disc via `reader` (a live [`Drive`] or a
+/// file-backed [`SectorSource`] from [`scan_iso`]), runs the ordered `sources`
+/// first-valid-wins, banks any winning unit keys onto `disc`, and builds the
+/// read-time [`KeyFetch`] used for later on-decrypt-miss fetches.
 ///
-/// The `reader` is whatever the disc lives behind — a live [`Drive`] or a
-/// file-backed [`SectorSource`] from [`scan_iso`]; both implement
-/// [`SectorSource`].
+/// See docs/session.md for the exact step-by-step breakdown.
 pub fn resolve_keys_for(
     reader: &mut dyn SectorSource,
     disc: &mut Disc,
@@ -181,13 +168,9 @@ pub struct DiscSession {
     key_fetch: Option<KeyFetch>,
 }
 
-/// Overlay the session's consumer-supplied key material onto a caller's
-/// [`ScanOptions`], without ever clobbering what the caller already set.
-///
-/// Pure (no drive I/O) so the KeySpec → ScanOptions derivation is unit-testable
-/// without hardware. `credentials` is copied (it is `Clone`); `key_sources` is
-/// MOVED out of the spec (trait objects are not `Clone`), leaving the spec's
-/// vec empty once consumed.
+// Overlay the session's key material onto `opts` without clobbering what the
+// caller already set. `credentials` is cloned; `key_sources` is moved out of
+// `spec` (trait objects aren't `Clone`), leaving the spec's vec empty.
 fn forward_key_material(spec: &mut KeySpec, mut opts: ScanOptions) -> ScanOptions {
     if opts.credentials.is_none() {
         opts.credentials = spec.credentials.clone();
@@ -348,12 +331,8 @@ impl DiscSession {
     ///
     /// # Errors
     ///
-    /// [`Error::DeviceNotReady`] when the drive is no longer held — the PUBLIC
-    /// [`Self::stage_drive_as_reader`] moves it into the reader slot, and
-    /// calling this twice moves it out, so an empty slot is reachable through
-    /// ordinary use rather than being a caller error. A library must not panic
-    /// from public API, and a precondition that normal flow violates is a trap
-    /// rather than a contract.
+    /// [`Error::DeviceNotReady`] when the drive is no longer held — reachable
+    /// through ordinary use (see docs/session.md), not just caller error.
     pub fn into_drive(self) -> Result<Drive> {
         self.drive.ok_or_else(|| Error::DeviceNotReady {
             path: self.device.clone(),
@@ -389,19 +368,9 @@ impl DiscSession {
         self.reader.take()
     }
 
-    /// Test-only constructor: build a session over an INJECTED reader + already-
-    /// scanned disc WITHOUT opening a live [`Drive`]. `DiscSession::open` needs
-    /// real hardware, so this is the only way to exercise the
-    /// [`MuxInput::Session`](crate::mux::MuxInput::Session) mux arm (take_reader →
-    /// resolve_inline_base_map → DiscStream → with_key_map) and
-    /// [`Self::resolve_keys`]'s title-sampling branch against a synthetic reader.
-    ///
-    /// The drive slot stays `None` (a `MuxInput::Session` mux never touches it —
-    /// it reads through the staged `reader`); `device` carries a sentinel path so
-    /// the driver's missing-reader error still has a name.
-    ///
-    /// `disc` is an `Option` so a test can construct a session that has NOT been
-    /// scanned (`None`) to exercise the `resolve_keys` "called before scan" guard.
+    // Test-only: build a session over an injected reader + already-scanned disc
+    // without opening a live Drive, to exercise the mux/resolve_keys test paths.
+    // See docs/session.md for the full rationale.
     #[cfg(test)]
     pub(crate) fn from_parts_for_test(
         disc: Option<Disc>,
@@ -422,19 +391,13 @@ impl DiscSession {
 /// Scan an ISO image's structure from a file path, returning the scanned
 /// [`Disc`] together with a reusable [`SectorSource`] over the same file.
 ///
-/// This is the file-backed counterpart to [`DiscSession::scan`]: it is the one
-/// place that opens a [`FileSectorSource`], reads its capacity, and runs
-/// [`Disc::scan_image`], so consumers (CLI, autorip) stop hand-rolling that
-/// triple and stop constructing the low-level reader themselves. No SCSI, no
-/// handshake, no key resolution — AACS resolution during the scan uses only
-/// whatever `opts` already carries (mirroring how `Disc::scan_image` forwards
-/// `ScanOptions`).
+/// This is the file-backed counterpart to [`DiscSession::scan`]: it opens a
+/// [`FileSectorSource`], reads its capacity, and runs [`Disc::scan_image`].
+/// No SCSI, no handshake, no key resolution beyond what `opts` already
+/// carries. The returned reader is a fresh handle at the start of the image,
+/// reusable by callers that need to sample ciphertext or feed a mux.
 ///
-/// The returned reader is a fresh handle positioned at the start of the image;
-/// callers that need to sample ciphertext (key resolution) or feed a mux can
-/// reuse it directly rather than re-opening the file. `Disc::scan_image` reads
-/// only through the same reader, and all reads are LBA-addressed, so the
-/// handle is fully reusable afterward.
+/// See docs/session.md for the full rationale.
 pub fn scan_iso(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorSource>)> {
     let mut reader = FileSectorSource::open(path)?;
     let capacity = reader.capacity_sectors();
@@ -442,37 +405,22 @@ pub fn scan_iso(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorS
     Ok((disc, Box::new(reader)))
 }
 
-/// Sampled 6144-byte aligned units when deciding whether a folder that still
-/// carries `AACS/` actually holds encrypted content. Enough to survive a clip
-/// whose opening units happen to be unflagged (a clear leader), few enough to
-/// stay a handful of reads.
+// Sampled 6144-byte aligned units when judging whether a folder with `AACS/`
+// actually holds encrypted content — enough to survive a clear leader clip,
+// few enough to stay a handful of reads.
 const AACS_PROBE_UNITS: usize = 8;
 
 /// [`Disc`] together with a [`SectorSource`] over a synthesized image of an
 /// extracted disc FOLDER — the `dir://` counterpart to [`scan_iso`].
 ///
-/// The extra step over `scan_iso` is the encryption verdict.
-/// `Disc::scan_with` decides `encrypted` STRUCTURALLY, from the presence of an
-/// `/AACS` or `/BDMV/AACS` directory (see `disc::aacs_dir_present`). For the common
-/// case — a typical disc backup, which strips `AACS/` — that already gives the
-/// right answer, and `DecryptKeys::None` is a pass-through. But a folder copied
-/// verbatim from a decrypted disc keeps `AACS/`, and the tree shape then claims
-/// encryption over content that is already in the clear: the rip would fail
-/// asking for a key it does not need.
+/// The extra step over `scan_iso` is the encryption verdict: tree shape alone
+/// (an `AACS/` directory) can be wrong for an already-decrypted folder, so
+/// content is sampled and judged by `aacs_unit_needs_decrypt`:
 ///
-/// So for a folder, tree shape is not the evidence — CONTENT is. Several
-/// aligned units at the largest title's start are sampled and judged by
-/// `aacs_unit_needs_decrypt`, the same authority the mux read path uses:
+/// * none need decryption → `encrypted` is forced false, reason logged.
+/// * any unit does → [`Error::DirImageEncrypted`] (`dir://` doesn't support it).
 ///
-/// * none need decryption → the folder is decrypted; `encrypted` is forced
-///   false and the reason is logged.
-/// * any unit does → the folder is a raw encrypted copy, which `dir://` does
-///   not support; [`Error::DirImageEncrypted`].
-///
-/// This lives HERE and not in `Disc::scan_image`, which is shared with the ISO
-/// and drive paths: an ISO that carries `AACS/` and clear content is a
-/// different situation (it may be mid-decrypt, or `--raw` output), and the
-/// verdict must not change underneath those callers.
+/// See docs/session.md for the full rationale.
 pub fn scan_dir(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorSource>)> {
     let mut reader = crate::dirimage::DirImage::open(path)?;
     let capacity = reader.capacity_sectors();
@@ -482,17 +430,9 @@ pub fn scan_dir(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorS
     Ok((disc, Box::new(reader)))
 }
 
-/// Re-judge a FOLDER's encryption verdict from its CONTENT.
-///
-/// `Disc::scan_with` decides `encrypted` from tree shape — whether an `AACS/`
-/// directory is present. That is right for an image and wrong for a verbatim
-/// copy of an already-decrypted disc that kept the directory: the rip would
-/// fail asking for a key it does not need.
-///
-/// Shared by [`scan_dir`] and by the `dir://` PES input path in
-/// `mux::resolve`. It lives in one place because the two disagreed: a folder
-/// that ripped through `scan_dir` failed through `input()`, which is the exact
-/// failure this probe was written to prevent, reachable by the other door.
+// Re-judge a FOLDER's encryption verdict from its CONTENT (tree shape alone
+// can be wrong for an already-decrypted folder that kept `AACS/`). Shared by
+// scan_dir and the dir:// path in mux::resolve; see docs/session.md.
 pub(crate) fn apply_folder_encryption_verdict(
     reader: &mut dyn SectorSource,
     disc: &mut Disc,
@@ -519,12 +459,9 @@ pub(crate) fn apply_folder_encryption_verdict(
     Ok(())
 }
 
-/// `true` when any sampled content unit still needs decryption.
-///
-/// Anchored at the largest title's first extent, because AACS unit alignment
-/// is measured from the clip FILE's start (`aacs::content::is_unit_aligned`),
-/// not from an absolute `lba % 3` — sampling off a boundary would mis-judge a
-/// perfectly clear unit.
+// `true` when any sampled content unit still needs decryption. Anchored at
+// the largest title's first extent, because AACS unit alignment is measured
+// from the clip FILE's start, not an absolute `lba % 3`.
 fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result<bool> {
     use crate::aacs::content::{aacs_unit_needs_decrypt, is_unit_aligned};
     use crate::consts::SECTOR_BYTES;
@@ -756,11 +693,9 @@ mod tests {
         Arc::new(move || vec![Box::new(make()) as Box<dyn KeySource>])
     }
 
-    /// The happy path: a source's Unit Key is BANKED onto the disc's AACS state
-    /// (so `decrypt_keys()` now yields it) and a `KeyFetch` is retained.
-    ///
-    /// Mutation guard: if the banking step (`resolve_and_apply_traced`) is
-    /// dropped, `decrypt_keys()` stays `None` and this assertion fails.
+    // The happy path: a source's Unit Key is banked onto the disc's AACS state
+    // and a `KeyFetch` is retained. Guards against dropping the banking step
+    // (`resolve_and_apply_traced`), which would leave `decrypt_keys()` `None`.
     #[test]
     fn resolve_keys_for_banks_unit_key_and_builds_fetch() {
         use crate::decrypt::DecryptKeys;
@@ -825,11 +760,9 @@ mod tests {
         }
     }
 
-    /// `resolve_keys_for` samples the LARGEST title's ciphertext through the
-    /// reader when a source is configured (the `session.rs:90` sampling branch).
-    /// The other tests use a title-less disc (no sampling read), so this branch
-    /// was uncovered. With two titles and a non-empty source, the sampling read
-    /// fires against the LARGER title's extent.
+    // `resolve_keys_for` samples the LARGEST title's ciphertext through the
+    // reader when a source is configured. Other tests use a title-less disc
+    // (no sampling read); this one covers the sampling branch with two titles.
     #[test]
     fn resolve_keys_for_samples_largest_title_through_reader() {
         use crate::disc::{DiscTitle, Extent};
@@ -898,12 +831,9 @@ mod tests {
         );
     }
 
-    /// `resolve_keys` called before `scan` (disc slot still `None`) must return the
-    /// clean typed `DeviceNotReady` guard, never reach the `.expect("disc present
-    /// (checked above)")` below it and panic.
-    ///
-    /// Mutation: change the `if self.disc.is_none()` guard to `.expect()`/panic
-    /// (e.g. drop the early return) → this test panics instead of getting an Err.
+    // `resolve_keys` called before `scan` (disc slot still `None`) must return
+    // the typed `DeviceNotReady` guard, never reach the `.expect(...)` below it
+    // and panic. Guards against dropping the `if self.disc.is_none()` early return.
     #[test]
     fn resolve_keys_before_scan_is_clean_device_not_ready() {
         let mut session = DiscSession::from_parts_for_test(None, None, None);
@@ -916,15 +846,9 @@ mod tests {
         );
     }
 
-    /// `identify` after the drive has left the session (the PUBLIC
-    /// `stage_drive_as_reader` / `into_drive` both permit that ordering) must
-    /// return the typed `DeviceNotReady`, not reach `drive_mut`'s
-    /// `.expect("drive present")` and panic. A library returns errors from its
-    /// public API; only `main()` exits. This is the sibling of
-    /// `scan` / `resolve_keys`, which were already converted.
-    ///
-    /// Mutation: restore `Disc::identify(self.drive_mut())` → this test panics
-    /// instead of receiving an `Err`.
+    // `identify` after the drive has left the session (both `stage_drive_as_reader`
+    // and `into_drive` permit that ordering) must return `DeviceNotReady`, not
+    // reach `drive_mut`'s `.expect(...)` and panic. Sibling of scan/resolve_keys.
     #[test]
     fn identify_without_a_drive_is_clean_device_not_ready() {
         let mut session = DiscSession::from_parts_for_test(None, None, None);

@@ -37,63 +37,21 @@ pub const SCSI_READ_DISC_STRUCTURE: u8 = 0xAD;
 /// AACS key class for REPORT KEY / SEND KEY commands.
 pub const AACS_KEY_CLASS: u8 = 0x02;
 
-/// Timeout for TEST UNIT READY probes used by [`drive_has_disc`].
-/// TUR is the cheapest SCSI op (no data transfer); 5 s is generous
-/// for any healthy bus and short enough that a hung device can't stall
-/// a poll-loop tick.
-///
-/// Used by the Linux and Windows backends. macOS answers the same question
-/// from the IOKit registry (no SCSI command is issued, so no timeout applies)
-/// — see `macos::drive_has_disc`.
+// Timeout for TEST UNIT READY probes (drive_has_disc): cheapest SCSI op,
+// no data transfer, 5s is generous. Linux/Windows only — macOS answers
+// from the IOKit registry with no SCSI command, so no timeout applies.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 
-/// Timeout for content READ commands (READ_10 / READ_12) on the fast
-/// path — the `freemkv_engine::recovery::copy` sweep that bisects-on-failure.
-///
-/// 10 s is calibrated from live empirical data on an LG BU40N + Initio
-/// 1618L bridge ripping a UHD with marginal sectors:
-///
-///   - Sustained sequential reads:    3 – 7 ms
-///   - Cold-start seek + read:        up to ~1500 ms
-///   - Successful ECC recovery:       1.6 – 2.6 sec
-///   - Confirmed unreadable sector:   3.6 – 8.8 sec (kernel timeout)
-///
-/// 10 s catches every legitimate slow read with comfortable margin and
-/// short-circuits truly bad sectors at ~10 s rather than letting the
-/// kernel mid-layer escalate for 30 s+.
-///
-/// Pre-0.13.21 this was 1.5 s, which forced the kernel mid-layer to
-/// time out *normal* reads (cold-start often takes ~1.5 s) and run its
-/// full ABORT TASK / LUN RESET / BUS RESET escalation while userspace
-/// kept submitting fresh reads. The Initio bridge couldn't drain the
-/// resulting command queue and entered a wedge state that only physical
-/// replug recovered — proven by the v0.13.18 + v0.13.20 live tests.
-// Consumed only by the ripping read path (`drive::read`); gated so a
-// transport-only build doesn't warn on an unused const.
+// Timeout for content READ (READ_10/12) on the ripping fast path
+// (`freemkv_engine::recovery::copy`). 10s, calibrated on an LG BU40N +
+// Initio 1618L bridge. See docs/scsi-mod.md — READ_TIMEOUT_MS calibration.
 #[cfg(feature = "rip")]
 pub(crate) const READ_TIMEOUT_MS: u32 = 10_000;
 
-/// Timeout for content READ commands on the recovery path —
-/// `freemkv_engine::recovery::patch`'s targeted retries on bad ranges. Matches
-/// `sg_dd`'s 60 s ceiling: long enough that any sector the drive can
-/// recover at all gets the time to do so, short enough that an
-/// unresponsive bus is detected before the per-range watchdog fires.
-///
-/// In practice failed reads return in 1–4 s (the drive itself gives up
-/// on uncorrectable ECC before the timeout); the 60 s value is a
-/// safety ceiling, not a steady-state cost.
-///
-/// Historical note (2026-05-08): briefly lowered to 2 s with a 5×
-/// inline retry loop in `freemkv_engine::recovery::patch` to mimic the kernel `sr_mod`
-/// driver's auto-retry pattern. The synthetic logic worked but on the
-/// live drive each "2 s" read paid ~1.5 s of kernel SCSI mid-layer
-/// error escalation on top, so 5× retries took ~17 s per LBA and
-/// triggered MAX_RANGE_SECS after 4 sectors — pushing recovery to
-/// 0/22 ranges (worse than the 0/22 baseline of v0.17.3 single-shot
-/// at 60 s, since that at least visited every range). Reverted; the
-/// kernel-auto-retry approach is being pursued via a `/dev/sr0` pread
-/// fallback instead.
+// Timeout for content READ on the recovery path (`recovery::patch`'s
+// targeted retries). Matches sg_dd's 60s ceiling; failed reads usually
+// return in 1-4s. See docs/scsi-mod.md — READ_RECOVERY_TIMEOUT_MS history.
 #[cfg(feature = "rip")]
 pub(crate) const READ_RECOVERY_TIMEOUT_MS: u32 = 60_000;
 
@@ -112,26 +70,8 @@ pub const SCSI_STATUS_TRANSPORT_FAILURE: u8 = 0xFF;
 
 // ── CDB length validation ──────────────────────────────────────────────────
 
-/// Validate a CDB against a transport's CDB field width, returning the length
-/// as the `u8` every backend's pass-through descriptor wants.
-///
-/// A CDB longer than the field must be REJECTED, never truncated. Under SPC-4
-/// the opcode's group code (bits 7-5 of byte 0) fixes the CDB length, so
-/// dropping the tail bytes does not produce a shorter form of the same
-/// command — it produces a DIFFERENT command with a different meaning for the
-/// bytes that remain. The drive will usually execute it and return GOOD
-/// status with data for a request the caller never made: a silently wrong
-/// result, on the transport layer everything else in the crate sits on.
-///
-/// Lives here, shared by all three platform backends, so the guard cannot
-/// drift per platform (it previously truncated on Linux and Windows while
-/// erroring on macOS — the "works on my platform, not theirs" class).
-/// An EMPTY CDB is rejected here too. `ScsiTransport` is a public trait, so an
-/// out-of-crate caller can pass one; every backend then either indexes `cdb[0]`
-/// (a panic out of a public API) or hands the driver a zero-length command
-/// descriptor, which under SPC-4 is not a command at all. That guard used to
-/// exist ONLY in the Linux backend — macOS and Windows had nothing — which is
-/// the same per-platform drift this helper exists to prevent.
+// Validate a CDB against a transport's field width; REJECT (never
+// truncate) an over-length CDB — see docs/scsi-mod.md — checked_cdb_len rationale.
 pub(crate) fn checked_cdb_len(cdb: &[u8], max: usize) -> Result<u8> {
     if cdb.is_empty() || cdb.len() > max {
         return Err(Error::InvalidCdbLength {
@@ -150,12 +90,9 @@ mod cdb_len_tests {
     /// The maximum every backend declares (`K_MAX_CDB_SIZE`).
     const MAX: usize = 16;
 
-    /// A CDB one byte over the transport's field width must be REJECTED with
-    /// [`Error::InvalidCdbLength`], never silently shortened to `max`. This is
-    /// the cross-platform test for the guard that `linux.rs`, `macos.rs` and
-    /// `windows.rs` all route through — none of those three modules is
-    /// compiled on more than one host, so the shared helper is the only place
-    /// the behaviour can be tested on every platform's CI.
+    // Oversized CDB must be rejected, never truncated. This is the only
+    // place the guard can be tested on every platform's CI, since
+    // linux.rs/macos.rs/windows.rs each compile on one host only.
     #[test]
     fn oversized_cdb_is_rejected_not_truncated() {
         let cdb = [0u8; MAX + 1];
@@ -193,14 +130,9 @@ mod cdb_len_tests {
         }
     }
 
-    /// An EMPTY CDB must be rejected by the SHARED helper, not left to a
-    /// per-backend guard. It previously reported `Ok(0)` and only the Linux
-    /// backend caught it before `cdb[0]`; macOS and Windows passed a
-    /// zero-length command descriptor straight to the driver.
-    ///
-    /// This is the only place the property can be tested on every platform's
-    /// CI — none of `linux.rs` / `macos.rs` / `windows.rs` compiles on more
-    /// than one host.
+    // Empty CDB must be rejected by the shared helper; per-backend guards
+    // previously missed it (macOS/Windows passed a zero-length descriptor
+    // straight to the driver before this existed).
     #[test]
     fn empty_cdb_is_rejected_by_the_shared_helper() {
         match checked_cdb_len(&[], MAX) {
@@ -308,13 +240,11 @@ mod sense_family_tests {
 ///
 /// Returned by [`parse_sense`] and embedded inside [`Error::ScsiError`]
 /// (`sense: Option<ScsiSense>`). Predicate methods (`is_medium_error`,
-/// `is_unit_attention`, `is_marginal`, …) read more fluently at call
-/// sites than raw `sense_key` comparisons.
+/// `is_unit_attention`, `is_marginal`, …) read more fluently than raw
+/// `sense_key` comparisons at call sites.
 ///
-/// `Default::default()` and the [`ScsiSense::NONE`] constant both
-/// produce the all-zero "no sense info" triple. Per SPC-4 §4.5.3, an
-/// empty sense buffer is reported as NO SENSE (key 0); use the constant
-/// for explicit intent at construction sites.
+/// `Default::default()` and [`ScsiSense::NONE`] both produce the all-zero
+/// "no sense info" triple (SPC-4 §4.5.3: empty sense buffer = NO SENSE).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScsiSense {
     /// Sense key — broad failure category (SPC-4 §4.5.6 Table 28).
@@ -337,21 +267,13 @@ impl ScsiSense {
         ascq: 0,
     };
 
-    /// `true` when the sense key indicates a *marginal-read* failure —
-    /// the kind of error where the same read at smaller granularity
-    /// (or a brief retry) sometimes succeeds:
-    ///
-    ///   - `MEDIUM ERROR` (3) — canonical bad-sector signal
-    ///   - `NOT READY` (2) — on many drives (notably BU40N), this is the
-    ///     dominant response for unreadable sectors (ASC 04/3E, 04/01, etc.)
-    ///   - `ABORTED COMMAND` (B) — transient; retry usually works
-    ///   - `RECOVERED ERROR` (1) / `NO SENSE` (0) — drive is healthy and
-    ///     either recovered the data or has no specific fault to report
-    ///
-    /// `false` for HARDWARE ERROR, DATA PROTECT, UNIT ATTENTION,
-    /// ILLEGAL REQUEST, BLANK CHECK, and any unknown key. Used
-    /// by [`Error::is_marginal_read`] / `freemkv_engine::recovery::copy`'s hysteresis
-    /// dispatch.
+    /// `true` when the sense key indicates a *marginal-read* failure — one
+    /// where a retry or smaller-granularity read sometimes succeeds:
+    /// MEDIUM ERROR, NOT READY (dominant on BU40N), ABORTED COMMAND,
+    /// RECOVERED ERROR, or NO SENSE. `false` for HARDWARE ERROR, DATA
+    /// PROTECT, UNIT ATTENTION, ILLEGAL REQUEST, BLANK CHECK, and unknown
+    /// keys. Used by [`Error::is_marginal_read`] / the recovery-copy
+    /// hysteresis dispatch. See docs/scsi-mod.md — is_marginal detail.
     pub fn is_marginal(&self) -> bool {
         matches!(
             self.sense_key,
@@ -419,31 +341,9 @@ impl ScsiSense {
     }
 }
 
-/// Decode an SPC-4 sense buffer into the structured triple
-/// `(sense_key, asc, ascq)`.
-///
-/// Handles both response-code formats SPC-4 mandates:
-///
-///   - **Descriptor format** (response code `0x72` / `0x73`):
-///     - sense key = `sense[1] & 0x0F`
-///     - asc = `sense[2]`
-///     - ascq = `sense[3]`
-///   - **Fixed format** (response code `0x70` / `0x71` and any unknown
-///     code per SPC-4 §4.5.3):
-///     - sense key = `sense[2] & 0x0F`
-///     - asc = `sense[12]`
-///     - ascq = `sense[13]`
-///
-/// `sb_len_wr` is the number of bytes the transport actually wrote into
-/// `sense`. When the buffer is too short for the relevant fields we
-/// return [`ScsiSense::NONE`] for the missing pieces rather than reading
-/// uninitialised memory. The minimum useful sense reply is 4 bytes
-/// (descriptor, to reach ASCQ at offset 3) or 14 bytes (fixed, to reach
-/// ASC/ASCQ at offsets 12/13).
-///
-/// Pure function — same parse on every platform backend (Linux SG_IO,
-/// macOS IOKit, Windows SPTI) so a regression here would silently
-/// mis-route SCSI errors on all three OSes simultaneously.
+// Decode an SPC-4 sense buffer into (sense_key, asc, ascq), handling both
+// descriptor (0x72/0x73) and fixed (0x70/0x71) response-code formats; pure
+// function shared by all three platform backends. See docs/scsi-mod.md — parse_sense format details.
 pub(crate) fn parse_sense(sense: &[u8], sb_len_wr: u8) -> ScsiSense {
     let n = (sb_len_wr as usize).min(sense.len());
     if n < 3 {
@@ -476,14 +376,8 @@ pub(crate) fn parse_sense(sense: &[u8], sb_len_wr: u8) -> ScsiSense {
 
 // ── SG_IO driver_status bits ────────────────────────────────────────────────
 
-/// `DRIVER_SENSE` (0x08) — bit set in `driver_status` to indicate that
-/// sense data was attached to a CHECK CONDITION reply. **Not** a transport
-/// failure on its own. Mask this off before deciding whether `driver_status`
-/// represents a real bus/host problem.
-///
-/// Used by Linux SG_IO (`sg_io_hdr.driver_status`); macOS IOKit and
-/// Windows SPTI carry the equivalent signal in different fields and
-/// don't need the same masking — the misclassification was Linux-only.
+// DRIVER_SENSE (0x08): SG_IO driver_status bit meaning sense data was
+// attached to CHECK CONDITION — mask it off before treating driver_status as a real bus/host problem (Linux-only field).
 #[cfg(target_os = "linux")]
 pub(crate) const DRIVER_SENSE: u16 = 0x08;
 
@@ -518,14 +412,9 @@ pub trait ScsiTransport: Send {
     /// into chunks by the caller ([`crate::Drive::read`]) — otherwise the
     /// transport fails the whole command.
     ///
-    /// The default is a conservative 1 MiB, safe on every platform. The
-    /// Windows backend overrides this with the adapter's real
-    /// `MaximumTransferLength` (queried via `IOCTL_STORAGE_QUERY_PROPERTY`):
-    /// a 16 MiB READ that exceeds the adapter limit makes
-    /// `DeviceIoControl` fail outright, which freemkv then mis-reads as a
-    /// transport failure and falls back to slow, log-spamming tiny reads.
-    /// Chunking to this limit fixes that. Linux/macOS keep the 1 MiB
-    /// default (well within any real `max_sectors_kb`).
+    /// Default is a conservative 1 MiB, safe on every platform. Windows
+    /// overrides with the adapter's real `MaximumTransferLength`; see
+    /// docs/scsi-mod.md — max_transfer_bytes Windows rationale.
     fn max_transfer_bytes(&self) -> usize {
         1 << 20
     }
@@ -559,17 +448,8 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
     }
 }
 
-// Note: a top-level `scsi::reset()` wrapping platform reset in a
-// thread+recv_timeout used to live here; removed in 0.13.6 along with the
-// SG_SCSI_RESET / STOP+START UNIT escalation it existed to guard.
-
-// USB-layer recovery (`scsi::usb_reset()`) was rolled back in 0.13.4: on
-// the LG BU40N the USB reset itself succeeds but firmware below the
-// bridge stays locked until unplug-replug. See git tag `v0.13.3`.
-
-// The only hardware-touching APIs autorip + freemkv CLI use outside the
-// rip path: a one-shot `list_drives()` enumeration and a single-TUR
-// `drive_has_disc(path)`. `Drive::open`/`init()`/`Disc::scan` stay heavy.
+// scsi::reset()/usb_reset() (removed 0.13.6/0.13.4) and hardware-touching
+// API surface history: see docs/scsi-mod.md — scsi module reset history.
 
 /// One optical drive on the system. Returned by [`list_drives`]. The
 /// fields are populated from a single INQUIRY at enumeration time —
@@ -590,15 +470,12 @@ pub struct DriveInfo {
 /// Enumerate optical drives present on the system.
 ///
 /// **What it does**: per-platform sysfs / IOKit / setupapi walk for SCSI
-/// devices, filtered to type 5 (CD/DVD/BD), with a single INQUIRY each
-/// for vendor/model/firmware. No firmware reset, no `Drive::init`, no
-/// disc scan. Suitable for an autorip-style poll loop or a CLI's
-/// drive-list command.
+/// devices, filtered to type 5 (CD/DVD/BD), with a single INQUIRY each for
+/// vendor/model/firmware. No firmware reset, no `Drive::init`, no disc scan.
 ///
-/// **What it doesn't do**: probe disc presence (use [`drive_has_disc`]),
-/// open a `Drive` for ripping (use [`crate::Drive::open`]), or load
-/// drive profiles. Those are heavier operations callers invoke once
-/// they've selected a drive.
+/// **What it doesn't do**: probe disc presence (use [`drive_has_disc`]) or
+/// open a `Drive` for ripping (use [`crate::Drive::open`]) — those are
+/// heavier operations invoked once a drive is selected.
 pub fn list_drives() -> Vec<DriveInfo> {
     #[cfg(target_os = "linux")]
     {
@@ -624,21 +501,13 @@ pub fn list_drives() -> Vec<DriveInfo> {
 /// True if the drive at `path` currently has a disc inserted.
 ///
 /// Issues a single TEST UNIT READY (cheapest SCSI op, no data transfer).
-/// Sense-key 2 ("not ready, medium not present") → `Ok(false)`; any
-/// other ready/not-ready response → `Ok(true)` or interpreted ready
-/// state. Suitable for poll-loop tick (~50 ms / drive on a healthy bus).
+/// Sense-key 2 ("not ready, medium not present") → `Ok(false)`; any other
+/// ready/not-ready response → `Ok(true)`. Suitable for poll-loop tick
+/// (~50 ms / drive on a healthy bus).
 ///
-/// **No internal recovery.** A single TUR is issued; nothing else. When
-/// the transport reports a wedged target (the `0xff` "no answer from the
-/// device" pattern synthesised by the backend from a non-zero
-/// `host_status` / `driver_status`), that failure surfaces directly to
-/// the caller as `Err(Error::ScsiError)` with
-/// `status == SCSI_STATUS_TRANSPORT_FAILURE (0xFF)` and `sense: None`. No
-/// SCSI bus reset, no USB device reset, no retry is attempted in-library
-/// (the USB-reset escalation was removed in 0.13.4 after it was shown to
-/// deepen rather than clear the wedge). **No SCSI primitive is exposed to
-/// outside crates** — autorip / freemkv CLI / bdemu use this single
-/// function for the entire "is there a disc?" decision.
+/// **No internal recovery.** A wedged target surfaces as
+/// `Err(Error::ScsiError)` with `status == SCSI_STATUS_TRANSPORT_FAILURE`
+/// and `sense: None` — no bus/USB reset, no retry. See docs/scsi-mod.md.
 pub fn drive_has_disc(path: &Path) -> Result<bool> {
     #[cfg(target_os = "linux")]
     {
@@ -761,23 +630,9 @@ pub fn build_read10_fua(lba: u32, count: u16) -> [u8; 10] {
     ]
 }
 
-/// Round a pointer/address `p` up to the next boundary that satisfies an
-/// SPTI-style `AlignmentMask` (`STORAGE_ADAPTER_DESCRIPTOR::AlignmentMask`,
-/// ntddscsi.h / winioctl.h).
-///
-/// `mask` is a *mask*, not a power-of-two alignment value: `0` means "no
-/// alignment requirement" (any address is fine), `1` means 2-byte, `3`
-/// means DWORD (4-byte), `7` means 8-byte, etc. — always one less than the
-/// required alignment. An address is acceptable iff `(addr & mask) == 0`.
-///
-/// Returns the smallest `addr >= p` with `(addr & mask) == 0`. The
-/// standard branch-free idiom `(p + mask) & !mask` works for any valid
-/// (`2^n - 1`) mask, including `mask == 0` (where it is the identity).
-///
-/// Lives here, compiled on every platform, so the Windows SPTI bounce
-/// buffer in `windows.rs` can share it and so the arithmetic gets unit
-/// coverage on macOS/Linux CI even though the SPTI path only builds on
-/// Windows.
+// Round `p` up to satisfy an SPTI AlignmentMask (`(p + mask) & !mask`);
+// mask=0 means no alignment requirement. See docs/scsi-mod.md —
+// align_up mask semantics and Windows SPTI sharing rationale.
 #[allow(dead_code)]
 pub(crate) fn align_up(p: usize, mask: usize) -> usize {
     (p + mask) & !mask
@@ -1173,13 +1028,9 @@ mod scsi_sense_predicate_tests {
         assert!(ScsiSense::NONE.is_marginal());
     }
 
-    /// `is_css_locked` must be the exact triple `05/6F/03` (MMC "READ OF
-    /// SCRAMBLED SECTOR WITHOUT AUTHENTICATION"), all three fields ANDed
-    /// together — not any single field, and not an OR of the three. The
-    /// CSS crack scan keys on this to positively distinguish "encrypted but
-    /// locked" from "unreadable"; a false positive on a bare ILLEGAL REQUEST
-    /// (e.g. a malformed CDB) would make the scanner treat an unrelated
-    /// error as proof of CSS scrambling.
+    // is_css_locked must require the exact 05/6F/03 triple (all three
+    // fields ANDed, not ORed) — the CSS crack scan relies on it to
+    // distinguish "encrypted but locked" from "unreadable".
     #[test]
     fn is_css_locked_requires_exact_key_asc_ascq_triple() {
         // The real signature: true.

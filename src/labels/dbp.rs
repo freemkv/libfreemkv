@@ -1,11 +1,8 @@
-//! "dbp" framework — a BD-J authoring framework identified by
-//! `com/dbp/` package paths in a top-level `/BDMV/JAR/<x>.jar` (not in
-//! a subdir). Seen on UHD discs.
+//! "dbp" framework — a BD-J authoring framework identified by `com/dbp/`
+//! package paths in a top-level `/BDMV/JAR/<x>.jar`. Seen on UHD discs.
 //!
 //! Stream labels live as plain ASCII strings inside compiled `.class`
-//! files in the jar — a quirk of the menu-rendering layer encoding
-//! its TextField positions and content as constant strings the
-//! Java compiler retained in the class string pool. Observed format:
+//! files in the jar. Observed format:
 //!
 //! ```text
 //! LTextField,Audio1,English Dolby Atmos,Fontstrip_Composite,...
@@ -14,20 +11,9 @@
 //! ATextField,Subtitle0,None,Fontstrip_Composite,...
 //! ```
 //!
-//! The parser ignores any prefix before the first `TextField,`
-//! occurrence — whatever string-pool ordering placed ahead of it is
-//! irrelevant. `Subtitle0` is the disable-subtitles menu button and is
-//! skipped (not a real subtitle stream).
-//!
-//! ## Implementation
-//!
-//! Iterates `CpInfo::Utf8` constant-pool entries rather than raw
-//! byte-scanning each class file. Equivalent label coverage (the literal
-//! `TextField,...` strings live in the CP as Utf8 entries) with no
-//! false-positive risk from method bytecode or attribute names that
-//! happen to contain `TextField,`. Language / purpose / qualifier
-//! classification lives in [`super::vocab`] so all Java-parser families
-//! share one source of truth.
+//! The parser ignores any prefix before `TextField,`; `Subtitle0` is the
+//! disable-subtitles button, skipped. Classification lives in
+//! [`super::vocab`]. See docs/dbp.md for the implementation approach.
 
 use super::class_reader::CpInfo;
 use super::{ParseResult, StreamLabel, StreamLabelType, jar, vocab};
@@ -91,30 +77,14 @@ fn scan_jar(archive: &mut jar::Jar) -> Vec<StreamLabel> {
     out
 }
 
-/// Cap on the bytes retained for one stream label.
-///
-/// The label is an owned copy of a slice of a `CONSTANT_Utf8_info` entry,
-/// whose `length` field is a `u16` (JVMS §4.4.7) — so a single crafted
-/// constant contributes up to 65535 bytes, and the `u16` stream-number
-/// keyspace admits 65536 of them per type.
-///
-/// Headroom: real dbp menu labels are short display names — "English Dolby
-/// Atmos" (19 bytes), "Spanish 5.1 Dolby Digital" (25). The longest plausible
-/// retail string ("Portuguese (Brazilian) 5.1 Dolby Digital Plus") is 45
-/// bytes. 256 leaves >5x headroom over that, and any string past it is menu
-/// geometry or padding, never a language name — `vocab::lang` would not
-/// resolve it anyway.
+// Cap on bytes retained per stream label. CONSTANT_Utf8_info's `length` is a
+// u16 (JVMS §4.4.7), so a crafted constant could contribute up to 65535
+// bytes. See docs/dbp.md — MAX_LABEL_BYTES rationale.
 const MAX_LABEL_BYTES: usize = 256;
 
-/// Cap on retained stream slots per type.
-///
-/// The keys come from `parse::<u16>()` on disc bytes, so all 65536 slots per
-/// type are reachable; paired with [`MAX_LABEL_BYTES`] this bounds the whole
-/// scan at 2 x 512 x 256 bytes.
-///
-/// Headroom: the BD STN_table admits at most 32 primary audio and 32 PG
-/// streams per playlist, and dbp emits one menu TextField per stream. 512
-/// leaves 16x headroom over the spec maximum.
+// Cap on retained stream slots per type. Keys come from parse::<u16> on disc
+// bytes, so all 65536 slots per type are reachable. See docs/dbp.md —
+// MAX_LABELS_PER_TYPE rationale.
 const MAX_LABELS_PER_TYPE: usize = 512;
 
 /// Record `label` for stream `n`, honouring the retention caps. Existing
@@ -187,11 +157,9 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Write as _};
 
-    /// Build a minimal, structurally valid `.class` file (JVMS §4.1) whose
-    /// constant pool holds exactly the given `Utf8` strings (indices 1..=N,
-    /// no long/double slot padding needed for plain strings). No fields,
-    /// methods, interfaces, or attributes — `scan_jar`'s only interest is
-    /// the constant pool.
+    // Minimal, structurally valid `.class` file (JVMS §4.1) with only the
+    // given `Utf8` constant-pool entries — no fields/methods/attributes,
+    // since `scan_jar` only reads the constant pool.
     fn build_class(utf8_entries: &[&str]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&0xCAFEBABEu32.to_be_bytes()); // magic
@@ -231,14 +199,9 @@ mod tests {
         zip::ZipArchive::new(Cursor::new(buf)).expect("valid zip")
     }
 
-    /// `scan_jar` wires together `for_each_class`, constant-pool iteration,
-    /// `collect_textfield`, and `make_label` into the actual per-jar scan
-    /// used by `parse`. The pure `collect_textfield`/`make_label` unit
-    /// tests above don't exercise this wiring at all.
-    ///
-    /// Mutation: replace the whole function body with `vec![]` — every
-    /// dbp disc would silently lose all its stream labels regardless of
-    /// what's in the jar.
+    // Wires for_each_class + collect_textfield + make_label into the real
+    // per-jar scan (unit tests above only cover the pure pieces). Mutation
+    // pin: catches scan_jar's body being replaced with `vec![]`.
     #[test]
     fn scan_jar_extracts_labels_from_real_class_entries() {
         let class_bytes = build_class(&[
@@ -271,14 +234,9 @@ mod tests {
         assert_eq!(sub.qualifier, LabelQualifier::Sdh);
     }
 
-    /// Immunity pin. Every dbp label states its own slot in the `AudioN` /
-    /// `SubtitleN` token, so the numbering survives gaps and skipped entries
-    /// intact. Nothing here counts positionally, which is what keeps this
-    /// parser out of the failure mode where a skipped entry pulls every later
-    /// label one stream forward.
-    ///
-    /// Mutation: number by iteration order → `Audio4` becomes 2 and
-    /// `Subtitle3` becomes 1, silently rebinding both to other streams.
+    // Immunity pin: stream numbers come from the AudioN/SubtitleN token, not
+    // iteration order, so gaps/skipped entries don't shift later labels.
+    // Mutation: numbering by iteration order would rebind Audio4/Subtitle3.
     #[test]
     fn stream_numbers_come_from_the_token_not_iteration_order() {
         let class_bytes = build_class(&[
@@ -309,13 +267,9 @@ mod tests {
         );
     }
 
-    /// A `CONSTANT_Utf8_info` carries a `u16` length (JVMS §4.4.7), so one
-    /// crafted constant contributes up to 65535 bytes and the `u16` stream
-    /// keyspace admits 65536 slots per type — ~4 GiB of retained `String` per
-    /// map from a jar that is orders of magnitude smaller.
-    ///
-    /// Boundary literals, not the constant: a 256-byte label is kept, 257 and
-    /// the JVMS maximum 65535 are refused.
+    // CONSTANT_Utf8_info's u16 length lets one crafted constant retain up to
+    // 65535 bytes across 65536 slots (~4 GiB) without MAX_LABEL_BYTES.
+    // Boundary check: 256 bytes kept, 257 and the JVMS max 65535 refused.
     #[test]
     fn oversized_labels_are_not_retained() {
         let mut audios = BTreeMap::new();

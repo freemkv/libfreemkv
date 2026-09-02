@@ -2,23 +2,12 @@
 //! FVI object").
 //!
 //! A [`VideoMap`](crate::mux::videomap::VideoMap) is a header (per-title video facts + provenance root) plus an
-//! ordered list of per-picture records. Each record carries the per-picture
-//! coding truth ([`PictureInfo`](crate::mux::codec::PictureInfo), off `frame.coding`) and the byte-exact source
-//! provenance ([`SourcePos`](crate::pes::SourcePos), off `frame.source`) that the highway already
-//! stamps — this module never re-parses the elementary stream.
+//! ordered list of per-picture records: coding truth
+//! ([`PictureInfo`](crate::mux::codec::PictureInfo)) plus source provenance ([`SourcePos`](crate::pes::SourcePos)).
 //!
-//! It is a STANDALONE PRIMITIVE, deliberately decoupled from any one sink:
-//! - The `fvi://` sink ([`crate::mux::fvi_sink`]) owns a `VideoMap`, appends
-//!   each video [`PesFrame`](crate::pes::PesFrame), and serializes it.
-//! - The same `VideoMap` can later be populated as a side-channel during ANY
-//!   mux (e.g. `iso → mkv` while ALSO emitting a `.fvi` sidecar), and reused
-//!   for seek-indexing, recovery loss-mapping, and diagnostics.
-//!
-//! `VideoMap` is PURE DATA — it knows no output format. The on-disk shape is the
-//! freemkv FVI format, whose normative spec is `docs/FVI_FORMAT.md` (ships
-//! publicly with libfreemkv); the `fvi://` sink does the serialization. A
-//! different output format would be a DIFFERENT sink reusing this same model,
-//! not a pluggable encoder here.
+//! `VideoMap` is PURE DATA — it knows no output format; the `fvi://` sink does
+//! the serialization to the on-disk FVI format (`docs/FVI_FORMAT.md`).
+//! See docs/videomap-mod.md for the standalone-primitive / multi-sink design.
 
 use crate::disc::{ColorSpace, DiscTitle, Stream as DiscStream, VideoStream};
 use crate::mux::codec::PictureInfo;
@@ -338,14 +327,13 @@ pub fn field_order_label(coding: Option<PictureInfo>) -> Option<&'static str> {
 ///
 /// For EVERY codec the frame's own `keyframe` flag IS the random-access signal:
 /// IDR/IRAP for HEVC/H.264, the I-picture flag for MPEG-2/VC-1 — authored by
-/// each codec's parser through the highway. The codec-agnostic [`PictureInfo`]
-/// carries NO GOP-closure (no `closed_gop`/`gop_start`), so we DO NOT claim the
-/// stricter open-GOP clean-RAP precision; `key` is the parser-flagged
-/// decode-restart point (an intra picture). This is the honest limitation
-/// documented in `docs/FVI_FORMAT.md`.
+/// each codec's parser through the highway. `key` is the parser-flagged
+/// decode-restart point (an intra picture), not the stricter open-GOP
+/// clean-RAP precision; see `docs/FVI_FORMAT.md` for the honest limitation.
 pub fn is_random_access(coding: Option<PictureInfo>, keyframe: bool) -> bool {
-    // For a video frame `coding.keyframe()` == an intra (I) picture, which is
-    // exactly the highway's `frame.keyframe`; use the frame flag uniformly.
+    // `PictureInfo` carries no GOP-closure (`closed_gop`/`gop_start`), so we
+    // don't claim clean-RAP precision here; frame-flag alone is sufficient
+    // since `coding.keyframe()` always agrees with `frame.keyframe`.
     let _ = coding;
     keyframe
 }
@@ -489,12 +477,9 @@ mod tests {
         assert_eq!(Colour::from_color_space(ColorSpace::Unknown).primaries, 2);
     }
 
-    /// Regression: the FVI sidecar must mirror the MKV muxer's colour precedence,
-    /// not blindly map `color_space` → the SDR transfer 14 for BT.2020. An HDR10
-    /// BT.2020 title's real transfer is PQ (16); a measured CICP triplet is
-    /// authoritative and copied through verbatim. Before the fix the FVI Colour
-    /// reported transfer=14 while the MKV container reported 16 — two sinks of
-    /// one title disagreeing on the colour code points.
+    // Regression: FVI colour must mirror the MKV muxer's precedence, not
+    // blindly map `color_space` → SDR transfer 14 for BT.2020.
+    // See docs/videomap-mod.md for the HDR10/measured-CICP bug history.
     #[test]
     fn fvi_colour_follows_hdr_and_measured_cicp() {
         use crate::disc::MeasuredCicp;

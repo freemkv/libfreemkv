@@ -1,10 +1,7 @@
 //! libfreemkv -- Open source optical drive library for 4K UHD / Blu-ray / DVD.
 //!
 //! Handles drive access, disc structure parsing, AACS decryption, and raw
-//! sector reading. Unlocking — removing bus encryption (firmware unlock, AACS
-//! cert handshake, CSS bus-auth) — lives entirely in the `freemkv-unlock`
-//! crate; libfreemkv consumes it privately and exposes none of it, so clients
-//! are oblivious to unlockers (just as they are to the SCSI layer).
+//! sector reading. Architecture, AACS, and error code details: `docs/lib-overview.md`.
 //!
 //! # Quick Start
 //!
@@ -21,11 +18,10 @@
 //! }
 //! ```
 //!
-//! Muxing to an output container runs through the PES pipeline. A live
-//! `disc://` cannot be opened via [`input`] — it returns
-//! [`Error::DiscUrlNotDirect`] by design (use `Drive` + `Disc::scan` +
-//! `DiscStream::new` directly for a live drive). Any file-backed source
-//! (`iso://`, `m2ts://`) opens through [`input`]:
+//! Muxing runs through the PES pipeline. `input()` rejects live `disc://`
+//! URLs with [`Error::DiscUrlNotDirect`] (use `Drive` + `Disc::scan` +
+//! `DiscStream::new` instead); file-backed sources (`iso://`, `m2ts://`) open
+//! directly:
 //!
 //! ```no_run
 //! # fn run() -> std::io::Result<()> {
@@ -41,50 +37,6 @@
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! # Architecture
-//!
-//! ```text
-//! Drive           -- open, identify, unlock, read sectors
-//!   ├── ScsiTransport    -- SG_IO (Linux), IOKit (macOS)
-//!   ├── DriveId          -- INQUIRY + GET_CONFIG identification
-//!   └── unlock_bridge    -- private seam to the `freemkv-unlock` crate
-//!                           (firmware / AACS cert / CSS bus-auth unlockers)
-//!
-//! Disc                   -- scan titles, streams, AACS state
-//!   ├── UDF reader       -- Blu-ray UDF 2.50 with metadata partitions
-//!   ├── MPLS parser      -- playlists → titles + clips + STN streams
-//!   ├── CLPI parser      -- clip info → EP map → sector extents
-//!   ├── JAR parser       -- BD-J audio track labels
-//!   └── AACS             -- encryption: key resolution + content decrypt
-//!       ├── aacs         -- KEYDB, VUK, MKB, unit decrypt
-//!       └── host_certs   -- collect host certs (cert handshake lives in freemkv-unlock)
-//! ```
-//!
-//! # AACS Encryption
-//!
-//! Disc scanning automatically detects and handles AACS encryption.
-//! If a KEYDB.cfg is available (via `ScanOptions` or standard paths),
-//! the library resolves keys and decrypts content transparently.
-//!
-//! Supports AACS 1.0 (Blu-ray) and AACS 2.0 (UHD, with fallback).
-//!
-//! # Error Codes
-//!
-//! All errors are structured with numeric codes. No user-facing English
-//! text -- applications format their own messages.
-//!
-//! | Range | Category |
-//! |-------|----------|
-//! | E1xxx | Device errors (not found, permission) |
-//! | E2xxx | Profile errors (unsupported drive) |
-//! | E3xxx | Unlock errors (failed, signature) |
-//! | E4xxx | SCSI errors (command failed, timeout) |
-//! | E5xxx | I/O errors |
-//! | E6xxx | Disc format errors |
-//! | E7xxx | AACS errors |
-//! | E8xxx | Keydb errors (fetch, parse, load) |
-//! | E9xxx | Stream / mux errors (URL, PES, pipeline) |
 
 /// Single source of truth for every freemkv version surface.
 ///
@@ -226,13 +178,9 @@ pub use event::{BatchSizeReason, Event, EventKind};
 #[cfg(feature = "rip")]
 pub use identity::DriveId;
 
-// ─── Unlock seam ────────────────────────────────────────────────────────────
-// Drive/disc unlocking (firmware, AACS cert, CSS bus-auth) lives entirely in
-// `freemkv-unlock`; libfreemkv consumes it via `unlock_bridge` and exposes nothing.
+// ─── Unlock seam: drive/disc unlocking (firmware, AACS cert, CSS bus-auth) lives entirely in `freemkv-unlock`; consumed via `unlock_bridge`, exposes nothing. ───
 
-// ─── Decryption (AACS / CSS) ────────────────────────────────────────────────
-// `Disc::scan()` resolves keys onto `Disc`; `DiscStream::new(...)` consumes
-// them directly. `decrypt_sectors()` is for raw sector buffers (ISO patching).
+// ─── Decryption (AACS/CSS): `Disc::scan()` resolves keys onto `Disc`; `DiscStream::new(...)` consumes them directly; `decrypt_sectors()` is for raw sector buffers (ISO patching). ───
 #[cfg(feature = "rip")]
 pub use decrypt::{AacsKeyMap, DecryptKeys, decrypt_sectors, decrypt_threads, set_decrypt_threads};
 

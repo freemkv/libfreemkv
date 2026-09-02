@@ -1,39 +1,34 @@
 //! ECMA-167 / UDF 1.02 descriptor encoder.
 //!
 //! Turns a [`Layout`](super::layout::Layout) — a directory tree with every
-//! ICB, directory-data and file-data block already assigned — into the set of
-//! metadata sectors a real UDF volume would carry. Nothing here touches the
-//! filesystem: it is a pure function from layout to sectors, which is what
-//! makes it testable against the production parser in `udf.rs`.
+//! ICB, directory-data and file-data block already assigned — into the set
+//! of metadata sectors a real UDF volume would carry. A pure function from
+//! layout to sectors; nothing here touches the filesystem.
 //!
 //! What is emitted, in volume order:
 //!
-//! | sector | descriptor |
-//! |---|---|
-//! | 16, 17, 18 | Volume Recognition Sequence — `BEA01`, `NSR02`, `TEA01` (ECMA-167 2/9.1) |
-//! | 32… | Main Volume Descriptor Sequence — PVD, IUVD, PD, LVD, USD, TD |
-//! | 48… | Reserve VDS (byte-identical but for the tag locations) |
-//! | 64, 65 | Logical Volume Integrity Sequence — LVID, TD |
-//! | 256 | Anchor Volume Descriptor Pointer |
-//! | `part_start` + 0, +1 | File Set Descriptor, TD |
-//! | `part_start` + … | File Entries (ICBs) and directory data (FIDs) |
-//! | last sector | Anchor Volume Descriptor Pointer (copy) |
+//! ```text
+//! sector                  descriptor
+//! 16, 17, 18              Volume Recognition Sequence: BEA01, NSR02, TEA01
+//! 32…                     Main VDS — PVD, IUVD, PD, LVD, USD, TD
+//! 48…                     Reserve VDS (byte-identical but for tag locations)
+//! 64, 65                  Logical Volume Integrity Sequence — LVID, TD
+//! 256                     Anchor Volume Descriptor Pointer
+//! part_start + 0, +1      File Set Descriptor, TD
+//! part_start + …          File Entries (ICBs) and directory data (FIDs)
+//! last sector             Anchor Volume Descriptor Pointer (copy)
+//! ```
 //!
-//! UDF revision 1.02 with a single Type-1 partition map is deliberate: it is
-//! the DVD-Video profile, it is the shape `read_filesystem` takes when
-//! `num_partition_maps < 2`, and it avoids the UDF 2.50 Metadata Partition
-//! entirely. That also means a synthetic image never exercises the Metadata
-//! Partition path in `udf.rs` (`:946-991`) — see the module docs on `dirimage`.
+//! See `docs/encode.md` for why this is UDF 1.02 with a single Type-1
+//! partition map, and why that makes the module testable against `udf.rs`.
 
 use super::layout::{DirNode, Layout};
 use crate::error::{Error, Result};
 use std::collections::BTreeMap;
 
-/// Logical block / sector size. Fixed for every optical profile this crate
-/// reads, and the same quantity as [`crate::consts::SECTOR_BYTES`] — aliased
-/// rather than re-declared so the two cannot drift apart. The short name is
-/// kept because it appears in ~25 extent and offset expressions across
-/// `dirimage`, where the longer one would bury the arithmetic.
+// Logical block / sector size; aliases crate::consts::SECTOR_BYTES so the
+// two can't drift apart. Short name kept because it appears in ~25
+// extent/offset expressions across dirimage.
 pub(super) use crate::consts::SECTOR_BYTES as SECTOR;
 
 /// Descriptor version recorded in every tag. 2 = ECMA-167 2nd edition, which
@@ -62,10 +57,9 @@ struct Timestamp {
 /// NOT here; they are served from the backing files.
 pub(super) type MetaSectors = BTreeMap<u32, Box<[u8; SECTOR]>>;
 
-/// The descriptor-tag CRC of ECMA-167 7.2.4: polynomial 0x1021, initial value
-/// ZERO, no reflection, no final XOR — the variant catalogued as CRC-16/XMODEM
-/// (check value 0x31C3), NOT CCITT-FALSE, which seeds at 0xFFFF and would make
-/// every descriptor this crate writes fail a conformant driver's validation.
+// ECMA-167 7.2.4 descriptor-tag CRC: polynomial 0x1021, initial value ZERO,
+// no reflection, no final XOR (CRC-16/XMODEM, check 0x31C3) — NOT
+// CCITT-FALSE (seeds 0xFFFF), which would fail a conformant driver.
 fn crc16(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
     for &b in data {
@@ -81,16 +75,9 @@ fn crc16(data: &[u8]) -> u16 {
     crc
 }
 
-/// Write an ECMA-167 3/7.2 descriptor tag over `buf[0..16]`.
-///
-/// `tag_loc` is the block number of the sector holding the descriptor —
-/// ABSOLUTE for the volume-space descriptors (AVDP, VDS, LVID) and
-/// PARTITION-RELATIVE for everything inside the partition (FSD, File Entries).
-/// Getting that wrong is the classic reason a hand-built volume mounts nowhere:
-/// a driver that validates the tag location rejects the descriptor outright.
-///
-/// `desc_len` is the descriptor's total length including the tag; the CRC
-/// covers `buf[16..desc_len]`.
+// ECMA-167 3/7.2 descriptor tag over buf[0..16]. tag_loc: ABSOLUTE for
+// volume-space descriptors, PARTITION-RELATIVE inside the partition (else
+// a driver rejects the volume, see docs/encode.md); desc_len incl. tag.
 fn finish_tag(buf: &mut [u8], tag_id: u16, tag_loc: u32, desc_len: usize) {
     buf[0..2].copy_from_slice(&tag_id.to_le_bytes());
     buf[2..4].copy_from_slice(&DESC_VERSION.to_le_bytes());
@@ -165,14 +152,8 @@ fn put_dstring(buf: &mut [u8], s: &str) {
     buf[buf.len() - 1] = n as u8;
 }
 
-/// OSTA CS0: compression ID 8 (one byte per character) when every character
-/// is ASCII, otherwise compression ID 16 (UTF-16BE).
-///
-/// ASCII rather than Latin-1 for the 8-bit form on purpose: `parse_udf_name`
-/// (`udf.rs:1467`) decodes a compression-8 name with `from_utf8_lossy`, so a
-/// 0x80-0xFF byte — legal CS0 — would come back as U+FFFD. Every character
-/// above 0x7F therefore takes the 16-bit form, which that parser decodes
-/// correctly.
+// OSTA CS0: compression ID 8 (ASCII, one byte/char) else ID 16 (UTF-16BE).
+// ASCII not Latin-1 for the 8-bit form on purpose — see docs/encode.md.
 pub(super) fn encode_cs0(s: &str) -> Vec<u8> {
     if s.is_ascii() {
         let mut v = Vec::with_capacity(1 + s.len());
@@ -211,10 +192,9 @@ fn put_long_ad(buf: &mut [u8], len_bytes: u32, lba: u32) {
     buf[8..10].copy_from_slice(&0u16.to_le_bytes()); // partition reference 0
 }
 
-/// ECMA-167 4/14.14.1 short_ad. The top two bits of the length word are the
-/// extent TYPE (0 = recorded and allocated), which is exactly why `udf.rs`
-/// masks with `0x3FFF_FFFF` when it reads one back — the mask is the field
-/// boundary, not a truncation bug.
+// ECMA-167 4/14.14.1 short_ad. Top two bits of length word = extent TYPE
+// (0 = recorded/allocated); udf.rs masks with 0x3FFF_FFFF reading it back —
+// field boundary, not a truncation bug.
 fn put_short_ad(buf: &mut [u8], len_bytes: u32, lba: u32) {
     debug_assert!(len_bytes <= 0x3FFF_FFFF, "AD length must fit 30 bits");
     buf[0..4].copy_from_slice(&len_bytes.to_le_bytes());
@@ -411,15 +391,9 @@ fn file_set(volume_id: &str, root_icb: u32, lba: u32) -> Box<[u8; SECTOR]> {
 /// bit anywhere — the volume is read-only.
 const PERM_R_X: u32 = 0x0000_1000 | 0x0000_0400 | 0x0000_0080 | 0x0000_0020 | 0x4 | 0x1;
 
-/// ECMA-167 4/14.9 File Entry (tag 261).
-///
-/// Tag 261 rather than the Extended File Entry (266) real BD-ROMs use: an EFE
-/// requires UDF 2.00+, and this image declares 1.02. `udf.rs` reads both — the
-/// 261 field offsets it uses (l_ea 168, l_ad 172, ADs at 176 + l_ea) are the
-/// ones written here.
-///
-/// `extents` are partition-relative (block, byte-length) pairs, already split
-/// so no single one exceeds the 30-bit AD length field.
+// ECMA-167 4/14.9 File Entry (tag 261, not EFE 266 — see docs/encode.md).
+// extents are partition-relative (block, len) pairs, already split so none
+// exceeds the 30-bit AD length field.
 fn file_entry(
     is_dir: bool,
     info_len: u64,
@@ -474,13 +448,9 @@ fn file_entry(
     Ok(s)
 }
 
-/// ECMA-167 4/14.4 File Identifier Descriptor, appended to `buf`.
-///
-/// FIDs are packed with no inter-descriptor padding beyond the 4-byte
-/// alignment the spec mandates, and they are allowed to span logical blocks —
-/// which is also what `read_directory` (`udf.rs:1312`) assumes: it walks the
-/// directory extent as one flat byte run and STOPS at the first non-257 tag,
-/// so any block-alignment gap would truncate the directory.
+// ECMA-167 4/14.4 File Identifier Descriptor, appended to buf. FIDs pack
+// with no padding beyond the mandated 4-byte alignment and may span
+// logical blocks — see docs/encode.md for why that's required.
 fn push_fid(buf: &mut Vec<u8>, name: &str, icb_lba: u32, is_dir: bool, is_parent: bool) {
     let start = buf.len();
     let name_field: Vec<u8> = if is_parent {
@@ -681,11 +651,9 @@ pub(super) fn encode(layout: &Layout) -> Result<MetaSectors> {
 mod tests {
     use super::*;
 
-    /// The reference check value for CRC-16/XMODEM — poly 0x1021 seeded at 0,
-    /// which is what ECMA-167 7.2.4 specifies: "123456789" → 0x31C3. Seeding
-    /// at 0xFFFF instead (CCITT-FALSE) yields 0x29B1, and that mutant is
-    /// invisible to `udf.rs`, which never verifies a tag CRC — it would only
-    /// show up as a volume no operating system will mount.
+    // Reference check value for CRC-16/XMODEM: poly 0x1021 seeded at 0
+    // (ECMA-167 7.2.4): "123456789" -> 0x31C3. CCITT-FALSE (seed 0xFFFF)
+    // gives 0x29B1, a mutant udf.rs wouldn't catch — it never verifies a CRC.
     #[test]
     fn crc16_matches_the_ecma167_check_value() {
         assert_eq!(crc16(b"123456789"), 0x31C3);

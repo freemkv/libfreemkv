@@ -1,17 +1,14 @@
 //! `DecryptingSectorSource` — wrap any [`SectorSource`] to apply
 //! AACS / CSS in-place decryption on every read.
 //!
-//! This is the single source of truth for decrypt-on-read: every
-//! decrypt-on-read caller (e.g. `DiscStream`) wraps its source in this
-//! decorator. The actual cipher code lives in [`crate::aacs`] and
-//! [`crate::css`]; we just call the existing
-//! [`crate::decrypt::decrypt_sectors`] helper that drives both of them
-//! in-place after each read (a no-op for [`DecryptKeys::None`]).
+//! The cipher code lives in [`crate::aacs`] and [`crate::css`]; this
+//! decorator calls [`crate::decrypt::decrypt_sectors`] after each read
+//! (a no-op for [`DecryptKeys::None`]).
 //!
 //! Composition: `Drive` → `DecryptingSectorSource` → caller sees
-//! plaintext. For `DecryptKeys::None` discs the decorator is a
-//! pass-through, so callers can wire it unconditionally and keep
-//! their pipeline shape uniform regardless of encryption state.
+//! plaintext; `DecryptKeys::None` discs pass through unconditionally.
+//!
+//! See docs/decrypting-sector-source.md for the single-source-of-truth rationale.
 
 use crate::decrypt::{DecryptKeys, decrypt_sectors, decrypt_sectors_in_content};
 use crate::error::Result;
@@ -24,35 +21,16 @@ use super::SectorSource;
 /// read clearly.
 pub type KeyFetchFn = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Vec<[u8; 16]> + Send + Sync>;
 
-/// Application-supplied "fetch a fresh key for THIS data" callback.
+/// Resolves keys from encrypted-content samples for [`DecryptingSectorSource`].
 ///
-/// Invoked by [`DecryptingSectorSource`] when a read contains scrambled AACS
-/// units that NONE of the currently-held unit keys could decrypt. The argument
-/// is those still-scrambled 6144-byte aligned units (real on-disc ciphertext);
-/// the return is any additional unit keys to add to the pool and retry with —
-/// empty if the source can't help. Mirrors the DVD model (try the held key,
-/// then ask the key source for the failing data) generalised to AACS.
+/// Two operations: [`unit_keys`](Self::unit_keys) resolves the base Unit
+/// Key(s) for a CPS unit from real encrypted samples; [`fmts_indexes`](Self::fmts_indexes)
+/// resolves the disc's AACS 2.1 forensic index key set from an index-1
+/// anchor batch. Both return additional keys to add to the pool and retry
+/// with; empty if the source can't help. The library does no key lookup or
+/// network I/O itself — this is the caller's seam to its key source.
 ///
-/// The library performs NO key lookup or network I/O itself; this is the seam an
-/// application uses to call its key source (e.g. an online key service) with the
-/// exact ciphertext that failed.
-///
-/// TWO explicit operations, so the "one base key vs a whole forensic set"
-/// contract lives in the type instead of a caller guessing at the return length:
-///
-/// * [`unit_keys`](Self::unit_keys) — the base Unit Key(s) for a CPS unit, from
-///   real encrypted samples drawn from it. The non-forensic path: one key per CPS
-///   unit (the pool grows by whatever it returns). Used by the mux's base /
-///   multi-CPS map resolution AND by the sweep/patch recovery decorator.
-/// * [`fmts_indexes`](Self::fmts_indexes) — the disc's AACS 2.1 forensic index
-///   keys, from an index-1 single-phase anchor batch. The source hands back the
-///   COMPLETE set (ordered index 1..N); the caller sizes the forensic map to
-///   `len()` and never assumes a fixed N (32 is all we've seen, but the contract
-///   is "whatever the source returns, ≥ 1, is all of them").
-///
-/// A **stateless, shared** pair of `Arc<Fn>`, so one `KeyFetch` is built
-/// once and cloned cheaply (two `Arc` bumps) into every read path. `Send + Sync`
-/// so it can ride the mux highway's producer thread.
+/// See docs/decrypting-sector-source.md for the two-operation rationale.
 #[derive(Clone)]
 pub struct KeyFetch {
     unit: KeyFetchFn,
@@ -195,10 +173,9 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         self.inner
     }
 
-    /// Decrypt `buf` in place with the active keys, applying the content gate
-    /// when one is installed (whole-disc readers) or running ungated (the mux).
-    /// The single dispatch both the first read and the post-fetch retry share,
-    /// so they agree on which units are content and on the unit-key try order.
+    // Decrypt `buf` with the active keys, gated by content ranges when set.
+    // Shared by the first read and post-fetch retry so both agree on which
+    // units are content and the unit-key try order.
     fn decrypt_buf(
         buf: &mut [u8],
         keys: &mut DecryptKeys,
@@ -367,23 +344,16 @@ mod tests {
         assert_eq!(wrapped.inner().last, Some(7200));
     }
 
-    // TODO: AACS round-trip test needs a fixture-encrypted unit + matching key.
-    // `crate::aacs` unit tests already exercise the cipher; this would only
-    // assert the decorator wires the existing helper, not that AES-128 is correct.
+    // TODO: AACS round-trip test needs a fixture-encrypted unit + matching key
+    // (`crate::aacs` tests already exercise the cipher itself).
 
-    // ---------------------------------------------------------------
-    // Additional coverage.
-    // ---------------------------------------------------------------
+    // Additional coverage:
 
     use std::sync::{Arc, Mutex};
 
-    /// Source that fills the FULL requested span with a CSS-scrambled-
-    /// FLAGGED sector pattern (byte 0x14 scramble bits set, non-zero
-    /// data) but reports a SHORTER read (`report_n`). With a CSS key the
-    /// decorator must descramble ONLY `buf[..report_n]`; the bytes
-    /// beyond `report_n` must stay exactly as filled. A whole-`buf`
-    /// decrypt would clear the flagged sector's scramble bits and XOR
-    /// its data region — observable here.
+    // Fills the full span with a CSS-scrambled-flagged sector but reports a
+    // shorter read (`report_n`); with a CSS key, only `buf[..report_n]` must
+    // be descrambled — bytes beyond it must stay exactly as filled.
     struct ShortReportSource {
         report_n: usize,
     }
@@ -429,11 +399,9 @@ mod tests {
         }
     }
 
-    /// A source whose read returns an error — the decorator must
-    /// propagate it and NOT call decrypt afterward (decrypt over an
-    /// unwritten buffer would be at best wasted work, at worst a panic
-    /// for a missing AACS key). Grounding: `read_sectors` uses `?` on
-    /// the inner read before `decrypt_sectors`.
+    // A source whose read errors — the decorator must propagate it and NOT
+    // call decrypt afterward (over an unwritten buffer, at best wasted work,
+    // at worst a panic for a missing AACS key).
     struct FailingSource;
     impl SectorSource for FailingSource {
         fn read_sectors(
@@ -449,13 +417,9 @@ mod tests {
         }
     }
 
-    /// The CSS path is a no-op for sectors whose scrambling-control
-    /// bits are clear. Per CSS, the sector's mode-2 subheader byte at
-    /// offset 0x14 carries the copyright/scramble flags; descrambling
-    /// only runs when `(byte[0x14] >> 4) & 0x03 != 0`. With those bits
-    /// clear (byte 0x14 == 0) the descrambler returns immediately, so
-    /// the decorator must hand back the bytes unchanged. Grounding:
-    /// `css::lfsr::descramble_sector` early-return on `flags == 0`.
+    // CSS is a no-op when the mode-2 subheader byte 0x14 scramble-control
+    // bits are clear (`css::lfsr::descramble_sector` early-returns on
+    // `flags == 0`), so the decorator must hand bytes back unchanged.
     #[test]
     fn css_unscrambled_sector_passes_through() {
         struct FixedSector {
@@ -501,13 +465,9 @@ mod tests {
         );
     }
 
-    /// The decorator must decrypt ONLY the `n` bytes the inner source
-    /// reported as read — never the full `buf`. We use a CSS key and a
-    /// sector whose flags ARE set (so descramble would mutate bytes if
-    /// applied), but the inner source reports a short `n` of 0. With
-    /// n=0 the decrypt span is empty, so the whole buffer must come
-    /// back exactly as the inner source filled it. Grounding:
-    /// `decrypt_sectors(&mut buf[..n], ...)`.
+    // Decorator must decrypt only the reported `n` bytes, never full `buf`.
+    // With a CSS-flagged sector but n=0, the whole buffer must come back
+    // exactly as filled (`decrypt_sectors(&mut buf[..n], ...)`).
     #[test]
     fn decrypt_span_bounded_by_reported_n() {
         // Inner fills a CSS-scrambled-FLAGGED sector but reports n=0, so the
@@ -569,10 +529,9 @@ mod tests {
         assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
     }
 
-    /// An AACS source reaching the decrypt step WITHOUT an installed key map
-    /// must fail loud (DecryptFailed) rather than silently return still-encrypted
-    /// bytes. Grounding: the map-only model — `decrypt_sectors`' AACS arm
-    /// unconditionally returns `Error::DecryptFailed` when no map path handled it.
+    // AACS reaching decrypt without an installed key map must fail loud
+    // (DecryptFailed), not silently return still-encrypted bytes — the
+    // map-only model: decrypt_sectors' AACS arm always errors without one.
     #[test]
     fn aacs_missing_unit_key_errors() {
         let src = PatternedSource { capacity: 16 };
@@ -595,13 +554,9 @@ mod tests {
         );
     }
 
-    /// A source that yields exactly one CLEAR AACS aligned unit (6144
-    /// bytes = 3 sectors) with MPEG-TS sync bytes (0x47) at the BD-TS
-    /// stride (offset 4, then every 192 bytes). `is_clean`
-    /// reports such a unit as clear (not scrambled), so the AACS decrypt path
-    /// reaches the per-unit closure and leaves it untouched — letting
-    /// us prove the unit-key LOOKUP (not the cipher) is what fails for
-    /// an out-of-range index.
+    // Yields one clear AACS aligned unit (6144 bytes = 3 sectors) with TS
+    // sync bytes at the BD-TS stride; `is_clean` reports it unscrambled, so
+    // decrypt reaches the per-unit closure — isolating key LOOKUP failures.
     struct ClearUnitSource;
     impl SectorSource for ClearUnitSource {
         fn read_sectors(
@@ -623,14 +578,9 @@ mod tests {
         }
     }
 
-    /// `set_keys` must replace the active keys mid-life. We use a
-    /// CSS-SCRAMBLED-flagged sector (byte 0x14 scramble bits set) so the
-    /// effect of the active key is observable: under a CSS key the
-    /// descrambler XORs a keystream into bytes 128..2048 AND clears the
-    /// scramble flags (`sector[0x14] &= 0xCF`); under `None` the bytes
-    /// pass through unchanged. Flipping keys mid-life must change which
-    /// behavior runs. Grounding: `set_keys` + `css::lfsr::descramble_sector`
-    /// (keystream XOR + flag-clear on flags != 0).
+    // set_keys must replace the active keys mid-life. Uses a CSS-scrambled
+    // sector: under CSS the descrambler XORs data and clears scramble flags;
+    // under None bytes pass through — flipping keys must change which runs.
     #[test]
     fn set_keys_swaps_active_keys() {
         struct ScrambledSector {
@@ -698,10 +648,9 @@ mod tests {
         );
     }
 
-    /// The unit-alignment guard is AACS-only. A CSS decrypting read (per-sector,
-    /// stateless — DVDs) must NOT be gated on a 3-sector boundary: a single
-    /// sector at lba 1 must read fine. Grounding: the guard is inside
-    /// `matches!(self.keys, DecryptKeys::Aacs { .. })`.
+    // Unit-alignment guard is AACS-only; a CSS read (per-sector, stateless)
+    // must not be gated on a 3-sector boundary — lba 1 must read fine. Guard
+    // is inside `matches!(self.keys, DecryptKeys::Aacs { .. })`.
     #[test]
     fn css_start_lba_not_unit_gated() {
         let mut wrapped = DecryptingSectorSource::new(
@@ -716,12 +665,9 @@ mod tests {
         assert_eq!(n, 2048, "CSS reads must not be unit-alignment gated");
     }
 
-    /// The clear 6144-byte AACS unit that [`encrypt_aacs_unit`] encrypts: all
-    /// zeroes except a TS sync `0x47` at the BD-TS stride (offset 4, then every
-    /// 192 bytes) and the CPI bits on byte 0.
-    ///
-    /// Exposed separately so a decrypt test can assert byte-exact recovery of the
-    /// known plaintext instead of only spot-checking the sync bytes.
+    // The clear 6144-byte AACS unit `encrypt_aacs_unit` encrypts: zeroes
+    // except TS sync 0x47 at the BD-TS stride and CPI bits on byte 0. Exposed
+    // separately so decrypt tests can assert byte-exact plaintext recovery.
     fn clear_aacs_unit() -> Vec<u8> {
         let mut unit = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let mut off = 4;
@@ -775,10 +721,9 @@ mod tests {
         }
     }
 
-    /// END-TO-END AACS: an encrypted unit read through the decorator with a matching
-    /// [`AacsKeyMap`] comes back as the known plaintext. This is the round-trip that
-    /// was previously only asserted through the (deleted) reactive path — the actual
-    /// shipping mapped-decrypt path had no decorator-level coverage.
+    // End-to-end AACS: an encrypted unit read through the decorator with a
+    // matching AacsKeyMap comes back as the known plaintext — the shipping
+    // mapped-decrypt path, previously covered only via the deleted reactive path.
     #[test]
     fn aacs_decorator_decrypts_encrypted_unit_via_map() {
         let key = [0x5Au8; 16];

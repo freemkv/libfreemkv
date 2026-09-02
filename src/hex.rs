@@ -1,16 +1,12 @@
 //! The single hex → bytes parser for the whole workspace.
 //!
-//! Key material arrives as hex from three third-party sources — the keydb, an
-//! online key service, and the mapfile's `# freemkv-vid:` comment — and each
-//! used to parse it slightly differently (one stripped `0x`/`0X`, one stripped
-//! nothing, one stripped `0x` only). A key written with a prefix one parser
-//! didn't expect was silently dropped → "can't decrypt" with no error. This is
-//! the one parser they all call, so the prefix/case/validation rules live in
-//! exactly one place.
+//! Key material arrives as hex from three third-party sources that each used
+//! to parse it slightly differently, so a key with a prefix one parser didn't
+//! expect was silently dropped. This is the one parser they all call, so the
+//! prefix/case/validation rules live in exactly one place. See `docs/hex.md`.
 //!
-//! Operates on BYTES, not `&str` char indices: the inputs are untrusted, so a
-//! multi-byte UTF-8 scalar must reject as malformed, never panic on a
-//! mid-codepoint slice.
+//! Operates on BYTES, not `&str` char indices, so a multi-byte UTF-8 scalar
+//! in untrusted input rejects as malformed rather than panicking mid-codepoint.
 
 /// Parse a hex string into bytes. Accepts an optional `0x`/`0X` prefix
 /// (case-insensitive), then requires an even run of ASCII hex digits. Any
@@ -78,10 +74,9 @@ pub fn strip_hex_prefix(s: &str) -> &str {
         .unwrap_or(s)
 }
 
-/// Combine two ASCII hex-digit bytes into one byte. `as char` is intentional:
-/// for a non-ASCII byte it produces a Latin-1 scalar that `to_digit(16)` then
-/// rejects — so non-hex (incl. `+`/`-` sign chars) and multi-byte input fail
-/// cleanly rather than slipping through `from_str_radix`'s sign handling.
+// Combine two ASCII hex-digit bytes into one byte. `as char` is intentional:
+// non-ASCII bytes become a Latin-1 scalar that `to_digit(16)` then rejects,
+// so non-hex/multi-byte input fails cleanly. See `docs/hex.md`.
 fn byte(hi: u8, lo: u8) -> Option<u8> {
     let hi = (hi as char).to_digit(16)?;
     let lo = (lo as char).to_digit(16)?;

@@ -1,14 +1,9 @@
 //! Standard MPEG-TS (188-byte packets) muxer — sequential-only.
 //!
-//! Distinct from `super::tsmux::TsMuxer` (BD-TS with 192-byte packets
-//! and the 4-byte TP_extra_header). This muxer emits the ITU-T H.222.0 /
-//! ISO/IEC 13818-1 wire format that any conformant transport-stream
-//! demuxer or player consumes out of the box. Use it for plain
-//! `.ts` / `.m2ts` files over a
-//! [`SequentialSink`](crate::io::sink::SequentialSink), and for
-//! MPEG-TS-over-UDP via [`UdpSocketSink`](crate::io::sink::UdpSocketSink).
-//!
-//! ## Wire format
+//! Distinct from `super::tsmux::TsMuxer` (BD-TS with 192-byte packets).
+//! Emits ITU-T H.222.0 / ISO/IEC 13818-1 wire format for `.ts`/`.m2ts` files
+//! over a [`SequentialSink`](crate::io::sink::SequentialSink), or MPEG-TS-over-UDP
+//! via [`UdpSocketSink`](crate::io::sink::UdpSocketSink).
 //!
 //! Every output packet is exactly 188 bytes:
 //!
@@ -25,28 +20,7 @@
 //! [payload, if signalled]
 //! ```
 //!
-//! ## Wiring
-//!
-//! Single program (PMT PID `0x1000`, program number `1`):
-//!   - PAT on PID `0x0000`
-//!   - PMT on PID `0x1000`
-//!   - Video (HEVC, stream_type `0x24`) on PID `0x0100`
-//!   - First audio (AC3, stream_type `0x81`) on PID `0x0101`
-//!     (or TrueHD, stream_type `0x83`, if hinted)
-//!
-//! ## Scope vs. full TS
-//!
-//! This is a deliberately minimal viable muxer:
-//!   - One program, one video track, optionally one audio track.
-//!   - PAT + PMT re-emitted every `PSI_INTERVAL_PACKETS` packets so a
-//!     mid-stream receiver can lock on within ~100 ms at typical
-//!     UHD bitrates.
-//!   - PCR clock derived from video PTS (`pts - PCR_LEAD_90KHZ`),
-//!     attached to the video PID's adaptation field every
-//!     `PCR_INTERVAL_PACKETS` packets.
-//!   - No language / descriptor tags, no SCTE-35 markers, no per-PID
-//!     PMT version bumps, no SDT/EIT. Sufficient for a conformant
-//!     demuxer to play this back, not for full broadcast deployment.
+//! See docs/m2ts-mux.md for PID wiring, PSI/PCR cadence, and scope notes.
 
 use std::io::{self, Write};
 
@@ -269,12 +243,8 @@ impl<W: Write> M2tsMux<W> {
         self.out.flush()
     }
 
-    /// Convert input PTS (nanoseconds) to 90 kHz ticks rebased on the
-    /// stream's PTS origin. The origin is seeded ONLY by the first video
-    /// frame (`may_seed_base == true`); audio frames never seed it. This
-    /// keeps the audio/video offset intact: a leading audio frame can't
-    /// pull the base up and collapse the first/lowest-PTS video frame to 0.
-    /// Frames earlier than the base saturate to 0.
+    // PTS (ns) -> 90 kHz ticks rebased on the stream origin, seeded ONLY by
+    // the first video frame. See docs/m2ts-mux.md#base_relative_pts.
     fn base_relative_pts(&mut self, pts_ns: i64, may_seed_base: bool) -> u64 {
         let raw_90k = if pts_ns > 0 {
             // Widen to u128 so adversarial timestamps can't overflow the
@@ -298,21 +268,9 @@ impl<W: Write> M2tsMux<W> {
         if delta >= (1 << 32) { 0 } else { delta }
     }
 
-    /// Emit one PES payload as a chain of TS packets on `pid`. If `pcr`
-    /// is provided the first packet carries an adaptation field with
-    /// the PCR. PAT/PMT are re-emitted every `PSI_INTERVAL_PACKETS`.
-    ///
-    /// Packet-size math (TS = 188 bytes, header = 4 bytes):
-    ///   - 184 B remain after the header for the adaptation-field area
-    ///     plus the payload area.
-    ///   - With AF body of `b` bytes and `s` stuffing bytes: AF total =
-    ///     `1 + b + s` (the leading `1` is the `adaptation_field_length`
-    ///     byte itself). Payload = `184 - (1 + b + s)`.
-    ///   - With no AF area at all: payload = `184`.
-    ///
-    /// The fit-the-tail logic on the last packet of the PES uses
-    /// stuffing rather than a separate small packet, which is the
-    /// standard MPEG-TS convention.
+    // Emit one PES payload as a chain of TS packets on `pid`; `pcr`, if
+    // given, is stamped on the first packet's AF. See docs/m2ts-mux.md
+    // #write_pes-packet-size-math for the 188/184-byte layout math.
     fn write_pes(
         &mut self,
         pid: u16,
@@ -611,15 +569,9 @@ fn mpegts_crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    /// Golden vector for an audio PES header (ISO/IEC 13818-1 §2.4.3.7).
-    ///
-    /// Audio and video differ in TWO fields that no downstream check in this
-    /// module distinguishes: the stream_id, and whether `PES_packet_length` is
-    /// filled in or left at the unbounded 0x0000 form. A receiver reads the
-    /// length to find the end of the access unit without scanning for the next
-    /// start code, so an audio PES that borrowed the video form (or emitted a
-    /// stub header) still tiles into valid-looking 188-byte packets and only
-    /// fails inside a decoder.
+    // Golden vector for an audio PES header (ISO/IEC 13818-1 §2.4.3.7).
+    // See docs/m2ts-mux.md#audio_pes_header_is_byte_exact_and_bounded_unlike_video
+    // for why the stream_id and PES_packet_length fields matter here.
     #[test]
     fn audio_pes_header_is_byte_exact_and_bounded_unlike_video() {
         let es = [0xDEu8, 0xAD, 0xBE, 0xEF];
@@ -915,16 +867,9 @@ mod tests {
         assert_eq!(af[0] & 0x40, 0x40, "RAI bit set");
     }
 
-    /// The parameter-set prepend is attempted once, on the first keyframe, and
-    /// the latch is armed whether or not it produced anything. When it produced
-    /// nothing — no `codec_private` was set, or the `hvcC` will not parse — the
-    /// emitted TS carries no VPS/SPS/PPS at all and its video cannot be decoded,
-    /// yet `finish()` returns `Ok`. That must not be silent (same defect, and the
-    /// same fix, as the BD-TS sibling `tsmux.rs`): the muxer now warns and, so a
-    /// caller can act on it, exposes `parameter_sets_emitted()`.
-    ///
-    /// Mutation check: drop the `params_emitted` bookkeeping and the two arms are
-    /// indistinguishable to any caller.
+    // Regression: a silent no-op parameter-set prepend must be observable via
+    // `parameter_sets_emitted()`, not just a warning.
+    // See docs/m2ts-mux.md#absent_or_unparseable_codec_private_is_reported_not_silent.
     #[test]
     fn absent_or_unparseable_codec_private_is_reported_not_silent() {
         // A VPS NAL the parser can find, and the hvcC that carries it.
@@ -1047,12 +992,8 @@ mod tests {
         );
     }
 
-    /// Regression: PCR must be re-stamped MID-PES, not only at PES boundaries.
-    /// A single large video frame (one PES) spans far more than
-    /// PCR_INTERVAL_PACKETS TS packets — a UHD I-frame. PCR-bearing video
-    /// packets must recur at least every PCR_INTERVAL_PACKETS video packets
-    /// across that one PES; before the fix only the PES's first packet carried
-    /// PCR, leaving a multi-second clock gap for the whole frame.
+    // Regression: PCR must be re-stamped MID-PES, not only at PES boundaries.
+    // See docs/m2ts-mux.md#pcr_restamped_mid_pes_within_interval.
     #[test]
     fn pcr_restamped_mid_pes_within_interval() {
         let mut sink: Vec<u8> = Vec::new();

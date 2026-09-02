@@ -1,17 +1,12 @@
 //! FMTS index selection — the pure decode-time decision for a 2.1 disc.
 //!
-//! A 2.1 disc resolves to exactly one forensic index (1..=32) for a given
-//! rip. `IndividualSegment.tbl` tags each forensic segment with an index (see
-//! [`super::segment`]); the decode keeps the segments matching our index,
-//! drops the other 31, and treats everything outside a segment as ordinary
-//! (index-0) content. This module owns that classification and nothing else —
-//! no I/O, no keys, no cipher — so it is fully testable in isolation. The
-//! decrypt pipeline consumes the [`UnitDisposition`] it returns.
+//! A 2.1 disc resolves to exactly one forensic index (1..=32); `IndividualSegment.tbl`
+//! tags each segment with an index (see [`super::segment`]). Segments matching our
+//! index are kept, others dropped; everything outside a segment is ordinary (index-0)
+//! content. This module owns that classification only — no I/O, no keys, no cipher.
+//! The decrypt pipeline consumes the [`UnitDisposition`] it returns.
 //!
-//! Where the resolved index comes from is a separate concern
-//! ([`resolve_disc_index`]): today it is read off the index keys the key
-//! source handed us; when Processing Keys are available it will come from the
-//! VK derivation instead. Either way the disposition logic below is identical.
+//! See docs/index-select.md for where the resolved index ([`resolve_disc_index`]) comes from.
 
 use super::segment::{Segment, segment_for_unit};
 use super::types::UnitKey;

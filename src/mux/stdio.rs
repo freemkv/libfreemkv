@@ -48,10 +48,8 @@ impl StdioStream {
         }
     }
 
-    /// Write the FMKV metadata header to stdout exactly once, before any
-    /// frames. Always writes (even when the title has no streams) so a
-    /// zero-frame output stream still emits the magic + metadata header,
-    /// keeping the wire protocol symmetric with the read side's read_header().
+    // Write the FMKV header to stdout exactly once, even for zero-frame
+    // output, keeping the wire protocol symmetric with read_header().
     fn ensure_header_written(&mut self) -> io::Result<()> {
         if let Some(w) = &mut self.writer
             && !self.header_written
@@ -158,10 +156,9 @@ mod tests {
         t
     }
 
-    /// write() on a read-opened (input) stdio stream must return
-    /// StreamReadOnly WITHOUT touching stdin/stdout — the writer.is_none()
-    /// guard returns before any header logic runs. (Returning Ok would let a
-    /// caller silently discard frames into a read-only stream.)
+    // write() on an input stream must error StreamReadOnly without touching
+    // stdin/stdout (writer.is_none() guard short-circuits header logic),
+    // not silently discard frames.
     #[test]
     fn write_on_input_stream_is_read_only_error() {
         let mut s = StdioStream::input();
@@ -179,9 +176,9 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
-    /// read() on a write-opened (output) stdio stream must return
-    /// StreamWriteOnly. ensure_header_read is a no-op when reader is None,
-    /// so this never blocks on real stdin.
+    // read() on an output stream must error StreamWriteOnly;
+    // ensure_header_read is a no-op when reader is None, so this
+    // never blocks on real stdin.
     #[test]
     fn read_on_output_stream_is_write_only_error() {
         let mut s = StdioStream::output(&DiscTitle::empty());
@@ -190,20 +187,18 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
-    /// The write side has the title up front, so headers_ready() must be
-    /// true immediately — the downstream MKV writer needs this to start
-    /// writing the container header without waiting for a (nonexistent)
-    /// read-side header parse.
+    // The write side has the title up front, so headers_ready() must be
+    // true immediately — the MKV writer starts the container header
+    // without waiting for a (nonexistent) read-side header parse.
     #[test]
     fn output_headers_ready_immediately() {
         let s = StdioStream::output(&DiscTitle::empty());
         assert!(s.headers_ready(), "write side is always header-ready");
     }
 
-    /// A fresh read (input) side has NOT parsed any header yet, so
-    /// headers_ready() must be false (meta_parsed=false, writer=None).
-    /// Claiming readiness before the header is parsed would starve the MKV
-    /// writer of codec init data.
+    // A fresh input side has not parsed any header yet, so headers_ready()
+    // must be false; claiming readiness early would starve the MKV
+    // writer of codec init data.
     #[test]
     fn input_not_header_ready_before_any_read() {
         let s = StdioStream::input();
