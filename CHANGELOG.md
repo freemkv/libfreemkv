@@ -1,8 +1,10 @@
 # Changelog
 
-## [1.6.15] — unreleased
+## [1.7.0] — 2026-09-02
 
 ### Fixed
+
+- `mux/mp4`: the capped child-box scan treated any `size < 8` as a stop, which dropped a 64-bit `largesize` child box (`size == 1`, real length in the following 8 bytes) and every sibling after it; a `size == 0` (run-to-end) box was mishandled too. Both are now honoured, so an MP4/MOV whose boxes use 64-bit sizes is walked fully instead of truncated.
 
 - Linux: `SgIoTransport::raw_command` clamped an over-length CDB with `cdb.len().min(16)` instead of routing it through the shared `checked_cdb_len` guard that `execute()` uses. Under SPC-4 a CDB's length is fixed by its opcode, so truncating one does not shorten the command — it sends a descriptor the drive will read as something else. An empty CDB was likewise unguarded, and went to the sg driver as a zero-length command descriptor. Unreachable — `raw_command` is private and its one caller passes a fixed 6-byte ALLOW MEDIUM REMOVAL — but it was the one transport path that did the thing the guard exists to prevent.
 - Linux: the fd hand-off between a background recovery thread and `SgIoTransport::drop` had no release edge, so a recovery thread that published its fd after teardown had drained the slot was not guaranteed to observe `dead == true` and could leave the descriptor unclosed. `Drop`'s claiming `swap` was `Acquire` (a relaxed store, heading no release sequence) and the recovery thread's `compare_exchange` was `Release` (a relaxed load, acquiring nothing) — neither side alone was enough, and upgrading only one still leaks. Both are now `AcqRel`. Worst case was a leaked file descriptor on a transport already being torn down.

@@ -426,7 +426,7 @@ fn find_boxes_capped<'a>(payload: &'a [u8], want: &[u8; 4], cap: usize) -> Vec<&
     let mut out = Vec::new();
     let mut pos = 0;
     while pos + 8 <= payload.len() && out.len() < cap {
-        let size = u32::from_be_bytes([
+        let size32 = u32::from_be_bytes([
             payload[pos],
             payload[pos + 1],
             payload[pos + 2],
@@ -438,13 +438,36 @@ fn find_boxes_capped<'a>(payload: &'a [u8], want: &[u8; 4], cap: usize) -> Vec<&
             payload[pos + 6],
             payload[pos + 7],
         ];
-        if size < 8 || pos + size > payload.len() {
+        // ISO/IEC 14496-12 §4.2: size==1 → 64-bit largesize after the type
+        // (16-byte header); size==0 → box runs to the payload end. The child
+        // scan must honour both or a largesize sibling ends the walk early.
+        let (box_size, header_len) = match size32 {
+            1 => {
+                if pos + 16 > payload.len() {
+                    break;
+                }
+                let large = u64::from_be_bytes([
+                    payload[pos + 8],
+                    payload[pos + 9],
+                    payload[pos + 10],
+                    payload[pos + 11],
+                    payload[pos + 12],
+                    payload[pos + 13],
+                    payload[pos + 14],
+                    payload[pos + 15],
+                ]) as usize;
+                (large, 16usize)
+            }
+            0 => (payload.len() - pos, 8usize),
+            n => (n, 8usize),
+        };
+        if box_size < header_len || pos + box_size > payload.len() {
             break;
         }
         if &bt == want {
-            out.push(&payload[pos + 8..pos + size]);
+            out.push(&payload[pos + header_len..pos + box_size]);
         }
-        pos += size;
+        pos += box_size;
     }
     out
 }
@@ -996,6 +1019,28 @@ mod tests {
             };
             Ok(self.pos)
         }
+    }
+
+    // Regression: a child box in the 64-bit largesize form (size==1) must not
+    // stop the sibling walk — old code saw size 1 < 8 and broke, so every box
+    // after it (here `moov`) vanished and its track was silently dropped.
+    #[test]
+    fn find_box_walks_past_a_largesize_sibling() {
+        let mut payload = Vec::new();
+        // `free` as an empty largesize box: size32=1, u64 total size = 16.
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        payload.extend_from_slice(b"free");
+        payload.extend_from_slice(&16u64.to_be_bytes());
+        // `moov` (32-bit) with a 4-byte payload immediately after it.
+        payload.extend_from_slice(&12u32.to_be_bytes());
+        payload.extend_from_slice(b"moov");
+        payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        assert_eq!(
+            find_box(&payload, b"moov"),
+            Some(&[0xDEu8, 0xAD, 0xBE, 0xEF][..]),
+            "moov after a largesize `free` sibling must still be found",
+        );
     }
 
     // Positive-path test for `parse_stss`: two distinct entries in a buffer
