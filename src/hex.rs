@@ -24,7 +24,7 @@ pub fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         out.push(byte(pair[0], pair[1])?);
     }
     Some(out)
