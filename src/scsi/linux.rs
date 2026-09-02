@@ -81,7 +81,7 @@ pub struct SgIoTransport {
     /// Single-slot mailbox a background recovery thread publishes a freshly
     /// opened fd into. Drained by `execute()`, or claimed by `Drop` if the
     /// transport dies first. The protocol — and the memory ordering that makes
-    /// it leak-free — lives in [`super::fd_handoff`].
+    /// it leak-free — lives in `super::fd_handoff`.
     pub fd_recovery: Arc<AtomicI32>,
     /// Set to `true` by `Drop` before it claims the slot. A recovery thread
     /// that publishes after that point sees it and closes its own fd, since
