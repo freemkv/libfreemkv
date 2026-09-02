@@ -1,22 +1,14 @@
 //! `LocalFileSink` — `BufWriter<File>` for the common local-disk case.
 //!
-//! Buffering: 4 MiB internal `BufWriter`. Sized to coalesce the small
-//! per-PES writes that come out of the muxer into kernel-page-aligned
-//! flushes without making the buffer big enough to matter for memory
-//! pressure on a single concurrent rip.
-//!
-//! `Seek` flushes the underlying `BufWriter` first; otherwise a seek
-//! could leapfrog buffered data and silently corrupt the file. This is
-//! the same shape `BufWriter` itself uses when it impls `Seek` in
-//! stdlib, and is necessary for MKV's seek-back operations (cluster
-//! size patch, Cues index, segment header backpatch) to land on the
-//! right offset.
+//! 4 MiB internal `BufWriter` coalesces small per-PES muxer writes into
+//! kernel-page-aligned flushes. `Seek` flushes the buffer first so a
+//! seek can't leapfrog buffered data and corrupt the file — required
+//! for MKV's seek-back patches (cluster size, Cues, segment header).
 //!
 //! [`SequentialSink`](super::SequentialSink) is implemented explicitly
-//! (not via a blanket impl) so its `finish()` flushes the `BufWriter`
-//! and `fsync`s the file even when called through a `dyn` trait object;
-//! [`RandomAccessSink`](super::RandomAccessSink) is implemented over the
-//! `Seek` impl below.
+//! so `finish()` flushes and `fsync`s even through a `dyn` trait object;
+//! [`RandomAccessSink`](super::RandomAccessSink) is over the `Seek` impl.
+// See docs/local-file-sink.md — buffering & seek-flush rationale.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
@@ -32,17 +24,11 @@ const BUFFER_BYTES: usize = 4 * 1024 * 1024;
 /// Wraps a `BufWriter<File>` with a 4 MiB internal buffer and forwards
 /// `Write`/`Seek` so any call site that previously held a `File` or
 /// `WritebackFile` can drop this in. `finish()` flushes the buffer and
-/// runs `sync_all` on the underlying file so the caller can drop it
-/// without losing data.
+/// `sync_all`s the underlying file before the caller drops it.
 ///
-/// Construction always opens the file `create + truncate + read +
-/// write`. `read` is enabled so the same handle can be reused for a
-/// verification re-read after the mux (the existing
-/// `FileSectorSink::create` pattern). On Linux, [`with_size_hint`]
-/// additionally calls `fallocate(FALLOC_FL_KEEP_SIZE)` to pre-reserve
-/// extents.
-///
-/// [`with_size_hint`]: Self::with_size_hint
+/// Opens the file `create + truncate + read + write`; `read` allows
+/// reusing the handle for a post-mux verification re-read. On Linux,
+/// `Self::with_size_hint` additionally pre-reserves extents via `fallocate`.
 pub struct LocalFileSink {
     inner: BufWriter<File>,
 }
@@ -179,11 +165,8 @@ mod tests {
 
     // ── Added hardening tests ───────────────────────────────────────
 
-    /// `create` must TRUNCATE an existing file (OpenOptions
-    /// `.truncate(true)`, lines 52-58). Pre-seed a long file, recreate
-    /// it via the sink, write a shorter payload — the old tail must be
-    /// gone. Mutation: dropping `.truncate(true)` would leave the stale
-    /// tail and the length assert fails.
+    // `create` must truncate: pre-seed a long file, recreate via the sink
+    // with a shorter payload, and confirm the old tail is gone.
     #[test]
     fn create_truncates_existing_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -202,13 +185,9 @@ mod tests {
         assert_eq!(&bytes, b"short");
     }
 
-    /// Seek must flush the BufWriter FIRST so buffered bytes land at
-    /// their intended offset, not the post-seek one (lines 121-128, and
-    /// the module doc's silent-corruption warning). We write into the
-    /// buffer (no explicit flush), seek backward, write again, and
-    /// confirm the first write stayed at offset 0. Mutation: removing
-    /// the `self.inner.flush()?` in `seek` would flush the first 4
-    /// bytes at the seeked offset, corrupting the file.
+    // Seek must flush the BufWriter first so buffered bytes land at their
+    // intended offset, not the post-seek one. Removing the flush in `seek`
+    // would corrupt the file by writing the buffered bytes at the wrong offset.
     #[test]
     fn seek_flushes_buffer_before_moving() {
         let dir = tempfile::tempdir().unwrap();

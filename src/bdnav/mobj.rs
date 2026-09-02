@@ -7,10 +7,8 @@
 //! byte 50. Each object is `flags`(1) + reserved(1) + `num_cmds`(u16) followed
 //! by `num_cmds` 12-byte navigation commands.
 
-/// One decoded 12-byte navigation command. Field layout (big-endian): byte 0 =
-/// `op_cnt(3) grp(2) sub_grp(3)`; byte 1 = `imm_op1(1) imm_op2(1) branch_opt(4)`
-/// (low nibble); byte 2 low nibble = `cmp_opt`; byte 3 low 5 bits = `set_opt`;
-/// then `dst`(u32) and `src`(u32).
+// One decoded 12-byte navigation command.
+// See docs/mobj.md — byte-level field layout (big-endian).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Cmd {
     pub op_cnt: u8,

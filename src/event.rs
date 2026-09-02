@@ -127,20 +127,15 @@ pub fn ignore(_event: Event) {}
 mod tests {
     use super::*;
 
-    /// BatchSizeReason::Shrunk != BatchSizeReason::Probed.
-    /// These two variants carry distinct meanings (error vs. recovery); they
-    /// must not compare as equal.
-    /// Mutation: deriving PartialEq without proper variant discrimination
-    ///           could make two distinct variants equal.
+    // Shrunk != Probed: distinct meanings (error vs. recovery), must not compare equal.
+    // Mutation: bad PartialEq derive could make distinct variants equal.
     #[test]
     fn batch_size_reason_variants_are_not_equal() {
         assert_ne!(BatchSizeReason::Shrunk, BatchSizeReason::Probed);
     }
 
-    /// BatchSizeReason is Clone + Copy: cloning does not move the original.
-    /// This is required because EventKind::BatchSizeChanged embeds it by value.
-    /// Mutation: removing Copy would require the caller to clone explicitly;
-    ///           code that passes reason by value would fail to compile.
+    // Clone + Copy: cloning doesn't move; required since BatchSizeChanged embeds by value.
+    // Mutation: removing Copy would break callers that pass reason by value.
     #[test]
     fn batch_size_reason_is_copy() {
         let r = BatchSizeReason::Shrunk;

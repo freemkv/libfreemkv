@@ -201,6 +201,42 @@ The full ripping pipeline chains three parsers:
 
 The `Disc::scan()` method in `src/disc/mod.rs` orchestrates this: for each play item in each playlist, it loads the corresponding CLPI, calls `get_extents()` with the play item's in/out times, and collects the resulting sector ranges into the title's extent list.
 
+## ProgramInfo Section (Per-Stream Metadata)
+
+`parse_program_info` in `src/clpi.rs` reads per-stream (pid, coding_type,
+language, codec sub-fields) from the ProgramInfo section, per the Blu-ray
+Disc Read-Only Format Part 3 CLIPINF (CLPI) specification:
+
+```text
+ProgramInfo:
+  length: 4 bytes
+  reserved: 1 byte
+  num_programs: 1 byte
+  for each program:
+    spn_program_sequence_start: 4 bytes
+    program_map_pid: 2 bytes
+    num_streams: 1 byte
+    num_groups: 1 byte
+    for each stream:
+      pid: 2 bytes
+      stream_coding_info_length: 1 byte
+      stream_coding_info: (varies by coding_type)
+        coding_type: 1 byte
+        per-type bytes (see match arms in parse_program_info)
+```
+
+It returns `Vec::new()` on any structural mismatch — errors aren't
+propagated because the EP map is the primary CLPI output, and a corrupt
+program_info shouldn't break sector-range lookups.
+
+### Test fixture notes
+
+- `prog_info_start_zero_does_not_parse_header_as_program_info`: the
+  fixture is crafted so that parsing from offset 0 WOULD yield a stream
+  (num_programs at `[5]`, a second program header whose num_streams
+  byte at `[20]` is 1, then a well-formed stream record), so an empty
+  result can only come from the `prog_info_start > 0` gate in `parse`.
+
 ## References
 
 - BD-ROM Part 3, Section 5.5: Clip Information file format

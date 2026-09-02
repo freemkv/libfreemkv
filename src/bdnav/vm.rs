@@ -1,13 +1,13 @@
-//! The HDMV navigation VM — a faithful, bounded re-implementation of the subset
-//! of HDMV navigation semantics needed to follow First-Play to the feature
-//! `PlayPlayList`. It "mimics a real player": correct power-on register state is
-//! what lets a densely-branched dispatcher converge on the feature rather than
-//! loop. Never panics; hard step/switch caps.
+//! The HDMV navigation VM — a bounded re-implementation of the subset of HDMV
+//! navigation semantics needed to follow First-Play to the feature
+//! `PlayPlayList`. Never panics; hard step/switch caps.
 //!
 //! It resolves generically — there is no per-disc special-casing. When
 //! First-Play is a BD-J title (the feature is chosen by a Java Xlet), or the
 //! program does not reach a `PlayPL` on a caller-approved feature candidate, it
 //! abstains (`None`) and selection falls back to the structural/heuristic order.
+//
+// See docs/vm.md — why power-on register fidelity matters for convergence.
 
 use super::index::{Index, PlaybackObj};
 use super::mobj::MovieObject;
@@ -20,10 +20,9 @@ const MAX_STEPS: usize = 1_000_000;
 /// bounds pathological jump chains.
 const MAX_SWITCHES: usize = 1024;
 
-/// BD player power-on register defaults (indices 0..=61); unlisted = 0. The
-/// load-bearing values are PSR4/5 = `0xffff` ("no title/chapter selected") and
-/// PSR6/7/8 = 0, which steer dispatcher compares; the rest are set for fidelity
-/// with real player behavior.
+// BD player power-on register defaults (indices 0..=61); unlisted = 0.
+// Load-bearing: PSR4/5 = 0xffff ("no title/chapter selected"), PSR6/7/8 = 0 —
+// these steer dispatcher compares; rest set for fidelity with real player.
 fn psr_init() -> [u32; 128] {
     let mut p = [0u32; 128];
     let vals: &[(usize, u32)] = &[

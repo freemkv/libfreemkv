@@ -1,14 +1,11 @@
 //! Text-extraction helpers used by parsers that scan binary blobs for
 //! embedded label strings.
 //!
-//! Promoted from a byte-scanning helper (`bluray_project.bin`,
-//! min_len=4). Single implementation, threshold passed in.
-//!
-//! `dbp` no longer uses a byte-scanning helper — it iterates
-//! `class_reader::CpInfo::Utf8` constant-pool entries directly. Callers
-//! that have a more structured parse path (e.g. `class_reader` for
-//! `.class`) should prefer that; this helper is for genuinely
-//! unstructured input.
+//! Promoted from a byte-scanning helper (`bluray_project.bin`, min_len=4);
+//! single implementation, threshold passed in. Callers with a more
+//! structured parse path (e.g. `class_reader` for `.class`, which reads
+//! `CpInfo::Utf8` entries directly) should prefer that — this helper is
+//! for genuinely unstructured input.
 
 /// Walk `data`, emit every maximal run of printable-ASCII bytes
 /// (`0x20..=0x7E`) whose length is at least `min_len`.

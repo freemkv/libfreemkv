@@ -1,64 +1,36 @@
 //! AC3 (Dolby Digital) / EAC3 (Dolby Digital Plus) frame parser.
 //!
-//! Every (E-)AC-3 syncframe starts with syncword 0x0B77. A legacy AC-3
-//! syncframe is a complete access unit on its own, but an E-AC-3 access unit
+//! Every (E-)AC-3 syncframe starts with syncword 0x0B77. An E-AC-3 access unit
 //! (ETSI TS 102 366 / ATSC A/52 Annex E) is a whole FRAME SET: the mandatory
-//! independent substream (`substreamid` 0) plus every DEPENDENT substream frame
-//! that follows it, plus any ADDITIONAL independent substreams (`substreamid`
-//! 1..7) and their own dependents. A decoder needs the whole set to reconstruct
-//! the programme (a 5.1 independent substream plus a dependent substream
-//! carrying the extra channels of a 7.1 programme, and the AC-3-core +
-//! E-AC-3-dependent arrangement used for backwards-compatible Dolby Digital
-//! Plus), and every substream of the frame set covers the SAME time period.
-//! This parser therefore groups syncframes into access units at each
-//! independent substream whose `substreamid` is 0, rather than emitting one
-//! frame per syncframe or breaking at every independent substream.
-//!
-//! WHY the whole frame set is ONE sample, rather than splitting an additional
-//! independent substream (an associated / commentary service) into a track of its
-//! own: Annex E orders the substreams of a frame set inside a single elementary
-//! stream, all covering one time period, and a decoder handed a frame set renders
-//! the programme it is asked for from it — that is exactly what the container's
-//! E-AC-3 sample and its `dec3`/`num_ind_sub` description denote. Splitting would
-//! mean rewriting the bitstream (re-numbering `substreamid` so the extracted
-//! service becomes substream 0, and rebuilding its frame sets), because a
-//! substream numbered 1..7 with no substream 0 is not a conforming stream. That
-//! is a transcode, not a remux; this parser is lossless, so the frame set stays
-//! whole and player-side programme selection decides what is heard.
-//!
-//! Buffers across PES boundaries so access units that span two PES packets
-//! are emitted complete, not truncated or split.
+//! independent substream (`substreamid` 0) plus every dependent and additional
+//! substream that follows it, all covering the SAME time period, so this parser
+//! groups syncframes into access units at each `substreamid`-0 independent
+//! substream rather than at every syncframe. Buffers across PES boundaries so
+//! access units that span two PES packets are emitted complete, never split.
+// See docs/ac3.md — why a frame set is one sample and never split into tracks.
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
-/// Sample rates indexed by fscod (0=48kHz, 1=44.1kHz, 2=32kHz). fscod=3 is
-/// reserved in AC-3; in E-AC-3 it signals "fscod2" (reduced rates: 24/22.05/16
-/// kHz, selected by byte-4 bits `[5:4]`). `frame_sample_rate` decodes fscod2 in
-/// the E-AC-3 case; this table's index-3 entry (48 kHz) is only the fallback
-/// when the header is too short to read fscod2.
+// Sample rates by fscod (0=48kHz, 1=44.1kHz, 2=32kHz). fscod=3 is reserved in
+// AC-3 / signals E-AC-3 "fscod2"; see docs/ac3.md for the fscod2 decode and
+// why index 3 (48 kHz) is only a too-short-header fallback.
 const SAMPLE_RATES: [u32; 4] = [48_000, 44_100, 32_000, 48_000];
 
 /// E-AC-3 reduced sample rates indexed by fscod2 (byte-4 bits `[5:4]`), used when
 /// fscod==3. Index 3 is reserved; we fall back to 48 kHz for it.
 const EAC3_REDUCED_RATES: [u32; 4] = [24_000, 22_050, 16_000, 48_000];
 
-/// Minimum byte length of a valid (E-)AC-3 frame. A real E-AC-3 frame must carry
-/// at least the syncword (2) + BSI header (~4) before any audio. `eac3_frame_size`
-/// returns `(frmsiz + 1) * 2`, so frmsiz=0/1 yield 2/4-byte "frames" that are
-/// sub-header junk; rejecting anything below this guards against emitting them.
+// Minimum byte length of a valid (E-)AC-3 frame: syncword (2) + BSI header
+// (~4). Rejects the frmsiz=0/1 sub-header junk `eac3_frame_size` could
+// otherwise report as a 2/4-byte "frame".
 const MIN_FRAME_BYTES: usize = 6;
 
 /// AC-3 (legacy) always carries 6 audio blocks × 256 samples = 1536 samples.
 const AC3_SAMPLES_PER_FRAME: u32 = 1536;
 
-/// Hard cap on the carry-over buffer. An AC-3/E-AC-3 syncframe is at most 8192
-/// bytes (the `frame_size > 8192` reject below) and an access unit is a whole
-/// frame set: up to 8 independent substreams, each with up to 8 dependent
-/// substreams (ETSI TS 102 366 Annex E) — 72 syncframes worst case. A cap of one
-/// straddling frame set plus slack therefore has to exceed 72 × 8192 = 576 KiB.
-/// If the buffer grows past the cap without yielding a frame (pathological /
-/// never-syncing input) we drop it and resync rather than accumulate one PES
-/// worth of data per call for the whole title.
+// Hard cap on the carry-over buffer: one worst-case straddling frame set
+// (72 × 8192-byte syncframes, Annex E) plus slack. See docs/ac3.md for the
+// derivation; past this we drop and resync rather than accumulate forever.
 const MAX_AC3_BUF: usize = 1024 * 1024;
 
 pub struct Ac3Parser {
@@ -135,28 +107,9 @@ impl Ac3Parser {
         self.tally.dropped_duration_ns()
     }
 
-    /// Scan `data` for (E-)AC-3 syncframes and group them into access units.
-    ///
-    /// Per ETSI TS 102 366 (ATSC A/52) Annex E an access unit is one FRAME SET:
-    /// the mandatory independent substream (`substreamid` 0) plus every DEPENDENT
-    /// substream that follows it, plus any ADDITIONAL independent substreams
-    /// (`substreamid` 1..7 — associated/commentary services) with their own
-    /// dependents. The access unit therefore closes only when the next
-    /// `substreamid`-0 independent substream (or, with `at_eos`, the end of the
-    /// stream) is seen, and it carries THAT substream's PTS and duration: every
-    /// other substream of the frame set describes the SAME time period and adds no
-    /// duration of its own.
-    ///
-    /// `base_pts_ns` times the access unit that begins at `data[0]` — i.e. the
-    /// running cadence carried over from the previous call. `anchor` re-anchors
-    /// the running PTS to this PES's own timestamp at the first access unit that
-    /// STARTS in the newly-appended bytes: a PES timestamp applies to the first
-    /// access unit beginning in that PES, never to one that began in an earlier
-    /// PES and is only being completed (or was held) here.
-    ///
-    /// Returns the emitted access units, the offset in `data` from which bytes
-    /// must be carried over to the next call, and the PTS to stamp on the access
-    /// unit that begins that carry-over.
+    // Scan `data` for (E-)AC-3 syncframes and group them into access units,
+    // closing each only at the next `substreamid`-0 independent substream.
+    // See docs/ac3.md — frame-set closing rule, PTS-anchor semantics, returns.
     fn scan_access_units(
         &mut self,
         data: &[u8],
@@ -356,20 +309,15 @@ impl Ac3Parser {
     }
 }
 
-/// Where a PES's own timestamp takes over the running per-access-unit PTS:
-/// `pts_ns` applies to the first access unit whose independent substream starts
-/// at or after byte `at` of the scanned buffer (the first byte contributed by
-/// that PES).
+// Where a PES's own timestamp takes over the running per-access-unit PTS:
+// `pts_ns` applies to the first access unit starting at/after byte `at`.
 struct PtsAnchor {
     at: usize,
     pts_ns: i64,
 }
 
-/// What one `scan_access_units` pass produced: the access units it emitted,
-/// the offset in the scanned buffer from which bytes must be carried over to
-/// the next call, the PTS to stamp on the access unit that begins that
-/// carry-over, and — when the trailing access unit was HELD — the state that
-/// lets the next call resume rather than re-derive it.
+// What one `scan_access_units` pass produced: emitted frames, the carry-over
+// offset + PTS for the next call, and the HeldAu state to resume from (if any).
 struct ScanOut {
     frames: Vec<Frame>,
     keep_from: usize,
@@ -395,10 +343,8 @@ struct HeldAu {
     bsid: u8,
 }
 
-/// An access unit (frame set) under construction: `data[start..end]` is the
-/// `substreamid`-0 independent substream frame plus every substream appended to it
-/// so far — its dependents, and any additional independent substreams 1..7 with
-/// their own dependents.
+// An access unit (frame set) under construction: `data[start..end]` is the
+// `substreamid`-0 independent substream plus every substream appended so far.
 struct PendingAu {
     start: usize,
     end: usize,
@@ -414,10 +360,8 @@ struct PendingAu {
     bsid: u8,
 }
 
-/// Emit a finished access unit, or record it as a drop when any of its
-/// substreams failed the decodability gate. A drop still accounts for the full
-/// access-unit duration, so it reads as a silence gap and never shifts the audio
-/// that follows.
+// Emit a finished access unit, or record it as a drop (still counting the
+// full duration, so it reads as a silence gap, never a shift of later audio).
 fn close_access_unit(
     tally: &mut super::dropgate::DropTally,
     data: &[u8],
@@ -453,38 +397,9 @@ enum SubstreamRole {
     Extends,
 }
 
-/// Classify a syncframe for access-unit assembly.
-///
-/// Byte 2 of an E-AC-3 syncframe is `strmtyp(2) | substreamid(3) | frmsiz[10:8]`
-/// (ETSI TS 102 366 Annex E BSI). `strmtyp` 0 and 2 are independent substreams
-/// (type 2 being an independent substream that is not the first of the bit
-/// stream); `strmtyp` 1 is the dependent substream.
-///
-/// Annex E defines a FRAME SET as independent substream 0 — mandatory, always
-/// first — with its dependent substreams, followed by the OPTIONAL additional
-/// independent substreams 1..7, each with their own dependents; all of them carry
-/// the same time period. So the access-unit boundary is an independent substream
-/// with `substreamid` == 0, and NOT merely "an independent substream": an
-/// additional independent substream (an associated or commentary service) sits
-/// INSIDE the frame set already open. Keying the boundary on `strmtyp` alone made
-/// every such substream close the access unit and advance the running PTS a
-/// second time over the same ~32 ms, doubling the timeline (about a second of A/V
-/// drift per second of audio).
-///
-/// `strmtyp` 3 is reserved: its BSI layout is not defined, so its `substreamid`
-/// bits cannot be trusted and it is treated as starting a fresh access unit —
-/// an unknown frame is never merged into an unrelated programme, and never
-/// discarded as an orphan either.
-///
-/// Legacy AC-3 (`bsid < 11`) has no substream structure — byte 2 there is the
-/// crc1 field, never `strmtyp` — so it always starts an access unit.
-///
-/// A frame set MAY carry a substream as several consecutive syncframes of fewer
-/// than six blocks each (Annex E allows numblkscod < 3). Those extra syncframes
-/// are `substreamid` 0 too, so each starts its own access unit here rather than
-/// merging into one frame set. That is deliberate: each carries its OWN
-/// numblkscod-derived duration (see `frame_duration_ns`), so the timeline total
-/// stays exact, and the substreams are still delivered in bitstream order.
+// Classify a syncframe for access-unit assembly: byte 2's strmtyp/substreamid
+// (ETSI TS 102 366 Annex E BSI) decide Starts vs Extends. See docs/ac3.md for
+// the full boundary rule (why substreamid==0, not strmtyp alone, is the key).
 fn substream_role(data: &[u8], bsid: u8) -> SubstreamRole {
     if bsid < 11 || data.len() < 3 {
         return SubstreamRole::Starts;
@@ -502,13 +417,9 @@ fn substream_role(data: &[u8], bsid: u8) -> SubstreamRole {
 
 use super::crc::crc16_ansi;
 
-/// Whether a fully-buffered (E-)AC-3 frame passes its native CRC. Per ETSI TS
-/// 102 366 (ATSC A/52) the frame carries a CRC-16/ANSI (poly 0x8005, init 0,
-/// non-reflected) over the bytes after the 2-byte syncword — i.e. `crc16_ansi(
-/// &buf[2..]) == 0` covers `frame_size - 2` bytes; the trailing crc word makes a
-/// clean frame's residue zero. A nonzero residue is a ~1-in-65536-certain sign
-/// of payload corruption, so we drop the frame (silence gap) rather than ship a
-/// glitch. `frame` must be exactly the frame bytes (syncword .. frame_size).
+// Whether a fully-buffered (E-)AC-3 frame passes its native CRC-16/ANSI over
+// the bytes after the syncword. `frame` must be exactly syncword..frame_size;
+// see docs/ac3.md for the CRC layout and why a mismatch drops the frame.
 fn frame_crc_ok(frame: &[u8]) -> bool {
     // Need the syncword (2) plus at least one covered byte; the caller only
     // invokes this on a fully-sized frame, so this is defensive.
@@ -518,10 +429,8 @@ fn frame_crc_ok(frame: &[u8]) -> bool {
     crc16_ansi(&frame[2..]) == 0
 }
 
-/// Decodability verdict for a fully-sized (E-)AC-3 frame: `Some(reason)` when it
-/// must be dropped, `None` when it decodes. Drops (in order): a poisoned track
-/// (mostly-undecodable → drop the rest), an out-of-range bitstream id (`bsid >
-/// 16`; ETSI TS 102 366 defines no bsid above 16), or a failed native frame CRC.
+// Decodability verdict for a fully-sized frame: poisoned track, out-of-range
+// bsid (> 16, undefined by ETSI TS 102 366), or a failed native CRC, in order.
 fn ac3_drop_reason(
     tally: &super::dropgate::DropTally,
     frame: &[u8],
@@ -660,10 +569,8 @@ fn eac3_samples_per_frame(data: &[u8]) -> u32 {
     numblks * 256
 }
 
-/// Sample rate (Hz) of an AC-3/E-AC-3 frame from its fscod field (byte 4 bits
-/// 7-6). For E-AC-3 (`bsid >= 11`) an fscod of 3 selects a reduced rate via
-/// fscod2 (byte 4 bits `[5:4]`); decoding it keeps the frame duration correct
-/// instead of mistiming reduced-rate frames at 48 kHz (A/V drift).
+// Sample rate (Hz) from fscod (byte 4 bits 7-6); E-AC-3 fscod==3 selects a
+// reduced rate via fscod2 (byte 4 bits [5:4]) to keep frame duration correct.
 fn frame_sample_rate(data: &[u8], bsid: u8) -> u32 {
     if data.len() < 5 {
         return SAMPLE_RATES[0];
@@ -689,38 +596,13 @@ fn frame_duration_ns(data: &[u8], bsid: u8) -> u64 {
     (samples * 1_000_000_000 + rate / 2) / rate
 }
 
-/// Base channel count per AC-3 `acmod` (A/52 Table 5.8), BEFORE the LFE.
-/// Index is the 3-bit acmod value; add 1 when `lfeon` is set.
-///
-/// ```text
-///   0 = 1+1 (Ch1, Ch2)  -> 2     4 = 2/1 (L,R,S)        -> 3
-///   1 = 1/0 (C, mono)   -> 1     5 = 3/1 (L,C,R,S)      -> 4
-///   2 = 2/0 (L, R)      -> 2     6 = 2/2 (L,R,SL,SR)    -> 4
-///   3 = 3/0 (L,C,R)     -> 3     7 = 3/2 (L,C,R,SL,SR)  -> 5
-/// ```
+// Base channel count per AC-3 `acmod` (A/52 Table 5.8), BEFORE the LFE; add 1
+// when `lfeon` is set. See docs/ac3.md for the per-acmod channel layout table.
 const ACMOD_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
 
-/// Decode the channel count of an (E-)AC-3 frame from its bitstream `acmod` and
-/// `lfeon`, starting at the 0x0B77 syncword. Returns `None` when the frame is
-/// too short to carry the BSI bits.
-///
-/// This is the AUTHORITATIVE channel count for the track header: the DVD IFO
-/// `audio_attr_t.channels` nibble is a well-known unreliable/stale field, so
-/// the muxer prefers this over the IFO-claimed count (the bitstream acmod is
-/// authoritative; the IFO audio nibble is not trusted). LFE adds one channel
-/// (e.g. acmod=7 + lfeon → 6 = 5.1).
-///
-/// Bit layout from the syncword (A/52 §5.3.2 BSI):
-///
-/// ```text
-///   byte 5: bsid(5) | bsmod(3)
-///   byte 6: acmod(3) | [cmixlev(2) if acmod has a centre and acmod!=1]
-///                    | [surmixlev(2) if acmod has surround]
-///                    | [dsurmod(2) if acmod==2] | lfeon(1) | ...
-/// ```
-///
-/// `acmod` therefore always occupies byte-6 bits 7-5; `lfeon` follows a
-/// variable number of optional 2-bit fields, so we track the bit cursor.
+// Decode the channel count of an (E-)AC-3 frame from its bitstream `acmod` +
+// `lfeon` (A/52 §5.3.2 BSI) — the AUTHORITATIVE count over the unreliable DVD
+// IFO nibble. See docs/ac3.md for the bit layout `acmod`/`lfeon` are read from.
 pub(crate) fn acmod_channels(data: &[u8]) -> Option<u8> {
     // Need at least bytes 0..=6 to read acmod (byte 6) and its trailing
     // optional fields + lfeon (which never spills past byte 7 for any acmod).
@@ -787,10 +669,9 @@ fn eac3_frame_size(data: &[u8]) -> usize {
     (frmsiz + 1) * 2
 }
 
-/// Calculate AC-3 frame size in bytes from fscod and frmsizecod. Returns 0 for
-/// an unmappable header (reserved fscod==3, or frmsizecod out of table range).
-/// `pub(crate)` so the TrueHD parser can reuse it when skipping interleaved AC-3
-/// frames instead of duplicating the size table.
+// Calculate AC-3 frame size in bytes from fscod and frmsizecod (0 if
+// unmappable). pub(crate) so the TrueHD parser can reuse it rather than
+// duplicating the size table when skipping interleaved AC-3 frames.
 pub(crate) fn ac3_frame_size(data: &[u8]) -> usize {
     if data.len() < 5 {
         return 0;
@@ -866,10 +747,8 @@ mod tests {
         frame
     }
 
-    /// Set the trailing CRC word so the whole-frame residue over `[2..]` is zero
-    /// — i.e. the frame passes the decodability gate. Relies on the CRC-16/ANSI
-    /// residue property: appending `crc16([2..n-2])` (big-endian) zeroes the
-    /// register over `[2..n]`. Leaves the crc1 field (bytes 2-3) untouched.
+    // Sets the trailing CRC word so the frame's [2..] residue is zero (passes
+    // the decodability gate); leaves the crc1 field (bytes 2-3) untouched.
     fn finalize_ac3_crc(frame: &mut [u8]) {
         let n = frame.len();
         if n < 4 {
@@ -880,17 +759,9 @@ mod tests {
         frame[n - 1] = (c & 0xFF) as u8;
     }
 
-    /// The per-PES working buffer must be REUSED, not reallocated.
-    ///
-    /// `parse` runs once per PES packet — of the order of 10^5 times on a
-    /// feature's audio track — and used to build a fresh `Vec` every call. The
-    /// copy itself cannot go without restructuring the borrow relationship, but
-    /// the allocation can: the buffer is taken out of `self`, filled, and put
-    /// back with its capacity intact.
-    ///
-    /// Asserting on capacity is deliberately white-box, because that is exactly
-    /// what regresses if someone reverts to `to_vec()` — the behaviour would be
-    /// identical and no other test would notice.
+    // The per-PES working buffer must be REUSED, not reallocated (`parse`
+    // runs ~10^5 times per audio track). See docs/ac3.md for why the capacity
+    // assert is deliberately white-box.
     #[test]
     fn the_working_buffer_is_reused_across_packets_not_reallocated() {
         let mut parser = Ac3Parser::new();
@@ -1673,10 +1544,8 @@ mod tests {
 
     // --- acmod_channels: channel count from the AC-3 BSI bitstream ---
 
-    /// Build a minimal AC-3 BSI header (8 bytes) with a given acmod + lfeon.
-    /// byte5 = bsid<<3 (bsmod=0); byte6 carries acmod in bits 7-5 followed by
-    /// the optional mix-level fields and lfeon. We construct byte6/7 by writing
-    /// bits MSB-first in the exact order acmod_channels reads them.
+    // Builds a minimal AC-3 BSI header (8 bytes) with a given acmod + lfeon,
+    // writing byte6/7 bits MSB-first in the order acmod_channels reads them.
     fn make_bsi(acmod: u8, lfeon: bool) -> Vec<u8> {
         // Collect the bit sequence after byte 6 bit 7: acmod(3), [cmixlev(2)],
         // [surmixlev(2)], [dsurmod(2)], lfeon(1). Mix-level/dsurmod bits are
@@ -1872,13 +1741,9 @@ mod tests {
 
     // --- E-AC-3 substream grouping: one access unit per independent substream ---
 
-    /// Build a synthetic E-AC-3 syncframe of exactly `size` bytes with the given
-    /// `strmtyp` / `substreamid` (ETSI TS 102 366 Annex E: byte 2 is
-    /// strmtyp(2) | substreamid(3) | frmsiz[10:8], byte 3 is frmsiz[7:0], and the
-    /// frame is `(frmsiz + 1) * 2` bytes). byte 4 = fscod 0 (48 kHz),
-    /// numblkscod 3 (6 blocks → 1536 samples → 32 ms), acmod 7 + lfeon (5.1);
-    /// byte 5 = bsid 16 so the E-AC-3 paths are taken. CRC finalized so the frame
-    /// passes the decodability gate.
+    /// Builds a synthetic E-AC-3 syncframe of exactly `size` bytes with the
+    /// given strmtyp/substreamid; fscod/numblkscod/acmod fixed at 48kHz/6
+    /// blocks/5.1, bsid 16, CRC finalized. See docs/ac3.md for the byte layout.
     fn make_eac3_frame(strmtyp: u8, substreamid: u8, size: usize) -> Vec<u8> {
         assert!(size >= MIN_FRAME_BYTES && size.is_multiple_of(2));
         let frmsiz = size / 2 - 1;
@@ -2224,10 +2089,8 @@ mod tests {
         );
     }
 
-    /// A 256-byte E-AC-3 syncframe with a valid CRC. `strmtyp`/`substreamid`
-    /// go into byte 2 (A/52 Annex E), which is what `substream_role` reads:
-    /// (0, 0) OPENS an access unit, (1, 0) is a dependent substream that
-    /// EXTENDS the open one.
+    // A 256-byte E-AC-3 syncframe with a valid CRC; strmtyp/substreamid go
+    // into byte 2, which substream_role reads: (0,0) opens, (1,0) extends.
     fn eac3_substream_frame(strmtyp: u8, substreamid: u8) -> Vec<u8> {
         const SIZE: usize = 256;
         let frmsiz = SIZE / 2 - 1; // (frmsiz + 1) * 2 == SIZE
@@ -2241,20 +2104,9 @@ mod tests {
         f
     }
 
-    /// An access unit closes only at the next `substreamid`-0 independent
-    /// substream, so one that keeps gaining dependent substreams stays OPEN
-    /// across PES boundaries and its bytes stay in the carry-over. The
-    /// carry-over must not be re-scanned — and re-CRCed — from the access
-    /// unit's first byte on every packet: the buffer only stops growing at
-    /// MAX_AC3_BUF (1 MiB), and a PES on a DVD is about 2 KiB, so re-deriving
-    /// the held access unit costs work quadratic in the packets fed.
-    ///
-    /// Measured directly, because a work bound has no frame-level shadow:
-    /// `frames_scanned` counts the syncframes the scanner sizes and CRC-gates.
-    /// Re-scanning from byte 0 examines 1 + 2 + ... + (N+1) frames.
-    ///
-    /// Mutation: pass `None` for `held` in `parse` (or drop the `if let
-    /// Some(h) = held` resume) — the count returns to the quadratic figure.
+    // A held access unit's carry-over bytes must not be re-scanned/re-CRCed
+    // from byte 0 on every packet (quadratic work). See docs/ac3.md for the
+    // frames_scanned measurement and the mutation this catches.
     #[test]
     fn a_held_access_unit_is_not_rescanned_from_its_first_frame_every_packet() {
         const DEPENDENTS: usize = 200;
@@ -2290,19 +2142,9 @@ mod tests {
         );
     }
 
-    /// A concealed gap must drop the HELD access unit, not just the byte
-    /// buffer.
-    ///
-    /// `parse` clears `self.acc` on a discontinuity because the buffered bytes
-    /// are a truncated frame. The held access unit is described by OFFSETS into
-    /// exactly those bytes, so it has to go with them. Without
-    /// `self.held = None`, the next packet resumes a HeldAu whose `start`/`end`
-    /// were computed against the pre-gap buffer but are applied to the
-    /// unrelated post-gap bytes — splicing audio across the gap at best, and
-    /// indexing past the end of the new, shorter buffer at worst.
-    ///
-    /// The two existing discontinuity tests use plain AC-3 (bsid < 11), which
-    /// never holds an access unit open, so neither of them reaches this reset.
+    // A concealed gap must drop the HELD access unit, not just the byte
+    // buffer: its offsets describe the pre-gap bytes and must not be applied
+    // to the unrelated post-gap ones. See docs/ac3.md for the full rationale.
     #[test]
     fn a_discontinuity_drops_the_held_access_unit_with_its_bytes() {
         let mut parser = Ac3Parser::new();
@@ -2392,31 +2234,9 @@ mod tests {
             "the unit belongs to the packet its FIRST byte came from"
         );
     }
-    /// A track that becomes POISONED while an access unit is held open across a
-    /// PES boundary must not emit that access unit when it resumes.
-    ///
-    /// Mutation this catches: deleting (or inverting) the resume-path re-check
-    /// `if drop_reason.is_none() && self.tally.is_poisoned()` at the top of
-    /// `scan_access_units`. The verdict on a held access unit is frozen at the
-    /// moment it was OPENED, and `ac3_drop_reason` reads the tally BEFORE the
-    /// previous access unit is closed — so the very drop that crosses the
-    /// poison threshold lands after the next unit's verdict was already taken
-    /// as `None`. Without the re-check that unit is emitted as an ordinary
-    /// frame after the track has been judged too damaged to mux: corrupt audio
-    /// passed through as success, and worse, it is the ONE frame that escapes
-    /// a whole-track fallback whose entire point is that nothing after the
-    /// verdict ships.
-    ///
-    /// Neither existing held-AU test reaches this: both keep a pristine tally.
-    ///
-    /// The fixture drives the exact interleaving above. `DropTally` poisons
-    /// once `verified_dropped * 2 > kept + dropped` past the 200-AU gate, so
-    /// one PES carries 200 CRC-failing `substreamid`-0 syncframes followed by a
-    /// clean one. Closing corrupt unit #200 (which happens only when the clean
-    /// frame is reached) latches the poison — after that clean frame's own
-    /// verdict was computed. Being an E-AC-3 unit that can still gain
-    /// substreams, it is then HELD across the boundary with `drop_reason:
-    /// None`, which is precisely the state the re-check exists for.
+    // A track that becomes POISONED while an access unit is held open across
+    // a PES boundary must not emit that unit on resume. See docs/ac3.md for
+    // the mutation this catches and the fixture's interleaving.
     #[test]
     fn a_held_access_unit_is_dropped_when_the_track_poisons_before_it_resumes() {
         // One more than the verdict gate: the Nth close is what poisons.

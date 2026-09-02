@@ -1,21 +1,13 @@
 //! macOS SCSI transport: IOKit SCSITaskDeviceInterface with exclusive access.
 //!
-//! Single dispatch path: **all** CDBs (INQUIRY, READ, REPORT KEY, etc.) go
-//! through `SCSITaskDeviceInterface::ExecuteTaskSync` — 1:1 with the Linux
-//! SG_IO backend. The C shim (`macos_shim.c`) handles:
+//! Single dispatch path: **all** CDBs go through
+//! `SCSITaskDeviceInterface::ExecuteTaskSync`, 1:1 with the Linux SG_IO
+//! backend. The C shim (`macos_shim.c`) unmounts, opens, and obtains
+//! exclusive access before dispatch; see `docs/scsi-macos.md` for the
+//! full open sequence.
 //!
-//! 1. `diskutil unmountDisk force` on the target device only
-//! 2. Find `IOBDServices` matching the requested BSD name (walks IOKit
-//!    registry: IOBDServices → IOBDBlockStorageDriver → IOMedia → BSD Name)
-//! 3. Create `MMCDeviceInterface` → `SCSITaskDeviceInterface`
-//! 4. `ObtainExclusiveAccess`
-//! 5. Raw CDB dispatch via `CreateSCSITask` + `ExecuteTaskSync`
-//!
-//! Drive enumeration (`list_drives`) uses the IOKit registry directly via
-//! `shim_list_drives` — no exclusive access, no SCSI commands, no unmounts.
-//! The media-presence probe (`drive_has_disc`) does the same via
-//! `shim_media_present`: steps 1-5 above are the *transport* open path, and a
-//! probe documented as side-effect-free must not run any of them.
+//! Drive enumeration and the media-presence probe use the IOKit registry
+//! directly and never take exclusive access; see `docs/scsi-macos.md`.
 
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
@@ -29,10 +21,9 @@ const K_SENSE_DATA_SIZE: usize = 32;
 /// shim so a pathological >255-byte slice can't wrap a `u8`.
 const K_MAX_CDB_SIZE: usize = 16;
 
-/// The C shim uses a single global IOKit handle (`g_handle`), so only one
-/// [`MacScsiTransport`] may exist at a time — a second `open()` would
-/// share that handle and the first `drop()` would tear it down out from
-/// under the other. This flag enforces single-instance ownership.
+// The C shim uses a single global IOKit handle, so only one
+// MacScsiTransport may exist at a time — a second open() would race the
+// shared handle with the first drop(). See docs/scsi-macos.md.
 static OPEN: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
@@ -62,10 +53,9 @@ unsafe extern "C" {
     fn shim_media_present(bsd_name: *const u8) -> i32;
 }
 
-/// Strip the `/dev/` (or raw-device `/dev/r`) prefix off a device path,
-/// yielding the BSD name the shim's IOKit lookups take. Shared by
-/// [`MacScsiTransport::open`] and [`drive_has_disc`] so the two cannot
-/// disagree about what device they are talking about.
+// Strip the /dev/ (or raw-device /dev/r) prefix off a device path,
+// yielding the BSD name the shim's IOKit lookups take. Shared by
+// MacScsiTransport::open and drive_has_disc so they can't disagree.
 fn bsd_name_of(device: &Path) -> Result<&str> {
     let dev_str = device.to_str().ok_or_else(|| Error::DeviceNotFound {
         path: device.display().to_string(),
@@ -76,13 +66,9 @@ fn bsd_name_of(device: &Path) -> Result<&str> {
         .unwrap_or(dev_str))
 }
 
-/// Map a `shim_open_exclusive` failure sentinel (a negative return code, NOT
-/// an `IOReturn`) to the typed [`Error`] variant it represents. Pulled out of
-/// [`MacScsiTransport::open`] as its own callable predicate so the mapping —
-/// otherwise reachable only through a real IOKit FFI call — can be pinned by
-/// a test: collapsing `-4..=-2` or `-5` into the `DeviceNotFound` catch-all
-/// would silently turn "another process holds the drive" into "no such
-/// drive", or "the IOKit plugin chain failed" into the same.
+// Maps a shim_open_exclusive failure sentinel (negative rc, not an
+// IOReturn) to its typed Error variant, pulled out standalone so the
+// mapping can be unit-tested. See docs/scsi-macos.md.
 fn map_shim_open_error(rc: i32, path: String) -> Error {
     match rc {
         // -2/-3/-4: IOCreatePlugInInterfaceForService /
@@ -260,30 +246,9 @@ fn cstr_to_str(bytes: &[u8]) -> &str {
     std::str::from_utf8(&bytes[..end]).unwrap_or("")
 }
 
-/// Media-presence probe, via the IOKit registry only.
-///
-/// [`crate::scsi::drive_has_disc`] is documented as the cheap, side-effect-free
-/// "is there a disc?" question, suitable for a poll-loop tick. The Linux
-/// backend honours that: `open(O_RDWR|O_NONBLOCK)` + one TEST UNIT READY, no
-/// exclusive access, no unmount. The Windows backend likewise opens a shared
-/// handle and issues one TUR.
-///
-/// macOS could not: `MacScsiTransport::open` is the FULL exclusive-transport
-/// path, whose first act is `diskutil unmountDisk force` on the target device.
-/// So the probe documented as side-effect-free force-unmounted the user's disc
-/// — and on every poll tick, taking (and dropping) exclusive access each time.
-///
-/// The registry answers the same question with no side effect at all: the
-/// IOStorageFamily publishes an IOMedia object for a removable device only
-/// while media is present and removes it on eject, so a matching IOMedia is
-/// exactly "a disc is in the drive". No SCSI command is issued, which is why
-/// no timeout parameter is involved.
-///
-/// Trade-off, stated plainly: this reports what the OS has *enumerated*, so a
-/// disc that is inserted but still spinning up (no IOMedia published yet) reads
-/// as absent for the moment the enumeration takes — the same window in which a
-/// TUR would answer "not ready" and this function's contract already maps to
-/// `Ok(false)`.
+// Media-presence probe via the IOKit registry only — no exclusive access,
+// no unmount, no SCSI command (open() force-unmounts the disc; a probe
+// documented as side-effect-free must never do that). See docs/scsi-macos.md.
 pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
     let bsd_name = bsd_name_of(path)?;
     let mut bsd_c = bsd_name.as_bytes().to_vec();
@@ -316,10 +281,9 @@ mod tests {
         assert_eq!(bsd_name_of(Path::new("disk4")).unwrap(), "disk4");
     }
 
-    /// The shim's fixed-width `[u8; N]` fields are C strings: NUL-terminated,
-    /// with trailing bytes undefined/garbage past the terminator. `cstr_to_str`
-    /// must stop at the first NUL, not read the full fixed width, and must
-    /// never panic on a non-UTF-8 tail the shim could hand back.
+    // Shim fixed-width fields are NUL-terminated C strings with garbage
+    // after the terminator; cstr_to_str must stop at the first NUL, not
+    // read the full width, and never panic on a non-UTF-8 tail.
     #[test]
     fn cstr_to_str_stops_at_first_nul() {
         let mut bytes = [0xAAu8; 8]; // 0xAA is not valid UTF-8 on its own
@@ -340,20 +304,9 @@ mod tests {
         assert_eq!(cstr_to_str(&bytes), "");
     }
 
-    /// `drive_has_disc` is documented as a cheap, side-effect-free presence
-    /// probe. It used to be implemented by constructing a FULL exclusive
-    /// transport, whose first act is `diskutil unmountDisk force` on the target
-    /// device followed by an unconditional `usleep(500000)` — so the probe
-    /// force-unmounted the user's disc, on every poll tick.
-    ///
-    /// Two observables separate the registry probe from the transport open,
-    /// neither of which needs an optical drive to be attached:
-    ///
-    /// 1. It ANSWERS. The transport path returned `Err(DeviceNotFound)` here;
-    ///    the registry path reports "no media" as `Ok(false)`.
-    /// 2. It is FAST. The transport path's `usleep(500000)` after the spawn is
-    ///    unconditional, so it could not complete inside this budget even when
-    ///    the spawn itself failed.
+    // Regression test: drive_has_disc used to open a FULL exclusive
+    // transport (force-unmount + 500ms sleep) on every poll tick. Checks
+    // it now answers Ok(false) fast with no lock held. See docs/scsi-macos.md.
     #[test]
     fn presence_probe_does_not_open_a_transport() {
         let path = Path::new("/dev/freemkv-no-such-device");
@@ -376,11 +329,9 @@ mod tests {
         );
     }
 
-    /// Every negative sentinel `shim_open_exclusive` can return must map to
-    /// its own distinct typed error, not collapse into the `DeviceNotFound`
-    /// catch-all. `-2..=-4` (IOKit plugin chain) and `-5` (exclusive access
-    /// held elsewhere) are the two that a deleted match arm would silently
-    /// fold into "no such drive".
+    // Every negative shim_open_exclusive sentinel must map to its own typed
+    // error, not collapse into DeviceNotFound: -2..=-4 (IOKit plugin chain)
+    // and -5 (exclusive access held elsewhere) are the two at risk.
     #[test]
     fn map_shim_open_error_distinguishes_every_sentinel() {
         for rc in [-2, -3, -4] {
@@ -407,10 +358,9 @@ mod tests {
         }
     }
 
-    /// A CDB longer than K_MAX_CDB_SIZE must be rejected with
-    /// `Error::InvalidCdbLength` before the shim is ever called. Exercises the
-    /// real guard `MacScsiTransport::execute` uses, without opening an IOKit
-    /// handle.
+    // A CDB longer than K_MAX_CDB_SIZE must be rejected with
+    // InvalidCdbLength before the shim is called; exercises the real
+    // guard MacScsiTransport::execute uses, without opening an IOKit handle.
     #[test]
     fn oversized_cdb_returns_invalid_cdb_length() {
         // Build a CDB one byte over the limit.

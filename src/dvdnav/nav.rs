@@ -1,22 +1,13 @@
 //! DVD-Video navigation executor — the DVD arm of "mimic a real player" title
-//! selection (issue #40).
+//! selection (issue #40). See docs/nav.md for full rationale and design.
 //!
-//! A player enters a disc at the **First-Play PGC** (FP_PGC): a short program of
-//! VM commands (parsed by [`super::vmcmd`]) that runs before any menu draws and
-//! typically dispatches straight to the feature title. This module reads that
-//! program out of `VIDEO_TS.IFO` (VMGI), executes its pre-command list on a
-//! minimal register machine, and — when the program deterministically reaches a
-//! title dispatch (`JumpTT`) — maps the selected VMG title through the title
-//! search pointer table (`TT_SRPT`) to its `(VTS number, title-in-set)`
-//! coordinates. That is the title a player would land on, so DVD title
-//! selection can prefer it over the structural leading-cell heuristic.
+//! Reads the First-Play PGC pre-command list from `VIDEO_TS.IFO`, executes it
+//! on a minimal register machine, and when it deterministically reaches a
+//! title dispatch (`JumpTT`), maps the VMG title through `TT_SRPT` to
+//! `(VTS number, title-in-set)` coordinates.
 //!
-//! Contract: this is a strict improvement over the fallback. Any parse error,
-//! interactive/menu-only entry, or non-convergence yields `None`, and the caller
-//! keeps today's behaviour. Every table count and offset is attacker-controlled,
-//! so all arithmetic is checked and all reads are bounds-guarded — the entry
-//! point [`resolve_from_vmg`] never panics on any input (exercised by the
-//! never-panic harness).
+//! Contract: any parse error, menu-only entry, or non-convergence yields
+//! `None`; [`resolve_from_vmg`] never panics on any input.
 
 use super::vmcmd::{self, Compare, Instr};
 use crate::consts::SECTOR_BYTES;
@@ -80,10 +71,9 @@ fn u32_at(b: &[u8], o: usize) -> Option<u32> {
     ]))
 }
 
-/// A register operand index names a system parameter (SPRM) when it carries the
-/// `0x80` bias — matching [`Vm::reg`]'s split of GPRM (`< 128`) vs SPRM
-/// (`>= 128`). Only SPRM reads are session-specific and therefore taint a
-/// compare; GPRM reads do not.
+// Register operand index >= 0x80 (128) names a system parameter (SPRM),
+// matching [`Vm::reg`]'s GPRM/SPRM split. Only SPRM reads are session-specific
+// and therefore taint a compare; GPRM reads do not.
 #[inline]
 fn is_sprm(idx: u8) -> bool {
     idx >= 128
@@ -91,23 +81,12 @@ fn is_sprm(idx: u8) -> bool {
 
 // ── Minimal navigation register machine ──────────────────────────────────────
 
-/// The subset of the DVD-Video VM register file the First-Play resolver needs:
-/// 16 general parameters (GPRMs) and the system parameters (SPRMs). Execution
-/// starts from a cold machine (all zero) — the same starting point a player has
-/// before any user interaction. The SPRMs a First-Play routine might branch on
-/// (region, parental level, language) are player-/session-specific and unknown
-/// at scan time; leaving them zero means the resolver only commits to a title
-/// when the program reaches one *without* depending on them (an unconditional
-/// dispatch, or a conditional whose zero-register path a player also takes).
-/// When a branch genuinely depends on an unknown SPRM the routine is treated as
-/// undecidable and the caller falls back — see the module contract.
+// Minimal VM register file (GPRMs + SPRMs) for the First-Play resolver, cold
+// (all-zero) at start. See docs/nav.md — "The Vm register machine".
 struct Vm {
     gprm: [u16; 16],
     sprm: [u16; 24],
-    /// Per-GPRM taint: set when the register holds a value derived from a system
-    /// parameter (SPRM). An SPRM read taints a compare directly ([`is_sprm`]);
-    /// this bit tracks an SPRM *laundered through* a GPRM store so a later
-    /// GPRM-only compare that reads it is still recognised as undecidable.
+    // Per-GPRM taint: set when SPRM-derived. See docs/nav.md.
     gprm_tainted: [bool; 16],
 }
 
@@ -149,15 +128,9 @@ impl Vm {
         }
     }
 
-    /// Evaluate a compare predicate (op codes per [`Compare`]). Returns the
-    /// predicate result together with a *taint* flag that is set when either
-    /// operand read a system parameter (SPRM). An SPRM's value is
-    /// player-/session-specific (region, parental level, language) and unknown
-    /// at scan time, so a branch decision that depends on one is undecidable —
-    /// the caller abstains rather than commit to the cold-power-on arm. A GPRM
-    /// read taints only when that register was itself loaded from an SPRM
-    /// (tracked by [`Vm::gprm_tainted`]); a GPRM holding a program-established
-    /// value does not taint.
+    // Evaluate a compare predicate (op codes per [`Compare`]); returns (result,
+    // taint). Taint marks an SPRM-dependent (undecidable) branch. See
+    // docs/nav.md — "Vm::eval — compare taint".
     fn eval(&self, c: &Compare) -> (bool, bool) {
         let mut tainted = self.reg_tainted(c.lhs_reg);
         let l = self.reg(c.lhs_reg);
@@ -271,11 +244,8 @@ fn tt_srpt_titles(vmg: &[u8]) -> Option<Vec<(u8, u8)>> {
 
 // ── First-Play executor ──────────────────────────────────────────────────────
 
-/// Execute the First-Play pre-command list and return the VMG title number it
-/// dispatches to, if it reaches one deterministically. Returns `None` for a
-/// program that ends in a menu/sub-domain, links within the menu domain, exits,
-/// or does not converge inside the step budget — every case the caller falls
-/// back on.
+// Execute the First-Play pre-command list; returns the VMG title number
+// reached deterministically, or None (menu/exit/non-convergence) to fall back.
 fn run_first_play(cmds: &[[u8; 8]]) -> Option<u8> {
     let mut vm = Vm::new();
     let mut pc = 0usize;
@@ -426,14 +396,8 @@ mod tests {
 
     // ── Fixture builders ────────────────────────────────────────────────────
 
-    /// Assemble a VMGI (`VIDEO_TS.IFO`) image with a First-Play PGC whose
-    /// pre-command list is `pre`, and a TT_SRPT at sector `tt_srpt_sector`
-    /// mapping each title to `(vtsn, vts_ttn)`.
-    ///
-    /// Layout: the fixed VMGI header (magic + the FP_PGC and TT_SRPT pointers),
-    /// then the FP_PGC (with a command table holding `pre`), then the TT_SRPT at
-    /// its sector. Kept minimal but spec-shaped so the same code path a real
-    /// disc takes is exercised.
+    // Assemble a spec-shaped VMGI image (FP_PGC + TT_SRPT). See docs/nav.md —
+    // "Test fixture: build_vmgi".
     fn build_vmgi(pre: &[[u8; 8]], tt_srpt_sector: u32, titles: &[(u8, u8)]) -> Vec<u8> {
         // Place the FP_PGC at a fixed byte offset past the header.
         let fp_pgc_off: u32 = 0x400;
@@ -569,11 +533,8 @@ mod tests {
         assert_eq!(resolve_from_vmg(&vmgi), None);
     }
 
-    /// A dispatch gated on a system parameter (SPRM) is undecidable at scan
-    /// time — the resolver must abstain rather than commit to the cold-power-on
-    /// arm. Here `if SPRM0 == g0 -> JumpTT 1` is *true* on the cold machine
-    /// (both read 0), so without SPRM taint-tracking the resolver would wrongly
-    /// return title 1; with it, the SPRM read taints the branch and it abstains.
+    // SPRM-gated dispatch is undecidable at scan time and must abstain. See
+    // docs/nav.md — "Regression test rationale".
     #[test]
     fn sprm_gated_dispatch_abstains() {
         // 30 22: jump with EQ compare (op=2); if_v2 operands are registers
@@ -600,12 +561,9 @@ mod tests {
         );
     }
 
-    /// Defect-1 regression (over-abstention): a store guarded by an SPRM-tainted
-    /// compare does NOT gate a control transfer, so it must not abstain. Here
-    /// `if SPRM0 == g0 -> g0 = 5` (a guarded store) is followed by an
-    /// UNCONDITIONAL `JumpTT 1`. The tainted predicate only decides whether the
-    /// store runs; the dispatch that follows is SPRM-independent, so the resolver
-    /// must resolve to title 1.
+    // Defect-1 regression: a store guarded by taint must not abstain the
+    // unconditional dispatch that follows. See docs/nav.md — "Regression
+    // test rationale".
     #[test]
     fn sprm_guarded_store_then_unconditional_dispatch_resolves() {
         // line 0: 71 20 | lhs=b2=0x80 (SPRM0), cmp EQ(op=2, register), rhs=b7=0
@@ -626,11 +584,8 @@ mod tests {
         );
     }
 
-    /// Defect-2 regression (under-abstention): an SPRM laundered through a GPRM
-    /// must still taint a later branch. `SetGPRM g0 = SPRM20` (register source,
-    /// index >= 128) followed by `if g0 == g1 -> JumpTT 1` — the compare reads
-    /// only GPRMs, but g0 now holds an SPRM-derived value, so the decision is
-    /// undecidable and the resolver must abstain.
+    // Defect-2 regression: an SPRM laundered through a GPRM must still taint a
+    // later GPRM-only branch. See docs/nav.md — "Regression test rationale".
     #[test]
     fn sprm_laundered_through_gprm_abstains() {
         // line 0: 61 00 | SetGPRM g0 = SPRM20 (mov, register src=b5=0x94).
@@ -737,10 +692,9 @@ mod tests {
         }
     }
 
-    /// A TT_SRPT pointer that would overflow when scaled to a byte offset must
-    /// be rejected, not wrap. Build a normal fixture, then overwrite just the
-    /// TT_SRPT sector pointer with the extreme value (building a real table at
-    /// that sector would allocate terabytes in the fixture, not the resolver).
+    // A TT_SRPT pointer that would overflow when scaled to a byte offset must
+    // be rejected, not wrap (a real table at that sector would allocate
+    // terabytes in the fixture, not the resolver).
     #[test]
     fn overflowing_tt_srpt_sector_abstains() {
         let mut vmgi = build_vmgi(&[h("3002000000010000")], 1, &[(2, 1)]);

@@ -1,37 +1,13 @@
 //! Integration tests for the SCSI error-decoding contract.
 //!
-//! v0.13.20 rewrote `scsi/linux.rs` to a synchronous blocking SG_IO and
-//! consolidated sense parsing into the `parse_sense` helper that every
-//! platform backend now shares. v0.13.23 replaced the `Error::ScsiError`
-//! flat-fields shape with `{ opcode, status, sense: Option<ScsiSense> }`
-//! so callers can route on structured sense data (key + ASC + ASCQ) via
-//! [`Error::scsi_sense`] / [`Error::is_marginal_read`] /
-//! [`ScsiSense::is_*`].
+//! Pins the contract every backend must satisfy via a mock `ScsiTransport`:
+//! healthy result → `Ok(ScsiResult { .. })`; transport-level failure →
+//! `Error::ScsiError { status: SCSI_STATUS_TRANSPORT_FAILURE, sense: None }`
+//! ([`Error::is_scsi_transport_failure`] true); SCSI-level failure (CHECK
+//! CONDITION) → `Error::ScsiError` with parsed key/ASC/ASCQ, checked via
+//! [`Error::is_marginal_read`] / [`ScsiSense::is_*`].
 //!
-//! The actual `ioctl(SG_IO, ...)` call is impossible to mock without a
-//! kernel, so libc shims are deliberately avoided here. These tests
-//! therefore pin the *contract* every backend must satisfy via a mock
-//! `ScsiTransport`:
-//!
-//!   1. Healthy result → `Ok(ScsiResult { bytes_transferred = data.len() - resid })`.
-//!   2. Transport-level failure (no SCSI status delivered: kernel
-//!      timeout, USB bridge wedge, IOKit service error) →
-//!      `Error::ScsiError { status: SCSI_STATUS_TRANSPORT_FAILURE, sense: None }`.
-//!      `Error::is_scsi_transport_failure()` returns `true`. Used by
-//!      `drive_has_disc` to detect the wedge signature.
-//!   3. SCSI-level failure (drive replied CHECK CONDITION with sense) →
-//!      `Error::ScsiError { status: 0x02, sense: Some(ScsiSense {…}) }`
-//!      with the parsed key/ASC/ASCQ.
-//!   4. `Error::is_marginal_read()` is `true` for MEDIUM ERROR /
-//!      ABORTED COMMAND / RECOVERED ERROR / NO SENSE; `false` for
-//!      HARDWARE / DATA PROTECT / UNIT ATTENTION / NOT READY / ILLEGAL
-//!      REQUEST and for transport failures.
-//!
-//! Inline `parse_sense_tests` in `src/scsi/mod.rs` cover the pure parse
-//! logic (descriptor 0x72/0x73 vs fixed 0x70/0x71, short-buffer, VALID
-//! bit masking, unknown response codes, ASC/ASCQ offsets); this file
-//! covers the consumer side — a real transport feeding a real Error
-//! variant to a real call site (`scsi::inquiry`).
+//! See docs/scsi-error-decoding.md for rationale and history.
 
 use libfreemkv::error::Error;
 use libfreemkv::scsi::{
@@ -41,13 +17,9 @@ use libfreemkv::scsi::{
     SENSE_KEY_RECOVERED_ERROR, SENSE_KEY_UNIT_ATTENTION, ScsiResult, ScsiSense, ScsiTransport,
 };
 
-/// A scripted ScsiTransport. Each `execute()` consumes the next entry
-/// from `script` and returns the corresponding outcome.
-///
-/// Outcomes mirror what each backend's `execute()` should produce after
-/// the v0.13.23 sense plumbing: `Option<ScsiSense>` carrying the full
-/// SPC-4 triple for drive-reported failures, `None` for transport-level
-/// failures.
+// A scripted ScsiTransport. Each `execute()` consumes the next entry
+// from `script` and returns the corresponding outcome.
+// See docs/scsi-error-decoding.md — MockTransport outcomes.
 struct MockTransport {
     script: Vec<MockOutcome>,
     next: usize,

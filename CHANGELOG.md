@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.15] — unreleased
+
+### Security
+
+- Fixed a soundness bug (GHSA-j8ww-f5fg-9pmh, low severity): `PrefetchedSectorSource::into_channels` handed out a `Sender<Vec<u8>>` recycle channel whose buffers the producer re-exposed with `unsafe { Vec::set_len }` guarded only by capacity, so a downstream caller recycling a `Vec::with_capacity(n)` (len 0) could drive `set_len` over uninitialized memory — undefined behaviour reachable from safe code. The producer now uses `Vec::resize`, removing the `unsafe`; buffer pooling (the real cross-thread alloc/free win) is unchanged. No in-tree caller triggered it.
+
 ## [1.6.14] — 2026-08-31
 
 ### Changed

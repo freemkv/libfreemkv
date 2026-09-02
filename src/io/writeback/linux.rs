@@ -1,55 +1,13 @@
 //! Linux writeback pipeline using `sync_file_range` + `posix_fadvise`.
 //!
-//! Pathology this fixes: the kernel's default `vm.dirty_ratio` (~20 %
-//! of RAM) lets dirty pages accumulate to hundreds of MB during a
-//! big sequential write, then bursts a flush at 99 % disk utilisation.
-//! While the burst runs, app writes block on the writeback queue —
-//! observed empirically as instantaneous speed dropping from ~15 MB/s
-//! to ~1 MB/s every ~30 s during a Pass 1 sweep.
+//! Bounds dirty page cache during large sequential writes: every
+//! `chunk_bytes`, kicks async writeback on the just-completed chunk and
+//! finalises the previous one via `WAIT_AFTER` + `posix_fadvise(DONTNEED)`.
+//! Chunk size adapts to storage speed from a rolling p95 of `WAIT_AFTER`
+//! latency, bounded to [4 MiB, 256 MiB]. NFS mounts, and any local storage
+//! that times out inside `WAIT_AFTER` (30s), skip the wait+dontneed step.
 //!
-//! Strategy: every `chunk_bytes` of new sequential output, kick async
-//! writeback (`SYNC_FILE_RANGE_WRITE`) on the just-completed chunk and
-//! finalise the *previous* chunk via `WAIT_AFTER` + `posix_fadvise
-//! (DONTNEED)`. By the time we finalise, that previous chunk has had
-//! a full chunk's worth of work to flush — the wait is near-instant.
-//! Dirty cache stays bounded at ~2 × `chunk_bytes` and writes drain
-//! continuously instead of in bursts.
-//!
-//! The chunk size is adaptive: we measure the elapsed time of the
-//! `WAIT_AFTER` call over a rolling window of the last 16 chunks and
-//! resize the chunk based on the p95. Slow storage (NFS, network
-//! shares, HDD) sees larger chunks to amortise per-chunk overhead;
-//! fast storage (NVMe) sees smaller chunks to keep cache pressure
-//! tight. Bounds: [4 MiB, 256 MiB].
-//!
-//! ## NFS escape hatch
-//!
-//! `sync_file_range(WAIT_AFTER)` on an NFS-mounted file can block
-//! indefinitely waiting for the server's commit ack. If the server
-//! never acks (network partition, server-side hang, slow commit), the
-//! syscall never returns and the consumer thread is stuck inside the
-//! kernel — `/api/stop` can't reach it because halt is cooperative.
-//!
-//! When `fstatfs` reports the file lives on an NFS mount
-//! (`f_type == NFS_SUPER_MAGIC`), the pipeline skips the WAIT_AFTER +
-//! `posix_fadvise(DONTNEED)` dance entirely. NFS clients have their
-//! own buffering and commit semantics that handle dirty-page bounds
-//! without us forcing the issue. The async `SYNC_FILE_RANGE_WRITE`
-//! kickoff still runs (non-blocking by spec) so writeback still gets
-//! a nudge.
-//!
-//! ## Defence in depth: WAIT_AFTER timeout
-//!
-//! Even on local storage, a degraded disk or odd filesystem driver
-//! could in principle wedge inside WAIT_AFTER. Each WAIT_AFTER call
-//! runs on a worker thread with a 30s recv_timeout on its result
-//! channel. On timeout we log a loud error, set a `degraded` flag,
-//! and from then on skip WAIT_AFTER + DONTNEED for the rest of the
-//! pipeline's life (same shape as the NFS path). The worker thread
-//! is intentionally leaked — it unwinds whenever the syscall
-//! eventually returns or the process exits. The mux continues; the
-//! original dirty-burst pathology re-emerges but the rip can still
-//! finish instead of freezing.
+//! See docs/writeback-linux.md for rationale, NFS handling, and timeout details.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -110,10 +68,8 @@ pub(crate) struct WritebackPipeline {
 }
 
 impl WritebackPipeline {
-    /// Construct a pipeline aliasing `file`'s file descriptor. The
-    /// returned `WritebackPipeline` MUST be dropped before `file`
-    /// itself, or kept inside the same struct that owns `file` — the
-    /// alias is unchecked.
+    // Aliases `file`'s fd; MUST be dropped before `file` itself, or kept
+    // inside the same struct that owns `file` — the alias is unchecked.
     pub(crate) fn new(file: &File, start_pos: u64, chunk_bytes: u64) -> Self {
         let fd = file.as_raw_fd();
         let is_nfs = detect_nfs(fd);
@@ -156,17 +112,9 @@ impl WritebackPipeline {
         self.is_nfs || self.degraded.load(Ordering::Relaxed)
     }
 
-    /// Produce a fresh per-call `File` clone for the WAIT_AFTER worker.
-    ///
-    /// Each call to `wait_after_with_timeout` needs its own owned clone
-    /// so the worker thread keeps the file description alive for the
-    /// duration of the syscall. We clone from `self.wait_file` (itself a
-    /// clone taken at construction) rather than from the original file.
-    ///
-    /// Returns `None` only if `wait_file` is `None` (construction
-    /// try_clone failed) or if the second-level try_clone fails — both
-    /// rare; the fallback raw-fd path in `wait_after_with_timeout`
-    /// handles that case.
+    // Fresh per-call `File` clone for the WAIT_AFTER worker so the worker
+    // thread keeps the file description alive for the syscall's duration.
+    // `None` only if `wait_file` is `None` or the clone itself fails.
     #[inline]
     fn clone_for_worker(&self) -> Option<File> {
         self.wait_file.as_ref().and_then(|f| f.try_clone().ok())
@@ -357,17 +305,9 @@ impl WritebackPipeline {
     }
 }
 
-/// Probe whether `fd` lives on an NFS mount. Thin wrapper around
-/// [`crate::platform::fs_type::detect_fd`] so writeback policy and
-/// general-purpose fs-type classification stay in sync (same magic
-/// numbers, same musl-vs-glibc cast handling).
-///
-/// Fails open: any classification other than NFS counts as "not NFS"
-/// (including `Unknown` on `fstatfs` error) — better to run the
-/// normal local-storage path on a misdetected NFS mount and surface
-/// the freeze loudly via [`WAIT_AFTER_TIMEOUT`] than to needlessly
-/// disable writeback bounding on every local file because of a
-/// transient stat error.
+// Probe whether `fd` lives on an NFS mount via `crate::platform::fs_type::detect_fd`.
+// Fails open: any non-NFS classification (incl. `Unknown` on `fstatfs` error) runs the
+// normal local path — WAIT_AFTER_TIMEOUT surfaces a misdetected freeze instead of us.
 fn detect_nfs(fd: RawFd) -> bool {
     matches!(
         crate::platform::fs_type::detect_fd(fd),
@@ -375,30 +315,9 @@ fn detect_nfs(fd: RawFd) -> bool {
     )
 }
 
-/// Run `sync_file_range(WAIT_AFTER)` on a worker thread and wait up
-/// to [`WAIT_AFTER_TIMEOUT`] for it to return. `Some(elapsed_ms)` on
-/// success; `None` on timeout. On timeout the worker thread is
-/// intentionally leaked — it unwinds whenever the syscall eventually
-/// returns or the process exits.
-///
-/// This delegates to [`crate::io::bounded::bounded_syscall`], the
-/// generic worker-thread + `recv_timeout` primitive, and just adapts it
-/// to the WAIT_AFTER call shape: it returns `elapsed_ms` instead of the
-/// syscall's `()`, and treats `WorkerLost` as a benign no-op to match
-/// the original semantics.
-///
-/// ## fd lifetime / fd-reuse safety
-///
-/// `worker_file` is an *owned* `File` (produced by `File::try_clone` at
-/// pipeline construction). It is moved into the worker closure so the
-/// file description stays alive for exactly as long as the worker thread
-/// lives — even if the original `WritebackFile` is closed and the OS
-/// reuses its fd number before the worker's syscall returns.
-///
-/// `fallback_fd` is used only when `worker_file` is `None` (i.e. the
-/// `try_clone` at construction failed). In that case the worker captures
-/// the raw fd integer, which carries the original fd-reuse risk but is
-/// no worse than the pre-fix behaviour.
+// Runs `sync_file_range(WAIT_AFTER)` on a worker thread, waiting up to
+// WAIT_AFTER_TIMEOUT; `Some(elapsed_ms)` on success, `None` on timeout
+// (worker leaked). See docs/writeback-linux.md — fd lifetime / fd-reuse safety.
 fn wait_after_with_timeout(
     worker_file: Option<File>,
     fallback_fd: RawFd,
@@ -444,10 +363,9 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    /// Helper: build a `WritebackPipeline` over a local tempfile. On
-    /// every test rig (linux dev box, CI) the tempfile lives on a
-    /// local FS, so `is_nfs=false` and `skip_wait` returns false until
-    /// we explicitly mark the pipeline degraded.
+    // Helper: build a `WritebackPipeline` over a local tempfile (always
+    // non-NFS on test rigs), so `is_nfs=false` and `skip_wait` is false
+    // until the pipeline is explicitly marked degraded.
     fn local_pipeline(chunk_bytes: u64) -> (NamedTempFile, WritebackPipeline) {
         let f = NamedTempFile::new().expect("tempfile create");
         let pipeline = WritebackPipeline::new(f.as_file(), 0, chunk_bytes);
@@ -554,19 +472,8 @@ mod tests {
 
     // ── Bug-fix regression tests ────────────────────────────────────────
 
-    /// Regression for the fd-reuse / use-after-close fix. Verifies that
-    /// `WritebackPipeline::new` successfully clones the fd into
-    /// `wait_file` (i.e. `try_clone` doesn't fail for a normal
-    /// tempfile) and that `clone_for_worker` returns `Some` — meaning
-    /// the WAIT_AFTER worker will capture an owned `File` rather than a
-    /// raw fd integer.
-    ///
-    /// A deterministic test for the actual fd-reuse race is not clean to
-    /// write (it would require simultaneously closing the original File
-    /// and re-opening a new one to steal the fd number while the worker
-    /// is mid-syscall, which is inherently racy). This test instead pins
-    /// the structural invariant: on a normal local file, the pipeline
-    /// holds a valid clone and will give the worker an owned File.
+    // Regression for the fd-reuse fix: `new` clones the fd into `wait_file`,
+    // so `clone_for_worker` gives the worker an owned `File`, not a raw fd.
     #[test]
     fn wait_file_clone_is_present_for_local_tempfile() {
         let (_f, p) = local_pipeline(32 * 1024 * 1024);
@@ -583,14 +490,9 @@ mod tests {
         );
     }
 
-    /// Structural: the worker `File` clone returned by `clone_for_worker`
-    /// is a distinct file descriptor (different fd number) that refers to
-    /// the same underlying file. Closing the original tempfile must not
-    /// affect the clone's validity — the OS keeps the file description
-    /// alive until all file descriptors referring to it are closed.
-    ///
-    /// We verify "distinct fd number" and "still usable as a raw fd"
-    /// without actually racing a syscall.
+    // Structural: `clone_for_worker`'s `File` has a distinct fd number but
+    // refers to the same underlying file, which stays open via the OS's
+    // file-description refcount even after the original tempfile closes.
     #[test]
     fn worker_clone_has_distinct_fd_from_original() {
         let f = NamedTempFile::new().expect("tempfile create");

@@ -1,41 +1,13 @@
 //! Key source abstraction for the AACS resolve chain.
 //!
-//! libfreemkv keeps all crypto (AES-G primitives, SD-tree walking,
-//! validation, MK/VUK/TK derivation) but accepts key material from
-//! arbitrary backends via [`KeyProvider`].
+//! libfreemkv owns all AACS crypto; backends supply raw key material via
+//! [`KeyProvider`]. Bulk methods (device/processing/media keys) are unioned
+//! and deduped across providers, trying each; disc-keyed lookups
+//! (`lookup_disc_by_hash`/`_by_vid`) short-circuit on the first hit, queried
+//! in provider-array order.
 //!
-//! Methods come in two flavors:
-//!
-//! - **Bulk material** ([`device_keys`], [`processing_keys`],
-//!   [`media_keys`]) — the resolver unions (and dedups) results
-//!   across all providers and tries each candidate.
-//! - **Disc-keyed lookup** ([`lookup_disc_by_hash`],
-//!   [`lookup_disc_by_vid`]) — the resolver short-circuits on the
-//!   first hit, so providers are queried in array order with
-//!   fastest/closest first.
-//!
-//! [`host_certs`] is a sixth method but is NOT consumed by the
-//! resolver chain: the SCSI handshake reads host certs directly from
-//! the caller-supplied credentials, not from the provider array. A
-//! provider that overrides `host_certs` today has no effect on the
-//! handshake; the method is retained as a forward-looking extension
-//! point only.
-//!
-//! Default impls return empty / `None` so backends only override
-//! the methods they actually support — an external key service might
-//! implement only `lookup_disc_by_hash`, while a local file might
-//! implement all six.
-//!
-//! Calls may block (disk I/O, network round-trips). The resolver
-//! invokes each method at most a handful of times per scan; for
-//! per-disc memoization, implementations should cache internally.
-//!
-//! [`device_keys`]: KeyProvider::device_keys
-//! [`processing_keys`]: KeyProvider::processing_keys
-//! [`media_keys`]: KeyProvider::media_keys
-//! [`host_certs`]: KeyProvider::host_certs
-//! [`lookup_disc_by_hash`]: KeyProvider::lookup_disc_by_hash
-//! [`lookup_disc_by_vid`]: KeyProvider::lookup_disc_by_vid
+//! Default impls return empty/`None`; calls may block, so cache per-disc.
+//! See docs/key-provider.md for rationale and `host_certs`'s caveat.
 
 use super::types::{DeviceKey, DiscEntry, HostCert};
 
@@ -89,12 +61,9 @@ pub trait KeyProvider: Send + Sync {
     }
 }
 
-/// Resolver-side helpers that aggregate across a provider array.
-///
-/// The resolver wraps `ctx.providers` (`&[&dyn KeyProvider]`) in this
-/// struct; these helpers apply the union-vs-short-circuit policy per
-/// method. The bulk unions dedup so overlapping providers don't make
-/// the resolver re-walk/re-validate identical material.
+// Resolver-side helper that aggregates KeyProvider material across a
+// provider array (union-and-dedup for bulk methods, first-hit for
+// disc-keyed lookups). See docs/key-provider.md for the policy detail.
 pub(crate) struct Providers<'a>(pub &'a [&'a dyn KeyProvider]);
 
 impl Providers<'_> {
@@ -143,20 +112,9 @@ impl Providers<'_> {
     }
 }
 
-/// A [`KeyProvider`] backed by a single caller-supplied key's raw material —
-/// the bridge for [`crate::disc::Disc::decrypt_with`].
-///
-/// The application's key source did the lookup and handed in material at one
-/// level (DK / PK / MK / VUK). This exposes exactly that material to the
-/// version-dispatched resolver, which owns ALL derivation — so a source never
-/// derives, and the lib remains the single home for the AACS chain across
-/// 1.0 / 2.0 / 2.1 / 2.x.
-///
-/// Each level fills only its own field; the rest stay empty, so the resolver
-/// naturally runs the matching path (DK→…, PK→…, MK-pool brute, or a
-/// disc-keyed VUK hit). `decrypt_with` already knows the disc, so the
-/// `lookup_disc_by_*` hash/VID arguments are irrelevant — a present
-/// `disc_entry` is returned for any query.
+// Bridges a single caller-supplied key's raw material into a KeyProvider,
+// for `Disc::decrypt_with`. Fills only its own level (DK/PK/MK/VUK) so the
+// resolver runs the matching path; see docs/key-provider.md for details.
 pub(crate) struct SuppliedKey {
     pub device_keys: Vec<DeviceKey>,
     pub processing_keys: Vec<[u8; 16]>,
@@ -368,15 +326,9 @@ mod tests {
         assert_eq!(got.disc_hash, "vid-a");
     }
 
-    /// `Providers::host_certs` is the union across the provider array. It is not
-    /// wired into the handshake today (see the module docs), so nothing else in
-    /// the crate would notice a body that dropped every cert on the floor — and
-    /// the day it IS wired in, a silently-empty cert list means the drive AACS
-    /// authentication finds no host certificate to present and every disc fails
-    /// to open, with no indication that the caller's certs were discarded.
-    ///
-    /// Unlike the bulk key unions this one does NOT dedup (HostCert is not
-    /// Ord/Hash), so the assertion is on the full concatenation in array order.
+    // `host_certs` unions across the provider array, unwired into the
+    // handshake today (see docs/key-provider.md); asserts full concatenation
+    // in array order since HostCert has no Ord/Hash to dedup.
     #[test]
     fn providers_host_certs_unions_every_providers_certs_in_array_order() {
         struct Certs(Vec<HostCert>);

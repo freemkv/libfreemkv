@@ -26,19 +26,14 @@ pub trait SectorSource: Send {
 
     /// Read `count` sectors starting at `lba` into `buf`.
     /// `buf` must be at least `count * 2048` bytes.
-    /// `recovery`: true = full retry/reset loop (ripping),
-    /// false = single attempt (verify). File-backed sources ignore
-    /// the flag.
+    /// `recovery`: true = full retry/reset loop (ripping), false = single
+    /// attempt (verify). File-backed sources ignore the flag.
     ///
     /// Returns the number of bytes written into `buf` on success.
     ///
     /// # Panics
     ///
-    /// Implementations may panic if `buf.len() < count * 2048`. This
-    /// is a caller contract enforced via `debug_assert!` in the
-    /// primary impl ([`FileSectorSource`]); in release builds an
-    /// undersized buffer panics on the slice. Callers must size `buf`
-    /// to at least `count * 2048` bytes.
+    /// Implementations may panic if `buf` is undersized.
     fn read_sectors(
         &mut self,
         lba: u32,
@@ -46,19 +41,17 @@ pub trait SectorSource: Send {
         buf: &mut [u8],
         recovery: bool,
     ) -> Result<usize>;
+    // Enforced via `debug_assert!` in the primary impl (`FileSectorSource`);
+    // release builds panic on the out-of-bounds slice instead.
 
     /// Like [`read_sectors`], but with an explicit Force Unit Access request.
     ///
-    /// `fua = true` asks the drive to bypass its readahead cache and physically
-    /// re-fetch the medium — a Pass-N marginal-sector lever: a cached hit can
-    /// mask a *stochastic* sector that would land differently off the platter on
-    /// each physical read, so FuaRetry re-reads it FUA. It is never blanket-
-    /// applied to the bulk path (forcing every sequential read past the cache
-    /// collapses streaming throughput ~10×).
+    /// `fua = true` asks the drive to bypass its readahead cache and
+    /// physically re-fetch the medium.
     ///
-    /// The default ignores `fua` and delegates to [`read_sectors`]: only a live
-    /// [`Drive`] sets the CDB bit; file- / memory-backed sources have no drive
-    /// cache to bypass, so FUA is meaningless to them.
+    /// The default ignores `fua` and delegates to [`read_sectors`]: only a
+    /// live [`Drive`] sets the CDB bit; file-backed sources have no drive
+    /// cache to bypass.
     ///
     /// [`read_sectors`]: SectorSource::read_sectors
     /// [`Drive`]: crate::drive::Drive
@@ -70,6 +63,8 @@ pub trait SectorSource: Send {
         recovery: bool,
         fua: bool,
     ) -> Result<usize> {
+        // See docs/sector.md — Pass-N marginal-sector FUA rationale and the
+        // ~10x throughput cost of applying it to the bulk path.
         let _ = fua;
         self.read_sectors(lba, count, buf, recovery)
     }
@@ -172,10 +167,9 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    /// A fully-instrumented SectorSource: records every read's
-    /// (lba, count, recovery), reports a known capacity, and records
-    /// set_speed calls. Lets the forwarding-impl tests prove each
-    /// trait method is delegated, not stubbed.
+    // Instrumented SectorSource: records reads, capacity, and set_speed
+    // calls so the forwarding-impl tests can prove each trait method is
+    // delegated, not stubbed.
     struct Spy {
         capacity: u32,
         reads: Arc<Mutex<Vec<(u32, u16, bool)>>>,
@@ -235,10 +229,8 @@ mod tests {
         }
     }
 
-    /// Call `set_unit_base` through a generic `S: SectorSource` bound so the
-    /// `Box<dyn SectorSource>` / `&mut dyn SectorSource` FORWARDING impls are the
-    /// ones invoked (the generic monomorphizes to each forwarding body — the same
-    /// body a direct call on those receiver types also resolves to).
+    // Routes through a generic `S: SectorSource` bound so the forwarding
+    // impls (not the vtable) are exercised. See docs/sector.md.
     fn set_unit_base_generic<S: SectorSource>(mut s: S, base: u32) {
         s.set_unit_base(base);
     }
@@ -282,11 +274,9 @@ mod tests {
         m.set_speed(12345); // must not panic
     }
 
-    /// `Box<dyn SectorSource>` must forward ALL three trait methods to
-    /// the inner source (capacity, read_sectors args + return, speed) —
-    /// the blanket impl exists so boxed sources satisfy generic
-    /// decorator bounds. Grounding: `impl SectorSource for
-    /// Box<dyn SectorSource>` forwarding bodies.
+    // `Box<dyn SectorSource>` must forward capacity, read_sectors, and
+    // set_speed to the inner source, so boxed sources satisfy generic
+    // decorator bounds.
     #[test]
     fn boxed_dyn_forwards_all_methods() {
         let (spy, reads, speeds, unit_bases) = Spy::new(777);
@@ -354,11 +344,9 @@ mod tests {
         );
     }
 
-    /// Records every read that reaches it, including whether it arrived on the
-    /// FUA path and with which `fua` bit — `Spy` above leaves `read_sectors_fua`
-    /// to the trait default, so it cannot tell the two entry points apart.
-    /// One recorded read: `(lba, count, recovery, fua)`, where `fua` is `None`
-    /// when the plain `read_sectors` entry point was the one reached.
+    // Records every read, incl. whether it arrived via the FUA entry point
+    // (`Spy` leaves `read_sectors_fua` to the trait default, so it can't
+    // tell). `fua` is `None` when the plain `read_sectors` path was hit.
     type ReadLog = Arc<Mutex<Vec<(u32, u16, bool, Option<bool>)>>>;
 
     #[derive(Default)]
@@ -401,10 +389,8 @@ mod tests {
         }
     }
 
-    /// Read through a generic `S: SectorSource` bound so the FORWARDING impl is
-    /// what runs. A direct `r.read_sectors(..)` on a `&mut dyn SectorSource`
-    /// receiver auto-derefs to the vtable and never touches the forwarding body,
-    /// which is exactly why `set_unit_base` needed `set_unit_base_generic` too.
+    // Routes through a generic `S: SectorSource` bound so the forwarding
+    // impl (not the vtable) runs. See docs/sector.md.
     fn read_generic<S: SectorSource>(
         mut s: S,
         lba: u32,
@@ -434,16 +420,9 @@ mod tests {
         s.read_sectors_fua(lba, count, buf, recovery, fua)
     }
 
-    /// The `&mut dyn SectorSource` forwarding impl must actually DELEGATE
-    /// `read_sectors` — pass the args through unchanged, return the inner
-    /// source's byte count, and leave the inner source's bytes in the caller's
-    /// buffer. A body that returned a bare `Ok(n)` without calling the inner
-    /// source would be a delegating reader that reads NOTHING and reports
-    /// success: the caller sees `Ok` and consumes an untouched buffer.
-    ///
-    /// `mut_ref_dyn_forwards_all_methods` above does not cover this: its
-    /// `r.read_sectors(..)` call on a `&mut dyn` receiver dispatches through the
-    /// vtable to `Spy`, not through the forwarding impl.
+    // Proves the forwarding impl actually delegates `read_sectors`, unlike
+    // `mut_ref_dyn_forwards_all_methods` (vtable dispatch). See
+    // docs/sector.md.
     #[test]
     fn mut_ref_dyn_forwards_read_sectors_to_the_inner_source() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -474,12 +453,9 @@ mod tests {
         );
     }
 
-    /// The same for `read_sectors_fua`: the forwarding impl must reach the inner
-    /// source's FUA entry point (not silently downgrade to the plain read, and
-    /// not fabricate a count), carrying the `fua` bit through. FUA is the
-    /// Pass-N lever that re-fetches a stochastic sector past the drive cache
-    /// (MMC-6 READ(10) FUA bit); a forwarder that dropped it would make every
-    /// FUA retry re-read the same cached bytes and "confirm" the bad sector.
+    // Same, for `read_sectors_fua`: the forwarder must reach the inner
+    // source's FUA entry point, carrying the `fua` bit through. See
+    // docs/sector.md.
     #[test]
     fn mut_ref_dyn_forwards_read_sectors_fua_to_the_inner_source() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -504,16 +480,9 @@ mod tests {
         );
     }
 
-    /// The `&mut dyn SectorSource` forwarding impl must delegate `set_speed`.
-    ///
-    /// This one hides better than the read methods, because the trait's own
-    /// default body is `fn set_speed(&mut self, _kbs: u16) {}` — so a forwarding
-    /// impl that dropped the call on the floor compiles, type-checks, and looks
-    /// exactly like a source that legitimately has no speed control. The
-    /// consequence is not a wrong value but a silently absent one: the recovery
-    /// path throttles a struggling drive by lowering its read speed, and a
-    /// forwarder that swallowed the call would leave the drive at full speed
-    /// through the damaged region while the caller believed it had slowed down.
+    // The forwarding impl must delegate `set_speed`, which hides worse than
+    // the read methods because the trait default is also a no-op. See
+    // docs/sector.md.
     #[test]
     fn mut_ref_dyn_forwards_set_speed_to_the_inner_source() {
         let (mut spy, _reads, speeds, _bases) = Spy::new(0);

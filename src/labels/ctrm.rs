@@ -70,10 +70,9 @@ fn merge(ls: Vec<StreamLabel>, mb: Vec<StreamLabel>) -> Vec<StreamLabel> {
     result
 }
 
-/// True if a property-key prefix denotes a commentary stream group.
-/// Tightened from a bare `prefix.contains("comm")` substring scan, which
-/// over-matched unrelated prefixes like `common_*` / `community_*`. We
-/// split on `_` and require a `commentary` (or `comm`) segment.
+// Prefix denotes a commentary group if it has a `commentary`/`comm`
+// segment (split on `_`) — not a substring scan, which used to
+// over-match `common_*`/`community_*`.
 fn prefix_is_commentary(prefix: &str) -> bool {
     prefix
         .split('_')
@@ -92,13 +91,9 @@ fn parse_language_streams(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<
     Some(labels)
 }
 
-/// Parse the body of a `language_streams.txt` file into stream labels.
-///
-/// This is the shipping parser: [`parse_language_streams`] does the UDF read
-/// and UTF-8 decode and then delegates here. It is split out — rather than
-/// duplicated under `#[cfg(test)]`, which is what it used to be — so the unit
-/// tests below exercise production code. A test that re-implements the
-/// function it guards cannot fail when the real function breaks.
+// Parses language_streams.txt body into labels. Split from
+// parse_language_streams (I/O + UTF-8 decode only) so tests below
+// exercise this production code, not a hand-copied duplicate.
 fn parse_language_streams_text(text: &str) -> Vec<StreamLabel> {
     let mut labels = Vec::new();
 
@@ -319,12 +314,9 @@ mod tests {
         assert_eq!(labels[0].qualifier, LabelQualifier::None);
     }
 
-    /// Spec: `menu_base.prop` lines are skipped when `is_empty() ||
-    /// starts_with('#')` — either alone is sufficient. A commented-out
-    /// key=value line must never be parsed into an entry.
-    /// Mutation: `||` -> `&&` requires both, which a non-empty comment
-    /// line can't satisfy, so it falls through to `line.find('=')` and
-    /// gets parsed as a real property.
+    // Spec: lines are skipped when is_empty() || starts_with('#') —
+    // either alone suffices. Mutation `||`->`&&` would let a
+    // commented-out key=value line fall through and get parsed.
     #[test]
     fn menu_base_comment_line_with_equals_is_still_skipped() {
         let labels = parse_props(
@@ -339,12 +331,9 @@ mod tests {
         assert_eq!(labels[0].name, "Real Track");
     }
 
-    /// Spec: `menu_base.prop` streamNumber (or audioStream/subtitleStream)
-    /// must be strictly positive — `0` means "no STN entry" and must be
-    /// skipped, matching the `n > 0` guard on the language_streams side.
-    /// Mutation: `n > 0` -> `n >= 0` (or the guard deleted) would let a
-    /// stream_num of 0 through, emitting a dead label apply_labels can
-    /// never match (its counter starts at 1).
+    // Spec: streamNumber must be strictly positive (0 = "no STN
+    // entry"), matching the language_streams `n > 0` guard. Mutation
+    // `n>0`->`n>=0` emits a dead label apply_labels never matches.
     #[test]
     fn menu_base_zero_stream_number_skipped() {
         let labels = parse_props(
@@ -358,14 +347,9 @@ mod tests {
         );
     }
 
-    /// Spec: `is_subtitle` is `class.contains("SubtitleButton") ||
-    /// prefix.starts_with("subtitle_")` — EITHER signal alone is
-    /// sufficient to classify (and keep) a subtitle entry whose prefix
-    /// doesn't follow the `subtitle_` naming convention.
-    /// Mutation: `||` -> `&&` would require BOTH signals; an entry whose
-    /// class says SubtitleButton but whose prefix is something else
-    /// (e.g. a vendor-specific button id) would then satisfy neither
-    /// `is_audio` nor `is_subtitle` and get dropped entirely.
+    // Spec: is_subtitle = class contains SubtitleButton ||
+    // prefix.starts_with("subtitle_") — either alone suffices.
+    // Mutation `||`->`&&` drops entries with a non-`subtitle_` prefix.
     #[test]
     fn menu_base_subtitle_class_alone_is_sufficient() {
         let labels = parse_props(
@@ -408,13 +392,9 @@ mod tests {
         }
     }
 
-    /// Spec: `merge`'s `mb.iter().find(...)` must match an mb entry by
-    /// (stream_type AND stream_number) TOGETHER — either alone is not a
-    /// unique key (there can be an audio #1 and a subtitle #1, or two
-    /// different audio streams).
-    /// Mutation: `&&` -> `||` inside the closure would match on type OR
-    /// number alone, so `.find` (which returns the FIRST match) can pick
-    /// an mb entry with the right type but the WRONG stream number.
+    // Spec: merge matches mb entries by (type AND number) together —
+    // either alone isn't a unique key. Mutation `&&`->`||` lets
+    // .find() (first match) pick the right type but wrong number.
     #[test]
     fn merge_matches_mb_entry_by_type_and_number_together() {
         // ls wants audio #2 (empty name, so it will borrow from mb).
@@ -510,21 +490,9 @@ mod tests {
         assert_eq!(labels[0].qualifier, LabelQualifier::Forced);
     }
 
-    /// Immunity pin against the defect measured in the `paramount` parser,
-    /// where a vendor `forced_sub` cell hung off a FULL dialogue track's own
-    /// slot to say "this track also contains forced signs", and reading that
-    /// cell as "this track is forced" flagged 30 MB dialogue tracks forced.
-    ///
-    /// This format cannot express that. The forced signal is not a flag beside
-    /// a track's entry — it IS the entry's stream-kind token, drawn from a
-    /// closed vocabulary in which `subtitle_production` (the full dialogue
-    /// track) and `subtitle_narrative` (the forced-narrative track) are
-    /// mutually exclusive alternatives in the same position. A row is one or
-    /// the other; there is no cell a full track can carry to acquire the
-    /// qualifier, so the paramount failure mode has no encoding here.
-    ///
-    /// Mutation: give `subtitle_production` a `Forced` qualifier, or add a
-    /// forced side-flag that both kinds may carry.
+    // See docs/ctrm.md — immunity pin: unlike `paramount`'s forced_sub
+    // flag, forced-ness is the row's stream-kind token, so a full
+    // dialogue track can never acquire it (Forced qualifier misuse).
     #[test]
     fn a_full_subtitle_track_kind_can_never_carry_the_forced_qualifier() {
         // Every subtitle kind in the vocabulary, one row each.
@@ -594,15 +562,9 @@ mod tests {
         assert!(labels.is_empty());
     }
 
-    /// Immunity pin. `language_streams.txt` states each stream's number in
-    /// field 3, so a row the parser cannot use is simply dropped — it can
-    /// never renumber the rows behind it. This is the property that keeps
-    /// this parser out of the STN-slot-shifting failure mode that bites
-    /// parsers which count positionally: there, a skipped entry silently
-    /// pulls every later label one stream forward.
-    ///
-    /// Mutation: replace `parts[2]` with a running per-type counter → the
-    /// three unusable rows here collapse the survivors onto 1/2 and 1.
+    // See docs/ctrm.md — immunity pin: stream number comes from field
+    // 3, so a dropped row never shifts later rows (unlike a
+    // positional counter). Mutation: number via a running counter.
     #[test]
     fn ls_stream_numbers_come_from_the_row_not_a_counter() {
         let labels = parse_language_streams_text(
@@ -629,12 +591,9 @@ mod tests {
         assert_eq!(labels[2].qualifier, LabelQualifier::Forced);
     }
 
-    /// Immunity pin, `menu_base.prop` side: the number comes from the
-    /// entry's own `streamNumber` property, so a skipped entry (commented
-    /// out, `streamNumber=0`, neither audio nor subtitle) leaves the
-    /// surviving entries on their authored slots.
-    ///
-    /// Mutation: number by iteration order → the survivors collapse to 1/2.
+    // Immunity pin: menu_base numbers come from the entry's own
+    // streamNumber, so skipped entries don't renumber survivors.
+    // Mutation: number by iteration order → survivors collapse to 1/2.
     #[test]
     fn menu_base_stream_numbers_come_from_the_entry_not_a_counter() {
         let labels = parse_props(
@@ -704,14 +663,9 @@ mod tests {
         assert_eq!(labels[0].language, "eng");
     }
 
-    /// Spec: the skip test is `is_empty() || starts_with('#')` — EITHER
-    /// condition alone must skip the line. A commented-out line that
-    /// happens to look like valid CSV (a real authoring pattern for
-    /// disabling a stream entry) must never produce a label.
-    /// Mutation: `||` -> `&&` requires BOTH conditions, which a non-empty
-    /// comment line can never satisfy, so it would fall through to the
-    /// CSV parser and (since it has >= 4 comma fields) emit a spurious
-    /// label instead of being skipped.
+    // Spec: skip test is is_empty()||starts_with('#') — either alone
+    // skips. A commented-out CSV-shaped line must never produce a
+    // label. Mutation `||`->`&&` lets it fall through to the CSV parser.
     #[test]
     fn ls_comment_line_with_csv_shape_is_still_skipped() {
         let labels =
@@ -777,11 +731,9 @@ mod tests {
         assert_eq!(subs.len(), 1);
     }
 
-    /// Spec: prefix_is_commentary rejects "community_" as a false positive.
-    /// This is the pre-fix bug: bare `contains("comm")` matched any word with
-    /// "comm" as a substring. After the fix only whole-segment "comm" or
-    /// "commentary" matches.
-    /// Mutation: use `prefix.contains("comm")` → community_1 incorrectly matches.
+    // Spec: rejects "community_" (pre-fix bug: bare contains("comm")
+    // substring-matched it). Now only whole-segment comm/commentary
+    // match. Mutation: contains("comm") → community_1 wrongly matches.
     #[test]
     fn prefix_is_commentary_rejects_community_prefix() {
         assert!(!prefix_is_commentary("community_1"));
@@ -811,10 +763,9 @@ fn parse_menu_base(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<Str
     Some(labels)
 }
 
-/// Parse the body of a `menu_base.prop` file into stream labels. Split
-/// out from [`parse_menu_base`] (which only handles file I/O + UTF-8
-/// decode) so unit tests exercise the real parsing logic instead of a
-/// hand-copied duplicate. Returns the labels sorted by (type, number).
+// Parses menu_base.prop body into labels. Split from parse_menu_base
+// (I/O + UTF-8 decode only) so tests exercise real parsing logic.
+// Returns labels sorted by (type, number).
 fn parse_menu_base_text(text: &str) -> Vec<StreamLabel> {
     // Parse key=value, group by prefix
     let mut entries: HashMap<String, HashMap<String, String>> = HashMap::new();

@@ -34,12 +34,9 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
     drives
 }
 
-/// Enumerate `sg*` device names. Linux assigns `/dev/sgN` sequentially
-/// across *all* SCSI-generic devices (disks, tape, HBAs, optical), so a
-/// fixed `sg0..15` range can miss an optical drive on a host with many
-/// targets. Prefer the exact present-device list from
-/// `/sys/class/scsi_generic/`; fall back to a bounded `sg0..15` probe
-/// only when sysfs is unreadable (minimal containers).
+// Enumerate `sg*` names via `/sys/class/scsi_generic/` (exact present-device
+// list); fall back to a bounded `sg0..15` probe if sysfs is unreadable.
+// See docs/drive-linux.md — why a fixed sg range is unsafe.
 fn enumerate_sg_names() -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/sys/class/scsi_generic") {

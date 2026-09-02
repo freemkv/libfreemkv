@@ -6,36 +6,15 @@ use crate::mpls;
 use crate::sector::SectorSource;
 use crate::udf;
 
-/// Stream-file extensions probed for a BD-family playlist clip, in priority
-/// order. A clip is normally `.m2ts`; AACS 2.1 (FMTS) discs name the main feature
-/// `.fmts` (an M2TS transport stream plus forensic variant segments) and 3D discs
-/// use `.ssif`. `.m2ts` is tried first, so a normal clip is unaffected — the
-/// fallback only runs when `.m2ts` is absent (exactly when `file_extents` errors).
-///
-/// Scope: these are all variants that live in `BDMV/STREAM/` and are reached
-/// through an MPLS playlist. HD-DVD's `.evo` does NOT belong here — HD-DVD is a
-/// different tree (`HVDVD_TS/`) with `.XPL` playlists and needs its own
-/// enumerator (a peer to `parse_playlist`), not another extension in this list.
+// Stream extensions probed for a BD clip, in priority order: `.m2ts`
+// normally, AACS 2.1 uses `.fmts`, 3D uses `.ssif`. HD-DVD's `.evo` is a
+// different tree and does NOT belong here. See docs/bluray.md — CLIP_STREAM_EXTS.
 const CLIP_STREAM_EXTS: [&str; 3] = ["m2ts", "fmts", "ssif"];
 
 impl Disc {
-    /// Scan Blu-ray titles from MPLS playlists.
-    ///
-    /// Cancellation: `halt` is polled between playlists and once more after
-    /// the loop, and a read that fails with [`Error::Halted`] — how a live
-    /// drive reports a Stop, since `Drive::checked_exec` fails EVERY command
-    /// once its flag is set and `Drive::read` preserves the variant — is
-    /// propagated rather than swallowed. `Halted` is the only error this
-    /// returns from the enumeration itself; an unreadable or unparseable
-    /// playlist keeps its best-effort skip.
-    ///
-    /// It has to be an error and not a short title list, for the same reason
-    /// spelled out on [`Disc::scan_hddvd_titles`]: a cancelled enumeration
-    /// that returned `Ok` would be indistinguishable from a disc that
-    /// genuinely holds fewer titles, and the caller would cache and act on
-    /// it. Before this, a Stop pressed mid-scan failed every REMAINING
-    /// `.mpls` read in turn, each one silently skipped, and the scan returned
-    /// `Ok(truncated)` at rc=0.
+    // Scan Blu-ray titles from MPLS playlists. `halt` is polled between
+    // playlists and once more after the loop; a Halted read propagates
+    // instead of being swallowed. See docs/bluray.md — scan_bluray_titles.
     pub(super) fn scan_bluray_titles(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
@@ -77,19 +56,9 @@ impl Disc {
         Ok(titles)
     }
 
-    /// Parse one MPLS playlist into a [`DiscTitle`].
-    ///
-    /// Sums PlayItem durations; returns `Ok(None)` if the playlist is under
-    /// 30 seconds (skips menu / clip-info stub playlists), fails to
-    /// parse, or names a clip that cannot be resolved. Physical sector
-    /// extents are pulled from the UDF allocation descriptors of each
-    /// referenced `.m2ts` (deduplicated by clip_id).
-    ///
-    /// `Ok(None)` keeps its two benign meanings (unparseable MPLS, sub-30 s
-    /// playlist) plus the deliberate "drop this title" outcomes below. `Err`
-    /// means the SCAN is over: today that is only [`Error::Halted`], the
-    /// operator's Stop, which must not be reported as a disc that simply
-    /// holds fewer titles.
+    // Parse one MPLS playlist into a DiscTitle. `Ok(None)` covers both benign
+    // misses (unparseable, sub-30s) and deliberate drops; `Err` (only
+    // Halted) means the scan is over. See docs/bluray.md — parse_playlist.
     pub(super) fn parse_playlist(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
@@ -668,14 +637,9 @@ mod tests {
         );
     }
 
-    /// At exactly 30 s the playlist is kept (`< 30.0` is strict).
-    ///
-    /// The fixture is a FULLY WIRED BDMV (`make_bdmv_fs`), not the bare
-    /// `make_min_fs` this used to use. `make_min_fs` lays no STREAM/CLIPINF,
-    /// so the play item's `.clpi` read now fails and the title drops — which
-    /// is correct behaviour for an unresolvable clip but has nothing to do
-    /// with the 30-second boundary this test exists to pin. Wiring the clip
-    /// keeps the test measuring exactly one thing.
+    // At exactly 30s the playlist is kept (`< 30.0` is strict); uses a fully
+    // wired BDMV so the boundary, not an unresolvable clip, is what's pinned.
+    // See docs/bluray.md — parse_playlist_keeps_exactly_30_seconds.
     #[test]
     fn parse_playlist_keeps_exactly_30_seconds() {
         let mut disc = MemDisc::new();
@@ -815,10 +779,9 @@ mod tests {
         udf::read_filesystem(disc).expect("fs")
     }
 
-    /// Full BDMV with a real Blu-ray 3D layout: `.ssif` files under
-    /// `BDMV/STREAM/SSIF/<clip>.ssif` (note the SSIF subdirectory, unlike
-    /// [`make_bdmv_fs_ext`]) plus a matching `.clpi` in CLIPINF. Resolving
-    /// the SSIF is what latches `is_3d = true` in `parse_playlist`.
+    // BDMV with a real 3D layout: `.ssif` under BDMV/STREAM/SSIF/<clip>.ssif
+    // (unlike make_bdmv_fs_ext) plus a matching .clpi — resolving it latches
+    // `is_3d = true`. See docs/bluray.md — make_bdmv_fs_ssif.
     fn make_bdmv_fs_ssif(
         disc: &mut MemDisc,
         clips: &[(
@@ -917,10 +880,9 @@ mod tests {
         assert_eq!(t.clips[0].source_packets, 4000);
     }
 
-    /// Each Clip's `duration_secs` is `(out_time - in_time) / 45000` (the BD
-    /// 45kHz playback clock). Uses a duration (75s) whose ticks are not a
-    /// multiple of any small constant, so a `*` or `%` in place of `/` would
-    /// produce a wildly different (or non-matching) value instead of 75.0.
+    // duration_secs = (out_time - in_time) / 45000 (BD 45kHz clock). Uses a
+    // 75s duration whose ticks aren't a multiple of a small constant, so a
+    // `*`/`%` swap for `/` would not coincidentally match.
     #[test]
     fn parse_playlist_clip_duration_secs_computed_from_ticks() {
         let mut disc = MemDisc::new();
@@ -946,11 +908,9 @@ mod tests {
         );
     }
 
-    /// AACS 2.1: the feature clip is `00001.fmts`, NOT `.m2ts`. The
-    /// [`CLIP_STREAM_EXTS`] fallback in `parse_playlist` must still resolve the
-    /// physical extent — before the fix the hard-coded `.m2ts` path errored,
-    /// yielding empty extents (a silent empty rip and 0 encrypted samples for key
-    /// resolution). Size still comes from the `.clpi`, which parses regardless.
+    // AACS 2.1: feature clip is `00001.fmts`, not `.m2ts`; CLIP_STREAM_EXTS
+    // fallback must still resolve the extent (used to error → empty rip).
+    // See docs/bluray.md — parse_playlist_fmts_clip_resolves_extent.
     #[test]
     fn parse_playlist_fmts_clip_resolves_extent() {
         let mut disc = MemDisc::new();
@@ -979,13 +939,9 @@ mod tests {
         assert_eq!(t.extents[0].sector_count, 1000);
     }
 
-    /// THE 0.31.0 DEDUP PATH. A playlist that references the SAME clip_id
-    /// from multiple PlayItems (seamless split / looped segment) must count
-    /// the physical extents and packet bytes EXACTLY ONCE — mux reads
-    /// extents in order, so a duplicate would mux the A/V twice and inflate
-    /// size_bytes (bluray.rs: `first_ref = seen_clips.insert(...)` gates
-    /// both `total_size +=` and the `extents.push`). Per-PlayItem Clip
-    /// entries are still recorded for both.
+    // 0.31.0 dedup path: a playlist referencing the same clip_id from
+    // multiple PlayItems must count extents/bytes exactly once, though each
+    // PlayItem still gets a Clip entry. See docs/bluray.md — dedup test.
     #[test]
     fn parse_playlist_dedups_repeated_clip_extents_and_size() {
         let mut disc = MemDisc::new();
@@ -1062,31 +1018,9 @@ mod tests {
         assert_eq!(t.size_bytes, (4000 + 2000) * 192);
     }
 
-    /// A clip whose `.clpi` is missing must yield NO TITLE.
-    ///
-    /// This test used to assert the opposite — a title with `size_bytes == 0`
-    /// and empty extents — and its docstring quoted the buggy control flow
-    /// ("bluray.rs only fetches extents inside the `if let Ok(clpi_data)`")
-    /// as if it were the specification. It was blessing the defect: the
-    /// title's `duration_secs` is summed from the PlayItems BEFORE the clip is
-    /// resolved, so the returned title advertised the movie's full runtime
-    /// while carrying none of its bytes, and the discarded error meant not one
-    /// log line said so. That is the flagship failure class of this crate — a
-    /// failure that looks like success — reached through an ordinary missing
-    /// or scratched CLIPINF file.
-    ///
-    /// The correct behaviour is the same as for a clip whose extents cannot be
-    /// resolved (see `parse_playlist_unreadable_clip_icb_yields_no_title`):
-    /// drop the title and log the read's OWN error code.
-    ///
-    /// That last clause is now ASSERTED, not merely asked for. The site's
-    /// comment insists on `e.code()` because a missing `.clpi` (E6003), a
-    /// scratched one (E6000) and a malformed one (E6002) are different
-    /// populations, but nothing checked it: putting a literal back compiled
-    /// and passed. Mutation: `"E6017"` (or any fixed code) in place of
-    /// `"E{}", e.code()` fails here, and so does dropping the warn entirely —
-    /// a silent drop is the same invisible title loss this test was written
-    /// for, one step later.
+    // A clip whose .clpi is missing must yield NO title, not one advertising
+    // the full runtime with none of its bytes, and must log the read's OWN
+    // error code. See docs/bluray.md — parse_playlist_missing_clpi_yields_no_title.
     #[test]
     fn parse_playlist_missing_clpi_yields_no_title() {
         let mut disc = MemDisc::new();
@@ -1164,20 +1098,9 @@ mod tests {
         );
     }
 
-    /// A clip stream whose ICB declares an UNRECORDED (ECMA-167 4/14.14.1.1
-    /// type-1) extent must not yield a title at all.
-    ///
-    /// The extent is allocated to the file but was never written, so the
-    /// file's content there is zeros while the media holds whatever was left
-    /// at those sectors. Neither answer a `(lba, sector_count)` read plan can
-    /// give is true — reading it splices undefined sectors into the rip as
-    /// content, dropping it slides every later extent's byte space — so the
-    /// title is refused rather than mis-ripped. This fixture is the shape a
-    /// crafted disc uses to get such a range into a title's extent list.
-    ///
-    /// (The `sectors > 0 && lba > 0` filter below the resolver stays as
-    /// defence in depth; a zero-length AD is only reachable as an unrecorded
-    /// descriptor, since a zero-length TYPE 0 one terminates the AD list.)
+    // A clip stream whose ICB declares an UNRECORDED (ECMA-167 4/14.14.1.1
+    // type-1) extent must not yield a title: neither reading nor dropping it
+    // is truthful. See docs/bluray.md — parse_playlist_unrecorded_extent_yields_no_title.
     #[test]
     fn parse_playlist_unrecorded_extent_yields_no_title() {
         let mut disc = MemDisc::new();
@@ -1263,18 +1186,9 @@ mod tests {
         );
     }
 
-    /// An unrecorded extent was never the only way a clip fails to resolve.
-    ///
-    /// RED BEFORE GREEN: this fixture gives the .m2ts an ICB whose descriptor
-    /// tag is neither 261 nor 266, so `file_extents` returns `DiscRead` — the
-    /// same variant a SCRATCHED SECTOR under a real clip's ICB produces, which
-    /// is the ordinary way this happens on real media. Before the fix only
-    /// `UdfUnrecordedExtent` set the drop flag, so this fell through to the
-    /// "file absent" path and `parse_playlist` returned a title: full declared
-    /// duration from the play item, `total_size` already counted from the
-    /// .clpi, and ZERO extents — a movie advertising its runtime with the
-    /// content missing, and not one log line. The clip must drop the title
-    /// exactly as an unrecorded extent does.
+    // An unrecorded extent was never the only way a clip fails to resolve: a
+    // scratched-sector DiscRead on the .m2ts ICB must drop the title too, not
+    // fall through to "absent". See docs/bluray.md — parse_playlist_unreadable_clip_icb_yields_no_title.
     #[test]
     fn parse_playlist_unreadable_clip_icb_yields_no_title() {
         let mut disc = MemDisc::new();
@@ -1361,26 +1275,9 @@ mod tests {
         );
     }
 
-    /// A non-absence SSIF failure that the `.m2ts` fallback then papers over
-    /// must be LOGGED, with its own code.
-    ///
-    /// `unresolved` had exactly one reader — `if let (None, Some(code))` — so
-    /// a code recorded for `/BDMV/STREAM/SSIF/<clip>.ssif` was thrown away
-    /// whenever the fallback succeeded. The disc here IS a 3D disc: the SSIF
-    /// is present and carries both eyes, and only its ICB is unreadable (a
-    /// scratched sector, the ordinary way this happens). The title shipped
-    /// base-view 2D at rc=0 with `is_3d` false and NOT ONE LOG LINE, so the
-    /// operator's rip is silently missing the dependent view and the journal
-    /// cannot tell this disc apart from one that was only ever 2D.
-    ///
-    /// The title is deliberately still RETURNED — the base view resolved, so
-    /// refusing would trade a degraded rip for no rip. The defect being fixed
-    /// is the silence, not the fallback.
-    ///
-    /// Mutations this catches: deleting the new `(Some(_), Some(code))` arm,
-    /// or restoring the `if let (None, Some(code))` shape, leaves no event to
-    /// find; logging a fixed code instead of `e.code()` fails the code
-    /// assertion; making the arm `return Ok(None)` fails the title assertion.
+    // A non-absence SSIF failure that the .m2ts fallback papers over must be
+    // LOGGED with its own code, while the (degraded 2D) title still ships.
+    // See docs/bluray.md — parse_playlist_logs_a_non_absence_ssif_failure_the_m2ts_fallback_hid.
     #[test]
     fn parse_playlist_logs_a_non_absence_ssif_failure_the_m2ts_fallback_hid() {
         let mut disc = MemDisc::new();
@@ -1512,10 +1409,8 @@ mod tests {
         assert_eq!(videos[0].codec, Codec::Hevc);
     }
 
-    /// HEVC HDR byte (sa[2]): high nibble = dynamic_range, low nibble =
-    /// color_space. dynamic_range 1 -> HDR10, color_space 2 -> BT.2020
-    /// (bluray.rs `match s.dynamic_range { 1 => Hdr10, ... }` /
-    /// `match s.color_space { 2 => Bt2020, ... }`).
+    // HEVC HDR byte (sa[2]): high nibble = dynamic_range, low nibble =
+    // color_space. dynamic_range 1 -> HDR10, color_space 2 -> BT.2020.
     #[test]
     fn parse_playlist_maps_hdr10_bt2020_from_hevc_nibbles() {
         let mut disc = MemDisc::new();
@@ -1576,11 +1471,9 @@ mod tests {
         assert_eq!(v.color_space, ColorSpace::Bt709);
     }
 
-    /// A PGS coding_type (0x90) sitting in the AUDIO STN slot is a
-    /// misaligned-stream guard case: bluray.rs routes it to Subtitle, not
-    /// Audio (`if matches!(codec, Codec::Pgs)`). Wrong-title regression
-    /// guard: ensures audio slot data never silently becomes a fake audio
-    /// track when it is really PGS.
+    // A PGS coding_type (0x90) in the AUDIO STN slot must route to Subtitle,
+    // not Audio: guards against audio-slot data silently becoming a fake
+    // audio track when it is really PGS.
     #[test]
     fn parse_playlist_pgs_in_audio_slot_becomes_subtitle() {
         let mut disc = MemDisc::new();
@@ -1717,9 +1610,8 @@ mod tests {
     // ---------------------------------------------------------------
 
     /// When a clip resolves via `STREAM/SSIF/<clip>.ssif`, `is_3d` latches
-    /// and a synthetic MVC dependent-view video stream is added at
-    /// `base_pid + 1` (bluray.rs's 3D block). Verifies all three fields set
-    /// on the synthesized `VideoStream`: `pid`, `secondary`, `label`.
+    /// and a synthetic MVC dependent-view stream is added at base_pid + 1.
+    /// Verifies its `pid`, `secondary`, and `label` fields.
     #[test]
     fn parse_playlist_3d_adds_dependent_view_stream() {
         let mut disc = MemDisc::new();
@@ -1763,10 +1655,9 @@ mod tests {
         );
     }
 
-    /// If the STN table already lists a video stream at `base_pid + 1`
-    /// (e.g. an authoring tool that populated STN_table_SS), the synthetic
-    /// push must be skipped -- never duplicate an existing dependent-view
-    /// entry (bluray.rs `if !have_dep`).
+    // If the STN table already lists a video stream at base_pid + 1 (e.g. an
+    // authoring tool populated STN_table_SS), the synthetic push must be
+    // skipped: never duplicate an existing dependent-view entry.
     #[test]
     fn parse_playlist_3d_does_not_duplicate_existing_dependent_stream() {
         let mut disc = MemDisc::new();
@@ -1847,11 +1738,9 @@ mod tests {
         );
     }
 
-    /// In a multi-PlayItem playlist, a mark referencing PlayItem 1 is
-    /// placed at (sum of preceding PlayItem durations) + (mark offset
-    /// within its own PlayItem). Using play_items[0].in_time for every
-    /// mark would misplace it (bluray.rs `preceding + within`). PI0 = 60s,
-    /// mark in PI1 at its in_time → chapter at exactly 60 s.
+    // A mark referencing PlayItem 1 is placed at (sum of preceding PlayItem
+    // durations) + (offset within its own PlayItem); PI0 = 60s, mark at
+    // PI1's in_time → chapter at exactly 60s.
     #[test]
     fn parse_playlist_chapter_time_accounts_for_preceding_play_items() {
         let mut disc = MemDisc::new();
@@ -1890,11 +1779,9 @@ mod tests {
         );
     }
 
-    /// The within-PlayItem offset is `(timestamp - pi.in_time) / 45000`
-    /// ticks-to-seconds. Uses a non-zero, non-round offset (5s) added to a
-    /// non-zero `preceding` (60s) so a `*` or `%` in place of `/` would not
-    /// coincidentally produce the same total (bluray.rs `within = ... /
-    /// 45000.0`).
+    // within = (timestamp - pi.in_time) / 45000. Uses a non-round 5s offset
+    // added to a non-zero 60s preceding, so a `*`/`%` swap for `/` would not
+    // coincidentally match the total.
     #[test]
     fn parse_playlist_chapter_within_offset_divides_ticks_to_seconds() {
         let mut disc = MemDisc::new();
@@ -2043,11 +1930,9 @@ mod tests {
         assert_eq!(t.playlist_id, 0);
     }
 
-    /// A filename that is long enough (>= 5 bytes) but does NOT end in
-    /// ".mpls" must NOT have its last 5 bytes stripped -- the whole string
-    /// is handed to the numeric parse instead, which fails and falls back
-    /// to playlist_id 0 (bluray.rs `filename.len() >= 5 &&
-    /// filename[len-5..].eq_ignore_ascii_case(".mpls")`).
+    // A filename >= 5 bytes but NOT ending in ".mpls" must not have its last
+    // 5 bytes stripped; the whole string fails the numeric parse instead.
+    // See docs/bluray.md — parse_playlist_id_falls_back_to_zero_when_suffix_is_not_mpls.
     #[test]
     fn parse_playlist_id_falls_back_to_zero_when_suffix_is_not_mpls() {
         let mut disc = MemDisc::new();
@@ -2152,11 +2037,9 @@ mod tests {
         assert_eq!(titles[0].playlist_id, 800);
     }
 
-    /// A non-directory PLAYLIST entry whose name does NOT end in ".mpls"
-    /// must be skipped even though its content parses as a perfectly good
-    /// (long) MPLS playlist -- extension gating, not content sniffing,
-    /// decides eligibility (bluray.rs `!entry.is_dir &&
-    /// entry.name...ends_with(".mpls")`).
+    // A non-directory PLAYLIST entry not ending in ".mpls" must be skipped
+    // even if its content parses as a valid MPLS: extension gating, not
+    // content sniffing. See docs/bluray.md — scan_bluray_titles_skips_non_mpls_extension_file.
     #[test]
     fn scan_bluray_titles_skips_non_mpls_extension_file() {
         let mut disc = MemDisc::new();
@@ -2215,13 +2098,9 @@ mod tests {
         );
     }
 
-    /// A `SectorSource` that fails every read in `halt_range` with
-    /// [`Error::Halted`] — exactly how a LIVE DRIVE behaves once the operator
-    /// presses Stop: `Drive::checked_exec` fails every SCSI command with
-    /// `Halted` from then on, and `Drive::read` deliberately preserves the
-    /// variant. Reads outside the range still succeed, so a test can aim the
-    /// cancel at ONE structure and leave the scan far enough along to have
-    /// something to truncate.
+    // A SectorSource that fails every read in `halt_range` with Error::Halted
+    // — how a live drive behaves once Stop is pressed. Reads outside the
+    // range succeed. See docs/bluray.md — HaltingReader.
     struct HaltingReader<'a> {
         inner: &'a mut MemDisc,
         halt_range: std::ops::Range<u32>,
@@ -2300,21 +2179,9 @@ mod tests {
         udf::read_filesystem(disc).expect("fs")
     }
 
-    /// A Stop on a LIVE DRIVE never touches `ScanOptions::halt`: `Drive` has
-    /// its own flag and `checked_exec` fails every SCSI command with
-    /// [`Error::Halted`] once it is set. The Blu-ray enumerator must not
-    /// swallow that into a successful scan.
-    ///
-    /// RED BEFORE GREEN: with the propagation reverted this returned
-    /// `Ok([00800])` — the `if let Ok(mpls_data)` skipped the cancelled read
-    /// of 00801.mpls, the loop ended, and a HALF-ENUMERATED disc came back at
-    /// success. One title from a two-title disc is indistinguishable from a
-    /// disc that genuinely holds one title, and the caller caches and rips
-    /// from it.
-    ///
-    /// The halt lands on the SECOND playlist deliberately: it is the last
-    /// iteration, so nothing after it would poll a flag — only propagating
-    /// the read's own error catches it.
+    // A Stop on a live drive never touches ScanOptions::halt; the enumerator
+    // must not swallow a Halted read into a successful (shorter) scan. Halt
+    // lands on the LAST playlist deliberately. See docs/bluray.md — halted_playlist_read_is_not_reported_as_a_shorter_disc.
     #[test]
     fn halted_playlist_read_is_not_reported_as_a_shorter_disc() {
         let mut disc = MemDisc::new();
@@ -2341,15 +2208,9 @@ mod tests {
         );
     }
 
-    /// The same cancel landing on a `.clpi` read must not be classified as an
-    /// unresolvable clip either.
-    ///
-    /// RED BEFORE GREEN: with the `Err(Error::Halted)` arm removed from the
-    /// CLIPINF match, the cancel fell into the generic "clip could not be
-    /// resolved" arm, which logs a disc-defect code and drops the title —
-    /// accounting an operator Stop as a scratched disc, and (in the scan loop)
-    /// dropping every remaining playlist in turn for a truncated `Ok`. With
-    /// the fix the cancel is propagated with its own variant intact.
+    // The same cancel landing on a .clpi read must not be classified as an
+    // unresolvable clip either — it must propagate, not be logged as a
+    // disc defect. See docs/bluray.md — halted_clpi_read_is_not_accounted_as_an_unresolvable_clip.
     #[test]
     fn halted_clpi_read_is_not_accounted_as_an_unresolvable_clip() {
         let mut disc = MemDisc::new();
@@ -2379,16 +2240,9 @@ mod tests {
         );
     }
 
-    /// And the same cancel landing on `file_extents` — the clip's ICB, not its
-    /// CLIPINF — must propagate too.
-    ///
-    /// RED BEFORE GREEN: `note` used to EXEMPT `Halted` from the unresolved
-    /// classification (correctly — a cancel is not an authoring hole) but had
-    /// no way to propagate it, so the resolver simply produced no extents and
-    /// `parse_playlist` returned a title with the clip's runtime counted, its
-    /// `size_bytes` counted from the .clpi, and ZERO bytes behind it. Measured
-    /// with the propagation reverted: `Ok(Some((768000, [])))` — the flagship
-    /// defect shape, wearing a cancel.
+    // And the same cancel landing on file_extents (the clip's ICB, not its
+    // CLIPINF) must propagate too, not yield a title with runtime counted and
+    // zero bytes behind it. See docs/bluray.md — halted_extent_resolve_is_not_a_title_missing_its_clip.
     #[test]
     fn halted_extent_resolve_is_not_a_title_missing_its_clip() {
         let mut disc = MemDisc::new();
@@ -2517,10 +2371,9 @@ mod tests {
         }
     }
 
-    /// A non-.xml file must be ignored even if its content looks like a
-    /// valid meta XML (contains a `<di:name>`) -- extension gating, not
-    /// content sniffing, decides eligibility (bluray.rs `!e.is_dir &&
-    /// e.name...ends_with(".xml")`).
+    // A non-.xml file must be ignored even if its content looks like valid
+    // meta XML: extension gating, not content sniffing, decides eligibility.
+    // See docs/bluray.md — read_meta_title_ignores_non_xml_file_regardless_of_content.
     #[test]
     fn read_meta_title_ignores_non_xml_file_regardless_of_content() {
         let mut disc = MemDisc::new();

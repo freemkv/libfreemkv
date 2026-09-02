@@ -1,51 +1,13 @@
 //! [`FileSectorSource`] — read 2048-byte sectors from an ISO file on
-//! disk via direct `seek + read_exact` (`pread`-equivalent) calls,
-//! letting the kernel's own readahead policy manage prefetch.
+//! disk via direct `seek + read_exact`, letting the kernel's own
+//! readahead policy handle prefetch instead of an app-level buffer.
 //!
-//! ## Why no app-level buffer
+//! Issues a platform "sequential access" hint on open, prefetches the
+//! next window after each read, and periodically evicts the consumed
+//! byte range via `posix_fadvise(DONTNEED)` to bound page-cache pressure.
 //!
-//! Pre-0.21.3 this source held a 32 MiB (later 4 MiB) read-ahead
-//! buffer to amortise per-sector NFS round-trips. Empirically that
-//! buffer hurt: 32 MiB refills bursted the NFS TCP connection hard
-//! enough to starve the concurrent writer, and even a 4 MiB window
-//! gave the kernel less freedom to pipeline reads with writes. Direct
-//! pread per call lets Linux's readahead widen as it detects the
-//! sequential pattern, and naturally interleaves with writeback.
-//!
-//! ## DONTNEED on the consumed window
-//!
-//! Without page-cache eviction an 85 GB streaming ISO read pins the
-//! entire file in memory, starves the concurrent writer, and collapses
-//! mux throughput (observed: 2.7 MB/s mux on 0.21.5 vs. 70 MB/s
-//! isolated NFS reads). Every [`READ_DROP_CHUNK_BYTES_DEFAULT`] of
-//! consumed bytes we call `posix_fadvise(DONTNEED)` over that window,
-//! mirroring the write-side [`crate::io::writeback::WritebackPipeline`]
-//! policy.
-//!
-//! The drop window is accounted by a monotonic forward byte counter,
-//! which matches the sequential streaming pattern the mux highway
-//! drives. Under random or backward access the dropped range no longer
-//! lines up with the bytes actually read — but `DONTNEED` is purely an
-//! advisory cache hint with no correctness impact, so this degrades to
-//! a slightly imprecise hint rather than a bug.
-//!
-//! ## Platform open hint
-//!
-//! On `open()` each platform issues its "sequential access expected"
-//! hint so OS-level readahead widens. The hint and the DONTNEED call
-//! live in per-OS sibling modules (`linux::hint_sequential` et al.)
-//! — no inline `#[cfg]` in this file.
-//!
-//! ## Read-ahead prefetch
-//!
-//! After every consumed read we issue an OS-level prefetch hint for
-//! the next equivalent-sized window (`platform::prefetch`). The
-//! kernel queues that I/O asynchronously and returns immediately, so
-//! the next batch's read overlaps with the caller's processing of
-//! the current batch (decrypt + demux + mux). Without this the disk
-//! sits idle ~70% of each iteration because kernel SEQUENTIAL
-//! readahead alone (capped at `read_ahead_kb`, default 128 KB) is
-//! far smaller than our 16 MiB app-level batch.
+//! See docs/file-sector-source.md for design rationale (no app-level
+//! buffer, DONTNEED window, platform hint, prefetch).
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
@@ -77,24 +39,14 @@ use crate::sector::SectorSource;
 
 use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
 
-/// Bytes-read threshold per `posix_fadvise(DONTNEED)` drop on the
-/// read side. Mirrors `WRITEBACK_CHUNK_BYTES` so the read-side page
-/// cache stays bounded the same way the write side does.
-///
-/// 32 MiB is the empirically tuned value on a 7200rpm HDD via SATA:
-/// smaller windows (8 / 16 MiB) shorten the
-/// kernel-readahead overlap and slow the producer; larger windows
-/// (64 / 128 MiB) let the page cache pin enough of the ISO to
-/// pressure concurrent writes. Override via `FREEMKV_READ_DROP_CHUNK_MIB`.
+// Bytes-read threshold per `posix_fadvise(DONTNEED)` drop; mirrors
+// WRITEBACK_CHUNK_BYTES. 32 MiB is empirically tuned (7200rpm HDD/SATA);
+// see docs/file-sector-source.md. Override: FREEMKV_READ_DROP_CHUNK_MIB.
 const READ_DROP_CHUNK_BYTES_DEFAULT: u64 = 32 * 1024 * 1024;
 
-/// Upper bound (in MiB) accepted from `FREEMKV_READ_DROP_CHUNK_MIB`. 64 GiB —
-/// generous for any real medium, and small enough that `n * 1024 * 1024` cannot
-/// wrap `u64`. Mirrors `WRITEBACK_CHUNK_MIB_MAX`, whose identical multiply is
-/// bounded for exactly this reason: without the bound, a value above 2^44
-/// overflows — a panic on the first ISO open in an overflow-checked build, and in
-/// release a wrap to a near-zero window that fires `drop_window` on every read.
-/// Out-of-range values fall back to the default.
+// Max MiB from FREEMKV_READ_DROP_CHUNK_MIB: 64 GiB, and small enough
+// n*1024*1024 can't overflow u64 (mirrors WRITEBACK_CHUNK_MIB_MAX).
+// See docs/file-sector-source.md; out-of-range falls back to default.
 const READ_DROP_CHUNK_MIB_MAX: u64 = 64 * 1024;
 
 fn read_drop_chunk_bytes() -> u64 {
@@ -238,15 +190,9 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
-    /// An undersized output buffer must return an error, never panic. This is a
-    /// public `SectorSource` impl, so buffer length is caller input, and the guard
-    /// used to be a `debug_assert!` — compiled out in release, where the
-    /// `out[..bytes]` slice then panicked with 'range end index out of range'.
-    ///
-    /// `Drive::read_fua` already carries this exact guard with a comment recording
-    /// the same panic being fixed there, and `PrefetchedSectorSource` has
-    /// `direct_read_too_small_buffer_errors` for the same case; this impl had
-    /// neither.
+    // Undersized `out` must error, not panic: `debug_assert!` alone is compiled
+    // out in release, letting `out[..bytes]` panic. See docs/file-sector-source.md
+    // (also guarded in Drive::read_fua and PrefetchedSectorSource).
     #[test]
     fn read_sectors_with_an_undersized_buffer_errors_rather_than_panicking() {
         let dir = tempdir().unwrap();
@@ -272,9 +218,8 @@ mod tests {
         );
     }
 
-    /// Build a deterministic ISO of `sectors` sectors where sector `n`
-    /// is filled with the byte pattern `((n & 0xff) as u8)`. Lets us
-    /// verify any sector by content alone.
+    // Build a deterministic ISO: sector `n` filled with byte `(n & 0xff)`,
+    // so any sector can be verified by content alone.
     fn make_iso(path: &std::path::Path, sectors: u32) {
         let mut f = std::fs::File::create(path).unwrap();
         let mut chunk = vec![0u8; SECTOR_BYTES];
@@ -286,10 +231,9 @@ mod tests {
         f.flush().unwrap();
     }
 
-    /// Sectors used by spanning-boundary tests. Pick something that
-    /// exercises multi-megabyte reads without making test ISOs huge.
-    /// 8192 sectors = 16 MiB — large enough to cross any readahead
-    /// chunk size we set the kernel hint to.
+    // Sectors used by spanning-boundary tests: 8192 sectors = 16 MiB,
+    // large enough to cross any readahead chunk size we set the kernel
+    // hint to, without making test ISOs huge.
     const TEST_SPAN_SECTORS: u32 = 8192;
 
     #[test]
@@ -422,19 +366,9 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
-    // Additional coverage.
-    // ---------------------------------------------------------------
-
-    /// `count == 0` must short-circuit to Ok(0) WITHOUT seeking or reading,
-    /// even at an out-of-range LBA. Grounding: `if count == 0 { return Ok(0) }`.
-    ///
-    /// The `Ok(0)` return alone proves nothing: with the guard deleted, a seek
-    /// past EOF succeeds (POSIX permits seeking beyond the end of a file) and a
-    /// zero-length `read_exact` returns `Ok(())` immediately, so the call still
-    /// returns `Ok(0)`. The observable difference is the file's cursor — the
-    /// seek MOVES it to `lba * 2048`. Assert on that, so the guard is what the
-    /// test is actually measuring.
+    // Additional coverage. count==0 must short-circuit to Ok(0) before any
+    // seek/read, even at an out-of-range LBA — Ok(0) alone doesn't prove it,
+    // so we assert the file cursor is unmoved instead.
     #[test]
     fn zero_count_returns_zero_no_io() {
         let dir = tempdir().unwrap();
@@ -458,11 +392,9 @@ mod tests {
         assert_eq!(src.drop_window_start, 0);
     }
 
-    /// Reading past EOF must ERROR (read_exact's UnexpectedEof), never
-    /// return a partial/short count. This is the core "never silently
-    /// truncate / never return fewer bytes than declared" property of
-    /// the SectorSource contract. Grounding: `self.file.read_exact(...)`
-    /// — read_exact fails if the file can't supply the full span.
+    // Reading past EOF must ERROR (read_exact's UnexpectedEof), never a
+    // partial/short count — the "never silently truncate" SectorSource
+    // contract, backed by read_exact failing on a short span.
     #[test]
     fn read_past_eof_errors_not_truncates() {
         let dir = tempdir().unwrap();
@@ -497,10 +429,9 @@ mod tests {
         assert_eq!(n, 5 * SECTOR_BYTES, "must return exactly count*2048 bytes");
     }
 
-    /// Capacity is `file_len / 2048` (floor); trailing bytes that don't
-    /// complete a sector are NOT counted. A file of 4 sectors + 100
-    /// extra bytes reports capacity 4. Grounding: `len / SECTOR_BYTES`
-    /// integer division in `open`.
+    // Capacity is `file_len / 2048` (floor); a torn trailing sector (4
+    // sectors + 100 stray bytes) must not inflate it — verified against
+    // `len / SECTOR_BYTES` integer division in `open`.
     #[test]
     fn capacity_floors_partial_trailing_sector() {
         let dir = tempdir().unwrap();
@@ -549,15 +480,9 @@ mod tests {
         assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
     }
 
-    /// A DONTNEED drop crossing the chunk threshold must not corrupt or
-    /// short subsequent reads — the eviction is a pure page-cache hint.
-    /// We read past the DEFAULT 32 MiB drop chunk (16384 sectors) so the
-    /// eviction block fires at least once, asserting every sector still
-    /// reads correctly. (Avoids mutating FREEMKV_READ_DROP_CHUNK_MIB to
-    /// sidestep a parallel-test env race with `drop_chunk_size_env_override`.)
-    /// Grounding: the `bytes_read_since_drop >= drop_chunk_bytes`
-    /// eviction block calls only `platform::drop_window` (advisory) and
-    /// resets counters — no data effect.
+    // A DONTNEED drop crossing the chunk threshold must not corrupt/short
+    // reads — it's an advisory hint. Reads past the default 32 MiB chunk
+    // (16384 sectors) so eviction fires; see docs/file-sector-source.md.
     #[test]
     fn dontneed_eviction_does_not_affect_data() {
         // 32 MiB default chunk = 16384 sectors; read a bit past it.
@@ -586,11 +511,9 @@ mod tests {
         }
     }
 
-    /// `FREEMKV_READ_DROP_CHUNK_MIB` must be BOUNDED before the MiB→byte
-    /// multiply, exactly as its writeback twin bounds the identical multiply.
-    /// Unbounded, any value above 2^44 overflowed `n * 1024 * 1024`: a panic on
-    /// the first ISO open in an overflow-checked build, and in release a wrap to
-    /// a near-zero window that fires `drop_window` on essentially every read.
+    // FREEMKV_READ_DROP_CHUNK_MIB must be bounded before the MiB→byte
+    // multiply (mirrors WRITEBACK_CHUNK_MIB_MAX): unbounded, values above
+    // 2^44 overflow/wrap — see docs/file-sector-source.md.
     #[test]
     fn read_drop_chunk_env_is_bounded_before_the_multiply() {
         // Default when unset / zero / out of range.

@@ -29,7 +29,6 @@ seam).
 | `init()` | Route to the matching registered unlocker (if any), then prepare for reads |
 | `probe_disc()` | Probe disc surface for optimal speeds |
 | `read(lba, count, buf, recovery)` | Read sectors. Single-shot — no inline retries or reset. |
-| `reset()` | Eject-cycle escape hatch. Caller-invoked only; not on the read path. |
 | `lock_tray()` | Prevent tray ejection during rip |
 | `unlock_tray()` | Allow tray ejection (also runs on Drop) |
 | `eject()` | Eject disc tray |
@@ -104,14 +103,14 @@ descriptors or calls ioctls outside of a `ScsiTransport` implementation.
 
 | Platform | Implementation | Device |
 |----------|---------------|--------|
-| Linux | `SgIoTransport` — async `write`/`poll`/`read` on `/dev/sg*` | `/dev/sg*` |
+| Linux | `SgIoTransport` — synchronous `ioctl(fd, SG_IO, &hdr)` on `/dev/sg*` | `/dev/sg*` |
 | macOS | `MacScsiTransport` — IOKit SCSITask | IOKit service |
 
-The Linux backend uses the sg driver's asynchronous interface: `write()` submits
-the command, `poll()` waits with an enforceable wall-clock timeout, `read()`
-retrieves the result. If `poll()` times out, the fd is abandoned (closed in a
-background thread) and a fresh fd opened — the kernel's USB error recovery
-cannot block us. Opens with `O_RDWR | O_NONBLOCK`.
+The Linux backend issues each command as one synchronous `ioctl(fd, SG_IO, &hdr)`
+(`linux.rs`); the timeout is the kernel's, set via `hdr.timeout`, not a userspace
+`poll()`. Opens with `O_RDWR | O_NONBLOCK`. (Pre-0.13.20 this backend ran an async
+`write()` + `poll(1.5s)` + close-on-timeout + background-reopen pattern; it was
+reverted in 0.13.20 — see the note at the top of `linux.rs`.)
 
 The macOS backend uses a C shim (`macos_shim.c`) for IOKit exclusive access.
 The shim handles:
@@ -127,14 +126,13 @@ The shim handles:
 On non-zero SCSI status, the transport parses sense key from the sense buffer
 and returns `Error::ScsiError`.
 
-`SgIoTransport::reset` (Linux) does pure userspace state cleanup: an open +
-close pair to make the kernel cancel any SG_IO commands queued against a
-previous fd, a 2 s sleep to let the kernel finish that cancellation, then a
-fresh fd to send ALLOW MEDIUM REMOVAL to clear any stale tray lock. It does
-NOT issue `SG_SCSI_RESET` or escalate via STOP+START UNIT. Both were tried
-in 0.13.0–0.13.5 against the LG BU40N (Initio USB-SATA bridge); both failed
-to recover wedged drives and made the wedge worse. The macOS reset (which
-had been a no-op) was removed entirely in 0.13.6, and the top-level
+The Linux backend has no `reset`. `SG_SCSI_RESET` and STOP+START UNIT
+escalation were tried in 0.13.0–0.13.5 against the LG BU40N (Initio USB-SATA
+bridge); both failed to recover wedged drives and made the wedge worse, so no
+Linux transport-reset path exists today — recovery is just a fresh fd opened on
+the next command. The only `reset` on a transport in the crate is
+`SptiTransport::reset` on Windows (`windows.rs`). The macOS reset (which had
+been a no-op) was removed entirely in 0.13.6, and the top-level
 `scsi::reset()` / `reset_with_timeout()` / `reset_blocking()` wrappers were
 removed at the same time (no callers).
 
@@ -241,3 +239,13 @@ Available speeds:
 | Blu-ray | 1x (4,500 KB/s) through 12x (54,000 KB/s) |
 | DVD | 1x (1,385 KB/s) through 16x (22,160 KB/s) |
 | Max | 0xFFFF (drive decides) |
+
+---
+
+## Windows Path Normalization
+
+`normalize_path` in `src/drive/windows.rs` converts a device path ("D:",
+"D:\\", "\\.\D:", "\\.\CdRom0") to Windows `\\.\X:` form. A near-identical
+`normalize_device_path` exists in `scsi::windows`; both are kept because
+they live in separate `cfg(windows)` modules that cannot easily share a
+helper without introducing cross-module coupling.

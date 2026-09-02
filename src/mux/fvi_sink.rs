@@ -1,23 +1,13 @@
 //! `fvi://` sink — freemkv's own native video-index output.
 //!
-//! This is a write-only [`crate::pes::Stream`] that, instead of muxing frames
-//! into a container, emits one machine-readable *video-index* record per coded
-//! picture of the title's primary video track. It is a thin consumer of the
-//! reusable, pure-data [`VideoMap`](crate::mux::videomap) model
-//! ([`MapHeader`](crate::mux::videomap::MapHeader)/[`PictureRecord`](crate::mux::videomap::PictureRecord)): the sink builds the header from the title,
-//! then writes one record per video [`PesFrame`](crate::pes::PesFrame) straight to disk — nothing here
-//! re-parses the elementary stream, and the whole index is never buffered.
+//! A write-only [`crate::pes::Stream`] that emits one machine-readable
+//! *video-index* record per coded picture of the title's primary video
+//! track, instead of muxing frames into a container.
 //!
-//! The on-disk shape is the freemkv FVI format (normative public spec
-//! `docs/FVI_FORMAT.md`): JSON Lines — a header object on line 1, then one
-//! record object per picture. Serialization is inlined here in the sink.
-//!
-//! A different output format would be a DIFFERENT sink reusing the same
-//! [`VideoMap`](crate::mux::videomap) model (e.g. a future `fvi2://`), not a
-//! pluggable encoder — extensibility is by adding a sink, like every other
-//! sink in this crate.
-//!
-//! The sink is purely additive — it does NOT touch the MKV mux path.
+//! On-disk shape: the freemkv FVI format (normative spec `docs/FVI_FORMAT.md`)
+//! — JSON Lines, a header object on line 1, then one record per picture.
+//! The sink is purely additive: it does NOT touch the MKV mux path.
+// See docs/fvi-sink.md — relationship to `VideoMap` and extensibility design.
 
 use crate::disc::{DiscTitle, Stream as DiscStream};
 use crate::mux::videomap::{
@@ -74,10 +64,9 @@ fn write_fvi_header(w: &mut dyn Write, h: &MapHeader) -> io::Result<()> {
     w.write_all(b"\n")
 }
 
-/// Write one FVI per-picture record (JSON Lines, `docs/FVI_FORMAT.md` §7) into
-/// `w`. `type`/`key` are codec-agnostic and always emitted; the coding-derived
-/// members (`field_order`, `progressive`, `nb_fields`) are emitted ONLY when the
-/// codec actually measured them — an honest absence, never a guessed default.
+// Write one FVI per-picture record (JSON Lines, `docs/FVI_FORMAT.md` §7).
+// `type`/`key` are always emitted; coding-derived members are emitted only
+// when the codec measured them — an honest absence, never a guessed default.
 fn write_fvi_record(w: &mut dyn Write, r: &PictureRecord) -> io::Result<()> {
     // `src` is REQUIRED (Appendix A); null when provenance absent = "position
     // unknown". Per §9, `src.byte` is the offset WITHIN the sector, so reduce the
@@ -101,13 +90,9 @@ fn write_fvi_record(w: &mut dyn Write, r: &PictureRecord) -> io::Result<()> {
     if let Some(pts) = r.pts_ns {
         obj["pts"] = serde_json::json!(pts);
     }
-    // dts is MAY — the highway carries no DTS on a frame, so it is omitted.
-    // TODO(provenance→recovery join): a `recovered` MAY member (sweep/patch
-    // mapfile overlap with this AU's `src`) belongs here; unreachable at PesFrame.
+    // dts: MAY, always omitted. See docs/fvi-sink.md for the TODO(provenance→recovery join) note.
 
-    // Coding-derived members (§7.1) via codec-agnostic `PictureInfo` accessors,
-    // never the raw bitstream: `field_order` only when measured (OMITTED on
-    // codec-type-only HEVC/H.264/VC-1), `progressive` only when signalled.
+    // See docs/fvi-sink.md — coding-derived record members (§7.1).
     if let Some(c) = r.coding {
         if let Some(fo) = field_order_label(r.coding) {
             obj["field_order"] = serde_json::json!(fo);

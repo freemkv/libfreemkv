@@ -1,20 +1,13 @@
 //! `Disc::extract_tree` — decrypted file-tree extraction (`dir://`).
 //!
-//! Sibling of the disc→ISO sector dump (the sweep/patch recovery passes, which
-//! now live in the `freemkv-engine` crate),
-//! specialized to write **per file** rather than a whole image, applying
-//! decryption on the way out, and **without** any multipass / recovery
-//! orchestration. 1-shot, decrypt-only.
-//!
 //! The filesystem enumeration and decryption are entirely reused:
 //! [`udf::read_filesystem`] yields the recursive [`UdfFs`] tree (BD and DVD
-//! alike — DVD-Video is a UDF bridge volume), and
-//! [`DecryptingSectorSource`](crate::sector::DecryptingSectorSource) applies
-//! AACS / CSS in-place. This module is the focused per-file producer: tree
-//! walk, host-path mapping + per-component sanitization, per-VTS CSS key
-//! grouping, decrypt-and-stream-to-disk, `AACS/` strip, sparse-gap handling,
-//! truncate-to-size, and `.partial` + rename. No new error codes — it reuses
-//! the existing `Error` set (`error.rs` is numeric-only, no English).
+//! alike), and [`DecryptingSectorSource`](crate::sector::DecryptingSectorSource)
+//! applies AACS / CSS in-place. This module is the focused per-file producer:
+//! tree walk, host-path mapping + sanitization, per-VTS CSS key grouping,
+//! decrypt-and-stream-to-disk, sparse-gap handling, and truncate + rename.
+// See docs/extract.md — relation to the sweep/patch ISO recovery passes and
+// the numeric-only error code policy.
 
 use super::Disc;
 use crate::decrypt::DecryptKeys;
@@ -114,20 +107,17 @@ struct PlannedFile {
 }
 
 impl Disc {
+    // See docs/extract.md — reader/extent-read ordering, per-VTS CSS key
+    // resolution, and undecryptable-unit loss accounting.
     /// Extract this disc's **decrypted file tree** to `dest`. 1-shot,
     /// decrypt-only, no recovery loop.
     ///
-    /// `reader` is consumed for content reads (it is moved into a
-    /// [`DecryptingSectorSource`]); the structure + extent metadata are read
-    /// first with the raw reader. `dest` receives the tree STRAIGHT IN (no
-    /// auto-named subfolder). The caller must have run the pre-flight decrypt
-    /// gate ([`ensure_decryptable`](Disc::ensure_decryptable)); this method
-    /// resolves per-VTS CSS keys itself for DVD.
+    /// `reader` is consumed for content reads. `dest` receives the tree
+    /// STRAIGHT IN (no auto-named subfolder). The caller must have run the
+    /// pre-flight decrypt gate ([`ensure_decryptable`](Disc::ensure_decryptable)).
     ///
-    /// Bad sectors become recorded zero-filled holes in the affected file
-    /// (the run does not abort); undecryptable units are counted as loss.
-    /// Files are written `<name>.partial` and renamed on success, so an
-    /// interrupted run never leaves a half-written file that looks complete.
+    /// Bad sectors become zero-filled holes (the run does not abort); files
+    /// are written `<name>.partial` and renamed on success.
     pub fn extract_tree(
         &self,
         reader: &mut dyn SectorSource,
@@ -277,21 +267,9 @@ impl Disc {
         Ok(result)
     }
 
-    /// Resolve the CSS title key for a VTS group by recovering it from the
-    /// group's scrambled title-VOB sectors. The disc-wide key is reused when
-    /// it already covers this VTS (single-VTS discs, or this VTS's span). The
-    /// reader is borrowed from the decrypting decorator (its inner source).
-    ///
-    /// FALLIBLE, because the three outcomes of a crack are not two.
-    /// [`crate::css::CrackOutcome`] exists precisely to separate "no scrambled
-    /// sector was seen, so there is nothing to decrypt" from "scrambled sectors
-    /// were seen and no key came out", and its doc says callers MUST surface
-    /// the second as a hard error. This function used the `Option`-returning
-    /// `crack_key`, which collapses both into `None`, and then fell back to the
-    /// disc-wide key — descrambling this VTS with ANOTHER VTS's title key. The
-    /// hazard is described in the ordering note below, which was written about
-    /// the same fallback; ordering makes the crack far more likely to succeed,
-    /// but it cannot make a failed crack safe.
+    // Resolves the CSS title key for a VTS group from its scrambled title-VOB
+    // sectors. MUST surface a failed crack as a hard error, never silently
+    // fall back to the disc-wide key — see docs/extract.md for why.
     fn resolve_vts_key<S: SectorSource>(
         &self,
         vts: &str,
@@ -346,12 +324,9 @@ impl Disc {
     }
 }
 
-/// A borrowing `SectorSource` wrapper. Lets the decrypting decorator "own" an
-/// inner source for its lifetime while the caller keeps the underlying
-/// `&mut dyn SectorSource` (the decorator is a `DecryptingSectorSource<S>`
-/// generic over `S`, so it does NOT require a `'static` boxed inner — unlike
-/// the mux highway, which takes the reader by value). The decorator is dropped
-/// before `extract_tree` returns, so the borrow never escapes.
+// A borrowing `SectorSource` wrapper: lets the decrypting decorator "own" an
+// inner source for its lifetime while the caller keeps the underlying
+// `&mut dyn SectorSource` — see docs/extract.md for why (vs. the mux highway).
 struct Borrowed<'a>(&'a mut dyn SectorSource);
 
 impl SectorSource for Borrowed<'_> {
@@ -456,12 +431,9 @@ fn plan_tree(
     Ok(())
 }
 
-/// Extract a single planned file: open `<host>.partial`, stream its extents
-/// through the decrypting decorator (bad sectors → recorded zero-filled
-/// holes), truncate to the declared size, then rename to the final name.
-///
-/// Returns `(FileResult, halted)`. When `halted` is true the file was left as
-/// `.partial` (incomplete) because the caller cancelled mid-file.
+// Extracts a single planned file: `<host>.partial`, stream extents through
+// the decrypting decorator (bad sectors -> zero-filled holes), truncate,
+// rename. Returns `(FileResult, halted)`; `halted` means left as `.partial`.
 fn extract_one_file<S: SectorSource>(
     dec: &mut DecryptingSectorSource<S>,
     dest: &Path,
@@ -593,13 +565,9 @@ fn extract_one_file<S: SectorSource>(
     Ok((fr, false))
 }
 
-/// Size the next FILE-ANCHORED content read in whole AACS units. `remaining` is
-/// the sectors left in the current extent; the batch is capped at
-/// [`READ_BATCH_SECTORS`] and rounded DOWN to a whole number of 3-sector units
-/// UNLESS it is the extent's final (possibly short) tail — the tail always
-/// begins on a unit boundary, so a 1–2 sector partial there is handled by
-/// `decrypt_sectors`' trailing-partial contract. Used by `extract_one_file`
-/// so this rounding rule lives in exactly one place.
+// Sizes the next FILE-ANCHORED content read in whole AACS units, capped at
+// READ_BATCH_SECTORS, rounded DOWN to 3-sector units unless it's the
+// extent's final tail — see docs/extract.md for the trailing-partial rule.
 fn whole_unit_batch(remaining: u32) -> u32 {
     let mut batch = remaining.min(READ_BATCH_SECTORS);
     if batch >= AACS_UNIT_SECTORS && batch < remaining {
@@ -608,11 +576,9 @@ fn whole_unit_batch(remaining: u32) -> u32 {
     batch
 }
 
-/// Read one batch through the decrypting decorator with bounded retries.
-/// Returns `true` on success, `false` once retries are exhausted (the caller
-/// then records a hole). A `DecryptFailed` (unit-alignment / no-key) is NOT
-/// retried — it would never succeed; treat it as a content read failure so the
-/// range becomes a recorded hole rather than aborting the whole run.
+// Reads one batch with bounded retries; false once exhausted (caller records
+// a hole). `DecryptFailed` is NOT retried — it would never succeed, so it's
+// treated as a read failure (a hole) rather than aborting the whole run.
 fn read_batch<S: SectorSource>(
     dec: &mut DecryptingSectorSource<S>,
     lba: u32,
@@ -734,15 +700,9 @@ fn available_space(dir: &Path) -> Option<u64> {
     Some(avail)
 }
 
-/// Windows has no `statvfs`. This returned `None` unconditionally, which does
-/// not merely skip a test — it skipped the free-space GATE, so a Windows user
-/// extracting a disc to a full volume got a confusing failure part-way through
-/// instead of a clear refusal up front. libfreemkv ships a Windows GUI, so that
-/// is the platform where the friendly error matters most.
-///
-/// `GetDiskFreeSpaceExW` is declared directly against kernel32, matching how
-/// `scsi::windows` already reaches the Win32 API rather than pulling in a
-/// binding crate for one call.
+// Windows has no `statvfs`; queries free space via `GetDiskFreeSpaceExW`
+// (declared directly against kernel32, matching `scsi::windows`) so the
+// free-space gate still runs — see docs/extract.md for why this matters.
 #[cfg(windows)]
 fn available_space(dir: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
@@ -792,13 +752,9 @@ fn dir_is_non_empty(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Sanitize ONE disc-path component for the host filesystem. Rejects `..`,
-/// host-illegal characters, and control bytes; strips a trailing dot/space
-/// (Windows). A name whose base matches a Windows reserved device name (`NUL`,
-/// `CON`, `COM1`..) is **substituted** (prefixed with `_`) rather than rejected
-/// — a Linux-authored disc may legally carry such a file and a single reserved
-/// name must not abort the whole tree walk. An empty result after stripping is
-/// an error.
+// Sanitizes ONE disc-path component: rejects `..`, host-illegal chars,
+// control bytes; strips trailing dot/space (Windows); substitutes (not
+// rejects) a Windows reserved device name — see docs/extract.md for why.
 fn sanitize_component(name: &str) -> Result<String> {
     if name == ".." || name == "." {
         return Err(Error::DirNameCollision {
@@ -1116,11 +1072,9 @@ mod tests {
         }
     }
 
-    /// Build a file ICB with TWO Short ADs (a fragmented / multi-extent file).
-    /// Each AD records `sectors_each` sectors at its own partition-relative
-    /// `data_lba`. Used to exercise the per-extent AACS unit-base re-anchoring:
-    /// the two extents' absolute starts differ by a non-multiple-of-3 so a
-    /// single (first-extent) unit base mis-aligns the second extent.
+    // A file ICB with TWO Short ADs (a fragmented / multi-extent file), each
+    // recording `sectors_each` sectors at its own `data_lba`. Exercises
+    // per-extent AACS unit-base re-anchoring across a non-3-aligned gap.
     fn build_two_extent_icb(sectors_each: u32, data_lba_a: u32, data_lba_b: u32) -> [u8; 2048] {
         let mut s = [0u8; 2048];
         s[0..2].copy_from_slice(&266u16.to_le_bytes()); // Extended File Entry
@@ -1140,10 +1094,9 @@ mod tests {
         s
     }
 
-    /// Like [`build_two_extent_icb`] but the two extents may have DIFFERENT
-    /// sector counts — used to exercise the within-extent batch-size
-    /// arithmetic (`sectors - sector_off`) with a first extent long enough to
-    /// force a second while-loop iteration.
+    // Like `build_two_extent_icb` but the two extents may have DIFFERENT
+    // sector counts — exercises within-extent batch-size arithmetic with a
+    // first extent long enough to force a second while-loop iteration.
     fn build_two_extent_icb_sized(
         sectors_a: u32,
         data_lba_a: u32,
@@ -1206,11 +1159,9 @@ mod tests {
         unit
     }
 
-    /// A `Disc` carrying an AACS unit key so `decrypt_keys()` returns
-    /// `DecryptKeys::Aacs` (engaging the unit-alignment gate). The content laid
-    /// down by the fixture is genuinely encrypted under the key, so a clean
-    /// per-extent decrypt records zero loss — letting the test isolate the GATE
-    /// (alignment) from a false decrypt-loss tally.
+    // A `Disc` carrying an AACS unit key so `decrypt_keys()` engages the
+    // unit-alignment gate. Content is genuinely encrypted under the key, so a
+    // clean decrypt isolates the GATE from a false decrypt-loss tally.
     fn aacs_disc() -> Disc {
         let mut d = clear_disc();
         d.encrypted = true;
@@ -1483,11 +1434,9 @@ mod tests {
         assert_eq!(res.files[0].bytes_unreadable, good.len() as u64);
     }
 
-    /// An UNDECRYPTABLE unit (DecryptFailed — wrong/missing key) is zero-filled
-    /// and counted as loss through the public API exactly like a bad sector:
-    /// the recovery-seam consolidation folded the old bytes_undecryptable bucket
-    /// into bytes_unreadable, and the run must still report complete == false and
-    /// bytes_lost() > 0 (this gates the CLI exit code / multipass re-run).
+    // An UNDECRYPTABLE unit (wrong/missing key) is zero-filled and counted as
+    // loss exactly like a bad sector; the run must still report complete ==
+    // false and bytes_lost() > 0 (gates the CLI exit code / multipass re-run).
     #[test]
     fn undecryptable_unit_holes_file_and_accounts_loss() {
         let good = vec![0x55u8; 4 * 2048];
@@ -1591,13 +1540,9 @@ mod tests {
         assert!(matches!(err, Error::DirNameCollision { .. }));
     }
 
-    /// Two disc names differing only by CASE are one host file on macOS APFS
-    /// and Windows NTFS, both case-insensitive by default. Keyed by the
-    /// case-preserving path, the collision map sees two entries, raises
-    /// nothing, and the second file extracted overwrites the first — while both
-    /// `PlannedFile`s report `complete: true`. Silent data loss reported as a
-    /// clean extract is the one outcome this crate must never produce, so the
-    /// host-equivalence key has to model the host's namespace, not the disc's.
+    // Two disc names differing only by CASE fold to one host file on macOS
+    // APFS / Windows NTFS — must be a collision, not a silent overwrite
+    // reported clean. See docs/extract.md for the failure this prevents.
     #[test]
     fn names_differing_only_by_case_are_a_collision() {
         let root = DirSpec {
@@ -1618,12 +1563,9 @@ mod tests {
         assert!(matches!(err, Error::DirNameCollision { .. }), "got {err:?}");
     }
 
-    /// A file's in-flight `.partial` path shares the host namespace with every
-    /// other planned file's FINAL path. A disc carrying both `X` and
-    /// `X.partial` plans two distinct final names, so nothing collides — but
-    /// extracting `X` writes through `X.partial`, the same host path the other
-    /// file owns. Whichever lands second truncates the other, and both entries
-    /// are still reported complete.
+    // A file's in-flight `.partial` path shares the host namespace with
+    // another planned file's FINAL path (disc carries both `X` and
+    // `X.partial`) — see docs/extract.md for why this must be an error.
     #[test]
     fn a_files_partial_path_colliding_with_another_files_final_name_is_an_error() {
         let root = DirSpec {
@@ -1701,17 +1643,9 @@ mod tests {
         assert!(!is_title_vob("VTS_01_1.IFO"));
     }
 
-    /// Regression (rc.6 audit, finding #449): a MULTI-EXTENT AACS file must
-    /// re-anchor the unit-alignment base PER extent, not once at the first
-    /// extent. The two extents here start at absolute LBAs whose difference is
-    /// NOT a multiple of 3 (PART_START+5000 vs PART_START+5004 → Δ4 sectors).
-    /// With a single first-extent unit base the second extent's first read is
-    /// off the unit grid (offset 4, 4 % 3 == 1) → `is_unit_aligned` fails →
-    /// `DecryptFailed` → the whole extent becomes a zero-filled (false) hole.
-    /// With per-extent anchoring both extents read clean: bytes_unreadable == 0
-    /// and the file content survives. The fixture content is clear (no TS
-    /// syncs) so the decrypt step restores each unit verbatim — this isolates
-    /// the GATE from the cipher math.
+    // Regression (rc.6 audit, finding #449): a MULTI-EXTENT AACS file must
+    // re-anchor the unit-alignment base PER extent, not once at the first —
+    // see docs/extract.md for the alignment arithmetic this guards against.
     #[test]
     fn multi_extent_aacs_anchors_unit_base_per_extent() {
         const SECTORS_EACH: u32 = 3; // one AACS unit per extent
@@ -1776,18 +1710,9 @@ mod tests {
         );
     }
 
-    /// An ECMA-167 4/14.14.1.1 type-1 extent is ALLOCATED BUT NOT RECORDED:
-    /// the space belongs to the file and occupies its byte range, but nothing
-    /// was ever written there, and the standard defines its contents as zeros.
-    /// `read_icb_extents` keeps the flag (`IcbExtent::recorded`) and
-    /// `read_file_limited` honours it by emitting zeros WITHOUT touching the
-    /// media. The tree extractor reads the same ICBs and must agree: reading
-    /// those sectors returns whatever the media happens to hold there — on an
-    /// AACS disc, ciphertext that decrypts to noise — and writes it into the
-    /// extracted file as if the disc had recorded it.
-    ///
-    /// The hole here is filled with a recognisable non-zero pattern, so
-    /// "emitted zeros" and "read the media" are told apart by CONTENT.
+    // An ECMA-167 4/14.14.1.1 type-1 extent is ALLOCATED BUT NOT RECORDED and
+    // must be zero-filled, not read from media — see docs/extract.md. The
+    // hole is filled with a non-zero pattern so the two paths differ by CONTENT.
     #[test]
     fn extract_tree_zero_fills_an_unrecorded_extent_instead_of_reading_it() {
         const SECTORS_EACH: u32 = 1;
@@ -1833,12 +1758,9 @@ mod tests {
         assert!(res.complete);
     }
 
-    /// Focused alignment-computation check underpinning the per-extent fix:
-    /// when each extent anchors its OWN start as the unit base, the extent's
-    /// own batch starts are always unit-aligned; anchoring a later extent
-    /// against the FIRST extent's base mis-aligns whenever the extents' starts
-    /// differ by a non-multiple of 3 sectors. This is the exact arithmetic the
-    /// decrypt-on-read gate (`aacs::content::is_unit_aligned`) performs.
+    // Focused alignment-computation check underpinning the per-extent fix
+    // (`aacs::content::is_unit_aligned`'s exact arithmetic) — see
+    // docs/extract.md for the full per-extent-vs-first-extent-base reasoning.
     #[test]
     fn per_extent_base_is_aligned_first_extent_base_is_not() {
         use crate::aacs::content::is_unit_aligned;
@@ -1926,10 +1848,9 @@ mod tests {
         );
     }
 
-    /// The free-space pre-check must fire whenever the disc's declared total
-    /// exceeds real available space. An absurdly large declared size (an
-    /// exabyte) trips it regardless of the actual free space on whatever
-    /// machine runs the test.
+    // The free-space pre-check must fire whenever the disc's declared total
+    // exceeds real available space; an exabyte size trips it regardless of
+    // actual free space on whatever machine runs the test.
     #[test]
     fn insufficient_space_errors_on_absurdly_large_required() {
         let root = DirSpec {
@@ -1955,13 +1876,9 @@ mod tests {
         assert!(matches!(err, Error::DirInsufficientSpace { .. }));
     }
 
-    /// Regression: the per-VTS key crack in `resolve_vts_key` must gather ONLY
-    /// this VTS's own title-VOB extents. Two VTS groups here carry DISTINCT
-    /// scrambling keys; if the group filter (`vts_group_of(..) == Some(vts) &&
-    /// is_title_vob(..)`) is loosened (`!=`, or `&&` -> `||`), one VTS's
-    /// resolve gathers the OTHER VTS's extents, cracks the wrong key, and that
-    /// VTS's own content silently fails to descramble to the expected
-    /// plaintext.
+    // Regression: the per-VTS key crack in `resolve_vts_key` must gather ONLY
+    // this VTS's own title-VOB extents, not a sibling VTS's — see
+    // docs/extract.md for the group-filter loosening this guards against.
     #[test]
     fn css_two_vts_groups_do_not_cross_contaminate_keys() {
         fn scrambled_vob(title_key: [u8; 5], marker: u8) -> (Vec<u8>, Vec<u8>) {
@@ -2039,18 +1956,9 @@ mod tests {
         assert!(res.complete);
     }
 
-    /// A VTS that IS scrambled but whose key could not be recovered must
-    /// FAIL, not borrow another VTS's key.
-    ///
-    /// `crack_key` returns `Option`, which collapses "no scrambled sector was
-    /// seen" with "scrambled sectors were seen and no key came out"; the
-    /// fallback then descrambled this VTS under the disc-wide key and
-    /// `extract_tree` reported `complete = true` at exit 0, because no read had
-    /// failed. `CrackOutcome` exists to keep those two apart, and every sibling
-    /// path in the crate already honours it.
-    ///
-    /// The fixture: VTS_01 is crackable, VTS_02 is scrambled with NO periodic
-    /// crib, so its crack genuinely fails.
+    // A VTS that IS scrambled but whose key could not be recovered must FAIL,
+    // not borrow another VTS's key (`CrackOutcome`, not `Option`) — see
+    // docs/extract.md. VTS_01 here is crackable, VTS_02 genuinely fails.
     #[test]
     fn a_scrambled_vts_that_cannot_be_cracked_fails_instead_of_borrowing_a_key() {
         let key_1 = [0x10u8, 0x20, 0x30, 0x40, 0x50];
@@ -2119,13 +2027,9 @@ mod tests {
         );
     }
 
-    /// `Borrowed` is a thin forwarding wrapper the decrypting decorator uses
-    /// to avoid taking ownership of the caller's reader -- every
-    /// `SectorSource` method must forward to the wrapped `&mut dyn
-    /// SectorSource` verbatim. Calling directly on a concrete `Borrowed`
-    /// value (not through `&mut dyn SectorSource`) exercises the actual
-    /// forwarding body via static dispatch, not vtable dispatch through a
-    /// trait object.
+    // `Borrowed` must forward every `SectorSource` method to the wrapped
+    // `&mut dyn SectorSource` verbatim; calling on a concrete `Borrowed`
+    // value exercises the forwarding body via static, not vtable, dispatch.
     #[test]
     fn borrowed_forwards_every_sector_source_call() {
         struct Recorder {
@@ -2173,14 +2077,9 @@ mod tests {
         );
     }
 
-    /// Regression: within ONE extent, a batch's "sectors remaining IN THIS
-    /// EXTENT" must be computed as `sectors - sector_off`, not `sectors +
-    /// sector_off`. The latter inflates without bound as the loop advances,
-    /// letting a later batch's read run PAST this extent's true end into
-    /// whatever content sits at the following LBAs (an unrelated disc region
-    /// in this fixture) and get written into the file as if it were this
-    /// extent's own data -- untrusted-disc content bleed across extent
-    /// boundaries.
+    // Regression: within ONE extent, "sectors remaining IN THIS EXTENT" must
+    // be `sectors - sector_off`, not `sectors + sector_off` — the latter lets
+    // a later batch read PAST the extent into unrelated content. See docs/extract.md.
     #[test]
     fn extent_second_batch_stays_within_its_own_bounds() {
         // Extent A: 1600 sectors of pattern 'A' -- just over
@@ -2239,11 +2138,9 @@ mod tests {
         assert_eq!(res.bytes_unreadable, 0);
     }
 
-    /// Pure-function coverage of `whole_unit_batch`'s cap: a batch that is
-    /// NOT the extent's final chunk (there is more remaining after it) is
-    /// capped at `READ_BATCH_SECTORS`, which is itself an exact multiple of
-    /// `AACS_UNIT_SECTORS` (1536 = 512 * 3) -- so the result is already
-    /// unit-aligned.
+    // A batch that is NOT the extent's final chunk is capped at
+    // READ_BATCH_SECTORS, itself an exact multiple of AACS_UNIT_SECTORS
+    // (1536 = 512 * 3), so the result is already unit-aligned.
     #[test]
     fn whole_unit_batch_caps_mid_stream_batches() {
         assert_eq!(whole_unit_batch(2000), READ_BATCH_SECTORS);
@@ -2251,12 +2148,9 @@ mod tests {
         assert_eq!(whole_unit_batch(READ_BATCH_SECTORS + 2), READ_BATCH_SECTORS);
     }
 
-    /// Pure-function coverage of `whole_unit_batch`'s tail contract: the
-    /// FINAL chunk of an extent (`batch == remaining`, i.e. `remaining <=
-    /// READ_BATCH_SECTORS`) must NOT be rounded down to a unit boundary, even
-    /// when it is not itself a multiple of 3 -- `decrypt_sectors`'s
-    /// trailing-partial contract handles a non-multiple tail specially, and
-    /// rounding it here would silently drop sectors from the read.
+    // The FINAL chunk of an extent (`batch == remaining`) must NOT be rounded
+    // down to a unit boundary even when not a multiple of 3 — rounding it
+    // would silently drop sectors; `decrypt_sectors` handles the tail specially.
     #[test]
     fn whole_unit_batch_true_tail_is_never_rounded() {
         assert_eq!(whole_unit_batch(5), 5);
@@ -2266,10 +2160,9 @@ mod tests {
         assert_eq!(whole_unit_batch(READ_BATCH_SECTORS), READ_BATCH_SECTORS);
     }
 
-    /// `read_batch` must retry a non-decrypt read failure up to
-    /// `READ_RETRIES` times and succeed if a later attempt does -- a
-    /// transient failure must not be treated as permanent on the very first
-    /// try.
+    // `read_batch` must retry a non-decrypt failure up to READ_RETRIES times
+    // and succeed if a later attempt does — not treat a transient failure as
+    // permanent on the first try.
     #[test]
     fn read_batch_retries_transient_failures_and_succeeds() {
         struct FlakySource {
@@ -2371,11 +2264,9 @@ mod tests {
         );
     }
 
-    /// `available_space` must return the real free-space figure (`Some`) for
-    /// an existing directory on a platform that exposes it -- the free-space
-    /// pre-check in `extract_tree` silently no-ops whenever this returns
-    /// `None`, so a `statvfs` SUCCESS (`rc == 0`) must never be read as
-    /// "unavailable".
+    // `available_space` must return `Some` for an existing dir on a platform
+    // that exposes it — the free-space pre-check silently no-ops on `None`,
+    // so a `statvfs` SUCCESS must never be read as "unavailable".
     #[cfg(unix)]
     #[test]
     fn available_space_reports_free_bytes_on_a_real_dir() {

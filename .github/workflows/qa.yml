@@ -24,6 +24,19 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Single source of truth for the MSRV — see ci.yml. Jobs that build/test AT
+  # the MSRV read `needs.resolve-msrv.outputs.v` from Cargo.toml's rust-version;
+  # clippy (cross-lint) runs on stable instead.
+  resolve-msrv:
+    runs-on: ubuntu-latest
+    outputs:
+      v: ${{ steps.msrv.outputs.v }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: msrv
+        shell: bash
+        run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
+
   # ── Name the candidate ────────────────────────────────────────────────
   #
   # Every push to `qa` is a release candidate, so every push gets a tag:
@@ -65,6 +78,7 @@ jobs:
   # changes what the optimiser can prove. A test that only passes in debug is
   # a test that never guarded the binary anyone actually ships.
   release-tests:
+    needs: resolve-msrv
     strategy:
       fail-fast: false
       matrix:
@@ -79,7 +93,9 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: qa
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: libfreemkv
@@ -100,7 +116,9 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: qa
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.88.0
+      # clippy runs on stable (matches ci.yml's lint job); build/test stay on
+      # the MSRV pin. See ci.yml for why the lint toolchain need not be the MSRV.
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -115,6 +133,7 @@ jobs:
   # of the SCSI transport and platform layers compile on no other runner, so
   # without this they are first built at release time.
   windows-build:
+    needs: resolve-msrv
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -125,7 +144,9 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: qa
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: libfreemkv

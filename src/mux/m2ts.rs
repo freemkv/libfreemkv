@@ -164,14 +164,9 @@ mod tests {
         }
     }
 
-    /// An H.264 track's codec_private is an **avcC** record, not hvcC. The BD-TS
-    /// muxer must parse it with the avcC parser and emit the SPS/PPS as Annex-B
-    /// parameter sets, or the H.264 elementary stream reaches the player with no
-    /// SPS/PPS at all and is undecodable — silently, because frame_count still
-    /// advances and the mux reports success.
-    ///
-    /// Mutation: parse codec_private with hvcc_to_annex_b (the pre-fix behaviour) ->
-    /// the parser returns None, no parameter sets are emitted, and this fails.
+    // avcC (not hvcC) must parse via the avcC parser so SPS/PPS reach the
+    // player as Annex-B; otherwise the ES is silently undecodable.
+    // See docs/m2ts.md — h264_avcc_parameter_sets_are_emitted_as_annex_b
     #[test]
     fn h264_avcc_parameter_sets_are_emitted_as_annex_b() {
         let sps: &[u8] = &[0x67, 0x42, 0xC0, 0x1E, 0xAB, 0xCD];
@@ -226,16 +221,9 @@ mod tests {
         );
     }
 
-    /// `M2tsStream::create` must opt a VC-1 video track OUT of Annex-B conversion.
-    ///
-    /// This pins the WIRING in `create`, not just `TsMuxer`'s flag: deleting the
-    /// `set_video_codec` loop leaves every TsMuxer-level test passing, because those
-    /// drive the muxer directly and set the flag themselves. Only a test that goes
-    /// through `create` catches it — and mangling MPEG-2/VC-1 video is silent, since
-    /// frame_count still increments and the mux reports success.
-    ///
-    /// Mutation: remove the `set_video_codec` loop from `create`, or make it declare
-    /// Vc1 as a NAL codec -> the ES gains a start code and this fails.
+    // create() must opt VC-1 video OUT of Annex-B conversion; this pins the
+    // wiring in create() itself, not just TsMuxer's flag.
+    // See docs/m2ts.md — vc1_video_is_wired_to_the_non_nal_path
     #[test]
     fn vc1_video_is_wired_to_the_non_nal_path() {
         let mut title = make_title();
@@ -301,11 +289,13 @@ mod tests {
         let header_end = cursor.position() as usize;
         let ts_bytes = &buf[header_end..];
 
-        // Find first PUSI packet on VIDEO_PID; verify RAI in AF flags.
-        // chunks_exact drops a partial trailing chunk — only whole 192-byte
-        // BD-TS packets are valid, and it avoids OOB indexing on a short chunk.
+        // First PUSI packet on VIDEO_PID; verify RAI in AF flags. as_chunks
+        // drops a partial trailing chunk (.0 = whole chunks only) — valid BD-TS
+        // packets are 192 bytes, and it avoids OOB indexing on a short chunk.
         let pkt = ts_bytes
-            .chunks_exact(192)
+            .as_chunks::<192>()
+            .0
+            .iter()
             .find(|p| {
                 let h = &p[4..];
                 let pid = (((h[1] & 0x1F) as u16) << 8) | h[2] as u16;

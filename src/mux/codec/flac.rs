@@ -1,18 +1,13 @@
 //! FLAC elementary-stream decodability gate.
 //!
-//! FLAC frames carry no length field, so a raw stream is delimited only by
-//! sync-scanning + CRC validation. In freemkv, though, FLAC never arrives raw:
-//! it comes from mp4/mkv, where each packet is exactly one container-delimited
-//! FLAC frame (a complete, pre-delimited frame per packet). So this parser
-//! is a per-packet gate, not a framer: every FLAC frame ends with a 16-bit CRC
-//! (poly 0x8005, init 0, non-reflected) computed so the residue over the whole
-//! frame — footer CRC included — is zero (per the FLAC format specification,
-//! RFC 9639, frame footer). A
-//! nonzero residue is definitive corruption → drop the frame (a silence gap,
-//! never a shift — each packet keeps its own PTS), logged via the shared tally.
+//! Per-packet gate, not a framer: each PES packet is one container-delimited
+//! FLAC frame. Every frame ends with a 16-bit CRC (poly 0x8005, init 0,
+//! non-reflected) over the whole frame including the footer; a valid frame
+//! has zero residue (RFC 9639, frame footer). Nonzero residue → corruption:
+//! drop the frame (silence gap, PTS preserved), logged via the shared tally.
+//! A packet without the FLAC sync passes through unchanged (never false-dropped).
 //!
-//! A packet that does not begin with the FLAC frame sync is not a delimited
-//! frame we can validate, so it is passed through unchanged (never false-dropped).
+//! See docs/flac.md for the raw-stream-vs-container-delimited framing rationale.
 
 use super::crc::crc16_ansi;
 use super::dropgate::DropTally;
@@ -35,11 +30,9 @@ const FLAC_SAMPLE_RATE_TABLE: [u32; 16] = [
     0, 0, 0,
 ];
 
-/// Best-effort duration (ns) of a FLAC frame from its header block-size and
-/// sample-rate codes (byte 2). Only the table-coded cases are resolved; the
-/// explicit-in-trailing-bytes codes (block 6/7, rate 12/13/14) and
-/// STREAMINFO-derived (code 0) return `None`. Used only for the dropped-audio
-/// accounting, so a `None` (→ 0) is harmless.
+// Best-effort duration (ns) from header block-size/sample-rate codes; the
+// explicit-in-trailing-bytes and STREAMINFO-derived codes return None. Used
+// only for dropped-audio accounting, so a None (→ 0) is harmless.
 fn flac_frame_duration_ns(frame: &[u8]) -> Option<i64> {
     if frame.len() < 3 {
         return None;
@@ -241,11 +234,9 @@ mod tests {
         assert!(p.parse(&make_pes(Vec::new(), Some(0))).is_empty());
     }
 
-    /// FLAC packets are self-framing: `parse` emits or drops each one on the
-    /// spot and buffers nothing, so `flush` has nothing to deliver. A
-    /// manufactured tail frame would be a zero-length block at PTS 0 appended
-    /// after the track's real end — a backwards timestamp (RFC 9559 §5.1.3.2)
-    /// carrying no decodable FLAC frame.
+    // FLAC packets are self-framing: parse() emits/drops on the spot, buffering
+    // nothing, so flush() delivers nothing. A manufactured tail frame would be a
+    // backwards-timestamp phantom (RFC 9559 §5.1.3.2) with no real FLAC frame.
     #[test]
     fn flush_adds_no_phantom_frame_after_the_last_real_packet() {
         let mut p = FlacParser::new();
@@ -271,11 +262,9 @@ mod tests {
         assert_eq!(emitted.len() + tail.len(), 2);
     }
 
-    /// The text guard in `codec/mod.rs` scans for a literal `source: None` and
-    /// cannot see a parser that writes `source: facts.source` where the facts
-    /// carry no offset. Only a runtime check proves an emitted frame really
-    /// carries the byte it was read from, and without it a multi-clip title
-    /// places this track by timestamp inference instead of by byte.
+    // The text guard in codec/mod.rs can't see `source: facts.source` writing a
+    // missing offset; only a runtime check proves the emitted frame carries the
+    // byte it was read from — needed for multi-clip placement by byte, not PTS.
     #[test]
     fn an_emitted_frame_carries_the_packets_source_offset() {
         let mut p = FlacParser::new();
