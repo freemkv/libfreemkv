@@ -96,10 +96,10 @@ jobs:
           workspaces: libfreemkv
       - run: cargo fmt --check
         working-directory: libfreemkv
-      # libfreemkv is a library — Cargo.lock is gitignored. --locked
-      # would always fail on a fresh runner because there's no committed
-      # lockfile to lock against. The binary crates (freemkv, autorip,
-      # bdemu) track Cargo.lock and DO use --locked.
+      # Cargo.lock is now committed (issue #15) and the `deny` job audits the
+      # resolved graph, but --locked is still omitted: CI's sibling path-patch
+      # layout resolves the freemkv crates as path packages, which --locked
+      # can't satisfy — the same reason the binary crates omit it in ci.yml.
       # --all-targets so TEST code is linted too. Without it this crate — the
       # reference implementation for the other seven — was the only one whose
       # tests had never been linted at all, and it was hiding 74 findings.
@@ -135,6 +135,32 @@ jobs:
           workspaces: libfreemkv
       - run: cargo test --tests
         working-directory: libfreemkv
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: libfreemkv
+      # libfreemkv path-deps ../freemkv-unlock on the BRANCH tip (release.sh
+      # swaps it to a git tag only inside the tagged commit, then restores the
+      # path dep). CI checks out one repo, so the branch tip has never been
+      # buildable here — every green run you have ever seen was a tag build,
+      # and Windows/Linux were first compiled at release time.
+      #
+      # Both repos go into subdirectories because actions/checkout refuses a
+      # `path:` outside $GITHUB_WORKSPACE, and `../freemkv-unlock` is outside.
+      # With this layout the path dep resolves exactly as it does locally.
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-unlock
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+          manifest-path: libfreemkv/Cargo.toml
 
   check-macos:
     # dev is the FAST lane: this job still runs, but on the release-candidate
@@ -307,8 +333,8 @@ jobs:
   # workspace and working-directory. cargo-llvm-cov comes as a prebuilt binary
   # from taiki-e/install-action, so it is toolchain-independent.
   #
-  # No `--locked`: like the fmt/clippy/test jobs above, this crate's Cargo.lock
-  # is gitignored, so there is nothing to lock against on a fresh runner.
+  # No `--locked`: like the fmt/clippy/test jobs above, the sibling path-patch
+  # layout resolves the freemkv crates as path packages, which --locked can't satisfy.
   coverage:
     needs: resolve-msrv
     runs-on: ubuntu-latest

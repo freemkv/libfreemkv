@@ -45,8 +45,9 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
-      # libfreemkv is a library — Cargo.lock isn't tracked, so --locked
-      # would always fail (no lockfile to lock against on a fresh runner).
+      # Cargo.lock is now committed (issue #15), but --locked is still omitted:
+      # the sibling path-patch layout resolves the freemkv crates as path
+      # packages, which --locked can't satisfy.
       - run: cargo test
 
   # NOTE: there is no crates.io publish job. libfreemkv is git-tag-only
