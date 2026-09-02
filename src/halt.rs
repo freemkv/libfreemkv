@@ -5,11 +5,7 @@
 //! cleanly. Calling `cancel()` from any clone flips the shared flag, and
 //! every other clone observes it on its next poll.
 //!
-//! Why: `Ordering::Relaxed` is sufficient on both load and store because
-//! this flag is purely advisory — no other memory operations piggyback on
-//! it for happens-before ordering. Callers that need to publish data
-//! across threads do so via channels or other synchronization, not via
-//! this bit.
+//! See docs/halt.md — why `Ordering::Relaxed` is sufficient here.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,11 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// no `reset()` by design — construct a fresh `Halt` for a fresh
 /// operation.
 ///
-/// Construct with [`Halt::new`] (or [`Halt::default`]). The `Default`
-/// impl forwards to `new()` — both produce a fresh, uncancelled token.
-/// The pair exists because clippy's `new_without_default` lint requires
-/// `Default` whenever a public `new()` is present, even when the two
-/// would do exactly the same thing.
+/// Construct with [`Halt::new`] (or [`Halt::default`]); both produce a
+/// fresh, uncancelled token. `Default` forwards to `new()` — the pair
+/// exists because clippy's `new_without_default` lint requires it.
 #[derive(Clone, Debug)]
 pub struct Halt(Arc<AtomicBool>);
 
@@ -73,13 +67,8 @@ impl Default for Halt {
 /// `bounded_syscall` checks the cancellation flag and the deadline
 /// every [`POLL_INTERVAL`] while blocked on a worker; the same
 /// cadence governs `Pipeline::send_with_halt`'s `try_send` retry.
-/// 250 ms is the sweet spot between responsiveness (operator presses
-/// Stop, sees it take effect within ~quarter-second) and waste
-/// (atomic load + clock read is cheap but not free at thousands of
-/// hertz).
 ///
-/// Centralised here so the half-dozen halt-polling loops across `io`
-/// can't drift apart silently.
+/// See docs/halt.md — why 250ms, and why this constant is centralised.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(test)]

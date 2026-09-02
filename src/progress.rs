@@ -6,11 +6,7 @@
 //! compute their own single derived view from these fields and never reach
 //! into per-pass internals.
 //!
-//! Why this matters: pre-0.13.16 the API leaked `pos`, `bytes_good`,
-//! `work_done`, `bytes_pending`, `Finished/NonTrimmed` mapfile semantics —
-//! and consumers reinvented the math each time they wanted a percentage.
-//! UIs ended up reading one source while server-side computed from another,
-//! producing wrong percentages without anyone noticing.
+//! See docs/progress.md — why this design (pre-0.13.16 leaked-field history).
 
 /// Identifies which pipeline phase the progress event belongs to.
 ///
@@ -87,17 +83,8 @@ pub struct LocatedProgress {
 /// cumulative count of confirmed-clean bytes across the whole rip; useful
 /// for the "data recovered" stat the user sees.
 ///
-/// For `PassKind::Verify`, the fields map as follows:
-/// - `work_done` = sectors read so far
-/// - `work_total` = total sectors in title
-/// - `bytes_good_total` = good + slow + recovered sectors × 2048
-/// - `bytes_unreadable_total` = bad sectors × 2048
-/// - `bytes_pending_total` = 0 (verify processes sequentially, nothing pending)
-///
-/// NOT `Copy`: `located` carries a `Vec`. Constructed once per (throttled)
-/// emission and passed by reference to `Progress::report`, so this costs one
-/// small heap alloc per UI tick — cheap, and it makes `PassProgress` the single
-/// complete contract a client renders from.
+/// See docs/progress.md — `PassKind::Verify` field mapping, and why
+/// `PassProgress` is NOT `Copy`.
 #[derive(Debug, Clone)]
 pub struct PassProgress {
     pub kind: PassKind,
@@ -178,12 +165,9 @@ impl PassProgress {
 /// `Heartbeat` and calls [`tick`](Heartbeat::tick) each iteration. `tick`
 /// emits a `DEBUG` event on target `freemkv::heartbeat` at most once per
 /// interval (default 5s), so a stalled loop is visible in the log as the
-/// absence of a beat, and a slow-but-alive loop shows steady progress.
+/// absence of a beat.
 ///
-/// `tick` is cheap on the hot path: it reads one `Instant` and compares. For
-/// pure-CPU inner loops where even that is too much, use
-/// [`tick_cpu`](Heartbeat::tick_cpu), which only consults the clock every 256
-/// calls.
+/// See docs/progress.md — hot-path cost and [`tick_cpu`](Heartbeat::tick_cpu).
 #[derive(Debug)]
 pub struct Heartbeat {
     phase: &'static str,
@@ -342,10 +326,8 @@ mod pass_progress_tests {
         }
     }
 
-    /// The ordinary case: a quarter of the work done reads 25%, not some other
-    /// arrangement of the same three numbers. The exact value is what pins the
-    /// arithmetic — `done / total * 100` and `done * total / 100` and
-    /// `done / total + 100` all "look like" a percentage and only one is right.
+    // Pins the exact arithmetic (`done / total * 100`, not `done * total / 100`
+    // or `done / total + 100` — all "look like" a percentage).
     #[test]
     fn work_pct_is_done_over_total_scaled_to_a_hundred() {
         let p = PassProgress {
@@ -400,10 +382,8 @@ mod pass_progress_tests {
         assert_eq!(p.good_pct(), 75.0);
     }
 
-    /// An unknown disc size reports 100% clean, matching `bad_pct` and
-    /// `pending_pct` both reporting 0% there: the triple is the coherent
-    /// "nothing known to be damaged" state a client renders before the disc
-    /// size is established, rather than three percentages that disagree.
+    // Unknown disc size: good=100%, bad/pending=0% — the coherent
+    // "nothing known damaged" state, not three disagreeing percentages.
     #[test]
     fn good_pct_with_unknown_disc_size_reports_clean() {
         assert_eq!(sample().good_pct(), 100.0);
@@ -499,11 +479,9 @@ mod pass_progress_tests {
         );
     }
 
-    /// The three disc-relative percentages read three DIFFERENT byte counters.
-    /// Nothing above would catch `bad_pct` reading `bytes_pending_total`: each
-    /// test sets one counter and leaves the others zero, so a swapped field
-    /// still returns the right answer for its own test. This one sets all three
-    /// to distinct values at once.
+    // The three disc-relative percentages read distinct byte counters. Earlier
+    // tests set one counter at a time, so a swapped field would slip past them;
+    // this one sets all three to distinct values at once.
     #[test]
     fn the_disc_percentages_read_distinct_counters() {
         let p = PassProgress {
@@ -526,10 +504,9 @@ mod pass_progress_tests {
         );
     }
 
-    /// A closure IS a `Progress` via the blanket impl, and its return value is
-    /// the cancellation signal: `false` means stop. A blanket body that ignored
-    /// the closure and returned a constant would make every closure-based
-    /// consumer uncancellable — the caller asks to stop, the rip keeps going.
+    // A closure is a `Progress` via the blanket impl; its return value is the
+    // cancellation signal. A constant-returning blanket body would make every
+    // closure-based consumer uncancellable.
     #[test]
     fn the_closure_blanket_impl_returns_the_closures_own_verdict() {
         fn ask<P: Progress>(p: &P, s: &PassProgress) -> bool {

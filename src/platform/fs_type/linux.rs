@@ -19,15 +19,9 @@ const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
 const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 
-/// Classify an `f_type` magic from `statfs`/`fstatfs`. Single source
-/// of truth for the magic comparisons used by both the path-based
-/// (`detect_impl`) and fd-based (`detect_fd_impl`) entry points.
-///
-/// Cast to `i64` because `statfs::f_type` is signed `__fsword_t` on
-/// glibc and unsigned `c_ulong` on musl; a portable comparison needs a
-/// common type. On glibc x86_64 both already are i64 — clippy flags
-/// the cast as unnecessary on that target only, but we need it for
-/// musl.
+// Classify an `f_type` magic from `statfs`/`fstatfs`; shared by the
+// path-based and fd-based entry points. See docs/fs-type-linux.md for
+// why the `i64` cast (and its clippy allow) is needed.
 #[allow(clippy::unnecessary_cast)]
 fn classify_f_type(f_type: i64) -> FsType {
     let nfs_magic = libc::NFS_SUPER_MAGIC as i64;

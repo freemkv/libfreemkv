@@ -21,8 +21,7 @@ pub(crate) fn hint_sequential(_file: &File, _len_bytes: u64) {
 /// for now.
 pub(crate) fn drop_window(_file: &File, _start: u64, _len: u64) {}
 
-/// Windows async-prefetch hint. With FILE_FLAG_SEQUENTIAL_SCAN at
-/// open the kernel already prefetches aggressively, so there's no
-/// per-range hint we'd add on top. No-op stub for parity with the
-/// posix platforms.
+// Async-prefetch hint. FILE_FLAG_SEQUENTIAL_SCAN at open already makes
+// the kernel prefetch aggressively, so there's no per-range hint to add.
+// No-op stub for parity with the posix platforms.
 pub(crate) fn prefetch(_file: &File, _offset: u64, _len: u64) {}

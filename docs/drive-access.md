@@ -241,3 +241,13 @@ Available speeds:
 | Blu-ray | 1x (4,500 KB/s) through 12x (54,000 KB/s) |
 | DVD | 1x (1,385 KB/s) through 16x (22,160 KB/s) |
 | Max | 0xFFFF (drive decides) |
+
+---
+
+## Windows Path Normalization
+
+`normalize_path` in `src/drive/windows.rs` converts a device path ("D:",
+"D:\\", "\\.\D:", "\\.\CdRom0") to Windows `\\.\X:` form. A near-identical
+`normalize_device_path` exists in `scsi::windows`; both are kept because
+they live in separate `cfg(windows)` modules that cannot easily share a
+helper without introducing cross-module coupling.

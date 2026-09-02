@@ -1,26 +1,11 @@
 //! Structured scan diagnostics — the `--log-level 3` self-diagnosing dump.
 //!
-//! A bug report log must be self-diagnosing: everything needed to explain
-//! *why* freemkv made the choices it did at scan must be in the log, in a
-//! compact, machine-parseable form. This module emits one terse line per row
-//! (title, cell, stream, decision) under the `tracing` target
-//! `freemkv::diag`, which the CLI routes to `log.txt` when `--log-level 3`
-//! (debug) is set.
-//!
-//! Format conventions (stable, greppable):
-//!   - Every line is prefixed by a `tag=` so a log scraper can filter
-//!     (`disc`, `title`, `dvd.cell`, `dvd.vattr`, `dvd.aattr`, `bd.clip`,
-//!     `bd.mark`, `aacs`, `stream`, `decision`).
-//!   - Raw bytes are shown as `0xNN` next to their decode so a wrong decode
-//!     is obvious against the raw value.
-//!   - This module only READS already-parsed scan state — it never re-reads
-//!     the disc and never mutates anything.
-//!
-//! The DVD per-cell table (with the raw cell-category byte) is emitted from
-//! the IFO scan itself ([`dump_dvd_cells`]), because the per-cell
-//! `ifo::DvdCell` detail is lowered away before the `Disc` is built. The
-//! `Disc`-level dump ([`dump_disc`]) covers everything that survives
-//! lowering: titles, streams, the picked main feature, and AACS state.
+//! Emits one terse line per row (title, cell, stream, decision) under the
+//! `tracing` target `freemkv::diag`, routed to `log.txt` at `--log-level 3`.
+//! Every line is prefixed `tag=` (`disc`, `title`, `dvd.cell`, `dvd.vattr`,
+//! `dvd.aattr`, `bd.clip`, `bd.mark`, `aacs`, `stream`, `decision`) so a log
+//! scraper can filter, and raw bytes are shown as `0xNN` beside their decode.
+//! This module only reads already-parsed scan state; see docs/diag.md.
 
 use crate::disc::{ColorSpace, Disc, DiscTitle, FrameRate, HdrFormat, Resolution, Stream};
 use crate::ifo::{CellCategory, DvdTitle};
@@ -92,9 +77,8 @@ pub fn hdr_str(h: HdrFormat) -> &'static str {
     }
 }
 
-// `channel_count`/`sample_rate_hz` used to live here as a third, HONEST copy of
-// the AudioChannels/SampleRate mappings (returning 0 for Unknown where the
-// canonical accessors fabricated 6ch/48kHz). Canonical accessors are honest now.
+// `channel_count`/`sample_rate_hz` used to live here as a HONEST duplicate of
+// the AudioChannels/SampleRate mappings; deleted now canonical accessors are honest.
 
 // ── DVD cell-category dump (from the IFO scan, pre-lowering) ─────────────────
 
@@ -215,16 +199,11 @@ pub fn dump_dvd_attrs(ts: &crate::ifo::DvdTitleSet) {
 }
 
 /// Emit the ACTUAL per-physical-sub-stream AC-3 channel counts read off the VOB
-/// during the mux-time sub-stream probe (the Silence-of-the-Lambs wrong-stream
-/// fix). This is the ground truth the IFO nibble is compared against: each row
-/// is `sub_id=0x8x channels=N` for a physical `private_stream_1` AC-3 sub-stream
-/// whose first frame was decoded. An empty probe (scrambled / unreadable / short
-/// VOB) logs a single `probed=0` line so the absence is explicit in a bug log.
-///
-/// Self-sufficiency: with `tag=dvd.aattr` (the IFO's declared sub_id + claimed
-/// channels) and these `tag=dvd.substream` rows (the physical reality), a bug
-/// log alone shows whether the ordinal `0x80` actually carries the declared
-/// channel layout — no disc needed to diagnose a wrong-substream rip.
+/// during the mux-time sub-stream probe. This is the ground truth the IFO
+/// nibble is compared against: each row is `sub_id=0x8x channels=N` for a
+/// physical `private_stream_1` AC-3 sub-stream whose first frame was decoded.
+/// An empty probe (scrambled / unreadable / short VOB) logs a single
+/// `probed=0` line so the absence is explicit in a bug log. See docs/diag.md.
 pub fn dump_dvd_substream_probe(title_id: u16, probed: &std::collections::BTreeMap<u8, u8>) {
     if !tracing::enabled!(target: DIAG, tracing::Level::DEBUG) {
         return;
@@ -253,10 +232,9 @@ pub fn diag_enabled() -> bool {
     tracing::enabled!(target: DIAG, tracing::Level::DEBUG)
 }
 
-/// Cap on the number of codecPrivate bytes rendered to hex in a `tag=mkv.track`
-/// line. The sequence header / avcC / hvcC prefix that matters for diagnosis
-/// (resolution, frame rate, profile) is at the front; a multi-KB blob past this
-/// is summarised as `..(+NB)` rather than flooding the log.
+// Cap on codecPrivate bytes rendered to hex in `tag=mkv.track`. The seq
+// header / avcC / hvcC prefix that matters for diagnosis is at the front;
+// a multi-KB blob past this is summarised as `..(+NB)`.
 const CODEC_PRIVATE_HEX_CAP: usize = 64;
 
 /// Render a track's codecPrivate as an uppercase-hex string for the diagnostic
@@ -280,10 +258,9 @@ fn codec_private_hex(cp: Option<&[u8]>) -> String {
     }
 }
 
-/// Frame the raw bytes of one captured opening frame for the `.opening.bin` side
-/// file: `[track:u8][keyframe:u8][pts_ns:i64 LE][len:u32 LE][raw bytes]`. Pure
-/// (no I/O) so the record layout is directly unit-testable; `record` appends the
-/// returned bytes to the side file.
+// Frame one captured opening frame for the `.opening.bin` side file:
+// `[track:u8][keyframe:u8][pts_ns:i64 LE][len:u32 LE][raw bytes]`. Pure
+// (no I/O); `record` appends the returned bytes to the side file.
 fn frame_record(track_idx: usize, pts_ns: i64, keyframe: bool, data: &[u8]) -> Vec<u8> {
     let mut rec = Vec::with_capacity(14 + data.len());
     rec.push(track_idx as u8);
@@ -294,17 +271,9 @@ fn frame_record(track_idx: usize, pts_ns: i64, keyframe: bool, data: &[u8]) -> V
     rec
 }
 
-/// Emit the MKV `TrackEntry` elements the muxer is about to WRITE for one
-/// track — the Windows-fps-class metadata (FlagInterlaced, FieldOrder,
-/// DefaultDuration, DefaultDecodedFieldDuration, Display dims) plus the
-/// codecPrivate as hex. With this row a bug log alone is enough to verify why
-/// Windows Explorer reports a given frame rate for an interlaced SD track: the
-/// container values that drive its fps derivation are all present, no disc and
-/// no MediaInfo needed.
-///
-/// `track_number` is the 1-based MKV track number; `track` is the built
-/// [`crate::mux::mkv::MkvTrack`] whose fields map one-to-one onto the emitted
-/// elements (see `MkvMuxer::new`). No-op unless the diag target is on.
+// Emits the MKV `TrackEntry` elements the muxer is about to write for one
+// track (FlagInterlaced, FieldOrder, DefaultDuration, Display dims,
+// codecPrivate hex). See docs/diag.md. No-op unless the diag target is on.
 pub(crate) fn dump_mkv_track(track_number: u64, track: &crate::mux::mkv::MkvTrack) {
     if !diag_enabled() {
         return;
@@ -348,10 +317,8 @@ pub(crate) fn dump_mkv_track(track_number: u64, track: &crate::mux::mkv::MkvTrac
 
 // ── Opening-frame capture (first ~N coded frames per track → side file) ──────
 
-/// Number of coded frames captured PER TRACK before the capture goes dormant.
-/// ~100 frames covers a DVD's first few seconds of every track (the
-/// opening-GOP / still-frame / menu window where mid-GOP open or PTS-floor bugs
-/// show up) while bounding the side file to a few MB even for HD I-frames.
+// Frames captured PER TRACK before capture goes dormant. ~100 covers a DVD's
+// first few seconds per track while bounding the side file to a few MB.
 const OPENING_FRAMES_PER_TRACK: usize = 100;
 
 /// Captures the first [`OPENING_FRAMES_PER_TRACK`] coded frames of EACH track to
@@ -498,14 +465,9 @@ pub fn dump_disc(disc: &Disc) {
     }
 }
 
-/// The `reason=` token on the main-feature decision row.
-///
-/// DERIVED from [`Disc::CANONICAL_TITLE_ORDER_KEYS`], which lives beside the
-/// comparator that actually implements them — never restated here. The previous
-/// hand-written copy drifted (it advertised a `fewest-clips` key the comparator
-/// had replaced with largest-physical-size), which made the self-diagnosing log
-/// explain the pick with a rule the code does not apply. A diagnostic that
-/// disagrees with the decision it documents is worse than no diagnostic.
+// The `reason=` token on the main-feature decision row. DERIVED from
+// `Disc::CANONICAL_TITLE_ORDER_KEYS`, never restated here — see docs/diag.md
+// for why (a prior hand-written copy drifted from the real comparator keys).
 fn main_feature_reason() -> String {
     let keys: Vec<&str> = Disc::MAIN_FEATURE_ORDER_KEYS
         .iter()
@@ -643,15 +605,9 @@ mod tests {
     // deleted in favour of the canonical accessors.
     use crate::disc::{AudioChannels, SampleRate};
 
-    /// The main-feature decision row must NAME `canonical_title_order`'s sort
-    /// keys, not restate them from memory. The restated copy had drifted: it
-    /// still advertised a "fewest-clips" key long after the comparator replaced
-    /// clip-count with largest-physical-size, so a bug report read at
-    /// `--log-level 3` explained the pick with a rule the code does not apply.
-    ///
-    /// The behavioural half is asserted first — against the comparator itself,
-    /// with literals — so the key names are checked against what the code
-    /// actually does, not against the string that names them.
+    // The main-feature decision row must NAME the comparator's real sort keys,
+    // not a restated (driftable) copy — see docs/diag.md. Asserts the
+    // behavioural half first, against the comparator itself with literals.
     #[test]
     fn main_feature_reason_names_the_comparators_real_keys() {
         use crate::disc::{Clip, Disc, DiscTitle};

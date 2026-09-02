@@ -49,18 +49,13 @@ pub const BD_SOURCE_PACKET_BYTES: usize = TS_PACKET_BYTES + BD_TIMESTAMP_PREFIX_
 /// Elementary-stream coding-type codes — the single source of truth for the
 /// byte that identifies a stream's codec.
 ///
-/// This is one registry used in two places that share the same value space:
-/// the MPEG-TS PMT `stream_type` (ISO/IEC 13818-1 Table 2-34) and the Blu-ray
-/// STN/CLPI `stream_coding_type` (BD-ROM Part 3). The standardized video codes
-/// (`0x02`, `0x1B`, `0x24`) are ISO assignments (ISO/IEC 13818-1 Table 2-34);
-/// `0xEA` (VC-1) is a BD-ROM convention in the ISO user-private range. The
-/// `0x80..=0xA2` audio/graphics codes also sit in the user-private range and follow the
-/// Blu-ray Disc Association / ATSC A/52 convention. Because every consumer
-/// reads or writes this single byte, the family is unprefixed — the scope is
-/// "any elementary stream freemkv parses or muxes".
+/// Shared registry for the MPEG-TS PMT `stream_type` and the Blu-ray STN/CLPI
+/// `stream_coding_type`, which use the same value space. Unprefixed because
+/// every consumer of either spec reads or writes this one byte. Each constant
+/// is `u8`: the spec defines an 8-bit field, so the code compares it directly
+/// against a buffer byte with no casts.
 ///
-/// Each constant is `u8`: the spec defines an 8-bit field and the code compares
-/// it directly against a byte read from the buffer, so no casts are needed.
+/// See docs/consts.md for the ISO/BD-ROM table citations and user-private-range notes.
 pub mod coding_type {
     /// MPEG-2 video (ISO/IEC 13818-1 Table 2-34).
     pub const MPEG2_VIDEO: u8 = 0x02;

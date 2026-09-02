@@ -71,31 +71,9 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
     })
 }
 
-/// Parse the ProgramInfo section: per-stream (pid, coding_type,
-/// language, codec sub-fields). Layout per the Blu-ray Disc Read-Only Format
-/// Part 3 CLIPINF (CLPI) specification:
-///
-/// ```text
-/// ProgramInfo:
-///   length: 4 bytes
-///   reserved: 1 byte
-///   num_programs: 1 byte
-///   for each program:
-///     spn_program_sequence_start: 4 bytes
-///     program_map_pid: 2 bytes
-///     num_streams: 1 byte
-///     num_groups: 1 byte
-///     for each stream:
-///       pid: 2 bytes
-///       stream_coding_info_length: 1 byte
-///       stream_coding_info: (varies by coding_type)
-///         coding_type: 1 byte
-///         per-type bytes (see match arms below)
-/// ```
-///
-/// Returns `Vec::new()` on any structural mismatch — we don't propagate
-/// errors because the EP map is the primary CLPI output, and a corrupt
-/// program_info shouldn't break sector-range lookups.
+// Parse the ProgramInfo section: per-stream (pid, coding_type, language,
+// codec sub-fields). Returns Vec::new() on any structural mismatch. See
+// docs/clpi.md — "ProgramInfo Section" for the full byte layout.
 fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
     use crate::consts::coding_type as c;
     let mut out = Vec::new();
@@ -222,14 +200,9 @@ mod tests {
         assert!(parse(&data).is_err());
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // Added hardening tests, grounded in the BD-ROM CLPI spec byte layout.
-    // ─────────────────────────────────────────────────────────────────────
-
-    /// Build a ProgramInfo section. `streams` = Vec<(pid, sci_bytes)>.
-    /// Layout per source doc: length(4)+reserved(1)+num_programs(1)+
-    /// per program [spn(4)+pmt_pid(2)+num_streams(1)+num_groups(1)] then
-    /// per stream [pid(2)+sci_len(1)+sci].
+    // Build a ProgramInfo section; `streams` = Vec<(pid, sci_bytes)> — see
+    // docs/clpi.md "ProgramInfo Section" for the full byte layout.
     fn build_program_info(streams: &[(u16, Vec<u8>)]) -> Vec<u8> {
         let mut body = Vec::new();
         body.push(0); // reserved (offset 4)
@@ -371,10 +344,9 @@ mod tests {
         assert_eq!(clip.streams[2].language, "jpn");
     }
 
-    /// parse_program_info is best-effort: a stream whose declared sci_len
-    /// runs past the section (`sci_end > data.len()`) makes it return the
-    /// streams collected so far (here: none), never panic. Source returns
-    /// `out` early on the overflow.
+    // Best-effort: a stream whose sci_len runs past the section end
+    // (`sci_end > data.len()`) returns streams collected so far (none
+    // here), never panics — source returns `out` early on overflow.
     #[test]
     fn program_info_truncated_sci_no_panic() {
         // One stream claiming sci_len = 200 but with no body.
@@ -416,16 +388,9 @@ mod tests {
         assert!(clip.streams.is_empty());
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Section-offset gates in `parse`.
-    // ─────────────────────────────────────────────────────────────────────
-
-    /// A prog_info_start of 0 means "no ProgramInfo section" — the CLPI
-    /// header bytes at offset 0 must NOT be reinterpreted as a ProgramInfo
-    /// table. The fixture is crafted so that parsing from offset 0 WOULD
-    /// yield a stream (num_programs at [5], a second program header whose
-    /// num_streams byte at [20] is 1, then a well-formed stream record), so
-    /// the empty result can only come from the `prog_info_start > 0` gate.
+    // Section-offset gates in `parse`: prog_info_start == 0 means "no
+    // ProgramInfo section" — offset-0 bytes must NOT be reinterpreted as a
+    // table. See docs/clpi.md "Test fixture notes" for the fixture design.
     #[test]
     fn prog_info_start_zero_does_not_parse_header_as_program_info() {
         let mut data = build_clpi(1000, None);
@@ -445,15 +410,9 @@ mod tests {
         );
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // parse_program_info
-    // ─────────────────────────────────────────────────────────────────────
-
-    /// Secondary audio (0xA1 AC-3+ secondary, 0xA2 DTS-HD secondary) has the
-    /// same stream_coding_info layout as primary audio: sci[1] carries
-    /// audio_presentation_type in the high nibble and sampling_frequency in
-    /// the low nibble, sci[2..5] the ISO 639-2 language. Both sub-fields and
-    /// the language must be populated.
+    // parse_program_info: secondary audio (0xA1/0xA2) shares primary
+    // audio's sci layout — sci[1] = presentation-type/rate nibbles,
+    // sci[2..5] = ISO 639-2 language. Both sub-fields must be populated.
     #[test]
     fn program_info_secondary_audio_fields() {
         for coding in [c_ac3_plus_secondary(), c_dts_hd_secondary()] {
@@ -477,10 +436,9 @@ mod tests {
         crate::consts::coding_type::DTS_HD_SECONDARY
     }
 
-    /// A stream_coding_info of exactly 1 byte (coding_type only) is the
-    /// minimum the parser accepts: the stream is recorded with its PID and
-    /// coding_type, and every sub-field that needs more bytes stays empty.
-    /// Notably a PG stream must NOT read sci[1..4] when only sci[0] exists.
+    // A 1-byte sci (coding_type only) is the accepted minimum: PID and
+    // coding_type get recorded, all sub-fields needing more bytes stay
+    // empty — a PG stream must NOT read sci[1..4] when only sci[0] exists.
     #[test]
     fn program_info_sci_len_one_yields_bare_stream() {
         let pi = build_program_info(&[(0x1200, vec![0x90u8])]);

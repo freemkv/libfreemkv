@@ -3,11 +3,7 @@
 //! documented binary format, never executed: every field is bounds-checked and
 //! any malformed input yields `None` (the nav resolver then abstains).
 //!
-//! Layout: `"INDX"` + version(4) + `indexes_start`(u32 @8) + … ; at
-//! `indexes_start`: `index_len`(u32), First-Play object(12), Top-Menu object(12),
-//! `num_titles`(u16), then `num_titles` title objects(12 each). Every object's
-//! `object_type` is the top two bits of its first byte; for an HDMV object the
-//! `id_ref` into `MovieObject.bdmv` is a big-endian u16 at object offset 6.
+//! See docs/index-bdmv.md for the full binary layout.
 
 /// One playback/title object in `index.bdmv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

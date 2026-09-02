@@ -1,25 +1,13 @@
 //! B1 drop-to-IRAP gate — keep a muxed elementary stream decode-clean across a
-//! mid-stream gap (e.g. an undecryptable unit the mux concealed as NULL TS,
-//! P3/A2).
+//! mid-stream gap (e.g. an undecryptable unit the mux concealed as NULL TS).
 //!
-//! When packets are lost, the affected access unit is already dropped at the TS
-//! layer (the assembler drops the partial PES on the continuity gap). But for
-//! INTER-CODED video the frames that follow reference the lost frame (and each
-//! other) until the next IRAP/IDR keyframe — emitting them makes any decoder
-//! fault on the "missing reference / non-existing PPS" condition and visibly
-//! break decode. So after a gap on a video track we DROP FORWARD to the keyframe
-//! and resume cleanly there. The gap rounds up to (at most) one GOP — the price
-//! of never emitting a dangling reference; it is logged.
+//! After a packet-loss gap, inter-coded video frames referencing the lost
+//! frame would fault a decoder, so this gate drops forward past a gap on a
+//! video track until the next IRAP/IDR keyframe and resumes there.
 //!
-//! Most audio and all subtitle frames are independently decodable (each frame
-//! re-inits on its own header), so a gap there costs only the single already-
-//! dropped frame and this gate is a no-op for them (it always admits). The one
-//! exception is TrueHD/MLP, whose predictor + restart state spans access units:
-//! its re-init point is a codec-specific major-sync AU (not a generic keyframe),
-//! so it runs the equivalent drop-forward-to-major-sync inside `codec::truehd`
-//! rather than through this gate. In short: this gate is NOT keyed on "audio vs
-//! video" but on "needs a re-init point after a gap" — video here, TrueHD in its
-//! own parser, everything else genuinely independent.
+//! Audio/subtitle frames are independently decodable, so the gate is a
+//! no-op for them; TrueHD/MLP is the one exception and is handled in
+//! `codec::truehd` instead. See docs/resync.md for the full rationale.
 
 /// Per-track keyframe-resync state. One gate per elementary stream; a video
 /// track's gate stays "armed" from a discontinuity until the next keyframe.
@@ -49,17 +37,9 @@ impl ResyncGate {
         }
     }
 
-    /// Decide whether a parsed frame should be EMITTED (`true`) or DROPPED
-    /// (`false`).
-    ///
-    /// * `is_video` — inter-coded video track (the only kind with cross-frame
-    ///   references); `false` for audio/subtitle, which always admit.
-    /// * `discontinuity` — this frame's source PES followed a TS continuity gap.
-    /// * `keyframe` — this frame is a self-contained IRAP/IDR.
-    ///
-    /// A non-video track always admits. A video track arms on a discontinuity
-    /// and then drops every non-keyframe until (and excluding the drop of) the
-    /// next keyframe, which disarms and is emitted.
+    // Decide whether a parsed frame should be EMITTED (`true`) or DROPPED
+    // (`false`). Video arms on discontinuity, drops until the next keyframe.
+    // See docs/resync.md — `admit` parameters and behavior.
     pub(crate) fn admit(&mut self, is_video: bool, discontinuity: bool, keyframe: bool) -> bool {
         if !is_video {
             return true;
@@ -103,14 +83,9 @@ impl ResyncGate {
 #[cfg(test)]
 mod tests {
 
-    /// `dropped` is per-run and `dropped_total` is cumulative, and only the
-    /// second can report loss.
-    ///
-    /// A gap that RESOLVES — the common case — disarms the gate at the next
-    /// keyframe and zeroes `dropped`. Anything reading that counter afterwards
-    /// sees nothing happened, which is how concealed video loss reached no
-    /// caller: the only EOF warning fired for gates STILL armed, i.e. exactly
-    /// the gaps that did not resolve.
+    // `dropped` is per-run, `dropped_total` cumulative; only the latter can
+    // report loss on a gap that resolves. See docs/resync.md — test
+    // `a_resolved_gap_still_reports_its_dropped_frames`.
     #[test]
     fn a_resolved_gap_still_reports_its_dropped_frames() {
         let mut g = ResyncGate::new();

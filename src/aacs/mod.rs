@@ -1,29 +1,12 @@
 //! AACS decryption — Volume Unique Key lookup and title key derivation.
 //!
-//! Two paths:
-//!   1. VUK lookup: disc_hash → KEYDB.cfg → VUK (fast, 99% of discs)
-//!   2. Full handshake: device_keys + MKB → Media Key → + Volume ID → VUK (fallback)
+//! Two paths: VUK lookup (disc_hash → KEYDB.cfg → VUK, fast, common) or a full
+//! handshake (device_keys + MKB → Media Key → + Volume ID → VUK, fallback).
+//! The VUK decrypts title keys from AACS/Unit_Key_RO.inf; title keys decrypt
+//! m2ts stream content (AES-128-CBC).
 //!
-//! KEYDB.cfg format:
-//!   | DK | DEVICE_KEY 0x... | DEVICE_NODE 0x... | KEY_UV 0x... | KEY_U_MASK_SHIFT 0x...
-//!   | PK | 0x...
-//!   | HC | HOST_PRIV_KEY 0x... | HOST_CERT 0x...
-//!   | HC2 | HOST_PRIV_KEY 0x... | HOST_CERT 0x...
-//!   0x<disc_hash> = <title> | D | <date> | M | 0x<media_key> | I | 0x<disc_id> | V | 0x<vuk> | U | <unit_keys>
-//!
-//! The VUK decrypts title keys from AACS/Unit_Key_RO.inf on disc.
-//! Title keys decrypt m2ts stream content (AES-128-CBC).
-//!
-//! ## Spec provenance
-//!
-//! The crypto below carries `[TAG] §x.y` citations back to the published AACS
-//! specification (Final Rev 0.953), so each primitive links to the section it
-//! implements:
-//!   - `[C]`  — AACS Introduction and Common Cryptographic Elements Book (primitives, MKB/key-management).
-//!   - `[PR]` — AACS Pre-recorded Video Book (Volume/Title Key layer).
-//!   - `[BD]` — AACS Blu-ray Disc Pre-recorded Book (CPS Unit Key, Aligned Unit, Block Key).
-//!   - `[RE]` — reverse-engineered from real discs, cited only where the public
-//!     spec is silent (the `0x86` verify record and the Category-C MKB type values).
+//! See docs/aacs.md ("src/aacs/mod.rs module notes") for the KEYDB.cfg line
+//! format and the `[TAG] §x.y` spec-provenance citation scheme used below.
 
 pub mod content;
 pub mod crypto;
@@ -41,25 +24,13 @@ pub mod types;
 pub mod variant;
 
 /// On-disc UDF paths to the AACS key-input files, plus HD DVD AACS-directory
-/// discovery.
+/// discovery (never hardcoded — see [`find_hddvd_aacs_dir`], [`role_paths`]).
 ///
-/// BD and UHD keep their key material under a fixed `/AACS/…` tree, so those
-/// paths are constants. HD DVD keeps the equivalents in a reserved root
-/// directory whose NAME is authoring-house-specific — observed `ANY!` (Dukes
-/// of Hazzard) and `AAC!` (Freedom / Memory-Tech), each with a `<name>!_BAK`
-/// mirror — and whose title-key file is NOT always `VTKF000.AACS` (Freedom
-/// ships `VTKF090.AACS` + `VTKF100.AACS`). So the HD DVD files are DISCOVERED
-/// from the parsed UDF tree ([`find_hddvd_aacs_dir`] + [`role_paths`]), never
-/// hardcoded.
+/// Each [`AacsRole`] resolves to an ordered candidate list, walked by
+/// [`read_first`] to the first that reads, so every reader shares one source
+/// of truth for disc_hash / MKB / VID.
 ///
-/// Each key ROLE ([`AacsRole`]) resolves to an ordered candidate list — the
-/// BD/UHD constants first, then whatever the HD DVD directory actually holds —
-/// which every reader walks with [`read_first`], first-that-reads. No reader
-/// ever branches on disc type: a BD/UHD disc has the `/AACS/` files so those
-/// win; an HD DVD has none of them, so it falls through to the discovered
-/// entries. Centralised so `resolve_vid_only`, `read_aacs_inputs`,
-/// `read_mkb_content`, and `read_aacs_version` can never silently diverge the
-/// disc_hash / MKB / VID that another reader feeds a key service.
+/// See docs/aacs.md for HD DVD directory-name/file details.
 pub const PATH_UNIT_KEY_RO: &str = "/AACS/Unit_Key_RO.inf";
 pub const PATH_UNIT_KEY_RO_DUPLICATE: &str = "/AACS/DUPLICATE/Unit_Key_RO.inf";
 pub const PATH_MKB_RO: &str = "/AACS/MKB_RO.inf";
@@ -81,13 +52,9 @@ pub enum AacsRole {
     ContentCert,
 }
 
-/// The HD DVD AACS directory in a parsed UDF tree, if present.
-///
-/// Identified structurally, NOT by a hardcoded name: the root child directory
-/// whose name ends in `!` (so the `<name>!_BAK` backup mirror, which also ends
-/// in a non-`!` char, is not mistaken for it) and which contains `MKBROM.AACS`.
-/// Observed real names: `ANY!` (Dukes of Hazzard), `AAC!` (Freedom). A BD/UHD
-/// disc has no such directory → `None`.
+// The HD DVD AACS directory in a parsed UDF tree, if present. Identified
+// structurally (name ends `!`, contains MKBROM.AACS), not by a hardcoded
+// name. See docs/aacs.md for observed real directory names.
 pub(crate) fn find_hddvd_aacs_dir(udf: &crate::udf::UdfFs) -> Option<&crate::udf::DirEntry> {
     udf.root.entries.iter().find(|e| {
         e.is_dir
@@ -98,14 +65,9 @@ pub(crate) fn find_hddvd_aacs_dir(udf: &crate::udf::UdfFs) -> Option<&crate::udf
     })
 }
 
-/// Ordered candidate paths for an AACS key [`AacsRole`]: the fixed BD/UHD
-/// `/AACS/…` paths first, then the actual HD DVD files discovered in the disc's
-/// AACS directory (see [`find_hddvd_aacs_dir`]). A disc has only one family, so
-/// the other family's entries simply never read.
-///
-/// For [`AacsRole::UnitKey`] every `VTKF*.AACS` in the directory is appended in
-/// sorted name order — a disc may carry more than one variant (Freedom:
-/// `VTKF090` + `VTKF100`), not just `VTKF000`.
+// Ordered candidate paths for an AACS key role: fixed BD/UHD `/AACS/…` paths
+// first, then discovered HD DVD files (see `find_hddvd_aacs_dir`). UnitKey
+// appends every VTKF*.AACS found, sorted, since a disc may ship >1 variant.
 pub(crate) fn role_paths(udf: &crate::udf::UdfFs, role: AacsRole) -> Vec<String> {
     let mut v: Vec<String> = match role {
         AacsRole::UnitKey => vec![PATH_UNIT_KEY_RO, PATH_UNIT_KEY_RO_DUPLICATE],
@@ -143,14 +105,9 @@ pub(crate) fn role_paths(udf: &crate::udf::UdfFs, role: AacsRole) -> Vec<String>
     v
 }
 
-/// Walk an AACS role's candidate paths (from [`role_paths`]) and return the
-/// first that reads.
-///
-/// `read` performs the actual per-path read (full file or bounded prefix), so
-/// callers share the same first-present walk regardless of read style. Returns
-/// [`Error::AacsNoKeys`](crate::Error::AacsNoKeys) if no candidate is present. Generic over the path
-/// element (`&str` or owned `String`) so it accepts the `Vec<String>` that
-/// [`role_paths`] builds from the discovered HD DVD directory.
+// Walk an AACS role's candidate paths and return the first that reads;
+// generic over `&str`/`String` so it accepts `role_paths`' `Vec<String>`.
+// Returns `Error::AacsNoKeys` if no candidate is present.
 pub(crate) fn read_first<S, F>(candidates: &[S], mut read: F) -> crate::error::Result<Vec<u8>>
 where
     S: AsRef<str>,
@@ -292,19 +249,9 @@ mod tests {
         );
     }
 
-    /// The `!`-suffix and the `MKBROM.AACS` presence test are BOTH required —
-    /// the discovery is a conjunction, not a disjunction.
-    ///
-    /// The existing fixtures only ever present a directory that satisfies both
-    /// (`AAC!` with `MKBROM.AACS`) alongside one that satisfies neither
-    /// (`AAC!_BAK` — which contains `MKBROM.AACS` but is ALSO reached only after
-    /// the real dir), so either half of the conjunction could be dropped and the
-    /// same directory would still be found. Here a directory satisfies the name
-    /// half and NOT the contents half: it must not be picked.
-    ///
-    /// If it were, the HD DVD path would resolve `MKBROM.AACS`,
-    /// `CONTENT_CERT.AACS` and the title-key file under a directory that holds
-    /// none of them — the disc reports "no AACS key files" and never rips.
+    // Both the `!`-suffix AND MKBROM.AACS presence are required (conjunction,
+    // not disjunction) — else the HD DVD path resolves key files under a dir
+    // holding none. See docs/aacs.md for the full rationale.
     #[test]
     fn a_bang_suffixed_directory_without_mkbrom_is_not_the_aacs_directory() {
         use crate::udf::fixture::*;

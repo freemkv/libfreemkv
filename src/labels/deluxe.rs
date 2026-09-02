@@ -3,74 +3,10 @@
 //! Detected on discs whose `/BDMV/JAR/<x>.jar` contains a
 //! `com/bydeluxe/` directory entry.
 //!
-//! ## What this parser reads
-//!
-//! Deluxe-authored discs store stream labels as ordinal references into
-//! enum classes whose names are obfuscated per-disc, so a name-based
-//! match won't work. The label data is instead recovered by matching on
-//! the **shape of each enum's `<clinit>`**, which is framework-stable:
-//!
-//! | Enum | Signature |
-//! |---|---|
-//! | Language | 70 `ldc` operations in `<clinit>`, sequence starts `English, French, Spanish, Dutch, ...` |
-//! | Purpose | 8 ldcs starting `Normal, Commentary, PiP, Trivia, ...` |
-//! | VideoFormat | 7 ldcs starting `HD, HDR10 Plus, HD Dolby, ...` |
-//! | Region | 22 ldcs starting `USA_D1, LIC1, LIC2, LIC3, ...` |
-//! | Studio | 6 ldcs in `<clinit>` |
-//!
-//! Matching on the shape rather than the class name keeps the parser
-//! working across obfuscation variants. Codec strings come from the
-//! standard BD-J `org/bluray/ti/CodingType` enum referenced directly by
-//! the binding constructors (see [`StackVal::CodingType`]), not from a
-//! Deluxe-internal enum.
-//!
-//! ## Implementation phases
-//!
-//! - **Phase A** — master enum identification (`identify_master_enums`).
-//!   Walks every `.class`'s `<clinit>` ldc sequence and matches against
-//!   the framework-stable fingerprints. Output: `Vec<(label, MasterEnum)>`
-//!   with full ordinal → string-value tables.
-//!
-//! - **Phase C** — binding-class identification (`find_binding_classes`).
-//!   The per-stream table is built by some class via repeated
-//!   `getstatic` references to the master enums identified in A.
-//!   That class has the highest such `getstatic` count in the jar.
-//!   Heuristic shape; precise threshold may need tuning.
-//!
-//! - **Phase D** — binding-class bytecode decoder (`decode_binding`).
-//!   Walks the binding class's `<clinit>` with a tiny symbolic stack
-//!   machine. For each `new X / dup / ... / invokespecial X.<init>`
-//!   sequence, collects the int values and enum-reference operands
-//!   between the `dup` and the constructor call, then emits a
-//!   `DecodedStream`. The signal-to-StreamLabel mapping (which arg is
-//!   stream index? which is language? audio vs subtitle?) uses a
-//!   heuristic — see `interpret_streams` for the mapping rules.
-//!
-//! ## Confidence
-//!
-//! [`parse`] returns `Some(ParseResult::high(labels))` when Phases A
-//! through D produce at least one stream: the master enums matched their
-//! framework-stable fingerprints (a strong ordered-prefix signature), the
-//! binding class decoded, and at least one per-stream binding resolved to a
-//! real (language, purpose, codec) tuple — the schema was fully recovered,
-//! not guessed. `None` when the disc isn't Deluxe-authored or when decoding
-//! produces zero streams (a recognized-but-broken state that the analyzer
-//! still surfaces via `parsers_detected`).
-//!
-//! ## Confirmed studio variants
-//!
-//! - **Universal** (`studio="uni"`): Language enum `pd` (65 values,
-//!   `English, French, Spanish, Dutch, …`), Purpose enum `lp`
-//!   (`Normal, Commentary, PiP, Trivia, Descriptive, Score`), audio binding
-//!   `np.<init>(I, Lpd;, Llp;, Lorg/bluray/ti/CodingType;)`, subtitle binding
-//!   `wb.<init>(I, Lpd;, Llp;, Lmi;)`, all built in one binding class's
-//!   `<clinit>` alongside a title-wrapper object whose constructor takes the
-//!   per-stream arrays (filtered out by the array-parameter guard in the
-//!   decoder). SDH/RNIB is encoded as a distinct Language VALUE
-//!   ("English SDH", "English RNIB"), recovered into the qualifier from the
-//!   name. Grounded on fixtures captured from a real Universal Blu-ray release.
-//! - **Disney/Warner**: 70-value Language enum, same binding shape; the
-//!   original corpus this parser was written against.
+//! Stream labels are ordinal references into enum classes obfuscated
+//! per-disc, so parsing matches each enum's `<clinit>` shape rather
+//! than class names; see docs/deluxe.md for the enum fingerprints,
+//! decoder phases, confidence semantics, and confirmed studio variants.
 
 use super::class_reader::{
     AASTORE, ANEWARRAY, BIPUSH, ClassFile, CodeAttribute, ConstantPool, CpInfo, GETSTATIC,
@@ -183,13 +119,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     })
 }
 
-/// Read the studio identifier from a Deluxe disc's `config.xml`
-/// (`<TitleConfig studio="uni"…>`), if present. The file lives under a
-/// numbered subdirectory of `/BDMV/JAR/` (e.g. `/BDMV/JAR/99999/config.xml`),
-/// so this scans the subdirectories for the first one that carries it.
-///
-/// Returns the lowercased studio token (`"uni"`, `"fox"`, `"wb"`, …) or `None`
-/// when no readable `config.xml` names a studio.
+// Reads the studio id from a Deluxe disc's config.xml (`<TitleConfig
+// studio="uni"...>`), scanning numbered /BDMV/JAR/ subdirs. Returns the
+// lowercased studio token, or None if no config.xml names one.
 fn detect_studio(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<String> {
     let dir = udf.find_dir("/BDMV/JAR")?;
     for entry in &dir.entries {
@@ -207,10 +139,9 @@ fn detect_studio(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<String> {
     None
 }
 
-/// Extract the `studio="…"` attribute value from a `config.xml` byte buffer.
-/// Deliberately a tolerant substring scan rather than a full XML parse: the
-/// file is tiny attacker-controlled disc metadata and the only field of
-/// interest is this one attribute. Rejects an empty or implausibly long value.
+// Extracts studio="..." from config.xml via tolerant substring scan, not a
+// full XML parse: the file is tiny attacker-controlled metadata and this is
+// the only field of interest. Rejects empty or implausibly long values.
 fn parse_studio_attr(xml: &[u8]) -> Option<String> {
     const MAX_STUDIO_LEN: usize = 32;
     let text = std::str::from_utf8(xml).ok()?;
@@ -247,12 +178,9 @@ pub(crate) struct MasterEnum {
     pub fields: Vec<String>,
 }
 
-/// Fingerprints we use to identify each master enum class. The
-/// matcher walks every class's `<clinit>` ldc sequence; a class
-/// matches if its first N ldcs match `prefix` AND the total ldc count
-/// equals `expected_count` (allows some slack via tolerance — see
-/// `LDC_COUNT_TOLERANCE`). Class names are obfuscated and change per
-/// disc; shape is stable.
+// Fingerprint to identify a master enum class: matches if its first N ldcs
+// equal `prefix` and total ldc count is near `expected_count` (see
+// LDC_COUNT_TOLERANCE). Class names are obfuscated per disc; shape is stable.
 struct Fingerprint {
     label: &'static str,
     prefix: &'static [&'static str],
@@ -306,52 +234,21 @@ const FINGERPRINTS: &[Fingerprint] = &[
 /// prefix, so a count mismatch within tolerance is informative-but-OK.
 const LDC_COUNT_TOLERANCE: usize = 4;
 
-/// Cap on the `ldc` operands retained per class by [`clinit_ldc_strings`].
-///
-/// Unlike every other count cap in this crate, the paired byte cap here cannot
-/// be the disc-file size: a `.class` entry gated only by a `com/bydeluxe/` path
-/// prefix deflates from ~100 KB up to the 64 MiB `MAX_CLASS_BYTES` read ceiling,
-/// so ~33M two-byte `ldc` instructions — one retained `String` each — are
-/// reachable from a small crafted disc. The bound has to be on the decompressed
-/// work, so it is applied here.
-///
-/// Headroom: the largest framework-stable enum is `Language` at 70 values
-/// (`FINGERPRINTS`), and no fingerprint matches a count more than
-/// `LDC_COUNT_TOLERANCE` away from its expected size, so anything past ~74 can
-/// never identify a master enum. 4096 leaves ~55x headroom over the largest
-/// real enum for framework drift.
+// Cap on `ldc` operands retained per class by clinit_ldc_strings. The bound
+// must be on decompressed work, not disc-file size (deflate can inflate a
+// small crafted class). See docs/deluxe.md "Size caps" for headroom math.
 const MAX_CLINIT_LDC_STRINGS: usize = 4096;
 
-/// Companion byte cap for [`MAX_CLINIT_LDC_STRINGS`]: the count cap alone still
-/// admits 4096 x 64 KiB of `Utf8` (a JVMS `CONSTANT_Utf8_info` length is a u16),
-/// i.e. ~268 MB per class from repeated `ldc` of one huge constant.
-///
-/// Headroom: master-enum values are short display names ("English",
-/// "HDR10 Plus", "USA_D1") well under 32 bytes, so a real Language enum retains
-/// ~1 KB. 256 KiB admits 4096 values averaging 64 bytes each.
+// Companion byte cap for MAX_CLINIT_LDC_STRINGS: guards against repeated ldc
+// of one huge Utf8 constant (up to 64 KiB each). See docs/deluxe.md.
 const MAX_CLINIT_LDC_BYTES: usize = 256 * 1024;
 
-/// Aggregate companion to [`MAX_CLINIT_LDC_BYTES`], which bounds retention PER
-/// CLASS only. `identify_master_enums` holds every class's retained strings in
-/// one map SIMULTANEOUSLY, so the per-class cap alone still admits
-/// `classes x 256 KiB`: a 64 MiB jar of minimal `.class` entries reaches tens
-/// of GiB. This is the same bound one level up.
-///
-/// Headroom: the five `FINGERPRINTS` enums together hold ~113 short values
-/// (~1.2 KB). Every other class in a real BD-J jar contributes only whatever
-/// string constants its own `<clinit>` loads — resource paths, config keys —
-/// so a large authored jar lands in the low hundreds of KB. 16 MiB leaves
-/// ~40x headroom over a deliberately generous 400 KB estimate for real media.
+// Aggregate companion to MAX_CLINIT_LDC_BYTES: bounds retention across ALL
+// classes at once, not just per class. See docs/deluxe.md "Size caps".
 const MAX_CANDIDATE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
-/// Entry-count companion to [`MAX_CANDIDATE_TOTAL_BYTES`]. The byte budget
-/// alone still admits ~16M map entries when every class retains a single
-/// one-byte `ldc`, and the per-entry `HashMap` + `String` overhead is not
-/// counted by that budget.
-///
-/// Headroom: a large retail BD-J title ships on the order of 1-3k classes,
-/// and only those with a non-empty `<clinit>` ldc sequence become candidates.
-/// 65536 leaves >20x headroom over the class count of any real jar.
+// Entry-count companion to MAX_CANDIDATE_TOTAL_BYTES, guarding per-entry
+// HashMap/String overhead the byte budget alone doesn't count. See docs/deluxe.md.
 const MAX_CANDIDATE_CLASSES: usize = 65536;
 
 /// The Phase A candidate pool: every class's retained `<clinit>` ldc strings,
@@ -473,21 +370,9 @@ fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnu
         .collect()
 }
 
-/// Collect the static-field names an enum class's `<clinit>` stores its
-/// own instances into, in declaration order — the ordinal → field-name
-/// mapping that mirrors [`clinit_ldc_strings`]'s ordinal → value mapping.
-///
-/// An obfuscated Deluxe enum constant compiles to
-/// `new E; dup; ldc "Value"; invokespecial E.<init>(…); putstatic E.<field>`,
-/// so the `putstatic` whose owning class AND field descriptor are both this
-/// class's own type names the field that ordinal. The binding class then
-/// references that constant as `getstatic E.<field>`; without this mapping
-/// the resolver in [`MasterEnumTable`] cannot turn the obfuscated field name
-/// back into an ordinal.
-///
-/// Bounded by [`MAX_CLINIT_LDC_STRINGS`] like the value walk: a `.class`
-/// gated only by a path prefix can inflate to the read ceiling, and each
-/// retained field name is a heap `String`.
+// Ordinal -> putstatic field-name mapping (mirrors clinit_ldc_strings'
+// ordinal -> value), so MasterEnumTable can resolve a binding class's
+// `getstatic E.<field>` back to an ordinal. See docs/deluxe.md.
 fn clinit_enum_field_names(class: &super::class_reader::ClassFile) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut out_bytes = 0usize;
@@ -529,17 +414,9 @@ fn clinit_enum_field_names(class: &super::class_reader::ClassFile) -> Vec<String
     out
 }
 
-/// Walk `<clinit>` and collect every `ldc` / `ldc_w` operand that
-/// resolves to either a `String` constant or a `Utf8` constant, in
-/// declaration order. Returns `None` if the class has no `<clinit>`.
-///
-/// Collection stops at [`MAX_CLINIT_LDC_STRINGS`] operands or
-/// [`MAX_CLINIT_LDC_BYTES`] of retained text, whichever comes first: the walk
-/// is driven by the DECOMPRESSED class, so it is not bounded by the disc-file
-/// size cap the way the rest of this module's counts are. Truncation cannot
-/// lose a real match — a truncated sequence is far longer than any
-/// `FINGERPRINTS` entry's `expected_count + LDC_COUNT_TOLERANCE`, so it would
-/// have been rejected on count anyway.
+// Walks `<clinit>` collecting every ldc/ldc_w String/Utf8 operand in order;
+// None if no `<clinit>`. Stops at MAX_CLINIT_LDC_STRINGS/MAX_CLINIT_LDC_BYTES
+// (decompressed work, not disc-file size); can't lose a real fingerprint match.
 fn clinit_ldc_strings(class: &super::class_reader::ClassFile) -> Option<Vec<String>> {
     let mut found = false;
     let mut out: Vec<String> = Vec::new();
@@ -603,22 +480,8 @@ fn ldcs_match_prefix(ldcs: &[String], prefix: &[&str]) -> bool {
 
 // ── Phase C: find the binding class ─────────────────────────────────────────
 
-/// Threshold: requires at least `MIN_GETSTATIC` matches to consider a
-/// class a binding candidate. Empirically the binding class on a
-/// typical disc has 50+ such getstatic references (one per slot ×
-/// arity); we use a low floor (4) so a small disc with few streams
-/// still qualifies, but high enough to filter out classes that just
-/// reference the language enum once for a config string.
-/// Identify all binding-class candidates by getstatic-count to the
-/// master enums. Some Deluxe discs split the per-stream table across
-/// two binding classes (one for audio, one for subtitle), so the
-/// per-stream decoder needs to walk all of them. Returns top-K
-/// candidates ordered by descending getstatic count, filtered to a
-/// minimum concentration of master-enum references.
-///
-/// A disc that splits the table commonly has one audio binding class
-/// with the most getstatic refs and a subtitle binding class with
-/// somewhat fewer; both share the master Language + Purpose enums.
+// Finds binding-class candidates by getstatic-count to the master enums.
+// Some discs split the table across audio/subtitle classes, hence top-K.
 fn find_binding_classes(
     archive: &mut jar::Jar,
     master_enum_classes: &HashSet<&str>,
@@ -693,13 +556,9 @@ pub(crate) enum StackVal {
         kind: &'static str,
         ordinal: u16,
     },
-    /// Reference to a `org.bluray.ti.CodingType` enum value. Field
-    /// name (e.g. `DOLBY_AC3_AUDIO`, `DOLBY_LOSSLESS_AUDIO`) is the
-    /// codec identifier. Deluxe binding constructors take a
-    /// `LCodingType;` arg directly — codecs are NOT a Deluxe-internal
-    /// enum; the codec source is the standard BD-J API `CodingType`
-    /// enum, so the binding constructor's codec arg is read straight
-    /// from that getstatic operand.
+    // Reference to org.bluray.ti.CodingType; field name (e.g.
+    // DOLBY_AC3_AUDIO) is the codec id — NOT a Deluxe-internal enum, read
+    // straight from the binding constructor's getstatic operand.
     CodingType(String),
     /// An uninitialized `new` object — popped by the matching
     /// invokespecial.
@@ -714,22 +573,9 @@ pub(crate) enum StackVal {
 /// Deluxe constructors reference directly.
 const BD_CODING_TYPE_CLASS: &str = "org/bluray/ti/CodingType";
 
-/// Cap on `Construction`s retained from a binding `<clinit>` walk.
-///
-/// One entry is appended per matched `new X / dup / invokespecial X.<init>`
-/// with no other bound: a `.class` gated only by a `com/bydeluxe/` path prefix
-/// deflates to the 64 MiB `MAX_CLASS_BYTES` ceiling, and the shortest matching
-/// sequence is a handful of bytes, so millions of `Construction`s — each a
-/// `String` plus an arg `Vec` — are reachable from a small crafted disc
-/// (~1 GiB). The same cap bounds the per-class union in
-/// [`decode_binding_class`] (a crafted class may repeat `<clinit>`, which JVMS
-/// §4.6 forbids but this reader tolerates) and the cross-class union in
-/// [`parse`], so the whole phase retains at most this many.
-///
-/// Headroom: the BD STN_table (BDAV, `STN_table` stream-entry counts) admits
-/// at most 32 primary audio and 32 PG streams per playlist, and a Deluxe
-/// binding table covers the disc's playlists — low hundreds of entries on the
-/// largest retail titles. 4096 leaves >20x headroom.
+// Cap on Constructions retained from a binding `<clinit>` walk (also bounds
+// decode_binding_class's per-class union and parse's cross-class union).
+// See docs/deluxe.md "Size caps" for the headroom math.
 const MAX_CONSTRUCTIONS: usize = 4096;
 
 /// Phase D entry point: find the binding class in `archive`, run the
@@ -815,21 +661,9 @@ impl<'a> BindingDecoder<'a> {
         }
     }
 
-    /// Push onto the symbolic stack, honouring the Code attribute's declared
-    /// `max_stack`.
-    ///
-    /// JVMS 4.7.3 requires that a method's operand stack never exceed
-    /// `max_stack` at any point, so a push past it can only come from bytecode
-    /// that would fail JVM verification. Dropping it costs nothing on real
-    /// bytecode and bounds the decoder: a `.class` gated only by a
-    /// `com/bydeluxe/` path prefix deflates from ~100 KB to the 64 MiB
-    /// `MAX_CLASS_BYTES` ceiling, i.e. ~67M single-byte `iconst_0` (~2 GiB of
-    /// `StackVal`) on an unbounded `Vec`.
-    ///
-    /// Headroom: `max_stack` is exactly what javac computed for the real
-    /// binding `<clinit>`, so no real construction can be clipped. Our symbolic
-    /// stack counts `long`/`double` as one slot where the JVM counts two, so
-    /// our depth is never greater than the verified depth.
+    // Pushes onto the symbolic stack, honouring the declared max_stack: JVMS
+    // 4.7.3 forbids exceeding it, so a push past it means unverifiable
+    // bytecode. Bounds the decoder against a crafted class. See docs/deluxe.md.
     fn push(&mut self, val: StackVal) {
         if self.stack.len() >= self.max_stack {
             return;
@@ -1013,11 +847,9 @@ impl<'a> BindingDecoder<'a> {
     }
 }
 
-/// Count argument slots in a JVMS method descriptor like
-/// `(IILjava/lang/String;LFoo;)V`. Each field descriptor is one slot
-/// here (we don't track JVM's 2-slot long/double layout — the
-/// symbolic stack treats every value as 1 slot, which is what we
-/// want for `arg_count` purposes).
+// Counts argument slots in a JVMS descriptor like `(IILjava/lang/String;LFoo;)V`.
+// Each field descriptor is one slot (we don't track the JVM's 2-slot
+// long/double layout — the symbolic stack treats every value as 1 slot).
 fn parse_method_arg_count(descriptor: &str) -> usize {
     let bytes = descriptor.as_bytes();
     let mut i = 1; // skip leading '('
@@ -1114,30 +946,8 @@ impl MasterEnumTable {
 
 // ── interpret_streams: Constructions → StreamLabels ─────────────────────────
 
-/// Convert the per-construction tuples from Phase D into
-/// [`StreamLabel`]s. Two binding-constructor shapes are handled:
-///
-/// 5-arg: `BindingType.<init>(I, Lang;, Lpurpose;, I, LCodingType;)V`
-/// 4-arg: `BindingType.<init>(I, Lang;, Lpurpose;, LCodingType;)V`
-///
-/// Args are identified by **TYPE**, not position:
-/// - First `EnumRef{kind: "Language"}` → audio/subtitle language
-/// - First `EnumRef{kind: "Purpose"}` → Deluxe purpose ordinal
-/// - First `CodingType(name)` → codec field name (translated via
-///   [`coding_type_to_codec_hint`])
-/// - First `Int(n)` → stream index (preserved as ordering hint;
-///   per-type sequential stream_number is what actually goes into
-///   the StreamLabel, since BD spec stream-numbering is anchored on
-///   MPLS data, not the binding code)
-///
-/// Stream type inference:
-/// - Construction has a `CodingType` arg → audio stream (subtitles
-///   on Deluxe don't carry a CodingType; their codec is implicit
-///   PGS via the BD spec).
-/// - Construction has Language but no CodingType → subtitle stream.
-/// - Neither, and its binding type never yielded a stream → not a
-///   stream (skip). See [`slot_kind`] for why the binding type is
-///   consulted rather than the language alone.
+// Converts Phase D's per-construction tuples into StreamLabels (args
+// identified by TYPE not position). See docs/deluxe.md.
 fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -> Vec<StreamLabel> {
     let mut audio_idx: u16 = 0;
     let mut sub_idx: u16 = 0;
@@ -1260,18 +1070,9 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
     out
 }
 
-/// Which stream list each binding type enumerates, learned from the
-/// constructions that DID resolve a language.
-///
-/// A `<clinit>` walk emits a [`Construction`] for every `new X; … ;
-/// invokespecial X.<init>` it sees, so the list mixes real stream bindings
-/// with whatever else the class initializer builds. `binding_type` is the
-/// constructed class name, which is how the two are told apart: the stream
-/// bindings all share one class (Deluxe splits audio and subtitle across two),
-/// and that class is identifiable from the slots that resolved.
-///
-/// A binding type that resolved as both kinds is left out — with no consistent
-/// answer, guessing a list to advance would be worse than not advancing.
+// Which stream list each binding type enumerates, learned from the
+// constructions that DID resolve a language; a type that resolved as both
+// kinds is left out (no consistent answer). See docs/deluxe.md.
 fn slot_kinds(constructions: &[Construction]) -> HashMap<&str, Option<StreamLabelType>> {
     let mut kinds: HashMap<&str, Option<StreamLabelType>> = HashMap::new();
     for c in constructions {
@@ -1306,12 +1107,9 @@ fn slot_kinds(constructions: &[Construction]) -> HashMap<&str, Option<StreamLabe
     kinds
 }
 
-/// The stream list an unresolved construction occupies a slot in, or `None`
-/// when it is not a stream binding.
-///
-/// A `org.bluray.ti.CodingType` argument is decisive on its own: nothing but
-/// an audio stream binding is handed one. Otherwise fall back to what the
-/// binding type's resolved siblings showed (see [`slot_kinds`]).
+// The stream list an unresolved construction occupies a slot in, or None if
+// not a stream binding. A CodingType arg is decisive (only audio gets one);
+// otherwise falls back to what the binding type's resolved siblings showed.
 fn slot_kind(
     c: &Construction,
     has_coding_type: bool,
@@ -1323,14 +1121,9 @@ fn slot_kind(
     slot_kinds.get(c.binding_type.as_str()).copied().flatten()
 }
 
-/// Map a `org.bluray.ti.CodingType` field name (as observed in
-/// getstatic operands on Deluxe binding classes) to a human-readable
-/// codec hint string.
-///
-/// CodingType is the standard BD-J API enum; values are documented in
-/// the BD-J specification. Unknown field names pass through unchanged
-/// so unfamiliar codecs still surface something rather than going
-/// silent.
+// Maps an org.bluray.ti.CodingType field name (from getstatic operands on
+// Deluxe binding classes) to a human-readable codec hint. Unknown field
+// names pass through unchanged so unfamiliar codecs still surface something.
 fn coding_type_to_codec_hint(field: &str) -> &str {
     match field {
         // Lossless / hi-res.
@@ -1355,10 +1148,9 @@ fn coding_type_to_codec_hint(field: &str) -> &str {
     }
 }
 
-/// Deluxe Purpose enum ordinal → (LabelPurpose, LabelQualifier). The
-/// enum order is fixed per Phase A's verified output:
-/// 0=Normal, 1=Commentary, 2=PiP, 3=Trivia, 4=Descriptive, 5=Score,
-/// 6=NoForced, 7=NoForcedDescriptive.
+// Deluxe Purpose enum ordinal -> (LabelPurpose, LabelQualifier); order is
+// fixed per Phase A's verified output: 0=Normal, 1=Commentary, 2=PiP,
+// 3=Trivia, 4=Descriptive, 5=Score, 6=NoForced, 7=NoForcedDescriptive.
 fn deluxe_purpose_to_label(ordinal: u16) -> (LabelPurpose, LabelQualifier) {
     match ordinal {
         0 => (LabelPurpose::Normal, LabelQualifier::None),
@@ -1647,12 +1439,9 @@ mod tests {
         encode_class(&cp, this_class_idx, &methods)
     }
 
-    /// A `.class` fixture whose `<clinit>` is exactly `new AudioSlot; dup;
-    /// getstatic LanguageEnum.English; invokespecial AudioSlot.<init>
-    /// (LLanguageEnum;)V` — one real `Construction`, for Jar-level
-    /// `decode_binding` tests. `class_name` only affects the class's own
-    /// `this_class` entry (informational); the Jar-level lookup key is the
-    /// zip entry path passed to `build_zip`, not this name.
+    // A .class fixture whose `<clinit>` is `new AudioSlot; dup; getstatic
+    // LanguageEnum.English; invokespecial AudioSlot.<init>(LLanguageEnum;)V`
+    // — one real Construction, for Jar-level decode_binding tests.
     fn class_with_simple_construction(class_name: &str) -> Vec<u8> {
         let cp = vec![
             CpInfo::Empty,
@@ -1814,20 +1603,9 @@ mod tests {
         assert_eq!(purpose.1.values[7], "NoForcedDescriptive");
     }
 
-    /// Two candidates that BOTH match a fingerprint's prefix and are BOTH
-    /// within `LDC_COUNT_TOLERANCE` but neither exact must resolve the same
-    /// way on every run.
-    ///
-    /// The tie-break only prefers an exact ldc count over an inexact one, so
-    /// between two inexact candidates the winner is whichever the pool yields
-    /// first. Backed by a `HashMap` that is per-process seeded, meaning the
-    /// same disc image could pick a different master enum on a second run and
-    /// emit different commentary/SDH labels for byte-identical input — with
-    /// nothing in the output to say the choice was arbitrary.
-    ///
-    /// Running the whole identification repeatedly is what makes this a test
-    /// rather than a hope: a single run cannot distinguish "deterministic"
-    /// from "got lucky", and the hash seed does not change within one process.
+    // Two candidates that BOTH match a fingerprint's prefix and are BOTH within
+    // LDC_COUNT_TOLERANCE but neither exact must resolve the same way on every
+    // run. Repeated runs are what distinguish "deterministic" from "got lucky".
     #[test]
     fn identify_master_enums_breaks_a_tie_between_two_inexact_candidates_deterministically() {
         // Both are prefix-matching Purpose candidates at diff 2 and 3 from the
@@ -2167,16 +1945,8 @@ mod tests {
 
     // ── Aggregate (cross-class) candidate-pool bounds ───────────────────────
 
-    /// `MAX_CLINIT_LDC_BYTES` bounds retention PER CLASS; the candidate pool
-    /// holds every class's strings at once, so without an aggregate a 64 MiB
-    /// jar reaches tens of GiB.
-    ///
-    /// Fixture arithmetic (deliberately NOT expressed in terms of the constant
-    /// under test — raising the constant must FAIL this test, not silently
-    /// widen it): each entry costs a 5-byte class name plus a 65536-byte
-    /// string = 65541 bytes. 65541 x 255 = 16 712 955 fits in the budget;
-    /// 65541 x 256 = 16 778 496 does not, and the leftover 64 261 bytes admit
-    /// no further entry. So exactly 255 of the 1024 offered entries are kept.
+    // MAX_CLINIT_LDC_BYTES bounds PER CLASS; this checks the cross-class
+    // aggregate (255 of 1024 kept, a literal so a raise fails loud).
     #[test]
     fn candidate_pool_bounds_bytes_retained_across_classes() {
         let payload = "x".repeat(64 * 1024);
@@ -2196,13 +1966,9 @@ mod tests {
         assert_eq!(pool.by_class.len(), 255);
     }
 
-    /// The byte budget alone still admits millions of map entries when each
-    /// class retains one tiny string, and per-entry `HashMap`/`String`
-    /// overhead is not charged against it. The entry-count cap binds there.
-    ///
-    /// Fixture: 1-byte payloads, so ~7 bytes per entry — the byte budget is
-    /// nowhere near reached and the count cap is the only thing that can stop
-    /// this at 65536.
+    // The byte budget alone still admits millions of map entries when each
+    // class retains one tiny string (per-entry overhead isn't charged), so
+    // this checks the entry-count cap binds independently, at 65536.
     #[test]
     fn candidate_pool_bounds_entry_count_for_tiny_classes() {
         let mut pool = CandidatePool::default();
@@ -2219,10 +1985,9 @@ mod tests {
         );
     }
 
-    /// Headroom check: a jar far larger than any real BD-J title (3000
-    /// classes, 200 bytes of `<clinit>` strings each — the five master enums
-    /// together are ~1.2 KB) must be retained in full. A cap that rejects real
-    /// media is a defect in the other direction.
+    // Headroom check: a jar far larger than any real BD-J title (3000
+    // classes, 200 bytes of clinit strings each) must be retained in full.
+    // A cap that rejects real media is a defect in the other direction.
     #[test]
     fn candidate_pool_admits_a_generously_sized_real_jar() {
         let mut pool = CandidatePool::default();
@@ -2239,11 +2004,9 @@ mod tests {
         );
     }
 
-    /// `insert` rejects when `bytes.saturating_add(cost) > MAX_CANDIDATE_TOTAL_BYTES`
-    /// — i.e. landing EXACTLY on the cap is still accepted; only strictly
-    /// exceeding it is rejected. A `>` -> `>=` mutant would reject the
-    /// exact-cap entry too. Two entries are sized so the second brings
-    /// `bytes` to precisely `MAX_CANDIDATE_TOTAL_BYTES`, not one byte over.
+    // insert rejects on `bytes.saturating_add(cost) > MAX_CANDIDATE_TOTAL_BYTES`,
+    // so landing EXACTLY on the cap must still be accepted (a `>` -> `>=`
+    // mutant would reject it); only strictly exceeding it is rejected.
     #[test]
     fn candidate_pool_insert_accepts_landing_exactly_on_the_cap() {
         let mut pool = CandidatePool::default();
@@ -2268,12 +2031,8 @@ mod tests {
 
     // ── Construction accumulation bounds ────────────────────────────────────
 
-    /// One `new X / dup / ... / invokespecial X.<init>` per 11 code bytes, so
-    /// a 64 MiB decompressed class reaches ~6M `Construction`s (~1 GiB of
-    /// `String` + arg `Vec`). Offer 5000 and exactly 4096 must be retained.
-    ///
-    /// 4096 is asserted as a literal, not as `MAX_CONSTRUCTIONS`: raising the
-    /// constant must fail this test rather than pass vacuously.
+    // One construction per 11 code bytes reaches millions on a crafted class.
+    // Offer 5000; expect 4096 (a literal, so raising the constant fails loud).
     #[test]
     fn binding_decoder_construction_count_is_capped() {
         // new AudioSlot; dup; getstatic Lang.English; invokespecial <init>; pop
@@ -2309,9 +2068,8 @@ mod tests {
         );
     }
 
-    /// Headroom: the BD STN_table admits at most 32 primary audio + 32 PG
-    /// streams per playlist, so even a disc binding several hundred stream
-    /// slots must survive the cap untouched.
+    // Headroom: the BD STN_table admits at most 32 primary audio + 32 PG
+    // streams per playlist, so even several hundred stream slots must survive.
     #[test]
     fn binding_decoder_admits_a_large_real_binding_table() {
         let one: [u8; 11] = [NEW, 0, 8, 0x59, GETSTATIC, 0, 6, INVOKESPECIAL, 0, 12, 0x57];
@@ -2332,14 +2090,9 @@ mod tests {
         );
     }
 
-    /// `interpret_streams` numbers streams with a 1-based `u16` counter. An
-    /// unguarded `+= 1` panics in debug and wraps in release past 65535;
-    /// `saturating_add` would be worse still (every stream past the ceiling
-    /// pegged to the SAME number, and `apply_labels` binds on
-    /// `(type, stream_number)` — silent mislabelling). Emission must stop at
-    /// the end of the numbering space instead.
-    ///
-    /// 65535 is the size of the 1-based u16 domain, not a tunable constant.
+    // interpret_streams numbers streams with a 1-based u16 counter: unguarded
+    // `+= 1` wraps/panics past 65535, and `saturating_add` would silently peg
+    // every overflow stream to the same number. Emission must stop instead.
     #[test]
     fn interpret_streams_stops_at_the_u16_numbering_ceiling() {
         let master = lang_enum_master();
@@ -2388,20 +2141,9 @@ mod tests {
         );
     }
 
-    /// Construct a minimal ConstantPool that supports the synthetic
-    /// bytecode in the tests below. Layout:
-    ///   1: Utf8 "LanguageEnum"
-    ///   2: Class -> 1                                (LanguageEnum)
-    ///   3: Utf8 "English"
-    ///   4: Utf8 "LLanguageEnum;"
-    ///   5: NameAndType { name: 3, descriptor: 4 }   (LanguageEnum.English)
-    ///   6: Fieldref { class: 2, nat: 5 }            (getstatic operand)
-    ///   7: Utf8 "AudioSlot"
-    ///   8: Class -> 7                                (AudioSlot)
-    ///   9: Utf8 "<init>"
-    ///  10: Utf8 "(LLanguageEnum;)V"
-    ///  11: NameAndType { name: 9, descriptor: 10 }
-    ///  12: Methodref { class: 8, nat: 11 }          (invokespecial operand)
+    // Minimal ConstantPool for the synthetic bytecode in the tests below:
+    // entries 1-6 encode LanguageEnum.English (getstatic operand at 6),
+    // entries 7-12 encode AudioSlot.<init> (invokespecial operand at 12).
     fn build_simple_pool() -> ConstantPool {
         let entries = vec![
             CpInfo::Empty,
@@ -2709,11 +2451,9 @@ mod tests {
         );
     }
 
-    /// Pool for a single-int-arg constructor `AudioSlot.<init>(I)V`, used by
-    /// `binding_decoder_int_push_opcodes_produce_the_right_value` to isolate
-    /// each int-push opcode's produced VALUE (not just "a construction
-    /// happened") — JVMS §3.11.3 (`iconst_<i>`, `bipush`, `sipush`, `ldc` of
-    /// a `CONSTANT_Integer`) each push a specific known int.
+    // Pool for a single-int-arg constructor `AudioSlot.<init>(I)V`, used to
+    // isolate each int-push opcode's (iconst_<i>, bipush, sipush, ldc) exact
+    // produced value, not just "a construction happened".
     fn int_ctor_pool() -> ConstantPool {
         ConstantPool::from_entries(vec![
             CpInfo::Empty,
@@ -2918,18 +2658,9 @@ mod tests {
         assert_eq!(out[0].language, "eng");
     }
 
-    /// Each stream binding in a binding class's `<clinit>` is one STN slot,
-    /// in STN order — that is the whole basis for numbering them positionally
-    /// here. Whether the abstract interpreter managed to RESOLVE a slot's
-    /// language does not change how many slots the disc has: a `getstatic`
-    /// whose owning class was not fingerprinted as a master enum, or whose
-    /// field is missing from the resolved ordinal map, arrives as
-    /// `StackVal::Unknown`.
-    ///
-    /// A slot that resolved nothing has no label to emit, but it must still
-    /// consume its number. Skipping it renumbers every slot behind it and
-    /// binds their labels — language, commentary, descriptive-audio — one
-    /// stream early.
+    // Each stream binding is one STN slot in STN order, regardless of whether
+    // the interpreter resolved its language. A slot that resolved nothing
+    // still consumes its number, or every slot behind it renumbers wrong.
     #[test]
     fn interpret_streams_unresolved_slot_still_consumes_its_number() {
         let audio_slot = |lang: Option<u16>| Construction {

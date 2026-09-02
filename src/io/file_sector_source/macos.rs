@@ -1,18 +1,13 @@
-//! macOS: hint the kernel to prefetch a generous chunk. macOS has no
-//! direct `POSIX_FADV_SEQUENTIAL` equivalent; the idiomatic hint is
-//! `fcntl(F_RDADVISE, &radvisory)` describing the byte range you
-//! intend to read soon. We point it at the whole file (clamped to a
-//! ceiling so a multi-TB ISO doesn't ask the kernel to prefetch
-//! everything at once).
+// macOS: hint the kernel to prefetch via fcntl(F_RDADVISE, &radvisory),
+// the closest equivalent to POSIX_FADV_SEQUENTIAL.
+// See docs/file-sector-source-macos.md — F_RDADVISE background.
 
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 
-/// Cap on the byte length we pass to `F_RDADVISE`. Asking for a
-/// multi-GB readahead window is counterproductive — the OS doesn't
-/// have that much cache to throw at one fd. 64 MiB is generous for
-/// our use case (sweep, mux) so the kernel's prefetch ≥ our app-level
-/// pipeline depth.
+// Cap on the byte length we pass to `F_RDADVISE`; 64 MiB is generous
+// without over-asking the OS's cache.
+// See docs/file-sector-source-macos.md — RDADVISE_MAX_BYTES rationale.
 const RDADVISE_MAX_BYTES: i64 = 64 * 1024 * 1024;
 
 pub(crate) fn hint_sequential(file: &File, len_bytes: u64) {
@@ -27,19 +22,14 @@ pub(crate) fn hint_sequential(file: &File, len_bytes: u64) {
     }
 }
 
-/// macOS has no direct `POSIX_FADV_DONTNEED` equivalent for a byte
-/// range. `fcntl(F_NOCACHE)` would disable caching globally on the fd
-/// (too coarse — we want the unread region to still benefit). Best
-/// approximation: no-op. macOS's unified buffer cache is generally
-/// less prone to the pin-everything pathology that triggers the
-/// regression on Linux NFS clients.
+// No direct POSIX_FADV_DONTNEED equivalent; F_NOCACHE is too coarse
+// (disables caching for the whole fd), so this is a best-effort no-op.
+// See docs/file-sector-source-macos.md — drop_window rationale.
 pub(crate) fn drop_window(_file: &File, _start: u64, _len: u64) {}
 
-/// Async-prefetch the byte range `[offset, offset+len)`. macOS uses
-/// the same `fcntl(F_RDADVISE, &radvisory)` primitive as the open-
-/// time sequential hint, just targeted at a moving window instead of
-/// the whole file. The kernel queues I/O for the requested range and
-/// returns immediately.
+// Async-prefetch `[offset, offset+len)` via the same F_RDADVISE
+// primitive as the open-time hint, targeted at a moving window.
+// See docs/file-sector-source-macos.md — prefetch details.
 pub(crate) fn prefetch(file: &File, offset: u64, len: u64) {
     let bytes = (len as i64).min(RDADVISE_MAX_BYTES);
     let mut ra = libc::radvisory {

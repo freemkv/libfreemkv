@@ -117,3 +117,100 @@ starting with `;` or `#` are comments) holding the host credentials and per-disc
 entries the library uses to resolve a disc. autorip can auto-download and
 refresh it from a configured URL. The library does not ship any AACS keys
 compiled into the binary.
+
+## `UnitKey::is_default_index` test rationale
+
+`is_default_index` is the public predicate that separates ordinary (index-0)
+content keys from FMTS forensic index keys (see `UnitKey` docs; AACS 2.1
+`IndividualSegment.tbl` tagging). A body answering `true` for everything would
+present a forensic index key as an ordinary content key -- the caller would
+decrypt the bulk of the title with a key that only opens 1/32nd of it;
+answering `false` for everything would hide every ordinary key.
+
+`is_default_index_separates_the_two_constructors` is pinned against the two
+named constructors, which are the contract: `UnitKey::new` builds the ordinary
+key, `UnitKey::forensic` builds an index key for `1..=32`.
+
+`is_default_index_agrees_with_the_forensic_index_resolver` checks the
+predicate agrees with the one consumer of `index_number` in the crate:
+`crate::aacs::index_select::resolve_disc_index` resolves the disc's forensic
+index from exactly the keys that are NOT default. If the two disagree, a disc
+resolves an index whose key the rest of the pipeline treats as ordinary (or
+vice versa).
+
+## `src/aacs/mod.rs` module notes
+
+### KEYDB.cfg line format
+
+```
+| DK | DEVICE_KEY 0x... | DEVICE_NODE 0x... | KEY_UV 0x... | KEY_U_MASK_SHIFT 0x...
+| PK | 0x...
+| HC | HOST_PRIV_KEY 0x... | HOST_CERT 0x...
+| HC2 | HOST_PRIV_KEY 0x... | HOST_CERT 0x...
+0x<disc_hash> = <title> | D | <date> | M | 0x<media_key> | I | 0x<disc_id> | V | 0x<vuk> | U | <unit_keys>
+```
+
+### Spec provenance tags
+
+The crypto in `src/aacs/` carries `[TAG] §x.y` citations back to the published
+AACS specification (Final Rev 0.953), so each primitive links to the section it
+implements:
+
+- `[C]` -- AACS Introduction and Common Cryptographic Elements Book (primitives,
+  MKB/key-management).
+- `[PR]` -- AACS Pre-recorded Video Book (Volume/Title Key layer).
+- `[BD]` -- AACS Blu-ray Disc Pre-recorded Book (CPS Unit Key, Aligned Unit,
+  Block Key).
+- `[RE]` -- reverse-engineered from real discs, cited only where the public
+  spec is silent (the `0x86` verify record and the Category-C MKB type values).
+
+### AACS key-input path discovery (`AacsRole`, `role_paths`, `find_hddvd_aacs_dir`)
+
+BD and UHD keep their key material under a fixed `/AACS/...` tree, so those
+paths are constants. HD DVD keeps the equivalents in a reserved root directory
+whose NAME is authoring-house-specific -- observed `ANY!` (Dukes of Hazzard)
+and `AAC!` (Freedom / Memory-Tech), each with a `<name>!_BAK` mirror -- and
+whose title-key file is NOT always `VTKF000.AACS` (Freedom ships
+`VTKF090.AACS` + `VTKF100.AACS`). So the HD DVD files are DISCOVERED from the
+parsed UDF tree (`find_hddvd_aacs_dir` + `role_paths`), never hardcoded.
+
+Each key role (`AacsRole`) resolves to an ordered candidate list -- the BD/UHD
+constants first, then whatever the HD DVD directory actually holds -- which
+every reader walks with `read_first`, first-that-reads. No reader ever
+branches on disc type: a BD/UHD disc has the `/AACS/` files so those win; an
+HD DVD has none of them, so it falls through to the discovered entries.
+Centralised so `resolve_vid_only`, `read_aacs_inputs`, `read_mkb_content`, and
+`read_aacs_version` can never silently diverge the disc_hash / MKB / VID that
+another reader feeds a key service.
+
+`find_hddvd_aacs_dir` identifies the HD DVD AACS directory structurally, NOT by
+a hardcoded name: the root child directory whose name ends in `!` (so the
+`<name>!_BAK` backup mirror, which also ends in a non-`!` char, is not
+mistaken for it) and which contains `MKBROM.AACS`. Observed real names:
+`ANY!` (Dukes of Hazzard), `AAC!` (Freedom). A BD/UHD disc has no such
+directory -> `None`.
+
+`role_paths` builds the ordered candidate list: fixed BD/UHD paths first, then
+the discovered HD DVD files. For `AacsRole::UnitKey` every `VTKF*.AACS` in the
+directory is appended in sorted name order -- a disc may carry more than one
+variant (Freedom: `VTKF090` + `VTKF100`), not just `VTKF000`.
+
+`read_first` walks an AACS role's candidate paths and returns the first that
+reads; `read` performs the actual per-path read (full file or bounded prefix),
+so callers share the same first-present walk regardless of read style. Returns
+`Error::AacsNoKeys` if no candidate is present. Generic over the path element
+(`&str` or owned `String`) so it accepts the `Vec<String>` that `role_paths`
+builds from the discovered HD DVD directory.
+
+### Test: `a_bang_suffixed_directory_without_mkbrom_is_not_the_aacs_directory`
+
+The `!`-suffix and the `MKBROM.AACS` presence test are BOTH required -- the
+discovery is a conjunction, not a disjunction. The existing fixtures only ever
+present a directory that satisfies both (`AAC!` with `MKBROM.AACS`) alongside
+one that satisfies neither (`AAC!_BAK` -- which contains `MKBROM.AACS` but is
+ALSO reached only after the real dir), so either half of the conjunction could
+be dropped and the same directory would still be found. This test's fixture
+has a directory that satisfies the name half and NOT the contents half: it
+must not be picked. If it were, the HD DVD path would resolve `MKBROM.AACS`,
+`CONTENT_CERT.AACS` and the title-key file under a directory that holds none
+of them -- the disc reports "no AACS key files" and never rips.

@@ -147,16 +147,9 @@ pub fn start_master<W: Write + Seek>(w: &mut W, id: u32) -> io::Result<u64> {
     Ok(size_pos)
 }
 
-/// Encode `data_size` as the FIXED-WIDTH 8-octet EBML VINT used to back-patch
-/// a master element's size field: the `0x01` VINT_MARKER octet followed by the
-/// 56-bit VINT_DATA payload, big-endian (RFC 8794 section 4.4 — an 8-octet
-/// VINT carries 7 octets of VINT_DATA).
-///
-/// Extracted so the full 56-bit payload can be exercised directly: reaching
-/// the high payload bytes through [`end_master`] / [`end_master_buf`] would
-/// take a multi-terabyte buffer, leaving them unconstrained by any test.
-///
-/// `data_size` must be below 2^56; both callers check that first.
+// Fixed-width 8-octet EBML VINT (0x01 marker + 56-bit big-endian payload,
+// RFC 8794 §4.4) used to back-patch a master element's size field.
+// See docs/ebml.md — fixed_width_vint8 (rationale, callers' invariants).
 fn fixed_width_vint8(data_size: u64) -> [u8; 8] {
     debug_assert!(data_size < 0x0100_0000_0000_0000);
     [
@@ -200,13 +193,8 @@ pub fn end_master<W: Write + Seek>(w: &mut W, size_pos: u64) -> io::Result<()> {
 /// 8-byte size placeholder [`start_master`] writes. Returns the buffer index of
 /// the size field, for [`end_master_buf`].
 ///
-/// This is the seek-free twin of [`start_master`]/[`end_master`] for elements
-/// small enough to assemble whole before hitting the file (a BlockGroup: one
-/// Block plus a couple of tiny elements). Because [`end_master`] always
-/// back-patches a FIXED-WIDTH 8-byte VINT (`0x01` + 7 payload bytes) rather
-/// than a minimal-width one, the bytes produced by this pair are byte-for-byte
-/// identical to the seek-and-back-patch pair — assembling in memory cannot
-/// change the emitted Matroska.
+/// This is the seek-free twin of [`start_master`]/[`end_master`], producing
+/// byte-for-byte identical output — see docs/ebml.md for why.
 pub fn start_master_buf(buf: &mut Vec<u8>, id: u32) -> io::Result<usize> {
     write_id(buf, id)?;
     let size_pos = buf.len();
@@ -427,13 +415,9 @@ pub fn read_binary_val(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
     read_exact_bounded(r, len)
 }
 
-/// Read exactly `len` bytes WITHOUT trusting `len` to size the allocation.
-///
-/// `vec![0u8; len]` on an attacker-controlled EBML size would allocate
-/// gigabytes before the read fails. Instead we cap the reader to `len`
-/// and grow the buffer as bytes actually arrive: a malformed element that
-/// claims a huge length but supplies few bytes allocates only what it
-/// delivers, then errors on the short read.
+// Reads exactly `len` bytes without trusting `len` to size the allocation
+// up front (an attacker-controlled EBML size could claim gigabytes).
+// See docs/ebml.md — read_exact_bounded.
 fn read_exact_bounded(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let got = r.take(len as u64).read_to_end(&mut buf)?;
@@ -446,9 +430,7 @@ fn read_exact_bounded(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-// ============================================================
 // Matroska Element IDs
-// ============================================================
 
 // EBML Header
 pub const EBML: u32 = 0x1A45_DFA3;
@@ -1350,16 +1332,9 @@ mod tests {
         // And the whole buffer is exactly the outer element.
         assert_eq!(data.len() as u64, outer_body_start + osize);
     }
-    /// The buffer-based master helpers must produce byte-for-byte what the
-    /// seek-based ones produce. `write_block_group` was rewritten onto
-    /// `start_master_buf`/`end_master_buf` to eliminate ~4 seeks (and 4 MiB
-    /// BufWriter flushes) PER FRAME, which on an MPEG-2 title is ~350k frames — a
-    /// change only safe because the two encodings are identical.
-    ///
-    /// Both write a FIXED-width 8-byte VINT placeholder (0x01 + 7 payload bytes)
-    /// and patch it in place; neither ever emits a minimal-width size. This test
-    /// pins that, so a future "optimisation" of either one to minimal-width sizes
-    /// cannot silently desync the two and change emitted Matroska.
+    // Buffer-based and seek-based master helpers must produce byte-for-byte
+    // identical output; write_block_group relies on that to skip seeks/flushes.
+    // See docs/ebml.md — buffered_master_matches_seeking_master_byte_for_byte.
     #[test]
     fn buffered_master_matches_seeking_master_byte_for_byte() {
         use std::io::Cursor;
@@ -1393,10 +1368,8 @@ mod tests {
         }
     }
 
-    /// Nested masters must patch correctly too — the MVC BlockGroup nests
-    /// BlockAdditions > BlockMore inside the BlockGroup, and in-memory patching
-    /// works by index rather than by file offset, so nesting is where an
-    /// index-arithmetic slip would show up.
+    // Nested masters must patch correctly too: in-memory patching works by
+    // index rather than file offset, so nesting is where an index slip shows.
     #[test]
     fn buffered_master_nests_correctly() {
         use std::io::Cursor;
@@ -1437,12 +1410,9 @@ mod tests {
         );
     }
 
-    /// The fixed-width 8-octet VINT is `0x01` followed by the 56-bit
-    /// VINT_DATA payload in BIG-ENDIAN order (RFC 8794 section 4.4). Every
-    /// payload octet is distinct here, so a shifted, reversed or dropped
-    /// octet is visible; the top payload octets are unreachable through
-    /// end_master without a multi-terabyte buffer, which is why this is
-    /// tested at the encoder.
+    // Every payload octet is distinct, so a shifted/reversed/dropped octet
+    // is visible; the top octets are unreachable through end_master directly.
+    // See docs/ebml.md — fixed_width_vint8_is_big_endian_over_the_full_payload.
     #[test]
     // Underscores mark bitfield boundaries (e.g. 5-bit then 3-bit), not digit
     // groups; regrouping uniformly would destroy the only thing they encode.

@@ -1,37 +1,18 @@
 //! One accumulation buffer for parsers that assemble access units across PES
 //! packets.
 //!
-//! A buffering parser has to answer the same question for every unit it emits:
-//! *which PES contributed this unit's FIRST byte?* Its timestamp comes from
-//! that PES, and so does the source byte offset that identifies which clip of a
-//! multi-clip title the unit belongs to. The trailing PES packets that complete
-//! the unit carry their own, later, values which must not override it.
-//!
-//! That question was answered three different ways. DTS kept a deque of
-//! `(offset, pts)` markers and took the one covering offset 0 — correct. AC-3
-//! kept a single carry-over timestamp. TrueHD kept its own. None of them
-//! carried the source offset at all, so provenance existed only for video, and
-//! a title whose clip marks could not be read from timestamps alone had nine
-//! audio and subtitle tracks with nothing to place them by.
-//!
-//! Three spellings of one rule is how they drifted, so this is the one place it
-//! lives. The buffer owns the bytes AND the marks, and returns a PES's facts
-//! together — a parser cannot take the timestamp from one PES and the source
-//! from another, because it does not assemble them itself.
+//! The buffer owns the bytes and the marks together, so a unit's timestamp
+//! and source offset always come from the PES that carried its first byte,
+//! never taken from two different packets. See docs/pesbuf.md for the full
+//! rationale.
 
 use super::PesPacket;
 use super::pts_to_ns;
 use crate::pes::SourcePos;
 
-/// What a PES contributes to the bytes it carried.
-///
-/// Returned as a unit so a caller cannot mix fields from different packets.
-/// The timestamps are carried RAW, as the packet had them. This type answers
-/// *which packet* a unit's facts come from — the question that was being
-/// answered three different ways. How a given codec derives a timestamp from
-/// that packet stays the codec's business: DVD subtitles read `pts` only and
-/// fall back to 0, most audio takes `pts.or(dts)`. Deriving it here would have
-/// changed those semantics silently while fixing provenance.
+// What a PES contributes to the bytes it carried, returned as a unit so a
+// caller cannot mix fields from different packets. Timestamps are raw, as
+// the packet had them; see docs/pesbuf.md for how codecs derive from them.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct PesFacts {
     /// Presentation time in NANOSECONDS, already derived (see `of`). Stored
@@ -47,13 +28,9 @@ pub(crate) struct PesFacts {
 }
 
 impl PesFacts {
-    /// The facts a PES packet carries, read straight off it.
-    ///
-    /// Every parser reads its frame's timestamp, source and discontinuity from
-    /// a `PesFacts` — never off a `PesPacket` field directly — so the three can
-    /// never be taken from different packets. Parsers that assemble units
-    /// across packets get theirs from [`PesBuf::front`]; this is the same value
-    /// for a parser whose unit begins in the packet it is handed.
+    // The facts a PES packet carries, read straight off it. Every parser reads
+    // timestamp/source/discontinuity from PesFacts, never PesPacket directly,
+    // so they can't be mixed. See docs/pesbuf.md; PesBuf::front gives the same.
     pub(crate) fn of(pes: &PesPacket) -> Self {
         Self {
             pts_ns: pes.pts.or(pes.dts).map(pts_to_ns),
@@ -62,10 +39,9 @@ impl PesFacts {
         }
     }
 
-    /// The same facts with the presentation time replaced by one the parser
-    /// resolved itself — for a packet that carried no timestamp and whose unit
-    /// continues a base established earlier. The attribution is unchanged:
-    /// still this packet's bytes, still its source offset.
+    // Same facts with the presentation time replaced by one the parser resolved
+    // itself, for a packet with no timestamp continuing an earlier base.
+    // Attribution is unchanged: still this packet's bytes and source offset.
     pub(crate) fn with_pts_ns(self, pts_ns: i64) -> Self {
         Self {
             pts_ns: Some(pts_ns),
@@ -73,28 +49,17 @@ impl PesFacts {
         }
     }
 
-    /// This unit's presentation time in nanoseconds — the ONE derivation.
-    ///
-    /// PTS and DTS are not two spellings of one value: PTS is when to display,
-    /// DTS is when to decode, and for a stream that REORDERS (video carrying
-    /// B-frames) they differ, so reading DTS as a presentation time would be
-    /// wrong. Reordering is handled by the video path, which reconstructs
-    /// display order rather than calling this.
-    ///
-    /// For everything that reaches here — audio and subtitles — there is no
-    /// reordering, so DTS *is* the presentation time, and falling back to it is
-    /// reading the same value from whichever field the packet used. A fallback
-    /// for a missing field, not a second rule: dvdsub read `pts` alone and
-    /// returned 0 for a packet that carried only DTS.
+    // This unit's presentation time in nanoseconds — the ONE derivation. PTS and
+    // DTS differ for reordering (B-frame) streams, so video derives display
+    // order itself; see docs/pesbuf.md for audio/subtitle fallback rationale.
     pub(crate) fn presentation_ns(&self) -> Option<i64> {
         self.pts_ns
     }
 }
 
-/// The facts of the packet covering `off` within a [`PesBuf::marks_snapshot`].
-///
-/// The same at-or-before rule as [`PesBuf::facts_at`], for a scanner holding a
-/// snapshot rather than the buffer.
+// The facts of the packet covering `off` within a PesBuf::marks_snapshot.
+// Same at-or-before rule as PesBuf::facts_at, for a scanner holding a
+// snapshot rather than the buffer.
 pub(crate) fn facts_for(marks: &[(usize, PesFacts)], off: usize) -> PesFacts {
     let mut found = PesFacts::default();
     for &(at, facts) in marks {
@@ -123,12 +88,9 @@ impl PesBuf {
         }
     }
 
-    /// Append a PES's payload, recording where its bytes begin.
-    ///
-    /// A PES carrying no payload records nothing: it contributed no byte, so it
-    /// can never be the answer to "which packet carried the byte at offset N",
-    /// and admitting a zero-length mark would let it shadow the packet that
-    /// actually did.
+    // Append a PES's payload, recording where its bytes begin. A PES with no
+    // payload records nothing, so a zero-length mark can never shadow the
+    // packet that actually carried the byte at a given offset.
     pub(crate) fn push(&mut self, pes: &PesPacket) {
         if pes.data.is_empty() {
             return;
@@ -148,11 +110,9 @@ impl PesBuf {
         self.buf.extend_from_slice(data);
     }
 
-    /// The facts of the PES that carried the byte at `off`.
-    ///
-    /// The last mark at or before `off`: bytes belong to the most recent packet
-    /// that started at or before them. Defaults when the buffer holds bytes
-    /// that predate any mark (a parser that seeded it directly).
+    // The facts of the PES that carried the byte at `off`: the last mark at or
+    // before it. Defaults when the buffer holds bytes that predate any mark
+    // (a parser that seeded it directly).
     pub(crate) fn facts_at(&self, off: usize) -> PesFacts {
         let mut found = PesFacts::default();
         for &(at, facts) in &self.marks {
@@ -183,13 +143,9 @@ impl PesBuf {
         self.buf.is_empty()
     }
 
-    /// Consume `n` bytes from the front, rebasing the marks onto the new front.
-    ///
-    /// The mark covering the new front byte is RETAINED at offset 0 even though
-    /// its packet started earlier: those bytes are still that packet's. Dropping
-    /// it would attribute the remainder of a straddling unit to whichever packet
-    /// happened to start next — precisely the misattribution this type exists to
-    /// prevent, and it would land at a clip boundary, the one place it matters.
+    // Consume `n` bytes from the front, rebasing marks onto the new front. The
+    // mark covering the new byte at offset 0 is retained even though its packet
+    // started earlier; see docs/pesbuf.md for why dropping it misattributes.
     pub(crate) fn drain(&mut self, n: usize) {
         let n = n.min(self.buf.len());
         if n == 0 {
@@ -206,10 +162,9 @@ impl PesBuf {
         }
     }
 
-    /// Seed the buffer directly with bytes carrying no packet attribution —
-    /// for tests that drive a parser's scanner without a demuxer in front of
-    /// it. Facts for these bytes default to absent, which is what an
-    /// unattributed byte honestly is.
+    // Seed the buffer directly with bytes carrying no packet attribution, for
+    // tests driving a parser's scanner without a demuxer. Facts for these bytes
+    // default to absent, which is what an unattributed byte honestly is.
     #[cfg(test)]
     pub(crate) fn seed(&mut self, data: &[u8]) {
         self.buf.clear();
@@ -236,10 +191,9 @@ impl PesBuf {
         self.marks.push_back((self.buf.len(), facts));
     }
 
-    /// The marks, for a scanner that must resolve facts at several offsets
-    /// while the buffer's bytes are borrowed elsewhere. Use with
-    /// [`facts_for`], which applies the same at-or-before rule as
-    /// [`PesBuf::facts_at`].
+    // The marks, for a scanner resolving facts at several offsets while the
+    // buffer's bytes are borrowed elsewhere. Use with facts_for, which applies
+    // the same at-or-before rule as PesBuf::facts_at.
     pub(crate) fn marks_snapshot(&self) -> Vec<(usize, PesFacts)> {
         self.marks.iter().copied().collect()
     }

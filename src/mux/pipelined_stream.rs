@@ -1,13 +1,8 @@
-//! `PipelinedPesStream` — the read-side of the freemkv mux
-//! highway.
+//! `PipelinedPesStream` — the read-side of the freemkv mux highway.
 //!
-//! Given a [`crate::mux::demux_thread::DemuxThread`] (which has the
-//! producer + demux workers already spawned), a set of codec
-//! parsers, and the title metadata, this struct implements
-//! [`crate::pes::Stream`] by running codec parse on the caller's
-//! thread and emitting `PesFrame`s one at a time.
-//!
-//! The pipeline runs three threads in parallel:
+//! Given a [`crate::mux::demux_thread::DemuxThread`] and a set of codec
+//! parsers, this struct implements [`crate::pes::Stream`] by running codec
+//! parse on the caller's thread and emitting `PesFrame`s one at a time.
 //!
 //! ```text
 //! Thread A: read + decrypt   (PrefetchedSectorSource / BytePrefetcher)
@@ -15,18 +10,8 @@
 //! Thread C: codec parse      (this struct, on the caller's thread)
 //! ```
 //!
-//! Communication between A→B and B→C is via bounded channels with
-//! recycled buffer pools — no allocations or memcpys in the steady-
-//! state hot loop.
-//!
-//! This is the *only* read-side `Stream` impl in tree. Both the ISO
-//! file mux and the BD-TS (`m2ts://`) file mux input paths are built by
-//! [`crate::mux::resolve`] (`build_iso_pipeline` / the m2ts pipeline
-//! builder) and hand back a `PipelinedPesStream`; the differences are
-//! in how the producer thread (A) is configured — sector-aligned reads
-//! with AACS decrypt for ISO, raw byte reads for M2TS.
-//! ([`crate::mux::M2tsStream`] itself is a write-only sink and does not
-//! construct this type.)
+//! See docs/pipelined-stream.md for the full threading/channel model and
+//! how the ISO vs M2TS input paths construct this type.
 
 use super::codec::CodecParser;
 use super::demux_thread::{DemuxBatch, DemuxThread};
@@ -88,15 +73,9 @@ fn stream_codec(s: &crate::disc::Stream) -> crate::disc::Codec {
 }
 
 impl PipelinedPesStream {
-    /// Wire up the stream. Caller has already spawned the
-    /// `DemuxThread` (which in turn owns the producer); we take the
-    /// receiver end + the join handle bundle so cleanup is bounded
-    /// on drop.
-    ///
-    /// `pub(crate)`: the signature takes the internal `DemuxThread` /
-    /// `DemuxBatch` / `CodecParser` types, so external callers reach this
-    /// stream via [`super::resolve::input`] / `build_iso_pipeline`
-    /// instead.
+    // Wire up the stream; takes ownership of DemuxThread so cleanup is bounded
+    // on drop. pub(crate): external callers go through super::resolve::input /
+    // build_iso_pipeline instead.
     pub(crate) fn new(
         demux_thread: DemuxThread,
         demux_rx: Receiver<DemuxBatch>,
@@ -133,10 +112,8 @@ impl PipelinedPesStream {
         }
     }
 
-    /// Pull one batch of `PesPacket`s from the demux thread, run
-    /// codec parse on each, enqueue resulting `PesFrame`s on
-    /// `pending_frames`. Returns Ok(true) on success, Ok(false) on
-    /// EOF (channel closed cleanly), Err on demuxer error.
+    // Pull one batch, parse it, enqueue frames on pending_frames. Ok(true) =
+    // success, Ok(false) = clean EOF, Err = demuxer error.
     fn pump_one_batch(&mut self) -> io::Result<bool> {
         match self.demux_rx.recv() {
             Ok(DemuxBatch::Ts(packets)) => {
@@ -437,12 +414,9 @@ mod tests {
     use crate::mux::ts::PesPacket;
     use crossbeam_channel::{Sender, bounded};
 
-    /// Build a real, cleanly-exiting `DemuxThread` whose own receiver we
-    /// discard. The worker exits immediately (its prefetch sender is dropped)
-    /// and joins on drop — it exists only to satisfy `new()`'s ownership of a
-    /// `DemuxThread`. The caller controls the SEPARATE `demux_rx` we hand to
-    /// `PipelinedPesStream::new`, so we can inject any `DemuxBatch` sequence
-    /// (or a bare disconnect) independent of the dummy worker.
+    // Real, cleanly-exiting DemuxThread whose own receiver is discarded — it
+    // exists only to satisfy new()'s ownership. Tests drive the SEPARATE
+    // demux_rx channel independently to inject any DemuxBatch sequence.
     fn dummy_demux_thread() -> DemuxThread {
         let (_pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(1);
         let (rec_tx, _rec_rx) = bounded::<Vec<u8>>(2);
@@ -516,10 +490,8 @@ mod tests {
         }
     }
 
-    /// CLEAN EOF: the demux worker sends the explicit `Eof` sentinel. The
-    /// consumer must return Ok(None) — a normal end-of-stream — and stay
-    /// Ok(None) on subsequent reads. (DemuxBatch::Eof doc: "explicit
-    /// clean-completion sentinel".)
+    // CLEAN EOF: explicit Eof sentinel → consumer returns Ok(None) and stays
+    // Ok(None) on subsequent reads.
     #[test]
     fn eof_sentinel_yields_clean_none() {
         let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
@@ -529,11 +501,9 @@ mod tests {
         assert!(stream.read().unwrap().is_none());
     }
 
-    /// PANIC / BARE DISCONNECT: the channel closes WITHOUT an Eof (or Err)
-    /// sentinel — exactly what happens when the demux worker panics and drops
-    /// its sender. The consumer MUST surface DemuxThreadPanicked, never a
-    /// clean Ok(None) (which would silently truncate the output). This is the
-    /// truncation guard the module docstring promises.
+    // BARE DISCONNECT (no Eof/Err sentinel) = worker panic. Consumer must
+    // surface DemuxThreadPanicked, never a silent clean Ok(None) — the
+    // truncation guard the module doc promises.
     #[test]
     fn bare_disconnect_is_error_not_silent_eof() {
         let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
@@ -636,12 +606,9 @@ mod tests {
         }
     }
 
-    /// B1 end-to-end: after a TS discontinuity on a VIDEO track the consumer
-    /// must DROP every inter-coded frame until the next keyframe, so no frame
-    /// with a dangling reference reaches the muxer (a strict decode-order
-    /// deep-scan would otherwise report a missing reference). The frame carrying the
-    /// discontinuity and the inter frames behind it are dropped; the stream
-    /// resumes cleanly at the next keyframe.
+    // B1 end-to-end: after a TS discontinuity on a VIDEO track, drop every
+    // inter-coded frame until the next keyframe so no dangling-reference frame
+    // reaches the muxer; the stream resumes cleanly at that keyframe.
     #[test]
     fn b1_video_drops_to_keyframe_after_discontinuity() {
         let title = video_title(false); // one HEVC video stream, PID 0x1011
@@ -721,10 +688,8 @@ mod tests {
         );
     }
 
-    /// At EOF the consumer must call `flush()` on every parser and emit the
-    /// buffered tail frames — a parser that holds the final access unit (e.g.
-    /// DTS-HD) must NOT have it dropped. Without the flush the last frame is
-    /// silently truncated.
+    // At EOF the consumer must call flush() on every parser and emit the
+    // buffered tail — a held final AU (e.g. DTS-HD) must not be dropped.
     #[test]
     fn flush_tail_emitted_at_eof() {
         let title = DiscTitle::empty();
@@ -774,10 +739,9 @@ mod tests {
         );
     }
 
-    /// consume_ps must route by the REAL DVD PID (via PsPacket::dvd_pid).
-    /// An audio private-stream-1 packet (stream_id 0xBD, sub-id 0x80 → PID
-    /// 0xBD80) routes to the track mapped to 0xBD80. A packet with an
-    /// unmappable (stream_id, sub_id) is dropped, never mis-routed.
+    // consume_ps routes by the REAL DVD PID (via PsPacket::dvd_pid), e.g.
+    // stream_id 0xBD sub-id 0x80 → PID 0xBD80. Unmappable (stream_id, sub_id)
+    // is dropped, never mis-routed.
     #[test]
     fn ps_routing_uses_dvd_pid_and_drops_unmappable() {
         let title = DiscTitle::empty();
@@ -819,10 +783,9 @@ mod tests {
         assert!(stream.read().unwrap().is_none(), "unmappable PS dropped");
     }
 
-    /// Build a single-video-stream title on `codec`, a [`CountingParser`] (1 frame
-    /// per PES it is handed), and feed three 0xE0 program-stream fragments that
-    /// together form TWO H.264 access units (AUD-delimited); only AU-start
-    /// fragments carry a PTS. Returns every emitted frame.
+    // Single-video-stream title on `codec` + CountingParser; feeds three 0xE0
+    // PS fragments forming TWO AUD-delimited AUs (only AU-start has a PTS).
+    // Returns every emitted frame.
     fn run_ps_fragments(codec: Codec) -> Vec<crate::pes::PesFrame> {
         let mut title = DiscTitle::empty();
         title.streams.push(crate::disc::Stream::Video(VideoStream {
@@ -871,11 +834,9 @@ mod tests {
         out
     }
 
-    /// PS-path integration: an H.264 access unit split across several fixed-size
-    /// PES fragments (only the first with a PTS) must be REJOINED so the parser
-    /// sees one AU-complete PES with the AU-START pts — not one bogus per-fragment
-    /// frame each with pts 0 (the HD-DVD truncation/corruption bug). The
-    /// `CountingParser` makes it observable: 3 fragments forming 2 AUs → 2 frames.
+    // PS-path integration: fragmented H.264 AU (only first fragment has PTS)
+    // must be REJOINED into one AU-complete PES with the AU-START pts, not
+    // per-fragment frames at pts 0 (the HD-DVD truncation bug).
     #[test]
     fn ps_h264_au_split_across_fragments_reassembles_to_one_frame() {
         let frames = run_ps_fragments(Codec::H264);
@@ -902,10 +863,9 @@ mod tests {
         assert_eq!(frames[1].pts, 18_000);
     }
 
-    /// Contrast: a self-framing codec (MPEG-2 reassembles in its own parser) uses
-    /// a Passthrough assembler — the SAME three fragments pass straight through as
-    /// three frames, byte-identical to the pre-assembler behaviour. This proves the
-    /// reassembly is gated by codec and does not disturb the DVD/MPEG-2 path.
+    // Contrast: self-framing MPEG-2 uses a Passthrough assembler — the same
+    // three fragments pass straight through as three frames, proving
+    // reassembly is gated by codec.
     #[test]
     fn ps_self_framing_codec_is_not_reassembled() {
         let frames = run_ps_fragments(Codec::Mpeg2);
@@ -922,10 +882,8 @@ mod tests {
         assert_eq!(frames[2].pts, 18_000);
     }
 
-    /// A batch with no trackable packets must NOT terminate the stream early:
-    /// pump_one_batch loops to the next batch. Here an empty-but-untracked
-    /// batch is followed by a real frame batch — the consumer must skip the
-    /// first and deliver the second (not return Ok(None) prematurely).
+    // A batch with no trackable packets must not end the stream early —
+    // pump_one_batch loops to the next batch (skip first, deliver second).
     #[test]
     fn empty_batch_does_not_end_stream_early() {
         let title = DiscTitle::empty();
@@ -1116,15 +1074,9 @@ mod tests {
         au
     }
 
-    /// DVD seek-index regression at the HIGHWAY level. The real CLI mux runs
-    /// `PsDemuxer → PipelinedPesStream (codec parse) → frame out`, NOT the
-    /// codec parser straight into the muxer. The keyframe flag and per-frame
-    /// duration the `Mpeg2Parser` sets on each `Frame` must survive that path
-    /// (`from_codec_frame`) so the muxer's cluster/cue logic — which opens a
-    /// cluster + pushes a cue on `keyframe && track 0` — actually fires. If the
-    /// highway dropped the keyframe flag, every video I-frame would arrive as a
-    /// non-keyframe and the DVD MKV would get thousands of clusters with ZERO
-    /// cues (chapter-seek only, no scrub).
+    // DVD seek-index regression at the HIGHWAY level (PsDemuxer →
+    // PipelinedPesStream → frame out). Keyframe flag/duration must survive so
+    // the muxer's cluster/cue logic fires. See docs/pipelined-stream.md.
     #[test]
     fn dvd_highway_preserves_video_keyframe_and_duration() {
         use crate::mux::codec::mpeg2::Mpeg2Parser;

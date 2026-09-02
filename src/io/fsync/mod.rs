@@ -1,27 +1,12 @@
 //! Platform-aware crash-durability primitives.
 //!
-//! Two flush operations need OS-specific handling to make a write survive a
-//! crash / power loss:
-//!
-//! - [`dir`] — fsync a directory so a prior `rename(2)` into it is durable.
-//!   After a crash a renamed file's dirent can otherwise be lost even though
-//!   the rename returned, because it is still page-cache-only. This is a POSIX
-//!   concept: on Windows std cannot even open a directory as a `File` (it does
-//!   not set `FILE_FLAG_BACKUP_SEMANTICS`), and NTFS/ReFS commit the rename's
-//!   dirent without an explicit directory flush — so it is a no-op there
-//!   rather than a failed open that logs on every marker write.
-//!
-//! - [`file_durable`] — fsync a file's contents + metadata. Opens the file
-//!   **read+write**: on Windows `File::sync_all` maps to `FlushFileBuffers`,
-//!   which requires a handle with write access and returns
-//!   `ERROR_ACCESS_DENIED` (os error 5) on a read-only handle. (A read-only
-//!   `File::open` + `sync_all` is legal on POSIX, which is why that bug only
-//!   bit Windows.) The open mode is platform-uniform, so this lives here with
-//!   no dispatch.
+//! [`dir`] fsyncs a directory so a prior `rename(2)` into it is durable
+//! (no-op on Windows); [`file_durable`] fsyncs a file's contents + metadata,
+//! opened read+write so the flush also succeeds on Windows. See
+//! docs/fsync.md for the full per-platform rationale.
 //!
 //! Per the crate convention (see [`crate::io::writeback_file`]), platform
-//! dispatch happens once here via cfg-gated `mod` decls — callers carry no
-//! inline `#[cfg(...)]`.
+//! dispatch happens once here via cfg-gated `mod` decls — no inline `#[cfg]`.
 
 use std::io;
 use std::path::Path;
@@ -61,10 +46,8 @@ pub fn file_durable(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// `file_durable` opens read+write (so the flush works on Windows) and
-    /// syncs an existing file; a missing path surfaces as `Err` so the caller
-    /// treats it as "not durably synced". Platform-uniform — same on
-    /// unix/windows.
+    // Opens read+write (works on Windows) and syncs an existing file;
+    // missing path surfaces as `Err` ("not durably synced").
     #[test]
     fn file_durable_ok_for_existing_err_for_missing() {
         let td = tempfile::tempdir().unwrap();

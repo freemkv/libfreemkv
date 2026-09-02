@@ -3,16 +3,11 @@
 //! [`PictureInfo`] is the single per-frame carrier of coding signals that the
 //! muxer (and any downstream index/diagnostic) reads WITHOUT branching on the
 //! codec. Each codec's parser decodes its own bitstream once and folds the raw
-//! signals into a [`CodingDetail`](crate::mux::codec::coding::CodingDetail) variant; consumers then call ONLY the
+//! signals into a [`CodingDetail`](crate::mux::codec::coding::CodingDetail) variant; consumers call ONLY the
 //! codec-agnostic accessors ([`coding_type`](PictureInfo::coding_type),
 //! [`field_order`](PictureInfo::field_order), [`nb_fields`](PictureInfo::nb_fields),
-//! [`progressive`](PictureInfo::progressive)). The accessor surface is fixed:
-//! adding a codec means adding a `CodingDetail` arm, never changing a consumer.
-//!
-//! Spec references: ITU-T H.273 (CICP code points, shared elsewhere),
-//! ISO/IEC 13818-2 §6.3.10 (MPEG-2 picture coding extension: `top_field_first`,
-//! `repeat_first_field`, `progressive_frame`), RFC 9559 §5.1.4.1.28
-//! (Matroska `FieldOrder` element 0x9D).
+//! [`progressive`](PictureInfo::progressive)); adding a codec adds a `CodingDetail` arm.
+// See docs/coding.md — spec references (H.273, ISO/IEC 13818-2 §6.3.10, RFC 9559 §5.1.4.1.28).
 
 /// Coding/prediction type of a coded picture, mapped to the three families the
 /// muxer cares about (cue/keyframe marking, B-frame ordering). Each codec maps
@@ -78,18 +73,13 @@ pub enum CodingDetail {
     CodingTypeOnly,
 }
 
+// See docs/coding.md — HDR10 unit-scaling rationale and H.265 SEI spec refs (D.2.28, D.2.35).
 /// HDR10 static metadata measured from a video bitstream (HEVC SEI). Carried on
 /// [`PictureInfo`] as the per-stream colour-volume signalling: it only ever
 /// reaches the muxer when BOTH SEI messages were actually present in the stream,
 /// so an SDR / no-SEI track leaves it `None` and the muxer omits the elements
-/// (never fabricated).
-///
-/// All values are stored in their RAW SEI integer units (NOT yet scaled to the
-/// Matroska float domain); the muxer applies the H.265 → Matroska unit
-/// conversion at emit time so the scaling lives in exactly one place.
-///
-/// Spec: Rec. ITU-T H.265 D.2.28 (Mastering Display Colour Volume,
-/// payloadType 137) and D.2.35 (Content Light Level Info, payloadType 144).
+/// (never fabricated). Values are stored in raw SEI integer units, not yet
+/// scaled to the Matroska float domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hdr10Metadata {
     /// `display_primaries_x[c]` / `display_primaries_y[c]` for c = 0,1,2.

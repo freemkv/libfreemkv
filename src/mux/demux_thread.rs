@@ -1,29 +1,13 @@
 //! `DemuxThread` — runs the read+decrypt+demux pipeline on a
 //! dedicated thread, feeding completed `PesPacket` batches to the
-//! caller via a bounded channel.
+//! caller via a bounded channel. Splits `ts_demuxer.feed` off the
+//! consumer thread so feed and codec parse pipeline instead of serialise.
 //!
-//! ## Why a second worker thread
+//! [`DemuxThread::spawn_zero_copy`] returns a handle plus a
+//! `Receiver<DemuxBatch>`; dropping the handle closes the channel and
+//! `Drop::drop` joins the worker.
 //!
-//! With [`crate::sector::PrefetchedSectorSource`] alone, read+decrypt
-//! already runs on a producer thread; the *consumer* (main) thread
-//! still serialises `ts_demuxer.feed` (M2TS parsing) with the codec
-//! parsers. Profiling showed feed at ~37 % and
-//! codec parse at ~44 % of consumer wall time — i.e. feed is heavy
-//! enough that pipelining it with parse pays for itself.
-//!
-//! Splitting them: feed runs in [`DemuxThread`]; the consumer thread
-//! receives `Vec<PesPacket>` batches and runs codec parse + frame
-//! emission only. Total throughput becomes `1/max(feed, parse)`
-//! instead of `1/(feed + parse)`.
-//!
-//! ## Lifecycle
-//!
-//! [`DemuxThread::spawn_zero_copy`] consumes the prefetch channels and
-//! the demuxer state, returning a handle plus a `Receiver<DemuxBatch>`.
-//! Dropping the handle closes the channel which signals the worker to
-//! exit; the join in `Drop::drop` blocks until the worker observes
-//! channel closure and returns (no timeout — a wedged downstream would
-//! block the drop until it releases the channel).
+//! See docs/demux-thread.md for rationale and lifecycle details.
 
 use crate::halt::Halt;
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -64,22 +48,15 @@ pub struct DemuxThread {
 }
 
 impl DemuxThread {
-    /// Spawn the demux thread. Instead of taking a `SectorSource` and
-    /// memcpy-ing through its `read_sectors` API, this constructor
-    /// consumes the prefetch channels directly: filled buffers come
-    /// in via `prefetch_rx`, the demux thread feeds them, then
-    /// returns them to `recycle_tx` for the producer to re-fill.
-    /// Eliminates the 16 MiB memcpy per batch that the SectorSource
-    /// adapter incurred (and, with the producer-side recycling pool,
-    /// also eliminates the per-batch heap alloc / cross-thread free
-    /// that was costing 40 %+ of demux-thread time before).
+    /// Spawn the demux thread. Consumes prefetch channels directly:
+    /// filled buffers arrive via `prefetch_rx`, get fed, then are
+    /// returned to `recycle_tx` for the producer to re-fill.
     ///
-    /// `producer_shell` is an opaque handle whose only purpose is to
-    /// outlive the demux thread and join the upstream producer when
-    /// dropped. Both
-    /// [`crate::sector::PrefetchedSectorSource::into_channels`] and
-    /// [`crate::io::byte_prefetcher::BytePrefetcher::into_channels`]
-    /// hand back a shell that fits — pass either.
+    /// `producer_shell` is an opaque handle that outlives the demux
+    /// thread and joins the upstream producer on drop. Accepts a shell from
+    /// [`crate::sector::PrefetchedSectorSource::into_channels`] or
+    /// [`crate::io::byte_prefetcher::BytePrefetcher::into_channels`].
+    /// See docs/demux-thread.md for the memcpy/alloc-elimination rationale.
     pub fn spawn_zero_copy<S: Send + 'static>(
         prefetch_rx: Receiver<std::io::Result<Vec<u8>>>,
         recycle_tx: Sender<Vec<u8>>,
@@ -252,11 +229,9 @@ mod tests {
     use crossbeam_channel::bounded;
     use std::time::Duration;
 
-    /// Build one 192-byte BD-TS packet on `pid` carrying a complete PES with
-    /// a `00 00 01 E0` start, hdr_len 0, then `payload` as ES. The TS payload
-    /// region after the PES header is padded with a stuffing adaptation field
-    /// so `payload` is the exact ES (no zero padding the unbounded PES would
-    /// absorb). ISO 13818-1 packet layout: sync 0x47 at TS offset 0 (BD off 4).
+    // Build one 192-byte BD-TS packet on `pid` carrying a complete PES
+    // (00 00 01 E0 start, hdr_len 0, `payload` as ES), stuffing-padded so
+    // `payload` is exact (BD-TS: sync 0x47 at TS offset 0, i.e. BD off 4).
     fn bdts_pes_packet(pid: u16, payload: &[u8]) -> Vec<u8> {
         const SYNC: u8 = 0x47;
         use crate::consts::TS_PAYLOAD_BYTES;
@@ -523,16 +498,9 @@ mod tests {
         assert!(matches!(batches[1], DemuxBatch::Eof));
     }
 
-    /// Regression: worker must detect consumer disconnect even when every
-    /// demux batch is empty (no matching PIDs / null packets).
-    ///
-    /// Before the fix, `tx.send()` was never called for empty batches so the
-    /// worker never observed the consumer drop — it would spin through ALL
-    /// remaining extents before exiting, causing DemuxThread::drop's join()
-    /// to block for minutes on a mostly-untracked disc region.
-    ///
-    /// The watchdog: if the worker doesn't exit within 1 s of the consumer
-    /// drop the test fails (rather than hanging forever as the bug would).
+    // Regression: worker must detect consumer disconnect even when every batch
+    // is empty, else it spins through all remaining extents before exiting
+    // (join() blocking for minutes). See docs/demux-thread.md — empty-batch disconnect fix.
     #[test]
     fn worker_exits_promptly_on_consumer_drop_during_empty_batches() {
         // Use an untracked PID so every batch the demuxer produces is empty.
@@ -586,22 +554,9 @@ mod tests {
         );
     }
 
-    /// Regression: on thread-spawn failure the channels must be dropped BEFORE
-    /// the producer shell so the upstream producer observes disconnection and
-    /// exits, allowing join() to complete without hanging.
-    ///
-    /// A true EAGAIN/pids-limit spawn failure cannot be reliably forced in a
-    /// unit test without root or ulimit co-operation, so we test the
-    /// drop-order contract directly: a mock shell that panics if join() is
-    /// called while either channel end is still open.
-    ///
-    /// The test constructs a `(prefetch_tx, prefetch_rx)` pair where the tx
-    /// side is held by a sentinel that stays alive as long as either channel
-    /// end is open, then asserts that the sentinel is gone by the time
-    /// producer_shell's join logic would run. Because we can't force a real
-    /// spawn failure, we instead verify the helper logic in isolation: drop
-    /// `prefetch_rx` and `recycle_tx` first, then observe the producer-side
-    /// sender is disconnected, which is the property the fix relies on.
+    // Regression: on spawn failure, channels must drop before producer_shell so
+    // the producer observes disconnection and join() doesn't hang. See
+    // docs/demux-thread.md — spawn-failure drop-order test rationale.
     #[test]
     fn channels_disconnected_before_producer_join_on_spawn_failure() {
         // The producer "thread" is simulated by holding prefetch_tx; verify it

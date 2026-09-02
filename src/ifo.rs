@@ -130,33 +130,12 @@ impl CellCategory {
 impl DvdTitle {
     /// Index of the first cell to include in the muxed feature.
     ///
-    /// Bug-4 (scene-selection / logo at the head of the feature): the main
-    /// feature's PGC can open with leading cells that are NOT part of the
-    /// movie — a scene-index segment or an interleaved-angle sub-block. Those
-    /// are recognisable by their cell-category byte: a leading cell flagged as
-    /// a *secondary* piece of an angle/interleave block
-    /// ([`CellCategory::is_secondary_block_piece`]) is not feature content.
-    ///
-    /// This walks the leading run and returns the index of the first cell that
-    /// is a plain feature cell (category `0x00`-class). Cells before it that
-    /// are secondary block pieces are dropped from the feature extents.
-    ///
-    /// **Conservative by construction — it can NEVER truncate a normal
-    /// feature:**
-    /// - It only ever skips a *prefix*; the scan stops at the first
-    ///   plain-feature cell and keeps everything from there on.
-    /// - A normal single-angle feature has category `0x00` on cell 0, so the
-    ///   scan stops immediately at index 0 and drops nothing.
-    /// - It never drops on duration or any heuristic — only on the spec
-    ///   category bits — and it never drops the FIRST cell of an angle block
-    ///   (the angle we keep).
-    /// - As a final guard it never returns past the last cell, and never drops
-    ///   when that would leave zero cells.
-    ///
-    /// For a real disc where every feature cell category is `0x00` and
-    /// chapter 1 sits at 00:00:00, this returns 0 — a no-op — which is the correct
-    /// result: the disc's scene-index lives in a separate menu/title PGC, not
-    /// in leading cells of the feature PGC, so there is nothing to drop here.
+    /// Some PGCs open with leading cells that are not part of the movie,
+    /// identified by a cell-category flagged as a *secondary* piece of an
+    /// angle/interleave block ([`CellCategory::is_secondary_block_piece`]).
+    /// Returns the index of the first plain-feature cell; cells before it are
+    /// dropped from the feature extents. Conservative: only ever skips a
+    /// prefix, never past the last cell or to zero cells. See docs/ifo.md.
     pub fn feature_start_cell(&self) -> usize {
         let n = self.cells.len();
         if n == 0 {
@@ -321,22 +300,11 @@ impl DvdRate {
     }
 }
 
-/// Total non-drop-frame timecode frames in a 4-byte DVD BCD time.
+/// Total non-drop-frame timecode frames in a 4-byte DVD BCD time
+/// (`[hours_bcd, minutes_bcd, seconds_bcd, rate_and_frames]`; byte 3 packs
+/// the frame-rate flag in bits 7-6 and the frame count in bits 5-0).
 ///
-/// Format: `[hours_bcd, minutes_bcd, seconds_bcd, rate_and_frames]`
-///   - Byte 0: hours in BCD (e.g. 0x01 = 1 hour, 0x12 = 12 hours)
-///   - Byte 1: minutes in BCD
-///   - Byte 2: seconds in BCD
-///   - Byte 3: bits 7-6 = frame rate flag (01=25fps, 11=29.97fps),
-///     bits 5-0 = frame count in BCD
-///
-/// **`dvd_time_t` is a timecode, not elapsed wall-clock time.** The seconds
-/// field advances once every [`DvdRate::nominal_fps`] frames. On NTSC discs
-/// that is every 30 frames, but 30 frames of 30000/1001 fps video last
-/// 1001/1000 s — so reading H:M:S as literal seconds under-reports real time
-/// by exactly 0.1% (3.6 s per hour). Callers that need real seconds must go
-/// through the frame count, which is what [`bcd_to_secs`] does.
-///
+/// `dvd_time_t` is a timecode, not elapsed wall-clock time — see docs/ifo.md.
 /// Returns `None` when the slice is short or the rate flag is unspecified,
 /// since without a nominal rate the frame count cannot be interpreted.
 pub fn bcd_to_frames(bcd: &[u8]) -> Option<(u64, DvdRate)> {
@@ -396,13 +364,9 @@ pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> 
     parse_vmg_with(reader, udf, None)
 }
 
-/// Parse VIDEO_TS.IFO and all VTS_XX_0.IFO files to build a complete DvdInfo.
-///
-/// Reads the VMG (Video Manager) to discover title sets, then reads each VTS
-/// IFO to extract PGC chains, cell addresses, and stream attributes. When
-/// `vmg_bytes` is `Some`, reuses those already-read VIDEO_TS.IFO bytes instead
-/// of reading the file again; `None` reads it. Only the source of the VMG bytes
-/// changes — the parse is byte-for-byte identical.
+// Parses VIDEO_TS.IFO + all VTS_XX_0.IFO into a DvdInfo. `vmg_bytes`, if
+// `Some`, reuses already-read VIDEO_TS.IFO bytes instead of re-reading the
+// file; the parse is byte-for-byte identical either way.
 pub(crate) fn parse_vmg_with(
     reader: &mut dyn SectorSource,
     udf: &UdfFs,
@@ -484,25 +448,14 @@ pub(crate) fn parse_vmg_with(
     Ok(DvdInfo { title_sets })
 }
 
-/// Maximum TT_SRPT entries honoured. DVD-Video caps a disc at 99 titles
-/// (VMGI TT_SRPT `TT_Ns`, and the 99-title / 99-title-set structure the format
-/// is built around), but the on-disc count is an untrusted `u16`: a ~800 KB
-/// crafted IFO can declare 65535 entries, each re-parsing a PGC into a full
-/// `DvdTitle` (~540 MB of `DvdInfo`).
-///
-/// Headroom: this IS the format maximum, so it clips no conformant disc — a
-/// real DVD cannot address a 100th title through TT_SRPT.
+// Maximum TT_SRPT entries honoured (DVD-Video's own 99-title cap). The
+// on-disc count is an untrusted u16; without this, a crafted IFO could
+// declare 65535 entries and blow up memory re-parsing PGCs. See docs/ifo.md.
 pub(crate) const MAX_TT_SRPT_TITLES: usize = 99;
 
-/// Parse the VMG TT_SRPT into a per-title-set map of
-/// `(chapter_count, vts_title_number)`.
-///
-/// Two bounds on untrusted input: the declared entry count is clamped to
-/// [`MAX_TT_SRPT_TITLES`], and entries naming a `(vts_number, vts_title_num)`
-/// pair already seen are dropped. De-duplication is a correctness fix as well
-/// as a bound: two TT_SRPT entries pointing at the same VTS title are the same
-/// title, and `parse_pgcit` would otherwise re-parse that one PGC into a
-/// separate `DvdTitle` per entry.
+// Parses the VMG TT_SRPT into a per-title-set map of (chapter_count,
+// vts_title_number). Clamps the declared entry count to MAX_TT_SRPT_TITLES
+// and drops duplicate (vts_number, vts_title_num) pairs. See docs/ifo.md.
 fn parse_tt_srpt(
     vmg_data: &[u8],
     tt_srpt_offset: usize,
@@ -642,9 +595,8 @@ fn parse_vts(
 
 // ── Attribute parsers ───────────────────────────────────────────────────────
 
-// VTS_V_ATR byte 0 (MSB first): bits 7-6 mpeg_version | bits 5-4 video_format |
-// bits 3-2 display_aspect | bits 1-0 permitted_df. video_format is bits 5-4, NOT
-// bits 1-0 (pan&scan/letterbox permission) — the earlier bug misread PAL as NTSC.
+// VTS_V_ATR byte 0: bits 7-6 mpeg_version | 5-4 video_format | 3-2
+// display_aspect | 1-0 permitted_df (the earlier bug misread bits 1-0).
 const V_ATR_VIDEO_FORMAT_SHIFT: u8 = 4;
 const V_ATR_ASPECT_SHIFT: u8 = 2;
 const V_ATR_FIELD_MASK: u8 = 0x03;
@@ -655,10 +607,8 @@ pub(crate) const VIDEO_FORMAT_PAL: u8 = 1;
 pub(crate) const ASPECT_4X3: u8 = 0;
 pub(crate) const ASPECT_16X9: u8 = 3;
 
-/// Compose a VTS_V_ATR byte 0 from its `video_format` / `display_aspect`
-/// fields, mirroring the layout [`parse_video_attr`] reads. Test-only — keeps
-/// fixtures self-documenting (`v_atr_byte(VIDEO_FORMAT_PAL, ASPECT_16X9)`)
-/// instead of opaque packed hex.
+// Composes a VTS_V_ATR byte 0 from its video_format/display_aspect fields,
+// mirroring parse_video_attr's layout. Test-only, for self-documenting fixtures.
 #[cfg(test)]
 pub(crate) fn v_atr_byte(video_format: u8, display_aspect: u8) -> u8 {
     (video_format << V_ATR_VIDEO_FORMAT_SHIFT) | (display_aspect << V_ATR_ASPECT_SHIFT)
@@ -695,16 +645,9 @@ fn parse_video_attr(data: &[u8]) -> Result<DvdVideoAttr> {
     })
 }
 
-/// Parse one audio stream attribute block (8 bytes at `offset`).
-/// `pub(crate)` for the CROSS-MODULE tests only. The sole production caller is
-/// `parse_vts_attributes` in this file; `src/mux/mkv.rs`'s `#[cfg(test)]` block
-/// calls it directly so its language-mapping tests run the real parser over real
-/// on-disc IFO bytes end to end, instead of a hand-built `DvdAudioAttr` that
-/// could agree with the muxer while both disagree with the disc. Narrowing this
-/// would mean either a `#[cfg(test)]`/`#[cfg(not(test))]` pair of signatures
-/// that can drift apart, or moving those tests away from the code they exist to
-/// pin — both worse than the widened crate-internal visibility, which reaches no
-/// public API.
+// Parses one audio stream attribute block (8 bytes at `offset`). pub(crate)
+// so src/mux/mkv.rs's cross-module tests can call the real parser directly.
+// See docs/ifo.md for why that's preferable to narrowing visibility.
 pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
     let b0 = byte_at(data, offset)?;
     let b1 = byte_at(data, offset + 1)?;
@@ -745,28 +688,9 @@ pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAtt
     })
 }
 
-/// Assign the on-wire `private_stream_1` sub-stream id to each audio
-/// stream. On DVD-Video the sub-id's **low nibble is the audio-stream
-/// *number* (0-7), shared across all codecs** — the single stream index the
-/// PGC `audio_control` table / navigation registers select — and the high
-/// nibble is the codec base. So the sub-id is `codec_base | position`, where
-/// `position` is the stream's index in the IFO audio-attribute table (NOT a
-/// per-codec running count):
-///   - AC-3  → `0x80 | i`
-///   - DTS   → `0x88 | i`
-///   - LPCM  → `0xA0 | i`
-///   - MP1/MP2 and anything else → `None` (regular MPEG-audio PES, not a
-///     private-stream-1 sub-id).
-///
-/// A per-codec ordinal was wrong: it only coincides with the wire id when a
-/// codec's first stream is also the disc's audio stream #0. Any codec that is
-/// not the first audio stream (e.g. a DTS track after an AC-3 track) then got
-/// a sub-id one-too-low, so the demux routing key (`0xBD00 | sub_id`) never
-/// matched and the track muxed silent. The positional index is the real wire
-/// number, so distinct positions still give distinct sub-ids (no collision).
-///
-/// Position saturates at 7 so a malformed over-count never produces an
-/// out-of-range sub-id.
+// Assigns the on-wire private_stream_1 sub-stream id (codec_base | position,
+// saturated at 7) to each audio stream: AC-3 0x80|i, DTS 0x88|i, LPCM 0xA0|i,
+// else None. See docs/ifo.md for why position beats a per-codec ordinal.
 fn assign_audio_sub_stream_ids(streams: &mut [DvdAudioAttr]) {
     for (i, s) in streams.iter_mut().enumerate() {
         let n = (i as u8).min(7);
@@ -788,18 +712,9 @@ fn parse_subtitle_attr(data: &[u8], offset: usize) -> Result<DvdSubtitleAttr> {
     Ok(DvdSubtitleAttr { language })
 }
 
-/// Decode the raw 2-byte on-disc language code shared by the audio and
-/// subtitle attribute blocks. A pair of lowercase a-z bytes is taken
-/// verbatim (the ISO 639-1 code the DVD-Video spec puts there); an all-zero
-/// pair means unspecified (empty string); anything else falls through to an
-/// ASCII-alphanumeric salvage — letters (either case) and digits are kept,
-/// everything else (control bytes, punctuation, high bytes from a corrupt or
-/// hostile disc) is dropped.
-///
-/// The salvage is deliberately not narrowed to a-z: whatever survives is only
-/// ever a lookup key for [`dvd_lang_to_iso639_2`], which degrades anything it
-/// does not recognize to `und`, so a stray `X` or `5` costs nothing and cannot
-/// reach an output stream as a language code.
+// Decodes the raw 2-byte on-disc language code: lowercase a-z taken verbatim,
+// all-zero means unspecified (empty), else an ASCII-alphanumeric salvage. See
+// docs/ifo.md for why the salvage isn't narrowed to a-z.
 fn parse_raw_dvd_lang_bytes(lang_bytes: &[u8]) -> String {
     if lang_bytes[0] >= b'a'
         && lang_bytes[0] <= b'z'
@@ -818,28 +733,9 @@ fn parse_raw_dvd_lang_bytes(lang_bytes: &[u8]) -> String {
     }
 }
 
-/// Convert a DVD IFO audio/subtitle attribute's language code — ISO 639-1
-/// (2 lowercase letters) per the DVD-Video spec, or empty when unspecified —
-/// to the ISO 639-2 form every downstream consumer (`disc::AudioStream` /
-/// `disc::SubtitleStream::language`, and in turn Matroska's `Language`
-/// element per RFC 9559 §12 and the MP4 sink's `mdhd` language) requires.
-///
-/// Uses `labels::vocab::iso639_1_to_iso639_2`, which spans the WHOLE of ISO
-/// 639-1 (plus the withdrawn spellings `iw`/`in`/`ji` that DVD-Video's
-/// frozen-1988 language list still puts on disc). The narrower
-/// `vocab::menu_lang` table is deliberately NOT used here: it exists for
-/// Blu-ray menu-graphic filename tokens and knows only 25 languages, so a
-/// Region-2 disc's Romanian, Bulgarian, Croatian, Serbian, Slovak, Slovenian,
-/// Hebrew, Estonian, Latvian, Lithuanian and Icelandic tracks would all fold
-/// onto `und` together. DVD streams carry an empty `label`, so the language
-/// is the only thing distinguishing one subtitle track from the next — a
-/// valid code that is identical for six tracks is worse for the user than the
-/// invalid one it replaced. Both tables normalize to ISO 639-2/T, so they
-/// agree wherever they overlap.
-///
-/// An empty or unrecognized code degrades to `"und"` (ISO 639-2 / Matroska's
-/// own "undetermined" value) — a valid element value — rather than passing
-/// through an invalid 2-letter code or an empty string. Never guesses.
+// Converts a DVD IFO audio/subtitle language code (ISO 639-1, or empty) to
+// ISO 639-2 for Matroska/MP4 language fields; unrecognized/empty -> "und".
+// See docs/ifo.md for why the wider iso639_1_to_iso639_2 table is used.
 fn dvd_lang_to_iso639_2(raw: &str) -> String {
     crate::labels::vocab::iso639_1_to_iso639_2(raw)
         .unwrap_or("und")
@@ -1390,11 +1286,9 @@ mod tests {
         assert_eq!(attr.resolution, Resolution::R576i);
     }
 
-    /// Real-world regression: a PAL 16:9 anamorphic disc (the Silence of the
-    /// Lambs UK SKU). Must parse as PAL / 16:9 / 576i. The old code read the TV
-    /// system from bits 1-0 (permitted_df, here 0) and reported NTSC/480i — the
-    /// case that shipped broken because only NTSC discs (where the wrong bits
-    /// coincide on 0) were ever tested.
+    // Regression: PAL 16:9 anamorphic disc (Silence of the Lambs UK SKU). Old
+    // code read TV system from bits 1-0 (permitted_df) and reported NTSC/480i
+    // — only NTSC discs, where the wrong bits coincide on 0, were tested.
     #[test]
     fn video_attr_pal_16x9_anamorphic() {
         let mut data = vec![0u8; 0x204];
@@ -1405,14 +1299,9 @@ mod tests {
         assert_eq!(attr.resolution, Resolution::R576i);
     }
 
-    /// ABSOLUTE-BYTE pin (audit §3 #2): the existing video-attr tests build the
-    /// byte via `v_atr_byte(...)`, which uses the SAME shift constants the parser
-    /// reads with — a co-edit of constant + helper would silently re-introduce
-    /// the PAL-as-NTSC bug and every test would still pass. This test feeds
-    /// `parse_video_attr` HARDCODED bytes captured from real DVD-Video layouts
-    /// (DVD-Video video attributes: mpeg_version[7-6] video_format[5-4]
-    /// display_aspect[3-2] permitted_df[1-0]) — no `v_atr_byte`. If the parser's
-    /// bit positions drift, these fail.
+    // ABSOLUTE-BYTE pin: other tests build the byte via v_atr_byte(...), which
+    // shares the parser's shift constants, so a co-edit could hide a bug. This
+    // feeds parse_video_attr HARDCODED real-layout bytes instead. See docs/ifo.md.
     #[test]
     fn video_attr_absolute_bytes_pin_real_layout() {
         // (byte @0x200, expected standard, expected aspect, expected resolution):
@@ -1513,13 +1402,9 @@ mod tests {
         assert_eq!(ids.len(), sorted.len(), "sub-stream ids must be unique");
     }
 
-    /// Regression (The Punisher 2004): audio[0]=AC-3 5.1, audio[1]=DTS 5.0.
-    /// The DTS track sits at audio position 1, so its wire sub-id is 0x89
-    /// (0x88 | 1), NOT the per-codec 0x88. With the old per-codec ordinal it
-    /// got 0x88 → demux routing key 0xBD88 had no match → every DTS packet
-    /// (which carries 0x89) was dropped → the track muxed present-but-silent
-    /// while the AC-3 (at position 0, where ordinal and position coincide)
-    /// played fine. Positional numbering fixes it end-to-end.
+    // Regression (The Punisher 2004): audio[0]=AC-3, audio[1]=DTS. DTS at
+    // position 1 must get wire sub-id 0x89 (0x88|1), not the old per-codec
+    // 0x88 (which broke demux routing and muxed it silent). See docs/ifo.md.
     #[test]
     fn dts_after_ac3_uses_positional_substream_id() {
         let mut streams = vec![
@@ -1702,10 +1587,8 @@ mod tests {
         assert_eq!(attr2.codec, Codec::Unknown(1));
     }
 
-    /// Audio language bytes [offset+2..+4]: when both bytes are 0x00 the
-    /// on-disc code is unspecified, and `dvd_lang_to_iso639_2` maps that to
-    /// the valid ISO 639-2 "und" (undetermined) rather than an empty string,
-    /// which is not a legal Matroska `Language` element value.
+    // Audio language bytes [offset+2..+4] both 0x00: unspecified, maps to
+    // valid ISO 639-2 "und", not an empty string (illegal Matroska element).
     #[test]
     fn audio_attr_zero_language_becomes_und() {
         let mut data = vec![0u8; 8];
@@ -1861,11 +1744,9 @@ mod tests {
         );
     }
 
-    /// parse_pgc chapter_times: the program map (at PGC+0xE6) holds, per
-    /// program, the 1-based first cell number. chapter_time[p] = sum of
-    /// cell durations BEFORE that program's first cell. Verify a 2-program,
-    /// 3-cell layout: program 0 starts at cell 1 (time 0), program 1 starts
-    /// at cell 3 (time = dur(cell0)+dur(cell1)).
+    // chapter_time[p] = sum of cell durations before program p's first cell
+    // (program map at PGC+0xE6, 1-based cell numbers). 2-program, 3-cell case:
+    // program 0 at cell 1 (t=0), program 1 at cell 3 (t=dur(cell0)+dur(cell1)).
     #[test]
     fn pgc_chapter_times_from_program_map() {
         let mut pgc = vec![0u8; 0xEA];
@@ -1903,12 +1784,9 @@ mod tests {
         );
     }
 
-    /// Regression test for issue freemkv#25 (NTSC chapter drift).
-    ///
-    /// Builds a PGC from the real cell table of the disc in the
-    /// bug report and checks the chapter marks against the reference tool's values. Before
-    /// the fix, chapter 14 landed 4.019 s early; the drift was proportional to
-    /// elapsed time (0.1%), so a short synthetic fixture would not have caught it.
+    // Regression for freemkv#25 (NTSC chapter drift): real cell table vs
+    // reference chapter marks. Drift (0.1%, proportional to elapsed time) is
+    // why a short synthetic fixture wouldn't catch it. See docs/ifo.md.
     #[test]
     fn pgc_chapter_times_ntsc_no_pulldown_drift() {
         // (minutes, seconds, frames) of NTSC non-drop-frame timecode per cell.
@@ -2125,10 +2003,8 @@ mod tests {
         assert_eq!(fc[0].first_sector, 20);
     }
 
-    /// Conservative guard: if EVERY cell looks like a secondary block piece
-    /// (corrupt/pathological category bytes), the filter refuses to drop them
-    /// all — it returns 0 and keeps every cell rather than emit an empty
-    /// feature.
+    // Conservative guard: if EVERY cell looks like a secondary block piece,
+    // the filter refuses to drop them all — returns 0, keeps every cell.
     #[test]
     fn feature_filter_never_empties_title() {
         let t = DvdTitle {
@@ -2185,15 +2061,9 @@ mod tests {
         assert_eq!(title.feature_start_cell(), 1);
     }
 
-    /// Regression: a crafted IFO whose program-map byte names a first_cell
-    /// index larger than the actual cell count must NOT panic. Before the fix,
-    /// `cell_durations[..first_cell.saturating_sub(1)]` would panic with an
-    /// out-of-bounds slice index when first_cell > cell_durations.len().
-    ///
-    /// Layout: 1 real cell, but the program map byte is 0xFF (255) — an
-    /// attacker-controlled value that exceeds the cell_durations Vec length.
-    /// Expected: parse_pgc returns Ok (the clamped sum is simply the full
-    /// cell duration) without panicking.
+    // Regression: a crafted IFO whose program-map byte names a first_cell
+    // index larger than the actual cell count must NOT panic (it used to,
+    // slicing cell_durations out of bounds). See docs/ifo.md.
     #[test]
     fn pgc_program_map_oob_cell_index_no_panic() {
         let mut pgc = vec![0u8; 0xEA];
@@ -2230,13 +2100,9 @@ mod tests {
         );
     }
 
-    // Added: cell-category bit isolation, palette/program-map arithmetic,
-    // and the malformed-language salvage paths.
-
-    /// Each low flag of the cell-category byte comes from its OWN bit and no
-    /// other: bit3 seamless_play, bit2 interleaved, bit1 stc_discontinuity,
-    /// bit0 seamless_angle (DVD-Video cell playback `cell_category`).
-    /// Setting one bit must leave all three siblings clear.
+    // Cell-category bit isolation: each low flag (bit3 seamless_play, bit2
+    // interleaved, bit1 stc_discontinuity, bit0 seamless_angle) comes from its
+    // OWN bit — setting one must leave the other three clear.
     #[test]
     fn cell_category_low_flags_are_bit_isolated() {
         let c = CellCategory::decode(0x00);
@@ -2288,14 +2154,8 @@ mod tests {
 
     // ── malformed language codes ─────────────────────────────────────────
 
-    /// The ISO 639 language code in the audio/subtitle attribute block is
-    /// two bytes at +2. Only a pair of lowercase a-z bytes is taken verbatim;
-    /// anything else falls through to the ASCII-alphanumeric salvage, which
-    /// keeps only the usable characters. A byte outside a-z must never end up
-    /// in the raw salvaged string. This exercises `parse_raw_dvd_lang_bytes`
-    /// directly — the byte-level salvage step — separately from the ISO
-    /// 639-1 -> 639-2 mapping `parse_audio_attr`/`parse_subtitle_attr` apply
-    /// on top (see `dvd_two_letter_and_malformed_language_becomes_iso639_2`).
+    // Only lowercase a-z is taken verbatim, else ASCII-alphanumeric salvage.
+    // Exercises parse_raw_dvd_lang_bytes, separately from ISO 639-1->2 mapping.
     #[test]
     fn language_code_rejects_non_lowercase_bytes() {
         // (byte0, byte1, expected raw salvage)
@@ -2318,13 +2178,9 @@ mod tests {
         }
     }
 
-    /// The full pipeline `parse_audio_attr`/`parse_subtitle_attr` apply on
-    /// top of the raw salvage: a valid ISO 639-1 code maps to its ISO 639-2
-    /// equivalent, and anything the raw salvage does NOT produce a mapped
-    /// code for (empty, or a single leftover letter from a malformed byte
-    /// pair) degrades to "und" — never an invalid 2-letter/1-letter code and
-    /// never an empty string, both of which are illegal Matroska `Language`
-    /// element values (RFC 9559 §12).
+    // Full pipeline: parse_audio_attr/parse_subtitle_attr on top of the raw
+    // salvage. Valid ISO 639-1 maps to 639-2; anything unmapped (empty or a
+    // malformed leftover letter) degrades to "und", never an illegal value.
     #[test]
     fn dvd_two_letter_and_malformed_language_becomes_iso639_2() {
         // (byte0, byte1, expected final language)
@@ -2357,11 +2213,8 @@ mod tests {
 
     // ── PGC fixtures ─────────────────────────────────────────────────────
 
-    /// Build a standalone PGC starting at offset 0.
-    ///
-    /// Layout: 0xEA-byte header, then the program map (one byte per program,
-    /// the 1-based first cell number), then the 24-byte cell playback table.
-    /// `cells` are `(category, BCD time, first_sector, last_sector)`.
+    // Builds a standalone PGC at offset 0: header, program map (1-based first
+    // cell number per program), 24-byte cell table. See docs/ifo.md for the layout.
     fn build_pgc(
         pgc_time: [u8; 4],
         cells: &[(u8, [u8; 4], u32, u32)],
@@ -2397,14 +2250,9 @@ mod tests {
         d
     }
 
-    /// BCD playback time of `secs` TIMECODE seconds (< 60) at the NTSC rate
-    /// flag.
-    ///
-    /// The argument is timecode, not real time: every fixture built from this
-    /// helper carries the 0b11 flag, so `secs` timecode seconds are
-    /// `secs * 30` frames and last `secs * 1.001` real seconds. Expectations
-    /// below are written in real seconds and so read 1.001x the argument —
-    /// `bcd_secs(10)` is 10.01 s, not 10 s.
+    // BCD playback time of `secs` TIMECODE seconds (<60) at the NTSC rate.
+    // Timecode, not real time: `secs` seconds = `secs*30` frames, lasting
+    // `secs*1.001` real seconds, so e.g. bcd_secs(10) is 10.01s not 10s.
     fn bcd_secs(secs: u8) -> [u8; 4] {
         assert!(secs < 60);
         [0, 0, ((secs / 10) << 4) | (secs % 10), 0b11_000000]
@@ -2437,10 +2285,9 @@ mod tests {
         );
     }
 
-    /// Chapter times come from the program map: each program's byte is the
-    /// 1-based number of its first cell, and the chapter time is the sum of
-    /// the durations of every cell BEFORE it. Distinct cell durations mean a
-    /// misread program byte or a mis-strided cell table changes the result.
+    // Chapter times: program's byte is the 1-based first-cell number; chapter
+    // time is the sum of durations of every cell BEFORE it. Distinct cell
+    // durations mean a misread program byte or mis-strided table shows up.
     #[test]
     fn pgc_chapter_times_sum_preceding_cell_durations() {
         let pgc = build_pgc(
@@ -2512,10 +2359,9 @@ mod tests {
         assert_eq!(title.chapter_times, vec![0.0, 10.01]);
     }
 
-    /// A program map that runs past the end of the data must stop at the
-    /// buffer end rather than reading past it. The fixture's map begins at
-    /// PGC+0xEA and the buffer holds 50 bytes from there, so a declared
-    /// count of 255 programs must yield exactly 50 chapter times.
+    // A program map running past the end of the data must stop at the buffer
+    // end. Fixture map begins at PGC+0xEA, buffer holds 50 bytes from there,
+    // so a declared 255 programs must yield exactly 50 chapter times.
     #[test]
     fn pgc_program_map_past_end_stops() {
         let mut pgc = build_pgc(
@@ -2591,10 +2437,8 @@ mod tests {
 
     // ── PGCIT ────────────────────────────────────────────────────────────
 
-    /// Build a VTS_PGCIT at offset 0: VTS_PGC_Ns(2) + reserved(2) +
-    /// VTS_PGCIT_EA(4), then one 8-byte VTS_PGCI_SRP per PGC
-    /// (VTS_PGC_CAT(4) + VTS_PGCI_SA(4), the PGC's byte offset from the
-    /// VTS_PGCIT start). `pgcs` are appended after the SRP table.
+    // Builds a VTS_PGCIT at offset 0: header, one 8-byte VTS_PGCI_SRP per PGC,
+    // then `pgcs` appended after the SRP table. See docs/ifo.md for the layout.
     fn build_pgcit(pgcs: &[Vec<u8>]) -> Vec<u8> {
         let mut d = vec![0u8; 8 + pgcs.len() * 8];
         d[0..2].copy_from_slice(&(pgcs.len() as u16).to_be_bytes());
@@ -2610,10 +2454,9 @@ mod tests {
         d
     }
 
-    /// Each VTS_PGCI_SRP is 8 bytes and the PGC start address is the second
-    /// word of its own entry, so title N must resolve to PGC N. Two PGCs
-    /// with distinct durations catch an entry read at the wrong stride or
-    /// from the wrong entry.
+    // Each VTS_PGCI_SRP is 8 bytes; PGC start address is the entry's own
+    // second word, so title N must resolve to PGC N. Distinct durations
+    // catch an entry read at the wrong stride or from the wrong entry.
     #[test]
     fn pgcit_entry_stride_selects_the_right_pgc() {
         let pgc0 = build_pgc(bcd_secs(11), &[(0x00, bcd_secs(11), 0, 9)], &[], None);
@@ -2668,11 +2511,9 @@ mod tests {
         assert!(titles.is_empty());
     }
 
-    /// A TT_SRP entry is 12 bytes: playback_type(1) + angles(1) +
-    /// number_of_PTTs(2) + parental_mask(2) + VTSN(1) + VTS_TTN(1) +
-    /// VTS_start_sector(4). The chapter count is the 16-bit field at +2, and
-    /// each entry's own value must be carried through. Distinct counts per
-    /// entry catch a read from a neighbouring offset.
+    // TT_SRP entry is 12 bytes; chapter count is the 16-bit field at +2, and
+    // each entry's own value must carry through. Distinct counts per entry
+    // catch a read from a neighbouring offset.
     #[test]
     fn tt_srpt_chapter_count_read_from_entry_offset_2() {
         let data = tt_srpt_bytes(3, &[(7, 1, 1), (13, 1, 2), (0x0102, 2, 1)]);
@@ -2716,10 +2557,9 @@ mod tests {
         assert_eq!(map[&2], vec![(20, 1)], "VTS 2 keeps its one");
     }
 
-    /// The pointer at 0xC4 is a SECTOR offset from the start of VIDEO_TS.IFO,
-    /// not a byte offset. Reading it as bytes would find the table at 1/2048th
-    /// of its real position — which is a zero-filled region on most discs, so
-    /// it would report a disc with no titles rather than fail loudly.
+    // Pointer at 0xC4 is a SECTOR offset from VIDEO_TS.IFO start, not a byte
+    // offset. Reading as bytes lands 1/2048th of the way in — a zero-filled
+    // region on most discs — reporting no titles rather than failing loudly.
     #[test]
     fn tt_srpt_pointer_is_a_sector_offset_not_a_byte_offset() {
         for sector in [1u32, 2, 5] {

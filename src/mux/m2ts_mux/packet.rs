@@ -15,10 +15,9 @@ const MAX_AF_LEN: usize = TS_PACKET_BYTES - 4 - 1;
 const SYNC_BYTE: u8 = 0x47;
 const STUFF_BYTE: u8 = 0xFF;
 
-/// One TS packet under construction. Backed by a fixed 188-byte array
-/// with a write cursor — no per-packet heap allocation. Always emits 188
-/// bytes when [`pad_to_188`](Self::pad_to_188) is called; if it's not
-/// called the caller is responsible for filling the packet exactly.
+// One TS packet under construction, backed by a fixed 188-byte array with
+// a write cursor (no per-packet heap allocation). pad_to_188() fills to
+// 188 bytes; otherwise the caller must fill it exactly.
 pub(super) struct Packet {
     buf: [u8; TS_PACKET_BYTES],
     len: usize,
@@ -48,13 +47,9 @@ impl Packet {
         self.len += n;
     }
 
-    /// Write the 4-byte TS packet header.
-    ///
-    /// * `pid` — 13-bit PID
-    /// * `payload_unit_start` — first packet of a PES / PSI section
-    /// * `has_payload` — packet carries any payload bytes
-    /// * `has_adaptation` — packet carries an adaptation field
-    /// * `cc` — 4-bit continuity counter
+    // Write the 4-byte TS packet header (pid, payload_unit_start,
+    // has_payload, has_adaptation, cc — see docs/m2ts-mux.md for the
+    // per-field bit layout).
     pub(super) fn set_header(
         &mut self,
         pid: u16,
@@ -79,19 +74,9 @@ impl Packet {
         self.push((afc << 4) | (cc & 0x0F));
     }
 
-    /// Append the adaptation field after the header.
-    ///
-    /// `body` is the adaptation field body (flags byte plus optional PCR
-    /// and so on). `stuffing` is the number of `0xFF` stuffing bytes to
-    /// append after the body. The first byte of the field
-    /// (`adaptation_field_length`) is computed here from
-    /// `body.len() + stuffing`.
-    ///
-    /// Returns [`Error::M2tsPacketMalformed`] if the computed
-    /// `adaptation_field_length` would exceed `MAX_AF_LEN` — the length
-    /// byte and the bytes actually written must always agree, so an
-    /// over-long field is rejected rather than written with a clamped
-    /// (and therefore lying) length byte.
+    // Append the adaptation field after the header: `body` is the field body
+    // (flags + optional PCR etc.), `stuffing` is the trailing 0xFF count.
+    // See docs/m2ts-mux.md for the length-byte and error contract.
     pub(super) fn append_adaptation(&mut self, body: &[u8], stuffing: usize) -> io::Result<()> {
         let af_len = body.len() + stuffing;
         if af_len > MAX_AF_LEN {
@@ -105,11 +90,9 @@ impl Packet {
         Ok(())
     }
 
-    /// Append payload bytes.
-    ///
-    /// Returns [`Error::M2tsPacketMalformed`] if doing so would push the
-    /// packet past 188 bytes — overflow is a muxer invariant break, not
-    /// something to silently emit.
+    // Append payload bytes. Errors with M2tsPacketMalformed rather than
+    // silently truncating if this would push the packet past 188 bytes —
+    // overflow is a muxer invariant break.
     pub(super) fn append_payload(&mut self, payload: &[u8]) -> io::Result<()> {
         if self.len + payload.len() > TS_PACKET_BYTES {
             return Err(Error::M2tsPacketMalformed.into());
@@ -118,10 +101,9 @@ impl Packet {
         Ok(())
     }
 
-    /// Pad the packet to exactly 188 bytes with `0xFF` bytes — used by
-    /// PSI emit paths where the section is much smaller than 184 bytes.
-    /// For PSI packets only — payload-carrying packets reserve room for
-    /// stuffing via `append_adaptation`.
+    // Pad the packet to exactly 188 bytes with 0xFF — for PSI emit paths
+    // where the section is much smaller than 184 bytes. Payload-carrying
+    // packets reserve stuffing room via append_adaptation instead.
     pub(super) fn pad_to_188(&mut self) {
         while self.len < TS_PACKET_BYTES {
             self.push(STUFF_BYTE);
@@ -137,10 +119,9 @@ impl Packet {
     }
 }
 
-/// Writer for assembled TS packets. Owns the underlying sink and writes
-/// each 188-byte packet straight through — it adds no buffering of its
-/// own, so callers that need buffering should wrap the sink in a
-/// `BufWriter`.
+// Writer for assembled TS packets. Owns the sink and writes each
+// 188-byte packet straight through with no buffering of its own — wrap
+// the sink in a BufWriter if buffering is needed.
 pub(super) struct PacketWriter<W: Write> {
     inner: W,
 }
@@ -351,10 +332,9 @@ mod tests {
         assert_eq!(pid, 0xE100 & 0x1FFF, "PID masked to 13 bits");
     }
 
-    /// A sink that records only what actually reaches it, so "was flush called"
-    /// is MEASURED rather than assumed. Its own `flush` is a no-op — the whole
-    /// point is that the intermediate `BufWriter` must be told to hand its bytes
-    /// over.
+    // Records only what actually reaches it, so "was flush called" is
+    // MEASURED not assumed. Its own flush is a no-op — the point is that
+    // the intermediate BufWriter must be told to hand bytes over.
     #[derive(Clone, Default)]
     struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -374,12 +354,9 @@ mod tests {
         }
     }
 
-    /// `PacketWriter` adds no buffering of its own, so the sink's buffer is the
-    /// only one — and `flush()` is the only thing that empties it. Skipping it
-    /// truncates the transport stream mid-packet: the final 188-byte packets
-    /// never reach the file, so the last PES of the title is lost and the stream
-    /// ends on a partial packet (ISO/IEC 13818-1 §2.4.3.2 requires whole
-    /// 188-byte packets).
+    // PacketWriter buffers nothing itself, so flush() is the only thing
+    // that empties the sink's buffer — skipping it truncates the stream
+    // mid-packet. See docs/m2ts-mux.md for the full failure mode.
     #[test]
     fn flush_delivers_the_buffered_packets_to_the_sink() {
         let sink = SharedSink::default();

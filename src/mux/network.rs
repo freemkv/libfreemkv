@@ -14,14 +14,9 @@ use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 /// I/O buffer size for network reads/writes.
 const NET_BUF_SIZE: usize = 256 * 1024;
 
-/// True if `ip` is one we must never connect a `network://` output to:
-/// loopback, RFC1918/ULA private, link-local, unspecified, or multicast.
-///
-/// `validate_network_target` (in autorip) vets the host once at
-/// settings-save time, but the raw hostname is re-resolved here at rip
-/// time — a DNS-rebinding attacker can flip a previously-public name to
-/// `127.0.0.1` / `10.x` / `169.254.x` in that window. Re-checking the
-/// actually-resolved address at connect time closes that TOCTOU.
+// True if `ip` must never be a `network://` connect target (loopback,
+// private, link-local, unspecified, multicast). Re-checked here at
+// connect time to close a DNS-rebinding TOCTOU. See docs/network-mod.md.
 pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -55,13 +50,9 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Resolve `addr` (host:port) and return the first socket address whose
-/// IP is NOT [`is_blocked_ip`]. Errors with
-/// [`crate::error::Error::NetworkAddrBlocked`] if every resolved address
-/// is blocked, or propagates the resolver's own error if resolution
-/// fails. The returned `SocketAddr` carries a vetted IP literal, so the
-/// subsequent `TcpStream::connect` cannot be re-pointed by a second DNS
-/// lookup (it connects to the IP we vetted, not the name).
+// Resolve `addr` and return the first IP not blocked by `is_blocked_ip`;
+// errors NetworkAddrBlocked if all are blocked, since the returned
+// SocketAddr is a vetted IP literal (no second DNS lookup possible).
 fn resolve_allowed_addr(addr: &str) -> io::Result<std::net::SocketAddr> {
     // Zero resolved addresses and "all resolved addresses blocked" both
     // mean there is no safe address to connect to — same error either way.
@@ -98,13 +89,9 @@ impl NetworkStream {
         Self::connect_vetted(addr, true)
     }
 
-    /// `connect` with an explicit SSRF-vetting toggle.
-    ///
-    /// `vet=true` (the public [`connect`](Self::connect) path) resolves
-    /// the target and refuses any loopback/private/link-local/multicast
-    /// address, closing the DNS-rebinding TOCTOU. `vet=false` exists only
-    /// for in-crate tests, which must connect to `127.0.0.1` ephemeral
-    /// listeners that the production vet would (correctly) reject.
+    // `connect` with an explicit SSRF-vetting toggle: vet=true (the public
+    // path) rejects loopback/private/link-local/multicast; vet=false is
+    // for in-crate tests connecting to 127.0.0.1 ephemeral listeners.
     fn connect_vetted(addr: &str, vet: bool) -> io::Result<Self> {
         // Connect to the vetted IP literal (not the raw name) so a DNS rebind between
         // settings-save validation and now can't redirect us to a loopback/private/
@@ -171,10 +158,9 @@ impl NetworkStream {
     }
 }
 
-/// Write the FMKV metadata header exactly once, before any frames. Always
-/// writes (even when the title has no streams) so the receiver's
-/// `read_header()` always finds the magic and never falls into the
-/// NoMetadata path on a zero-frame stream.
+// Write the FMKV header exactly once, before any frames. Always writes
+// (even for a title with no streams) so read_header() finds the magic
+// and doesn't fall into NoMetadata on a zero-frame stream.
 fn ensure_header_written(
     writer: &mut BufWriter<TcpStream>,
     header_written: &mut bool,
@@ -238,10 +224,9 @@ mod tests {
     };
     use std::net::TcpListener;
 
-    /// SSRF guard: every loopback / private / link-local / multicast /
-    /// unspecified address (v4 and v6) must be rejected, and ordinary
-    /// public addresses must be allowed. This is what closes the
-    /// DNS-rebinding window in `NetworkStream::connect`.
+    // SSRF guard: every loopback/private/link-local/multicast/unspecified
+    // address (v4+v6) must be rejected, ordinary public addresses allowed —
+    // this is what closes the DNS-rebinding window in `connect`.
     #[test]
     fn is_blocked_ip_rejects_internal_targets() {
         use std::net::{Ipv4Addr, Ipv6Addr};
@@ -553,10 +538,9 @@ mod tests {
         let _ = handle.join().unwrap();
     }
 
-    /// The FMKV header must be written exactly once, before the first frame,
-    /// even across many frames. The receiver must therefore reconstruct the
-    /// title exactly once and read every frame after it — a header re-emitted
-    /// between frames would desync PesFrame::deserialize and corrupt frame N.
+    // FMKV header must be written exactly once, before the first frame, even
+    // across many frames — a re-emitted header mid-stream would desync
+    // PesFrame::deserialize and corrupt frame N.
     #[test]
     fn header_written_once_then_all_frames_roundtrip() {
         use crate::pes;
@@ -594,10 +578,9 @@ mod tests {
         }
     }
 
-    /// The receiver's title comes strictly from the SENDER's FMKV header:
-    /// the sender's meta() title is what accept_from() reconstructs, proving
-    /// the metadata flows sender→receiver over the header (not from the
-    /// receiver's empty default). Distinct sender title confirms the source.
+    // Receiver's title comes strictly from the sender's FMKV header (not the
+    // receiver's empty default) — proven here via a distinct sender title
+    // that accept_from() must reconstruct.
     #[test]
     fn receiver_title_comes_from_sender_header() {
         use crate::pes;
@@ -620,26 +603,9 @@ mod tests {
         );
     }
 
-    /// accept_from() must reject a connection whose first bytes are NOT the
-    /// FMKV magic — there is no metadata to drive muxing, so it surfaces
-    /// NoMetadata rather than proceeding with an empty/garbage title.
-    ///
-    /// FLAKE FIXED, not the behaviour under test: this used to
-    /// `shutdown(Shutdown::Both)` the instant the bytes were written. Closing
-    /// the READ half while the server had not yet read makes the kernel answer
-    /// the server's in-flight data with an RST, so `accept_from` came back
-    /// `ConnectionReset` instead of the `InvalidInput` this asserts — rarely
-    /// when run alone, reproducibly under the loaded concurrent suite, where
-    /// the server thread is descheduled long enough for the race to open. A
-    /// logging/protocol assertion that fails at random teaches the next person
-    /// to re-run until green, which is how a real regression gets waved
-    /// through.
-    ///
-    /// Half-closing (`Shutdown::Write`) delivers the same EOF the test needs
-    /// while leaving the read half open, and blocking on a read until the
-    /// server drops its end keeps the socket alive for as long as the server
-    /// is looking at it. The port was already ephemeral (`:0`), so it was
-    /// never a port collision.
+    // accept_from() must reject a connection whose first bytes aren't the
+    // FMKV magic, surfacing NoMetadata rather than an empty/garbage title.
+    // See docs/network-mod.md for why this test half-closes, not full-closes.
     #[test]
     fn accept_from_rejects_stream_without_fmkv_header() {
         use std::io::Read as _;

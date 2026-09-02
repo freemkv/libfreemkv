@@ -18,10 +18,9 @@ use crate::consts::TS_PAYLOAD_BYTES;
 /// so a PID's stream_id and its NAL handling can never disagree.
 const VIDEO_PID_RANGE: std::ops::RangeInclusive<u16> = 0x1011..=0x101F;
 
-/// Largest PES payload that fits a bounded `PES_packet_length` (u16) on a
-/// `0xBD` (private_stream_1) stream after the 8 PES-header bytes. Frames
-/// larger than this are split into multiple PES so the length field stays
-/// spec-conformant (the unbounded `0` length is only legal for video).
+// Largest PES payload that fits a bounded `PES_packet_length` (u16) on a
+// `0xBD` stream after the 8 PES-header bytes. Frames larger than this split
+// into multiple PES (unbounded `0` length is video-only).
 const MAX_BD_PES_PAYLOAD: usize = u16::MAX as usize - 8;
 
 fn is_video_pid(pid: u16) -> bool {
@@ -33,34 +32,21 @@ fn is_video_pid(pid: u16) -> bool {
 /// Constructed over an output writer and a slice of per-track PIDs. The
 /// `track` index passed to [`TsMuxer::write_frame`] and
 /// [`TsMuxer::set_codec_private`] is the position in that PID slice; all
-/// per-track state vectors are sized to `pids.len()`. PIDs in
-/// `0x1011..=0x101F` are treated as video (length-prefixed NALUs in,
-/// Annex B out, with parameter-set prepend and RAI on keyframes); every
-/// other PID is carried as `private_stream_1` (`0xBD`) audio/subtitle.
-/// All tracks share one PTS origin seeded from the first video frame, so
-/// audio/video PTS offsets are preserved.
+/// per-track state vectors are sized to `pids.len()`. See docs/tsmux.md
+/// for the video-vs-audio PID split and PTS-origin rules.
 pub struct TsMuxer<W: Write> {
     writer: W,
     pids: Vec<u16>,
     continuity: Vec<u8>,                  // per-PID continuity counter (0-15)
     codec_privates: Vec<Option<Vec<u8>>>, // per-track codec_private (for video parameter sets)
     params_written: Vec<bool>,            // per-track: have we written parameter sets?
-    /// Per-track video codec, which decides BOTH how the ES is framed and how
-    /// its `codec_private` parameter-set record is parsed. One fact, one field:
-    /// carrying NAL-ness separately from the codec is what let a track be
-    /// treated as NAL video while its avcC record was handed to the hvcC parser.
-    ///
-    /// * HEVC / H.264 arrive length-prefixed (MKV/PES NALU convention) and need
-    ///   Annex-B conversion; their parameter sets live in an hvcC / avcC record
-    ///   respectively, and the two layouts are NOT interchangeable.
-    /// * MPEG-2 and VC-1 are already plain start-code ES; running
-    ///   `length_prefixed_to_annex_b` over them mangles the frame into
-    ///   empty/garbage output while `frame_count` still increments, so the mux
-    ///   "succeeds" and silently produces a video-less file.
-    ///
-    /// Defaults to [`Codec::Hevc`] — the prior, only behaviour — so a caller that
-    /// never calls [`TsMuxer::set_video_codec`] is unaffected. Ignored for
-    /// non-video tracks.
+    /// Per-track video codec: decides how the ES is framed AND how its
+    /// `codec_private` parameter-set record is parsed. HEVC/H.264 need
+    /// Annex-B conversion (hvcC/avcC parameter sets); MPEG-2/VC-1 are
+    /// already start-code ES and must NOT be converted. Defaults to
+    /// [`Codec::Hevc`]; ignored for non-video tracks. See docs/tsmux.md
+    /// for why NAL-ness is derived from this rather than tracked
+    /// separately.
     video_codec: Vec<Codec>,
     /// Global PTS origin (nanoseconds), seeded by the FIRST video frame so
     /// the audio/video offset is preserved. Frames that arrive before it
@@ -269,10 +255,9 @@ impl<W: Write> TsMuxer<W> {
         Ok(())
     }
 
-    /// Wrap `es_data` in a PES header and split it into 192-byte BD-TS
-    /// packets. `keyframe` drives the RAI bit on the first packet (video
-    /// only). The PES header and ES bytes are sliced in place — no second
-    /// full-frame copy.
+    // Wrap `es_data` in a PES header and split it into 192-byte BD-TS
+    // packets. `keyframe` drives the RAI bit on the first video packet;
+    // header and ES bytes are sliced in place (no second full-frame copy).
     fn write_pes_chain(
         &mut self,
         track: usize,
@@ -401,14 +386,9 @@ impl<W: Write> TsMuxer<W> {
     }
 }
 
-/// Build a PES packet header for a BD stream.
-/// `pts_90k` is `None` for a CONTINUATION PES packet — one carrying the rest of an
-/// access unit that was too large for a single bounded-length private_stream_1 PES.
-/// ISO/IEC 13818-1 §2.4.3.7 puts the PTS in the header of the PES packet that
-/// contains the FIRST byte of the access unit; repeating it on the continuations
-/// makes each of them look like a new access unit at the same timestamp, so a
-/// demuxer re-reading the stream splits one display set into two blocks with
-/// identical timestamps.
+// Build a PES packet header for a BD stream. `pts_90k` is `None` for a
+// CONTINUATION PES (rest of an oversized private_stream_1 access unit) —
+// only the first PES may carry a PTS. See docs/tsmux.md for the spec cite.
 fn build_pes_header(pid: u16, pts_90k: Option<u64>, data_len: usize) -> Vec<u8> {
     use crate::consts::pes_stream_id;
     // Determine stream_id from PID range
@@ -825,10 +805,9 @@ mod tests {
     // Added hardening tests
     // ════════════════════════════════════════════════════════════════════
 
-    /// Concatenate the ES payloads of all packets on `pid`, stripping the
-    /// PES header off each PUSI packet. A PUSI packet starts a PES whose
-    /// header is `00 00 01 stream_id len len 80 80 05` + 5 PTS bytes = 14
-    /// bytes for our muxer (always PTS-present, header_data_length 5).
+    /// Concatenate the ES payloads of all packets on `pid`, stripping the PES
+    /// header off each PUSI packet (`00 00 01 stream_id len len 80 80 05` +
+    /// 5 PTS bytes = 14 bytes; always PTS-present, header_data_length 5).
     fn reassemble_es(packets: &[TsPacket], pid: u16) -> Vec<u8> {
         let mut out = Vec::new();
         for p in packets.iter().filter(|p| p.pid == pid) {
@@ -854,18 +833,9 @@ mod tests {
             .collect()
     }
 
-    /// A non-NAL codec must pass the ES through byte-for-byte: MPEG-2 and
-    /// VC-1 are not NAL-based, so their ES already IS the wire format and
-    /// `length_prefixed_to_annex_b` would mangle it.
-    ///
-    /// The payload is deliberately length-prefix SHAPED (a big-endian length
-    /// followed by that many bytes) so the conversion, if wrongly applied, rewrites
-    /// the leading four bytes into a `00 00 00 01` start code. That makes the two
-    /// paths produce visibly different bytes; a payload the converter happened to
-    /// leave alone would let a mutant pass.
-    ///
-    /// Mutation: delete the `set_video_codec` call, or make Mpeg2 report as NAL,
-    /// and the emitted ES gains a start code -> this fails.
+    // Non-NAL codec (MPEG-2/VC-1) must pass ES through byte-for-byte; the
+    // payload is length-prefix SHAPED so a wrongly-applied Annex-B
+    // conversion is visibly detectable. See docs/tsmux.md for full rationale.
     #[test]
     fn non_nal_video_es_passes_through_unconverted() {
         // 4-byte BE length (6) + 6 payload bytes: exactly what the Annex-B
@@ -915,10 +885,9 @@ mod tests {
         );
     }
 
-    /// A non-NAL video track must still arm `params_written`, or every later
-    /// non-keyframe would fail the drop guard and silently vanish — the same class
-    /// of bug `empty_data_keyframe_arms_params_so_later_frames_survive` guards on
-    /// the NAL path.
+    // A non-NAL video track must still arm `params_written`, or every later
+    // non-keyframe fails the drop guard and silently vanishes — same class of
+    // bug `empty_data_keyframe_arms_params_so_later_frames_survive` guards.
     #[test]
     fn non_nal_video_keyframe_arms_params_so_later_frames_survive() {
         let key: Vec<u8> = vec![0x00, 0x00, 0x01, 0xB3, 0xAA, 0xBB];
@@ -1157,16 +1126,9 @@ mod tests {
         assert_eq!(got, big, "split audio reassembles byte-for-byte");
     }
 
-    /// ISO/IEC 13818-1 §2.4.3.7: the PTS belongs in the header of the PES packet
-    /// that contains the FIRST byte of the access unit. An oversized
-    /// private_stream_1 access unit is split across several PES packets, and every
-    /// one of them used to carry the SAME PTS (PTS_DTS_flags = 0b10) even though
-    /// only the first holds the start of the AU. On read-back a demuxer treats each
-    /// PUSI as a new access unit, so the second half of e.g. a full-screen PGS
-    /// display set arrived as an independent segment at an identical timestamp and
-    /// the display set was emitted as TWO blocks with the same timestamp instead of
-    /// one. Only the first PES may carry a PTS; the continuations must set
-    /// PTS_DTS_flags = 0b00.
+    // ISO/IEC 13818-1 §2.4.3.7: only the first PES of a split access unit may
+    // carry a PTS; repeating it on continuations makes each look like an
+    // independent AU at the same timestamp. See docs/tsmux.md for detail.
     #[test]
     fn split_access_unit_carries_pts_only_on_the_first_pes() {
         // Three PES worth of ES so there are two continuations to check.
@@ -1195,13 +1157,9 @@ mod tests {
         );
     }
 
-    /// MEASURED: the Annex-B conversion buffer must be REUSED across video
-    /// frames, not allocated per frame. Both the allocation's address and its
-    /// capacity are unchanged after the second and third same-sized frames — if
-    /// the conversion allocated a fresh `Vec` per frame (the old
-    /// `Vec::with_capacity(data.len() + 1024)`), the buffer left on the muxer
-    /// would be empty with zero capacity, and each frame would pay an
-    /// allocate/first-touch/free cycle over the whole ~310 KB frame.
+    // MEASURED: the Annex-B conversion buffer must be REUSED across video
+    // frames, not allocated per frame (~310 KB/frame otherwise). See
+    // docs/tsmux.md for the old-allocator regression this pins.
     #[test]
     fn annex_b_conversion_buffer_is_reused_across_frames() {
         let mut sink: Vec<u8> = Vec::new();
@@ -1236,24 +1194,17 @@ mod tests {
     // Mutation-gap hardening (mux-ts pass)
     // ════════════════════════════════════════════════════════════════════
 
-    /// `MAX_BD_PES_PAYLOAD` is read by its own tests (the oversized-split
-    /// tests) only through the same symbol, so a mutated arithmetic
-    /// expression in its definition changes what the symbol itself
-    /// evaluates to and those assertions still pass. Pin the compiled value
-    /// against a literal computed independently.
+    /// Pin MAX_BD_PES_PAYLOAD against an independently computed literal: the
+    /// oversized-split tests read it only through the same symbol, so a
+    /// mutated definition would still pass those assertions.
     #[test]
     fn max_bd_pes_payload_has_the_documented_value() {
         assert_eq!(MAX_BD_PES_PAYLOAD, u16::MAX as usize - 8);
     }
 
-    /// A video access unit larger than `MAX_BD_PES_PAYLOAD` (the bound that
-    /// exists ONLY because a bounded `private_stream_1` PES can't exceed a
-    /// `u16` length) must still go out as ONE PES using the video-only
-    /// unbounded-length form — never split into several independent PES
-    /// chunks the way an oversized audio/subtitle access unit is. A
-    /// splitting bug here would emit several PUSI packets that each look
-    /// like a complete, independent video access unit (RAI + PTS on each),
-    /// corrupting any large keyframe.
+    // An oversized video access unit must stay ONE PES (unbounded-length
+    // form), never split like bounded private_stream_1 audio/subtitle data —
+    // a split here would emit multiple independent-looking video AUs.
     #[test]
     fn oversized_video_frame_is_one_pes_not_split() {
         let big = fake_hevc_nal(19, MAX_BD_PES_PAYLOAD + 5000);
@@ -1276,12 +1227,9 @@ mod tests {
         );
     }
 
-    /// The RAI-carrying first packet of a keyframe video PES needs only the
-    /// MINIMUM adaptation field (2 bytes: length + RAI flag) before payload
-    /// resumes — `max_payload = TS_PAYLOAD_BYTES - 2`. A `-` -> `/` mutation
-    /// collapses that to `184 / 2 = 92`, wasting 90 bytes of every keyframe's
-    /// first packet as pointless AF stuffing. Pin the AF to its true minimum
-    /// length when there is enough data to fill the rest as payload.
+    // The RAI first packet of a keyframe video PES needs only the MINIMUM
+    // adaptation field (2 bytes). A `-`->`/` mutation in `max_payload`'s
+    // arithmetic would waste 90 bytes as pointless AF stuffing; pin it.
     #[test]
     fn rai_adaptation_field_uses_the_minimum_two_bytes() {
         let mut sink: Vec<u8> = Vec::new();
@@ -1309,13 +1257,9 @@ mod tests {
         assert_eq!(first_pusi.payload.len(), 182);
     }
 
-    /// `build_pes_header`'s bounded-length field is big-endian 16-bit
-    /// (`(len >> 8) as u8`, then `len as u8`). A `>>` -> `<<` mutation
-    /// zeroes the high byte for every length (shifting left by 8 then
-    /// truncating to `u8` always yields 0), so any PES longer than 255
-    /// bytes gets a silently wrong (far too small) declared length. Use an
-    /// audio frame comfortably over 255 bytes but under the oversized-split
-    /// threshold so exactly one bounded PES is produced.
+    // build_pes_header's length field is big-endian 16-bit; a `>>`->`<<`
+    // mutation would zero the high byte for any PES >255 bytes, silently
+    // truncating the declared length. Use a >255-byte audio frame to catch it.
     #[test]
     fn bounded_pes_length_field_encodes_the_high_byte() {
         let es: Vec<u8> = vec![0xAB; 2000];
@@ -1343,12 +1287,9 @@ mod tests {
         );
     }
 
-    /// The PTS encoding's top byte carries bits 29..32 of the 33-bit
-    /// timestamp (`(pts >> 29) & 0x0E`). A `>>` -> `<<` mutation there always
-    /// yields 0 regardless of `pts` (shifting left by 29 then masking the
-    /// low 4 bits always sees zeros shifted in), which a small test PTS
-    /// (whose true bits 29..32 are already 0) cannot distinguish from
-    /// correct code. Use a PTS large enough that bits 29..32 are nonzero.
+    // PTS top byte carries bits 29..32 (`(pts >> 29) & 0x0E`); a `>>`->`<<`
+    // mutation always yields 0, undetectable with a small PTS. Use a PTS
+    // large enough that bits 29..32 are nonzero.
     #[test]
     fn pts_high_bits_survive_encoding() {
         // pts_ns is an exact multiple of 100_000 so the ns->90kHz conversion is exact;

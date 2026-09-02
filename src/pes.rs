@@ -6,10 +6,9 @@
 //! disc.read()  → PES frame (sectors → decrypt → demux internally)
 //! mkv.write(frame) → MKV file (mux internally)
 
-/// Maximum frame payload size, shared by `serialize` and `deserialize`
-/// so the wire format round-trips: any frame that serializes can be read
-/// back. A frame larger than this is rejected on write rather than written
-/// and then hard-erroring mid-stream on read.
+// Shared by `serialize`/`deserialize` so the wire format round-trips.
+// Oversized frames are rejected on write rather than hard-erroring
+// mid-stream on read.
 const MAX_FRAME_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 
 /// Where a unit's first byte came from in the SOURCE address space.
@@ -158,10 +157,8 @@ impl PesFrame {
         }))
     }
 
-    /// Create from a codec::Frame with a track index.
-    ///
-    /// `pub(crate)`: takes the internal `mux::codec::Frame` type, so it
-    /// can't be part of the public API surface.
+    // Create from a codec::Frame with a track index. `pub(crate)`: takes
+    // the internal `mux::codec::Frame` type, so it can't be public API.
     pub(crate) fn from_codec_frame(track: usize, frame: crate::mux::codec::Frame) -> Self {
         Self {
             track,
@@ -240,12 +237,10 @@ pub trait Stream: Send {
     /// everything it accepted — which is all of them except `mp4://`, whose
     /// `finish()` must drop an audio track no frame of which yielded a parseable
     /// sample entry (an `stsd` cannot describe it).
-    ///
-    /// This exists because such a drop otherwise contradicts the pre-mux plan the
-    /// crate publishes (`mp4_fit_report`), leaving the caller reporting a
-    /// successful export of a file missing a stream it was told would be there.
-    /// The driver folds this into `MuxOutcome::undelivered_streams`.
     fn undelivered_streams(&self) -> Vec<usize> {
+        // Without this, such a drop would silently contradict the pre-mux
+        // plan the crate publishes (`mp4_fit_report`); the driver folds
+        // this into `MuxOutcome::undelivered_streams`.
         Vec::new()
     }
 }
@@ -653,10 +648,9 @@ mod tests {
         );
     }
 
-    /// duration_ns is serialized as 8 LE bytes; None encodes as u64::MAX sentinel.
-    /// Spec: duration_ns is part of the wire format so network/stdio hops preserve it.
-    /// Mutation: dropping duration_ns from serialize would zero-fill the field and
-    ///           silently lose PGS subtitle durations on the network:// path.
+    // duration_ns is 8 LE bytes on the wire (None = u64::MAX sentinel) so
+    // network/stdio hops preserve it; dropping it would silently lose PGS
+    // subtitle durations on the network:// path.
     #[test]
     fn deserialize_duration_ns_roundtrips() {
         // None encodes as u64::MAX sentinel and decodes back to None.

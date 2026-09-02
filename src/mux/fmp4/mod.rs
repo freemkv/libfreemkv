@@ -3,30 +3,10 @@
 //! Goal: ISO/IEC 14496-12 fragmented MP4 (`ftyp` + `moov` init segment,
 //! then a sequence of `moof+mdat` media fragments) targeting a
 //! [`SequentialSink`](crate::io::sink::SequentialSink). DASH-friendly,
-//! no Cues backpatch.
-//!
-//! Status: **STUB**. The muxer can emit the init segment (`ftyp` + a
-//! minimal HEVC `moov` skeleton with one video track) via
-//! [`Fmp4Mux::write_init_segment`], so the shape and call site are
-//! validated, but media fragments (`moof`/`mdat`) are NOT emitted.
-//! [`Fmp4Mux::write_video`] therefore returns
-//! [`Error::Fmp4Unimplemented`](crate::error::Error::Fmp4Unimplemented)
-//! rather than silently accepting and discarding frames. It buffers
-//! nothing, so it cannot accumulate memory.
-//!
-//! ## Not yet implemented
-//!
-//! - `moof` box: `mfhd` (sequence_number) + `traf` (`tfhd` + `tfdt`
-//!   + `trun` with sample sizes, durations, flags, composition offsets).
-//! - `mdat` box: concatenated sample data.
-//! - Fragment cadence: one fragment per GOP or every N seconds,
-//!   whichever comes first.
-//! - HEVC `hvcC` box inside `moov.trak.mdia.minf.stbl.stsd` so the
-//!   init segment is self-describing (`stsd` currently has zero entries).
-//! - Sample-flags computation (sync vs. delta, depends_on, etc.).
-//! - Edit lists / fragment_duration for accurate seeking.
-//!
-//! Reference: ISO/IEC 14496-12 §8 (Movie Fragments).
+//! no Cues backpatch. Emits the init segment via
+//! [`Fmp4Mux::write_init_segment`]; [`Fmp4Mux::write_video`] returns
+//! [`Error::Fmp4Unimplemented`](crate::error::Error::Fmp4Unimplemented). See
+//! docs/fmp4-mod.md for details.
 
 use std::io::{self, Write};
 
@@ -317,17 +297,9 @@ fn build_mvex() -> Vec<u8> {
     wrap_box(&MVEX, &trex)
 }
 
-/// Wrap a box body in `[size:u32-BE][type:4]`. Suitable for any body
-/// that fits in u32; oversized boxes (size > 4 GiB) need the 64-bit
-/// large-size extension which we don't generate in the stub.
-///
-/// All callers build tiny init-segment boxes (kilobytes at most), so the
-/// `u32` size never overflows; the saturating cast plus the debug assert
-/// documents and guards that invariant rather than silently emitting a
-/// truncated, structurally corrupt size field. `body` is always internally
-/// constructed here, never untrusted input — a future caller feeding a
-/// multi-gigabyte body trips the debug assert instead of writing a malformed
-/// box.
+// Wrap a box body in `[size:u32-BE][type:4]`; oversized boxes (>4 GiB)
+// need the 64-bit large-size extension, not generated in the stub.
+// See docs/fmp4-mod.md — wrap_box size-cast rationale.
 fn wrap_box(box_type: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let total = body.len() + 8;
     debug_assert!(total <= u32::MAX as usize, "fMP4 box exceeds u32 size");
@@ -615,10 +587,9 @@ mod tests {
         assert_eq!(&body[8..12], b"vide", "handler_type must be 'vide'");
     }
 
-    /// `mdhd` (§8.4.2), `vmhd` (§12.1.2) and `dinf`/`dref` (§8.7.1–2) are all
-    /// mandatory in a video track's media tree, and each fixes field values a
-    /// player relies on. None of them is read back by this crate — the init
-    /// segment is only ever written — so nothing else constrains them.
+    // mdhd (§8.4.2), vmhd (§12.1.2), dinf/dref (§8.7.1-2) are mandatory
+    // in a video track's media tree; none is read back by this crate,
+    // so only the spec-fixed field values constrain them here.
     #[test]
     fn mdhd_vmhd_and_dinf_carry_the_values_the_spec_fixes() {
         let buf = init_segment();

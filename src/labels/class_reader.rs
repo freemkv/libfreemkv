@@ -1,14 +1,12 @@
 //! Hand-rolled JVM `.class` file reader, tailored to the subset we need
 //! for BD-J label extraction (Deluxe / dbp / similar frameworks).
 //!
-//! Spec: JVMS §4 (class file format) and §6 (bytecode). We implement the
-//! minimum to expose: constant pool, methods, the `Code` attribute, and
-//! a non-allocating bytecode iterator.
+//! Spec: JVMS §4 (class file format) and §6 (bytecode). Exposes: constant
+//! pool, methods, the `Code` attribute, and a non-allocating bytecode
+//! iterator.
 //!
 //! No external deps beyond `std`. No `unsafe`. No panics on malformed
-//! input — every parse fault is a typed [`Error`]. Shared infrastructure
-//! for any label parser that needs structured access to .class files
-//! inside a `/BDMV/JAR/<x>.jar`.
+//! input — every parse fault is a typed [`Error`]. See docs/class-reader.md.
 
 // Foundation module — public API is staged for `labels::deluxe` (bytecode
 // walker) and `labels::dbp`'s refactor onto the constant-pool iterator.
@@ -100,16 +98,9 @@ pub struct ConstantPool {
 }
 
 impl ConstantPool {
-    /// Test-only constructor — build a constant pool directly from a
-    /// vector of entries. Real callers go through `ClassFile::parse`
-    /// which builds this from class-file bytes. Used by parser unit
-    /// tests (e.g. `labels::deluxe`) that need to exercise bytecode
-    /// walkers against synthetic class fixtures without hand-rolling
-    /// valid .class byte buffers.
-    ///
-    /// Caller is responsible for: prepending a `CpInfo::Empty` at
-    /// index 0 (the spec-reserved slot), and inserting a `CpInfo::Empty`
-    /// after each Long/Double entry (the 2-slot quirk).
+    // Test-only: build a pool directly from entries (real code goes through
+    // ClassFile::parse). Caller must prepend CpInfo::Empty at index 0 and
+    // after each Long/Double entry (2-slot quirk). See docs/class-reader.md.
     #[cfg(test)]
     pub(crate) fn from_entries(entries: Vec<CpInfo>) -> Self {
         ConstantPool { entries }
@@ -443,18 +434,9 @@ fn read_constant_pool(r: &mut Reader<'_>) -> Result<ConstantPool> {
     Ok(ConstantPool { entries })
 }
 
-/// Decode JVM "modified UTF-8" (JVMS §4.4.7). Practically identical to
-/// standard UTF-8 for the BMP-printable subset we see in label strings,
-/// but with two notable deviations:
-/// - U+0000 is encoded as the two-byte sequence 0xC0 0x80, not as 0x00.
-/// - Supplementary characters (U+10000..) are encoded as a UTF-16
-///   surrogate pair, each surrogate emitted as 3-byte modified UTF-8.
-///
-/// For label data (mostly ASCII / Latin-1 / CJK in BMP), the simple
-/// implementation here covers everything we'll encounter. We tolerate
-/// the 0xC0 0x80 → U+0000 case explicitly; supplementary characters
-/// would need surrogate-pair stitching, but no label-relevant string
-/// uses them.
+// Decode JVM "modified UTF-8" (JVMS §4.4.7): like UTF-8 but U+0000 is 0xC0
+// 0x80, and supplementary chars use a 3-byte-surrogate-pair encoding we
+// don't bother handling — no label string needs it. See docs/class-reader.md.
 fn decode_modified_utf8(bytes: &[u8]) -> std::result::Result<String, ()> {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
@@ -696,11 +678,7 @@ fn instruction_size(code: &[u8], pc: usize) -> Option<usize> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Opcode table
-// ---------------------------------------------------------------------------
-
-// Named opcode constants for the ones we walk in the parser.
+// Opcode table: named opcode constants for the ones we walk in the parser.
 #[allow(dead_code)]
 pub const NOP: u8 = 0x00;
 pub const ACONST_NULL: u8 = 0x01;
@@ -1010,13 +988,9 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
-    /// `Reader::slice` takes an attacker-supplied length: a JVMS `u4`
-    /// `attribute_length` / `code_length` (§4.7, §4.7.3) or a `u2` Utf8
-    /// length (§4.4.7). Adding it to `pos` without a wrap check panics on
-    /// overflow in debug and, in release, wraps to a small end offset that
-    /// slips past the bounds check and then panics inside the slice index.
-    /// Both are panics escaping a parser whose whole input is untrusted disc
-    /// bytes; the contract is an EOF error.
+    // Reader::slice takes an attacker-supplied length (JVMS u4/u2 field);
+    // pos + len must not overflow/wrap past the bounds check and panic —
+    // untrusted disc input must yield an EOF error, not a panic.
     #[test]
     fn slice_rejects_a_length_that_would_wrap_pos() {
         let data = [0u8; 16];

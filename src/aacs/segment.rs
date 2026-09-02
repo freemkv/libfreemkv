@@ -1,21 +1,9 @@
 //! AACS 2.1 FMTS forensic segment map — `AACS/IndividualSegment.tbl`.
 //!
-//! An FMTS main feature interleaves short forensic **segments** — the sequence-key
-//! / forensic-watermark mechanism. Each segment carries an **index** (1..32): a
-//! tag in `IndividualSegment.tbl` that selects which of the 32 forensic **index
-//! keys** decrypts that segment's units, in place of the ordinary CPS Unit Key.
-//!
-//! Terminology (see the project AACS reference): the **index** here is NOT the
-//! AACS 2.1 *Media Key Variant* — that is the 65536-value device selector in the
-//! MKB that decides *which set* of index keys a device receives, a layer this
-//! module does not deal with. All the index keys belong to one variant, whose
-//! number is unknown and irrelevant to the segment map. Decrypting a segment with
-//! the Unit Key yields garbage — broken HEVC reference frames (empirically:
-//! `Could not find ref with POC …` on a plain unit-key rip).
-//!
-//! This table says WHERE the segments live and which index each carries, so a
-//! decoder can decrypt them with the matching index key instead of muxing
-//! unit-key garbage.
+//! An FMTS main feature interleaves short forensic **segments**, each with an
+//! **index** (1..32) selecting one of 32 forensic index keys to decrypt that
+//! segment's units in place of the ordinary CPS Unit Key. This table says
+//! WHERE the segments live and which index each carries.
 //!
 //! Format (validated against a retail AACS 2.1 disc):
 //! ```text
@@ -24,17 +12,7 @@
 //!     u32 marker (= 0x01000000) | u16 index | u16 flag (= 1)
 //!     u32 start_spn | u32 end_spn        (source-packet numbers, inclusive)
 //! ```
-//! `index` is the 1..32 forensic index tag, NOT a sequential segment id: measured
-//! on a retail 2.1 disc it cycles 1,2,…,32,1,2,… across records in
-//! file order — 24 full cycles of 32 plus a final partial cycle of 24 = 792
-//! records. Source-packet numbers are the 192-byte BDAV packet index: byte offset
-//! = `spn * 192`. Each segment is ~2560 packets (~480 KB) = 80 aligned units,
-//! spread across the entire 54 GB feature (one roughly every 67 MB). Inside a
-//! segment the 80 units interleave in two stride-2 halves: applying the segment's
-//! index key decrypts ~40 of them to clean TS and garbles the other ~40 (a second
-//! interleaved half, unidentified), which the demux then drops — leaving one
-//! coherent stream. Confirmed by decoding a retail disc with a full set of 32
-//! index keys.
+//! See docs/segment.md — terminology, measurements, interleave rationale.
 
 /// Fixed size of one `IndividualSegment.tbl` record.
 pub const SEGMENT_RECORD_LEN: usize = 16;
@@ -102,18 +80,13 @@ pub fn lba_byte_offset(lba: u32) -> u64 {
 /// The forensic segment an AACS aligned unit belongs to, if any, given the
 /// unit's clip-relative byte offset.
 ///
-/// This is the routing decision behind a 2.1 decrypt-miss: a unit that
-/// overlaps a forensic segment must be opened with that segment's **index key**
-/// (selected by the segment's `index`), not the CPS Unit Key. Opening it with
-/// the Unit Key is exactly what yields the broken-reference-frame garbage a
-/// plain unit-key rip produces. A unit outside every segment is ordinary
-/// content and a miss on it is a Unit-Key miss, so this returns `None` and the
-/// caller falls back to the normal unit-key fetch.
+/// A unit overlapping a segment must be opened with that segment's index key
+/// (selected by `index`), not the CPS Unit Key — see docs/segment.md for why.
+/// `None` means the unit is ordinary content and a miss on it is a plain
+/// Unit-Key miss.
 ///
-/// The unit is tested as a packet *span* (`[off/192, (off+6144-1)/192]`) so a
-/// unit that only partly overlaps a segment edge is still classified as
-/// forensic; on the observed disc segments are unit-aligned, but the span test
-/// does not rely on that.
+/// Tested as a packet *span* (`[off/192, (off+6144-1)/192]`) so a unit that
+/// only partly overlaps a segment edge still counts as forensic.
 pub fn segment_for_unit(segments: &[Segment], unit_offset: u64) -> Option<&Segment> {
     let unit_len = crate::aacs::content::ALIGNED_UNIT_LEN as u64;
     let first = (unit_offset / SOURCE_PACKET_LEN) as u32;
@@ -175,18 +148,13 @@ pub fn clip_byte_to_lba(extents: &[crate::disc::Extent], clip_byte: u64) -> Opti
 /// Build the `[start_lba, end_lba) → key_idx` ranges for an FMTS forensic key map.
 ///
 /// Each forensic segment's clip-relative source-packet span becomes an absolute
-/// LBA range tagged with the key its `index` selects (via `index_to_key_idx`,
-/// e.g. `|i| i as usize` when the pool is `[base, idx1, idx2, …]`). Applying that
-/// one key across the whole segment decodes the ~40 units of its interleave half
-/// to clean TS and garbles the other ~40 (the second interleaved half), which the
-/// demux then drops — yielding one coherent stream. Ranges outside every segment
-/// are left for the map's default (the ordinary Unit Key). A segment that straddles
-/// a UDF extent boundary is skipped entirely, falling back to the Unit Key rather
-/// than emitting a wrong span.
+/// LBA range tagged with the key its `index` selects (via `index_to_key_idx`).
+/// Ranges outside every segment are left for the map's default (the Unit Key).
+/// A segment straddling a UDF extent boundary is skipped rather than emitting
+/// a wrong span. See docs/segment.md for the interleave-decode rationale.
 ///
-/// The result feeds [`AacsKeyMap::from_ranges`](crate::decrypt::AacsKeyMap::from_ranges)
-/// with the Unit-Key index as the default — the same structure the CPS map uses,
-/// only finer-grained.
+/// Feeds [`AacsKeyMap::from_ranges`](crate::decrypt::AacsKeyMap::from_ranges)
+/// with the Unit-Key index as the default.
 pub fn fmts_key_ranges(
     segments: &[Segment],
     extents: &[crate::disc::Extent],

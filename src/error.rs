@@ -3,19 +3,7 @@
 //! Every error is a code with structured data. No English text.
 //! Applications map codes to localized messages.
 //!
-//! # Error Code Ranges
-//!
-//! | Range | Category |
-//! |-------|----------|
-//! | E1xxx | Device errors |
-//! | E2xxx | Profile errors |
-//! | E3xxx | Unlock errors |
-//! | E4xxx | SCSI errors |
-//! | E5xxx | I/O errors |
-//! | E6xxx | Disc format errors |
-//! | E7xxx | AACS errors |
-//! | E8xxx | Keydb errors |
-//! | E9xxx | Stream/mux errors |
+//! See docs/error-codes.md for the full E1xxx-E9xxx range table.
 
 // ── Error codes ─────────────────────────────────────────────────────────────
 
@@ -72,13 +60,9 @@ pub const E_UDF_EMBEDDED_DATA: u16 = 6018;
 /// which is zero-length or points at LBA 0. Reported by the HD-DVD clip
 /// resolver (`disc::hddvd`).
 ///
-/// It has no [`Error`] variant on purpose. `UdfFs::file_extents` returns
-/// `Ok(vec![])` here rather than failing — the emptiness is only a defect in
-/// the eye of a caller that needs bytes — so the condition is DETECTED by the
-/// caller, not returned to it. The code exists so that detection can be
-/// accounted in the log with something other than a neighbouring error's code:
-/// logging it as E6017 would file a zero-length AD list as an authoring hole
-/// and send whoever triages it at the wrong population.
+/// It has no [`Error`] variant on purpose: `UdfFs::file_extents` returns
+/// `Ok(vec![])` here and the CALLER detects the condition. See
+/// docs/error-codes.md for why.
 pub const E_UDF_NO_USABLE_EXTENT: u16 = 6019;
 
 // AACS (7xxx)
@@ -113,11 +97,9 @@ pub const E_FMTS_KEY_MISSING: u16 = 7026;
 /// sectors and the known-plaintext crack recovered no title key at all, so every
 /// title will fail identically. The CSS analogue of [`E_NO_DISC_KEY`], and
 /// deliberately NOT [`E_CSS_KEY_MISSING`], which [`is_skippable_title_stub`]
-/// treats as one skippable per-title stub: while both conditions shared
-/// `E_CSS_KEY_MISSING`, an uncrackable CSS disc was iterated title by title,
-/// each one logged as skipped, and the run exited reporting success — a total
-/// failure reported as success. [`is_disc_level_no_key`] classifies this code, so
-/// a multi-title rip loop fails fast on it.
+/// treats as a skippable per-title stub. [`is_disc_level_no_key`] classifies
+/// this code, so a multi-title rip loop fails fast on it. See
+/// docs/error-codes.md for the history of why these codes were split.
 pub const E_CSS_NO_DISC_KEY: u16 = 7027;
 /// A key SOURCE could not be reached, or failed on its own side — transport
 /// error, DNS failure, timeout, TLS failure, an HTTP 5xx, or a reply the client
@@ -125,10 +107,8 @@ pub const E_CSS_NO_DISC_KEY: u16 = 7027;
 /// nothing at all is known about whether a key for this disc exists.
 ///
 /// Deliberately NOT [`E_NO_DISC_KEY`], which asserts the OPPOSITE — every source
-/// answered and none holds a key. A seven-hour run of HTTP 502s reported as
-/// `E_NO_DISC_KEY` told operators their disc was not in the key database and sent
-/// them hunting for a VUK that was never missing; the correct action was to wait.
-/// Transient: retry later.
+/// answered and none holds a key. Transient: retry later. See
+/// docs/error-codes.md for why conflating the two is dangerous.
 pub const E_KEY_SERVICE_UNAVAILABLE: u16 = 7028;
 /// A key source rejected the configured credentials (HTTP 401/403 from the online
 /// key service). NOT transient and NOT an absent key — the operator action is to
@@ -254,13 +234,8 @@ pub const E_MKV_LACING_INVALID: u16 = 9052;
 /// allocation caps, an out-of-range TimestampScale / cluster timestamp / track
 /// number).
 ///
-/// The read-path counterpart of [`E_MP4_INVALID`], and deliberately NOT
-/// [`E_MKV_INVALID`]: [`is_skippable_title_stub`] classifies `E_MKV_INVALID` as
-/// a title that yielded no muxable frames, which an all-titles rip may skip
-/// while finishing the rest. A corrupt or truncated input file is a FAILURE, not
-/// a stub — reporting it as skippable would let a broken source be silently
-/// passed over by a run that then exits successfully. The same conflation
-/// [`E_MUX_HEADER_BUFFER_EXCEEDED`] and [`E_MKV_LACING_INVALID`] exist to avoid.
+/// Deliberately NOT [`E_MKV_INVALID`] (a no-frames stub, skippable). See
+/// docs/error-codes.md for why conflating the two is dangerous.
 pub const E_MKV_SOURCE_INVALID: u16 = 9053;
 /// The Matroska WRITER was asked to emit something EBML cannot represent: an
 /// element body at or above the 56-bit VINT payload limit (which would encode
@@ -368,18 +343,13 @@ pub enum Error {
     // SCSI (4xxx)
     /// SCSI command failed.
     ///
-    /// `opcode` is the failing CDB byte 0. `status` is the raw SCSI
-    /// status byte: `0x02` = CHECK CONDITION (drive replied with sense
-    /// data), `0xFF` = libfreemkv-synthesised sentinel meaning "no SCSI
-    /// status delivered" (kernel timeout, USB bridge wedge, IOKit
-    /// service failure). `sense` carries the drive's SPC-4 sense triple
-    /// when the drive replied; `None` for transport-layer failures.
+    /// `opcode` is the failing CDB byte 0. `status` is the raw SCSI status byte:
+    /// `0x02` = CHECK CONDITION (sense data present), `0xFF` = synthesised
+    /// sentinel for "no SCSI status delivered" (transport wedge). `sense` is the
+    /// drive's SPC-4 sense triple, `None` for transport-layer failures.
     ///
-    /// Recommended dispatch (callers shouldn't pattern-match raw
-    /// fields):
-    ///   - [`Error::is_scsi_transport_failure`] — bail; bridge/transport wedge
-    ///   - [`Error::is_marginal_read`] — drive said this read was marginal; smaller block may recover
-    ///   - [`Error::scsi_sense`] — borrow the sense triple for finer routing ([`ScsiSense::is_medium_error`](crate::scsi::ScsiSense::is_medium_error) etc.)
+    /// Prefer [`Error::is_scsi_transport_failure`], [`Error::is_marginal_read`],
+    /// and [`Error::scsi_sense`] over pattern-matching these fields directly.
     ScsiError {
         opcode: u8,
         status: u8,
@@ -447,18 +417,11 @@ pub enum Error {
     /// A file's ICB declares its data EMBEDDED inline (ECMA-167 4/14.6.8
     /// allocation-descriptor type 3), so it has no out-of-line extents at all.
     ///
-    /// Returned only when a caller asked for a read plan over such a file.
-    /// The bytes in the allocation-descriptor field are then the file's own
-    /// CONTENT, not descriptors, so decoding them as (length, LBA) pairs
-    /// manufactures extents out of arbitrary data and points the reader at
-    /// unrelated sectors — a rip that completes at rc=0 carrying whatever
-    /// happened to be there. `read_directory` already refuses the same shape
-    /// for directories; this is the file half of that decision.
-    ///
-    /// A file that legitimately stores its data this way is tiny (an ICB caps
-    /// it at well under 2 KiB — the AACS `*.inf` key files are the usual
-    /// case), and the callers that expect one read it via `read_inline_data`
-    /// long before extents are ever requested. A stream file cannot be one.
+    /// Returned only when a caller asked for a read plan over such a file;
+    /// decoding the inline bytes as (length, LBA) pairs would manufacture
+    /// extents out of file content and point the reader at unrelated sectors.
+    /// Callers that expect an embedded file (e.g. AACS `*.inf`) read it via
+    /// `read_inline_data` instead. See docs/error-codes.md for more.
     UdfEmbeddedData,
     DiscTitleRange {
         index: usize,
@@ -487,10 +450,9 @@ pub enum Error {
     /// nav/menu PGC stub, and [`is_skippable_title_stub`] classifies this code as
     /// skippable so an all-titles rip drops the stub and finishes the rest.
     ///
-    /// This meaning is EXCLUSIVE. Malformed `mkv://` source input is
-    /// [`Error::MkvSourceInvalid`]; an unrepresentable element on the write side
-    /// is [`Error::MkvUnencodable`]. Routing either of those here would report a
-    /// broken file as a title worth silently skipping.
+    /// EXCLUSIVE meaning: malformed `mkv://` source is [`Error::MkvSourceInvalid`];
+    /// an unrepresentable write-side element is [`Error::MkvUnencodable`]. Neither
+    /// is safe to skip.
     MkvInvalid,
     /// An `mkv://` SOURCE file is malformed or truncated — the EBML/Matroska
     /// reader rejected it. NOT [`Error::MkvInvalid`]: see
@@ -581,22 +543,18 @@ pub enum Error {
     /// re-cracked). Muxing would emit scrambled ciphertext, so the caller
     /// fails fast instead. CSS analogue of [`Error::NoDiscKey`].
     ///
-    /// PER-TITLE by construction: a sibling title in another VTS may still crack
-    /// its own key, so [`is_skippable_title_stub`] classifies this code and an
-    /// all-titles rip skips the title and finishes the rest. The whole-disc
-    /// counterpart — the main feature's crack failed, so nothing on the disc can
-    /// be decrypted — is [`Error::CssNoDiscKey`].
+    /// PER-TITLE: [`is_skippable_title_stub`] classifies this code so an
+    /// all-titles rip skips just this title. The whole-disc counterpart is
+    /// [`Error::CssNoDiscKey`].
     CssKeyMissing,
     /// The disc is CSS-encrypted and decryption was requested, but the
     /// known-plaintext crack recovered NO title key for the disc at all (the scan
     /// saw scrambled sectors and stamped `Disc::css_error`). A whole-disc
     /// condition: every title would fail the same way, so a multi-title rip loop
-    /// must stop instead of iterating. The CSS analogue of [`Error::NoDiscKey`]
-    /// on the disc-wide axis, and classified by [`is_disc_level_no_key`] — NOT by
-    /// [`is_skippable_title_stub`], which owns the per-title
-    /// [`Error::CssKeyMissing`]. Raising this as `CssKeyMissing` (as the disc-wide
-    /// gate once did) makes an undecryptable disc log one "title skipped" notice
-    /// per title and exit successfully.
+    /// must stop instead of iterating. The CSS analogue of [`Error::NoDiscKey`],
+    /// classified by [`is_disc_level_no_key`] — NOT [`is_skippable_title_stub`],
+    /// which owns the per-title [`Error::CssKeyMissing`]. See docs/error-codes.md
+    /// for why conflating the two matters.
     CssNoDiscKey,
     /// A key source could not be reached, or failed on its own side — transport
     /// error, DNS failure, timeout, TLS failure, HTTP 5xx, or an unreadable /
@@ -615,13 +573,12 @@ pub enum Error {
     KeyServiceRateLimited,
     /// The live-drive AACS cert-auth handshake (the OEM/AACS baseline route)
     /// could not run because NO host certificate was available from any key
-    /// source. Host certs are keysource-served, never compiled in, so without
-    /// a keysource that supplies one the OEM route fails gracefully here — this
-    /// is the intended outcome, not a panic. Resolution still proceeds with a
-    /// zero Volume ID and relies on the path-1 disc-hash → VUK lookup, so the
-    /// error is dropped when that lookup hits. `path` carries the sentinel
-    /// `<no host cert>` (mirroring [`Error::KeydbLoad`]'s sentinel) so a CLI can
-    /// render "No Host Certs Found."
+    /// source. Host certs are keysource-served, never compiled in, so the OEM
+    /// route fails gracefully here rather than panicking. Resolution still
+    /// proceeds with a zero Volume ID and relies on the path-1 disc-hash → VUK
+    /// lookup, so the error is dropped when that lookup hits. `path` carries the
+    /// sentinel `<no host cert>` (mirroring [`Error::KeydbLoad`]'s sentinel) so a
+    /// CLI can render "No Host Certs Found."
     AacsNoHostCert {
         path: String,
     },
@@ -630,11 +587,9 @@ pub enum Error {
     /// `read_data_key` (bus key) was produced — so the on-disc bytes are still
     /// bus-encrypted and would decrypt to garbage. The bus key is derivable ONLY
     /// from the AACS host-certificate cert-auth handshake; a VID-only OEM unlock
-    /// path (which returns no bus key) is insufficient for such a disc. Surfaced
-    /// instead of silently producing a corrupt rip. NOT raised for AACS 1.0 BD
-    /// (no bus encryption, `read_data_key` legitimately absent) nor for
-    /// file-backed (ISO) scans, where bus encryption was already removed at read
-    /// time and no handshake runs.
+    /// path is insufficient for such a disc. Surfaced instead of silently
+    /// producing a corrupt rip. NOT raised for AACS 1.0 BD or file-backed (ISO)
+    /// scans, where no bus-key handshake runs. See docs/error-codes.md for detail.
     AacsBusKeyUnavailable,
 
     /// AACS 2.1 (FMTS) disc carries forensic variant segments, but no segment
@@ -699,12 +654,9 @@ pub enum Error {
     /// frames but its codec init data never appears, so buffering further would
     /// swap the box to death. Carries the buffered byte count.
     ///
-    /// DISTINCT from [`Error::MkvInvalid`] on purpose. `MkvInvalid` is what an
-    /// empty nav/menu PGC stub yields, and [`is_skippable_title_stub`] classifies
-    /// it as skippable — an all-titles rip drops that title and finishes the
-    /// rest. Hundreds of megabytes of real frames with unresolvable headers is
-    /// NOT a stub; reporting it as one silently dropped a main feature from a
-    /// rip that then exited successfully. This code is not skippable.
+    /// DISTINCT from [`Error::MkvInvalid`] (an empty nav/menu stub, skippable):
+    /// real frames with unresolvable headers is a main feature, not a stub.
+    /// This code is not skippable. See docs/error-codes.md for the history.
     MuxHeaderBufferExceeded {
         bytes: u64,
     },
@@ -793,13 +745,10 @@ pub enum Error {
     /// an error or before delivering the extents it was given — so it can
     /// never return another byte.
     ///
-    /// It exists because the alternative answer is a lie: a dead source
-    /// that reports `Ok(0)` is indistinguishable from end-of-stream, and
-    /// `DiscStream::fill_extents` legitimately reads a short count as a
-    /// skippable hole — zero-filling and advancing over every remaining
-    /// sector of the title and still returning success. Unlike a bad
-    /// sector, this condition cannot be retried at a smaller size or
-    /// skipped past, so every consumer must abort the pass on it.
+    /// It exists because `Ok(0)` from a dead source is indistinguishable from
+    /// end-of-stream, and callers may legitimately treat a short read as a
+    /// skippable hole. This cannot be retried or skipped past; every consumer
+    /// must abort the pass on it. See docs/error-codes.md for more.
     SourceTerminated,
     /// An MPEG-TS packet under construction violated the 188-byte fixed
     /// size (over-long adaptation field, overflowing payload, or a
@@ -1332,20 +1281,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// produced from an [`Error`], or `None` if it carries none.
 ///
 /// Public because consumers need the code itself, not just the yes/no
-/// predicates built on it below. `mux_stream` hands back an `io::Error`, and a
-/// front-end reporting *why* a title failed had no way to recover the code
-/// from it — the typed `Error` is gone by then and only the `E<code>` string
-/// prefix survives. Parsing that prefix is this function's job; every consumer
-/// re-implementing the parse is how the string-matching this crate spent 1.5.x
-/// removing comes back.
+/// predicates built on it below — parsing the `E<code>` prefix is this
+/// function's job, so callers don't reimplement it.
 ///
 /// [`From<Error> for io::Error`] is the ONLY path from a typed [`Error`] to an
-/// `io::Error` in this crate. It boxes the typed value as the payload
-/// (`io::Error::new(kind, e)`), whose [`Display`](std::fmt::Display) is the
-/// same `E<code>[: …]` string the stringifying version produced — so this
-/// parse is unaffected, and `From<io::Error> for Error` can additionally
-/// `downcast` the payload back to the exact typed error. Errors that did NOT
-/// come from this crate carry no `E<code>` prefix and yield `None`.
+/// `io::Error` in this crate; see docs/error-codes.md for the round-trip detail.
 pub fn error_code(e: &std::io::Error) -> Option<u16> {
     // Round-tripped: `From<Error> for io::Error` renders as "E<code>[: …]".
     let s = e.to_string();
@@ -1358,29 +1298,12 @@ pub fn error_code(e: &std::io::Error) -> Option<u16> {
 
 /// Whether a per-title mux failure is a *skippable title stub* — a
 /// copy-protected-but-uncrackable title ([`Error::CssKeyMissing`]) or a title
-/// that produced no muxable frames ([`Error::MkvInvalid`], an empty nav/menu
-/// PGC stub). An all-titles rip skips such a title and finishes the rest;
-/// every other error stays fatal.
+/// that produced no muxable frames ([`Error::MkvInvalid`]). An all-titles rip
+/// skips such a title and finishes the rest; every other error stays fatal.
 ///
-/// This replaces the CLI's `E7023`/`E6008` string-match with a typed check on
-/// the [`io::Error`](std::io::Error) `mux_stream` returns.
-///
-/// # Not skippable
-///
-/// A BROKEN input is not a stub. [`Error::MkvSourceInvalid`] (malformed or
-/// truncated `mkv://` source), [`Error::MkvLacingInvalid`], and
-/// [`Error::MkvUnencodable`] all used to be raised as [`Error::MkvInvalid`] and
-/// therefore landed in this set, so a corrupt source was reported as a title
-/// worth silently passing over by a run that then exited successfully. They now
-/// carry their own codes and are fatal here — as is
-/// [`Error::MuxHeaderBufferExceeded`].
-///
-/// Nor is a WHOLE-DISC key failure. [`Error::CssNoDiscKey`] (the disc's CSS
-/// crack recovered no key at all) is the same conflation on the decrypt axis:
-/// while it too was raised as [`Error::CssKeyMissing`], every title of an
-/// undecryptable disc classified as a skippable stub, so the rip loop skipped
-/// all of them and exited successfully. It is [`is_disc_level_no_key`]'s, and
-/// fatal here.
+/// NOT skippable: a broken `mkv://` source ([`Error::MkvSourceInvalid`] and
+/// siblings) or a whole-disc key failure ([`Error::CssNoDiscKey`], see
+/// [`is_disc_level_no_key`]). See docs/error-codes.md for why.
 pub fn is_skippable_title_stub(e: &std::io::Error) -> bool {
     matches!(error_code(e), Some(E_MKV_INVALID | E_CSS_KEY_MISSING))
 }
@@ -1396,27 +1319,12 @@ pub fn is_halt(e: &std::io::Error) -> bool {
 
 /// Whether an [`io::Error`](std::io::Error) is a **disc-level** key failure —
 /// the disc as a whole cannot be decrypted, so EVERY title will fail the same
-/// way. Distinct from a per-title skippable stub
-/// ([`is_skippable_title_stub`]): `E_NO_DISC_KEY` (keydb present but no entry
-/// for this disc), `E_KEYDB_LOAD` (no keydb at all), `E_AACS_NO_KEYS` (no
-/// usable AACS key material), and `E_CSS_NO_DISC_KEY` (the CSS crack recovered
-/// no title key for the disc at all) are all whole-disc conditions. A
-/// multi-title rip loop should stop immediately on this (fail-fast) rather than
-/// iterate every title re-printing the same error.
-///
-/// `E_CSS_NO_DISC_KEY` is the CSS side of exactly that split, and it exists
-/// because the disc-wide CSS failure used to be raised as the per-title
-/// [`E_CSS_KEY_MISSING`]: an undecryptable CSS disc landed in
-/// [`is_skippable_title_stub`], so the rip loop skipped all N titles with an
-/// "empty stub" notice and exited successfully.
-/// The key-SOURCE failures ([`E_KEY_SERVICE_UNAVAILABLE`],
-/// [`E_KEY_SERVICE_UNAUTHORIZED`], [`E_KEY_SERVICE_RATE_LIMITED`]) are here for
-/// the same fail-fast reason and NOT because they mean "no key": a service that
-/// is down, refusing the token, or throttling is down for every title on the
-/// disc, so iterating N titles re-issues N doomed requests (and, on 429, digs the
-/// rate-limit hole deeper). They are separate CODES precisely so the front-end
-/// can say "retry later" / "fix the token" instead of `E_NO_DISC_KEY`'s "no key
-/// source has a key for this disc".
+/// way. Distinct from a per-title skippable stub ([`is_skippable_title_stub`]).
+/// Covers `E_NO_DISC_KEY`, `E_KEYDB_LOAD`, `E_AACS_NO_KEYS`, `E_CSS_NO_DISC_KEY`,
+/// and the key-SOURCE failures (`E_KEY_SERVICE_UNAVAILABLE`/`UNAUTHORIZED`/
+/// `RATE_LIMITED`) — a down/throttled/unauthorized source fails every title too.
+/// A multi-title rip loop should fail fast rather than iterate. See
+/// docs/error-codes.md for why each code belongs here.
 pub fn is_disc_level_no_key(e: &std::io::Error) -> bool {
     matches!(
         error_code(e),
@@ -1475,16 +1383,12 @@ impl Error {
 
     /// True if the read SOURCE itself is gone, as opposed to one range of
     /// media being unreadable. Kept separate from
-    /// [`is_scsi_transport_failure`](Self::is_scsi_transport_failure) —
-    /// which is about the bus/bridge and drives "power-cycle the drive"
-    /// advice — because a terminated producer thread is neither a wedged
-    /// bridge nor a bad sector, and reporting it as SCSI status 0xFF would
-    /// be a fabricated status byte.
+    /// [`is_scsi_transport_failure`](Self::is_scsi_transport_failure) because a
+    /// terminated producer thread is neither a wedged bridge nor a bad sector.
     ///
-    /// What it shares with a transport failure is the only thing the read
-    /// loops need to know: retrying smaller or skipping ahead cannot
-    /// recover anything, so the pass must abort rather than fabricate
-    /// zeros for the rest of the title.
+    /// What it shares with a transport failure: retrying smaller or skipping
+    /// ahead cannot recover anything, so the pass must abort rather than
+    /// fabricate zeros for the rest of the title.
     pub fn is_source_terminated(&self) -> bool {
         matches!(self, Error::SourceTerminated)
     }
@@ -1506,23 +1410,14 @@ impl Error {
             && status != crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE
     }
 
-    /// True if the underlying SCSI failure is a *marginal read* — the
-    /// drive returned an error category in which smaller-granularity
-    /// retries can sometimes recover the data:
+    /// True if the underlying SCSI failure is a *marginal read* — the drive
+    /// returned an error category where smaller-granularity retries can
+    /// sometimes recover the data: MEDIUM ERROR (3), ABORTED COMMAND (B),
+    /// NOT READY (2), RECOVERED ERROR (1), or NO SENSE (0).
     ///
-    ///   - MEDIUM ERROR (sense key 3) — canonical bad-sector signal
-    ///   - ABORTED COMMAND (sense key B) — transient; retry usually works
-    ///   - NOT READY (sense key 2) — the dominant bad-sector response on
-    ///     the BU40N (ASC 0x04/ASCQ 0x3E); a pause + retry often recovers
-    ///   - RECOVERED ERROR (sense key 1) / NO SENSE (sense key 0) — not
-    ///     classified as fatal; treat as recoverable
-    ///
-    /// Returns `false` for transport failures (no sense data delivered),
-    /// HARDWARE ERROR, DATA PROTECT, UNIT ATTENTION, ILLEGAL
-    /// REQUEST, BLANK CHECK, kernel `IoError`, and any non-SCSI variant.
-    /// Caller-agnostic predicate — describes a property of the *error*,
-    /// not what one specific call site should do with it. Used by
-    /// `freemkv_engine::recovery::copy`'s hysteresis dispatch.
+    /// `false` for transport failures, HARDWARE ERROR, DATA PROTECT, UNIT
+    /// ATTENTION, ILLEGAL REQUEST, BLANK CHECK, `IoError`, and non-SCSI
+    /// variants. See docs/error-codes.md for BU40N specifics and callers.
     pub fn is_marginal_read(&self) -> bool {
         self.scsi_sense()
             .map(crate::scsi::ScsiSense::is_marginal)
@@ -1584,18 +1479,9 @@ mod tests {
         assert!(!is_skippable_title_stub(&cap));
     }
 
-    /// The two CSS no-key conditions must land on OPPOSITE sides of the
-    /// per-title / whole-disc split, and the AACS pair must keep doing the same.
-    ///
-    /// [`Error::CssNoDiscKey`] is the disc-wide verdict (the main feature's crack
-    /// failed, so every title fails identically) and belongs ONLY to
-    /// [`is_disc_level_no_key`], exactly like its AACS analogue
-    /// [`Error::NoDiscKey`]. [`Error::CssKeyMissing`] is the per-title verdict
-    /// (one VTS of a multi-VTS DVD could not be re-cracked) and belongs ONLY to
-    /// [`is_skippable_title_stub`], so an all-titles rip skips that title and
-    /// finishes the rest. While the disc-wide raise also used
-    /// `E_CSS_KEY_MISSING`, an uncrackable CSS disc was iterated title by title,
-    /// each one "skipped", and the run exited 0.
+    // The two CSS no-key conditions land on opposite sides of the per-title /
+    // whole-disc split (mirroring the AACS pair). See docs/error-codes.md for
+    // the incident that motivated the split.
     #[test]
     fn css_no_key_codes_split_disc_level_from_skippable() {
         let wide: std::io::Error = Error::CssNoDiscKey.into();
@@ -1830,10 +1716,9 @@ mod tests {
         );
     }
 
-    /// `Error::IoError` must round-trip back to the *original*
-    /// `io::Error` — preserving its `ErrorKind` and raw OS error —
-    /// rather than being flattened to `Other` with a stringified
-    /// message.
+    // `Error::IoError` must round-trip to the *original* `io::Error` —
+    // preserving `ErrorKind` and raw OS error — not flatten to `Other` with a
+    // stringified message.
     #[test]
     fn ioerror_roundtrips_preserving_kind_and_oscode() {
         use std::io::ErrorKind;
@@ -1885,33 +1770,8 @@ mod tests {
 
     // ── New comprehensive tests ────────────────────────────────────────────────
 
-    /// Every `pub const E_*` code declared in this file, as
-    /// `(name, value)`, PARSED OUT OF THE SOURCE at compile time.
-    ///
-    /// WHY THIS IS PARSED AND NOT LISTED. The uniqueness test below used to
-    /// carry a hand-maintained `vec![]` of the constants, with a doc comment
-    /// claiming it "pins all code assignments". It did not. At the time this
-    /// was written the file declared **127** `pub const E_*` and the vector
-    /// named **109** of them: eighteen codes — `E_DIR_IMAGE_FANOUT`,
-    /// `E_DIR_INSUFFICIENT_SPACE`, `E_DIR_MULTIPASS_REJECTED`,
-    /// `E_DIR_NAME_COLLISION`, `E_DIR_NAME_TOO_LONG`, `E_DIR_NOT_EMPTY`,
-    /// `E_DIR_RAW_REJECTED`, `E_DIR_SOURCE_UNSUPPORTED`, `E_DIR_WRITE_FAILED`,
-    /// `E_DRIVE_INQUIRY_SHORT`, `E_EMPTY_IMAGE`, `E_MP4_UNKNOWN_RESOLUTION`,
-    /// `E_SEAM_PLAN_DROPPED_MOST`, `E_SHORT_IMAGE_READ`, `E_SINK_WROTE_NOTHING`,
-    /// `E_SOURCE_TERMINATED`, `E_SYNC_TIMEOUT`, `E_SYNC_WORKER_LOST` — were
-    /// outside the guarantee entirely, so a new variant colliding with any of
-    /// them passed green. Worse, an earlier audit READ that doc comment and
-    /// trusted it while assigning new codes.
-    ///
-    /// The defect is not the eighteen omissions, it is that the list is
-    /// hand-maintained at all: adding a constant and forgetting the vector is
-    /// a silent no-op, which is the definition of a guarantee that decays.
-    /// Deriving the list from the declarations makes forgetting impossible —
-    /// the only way to escape the check is to stop declaring the constant.
-    ///
-    /// `include_str!` of this very file is the cheapest seam that does that:
-    /// no `build.rs`, no proc macro, no dependency, and — being `#[cfg(test)]`
-    /// — not one byte of the source embedded in a release build.
+    // Every `pub const E_*`, parsed from source (not hand-listed) so a new
+    // constant can't escape the uniqueness check below. See docs/error-codes.md.
     fn declared_error_codes() -> Vec<(&'static str, u16)> {
         const SRC: &str = include_str!("error.rs");
         SRC.lines()
@@ -1935,14 +1795,9 @@ mod tests {
             .collect()
     }
 
-    /// The parser above must actually FIND the declarations, and read their
-    /// values correctly. Without this, a `declared_error_codes` that returned
-    /// an empty vector would make the uniqueness test below pass vacuously —
-    /// exactly the failure mode (a guarantee that is really a no-op) this
-    /// whole change exists to remove.
-    ///
-    /// Mutation: a `strip_prefix` typo, an off-by-one in the name slice, or a
-    /// parser that drops the last line fails here.
+    // Guards against `declared_error_codes` silently returning empty (which
+    // would make the uniqueness test below pass vacuously). Mutation: a
+    // `strip_prefix` typo or off-by-one in the name slice fails here.
     #[test]
     fn declared_error_codes_parses_the_declarations_it_claims_to() {
         let declared = declared_error_codes();
@@ -1984,16 +1839,9 @@ mod tests {
         );
     }
 
-    /// Every published error code constant must be unique.
-    ///
-    /// The set is derived from the declarations by
-    /// [`declared_error_codes`], so — unlike the hand-kept vector this
-    /// replaced — a newly added constant is covered the moment it is
-    /// written, with no second edit to remember.
-    ///
-    /// Mutation: changing E_KEYDB_PARSE from 8004 to 8000 (duplicating
-    /// E_KEYDB_CONNECT) fails here, and so now does the same collision on any
-    /// of the eighteen codes the old hand-kept list had never heard of.
+    // Every published error code constant must be unique. Set is derived from
+    // `declared_error_codes` (not hand-kept) so new constants are covered
+    // automatically. Mutation: duplicating any code's value fails here.
     #[test]
     fn all_error_code_constants_are_unique() {
         let mut by_code: std::collections::BTreeMap<u16, Vec<&str>> =
@@ -2011,10 +1859,9 @@ mod tests {
         );
     }
 
-    /// Error code ranges match their documented category buckets.
-    /// E.g. all device codes are 1000–1999, all AACS codes are 7000–7999.
-    /// Mutation: accidentally shifting a constant out of its range (e.g. E_DEVICE_NOT_FOUND = 2000)
-    ///           breaks CLI range-based dispatch and logging.
+    // Error code ranges match their documented category buckets (e.g. device
+    // codes 1000-1999, AACS codes 7000-7999). Mutation: shifting a constant
+    // out of range breaks CLI range-based dispatch and logging.
     #[test]
     fn error_code_range_buckets_are_correct() {
         // Device (1xxx)
@@ -2156,13 +2003,9 @@ mod tests {
         }
     }
 
-    /// is_scsi_transport_failure is true for the 0xFF SCSI sentinel AND for the
-    /// non-SCSI dead-bus faults (Error::IoError from a failed ioctl(SG_IO),
-    /// Error::DeviceNotFound from a vanished fd) — but NEVER for a real SCSI
-    /// reply (CHECK CONDITION) or unrelated errors.
-    /// Mutation: testing against 0x02 (CHECK CONDITION) would wrongly mark CHECK
-    ///           CONDITION replies as transport failures; dropping the IoError/
-    ///           DeviceNotFound arm would let a dead bus zero-fill the disc.
+    // is_scsi_transport_failure is true for the 0xFF sentinel and non-SCSI
+    // dead-bus faults (IoError, DeviceNotFound), never for CHECK CONDITION.
+    // Mutation: dropping the IoError/DeviceNotFound arm lets a dead bus zero-fill.
     #[test]
     fn is_scsi_transport_failure_only_for_0xff() {
         use crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE;
@@ -2205,11 +2048,9 @@ mod tests {
         assert!(!Error::Halted.is_scsi_transport_failure());
     }
 
-    /// is_marginal_read returns true for MEDIUM ERROR (3), NOT READY (2),
-    /// ABORTED COMMAND (B), RECOVERED ERROR (1), NO SENSE (0).
-    /// Spec: comment on is_marginal_read lists these five sense keys.
-    /// Mutation: removing NOT_READY from the marginal set means BU40N "bad sector"
-    ///           responses are treated as fatal instead of retriable.
+    // is_marginal_read is true for sense keys MEDIUM ERROR(3), NOT READY(2),
+    // ABORTED COMMAND(B), RECOVERED ERROR(1), NO SENSE(0). Mutation: dropping
+    // NOT_READY treats BU40N "bad sector" responses as fatal instead of retriable.
     #[test]
     fn is_marginal_read_sense_key_coverage() {
         use crate::scsi::ScsiSense;
@@ -2257,11 +2098,9 @@ mod tests {
         }
     }
 
-    /// is_bridge_degradation returns true for a status byte that is not GOOD,
-    /// CHECK CONDITION, or TRANSPORT_FAILURE.
-    /// Spec: comment says "bridge firmware returns non-standard status bytes
-    ///       (e.g. 0x04, 0x05) with empty sense data."
-    /// Mutation: checking only for 0x04 misses 0x05 and other degradation bytes.
+    // is_bridge_degradation is true for any status byte that isn't GOOD, CHECK
+    // CONDITION, or TRANSPORT_FAILURE (bridge firmware returns non-standard
+    // bytes like 0x04/0x05). Mutation: checking only 0x04 misses 0x05 etc.
     #[test]
     fn is_bridge_degradation_detects_non_standard_status() {
         use crate::scsi::{

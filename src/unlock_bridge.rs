@@ -88,13 +88,8 @@ pub(crate) fn map_host_certs(certs: &[crate::aacs::types::HostCert]) -> Vec<fu::
         .collect()
 }
 
-/// Result of a capability dispatch: `(matched_name, result)`. `matched_name` is
-/// the unlocker that handled it (or `""` if none did) — lets the caller record
-/// WHICH unlocker ran (e.g. `MT1959` vs `Renesas`), distinct from the ld-only
-/// identity lookup [`unlocker_name`]. Iterating stops at the first unlocker whose
-/// capability method returns anything other than `NotApplicable` — i.e. an actual
-/// unlock (`Ok`) OR a real failure such as a dead bus (`Err(Transport)`), which
-/// the caller must surface rather than skip.
+// See docs/unlock-bridge.md — Dispatch = (matched_name, result); matched_name
+// records WHICH unlocker ran, distinct from the identity-only unlocker_name().
 type Dispatch = (
     &'static str,
     std::result::Result<fu::Unlocked, fu::UnlockError>,
@@ -154,11 +149,8 @@ pub(crate) fn run_bus(
     })
 }
 
-/// The names of every REGISTERED unlocker, in dispatch order. Registry-driven —
-/// sourced from `all_unlockers()`, so adding/removing an unlocker updates every
-/// report with no other change (no hardcoded names). The per-unlocker "did it
-/// run this rip" outcome is computed by the caller, which has the disc + drive
-/// runtime state this crate cannot see.
+// See docs/unlock-bridge.md — names of every registered unlocker, in dispatch
+// order; registry-driven so adding/removing an unlocker needs no other change.
 pub(crate) fn unlocker_names() -> Vec<&'static str> {
     fu::all_unlockers().iter().map(|u| u.name()).collect()
 }

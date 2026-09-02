@@ -1,17 +1,16 @@
 //! DVD-Video VM command decoder.
 //!
 //! An 8-byte navigation command as found in PGC command tables (pre/post/cell)
-//! and PCI button info. Decoded per the DVD-Video VM instruction set and
-//! verified against real discs.
+//! and PCI button info. Decoded per the DVD-Video VM instruction set.
 //!
 //! Bit model: the 8 bytes are a big-endian 64-bit word. `byte0` bits 7-5 are the
 //! command **type**; for type 1, `byte0` bit 4 selects Link (0) vs Jump (1), and
 //! `byte1` bits 3-0 are the sub-command. Compare predicates live in `byte1`
 //! bits 6-4 with the operands in bytes 2-5.
-//!
-//! This module is pure decode + a register model — no I/O, no English (numeric
-//! semantics only), matching libfreemkv conventions. The navigation *executor*
-//! and IFO/PCI parsing build on top of this.
+
+// Decoding verified against real discs. Pure decode + register model — no I/O,
+// no English (numeric semantics only). The navigation executor and IFO/PCI
+// parsing build on top of this.
 
 /// A decoded navigation instruction. Only the variants freemkv's start-point
 /// resolver needs are modelled explicitly; everything else is [`Instr::Other`].

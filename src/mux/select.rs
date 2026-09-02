@@ -1,18 +1,11 @@
 //! Per-title audio/subtitle stream selection — the pure primitive.
 //!
-//! The demux pipeline is **declaration-driven**: every demux table
-//! (`build_demux_state` in `mux/resolve.rs`, `DiscStream::new` in `mux/disc.rs`)
-//! is built from the input [`DiscTitle`]'s `streams` list, and the MKV writer
-//! builds its track headers + `codec_privates` from that same list. A PID not
-//! declared there is never tracked, extracted, or written. So "which streams to
-//! keep" is already a capability of the pipeline — it just has no public knob.
+//! [`StreamSelection::apply`] prunes `DiscTitle.streams` (video always kept)
+//! BEFORE the mux path finalizes the title, so track headers, `codec_privates`,
+//! PID routing, and frame emission all follow from the pruned list by
+//! construction. Language-agnostic: PIDs, not languages.
 //!
-//! [`StreamSelection::apply`] is that knob: prune the `DiscTitle.streams` list
-//! (video always kept) BEFORE the mux path finalizes the title, and everything
-//! downstream — track headers, `codec_privates`, PID routing, frame emission —
-//! follows from the pruned list by construction, with zero scattered PID
-//! checks. This is language-agnostic: PIDs, not languages (the language→PID
-//! mapping is the caller's/engine's policy).
+//! See docs/mux-select.md — declaration-driven pipeline rationale.
 
 use crate::disc::{DiscTitle, Stream};
 use crate::error::{Error, Result};
@@ -46,19 +39,15 @@ impl StreamSelection {
         matches!(self.audio, PidFilter::All) && matches!(self.subtitle, PidFilter::All)
     }
 
+    // See docs/mux-select.md — codec_privates lockstep & fail-loud rationale.
     /// Prune `title.streams` in place: keep every [`Stream::Video`]
     /// unconditionally; keep an [`Stream::Audio`]/[`Stream::Subtitle`] iff its
-    /// PID passes the corresponding [`PidFilter`]; drop the rest. Declared order
-    /// is preserved. The parallel `codec_privates` vec is pruned in lockstep
-    /// when it is populated (it is empty on a freshly-scanned title, non-empty
-    /// only if a caller pre-filled it) — by index, whatever its length, since it
-    /// is consumed positionally and a partial prune would attach the wrong
-    /// codec-private to a retained track.
+    /// PID passes the corresponding [`PidFilter`]; drop the rest. Declared
+    /// order is preserved. The parallel `codec_privates` vec is pruned in
+    /// lockstep, by index, when populated.
     ///
-    /// Errors [`Error::SelectionPidUnknown`] if a filter lists a PID that does
-    /// not exist in `title.streams` — a caller bug (e.g. a stale scan). Fail
-    /// loud rather than silently emit an MKV missing a requested track. On
-    /// error the title is left unmodified.
+    /// Errors [`Error::SelectionPidUnknown`] if a filter lists a PID absent
+    /// from `title.streams`; the title is left unmodified on error.
     pub fn apply(&self, title: &mut DiscTitle) -> Result<()> {
         if self.is_all() {
             return Ok(());
@@ -313,15 +302,9 @@ mod tests {
         );
     }
 
-    /// A `codec_privates` vec that is NOT exactly stream-length must still be
-    /// pruned in lockstep. `m2ts.rs::create` documents a longer-than-streams vec
-    /// as a benign shape ("ignore any trailing entries that exceed the track
-    /// count"), and the vec is consumed positionally, so skipping the prune left
-    /// `codec_privates[i]` describing a stream that is no longer at index `i`.
-    ///
-    /// Regression: with one trailing extra entry the prune was skipped entirely
-    /// and index 1 — the retained `fra` audio — resolved to `eng`'s record, so
-    /// the muxer attached the wrong codec-private to the track. No error, no log.
+    // codec_privates longer than streams must still prune in lockstep by index
+    // (regression: a trailing extra entry once skipped the prune, misattaching
+    // codec-private to the wrong track). See docs/mux-select.md.
     #[test]
     fn apply_prunes_codec_privates_even_when_length_does_not_match_streams() {
         let mut t = title();
@@ -352,12 +335,9 @@ mod tests {
             "the two positional vecs must be aligned after apply()"
         );
     }
-    /// A PID listed in the WRONG class's filter must fail loud, not validate and
-    /// then quietly vanish. Validation used to scan both audio and subtitle
-    /// streams, so an audio filter naming a subtitle PID passed — and `keeps`
-    /// then matched it against audio streams only, dropping the requested track
-    /// from the output with no error. That defeats the documented "fail loud
-    /// rather than silently emit an MKV missing a requested track" contract.
+    // A PID in the wrong class's filter must fail loud, not silently vanish
+    // (validation once scanned both classes, letting it pass then get dropped
+    // by `keeps`). See docs/mux-select.md.
     #[test]
     fn a_pid_listed_in_the_wrong_class_filter_is_rejected() {
         let mut t = title();

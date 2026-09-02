@@ -1,18 +1,11 @@
 //! Fox — loose `/BDMV/JAR/<id>/dcx.xml` plain-XML manifest.
 //!
-//! Older Fox authoring (e.g. a real Fox release, `/BDMV/JAR/05001/dcx.xml`) ships a
-//! human-readable XML manifest alongside the BD-J jar. Its root is `<dcx>`, and
-//! under `<disc>` it lists every playlist the disc plays. The main-feature
-//! playlists carry nested per-stream `<audio>`/`<subtitle>` elements naming
-//! language, editorial purpose and forced/SDH state outright — everything a
-//! label parser wants, in attributes, with no bytecode to walk.
-//!
-//! NOT A SPECIFICATION. `/BDMV/JAR/` is application-defined space, so this file
-//! is one authoring house's internal metadata that happens to press onto the
-//! disc. Every field meaning below was read off a real disc; treat an
-//! unfamiliar value as unknown rather than guessing.
-//!
-//! Confirmed schema (a real Fox release, `/BDMV/JAR/05001/dcx.xml`):
+//! Root `<dcx><disc>` lists playlists; the feature playlist's nested
+//! `<audio>`/`<subtitle>` elements name language, purpose and forced/SDH
+//! state directly, with no bytecode to decode. NOT A SPECIFICATION — this is
+//! one authoring house's internal metadata; every field meaning was read off
+//! a real disc. See docs/fox.md for the full field mapping, confirmed
+//! schema, and feature-playlist scoping rationale.
 //!
 //! ```xml
 //! <dcx>
@@ -34,25 +27,6 @@
 //!   </disc>
 //! </dcx>
 //! ```
-//!
-//! Field meanings (read off the disc, not documented):
-//!   * `<audio type>`: `feature` = a normal program track; `rnib` = a
-//!     descriptive/narration track ("Royal National Institute of Blind People"
-//!     described-video), mapped to [`LabelPurpose::Descriptive`]. A `type`
-//!     containing "comment" maps to [`LabelPurpose::Commentary`].
-//!   * `<subtitle form>`: `sdh` marks a subtitles-for-the-deaf-and-hard-of-
-//!     hearing track ([`LabelQualifier::Sdh`]).
-//!   * `<subtitle type>`: `embed` marks a dedicated forced/embedded-subtitle
-//!     track ([`LabelQualifier::Forced`]); `feature`/`text` are full tracks.
-//!   * `id` on a nested stream is its 1-based STN slot WITHIN ITS TYPE
-//!     (audio ids 01..N, subtitle ids 01..N independently), matching the vendor
-//!     `stream_number` convention the ordinal binder in [`super::apply_labels`]
-//!     reads.
-//!
-//! The `<audio>`/`<subtitle>` elements are NESTED inside one feature playlist,
-//! so extraction is scoped to a single `<playlist name="feature">` element —
-//! never a document-wide `<audio>` scan, which would merge the regional
-//! `00800` (eng) and `00801` (jpn) tables into one and collide their slots.
 
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, xml};
 use crate::sector::SectorSource;
@@ -60,16 +34,13 @@ use crate::udf::UdfFs;
 
 /// Detect a Fox disc.
 ///
-/// Primary, cheap signal: a loose `dcx.xml` under some `/BDMV/JAR/<id>/`
-/// subdirectory — the manifest [`parse`] reads. Checked first because it is a
-/// directory walk with no sector reads.
+/// Primary signal: a loose `dcx.xml` under `/BDMV/JAR/<id>/` (the manifest
+/// [`parse`] reads), checked first as a cheap directory walk.
 ///
-/// Secondary signal: a `com/foxbd/` prefix in a top-level BD-J jar, which newer
-/// Fox discs (later franchise sequels) carry instead of a loose `dcx.xml`. Recognising
-/// it attributes the disc to Fox rather than the generic deluxe stub even
-/// though [`parse`] cannot decode that bytecode form yet (see the Phase 2 note
-/// at the bottom of this file); such a disc detects here but yields no labels,
-/// so a lower-confidence parser still wins.
+/// Secondary signal: a `com/foxbd/` prefix in a top-level BD-J jar (newer Fox
+/// discs ship no loose `dcx.xml`). This attributes the disc to Fox even
+/// though [`parse`] cannot decode that bytecode form yet — see the Phase 2
+/// note at the bottom of this file.
 pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     if super::jar_file_exists(udf, "dcx.xml") {
         return true;
@@ -102,12 +73,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     Some(result)
 }
 
-/// Build the stream labels from a `dcx.xml` document. Split out from [`parse`]
-/// so the schema mapping is unit-testable without a `SectorSource`/`UdfFs`.
-///
-/// Scoped to ONE feature playlist element (see the module note): the richest
-/// `<playlist name="feature">`. Its nested `<audio>`/`<subtitle>` children are
-/// the vendor's STN table for that title.
+// Build stream labels from a `dcx.xml` doc; split out from `parse` for unit
+// testing. Scoped to the richest `<playlist name="feature">` element — see
+// docs/fox.md for why merging playlists is wrong.
 pub(crate) fn labels_from_dcx(text: &str) -> Vec<StreamLabel> {
     let Some(feature) = select_feature_playlist(text) else {
         return Vec::new();
@@ -175,16 +143,9 @@ pub(crate) fn labels_from_dcx(text: &str) -> Vec<StreamLabel> {
     labels
 }
 
-/// Pick the disc's primary feature playlist element (the full `<playlist ...>
-/// ... </playlist>` text). Among all `<playlist name="feature">` elements —
-/// Fox presses one per regional variant (`00800` eng, `00801` jpn) — the one
-/// carrying the most `<audio>`/`<subtitle>` streams wins, ties to the first.
-///
-/// Returning ONE element is the whole point: each feature playlist is its own
-/// STN table with its own 1-based slot ids, so merging two would put two
-/// different streams on slot `01`. The richest table is the fullest label set
-/// and anchors to its matching title by language sequence in
-/// [`super::apply_labels`].
+// Pick the richest `<playlist name="feature">` element (ties to first) —
+// Fox presses one per regional variant. Returning ONE avoids merging two
+// STN tables. See docs/fox.md for full rationale.
 fn select_feature_playlist(text: &str) -> Option<&str> {
     let mut best: Option<&str> = None;
     let mut best_streams = 0usize;
@@ -235,10 +196,9 @@ fn count_elements(element: &str, tag: &str) -> usize {
     n
 }
 
-/// Parse a nested stream `id` (e.g. "01", "11") into its 1-based STN slot.
-/// Digits only, so a stray quote/space cannot poison it; `None` (skip the
-/// stream) when it names no slot — 0 is the module's `NO_STN_SLOT` sentinel and
-/// cannot be bound by the ordinal path.
+// Parse a nested stream `id` into its 1-based STN slot; digits only. `None`
+// when it names no slot — 0 is the module's NO_STN_SLOT sentinel, not
+// bindable by the ordinal path.
 fn stream_number_from_id(id: &Option<String>) -> Option<u16> {
     let id = id.as_deref()?;
     let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
@@ -258,10 +218,9 @@ fn audio_purpose(ty: &str) -> LabelPurpose {
     }
 }
 
-/// Map a `<subtitle>`'s `form`/`type` to a [`LabelQualifier`]. `form="sdh"`
-/// takes precedence (an SDH track is the editorially meaningful flag);
-/// otherwise `type="embed"` is a dedicated forced/embedded track. `feature`
-/// and `text` full tracks carry no qualifier.
+// Map subtitle `form`/`type` to a LabelQualifier: `form="sdh"` takes
+// precedence; else `type="embed"` is forced; `feature`/`text` carry no
+// qualifier.
 fn subtitle_qualifier(ty: &str, form: &str) -> LabelQualifier {
     if form == "sdh" {
         LabelQualifier::Sdh
@@ -285,12 +244,9 @@ fn normalize_language(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A real Fox-release manifest, reduced only by truncating the giant
-    /// chapter-mark `<properties>` blocks (which carry no stream labels). Every
-    /// `<audio>`/`<subtitle>` element and both regional feature playlists are
-    /// verbatim from a real disc's `/BDMV/JAR/05001/dcx.xml`, so this fixture exercises the
-    /// exact bytes production sees: feature selection across two `name="feature"`
-    /// playlists, the nested-scope rule, and the rnib/sdh/embed flags.
+    // Real Fox-release manifest, reduced only by truncating chapter-mark
+    // `<properties>` blocks. Verbatim `/BDMV/JAR/05001/dcx.xml` audio/subtitle
+    // data exercising feature selection, scoping, and rnib/sdh/embed flags.
     const FOX_DCX_SAMPLE: &str = r#"<dcx>
 	<disc>
 		<properties region="ABC" regioncheckon="false" parentallevel="PG" hdronlydisc="true" bootstrap.bdjo="88888"
@@ -436,10 +392,9 @@ mod tests {
         );
     }
 
-    /// The nested-scope rule: audio/subtitle come from ONE feature playlist,
-    /// never a document-wide scan that would merge 00800 and 00801 and collide
-    /// their `id="01"` slots. If scoping regressed, slot 1 audio would appear
-    /// twice and the count would jump past 11.
+    // Nested-scope rule: audio/subtitle come from ONE feature playlist, never
+    // a document-wide scan merging 00800/00801 id="01" slots. Regression
+    // would double slot-1 audio and push the count past 11.
     #[test]
     fn does_not_merge_regional_feature_playlists() {
         let labels = labels_from_dcx(FOX_DCX_SAMPLE);
@@ -486,12 +441,9 @@ mod tests {
         assert_eq!(stream_number_from_id(&Some("".into())), None);
     }
 
-    // ── Negative detection ─────────────────────────────────────────────────
-
-    /// A document that is not a Fox feature manifest yields no labels. Three
-    /// shapes: empty, a `<dcx>` whose playlists are all non-feature menu/logo
-    /// clips (no `name="feature"`), and unrelated XML. None must be mistaken
-    /// for a Fox feature table.
+    // ── Negative detection: a non-Fox-feature document yields no labels —
+    // empty, all-menu/logo playlists (no name="feature"), and unrelated XML,
+    // none mistaken for a feature table.
     #[test]
     fn non_feature_manifest_yields_no_labels() {
         assert!(labels_from_dcx("").is_empty());

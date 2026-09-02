@@ -1,18 +1,13 @@
 //! MPEG-1/2/2.5 audio (MP1/MP2/MP3) decodability gate.
 //!
-//! Per ISO/IEC 11172-3 / ISO/IEC 13818-3, an MPEG-audio frame is validated by
-//! header sanity + framing resync, not a payload CRC (the optional 16-bit CRC in
-//! the header protects only the side-information and is absent unless the
-//! protection bit says otherwise). The gate mirrors that header-only check and
-//! ACCEPTS free-format (`bitrate_index == 0`) as a legal decodable mode — it
-//! deliberately does NOT apply the stricter free-format reject that a full
-//! decoder would (see the note at the `bitrate_index` check). So the gate rejects
-//! only the truly invalid headers: a packet that begins with the 11-bit
-//! MPEG-audio sync but whose version / layer / sample-rate fields (or the
-//! reserved bitrate index 15) are reserved/invalid is undecodable → drop it (a
-//! silence gap; each packet keeps its own PTS). A packet with no leading sync is
-//! not a frame we can validate (raw payload / continuation), so it passes through
-//! unchanged — never false-dropped.
+//! Validates header sanity + framing resync per ISO/IEC 11172-3 / ISO/IEC
+//! 13818-3, not a payload CRC. ACCEPTS free-format (`bitrate_index == 0`) as a
+//! legal decodable mode (see `mpa_verdict`'s doc). Rejects only truly invalid
+//! headers (bad version / layer / sample-rate / reserved bitrate index 15) →
+//! dropped as a silence gap, each packet keeping its own PTS. A packet with no
+//! leading sync passes through unchanged — never false-dropped.
+//!
+//! See docs/mpegaudio.md for the CRC and free-format-reject rationale.
 
 use super::dropgate::DropTally;
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
@@ -28,11 +23,9 @@ enum MpaVerdict {
     Invalid,
 }
 
-/// Header-only validity check per ISO/IEC 11172-3 / ISO/IEC 13818-3 (which
-/// ACCEPTS free-format, `bitrate_index == 0`) — deliberately NOT the stricter
-/// free-format reject a full decoder applies. A dropped MPEG-audio frame has a
-/// corrupt header, so no duration is computed (the fields it would come from are
-/// the invalid ones).
+// Header-only check (ISO/IEC 11172-3 / 13818-3); ACCEPTS free-format
+// (bitrate_index == 0), NOT the stricter reject a full decoder applies. A
+// dropped frame's header is corrupt, so no duration is computed.
 fn mpa_verdict(data: &[u8]) -> MpaVerdict {
     if data.len() < 4 {
         return MpaVerdict::NoSync;
@@ -182,11 +175,9 @@ mod tests {
         );
     }
 
-    /// Same contract as the ADTS gate: an MPEG-audio frame is dropped because
-    /// its header is invalid, and the header is exactly where a frame duration
-    /// (samples-per-frame for the layer, divided by the sampling rate) would
-    /// have to come from — see `mpa_verdict`'s doc comment. So the drop's
-    /// duration is reported as zero, not derived from rejected fields.
+    // Same contract as ADTS: header is invalid → frame duration (which would
+    // come from the header) is unavailable, so drop duration is reported as
+    // zero, not derived/guessed.
     #[test]
     fn dropped_frames_are_counted_but_their_duration_is_not_invented() {
         let mut parser = MpegAudioParser::new();
@@ -287,14 +278,9 @@ mod tests {
         );
     }
 
-    /// This parser is self-framing at PES granularity: `parse` emits (or drops)
-    /// every packet immediately and buffers nothing, so end-of-stream has
-    /// nothing left to hand over. A `flush` that manufactured a frame would
-    /// append a zero-length block at PTS 0 AFTER a track that has already run to
-    /// its real end — a Matroska Block whose timestamp jumps backwards past every
-    /// cluster before it (RFC 9559 §5.1.3.2 Blocks are relative to their
-    /// cluster's timestamp; a phantom 0 lands in the wrong cluster entirely) and
-    /// an empty audio frame no decoder can consume.
+    // Self-framing at PES granularity: parse emits/drops immediately, buffers
+    // nothing, so end-of-stream has nothing left to hand over.
+    // See docs/mpegaudio.md — flush-no-phantom-frame rationale.
     #[test]
     fn flush_adds_no_phantom_frame_after_the_last_real_packet() {
         let mut p = MpegAudioParser::new();
@@ -319,11 +305,9 @@ mod tests {
         assert_eq!(emitted.len() + tail.len(), 2);
     }
 
-    /// The text guard in `codec/mod.rs` scans for a literal `source: None` and
-    /// cannot see a parser that writes `source: facts.source` where the facts
-    /// carry no offset. Only a runtime check proves an emitted frame really
-    /// carries the byte it was read from, and without it a multi-clip title
-    /// places this track by timestamp inference instead of by byte.
+    // The `codec/mod.rs` text guard can't see `source: facts.source`; only a
+    // runtime check proves an emitted frame carries the byte it was read from
+    // (needed for multi-clip placement by byte, not timestamp inference).
     #[test]
     fn an_emitted_frame_carries_the_packets_source_offset() {
         let mut p = MpegAudioParser::new();

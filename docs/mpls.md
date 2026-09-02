@@ -211,6 +211,12 @@ libfreemkv's `Disc::scan()` reads every MPLS file from the disc and builds a `Ti
 
 The resulting `Title` struct contains everything needed to rip: streams, duration, byte size, and the sector extents to read from disc.
 
+## STN Table Secondary Block Alignment (test coverage note)
+
+The `full_stn_table_block_alignment` unit test exercises every STN category at once, with DISTINCT counts, so no count byte can be read from a neighbour's offset without changing the result.
+
+Each secondary block is followed by its reference block(s), which per the BD STN table are `num_refs(1) + reserved(1) + one byte per ref + one padding byte when the ref count is odd`. The test sets every ref count to 1 — the value that distinguishes `n % 2` (=1) from `n / 2` (=0) — so a wrong skip length misaligns the cursor and every following stream decodes from the wrong offset. IG entries are consumed to keep the cursor aligned but never retained.
+
 ## References
 
 - BD-ROM Part 3, Section 5.3: PlayList file format

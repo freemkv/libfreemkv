@@ -1,13 +1,7 @@
-//! Stream-based I/O pipeline.
+//! Stream-based I/O pipeline. Two muxer families live here:
 //!
-//! Two muxer families live here:
-//!
-//! 1. **Bidirectional PES streams** (`disc`, `mkv`, `m2ts`, `network`,
-//!    `stdio`, `null`) implement the [`crate::pes::Stream`] interface:
-//!    read a format → PES frames, or write PES frames → a format.
-//! 2. **Write-only sequential-sink muxers** (`fmp4`, `hevc`,
-//!    `m2ts_mux`) consume PES frames and write a container to a
-//!    `SequentialSink`; they do not implement the read loop below.
+//! 1. **Bidirectional PES streams** (`disc`, `mkv`, `m2ts`, `network`, `stdio`, `null`) implement the [`crate::pes::Stream`] interface: read a format → PES frames, or write PES frames → a format.
+//! 2. **Write-only sequential-sink muxers** (`fmp4`, `hevc`, `m2ts_mux`) consume PES frames and write a container to a `SequentialSink`; they do not implement the read loop below.
 //!
 //! The bidirectional family is driven like this:
 //!
@@ -77,12 +71,8 @@ pub(crate) mod stdio;
 pub(crate) mod timeline;
 pub(crate) mod ts;
 pub(crate) mod tsmux;
-/// Reusable, pure-data per-picture video index (the FVI logical model) consumed
-/// by the [`fvi_sink`]. Serialization-independent. `#[allow(dead_code)]`: the
-/// `VideoMap` accumulator is a standalone primitive staged for the side-channel
-/// (mux-while-indexing) reuse described in its module doc; the `fvi://` sink
-/// today builds `PictureRecord`s directly, so the accumulator is covered only by
-/// its own unit tests until that wiring lands.
+// Per-picture video index (FVI model) consumed by fvi_sink; pure data, serialization-independent.
+// See docs/videomap.md — why the VideoMap accumulator is allow(dead_code) for now.
 #[allow(dead_code)]
 pub(crate) mod videomap;
 

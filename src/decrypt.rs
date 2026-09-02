@@ -1,35 +1,12 @@
-//! Decrypt-on-read layer.
+//! Decrypt-on-read layer. Decrypts sectors in-place using resolved keys
+//! from disc scanning; handles AACS 1.0/2.0 and CSS transparently, and
+//! the caller never sees encrypted data unless explicitly bypassed.
 //!
-//! Decrypts sectors in-place using resolved keys from disc scanning.
-//! Handles AACS 1.0, AACS 2.0, and CSS transparently.
-//! The caller never sees encrypted data unless explicitly bypassed.
-//!
-//! ## Parallel AACS decrypt
-//!
-//! Each AACS aligned unit (6144 bytes) is decrypted INDEPENDENTLY of
-//! every other unit — per-unit key derivation from the unit_key plus
-//! the unit's own first-16-byte header. There is no cross-unit
-//! dependency, so a buffer of N units can be decrypted on N threads
-//! in parallel via a persistent rayon thread pool.
-//!
-//! Small buffers (< [`PARALLEL_MIN_UNITS`] units) fall through to the
-//! serial path to avoid pool dispatch overhead beating the per-unit
-//! AES work.
-//!
-//! ## Thread-count configuration — three layers
-//!
-//! Resolution order (highest wins):
-//! 1. The most recent [`set_decrypt_threads`] call with `n > 0`.
-//!    Calling this *replaces* the live thread pool — useful for a
-//!    settings-page slider in a long-running daemon.
-//! 2. `FREEMKV_THREADS` env var, if set and `> 0`. Single knob
-//!    covering decrypt today, intended to also drive any future
-//!    input-side / output-side worker pools.
-//! 3. Default: all available cores. Algorithm optimisation comes
-//!    first — we measure single-thread performance to find serial
-//!    bottlenecks before throwing parallelism at it — but once a
-//!    pool is engaged we use the whole box. Hard cap at
-//!    [`MAX_THREADS`] (rayon stack memory).
+//! AACS aligned units decrypt independently, so buffers of at least
+//! [`PARALLEL_MIN_UNITS`] units parallelize across a rayon pool; smaller
+//! buffers use the serial path. Thread count resolves from
+//! [`set_decrypt_threads`], else `FREEMKV_THREADS`, else all cores
+//! (capped at [`MAX_THREADS`]). See docs/decrypt.md for detail.
 
 use crate::aacs;
 use crate::css;
@@ -51,11 +28,9 @@ pub const MAX_THREADS: usize = 64;
 /// order.
 static DECRYPT_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-/// Current rayon pool. `RwLock<Option<Arc<...>>>` so that
-/// [`set_decrypt_threads`] can swap the pool out without leaking the
-/// old one and without blocking ongoing decrypt work (in-flight calls
-/// hold an `Arc` clone via [`decrypt_pool`] and finish on the old
-/// pool; new calls pick up the new pool).
+// Current rayon pool. `set_decrypt_threads` swaps it without leaking the
+// old one; in-flight calls hold their own `Arc` via `decrypt_pool` and
+// finish on it. See docs/decrypt.md — DECRYPT_POOL.
 static DECRYPT_POOL: RwLock<Option<Arc<rayon::ThreadPool>>> = RwLock::new(None);
 
 /// Configure how many threads to use for AACS unit decryption. A value
@@ -63,12 +38,9 @@ static DECRYPT_POOL: RwLock<Option<Arc<rayon::ThreadPool>>> = RwLock::new(None);
 /// `N > 1` builds a new rayon pool of size N (capped at [`MAX_THREADS`])
 /// and atomically replaces the live pool.
 ///
-/// Thread-safe. Live decrypt calls keep their previously-acquired
-/// pool reference for the rest of the call — no mid-call pool
-/// switch. Subsequent calls see the new pool.
-///
-/// Pool construction is ~ms-scale; safe to call from a settings POST
-/// handler.
+/// Thread-safe. Live decrypt calls keep their previously-acquired pool
+/// reference for the call; subsequent calls see the new pool. Pool
+/// construction is ~ms-scale; safe to call from a settings POST handler.
 pub fn set_decrypt_threads(n: usize) {
     let clamped = n.min(MAX_THREADS);
     DECRYPT_THREADS.store(clamped, Ordering::Relaxed);
@@ -79,13 +51,9 @@ pub fn set_decrypt_threads(n: usize) {
     *guard = None;
 }
 
-/// Get (or lazily build) the active rayon thread pool. Returns an
-/// `Arc` so in-flight work survives a concurrent
-/// [`set_decrypt_threads`] swap.
-///
-/// Returns `None` if the pool cannot be built (e.g. the OS refuses the
-/// worker threads under a pid/thread limit). The caller falls back to
-/// the serial decrypt path — library code never panics here.
+// Get (or lazily build) the pool; `Arc` so in-flight work survives a
+// concurrent `set_decrypt_threads` swap. `None` if unbuildable (e.g. OS
+// thread limit) — caller falls back to serial. See docs/decrypt.md.
 fn decrypt_pool() -> Option<Arc<rayon::ThreadPool>> {
     // Fast path: pool already built. A poisoned read lock still yields a
     // usable guard (the pool Arc is immutable once stored).
@@ -182,19 +150,9 @@ pub enum Phase {
     Odd,
 }
 
-/// Does this unit belong to the phase we hold the key for?
-///
-/// An FMTS forensic segment interleaves two variants at the unit level: the
-/// disc carries both, and we hold the key for exactly one parity. Decrypting
-/// the alternate half with our key produces garbage; leaving it as ciphertext
-/// is correct, because the muxer drops untouched ciphertext cleanly.
-///
-/// `Phase::All` means the whole range is ours (the non-forensic case).
-///
-/// This lived inline inside `apply_aacs_map`'s per-unit closure, where nothing
-/// could reach it: a mutation run flipped the `-` to `+` and the `/` to `*` in
-/// the index arithmetic and every test still passed. Getting either wrong
-/// silently decrypts the wrong half of a forensic segment.
+// Does this unit belong to the phase we hold the key for? `Phase::All`
+// means the whole range is ours; a wrong index gets the wrong half.
+// See docs/decrypt.md — unit_is_our_phase.
 fn unit_is_our_phase(unit_lba: u32, range_start: u32, unit_sectors: u32, phase: Phase) -> bool {
     let want_odd = match phase {
         Phase::All => return true,
@@ -208,30 +166,15 @@ fn unit_is_our_phase(unit_lba: u32, range_start: u32, unit_sectors: u32, phase: 
     (unit_ix % 2 == 1) == want_odd
 }
 
-/// Proactive AACS key-selection map: which held unit key decrypts each LBA of a
-/// title's encrypted content, decided ONCE before mux from the disc's CPS-unit
-/// (and, later, FMTS segment) structure — never by trial-decrypt-and-check per
-/// unit at mux time.
+/// Proactive AACS key-selection map: which held unit key decrypts each LBA of
+/// a title's encrypted content, decided ONCE before mux from the disc's
+/// CPS-unit (and, later, FMTS segment) structure — never by
+/// trial-decrypt-and-check per unit at mux time. Ends the mux "key-server
+/// storm" caused by that per-unit re-derivation. See docs/decrypt.md.
 ///
-/// This is the pivot that ends the mux "key-server storm": the old path decrypts
-/// a unit, checks whether the plaintext looks like clean MPEG-TS, and — because
-/// authored-bad content never reaches that bar — concludes "wrong key, fetch a
-/// fresh one" and re-asks the key service for units it already holds the correct
-/// key for. There is NO per-unit byte pattern that separates "correctly decrypted
-/// but authored-bad" from "still encrypted", so that check is unanswerable. The
-/// map removes the question: we resolve one key per CPS unit / segment up front
-/// (see `resolve_mux_key_map`), record which LBA ranges each covers, and at mux
-/// time simply "decrypt this LBA with key K" and trust it — bad TS is the muxer's
-/// concern, exactly as for a physically-read clear disc.
-///
-/// Ranges are `[start_lba, end_lba)` → index into the `Aacs { unit_keys }` pool,
-/// sorted and disjoint. The map is a POSITIVE list: an LBA in no range is passed
-/// through untouched (no default key). How a single-CPS disc is mapped depends on
-/// the caller: the whole-disc EXTRACT path uses one blanket range `(0, u32::MAX,
-/// 0)` so every encrypted unit — parsed title or orphan clip — resolves to key 0;
-/// the per-title MUX/sweep path (`resolve_mux_key_map` → `content_map`) maps only
-/// the title's own extents, so an orphan clip outside them is left as pass-through.
-/// Either way, clear nav/filesystem sectors (encrypted-flag off) pass through.
+/// Ranges are `[start_lba, end_lba)` → index into the `Aacs { unit_keys }`
+/// pool, sorted and disjoint. An LBA in no range (incl. clear nav/filesystem
+/// sectors) is passed through untouched — the map is a POSITIVE list only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AacsKeyMap {
     // (start_lba, end_lba, key_idx, phase). An LBA in NO range is passed through
@@ -311,25 +254,11 @@ impl AacsKeyMap {
     /// Build the FMTS **read plan**: the title's aligned units filtered down to
     /// only the units this rip must actually read — every default / CPS unit,
     /// plus, inside each forensic segment, ONLY our-phase ([`Phase::Even`] /
-    /// [`Phase::Odd`]) units. The alternate-phase units are a different device
-    /// group's variant: a licensed player never reads them, and neither do we.
-    /// They are omitted from the plan entirely, so they are never fetched,
-    /// decrypted, or handed to the demux — the demux therefore sees one gapless
-    /// our-variant stream, with no ciphertext to trip a concealed-gap resync (the
-    /// old behaviour that dropped good frames around every segment).
-    ///
-    /// `extents` are the title's clip extents (unit-aligned in the interior;
-    /// a shorter tail is ordinary content and always kept). `unit_sectors` is the
-    /// AACS aligned-unit size in sectors (3). Contiguous kept units coalesce into
-    /// as few extents as possible so the producer still issues large sequential
-    /// reads across default content; only inside a ~480 KB forensic segment do
-    /// reads become unit-granular (every other unit). A map with no forensic
-    /// (Even/Odd) range returns `extents` unchanged — the common disc is not
-    /// touched.
-    ///
-    /// The parity test is byte-identical to the decrypt hot loop
-    /// (`(unit_lba - range_start) / unit_sectors`), so a unit kept here is exactly
-    /// a unit [`decrypt_sectors_mapped`] would open, and vice-versa.
+    /// [`Phase::Odd`]) units; alternate-phase units belong to a different device
+    /// group's variant and are omitted entirely. `extents` are the title's clip
+    /// extents; `unit_sectors` is the AACS aligned-unit size (3 sectors). A map
+    /// with no forensic range returns `extents` unchanged, and a kept unit is
+    /// always one [`decrypt_sectors_mapped`] would open. See docs/decrypt.md.
     pub fn read_plan(
         &self,
         extents: &[crate::disc::Extent],
@@ -406,20 +335,9 @@ pub(crate) fn decrypt_sectors_mapped(
     decrypt_span(buf, &mut keys, base_lba, Some(map), None).map(|_| ())
 }
 
-/// AACS scheme step: apply `map`'s per-unit keys to `buf`, in-place. `base_lba`
-/// is the absolute LBA of `buf`'s first sector; each aligned unit (3 sectors) is
-/// decrypted with the key the map assigns to its LBA. There is NO key trial and
-/// NO `is_clean` verdict: the map already decided the key from disc structure,
-/// so this applies it and moves on — a unit that decrypts to authored-bad TS
-/// passes through for the muxer to drop, never re-fetched.
-///
-/// A SCHEME, not a policy. It reports what it could not open by returning
-/// `Err(DecryptFailed)`; the decision that an unopenable unit must never be
-/// emitted belongs to [`decrypt_span`], which is the one place that decides it
-/// for every scheme. A map index outside the held pool is likewise a fail-loud
-/// [`Error::DecryptFailed`](crate::Error::DecryptFailed): the resolver's job is
-/// to guarantee every selectable index is present, so a gap here is a resolver
-/// bug, not silent loss.
+// AACS scheme step: apply `map`'s per-unit keys to `buf`, in-place — no key
+// trial, no `is_clean` verdict; the refusal decision belongs to
+// `decrypt_span`. See docs/decrypt.md — apply_aacs_map.
 fn apply_aacs_map(
     buf: &mut [u8],
     keys: &DecryptKeys,
@@ -529,19 +447,12 @@ fn apply_aacs_map(
 
 /// Decrypt a buffer of sectors in-place — the CSS / clear path only.
 ///
-/// For CSS: descrambles per 2048-byte sector, self-cracking the title key from the
-/// data (no external input). For `None`: a no-op. For AACS: **always** returns
-/// `Err(DecryptFailed)` — AACS decrypts exclusively through the resolved key map
-/// ([`decrypt_sectors_mapped`]), which keys every content unit up front and fails
-/// at RESOLVE time when a key is missing. Reaching this arm with AACS keys means a
-/// reader was built without installing its map (a bug), so it fails loud rather
-/// than apply a guessed key.
-///
-/// `unit_key_idx` is a legacy parameter kept so the CSS / `None` wrapper
-/// signature stays stable; it is ignored (the CSS arm self-gates on its
-/// per-sector scramble flag). Returns `Err` if decryption was expected but
-/// impossible; never produces silently corrupted output. The `usize` return is a
-/// legacy unverified-byte count that is always `0` for the CSS / `None` arms.
+/// For CSS: descrambles per 2048-byte sector, self-cracking the title key
+/// from the data. For `None`: a no-op. For AACS: **always** returns
+/// `Err(DecryptFailed)` — AACS decrypts exclusively through the resolved key
+/// map ([`decrypt_sectors_mapped`]); reaching this arm with AACS keys means a
+/// reader was built without installing its map (a bug). `unit_key_idx` is a
+/// legacy parameter, ignored. See docs/decrypt.md for full detail.
 pub fn decrypt_sectors(
     buf: &mut [u8],
     keys: &mut DecryptKeys,
@@ -569,25 +480,9 @@ pub fn decrypt_sectors_in_content(
     decrypt_span(buf, keys, base_lba, None, Some((base_lba, content_ranges)))
 }
 
-/// THE decrypt orchestrator. Every path into this crate's decryption goes
-/// through here.
-///
-/// How a disc decrypts is one process — resolve a key for this span, apply it,
-/// and refuse if no key can be proven. Only the resolve-and-apply step is
-/// scheme-specific. This function owns the loop and the refusal; the schemes
-/// below supply only what genuinely differs between AACS, CSS and clear media.
-///
-/// That split exists because its absence caused six separate defects in one
-/// release. There used to be TWO top-level paths — this one for CSS and clear,
-/// and a wholly separate `decrypt_sectors_mapped` for AACS whose arm here was a
-/// bare `return Err` stub — so each scheme decided its own answer to "there is
-/// no key for these bytes" and nothing held them to the same one. CSS drifted to
-/// descrambling with a key it had just proven stale; the mapped path drifted to
-/// passing an unkeyable encrypted unit through as ciphertext. Both looked like
-/// success to the caller.
-///
-/// Adding a scheme means adding an arm here, which means answering the refusal
-/// question. That is the point.
+// THE decrypt orchestrator: every path into this crate's decryption goes
+// through here. Resolve a key for the span, apply it, refuse if none can be
+// proven — see docs/decrypt.md — decrypt_span for why the split matters.
 fn decrypt_span(
     buf: &mut [u8],
     keys: &mut DecryptKeys,
@@ -657,17 +552,8 @@ mod tests {
 
     // ── `decrypt_sectors_in_content` (now a legacy alias of `decrypt_sectors`) ──
 
-    /// `DecryptKeys::None` is a no-op even with a content map + scrambled bytes.
-    /// A forensic map's read plan is NOT the extents it was given — and that is
-    /// the precondition the mux's provenance guard keys on.
-    ///
-    /// A clip's feed span is measured over the FULL extents at scan time, while
-    /// the mux reads this reduced plan, so the byte offsets stamped on frames
-    /// and the offsets recorded in the spans describe different streams. The
-    /// deficit accumulates, so every frame after the first segment resolves to
-    /// an earlier clip than it came from. The spans still tile each other, so
-    /// the tiling check cannot see it; the mux compares the plan against the
-    /// full extents instead and stops trusting provenance when they differ.
+    // `DecryptKeys::None` is a no-op; a forensic read plan is NOT the extents
+    // it was given — the mux's provenance guard's precondition. docs/decrypt.md.
     #[test]
     fn a_forensic_read_plan_drops_units_the_full_extents_include() {
         let full = vec![crate::disc::Extent {
@@ -711,10 +597,8 @@ mod tests {
         assert_eq!(buf, original);
     }
 
-    /// CSS ignores the content gate (it lives in the AACS arm) and always reports
-    /// `0` — confirming the gate is a no-op for CSS and the read stays
-    /// scheme-agnostic (the litmus test: adding CSS verify touches only the CSS
-    /// arm, never the read).
+    // CSS ignores the content gate (it lives in the AACS arm) and always
+    // reports `0` — the read stays scheme-agnostic. See docs/decrypt.md.
     #[test]
     fn content_gate_css_keys_is_noop() {
         let mut keys = DecryptKeys::Css { title_key: [0; 5] };
@@ -726,21 +610,9 @@ mod tests {
         );
     }
 
-    /// `decrypt_sectors_in_content` is the entry point `DecryptingSectorSource`
-    /// dispatches to whenever a content map is installed (`sector/decrypting.rs`
-    /// line ~211), so it is on the live read path for every mapped rip. It must
-    /// actually DECRYPT. The two `_is_noop` tests above only assert its `usize`
-    /// return is `0` — which is what a body replaced by `Ok(0)` also returns, so
-    /// neither one constrains it at all.
-    ///
-    /// Here a genuinely scrambled CSS sector goes in and the CONSTRUCTED
-    /// plaintext must come out. Anything that skips `css::descramble_region` —
-    /// including a body that just reports `Ok(0)` — leaves ciphertext in the
-    /// buffer and the caller muxes scrambled MPEG at exit 0.
-    ///
-    /// Expected bytes come from the plaintext this test built BEFORE scrambling
-    /// (CSS scrambles only 0x80..2048; the header stays clear), not from
-    /// re-running any descramble routine.
+    // `decrypt_sectors_in_content` is the live read path for every mapped rip
+    // and must actually DECRYPT — the `_is_noop` tests above only pin `0`,
+    // which an `Ok(0)` stub also returns. See docs/decrypt.md.
     #[test]
     fn content_gate_css_actually_descrambles_the_buffer() {
         const RUN_START: usize = 0x59;
@@ -785,13 +657,9 @@ mod tests {
         );
     }
 
-    /// The AACS arm of the same entry point must fail LOUD. Under the
-    /// keymap-only model AACS decrypts exclusively through
-    /// `decrypt_sectors_mapped`; reaching this wrapper with AACS keys means a
-    /// reader was built without installing its key map, and continuing would
-    /// hand the caller ciphertext under an `Ok`. `DecryptFailed` is the correct
-    /// verdict per the function's own contract — it must not be softened into a
-    /// success with a zero count.
+    // The AACS arm of the same entry point must fail LOUD: reaching it means
+    // a reader was built without installing its key map, and must not be
+    // softened into a success with a zero count. See docs/decrypt.md.
     #[test]
     fn content_gate_aacs_keys_fail_loud_not_ok_zero() {
         let mut keys = DecryptKeys::Aacs {
@@ -812,11 +680,9 @@ mod tests {
         );
     }
 
-    /// Build a crackable scrambled CSS sector for `title_key` (mirrors
-    /// `crackable_sector` in the css::mod tests): a periodic run in the clear
-    /// header continues past 0x80 into the encrypted region, so
-    /// `keyless::crack_title_key` recovers the key. Distinct `seed` values give
-    /// two sectors different cribs, standing in for two VOB regions.
+    // Build a crackable scrambled CSS sector: a periodic run in the clear
+    // header continues past 0x80 so `crack_title_key` recovers the key.
+    // Distinct `seed`s give two sectors different cribs (two VOB regions).
     fn crackable_css_sector(title_key: &[u8; 5], seed: &[u8; 5]) -> Vec<u8> {
         const RUN_START: usize = 0x59;
         const SEED_OFFSET: usize = 0x54;
@@ -835,17 +701,9 @@ mod tests {
         plaintext
     }
 
-    /// CHARACTERIZATION (recovery refactor safety net): the CSS arm's per-region
-    /// re-crack (the `title_key` cache is stale for a new VOB region → restore
-    /// ciphertext, `crack_title_key` this sector, re-descramble). Two crackable
-    /// sectors scrambled under DIFFERENT keys sit back-to-back; the cache is
-    /// primed to the FIRST key. Sector 0 rides the cache (crib matches); sector 1
-    /// must trip the crib mismatch and re-crack to its own key. Both must land
-    /// correct plaintext, and the cache must end on region 1's key.
-    ///
-    /// This behaviour currently lives inline in `decrypt_sectors` (the `Css`
-    /// arm). It is the delicate logic the recovery refactor will move to the
-    /// input-stream seam, so it must stay green byte-for-byte across that move.
+    // CHARACTERIZATION: the CSS arm's per-region re-crack when the cached
+    // title key goes stale at a VOB region boundary. Delicate logic the
+    // recovery refactor moves next; see docs/decrypt.md for detail.
     #[test]
     fn css_region_change_recracks_the_title_key() {
         let key_a = [0x11, 0x22, 0x33, 0x44, 0x55];
@@ -889,12 +747,9 @@ mod tests {
         );
     }
 
-    /// Whole leading unit plus a SCRAMBLED trailing partial that is FLAGGED
-    /// encrypted in its clear seed (the malformed danger case): an encrypted unit
-    /// split across an extent boundary cannot be CBC-decrypted standalone. The
-    /// mapped decrypt must fail loud with `DecryptFailed` rather than emit the
-    /// ciphertext partial as clear. Exercises the real shipping path
-    /// (`decrypt_sectors_mapped`) and its trailing-partial guard.
+    // Whole leading unit + a SCRAMBLED trailing partial flagged encrypted: an
+    // encrypted unit split across an extent boundary cannot be CBC-decrypted
+    // standalone, so mapped decrypt must fail loud, not emit it as clear.
     #[test]
     fn aacs_scrambled_trailing_partial_is_rejected() {
         let keys = DecryptKeys::Aacs {
@@ -919,14 +774,9 @@ mod tests {
         );
     }
 
-    /// A CLEAR trailing partial (encrypted flag NOT set) is a legitimate content
-    /// tail and must pass through, never trip the guard above.
-    ///
-    /// "Passes through" means byte-for-byte unchanged, not merely `Ok`. Asserting
-    /// only `is_ok()` let a mutant that corrupts the clear partial while still
-    /// returning `Ok` pass — which is the whole failure this test names.
-    /// Mutation: XOR any byte of the tail before returning -> the snapshot
-    /// comparison fails.
+    // A CLEAR trailing partial is legitimate content and must pass through
+    // byte-for-byte, not just return `Ok` — a corrupting mutant that still
+    // returns `Ok` must fail this. See docs/decrypt.md.
     #[test]
     fn aacs_clear_trailing_partial_passes_through() {
         let keys = DecryptKeys::Aacs {
@@ -950,13 +800,8 @@ mod tests {
 
     // ── DecryptKeys::None and is_encrypted ─────────────────────────────────
 
-    /// DecryptKeys::None is a pure no-op: the buffer must be returned
-    /// byte-for-byte unchanged with Ok, regardless of content (even content
-    /// that looks scrambled).
-    ///
-    /// Grounding: the `DecryptKeys::None => {}` match arm does nothing.
-    /// Mutation: replace the empty arm with a call that mutates buf -> the
-    /// unchanged assert fails.
+    // DecryptKeys::None is a pure no-op: the buffer must return byte-for-byte
+    // unchanged with Ok. The `None => {}` arm does nothing.
     #[test]
     fn none_keys_is_noop() {
         let mut buf: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
@@ -965,10 +810,8 @@ mod tests {
         assert_eq!(buf, snapshot, "None must not touch the buffer");
     }
 
-    /// is_encrypted reflects the variant: None -> false, Css/Aacs -> true.
-    ///
-    /// Grounding: `!matches!(self, DecryptKeys::None)`.
-    /// Mutation: invert the `!` -> None reports true, this fails.
+    // is_encrypted reflects the variant: None -> false, Css/Aacs -> true.
+    // Grounding: `!matches!(self, DecryptKeys::None)`.
     #[test]
     fn is_encrypted_matches_variant() {
         assert!(!DecryptKeys::None.is_encrypted());
@@ -985,12 +828,8 @@ mod tests {
 
     // ── CSS dispatch (DecryptKeys::Css) ────────────────────────────────────
 
-    /// Build a CSS-scrambled 2048-byte sector by scrambling a known plaintext
-    /// body with the exact inverse of `descramble_sector`, so decrypt_sectors
-    /// will descramble it back to the plaintext. The content cipher applies
-    /// TAB1 to the ciphertext (`plain = TAB1[cipher] ^ ks`), so it is NOT a
-    /// self-inverse XOR — `scramble_sector` is the true inverse and sets the
-    /// scramble flag.
+    // Build a CSS-scrambled sector via `scramble_sector` (the true inverse
+    // of `descramble_sector`), so decrypt_sectors descrambles it back.
     fn make_css_sector(title_key: &[u8; 5], seed: &[u8; 5], body_fill: u8) -> (Vec<u8>, Vec<u8>) {
         let mut sector = vec![body_fill; 2048];
         // A real scrambled DVD sector is an MPEG-2 PS pack starting with the pack
@@ -1004,15 +843,9 @@ mod tests {
         (sector, plaintext)
     }
 
-    /// The CSS path descrambles each 2048-byte sector with the title key. A
-    /// scrambled sector run through decrypt_sectors must come back to its
-    /// plaintext body (keystream XOR is involutive), proving the title key is
-    /// actually applied.
-    ///
-    /// Grounding: `DecryptKeys::Css { title_key } => for chunk in
-    /// buf.chunks_mut(2048) { descramble_sector(title_key, chunk) }`.
-    /// Mutation: change `chunks_mut(2048)` to `chunks_mut(2049)` or pass a
-    /// fixed wrong key -> the body no longer matches the plaintext.
+    // The CSS path descrambles each 2048-byte sector with the title key: a
+    // scrambled sector run through decrypt_sectors must come back to its
+    // plaintext body, proving the title key is actually applied.
     #[test]
     fn css_descrambles_with_title_key() {
         let mut title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
@@ -1034,14 +867,9 @@ mod tests {
         );
     }
 
-    /// The CSS path processes EACH 2048-byte sector independently in a
-    /// multi-sector buffer. Two scrambled sectors (with different seeds) in
-    /// one buffer must both round-trip — pinning that the loop steps by 2048
-    /// and applies the key to every sector, not just the first.
-    ///
-    /// Grounding: `for chunk in buf.chunks_mut(2048)`.
-    /// Mutation: change the loop to descramble only the first chunk (e.g.
-    /// `.next()`) -> the second sector stays scrambled, assert fails.
+    // The CSS path processes EACH 2048-byte sector independently: two
+    // scrambled sectors in one buffer must both round-trip, pinning that
+    // the loop reaches every sector, not just the first.
     #[test]
     fn css_processes_every_sector_in_buffer() {
         let title_key = [0x01, 0x02, 0x03, 0x04, 0x05];
@@ -1063,11 +891,9 @@ mod tests {
         );
     }
 
-    /// Build a CSS sector whose clear header ends in a periodic run that
-    /// continues into the encrypted region — the crackable shape `attack_crib`/
-    /// `crack_title_key` recover a key from (a constant body fill gives a
-    /// degenerate crib the cracker can't pin a unique key on). Returns
-    /// (scrambled_sector, plaintext_body).
+    // Build a CSS sector whose clear header ends in a periodic run that
+    // continues into the encrypted region, so `crack_title_key` can recover
+    // a key from it. Returns (scrambled_sector, plaintext_body).
     fn make_crackable_css_sector(
         title_key: &[u8; 5],
         seed: &[u8; 5],
@@ -1093,22 +919,9 @@ mod tests {
         (plaintext, body)
     }
 
-    /// CSS title keys are per-VTS/VOB region: a real disc holds DIFFERENT keys
-    /// for different regions and the only way to get each is to crack it. The
-    /// decrypt path must re-crack when the cached key stops descrambling (its
-    /// crib no longer reappears at 0x80) instead of blindly applying one key
-    /// across a region boundary — the bug that pixelated every freemkv DVD rip.
-    ///
-    /// Two sectors scrambled under DIFFERENT keys, cache primed to ONLY the
-    /// first (exactly what the one-shot scan crack leaves). Sector 0 validates +
-    /// descrambles with the cached key; sector 1's cached-key descramble fails
-    /// the crib, so the path re-cracks sector 1's own key and recovers its
-    /// plaintext. Before the fix (blind single-key apply) sector 1 was garbage.
-    ///
-    /// Grounding: the CSS arm's `attack_crib` → `chunk[0x80..] != crib` →
-    /// `crack_title_key` → `*title_key = fresh` rekey.
-    /// Mutation: drop the rekey branch (apply the cached key always) → sector 1's
-    /// body no longer matches its plaintext; this fails.
+    // CSS keys are per-VTS/VOB region: must re-crack when the cached key
+    // stops descrambling, not blindly reapply it — the bug that pixelated
+    // every DVD rip. See docs/decrypt.md.
     #[test]
     fn css_rekeys_when_title_key_region_changes() {
         let key_a = [0x42, 0x13, 0x37, 0xBE, 0xEF];
@@ -1151,14 +964,9 @@ mod tests {
         );
     }
 
-    /// The CSS path leaves UNSCRAMBLED sectors (flag clear) byte-for-byte
-    /// untouched — descramble_sector early-returns on a zero flag. A clear
-    /// sector mixed into the buffer must not be corrupted.
-    ///
-    /// Grounding: descramble_sector returns immediately when
-    /// `(sector[0x14] >> 4) & 0x03 == 0`.
-    /// Mutation: remove that early return in lfsr.rs -> a clear sector would
-    /// be XORed with a keystream and change; this fails.
+    // The CSS path leaves UNSCRAMBLED sectors (flag clear) byte-for-byte
+    // untouched — descramble_sector early-returns on a zero flag; a clear
+    // sector mixed into the buffer must not be corrupted.
     #[test]
     fn css_leaves_clear_sector_unchanged() {
         let title_key = [0x01, 0x02, 0x03, 0x04, 0x05];
@@ -1170,12 +978,8 @@ mod tests {
         assert_eq!(sector, snapshot, "clear CSS sector must be left untouched");
     }
 
-    /// CSS decrypt always returns Ok (it cannot fail — descrambling is XOR,
-    /// no key validity check), even for an empty buffer.
-    ///
-    /// Grounding: the CSS arm has no `return Err` path; `chunks_mut` over an
-    /// empty slice is a no-op; the function ends `Ok(())`.
-    /// Mutation: make the CSS arm return Err -> this fails.
+    // CSS decrypt always returns Ok (it cannot fail — descrambling is XOR,
+    // no key validity check), even for an empty buffer.
     #[test]
     fn css_empty_buffer_is_ok() {
         let mut buf: Vec<u8> = Vec::new();
@@ -1185,13 +989,8 @@ mod tests {
 
     // ── AACS unit-key index selection ──────────────────────────────────────
 
-    /// A map that selects a key index OUTSIDE the held pool must fail loud with
-    /// DecryptFailed — never silently apply a wrong key or pass ciphertext through.
-    /// This validates `decrypt_sectors_mapped`'s up-front `key_indices()` bounds
-    /// check (the real shipping AACS decrypt path).
-    ///
-    /// Mutation: drop the `unit_keys.get(idx).is_none()` guard → the out-of-range
-    /// index would not error; this fails.
+    // A map that selects a key index OUTSIDE the held pool must fail loud,
+    // validating `decrypt_sectors_mapped`'s up-front bounds check.
     #[test]
     fn aacs_mapped_out_of_range_key_idx_errors() {
         let keys = DecryptKeys::Aacs {
@@ -1307,10 +1106,8 @@ mod tests {
         assert_eq!(multi.read_plan(&ext, us), ext);
     }
 
-    /// FMTS: a forensic Even segment drops exactly its alternate (odd) units from
-    /// the read plan — they are never fetched — while default content on either
-    /// side stays one coalesced sequential run. The kept units are byte-identical
-    /// to the ones the decrypt hot loop opens.
+    // FMTS: a forensic Even segment drops exactly its alternate (odd) units,
+    // while default content stays one coalesced sequential run.
     #[test]
     fn read_plan_forensic_reads_only_our_phase_units() {
         use crate::disc::Extent;
@@ -1376,23 +1173,9 @@ mod tests {
         }
     }
 
-    /// A forensic range does NOT start on an aligned-unit boundary. Its start LBA
-    /// comes from a source-packet number — `start_spn * 192` put through
-    /// `clip_byte_to_lba` (`mux/resolve.rs`) — and 192-byte packets have no
-    /// relationship to the 3-sector aligned unit, so `range_start % 3` is
-    /// whatever the disc says.
-    ///
-    /// That makes `unit_ix = (lba - range_start) / us` load-bearing in both of
-    /// its operations, and the existing coverage used a range starting exactly
-    /// on the extent's first unit, where several wrong formulas agree with the
-    /// right one by arithmetic accident.
-    ///
-    /// Getting the parity wrong is not a crash. It reads and decrypts the
-    /// ALTERNATE variant's half of a forensic segment: the units this disc's
-    /// key does not open decrypt to garbage, and the units it does open are
-    /// skipped. AACS 2.1 forensic marking is exactly the mechanism that makes
-    /// the two halves different, so a phase inversion is silent — it produces a
-    /// full-length rip carrying the wrong variant.
+    // A forensic range does NOT start on an aligned-unit boundary, so
+    // `unit_ix = (lba - range_start) / us` must still get the parity right
+    // for an unaligned `range_start`. See docs/decrypt.md.
     #[test]
     fn read_plan_phase_parity_is_measured_from_an_unaligned_range_start() {
         use crate::disc::Extent;
@@ -1446,15 +1229,9 @@ mod tests {
         );
     }
 
-    /// An extent whose last whole unit is an alternate-phase unit must still drop
-    /// it. The tail guard exists for a REMNANT shorter than a unit — bytes with
-    /// no following unit to desync — and an extent ending exactly on a unit
-    /// boundary has no remnant at all.
-    ///
-    /// With the guard widened to `remaining <= us`, the final unit of every
-    /// extent bypasses the phase gate and is read unconditionally. On a forensic
-    /// segment that lands at an extent end, that is one alternate-variant unit
-    /// pulled into the rip and decrypted with a key that does not open it.
+    // An extent whose last whole unit is an alternate-phase unit must still
+    // drop it — the tail guard is only for a REMNANT shorter than a unit.
+    // See docs/decrypt.md for the widened-guard failure mode it pins.
     #[test]
     fn read_plan_gates_the_last_whole_unit_of_an_extent_not_just_the_remnant() {
         use crate::disc::Extent;
@@ -1495,26 +1272,9 @@ mod tests {
         );
     }
 
-    /// Every scheme that CANNOT prove a key answers the same way.
-    ///
-    /// This is the property `decrypt_span` exists to hold. There used to be two
-    /// top-level decrypt paths — one for CSS and clear media, one for AACS —
-    /// and each decided its own answer, so they drifted apart in opposite
-    /// directions within a single release: CSS descrambled with a key it had
-    /// just proven stale, and the AACS path passed an unkeyable encrypted unit
-    /// through as ciphertext. Both reported success.
-    ///
-    /// Asserting one verdict across the schemes is what makes a future
-    /// divergence a test failure rather than a silent corruption. A per-scheme
-    /// test cannot do that: each would still pass while the two disagreed.
-    ///
-    /// CSS is deliberately NOT in this list. Its title key is recovered from
-    /// the data, sector by sector, by a heuristic that false-positives — a crib
-    /// mismatch whose re-crack fails means the crib was wrong, not that the key
-    /// is stale, so the cached key is kept and used. Round 9 folded CSS in here
-    /// on the reasoning that "no key" should mean one thing everywhere; that
-    /// made real DVDs unrippable, and the real-media gate caught it. Uniform
-    /// policy is right for schemes that can PROVE a key wrong. CSS cannot.
+    // Every scheme that CANNOT prove a key answers the same way — the
+    // property `decrypt_span` exists to hold. CSS is deliberately excluded
+    // (self-recovers heuristically; cannot PROVE a key wrong). docs/decrypt.md.
     #[test]
     fn every_scheme_gives_the_same_verdict_when_no_key_can_be_proven() {
         use crate::disc::ContentFormat;
@@ -1561,20 +1321,9 @@ mod tests {
         );
     }
 
-    /// An ENCRYPTED unit that falls outside every key-map range must fail, not
-    /// pass through as ciphertext.
-    ///
-    /// "The map has no key here" and "there is nothing to decrypt here" are
-    /// different statements, and only the second makes passing the unit through
-    /// correct. On a multi-CPS disc an orphan clip — referenced by no playlist,
-    /// so in no title extent and therefore in no range — hits the first and was
-    /// treated as the second. `extract_tree` then counted those bytes as GOOD,
-    /// dropped the `.partial` suffix, and reported `complete: true`, exit 0:
-    /// a scrambled file on disk with a clean bill of health.
-    ///
-    /// A CLEAR unit outside every range is the ordinary case (filesystem and
-    /// nav on a whole-disc read) and must still pass through untouched — so
-    /// this asserts both directions.
+    // An ENCRYPTED unit outside every key-map range must fail, not pass
+    // through as ciphertext — a CLEAR one outside every range still must
+    // pass through untouched. Both directions asserted. See docs/decrypt.md.
     #[test]
     fn an_encrypted_unit_outside_every_key_range_fails_instead_of_passing_through() {
         use crate::disc::ContentFormat;
@@ -1666,15 +1415,9 @@ mod tests {
         }
     }
 
-    /// The mapped descramble indexes the committed key pool POSITIONALLY
-    /// (`unit_keys[key_idx].1`), so the ORDER of the `Vec<UnitKey>` a
-    /// `KeySource` returns is load-bearing — it is NOT "cosmetic, the decrypt path
-    /// strips it and tries every key", as `keysource::resolve_and_apply_traced`'s
-    /// doc used to claim. Trial-decrypt was deliberately deleted; nothing here
-    /// searches the pool. Reordering the same two keys therefore sends each range
-    /// to the WRONG key: the range that decrypted clean now fails the correct-phase
-    /// `is_clean` net loudly (or, off a forensic phase, would decrypt a whole span
-    /// under a neighbour's key). Pins the corrected doc.
+    // The mapped descramble indexes the committed key pool POSITIONALLY, so
+    // the ORDER of the `Vec<UnitKey>` a `KeySource` returns is load-bearing —
+    // nothing here searches the pool. See docs/decrypt.md.
     #[test]
     fn mapped_key_selection_is_positional_so_pool_order_matters() {
         use crate::disc::ContentFormat;
@@ -1780,18 +1523,8 @@ mod tests {
 
     // ── decrypt_threads resolution (read-only; no global mutation) ─────────
 
-    /// The default (auto) decrypt thread count is always a usable pool size:
-    /// at least 1 (a 0-thread rayon pool is invalid) and never above
-    /// MAX_THREADS (rayon stack-memory cap). This test reads the resolved
-    /// value without mutating the process-global override, so it is safe to
-    /// run in parallel with other tests.
-    ///
-    /// Grounding: `cores.clamp(1, MAX_THREADS)` in the default branch;
-    /// `env.min(MAX_THREADS)` in the env branch.
-    /// Mutation: change `.clamp(1, MAX_THREADS)` to `.clamp(0, MAX_THREADS)`
-    /// on a 0-core probe (unlikely) — more robustly, change the cap to
-    /// `MAX_THREADS * 2` -> on a many-core CI box the upper-bound assert can
-    /// fail. The lower-bound (>=1) guard is the load-bearing invariant.
+    // Default thread count is always usable: >=1, never above MAX_THREADS.
+    // Reads only; safe alongside other tests. See docs/decrypt.md.
     #[test]
     fn decrypt_threads_within_valid_pool_range() {
         let n = decrypt_threads();
@@ -1802,10 +1535,9 @@ mod tests {
         );
     }
 
-    /// The FMTS phase gate picks which half of an interleaved forensic segment
-    /// we decrypt. Both the `-` and the `/` in its index arithmetic survived a
-    /// mutation run, and getting either wrong silently decrypts the alternate
-    /// variant into garbage while reporting success.
+    // The FMTS phase gate picks which half of an interleaved forensic
+    // segment we decrypt; getting its index arithmetic wrong silently
+    // decrypts the alternate variant into garbage. See docs/decrypt.md.
     #[test]
     fn phase_gate_selects_only_our_parity_of_a_forensic_segment() {
         use super::{Phase, unit_is_our_phase};
@@ -1847,18 +1579,9 @@ mod tests {
         assert!(!unit_is_our_phase(33, 30, 3, Phase::Even));
     }
 
-    /// A malformed key map must not take down a long-running service. A unit
-    /// below its own range start, or a zero unit size, are both map bugs — they
-    /// must return a defined answer rather than panicking on debug overflow or
-    /// dividing by zero.
-    ///
-    /// Every case here asserts the DEFINED answer, not merely the absence of a
-    /// panic. The zero-unit-size case used to be written
-    /// `assert!(unit_is_our_phase(100, 30, 0, Phase::Even) || true)`, which
-    /// accepts both answers and so pinned nothing at all: the guards could
-    /// invert and it would still pass. The answer is knowable —
-    /// `saturating_sub` gives 70, `max(1)` makes the divisor 1, unit index 70
-    /// is even — so pin it.
+    // A malformed key map (unit below range start, or zero unit size) must
+    // return a DEFINED answer, not merely avoid panicking. See docs/decrypt.md
+    // for the `|| true` non-assertion this replaces.
     #[test]
     fn phase_gate_does_not_panic_on_a_malformed_map() {
         use super::{Phase, unit_is_our_phase};
