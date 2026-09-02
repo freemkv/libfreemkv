@@ -11,6 +11,25 @@ on:
   pull_request:
 
 jobs:
+  # ── Single source of truth for the MSRV ─────────────────────────────────────
+  #
+  # `rust-version` in Cargo.toml is the ONE place the MSRV is declared. This job
+  # reads it; every job that must build/test AT the MSRV consumes
+  # `needs.resolve-msrv.outputs.v` instead of a hardcoded pin, so the floor
+  # cannot drift out of sync across workflow files. The `test` job building
+  # green at this value IS the verification that the declared MSRV is real.
+  # clippy and the `consumers` job deliberately do NOT use it — they run on
+  # `stable` (lint debt is caught against current Rust; dependents float highest).
+  resolve-msrv:
+    runs-on: ubuntu-latest
+    outputs:
+      v: ${{ steps.msrv.outputs.v }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: msrv
+        shell: bash
+        run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
+
   # CI owns the changelog: main may never carry a released version without a
   # CHANGELOG.md entry for it. The release orchestrator dates an existing
   # `## [X.Y.Z]` heading — it does NOT invent one — so a version bump that
@@ -38,6 +57,7 @@ jobs:
           echo "::warning::${msg} (allowed on ${GITHUB_REF_NAME:-unknown}; required before it can reach main)."
 
   lint:
+    needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -57,9 +77,20 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.88.0
+      # fmt runs on the pinned MSRV toolchain; clippy runs on stable. Third
+      # parties compile our source on their own toolchain and never run our
+      # clippy, so the lint toolchain need not match the MSRV — only build/test
+      # must (see the test/cross jobs). Linting on stable makes new-lint debt a
+      # BLOCKING gate the pinned version would otherwise hide. The MSRV pin is
+      # installed second so it stays the default toolchain (fmt uses it
+      # implicitly); clippy is invoked explicitly with `+stable`.
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: libfreemkv
@@ -72,10 +103,11 @@ jobs:
       # --all-targets so TEST code is linted too. Without it this crate — the
       # reference implementation for the other seven — was the only one whose
       # tests had never been linted at all, and it was hiding 74 findings.
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo +stable clippy --all-targets -- -D warnings
         working-directory: libfreemkv
 
   test:
+    needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -95,7 +127,9 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: libfreemkv
@@ -115,6 +149,7 @@ jobs:
     # than a slow one: release.sh's CI gate refuses while any run for the
     # commit is still in progress, so a never-scheduled job blocks releases
     # silently -- see the note on real-media in qa.yml.
+    needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
     steps:
@@ -135,7 +170,9 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: libfreemkv
@@ -155,6 +192,7 @@ jobs:
     # than a slow one: release.sh's CI gate refuses while any run for the
     # commit is still in progress, so a never-scheduled job blocks releases
     # silently -- see the note on real-media in qa.yml.
+    needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
     steps:
@@ -175,7 +213,9 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: libfreemkv
@@ -230,10 +270,11 @@ jobs:
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
           done
-      # The consumers span a higher MSRV than libfreemkv itself (the bins are
-      # 1.98, keysources 1.97), so build them with a toolchain that satisfies the
-      # HIGHEST dependent floor — libfreemkv's own 1.94 cannot compile them.
-      - uses: dtolnay/rust-toolchain@1.98.0
+      # The dependents span a higher MSRV than libfreemkv itself — the binaries
+      # (freemkv/autorip/bdemu) always track the highest supported Rust. Build
+      # them on `stable` so this job satisfies the highest dependent floor; the
+      # library's own lower MSRV (verified by the `test` job) cannot compile them.
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -261,14 +302,15 @@ jobs:
   #
   # Reports line coverage to Codecov. Deliberately NOT wired into any release
   # gate: it is informational only (see codecov.yml) and no other job `needs:`
-  # it. Mirrors the `test` job's layout exactly — same pinned 1.94 toolchain,
-  # same dual checkout so the `../freemkv-unlock` path dep resolves, same cache
+  # it. Mirrors the `test` job's layout exactly — same MSRV toolchain (resolved
+  # from Cargo.toml), same dual checkout so `../freemkv-unlock` resolves, cache
   # workspace and working-directory. cargo-llvm-cov comes as a prebuilt binary
   # from taiki-e/install-action, so it is toolchain-independent.
   #
   # No `--locked`: like the fmt/clippy/test jobs above, this crate's Cargo.lock
   # is gitignored, so there is nothing to lock against on a fresh runner.
   coverage:
+    needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -279,8 +321,9 @@ jobs:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
