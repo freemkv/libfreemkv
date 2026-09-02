@@ -9,9 +9,13 @@
 //! See docs/scsi-linux.md for the escalation ladder, the design
 //! rationale, and the pre-0.13.20 async-poll design it replaced.
 
+use super::fd_handoff::{
+    AtomicBool, AtomicI32, claim_for_teardown, publish_recovered_fd, take_recovered_fd,
+};
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
 use std::path::Path;
+use std::sync::Arc;
 
 const SG_IO: u32 = 0x2285;
 const SG_DXFER_NONE: i32 = -1;
@@ -23,6 +27,10 @@ const SG_FLAG_Q_AT_HEAD: u32 = 0x10;
 /// single byte and every SPC-4/MMC command this crate issues is 6, 10, 12 or
 /// 16 bytes. Matches `K_MAX_CDB_SIZE` in the macOS and Windows backends.
 const K_MAX_CDB_SIZE: usize = 16;
+
+/// SPC-4 PREVENT ALLOW MEDIUM REMOVAL (0x1E) with PREVENT=0. Sent by `Drop` so
+/// the tray is not left locked; a six-byte group-0 CDB.
+const ALLOW_MEDIUM_REMOVAL: [u8; 6] = [0x1E, 0, 0, 0, 0, 0];
 
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -61,12 +69,15 @@ const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 64);
 pub struct SgIoTransport {
     pub fd: i32,
     device_path: std::path::PathBuf,
-    pub fd_recovery: std::sync::Arc<std::sync::atomic::AtomicI32>,
-    /// Set to `true` by `Drop` before the transport is torn down. The
-    /// recovery thread checks this after a successful `compare_exchange`
-    /// and closes `new_fd` itself when the transport is already gone,
-    /// preventing an fd leak when Drop races the recovery thread.
-    dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Single-slot mailbox a background recovery thread publishes a freshly
+    /// opened fd into. Drained by `execute()`, or claimed by `Drop` if the
+    /// transport dies first. The protocol — and the memory ordering that makes
+    /// it leak-free — lives in `super::fd_handoff`.
+    pub fd_recovery: Arc<AtomicI32>,
+    /// Set to `true` by `Drop` before it claims the slot. A recovery thread
+    /// that publishes after that point sees it and closes its own fd, since
+    /// nothing will ever drain the slot again.
+    dead: Arc<AtomicBool>,
 }
 
 impl SgIoTransport {
@@ -86,8 +97,8 @@ impl SgIoTransport {
         Ok(SgIoTransport {
             fd,
             device_path: device,
-            fd_recovery: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
-            dead: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fd_recovery: Arc::new(AtomicI32::new(super::fd_handoff::EMPTY)),
+            dead: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -107,14 +118,22 @@ impl SgIoTransport {
         })
     }
 
-    /// Send a raw SCSI command on an fd. Used by reset() before the
-    /// transport is constructed.
-    fn raw_command(fd: i32, cdb: &[u8], timeout_ms: u32) -> std::result::Result<(), ()> {
+    /// Send a raw SCSI command on a bare fd, for the one caller that has no
+    /// live `&mut self` to route through `execute()`: `Drop`, unlocking the
+    /// tray on its way out.
+    ///
+    /// The CDB goes through the shared [`super::checked_cdb_len`] guard rather
+    /// than the old `cdb.len().min(16)` clamp — see docs/scsi-mod.md,
+    /// "checked_cdb_len rationale". Returning a typed [`Error`] rather than
+    /// `()` is what lets `raw_command_cdb_guard_tests` tell a rejected CDB
+    /// from an I/O failure without a real `/dev/sg*` device.
+    fn raw_command(fd: i32, cdb: &[u8], timeout_ms: u32) -> Result<()> {
+        let cmd_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
         let mut sense = [0u8; 32];
         let mut hdr: sg_io_hdr = unsafe { std::mem::zeroed() };
         hdr.interface_id = b'S' as i32;
         hdr.dxfer_direction = SG_DXFER_NONE;
-        hdr.cmd_len = cdb.len().min(16) as u8;
+        hdr.cmd_len = cmd_len;
         hdr.mx_sb_len = sense.len() as u8;
         hdr.dxfer_len = 0;
         hdr.dxferp = std::ptr::null_mut();
@@ -124,15 +143,32 @@ impl SgIoTransport {
         hdr.flags = SG_FLAG_Q_AT_HEAD;
 
         let ret = unsafe { libc::ioctl(fd, SG_IO as _, &mut hdr as *mut sg_io_hdr) };
+        if ret < 0 {
+            return Err(Error::IoError {
+                source: std::io::Error::last_os_error(),
+            });
+        }
         // Mask DRIVER_SENSE (0x08): it only flags "sense data present", not
         // a failure — matches execute()'s driver_status_real handling so a
         // benign CHECK CONDITION isn't misread as a transport error.
         let driver_status_real = hdr.driver_status & !super::DRIVER_SENSE;
-        if ret < 0 || hdr.status != 0 || hdr.host_status != 0 || driver_status_real != 0 {
-            Err(())
-        } else {
-            Ok(())
+        if hdr.host_status != 0 || driver_status_real != 0 {
+            // No SCSI status was delivered: same synthesised sentinel and same
+            // `sense: None` that `execute()` reports for a transport wedge.
+            return Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: super::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
+            });
         }
+        if hdr.status != 0 {
+            return Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: hdr.status,
+                sense: Some(super::parse_sense(&sense, hdr.sb_len_wr)),
+            });
+        }
+        Ok(())
     }
 
     fn to_c_path(device: &Path) -> Vec<u8> {
@@ -174,20 +210,13 @@ impl Drop for SgIoTransport {
     fn drop(&mut self) {
         if self.fd >= 0 {
             // Unlock tray before closing — don't leave it locked.
-            let _ = Self::raw_command(self.fd, &[0x1E, 0, 0, 0, 0, 0], 3_000);
+            let _ = Self::raw_command(self.fd, &ALLOW_MEDIUM_REMOVAL, 3_000);
             unsafe { libc::close(self.fd) };
         }
-        // Signal the recovery thread this transport is gone. Must be set
-        // before the fd_recovery swap so it can't observe dead=false and
-        // store into a slot Drop is no longer going to drain.
-        self.dead.store(true, std::sync::atomic::Ordering::Release);
         // A failed execute() spawns a thread that opens a fresh fd into
-        // fd_recovery, normally drained at the top of the next execute().
-        // If dropped first (abort-on-wedge), claim and close it here.
-        let recovered = self
-            .fd_recovery
-            .swap(-1, std::sync::atomic::Ordering::Acquire);
-        if recovered >= 0 {
+        // fd_recovery, normally drained at the top of the next execute(). If
+        // dropped first (abort-on-wedge), claim and close it here.
+        if let Some(recovered) = claim_for_teardown(&self.fd_recovery, &self.dead) {
             unsafe { libc::close(recovered) };
         }
     }
@@ -221,10 +250,7 @@ impl ScsiTransport for SgIoTransport {
         );
 
         // Check if a background recovery has produced a new fd.
-        let recovered = self
-            .fd_recovery
-            .swap(-1, std::sync::atomic::Ordering::Acquire);
-        if recovered >= 0 {
+        if let Some(recovered) = take_recovered_fd(&self.fd_recovery) {
             // Close the old fd if it's still valid.
             if self.fd >= 0 {
                 unsafe { libc::close(self.fd) };
@@ -329,31 +355,11 @@ impl ScsiTransport for SgIoTransport {
                 if new_fd < 0 {
                     return;
                 }
-                // Publish only into an empty (-1) slot. If two recovery
-                // threads race, the loser closes its own fd rather than
-                // overwriting (and leaking) the winner's.
-                if recovery
-                    .compare_exchange(
-                        -1,
-                        new_fd,
-                        std::sync::atomic::Ordering::Release,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_err()
-                {
-                    // Another recovery thread already stored its fd; ours
-                    // was not stored so it's our responsibility to close it.
-                    unsafe { libc::close(new_fd) };
-                    return;
-                }
-                // Check whether Drop raced us: if the transport is already
-                // dead it won't drain fd_recovery, so swap to atomically
-                // claim new_fd and close it; a -1 result means Drop won.
-                if dead.load(std::sync::atomic::Ordering::Acquire) {
-                    let claimed = recovery.swap(-1, std::sync::atomic::Ordering::AcqRel);
-                    if claimed >= 0 {
-                        unsafe { libc::close(claimed) };
-                    }
+                // Hand the fd to the transport. Comes back to us only if
+                // nobody there will ever close it: another recovery thread
+                // won the slot, or Drop already tore the transport down.
+                if let Some(orphan) = publish_recovered_fd(&recovery, &dead, new_fd) {
+                    unsafe { libc::close(orphan) };
                 }
             });
 
@@ -584,5 +590,106 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
             status: hdr.status,
             sense: Some(parsed),
         })
+    }
+}
+
+// ── CDB guard wiring ───────────────────────────────────────────────────────
+#[cfg(test)]
+mod raw_command_cdb_guard_tests {
+    use super::*;
+
+    /// `ioctl()` on this fails with `EBADF` before touching any device, so the
+    /// tests below need no `/dev/sg*` and have no side effects — they run in
+    /// ordinary CI. Any error that is NOT `InvalidCdbLength` therefore means
+    /// the CDB cleared the guard and the syscall was reached.
+    const NO_FD: i32 = -1;
+
+    fn reached_the_ioctl(err: &Error) -> bool {
+        !matches!(err, Error::InvalidCdbLength { .. })
+    }
+
+    // ── Negative: CDBs the guard must reject ──────────────────────────────
+
+    /// The regression this module exists for. `raw_command` used to set
+    /// `cmd_len = cdb.len().min(16)`, silently shortening an over-length CDB
+    /// into a *different* SPC-4 command and issuing it. It must fail the
+    /// caller instead, with the same error `execute()` gives.
+    ///
+    /// Before the fix this test fails by reaching the `ioctl` and returning
+    /// `IoError(EBADF)` — the guard never ran.
+    #[test]
+    fn over_length_cdb_is_rejected_not_truncated() {
+        let cdb = [0u8; K_MAX_CDB_SIZE + 1];
+        match SgIoTransport::raw_command(NO_FD, &cdb, 3_000) {
+            Err(Error::InvalidCdbLength { len, max }) => {
+                assert_eq!(len, K_MAX_CDB_SIZE + 1);
+                assert_eq!(max, K_MAX_CDB_SIZE);
+            }
+            other => panic!(
+                "over-length CDB must be rejected with InvalidCdbLength, got {other:?} — \
+                 a non-guard error means it was truncated to {K_MAX_CDB_SIZE} bytes and sent"
+            ),
+        }
+    }
+
+    /// Well past the field width, to show the guard is a bound and not a
+    /// one-off check at `max + 1`.
+    #[test]
+    fn far_over_length_cdb_is_rejected() {
+        let cdb = [0u8; 260];
+        assert!(matches!(
+            SgIoTransport::raw_command(NO_FD, &cdb, 3_000),
+            Err(Error::InvalidCdbLength {
+                len: 260,
+                max: K_MAX_CDB_SIZE
+            })
+        ));
+    }
+
+    /// An empty CDB must be rejected rather than handed to the sg driver as a
+    /// zero-length command descriptor, which under SPC-4 is not a command at
+    /// all. (The pre-fix code did not panic on this — it never read the opcode
+    /// — it just issued `cmd_len = 0`. The two error paths added here DO read
+    /// `cdb[0]`, so the guard is now load-bearing for that too.)
+    #[test]
+    fn empty_cdb_is_rejected_before_the_opcode_is_read() {
+        assert!(matches!(
+            SgIoTransport::raw_command(NO_FD, &[], 3_000),
+            Err(Error::InvalidCdbLength {
+                len: 0,
+                max: K_MAX_CDB_SIZE
+            })
+        ));
+    }
+
+    // ── Positive: CDBs the guard must let through ─────────────────────────
+
+    /// The only CDB `raw_command` is called with in the crate. It must still
+    /// reach the syscall — a guard that rejected this would silently stop
+    /// unlocking the tray on `Drop`.
+    #[test]
+    fn drops_allow_medium_removal_still_reaches_the_ioctl() {
+        let err = SgIoTransport::raw_command(NO_FD, &ALLOW_MEDIUM_REMOVAL, 3_000)
+            .expect_err("EBADF on fd -1");
+        assert!(
+            reached_the_ioctl(&err),
+            "the 6-byte CDB Drop sends must pass the guard, got {err:?}"
+        );
+    }
+
+    /// Every real SPC-4 CDB length (groups 0-5: 6, 10, 12, 16), plus the
+    /// shortest a caller could legally construct, plus the boundary case — a
+    /// CDB of exactly `K_MAX_CDB_SIZE` must not be caught by an off-by-one.
+    #[test]
+    fn in_range_cdb_lengths_reach_the_ioctl() {
+        for len in [1usize, 6, 10, 12, K_MAX_CDB_SIZE] {
+            let cdb = vec![0x1Eu8; len];
+            let err = SgIoTransport::raw_command(NO_FD, &cdb, 3_000).expect_err("EBADF on fd -1");
+            assert!(
+                reached_the_ioctl(&err),
+                "a {len}-byte CDB is within the {K_MAX_CDB_SIZE}-byte field and must \
+                 pass the guard, got {err:?}"
+            );
+        }
     }
 }

@@ -101,10 +101,35 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 
+# Permutation model checker for the `scsi::fd_handoff` atomics — the fd
+# hand-off between a Linux recovery thread and `SgIoTransport::drop`. A normal
+# test cannot see a missing release edge there: the orderings compile to the
+# same instructions on x86_64, so the wrong ones pass every time. loom
+# enumerates the executions the C++20 model permits and reports the leaked
+# descriptor directly.
+#
+# Behind `cfg(loom)`, which nothing sets unless you ask for it, so this is out
+# of the graph for every ordinary build and for every CI job but the dedicated
+# `loom` one. Run it with:
+#
+#     RUSTFLAGS="--cfg loom" cargo test --lib --no-default-features \
+#         --features scsi fd_handoff
+#
+# `cargo test --lib` specifically: as a DEV-dependency loom is only in scope for
+# test targets, which is why `fd_handoff` gates its import on `all(loom, test)`
+# and falls back to std elsewhere. Without that, `--cfg loom` would break plain
+# `cargo build`/`clippy` with an unresolved-crate error.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [[bench]]
 name = "sgio_read"
 harness = false
 
+
+[lints.rust]
+# `loom` is set by RUSTFLAGS for the model checker above, never by a feature.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [lints.clippy]
 uninlined_format_args = "allow"
