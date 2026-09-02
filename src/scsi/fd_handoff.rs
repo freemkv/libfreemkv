@@ -74,6 +74,11 @@
 //! file still report the leak with either half applied alone. Both are
 //! `AcqRel` below.
 //!
+//! Concretely, the CAS in [`publish_recovered_fd`] carries both roles at once:
+//! its release half publishes the `open()` to [`take_recovered_fd`], and its
+//! acquire half is what lets the `dead` load that follows observe a teardown
+//! that has already claimed the slot.
+//!
 //! [`take_recovered_fd`] is deliberately left at `Acquire`, which makes its
 //! store half relaxed. That is harmless precisely because of the release-
 //! sequence rule above: an RMW extends the sequence whatever its own ordering,
@@ -136,26 +141,16 @@ pub(crate) fn take_recovered_fd(slot: &AtomicI32) -> Option<i32> {
     taken(slot.swap(EMPTY, Ordering::Acquire))
 }
 
-/// Publish a freshly opened fd from a recovery thread.
+/// Publish a freshly opened fd from a recovery thread. Returns the fd the
+/// **caller** must now close, or `None` if it was handed off:
 ///
-/// Returns the fd the **caller** must now close, or `None` if the fd was
-/// handed off successfully and someone else owns it:
+/// - The slot was already full — another recovery thread won, so we close
+///   ours rather than overwrite (and leak) the winner's.
+/// - The transport was torn down mid-`open()`; nothing will drain the slot,
+///   so we re-claim through it rather than close `new_fd` directly, which
+///   would double-close against a teardown swapping at the same moment.
 ///
-/// - The slot was already full — another recovery thread won. Ours was never
-///   published, so we close it rather than overwrite (and leak) the winner's.
-/// - The transport was torn down while we were opening. `claim_for_teardown`
-///   has already come and gone, so nothing will ever drain the slot; we take
-///   our fd back out and close it ourselves.
-///
-/// The `AcqRel` success ordering is load-bearing on both counts: the release
-/// half publishes the `open()` to [`take_recovered_fd`], and the acquire half
-/// is what makes the `dead` load below able to observe a teardown that has
-/// already claimed the slot. See the module docs.
-///
-/// The teardown case re-claims through the slot rather than closing `new_fd`
-/// directly, because a teardown may be claiming it at the same moment and only
-/// one of the two swaps can come away with a non-`EMPTY` value. Closing
-/// `new_fd` unconditionally there would double-close it.
+/// Both orderings below are `AcqRel`; the module docs say why.
 pub(crate) fn publish_recovered_fd(
     slot: &AtomicI32,
     dead: &AtomicBool,

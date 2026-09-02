@@ -132,19 +132,11 @@ impl SgIoTransport {
     /// live `&mut self` to route through `execute()`: `Drop`, unlocking the
     /// tray on its way out.
     ///
-    /// The CDB goes through the shared [`super::checked_cdb_len`] guard, so an
-    /// empty or over-length CDB is REJECTED here exactly as it is in
-    /// `execute()`. It used to be clamped with `cdb.len().min(16)`, which is
-    /// the one thing that guard exists to prevent: under SPC-4 the group code
-    /// in byte 0 fixes the CDB length, so dropping the tail bytes does not
-    /// shorten the command, it issues a different one. See `checked_cdb_len`
-    /// for the full argument.
-    ///
-    /// Returns a typed [`Error`] rather than `()` so a rejected CDB is
-    /// distinguishable from an I/O failure. That is not decoration: `Drop`
-    /// discards the result either way, and telling the two apart is the only
-    /// way to test the guard without a real `/dev/sg*` device — see
-    /// `raw_command_cdb_guard_tests`.
+    /// The CDB goes through the shared [`super::checked_cdb_len`] guard rather
+    /// than the old `cdb.len().min(16)` clamp — see docs/scsi-mod.md,
+    /// "checked_cdb_len rationale". Returning a typed [`Error`] rather than
+    /// `()` is what lets `raw_command_cdb_guard_tests` tell a rejected CDB
+    /// from an I/O failure without a real `/dev/sg*` device.
     fn raw_command(fd: i32, cdb: &[u8], timeout_ms: u32) -> Result<()> {
         let cmd_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
         let mut sense = [0u8; 32];
