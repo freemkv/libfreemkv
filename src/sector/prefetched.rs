@@ -232,14 +232,10 @@ impl PrefetchedSectorSource {
                                 Err(RecvTimeoutError::Disconnected) => return,
                             }
                         };
-                        if bytes <= buf.capacity() {
-                            // Re-expose `bytes` without zero-filling; sound because
-                            // buffers are born `vec![0u8; batch_bytes]` and only grown
-                            // via `resize(_, 0)`, so bytes below `capacity` are init'd.
-                            unsafe { buf.set_len(bytes) };
-                        } else {
-                            buf.resize(bytes, 0);
-                        }
+                        // Sound resize (was `unsafe set_len` guarded only by capacity):
+                        // public `into_channels` lets a caller recycle a cap-only Vec, so
+                        // set_len could expose uninit memory (UB) — GHSA-j8ww-f5fg-9pmh.
+                        buf.resize(bytes, 0);
                         // `start_lba + offset` derives from untrusted extent
                         // data — saturate rather than wrap/panic on a
                         // hostile start_lba near u32::MAX.
