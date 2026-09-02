@@ -136,6 +136,49 @@ jobs:
       - run: cargo test --tests
         working-directory: libfreemkv
 
+  # The memory orderings in `scsi::fd_handoff` — the fd hand-off between a
+  # recovery thread and `SgIoTransport::drop` — cannot be checked by `cargo
+  # test`: they compile to the same instructions on x86_64, so the WRONG ones
+  # pass every run. loom enumerates the executions the C++20 model permits and
+  # reports the leaked descriptor directly, which makes it the only regression
+  # coverage that part of the module has. If this job stops running, that
+  # coverage disappears silently behind a green build.
+  #
+  # Its own job rather than a step in `test` because `RUSTFLAGS` is part of the
+  # rust-cache key: folding it into `test` costs that job a full cache miss on
+  # every run. It takes the same sibling checkout as the jobs above even though
+  # `--no-default-features` drops freemkv-unlock from the BUILD — `--features`
+  # does not exempt an optional path dependency from manifest RESOLUTION, so
+  # without the sibling this job would fail the moment the branch tip carries
+  # the path-dep form of that dependency rather than a git tag.
+  loom:
+    needs: resolve-msrv
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg loom
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: libfreemkv
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-unlock
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: libfreemkv
+      - run: cargo test --lib --no-default-features --features scsi fd_handoff
+        working-directory: libfreemkv
+      # `lint` runs clippy without `--cfg loom`, so this is the only place the
+      # model code is linted at all.
+      - run: cargo clippy --lib --no-default-features --features scsi --profile test -- -D warnings
+        working-directory: libfreemkv
+
   deny:
     runs-on: ubuntu-latest
     steps:

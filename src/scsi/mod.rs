@@ -12,6 +12,12 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+// The Linux recovery-thread fd hand-off. Compiled on every platform though
+// only `linux.rs` uses it, so its tests run everywhere — the same reasoning as
+// `checked_cdb_len`. Rationale and memory ordering: the module's own docs.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) mod fd_handoff;
+
 #[allow(unused_imports)]
 use crate::error::{Error, Result};
 use std::path::Path;
