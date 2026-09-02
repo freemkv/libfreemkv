@@ -495,9 +495,6 @@ mod tests {
     // This suite predates the module split; it white-box-tests items now living
     // in sibling modules. Pull them all in so the tests keep exercising them.
     use super::super::crypto::*;
-    use super::super::derive::*;
-    use super::super::inf::*;
-    use super::super::mkb::*;
     use super::super::provider::SuppliedKey;
     use super::super::types::DiscEntry;
     use super::super::types::*;

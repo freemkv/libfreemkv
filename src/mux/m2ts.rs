@@ -301,11 +301,13 @@ mod tests {
         let header_end = cursor.position() as usize;
         let ts_bytes = &buf[header_end..];
 
-        // Find first PUSI packet on VIDEO_PID; verify RAI in AF flags.
-        // chunks_exact drops a partial trailing chunk — only whole 192-byte
-        // BD-TS packets are valid, and it avoids OOB indexing on a short chunk.
+        // First PUSI packet on VIDEO_PID; verify RAI in AF flags. as_chunks
+        // drops a partial trailing chunk (.0 = whole chunks only) — valid BD-TS
+        // packets are 192 bytes, and it avoids OOB indexing on a short chunk.
         let pkt = ts_bytes
-            .chunks_exact(192)
+            .as_chunks::<192>()
+            .0
+            .iter()
             .find(|p| {
                 let h = &p[4..];
                 let pid = (((h[1] & 0x1F) as u16) << 8) | h[2] as u16;
