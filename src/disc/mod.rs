@@ -64,20 +64,13 @@ pub struct Disc {
     /// attempted (unencrypted disc) or succeeded.
     pub aacs_error: Option<crate::error::Error>,
     /// CSS crack failure: `Some(Error::CssKeyMissing)` when the scan SAW
-    /// scrambled sectors but could NOT recover a title key (the
-    /// known-plaintext attack found no crackable crib, or the scrambled
-    /// region was unreadable). `css` is `None` in that case — but the disc is
-    /// genuinely encrypted, so callers MUST surface this hard error rather
-    /// than treat `css.is_none()` as "unencrypted" and mux scrambled MPEG as
-    /// plaintext garbage. `None` when no scrambled sector was seen (genuinely
-    /// unencrypted) or a key was recovered (`css.is_some()`). The CSS analogue
-    /// of [`Self::aacs_error`].
-    ///
-    /// This records the MAIN feature's crack, so it is a WHOLE-DISC signal: the
-    /// gates convert it into [`crate::error::Error::CssNoDiscKey`] (disc-level,
-    /// `error::is_disc_level_no_key`), not the per-title
-    /// [`crate::error::Error::CssKeyMissing`] the field itself carries as its
-    /// recorded reason.
+    /// scrambled sectors but could NOT recover a title key. `css` is `None`
+    /// in that case — but the disc is genuinely encrypted, so callers MUST
+    /// surface this hard error rather than treat `css.is_none()` as
+    /// "unencrypted" and mux scrambled MPEG as plaintext garbage. `None` when
+    /// no key was needed or one was recovered. Records the MAIN feature's
+    /// crack (whole-disc signal): gates convert it to `Error::CssNoDiscKey`,
+    /// not the per-title `Error::CssKeyMissing` this field itself carries.
     pub css_error: Option<crate::error::Error>,
     /// Content format (BD transport stream vs DVD program stream)
     pub content_format: ContentFormat,
@@ -177,14 +170,10 @@ pub struct Clip {
     pub source_packets: u32,
     /// Byte range this clip's stream occupies within the TITLE'S FEED — the
     /// concatenation of the title's extents, in the order the mux reads them.
-    /// `None` when it could not be determined.
-    ///
-    /// This is PROVENANCE, and it is what makes clip assignment a lookup
-    /// instead of a guess. During an overlap two clips' mark ranges both
-    /// contain the same timestamp, so no rule over timestamps alone can say
-    /// which clip a frame came from — four audit rounds each fixed one such
-    /// rule and broke another. A frame carries its source byte offset
-    /// (`PesFrame::source`), and that offset falls in exactly one clip's span.
+    /// `None` when it could not be determined. This is PROVENANCE: during an
+    /// overlap, two clips' mark ranges can share a timestamp, so a frame's
+    /// source byte offset (`PesFrame::source`) — which falls in exactly one
+    /// clip's span — is used for assignment instead of timestamps alone.
     pub feed_span: Option<(u64, u64)>,
 }
 
@@ -496,21 +485,9 @@ pub struct Extent {
     pub sector_count: u32,
 }
 
-/// Is this disc structurally AACS-encrypted — i.e. does it carry an AACS
-/// directory?
-///
-/// THE ONE definition of that question. `Disc::identify` (the fast path, which
-/// only reads the filesystem) and `Disc::scan_with` (the full scan) both need
-/// it, and both used to spell the same two `find_dir` calls out by hand. They
-/// agreed today; nothing made them agree tomorrow. Adding a third AACS
-/// location, or excluding an empty placeholder directory, to one copy and not
-/// the other would silently desync the fast identify from the full scan — the
-/// same disc reported encrypted by one and clear by the other.
-///
-/// This is STRUCTURAL, not cryptographic: it says the tree looks like an
-/// encrypted disc, not that any sector actually is. A folder copied verbatim
-/// from a decrypted disc keeps its `AACS/` and answers true here (see
-/// `session::scan_dir`, which corrects for exactly that).
+// THE ONE definition of "structurally AACS-encrypted" — shared by the fast
+// identify and the full scan so they can't silently desync. Structural, not
+// cryptographic. See docs/disc-mod.md — aacs_dir_present.
 pub(crate) fn aacs_dir_present(udf_fs: &crate::udf::UdfFs) -> bool {
     udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some()
 }
@@ -524,22 +501,9 @@ fn merged_extents<'a>(extents: impl Iterator<Item = &'a Extent>) -> Vec<(u32, u3
     crate::udf::merge_ranges(&ranges)
 }
 
-/// Correct a title's TrueHD audio-stream metadata by probing the first
-/// decrypted access units — channel count, real sample rate, and Atmos
-/// detection in a single major-sync read. The MPLS descriptors declare the BASE
-/// layout (often 5.1 / a container-guessed rate) even for a 7.1/Atmos TrueHD
-/// track; the truth is in the MLP major sync. `reader` must yield DECRYPTED
-/// sectors (the m2ts is AACS-encrypted, so this can only run at mux time, not
-/// scan). Reads a bounded window of the title's first extent.
-///
-/// Corrections, each individually guarded so a malformed field never writes a
-/// wrong header:
-/// - **Channels**: from the presentation channel masks (as before).
-/// - **Sample rate**: from the whitelisted rate nibble; left untouched on an
-///   unknown rate or no major sync.
-/// - **Atmos**: when a 4th substream is detected AND the stream still carries
-///   the basic descriptor label, the label is promoted to the Atmos form;
-///   richer editorial labels (e.g. an existing "Dolby Atmos") are left intact.
+// Corrects a title's TrueHD channels/sample-rate/Atmos by probing the first
+// decrypted major sync (`reader` must yield DECRYPTED sectors: mux time, not
+// scan). See docs/disc-mod.md — correct_truehd_channels.
 pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut DiscTitle) {
     use crate::mux::codec::truehd::{
         truehd_channels, truehd_sample_rate_hz, truehd_sync_info_from_stream,
@@ -637,16 +601,9 @@ pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut
     }
 }
 
-/// Merge per-title AACS key ranges into the sorted, disjoint set the whole-disc map
-/// needs ([`crate::decrypt::AacsKeyMap::entry_for`] requires disjoint ranges).
-/// Titles that share a clip resolve the SAME physical span (same LBAs → same CPS
-/// unit → same key). When a later range overlaps a kept one that carries the SAME
-/// key index and phase, the two are UNIONED (end extended to the max) — this covers
-/// both the exact-duplicate (shared clip) case and any partial overlap without ever
-/// dropping coverage, so no encrypted LBA is left in no range (which would pass
-/// through as ciphertext). A real disc never produces two DIFFERENT keys for one
-/// LBA; if that malformed case ever appeared, the later range is dropped to keep the
-/// set disjoint rather than extend one key over another key's LBAs.
+// Merges per-title AACS key ranges into the sorted, disjoint set the whole-disc
+// map needs. Same-key overlaps are UNIONED (never drop coverage); a malformed
+// different-key overlap is dropped to stay disjoint. See docs/disc-mod.md.
 fn merge_content_key_ranges(
     mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)>,
 ) -> Vec<(u32, u32, usize, crate::decrypt::Phase)> {
@@ -693,10 +650,9 @@ pub fn bytes_bad_in_title(title: &DiscTitle, bad_ranges: &[(u64, u64)]) -> u64 {
     total
 }
 
-/// Byte offset of `lba` within `title`'s extents (concatenated in order), or
-/// `None` if the LBA falls outside every extent. The title is a virtual
-/// contiguous stream; this maps a disc LBA into that stream so a chapter/time
-/// lookup can place it. (Moved from autorip — clients must not re-derive it.)
+// Byte offset of `lba` within `title`'s extents (concatenated in order), or
+// `None` if outside every extent — maps a disc LBA into the title's virtual
+// contiguous stream. (Moved from autorip — clients must not re-derive it.)
 fn byte_offset_in_title(lba: u32, title: &DiscTitle) -> Option<u64> {
     use crate::consts::SECTOR_BYTES_U64;
     let mut cumulative = 0u64;
@@ -757,15 +713,11 @@ fn range_chapter(lba: u32, title: &DiscTitle) -> (Option<u32>, Option<f64>) {
 
 /// Annotate raw bad byte-ranges with chapter + movie time, producing the
 /// rendered drilldown ([`crate::progress::LocatedProgress`]) a client draws.
-/// `raw` is the mapfile's `(byte_pos, byte_len)` set for whichever statuses the
-/// caller cares about (the live "Maybe" set during a patch, or terminal
-/// `Unreadable` for the verdict). The list is sorted largest-movie-time first
-/// and capped at 50; `truncated` reports the overflow. `bps` (title bytes/sec)
-/// is derived from the title so callers don't thread it.
-///
-/// This is the single place range→chapter/time annotation happens; autorip used
-/// to own it and read the mapfile to do so. Now the library computes it from
-/// its in-memory mapfile + title, and the client renders the result verbatim.
+/// `raw` is the mapfile's `(byte_pos, byte_len)` set for whichever statuses
+/// the caller cares about (the live "Maybe" set, or terminal `Unreadable`).
+/// Sorted largest-movie-time first and capped at 50; `truncated` reports the
+/// overflow. `bps` (title bytes/sec) is derived from the title so callers
+/// don't thread it. Single place range→chapter/time annotation happens.
 pub fn locate_ranges(raw: &[(u64, u64)], title: &DiscTitle) -> crate::progress::LocatedProgress {
     use crate::consts::{MILLIS_PER_SEC, SECTOR_BYTES_U64};
     use crate::progress::{LocatedProgress, LocatedRange};
@@ -957,43 +909,15 @@ impl Resolution {
         }
     }
 
+    // See docs/disc-mod.md — Resolution::pixels for the fabrication-trap history.
     /// Pixel dimensions (width, height). `None` when the resolution is
-    /// [`Resolution::Unknown`] — "no dimensions", not a guess.
-    ///
-    /// The SD frames are the DVD-Video coded pictures (ITU-R BT.601 525/60 and
-    /// 625/50 active area); the HD frames are the Blu-ray Disc Read-Only Format
-    /// part 3 video formats; 3840x2160 is the UHD BD frame.
-    ///
-    /// `Unknown` deliberately does NOT fabricate a plausible 1920x1080. This is
-    /// the same trap already closed on [`AudioChannels::count`] (which used to
-    /// return 6) and [`SampleRate::hz`] (48000.0): a plausible wrong answer is
-    /// indistinguishable from a real one at every call site, so it makes each
-    /// caller responsible for remembering to check the variant first — and the
-    /// `json://` sink had already walked into exactly that, reporting confident
-    /// dimensions for a stream whose neighbouring `resolution` field said
-    /// "unknown". A zero is unmistakable, and every caller in tree already
-    /// handles it: the Matroska sink omits the optional PixelWidth/PixelHeight,
-    /// the VobSub `.idx` writer omits its `size:` line, and no caller divides by
-    /// either dimension.
-    /// `None` when the resolution never resolved.
-    ///
-    /// Returns an `Option` rather than a sentinel because every caller has to
-    /// make a DIFFERENT decision and the compiler is the only thing that
-    /// reliably makes them: Matroska omits the optional PixelWidth/PixelHeight
-    /// elements, the metadata sinks report the dimensions as absent, and MP4
-    /// cannot do either — ISO/IEC 14496-12 makes width and height MANDATORY in
-    /// both `tkhd` (8.3.2) and VisualSampleEntry (12.1.3), so it must refuse.
-    ///
-    /// This returned `(0, 0)` before, and that is the shape the sentinel
-    /// creates: `(0, 0)` looks like a usable pair, so the MP4 sink stored it
-    /// and serialised a 0x0 video track — a structurally complete file that no
-    /// player can render, written with no error. It returned a fabricated
-    /// 1920x1080 before that, which was wrong but at least playable, so the
-    /// sink had never needed a guard and the absence of one was invisible.
-    ///
-    /// A doc comment listing which callers are safe cannot hold this: one did
-    /// not check, and a third kept its own duplicate `Unknown` test long after
-    /// the accessor took the job over.
+    /// [`Resolution::Unknown`] — "no dimensions", not a guess. SD frames are
+    /// the DVD-Video coded pictures (BT.601 525/60, 625/50 active area); HD
+    /// frames are the BD-ROM part 3 video formats; 3840x2160 is UHD BD.
+    /// `Unknown` deliberately does NOT fabricate a plausible 1920x1080 or
+    /// `(0, 0)`: every caller must positively check the variant, and each
+    /// makes a DIFFERENT decision on `None` (Matroska/VobSub omit the field,
+    /// MP4 must refuse per ISO/IEC 14496-12's mandatory width/height).
     pub fn pixels(&self) -> Option<(u32, u32)> {
         match self {
             Resolution::R480i | Resolution::R480p => Some((720, 480)),
@@ -1475,22 +1399,14 @@ impl DiscTitle {
         self.video_streams().next().is_some()
     }
 
+    // See docs/disc-mod.md — has_probable_video for the full audit-R6 rationale.
     /// Whether this title PLAUSIBLY carries feature video content — a real
     /// primary video stream, OR a size/duration profile only video explains
-    /// (at least 2 GB and 5 minutes).
-    ///
-    /// The exposed `streams` come from the title's FIRST PlayItem only, so a
-    /// feature whose first PlayItem is a non-video bumper reports
-    /// `has_video() == false` and would be wrongly disqualified (audit R6).
-    /// This predicate is deliberately MORE permissive than [`Self::has_video`]
-    /// — it only ever ADMITS a title the stricter gate would reject — so it
-    /// cannot reopen the decoy hole (a size-inflated streamless decoy is demoted
-    /// STRUCTURALLY by composite detection in [`Disc::rank_titles`], not by this
-    /// gate), while it still rejects tiny streamless menu/metadata playlists.
-    /// It is the `has-video` key used by [`Disc::main_feature_order`]. The size
-    /// fallback requires at least one clip, so a clip-less pure-metadata decoy
-    /// (which cannot be a real bumper-lead feature — that has the feature clip)
-    /// is still rejected.
+    /// (at least 2 GB and 5 minutes). Deliberately MORE permissive than
+    /// [`Self::has_video`] (only ever ADMITS a title the stricter gate would
+    /// reject) so a bumper-led feature isn't wrongly disqualified, while a
+    /// clip-less pure-metadata decoy is still rejected. Used as the
+    /// `has-video` key by [`Disc::main_feature_order`].
     pub fn has_probable_video(&self) -> bool {
         self.has_video()
             || (!self.clips.is_empty()
@@ -1575,9 +1491,8 @@ pub enum KeyOrigin {
     ExternalUk,
 }
 
-// No `KeyOrigin::name()`: the library holds ZERO user-facing English (CLAUDE.md).
-// `KeyOrigin` is a typed enum; applications map its variants to display text
-// (see freemkv's `disc_info::key_origin_label`).
+// No `KeyOrigin::name()`: the library holds ZERO user-facing English. Callers
+// map variants to display text (see freemkv's `disc_info::key_origin_label`).
 
 // ─── Disc scanning ──────────────────────────────────────────────────────────
 
@@ -1710,19 +1625,14 @@ impl Disc {
         Ok((capacity, buffered, udf_fs))
     }
 
-    /// Scan a disc — parse filesystem, playlists, streams, and set up
-    /// AACS decryption. This is the main entry point; after `scan()` the
-    /// Disc is ready (titles populated with streams, AACS inputs
-    /// captured, content readable and decryptable transparently).
-    ///
-    /// One pipeline, one order:
-    ///   1. Read capacity + UDF filesystem
-    ///   2. AACS handshake + key resolution
-    ///   3. Parse playlists + streams
-    ///   4. Apply labels
-    ///
-    /// The session must be open and unlocked (`Drive::open` handles this).
-    /// All disc reads use standard READ(10) via UDF — no vendor SCSI commands.
+    /// Scan a disc — parse filesystem, playlists, streams, and set up AACS
+    /// decryption. This is the main entry point; after `scan()` the Disc is
+    /// ready (titles populated with streams, AACS inputs captured, content
+    /// readable and decryptable transparently). One pipeline, one order:
+    /// (1) read capacity + UDF filesystem, (2) AACS handshake + key
+    /// resolution, (3) parse playlists + streams, (4) apply labels. The
+    /// session must be open and unlocked (`Drive::open` handles this). All
+    /// disc reads use standard READ(10) via UDF — no vendor SCSI commands.
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
         // AACS handshake (Blu-ray/UHD) acquires the Volume ID via cert-based
         // mutual-auth; drive unlock runs separately behind the `Unlocker` seam.
@@ -1783,52 +1693,15 @@ impl Disc {
         tracing::info!(target: "freemkv::scan", titles = disc.titles.len(), format = ?disc.content_format, "phase: titles parsed");
 
         // No CSS key recovery at scan time: DVD CSS keys are per-title and are
-        // re-cracked keylessly at read/decrypt time, so an up-front "disc key"
-        // is meaningless. Scan's only CSS job is the bus-auth unlock above.
-
-        // `disc.css` is intentionally never set at scan time now (per-title CSS
-        // keys are cracked at read/mux time), so log the format the scan actually
-        // determined rather than a key state that is always `None` here.
+        // re-cracked keylessly at read/decrypt time (`disc.css` stays unset),
+        // so log the format rather than a key state that is always `None`.
         tracing::info!(target: "freemkv::scan", format = ?disc.format, titles = disc.titles.len(), "phase: scan complete");
         Ok(disc)
     }
 
-    /// The extents an image-time CSS crack scans, in the crate's CANONICAL
-    /// order: the main feature's own extents, in natural playback order.
-    ///
-    /// Both halves are deferred to logic the crate already owns rather than
-    /// re-derived here:
-    /// - WHICH title — `scan_with` has already sorted `titles` with
-    ///   [`Self::canonical_title_order`], so the canonical main feature is the
-    ///   first title that actually has extents. No local pick.
-    /// - WHAT ORDER — playback order, i.e. the extent vector untouched, exactly
-    ///   as [`Self::decrypt_keys_for_title`] hands `&title.extents` to
-    ///   `css::crack_key_outcome`.
-    ///
-    /// **Why this function exists (do not let the copy grow back):**
-    /// `Disc::scan_image` used to re-implement both halves inline — it picked
-    /// the title with the largest total sector count, then re-sorted that
-    /// title's extents LARGEST-CELL-FIRST before handing them to
-    /// `crack_key_outcome`. Both had drifted from the canonical rules:
-    ///
-    /// - Largest-cell-first is the 1.5.1 garbage bug. A CSS DVD's biggest cell
-    ///   opens with a long CLEAR run, and the crack's 50_000-sector budget is
-    ///   shared across the whole extent list, so starting there can exhaust the
-    ///   budget without ever reaching a scrambled sector — the crack reports
-    ///   `Unencrypted` and the mux emits scrambled MPEG as plaintext. Playback
-    ///   order reaches the scrambled feature body after only the small clear
-    ///   front matter that precedes it on a real disc (CSS: the title key is
-    ///   recovered from the scrambled data itself, so the scan must actually
-    ///   MEET scrambled data).
-    /// - The sector-count pick ignores `canonical_title_order`'s capacity gate,
-    ///   so it selects the oversize "play-all" composite (whose declared cells
-    ///   double-count data shared with other playlists) instead of the real
-    ///   feature — i.e. a DIFFERENT title, and on a multi-VTS disc a different
-    ///   VTS, whose CSS title key does not descramble the feature at all.
-    ///
-    /// The result: the same disc cracked as an ISO could disagree with the same
-    /// disc cracked from the drive, which is precisely what the duplicate was
-    /// free to do. Keep the derivation here, shared, so it cannot recur.
+    // The extents an image-time CSS crack scans, in the crate's CANONICAL
+    // order (main feature's own extents, playback order) — do not re-derive
+    // this inline. See docs/disc-mod.md — image_crack_extents.
     fn image_crack_extents(titles: &[DiscTitle]) -> &[Extent] {
         // Prefer the first title with BOTH video and extents (the main feature)
         // so the CSS crack scans the movie, not a streamless decoy. Falls back
@@ -1883,16 +1756,9 @@ impl Disc {
         Ok(disc)
     }
 
-    /// Read a disc's AACS key-input files from a sector source: returns
-    /// `(Unit_Key_RO.inf, MKB)` raw bytes. Shared body for
-    /// [`Disc::read_aacs_inputs`] (ISO) and
-    /// [`Disc::read_aacs_inputs_from_drive`] (live drive).
-    ///
-    /// Prefers MKB_RO, falls back to MKB_RW, then TRIMS to the real
-    /// record length. Both files are allocated to a fixed ~128 MiB and
-    /// zero-padded, so reading either ships up to ~124 MiB of nothing —
-    /// trim to the record stream so callers send/store a few MB, not
-    /// 128 MiB.
+    // Reads a disc's AACS key-input files: (Unit_Key_RO.inf, MKB) raw bytes.
+    // Shared body for read_aacs_inputs (ISO) / read_aacs_inputs_from_drive
+    // (live drive). See docs/disc-mod.md — read_aacs_inputs_from_reader.
     pub(crate) fn read_aacs_inputs_from_reader(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
@@ -1906,17 +1772,9 @@ impl Disc {
         Ok((inf, mkb, version))
     }
 
-    /// AACS major version ([`crate::aacs::mkb::AACS_MAJOR_BD`] /
-    /// [`crate::aacs::mkb::AACS_MAJOR_UHD`]) from the content certificate. Drives the
-    /// `Unit_Key_RO.inf` parse stride (48-byte V10 vs 64-byte V20/V21), so the
-    /// out-of-band key-fetch path parses `enc_title_keys` at the right stride (a
-    /// server VUK then derives the correct unit keys).
-    ///
-    /// When no content certificate is readable/parseable, defaults to **UHD
-    /// (V20, 64-byte stride)** — the conservative choice the pre-1.2.0 fetch path
-    /// hardcoded — and logs it: a wrong stride here folds a server VUK against
-    /// mis-strided title keys (silent wrong unit keys), so a missing cert must
-    /// not quietly pick the V10 stride for a UHD disc.
+    // AACS major version from the content certificate; drives the
+    // Unit_Key_RO.inf parse stride. Defaults to UHD (V20, 64-byte stride)
+    // when unreadable. See docs/disc-mod.md — read_aacs_version.
     fn read_aacs_version(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> u8 {
         match crate::aacs::read_first(
             &crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::ContentCert),
@@ -1939,17 +1797,9 @@ impl Disc {
         }
     }
 
-    /// Read the AACS MKB's real record stream — NOT its zero padding.
-    ///
-    /// `MKB_RO.inf` / `MKB_RW.inf` are allocated to a fixed ~128 MiB and
-    /// zero-padded; the actual record stream is a few MiB. We read a bounded
-    /// prefix, find the record-stream length via [`crate::aacs::mkb::mkb_content_len`]
-    /// and return exactly that, growing the prefix if the records run past it.
-    /// This avoids reading 100+ MiB of padding on every scan AND avoids the
-    /// `read_file` `MAX_FILE_BYTES` cap that (since 0.31.0) rejected the padded
-    /// 128 MiB MKB outright — which made `read_aacs_inputs` fail and autorip
-    /// report "could not read this disc's key files" without ever contacting
-    /// the keyserver.
+    // Reads the AACS MKB's real record stream — NOT its ~128 MiB zero padding.
+    // Reads a bounded, growing prefix instead, avoiding both the padding read
+    // and the read_file MAX_FILE_BYTES cap. See docs/disc-mod.md.
     fn read_mkb_content(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> Result<Vec<u8>> {
         const START_BYTES: usize = 16 * 1024 * 1024;
         const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -2008,13 +1858,9 @@ impl Disc {
         Self::read_aacs_inputs_from_reader(&mut reader, &udf_fs)
     }
 
-    /// Core scan pipeline — works with any SectorSource.
-    ///
-    /// `handshake_error` is plumbed from `do_handshake` so failures
-    /// (cert rejected, raw-read unsupported, VID read failed) are
-    /// preserved as `disc.aacs_error` for callers to render. When key
-    /// resolution succeeds despite the handshake failure (built-in
-    /// keys + disc-hash lookup hit) the error is dropped.
+    // Core scan pipeline — works with any SectorSource. `handshake_error` is
+    // plumbed so failures are preserved as `disc.aacs_error`, unless key
+    // resolution still succeeds (built-in keys + disc-hash hit).
     fn scan_with(
         reader: &mut dyn SectorSource,
         capacity: u32,
@@ -2171,70 +2017,19 @@ impl Disc {
     // ── Internal helpers ────────────────────────────────────────────────────
 
     /// Total ordering used to sort `Disc::titles` so `titles[0]` is the
-    /// canonical main feature.
-    ///
-    /// **Why not just sort by duration descending?** Branching UHDs
-    /// (and some BD authoring) ship a "play-all" virtual playlist that
-    /// references the same source clips multiple times for seamless
-    /// alternate-angle / alternate-ending playback. Those playlists
-    /// report an inflated `duration_secs` (often 4+ hours) and an
-    /// inflated `size_bytes` greater than the disc's physical
-    /// capacity. Example seen in the wild — *The Amateur (2025)* UHD,
-    /// 58.5 GB BD-100 disc:
-    ///
-    /// | Title | Playlist     | Duration | Size    | Clips |
-    /// |-------|--------------|----------|---------|-------|
-    /// |   1   | 00020.mpls   | 4h 13m   | 92.4 GB |  253  |
-    /// |   2   | 00800.mpls   | 2h 02m   | 57.2 GB |    1  |
-    ///
-    /// Title 1's 92.4 GB cannot fit on a 58.5 GB disc unless the same
-    /// clip data is referenced multiple times — proof it's a virtual
-    /// composite. A duration-only sort would put it at `titles[0]`,
-    /// so `freemkv -t 1`, `disc.titles.first()`, and autorip's
-    /// main-feature picker all grab the 4-hour composite instead of
-    /// the 2-hour movie that actually matches TMDB.
-    ///
-    /// **Sort priority (`titles[0]` = most likely main feature):**
-    /// 1. Real titles (`size_bytes ≤ capacity_bytes`) before virtual
-    ///    composites. The capacity check is a hard "physically
-    ///    possible data on this disc" gate. `capacity_bytes == 0` means
-    ///    the capacity is UNKNOWN (READ CAPACITY failed), so the gate is
-    ///    skipped entirely rather than demoting every real title.
-    /// 2. Among real titles, LARGEST physical size first — the main
-    ///    feature is the biggest real title on the disc. (This replaced
-    ///    the old clip-count ordering, which mis-ranked heavily
-    ///    chapter-per-clip discs.)
-    /// 3. Tiebreak on longer duration first.
-    ///
-    /// **Effect on non-branching discs:** unchanged — the main movie
-    /// is already the longest 1-clip title.
-    /// **Effect on branching UHDs:** the virtual play-all playlist is
-    /// pushed to the back, the actual movie surfaces at index 0.
-    /// The sort keys [`Self::canonical_title_order`] applies, in priority
-    /// order, as diagnostic-facing tokens.
-    ///
-    /// Defined HERE, immediately beside the comparator, so a diagnostic can
-    /// NAME the ordering instead of restating it. The `freemkv::diag`
-    /// main-feature decision row used to carry its own hand-written copy of
-    /// this list, and it drifted: it still advertised a `fewest-clips` key long
-    /// after the comparator replaced clip-count with largest-physical-size, so
-    /// the `--log-level 3` bug-report log explained freemkv's top-level pick
-    /// with a rule freemkv does not apply. Any change to the keys below must
-    /// change this list in the same edit.
+    /// canonical main feature. Sort priority: (1) real titles (`size_bytes
+    /// <= capacity_bytes`, skipped when capacity is UNKNOWN i.e. 0) before
+    /// virtual "play-all" composites; (2) among real titles, LARGEST
+    /// physical size first; (3) tiebreak on longer duration. Not a plain
+    /// duration sort: a branching UHD's play-all can report an inflated
+    /// duration/size exceeding the disc's physical capacity. These are the
+    /// [`Self::canonical_title_order`] sort keys; see docs/disc-mod.md.
     pub const CANONICAL_TITLE_ORDER_KEYS: &'static [&'static str] =
         &["fits-disc", "largest-size", "longest", "richest-audio"];
 
-    /// Content-based forced-subtitle detection, restricted to `BdTs` titles —
-    /// gates on the STREAM CONTAINER, not the disc-tree format, because a
-    /// disc can carry non-`BdTs` titles even under `BDMV/` scanning. Only
-    /// `BdTs` titles carry PES-wrapped PGS the shared classifier
-    /// (`pgs_forced_probe`) understands; running it against an HD-DVD/DVD
-    /// (`MpegPs`) title's extents would demux the wrong container.
-    ///
-    /// Pulled out of `scan_with` as its own callable predicate: the decision
-    /// is otherwise reachable only by driving the full scan pipeline (tree
-    /// dispatch → title parsing → this loop), so a test could not pin the
-    /// gate without also authoring an entire synthetic disc image.
+    // Content-based forced-subtitle detection, restricted to `BdTs` titles —
+    // gates on STREAM CONTAINER not disc-tree format (only BdTs carries
+    // PES-wrapped PGS). See docs/disc-mod.md for why it's its own function.
     fn probe_forced_subtitles_for_bdts_titles(
         reader: &mut dyn SectorSource,
         titles: &mut [DiscTitle],
@@ -2276,30 +2071,12 @@ impl Disc {
 
     /// The keys [`Self::main_feature_order`] layers ON TOP of
     /// [`Self::CANONICAL_TITLE_ORDER_KEYS`], highest priority first, as
-    /// diagnostic tokens. Kept beside the comparator so the `freemkv::diag`
-    /// decision row can NAME the ordering instead of restating it (same
-    /// anti-drift contract as `CANONICAL_TITLE_ORDER_KEYS`).
-    ///
-    /// - `nav-feature`: the title the disc's own HDMV navigation plays as the
-    ///   feature, resolved by running First-Play in the [`crate::bdnav`] VM the
-    ///   way a real player would. This is the authoritative, size-independent
-    ///   pick; it is video-gated (a mis-resolve cannot select a streamless
-    ///   playlist) and simply absent when the VM abstains (BD-J discs, or
-    ///   non-convergence), in which case the lower keys decide.
-    /// - `authoring-feature`: a title the disc's own menu authoring designates
-    ///   as the feature (has video, is not itself a composite, and is within a
-    ///   sane fraction of the longest title's duration) outranks everything
-    ///   else — a size-independent signal an obfuscation decoy cannot forge.
-    /// - `standalone`: a title that is a play-all / wrapper COMPOSITE — its clip
-    ///   set properly contains another substantial video title's whole clip set
-    ///   (a real UHD title's decoy playlist `00245` = `[bumper][00001 feature clip][outro]`
-    ///   case) — is demoted below the standalone title it wraps. This is the
-    ///   STRUCTURAL anti-decoy signal; it does not depend on stream counts,
-    ///   physical size, or disc capacity, so it survives where those are spoofed
-    ///   or unknown.
-    /// - `has-video`: a title with no plausible video content (see
-    ///   [`DiscTitle::has_probable_video`]) is demoted below every title that
-    ///   has some — a floor that drops streamless menu/metadata playlists.
+    /// diagnostic tokens: `nav-feature` (disc's own HDMV nav pick,
+    /// authoritative), `authoring-feature` (disc's menu-designated feature),
+    /// `standalone` (demotes a play-all/wrapper COMPOSITE below the real
+    /// title it wraps), `has-video` (demotes titles with no plausible video,
+    /// see [`DiscTitle::has_probable_video`]). Kept beside the comparator;
+    /// see docs/disc-mod.md for detail.
     pub const MAIN_FEATURE_ORDER_KEYS: &'static [&'static str] = &[
         "nav-feature",
         "authoring-feature",
@@ -2307,22 +2084,14 @@ impl Disc {
         "has-video",
     ];
 
-    /// Precompute the [`TitleRank`] for every title, in the same index order.
-    ///
-    /// Composite detection: title `P` is a composite when some OTHER title `Q`
-    /// has a non-empty clip-id set that is a PROPER SUBSET of `P`'s
-    /// (`Q ⊊ P` — `P` re-uses all of `Q`'s clips plus extra), `Q` has plausible
-    /// video, and `Q` accounts for at least half of `P`'s declared size (so `Q`
-    /// is a real feature `P` merely wraps/aggregates, not an incidental short
-    /// clip). This catches both the wrapper decoy (`00245 ⊋ 00001`) and the
-    /// oversize play-all — independent of capacity, which the `fits-disc` gate
-    /// needs and which is `0`/unknown on drives that fail READ CAPACITY.
-    ///
-    /// Known residual: a real feature that has a separate "resume from the
-    /// middle" branch playlist reusing most of its clips could be mis-flagged;
-    /// this is rare on BD/UHD, and the (higher-precedence) nav and authoring
-    /// signals override it when present. The corpus title-selection gate is the
-    /// backstop across the disc hoard.
+    /// Precompute the [`TitleRank`] for every title, in the same index
+    /// order. Composite detection: title `P` is a composite when some OTHER
+    /// title `Q` has a non-empty clip-id set that is a PROPER SUBSET of `P`'s,
+    /// `Q` has plausible video, and `Q` accounts for at least half of `P`'s
+    /// declared size — independent of capacity, which may be `0`/unknown.
+    /// Known residual: a "resume from the middle" branch playlist could be
+    /// mis-flagged; rare, and higher-precedence nav/authoring signals
+    /// override it. See docs/disc-mod.md for detail.
     pub fn rank_titles(
         titles: &[DiscTitle],
         hint: Option<&crate::labels::FeaturePlaylistHint>,
@@ -2473,17 +2242,9 @@ impl Disc {
         (lossless, max_ch, count)
     }
 
-    /// The disc format, from the two on-disc axes:
-    ///   * **tree** → HD-DVD (`HVDVD_TS/`) and DVD (`VIDEO_TS/`) are tree-level
-    ///     peers with their own enumerators;
-    ///   * **AACS MKB generation** → within the BD tree (`BDMV/`), the MKB Type
-    ///     record decides BD (1.0) / UHD (2.0) / FMTS (2.1). This is the
-    ///     authoritative, cheap signal (the Type record is the first bytes of
-    ///     `MKB_RO.inf`) — reusing [`crate::aacs::mkb::mkb_type`] /
-    ///     [`crate::aacs::mkb::MkbType::generation`], not a filesystem heuristic.
-    ///
-    /// An unencrypted / MKB-less BD tree falls back to video resolution (still a
-    /// BD-tree disc, so never below [`DiscFormat::BluRay`]).
+    // The disc format, from tree (HD-DVD/DVD are tree-level peers) and AACS
+    // MKB generation (within BDMV/, the MKB Type record decides BD/UHD/FMTS).
+    // Unencrypted/MKB-less BD falls back to resolution, never below BluRay.
     fn detect_disc_format(
         reader: &mut dyn SectorSource,
         udf_fs: &crate::udf::UdfFs,
@@ -2566,19 +2327,14 @@ impl Disc {
     }
 }
 
-/// A decryption key handed to libfreemkv by the caller.
-///
-/// libfreemkv is **lookup-free**: it never reads a keydb, never talks to a key
-/// server, never searches paths. The application resolves a key from whatever
-/// source it likes (a local keydb, an online key service, a mapfile cache) and
-/// hands it in here; libfreemkv uses it to decrypt, deriving any remaining
-/// AACS-chain steps it can from disc-read inputs (MKB / VID / `Unit_Key_RO.inf`).
-///
-/// `#[non_exhaustive]`: AACS is a derivation chain
-/// (`DK →(MKB)→ MK →(VID)→ VK →(Unit_Key_RO)→ UK`). Each variant is an entry
-/// point at one level of that chain; [`Disc::decrypt_with`] derives down from
-/// it to the per-CPS unit keys. New levels can be added without breaking
-/// callers.
+/// A decryption key handed to libfreemkv by the caller. libfreemkv is
+/// **lookup-free**: it never reads a keydb, talks to a key server, or
+/// searches paths — the application resolves a key however it likes and
+/// hands it in here; libfreemkv derives any remaining AACS-chain steps from
+/// disc-read inputs (MKB / VID / `Unit_Key_RO.inf`). `#[non_exhaustive]`:
+/// AACS is a derivation chain (`DK →(MKB)→ MK →(VID)→ VK →(Unit_Key_RO)→
+/// UK`); each variant enters at one level, and [`Disc::decrypt_with`]
+/// derives down from it — new levels can be added without breaking callers.
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum Key {
@@ -2623,26 +2379,9 @@ impl std::fmt::Debug for Key {
     }
 }
 
-/// True if `unit_keys` covers EVERY supplied scrambled content `sample` — the
-/// validation gate for [`Disc::decrypt_with`]. Conservative: a sample that is
-/// not AACS-scrambled proves nothing, and with no scrambled sample at all there
-/// is nothing to disprove against, so it returns `true` (accept).
-///
-/// It returns `false` when ANY scrambled sample cannot be restored to clear
-/// MPEG-TS by ANY unit key in the set. That covers two distinct failure shapes:
-///   1. a wholly wrong key (a keydb VK that does not match this disc) — no
-///      sample decrypts; and
-///   2. a *partially* applicable key set on a multi-CPS-unit disc — the resolved
-///      keys cover CPS unit 0 but not CPS unit 1. Accepting on the first sample
-///      that decrypts (the old behaviour) would commit such a set, after which
-///      CPS-unit-1 sectors pass through as raw encrypted bytes into the ISO/MKV
-///      with no error surfaced anywhere. Requiring every scrambled sample to
-///      decrypt rejects the incomplete set so the caller falls through to the
-///      next candidate (and ultimately surfaces a key error rather than silently
-///      writing ciphertext).
-///
-/// Reuses the ecosystem's single `is_clean` content-clarity predicate and the
-/// full (bus + AACS) unit decrypt, so it agrees with the actual mux decrypt.
+// True if `unit_keys` covers EVERY supplied scrambled content `sample` —
+// validation gate for Disc::decrypt_with. `false` if a set only covers some
+// CPS units. See docs/disc-mod.md for why "first sample decrypts" is unsafe.
 fn aligned_unit_keys_validate(
     unit_keys: &[(u32, [u8; 16])],
     read_data_key: Option<&[u8; 16]>,
@@ -2758,28 +2497,18 @@ impl Disc {
 
     /// The disc's AACS-encrypted content as a sorted, merged, disjoint set of
     /// `(start_lba, sector_count)` ranges — the union of every title's m2ts
-    /// stream extents.
-    ///
-    /// This is the authoritative "which sectors are encrypted" map for a
-    /// whole-disc read. AACS only encrypts the m2ts AV streams, so a sector is
-    /// encrypted content **iff** it falls inside one of these ranges; everything
-    /// else (UDF filesystem, BDMV nav, PLAYLIST/CLIPINF) is always clear.
-    ///
-    /// The in-read decrypt-verify gate (`DecryptingSectorSource`) uses this so it
-    /// never consults the TS-sync content check about
-    /// non-content bytes — filesystem data has no TS sync and would otherwise be
-    /// mistaken for ciphertext (the first-2-GB false-positive this fixes).
-    ///
-    /// Empty when the disc has no parsed titles (CSS / unencrypted / unscanned);
-    /// callers treat an empty map as "no content gate" and fall back accordingly.
+    /// stream extents. The authoritative "which sectors are encrypted" map:
+    /// a sector is encrypted content **iff** it falls inside one of these
+    /// ranges; everything else (UDF filesystem, BDMV nav, PLAYLIST/CLIPINF)
+    /// is always clear. The in-read decrypt-verify gate uses this so it never
+    /// mistakes non-content bytes (no TS sync) for ciphertext. Empty when the
+    /// disc has no parsed titles; callers fall back to "no content gate".
     pub fn encrypted_content_ranges(&self) -> Vec<(u32, u32)> {
         merged_extents(self.titles.iter().flat_map(|t| &t.extents))
     }
 
-    /// The 40-hex AACS disc id (SHA1 of `Unit_Key_RO.inf`, no `0x` prefix), or
-    /// empty when this disc has no captured AACS state. Used to name the disc in
-    /// a [`Error::NoDiscKey`] so the application can tell the user which disc to
-    /// add to the keydb.
+    // The 40-hex AACS disc id (SHA1 of Unit_Key_RO.inf, no 0x prefix), or
+    // empty when uncaptured. Names the disc in an Error::NoDiscKey.
     pub(crate) fn aacs_disc_hash(&self) -> String {
         self.aacs
             .as_ref()
@@ -2788,18 +2517,13 @@ impl Disc {
     }
 
     /// The unlocker matrix for this scanned disc on `drive`: each REGISTERED
-    /// unlocker's name + whether it actually **did work this rip** — i.e. ran and
-    /// accomplished its job, NOT merely "matched the disc kind". Registry-driven
-    /// names (no hardcoding) so the CLI and autorip render an identical, always-
-    /// current report; the per-unlocker runtime signal is computed here because
-    /// the library owns unlock semantics AND the disc/drive state.
-    ///
-    /// The distinction matters: on a drive taken by the firmware bus-unlock
-    /// route, that route removes the AACS bus and reads the VID, so the AACS
-    /// host-cert unlocker never runs — it "matched" (AACS disc) but did nothing.
-    /// `did-work` reports that honestly (`AACS: no`), and on a *stock* drive that
-    /// fell back to the cert route it reports `MT1959: no, AACS: yes` — the real
-    /// diagnostic.
+    /// unlocker's name + whether it actually **did work this rip** — i.e. ran
+    /// and accomplished its job, NOT merely "matched the disc kind".
+    /// Registry-driven names so the CLI and autorip render an identical
+    /// report. On a drive taken by the firmware bus-unlock route, the AACS
+    /// host-cert unlocker never runs — it "matched" but did nothing, so
+    /// `did-work` reports `AACS: no`, and a *stock* drive on the cert route
+    /// instead reports `MT1959: no, AACS: yes` — the real diagnostic.
     pub fn unlocker_matrix(&self, drive: &crate::Drive) -> Vec<(&'static str, bool)> {
         // The drive-prep unlocker that actually ran (recorded on init):
         // "MT1959" (drive-firmware bus-unlock route) or "Renesas" (cert route) —
@@ -2832,48 +2556,26 @@ impl Disc {
             .collect()
     }
 
-    /// The system-wide decrypt correctness gate.
-    ///
-    /// Returns `Ok(())` when it is safe to proceed with a copy or mux, and a
-    /// clear typed error when decryption is **needed but unavailable** — the
-    /// case that would otherwise write ciphertext (disc→ISO) or feed the demux
-    /// undecryptable bytes (mux) and exit 0. Every copy/mux entry point calls
-    /// this **after key resolution and before any source-data processing
-    /// begins**, so the verdict is identical everywhere and the failure is a
-    /// pre-flight one (no partial output).
-    ///
-    /// The verdict, in order:
-    /// - `raw == true` → `Ok(())`. `--raw` intentionally skips decryption and
-    ///   needs no key (the caller wants an encrypted image).
-    /// - `self.css_error.is_some()` → `Err(Error::CssNoDiscKey)`. The scan saw
-    ///   scrambled CSS sectors but recovered no title key (`self.css` is `None`
-    ///   yet the content IS encrypted). Treating `css.is_none()` as
-    ///   "unencrypted" would mux scrambled MPEG as plaintext garbage. A
-    ///   DISC-LEVEL verdict (`error::is_disc_level_no_key`) — the main feature's
-    ///   crack failed, so every title fails the same way and the rip loop must
-    ///   stop rather than skip each title in turn.
-    /// - AACS-encrypted (`self.aacs.is_some()`) with no usable key
-    ///   (`decrypt_keys()` is `None`) → `Err(Error::NoDiscKey { .. })`, naming
-    ///   the disc by hash.
-    /// - CSS-encrypted (`self.css.is_some()`) with no usable key →
-    ///   `Err(Error::CssKeyMissing)`. (The disc-wide `decrypt_keys()` yields
-    ///   `Css{..}` whenever `css.is_some()`, so this is defensive; the live
-    ///   multi-VTS case is gated by [`Self::ensure_decryptable_keys`].)
-    /// - otherwise → `Ok(())`. A genuinely unencrypted disc has `None` keys
-    ///   legitimately, and a CSS disc whose keyless crack succeeded has a key.
+    /// The system-wide decrypt correctness gate. Returns `Ok(())` when safe
+    /// to proceed with a copy or mux, and a clear typed error when
+    /// decryption is **needed but unavailable** — the case that would
+    /// otherwise write ciphertext or feed the demux undecryptable bytes and
+    /// exit 0. Every copy/mux entry point calls this after key resolution
+    /// and before any source-data processing, so the failure is pre-flight
+    /// (no partial output). `raw == true` always succeeds. See
+    /// docs/disc-mod.md for the full per-case verdict table.
     pub fn ensure_decryptable(&self, raw: bool) -> Result<()> {
         self.ensure_decryptable_keys(raw, &self.decrypt_keys())
     }
 
-    /// [`Self::ensure_decryptable`] against a caller-resolved key set, for the
-    /// per-title path. A multi-VTS CSS DVD resolves its key with
-    /// [`Self::decrypt_keys_for_title`] (which can return `None` when the chosen
-    /// title's VTS could not be re-cracked even though the disc-wide
-    /// `decrypt_keys()` is `Css{..}`); the gate must judge THAT key, not the
-    /// disc-wide one. The "is the source encrypted?" question is answered by the
-    /// scan-captured disc state (`css_error`/`aacs`/`css`), never by the keys —
-    /// so an unencrypted disc (no AACS/CSS state) never false-errors regardless
-    /// of `keys`.
+    /// [`Self::ensure_decryptable`] against a caller-resolved key set, for
+    /// the per-title path. A multi-VTS CSS DVD resolves its key with
+    /// [`Self::decrypt_keys_for_title`] (which can return `None` when the
+    /// chosen title's VTS could not be re-cracked even though the disc-wide
+    /// `decrypt_keys()` is `Css{..}`); the gate must judge THAT key. "Is the
+    /// source encrypted?" is answered by scan-captured disc state
+    /// (`css_error`/`aacs`/`css`), never by the keys — so an unencrypted
+    /// disc never false-errors regardless of `keys`.
     pub fn ensure_decryptable_keys(
         &self,
         raw: bool,
@@ -2923,39 +2625,14 @@ impl Disc {
         Ok(())
     }
 
-    /// Resolve decryption keys for muxing a *specific* title.
-    ///
-    /// For a **DVD** the CSS title key MUST be recovered before descrambling: a
-    /// scrambled sector without a recoverable crib cannot self-crack, and CSS leaves
-    /// the pack/PES header clear, so a sector left un-descrambled would mux as a
-    /// structurally-valid but corrupt PES packet with no loss reported. Two ways
-    /// to get it:
-    ///
-    /// - **Fast path** — the scan already cracked a key whose LBA span
-    ///   ([`crate::css::CssState::crack_span`]) covers this title's VTS: reuse it.
-    ///   No re-read, and on a live drive no second CSS bus-auth round-trip. CSS
-    ///   title keys are per-VTS, so an overlapping span is the same key.
-    /// - **Crack** — when up-front detection missed (`self.css == None`) or the
-    ///   title lives in a different VTS: crack the key from this title's OWN
-    ///   extents in a SINGLE scan, in natural PLAYBACK ORDER (never largest-cell-
-    ///   first, which starved the crack in a big cell's clear prefix — the 1.5.1
-    ///   bug). Playback order reaches the scrambled feature body after only the
-    ///   small clear front matter (logo / rating card) that precedes it. One
-    ///   scan = one CSS-locked early-bail, so a locked title is not re-hammered
-    ///   per cell against a live drive (hard rule #2); its 50k-sector budget is
-    ///   the same accepted bound the disc-wide scan uses.
-    ///
-    /// Crucially the crack path does NOT gate on `self.css`: a detection miss can
-    /// never route the mux into raw passthrough of scrambled sectors.
-    ///
-    /// Outcomes (`batch_sectors` sizes the crack's batched reads):
-    /// - `(Css{title_key}, false)` — descramble with the recovered/reused key.
-    /// - `(None, true)` — a genuinely-clear title needs no key; the gate passes it.
-    /// - `(None, false)` — scrambled but no key recoverable → hard failure via
-    ///   [`Self::ensure_title_decryptable`], never a silent garbage mux.
-    ///
-    /// Non-DVD schemes (AACS / FMTS / genuinely unencrypted) return
-    /// [`Self::decrypt_keys`] unchanged.
+    /// Resolve decryption keys for muxing a *specific* title. For a **DVD**
+    /// the CSS title key MUST be recovered before descrambling: either reuse
+    /// the scan's cracked key if its span covers this title's VTS, or crack
+    /// it fresh from this title's own extents in natural PLAYBACK ORDER
+    /// (never largest-cell-first, the 1.5.1 bug). The crack path does NOT
+    /// gate on `self.css`, so a detection miss can never route the mux into
+    /// raw passthrough of scrambled sectors. Non-DVD schemes return
+    /// [`Self::decrypt_keys`] unchanged. See docs/disc-mod.md for detail.
     pub fn decrypt_keys_for_title(
         &self,
         idx: usize,
@@ -3012,15 +2689,13 @@ impl Disc {
     }
 
     /// Per-title decrypt gate that honours the `title_is_clear` verdict from
-    /// [`Self::decrypt_keys_for_title`].
-    ///
-    /// Identical to [`Self::ensure_decryptable_keys`] EXCEPT it does not raise
-    /// `E7023` when the chosen title proved genuinely clear (`title_is_clear`):
-    /// a multi-VTS CSS disc can carry an unencrypted stub title in its own VTS,
-    /// and that title needs no key. The disc-wide `css.is_some()` is true, so the
-    /// plain gate would false-error; this one passes the clear title through.
-    /// A scrambled-but-uncrackable title (`title_is_clear == false`, key `None`)
-    /// still hard-fails exactly as before.
+    /// [`Self::decrypt_keys_for_title`]. Identical to
+    /// [`Self::ensure_decryptable_keys`] EXCEPT it does not raise `E7023`
+    /// when the chosen title proved genuinely clear: a multi-VTS CSS disc
+    /// can carry an unencrypted stub title in its own VTS that needs no key,
+    /// even though disc-wide `css.is_some()` is true. A scrambled-but-
+    /// uncrackable title (`title_is_clear == false`, key `None`) still
+    /// hard-fails exactly as before.
     pub fn ensure_title_decryptable(
         &self,
         raw: bool,
@@ -3051,23 +2726,9 @@ impl Disc {
         self.ensure_decryptable_keys(raw, keys)
     }
 
-    /// Inject pre-resolved AACS unit keys into a scanned disc — the deferred-mux
-    /// / resume path. The keys come from the mapfile's `# freemkv-uk:` header
-    /// (persisted at sweep time when the disc was keyed), so the mux decrypts
-    /// directly with NO key-service round-trip. Populates `self.aacs.unit_keys`
-    /// so [`Self::decrypt_keys`] returns them and marks the source `ExternalUk`.
-    ///
-    /// If the scan built no AACS state (`self.aacs == None`) — which happens
-    /// when the keydb was absent at scan time (`scan_aacs_no_keydb` →
-    /// `aacs_error = KeydbLoad`) — this synthesizes a minimal `ExternalUk`
-    /// state for an encrypted AACS disc. A Unit Key is the FINAL per-title
-    /// decryption key; the keydb is only needed to *derive* it, and that
-    /// derivation already happened at sweep (the UK is in the mapfile). So a UK
-    /// alone is sufficient to decrypt the on-disk ISO — AACS 2.0 bus decryption
-    /// was applied by the drive at read time, so `read_data_key` is unused for
-    /// file-backed mux. Without this, a keyed disc swept without a keydb would
-    /// recover its UK yet still report E8005 (no usable `decrypt_keys`) at
-    /// remux. No-op for an unencrypted or CSS (DVD) disc.
+    // Injects pre-resolved AACS unit keys into a scanned disc — the
+    // deferred-mux/resume path (keys from the mapfile's `# freemkv-uk:`
+    // header). See docs/disc-mod.md — inject_unit_keys.
     pub(crate) fn inject_unit_keys(&mut self, keys: Vec<(u32, [u8; 16])>) {
         if let Some(aacs) = self.aacs.as_mut() {
             aacs.unit_keys = keys;
@@ -3127,20 +2788,13 @@ impl Disc {
     }
 
     /// Apply a caller-resolved [`Key`] so [`Self::decrypt_keys`] yields usable
-    /// decryption state. **Lookup-free**: no keydb, no network — the caller
-    /// (an application, via a key source) does all resolution and hands the key
-    /// in here. For [`Key::Unit`] this is the deferred-mux / resume path: the
-    /// unit keys came from a key source or the mapfile cache, and libfreemkv
-    /// decrypts directly (see [`Self::inject_unit_keys`]).
-    /// `samples` are encrypted on-disc aligned units (each 6144 bytes), supplied
-    /// by the caller for content validation. A wrong key — a keydb VK that does
-    /// not match this disc, a stale UK — can still *derive* a non-empty (garbage)
-    /// unit-key set, so before the key touches disc state we confirm it actually
-    /// de-scrambles real ciphertext. This is the single home of key validation:
-    /// every caller loops a key source's candidates through `decrypt_with` and a
-    /// rejected key (`Err(AacsKeyRejected)`) transparently falls through to the
-    /// next. Pass `&[]` when no content sample is available (resume / mapfile
-    /// cache) — validation is then skipped and the key is applied as-is.
+    /// decryption state. **Lookup-free**: the caller does all resolution and
+    /// hands the key in here. For [`Key::Unit`] this is the deferred-mux /
+    /// resume path (see [`Self::inject_unit_keys`]). `samples` are encrypted
+    /// on-disc aligned units (6144 bytes each) for content validation, since
+    /// a wrong key can still *derive* a non-empty (garbage) unit-key set. A
+    /// rejected key (`Err(AacsKeyRejected)`) falls through to the caller's
+    /// next candidate. Pass `&[]` to skip validation (resume / mapfile cache).
     pub fn decrypt_with(&mut self, key: Key, samples: &[Vec<u8>]) -> Result<()> {
         // The AACS 2.x bus key, needed to de-scramble a sample for validation;
         // captured before any mutable borrow. None for AACS 1.0 and file-backed
@@ -3246,10 +2900,8 @@ impl Disc {
     }
 }
 
-/// Mapfile path for a regular output file: appends `.mapfile` to the
-/// output path. For `/dev/null` (benchmark) output use
-/// [`Disc::mapfile_for`], which special-cases it to a temp-dir path
-/// derived from the disc title.
+// Mapfile path for a regular output file: appends `.mapfile` to the output
+// path. For `/dev/null` (benchmark) output use `Disc::mapfile_for` instead.
 pub(crate) fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf {
     let mut s = iso_path.as_os_str().to_os_string();
     s.push(".mapfile");
@@ -3290,12 +2942,9 @@ const DEFAULT_BATCH_SECTORS_OPTICAL: u16 = 60;
 const DEFAULT_BATCH_SECTORS_BLOCK: u16 = 8192;
 const MIN_BATCH_SECTORS: u16 = 3;
 
-/// Whether the Linux-sysfs transfer-size probe applies to this device path.
-///
-/// The probe reads `/sys/block/<name>/...` / `/sys/class/scsi_generic/<name>/...`,
-/// which only exist on Linux and only for `/`-delimited node paths. A Windows
-/// `\\.\CdRom0` / `\\.\D:` path has no forward slash and no sysfs node, so the
-/// probe cannot run and the caller must fall back to the optical default.
+// Whether the Linux-sysfs transfer-size probe applies to this device path.
+// The probe reads /sys/block or /sys/class/scsi_generic, Linux-only and only
+// for `/`-delimited paths; a Windows `\\.\CdRom0` path has neither.
 fn sysfs_batch_probe_supported(device_path: &str) -> bool {
     cfg!(target_os = "linux") && device_path.contains('/')
 }
@@ -3391,15 +3040,9 @@ mod tests {
         }
     }
 
-    /// The image-time CSS crack must scan the main feature's extents in natural
-    /// PLAYBACK order — the same order `decrypt_keys_for_title` (the canonical
-    /// per-title crack) uses. Largest-cell-first is the 1.5.1 garbage bug: a big
-    /// cell's long clear prefix starves the 50k-sector budget before the crack
-    /// ever reaches a scrambled sector.
-    ///
-    /// This test distinguishes the two orderings: the fixture's LARGEST cell is
-    /// physically LAST, so largest-cell-first yields a strictly different LBA
-    /// sequence than playback order.
+    // The image-time CSS crack must scan extents in natural PLAYBACK order
+    // (largest-cell-first is the 1.5.1 garbage bug). Fixture's LARGEST cell
+    // is physically LAST, so the two orderings yield different LBA sequences.
     #[test]
     fn image_crack_extents_are_playback_order_not_largest_cell_first() {
         // A real CSS DVD: a short clear front matter cell (logo/rating card)
@@ -3414,12 +3057,9 @@ mod tests {
         );
     }
 
-    /// The main feature for the image-time crack is the canonically-ordered
-    /// `titles[0]` (`scan_with` has already applied `canonical_title_order`),
-    /// NOT a locally re-derived "most sectors" pick. The capacity gate is the
-    /// difference: an oversize play-all composite double-counts shared cells, so
-    /// it has the most sectors while being demoted to the back by the canonical
-    /// order. Cracking from its extents is cracking from the wrong title.
+    // Image-time crack must use the canonically-ordered titles[0], NOT a
+    // locally re-derived "most sectors" pick: an oversize play-all composite
+    // has the most sectors but is demoted to the back by canonical order.
     #[test]
     fn image_crack_extents_follow_canonical_title_order_not_sector_count() {
         // titles[0] = the real feature (canonical order already applied).
@@ -3536,12 +3176,9 @@ mod tests {
         );
     }
 
-    /// An HD-DVD image is also MPEG-PS, but must NEVER enter the CSS
-    /// known-plaintext crack — its `.evo` payload can never satisfy the CSS
-    /// attack, and running it wastes a 50_000-sector scan budget in the real
-    /// case. Prove the gate actually keeps the crack away: the HD-DVD clip's
-    /// own extent carries a genuinely crackable CSS sector, so if the
-    /// gate wrongly let the crack run, `disc.css` would come back `Some`.
+    // An HD-DVD image is also MPEG-PS but must NEVER enter the CSS crack.
+    // The HD-DVD clip's own extent carries a genuinely crackable CSS sector,
+    // so if the gate wrongly let the crack run, `disc.css` would be `Some`.
     #[test]
     fn scan_image_hddvd_never_enters_css_crack() {
         use crate::udf::fixture::*;
@@ -3625,12 +3262,9 @@ mod tests {
         }
     }
 
-    /// The forced-subtitle probe gates on `content_format == BdTs`, NOT on
-    /// whether a title happens to declare a PGS stream: an HD-DVD/DVD
-    /// (`MpegPs`) title's PES container is not what the shared PGS classifier
-    /// understands, so it must never be probed even if it carries a PGS pid.
-    /// The BdTs title (at LBA 0) must be probed; the MpegPs title (at LBA
-    /// 5000) must never be touched.
+    // Probe gates on content_format == BdTs, NOT on whether a title declares
+    // a PGS stream. The BdTs title (LBA 0) must be probed; the MpegPs title
+    // (LBA 5000) must never be touched.
     #[test]
     fn probe_forced_subtitles_only_touches_bdts_titles() {
         let mut titles = vec![
@@ -3653,11 +3287,8 @@ mod tests {
     }
 
     // ── scan_with's capacity_bytes feeds canonical_title_order (finding 10) ─
-
-    /// Two HD-DVD `.evo` clips (no VTI/playlist, so each is its own title —
-    /// see `scan_hddvd_titles`), with the given DECLARED byte sizes. No real
-    /// content is written; `scan_with`'s capacity-threshold ranking depends
-    /// only on the ICB-declared size, not the bytes at the extent.
+    // Two HD-DVD .evo clips (each its own title) with the given DECLARED byte
+    // sizes; scan_with's capacity ranking depends on ICB-declared size only.
     fn hddvd_two_clip_disc(
         main_bytes: u32,
         other_bytes: u32,
@@ -3687,18 +3318,9 @@ mod tests {
         (disc, udf)
     }
 
-    /// A cancelled [`crate::halt::Halt`] must stop the HD-DVD title scan.
-    ///
-    /// The scan is bounded but big — up to `MAX_HDDVD_CLIPS` clips, each
-    /// costing an ICB resolve plus a 16 MiB `EVO_PROBE_SECTORS` stream probe —
-    /// so on a live drive an operator Stop that only takes effect after the
-    /// whole enumerator returns is no Stop at all. `ScanOptions::halt` is
-    /// already honoured by the CSS crack and the forced-subtitle probe; the
-    /// title enumerator must honour it too.
-    ///
-    /// It must also not report a HALF-ENUMERATED disc as a successful scan:
-    /// a truncated title list is indistinguishable from a disc that genuinely
-    /// holds fewer titles.
+    // A cancelled Halt must stop the HD-DVD title scan (bounded but big, so a
+    // Stop that only takes effect after the enumerator returns is no Stop at
+    // all), and must not report a half-enumerated disc as a successful scan.
     #[test]
     fn scan_with_cancelled_halt_stops_the_hddvd_title_scan() {
         use crate::udf::fixture::PART_START;
@@ -3752,23 +3374,9 @@ mod tests {
         );
     }
 
-    /// `scan_with` must hand `ScanOptions::halt` to the BLU-RAY enumerator.
-    ///
-    /// Every BD and DVD cancellation test in this crate calls
-    /// `scan_bluray_titles` / `scan_dvd_titles` DIRECTLY, so the three-line
-    /// wiring in `scan_with` that connects the operator's Stop to them was
-    /// covered by nothing at all: replacing `opts.halt.as_ref()` with `None`
-    /// on either branch left the whole suite green while a Stop during a BD
-    /// or DVD scan silently did nothing. Only the HD-DVD branch was pinned.
-    ///
-    /// The fixture is deliberately the smallest disc that takes the BD branch
-    /// — a bare `/BDMV` with no PLAYLIST — because the point under test is the
-    /// ARGUMENT, not the enumerator's own (separately tested) halt polling.
-    /// Nothing between `scan_with`'s entry and the enumerator reads the flag
-    /// (the disc is unencrypted, so the AACS path is skipped), so a green here
-    /// can only mean the flag arrived.
-    ///
-    /// Mutation: `Self::scan_bluray_titles(reader, &udf_fs, None)?` fails here.
+    // scan_with must hand ScanOptions::halt to the BLU-RAY enumerator: other
+    // tests call scan_bluray_titles directly, so this wiring was otherwise
+    // uncovered. See docs/disc-mod.md for the fixture rationale.
     #[test]
     fn scan_with_passes_the_halt_flag_to_the_bluray_enumerator() {
         use crate::udf::fixture::*;
@@ -3861,15 +3469,9 @@ mod tests {
         );
     }
 
-    /// A Stop on a LIVE DRIVE never touches `ScanOptions::halt`: `Drive` has
-    /// its own flag and `checked_exec` fails every SCSI command with
-    /// [`Error::Halted`] once it is set. The HD-DVD enumerator must not
-    /// swallow that into a successful scan.
-    ///
-    /// Measured before this was fixed: the scan returned `Ok` with both
-    /// titles present and ZERO streams on each — a cancelled scan wearing the
-    /// shape of a disc whose clips carry no video or audio. Downstream that is
-    /// a title list to cache, display and rip from.
+    // A Stop on a LIVE DRIVE never touches ScanOptions::halt (Drive fails
+    // every SCSI command with Error::Halted itself); the HD-DVD enumerator
+    // must not swallow that into a successful scan. See docs/disc-mod.md.
     #[test]
     fn halted_reads_do_not_report_the_hddvd_scan_as_successful() {
         use crate::udf::fixture::PART_START;
@@ -3918,14 +3520,9 @@ mod tests {
         );
     }
 
-    /// `scan_with`'s `capacity_bytes = capacity as u64 * 2048` feeds
-    /// `canonical_title_order`'s "bigger than the whole disc = play-all
-    /// composite" threshold. Chosen so `capacity * 2048` clears both titles
-    /// (neither is oversize, so the bigger one — OTHER — ranks first), but
-    /// `capacity + 2048` lands BETWEEN the two sizes: MAIN stays non-oversize
-    /// while OTHER flips to oversize and gets demoted, changing `titles[0]`.
-    /// A `*` → `+` mutation is caught by this ranking flip, not merely a
-    /// wrong numeric threshold value.
+    // capacity_bytes = capacity * 2048 feeds canonical_title_order's oversize
+    // threshold; chosen so a `*` -> `+` mutation flips titles[0] (see
+    // docs/disc-mod.md), not merely a wrong numeric threshold.
     #[test]
     fn scan_with_capacity_bytes_uses_multiplication_not_addition() {
         const CAPACITY_SECTORS: u32 = 3_997_952; // *2048 = 8_187_805_696; +2048 = 4_000_000
@@ -3952,10 +3549,8 @@ mod tests {
         );
     }
 
-    /// Same mechanism as above, tuned to catch a `*` → `/` mutation instead:
-    /// `capacity * 2048` clears both titles, but `capacity / 2048` collapses
-    /// to a threshold far below MAIN's declared size while still leaving
-    /// MAIN under it, so only OTHER flips to oversize.
+    // Same mechanism as above, tuned to catch a `*` -> `/` mutation instead.
+    // See docs/disc-mod.md — scan_with_capacity_bytes tests.
     #[test]
     fn scan_with_capacity_bytes_uses_multiplication_not_division() {
         const CAPACITY_SECTORS: u32 = 204_800_000; // *2048 = huge; /2048 = 100_000
@@ -3983,20 +3578,8 @@ mod tests {
     }
 
     // ── Unknown must not fabricate a plausible value (finding 2) ────────────
-
-    /// `Resolution::Unknown` has no dimensions, so `pixels()` must report none
-    /// (0, 0) — the same treatment `AudioChannels::count()` and
-    /// `SampleRate::hz()` already give their `Unknown` variants. Returning a
-    /// plausible 1920x1080 is indistinguishable from a real 1080p title, so a
-    /// sink (the `json://` one already did this for audio) reports confident
-    /// dimensions for video its own neighbouring `resolution` field calls
-    /// "unknown".
-    ///
-    /// The real variants are asserted against spec literals, not against
-    /// `pixels()` itself: 720x480 / 720x576 are the DVD-Video coded frames
-    /// (ITU-R BT.601 525/60 and 625/50 active area), 1920x1080 and 1280x720 are
-    /// the Blu-ray Disc Read-Only Format part 3 HD frames, 3840x2160 the UHD
-    /// BD frame.
+    // Resolution::Unknown has no dimensions, so pixels() must report none —
+    // not (0, 0) or a plausible 1920x1080. See docs/disc-mod.md.
     #[test]
     fn unknown_resolution_reports_no_pixel_dimensions() {
         assert_eq!(
@@ -4015,10 +3598,9 @@ mod tests {
         assert_eq!(Resolution::R4320p.pixels(), Some((7680, 4320)));
     }
 
-    /// Every `Unknown` variant that exposes a numeric accessor must report
-    /// "nothing", never a plausible default — the sibling sweep the previous
-    /// round skipped. `FrameRate::Unknown` reports the 0/1 null fraction rather
-    /// than 0 fps, because callers divide by the numerator.
+    // Every Unknown variant with a numeric accessor must report "nothing",
+    // never a plausible default. FrameRate::Unknown reports 0/1 (not 0 fps)
+    // because callers divide by the numerator.
     #[test]
     fn no_unknown_variant_fabricates_a_numeric_value() {
         assert_eq!(
@@ -4035,15 +3617,8 @@ mod tests {
     }
 
     // ── BD-ROM stream_coding_type 0xA2 (finding 3) ──────────────────────────
-
-    /// Blu-ray Disc Read-Only Format part 3, `stream_coding_type` table: 0xA2 is
-    /// the SECONDARY DTS-HD audio stream — DTS Express / DTS-HD LBR, a LOSSY
-    /// low-bitrate codec carried alongside the primary track for
-    /// picture-in-picture and BD-J mixing. It is NOT DTS-HD Master Audio (0x86),
-    /// which is the lossless primary code.
-    ///
-    /// Literals, not the `consts::coding_type` names, so renaming or re-valuing
-    /// a constant cannot make this pass vacuously.
+    // 0xA2 is SECONDARY DTS-HD (lossy LBR), NOT DTS-HD Master Audio (0x86).
+    // Literals, not consts::coding_type names (renaming can't pass vacuously).
     #[test]
     fn secondary_dts_hd_0xa2_is_lossy_not_master_audio() {
         assert_ne!(
@@ -4059,13 +3634,8 @@ mod tests {
     }
 
     // ── extent-end arithmetic saturates (finding 5) ─────────────────────────
-
-    /// `byte_offset_in_title` must compute its extent end with saturating
-    /// arithmetic, like every other extent-end computation in the crate. A
-    /// malformed UDF/IFO extent near the top of the 32-bit LBA space (ECMA-167
-    /// logical block numbers are 32-bit) otherwise overflows: a debug build
-    /// PANICS inside a library, and a release build wraps to a tiny end LBA so
-    /// the range test silently fails and the offset comes back `None`.
+    // byte_offset_in_title must saturate its extent-end arithmetic: a
+    // malformed extent near u32::MAX otherwise panics in debug or wraps.
     #[test]
     fn byte_offset_in_title_saturates_the_extent_end() {
         let title = title_with_extents(0, &[(u32::MAX - 10, 100)]);
@@ -4233,10 +3803,9 @@ mod tests {
         );
     }
 
-    /// A Windows-form optical device path (`\\.\CdRom0`, `\\.\D:`) must never
-    /// fall through to the block default (8192 sectors = 16 MiB, well over the
-    /// optical 510-sector cap). It has no forward slash, so the Linux-sysfs
-    /// name parse cannot apply; the detector must return the optical default.
+    // A Windows-form path (\\.\CdRom0, \\.\D:) must never fall through to
+    // the block default (8192 sectors, over the optical 510-sector cap): it
+    // has no forward slash, so the Linux-sysfs name parse cannot apply.
     #[test]
     fn windows_device_path_uses_optical_default() {
         for path in ["\\\\.\\CdRom0", "\\\\.\\CdRom15", "\\\\.\\D:", "\\\\.\\E:"] {
@@ -4252,11 +3821,9 @@ mod tests {
         }
     }
 
-    /// `read_aacs_inputs` on a missing/unreadable ISO must surface the real
-    /// I/O fault (`E_IO_ERROR`, 5000) carrying the OS errno — NOT `AacsNoKeys`
-    /// (7000). Collapsing ENOENT into a key error makes callers that dispatch
-    /// on `.code()` tell the user "no keys / check your KEYDB" when the actual
-    /// problem is that the ISO file does not exist.
+    // read_aacs_inputs on a missing ISO must surface E_IO_ERROR (5000), NOT
+    // AacsNoKeys (7000) — else callers dispatching on .code() would tell the
+    // user "check your KEYDB" when the ISO simply doesn't exist.
     #[test]
     fn read_aacs_inputs_missing_iso_is_io_error_not_no_keys() {
         let missing = std::path::Path::new("/nonexistent/freemkv/does-not-exist.iso");
@@ -4366,11 +3933,9 @@ mod tests {
         t
     }
 
-    /// Regression for branching-UHD title ordering. Mirrors the live
-    /// observed *The Amateur (2025)* layout: a 4h13m / 92.4 GB / 253-clip
-    /// virtual play-all playlist alongside the real 2h02m / 57.2 GB /
-    /// 1-clip main feature. Disc capacity 58.5 GB. After sorting,
-    /// titles[0] must be the main feature, not the virtual composite.
+    // Regression for branching-UHD title ordering: mirrors the observed
+    // *The Amateur (2025)* layout (4h13m/92.4GB/253-clip play-all vs the
+    // real 2h02m/57.2GB/1-clip feature, 58.5GB disc).
     #[test]
     fn canonical_order_pushes_oversize_play_all_behind_real_main() {
         const CAPACITY: u64 = 58_500_000_000; // 58.5 GB
@@ -4416,12 +3981,9 @@ mod tests {
         assert_eq!(titles[2].playlist, "00100.mpls");
     }
 
-    /// Contract pin (owner-flagged): `freemkv -t 1` ALWAYS selects the main
-    /// feature. The CLI's `-t 1` maps to `titles[0]`, and the title list is
-    /// ordered by `canonical_title_order` (main feature first), so `titles[0]`
-    /// IS the movie. Anything but the main feature at index 0 is a
-    /// title-ordering bug, not a remux problem. DVD-shaped fixture (DVD-9
-    /// capacity; a 1h49m main feature alongside a menu loop and a short extra).
+    // Contract pin (owner-flagged): `freemkv -t 1` maps to titles[0], which
+    // canonical_title_order orders main-feature-first, so titles[0] IS the
+    // movie. DVD-9 fixture: 1h49m feature alongside a menu loop and extra.
     #[test]
     fn title_index_0_is_main_feature_dvd_the_dash_t_1_contract() {
         const DVD9: u64 = 7_900_000_000; // dual-layer DVD
@@ -4547,20 +4109,9 @@ mod tests {
         );
     }
 
-    /// `read_mkb_content` reads a bounded 16 MiB starting prefix and must GROW
-    /// it when the MKB's real record stream runs past that prefix — otherwise
-    /// the caller silently gets a truncated MKB. This fixture's record stream
-    /// is deliberately built so the first 16 records land EXACTLY on the 16
-    /// MiB boundary (so the 16 MiB prefix alone parses as a clean, complete
-    /// record stream — the case a naive "n < buf.len() means done" check would
-    /// wrongly accept) and 4 more MiB of records follow, terminated by the
-    /// explicit `00 000000` end marker. Only a caller that actually grows past
-    /// 16 MiB recovers the true 20 MiB content length.
-    ///
-    /// Run inside a watchdog thread: some mutants of the growth step (e.g.
-    /// `want / 2` instead of `want * 2`) walk `want` to 0 and spin forever
-    /// re-reading a zero-length prefix, which must fail this test rather than
-    /// hang the suite.
+    // read_mkb_content must GROW its bounded prefix when the real record
+    // stream runs longer. Run inside a watchdog: some growth-step mutants
+    // spin forever re-reading a zero-length prefix. See docs/disc-mod.md.
     #[test]
     fn read_mkb_content_grows_prefix_past_16mib_when_records_run_longer() {
         use crate::udf::fixture::*;
@@ -4619,13 +4170,8 @@ mod tests {
     }
 
     // ── identify(): AACS-directory encrypted gate (finding 6) ──────────────
-
-    /// A `ScsiTransport` that serves a synthetic UDF image (built with the
-    /// shared `udf::fixture` helpers) through real READ CAPACITY(10) /
-    /// READ(10) commands, so `Disc::identify` is exercised end-to-end through
-    /// a real `Drive` rather than mocking `identify` itself — proving the
-    /// AACS-directory check is actually what the caller uses, not just that
-    /// `UdfFs::find_dir` works in isolation.
+    // A ScsiTransport serving a synthetic UDF image through real READ(10),
+    // so Disc::identify is exercised end-to-end, not mocked itself.
     struct MemDiscDrive {
         mem: crate::udf::fixture::MemDisc,
         last_lba: u32,
@@ -4722,10 +4268,9 @@ mod tests {
         assert!(id.encrypted, "/AACS alone must report encrypted");
     }
 
-    /// A nested `/BDMV/AACS` directory alone must ALSO report
-    /// `encrypted == true` — dropping this side of the `||` (degrading it to
-    /// `&&`) would report virtually every retail BD as unencrypted, since
-    /// real discs almost never carry both paths at once.
+    // A nested /BDMV/AACS alone must ALSO report encrypted == true —
+    // degrading the `||` to `&&` would report almost every retail BD as
+    // unencrypted, since real discs rarely carry both paths at once.
     #[test]
     fn identify_reports_encrypted_for_bdmv_aacs_dir_alone() {
         let id = identify_with_aacs_dirs(false, true);
@@ -4742,10 +4287,9 @@ mod tests {
         );
     }
 
-    /// Title selection is by largest physical size, NOT clip count or duration.
-    /// Real-disc shape: a 57 GB / 11-clip feature must outrank both a
-    /// small 1-clip bonus reel and a long-but-tiny decoy "play-all" (91 reused
-    /// clips, 1h31m, 0.4 GB). The old clip-count-ascending key put the bonus t1.
+    // Title selection is by largest physical size, NOT clip count/duration: a
+    // 57 GB/11-clip feature must outrank a 1-clip bonus reel and a
+    // long-but-tiny decoy play-all (91 reused clips, 1h31m, 0.4 GB).
     #[test]
     fn canonical_title_order_picks_largest_feature() {
         fn title_sized(size_bytes: u64, duration_secs: f64, n_clips: usize) -> DiscTitle {
@@ -4821,14 +4365,9 @@ mod tests {
         }
     }
 
-    /// Regression for a real UHD title's decoy-playlist hang: the decoy `00245.mpls` is a
-    /// WRAPPER COMPOSITE — `[00339 2s bumper][00001 the whole feature clip][00336
-    /// outro]` — so its first-PlayItem STN reports v=0, and it is the LONGEST and
-    /// LARGEST title (8350s / 78.4 GB vs the feature's 8038s / 76.5 GB). Muxing
-    /// its zero frames produced E6008 forever. It must be demoted STRUCTURALLY
-    /// (its clip set properly contains the feature's), not by the fragile
-    /// first-PlayItem stream count — this is what makes the fix robust to the
-    /// video-bearing-composite variant (see `main_feature_order_demotes_video_composite`).
+    // Regression for a real UHD decoy hang: 00245.mpls is a WRAPPER
+    // COMPOSITE (bumper+feature+outro) that is LONGEST/LARGEST; must be
+    // demoted STRUCTURALLY, not by stream count. See docs/disc-mod.md.
     #[test]
     fn main_feature_order_demotes_wrapper_composite_decoy() {
         let decoy = bd_title_no_stn_video(
@@ -4865,10 +4404,9 @@ mod tests {
         );
     }
 
-    /// The O(n^2 · clips) composite scan is work-bounded: a crafted disc with a
-    /// pathological title/clip count must skip the scan (degrade to has-video +
-    /// canonical order) instead of stalling uncancellably. At a normal count the
-    /// wrapper is still detected.
+    // The O(n^2 * clips) composite scan is work-bounded: a pathological
+    // title/clip count must skip it (degrade to has-video + canonical
+    // order); at a normal count the wrapper is still detected.
     #[test]
     fn composite_scan_is_work_bounded() {
         let decoy = bd_title(
@@ -4897,10 +4435,9 @@ mod tests {
         );
     }
 
-    /// Audit T2: a composite that ALSO carries video (its first PlayItem is the
-    /// feature clip, so v>0) — the case the old `has-video` gate could not see —
-    /// is still demoted below the standalone feature it wraps, by clip-set
-    /// containment alone.
+    // Audit T2: a composite that ALSO carries video (old has-video gate
+    // couldn't see this) is still demoted below the standalone feature it
+    // wraps, by clip-set containment alone.
     #[test]
     fn main_feature_order_demotes_video_composite() {
         let composite = bd_title(
@@ -4921,10 +4458,9 @@ mod tests {
         );
     }
 
-    /// Audit T3: capacity unknown (`0` — READ CAPACITY failed) disables the
-    /// `fits-disc` oversize gate, so a video-bearing OVERSIZE play-all composite
-    /// would win on size. Clip-set composite detection demotes it regardless of
-    /// capacity.
+    // Audit T3: capacity unknown (0, READ CAPACITY failed) disables the
+    // fits-disc oversize gate, so an oversize play-all composite would win
+    // on size; clip-set composite detection demotes it regardless.
     #[test]
     fn main_feature_order_demotes_oversize_composite_when_capacity_unknown() {
         let playall = bd_title(
@@ -4974,10 +4510,9 @@ mod tests {
         );
     }
 
-    /// The disc's own HDMV navigation pick (`nav_feature`, resolved by the
-    /// `bdnav` VM playing First-Play like a real player) wins outright — above
-    /// the authoring hint and the physical size order — when the nav-resolved
-    /// title has video.
+    // The disc's own HDMV navigation pick (nav_feature, resolved by bdnav
+    // playing First-Play) wins outright — above the authoring hint and
+    // physical size order — when the nav-resolved title has video.
     #[test]
     fn nav_feature_promotes_navigated_title_over_larger() {
         let navigated = bd_title("00222.mpls", 222, 6000.0, 40_000_000_000, &["00222"]);
@@ -5023,12 +4558,9 @@ mod tests {
         );
     }
 
-    /// Regression (a real UHD title): the disc navigates to a Dolby-Vision
-    /// seamless-branch playlist (`00001` = 102 tiny clips, 0.4 GB) that has real
-    /// video streams but carries almost no payload, sitting beside the 91.5 GB
-    /// single-clip feature (`00002`). A player plays the branch; a RIP wants the
-    /// feature. The nav pick is video-gated but must ALSO clear the payload floor,
-    /// so it falls through to size ranking and the substantial feature wins.
+    // Regression: the disc navigates to a Dolby-Vision seamless-branch
+    // playlist (tiny payload, real video) beside a 91.5 GB feature. Nav pick
+    // must ALSO clear the payload floor, falling through to size ranking.
     #[test]
     fn nav_feature_ignored_when_target_is_a_low_payload_branch() {
         let branch = bd_title("00001.mpls", 1, 7500.0, 400_000_000, &["b01", "b02", "b03"]);
@@ -5115,10 +4647,9 @@ mod tests {
         );
     }
 
-    /// Audit T7: when every title is streamless (whole-disc parse failure), the
-    /// pick is still deterministic (largest) and the three pickers agree —
-    /// `titles[0]` after the sort, `image_crack_extents`, and the diag `pick`
-    /// (also `titles[0]`) name the same title (audit R9 single-source-of-truth).
+    // Audit T7: when every title is streamless, the pick is still
+    // deterministic (largest) and the sort/image_crack_extents/diag pick
+    // all name the same title (audit R9 single-source-of-truth).
     #[test]
     fn all_streamless_fallback_is_deterministic_and_consistent() {
         let mut a = DiscTitle::empty();
@@ -5376,12 +4907,9 @@ mod tests {
         );
     }
 
-    /// E7017 vs E7022 split (rc.6 WS1). When key resolution HAD derivation
-    /// material (device / processing keys) but no Volume ID was available to
-    /// derive the unit key, the captured `aacs_error` is `AacsVidUnavailable`
-    /// — the gate must surface THAT (E7017), not the generic `NoDiscKey`
-    /// (E7022). When there was no usable key material at all, the reason is
-    /// absent and the gate keeps `NoDiscKey` (E7022). Both branches proven here.
+    // E7017 vs E7022 split (rc.6 WS1): with derivation material but no VID,
+    // aacs_error is AacsVidUnavailable and the gate must surface E7017, not
+    // the generic E7022. With no key material at all, E7022 stands.
     #[test]
     fn ensure_decryptable_aacs_vid_unavailable_vs_no_key() {
         // Branch 1 — derivation material present, but no VID: E7017.
@@ -5469,22 +4997,9 @@ mod tests {
         );
     }
 
-    /// THE defect: a key SOURCE that could not answer must not be reported as
-    /// "this disc has no key".
-    ///
-    /// Drives the real chain end to end — `KeySource` → `resolve_and_apply_traced`
-    /// → `Disc::aacs_error` → `ensure_decryptable` — twice over the SAME disc, and
-    /// asserts the two operator-visible verdicts differ:
-    ///
-    /// * source returns `Err(KeyServiceUnavailable)` (the HTTP-502 outage) → E7028
-    ///   "the key service could not answer; retry later",
-    /// * source returns `Ok(vec![])` (the service answered, no entry) → E7022
-    ///   "no key source has a decryption key for this disc".
-    ///
-    /// Before the fix both arms produced E7022, which is what sent an operator
-    /// hunting for a VUK through seven hours of 502s. The credential and
-    /// rate-limit verdicts are asserted alongside, since each is a different
-    /// operator action (fix the token / back off).
+    // THE defect: a key SOURCE that could not answer must not be reported as
+    // "this disc has no key" (E7022 for both used to send an operator
+    // hunting for a VUK through seven hours of 502s). See docs/disc-mod.md.
     #[test]
     fn key_source_failure_is_not_reported_as_a_missing_disc_key() {
         use crate::keysource::{KeySource, ResolveCtx, resolve_and_apply_traced};
@@ -5638,11 +5153,9 @@ mod tests {
         );
     }
 
-    /// CSS scrambled-but-uncracked (the keyless crack failed): `css` is None but
-    /// `css_error` is Some — the disc IS encrypted. The gate must fail rather
-    /// than read `css.is_none()` as "unencrypted", and with the DISC-LEVEL
-    /// `CssNoDiscKey` (not the per-title, skippable `CssKeyMissing`): `css_error`
-    /// reflects the main feature's crack, so every title fails identically.
+    // CSS scrambled-but-uncracked: css is None but css_error is Some — the
+    // disc IS encrypted. Gate must fail with DISC-LEVEL CssNoDiscKey, not
+    // the per-title skippable CssKeyMissing.
     #[test]
     fn ensure_decryptable_css_error_errors() {
         let mut disc = make_test_disc(1000, "DVD");
@@ -5656,21 +5169,9 @@ mod tests {
         assert!(disc.ensure_decryptable(true).is_ok());
     }
 
-    /// The two CSS no-key conditions are NOT the same verdict and must classify
-    /// oppositely through the public predicates:
-    ///
-    /// - **disc-wide** — `css_error` is set: the MAIN feature's crack failed, so
-    ///   every title of this disc fails identically. Must be
-    ///   [`crate::error::is_disc_level_no_key`] (the rip loop fail-fasts) and
-    ///   must NOT be [`crate::error::is_skippable_title_stub`]. While both
-    ///   conditions shared `E_CSS_KEY_MISSING`, an uncrackable CSS disc iterated
-    ///   all N titles logging "title skipped" and exited 0 — a total failure
-    ///   reported as success.
-    /// - **per-title** — one title's own re-crack failed on a multi-VTS disc
-    ///   (`title_is_clear == false`, no key): skipping it and finishing the rest
-    ///   is correct policy, so it must STAY skippable and must NOT be disc-level.
-    ///
-    /// Pinned in both directions so a future change cannot silently flip either.
+    // The two CSS no-key conditions must classify oppositely: disc-wide
+    // (css_error set) is disc_level_no_key and NOT skippable; per-title
+    // stays skippable and NOT disc-level. See docs/disc-mod.md.
     #[test]
     fn css_disc_wide_no_key_is_disc_level_while_per_title_stays_skippable() {
         // Disc-wide: the scan saw scrambled sectors and recovered no key.
@@ -5716,10 +5217,9 @@ mod tests {
         assert!(disc.ensure_decryptable(false).is_ok());
     }
 
-    /// Per-title gate: a multi-VTS CSS disc whose chosen title's VTS could not
-    /// be re-cracked yields `DecryptKeys::None` even though the disc-wide
-    /// `decrypt_keys()` is `Css{..}`. `ensure_decryptable_keys` judges the
-    /// per-title key and must fail with CssKeyMissing.
+    // Per-title gate: a multi-VTS CSS disc whose chosen title's VTS could not
+    // be re-cracked yields DecryptKeys::None even though disc-wide
+    // decrypt_keys() is Css{..}; must fail with CssKeyMissing.
     #[test]
     fn ensure_decryptable_keys_css_per_title_none_errors() {
         let mut disc = make_test_disc(1000, "DVD");
@@ -5800,13 +5300,9 @@ mod tests {
         (disc, 1) // stub is title index 1
     }
 
-    /// A genuinely-clear extra title (an unencrypted menu stub in its own VTS)
-    /// on a CSS DVD must mux without a false E7023. The stub lives in a DISJOINT
-    /// VTS (its extents don't overlap the scan's `crack_span`), so
-    /// `decrypt_keys_for_title` takes the crack path over the stub's own extents;
-    /// the reader serves only clear sectors, so the crack returns `Unencrypted`
-    /// → `(None, title_is_clear=true)`. The gate must then PASS the title with no
-    /// key — no false E7023.
+    // A genuinely-clear extra title (menu stub in its own VTS, disjoint from
+    // crack_span) on a CSS DVD must mux without a false E7023 — the crack
+    // returns Unencrypted, and the gate must PASS with no key.
     #[test]
     fn clear_stub_title_on_css_disc_is_not_a_key_failure() {
         let (disc, stub_idx) = css_disc_with_clear_stub();
@@ -6110,10 +5606,9 @@ mod tests {
         ));
     }
 
-    /// Inverse of `decrypt_unit` for one 6144-byte unit: produce on-disc
-    /// ciphertext that `decrypt_unit(uk)` restores to `clear`. Mirrors the AACS
-    /// unit algorithm — ECB-derive the per-unit key, then AES-CBC encrypt the
-    /// body with the fixed AACS IV.
+    // Inverse of decrypt_unit for one 6144-byte unit: produce ciphertext that
+    // decrypt_unit(uk) restores to clear (ECB-derive the per-unit key, then
+    // AES-CBC encrypt with the fixed AACS IV).
     fn encrypt_unit_for_test(clear: &[u8], uk: &[u8; 16]) -> Vec<u8> {
         use crate::aacs::content::ALIGNED_UNIT_LEN;
         use crate::aacs::crypto::AACS_IV;
@@ -6280,10 +5775,9 @@ mod tests {
         disc
     }
 
-    /// `decrypt_keys_for_title` cracks a scrambled DVD title's key from the
-    /// title's OWN extents and hands the mux the validated key — the seed the
-    /// descramble needs, since a crib-less sector cannot self-crack and CSS leaves
-    /// the pack/PES header clear (an un-seeded mux would emit corrupt PES).
+    // decrypt_keys_for_title cracks a scrambled DVD title's key from its OWN
+    // extents and hands the mux the validated key (an un-seeded mux would
+    // emit corrupt PES, since CSS leaves the pack/PES header clear).
     #[test]
     fn decrypt_keys_for_title_cracks_the_titles_key() {
         let key = [0x11, 0x22, 0x33, 0x44, 0x55];
@@ -6306,12 +5800,9 @@ mod tests {
         }
     }
 
-    /// REGRESSION (the 1.5.1 garbage bug): the crack scans extents in PLAYBACK
-    /// ORDER, never largest-cell-first. A title whose LARGEST cell opens with a
-    /// long unscrambled run must still crack its key from the smaller,
-    /// scrambled-early cell that plays first — largest-first would exhaust the
-    /// crack budget in the clear giant and wrongly report the title unencrypted,
-    /// which the mux would pass through as scrambled garbage.
+    // REGRESSION (1.5.1 garbage bug): crack scans extents in PLAYBACK ORDER,
+    // never largest-cell-first — must crack from the smaller scrambled-early
+    // cell that plays first, not starve on a larger clear cell. See docs.
     #[test]
     fn decrypt_keys_for_title_scans_playback_order_not_largest_first() {
         let key = [0xDE, 0xAD, 0xBE, 0xEF, 0x01];
@@ -6348,8 +5839,8 @@ mod tests {
         );
     }
 
-    /// A reader whose every read is CSS-locked (`05/6F/03`) — a genuinely
-    /// encrypted DVD whose sectors can't be authenticated/cracked.
+    // A reader whose every read is CSS-locked (05/6F/03) — a genuinely
+    // encrypted DVD whose sectors can't be authenticated/cracked.
     struct LockedReader;
     impl SectorSource for LockedReader {
         fn read_sectors(
@@ -6371,10 +5862,9 @@ mod tests {
         }
     }
 
-    /// End-to-end: a scrambled-but-uncrackable DVD title with NO up-front
-    /// detection (`self.css == None`) drives `decrypt_keys_for_title` to
-    /// `(None, false)`, and the gate MUST hard-fail (CssKeyMissing) rather than
-    /// pass it to the muxer — the silent-garbage case the per-title crack catches.
+    // End-to-end: a scrambled-but-uncrackable DVD title with NO up-front
+    // detection drives decrypt_keys_for_title to (None, false), and the
+    // gate MUST hard-fail (CssKeyMissing), never pass it to the muxer.
     #[test]
     fn decrypt_keys_for_title_scrambled_uncracked_dvd_hard_fails_even_without_detection() {
         let disc = css_dvd_with_extents(vec![Extent {
@@ -6445,12 +5935,9 @@ mod tests {
         );
     }
 
-    /// A title whose (realistic) clear front matter — studio logo / rating card —
-    /// plays FIRST, then the scrambled feature, still cracks: the single
-    /// playback-order scan reads through the small clear prefix and reaches the
-    /// scrambled body within its budget. (A clear prefix LARGER than the ~100 MB
-    /// crack budget would starve — the accepted bounded-budget limit, identical to
-    /// the disc-wide scan; not producible by real DVD front matter.)
+    // A title whose clear front matter (studio logo/rating card) plays FIRST
+    // still cracks: the single playback-order scan reads through the small
+    // clear prefix and reaches the scrambled body within budget.
     #[test]
     fn decrypt_keys_for_title_cracks_feature_after_clear_front_matter() {
         let key = [0xCA, 0xFE, 0xBA, 0xBE, 0x02];
@@ -6481,10 +5968,9 @@ mod tests {
         }
     }
 
-    /// Scrambling that begins well INTO a cell (after a clear prefix), not at its
-    /// start, must still be cracked: the single playback-order scan reads through
-    /// the clear prefix and reaches the scrambled body within its budget — never a
-    /// silent "clear" verdict that would mux the scrambled tail as corrupt PES.
+    // Scrambling beginning well INTO a cell must still be cracked: the scan
+    // reads through the clear prefix and reaches the scrambled body within
+    // budget — never a silent "clear" verdict muxing corrupt PES.
     #[test]
     fn decrypt_keys_for_title_cracks_scrambling_after_a_clear_prefix_in_one_cell() {
         let key = [0x0D, 0xEE, 0x40, 0x00, 0x05];
@@ -6509,10 +5995,9 @@ mod tests {
         }
     }
 
-    /// A DVD title with EMPTY extents (an angle/PGC placeholder with no cells)
-    /// resolves to `(decrypt_keys(), true)` — clear, no key needed — and the gate
-    /// must PASS it. Returning `false` here would trip the DVD scrambled-uncracked
-    /// rule and wrongly hard-fail a genuinely-clear empty title.
+    // A DVD title with EMPTY extents resolves to (decrypt_keys(), true) —
+    // clear, no key needed — and the gate must PASS it (returning false
+    // would wrongly hard-fail a genuinely-clear empty title).
     #[test]
     fn decrypt_keys_for_title_empty_extents_is_clear_not_hard_fail() {
         let mut disc = css_dvd_with_extents(vec![Extent {
@@ -6534,10 +6019,9 @@ mod tests {
         );
     }
 
-    /// A bonus title that cracked its OWN valid key must NOT be blocked by the
-    /// disc-wide `css_error` set when the MAIN feature's scan failed. A usable
-    /// per-title key means the title is decryptable regardless of another title's
-    /// failure. (Regression for the audit r5 css_error-over-valid-key finding.)
+    // A bonus title that cracked its OWN valid key must NOT be blocked by
+    // disc-wide css_error from the MAIN feature's scan failure. (Regression
+    // for audit r5 css_error-over-valid-key.)
     #[test]
     fn ensure_title_decryptable_valid_key_ignores_disc_wide_css_error() {
         let mut disc = css_dvd_with_extents(vec![Extent {
@@ -6587,15 +6071,9 @@ mod tests {
         assert_eq!(bytes_bad_in_title(&title, &spanning), 20 * 2048);
     }
 
-    // (Former `coding_type_a2_is_dts_hd_ma` wrongly asserted 0xA2 is lossless Master
-    // Audio; it's the lossy secondary stream — see
-    // `secondary_dts_hd_0xa2_is_lossy_not_master_audio`, covering 0xA2 and 0x86.)
-
-    /// HDMV coding_type 0x90 = Presentation Graphics (PG / subtitles) → Pgs,
-    /// but 0x91 = Interactive Graphics (IG / menus) is NOT a subtitle stream.
-    /// It must NOT map to Pgs (whose kind() is Subtitle), else a menu ES would
-    /// surface as a bogus PGS subtitle track. 0x91 falls through to Unknown so
-    /// the PMT/STN walker drops it.
+    // (Former coding_type_a2_is_dts_hd_ma wrongly asserted 0xA2 is Master
+    // Audio; see secondary_dts_hd_0xa2_is_lossy_not_master_audio instead.)
+    // HDMV 0x91 (IG/menus) must NOT map to Pgs (0x90); falls to Unknown.
     #[test]
     fn coding_type_ig_0x91_is_not_pgs_subtitle() {
         assert_eq!(Codec::from_coding_type(0x90), Codec::Pgs);
@@ -6613,12 +6091,8 @@ mod tests {
     }
 
     // ── correct_truehd_channels ──────────────────────────────────────────
-
-    /// Records every `read_sectors` call and serves a fixed byte buffer
-    /// (zero-padded to the requested size) — probes
-    /// `correct_truehd_channels`'s early-return guards (empty pid list, `n ==
-    /// 0`) without needing real TrueHD content, and carries real synthetic
-    /// TrueHD bytes for the full round-trip tests below.
+    // Records every read_sectors call and serves a fixed zero-padded
+    // buffer, for probing early-return guards and round-trip tests below.
     struct ThdSpyReader {
         calls: std::cell::RefCell<Vec<(u32, u16)>>,
         data: Vec<u8>,
@@ -6692,12 +6166,9 @@ mod tests {
         })
     }
 
-    /// No TrueHd stream in the title → the pid list is empty and the probe
-    /// must return before ever touching the reader (extent/read-count guards
-    /// are irrelevant once there's nothing to probe for). Mutation guard:
-    /// `matches!(a.codec, Codec::TrueHd)` flipped to `true` would sweep this
-    /// title's non-TrueHD stream's pid into the probe list too, and it would
-    /// read the (spied) source.
+    // No TrueHd stream -> the pid list is empty and the probe must return
+    // before touching the reader. Mutation guard: flipping the codec match
+    // to `true` would sweep this stream's pid into the probe list too.
     #[test]
     fn correct_truehd_channels_skips_probe_when_no_truehd_stream() {
         let mut title = DiscTitle::empty();
@@ -6727,10 +6198,9 @@ mod tests {
         );
     }
 
-    /// A TrueHd stream IS present → the probe must proceed past the pid-list
-    /// guard and actually read the title's first extent. Mutation guard:
-    /// `matches!(a.codec, Codec::TrueHd)` flipped to `false` would empty the
-    /// pid list even here and the probe would return before ever reading.
+    // A TrueHd stream IS present -> the probe must read the title's first
+    // extent. Mutation guard: flipping the codec match to `false` would
+    // empty the pid list even here, so the probe never reads.
     #[test]
     fn correct_truehd_channels_reads_when_truehd_stream_present() {
         let mut title = DiscTitle::empty();
@@ -6754,11 +6224,9 @@ mod tests {
         );
     }
 
-    /// The bounded-probe sector count is `ext.sector_count.min(4096)`; when the
-    /// extent has ZERO sectors that count is zero and there is nothing to read
-    /// — the probe must return before calling into the reader. Mutation guard:
-    /// `n == 0` flipped to `n != 0` inverts this so a zero-sector extent
-    /// wrongly falls through to a (zero-length) read.
+    // The bounded-probe sector count is ext.sector_count.min(4096); a ZERO
+    // sector extent means nothing to read, so the probe must return before
+    // calling into the reader. Mutation guard: `n == 0` flipped to `!= 0`.
     #[test]
     fn correct_truehd_channels_skips_read_on_zero_sector_extent() {
         let mut title = DiscTitle::empty();
@@ -6783,14 +6251,9 @@ mod tests {
         );
     }
 
-    /// Full round-trip: a real major sync carrying a 7.1 (8ch) presentation, a
-    /// whitelisted 96 kHz rate nibble, and an Atmos substream count, probed
-    /// through a container-declared 5.1/48 kHz basic-descriptor stream. All
-    /// three corrections must land, and the label must be promoted to the
-    /// Atmos form (the stream still carried the basic, non-editorial label).
-    /// Kills the was_basic `==`, the channels/rate `!=`/`&&` guards' "already
-    /// correct" branch, the `!matches!` per-stream skip, the `is_atmos ==
-    /// Some(true)` branch, and the whole-function no-op mutant.
+    // Full round-trip: a major sync carrying 7.1/96kHz/Atmos, probed through
+    // a container-declared 5.1/48kHz basic-descriptor stream. All three
+    // corrections must land and the label promote to Atmos. See docs.
     #[test]
     fn correct_truehd_channels_full_correction_and_atmos_promotion() {
         let pid = 0x1100u16;
@@ -6837,13 +6300,9 @@ mod tests {
         );
     }
 
-    /// A major sync whose 8ch/6ch presentation masks are BOTH set to values
-    /// with no real channel-count meaning (all 13 8ch bits, summing to 20) —
-    /// `AudioChannels::from_count` maps that to `Unknown`. The correction must
-    /// leave the container's channel count untouched rather than overwrite a
-    /// known-good value with `Unknown`. Kills the `new_ch != Unknown` guard's
-    /// `==` and `&&`-to-`||` mutants (both would let an unmapped count
-    /// clobber a valid `a.channels`).
+    // A major sync whose presentation masks map to Unknown (no real
+    // channel-count meaning) must leave the container's channel count
+    // untouched, not overwrite a known-good value with Unknown.
     #[test]
     fn correct_truehd_channels_leaves_channels_when_count_unmapped() {
         let pid = 0x1100u16;
@@ -6878,12 +6337,9 @@ mod tests {
         );
     }
 
-    /// A major sync whose rate nibble (`format_info` bits 31..28) is `0x3` —
-    /// not one of the six whitelisted rates `truehd_sample_rate_hz` recognises
-    /// — must leave the container's sample rate untouched, mirroring the
-    /// channels guard above ("never write a wrong SamplingFrequency"). Both
-    /// channel-assignment masks are zeroed so `truehd_channels` returns `None`
-    /// too, isolating this to the sample-rate guard alone.
+    // A rate nibble not in the six whitelisted rates must leave the
+    // container's sample rate untouched, mirroring the channels guard
+    // ("never write a wrong SamplingFrequency").
     #[test]
     fn correct_truehd_channels_leaves_sample_rate_when_nibble_unrecognized() {
         let pid = 0x1100u16;
@@ -6915,11 +6371,8 @@ mod tests {
         );
     }
 
-    // ── bytes_bad_in_title: empty-input guard ────────────────────────────
-
-    // NOTE: `bad_ranges.is_empty() || title.extents.is_empty()` (mod.rs:628) — the
-    // `||`-to-`&&` mutant is EQUIVALENT here, not tested: it's a pure short-circuit,
-    // and whichever operand is empty the corresponding loop iterates zero times anyway.
+    // bytes_bad_in_title empty-input guard: the `||`-to-`&&` mutant here is
+    // EQUIVALENT (pure short-circuit), so it's intentionally untested.
 
     // ── byte_offset_in_title ──────────────────────────────────────────────
 
@@ -6931,15 +6384,9 @@ mod tests {
         }
     }
 
-    /// A multi-extent title where the target LBA lands in the SECOND extent.
-    /// Exercises both the boundary check for the FIRST (non-matching) extent
-    /// and the running `cumulative` byte total added on the way past it.
-    /// Kills: `lba >= start && lba < end` flipped to `||` (the first extent's
-    /// disjunction would trivially match almost any lba and return the wrong,
-    /// too-early offset); `cumulative +=` flipped to `*=` (cumulative is
-    /// seeded at 0, so `*=` freezes it at 0 forever); and `sector_count *
-    /// SECTOR_BYTES_U64` flipped to `+` or `/` (wrong per-extent byte length
-    /// folded into cumulative).
+    // A multi-extent title where the target LBA lands in the SECOND extent —
+    // exercises both the first extent's boundary check and the running
+    // `cumulative` byte total added on the way past it. See docs/disc-mod.md.
     #[test]
     fn byte_offset_in_title_accumulates_across_extents() {
         let title = title_with_size(
@@ -7008,13 +6455,9 @@ mod tests {
         ]
     }
 
-    /// Concrete end-to-end arithmetic check: byte_offset 60/100 of a 100s
-    /// title lands at t=60s, which is chapter index 1 (0-based, the last
-    /// chapter whose start <= 60) → 1-based chapter 2. Kills: the `/`
-    /// (time-fraction) flipped to `%` or `*`; the `*` (duration scale)
-    /// flipped to `+`; the `<=` chapter-scan comparison flipped to `>`; the
-    /// final `chapter_idx + 1` flipped to `-` or `*`; and every
-    /// whole-function fixed-tuple replacement (none produce `(2, 60.0)`).
+    // Concrete end-to-end arithmetic: byte_offset 60/100 of a 100s title
+    // lands at t=60s, chapter index 1 (0-based) -> 1-based chapter 2. Kills
+    // every arithmetic-operator and fixed-tuple mutant. See docs.
     #[test]
     fn chapter_at_offset_concrete_arithmetic() {
         let chapters = three_chapters();
@@ -7026,10 +6469,9 @@ mod tests {
         );
     }
 
-    /// `total_bytes == 0` must short-circuit to `None` (no title size to
-    /// compute a fraction against) regardless of whether chapters exist.
-    /// Kills `total_bytes == 0` flipped to `!=`, and (combined with the next
-    /// test) the `||` flipped to `&&`.
+    // total_bytes == 0 must short-circuit to None regardless of chapters.
+    // Kills `total_bytes == 0` flipped to `!=`, and (with the next test)
+    // the `||` flipped to `&&`.
     #[test]
     fn chapter_at_offset_zero_total_bytes_is_none() {
         let chapters = three_chapters();
@@ -7040,10 +6482,9 @@ mod tests {
         );
     }
 
-    /// No chapters declared → `None`, even with a perfectly valid nonzero
-    /// title size. Kills the `||` flipped to `&&` (which would let this case
-    /// fall through the guard and return a bogus `Some((1, ..))` from the
-    /// then-empty scan loop).
+    // No chapters declared -> None, even with a valid nonzero title size.
+    // Kills the `||` flipped to `&&` (would fall through the guard and
+    // return a bogus Some((1, ..)) from the then-empty scan loop).
     #[test]
     fn chapter_at_offset_no_chapters_is_none() {
         assert_eq!(
@@ -7068,12 +6509,9 @@ mod tests {
         }
     }
 
-    /// Concrete positive case chaining `byte_offset_in_title` +
-    /// `chapter_at_offset`: lba 1060 is 60 sectors (122_880 bytes) into the
-    /// extent, 60% of the 204_800-byte title → t=60s → chapter 2. This exact
-    /// non-default tuple kills every fixed-tuple whole-function replacement
-    /// mutant (`(None, None)`, `(Some(0), ..)`, `(Some(1), ..)`, etc. — none
-    /// equal `(Some(2), Some(60.0))`).
+    // Concrete positive case chaining byte_offset_in_title + chapter_at_offset:
+    // lba 1060 -> t=60s -> chapter 2. This exact tuple kills every
+    // fixed-tuple whole-function replacement mutant.
     #[test]
     fn range_chapter_concrete_positive_case() {
         let title = title_for_range_chapter();
@@ -7088,13 +6526,8 @@ mod tests {
     }
 
     // ── locate_ranges ─────────────────────────────────────────────────────
-
-    /// Isolates the per-range `lba`/`count` sector-arithmetic from every
-    /// bps-dependent branch (duration_secs is negative, so `bps` is 0.0
-    /// under both the real `>` and any surviving `>=`/`==`/`<` mutant at that
-    /// same guard). Non-power-coincidental `pos`/`size` so `/` vs `%` vs `*`
-    /// all disagree with the expected quotient. Kills `pos / SECTOR_BYTES_U64`
-    /// and `size / SECTOR_BYTES_U64` each flipped to `%` or `*`.
+    // Isolates the per-range lba/count sector-arithmetic from every
+    // bps-dependent branch (duration_secs negative forces bps == 0.0).
     #[test]
     fn locate_ranges_lba_and_count_are_sector_quotients() {
         let title = title_with_size(0, vec![]);
@@ -7106,14 +6539,9 @@ mod tests {
         assert_eq!(result.ranges[0].count, 2, "6000 / 2048 = 2");
     }
 
-    /// Concrete positive-`bps` arithmetic for both `duration_ms` (per-range)
-    /// and `main_at_risk_ms` (title-wide): bps = 204_800 B / 100 s = 2048
-    /// B/s exactly. A 4096-byte range = 2 sectors = 2000 ms at that rate,
-    /// and it's entirely inside the title's only extent so all of it counts
-    /// toward `main_at_risk_ms` too. Kills `bps > 0.0` flipped to `==`/`<`
-    /// (both would take the `else 0.0` branch here, wrongly reporting 0);
-    /// `(*size as f64) / bps` flipped to `%` or `*`; and the trailing
-    /// `* MILLIS_PER_SEC` flipped to `+` or `/`.
+    // Concrete positive-bps arithmetic for duration_ms and main_at_risk_ms:
+    // bps = 2048 B/s exactly, a 4096-byte range = 2000 ms, entirely inside
+    // the title's only extent. Kills bps/size arithmetic mutants; see docs.
     #[test]
     fn locate_ranges_positive_bps_duration_and_at_risk() {
         let title = title_with_size(
@@ -7138,12 +6566,9 @@ mod tests {
         );
     }
 
-    /// `bps` computed exactly `0.0` (duration_secs == 0.0): both the
-    /// per-range `duration_ms` and title-wide `main_at_risk_ms` must stay
-    /// `0.0`, never a divide-by-zero `inf`/`NaN`. Kills `bps > 0.0` flipped
-    /// to `>=` at BOTH sites (mod.rs:743 and mod.rs:768) — with the boundary
-    /// exactly zero, `>=` wrongly takes the division branch and produces
-    /// `inf` instead of the real code's `0.0`.
+    // bps computed exactly 0.0: duration_ms/main_at_risk_ms must stay 0.0,
+    // never inf/NaN. Kills `bps > 0.0` flipped to `>=` at both sites (the
+    // boundary exactly zero would wrongly take the division branch).
     #[test]
     fn locate_ranges_zero_bps_stays_zero_not_infinite() {
         let title = title_with_size(
@@ -7159,16 +6584,9 @@ mod tests {
         assert_eq!(result.main_at_risk_ms, 0.0);
     }
 
-    // NOTE: mod.rs:732 (`duration_secs > 0.0` seeding `bps`) — the `>`-to-`>=` mutant
-    // is EQUIVALENT: `bps` is only used behind its own `bps > 0.0` re-check (mod.rs:743,
-    // 768), and at the boundary `size_bytes / 0.0` is inf/NaN, still `false` there.
-
-    // ── Codec::name / Display ────────────────────────────────────────────
-
-    /// `name()` is a linear lookup keyed by `==` against `ALL_CODECS`; picking
-    /// a codec that is NOT the first table entry means a mutated `==`→`!=`
-    /// returns the (wrong) first entry's name instead. `Unknown` isn't in the
-    /// table at all, exercising the post-loop fallback.
+    // NOTE: the `>`-to-`>=` mutant seeding bps is EQUIVALENT (re-checked).
+    // ── Codec::name/Display: linear lookup keyed by `==` against
+    // ALL_CODECS; a non-first entry catches a mutated `==`->`!=`.
     #[test]
     fn codec_name_lookup_and_unknown_fallback() {
         assert_eq!(Codec::Hevc.name(), "HEVC");
@@ -7199,10 +6617,9 @@ mod tests {
         assert!(!Resolution::Unknown.is_sd());
     }
 
-    /// Every from_height bucket boundary — deleting any one match arm makes
-    /// its heights fall through to the NEXT surviving arm (a strictly
-    /// different variant), so each of these pairs (top of one bucket, bottom
-    /// of the next) pins the arm to its own boundary.
+    // Every from_height bucket boundary — deleting any match arm makes its
+    // heights fall through to the NEXT surviving arm, so each pair (top of
+    // one bucket, bottom of the next) pins the arm to its own boundary.
     #[test]
     fn resolution_from_height_bucket_boundaries() {
         assert_eq!(Resolution::from_height(0), Resolution::R480p);
@@ -7237,12 +6654,8 @@ mod tests {
     }
 
     // ── SampleRate::from_hz ───────────────────────────────────────────────
-
-    /// Every rate the enum can represent, expressed in Hz. Deleting any one
-    /// match arm sends that rate to `_ => Unknown`, so a rate-by-rate check
-    /// pins each arm independently. The two combo rates (`S48_96`,
-    /// `S48_192`) deliberately have no Hz spelling — `hz()` collapses them
-    /// onto 48000, so 48000 must map back to the plain `S48` and nothing else.
+    // Every rate the enum can represent, in Hz. Combo rates (S48_96,
+    // S48_192) have no Hz spelling — 48000 must map back to plain S48 only.
     #[test]
     fn sample_rate_from_hz_every_mapped_rate() {
         assert_eq!(SampleRate::from_hz(44_100), SampleRate::S44_1);
@@ -7255,10 +6668,9 @@ mod tests {
         assert_eq!(SampleRate::from_hz(32_000), SampleRate::Unknown);
     }
 
-    /// `from_hz` must invert `hz()` for every rate that has a single Hz
-    /// value (i.e. all but the two combo rates, whose `hz()` reports their
-    /// primary 48 kHz). Round-tripping rather than restating the table keeps
-    /// this honest if a rate is ever added.
+    // from_hz must invert hz() for every rate with a single Hz value (all
+    // but the two combo rates). Round-tripping keeps this honest if a rate
+    // is ever added.
     #[test]
     fn sample_rate_from_hz_inverts_hz_for_single_rate_variants() {
         for r in [
@@ -7289,12 +6701,9 @@ mod tests {
         assert_eq!(format!("{}", HdrFormat::Hlg), HdrFormat::Hlg.name());
     }
 
-    /// `FromStr` accepts the human display names as well as the compact ids,
-    /// via a second linear scan keyed on `name(v) == s`. Every probe here is
-    /// a display name that is NOT its own id, so it can only be resolved by
-    /// that second scan — and none of them is the first table entry, so a
-    /// scan whose comparison is inverted returns the wrong (first) variant
-    /// rather than the right one.
+    // FromStr accepts human display names as well as compact ids, via a
+    // second linear scan keyed on `name(v) == s`; every probe here is a
+    // display name (not its own id) and not the first table entry.
     #[test]
     fn hdr_format_from_str_resolves_display_names() {
         assert_eq!(
@@ -7345,11 +6754,8 @@ mod tests {
     }
 
     // ── DiscTitle stream filters ──────────────────────────────────────────
-
-    /// A title whose stream list interleaves all three kinds. Each accessor
-    /// must yield exactly its own kind, in declared order — an accessor that
-    /// yields nothing (or drops its match arm) would leave stream selection
-    /// and the info panel with no tracks at all.
+    // A title whose stream list interleaves all three kinds; each accessor
+    // must yield exactly its own kind, in declared order.
     #[test]
     fn disc_title_stream_filters_select_their_own_kind_in_order() {
         let mut title = DiscTitle::empty();
@@ -7439,11 +6845,8 @@ mod tests {
     }
 
     // ── DiscId::name ──────────────────────────────────────────────────────
-
-    /// The disc's best available name: the META/DL `bdmt_*.xml` title when the
-    /// disc carries one, otherwise the UDF Volume Identifier. Never a constant
-    /// and never empty when either source has content — this string names the
-    /// output file and the rip's directory.
+    // The disc's best available name: the META/DL bdmt_*.xml title when
+    // present, otherwise the UDF Volume Identifier.
     #[test]
     fn disc_id_name_prefers_meta_title_then_volume_id() {
         let with_meta = DiscId {
@@ -7463,18 +6866,8 @@ mod tests {
     }
 
     // ── canonical_title_order: the capacity gate is STRICTLY greater-than ──
-
-    /// The "physically possible on this disc" gate is `size_bytes <=
-    /// capacity_bytes` (see [`Disc::canonical_title_order`]'s contract:
-    /// *"Real titles (`size_bytes ≤ capacity_bytes`) before virtual
-    /// composites"*). A title whose declared size EXACTLY equals the disc
-    /// capacity fits — a full-disc single-layer authoring, no double-counted
-    /// clips — so it is a REAL title and must outrank the oversize composite,
-    /// never be demoted alongside it.
-    ///
-    /// Asserted on the comparator directly (both argument orders), not on a
-    /// sort: an inconsistent comparator produces an implementation-defined
-    /// permutation, which would make a sort-based assertion prove nothing.
+    // The gate is size_bytes <= capacity_bytes: a title whose size EXACTLY
+    // equals capacity is REAL and must outrank an oversize composite.
     #[test]
     fn canonical_order_capacity_gate_admits_a_title_that_exactly_fills_the_disc() {
         use std::cmp::Ordering;
@@ -7510,15 +6903,9 @@ mod tests {
         );
     }
 
-    /// `capacity_bytes == 0` means the disc capacity is UNKNOWN — `read_udf`
-    /// substitutes 0 when READ CAPACITY fails (transient spin-up, SCSI error)
-    /// and proceeds with the scan. It does NOT mean "the disc holds nothing".
-    ///
-    /// With a literal reading of the gate, 0 inverts it: EVERY real title is
-    /// `size_bytes > 0` and therefore "oversize", while a title with no CLPI
-    /// (`size_bytes == 0`) is not — so the empty title sorts to `titles[0]`
-    /// ahead of the feature and `freemkv -t 1` rips garbage. The gate must be
-    /// INERT when the capacity is unknown.
+    // capacity_bytes == 0 means UNKNOWN (READ CAPACITY failed): a literal
+    // gate reading inverts on 0, wrongly letting an empty title win
+    // titles[0]. The gate must be INERT when capacity is unknown.
     #[test]
     fn canonical_order_unknown_capacity_does_not_demote_every_real_title() {
         const UNKNOWN: u64 = 0; // READ CAPACITY failed
@@ -7535,12 +6922,8 @@ mod tests {
         assert_eq!(titles[1].playlist, "00001.mpls");
     }
 
-    /// Control for [`canonical_order_unknown_capacity_does_not_demote_every_real_title`]:
-    /// making the gate inert on an UNKNOWN capacity must not make it dead. With
-    /// a KNOWN capacity a genuinely oversize play-all composite is still demoted
-    /// below a smaller real title — even though "largest size first" would
-    /// otherwise rank it first. Asserted on the comparator in both argument
-    /// orders so an inconsistent comparator cannot pass.
+    // Control: making the gate inert on UNKNOWN capacity must not make it
+    // dead — with a KNOWN capacity an oversize composite is still demoted.
     #[test]
     fn canonical_order_known_capacity_still_demotes_a_genuinely_oversize_title() {
         use std::cmp::Ordering;
@@ -7587,14 +6970,9 @@ mod tests {
         }
     }
 
-    /// Equal-size, equal-duration sibling playlists (the same feature authored
-    /// twice — a full-audio main and an audio-reduced twin) are separated by
-    /// audio richness, ranked `(any lossless, best channel count, track count)`
-    /// with richer first. Each assertion below varies exactly ONE component of
-    /// that key and holds the other two equal, so each component is pinned
-    /// independently; the final pair is identical in all three and must compare
-    /// Equal, so "richer first" is not satisfied by a comparator that simply
-    /// never reports a tie.
+    // Equal-size/duration siblings are separated by audio richness (any
+    // lossless, best channel count, track count). Each assertion varies ONE
+    // component; the final pair is identical and must compare Equal.
     #[test]
     fn canonical_order_breaks_equal_size_ties_on_audio_richness() {
         use std::cmp::Ordering;
@@ -7642,15 +7020,8 @@ mod tests {
     }
 
     // ── detect_disc_format: the MKB-less BDMV fallback ────────────────────
-
-    /// A BDMV-tree disc with NO readable `/AACS/MKB_RO.inf` (unencrypted, or an
-    /// unreadable MKB) has no AACS generation to classify by, so the format
-    /// falls back to video resolution. Two rules apply there:
-    ///   * UHD resolution PROMOTES the disc to [`DiscFormat::Uhd`] — the ECC
-    ///     block sweep is sized off this, so losing the promotion mis-sizes it;
-    ///   * everything else is clamped UP to [`DiscFormat::BluRay`], because a
-    ///     BD-tree disc is never a DVD even when an SD bonus title is scanned
-    ///     first.
+    // No readable MKB falls back to video resolution: UHD PROMOTES to
+    // DiscFormat::Uhd, everything else is clamped UP to BluRay (never DVD).
     #[test]
     fn mkb_less_bdmv_disc_is_promoted_to_uhd_by_resolution_and_clamped_up_otherwise() {
         use crate::udf::fixture::*;
@@ -7693,14 +7064,8 @@ mod tests {
     }
 
     // ── encrypted_content_ranges ──────────────────────────────────────────
-
-    /// The authoritative "which sectors are AACS content" map is the UNION of
-    /// every title's extents, sorted and merged into a disjoint set. Titles
-    /// routinely share clips (a play-all playlist references the feature's
-    /// clips), so the raw per-title extents overlap and arrive in playlist
-    /// order, not LBA order. The fixture below carries all three shapes at
-    /// once — an OVERLAP across two titles, an ADJACENT pair, and a DISJOINT
-    /// region — supplied out of order.
+    // The content map is the UNION of every title's extents, merged into a
+    // disjoint set. Fixture has OVERLAP, ADJACENT, and DISJOINT, out of order.
     #[test]
     fn encrypted_content_ranges_unions_sorts_and_merges_every_titles_extents() {
         let mut disc = make_test_disc(200_000, "BD");
@@ -7727,13 +7092,8 @@ mod tests {
     }
 
     // ── aacs_disc_hash ────────────────────────────────────────────────────
-
-    /// The disc hash names the disc in an [`Error::NoDiscKey`] so the caller can
-    /// tell the user which keydb entry to add — it must be the disc's OWN
-    /// captured SHA-1 of `Unit_Key_RO.inf`, in the bare 40-hex form the keydb is
-    /// keyed on (the stored field carries a `0x` prefix). A disc with no AACS
-    /// state has no hash to report, and reports nothing rather than a
-    /// placeholder that would send the user hunting a non-existent entry.
+    // Names the disc in Error::NoDiscKey: the disc's own SHA-1 of
+    // Unit_Key_RO.inf, stripped to bare 40-hex. No AACS state reports nothing.
     #[test]
     fn aacs_disc_hash_is_the_captured_hash_without_its_0x_prefix() {
         const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -7756,19 +7116,8 @@ mod tests {
     }
 
     // ── decrypt_keys_for_title: CSS crack-span reuse is half-open ─────────
-
-    /// A CSS title key is per-VTS: reusing the scan's cracked key for a title
-    /// that lives OUTSIDE the cracked span descrambles that title with the wrong
-    /// key, and the mux emits garbage at exit 0. `crack_span` is documented as
-    /// the half-open LBA span `[start, end)`, so overlap is
-    /// `extent.start < span.end && span.start < extent.end` — both comparisons
-    /// STRICT. A title that merely ABUTS the span (ends exactly where it begins,
-    /// or begins exactly where it ends) shares no sector with it and must NOT
-    /// reuse the key.
-    ///
-    /// The reader serves only clear (all-zero) sectors, so a title that falls
-    /// through to its own crack is reported unencrypted — distinguishable from
-    /// the reused-key answer both in the key and in the is-clear flag.
+    // crack_span uses STRICT `<` both sides, so a title that merely ABUTS
+    // the span must NOT reuse the key. See docs/disc-mod.md.
     #[test]
     fn decrypt_keys_for_title_css_span_reuse_is_half_open() {
         const KEY: [u8; 5] = [0xA1, 0xB2, 0xC3, 0xD4, 0xE5];
@@ -7872,12 +7221,9 @@ mod tests {
         );
     }
 
-    /// `/dev/null` output (the benchmark sink) cannot host a sibling mapfile, so
-    /// the mapfile is named from the disc and placed in the temp dir. The name
-    /// is sanitized to `[A-Za-z0-9-_]` — every other character, including the
-    /// spaces and punctuation that appear in real META/DL titles and the
-    /// non-ASCII ones, becomes `_` — because this string is used verbatim as a
-    /// filename.
+    // /dev/null output cannot host a sibling mapfile, so it's named from the
+    // disc and placed in the temp dir, sanitized to [A-Za-z0-9-_] since it's
+    // used verbatim as a filename.
     #[test]
     fn mapfile_for_dev_null_sanitizes_the_disc_name_into_a_temp_path() {
         let mut disc = make_test_disc(1_000, "VOLUME_ID");
@@ -7896,11 +7242,9 @@ mod tests {
         );
     }
 
-    /// A drive that answers READ CAPACITY (10) with GOOD status but an empty
-    /// data phase leaves the caller's buffer zero-initialised. Decoding that
-    /// blind yields `last_lba = 0` -> a "1 sector" disc, which reads as a
-    /// successful capacity probe of an absurdly small disc rather than as the
-    /// malformed response it is. `Disc::read_capacity` must reject it.
+    // A drive answering READ CAPACITY(10) GOOD with an empty data phase
+    // leaves the buffer zero, decoding blind to a bogus "1 sector" disc.
+    // read_capacity must reject it.
     #[test]
     fn read_capacity_rejects_a_short_transfer_instead_of_reporting_one_sector() {
         use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};

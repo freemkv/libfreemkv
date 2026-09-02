@@ -1,37 +1,12 @@
-//! Test-only capture of `tracing` events, so the crate's logging contract is
-//! ENFORCED rather than merely commented.
+//! Test-only capture of `tracing` events, so the crate's logging contract
+//! ("Account / Log / Classify") is ENFORCED rather than merely commented.
 //!
-//! # Why this exists
+//! Uses a hand-rolled [`tracing::Subscriber`] rather than `tracing-subscriber`
+//! to keep this crate's one dev-dependency; installed once globally (see
+//! [`capture`]) and routes each event to the emitting thread's own sink so
+//! `cargo test`'s parallel harness can't cross-contaminate captures.
 //!
-//! The error contract is "Account / Log / Classify", and the round-2 audit
-//! found the third leg unverifiable: three separate sites carry long comments
-//! insisting they log **the error's OWN code, not a fixed one** — because
-//! flattening a scratched sector (E6000) or an over-long allocation-descriptor
-//! chain (E6016) into E6017 sends whoever triages them after authoring holes
-//! and hides the population that actually exists. Nothing tested that. Putting
-//! a literal back at `bluray.rs`'s or `hddvd.rs`'s warn sites broke no test, so
-//! the guarantee was a convention one careless edit away from being false. Two
-//! of those very sites were changed in round 1, and a third still carried a
-//! hardcoded `code = 6017`.
-//!
-//! Likewise "absence of a log is itself a bug": a refusal that returns the
-//! right error but says nothing produces the wrong population downstream (a
-//! residual-underrunning drive is indistinguishable from a scratched disc).
-//! That is only checkable by looking at what was emitted.
-//!
-//! # Why a hand-rolled subscriber and not `tracing-subscriber`
-//!
-//! Same posture as [`crate::harness`]: this crate has exactly one
-//! dev-dependency on purpose. `tracing-subscriber` would pull a tree of them to
-//! do what forty lines of [`tracing::Subscriber`] does here. The capture is
-//! installed with [`tracing::subscriber::with_default`], which is
-//! THREAD-LOCAL — so it composes with `cargo test`'s parallel harness and two
-//! capturing tests cannot see each other's events.
-//!
-//! Field values are stringified through [`std::fmt::Debug`]/`Display` because
-//! that is all the visitor API offers without a typed schema; tests compare
-//! against the string form of the expected constant, which is exactly the
-//! comparison that catches a hardcoded code.
+//! See docs/testlog.md for the full rationale.
 
 #![cfg(test)]
 
@@ -148,27 +123,9 @@ fn install() {
     });
 }
 
-/// Run `f` with every `tracing` event it emits ON THIS THREAD captured.
-///
-/// Returns `f`'s value alongside the events, in emission order.
-///
-/// # Why one global subscriber, not scoped `with_default`
-///
-/// `tracing`'s per-callsite INTEREST CACHE is GLOBAL, but `with_default` is
-/// thread-local. Under `cargo test`'s parallel harness a rebuild of that cache
-/// — triggered by ANY other thread registering any callsite for the first time
-/// — re-evaluates the target callsite against the global dispatcher, which a
-/// scoped subscriber is NOT part of, and can leave it cached "off" while a
-/// capture is live, so the capture observes NOTHING. Serialising captures
-/// against each other does not help: the poisoning thread is not itself
-/// capturing. `parse_playlist_unreadable_clip_icb_yields_no_title` flaked ~1
-/// run in 15 on exactly this — an empty event list.
-///
-/// The robust shape is a single subscriber installed globally for the whole
-/// run, whose `register_callsite` returns `sometimes` (so no callsite is ever
-/// hard-cached) and which routes each event to the emitting thread's own sink.
-/// No scoped-dispatcher transitions, no cross-thread cache race, and concurrent
-/// captures on different threads stay isolated by the thread-local sink.
+// Run `f` with every `tracing` event it emits on this thread captured;
+// returns `f`'s value alongside the events, in emission order. One global
+// subscriber, not scoped `with_default` — see docs/testlog.md for why.
 pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
     install();
     let sink: Sink = Arc::default();
@@ -184,12 +141,9 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
 mod tests {
     use super::*;
 
-    /// The capture must actually see events and their field VALUES — if it
-    /// silently recorded nothing, every logging assertion built on it would
-    /// pass vacuously, which is worse than having no harness at all.
-    ///
-    /// Mutation: an `enabled()` returning `false`, or an `event()` that drops
-    /// the visitor's fields, fails here.
+    // The capture must actually see events and field values, not silently
+    // record nothing (see docs/testlog.md). Mutation: `enabled()` returning
+    // false, or `event()` dropping fields, fails here.
     #[test]
     fn capture_records_target_level_and_fields() {
         let ((), events) = capture(|| {

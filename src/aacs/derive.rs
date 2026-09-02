@@ -8,25 +8,15 @@ use super::types::*;
 
 /// Derive Media Key from MKB data using processing keys.
 ///
-/// A Processing Key is **terminal**: it is the key at its Subset-Difference
-/// node, one `AES-G` from the Media Key. So this is the fast path — each PK is
-/// tried *directly* against the MKB cvalue tables (no tree descent) — the
-/// direct PK × cvalue iteration. On a large AACS 2.x UHD MKB
-/// (~181k cvalues) this is ~15x faster than treating a PK as a device-node
-/// label and walking the tree.
+/// A Processing Key is **terminal**: tried *directly* against the MKB
+/// cvalue tables (no tree descent) — the fast path.
 ///
-/// If you hold a **device-node label** at unknown tree depth (not a terminal
-/// PK), derive its Media Key through the device-key path
-/// ([`derive_media_key_from_dk`]) — that path owns the Subset-Difference tree
-/// walk; the PK path never descends.
+/// If you hold a **device-node label** at unknown tree depth (not a
+/// terminal PK), use [`derive_media_key_from_dk`] instead — only that path
+/// walks the Subset-Difference tree.
 ///
-/// MKB format:
-///   Record type 0x10 = Type and Version Record (has MKB version)
-///   Record type 0x81 = Verify Media Key Record, AACS 1.0 (has mk_dv)
-///   Record type 0x86 = Verify Media Key Record, AACS 2.0/2.1 (has mk_dv)
-///   Record type 0x04 = Subset-Difference Index (has UVS entries)
-///   Record type 0x05 = Media Key Data Record (cvalues, 1:1 with 0x04)
-///   Record type 0x07 = Explicit Subset-Difference Record (NOT cvalues)
+/// See `docs/aacs-derive.md` for the MKB record-type layout and the
+/// performance case for the direct PK × cvalue scan.
 pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Option<[u8; 16]> {
     let mk_dv = mkb_find_mk_dv(mkb)?;
     let uvs = mkb_find_subdiff_records(mkb)?;
@@ -34,10 +24,9 @@ pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Opt
     try_pk_against_tables(processing_keys, &uvs, &cvalues, &mk_dv)
 }
 
-/// Core terminal-PK table scan over explicit record bodies. Each processing
-/// key is tried **directly** against every `(uv, cvalue)` pair — no tree
-/// descent. Reached in production via [`derive_media_key_from_pk`]; factored
-/// out so reproduction harnesses can drive it with explicit tables.
+// Core terminal-PK table scan: each PK tried directly against every
+// (uv, cvalue) pair, no tree descent. Factored out so reproduction
+// harnesses can drive it with explicit tables (see docs/aacs-derive.md).
 pub(crate) fn try_pk_against_tables(
     processing_keys: &[[u8; 16]],
     uvs: &[u8],
@@ -68,14 +57,9 @@ pub(crate) fn try_pk_against_tables(
     None
 }
 
-/// Validate a processing key against a cvalue/UV pair.
-/// Returns the Media Key if valid.
-///
-/// Steps (media key: `[C]` §3.2.4; verify relation: `[C]` §3.2.5.1.4):
-///   1. `mk = AES-128D(pk, cvalue)`                       `[C]` §3.2.4
-///   2. `mk[12..16] ^= uv` (4 bytes XOR into the last 4 bytes only)  `[C]` §3.2.4
-///   3. `dec_vd = AES-128D(mk, mk_dv)`                     `[C]` §3.2.5.1.4
-///   4. If `dec_vd[0..8] == 01 23 45 67 89 AB CD EF` → valid.  `[C]` §3.2.5.1.4
+// Validate a processing key against a cvalue/UV pair; returns the Media Key
+// if valid. `[C]` §3.2.4 (mk = AES-128D(pk,cvalue); mk[12..16] ^= uv) then
+// §3.2.5.1.4 (dec_vd = AES-128D(mk,mk_dv); valid iff dec_vd[0..8] == magic).
 pub(crate) fn validate_processing_key(
     pk: &[u8; 16],
     cvalue: &[u8],
@@ -249,21 +233,14 @@ pub fn derive_media_key_and_pk_from_dk(
 
 /// Recover the subset-difference position (`node`, `uv`, `u_mask_shift`) of an
 /// UNPOSITIONED device key by scanning a disc MKB. A device key alone (just the
-/// 16 bytes) cannot be walked — the walk needs its tree node. This finds that
-/// node empirically: for each MKB subset-difference record, it tries the device
-/// at the record's node AND at every ancestor v-position (the device may sit one
-/// or more levels ABOVE the record, descending via AES-G3 to reach it), deriving
-/// the candidate Processing Key DIRECTLY (one [`calc_pk_from_dk`] per candidate,
-/// no full re-walk) and checking it validates against that record's cvalue.
+/// 16 bytes) cannot be walked — the walk needs its tree node.
 ///
 /// On the first verifying candidate it pins `(uv, u_mask_shift)` — invariant for
-/// the key across all discs — and resolves a gate-passing `node` (a one-time
-/// ≤32-try search at the single hit). Returns a [`DeviceKey`] ready to bank and
-/// reuse on every future disc via [`derive_media_key_from_dk`]. `None` if the
-/// key does not apply to this MKB.
+/// the key across all discs — and resolves a gate-passing `node`. Returns a
+/// [`DeviceKey`] ready to bank and reuse on every future disc via
+/// [`derive_media_key_from_dk`]. `None` if the key does not apply to this MKB.
 ///
-/// Cost is `O(slots × tree_depth)` — linear in the MKB's subset-difference
-/// index, not the quartic cost of re-deriving per candidate.
+/// See `docs/aacs-derive.md` for the search strategy and its cost.
 pub fn recover_dk_position(mkb: &[u8], key: &[u8; 16]) -> Option<DeviceKey> {
     let mk_dv = mkb_find_mk_dv(mkb)?;
     let uvs = mkb_find_subdiff_records(mkb)?;
@@ -320,11 +297,9 @@ pub fn recover_dk_position(mkb: &[u8], key: &[u8; 16]) -> Option<DeviceKey> {
     found.and_then(|(uv, mask)| resolve_dk_node(mkb, key, uv, mask))
 }
 
-/// Resolve a positioned [`DeviceKey`] for an orphan `key` known to sit at
-/// `(uv, u_mask_shift)`: find a `device_number` (node) that passes the walk's
-/// subset-difference gate on `mkb`. The derived key is independent of the exact
-/// node (it only gates), so any gating node yields the same Media Key — a
-/// one-time ≤32-try search, run only once at the recovered position.
+// Resolve a positioned DeviceKey for an orphan `key` at `(uv, u_mask_shift)`:
+// find a `device_number` (node) that passes the walk's subset-difference
+// gate. Any gating node yields the same Media Key — a one-time ≤32-try search.
 pub(crate) fn resolve_dk_node(
     mkb: &[u8],
     key: &[u8; 16],
@@ -420,10 +395,9 @@ pub fn decrypt_unit_key(vuk: &[u8; 16], encrypted_uk: &[u8; 16]) -> [u8; 16] {
     aes_ecb_decrypt(vuk, encrypted_uk)
 }
 
-/// Decrypt every encrypted unit key in a parsed `Unit_Key_RO.inf` with a VUK,
-/// paired with its declared CPS-unit number. THE single VUK→unit-keys step:
-/// both classical/v21 resolvers and [`resolve_candidate`] call this, so the
-/// map cannot drift between the player and harvest paths.
+// Decrypt every encrypted unit key in a parsed Unit_Key_RO.inf with a VUK,
+// paired with its declared CPS-unit number. The single VUK->unit-keys step
+// both resolvers and resolve_candidate call, so the map cannot drift.
 pub(crate) fn derive_unit_keys(uk_file: &UnitKeyFile, vuk: &[u8; 16]) -> Vec<(u32, [u8; 16])> {
     uk_file
         .encrypted_keys
@@ -482,19 +456,12 @@ impl std::fmt::Debug for ResolvedChain {
 ///
 /// Runs the deterministic derivation DOWNWARD to the disc's terminal unit keys:
 /// `DK → MK → VUK → UKs`, `PK → MK → VUK → UKs`, `MK → VUK → UKs`,
-/// `VUK → UKs`, or `UK → itself`. Composes the raw derivation primitives
-/// ([`derive_media_key_from_pk`], [`derive_media_key_and_pk_from_dk`],
-/// [`derive_vuk`], [`derive_unit_keys`]) and parses `Unit_Key_RO.inf` at the
-/// version the disc's MKB declares, so a multi-CPS disc yields all its unit
-/// keys from the one candidate.
+/// `VUK → UKs`, or `UK → itself`, parsing `Unit_Key_RO.inf` at the version the
+/// disc's MKB declares so a multi-CPS disc yields all its unit keys.
 ///
-/// PURE DERIVATION: no sampling, no validation, no position recovery. Validate
-/// `unit_keys` against a real encrypted unit with
-/// `decrypt_unit` + `is_clean_ts` to prove the candidate opens the disc.
-///
-/// Returns `None` only when derivation itself cannot proceed: a PK its MKB
-/// rejects, a `Dk` the MKB can't process, a missing VID on a path that needs
-/// one, or an unparseable/empty `Unit_Key_RO.inf`.
+/// PURE DERIVATION: no sampling, no validation, no position recovery. Returns
+/// `None` only when derivation itself cannot proceed. See `docs/aacs-derive.md`
+/// for the composed primitives and the full `None` conditions.
 pub fn resolve_candidate(
     candidate: &KeyCandidate,
     mkb: &[u8],
@@ -571,20 +538,9 @@ mod resolve_candidate_tests {
     use super::*;
     use crate::aacs::crypto::aes_ecb_encrypt;
 
-    /// `km_verifies` is the gate deciding whether a candidate Media Key is the
-    /// disc's. `resolve.rs`'s MK-pool brute force runs every candidate through
-    /// it, so if it said yes to everything the first candidate would be accepted
-    /// and the rip would continue with a wrong Media Key — wrong VUK, wrong
-    /// title keys, garbage plaintext, and no error raised anywhere.
-    ///
-    /// Nothing tested it. Whole-crate mutation testing surfaced
-    /// `replace km_verifies -> bool with true` as SURVIVING: the body could be
-    /// replaced by `true` and all 2,556 tests still passed. A verification
-    /// routine whose verification was itself unverified.
-    ///
-    /// No real key material is needed. AACS defines the relation as
-    /// `AES-D(km, mk_dv)[0..8] == 01 23 45 67 89 AB CD EF`, so a valid record
-    /// for a chosen `km` is simply `AES-E(km, <that constant> || anything)`.
+    // km_verifies gates every candidate Media Key; mutation testing found
+    // `-> true` surviving all 2,556 tests, i.e. unverified verification.
+    // See docs/aacs-derive.md for how the fixture inverts the AES relation.
     #[test]
     fn km_verifies_accepts_only_the_key_its_record_was_built_for() {
         use crate::aacs::mkb::mkb_find_mk_dv;
@@ -776,15 +732,9 @@ mod resolve_candidate_tests {
     }
 }
 
-/// Device-key POSITION recovery and the MKB probe accessors.
-///
-/// This file holds the whole subset-difference walk and had five tests for it.
-/// There are no published AACS test vectors, but none are needed: the AACS
-/// relations (`[C]` §3.2.3–§3.2.5) are invertible, so a valid MKB for a CHOSEN
-/// key can be constructed with `aes_ecb_encrypt` and the same `aesg3` the walk
-/// uses as its node function. That is what `plant_mkb` below does — no real
-/// key material, and the assertions check the DERIVED Media Key, not any
-/// intermediate the code under test also produces.
+// Device-key POSITION recovery and the MKB probe accessors. No published AACS
+// test vectors exist; the relations (`[C]` §3.2.3-§3.2.5) are invertible, so
+// `plant_mkb` below builds a valid MKB for a CHOSEN key. See docs/aacs-derive.md.
 #[cfg(test)]
 mod position_recovery_tests {
     use super::*;
@@ -818,13 +768,9 @@ mod position_recovery_tests {
         u_mask_shift: u8,
     }
 
-    /// Build the fixture by inverting the AACS relations.
-    ///
-    /// `uv = 0x0400` (lowest set bit 10) with `u_mask_shift = 12` is chosen so a
-    /// gating device node exists: `resolve_dk_node` flips one bit `b < 12`, and
-    /// the walk's gate (`[C]` §3.2.4) needs that bit inside `v_mask`
-    /// (`0xFFFF_FFFF << 11`) and outside `u_mask` (`0xFFFF_FFFF << 12`) — i.e.
-    /// `b == 11`. `uv` is kept under 0x10000 because `DeviceKey::node` is a u16.
+    // Build the fixture by inverting the AACS relations. uv/u_mask_shift are
+    // chosen so a gating device node exists (see docs/aacs-derive.md for the
+    // bit-level derivation); uv stays under 0x10000 since DeviceKey::node is u16.
     fn plant_mkb() -> Planted {
         let dkey: [u8; 16] = [
             0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2,
@@ -892,17 +838,9 @@ mod position_recovery_tests {
         );
     }
 
-    /// `recover_dk_position` turns an UNPOSITIONED 16-byte device key into a
-    /// bankable `DeviceKey`. Returning `None` means "this key does not apply to
-    /// this disc" — indistinguishable, to every caller, from a key that does
-    /// apply but whose position was never found. The whole feature silently
-    /// stops working: the key is discarded, the disc reports no usable key, and
-    /// the operator is pointed at their keydb.
-    ///
-    /// The load-bearing assertion is the last one: the recovered position must
-    /// actually drive `derive_media_key_from_dk` to the planted Media Key. That
-    /// is the property the caller depends on, and it cannot be satisfied by a
-    /// position that merely looks plausible.
+    // `None` here means "key does not apply", indistinguishable from a position
+    // that was simply never found — the feature silently stops working. The
+    // load-bearing assertion is that the recovered position walks to the planted MK.
     #[test]
     fn recover_dk_position_finds_a_position_that_derives_the_planted_media_key() {
         let p = plant_mkb();
@@ -928,10 +866,9 @@ mod position_recovery_tests {
         );
     }
 
-    /// The other direction: a key the MKB does NOT open must not be given a
-    /// position. A device key wrongly declared as applying would be banked and
-    /// reused on every future disc, and each of those discs would derive a wrong
-    /// Media Key.
+    // The other direction: a key the MKB does NOT open must not be given a
+    // position — wrongly banking one would derive a wrong Media Key on every
+    // future disc.
     #[test]
     fn recover_dk_position_rejects_a_key_the_mkb_does_not_open() {
         let p = plant_mkb();
@@ -943,14 +880,9 @@ mod position_recovery_tests {
         );
     }
 
-    /// `resolve_dk_node` picks the `device_number` that passes the walk's
-    /// subset-difference gate (`[C]` §3.2.4). `None` here strands a key whose
-    /// position was already successfully recovered, so it is the last step of
-    /// position recovery and fails the same way: usable key, discarded.
-    ///
-    /// Asserted through the Media Key the chosen node derives, not through the
-    /// node value itself — the doc comment's own claim is that any gating node
-    /// works, so pinning a specific number would test the wrong thing.
+    // `None` here strands a key whose position was already recovered — the
+    // last step of position recovery, failing the same way: usable key, discarded.
+    // Asserted through the derived Media Key, not the node value, since any gating node works.
     #[test]
     fn resolve_dk_node_returns_a_node_that_passes_the_walk_gate() {
         let p = plant_mkb();
@@ -978,11 +910,9 @@ mod position_recovery_tests {
         );
     }
 
-    /// `probe::mkb_mk_dv` is the reproduction harnesses' view of the MKB's
-    /// Verify-Media-Key record. It feeds `km_verifies`, so a body returning a
-    /// fixed block would make an independent harness "verify" Media Keys
-    /// against a record no disc ever carried, and a body returning `None` would
-    /// make every verification report "unverifiable".
+    // probe::mkb_mk_dv feeds km_verifies for reproduction harnesses; a fixed
+    // block would "verify" against a record no disc carries, and always-None
+    // would make every verification report "unverifiable".
     #[test]
     fn probe_mkb_mk_dv_returns_the_records_actual_bytes() {
         let p = plant_mkb();
@@ -1003,24 +933,18 @@ mod position_recovery_tests {
         );
     }
 
-    // A MULTI-SLOT MKB where the device key sits ABOVE the matching slot. Unlike
-    // `plant_mkb`'s one-slot zero-descent fixture, this pins slot INDEXING and the
-    // DESCENT branch: keyed slot is index 2 of 3, opened by a device one level above.
-
-    /// v-masks for the fixture's two positions, written as literals from
-    /// `[C]` §3.2.3 (`v_mask` is all-ones above the LOWEST set bit of `uv`, i.e.
-    /// `0xFFFF_FFFF << (uv.trailing_zeros() + 1)`) rather than computed with
-    /// `calc_v_mask`, which is itself under test.
+    // A MULTI-SLOT MKB (unlike plant_mkb's zero-descent fixture) pinning slot
+    // INDEXING and the DESCENT branch. v-masks below are literals from `[C]`
+    // §3.2.3, not computed with calc_v_mask, which is itself under test.
     const UV_SLOT: u32 = 0x0000_9400; // lowest set bit 10
     const V_MASK_SLOT: u32 = 0xFFFF_F800; // 0xFFFF_FFFF << 11
     const UV_ANCESTOR: u32 = 0x0000_9800; // lowest set bit 11
     const V_MASK_ANCESTOR: u32 = 0xFFFF_F000; // 0xFFFF_FFFF << 12
     const U_MASK_SHIFT: u8 = 16;
 
-    /// `calc_v_mask` implements `[C]` §3.2.3. Every subset-difference gate and
-    /// every descent in the walk is masked by its result, so a wrong mask makes
-    /// the walk match the wrong slots (or none) — pinned here against literal
-    /// expectations, not against a re-computation.
+    // calc_v_mask implements `[C]` §3.2.3; every gate and descent is masked by
+    // its result, so a wrong mask matches the wrong slots — pinned against
+    // literal expectations, not a re-computation.
     #[test]
     fn calc_v_mask_is_all_ones_above_the_lowest_set_bit() {
         // (uv, expected v_mask) — expected = 0xFFFF_FFFF << (trailing_zeros+1).
@@ -1048,14 +972,9 @@ mod position_recovery_tests {
         mk: [u8; 16],
     }
 
-    /// Build an MKB with THREE subset-difference slots where only slot **2** is
-    /// keyed, and the device key sits one level ABOVE that slot (at
-    /// `UV_ANCESTOR`, the position `recover_dk_position`'s descent loop reaches
-    /// first from `UV_SLOT`).
-    ///
-    /// The two decoy slots carry real-looking `uv`s and junk cvalues, so a walk
-    /// that indexes the slot table wrongly reads a decoy's cvalue and validates
-    /// nothing.
+    // Build an MKB with THREE subset-difference slots where only slot 2 is
+    // keyed, and the device key sits one level ABOVE it (at UV_ANCESTOR). The
+    // two decoy slots carry real-looking uvs so wrong indexing validates nothing.
     fn plant_descent_mkb() -> PlantedDescent {
         let dkey: [u8; 16] = [
             0x5A, 0x4B, 0x3C, 0x2D, 0x1E, 0x0F, 0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87,
@@ -1121,17 +1040,9 @@ mod position_recovery_tests {
         assert_ne!(UV_SLOT, UV_ANCESTOR, "the device is not at the slot");
     }
 
-    /// `recover_dk_position` must find the device's ANCESTOR position and that
-    /// position must walk the MKB to the planted Media Key.
-    ///
-    /// Two things are pinned that the single-slot fixture cannot pin:
-    ///   * the recovered `uv` is the ancestor, not the slot's own `uv` — proof
-    ///     the descent branch ran rather than the zero-descent shortcut;
-    ///   * the keyed slot is index 2, so the slot-table and cvalue-table
-    ///     offsets must both be computed correctly to reach it.
-    ///
-    /// As always the load-bearing assertion is the final Media Key: a position
-    /// that does not walk to it is no better than `None`.
+    // Pins two things the single-slot fixture cannot: recovered uv is the
+    // ancestor (proof the descent branch ran, not the zero-descent shortcut),
+    // and the keyed slot is index 2 (slot/cvalue table offsets both correct).
     #[test]
     fn recover_dk_position_finds_an_ancestor_position_in_a_multi_slot_mkb() {
         let p = plant_descent_mkb();
@@ -1233,13 +1144,9 @@ mod position_recovery_tests {
         PlantedDescent4 { mkb, dkey, mk, pk }
     }
 
-    /// `calc_pk_from_dk` must reproduce the explicit four-level AES-G3 chain:
-    /// right, left, right, left, then the terminal `aesg3(.,1)`.
-    ///
-    /// This is the tree descent every device-key path in the crate runs. A
-    /// wrong branch, a wrong level count, or a wrong terminal increment yields
-    /// a Processing Key that validates against nothing — the disc reports no
-    /// key while the operator's device key is perfectly good.
+    // calc_pk_from_dk is the tree descent every device-key path runs. A wrong
+    // branch, level count, or terminal increment yields a PK that validates
+    // against nothing — the disc reports no key though the operator's DK is good.
     #[test]
     fn calc_pk_from_dk_walks_the_uv_bits_right_left_right_left() {
         let p = plant_four_level_mkb();
@@ -1316,13 +1223,9 @@ mod position_recovery_tests {
         (p.dkey, p.mk, p.pk, cv, mk_dv)
     }
 
-    /// A cvalue table with FEWER entries than the subset-difference index has
-    /// slots — a truncated or short-read `0x05` record. The slot whose cvalue is
-    /// missing must be skipped, not read past the end of the table.
-    ///
-    /// Asserted as "no key, no panic": the keyed slot's cvalue is absent, so
-    /// there is nothing to derive, and the walk must say so rather than index
-    /// out of bounds.
+    // A cvalue table with FEWER entries than the subset-difference index has
+    // slots — a truncated 0x05 record. The slot whose cvalue is missing must be
+    // skipped, not read past the end: "no key, no panic".
     #[test]
     fn a_cvalue_table_shorter_than_the_slot_index_is_not_read_past() {
         let (dkey, _mk, _pk, cv, mk_dv) = four_level_parts();
@@ -1379,14 +1282,9 @@ mod position_recovery_tests {
         );
     }
 
-    /// The `0xC0` revoked marker in a slot's `u_mask_shift` byte TERMINATES the
-    /// subset-difference table (`[C]` §3.2.5.1.5). Slots after it are not part of
-    /// the index and must not be walked — a walk that ran past the marker would
-    /// derive keys from entries the MKB has explicitly ended.
-    ///
-    /// The fixture puts the keyed slot AFTER a marker, so "the marker stopped
-    /// the walk" is observable as no key; removing the marker resolves the same
-    /// MKB, which is what makes the first assertion mean something.
+    // The 0xC0 revoked marker (`[C]` §3.2.5.1.5) TERMINATES the subset-difference
+    // table; slots after it must not be walked. Fixture puts the keyed slot
+    // AFTER the marker; removing it resolves the same MKB, proving the gate works.
     #[test]
     fn a_revoked_marker_slot_terminates_the_subset_difference_table() {
         let (dkey, mk, pk, cv, mk_dv) = four_level_parts();
@@ -1445,12 +1343,9 @@ mod position_recovery_tests {
         );
     }
 
-    /// A device key applies to a subset-difference only when BOTH gates hold
-    /// (`[C]` §3.2.4): its u-mask must equal the slot's, AND its `uv` must agree
-    /// with the slot's under the device's v-mask. A key filed with the wrong
-    /// `u_mask_shift` describes a different region of the tree and must not be
-    /// used, even though its tree position would otherwise line up — accepting
-    /// it derives a Media Key from a slot the key does not actually cover.
+    // A device key applies only when BOTH gates hold (`[C]` §3.2.4): u-mask
+    // equal AND uv agrees under the device's v-mask. Wrong u_mask_shift
+    // describes a different tree region and must not derive a Media Key.
     #[test]
     fn a_device_key_with_the_wrong_u_mask_shift_does_not_apply() {
         let p = plant_four_level_mkb();
@@ -1479,10 +1374,9 @@ mod position_recovery_tests {
         );
     }
 
-    /// `validate_processing_key` XORs the slot's 4-byte `uv` into `mk[12..16]`
-    /// (`[C]` §3.2.4 step 2). XOR, not OR: the operation must be reversible, and
-    /// it must be able to CLEAR a bit the AES output set. A `uv` and a Media Key
-    /// that share set bits in those four bytes are what tell the two apart.
+    // validate_processing_key XORs uv into mk[12..16] (`[C]` §3.2.4 step 2).
+    // XOR, not OR: must be reversible and able to CLEAR a bit AES set — a uv
+    // and MK sharing set bits in those bytes is what tells the two operators apart.
     #[test]
     fn validate_processing_key_xors_the_uv_into_the_media_key_tail() {
         // uv with all four bytes non-zero and overlapping the planted mk tail.
@@ -1534,17 +1428,9 @@ mod position_recovery_tests {
         );
     }
 
-    /// `probe::aes_dec` is the single AACS verify primitive a reproduction
-    /// harness has: every claim such a harness makes about a Media Key is
-    /// `aes_dec(km, mk_dv)` starting with the `[C]` §3.2.5.1.4 magic. A body
-    /// returning a fixed block makes the harness answer the SAME way for every
-    /// key and every disc — either "nothing verifies" or, if the constant
-    /// happened to start with the magic, "everything verifies", which is the
-    /// `km_verifies` failure again one layer out.
-    ///
-    /// Asserted against the planted MKB: the probe must reproduce the verify
-    /// relation for the planted Media Key and must NOT reproduce it for a key
-    /// one bit away.
+    // probe::aes_dec is the sole verify primitive a reproduction harness has;
+    // a fixed-block body would answer the same way for every key/disc — the
+    // km_verifies failure one layer out. Asserted for the planted key and a stranger.
     #[test]
     fn probe_aes_dec_reproduces_the_verify_relation_for_the_planted_key() {
         let p = plant_mkb();
@@ -1615,13 +1501,9 @@ mod position_recovery_tests {
     const UV_ODD_ANC: u32 = 0x0000_0152;
     const U_MASK_SHIFT_ODD: u8 = 12;
 
-    /// An MKB with a single ODD-`uv` slot, keyed by a device one level above it.
-    ///
-    /// The expected Processing Key is written as the EXPLICIT `aesg3` chain the
-    /// one-level descent produces (`[C]` §3.2.4): from the ancestor, bit 1 of
-    /// `UV_ODD` is CLEAR, so the walk takes the left child (`aesg3(.,0)`) and
-    /// then terminates with `aesg3(.,1)`. Not built with `calc_pk_from_dk` —
-    /// a fixture built by the walk moves with the walk's own mutations.
+    // An MKB with a single ODD-uv slot, keyed one level above it. Expected PK
+    // is the EXPLICIT aesg3 chain (`[C]` §3.2.4), not calc_pk_from_dk — a
+    // fixture built by the walk would move with the walk's own mutations.
     fn plant_odd_uv_mkb() -> (Vec<u8>, [u8; 16], [u8; 16], [u8; 16]) {
         let dkey: [u8; 16] = [
             0x2F, 0x3E, 0x4D, 0x5C, 0x6B, 0x7A, 0x89, 0x98, 0xA7, 0xB6, 0xC5, 0xD4, 0xE3, 0xF2,
@@ -1665,11 +1547,9 @@ mod position_recovery_tests {
         assert_eq!(UV_ODD & dev_v_mask, UV_ODD_ANC & dev_v_mask);
     }
 
-    /// `recover_dk_position` must find the ancestor position of an ODD-`uv`
-    /// slot and derive its Media Key. Depth 0 is where the descent's lower bound
-    /// is at its arithmetic edge; a wrong bound either underflows or starts the
-    /// scan at the slot's own level, and in both cases a device key that DOES
-    /// open the disc is reported as not applying.
+    // Depth 0 is where the descent's lower bound is at its arithmetic edge; a
+    // wrong bound either underflows or starts the scan at the slot's own level,
+    // both reporting a valid key as not applying.
     #[test]
     fn recover_dk_position_descends_from_an_odd_uv_slot_at_tree_depth_zero() {
         let (mkb, dkey, mk, pk) = plant_odd_uv_mkb();
@@ -1697,10 +1577,9 @@ mod position_recovery_tests {
         assert_ne!(pk, aesg3(&dkey, 1), "this is NOT the zero-descent key");
     }
 
-    /// The negative direction on the same odd-`uv` MKB: a key that does not open
-    /// it must sweep every descent level (1..32 — the full range, since the slot
-    /// is at depth 0) and return `None`, without underflowing the lower bound or
-    /// shifting a `u32` by 32 at the top of the range.
+    // Negative direction: a key that does not open the slot must sweep every
+    // descent level (1..32, since depth 0) and return None, without
+    // underflowing the lower bound or shifting a u32 by 32 at the top.
     #[test]
     fn an_odd_uv_slot_sweeps_every_descent_level_without_arithmetic_overflow() {
         let (mkb, dkey, _mk, _pk) = plant_odd_uv_mkb();

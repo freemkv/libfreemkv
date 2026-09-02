@@ -5,9 +5,8 @@ use super::derive::*;
 use super::inf::*;
 use super::mkb::*;
 
-// Canonical form is `<category>1003` (low 16 bits `0x1003` is a fixed marker).
-// Types 3/4/10 are from the AACS Common Cryptographic Elements spec (0.953,
-// §3.2.5.1.1); Category-C 2.0/2.1 values are the standard MKB type constants.
+// Canonical form `<category>1003` (`0x1003` fixed marker). Types 3/4/10: AACS
+// CCE spec 0.953 §3.2.5.1.1. Category-C 2.0/2.1: standard MKB type constants.
 
 // ── Full VUK resolution chain ───────────────────────────────────────────────
 
@@ -67,19 +66,18 @@ pub struct ResolveContext<'a> {
     pub mkb: Option<&'a [u8]>,
 }
 
+// Carries no key bytes and is independent of the decryption math — purely
+// the *reason* a resolution returned no key.
+
 /// Why a key resolution attempt produced no usable key.
 ///
 /// Distinguishes the two no-key outcomes that an application must report
 /// differently:
-///   * [`ResolveFailure::VidUnavailable`] — the key source DID provide
-///     derivation material (device or processing keys), but no Volume ID
-///     (VID) was available to derive the Volume Unique Key. The fix is to
-///     recover the VID (a drive / handshake problem), not to add keys.
+///   * [`ResolveFailure::VidUnavailable`] — derivation material (device or
+///     processing keys) was present, but no VID was available; the fix is
+///     recovering the VID (a drive / handshake problem), not adding keys.
 ///   * [`ResolveFailure::NoMaterial`] — no usable key material was found at
 ///     all (no DK/PK material, no disc-keyed hit). The fix is to add keys.
-///
-/// This carries no key bytes and is independent of the decryption math; it
-/// is purely the *reason* a resolution returned no key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolveFailure {
     /// Derivation material was present (DKs or PKs) but no VID was available
@@ -112,12 +110,9 @@ pub fn resolve_keys_with_reason(
     }
 }
 
-/// Classify why resolution found no key. The key source provided derivation
-/// material (device or processing keys) but the VID sentinel is all-zero →
-/// [`ResolveFailure::VidUnavailable`]; otherwise → [`ResolveFailure::NoMaterial`].
-///
-/// Reads only what the resolver already had (provider material + the VID
-/// sentinel) — no key derivation, no descramble.
+// Classify why resolution found no key: derivation material present but the
+// VID sentinel all-zero -> VidUnavailable; otherwise -> NoMaterial. Reads
+// only provider material + the VID sentinel — no derivation, no descramble.
 pub(crate) fn classify_resolve_failure(ctx: &ResolveContext<'_>) -> ResolveFailure {
     let has_vid = *ctx.volume_id != [0u8; 16];
     let providers = super::provider::Providers(ctx.providers);
@@ -161,16 +156,14 @@ pub fn resolve_keys_v2(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
 ///
 /// Paths run in root-of-trust → per-disc-leaf order:
 ///   1. Variant chain: device keys → PK → Km → Kvu (needs a covering 2.1
-///      Processing Key; misses cleanly when the device-key pool covers no slot)
-///   3. KEYDB MK + matching VID → derived VUK (V21 discs already in
-///      the keydb decrypt identically to V20)
+///      Processing Key)
+///   3. KEYDB MK + matching VID → derived VUK
 ///   4. KEYDB disc-hash → VUK
 ///   5. KEYDB disc-hash → pre-decrypted unit keys (no VUK)
-///
-/// (Numbering preserves the cross-resolver convention; AACS 2.1 has no
-/// equivalent of path 2 — there's no host-side PK derivation against a
-/// Variant MKB.)
 pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
+    // Numbering preserves the cross-resolver convention; AACS 2.1 has no
+    // equivalent of path 2 (no host-side PK derivation against a Variant
+    // MKB). Path 3's VUK derives identically to V20 once the MK is found.
     let uk_file = parse_title_keys(ctx.unit_key_ro, AacsVersion::V20)?;
     let hash_hex = disc_hash_hex(&uk_file.disc_hash);
     let bus_encryption = ctx
@@ -276,16 +269,9 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
     None
 }
 
-/// Resolve all AACS keys for a disc using the classical (single-stage
-/// Media Key derivation) paths. Used by both V10 and V20.
-///
-/// Paths run in root-of-trust → per-disc-leaf order. A match at any
-/// path returns immediately:
-///   1. MKB + device keys → processing key → media key → VUK
-///   2. MKB + processing keys → media key → VUK
-///   3. KEYDB MK + matching VID → derived VUK
-///   4. KEYDB disc-hash → VUK
-///   5. KEYDB disc-hash → pre-decrypted unit keys (no VUK)
+// Classical (single-stage Media Key derivation) path chain, used by both
+// V10 and V20. See docs/aacs-resolve.md#resolve_keys_classical for the
+// full root-of-trust -> per-disc-leaf path list.
 fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Option<ResolvedKeys> {
     let bus_encryption = ctx
         .content_cert
@@ -439,23 +425,9 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
 /// verifies when AES-128-ECB-D(mk, mk_dv) starts with it.
 const MK_VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
 
-/// The MK-pool selection rule of path 2.5, split out of [`resolve_keys_v1`] so
-/// the ambiguity guard has a reachable test.
-///
-/// `verifies` is the MKB check — in production
-/// `AES-D(mk, mk_dv)[..8] == MK_VERIFY_MAGIC`. Returns a Media Key only when
-/// EXACTLY ONE DISTINCT candidate passes. Duplicates of the same key are one
-/// candidate (a pool aggregated across providers routinely repeats a key), but
-/// two DIFFERENT keys that both verify mean the pool cannot say which is this
-/// disc's Km: picking either derives a wrong VUK, and a wrong VUK decrypts to
-/// plausible-looking garbage rather than failing loudly. Bail and let the
-/// later hash/VID paths answer instead.
-///
-/// The predicate is a parameter rather than the inlined AES check because a
-/// genuine two-key multi-hit cannot be synthesised: it needs one ciphertext
-/// that decrypts under two distinct AES-128 keys to plaintexts sharing a
-/// 64-bit prefix — a 2^64 search. Injecting the verifier is the only way the
-/// ambiguity branch is reachable from a test at all.
+// Path 2.5's MK-pool selection rule: a Media Key must be the EXACTLY ONE
+// distinct verifying candidate (dupes across providers are one candidate).
+// See docs/aacs-resolve.md#unique_verifying_mk for the ambiguity rationale.
 fn unique_verifying_mk(mks: &[[u8; 16]], verifies: impl Fn(&[u8; 16]) -> bool) -> Option<[u8; 16]> {
     let mut hits: Vec<[u8; 16]> = Vec::new();
     for mk in mks {
@@ -470,11 +442,9 @@ fn unique_verifying_mk(mks: &[[u8; 16]], verifies: impl Fn(&[u8; 16]) -> bool) -
     hits.first().copied()
 }
 
-/// For path 5: cross-reference the disc's `Unit_Key_RO.inf` CPS-unit
-/// numbering against the KEYDB entry's pre-decrypted unit keys. Every
-/// CPS unit the disc declares must have a matching entry in KEYDB;
-/// partial coverage returns `None` so the resolver doesn't half-decrypt
-/// a disc.
+// Path 5: cross-reference the disc's Unit_Key_RO.inf CPS-unit numbering
+// against the KEYDB entry's pre-decrypted unit keys. Partial coverage
+// returns `None` so the resolver doesn't half-decrypt a disc.
 pub(crate) fn match_keydb_unit_keys(
     uk_file: &UnitKeyFile,
     keydb_unit_keys: &[(u32, [u8; 16])],
@@ -495,9 +465,6 @@ mod tests {
     // This suite predates the module split; it white-box-tests items now living
     // in sibling modules. Pull them all in so the tests keep exercising them.
     use super::super::crypto::*;
-    use super::super::derive::*;
-    use super::super::inf::*;
-    use super::super::mkb::*;
     use super::super::provider::SuppliedKey;
     use super::super::types::DiscEntry;
     use super::super::types::*;
@@ -541,10 +508,9 @@ mod tests {
         );
     }
 
-    /// Finding #5 regression: parse_unit_key_ro must REJECT a Unit_Key_RO.inf
-    /// whose declared `num_unit_keys` exceeds the keys actually present in the
-    /// buffer, instead of silently returning a short list. A truncated list
-    /// would later map title CPS units to nonexistent keys.
+    // Finding #5 regression: parse_unit_key_ro must REJECT a Unit_Key_RO.inf
+    // whose declared num_unit_keys exceeds the keys actually present, not
+    // silently return a short list (which maps titles to nonexistent keys).
     #[test]
     fn parse_unit_key_ro_rejects_truncated_key_list() {
         // V10 layout: stride 48, keys start at uk_pos + 48.
@@ -901,11 +867,9 @@ mod tests {
         rec
     }
 
-    /// Synthesize an AACS-2.x-shaped MKB carrying BOTH a small 0x07 record
-    /// and the real 0x05 cvalue table, with 0x07 placed first so a
-    /// "0x07-first" selector would pick the wrong record. The 0x05 table
-    /// has `n` 16-byte entries (1:1 with the `n`-entry 0x04 SD index); the
-    /// 0x07 decoy has `decoy` 16-byte entries.
+    // AACS-2.x-shaped MKB with a small 0x07 decoy (0x07 first) AND the real
+    // 0x05 cvalue table, so a "0x07-first" selector picks wrong. 0x05 has
+    // `n` entries (1:1 with 0x04's SD index); the 0x07 decoy has `decoy`.
     fn synth_aacs2_mkb(n: usize, decoy: usize) -> Vec<u8> {
         let mut mkb = Vec::new();
         mkb.extend_from_slice(&mkb_record(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]));
@@ -1284,17 +1248,9 @@ mod tests {
         );
     }
 
-    /// Path 2.5's ambiguity guard: when MORE THAN ONE DISTINCT pooled Media Key
-    /// verifies against the MKB, the resolver must return no key at all rather
-    /// than pick one. A wrong Km derives a wrong VUK, and a wrong VUK does not
-    /// fail loudly — it decrypts the title to garbage that muxes and plays as a
-    /// corrupt rip.
-    ///
-    /// The real MKB check cannot be forced into a multi-hit: two distinct
-    /// AES-128 keys decrypting one `mk_dv` to plaintexts that share the 64-bit
-    /// verify magic is a 2^64 search, not a fixture. So the rule is tested
-    /// through `unique_verifying_mk`, whose verifier is a parameter — the same
-    /// function `resolve_keys_v1` calls, with the same pool semantics.
+    // Path 2.5's ambiguity guard: >1 distinct pooled MK verifying must yield
+    // NO key, never a pick (a wrong Km derives a wrong VUK that decrypts to
+    // garbage rather than failing loudly). See docs/aacs-resolve.md.
     #[test]
     fn mk_pool_ambiguity_bails_rather_than_picking_a_media_key() {
         let a = [0xAAu8; 16];
@@ -1854,19 +1810,9 @@ mod tests {
         assert_eq!(r.vuk, Some(derive_vuk(&mk, &vid)));
     }
 
-    /// `resolve_keys_v21` gates paths 1 and 3 on `has_vid`, and an all-zero
-    /// Volume ID is the crate's "the VID was never read" sentinel — the SCSI
-    /// handshake leaves the buffer zeroed when it does not run or fails.
-    ///
-    /// Both directions matter and both fail silently:
-    ///   - treating the zero sentinel as a real VID runs path 3 and derives
-    ///     `Kvu = AES-G(Km, 0…0)`, a perfectly well-formed but WRONG VUK. It
-    ///     unwraps the title keys to garbage, and nothing downstream errors —
-    ///     the rip just decodes to noise.
-    ///   - treating a real VID as absent skips paths 1 and 3 entirely, so a
-    ///     disc that could have been resolved from its Media Key reports no key.
-    ///
-    /// Asserted through the final VUK, not through the flag.
+    // Zero VID is the "never read" sentinel gating paths 1/3; treating it as
+    // real derives a WRONG-but-valid VUK (silent garbage), treating a real
+    // VID as absent skips a resolvable disc. See docs/aacs-resolve.md.
     #[test]
     fn resolve_keys_v21_treats_the_all_zero_volume_id_as_no_vid() {
         let uk_ro = minimal_unit_key_ro();
@@ -2093,10 +2039,9 @@ mod tests {
         }
     }
 
-    /// Zero VID + PROCESSING keys (not device keys) is still "derivation
-    /// material present, VID missing" → VidUnavailable (E7017). The gate test
-    /// only proves the device-keys arm of `has_derivation_material`; this pins
-    /// the processing-keys arm of the same `||`.
+    // Zero VID + PROCESSING keys (not device keys) is still "material
+    // present, VID missing" -> VidUnavailable; pins the processing-keys arm
+    // of `has_derivation_material`'s `||` (the gate test only covers device keys).
     #[test]
     fn classify_processing_keys_zero_vid_is_vid_unavailable() {
         let prov = material_provider(Vec::new(), vec![[0u8; 16]]);
@@ -2116,12 +2061,9 @@ mod tests {
         );
     }
 
-    /// A NON-zero VID present, but resolution still fails (the providers carry
-    /// material that doesn't resolve this disc). The VID is available, so the
-    /// failure is NOT "VID unavailable" — it must classify NoMaterial regardless
-    /// of how much derivation material is present, because re-acquiring the VID
-    /// is not the fix. This is the `has_vid == true` short-circuit, which no
-    /// existing test covers (the gate test only uses the zero-VID sentinel).
+    // A non-zero VID present but resolution still fails must classify
+    // NoMaterial, never VidUnavailable, regardless of how much derivation
+    // material is on hand. See docs/aacs-resolve.md for the full rationale.
     #[test]
     fn classify_vid_present_with_material_is_no_material_not_vid() {
         let prov = material_provider(vec![one_device_key()], vec![[0u8; 16]]);
@@ -2163,11 +2105,9 @@ mod tests {
         );
     }
 
-    /// `resolve_keys_with_reason` routes `version_u8 == 1` through the V10
-    /// resolver and any other value through the V20→V21 chain. Prove the
-    /// dispatch by resolving the SAME path-4 (disc-hash→VUK) fixture under both
-    /// versions: V10 stamps V10, the non-1 arm reaches V20/V21. A success must
-    /// come back as `Ok`, never an `Err(ResolveFailure)`.
+    // version_u8 == 1 routes through V10, anything else through V20->V21;
+    // resolve the SAME path-4 fixture under both to prove the dispatch, and
+    // that success comes back Ok, never Err(ResolveFailure).
     #[test]
     fn resolve_with_reason_dispatches_on_version_and_returns_ok() {
         let uk_ro = build_unit_key_ro(1, 64);

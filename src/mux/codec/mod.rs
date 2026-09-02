@@ -60,15 +60,14 @@ pub struct Frame {
     pub pts_ns: i64,
     /// Whether this is a keyframe (used for cue points).
     pub keyframe: bool,
-    /// This frame is the FIRST coded picture after a concealed/lost gap (P3/B1):
-    /// its data begins after packets the demuxer never received (an undecryptable
+    /// This frame is the FIRST coded picture after a concealed/lost gap: its
+    /// data begins after packets the demuxer never received (an undecryptable
     /// unit concealed as NULL-TS upstream, or a continuity break in a damaged
-    /// source). Inter-coded video frames carrying this flag reference data that is
-    /// gone, so the consumer's `ResyncGate` arms here and drops forward to the next
-    /// keyframe. Carried per-FRAME (not per-PES) because buffering parsers — MPEG-2
-    /// emits whole GOPs, H.264/HEVC lag one access unit — decouple the frame from
-    /// the PES that carried the gap signal. Default `false`; only ever set on the
-    /// degraded/conceal path, so a clean rip leaves every frame `false`.
+    /// source). Inter-coded video frames carrying this flag reference data
+    /// that is gone, so the consumer's `ResyncGate` arms here and drops
+    /// forward to the next keyframe. Default `false`; only ever set on the
+    /// degraded/conceal path. See docs/codec-mod.md for why this is carried
+    /// per-frame rather than per-PES.
     pub discontinuity: bool,
     /// Frame data (elementary stream bytes).
     pub data: Vec<u8>,
@@ -168,33 +167,17 @@ impl CodecParser for PassthroughParser {
     }
 }
 
-/// Drop-on-undecodable policy across codecs ("clean muxes always"):
+// See docs/codec-mod.md for the drop-on-undecodable policy across codecs
+// ("clean muxes always") that motivates each parser's error handling.
+/// Create the appropriate parser for a codec, with optional codec private
+/// data.
 ///
-/// - **Audio with independent access units** (DTS, AC-3/E-AC-3, …) gates each AU
-///   through a per-codec corruption check and drops the ones that fail, keeping
-///   A/V sync (a drop is a silence gap, never a shift) and logging every drop
-///   via the shared [`dropgate::DropTally`]. DTS validates via its core-frame
-///   header (ETSI TS 102 114); AC-3 uses its native frame CRC.
-/// - **LPCM is excluded on purpose**: raw PCM carries no framing or integrity
-///   data, so a corrupt sample is indistinguishable from a quiet one — there is
-///   nothing to detect, so nothing can be honestly dropped.
-/// - **Video is excluded on purpose**: H.264/HEVC/MPEG-2/VC-1 are inter-frame
-///   predicted, so dropping one frame corrupts every frame that references it
-///   until the next keyframe. Video instead resyncs at GOP/IDR boundaries (the
-///   ResyncGate) and lets the decoder conceal — a fundamentally different model
-///   than per-frame audio dropping.
-/// - TrueHD/MLP, FLAC, MP2/MP3 and AAC-ADTS also gate undecodable frames via a
-///   `DropTally` (poison/drop-forward for MLP's inter-AU restart state on a
-///   major-sync boundary; CRC/sync-verdict drops for the passthrough codecs).
-///
-/// Create the appropriate parser for a codec, with optional codec private data.
-///
-/// For DvdSub, `codec_data` should be the pre-formatted VobSub .idx palette header.
-///
-/// `is_dvd_ps` selects the DVD program-stream variant where it matters: DVD
-/// LPCM arrives with its private sub-header already stripped by the
-/// `PsDemuxer`, so the LPCM parser must NOT strip the 4-byte BD LPCM header
-/// again (that would drop one PCM sample pair per PES → progressive drift).
+/// For DvdSub, `codec_data` should be the pre-formatted VobSub .idx palette
+/// header. `is_dvd_ps` selects the DVD program-stream variant where it
+/// matters: DVD LPCM arrives with its private sub-header already stripped by
+/// the `PsDemuxer`, so the LPCM parser must NOT strip the 4-byte BD LPCM
+/// header again (that would drop one PCM sample pair per PES → progressive
+/// drift).
 pub fn parser_for_codec(
     codec: Codec,
     codec_data: Option<Vec<u8>>,
@@ -285,22 +268,9 @@ mod tests {
         }
     }
 
-    /// A codec parser's `codec_private()` feeds `DiscStream::codec_private`,
-    /// which the MKV muxer turns directly into the track's `CodecPrivate`
-    /// element (RFC 9559 §5.1.4.1.24): `Some(bytes)` writes an element holding
-    /// exactly those bytes, `None` omits the element entirely. The two are NOT
-    /// interchangeable — a zero-length `CodecPrivate` asserts that the codec's
-    /// initialisation data IS empty, which is not true of any codec, and a
-    /// one-byte one asserts a config no decoder can parse.
-    ///
-    /// The gating parsers (ADTS, MPEG audio, FLAC) and the passthrough parser
-    /// extract no configuration at all: they validate and forward frames whose
-    /// configuration is carried in band (ADTS headers, MPEG-1 audio frame
-    /// headers, FLAC frame headers) or supplied by the source container. Having
-    /// derived nothing, the only truthful answer they can give is "absent" —
-    /// any `Some` would be a value they invented. Nothing else in the suite
-    /// distinguished the two, so each of these impls could have returned a
-    /// fabricated `Some` and produced a malformed track header unnoticed.
+    // codec_private() feeds MKV CodecPrivate (RFC 9559 §5.1.4.1.24): Some vs
+    // None are NOT interchangeable. See docs/codec-mod.md for why the gating
+    // parsers must answer "absent", never a fabricated Some.
     #[test]
     fn parsers_that_derive_no_config_report_absent_never_an_empty_codec_private() {
         // Codecs whose parsers do no configuration extraction, paired with a
@@ -359,16 +329,12 @@ mod tests {
 #[cfg(test)]
 mod provenance_guard {
     //! Every emitted frame must carry the source byte offset of the packet it
-    //! came from. That invariant held only for video for as long as it existed:
-    //! `dts`, `ac3`, `adts`, `truehd`, `pgs`, `dvdsub`, `flac`, `lpcm`,
-    //! `mpegaudio` and the passthrough parser all built frames with
-    //! `source: None`, so a multi-clip title could not place audio or subtitles
-    //! by byte and fell back to inferring the clip from timestamps — which is
-    //! what made branched titles run minutes long.
-    //!
-    //! Nothing asserted it, so nothing caught it. Finding it took a
-    //! brace-balanced scan of the tree by hand, which also turned up five sites
-    //! a regex had missed. This is that scan, as a test.
+    //! came from. That invariant held only for video for as long as it
+    //! existed: several audio/subtitle parsers built frames with `source:
+    //! None`, so a multi-clip title fell back to inferring the clip from
+    //! timestamps — which made branched titles run minutes long. This is a
+    //! brace-balanced scan of the tree, as a test. See docs/codec-mod.md for
+    //! the affected module list and how the gap was found.
 
     /// Every parser module's source, checked for a `Frame` built without a
     /// source. Paired with `every_codec_module_is_covered` below, which fails
@@ -400,14 +366,9 @@ mod provenance_guard {
         "startcode",
     ];
 
-    /// Walk `Frame { .. }` literals with balanced braces. A regex cannot do
-    /// this — `Frame` blocks contain nested braces (`coding: Some(..)`, closures)
-    /// and a non-greedy match stops at the first `}`, which is how five sites
-    /// survived the first pass.
-    /// Strip line comments before scanning. A comment that MENTIONS
-    /// `source: None` is prose, not a construction — this guard's own doc
-    /// comment tripped it on the first run, which is the same mistake as
-    /// grepping a file and matching its commentary.
+    // Strip line comments before scanning: a comment merely mentioning
+    // `source: None` isn't a construction. See docs/codec-mod.md for why
+    // this and `frame_literals` need brace-balanced parsing, not regex.
     fn code_only(src: &str) -> String {
         // The guard itself constructs no Frame; it only talks about them, in
         // prose and in string literals. Scanning its own body matches both.

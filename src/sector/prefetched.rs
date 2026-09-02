@@ -1,45 +1,12 @@
 //! `PrefetchedSectorSource` — runs the wrapped read+decrypt in a
 //! dedicated producer thread and surfaces the prepared plaintext
-//! buffers on demand via a bounded channel.
+//! buffers on demand via a bounded channel, so disk+decrypt and
+//! demux run in parallel instead of serialized on one thread.
 //!
-//! ## Why
-//!
-//! The mux consumer (demux + codec parsing + frame output) is
-//! single-threaded by nature (streams are sequential). The mux
-//! producer (read sectors + AACS decrypt) is also single-threaded
-//! per-call but does CPU-heavy work (AES per 6144-byte unit). Running
-//! both on the same thread means the disk and decrypt cores sit idle
-//! while the demux runs, and vice versa.
-//!
-//! Splitting them across two threads with a bounded channel between
-//! lets both run in parallel — peak throughput becomes
-//! `min(producer_rate, consumer_rate)` instead of
-//! `1 / (1/producer + 1/consumer)`.
-//!
-//! ## Lifecycle
-//!
-//! The producer thread is spawned by [`PrefetchedSectorSource::new`]
-//! (which returns `Err` if the OS refuses the thread spawn).
-//! It walks the supplied extent list in order, reads the configured
-//! batch size at each LBA, and sends the resulting plaintext buffer
-//! into a [`crossbeam_channel::bounded`] channel of small depth (so
-//! the producer stays a couple of batches ahead without unbounded
-//! memory growth).
-//!
-//! When the channel sender drops (either because all extents were
-//! served or because the [`Halt`] token cancelled), the consumer
-//! observes `RecvError` on the next `read_sectors` and treats it as
-//! end-of-stream. Errors from the underlying reader are forwarded
-//! verbatim through the channel.
-//!
-//! ## Read API
-//!
-//! `read_sectors` ignores its `lba`/`count` arguments — the producer
-//! has already chosen what to read, in the order the extents dictate.
-//! This is sound for the mux read path, which always walks extents
-//! sequentially and never seeks. For random-access callers (sweep
-//! patch retries) this wrapper is the wrong tool — they should keep
-//! reading the underlying source directly.
+//! The producer thread ([`PrefetchedSectorSource::new`]) walks the
+//! extent list in order, sending batches into a bounded channel;
+//! sender drop reads as end-of-stream. `read_sectors` ignores its
+//! `lba`/`count` args. See docs/prefetched.md for full rationale.
 
 use crate::error::Result;
 use crate::event::{Event, EventKind};
@@ -95,20 +62,12 @@ pub struct PrefetchedSectorSource {
 
 impl PrefetchedSectorSource {
     /// Spawn the producer thread. `reader` must already be the fully
-    /// composed read+decrypt stack (e.g.
-    /// [`DecryptingSectorSource`](crate::sector::DecryptingSectorSource))
-    /// — every byte the producer emits is what the consumer's demux
-    /// will feed to its codec parsers.
+    /// composed read+decrypt stack — every byte the producer emits is
+    /// what the consumer's demux will feed to its codec parsers.
     ///
-    /// ## Unit-alignment precondition
-    ///
-    /// Each extent's `sector_count` should be a multiple of
-    /// [`SECTOR_ALIGNMENT`] (3 sectors / one 6144-byte AACS aligned
-    /// unit). Blu-ray m2ts extents satisfy this by spec. If an extent
-    /// has a trailing 1-2 sectors that cannot fill a complete unit,
-    /// the producer surfaces [`Error::ExtentNotUnitAligned`] through
-    /// the channel rather than handing the decrypt step a sub-unit
-    /// chunk it would silently leave encrypted.
+    /// Precondition: each extent's `sector_count` should be a multiple
+    /// of [`SECTOR_ALIGNMENT`], else [`Error::ExtentNotUnitAligned`]
+    /// surfaces through the channel. See docs/prefetched.md.
     ///
     /// [`Error::ExtentNotUnitAligned`]: crate::error::Error::ExtentNotUnitAligned
     pub fn new<S>(
@@ -232,14 +191,10 @@ impl PrefetchedSectorSource {
                                 Err(RecvTimeoutError::Disconnected) => return,
                             }
                         };
-                        if bytes <= buf.capacity() {
-                            // Re-expose `bytes` without zero-filling; sound because
-                            // buffers are born `vec![0u8; batch_bytes]` and only grown
-                            // via `resize(_, 0)`, so bytes below `capacity` are init'd.
-                            unsafe { buf.set_len(bytes) };
-                        } else {
-                            buf.resize(bytes, 0);
-                        }
+                        // Sound resize (was `unsafe set_len` guarded only by capacity):
+                        // public `into_channels` lets a caller recycle a cap-only Vec, so
+                        // set_len could expose uninit memory (UB) — GHSA-j8ww-f5fg-9pmh.
+                        buf.resize(bytes, 0);
                         // `start_lba + offset` derives from untrusted extent
                         // data — saturate rather than wrap/panic on a
                         // hostile start_lba near u32::MAX.
@@ -305,17 +260,11 @@ impl PrefetchedSectorSource {
         })
     }
 
-    /// Peel off the receivers for zero-copy pipeline mode. The
-    /// caller (typically [`super::super::mux::demux_thread::DemuxThread`])
-    /// pulls buffers from `rx`, consumes them, and pushes the empty
-    /// `Vec<u8>` back through `recycle_tx` so the producer can
-    /// re-fill it. The producer-thread `JoinHandle` stays with the
-    /// returned `PrefetchedSectorSource` shell; drop that to join.
-    ///
-    /// Returns `(forward_rx, recycle_tx, shell)`. The shell only
-    /// holds the join handle and total_sectors for `capacity_sectors`
-    /// queries; its `SectorSource` impl becomes invalid after this
-    /// call (data has been moved out).
+    /// Peel off the receivers for zero-copy pipeline mode: the caller
+    /// pulls buffers from `rx` and pushes drained ones back through
+    /// `recycle_tx`. Returns `(forward_rx, recycle_tx, shell)`; the
+    /// shell holds the producer's `JoinHandle` (drop it to join) plus
+    /// `total_sectors`. See docs/prefetched.md.
     pub fn into_channels(self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
         // MOVE the fields out, never clone: pre-1.0.0 code cloned + `forget`-ed
         // `self`, leaking endpoints that defeated disconnection shutdown and
@@ -430,10 +379,9 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// Endless zero-yielding source: every read succeeds, so the
-    /// producer keeps trying to push batches forward until the forward
-    /// channel disconnects. Exactly the shape that wedged the pre-1.0.0
-    /// `clone + mem::forget` `into_channels`.
+    // Endless zero-yielding source: every read succeeds, so the producer
+    // pushes batches until the channel disconnects — the shape that
+    // wedged the pre-1.0.0 `clone + mem::forget` `into_channels`.
     struct EndlessZeroSource;
     impl SectorSource for EndlessZeroSource {
         fn read_sectors(
@@ -566,22 +514,9 @@ mod tests {
         }
     }
 
-    /// Regression: dropping a `PrefetchedSectorSource` DIRECTLY — the
-    /// public `new` + documented direct-read path, and any error/halt
-    /// exit before the extents are drained — must join the producer
-    /// cleanly. `Drop::drop` used to `join()` while the struct still
-    /// held `rx` and `recycle_tx` (sibling fields drop only AFTER
-    /// `Drop::drop` returns), so a producer parked in the plain blocking
-    /// `tx.send(Ok(buf))` never saw a disconnect and the dropping thread
-    /// blocked in `join()` forever — a permanent two-thread deadlock that
-    /// cancelling the `Halt` could not escape, because that `send` has no
-    /// timeout and never re-polls the token.
-    ///
-    /// 300 sectors at batch=3 is 100 batches against a forward channel of
-    /// depth `PREFETCH_CHANNEL_DEPTH` (2), so the producer is guaranteed
-    /// to be blocked in `send` by the time the drop runs. Mirrors
-    /// `byte_prefetcher::drop_endless_prefetcher_joins_cleanly`, whose
-    /// `Drop` already had the correct shape.
+    // Regression: dropping a `PrefetchedSectorSource` DIRECTLY, before
+    // extents are drained, must join the producer cleanly (old `Drop`
+    // joined before dropping `rx`/`recycle_tx`, deadlocking; see docs/prefetched.md).
     #[test]
     fn drop_undrained_source_joins_cleanly() {
         with_watchdog(Duration::from_secs(10), || {
@@ -602,12 +537,9 @@ mod tests {
         });
     }
 
-    /// The CRITICAL regression: after `into_channels`, dropping the
-    /// returned forward receiver + recycle sender must let the producer
-    /// observe disconnection and exit, so dropping the `PrefetchShell`
-    /// (which joins the producer) returns promptly. With the old
-    /// clone+forget the leaked endpoints kept the producer blocked and
-    /// this join hung forever.
+    // CRITICAL regression: after `into_channels`, dropping the forward
+    // receiver + recycle sender must let the producer observe
+    // disconnection so `PrefetchShell` drop (join) returns promptly.
     #[test]
     fn into_channels_drop_releases_producer() {
         within(10, || {
@@ -623,18 +555,9 @@ mod tests {
         });
     }
 
-    /// Same property via the halt path: cancel the token, then the
-    /// producer must exit and the shell join must complete.
-    ///
-    /// The producer parks in a BLOCKING `tx.send` on the forward channel
-    /// and only checks `halt` at the loop top, so `halt.cancel()` cannot
-    /// interrupt a send that is already blocked on a full channel. To
-    /// keep the test deterministic under load, we drain the forward
-    /// receiver on a background thread: every send then makes progress,
-    /// the producer reaches the loop top, observes the cancelled halt,
-    /// and exits — so the shell join completes promptly regardless of
-    /// scheduling. (Channel-disconnection shutdown is covered separately
-    /// by `into_channels_drop_releases_producer`.)
+    // Same property via the halt path: cancel the token, then the producer
+    // must exit and the shell join must complete (drain on a background
+    // thread so blocked sends make progress toward the halt check).
     #[test]
     fn halt_releases_producer() {
         within(10, || {
@@ -667,13 +590,9 @@ mod tests {
         assert!(err.is_err(), "zero batch_sectors must be rejected");
     }
 
-    /// `unit_align == 0` must be rejected by the constructor, not turned into a
-    /// divide-by-zero panic on the producer thread. Before the guard,
-    /// `new_with_events` returned `Ok` and the producer evaluated
-    /// `remaining % 0`, panicking ("attempt to calculate the remainder with a
-    /// divisor of zero"); `catch_unwind` then reported the read as
-    /// `DemuxThreadPanicked` instead of the `InvalidInput` its sibling parameter
-    /// gets — a panic printed out of a public constructor's own thread.
+    // `unit_align == 0` must be rejected by the constructor, not a producer-thread
+    // divide-by-zero panic (`remaining % 0`) misreported as DemuxThreadPanicked.
+    // See docs/prefetched.md.
     #[test]
     fn zero_unit_align_rejected() {
         let res = PrefetchedSectorSource::new_with_events(
@@ -690,10 +609,9 @@ mod tests {
         assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
     }
 
-    /// More than 3 sequential direct `read_sectors` calls must succeed. The
-    /// recycle pool seeds PREFETCH_CHANNEL_DEPTH+1 (3) buffers; before
-    /// the fix the direct path dropped each drained buffer, so the 4th
-    /// call deadlocked. Watchdog-guarded.
+    // More than 3 sequential direct `read_sectors` calls must succeed: the
+    // recycle pool seeds 3 buffers; before the fix each drained buffer was
+    // dropped instead of recycled, so the 4th call deadlocked.
     #[test]
     fn direct_reads_past_pool_depth_do_not_deadlock() {
         with_watchdog(Duration::from_secs(10), || {
@@ -719,18 +637,9 @@ mod tests {
         });
     }
 
-    /// The producer-thread `event_fn` must fire a `BytesRead` event for
-    /// every batch it reads, with a monotonically increasing cumulative
-    /// byte count that reaches the full extent size at EOF.
-    ///
-    /// This is the contract autorip's mux progress bar + soft-stall
-    /// watchdog depend on: the resume/multipass paths pass an `event_fn`
-    /// so `latest_bytes_read` tracks read-ahead progress and
-    /// `wd_last_frame` is refreshed on each sector read (not only on the
-    /// slower write cadence). Before this guard nothing asserted the
-    /// callback fired at all, so a path that passed `None` (the
-    /// `resume_remux` regression) compiled and ran silently with the bar
-    /// stuck at write-lagged progress.
+    // The producer-thread `event_fn` must fire a `BytesRead` event per batch,
+    // cumulative and non-decreasing, reaching the full extent size at EOF —
+    // the contract autorip's progress bar + stall watchdog depend on (docs/prefetched.md).
     #[test]
     fn event_fn_fires_bytes_read_per_batch() {
         with_watchdog(Duration::from_secs(10), || {
@@ -793,11 +702,9 @@ mod tests {
         });
     }
 
-    /// An extent whose sector_count is not a multiple of 3 must not
-    /// emit a still-encrypted sub-unit tail. The producer delivers the
-    /// readable full units, then surfaces a typed error on the tail
-    /// instead of a short batch. Watchdog-guarded so a regression that
-    /// hangs (rather than errors) still fails.
+    // An extent whose sector_count is not a multiple of 3 must not emit a
+    // still-encrypted sub-unit tail: the producer delivers the readable
+    // full units, then surfaces a typed error on the tail.
     #[test]
     fn non_multiple_of_three_extent_errors_on_tail() {
         with_watchdog(Duration::from_secs(10), || {
@@ -828,11 +735,9 @@ mod tests {
         });
     }
 
-    /// A short read (inner source returns fewer sectors than
-    /// requested) must advance the extent cursor by the sectors
-    /// actually read, not the requested count — otherwise the bytes
-    /// between the short read and the request size are silently
-    /// skipped. We verify every sector of the extent is delivered.
+    // A short read must advance the extent cursor by the sectors actually
+    // read, not the requested count, or bytes are silently skipped. We
+    // verify every sector of the extent is delivered.
     #[test]
     fn short_read_does_not_desync_stream() {
         with_watchdog(Duration::from_secs(10), || {
@@ -999,11 +904,9 @@ mod tests {
         });
     }
 
-    /// Total-sector accumulation must clamp at u32::MAX rather than
-    /// panic (debug overflow) or wrap (release) on a hostile extent set
-    /// whose summed sector_count exceeds u32. Grounding: the `new`
-    /// comment — "Accumulate in u64 then clamp ... a naive u32 sum()
-    /// could panic in debug / wrap in release".
+    // Total-sector accumulation must clamp at u32::MAX rather than panic
+    // (debug overflow) or wrap (release) on a hostile extent set whose
+    // summed sector_count exceeds u32.
     #[test]
     fn capacity_sectors_clamps_on_overflow() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1037,11 +940,9 @@ mod tests {
         });
     }
 
-    /// The producer must walk extents in list order and start each
-    /// extent at its `start_lba` (plus running offset within the
-    /// extent), never reorder or merge them. Grounding: lifecycle doc
-    /// — "walks the supplied extent list in order" and
-    /// `lba = extent.start_lba.saturating_add(offset)`.
+    // The producer must walk extents in list order and start each extent
+    // at its `start_lba` (plus running offset within it), never
+    // reorder/merge them.
     #[test]
     fn producer_walks_extents_in_order_at_correct_lbas() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1075,11 +976,9 @@ mod tests {
         });
     }
 
-    /// A batch larger than one unit must be trimmed DOWN to a whole
-    /// number of 3-sector units before issuing the read — never a
-    /// sub-unit count that decrypt would leave partially encrypted.
-    /// batch=5 → trimmed to 3 (5 - 5%3). Grounding: the unit-trim block
-    /// `sectors -= sectors % SECTOR_ALIGNMENT`.
+    // A batch larger than one unit must be trimmed DOWN to a whole number
+    // of 3-sector units before issuing the read — never a sub-unit count
+    // that decrypt would leave partially encrypted. batch=5 -> trimmed to 3.
     #[test]
     fn batch_trimmed_to_whole_units() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1112,11 +1011,9 @@ mod tests {
         });
     }
 
-    /// An extent whose sector_count IS a multiple of 3 must deliver
-    /// exactly that many sectors and then cleanly EOF (no error on the
-    /// final aligned batch). Grounding: the trailing-tail guard only
-    /// fires for sub-unit leftovers; a unit-aligned extent forms full
-    /// units on its own (the comment at line ~188).
+    // An extent whose sector_count IS a multiple of 3 must deliver exactly
+    // that many sectors and then cleanly EOF (no error on the final
+    // aligned batch); the trailing-tail guard only fires on sub-unit leftovers.
     #[test]
     fn unit_aligned_extent_delivers_all_and_eofs() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1137,16 +1034,9 @@ mod tests {
         });
     }
 
-    /// The underlying reader's error must propagate to the consumer as
-    /// an error (not Ok(0)/EOF), and its ErrorKind must survive the
-    /// round-trip through the channel. Grounding: the producer's
-    /// `Err(e) => tx.send(Err(e.into()))` arm, and `read_sectors`'
-    /// `Ok(Err(e)) => { self.producer_failed = true; Err(Error::from(e)) }`.
-    ///
-    /// That arm recovers the producer's TYPED error by downcast rather than
-    /// blanket-wrapping it as `Error::IoError`, so the kind survives; the
-    /// `producer_failed` latch it also sets is what turns the channel close
-    /// that follows into `SourceTerminated` instead of a clean EOF.
+    // The underlying reader's error must propagate to the consumer as an
+    // error (not Ok(0)/EOF), with its ErrorKind surviving the channel
+    // round-trip (typed, not blanket-wrapped). See docs/prefetched.md.
     #[test]
     fn reader_error_propagates_with_kind() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1167,13 +1057,9 @@ mod tests {
         });
     }
 
-    /// An inner source that answers a mid-extent read with `Ok(0)` has quit
-    /// early: the extent list still has sectors to serve. The producer must
-    /// say so, not simply drop `tx` — a closed channel reads as clean
-    /// end-of-stream, and `DiscStream::fill_extents` then fabricates zeros
-    /// for every remaining sector of the title and reports the pass
-    /// complete. Same rule as the panic sentinel: a truncated title must
-    /// never be finalized as success.
+    // An inner source that answers a mid-extent read with `Ok(0)` has quit
+    // early: the producer must say so, not drop `tx` (which reads as clean
+    // EOF and lets `fill_extents` fabricate zeros for the rest). See docs/prefetched.md.
     struct QuitsEarlySource;
     impl SectorSource for QuitsEarlySource {
         fn read_sectors(
@@ -1224,10 +1110,9 @@ mod tests {
         });
     }
 
-    /// A read returning a byte count that is not a whole number of
-    /// sectors (n % 2048 != 0) must be rejected — never truncated and
-    /// advanced, which would split a sector and hand decrypt a partial
-    /// unit. Grounding: the `if n % 2048 != 0 { send Err }` guard.
+    // A read returning a byte count that is not a whole number of sectors
+    // must be rejected — never truncated and advanced, which would split
+    // a sector and hand decrypt a partial unit.
     #[test]
     fn non_sector_multiple_read_rejected() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1249,11 +1134,9 @@ mod tests {
         });
     }
 
-    /// A too-small consumer buffer in the direct `read_sectors` path
-    /// must error (InvalidInput), never silently drop the bytes past
-    /// `buf.len()`. Grounding: the `if filled.len() > buf.len()` guard
-    /// in `read_sectors` ("would silently drop filled[buf.len()..],
-    /// desyncing the stream").
+    // A too-small consumer buffer in the direct `read_sectors` path must
+    // error (InvalidInput), never silently drop the bytes past
+    // `buf.len()` (would desync the stream).
     #[test]
     fn direct_read_too_small_buffer_errors() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1274,15 +1157,9 @@ mod tests {
         });
     }
 
-    /// Regression for the fix-1 deadlock: calling read_sectors with a
-    /// too-small buffer more times than the pool depth (PREFETCH_CHANNEL_DEPTH+1
-    /// = 3) must NOT deadlock and the pool must remain usable afterwards.
-    ///
-    /// Before the fix, each too-small-buffer error path returned without
-    /// recycling the received buffer, draining the fixed pool. On the 4th
-    /// call the producer blocked on recycle_rx.recv() while the consumer
-    /// blocked on rx.recv() — permanent deadlock. The watchdog turns a
-    /// regression into a test failure rather than a hung suite.
+    // Regression: too-small-buffer reads repeated past the pool depth (3)
+    // must NOT deadlock. Before the fix, each error path skipped recycling
+    // the received buffer, draining the pool by the 4th call. See docs/prefetched.md.
     #[test]
     fn too_small_buffer_repeated_does_not_deadlock_pool() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1312,11 +1189,9 @@ mod tests {
         });
     }
 
-    /// The producer delivers exactly the bytes the inner source
-    /// produced, in order, byte-for-byte. PatternSource tags each
-    /// sector with `(lba & 0xff)`, so the assembled stream must match a
-    /// reconstruction from the extent's LBA range. Guards against
-    /// off-by-one/duplicate/reorder in the offset bookkeeping.
+    // The producer delivers exactly the bytes the inner source produced,
+    // in order, byte-for-byte — guards against off-by-one/duplicate/reorder
+    // in the offset bookkeeping.
     #[test]
     fn delivered_bytes_match_source_exactly() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1344,10 +1219,9 @@ mod tests {
         });
     }
 
-    /// An empty extent list must EOF immediately (capacity 0, first
-    /// direct read returns Ok(0)) and must not deadlock. Grounding: the
-    /// producer's `while ext_idx < extents.len()` loop body never runs,
-    /// so `tx` drops and the consumer sees RecvError → Ok(0).
+    // An empty extent list must EOF immediately (capacity 0, first direct
+    // read returns Ok(0)) and must not deadlock: the loop body never runs,
+    // so `tx` drops and the consumer sees RecvError -> Ok(0).
     #[test]
     fn empty_extents_eof_immediately() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1361,10 +1235,9 @@ mod tests {
         });
     }
 
-    /// A zero-length extent in the middle of the list must be skipped
-    /// (remaining == 0 → advance to next extent) without emitting a
-    /// batch and without stalling. Grounding: the `if remaining == 0 {
-    /// ext_idx += 1; continue }` branch.
+    // A zero-length extent in the middle of the list must be skipped
+    // (remaining == 0 -> advance to next extent) without emitting a
+    // batch and without stalling.
     #[test]
     fn zero_length_extent_is_skipped() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1402,13 +1275,9 @@ mod tests {
         });
     }
 
-    /// A 4-sector extent (one full unit + a 1-sector tail) must
-    /// deliver the 3-sector unit and then error on the 1-sector
-    /// remainder — exercising the trim-within-batch path
-    /// (`sectors -= sectors % 3` lands on 3, leaving remaining=1) that
-    /// then hits the sub-unit guard on the next iteration. Distinct
-    /// control flow from the 8-sector case. Grounding: trailing-tail
-    /// guard plus the unit-trim block.
+    // A 4-sector extent (one full unit + a 1-sector tail) must deliver the
+    // 3-sector unit then error on the 1-sector remainder — exercising the
+    // trim-within-batch path, distinct control flow from the 8-sector case.
     #[test]
     fn four_sector_extent_errors_on_one_sector_tail() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1429,11 +1298,9 @@ mod tests {
         });
     }
 
-    /// Many sequential direct reads across MANY extents must all flow
-    /// through the fixed recycle pool without deadlock — a stronger
-    /// version of the pool-depth regression that also crosses extent
-    /// boundaries (offset reset to 0, ext_idx advance). Grounding: the
-    /// recycle-pool comment in `read_sectors`.
+    // Many sequential direct reads across MANY extents must all flow
+    // through the fixed recycle pool without deadlock — a stronger
+    // pool-depth regression that also crosses extent boundaries.
     #[test]
     fn many_extents_drain_without_deadlock() {
         with_watchdog(Duration::from_secs(15), || {
@@ -1493,14 +1360,9 @@ mod tests {
             .expect_err("the producer's read failure must surface")
     }
 
-    /// REGRESSION: an ordinary MEDIUM ERROR bad sector that crosses the
-    /// prefetch channel must NOT be classified as a SCSI transport failure.
-    ///
-    /// `read_sectors` used to re-wrap EVERY channel error as
-    /// `Error::IoError { source }`, and `is_scsi_transport_failure` matches
-    /// `IoError` (the wedged-USB-bridge arm). So a skippable bad sector
-    /// arrived at `DiscStream::fill_extents` looking like a dead bus and
-    /// aborted the whole pass instead of honouring `skip_errors`.
+    // REGRESSION: an ordinary MEDIUM ERROR bad sector crossing the prefetch
+    // channel must NOT classify as a SCSI transport failure (old blanket
+    // `Error::IoError` wrap made it match the wedged-USB-bridge arm). See docs/prefetched.md.
     #[test]
     fn bad_sector_across_channel_is_not_a_transport_failure() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1528,10 +1390,9 @@ mod tests {
         });
     }
 
-    /// OPPOSITE-DIRECTION CONTROL: a genuine transport failure (status 0xFF,
-    /// wedged USB bridge) crossing the same channel MUST still classify as a
-    /// transport failure, so `fill_extents` / sweep keep aborting the pass
-    /// instead of zero-filling every read against a dead bus.
+    // OPPOSITE-DIRECTION CONTROL: a genuine transport failure (0xFF, wedged
+    // USB bridge) crossing the same channel MUST still classify as one, so
+    // sweep keeps aborting instead of zero-filling against a dead bus.
     #[test]
     fn transport_failure_across_channel_still_classifies() {
         with_watchdog(Duration::from_secs(10), || {

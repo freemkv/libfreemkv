@@ -1,65 +1,44 @@
 //! Dolby TrueHD / Atmos elementary stream parser.
 //!
-//! BD-TS TrueHD PES packets contain interleaved AC-3 + TrueHD access units.
-//! Access units span PES boundaries — must buffer and reassemble.
+//! BD-TS TrueHD PES packets contain interleaved AC-3 + TrueHD access units,
+//! which span PES boundaries — must buffer and reassemble.
 //!
-//! TrueHD access unit header (4 bytes):
-//!   bytes 0-1: top nibble = MLP check/access-unit nibble, lower 12 bits =
-//!              access-unit length in 2-byte words
-//!   bytes 2-3: timing value
-//!   bytes 4..: substream data (major sync 0xF8726FBA may appear at offset 4)
+//! TrueHD AU header (4 bytes): bytes 0-1 top nibble = MLP check/AU nibble,
+//! lower 12 bits = AU length in 2-byte words; bytes 2-3 timing value; bytes
+//! 4.. substream data (major sync 0xF8726FBA may appear at offset 4).
 //!
-//! AC-3 frames (interleaved, same PID): start with sync word 0x0B77.
-//! We skip AC-3 frames and only emit TrueHD access units.
+//! AC-3 frames (interleaved, same PID) start with sync 0x0B77; skipped —
+//! only TrueHD access units are emitted.
 
 use super::crc::crc16_mlp;
 use super::dropgate::DropTally;
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 use crate::mux::timeline::DISCONTINUITY_BACKSTEP_NS;
 
-/// Is `w` an MLP-family major sync — a random-access / decoder re-init point?
-///
-/// The 24-bit signature is 0xF8726F; the following byte is the STREAM TYPE:
-/// 0xBA = Dolby TrueHD (the only one Blu-ray carries), 0xBB = MLP. Both are
-/// restart points, so the keyframe / re-sync decision accepts either.
+// Is `w` an MLP-family major sync (24-bit sig 0xF8726F; last byte 0xBA
+// TrueHD or 0xBB MLP) — a decoder re-init point. Both count as restart.
 fn is_mlp_major_sync(w: u32) -> bool {
     (w & 0xFFFF_FFFE) == 0xF872_6FBA
 }
 
-/// Is `w` specifically the TrueHD major sync (stream type 0xBA)?
-///
-/// The 32-bit word that FOLLOWS the sync is laid out per stream type: TrueHD's
-/// `format_info` carries [31..28] audio_sampling_frequency, the 5-bit 6-channel
-/// and 13-bit 8-channel presentation channel-assignment masks; MLP's (0xBB) same
-/// word carries quantization word lengths and the MLP group sample-rate fields
-/// instead. So every site that DECODES `format_info` with the TrueHD layout must
-/// require 0xBA exactly — masking the low sync bit there read a quantization code
-/// as the rate nibble and pulled channel masks out of unrelated bits, giving the
-/// track header a wrong `SamplingFrequency` and `truehd_au_duration_ns` a wrong
-/// per-AU increment (audio drifting against video for the whole track).
-/// `None` from these helpers is the safe outcome: the caller falls back to its
-/// container-derived rate/channel count.
+// Is `w` specifically the TrueHD major sync (stream type 0xBA)? Must be
+// exact, not the 0xBA/0xBB mask — see docs/truehd.md for why.
 fn is_truehd_major_sync(w: u32) -> bool {
     w == 0xF872_6FBA
 }
 
-/// Duration of one TrueHD access unit in nanoseconds for the 48 kHz family
-/// (48 / 96 / 192 kHz). `access_unit_size = 40 << (ratebits & 7)` and
-/// `sample_rate = 48000 << (ratebits & 7)`; the shared shift cancels in
-/// `samples_per_AU / sample_rate = 40/48000 = 1/1200 s`, so this constant is
-/// exact for the whole 48 kHz family — 48, 96 and 192 kHz alike. Used as the
-/// default until a major sync reveals the actual rate family.
+// AU duration (ns), 48 kHz family (48/96/192 kHz): 40/48000 = 1/1200 s,
+// exact for the whole family since the ratebits shift cancels. Default
+// until a major sync reveals the actual rate.
 const AU_DURATION_NS: i64 = 833_333;
 
-/// Duration of one TrueHD access unit in nanoseconds for the 44.1 kHz family
-/// (44.1 / 88.2 / 176.4 kHz): `40/44100 = 1/1102.5 s = 907_029.478… ns`. The
-/// 48 kHz constant would run ~8.95 % fast on these (rare) streams.
+// AU duration (ns), 44.1 kHz family: 40/44100 = 907_029.478.. ns. The 48
+// kHz constant would run ~8.95% fast on these (rare) streams.
 const AU_DURATION_NS_441: i64 = 907_029;
 
-/// Hard cap on the reassembly buffer. A valid TrueHD/MAT access unit is
-/// well under 32 KiB; if the buffer grows far past that without yielding a
-/// frame the stream is malformed, so we drop it and resync rather than grow
-/// without bound. Parity with the AC-3 / DTS / PGS caps.
+// Hard cap on the reassembly buffer: a valid AU is well under 32 KiB, so
+// past this the stream is malformed — drop and resync. Parity with the
+// AC-3/DTS/PGS caps.
 const MAX_TRUEHD_BUF: usize = 256 * 1024;
 
 pub struct TrueHdParser {
@@ -116,12 +95,8 @@ impl TrueHdParser {
         self.tally.dropped_duration_ns()
     }
 
-    /// Decide whether an access unit is corrupt, updating `num_substreams` from a
-    /// valid major sync. Per the MLP/TrueHD access-unit decode rules: a major sync
-    /// with a bad header CRC, or any AU whose header parity fails, is undecodable.
-    /// Returns `false` (not corrupt) when the AU is too short to judge or no
-    /// major sync has established `num_substreams` yet — we never drop what we
-    /// cannot verify. Verified against real TrueHD streams (3600/3600 AUs).
+    // Decide whether an AU is corrupt, updating `num_substreams` from a
+    // valid major sync. See docs/truehd.md#au_check-corruption-decision.
     fn au_check(&mut self, au: &[u8], is_major_sync: bool) -> AuCheck {
         let mut header_size = 4;
         let mut format_info = None;
@@ -169,18 +144,8 @@ impl TrueHdParser {
         }
     }
 
-    /// Size (bytes) of the AC-3 frame at the buffer head.
-    ///
-    /// Distinguishes three cases the caller must treat differently:
-    /// - `Unmappable`: the header's fscod/frmsizecod don't map to a real frame
-    ///   size (reserved fscod==3, or frmsizecod >= 38). The caller must drain
-    ///   and resync, NOT wait for more data — waiting would stall forever.
-    /// - `NeedMore`: a valid size, but the frame isn't fully buffered yet.
-    /// - `Frame(n)`: a complete `n`-byte AC-3 frame is buffered.
-    ///
-    /// Frame sizing reuses `ac3::ac3_frame_size` so the AC-3 size table has a
-    /// single source of truth shared with the AC-3 parser; a returned `0` there
-    /// (reserved fscod or out-of-range frmsizecod) is the unmappable case.
+    // Size (bytes) of the AC-3 frame at the buffer head: Unmappable/NeedMore/
+    // Frame(n). See docs/truehd.md#ac3_frame_at_head-ac-3-size-lookup.
     fn ac3_frame_at_head(&self) -> Ac3Size {
         if self.acc.len() < 6 {
             return Ac3Size::NeedMore;
@@ -197,12 +162,8 @@ impl TrueHdParser {
     }
 }
 
-/// Secondary validation for an AC-3 frame of `frame_bytes` at the buffer head:
-/// is its computed end a plausible boundary? Accept when the frame fills the
-/// rest of the buffer, or the bytes that follow start another AC-3 sync
-/// (0x0B77) or a plausible TrueHD access unit (non-zero 12-bit length within
-/// the 32 KiB cap). If none holds, the leading 0x0B77 is more likely a TrueHD
-/// AU header that happens to look like AC-3, so the AC-3 reading is rejected.
+// Secondary validation: is the AC-3 frame's computed end a plausible
+// boundary? See docs/truehd.md#ac3_boundary_corroborated.
 fn ac3_boundary_corroborated(buf: &[u8], frame_bytes: usize) -> bool {
     if frame_bytes >= buf.len() {
         // The AC-3 frame is fully buffered and ends the data — consistent.
@@ -252,10 +213,8 @@ enum Ac3Size {
 
 // --- MLP/TrueHD access-unit integrity (per the MLP/TrueHD bitstream spec) ---
 
-/// Major-sync header size in bytes: base 28, plus `2 + extensions*2` when the
-/// extension flag (major-sync byte 25, bit 0) is set (`extensions` = byte 26
-/// high nibble). `ms` is the major-sync header, i.e. AU bytes `[4..]`. `None`
-/// when the AU is too short to contain the full header.
+// Major-sync header size: base 28 + `2 + extensions*2` when the extension
+// flag is set. See docs/truehd.md#mlp_major_sync_header_size.
 fn mlp_major_sync_header_size(ms: &[u8]) -> Option<usize> {
     if ms.len() < 28 {
         return None;
@@ -270,12 +229,8 @@ fn mlp_major_sync_header_size(ms: &[u8]) -> Option<usize> {
     Some(size)
 }
 
-/// Validate the MLP/TrueHD major-sync header checksum (a CRC-16 with polynomial
-/// 0x002D). The stored trailer is the last 2 header bytes; because
-/// MLP's checksum is byte-reversed relative to a standard CRC, a standard CRC of
-/// the header body XOR the little-endian word before the trailer must equal the
-/// trailer read LITTLE-endian. (Comparing it big-endian was the bug this function
-/// was fixed for; the body and the inline note below are authoritative.)
+// Validate the major-sync header checksum (CRC-16, poly 0x002D, byte-
+// reversed vs standard). See docs/truehd.md#mlp_major_sync_crc_ok.
 fn mlp_major_sync_crc_ok(ms: &[u8], mshdr: usize) -> bool {
     if mshdr < 4 || ms.len() < mshdr {
         return false;
@@ -588,14 +543,12 @@ pub fn truehd_channels_from_stream(data: &[u8]) -> Option<u8> {
 
 /// Real sample rate (Hz) from a TrueHD major-sync `format_info` word.
 ///
-/// The 4-bit `ratebits` nibble sits in `format_info` bits 31..28 (the top
-/// nibble), the same word `truehd_channels` reads for the channel masks. The
-/// MLP rate formula is `(ratebits & 8 ? 44100 : 48000) << (ratebits & 7)`;
-/// rather than evaluate it blindly this is a **strict whitelist** of the only
-/// six rates that occur on real BD/UHD TrueHD. Every other code — the invalid
-/// `0xF`, the formula-only `0x3`/`0xB`, and all reserved values — returns
-/// `None`, so a malformed or unexpected field can never produce a wrong
-/// `SamplingFrequency`; the caller falls back to its container-derived rate.
+/// The 4-bit `ratebits` nibble sits in `format_info` bits 31..28, the same
+/// word `truehd_channels` reads for the channel masks. This is a **strict
+/// whitelist** of the six rates that occur on real BD/UHD TrueHD; every
+/// other code returns `None` so a malformed field can never produce a wrong
+/// `SamplingFrequency` — the caller falls back to its container-derived
+/// rate. See docs/truehd.md for the full rate formula and rationale.
 pub fn truehd_sample_rate_hz(format_info: u32) -> Option<u32> {
     match (format_info >> 28) & 0xF {
         0x0 => Some(48000),
@@ -691,13 +644,8 @@ mod tests {
         }
     }
 
-    /// The substream count and the substream-directory size are the two numbers
-    /// that position `mlp_parity_ok`'s check window over the AU header. Every
-    /// other fixture in this module uses the degenerate shape — one substream,
-    /// no extraword — so neither function's real behaviour was ever exercised:
-    /// a constant answer agreed with all of them, and would then mis-window the
-    /// parity check on the multi-substream AUs that carry 7.1 and Atmos, judging
-    /// clean audio corrupt (or corrupt audio clean).
+    // Non-degenerate substream count/directory size test — see
+    // docs/truehd.md#mlp_substr_header_size-test-rationale.
     #[test]
     fn mlp_num_substreams_is_the_top_nibble_of_major_sync_byte_16() {
         // Byte 16 of the major sync: top nibble is num_substreams, bottom nibble
@@ -763,12 +711,8 @@ mod tests {
         data
     }
 
-    /// Turn a synthetic major-sync AU (sync bytes already set at offset 4, any
-    /// `format_info` set) into one that passes the decodability gate: 1 substream,
-    /// a clean substream directory, a valid major-sync CRC-16, and a valid header
-    /// parity nibble. Mirrors what a real encoder writes (verified against real
-    /// TrueHD streams). The AU must be ≥ 36 bytes (4 AU header + 28 major-sync
-    /// header + 2 directory + slack), which every `make_truehd_unit(≥200)` is.
+    // Make a synthetic major-sync AU pass the decodability gate (CRC +
+    // parity). See docs/truehd.md#finalize_major_sync-test-helper.
     fn finalize_major_sync(au: &mut [u8]) {
         const MSHDR: usize = 28; // no extension (byte 25 clear)
         // num_substreams = 1 → major-sync byte 16 (AU[20]) top nibble.
@@ -928,11 +872,8 @@ mod tests {
         // `corrupt_major_sync_drops_forward_to_next_valid`).
     }
 
-    /// Independent bitwise CRC-16 (poly 0x002D, init 0, MSB-first) — a SEPARATE
-    /// oracle from `crc16_mlp`, so a fixture built with it is not tautological
-    /// with the validator under test. Anchored to the catalogue check value
-    /// (0x4FF7 for "123456789") so the oracle itself is proven correct without
-    /// reference to the code under test.
+    // Independent bitwise CRC-16 oracle (poly 0x002D), not tautological
+    // with `crc16_mlp`. See docs/truehd.md#ref_crc16_2d-test-oracle.
     fn ref_crc16_2d(data: &[u8]) -> u16 {
         let mut crc: u16 = 0;
         for &b in data {
@@ -1756,10 +1697,8 @@ mod tests {
 
     // --- #2 sample rate from the major-sync rate nibble ---
 
-    /// Build a `format_info` word with the given `ratebits` (top nibble) and a
-    /// 7.1 8-channel mask (ch8 = 0x1F) in the low 13 bits — exactly the layout
-    /// §1.A pins, so the rate nibble and the channel masks are co-located in one
-    /// real word.
+    // `format_info` with given `ratebits` (top nibble) + a 7.1 8-channel
+    // mask (ch8 = 0x1F) in the low 13 bits, co-located in one real word.
     fn format_info_with(ratebits: u32) -> u32 {
         ((ratebits & 0xF) << 28) | 0x1F
     }

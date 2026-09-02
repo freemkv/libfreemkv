@@ -313,12 +313,9 @@ fn fvi_sink_indexes_real_mpeg2_pipeline_output() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Codec-agnostic path: a non-MPEG2 stream (HEVC/H.264/VC-1) emits frames with
-/// `coding == None` but real `keyframe` + `source` + `pts`. The `.fvi` records
-/// must still be USEFUL — `key`/`type` from the frame's keyframe flag, `src`/
-/// `pts` populated — NOT degraded to `type:"?"`/`src:null` just because
-/// `PictureInfo` is MPEG-2-specific. The genuine null/"P"-fallback path only
-/// fires when a field is truly absent (no provenance / non-key). No panic.
+// Codec-agnostic path: non-MPEG2 frames (`coding == None`) with real keyframe/
+// source/pts must still yield useful `.fvi` records, not degrade to
+// `type:"?"`/`src:null` just because `PictureInfo` is MPEG-2-specific.
 #[test]
 fn fvi_sink_indexes_non_mpeg2_frames_codec_agnostically() {
     use libfreemkv::pes::{PesFrame, SourcePos};

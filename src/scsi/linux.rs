@@ -3,20 +3,11 @@
 //! `execute()` is one syscall: `ioctl(fd, SG_IO, &hdr)` blocks until the
 //! kernel completes the command (success, error, or its own timeout).
 //! No userspace abort, no fd close+reopen, no SG_SCSI_RESET escalation —
-//! the kernel SCSI mid-layer's `scsi_eh.rst` ladder
-//! (ABORT TASK → LUN RESET → BUS RESET → HOST RESET) runs internally
-//! when `hdr.timeout` expires, and by the time the ioctl returns the
-//! kernel has already done what it can.
+//! the kernel SCSI mid-layer's own error-handling ladder runs internally
+//! when `hdr.timeout` expires.
 //!
-//! This matches established practice for optical/SCSI I/O: a single
-//! synchronous ioctl with a bounded per-command timeout (commonly in the
-//! 8–60 s range), consistent with the Linux kernel default for SCSI block
-//! devices (30 s `/sys/.../timeout`).
-//!
-//! Pre-0.13.20 we ran an async `write() + poll(1.5s) + close-on-timeout +
-//! bg reopen` pattern. That abandoned slow-but-alive commands faster than
-//! the drive could drain its internal queue, deepening the wedge
-//! pattern on the LG BU40N. Reverted in 0.13.20.
+//! See docs/scsi-linux.md for the escalation ladder, the design
+//! rationale, and the pre-0.13.20 async-poll design it replaced.
 
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
@@ -100,10 +91,9 @@ impl SgIoTransport {
         })
     }
 
-    /// Map the current `errno` (from a failed `libc::open`) to a typed
-    /// [`Error`]: `EACCES`/`EPERM` → [`Error::DevicePermission`], anything
-    /// else → [`Error::DeviceNotFound`]. The device path is carried in the
-    /// error; no English commentary (the app layer localizes).
+    // Map errno from a failed open(): permission-denied -> DevicePermission,
+    // else DeviceNotFound. Path carried in the error; no English text (app
+    // layer localizes).
     fn open_error<T>(device: &Path) -> Result<T> {
         let err = std::io::Error::last_os_error();
         Err(if err.kind() == std::io::ErrorKind::PermissionDenied {
@@ -204,33 +194,9 @@ impl Drop for SgIoTransport {
 }
 
 impl ScsiTransport for SgIoTransport {
-    /// Execute a SCSI command via synchronous blocking SG_IO.
-    ///
-    /// One syscall: `ioctl(fd, SG_IO, &hdr)`. The kernel honors
-    /// `hdr.timeout` and runs its own ABORT TASK → LUN RESET → BUS
-    /// RESET → HOST RESET escalation if the device times out (per
-    /// `Documentation/scsi/scsi_eh.rst`). By the time this returns,
-    /// the kernel has done its recovery work.
-    ///
-    /// Errors we surface to caller (any of these = command failed):
-    ///
-    ///   - ioctl returned -1 → `Error::IoError` (kernel-level failure)
-    ///   - `hdr.host_status` != 0 OR `(hdr.driver_status & ~DRIVER_SENSE)` != 0
-    ///     → `Error::ScsiError { status: 0xFF, sense_key: 0, asc: 0, ascq: 0 }`
-    ///     (real transport-layer failure: kernel timeout, bridge wedge, bus error)
-    ///   - `hdr.status` != 0 (typically `0x02` CHECK CONDITION) →
-    ///     `Error::ScsiError { status, sense_key, asc, ascq }` carrying the
-    ///     drive's full SPC-4 sense triple. Callers route on
-    ///     `is_medium_error()`, `is_unit_attention()`, etc.
-    ///
-    /// Note: SG's `DRIVER_SENSE` (0x08) bit indicates *sense data is
-    /// attached* — it's set on every CHECK CONDITION reply. It is **not**
-    /// a transport failure; pre-0.13.23 we conflated it with one and
-    /// silently lost every drive-reported error reason. The mask in the
-    /// transport-error check below is the fix.
-    ///
-    /// Caller's `data` buffer is mutated only on success; partial
-    /// transfers are reported via `bytes_transferred = data.len() - resid`.
+    // Execute via one synchronous SG_IO ioctl; errors map to IoError/ScsiError.
+    // See docs/scsi-linux.md — error mapping, DRIVER_SENSE masking, and
+    // partial-transfer notes.
     fn execute(
         &mut self,
         cdb: &[u8],
@@ -522,10 +488,9 @@ fn sysfs_identity(name: &str) -> (String, String, String) {
     (read("vendor"), read("model"), read("rev"))
 }
 
-/// Enumerate `sg*` names via `/sys/class/scsi_generic/`, filtered to
-/// SCSI peripheral type 5 (optical). Falls back to a `sg0..15` probe
-/// when sysfs is unreadable. Returns names sorted lexically so caller
-/// iteration is deterministic.
+// Enumerate `sg*` names via `/sys/class/scsi_generic/`, filtered to type 5
+// (optical). Falls back to a `sg0..15` probe when sysfs is unreadable.
+// Names sorted lexically so caller iteration is deterministic.
 fn enumerate_sg_names() -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/sys/class/scsi_generic") {

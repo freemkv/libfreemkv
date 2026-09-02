@@ -22,16 +22,9 @@ impl Scratch {
         Self(p)
     }
 
-    /// The path a scratch dir takes — kept separate from directory creation so
-    /// its uniqueness is testable without a syscall between draws. A monotonic
-    /// counter, NOT a timestamp, is what guarantees it: `SystemTime::now()`
-    /// resolves to only a MICROSECOND on macOS, so two of the seven parallel
-    /// tests that share the "bdmv" tag routinely read the same value within one
-    /// microsecond, collide on the same directory, and the first to finish
-    /// `remove_dir_all`s it out from under the others' reads — an intermittent
-    /// `read_sectors` ENOENT. The counter is unique regardless of clock
-    /// granularity; pairing it with the pid keeps it unique across test-binary
-    /// processes.
+    // A monotonic counter, not a timestamp: macOS's clock resolves to only a
+    // microsecond, which collides across parallel tests sharing a tag.
+    // See docs/dirimage-tests.md — Scratch::unique_path
     fn unique_path(tag: &str) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -82,15 +75,9 @@ fn bdmv_scratch() -> (Scratch, Vec<u8>, Vec<u8>) {
     (s, index, clip)
 }
 
-/// Every `Scratch` must own a DISTINCT directory. Seven tests share the "bdmv"
-/// tag and run in parallel; if two land the same path, the first to drop
-/// `remove_dir_all`s it out from under the other's reads, which surfaced as an
-/// intermittent `read_sectors` failure. Regression: with the old
-/// `SystemTime::now()` name this is RED, because macOS's clock advances only
-/// per microsecond, so a tight loop of pure draws — no `create_dir_all` syscall
-/// between them to nudge the clock, mirroring the real cross-thread collision —
-/// hands back the same value many times over. The counter-based name is unique
-/// regardless of clock granularity.
+// Every Scratch must own a distinct directory, or a parallel test's
+// remove_dir_all deletes another's files mid-read.
+// See docs/dirimage-tests.md — scratch_paths_are_unique_even_at_clock_resolution
 #[test]
 fn scratch_paths_are_unique_even_at_clock_resolution() {
     let paths: Vec<PathBuf> = (0..1000).map(|_| Scratch::unique_path("uniq")).collect();
@@ -106,10 +93,9 @@ fn scratch_paths_are_unique_even_at_clock_resolution() {
 
 // ── The de-risking spike ────────────────────────────────────────────────────
 
-/// THE load-bearing assertion of the whole design: metadata synthesized here
-/// must be parseable by the PRODUCTION `read_filesystem`, unmodified. If this
-/// fails, nothing above the sector layer can consume a `dir://` source and the
-/// approach is wrong.
+/// THE load-bearing assertion: metadata synthesized here must be parseable by
+/// the PRODUCTION read_filesystem, unmodified — else nothing above the sector
+/// layer can consume a dir:// source.
 #[test]
 fn production_parser_reads_the_synthesized_tree() {
     let (s, index, clip) = bdmv_scratch();
@@ -176,10 +162,9 @@ fn file_extents_are_absolute_and_readable() {
     );
 }
 
-/// A file past the 30-bit allocation-descriptor ceiling comes back as MULTIPLE
-/// extents whose lengths sum to the file size — the multi-extent case a real
-/// dual-layer disc produces, and the one the single-AD fixture in `udf.rs`
-/// never covered. Uses a sparse file so the test costs no real disk space.
+// A file past the 30-bit allocation-descriptor ceiling comes back as multiple
+// extents summing to the file size — the multi-extent case the single-AD
+// fixture in udf.rs never covered. Uses a sparse file to cost no disk space.
 #[test]
 fn a_file_past_the_ad_ceiling_reads_back_as_multiple_extents() {
     let s = Scratch::new("big");
@@ -250,15 +235,9 @@ fn the_same_folder_synthesizes_the_same_image() {
     }
 }
 
-/// A directory with enough children that its FID list spans several 2048-byte
-/// blocks, read back through the production parser.
-///
-/// This is the case the block-alignment question turns on: FIDs are packed
-/// contiguously and a descriptor may straddle a block boundary, because
-/// `read_directory` (`udf.rs:1312`) walks the directory extent as one flat byte
-/// run and BREAKS at the first non-257 tag. Padding each block would truncate
-/// the directory at the first pad. 200 entries also exceeds the 16-handle LRU
-/// several times over, so it exercises handle eviction on the read path.
+// A directory whose FID list spans several 2048-byte blocks, read back
+// through the production parser; also exercises handle-cache eviction.
+// See docs/dirimage-tests.md — a_directory_spanning_many_blocks_reads_back_whole
 #[test]
 fn a_directory_spanning_many_blocks_reads_back_whole() {
     const N: usize = 200;
@@ -358,11 +337,9 @@ fn vts_ifo(len: usize, vtsm_vobs: u32, vtstt_vobs: u32) -> Vec<u8> {
     v
 }
 
-/// THE DVD invariant. `ifo.rs:554-556` computes
-/// `vob_start_sector = file_start_lba(VTS_01_0.IFO) + vtstt_vobs`, and the
-/// title extents are built on top of that, so the planner must place
-/// `VTS_01_1.VOB` at exactly that sector. Anything else rips the wrong bytes
-/// with no error anywhere.
+// THE DVD invariant. ifo.rs:554-556 computes vob_start_sector as
+// file_start_lba(VTS_01_0.IFO) + vtstt_vobs, so the planner must place
+// VTS_01_1.VOB at exactly that sector, or the wrong bytes rip silently.
 #[test]
 fn vtstt_vobs_lands_on_the_first_sector_of_the_title_vob() {
     let s = Scratch::new("dvd");
@@ -482,15 +459,9 @@ fn an_oversized_vob_offset_leaves_a_gap_rather_than_failing() {
     assert!(buf.iter().all(|&b| b == 0));
 }
 
-/// A file inside a SUBDIRECTORY of `VIDEO_TS` must still have its data placed.
-///
-/// Audit finding. The DVD branch places only the files directly inside
-/// `VIDEO_TS`, because only those carry the IFO-relative constraints — and the
-/// follow-up loop skipped that directory entirely, so anything one level deeper
-/// got a File Entry declaring the file's real size with no extents behind it.
-/// It appeared in the tree at full length and read back as nothing, at exit 0.
-/// The identical folder under `BDMV/` was always placed correctly, which is
-/// what made the gap easy to miss.
+// A file inside a SUBDIRECTORY of VIDEO_TS must still have its data placed.
+// Audit finding: the DVD branch's follow-up loop skipped that directory.
+// See docs/dirimage-tests.md — a_file_below_video_ts_is_placed_not_just_declared
 #[test]
 fn a_file_below_video_ts_is_placed_not_just_declared() {
     let s = Scratch::new("dvdsubdir");
@@ -511,17 +482,9 @@ fn a_file_below_video_ts_is_placed_not_just_declared() {
     );
 }
 
-/// A VOBS offset far past the content must be REFUSED, not honoured.
-///
-/// Audit finding. The planner honours a title set's declared VOBS offset
-/// because honouring it is what makes a real backup readable, and nothing
-/// bounded it: a regenerated `.BUP`, a rewritten IFO or a hand-assembled folder
-/// naming a huge offset grew the image to wherever it pointed. A `u32` sector
-/// count reaches roughly 8.8 TB, and writing that to an `iso://` destination
-/// would fill a disk with zeros before anything noticed.
-///
-/// The companion above pins that a MODEST oversize is still honoured as a gap,
-/// so this cap refuses only what it must.
+// A VOBS offset far past the content must be REFUSED, not honoured, or a
+// u32 sector count (~8.8 TB) can fill an iso:// destination with zeros.
+// See docs/dirimage-tests.md — a_vob_offset_past_the_image_cap_is_refused
 #[test]
 fn a_vob_offset_past_the_image_cap_is_refused() {
     let s = Scratch::new("dvdcap");
@@ -607,15 +570,9 @@ fn minimal_clpi(source_packets: u32) -> Vec<u8> {
     d
 }
 
-/// A BD folder that really enumerates a title, so the AACS content probe has
-/// an extent to sample.
-///
-/// The `.m2ts` is built as real 192-byte BD source packets, because that is
-/// what the probe judges: byte 0 carries the AACS Copy Permission Indicator in
-/// its top two bits, and byte 4 is the MPEG-TS sync. `scrambled` sets the CPI
-/// and withholds the sync — "flagged and not structurally clean", which is
-/// exactly `aacs_unit_needs_decrypt`. An all-zero payload would prove nothing
-/// either way: `is_clean_ts` skips zero payloads as padding.
+// A BD folder that enumerates a title, so the AACS content probe has an
+// extent to sample; `scrambled` sets the CPI bits and withholds TS sync.
+// See docs/dirimage-tests.md — playable_bdmv
 fn playable_bdmv(tag: &str, scrambled: bool) -> Scratch {
     let s = Scratch::new(tag);
     let packets = 4096u32;
@@ -687,13 +644,9 @@ fn an_aacs_folder_with_scrambled_content_is_rejected() {
 // `scan_dir` and `mux::resolve::input("dir://…")` once disagreed: only `scan_dir`
 // re-judged the verdict from CONTENT. Fixed via `apply_folder_encryption_verdict`.
 
-/// The two doors must AGREE. Same folder, same verdict, same extents.
-///
-/// Stated as a differential rather than a bare `is_ok()` so it cannot go
-/// vacuous: if the fixture ever stops producing an AACS state, a one-sided
-/// `Ok` assertion would still pass while guarding nothing, whereas "both doors
-/// see the same title" is the invariant the shared function actually exists to
-/// hold.
+/// The two doors must AGREE: same folder, same verdict, same extents. Stated
+/// as a differential, not a bare is_ok(), so it cannot go vacuous.
+/// See docs/dirimage-tests.md — both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory
 #[test]
 fn both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory() {
     // `s` MUST outlive `stream`: the pipeline's producer thread is still
@@ -728,13 +681,9 @@ fn both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory() {
     drop(stream);
 }
 
-/// The other verdict, through the same door: a folder whose content units are
-/// really scrambled is refused with the TYPED code, not muxed into garbage.
-///
-/// This is the load-bearing half. `E_DIR_IMAGE_ENCRYPTED` is produced at
-/// exactly one site in the crate (`session::apply_folder_encryption_verdict`),
-/// reachable from here only through the `is_folder` argument — so this test
-/// cannot pass if that argument is dropped, whatever else changes.
+// The other verdict, same door: a truly scrambled folder is refused with the
+// TYPED code, not muxed into garbage. Load-bearing half.
+// See docs/dirimage-tests.md — a_scrambled_folder_is_refused_through_the_dir_url_door_too
 #[test]
 fn a_scrambled_folder_is_refused_through_the_dir_url_door_too() {
     let s = playable_bdmv("dirdoorenc", true);
@@ -755,13 +704,9 @@ fn a_scrambled_folder_is_refused_through_the_dir_url_door_too() {
 
 // ── External oracle ─────────────────────────────────────────────────────────
 
-/// Write a synthesized image to a real file and ask the OS to mount it.
-///
-/// This is the only check here that is not circular: `read_filesystem` shares
-/// every assumption with the encoder, an operating system's UDF driver shares
-/// none of them. Ignored by default because it shells out to `hdiutil` and
-/// needs a host that can attach an image; run with
-/// `cargo test -- --ignored write_and_mount_externally --nocapture`.
+/// Write a synthesized image to a real file and ask the OS to mount it — the
+/// only check here not circular with the encoder. Ignored by default (shells
+/// out to hdiutil). See docs/dirimage-tests.md — write_and_mount_externally
 #[test]
 #[ignore = "external: shells out to hdiutil/mount"]
 fn write_and_mount_externally() {
@@ -838,13 +783,9 @@ fn write_and_mount_externally() {
     );
 }
 
-/// Diagnostic (opt-in): verify the DVD placement invariant for every title set
-/// in a REAL folder. `ifo.rs` derives a title's extents as
-/// `file_start_lba(VTS_nn_0.IFO) + vtstt_vobs`, so that sum must land exactly on
-/// `VTS_nn_1.VOB` or the mux reads the wrong sectors for that title.
-///
-/// Run with: `FMKV_DVD_FOLDER=/path/to/tree cargo test --lib
-/// dvd_placement_invariant_on_a_real_folder -- --ignored --nocapture`
+// Diagnostic (opt-in): verify the DVD placement invariant for every title set
+// in a REAL folder. Run with FMKV_DVD_FOLDER=/path/to/tree cargo test --lib
+// dvd_placement_invariant_on_a_real_folder -- --ignored --nocapture
 #[test]
 #[ignore = "diagnostic: needs FMKV_DVD_FOLDER pointing at a real VIDEO_TS tree"]
 fn dvd_placement_invariant_on_a_real_folder() {
@@ -887,11 +828,9 @@ fn dvd_placement_invariant_on_a_real_folder() {
     );
 }
 
-/// Diagnostic (opt-in): dump every title an image scan produces, with the
-/// numbers `canonical_title_order` actually sorts on.
-///
-/// Run: `FMKV_IMAGE=/path/to.iso cargo test --lib dump_titles_for_an_image
-/// -- --ignored --nocapture`
+// Diagnostic (opt-in): dump every title an image scan produces, with the
+// numbers canonical_title_order sorts on. Run: FMKV_IMAGE=/path/to.iso
+// cargo test --lib dump_titles_for_an_image -- --ignored --nocapture
 #[test]
 #[ignore = "diagnostic: needs FMKV_IMAGE"]
 fn dump_titles_for_an_image() {
@@ -928,10 +867,9 @@ fn dump_titles_for_an_image() {
     }
 }
 
-/// Diagnostic (opt-in): can each VTS IFO be READ from an image?
-///
-/// `parse_vmg` skips a title set whose `parse_vts` fails, and `parse_vts`
-/// begins by reading `/VIDEO_TS/VTS_nn_0.IFO`. This isolates the read.
+// Diagnostic (opt-in): can each VTS IFO be READ from an image? parse_vmg
+// skips a title set whose parse_vts fails, and parse_vts begins by reading
+// VTS_nn_0.IFO. This isolates the read.
 #[test]
 #[ignore = "diagnostic: needs FMKV_IMAGE"]
 fn dump_vts_ifo_reads_for_an_image() {
@@ -1057,16 +995,9 @@ fn multi_item_mpls(clip_ids: &[&[u8; 5]]) -> Vec<u8> {
     buf
 }
 
-/// `Clip::feed_span` is the INPUT to the whole provenance feature — it is what
-/// tells the muxer which clip a byte offset belongs to — and it is produced in
-/// exactly one place, `disc/bluray.rs`. Every `SeamPlan` test synthesizes spans
-/// by hand, so the consumer is thoroughly tested against fixtures written from
-/// the same assumptions as the producer, and nothing checks the producer at all.
-///
-/// That is the shape of the original defect: the placement logic was tested and
-/// correct, and the thing feeding it was wrong. `SeamPlan` only trusts spans
-/// that TILE the feed contiguously from zero, so this asserts exactly that,
-/// against the real scanner reading a real synthesized filesystem.
+// Clip::feed_span is the INPUT to the whole provenance feature, produced in
+// exactly one place; every SeamPlan test synthesizes spans by hand, so
+// nothing else checks the producer. See docs/dirimage-tests.md (this fn).
 #[test]
 fn a_multi_clip_playlist_produces_feed_spans_that_tile_the_feed() {
     let s = Scratch::new("spans");

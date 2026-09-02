@@ -77,13 +77,9 @@ const SCSI_MODE_SENSE: u8 = 0x5A;
 const SCSI_MODE_SELECT: u8 = 0x55;
 const SCSI_REPORT_KEY: u8 = 0xA4;
 
-/// SBC/MMC Read-Write Error Recovery mode page (page code 0x01). We flip the
-/// `PER` bit to make the drive REPORT a recovered read (via CHECK CONDITION +
-/// sense key RECOVERED ERROR) instead of silently returning best-effort data as
-/// GOOD status. On marginal/dirty media that silent-GOOD data can be
-/// mis-corrected — a rip that "passed clean" but decoded with errors. With PER
-/// on, freemkv sees the marginal read and re-reads it in Pass N (a loud miss,
-/// never a silent commit). See `build_error_recovery_select_payload`.
+// SBC/MMC Read-Write Error Recovery mode page. Flipping PER makes the drive
+// REPORT recovered reads instead of silently returning best-effort GOOD data.
+// See docs/drive-mod.md — Error-recovery mode page (PER bit).
 const MODE_PAGE_ERROR_RECOVERY: u8 = 0x01;
 /// Bit masks in the Read-Write Error Recovery flags byte (page byte 2).
 const ERP_FLAG_TB: u8 = 0x20; // Transfer Block: still deliver the recovered data
@@ -166,10 +162,9 @@ impl Drive {
         })
     }
 
-    /// Test-only constructor: build a `Drive` over an arbitrary
-    /// [`ScsiTransport`] (no profile, no platform driver, no block-device
-    /// fallback) so command-builder/response-parser logic can be exercised
-    /// against a scripted mock transport.
+    // Test-only constructor: build a `Drive` over an arbitrary `ScsiTransport`
+    // (no profile, no platform driver, no block-device fallback) so
+    // command-builder/response-parser logic can be exercised against a mock.
     #[cfg(test)]
     pub(crate) fn from_transport_for_test(scsi: Box<dyn ScsiTransport>) -> Self {
         Drive {
@@ -220,10 +215,8 @@ impl Drive {
         self.halt.load(Ordering::Relaxed)
     }
 
-    /// Halt-aware SCSI execute. Returns `Err(Halted)` if the flag is set
-    /// before the command dispatches or by the time it completes. The only
-    /// path to talk to the drive in the recovery hot loop; keeps Drive::read
-    /// free of explicit halt checks.
+    // Halt-aware SCSI execute: returns `Err(Halted)` if the flag is set before
+    // dispatch or by completion. Keeps Drive::read free of explicit halt checks.
     fn checked_exec(
         &mut self,
         cdb: &[u8],
@@ -273,10 +266,8 @@ impl Drive {
         self.scsi.as_mut()
     }
 
-    /// The OEM Volume ID a matching unlocker returned at [`Drive::init`], if any.
-    /// The AACS handshake uses this to skip the cert handshake when an unlocker
-    /// already supplied the VID. `None` when no unlocker matched or it produced
-    /// no VID.
+    // The OEM Volume ID a matching unlocker returned at Drive::init, if any.
+    // AACS uses it to skip the cert handshake. None if no unlocker matched.
     pub(crate) fn oem_vid(&self) -> Option<[u8; 16]> {
         self.oem_vid
     }
@@ -439,10 +430,9 @@ impl Drive {
         &self.device_path
     }
 
-    /// Current mounted-disc profile from the GET CONFIGURATION header
-    /// (Current Profile, bytes 6-7). DVD family is `0x0010..=0x001F`, BD
-    /// family `0x0040..=0x0043`. This is a stock MMC command — it works
-    /// before (and without) any drive unlock. `None` if unreadable.
+    // Current mounted-disc profile from GET CONFIGURATION (Current Profile,
+    // bytes 6-7). DVD is 0x0010..=0x001F, BD 0x0040..=0x0043. Stock MMC
+    // command, works before any drive unlock. None if unreadable.
     fn current_profile(&mut self) -> Option<u16> {
         let cdb = [
             crate::scsi::SCSI_GET_CONFIGURATION,
@@ -668,11 +658,9 @@ impl Drive {
     /// the data), and MODE SELECT it back — preserving the drive's own retry
     /// count and other bits.
     ///
-    /// Best-effort: a drive that doesn't support the page, or rejects the SELECT,
-    /// simply keeps its default behaviour — no regression, the rip proceeds. On a
-    /// clean disc this changes nothing (no recovered errors fire); it only
-    /// surfaces the marginal reads that a dirty disc would otherwise commit
-    /// silently. Returns whether the page was successfully written.
+    /// Best-effort: a drive that doesn't support the page, or rejects the
+    /// SELECT, simply keeps its default behaviour. Returns whether the page
+    /// was successfully written.
     pub fn enable_recovered_error_reporting(&mut self) -> bool {
         let Some(sense) = self.mode_sense_page(MODE_PAGE_ERROR_RECOVERY) else {
             tracing::debug!(target: "freemkv::drive", "MODE SENSE error-recovery page unavailable; leaving drive defaults");
@@ -752,20 +740,11 @@ impl Drive {
     /// SCSI reset.
     ///
     /// `recovery=true` uses [`crate::scsi::READ_RECOVERY_TIMEOUT_MS`] (60 s,
-    /// matches sg_dd) for the `freemkv_engine::recovery::patch` pass; `recovery=false` uses
-    /// [`crate::scsi::READ_TIMEOUT_MS`] (10 s) for `freemkv_engine::recovery::copy`'s fast
-    /// skip-forward sweep. Both budgets are generous enough that the drive
-    /// can finish ECC recovery on a marginal sector — pre-0.13.21 this was
-    /// 1.5 s on the fast path which forced the kernel mid-layer to time
-    /// out and escalate while we waited anyway. On any failure returns
-    /// `Err(DiscRead)` immediately; orchestration (`freemkv_engine::recovery::patch` multi-pass,
-    /// `DiscStream` adaptive batch halving) handles retry policy.
-    ///
-    /// Inline retry phases (5× gentle + reset+reopen + 5× more) were
-    /// removed in 0.13.6: on some USB-SATA bridges the inline reset wedged
-    /// drive firmware without ever recovering a sector. The remaining
-    /// recovery layers (freemkv_engine::recovery::patch multi-pass, DiscStream batch halving)
-    /// do not touch the wedge-prone reset path.
+    /// matches sg_dd) for the `freemkv_engine::recovery::patch` pass;
+    /// `recovery=false` uses [`crate::scsi::READ_TIMEOUT_MS`] (10 s) for
+    /// `freemkv_engine::recovery::copy`'s fast skip-forward sweep. On any
+    /// failure returns `Err(DiscRead)` immediately; orchestration handles
+    /// retry policy. See docs/drive-mod.md — single-shot contract.
     pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
         // Bulk path: FUA off (the drive cache IS the streaming throughput).
         self.read_fua(lba, count, buf, recovery, false)
@@ -848,13 +827,9 @@ impl Drive {
         Ok(total)
     }
 
-    /// Issue a single READ(10) for up to `count` sectors at `lba` into
-    /// `buf`, with the recovery-timeout already resolved by the caller.
-    /// This is the byte-identical single-shot read body that `read` calls
-    /// (once for small reads, in a loop for reads larger than the
-    /// transport's max transfer). On failure returns `Err(DiscRead)` with
-    /// `sector = lba` (the failing chunk's LBA) and the preserved SCSI
-    /// status/sense; a short transfer is treated as a failed read.
+    // Single READ(10) for up to `count` sectors at `lba`, timeout already
+    // resolved by the caller. On failure returns `Err(DiscRead)` with
+    // `sector = lba`; a short transfer is treated as a failed read.
     fn read_one(
         &mut self,
         lba: u32,
@@ -1103,15 +1078,9 @@ impl Drop for Drive {
     }
 }
 
-/// Resolve a `/dev/sg*` path to the corresponding `/dev/sr*` block
-/// device by walking sysfs, then open it for read (no `O_DIRECT` —
-/// `posix_fadvise(POSIX_FADV_DONTNEED)` flushes the cache before each
-/// pread, which avoids buffer-alignment requirements while still
-/// forcing fresh device reads).
-///
-/// Returns `None` on any error (sysfs not present, no matching block
-/// device, open failed). Callers treat that as "no fallback available"
-/// and propagate the original SCSI READ error.
+// Resolve a `/dev/sg*` path to its `/dev/sr*` block device via sysfs, open
+// for read (no O_DIRECT). None on any error ("no fallback available").
+// See docs/drive-mod.md — open_block_device_for_sg.
 #[cfg(target_os = "linux")]
 fn open_block_device_for_sg(sg_path: &Path) -> Option<std::os::unix::io::RawFd> {
     let basename = sg_path.file_name()?.to_str()?;
@@ -1184,21 +1153,11 @@ impl SectorSource for Drive {
 /// Find an optical drive on this system and open it, **preferring a drive
 /// that currently has media**.
 ///
-/// On a multi-drive system (common on Windows, where an empty/not-ready
-/// drive can enumerate first) returning the first drive blindly can pick a
-/// drive with no disc, dooming the operation. So this opens each candidate
-/// in enumeration order, queries [`Drive::drive_status`] (GET EVENT STATUS,
-/// which works regardless of firmware state), and returns the first drive
-/// reporting [`DriveStatus::DiscPresent`].
-///
-/// If no drive reports a disc — or `drive_status()` is unavailable/returns
-/// `Unknown` everywhere (single-drive or quirky bridges) — it falls back to
-/// the first drive that opened, preserving the historical behavior so those
-/// setups don't regress.
-///
-/// For just listing drives without opening (e.g. UI sidebar), use
-/// `scsi::list_drives()` — that returns `DriveInfo` (path + identity)
-/// without the cost of running every drive's profile + identity probe.
+/// Opens each candidate in enumeration order and returns the first reporting
+/// [`DriveStatus::DiscPresent`] via [`Drive::drive_status`]; falls back to
+/// the first drive that opened if none report a disc. For just listing
+/// drives without opening, use `scsi::list_drives()` instead.
+/// See docs/drive-mod.md — find_drive selection policy.
 pub fn find_drive() -> Option<Drive> {
     select_drive_with_media(
         discover_drives()
@@ -1207,11 +1166,8 @@ pub fn find_drive() -> Option<Drive> {
     )
 }
 
-/// Pick a drive from an iterator of opened drives, preferring one whose
-/// [`Drive::drive_status`] reports [`DriveStatus::DiscPresent`]. Falls back
-/// to the first drive yielded if none report a disc. Split out from
-/// [`find_drive`] so the selection policy is unit-testable against fake
-/// drives without touching real hardware.
+// Pick a drive preferring DiscPresent status, falling back to the first
+// yielded. Split from find_drive so it's unit-testable without hardware.
 fn select_drive_with_media(drives: impl Iterator<Item = Drive>) -> Option<Drive> {
     let mut fallback: Option<Drive> = None;
     for mut drive in drives {
@@ -1227,21 +1183,9 @@ fn select_drive_with_media(drives: impl Iterator<Item = Drive>) -> Option<Drive>
     fallback
 }
 
-/// Turn a MODE SENSE(10) Read-Write Error Recovery page response into the
-/// payload for a MODE SELECT(10) that enables recovered-error REPORTING —
-/// preserving every other bit (notably the drive's own read-retry count).
-///
-/// Pure so the bit-twiddling is unit-tested without a drive. Steps:
-/// - locate the page after the 8-byte header + block descriptors (bytes 6-7);
-/// - verify it is page 0x01 with a flags byte present;
-/// - in the flags byte: set `PER` (report) and `TB` (still deliver the data),
-///   clear `DTE` (don't terminate the transfer on the recovered error);
-/// - clear the page's `PS` bit (valid only on SENSE) and zero the header's
-///   mode-data-length field (reserved on SELECT).
-///
-/// Returns `None` (caller leaves the drive at its defaults) when the response is
-/// too short or isn't the error-recovery page — never panics on adversarial
-/// bytes.
+// MODE SENSE(10) Error Recovery page -> MODE SELECT(10) payload enabling
+// recovered-error reporting (PER/TB set, DTE/PS cleared), other bits kept.
+// None if too short or not the error-recovery page.
 fn build_error_recovery_select_payload(sense: &[u8]) -> Option<Vec<u8>> {
     if sense.len() < MODE10_HEADER_LEN {
         return None;
@@ -1267,14 +1211,9 @@ fn build_error_recovery_select_payload(sense: &[u8]) -> Option<Vec<u8>> {
     Some(payload)
 }
 
-/// Decode a READ CAPACITY (10) response into a sector count.
-///
-/// A short transfer (`bytes_transferred < 4`, which would leave the high
-/// bytes zero-initialised and decode to a bogus 1-sector disc) is rejected
-/// as [`Error::DiscCapacityMalformed`]. The `0xFFFF_FFFF` "capacity exceeds
-/// 32-bit" sentinel, whose `last_lba + 1` overflows `u32`, is reported as the
-/// distinct [`Error::DiscCapacityOverflow`] so callers can tell an unusable
-/// response apart from an over-large disc.
+// Decode a READ CAPACITY(10) response into a sector count. A short transfer
+// (<4 bytes, would decode a bogus 1-sector disc) is DiscCapacityMalformed;
+// the 0xFFFF_FFFF sentinel (last_lba+1 overflows u32) is DiscCapacityOverflow.
 pub(crate) fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> Result<u32> {
     if bytes_transferred < 4 {
         return Err(Error::DiscCapacityMalformed);
@@ -1283,18 +1222,9 @@ pub(crate) fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> R
     last_lba.checked_add(1).ok_or(Error::DiscCapacityOverflow)
 }
 
-/// Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping to
-/// true, returning [`Error::Halted`].
-///
-/// This was `#[cfg(test)]` for two releases, kept alive only by the four unit
-/// tests below, while the two production paths that actually sleep — the
-/// `wait_ready` poll backoff (60 x 500 ms) and `spin_cycle`'s spin-down/settle
-/// pauses (`SPIN_DOWN_IDLE_SECS` + `SPIN_UP_SETTLE_SECS`) — used a plain
-/// `std::thread::sleep` and so were DEAF to the operator's Stop for ~30 s and
-/// ~15 s respectively. Every other drive path returns `Halted` at the next
-/// `checked_exec` boundary; a Stop pressed during spin-up simply did nothing
-/// visible until the poll ran out. The primitive existed; the sleeping code
-/// just did not call it. It is production code again.
+// Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping true,
+// returning Error::Halted. Used by wait_ready's poll backoff and
+// spin_cycle's spin-down/settle pauses. See docs/drive-mod.md — sleep_until_halted.
 fn sleep_until_halted(halt: &AtomicBool, total: std::time::Duration) -> Result<()> {
     const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
     let deadline = std::time::Instant::now() + total;
@@ -1330,14 +1260,9 @@ pub enum DeviceResolution {
     SrNoSgMatch,
 }
 
-/// Resolve a device path to its raw SCSI device. Returns the resolved
-/// path plus a structured [`DeviceResolution`] signal describing whether
-/// any substitution happened; the application layer maps that to UX text.
-///
-/// Staged, not yet wired: the cross-platform dispatch is kept ready for the
-/// caller that will consume it, so the per-platform implementations below it
-/// (and their tests) stay live. `allow(dead_code)` marks that deliberately —
-/// this is not an accidental orphan.
+// Resolve a device path to its raw SCSI device; returns the resolved path
+// plus a DeviceResolution signal. Staged, not yet wired — allow(dead_code)
+// is deliberate. See docs/drive-mod.md — resolve_device.
 #[allow(dead_code)]
 pub(crate) fn resolve_device(path: &str) -> Result<(String, DeviceResolution)> {
     platform::resolve_device(path)
@@ -1434,10 +1359,9 @@ mod command_tests {
     use super::*;
     use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};
 
-    /// A minimal MODE SENSE(10) response carrying the Read-Write Error Recovery
-    /// page (0x01) with the given flags byte and retry count, no block
-    /// descriptors. `ps` sets the page's PS bit (SENSE-only), which the SELECT
-    /// payload must clear.
+    // Minimal MODE SENSE(10) reply carrying the Error Recovery page (0x01)
+    // with the given flags/retry, no block descriptors. `ps` sets the page's
+    // PS bit (SENSE-only), which the SELECT payload must clear.
     fn mode_sense_error_recovery(flags: u8, retry: u8, ps: bool) -> Vec<u8> {
         let mut v = vec![0u8; MODE10_HEADER_LEN + 12];
         // Header: nonzero mode-data-length (must be zeroed on SELECT); no block
@@ -1512,12 +1436,8 @@ mod command_tests {
         assert!(build_error_recovery_select_payload(&bad).is_none());
     }
 
-    /// Boundary for the "does the buffer hold the full 3-byte page header
-    /// (code/length/flags)?" guard: `page_off + 3 > sense.len()`. Build a
-    /// buffer that is EXACTLY long enough (no slack) — `page_off + 3 ==
-    /// sense.len()` — which must be accepted (`> ` is false), not rejected
-    /// (a `>=` mutation would wrongly reject the last valid byte and return
-    /// None even though every byte the function touches is in bounds).
+    // Boundary for the 3-byte page header guard (page_off + 3 > sense.len()):
+    // exactly-enough length must be accepted, not rejected by a `>=` mutation.
     #[test]
     fn error_recovery_payload_accepts_exact_minimum_length() {
         // No block descriptors: page starts right after the 8-byte header.
@@ -1580,14 +1500,8 @@ mod command_tests {
         ));
     }
 
-    /// `disc_is_dvd()` must match the DVD profile family (0x0010..=0x001F)
-    /// and ONLY that family. A false positive on a BD/UHD profile (0x0040+)
-    /// would skip the drive unlock that UHD reads require; a
-    /// false negative on a DVD would re-introduce the CSS read failure. The
-    /// Current Profile is bytes 6-7 of the GET CONFIGURATION header.
-    /// Mutation: widening the range to `..=0x0040` makes the BD-ROM assert
-    /// fire; a failed/short GET CONFIGURATION must default to NOT-DVD so the
-    /// unlock still runs.
+    // disc_is_dvd() must match ONLY the DVD profile family (0x0010..=0x001F).
+    // See docs/drive-mod.md — disc_is_dvd_matches_only_dvd_profile_family.
     #[test]
     fn disc_is_dvd_matches_only_dvd_profile_family() {
         let probe = |profile: u16| {
@@ -1613,12 +1527,9 @@ mod command_tests {
         );
     }
 
-    /// A conformant GET EVENT STATUS NOTIFICATION reply carrying one Media
-    /// Event Descriptor (MMC-6 §6.7): Event Header — Event Descriptor Length
-    /// (big-endian, bytes 0-1), then NEA (bit 7) + Notification Class (bits
-    /// 2-0) in byte 2 and the Supported Event Class bitmap in byte 3 — followed
-    /// by the 4-byte Media Event Descriptor whose byte 1 (reply byte 5) is the
-    /// Media Status.
+    // A conformant GET EVENT STATUS NOTIFICATION reply with one Media Event
+    // Descriptor (MMC-6 §6.7): Event Header (bytes 0-3) + Media Event
+    // Descriptor whose byte 1 (reply byte 5) is the Media Status.
     fn media_event_reply(media_status: u8) -> Vec<u8> {
         let mut buf = vec![0u8; 8];
         buf[0..2].copy_from_slice(&6u16.to_be_bytes()); // 6 bytes follow
@@ -1644,19 +1555,9 @@ mod command_tests {
         assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
     }
 
-    /// MMC-6 §6.7: byte 5 of the reply is a Media Status ONLY when the Event
-    /// Header says a media event descriptor follows — NEA (byte 2 bit 7) clear
-    /// AND Notification Class (byte 2 bits 2-0) == 4 (Media). A drive that
-    /// answers with NEA set, or with a different class it chose to report, still
-    /// returns 8 bytes; decoding byte 5 regardless reads a reserved/zero byte as
-    /// Media Status 0 and reports NoDisc on a drive that has a disc loaded —
-    /// the classic "works on my drive, not theirs" firmware split. The drive is
-    /// untrusted input: an event-less reply carries no media state at all, so
-    /// the status must come from the TEST UNIT READY fallback instead.
-    ///
-    /// This mock answers every command (including the fallback TUR) with
-    /// success, so the fallback's verdict is `DiscPresent` — the point is that
-    /// it is NOT the fabricated `NoDisc`.
+    // Byte 5 is a Media Status only when NEA is clear AND class == Media;
+    // otherwise it must fall back to TUR, not decode a reserved byte.
+    // See docs/drive-mod.md — media-status decoding.
     #[test]
     fn drive_status_rejects_a_reply_carrying_no_media_event_descriptor() {
         // NEA = 1: "No Event Available" — no descriptor was returned, so the
@@ -1798,13 +1699,8 @@ mod command_tests {
         );
     }
 
-    /// The existing CDB-encoding test (`read_builds_read10_cdb_with_be_lba_and_count`)
-    /// uses LBA `0x00AB_CDEF` and count `2` — both of which have a ZERO top
-    /// byte/top-byte-of-count, so a `(lba >> 24) as u8` or `(count >> 8) as
-    /// u8` silently mutated to a left shift still yields `0x00` (any
-    /// left-shift of at least 8 bits zeroes the low byte a `u8` cast keeps),
-    /// and the assertion can't tell the two apart. Use values with a NONZERO
-    /// top byte so a right-shift mutated to a left-shift is observable.
+    // Uses a NONZERO top byte for LBA/count so a `>>` mutated to `<<` is
+    // observable (a zero top byte can't tell the two apart).
     #[test]
     fn read_cdb_shifts_are_not_masked_by_a_zero_top_byte() {
         let RecordingHarness {
@@ -1900,16 +1796,9 @@ mod command_tests {
         assert!(err.scsi_sense().is_none());
     }
 
-    /// `extract_scsi_context` must map the two non-SCSI dead-bus faults
-    /// (a failed `ioctl(SG_IO)` → `Error::IoError`, a vanished fd →
-    /// `Error::DeviceNotFound`) to the 0xFF TRANSPORT_FAILURE sentinel, not
-    /// to 0x00. Everything else keeps the (0, None) catch-all.
-    /// Spec: `Error::is_scsi_transport_failure` (error.rs) declares both
-    ///       variants transport failures so sweep/patch/fill_extents abort
-    ///       the pass instead of zero-filling against a wedged device.
-    /// Mutation: returning (0, None) here flattens IoError into
-    ///           `DiscRead { status: Some(0) }`, which is_scsi_transport_failure
-    ///           rejects — a wedged USB bridge zero-fills the whole title.
+    // extract_scsi_context must map the two dead-bus faults (IoError,
+    // DeviceNotFound) to the 0xFF TRANSPORT_FAILURE sentinel, not 0x00 — a
+    // wedged bus must abort the pass, not zero-fill it.
     #[test]
     fn extract_scsi_context_maps_dead_bus_faults_to_transport_failure() {
         let (status, sense) = extract_scsi_context(&Error::IoError {
@@ -1952,11 +1841,8 @@ mod command_tests {
         );
     }
 
-    /// End-to-end: an `Error::IoError` raised by the transport must still be
-    /// classified as a transport failure after `Drive::read` flattens it into
-    /// `Error::DiscRead`. Without the `extract_scsi_context` mapping the
-    /// variant is destroyed (status becomes `Some(0)`) and the caller treats a
-    /// dead bus as a recoverable bad sector.
+    // End-to-end: a transport IoError must still classify as a transport
+    // failure after Drive::read flattens it into DiscRead.
     #[test]
     fn read_io_error_surfaces_as_transport_failure_not_a_bad_sector() {
         let mut d = Drive::from_transport_for_test(Box::new(AlwaysErr {
@@ -2035,11 +1921,8 @@ mod command_tests {
 
     // ── Drive::read chunking against a capped transport ─────────────
 
-    /// Transport with a small `max_transfer_bytes` that records the LBA +
-    /// transfer-length of every READ(10) CDB it sees, reports a full
-    /// transfer for each, and can be told to fail the Nth read with a SCSI
-    /// error. Lets a test assert the chunk decomposition and per-chunk
-    /// error LBA.
+    // Transport with a small max_transfer_bytes that records each READ(10)'s
+    // (lba, count), can fail the Nth read, for chunk-decomposition tests.
     struct ChunkingTransport {
         max_bytes: usize,
         /// Recorded (lba, transfer_length_sectors) per READ(10).
@@ -2112,18 +1995,9 @@ mod command_tests {
         }
     }
 
-    /// An undersized caller buffer must be rejected identically whether the
-    /// request fits in one transfer or has to be chunked.
-    ///
-    /// The chunk loop slices `buf` by `count * 2048`, so without the up-front
-    /// length check this PANICKED with "range end index out of range" out of
-    /// the public `read`/`read_fua` — while the single-chunk path tolerated the
-    /// same buffer and returned `Err(DiscRead)`. Behaviour on a caller error
-    /// must not depend on the drive's transfer limit, and a library inside a
-    /// long-running service must not panic on it at all.
-    ///
-    /// Every other read test stays on the single-chunk path, so this guard was
-    /// entirely unasserted and a mutation run flipped its arithmetic freely.
+    // An undersized caller buffer must error, not panic, whether the request
+    // fits in one transfer or has to be chunked. See docs/drive-mod.md —
+    // chunked-read tests.
     #[test]
     fn an_undersized_buffer_errors_on_the_chunked_path_just_like_the_single_one() {
         // max_transfer = 4 sectors, so a 10-sector read must chunk.
@@ -2238,16 +2112,9 @@ mod command_tests {
         }
     }
 
-    /// The chunk loop computes each chunk's destination slice as
-    /// `buf[done * 2048 .. done * 2048 + chunk * 2048]`. `reads.lock()`-style
-    /// assertions on the (lba, count) pairs alone can't tell `done * 2048`
-    /// apart from a corrupted `done + 2048` (chunk boundaries still line up
-    /// on nice round numbers for small test LBAs, and neither mock transport
-    /// above touches the buffer at all) — this test writes a distinct marker
-    /// per chunk and checks it landed at the BYTE offset the request maps
-    /// to, catching a `*` -> `+`/`/` mutation in the offset arithmetic that
-    /// would silently misplace or overlap chunk data written from the
-    /// physical drive into the caller's assembled buffer.
+    // Writes a distinct marker per chunk and checks the BYTE offset, catching
+    // a `*` -> `+`/`/` mutation in the chunk destination-slice arithmetic.
+    // See docs/drive-mod.md — chunked-read tests.
     #[test]
     fn read_chunks_write_into_correctly_offset_buffer_regions() {
         // max_transfer = 4 sectors (8192 bytes): a 10-sector read at LBA 0
@@ -2269,12 +2136,8 @@ mod command_tests {
         );
     }
 
-    /// The multi-chunk path slices the caller's buffer by `count * 2048` with no
-    /// length check, so an undersized `buf` PANICKED ('range end index out of
-    /// range') out of the public `Drive::read` / `Drive::read_fua` — while the
-    /// single-chunk path (`read_one` → `checked_exec`) tolerates the same
-    /// undersized buffer and returns `Err(DiscRead)`. The public API's behaviour
-    /// on an undersized buffer must not depend on the transport's transfer limit.
+    // Multi-chunk path with an undersized buffer must error, not panic, same
+    // as the single-chunk path. See docs/drive-mod.md — chunked-read tests.
     #[test]
     fn undersized_buffer_multi_chunk_errors_not_panics() {
         let ChunkingHarness {
@@ -2296,10 +2159,8 @@ mod command_tests {
         );
     }
 
-    /// `Drive::read`'s chunk loop advanced the per-chunk LBA with an unchecked
-    /// `lba + done`. SBC-3 READ(10) `LOGICAL BLOCK ADDRESS` is a 32-bit field, so
-    /// a request whose last chunk crosses `u32::MAX` overflowed: debug panic out
-    /// of the public API, release wrap to a low LBA silently read instead.
+    // The chunk loop's `lba + done` is checked: a request crossing u32::MAX
+    // must error, not debug-panic or release-wrap to a low LBA.
     #[test]
     fn chunk_lba_near_u32_max_errors_not_overflows() {
         let ChunkingHarness {
@@ -2319,10 +2180,8 @@ mod command_tests {
 
     // ── find_drive media-preference selection policy ────────────────
 
-    /// Build a fake drive whose GET EVENT STATUS reply reports the given
-    /// media_status byte (byte 5 of an 8-byte reply): 0x02 = DiscPresent,
-    /// 0x00 = NoDisc, etc. Stands in for a real opened drive so the
-    /// selection policy is testable without hardware.
+    // Fake drive whose GET EVENT STATUS reply reports the given media_status
+    // byte (0x02 = DiscPresent, 0x00 = NoDisc), for hardware-free tests.
     fn drive_with_media_byte(media_status: u8) -> Drive {
         drive_with(media_event_reply(media_status))
     }
@@ -2388,18 +2247,8 @@ mod command_tests {
         assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
     }
 
-    /// The `bytes_transferred >= 6` guard exists so byte 5 (Media Status) is
-    /// only trusted when the transport actually delivered it. Craft a SHORT
-    /// transfer (5 bytes) whose delivered prefix (bytes 0-2) still passes
-    /// every OTHER check a look-ahead decode would make (descriptor_len=6,
-    /// NEA clear, class=Media) — the only thing distinguishing "trust it"
-    /// from "don't" is the byte count. Byte 5 itself was never delivered and
-    /// is zero only because the local buffer was zero-initialised, not
-    /// because the drive said so. Correct code falls back to the TUR (which
-    /// this mock always answers OK) and reports DiscPresent; a guard
-    /// weakened to unconditionally-true would decode the untransferred
-    /// byte 5 as Media Status 0 and misreport NoDisc — a disc silently
-    /// reported as absent from a reply that never said so.
+    // A 5-byte transfer (byte 5 undelivered) must fall back to TUR, not
+    // decode a zero-initialised byte 5 as a real Media Status of NoDisc.
     #[test]
     fn drive_status_rejects_media_status_from_an_undelivered_byte() {
         let short = vec![0x00, 0x06, 0x04, 0x00, 0x00]; // 5 bytes: descriptor_len=6, NEA=0, class=Media
@@ -2567,13 +2416,8 @@ mod command_tests {
         }
     }
 
-    /// The documented BU40N/Initio wedge recovery: spin the disc down then
-    /// back up WITHOUT ejecting. Exactly two START STOP UNIT (0x1B) commands,
-    /// in order — STOP (START=0) then START (START=1) — both with LOEJ=0
-    /// (byte 4 bit 1 clear): a slot-loading BU40N must never eject during
-    /// unattended recovery. Real time cost (~15s: the validated 5s spin-down
-    /// idle + 10s spin-up settle) is accepted here rather than adding an
-    /// injectable-sleep seam.
+    // BU40N/Initio wedge recovery: exactly STOP (START=0) then START
+    // (START=1), both LOEJ=0 — a slot-loading drive must never eject.
     #[test]
     fn spin_cycle_issues_stop_then_start_without_ejecting() {
         let cdbs = Arc::new(Mutex::new(Vec::new()));
@@ -2603,10 +2447,8 @@ mod command_tests {
         }
     }
 
-    /// A drive that never answers TEST UNIT READY successfully must surface
-    /// `Err(DeviceNotReady)`, not silently report ready. Real time cost
-    /// accepted (60 x 500ms = ~30s) rather than adding an injectable-sleep
-    /// seam for the poll backoff.
+    // A drive that never answers TUR successfully must surface
+    // Err(DeviceNotReady), not silently report ready.
     #[test]
     fn wait_ready_returns_err_when_drive_never_becomes_ready() {
         struct NeverReady;
@@ -2633,18 +2475,8 @@ mod command_tests {
         );
     }
 
-    /// A Stop pressed before the poll starts must be answered at once.
-    ///
-    /// `wait_ready` was the ONE drive path that called
-    /// `self.scsi.as_mut().execute(..)` instead of `checked_exec`, and its
-    /// 60 x 500 ms loop never read `self.halt`. A cancel during spin-up was
-    /// therefore ignored for ~30 s — the test above measures exactly how long
-    /// — while every other drive path returns `Halted` at its next command
-    /// boundary. Thirty seconds of a dead Stop button is indistinguishable
-    /// from a hung application.
-    ///
-    /// Mutation: restoring the bare `execute` makes this run the full poll and
-    /// return `DeviceNotReady`, failing both assertions.
+    // A Stop pressed before the poll starts must be answered at once, not
+    // after the ~30 s poll. See docs/drive-mod.md — wait_ready/spin_cycle halt tests.
     #[test]
     fn wait_ready_returns_halted_when_stopped_before_the_poll() {
         struct NeverReady;
@@ -2677,13 +2509,8 @@ mod command_tests {
         );
     }
 
-    /// ...and a Stop pressed PART WAY THROUGH the poll must be answered at the
-    /// next command boundary, not at the end of the 30 s.
-    ///
-    /// The flag is flipped by the transport itself on its third TEST UNIT
-    /// READY, which is deterministic (no wall-clock race): `checked_exec`
-    /// re-reads the flag after the command completes, so the loop must exit on
-    /// attempt three of sixty.
+    // A Stop pressed part way through the poll must be answered at the next
+    // command boundary. See docs/drive-mod.md — wait_ready/spin_cycle halt tests.
     #[test]
     fn wait_ready_returns_halted_when_stopped_during_the_poll() {
         struct StopsOnThirdPoll {
@@ -2733,21 +2560,8 @@ mod command_tests {
         );
     }
 
-    /// `spin_cycle` must not be deaf to Stop for its ~15 s of deliberate
-    /// waiting.
-    ///
-    /// Both START STOP UNIT commands went out through a bare `execute` and
-    /// both pauses (`SPIN_DOWN_IDLE_SECS` + `SPIN_UP_SETTLE_SECS`) were plain
-    /// `std::thread::sleep`, so the whole routine ignored the halt flag. It
-    /// runs from the RECOVERY path — precisely when a run is going badly and
-    /// the operator is most likely to press Stop.
-    ///
-    /// The flag is set BEFORE the call, so this is deterministic: the very
-    /// first `checked_exec` must refuse.
-    ///
-    /// Mutation: restoring either bare `execute` lets the first command
-    /// through and the test then waits out a real 5 s sleep, failing the
-    /// elapsed bound.
+    // spin_cycle must not be deaf to Stop for its ~15 s of deliberate
+    // waiting. See docs/drive-mod.md — wait_ready/spin_cycle halt tests.
     #[test]
     fn spin_cycle_returns_halted_when_stopped_before_it_starts() {
         let RecordingHarness {
@@ -2772,17 +2586,8 @@ mod command_tests {
         );
     }
 
-    /// ...and a Stop that lands DURING the spin-down pause must wake it.
-    ///
-    /// This is the half a `checked_exec` alone cannot fix: the flag flips
-    /// while the thread is parked inside the 5 s `SPIN_DOWN_IDLE_SECS` sleep,
-    /// so only a halt-aware sleep can observe it. `sleep_until_halted` — which
-    /// already lived in this file with four tests, marked `#[cfg(test)]` and
-    /// called from nowhere — wakes within ~100 ms.
-    ///
-    /// The margin is deliberately enormous (≈0.3 s against 5 s) so the bound
-    /// is not a wall-clock race: a plain `thread::sleep` cannot come in under
-    /// two seconds, and the halt-aware one cannot take that long.
+    // A Stop that lands DURING the spin-down pause must wake it (halt-aware
+    // sleep, ~100 ms). See docs/drive-mod.md — wait_ready/spin_cycle halt tests.
     #[test]
     fn spin_cycle_wakes_from_its_spin_down_pause_when_stopped() {
         let RecordingHarness {
@@ -2810,21 +2615,8 @@ mod command_tests {
         );
     }
 
-    /// A READ(10) that completes with GOOD status but a residual underrun is
-    /// correctly refused — and must SAY SO.
-    ///
-    /// The refusal itself already existed and is right: the tail of the buffer
-    /// still holds stale bytes, so committing them would be silent
-    /// corruption. What was missing is any trace of it. The sibling `Err(e)`
-    /// arm warns with lba/count/status; this arm logged NOTHING, so a drive
-    /// that residual-underruns on GOOD status produced exactly the same
-    /// journal as a scratched disc — two populations with opposite remedies
-    /// (replace the drive vs. clean the disc) collapsed into one, with the
-    /// operator sent after the wrong one.
-    ///
-    /// Mutation: deleting the `tracing::warn!` leaves no event; logging a
-    /// different code, or dropping the transferred/expected pair that is the
-    /// entire signal, fails the field assertions.
+    // A READ(10) with GOOD status but a residual underrun must be refused
+    // AND logged. See docs/drive-mod.md — read_logs_a_good_status_short_transfer.
     #[test]
     fn read_logs_a_good_status_short_transfer() {
         let RecordingHarness {

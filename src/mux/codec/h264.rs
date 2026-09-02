@@ -16,10 +16,8 @@ const NAL_SPS: u8 = 7;
 const NAL_PPS: u8 = 8;
 const NAL_AUD: u8 = 9;
 
-/// Map an H.264 `slice_type` (Rec. ITU-T H.264 §7.4.3, Table 7-6) to a coding
-/// type. Values 5..=9 repeat 0..=4 (the "all slices of this type" forms), so
-/// `slice_type % 5`: 0 = P, 1 = B, 2 = I, 3 = SP (predicted → P), 4 = SI
-/// (intra → I). Returns `None` for values outside 0..=9 (malformed header).
+// Map an H.264 slice_type (§7.4.3, Table 7-6) to a coding type via
+// slice_type % 5 (values 5..=9 repeat 0..=4). See docs/h264.md — slice-type mapping.
 fn h264_slice_coding_type(slice_type: u32) -> Option<CodingType> {
     match slice_type {
         0..=9 => Some(match slice_type % 5 {
@@ -86,10 +84,8 @@ impl H264Parser {
         self
     }
 
-    /// Enable MVC dependent-view passthrough (see the `mvc_passthrough` field):
-    /// keep every parameter set in-band so each frame is a self-contained
-    /// dependent access unit for a Matroska `BlockAdditional`. Used only for the
-    /// Blu-ray 3D dependent (right-eye) stream.
+    // Enable MVC dependent-view passthrough (see `mvc_passthrough` field): keep
+    // every param set in-band so each frame is self-contained. Blu-ray 3D only.
     pub(crate) fn with_mvc_passthrough(mut self, enabled: bool) -> Self {
         self.mvc_passthrough = enabled;
         self
@@ -118,33 +114,16 @@ thread_local! {
     static PARAM_REASSERT_REALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Copy the leading bytes of an EBSP with emulation-prevention bytes removed
-/// (ISO/IEC 14496-10 §7.3.1: a 0x03 following 0x00 0x00 is not part of the RBSP).
-///
-/// Only a short prefix is produced, because the sole caller decodes two ue(v)
-/// fields from the very start of a slice header. `first_mb_in_slice` and
-/// `slice_type` are each at most 32 bits, so 16 octets is ample and keeps this
-/// off the per-frame allocation path for anything larger.
+// Copy the leading bytes of an EBSP with emulation-prevention bytes removed.
+// See docs/h264.md — unescape_ebsp_prefix.
 fn unescape_ebsp_prefix(ebsp: &[u8]) -> Vec<u8> {
     const PREFIX_OCTETS: usize = 16;
     unescape_ebsp(ebsp, PREFIX_OCTETS)
 }
 
-/// Copy `ebsp` with emulation-prevention bytes removed, stopping after at
-/// most `max_octets` OUTPUT bytes (pass `ebsp.len()` for "no cap").
-///
-/// The zero run-length counter is cumulative across the whole scan and is
-/// reset only when an escape byte is actually dropped — matching the
-/// reference decoding process in ITU-T H.264 §7.3.1, which discards a 0x03
-/// following ANY run of two-or-more 0x00 bytes, not just an exact
-/// `00 00 03` sliding window. A window-based scanner
-/// that advances by 3 on a match and by 1 otherwise disagrees with this on a
-/// run of 3+ real zero bytes ahead of an 0x03: `00 00 00 03` decodes here as
-/// `00 00 00` (the run is escaped, matching every other H.264 decoder), where
-/// a window scan starting fresh after each non-match would keep the 0x03 as
-/// real payload. Only one implementation of this rule may exist in this
-/// module — see `parse_sps_high_profile_ext`, which used to keep its own
-/// window-scan copy that disagreed with this one on exactly that input.
+// Copy `ebsp` with emulation-prevention bytes removed (cumulative zero-run
+// rule, ITU-T H.264 §7.3.1), stopping after `max_octets` output bytes.
+// See docs/h264.md — unescape_ebsp.
 fn unescape_ebsp(ebsp: &[u8], max_octets: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(max_octets.min(ebsp.len()));
     let mut zeros = 0usize;
@@ -174,19 +153,9 @@ fn push_length_prefixed(out: &mut Vec<u8>, nal: &[u8]) {
     out.extend_from_slice(nal);
 }
 
-/// Handle an SPS/PPS NAL (mirrors the HEVC fix). The strip/emit decision is
-/// made against the currently-ACTIVE set `cur`, NOT the codecPrivate copy
-/// `first`: a streaming MKV decoder applies avcC once at init and thereafter
-/// updates a parameter set only from an in-band NAL, so a switch BACK to the
-/// first-seen body (== codecPrivate) is still a change the decoder must be told
-/// about. Stripping on `== first` silently dropped that revert.
-///
-/// - First of its type → seeds codecPrivate; stripped (decoder gets it from avcC).
-/// - Equal to the active set `cur` → redundant; stripped.
-/// - Different from `cur` (a change in EITHER direction) → emitted in-band and
-///   `cur` updated.
-///
-/// Returns `true` when the NAL was emitted in-band into `frame_data`.
+// Handle an SPS/PPS NAL: strip/emit decision is against the ACTIVE set `cur`,
+// not codecPrivate `first`, so a switch back to the first-seen body is still
+// told to the decoder. Returns true when emitted in-band. See docs/h264.md.
 fn handle_param_set(
     first: &mut Option<Vec<u8>>,
     cur: &mut Option<Vec<u8>>,
@@ -208,21 +177,9 @@ fn handle_param_set(
     true
 }
 
-/// Append the active parameter set `cur` to `prefix` (length-prefixed) so every
-/// keyframe is SELF-CONTAINED: it carries the active SPS/PPS in-band ahead of
-/// its slices. Skipped only when this access unit ALREADY carried the NAL in-band
-/// (`emitted` — avoids a duplicate) or no active set exists yet.
-///
-/// Unconditional (not only when the active set differs from codecPrivate): a
-/// streaming decoder applies the avcC param sets once at init, then relies on
-/// in-band repetition. Some sources stop repeating a param set at later IDRs even
-/// though its body is unchanged; if the decoder then drops it (a reset event),
-/// nothing re-sends it and every subsequent slice fails (param-set id out of
-/// range) until the next genuine change. Re-asserting at EVERY keyframe — what
-/// compliant muxers do at every IDR — makes streaming decode self-healing.
-/// Re-sending an identical param set is benign; cost is a few bytes per keyframe.
-/// This strictly supersets the change-only re-assert, so the param-set-revert
-/// fix is unaffected.
+// Append the active parameter set `cur` to `prefix` (length-prefixed) so every
+// keyframe is self-contained. Unconditional (not only on change) so a decoder
+// that silently dropped a param set is self-healing. See docs/h264.md.
 fn reassert_active(prefix: &mut Vec<u8>, cur: &Option<Vec<u8>>, emitted: bool) {
     if emitted {
         return;
@@ -425,28 +382,9 @@ impl CodecParser for H264Parser {
     }
 }
 
-/// Parse `(chroma_format_idc, bit_depth_luma_minus8, bit_depth_chroma_minus8)` from
-/// a High-Profile SPS NAL (profile_idc ∈ `HIGH_PROFILES` — the 14 chroma/bit-depth
-/// extended profiles `codec_private` invokes this for).
-///
-/// SPS RBSP layout (ITU-T H.264 §7.3.2.1.1) up to the fields we need:
-///   byte 0        NAL header (already known to be type 7)
-///   byte 1        profile_idc
-///   byte 2        constraint_set_flags / reserved
-///   byte 3        level_idc
-///   ue(v)         seq_parameter_set_id
-///   — High-profile branch —
-///   ue(v)         chroma_format_idc
-///   if chroma_format_idc == 3: u(1) separate_colour_plane_flag
-///   ue(v)         bit_depth_luma_minus8
-///   ue(v)         bit_depth_chroma_minus8
-///
-/// RBSP emulation-prevention bytes (0x00 0x00 0x03 → 0x00 0x00) are removed
-/// before bit-parsing so the bit reader sees clean RBSP data.
-///
-/// Returns `None` if the SPS is too short or malformed (Exp-Golomb code
-/// overflows 32 bits, leading-zero count > 31, etc.). The caller silently
-/// omits the extension in that case.
+// Parse (chroma_format_idc, bit_depth_luma_minus8, bit_depth_chroma_minus8)
+// from a High-Profile SPS NAL (ITU-T H.264 §7.3.2.1.1). Returns None if the
+// SPS is too short/malformed. See docs/h264.md — parse_sps_high_profile_ext.
 fn parse_sps_high_profile_ext(sps: &[u8]) -> Option<(u8, u8, u8)> {
     // Strip emulation-prevention bytes (00 00 03 xx -> 00 00 xx), skipping the
     // NAL header. Shares `unescape_ebsp` with the slice-header prefix reader —
@@ -621,13 +559,9 @@ mod tests {
         }
     }
 
-    /// Open-GOP resync fix: a non-IDR intra-coded access unit MUST be flagged a
-    /// keyframe so the B1 resync gate (`mux/resync.rs`) can disarm on a BD open-
-    /// GOP tail instead of dropping every frame to EOF and truncating the video.
-    /// BD H.264 titles reach random access at a non-IDR I-frame (the recovery
-    /// point); HEVC gets this free from the CRA NAL type, H.264 does not, so the
-    /// measured intra coding type is the signal. Red before the intra promotion
-    /// in `parse` — a non-IDR I-slice used to yield `keyframe == false`.
+    // Open-GOP resync fix: a non-IDR intra access unit must be flagged a
+    // keyframe so the B1 resync gate can disarm on a BD open-GOP tail.
+    // See docs/h264.md — open_gop_intra_access_unit_is_a_keyframe.
     #[test]
     fn open_gop_intra_access_unit_is_a_keyframe() {
         // Annex B AU: one non-IDR coded slice (NAL type 1, nal_ref_idc 3 -> 0x61)
@@ -648,10 +582,8 @@ mod tests {
         );
     }
 
-    /// Guard the promotion's precision: a non-intra (P) access unit must NOT be
-    /// promoted to a keyframe, or the resync gate would resume on a frame that
-    /// carries inter-references to dropped data and the MKV cue index would gain
-    /// bogus random-access points.
+    // Guard the promotion's precision: a non-intra (P) AU must NOT become a
+    // keyframe, or resync would resume on inter-referenced dropped data.
     #[test]
     fn inter_coded_access_unit_is_not_a_keyframe() {
         // Same NAL type 1, but slice_type = 0 (P): ue "1", so with first_mb = 0
@@ -671,16 +603,9 @@ mod tests {
         );
     }
 
-    /// The slice-header parse must remove emulation-prevention bytes first
-    /// (ISO/IEC 14496-10 §7.3.1/§7.4.1): the payload after the NAL header is
-    /// EBSP, and a 0x03 following 0x00 0x00 is not part of the RBSP.
-    ///
-    /// Reachable when `first_mb_in_slice` is 65535 or more — a ue(v) that needs
-    /// sixteen leading zero bits, so the payload opens 0x00 0x00 and an encoder
-    /// must escape it. A UHD frame is ~32,400 macroblocks so conforming Blu-ray
-    /// never gets there, but 8K does, and the disc is untrusted input. Reading
-    /// the raw NAL decoded `slice_type` against the inserted byte and produced
-    /// the wrong picture type.
+    // The slice-header parse must remove emulation-prevention bytes first
+    // (ISO/IEC 14496-10 §7.3.1/§7.4.1) before decoding ue(v) fields.
+    // See docs/h264.md — slice_header_parse_removes_emulation_prevention_bytes.
     #[test]
     fn slice_header_parse_removes_emulation_prevention_bytes() {
         // first_mb_in_slice=65535 needs 16 zero bits (ue(v)); combined with
@@ -729,17 +654,9 @@ mod tests {
         );
     }
 
-    /// Regression: `parse_sps_high_profile_ext` used to re-derive the
-    /// emulation-prevention rule with its own window scanner (match `00 00
-    /// 03` at position i, advance by 3; else advance by 1) instead of calling
-    /// the shared `unescape_ebsp`. On a run of 3+ real 0x00 bytes ahead of an
-    /// 0x03 — non-conformant, but this is untrusted disc input, not a
-    /// spec-clean encoder — the two disagreed: `unescape_ebsp`'s cumulative
-    /// zero counter (the rule the H.264 reference decoding process in
-    /// §7.3.1 specifies) drops the 0x03 as an escape, while a
-    /// fresh 3-byte window starting right after the non-matching first byte
-    /// kept it as real payload. Pin the shared function's behaviour here so a
-    /// second hand-rolled copy doesn't quietly reappear.
+    // Regression: `parse_sps_high_profile_ext` used to re-derive the
+    // emulation-prevention rule with its own (disagreeing) window scanner.
+    // Pin the shared `unescape_ebsp` behaviour. See docs/h264.md.
     #[test]
     fn unescape_ebsp_drops_escape_after_a_run_of_three_zeros() {
         assert_eq!(
@@ -750,17 +667,8 @@ mod tests {
     }
 
     // --- keyframe parameter-set re-assert: exact bytes + no whole-frame copy ---
-
-    /// The keyframe SPS/PPS re-assert must produce EXACTLY these bytes: the
-    /// active SPS, then the active PPS, then the access unit's own NALs, each as
-    /// a 4-byte big-endian length prefix followed by the NAL body (ISO/IEC
-    /// 14496-15 length-prefixed form, lengthSizeMinusOne = 3).
-    ///
-    /// This pins the full byte string, not just its length, so the in-place
-    /// `splice` that replaced the build-a-new-buffer-and-copy approach is proven
-    /// byte-for-byte equivalent — including the ORDER (parameter sets ahead of
-    /// the slices, which is what makes the keyframe self-contained). The literals
-    /// below were captured from the pre-splice implementation's output.
+    // Must produce EXACTLY: active SPS, active PPS, then the AU's own NALs,
+    // each length-prefixed. See docs/h264.md — keyframe_param_reassert_emits_exact_bytes.
     #[test]
     fn keyframe_param_reassert_emits_exact_bytes() {
         fn annexb(nal: &[u8]) -> Vec<u8> {
@@ -804,20 +712,9 @@ mod tests {
         );
     }
 
-    /// MEASURED: the keyframe parameter-set re-assert must be spliced into the
-    /// front of the already-assembled access unit IN PLACE, not built as a fresh
-    /// full-size buffer.
-    ///
-    /// It used to `prefix.extend_from_slice(&frame_data)` and then replace
-    /// `frame_data` with `prefix`, which grew a few-hundred-byte `prefix` to the
-    /// FULL access-unit size — a fresh multi-hundred-KB allocation — memcpy'd the
-    /// whole frame into it, and dropped the presized buffer. One extra
-    /// whole-frame allocation plus one extra whole-frame copy per keyframe: a UHD
-    /// title is ~200,000 frames of 150-400 KB with a keyframe every 1-2 s, i.e.
-    /// thousands of avoidable multi-hundred-KB copies per title, each large
-    /// enough to go through mmap. `PARAM_REASSERT_HEADROOM` exists so the splice
-    /// never reallocates; this counts the reallocations that happen, which must
-    /// be zero. Mirrors the HEVC parser's test of the same name.
+    // MEASURED: the keyframe param-set re-assert must be spliced in place,
+    // not built as a fresh full-size buffer (avoids a whole-frame realloc+copy
+    // per keyframe). Mirrors HEVC's test of the same name. See docs/h264.md.
     #[test]
     fn keyframe_param_reassert_does_not_reallocate_the_frame() {
         fn annexb(nal_header: u8, body: &[u8]) -> Vec<u8> {
@@ -1069,11 +966,9 @@ mod tests {
         );
     }
 
-    /// End-to-end sparse-PTS reconstruction through the REAL parser + reorder:
-    /// a program-stream source (`with_ps_reorder(true)`) that stamps a PTS only
-    /// on each GOP's I-frame must yield distinct, display-ordered PTS for every
-    /// frame — the property the mkv muxer needs so a decoder derives monotonic
-    /// DTS. Without the reorder the non-anchor frames all collapse to one PTS.
+    // End-to-end sparse-PTS reconstruction: a program-stream source that
+    // stamps PTS only on each GOP's I-frame must yield distinct, display-
+    // ordered PTS for every frame. Without reorder, non-anchors collapse.
     #[test]
     fn h264_ps_reorder_reconstructs_distinct_display_pts() {
         use super::super::coding::CodingType;
@@ -1134,10 +1029,9 @@ mod tests {
         );
     }
 
-    /// Regression (the PPS revert bug, H.264 variant): PPS id 0 = body A (→ avcC),
-    /// redefined to B, then switched BACK to A. A streaming decoder is on B; the
-    /// revert to A == avcC must still be emitted in-band or the A-segment
-    /// decodes against B.
+    // Regression (PPS revert bug, H.264 variant): PPS id 0 = body A (→ avcC),
+    // redefined to B, then switched back to A; the revert must still be
+    // emitted in-band or the A-segment decodes against stale B.
     #[test]
     fn h264_emits_switch_back_to_codecprivate_pps() {
         let a = [0xA1u8, 0xA2];
@@ -1748,21 +1642,8 @@ mod tests {
     }
 
     // --- High Profile avcC extension (ISO 14496-15 §5.3.3.1.2) ---
-
-    /// Build a minimal High-Profile SPS RBSP with the fields needed for the
-    /// avcC extension. The SPS bytes (NAL-header included) are:
-    ///   [0x67]  NAL header (type=7, ref_idc=3)
-    ///   [profile_idc] [constraint_flags] [level_idc]
-    ///   ue(v) seq_parameter_set_id = 0  → 1 bit: 0b1
-    ///   ue(v) chroma_format_idc         → depends on value
-    ///   if chroma_format_idc==3: u(1) separate_colour_plane_flag
-    ///   ue(v) bit_depth_luma_minus8
-    ///   ue(v) bit_depth_chroma_minus8
-    ///
-    /// All ue(v) values <= 6 fit within 3 leading zeros + 3 suffix bits (7 bits
-    /// total): prefix = leading_zeros + stop-1 bit, suffix = leading_zeros bits.
-    /// For small values (0..=2), the unary prefix + code is short enough to
-    /// pack manually with a simple bit-packing helper.
+    // Build a minimal High-Profile SPS RBSP: NAL header + profile/constraint/
+    // level + ue(v) fields through bit_depth_chroma_minus8, bit-packed manually.
     fn build_high_profile_sps(
         profile_idc: u8,
         chroma_format_idc: u32,
@@ -1934,11 +1815,9 @@ mod tests {
         );
     }
 
-    /// ISO 14496-15 §5.3.3.1.2 regression: profile_idc=244 (High 4:4:4
-    /// Predictive) ALSO mandates the chroma/bit-depth extension. It was missing
-    /// from HIGH_PROFILES, so a 244 stream took the Baseline/Main path and
-    /// emitted an avcC with NO extension bytes — non-conforming, and strict
-    /// parsers then assume 8-bit 4:2:0. The extension must be appended.
+    // ISO 14496-15 §5.3.3.1.2 regression: profile_idc=244 (High 4:4:4
+    // Predictive) also mandates the chroma/bit-depth extension; it was
+    // missing from HIGH_PROFILES. See docs/h264.md — avcc_profile_244.
     #[test]
     fn avcc_profile_244_appends_extension_bytes() {
         // profile_idc=244, chroma_format_idc=3 (4:4:4), depths both 4 (12-bit).
@@ -1996,10 +1875,8 @@ mod tests {
         );
     }
 
-    /// `SpsReader::read_bits` shifts each new bit into the low end of the
-    /// accumulator (`val << 1 | bit`). Pins the direction directly: a
-    /// `<<` -> `>>` typo would leave every accumulated bit shifted out and
-    /// the result would collapse towards 0 instead of building up the value.
+    // `SpsReader::read_bits` shifts each new bit into the low end
+    // (`val << 1 | bit`); pins the direction against a `<<` -> `>>` typo.
     #[test]
     fn sps_reader_read_bits_builds_value_msb_first() {
         // 0b1011_0000 read 4 bits MSB-first -> 0b1011 = 11.
@@ -2007,11 +1884,9 @@ mod tests {
         assert_eq!(r.read_bits(4), Some(0b1011));
     }
 
-    /// `SpsReader::read_ue`'s truncation guard is `leading_zeros > 31`: 31
-    /// leading zero bits is the longest legal code and must decode, not
-    /// abort. Mirrors the equivalent guard in the shared `BitReader` in
-    /// `startcode.rs`, kept here because `SpsReader` is a separate,
-    /// unshared implementation used only for SPS parsing.
+    // `SpsReader::read_ue`'s truncation guard is `leading_zeros > 31`: the
+    // longest legal code must decode, not abort. Mirrors `BitReader` in
+    // `startcode.rs`; kept separate since `SpsReader` is unshared.
     #[test]
     fn sps_reader_read_ue_thirty_one_leading_zeros_is_still_valid() {
         let data = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];

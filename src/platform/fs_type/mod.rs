@@ -1,15 +1,10 @@
 //! Filesystem-type detection.
 //!
-//! The buffering architecture (Phase 2) selects different output sinks
-//! for local vs network filesystems: NFS gets the adaptive
-//! `WritebackFile` machinery on Linux; local disks get `LocalFileSink`
-//! and rely on the kernel's default writeback policy. This module
-//! provides the construction-site primitive that picks which one.
-//!
-//! Per the per-OS file-split convention, the actual `statfs` call lives
-//! in the matching platform file (`linux.rs`, `macos.rs`, `windows.rs`,
-//! `other.rs`); this `mod.rs` exposes only the cross-platform enum and
-//! the `detect` entry point.
+//! Picks the output sink for the Phase 2 buffering architecture (NFS
+//! gets `WritebackFile`, local disks get `LocalFileSink`) and exposes
+//! the cross-platform enum and `detect` entry point; the per-OS
+//! `statfs` call lives in the matching platform file. See
+//! docs/fs-type.md for the full rationale.
 
 use std::path::Path;
 

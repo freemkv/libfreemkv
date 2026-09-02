@@ -5,31 +5,8 @@
 //! The consumer's behaviour is supplied by a [`Sink`] implementation:
 //! `apply` is called once per item, `close` is called once at the end.
 //!
-//! The file-backed mux highway is built on this primitive. (An earlier
-//! sweep sink also used it; sweep moved to freemkv-engine in 1.6.0.)
-//!
-//! ## Cancellation and error semantics
-//!
-//! - Producer dropping the channel (via `Pipeline::finish` dropping
-//!   `tx`) signals end-of-stream; consumer flushes via `close()` and
-//!   returns its `Output`.
-//! - Consumer returning [`Flow::Stop`] also calls `close()` and
-//!   returns its `Output`. `send()` from the producer will then either
-//!   succeed (if the item already fit in the channel buffer) or fail
-//!   with `Err(item)` once the consumer has dropped its receiver.
-//! - Consumer returning `Err` from `apply` skips `close()` entirely;
-//!   the consumer keeps draining the channel so the producer never
-//!   blocks on a dead receiver, and the first error is propagated as
-//!   the `JoinHandle` result.
-//! - Consumer panic is converted into
-//!   [`Error::PipelineConsumerPanicked`] (the panic message is logged,
-//!   not embedded in the error value).
-//!
-//! ## Debug logging
-//!
-//! Set `FREEMKV_DEBUG=1` environment variable to enable verbose debug
-//! logging throughout the pipeline (channel sends/receives, backpressure,
-//! consumer lag detection). This is critical for diagnosing stalls.
+//! See docs/pipeline.md for full cancellation/error semantics and the
+//! `FREEMKV_DEBUG=1` debug-logging switch.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -41,50 +18,21 @@ use crossbeam_channel::{Sender, TrySendError, bounded};
 use crate::error::Error;
 use crate::halt::Halt;
 
-/// Deadline for [`Pipeline::finish_with_halt`]'s polling join.
-///
-/// 10 minutes is a backstop, not a normal timeout — the consumer is
-/// expected to drain in seconds. If we hit this, something is wedged
-/// inside a kernel call the consumer thread can't unwind from. It is
-/// deliberately long so a consuming application's own (shorter) stall
-/// watchdog gets the first chance to escalate; this join only fires
-/// when no such watchdog intervenes.
+// Deadline for finish_with_halt's polling join. See docs/pipeline.md —
+// it's a backstop for a wedged kernel call, not a normal timeout.
 pub const JOIN_TIMEOUT_SECS: u64 = 600;
 
-/// Short grace period after a halt or 10-min timeout fires in
-/// [`Pipeline::finish_with_halt`]. Most wedged consumers that are
-/// "about to return" when the halt fires will unblock within a few
-/// seconds (e.g. their bounded_syscall timeout returns and the consumer
-/// drains). Spinning here converts those into clean joins and releases
-/// the output file handle, at the cost of at most this much extra
-/// latency on a genuinely stuck consumer before we accept the leak.
+// Grace period after a halt/timeout fires in finish_with_halt, to let a
+// "nearly done" consumer join cleanly. See docs/pipeline.md.
 const FINISH_GRACE_SECS: u64 = 5;
 
-/// Halt-check cadence for the send loop. Producer blocks on
-/// [`crossbeam_channel::Sender::send_timeout`] for this slice — the
-/// kernel wakes it the instant the consumer drains a slot, so on the
-/// happy path there's no throughput cap from this primitive at all
-/// (the cap is whatever the underlying medium can sustain). When the
-/// consumer is genuinely wedged, the timeout fires every
-/// [`crate::halt::POLL_INTERVAL`] and the producer checks the halt
-/// token; that's the latency a stop request will observe.
-///
-/// Single source of truth lives in [`crate::halt::POLL_INTERVAL`]
-/// (also used by `bounded_syscall`). Aliased here for readability of
-/// the send/finish call sites below.
-///
-/// 0.21.7 replaced an old `std::sync::mpsc::sync_channel` + 50 ms
-/// `thread::sleep` polling loop that capped mux throughput at
-/// ~20 frames/sec ≈ 1 MB/s on saturated channels.
+// Halt-check cadence for the send loop; aliases crate::halt::POLL_INTERVAL.
+// See docs/pipeline.md — SEND_HALT_CHECK_INTERVAL.
 use crate::halt::POLL_INTERVAL;
 const SEND_HALT_CHECK_INTERVAL: Duration = POLL_INTERVAL;
 
-/// Check if verbose debug logging is enabled via FREEMKV_DEBUG env var.
-///
-/// The value cannot change mid-run, and this is called multiple times
-/// per item on the mux highway hot loop, so the env lookup (a String
-/// allocation behind the global env lock) is cached after the first
-/// call.
+// Cached FREEMKV_DEBUG=1 lookup — called per item on the mux hot loop,
+// so the env lock is paid once, not per call.
 pub fn debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -95,12 +43,9 @@ pub fn debug_enabled() -> bool {
     })
 }
 
-/// Turn a consumer-thread panic payload into the numeric
-/// [`Error::PipelineConsumerPanicked`] variant. The original panic
-/// message (the two stdlib formats `panic!` produces: `&str` /
-/// `String`) is logged at the join site for diagnostics — it is NOT
-/// baked into the error value, since the library carries no English
-/// text in its errors. Callers discriminate on the variant.
+// Converts a consumer-thread panic payload into Error::PipelineConsumerPanicked.
+// The panic message is logged here for diagnostics, not baked into the error
+// value. See docs/pipeline.md — consumer_panicked.
 fn consumer_panicked(payload: Box<dyn std::any::Any + Send>) -> Error {
     let msg = payload
         .downcast_ref::<&'static str>()
@@ -116,18 +61,9 @@ fn consumer_panicked(payload: Box<dyn std::any::Any + Send>) -> Error {
     Error::PipelineConsumerPanicked
 }
 
-/// Consumer lifecycle state, shared between the caller and the consumer thread.
-///
-/// A plain `AtomicBool` could not make "the caller abandons" and "the consumer
-/// commits to finalising" mutually exclusive: the consumer loaded the flag, the
-/// caller stored it, and the consumer then finalised the container anyway — the
-/// caller reporting the rip as interrupted while a fully finalised MKV (Cues
-/// written, Segment size patched) landed on disk, indistinguishable from a
-/// complete one. The two transitions are therefore a single compare-exchange each,
-/// out of [`state::RUNNING`]: whoever wins decides, and the loser observes the
-/// winner. (`ST_RUNNING` does not exist anywhere in the crate — the constants are
-/// `state::RUNNING` / `state::ABANDONED` / `state::CLOSING` below, and both
-/// compare-exchange sites that must stay in step with this argument name them.)
+// Consumer lifecycle state, shared between caller and consumer thread. Each
+// transition is a compare-exchange out of RUNNING so abandon vs. finalise
+// stays mutually exclusive. See docs/pipeline.md — `state` module.
 mod state {
     /// Consumer is running; neither side has committed yet.
     pub const RUNNING: u8 = 0;
@@ -140,19 +76,9 @@ mod state {
     pub const CLOSING: u8 = 2;
 }
 
-/// After a halt or deadline fires, spin-poll `handle.is_finished()` for
-/// `grace` before accepting the thread leak. This converts
-/// the common "nearly-done" consumer (whose own bounded_syscall just
-/// returned and is about to drop its output file) into a clean join,
-/// releasing the file handle without waiting the full grace period.
-///
-/// If the consumer is still running when the grace expires, the
-/// `abandoned` flag is set and the `JoinHandle` is dropped, detaching
-/// from the thread. The leaked consumer keeps running until its current
-/// kernel call returns, then — observing `abandoned` — exits WITHOUT
-/// calling `close()`, so it does not finalise an output the caller has
-/// already reported as failed. It does not unblock the in-flight
-/// syscall itself; that still returns on its own (or at process exit).
+// Spin-polls handle.is_finished() for `grace` before accepting the thread
+// leak, so a "nearly done" consumer still joins cleanly. See docs/pipeline.md
+// — finish_with_grace.
 fn finish_with_grace<R: Send + 'static>(
     handle: thread::JoinHandle<Result<R, Error>>,
     state: &Arc<AtomicU8>,
@@ -238,12 +164,9 @@ pub const WRITE_THROUGH_DEPTH: usize = 1;
 /// ([`Flow::Continue`]), or stop the pipeline early and run `close()`
 /// ([`Flow::Stop`]).
 ///
-/// `Stop` currently has no in-tree caller — sweep never returns it (it
-/// always processes the producer's full work-list before the channel
-/// is dropped), and the mux highway drains to EOF. The variant is part
-/// of the fixed `Sink` contract for early-stop consumers, so the
-/// `#[allow(dead_code)]` is intentional and permanent until such a
-/// consumer lands.
+/// `Stop` currently has no in-tree caller (sweep always processes its
+/// full work-list; the mux highway drains to EOF), but it's part of the
+/// fixed `Sink` contract, so `#[allow(dead_code)]` is intentional.
 pub enum Flow {
     Continue,
     #[allow(dead_code)]
@@ -279,54 +202,31 @@ pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
     tx: Sender<I>,
     handle: JoinHandle<Result<R, Error>>,
     /// Set by [`finish_with_grace`] when the grace period expires and the
-    /// consumer thread is about to be leaked. The consumer holds a clone
-    /// and polls it in its drain loop and before `close()`: once set, it
-    /// stops applying further items and — crucially — does NOT call
-    /// `close()`. For sinks that finalise an output file in `close()`
-    /// (e.g. the mux MKV writer's Cues/segment-header patch), this
-    /// prevents a leaked consumer from finalising an output the caller
-    /// has already abandoned and reported as failed. It cannot interrupt
-    /// a syscall the consumer is currently wedged in, but it does bound
-    /// the damage to "whatever write is already in flight" once that
-    /// syscall returns, instead of running on to a clean finalise.
-    ///
-    /// One of [`state::RUNNING`] / [`state::ABANDONED`] / [`state::CLOSING`];
-    /// both transitions are compare-exchanges so abandoning and finalising are
-    /// mutually exclusive rather than racing.
+    /// consumer thread is about to be leaked: it stops applying further
+    /// items and does NOT call `close()`, so a leaked consumer can't
+    /// finalise an output already reported as failed. One of
+    /// [`state::RUNNING`] / [`state::ABANDONED`] / [`state::CLOSING`];
+    /// both transitions are compare-exchanges so abandoning and
+    /// finalising are mutually exclusive rather than racing. See
+    /// docs/pipeline.md for the full race this prevents.
     state: Arc<AtomicU8>,
-    /// Set by the consumer the moment an `apply` returns `Err`. The consumer keeps
-    /// draining the channel after that (so the producer never blocks on a dead
-    /// receiver) — which means a producer watching only `send`'s return value
-    /// cannot tell the difference between "being consumed" and "being discarded
-    /// after a fatal write error", and would go on reading the whole remaining
-    /// disc before `finish()` finally surfaced the error. This flag is that
-    /// missing edge: [`Pipeline::send_with_halt`] fails fast on it, and
-    /// [`Pipeline::consumer_failed`] exposes it to producers that use plain
-    /// [`Pipeline::send`].
+    /// Set by the consumer the moment an `apply` returns `Err`, since the
+    /// consumer keeps draining afterwards (so the producer never blocks
+    /// on a dead receiver) and a producer watching only `send`'s return
+    /// value can't otherwise tell "consumed" from "discarded after a
+    /// fatal write error". [`Pipeline::send_with_halt`] fails fast on
+    /// this; [`Pipeline::consumer_failed`] exposes it to plain
+    /// [`Pipeline::send`] users.
     failed: Arc<AtomicBool>,
 }
 
 impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// Spawn the consumer thread with the given channel depth and
-    /// [`Sink`].
-    ///
-    /// The thread is named `freemkv-pipeline-consumer` so it shows up
-    /// distinctly in stack traces and `top -H`. Callers that want a
+    /// [`Sink`]. Named `freemkv-pipeline-consumer`; callers that want a
     /// more specific name should use [`Pipeline::spawn_named`] instead.
-    /// Returns an `Error::IoError` if the OS refuses the thread spawn
-    /// (resource exhaustion); callers already operate in fallible context, so
-    /// this is propagated rather than panicked.
-    ///
-    /// Inside this crate the only [`Pipeline::spawn_named`] caller is the mux
-    /// driver, which names its thread `freemkv-mux-consumer`. `Pipeline::spawn`
-    /// (this function, with the default name) is used only by the unit tests in
-    /// this module.
-    ///
-    /// This paragraph twice named a caller that had left the crate: first
-    /// `disc::patch`, then Sweep and its `freemkv-sweep-consumer` thread. Both
-    /// went to freemkv-engine with the recovery passes in 1.6.0, and each in
-    /// turn sent readers hunting a component that is not here. Name callers
-    /// that live in THIS crate, or none.
+    /// Returns `Error::IoError` if the OS refuses the thread spawn
+    /// (resource exhaustion) rather than panicking. See docs/pipeline.md
+    /// for which in-crate callers use this vs. `spawn_named`.
     pub fn spawn<S: Sink<I, Output = R>>(depth: usize, sink: S) -> Result<Self, Error> {
         Self::spawn_named("freemkv-pipeline-consumer", depth, sink)
     }
@@ -512,12 +412,10 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// the item back if the consumer thread is gone (panicked or
     /// already returned).
     ///
-    /// After the consumer returns [`Flow::Stop`], `send` will silently
-    /// buffer items into the channel until the channel fills, then
-    /// return `Err(item)` once the consumer has dropped its receiver.
-    /// Producers that need to stop pushing on `Stop` should track an
-    /// independent signal (e.g. `Halt`) — `send` alone is not the
-    /// notification edge.
+    /// After [`Flow::Stop`], `send` silently buffers until the channel
+    /// fills, then returns `Err(item)` once the consumer drops its
+    /// receiver — producers that need to stop pushing on `Stop` should
+    /// track an independent signal (e.g. `Halt`) instead.
     pub fn send(&self, item: I) -> Result<(), I> {
         // Only timestamp when debug tracing is on — `send` runs per
         // item on the mux highway hot path.
@@ -574,39 +472,15 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         self.tx.try_send(item)
     }
 
-    /// Halt-aware bounded variant of [`Pipeline::send`].
-    ///
-    /// Uses [`crossbeam_channel::Sender::send_timeout`] so the producer
-    /// thread BLOCKS on consumer drain (kernel-wakeup) rather than
-    /// polling. The timeout slice is just the halt-observation cadence
-    /// ([`SEND_HALT_CHECK_INTERVAL`]) — on the happy path the producer
-    /// wakes the instant the consumer drains a slot, so there is no
-    /// throughput cap from this primitive at any medium speed.
-    ///
-    /// Returns:
-    ///
-    /// - `Ok(())` once the item lands in the channel.
-    /// - `Err(item)` if the consumer disconnected, the halt fired, or
-    ///   the deadline elapsed — the caller gets the item back so it
-    ///   can decide whether to drop it, route it elsewhere, or unwind.
-    ///
-    /// Use this in producer threads that have a `Halt` token threaded
-    /// through (mux, sweep, patch). Plain [`Pipeline::send`] is
-    /// preserved for callers that don't (yet) plumb halt through.
-    ///
-    /// Unlike [`Pipeline::send`], this never blocks the producer
-    /// thread inside an unkillable `mpsc::send` — if the consumer is
-    /// wedged inside an unkillable syscall, the producer can still
-    /// observe `/api/stop` and unwind within
+    /// Halt-aware bounded variant of [`Pipeline::send`]. Uses
+    /// [`crossbeam_channel::Sender::send_timeout`] so the producer
+    /// BLOCKS on consumer drain rather than polling, in slices of
     /// [`SEND_HALT_CHECK_INTERVAL`].
-    /// NOT a `foo_with_X` variant of [`Pipeline::send`], despite the name.
-    /// The two encode OPPOSITE policies on the same event, each with its own
-    /// test: after the consumer's `apply` has failed, `send` still succeeds
-    /// (the consumer keeps draining, so the channel accepts the item), while
-    /// this one hands the item straight back — so a producer does not read an
-    /// hour of disc for a write that died on the first frame. Collapsing them
-    /// into one Option-parameterised method deletes one of those behaviours;
-    /// it was tried and `apply_error_drains_then_propagates` caught it.
+    ///
+    /// Returns `Ok(())` once the item lands in the channel, or
+    /// `Err(item)` if the consumer disconnected, the halt fired, or the
+    /// deadline elapsed. NOT a `foo_with_X` variant of
+    /// [`Pipeline::send`] despite the name — see docs/pipeline.md.
     pub fn send_with_halt(&self, item: I, halt: &Halt, deadline: Duration) -> Result<(), I> {
         use crossbeam_channel::SendTimeoutError;
         let end = Instant::now() + deadline;
@@ -690,36 +564,14 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     }
 
     /// Halt-aware, deadline-bounded variant of [`Pipeline::finish`].
+    /// Drops the producer-side channel, then polls
+    /// `JoinHandle::is_finished()`, checking the optional [`Halt`]
+    /// token and the [`JOIN_TIMEOUT_SECS`] deadline between slices.
     ///
-    /// Drops the producer-side channel (same as `finish`) and then
-    /// polls `JoinHandle::is_finished()` on a 250 ms cadence. Between
-    /// slices, checks (1) the optional [`Halt`] token and (2) the
-    /// [`JOIN_TIMEOUT_SECS`] deadline. Returns:
-    ///
-    /// - `Ok(R)` on a clean consumer exit.
-    /// - One of three numeric error variants for the wedge cases:
-    ///   - [`Error::Halted`] — halt fired while waiting.
-    ///   - [`Error::PipelineJoinTimeout`] — `JOIN_TIMEOUT_SECS` elapsed.
-    ///   - [`Error::PipelineConsumerPanicked`] — same as `finish()`.
-    ///
-    /// In the `halted` and `timed out` branches the consumer thread is
-    /// intentionally leaked after a short grace period — exactly the
-    /// same trade-off the `bounded_syscall` primitive makes. A
-    /// [`FINISH_GRACE_SECS`] spin-poll is attempted first so that
-    /// consumers that are "nearly done" (e.g. their own bounded syscall
-    /// just timed out and is about to unblock) can join cleanly and
-    /// release their output file handle. Only if the consumer is still
-    /// running after the grace period does the leak occur.
-    ///
-    /// Plain [`Pipeline::finish`] is preserved for callers without a
-    /// halt-token plumbed through; that path still blocks indefinitely
-    /// on `join()`, matching pre-0.20.8 behaviour.
-    /// Also not a `foo_with_X` variant: [`Pipeline::finish`] joins and waits
-    /// however long the consumer needs, while this one gives up after
-    /// `JOIN_TIMEOUT_SECS` and reports halted. Which is right depends on
-    /// whether the caller has a user waiting to cancel — the mux driver does
-    /// and uses this; the unit tests do not and use the plain join. Merging
-    /// them means picking one of those policies for both.
+    /// Returns `Ok(R)` on a clean exit, or one of [`Error::Halted`],
+    /// [`Error::PipelineJoinTimeout`], [`Error::PipelineConsumerPanicked`]
+    /// for the wedge cases (leaks the consumer after a grace spin). NOT
+    /// a `foo_with_X` variant of [`Pipeline::finish`] — see docs/pipeline.md.
     pub fn finish_with_halt(self, halt: Option<&Halt>) -> Result<R, Error> {
         let Pipeline {
             tx,
@@ -1004,12 +856,9 @@ mod tests {
         );
     }
 
-    /// Never-completing sink — `apply` blocks until cancelled. Signals
-    /// `started` once it has consumed its first item so the test
-    /// driver knows the consumer thread is wedged in `apply` (and
-    /// will no longer drain the channel). Used to drive the
-    /// halt/timeout paths of `send_with_halt` and `finish_with_halt`
-    /// without depending on real I/O.
+    // Never-completing sink: `apply` blocks until cancelled, signalling
+    // `started` so tests can sync on the consumer being wedged. Drives the
+    // halt/timeout paths of send_with_halt / finish_with_halt.
     struct NeverDrainsSink {
         cancel: Arc<std::sync::atomic::AtomicBool>,
         started: Arc<std::sync::atomic::AtomicBool>,
@@ -1186,14 +1035,8 @@ mod tests {
 
     // ── Added hardening tests ───────────────────────────────────────
 
-    /// A sink that records the exact order of items it receives, so we
-    /// can prove the channel is FIFO (no reordering). `close` returns
-    /// the recorded vector.
-    /// Zero items sent: closing the pipeline immediately must still
-    /// call `close()` exactly once and return its Output. The consumer
-    /// loop's `while let Ok = rx.recv()` exits on the dropped tx with
-    /// zero iterations, then runs `sink.close()` (line 268). Mutation:
-    /// moving close() inside the loop would never call it here.
+    // Zero items sent must still call close() exactly once.
+    // See docs/pipeline.md — empty_pipeline_still_calls_close.
     #[test]
     fn empty_pipeline_still_calls_close() {
         let close_called = Arc::new(AtomicUsize::new(0));
@@ -1214,11 +1057,8 @@ mod tests {
         assert_eq!(close_called.load(Ordering::SeqCst), 1);
     }
 
-    /// `close()` returning Err must surface that error from `finish`,
-    /// not be swallowed. Doc lines 18-21: on a clean producer drop the
-    /// consumer "flushes via close() and returns its Output" — and an
-    /// Err Output is a valid return. Mutation: if the consumer ignored
-    /// close()'s Result and returned Ok, this fails.
+    // close() returning Err must surface from finish(), not be swallowed.
+    // See docs/pipeline.md — close_error_propagates_from_finish.
     #[test]
     fn close_error_propagates_from_finish() {
         struct CloseFails;
@@ -1237,12 +1077,8 @@ mod tests {
         assert!(matches!(res, Err(Error::DecryptFailed)));
     }
 
-    /// `try_send` must report `Full` when the channel is saturated and
-    /// the consumer is wedged, NOT block. Doc lines 325-329: "If the
-    /// channel is full ... the item is returned in Err." We wedge the
-    /// consumer on the first item (depth=1), fill the one buffer slot,
-    /// then try_send must return Full immediately. Mutation: routing
-    /// try_send to the blocking `send` would hang.
+    // try_send must report Full when saturated and the consumer is wedged,
+    // NOT block. See docs/pipeline.md — try_send_reports_full_when_saturated.
     #[test]
     fn try_send_reports_full_when_saturated() {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1269,11 +1105,8 @@ mod tests {
         let _ = pipe.finish();
     }
 
-    /// `try_send` must report `Disconnected` once the consumer thread
-    /// has exited (here via a panic). The item is handed back inside
-    /// the `Disconnected` variant. Mutation: if try_send mapped
-    /// Disconnected→Full it would mis-signal a permanently-dead
-    /// consumer as transient backpressure.
+    // try_send must report Disconnected once the consumer has exited (via
+    // panic here). See docs/pipeline.md — try_send_reports_disconnected.
     #[test]
     fn try_send_reports_disconnected_after_consumer_gone() {
         let prev = std::panic::take_hook();
@@ -1302,12 +1135,8 @@ mod tests {
         );
     }
 
-    /// Plain `send` must hand the item back via `Err(item)` once the
-    /// consumer has gone away (panic). Doc lines 276-280: "Returns the
-    /// item back if the consumer thread is gone." The first send may
-    /// race the panic, so we loop until one fails and assert the
-    /// returned item identity. Mutation: if `send`'s Err arm returned a
-    /// different/default item, the identity assert fails.
+    // Plain send must hand the item back via Err(item) once the consumer
+    // has panicked. See docs/pipeline.md — send_returns_item_after_panic.
     #[test]
     fn send_returns_item_after_consumer_panicked() {
         let prev = std::panic::take_hook();
@@ -1332,13 +1161,8 @@ mod tests {
         );
     }
 
-    /// `send_with_halt` must return the exact item via `Err(item)` when
-    /// the consumer has disconnected (the `Disconnected` arm, lines
-    /// 395-403). We panic the consumer, wait for it to fully exit, then
-    /// send_with_halt with a live halt + long deadline — the only way
-    /// it can return Err is the disconnect arm. Mutation: if that arm
-    /// returned a default item instead of `returned`, the identity
-    /// assert fails.
+    // send_with_halt must return the exact item via Err(item) on the
+    // Disconnected arm. See docs/pipeline.md — send_with_halt_on_disconnect.
     #[test]
     fn send_with_halt_returns_item_on_disconnect() {
         let prev = std::panic::take_hook();
@@ -1364,11 +1188,8 @@ mod tests {
         assert!(!halt.is_cancelled(), "halt must not have been the cause");
     }
 
-    /// `send_with_halt` with a pre-cancelled halt must return the item
-    /// immediately without attempting to enqueue. Pins the pre-check at
-    /// line 365 (`if halt.is_cancelled()`). Mutation: removing that
-    /// pre-check would still likely deliver into an open channel (Ok),
-    /// flipping this assertion.
+    // A pre-cancelled halt must return the item immediately without
+    // attempting to enqueue (pins the is_cancelled() pre-check).
     #[test]
     fn send_with_halt_precancelled_returns_item_without_send() {
         let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, SumSink { total: 0 }).expect("spawn");
@@ -1384,16 +1205,9 @@ mod tests {
         assert_eq!(total, 0, "item was enqueued despite pre-cancelled halt");
     }
 
-    /// `finish_with_halt(None)` with a wedged consumer and NO halt
-    /// token must NOT return early — it must keep polling until the
-    /// JOIN_TIMEOUT_SECS deadline (it cannot observe a halt that was
-    /// never supplied). We can't wait 10 minutes, so we assert the
-    /// weaker but still-meaningful property: with a None halt and a
-    /// wedged consumer, finish_with_halt does not return within a short
-    /// window (it is genuinely blocked, not spuriously returning
-    /// Halted). Then we release the consumer and confirm it returns Ok.
-    /// Mutation: if the None branch erroneously treated None as
-    /// "cancelled", it would return Halted immediately and this fails.
+    // finish_with_halt(None) + wedged consumer must NOT spuriously return
+    // Halted (no halt supplied to observe). See docs/pipeline.md —
+    // finish_with_halt_none_does_not_spuriously_halt.
     #[test]
     fn finish_with_halt_none_does_not_spuriously_halt() {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1433,11 +1247,8 @@ mod tests {
         );
     }
 
-    /// Multiple `Flow::Stop` returns: once a sink returns Stop, the
-    /// consumer must stop calling `apply` for all subsequent items
-    /// (lines 220-225 drain without applying) and call `close` exactly
-    /// once. We send far more items than the Stop index and assert
-    /// apply count never exceeds the Stop point and close ran once.
+    // Once a sink returns Stop, the consumer must stop calling apply for
+    // all subsequent items and call close() exactly once.
     #[test]
     fn stop_halts_further_apply_calls() {
         let seen = Arc::new(AtomicUsize::new(0));
@@ -1467,19 +1278,8 @@ mod tests {
 
     // ── Bug-fix regression tests ────────────────────────────────────────
 
-    /// Regression for the "consumer thread / output-file leak on halt"
-    /// fix. When the halt fires but the consumer finishes WITHIN the
-    /// grace period, `finish_with_halt` must join cleanly and return `Ok`
-    /// — not leak the thread or return `Err(Halted)`.
-    ///
-    /// Setup: a sink that sleeps briefly (well inside `FINISH_GRACE_SECS`)
-    /// after the producer drops the channel. We fire the halt immediately,
-    /// so `finish_with_halt` enters the grace spin. The consumer finishes
-    /// during the grace window and the result is `Ok`.
-    ///
-    /// Without the fix (old behaviour: immediate leak on halt), this
-    /// would have returned `Err(Halted)` and the SumSink total would
-    /// be unobservable.
+    // Regression: halt fires but consumer finishes WITHIN the grace period —
+    // finish_with_halt must join cleanly and return Ok. See docs/pipeline.md.
     #[test]
     fn finish_with_halt_joins_cleanly_when_consumer_finishes_in_grace() {
         // A sink that adds a short artificial delay in `close` to
@@ -1537,22 +1337,8 @@ mod tests {
         );
     }
 
-    /// Regression for the "leaked consumer finalises an abandoned output"
-    /// bug. When the grace period expires and the consumer is leaked, the
-    /// consumer — once its wedged `apply` syscall returns — must observe
-    /// the abandonment flag and exit WITHOUT calling `close()`. For the
-    /// mux writer, `close()` is where the MKV is finalised (Cues +
-    /// segment-header patch); running it on a file the caller already
-    /// reported as failed is the write race this fix prevents.
-    ///
-    /// Setup: a sink whose `apply` blocks until released (simulating a
-    /// wedged write syscall) and records whether `close()` ran. We fire
-    /// the halt, let `finish_with_halt` spin through the full grace period
-    /// and leak the thread, THEN release the wedged `apply`. The consumer
-    /// drains to EOF (tx already dropped) and must skip `close()`.
-    ///
-    /// Without the fix, the leaked consumer would fall through to
-    /// `sink.close()` and `closed` would flip to true.
+    // Regression: a leaked consumer must not finalise an abandoned output —
+    // once released it must skip close(). See docs/pipeline.md.
     #[test]
     fn leaked_consumer_skips_close_after_abandonment() {
         struct WedgeThenRecord {
@@ -1617,12 +1403,8 @@ mod tests {
         );
     }
 
-    /// Companion to the above: the abandonment guard must NOT fire on the
-    /// normal halt path where the consumer finishes inside the grace
-    /// window. There, `close()` runs and the output is finalised as
-    /// usual. (Covered for the value-return case by
-    /// `finish_with_halt_joins_cleanly_when_consumer_finishes_in_grace`;
-    /// this one asserts `close()` specifically ran.)
+    // Companion to the above: the abandonment guard must NOT fire when the
+    // consumer finishes inside the grace window. See docs/pipeline.md.
     #[test]
     fn consumer_finishing_in_grace_still_calls_close() {
         struct ReleasableClose {
@@ -1678,11 +1460,8 @@ mod tests {
         );
     }
 
-    /// Regression: `finish_with_halt` with no halt token and a consumer
-    /// that completes normally must still return `Ok` (the None-halt
-    /// polling path is unchanged by the grace-period fix). This is the
-    /// pre-existing happy-path test reproduced with an explicit timing
-    /// floor to guard against spurious early returns.
+    // Regression: finish_with_halt with no halt token must still return Ok
+    // on normal completion (None-halt path unchanged by the grace fix).
     #[test]
     fn finish_with_halt_no_halt_token_normal_completion() {
         let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, SumSink { total: 0 }).expect("spawn");
@@ -1693,12 +1472,8 @@ mod tests {
         assert!(matches!(res, Ok(190)), "expected Ok(190), got {res:?}");
     }
 
-    /// A fatal `apply` error must become visible to the PRODUCER, not only to
-    /// `finish()`. The consumer keeps draining after the error (so the producer
-    /// never blocks on a dead receiver), which meant every `send_with_halt`
-    /// returned `Ok` for the rest of the run: on a 60 GB mkv:// mux that hit
-    /// ENOSPC on the first frame, the mux driver read the entire remaining title —
-    /// an hour of optical-drive time — before learning the write had died.
+    // A fatal apply error must become visible to the PRODUCER, not only to
+    // finish() — see docs/pipeline.md for the ENOSPC-on-60GB-mux scenario.
     #[test]
     fn send_with_halt_fails_fast_once_apply_has_failed() {
         struct FailFirst {
@@ -1753,14 +1528,8 @@ mod tests {
         );
     }
 
-    /// The abandon/finalise race. A consumer that has ALREADY committed to
-    /// `close()` when the grace period expires cannot be stopped — the finalise is
-    /// happening — so the caller must wait for its result instead of reporting the
-    /// output as un-finalised. With a plain flag the consumer read it as clear, the
-    /// caller then stored it, and the caller returned `Err(Halted)`
-    /// (`completed = false`) while a fully finalised MKV (Cues written, Segment
-    /// size patched) landed on disk — a truncated rip indistinguishable from a
-    /// complete one.
+    // The abandon/finalise race: a consumer already committed to close() when
+    // grace expires must be waited for, not abandoned. See docs/pipeline.md.
     #[test]
     fn abandon_loses_to_a_close_already_committed() {
         let state = Arc::new(AtomicU8::new(state::RUNNING));

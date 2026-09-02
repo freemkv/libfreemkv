@@ -11,15 +11,9 @@ use super::{WriteSeek, ebml};
 /// `track_table` maps Matroska TrackNumbers onto `DiscTitle::streams` indices.
 type MkvHeaderResult = io::Result<(crate::disc::DiscTitle, Vec<(u16, Vec<u8>)>, i64, TrackTable)>;
 
-/// Skip `n` bytes on a forward-only reader (no Seek required).
-///
-/// A skip that runs out of input before `n` bytes is a TRUNCATED element, and is
-/// reported the same way `ebml::read_binary_val` reports a truncated body: as
-/// `MkvSourceInvalid`. Discarding `io::copy`'s byte count instead made a skip
-/// that hit EOF look like a success, so one corrupt size field mid-Clusters
-/// drained the rest of the file, the next element header raised
-/// `UnexpectedEof`, and `Stream::read` mapped that to `Ok(None)` — half the
-/// title missing, `errors = 0`, `completed = true`.
+// Skip `n` bytes on a forward-only reader (no Seek required). A short skip
+// is a TRUNCATED element, reported as `MkvSourceInvalid` (not a silent `Ok`).
+// See docs/mkvstream.md#skip-bytes for why the byte count is checked.
 fn skip_bytes(r: &mut impl Read, n: u64) -> io::Result<()> {
     let skipped = io::copy(&mut r.take(n), &mut io::sink())?;
     if skipped != n {
@@ -28,15 +22,11 @@ fn skip_bytes(r: &mut impl Read, n: u64) -> io::Result<()> {
     Ok(())
 }
 
-// ── Sanity caps for untrusted EBML element sizes ──────────────
-// Sizes are cast to `usize` for alloc/read; a corrupt container can claim a multi-GB
-// element (OOM) or one wider than 8 bytes (panic) — every size is checked against a cap.
+// ── Sanity caps for untrusted EBML element sizes: cast to `usize` for
+// alloc/read, so every size is checked against a cap first (OOM/panic guard).
+// See docs/mkvstream.md#ebml-size-caps.
 
-/// Largest accepted SIMPLE_BLOCK payload. A block is a small vint track
-/// header + 2-byte rel-ts + 1-byte flags + one frame of elementary data.
-/// UHD HEVC keyframes run a few MB; 64 MiB is generously above any real
-/// single-frame block while still bounding a hostile allocation.
-const MAX_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
+const MAX_BLOCK_SIZE: u64 = 64 * 1024 * 1024; // largest accepted SIMPLE_BLOCK payload
 /// Largest accepted CODEC_PRIVATE payload. hvcC/avcC/setup blobs are a
 /// few KB in practice; 16 MiB is far above any legitimate value.
 const MAX_CODEC_PRIVATE: u64 = 16 * 1024 * 1024;
@@ -98,16 +88,13 @@ struct ReadState {
     additions_dropped_bytes: u64,
 }
 
-/// Safety cap on frames buffered before the first video frame triggers muxer
-/// construction. The first video frame normally arrives within the first few
-/// frames, so this is only a backstop for a pathological audio-only-prefix
-/// stream — past it we build with no measured field order (logged) rather than
-/// buffer unbounded.
+// Safety cap on frames buffered before the first video frame triggers muxer
+// construction (backstop for a pathological audio-only-prefix stream); past
+// it we build with no measured field order (logged) rather than buffer forever.
 const MAX_PENDING_FRAMES: usize = 4096;
-/// Companion byte cap on the same pending buffer. The frame count alone does not
-/// bound memory: frames are arbitrarily large, and a UHD video frame runs to a
-/// few hundred KB, so 4096 of them is over a gigabyte. 64 MiB is far more than
-/// the handful of frames a real audio-only prefix produces, and finite.
+// Companion byte cap: frame count alone doesn't bound memory (a UHD frame is
+// hundreds of KB, so 4096 of them exceeds a gigabyte). Far above any real
+// audio-only prefix, and finite.
 const MAX_PENDING_BYTES: usize = 64 << 20;
 
 enum Mode {
@@ -115,13 +102,9 @@ enum Mode {
     Read(ReadState),
 }
 
-/// MKV write state with DEFERRED muxer construction. The track header (which
-/// carries `FieldOrder`) is written only once the first coded picture is in
-/// hand, so the primary video track's field order is set to the parser's
-/// MEASURED value the first time — never a guessed default a later pass would
-/// rewrite. The muxer still only ever muxes the track it is *given*; this stream
-/// is the adapter that routes the parser's measured field order onto that track
-/// before construction.
+// MKV write state with DEFERRED muxer construction: the track header
+// (carrying `FieldOrder`) is written only once the first coded picture is
+// in hand, so field order is the parser's MEASURED value, never a guess.
 enum WriteMode {
     /// Header not written yet: buffering frames until the first video frame.
     Pending(Box<PendingMux>),
@@ -168,11 +151,9 @@ pub struct MkvStream {
     mvc: Option<MvcMerge>,
 }
 
-/// Largest number of base frames held awaiting their PTS-matching dependent AU
-/// before the oldest is flushed unpaired (a plain Block). The SSIF interleaves
-/// base and dependent access units per unit, so a base's dependent normally
-/// arrives within one or two frames; this window only bounds memory/latency for
-/// a stream where the pairing drifts.
+// Base frames held awaiting their PTS-matching dependent AU before the oldest
+// flushes unpaired. SSIF interleaves base/dependent per unit so pairing is
+// normally 1-2 frames deep; this only bounds memory if pairing drifts.
 const MVC_PAIR_WINDOW: usize = 32;
 
 /// A base-view frame (track already remapped to the muxer's base track index)
@@ -207,11 +188,9 @@ struct MvcMerge {
 }
 
 impl MvcMerge {
-    /// Ingest one incoming frame; returns `(frame, additional)` pairs ready to
-    /// hand to the muxer, in emit order. Base frames buffer briefly to pair with
-    /// their dependent by PTS; the dependent stream produces no frames of its own
-    /// (it becomes `BlockAdditional`); all other streams pass straight through
-    /// with their track index remapped.
+    // Ingest one frame; returns `(frame, additional)` pairs ready for the muxer,
+    // in emit order. Base frames buffer to pair with their dependent by PTS; the
+    // dependent produces no frame of its own (folds into `BlockAdditional`).
     fn ingest(
         &mut self,
         frame: &crate::pes::PesFrame,
@@ -320,11 +299,9 @@ fn emit_to_muxer(
     )
 }
 
-/// Scan a length-prefixed (4-byte big-endian) H.264 NAL stream for the first
-/// subset SPS (NAL type 15) and first PPS (NAL type 8) — the two parameter sets
-/// that populate the `mvcC` MVCDecoderConfigurationRecord. Returns
-/// `Some((subset_sps, pps))` only when BOTH are found; `None` otherwise (the
-/// serializer then emits no mvcC mapping and logs it).
+// Scan a length-prefixed H.264 NAL stream for the first subset SPS (type 15)
+// and PPS (type 8) that populate the `mvcC` record. `Some` only when both are
+// found; `None` otherwise (serializer then emits no mvcC mapping and logs it).
 fn extract_mvc_params(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut subset_sps: Option<Vec<u8>> = None;
     let mut pps: Option<Vec<u8>> = None;
@@ -458,11 +435,9 @@ impl MkvStream {
         })
     }
 
-    /// Build the muxer from the pending state, setting the primary video track's
-    /// `FieldOrder` from the MEASURED `coding` of the first coded picture (when
-    /// available), then write the header and replay buffered frames. A no-op if
-    /// not pending. The muxer only ever muxes the track it is given — this routes
-    /// the parser's measured value onto that track first.
+    // Build the muxer from the pending state, setting the primary video track's
+    // `FieldOrder` from the MEASURED `coding` of the first coded picture, then
+    // write the header and replay buffered frames. No-op if not pending.
     fn activate(
         &mut self,
         coding: Option<crate::mux::codec::PictureInfo>,
@@ -531,11 +506,9 @@ impl MkvStream {
         Ok(())
     }
 
-    /// Emit one frame (track index already muxer-relative) with an optional MVC
-    /// dependent-view `BlockAdditional`, honouring the deferred-activation
-    /// machinery: the first video frame triggers muxer construction (its coding
-    /// sets FieldOrder); earlier frames buffer. `additional` is `None` for every
-    /// non-3D frame and for the 3D base frames that had no paired dependent.
+    // Emit one frame (track index already muxer-relative) with an optional MVC
+    // dependent-view `BlockAdditional`: the first video frame triggers muxer
+    // construction (its coding sets FieldOrder); earlier frames buffer.
     fn emit(&mut self, frame: &crate::pes::PesFrame, additional: Option<&[u8]>) -> io::Result<()> {
         match &mut self.mode {
             Mode::Read(_) => return Err(crate::error::Error::StreamReadOnly.into()),
@@ -602,20 +575,9 @@ impl MkvStream {
     }
 }
 
-/// Set a video track's `FieldOrder` from the MEASURED coding of the first coded
-/// picture — the parser's value, the first time, never a guess.
-///
-/// A progressive track — or a progressive picture on an interlaced-flagged track
-/// — has no field order (left UNDETERMINED — expected); the latter case ALSO
-/// clears the track's `interlaced` flag, since the declared scan type came from
-/// the IFO/MPLS resolution and the measurement supersedes it. An INTERLACED
-/// track that reaches here WITH a video picture but no measured field order is a
-/// parser/source gap (MPEG-2 carries `top_field_first` on every interlaced
-/// picture, so it should never be missing): LOG it loudly so the source can be
-/// debugged, and leave UNDETERMINED — a muxer never fabricates a source fact.
-/// `video_picture_seen == false` (an empty title finalized with no frames, or a
-/// cap-triggered build that never saw the video frame) is NOT a defect — the
-/// missing coding is expected there, so log it quietly.
+// Set a video track's `FieldOrder` from the MEASURED coding of the first coded
+// picture — the parser's value, never a guess. See
+// docs/mkvstream.md#apply-coding-to-track for the UNDETERMINED/logging cases.
 fn apply_coding_to_track(
     track: &mut MkvTrack,
     coding: Option<crate::mux::codec::PictureInfo>,
@@ -900,15 +862,9 @@ impl crate::pes::Stream for MkvStream {
         true // MKV has all headers upfront in the EBML header
     }
 
-    /// Count of `BlockAdditions` subtrees dropped on read-back — each one a
-    /// per-frame side payload (a Blu-ray 3D MVC dependent-view access unit for a
-    /// 3D rip written by this crate) that the PES frame model cannot carry.
-    ///
-    /// Reported through the same channel as a disc-read skip event because it is
-    /// the same kind of fact: input bytes that did not reach the output. A 3D
-    /// re-mux losing an eye is a degraded outcome, and a degraded outcome is
-    /// never silent. `0` for the write side and for any source with no
-    /// `BlockAdditions`.
+    // Count of `BlockAdditions` subtrees dropped on read-back (e.g. a 3D MVC
+    // dependent-view AU the PES frame model can't carry). Reported like a
+    // disc-read skip: `0` for write side / sources with no `BlockAdditions`.
     fn errors(&self) -> u64 {
         match self.mode {
             Mode::Read(ref rs) => rs.additions_dropped,
@@ -916,10 +872,8 @@ impl crate::pes::Stream for MkvStream {
         }
     }
 
-    /// Cumulative `BlockAdditions` bytes dropped on read-back — see
-    /// [`errors`](crate::pes::Stream::errors). Counts the whole skipped subtree (the
-    /// `BlockAdditional` payload plus a handful of bytes of EBML framing above
-    /// it), so it is an upper bound on the payload proper.
+    // Cumulative `BlockAdditions` bytes dropped on read-back; counts the whole
+    // skipped subtree (payload + EBML framing), an upper bound on the payload.
     fn lost_bytes(&self) -> u64 {
         match self.mode {
             Mode::Read(ref rs) => rs.additions_dropped_bytes,
@@ -1053,10 +1007,9 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
 /// Largest valid 13-bit MPEG-TS PID.
 const MAX_TS_PID: u32 = 0x1FFF;
 
-/// Map an MKV track number to a synthetic BD-TS PID, rejecting any value that
-/// would overflow the 13-bit PID space. Track 1 is the video PID (0x1011);
-/// every other track maps to `0x1100 + (tnum - 2)`. Computed in `u32` so the
-/// addition can never wrap, unlike the prior `u16` arithmetic.
+// Map an MKV track number to a synthetic BD-TS PID, rejecting overflow of the
+// 13-bit PID space. Track 1 -> video PID (0x1011); others -> 0x1100+(tnum-2),
+// computed in `u32` so the addition can never wrap.
 fn ts_pid_for_track(tnum: u16) -> io::Result<u16> {
     // MKV track numbers are 1-based; 0 is invalid (and would underflow the
     // `tnum - 2` below).
@@ -1265,20 +1218,9 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     Ok((stream, tnum, codec_priv, default_dur))
 }
 
-/// Read-side map from Matroska TrackNumber to the index of the corresponding
-/// entry in `DiscTitle::streams`.
-///
-/// RFC 9559 §5.1.4.1.1 constrains TrackNumber only to be non-zero ("range: not
-/// 0"); NOTHING in the specification requires the numbers to be `1..=N`, to be
-/// contiguous, or to appear in ascending TrackEntry order. `parse_track` also
-/// DROPS every TrackEntry whose TrackType this crate cannot carry (anything but
-/// 1/2/17 — e.g. a TrackType 18 buttons track), so the TrackNumber space and the
-/// stream vector diverge for perfectly legal inputs.
-///
-/// The reader used to derive the stream index as `TrackNumber - 1`, which routes
-/// blocks to the WRONG stream (parsed by the wrong codec parser) or drops them
-/// entirely. This table records the real TrackNumber for each retained stream,
-/// in stream order, and is the only thing allowed to translate between the two.
+// Read-side map from Matroska TrackNumber to the index of the corresponding
+// entry in `DiscTitle::streams` (TrackNumber is NOT guaranteed `1..=N`). See
+// docs/mkvstream.md#track-table for why `TrackNumber - 1` is unsafe here.
 #[derive(Default)]
 struct TrackTable {
     /// Matroska TrackNumber of `DiscTitle::streams[i]`, indexed by `i`.
@@ -1331,14 +1273,9 @@ const LACING_XIPH: u8 = 0b01;
 const LACING_FIXED: u8 = 0b10;
 const LACING_EBML: u8 = 0b11;
 
-/// Read one unsigned EBML VINT (RFC 8794 §4.4) from the head of `d`, returning
-/// `(value, octet width)`. `None` when the first octet has no VINT_MARKER (a
-/// width above 8 octets, which Matroska lacing never uses) or the value is
-/// truncated.
-///
-/// Distinct from `block_vint`: that one is the *track number* decoder and caps
-/// at 4 octets with a "treat as track 0" fallback, whereas lacing sizes need the
-/// full 1..=8 range and must be able to report malformedness.
+// Read one unsigned EBML VINT (RFC 8794 §4.4) from `d`'s head, returning
+// `(value, octet width)`. `None` on truncation or width > 8 octets. Unlike
+// `block_vint` (4-octet track-number decoder), lacing needs the full 1..=8.
 fn lace_vint(d: &[u8]) -> Option<(u64, usize)> {
     let first = *d.first()?;
     if first == 0 {
@@ -1366,19 +1303,9 @@ fn lace_svint(d: &[u8]) -> Option<(i64, usize)> {
     Some(((v as i64) - bias, width))
 }
 
-/// Split the body of a LACED (Simple)Block — the bytes after the flags octet,
-/// beginning with the Lacing Head — into its individual frame payloads, per
-/// RFC 9559 §10.3.
-///
-/// `lacing` is the 2-bit LACING field value (`LACING_XIPH`, `LACING_EBML` or
-/// `LACING_FIXED`). Returns `None` when the lacing header is malformed — the
-/// frame boundaries are then unknown, and the caller MUST reject the block
-/// rather than hand a concatenation of frames plus lacing header downstream as
-/// though it were one frame (which is exactly the silent corruption this
-/// function exists to end).
-///
-/// The Lacing Head is "number of frames in the lace minus 1" on one octet, so
-/// the frame count is bounded by 256 and no allocation here is attacker-scaled.
+// Split a LACED (Simple)Block's body into frame payloads per RFC 9559 §10.3.
+// `None` on a malformed lacing header — caller MUST reject the block, not
+// treat it as one frame. See docs/mkvstream.md#split-lacing.
 pub(crate) fn split_lacing(lacing: u8, body: &[u8]) -> Option<Vec<&[u8]>> {
     let (&count_minus_one, rest) = body.split_first()?;
     let n = count_minus_one as usize + 1;
@@ -1456,22 +1383,9 @@ pub(crate) fn split_lacing(lacing: u8, body: &[u8]) -> Option<Vec<&[u8]>> {
     Some(out)
 }
 
-/// Parse a (Simple)Block payload into zero or more PesFrames.
-///
-/// Zero frames means the block was SKIPPED — too short, track 0, or a
-/// TrackNumber this file does not (retainedly) declare. More than one frame
-/// means the Block was LACED (RFC 9559 §10.3): one Block legitimately carries
-/// several frames, and handing the raw payload downstream as a single frame
-/// feeds the codec parser a concatenation of frames plus lacing header. An
-/// `Err` means the lacing header is malformed, so the frame boundaries are
-/// unknowable — the block is rejected rather than mangled.
-///
-/// `cluster_ts_ticks` is the open cluster's timestamp in TimestampScale ticks
-/// and `ts_scale_ns` is that scale (ns per tick); the block PTS is computed as
-/// `(cluster_ts_ticks + rel_ts) * ts_scale_ns` so foreign MKVs whose scale
-/// isn't 1 ms are honoured (freemkv's own output uses 1_000_000 and round-trips
-/// unchanged). `tracks` resolves the TrackNumber to a stream index; `duration_ns`
-/// is propagated for BlockGroup blocks (None for SimpleBlock).
+// Parse a (Simple)Block payload into zero or more PesFrames: zero means
+// SKIPPED (too short/track 0/undeclared TrackNumber), >1 means LACED, `Err`
+// means a malformed lacing header. See docs/mkvstream.md#parse-block.
 fn parse_block(
     block: &[u8],
     cluster_ts_ticks: i64,
@@ -1614,11 +1528,9 @@ fn block_vint(d: &[u8]) -> (u64, usize) {
 #[cfg(test)]
 mod tests {
 
-    /// A fixed lace whose body is empty declares n frames and carries none. It is
-    /// malformed, and must be rejected rather than silently yielding zero frames:
-    /// 0 % n == 0 passes the divisibility check, and `chunks` on an empty slice
-    /// yields nothing whatever width it is given, so the whole lace vanished with
-    /// no error raised and the caller saw a clean short block.
+    // Empty-body fixed lace declares n frames, carries none: must be rejected,
+    // not silently yield zero frames (0 % n == 0 passes divisibility, and
+    // `chunks` on an empty slice yields nothing — the lace would vanish).
     #[test]
     fn fixed_lacing_with_an_empty_body_is_malformed_not_zero_frames() {
         // Lacing Head only: count_minus_one = 2, i.e. three frames declared,
@@ -1849,13 +1761,9 @@ mod tests {
         );
     }
 
-    /// The Blu-ray 3D case the merge exists for: a base (left-eye) video and a
-    /// dependent (right-eye) video. The dependent must NOT become a track of its
-    /// own — it is folded into the base as per-frame BlockAdditional — and the
-    /// merge state must be wired to the right stream and track indices.
-    ///
-    /// With the merge silently disabled, the muxer emits the two views as two
-    /// unrelated H.264 tracks: a file that opens, plays, and is not 3D.
+    // Blu-ray 3D case: base (left-eye) + dependent (right-eye) video. The
+    // dependent must NOT become its own track (folds into base as
+    // BlockAdditional) — a silently-disabled merge yields two H.264 tracks, not 3D.
     #[test]
     fn a_base_and_dependent_video_pair_builds_the_mvc_merge_and_skips_the_dependent_track() {
         use crate::disc::{
@@ -2088,12 +1996,9 @@ mod tests {
         }
     }
 
-    /// Whether the error is the read path's malformed-source rejection
-    /// (`E_MKV_SOURCE_INVALID`). Asserted rather than the historical
-    /// `E_MKV_INVALID` on purpose: `E_MKV_INVALID` is the no-muxable-frames stub
-    /// code, and `error::is_skippable_title_stub` classifies it as skippable, so
-    /// a corrupt source reported under it would be silently passed over by an
-    /// all-titles rip that then exited successfully.
+    // Whether the error is `E_MKV_SOURCE_INVALID`, not the historical
+    // `E_MKV_INVALID` (a no-muxable-frames stub code that
+    // `is_skippable_title_stub` treats as skippable — wrong for a corrupt source).
     fn is_mkv_source_invalid(e: &io::Error) -> bool {
         has_code(e, crate::error::E_MKV_SOURCE_INVALID) && !crate::error::is_skippable_title_stub(e)
     }
@@ -2378,18 +2283,9 @@ mod tests {
         assert_eq!(frame.duration_ns, Some(40 * 1_000_000));
     }
 
-    /// A BlockGroup's `BlockAdditions` subtree (BlockAddID=2 — the MVC
-    /// dependent/right-eye access unit this crate's 3D writer emits, see
-    /// `mkv.rs::build_block_group`) cannot be carried by `PesFrame`, so read-back
-    /// drops it. That is a LOSSY outcome, and this crate's rule is that a lossy
-    /// outcome is never silent.
-    ///
-    /// Regression: the arm did not exist, so the subtree fell into the `_ =>`
-    /// skip arm — an `mkv://` → `mkv://` re-mux of a 3D rip lost one whole eye
-    /// with no error, no warning and `lost_bytes == 0`, i.e. the mux reported a
-    /// clean, complete, loss-free copy of a file it had halved. The base view
-    /// must still read back intact, and the dropped payload must now be counted
-    /// so it reaches `MuxOutcome.lost_bytes` / `.errors`.
+    // A BlockGroup's `BlockAdditions` subtree (MVC dependent view) can't be
+    // carried by `PesFrame`, so read-back drops it — a LOSSY outcome that must
+    // be counted, never silent. See docs/mkvstream.md#block-additions-dropped-test.
     #[test]
     fn block_additions_dropped_on_read_back_is_counted_not_silent() {
         // The dependent-view payload: big enough that a byte count is unambiguous.
@@ -2479,16 +2375,9 @@ mod tests {
         assert_eq!(stream.errors(), 1);
     }
 
-    /// A BlockGroup carrying a ReferenceBlock is NOT a keyframe — that element's
-    /// presence is the only non-keyframe signal a BlockGroup has (the
-    /// SimpleBlock 0x80 flag bit is reserved and always 0 inside one).
-    ///
-    /// Regression: the reader used to `skip_bytes` past REFERENCE_BLOCK and read
-    /// the reserved bit instead, so EVERY BlockGroup frame came back as a
-    /// non-keyframe. Since the MPEG-2 parser stamps a per-frame duration, all
-    /// MPEG-2 video takes the BlockGroup path — so no video frame ever looked
-    /// like a keyframe on re-mux. That silently dropped all video on
-    /// `mkv://`→`m2ts://` and failed `mkv://`→`mkv://` with E6008.
+    // A BlockGroup carrying a ReferenceBlock is NOT a keyframe (the only
+    // non-keyframe signal a BlockGroup has); a past regression silently
+    // dropped MPEG-2 video. See docs/mkvstream.md#reference-block-keyframe-test.
     #[test]
     fn reference_block_marks_block_group_frame_as_non_keyframe() {
         // Same construction as the test above, plus a ReferenceBlock child.
@@ -3113,15 +3002,9 @@ mod tests {
         assert!(stream.read().unwrap().is_none(), "clean EOF → None");
     }
 
-    /// A skipped element whose declared size runs PAST the end of the file is a
-    /// truncated element, exactly like a truncated `read_binary_val` body — and
-    /// must be reported the same way, as `MkvSourceInvalid`.
-    ///
-    /// `skip_bytes` used to discard `io::copy`'s returned count, so the skip
-    /// "succeeded" having drained the rest of the file. The next element header
-    /// then hit `UnexpectedEof`, which `read()` maps to `Ok(None)` — a clean end
-    /// of stream. One corrupt size field mid-Clusters therefore threw away every
-    /// remaining frame of the title and reported `errors = 0`, `complete = true`.
+    // A skipped element whose declared size runs PAST EOF is a truncated
+    // element, reported as `MkvSourceInvalid`, not a clean end of stream.
+    // See docs/mkvstream.md#skip-bytes for the regression this guards.
     #[test]
     fn a_skip_past_eof_is_an_error_not_a_clean_end_of_stream() {
         let mut cluster = Vec::new();
@@ -3269,15 +3152,9 @@ mod tests {
         out
     }
 
-    /// EBML lacing (RFC 9559 §10.3.3): the Lacing Head, the first frame's size as
-    /// an unsigned VINT, then each later size as a SIGNED VINT difference from
-    /// the previous one. Three frames of 3/4/5 octets must come out as THREE
-    /// frames with byte-exact payloads.
-    ///
-    /// Regression (silent corruption): the reader took the Block payload verbatim
-    /// and never looked at the LACING bits, so this Block became ONE 15-byte frame
-    /// whose first three bytes are the lacing header — garbage handed to the codec
-    /// parser with no error, and one timestamp for three frames.
+    // EBML lacing (RFC 9559 §10.3.3): three frames of 3/4/5 octets must come out
+    // as THREE byte-exact frames, not one Block-verbatim frame with the lacing
+    // header as garbage payload. See docs/mkvstream.md#ebml-lacing-test.
     #[test]
     fn ebml_laced_block_yields_every_frame_with_exact_payloads() {
         // size 3 → 0x83 (VINT, value 3). size delta 4-3 = +1 → unsigned 1 + bias
@@ -3438,23 +3315,9 @@ mod tests {
         assert_eq!(frames[1].pts, 24_000_000, "spaced by the derived duration");
     }
 
-    /// RFC 9559 §5.1.4.1.1 constrains TrackNumber only to be non-zero — nothing
-    /// requires `1..=N` in TrackEntry order. A file with a TrackType this reader
-    /// drops (18 = buttons) between two carried tracks makes the TrackNumber
-    /// space and the stream vector diverge.
-    ///
-    /// Regression (silent corruption): the reader computed the stream index as
-    /// `TrackNumber - 1`, so the audio blocks of TrackNumber 3 resolved to index
-    /// 2 in a 2-stream title and were DISCARDED — a remux with no audio, reported
-    /// as success.
-    /// A legal SamplingFrequency below the lowest rate this enum maps must come
-    /// back as Unknown, not silently as 48 kHz.
-    ///
-    /// The ladder's final `else` was `SampleRate::S48`, so a 32000 Hz AC-3 or DTS
-    /// track — legal, and common in broadcast-sourced content — was recorded as
-    /// 48 kHz and the wrong rate propagated into the reconstructed AudioStream.
-    /// The crate's canonical mapping, `SampleRate::from_hz`, returns Unknown for
-    /// 32000; this ladder disagreed with it.
+    // TrackNumber gaps must not divide the stream index (`TrackNumber - 1` was
+    // a past regression); a sub-44100 SamplingFrequency must map to Unknown,
+    // not silently 48 kHz. See docs/mkvstream.md#track-number-gap-and-sub-44100-sampling-test.
     #[test]
     fn a_sub_44100_sampling_frequency_is_unknown_not_48k() {
         /// One TrackEntry body: an audio track with the given sampling frequency.
@@ -3660,16 +3523,9 @@ mod tests {
         t
     }
 
-    /// `finish()` is what turns a stream of frames into a FILE. It activates a
-    /// still-pending muxer (writing EBML header, Segment, Info, Tracks), then
-    /// finalizes it (Cues, SeekHead, the backpatched Segment size). A `finish`
-    /// that returned `Ok(())` without doing any of that leaves the caller with a
-    /// zero-byte or truncated `.mkv` and an exit code of 0 — a rip that reports
-    /// success and produced nothing.
-    ///
-    /// Proven by reading the output back through this crate's own MKV reader:
-    /// the frames must come out in order, with their real payloads, timestamps
-    /// and keyframe flags.
+    // `finish()` turns a stream of frames into a FILE (activates + finalizes
+    // the muxer); proven by reading the output back through this crate's own
+    // reader. See docs/mkvstream.md#finish-produces-readable-mkv-test.
     #[test]
     fn finish_produces_a_readable_mkv_with_every_written_frame() {
         let out = SharedOut::new();
@@ -3732,16 +3588,9 @@ mod tests {
         );
     }
 
-    /// A title that produced NO frames must NOT finish successfully. `finish()`
-    /// activates the still-pending muxer (so the header/Tracks are written) and
-    /// then hands off to `MkvMuxer::finish`, whose zero-frame guard raises
-    /// `Error::MkvInvalid` (E6008) rather than emitting a structurally valid but
-    /// clusterless MKV.
-    ///
-    /// A `finish` that returned `Ok(())` would report a completed rip for a
-    /// title that muxed nothing — precisely the "empty title, exit code 0"
-    /// outcome the guard exists to prevent — and `error::is_skippable_title_stub`
-    /// would never get the code it classifies on.
+    // A title that produced NO frames must NOT finish successfully — MkvMuxer's
+    // zero-frame guard raises E6008, not a clusterless-but-"complete" MKV.
+    // See docs/mkvstream.md#finish-refuses-zero-frame-title-test.
     #[test]
     fn finish_refuses_a_zero_frame_title_instead_of_reporting_success() {
         let out = SharedOut::new();
@@ -3763,22 +3612,9 @@ mod tests {
         );
     }
 
-    /// `headers_ready()` gates the CLI's wait-for-codec-private loop. For
-    /// Matroska it is unconditionally true because RFC 9559 §5.1 places the
-    /// Tracks element (carrying every CodecPrivate) in the Segment header,
-    /// ahead of the first Cluster — `MkvStream::open` has therefore already
-    /// parsed them by the time it returns. Returning `false` would hang the
-    /// mux forever on a source whose headers are, by construction, present.
-    ///
-    /// Pinned as an implication rather than a bare constant: readiness is
-    /// asserted TOGETHER with the codec private actually being retrievable, on
-    /// a freshly opened stream that has read no frame yet.
-    /// The untrusted-size caps ARE the OOM guard: every EBML element size is
-    /// checked against one before it is used to allocate. Only their existence
-    /// was pinned, never their magnitude — so a cap that collapsed to a few
-    /// kilobytes would still look guarded while rejecting ordinary discs, and one
-    /// that ballooned would allocate whatever a hostile container asks for. Both
-    /// ends need a number.
+    // `headers_ready()` is unconditionally true for Matroska (Tracks precedes
+    // the first Cluster); the untrusted-size caps' magnitude, not just
+    // existence, is pinned here. See docs/mkvstream.md#headers-ready-and-untrusted-size-caps-test.
     #[test]
     fn the_untrusted_size_caps_admit_real_discs_and_reject_hostile_ones() {
         // A UHD HEVC keyframe runs to a few MB — that has to get through.
@@ -3833,11 +3669,9 @@ mod tests {
         }
     }
 
-    /// The CodecID string is the only thing in a Matroska TrackEntry that says
-    /// which parser the elementary stream belongs to. One HEVC track was pinned;
-    /// the other ten branches of the ladder were not, so any of them could have
-    /// been mis-wired (or dropped to `Unknown`) and every re-mux of that codec
-    /// would have gone out with the wrong parser and no error raised.
+    // CodecID is the only thing in a TrackEntry that says which parser the
+    // elementary stream belongs to; every branch of the codec ladder is
+    // exercised so a mis-wired one can't silently ship with the wrong parser.
     #[test]
     fn every_matroska_codec_id_decodes_to_its_codec_on_read_back() {
         let cases: &[(u64, &str, Codec)] = &[
@@ -3873,10 +3707,9 @@ mod tests {
         }
     }
 
-    /// A TrackType this crate cannot carry (18 = buttons) is DROPPED, and the
-    /// three it can carry each build the matching stream kind. TrackType 17
-    /// (subtitle) had no coverage at all: losing that arm drops every subtitle
-    /// track from a re-mux, silently.
+    // A TrackType this crate cannot carry (18 = buttons) is DROPPED; the three
+    // it can carry each build the matching stream kind (subtitle, TrackType
+    // 17, was previously untested and could silently drop every subtitle).
     #[test]
     fn track_types_map_to_stream_kinds_and_unsupported_ones_are_dropped() {
         let bytes = mkv_with_codec_ids(&[
@@ -3938,13 +3771,9 @@ mod tests {
         }
     }
 
-    /// Write a real three-track title through this crate's own muxer, then read
-    /// it back through this crate's own reader and check the TrackEntry metadata
-    /// survived. Language, track name, the forced flag, pixel height and channel
-    /// count each had a dedicated arm in `parse_track` and NONE of them was
-    /// asserted — every one could have been deleted and the suite stayed green
-    /// while a re-mux quietly lost the audio language, the subtitle forced flag,
-    /// the track labels, the resolution and the channel layout.
+    // Round-trip a real three-track title and check the TrackEntry metadata
+    // (language, name, forced flag, resolution, channels) survived — none of
+    // it was previously asserted. See docs/mkvstream.md#track-entry-metadata-round-trip-test.
     #[test]
     fn track_entry_metadata_survives_a_write_read_round_trip() {
         let out = SharedOut::new();
@@ -4040,13 +3869,9 @@ mod tests {
         }
     }
 
-    /// FlagDefault says "play this track unless the viewer picks another". Only
-    /// ONE video and ONE audio track may carry it; `MkvTrack::video`/`audio` set
-    /// it from `!secondary` alone, so a disc with two ordinary video angles or
-    /// two ordinary audio tracks arrives here with the flag on all of them and
-    /// this de-duplication is the only thing that fixes it. It lives here and
-    /// nowhere else — the muxer just writes what it is handed — and it had no
-    /// test at all.
+    // FlagDefault: only ONE video and ONE audio track may carry it; this
+    // de-duplication (not the muxer) is the only thing that enforces that.
+    // See docs/mkvstream.md#default-track-dedup-test.
     #[test]
     fn only_the_first_video_and_first_audio_track_are_default() {
         use crate::disc::{
@@ -4097,12 +3922,9 @@ mod tests {
         );
     }
 
-    /// The deferred-activation machinery waits for the PRIMARY VIDEO track's
-    /// first frame so the header can carry a measured FieldOrder. "Primary video"
-    /// means the first track whose type is video — not the first track. On a
-    /// title whose audio comes first (an M2TS whose PMT lists audio ahead of
-    /// video, routine on Blu-ray), picking track 0 instead means the header is
-    /// built from an audio frame and the measured field order never lands.
+    // Deferred activation waits for the PRIMARY VIDEO track's first frame (the
+    // first track whose type is video, not track 0) — audio commonly comes
+    // first in a Blu-ray PMT, so picking track 0 would drop the measured order.
     #[test]
     fn the_activation_trigger_is_the_first_video_track_not_the_first_track() {
         use crate::disc::{
@@ -4147,10 +3969,9 @@ mod tests {
         }
     }
 
-    /// The bytes before the first Cluster — where the Tracks header (and thus
-    /// FlagInterlaced/FieldOrder) lives. Bounding the scans below to this region
-    /// stops a coincidental 0x9A/0x9D byte pair in SimpleBlock payload from
-    /// spoofing a match. Cluster ID = 0x1F 0x43 0xB6 0x75 (RFC 9559).
+    // Bytes before the first Cluster (Tracks header lives there); bounding the
+    // scans below to this region stops a coincidental byte pair in a
+    // SimpleBlock payload from spoofing a match. Cluster ID = 0x1F43B675.
     fn tracks_region(data: &[u8]) -> &[u8] {
         data.windows(4)
             .position(|w| w == [0x1F, 0x43, 0xB6, 0x75])
@@ -4177,20 +3998,9 @@ mod tests {
             .map(|w| w[2] as u64)
     }
 
-    /// A DVD whose IFO declares 480i/576i but whose pictures are CODED
-    /// progressive — film and animation on NTSC discs routinely are — must ship
-    /// `FlagInterlaced=progressive`, because that is what the bitstream says.
-    ///
-    /// `MkvTrack::video` sets `interlaced` from the DECLARED resolution, which
-    /// on a DVD is 480i essentially always. Shipping that unchecked marks
-    /// progressive content interlaced, and every player that honours the flag
-    /// then runs a deinterlacer over progressive frames — softening every frame
-    /// of an otherwise bit-exact remux. Measured against a real disc: `idet`
-    /// reports 100% progressive on titles this shipped as `FlagInterlaced=1`.
-    ///
-    /// The sibling test above pins the interlaced direction, so together they
-    /// constrain both: a measurement of TFF keeps the track interlaced, and a
-    /// measurement of progressive corrects it.
+    // A DVD declared 480i/576i but CODED progressive must ship
+    // `FlagInterlaced=progressive` — the measured bitstream overrides the
+    // declared resolution. See docs/mkvstream.md#progressive-on-declared-interlaced-test.
     #[test]
     fn a_progressive_picture_on_a_declared_interlaced_disc_ships_as_progressive() {
         use crate::disc::{
@@ -4255,11 +4065,9 @@ mod tests {
         );
     }
 
-    /// Whole-stream FlagInterlaced correction, PROMOTE direction: a genuinely
-    /// interlaced 576i feature whose FIRST coded picture is a progressive leader
-    /// (black/logo). One unrepresentative picture must NOT flip the whole track —
-    /// the majority scan (interlaced) wins at finish(). Without the correction the
-    /// first-picture verdict ships FlagInterlaced=progressive for the whole file.
+    // Whole-stream FlagInterlaced correction, PROMOTE direction: a genuinely
+    // interlaced feature whose FIRST picture is a progressive leader must not
+    // flip the whole track — the majority scan wins at finish().
     #[test]
     fn a_progressive_first_picture_on_a_mostly_interlaced_title_ships_interlaced() {
         use crate::disc::{
@@ -4328,11 +4136,9 @@ mod tests {
         );
     }
 
-    /// Whole-stream FlagInterlaced correction, DEMOTE direction — which also
-    /// extends the original fix: progressive film mis-declared 576i whose FIRST
-    /// coded picture is interlaced-coded. The majority (progressive) wins, so the
-    /// track ships progressive AND the up-front FieldOrder is Void'd (a progressive
-    /// track carries none).
+    // Whole-stream FlagInterlaced correction, DEMOTE direction: progressive
+    // film mis-declared 576i whose FIRST picture is interlaced-coded. Majority
+    // (progressive) wins: track ships progressive, FieldOrder is Void'd.
     #[test]
     fn an_interlaced_first_picture_on_a_mostly_progressive_title_ships_progressive() {
         use crate::disc::{
@@ -4407,10 +4213,8 @@ mod tests {
         );
     }
 
-    /// Whole-stream FlagInterlaced correction, TIE case: equal progressive and
-    /// interlaced picture counts must resolve to PROGRESSIVE (a tie is not a
-    /// majority, so the track is not deinterlaced). Pins the strict-`>` tie-break
-    /// so a future flip to `>=` (interlaced wins ties) is caught.
+    // FlagInterlaced TIE case: equal progressive/interlaced counts resolve to
+    // PROGRESSIVE (a tie is not a majority); pins the strict-`>` tie-break.
     #[test]
     fn an_even_split_of_scan_types_ships_progressive_not_interlaced() {
         use crate::disc::{
@@ -4469,16 +4273,9 @@ mod tests {
         );
     }
 
-    /// THE deferred-activation contract, end to end: the field order MEASURED
-    /// from the first coded picture has to reach the FILE.
-    ///
-    /// `apply_coding_to_track` was tested in isolation, which proves nothing
-    /// about whether the caller ever reaches it with a real measurement — and
-    /// the route there runs through the pending-buffer cap, the
-    /// "is this the video frame" test and the activation trigger, none of which
-    /// were observed from the outside. Any of them mis-set and the file ships
-    /// FieldOrder omitted: an interlaced DVD that players then deinterlace with
-    /// the fields in the wrong order (visible combing on motion).
+    // THE deferred-activation contract, end to end: the field order MEASURED
+    // from the first coded picture must reach the FILE, not just
+    // `apply_coding_to_track` in isolation. See docs/mkvstream.md#deferred-activation-end-to-end-test.
     #[test]
     fn the_measured_field_order_reaches_the_written_file() {
         use crate::disc::{
@@ -4565,10 +4362,8 @@ mod tests {
         );
     }
 
-    /// The dependent (right-eye) view is matched to its base frame BY PTS. Any
-    /// other pairing rule attaches the wrong eye to the wrong frame — a 3D title
-    /// that plays with the views swapped on part of the runtime, which no
-    /// structural check on the output can catch.
+    // The dependent (right-eye) view is matched to its base frame BY PTS; any
+    // other rule attaches the wrong eye to the wrong frame (view-swap 3D bug).
     #[test]
     fn a_dependent_view_pairs_only_with_the_base_frame_of_the_same_pts() {
         let mut m = empty_merge();
@@ -4594,10 +4389,8 @@ mod tests {
         );
     }
 
-    /// TimestampScale is an untrusted u64 that every frame PTS is multiplied by.
-    /// A value above `i64::MAX` casts to a negative scale and turns the whole
-    /// timeline inside out, so it is clamped back to the 1 ms default — the same
-    /// treatment a declared zero gets. Only the zero half was covered.
+    // TimestampScale above `i64::MAX` casts to a negative scale (inverts the
+    // whole timeline), so it clamps to the 1 ms default like a declared zero.
     #[test]
     fn a_timestamp_scale_above_i64_max_falls_back_to_one_millisecond() {
         let build = |scale: u64| {
@@ -4649,12 +4442,9 @@ mod tests {
         assert_eq!(f.pts, 5 * 100_000, "a legal 0.1 ms scale is honoured");
     }
 
-    /// An EBML lace of exactly TWO frames stores exactly ONE size (the first);
-    /// the second is the Block remainder. Every earlier lacing test used three
-    /// frames, where the "read n-2 more sizes" loop happens to run the same
-    /// number of times whichever way its bound is computed. Two frames is the
-    /// case that separates them, and reading one size too many eats the frame
-    /// payload as a size table.
+    // An EBML lace of exactly TWO frames stores exactly ONE size (the first);
+    // the second is the Block remainder — the boundary case where an off-by-one
+    // in the "read n-2 more sizes" loop would eat frame payload as size table.
     #[test]
     fn an_ebml_lace_of_exactly_two_frames_stores_one_size() {
         let mut block = vec![
@@ -4679,11 +4469,9 @@ mod tests {
         );
     }
 
-    /// The shortest usable (Simple)Block is a 1-octet track VINT, a 2-octet
-    /// relative timestamp and a flags octet — four bytes, carrying an empty
-    /// payload. Its length is exactly the boundary of the two short-block
-    /// guards, and a guard one off either way turns a legal (if degenerate)
-    /// block into a dropped frame or an index past the end of the buffer.
+    // The shortest usable (Simple)Block is 4 bytes (track VINT + rel-ts + flags,
+    // empty payload) — exactly the boundary of the short-block guards, where an
+    // off-by-one drops a legal frame or indexes past the buffer end.
     #[test]
     fn a_four_byte_block_is_the_shortest_legal_one_and_is_not_dropped() {
         let tracks = TrackTable::contiguous(1);
@@ -4719,13 +4507,9 @@ mod tests {
         assert_eq!(frames[0].track, 0, "0x4001 is TrackNumber 1 → stream 0");
     }
 
-    /// The `Video` master's child walk must consume EXACTLY the bytes its
-    /// children declare. This crate's own writer happens to place every other
-    /// TrackEntry field ahead of `Video`, so an over-run there costs nothing —
-    /// but a foreign MKV (mkvmerge orders children differently) puts fields
-    /// after it, and an over-running walk then swallows them: the reader reports
-    /// language `und` for a track that declared one, on a file that is perfectly
-    /// well formed.
+    // The `Video` master's child walk must consume EXACTLY its declared bytes,
+    // not over-run into a following field (fine for this crate's own writer,
+    // but breaks on foreign MKVs). See docs/mkvstream.md#video-master-walk-bounds-test.
     #[test]
     fn the_video_master_walk_stops_at_its_own_end_not_inside_the_next_field() {
         let mut video = Vec::new();
@@ -4773,11 +4557,8 @@ mod tests {
         }
     }
 
-    /// A Dolby Vision enhancement layer is marked SECONDARY so it is never
-    /// selected as the default video track. It is recognised by either of two
-    /// label spellings, and only the pair together covers the labels this crate
-    /// and its sources actually emit — matching on both is the policy, so both
-    /// have to hold.
+    // A Dolby Vision enhancement layer is marked SECONDARY (never default video)
+    // when recognised by either of two label spellings; both must hold.
     #[test]
     fn a_dolby_vision_enhancement_layer_track_is_marked_secondary_by_either_label() {
         let build = |name: &str| {
@@ -4817,11 +4598,8 @@ mod tests {
         );
     }
 
-    /// `DefaultDuration` is the per-frame period a laced Block's second and later
-    /// frames are spaced by (RFC 9559 §10.3.5). The reader treats 0 and absurd
-    /// values as ABSENT — a zero period would stack every laced frame on one
-    /// timestamp while claiming a real duration, and a nonsense one would smear
-    /// them across minutes. Both ends of that filter were unasserted.
+    // `DefaultDuration` spaces a laced Block's later frames (RFC 9559 §10.3.5);
+    // the reader treats 0 and absurd values as ABSENT (not a real duration).
     #[test]
     fn a_zero_or_absurd_default_duration_is_treated_as_absent() {
         // A two-frame EBML lace: frame 2's timestamp comes only from the track's
@@ -4882,10 +4660,8 @@ mod tests {
         }
     }
 
-    /// Only a CLEAN end of stream ends a read. A disc-read failure partway
-    /// through must PROPAGATE: treating it as end-of-stream truncates the output
-    /// at the bad sector and reports the rip as complete, which is the worst
-    /// outcome this crate has — a short file with an exit code of 0.
+    // Only a CLEAN end of stream ends a read; a disc-read failure partway
+    // through must PROPAGATE, not be mistaken for a complete rip.
     #[test]
     fn a_mid_stream_io_failure_propagates_instead_of_ending_the_stream() {
         // Header parses cleanly, then the cluster read hits a device error.
@@ -4909,10 +4685,8 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::Other);
     }
 
-    /// The same distinction while parsing the HEADER: a truncated (clean-EOF)
-    /// Segment stops the scan with whatever was found, but a device failure has
-    /// to surface. Swallowing it yields a title with no tracks that the caller
-    /// then reports as an empty stub.
+    // Same distinction while parsing the HEADER: a clean-EOF Segment stops the
+    // scan with whatever was found, but a device failure must surface.
     #[test]
     fn a_header_io_failure_propagates_instead_of_ending_the_scan() {
         let mut out = Vec::new();
@@ -4944,10 +4718,8 @@ mod tests {
         assert!(s.info().streams.is_empty());
     }
 
-    /// The first subset SPS and the first PPS win. A dependent access unit that
-    /// repeats a parameter set (routine after a stream discontinuity) must not
-    /// have the later copy overwrite the one already captured — the mvcC record
-    /// is built once, from the set the stream opened with.
+    // The first subset SPS and first PPS win; a repeated parameter set (routine
+    // after a discontinuity) must not overwrite the one already captured.
     #[test]
     fn extract_mvc_params_keeps_the_first_parameter_set_of_each_kind() {
         const SECOND_SPS: [u8; 5] = [0x6F, 0x99, 0x11, 0x22, 0x33];

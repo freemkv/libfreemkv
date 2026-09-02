@@ -4,22 +4,9 @@
 //! out to a file, in order, once. It is what an `iso://` DESTINATION means when
 //! the source is not a physical drive.
 //!
-//! # Why this is not `freemkv_engine::copy`
-//!
-//! The engine's `copy` is the RECOVERY path — mapfile sidecar, `--multipass`
-//! sweep/patch, damage-jump, ECC-aware batching, auto-resume. Every one of those
-//! exists because an optical drive returns read errors on marginal media. A
-//! file-backed or synthesized source has no marginal media: a read either
-//! succeeds or the underlying file is broken, and retrying it is pointless.
-//!
-//! Routing a non-drive source through the recovery path is not merely wasteful,
-//! it is wrong. Its mapfile identity check compares AACS unit keys and the VID,
-//! both of which are empty for an already-decrypted source, so identity passes
-//! for ANY such source: a second run with a different input to the same output
-//! path would resume over the previous image and produce wrong content at exit
-//! zero. Keeping the two paths separate makes that unrepresentable.
-//!
-//! So: drive sources get `freemkv_engine::copy`. Everything else gets this.
+//! Drive sources go through `freemkv_engine::copy` (the recovery path) instead;
+//! this function is for everything else. See docs/image-writer.md for why the
+//! two paths must stay separate.
 
 use crate::consts::SECTOR_BYTES;
 use crate::error::{Error, Result};
@@ -36,30 +23,15 @@ const BATCH_SECTORS: u32 = 2048;
 
 /// Write `total_sectors` sectors from `reader` to `dest`.
 ///
-/// Reads sequentially from LBA 0 and writes in order, so the output is a faithful
-/// image of whatever the source presents — decrypted if the caller wrapped the
-/// source in a [`DecryptingSectorSource`](crate::sector::decrypting::DecryptingSectorSource),
-/// ciphertext if it did not. This function performs no decryption itself and makes
-/// no decryption decision; that belongs to the caller, which knows whether the run
-/// is `--raw`.
-///
-/// `on_progress` is called after each batch with the cumulative byte count, for
-/// front-end progress reporting. It must not block.
-///
-/// `halt` is checked once per batch. On cancellation the partial file is left in
-/// place — the caller decides whether a partial image is worth keeping, and
-/// deleting a multi-gigabyte file the user may want to inspect is not this
-/// function's call to make.
-///
-/// Returns the number of bytes written.
+/// Reads sequentially, writes in order; does no decryption itself (caller's call).
+/// `on_progress` runs after each batch with cumulative bytes and must not block;
+/// `halt` is checked once per batch, and on cancellation the partial file is kept.
+/// Returns bytes written. See docs/image-writer.md for rationale.
 ///
 /// # Errors
 ///
-/// - [`Error::Halted`] if `halt` was cancelled.
-/// - [`Error::IoError`] if the destination cannot be created or written.
-/// - Whatever the source's `read_sectors` returns. A short read is an error, not
-///   a zero-fill: silently padding a truncated source produces an image that
-///   looks complete and is not.
+/// - [`Error::Halted`]/[`Error::IoError`], or whatever `read_sectors` returns
+///   (a short read is an error, not zero-filled).
 pub fn write_image(
     reader: &mut dyn SectorSource,
     dest: &Path,
