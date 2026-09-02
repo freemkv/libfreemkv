@@ -1,55 +1,11 @@
-//! `WritebackFile` — a `File` wrapper whose reason for existing is the
-//! bounded-cache writeback pipeline.
-//!
-//! Why: large sequential writes (sweep, patch, mux on UHD-scale output)
-//! left to the kernel's default writeback policy accumulate hundreds of
-//! megabytes of dirty pages and then burst-flush, stalling subsequent
-//! writes for seconds at a time. `WritebackFile` drives a continuous
-//! [`super::writeback::WritebackPipeline`] that on Linux issues
-//! incremental `sync_file_range` + `posix_fadvise(DONTNEED)` calls at
-//! 32 MB granularity so dirty pages drain at the same rate they're
-//! produced. macOS and Windows fall through to a no-op pipeline — their
-//! default cache policies have not been shown to exhibit the same
-//! pathology for this access pattern.
-//!
-//! It implements `Write` and `Seek` so any call site that wrote to a
-//! plain `File` through those traits (sweep, patch, mux) can swap in
-//! `WritebackFile` without touching the body of the loop. The wrapper
-//! also tracks the current file position to feed the pipeline with
-//! progress + seek boundaries.
-//!
-//! See `super::writeback::linux` for the underlying pathology and the
-//! strategy.
-//!
-//! ## Platform split
-//!
-//! The platform-specific pieces of this wrapper — extent preallocation
-//! (Linux `fallocate(KEEP_SIZE)`, macOS `F_PREALLOCATE`, Windows no-op
-//! today) and the durable-flush primitive (Linux/macOS
-//! `fsync`/`F_FULLFSYNC` wrapped in a bounded syscall; Windows plain
-//! `FlushFileBuffers`, unbounded) — live in per-OS sibling modules. The
-//! dispatch happens once at the bottom of this file via cfg-gated `mod`
-//! decls. No inline `#[cfg(target_os = "...")]` in the business-logic
-//! above.
-//!
-//! ## Write path
-//!
-//! Writes are direct passthrough to the underlying `File` (no writer
-//! thread, no ring, no batching). Empirically a writer-thread
-//! architecture introduced a ~60% mux throughput regression on NFS
-//! bidirectional workloads; the direct-passthrough write path is faster.
-//! The writeback pipeline still runs (it's called inline from `write` /
-//! `write_all` / `seek`) so the bounded-cache invariant on Linux is
-//! preserved.
-//!
-//! ## Halt-safety
-//!
-//! `sync_all` runs the per-OS durable-flush primitive. On Linux/macOS
-//! it is wrapped in [`crate::io::bounded::bounded_syscall`] with a 60 s
-//! deadline, so a wedged NFS server cannot trap the muxer indefinitely
-//! on the final fsync. Windows is a known deviation: its `durable_sync`
-//! calls `File::sync_all` (`FlushFileBuffers`) directly and is NOT
-//! bounded — a wedged UNC/SMB share can block the final flush there.
+//! `WritebackFile` — a `File` wrapper that drives a continuous
+//! [`super::writeback::WritebackPipeline`] so large sequential writes
+//! (sweep, patch, mux) don't accumulate unbounded dirty pages before a
+//! stalling burst-flush. It implements `Write` and `Seek` so any call
+//! site that wrote to a plain `File` can swap in `WritebackFile`
+//! unchanged. Platform-specific preallocation/durable-flush primitives
+//! live in per-OS sibling modules, dispatched via the cfg-gated `mod`
+//! decls below — see docs/writeback-file.md for the full rationale.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -75,17 +31,12 @@ use std::path::Path;
 
 use super::writeback::WritebackPipeline;
 
-/// Granularity at which the Linux writeback pipeline issues
-/// `sync_file_range` pairs. 32 MiB is the empirically best value on a
-/// 1 GbE NFS mount backed by a single spinning disk: 8 MiB / 64 MiB /
-/// 128 MiB all measured worse. Override via `FREEMKV_WRITEBACK_CHUNK_MIB`
-/// — faster backends (NVMe, RAID) may tolerate larger windows.
+// Linux sync_file_range granularity. 32 MiB measured best on a 1 GbE NFS
+// mount (8/64/128 MiB all worse); override via FREEMKV_WRITEBACK_CHUNK_MIB.
 const WRITEBACK_CHUNK_BYTES_DEFAULT: u64 = 32 * 1024 * 1024;
 
-/// Upper bound (in MiB) accepted from `FREEMKV_WRITEBACK_CHUNK_MIB`.
-/// 64 GiB — far above `CHUNK_BYTES_MAX` (256 MiB), generous for any
-/// real backend, and small enough that `n * 1024 * 1024` cannot wrap
-/// `u64`. Out-of-range values fall back to the default.
+// Max accepted FREEMKV_WRITEBACK_CHUNK_MIB: generous, and small enough that
+// `n * 1024 * 1024` cannot overflow u64. Out-of-range falls back to default.
 const WRITEBACK_CHUNK_MIB_MAX: u64 = 64 * 1024;
 
 fn writeback_chunk_bytes() -> u64 {
@@ -141,19 +92,12 @@ impl WritebackFile {
         Self::new(file)
     }
 
-    /// Like [`Self::create`] but pre-reserves `size_bytes` of disk
-    /// space via the platform's extent-preallocation primitive (Linux
-    /// `fallocate(KEEP_SIZE)`, macOS `F_PREALLOCATE`; Windows has no
-    /// equivalent, so it is a debug-logged no-op there). The reported
-    /// file size is unchanged
-    /// (writes still grow the file naturally) — only the on-disk extent
-    /// allocation is preallocated, which reduces extent fragmentation
-    /// on large sequential writes (mux output, especially on slow
-    /// storage / NFS).
-    ///
-    /// On platforms without an extent-preallocation primitive this is
-    /// equivalent to `create` — the size hint is dropped after a debug
-    /// log.
+    /// Like [`Self::create`] but pre-reserves `size_bytes` of disk space
+    /// via the platform's extent-preallocation primitive (Linux
+    /// `fallocate(KEEP_SIZE)`, macOS `F_PREALLOCATE`; no-op on platforms
+    /// without one). The reported file size is unchanged — only the
+    /// on-disk extent allocation is preallocated. See
+    /// docs/writeback-file.md for rationale.
     pub fn create_with_size_hint(path: &Path, size_bytes: u64) -> io::Result<Self> {
         let file = File::create(path)?;
         platform::preallocate(&file, size_bytes);
@@ -169,29 +113,14 @@ impl WritebackFile {
         Self::new(file)
     }
 
-    /// Drain in-flight writeback then issue a full fsync. Use this in
-    /// place of `File::sync_all`.
-    ///
-    /// The final durable flush is wrapped in
-    /// [`crate::io::bounded::bounded_syscall`] (per the per-OS module)
-    /// with a 60 s deadline on Linux/macOS — a wedged NFS server cannot
-    /// trap the calling thread indefinitely. On timeout the page cache
-    /// is left to the kernel's normal flush-on-close path — best
-    /// effort, but bounded.
-    ///
-    /// A bounded-fsync failure is returned as an `Err` on BOTH platforms, so
-    /// `Ok(())` means the flush completed and a caller needing
-    /// crash-consistency can treat it as a durability barrier.
-    ///
-    /// The three causes are DISTINGUISHABLE by numeric code, because a caller
-    /// should not retry a lost worker the way it retries a timeout, and must
-    /// not report a user cancel as a failure:
-    ///
-    /// * [`E_SYNC_TIMEOUT`](crate::error::E_SYNC_TIMEOUT) — deadline expired
-    /// * [`E_HALTED`](crate::error::E_HALTED) — cancelled;
-    ///   [`is_halt`](crate::error::is_halt) recognises it
-    /// * [`E_SYNC_WORKER_LOST`](crate::error::E_SYNC_WORKER_LOST) — the worker
-    ///   thread died before reporting
+    /// Drain in-flight writeback then issue a full fsync, in place of
+    /// `File::sync_all`. Bounded by
+    /// [`crate::io::bounded::bounded_syscall`] on Linux/macOS (60 s), so
+    /// a wedged NFS server cannot trap the caller indefinitely;
+    /// `Ok(())` is a durability barrier. Failure is
+    /// [`E_SYNC_TIMEOUT`](crate::error::E_SYNC_TIMEOUT),
+    /// [`E_HALTED`](crate::error::E_HALTED), or
+    /// [`E_SYNC_WORKER_LOST`](crate::error::E_SYNC_WORKER_LOST); see docs/writeback-file.md.
     pub fn sync_all(&mut self) -> io::Result<()> {
         if self.seek_count > 0 {
             tracing::debug!(
@@ -255,12 +184,9 @@ impl Seek for WritebackFile {
 }
 
 impl super::sink::SequentialSink for WritebackFile {
-    /// Drain the writeback pipeline and run the bounded durable flush —
-    /// the same work [`Self::sync_all`] does. Implemented explicitly (no
-    /// blanket impl) so a `dyn SequentialSink` / `dyn RandomAccessSink`
-    /// `finish()` actually finalises + fsyncs instead of hitting a no-op
-    /// default. A bounded-fsync failure surfaces as an `Err` here, on every
-    /// platform, exactly as it does from [`Self::sync_all`].
+    // Same work as sync_all(); implemented explicitly (no blanket impl) so
+    // a `dyn SequentialSink`/`dyn RandomAccessSink` finish() finalises +
+    // fsyncs instead of hitting a no-op default.
     fn finish(&mut self) -> io::Result<()> {
         self.sync_all()
     }
@@ -358,10 +284,8 @@ mod tests {
         assert_eq!(read_back(&p), b"onetwothree");
     }
 
-    /// finish() through a `dyn RandomAccessSink` trait object must
-    /// dispatch to WritebackFile's override (finalize + durable_sync),
-    /// not a no-op default. Bytes must be visible to a separate reader
-    /// before drop.
+    // finish() through a `dyn RandomAccessSink` must dispatch to
+    // WritebackFile's override (finalize + durable_sync), not a no-op.
     #[test]
     fn finish_through_trait_object_persists() {
         use crate::io::sink::RandomAccessSink;
@@ -376,15 +300,8 @@ mod tests {
 
     // ── Added hardening tests ───────────────────────────────────────
 
-    /// `write` (not write_all) must return the count the inner File
-    /// reported and advance `pos` by exactly that count (lines
-    /// 185-189). For a regular file a single `write` of a small buffer
-    /// writes all of it. We verify the returned count equals the buffer
-    /// length AND that a subsequent seek reports the right position.
-    /// Mutation: changing `self.pos += n` to `self.pos += buf.len()`
-    /// (lines 187 vs a hypothetical bug) would desync on a partial
-    /// write; here they coincide, but `Seek(Current(0))` reflecting `n`
-    /// still guards the count return value.
+    // `write` must return the inner File's reported count and advance
+    // `pos` by exactly that count (not `buf.len()`). See docs/writeback-file.md.
     #[test]
     fn write_returns_byte_count_and_advances_pos() {
         let dir = tempfile::tempdir().unwrap();
@@ -401,16 +318,9 @@ mod tests {
         assert_eq!(read_back(&p), b"twelve bytes");
     }
 
-    /// Redundant seek to the CURRENT position must be a no-op for the
-    /// pipeline (lines 211-228 only act when `p != self.pos`). This is
-    /// the documented sweep optimisation: sweep does
-    /// `seek(Current(pos))` before every write and we must not treat it
-    /// as a boundary. We can only observe the public effect: the seek
-    /// returns the same offset and writes continue contiguously.
-    /// Mutation: removing the `if p != self.pos` guard (line 211) would
-    /// call handle_seek on every redundant seek — on the noop pipeline
-    /// (macOS) this stays correct for data, but the contiguity +
-    /// returned-offset invariant still must hold and is asserted here.
+    // Redundant seek to the CURRENT position (sweep's `seek(Current(pos))`
+    // before every write) must not be treated as a boundary. See
+    // docs/writeback-file.md.
     #[test]
     fn seek_to_current_position_is_noop_for_data() {
         let dir = tempfile::tempdir().unwrap();
@@ -430,12 +340,8 @@ mod tests {
         );
     }
 
-    /// `open` (no-truncate) must preserve existing file contents and
-    /// allow in-place patching from offset 0 — distinct from `create`
-    /// which truncates (lines 157-160 use OpenOptions write-only, no
-    /// truncate). We pre-seed a file, reopen with `open`, overwrite the
-    /// first bytes, and confirm the tail survives. Mutation: if `open`
-    /// used `File::create` (truncate) the tail would be lost.
+    // `open` (no-truncate) must preserve existing file contents, distinct
+    // from `create`'s truncating path. See docs/writeback-file.md.
     #[test]
     fn open_preserves_existing_contents() {
         let dir = tempfile::tempdir().unwrap();
@@ -452,13 +358,8 @@ mod tests {
         assert_eq!(read_back(&p), b"PATCHED!-CONTENT");
     }
 
-    /// `open` on a file whose position is queried must start tracking
-    /// from the file's current offset. `WritebackFile::new` calls
-    /// `stream_position()` (line 112); a freshly `open`ed file is at
-    /// offset 0. After writing, seeking Current(0) must reflect the
-    /// bytes written from 0. Mutation: if `new` hardcoded pos=0 instead
-    /// of querying, a non-zero starting offset would desync — covered
-    /// indirectly; here we assert the offset is exactly the write size.
+    // `new` queries stream_position() rather than hardcoding pos=0, so a
+    // non-zero starting offset stays in sync. See docs/writeback-file.md.
     #[test]
     fn new_tracks_initial_position() {
         let dir = tempfile::tempdir().unwrap();
@@ -472,11 +373,8 @@ mod tests {
         assert_eq!(after, 2, "pos must advance by written length");
     }
 
-    /// Seek past EOF then write must create a sparse hole that reads
-    /// back as zeros — standard POSIX file semantics that the wrapper
-    /// must not break (it forwards seek to the inner File at line 205).
-    /// Mutation: if `seek` clamped or mishandled the offset, the hole
-    /// size/zero-fill would be wrong.
+    // Seek past EOF then write must create a sparse hole reading back as
+    // zeros — standard POSIX semantics forwarded to the inner File.
     #[test]
     fn seek_past_eof_creates_zero_hole() {
         let dir = tempfile::tempdir().unwrap();
@@ -499,10 +397,8 @@ mod tests {
         assert_eq!(&bytes[20..24], b"tail");
     }
 
-    /// `SeekFrom::End` must resolve against the actual file length.
-    /// After writing 10 bytes, `seek(End(-2))` lands at offset 8;
-    /// overwriting 2 bytes there patches the tail. Mutation: forwarding
-    /// the wrong SeekFrom variant would land at the wrong offset.
+    // `SeekFrom::End` must resolve against the actual file length; after
+    // writing 10 bytes, `seek(End(-2))` lands at offset 8.
     #[test]
     fn seek_from_end_resolves_against_length() {
         let dir = tempfile::tempdir().unwrap();
@@ -517,13 +413,8 @@ mod tests {
         assert_eq!(read_back(&p), b"01234567XY");
     }
 
-    /// `create_with_size_hint` must produce a normal, writable file
-    /// whose *reported size* tracks bytes written (the hint only
-    /// reserves extents, per the doc lines 137-145 — it must NOT
-    /// pre-grow the logical file length). We write 5 bytes against a
-    /// 1 MiB hint and the file must be exactly 5 bytes long.
-    /// Mutation: if the hint path truncated/extended to size_bytes the
-    /// length would be 1 MiB and this fails.
+    // `create_with_size_hint`'s hint reserves extents only; it must NOT
+    // pre-grow the logical file length. See docs/writeback-file.md.
     #[test]
     fn create_with_size_hint_does_not_inflate_logical_length() {
         let dir = tempfile::tempdir().unwrap();
@@ -537,11 +428,8 @@ mod tests {
         assert_eq!(&bytes, b"hello");
     }
 
-    /// `sync_all` is idempotent: calling it twice (and then Drop, which
-    /// also finalizes) must not corrupt data or panic. Doc lines
-    /// 256-262: `finalize` is idempotent so explicit sync_all then drop
-    /// is safe. Mutation: a finalize that double-freed or advanced a
-    /// cursor would corrupt on the second call.
+    // `sync_all` is idempotent: calling it twice, then Drop (also
+    // finalizes), must not corrupt data or panic.
     #[test]
     fn double_sync_all_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
@@ -554,15 +442,8 @@ mod tests {
         assert_eq!(read_back(&p), b"idempotent");
     }
 
-    /// Env-var chunk override parsing (`writeback_chunk_bytes`, lines
-    /// 91-98). Out-of-range / unparseable values must fall back to the
-    /// 32 MiB default; valid in-range values are converted MiB→bytes.
-    /// We can't safely mutate process env in parallel tests for the
-    /// default-path branch, but we CAN assert the pure boundary logic
-    /// the function encodes by reconstructing it: the filter accepts
-    /// `0 < n <= WRITEBACK_CHUNK_MIB_MAX`. This pins the constants and
-    /// the MiB→byte multiply. Mutation: changing `* 1024 * 1024` to a
-    /// single `* 1024` would break this equality.
+    // Pins the WRITEBACK_CHUNK_* constants and the MiB->byte multiply that
+    // `writeback_chunk_bytes` relies on. See docs/writeback-file.md.
     #[test]
     fn writeback_chunk_constants_and_conversion() {
         // Default is exactly 32 MiB.
@@ -577,18 +458,9 @@ mod tests {
         );
     }
 
-    /// Env-var override parsing for `writeback_chunk_bytes` (lines
-    /// 91-98). All four branches in ONE test to avoid the data race of
-    /// several parallel tests mutating the same process-global env var.
-    ///
-    /// Branches: (1) valid in-range value → MiB→byte conversion; (2)
-    /// zero → `n > 0` filter rejects → default; (3) garbage → parse
-    /// fails → default; (4) over-max → `n <= MAX` filter rejects →
-    /// default.
-    ///
-    /// Mutations: `* 1024 * 1024` → `* 1024` breaks (1); dropping
-    /// `n > 0` breaks (2); `unwrap()` on parse panics (3); dropping
-    /// `n <= MAX` breaks (4).
+    // All `writeback_chunk_bytes` env-var branches in ONE test (avoids a
+    // data race between parallel tests mutating the same env var). See
+    // docs/writeback-file.md for the branch list.
     #[test]
     fn writeback_chunk_env_override_branches() {
         // SAFETY: this is the only test touching this env var, and it

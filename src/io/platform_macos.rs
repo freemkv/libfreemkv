@@ -2,13 +2,11 @@
 //!
 //! The `libc` crate doesn't expose these symbols across all macOS SDK
 //! versions, so we define them locally with values from
-//! `/usr/include/sys/fcntl.h`. Two call sites (
-//! [`crate::io::writeback_file`] and `crate::io::sink::preallocate`)
-//! need the same constants and `fstore_t` layout — keeping a single
-//! source of truth here prevents the two copies from drifting.
+//! `/usr/include/sys/fcntl.h`. See docs/platform-macos.md for why a
+//! single source of truth here matters and how the cfg gate works.
 //!
-//! Module-level cfg gate lives in the parent (`io/mod.rs`); this file
-//! is only compiled on macOS, so no inner `#![cfg]` is needed.
+//! [`crate::io::writeback_file`] and `crate::io::sink::preallocate`
+//! both depend on these constants and the `fstore_t` layout.
 
 /// `fcntl(F_PREALLOCATE)` command number from `sys/fcntl.h`.
 pub(crate) const F_PREALLOCATE: libc::c_int = 42;

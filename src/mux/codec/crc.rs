@@ -8,11 +8,9 @@
 //! exactly how these are used: compute over the whole frame (including its
 //! trailing CRC) and check `== 0`.
 
-/// CRC-16/ANSI (a.k.a. CRC-16/BUYPASS): polynomial 0x8005, init 0x0000,
-/// MSB-first, no reflection, no final XOR. Called by the AC-3/E-AC-3 frame-CRC
-/// gate (ETSI TS 102 366) and the FLAC frame footer. (The MPEG-audio and
-/// AAC-ADTS gates validate the header structurally and do not verify their
-/// optional CRC, so they do not call this.)
+// CRC-16/ANSI (CRC-16/BUYPASS): poly 0x8005, init 0, MSB-first, no
+// reflection, no final XOR. Used by AC-3/E-AC-3 frame-CRC (ETSI TS 102 366)
+// and FLAC frame footer; MPEG-audio/AAC-ADTS don't verify their optional CRC.
 pub(crate) fn crc16_ansi(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
     for &b in data {
@@ -28,19 +26,9 @@ pub(crate) fn crc16_ansi(data: &[u8]) -> u16 {
     crc
 }
 
-/// CRC-16 with polynomial 0x002D, init 0, MSB-first, used by the MLP / Dolby
-/// TrueHD major-sync header checksum.
-///
-/// NOTE: MLP's checksum is the "reversed" scheme. This function emits its two
-/// bytes in the OPPOSITE order to a standard little-endian CRC readout, so the
-/// caller swaps them back and compares against the stored trailer word read
-/// LITTLE-endian — see `truehd::mlp_major_sync_crc_ok`, which is authoritative.
-///
-/// Comparing big-endian instead is precisely the bug that function was fixed
-/// for: it could never validate a real extended major sync, so whole TrueHD
-/// tracks were dropped silently. This comment used to prescribe exactly that,
-/// and to point at a `truehd::mlp_major_sync_ok` that does not exist.
-/// Verified against real MLP/TrueHD bitstreams (225/225 major-sync AUs).
+// CRC-16, poly 0x002D, init 0, MSB-first — MLP/TrueHD major-sync checksum.
+// Emits bytes in reversed order vs a standard little-endian CRC readout;
+// see docs/crc.md for the swap-and-compare details and verification history.
 pub(crate) fn crc16_mlp(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
     for &b in data {

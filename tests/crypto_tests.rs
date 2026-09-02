@@ -77,11 +77,8 @@ fn css_is_scrambled_detection() {
 
 // ── AACS Public API Tests ───────────────────────────────────────────────────
 
-/// Test 6: aacs_decrypt_unit_roundtrip
-///
-/// Build a synthetic 6144-byte aligned unit with TS sync bytes, encrypt it
-/// using the AACS algorithm (AES-ECB header derivation + AES-CBC body),
-/// then decrypt with decrypt_unit() and verify the plaintext matches.
+// Test 6: build a synthetic aligned unit with TS sync bytes, encrypt via
+// AACS, decrypt with decrypt_unit(), and verify the plaintext matches.
 #[test]
 fn aacs_decrypt_unit_roundtrip() {
     use aes::Aes128;
@@ -209,10 +206,8 @@ fn aacs_disc_hash_deterministic() {
     );
 }
 
-/// Test: aacs_decrypt_unit_key_roundtrip
-///
-/// Verify that encrypting a unit key with AES-ECB and decrypting it with
-/// decrypt_unit_key recovers the original.
+// Test: verify that encrypting a unit key with AES-ECB and decrypting it
+// with decrypt_unit_key recovers the original.
 #[test]
 fn aacs_decrypt_unit_key_roundtrip() {
     use aes::Aes128;
@@ -308,12 +303,9 @@ fn aacs_is_clean_detection() {
     );
 }
 
-/// Test: aacs_clear_unit_reports_not_encrypted
-///
-/// `decrypt_unit` is now PURE (applies the key unconditionally). The "leave a
-/// clear unit untouched" policy lives at the caller's gate `aacs_unit_encrypted`:
-/// a CPI-clear unit reports not-encrypted, so the caller never hands it to
-/// decrypt_unit.
+// Test: decrypt_unit is PURE (applies the key unconditionally). The "leave
+// a clear unit untouched" policy lives at the caller's gate
+// aacs_unit_encrypted: a CPI-clear unit reports not-encrypted.
 #[test]
 fn aacs_clear_unit_reports_not_encrypted() {
     let mut unit = vec![0x42u8; aacs::content::ALIGNED_UNIT_LEN];
@@ -559,14 +551,8 @@ fn css_roundtrip_multiple_keys() {
 
 // ── CSS keyless recovery tests ─────────────────────────────────────────────
 
-/// Attempt the keyless recovery on synthetically scrambled sectors.
-///
-/// The CSS cipher on real DVDs stores ciphertext through a TAB1 output
-/// layer that the keyless recovery depends on. Synthetically scrambled
-/// sectors (produced by calling descramble_sector on plaintext) may not
-/// exhibit this relationship, so the attack is not guaranteed to converge
-/// on synthetic data. This test verifies that when the attack DOES return
-/// a key, that key correctly descrambles the sector.
+// Attempt keyless recovery on synthetically scrambled sectors; see
+// docs/css-keyless.md for why synthetic data may not converge.
 #[test]
 fn css_keyless_recovery_validates_cracked_key() {
     let candidates: &[([u8; 5], [u8; 5])] = &[

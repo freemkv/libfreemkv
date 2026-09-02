@@ -4,9 +4,9 @@
 
 # libfreemkv
 
-Rust library for 4K UHD / Blu-ray / DVD optical drives. Drive access, disc scanning, stream labels, AACS decryption, CSS decryption, KEYDB updates, and content reading in one crate. Drive-level unlocking is handled internally; consumers work with disc access and decryption only.
+Rust library for 4K UHD / Blu-ray / DVD optical drives. Drive access, disc scanning, stream labels, AACS decryption, CSS decryption, and content reading in one crate. Drive-level unlocking is handled internally; consumers work with disc access and decryption only.
 
-DVDs (CSS) decrypt out of the box. Blu-ray and UHD (AACS) require a `keydb.cfg` (default `~/.config/freemkv/keydb.cfg`) supplying disc-specific volume unique keys; no AACS key material is compiled in.
+DVDs (CSS) decrypt out of the box. Blu-ray and UHD (AACS) require disc-specific volume unique keys, supplied by the consumer (e.g. via [freemkv-keysources](https://github.com/freemkv/freemkv-keysources), which owns `keydb.cfg` lookup/download); libfreemkv itself never reads `keydb.cfg` or downloads keys, and no AACS key material is compiled in.
 
 **12+ MB/s** sustained read speeds on BD. Drive prep (`init()`) handles unlocking internally via the `freemkv-unlock` crate — clients never see it; when no drive unlock applies, the library rips via the host-certificate AACS handshake.
 
@@ -72,9 +72,8 @@ cannot call into it; front-ends get recovery from the engine directly. See
 - **Drive access** — open, identify, internal unlock + prep, speed control, eject
 - **12+ MB/s reads** — auto-detects kernel transfer limits, sustained full speed
 - **Disc scanning** — UDF 2.50 filesystem, MPLS playlists, CLPI clip info
-- **Stream labels** — 5 BD-J format parsers (Paramount, Criterion, Pixelogic, CTRM, Deluxe)
+- **Stream labels** — 7 BD-J format parsers (Paramount, Criterion, Pixelogic, CTRM, DBP, Deluxe, Fox)
 - **AACS decryption** — transparent key resolution and content decrypt (1.0 + 2.0 bus decryption)
-- **KEYDB updates** — download, verify, save from any HTTP URL (zero deps, raw TCP)
 - **Content reading** — adaptive batch reads with automatic decryption
 - **Stream I/O** — unified stream pipeline for reading and writing any format
 
@@ -96,7 +95,7 @@ Streams implement a single unified `pes::Stream` trait (re-exported as `PesStrea
 
 DVDs (CSS) decrypt out of the box, with no external key file needed.
 
-Blu-rays and UHD (AACS) require a `keydb.cfg` at `~/.config/freemkv/keydb.cfg` (or passed via `ScanOptions`). No AACS key material is compiled into the binary.
+Blu-rays and UHD (AACS) require Unit Keys passed in via `ScanOptions`/`KeySpec`. libfreemkv does not read `keydb.cfg` or fetch keys itself — that's the consumer's job (see [freemkv-keysources](https://github.com/freemkv/freemkv-keysources)). No AACS key material is compiled into the binary.
 
 ## Architecture
 
@@ -111,10 +110,9 @@ Disc                   — scan titles, streams, AACS/CSS state
   ├── MPLS parser      — playlists → titles + clips + streams
   ├── CLPI parser      — clip info → EP map → sector extents
   ├── IFO parser       — DVD title sets, PGC chains, cell addresses
-  ├── Labels           — 5 BD-J format parsers (detect + parse)
+  ├── Labels           — 7 BD-J format parsers (detect + parse)
   ├── AACS             — key resolution + content decryption
-  ├── CSS              — DVD CSS (bus auth → player-key disc crack → known-plaintext title-key attack)
-  └── KEYDB            — download + verify + save
+  └── CSS              — DVD CSS (bus auth → player-key disc crack → known-plaintext title-key attack)
 
 Streams                — unified PES pipeline
   ├── PesStream        — pes::Stream: one trait, read()/write() PES frames

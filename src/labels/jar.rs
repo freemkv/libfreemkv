@@ -13,12 +13,9 @@ use crate::udf::UdfFs;
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
-/// Upper bound on bytes read out of a single `.class` entry. The jar's
-/// uncompressed-size field is attacker-controlled disc metadata, so the
-/// buffer is grown incrementally and the read is capped here rather than
-/// pre-sized from the declared size. A real BD-J `.class` is far under
-/// this ceiling (64 MiB); a lying header simply gets truncated and the
-/// class fails to parse, which is skipped like any other bad entry.
+// Cap on bytes read from one `.class` entry — the jar's declared size
+// is attacker-controlled, so the buffer grows incrementally instead of
+// pre-sizing. See docs/jar.md — MAX_CLASS_BYTES rationale.
 const MAX_CLASS_BYTES: u64 = 64 * 1024 * 1024;
 
 /// In-memory zip archive: backed by a `Vec<u8>` read from UDF. Owns
@@ -31,9 +28,7 @@ pub type Jar = ZipArchive<Cursor<Vec<u8>>>;
 /// produces, or `None` if every jar was visited without a hit.
 ///
 /// "Top-level" means entries directly under `/BDMV/JAR/`, not nested
-/// under a subdir. (Pixelogic, Criterion, Paramount, etc. put their
-/// data files inside `/BDMV/JAR/<x>/`; dbp and Deluxe put their jar
-/// directly at `/BDMV/JAR/<name>.jar`.)
+/// under a subdir.
 ///
 /// Entries that fail to read from UDF or that aren't valid zips are
 /// silently skipped — same defensive shape as the existing dbp parser.
@@ -41,6 +36,7 @@ pub fn for_each_jar<R, F>(reader: &mut dyn SectorSource, udf: &UdfFs, mut f: F) 
 where
     F: FnMut(&str, &mut Jar) -> Option<R>,
 {
+    // See docs/jar.md — for_each_jar "top-level" vendor examples.
     let jar_dir = udf.find_dir("/BDMV/JAR")?;
     for entry in &jar_dir.entries {
         if entry.is_dir {
@@ -144,11 +140,9 @@ mod tests {
         0x00, 0x00, // attributes_count
     ];
 
-    /// Build a raw, single-entry, Stored (uncompressed) ZIP whose local
-    /// header and central directory both declare `declared_size` as the
-    /// uncompressed size, while the actual stored payload is `payload`.
-    /// This lets a test forge an attacker-controlled size field that does
-    /// not match the real data length.
+    // Build a raw, single-entry, Stored ZIP whose header declares
+    // `declared_size` as the uncompressed size while the actual stored
+    // payload is `payload` — forges an attacker-controlled size field.
     fn build_stored_zip(name: &str, payload: &[u8], declared_size: u32) -> Vec<u8> {
         let name_bytes = name.as_bytes();
         let crc: u32 = {
@@ -216,11 +210,9 @@ mod tests {
         ZipArchive::new(Cursor::new(bytes)).expect("valid zip")
     }
 
-    /// The doc comment states the cap is 64 MiB. Pin the exact numeric
-    /// value (not derived from the same `64 * 1024 * 1024` expression
-    /// under test — a hardcoded literal) so a mutation of the arithmetic
-    /// (e.g. `*` -> `+`) is caught even though no test builds an actual
-    /// 64 MiB buffer.
+    // Pins the exact 64 MiB value as a literal (not derived from the
+    // same expression under test) so an arithmetic mutation is caught
+    // even though no test builds a full 64 MiB buffer.
     #[test]
     fn max_class_bytes_is_64_mebibytes() {
         assert_eq!(MAX_CLASS_BYTES, 67_108_864);
@@ -265,10 +257,9 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    /// The uncompressed-size field is attacker-controlled. A tiny stored
-    /// entry that declares 0xFFFF_FFFF (≈4 GiB) must NOT trigger a 4 GiB
-    /// pre-allocation; with the incremental read the call completes and
-    /// the real (small) payload parses fine.
+    // Attacker-controlled size field (0xFFFF_FFFF ≈ 4 GiB) must not
+    // trigger a 4 GiB pre-allocation; incremental read completes and
+    // the real (small) payload parses fine.
     #[test]
     fn forged_huge_uncompressed_size_does_not_preallocate() {
         let mut jar = open(build_stored_zip("Evil.class", MINIMAL_CLASS, 0xFFFF_FFFF));
@@ -281,13 +272,9 @@ mod tests {
         assert!(parsed);
     }
 
-    /// The read is bounded by MAX_CLASS_BYTES: a stored entry whose real
-    /// payload exceeds the cap yields only the first MAX_CLASS_BYTES
-    /// bytes to the parser, never the full (unbounded) entry. Verified
-    /// here on a small cap via the entry-count path: the truncated bytes
-    /// still parse a valid class prefix, but no read beyond the cap
-    /// occurs. We assert the entry is still surfaced exactly once (the
-    /// cap does not drop legitimate entries) and the call returns.
+    // See docs/jar.md — read_is_bounded_by_cap rationale.
+    // Read is bounded by MAX_CLASS_BYTES; the entry still parses and
+    // is surfaced exactly once despite a forged huge declared size.
     #[test]
     fn read_is_bounded_by_cap() {
         // Padding past MINIMAL_CLASS is harmless trailing data the parser

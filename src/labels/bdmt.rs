@@ -1,38 +1,22 @@
 //! BDMV disc-library metadata (`/BDMV/META/DL/bdmt_<lang>.xml`).
 //!
-//! Every commercial Blu-ray carries a disc-library metadata directory
-//! with one XML file per shipped language. The schema is the Blu-ray
-//! "disc library metadata" namespace (`urn:BDA:bdmv;disclibmeta`),
-//! conventionally prefixed `di:`. Fields commonly present:
+//! Parses the Blu-ray disc-library metadata XML (`urn:BDA:bdmv;disclibmeta`,
+//! prefix `di:`) into title, description, and disc-set position per
+//! language. Invoked from the disc-scan path in [`labels`](super)
+//! ([`detect`] then [`parse`]); [`DiscMetadata`] is re-exported there.
+//! Extraction is best-effort — a malformed file yields `None`, other
+//! sibling-language files can still supply metadata.
 //!
-//! - `<di:title>` or `<di:name>` — the title string. Vendor practice
-//!   varies (Paramount discs tend to use `<di:name>`).
-//! - `<di:description>` — optional synopsis (often absent on retail
-//!   discs; common on box sets and special editions).
-//! - `<di:discNumber>` / `<di:numSets>` (or `<di:numberOfSets>`) —
-//!   set position for multi-disc releases.
-//!
-//! This module is intentionally separate from the BD-J `StreamLabel`
-//! parsers under `labels/*.rs`. The XML here is disc-level (title,
-//! description, set position), not per-stream. It is invoked from the
-//! disc-scan path in [`labels`](super) ([`detect`] then [`parse`]),
-//! and [`DiscMetadata`] is re-exported there.
-//!
-//! Real-world XML is irregular: missing description elements, multiple
-//! title elements (first one wins), and occasional malformed content.
-//! Extraction is best-effort — a malformed file is treated as "no
-//! metadata" (returns `None` from the helper), and the caller can
-//! still get metadata from sibling-language XML files.
+//! See docs/bdmt.md — schema fields, vendor quirks, real-world irregularities.
 
 use super::xml;
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::BTreeMap;
 
-/// Upper bound on the size of a single `bdmt_<lang>.xml` we will read.
-/// The size comes from attacker-controlled UDF metadata; real files are
-/// a few KB, so 1 MiB is generous while preventing a crafted huge-size
-/// entry from triggering an oversized allocation in `read_file`.
+// Upper bound on a single bdmt_<lang>.xml we will read. Size is
+// attacker-controlled UDF metadata; real files are a few KB. See
+// docs/bdmt.md — MAX_BDMT_BYTES.
 const MAX_BDMT_BYTES: u64 = 1024 * 1024;
 
 /// Disc-level metadata extracted from `/BDMV/META/DL/bdmt_*.xml`.
@@ -147,13 +131,9 @@ fn lang_code_from_filename(name: &str) -> Option<String> {
 /// Aliased so the function signature isn't a clippy::type-complexity offender.
 pub(crate) type BdmtFields = (String, Option<String>, Option<(u32, u32)>);
 
-/// Parse one `bdmt_<lang>.xml` document and return
-/// `(title, description?, disc_set?)`. Returns `None` if no title
-/// could be located — the caller treats this as "skip this file".
-///
-/// Title-element preference: `<di:name>` → `<di:title>` →
-/// `<di:tableOfContents>/<di:titleName>` (first match wins, per the
-/// authoring-tool conventions documented at the module level).
+// Parse one bdmt_<lang>.xml document into (title, description?, disc_set?).
+// None if no title could be located. See docs/bdmt.md — parse_bdmt_xml
+// title-element priority order.
 pub(crate) fn parse_bdmt_xml(xml_text: &str) -> Option<BdmtFields> {
     let title = extract_title(xml_text)?;
     // xml::text already returns a trimmed string (see xml::text), so the
@@ -165,11 +145,9 @@ pub(crate) fn parse_bdmt_xml(xml_text: &str) -> Option<BdmtFields> {
     Some((title, description, disc_set))
 }
 
-/// Reject candidate description strings that are themselves XML
-/// fragments — observed on a captured disc, where
-/// `<di:description>` contained `<di:thumbnail href="…"/>` child
-/// elements and no actual prose. Surfacing that raw to the JSON
-/// output is worse than dropping the field entirely.
+// Reject description candidates that are themselves XML fragments (e.g.
+// only <di:thumbnail/> children, no prose). See docs/bdmt.md —
+// looks_like_xml.
 fn looks_like_xml(s: &str) -> bool {
     let t = s.trim_start();
     t.starts_with('<')
@@ -545,11 +523,9 @@ mod tests {
         assert_eq!(set, None);
     }
 
-    /// Whitespace-only title element must be treated as empty (trimmed → "").
-    /// Spec: xml::text trims; an all-whitespace element produces "" after trim,
-    /// which the title-extraction logic should skip.
-    /// Mutation: remove the `!s.is_empty()` guard in extract_title →
-    /// whitespace-only di:name would be returned as the title.
+    // Whitespace-only title element must be treated as empty (trimmed → "").
+    // Mutation: remove the `!s.is_empty()` guard in extract_title →
+    // whitespace-only di:name would be returned as the title.
     #[test]
     fn whitespace_only_di_name_falls_through() {
         let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
@@ -560,10 +536,8 @@ mod tests {
         assert_eq!(title, "Real Title");
     }
 
-    /// `is_bdmt_filename` must recognize the `bdmt_<lang>.xml` convention
-    /// and reject everything else — it drives `detect`'s directory scan.
-    /// Mutation: stub the return to a constant `true`/`false` → every
-    /// directory listing (or none) would match regardless of filename.
+    // is_bdmt_filename must recognize bdmt_<lang>.xml and reject everything
+    // else — it drives detect's directory scan.
     #[test]
     fn is_bdmt_filename_matches_convention_only() {
         assert!(is_bdmt_filename("bdmt_eng.xml"));
@@ -573,11 +547,8 @@ mod tests {
         assert!(!is_bdmt_filename("foo.xml"));
     }
 
-    /// Spec: "Disc 1 of 1" (a single-disc release whose bdmt XML still
-    /// carries `<di:numSets>1</di:numSets>`) is a valid, non-nonsensical
-    /// pair — `total < 1` must reject only `total == 0`, not `total == 1`.
-    /// Mutation: `total < 1` -> `total == 1` or `total <= 1` would reject
-    /// this legitimate (1, 1) pair as if it were malformed.
+    // "Disc 1 of 1" is a valid, non-nonsensical pair — total < 1 must
+    // reject only total == 0, not total == 1.
     #[test]
     fn disc_set_allows_single_disc_release() {
         let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">

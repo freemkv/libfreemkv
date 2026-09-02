@@ -1,14 +1,11 @@
-//! Paramount/onQ — `playlists.xml`
+//! Paramount/onQ — `playlists.xml`. Richest structured format: complete
+//! language lists with forced flags and commentary indices per playlist,
+//! all in XML attributes.
 //!
-//! Richest structured format. Complete language lists with forced flags
-//! and commentary indices per playlist, all in XML attributes.
-//!
-//! NOT A SPECIFICATION. `/BDMV/JAR/` is application-defined space, so this
-//! file is one authoring house's internal metadata that happens to ship on
-//! the pressing. There is nothing to look up: every field meaning here was
-//! derived by measuring real discs and cross-checking against per-display-set
-//! content. Treat an unfamiliar value as unknown rather than guessing — the
-//! disc's own `forced_on_flag` is the only authoritative forced signal.
+//! NOT A SPECIFICATION: `/BDMV/JAR/` is application-defined space; every
+//! field meaning here was derived by measuring real discs — see
+//! docs/paramount.md for the derivation. The disc's own `forced_on_flag`
+//! is the only authoritative forced signal.
 //!
 //! ```xml
 //! <playlist name="Feature" id="00222"
@@ -65,46 +62,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     Some(result)
 }
 
-/// One cell of the `forced_sub` CSV.
-///
-/// The attribute reads like a boolean and was parsed as one (`cell == "1"` →
-/// forced). It is not. Every image in the corpus carrying this vendor's
-/// `playlists.xml` — seven distinct discs — uses four values, and decoding
-/// three of those discs' feature subtitle tracks and counting every PGS
-/// display set separates them into two populations two orders of magnitude
-/// apart:
-///
-///   * `0` — a subtitle track with no forced-narrative content. On the two
-///     discs measured that use the flag at all, not one `0` track carried a
-///     single `forced_on_flag` display set.
-///   * `1` — a FULL DIALOGUE track that additionally contains some
-///     forced-narrative signs. On one measured disc, all nine `1` cells are
-///     full tracks of 949-1411 display sets, eight of them carrying 5-14
-///     flagged sets and the ninth none; that disc has no dedicated forced
-///     track at all. On another, all seven `1` cells are full tracks of
-///     1602-1651 display sets carrying 0-31 flagged sets. Reading `1` as
-///     forced is what made one language present as two identical full
-///     subtitle tracks with one of them flagged forced.
-///   * `2` and `3` — a DEDICATED forced-narrative track. These take their own
-///     trailing STN slots, one per localized language, duplicating a language
-///     that already holds a full track earlier in the list. Measured: the two
-///     `2` slots on one disc are 15 and 10 display sets, EVERY one flagged
-///     forced, against ~1600 on that disc's full tracks; the four `3` slots on
-///     another are 7, 14, 23 and 59 display sets against 1216-2655. What
-///     distinguishes `2` from `3` the corpus does not reveal — both sit in the
-///     same trailing position, both measure the same shape, and one disc uses
-///     each for a different language — so both map alike.
-///
-/// So the old reading was wrong in BOTH directions: it flagged full dialogue
-/// tracks forced, and it discarded the cells that name the real forced tracks.
-///
-/// The `1` case is deliberately NOT carried through as a weaker "contains
-/// forced segments" hint. There is no qualifier for that, and the asymmetry
-/// argues against inventing one here: a wrong forced flag on a 30 MB dialogue
-/// track is the user-visible defect, while a missing hint costs nothing.
-///
-/// An unrecognised cell maps to [`ForcedSub::None`] — the conservative
-/// direction, since asserting forced is the expensive mistake.
+// One cell of the `forced_sub` CSV. Reads like a boolean but is an
+// enumeration; see docs/paramount.md for the corpus measurements behind
+// each value. Unrecognised cells map to `None` — the conservative direction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ForcedSub {
     /// No forced-narrative content, or an unrecognised cell.
@@ -115,39 +75,14 @@ enum ForcedSub {
     ForcedNarrative,
 }
 
-/// The one number behind every cap in this parser: the highest CSV cell
-/// position that can ever be addressed.
-///
-/// The labelling loops number cells 1-based into a `u16` and `break` at
-/// `u16::try_from(i + 1)`, so cell `MAX_COM_INDICES` and everything past it is
-/// never visited. Two different things are measured against that, and they are
-/// not the same bound:
-///
-/// - **A VALUE at or beyond it cannot match any cell.** This is what caps the
-///   set: values are filtered before insertion, so at most `MAX_COM_INDICES`
-///   distinct entries can ever be stored, however long the attribute is. The
-///   `HashSet` that replaced a linear scan fixed the LOOKUP cost; this is what
-///   fixes the ALLOCATION, and a disc declaring half a billion indices no
-///   longer costs half a billion entries.
-/// - **A POSITION at or beyond it describes nothing new.** This caps the WORK,
-///   not the memory — the value filter already made the set small, but without
-///   it every one of those half a billion cells is still split and parsed. It
-///   is an early exit at the first position whose contents provably cannot
-///   matter, and it is why `forced_sub` — which holds no set at all, and so
-///   gets no protection from the value rule — is bounded too.
-///
-/// Real authoring is nowhere near either limit: the BD STN table admits at
-/// most 32 streams per playlist, so nothing legitimate is lost.
+// The highest CSV cell position that can ever be addressed — caps both the
+// VALUE set size and the WORK done per cell. See docs/paramount.md for why
+// those are two different bounds. Real authoring never approaches it.
 const MAX_COM_INDICES: usize = u16::MAX as usize;
 
-/// Parse a `*_com1_idx` attribute into the set the labelling loops query.
-///
-/// Extracted so the BOUND is observable. Asserting it through
-/// `labels_from_feature` is not possible: a `HashSet` collapses repeated
-/// values, and an out-of-range index changes no label either way, so such a
-/// test passes whether or not the cap exists — an assertion that cannot fail.
-/// Returning the set lets a test hand in tens of thousands of DISTINCT
-/// unaddressable indices and see them refused.
+// Parse a `*_com1_idx` attribute into the set the labelling loops query.
+// Extracted so the bound is independently testable — see docs/paramount.md
+// (`com_indices` / `forced_subs`) for why a label-level test cannot see it.
 fn com_indices(attr: Option<String>) -> HashSet<usize> {
     attr.map(|s| {
         s.split(',')
@@ -159,20 +94,9 @@ fn com_indices(attr: Option<String>) -> HashSet<usize> {
     .unwrap_or_default()
 }
 
-/// Parse the `forced_sub` attribute into the cell list the subtitle loop
-/// queries — the third attacker-controlled CSV in this file, and the last one
-/// that was still unbounded.
-///
-/// Bounded by POSITION, and it has no other choice: a `*_com1_idx` list holds
-/// values that can be filtered, and that filter is what caps its set, but a
-/// `forced_sub` cell is a classification of the position it sits at, so there
-/// is nothing to filter and nothing else would ever cap this. The Vec is read
-/// only as `forced.get(i)` from a loop that stops at `MAX_COM_INDICES`, so
-/// every cell past that is unreachable by construction.
-///
-/// Extracted, like [`com_indices`], so the bound is OBSERVABLE. Through
-/// `labels_from_feature` it is not: the subtitle loop cannot reach those cells
-/// either, so a label-level assertion passes whether or not the cap exists.
+// Parse `forced_sub` into the cell list the subtitle loop queries. Bounded
+// by POSITION rather than value (nothing to filter on a classification) —
+// see docs/paramount.md (`com_indices` / `forced_subs`) for why.
 fn forced_subs(attr: Option<String>) -> Vec<ForcedSub> {
     attr.map(|s| {
         s.split(',')
@@ -191,10 +115,9 @@ fn forced_sub_cell(cell: &str) -> ForcedSub {
     }
 }
 
-/// Build the stream labels from a single `<playlist .../>` feature
-/// element. Split out from `parse` so the per-type numbering and
-/// commentary/forced-index logic is unit-testable without a
-/// `SectorSource`/`UdfFs`.
+// Build the stream labels from a single `<playlist .../>` feature element.
+// Split out from `parse` so numbering/commentary/forced-index logic is
+// unit-testable without a `SectorSource`/`UdfFs`.
 fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
     let mut labels = Vec::new();
 
@@ -323,23 +246,9 @@ fn find_feature_playlist(text: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Immunity pin, section-boundary half. The pixelogic parser walks a flat
-    /// string sequence and recognises its feature section's END by marker
-    /// alone, so a section with no marker behind it runs off into whatever
-    /// follows and counts it as more STN slots. Nothing here can do that: the
-    /// stream list is one attribute of one XML element, so its length is the
-    /// CSV's own cell count and its scope is the element's byte range that
-    /// `xml::find_element` returns. Text after the element — including the
-    /// next playlist's own `aud` — is not reachable from it.
-    ///
-    /// And when the boundary is MISSING the failure is closed, not open:
-    /// `xml::find_element` needs a matching close tag and yields `None`
-    /// without one, so an unterminated element ends the walk rather than
-    /// swallowing the rest of the document.
-    ///
-    /// Mutation: hand `labels_from_feature` the document instead of the
-    /// element, or let an unterminated element run to EOF → the bonus
-    /// playlist's languages join the feature's stream list.
+    // Immunity pin, section-boundary half — see docs/paramount.md.
+    // Mutation: hand `labels_from_feature` the document instead of the
+    // element, or let an unterminated element run to EOF.
     #[test]
     fn a_playlists_stream_list_cannot_run_into_the_next_playlist() {
         let doc = r#"
@@ -374,32 +283,9 @@ mod tests {
         );
     }
 
-    /// `sub_com1_idx` is parsed straight out of the disc's `playlists.xml`,
-    /// which is attacker-controlled and has no length bound of its own.
-    ///
-    /// This replaces a WALL-CLOCK test. That one built a 200 000 x 1 000 001
-    /// fixture and failed if it took over 10 s, to prove the membership test
-    /// was a set rather than a linear scan. Measured on the machine that
-    /// wrote this: 1.62 s alone, and OVER 10 s — a real failure — when the
-    /// suite's other 3 347 tests were running concurrently. A 6x margin
-    /// against a shared CPU is not a margin; it is a CI failure that looks
-    /// like a flake and gets re-run until it passes.
-    ///
-    /// It also measured the wrong thing. Making the lookup O(1) bounded the
-    /// QUERY, not the PARSE: the set was still built from every entry the
-    /// disc declared, so a hostile playlist could still force an unbounded
-    /// allocation before any lookup happened. `MAX_COM_INDICES` bounds that.
-    ///
-    /// What THIS test guards is that bounding did not change what a
-    /// legitimate playlist MEANS: it goes red if the bound is set too LOW
-    /// (verified at 2 — the real indices `0,2,4` stop resolving and the
-    /// purposes change). It does NOT go red if the bound is deleted
-    /// entirely, because the out-of-range filler is unobservable at the
-    /// label level and a `HashSet` collapses the repeats. Enforcement is
-    /// proven separately, by
-    /// `distinct_unaddressable_indices_are_refused_not_stored`, which reads
-    /// the set itself. Two tests, two properties; neither pretends to the
-    /// other's job.
+    // Replaces a flaky wall-clock test; see docs/paramount.md for why.
+    // Guards that bounding the parse did not change what a legitimate
+    // playlist MEANS (real indices `0,2,4` must still resolve).
     #[test]
     fn bounding_the_parse_does_not_change_a_legitimate_playlist() {
         // Three real indices, then far more entries than can address a cell.
@@ -424,13 +310,9 @@ mod tests {
         assert_eq!(labels[4].purpose, LabelPurpose::Commentary);
     }
 
-    /// The set REFUSES unaddressable indices, so a hostile playlist cannot
-    /// inflate it. DISTINCT values on purpose: a `HashSet` collapses repeats,
-    /// so a million copies of one index costs one entry and would prove
-    /// nothing. Fifty thousand distinct out-of-range indices cost fifty
-    /// thousand entries without the filter, and none with it — so this test
-    /// goes red if the bound is removed, which the label-level assertions
-    /// below cannot do.
+    // The set REFUSES unaddressable indices. DISTINCT values on purpose — a
+    // `HashSet` collapses repeats, so only distinct entries can prove the
+    // filter exists; see docs/paramount.md for the full rationale.
     #[test]
     fn distinct_unaddressable_indices_are_refused_not_stored() {
         let hostile: String = (MAX_COM_INDICES..MAX_COM_INDICES + 50_000)
@@ -447,13 +329,9 @@ mod tests {
         assert_eq!(com_indices(Some("0,2,4".to_string())).len(), 3);
     }
 
-    /// `forced_sub` is bounded too — the third CSV in the same function, and
-    /// the one that had no value filter to hide behind.
-    ///
-    /// Read through `forced_subs` rather than through the labels for the same
-    /// reason the two tests above read the set: the subtitle loop stops at
-    /// `MAX_COM_INDICES`, so a label-level assertion cannot tell a bounded
-    /// parse from an unbounded one.
+    // `forced_sub` is bounded too, and read through `forced_subs` rather
+    // than the labels for the same reason as the tests above — see
+    // docs/paramount.md.
     #[test]
     fn forced_sub_cells_past_the_last_addressable_one_are_not_parsed() {
         let hostile = "0,".repeat(MAX_COM_INDICES + 50_000);
@@ -482,12 +360,9 @@ mod tests {
         );
     }
 
-    /// An index that cannot address any cell is dropped rather than STORED.
-    ///
-    /// Asserted through `com_indices`, not through the labels: the labelling
-    /// loop never queries a cell position that high, so at the label level
-    /// retaining the value is unobservable and the assertion could not fail.
-    /// Reading the set is what makes the claim checkable.
+    // An index that cannot address any cell is dropped rather than STORED.
+    // Asserted through `com_indices`, not the labels — see docs/paramount.md
+    // for why a label-level assertion here could not fail.
     #[test]
     fn an_index_that_cannot_address_any_cell_is_not_retained() {
         let set = com_indices(Some(format!(
@@ -537,16 +412,9 @@ mod tests {
             .collect()
     }
 
-    /// The `aud` / `sub` CSVs are the vendor's STN-ordered stream lists: one
-    /// slot per stream, and `aud_com1_idx` / `forced_sub` are indexed against
-    /// those same slot positions. A slot whose language cell is empty carries
-    /// nothing to label but still OCCUPIES its slot, so it must not renumber
-    /// the slots behind it.
-    ///
-    /// Numbering only the slots that carry a language collapsed every later
-    /// label one position forward per empty cell, which is how a forced
-    /// marker authored for one STN slot lands on the full-subtitle track in
-    /// front of it.
+    // An empty CSV cell carries nothing to label but still OCCUPIES its STN
+    // slot, so it must not renumber the slots behind it — see
+    // docs/paramount.md for how the old renumbering misplaced a forced flag.
     #[test]
     fn empty_csv_slot_still_occupies_its_stn_slot() {
         // Audio: slot 2 is empty; `fra` is STN slot 3 and is the commentary
@@ -661,10 +529,9 @@ mod tests {
         assert!(feature.contains(r#"name="MainMovie""#));
     }
 
-    /// Spec: stream_number for audio is the cell's own 1-based CSV position,
-    /// because the CSV is the STN list and empty cells are slots too.
-    /// Mutation: count only non-empty cells → every label behind an empty
-    /// cell shifts one slot forward.
+    // Spec: stream_number is the cell's own 1-based CSV position, since
+    // empty cells are slots too. Mutation: count only non-empty cells →
+    // every label behind an empty cell shifts one slot forward.
     #[test]
     fn audio_stream_numbering_uses_raw_csv_slot_position() {
         let feature = r#"<playlist name="Feature" aud="eng,,fra,,spa" />"#;
@@ -699,10 +566,9 @@ mod tests {
         assert_eq!(s[2].stream_number, 5);
     }
 
-    /// Spec: aud_com1_idx is positional against the raw CSV.
-    /// When the index refers to a slot before an empty gap, the gap does
-    /// not shift what stream is labeled as commentary.
-    /// Mutation: use stream_number instead of raw CSV index → wrong stream is commentary.
+    // Spec: aud_com1_idx is positional against the raw CSV, so an empty
+    // gap before the index does not shift what's labeled commentary.
+    // Mutation: use stream_number instead of raw CSV index.
     #[test]
     fn audio_commentary_index_raw_csv_position() {
         // aud="eng,,fra,spa" aud_com1_idx="2" → CSV index 2 = "fra",
@@ -791,21 +657,9 @@ mod tests {
         assert_eq!(s[2].qualifier, LabelQualifier::None);
     }
 
-    /// `forced_sub` is an enumeration, and `1` is its "full dialogue track that
-    /// also carries forced signs" value — NOT "this track is forced".
-    ///
-    /// Measured on a disc whose feature declares nine `1` cells among 32
-    /// subtitle slots: all nine are full dialogue tracks of 949-1411 display
-    /// sets, and the disc has no dedicated forced track at all. Reading `1` as
-    /// forced is what produced two identical full subtitle tracks for one
-    /// language with one of them flagged forced.
-    ///
-    /// Nothing downstream can undo this on the discs that need it most:
-    /// `mux::codec::pgs::demotable` may only clear a vendor forced label where
-    /// some track on the disc demonstrably sets `forced_on_flag`, and measured
-    /// discs using this label format never set it.
-    ///
-    /// Mutation: `"1" => ForcedNarrative` (the old reading) → red.
+    // `forced_sub` is an enumeration; `1` means "full dialogue track that
+    // also carries forced signs", NOT "this track is forced" — see
+    // docs/paramount.md. Mutation: `"1" => ForcedNarrative` (old reading).
     #[test]
     fn a_contains_forced_segments_cell_is_not_a_forced_track() {
         let feature = r#"<playlist name="Feature" sub="eng,ces,deu" forced_sub="0,1,1" />"#;
@@ -818,18 +672,9 @@ mod tests {
         );
     }
 
-    /// `2` and `3` are the cells that DO name a dedicated forced-narrative
-    /// track, and the old boolean reading discarded both.
-    ///
-    /// Measured: these cells occupy their own trailing STN slots, one per
-    /// localized language, duplicating a language that already holds a full
-    /// track earlier in the list. On one measured disc the four `3` slots carry
-    /// 7, 14, 23 and 59 display sets against 1216-2655 on the full tracks they
-    /// duplicate — and not one display set anywhere on that disc carries
-    /// `forced_on_flag`, so neither the scan probe nor the muxer can promote
-    /// them from content. The vendor cell is the only evidence there is.
-    ///
-    /// Mutation: drop either arm of the `"2" | "3"` match → red.
+    // `2` and `3` are the cells that DO name a dedicated forced-narrative
+    // track, and the old boolean reading discarded both — see
+    // docs/paramount.md. Mutation: drop either arm of the `"2" | "3"` match.
     #[test]
     fn a_dedicated_forced_narrative_cell_is_a_forced_track() {
         // The measured shape: full tracks first, their forced companions in
@@ -847,12 +692,9 @@ mod tests {
         assert_eq!(s[4].stream_number, 5);
     }
 
-    /// An unrecognised cell must fall to NOT forced. Asserting forced is the
-    /// expensive mistake (a full dialogue track a player then burns on screen),
-    /// so an unknown value from a future authoring revision must not be able to
-    /// make that claim.
-    ///
-    /// Mutation: `_ => ForcedNarrative`, or treating "any non-zero" as forced.
+    // An unrecognised cell must fall to NOT forced — asserting forced is
+    // the expensive mistake (see docs/paramount.md). Mutation:
+    // `_ => ForcedNarrative`, or treating "any non-zero" as forced.
     #[test]
     fn an_unrecognised_forced_sub_cell_is_not_forced() {
         let feature = r#"<playlist name="Feature" sub="eng,fra,spa,ita" forced_sub="4,x,,-1" />"#;
@@ -874,12 +716,9 @@ mod tests {
         assert!(find_feature_playlist("<root />").is_none());
     }
 
-    /// Spec: on a tie in audio-slot count, the FIRST playlist encountered
-    /// wins (consistent with `select_result`'s first-wins tiebreak
-    /// elsewhere in the registry) — later playlists only displace the
-    /// current best on a STRICTLY greater count.
-    /// Mutation: `count > best_aud_count` -> `count >= best_aud_count`
-    /// would let a later tied playlist silently displace the first.
+    // Spec: on a tie in audio-slot count, the FIRST playlist wins (see
+    // docs/paramount.md). Mutation: `count > best_aud_count` ->
+    // `count >= best_aud_count` lets a later tie silently displace it.
     #[test]
     fn find_feature_first_wins_on_audio_count_tie() {
         let xml = r#"

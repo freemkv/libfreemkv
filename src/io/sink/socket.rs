@@ -1,23 +1,10 @@
 //! TCP / UDP socket sinks (sequential-only).
 //!
-//! [`SocketSink`] wraps a `TcpStream` in a 1 MiB `BufWriter`. Constructor
-//! tunes `SO_SNDBUF` to a caller hint when provided. `finish()` flushes
-//! the buffer then `shutdown(Write)`s the socket so the peer sees clean
-//! end-of-stream.
-//!
-//! [`UdpSocketSink`] wraps a connected `UdpSocket`. Each `write` call
-//! emits exactly one datagram — the caller is responsible for packetizing
-//! to a reasonable MTU (188 × 7 = 1316 bytes for MPEG-TS-over-UDP is the
-//! conventional choice). `finish()` is a no-op; UDP has no end-of-stream
-//! marker.
-//!
-//! Both types implement [`SequentialSink`] explicitly so their
-//! `finish()` dispatches correctly through a `dyn SequentialSink` trait
-//! object (the `SocketSink` override drains the buffer and
-//! `shutdown(Write)`s; the `UdpSocketSink` override flushes only).
-//! Neither implements `Seek`, so neither satisfies [`RandomAccessSink`]
-//! — using one with `MkvMux` is a compile error, which is the design
-//! intent.
+//! [`SocketSink`] wraps a `TcpStream` in a 1 MiB `BufWriter`; `finish()`
+//! flushes then `shutdown(Write)`s for a clean end-of-stream.
+//! [`UdpSocketSink`] wraps a connected `UdpSocket`; each `write` emits
+//! one datagram and `finish()` is a no-op. Neither implements `Seek`,
+//! so neither satisfies [`RandomAccessSink`]. See docs/socket.md.
 //!
 //! [`SequentialSink`]: super::SequentialSink
 //! [`RandomAccessSink`]: super::RandomAccessSink
@@ -27,10 +14,9 @@ use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 
 use super::SequentialSink;
 
-/// `BufWriter` capacity for [`SocketSink`]. 1 MiB matches the typical
-/// kernel send-buffer ceiling and keeps small-write amplification from
-/// containers (TS = 188-byte packets, fMP4 fragment headers = ~100 bytes)
-/// from translating into syscall storms.
+// `BufWriter` capacity for `SocketSink`. 1 MiB matches the typical
+// kernel send-buffer ceiling; see docs/socket.md for the amplification
+// rationale.
 const TCP_BUF_CAPACITY: usize = 1024 * 1024;
 
 /// Sequential-only sink over a TCP connection.
@@ -81,10 +67,8 @@ impl Write for SocketSink {
 }
 
 impl SequentialSink for SocketSink {
-    /// Drain the BufWriter and `shutdown(Write)` the underlying socket
-    /// so the peer sees a clean EOF. Overriding the trait default is
-    /// what makes a `dyn SequentialSink` `finish()` send the buffered
-    /// tail and the EOF instead of silently dropping them.
+    // Drains the BufWriter and shuts down writes so a `dyn SequentialSink`
+    // `finish()` sends the buffered tail and EOF instead of dropping them.
     fn finish(&mut self) -> io::Result<()> {
         self.buf.flush()?;
         // `shutdown(Write)` signals clean EOF to the peer. Errors here
@@ -151,10 +135,8 @@ impl Write for UdpSocketSink {
 }
 
 impl SequentialSink for UdpSocketSink {
-    /// UDP has no end-of-stream marker, so there is nothing to shut
-    /// down; `write` already sent each datagram unbuffered. Flush is a
-    /// no-op but kept explicit so the trait-object `finish()` matches
-    /// the concrete behaviour.
+    // No-op: `write` already sent each datagram unbuffered, and UDP has
+    // no end-of-stream marker to shut down.
     fn finish(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -284,14 +266,8 @@ mod tests {
 
     // ── Added hardening tests ───────────────────────────────────────
 
-    /// `SocketSink::finish` must signal a clean EOF to the peer via
-    /// `shutdown(Write)` (lines 91-97). The receiving side's
-    /// `read_to_end` only returns when it observes that EOF — if
-    /// `finish` merely flushed without the shutdown, `read_to_end`
-    /// would block forever (the socket stays half-open). We assert the
-    /// receiver completes promptly AND sees the buffered tail.
-    /// Mutation: replacing the `shutdown(Write)` line with `Ok(())`
-    /// makes the accept thread hang and the join times out.
+    // `finish` must `shutdown(Write)` so the peer's `read_to_end` sees EOF
+    // instead of blocking forever. See docs/socket.md — test notes.
     #[test]
     fn finish_signals_eof_to_peer() {
         use std::sync::mpsc;
@@ -318,13 +294,8 @@ mod tests {
         assert_eq!(received, b"unflushed-tail");
     }
 
-    /// UDP `write` must emit ONE datagram per call carrying exactly the
-    /// bytes passed — no buffering, no coalescing (doc lines 100-108).
-    /// Two writes of different lengths must arrive as two separate
-    /// datagrams of those exact lengths, in order. Mutation: adding a
-    /// BufWriter to UdpSocketSink (the doc explicitly forbids it) would
-    /// merge these into one datagram and the second `recv` would time
-    /// out.
+    // UDP `write` must emit one datagram per call, no coalescing. See
+    // docs/socket.md — test notes.
     #[test]
     fn udp_write_is_one_datagram_per_call() {
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -349,11 +320,8 @@ mod tests {
         assert!(buf[..second].iter().all(|&b| b == 0xBB));
     }
 
-    /// UDP `finish` is a documented no-op (lines 157-165): there is no
-    /// EOF marker for UDP. Calling it must not error and must not
-    /// affect prior datagrams. Mutation: if `finish` tried to
-    /// `shutdown` the UDP socket it could error or close it
-    /// prematurely; here it must just return Ok.
+    // UDP `finish` is a documented no-op; must not error. See
+    // docs/socket.md — test notes.
     #[test]
     fn udp_finish_is_noop_ok() {
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();

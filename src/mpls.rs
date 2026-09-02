@@ -40,12 +40,9 @@ pub(crate) struct PlaylistMark {
 }
 
 impl PlaylistMark {
-    /// Is this mark a chapter entry point?
-    ///
-    /// Only `mark_type == 1` counts. Type 0 is reserved and type 2 is a link
-    /// point, and neither is a chapter. Every chapter filter in the crate goes
-    /// through here: two hand-rolled copies had already drifted, one testing
-    /// `<= 1` and silently counting reserved marks as chapters.
+    // Only mark_type == 1 is a chapter (0 = reserved, 2 = link point).
+    // Route all chapter filters through here; a hand-rolled `<= 1` copy
+    // once drifted and silently counted reserved marks as chapters.
     pub(crate) fn is_chapter_mark(&self) -> bool {
         self.mark_type == 1
     }
@@ -334,10 +331,9 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
     })
 }
 
-/// Parse one stream entry from the STN table.
-/// Returns (StreamEntry, next position) or None.
-/// BD `stream_entry()` type codes (the `stream_entry_type` field). Determine
-/// where the PID sits within the entry — see `parse_stream_entry`.
+// Parse one stream entry from the STN table.
+// Returns (StreamEntry, next position) or None. BD `stream_entry()` type
+// codes (`stream_entry_type` field); determine where the PID sits — see `parse_stream_entry`.
 const STREAM_ENTRY_PLAYITEM_CLIP: u8 = 0x01; // stream in the PlayItem's Clip
 const STREAM_ENTRY_SUBPATH_SUBCLIP: u8 = 0x02; // stream in a SubPath SubClip
 const STREAM_ENTRY_SUBPATH_CLIP: u8 = 0x03; // stream in a SubPath clip
@@ -480,8 +476,8 @@ mod tests {
         play_items_data: &[(
             /*clip_id*/ &[u8; 5],
             /*conn*/ u8,
-            /*in_time*/ u32,
-            /*out_time*/ u32,
+            /*in_time, out_time*/ u32,
+            u32,
         )],
         stn_counts: (u8, u8, u8, u8, u8, u8, u8, u8),
         stream_entries: &[Vec<u8>], // raw stream entry + attributes bytes for each stream
@@ -493,8 +489,8 @@ mod tests {
         play_items_data: &[(
             /*clip_id*/ &[u8; 5],
             /*conn*/ u8,
-            /*in_time*/ u32,
-            /*out_time*/ u32,
+            /*in_time, out_time*/ u32,
+            u32,
         )],
         stn_counts: (u8, u8, u8, u8, u8, u8, u8, u8),
         stream_entries: &[Vec<u8>],
@@ -609,11 +605,9 @@ mod tests {
         buf
     }
 
-    /// Build a stream entry (stream_entry part + stream_attributes part).
-    /// stream_entry: type=0x01 (PlayItem stream), PID given.
-    /// For video: attrs = coding_type(1) + format_rate(1) [+ hdr_byte if HEVC]
-    /// For audio: attrs = coding_type(1) + format_rate(1) + language(3)
-    /// For PG:    attrs = coding_type(1) + language(3)
+    // Build a stream entry (stream_entry part + stream_attributes part),
+    // type=0x01 (PlayItem stream). Video attrs: coding_type+format_rate
+    // [+hdr if HEVC]; audio adds language(3); PG: coding_type+language(3).
     fn build_stream_entry_video(
         pid: u16,
         coding_type: u8,
@@ -1014,10 +1008,8 @@ mod tests {
 
     // ─── Added hardening tests below, grounded in the BD-ROM MPLS spec byte layout ───
 
-    /// Header guard: parse() requires `playlist_start + 10 <= data.len()`
-    /// before reading the PlayList header (num_play_items at pl[6..8]).
-    /// A playlist_start that points past EOF must be rejected with
-    /// MplsParse, not panic.
+    // Header guard: parse() requires `playlist_start + 10 <= data.len()` before
+    // reading the PlayList header. A playlist_start past EOF must error, not panic.
     #[test]
     fn playlist_start_past_eof_errs() {
         let mut data = build_mpls(&[(b"00001", 1, 0, 9000000)], (0, 0, 0, 0, 0, 0, 0, 0), &[]);
@@ -1026,10 +1018,9 @@ mod tests {
         assert!(parse(&data).is_err());
     }
 
-    /// connection_condition is the LOW nibble of PlayItem byte[10] (the high
-    /// nibble carries reserved bits and the is_multi_angle flag at bit 4).
-    /// byte[9] is entirely reserved and must NOT be read. A byte[10] of 0xF5
-    /// must yield 5, and a non-zero byte[9] must not leak into the value.
+    // connection_condition is the LOW nibble of PlayItem byte[10] (high nibble
+    // is reserved + is_multi_angle flag). byte[9] is reserved and must not leak
+    // in; byte[10] = 0xF5 must yield 5 even with a non-zero byte[9].
     #[test]
     fn connection_condition_is_low_nibble_only() {
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
@@ -1048,10 +1039,9 @@ mod tests {
         assert_eq!(pl.play_items[0].connection_condition, 0x05);
     }
 
-    /// stream_entry() PID location for type 0x02 (stream in a SubPath
-    /// SubClip): subpath_id(1)+subclip_id(1) precede the PID, so PID is at
-    /// +4 within the entry. A parser that read +2 (type-1 layout) would
-    /// pick up the subpath/subclip bytes as the PID.
+    // stream_entry() PID location for type 0x02 (SubPath SubClip):
+    // subpath_id(1)+subclip_id(1) precede the PID, so PID is at +4. A parser
+    // reading +2 (type-1 layout) would wrongly pick up subpath/subclip bytes.
     #[test]
     fn stream_entry_type2_pid_at_offset_4() {
         // Build a primary-audio entry with stream_entry type 0x02.
@@ -1141,10 +1131,9 @@ mod tests {
         assert_eq!(pl.streams[0].video_rate, 4);
     }
 
-    /// HDR byte (HEVC only, coding_type 0x24): sa[2] high nibble =
-    /// dynamic_range, low nibble = color_space. For a non-HEVC video
-    /// (e.g. H264 0x1B) the HDR byte must NOT be consumed even if present,
-    /// per the `coding_type == 0x24` guard.
+    // HDR byte (HEVC only, coding_type 0x24): sa[2] hi nibble = dynamic_range,
+    // lo nibble = color_space. Non-HEVC video (e.g. H264 0x1B) must not
+    // consume it even if present, per the `coding_type == 0x24` guard.
     #[test]
     fn hdr_byte_only_for_hevc() {
         // H264 video with a third attr byte present — must stay SDR/unknown.
@@ -1160,10 +1149,9 @@ mod tests {
         assert_eq!(pl.streams[0].color_space, 0);
     }
 
-    /// Audio language is at sa[2..5] (after coding_type + format_rate),
-    /// EXCEPT when the audio slot carries a PG coding_type (0x90/0x91),
-    /// where the layout is coding_type(1)+language(3) → lang at sa[1..4].
-    /// This branch is explicit in source. Verify the PG-in-audio path.
+    // Audio language is at sa[2..5] normally, EXCEPT when the audio slot
+    // carries a PG coding_type (0x90/0x91): layout is coding_type(1)+lang(3),
+    // so lang is at sa[1..4]. Verify the PG-in-audio path.
     #[test]
     fn pg_coding_in_audio_slot_uses_pg_lang_offset() {
         // Audio-slot entry but coding_type 0x90 (PGS): attrs = 0x90 + lang(3).
@@ -1186,10 +1174,9 @@ mod tests {
         assert_eq!(pl.streams[0].audio_format, 0);
     }
 
-    /// IG streams (count n_ig, stream_type 4) are consumed to keep the STN
-    /// cursor aligned but NEVER retained as StreamEntry (doc'd in source).
-    /// An STN with 1 video + 1 IG + 1 PG must report exactly the video and
-    /// PG, and the PG must keep its correct PID (proving IG advanced spos).
+    // IG streams (n_ig, stream_type 4) are consumed to keep the STN cursor
+    // aligned but NEVER retained as StreamEntry. Placing a DV EL right after
+    // IG proves spos still advanced correctly past the dropped IG entry.
     #[test]
     fn ig_consumed_but_not_retained_and_dv_after_aligned() {
         // STN parse order is video, audio, PG, IG, sec_audio, sec_video, pip_pg, DV.
@@ -1214,11 +1201,9 @@ mod tests {
         assert!(pl.streams.iter().all(|s| s.pid != 0x1400));
     }
 
-    /// parse_stream_entry short-circuits when the declared stream_entry
-    /// length runs past the item end (`se_end > item.len()` → None). The
-    /// STN count loop then `break`s, so a truncated entry yields fewer
-    /// streams without panicking. Build n_video=2 but only enough bytes
-    /// for 1 full entry plus a too-long second.
+    // parse_stream_entry short-circuits when the declared length runs past
+    // the item end (`se_end > item.len()` → None); the STN count loop then
+    // `break`s. Build n_video=2 but only enough bytes for 1 full entry.
     #[test]
     fn truncated_stream_entry_stops_without_panic() {
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
@@ -1235,11 +1220,9 @@ mod tests {
         assert_eq!(pl.streams[0].pid, 0x1011);
     }
 
-    /// PID must be bounded by the entry's declared se_end, not item.len():
-    /// a short se_len must leave PID 0 rather than reading into the
-    /// following stream_attributes region (explicit in source comment).
-    /// se_len=1 (only the type byte) for a type-1 entry → PID read would
-    /// need bytes at +2/+3 which are inside attrs, so PID must be 0.
+    // PID must be bounded by the entry's declared se_end, not item.len(): a
+    // short se_len must leave PID 0 rather than reading into stream_attributes.
+    // se_len=1 (type byte only) means the PID bytes at +2/+3 fall in attrs.
     #[test]
     fn short_se_len_does_not_read_pid_from_attrs() {
         // se_len = 1: just the type byte, no PID bytes within the entry.
@@ -1303,10 +1286,9 @@ mod tests {
         assert_eq!(pl.marks[0].timestamp, 0x0A0B0C0D);
     }
 
-    /// num_marks is read from ms[4..6] (after length(4)). Each entry is
-    /// strictly 14 bytes. The loop must stop when fewer than 14 bytes
-    /// remain (`mpos + 14 > ms.len()` → break) rather than panic, so a
-    /// num_marks that overshoots the actual byte count is safe.
+    // num_marks is read from ms[4..6]; each entry is strictly 14 bytes. The
+    // loop must stop when fewer than 14 bytes remain (`mpos + 14 > ms.len()`
+    // → break) rather than panic, so an overshooting num_marks is safe.
     #[test]
     fn mark_count_overshoot_truncates_safely() {
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
@@ -1356,10 +1338,9 @@ mod tests {
         assert_eq!(pl.marks.len(), 0);
     }
 
-    /// A PlayItem whose declared item_length leaves fewer than 20 bytes of
-    /// body is skipped (`item.len() < 20` → continue) — its clip_id/times
-    /// are not parsed, but the cursor advances and following items still
-    /// parse. Grounded in the `if item.len() < 20` guard.
+    // A PlayItem whose item_length leaves fewer than 20 bytes of body is
+    // skipped (`item.len() < 20` → continue): clip_id/times aren't parsed,
+    // but the cursor advances and following items still parse.
     #[test]
     fn short_play_item_skipped_cursor_advances() {
         // Construct two items manually: a short (10-byte) first item, then
@@ -1474,10 +1455,9 @@ mod tests {
         assert!(pl.streams.is_empty(), "no STN table exists below byte 32");
     }
 
-    /// A 40-byte MPLS whose PlayList section is exactly its 10-byte header
-    /// (length(4)+reserved(2)+num_play_items(2)+num_sub_paths(2)) ending at
-    /// EOF is structurally complete, not truncated: nothing the parser reads
-    /// lies past the buffer, so it must parse to an empty playlist.
+    // A 40-byte MPLS whose PlayList section is exactly its 10-byte header
+    // ending at EOF is structurally complete, not truncated: nothing the
+    // parser reads lies past the buffer, so it must parse to an empty playlist.
     #[test]
     fn minimum_size_mpls_with_empty_playlist_header_parses() {
         let mut data = vec![0u8; 40];
@@ -1510,17 +1490,7 @@ mod tests {
         );
     }
 
-    /// Full STN table walk with every category populated and DISTINCT
-    /// counts, so no count byte can be read from a neighbour's offset
-    /// without changing the result.
-    ///
-    /// Each secondary block is followed by its reference block(s), which
-    /// per the BD STN table are num_refs(1) + reserved(1) + one byte per
-    /// ref + one padding byte when the ref count is odd. Every ref count
-    /// here is 1 — the value that distinguishes `n % 2` (=1) from `n / 2`
-    /// (=0) — so a wrong skip length misaligns the cursor and every
-    /// following stream decodes from the wrong offset. IG entries are
-    /// consumed to keep the cursor aligned but never retained.
+    // See docs/mpls.md — STN Table Secondary Block Alignment (test coverage note)
     #[test]
     fn full_stn_table_block_alignment() {
         let mut entries: Vec<Vec<u8>> = vec![
@@ -1585,10 +1555,9 @@ mod tests {
         assert_eq!(pl.streams[8].language, "jpn");
     }
 
-    /// A secondary block whose stream entry ends exactly at the end of the
-    /// PlayItem has no reference block at all; the count byte must not be
-    /// read from one-past-the-end. Covers all three secondary blocks that
-    /// carry reference data.
+    // A secondary block whose stream entry ends exactly at the end of the
+    // PlayItem has no reference block at all; the count byte must not be
+    // read from one-past-the-end. Covers all three secondary ref blocks.
     #[test]
     fn secondary_ref_block_at_item_end_is_not_read() {
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
@@ -1677,10 +1646,9 @@ mod tests {
         assert!(parse_stream_entry(&item, 0, STREAM_CATEGORY_VIDEO).is_none());
     }
 
-    /// stream_attributes of exactly 1 byte carries only the coding_type.
-    /// That is the minimum the parser accepts, so the entry is returned
-    /// with its PID and coding_type and no format-specific fields — for a
-    /// PG stream the 3-byte language must NOT be read past the attributes.
+    // stream_attributes of exactly 1 byte carries only the coding_type — the
+    // minimum accepted, so the entry returns with no format-specific fields;
+    // for a PG stream the 3-byte language must NOT be read past attributes.
     #[test]
     fn one_byte_stream_attributes_yields_bare_entry() {
         // se_len = 3 → se_end = 4; sa_len = 1 → sa_end = 6 == item.len().
@@ -1701,11 +1669,9 @@ mod tests {
         assert_eq!(entry.language, "");
     }
 
-    /// Type 0 is reserved and type 2 is a link point; neither is a chapter.
-    /// `labels::collect_chapter_summary` used to filter on `mark_type <= 1`,
-    /// which counted reserved marks and inflated the public `chapter_count`
-    /// (and let a playlist whose only marks are reserved pass the
-    /// `chapter_count == 0` skip). Both call sites now share this predicate.
+    // Type 0 is reserved, type 2 a link point; neither is a chapter.
+    // `labels::collect_chapter_summary` once filtered on `mark_type <= 1`,
+    // inflating `chapter_count`. Both call sites now share this predicate.
     #[test]
     fn only_entry_marks_count_as_chapters() {
         let mk = |mark_type| PlaylistMark {

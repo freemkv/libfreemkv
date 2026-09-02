@@ -15,15 +15,9 @@ const IOCTL_SCSI_PASS_THROUGH_DIRECT: u32 = 0x4D014;
 /// IOCTL_STORAGE_QUERY_PROPERTY — CTL_CODE(IOCTL_STORAGE_BASE(0x2D),
 /// 0x500, METHOD_BUFFERED(0), FILE_ANY_ACCESS(0)) = 0x002D1400.
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
-/// IOCTL_STORAGE_RESET_DEVICE (ntddstor.h) —
-/// CTL_CODE(IOCTL_STORAGE_BASE=0x2D, 0x0401, METHOD_BUFFERED=0,
-/// FILE_READ_ACCESS=1) = (0x2D<<16) | (1<<14) | (0x0401<<2) | 0
-/// = 0x002D0000 | 0x4000 | 0x1004 = 0x002D5004.
-/// Two earlier values were wrong: 0x002D1004 (function 0x401 but access
-/// bits cleared) and 0x002DD000 (function 0x400 + R|W access — the
-/// OBSOLETE RESET_BUS code class drivers reject). Both made
-/// `DeviceIoControl` fail ERROR_INVALID_FUNCTION, silently skipping the
-/// reset. See the value-regression test at the bottom of this module.
+// IOCTL_STORAGE_RESET_DEVICE (ntddstor.h) = 0x002D5004. Two earlier values
+// silently no-op'd the reset (ERROR_INVALID_FUNCTION) instead of failing
+// loud. See docs/scsi-windows.md — IOCTL_STORAGE_RESET_DEVICE derivation.
 const IOCTL_STORAGE_RESET_DEVICE: u32 = 0x002D_5004;
 /// STORAGE_PROPERTY_ID::StorageAdapterProperty.
 const STORAGE_ADAPTER_PROPERTY: u32 = 1;
@@ -89,14 +83,9 @@ struct StoragePropertyQuery {
     AdditionalParameters: [u8; 1],
 }
 
-/// Subset of `STORAGE_ADAPTER_DESCRIPTOR` (winioctl.h) up to and including
-/// `MaximumTransferLength`. The real struct has more trailing fields, but
-/// the driver fills the whole thing and we only read this prefix; reading a
-/// truncated descriptor is the documented usage. Field layout (all the
-/// leading fields are present so the offset of `MaximumTransferLength` is
-/// correct):
-///   Version, Size, MaximumTransferLength, MaximumPhysicalPages,
-///   AlignmentMask: u32 …
+// Prefix of `STORAGE_ADAPTER_DESCRIPTOR` (winioctl.h) up to
+// `MaximumTransferLength`; the driver fills the whole thing, we only read
+// this prefix. See docs/scsi-windows.md — StorageAdapterDescriptor field layout.
 #[repr(C)]
 #[allow(non_snake_case)]
 struct StorageAdapterDescriptor {
@@ -156,27 +145,19 @@ pub struct SptiTransport {
     /// `DeviceIoControl` outright, so [`crate::Drive::read`] chunks to it.
     max_transfer: usize,
     /// Adapter `AlignmentMask` (STORAGE_ADAPTER_DESCRIPTOR, ntddscsi.h /
-    /// winioctl.h), queried alongside `max_transfer`. It is a *mask*: `0`
-    /// (the common case on USB optical bridges) means the DataBuffer may
-    /// sit at any address; `3` means DWORD-aligned, `7` 8-byte, etc. —
-    /// always one less than the required alignment. SCSI/SAS HBAs report
-    /// nonzero masks, and IOCTL_SCSI_PASS_THROUGH_DIRECT rejects a
-    /// misaligned `DataBuffer` (DeviceIoControl fails → all reads return
-    /// transport failure / status 0xFF). When set and the caller's buffer
-    /// is misaligned, `execute()` bounces through an aligned scratch
-    /// buffer (see there).
+    /// winioctl.h), queried alongside `max_transfer`. `0` (common on USB
+    /// bridges) means no alignment requirement; a nonzero mask (SCSI/SAS
+    /// HBAs) means a misaligned `DataBuffer` makes `DeviceIoControl` fail.
+    /// When set and the caller's buffer is misaligned, `execute()` bounces
+    /// through an aligned scratch buffer (see there).
+    /// See docs/scsi-windows.md — alignment_mask / bounce-buffer rationale.
     alignment_mask: u32,
 }
 
-// SptiTransport's only field is an isize HANDLE, so the compiler
-// auto-derives BOTH Send and Sync. Exclusive use of the raw handle is
-// enforced by `&mut self` on `execute()`, not by any absence of Sync.
+// SptiTransport's only field is an isize HANDLE: Send+Sync auto-derive;
+// `&mut self` on execute() enforces exclusive use, not absence of Sync.
 
-/// Normalize a device path to Windows \\.\X: format.
-///
-/// NOTE: A near-identical `normalize_path` exists in `drive::windows`.
-/// Both are kept because they live in separate `cfg(windows)` modules that
-/// cannot easily share a helper without introducing cross-module coupling.
+// Normalize a device path to \\.\X: format; see docs/scsi-windows.md — normalize_device_path duplication.
 fn normalize_device_path(path: &str) -> String {
     if path.starts_with("\\\\.\\") {
         return path.to_string();
@@ -347,21 +328,9 @@ impl Drop for SptiTransport {
     }
 }
 
-/// Query the storage adapter descriptor via IOCTL_STORAGE_QUERY_PROPERTY /
-/// StorageAdapterProperty and return `(max_transfer_bytes, alignment_mask)`.
-///
-/// `max_transfer_bytes`: the adapter's `MaximumTransferLength`. On any
-/// failure (IOCTL failed, short reply, or a nonsensical zero) falls back to
-/// the conservative [`WINDOWS_MIN_TRANSFER_BYTES`]; otherwise clamped up to
-/// that floor. Never 0.
-///
-/// `alignment_mask`: the adapter's `AlignmentMask` (offset 16 in
-/// STORAGE_ADAPTER_DESCRIPTOR). `0` means no alignment requirement (the
-/// common case for USB optical bridges). A nonzero mask (SCSI/SAS HBAs)
-/// forces `execute()` to bounce the DataBuffer through an aligned scratch
-/// buffer. If the reply is too short to include `AlignmentMask`, returns
-/// `0` (no requirement) — the safe default, since any address satisfies a
-/// zero mask and the descriptor's leading fields are read first regardless.
+// Query the adapter descriptor via IOCTL_STORAGE_QUERY_PROPERTY; returns
+// (max_transfer_bytes, alignment_mask), both safely defaulted on failure.
+// See docs/scsi-windows.md — query_adapter_descriptor contract.
 fn query_adapter_descriptor(handle: isize) -> (usize, u32) {
     if handle == INVALID_HANDLE_VALUE {
         return (WINDOWS_MIN_TRANSFER_BYTES, 0);
@@ -567,13 +536,9 @@ impl ScsiTransport for SptiTransport {
 mod tests {
     use super::*;
 
-    /// Regression guard for `SptiTransport::reset()`. Two earlier IOCTL
-    /// values (0x002D1004 and 0x002DD000) silently failed with
-    /// ERROR_INVALID_FUNCTION while appearing to work — the reset no-oped
-    /// but the unconditional settle sleep made it look successful. This
-    /// recomputes IOCTL_STORAGE_RESET_DEVICE from the CTL_CODE formula
-    /// independently of the hardcoded constant so a wrong value can't slip
-    /// back in unnoticed.
+    // Regression guard for `SptiTransport::reset()`: recomputes
+    // IOCTL_STORAGE_RESET_DEVICE from the CTL_CODE formula, independently of
+    // the hardcoded constant. See docs/scsi-windows.md — IOCTL_STORAGE_RESET_DEVICE derivation.
     #[test]
     fn ioctl_storage_reset_device_value_is_correct() {
         // CTL_CODE(DeviceType, Function, Method, Access) =
@@ -603,13 +568,9 @@ mod tests {
         assert_ne!(IOCTL_STORAGE_RESET_DEVICE, 0x002D_D000);
     }
 
-    /// Regression guard for the `StorageAdapterDescriptor` layout. It must
-    /// match `STORAGE_ADAPTER_DESCRIPTOR` (winioctl.h) field-for-field so a
-    /// driver-filled buffer is interpreted at the correct offsets. `BusType`
-    /// is `STORAGE_BUS_TYPE`, an `int`-sized (4-byte) enum, NOT a byte; a
-    /// previous `u8` declaration kept the total size at 32 by coincidence but
-    /// shifted `BusMajorVersion`/`BusMinorVersion` to offsets 26/28 (vs the
-    /// SDK's 28/30), so any reader of those fields got wrong values.
+    // Regression guard: `StorageAdapterDescriptor` must match
+    // `STORAGE_ADAPTER_DESCRIPTOR` (winioctl.h) field-for-field. See
+    // docs/scsi-windows.md — StorageAdapterDescriptor field layout.
     #[test]
     fn storage_adapter_descriptor_matches_sdk_layout() {
         use std::mem::{offset_of, size_of};
@@ -638,18 +599,9 @@ mod tests {
         assert_eq!(size_of::<StorageAdapterDescriptor>(), 32);
     }
 
-    /// Regression guard for the `ScsiPassThroughDirect` layout, cross-checked
-    /// against the authoritative `SCSI_PASS_THROUGH_DIRECT` in the Windows SDK
-    /// `ntddscsi.h`. That struct has **no `#pragma pack`** — it uses natural
-    /// alignment — so on 64-bit Windows (LLP64, 8-byte `PVOID`) the compiler
-    /// pads `DataBuffer` to offset 24 and the struct is 56 bytes. That is the
-    /// layout `DeviceIoControl` expects, and bare `#[repr(C)]` reproduces it.
-    ///
-    /// Do NOT add `packed(4)`: that yields offset 20 / 48 bytes, which is the
-    /// SDK's SEPARATE 32-bit thunk struct `SCSI_PASS_THROUGH_DIRECT32`
-    /// (`VOID* POINTER_32 DataBuffer`). Using that 32-bit layout on a 64-bit
-    /// host malforms every SPTI ioctl, so INQUIRY fails and drive enumeration
-    /// returns zero drives (the rc.4 Windows "no drives detected" regression).
+    // Regression guard for `ScsiPassThroughDirect`, cross-checked against
+    // the SDK's `SCSI_PASS_THROUGH_DIRECT` (natural alignment, no pack).
+    // Do NOT add `packed(4)` — see docs/scsi-windows.md — ScsiPassThroughDirect layout, cross-checked against SDK.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn scsi_pass_through_direct_matches_sdk_layout_win64() {
@@ -668,10 +620,9 @@ mod tests {
         assert_eq!(size_of::<SptwbDirect>(), 56 + K_SENSE_SIZE);
     }
 
-    /// Cross-checked against `STORAGE_PROPERTY_QUERY` (winioctl.h):
-    /// `STORAGE_PROPERTY_ID PropertyId; STORAGE_QUERY_TYPE QueryType;
-    /// BYTE AdditionalParameters[1];`. Both enums are `int`-sized (4 bytes),
-    /// so PropertyId@0, QueryType@4, AdditionalParameters@8, size 12.
+    // Cross-checked against `STORAGE_PROPERTY_QUERY` (winioctl.h): both
+    // enums are `int`-sized, so PropertyId@0, QueryType@4,
+    // AdditionalParameters@8, size 12.
     #[test]
     fn storage_property_query_matches_sdk_layout() {
         use std::mem::{offset_of, size_of};
@@ -681,11 +632,9 @@ mod tests {
         assert_eq!(size_of::<StoragePropertyQuery>(), 12);
     }
 
-    /// Cross-checked against the Windows SDK headers. Each IOCTL is asserted
-    /// against an INDEPENDENT re-derivation of the `CTL_CODE` macro
-    /// (devioctl.h: `(DeviceType<<16) | (Access<<14) | (Function<<2) | Method`),
-    /// not just its literal — so a mistyped constant fails the derivation, not
-    /// a tautology. Flag/enum values cite their defining header.
+    // Cross-checked against the Windows SDK headers: each IOCTL is asserted
+    // against an independent re-derivation of `CTL_CODE`, not just its
+    // literal. See docs/scsi-windows.md — windows_ffi_constants_match_sdk test rationale.
     #[test]
     fn windows_ffi_constants_match_sdk() {
         // CTL_CODE re-derivation. FILE_DEVICE_CONTROLLER=0x4,

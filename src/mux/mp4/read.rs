@@ -3,12 +3,11 @@
 //! The inverse of the writer in [`super`]: parse `moov`/`trak`/`stbl`, rebuild a
 //! [`DiscTitle`] and a per-sample index (offset/size/timing/sync from
 //! `stsc`+`stco`/`co64`+`stsz`, `stts`+`ctts`, `stss`), then stream each sample
-//! out as a [`PesFrame`] in decode order. Video NALs are length-prefixed in MP4 —
-//! exactly the framing the MKV muxer consumes — so `mp4://` → `mkv://` (and
-//! `mp4://` → any sink) needs no reframing.
+//! out as a [`PesFrame`] in decode order. Video NALs are length-prefixed in MP4,
+//! so `mp4://` → any sink needs no reframing.
 //!
-//! Scope: progressive MP4 (`moov` + `mdat`). Fragmented MP4 (`moof`) is out of
-//! scope for now — its samples live in `traf`/`trun`, not `stbl`.
+//! Scope: progressive MP4 (`moov` + `mdat`); fragmented MP4 (`moof`, samples in
+//! `traf`/`trun`) is out of scope for now.
 
 use crate::disc::{
     AudioChannels, AudioStream, Codec, DiscTitle, Resolution, SampleRate, Stream as DiscStream,
@@ -22,35 +21,20 @@ use std::path::Path;
 
 const NS: i128 = 1_000_000_000;
 
-/// Upper bound on the number of tracks. Track count is otherwise unbounded (a
-/// crafted moov can pack tens of thousands of `trak` boxes), and the per-track
-/// PID is `0x1011 + track_idx` — which overflows u16 past ~61k tracks. Real
-/// titles have well under a hundred tracks.
+// Upper bound on the number of tracks — the per-track PID (`0x1011 +
+// track_idx`) overflows u16 past ~61k. See docs/mp4-read.md — MAX_TRACKS.
 const MAX_TRACKS: usize = 512;
 
-/// Upper bound on a track's decoded sample count. MP4 sample-table fields
-/// (`stsz` sample_count, `stts`/`ctts` run-lengths) are untrusted 32-bit values;
-/// a crafted box can declare billions of entries in a few bytes. Real titles stay
-/// far under this (a 10 h/60 fps track is ~2M samples), so clamping to it caps a
-/// hostile file's allocation without truncating any legitimate track.
+// Upper bound on a track's decoded sample count; caps a crafted box's
+// allocation. See docs/mp4-read.md — MAX_SAMPLE_COUNT.
 const MAX_SAMPLE_COUNT: usize = 1 << 24;
 
-/// Smallest number of FILE bytes one indexed sample is assumed to occupy — the
-/// divisor that turns `file_len` into a sample-count budget (see `from_reader`).
-///
-/// Only `vide` and `soun` tracks are indexed here, and no real coded video or
-/// audio access unit is anywhere near this small: the shortest legal AC-3 frame is
-/// 128 bytes, an AAC frame is hundreds, and a video sample carries at least a NAL
-/// header plus slice data. A 2-hour title runs to thousands of file bytes per
-/// sample, so this cannot truncate a genuine track — it only stops a crafted
-/// sample table from claiming more samples than the file could possibly hold.
+// Smallest FILE bytes one indexed sample is assumed to occupy (divisor for
+// `from_reader`'s sample budget). See docs/mp4-read.md — MIN_FILE_BYTES_PER_SAMPLE.
 const MIN_FILE_BYTES_PER_SAMPLE: u64 = 16;
 
-/// Absolute ceiling on a single allocation sized from an untrusted MP4 field (a
-/// per-sample buffer or the `moov` payload). The EOF check alone is not enough:
-/// `file_len` is cheaply inflatable with a sparse file (`truncate -s 8G`), so a
-/// crafted stsz size or moov box size just under an 8 GiB apparent length would
-/// otherwise force a multi-GiB allocation. No real sample or moov approaches this.
+// Ceiling on a single allocation sized from an untrusted MP4 field, since a
+// sparse file can inflate `file_len` cheaply. See docs/mp4-read.md — MAX_ALLOC_BYTES.
 const MAX_ALLOC_BYTES: u64 = 256 << 20; // 256 MiB
 
 /// One sample's location + timing in the emission plan.
@@ -435,10 +419,9 @@ fn find_box<'a>(payload: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
     find_boxes_capped(payload, want, 1).into_iter().next()
 }
 
-/// All child boxes of `payload` with the given type (each as its payload slice),
-/// stopping after `cap` matches so a caller that only processes the first `cap`
-/// never forces an oversized Vec of slice fat-pointers from a crafted payload
-/// packed with minimum-size boxes. Pass `usize::MAX` for "all matches".
+// All child boxes of `payload` with the given type, stopping after `cap`
+// matches so a crafted payload of minimum-size boxes can't force an
+// oversized Vec. Pass `usize::MAX` for "all matches".
 fn find_boxes_capped<'a>(payload: &'a [u8], want: &[u8; 4], cap: usize) -> Vec<&'a [u8]> {
     let mut out = Vec::new();
     let mut pos = 0;
@@ -485,21 +468,17 @@ fn mvhd_timescale(b: &[u8]) -> Option<u32> {
     }
 }
 
-/// Upper bound on parsed `elst` entries. Only the leading empty edits and the
-/// FIRST non-empty edit shape the offset applied below, so a longer list buys
-/// nothing but allocation; the cap keeps a crafted 256 MiB `moov` from turning
-/// a box into a larger Vec than the box itself.
+// Upper bound on parsed `elst` entries: only the leading empty edits and the
+// FIRST non-empty edit matter, so a cap keeps a crafted `moov` from turning
+// a box into a larger Vec than the box itself.
 const MAX_ELST_ENTRIES: usize = 1024;
 
-/// One `elst` entry: `(segment_duration, media_time, media_rate_integer)`.
+// One `elst` entry: `(segment_duration, media_time, media_rate_integer)`.
 type EditListEntry = (u64, i64, i16);
 
-/// Parse an `elst` payload (ISO/IEC 14496-12 §8.6.6). Entry count is clamped
-/// both by the box's own bytes and by [`MAX_ELST_ENTRIES`].
-///
-/// Version 1 entries are `segment_duration:u64, media_time:i64,
-/// media_rate_integer:i16, media_rate_fraction:i16` (20 bytes); version 0 uses
-/// 32-bit duration/time (12 bytes).
+// Parse an `elst` payload (ISO/IEC 14496-12 §8.6.6), clamped by the box's
+// own bytes and by `MAX_ELST_ENTRIES`. Version 1 entries are 20 bytes
+// (u64+i64+i16+i16); version 0 uses 32-bit duration/time (12 bytes).
 fn parse_elst(b: &[u8]) -> Vec<EditListEntry> {
     // `<`↔`<=` here is equivalent, not a coverage gap: at `b.len() == 8` falling
     // through computes `available = (b.len() - 8) / entry_size = 0`, floors `n`
@@ -546,20 +525,9 @@ fn parse_elst(b: &[u8]) -> Vec<EditListEntry> {
     out
 }
 
-/// Presentation-time offset an edit list imposes on a track's samples, in the
-/// track's MEDIA timescale ticks (ISO/IEC 14496-12 §8.6.5-§8.6.6).
-///
-/// Two constructs cover essentially every real edit list, and both reduce to a
-/// constant shift of the whole track:
-///   * an EMPTY edit (`media_time == -1`) before the media edit, whose
-///     `segment_duration` — in MOVIE timescale ticks — delays presentation;
-///   * a non-empty edit whose `media_time` trims that much media off the front.
-///
-/// So the offset is `(sum of leading empty segment_durations) - media_time`.
-/// A list with several non-empty edits, or a non-empty edit at a rate other than
-/// 1, describes a timeline this frame model cannot express (it would need samples
-/// dropped, reordered or repeated); the leading edit is still honoured, and the
-/// part that is not is LOGGED rather than passed off as a faithful copy.
+// Presentation-time offset an edit list imposes on a track's samples, in
+// MEDIA timescale ticks: (sum of leading empty segment_durations) minus the
+// first non-empty edit's media_time. See docs/mp4-read.md — elst_offset_ticks.
 fn elst_offset_ticks(
     entries: &[EditListEntry],
     movie_timescale: Option<u32>,
@@ -995,12 +963,9 @@ fn parse_stss(b: &[u8]) -> std::collections::HashSet<u32> {
 mod tests {
     use super::*;
 
-    /// A `Read + Seek` backed by a small crafted prefix followed by an endless
-    /// run of zeros, reporting `len` bytes total on `seek(End)`. Lets a test
-    /// exercise a hundred-MiB-to-multi-GiB boundary (`MAX_ALLOC_BYTES`, a
-    /// sparse-file-inflated `file_len`) without a real backing allocation of
-    /// that size for the SOURCE side — only the destination buffer the code
-    /// under test allocates is real, which is the point of the test.
+    // `Read + Seek` backed by a small crafted prefix + endless zeros, reporting
+    // `len` bytes on `seek(End)` — exercises MAX_ALLOC_BYTES-scale reads
+    // without a real multi-GiB source allocation. See docs/mp4-read.md — FakeBigReader.
     struct FakeBigReader {
         prefix: Vec<u8>,
         pos: u64,
@@ -1033,16 +998,9 @@ mod tests {
         }
     }
 
-    /// `parse_stss` had no direct positive-path test anywhere in this file —
-    /// only its short-buffer safety was pinned. Two real, distinct entries in
-    /// a buffer sized to exactly fit them (`b.len() == 16`, so the second
-    /// entry's `o + 4 == b.len()` exactly) separates every arithmetic mutant
-    /// at once: an `o = 8 + i*4` → `8 - i*4` slip reads the `count` field
-    /// instead of the second entry; an `i*4` → `i/4` slip re-reads the FIRST
-    /// entry for the second (integer division collapses `i=1` back to the
-    /// same offset as `i=0`); and an `o + 4 > b.len()` → `o + 4 < b.len()`
-    /// slip breaks out on the very first entry, because there IS more room
-    /// after it (`12 < 16`) — leaving the set empty instead of holding both.
+    // Positive-path test for `parse_stss`: two distinct entries in a buffer
+    // sized to exactly fit them, catching offset/stride arithmetic mutants.
+    // See docs/mp4-read.md — parse_stss_reads_two_distinct_entries.
     #[test]
     fn parse_stss_reads_two_distinct_entries_from_their_own_offsets() {
         let mut b = vec![0u8, 0, 0, 0]; // version+flags
@@ -1058,14 +1016,9 @@ mod tests {
         );
     }
 
-    /// A declared `count` larger than the box can hold (a lie, or a truncated
-    /// box) must be bounded by the per-entry guard, not by trusting the
-    /// count — the SAME contract `parse_stco`/`parse_stsc`/`parse_stts` pin
-    /// with their own "count lie" tests. Bounded HERE means the loop must
-    /// stop, not read past the end: an `o + 4 > b.len()` → `o - 4 > b.len()`
-    /// mutant almost never fires (`o - 4` stays small for every realistic
-    /// `o`), so it lets the loop walk straight past a truncated box into an
-    /// out-of-bounds `be32` read.
+    // A declared `count` larger than the box can hold must be bounded by the
+    // per-entry guard, not trusted — same contract as stco/stsc/stts.
+    // See docs/mp4-read.md — parse_stss_count_lie.
     #[test]
     fn parse_stss_count_lie_is_bounded_by_the_box_not_trusted() {
         let mut b = vec![0u8, 0, 0, 0];
@@ -1116,12 +1069,9 @@ mod tests {
         assert_eq!(offs[1], u64::MAX, "(MAX-5)+10 saturates to MAX");
     }
 
-    /// `sidx` must advance by exactly one PER SAMPLE PLACED, so the third (and
-    /// every later) sample in a chunk picks up its own size, not the first
-    /// sample's reused over and over. With only two samples in a chunk this
-    /// bug is invisible — the second sample's pushed offset was already
-    /// computed from `sizes[0]` before `sidx` had a chance to matter — so this
-    /// test needs a chunk with THREE distinctly-sized samples to expose it.
+    // `sidx` must advance once PER SAMPLE PLACED; a chunk of only two samples
+    // can't expose a stuck index, so this uses three distinctly-sized samples.
+    // See docs/mp4-read.md — sample_offsets_advances_through_distinct_sizes.
     #[test]
     fn sample_offsets_advances_through_distinct_sizes_within_one_chunk() {
         let sizes = [10u32, 20, 30];
@@ -1186,15 +1136,9 @@ mod tests {
         );
     }
 
-    /// `Stream::read`'s own `s.size as u64 > MAX_ALLOC_BYTES` cap — a SEPARATE
-    /// call site from `read_moov`'s (see `read_moov_allows_a_payload_of_exactly_max_alloc_bytes`
-    /// / the module doc's note on the same policy hardened at only one of two
-    /// sites elsewhere in this crate). A `>`↔`>=` mutant here would reject a
-    /// sample of exactly the cap, which must be allowed. Builds an
-    /// `Mp4Reader` directly (its fields are private but visible to this
-    /// module's tests) over a `FakeBigReader` so the 256 MiB sample doesn't
-    /// need a real backing file — only the destination buffer `read()`
-    /// allocates is real.
+    // `Stream::read`'s own `s.size as u64 > MAX_ALLOC_BYTES` cap — a separate
+    // call site from `read_moov`'s. Exactly-the-cap must still be allowed.
+    // See docs/mp4-read.md — stream_read_allows_a_sample_of_exactly_max_alloc_bytes.
     #[test]
     fn stream_read_allows_a_sample_of_exactly_max_alloc_bytes() {
         use crate::disc::DiscTitle;
@@ -1225,10 +1169,8 @@ mod tests {
         assert_eq!(frame.data.len() as u64, MAX_ALLOC_BYTES);
     }
 
-    /// The same cap's other edge: one byte OVER it must still be rejected. A
-    /// `>`↔`==` mutant would only catch a sample of EXACTLY the cap and let
-    /// anything larger through — the worse direction to get wrong, since it
-    /// turns the cap into a no-op for every real oversized/hostile sample.
+    // The same cap's other edge: one byte OVER it must still be rejected,
+    // not just values exactly at the cap. See docs/mp4-read.md — stream_read_rejects.
     #[test]
     fn stream_read_rejects_a_sample_one_byte_over_max_alloc_bytes() {
         use crate::disc::DiscTitle;
@@ -1395,15 +1337,9 @@ mod tests {
         assert_eq!(auds[0].1, ac3.len());
     }
 
-    /// `stts` run-length expansion — ISO/IEC 14496-12 §8.6.1.2. The box stores
-    /// `(sample_count, sample_delta)` runs; the reader must expand them back to
-    /// one delta PER SAMPLE, in order, or every sample after the first run lands
-    /// on the wrong decode time.
-    ///
-    /// (This test used to be called `stts_and_ctts_expand` while touching no
-    /// `ctts` box at all. The composition-offset half now lives in
-    /// `ctts_build_and_parse_are_exact_inverses_over_signed_offsets` and
-    /// `b_frame_presentation_order_survives_the_mp4_round_trip`.)
+    // `stts` run-length expansion (ISO/IEC 14496-12 §8.6.1.2) must expand
+    // `(sample_count, sample_delta)` runs to one delta PER SAMPLE, in order.
+    // See docs/mp4-read.md — stts_expands_runs_to_per_sample_deltas.
     #[test]
     fn stts_expands_runs_to_per_sample_deltas_in_order() {
         // Three runs with DISTINCT deltas/lengths, so a parser that drops a run,
@@ -1555,11 +1491,9 @@ mod tests {
         );
     }
 
-    /// A track's declared duration must be its real length. `mdhd.duration` is in
-    /// the MEDIA timescale and `mvhd.duration` in the movie timescale
-    /// (ISO/IEC 14496-12 §8.2.2, §8.4.2); a player uses them to draw the seek bar
-    /// and to decide when the title ends, so a zeroed or constant duration makes
-    /// a correct file unseekable and apparently empty.
+    // A track's declared duration must be its real length: `mdhd.duration`
+    // in MEDIA timescale, `mvhd.duration` in movie timescale (§8.2.2, §8.4.2).
+    // See docs/mp4-read.md — declared_track_duration.
     #[test]
     fn declared_track_duration_equals_frame_count_times_frame_duration() {
         use crate::disc::{
@@ -1640,15 +1574,9 @@ mod tests {
         );
     }
 
-    /// The `moov` tree must carry the boxes ISO/IEC 14496-12 makes mandatory for a
-    /// playable track, with the field values the spec fixes. These live in this
-    /// module rather than the writer's because the box-walking helpers
-    /// ([`find_box`]) are here — asserting through them means the test reads the
-    /// file the way the demuxer does, instead of re-deriving the layout.
-    ///
-    /// Nothing in the demux path needs `tkhd`/`vmhd`/`smhd`/`dinf`, so an empty
-    /// one of any of them round-trips through this crate unnoticed while making
-    /// the file unplayable elsewhere.
+    // The `moov` tree must carry the boxes ISO/IEC 14496-12 makes mandatory
+    // for a playable track. Lives here (not the writer's tests) so assertions
+    // go through `find_box`. See docs/mp4-read.md — moov_tree_carries_mandatory_boxes.
     #[test]
     // Underscores mark BITFIELD boundaries in the bitstream header being built
     // (e.g. 5-bit then 3-bit field), not thousands-style digit groups.
@@ -1862,14 +1790,9 @@ mod tests {
         assert_eq!(parse_stsc(&stsc), vec![(1, 7)]);
     }
 
-    /// Every one of these five table parsers opens with `if b.len() < 8 {
-    /// return <empty> }` before reading `count = be32(b, 4)`, which needs
-    /// `b.len() >= 8`. No existing fixture ever called any of them with a
-    /// buffer shorter than 8 bytes — every test builds a complete box — so a
-    /// `<`→`==` mutant of that guard (which only early-returns at EXACTLY
-    /// `b.len() == 8`, letting every length below it fall through to the
-    /// out-of-bounds `be32` read) had nothing to fail against. Pins the
-    /// entire boundary at once, every length from 0 through 8, for all five.
+    // Every one of these five table parsers must reject every buffer length
+    // below the 8-byte version+flags+count header, not just exactly `< 8`.
+    // See docs/mp4-read.md — table_parsers_reject_every_length.
     #[test]
     fn table_parsers_reject_every_length_up_to_the_header_size() {
         for len in 0..=8 {
@@ -1895,12 +1818,9 @@ mod tests {
         }
     }
 
-    /// `co64`'s 8-byte offsets are decoded byte-by-byte
-    /// (`u64::from_be_bytes([b[o], b[o+1], ..., b[o+7]])`) — a SEPARATE code
-    /// path from the 32-bit `stco` case, which goes through `be32` instead and
-    /// was never itself built with a co64 fixture anywhere in this file. Every
-    /// byte here is distinct, so an index slip (off by one, negated, or
-    /// scaled) that reads the wrong byte cannot agree by coincidence.
+    // `co64`'s 8-byte offsets decode byte-by-byte, a separate path from the
+    // 32-bit `stco`/`be32` case; every byte here is distinct to catch index slips.
+    // See docs/mp4-read.md — parse_stco_co64_reads_each_byte.
     #[test]
     fn parse_stco_co64_reads_each_byte_from_its_own_offset() {
         let mut b = vec![0u8; 4]; // version+flags (unused by this parser)
@@ -1934,12 +1854,8 @@ mod tests {
         assert!(parse_stsd(&b).is_none());
     }
 
-    /// Every buffer shorter than the 8-byte version+flags+entry_count header
-    /// must return `None` — never fall through to `&b[8..]`, which would slice
-    /// past the end and panic. `b.len() == 8` is the boundary itself (see the
-    /// equivalence note on `parse_stsd`'s guard); everything strictly below it
-    /// must be rejected by THIS check, not rely on a later one that isn't
-    /// reached yet.
+    // Every buffer shorter than the 8-byte header must return `None`, never
+    // fall through to `&b[8..]` and panic. See docs/mp4-read.md — parse_stsd_rejects.
     #[test]
     fn parse_stsd_rejects_every_length_below_the_header_size() {
         for len in 0..8 {
@@ -1981,16 +1897,9 @@ mod tests {
         assert_eq!(parse_esds_asc(&esds[..12]), None);
     }
 
-    /// The final guard is `asc_len == 0 || end > b.len()` — two independent
-    /// rejection reasons, not one condition that needs both. Pins each half:
-    ///   * `asc_len == 0` must be rejected even though `end == pos` is
-    ///     trivially in bounds (an `||`→`&&` mutant would let a useless
-    ///     zero-length ASC through as `Some(vec![])`);
-    ///   * `end > b.len()` means TRUNCATED, not "anything before the buffer's
-    ///     end" — trailing bytes after a complete ASC (`end < b.len()`) must
-    ///     still succeed (a `>`→`<` mutant rejects exactly this, the common
-    ///     case of an esds embedded inside a larger box with more child boxes
-    ///     or padding after it).
+    // The final guard `asc_len == 0 || end > b.len()` is two independent
+    // rejection reasons, not one condition needing both; pins each half.
+    // See docs/mp4-read.md — parse_esds_asc_boundary_checks.
     #[test]
     fn parse_esds_asc_boundary_checks_are_independent() {
         // Shared prefix through the DecoderSpecificInfo tag (byte 24 = 0x05);
@@ -2121,11 +2030,9 @@ mod tests {
         assert!(read_moov(&mut Cursor::new(b)).is_err());
     }
 
-    /// `box_size < header_len` rejects a box that cannot even hold its own
-    /// header. A box whose size is EXACTLY `header_len` (8, no 64-bit
-    /// largesize) is the boundary itself: legal (an empty box), so an empty
-    /// `moov` — size 8, zero payload bytes — must parse to `Ok(vec![])`, not
-    /// be rejected by a `<`→`<=`/`==` mutant that also rejects the boundary.
+    // `box_size == header_len` (8) is the legal empty-box boundary: an empty
+    // `moov` must parse to `Ok(vec![])`, not be rejected by `<`→`<=`/`==`.
+    // See docs/mp4-read.md — read_moov_exactly_header_sized.
     #[test]
     fn read_moov_exactly_header_sized_is_a_valid_empty_box() {
         use std::io::Cursor;
@@ -2139,16 +2046,9 @@ mod tests {
         );
     }
 
-    /// The forward-progress / EOF guard is `box_size < header_len ||
-    /// pos.checked_add(box_size).is_none_or(|end| end > file_end)` — an `||`↔
-    /// `&&` mutant only shows up on an input where EXACTLY ONE side is true.
-    /// A box that claims to run 992 bytes past a file that ends right after
-    /// its header satisfies only the second clause (`box_size >= header_len`,
-    /// so the first is false); under `&&` the guard would not fire, and
-    /// `read_moov` would instead fail later inside `read_exact` with a plain
-    /// `UnexpectedEof` — a different, uncoded `io::Error` rather than this
-    /// crate's `Mp4Invalid` (`ErrorKind::InvalidData`), which the guard exists
-    /// to produce uniformly for every malformed box.
+    // The forward-progress/EOF guard is an `||` of two clauses; an input
+    // where exactly one is true must still be rejected as `Mp4Invalid`, not
+    // fall through to a bare `UnexpectedEof`. See docs/mp4-read.md — read_moov_rejects_overrun.
     #[test]
     fn read_moov_rejects_a_box_that_overruns_the_file_via_the_or_not_and_guard() {
         use std::io::Cursor;
@@ -2166,10 +2066,8 @@ mod tests {
         );
     }
 
-    /// `payload_len > MAX_ALLOC_BYTES` is a SEPARATE, sparse-file-proof cap from
-    /// the EOF check above (see `read_moov_over_cap_rejected_despite_inflated_file_len`).
-    /// A `>`→`>=` mutant would reject a `moov` whose payload is EXACTLY
-    /// `MAX_ALLOC_BYTES`, which must be allowed.
+    // `payload_len > MAX_ALLOC_BYTES` is a separate cap from the EOF check;
+    // a payload of exactly the cap must be allowed. See docs/mp4-read.md — read_moov_allows_exactly_max_alloc.
     #[test]
     fn read_moov_allows_a_payload_of_exactly_max_alloc_bytes() {
         let box_size = MAX_ALLOC_BYTES as u32 + 8; // header + exactly the cap
@@ -2195,10 +2093,8 @@ mod tests {
         v
     }
 
-    /// Build a minimal-but-complete audio `trak` (one AC-3 sample) with the given
-    /// media timescale — enough boxes that `from_reader` reaches the per-sample
-    /// `to_ns` timestamp conversion (mdia → mdhd/hdlr/minf → stbl → stsd/stsz/
-    /// stco/stsc, one sample).
+    // Build a minimal-but-complete audio `trak` (one AC-3 sample) with the
+    // given media timescale, enough boxes to reach per-sample `to_ns` conversion.
     fn audio_trak(timescale: u32) -> Vec<u8> {
         let mdhd = {
             // v0: version+flags(4) creation(4) modification(4) timescale(4) duration(4).
@@ -2318,11 +2214,9 @@ mod tests {
         mp4_box(b"trak", &payload)
     }
 
-    /// Regression (silent A/V desync): the sample timeline was built purely from
-    /// stts/ctts starting at tick 0 and no `edts`/`elst` was ever parsed, so the
-    /// presentation timeline an edit list defines was discarded. A non-empty edit
-    /// with `media_time = 1024` — the standard way encoder delay is expressed —
-    /// must move the track's presentation, not be ignored.
+    // Regression (silent A/V desync): a non-empty edit with `media_time =
+    // 1024` (encoder delay) must shift the track's presentation, not be ignored.
+    // See docs/mp4-read.md — edit_list_media_time_shifts_the_presentation_timeline.
     #[test]
     fn edit_list_media_time_shifts_the_presentation_timeline() {
         use std::io::Cursor;
@@ -2422,14 +2316,9 @@ mod tests {
         );
     }
 
-    /// Every byte of a version-1 entry's `segment_duration` (8 bytes) and
-    /// `media_time` (8 bytes) at its own offset — not a neighbour's. The
-    /// existing fixtures above use `5_000u64` and `-1i64`, which are almost all
-    /// zero/`0xFF` bytes, so an index slip that reads an adjacent byte (or a
-    /// header byte outside the entry) often reads the SAME value and the test
-    /// cannot tell. Every byte here is distinct and nonzero, and the header
-    /// bytes are zero, so any wrong index — off by one, negated, or scaled —
-    /// pulls in a value that cannot match by coincidence.
+    // Every byte of a version-1 entry's fields must come from its own
+    // offset, not a neighbour's; every byte here is distinct and nonzero.
+    // See docs/mp4-read.md — parse_elst_v1_entry_bytes.
     #[test]
     fn parse_elst_v1_entry_bytes_come_from_their_own_offsets() {
         let mut v1 = vec![1u8, 0, 0, 0]; // version 1 + flags
@@ -2444,20 +2333,9 @@ mod tests {
         );
     }
 
-    /// `Some(mts) if empty_movie_ticks > 0` and the `None` branch's `if
-    /// empty_movie_ticks > 0` are both guards around a `tracing::warn!`/delay
-    /// computation that, at `empty_movie_ticks == 0`, must produce the exact
-    /// same answer as skipping it (0 ticks of delay — there is no empty edit to
-    /// convert). The one case where the two are NOT interchangeable is
-    /// `movie_timescale == Some(0)`: skipping the arithmetic returns 0, but
-    /// entering it divides by that zero timescale and panics. Real callers
-    /// never pass this — `from_reader` filters `mvhd`'s timescale through
-    /// `.filter(|&t| t != 0)` before it ever reaches this function (see
-    /// `mdhd_timescale_zero_does_not_divide_by_zero` for the sibling guard on
-    /// the media timescale) — but the function itself has to stay panic-free at
-    /// its own boundary, independent of what its one caller happens to do
-    /// today, because `libfreemkv` runs inside the long-lived `autorip`
-    /// service and a panic there is downtime.
+    // At `empty_movie_ticks == 0` the function must short-circuit before a
+    // `movie_timescale == Some(0)` is ever used as a divisor, independent of
+    // what the one real caller happens to pass. See docs/mp4-read.md — elst_offset_ticks_stays_safe.
     #[test]
     fn elst_offset_ticks_stays_safe_at_zero_empty_ticks_even_with_a_zero_movie_timescale() {
         assert_eq!(
@@ -2490,16 +2368,9 @@ mod tests {
         );
     }
 
-    /// A crafted file with a *fixed-size* `stsz` (sample_size != 0) claiming
-    /// count = 0xFFFFFFFF must not inflate the sample index past the file's own
-    /// byte length. `from_reader` sets `sample_budget = MAX_SAMPLE_COUNT.min(file_len)`,
-    /// so a few-hundred-byte file bounds the `Vec<SampleRef>` to a few hundred —
-    /// NOT the 16M `MAX_SAMPLE_COUNT` ceiling. Mutation check: revert the budget
-    /// to a bare `MAX_SAMPLE_COUNT` and this file yields ~16M samples, failing the
-    /// `<= file_len` (and `< MAX_SAMPLE_COUNT`) assertions below.
-    /// A minimal-but-complete audio `trak` whose fixed-size `stsz` LIES about its
-    /// sample count (`u32::MAX`), with an stsc/stts wide enough to place whatever
-    /// count survives the budget. The shape the sample-table budget bounds.
+    // A minimal audio `trak` whose fixed-size `stsz` LIES about its sample
+    // count (`u32::MAX`); stsc/stts are wide enough to place whatever count
+    // survives the budget. See docs/mp4-read.md — audio_trak_hostile_count.
     fn audio_trak_hostile_count() -> Vec<u8> {
         let mdhd = {
             let mut p = vec![0u8; 24];
@@ -2596,12 +2467,9 @@ mod tests {
         );
     }
 
-    /// The RAM amplification the byte-per-sample budget actually bounds: a small
-    /// crafted file whose `stsz` claims `u32::MAX` samples must not force an eager
-    /// multi-hundred-MB index. At ~60 bytes of RAM per indexed sample, a budget of
-    /// one sample per file byte gave ~60x the input size; the assertion below pins
-    /// the amplification factor rather than a raw count, so it fails if the budget
-    /// ever goes back to counting samples per byte.
+    // The RAM amplification the byte-per-sample budget bounds: a crafted
+    // `stsz` claiming u32::MAX samples must not force an eager multi-hundred-MB
+    // index. See docs/mp4-read.md — sample_index_ram_is_bounded.
     #[test]
     fn sample_index_ram_is_bounded_by_a_multiple_of_the_file() {
         use std::io::Cursor;
@@ -2625,11 +2493,9 @@ mod tests {
         );
     }
 
-    /// Build an audio `trak` identical to `audio_trak(48_000)` but with the
-    /// named stbl child box omitted. Used to reach the untrusted-input guards
-    /// that drop a track whose `stsz` says samples exist yet whose `stco`/`co64`
-    /// (chunk offsets) or `stsc` (sample-to-chunk map) is missing — without such
-    /// a table every sample offset would resolve near file byte 0.
+    // Build an audio `trak` like `audio_trak(48_000)` but with the named stbl
+    // child box omitted, to reach the untrusted-input guards that drop a
+    // track whose `stsz` says samples exist yet stco/co64/stsc is missing.
     fn audio_trak_missing(omit: &[u8; 4]) -> Vec<u8> {
         let mdhd = {
             let mut p = vec![0u8; 24];
@@ -2705,11 +2571,9 @@ mod tests {
         mp4_box(b"trak", &mp4_box(b"mdia", &mdia))
     }
 
-    /// A track with samples (`stsz`) but no chunk-offset table (`stco`/`co64`)
-    /// must be DROPPED, not indexed with offsets that resolve near file byte 0.
-    /// With it the only track, the whole file fails `Mp4Invalid`.
-    /// Mutation check: delete the `if chunk_offsets.is_empty() { continue; }`
-    /// guard and `from_reader` returns `Ok` (garbage samples), flipping this to FAIL.
+    // A track with samples (`stsz`) but no chunk-offset table (`stco`/`co64`)
+    // must be DROPPED, not indexed with offsets near file byte 0.
+    // See docs/mp4-read.md — missing_stco_drops_track.
     #[test]
     fn missing_stco_drops_track_all_dropped_is_invalid() {
         use std::io::Cursor;
@@ -2721,11 +2585,8 @@ mod tests {
         );
     }
 
-    /// A track with samples (`stsz`) and chunk offsets (`stco`) but no
-    /// sample-to-chunk map (`stsc`) must be DROPPED — without `stsc` the samples
-    /// cannot be placed against the chunk offsets and would pack from byte 0.
-    /// Mutation check: delete the `if stsc.is_empty() { continue; }` guard and
-    /// `from_reader` returns `Ok`, flipping this to FAIL.
+    // A track with samples + chunk offsets but no sample-to-chunk map
+    // (`stsc`) must be DROPPED. See docs/mp4-read.md — missing_stsc_drops_track.
     #[test]
     fn missing_stsc_drops_track_all_dropped_is_invalid() {
         use std::io::Cursor;
@@ -2737,12 +2598,8 @@ mod tests {
         );
     }
 
-    /// A track with samples (`stsz`) but no time-to-sample table (`stts`, mandatory
-    /// per ISO/IEC 14496-12 §8.6.1) must be DROPPED — without it every sample takes
-    /// dur=0, collapsing the whole track onto one instant (all-zero timestamps).
-    /// With it the only track, the file fails `Mp4Invalid`.
-    /// Mutation check: delete the `if durations.is_empty() { continue; }` guard and
-    /// `from_reader` returns `Ok` (all-zero-timestamp samples), flipping this to FAIL.
+    // A track with samples but no time-to-sample table (`stts`, mandatory
+    // per §8.6.1) must be DROPPED. See docs/mp4-read.md — missing_stts_drops_track.
     #[test]
     fn missing_stts_drops_track_all_dropped_is_invalid() {
         use std::io::Cursor;
@@ -2754,14 +2611,9 @@ mod tests {
         );
     }
 
-    /// An `stsc` that PASSES the non-empty guard but places fewer samples than
-    /// `stsz` declares must drop the track. `sample_offsets` used to pack the
-    /// unplaced tail after the last known offset, inventing a position, so those
-    /// frames were read from arbitrary file bytes — the same "emit garbage"
-    /// outcome the stco/stsc presence guards exist to refuse.
-    ///
-    /// Mutation check: restore the trailing `while offsets.len() < sizes.len()`
-    /// pack-after-last loop and this file indexes 3 samples instead of erroring.
+    // An `stsc` that passes the non-empty guard but places fewer samples than
+    // `stsz` declares must still drop the track, not invent positions for the tail.
+    // See docs/mp4-read.md — stsc_placing_fewer_samples.
     #[test]
     fn stsc_placing_fewer_samples_than_stsz_drops_the_track() {
         use std::io::Cursor;
@@ -2793,13 +2645,9 @@ mod tests {
         );
     }
 
-    /// A SHORT `stts` — present and non-empty, but covering fewer samples than
-    /// `stsz` declares — must drop the track just like an absent one. The tail
-    /// samples took `dur = 0`, collapsing the whole tail onto a single timestamp,
-    /// which is the exact degenerate timing the absent-stts guard refuses.
-    ///
-    /// Mutation check: weaken the guard back to `durations.is_empty()` and this
-    /// file indexes 3 samples whose last two share one timestamp.
+    // A SHORT `stts` covering fewer samples than `stsz` declares must drop the
+    // track just like an absent one, not collapse the tail onto dur=0.
+    // See docs/mp4-read.md — short_stts_drops_the_track.
     #[test]
     fn short_stts_drops_the_track_like_an_absent_one() {
         use std::io::Cursor;
@@ -2853,14 +2701,9 @@ mod tests {
         assert_eq!(mdhd_language(&v1).as_deref(), Some("eng"));
     }
 
-    /// The length guard is `b.len() < off + 2` — reject too SHORT, not
-    /// "not exactly `off + 2`". Pins both edges of that boundary for the
-    /// version-0 offset (`off == 20`):
-    ///   * `b.len() == off` (no room for the packed field at all) must return
-    ///     `None`, not read two bytes past the end;
-    ///   * `b.len() == off + 3` (one byte MORE than the minimum) must still
-    ///     succeed — a `<`→`>` mutant of the guard would reject this case, since
-    ///     `off + 3 > off + 2`.
+    // The length guard is `b.len() < off + 2` — reject too SHORT, not "not
+    // exactly `off + 2`"; pins both edges of that boundary.
+    // See docs/mp4-read.md — mdhd_language_boundary_rejects_short.
     #[test]
     fn mdhd_language_boundary_rejects_short_not_merely_non_exact() {
         let short = vec![0u8; 20]; // == off, zero room for the language field
@@ -2890,11 +2733,8 @@ mod tests {
         p
     }
 
-    /// A `VisualSampleEntry` body with DISTINCT width and height, plus optional
-    /// child boxes (ISO/IEC 14496-12 §12.1.3). The fixed part is 78 bytes:
-    /// 6 reserved, 2 data_reference_index, 16 pre_defined/reserved, width(2) at
-    /// offset 24, height(2) at 26, then 50 more bytes of resolution,
-    /// frame_count, compressorname, depth and pre_defined.
+    // A `VisualSampleEntry` body (§12.1.3) with DISTINCT width/height, plus
+    // optional child boxes. Fixed part is 78 bytes: width(2) at 24, height(2) at 26.
     fn visual_entry(width: u16, height: u16, children: &[u8]) -> Vec<u8> {
         let mut b = vec![0u8; 78];
         b[24..26].copy_from_slice(&width.to_be_bytes());
@@ -2903,10 +2743,8 @@ mod tests {
         b
     }
 
-    /// An `AudioSampleEntry` body (ISO/IEC 14496-12 §12.2.3): 6 reserved + 2
-    /// data_reference_index + 8 reserved, then channelcount(2) at 16, samplesize(2),
-    /// pre_defined(2), reserved(2), samplerate(4) — 28 bytes — then child boxes.
-    /// `decoy` goes in the reserved field at 14 so an offset slip is visible.
+    // An `AudioSampleEntry` body (§12.2.3): channelcount(2) at 16, 28-byte
+    // fixed part, then child boxes. `decoy` at 14 makes an offset slip visible.
     fn audio_entry(channels: u16, decoy: u16, children: &[u8]) -> Vec<u8> {
         let mut b = vec![0u8; 28];
         b[14..16].copy_from_slice(&decoy.to_be_bytes());
@@ -2917,13 +2755,9 @@ mod tests {
         b
     }
 
-    /// `height` is the SECOND of the two 16-bit dimensions in a VisualSampleEntry,
-    /// at byte 26 — width sits at 24. Reading the wrong one is silent: the value is
-    /// still a plausible dimension, so the track's seeded resolution simply comes
-    /// out wrong (1920 read as a height would classify a 1080p title as UHD).
-    ///
-    /// The two are deliberately different here; a fixture with width == height
-    /// would pass under either offset.
+    // `height` is the SECOND 16-bit dimension in a VisualSampleEntry, at byte
+    // 26 (width at 24); reading the wrong one is silent, so width != height here.
+    // See docs/mp4-read.md — parse_stsd_takes_height.
     #[test]
     fn parse_stsd_takes_height_from_its_own_field_not_the_width_beside_it() {
         let stsd = stsd_with(b"avc1", &visual_entry(1920, 1080, &[]));
@@ -2941,14 +2775,9 @@ mod tests {
         );
     }
 
-    /// `channelcount` is at byte 16 of an AudioSampleEntry, after the 8 reserved
-    /// bytes that follow `data_reference_index`. An offset slip reads a reserved
-    /// field, and reserved fields are conventionally zero — which would make every
-    /// audio track come out as 0 channels rather than fail.
-    ///
-    /// The short-entry fallback of 2 is pinned in the same test: an entry with no
-    /// room for the fixed part still has to name SOME channel count, and 0 is not a
-    /// usable one.
+    // `channelcount` is at byte 16 of an AudioSampleEntry; an offset slip
+    // reads a conventionally-zero reserved field instead. Also pins the
+    // short-entry fallback of 2. See docs/mp4-read.md — parse_stsd_reads_channelcount.
     #[test]
     fn parse_stsd_reads_channelcount_from_its_own_field_and_defaults_a_short_entry() {
         let stsd = stsd_with(b"ac-3", &audio_entry(6, 0xBEEF, &[]));
@@ -2969,15 +2798,9 @@ mod tests {
         );
     }
 
-    /// `mp4a`'s codec_private (the AudioSpecificConfig inside a child `esds`
-    /// box) is only read when the entry is `Codec::Aac` AND its body is at
-    /// least the 28-byte fixed AudioSampleEntry part — `find_box(&body[28..],
-    /// ...)` would slice past the end otherwise. No existing test built an
-    /// actual `mp4a` entry, so neither half of that guard (`&&`, or the
-    /// `>= 28` on its right) was constrained: an `&&`→`||` mutant reaches the
-    /// same `&body[28..]` on a codec-only match, and a `>=`→`<` mutant loses a
-    /// real title's AAC CodecPrivate outright by only running on entries too
-    /// short to have one.
+    // `mp4a` codec_private is only read when the entry is `Codec::Aac` AND
+    // its body is >= the 28-byte fixed part, else `find_box(&body[28..], ...)`
+    // would slice past the end. See docs/mp4-read.md — parse_stsd_extracts_aac_codec_private.
     #[test]
     fn parse_stsd_extracts_aac_codec_private_only_when_the_body_is_long_enough() {
         let asc = vec![0x12u8, 0x10]; // AAC-LC 44.1 kHz stereo
@@ -3013,11 +2836,9 @@ mod tests {
         );
     }
 
-    /// Every recognised audio fourcc must map to its own `Codec`, checked one
-    /// by one. `ec-3`/`dtsc`/`dtse`/`dtsh`/`dtsl` had no coverage at all before
-    /// this test — a deleted match arm for any of them falls through to the
-    /// catch-all `_ => return None`, silently dropping every E-AC-3 or DTS
-    /// variant track from the title instead of remuxing it.
+    // Every recognised audio fourcc must map to its own `Codec`; a deleted
+    // match arm falls through to `_ => return None`, dropping the track.
+    // See docs/mp4-read.md — parse_stsd_recognises_every_audio_fourcc.
     #[test]
     fn parse_stsd_recognises_every_audio_fourcc() {
         let cases: &[(&[u8; 4], Codec)] = &[
@@ -3048,12 +2869,7 @@ mod tests {
 
     // ── MPEG-4 expandable descriptors (ISO/IEC 14496-1 §8.3.3) ────────────────
 
-    /// A descriptor length is a base-128 varint: 7 bits per byte, continued while
-    /// the top bit is set, to a maximum of FOUR bytes. Every existing esds fixture
-    /// uses a single-byte length, so the continuation path is unconstrained by
-    /// them — yet a multi-byte length is exactly what an `esds` carrying a long
-    /// AudioSpecificConfig (or one written by a tool that always pads to 4 bytes,
-    /// which is common) uses.
+    // Base-128 varint, max FOUR bytes. See docs/mp4-read.md — read_descriptor_len.
     #[test]
     fn read_descriptor_len_is_a_four_byte_base_128_varint() {
         let read = |b: &[u8]| {
@@ -3085,15 +2901,9 @@ mod tests {
         assert_eq!(read(&[0x81]), (1, 1), "a dangling continuation just ends");
     }
 
-    /// The optional `ES_Descriptor` fields (ISO/IEC 14496-1 §7.2.6.5) are selected
-    /// by three flag bits, and each one that is set inserts bytes before the
-    /// `DecoderConfigDescriptor`. Skipping them wrongly does not corrupt anything —
-    /// the tag check fails and `parse_esds_asc` returns `None`, so the AAC track
-    /// simply loses its CodecPrivate and the remux emits AAC no decoder can
-    /// initialise.
-    ///
-    /// The existing fixture has flags = 0, so all three skips are unconstrained.
-    /// This one sets all three at once and still has to reach the same ASC.
+    // The optional `ES_Descriptor` fields (§7.2.6.5) are selected by three
+    // flag bits; skipping them wrongly loses the AAC track's CodecPrivate.
+    // See docs/mp4-read.md — parse_esds_asc_steps_over_every_optional_field.
     #[test]
     fn parse_esds_asc_steps_over_every_optional_es_descriptor_field() {
         let asc = vec![0x12u8, 0x10]; // AAC-LC 44.1 kHz stereo
@@ -3142,10 +2952,9 @@ mod tests {
         );
     }
 
-    /// A box header is 8 bytes, so a declared `size` below 8 cannot describe a box —
-    /// and taking it at face value slices `payload[pos + 8 .. pos + size]` with the
-    /// start past the end, which panics. A crafted `moov` is untrusted input read
-    /// straight off a user's file.
+    // A box header is 8 bytes, so a declared `size` below 8 cannot describe
+    // a box; taking it at face value would slice past the start and panic.
+    // See docs/mp4-read.md — find_boxes_capped_refuses_a_box_smaller_than_header.
     #[test]
     fn find_boxes_capped_refuses_a_box_smaller_than_its_own_header() {
         // size = 4, type = 'avcC': shorter than the header that declares it.
@@ -3164,10 +2973,8 @@ mod tests {
         );
     }
 
-    /// `find_boxes_capped` stops at exactly `cap` matches, not one past it —
-    /// the whole point being that a caller asking for `cap` matches never
-    /// forces the scan to walk (and match-collect) further into a crafted
-    /// payload than it asked for.
+    // `find_boxes_capped` stops at exactly `cap` matches, not one past it,
+    // so a caller never forces the scan further into a crafted payload.
     #[test]
     fn find_boxes_capped_stops_exactly_at_cap_not_one_past() {
         let mut payload = Vec::new();
@@ -3182,12 +2989,9 @@ mod tests {
         );
     }
 
-    /// The declared box size is decoded from four specific bytes
-    /// (`payload[pos..pos+4]`, big-endian). A size deliberately chosen so byte
-    /// 1 differs from byte 0 catches an index slip that rereads byte 0 (or any
-    /// other wrong offset) instead of the byte the field actually occupies —
-    /// with a small size every byte but the last is zero, so such a slip would
-    /// go unnoticed.
+    // The declared box size decodes from four specific bytes; a size with
+    // distinct bytes catches an index slip a small, mostly-zero size would hide.
+    // See docs/mp4-read.md — find_boxes_capped_decodes_the_size_field.
     #[test]
     fn find_boxes_capped_decodes_the_size_field_from_its_own_bytes() {
         let want_size: u32 = 0x0001_0010; // byte0=0x00 byte1=0x01 byte2=0x00 byte3=0x10
@@ -3204,14 +3008,9 @@ mod tests {
         );
     }
 
-    /// An `stsc` entry names a `first_chunk` that may exceed the chunk count the
-    /// `stco` actually declares (a truncated or crafted table). The run it would
-    /// fill has to be clamped to the chunks that exist — indexing `spc` past its
-    /// length is a panic on a file the user merely opened.
-    ///
-    /// The clamp is only reachable through a NON-final entry: the final entry's end
-    /// is `n_chunks` by construction, so a fixture whose only over-range entry is
-    /// last never reaches the line.
+    // An `stsc` entry naming a `first_chunk` beyond what `stco` declares must
+    // be clamped, not index `spc` past its length and panic.
+    // See docs/mp4-read.md — sample_offsets_clamps_an_stsc_run.
     #[test]
     fn sample_offsets_clamps_an_stsc_run_that_outruns_the_chunk_table() {
         let sizes = [10u32, 20];
@@ -3226,11 +3025,9 @@ mod tests {
         );
     }
 
-    /// ISO/IEC 14496-12 §8.6.6: an edit list may hold several media edits. This
-    /// frame model can only express a constant shift, so it honours the LEADING
-    /// one and logs the rest — taking the last instead would shift the whole track
-    /// by a trim that belongs to a later segment, i.e. silent A/V desync of exactly
-    /// the size of the difference.
+    // §8.6.6: an edit list may hold several media edits; this frame model
+    // can only express a constant shift, so it honours the LEADING one, not the last.
+    // See docs/mp4-read.md — elst_offset_ticks_honours_the_first_media_edit.
     #[test]
     fn elst_offset_ticks_honours_the_first_media_edit_not_the_last() {
         // Two non-empty edits with different media_time; no empty edit.
@@ -3255,16 +3052,9 @@ mod tests {
         );
     }
 
-    /// A version-1 `mvhd` carries 64-bit creation/modification times, so its
-    /// `timescale` sits at byte 20 rather than 12 (ISO/IEC 14496-12 §8.2.2). Every
-    /// existing fixture is version 0, so the version-1 offset is unconstrained by
-    /// them — and it is not a hypothetical: writers emit version 1 whenever the
-    /// movie duration does not fit 32 bits.
-    ///
-    /// A wrong offset reads part of the 64-bit modification time, which is a large
-    /// arbitrary number — and the movie timescale is the denominator that converts
-    /// an empty edit's delay into media ticks, so the A/V offset it produces is
-    /// arbitrary too.
+    // A version-1 `mvhd` carries 64-bit creation/modification times, so its
+    // `timescale` sits at byte 20 rather than 12 (§8.2.2); writers emit
+    // version 1 whenever movie duration doesn't fit 32 bits. See docs/mp4-read.md — mvhd_timescale_version_1.
     #[test]
     fn mvhd_timescale_version_1_reads_past_the_64_bit_times() {
         let mut v1 = vec![0u8; 24];
@@ -3285,11 +3075,9 @@ mod tests {
         assert_eq!(mvhd_timescale(&v0), Some(600), "v0 timescale is at 12");
     }
 
-    /// Only the leading empty edits and the FIRST media edit shape the offset, so
-    /// [`MAX_ELST_ENTRIES`] bounds what a crafted `elst` can allocate. Without it a
-    /// box declaring millions of entries — and carrying the bytes for them, inside a
-    /// `moov` already capped at 256 MiB — expands to a Vec of 20-byte tuples for no
-    /// benefit at all.
+    // Only the leading empty edits and the FIRST media edit shape the offset,
+    // so `MAX_ELST_ENTRIES` bounds what a crafted `elst` can allocate.
+    // See docs/mp4-read.md — parse_elst_entry_count_is_capped.
     #[test]
     fn parse_elst_entry_count_is_capped() {
         let n = MAX_ELST_ENTRIES + 500;
@@ -3382,12 +3170,9 @@ mod tests {
         mp4_box(b"trak", &mp4_box(b"mdia", &mdia))
     }
 
-    /// A `hdlr` of anything other than `vide`/`soun` (e.g. a hint or subtitle
-    /// track) must be dropped, not folded into the audio branch. Before this
-    /// guard existed as a literal `&h == b"soun"` comparison, weakening it to
-    /// "anything that isn't vide" would silently turn a hint track's `stsd`
-    /// entry into a fabricated `AudioStream` — with whatever codec its sample
-    /// entry happened to name.
+    // A `hdlr` of anything other than `vide`/`soun` (e.g. hint/subtitle)
+    // must be dropped, not folded into the audio branch.
+    // See docs/mp4-read.md — non_av_handler_track_is_dropped.
     #[test]
     fn non_av_handler_track_is_dropped_not_folded_into_audio() {
         use std::io::Cursor;
@@ -3406,13 +3191,9 @@ mod tests {
         );
     }
 
-    /// The per-track PID is `0x1011 + track_idx` for video and `0x1100 +
-    /// track_idx` for audio. At `track_idx == 0` a `+`↔`-`/`*` mutant of either
-    /// is invisible (`0x1011 + 0 == 0x1011 - 0 == 0x1011 * 0`… no — `* 0` is 0,
-    /// already different — but `+`↔`-` specifically needs `track_idx != 0` to
-    /// separate). Four tracks (two video, two audio) push `track_idx` to 1 and
-    /// 3 respectively, so every one of `+`→`*`, `+`→`-` is forced to disagree
-    /// with the correct PID on the second track of its kind.
+    // Per-track PID is `0x1011 + track_idx` (video) / `0x1100 + track_idx`
+    // (audio); at track_idx==0 a `+`↔`-`/`*` mutant is invisible, so this
+    // pushes track_idx past 0. See docs/mp4-read.md — per_track_pid_arithmetic.
     #[test]
     fn per_track_pid_arithmetic_is_exact_past_the_first_track() {
         use crate::disc::Stream as DiscStreamE;
@@ -3453,11 +3234,9 @@ mod tests {
         );
     }
 
-    /// A track whose `stsz` is absent (`n == 0`) still occupies a `track_idx`
-    /// slot and must still advance the counter for the NEXT track — otherwise
-    /// two tracks collide on the same PID, or (worse, if the increment
-    /// direction is reversed) `track_idx` underflows a `usize` and panics on
-    /// the very first sample-less track.
+    // A track whose `stsz` is absent still occupies a `track_idx` slot and
+    // must advance the counter, else two tracks collide on the same PID.
+    // See docs/mp4-read.md — track_idx_advances_past_a_sample_less_track.
     #[test]
     fn track_idx_advances_past_a_sample_less_track() {
         use crate::disc::Stream as DiscStreamE;
@@ -3483,16 +3262,9 @@ mod tests {
         }
     }
 
-    /// The global `sample_budget` is DECREMENTED by each track's real sample
-    /// count, and it is SHARED across tracks — a track late in the file gets
-    /// only what earlier tracks left behind. Build two tracks that both LIE
-    /// about their sample count (`stsz` fixed-size, count = `u32::MAX`, as in
-    /// `audio_trak_hostile_count`): the file is tiny, so the first track's
-    /// clamped count exactly exhausts the whole initial budget, and the
-    /// second track — clamped against what's left — must come back with
-    /// ZERO samples. An `+=`/`/=` mutant of the decrement either grows the
-    /// budget or leaves it nonzero, letting the second track claim samples it
-    /// must not have.
+    // The global `sample_budget` is DECREMENTED by each track's real sample
+    // count and SHARED across tracks; a late track gets only what's left.
+    // See docs/mp4-read.md — sample_budget_is_shared_and_exhausted.
     #[test]
     fn sample_budget_is_shared_and_exhausted_across_tracks() {
         use std::io::Cursor;

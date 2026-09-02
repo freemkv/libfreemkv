@@ -1,36 +1,13 @@
 //! `dir://` as an image-level SOURCE: a synthetic UDF volume over a folder.
 //!
-//! A user's extracted disc — a DVD `VIDEO_TS/` or a Blu-ray `BDMV/`, typically
-//! a MakeMKV-style backup — has files but no sectors, and everything above the
-//! sector layer in this crate wants sectors: `Disc::scan_image`, `UdfFs`,
-//! `ifo.rs`, `mpls.rs`, `clpi.rs` and the mux all read through a
-//! [`SectorSource`]. [`DirImage`] supplies one.
+//! A user's extracted disc has files but no sectors, and everything above
+//! the sector layer in this crate reads through a [`SectorSource`].
+//! [`DirImage`] supplies one by synthesizing a real, minimal UDF 1.02 volume:
+//! metadata is encoded into RAM by [`encode`], data sectors map to on-demand
+//! file reads. 3D/SSIF folders are rejected up front
+//! ([`Error::DirImageSsifUnsupported`]).
 //!
-//! The trick is that nothing is emulated. A real, minimal, valid UDF 1.02
-//! volume is synthesized over the folder:
-//!
-//! * **Metadata sectors** (anchors, the volume descriptor sequences, the File
-//!   Set Descriptor, every File Entry, every directory's FID list) are encoded
-//!   into RAM by [`encode`] — a few MiB even for a large Blu-ray.
-//! * **Data sectors** are not materialized at all. Each one maps to a byte
-//!   range of a real file, read on demand.
-//!
-//! So `udf::read_filesystem` parses this image by exactly the same code path it
-//! parses a real disc with, and every consumer above it is unchanged. The cost
-//! is that a single-partition synthetic volume never exercises the UDF 2.50
-//! Metadata Partition path (`udf.rs:946-991`) that every real BD-ROM uses —
-//! this module's tests do not cover that block and must not be read as if they
-//! did.
-//!
-//! What this module deliberately does NOT do:
-//!
-//! * **3D / SSIF** — rejected up front ([`Error::DirImageSsifUnsupported`]).
-//!   An SSIF aliases the same sectors as its base and dependent `.m2ts`; the
-//!   planner allocates disjoint extents, so a 3D folder would produce silently
-//!   wrong output.
-//! * **HD-DVD `HVDVD_TS/`** — no title enumerator constraint is modelled.
-//! * **Encrypted folders** — a folder whose content is still AACS-scrambled is
-//!   rejected by the caller-side probe, not decrypted here.
+//! See docs/dirimage.md for details, unsupported cases, and caveats.
 
 mod encode;
 mod layout;
@@ -50,12 +27,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-/// How many host files may be held open at once.
-///
-/// A Blu-ray `BDMV/` can exceed a thousand files while macOS `RLIMIT_NOFILE`
-/// defaults to 256, so "open every file up front" is not available. Reads are
-/// overwhelmingly sequential through one large stream file at a time, so a
-/// small LRU keeps the hit rate near 1 while bounding descriptors.
+// How many host files may be held open at once. A Blu-ray BDMV/ can exceed a
+// thousand files while macOS RLIMIT_NOFILE defaults to 256; reads are
+// overwhelmingly sequential through one file at a time, so a small LRU works.
 const HANDLE_CACHE: usize = 16;
 
 /// One file's bytes at one place in the image.
@@ -201,15 +175,9 @@ impl DirImage {
         (lba < r.start_lba + r.sectors).then_some(r)
     }
 
-    /// Borrow an open handle for `file`, opening it (and evicting the
-    /// least-recently-used handle) if necessary.
-    ///
-    /// Opening is also where the plan is revalidated. A folder is not a disc:
-    /// a file can be shortened or replaced between planning and reading, and
-    /// zero-filling the difference would turn "the user deleted something"
-    /// into corrupt output at exit 0. The size is re-checked here, and a
-    /// truncation that happens while the handle is already open is caught by
-    /// the short read in [`Self::fill`].
+    // Borrow an open handle for `file` (evicting the LRU handle if needed).
+    // Also revalidates the plan: a folder can shrink/change between planning
+    // and reading; a later truncation is caught by the short read in `fill`.
     fn handle(&mut self, file: usize) -> Result<&mut File> {
         if let Some(pos) = self.open.iter().position(|(i, _)| *i == file) {
             // `open` is ordered most-recently-used first.
@@ -239,10 +207,9 @@ impl DirImage {
         Ok(&mut self.open[0].1)
     }
 
-    /// Fill `out` (a whole number of sectors) from one data range, starting at
-    /// `lba`. `out` is already zeroed, so a file's tail sector comes back
-    /// zero-padded — which is exactly what `file_extents`' `div_ceil(2048)`
-    /// (`udf.rs:816`) makes every consumer expect.
+    // Fill `out` (whole sectors) from one data range starting at `lba`. `out`
+    // is pre-zeroed, so a tail sector zero-pads — matching `file_extents`'
+    // div_ceil(2048) (udf.rs:816) that every consumer expects.
     fn fill(&mut self, r: &DataRange, lba: u32, out: &mut [u8]) -> Result<()> {
         let within = (lba - r.start_lba) as u64 * SECTOR as u64;
         let want = (r.bytes.saturating_sub(within)).min(out.len() as u64) as usize;

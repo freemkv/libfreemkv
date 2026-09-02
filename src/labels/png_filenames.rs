@@ -1,17 +1,13 @@
 //! Menu-graphic filename language hints.
 //!
 //! Some BD-J discs encode per-language menu artwork with the language in the
-//! filename, e.g. `Feature_UHD01_Eng_Composite1.png`,
-//! `AltFeature_UHD01_FRE_Composite2.png`. The `_UHD01_{LANG}_Composite`
-//! marker is authored deliberately, so the set of `{LANG}` tokens is the set
-//! of menu languages the disc ships.
+//! filename (e.g. `Feature_UHD01_Eng_Composite1.png`). The
+//! `_UHD01_{LANG}_Composite` marker is authored deliberately, so the set of
+//! `{LANG}` tokens found is the set of menu languages the disc ships.
 //!
-//! This is a language-only hint (no per-stream purpose/codec), so it runs at
-//! [`Confidence::Low`](super::Confidence::Low) — it never displaces a real framework parser, and it
-//! sits at the same tier as the MPLS floor. It is here so the pattern is a
-//! first-class, testable parser that keeps picking up discs as the corpus
-//! grows, rather than lost logic. Detection is precise: it fires only on the
-//! `_UHD01_{LANG}_Composite` grammar with a `{LANG}` the vocab recognizes.
+//! Language-only hint; runs at [`Confidence::Low`](super::Confidence::Low).
+// See docs/png_filenames.md — why Low confidence, and why this is a
+// first-class parser instead of inline logic.
 
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, vocab};
 use crate::sector::SectorSource;
@@ -63,13 +59,9 @@ fn labels_from_filenames(names: &[String]) -> Vec<StreamLabel> {
         .collect()
 }
 
-/// Extract the ISO-639-2 language code from a `{title}_UHD01_{LANG}_Composite`
-/// menu-graphic filename, or `None` if the name does not match the grammar or
-/// carries a `{LANG}` the vocab does not recognize.
-///
-/// The `_UHD01_` marker plus the `_Composite` suffix keep this from firing on
-/// unrelated PNGs (`KeyComposite4.png`, `LoadingComposite1.png` have no
-/// `_UHD01_{LANG}_` segment).
+// Extract the ISO-639-2 lang code from a `{title}_UHD01_{LANG}_Composite`
+// filename, or None if the grammar doesn't match or `{LANG}` isn't recognized.
+// See docs/png_filenames.md — why the marker+suffix avoid false positives.
 fn filename_lang(name: &str) -> Option<&'static str> {
     // Case-fold once; the marker/suffix are matched case-insensitively.
     let lower = name.to_ascii_lowercase();

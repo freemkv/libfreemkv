@@ -191,17 +191,9 @@ impl std::fmt::Debug for DiscEntry {
 mod unit_key_tests {
     use super::*;
 
-    /// `is_default_index` is the public predicate that separates ordinary
-    /// (index-0) content keys from FMTS forensic index keys ([`UnitKey`] docs;
-    /// AACS 2.1 `IndividualSegment.tbl` tagging). A body answering `true` for
-    /// everything would present a forensic index key as an ordinary content
-    /// key — the caller would decrypt the bulk of the title with a key that
-    /// only opens 1/32nd of it; answering `false` for everything would hide
-    /// every ordinary key.
-    ///
-    /// Pinned against the two NAMED constructors, which are the contract:
-    /// [`UnitKey::new`] builds the ordinary key, [`UnitKey::forensic`] builds
-    /// an index key for `1..=32`.
+    // Pinned against the two named constructors: `UnitKey::new` is the
+    // ordinary key, `UnitKey::forensic` is an index key.
+    // See docs/aacs.md — `UnitKey::is_default_index` test rationale.
     #[test]
     fn is_default_index_separates_the_two_constructors() {
         let ordinary = UnitKey::new(0, [0xAA; 16]);
@@ -220,11 +212,8 @@ mod unit_key_tests {
         }
     }
 
-    /// The predicate must agree with the one consumer of `index_number` in the
-    /// crate: [`crate::aacs::index_select::resolve_disc_index`] resolves the
-    /// disc's forensic index from exactly the keys that are NOT default. If
-    /// the two disagree, a disc resolves an index whose key the rest of the
-    /// pipeline treats as ordinary (or vice versa).
+    // Must agree with `resolve_disc_index`, the one consumer of `index_number`.
+    // See docs/aacs.md — `UnitKey::is_default_index` test rationale.
     #[test]
     fn is_default_index_agrees_with_the_forensic_index_resolver() {
         use crate::aacs::index_select::resolve_disc_index;

@@ -2,25 +2,11 @@
 //! stream file (per-codec ES, PGS `.sup`, VobSub `.idx`/`.sub`, LPCM raw PCM),
 //! plus a chapters file and per-audio-track delay metadata.
 //!
-//! This is a write-only [`crate::pes::Stream`]. Instead of muxing the per-track
-//! `PesFrame` stream into a single container (as `MkvStream` does), it routes
-//! each frame's payload to the file for `frame.track`, post-processing where the
-//! internal codec `Frame` form differs from the standalone on-disk ES form:
-//!
-//! - **HEVC / H.264**: the codec parsers emit hvcC/avcC-style 4-byte
-//!   length-prefixed NALs (start codes stripped) and carry the parameter sets
-//!   out-of-band in `codec_private`. A standalone `.hevc`/`.h264` needs Annex-B
-//!   framing with the parameter sets prepended — see [`AnnexBWriter`].
-//! - **PGS**: the parser collapses a display/clear PCS pair into one
-//!   duration-bearing `Frame` with the raw segment payload but no `PG` magic /
-//!   timestamp header. A `.sup` needs the HDMV segment framing rebuilt — see
-//!   [`PgsSupWriter`].
-//! - **VobSub**: the `.sub` is the raw SPU stream; the `.idx` sidecar is
-//!   synthesized from per-SPU PTS + byte offsets — see [`VobSubWriter`].
-//!
-//! Every other codec writes `frame.data` verbatim ([`PassthroughWriter`]).
-//!
-//! The sink does NOT touch the MKV mux path; it is purely additive.
+//! This is a write-only [`crate::pes::Stream`] that routes each frame's
+//! payload to the file for `frame.track`, post-processing where the codec's
+//! internal `Frame` form differs from the on-disk ES form (HEVC/H.264
+//! Annex-B, PGS `.sup`, VobSub `.idx`) — see docs/demux-sink.md for details.
+//! Other codecs write `frame.data` verbatim; this sink is purely additive.
 
 use crate::disc::{Chapter, Codec, DiscTitle, Stream as DiscStream};
 use crate::mux::hevc::{
@@ -184,10 +170,8 @@ pub(crate) fn codec_label(codec: Codec) -> &'static str {
 
 // ── Per-codec ES writers ─────────────────────────────────────────────────────
 
-/// Per-codec elementary-stream writer.
-///
-/// Most codecs are pass-through; HEVC/H.264 re-frame to Annex-B, PGS re-frames
-/// to `.sup`, VobSub records `.idx` entries and emits the sidecar at finish.
+// Per-codec elementary-stream writer: most codecs pass through; HEVC/H.264
+// re-frame to Annex-B, PGS re-frames to `.sup`, VobSub emits `.idx`.
 trait EsWriter: Send {
     /// Write one frame's payload to `w`. Returns the number of bytes written to
     /// the main file.
@@ -275,11 +259,9 @@ impl EsWriter for AnnexBWriter {
     }
 }
 
-/// Extract the parameter-set NALs from an hvcC (HEVC) or avcC (H.264)
-/// configuration record and return them as a single Annex-B blob
-/// (`00 00 00 01 | NAL …`). Returns an empty Vec if the record can't be parsed.
-/// Delegates to the canonical hvcC/avcC → Annex-B converters in
-/// [`crate::mux::hevc`] — the single source of truth across all muxers.
+// Extract the parameter-set NALs from an hvcC (HEVC) or avcC (H.264) record
+// as a single Annex-B blob; empty Vec if unparsable. Delegates to the
+// canonical hvcC/avcC -> Annex-B converters in `crate::mux::hevc`.
 fn annexb_param_sets(codec: Codec, record: &[u8]) -> Vec<u8> {
     let converted = match codec {
         Codec::Hevc => hvcc_to_annex_b(record),
@@ -299,15 +281,9 @@ fn annexb_param_sets(codec: Codec, record: &[u8]) -> Vec<u8> {
     })
 }
 
-/// PGS `.sup` writer: rebuilds the HDMV segment framing the parser stripped.
-///
-/// The parser hands us the concatenated PGS segments of a display set in
-/// `frame.data` (segment_type + segment_size + payload, repeated), with no `PG`
-/// magic and no PTS/DTS. A `.sup` prefixes each segment with a 13-byte header:
-///   `0x50 0x47` ("PG") | PTS u32 BE | DTS u32 BE | (segment_type|size already
-///   present in the payload).
-/// When the parser folded a trailing clear (`duration_ns` set), we re-emit it as
-/// an empty composition at `pts + duration` so players time the subtitle out.
+// PGS `.sup` writer: rebuilds the HDMV segment framing the parser stripped,
+// prefixing each segment with a 13-byte `PG` header (PTS/DTS).
+// See docs/demux-sink.md — PgsSupWriter.
 struct PgsSupWriter;
 
 // ── PGS / HDMV segment framing constants ─────────────────────────────────────
@@ -368,18 +344,9 @@ impl PgsSupWriter {
         Ok(written)
     }
 
-    /// Build a synthetic "clear" display set: an empty PCS (0 composition
-    /// objects) followed by an END segment. The parser folds the original
-    /// clear/end PCS pair's wipe time into the display frame's `duration_ns`
-    /// and drops the clear bytes, so a faithful `.sup` re-emits one here at
-    /// `display_pts + duration`. Without it every subtitle lingers to EOF.
-    ///
-    /// `width`/`height` are carried from the display set's PCS so the clear PCS
-    /// advertises the same video geometry; they don't affect the wipe but keep
-    /// the segment well-formed.
-    ///
-    /// Returned bytes are concatenated `type(1)+size(2 BE)+payload` segments,
-    /// the same shape [`Self::emit_segments`] consumes.
+    // Synthetic "clear" display set (empty PCS + END) re-emitted at
+    // `display_pts + duration`; without it every subtitle lingers to EOF.
+    // See docs/demux-sink.md — synthetic_clear_display_set.
     fn synthetic_clear_display_set(width: u16, height: u16) -> Vec<u8> {
         // Empty PCS payload (HDMV PGS, BD-ROM Part 3): width(2) height(2)
         // frame_rate(1) composition_number(2) composition_state(1)
@@ -628,14 +595,9 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Replace path-hostile characters in a filename component.
-///
-/// Control characters included, NUL above all. Every string this touches is
-/// disc bytes, and a language code is three raw STN bytes run through
-/// `from_utf8_lossy` with no validation — `00 00 00` is the ordinary
-/// "undefined" encoding on real Blu-rays. A NUL in a path aborts `File::create`
-/// with `InvalidInput`, which took the whole demux export down before a single
-/// track file was opened.
+// Replace path-hostile characters (control chars incl. NUL) in a filename
+// component; disc-derived text (e.g. STN language codes) is unvalidated.
+// See docs/demux-sink.md — sanitize.
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -1095,10 +1057,8 @@ mod tests {
         );
     }
 
-    /// `audio://` filters the video track's file out, but the video track is
-    /// still the DELAY reference. The delay must be measured against the video's
-    /// actual first PTS, not against an assumed zero — a filename that says
-    /// `DELAY 600ms` when the true audio offset is 100ms is worse than no tag.
+    // `audio://` filters the video file out, but video is still the DELAY
+    // reference; must measure against its actual first PTS, not zero.
     #[test]
     fn audio_only_sink_delays_against_filtered_video_reference() {
         let dir = tempdir();
@@ -1217,12 +1177,9 @@ mod tests {
         );
     }
 
-    /// Regression (silent corruption): the sink reframed every frame as if the
-    /// NAL length prefixes were 4 octets wide. ISO/IEC 14496-15 §5.3.3.1.2 lets
-    /// an avcC declare `lengthSizeMinusOne = 1` (2-octet prefixes); reading those
-    /// as one u32-BE gives an absurd length, so nothing parsed and the raw
-    /// prefixed bytes were written to the `demux://` ES verbatim — no start
-    /// codes, undecodable video, and no error anywhere.
+    // Regression: an avcC may declare `lengthSizeMinusOne = 1` (2-octet NAL
+    // prefixes, ISO/IEC 14496-15 §5.3.3.1.2); assuming 4 octets silently
+    // wrote raw prefixed bytes as if Annex-B, with no start codes or error.
     #[test]
     fn annexb_writer_honours_the_records_declared_nal_length_size() {
         // avcC with byte 4 = 0xFD → lengthSizeMinusOne 1 → 2-octet prefixes.
@@ -1513,15 +1470,9 @@ mod tests {
         assert!(ogm.contains("CHAPTER02NAME=2"));
     }
 
-    /// Chapter names originate on the disc, which is untrusted input, and the
-    /// sink drops them straight into an XML document (`<ChapterString>`). Escaping
-    /// is what keeps a hostile or merely odd name from terminating the element and
-    /// injecting markup — the document is character data, so XML 1.0 §2.4 requires
-    /// `&` and `<`, and escaping `>` as well keeps a `]]>` sequence safe too.
-    ///
-    /// The order matters as much as the set: `&` must be replaced FIRST, otherwise
-    /// the ampersands introduced by the `<`/`>` replacements get escaped a second
-    /// time and `<` renders as the literal text `&lt;` instead of a `<`.
+    // Disc-sourced chapter names go straight into XML (`<ChapterString>`);
+    // `&`/`<`/`>` must be escaped, and `&` FIRST or the `<`/`>` replacements'
+    // ampersands get double-escaped (`<` rendering as literal `&lt;`).
     #[test]
     fn chapter_names_are_xml_escaped_so_a_disc_cannot_inject_markup() {
         let chaps = vec![Chapter {
@@ -1575,15 +1526,9 @@ mod tests {
         assert_eq!(a, out);
     }
 
-    /// Regression for the hardcoded `frame.track == 0` epoch driver: on an
-    /// M2TS/PMT title the PMT can list an AUDIO ES before the VIDEO ES, so the
-    /// video lands at stream index 1. The sink already resolves the video
-    /// reference dynamically (`ref_video_track`); the epoch driver must use that
-    /// SAME reference, not the literal 0. Here track 0 is audio and track 1 is
-    /// video. A video-only clip boundary (track 1) must open a new epoch (bump
-    /// `offset_ns`). With the bug (only `frame.track == 0` drives epochs) the
-    /// video back-jump would be treated as a passive rider and `offset_ns` would
-    /// stay 0 — corrupting every track's rebased timeline.
+    // Regression: the epoch driver must follow `ref_video_track` (dynamic),
+    // not a hardcoded `frame.track == 0` — a PMT can list audio before video.
+    // See docs/demux-sink.md — epoch_driver_follows_ref_video_not_track_zero.
     #[test]
     fn epoch_driver_follows_ref_video_not_track_zero() {
         let dir = tempdir();
@@ -1707,16 +1652,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A demux export whose seam plan drops every frame must FAIL, not write a
-    /// directory of empty track files and report success.
-    ///
-    /// Audit finding: this sink builds its timeline with
-    /// `TimelineContinuity::with_clips` but no test ever gave it a title with
-    /// usable PlayItem marks, so `frames_mapped` and `dropped_total()` were
-    /// always zero and BOTH gates in `finish` were unreachable. Deleting either
-    /// left the whole suite green while a `demux://` export of a
-    /// seamless-branching title wrote zero-byte track files beside a populated
-    /// chapters document, at exit 0.
+    // A demux export whose seam plan drops every frame must FAIL, not write
+    // empty track files and report success.
+    // See docs/demux-sink.md — a_demux_export_the_seam_plan_emptied_fails.
     #[test]
     fn a_demux_export_the_seam_plan_emptied_fails() {
         let dir = tempdir();
@@ -1786,15 +1724,9 @@ mod tests {
         p
     }
 
-    /// `demux://` exports the title's chapters as side files at `finish()`.
-    /// A `write_chapters` that returned `Ok(())` without writing produces a
-    /// demux run that reports complete success while the chapter files simply
-    /// do not exist — the caller has no way to tell an intentionally
-    /// chapterless title from a lost export.
-    ///
-    /// Both formats are requested at once and BOTH files are checked, with
-    /// distinct chapter names and a non-zero timestamp, so a writer that emitted
-    /// one format, an empty file, or the wrong chapter list cannot pass.
+    // `write_chapters` returning `Ok(())` without writing would report success
+    // with no chapter files. Both formats requested + checked with distinct
+    // names/timestamps, so a missing/wrong/empty writer output can't pass.
     #[test]
     fn finish_exports_both_chapter_formats_with_real_content() {
         let dir = tempdir();
@@ -1873,13 +1805,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Every filename component `demux://` writes is built from DISC-CONTROLLED
-    /// text — the volume label / playlist name (`opts.base`) and the track label.
-    /// `sanitize` is the only thing standing between that text and the
-    /// filesystem: a surviving `/` (or `\` on Windows) makes the sink write
-    /// OUTSIDE the output directory the caller chose, and `:` / `?` / `*` / `"` /
-    /// `<` / `>` / `|` make the create fail outright on Windows and on SMB/exFAT
-    /// shares, which are the normal targets for a rip.
+    // Filenames are built from disc-controlled text (volume/track labels);
+    // `sanitize` is all that stands between that text and the filesystem — a
+    // surviving `/` escapes the output dir, other chars break Windows/SMB.
     #[test]
     fn sanitize_neutralises_every_path_hostile_character() {
         for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|'] {
