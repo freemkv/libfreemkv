@@ -3,11 +3,7 @@
 //! runs a faithful, bounded HDMV navigation VM to find the playlist the disc's
 //! own First-Play navigation plays as the feature.
 //!
-//! There is no per-disc special-casing: one correctly-booted VM resolves
-//! densely-branched dispatchers as well as simple ones. The honest boundary is
-//! BD-J (the feature is chosen by a Java Xlet, not by the HDMV VM); there — and
-//! on any malformed data or non-convergence — the resolver ABSTAINS (`None`)
-//! and selection falls back to the structural/heuristic order.
+//! See docs/bdnav.md for the no-special-casing rationale and the BD-J/abstain boundary.
 //!
 //! Contract: read-only, bounded, and never panics or hard-fails.
 
@@ -18,12 +14,9 @@ pub(crate) mod vm;
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 
-/// Resolve the playlist id the disc's First-Play navigation plays as the
-/// feature, restricted to ids the caller marks as feature candidates
-/// (`is_feature_candidate` — typically video-bearing, non-trivial titles, so a
-/// short logo/pre-roll `PlayPlayList` is skipped). Returns `None` for BD-J discs,
-/// missing/malformed nav data, or when navigation does not converge on a
-/// candidate.
+// Resolve the playlist id First-Play navigation plays as the feature, among
+// ids the caller marks as feature candidates (`is_feature_candidate`).
+// Returns `None` for BD-J discs, malformed nav data, or non-convergence; see docs/bdnav.md.
 pub(crate) fn resolve_feature(
     reader: &mut dyn SectorSource,
     udf: &UdfFs,
@@ -55,10 +48,9 @@ mod tests {
     use super::*;
     use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
 
-    /// Encode one 12-byte `index.bdmv` playback object: `object_type` in the
-    /// top two bits of byte 0 (1 = HDMV, `id_ref` big-endian @6; 2 = BD-J).
-    /// Mirrors `index.rs`'s own test builder (kept local — that one is
-    /// private to `index.rs`'s test module).
+    // Encode one 12-byte `index.bdmv` playback object: `object_type` in the top
+    // two bits of byte 0 (1 = HDMV, `id_ref` big-endian @6; 2 = BD-J). Mirrors
+    // index.rs's own private test builder (kept local).
     fn hdmv_obj(id_ref: u16) -> [u8; 12] {
         let mut b = [0u8; 12];
         b[0] = 1 << 6;
@@ -87,11 +79,9 @@ mod tests {
         d
     }
 
-    /// Smoke/e2e test of the public resolver: a minimal valid
-    /// `/BDMV/index.bdmv` + `/BDMV/MovieObject.bdmv` on an in-memory UDF disc,
-    /// resolved end-to-end through `read_file` + `index::parse` +
-    /// `mobj::parse` + `vm::resolve`. First-Play HDMV object 0 unconditionally
-    /// `PlayPL`s playlist 11, which the caller marks as the feature candidate.
+    // Smoke/e2e test of the resolver: minimal index.bdmv + MovieObject.bdmv on
+    // an in-memory UDF disc, resolved via read_file + index::parse +
+    // mobj::parse + vm::resolve. First-Play HDMV object 0 unconditionally PlayPLs playlist 11.
     #[test]
     fn resolve_feature_end_to_end_resolves_playlist() {
         // op_cnt=1, grp=BRANCH(0), sub_grp=PLAY(2), branch_opt=PLAY_PL(0), imm dst.

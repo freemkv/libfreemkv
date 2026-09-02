@@ -39,6 +39,7 @@ PUB_CAP = 8
 _TYPE_OPENER = re.compile(r"^(pub(\([^)]*\))?\s+)*(enum|struct|union|trait)\b")
 _PUB_UNRESTRICTED = re.compile(r"^pub\s")  # `pub ` — not `pub(crate)` etc.
 _ATTR = re.compile(r"^#\[")
+_RAW_OPEN = re.compile(r'r(#*)"')  # raw string opener: r"…", r#"…"#, br##"…"## …
 
 
 def _strip_line_comment(s):
@@ -68,9 +69,19 @@ def _classify(lines):
     info = []
     in_block = False
     block_is_doc = False
+    raw_hashes = None  # None = not in a raw string; int N = open, needs '"' + N*'#'
     for raw in lines:
         s = raw.lstrip()
         rec = {"raw": raw, "s": s, "comment": None, "is_doc": False, "code": False}
+        # Inside a raw string literal (e.g. an embedded HTML/CSS/JS asset): the
+        # bytes are string data, not Rust comments, so the guard is blind to them
+        # until the string closes. Prevents `/* */` or `//` lines in an embedded
+        # page from being counted as comment blocks.
+        if raw_hashes is not None:
+            if ('"' + "#" * raw_hashes) in raw:
+                raw_hashes = None
+            info.append(rec)
+            continue
         if in_block:
             rec["comment"] = "doc" if block_is_doc else "plain"
             rec["is_doc"] = block_is_doc
@@ -95,6 +106,11 @@ def _classify(lines):
             continue
         # Code (or blank). Blank = empty after strip.
         rec["code"] = s != ""
+        # A code line may OPEN a raw string that spans following lines. Detected
+        # only on code (comments were handled above), so `// see r"x"` is safe.
+        m = _RAW_OPEN.search(raw)
+        if m and ('"' + "#" * len(m.group(1))) not in raw[m.end():]:
+            raw_hashes = len(m.group(1))
         info.append(rec)
     return info
 
@@ -273,6 +289,13 @@ def _selftest():
         ("/* one\n two\n three\n four\n five */\nfn q() {}\n", 1),
         # pub(crate) is NOT unrestricted pub -> private cap
         ("/// l1\n/// l2\n/// l3\n/// l4\npub(crate) fn r() {}\n", 1),
+        # comment-like lines INSIDE a raw string are string data, not comments
+        (
+            'const H: &str = r##"<style>\n'
+            + "".join("/* css note */\n" for _ in range(8))
+            + '</style>"##;\nfn h() {}\n',
+            0,
+        ),
     ]
     ok = True
     with tempfile.TemporaryDirectory() as d:

@@ -105,30 +105,8 @@ impl Stream for ChaptersSink {
 
 // ── json:// ──────────────────────────────────────────────────────────────────
 
-/// The `json://` document for one title.
-///
-/// SINGLE SERIALIZATION SOURCE OF TRUTH: the per-title / per-stream schema comes
-/// from the normalized [`TitleProfile`] (the same typed view `Disc::profile`
-/// exposes), serialized directly — `json://` and any downstream consumer share
-/// one schema rather than a hand-built one that can drift.
-///
-/// SCHEMA NOTE. This replaces the previous hand-built `streams` array. The
-/// stable editorial meaning is preserved, but the shape is normalized: the one
-/// `streams` array (tagged with `kind`) becomes three typed arrays (`video` /
-/// `audio` / `subtitles`); subtitle `qualifier` becomes the booleans `forced` +
-/// `sdh`; audio `purpose` becomes `commentary` + `descriptive`; and per-track
-/// `default` is now hoisted (first non-secondary video/audio). Per-stream fields
-/// the normalized profile intentionally omits (`pid`, `width`/`height`,
-/// `color_space`, `measured_cicp`, `sample_rate`, `channel_count`,
-/// `mvc_dependent`) are no longer emitted; they live on the richer scan model,
-/// not on this format-agnostic view.
-///
-/// `json://`-only extras that are NOT part of the normalized profile — the
-/// title's `clips` and the full `chapter_marks` list — are spliced back on so
-/// those consumers do not regress. (`chapters` from the profile is the marker
-/// COUNT; the full list is under `chapter_marks`.) `json://` is a per-title sink
-/// with no disc context, so `index` is `0` and `is_main` is `false`; the
-/// disc-level [`crate::disc::DiscProfile`] populates those correctly.
+// The `json://` document for one title, built from [`TitleProfile`].
+// See docs/meta-sink.md — title_json schema.
 pub(crate) fn title_json(title: &DiscTitle) -> serde_json::Value {
     use serde_json::json;
     let profile = TitleProfile::from_title(title, 0, false);
@@ -334,12 +312,8 @@ mod tests {
         t
     }
 
-    /// `chapters://` and `json://` are WRITE-ONLY sinks: the whole file is
-    /// emitted at `create()` and there is nothing to demux back. `read()`
-    /// returning `Ok(None)` instead of the write-only error makes a caller that
-    /// pointed a mux INPUT at one of these URLs see a clean empty stream — the
-    /// exact shape of the shipped "empty title, exit code 0" defect. It must
-    /// refuse with the numeric code `E_STREAM_WRITE_ONLY`.
+    // Write-only sinks must refuse read() with E_STREAM_WRITE_ONLY, not Ok(None).
+    // See docs/meta-sink.md — write-only sinks: read() semantics.
     #[test]
     fn metadata_sinks_refuse_to_be_read_from() {
         let code = format!("E{}", crate::error::Error::StreamWriteOnly.code());

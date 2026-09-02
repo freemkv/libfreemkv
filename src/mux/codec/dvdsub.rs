@@ -2,17 +2,13 @@
 //!
 //! DVD subtitles are carried in PS private stream 1 with sub-stream IDs 0x20-0x3F.
 //! A single subpicture unit (SPU — one displayed bitmap) may span multiple PES
-//! packets: only the first PES carries a PTS; continuation PES packets have no
-//! PTS field (the PS demuxer leaves `pts` as `None`). The SPU begins with a
-//! 2-byte big-endian `SPU_size` giving the total byte length of the whole unit.
-//! We reassemble across PES boundaries into one Frame so large subtitles aren't
-//! split/garbled, inheriting the head PES's PTS. The presence of a PTS — not
-//! merely an open `pending` — is the authoritative SPU-boundary signal, so a
-//! lost continuation or a corrupt SPU_size can't merge the next subtitle into
-//! the stuck unit.
+//! packets: only the first PES carries a PTS; continuation packets have none.
+//! The SPU begins with a 2-byte big-endian `SPU_size` giving the unit's total
+//! byte length. We reassemble across PES boundaries into one Frame so large
+//! subtitles aren't split/garbled, inheriting the head PES's PTS.
 //!
-//! For MKV: codec ID "S_VOBSUB".
-//! All frames are keyframes (each is a complete bitmap).
+//! For MKV: codec ID "S_VOBSUB". All frames are keyframes.
+// See docs/dvdsub-mod.md — why PTS presence, not `pending`, is the SPU boundary.
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
@@ -149,28 +145,18 @@ impl CodecParser for DvdSubParser {
 
 // ── YCbCr → RGB conversion and palette formatting ─────────────────────────
 
+// Byte-2-as-Cb is invisible on achromatic (Cb=Cr=128) palette entries.
+// See docs/dvdsub-mod.md for the full derivation.
 /// Convert a single YCbCr color to RGB, clamping to [0, 255].
 ///
 /// Input: `[padding, Y, Cr, Cb]` (as stored in DVD IFO PGC data). Note the
 /// chroma order: the on-disc PGC CLUT is **Cr before Cb** — byte 2 is Cr and
-/// byte 3 is Cb. Reading byte 2 as Cb swaps red and blue on every chromatic
-/// entry, and is invisible on the achromatic (white/black/grey, Cb = Cr = 128)
-/// entries that dominate real palettes, which is how it survives casual
-/// inspection. The order is fixed by the DVD-Video PGC format, not by us.
+/// byte 3 is Cb. The order is fixed by the DVD-Video PGC format, not by us.
 ///
 /// Returns `[R, G, B]`.
 ///
-/// Range convention (deliberate): this uses the **full-range (JFIF) BT.601**
-/// coefficients with no 16/235 luma scaling. DVD IFO palette YCbCr is nominally
-/// studio-swing BT.601, so studio-swing math would be more colorimetrically
-/// "correct" in isolation. But the output here is a VobSub `.idx` `palette:`
-/// line, and the entire VobSub ecosystem (the original tooling, mkvtoolnix,
-/// players that read the .idx palette) is built around this full-range formula —
-/// it is the de-facto on-disk convention. Emitting studio-swing-scaled RGB here
-/// would make freemkv's palettes inconsistent with every other tool and wrong in
-/// players that assume the VobSub convention. We therefore intentionally keep
-/// full-range; do NOT "fix" this to studio-swing without changing the consuming
-/// side in lockstep.
+/// Uses full-range (JFIF) BT.601 coefficients, matching the VobSub `.idx`
+/// on-disk convention (see docs/dvdsub-mod.md for why not studio-swing).
 pub fn ycbcr_to_rgb(color: &[u8; 4]) -> [u8; 3] {
     let y = color[1] as f64;
     let cr = color[2] as f64;
@@ -193,6 +179,8 @@ fn clamp_u8(v: f64) -> u8 {
     }
 }
 
+// The `size:` line is the frame the subpicture coords were authored against;
+// without it some renderers assume a default frame and mis-place subtitles.
 /// Format a 16-color YCbCr palette as a VobSub `.idx` header for S_VOBSUB
 /// CodecPrivate.
 ///
@@ -204,12 +192,8 @@ fn clamp_u8(v: f64) -> u8 {
 /// palette: rrggbb, rrggbb, ...
 /// ```
 ///
-/// The `size:` line is the VobSub original-frame resolution (the video frame the
-/// subpicture coordinates were authored against). Players read it to place and
-/// scale the bitmap; without it, some renderers assume a default frame and
-/// mis-position or mis-scale the subtitles. `width`/`height` are the title's
-/// coded video dimensions. When either is 0 (unknown) the `size:` line is
-/// omitted rather than emitting a `0x0` frame.
+/// `width`/`height` are the title's coded video dimensions; when either is 0
+/// (unknown) the `size:` line is omitted rather than emitting a `0x0` frame.
 ///
 /// Returns the formatted bytes suitable for MKV codec_private.
 pub fn format_palette(palette: &[[u8; 4]], width: u32, height: u32) -> Vec<u8> {
@@ -459,22 +443,9 @@ mod tests {
         assert!(b < 30, "B should be low for red, got {}", b);
     }
 
-    /// On-disc DVD PGC CLUT byte order is `[0, Y, Cr, Cb]` — byte 2 is **Cr**
-    /// and byte 3 is **Cb**, per the DVD-Video PGC format.
-    ///
-    /// This fixture uses a real on-disc red entry, so it fails if the two
-    /// chroma bytes are ever exchanged again. It is deliberately NOT built
-    /// from this crate's own doc comments: those described the order wrongly
-    /// for a long time, and the previous version of this test inherited the
-    /// error from them and therefore could not detect it.
-    ///
-    /// A saturated RED entry therefore appears on disc as Y=76, Cr=255, Cb=85
-    /// (full-range BT.601 encoding of RGB #FF0000), i.e. bytes
-    /// `[0x00, 76, 255, 85]`. Reading byte 2 as Cb and byte 3 as Cr instead
-    /// turns this entry BLUE, which is the exact user-visible symptom.
-    ///
-    /// The pre-existing `_white` / `_black` tests cannot catch this: they use
-    /// Cb = Cr = 128, so exchanging two equal bytes is a literal no-op.
+    // Real on-disc red entry (byte 2=Cr, byte 3=Cb); catches a chroma-byte
+    // swap. `_white`/`_black` can't catch this (Cb=Cr=128 is a no-op swap).
+    // See docs/dvdsub-mod.md for the full derivation.
     #[test]
     fn ycbcr_to_rgb_reads_byte2_as_cr_and_byte3_as_cb() {
         // On-disc [pad, Y, Cr, Cb] for saturated red.
@@ -758,11 +729,8 @@ mod tests {
         assert_eq!(String::from_utf8(result).unwrap(), "palette: 101010\n");
     }
 
-    /// The text guard in `codec/mod.rs` scans for a literal `source: None` and
-    /// cannot see a parser that writes `source: facts.source` where the facts
-    /// carry no offset. Only a runtime check proves an emitted frame really
-    /// carries the byte it was read from, and without it a multi-clip title
-    /// places this track by timestamp inference instead of by byte.
+    // Text guard in codec/mod.rs can't see `source: facts.source` with no
+    // offset; only a runtime check proves the frame carries its real byte.
     #[test]
     fn an_emitted_frame_carries_the_packets_source_offset() {
         let mut parser = DvdSubParser::new(None);

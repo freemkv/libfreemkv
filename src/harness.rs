@@ -1,38 +1,13 @@
 //! Seeded robustness harness for the untrusted-input parsers.
 //!
 //! Every parser reached from here takes bytes that came off a disc, and this
-//! crate's primary boundary is that the disc is untrusted: a malformed, damaged
-//! or hostile image must never crash the library. These tests assert exactly
-//! that one property — **the parser returns `Ok` or `Err`, and never panics.**
+//! crate's primary boundary is that the disc is untrusted: a malformed,
+//! damaged or hostile image must never crash the library. These tests assert
+//! exactly that: **the parser returns `Ok` or `Err`, and never panics.**
 //!
-//! # Why this exists rather than `cargo-fuzz`
-//!
-//! `cargo-fuzz` needs a nightly toolchain (`-Zsanitizer` plus SanitizerCoverage
-//! for libFuzzer's coverage feedback) and this project pins stable. So the
-//! generator lives here instead. It gives up coverage-guided mutation — the real
-//! loss — and keeps everything else: millions of cases, structure-aware input,
-//! and a crash corpus. It also gains determinism, which a fuzzer does not have:
-//! the same seed replays the same cases on any machine.
-//!
-//! # Why no `proptest` or `arbitrary`
-//!
-//! This crate has exactly one dev-dependency. That is a deliberate posture, and
-//! a randomness crate is not worth ten transitive dependencies when the parsers
-//! take plain `&[u8]` and a good enough generator is forty lines.
-//!
-//! # Budget
-//!
-//! `FREEMKV_HARNESS_CASES` sets cases per generator per target (default 256, low
-//! enough that the per-commit gate stays under a second). The overnight run sets
-//! it to millions. `FREEMKV_HARNESS_SEED` overrides the seed; the default is
-//! fixed so a failure in CI reproduces locally verbatim.
-//!
-//! # On failure
-//!
-//! The panic message carries the seed, generator and case index. Re-run with
-//! `FREEMKV_HARNESS_SEED=<seed>` to reproduce, then write the offending bytes
-//! into `tests/corpus/` as a permanent regression fixture — discovery happens
-//! here, defence happens there.
+//! `FREEMKV_HARNESS_CASES` sets cases per generator per target (default 256).
+//! `FREEMKV_HARNESS_SEED` overrides the seed to reproduce a CI failure
+//! locally. See docs/harness.md for rationale and the on-failure workflow.
 
 #![cfg(test)]
 
@@ -96,22 +71,16 @@ fn seed() -> u64 {
 /// small enough that millions of cases stay quick.
 const MAX_LEN: usize = 4096;
 
-/// Drive `f` over three generators and report which case broke it.
-///
-/// A panic inside `f` fails the test on its own — nothing is caught here,
-/// because catching would risk reporting a pass on an input that aborted. The
-/// wrapper exists to make the failing case *identifiable*: the harness prints
-/// the seed, generator and index before each call, so the last line before a
-/// panic names the exact case to reproduce.
+// Drive `f` over three generators and report which case broke it. A panic
+// inside `f` fails the test on its own (nothing is caught here); this wrapper
+// just prints seed/generator/index before each call so a panic is reproducible.
 fn sweep<F: FnMut(&[u8])>(target: &str, magic: &[u8], f: F) {
     sweep_n(target, magic, cases(), f)
 }
 
-/// `sweep` with an explicit budget. The budget is a PARAMETER rather than read
-/// from the environment inside the loop: the meta-tests below need a small,
-/// fixed count, and `std::env::set_var` is unsound once the test harness runs
-/// tests in parallel — two tests setting the same variable race, which is
-/// exactly what happened on the first run of this file.
+// `sweep` with an explicit budget, passed as a PARAMETER rather than read from
+// the environment inside the loop: `std::env::set_var` is unsound once tests
+// run in parallel, and the meta-tests below need a small, fixed count.
 fn sweep_n<F: FnMut(&[u8])>(target: &str, magic: &[u8], n: usize, mut f: F) {
     let s = seed();
 
@@ -347,10 +316,9 @@ fn a_seed_replays_identically() {
     assert_eq!(a, b, "the same seed must produce the same cases");
 }
 
-/// The harness is worthless if its cases die at the entry guards, so this
-/// MEASURES how deep they actually reach instead of assuming. A generator that
-/// never gets past a length or magic check exercises the first ten lines and
-/// nothing else — the fuzzing equivalent of a test that cannot fail.
+// MEASURES how deep the generators actually reach instead of assuming: a
+// generator that never gets past a length/magic check exercises the first
+// ten lines and nothing else — the fuzzing equivalent of a test that cannot fail.
 #[test]
 fn the_generators_actually_reach_the_parser_bodies() {
     // mpls::parse rejects at: len < 40, bad magic, then playlist_start + 10 >

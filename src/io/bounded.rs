@@ -3,52 +3,10 @@
 //! cooperative [`Halt`] poll. The calling thread is never trapped
 //! inside a kernel call.
 //!
-//! ## Why this exists
-//!
-//! [`crate::halt::Halt`] is cooperative: callers poll
-//! `is_cancelled()`. It cannot reach inside a syscall the kernel
-//! currently owns the thread for — `libc::sync_file_range`,
-//! `libc::fsync`, `File::write` on NFS, and so on. `/api/stop` from
-//! autorip therefore can't unstick a thread sitting in such a syscall.
-//!
-//! [`bounded_syscall`] is the escape hatch: it runs `op` on a fresh
-//! worker thread, then `recv_timeout`s on a rendezvous channel for the
-//! result. The wait is broken into ~250 ms slices so the calling
-//! thread can poll the supplied [`Halt`] in between. If the deadline
-//! elapses or the halt fires, the worker is intentionally leaked — the
-//! syscall will unwind whenever the kernel decides, or at process
-//! exit, but the caller is free to fall back to a degraded code path
-//! (skip the sync, log loudly, etc.).
-//!
-//! ## Trade-offs
-//!
-//! - **Thread per call.** Cheap (`std::thread::spawn` is < 100 µs on
-//!   Linux/macOS), but not free. Use on coarse-grained finalisation
-//!   syscalls (`sync_all`, `sync_file_range(WAIT_AFTER)`), not on hot
-//!   inner-loop writes.
-//! - **Leak on timeout.** A wedged syscall keeps a kernel slot and a
-//!   user-space thread around for the rest of the process's life.
-//!   Bounded by the number of independent rip/mux sessions, which is
-//!   one per disc. The alternative — trapping the caller forever —
-//!   defeats the entire purpose of `/api/stop`.
-//! - **Halt granularity ~250 ms.** Halt observation is not instant;
-//!   it's the worst-case latency of the `recv_timeout` slice. Good
-//!   enough for human-driven stop requests; not suitable for hard
-//!   real-time deadlines.
-//!
-//! ## Single source of truth
-//!
-//! Do NOT inline this pattern. Every blocking-syscall wrapper in the
-//! rip + mux pipeline calls this helper, so changes (e.g. swapping the
-//! channel impl, adjusting the poll slice, adding metrics) land in one
-//! place.
-//!
-//! ## Platform
-//!
-//! Pure `std::thread` + `std::sync::mpsc`. No `cfg(target_os)` needed
-//! here — the helper itself is platform-agnostic. Callers that wrap
-//! Linux-only syscalls (`sync_file_range`) still need their own
-//! `#[cfg(target_os = "linux")]` gates; this helper does not.
+//! Escape hatch for syscalls that trap a thread inside the kernel
+//! (`sync_file_range`, `fsync`, NFS writes) where a cooperative
+//! [`Halt`] can't interrupt. The worker thread is leaked on timeout
+//! or halt. See docs/bounded.md for rationale, trade-offs, and platform notes.
 
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::thread;
@@ -76,24 +34,9 @@ pub(crate) enum BoundedError {
     WorkerLost,
 }
 
-/// Run a (potentially-blocking) operation on a worker thread with a
-/// deadline and an optional cooperative halt-token poll. Returns the
-/// operation's result if it completes within `timeout`; otherwise one
-/// of [`BoundedError::Halted`] / [`BoundedError::Timeout`] /
-/// [`BoundedError::WorkerLost`].
-///
-/// On `Halted` / `Timeout` the worker thread is intentionally leaked:
-/// the syscall will unwind whenever the kernel decides, or when the
-/// process exits. The calling thread is never trapped inside a kernel
-/// call.
-///
-/// `halt` is polled at [`POLL_INTERVAL`] granularity. Pass `None` for
-/// callers that don't (yet) have a halt token plumbed through —
-/// behaviour degrades to deadline-only, matching the 0.20.5
-/// `wait_after_with_timeout` shape this helper generalises.
-///
-/// `op` returns `R: Send + 'static`. The closure must own everything
-/// it touches because it may outlive this call (timeout / halt cases).
+// Runs `op` on a worker thread with a deadline + optional [`Halt`]
+// poll; returns Ok, or Err on Halted/Timeout/WorkerLost (worker leaked).
+// See docs/bounded.md for halt polling, `op` ownership, and semantics.
 pub(crate) fn bounded_syscall<F, R>(
     halt: Option<&Halt>,
     timeout: Duration,
@@ -237,11 +180,8 @@ mod tests {
 
     // ── Added hardening tests ───────────────────────────────────────
 
-    /// Doc contract (lines 106-110): "If the caller already requested
-    /// halt, don't spawn (and leak) a worker that would run `op`."
-    /// When halt is pre-cancelled the op closure must NEVER run — the
-    /// short-circuit returns Halted before spawning the worker. We
-    /// prove the op did not execute by checking a side-effect flag.
+    // Pre-cancelled halt must short-circuit before spawning the
+    // worker, so `op` must never run. Verified via a side-effect flag.
     #[test]
     fn pre_cancelled_halt_never_runs_op() {
         let halt = Halt::new();
@@ -260,12 +200,8 @@ mod tests {
         );
     }
 
-    /// Timeout boundary: with a tiny deadline and an op that sleeps
-    /// much longer, the helper must return Timeout and must do so
-    /// roughly at the deadline — NOT wait for the op to finish (that
-    /// is the whole point of the bounded wrapper; the worker is
-    /// leaked). Grounds the `Instant::now() >= deadline` arm (line 141)
-    /// and the leak contract (doc lines 84-88).
+    // Must return Timeout near the deadline, not after the op
+    // finishes — the worker is leaked, not awaited.
     #[test]
     fn timeout_returns_near_deadline_not_after_op() {
         let started = Instant::now();
