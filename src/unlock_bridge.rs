@@ -1,7 +1,7 @@
 //! Bridges libfreemkv's drive layer to the `freemkv-unlock` crate: one generic
 //! SCSI-transport adapter, identity/host-cert mapping, and the dispatch that
-//! news up `all_unlockers()` and runs the first matching one. libfreemkv names
-//! no individual unlocker — it only calls this bridge.
+//! assembles the unlocker list and runs each one's `unlock()` until one claims
+//! the drive. libfreemkv names no individual unlocker — it only calls this bridge.
 
 use freemkv_unlock as fu;
 
@@ -88,71 +88,72 @@ pub(crate) fn map_host_certs(certs: &[crate::aacs::types::HostCert]) -> Vec<fu::
         .collect()
 }
 
-// See docs/unlock-bridge.md — Dispatch = (matched_name, result); matched_name
-// records WHICH unlocker ran, distinct from the identity-only unlocker_name().
+// (matched_name, result): `Ok(Some)` = that unlocker unlocked; `Ok(None)` =
+// nobody claimed the drive; `Err(Transport)` = dead bus. See docs/unlock-bridge.md.
 type Dispatch = (
     &'static str,
-    std::result::Result<fu::Unlocked, fu::UnlockError>,
+    std::result::Result<Option<fu::Unlocked>, fu::UnlockError>,
 );
 
-/// Try each unlocker's `capability` (`unlock_features` or `unlock_bus`) in
-/// registration order, stopping at the first that doesn't decline. Shared by
-/// [`run_features`] and [`run_bus`].
-fn dispatch(
+/// Run an ordered set of unlockers, calling each one's uniform `unlock()` and
+/// stopping at the first that claims the drive. Shared by [`run_features`] and
+/// [`run_bus`]; the two differ ONLY in which unlockers they hand in — an
+/// unlocker is an unlocker, so this loop knows nothing about any of them.
+fn run(
+    unlockers: Vec<Box<dyn fu::Unlocker>>,
     scsi: &mut dyn crate::scsi::ScsiTransport,
     drive_id: &crate::identity::DriveId,
     kind: fu::DiscKind,
-    host_certs: &[fu::HostCert],
-    capability: impl Fn(
-        &dyn fu::Unlocker,
-        &mut dyn fu::scsi::ScsiTransport,
-        &fu::UnlockCtx,
-    ) -> std::result::Result<fu::Unlocked, fu::UnlockError>,
 ) -> Dispatch {
     let id = to_fu_drive_id(drive_id);
-    let ctx = fu::UnlockCtx::new(&id, kind, host_certs);
+    let ctx = fu::UnlockCtx::new(&id, kind);
     let mut adapter = ScsiAdapter(scsi);
-    for u in fu::all_unlockers() {
-        match capability(u.as_ref(), &mut adapter, &ctx) {
-            // This unlocker doesn't provide the capability for this drive/disc —
-            // try the next one.
-            Err(fu::UnlockError::NotApplicable) => continue,
-            // An actual unlock, or a real failure (e.g. Transport) — stop here.
-            other => return (u.name(), other),
+    for u in &unlockers {
+        match u.unlock(&mut adapter, &ctx) {
+            Ok(None) => continue, // not this one's drive
+            Ok(Some(unlocked)) => return (u.name(), Ok(Some(unlocked))),
+            Err(e) => return (u.name(), Err(e)), // dead bus — abort
         }
     }
-    ("", Err(fu::UnlockError::NotApplicable))
+    ("", Ok(None))
 }
 
-/// Drive-prep: unlock DRIVE FEATURES (riplock/speed, OEM VID). `host_certs` are
-/// not needed for features — pass `&[]`; `kind` is `Unknown` at drive-prep.
+/// Drive-prep: run the FIRMWARE unlockers (freemkv / MT1959 / Renesas), which
+/// key off the drive rather than the disc, so `kind` is `Unknown` and they need
+/// no certs. Each removes bus encryption at the drive and reads the OEM Volume
+/// ID best-effort.
 pub(crate) fn run_features(
     scsi: &mut dyn crate::scsi::ScsiTransport,
     drive_id: &crate::identity::DriveId,
 ) -> Dispatch {
-    dispatch(scsi, drive_id, fu::DiscKind::Unknown, &[], |u, s, c| {
-        u.unlock_features(s, c)
-    })
+    let unlockers: Vec<Box<dyn fu::Unlocker>> = vec![
+        Box::new(fu::FreemkvUnlocker::new()),
+        Box::new(fu::LdUnlocker::new()),
+        Box::new(fu::Renesas::new()),
+    ];
+    run(unlockers, scsi, drive_id, fu::DiscKind::Unknown)
 }
 
-/// Content: remove BUS ENCRYPTION for the mounted disc. Called only when the bus
-/// isn't already clear (the `oem_vid`/`bus_encryption_removed` gate). `host_certs`
-/// are the caller-collected certs for the AACS route; `kind` selects Aacs vs Css.
+/// Content: remove BUS ENCRYPTION for the mounted disc via the DISC-keyed
+/// unlockers — the AACS cert route (`host_certs` injected into it at
+/// construction, the one place certs enter) and the CSS/DVD route. `kind`
+/// selects which self-applies; the other declines.
 pub(crate) fn run_bus(
     scsi: &mut dyn crate::scsi::ScsiTransport,
     drive_id: &crate::identity::DriveId,
     kind: fu::DiscKind,
     host_certs: &[fu::HostCert],
 ) -> Dispatch {
-    dispatch(scsi, drive_id, kind, host_certs, |u, s, c| {
-        u.unlock_bus(s, c)
-    })
+    let unlockers: Vec<Box<dyn fu::Unlocker>> = vec![
+        Box::new(fu::AacsUnlocker::new(host_certs.to_vec())),
+        Box::new(fu::DvdUnlocker::new()),
+    ];
+    run(unlockers, scsi, drive_id, kind)
 }
 
-// See docs/unlock-bridge.md — names of every registered unlocker, in dispatch
-// order; registry-driven so adding/removing an unlocker needs no other change.
+// The unlocker names, in dispatch order, for the user-facing unlocker matrix.
 pub(crate) fn unlocker_names() -> Vec<&'static str> {
-    fu::all_unlockers().iter().map(|u| u.name()).collect()
+    vec!["freemkv", "LD", "Renesas", "AACS", "DVD"]
 }
 
 #[cfg(test)]

@@ -1661,12 +1661,17 @@ impl Disc {
                 freemkv_unlock::DiscKind::Css,
                 &[],
             );
-            if let Err(e) = css_unlock_res {
-                tracing::warn!(
+            match css_unlock_res {
+                Ok(Some(_)) => {}
+                Ok(None) => tracing::warn!(
+                    target: "freemkv::scan",
+                    "CSS bus-auth unlock declined; scrambled sectors may be unavailable"
+                ),
+                Err(e) => tracing::warn!(
                     target: "freemkv::scan",
                     outcome = ?e,
                     "CSS bus-auth unlock did not apply; scrambled sectors may be unavailable"
-                );
+                ),
             }
         }
 
@@ -2523,26 +2528,27 @@ impl Disc {
     /// report. On a drive taken by the firmware bus-unlock route, the AACS
     /// host-cert unlocker never runs — it "matched" but did nothing, so
     /// `did-work` reports `AACS: no`, and a *stock* drive on the cert route
-    /// instead reports `MT1959: no, AACS: yes` — the real diagnostic.
+    /// instead reports `LD: no, AACS: yes` — the real diagnostic.
     pub fn unlocker_matrix(&self, drive: &crate::Drive) -> Vec<(&'static str, bool)> {
-        // The drive-prep unlocker that actually ran (recorded on init):
-        // "MT1959" (drive-firmware bus-unlock route) or "Renesas" (cert route) —
-        // mutually exclusive per drive.
+        // The firmware unlocker that ran (recorded on init): "freemkv", "LD", or
+        // "Renesas" — mutually exclusive per drive. See docs/disc-mod.md.
         let prep = drive.unlocker_name();
-        // Only the firmware bus-unlock route removes AACS bus encryption AT THE
-        // DRIVE; the Renesas route unlocks features but leaves the bus to the cert.
-        let ld_removed_bus = prep == Some("MT1959");
+        // Every firmware / vendor-CDB route (freemkv Raw Read, LD, Renesas/Pioneer
+        // vendor open) removes bus encryption AT THE DRIVE — clear content, no
+        // host cert. See docs/disc-mod.md — unlocker_matrix.
+        let fw_removed_bus = matches!(prep, Some("freemkv") | Some("LD") | Some("Renesas"));
         crate::unlock_bridge::unlocker_names()
             .into_iter()
             .map(|name| {
                 let did_work = match name {
                     // Each firmware unlocker did work iff it was the one that ran.
-                    "MT1959" => ld_removed_bus,
+                    "freemkv" => prep == Some("freemkv"),
+                    "LD" => prep == Some("LD"),
                     "Renesas" => prep == Some("Renesas"),
-                    // The AACS host-cert route removed the bus ONLY when the
-                    // firmware didn't (stock or Renesas drive) AND AACS state was
-                    // actually obtained.
-                    "AACS" => self.aacs.is_some() && !ld_removed_bus,
+                    // The AACS host-cert route removed the bus ONLY when NO
+                    // firmware route did (stock or Renesas drive) AND AACS state
+                    // was actually obtained.
+                    "AACS" => self.aacs.is_some() && !fw_removed_bus,
                     // DVD read-unlock (CSS bus-auth) runs for EVERY DVD during scan
                     // and isn't tracked separately, so this reports the MEDIUM
                     // engaged, not a per-rip success bit — failures surface downstream.

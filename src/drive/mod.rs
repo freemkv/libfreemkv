@@ -488,19 +488,19 @@ impl Drive {
         let (matched, unlock_res) =
             crate::unlock_bridge::run_features(self.scsi.as_mut(), &self.drive_id);
         let r: Result<()> = match unlock_res {
-            Ok(unlocked) => {
-                // Record WHICH drive-prep unlocker ran ("MT1959" bus-unlock or
-                // "Renesas" cert route), not the id-only lookup, so a Renesas
-                // drive reports itself honestly rather than as nothing.
+            Ok(Some(unlocked)) => {
+                // Record which firmware unlocker ran, not the id-only lookup.
                 self.unlocker_name = Some(matched.to_string());
-                // Stash the OEM Volume ID the unlocker returned for the AACS
-                // handshake phase (do_handshake reads it via `oem_vid()`). A
-                // drive-prep unlocker always carries a VID; guard anyway.
+                // Stash the OEM Volume ID (best-effort: a transient miss leaves
+                // the drive unlocked with no VID). do_handshake reads `oem_vid()`.
                 if let Some(vid) = unlocked.vid {
                     self.oem_vid = Some(vid);
                 }
                 Ok(())
             }
+            // No firmware unlocker claimed the drive — a stock/cert-only drive;
+            // the AACS cert route runs later at the handshake phase.
+            Ok(None) => Ok(()),
             Err(freemkv_unlock::UnlockError::Transport) => Err(Error::ScsiError {
                 opcode: 0,
                 status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,

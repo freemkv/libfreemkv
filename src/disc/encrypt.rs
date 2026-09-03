@@ -109,7 +109,13 @@ impl AacsCertUnlocker<'_> {
             freemkv_unlock::DiscKind::Aacs,
             &fu_certs,
         );
-        let unlocked = unlock_res.map_err(CertUnlockFailure::Unlock)?;
+        // `Ok(None)` = the cert route declined/was rejected (certs were present —
+        // checked above — so this is a rejected handshake). `Err` = dead bus.
+        let unlocked = match unlock_res {
+            Ok(Some(u)) => u,
+            Ok(None) => return Err(CertUnlockFailure::Unlock(UnlockError::HandshakeRejected)),
+            Err(e) => return Err(CertUnlockFailure::Unlock(e)),
+        };
         // The cert handshake yields a VID on success; its absence is VidUnavailable.
         let Some(volume_id) = unlocked.vid else {
             return Err(CertUnlockFailure::Unlock(UnlockError::VidUnavailable));
@@ -121,7 +127,10 @@ impl AacsCertUnlocker<'_> {
             // AACS-specific "why the read_data_key read failed" diagnostic does
             // not cross the seam. The bus-key gate keys off presence, not cause.
             read_data_key_err: None,
-            drive_unlocked: unlocked.drive_unlocked,
+            // Cert route: bus encryption is removed via the read_data_key (AKE),
+            // NOT at the drive, so `drive_unlocked` is false — the gate credits
+            // this path through `read_data_key.is_some()` instead.
+            drive_unlocked: false,
         })
     }
 }
