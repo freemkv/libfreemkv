@@ -191,6 +191,13 @@ impl Drive {
         }
     }
 
+    /// Test-only: mark the drive as claimed by a named firmware unlocker at
+    /// init(), so the do_handshake_cert anti-poison guard can be exercised.
+    #[cfg(test)]
+    pub(crate) fn set_unlocker_name_for_test(&mut self, name: &str) {
+        self.unlocker_name = Some(name.to_string());
+    }
+
     /// Get a clone of the halt flag. Set to true to interrupt Drive::read().
     pub fn halt_flag(&self) -> Arc<AtomicBool> {
         self.halt.clone()

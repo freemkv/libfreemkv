@@ -232,10 +232,23 @@ impl Disc {
                 None,
             );
         }
+        // A picked unlocker is the sole VID source — no fall-through. A
+        // firmware-claimed drive with no VID stays None: the AACS cert route's
+        // REPORT KEY AGID cycle would poison it here (see the guard test).
+        if let Some(unlocker) = session.unlocker_name() {
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "firmware_unlocked_no_vid",
+                unlocker,
+                "Drive claimed by a firmware unlocker with no Volume ID; not running the AACS cert handshake — a key source may supply the key."
+            );
+            return (None, None);
+        }
+
         tracing::debug!(
             target: "freemkv::disc",
             phase = "oem_vid_none",
-            "No drive-unlocker Volume ID; running the in-tree AACS host-certificate handshake (AacsCertUnlocker)."
+            "No firmware unlocker claimed the drive; running the AACS host-certificate handshake (AacsCertUnlocker) — the cert route IS the unlocker here."
         );
 
         // Cert path: `AacsCertUnlocker` collects host certs, runs
@@ -947,6 +960,60 @@ mod tests {
     fn collect_host_certs_empty_when_no_credentials_no_sources() {
         let opts = ScanOptions::default();
         assert!(Disc::collect_host_certs(&opts, None).is_empty());
+    }
+
+    /// A transport that counts every SCSI command issued (via a shared counter
+    /// that outlives the drive, so the count can be read before `Drive::drop`'s
+    /// tray-unlock cleanup runs). Returns a benign CHECK CONDITION.
+    struct CountingTransport(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl crate::scsi::ScsiTransport for CountingTransport {
+        fn execute(
+            &mut self,
+            _cdb: &[u8],
+            _direction: crate::scsi::DataDirection,
+            _data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> crate::Result<crate::scsi::ScsiResult> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::scsi::ScsiResult {
+                status: 2,
+                bytes_transferred: 0,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    /// Anti-poison guard: when a FIRMWARE unlocker claimed the drive at init()
+    /// but stashed no Volume ID, `do_handshake_cert` returns `(None, None)`
+    /// WITHOUT running the AACS host-cert handshake — whose REPORT KEY AGID cycle
+    /// would poison the drive so every later bare `0xAD` VID read aborts until the
+    /// medium is reloaded. An unlocker that is picked does not fall through to
+    /// another. Red-before-green: without the guard, the cert route's MKB read
+    /// fires and the SCSI count is non-zero.
+    #[test]
+    fn firmware_claimed_no_vid_skips_cert_handshake_and_issues_no_scsi() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let scsi_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(CountingTransport(
+            scsi_count.clone(),
+        )));
+        drive.set_unlocker_name_for_test("freemkv");
+        let opts = ScanOptions::default();
+        let (result, err) = Disc::do_handshake_cert(&mut drive, &opts);
+        // Read the count BEFORE `drive` drops (Drop::cleanup issues a tray-unlock).
+        assert_eq!(
+            scsi_count.load(SeqCst),
+            0,
+            "the guard must issue NO SCSI on a firmware-claimed drive with no VID"
+        );
+        assert!(
+            result.is_none(),
+            "a firmware unlocker with no VID yields no HandshakeResult"
+        );
+        assert!(
+            err.is_none(),
+            "no VID from a firmware unlocker is not an error — a key source may still supply the key"
+        );
     }
 
     #[test]
