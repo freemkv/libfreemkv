@@ -105,17 +105,19 @@ pub(crate) fn role_paths(udf: &crate::udf::UdfFs, role: AacsRole) -> Vec<String>
     v
 }
 
-// Walk an AACS role's candidate paths and return the first that reads;
-// generic over `&str`/`String` so it accepts `role_paths`' `Vec<String>`.
-// Returns `Error::AacsNoKeys` if no candidate is present.
+// Walk an AACS role's candidate paths, returning the first that reads.
+// A missing candidate is skipped; any other error (e.g. a real `DiscRead`)
+// propagates; `AacsNoKeys` only when every candidate was absent.
 pub(crate) fn read_first<S, F>(candidates: &[S], mut read: F) -> crate::error::Result<Vec<u8>>
 where
     S: AsRef<str>,
     F: FnMut(&str) -> crate::error::Result<Vec<u8>>,
 {
     for path in candidates {
-        if let Ok(buf) = read(path.as_ref()) {
-            return Ok(buf);
+        match read(path.as_ref()) {
+            Ok(buf) => return Ok(buf),
+            Err(crate::error::Error::UdfNotFound { .. }) => continue,
+            Err(e) => return Err(e),
         }
     }
     Err(crate::error::Error::AacsNoKeys)
