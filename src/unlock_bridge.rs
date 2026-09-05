@@ -118,7 +118,7 @@ fn run(
     ("", Ok(None))
 }
 
-/// Drive-prep: run the FIRMWARE unlockers (freemkv / MT1959 / Renesas), which
+/// Drive-prep: run the FIRMWARE unlockers (freemkv / LD / Renesas), which
 /// key off the drive rather than the disc, so `kind` is `Unknown` and they need
 /// no certs. Each removes bus encryption at the drive and reads the OEM Volume
 /// ID best-effort.
