@@ -984,7 +984,10 @@ impl Drive {
     pub fn set_speed(&mut self, speed_kbs: u16) {
         let cdb = crate::scsi::build_set_cd_speed(speed_kbs);
         let mut dummy = [0u8; 0];
-        let _ = self.scsi_execute(&cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000);
+        if let Err(e) = self.scsi_execute(&cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000)
+        {
+            tracing::warn!(target: "freemkv::drive", error = %e, "SET CD SPEED failed");
+        }
     }
 
     /// Lock the tray so the disc cannot be ejected during a rip.
@@ -998,10 +1001,13 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 0];
-        let _ =
+        if let Err(e) =
             self.scsi
                 .as_mut()
-                .execute(&prevent, crate::scsi::DataDirection::None, &mut buf, 5_000);
+                .execute(&prevent, crate::scsi::DataDirection::None, &mut buf, 5_000)
+        {
+            tracing::warn!(target: "freemkv::drive", error = %e, "PREVENT MEDIUM REMOVAL failed");
+        }
     }
 
     /// Unlock the tray so the user can manually eject the disc.
