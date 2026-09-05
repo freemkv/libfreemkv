@@ -310,6 +310,10 @@ mod tests {
     #[test]
     fn presence_probe_does_not_open_a_transport() {
         let path = Path::new("/dev/freemkv-no-such-device");
+        // Snapshot rather than assume `false`: OPEN is a process-global bit any
+        // concurrent test's live transport can hold, so compare the delta — it
+        // scopes the check to this call, can't flake, still catches a held lock.
+        let open_before = OPEN.load(Ordering::Acquire);
         let t0 = std::time::Instant::now();
         let r = drive_has_disc(path);
         let elapsed = t0.elapsed();
@@ -323,9 +327,10 @@ mod tests {
             "probe took {elapsed:?}: the transport path's unconditional 500 ms \
              post-unmount sleep means this budget can only be met without it"
         );
-        assert!(
-            !OPEN.load(Ordering::Acquire),
-            "the probe must not leave the exclusive-transport lock held"
+        assert_eq!(
+            OPEN.load(Ordering::Acquire),
+            open_before,
+            "the probe must not change the exclusive-transport lock state"
         );
     }
 
