@@ -32,6 +32,12 @@ const K_MAX_CDB_SIZE: usize = 16;
 /// the tray is not left locked; a six-byte group-0 CDB.
 const ALLOW_MEDIUM_REMOVAL: [u8; 6] = [0x1E, 0, 0, 0, 0, 0];
 
+/// Cap on detached fd-recovery threads outstanding at once (process-wide).
+/// A sustained bridge wedge would otherwise spawn 2 threads per failed ioctl
+/// with no bound; past the cap, recovery runs inline instead of spawning.
+const MAX_RECOVERY_THREADS: usize = 8;
+static RECOVERY_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[repr(C)]
 #[allow(non_camel_case_types)]
 struct sg_io_hdr {
@@ -332,36 +338,64 @@ impl ScsiTransport for SgIoTransport {
             let recovery = self.fd_recovery.clone();
             let dead = self.dead.clone();
 
-            std::thread::spawn(move || {
-                if old_fd >= 0 {
-                    unsafe { libc::close(old_fd) };
-                }
-            });
+            // Cap outstanding recovery threads: past MAX_RECOVERY_THREADS a
+            // sustained wedge would spawn unbounded threads, so fall back to
+            // doing the close/reopen inline on this thread instead.
+            use std::sync::atomic::Ordering;
+            if RECOVERY_THREADS.load(Ordering::Acquire) < MAX_RECOVERY_THREADS {
+                RECOVERY_THREADS.fetch_add(1, Ordering::AcqRel);
+                std::thread::spawn(move || {
+                    if old_fd >= 0 {
+                        unsafe { libc::close(old_fd) };
+                    }
+                    RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
+                });
+            } else if old_fd >= 0 {
+                unsafe { libc::close(old_fd) };
+            }
 
-            std::thread::spawn(move || {
-                // Don't unwrap: a device path with an interior NUL would
-                // panic this detached thread (silently swallowed). Bail
-                // and leave fd_recovery untouched instead.
-                let c_path = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
+            if RECOVERY_THREADS.load(Ordering::Acquire) < MAX_RECOVERY_THREADS {
+                RECOVERY_THREADS.fetch_add(1, Ordering::AcqRel);
+                std::thread::spawn(move || {
+                    // Don't unwrap: a device path with an interior NUL would
+                    // panic this detached thread (silently swallowed). Bail
+                    // and leave fd_recovery untouched instead.
+                    let c_path = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
+                            return;
+                        }
+                    };
+                    let new_fd = unsafe {
+                        libc::open(
+                            c_path.as_ptr() as *const libc::c_char,
+                            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                        )
+                    };
+                    if new_fd >= 0 {
+                        // Hand the fd to the transport. Comes back to us only if
+                        // nobody there will ever close it: another recovery thread
+                        // won the slot, or Drop already tore the transport down.
+                        if let Some(orphan) = publish_recovered_fd(&recovery, &dead, new_fd) {
+                            unsafe { libc::close(orphan) };
+                        }
+                    }
+                    RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
+                });
+            } else if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+                // At the recovery-thread cap: reopen inline (blocking this
+                // call briefly) instead of spawning an unbounded 9th thread.
                 let new_fd = unsafe {
                     libc::open(
                         c_path.as_ptr() as *const libc::c_char,
                         libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
                     )
                 };
-                if new_fd < 0 {
-                    return;
+                if new_fd >= 0 {
+                    self.fd = new_fd;
                 }
-                // Hand the fd to the transport. Comes back to us only if
-                // nobody there will ever close it: another recovery thread
-                // won the slot, or Drop already tore the transport down.
-                if let Some(orphan) = publish_recovered_fd(&recovery, &dead, new_fd) {
-                    unsafe { libc::close(orphan) };
-                }
-            });
+            }
 
             return Err(Error::ScsiError {
                 opcode: cdb[0],
