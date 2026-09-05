@@ -285,19 +285,46 @@ impl SptiTransport {
     }
 }
 
-/// Enumerate optical drives on Windows via `find_drives()` (CdRom0..15
-/// scan) and re-shape into `DriveInfo`. Existing implementation already
-/// returns `(path, DriveId)`; mapped here to the public struct.
+/// Enumerate optical drives on Windows: probe `\\.\CdRom0..15`, falling back to
+/// drive letters `D..Z` only if none match, INQUIRY each, and keep the optical
+/// ones (peripheral device type 0x05).
+///
+/// Self-contained at the SCSI layer via `scsi::open` + `scsi::inquiry` (as the
+/// Linux backend is), with no dependency on the `rip`-gated `drive`/`identity`
+/// modules — `scsi` builds without `rip` (freemkv-firmware), where the old
+/// `crate::drive::windows::find_drives()` delegation failed to compile.
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
-    crate::drive::windows::find_drives()
-        .into_iter()
-        .map(|(path, id)| super::DriveInfo {
-            path,
-            vendor: id.vendor_id.trim().to_string(),
-            model: id.product_id.trim().to_string(),
-            firmware: id.product_revision.trim().to_string(),
-        })
-        .collect()
+    // SCSI peripheral device type 5 = MMC / optical, low 5 bits of INQUIRY byte 0.
+    const SCSI_PERIPHERAL_TYPE_OPTICAL: u8 = 0x05;
+
+    fn probe(path: &str, out: &mut Vec<super::DriveInfo>) {
+        let Ok(mut transport) = crate::scsi::open(Path::new(path)) else {
+            return;
+        };
+        let Ok(r) = super::inquiry(transport.as_mut()) else {
+            return;
+        };
+        if !r.raw.is_empty() && (r.raw[0] & 0x1F) == SCSI_PERIPHERAL_TYPE_OPTICAL {
+            out.push(super::DriveInfo {
+                path: normalize_device_path(path),
+                vendor: r.vendor_id,
+                model: r.model,
+                firmware: r.firmware,
+            });
+        }
+    }
+
+    let mut drives = Vec::new();
+    for i in 0..16 {
+        probe(&format!("\\\\.\\CdRom{}", i), &mut drives);
+    }
+    // Only fall back to drive letters if the CdRom scan found nothing.
+    if drives.is_empty() {
+        for letter in b'D'..=b'Z' {
+            probe(&format!("{}:", letter as char), &mut drives);
+        }
+    }
+    drives
 }
 
 /// TEST UNIT READY probe on Windows. No in-library recovery — see the
