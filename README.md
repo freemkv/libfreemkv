@@ -1,3 +1,5 @@
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/MattJackson)
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![CI](https://github.com/freemkv/libfreemkv/actions/workflows/ci.yml/badge.svg)](https://github.com/freemkv/libfreemkv/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/freemkv/libfreemkv/branch/dev/graph/badge.svg)](https://codecov.io/gh/freemkv/libfreemkv)
