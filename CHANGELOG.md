@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.1] — UNRELEASED
+
+### Changed
+
+- Unified release with freemkv-unlock 1.7.1 (LibreDrive profile-match fix). No functional changes to this crate.
+
 ## [1.7.0] — 2026-09-02
 
 ### Fixed
