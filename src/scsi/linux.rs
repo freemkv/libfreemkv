@@ -726,4 +726,43 @@ mod raw_command_cdb_guard_tests {
             );
         }
     }
+
+    // ── fd-reopen path helpers (used by open / drive_has_disc / recovery) ──
+
+    /// `to_c_path` must NUL-terminate exactly once and preserve the path bytes,
+    /// or `libc::open` in the reopen path reads past the buffer or opens a
+    /// truncated device name.
+    #[test]
+    fn to_c_path_nul_terminates_and_preserves_the_bytes() {
+        let c = SgIoTransport::to_c_path(Path::new("/dev/sg3"));
+        assert_eq!(c.last(), Some(&0u8), "must end in a NUL for libc::open");
+        assert_eq!(&c[..c.len() - 1], b"/dev/sg3", "path bytes preserved");
+        assert_eq!(
+            c.iter().filter(|&&b| b == 0).count(),
+            1,
+            "exactly one NUL, at the end"
+        );
+    }
+
+    /// `resolve_to_sg` passes an sg node through unchanged, and falls back to the
+    /// original path when there is no filename or the node is neither sr nor sg —
+    /// the branches that need no sysfs.
+    #[test]
+    fn resolve_to_sg_passes_sg_through_and_falls_back_otherwise() {
+        assert_eq!(
+            SgIoTransport::resolve_to_sg(Path::new("/dev/sg7")),
+            Path::new("/dev/sg7"),
+            "an sg node is already resolved"
+        );
+        assert_eq!(
+            SgIoTransport::resolve_to_sg(Path::new("/")),
+            Path::new("/"),
+            "a path with no filename falls back to itself"
+        );
+        assert_eq!(
+            SgIoTransport::resolve_to_sg(Path::new("/dev/foo")),
+            Path::new("/dev/foo"),
+            "a non-sr, non-sg node is returned unchanged"
+        );
+    }
 }
