@@ -2490,13 +2490,27 @@ mod tests {
         use std::sync::{Arc, Mutex};
         let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
         // make_video_track() writes the header PROGRESSIVE (interlaced=false).
-        let mut muxer =
-            MkvMuxer::new(SharedWriter(shared.clone()), &[make_video_track()], None, 0.0, &[])
-                .unwrap();
+        let mut muxer = MkvMuxer::new(
+            SharedWriter(shared.clone()),
+            &[make_video_track()],
+            None,
+            0.0,
+            &[],
+        )
+        .unwrap();
         // One progressive leader picture, then three interlaced → majority
         // interlaced (2:1 the other way would stay progressive on a tie).
         muxer
-            .write_frame_at(0, 0, true, &[0x01, 0x02, 0x03], None, None, None, Some(true))
+            .write_frame_at(
+                0,
+                0,
+                true,
+                &[0x01, 0x02, 0x03],
+                None,
+                None,
+                None,
+                Some(true),
+            )
             .unwrap();
         for (i, pts) in [40_000_000i64, 80_000_000, 120_000_000].iter().enumerate() {
             muxer

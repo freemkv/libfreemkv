@@ -394,7 +394,10 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             let stream = image_input(
                 reader,
                 opts,
-                move || crate::dirimage::DirImage::open(&probe_path).map_err(|e| -> io::Error { e.into() }),
+                move || {
+                    crate::dirimage::DirImage::open(&probe_path)
+                        .map_err(|e| -> io::Error { e.into() })
+                },
                 true,
             )?;
             Ok(Box::new(stream))

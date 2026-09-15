@@ -1746,7 +1746,11 @@ mod tests {
         pgc[0xA4 + 3] = 0x22; // Cb
         let title = parse_pgc(&pgc, 0, 1).unwrap();
         let pal = title.palette.expect("non-empty palette");
-        assert_eq!(pal[0], [0x00, 0x40, 0x11, 0x22], "stored as [pad, Y, Cr, Cb]");
+        assert_eq!(
+            pal[0],
+            [0x00, 0x40, 0x11, 0x22],
+            "stored as [pad, Y, Cr, Cb]"
+        );
         // The consumer interprets index 2 as Cr and index 3 as Cb (see
         // dvdsub::ycbcr_to_rgb). Cross-check the same entry both ways.
         let rgb = crate::mux::codec::dvdsub::ycbcr_to_rgb(&pal[0]);

@@ -219,7 +219,10 @@ fn an_in_range_gap_reads_zeros_but_a_past_capacity_read_errors() {
     let mut buf = [0xAAu8; SECTOR];
     let n = img.read_sectors(200, 1, &mut buf, false).unwrap();
     assert_eq!(n, SECTOR);
-    assert!(buf.iter().all(|&b| b == 0), "an in-range gap reads as zeros");
+    assert!(
+        buf.iter().all(|&b| b == 0),
+        "an in-range gap reads as zeros"
+    );
 
     // A read that BEGINS past the image's capacity is refused, not zero-filled.
     let mut buf = [0xAAu8; SECTOR * 2];
@@ -232,7 +235,11 @@ fn an_in_range_gap_reads_zeros_but_a_past_capacity_read_errors() {
     // zero-padded — the mux's final batch and the FS scan both rely on that.
     let mut buf = vec![0xAAu8; SECTOR * 4];
     let n = img.read_sectors(cap - 1, 4, &mut buf, false).unwrap();
-    assert_eq!(n, SECTOR * 4, "an in-range start may overshoot and zero-pad");
+    assert_eq!(
+        n,
+        SECTOR * 4,
+        "an in-range start may overshoot and zero-pad"
+    );
 }
 
 /// Two runs over the same unchanged folder must produce the same image, byte

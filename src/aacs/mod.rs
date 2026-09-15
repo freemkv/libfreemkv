@@ -209,10 +209,9 @@ mod tests {
             "the primary DiscRead must propagate once the DUPLICATE is absent, got {err:?}"
         );
 
-        let all_absent = super::read_first(&candidates, |p| {
-            Err(Error::UdfNotFound { path: p.into() })
-        })
-        .unwrap_err();
+        let all_absent =
+            super::read_first(&candidates, |p| Err(Error::UdfNotFound { path: p.into() }))
+                .unwrap_err();
         assert!(
             matches!(all_absent, Error::AacsNoKeys),
             "an entirely absent candidate set yields AacsNoKeys, got {all_absent:?}"

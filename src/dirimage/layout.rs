@@ -730,7 +730,10 @@ mod tests {
         // Old formula: one File Entry per node only.
         let file_entry_only = dir_count as u64 + file_count as u64;
         let fid_sectors = dir_bytes(&root.dirs, &root.files).div_ceil(SECTOR) as u64;
-        assert!(fid_sectors > 1, "300 files must fill more than one FID sector");
+        assert!(
+            fid_sectors > 1,
+            "300 files must fill more than one FID sector"
+        );
         // 2 (FSD + Terminating Descriptor) + File Entries + FID-list sectors.
         assert_eq!(
             metadata_block_count(&root),
