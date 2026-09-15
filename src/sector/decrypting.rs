@@ -103,6 +103,25 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     key_map: Option<Arc<crate::decrypt::AacsKeyMap>>,
 }
 
+/// Does the sector span `[lba, lba+count)` intersect any encrypted-content range?
+/// `None` content (the mux reads title extents only) means "always content" so the
+/// AACS unit-alignment gate stays enforced. When a content map IS set (whole-disc
+/// readers), a span touching NO content range is clear filesystem/nav and must be
+/// exempt from the alignment gate — it will pass through undecrypted.
+fn span_touches_content(content: Option<&[(u32, u32)]>, lba: u32, count: u16) -> bool {
+    match content {
+        None => true,
+        Some(ranges) => {
+            let end = lba as u64 + count as u64;
+            ranges.iter().any(|&(start, cnt)| {
+                let rs = start as u64;
+                let re = rs + cnt as u64;
+                (lba as u64) < re && rs < end
+            })
+        }
+    }
+}
+
 impl<S: SectorSource> DecryptingSectorSource<S> {
     /// Wrap `inner` with the given keys. For an AACS source, install a key map
     /// via [`with_key_map`](Self::with_key_map) before reading — AACS decrypts
@@ -217,10 +236,20 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         recovery: bool,
         fua: bool,
     ) -> Result<usize> {
+        // Content-extent map (whole-disc readers): units outside the encrypted
+        // extents are clear filesystem / nav and pass through untouched. Cheap Arc
+        // bump; frees the &self borrow so we can decrypt against `&mut buf`.
+        let content = self.content_ranges.clone();
+        let content_ref = content.as_deref();
+
         // Defense-in-depth: AACS units are 3-sector aligned; misalignment would
         // silently mis-decrypt, so reject loud (DecryptFailed) before reading.
-        // Gated relative to `unit_base` (per-extent), not raw `lba % 3`.
+        // Gated relative to `unit_base` (per-extent), not raw `lba % 3`. Only
+        // enforced when the span actually TOUCHES encrypted content — a clear
+        // UDF/nav read outside every content range is pass-through, so a
+        // non-aligned filesystem LBA must not fail the whole-disc reader.
         if matches!(self.keys, DecryptKeys::Aacs { .. })
+            && span_touches_content(content_ref, lba, count)
             && !crate::aacs::content::is_unit_aligned(lba, self.unit_base)
         {
             return Err(crate::error::Error::DecryptFailed);
@@ -232,16 +261,21 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         // Proactive map path (storm-free mux): keys were resolved per unit up
         // front, so decrypt with the mapped key and trust it, no per-unit
         // `is_clean` check. A resolver gap fails loud; bad TS passes through.
+        // Units outside the content extents (when set) pass through untouched.
         if let Some(map) = self.key_map.clone() {
-            crate::decrypt::decrypt_sectors_mapped(&mut buf[..n], &self.keys, lba, &map)?;
+            crate::decrypt::decrypt_sectors_mapped_in_content(
+                &mut buf[..n],
+                &self.keys,
+                lba,
+                &map,
+                content_ref,
+            )?;
             return Ok(n);
         }
 
         // Decrypt `buf` in place (None / CSS / AACS); with a content map, units
         // outside the encrypted extents pass through untouched. A can't-decrypt
         // fails loud; broken-TS output is the muxer's concern, not a read failure.
-        let content = self.content_ranges.clone(); // cheap Arc bump; frees the &self borrow
-        let content_ref = content.as_deref();
 
         // No map installed: CSS self-descramble / clear pass-through. A can't-
         // decrypt (misalignment, or mapless AACS reaching here — a bug) fails
@@ -772,5 +806,65 @@ mod tests {
             .read_sectors(0, 3, &mut buf, false)
             .expect_err("AACS decorator with no key map must fail loud");
         assert_eq!(err.code(), crate::error::Error::DecryptFailed.code());
+    }
+
+    // `with_content_ranges` contract: an encrypted unit whose LBA is OUTSIDE the
+    // disc's content extents passes through untouched (never decrypted). Before the
+    // fix the mapped path ignored the content map, so this unit was decrypted.
+    #[test]
+    fn content_ranges_pass_through_units_outside_encrypted_extents() {
+        let key = [0x5Au8; 16];
+        let unit = encrypt_aacs_unit(&key);
+        let ciphertext = unit.clone();
+        let src = FixedUnit { unit };
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
+            0,
+            u32::MAX,
+            0,
+        )]));
+        // Content covers a DIFFERENT extent (LBA 300..303); LBA 0 is outside it.
+        let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(300u32, 3u32)].into_boxed_slice());
+        let mut dec = DecryptingSectorSource::new(src, keys)
+            .with_key_map(map)
+            .with_content_ranges(ranges);
+        let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+        let n = dec.read_sectors(0, 3, &mut buf, false).unwrap();
+        assert_eq!(n, crate::aacs::content::ALIGNED_UNIT_LEN);
+        assert_eq!(
+            buf, ciphertext,
+            "a unit outside the content extents must pass through untouched"
+        );
+    }
+
+    // With content ranges set, a NON-aligned read that touches no content extent is
+    // clear filesystem — it must NOT trip the AACS unit-alignment gate (which would
+    // otherwise fail loud for any AACS read at a misaligned LBA).
+    #[test]
+    fn content_ranges_exempt_out_of_content_read_from_alignment_gate() {
+        let src = PatternedSource { capacity: 16 };
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0u8; 16])],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(300, 303, 0)]));
+        let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(300u32, 3u32)].into_boxed_slice());
+        let mut dec = DecryptingSectorSource::new(src, keys)
+            .with_key_map(map)
+            .with_content_ranges(ranges);
+        let mut buf = vec![0u8; 2048];
+        // LBA 1 is misaligned AND outside content → passes through, no DecryptFailed.
+        let n = dec
+            .read_sectors(1, 1, &mut buf, false)
+            .expect("a misaligned clear read outside content must not be gated");
+        assert_eq!(n, 2048);
+        let mut expected = vec![0u8; 2048];
+        PatternedSource::fill(1, 1, &mut expected);
+        assert_eq!(buf, expected, "clear out-of-content bytes pass through");
     }
 }
