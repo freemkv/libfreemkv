@@ -2814,6 +2814,31 @@ mod command_tests {
         assert_eq!(c[4], 0x00, "PREVENT bit clear (unlocked)");
     }
 
+    // SET CD SPEED and PREVENT/ALLOW MEDIUM REMOVAL are best-effort tray/speed
+    // control: a drive that REJECTS them must be warned about, never fail the
+    // rip. Each returns () on a transport error and still issues its CDB.
+    #[test]
+    fn set_speed_and_tray_control_swallow_a_drive_rejection() {
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Scsi(0x02, None));
+        // None of these may panic or propagate the ScsiError.
+        d.set_speed(0x1234);
+        assert_eq!(
+            cdb.lock().unwrap()[0],
+            crate::scsi::SCSI_SET_CD_SPEED,
+            "SET CD SPEED still issued despite the rejection"
+        );
+        d.lock_tray();
+        assert_eq!(cdb.lock().unwrap()[0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
+        assert_eq!(cdb.lock().unwrap()[4], 0x01, "PREVENT bit still set");
+        d.unlock_tray();
+        assert_eq!(cdb.lock().unwrap()[0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
+        assert_eq!(cdb.lock().unwrap()[4], 0x00, "ALLOW bit still clear");
+    }
+
     #[test]
     fn eject_unlocks_then_sends_start_stop_with_loej() {
         let RecordingHarness {
