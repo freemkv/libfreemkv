@@ -1125,73 +1125,150 @@ fn read_directory(
         }
         (icb[ad_off..ad_off + l_ad].to_vec(), l_ad as u32)
     } else {
-        // Out-of-line: read the FIRST allocation descriptor. short_ad/long_ad both
-        // start with 4-byte length + 4-byte LBA; extended_ad's lb_num is at offset
-        // 12. Other flag values fall back to short_ad, matching `read_icb_extents`.
-        let lba_at = if ad_type == 2 {
-            ad_off + 12
-        } else {
-            ad_off + 4
+        // Out-of-line: the FID list may span MULTIPLE allocation descriptors,
+        // and only extent_type 0 is recorded on-disc. Reading just the first AD
+        // (and trusting it recorded) truncated a directory whose FIDs cross an
+        // extent boundary, and could read a sparse/continuation descriptor's
+        // (length, LBA) as if it were FID data. Walk the descriptor list —
+        // following a type-3 continuation block just like `read_icb_extents` —
+        // gathering every recorded extent's sectors into one buffer.
+        let ad_size: usize = match ad_type {
+            0 => 8,  // short_ad
+            1 => 16, // long_ad
+            2 => 20, // extended_ad
+            // Reserved (4/14.6.8); fall back to the short_ad stride rather than
+            // fail the whole title, matching `read_icb_extents`.
+            _ => 8,
         };
-        if lba_at + 4 > icb.len() {
+        // The ICB's own allocation-descriptor field must fit inside its 2048-byte
+        // sector: a disc-controlled L_EA large enough to push the first
+        // descriptor past the sector end is corruption, not an out-of-bounds read.
+        if l_ad > 0 && ad_off.saturating_add(ad_size) > icb.len() {
             return Err(Error::DiscRead {
                 sector: icb_abs as u64,
                 status: None,
                 sense: None,
             });
         }
-        let ad_len = u32::from_le_bytes([
-            icb[ad_off],
-            icb[ad_off + 1],
-            icb[ad_off + 2],
-            icb[ad_off + 3],
-        ]) & 0x3FFF_FFFF;
-        let ad_pos = u32::from_le_bytes([
-            icb[lba_at],
-            icb[lba_at + 1],
-            icb[lba_at + 2],
-            icb[lba_at + 3],
-        ]);
+        let mut dir_data: Vec<u8> = Vec::new();
+        // Declared FID-list byte length (sum of the recorded extents' lengths),
+        // kept apart from the sector-rounded buffer so `size` and the FID-loop
+        // bound stay the honest declared length, never the padded buffer.
+        let mut total_len: u32 = 0;
+        let mut block = icb;
+        let mut ad_start = ad_off;
+        let mut ad_bytes = l_ad;
+        const MAX_AD_BLOCKS: usize = 256;
+        'chain: for _ in 0..MAX_AD_BLOCKS {
+            let avail = block.len().saturating_sub(ad_start);
+            let num = ad_bytes.min(avail) / ad_size;
+            let mut next_block: Option<u32> = None;
 
-        // Reject oversized dirs before allocating: ad_len is a disc-controlled
-        // 30-bit length, so corruption could force a ~1 GiB alloc (amplified by
-        // recursion). 1 MiB cap still covers a large STREAM/ dir's .m2ts FIDs.
-        if ad_len > MAX_DIR_BYTES {
-            return Err(Error::DiscRead {
-                sector: meta_start as u64,
-                status: None,
-                sense: None,
-            });
-        }
+            for i in 0..num {
+                let off = ad_start + i * ad_size;
+                if off + ad_size > block.len() {
+                    break;
+                }
+                let raw_len = u32::from_le_bytes([
+                    block[off],
+                    block[off + 1],
+                    block[off + 2],
+                    block[off + 3],
+                ]);
+                let extent_type = raw_len >> 30;
+                let data_len = raw_len & 0x3FFF_FFFF;
+                // Extended ADs place the extent LBA after three length fields.
+                let lba_off = if ad_size == 20 { off + 12 } else { off + 4 };
+                let data_lba = u32::from_le_bytes([
+                    block[lba_off],
+                    block[lba_off + 1],
+                    block[lba_off + 2],
+                    block[lba_off + 3],
+                ]);
 
-        // Read directory data
-        let dir_abs = meta_start.checked_add(ad_pos).ok_or(Error::DiscRead {
-            sector: meta_start as u64,
-            status: None,
-            sense: None,
-        })?;
-        let sector_count = ad_len.div_ceil(2048);
-        let mut dir_data = vec![0u8; sector_count as usize * 2048];
-        for i in 0..sector_count {
-            let abs = dir_abs.checked_add(i).ok_or(Error::DiscRead {
-                sector: dir_abs as u64,
-                status: None,
-                sense: None,
-            })?;
-            read_sector(
-                reader,
-                abs,
-                &mut dir_data[(i as usize) * 2048..(i as usize + 1) * 2048],
-            )?;
+                if extent_type == 3 {
+                    // Continuation (ECMA-167 4/14.14.1.1 type 3): the REST of the
+                    // ADs live in the block at data_lba, NOT FID data — reading
+                    // its (length, LBA) as an extent, as the old first-AD-only
+                    // path did, enumerates an unrelated sector. Follow the
+                    // pointer instead (bounded by MAX_AD_BLOCKS).
+                    if data_len > 0 {
+                        next_block = Some(data_lba);
+                    }
+                    break;
+                }
+                // Types 0/1/2 are allocated extents whose sectors hold FID data
+                // (the 2-bit extent type is masked out of `data_len` above). A
+                // zero-length descriptor terminates the AD list.
+                if data_len == 0 {
+                    break 'chain;
+                }
+                // Bound the cumulative allocation before growing: `data_len` is a
+                // disc-controlled 30-bit value, and multiple extents could
+                // otherwise sum to a huge buffer.
+                let sector_count = data_len.div_ceil(2048);
+                let add = sector_count as usize * 2048;
+                if dir_data.len().saturating_add(add) > MAX_DIR_BYTES as usize {
+                    return Err(Error::DiscRead {
+                        sector: meta_start as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                let dir_abs = meta_start.checked_add(data_lba).ok_or(Error::DiscRead {
+                    sector: meta_start as u64,
+                    status: None,
+                    sense: None,
+                })?;
+                let base = dir_data.len();
+                dir_data.resize(base + add, 0);
+                for s in 0..sector_count {
+                    let abs = dir_abs.checked_add(s).ok_or(Error::DiscRead {
+                        sector: dir_abs as u64,
+                        status: None,
+                        sense: None,
+                    })?;
+                    let o = base + s as usize * 2048;
+                    read_sector(reader, abs, &mut dir_data[o..o + 2048])?;
+                }
+                total_len = total_len.saturating_add(data_len);
+            }
+
+            match next_block {
+                Some(cont_lba) => {
+                    let abs = meta_start.checked_add(cont_lba).ok_or(Error::DiscRead {
+                        sector: meta_start as u64,
+                        status: None,
+                        sense: None,
+                    })?;
+                    read_sector(reader, abs, &mut block)?;
+                    // A continuation block leads with a 24-byte Allocation Extent
+                    // Descriptor (tag 258); its L_AD is at offset 20 and real ADs
+                    // start at offset 24.
+                    let aed_l_ad =
+                        u32::from_le_bytes([block[20], block[21], block[22], block[23]]) as usize;
+                    ad_start = 24;
+                    ad_bytes = aed_l_ad.min(block.len().saturating_sub(24));
+                }
+                None => break,
+            }
         }
-        (dir_data, ad_len)
+        (dir_data, total_len)
     };
 
-    // Parse File Identifier Descriptors
+    // Parse File Identifier Descriptors. The declared FID-list length — never
+    // the sector-rounded buffer — bounds the walk: trailing padding past it is
+    // not directory content and must not be read as FIDs.
+    let dir_end = dir_data.len().min(ad_len as usize);
     let mut entries = Vec::new();
     let mut pos = 0;
 
-    while pos + 38 < dir_data.len().min(ad_len as usize) {
+    // `<=`, not `<`: a FID's fixed 38-byte header that ends exactly at the
+    // declared boundary (pos + 38 == dir_end) is fully present and must be
+    // read; the strict `<` dropped it. The name, which may run past the header,
+    // is bounded against `dir_end` below so a FID whose header fits but whose
+    // NAME spills past the declared length is still rejected.
+    while pos + 38 <= dir_end {
         let fid_tag = u16::from_le_bytes([dir_data[pos], dir_data[pos + 1]]);
         if fid_tag != 257 {
             break;
@@ -1220,7 +1297,7 @@ fn read_directory(
         if !is_parent && !is_deleted && l_fi > 0 {
             let name_start = pos + 38 + l_iu;
             let name_end = name_start + l_fi;
-            if name_end > dir_data.len() {
+            if name_end > dir_end {
                 break;
             }
             let entry_name = parse_udf_name(&dir_data[name_start..name_end]);
@@ -4353,6 +4430,54 @@ mod tests {
             .expect("an embedded (AD type 3) directory is valid and must be readable");
         assert_eq!(child_names(&parsed), vec!["INDEX.BDMV".to_string()]);
         assert_eq!(parsed.entries[0].size, 1024);
+    }
+
+    #[test]
+    fn read_directory_reads_fids_spanning_multiple_allocation_descriptors() {
+        // A directory's FID list can span MORE than one allocation descriptor
+        // (ECMA-167 4/14.14.1). Reading only the first AD truncated the list at
+        // the extent boundary; every recorded extent must be gathered and walked.
+        // Extent 0 (sector 60) is packed to exactly 2048 bytes so the walk flows
+        // straight into extent 1 (sector 61) where the second file's FID lives.
+        let mut e0 = Vec::new();
+        push_fid_iu(&mut e0, "", 5, true, true, 0); // parent (..), 40 bytes
+        // Pad FIRST.CLPI's implementation-use area so e0 ends exactly at 2048.
+        push_fid_iu(&mut e0, "FIRST.CLPI", 7, false, false, 1959);
+        assert_eq!(e0.len(), 2048, "extent 0 must fill its sector exactly");
+        let mut sec0 = [0u8; 2048];
+        sec0.copy_from_slice(&e0);
+
+        let mut e1 = Vec::new();
+        push_fid_iu(&mut e1, "SECOND.CLPI", 8, false, false, 0);
+        let mut sec1 = [0u8; 2048];
+        sec1[..e1.len()].copy_from_slice(&e1);
+
+        // Two short_ads: (recorded, len=2048, lba=60) then (recorded, len, lba=61).
+        let mut body = Vec::new();
+        body.extend_from_slice(&2048u32.to_le_bytes());
+        body.extend_from_slice(&60u32.to_le_bytes());
+        body.extend_from_slice(&(e1.len() as u32).to_le_bytes());
+        body.extend_from_slice(&61u32.to_le_bytes());
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_flagged(0, &body));
+        reader.put(60, sec0);
+        reader.put(61, sec1);
+        reader.put(7, build_efe_icb(11, 2048, 0));
+        reader.put(8, build_efe_icb(22, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("a multi-extent directory must be readable");
+        assert_eq!(
+            child_names(&parsed),
+            vec!["FIRST.CLPI".to_string(), "SECOND.CLPI".to_string()],
+            "the FID in the SECOND allocation extent must be read, not truncated away"
+        );
+        assert_eq!(
+            parsed.size,
+            2048 + e1.len() as u64,
+            "the reported size is the sum of both recorded extents' declared lengths"
+        );
     }
 
     #[test]
