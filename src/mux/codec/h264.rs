@@ -289,11 +289,13 @@ impl CodecParser for H264Parser {
         }
 
         // Open-GOP resync anchor: BD titles use open GOPs whose random-access
-        // point is a non-IDR I-frame, not always SEI-tagged. Without treating it
-        // as a keyframe, the resync gate (`mux/resync.rs`) can miss it and drop
-        // frames to EOF. Promote only when EVERY VCL slice is intra (a picture
-        // with a P/B slice is not a random-access point) and only on the base
-        // view (`!mvc`): a dependent MVC view is never an independent anchor.
+        // point is a non-IDR I-frame. H.264 signals such a recovery point with a
+        // recovery_point SEI, which this parser does NOT read; instead it infers
+        // the anchor from the slices themselves. Without treating it as a
+        // keyframe, the resync gate (`mux/resync.rs`) can miss it and drop frames
+        // to EOF. Promote only when EVERY VCL slice is intra (a picture with a
+        // P/B slice is not a random-access point) and only on the base view
+        // (`!mvc`): a dependent MVC view is never an independent anchor.
         if saw_vcl && all_vcl_intra && !mvc {
             keyframe = true;
         }

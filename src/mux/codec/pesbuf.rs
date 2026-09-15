@@ -71,6 +71,16 @@ pub(crate) fn facts_for(marks: &[(usize, PesFacts)], off: usize) -> PesFacts {
     found
 }
 
+/// Internal hard cap on buffered bytes — defense-in-depth, mirroring
+/// reorder.rs's `MAX_GOP_BYTES`/`MAX_GOP_FRAMES`. Even a caller that never
+/// drains (a misbehaving or crafted-input codec) cannot grow this buffer
+/// without bound: a push past the cap drops the OLDEST bytes to make room,
+/// rebasing marks through `drain` so attribution of the surviving bytes stays
+/// correct. Real callers cap their own access units far below this (DTS at 64
+/// KiB), so this only ever fires on pathological input. Bounding the bytes also
+/// bounds the mark count, since every mark is anchored to at least one byte.
+const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
+
 /// Bytes accumulated across PES packets, each byte attributable to the packet
 /// that carried it.
 pub(crate) struct PesBuf {
@@ -97,6 +107,7 @@ impl PesBuf {
         }
         self.marks.push_back((self.buf.len(), PesFacts::of(pes)));
         self.buf.extend_from_slice(&pes.data);
+        self.enforce_cap();
     }
 
     /// Append a payload under facts the caller resolved — for a parser that
@@ -108,6 +119,17 @@ impl PesBuf {
         }
         self.marks.push_back((self.buf.len(), facts));
         self.buf.extend_from_slice(data);
+        self.enforce_cap();
+    }
+
+    /// Enforce [`MAX_BUFFERED_BYTES`] by dropping the oldest bytes when a push
+    /// overflows it. `drain` rebases the marks, so the surviving bytes keep
+    /// correct attribution and the mark count stays bounded with the bytes.
+    fn enforce_cap(&mut self) {
+        if self.buf.len() > MAX_BUFFERED_BYTES {
+            let overflow = self.buf.len() - MAX_BUFFERED_BYTES;
+            self.drain(overflow);
+        }
     }
 
     // The facts of the PES that carried the byte at `off`: the last mark at or
@@ -302,6 +324,31 @@ mod tests {
         let mut b = PesBuf::with_capacity(16);
         b.push(&p);
         assert_eq!(b.front(), PesFacts::of(&p));
+    }
+
+    /// Defense-in-depth: a caller that pushes without ever draining must not
+    /// grow the buffer — or its marks — without bound. Past MAX_BUFFERED_BYTES
+    /// the oldest bytes are dropped, and the mark count is bounded with them.
+    #[test]
+    fn a_caller_that_never_drains_cannot_grow_the_buffer_without_bound() {
+        let mut b = PesBuf::with_capacity(64);
+        let chunk = vec![0u8; 1024 * 1024]; // 1 MiB per push
+        // Push well past the 16 MiB cap (24 MiB total) without ever draining.
+        for i in 0..24u64 {
+            b.push(&pes(&chunk, Some(90_000 + i as i64), Some(i * 1000)));
+        }
+        assert!(
+            b.len() <= MAX_BUFFERED_BYTES,
+            "buffer stayed capped at {MAX_BUFFERED_BYTES}, got {}",
+            b.len()
+        );
+        // Marks are bounded with the bytes: at most one per surviving MiB (+1
+        // for the retained covering mark), never one per push.
+        assert!(
+            b.mark_count() <= MAX_BUFFERED_BYTES / (1024 * 1024) + 2,
+            "mark count stayed bounded, got {}",
+            b.mark_count()
+        );
     }
 
     /// Over-draining is clamped rather than panicking: a parser that

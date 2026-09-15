@@ -60,10 +60,24 @@ fn hevc_slice_coding_type(slice_type: u32) -> Option<CodingType> {
     }
 }
 
+// The `pps_pic_parameter_set_id` (first ue(v)) of a PPS NAL — the key under
+// which each PPS is stored so a slice's referenced PPS is resolved by its own
+// id. `None` if the PPS is too short. See docs/hevc.md.
+fn hevc_pps_id(pps_nal: &[u8]) -> Option<u32> {
+    BitReader::new(pps_nal.get(2..)?).read_ue()
+}
+
 // Measures the coding type from the FIRST coded slice of an access unit
 // (H.265 §7.3.6.1). `None` for a non-first slice or on truncation — never a
-// guess. See docs/hevc.md — hevc_first_slice_coding_type.
-fn hevc_first_slice_coding_type(nal: &[u8], nal_type: u8, num_extra: u32) -> Option<CodingType> {
+// guess. `resolve_num_extra` maps the slice's OWN `slice_pic_parameter_set_id`
+// to that PPS's `num_extra_slice_header_bits`, so the `slice_type` bit offset is
+// taken from the PPS the slice references — not merely the last-active one. See
+// docs/hevc.md — hevc_first_slice_coding_type.
+fn hevc_first_slice_coding_type(
+    nal: &[u8],
+    nal_type: u8,
+    resolve_num_extra: impl Fn(u32) -> Option<u32>,
+) -> Option<CodingType> {
     let mut br = BitReader::new(nal.get(2..)?); // RBSP after the 2-byte NAL header
     if br.read_bit()? != 1 {
         return None; // not the first slice segment of the picture
@@ -71,7 +85,11 @@ fn hevc_first_slice_coding_type(nal: &[u8], nal_type: u8, num_extra: u32) -> Opt
     if (NAL_BLA_W_LP..=NAL_RSV_IRAP_VCL23).contains(&nal_type) {
         br.skip_bits(1)?; // no_output_of_prior_pics_flag (IRAP only)
     }
-    br.read_ue()?; // slice_pic_parameter_set_id
+    let pps_id = br.read_ue()?; // slice_pic_parameter_set_id
+    // Resolve num_extra from the PPS this slice REFERENCES; a stream with
+    // multiple PPS can point a slice at one whose num_extra differs, which would
+    // shift the slice_type offset if the last-active PPS were assumed instead.
+    let num_extra = resolve_num_extra(pps_id)?;
     // First slice → no slice_segment_address and dependent_slice_segment_flag is
     // 0, so slice_type follows the reserved bits directly.
     br.skip_bits(num_extra)?; // slice_reserved_flag[i]
@@ -94,6 +112,11 @@ pub struct HevcParser {
     cur_vps: Option<Vec<u8>>,
     cur_sps: Option<Vec<u8>>,
     cur_pps: Option<Vec<u8>>,
+    // Every PPS seen, keyed by its `pps_pic_parameter_set_id`, so a slice's
+    // coding type is measured with the `num_extra_slice_header_bits` of the PPS
+    // it REFERENCES rather than the last-active one (multiple PPS with differing
+    // values would otherwise shift the slice_type bit offset).
+    pps_by_id: std::collections::HashMap<u32, Vec<u8>>,
     // Splice-aware CRA→BLA rewrite for a non-seamless BD clip boundary (first
     // CRA_NUT -> BLA_W_LP so NoRaslOutput discards dangling RASL). Armed by
     // `mark_clip_boundary` AND PTS-backstep auto-detect in `parse` — not dead code.
@@ -184,6 +207,7 @@ impl HevcParser {
             cur_vps: None,
             cur_sps: None,
             cur_pps: None,
+            pps_by_id: std::collections::HashMap::new(),
             pending_clip_boundary: false,
             high_pts: None,
             pts_wrap_offset: 0,
@@ -422,17 +446,19 @@ impl CodecParser for HevcParser {
                     // Measure coding type from the first coded slice (VCL NAL
                     // 0..=31), only once the active PPS is known so the bit
                     // offset to `slice_type` is exact; else decline (`None`), never guess.
-                    if coding_type.is_none()
-                        && nal_type <= NAL_VCL_MAX
-                        && let Some(num_extra) = self
-                            .cur_pps
-                            .as_deref()
-                            .and_then(hevc_num_extra_slice_header_bits)
-                    {
+                    if coding_type.is_none() && nal_type <= NAL_VCL_MAX {
+                        // Resolve num_extra from the PPS the slice REFERENCES (by
+                        // its slice_pic_parameter_set_id), not the last-active PPS.
+                        let pps_by_id = &self.pps_by_id;
                         coding_type = hevc_first_slice_coding_type(
                             &data[nal_start..end],
                             nal_type,
-                            num_extra,
+                            |pps_id| {
+                                pps_by_id
+                                    .get(&pps_id)
+                                    .map(Vec::as_slice)
+                                    .and_then(hevc_num_extra_slice_header_bits)
+                            },
                         );
                     }
 
@@ -454,6 +480,12 @@ impl CodecParser for HevcParser {
                             )
                         }
                         NAL_PPS => {
+                            // Store the PPS under its own id so a later slice's
+                            // coding type resolves num_extra from the PPS it
+                            // references, not merely the last-active one.
+                            if let Some(id) = hevc_pps_id(&data[nal_start..end]) {
+                                self.pps_by_id.insert(id, data[nal_start..end].to_vec());
+                            }
                             emitted_pps |= handle_param_set(
                                 &mut self.pps,
                                 &mut self.cur_pps,
@@ -1316,6 +1348,60 @@ mod tests {
             CodingType::B,
             "num_extra=0 reads slice_type from bit 2 instead → 0 (B)"
         );
+    }
+
+    // A slice must be measured with the num_extra_slice_header_bits of the PPS
+    // it REFERENCES (slice_pic_parameter_set_id), not the last-active PPS. Two
+    // PPS with different num_extra: the slice points at the FIRST while the
+    // second is active. Assuming the active PPS reads slice_type at the wrong
+    // offset (None here); resolving by the slice's own pps id reads it right.
+    #[test]
+    #[allow(clippy::unusual_byte_groupings)]
+    fn slice_coding_type_uses_the_pps_the_slice_references_not_the_active_one() {
+        use super::super::coding::CodingType;
+
+        // PPS id=0, num_extra=0 → RBSP byte 0xC0 (pps_id '1', sps_id '1', 00, 000).
+        let pps0 = 0xC0u8;
+        // PPS id=1, num_extra=3 → RBSP 0101_0001 1000_0000: pps_id ue '010'=1,
+        // sps_id '1'=0, 00, num_extra '011'=3.
+        let pps1 = [0x51u8, 0x80];
+        // Raw NAL (header + body, NO start code) for the direct-parse helpers.
+        let raw_pps = |body: &[u8]| {
+            let mut v = hevc_nal_header(NAL_PPS).to_vec();
+            v.extend_from_slice(body);
+            v
+        };
+        assert_eq!(hevc_num_extra_slice_header_bits(&raw_pps(&[pps0])), Some(0));
+        assert_eq!(hevc_num_extra_slice_header_bits(&raw_pps(&pps1)), Some(3));
+        assert_eq!(hevc_pps_id(&raw_pps(&[pps0])), Some(0));
+        assert_eq!(hevc_pps_id(&raw_pps(&pps1)), Some(1));
+
+        // TRAIL_R slice referencing pps_id=0: first_slice=1, pps_id '1'=0,
+        // slice_type ue '011'=2 (I) directly (num_extra of PPS 0 is 0). 0xD8.
+        let slice = 0xD8u8;
+
+        // AU order: PPS0, PPS1 (so cur_pps = PPS1, num_extra=3), then the slice
+        // that references PPS0 (num_extra=0).
+        let mut data = nal_bytes(NAL_PPS, &[pps0]);
+        data.extend_from_slice(&nal_bytes(NAL_PPS, &pps1));
+        data.extend_from_slice(&nal_bytes(1, &[slice]));
+
+        let frames = HevcParser::new().parse(&make_pes(data, Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].coding.expect("PictureInfo").coding_type(),
+            CodingType::I,
+            "resolved via the slice's own pps id (PPS0, num_extra=0) → slice_type 2 (I); \
+             assuming the active PPS1 (num_extra=3) would misread the offset"
+        );
+    }
+
+    /// Build an Annex-B NAL (start code + 2-byte header + body bytes).
+    fn nal_bytes(nal_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00, 0x01];
+        v.extend_from_slice(&hevc_nal_header(nal_type));
+        v.extend_from_slice(body);
+        v
     }
 
     #[test]
