@@ -532,6 +532,18 @@ where
                         // Bounded, file-backed probe; no live drive here.
                         None,
                     )
+                    // Non-fatal: a failed key-map resolution leaves the probe
+                    // without FMTS ranges, so TrueHD channel correction is
+                    // skipped (MPLS 7.1/Atmos stays understated as 5.1). Log the
+                    // actual error — same level/target as the sibling re-open
+                    // failure below — instead of swallowing it with a bare `.ok()`.
+                    .inspect_err(|e| {
+                        tracing::debug!(
+                            target: "mux",
+                            error = %e,
+                            "TrueHD channel-correction key-map resolution failed; skipping"
+                        );
+                    })
                     .ok()
                     .map(std::sync::Arc::new),
                     _ => None,

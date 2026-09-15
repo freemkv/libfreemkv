@@ -109,11 +109,23 @@ impl Stream for ChaptersSink {
 // See docs/meta-sink.md — title_json schema.
 pub(crate) fn title_json(title: &DiscTitle) -> serde_json::Value {
     use serde_json::json;
+    // `index`/`is_main` are disc-level facts (a title's position in the sorted
+    // title list, and whether it is the selected main feature). A `json://` sink
+    // is handed ONE `DiscTitle` with no view of the disc, so neither is knowable
+    // here: this document describes a single title in isolation. They are fixed
+    // at `0`/`false` deliberately — the authoritative, derived values live on the
+    // disc-level `DiscProfile::from_disc` path, not on this per-title export.
     let profile = TitleProfile::from_title(title, 0, false);
     // Serializing a plain-scalar struct is infallible; fall back to an empty
     // object rather than panic if that ever changes (the create() path then
     // surfaces the empty doc as a NoMetadata error).
     let mut doc = serde_json::to_value(&profile).unwrap_or_else(|_| json!({}));
+    // Restore the per-stream detail the normalized `TitleProfile` omits.
+    // `TitleProfile` is a deliberately flat VIEW with no field for pid, colour
+    // signalling, sample rate, raw purpose/qualifier, etc.; rather than widen
+    // that shared type, enrich this document straight from the source Title,
+    // walking each kind in the same order `from_title` split them.
+    enrich_streams(&mut doc, title);
     doc["format"] = json!(format!("{:?}", title.content_format));
     doc["playlist_id"] = json!(title.playlist_id);
     doc["clips"] = json!(
@@ -136,6 +148,79 @@ pub(crate) fn title_json(title: &DiscTitle) -> serde_json::Value {
             .collect::<Vec<_>>()
     );
     doc
+}
+
+/// Compact id for an audio stream's editorial purpose (no localized prose —
+/// the app maps it to display text). Mirrors the `Codec::id()` convention.
+fn purpose_id(p: crate::disc::LabelPurpose) -> &'static str {
+    use crate::disc::LabelPurpose::*;
+    match p {
+        Normal => "normal",
+        Commentary => "commentary",
+        Descriptive => "descriptive",
+        Score => "score",
+        Ime => "ime",
+    }
+}
+
+/// Merge the per-stream fields `TitleProfile` drops back into the `json://`
+/// document, straight from the source Title. Walks `title.streams` in declared
+/// order with a per-kind cursor so each raw stream lines up with the profile's
+/// `video`/`audio`/`subtitles` array element it produced.
+fn enrich_streams(doc: &mut serde_json::Value, title: &DiscTitle) {
+    use crate::disc::Stream;
+    use serde_json::json;
+    let (mut vi, mut ai, mut si) = (0usize, 0usize, 0usize);
+    for s in &title.streams {
+        match s {
+            Stream::Video(v) => {
+                let e = &mut doc["video"][vi];
+                e["pid"] = json!(v.pid);
+                e["color_space"] = json!(v.color_space.id());
+                e["display_aspect"] = match v.display_aspect {
+                    Some((n, d)) => json!([n, d]),
+                    None => json!(null),
+                };
+                e["measured_cicp"] = match v.measured_cicp {
+                    Some(c) => json!({
+                        "matrix": c.matrix,
+                        "transfer": c.transfer,
+                        "primaries": c.primaries,
+                        "range": c.range,
+                    }),
+                    None => json!(null),
+                };
+                match v.resolution.pixels() {
+                    Some((w, h)) => {
+                        e["width"] = json!(w);
+                        e["height"] = json!(h);
+                    }
+                    None => {
+                        e["width"] = json!(null);
+                        e["height"] = json!(null);
+                    }
+                }
+                e["interlaced"] = json!(v.resolution.is_interlaced());
+                e["mvc"] = json!(v.is_mvc_dependent());
+                vi += 1;
+            }
+            Stream::Audio(a) => {
+                let e = &mut doc["audio"][ai];
+                e["pid"] = json!(a.pid);
+                e["secondary"] = json!(a.secondary);
+                e["sample_rate"] = json!(a.sample_rate.to_string());
+                e["purpose"] = json!(purpose_id(a.purpose));
+                ai += 1;
+            }
+            Stream::Subtitle(sub) => {
+                let e = &mut doc["subtitles"][si];
+                e["pid"] = json!(sub.pid);
+                e["descriptive_service"] =
+                    json!(sub.qualifier == crate::disc::LabelQualifier::DescriptiveService);
+                si += 1;
+            }
+        }
+    }
 }
 
 /// `json://` sink: writes the title's structured metadata at construction; the
@@ -296,6 +381,83 @@ mod tests {
         assert_eq!(vid["frame_rate"], "23.976");
         assert_eq!(vid["hdr"], "hdr10");
         assert!(vid["default"].as_bool().unwrap());
+    }
+
+    /// The json:// document must carry the per-stream detail the normalized
+    /// `TitleProfile` drops: video pid/color_space/measured_cicp/aspect/w/h/
+    /// interlaced/mvc, audio pid/secondary/sample_rate/purpose, subtitle pid/
+    /// descriptive_service. Before the fix these were absent (profile had no such
+    /// fields), so each index read would be `Null` and every assertion below fail.
+    #[test]
+    fn json_restores_dropped_stream_fields_from_title() {
+        use crate::disc::{
+            AudioChannels, AudioStream, Codec, ColorSpace, DiscTitle, FrameRate, HdrFormat,
+            LabelPurpose, LabelQualifier, MeasuredCicp, Resolution, SampleRate,
+            Stream as DiscStream, SubtitleStream, VideoStream,
+        };
+        use serde_json::json;
+        let mut t = DiscTitle::empty();
+        t.streams = vec![
+            DiscStream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::Mpeg2,
+                resolution: Resolution::R576i, // interlaced, 720x576
+                frame_rate: FrameRate::F23_976,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt470bg,
+                display_aspect: Some((16, 9)),
+                secondary: false,
+                label: String::new(),
+                measured_cicp: Some(MeasuredCicp {
+                    matrix: 5,
+                    transfer: 6,
+                    primaries: 5,
+                    range: 1,
+                }),
+            }),
+            DiscStream::Audio(AudioStream {
+                pid: 0x1100,
+                codec: Codec::Ac3,
+                channels: AudioChannels::Stereo,
+                language: "eng".into(),
+                sample_rate: SampleRate::S48,
+                secondary: true,
+                purpose: LabelPurpose::Commentary,
+                label: String::new(),
+            }),
+            DiscStream::Subtitle(SubtitleStream {
+                pid: 0x1200,
+                codec: Codec::Pgs,
+                language: "eng".into(),
+                forced: false,
+                qualifier: LabelQualifier::DescriptiveService,
+                codec_data: None,
+            }),
+        ];
+        let v = title_json(&t);
+
+        let vid = &v["video"][0];
+        assert_eq!(vid["pid"], 0x1011);
+        assert_eq!(vid["color_space"], "bt470bg");
+        assert_eq!(vid["display_aspect"], json!([16, 9]));
+        assert_eq!(vid["measured_cicp"]["matrix"], 5);
+        assert_eq!(vid["measured_cicp"]["transfer"], 6);
+        assert_eq!(vid["measured_cicp"]["primaries"], 5);
+        assert_eq!(vid["measured_cicp"]["range"], 1);
+        assert_eq!(vid["width"], 720);
+        assert_eq!(vid["height"], 576);
+        assert_eq!(vid["interlaced"], true);
+        assert_eq!(vid["mvc"], false);
+
+        let a = &v["audio"][0];
+        assert_eq!(a["pid"], 0x1100);
+        assert_eq!(a["secondary"], true);
+        assert_eq!(a["sample_rate"], "48kHz");
+        assert_eq!(a["purpose"], "commentary");
+
+        let s = &v["subtitles"][0];
+        assert_eq!(s["pid"], 0x1200);
+        assert_eq!(s["descriptive_service"], true);
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {

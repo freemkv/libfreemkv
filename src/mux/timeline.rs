@@ -178,7 +178,6 @@ impl SeamPlan {
 
     /// How many frames this track has had dropped for falling outside every
     /// clip's marks.
-    #[cfg(test)]
     pub(crate) fn dropped_for(&self, track: usize) -> u64 {
         self.dropped.get(track).copied().unwrap_or(0)
     }
@@ -494,6 +493,21 @@ impl TimelineContinuity {
     // Zero without a seam plan. See docs/mux-timeline.md#timelinecontinuitydropped_total.
     pub(crate) fn dropped_total(&self) -> u64 {
         self.seams.as_ref().map_or(0, |p| p.dropped_total())
+    }
+
+    // Frames dropped for falling outside the playlist's clip marks, counted
+    // ONLY over `tracks` — the numerator/denominator alignment a filtered sink
+    // needs. A `demux://` variant that persists a subset of tracks (e.g.
+    // `audio://`) counts its written denominator over just those tracks, so the
+    // drop count it gates on must cover the SAME set: a video track dropped at a
+    // clip join during an `audio://` export is not evidence the audio files came
+    // up short. Zero without a seam plan.
+    pub(crate) fn dropped_for(&self, tracks: &[usize]) -> u64 {
+        self.seams.as_ref().map_or(0, |p| {
+            tracks
+                .iter()
+                .fold(0u64, |a, &t| a.saturating_add(p.dropped_for(t)))
+        })
     }
 
     // Map a raw PES PTS onto the output timeline, or `None` to drop the frame

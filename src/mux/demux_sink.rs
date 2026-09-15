@@ -645,14 +645,16 @@ pub struct DemuxSink {
     ref_first_pts_ns: Option<i64>,
     timeline: TimelineContinuity,
     finished: bool,
-    /// Frames the timeline PLACED (not necessarily persisted).
+    /// Frames actually PERSISTED to a track file — the drop gate's denominator.
     ///
-    /// A frame for a track this export filters out still flows through
-    /// `write()` and still counts here, so this is "the timeline placed
-    /// something" rather than "a file received bytes". That is the right
-    /// denominator for the drop gate below — it asks whether placement worked
-    /// at all — but it is deliberately NOT a per-track written count, so a
-    /// single lost track among many is not visible to it.
+    /// Counted in `write()` only inside the `Some(TrackOut)` arm, so a frame for
+    /// a track this export filters out (e.g. video during an `audio://` export)
+    /// flows through the timeline but does NOT count here. The gate in `finish()`
+    /// pairs this with `timeline.dropped_for(persisted_tracks)` so numerator and
+    /// denominator cover the SAME set of tracks: were it "frames the timeline
+    /// placed" instead, a filtered-out track's clip-join drops would be measured
+    /// against a written count that never included them, and a legitimate
+    /// filtered export could wrongly trip `SeamPlanDroppedMost`/`SinkWroteNothing`.
     frames_mapped: u64,
 }
 
@@ -893,7 +895,21 @@ impl Stream for DemuxSink {
         self.finished = true;
         // Same reporting as the MKV muxer's finish: an unexpected drop volume is
         // how a demux quietly comes up short, so surface it here too.
-        let seam_dropped = self.timeline.dropped_total();
+        //
+        // Count drops ONLY for tracks this export actually persists, matching the
+        // `frames_mapped` denominator (which counts persisted frames only). A
+        // filtered export (`audio://`/`sub://`, or a `--select` subset) drops the
+        // video track's clip-join tails through the timeline without writing a
+        // file for it; folding those into the numerator via `dropped_total()`
+        // wrongly tripped `SeamPlanDroppedMost`/`SinkWroteNothing` on an
+        // otherwise-complete rip.
+        let persisted_tracks: Vec<usize> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
+            .collect();
+        let seam_dropped = self.timeline.dropped_for(&persisted_tracks);
         // Frames arrived and all were dropped: previously finished cleanly as
         // zero-byte track files. Keyed on frames-offered so a legitimately empty
         // sink (chapters-only export, absent track class) still writes none.
@@ -1769,6 +1785,100 @@ mod tests {
             crate::error::error_code(&err),
             Some(crate::error::E_SEAM_PLAN_DROPPED_MOST),
             "more frames dropped than persisted must report SeamPlanDroppedMost"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A FILTERED export (`audio://`) must NOT trip the drop gates on drops that
+    // belong to a track it never persists. The video track is dropped hard at
+    // the clip join (2 frames, all outside the marks), while the persisted audio
+    // track loses nothing. `dropped_total()` would fold the video drops (2) into
+    // the numerator and, exceeding the persisted count (1), wrongly report
+    // SeamPlanDroppedMost; `dropped_for(persisted_tracks)` sees 0 and passes.
+    // See docs/demux-sink.md — a_filtered_export_ignores_drops_on_filtered_tracks.
+    #[test]
+    fn a_filtered_export_ignores_drops_on_non_persisted_tracks() {
+        let dir = tempdir();
+        let mut title = title_with(
+            vec![video_stream(Codec::H264), audio_stream(Codec::Ac3, "eng")],
+            vec![None, None],
+        );
+        title.clips = vec![
+            crate::disc::Clip {
+                feed_span: None,
+                clip_id: "00000".into(),
+                in_time: 100 * 45_000,
+                out_time: 200 * 45_000,
+                duration_secs: 100.0,
+                source_packets: 0,
+            },
+            crate::disc::Clip {
+                feed_span: None,
+                clip_id: "00001".into(),
+                in_time: 200 * 45_000,
+                out_time: 300 * 45_000,
+                duration_secs: 100.0,
+                source_packets: 0,
+            },
+        ];
+        // `audio://`: only the audio track is persisted; video is filtered out.
+        let opts = DemuxOptions {
+            base: "Filt".to_string(),
+            kind_filter: Some(TrackKind::Audio),
+            export_chapters: false,
+            ..Default::default()
+        };
+        let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
+        assert!(
+            sink.tracks[0].is_none() && sink.tracks[1].is_some(),
+            "audio:// must not persist the video track"
+        );
+
+        // Two VIDEO frames before the first IN mark: the plan drops both, but the
+        // video track has no file — these drops are not this export's shortfall.
+        for (i, pts) in [0i64, 1_000_000_000].iter().enumerate() {
+            let f = PesFrame {
+                coding: None,
+                source: None,
+                track: 0,
+                pts: *pts,
+                keyframe: true,
+                data: vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, i as u8],
+                duration_ns: None,
+            };
+            let _ = Stream::write(&mut sink, &f);
+        }
+        // One AUDIO frame inside the first clip (150 s): placed and persisted.
+        Stream::write(
+            &mut sink,
+            &PesFrame {
+                coding: None,
+                source: None,
+                track: 1,
+                pts: 150_000_000_000,
+                keyframe: true,
+                data: vec![0x0B, 0x77],
+                duration_ns: None,
+            },
+        )
+        .unwrap();
+
+        // Gate must PASS: the only drops were on the filtered-out video track.
+        Stream::finish(&mut sink)
+            .expect("a filtered export must not fail on drops it never persisted");
+        // And the audio file was actually written with its payload.
+        let wrote_audio = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.path().extension().map(|x| x == "ac3").unwrap_or(false)
+                    && std::fs::metadata(e.path())
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false)
+            });
+        assert!(
+            wrote_audio,
+            "the persisted audio track must have received bytes"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
