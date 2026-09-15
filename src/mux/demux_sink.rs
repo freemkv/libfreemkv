@@ -867,7 +867,6 @@ impl Stream for DemuxSink {
         ) else {
             return Ok(());
         };
-        self.frames_mapped = self.frames_mapped.saturating_add(1);
         if drives {
             // Delay reference: recorded here, not in the track's `TrackOut`, so
             // it survives the `audio://` / `sub://` kind filter dropping the
@@ -875,6 +874,12 @@ impl Stream for DemuxSink {
             self.ref_first_pts_ns.get_or_insert(pts);
         }
         if let Some(Some(t)) = self.tracks.get_mut(frame.track) {
+            // Count the denominator only for frames that are actually persisted.
+            // A kind-filtered frame (e.g. video during an `audio://` export)
+            // maps successfully but writes to no track file, so counting it
+            // here would mask a seam plan that dropped every *persisted* frame
+            // and let the sink ship zero-byte files at exit 0.
+            self.frames_mapped = self.frames_mapped.saturating_add(1);
             t.first_pts_ns.get_or_insert(pts);
             t.writer.write_frame(&mut t.w, frame, pts)?;
         }
@@ -1700,6 +1705,70 @@ mod tests {
             crate::error::error_code(&err),
             Some(crate::error::E_SINK_WROTE_NOTHING),
             "a fully-dropped demux export must report SinkWroteNothing, not success"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A demux export where the seam plan drops MORE frames than it persists
+    // must report SeamPlanDroppedMost — even though at least one frame did
+    // persist (frames_mapped > 0). The denominator counts persisted frames
+    // only, so a mostly-emptied export can no longer slip past as success.
+    // See docs/demux-sink.md — a_demux_export_the_seam_plan_mostly_emptied_fails.
+    #[test]
+    fn a_demux_export_the_seam_plan_mostly_emptied_fails() {
+        let dir = tempdir();
+        let mut title = title_with(vec![video_stream(Codec::H264)], vec![None]);
+        title.clips = vec![
+            crate::disc::Clip {
+                feed_span: None,
+                clip_id: "00000".into(),
+                in_time: 100 * 45_000,
+                out_time: 200 * 45_000,
+                duration_secs: 100.0,
+                source_packets: 0,
+            },
+            crate::disc::Clip {
+                feed_span: None,
+                clip_id: "00001".into(),
+                in_time: 200 * 45_000,
+                out_time: 300 * 45_000,
+                duration_secs: 100.0,
+                source_packets: 0,
+            },
+        ];
+        let mut sink = DemuxSink::create(&dir, &title, &DemuxOptions::default()).unwrap();
+
+        // Two frames before the first IN mark (dropped) …
+        for (i, pts) in [0i64, 1_000_000_000].iter().enumerate() {
+            let f = PesFrame {
+                coding: None,
+                source: None,
+                track: 0,
+                pts: *pts,
+                keyframe: true,
+                data: vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, i as u8],
+                duration_ns: None,
+            };
+            let _ = Stream::write(&mut sink, &f);
+        }
+        // … and one frame inside the first clip (150 s, in ns) that DOES persist,
+        // so frames_mapped > 0 while seam_dropped (2) still exceeds it (1).
+        let inside = PesFrame {
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 150_000_000_000,
+            keyframe: true,
+            data: vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x42],
+            duration_ns: None,
+        };
+        Stream::write(&mut sink, &inside).unwrap();
+
+        let err = Stream::finish(&mut sink).expect_err("a mostly-emptied export must fail");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_SEAM_PLAN_DROPPED_MOST),
+            "more frames dropped than persisted must report SeamPlanDroppedMost"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
