@@ -103,7 +103,7 @@ impl AacsCertUnlocker<'_> {
         // `session` across `scsi_mut()` + `&drive_id`, so clone the cheap identity.
         let drive_id = session.drive_id.clone();
         let fu_certs = crate::unlock_bridge::map_host_certs(&host_certs);
-        let (_, unlock_res) = crate::unlock_bridge::run_bus(
+        let (matched, unlock_res) = crate::unlock_bridge::run_bus(
             session.scsi_mut(),
             &drive_id,
             freemkv_unlock::DiscKind::Aacs,
@@ -127,10 +127,13 @@ impl AacsCertUnlocker<'_> {
             // AACS-specific "why the read_data_key read failed" diagnostic does
             // not cross the seam. The bus-key gate keys off presence, not cause.
             read_data_key_err: None,
-            // Cert route: bus encryption is removed via the read_data_key (AKE),
-            // NOT at the drive, so `drive_unlocked` is false — the gate credits
-            // this path through `read_data_key.is_some()` instead.
-            drive_unlocked: false,
+            // Derive from WHICH unlocker claimed the drive rather than hardcoding
+            // false: the disc-keyed cert route normally removes bus encryption via
+            // the read_data_key (AKE), so the gate credits it through
+            // `read_data_key.is_some()`. But if a firmware/drive unlocker in the
+            // dispatch set is what matched, the drive is already unlocked and the
+            // gate must credit that instead — the field now tracks reality.
+            drive_unlocked: crate::unlock_bridge::is_drive_unlocker(matched),
         })
     }
 }
