@@ -136,6 +136,23 @@ impl DtsParser {
         base
     }
 
+    /// Best "most recent known base" (ns) for a PES that carries no PTS. Never
+    /// resets the timeline to 0 while any prior base survives: prefer the
+    /// current AU's captured base, then the projected next-AU start, then the
+    /// last PES front. `pending_pts` going `PTS_UNSET` (e.g. after a forced
+    /// flush) used to fall straight to 0, jumping the timeline backwards.
+    fn continuation_base_ns(&self) -> i64 {
+        if self.pending_pts >= 0 {
+            self.pending_pts
+        } else if self.next_pts_ns != PTS_UNSET {
+            self.next_pts_ns
+        } else if self.last_front_pts != PTS_UNSET {
+            self.last_front_pts
+        } else {
+            0
+        }
+    }
+
     /// Drop `n` bytes from the front, rebasing attribution onto the new front.
     fn drain_front(&mut self, n: usize) {
         self.acc.drain(n);
@@ -197,11 +214,7 @@ impl CodecParser for DtsParser {
         // timeline to 0 — continue from the most recent known base.
         let pts_ns = super::pesbuf::PesFacts::of(pes)
             .presentation_ns()
-            .unwrap_or(if self.pending_pts >= 0 {
-                self.pending_pts
-            } else {
-                0
-            });
+            .unwrap_or_else(|| self.continuation_base_ns());
 
         // Blu-ray DTS-HD MA/HRA: core frame + extension substreams (lossless data)
         // arrive in SEPARATE, later PES packets, so assemble core-to-next-core
@@ -305,8 +318,15 @@ impl CodecParser for DtsParser {
             self.drain_front(au_end);
             // After draining, the marker covering the new front (if any) carries
             // the next AU's PTS; `pending_pts` is only the fallback when no
-            // marker survives. Track it so the fallback stays sensible.
-            self.pending_pts = self.front_pts();
+            // marker survives. Track it so the fallback stays sensible. A fully
+            // drained buffer has no live front, so the mark still "covering"
+            // offset 0 belongs to the AU just emitted — invalidate rather than
+            // keep that stale PTS as a fallback for a later PTS-less PES.
+            self.pending_pts = if self.acc.is_empty() {
+                PTS_UNSET
+            } else {
+                self.front_pts()
+            };
             if forced {
                 // Safety-valve flush: the next AU's real core PES hasn't arrived,
                 // so invalidate the PTS rather than inherit this non-core PES's.
@@ -690,6 +710,37 @@ mod tests {
             data,
             discontinuity: false,
         }
+    }
+
+    // A PTS-less PES must continue the timeline from the most recent known base,
+    // never snap it back to 0. `pending_pts` going PTS_UNSET (e.g. after a forced
+    // flush) previously fell straight to 0; the fallback must instead reach for
+    // the projected next-AU start, then the last PES front.
+    #[test]
+    fn continuation_base_prefers_a_known_projection_over_zero() {
+        let mut parser = DtsParser::new();
+        // Fresh current-AU base wins.
+        parser.pending_pts = 90_000;
+        parser.next_pts_ns = 200_000;
+        parser.last_front_pts = 100_000;
+        assert_eq!(parser.continuation_base_ns(), 90_000);
+
+        // pending_pts invalidated (post-forced-flush): fall to the projection,
+        // NOT to 0.
+        parser.pending_pts = PTS_UNSET;
+        assert_eq!(
+            parser.continuation_base_ns(),
+            200_000,
+            "an unset pending_pts must continue from the projected next-AU start"
+        );
+
+        // No projection either: the last PES front, still not 0.
+        parser.next_pts_ns = PTS_UNSET;
+        assert_eq!(parser.continuation_base_ns(), 100_000);
+
+        // Nothing known at all: only then is 0 the honest answer.
+        parser.last_front_pts = PTS_UNSET;
+        assert_eq!(parser.continuation_base_ns(), 0);
     }
 
     fn make_dts_core(size: usize) -> Vec<u8> {
