@@ -461,13 +461,19 @@ fn find_boxes_capped<'a>(payload: &'a [u8], want: &[u8; 4], cap: usize) -> Vec<&
             0 => (payload.len() - pos, 8usize),
             n => (n, 8usize),
         };
-        if box_size < header_len || pos + box_size > payload.len() {
-            break;
-        }
+        // checked_add: `box_size` is an attacker-controlled 64-bit largesize cast
+        // to usize, so a value near usize::MAX at a nonzero `pos` would wrap past
+        // the guard on a plain `pos + box_size` — producing a release panic on the
+        // slice or an infinite loop on the advance. Compute the end once and reuse
+        // it for the bounds check, the slice, and the advance.
+        let end = match pos.checked_add(box_size) {
+            Some(end) if box_size >= header_len && end <= payload.len() => end,
+            _ => break,
+        };
         if &bt == want {
-            out.push(&payload[pos + header_len..pos + box_size]);
+            out.push(&payload[pos + header_len..end]);
         }
-        pos += box_size;
+        pos = end;
     }
     out
 }
@@ -3051,6 +3057,30 @@ mod tests {
             "the matched payload slice's length must match the size field \
              decoded from its own four bytes"
         );
+    }
+
+    // A crafted 64-bit `largesize` near u64::MAX at a nonzero `pos` must not
+    // wrap `pos + box_size` past the length guard: the scan must reject it and
+    // return without a release panic (slice) or an infinite loop (advance).
+    // See docs/mp4-read.md — find_boxes_capped_rejects_a_hostile_largesize.
+    #[test]
+    fn find_boxes_capped_rejects_a_hostile_largesize_near_u64_max() {
+        let mut payload = Vec::new();
+        // A first, valid empty box so `pos` is nonzero when the hostile box is
+        // reached — that is what makes `pos + box_size` wrap rather than merely
+        // overshoot the length.
+        payload.extend_from_slice(&mp4_box(b"free", &[]));
+        // size32 == 1 selects the 16-byte largesize header; largesize = u64::MAX-3
+        // so `pos + box_size` overflows usize on a 64-bit target.
+        payload.extend_from_slice(&[0, 0, 0, 1, b't', b'e', b's', b't']);
+        payload.extend_from_slice(&(u64::MAX - 3).to_be_bytes());
+        // Must terminate without panicking and without matching the hostile box.
+        let out = find_boxes_capped(&payload, b"test", 8);
+        assert!(
+            out.is_empty(),
+            "a box whose largesize wraps the position must be rejected, not matched"
+        );
+        assert!(find_box(&payload, b"test").is_none());
     }
 
     // An `stsc` entry naming a `first_chunk` beyond what `stco` declares must
