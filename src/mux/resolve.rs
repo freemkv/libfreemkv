@@ -376,7 +376,10 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             let stream = image_input(
                 reader,
                 opts,
-                move || crate::io::file_sector_source::FileSectorSource::open(&probe_path).ok(),
+                move || {
+                    crate::io::file_sector_source::FileSectorSource::open(&probe_path)
+                        .map_err(|e| -> io::Error { e.into() })
+                },
                 false,
             )?;
             Ok(Box::new(stream))
@@ -391,7 +394,7 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             let stream = image_input(
                 reader,
                 opts,
-                move || crate::dirimage::DirImage::open(&probe_path).ok(),
+                move || crate::dirimage::DirImage::open(&probe_path).map_err(|e| -> io::Error { e.into() }),
                 true,
             )?;
             Ok(Box::new(stream))
@@ -445,7 +448,7 @@ fn image_input<S, F>(
 ) -> io::Result<PipelinedPesStream>
 where
     S: SectorSource + Send + 'static,
-    F: FnOnce() -> Option<S>,
+    F: FnOnce() -> io::Result<S>,
 {
     let capacity = reader.capacity_sectors();
     let mut disc =
@@ -510,7 +513,7 @@ where
     // probing decrypted units via a fresh reader; skipped in --raw (no point).
     if !opts.raw {
         match reopen() {
-            Some(mut probe) => {
+            Ok(mut probe) => {
                 // The probe decrypts the title head, so it needs the same
                 // key map the mux read installs below, or an AACS source
                 // fails loud on the first unit. `.ok()`: non-fatal.
@@ -536,11 +539,13 @@ where
                 }
                 crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]);
             }
-            None => {
+            Err(e) => {
                 // Non-fatal: a failed re-open leaves MPLS 7.1/Atmos counts
-                // uncorrected (as 5.1). Log so it's diagnosable, not silent.
+                // uncorrected (as 5.1). Log the actual error so it's
+                // diagnosable, not swallowed by a bare `.ok()` -> None.
                 tracing::debug!(
                     target: "mux",
+                    error = %e,
                     "TrueHD channel-correction probe re-open failed"
                 );
             }
