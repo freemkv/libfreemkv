@@ -942,7 +942,11 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         times
     };
 
-    // Extract subtitle palette at PGC offset 0xA4: 16 colors × 4 bytes [padding, Y, Cr, Cb]
+    // Extract subtitle palette at PGC offset 0xA4: 16 colors × 4 bytes
+    // [padding, Y, Cr, Cb]. Chroma order is Cr (byte 2) BEFORE Cb (byte 3),
+    // fixed by the DVD-Video PGC CLUT format — NOT Cb before Cr. The consumer
+    // `mux::codec::dvdsub::ycbcr_to_rgb` reads it the same way; keep them in
+    // lockstep or subtitle colours channel-swap.
     let palette = if pgc_offset + 0xA4 + 64 <= data.len() {
         let mut colors = Vec::with_capacity(16);
         for i in 0..16 {
@@ -1726,6 +1730,28 @@ mod tests {
         pgc2[0x03] = 0;
         let title2 = parse_pgc(&pgc2, 0, 1).unwrap();
         assert!(title2.palette.is_none());
+    }
+
+    /// The palette byte order is [padding, Y, Cr, Cb] — chroma is Cr BEFORE Cb
+    /// — and the DvdSub consumer reads it the same way. Pin both together with
+    /// distinct Cr/Cb so a future byte-swap in either place fails here.
+    #[test]
+    fn pgc_palette_chroma_order_is_cr_then_cb_matching_the_consumer() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x03] = 0; // no cells
+        // Color 0: Y=0x40, Cr=0x11, Cb=0x22 — distinct so an order swap shows.
+        pgc[0xA4] = 0x00; // padding
+        pgc[0xA4 + 1] = 0x40; // Y
+        pgc[0xA4 + 2] = 0x11; // Cr
+        pgc[0xA4 + 3] = 0x22; // Cb
+        let title = parse_pgc(&pgc, 0, 1).unwrap();
+        let pal = title.palette.expect("non-empty palette");
+        assert_eq!(pal[0], [0x00, 0x40, 0x11, 0x22], "stored as [pad, Y, Cr, Cb]");
+        // The consumer interprets index 2 as Cr and index 3 as Cb (see
+        // dvdsub::ycbcr_to_rgb). Cross-check the same entry both ways.
+        let rgb = crate::mux::codec::dvdsub::ycbcr_to_rgb(&pal[0]);
+        let expected = crate::mux::codec::dvdsub::ycbcr_to_rgb(&[0x00, 0x40, 0x11, 0x22]);
+        assert_eq!(rgb, expected, "ifo and dvdsub must read Cr/Cb the same way");
     }
 
     /// parse_pgc palette layout: each color is [padding, Y, Cr, Cb] and the
