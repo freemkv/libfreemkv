@@ -126,12 +126,36 @@ pub(crate) fn run_features(
     scsi: &mut dyn crate::scsi::ScsiTransport,
     drive_id: &crate::identity::DriveId,
 ) -> Dispatch {
-    let unlockers: Vec<Box<dyn fu::Unlocker>> = vec![
+    run(firmware_unlockers(), scsi, drive_id, fu::DiscKind::Unknown)
+}
+
+// The FIRMWARE/drive unlockers, in dispatch order. These key off the DRIVE and
+// remove bus encryption AT THE DRIVE, so a VID from one of them means the drive
+// is already unlocked (see `is_drive_unlocker`). Single constructor so both the
+// dispatch and the name/classification helpers share one source of truth.
+fn firmware_unlockers() -> Vec<Box<dyn fu::Unlocker>> {
+    vec![
         Box::new(fu::FreemkvUnlocker::new()),
         Box::new(fu::LdUnlocker::new()),
         Box::new(fu::Renesas::new()),
-    ];
-    run(unlockers, scsi, drive_id, fu::DiscKind::Unknown)
+    ]
+}
+
+// The DISC-keyed unlockers, in dispatch order. `host_certs` are injected into
+// the AACS unlocker here (the one place certs enter); pass an empty slice when
+// only the names are wanted.
+fn disc_unlockers(host_certs: Vec<fu::HostCert>) -> Vec<Box<dyn fu::Unlocker>> {
+    vec![
+        Box::new(fu::AacsUnlocker::new(host_certs)),
+        Box::new(fu::DvdUnlocker::new()),
+    ]
+}
+
+// Whether `name` (a matched unlocker's `.name()`) is a firmware/drive unlocker,
+// i.e. one whose success means bus encryption is already removed at the drive.
+// Derived from the real unlocker set, never a hardcoded name list.
+pub(crate) fn is_drive_unlocker(name: &str) -> bool {
+    firmware_unlockers().iter().any(|u| u.name() == name)
 }
 
 /// Content: remove BUS ENCRYPTION for the mounted disc via the DISC-keyed
@@ -144,16 +168,18 @@ pub(crate) fn run_bus(
     kind: fu::DiscKind,
     host_certs: &[fu::HostCert],
 ) -> Dispatch {
-    let unlockers: Vec<Box<dyn fu::Unlocker>> = vec![
-        Box::new(fu::AacsUnlocker::new(host_certs.to_vec())),
-        Box::new(fu::DvdUnlocker::new()),
-    ];
-    run(unlockers, scsi, drive_id, kind)
+    run(disc_unlockers(host_certs.to_vec()), scsi, drive_id, kind)
 }
 
 // The unlocker names, in dispatch order, for the user-facing unlocker matrix.
+// Derived from the real unlocker instances' `.name()` — firmware set then disc
+// set — so the matrix can never drift from what actually dispatches.
 pub(crate) fn unlocker_names() -> Vec<&'static str> {
-    vec!["freemkv", "LD", "Renesas", "AACS", "DVD"]
+    firmware_unlockers()
+        .iter()
+        .chain(disc_unlockers(Vec::new()).iter())
+        .map(|u| u.name())
+        .collect()
 }
 
 #[cfg(test)]
@@ -183,6 +209,47 @@ mod tests {
         adapter
             .execute(&[0u8; 12], fu::scsi::DataDirection::None, &mut buf, 1_000)
             .expect_err("error path")
+    }
+
+    // The user-facing unlocker matrix must be DERIVED from the real unlocker
+    // instances, never a hand-maintained list that can silently drift. Pin the
+    // dispatch order (firmware set, then disc set) and cross-check that every
+    // name comes from an actual `.name()`.
+    #[test]
+    fn unlocker_names_are_derived_from_the_real_unlockers() {
+        assert_eq!(
+            unlocker_names(),
+            vec!["freemkv", "LD", "Renesas", "AACS", "DVD"],
+            "the matrix is the firmware set then the disc set, in dispatch order"
+        );
+        let derived: Vec<&str> = firmware_unlockers()
+            .iter()
+            .chain(disc_unlockers(Vec::new()).iter())
+            .map(|u| u.name())
+            .collect();
+        assert_eq!(unlocker_names(), derived);
+    }
+
+    // `is_drive_unlocker` classifies a matched unlocker name against the real
+    // firmware set: firmware unlockers unlock AT THE DRIVE (true), disc-keyed
+    // ones do not (false), and an empty/unknown name is not a drive unlock.
+    #[test]
+    fn is_drive_unlocker_credits_only_the_firmware_set() {
+        for u in firmware_unlockers() {
+            assert!(
+                is_drive_unlocker(u.name()),
+                "{} is a firmware/drive unlocker",
+                u.name()
+            );
+        }
+        for u in disc_unlockers(Vec::new()) {
+            assert!(
+                !is_drive_unlocker(u.name()),
+                "{} is disc-keyed, not a drive unlock",
+                u.name()
+            );
+        }
+        assert!(!is_drive_unlocker(""), "no match is not a drive unlock");
     }
 
     /// A CHECK CONDITION carrying sense crosses the seam with status + parsed
