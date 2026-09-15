@@ -12,7 +12,7 @@
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, xml};
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Cheap signature check: a Criterion disc ships `streamproperties.xml`
 /// inside a `/BDMV/JAR/*` archive.
@@ -96,19 +96,33 @@ fn assign_stream_numbers(
 
     let mut audio_idx: u32 = 1;
     let mut sub_idx: u32 = 1;
+    // Numbers already EMITTED per type. A playbackconfig that maps two distinct
+    // StreamInfo_IDs to the SAME stream number (a duplicate) must NOT emit that
+    // number twice — the second occurrence is demoted to a synthesized free
+    // number instead of colliding. A HashSet keeps the skip loop O(1) so the
+    // full 65535-stream space stays cheap to walk.
+    let mut used_audio: HashSet<u16> = HashSet::new();
+    let mut used_sub: HashSet<u16> = HashSet::new();
     let mut out = Vec::with_capacity(infos.len());
     for info in infos {
-        let n = match stream_map.get(&info.id).copied() {
-            Some(n) if n != 0 => n,
+        let (idx, taken, used) = match info.stream_type {
+            StreamLabelType::Audio => (&mut audio_idx, &taken_audio, &mut used_audio),
+            StreamLabelType::Subtitle => (&mut sub_idx, &taken_sub, &mut used_sub),
+        };
+        // A map value of 0 is unmatchable (apply_labels is 1-based); treat it as
+        // unmapped. A mapped number already claimed by an earlier stream of the
+        // same type is a duplicate and is likewise demoted to synthesis.
+        let mapped = stream_map.get(&info.id).copied().filter(|&n| n != 0);
+        let n = match mapped {
+            Some(n) if !used.contains(&n) => n,
             _ => {
-                let (idx, taken) = match info.stream_type {
-                    StreamLabelType::Audio => (&mut audio_idx, &taken_audio),
-                    StreamLabelType::Subtitle => (&mut sub_idx, &taken_sub),
-                };
-                // Advance past any number already claimed via the map. The
-                // counter strictly increases and NUMBER_SPACE_END is fixed, so
-                // this terminates in at most 65535 steps for any input.
-                while *idx < NUMBER_SPACE_END && taken.contains(&(*idx as u16)) {
+                // Advance past any number already claimed via the map OR already
+                // emitted (dedup). The counter strictly increases and
+                // NUMBER_SPACE_END is fixed, so this terminates in at most 65535
+                // steps for any input.
+                while *idx < NUMBER_SPACE_END
+                    && (taken.contains(&(*idx as u16)) || used.contains(&(*idx as u16)))
+                {
                     *idx += 1;
                 }
                 if *idx >= NUMBER_SPACE_END {
@@ -127,6 +141,7 @@ fn assign_stream_numbers(
                 n
             }
         };
+        used.insert(n);
         out.push(n);
     }
     Some(out)
@@ -306,6 +321,34 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), 3, "stream numbers must be unique");
+    }
+
+    /// Duplicate stream numbers in playbackconfig: two distinct StreamInfo_IDs
+    /// mapped to the SAME number must not both emit it. The first keeps the
+    /// claimed number; the second is demoted to a synthesized free slot so the
+    /// output stays collision-free (pre-fix: both landed on the same number).
+    #[test]
+    fn duplicate_mapped_numbers_are_deduped_not_emitted_twice() {
+        let mut map = HashMap::new();
+        map.insert("a0".to_string(), 1u16);
+        map.insert("a1".to_string(), 1u16); // duplicate claim of 1
+        let infos = vec![
+            info("a0", StreamLabelType::Audio),
+            info("a1", StreamLabelType::Audio),
+            info("a2", StreamLabelType::Audio), // unmapped → fallback
+        ];
+        let nums = assign_stream_numbers(&infos, &map).expect("numbering space not exhausted");
+        // a0 keeps 1; a1's duplicate 1 is demoted (skips the taken 1 → 2);
+        // a2 synthesizes the next free number (3). All distinct.
+        assert_eq!(nums[0], 1);
+        assert_ne!(
+            nums[1], nums[0],
+            "duplicate must not reuse the claimed number"
+        );
+        let mut sorted = nums.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "all stream numbers must be unique");
     }
 
     #[test]

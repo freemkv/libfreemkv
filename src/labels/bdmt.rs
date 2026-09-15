@@ -146,11 +146,22 @@ pub(crate) fn parse_bdmt_xml(xml_text: &str) -> Option<BdmtFields> {
 }
 
 // Reject description candidates that are themselves XML fragments (e.g.
-// only <di:thumbnail/> children, no prose). See docs/bdmt.md —
-// looks_like_xml.
+// only <di:thumbnail/> children, no prose) OR mixed content — prose with an
+// embedded child element, which `xml::text` returns verbatim (tags and all).
+// The old `starts_with('<')` only caught fragments that LED with a tag, so a
+// description like `Real prose <di:thumbnail/>` leaked its markup through. Any
+// `<` that begins an element / close tag / comment / PI marks the value as
+// XML-tainted; a bare `<` used as prose (e.g. `a < b`) is left alone.
+// See docs/bdmt.md — looks_like_xml.
 fn looks_like_xml(s: &str) -> bool {
-    let t = s.trim_start();
-    t.starts_with('<')
+    let bytes = s.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'<'
+            && matches!(
+                bytes.get(i + 1),
+                Some(&c) if c.is_ascii_alphabetic() || matches!(c, b'/' | b'!' | b'?')
+            )
+    })
 }
 
 /// Try title-bearing element variants in priority order. The `xml`
@@ -416,6 +427,37 @@ mod tests {
             description.as_deref(),
             Some("An epic tale of one man's quest for tea.")
         );
+    }
+
+    /// Mixed content: prose LEADING with real text but carrying an embedded
+    /// child element. `xml::text` returns it verbatim (markup and all), so the
+    /// old `starts_with('<')` filter let the tags leak into the description.
+    /// A mixed-content description must be dropped, not surfaced with raw XML.
+    #[test]
+    fn mixed_content_description_with_embedded_tag_is_dropped() {
+        let xml = r#"<discInfo>
+            <di:name>Skyline Run</di:name>
+            <di:description>Intro prose <di:thumbnail href="x.jpg" /> more</di:description>
+        </discInfo>"#;
+        let (title, description, _) =
+            parse_bdmt_xml(xml).expect("title present so parse must succeed");
+        assert_eq!(title, "Skyline Run");
+        assert!(
+            description.is_none(),
+            "a description with embedded markup must be dropped, got {description:?}"
+        );
+    }
+
+    /// The mixed-content guard must not over-reject: a bare `<` used as prose
+    /// (a comparison, not a tag) is still a valid description.
+    #[test]
+    fn description_with_bare_less_than_is_not_treated_as_xml() {
+        let xml = r#"<discInfo>
+            <di:name>Math Film</di:name>
+            <di:description>when a < b holds</di:description>
+        </discInfo>"#;
+        let (_, description, _) = parse_bdmt_xml(xml).expect("must parse");
+        assert_eq!(description.as_deref(), Some("when a < b holds"));
     }
 
     #[test]

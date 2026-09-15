@@ -173,7 +173,12 @@ fn parse_studio_attr(xml: &[u8]) -> Option<String> {
             continue;
         }
         let rest = &after_eq[1..];
-        let close = rest.find(quote as char)?;
+        // An unterminated quote on THIS candidate must not abort the whole scan
+        // (the old `?` did): skip the bad item and keep looking so a later,
+        // well-formed `studio="..."` is still found.
+        let Some(close) = rest.find(quote as char) else {
+            continue;
+        };
         let val = rest[..close].trim();
         if val.is_empty() || val.len() > MAX_STUDIO_LEN {
             return None;
@@ -3004,5 +3009,21 @@ mod tests {
         // A `studio`-containing value with no real attribute anywhere → None,
         // not the value's own quotes.
         assert_eq!(parse_studio_attr(b"<C title=\"studio ghibli\">"), None);
+    }
+
+    // A malformed `studio=` candidate whose quote is never closed must be
+    // SKIPPED, not abort the scan: a later well-formed `studio="..."` still
+    // resolves. Pre-fix the `?` on the missing close-quote returned None for the
+    // whole document, dropping the real studio.
+    #[test]
+    fn unterminated_studio_quote_is_skipped_and_a_later_studio_resolves() {
+        // First `studio="` opens a double-quoted value with NO other `"` until
+        // the second attribute; only the single-quoted `studio='uni'` is valid.
+        let xml = b"<C studio=\"unclosed studio='uni'>";
+        assert_eq!(
+            parse_studio_attr(xml).as_deref(),
+            Some("uni"),
+            "a bad studio candidate must be skipped, not abort the whole scan"
+        );
     }
 }

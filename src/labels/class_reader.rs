@@ -26,7 +26,9 @@ pub enum Error {
     BadCpTag { index: u16, tag: u8 },
     BadUtf8 { index: u16 },
     BadCodeAttribute,
-    BadInstruction { pc: usize, opcode: u8 },
+    // NOTE: no `BadInstruction` variant. The bytecode iterator STOPS at the
+    // first malformed instruction (returns `None`) rather than surfacing a
+    // typed error, so nothing ever constructed one — it was dead and removed.
 }
 
 // No Display/std::error::Error impl: crate-internal typed error for `match`/`?`
@@ -593,11 +595,16 @@ impl<'a> Iterator for Instructions<'a> {
         let pc = self.pos;
         let opcode = self.code[pc];
         let size = instruction_size(self.code, pc)?;
-        if pc + size > self.code.len() {
+        // `size` can be as large as `usize::MAX` on a 32-bit target (saturated
+        // switch-table math on adversarial bytecode), so `pc + size` must be a
+        // CHECKED add — a wrapping add could produce a small `end` that passes
+        // the bounds check below and then slices out of range / panics.
+        let end = pc.checked_add(size)?;
+        if end > self.code.len() {
             return None;
         }
-        let operands = &self.code[pc + 1..pc + size];
-        self.pos = pc + size;
+        let operands = &self.code[pc + 1..end];
+        self.pos = end;
         Some(Instruction {
             pc,
             opcode,
@@ -1158,6 +1165,28 @@ mod tests {
         };
         let count = attr.instructions().count();
         assert_eq!(count, 0);
+    }
+
+    // A `tableswitch` whose declared jump table spans the full i32 index range
+    // drives `instruction_size` to a saturated, buffer-exceeding size. `next()`
+    // must add `pc + size` with a CHECKED add (no wrap on a 32-bit `usize`, no
+    // panic on any target) and simply stop the walk — malformed disc bytecode
+    // yields no instruction, never a panic.
+    #[test]
+    fn instructions_iter_rejects_oversized_switch_without_panicking() {
+        let mut code = vec![TABLESWITCH, 0, 0, 0]; // opcode + 3 pad bytes
+        code.extend_from_slice(&[0, 0, 0, 0]); // default offset
+        code.extend_from_slice(&i32::MIN.to_be_bytes()); // low
+        code.extend_from_slice(&i32::MAX.to_be_bytes()); // high (2^32 entries)
+        let attr = CodeAttribute {
+            max_stack: 0,
+            max_locals: 0,
+            code: &code,
+        };
+        // The size overruns the buffer, so the switch instruction is never
+        // yielded and iteration ends immediately — without panicking.
+        assert!(attr.instructions().next().is_none());
+        assert_eq!(attr.instructions().count(), 0);
     }
 
     #[test]
