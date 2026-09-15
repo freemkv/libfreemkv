@@ -141,8 +141,23 @@ impl PesFrame {
         if len > MAX_FRAME_SIZE {
             return Err(crate::error::Error::PesFrameTooLarge { size: len }.into());
         }
-        let mut data = vec![0u8; len];
-        r.read_exact(&mut data)?;
+        // Grow the buffer INCREMENTALLY instead of `vec![0u8; len]`: the header's
+        // `len` is attacker-controlled up to MAX_FRAME_SIZE (256 MiB), so a
+        // truncated stream claiming a huge frame must not pre-allocate the whole
+        // max before we learn the bytes aren't there. Read through a bounded
+        // scratch chunk and append, so memory tracks bytes actually delivered; a
+        // short read still surfaces as UnexpectedEof, and a full valid frame
+        // assembles byte-for-byte.
+        const GROW_CHUNK: usize = 1024 * 1024; // 1 MiB scratch, heap-allocated
+        let mut data: Vec<u8> = Vec::with_capacity(len.min(GROW_CHUNK));
+        let mut chunk = vec![0u8; GROW_CHUNK.min(len).max(1)];
+        let mut remaining = len;
+        while remaining > 0 {
+            let want = remaining.min(chunk.len());
+            r.read_exact(&mut chunk[..want])?;
+            data.extend_from_slice(&chunk[..want]);
+            remaining -= want;
+        }
         Ok(Some(Self {
             track,
             pts,
@@ -779,5 +794,53 @@ mod tests {
         cs.write(&f1).unwrap();
         cs.write(&f2).unwrap();
         assert_eq!(cs.bytes_written(), 5, "must accumulate 3+2=5 bytes");
+    }
+
+    /// A frame larger than the incremental read chunk (1 MiB) must assemble
+    /// byte-for-byte across chunk boundaries — the grow-as-you-read path must
+    /// not drop, duplicate, or corrupt bytes where one chunk ends and the next
+    /// begins. Uses a position-dependent pattern so any boundary slip shows up.
+    #[test]
+    fn large_multi_chunk_frame_assembles_correctly() {
+        // 2 MiB + a tail, so at least three read chunks are exercised.
+        let size = 2 * 1024 * 1024 + 12_345;
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let frame = PesFrame {
+            coding: None,
+            source: None,
+            track: 7,
+            pts: 42,
+            keyframe: true,
+            data: payload.clone(),
+            duration_ns: Some(5),
+        };
+        let mut buf = Vec::new();
+        frame.serialize(&mut buf).expect("serialize large frame");
+        let mut cursor = std::io::Cursor::new(buf);
+        let got = PesFrame::deserialize(&mut cursor)
+            .expect("deserialize")
+            .expect("frame present");
+        assert_eq!(got.data.len(), payload.len(), "length must survive");
+        assert_eq!(got.data, payload, "every byte must survive across chunks");
+        assert!(PesFrame::deserialize(&mut cursor).unwrap().is_none());
+    }
+
+    /// A header claiming a large frame with the data truncated must surface as
+    /// UnexpectedEof (not silently succeed) — and, crucially, the incremental
+    /// reader must not pre-allocate the full declared length before failing.
+    #[test]
+    fn truncated_large_frame_body_errors() {
+        // Header advertises a 4 MiB frame, but only 10 payload bytes follow.
+        let declared = 4 * 1024 * 1024u32;
+        let mut buf = Vec::new();
+        buf.push(0u8); // track
+        buf.extend_from_slice(&0i64.to_le_bytes()); // pts
+        buf.push(0u8); // keyframe
+        buf.extend_from_slice(&u64::MAX.to_le_bytes()); // duration None sentinel
+        buf.extend_from_slice(&declared.to_le_bytes()); // len
+        buf.extend_from_slice(&[0xAB; 10]); // far fewer than declared
+        let mut cursor = std::io::Cursor::new(buf);
+        let err = PesFrame::deserialize(&mut cursor).expect_err("truncated body must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

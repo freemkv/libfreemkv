@@ -366,14 +366,41 @@ impl SectorSource for Borrowed<'_> {
 /// can't run (e.g. a read-only dir), assume case-insensitive — the conservative
 /// choice that never MISSES a real overwrite collision.
 fn dir_is_case_insensitive(dir: &Path) -> bool {
-    let lower = dir.join(".fmkv_case_probe");
+    // Unique per attempt: a FIXED probe name (`.fmkv_case_probe`) let two
+    // concurrent extracts into the same dir race — one's `remove_file` could
+    // delete the other's marker between its create and its `exists()` check,
+    // flipping the result (a TOCTOU collision). A per-call token makes each
+    // probe's lower/upper pair private, so concurrent probes never touch the
+    // same path.
+    let token = unique_probe_token();
+    let lower_name = format!(".fmkv_case_probe_{token}");
+    let lower = dir.join(&lower_name);
     if std::fs::File::create(&lower).is_err() {
         return true;
     }
-    let upper = dir.join(".FMKV_CASE_PROBE");
+    // The upper spelling is the SAME name uppercased end-to-end (hex token
+    // letters `a-f` fold to `A-F`), so on a case-insensitive volume it resolves
+    // to the file just created and on a case-sensitive one it does not exist.
+    let upper = dir.join(lower_name.to_ascii_uppercase());
     let insensitive = upper.exists();
     let _ = std::fs::remove_file(&lower);
     insensitive
+}
+
+/// A process-unique, lowercase-hex token for the case-probe filename. No `rand`
+/// dependency: a monotonic counter (distinguishes concurrent same-process
+/// probes) mixed with the pid and a nanosecond clock (distinguishes processes /
+/// runs). Hex digits are case-foldable, which the probe relies on.
+fn unique_probe_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{pid:x}_{nanos:x}_{n:x}")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2359,5 +2386,55 @@ mod tests {
             "a 1-digit group is not valid"
         );
         assert_eq!(vts_group_of("VTS_01_1.VOB").as_deref(), Some("VTS_01"));
+    }
+
+    /// The case-probe filename token must be UNIQUE across calls: a fixed
+    /// suffix let concurrent probes collide (TOCTOU). Every token from a burst
+    /// of calls must be distinct.
+    #[test]
+    fn probe_token_is_unique_across_calls() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let t = unique_probe_token();
+            assert!(t.is_ascii(), "token must be ascii-hex, got {t:?}");
+            assert!(seen.insert(t.clone()), "probe token repeated: {t}");
+        }
+    }
+
+    /// Concurrency safety: many threads probing the SAME directory at once must
+    /// all agree on the answer and never panic — no probe's cleanup may clobber
+    /// another's marker (the collision a fixed name allowed). Also confirms no
+    /// stray `.fmkv_case_probe*` files survive the burst.
+    #[test]
+    fn concurrent_case_probes_do_not_collide() {
+        let tmp = TmpDir::new("case_probe_race");
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let expected = dir_is_case_insensitive(tmp.path());
+        let dir = tmp.path().to_path_buf();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        assert_eq!(dir_is_case_insensitive(&dir), expected);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("probe thread panicked");
+        }
+        // Every probe removes its own marker, so nothing should be left behind.
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .starts_with(".fmkv_case_probe")
+            })
+            .collect();
+        assert!(leftover.is_empty(), "probe markers leaked: {leftover:?}");
     }
 }
