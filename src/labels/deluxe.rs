@@ -145,18 +145,42 @@ fn detect_studio(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<String> {
 fn parse_studio_attr(xml: &[u8]) -> Option<String> {
     const MAX_STUDIO_LEN: usize = 32;
     let text = std::str::from_utf8(xml).ok()?;
-    let anchor = text.find("studio")?;
-    let after_key = &text[anchor + "studio".len()..];
-    // Skip whitespace / '=' up to the opening quote.
-    let open = after_key.find(['"', '\''])?;
-    let quote = after_key.as_bytes()[open];
-    let rest = &after_key[open + 1..];
-    let close = rest.find(quote as char)?;
-    let val = rest[..close].trim();
-    if val.is_empty() || val.len() > MAX_STUDIO_LEN {
-        return None;
+    let bytes = text.as_bytes();
+    // Anchor `studio` as a WHOLE attribute name, not a bare substring: the old
+    // `find("studio")` also fired on `substudio=`, `studioId=`, or the literal
+    // word "studio" inside some OTHER attribute's value, then read a later
+    // attribute's quotes as the studio value. Require a word boundary before it
+    // and an `=` (after optional whitespace) immediately after.
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("studio") {
+        let start = from + rel;
+        let end = start + "studio".len();
+        from = start + 1;
+        let boundary =
+            start == 0 || matches!(bytes[start - 1], b' ' | b'\t' | b'\r' | b'\n' | b'<' | b'/');
+        if !boundary {
+            continue;
+        }
+        let after_eq = text[end..].trim_start();
+        let Some(after_eq) = after_eq.strip_prefix('=') else {
+            continue;
+        };
+        let after_eq = after_eq.trim_start();
+        let Some(quote) = after_eq.as_bytes().first().copied() else {
+            continue;
+        };
+        if quote != b'"' && quote != b'\'' {
+            continue;
+        }
+        let rest = &after_eq[1..];
+        let close = rest.find(quote as char)?;
+        let val = rest[..close].trim();
+        if val.is_empty() || val.len() > MAX_STUDIO_LEN {
+            return None;
+        }
+        return Some(val.to_ascii_lowercase());
     }
-    Some(val.to_ascii_lowercase())
+    None
 }
 
 /// One identified master enum class.
@@ -2959,5 +2983,26 @@ mod tests {
         assert_eq!(parse_studio_attr(b"<TitleConfig>"), None);
         assert_eq!(parse_studio_attr(b"studio=\"\""), None);
         assert_eq!(parse_studio_attr(&[0xff, 0xfe, 0x00]), None);
+    }
+
+    // The `studio` anchor is a WHOLE attribute name, not a bare substring: a
+    // longer attribute that merely CONTAINS "studio", or the word inside some
+    // other attribute's value, must not be read as the studio — and the real
+    // `studio="..."` on the same tag must still win.
+    #[test]
+    fn studio_anchor_is_a_whole_attribute_not_a_substring() {
+        // `substudio` / `studioId` are not `studio`.
+        assert_eq!(parse_studio_attr(b"<C substudio=\"nope\">"), None);
+        assert_eq!(parse_studio_attr(b"<C studioId=\"nope\">"), None);
+        // "studio" inside another attribute's value must be skipped, and the
+        // real attribute later on the tag must be found.
+        assert_eq!(
+            parse_studio_attr(b"<C title=\"a studio film\" studio=\"fox\">").as_deref(),
+            Some("fox"),
+            "the word 'studio' in a value must not steal a later attribute's quotes"
+        );
+        // A `studio`-containing value with no real attribute anywhere → None,
+        // not the value's own quotes.
+        assert_eq!(parse_studio_attr(b"<C title=\"studio ghibli\">"), None);
     }
 }
