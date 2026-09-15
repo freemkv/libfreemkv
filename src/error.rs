@@ -118,6 +118,12 @@ pub const E_KEY_SERVICE_UNAUTHORIZED: u16 = 7029;
 /// The operator action is to back off and retry more slowly; the disc's key may
 /// well exist.
 pub const E_KEY_SERVICE_RATE_LIMITED: u16 = 7030;
+/// A key source is misconfigured — a bad URL scheme, a malformed authority, or a
+/// host that resolves only to non-public addresses. A standing operator fault
+/// that never self-heals, so it is emphatically NOT the transient
+/// [`E_KEY_SERVICE_UNAVAILABLE`]: retrying changes nothing until the
+/// configuration is fixed.
+pub const E_KEY_SERVICE_CONFIG: u16 = 7031;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -571,6 +577,14 @@ pub enum Error {
     /// A key source rate-limited the request (HTTP 429). See
     /// [`E_KEY_SERVICE_RATE_LIMITED`]. Back off and retry more slowly.
     KeyServiceRateLimited,
+    /// A key source is misconfigured — a bad URL scheme, a malformed authority,
+    /// or a host that resolves only to non-public addresses. See
+    /// [`E_KEY_SERVICE_CONFIG`]. A standing operator fault, never transient: fix
+    /// the configuration (retrying changes nothing).
+    ///
+    /// Carries no detail by design: the key-service URL and the resolved address
+    /// are operator-confidential and must not reach a log or a bug report.
+    KeyServiceConfig,
     /// The live-drive AACS cert-auth handshake (the OEM/AACS baseline route)
     /// could not run because NO host certificate was available from any key
     /// source. Host certs are keysource-served, never compiled in, so the OEM
@@ -917,6 +931,7 @@ impl Error {
             Error::KeyServiceUnavailable => E_KEY_SERVICE_UNAVAILABLE,
             Error::KeyServiceUnauthorized => E_KEY_SERVICE_UNAUTHORIZED,
             Error::KeyServiceRateLimited => E_KEY_SERVICE_RATE_LIMITED,
+            Error::KeyServiceConfig => E_KEY_SERVICE_CONFIG,
             Error::AacsNoHostCert { .. } => E_AACS_NO_HOST_CERT,
             Error::AacsBusKeyUnavailable => E_AACS_BUS_KEY_UNAVAILABLE,
             Error::FmtsKeyMissing => E_FMTS_KEY_MISSING,
@@ -1636,6 +1651,7 @@ mod tests {
             (Error::KeyServiceUnavailable, E_KEY_SERVICE_UNAVAILABLE),
             (Error::KeyServiceUnauthorized, E_KEY_SERVICE_UNAUTHORIZED),
             (Error::KeyServiceRateLimited, E_KEY_SERVICE_RATE_LIMITED),
+            (Error::KeyServiceConfig, E_KEY_SERVICE_CONFIG),
         ];
         for (e, want_code) in cases {
             let s = e.to_string();

@@ -258,7 +258,12 @@ pub fn encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
 
 /// Remove bus encryption from an aligned unit (AACS 2.0 / UHD).
 /// Bus encryption uses read_data_key, decrypting bytes 16..2048 of each 2048-byte sector.
-pub(crate) fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
+///
+/// Widened from `pub(crate)` to `pub` (behavior unchanged) so an out-of-tree
+/// diagnostic tool can invert AACS 2.0 bus encryption on sampled units after an
+/// OEM host-cert AKE yields the Read Data Key — the same de-bus step the rip
+/// path applies internally.
+pub fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
     // Expand the key schedule ONCE for the whole unit: `read_data_key` is
     // loop-invariant, but per-sector `aes_cbc_decrypt` rebuilt it 3x per unit
     // (~29M redundant expansions over a 90GB read) on the decrypt hot path.

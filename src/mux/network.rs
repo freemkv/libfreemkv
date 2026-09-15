@@ -31,21 +31,41 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
                 || (o[0] == 100 && (o[1] & 0xc0) == 0x40)
                 // "this network" 0.0.0.0/8
                 || o[0] == 0
+                // benchmarking 198.18.0.0/15 (RFC 2544) — 198.18.x and 198.19.x
+                // (the /15 second octet is 18 with the low bit free, i.e. 18|19).
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)
+                // IETF protocol assignments 192.0.0.0/24 (RFC 6890), which
+                // includes 192.0.0.170/171 (NAT64/DNS64 discovery).
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
                 // Class E reserved 240.0.0.0/4
                 || o[0] >= 240
         }
         IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            // 6to4 (2002::/16) embeds an IPv4 in segments[1..3]; Teredo
+            // (2001:0000::/32) embeds the client IPv4 in the last two segments,
+            // each XOR 0xffff. Both must be re-checked as their embedded IPv4 or
+            // an internal target slips through the tunnel.
+            let sixtofour = (seg[0] == 0x2002)
+                .then(|| std::net::Ipv4Addr::from(((seg[1] as u32) << 16) | (seg[2] as u32)));
+            let teredo = (seg[0] == 0x2001 && seg[1] == 0x0000).then(|| {
+                std::net::Ipv4Addr::from(
+                    (((seg[6] ^ 0xffff) as u32) << 16) | ((seg[7] ^ 0xffff) as u32),
+                )
+            });
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 // unique-local fc00::/7
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xfe00) == 0xfc00
                 // link-local fe80::/10
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (seg[0] & 0xffc0) == 0xfe80
                 // IPv4-mapped (::ffff:x.x.x.x) and IPv4-compatible (::x.x.x.x);
                 // to_ipv4() returns Some for both forms — re-check as IPv4 so an
                 // IPv4-mapped private/loopback address can't bypass the block above.
                 || v6.to_ipv4().map(|m| is_blocked_ip(IpAddr::V4(m))) == Some(true)
+                || sixtofour.is_some_and(|v4| is_blocked_ip(IpAddr::V4(v4)))
+                || teredo.is_some_and(|v4| is_blocked_ip(IpAddr::V4(v4)))
         }
     }
 }
@@ -301,6 +321,55 @@ mod tests {
         for (ip, label) in allowed {
             assert!(!is_blocked_ip(*ip), "{label} ({ip}) must be allowed");
         }
+    }
+
+    // Benchmarking 198.18.0.0/15 (RFC 2544) and IETF protocol assignments
+    // 192.0.0.0/24 (RFC 6890, incl. the 192.0.0.170/171 NAT64/DNS64 anycast)
+    // are non-public and must be blocked outbound — parity with keysources.
+    #[test]
+    fn ssrf_guard_blocks_benchmarking_and_protocol_assignment_ranges() {
+        use std::net::Ipv4Addr;
+        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+        // 198.18.0.0/15 spans 198.18.x AND 198.19.x — both octets blocked.
+        assert!(is_blocked_ip(v4(198, 18, 0, 1)));
+        assert!(is_blocked_ip(v4(198, 18, 255, 255)));
+        assert!(is_blocked_ip(v4(198, 19, 0, 1)));
+        assert!(is_blocked_ip(v4(198, 19, 200, 5)));
+        // 198.17.x and 198.20.x are OUTSIDE the /15 — must stay allowed.
+        assert!(!is_blocked_ip(v4(198, 17, 0, 1)));
+        assert!(!is_blocked_ip(v4(198, 20, 0, 1)));
+        // 192.0.0.0/24, including 192.0.0.170 / 192.0.0.171.
+        assert!(is_blocked_ip(v4(192, 0, 0, 0)));
+        assert!(is_blocked_ip(v4(192, 0, 0, 170)));
+        assert!(is_blocked_ip(v4(192, 0, 0, 171)));
+        assert!(is_blocked_ip(v4(192, 0, 0, 255)));
+        // The adjacent 192.0.1.0 is a different block — not covered here.
+        assert!(!is_blocked_ip(v4(192, 0, 1, 1)));
+    }
+
+    // 6to4 (2002::/16) and Teredo (2001:0000::/32) tunnel an IPv4 inside an
+    // IPv6 address; the guard must decode and re-check that embedded IPv4 or an
+    // internal target slips through the tunnel — parity with keysources.
+    #[test]
+    fn ssrf_guard_blocks_embedded_ipv4_via_6to4_and_teredo() {
+        use std::net::Ipv6Addr;
+        // 6to4 for 127.0.0.1: 2002:7f00:0001:: (embedded in segments[1..3]).
+        assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2002, 0x7f00, 0x0001, 0, 0, 0, 0, 0
+        ))));
+        // 6to4 for 169.254.169.254 (cloud metadata): 2002:a9fe:a9fe::.
+        assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2002, 0xa9fe, 0xa9fe, 0, 0, 0, 0, 0
+        ))));
+        // Teredo for 127.0.0.1: client IPv4 lives in the last two segments XOR
+        // 0xffff, so 0x7f00^0xffff=0x80ff and 0x0001^0xffff=0xfffe.
+        assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x0000, 0, 0, 0, 0, 0x80ff, 0xfffe
+        ))));
+        // A 6to4 wrapping a PUBLIC IPv4 (8.8.8.8 → 2002:0808:0808::) is allowed.
+        assert!(!is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2002, 0x0808, 0x0808, 0, 0, 0, 0, 0
+        ))));
     }
 
     /// The public `connect` must refuse a loopback target with the typed
