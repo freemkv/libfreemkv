@@ -1134,6 +1134,12 @@ impl std::fmt::Display for Error {
             Error::MuxHeaderBufferExceeded { bytes } => {
                 write!(f, "E{}: {}", self.code(), bytes)
             }
+            // have/want are byte lengths (an identifier-free, language-neutral
+            // pair) — surface them so a truncated-resume report carries the
+            // actual mismatch, not just the bare code.
+            Error::ImageTruncated { have, want } => {
+                write!(f, "E{} {have}/{want}", self.code())
+            }
             _ => write!(f, "E{}", self.code()),
         }
     }
