@@ -325,14 +325,50 @@ impl AacsKeyMap {
 /// Decrypt `buf` with a resolved AACS key map. Thin wrapper over
 /// [`decrypt_span`] — the map is the AACS scheme's input, not a second
 /// orchestrator.
+// Content-less convenience form used only by tests (production reads always go
+// through `decrypt_sectors_mapped_in_content`, which honours the content extents).
+#[cfg(test)]
 pub(crate) fn decrypt_sectors_mapped(
     buf: &mut [u8],
     keys: &DecryptKeys,
     base_lba: u32,
     map: &AacsKeyMap,
 ) -> Result<(), crate::error::Error> {
+    decrypt_sectors_mapped_in_content(buf, keys, base_lba, map, None)
+}
+
+/// [`decrypt_sectors_mapped`] restricted to the disc's encrypted-content extents.
+/// `content` is the sorted/merged `(start_lba, sector_count)` content map: an
+/// aligned unit whose absolute LBA falls in NO content range is clear
+/// (UDF filesystem / BDMV nav) and is passed through untouched — never decrypted,
+/// verified, or counted as loss. `None` means "the caller only reads encrypted
+/// content", so every unit is treated as content (the legacy behaviour). This is
+/// how [`DecryptingSectorSource::with_content_ranges`] honours its contract.
+pub(crate) fn decrypt_sectors_mapped_in_content(
+    buf: &mut [u8],
+    keys: &DecryptKeys,
+    base_lba: u32,
+    map: &AacsKeyMap,
+    content: Option<&[(u32, u32)]>,
+) -> Result<(), crate::error::Error> {
     let mut keys = keys.clone();
-    decrypt_span(buf, &mut keys, base_lba, Some(map), None).map(|_| ())
+    decrypt_span(
+        buf,
+        &mut keys,
+        base_lba,
+        Some(map),
+        content.map(|r| (base_lba, r)),
+    )
+    .map(|_| ())
+}
+
+/// Is `lba` inside any `(start_lba, sector_count)` content range? Used to gate the
+/// mapped decrypt so clear filesystem/nav units outside every encrypted-content
+/// extent are passed through untouched.
+fn lba_in_content_ranges(lba: u32, ranges: &[(u32, u32)]) -> bool {
+    ranges
+        .iter()
+        .any(|&(start, count)| lba >= start && (lba - start) < count)
 }
 
 // AACS scheme step: apply `map`'s per-unit keys to `buf`, in-place — no key
@@ -343,6 +379,7 @@ fn apply_aacs_map(
     keys: &DecryptKeys,
     base_lba: u32,
     map: &AacsKeyMap,
+    content: Option<&[(u32, u32)]>,
 ) -> Result<(), crate::error::Error> {
     let (unit_keys, rdk, format) = match keys {
         DecryptKeys::Aacs {
@@ -373,11 +410,19 @@ fn apply_aacs_map(
     let verify_failed = std::sync::atomic::AtomicBool::new(false);
 
     let decrypt_one = |idx_in_buf: usize, chunk: &mut [u8]| {
+        let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
+        // Content-extent gate: a unit outside the disc's encrypted-content ranges is
+        // clear filesystem / BDMV nav — pass it through untouched, never decrypting,
+        // verifying, or counting it as loss (the `with_content_ranges` contract).
+        if let Some(ranges) = content
+            && !lba_in_content_ranges(unit_lba, ranges)
+        {
+            return;
+        }
         if chunk.len() != unit_len {
             // Trailing partial unit: normally a genuinely-clear tail, left as-is. But
             // one that is BOTH inside a mapped range AND flagged encrypted is a CBC
             // fragment we cannot decrypt — fail loud instead of shipping it as clear.
-            let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
             if map.entry_for(unit_lba).is_some()
                 && aacs::content::aacs_unit_seed_encrypted(chunk, format)
             {
@@ -385,7 +430,6 @@ fn apply_aacs_map(
             }
             return;
         }
-        let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
         // No range covers this LBA — expected for clear filesystem/nav, but an
         // ENCRYPTED unit outside every range is an orphan clip we cannot key;
         // emitting it verbatim would ship ciphertext as clear content.
@@ -464,11 +508,12 @@ pub fn decrypt_sectors(
 
 /// Legacy alias of [`decrypt_sectors`]. Under the keymap-only model AACS decrypts
 /// EXCLUSIVELY through the resolved key map (`decrypt_sectors_mapped`), so there is
-/// no per-unit content-extent gate here any more: the AACS arm fails loud and the
-/// CSS / `None` arm self-gates on its per-sector scramble flag. `base_lba` and
-/// `content_ranges` are therefore inert — retained only so the wrapper signature
-/// stays stable for the `DecryptingSectorSource` dispatch. Prefer
-/// [`decrypt_sectors`] in new code.
+/// no per-unit content-extent gate on THIS map-less path: the AACS arm fails loud
+/// and the CSS / `None` arm self-gates on its per-sector scramble flag. `base_lba`
+/// and `content_ranges` are therefore inert here — retained only so the wrapper
+/// signature stays stable for the `DecryptingSectorSource` dispatch. The mapped
+/// AACS path honours content extents via
+/// [`decrypt_sectors_mapped_in_content`]. Prefer [`decrypt_sectors`] in new code.
 pub fn decrypt_sectors_in_content(
     buf: &mut [u8],
     keys: &mut DecryptKeys,
@@ -488,7 +533,7 @@ fn decrypt_span(
     keys: &mut DecryptKeys,
     base_lba: u32,
     map: Option<&AacsKeyMap>,
-    _content: Option<(u32, &[(u32, u32)])>,
+    content: Option<(u32, &[(u32, u32)])>,
 ) -> Result<usize, crate::error::Error> {
     let dropped: usize = match keys {
         DecryptKeys::None => 0,
@@ -499,7 +544,9 @@ fn decrypt_span(
             let Some(map) = map else {
                 return Err(crate::error::Error::DecryptFailed);
             };
-            apply_aacs_map(buf, keys, base_lba, map)?;
+            // Honour the content-extent gate when present: units outside the disc's
+            // encrypted-content ranges are clear filesystem/nav and pass through.
+            apply_aacs_map(buf, keys, base_lba, map, content.map(|(_, r)| r))?;
             0
         }
         DecryptKeys::Css { title_key } => {
@@ -1412,6 +1459,80 @@ mod tests {
                     "odd unit {i} left as ciphertext"
                 );
             }
+        }
+    }
+
+    // `with_content_ranges` contract: an encrypted unit whose LBA is OUTSIDE the
+    // disc's content extents (clear filesystem / BDMV nav) must be passed through
+    // untouched — never decrypted, verified, or counted as loss. Before the fix the
+    // content map was ignored, so this unit was decrypted (its bytes mangled).
+    #[test]
+    fn mapped_decrypt_skips_units_outside_content_ranges() {
+        let unit_key = [0x33u8; 16];
+        let mut clear = clear_ts_unit();
+        clear[0] |= 0xC0; // encrypted flag lives in the clear seed
+        let mut ciphertext = clear.clone();
+        aacs_encrypt_unit_for_test(&mut ciphertext, &unit_key);
+
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, unit_key)],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
+
+        // Unit at LBA 0 is OUTSIDE the content ranges → passed through untouched.
+        let mut outside = ciphertext.clone();
+        decrypt_sectors_mapped_in_content(&mut outside, &keys, 0, &map, Some(&[(100, 3)]))
+            .expect("an out-of-content unit passes through");
+        assert_eq!(
+            outside, ciphertext,
+            "unit outside content ranges must not be decrypted"
+        );
+
+        // The SAME unit at LBA 0 INSIDE the content ranges → decrypted to plaintext.
+        let mut inside = ciphertext.clone();
+        decrypt_sectors_mapped_in_content(&mut inside, &keys, 0, &map, Some(&[(0, 3)]))
+            .expect("an in-content unit decrypts");
+        assert_eq!(
+            inside, clear,
+            "unit inside content ranges must decrypt to plaintext"
+        );
+    }
+
+    // Exercise the rayon parallel branch of `apply_aacs_map`: a buffer of far more
+    // than `PARALLEL_MIN_UNITS` units, decrypted on the multi-thread path, must
+    // recover EVERY unit byte-for-byte — i.e. the `par_chunks_mut` fan-out keeps the
+    // per-unit `idx_in_buf` correct (a race or off-by-one would corrupt some units).
+    #[test]
+    fn mapped_decrypt_parallel_path_recovers_every_unit() {
+        use crate::disc::ContentFormat;
+        let key = [0x77u8; 16];
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let usz = (ul / 2048) as u32;
+        let n = PARALLEL_MIN_UNITS * 4; // well past the parallel threshold
+        let mut clear = clear_ts_unit();
+        clear[0] |= 0xC0; // the CPI/encrypted flag is part of the preserved clear seed
+        let mut buf = vec![0u8; n * ul];
+        for i in 0..n {
+            let mut u = clear.clone();
+            aacs_encrypt_unit_for_test(&mut u, &key);
+            buf[i * ul..(i + 1) * ul].copy_from_slice(&u);
+        }
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            read_data_key: None,
+            format: ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges(vec![(0, (n as u32) * usz, 0)]);
+        decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
+            .expect("the parallel mapped decrypt must succeed");
+        for i in 0..n {
+            assert_eq!(
+                &buf[i * ul..(i + 1) * ul],
+                clear.as_slice(),
+                "unit {i} must recover to the known plaintext on the parallel path"
+            );
         }
     }
 
