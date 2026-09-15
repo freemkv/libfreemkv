@@ -48,9 +48,10 @@ pub struct TsMuxer<W: Write> {
     /// for why NAL-ness is derived from this rather than tracked
     /// separately.
     video_codec: Vec<Codec>,
-    /// Global PTS origin (nanoseconds), seeded by the FIRST video frame so
-    /// the audio/video offset is preserved. Frames that arrive before it
-    /// is set saturate to 0.
+    /// Global PTS origin (nanoseconds), seeded by the FIRST frame of any kind
+    /// (video or audio) so a single fixed origin rebases every frame and the
+    /// audio/video offset is preserved. A frame earlier than the origin (e.g.
+    /// audio reordered before the seeding frame) saturates to 0.
     base_pts_ns: Option<i64>,
     /// Count of PES frames actually emitted (a frame dropped as non-key
     /// before the first keyframe does NOT count). `finish()` returns
@@ -157,13 +158,12 @@ impl<W: Write> TsMuxer<W> {
             return Ok(());
         }
 
-        // Seed the global PTS origin from the FIRST video frame only, so the
-        // audio/video offset is preserved. A leading audio frame must not
-        // pull the base up and collapse the first video IDR to t=0.
-        if is_video {
-            self.base_pts_ns.get_or_insert(pts_ns);
-        }
-        let base = self.base_pts_ns.unwrap_or(pts_ns);
+        // Seed the global PTS origin from the FIRST frame of ANY kind, so a
+        // single fixed origin rebases every frame and the audio/video offset is
+        // preserved. Seeding on video ONLY meant each pre-video audio frame fell
+        // back to `base = unwrap_or(pts_ns)` — i.e. its OWN pts — collapsing every
+        // leading audio frame onto PTS 0 and destroying the spacing between them.
+        let base = *self.base_pts_ns.get_or_insert(pts_ns);
         let pts_ns = pts_ns.saturating_sub(base);
 
         // NAL video (HEVC/H.264): convert length-prefixed NALUs to Annex B and prepend
@@ -733,17 +733,40 @@ mod tests {
             | ((pts[4] >> 1) as u64)
     }
 
+    /// Decode the 33-bit PTS from every PTS-bearing PUSI packet on `pid`, in
+    /// order — one per single-PES access unit. Continuation PES (no PTS flag)
+    /// are skipped so only real per-frame timestamps are returned.
+    fn all_pts_90k(packets: &[TsPacket], pid: u16) -> Vec<u64> {
+        packets
+            .iter()
+            .filter(|p| p.pid == pid && p.pusi)
+            .filter(|p| p.payload.len() >= 14 && p.payload[7] & 0x80 != 0)
+            .map(|p| {
+                let pts = &p.payload[9..14];
+                ((((pts[0] >> 1) & 0x07) as u64) << 30)
+                    | ((pts[1] as u64) << 22)
+                    | (((pts[2] >> 1) as u64) << 15)
+                    | ((pts[3] as u64) << 7)
+                    | ((pts[4] >> 1) as u64)
+            })
+            .collect()
+    }
+
     #[test]
     fn av_offset_preserved_with_audio_before_first_video() {
-        // Audio at t=0 arrives before the first video keyframe at t=1s; the base
-        // must seed from video, not both collapsing to 0.
+        // Audio at t=0 arrives before the first video keyframe at t=1s. The FIRST
+        // frame of any kind fixes the origin, so the leading audio frame becomes
+        // the origin (PTS 0) and the video keyframe lands 1s = 90_000 ticks later.
+        // The 1s audio→video offset must survive. The OLD code seeded the origin
+        // from video only, so the pre-video audio fell back to its OWN pts and BOTH
+        // collapsed to 0, destroying the offset.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
-            // Audio frame first, at PTS 0.
+            // Audio frame first, at PTS 0 — this seeds the origin.
             mux.write_frame(1, 0, false, &[0x0B, 0x77, 0x00, 0x00])
                 .unwrap();
-            // Video keyframe at PTS 1s — seeds the base.
+            // Video keyframe at PTS 1s — 1s after the origin.
             let idr = fake_hevc_nal(19, 100);
             mux.write_frame(0, 1_000_000_000, true, &idr).unwrap();
             mux.finish().unwrap();
@@ -751,13 +774,15 @@ mod tests {
         let packets = parse_bd_ts(&sink);
         let video_pts = first_pts_90k(&packets, VIDEO_PID);
         let audio_pts = first_pts_90k(&packets, AUDIO_PID);
-        // Video keyframe is the base ⇒ its relative PTS is 0.
-        assert_eq!(video_pts, 0, "video keyframe seeds the base at t=0");
-        // Audio arrived 1s earlier ⇒ saturates to 0, NOT lifted past video.
-        assert_eq!(audio_pts, 0, "earlier audio saturates to 0");
-        assert!(
-            audio_pts <= video_pts,
-            "audio must not be pulled ahead of the video base"
+        // The leading audio frame is the origin ⇒ its relative PTS is 0.
+        assert_eq!(
+            audio_pts, 0,
+            "the first (audio) frame seeds the origin at 0"
+        );
+        // Video is 1s after the origin ⇒ the audio→video offset is preserved.
+        assert_eq!(
+            video_pts, 90_000,
+            "video 1s after the origin must stay 90_000 ticks ahead, not collapse to 0"
         );
     }
 
@@ -1068,42 +1093,53 @@ mod tests {
 
     #[test]
     fn negative_relative_pts_saturates_to_zero() {
-        // A frame earlier than the base (negative relative PTS) must encode
-        // PTS 0, never an underflowed huge value. Audio at t=0 before a
-        // video keyframe at t=2s: base=video, audio relative = -2s → 0.
+        // A frame earlier than the origin (negative relative PTS) must encode
+        // PTS 0, never an underflowed huge value. Video keyframe at t=2s seeds
+        // the origin; a later-written audio frame at t=0 is 2s BEFORE it → -2s,
+        // which must floor to 0.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
-            mux.write_frame(1, 0, false, &[0x0B, 0x77, 0x00, 0x00])
-                .unwrap();
             let idr = fake_hevc_nal(19, 50);
             mux.write_frame(0, 2_000_000_000, true, &idr).unwrap();
+            // Audio a full 2s before the origin — must saturate, not wrap.
+            mux.write_frame(1, 0, false, &[0x0B, 0x77, 0x00, 0x00])
+                .unwrap();
             mux.finish().unwrap();
         }
         let packets = parse_bd_ts(&sink);
         assert_eq!(
             first_pts_90k(&packets, AUDIO_PID),
             0,
-            "earlier audio saturates to 0"
+            "audio before the origin saturates to 0"
         );
     }
 
     #[test]
-    fn no_base_seeded_by_audio_only_stream() {
-        // Audio-only never seeds base_pts_ns; each frame rebases to itself via
-        // unwrap_or(pts_ns), proving audio can't corrupt later A/V offsets.
+    fn audio_only_stream_preserves_frame_spacing() {
+        // Regression: an audio-only stream (no video to seed the origin) must keep
+        // the spacing between its frames. The FIRST audio frame seeds the origin;
+        // later frames rebase on it. The OLD code seeded only on video, so EVERY
+        // audio-only frame fell back to `base = unwrap_or(pts_ns)` — its own pts —
+        // and flat-lined every frame onto PTS 0.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
-            // First audio frame at 5s.
             mux.write_frame(0, 5_000_000_000, false, &[0x01, 0x02])
+                .unwrap();
+            // Second frame 1s later — must land 90_000 ticks after the first.
+            mux.write_frame(0, 6_000_000_000, false, &[0x03, 0x04])
                 .unwrap();
             mux.finish().unwrap();
         }
         let packets = parse_bd_ts(&sink);
-        // With no video base, base = unwrap_or(pts_ns) = this frame's pts,
-        // so relative PTS is 0.
-        assert_eq!(first_pts_90k(&packets, AUDIO_PID), 0);
+        let pts = all_pts_90k(&packets, AUDIO_PID);
+        assert_eq!(pts.len(), 2, "two audio frames → two PTS-bearing PES");
+        assert_eq!(pts[0], 0, "the first audio frame is the origin → 0");
+        assert_eq!(
+            pts[1], 90_000,
+            "the second frame (1s later) must keep its 1s spacing, not collapse to 0"
+        );
     }
 
     #[test]

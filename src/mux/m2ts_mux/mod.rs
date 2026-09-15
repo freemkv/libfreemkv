@@ -232,7 +232,12 @@ impl<W: Write> M2tsMux<W> {
         if self.audio.is_none() {
             return Ok(());
         }
-        let pts_90k = self.base_relative_pts(pts_ns, /* may_seed_base */ false);
+        // Audio seeds the shared origin too. Seeding only on video meant a leading
+        // audio frame (audio before the first video) fell back to `base =
+        // unwrap_or(raw_90k)` — its OWN pts — collapsing every pre-video audio frame
+        // onto PTS 0 and losing the spacing between them. `get_or_insert` still lets
+        // the FIRST frame (audio or video) fix the origin, so nothing is pulled up.
+        let pts_90k = self.base_relative_pts(pts_ns, /* may_seed_base */ true);
         let pes = build_audio_pes(pts_90k, data);
         self.write_pes(PID_AUDIO, &pes, None, false)
     }
@@ -243,8 +248,9 @@ impl<W: Write> M2tsMux<W> {
         self.out.flush()
     }
 
-    // PTS (ns) -> 90 kHz ticks rebased on the stream origin, seeded ONLY by
-    // the first video frame. See docs/m2ts-mux.md#base_relative_pts.
+    // PTS (ns) -> 90 kHz ticks rebased on the stream origin, seeded by the FIRST
+    // frame of any kind (video or audio) when `may_seed_base`. See
+    // docs/m2ts-mux.md#base_relative_pts.
     fn base_relative_pts(&mut self, pts_ns: i64, may_seed_base: bool) -> u64 {
         let raw_90k = if pts_ns > 0 {
             // Widen to u128 so adversarial timestamps can't overflow the
@@ -1421,6 +1427,53 @@ mod tests {
             | ((pes[12] as u64) << 7)
             | ((pes[13] >> 1) as u64);
         assert_eq!(pts, 0, "negative pts_ns encodes PTS 0");
+    }
+
+    #[test]
+    fn pre_video_audio_frames_keep_their_spacing() {
+        // Two audio frames arrive before any video. The FIRST frame (audio) seeds
+        // the shared origin, so the second audio frame keeps its 1s offset. The OLD
+        // code seeded the origin only on video, so every pre-video audio frame fell
+        // back to `base = unwrap_or(raw_90k)` — its own pts — collapsing BOTH onto
+        // PTS 0 and losing the 1s spacing.
+        let decode_audio_pts = |pkt: &[u8]| -> u64 {
+            let afc = (pkt[3] >> 4) & 0x03;
+            let pes_start = if afc & 0b10 != 0 {
+                4 + 1 + pkt[4] as usize // adaptation field present (stuffing)
+            } else {
+                4
+            };
+            let pes = &pkt[pes_start..];
+            assert_eq!(&pes[0..3], &[0x00, 0x00, 0x01], "PES start code");
+            assert!(pes[7] & 0x80 != 0, "the PES header carries a PTS");
+            ((((pes[9] >> 1) & 0x07) as u64) << 30)
+                | ((pes[10] as u64) << 22)
+                | (((pes[11] >> 1) as u64) << 15)
+                | ((pes[12] as u64) << 7)
+                | ((pes[13] >> 1) as u64)
+        };
+
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = M2tsMux::new(&mut sink);
+            mux.set_audio(AudioCodec::Ac3);
+            mux.write_audio(0, &[0x0B, 0x77, 0x00, 0x00]).unwrap();
+            mux.write_audio(1_000_000_000, &[0x0B, 0x77, 0x00, 0x01])
+                .unwrap();
+            mux.finish().unwrap();
+        }
+        let pkts = find_all_pkts(&sink, PID_AUDIO, true);
+        assert_eq!(pkts.len(), 2, "one PUSI packet per small audio frame");
+        assert_eq!(
+            decode_audio_pts(pkts[0]),
+            0,
+            "the first (audio) frame seeds the origin → 0"
+        );
+        assert_eq!(
+            decode_audio_pts(pkts[1]),
+            90_000,
+            "the second audio frame (1s later) must keep its spacing, not collapse to 0"
+        );
     }
 
     // ── audio without configured track ────────────────────────────────────

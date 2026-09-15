@@ -34,6 +34,8 @@ const MAX_CODEC_PRIVATE: u64 = 16 * 1024 * 1024;
 const MAX_STRING_LEN: u64 = 64 * 1024;
 /// EBML unsigned-int elements are at most 8 bytes wide.
 const MAX_UINT_LEN: u64 = 8;
+/// EBML float elements are 4 or 8 bytes wide.
+const MAX_FLOAT_LEN: u64 = 8;
 
 /// Reject an untrusted element size that exceeds `cap` before it is used
 /// to allocate or read. Returns the size as `usize` when within bounds.
@@ -54,6 +56,13 @@ fn read_uint_bounded(r: &mut impl Read, size: u64) -> io::Result<u64> {
 /// Read a bounded UTF-8 string element.
 fn read_string_bounded(r: &mut impl Read, size: u64) -> io::Result<String> {
     ebml::read_string_val(r, checked_size(size, MAX_STRING_LEN)?)
+}
+
+/// Read a bounded EBML float element (4- or 8-byte), reusing the same
+/// `checked_size` cap as the uint/string readers instead of a raw `as usize`
+/// truncation of an untrusted element size.
+fn read_float_bounded(r: &mut impl Read, size: u64) -> io::Result<f64> {
+    ebml::read_float_val(r, checked_size(size, MAX_FLOAT_LEN)?)
 }
 
 use crate::disc::*;
@@ -939,10 +948,17 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
                     if cs == u64::MAX {
                         return Err(crate::error::Error::MkvSourceInvalid.into());
                     }
-                    remaining = remaining.saturating_sub(hlen as u64 + cs);
+                    // A child whose header+body exceeds bytes left in the parent is
+                    // malformed — reject rather than saturating `remaining` to 0
+                    // (mirrors the BLOCK_GROUP child-loop guard).
+                    let consumed = (hlen as u64).saturating_add(cs);
+                    if consumed > remaining {
+                        return Err(crate::error::Error::MkvSourceInvalid.into());
+                    }
+                    remaining -= consumed;
                     match cid {
                         ebml::TIMESTAMP_SCALE => ts_scale = read_uint_bounded(r, cs)?,
-                        ebml::DURATION => duration_ticks = ebml::read_float_val(r, cs as usize)?,
+                        ebml::DURATION => duration_ticks = read_float_bounded(r, cs)?,
                         ebml::TITLE => title = read_string_bounded(r, cs)?,
                         _ => {
                             skip_bytes(r, cs)?;
@@ -961,7 +977,13 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
                     if cs == u64::MAX {
                         return Err(crate::error::Error::MkvSourceInvalid.into());
                     }
-                    remaining = remaining.saturating_sub(hlen as u64 + cs);
+                    // Reject a child that overruns the TRACKS body rather than
+                    // saturating `remaining` to 0 (same guard as BLOCK_GROUP).
+                    let consumed = (hlen as u64).saturating_add(cs);
+                    if consumed > remaining {
+                        return Err(crate::error::Error::MkvSourceInvalid.into());
+                    }
+                    remaining -= consumed;
                     if cid == ebml::TRACK_ENTRY {
                         let (stream, tnum, cp, default_dur) = parse_track(r, cs)?;
                         if let Some(s) = stream {
@@ -1055,7 +1077,13 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         if cs == u64::MAX {
             return Err(crate::error::Error::MkvSourceInvalid.into());
         }
-        remaining = remaining.saturating_sub(hlen as u64 + cs);
+        // Reject a child that overruns the TrackEntry body rather than
+        // saturating `remaining` to 0 (same guard as BLOCK_GROUP).
+        let consumed = (hlen as u64).saturating_add(cs);
+        if consumed > remaining {
+            return Err(crate::error::Error::MkvSourceInvalid.into());
+        }
+        remaining -= consumed;
         match cid {
             ebml::TRACK_NUMBER => {
                 // Reject a TRACK_NUMBER above u16::MAX rather than truncating
@@ -1089,7 +1117,13 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
                     if vs == u64::MAX {
                         return Err(crate::error::Error::MkvSourceInvalid.into());
                     }
-                    vrem = vrem.saturating_sub(vhlen as u64 + vs);
+                    // Reject a child overrunning the Video body (same guard as
+                    // BLOCK_GROUP) rather than saturating `vrem` to 0.
+                    let consumed = (vhlen as u64).saturating_add(vs);
+                    if consumed > vrem {
+                        return Err(crate::error::Error::MkvSourceInvalid.into());
+                    }
+                    vrem -= consumed;
                     if vid == ebml::PIXEL_HEIGHT {
                         ph = read_uint_bounded(r, vs)? as u32;
                     } else {
@@ -1104,9 +1138,15 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
                     if as_ == u64::MAX {
                         return Err(crate::error::Error::MkvSourceInvalid.into());
                     }
-                    arem = arem.saturating_sub(ahlen as u64 + as_);
+                    // Reject a child overrunning the Audio body (same guard as
+                    // BLOCK_GROUP) rather than saturating `arem` to 0.
+                    let consumed = (ahlen as u64).saturating_add(as_);
+                    if consumed > arem {
+                        return Err(crate::error::Error::MkvSourceInvalid.into());
+                    }
+                    arem -= consumed;
                     match aid {
-                        ebml::SAMPLING_FREQUENCY => sr = ebml::read_float_val(r, as_ as usize)?,
+                        ebml::SAMPLING_FREQUENCY => sr = read_float_bounded(r, as_)?,
                         // Clamp instead of `as u8`: a CHANNELS value that's a multiple of
                         // 256 would truncate to 0 (invalid) on a bare cast; saturate to
                         // u8::MAX so an absurd count degrades to "many", never to 0.
@@ -2909,6 +2949,34 @@ mod tests {
 
         let stream = MkvStream::open(Cursor::new(out)).unwrap();
         assert_eq!(stream.info().duration_secs, 5.0);
+    }
+
+    #[test]
+    fn info_child_size_exceeding_remaining_is_rejected() {
+        // A crafted INFO whose sole child (TITLE) declares a 1000-byte body while
+        // the INFO parent is sized to just the child header: header+body overruns
+        // the parent's `remaining`. The old code saturated `remaining` to 0 and
+        // fell through to read the oversized child (an EOF/garbage read); the guard
+        // must instead reject it as MkvSourceInvalid.
+        let mut info = Vec::new();
+        ebml::write_id(&mut info, ebml::TITLE).unwrap();
+        ebml::write_size(&mut info, 1000).unwrap(); // declares 1000 bytes, provides none
+
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        // Parent INFO sized to ONLY the child header — its child then overruns it.
+        ebml::write_size(&mut out, info.len() as u64).unwrap();
+        out.extend_from_slice(&info);
+
+        let e = open_err(MkvStream::open(Cursor::new(out)));
+        assert!(
+            is_mkv_source_invalid(&e),
+            "a child body larger than the INFO parent's remaining must be rejected"
+        );
     }
 
     #[test]
