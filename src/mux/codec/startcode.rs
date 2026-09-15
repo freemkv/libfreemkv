@@ -63,7 +63,11 @@ impl<'a> BitReader<'a> {
         Some(b as u32)
     }
 
-    /// Read `n` bits, MSB-first, into the low bits of a `u32`.
+    /// Read `n` bits, MSB-first, into the low `n` bits of a `u32`. Returns
+    /// `None` if fewer than `n` bits remain (the same exhaustion contract as
+    /// [`read_bit`](Self::read_bit)), leaving the reader's position unspecified.
+    /// `n` must be `<= 32`; a larger `n` shifts the earliest bits out of the
+    /// `u32`, keeping only the last 32. `read_bits(0)` yields `Some(0)`.
     pub fn read_bits(&mut self, n: u32) -> Option<u32> {
         let mut v = 0u32;
         for _ in 0..n {

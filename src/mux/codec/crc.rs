@@ -44,24 +44,6 @@ pub(crate) fn crc16_mlp(data: &[u8]) -> u16 {
     crc
 }
 
-/// CRC-8/ATM (a.k.a. CRC-8/ITU without the final XOR): polynomial 0x07, init 0,
-/// MSB-first, no reflection — the FLAC frame-header CRC-8 (RFC 9639). Available
-/// as a primitive; the FLAC gate currently validates only the frame footer CRC-16.
-pub(crate) fn crc8_atm(data: &[u8]) -> u8 {
-    let mut crc: u8 = 0;
-    for &b in data {
-        crc ^= b;
-        for _ in 0..8 {
-            crc = if crc & 0x80 != 0 {
-                (crc << 1) ^ 0x07
-            } else {
-                crc << 1
-            };
-        }
-    }
-    crc
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,23 +87,5 @@ mod tests {
         framed.push((c >> 8) as u8);
         framed.push((c & 0xFF) as u8);
         assert_eq!(crc16_mlp(&framed), 0);
-    }
-
-    #[test]
-    fn crc8_residue_property_holds() {
-        // Appending the CRC-8 of a message zeroes the residue over message+crc —
-        // how FLAC's header CRC-8 is verified.
-        let msg = [0xDEu8, 0xAD, 0xBE, 0xEF];
-        let c = crc8_atm(&msg);
-        let mut framed = msg.to_vec();
-        framed.push(c);
-        assert_eq!(crc8_atm(&framed), 0);
-    }
-
-    #[test]
-    fn crc8_known_vector_check_byte() {
-        // CRC-8/SMBUS (poly 0x07, init 0, no reflection) check value for
-        // "123456789" is 0xF4 — the catalogue check value.
-        assert_eq!(crc8_atm(b"123456789"), 0xF4);
     }
 }

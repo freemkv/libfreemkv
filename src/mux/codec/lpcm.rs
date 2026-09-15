@@ -19,6 +19,11 @@ pub struct LpcmParser {
     /// `true` for BD-TS LPCM (header still present), `false` for DVD-PS LPCM
     /// (header already removed by `PsDemuxer`).
     strip_header: bool,
+    /// Last emitted PTS (ns). A PES with no PTS (legal for audio, e.g. a
+    /// post-discontinuity continuation) carries this forward rather than
+    /// resetting the timeline to 0 — matching the ADTS/FLAC/MPEG-audio parsers
+    /// and preserving A/V sync.
+    last_pts_ns: i64,
 }
 
 impl Default for LpcmParser {
@@ -30,7 +35,10 @@ impl Default for LpcmParser {
 impl LpcmParser {
     /// BD-TS LPCM parser: strips the 4-byte BD LPCM header from each PES.
     pub fn new() -> Self {
-        Self { strip_header: true }
+        Self {
+            strip_header: true,
+            last_pts_ns: 0,
+        }
     }
 
     /// DVD-PS LPCM parser: `PsDemuxer` already stripped the private sub-header,
@@ -38,6 +46,7 @@ impl LpcmParser {
     pub fn new_dvd() -> Self {
         Self {
             strip_header: false,
+            last_pts_ns: 0,
         }
     }
 }
@@ -53,9 +62,14 @@ impl CodecParser for LpcmParser {
         if pes.data.len() <= offset {
             return Vec::new();
         }
-        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
+        let pts_ns = pes
+            .pts
+            .or(pes.dts)
+            .map(pts_to_ns)
+            .unwrap_or(self.last_pts_ns);
+        self.last_pts_ns = pts_ns;
         vec![Frame {
-            discontinuity: false,
+            discontinuity: pes.discontinuity,
             coding: None,
             source: super::pesbuf::PesFacts::of(pes).source,
             pts_ns,
@@ -259,6 +273,35 @@ mod tests {
         let mut parser = LpcmParser::new_dvd();
         let f = parser.parse(&make_pes(vec![0xAA, 0xBB], None));
         assert_eq!(f[0].pts_ns, 0);
+    }
+
+    #[test]
+    fn pts_less_pes_carries_last_timestamp_and_propagates_discontinuity() {
+        // A PES with no PTS (legal for audio, e.g. after a discontinuity) must
+        // carry the last known timestamp forward — resetting to 0 would corrupt
+        // A/V sync — and the emitted unit must reflect the PES discontinuity
+        // flag rather than a hardcoded false. Mirrors the adts/flac guards.
+        let mut parser = LpcmParser::new();
+        let header = vec![0x00, 0x01, 0x00, 0b1001_0001];
+        let pcm = vec![0x11, 0x22, 0x33, 0x44];
+        let mut data = header;
+        data.extend_from_slice(&pcm);
+        // Prime last_pts_ns with a real timestamp.
+        parser.parse(&make_pes(data.clone(), Some(90_000)));
+
+        // Next PES has no PTS and is flagged discontinuous.
+        let mut pes = make_pes(data, None);
+        pes.discontinuity = true;
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].pts_ns, 1_000_000_000,
+            "carried forward, not reset to 0"
+        );
+        assert!(
+            frames[0].discontinuity,
+            "PES discontinuity propagates into the access unit"
+        );
     }
 
     // The text-based guard in codec/mod.rs can't see writes via `facts.source`;

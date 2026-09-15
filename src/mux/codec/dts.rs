@@ -373,9 +373,14 @@ impl DtsParser {
             self.acc.clear();
             return Vec::new();
         }
+        // A trailing core sync at EOS opens a NEW access unit whose frame never
+        // completed — a complete next core would have closed this AU during
+        // parse(), so anything left here is truncated. Drop it rather than
+        // splicing it onto the final AU; real trailing extensions are kept.
+        let emit_end = final_au_end(self.acc.as_slice(), core_size);
         // The final AU's PTS is the PES covering the buffer front (its core's
         // PES). Fall back to pending_pts, clamping the sentinel to 0.
-        let au = self.acc.as_slice().to_vec();
+        let au = self.acc.as_slice()[..emit_end].to_vec();
         let dur_ns = dts_core_duration_ns(&au) as i64;
         let pts_ns = self.stamp_pts(self.front_pts(), dur_ns);
         let src = self.front_source();
@@ -383,6 +388,38 @@ impl DtsParser {
         let mut out = Vec::new();
         self.emit_or_drop(au, pts_ns, dur_ns, src, &mut out);
         out
+    }
+}
+
+// Offset where the FINAL access unit ends at end-of-stream, dropping a
+// truncated trailing core. Trailing DTS-HD extension substreams belong to this
+// AU and are skipped precisely (kept); a trailing CORE sync — complete or
+// truncated — begins a NEW AU that never closed during `parse()`, so the AU
+// ends there. A tail too short to identify, or non-sync garbage, is kept with
+// the AU. See docs/dts.md.
+fn final_au_end(buf: &[u8], core_size: usize) -> usize {
+    let mut pos = core_size;
+    loop {
+        if buf.len().saturating_sub(pos) < SYNCWORD_BYTES {
+            // Fewer than a syncword of trailing bytes: nothing identifiable —
+            // keep them with this AU (the same 3-byte-tail tolerance as parse).
+            return buf.len();
+        }
+        if buf[pos..].starts_with(&DTS_HD_EXT_SYNC) {
+            match exss_frame_size(&buf[pos..]) {
+                // A fully-buffered extension substream belongs to this AU.
+                Some(sz) if sz >= SYNCWORD_BYTES && buf.len() >= pos + sz => pos += sz,
+                // Truncated/unsizeable extension at EOS: still part of this AU.
+                _ => return buf.len(),
+            }
+        } else if buf[pos..].starts_with(&DTS_CORE_SYNC) {
+            // A trailing core (truncated — a complete one would have closed the
+            // AU during parse) is a new AU that never completed: drop it.
+            return pos;
+        } else {
+            // Non-sync garbage after the core is not a further AU; keep it.
+            return buf.len();
+        }
     }
 }
 
@@ -919,6 +956,33 @@ mod tests {
         let tail = parser.flush();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].data.len(), 512);
+    }
+
+    #[test]
+    fn truncated_trailing_core_is_dropped_at_eos() {
+        // A complete core is held awaiting a next core, but the stream cuts off
+        // mid-way into that next core (only its sync + a couple bytes arrived —
+        // too few to size, so it's held, not emitted, during parse). At EOS the
+        // truncated trailing core must be DROPPED, not spliced onto the final
+        // AU: the emitted unit is exactly the complete 512-byte core.
+        let mut parser = DtsParser::new();
+        let mut stream = make_dts_core(512);
+        // Truncated trailing core: sync + 2 bytes (< CORE_HEADER_MIN_BYTES).
+        stream.extend_from_slice(&DTS_CORE_SYNC);
+        stream.extend_from_slice(&[0x00, 0x00]);
+
+        assert!(
+            parser.parse(&make_pes(stream, Some(90000))).is_empty(),
+            "core held awaiting next core; truncated tail cannot close it"
+        );
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1, "exactly the one complete AU is emitted");
+        assert_eq!(
+            tail[0].data.len(),
+            512,
+            "the truncated trailing core is dropped, not appended to the AU"
+        );
+        assert_eq!(&tail[0].data[0..4], &DTS_CORE_SYNC);
     }
 
     #[test]
