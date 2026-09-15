@@ -154,7 +154,11 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
         // UO_mask_table(8) + misc flags(1) + still_mode(1) + still_time(2), then
         // STN_table starting at STN_OFFSET.
         const STN_OFFSET: usize = 32;
-        if item_idx == 0 && item.len() > STN_OFFSET + 16 {
+        // `>=`, not `>`: the 16-byte STN header spans item[STN_OFFSET..STN_OFFSET+16],
+        // so item.len() == STN_OFFSET + 16 already holds every header byte. The
+        // strict `>` demanded one extra byte and skipped a play item whose STN
+        // header ends exactly at the item boundary (a stream-less STN table).
+        if item_idx == 0 && item.len() >= STN_OFFSET + 16 {
             // STN header: length(2) + reserved(2) + counts(8) + reserved(4) = 16 bytes
             let n_video = item[STN_OFFSET + 4] as usize;
             let n_audio = item[STN_OFFSET + 5] as usize;
@@ -733,6 +737,22 @@ mod tests {
         assert_eq!(s.coding_type, 0x90); // PGS
         assert_eq!(s.language, "fra");
         assert!(!s.secondary);
+    }
+
+    // The STN gate is inclusive of the boundary: a first play item whose STN
+    // table is JUST the 16-byte header (no stream entries) has item.len() ==
+    // STN_OFFSET(32) + 16 == 48 exactly, and must be parsed, not skipped by a
+    // strict `>` that demands one extra byte.
+    #[test]
+    fn stn_header_ending_exactly_at_the_item_boundary_is_parsed() {
+        let data = build_mpls(&[(b"00001", 1, 0, 9000000)], (0, 0, 0, 0, 0, 0, 0, 0), &[]);
+        // The first play item is exactly the header length (32 + 16).
+        let playlist = parse(&data).expect("a boundary-length STN header must parse");
+        assert_eq!(playlist.play_items.len(), 1);
+        assert!(
+            playlist.streams.is_empty(),
+            "no stream entries were declared at the boundary"
+        );
     }
 
     #[test]
