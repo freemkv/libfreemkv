@@ -388,6 +388,15 @@ pub(crate) const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
 /// structural/nav `stream_id`s at offset 0x11 (`0xBB`/`0xBE`/`0xBF`) that CSS
 /// never scrambles, so a decrypted HD-DVD's RDI nav packs can't falsely trip
 /// it. See docs/css-mod.md — `is_scrambled_pack`.
+///
+/// NOTE: the `stream_id` sits at 0x11 only when the pack header carries ZERO
+/// stuffing bytes (14-byte pack header, then `00 00 01 <stream_id>`); the low
+/// 3 bits of byte 0x0D are `pack_stuffing_length` and would shift it right by
+/// that many bytes. DVD-Video VOB packs are authored with no pack stuffing, so
+/// 0x11 is correct for the sectors this gate ever sees. A stuffed pack would
+/// read a 0xFF stuffing byte here — which is not one of the excluded nav ids,
+/// so the exclusion simply doesn't fire (the safe direction: the 0x14 scramble
+/// bits, still the real gate, decide it).
 pub fn is_scrambled_pack(sector: &[u8]) -> bool {
     use crate::consts::pes_stream_id::{PADDING_STREAM, PRIVATE_STREAM_2, SYSTEM_HEADER};
     sector.len() >= 2048

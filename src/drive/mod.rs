@@ -305,6 +305,11 @@ impl Drive {
                     return Ok(());
                 }
                 Err(Error::Halted) => return Err(Error::Halted),
+                // A dead bus (transport failure / disconnected drive) will never
+                // spin up — surface it immediately instead of polling a phantom
+                // for the full 30 s. A plain not-ready TUR failure falls through
+                // and keeps the loop going.
+                Err(e) if e.is_scsi_transport_failure() => return Err(e),
                 Err(_) => {}
             }
             // Halt-aware backoff: the flag can also flip DURING the 500 ms
@@ -2485,6 +2490,39 @@ mod command_tests {
         assert!(
             matches!(r, Err(Error::DeviceNotReady { .. })),
             "a drive that never answers TUR successfully must be DeviceNotReady, got {r:?}"
+        );
+    }
+
+    // A dead bus (transport failure) will never spin up, so wait_ready must
+    // surface it AT ONCE rather than poll a phantom for the full ~30 s.
+    #[test]
+    fn wait_ready_breaks_immediately_on_a_dead_bus() {
+        struct DeadBus;
+        impl ScsiTransport for DeadBus {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                Err(Error::ScsiError {
+                    opcode: cdb[0],
+                    status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                    sense: None,
+                })
+            }
+        }
+        let mut d = Drive::from_transport_for_test(Box::new(DeadBus));
+        let t0 = std::time::Instant::now();
+        let r = d.wait_ready();
+        assert!(
+            matches!(&r, Err(e) if e.is_scsi_transport_failure()),
+            "a dead bus must surface the transport failure, not DeviceNotReady: {r:?}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "a dead bus must break out at once, not run the ~30 s poll"
         );
     }
 
