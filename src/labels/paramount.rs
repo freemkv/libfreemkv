@@ -40,26 +40,29 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         return None;
     }
 
-    // Surface the feature playlist's identity so title selection can prefer
-    // it over a size-inflated decoy. The id is 5-digit zero-padded on BD
-    // (matching `NNNNN.mpls`); keep only digits to resist a stray quote/space.
-    let feature_playlist = super::xml::attr(&feature, "id").and_then(|id| {
-        let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            return None;
-        }
-        Some(super::FeaturePlaylistHint {
-            playlist_id: digits.parse::<u16>().ok(),
-            filename: Some(format!("{digits}.mpls")),
-        })
-    });
-
     // High confidence: this format is fully structured and we extract
     // every field whose meaning the corpus establishes. "Documented" would
     // be the wrong word — see the module note; nothing about it is.
     let mut result = ParseResult::high(labels);
-    result.feature_playlist = feature_playlist;
+    result.feature_playlist = feature_hint(&feature);
     Some(result)
+}
+
+// The feature playlist hint for a `playlists.xml` `<playlist>` element. Surface
+// its identity so title selection can prefer it over a size-inflated decoy.
+// Derive the numeric id and the filename from ONE parsed number so they cannot
+// disagree: keep only the digits (resisting a stray quote/space), require a
+// valid u16 playlist number, and format the canonical 5-digit `NNNNN.mpls`.
+// (`format!("{digits}.mpls")` on a 5-digit id above u16::MAX left playlist_id
+// None while the filename stayed Some — a half-hint.)
+fn feature_hint(feature: &str) -> Option<super::FeaturePlaylistHint> {
+    let id = super::xml::attr(feature, "id")?;
+    let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+    let playlist_id = digits.parse::<u16>().ok()?;
+    Some(super::FeaturePlaylistHint {
+        playlist_id: Some(playlist_id),
+        filename: Some(format!("{playlist_id:05}.mpls")),
+    })
 }
 
 // One cell of the `forced_sub` CSV. Reads like a boolean but is an
@@ -714,6 +717,22 @@ mod tests {
     fn find_feature_returns_none_on_empty_xml() {
         assert!(find_feature_playlist("").is_none());
         assert!(find_feature_playlist("<root />").is_none());
+    }
+
+    // The feature hint's id and filename are derived from ONE parsed number, so
+    // they always name the same playlist (canonical 5-digit NNNNN.mpls), and a
+    // playlist with no numeric id yields no hint rather than a half-hint.
+    #[test]
+    fn feature_hint_id_and_filename_agree() {
+        let feature = r#"<playlist name="Feature" id="00222" duration="7000" />"#;
+        let h = feature_hint(feature).expect("a numeric id yields a hint");
+        assert_eq!(h.playlist_id, Some(222));
+        assert_eq!(h.filename.as_deref(), Some("00222.mpls"));
+        assert!(h.matches(222, "00222.mpls"), "the two fields agree");
+
+        // No id / non-numeric id → no hint (not a filename-only half-hint).
+        assert!(feature_hint(r#"<playlist name="Feature" />"#).is_none());
+        assert!(feature_hint(r#"<playlist id="menu" />"#).is_none());
     }
 
     // Spec: on a tie in audio-slot count, the FIRST playlist wins (see

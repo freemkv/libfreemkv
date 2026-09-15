@@ -880,4 +880,28 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // The nesting cap (`MAX_DEPTH`) refuses a tree deeper than the planner
+    // represents, before it recurses without bound. Executes `walk`'s depth
+    // guard on a real directory chain, not the constant.
+    #[test]
+    fn the_nesting_cap_refuses_a_tree_deeper_than_max_depth() {
+        let base = std::env::temp_dir().join(format!("fmkv-depth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // MAX_DEPTH + 2 nested levels below the root guarantees a `walk` call at
+        // a depth greater than MAX_DEPTH.
+        let mut deep = base.clone();
+        for _ in 0..(MAX_DEPTH as usize + 2) {
+            deep = deep.join("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let err = plan(&base).expect_err("a tree deeper than the nesting cap must be refused");
+        assert!(
+            matches!(err, Error::DirImageTooLarge),
+            "expected DirImageTooLarge, got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
