@@ -470,11 +470,17 @@ mod tests {
         vm.set(0, 6, true, 7, 0); // div → 150/7 = 21
         assert_eq!(vm.gprm[0], 21);
         vm.set(0, 6, true, 0, 0); // ÷0 → unchanged
-        assert_eq!(vm.gprm[0], 21, "divide by zero must leave the register intact");
+        assert_eq!(
+            vm.gprm[0], 21,
+            "divide by zero must leave the register intact"
+        );
         vm.set(0, 7, true, 5, 0); // mod → 21 % 5 = 1
         assert_eq!(vm.gprm[0], 1);
         vm.set(0, 7, true, 0, 0); // mod 0 → unchanged
-        assert_eq!(vm.gprm[0], 1, "modulo by zero must leave the register intact");
+        assert_eq!(
+            vm.gprm[0], 1,
+            "modulo by zero must leave the register intact"
+        );
 
         vm.set(2, 1, true, 0b1100, 0);
         vm.set(2, 9, true, 0b1010, 0); // and → 0b1000
