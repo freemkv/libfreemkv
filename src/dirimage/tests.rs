@@ -203,18 +203,36 @@ fn a_file_past_the_ad_ceiling_reads_back_as_multiple_extents() {
     );
 }
 
-/// Reads outside any planned extent are zeros, not errors — a real image has
-/// unrecorded sectors too, and `read_filesystem` probes fixed LBAs (256, the
-/// VDS window) before it knows what is there.
+/// An IN-RANGE gap (a sector below capacity that no extent covers) reads as
+/// zeros, not an error — a real image has unrecorded sectors too, and
+/// `read_filesystem` probes fixed LBAs (256, the VDS window) before it knows
+/// what is there. But a read AT OR BEYOND the image's own capacity is out of
+/// range: a real file/ISO source errors there, so DirImage must too rather than
+/// fabricate zeros and let an oversized offset fill an output with nothing.
 #[test]
-fn gaps_and_out_of_range_reads_are_zero_filled() {
+fn an_in_range_gap_reads_zeros_but_a_past_capacity_read_errors() {
     let (s, _, _) = bdmv_scratch();
     let mut img = DirImage::open(s.path()).unwrap();
     let cap = img.capacity_sectors();
+
+    // In-range gap: sector 200 sits below the data floor and covers no file.
+    let mut buf = [0xAAu8; SECTOR];
+    let n = img.read_sectors(200, 1, &mut buf, false).unwrap();
+    assert_eq!(n, SECTOR);
+    assert!(buf.iter().all(|&b| b == 0), "an in-range gap reads as zeros");
+
+    // A read that BEGINS past the image's capacity is refused, not zero-filled.
     let mut buf = [0xAAu8; SECTOR * 2];
-    let n = img.read_sectors(cap + 10, 2, &mut buf, false).unwrap();
-    assert_eq!(n, SECTOR * 2);
-    assert!(buf.iter().all(|&b| b == 0));
+    assert!(
+        img.read_sectors(cap + 10, 2, &mut buf, false).is_err(),
+        "a read that begins past capacity must be refused, not fabricated"
+    );
+
+    // A read that STARTS in range but overshoots the end still succeeds, tail
+    // zero-padded — the mux's final batch and the FS scan both rely on that.
+    let mut buf = vec![0xAAu8; SECTOR * 4];
+    let n = img.read_sectors(cap - 1, 4, &mut buf, false).unwrap();
+    assert_eq!(n, SECTOR * 4, "an in-range start may overshoot and zero-pad");
 }
 
 /// Two runs over the same unchanged folder must produce the same image, byte
