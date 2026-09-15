@@ -149,6 +149,12 @@ fn recover_title_key_from_plain(
 /// `plain` is the expected plaintext at byte 0x80 (at least 10 bytes).
 /// Returns the recovered key only if it actually descrambles the sector back
 /// to `plain` — guarding against the rare spurious LFSR-seed match.
+///
+/// TEST-ONLY: the production crack path uses [`crack_title_key`], which derives
+/// its own crib. `recover_title_key` is a known-plaintext helper exercised only
+/// by this module's unit tests and `tests/crypto_tests.rs`. It stays `pub` so
+/// that integration test (a separate crate linking the non-`cfg(test)` build)
+/// can reach it — do NOT gate it behind `#[cfg(test)]`, which would break it.
 pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
     if sector.len() < SECTOR_BYTES || plain.len() < 10 {
         return None;
