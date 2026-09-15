@@ -4508,6 +4508,34 @@ mod tests {
     }
 
     #[test]
+    fn read_directory_reads_a_long_ad_directorys_extent() {
+        // ICB Tag flags = 1 selects long_ad (16 bytes): extent_length(4) +
+        // extent_location{ lba(4) + part_ref(2) } + impl_use(6). The LBA is at
+        // offset 4 (like short_ad), NOT offset 12 like extended_ad — reading the
+        // wrong offset walks an empty sector and the directory comes back empty.
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "", 5, true, true, 0);
+        push_fid_iu(&mut fids, "INDEX.BDMV", 7, false, false, 0);
+        let mut dir = [0u8; 2048];
+        dir[..fids.len()].copy_from_slice(&fids);
+
+        let mut long_ad = [0u8; 16];
+        long_ad[0..4].copy_from_slice(&(fids.len() as u32).to_le_bytes()); // extent_length
+        long_ad[4..8].copy_from_slice(&60u32.to_le_bytes()); // extent_location lba
+        // long_ad[8..10] = partition_ref, long_ad[10..16] = implementation_use (0).
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_flagged(1, &long_ad));
+        reader.put(60, dir);
+        reader.put(7, build_efe_icb(1024, 1024, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("a long_ad directory must be readable");
+        assert_eq!(child_names(&parsed), vec!["INDEX.BDMV".to_string()]);
+        assert_eq!(parsed.size, fids.len() as u64);
+    }
+
+    #[test]
     fn read_directory_masks_the_extent_type_bits_out_of_the_ad_length() {
         // ECMA-167 4/14.14.1.1: a short_ad's head 32-bit field is a 30-bit length plus a 2-bit
         // extent TYPE (bits 30..31), which must be masked off before use as a byte count;
