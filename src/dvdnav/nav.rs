@@ -447,6 +447,69 @@ mod tests {
     // ── Executor: convergence to a title ────────────────────────────────────
 
     /// Unconditional-dispatch shape: First-Play is an unconditional `JumpTT 1`,
+    // Vm::set arithmetic/logic ops, including the ÷0 and mod-0 guards: a divide
+    // or modulo by zero must leave the register INTACT (checked_div/rem → cur),
+    // never panic, and an unmodelled op must be a no-op.
+    #[test]
+    fn set_ops_including_divide_and_mod_by_zero_leave_the_register_intact() {
+        let mut vm = Vm::new();
+        vm.set(0, 1, true, 42, 0); // mov
+        assert_eq!(vm.gprm[0], 42);
+        vm.set(0, 3, true, 10, 0); // add → 52
+        assert_eq!(vm.gprm[0], 52);
+        vm.set(0, 4, true, 2, 0); // sub → 50
+        assert_eq!(vm.gprm[0], 50);
+        vm.set(0, 5, true, 3, 0); // mul → 150
+        assert_eq!(vm.gprm[0], 150);
+
+        // mul wraps (u16), never panics.
+        vm.set(1, 1, true, 0xFFFF, 0);
+        vm.set(1, 5, true, 2, 0);
+        assert_eq!(vm.gprm[1], 0xFFFE, "0xFFFF * 2 wraps in u16");
+
+        vm.set(0, 6, true, 7, 0); // div → 150/7 = 21
+        assert_eq!(vm.gprm[0], 21);
+        vm.set(0, 6, true, 0, 0); // ÷0 → unchanged
+        assert_eq!(vm.gprm[0], 21, "divide by zero must leave the register intact");
+        vm.set(0, 7, true, 5, 0); // mod → 21 % 5 = 1
+        assert_eq!(vm.gprm[0], 1);
+        vm.set(0, 7, true, 0, 0); // mod 0 → unchanged
+        assert_eq!(vm.gprm[0], 1, "modulo by zero must leave the register intact");
+
+        vm.set(2, 1, true, 0b1100, 0);
+        vm.set(2, 9, true, 0b1010, 0); // and → 0b1000
+        assert_eq!(vm.gprm[2], 0b1000);
+        vm.set(2, 10, true, 0b0011, 0); // or → 0b1011
+        assert_eq!(vm.gprm[2], 0b1011);
+        vm.set(2, 11, true, 0b1111, 0); // xor → 0b0100
+        assert_eq!(vm.gprm[2], 0b0100);
+
+        // An unmodelled op (swap/rnd/…) leaves the register intact.
+        vm.set(2, 13, true, 99, 0);
+        assert_eq!(vm.gprm[2], 0b0100, "an unmodelled set op is a no-op");
+    }
+
+    // A SetSystem (SPRM write, type 2) in the First-Play list is a no-op FOR
+    // RESOLUTION: it must keep executing, not abort, so a following JumpTT still
+    // resolves. `40..` = type 2, zero compare nibble → unconditional.
+    #[test]
+    fn first_play_setsystem_is_a_noop_and_resolution_continues() {
+        let vmgi = build_vmgi(
+            &[h("4000000000000000"), h("3002000000010000")],
+            1,
+            &[(2, 1), (3, 1)],
+        );
+        assert_eq!(
+            resolve_from_vmg(&vmgi),
+            Some(ResolvedTitle {
+                title: 1,
+                vtsn: 2,
+                vts_ttn: 1
+            }),
+            "a SetSystem must not abort First-Play resolution"
+        );
+    }
+
     /// and TT_SRPT maps title 1 to the feature title set (here VTS_02, title 1).
     /// The resolver must return that title.
     #[test]
