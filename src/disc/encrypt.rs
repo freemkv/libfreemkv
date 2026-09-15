@@ -103,7 +103,10 @@ impl AacsCertUnlocker<'_> {
         // `session` across `scsi_mut()` + `&drive_id`, so clone the cheap identity.
         let drive_id = session.drive_id.clone();
         let fu_certs = crate::unlock_bridge::map_host_certs(&host_certs);
-        let (matched, unlock_res) = crate::unlock_bridge::run_bus(
+        // `matched` (the unlocker name) is intentionally unused: on this disc-keyed
+        // cert route it is only ever "AACS"/"DVD"/"", never a drive unlock — see the
+        // `drive_unlocked: false` note below.
+        let (_matched, unlock_res) = crate::unlock_bridge::run_bus(
             session.scsi_mut(),
             &drive_id,
             freemkv_unlock::DiscKind::Aacs,
@@ -127,13 +130,15 @@ impl AacsCertUnlocker<'_> {
             // AACS-specific "why the read_data_key read failed" diagnostic does
             // not cross the seam. The bus-key gate keys off presence, not cause.
             read_data_key_err: None,
-            // Derive from WHICH unlocker claimed the drive rather than hardcoding
-            // false: the disc-keyed cert route normally removes bus encryption via
-            // the read_data_key (AKE), so the gate credits it through
-            // `read_data_key.is_some()`. But if a firmware/drive unlocker in the
-            // dispatch set is what matched, the drive is already unlocked and the
-            // gate must credit that instead — the field now tracks reality.
-            drive_unlocked: crate::unlock_bridge::is_drive_unlocker(matched),
+            // Always false on the cert route: `run_bus` dispatches ONLY the disc-
+            // keyed unlockers (`disc_unlockers` = AACS, DVD), so `matched` is only
+            // ever "AACS"/"DVD"/"" — never a firmware/drive unlocker (freemkv, LD,
+            // Renesas). The disc-keyed cert route removes bus encryption via the
+            // read_data_key (AKE), which the gate credits through
+            // `read_data_key.is_some()`. A genuine DRIVE unlock cannot surface here;
+            // it arrives via the OEM-VID short-circuit in `do_handshake_cert`, which
+            // sets `drive_unlocked: true` for exactly that (rdk-less) case.
+            drive_unlocked: false,
         })
     }
 }
@@ -832,6 +837,42 @@ mod tests {
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).expect("bus key present → ok");
         assert!(st.bus_encryption);
         assert_eq!(st.read_data_key, Some([0x22u8; 16]));
+    }
+
+    /// Finding: `is_drive_unlocker(matched)` on the cert route was provably always
+    /// false — `run_bus` dispatches ONLY the disc-keyed AACS/DVD unlockers, never a
+    /// firmware/drive unlocker — so a cert handshake's `drive_unlocked` is always
+    /// false and bus removal there is credited solely via `read_data_key`. The
+    /// GENUINE drive-unlock case (drive_unlocked:true, NO read_data_key) is the
+    /// OEM/VID-only path, and the bus-key gate MUST credit it rather than
+    /// hard-error `AacsBusKeyUnavailable`.
+    #[test]
+    fn drive_unlock_without_read_data_key_removes_bus_encryption() {
+        // The cert route can never observe a firmware/drive unlocker: the only names
+        // `run_bus` can return ("AACS"/"DVD"/"") classify as NOT a drive unlock, so
+        // the replaced `is_drive_unlocker(matched)` was always false.
+        for name in ["AACS", "DVD", ""] {
+            assert!(
+                !crate::unlock_bridge::is_drive_unlocker(name),
+                "the disc-keyed cert route can never credit a drive unlock ({name:?})"
+            );
+        }
+        // The real case: a bus-encrypted disc unlocked AT THE DRIVE (drive_unlocked)
+        // with no cert read_data_key must resolve OK, not AacsBusKeyUnavailable.
+        let (mut disc, udf) = disc_with_cert(0x01, true);
+        let hs = HandshakeResult {
+            volume_id: [0x11u8; 16],
+            read_data_key: None,
+            read_data_key_err: None,
+            drive_unlocked: true,
+        };
+        let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs))
+            .expect("a drive-unlocked disc removes bus encryption even without a read_data_key");
+        assert!(st.bus_encryption);
+        assert_eq!(
+            st.read_data_key, None,
+            "the drive-unlock path carries no read_data_key"
+        );
     }
 
     /// ISO scan (handshake None) of a bus_encryption disc → Ok. Bus encryption

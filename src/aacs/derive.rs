@@ -306,7 +306,11 @@ pub(crate) fn resolve_dk_node(
     uv: u32,
     u_mask_shift: u8,
 ) -> Option<DeviceKey> {
-    for b in 0..u_mask_shift {
+    // `u_mask_shift` is a disc/keydb-controlled u8: bit positions 32..=255 do not
+    // exist in a u32, and `1u32 << b` with b >= 32 panics (debug) / wraps (release).
+    // Cap the search at the 32 real bit positions — same >= 32 guard the mask shifts
+    // above use — so a bad disc can never trip the shift.
+    for b in 0..u_mask_shift.min(32) {
         let dk = DeviceKey {
             key: *key,
             node: ((uv ^ (1u32 << b)) & 0xFFFF) as u16,
@@ -908,6 +912,18 @@ mod position_recovery_tests {
             "a node equal to uv under v_mask does not gate — the walk would \
              skip the slot entirely"
         );
+    }
+
+    // `u_mask_shift` is a disc/keydb-controlled u8; a value >= 32 would drive
+    // `1u32 << b` past a u32's width and panic (debug) / wrap (release). The `.min(32)`
+    // guard must bound the search so a hostile disc can never trip the shift.
+    #[test]
+    fn resolve_dk_node_does_not_shift_past_u32_on_a_huge_u_mask_shift() {
+        // Empty MKB → the inner derive returns None every iteration, so the loop runs
+        // its full range; with u_mask_shift = 200 the unguarded loop panics at b = 32.
+        let dk = resolve_dk_node(&[], &[0u8; 16], 0, 200)
+            .expect("must fall back to the node itself, not panic on the shift");
+        assert_eq!(dk.u_mask_shift, 200);
     }
 
     // probe::mkb_mk_dv feeds km_verifies for reproduction harnesses; a fixed
