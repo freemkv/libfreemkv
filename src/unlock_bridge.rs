@@ -154,6 +154,13 @@ fn disc_unlockers(host_certs: Vec<fu::HostCert>) -> Vec<Box<dyn fu::Unlocker>> {
 // Whether `name` (a matched unlocker's `.name()`) is a firmware/drive unlocker,
 // i.e. one whose success means bus encryption is already removed at the drive.
 // Derived from the real unlocker set, never a hardcoded name list.
+//
+// Test-only: the disc-keyed cert route (`run_bus`) can only ever match the disc
+// unlockers (AACS/DVD), so no production path classifies a `matched` name through
+// here — the AACS cert handshake credits bus removal via its `read_data_key`, and a
+// genuine firmware drive-unlock is surfaced separately by the OEM-VID short-circuit.
+// Retained so the disjointness invariant stays under test.
+#[cfg(test)]
 pub(crate) fn is_drive_unlocker(name: &str) -> bool {
     firmware_unlockers().iter().any(|u| u.name() == name)
 }

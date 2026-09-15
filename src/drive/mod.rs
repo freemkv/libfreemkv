@@ -541,9 +541,11 @@ impl Drive {
         r
     }
 
-    /// Probe disc surface so the drive firmware learns optimal read speeds
-    /// per region. After this the host reads at max speed and the drive
-    /// manages zones internally.
+    /// No-op retained for API stability. Disc-speed calibration is now
+    /// unlocker-specific and runs inside the unlocker's `unlock()` at `init()`
+    /// (for every disc, including DVD), so there is nothing to do here — this
+    /// only emits the begin/end trace span. Kept so existing callers and the
+    /// `probe_disc_without_unlocker_is_ok_noop` test need not change.
     pub fn probe_disc(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "probe_disc", "begin");
@@ -1026,10 +1028,21 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 0];
-        let _ =
+        // Best-effort (the tray-unlock is advisory), but a failure is worth a warn!
+        // rather than a silent `let _`: a stuck PREVENT lock is a real symptom the
+        // operator otherwise never sees until the tray won't open.
+        if let Err(e) =
             self.scsi
                 .as_mut()
-                .execute(&allow, crate::scsi::DataDirection::None, &mut buf, 5_000);
+                .execute(&allow, crate::scsi::DataDirection::None, &mut buf, 5_000)
+        {
+            tracing::warn!(
+                target: "freemkv::drive",
+                phase = "unlock_tray",
+                error_code = e.code(),
+                "Failed to clear the medium-removal PREVENT lock; the tray may stay locked until the drive is power-cycled."
+            );
+        }
     }
 
     /// Eject the disc tray. Unlocks first, then ejects.
