@@ -1607,22 +1607,79 @@ impl Disc {
     /// Read UDF filesystem and set up buffered reader with metadata prefetched.
     /// Shared setup for both identify() and scan().
     fn read_udf(session: &mut Drive) -> Result<(u32, udf::BufferedSectorReader<'_>, udf::UdfFs)> {
-        let capacity = Self::read_capacity(session).unwrap_or_else(|e| {
-            // A READ CAPACITY failure must not be silently treated as a 0-sector
-            // disc: capacity=0 skews the layer heuristic (always 1 layer) and
-            // title ordering. Recovery is unchanged, but surface it.
-            tracing::warn!(
-                target: "freemkv::scan",
-                error = %e,
-                "READ CAPACITY failed; treating disc capacity as 0 sectors (layer count and title ordering may be wrong)"
-            );
-            0
-        });
+        // READ CAPACITY is the sole authoritative whole-disc size (the UDF
+        // partition is a subset — measured 288 sectors short on a real BD, which
+        // would truncate the backup anchor). Its field failures are sporadic
+        // (5/5 reliable on the target drive), so retry rather than substitute a
+        // short value. On persistent failure capacity is left 0: the shared
+        // scan/identify/MKV path stays lenient (titles read by extent), and only
+        // image output hard-errors, via `image_read_sectors`.
+        let capacity = Self::read_capacity_retrying(session);
         let batch = detect_max_batch_sectors(session.device_path());
         let mut buffered = udf::BufferedSectorReader::new(session, batch);
         let udf_fs = udf::read_filesystem(&mut buffered)?;
         buffered.prefetch(udf_fs.metadata_start(), udf_fs.metadata_sectors());
         Ok((capacity, buffered, udf_fs))
+    }
+
+    /// Number of READ CAPACITY attempts before giving up. The command answers
+    /// reliably on a healthy drive (measured 5/5 on the target); the field
+    /// failure this rides out — GOOD-then-empty / host_status set, no sense,
+    /// intermittent, succeeds on retry — is the USB/UAS transport + spin-up
+    /// timing signature. Six attempts covers a cold spin-up plus one USB
+    /// re-enumeration; needing more means a bad disc or drive, not a blip.
+    const READ_CAPACITY_ATTEMPTS: u32 = 6;
+
+    /// First backoff after a failed READ CAPACITY. Backoff grows exponentially
+    /// (double each miss) up to [`Self::READ_CAPACITY_BACKOFF_CAP`]. The floor is
+    /// well above one revolution — an optical drive can only usefully retry
+    /// about once per rotation, so sub-100ms hammering buys nothing.
+    const READ_CAPACITY_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// Cap on the exponential backoff between READ CAPACITY attempts. With six
+    /// attempts the sleeps run 200/400/800/1600/2000 ms — a ~5s total budget,
+    /// comfortably inside a cold spin-up + one re-enumeration.
+    const READ_CAPACITY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// READ CAPACITY with retry. Returns the hardware sector count, or 0 if
+    /// every attempt failed. READ CAPACITY is the only authoritative whole-disc
+    /// size for an image and its failures are sporadic (a transient USB/UAS +
+    /// spin-up fault), so ride one out with exponential backoff instead of
+    /// substituting a UDF partition size (a subset that would truncate the
+    /// image). No readiness poke: the only ready helper (`Drive::wait_ready`) is
+    /// a ~30s TUR loop that would blow this budget, and inventing a cheap
+    /// single-shot TUR is out of scope — a plain backoff is sufficient. A final
+    /// 0 keeps the shared scan/identify/MKV path lenient (those read titles by
+    /// extent); image output turns the 0 into a hard [`Error::EmptyImage`] via
+    /// `image_read_sectors`.
+    fn read_capacity_retrying(session: &mut Drive) -> u32 {
+        let mut backoff = Self::READ_CAPACITY_BACKOFF_START;
+        for attempt in 1..=Self::READ_CAPACITY_ATTEMPTS {
+            match Self::read_capacity(session) {
+                Ok(sectors) => return sectors,
+                Err(e) if attempt == Self::READ_CAPACITY_ATTEMPTS => {
+                    tracing::warn!(
+                        target: "freemkv::scan",
+                        error = %e,
+                        attempts = Self::READ_CAPACITY_ATTEMPTS,
+                        "READ CAPACITY failed after all retries; disc capacity unavailable (image/ISO output disabled; scan/identify/MKV read by extent and continue)"
+                    );
+                    return 0;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "freemkv::scan",
+                        error = %e,
+                        attempt,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "READ CAPACITY failed; retrying after backoff"
+                    );
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Self::READ_CAPACITY_BACKOFF_CAP);
+                }
+            }
+        }
+        0
     }
 
     /// Scan a disc — parse filesystem, playlists, streams, and set up AACS
@@ -2440,6 +2497,21 @@ fn aligned_unit_keys_validate(
 }
 
 impl Disc {
+    /// Sector count for a whole-disc image read (`disc:// → iso://` / raw
+    /// image), validated non-zero.
+    ///
+    /// `capacity_sectors` is 0 only when both READ CAPACITY and the UDF
+    /// partition-size fallback failed (see `read_udf`). Imaging paths size their
+    /// read domain through this accessor so that empty case is a hard
+    /// [`Error::EmptyImage`], not a silent 0-byte ISO reported as success;
+    /// scan/identify/MKV paths read the field directly and stay lenient.
+    pub fn image_read_sectors(&self) -> Result<u32> {
+        if self.capacity_sectors == 0 {
+            return Err(Error::EmptyImage);
+        }
+        Ok(self.capacity_sectors)
+    }
+
     /// Get the resolved decryption keys for this disc.
     /// Used by disc-to-ISO and other full-disc operations.
     pub fn decrypt_keys(&self) -> crate::decrypt::DecryptKeys {
@@ -4761,6 +4833,155 @@ mod tests {
             ..disc
         };
         assert_eq!(disc_zero.capacity_gb(), 0.0);
+    }
+
+    #[test]
+    fn image_read_sectors_rejects_zero_capacity() {
+        // A non-zero capacity passes through unchanged — the imaging read
+        // domain is the disc's sector count.
+        let disc = Disc {
+            volume_id: String::new(),
+            meta_title: None,
+            format: DiscFormat::BluRay,
+            capacity_sectors: 12_219_392,
+            capacity_bytes: 12_219_392u64 * 2048,
+            layers: 1,
+            titles: Vec::new(),
+            region: DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: ContentFormat::BdTs,
+        };
+        assert_eq!(disc.image_read_sectors().expect("nonzero"), 12_219_392);
+
+        // capacity_sectors == 0 means READ CAPACITY failed and was swallowed to
+        // 0 during the scan. Imaging must hard-fail here, not size a 0-byte read
+        // domain and write an empty ISO that reports success.
+        let disc_zero = Disc {
+            capacity_sectors: 0,
+            capacity_bytes: 0,
+            ..disc
+        };
+        assert!(
+            matches!(disc_zero.image_read_sectors(), Err(Error::EmptyImage)),
+            "zero capacity must be EmptyImage, got {:?}",
+            disc_zero.image_read_sectors()
+        );
+    }
+
+    #[test]
+    fn read_capacity_retrying_rides_out_a_transient_failure() {
+        use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};
+
+        // Fails the first `fail_first` attempts with an empty data phase (which
+        // decodes to Error::DiscCapacityMalformed), then answers a healthy READ
+        // CAPACITY. Models the sporadic field failure the retry loop exists for.
+        struct FlakyCapacity {
+            calls: u32,
+            fail_first: u32,
+            last_lba: u32,
+        }
+        impl ScsiTransport for FlakyCapacity {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                buf: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::error::Result<ScsiResult> {
+                // Only model READ CAPACITY; any other opcode (e.g. the ALLOW
+                // MEDIUM REMOVAL that Drive::drop issues) trivially succeeds.
+                if cdb[0] != crate::scsi::SCSI_READ_CAPACITY {
+                    return Ok(ScsiResult {
+                        status: 0,
+                        sense: [0u8; 32],
+                        bytes_transferred: 0,
+                    });
+                }
+                self.calls += 1;
+                if self.calls <= self.fail_first {
+                    // Empty data phase → Error::DiscCapacityMalformed.
+                    return Ok(ScsiResult {
+                        status: 0,
+                        sense: [0u8; 32],
+                        bytes_transferred: 0,
+                    });
+                }
+                buf[0..4].copy_from_slice(&self.last_lba.to_be_bytes());
+                Ok(ScsiResult {
+                    status: 0,
+                    sense: [0u8; 32],
+                    bytes_transferred: 8,
+                })
+            }
+        }
+
+        // Fails on the first two attempts, succeeds on the third: the retry
+        // yields the hardware value, not the swallowed 0. (last_lba + 1.)
+        let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(FlakyCapacity {
+            calls: 0,
+            fail_first: 2,
+            last_lba: 9_997_279,
+        }));
+        assert_eq!(Disc::read_capacity_retrying(&mut drive), 9_997_280);
+    }
+
+    #[test]
+    fn read_capacity_retrying_gives_up_as_zero_and_that_blocks_imaging() {
+        use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};
+
+        // Every attempt answers GOOD with an empty data phase (malformed): the
+        // retry exhausts and returns 0 rather than a bogus value.
+        struct AlwaysEmpty;
+        impl ScsiTransport for AlwaysEmpty {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _dir: DataDirection,
+                _buf: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::error::Result<ScsiResult> {
+                Ok(ScsiResult {
+                    status: 0,
+                    sense: [0u8; 32],
+                    bytes_transferred: 0,
+                })
+            }
+        }
+
+        let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(AlwaysEmpty));
+        let capacity = Disc::read_capacity_retrying(&mut drive);
+        assert_eq!(
+            capacity, 0,
+            "exhausted retries must yield 0, not a bad value"
+        );
+
+        // A capacity of 0 leaves the shared scan/identify/MKV path lenient but
+        // hard-fails image output: image_read_sectors -> EmptyImage.
+        let disc = Disc {
+            volume_id: String::new(),
+            meta_title: None,
+            format: DiscFormat::BluRay,
+            capacity_sectors: capacity,
+            capacity_bytes: capacity as u64 * 2048,
+            layers: 1,
+            titles: Vec::new(),
+            region: DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: ContentFormat::BdTs,
+        };
+        assert!(
+            matches!(disc.image_read_sectors(), Err(Error::EmptyImage)),
+            "capacity 0 must block imaging with EmptyImage, got {:?}",
+            disc.image_read_sectors()
+        );
     }
 
     #[test]
