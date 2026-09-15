@@ -51,17 +51,30 @@ pub fn parse_hex_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
 /// (That reintroduced-in-keydb bug is exactly what this module was built to kill;
 /// the integer fields now share the one prefix rule.)
 pub fn parse_hex_u16(s: &str) -> Option<u16> {
-    u16::from_str_radix(strip_hex_prefix(s.trim()), 16).ok()
+    u16::from_str_radix(hex_int_body(s)?, 16).ok()
 }
 
 /// Parse a hex string into a `u32`. See [`parse_hex_u16`].
 pub fn parse_hex_u32(s: &str) -> Option<u32> {
-    u32::from_str_radix(strip_hex_prefix(s.trim()), 16).ok()
+    u32::from_str_radix(hex_int_body(s)?, 16).ok()
 }
 
 /// Parse a hex string into a `u8`. See [`parse_hex_u16`].
 pub fn parse_hex_u8(s: &str) -> Option<u8> {
-    u8::from_str_radix(strip_hex_prefix(s.trim()), 16).ok()
+    u8::from_str_radix(hex_int_body(s)?, 16).ok()
+}
+
+// Trim, strip the optional `0x`/`0X` prefix, and reject a leading `+` sign.
+// `from_str_radix` accepts a leading `+` (`+10` → 16), but hex key material
+// never carries a sign — the byte parsers already reject it via `byte()`, so
+// the integer parsers must too, or the same value parses in one path and drops
+// in another. (A bare `-` already fails on the unsigned parse.)
+fn hex_int_body(s: &str) -> Option<&str> {
+    let body = strip_hex_prefix(s.trim());
+    if body.starts_with('+') {
+        return None;
+    }
+    Some(body)
 }
 
 /// Strip a single leading `0x` / `0X` if present (case-insensitive). Public so
@@ -130,6 +143,20 @@ mod tests {
         // Overflow / non-hex → None.
         assert_eq!(parse_hex_u8("0x1FF"), None);
         assert_eq!(parse_hex_u16("0xzz"), None);
+    }
+
+    // `from_str_radix` accepts a leading `+` (`+10` → 16), but hex key material
+    // is never signed and the byte parsers reject it — so the integer parsers
+    // must reject it too. Red-before-green: before the guard, each of these
+    // returned `Some(..)` instead of `None`.
+    #[test]
+    fn hex_ints_reject_leading_plus_sign() {
+        assert_eq!(parse_hex_u16("+10"), None);
+        assert_eq!(parse_hex_u16("+0010"), None);
+        assert_eq!(parse_hex_u32("+deadbeef"), None);
+        assert_eq!(parse_hex_u8("+03"), None);
+        // A `+` behind the prefix is rejected too (strip leaves `+10`).
+        assert_eq!(parse_hex_u16("0x+10"), None);
     }
 
     #[test]

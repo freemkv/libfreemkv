@@ -1100,6 +1100,16 @@ impl std::fmt::Display for Error {
             Error::DiscTitleRange { index, count } => {
                 write!(f, "E{}: {}/{}", self.code(), index, count)
             }
+            Error::DirInsufficientSpace {
+                required,
+                available,
+            } => write!(f, "E{}: {}/{}", self.code(), required, available),
+            Error::DirNameCollision { host } => write!(f, "E{}: {}", self.code(), host),
+            // errno is Option: emit it after the code when present, else the
+            // bare code (mirrors NoDiscKey's empty-field handling — no dangling
+            // "colon space" suffix).
+            Error::DirWriteFailed { errno: Some(e) } => write!(f, "E{}: {}", self.code(), e),
+            Error::DirWriteFailed { errno: None } => write!(f, "E{}", self.code()),
             Error::KeydbConnect { host } => write!(f, "E{}: {}", self.code(), host),
             Error::KeydbHttp { status } => write!(f, "E{}: {}", self.code(), status),
             Error::KeydbWrite { path } => write!(f, "E{}: {}", self.code(), path),
@@ -1655,6 +1665,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The three `Dir*` variants whose fields previously fell through to the
+    /// bare-code `_` arm must now SURFACE their fields: `E9027` carries
+    /// `required/available`, `E9028` the colliding host, `E9029` the errno.
+    /// Red-before-green: before the arms were added each rendered only `E{code}`
+    /// with no field values, so these substring assertions failed.
+    #[test]
+    fn dir_space_collision_write_variants_surface_fields() {
+        let space = Error::DirInsufficientSpace {
+            required: 4096,
+            available: 512,
+        };
+        assert_eq!(
+            space.to_string(),
+            format!("E{}: 4096/512", E_DIR_INSUFFICIENT_SPACE)
+        );
+
+        let collision = Error::DirNameCollision {
+            host: "TITLE".into(),
+        };
+        assert_eq!(
+            collision.to_string(),
+            format!("E{}: TITLE", E_DIR_NAME_COLLISION)
+        );
+
+        let write_failed = Error::DirWriteFailed { errno: Some(28) };
+        assert_eq!(
+            write_failed.to_string(),
+            format!("E{}: 28", E_DIR_WRITE_FAILED)
+        );
+        // A None errno renders as the bare code — no dangling "colon space".
+        let write_none = Error::DirWriteFailed { errno: None };
+        assert_eq!(write_none.to_string(), format!("E{}", E_DIR_WRITE_FAILED));
+    }
+
+    /// `ImageTruncated` Display must carry BOTH the `have` and `want` byte
+    /// lengths as substrings, so a truncated-resume report shows the actual
+    /// mismatch rather than just the bare code.
+    #[test]
+    fn image_truncated_display_has_have_and_want() {
+        let e = Error::ImageTruncated {
+            have: 12345,
+            want: 67890,
+        };
+        let s = e.to_string();
+        assert!(
+            s.contains("12345"),
+            "have value missing from ImageTruncated display `{s}`"
+        );
+        assert!(
+            s.contains("67890"),
+            "want value missing from ImageTruncated display `{s}`"
+        );
     }
 
     #[test]
