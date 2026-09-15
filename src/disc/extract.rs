@@ -138,6 +138,9 @@ impl Disc {
         let mut dirs: Vec<PathBuf> = Vec::new();
         let mut seen_hosts: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        // The collision fold depends on the REAL target volume: fold case only
+        // where the host would (APFS/NTFS), never on a case-sensitive volume.
+        let case_insensitive = dir_is_case_insensitive(dest);
         plan_tree(
             reader,
             &fs,
@@ -145,6 +148,7 @@ impl Disc {
             Path::new(""),
             "",
             true,
+            case_insensitive,
             &mut planned,
             &mut dirs,
             &mut seen_hosts,
@@ -353,6 +357,25 @@ impl SectorSource for Borrowed<'_> {
 /// Recursively plan the host tree: collect directories to create and files to
 /// extract, sanitizing each component and detecting host-path collisions.
 /// Skips the top-level `AACS/` and `CERTIFICATE/` directories (§7).
+/// Whether `dir` lives on a case-INSENSITIVE filesystem (macOS APFS/HFS+ and
+/// Windows NTFS default). Probes the real target: create a lowercase marker
+/// and test whether its uppercase spelling resolves to the same file. On a
+/// case-SENSITIVE volume (typical Linux ext4, or a case-sensitive APFS) two
+/// disc names differing only by case are DISTINCT host files that coexist, so
+/// folding them together would wrongly abort a legitimate extract. If the probe
+/// can't run (e.g. a read-only dir), assume case-insensitive — the conservative
+/// choice that never MISSES a real overwrite collision.
+fn dir_is_case_insensitive(dir: &Path) -> bool {
+    let lower = dir.join(".fmkv_case_probe");
+    if std::fs::File::create(&lower).is_err() {
+        return true;
+    }
+    let upper = dir.join(".FMKV_CASE_PROBE");
+    let insensitive = upper.exists();
+    let _ = std::fs::remove_file(&lower);
+    insensitive
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_tree(
     reader: &mut dyn SectorSource,
@@ -361,6 +384,7 @@ fn plan_tree(
     host_rel: &Path,
     disc_path: &str,
     is_root: bool,
+    case_insensitive: bool,
     files: &mut Vec<PlannedFile>,
     dirs: &mut Vec<PathBuf>,
     seen_hosts: &mut std::collections::HashMap<String, String>,
@@ -381,11 +405,17 @@ fn plan_tree(
         let safe = sanitize_component(&entry.name)?;
         let child_rel = host_rel.join(&safe);
         let child_disc = format!("{disc_path}/{}", entry.name);
-        // Collision: two distinct disc paths → same host FILE (case-insensitive
-        // fold of `Movie`/`movie`, or `.partial` sharing the final-name namespace
-        // so `X`/`X.partial` collide too). Fold is ASCII/simple-Unicode only.
+        // Collision: two distinct disc paths → same host FILE. On a case-
+        // insensitive host that folds `Movie`/`movie` together; on a case-
+        // sensitive host only an EXACT match collides (case-differing names are
+        // distinct files that coexist). Either way `.partial` shares the
+        // final-name namespace so `X`/`X.partial` collide too.
         let mut register = |key: PathBuf| -> Result<()> {
-            let folded = key.to_string_lossy().to_lowercase();
+            let folded = if case_insensitive {
+                key.to_string_lossy().to_lowercase()
+            } else {
+                key.to_string_lossy().into_owned()
+            };
             if let Some(prev) = seen_hosts.insert(folded, child_disc.clone())
                 && prev != child_disc
             {
@@ -408,6 +438,7 @@ fn plan_tree(
                 &child_rel,
                 &child_disc,
                 false,
+                case_insensitive,
                 files,
                 dirs,
                 seen_hosts,
@@ -1540,11 +1571,13 @@ mod tests {
         assert!(matches!(err, Error::DirNameCollision { .. }));
     }
 
-    // Two disc names differing only by CASE fold to one host file on macOS
-    // APFS / Windows NTFS — must be a collision, not a silent overwrite
-    // reported clean. See docs/extract.md for the failure this prevents.
+    // Two disc names differing only by CASE fold to one host file on a case-
+    // INSENSITIVE host (macOS APFS / Windows NTFS) — that must be a collision,
+    // not a silent overwrite reported clean. On a case-SENSITIVE volume the two
+    // are distinct files that coexist, so the extract must NOT abort. The
+    // outcome tracks the REAL target volume, tested by probing it.
     #[test]
-    fn names_differing_only_by_case_are_a_collision() {
+    fn names_differing_only_by_case_collide_only_on_a_case_insensitive_host() {
         let root = DirSpec {
             name: String::new(),
             icb_lba: 10,
@@ -1557,10 +1590,18 @@ mod tests {
         };
         let mut disc = build_disc(root);
         let out = TmpDir::new("case_collision");
-        let err = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
-            .expect_err("two names that fold to one host file must collide");
-        assert!(matches!(err, Error::DirNameCollision { .. }), "got {err:?}");
+        let insensitive = super::dir_is_case_insensitive(out.path());
+        let res = clear_disc().extract_tree(&mut disc, out.path(), &ExtractOptions::default());
+        if insensitive {
+            let err = res.expect_err("two names that fold to one host file must collide");
+            assert!(matches!(err, Error::DirNameCollision { .. }), "got {err:?}");
+        } else {
+            let out = res.expect("distinct-case names coexist on a case-sensitive volume");
+            assert!(
+                out.files.iter().all(|f| f.complete),
+                "both case-distinct files must extract cleanly on a case-sensitive host"
+            );
+        }
     }
 
     // A file's in-flight `.partial` path shares the host namespace with
@@ -1885,12 +1926,10 @@ mod tests {
             let seed = [0x11u8, 0x22, 0x33, 0x44, marker];
             let mut plain = vec![0u8; 2048];
             // The crack scan's `is_scrambled_pack` gate requires the MPEG-PS pack-
-            // start signature before attempting a crack; without it, `resolve_vts_key`
-            // falls back to `base_keys` for both groups, masking this regression.
+            // start signature (a real scrambled sector is an MPEG-2 PS pack) before
+            // attempting a crack; without it, `resolve_vts_key` falls back to
+            // `base_keys` for both groups, masking this regression.
             plain[0x00..0x04].copy_from_slice(&crate::css::PACK_START);
-            // Pack start code: a real scrambled sector is an MPEG-2 PS pack, and
-            // the descrambler requires it before trusting byte 0x14.
-            plain[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
             plain[0x14] = 0x10; // scramble flag
             let pat: Vec<u8> = (0..8)
                 .map(|k| (0xA0u8.wrapping_add(k as u8) ^ marker) ^ 0x5A)
