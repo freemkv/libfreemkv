@@ -103,9 +103,12 @@ impl<R: Read + Seek> Mp4Reader<R> {
         // (8-byte) trak headers can't force the scan to materialize a Vec far
         // larger than the moov payload before the per-track cap below ever runs.
         for trak in find_boxes_capped(&moov, b"trak", MAX_TRACKS) {
-            if track_idx >= MAX_TRACKS {
-                break; // bound track count so the per-track PID can't overflow u16
-            }
+            // `find_boxes_capped` already yields at most MAX_TRACKS matches, so
+            // `track_idx` can never reach MAX_TRACKS inside this loop — the old
+            // runtime `break` was unreachable. Assert the invariant instead (a lower
+            // cap slipping in would trip this in debug) so the per-track PID stays
+            // within u16 without dead control flow.
+            debug_assert!(track_idx < MAX_TRACKS, "trak scan exceeded MAX_TRACKS");
             let Some(mdia) = find_box(trak, b"mdia") else {
                 tracing::warn!(track = track_idx, "mp4: trak has no mdia, dropping track");
                 continue;
@@ -134,6 +137,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 height,
                 config,
                 channels,
+                sample_rate: entry_sample_rate,
             }) = parse_stsd(stsd)
             else {
                 tracing::warn!(
@@ -164,7 +168,13 @@ impl<R: Read + Seek> Mp4Reader<R> {
                     // `as u8` (a crafted 256 would alias to 0/Mono).
                     channels: AudioChannels::from_count(channels.min(u8::MAX as u16) as u8),
                     language: language.clone().unwrap_or_else(|| "und".into()),
-                    sample_rate: SampleRate::from_hz(timescale),
+                    // Prefer the AudioSampleEntry's own samplerate; the mdhd media
+                    // timescale is only a fallback when the entry omits it (0).
+                    sample_rate: SampleRate::from_hz(if entry_sample_rate != 0 {
+                        entry_sample_rate
+                    } else {
+                        timescale
+                    }),
                     secondary: false,
                     purpose: LabelPurpose::Normal,
                     label: String::new(),
@@ -670,6 +680,10 @@ struct StsdInfo {
     height: u16,
     config: Option<Vec<u8>>,
     channels: u16,
+    /// Integer sample rate (Hz) from the AudioSampleEntry 16.16 samplerate
+    /// field (high 16 bits). `0` when absent/video — the caller then falls
+    /// back to the mdhd media timescale.
+    sample_rate: u32,
 }
 
 /// stsd → codec + dimensions + codec_private + channel count (first entry).
@@ -717,12 +731,22 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             height,
             config,
             channels: 0,
+            sample_rate: 0,
         })
     } else {
         // AudioSampleEntry header is 28 bytes, then child boxes. AAC (mp4a) carries
         // its AudioSpecificConfig in an `esds` box — the MKV CodecPrivate for
         // A_AAC. AC-3/DTS are self-describing in-band (None).
         let channels = if body.len() >= 28 { be16(body, 16) } else { 2 };
+        // The real audio sample rate lives in the AudioSampleEntry 16.16
+        // samplerate field at body offset 24 (ISO/IEC 14496-12 §12.2.3); the
+        // integer rate is the high 16 bits. The mdhd media timescale is only a
+        // fallback (it is USUALLY the sample rate, but need not be).
+        let sample_rate = if body.len() >= 28 {
+            be16(body, 24) as u32
+        } else {
+            0
+        };
         let config = if matches!(codec, Codec::Aac) && body.len() >= 28 {
             find_box(&body[28..], b"esds").and_then(parse_esds_asc)
         } else {
@@ -733,6 +757,7 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             height: 0,
             config,
             channels,
+            sample_rate,
         })
     }
 }
@@ -2230,6 +2255,78 @@ mod tests {
             1,
             "the timescale-0 track is still indexed"
         );
+    }
+
+    // Regression: audio sample rate must come from the AudioSampleEntry 16.16
+    // samplerate field, NOT the mdhd media timescale. Here the two DIFFER
+    // (mdhd timescale = 90_000, AudioSampleEntry samplerate = 48_000); the
+    // entry value must win. Old code read the rate from the timescale, so a
+    // 90 kHz mdhd yielded SampleRate::Unknown, dropping the real 48 kHz.
+    #[test]
+    fn audio_sample_entry_samplerate_wins_over_mdhd_timescale() {
+        use std::io::Cursor;
+        let mdhd = {
+            // v0: version+flags(4) creation(4) modification(4) timescale(4) duration(4).
+            let mut p = vec![0u8; 24];
+            p[12..16].copy_from_slice(&90_000u32.to_be_bytes()); // NOT the audio rate
+            mp4_box(b"mdhd", &p)
+        };
+        let hdlr = {
+            let mut p = vec![0u8; 12];
+            p[8..12].copy_from_slice(b"soun");
+            mp4_box(b"hdlr", &p)
+        };
+        // Full AudioSampleEntry: samplerate 48_000 in the 16.16 field at body 24.
+        let stsd = mp4_box(b"stsd", &stsd_with(b"ac-3", &audio_entry(6, 0, &[])));
+        // stsz: sample_size=10, count=1 (one 10-byte sample).
+        let stsz = {
+            let mut p = vec![0u8, 0, 0, 0];
+            p.extend_from_slice(&10u32.to_be_bytes());
+            p.extend_from_slice(&1u32.to_be_bytes());
+            mp4_box(b"stsz", &p)
+        };
+        let stco = {
+            let mut p = vec![0u8, 0, 0, 0];
+            p.extend_from_slice(&1u32.to_be_bytes()); // count
+            p.extend_from_slice(&0u32.to_be_bytes()); // chunk offset 0
+            mp4_box(b"stco", &p)
+        };
+        let stsc = {
+            let mut p = vec![0u8, 0, 0, 0];
+            p.extend_from_slice(&1u32.to_be_bytes()); // count
+            p.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
+            p.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk
+            p.extend_from_slice(&0u32.to_be_bytes()); // sample_desc_idx
+            mp4_box(b"stsc", &p)
+        };
+        let stts = {
+            let mut p = vec![0u8, 0, 0, 0];
+            p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+            p.extend_from_slice(&1u32.to_be_bytes()); // sample_count
+            p.extend_from_slice(&1000u32.to_be_bytes()); // sample_delta
+            mp4_box(b"stts", &p)
+        };
+        let mut stbl = Vec::new();
+        for b in [&stsd, &stsz, &stco, &stsc, &stts] {
+            stbl.extend_from_slice(b);
+        }
+        let minf = mp4_box(b"minf", &mp4_box(b"stbl", &stbl));
+        let mut mdia = Vec::new();
+        mdia.extend_from_slice(&mdhd);
+        mdia.extend_from_slice(&hdlr);
+        mdia.extend_from_slice(&minf);
+        let trak = mp4_box(b"trak", &mp4_box(b"mdia", &mdia));
+        let moov = mp4_box(b"moov", &trak);
+
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "sr".into()).unwrap();
+        match &rd.info().streams[0] {
+            DiscStream::Audio(a) => assert_eq!(
+                a.sample_rate,
+                SampleRate::S48,
+                "the AudioSampleEntry 48 kHz must win over the 90 kHz mdhd timescale"
+            ),
+            other => panic!("expected an audio stream, got {other:?}"),
+        }
     }
 
     // ============================================================
