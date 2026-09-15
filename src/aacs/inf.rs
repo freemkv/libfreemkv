@@ -92,7 +92,7 @@ pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFil
 
     // Key storage offset
     let uk_pos = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if uk_pos + 2 > data.len() {
+    if uk_pos.checked_add(2)? > data.len() {
         return None;
     }
 
@@ -114,8 +114,8 @@ pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFil
     let stride = version.unit_key_stride();
 
     // Validate size
-    let keys_start = uk_pos + 48; // first key at uk_pos + 48
-    if keys_start + 16 > data.len() {
+    let keys_start = uk_pos.checked_add(48)?; // first key at uk_pos + 48
+    if keys_start.checked_add(16)? > data.len() {
         return None;
     }
 
@@ -160,10 +160,14 @@ pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFil
 
         for i in 0..num_titles {
             let off = 26 + i * 4 + 2; // 2 bytes padding + 2 bytes CPS unit
-            if off + 2 <= data.len() {
-                let cps = u16::from_be_bytes([data[off], data[off + 1]]);
-                title_cps_unit.push(to_key_idx(cps));
+            // A declared title whose entry runs past the buffer means the .inf
+            // is truncated — reject rather than silently returning a short
+            // title→CPS map (mirrors the key-list truncation check above).
+            if off + 2 > data.len() {
+                return None;
             }
+            let cps = u16::from_be_bytes([data[off], data[off + 1]]);
+            title_cps_unit.push(to_key_idx(cps));
         }
     }
 
@@ -333,14 +337,13 @@ pub fn read_mkb_from_drive(
         cdb[5] = (pack & 0xFF) as u8;
 
         let mut buf = vec![0u8; 32772];
-        if session
-            .execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000)
-            .is_ok()
-        {
-            let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-            if len > 2 && len - 2 <= 32768 {
-                mkb.extend_from_slice(&buf[4..4 + len - 2]);
-            }
+        // A transport error on a non-first pack must PROPAGATE: swallowing it
+        // (the prior `.is_ok()`) silently truncated the MKB and returned the
+        // partial data as Ok, corrupting the root of the whole AACS ladder.
+        session.execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000)?;
+        let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        if len > 2 && len - 2 <= 32768 {
+            mkb.extend_from_slice(&buf[4..4 + len - 2]);
         }
     }
 
@@ -830,6 +833,106 @@ mod read_mkb_tests {
         assert!(
             read_mkb_from_drive(&mut DeadDrive).is_err(),
             "an unreadable MKB must surface as an error, not an empty MKB"
+        );
+    }
+
+    /// A transport failure on a NON-first pack must ALSO propagate. Before the
+    /// fix the per-pack loop tested `.is_ok()` and dropped the error, so a
+    /// mid-walk failure silently TRUNCATED the MKB and returned the partial
+    /// pack-0 data as Ok. Pack 0 succeeds, pack 1 errors → the whole read errors.
+    #[test]
+    fn read_mkb_from_drive_propagates_a_mid_walk_pack_failure() {
+        struct FlakyDrive;
+        impl ScsiTransport for FlakyDrive {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _direction: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::error::Result<ScsiResult> {
+                let pack = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+                if pack == 0 {
+                    // Honest first pack: 64 payload bytes, TWO packs declared so
+                    // the loop goes on to request pack 1.
+                    let body = [0x5Au8; 64];
+                    data[0..2].copy_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+                    data[2] = 0x00;
+                    data[3] = 2;
+                    data[4..4 + body.len()].copy_from_slice(&body);
+                    Ok(ScsiResult {
+                        status: 0,
+                        bytes_transferred: 4 + body.len(),
+                        sense: [0u8; 32],
+                    })
+                } else {
+                    // Pack 1 read fails mid-walk.
+                    Err(crate::error::Error::ScsiError {
+                        opcode: SCSI_READ_DISC_STRUCTURE,
+                        status: 0x02,
+                        sense: None,
+                    })
+                }
+            }
+        }
+        assert!(
+            read_mkb_from_drive(&mut FlakyDrive).is_err(),
+            "a transport error on pack 1 must surface, not truncate the MKB to pack 0"
+        );
+    }
+}
+
+#[cfg(test)]
+mod unit_key_ro_tests {
+    use super::*;
+
+    /// Finding 17: a Unit_Key_RO.inf that parses its key list fully but declares
+    /// more title entries than the buffer can hold is TRUNCATED and must be
+    /// rejected. Pre-fix the loop silently skipped the missing entries and
+    /// returned `Some` with a short title→CPS map (mirrors the key-list check).
+    #[test]
+    fn parse_unit_key_ro_rejects_truncated_title_table() {
+        let uk_pos = 26usize;
+        let mut data = vec![0u8; 90];
+        data[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes()); // key storage @26
+        data[24..26].copy_from_slice(&20u16.to_be_bytes()); // num_titles=20 (needs bytes to 106)
+        data[uk_pos..uk_pos + 2].copy_from_slice(&1u16.to_be_bytes()); // num_uk=1
+        // One present key at uk_pos+48 = 74..90 (V10 48-byte stride) so the key
+        // list parses fully; only the title table overruns the 90-byte buffer.
+        data[74..90].copy_from_slice(&[0xAB; 16]);
+        assert!(
+            parse_unit_key_ro(&data, AacsVersion::V10).is_none(),
+            "a title table that runs past the buffer is truncated → reject"
+        );
+    }
+
+    /// Fixture guard for the test above: the SAME buffer with an honest title
+    /// count parses to `Some`, proving it is only the truncation that is rejected
+    /// (not some unrelated malformation).
+    #[test]
+    fn parse_unit_key_ro_accepts_the_same_buffer_with_an_honest_title_count() {
+        let uk_pos = 26usize;
+        let mut data = vec![0u8; 90];
+        data[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+        data[24..26].copy_from_slice(&15u16.to_be_bytes()); // 15 titles: last entry ends at 88 <= 90
+        data[uk_pos..uk_pos + 2].copy_from_slice(&1u16.to_be_bytes());
+        data[74..90].copy_from_slice(&[0xAB; 16]);
+        let ukf = parse_unit_key_ro(&data, AacsVersion::V10).expect("fits → Some");
+        assert_eq!(ukf.encrypted_keys.len(), 1);
+        assert_eq!(ukf.title_cps_unit.len(), 2 + 15); // first_play + top_menu + 15 titles
+    }
+
+    /// Finding 15: a malformed key-storage offset pointing far past the buffer
+    /// must be rejected, never indexed. The `checked_add` guards also stop the
+    /// offset arithmetic (`uk_pos + 2`, `uk_pos + 48`) from overflowing `usize`
+    /// on 32-bit targets rather than panicking.
+    #[test]
+    fn parse_unit_key_ro_rejects_out_of_range_key_offset() {
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&u32::MAX.to_be_bytes()); // uk_pos = 0xFFFFFFFF
+        assert!(
+            parse_unit_key_ro(&data, AacsVersion::V10).is_none(),
+            "a key-storage offset past the buffer must not be indexed"
         );
     }
 }

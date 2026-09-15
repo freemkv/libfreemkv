@@ -178,9 +178,14 @@ pub fn fmts_key_ranges(
         ) else {
             continue;
         };
-        if b >= a
-            && (b - a) as u64 == (end_byte - 1 - start_byte) / crate::consts::SECTOR_BYTES as u64
-        {
+        // start_byte = start_spn*192 is generally NOT 2048-aligned, so the LBA
+        // carry is floor((end_byte-1)/2048) - floor(start_byte/2048), NOT
+        // (end_byte-1-start_byte)/2048 — the latter is only correct when
+        // start_byte is sector-aligned and otherwise mismatches `b - a`, wrongly
+        // dropping a legitimate non-aligned segment back to the Unit Key.
+        let sector = crate::consts::SECTOR_BYTES as u64;
+        let expected_delta = (end_byte - 1) / sector - start_byte / sector;
+        if b >= a && (b - a) as u64 == expected_delta {
             ranges.push((a, b + 1, index_to_key_idx(s.index)));
         }
     }
@@ -258,6 +263,33 @@ mod tests {
             None,
             "segment end is exclusive → no key"
         );
+    }
+
+    #[test]
+    fn fmts_key_ranges_carries_a_non_2048_aligned_segment() {
+        use crate::disc::Extent;
+        let extents = vec![Extent {
+            start_lba: 1000,
+            sector_count: 1_000_000,
+        }];
+        // start_spn=1 → start_byte = 192, which is NOT 2048-aligned. end_spn=10 →
+        // end_byte-1 = 2111. The correct LBA carry is
+        // floor(2111/2048) - floor(192/2048) = 1 - 0 = 1, so the segment maps to
+        // LBA 1000..=1001. The old aligned formula computed
+        // (2111 - 192)/2048 = 0, which mismatched b-a = 1 and DROPPED the segment
+        // (falling back to the Unit Key) — this test caught that as an empty map.
+        let segs = vec![Segment {
+            index: 5,
+            start_spn: 1,
+            end_spn: 10,
+        }];
+        let ranges = fmts_key_ranges(&segs, &extents, &|v| v as usize);
+        assert_eq!(
+            ranges.len(),
+            1,
+            "a non-2048-aligned segment must still carry, not be dropped"
+        );
+        assert_eq!(ranges[0], (1000, 1002, 5));
     }
 
     #[test]
