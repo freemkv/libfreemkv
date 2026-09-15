@@ -208,6 +208,13 @@ impl CodecParser for H264Parser {
         let mut keyframe = false;
         // Picture coding type, MEASURED from the first coded slice's header.
         let mut coding_type: Option<CodingType> = None;
+        // Open-GOP promotion needs EVERY VCL slice to be intra, not just the
+        // first: a picture whose first slice is I but whose later slices are
+        // P/B is not a clean random-access point. `all_vcl_intra` stays true
+        // only while every slice header parses AND codes as I/SI; `saw_vcl`
+        // guards against promoting a param-set-only access unit.
+        let mut all_vcl_intra = true;
+        let mut saw_vcl = false;
         // Did this access unit already carry each param-set type in-band?
         let mut emitted_sps = false;
         let mut emitted_pps = false;
@@ -243,16 +250,26 @@ impl CodecParser for H264Parser {
                     if nal_type == NAL_SLICE_IDR {
                         keyframe = true;
                     }
-                    // Measure coding type from the first slice header (§7.3.3:
+                    // Measure coding type from each slice header (§7.3.3:
                     // first_mb_in_slice, slice_type, both ue(v)) after unescaping
                     // EBSP (§7.3.1) — large first_mb_in_slice needs escaped 0x00 0x00.
-                    if (nal_type == NAL_SLICE_NON_IDR || nal_type == NAL_SLICE_IDR)
-                        && coding_type.is_none()
-                    {
+                    // The FIRST slice sets the picture's `coding_type`; EVERY slice
+                    // feeds `all_vcl_intra` for the open-GOP promotion below.
+                    if nal_type == NAL_SLICE_NON_IDR || nal_type == NAL_SLICE_IDR {
+                        saw_vcl = true;
                         let header = unescape_ebsp_prefix(&nal[1..]);
                         let mut br = BitReader::new(&header);
                         if let (Some(_first_mb), Some(slice_type)) = (br.read_ue(), br.read_ue()) {
-                            coding_type = h264_slice_coding_type(slice_type);
+                            let ct = h264_slice_coding_type(slice_type);
+                            if coding_type.is_none() {
+                                coding_type = ct;
+                            }
+                            if ct != Some(CodingType::I) {
+                                all_vcl_intra = false;
+                            }
+                        } else {
+                            // An unparseable slice header cannot be proven intra.
+                            all_vcl_intra = false;
                         }
                     }
                     // A NAL longer than u32::MAX can't be length-prefixed in the
@@ -273,8 +290,11 @@ impl CodecParser for H264Parser {
 
         // Open-GOP resync anchor: BD titles use open GOPs whose random-access
         // point is a non-IDR I-frame, not always SEI-tagged. Without treating it
-        // as a keyframe, the resync gate (`mux/resync.rs`) can miss it and drop frames to EOF.
-        if coding_type == Some(CodingType::I) {
+        // as a keyframe, the resync gate (`mux/resync.rs`) can miss it and drop
+        // frames to EOF. Promote only when EVERY VCL slice is intra (a picture
+        // with a P/B slice is not a random-access point) and only on the base
+        // view (`!mvc`): a dependent MVC view is never an independent anchor.
+        if saw_vcl && all_vcl_intra && !mvc {
             keyframe = true;
         }
 
@@ -600,6 +620,48 @@ mod tests {
         assert!(
             !frames[0].keyframe,
             "an inter-coded access unit must never be a keyframe",
+        );
+    }
+
+    // A picture whose FIRST slice is I but whose LATER slice is P/B is not a
+    // clean random-access point: the open-GOP promotion must require EVERY VCL
+    // slice to be intra, not trust the first slice alone.
+    #[test]
+    fn a_mixed_slice_picture_with_a_p_slice_is_not_promoted() {
+        // AU with two coded slices: slice 1 is I (0x88, slice_type=7), slice 2
+        // is P (0xC0, slice_type=0). Both NAL type 1, nal_ref_idc 3 -> 0x61.
+        let au = vec![
+            0x00, 0x00, 0x01, 0x61, 0x88, // I slice
+            0x00, 0x00, 0x01, 0x61, 0xC0, // P slice
+            0x00,
+        ];
+        let mut parser = H264Parser::new();
+        let frames = parser.parse(&make_pes(au, Some(0)));
+        assert_eq!(frames.len(), 1, "one PES access unit → one frame");
+        assert_eq!(
+            frames[0].coding.map(|c| c.coding_type()),
+            Some(CodingType::I),
+            "the picture's coding type is still the first slice's (I)",
+        );
+        assert!(
+            !frames[0].keyframe,
+            "a picture with a P slice is not a random-access point and must not promote",
+        );
+    }
+
+    // MVC dependent-view (Blu-ray 3D right-eye) passthrough: an intra dependent
+    // view is not an independent random-access anchor, so it must NOT be
+    // promoted to a keyframe even when every slice is intra.
+    #[test]
+    fn an_intra_mvc_dependent_view_is_not_promoted() {
+        // Single non-IDR I slice, as in open_gop_intra_access_unit_is_a_keyframe.
+        let au = vec![0x00, 0x00, 0x01, 0x61, 0x88, 0x00];
+        let mut parser = H264Parser::new().with_mvc_passthrough(true);
+        let frames = parser.parse(&make_pes(au, Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert!(
+            !frames[0].keyframe,
+            "an MVC dependent view is never an independent anchor, intra or not",
         );
     }
 
