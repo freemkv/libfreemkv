@@ -66,11 +66,23 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // Surface the feature playlist's authoring id (e.g. "00800") so title
     // selection can prefer the disc's own feature over a size-inflated decoy —
     // the same signal `paramount::parse` provides.
-    result.feature_playlist = feature_playlist_id(text).map(|id| super::FeaturePlaylistHint {
-        playlist_id: id.parse::<u16>().ok(),
-        filename: Some(format!("{id}.mpls")),
-    });
+    result.feature_playlist = feature_hint(text);
     Some(result)
+}
+
+// The feature playlist hint for a `dcx.xml` doc. Derives the numeric id and the
+// filename from ONE parsed number so they can never disagree: `format!("{id}")`
+// on a 5-digit id above u16::MAX (65536..=99999) left playlist_id `None` while
+// the filename stayed `Some`, a half-hint whose two fields named different
+// things. Require a valid u16 playlist number, then format the canonical
+// 5-digit `NNNNN.mpls` from it.
+pub(crate) fn feature_hint(text: &str) -> Option<super::FeaturePlaylistHint> {
+    let id = feature_playlist_id(text)?;
+    let playlist_id = id.parse::<u16>().ok()?;
+    Some(super::FeaturePlaylistHint {
+        playlist_id: Some(playlist_id),
+        filename: Some(format!("{playlist_id:05}.mpls")),
+    })
 }
 
 // Build stream labels from a `dcx.xml` doc; split out from `parse` for unit
@@ -323,6 +335,19 @@ mod tests {
             feature_playlist_id(FOX_DCX_SAMPLE),
             Some("00800".to_string())
         );
+    }
+
+    /// The feature hint's numeric id and filename are derived from ONE parsed
+    /// number, so they always name the same playlist — the id parses to 800 and
+    /// the filename is the canonical 5-digit `00800.mpls`, never a half-hint.
+    #[test]
+    fn feature_hint_id_and_filename_agree() {
+        let h = feature_hint(FOX_DCX_SAMPLE).expect("the sample has a feature id");
+        assert_eq!(h.playlist_id, Some(800));
+        assert_eq!(h.filename.as_deref(), Some("00800.mpls"));
+        assert!(!h.is_empty());
+        // The two fields point at the same playlist.
+        assert!(h.matches(800, "00800.mpls"));
     }
 
     /// Full real-disc parse: the 00800 audio table. Eleven tracks, id order =
