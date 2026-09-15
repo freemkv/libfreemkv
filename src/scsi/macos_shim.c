@@ -458,13 +458,31 @@ int shim_open_exclusive(const char *bsd_name) {
         svc = find_bdsvc_from_iomedia(mp, bsd_name);
     }
     if (!svc) {
-        // IOServiceMatching returns NULL on allocation failure. Both other call
-        // sites in this file check it; this one did not, and
-        // IOServiceGetMatchingService with a NULL matching dictionary is
-        // undefined (it consumes the reference it is given).
+        // Last-resort fallback: enumerate IOBDServices directly. This must still
+        // HONOR the requested bsd_name — grabbing IOServiceGetMatchingService's
+        // first/arbitrary match would open the wrong drive on a multi-drive host.
+        // So iterate and accept only the service whose IOMedia BSD name equals the
+        // requested one; if none matches, leave svc == 0 and fail below.
+        //
+        // IOServiceMatching returns NULL on allocation failure (checked here, as
+        // the other call sites do); IOServiceGetMatchingServices consumes the
+        // matching-dictionary reference whether it succeeds or fails.
         CFMutableDictionaryRef matching = IOServiceMatching("IOBDServices");
         if (matching) {
-            svc = IOServiceGetMatchingService(mp, matching);
+            io_iterator_t iter;
+            if (IOServiceGetMatchingServices(mp, matching, &iter) == KERN_SUCCESS) {
+                io_service_t cand;
+                while ((cand = IOIteratorNext(iter)) != 0) {
+                    char name[64];
+                    if (bdsvc_to_bsd_name(cand, name, sizeof(name))
+                        && strcmp(name, bsd_name) == 0) {
+                        svc = cand; // retained; released after the plug-in is built
+                        break;
+                    }
+                    IOObjectRelease(cand);
+                }
+                IOObjectRelease(iter);
+            }
         }
     }
     if (!svc) {
@@ -526,11 +544,14 @@ int shim_open_exclusive(const char *bsd_name) {
     //
     // TOCTOU note: the lock is released above, so a concurrent shim_close could
     // tear g_handle down in the gap before da_hold runs. That is SAFE, not a
-    // use-after-free: da_hold re-takes g_handle_lock and re-checks da_queue /
-    // da_session / da_disk under it, returning early (NULL → no claim) if the
-    // teardown already happened. It never dereferences a field it read before
-    // acquiring the lock. The lock is deliberately NOT held across da_hold's
-    // ~5 s self-locking claim wait, which would serialize every open behind it.
+    // use-after-free: da_hold re-takes g_handle_lock and builds its
+    // DiskArbitration state (da_queue / da_session / da_disk) from scratch,
+    // entirely under the lock and keyed only off its bsd_name argument — it never
+    // dereferences a g_handle field it read before acquiring the lock, so a
+    // teardown in the gap just leaves fresh state to overwrite. If any of those
+    // allocations fails it returns early (0 → no claim). The lock is deliberately
+    // NOT held across da_hold's ~5 s self-locking claim wait, which would
+    // serialize every open behind it.
     da_hold(bsd_name);
 
     return 0;
@@ -669,7 +690,13 @@ int shim_list_drives(ShimDriveInfo *out, int max_entries) {
 
     int count = 0;
     io_service_t svc;
-    while ((svc = IOIteratorNext(iter)) != 0 && count < max_entries) {
+    // Test count BEFORE calling IOIteratorNext: each IOIteratorNext returns a
+    // retained io_service_t the caller must release. With the count check second,
+    // the iteration that fills the last slot would call IOIteratorNext once more
+    // (obtaining, and then leaking, one extra service) before the loop exits.
+    // Short-circuiting on count first means no unreleased service is ever obtained;
+    // any entries left unvisited in the iterator are freed by IOObjectRelease(iter).
+    while (count < max_entries && (svc = IOIteratorNext(iter)) != 0) {
         ShimDriveInfo *info = &out[count];
         memset(info, 0, sizeof(*info));
 
