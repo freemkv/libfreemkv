@@ -602,7 +602,10 @@ pub(super) fn plan(root: &Path) -> Result<Layout> {
     }
     // Metadata is materialized up front and held for the life of the image, so
     // its size is bounded here rather than discovered when memory runs out.
-    let meta_bytes = (dir_count as u64 + file_count as u64).saturating_mul(SECTOR as u64);
+    // Count the FULL footprint — File Entries AND each directory's FID-list
+    // sectors — not just one File Entry per node: a wide, shallow tree's
+    // directory data alone can dwarf the per-node entries.
+    let meta_bytes = metadata_block_count(&tree).saturating_mul(SECTOR as u64);
     if meta_bytes > MAX_META_BYTES {
         return Err(Error::DirImageTooLarge);
     }
@@ -688,6 +691,54 @@ mod tests {
             f.extents.iter().map(|e| e.bytes as u64).sum::<u64>(),
             f.size,
             "no bytes lost or invented"
+        );
+    }
+
+    // The metadata ceiling must account for each directory's FID-list sectors,
+    // not just one File Entry per node: a wide directory's FID list can span
+    // many sectors that the old (dir_count + file_count) count ignored, so an
+    // oversized folder could slip past the guard and be materialized in full.
+    // See docs/dirimage.md — metadata_ceiling_counts_fid_lists.
+    #[test]
+    fn metadata_block_count_includes_the_fid_list_sectors() {
+        let files: Vec<FileNode> = (0..300)
+            .map(|i| FileNode {
+                name: format!("A_REASONABLY_LONG_FILENAME_{i:04}.M2TS"),
+                disc_path: format!("/{i}"),
+                host: PathBuf::new(),
+                size: 0,
+                mtime: None,
+                icb_lba: 0,
+                unique_id: 0,
+                extents: Vec::new(),
+            })
+            .collect();
+        let root = DirNode {
+            name: String::new(),
+            icb_lba: 0,
+            parent_icb_lba: 0,
+            data_lba: 0,
+            data_bytes: 0,
+            unique_id: 0,
+            dirs: Vec::new(),
+            files,
+        };
+
+        let mut dir_count = 0;
+        let mut file_count = 0;
+        count_nodes(&root, &mut dir_count, &mut file_count);
+        // Old formula: one File Entry per node only.
+        let file_entry_only = dir_count as u64 + file_count as u64;
+        let fid_sectors = dir_bytes(&root.dirs, &root.files).div_ceil(SECTOR) as u64;
+        assert!(fid_sectors > 1, "300 files must fill more than one FID sector");
+        // 2 (FSD + Terminating Descriptor) + File Entries + FID-list sectors.
+        assert_eq!(
+            metadata_block_count(&root),
+            2 + file_entry_only + fid_sectors
+        );
+        assert!(
+            metadata_block_count(&root) > file_entry_only,
+            "the ceiling must count FID-list sectors the old formula omitted"
         );
     }
 
