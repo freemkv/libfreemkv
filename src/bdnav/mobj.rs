@@ -30,10 +30,12 @@ pub(crate) struct MovieObject {
 }
 
 const CMD_LEN: usize = 12;
-/// Sanity caps (real discs are far under these; some densely-branched
-/// dispatchers run several thousand commands in one object).
+/// Sanity cap on object count (real discs are far under this; some densely-
+/// branched dispatchers run several thousand commands in one object). There is
+/// deliberately NO command-count cap: `num_cmds` is a u16 (≤ 65535) and each
+/// object's command span is bounded against the input length below, so a
+/// separate cap would be dead code.
 const MAX_OBJECTS: usize = 4096;
-const MAX_CMDS: usize = 200_000;
 
 fn be_u16(d: &[u8], o: usize) -> Option<u16> {
     Some(u16::from_be_bytes([*d.get(o)?, *d.get(o + 1)?]))
@@ -72,9 +74,6 @@ pub(crate) fn parse(d: &[u8]) -> Option<Vec<MovieObject>> {
         // Object header: flags(1) + reserved(1) + num_cmds(u16).
         let num_cmds = be_u16(d, off + 2)? as usize;
         off = off.checked_add(4)?;
-        if num_cmds > MAX_CMDS {
-            return None;
-        }
         let span = num_cmds.checked_mul(CMD_LEN)?;
         let end = off.checked_add(span)?;
         if end > d.len() {
@@ -156,7 +155,7 @@ pub(crate) mod tests {
         );
     }
 
-    // NOTE: no "rejects_cmd_count_over_the_cap" test — `num_cmds` is a u16
-    // field (max 65535), always < MAX_CMDS, so that branch is unreachable via
-    // honest bytes; a test for it would be tautological. Flagged, not faked.
+    // No command-count cap exists to test: `num_cmds` is a u16 (max 65535) and
+    // each object's span is bounded against the input length, so the former
+    // MAX_CMDS check was dead code and was removed rather than left flagged.
 }

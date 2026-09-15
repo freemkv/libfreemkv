@@ -523,6 +523,14 @@ int shim_open_exclusive(const char *bsd_name) {
     // Claim the disk now that we hold the drive, so DA can't remount it during
     // the read. Best-effort: a failed claim does not fail the open (we already
     // have exclusive SCSI access and the disc is unmounted).
+    //
+    // TOCTOU note: the lock is released above, so a concurrent shim_close could
+    // tear g_handle down in the gap before da_hold runs. That is SAFE, not a
+    // use-after-free: da_hold re-takes g_handle_lock and re-checks da_queue /
+    // da_session / da_disk under it, returning early (NULL → no claim) if the
+    // teardown already happened. It never dereferences a field it read before
+    // acquiring the lock. The lock is deliberately NOT held across da_hold's
+    // ~5 s self-locking claim wait, which would serialize every open behind it.
     da_hold(bsd_name);
 
     return 0;
