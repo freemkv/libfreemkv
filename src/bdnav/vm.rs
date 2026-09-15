@@ -280,6 +280,16 @@ mod tests {
         // sub_grp=JUMP(1), branch_opt=JUMP_TITLE(1), imm dst.
         cmd((1 << 5) | 1, 0x81, 0, 0, title as u32, 0)
     }
+    fn call_object(obj: u16) -> [u8; 12] {
+        // sub_grp=JUMP(1), branch_opt=CALL_OBJECT(0x02), imm dst. For play-path
+        // resolution a Call follows the same target as a Jump (the return
+        // address is not modelled).
+        cmd((1 << 5) | 1, 0x82, 0, 0, obj as u32, 0)
+    }
+    fn call_title(title: u16) -> [u8; 12] {
+        // sub_grp=JUMP(1), branch_opt=CALL_TITLE(0x03), imm dst.
+        cmd((1 << 5) | 1, 0x83, 0, 0, title as u32, 0)
+    }
     fn set_move_gpr(reg: u16, imm: u16) -> [u8; 12] {
         // grp=SET(2), sub_grp=SET(0), set_opt=MOVE(1); dst=reg (GPR), imm src.
         // op_cnt=2, imm_op2=1 (src immediate), imm_op1=0 (dst is a register).
@@ -315,6 +325,28 @@ mod tests {
         let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
         // Only 1 is a feature candidate; 99 is a logo.
         assert_eq!(resolve(&index, &mobjs, &|id| id == 1), Some(1));
+    }
+
+    #[test]
+    fn call_object_follows_the_play_path_like_jump_object() {
+        // First-Play HDMV obj0 → CallObject 1 → PlayPL 11. CallObject follows
+        // the same target as JumpObject for feature resolution.
+        let d = build(&[&[call_object(1)], &[play_pl(11)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        assert_eq!(resolve(&index, &mobjs, &|id| id == 11), Some(11));
+    }
+
+    #[test]
+    fn call_title_resolves_through_the_index_like_jump_title() {
+        // CallTitle 1 → titles[0] = HDMV obj 1 (which PlayPLs 42).
+        let d = build(&[&[call_title(1)], &[play_pl(42)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(
+            PlaybackObj::Hdmv { id_ref: 0 },
+            vec![PlaybackObj::Hdmv { id_ref: 1 }],
+        );
+        assert_eq!(resolve(&index, &mobjs, &|id| id == 42), Some(42));
     }
 
     #[test]

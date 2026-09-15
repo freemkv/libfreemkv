@@ -2481,6 +2481,52 @@ mod tests {
         );
     }
 
+    // FlagInterlaced is written up-front from the FIRST picture, then corrected
+    // at finish() to the WHOLE-STREAM scan majority. A progressive leader on an
+    // interlaced feature must not misrepresent the title: the header byte is
+    // rewritten from progressive (2) to interlaced (1).
+    #[test]
+    fn flag_interlaced_is_patched_to_the_whole_stream_scan_majority() {
+        use std::sync::{Arc, Mutex};
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        // make_video_track() writes the header PROGRESSIVE (interlaced=false).
+        let mut muxer =
+            MkvMuxer::new(SharedWriter(shared.clone()), &[make_video_track()], None, 0.0, &[])
+                .unwrap();
+        // One progressive leader picture, then three interlaced → majority
+        // interlaced (2:1 the other way would stay progressive on a tie).
+        muxer
+            .write_frame_at(0, 0, true, &[0x01, 0x02, 0x03], None, None, None, Some(true))
+            .unwrap();
+        for (i, pts) in [40_000_000i64, 80_000_000, 120_000_000].iter().enumerate() {
+            muxer
+                .write_frame_at(
+                    0,
+                    *pts,
+                    false,
+                    &[0x04, 0x05, i as u8],
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                )
+                .unwrap();
+        }
+        muxer.finish().unwrap();
+        let data = shared.lock().unwrap().clone().into_inner();
+
+        // FlagInterlaced is written by hand as id(0x9A) size(0x81) value.
+        let fi = data
+            .windows(2)
+            .position(|w| w == [ebml::FLAG_INTERLACED as u8, 0x81])
+            .expect("FlagInterlaced element present");
+        assert_eq!(
+            data[fi + 2],
+            ebml::INTERLACED_INTERLACED as u8,
+            "the up-front progressive flag must be patched to interlaced by the majority"
+        );
+    }
+
     #[test]
     fn mkv_write_frame_creates_cluster() {
         let buf = Cursor::new(Vec::new());
