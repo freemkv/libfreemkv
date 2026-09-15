@@ -106,21 +106,33 @@ pub(crate) fn role_paths(udf: &crate::udf::UdfFs, role: AacsRole) -> Vec<String>
 }
 
 // Walk an AACS role's candidate paths, returning the first that reads.
-// A missing candidate is skipped; any other error (e.g. a real `DiscRead`)
-// propagates; `AacsNoKeys` only when every candidate was absent.
+//
+// AACS ships a `/AACS/DUPLICATE/` copy of every managed file precisely so a
+// bad read on the primary can fall through to the backup. A missing candidate
+// (`UdfNotFound`) and a failed read (`DiscRead`) are therefore both retriable:
+// the walk moves on to the next candidate rather than aborting. Only after
+// every candidate has been tried does a remembered `DiscRead` propagate (more
+// informative than `AacsNoKeys`); if every candidate was merely absent, the
+// result is `AacsNoKeys`. Any other error is a genuine hard failure (parse,
+// corruption) and propagates immediately.
 pub(crate) fn read_first<S, F>(candidates: &[S], mut read: F) -> crate::error::Result<Vec<u8>>
 where
     S: AsRef<str>,
     F: FnMut(&str) -> crate::error::Result<Vec<u8>>,
 {
+    let mut deferred: Option<crate::error::Error> = None;
     for path in candidates {
         match read(path.as_ref()) {
             Ok(buf) => return Ok(buf),
             Err(crate::error::Error::UdfNotFound { .. }) => continue,
+            Err(e @ crate::error::Error::DiscRead { .. }) => {
+                deferred = Some(e);
+                continue;
+            }
             Err(e) => return Err(e),
         }
     }
-    Err(crate::error::Error::AacsNoKeys)
+    Err(deferred.unwrap_or(crate::error::Error::AacsNoKeys))
 }
 
 // The module structure IS the public API — consumers import from the owning module
@@ -147,6 +159,64 @@ mod tests {
         // pin it here so the public constant tracks the spec.
         assert_eq!(ALIGNED_UNIT_LEN, 6144);
         assert_eq!(ALIGNED_UNIT_LEN, 3 * 2048);
+    }
+
+    // AACS `/AACS/DUPLICATE/` redundancy: a `DiscRead` on the primary managed
+    // file must fall through to the backup copy, not abort the whole read.
+    #[test]
+    fn read_first_falls_through_a_primary_disc_read_to_the_duplicate() {
+        use crate::error::Error;
+        let candidates = ["/AACS/Unit_Key_RO.inf", "/AACS/DUPLICATE/Unit_Key_RO.inf"];
+        let out = super::read_first(&candidates, |p| {
+            if p == "/AACS/DUPLICATE/Unit_Key_RO.inf" {
+                Ok(vec![0xAA, 0xC5])
+            } else {
+                Err(Error::DiscRead {
+                    sector: 42,
+                    status: Some(0x02),
+                    sense: None,
+                })
+            }
+        });
+        assert_eq!(
+            out.unwrap(),
+            vec![0xAA, 0xC5],
+            "a primary DiscRead must fall through to the DUPLICATE copy"
+        );
+    }
+
+    // When every candidate fails to read, the remembered `DiscRead` propagates
+    // (more informative than a bare `AacsNoKeys`); a purely absent set yields
+    // `AacsNoKeys`.
+    #[test]
+    fn read_first_propagates_disc_read_only_after_all_candidates_fail() {
+        use crate::error::Error;
+        let candidates = ["/AACS/Unit_Key_RO.inf", "/AACS/DUPLICATE/Unit_Key_RO.inf"];
+        let err = super::read_first(&candidates, |p| {
+            if p.contains("DUPLICATE") {
+                Err(Error::UdfNotFound { path: p.into() })
+            } else {
+                Err(Error::DiscRead {
+                    sector: 7,
+                    status: None,
+                    sense: None,
+                })
+            }
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::DiscRead { sector: 7, .. }),
+            "the primary DiscRead must propagate once the DUPLICATE is absent, got {err:?}"
+        );
+
+        let all_absent = super::read_first(&candidates, |p| {
+            Err(Error::UdfNotFound { path: p.into() })
+        })
+        .unwrap_err();
+        assert!(
+            matches!(all_absent, Error::AacsNoKeys),
+            "an entirely absent candidate set yields AacsNoKeys, got {all_absent:?}"
+        );
     }
 
     #[test]
