@@ -434,9 +434,17 @@ pub(crate) struct TimelineContinuity {
     // docs/mux-timeline.md#timelinecontinuitylast_raw_ns.
     last_raw_ns: Vec<Option<i64>>,
     // Per-track provisional offset for frames arriving before the video
-    // frame that opens their epoch. Never written to offset_ns/high_ns and
+    // frame that opens their epoch, tagged with the epoch sequence it was
+    // captured in (see `epoch_seq`). Never written to offset_ns/high_ns and
     // never retires an epoch. See docs/mux-timeline.md#timelinecontinuityprovisional.
-    provisional: Vec<Option<(usize, i64)>>,
+    provisional: Vec<Option<(u64, i64)>>,
+    // Monotonic epoch counter, bumped once per `open_epoch`. Used as the epoch
+    // IDENTITY a provisional is tagged with, instead of `epoch_offsets.len()`:
+    // that length is capped at MAX_EPOCHS, so past the cap it stops changing and
+    // a provisional captured then would compare equal forever and never retire —
+    // outliving its epoch and mis-offsetting later passive frames. A monotonic
+    // counter always advances. (Same root as the disc.rs slice-identity finding.)
+    epoch_seq: u64,
 }
 
 /// Most epochs retained for straggler resolution. A title has a handful; this
@@ -453,6 +461,7 @@ impl TimelineContinuity {
             prev_offset_ns: 0,
             high_ns: None,
             seams: None,
+            epoch_seq: 0,
         }
     }
 
@@ -477,6 +486,7 @@ impl TimelineContinuity {
             prev_offset_ns: 0,
             high_ns: None,
             seams,
+            epoch_seq: 0,
         }
     }
 
@@ -527,7 +537,9 @@ impl TimelineContinuity {
             self.provisional.resize(track + 1, None);
         }
         let prev_raw = self.last_raw_ns[track].replace(raw_pts_ns);
-        let retired = self.epoch_offsets.len();
+        // Monotonic epoch identity, NOT epoch_offsets.len() (which is capped at
+        // MAX_EPOCHS and would stop distinguishing epochs past the cap).
+        let retired = self.epoch_seq;
 
         // A provisional only survives until the video opens the epoch for real.
         if let Some((taken_at, _)) = self.provisional[track]
@@ -564,6 +576,9 @@ impl TimelineContinuity {
             self.epoch_offsets.remove(0);
         }
         self.epoch_offsets.push((self.offset_ns, high));
+        // Advance the monotonic epoch identity so any provisional captured in the
+        // just-closed epoch retires, regardless of the ring buffer's length cap.
+        self.epoch_seq = self.epoch_seq.saturating_add(1);
         let bump = high
             .saturating_sub(mapped_now)
             .saturating_add(DISCONTINUITY_GAP_NS);
@@ -2057,6 +2072,50 @@ mod tests {
             adj_other(&mut tc, 2 * S),
             2 * S + tc.offset_ns,
             "the track now rides the real offset like every other"
+        );
+    }
+
+    // A provisional must retire even PAST the epoch-history cap. Epoch identity
+    // was `epoch_offsets.len()`, which pins at MAX_EPOCHS once the ring is full,
+    // so a provisional captured then compared equal forever and never retired —
+    // drifting that track away from every other for the rest of the title. The
+    // monotonic `epoch_seq` keeps distinguishing epochs past the cap.
+    #[test]
+    fn a_provisional_retires_even_past_the_epoch_history_cap() {
+        let mut tc = TimelineContinuity::new();
+        // Open well more than MAX_EPOCHS epochs so the ring is full and its
+        // length can no longer tell one epoch from the next.
+        for _ in 0..(MAX_EPOCHS + 5) {
+            for i in 0..=5 {
+                adj_video(&mut tc, i * S);
+            }
+            adj_video(&mut tc, 0); // big backstep → open_epoch
+        }
+        assert_eq!(
+            tc.epoch_offsets.len(),
+            MAX_EPOCHS,
+            "the epoch history ring is full and its length is pinned at the cap"
+        );
+
+        // A passive frame arrives before its epoch's video and takes a provisional.
+        for i in 0..=5 {
+            adj_video(&mut tc, i * S);
+        }
+        adj_other(&mut tc, 599 * S); // establish this track's prev raw
+        adj_other(&mut tc, 0); // big backstep → provisional
+        assert!(
+            tc.provisional[1].is_some(),
+            "an early frame past the cap still takes a provisional"
+        );
+
+        // The video opens the next epoch. epoch_offsets.len() does NOT change
+        // here (remove+push at the cap), so only the monotonic counter marks the
+        // transition — and the provisional must retire on it.
+        adj_video(&mut tc, 0);
+        adj_other(&mut tc, S);
+        assert!(
+            tc.provisional[1].is_none(),
+            "the provisional must retire once the epoch is real, even past MAX_EPOCHS"
         );
     }
 
