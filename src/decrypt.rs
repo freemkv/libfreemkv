@@ -1114,6 +1114,66 @@ mod tests {
         unit
     }
 
+    // AACS 2.0 / UHD "OEM route": a drive delivers bus_encrypt(encrypt_unit(clear))
+    // and the mapped decrypt must strip the bus layer with the read_data_key FIRST,
+    // then the unit-key layer — the `if let Some(rdk)` arm no other test reaches.
+    #[test]
+    fn mapped_decrypt_removes_bus_then_unit_encryption_end_to_end() {
+        let unit_key = [0x5Au8; 16];
+        let rdk = [0x91u8; 16];
+        let mut clear = clear_ts_unit();
+        clear[0] |= 0xC0; // the encrypted flag lives in the clear seed
+        let mut buf = clear.clone();
+        // Inner layer: unit-key encryption. Outer layer: drive bus-encryption.
+        aacs_encrypt_unit_for_test(&mut buf, &unit_key);
+        aacs::content::encrypt_bus(&mut buf, &rdk);
+        assert!(
+            !aacs::content::is_clean(&buf, crate::disc::ContentFormat::BdTs),
+            "the delivered unit must still be scrambled before decrypt"
+        );
+
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, unit_key)],
+            read_data_key: Some(rdk),
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
+        decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
+            .expect("bus + unit-key decrypt must succeed");
+        assert_eq!(
+            buf, clear,
+            "read_data_key (bus) then unit-key must recover the plaintext exactly"
+        );
+    }
+
+    // Necessity + ordering proof: the SAME delivered bytes with NO read_data_key
+    // run only the unit-key decrypt over still-bus-encrypted data and must NOT
+    // recover clear — so the rdk arm genuinely runs, and runs BEFORE the unit key.
+    #[test]
+    fn mapped_decrypt_without_read_data_key_cannot_clear_bus_encrypted_content() {
+        let unit_key = [0x5Au8; 16];
+        let rdk = [0x91u8; 16];
+        let mut clear = clear_ts_unit();
+        clear[0] |= 0xC0;
+        let mut buf = clear.clone();
+        aacs_encrypt_unit_for_test(&mut buf, &unit_key);
+        aacs::content::encrypt_bus(&mut buf, &rdk);
+
+        let keys_no_rdk = DecryptKeys::Aacs {
+            unit_keys: vec![(0, unit_key)],
+            read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
+        // Phase::All never runs the forensic verify, so this returns Ok either
+        // way; the point is the BYTES are not the plaintext without the bus key.
+        let _ = decrypt_sectors_mapped(&mut buf, &keys_no_rdk, 0, &map);
+        assert_ne!(
+            buf, clear,
+            "without the read_data_key, unit-key decrypt alone cannot recover clear"
+        );
+    }
+
     // ── FMTS phase-aware map ──────────────────────────────────────────────────
 
     /// `entry_for` returns Some((idx, phase, range_start)) inside a range;

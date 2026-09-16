@@ -399,6 +399,29 @@ mod tests {
         assert_eq!(mkb_type_raw(&[]), None);
     }
 
+    // A genuinely-old AACS 1.0 Blu-ray really does carry MKB version 1 (the "50
+    // First Dates" disc, MKB 12628 bytes, is a real example). `mkb_version` must
+    // read that `00 00 00 01` verbatim — never reject/clamp a low value as garbage.
+    #[test]
+    fn mkb_version_reads_a_genuine_version_one_prerecorded_mkb() {
+        // Realistic early-BD layout: Type-and-Version (type 0x00041003, v1)
+        // followed by another framed record, then the end marker.
+        let mut mkb = type_and_version(MKB_TYPE_4_PRERECORDED, 1);
+        mkb.extend(rec(REC_MEDIA_KEY_DATA, &[0x5A; 32]));
+        mkb.extend([0x00, 0x00, 0x00, 0x00]); // end marker
+        assert_eq!(
+            mkb_version(&mkb),
+            Some(1),
+            "version 1 is a real, valid MKB version and must be read verbatim"
+        );
+        assert_eq!(
+            mkb_type(&mkb),
+            Some(MkbType::Prerecorded),
+            "AACS 1.0 pre-recorded Blu-ray type must still decode alongside v1"
+        );
+        assert_eq!(mkb_is_uhd(&mkb), Some(false), "a v1 BD is not UHD");
+    }
+
     #[test]
     fn trim_mkb_keeps_only_the_framed_records() {
         let mut mkb = type_and_version(MKB_20_CATEGORY_C, 1);
@@ -494,5 +517,87 @@ mod tests {
             "every byte of the MKBType field must come from the record body"
         );
         assert_eq!(mkb_version(&mkb), Some(7));
+    }
+
+    // Every MkbType category the Type-and-Version field can name must decode to
+    // its variant, and an unknown value must round-trip verbatim through
+    // `Other(raw)` — the categorisation the stride/generation dispatch keys on.
+    #[test]
+    fn mkb_type_classifies_every_category_byte() {
+        let cases: &[(u32, MkbType)] = &[
+            (MKB_TYPE_3_RECORDABLE, MkbType::Recordable),
+            (MKB_TYPE_4_PRERECORDED, MkbType::Prerecorded),
+            (MKB_TYPE_10_CLASS_II, MkbType::ClassII),
+            (MKB_20_CATEGORY_C, MkbType::CategoryC20),
+            (MKB_21_CATEGORY_C, MkbType::CategoryC21),
+        ];
+        for &(raw, expected) in cases {
+            assert_eq!(
+                MkbType::from_raw(raw),
+                expected,
+                "raw {raw:#010x} must decode to {expected:?}"
+            );
+            // …and through the byte-level path a real MKB takes.
+            let mut mkb = type_and_version(raw, 1);
+            mkb.extend([0, 0, 0, 0]);
+            assert_eq!(mkb_type(&mkb), Some(expected));
+        }
+        // An unrecognised MKBType is preserved, not coerced to a known variant.
+        const UNKNOWN: u32 = 0x1234_5678;
+        assert_eq!(MkbType::from_raw(UNKNOWN), MkbType::Other(UNKNOWN));
+        assert!(!matches!(
+            MkbType::from_raw(UNKNOWN),
+            MkbType::CategoryC20 | MkbType::CategoryC21
+        ));
+        // No Type-and-Version record at all → no classification (not a default).
+        assert_eq!(mkb_type(&[]), None);
+        assert_eq!(mkb_type_raw(&[]), None);
+    }
+
+    // generation()/major()/is_uhd()/unit_key_stride() must agree per category:
+    // only Category C is UHD (2.x, 64-byte stride), and only CategoryC21 is V21.
+    #[test]
+    fn mkb_generation_stride_and_major_per_category() {
+        // Category C 2.1 → V21, UHD, major 2, 64-byte stride.
+        assert_eq!(MkbType::CategoryC21.generation(), AacsVersion::V21);
+        assert!(MkbType::CategoryC21.is_uhd());
+        // Category C 2.0 → V20, UHD, major 2, 64-byte stride.
+        assert_eq!(MkbType::CategoryC20.generation(), AacsVersion::V20);
+        assert!(MkbType::CategoryC20.is_uhd());
+        // Everything else → V10 (BD), NOT UHD.
+        for t in [
+            MkbType::Recordable,
+            MkbType::Prerecorded,
+            MkbType::ClassII,
+            MkbType::Other(0xDEAD_BEEF),
+        ] {
+            assert_eq!(t.generation(), AacsVersion::V10, "{t:?} is AACS 1.0");
+            assert!(!t.is_uhd(), "{t:?} is not UHD");
+        }
+
+        // Stride and major are the two consumers of the generation enum.
+        assert_eq!(AacsVersion::V10.unit_key_stride(), 48);
+        assert_eq!(AacsVersion::V20.unit_key_stride(), 64);
+        assert_eq!(AacsVersion::V21.unit_key_stride(), 64);
+        assert_eq!(AacsVersion::V10.major(), AACS_MAJOR_BD);
+        assert_eq!(AacsVersion::V20.major(), AACS_MAJOR_UHD);
+        assert_eq!(AacsVersion::V21.major(), AACS_MAJOR_UHD);
+    }
+
+    // from_major is the inverse the keysource stride dispatch relies on: ONLY
+    // the BD major (1) is V10; every other integer takes the V20 64-byte stride.
+    #[test]
+    fn aacs_version_from_major_only_bd_is_v10() {
+        assert_eq!(AacsVersion::from_major(AACS_MAJOR_BD), AacsVersion::V10);
+        assert_eq!(AacsVersion::from_major(AACS_MAJOR_UHD), AacsVersion::V20);
+        // Unknown majors are NOT V10 — they must not take the 48-byte stride.
+        for m in [0u8, 3, 4, 255] {
+            assert_eq!(
+                AacsVersion::from_major(m),
+                AacsVersion::V20,
+                "major {m} must not select the V10 stride"
+            );
+            assert_eq!(AacsVersion::from_major(m).unit_key_stride(), 64);
+        }
     }
 }

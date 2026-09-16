@@ -198,6 +198,14 @@ impl Drive {
         self.unlocker_name = Some(name.to_string());
     }
 
+    /// Test-only: stash the OEM Volume ID a matching unlocker would have
+    /// returned at init(), so `do_handshake_cert`'s OEM-VID short-circuit
+    /// (skip the cert handshake, credit `drive_unlocked`) can be exercised.
+    #[cfg(test)]
+    pub(crate) fn set_oem_vid_for_test(&mut self, vid: [u8; 16]) {
+        self.oem_vid = Some(vid);
+    }
+
     /// Get a clone of the halt flag. Set to true to interrupt Drive::read().
     pub fn halt_flag(&self) -> Arc<AtomicBool> {
         self.halt.clone()

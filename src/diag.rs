@@ -493,11 +493,13 @@ fn dump_aacs(disc: &Disc) {
     // Unit_Key_RO.inf if captured. Report both: resolved count and raw len.
     tracing::debug!(
         target: DIAG,
-        "tag=aacs version={} bus_enc={} mkb_version={:?} disc_hash={} key_source={:?} \
+        "tag=aacs version={} bus_enc={} mkb_version={} disc_hash={} key_source={:?} \
     vuk={} unit_keys_resolved={} uk_ro_bytes={} mkb_bytes={}",
         a.version,
         a.bus_encryption,
-        a.mkb_version,
+        a.mkb_version
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
         a.disc_hash,
         a.key_source,
         a.vuk.is_some(),

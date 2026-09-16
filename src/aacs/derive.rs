@@ -734,6 +734,258 @@ mod resolve_candidate_tests {
             "PK chain recovers the title key"
         );
     }
+
+    // VUK relation `Kvu = AES-128D(Km, IDv) XOR IDv` ([PR]/[BD] §3.3), anchored
+    // to the FIPS-197 AES-128 known-answer vector so the test pins BOTH the AES
+    // primitive and the trailing XOR (a dropped XOR or encrypt-swap changes it).
+    #[test]
+    fn derive_vuk_matches_the_fips197_aes_decrypt_xor_relation() {
+        use crate::aacs::crypto::aes_ecb_decrypt;
+
+        // FIPS-197 Appendix example: AES-128D(key, ciphertext) == plaintext.
+        let key: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let ciphertext: [u8; 16] = [
+            0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4,
+            0xc5, 0x5a,
+        ];
+        let plaintext: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        // The known AES-128 decrypt result — pins the primitive derive_vuk builds on.
+        assert_eq!(
+            aes_ecb_decrypt(&key, &ciphertext),
+            plaintext,
+            "FIPS-197 AES-128 decrypt vector"
+        );
+
+        // Treating `key` as the Media Key and `ciphertext` as the Volume ID, the
+        // VUK is the known plaintext XOR the Volume ID.
+        let mut expected = plaintext;
+        for i in 0..16 {
+            expected[i] ^= ciphertext[i];
+        }
+        assert_eq!(
+            derive_vuk(&key, &ciphertext),
+            expected,
+            "VUK = AES-128D(Km, IDv) XOR IDv against a known AES vector"
+        );
+
+        // And it is genuinely XOR: a Volume ID sharing set bits with the decrypt
+        // must CLEAR them, which an OR could never do.
+        let mk = [0xFFu8; 16];
+        let vid = [0xABu8; 16];
+        let mut want = aes_ecb_decrypt(&mk, &vid);
+        for i in 0..16 {
+            want[i] ^= vid[i];
+        }
+        assert_eq!(derive_vuk(&mk, &vid), want, "XOR, not OR, of IDv");
+    }
+
+    /// A single-CPS `Unit_Key_RO.inf` in the real on-disc shape (Bruges/Titanic:
+    /// one encrypted title key at offset 0x50) parses to exactly one key numbered
+    /// CPS unit 1, and `derive_unit_keys` unwraps it with the VUK.
+    #[test]
+    fn single_cps_inf_parses_one_key_at_offset_0x50_and_boils_it() {
+        // uk_pos = 0x20; first (only) key at uk_pos + 48 = 0x50.
+        let mut inf = vec![0u8; 0x50 + 16];
+        inf[0..4].copy_from_slice(&0x20u32.to_be_bytes());
+        inf[0x20..0x22].copy_from_slice(&1u16.to_be_bytes()); // num_unit_keys = 1
+        let enc = [0x9Au8; 16];
+        inf[0x50..0x60].copy_from_slice(&enc);
+
+        let ukf = parse_unit_key_ro(&inf, AacsVersion::V10).expect("valid single-CPS inf");
+        assert_eq!(
+            ukf.encrypted_keys,
+            vec![(1u32, enc)],
+            "one CPS unit, numbered 1, read from offset 0x50"
+        );
+
+        let vuk = [0x5Cu8; 16];
+        let boiled = derive_unit_keys(&ukf, &vuk);
+        assert_eq!(
+            boiled,
+            vec![(1u32, decrypt_unit_key(&vuk, &enc))],
+            "the single unit key is the VUK-decrypt of its slot, keyed by CPS 1"
+        );
+    }
+
+    /// Build an `n`-key `Unit_Key_RO.inf` at a chosen stride, each slot filled
+    /// with a distinct byte so a mis-strided read is visible.
+    fn multi_cps_inf(n: usize, stride: usize) -> (Vec<u8>, Vec<[u8; 16]>) {
+        let uk_pos = 0x20usize;
+        let key0 = uk_pos + 48;
+        let total = key0 + (n.saturating_sub(1)) * stride + 16;
+        let mut inf = vec![0u8; total];
+        inf[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+        inf[uk_pos..uk_pos + 2].copy_from_slice(&(n as u16).to_be_bytes());
+        let mut encs = Vec::new();
+        for i in 0..n {
+            let k = [(0x10 + i as u8); 16];
+            let o = key0 + i * stride;
+            inf[o..o + 16].copy_from_slice(&k);
+            encs.push(k);
+        }
+        (inf, encs)
+    }
+
+    /// A MULTI-CPS inf yields one key per CPS unit, numbered 1..=n in on-disc
+    /// order, and each boils to the VUK-decrypt of its own slot — the map cannot
+    /// drift or renumber.
+    #[test]
+    fn multi_cps_inf_numbers_each_unit_and_maps_to_its_slot() {
+        let (inf, encs) = multi_cps_inf(4, 48); // V10 stride
+        let ukf = parse_unit_key_ro(&inf, AacsVersion::V10).expect("valid multi-CPS inf");
+        assert_eq!(ukf.encrypted_keys.len(), 4, "one key per CPS unit");
+        let cps: Vec<u32> = ukf.encrypted_keys.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cps, vec![1, 2, 3, 4], "CPS units numbered 1..=n in order");
+
+        let vuk = [0x33u8; 16];
+        let boiled = derive_unit_keys(&ukf, &vuk);
+        for (i, (num, key)) in boiled.iter().enumerate() {
+            assert_eq!(*num, (i + 1) as u32, "CPS number is the 1-based slot index");
+            assert_eq!(
+                *key,
+                decrypt_unit_key(&vuk, &encs[i]),
+                "each unit key is the VUK-decrypt of its own encrypted slot"
+            );
+        }
+    }
+
+    /// The stride `parse_unit_key_ro` walks is driven by the AACS generation:
+    /// V10 reads 48-byte spacing, V20/V21 read 64-byte spacing. Same buffer, two
+    /// versions, DIFFERENT second key — the V10-vs-2.x distinction the on-disc
+    /// layout hinges on.
+    #[test]
+    fn parse_unit_key_ro_stride_follows_the_aacs_version() {
+        // Two keys spaced at the V20 (64-byte) stride. Key 0 is shared (both
+        // strides read +48); key 1 sits at +64, which a V10 parse (+48) misses.
+        let uk_pos = 0x20usize;
+        let key0 = uk_pos + 48;
+        let v10_key1 = key0 + 48;
+        let v20_key1 = key0 + 64;
+        let mut inf = vec![0u8; v20_key1 + 16];
+        inf[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+        inf[uk_pos..uk_pos + 2].copy_from_slice(&2u16.to_be_bytes());
+        inf[key0..key0 + 16].fill(0xA0);
+        inf[v10_key1..v10_key1 + 16].fill(0x10);
+        inf[v20_key1..v20_key1 + 16].fill(0x20);
+
+        let v10 = parse_unit_key_ro(&inf, AacsVersion::V10).expect("v10");
+        let v20 = parse_unit_key_ro(&inf, AacsVersion::V20).expect("v20");
+        let v21 = parse_unit_key_ro(&inf, AacsVersion::V21).expect("v21");
+
+        assert_eq!(v10.encrypted_keys[0].1, [0xA0; 16], "key 0 shared");
+        assert_eq!(v20.encrypted_keys[0].1, [0xA0; 16]);
+        assert_eq!(v10.encrypted_keys[1].1, [0x10; 16], "V10 reads +48");
+        assert_eq!(v20.encrypted_keys[1].1, [0x20; 16], "V20 reads +64");
+        assert_eq!(
+            v21.encrypted_keys[1].1, [0x20; 16],
+            "V21 shares the V20 64-byte stride"
+        );
+        assert_ne!(v10.encrypted_keys[1].1, v20.encrypted_keys[1].1);
+    }
+
+    /// `resolve_candidate` derives the inf parse stride from the disc's OWN MKB
+    /// (`mkb_type(mkb).generation()`), NOT a fixed default: a V20 (Category C)
+    /// MKB boils the second unit key at the 64-byte stride, while an absent MKB
+    /// falls back to V10's 48-byte stride.
+    #[test]
+    fn resolve_candidate_boils_at_the_mkb_declared_stride() {
+        // A two-key inf whose 2nd key differs by stride (see the parse test).
+        let uk_pos = 0x20usize;
+        let key0 = uk_pos + 48;
+        let v10_key1 = key0 + 48;
+        let v20_key1 = key0 + 64;
+        let mut inf = vec![0u8; v20_key1 + 16];
+        inf[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+        inf[uk_pos..uk_pos + 2].copy_from_slice(&2u16.to_be_bytes());
+        inf[key0..key0 + 16].fill(0xA0);
+        inf[v10_key1..v10_key1 + 16].fill(0x10);
+        inf[v20_key1..v20_key1 + 16].fill(0x20);
+
+        let vuk = Vuk([0x44u8; 16]);
+
+        // A minimal Category-C 2.0 Type-and-Version record → generation V20.
+        let v20_mkb: [u8; 12] = [
+            0x10, 0x00, 0x00, 0x0C, 0x48, 0x14, 0x10, 0x03, 0x00, 0x00, 0x00, 0x4D,
+        ];
+        assert_eq!(
+            mkb_type(&v20_mkb).map(|t| t.generation()),
+            Some(AacsVersion::V20),
+            "fixture check: this MKB declares AACS 2.0"
+        );
+        let r20 = resolve_candidate(&KeyCandidate::Vuk(vuk), &v20_mkb, &inf, None)
+            .expect("V20 MKB boils the inf");
+        assert_eq!(
+            r20.unit_keys[1].1,
+            decrypt_unit_key(&vuk.0, &[0x20; 16]),
+            "the V20 MKB drives the 64-byte stride, reading the 2nd key at +64"
+        );
+
+        // No MKB → mkb_type is None → the V10 48-byte fallback stride.
+        let r10 = resolve_candidate(&KeyCandidate::Vuk(vuk), &[], &inf, None)
+            .expect("absent MKB falls back to V10");
+        assert_eq!(
+            r10.unit_keys[1].1,
+            decrypt_unit_key(&vuk.0, &[0x10; 16]),
+            "an absent MKB falls back to the V10 48-byte stride, reading +48"
+        );
+        assert_ne!(r20.unit_keys[1].1, r10.unit_keys[1].1);
+    }
+
+    /// PIN: a `Mk` candidate is PURE DERIVATION — `resolve_candidate` does NOT
+    /// validate the Media Key against the MKB. A WRONG MK (one the MKB's verify
+    /// record would reject) still boils a full set of unit keys, from the VUK
+    /// that wrong MK produces. This documents the "computed-but-wrong-UK" case:
+    /// the caller's sample/`is_clean_ts` step, not this function, is the gate.
+    #[test]
+    fn resolve_candidate_mk_does_not_validate_the_media_key_against_the_mkb() {
+        // An MKB carrying a 0x86 verify record built for a DIFFERENT media key,
+        // so `km_verifies` would reject the candidate below.
+        let real_km = [0xC3u8; 16];
+        let mut vd = [0x11u8; 16];
+        vd[..8].copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]);
+        let mk_dv = aes_ecb_encrypt(&real_km, &vd);
+        let mut mkb = vec![
+            0x10, 0x00, 0x00, 0x0C, 0x48, 0x14, 0x10, 0x03, 0x00, 0x00, 0x00, 0x4D,
+        ];
+        mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&mk_dv);
+        // The MK we hand in is NOT the one the verify record was built for.
+        let wrong_mk = MediaKey([0x77u8; 16]);
+        assert!(
+            !probe::km_verifies(&mkb, &wrong_mk.0),
+            "fixture check: the wrong MK must fail the MKB verify record"
+        );
+
+        let vid = Vid([0x42u8; 16]);
+        let enc = [0x9Au8; 16];
+        let inf = synth_inf(std::slice::from_ref(&enc));
+
+        let r = resolve_candidate(&KeyCandidate::Mk(wrong_mk), &mkb, &inf, Some(vid))
+            .expect("resolve_candidate boils regardless of MK-vs-MKB validity");
+        // The chain is derived straight from the (wrong) MK, no gate applied.
+        let expected_vuk = derive_vuk(&wrong_mk.0, &vid.0);
+        assert_eq!(
+            r.vuk,
+            Some(Vuk(expected_vuk)),
+            "VUK is derived from the given MK"
+        );
+        assert_eq!(
+            r.mk,
+            Some(wrong_mk),
+            "the candidate MK is carried through unchecked"
+        );
+        assert_eq!(
+            r.unit_keys,
+            vec![(1u32, decrypt_unit_key(&expected_vuk, &enc))],
+            "unit keys are boiled from the wrong VUK — derivation does not validate"
+        );
+    }
 }
 
 // Device-key POSITION recovery and the MKB probe accessors. No published AACS

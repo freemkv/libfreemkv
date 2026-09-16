@@ -1304,4 +1304,102 @@ mod tests {
         // Non-secret shape stays printable for diagnostics.
         assert!(dbg.contains("units_len: 8"), "{dbg}");
     }
+
+    /// A source whose every unit is CPI-encrypted, for exercising the count cap
+    /// and extent-skip logic without the clarity/CPI selection getting in the way.
+    struct AllEncryptedSource {
+        cap: u32,
+    }
+    impl crate::sector::SectorSource for AllEncryptedSource {
+        fn capacity_sectors(&self) -> u32 {
+            self.cap
+        }
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _r: bool,
+        ) -> crate::error::Result<usize> {
+            let bytes = count as usize * 2048;
+            // 0xC0 in byte 0 of every unit → CPI-encrypted for BdTs.
+            buf[..bytes].fill(0xC0);
+            Ok(bytes)
+        }
+    }
+
+    fn title_with_extents(extents: Vec<crate::disc::Extent>) -> crate::disc::DiscTitle {
+        crate::disc::DiscTitle {
+            playlist: String::new(),
+            playlist_id: 0,
+            duration_secs: 0.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents,
+            content_format: crate::disc::ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        }
+    }
+
+    /// `read_encrypted_units` returns AT MOST `n` units and stops as soon as it
+    /// has them — an all-encrypted extent must not spill every probe's worth of
+    /// samples when the caller asked for a few.
+    #[test]
+    fn read_encrypted_units_returns_at_most_n() {
+        use crate::aacs::content::{ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
+        let total_units = 600u32;
+        let ext_start = 1000u32;
+        let mut src = AllEncryptedSource {
+            cap: ext_start + total_units * ALIGNED_UNIT_SECTORS + 64,
+        };
+        let title = title_with_extents(vec![crate::disc::Extent {
+            start_lba: ext_start,
+            sector_count: total_units * ALIGNED_UNIT_SECTORS,
+        }]);
+
+        for n in [1usize, 3, 8] {
+            let samples = read_encrypted_units(&mut src, &title, n);
+            assert_eq!(samples.len(), n, "must return exactly the {n} requested");
+            for s in &samples {
+                assert!(aacs_unit_encrypted(s, crate::disc::ContentFormat::BdTs));
+            }
+        }
+    }
+
+    /// An extent too small to hold a single 3-sector aligned unit yields zero
+    /// units and must be SKIPPED, with sampling continuing into the next extent —
+    /// not abandoned, and not a panic on the empty extent.
+    #[test]
+    fn read_encrypted_units_skips_a_zero_unit_extent_and_samples_the_next() {
+        use crate::aacs::content::{ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
+        let good_units = 400u32;
+        let good_start = 5000u32;
+        let mut src = AllEncryptedSource {
+            cap: good_start + good_units * ALIGNED_UNIT_SECTORS + 64,
+        };
+        // Extent 0: only 2 sectors — fewer than one 3-sector aligned unit → 0 units.
+        // Extent 1: a normal, sampleable extent.
+        let title = title_with_extents(vec![
+            crate::disc::Extent {
+                start_lba: 10,
+                sector_count: ALIGNED_UNIT_SECTORS - 1,
+            },
+            crate::disc::Extent {
+                start_lba: good_start,
+                sector_count: good_units * ALIGNED_UNIT_SECTORS,
+            },
+        ]);
+
+        let samples = read_encrypted_units(&mut src, &title, 4);
+        assert_eq!(
+            samples.len(),
+            4,
+            "the empty first extent is skipped; the second extent supplies the samples"
+        );
+        for s in &samples {
+            assert!(aacs_unit_encrypted(s, crate::disc::ContentFormat::BdTs));
+        }
+    }
 }

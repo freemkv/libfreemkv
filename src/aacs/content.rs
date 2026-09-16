@@ -280,6 +280,25 @@ pub fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
     }
 }
 
+/// Test-only exact inverse of [`decrypt_bus`]: apply AACS 2.0 bus ENCRYPTION to
+/// an aligned unit in place — per-sector AES-CBC-encrypt bytes 16..2048 of each
+/// 2048-byte sector under `read_data_key`, leaving the first 16 bytes of every
+/// sector clear (they are plaintext on the wire, as `decrypt_bus` relies on).
+/// Used to build a bus-encrypted fixture that `decrypt_bus` must recover, and by
+/// the `decrypt.rs` end-to-end tests to model the drive's forward transform.
+#[cfg(test)]
+pub(crate) fn encrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
+    for sector_start in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES) {
+        if sector_start + SECTOR_BYTES > unit.len() {
+            break;
+        }
+        crate::aacs::crypto::aes_cbc_encrypt(
+            read_data_key,
+            &mut unit[sector_start + 16..sector_start + SECTOR_BYTES],
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::crypto::aes_ecb_decrypt;
@@ -1068,6 +1087,90 @@ mod tests {
             unit.as_slice(),
             original.as_slice(),
             "decrypt_bus must invert the per-sector bus encryption exactly"
+        );
+    }
+
+    // Full round trip through the SHARED `encrypt_bus` seam (the exact inverse
+    // used by the decrypt.rs end-to-end tests): clear -> bus-encrypt -> bus-
+    // decrypt must recover byte-for-byte, and the payload must actually change.
+    #[test]
+    fn encrypt_bus_is_the_exact_inverse_of_decrypt_bus() {
+        let rdk = [0x3Cu8; 16];
+        let original = clear_unit();
+        let mut unit = original.clone();
+        encrypt_bus(&mut unit, &rdk);
+        assert_ne!(
+            &unit[16..SECTOR_BYTES],
+            &original[16..SECTOR_BYTES],
+            "bus encryption must encipher the per-sector payload"
+        );
+        decrypt_bus(&mut unit, &rdk);
+        assert_eq!(
+            unit, original,
+            "bus encrypt/decrypt must round-trip exactly"
+        );
+    }
+
+    // Bus encryption covers ONLY bytes 16..2048 of each 2048-byte sector; the
+    // first 16 bytes are the plaintext seed and `decrypt_bus` must never touch
+    // them. Pins the "skip first 16 bytes" contract per sector.
+    #[test]
+    fn decrypt_bus_leaves_each_sector_seed_untouched() {
+        let rdk = [0x6Du8; 16];
+        let mut unit = clear_unit();
+        encrypt_bus(&mut unit, &rdk);
+        // Snapshot each sector's 16-byte seed as it arrives from the drive.
+        let seeds: Vec<[u8; 16]> = (0..ALIGNED_UNIT_LEN)
+            .step_by(SECTOR_BYTES)
+            .map(|s| unit[s..s + 16].try_into().unwrap())
+            .collect();
+        decrypt_bus(&mut unit, &rdk);
+        for (i, s) in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES).enumerate() {
+            assert_eq!(
+                &unit[s..s + 16],
+                &seeds[i],
+                "decrypt_bus must leave sector {i}'s 16-byte seed byte-for-byte"
+            );
+        }
+    }
+
+    // A wrong read_data_key must NOT recover the bus-encrypted region — the
+    // ground truth that the key genuinely drives the transform.
+    #[test]
+    fn decrypt_bus_wrong_read_data_key_does_not_recover() {
+        let original = clear_unit();
+        let mut unit = original.clone();
+        encrypt_bus(&mut unit, &[0x91u8; 16]);
+        decrypt_bus(&mut unit, &[0x22u8; 16]); // wrong rdk
+        assert_ne!(
+            &unit[16..SECTOR_BYTES],
+            &original[16..SECTOR_BYTES],
+            "a wrong read_data_key must not recover the bus-encrypted region"
+        );
+    }
+
+    // A buffer whose length is not a whole number of sectors: `decrypt_bus`
+    // processes only the WHOLE sectors and leaves the partial trailing sector
+    // byte-for-byte (the `sector_start + SECTOR_BYTES > len` break).
+    #[test]
+    fn decrypt_bus_skips_a_partial_trailing_sector() {
+        let rdk = [0x5Cu8; 16];
+        let mut full = clear_unit();
+        encrypt_bus(&mut full, &rdk);
+        // Two whole sectors + a 100-byte fragment of the third.
+        let mut buf = full[..2 * SECTOR_BYTES + 100].to_vec();
+        let tail_before = buf[2 * SECTOR_BYTES..].to_vec();
+        decrypt_bus(&mut buf, &rdk);
+        let clear = clear_unit();
+        assert_eq!(
+            buf[..2 * SECTOR_BYTES],
+            clear[..2 * SECTOR_BYTES],
+            "the two whole sectors must bus-decrypt back to clear"
+        );
+        assert_eq!(
+            buf[2 * SECTOR_BYTES..],
+            tail_before[..],
+            "the partial trailing sector must be left untouched"
         );
     }
 

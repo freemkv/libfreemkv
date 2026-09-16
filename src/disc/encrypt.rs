@@ -1161,4 +1161,164 @@ mod tests {
             UnlockOutcome::HandshakeRejected
         );
     }
+
+    // ---------------------------------------------------------------
+    // Tests: do_handshake_cert route selection (OEM VID vs cert)
+    // ---------------------------------------------------------------
+
+    /// OEM-VID short-circuit: when an unlocker stashed the disc's Volume ID at
+    /// `init()` (`oem_vid` is `Some`), `do_handshake_cert` returns that VID and
+    /// SKIPS the AACS host-cert handshake entirely — no SCSI is issued (contrast
+    /// the cert route, which reads the MKB). The result credits `drive_unlocked`
+    /// (bus encryption removed AT THE DRIVE) but carries NO `read_data_key`: the
+    /// AACS-2.0 "VID served, but no bus key from this path" case the bus-key gate
+    /// must later surface. Red-before-green: without the short-circuit the cert
+    /// route fires and the SCSI count is non-zero.
+    #[test]
+    fn oem_vid_short_circuits_cert_handshake_with_drive_unlocked_and_no_rdk() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let scsi_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(CountingTransport(
+            scsi_count.clone(),
+        )));
+        let vid = [0x7Au8; 16];
+        drive.set_oem_vid_for_test(vid);
+        let opts = ScanOptions::default();
+        let (result, err) = Disc::do_handshake_cert(&mut drive, &opts);
+        // Read the count BEFORE `drive` drops (Drop::cleanup issues a tray-unlock).
+        assert_eq!(
+            scsi_count.load(SeqCst),
+            0,
+            "the OEM-VID short-circuit must issue NO SCSI (the cert route is skipped)"
+        );
+        assert!(err.is_none(), "an OEM VID is a success, not an error");
+        let hs = result.expect("OEM VID yields a HandshakeResult");
+        assert_eq!(hs.volume_id, vid, "the stashed OEM VID must propagate");
+        assert!(
+            hs.drive_unlocked,
+            "an OEM VID means the drive is unlocked at the drive (firmware)"
+        );
+        assert_eq!(
+            hs.read_data_key, None,
+            "the OEM/VID-only path never produces a read_data_key"
+        );
+        assert_eq!(
+            hs.read_data_key_err, None,
+            "None here is 'not attempted', not a read failure — no error code"
+        );
+    }
+
+    /// When NO unlocker serves a VID (neither `oem_vid` nor a firmware
+    /// `unlocker_name`), `do_handshake_cert` RUNS the cert route: it reads the
+    /// MKB from the drive (issuing SCSI) and collects host certs. With zero certs
+    /// available it folds to `AacsNoHostCert` and yields no HandshakeResult — but
+    /// crucially the cert route DID run (SCSI issued), unlike the firmware-claimed
+    /// guard which issues zero. This is the counterpart to the OEM-VID and
+    /// firmware-claimed short-circuits.
+    #[test]
+    fn no_unlocker_runs_cert_route_and_issues_scsi() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let scsi_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(CountingTransport(
+            scsi_count.clone(),
+        )));
+        // No oem_vid, no unlocker_name → the cert route is the unlocker here.
+        let opts = ScanOptions::default();
+        let (result, err) = Disc::do_handshake_cert(&mut drive, &opts);
+        assert!(
+            scsi_count.load(SeqCst) > 0,
+            "the cert route must have run (MKB read issues SCSI) when no unlocker serves a VID"
+        );
+        assert!(
+            result.is_none(),
+            "with no host cert the cert route yields no VID"
+        );
+        assert!(
+            matches!(err, Some(Error::AacsNoHostCert { .. })),
+            "no host cert from any source folds to AacsNoHostCert, got {err:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Tests: bus_encryption_removed — the single source of truth
+    // ---------------------------------------------------------------
+
+    fn hs_with(drive_unlocked: bool, rdk: Option<[u8; 16]>) -> HandshakeResult {
+        HandshakeResult {
+            volume_id: [0x11u8; 16],
+            read_data_key: rdk,
+            read_data_key_err: None,
+            drive_unlocked,
+        }
+    }
+
+    /// `bus_encryption_removed` is the single gate. Cover every combination:
+    /// - not bus-encrypted → always removed (nothing to remove), regardless of
+    ///   whether a handshake is present.
+    /// - bus-encrypted + no handshake (file/ISO) → removed at read time.
+    /// - bus-encrypted + handshake with a read_data_key → removed via AKE.
+    /// - bus-encrypted + handshake, drive_unlocked → removed at the drive.
+    /// - bus-encrypted + handshake, no RDK and not unlocked → NOT removed.
+    #[test]
+    fn bus_encryption_removed_covers_all_paths() {
+        // never had it: handshake state is irrelevant.
+        assert!(super::bus_encryption_removed(false, None));
+        assert!(super::bus_encryption_removed(
+            false,
+            Some(&hs_with(false, None))
+        ));
+
+        // bus-encrypted, no handshake (file/ISO): clear at read time.
+        assert!(super::bus_encryption_removed(true, None));
+
+        // bus-encrypted + a cert read_data_key: removed via AKE.
+        assert!(super::bus_encryption_removed(
+            true,
+            Some(&hs_with(false, Some([0x22u8; 16])))
+        ));
+
+        // bus-encrypted + drive_unlocked (no RDK): removed at the drive.
+        assert!(super::bus_encryption_removed(
+            true,
+            Some(&hs_with(true, None))
+        ));
+
+        // bus-encrypted + neither: NOT removed — the wrong-keys guard.
+        assert!(!super::bus_encryption_removed(
+            true,
+            Some(&hs_with(false, None))
+        ));
+
+        // Belt-and-braces: RDK present AND unlocked is still removed (OR, not XOR).
+        assert!(super::bus_encryption_removed(
+            true,
+            Some(&hs_with(true, Some([0x22u8; 16])))
+        ));
+    }
+
+    /// A handshake that carries a VID but `read_data_key: None` must SURFACE the
+    /// `None` onto the state — not silently drop it or synthesize a key. On a
+    /// non-bus-encrypted disc (so the bus-key gate does not fire) the VID still
+    /// propagates while `read_data_key` stays `None`. This is the AACS-2.0
+    /// "VID present, no RDK" signal the downstream gate keys off.
+    #[test]
+    fn resolve_vid_only_surfaces_vid_with_absent_read_data_key() {
+        let (mut disc, udf) = disc_with_cert(0x00, false); // V10, bus off
+        let vid = [0x33u8; 16];
+        let hs = HandshakeResult {
+            volume_id: vid,
+            read_data_key: None,
+            read_data_key_err: None,
+            drive_unlocked: false,
+        };
+        let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).expect("state");
+        assert_eq!(
+            st.volume_id, vid,
+            "the VID must propagate even without an RDK"
+        );
+        assert_eq!(
+            st.read_data_key, None,
+            "a handshake bus_key of None must surface as None, not be dropped or faked"
+        );
+    }
 }
