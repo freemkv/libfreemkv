@@ -1,6 +1,12 @@
 # Changelog
 
-## [1.7.1] — UNRELEASED
+## [1.7.2] — UNRELEASED
+
+### Changed
+
+- Unified release with freemkv-unlock 1.7.2 (firmware ABI v2). No functional changes to this crate.
+
+## [1.7.1] — 2026-09-14
 
 ### Changed
 
