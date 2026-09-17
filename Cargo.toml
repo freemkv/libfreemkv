@@ -56,9 +56,10 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 sha1 = { version = "0.10", optional = true }
 aes = { version = "0.9", optional = true }
-# Interim path dep for local cross-repo dev; the release script re-pins this to
-# `{ git = ".../freemkv-unlock", tag = "vX.Y.Z" }` before tagging libfreemkv (so
-# the released tag resolves freemkv-unlock from git, not a sibling path).
+# Interim path dep for local cross-repo dev; `release-orchestrate.yml` re-pins
+# this to `{ git = ".../freemkv-unlock", tag = "vX.Y.Z" }` in the tagged commit
+# (so the released tag resolves freemkv-unlock from git, not a sibling path) and
+# restores the path dep on the branch tip.
 freemkv-unlock = { path = "../freemkv-unlock", optional = true }
 rand = { version = "0.10", optional = true }
 zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
