@@ -1617,6 +1617,10 @@ mod tests {
         };
         let mut disc = build_disc(root);
         let out = TmpDir::new("case_collision");
+        // Create the dir before probing so the probe reflects the REAL volume:
+        // `dir_is_case_insensitive` returns a conservative `true` on a missing dir,
+        // disagreeing with `extract_tree`'s own post-mkdir probe on a case-sensitive host.
+        std::fs::create_dir_all(out.path()).unwrap();
         let insensitive = super::dir_is_case_insensitive(out.path());
         let res = clear_disc().extract_tree(&mut disc, out.path(), &ExtractOptions::default());
         if insensitive {
