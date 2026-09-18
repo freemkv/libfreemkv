@@ -2,9 +2,13 @@
 
 ## [1.7.2] — UNRELEASED
 
+### Fixed
+
+- ISO imaging: the READ CAPACITY (disc-size) query is now retried, with a UDF partition-size fallback, and `image_read_sectors()` hard-errors (`EmptyImage`) when the size is unavailable instead of writing a silent 0-byte ISO reported as success. Fixes an intermittent empty ISO caused by a transient capacity-query transport failure (shared CLI/autorip engine).
+
 ### Changed
 
-- Unified release with freemkv-unlock 1.7.2 (firmware ABI v2). No functional changes to this crate.
+- Unified release with freemkv-unlock 1.7.2 (firmware ABI v2).
 
 ## [1.7.1] — 2026-09-14
 
