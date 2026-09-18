@@ -258,7 +258,7 @@ impl AacsKeyMap {
     /// group's variant and are omitted entirely. `extents` are the title's clip
     /// extents; `unit_sectors` is the AACS aligned-unit size (3 sectors). A map
     /// with no forensic range returns `extents` unchanged, and a kept unit is
-    /// always one [`decrypt_sectors_mapped`] would open. See docs/decrypt.md.
+    /// always one `decrypt_sectors_mapped` would open. See docs/decrypt.md.
     pub fn read_plan(
         &self,
         extents: &[crate::disc::Extent],
@@ -337,13 +337,13 @@ pub(crate) fn decrypt_sectors_mapped(
     decrypt_sectors_mapped_in_content(buf, keys, base_lba, map, None)
 }
 
-/// [`decrypt_sectors_mapped`] restricted to the disc's encrypted-content extents.
+/// `decrypt_sectors_mapped` restricted to the disc's encrypted-content extents.
 /// `content` is the sorted/merged `(start_lba, sector_count)` content map: an
 /// aligned unit whose absolute LBA falls in NO content range is clear
 /// (UDF filesystem / BDMV nav) and is passed through untouched — never decrypted,
 /// verified, or counted as loss. `None` means "the caller only reads encrypted
 /// content", so every unit is treated as content (the legacy behaviour). This is
-/// how [`DecryptingSectorSource::with_content_ranges`] honours its contract.
+/// how [`crate::sector::DecryptingSectorSource::with_content_ranges`] honours its contract.
 pub(crate) fn decrypt_sectors_mapped_in_content(
     buf: &mut [u8],
     keys: &DecryptKeys,
@@ -494,7 +494,7 @@ fn apply_aacs_map(
 /// For CSS: descrambles per 2048-byte sector, self-cracking the title key
 /// from the data. For `None`: a no-op. For AACS: **always** returns
 /// `Err(DecryptFailed)` — AACS decrypts exclusively through the resolved key
-/// map ([`decrypt_sectors_mapped`]); reaching this arm with AACS keys means a
+/// map (`decrypt_sectors_mapped`); reaching this arm with AACS keys means a
 /// reader was built without installing its map (a bug). `unit_key_idx` is a
 /// legacy parameter, ignored. See docs/decrypt.md for full detail.
 pub fn decrypt_sectors(
