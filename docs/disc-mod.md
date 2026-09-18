@@ -217,10 +217,40 @@ authoring an entire synthetic disc image. Running it against an HD-DVD/DVD
 
 This catches both the wrapper decoy (`00245 ⊋ 00001`) and the oversize
 play-all — independent of capacity, which the `fits-disc` gate needs and
-which is `0`/unknown on drives that fail READ CAPACITY. The corpus
-title-selection gate is the backstop across the disc hoard for the known
-residual (a real feature with a separate "resume from the middle" branch
-playlist reusing most of its clips).
+which is `0`/unknown on drives that fail READ CAPACITY.
+
+### Wrapper-shape gate (issue #45)
+
+A proper-subset relation with `Q.size ≥ 0.5·P.size` is NOT by itself proof
+that `P` is a wrapper. A genuine **seamless-branch feature** `P` (body clip
+plus intro/credits/alternate-branch segments) is a *superset* of its
+single-clip body decoy `Q`: `Q` runs almost as long as `P` (e.g. 1h50 vs
+2h03, ~0.89 of the duration) yet is markedly smaller, because `P`'s branch
+segments add bytes without adding much played runtime. The old size-only
+gate mis-flagged such a `P` as a "play-all wrapper" and demoted the real
+2h03 feature below the shorter 1h50 body — a SAFETY bug (wrong title ripped).
+
+So the composite flag additionally requires `P` to *have* a wrapper shape,
+via one of two capacity-independent, per-title (`duration_secs`, `size_bytes`)
+signals on the subset `Q`:
+
+- **concat / play-all:** `Q.duration < 0.85·P.duration` — `Q` is a much
+  shorter cut and `P` pads its runtime with other segments (the true
+  play-all runs ~the SUM of its parts, so each part is well under half).
+- **bumper / outro wrapper:** `Q.size ≥ 0.90·P.size` — `Q` already holds
+  almost all of `P`'s bytes and `P` merely prepends/appends a short
+  non-feature lead/tail (the `00245 ⊋ 00001` decoy: `Q` is ~0.96 of both the
+  duration and the size, so the size limb keeps it demoted).
+
+Otherwise — `Q` runs almost as long as `P` (≥0.85) yet is well under 0.90 of
+its size — `P` is the fuller branch set and is kept. `0.85` sits above a real
+concat's per-part ratio (~0.5) and below a seamless body's (~0.89); `0.90`
+sits above a bumper wrapper's near-1.0 size share and below a branch body's.
+
+**Known residual:** a wrapper that pads runtime only modestly AND withholds
+most of its bytes from the body clip is ambiguous by shape alone. The corpus
+title-selection gate is the backstop across the disc hoard, and
+higher-precedence nav/authoring signals override the composite key.
 
 ## aligned_unit_keys_validate
 

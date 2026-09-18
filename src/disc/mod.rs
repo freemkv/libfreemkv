@@ -2142,11 +2142,11 @@ impl Disc {
     /// Precompute the [`TitleRank`] for every title, in the same index
     /// order. Composite detection: title `P` is a composite when some OTHER
     /// title `Q` has a non-empty clip-id set that is a PROPER SUBSET of `P`'s,
-    /// `Q` has plausible video, and `Q` accounts for at least half of `P`'s
-    /// declared size — independent of capacity, which may be `0`/unknown.
-    /// Known residual: a "resume from the middle" branch playlist could be
-    /// mis-flagged; rare, and higher-precedence nav/authoring signals
-    /// override it. See docs/disc-mod.md for detail.
+    /// `Q` has plausible video, `Q` accounts for at least half of `P`'s
+    /// declared size, AND `P` has a WRAPPER shape (issue #45): either `Q` is a
+    /// much shorter cut or `Q` is nearly `P`'s size-equal. Capacity-independent
+    /// (`capacity` may be `0`/unknown). See docs/disc-mod.md for the shape
+    /// gate, its thresholds, and the known residual.
     pub fn rank_titles(
         titles: &[DiscTitle],
         hint: Option<&crate::labels::FeaturePlaylistHint>,
@@ -2200,6 +2200,11 @@ impl Disc {
                                 && qj.len() < pi.len()
                                 && q.has_probable_video()
                                 && q.size_bytes as f64 >= 0.5 * p.size_bytes as f64
+                                // Seamless-branch guard (issue #45): wrapper only
+                                // if Q is a much SHORTER cut (concat) or nearly P's
+                                // SIZE-equal (bumper). See docs/disc-mod.md.
+                                && (q.duration_secs < 0.85 * p.duration_secs
+                                    || q.size_bytes as f64 >= 0.90 * p.size_bytes as f64)
                                 && qj.is_subset(pi)
                         }
                     });
@@ -4549,6 +4554,77 @@ mod tests {
         assert_eq!(
             titles[0].playlist_id, 800,
             "the standalone feature wins even when the oversize gate is disabled"
+        );
+    }
+
+    /// Issue #45 (SAFETY): a genuine seamless-branch FEATURE (00800, 4 clips,
+    /// 2h03) is a SUPERSET of its single-clip body decoy (00700, 1h50, ≥50 %
+    /// size). The old size-only composite gate mis-demoted 00800 as a "play-all
+    /// wrapper" and ripped the shorter decoy. The duration-shape guard keeps
+    /// 00800: its body subset runs almost as long (1h50 vs 2h03, ~0.89) yet is
+    /// markedly smaller (0.55) — the hallmark of seamless branching, not
+    /// concatenation.
+    #[test]
+    fn seamless_branch_feature_not_demoted_issue_45() {
+        // 00800: real feature = body + intro/credits/seamless branch segments.
+        let feature = bd_title(
+            "00800.mpls",
+            800,
+            7380.0, // 2h03
+            60_000_000_000,
+            &["00800", "00801", "00802", "00803"],
+        );
+        // 00700: single body clip, a PROPER subset, 1h50 (~89 % of 00800's
+        // duration) and 55 % of its size — enough to trip the old size gate.
+        let decoy = bd_title("00700.mpls", 700, 6600.0, 33_000_000_000, &["00800"]);
+        let capacity = 88_000_000_000u64;
+
+        // The body decoy is a proper subset with ≥50 % size — the OLD gate
+        // flagged 00800 composite on that alone. It must no longer be flagged.
+        let ranks = Disc::rank_titles(&[feature.clone(), decoy.clone()], None, None);
+        assert!(
+            !ranks[0].composite,
+            "the seamless-branch feature must not be flagged a wrapper composite"
+        );
+        assert!(!ranks[1].composite, "the shorter body subset is standalone");
+
+        let mut titles = vec![decoy, feature];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None, None);
+        assert_eq!(
+            titles[0].playlist_id, 800,
+            "the full seamless-branch feature is selected, not the shorter body decoy"
+        );
+    }
+
+    /// The seamless-branch guard must NOT weaken the real play-all case: a
+    /// concat wrapper (00099, four distinct parts, ~4h13 = their SUM) whose body
+    /// subset is much SHORTER (00800, one part, ~2h02, <half the runtime) is
+    /// still flagged composite and demoted below that standalone part.
+    #[test]
+    fn true_play_all_concat_wrapper_still_demoted() {
+        let playall = bd_title(
+            "00099.mpls",
+            99,
+            15_180.0, // ~4h13 — the SUM of its four parts
+            92_400_000_000,
+            &["00800", "00801", "00802", "00803"],
+        );
+        // The real feature = one part, ~2h02, less than half the wrapper's runtime.
+        let feature = bd_title("00800.mpls", 800, 7320.0, 57_200_000_000, &["00800"]);
+        let capacity = 100_000_000_000u64;
+
+        let ranks = Disc::rank_titles(&[playall.clone(), feature.clone()], None, None);
+        assert!(
+            ranks[0].composite,
+            "a concat play-all whose subset is much shorter is still a composite"
+        );
+        assert!(!ranks[1].composite, "the standalone feature part is not");
+
+        let mut titles = vec![playall, feature];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None, None);
+        assert_eq!(
+            titles[0].playlist_id, 800,
+            "the standalone feature wins; the concat play-all is demoted"
         );
     }
 
