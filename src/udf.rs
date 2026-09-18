@@ -1125,13 +1125,9 @@ fn read_directory(
         }
         (icb[ad_off..ad_off + l_ad].to_vec(), l_ad as u32)
     } else {
-        // Out-of-line: the FID list may span MULTIPLE allocation descriptors,
-        // and only extent_type 0 is recorded on-disc. Reading just the first AD
-        // (and trusting it recorded) truncated a directory whose FIDs cross an
-        // extent boundary, and could read a sparse/continuation descriptor's
-        // (length, LBA) as if it were FID data. Walk the descriptor list —
-        // following a type-3 continuation block just like `read_icb_extents` —
-        // gathering every recorded extent's sectors into one buffer.
+        // Out-of-line: the FID list may span MULTIPLE ADs (only extent_type 0 is FID data);
+        // reading just the first AD truncated dirs whose FIDs cross an extent boundary, or
+        // misread a sparse/type-3 descriptor's (length,LBA) as FIDs. Walk the list, gathering every extent's sectors into one buffer, following type-3 continuations like `read_icb_extents`.
         let ad_size: usize = match ad_type {
             0 => 8,  // short_ad
             1 => 16, // long_ad
@@ -1187,11 +1183,9 @@ fn read_directory(
                 ]);
 
                 if extent_type == 3 {
-                    // Continuation (ECMA-167 4/14.14.1.1 type 3): the REST of the
-                    // ADs live in the block at data_lba, NOT FID data — reading
-                    // its (length, LBA) as an extent, as the old first-AD-only
-                    // path did, enumerates an unrelated sector. Follow the
-                    // pointer instead (bounded by MAX_AD_BLOCKS).
+                    // Continuation (ECMA-167 4/14.14.1.1 type 3): the REST of the ADs live
+                    // in the block at data_lba, NOT FID data — reading its (length,LBA) as an
+                    // extent (the old first-AD-only bug) enumerates an unrelated sector. Follow the pointer instead (bounded by MAX_AD_BLOCKS).
                     if data_len > 0 {
                         next_block = Some(data_lba);
                     }
@@ -1263,11 +1257,9 @@ fn read_directory(
     let mut entries = Vec::new();
     let mut pos = 0;
 
-    // `<=`, not `<`: a FID's fixed 38-byte header that ends exactly at the
-    // declared boundary (pos + 38 == dir_end) is fully present and must be
-    // read; the strict `<` dropped it. The name, which may run past the header,
-    // is bounded against `dir_end` below so a FID whose header fits but whose
-    // NAME spills past the declared length is still rejected.
+    // `<=`, not `<`: a FID's fixed 38-byte header ending exactly at the declared boundary
+    // (pos + 38 == dir_end) is fully present and must be read (strict `<` dropped it). The
+    // name may run past the header but is bounded against `dir_end` below, so a FID whose header fits but whose NAME spills past the length is still rejected.
     while pos + 38 <= dir_end {
         let fid_tag = u16::from_le_bytes([dir_data[pos], dir_data[pos + 1]]);
         if fid_tag != 257 {
@@ -4434,11 +4426,9 @@ mod tests {
 
     #[test]
     fn read_directory_reads_fids_spanning_multiple_allocation_descriptors() {
-        // A directory's FID list can span MORE than one allocation descriptor
-        // (ECMA-167 4/14.14.1). Reading only the first AD truncated the list at
-        // the extent boundary; every recorded extent must be gathered and walked.
-        // Extent 0 (sector 60) is packed to exactly 2048 bytes so the walk flows
-        // straight into extent 1 (sector 61) where the second file's FID lives.
+        // A directory's FID list can span MORE than one AD (ECMA-167 4/14.14.1); reading
+        // only the first AD truncated it at the extent boundary, so every recorded extent
+        // must be gathered and walked. Extent 0 (sector 60) is packed to exactly 2048 bytes so the walk flows into extent 1 (sector 61), where the second file's FID lives.
         let mut e0 = Vec::new();
         push_fid_iu(&mut e0, "", 5, true, true, 0); // parent (..), 40 bytes
         // Pad FIRST.CLPI's implementation-use area so e0 ends exactly at 2048.
@@ -4510,9 +4500,8 @@ mod tests {
     #[test]
     fn read_directory_reads_a_long_ad_directorys_extent() {
         // ICB Tag flags = 1 selects long_ad (16 bytes): extent_length(4) +
-        // extent_location{ lba(4) + part_ref(2) } + impl_use(6). The LBA is at
-        // offset 4 (like short_ad), NOT offset 12 like extended_ad — reading the
-        // wrong offset walks an empty sector and the directory comes back empty.
+        // extent_location{ lba(4) + part_ref(2) } + impl_use(6). The LBA is at offset 4
+        // (like short_ad), NOT offset 12 like extended_ad — the wrong offset walks an empty sector and the directory comes back empty.
         let mut fids = Vec::new();
         push_fid_iu(&mut fids, "", 5, true, true, 0);
         push_fid_iu(&mut fids, "INDEX.BDMV", 7, false, false, 0);

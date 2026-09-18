@@ -1607,13 +1607,9 @@ impl Disc {
     /// Read UDF filesystem and set up buffered reader with metadata prefetched.
     /// Shared setup for both identify() and scan().
     fn read_udf(session: &mut Drive) -> Result<(u32, udf::BufferedSectorReader<'_>, udf::UdfFs)> {
-        // READ CAPACITY is the sole authoritative whole-disc size (the UDF
-        // partition is a subset — measured 288 sectors short on a real BD, which
-        // would truncate the backup anchor). Its field failures are sporadic
-        // (5/5 reliable on the target drive), so retry rather than substitute a
-        // short value. On persistent failure capacity is left 0: the shared
-        // scan/identify/MKV path stays lenient (titles read by extent), and only
-        // image output hard-errors, via `image_read_sectors`.
+        // READ CAPACITY is the sole authoritative whole-disc size (the UDF partition
+        // is a subset — 288 sectors short on a real BD, truncating the backup anchor).
+        // Its sporadic failures are ridden out by `read_capacity_retrying` (0 on hard fail).
         let capacity = Self::read_capacity_retrying(session);
         let batch = detect_max_batch_sectors(session.device_path());
         let mut buffered = udf::BufferedSectorReader::new(session, batch);
@@ -1641,17 +1637,14 @@ impl Disc {
     /// comfortably inside a cold spin-up + one re-enumeration.
     const READ_CAPACITY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(2);
 
-    /// READ CAPACITY with retry. Returns the hardware sector count, or 0 if
-    /// every attempt failed. READ CAPACITY is the only authoritative whole-disc
-    /// size for an image and its failures are sporadic (a transient USB/UAS +
-    /// spin-up fault), so ride one out with exponential backoff instead of
-    /// substituting a UDF partition size (a subset that would truncate the
-    /// image). No readiness poke: the only ready helper (`Drive::wait_ready`) is
-    /// a ~30s TUR loop that would blow this budget, and inventing a cheap
-    /// single-shot TUR is out of scope — a plain backoff is sufficient. A final
-    /// 0 keeps the shared scan/identify/MKV path lenient (those read titles by
-    /// extent); image output turns the 0 into a hard [`Error::EmptyImage`] via
-    /// `image_read_sectors`.
+    /// READ CAPACITY with retry. Returns the hardware sector count, or 0 if every
+    /// attempt failed. It is the only authoritative whole-disc size for an image and its
+    /// failures are sporadic (a transient USB/UAS + spin-up fault), so ride one out with
+    /// exponential backoff rather than substitute a UDF partition size (a subset that
+    /// would truncate the image). No readiness poke: the only ready helper
+    /// (`Drive::wait_ready`) is a ~30s TUR loop that would blow this budget, and a cheap
+    /// single-shot TUR is out of scope. A final 0 keeps the shared scan/identify/MKV path
+    /// lenient (titles read by extent); image output makes it a hard [`Error::EmptyImage`] via `image_read_sectors`.
     fn read_capacity_retrying(session: &mut Drive) -> u32 {
         let mut backoff = Self::READ_CAPACITY_BACKOFF_START;
         for attempt in 1..=Self::READ_CAPACITY_ATTEMPTS {

@@ -145,14 +145,14 @@ pub(crate) fn parse_bdmt_xml(xml_text: &str) -> Option<BdmtFields> {
     Some((title, description, disc_set))
 }
 
-// Reject description candidates that are themselves XML fragments (e.g.
-// only <di:thumbnail/> children, no prose) OR mixed content — prose with an
-// embedded child element, which `xml::text` returns verbatim (tags and all).
-// The old `starts_with('<')` only caught fragments that LED with a tag, so a
-// description like `Real prose <di:thumbnail/>` leaked its markup through. Any
-// `<` that begins an element / close tag / comment / PI marks the value as
-// XML-tainted; a bare `<` used as prose (e.g. `a < b`) is left alone.
-// See docs/bdmt.md — looks_like_xml.
+/// Reject description candidates that are themselves XML fragments (e.g.
+/// only <di:thumbnail/> children, no prose) OR mixed content — prose with an
+/// embedded child element, which `xml::text` returns verbatim (tags and all).
+/// The old `starts_with('<')` only caught fragments that LED with a tag, so a
+/// description like `Real prose <di:thumbnail/>` leaked its markup through. Any
+/// `<` that begins an element / close tag / comment / PI marks the value as
+/// XML-tainted; a bare `<` used as prose (e.g. `a < b`) is left alone.
+/// See docs/bdmt.md — looks_like_xml.
 fn looks_like_xml(s: &str) -> bool {
     let bytes = s.as_bytes();
     bytes.iter().enumerate().any(|(i, &b)| {

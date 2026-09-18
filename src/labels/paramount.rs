@@ -48,13 +48,13 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     Some(result)
 }
 
-// The feature playlist hint for a `playlists.xml` `<playlist>` element. Surface
-// its identity so title selection can prefer it over a size-inflated decoy.
-// Derive the numeric id and the filename from ONE parsed number so they cannot
-// disagree: keep only the digits (resisting a stray quote/space), require a
-// valid u16 playlist number, and format the canonical 5-digit `NNNNN.mpls`.
-// (`format!("{digits}.mpls")` on a 5-digit id above u16::MAX left playlist_id
-// None while the filename stayed Some — a half-hint.)
+/// The feature playlist hint for a `playlists.xml` `<playlist>` element. Surface
+/// its identity so title selection can prefer it over a size-inflated decoy.
+/// Derive the numeric id and the filename from ONE parsed number so they cannot
+/// disagree: keep only the digits (resisting a stray quote/space), require a
+/// valid u16 playlist number, and format the canonical 5-digit `NNNNN.mpls`.
+/// (`format!("{digits}.mpls")` on a 5-digit id above u16::MAX left playlist_id
+/// None while the filename stayed Some — a half-hint.)
 fn feature_hint(feature: &str) -> Option<super::FeaturePlaylistHint> {
     let id = super::xml::attr(feature, "id")?;
     let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();

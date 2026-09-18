@@ -96,11 +96,9 @@ fn assign_stream_numbers(
 
     let mut audio_idx: u32 = 1;
     let mut sub_idx: u32 = 1;
-    // Numbers already EMITTED per type. A playbackconfig that maps two distinct
-    // StreamInfo_IDs to the SAME stream number (a duplicate) must NOT emit that
-    // number twice — the second occurrence is demoted to a synthesized free
-    // number instead of colliding. A HashSet keeps the skip loop O(1) so the
-    // full 65535-stream space stays cheap to walk.
+    // Numbers already EMITTED per type. When a playbackconfig maps two distinct
+    // StreamInfo_IDs to the SAME number (a duplicate), the second is demoted to a
+    // synthesized free number, not emitted twice; the HashSet keeps the skip loop O(1) across the full 65535-stream space.
     let mut used_audio: HashSet<u16> = HashSet::new();
     let mut used_sub: HashSet<u16> = HashSet::new();
     let mut out = Vec::with_capacity(infos.len());
@@ -117,9 +115,8 @@ fn assign_stream_numbers(
             Some(n) if !used.contains(&n) => n,
             _ => {
                 // Advance past any number already claimed via the map OR already
-                // emitted (dedup). The counter strictly increases and
-                // NUMBER_SPACE_END is fixed, so this terminates in at most 65535
-                // steps for any input.
+                // emitted (dedup). The counter strictly increases and NUMBER_SPACE_END
+                // is fixed, so this terminates in at most 65535 steps for any input.
                 while *idx < NUMBER_SPACE_END
                     && (taken.contains(&(*idx as u16)) || used.contains(&(*idx as u16)))
                 {

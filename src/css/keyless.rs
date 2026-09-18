@@ -143,12 +143,10 @@ fn recover_title_key_from_plain(
     }
 }
 
-/// Recover the CSS title key from a scrambled sector using a known plaintext
-/// for the encrypted region.
+/// Recover the CSS title key from a scrambled sector via known plaintext.
 ///
-/// `plain` is the expected plaintext at byte 0x80 (at least 10 bytes).
-/// Returns the recovered key only if it actually descrambles the sector back
-/// to `plain` — guarding against the rare spurious LFSR-seed match.
+/// `plain` is the expected plaintext at byte 0x80 (≥10 bytes); returns the key only
+/// if it descrambles the sector back to `plain`, guarding a rare spurious LFSR match.
 ///
 /// TEST-ONLY: the production crack path uses [`crack_title_key`], which derives
 /// its own crib. `recover_title_key` is a known-plaintext helper exercised only

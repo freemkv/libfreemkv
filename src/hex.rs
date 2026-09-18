@@ -64,11 +64,11 @@ pub fn parse_hex_u8(s: &str) -> Option<u8> {
     u8::from_str_radix(hex_int_body(s)?, 16).ok()
 }
 
-// Trim, strip the optional `0x`/`0X` prefix, and reject a leading `+` sign.
-// `from_str_radix` accepts a leading `+` (`+10` → 16), but hex key material
-// never carries a sign — the byte parsers already reject it via `byte()`, so
-// the integer parsers must too, or the same value parses in one path and drops
-// in another. (A bare `-` already fails on the unsigned parse.)
+/// Trim, strip the optional `0x`/`0X` prefix, and reject a leading `+` sign.
+/// `from_str_radix` accepts a leading `+` (`+10` → 16), but hex key material
+/// never carries a sign — the byte parsers already reject it via `byte()`, so
+/// the integer parsers must too, or the same value parses in one path and drops
+/// in another. (A bare `-` already fails on the unsigned parse.)
 fn hex_int_body(s: &str) -> Option<&str> {
     let body = strip_hex_prefix(s.trim());
     if body.starts_with('+') {
@@ -145,10 +145,9 @@ mod tests {
         assert_eq!(parse_hex_u16("0xzz"), None);
     }
 
-    // `from_str_radix` accepts a leading `+` (`+10` → 16), but hex key material
-    // is never signed and the byte parsers reject it — so the integer parsers
-    // must reject it too. Red-before-green: before the guard, each of these
-    // returned `Some(..)` instead of `None`.
+    // `from_str_radix` accepts a leading `+` (`+10` → 16), but hex key material is
+    // never signed and the byte parsers reject it, so the integer parsers must too.
+    // Red-before-green: before the guard, each of these returned `Some(..)` not `None`.
     #[test]
     fn hex_ints_reject_leading_plus_sign() {
         assert_eq!(parse_hex_u16("+10"), None);

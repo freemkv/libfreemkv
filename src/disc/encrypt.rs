@@ -130,14 +130,9 @@ impl AacsCertUnlocker<'_> {
             // AACS-specific "why the read_data_key read failed" diagnostic does
             // not cross the seam. The bus-key gate keys off presence, not cause.
             read_data_key_err: None,
-            // Always false on the cert route: `run_bus` dispatches ONLY the disc-
-            // keyed unlockers (`disc_unlockers` = AACS, DVD), so `matched` is only
-            // ever "AACS"/"DVD"/"" — never a firmware/drive unlocker (freemkv, LD,
-            // Renesas). The disc-keyed cert route removes bus encryption via the
-            // read_data_key (AKE), which the gate credits through
-            // `read_data_key.is_some()`. A genuine DRIVE unlock cannot surface here;
-            // it arrives via the OEM-VID short-circuit in `do_handshake_cert`, which
-            // sets `drive_unlocked: true` for exactly that (rdk-less) case.
+            // Always false on the cert route: `run_bus` dispatches ONLY disc-keyed unlockers
+            // (AACS, DVD), so `matched` is never a firmware/drive unlocker (freemkv/LD/Renesas);
+            // a genuine DRIVE unlock instead sets `drive_unlocked: true` via the OEM-VID short-circuit in `do_handshake_cert` (the rdk-less case, credited by the gate like a cert `read_data_key`).
             drive_unlocked: false,
         })
     }

@@ -157,12 +157,9 @@ impl PrefetchedSectorSource {
                             offset = 0;
                             continue;
                         }
-                        // AACS units are SECTOR_ALIGNMENT (3) sectors; decrypt only
-                        // processes full units, leaving a short tail encrypted. If the
-                        // tail can't fill a unit, error instead of emitting encrypted bytes.
-                        // `remaining > 0` is already guaranteed above, so a value below one
-                        // unit IS the short-tail case — the `!is_multiple_of` clause was
-                        // redundant (0 < remaining < align is never a multiple of align).
+                        // AACS units are SECTOR_ALIGNMENT (3) sectors; decrypt processes only
+                        // full units, so a tail below one unit can't decrypt — error, don't emit
+                        // encrypted bytes. (`remaining > 0` above, so `< align` IS the short tail; `!is_multiple_of` was redundant.)
                         if remaining < unit_align as u32 {
                             let _ = tx.send(Err(crate::error::Error::ExtentNotUnitAligned.into()));
                             return;

@@ -942,11 +942,9 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         times
     };
 
-    // Extract subtitle palette at PGC offset 0xA4: 16 colors × 4 bytes
-    // [padding, Y, Cr, Cb]. Chroma order is Cr (byte 2) BEFORE Cb (byte 3),
-    // fixed by the DVD-Video PGC CLUT format — NOT Cb before Cr. The consumer
-    // `mux::codec::dvdsub::ycbcr_to_rgb` reads it the same way; keep them in
-    // lockstep or subtitle colours channel-swap.
+    // Subtitle palette at PGC offset 0xA4: 16 colors × 4 bytes [padding, Y, Cr, Cb].
+    // Chroma order is Cr (byte 2) BEFORE Cb (byte 3) per the DVD-Video PGC CLUT format,
+    // NOT Cb first; consumer `mux::codec::dvdsub::ycbcr_to_rgb` must stay in lockstep or subtitle colours channel-swap.
     let palette = if pgc_offset + 0xA4 + 64 <= data.len() {
         let mut colors = Vec::with_capacity(16);
         for i in 0..16 {

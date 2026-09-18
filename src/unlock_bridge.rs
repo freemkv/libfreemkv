@@ -129,10 +129,10 @@ pub(crate) fn run_features(
     run(firmware_unlockers(), scsi, drive_id, fu::DiscKind::Unknown)
 }
 
-// The FIRMWARE/drive unlockers, in dispatch order. These key off the DRIVE and
-// remove bus encryption AT THE DRIVE, so a VID from one of them means the drive
-// is already unlocked (see `is_drive_unlocker`). Single constructor so both the
-// dispatch and the name/classification helpers share one source of truth.
+/// The FIRMWARE/drive unlockers, in dispatch order. These key off the DRIVE and
+/// remove bus encryption AT THE DRIVE, so a VID from one of them means the drive
+/// is already unlocked (see `is_drive_unlocker`). Single constructor so both the
+/// dispatch and the name/classification helpers share one source of truth.
 fn firmware_unlockers() -> Vec<Box<dyn fu::Unlocker>> {
     vec![
         Box::new(fu::FreemkvUnlocker::new()),
@@ -151,15 +151,15 @@ fn disc_unlockers(host_certs: Vec<fu::HostCert>) -> Vec<Box<dyn fu::Unlocker>> {
     ]
 }
 
-// Whether `name` (a matched unlocker's `.name()`) is a firmware/drive unlocker,
-// i.e. one whose success means bus encryption is already removed at the drive.
-// Derived from the real unlocker set, never a hardcoded name list.
-//
-// Test-only: the disc-keyed cert route (`run_bus`) can only ever match the disc
-// unlockers (AACS/DVD), so no production path classifies a `matched` name through
-// here — the AACS cert handshake credits bus removal via its `read_data_key`, and a
-// genuine firmware drive-unlock is surfaced separately by the OEM-VID short-circuit.
-// Retained so the disjointness invariant stays under test.
+/// Whether `name` (a matched unlocker's `.name()`) is a firmware/drive unlocker,
+/// i.e. one whose success means bus encryption is already removed at the drive.
+/// Derived from the real unlocker set, never a hardcoded name list.
+///
+/// Test-only: the disc-keyed cert route (`run_bus`) can only match the disc
+/// unlockers (AACS/DVD), so no production path classifies a `matched` name here —
+/// the AACS cert handshake credits bus removal via its `read_data_key`, and a
+/// genuine firmware drive-unlock is surfaced by the OEM-VID short-circuit. Retained
+/// so the disjointness invariant stays under test.
 #[cfg(test)]
 pub(crate) fn is_drive_unlocker(name: &str) -> bool {
     firmware_unlockers().iter().any(|u| u.name() == name)
@@ -218,10 +218,10 @@ mod tests {
             .expect_err("error path")
     }
 
-    // The user-facing unlocker matrix must be DERIVED from the real unlocker
-    // instances, never a hand-maintained list that can silently drift. Pin the
-    // dispatch order (firmware set, then disc set) and cross-check that every
-    // name comes from an actual `.name()`.
+    /// The user-facing unlocker matrix must be DERIVED from the real unlocker
+    /// instances, never a hand-maintained list that can silently drift. Pin the
+    /// dispatch order (firmware set, then disc set) and cross-check that every
+    /// name comes from an actual `.name()`.
     #[test]
     fn unlocker_names_are_derived_from_the_real_unlockers() {
         assert_eq!(

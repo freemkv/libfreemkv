@@ -109,22 +109,17 @@ impl Stream for ChaptersSink {
 // See docs/meta-sink.md — title_json schema.
 pub(crate) fn title_json(title: &DiscTitle) -> serde_json::Value {
     use serde_json::json;
-    // `index`/`is_main` are disc-level facts (a title's position in the sorted
-    // title list, and whether it is the selected main feature). A `json://` sink
-    // is handed ONE `DiscTitle` with no view of the disc, so neither is knowable
-    // here: this document describes a single title in isolation. They are fixed
-    // at `0`/`false` deliberately — the authoritative, derived values live on the
-    // disc-level `DiscProfile::from_disc` path, not on this per-title export.
+    // `index`/`is_main` are disc-level (title's position in the sorted list, whether
+    // it's the selected main feature). A `json://` sink sees ONE `DiscTitle` with no
+    // disc view, so both are fixed `0`/`false`; authoritative values live on `DiscProfile::from_disc`.
     let profile = TitleProfile::from_title(title, 0, false);
     // Serializing a plain-scalar struct is infallible; fall back to an empty
     // object rather than panic if that ever changes (the create() path then
     // surfaces the empty doc as a NoMetadata error).
     let mut doc = serde_json::to_value(&profile).unwrap_or_else(|_| json!({}));
-    // Restore the per-stream detail the normalized `TitleProfile` omits.
-    // `TitleProfile` is a deliberately flat VIEW with no field for pid, colour
-    // signalling, sample rate, raw purpose/qualifier, etc.; rather than widen
-    // that shared type, enrich this document straight from the source Title,
-    // walking each kind in the same order `from_title` split them.
+    // Restore per-stream detail the flat `TitleProfile` VIEW omits (pid, colour
+    // signalling, sample rate, raw purpose/qualifier, etc.). Rather than widen that
+    // shared type, enrich straight from the source Title, in `from_title`'s kind order.
     enrich_streams(&mut doc, title);
     doc["format"] = json!(format!("{:?}", title.content_format));
     doc["playlist_id"] = json!(title.playlist_id);

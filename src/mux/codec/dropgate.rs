@@ -199,13 +199,13 @@ mod tests {
         assert_eq!(t.dropped_frames(), TRACK_VERDICT_MIN_AUS * 3);
     }
 
-    // Drop-gate mismatch: the two counters disagree. A MAJORITY of the track's
-    // AUs are dropped (>50%), yet only a MINORITY are individually verified
-    // undecodable — the rest are collateral. The poison gate keys on the
-    // VERIFIED subset, so this track must survive. The collateral bulk is
-    // recorded FIRST, so if the gate mistakenly judged on the raw `dropped`
-    // count it would poison as soon as a verified drop pushed it past the
-    // minimum; keying on `verified_dropped` it never does.
+    /// Drop-gate mismatch: the two counters disagree. A MAJORITY of the track's
+    /// AUs are dropped (>50%), yet only a MINORITY are individually verified
+    /// undecodable — the rest are collateral. The poison gate keys on the
+    /// VERIFIED subset, so this track must survive. The collateral bulk is
+    /// recorded FIRST, so if the gate mistakenly judged on the raw `dropped`
+    /// count it would poison as soon as a verified drop pushed it past the
+    /// minimum; keying on `verified_dropped` it never does.
     #[test]
     fn a_verified_minority_amid_a_dropped_majority_does_not_poison() {
         let mut t = DropTally::new("test");

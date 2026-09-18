@@ -259,12 +259,9 @@ impl SectorSource for DirImage {
         if buf.len() < need {
             return Err(Error::UdfBufferTooSmall);
         }
-        // A read that BEGINS at or beyond the image's own capacity addresses a
-        // sector that cannot exist (an oversized/crafted offset): refuse it, as a
-        // real file/ISO source's read_exact does past EOF, rather than fabricate
-        // zeros and report success. A batch that starts IN range and overshoots
-        // the end is still fine — its tail past capacity zero-pads below, which
-        // the mux's final batch and the FS scan's fixed-LBA probes both expect.
+        // A read that BEGINS at/beyond the image's own capacity addresses a sector
+        // that cannot exist (an oversized/crafted offset): refuse it, as a real
+        // file/ISO source's read_exact does past EOF, not fabricated zeros+success.
         if count > 0 && lba >= self.total_sectors {
             return Err(Error::DiscRead {
                 sector: lba as u64,
@@ -272,6 +269,9 @@ impl SectorSource for DirImage {
                 sense: None,
             });
         }
+        // A batch that starts IN range but overshoots the end is fine: this zero-pads
+        // its tail past capacity, which the mux's final batch and the FS scan's
+        // fixed-LBA probes both expect.
         buf[..need].fill(0);
         // Walk the request in RUNS, not sector by sector: a mux batch (8192
         // sectors) almost always lands in one extent, so per-sector seek+read

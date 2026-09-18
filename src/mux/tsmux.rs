@@ -158,11 +158,9 @@ impl<W: Write> TsMuxer<W> {
             return Ok(());
         }
 
-        // Seed the global PTS origin from the FIRST frame of ANY kind, so a
-        // single fixed origin rebases every frame and the audio/video offset is
-        // preserved. Seeding on video ONLY meant each pre-video audio frame fell
-        // back to `base = unwrap_or(pts_ns)` — i.e. its OWN pts — collapsing every
-        // leading audio frame onto PTS 0 and destroying the spacing between them.
+        // Seed the global PTS origin from the FIRST frame of ANY kind, so one fixed
+        // origin rebases every frame and the a/v offset is preserved. Video-ONLY seeding
+        // made pre-video audio fall back to `base = unwrap_or(pts_ns)` (own pts) → PTS 0, spacing lost.
         let base = *self.base_pts_ns.get_or_insert(pts_ns);
         let pts_ns = pts_ns.saturating_sub(base);
 
@@ -754,12 +752,9 @@ mod tests {
 
     #[test]
     fn av_offset_preserved_with_audio_before_first_video() {
-        // Audio at t=0 arrives before the first video keyframe at t=1s. The FIRST
-        // frame of any kind fixes the origin, so the leading audio frame becomes
-        // the origin (PTS 0) and the video keyframe lands 1s = 90_000 ticks later.
-        // The 1s audio→video offset must survive. The OLD code seeded the origin
-        // from video only, so the pre-video audio fell back to its OWN pts and BOTH
-        // collapsed to 0, destroying the offset.
+        // Audio at t=0 before the first video keyframe at t=1s. The FIRST frame of any
+        // kind fixes the origin, so audio becomes origin (PTS 0), video lands 1s=90_000
+        // ticks later. OLD video-only seeding made both fall back to own pts → collapse to 0, offset lost.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
@@ -1093,10 +1088,9 @@ mod tests {
 
     #[test]
     fn negative_relative_pts_saturates_to_zero() {
-        // A frame earlier than the origin (negative relative PTS) must encode
-        // PTS 0, never an underflowed huge value. Video keyframe at t=2s seeds
-        // the origin; a later-written audio frame at t=0 is 2s BEFORE it → -2s,
-        // which must floor to 0.
+        // A frame earlier than the origin (negative relative PTS) must encode PTS 0, not
+        // an underflowed huge value. Video keyframe at t=2s seeds the origin; a later
+        // audio frame at t=0 is 2s BEFORE it → -2s, which must floor to 0.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
@@ -1117,11 +1111,9 @@ mod tests {
 
     #[test]
     fn audio_only_stream_preserves_frame_spacing() {
-        // Regression: an audio-only stream (no video to seed the origin) must keep
-        // the spacing between its frames. The FIRST audio frame seeds the origin;
-        // later frames rebase on it. The OLD code seeded only on video, so EVERY
-        // audio-only frame fell back to `base = unwrap_or(pts_ns)` — its own pts —
-        // and flat-lined every frame onto PTS 0.
+        // Regression: an audio-only stream (no video to seed the origin) must keep its
+        // frame spacing. The FIRST audio frame seeds the origin; later frames rebase on
+        // it. OLD video-only seeding made EVERY frame fall back to own pts → all on PTS 0.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);

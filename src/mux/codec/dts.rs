@@ -316,12 +316,9 @@ impl CodecParser for DtsParser {
             let au_src = self.front_source();
             self.emit_or_drop(au, au_pts, dur_ns, au_src, &mut frames);
             self.drain_front(au_end);
-            // After draining, the marker covering the new front (if any) carries
-            // the next AU's PTS; `pending_pts` is only the fallback when no
-            // marker survives. Track it so the fallback stays sensible. A fully
-            // drained buffer has no live front, so the mark still "covering"
-            // offset 0 belongs to the AU just emitted — invalidate rather than
-            // keep that stale PTS as a fallback for a later PTS-less PES.
+            // After draining, the mark over the new front carries the next AU's PTS;
+            // `pending_pts` is the fallback when none survives. A fully drained buffer
+            // has no live front, so its offset-0 mark is the just-emitted AU's — invalidate rather than keep that stale PTS as a fallback for a later PTS-less PES.
             self.pending_pts = if self.acc.is_empty() {
                 PTS_UNSET
             } else {
@@ -373,10 +370,9 @@ impl DtsParser {
             self.acc.clear();
             return Vec::new();
         }
-        // A trailing core sync at EOS opens a NEW access unit whose frame never
-        // completed — a complete next core would have closed this AU during
-        // parse(), so anything left here is truncated. Drop it rather than
-        // splicing it onto the final AU; real trailing extensions are kept.
+        // A trailing core sync at EOS opens a NEW access unit that never completed
+        // (a complete next core would have closed this AU during parse()), so it is
+        // truncated — drop it rather than splice onto the final AU; real trailing extensions are kept.
         let emit_end = final_au_end(self.acc.as_slice(), core_size);
         // The final AU's PTS is the PES covering the buffer front (its core's
         // PES). Fall back to pending_pts, clamping the sentinel to 0.
@@ -391,12 +387,12 @@ impl DtsParser {
     }
 }
 
-// Offset where the FINAL access unit ends at end-of-stream, dropping a
-// truncated trailing core. Trailing DTS-HD extension substreams belong to this
-// AU and are skipped precisely (kept); a trailing CORE sync — complete or
-// truncated — begins a NEW AU that never closed during `parse()`, so the AU
-// ends there. A tail too short to identify, or non-sync garbage, is kept with
-// the AU. See docs/dts.md.
+/// Offset where the FINAL access unit ends at end-of-stream, dropping a
+/// truncated trailing core. Trailing DTS-HD extension substreams belong to this
+/// AU and are skipped precisely (kept); a trailing CORE sync — complete or
+/// truncated — begins a NEW AU that never closed during `parse()`, so the AU
+/// ends there. A tail too short to identify, or non-sync garbage, is kept with
+/// the AU. See docs/dts.md.
 fn final_au_end(buf: &[u8], core_size: usize) -> usize {
     let mut pos = core_size;
     loop {
@@ -749,10 +745,10 @@ mod tests {
         }
     }
 
-    // A PTS-less PES must continue the timeline from the most recent known base,
-    // never snap it back to 0. `pending_pts` going PTS_UNSET (e.g. after a forced
-    // flush) previously fell straight to 0; the fallback must instead reach for
-    // the projected next-AU start, then the last PES front.
+    /// A PTS-less PES must continue the timeline from the most recent known base,
+    /// never snap it back to 0. `pending_pts` going PTS_UNSET (e.g. after a forced
+    /// flush) previously fell straight to 0; the fallback must instead reach for
+    /// the projected next-AU start, then the last PES front.
     #[test]
     fn continuation_base_prefers_a_known_projection_over_zero() {
         let mut parser = DtsParser::new();
@@ -960,11 +956,9 @@ mod tests {
 
     #[test]
     fn truncated_trailing_core_is_dropped_at_eos() {
-        // A complete core is held awaiting a next core, but the stream cuts off
-        // mid-way into that next core (only its sync + a couple bytes arrived —
-        // too few to size, so it's held, not emitted, during parse). At EOS the
-        // truncated trailing core must be DROPPED, not spliced onto the final
-        // AU: the emitted unit is exactly the complete 512-byte core.
+        // A complete core is held awaiting a next core, but the stream cuts off mid-way
+        // into that next core (only sync + 2 bytes arrived — too few to size, so held not
+        // emitted during parse). At EOS that truncated trailing core is DROPPED, not spliced onto the final AU: the emitted unit is exactly the complete 512-byte core.
         let mut parser = DtsParser::new();
         let mut stream = make_dts_core(512);
         // Truncated trailing core: sync + 2 bytes (< CORE_HEADER_MIN_BYTES).

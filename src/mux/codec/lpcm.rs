@@ -277,10 +277,9 @@ mod tests {
 
     #[test]
     fn pts_less_pes_carries_last_timestamp_and_propagates_discontinuity() {
-        // A PES with no PTS (legal for audio, e.g. after a discontinuity) must
-        // carry the last known timestamp forward — resetting to 0 would corrupt
-        // A/V sync — and the emitted unit must reflect the PES discontinuity
-        // flag rather than a hardcoded false. Mirrors the adts/flac guards.
+        // A PES with no PTS (legal for audio, e.g. after a discontinuity) must carry the
+        // last known timestamp forward — resetting to 0 would corrupt A/V sync — and the
+        // emitted unit must reflect the PES discontinuity flag, not a hardcoded false. Mirrors the adts/flac guards.
         let mut parser = LpcmParser::new();
         let header = vec![0x00, 0x01, 0x00, 0b1001_0001];
         let pcm = vec![0x11, 0x22, 0x33, 0x44];

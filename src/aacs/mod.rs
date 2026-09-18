@@ -105,16 +105,15 @@ pub(crate) fn role_paths(udf: &crate::udf::UdfFs, role: AacsRole) -> Vec<String>
     v
 }
 
-// Walk an AACS role's candidate paths, returning the first that reads.
-//
-// AACS ships a `/AACS/DUPLICATE/` copy of every managed file precisely so a
-// bad read on the primary can fall through to the backup. A missing candidate
-// (`UdfNotFound`) and a failed read (`DiscRead`) are therefore both retriable:
-// the walk moves on to the next candidate rather than aborting. Only after
-// every candidate has been tried does a remembered `DiscRead` propagate (more
-// informative than `AacsNoKeys`); if every candidate was merely absent, the
-// result is `AacsNoKeys`. Any other error is a genuine hard failure (parse,
-// corruption) and propagates immediately.
+/// Walk an AACS role's candidate paths, returning the first that reads.
+///
+/// AACS ships a `/AACS/DUPLICATE/` copy of every managed file so a bad primary
+/// read can fall through to the backup. A missing candidate (`UdfNotFound`) and a
+/// failed read (`DiscRead`) are both retriable: the walk moves on rather than
+/// aborting. After all candidates are tried, a remembered `DiscRead` propagates
+/// (more informative than `AacsNoKeys`); if every candidate was merely absent, the
+/// result is `AacsNoKeys`. Any other error is a hard failure (parse, corruption)
+/// and propagates immediately.
 pub(crate) fn read_first<S, F>(candidates: &[S], mut read: F) -> crate::error::Result<Vec<u8>>
 where
     S: AsRef<str>,

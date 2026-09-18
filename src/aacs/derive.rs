@@ -306,10 +306,9 @@ pub(crate) fn resolve_dk_node(
     uv: u32,
     u_mask_shift: u8,
 ) -> Option<DeviceKey> {
-    // `u_mask_shift` is a disc/keydb-controlled u8: bit positions 32..=255 do not
-    // exist in a u32, and `1u32 << b` with b >= 32 panics (debug) / wraps (release).
-    // Cap the search at the 32 real bit positions — same >= 32 guard the mask shifts
-    // above use — so a bad disc can never trip the shift.
+    // `u_mask_shift` is disc/keydb-controlled: `1u32 << b` with b >= 32 panics
+    // (debug) / wraps (release), so cap the search at the 32 real u32 bit positions
+    // (same >= 32 guard the mask shifts above use) — a bad disc can't trip the shift.
     for b in 0..u_mask_shift.min(32) {
         let dk = DeviceKey {
             key: *key,

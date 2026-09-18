@@ -313,10 +313,9 @@ impl Drive {
                     return Ok(());
                 }
                 Err(Error::Halted) => return Err(Error::Halted),
-                // A dead bus (transport failure / disconnected drive) will never
-                // spin up — surface it immediately instead of polling a phantom
-                // for the full 30 s. A plain not-ready TUR failure falls through
-                // and keeps the loop going.
+                // A dead bus (transport failure / disconnected drive) will never spin
+                // up — surface it immediately instead of polling a phantom for 30 s. A
+                // plain not-ready TUR failure falls through and keeps the loop going.
                 Err(e) if e.is_scsi_transport_failure() => return Err(e),
                 Err(_) => {}
             }

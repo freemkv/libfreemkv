@@ -1522,10 +1522,9 @@ mod tests {
         }
     }
 
-    // `with_content_ranges` contract: an encrypted unit whose LBA is OUTSIDE the
-    // disc's content extents (clear filesystem / BDMV nav) must be passed through
-    // untouched — never decrypted, verified, or counted as loss. Before the fix the
-    // content map was ignored, so this unit was decrypted (its bytes mangled).
+    // `with_content_ranges` contract: an encrypted unit whose LBA is OUTSIDE the disc's
+    // content extents (clear filesystem / BDMV nav) must pass through untouched — never
+    // decrypted, verified, or counted as loss. Pre-fix the content map was ignored, so this unit was decrypted (mangled).
     #[test]
     fn mapped_decrypt_skips_units_outside_content_ranges() {
         let unit_key = [0x33u8; 16];
@@ -1560,10 +1559,9 @@ mod tests {
         );
     }
 
-    // Exercise the rayon parallel branch of `apply_aacs_map`: a buffer of far more
-    // than `PARALLEL_MIN_UNITS` units, decrypted on the multi-thread path, must
-    // recover EVERY unit byte-for-byte — i.e. the `par_chunks_mut` fan-out keeps the
-    // per-unit `idx_in_buf` correct (a race or off-by-one would corrupt some units).
+    // Exercise the rayon parallel branch of `apply_aacs_map`: a buffer of far more than
+    // `PARALLEL_MIN_UNITS` units on the multi-thread path must recover EVERY unit byte-for-
+    // byte — i.e. `par_chunks_mut` keeps each `idx_in_buf` correct (a race/off-by-one corrupts units).
     #[test]
     fn mapped_decrypt_parallel_path_recovers_every_unit() {
         use crate::disc::ContentFormat;

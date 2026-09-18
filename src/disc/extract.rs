@@ -354,9 +354,6 @@ impl SectorSource for Borrowed<'_> {
     }
 }
 
-/// Recursively plan the host tree: collect directories to create and files to
-/// extract, sanitizing each component and detecting host-path collisions.
-/// Skips the top-level `AACS/` and `CERTIFICATE/` directories (§7).
 /// Whether `dir` lives on a case-INSENSITIVE filesystem (macOS APFS/HFS+ and
 /// Windows NTFS default). Probes the real target: create a lowercase marker
 /// and test whether its uppercase spelling resolves to the same file. On a
@@ -366,12 +363,9 @@ impl SectorSource for Borrowed<'_> {
 /// can't run (e.g. a read-only dir), assume case-insensitive — the conservative
 /// choice that never MISSES a real overwrite collision.
 fn dir_is_case_insensitive(dir: &Path) -> bool {
-    // Unique per attempt: a FIXED probe name (`.fmkv_case_probe`) let two
-    // concurrent extracts into the same dir race — one's `remove_file` could
-    // delete the other's marker between its create and its `exists()` check,
-    // flipping the result (a TOCTOU collision). A per-call token makes each
-    // probe's lower/upper pair private, so concurrent probes never touch the
-    // same path.
+    // Unique per attempt: a FIXED name let concurrent extracts race — one's
+    // `remove_file` could delete another's marker between create and `exists()`
+    // (a TOCTOU flip). A per-call token keeps each probe's pair on private paths.
     let token = unique_probe_token();
     let lower_name = format!(".fmkv_case_probe_{token}");
     let lower = dir.join(&lower_name);
@@ -403,6 +397,9 @@ fn unique_probe_token() -> String {
     format!("{pid:x}_{nanos:x}_{n:x}")
 }
 
+/// Recursively plan the host tree: collect directories to create and files to
+/// extract, sanitizing each component and detecting host-path collisions.
+/// Skips the top-level `AACS/` and `CERTIFICATE/` directories (§7).
 #[allow(clippy::too_many_arguments)]
 fn plan_tree(
     reader: &mut dyn SectorSource,
@@ -432,11 +429,9 @@ fn plan_tree(
         let safe = sanitize_component(&entry.name)?;
         let child_rel = host_rel.join(&safe);
         let child_disc = format!("{disc_path}/{}", entry.name);
-        // Collision: two distinct disc paths → same host FILE. On a case-
-        // insensitive host that folds `Movie`/`movie` together; on a case-
-        // sensitive host only an EXACT match collides (case-differing names are
-        // distinct files that coexist). Either way `.partial` shares the
-        // final-name namespace so `X`/`X.partial` collide too.
+        // Collision: two distinct disc paths → one host FILE. Case-insensitive folds
+        // `Movie`/`movie`; case-sensitive collides only on EXACT match (else names
+        // coexist). `.partial` shares the final-name namespace, so `X`/`X.partial` collide.
         let mut register = |key: PathBuf| -> Result<()> {
             let folded = if case_insensitive {
                 key.to_string_lossy().to_lowercase()
@@ -1956,10 +1951,9 @@ mod tests {
         fn scrambled_vob(title_key: [u8; 5], marker: u8) -> (Vec<u8>, Vec<u8>) {
             let seed = [0x11u8, 0x22, 0x33, 0x44, marker];
             let mut plain = vec![0u8; 2048];
-            // The crack scan's `is_scrambled_pack` gate requires the MPEG-PS pack-
-            // start signature (a real scrambled sector is an MPEG-2 PS pack) before
-            // attempting a crack; without it, `resolve_vts_key` falls back to
-            // `base_keys` for both groups, masking this regression.
+            // The crack scan's `is_scrambled_pack` gate needs the MPEG-PS pack-start
+            // signature (real scrambled sector = MPEG-2 PS pack) before cracking; without it
+            // `resolve_vts_key` falls back to `base_keys` for both groups, masking the regression.
             plain[0x00..0x04].copy_from_slice(&crate::css::PACK_START);
             plain[0x14] = 0x10; // scramble flag
             let pat: Vec<u8> = (0..8)

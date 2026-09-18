@@ -600,11 +600,9 @@ pub(super) fn plan(root: &Path) -> Result<Layout> {
     if total_sectors > MAX_IMAGE_SECTORS {
         return Err(Error::DirImageTooLarge);
     }
-    // Metadata is materialized up front and held for the life of the image, so
-    // its size is bounded here rather than discovered when memory runs out.
-    // Count the FULL footprint — File Entries AND each directory's FID-list
-    // sectors — not just one File Entry per node: a wide, shallow tree's
-    // directory data alone can dwarf the per-node entries.
+    // Metadata is materialized up front and held for the image's life, so bound its
+    // size here rather than at OOM. Count the FULL footprint — File Entries AND each
+    // directory's FID-list sectors (a wide, shallow tree's dir data can dwarf them).
     let meta_bytes = metadata_block_count(&tree).saturating_mul(SECTOR as u64);
     if meta_bytes > MAX_META_BYTES {
         return Err(Error::DirImageTooLarge);
@@ -694,11 +692,11 @@ mod tests {
         );
     }
 
-    // The metadata ceiling must account for each directory's FID-list sectors,
-    // not just one File Entry per node: a wide directory's FID list can span
-    // many sectors that the old (dir_count + file_count) count ignored, so an
-    // oversized folder could slip past the guard and be materialized in full.
-    // See docs/dirimage.md — metadata_ceiling_counts_fid_lists.
+    /// The metadata ceiling must account for each directory's FID-list sectors,
+    /// not just one File Entry per node: a wide directory's FID list can span
+    /// many sectors that the old (dir_count + file_count) count ignored, so an
+    /// oversized folder could slip past the guard and be materialized in full.
+    /// See docs/dirimage.md — metadata_ceiling_counts_fid_lists.
     #[test]
     fn metadata_block_count_includes_the_fid_list_sectors() {
         let files: Vec<FileNode> = (0..300)

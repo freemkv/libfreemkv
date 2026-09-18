@@ -70,12 +70,12 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     Some(result)
 }
 
-// The feature playlist hint for a `dcx.xml` doc. Derives the numeric id and the
-// filename from ONE parsed number so they can never disagree: `format!("{id}")`
-// on a 5-digit id above u16::MAX (65536..=99999) left playlist_id `None` while
-// the filename stayed `Some`, a half-hint whose two fields named different
-// things. Require a valid u16 playlist number, then format the canonical
-// 5-digit `NNNNN.mpls` from it.
+/// The feature playlist hint for a `dcx.xml` doc. Derives the numeric id and the
+/// filename from ONE parsed number so they can never disagree: `format!("{id}")`
+/// on a 5-digit id above u16::MAX (65536..=99999) left playlist_id `None` while
+/// the filename stayed `Some`, a half-hint whose two fields named different
+/// things. Require a valid u16 playlist number, then format the canonical
+/// 5-digit `NNNNN.mpls` from it.
 pub(crate) fn feature_hint(text: &str) -> Option<super::FeaturePlaylistHint> {
     let id = feature_playlist_id(text)?;
     let playlist_id = id.parse::<u16>().ok()?;

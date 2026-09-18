@@ -652,9 +652,8 @@ pub struct DemuxSink {
     /// flows through the timeline but does NOT count here. The gate in `finish()`
     /// pairs this with `timeline.dropped_for(persisted_tracks)` so numerator and
     /// denominator cover the SAME set of tracks: were it "frames the timeline
-    /// placed" instead, a filtered-out track's clip-join drops would be measured
-    /// against a written count that never included them, and a legitimate
-    /// filtered export could wrongly trip `SeamPlanDroppedMost`/`SinkWroteNothing`.
+    /// placed", a filtered-out track's clip-join drops would measure against a
+    /// count that never included them, wrongly tripping `SeamPlanDroppedMost`/`SinkWroteNothing`.
     frames_mapped: u64,
 }
 
@@ -876,11 +875,9 @@ impl Stream for DemuxSink {
             self.ref_first_pts_ns.get_or_insert(pts);
         }
         if let Some(Some(t)) = self.tracks.get_mut(frame.track) {
-            // Count the denominator only for frames that are actually persisted.
-            // A kind-filtered frame (e.g. video during an `audio://` export)
-            // maps successfully but writes to no track file, so counting it
-            // here would mask a seam plan that dropped every *persisted* frame
-            // and let the sink ship zero-byte files at exit 0.
+            // Denominator = persisted frames only. A kind-filtered frame (video
+            // in an `audio://` export) maps but writes no file; counting it masks
+            // a seam plan that dropped every *persisted* frame → zero-byte exit 0.
             self.frames_mapped = self.frames_mapped.saturating_add(1);
             t.first_pts_ns.get_or_insert(pts);
             t.writer.write_frame(&mut t.w, frame, pts)?;
@@ -893,16 +890,9 @@ impl Stream for DemuxSink {
             return Ok(());
         }
         self.finished = true;
-        // Same reporting as the MKV muxer's finish: an unexpected drop volume is
-        // how a demux quietly comes up short, so surface it here too.
-        //
-        // Count drops ONLY for tracks this export actually persists, matching the
-        // `frames_mapped` denominator (which counts persisted frames only). A
-        // filtered export (`audio://`/`sub://`, or a `--select` subset) drops the
-        // video track's clip-join tails through the timeline without writing a
-        // file for it; folding those into the numerator via `dropped_total()`
-        // wrongly tripped `SeamPlanDroppedMost`/`SinkWroteNothing` on an
-        // otherwise-complete rip.
+        // Same as the MKV muxer's finish: surface unexpected drop volume. Count
+        // drops ONLY for persisted tracks (matches the `frames_mapped` denominator;
+        // see its doc for why filtered exports must not fold non-persisted drops in).
         let persisted_tracks: Vec<usize> = self
             .tracks
             .iter()
@@ -1725,11 +1715,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // A demux export where the seam plan drops MORE frames than it persists
-    // must report SeamPlanDroppedMost — even though at least one frame did
-    // persist (frames_mapped > 0). The denominator counts persisted frames
-    // only, so a mostly-emptied export can no longer slip past as success.
-    // See docs/demux-sink.md — a_demux_export_the_seam_plan_mostly_emptied_fails.
+    /// A demux export where the seam plan drops MORE frames than it persists
+    /// must report SeamPlanDroppedMost — even though at least one frame did
+    /// persist (frames_mapped > 0). The denominator counts persisted frames
+    /// only, so a mostly-emptied export can no longer slip past as success.
+    /// See docs/demux-sink.md — a_demux_export_the_seam_plan_mostly_emptied_fails.
     #[test]
     fn a_demux_export_the_seam_plan_mostly_emptied_fails() {
         let dir = tempdir();
@@ -1789,13 +1779,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // A FILTERED export (`audio://`) must NOT trip the drop gates on drops that
-    // belong to a track it never persists. The video track is dropped hard at
-    // the clip join (2 frames, all outside the marks), while the persisted audio
-    // track loses nothing. `dropped_total()` would fold the video drops (2) into
-    // the numerator and, exceeding the persisted count (1), wrongly report
-    // SeamPlanDroppedMost; `dropped_for(persisted_tracks)` sees 0 and passes.
-    // See docs/demux-sink.md — a_filtered_export_ignores_drops_on_filtered_tracks.
+    /// A FILTERED export (`audio://`) must NOT trip the drop gates on drops that
+    /// belong to a track it never persists. The video track is dropped hard at
+    /// the clip join (2 frames, all outside the marks), while the persisted audio
+    /// track loses nothing. `dropped_total()` would fold the video drops (2) into
+    /// the numerator and, exceeding the persisted count (1), wrongly report
+    /// SeamPlanDroppedMost; `dropped_for(persisted_tracks)` sees 0 and passes.
+    /// See docs/demux-sink.md — a_filtered_export_ignores_drops_on_filtered_tracks.
     #[test]
     fn a_filtered_export_ignores_drops_on_non_persisted_tracks() {
         let dir = tempdir();

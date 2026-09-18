@@ -147,10 +147,8 @@ fn parse_studio_attr(xml: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(xml).ok()?;
     let bytes = text.as_bytes();
     // Anchor `studio` as a WHOLE attribute name, not a bare substring: the old
-    // `find("studio")` also fired on `substudio=`, `studioId=`, or the literal
-    // word "studio" inside some OTHER attribute's value, then read a later
-    // attribute's quotes as the studio value. Require a word boundary before it
-    // and an `=` (after optional whitespace) immediately after.
+    // `find("studio")` also fired on `substudio=`, `studioId=`, or "studio" inside
+    // another attribute's value. Require a word boundary before it and an `=` (after optional whitespace) immediately after.
     let mut from = 0;
     while let Some(rel) = text[from..].find("studio") {
         let start = from + rel;
@@ -2990,10 +2988,10 @@ mod tests {
         assert_eq!(parse_studio_attr(&[0xff, 0xfe, 0x00]), None);
     }
 
-    // The `studio` anchor is a WHOLE attribute name, not a bare substring: a
-    // longer attribute that merely CONTAINS "studio", or the word inside some
-    // other attribute's value, must not be read as the studio — and the real
-    // `studio="..."` on the same tag must still win.
+    /// The `studio` anchor is a WHOLE attribute name, not a bare substring: a
+    /// longer attribute that merely CONTAINS "studio", or the word inside some
+    /// other attribute's value, must not be read as the studio — and the real
+    /// `studio="..."` on the same tag must still win.
     #[test]
     fn studio_anchor_is_a_whole_attribute_not_a_substring() {
         // `substudio` / `studioId` are not `studio`.
@@ -3011,10 +3009,10 @@ mod tests {
         assert_eq!(parse_studio_attr(b"<C title=\"studio ghibli\">"), None);
     }
 
-    // A malformed `studio=` candidate whose quote is never closed must be
-    // SKIPPED, not abort the scan: a later well-formed `studio="..."` still
-    // resolves. Pre-fix the `?` on the missing close-quote returned None for the
-    // whole document, dropping the real studio.
+    /// A malformed `studio=` candidate whose quote is never closed must be
+    /// SKIPPED, not abort the scan: a later well-formed `studio="..."` still
+    /// resolves. Pre-fix the `?` on the missing close-quote returned None for the
+    /// whole document, dropping the real studio.
     #[test]
     fn unterminated_studio_quote_is_skipped_and_a_later_studio_resolves() {
         // First `studio="` opens a double-quoted value with NO other `"` until

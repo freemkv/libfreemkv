@@ -103,11 +103,9 @@ impl<R: Read + Seek> Mp4Reader<R> {
         // (8-byte) trak headers can't force the scan to materialize a Vec far
         // larger than the moov payload before the per-track cap below ever runs.
         for trak in find_boxes_capped(&moov, b"trak", MAX_TRACKS) {
-            // `find_boxes_capped` already yields at most MAX_TRACKS matches, so
-            // `track_idx` can never reach MAX_TRACKS inside this loop — the old
-            // runtime `break` was unreachable. Assert the invariant instead (a lower
-            // cap slipping in would trip this in debug) so the per-track PID stays
-            // within u16 without dead control flow.
+            // `find_boxes_capped` yields at most MAX_TRACKS matches, so `track_idx`
+            // never reaches MAX_TRACKS here (old runtime `break` was dead). Assert the
+            // invariant instead so the per-track PID stays within u16 without dead flow.
             debug_assert!(track_idx < MAX_TRACKS, "trak scan exceeded MAX_TRACKS");
             let Some(mdia) = find_box(trak, b"mdia") else {
                 tracing::warn!(track = track_idx, "mp4: trak has no mdia, dropping track");
@@ -471,11 +469,9 @@ fn find_boxes_capped<'a>(payload: &'a [u8], want: &[u8; 4], cap: usize) -> Vec<&
             0 => (payload.len() - pos, 8usize),
             n => (n, 8usize),
         };
-        // checked_add: `box_size` is an attacker-controlled 64-bit largesize cast
-        // to usize, so a value near usize::MAX at a nonzero `pos` would wrap past
-        // the guard on a plain `pos + box_size` — producing a release panic on the
-        // slice or an infinite loop on the advance. Compute the end once and reuse
-        // it for the bounds check, the slice, and the advance.
+        // checked_add: `box_size` is an attacker-controlled 64-bit largesize cast to
+        // usize; near usize::MAX at nonzero `pos`, plain `pos + box_size` wraps past the
+        // guard (release panic on slice / infinite advance). Compute `end` once, reuse it.
         let end = match pos.checked_add(box_size) {
             Some(end) if box_size >= header_len && end <= payload.len() => end,
             _ => break,
@@ -738,10 +734,9 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
         // its AudioSpecificConfig in an `esds` box — the MKV CodecPrivate for
         // A_AAC. AC-3/DTS are self-describing in-band (None).
         let channels = if body.len() >= 28 { be16(body, 16) } else { 2 };
-        // The real audio sample rate lives in the AudioSampleEntry 16.16
-        // samplerate field at body offset 24 (ISO/IEC 14496-12 §12.2.3); the
-        // integer rate is the high 16 bits. The mdhd media timescale is only a
-        // fallback (it is USUALLY the sample rate, but need not be).
+        // Real audio sample rate: AudioSampleEntry 16.16 samplerate field at body
+        // offset 24 (ISO/IEC 14496-12 §12.2.3), integer rate = high 16 bits. The mdhd
+        // media timescale is only a fallback (USUALLY the rate, but need not be).
         let sample_rate = if body.len() >= 28 {
             be16(body, 24) as u32
         } else {
@@ -2257,11 +2252,11 @@ mod tests {
         );
     }
 
-    // Regression: audio sample rate must come from the AudioSampleEntry 16.16
-    // samplerate field, NOT the mdhd media timescale. Here the two DIFFER
-    // (mdhd timescale = 90_000, AudioSampleEntry samplerate = 48_000); the
-    // entry value must win. Old code read the rate from the timescale, so a
-    // 90 kHz mdhd yielded SampleRate::Unknown, dropping the real 48 kHz.
+    /// Regression: audio sample rate must come from the AudioSampleEntry 16.16
+    /// samplerate field, NOT the mdhd media timescale. Here the two DIFFER
+    /// (mdhd timescale = 90_000, AudioSampleEntry samplerate = 48_000); the
+    /// entry value must win. Old code read the rate from the timescale, so a
+    /// 90 kHz mdhd yielded SampleRate::Unknown, dropping the real 48 kHz.
     #[test]
     fn audio_sample_entry_samplerate_wins_over_mdhd_timescale() {
         use std::io::Cursor;
@@ -3156,10 +3151,10 @@ mod tests {
         );
     }
 
-    // A crafted 64-bit `largesize` near u64::MAX at a nonzero `pos` must not
-    // wrap `pos + box_size` past the length guard: the scan must reject it and
-    // return without a release panic (slice) or an infinite loop (advance).
-    // See docs/mp4-read.md — find_boxes_capped_rejects_a_hostile_largesize.
+    /// A crafted 64-bit `largesize` near u64::MAX at a nonzero `pos` must not
+    /// wrap `pos + box_size` past the length guard: the scan must reject it and
+    /// return without a release panic (slice) or an infinite loop (advance).
+    /// See docs/mp4-read.md — find_boxes_capped_rejects_a_hostile_largesize.
     #[test]
     fn find_boxes_capped_rejects_a_hostile_largesize_near_u64_max() {
         let mut payload = Vec::new();

@@ -2953,11 +2953,9 @@ mod tests {
 
     #[test]
     fn info_child_size_exceeding_remaining_is_rejected() {
-        // A crafted INFO whose sole child (TITLE) declares a 1000-byte body while
-        // the INFO parent is sized to just the child header: header+body overruns
-        // the parent's `remaining`. The old code saturated `remaining` to 0 and
-        // fell through to read the oversized child (an EOF/garbage read); the guard
-        // must instead reject it as MkvSourceInvalid.
+        // Crafted INFO whose sole child (TITLE) declares a 1000-byte body while the INFO
+        // parent is sized to just the child header, so header+body overruns `remaining`.
+        // Old code saturated it to 0 and read the oversized child (EOF/garbage); the guard rejects as MkvSourceInvalid.
         let mut info = Vec::new();
         ebml::write_id(&mut info, ebml::TITLE).unwrap();
         ebml::write_size(&mut info, 1000).unwrap(); // declares 1000 bytes, provides none

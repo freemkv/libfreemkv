@@ -242,12 +242,9 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         let content = self.content_ranges.clone();
         let content_ref = content.as_deref();
 
-        // Defense-in-depth: AACS units are 3-sector aligned; misalignment would
-        // silently mis-decrypt, so reject loud (DecryptFailed) before reading.
-        // Gated relative to `unit_base` (per-extent), not raw `lba % 3`. Only
-        // enforced when the span actually TOUCHES encrypted content — a clear
-        // UDF/nav read outside every content range is pass-through, so a
-        // non-aligned filesystem LBA must not fail the whole-disc reader.
+        // Defense-in-depth: AACS units are 3-sector aligned; misalignment silently mis-
+        // decrypts, so reject loud (DecryptFailed) before reading — gated vs `unit_base`
+        // (not raw `lba % 3`), only when the span TOUCHES content (else UDF/nav passes through).
         if matches!(self.keys, DecryptKeys::Aacs { .. })
             && span_touches_content(content_ref, lba, count)
             && !crate::aacs::content::is_unit_aligned(lba, self.unit_base)
@@ -258,10 +255,9 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             .inner
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
 
-        // Proactive map path (storm-free mux): keys were resolved per unit up
-        // front, so decrypt with the mapped key and trust it, no per-unit
-        // `is_clean` check. A resolver gap fails loud; bad TS passes through.
-        // Units outside the content extents (when set) pass through untouched.
+        // Proactive map path (storm-free mux): keys were resolved per unit up front,
+        // so decrypt with the mapped key and trust it (no per-unit `is_clean`). A
+        // resolver gap fails loud; bad TS and units outside content extents pass through.
         if let Some(map) = self.key_map.clone() {
             crate::decrypt::decrypt_sectors_mapped_in_content(
                 &mut buf[..n],
@@ -273,13 +269,9 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             return Ok(n);
         }
 
-        // Decrypt `buf` in place (None / CSS / AACS); with a content map, units
-        // outside the encrypted extents pass through untouched. A can't-decrypt
-        // fails loud; broken-TS output is the muxer's concern, not a read failure.
-
-        // No map installed: CSS self-descramble / clear pass-through. A can't-
-        // decrypt (misalignment, or mapless AACS reaching here — a bug) fails
-        // loud; otherwise units pass through, same as above.
+        // No map installed: `decrypt_buf` does CSS self-descramble / clear pass-through
+        // (units outside the content extents pass through untouched). A can't-decrypt
+        // (misalignment, or mapless AACS here — a bug) fails loud; broken TS is the muxer's concern.
         Self::decrypt_buf(&mut buf[..n], &mut self.keys, lba, content_ref)?;
         Ok(n)
     }

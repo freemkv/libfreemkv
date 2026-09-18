@@ -2481,10 +2481,10 @@ mod tests {
         );
     }
 
-    // FlagInterlaced is written up-front from the FIRST picture, then corrected
-    // at finish() to the WHOLE-STREAM scan majority. A progressive leader on an
-    // interlaced feature must not misrepresent the title: the header byte is
-    // rewritten from progressive (2) to interlaced (1).
+    /// FlagInterlaced is written up-front from the FIRST picture, then corrected
+    /// at finish() to the WHOLE-STREAM scan majority. A progressive leader on an
+    /// interlaced feature must not misrepresent the title: the header byte is
+    /// rewritten from progressive (2) to interlaced (1).
     #[test]
     fn flag_interlaced_is_patched_to_the_whole_stream_scan_majority() {
         use std::sync::{Arc, Mutex};

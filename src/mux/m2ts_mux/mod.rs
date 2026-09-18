@@ -232,11 +232,9 @@ impl<W: Write> M2tsMux<W> {
         if self.audio.is_none() {
             return Ok(());
         }
-        // Audio seeds the shared origin too. Seeding only on video meant a leading
-        // audio frame (audio before the first video) fell back to `base =
-        // unwrap_or(raw_90k)` — its OWN pts — collapsing every pre-video audio frame
-        // onto PTS 0 and losing the spacing between them. `get_or_insert` still lets
-        // the FIRST frame (audio or video) fix the origin, so nothing is pulled up.
+        // Audio seeds the shared origin too. Video-only seeding made a leading audio
+        // frame fall back to `base = unwrap_or(raw_90k)` (its OWN pts), collapsing all
+        // pre-video audio onto PTS 0; `get_or_insert` still lets the FIRST frame fix it.
         let pts_90k = self.base_relative_pts(pts_ns, /* may_seed_base */ true);
         let pes = build_audio_pes(pts_90k, data);
         self.write_pes(PID_AUDIO, &pes, None, false)
@@ -1431,11 +1429,9 @@ mod tests {
 
     #[test]
     fn pre_video_audio_frames_keep_their_spacing() {
-        // Two audio frames arrive before any video. The FIRST frame (audio) seeds
-        // the shared origin, so the second audio frame keeps its 1s offset. The OLD
-        // code seeded the origin only on video, so every pre-video audio frame fell
-        // back to `base = unwrap_or(raw_90k)` — its own pts — collapsing BOTH onto
-        // PTS 0 and losing the 1s spacing.
+        // Two audio frames before any video. The FIRST (audio) seeds the shared origin,
+        // so the second keeps its 1s offset. OLD code seeded only on video → both fell
+        // back to `base = unwrap_or(raw_90k)` (own pts), collapsing onto PTS 0, losing 1s.
         let decode_audio_pts = |pkt: &[u8]| -> u64 {
             let afc = (pkt[3] >> 4) & 0x03;
             let pes_start = if afc & 0b10 != 0 {

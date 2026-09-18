@@ -67,12 +67,12 @@ fn hevc_pps_id(pps_nal: &[u8]) -> Option<u32> {
     BitReader::new(pps_nal.get(2..)?).read_ue()
 }
 
-// Measures the coding type from the FIRST coded slice of an access unit
-// (H.265 §7.3.6.1). `None` for a non-first slice or on truncation — never a
-// guess. `resolve_num_extra` maps the slice's OWN `slice_pic_parameter_set_id`
-// to that PPS's `num_extra_slice_header_bits`, so the `slice_type` bit offset is
-// taken from the PPS the slice references — not merely the last-active one. See
-// docs/hevc.md — hevc_first_slice_coding_type.
+/// Measures the coding type from the FIRST coded slice of an access unit
+/// (H.265 §7.3.6.1). `None` for a non-first slice or on truncation — never a
+/// guess. `resolve_num_extra` maps the slice's OWN `slice_pic_parameter_set_id`
+/// to that PPS's `num_extra_slice_header_bits`, so the `slice_type` bit offset is
+/// taken from the PPS the slice references — not merely the last-active one. See
+/// docs/hevc.md — hevc_first_slice_coding_type.
 fn hevc_first_slice_coding_type(
     nal: &[u8],
     nal_type: u8,
@@ -112,10 +112,10 @@ pub struct HevcParser {
     cur_vps: Option<Vec<u8>>,
     cur_sps: Option<Vec<u8>>,
     cur_pps: Option<Vec<u8>>,
-    // Every PPS seen, keyed by its `pps_pic_parameter_set_id`, so a slice's
-    // coding type is measured with the `num_extra_slice_header_bits` of the PPS
-    // it REFERENCES rather than the last-active one (multiple PPS with differing
-    // values would otherwise shift the slice_type bit offset).
+    /// Every PPS seen, keyed by its `pps_pic_parameter_set_id`, so a slice's
+    /// coding type is measured with the `num_extra_slice_header_bits` of the PPS
+    /// it REFERENCES rather than the last-active one (multiple PPS with differing
+    /// values would otherwise shift the slice_type bit offset).
     pps_by_id: std::collections::HashMap<u32, Vec<u8>>,
     // Splice-aware CRA→BLA rewrite for a non-seamless BD clip boundary (first
     // CRA_NUT -> BLA_W_LP so NoRaslOutput discards dangling RASL). Armed by
@@ -1350,11 +1350,11 @@ mod tests {
         );
     }
 
-    // A slice must be measured with the num_extra_slice_header_bits of the PPS
-    // it REFERENCES (slice_pic_parameter_set_id), not the last-active PPS. Two
-    // PPS with different num_extra: the slice points at the FIRST while the
-    // second is active. Assuming the active PPS reads slice_type at the wrong
-    // offset (None here); resolving by the slice's own pps id reads it right.
+    /// A slice must be measured with the num_extra_slice_header_bits of the PPS
+    /// it REFERENCES (slice_pic_parameter_set_id), not the last-active PPS. Two
+    /// PPS with different num_extra: the slice points at the FIRST while the
+    /// second is active. Assuming the active PPS reads slice_type at the wrong
+    /// offset (None here); resolving by the slice's own pps id reads it right.
     #[test]
     #[allow(clippy::unusual_byte_groupings)]
     fn slice_coding_type_uses_the_pps_the_slice_references_not_the_active_one() {

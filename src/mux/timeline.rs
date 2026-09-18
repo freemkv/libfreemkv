@@ -432,17 +432,17 @@ pub(crate) struct TimelineContinuity {
     // (distinct from the shared frontier). See
     // docs/mux-timeline.md#timelinecontinuitylast_raw_ns.
     last_raw_ns: Vec<Option<i64>>,
-    // Per-track provisional offset for frames arriving before the video
-    // frame that opens their epoch, tagged with the epoch sequence it was
-    // captured in (see `epoch_seq`). Never written to offset_ns/high_ns and
-    // never retires an epoch. See docs/mux-timeline.md#timelinecontinuityprovisional.
+    /// Per-track provisional offset for frames arriving before the video
+    /// frame that opens their epoch, tagged with the epoch sequence it was
+    /// captured in (see `epoch_seq`). Never written to offset_ns/high_ns and
+    /// never retires an epoch. See docs/mux-timeline.md#timelinecontinuityprovisional.
     provisional: Vec<Option<(u64, i64)>>,
-    // Monotonic epoch counter, bumped once per `open_epoch`. Used as the epoch
-    // IDENTITY a provisional is tagged with, instead of `epoch_offsets.len()`:
-    // that length is capped at MAX_EPOCHS, so past the cap it stops changing and
-    // a provisional captured then would compare equal forever and never retire —
-    // outliving its epoch and mis-offsetting later passive frames. A monotonic
-    // counter always advances. (Same root as the disc.rs slice-identity finding.)
+    /// Monotonic epoch counter, bumped once per `open_epoch`. Used as the epoch
+    /// IDENTITY a provisional is tagged with, instead of `epoch_offsets.len()`:
+    /// that length is capped at MAX_EPOCHS, so past the cap it stops changing and
+    /// a provisional captured then would compare equal forever and never retire —
+    /// outliving its epoch and mis-offsetting later passive frames. A monotonic
+    /// counter always advances. (Same root as the disc.rs slice-identity finding.)
     epoch_seq: u64,
 }
 
@@ -495,13 +495,13 @@ impl TimelineContinuity {
         self.seams.as_ref().map_or(0, |p| p.dropped_total())
     }
 
-    // Frames dropped for falling outside the playlist's clip marks, counted
-    // ONLY over `tracks` — the numerator/denominator alignment a filtered sink
-    // needs. A `demux://` variant that persists a subset of tracks (e.g.
-    // `audio://`) counts its written denominator over just those tracks, so the
-    // drop count it gates on must cover the SAME set: a video track dropped at a
-    // clip join during an `audio://` export is not evidence the audio files came
-    // up short. Zero without a seam plan.
+    /// Frames dropped for falling outside the playlist's clip marks, counted
+    /// ONLY over `tracks` — the numerator/denominator alignment a filtered sink
+    /// needs. A `demux://` variant that persists a subset of tracks (e.g.
+    /// `audio://`) counts its written denominator over just those tracks, so the
+    /// drop count it gates on must cover the SAME set: a video track dropped at a
+    /// clip join during an `audio://` export is not evidence the audio files came
+    /// up short. Zero without a seam plan.
     pub(crate) fn dropped_for(&self, tracks: &[usize]) -> u64 {
         self.seams.as_ref().map_or(0, |p| {
             tracks
