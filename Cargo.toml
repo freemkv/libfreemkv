@@ -1,6 +1,6 @@
 [package]
 name = "libfreemkv"
-version = "1.7.1"
+version = "1.7.2-rc2"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -59,7 +59,7 @@ aes = { version = "0.9", optional = true }
 # this to `{ git = ".../freemkv-unlock", tag = "vX.Y.Z" }` in the tagged commit
 # (so the released tag resolves freemkv-unlock from git, not a sibling path) and
 # restores the path dep on the branch tip.
-freemkv-unlock = { path = "../freemkv-unlock", optional = true }
+freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.7.2-rc2", optional = true }
 zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
 base64 = { version = "0.23", optional = true }
 # Read-only XML DOM parser (pure Rust, forbid(unsafe_code), entity-expansion
