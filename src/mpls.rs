@@ -5,6 +5,21 @@
 //! stream info (video, audio, subtitle tracks).
 //!
 //! Format is documented in the BD-ROM PlayList (MPLS) specification.
+//!
+//! ## Multi-angle PlayItem STN offset (issue #45)
+//! The STN (stream-number) table sits at PlayItem offset 32 for a single-angle
+//! item, but a MULTI-ANGLE item (is_multi_angle = bit 4 of item[10]) inserts an
+//! angle block right after still_time at offset 32:
+//!   number_of_angles(1) + flags(1) + (number_of_angles − 1) angle references,
+//!   each clip_name(5) + clip_codec_id(4) + ref_to_STC_id(1) = 10 bytes
+//! (the first angle is the primary clip already at item[0..5]). So the real STN
+//! begins at `32 + 2 + (number_of_angles − 1) * 10`. A fixed offset of 32 lands
+//! INSIDE that block and misreads the stream counts as garbage (e.g. n_video =
+//! 51 on Spider-Man 3 UHD 00245/00246.mpls, number_of_angles = 2 ⇒ real offset
+//! 44), dropping every stream — the primary video included. That makes
+//! `DiscTitle::has_video()` return false, which drops a multi-angle/seamless-
+//! branch FEATURE from the disc's nav candidate set (see `Disc::scan_with`) and
+//! loses it in main-title selection. `parse` computes the offset accordingly.
 
 use crate::error::{Error, Result};
 
@@ -150,25 +165,31 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
         let in_time = u32::from_be_bytes([item[12], item[13], item[14], item[15]]);
         let out_time = u32::from_be_bytes([item[16], item[17], item[18], item[19]]);
 
-        // Parse STN table from the first play item. PlayItem layout after out_time:
-        // UO_mask_table(8) + misc flags(1) + still_mode(1) + still_time(2), then
-        // STN_table starting at STN_OFFSET.
-        const STN_OFFSET: usize = 32;
-        // `>=`, not `>`: the 16-byte STN header spans item[STN_OFFSET..STN_OFFSET+16], so
-        // item.len() == STN_OFFSET + 16 already holds every header byte. Strict `>` demanded
+        // STN table offset: base 32, shifted past the multi-angle angle block when
+        // present (issue #45 — see the module `//!` header for the layout and why a
+        // fixed 32 misparses). is_multi_angle is bit 4 of item[10].
+        let is_multi_angle = (item[10] & 0x10) != 0;
+        let stn_offset = if is_multi_angle && item.len() > 32 {
+            let number_of_angles = item[32] as usize;
+            32 + 2 + number_of_angles.saturating_sub(1) * 10
+        } else {
+            32
+        };
+        // `>=`, not `>`: the 16-byte STN header spans item[stn_offset..stn_offset+16], so
+        // item.len() == stn_offset + 16 already holds every header byte. Strict `>` demanded
         // one extra byte, skipping a play item whose STN header ends exactly at the boundary (stream-less STN table).
-        if item_idx == 0 && item.len() >= STN_OFFSET + 16 {
+        if item_idx == 0 && item.len() >= stn_offset + 16 {
             // STN header: length(2) + reserved(2) + counts(8) + reserved(4) = 16 bytes
-            let n_video = item[STN_OFFSET + 4] as usize;
-            let n_audio = item[STN_OFFSET + 5] as usize;
-            let n_pg = item[STN_OFFSET + 6] as usize;
-            let n_ig = item[STN_OFFSET + 7] as usize;
-            let n_sec_audio = item[STN_OFFSET + 8] as usize;
-            let n_sec_video = item[STN_OFFSET + 9] as usize;
-            let n_pip_pg = item[STN_OFFSET + 10] as usize;
-            let n_dv = item[STN_OFFSET + 11] as usize;
+            let n_video = item[stn_offset + 4] as usize;
+            let n_audio = item[stn_offset + 5] as usize;
+            let n_pg = item[stn_offset + 6] as usize;
+            let n_ig = item[stn_offset + 7] as usize;
+            let n_sec_audio = item[stn_offset + 8] as usize;
+            let n_sec_video = item[stn_offset + 9] as usize;
+            let n_pip_pg = item[stn_offset + 10] as usize;
+            let n_dv = item[stn_offset + 11] as usize;
 
-            let mut spos = STN_OFFSET + 16;
+            let mut spos = stn_offset + 16;
 
             // Primary video
             for _ in 0..n_video {
@@ -751,6 +772,70 @@ mod tests {
             playlist.streams.is_empty(),
             "no stream entries were declared at the boundary"
         );
+    }
+
+    // Regression for issue #45 (see module `//!` header): a multi-angle first
+    // PlayItem puts its STN past the angle block (2 angles ⇒ offset 44); a fixed
+    // offset of 32 misreads it and drops the video. Assert the video is found.
+    #[test]
+    fn multi_angle_first_play_item_stn_is_located_after_the_angle_block() {
+        let in_time = 0u32;
+        let out_time = 9_000_000u32;
+        let number_of_angles = 2u8;
+
+        let mut item = Vec::new();
+        item.extend_from_slice(b"00001"); // [0..5] clip_id (angle 1 = primary)
+        item.extend_from_slice(b"M2TS"); // [5..9] codec_id
+        item.push(0); // [9] reserved
+        item.push(0x10); // [10] is_multi_angle (bit 4), connection_condition = 0
+        item.push(0); // [11] stc_id
+        item.extend_from_slice(&in_time.to_be_bytes()); // [12..16]
+        item.extend_from_slice(&out_time.to_be_bytes()); // [16..20]
+        item.extend_from_slice(&[0u8; 8]); // [20..28] UO mask
+        item.push(0); // [28] misc flags
+        item.push(0); // [29] still_mode
+        item.extend_from_slice(&[0u8; 2]); // [30..32] still_time
+        // Angle block: number_of_angles(1) + flags(1) + (angles-1) refs * 10 bytes.
+        item.push(number_of_angles); // [32]
+        item.push(0); // [33] is_different_audios / is_seamless_angle_change
+        item.extend_from_slice(b"00002"); // angle 2 clip_name(5)
+        item.extend_from_slice(b"M2TS"); // angle 2 codec_id(4)
+        item.push(0); // angle 2 ref_to_STC_id(1)  -> STN now begins at offset 44
+        // STN table: length(2) + reserved(2) + counts(8) + reserved(4) + entries.
+        let stn_start = item.len();
+        item.extend_from_slice(&[0u8; 2]); // STN length placeholder
+        item.extend_from_slice(&[0u8; 2]); // reserved
+        item.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]); // n_video=1, rest 0
+        item.extend_from_slice(&[0u8; 4]); // reserved
+        item.extend_from_slice(&build_stream_entry_video(0x1011, 0x24, 8, 1, Some(0x12)));
+        let stn_len = (item.len() - stn_start - 2) as u16;
+        item[stn_start..stn_start + 2].copy_from_slice(&stn_len.to_be_bytes());
+
+        // Wrap in the file + PlayList headers.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"MPLS0200");
+        buf.extend_from_slice(&40u32.to_be_bytes()); // playlist_start
+        buf.extend_from_slice(&[0u8; 28]); // mark_start(0) + padding to 40
+        let pl_start = buf.len();
+        buf.extend_from_slice(&[0u8; 4]); // PlayList length placeholder
+        buf.extend_from_slice(&[0u8; 2]); // reserved
+        buf.extend_from_slice(&1u16.to_be_bytes()); // num_play_items
+        buf.extend_from_slice(&[0u8; 2]); // num_sub_paths
+        buf.extend_from_slice(&(item.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&item);
+        let pl_len = (buf.len() - pl_start - 4) as u32;
+        buf[pl_start..pl_start + 4].copy_from_slice(&pl_len.to_be_bytes());
+
+        let playlist = parse(&buf).expect("multi-angle MPLS must parse");
+        assert_eq!(playlist.play_items.len(), 1);
+        assert_eq!(
+            playlist.streams.len(),
+            1,
+            "the primary video must be found past the angle block, not misread as garbage"
+        );
+        assert_eq!(playlist.streams[0].stream_type, 1, "it is a video stream");
+        assert_eq!(playlist.streams[0].pid, 0x1011);
+        assert_eq!(playlist.streams[0].coding_type, 0x24); // HEVC
     }
 
     #[test]
