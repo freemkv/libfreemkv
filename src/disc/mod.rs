@@ -1903,6 +1903,61 @@ impl Disc {
         Self::read_aacs_inputs_from_reader(&mut reader, &udf_fs)
     }
 
+    /// Read a disc's **structure metadata** for diagnostics — `(relative_path,
+    /// bytes)` for each present index file that drives title enumeration and
+    /// main-feature selection: `BDMV/index.bdmv`, `MovieObject.bdmv`,
+    /// `PLAYLIST/*.mpls`, `CLIPINF/*.clpi`, `BDJO/*.bdjo`, `META/DL/*.xml`, DVD
+    /// `VIDEO_TS/*.IFO`. No audio/video essence and no AACS keys are read, so the
+    /// result is safe to share in a bug report (a few hundred KB); missing files
+    /// are skipped and empty = no readable structure. Powers `freemkv info …
+    /// --share` over any [`SectorSource`] (drive, ISO, `dir://`) — issue #45.
+    pub fn read_structure_files(reader: &mut dyn SectorSource) -> Result<Vec<(String, Vec<u8>)>> {
+        let udf_fs = udf::read_filesystem(reader)?;
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+
+        // Read one named file into `out` under `rel`, skipping if absent.
+        let mut grab = |udf_fs: &udf::UdfFs, reader: &mut dyn SectorSource, rel: &str| {
+            if let Ok(bytes) = udf_fs.read_file(reader, &format!("/{rel}")) {
+                out.push((rel.to_string(), bytes));
+            }
+        };
+
+        // Top-level BD nav files.
+        grab(&udf_fs, reader, "BDMV/index.bdmv");
+        grab(&udf_fs, reader, "BDMV/MovieObject.bdmv");
+
+        // List a directory's files by extension first (immutable borrow of
+        // udf_fs), then read them (needs &mut reader) — so the directory borrow
+        // is released before the reads. Sorted for deterministic bundles.
+        let list = |udf_fs: &udf::UdfFs, dir: &str, ext: &str| -> Vec<String> {
+            let mut names: Vec<String> = match udf_fs.find_dir(&format!("/{dir}")) {
+                Some(d) => d
+                    .entries
+                    .iter()
+                    .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(ext))
+                    .map(|e| e.name.clone())
+                    .collect(),
+                None => Vec::new(),
+            };
+            names.sort();
+            names
+        };
+
+        for (dir, ext) in [
+            ("BDMV/PLAYLIST", ".mpls"),
+            ("BDMV/CLIPINF", ".clpi"),
+            ("BDMV/BDJO", ".bdjo"),
+            ("BDMV/META/DL", ".xml"),
+            ("VIDEO_TS", ".ifo"),
+        ] {
+            for name in list(&udf_fs, dir, ext) {
+                grab(&udf_fs, reader, &format!("{dir}/{name}"));
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Same as [`Disc::read_aacs_inputs`] but reads from a live drive. The
     /// out-of-band Unit Key path fetches the disc's key files from the drive,
     /// resolves a key from them however it likes, then applies it via
