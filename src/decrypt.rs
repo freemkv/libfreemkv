@@ -367,9 +367,17 @@ pub(crate) fn decrypt_sectors_mapped_in_content(
 /// mapped decrypt so clear filesystem/nav units outside every encrypted-content
 /// extent are passed through untouched.
 fn lba_in_content_ranges(lba: u32, ranges: &[(u32, u32)]) -> bool {
-    ranges
-        .iter()
-        .any(|&(start, count)| lba >= start && (lba - start) < count)
+    debug_assert!(
+        ranges.windows(2).all(|w| w[0].0 <= w[1].0),
+        "content ranges must be sorted ascending by start LBA for the binary search"
+    );
+    // Sorted, non-overlapping (merged extents): binary-search the last range
+    // whose start <= lba and test containment — O(log n), not O(ranges).
+    let i = ranges.partition_point(|&(start, _)| start <= lba);
+    i > 0 && {
+        let (start, count) = ranges[i - 1];
+        (lba - start) < count
+    }
 }
 
 // AACS scheme step: apply `map`'s per-unit keys to `buf`, in-place — no key
@@ -1193,6 +1201,10 @@ mod tests {
             BusRemovalSectorSource::new(WireSource { bytes: wire }, BusStage::Passthrough);
         let mut buf = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
         src.read_sectors(0, 3, &mut buf, false).unwrap();
+        // Snapshot the still-bus-encrypted wire as delivered, so we can prove the
+        // unit-key decrypt actually TOUCHED the buffer (not a silent no-op) — a
+        // bare `!= clear` also passes on an untouched buffer.
+        let wire_delivered = buf.clone();
 
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, unit_key)],
@@ -1205,6 +1217,11 @@ mod tests {
         assert_ne!(
             buf, clear,
             "without bus removal first, unit-key decrypt alone cannot recover clear"
+        );
+        assert_ne!(
+            buf, wire_delivered,
+            "unit-key decrypt must have actually run over the buffer (not a no-op); \
+             it just can't recover clear without bus removal first"
         );
     }
 

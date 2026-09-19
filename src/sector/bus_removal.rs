@@ -315,6 +315,31 @@ mod tests {
         );
     }
 
+    // Per-sector gating WITHIN one multi-sector read at the decorator level:
+    // content [301,302) covers only the middle sector of a 3-sector read at 300.
+    // MUTATION: gating the whole buffer on the first sector's LBA goes red here.
+    #[test]
+    fn host_key_gates_per_sector_within_a_multi_sector_read() {
+        let rdk = [0x44u8; 16];
+        let clear = clear_content(3);
+        let mut wire = clear.clone();
+        // Encrypt ONLY the middle sector's body; 0 and 2 stay clear on the wire.
+        let mut mid = clear[SECTOR_BYTES..2 * SECTOR_BYTES].to_vec();
+        encrypt_bus(&mut mid, &rdk);
+        wire[SECTOR_BYTES..2 * SECTOR_BYTES].copy_from_slice(&mid);
+
+        let src = FixedSource { bytes: wire };
+        let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(301u32, 1u32)].into_boxed_slice());
+        let mut s = BusRemovalSectorSource::new(src, BusStage::AacsHostKey(rdk))
+            .with_content_ranges(ranges);
+        let mut got = vec![0u8; 3 * SECTOR_BYTES];
+        s.read_sectors(300, 3, &mut got, false).unwrap();
+        assert_eq!(
+            got, clear,
+            "only the in-range middle sector is de-bussed; clear neighbours untouched"
+        );
+    }
+
     // Only the reported `n` bytes are de-bussed; a short read must not touch
     // bytes beyond `n`. Also proves capacity delegates.
     #[test]

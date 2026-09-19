@@ -492,6 +492,29 @@ pub(crate) fn aacs_dir_present(udf_fs: &crate::udf::UdfFs) -> bool {
     udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some()
 }
 
+// Title-ranking heuristic thresholds. Each gates a DISTINCT decision — several
+// share a value (0.5) by coincidence, so they are named and tuned separately.
+// See docs/disc-mod.md for the shape gate.
+/// Nav candidate: a real-video title qualifies only if it runs at least this
+/// fraction of the longest probable-video title's duration.
+const NAV_CANDIDATE_MIN_DURATION_FRAC: f64 = 0.5;
+/// Payload floor: a promoted title must hold at least this fraction of the
+/// largest video-bearing title's byte size, else a tiny playback-valid branch
+/// could win nav/authoring.
+const FEATURE_PAYLOAD_MIN_SIZE_FRAC: f64 = 0.10;
+/// Composite/wrapper gate: candidate wrapper Q must be at least this fraction of
+/// the outer title P's byte size to count as a plausible wrapper.
+const WRAPPER_MIN_SIZE_FRAC: f64 = 0.5;
+/// Seamless-branch guard (issue #45): Q is a wrapper if it is a much SHORTER cut,
+/// i.e. its duration is below this fraction of P's duration.
+const SEAMLESS_SHORTER_CUT_DURATION_FRAC: f64 = 0.85;
+/// Seamless-branch guard (issue #45): Q is a wrapper if it is nearly P's SIZE, i.e.
+/// its byte size is at least this fraction of P's (a bumper, not a real branch).
+const SEAMLESS_BUMPER_SIZE_FRAC: f64 = 0.90;
+/// Authoring hint: honoured only when the title runs at least this fraction of the
+/// longest probable-video title's duration.
+const AUTHORING_MIN_DURATION_FRAC: f64 = 0.5;
+
 /// Union a set of extents into sorted, merged, disjoint `(start_lba,
 /// sector_count)` ranges — the pure, testable core of
 /// [`Disc::encrypted_content_ranges`]. Reuses [`crate::udf::merge_ranges`].
@@ -1749,21 +1772,34 @@ impl Disc {
         tracing::info!(target: "freemkv::scan", titles = disc.titles.len(), format = ?disc.content_format, "phase: titles parsed");
 
         // Wire the SINGLE de-bus point onto the drive from the handshake result,
-        // BEFORE the caller samples keys or muxes — gated to encrypted-content
-        // extents (the earlier UDF/metadata reads ran under default Passthrough).
-        session.set_bus_stage(crate::sector::bus_removal::BusStage::from_read_data_key(
-            bus_key,
-        ));
-        let content_ranges = disc.encrypted_content_ranges();
-        if !content_ranges.is_empty() {
-            session.set_bus_content_ranges(std::sync::Arc::from(content_ranges.into_boxed_slice()));
-        }
+        // BEFORE the caller samples keys or muxes (the earlier UDF/metadata reads
+        // ran under default Passthrough).
+        Self::wire_bus_removal(session, bus_key, disc.encrypted_content_ranges());
 
         // No CSS key recovery at scan time: DVD CSS keys are per-title and are
         // re-cracked keylessly at read/decrypt time (`disc.css` stays unset),
         // so log the format rather than a key state that is always `None`.
         tracing::info!(target: "freemkv::scan", format = ?disc.format, titles = disc.titles.len(), "phase: scan complete");
         Ok(disc)
+    }
+
+    /// Wire the SINGLE AACS bus-removal de-bus point onto `session` from a
+    /// completed handshake. The cert-route Read Data Key (`bus_key`, `None` on
+    /// the firmware/vendor route) picks the `BusStage`; the encrypted-content
+    /// ranges gate it. ALWAYS install the ranges even when empty: `None` means
+    /// "de-bus every sector", `Some([])` means "de-bus none" — so a host-key disc
+    /// that parsed zero content extents fails SAFE (untouched) instead of de-bussing
+    /// clear UDF/nav bytes to garbage. Extracted from [`Self::scan`] so it is
+    /// unit-testable without a live SCSI handshake.
+    pub(crate) fn wire_bus_removal(
+        session: &mut Drive,
+        bus_key: Option<[u8; 16]>,
+        content_ranges: Vec<(u32, u32)>,
+    ) {
+        session.set_bus_stage(crate::sector::bus_removal::BusStage::from_read_data_key(
+            bus_key,
+        ));
+        session.set_bus_content_ranges(std::sync::Arc::from(content_ranges.into_boxed_slice()));
     }
 
     // The extents an image-time CSS crack scans, in the crate's CANONICAL
@@ -2057,7 +2093,9 @@ impl Disc {
                 .iter()
                 .filter(|t| {
                     t.has_video()
-                        && (longest_video_dur <= 0.0 || t.duration_secs >= 0.5 * longest_video_dur)
+                        && (longest_video_dur <= 0.0
+                            || t.duration_secs
+                                >= NAV_CANDIDATE_MIN_DURATION_FRAC * longest_video_dur)
                 })
                 .map(|t| t.playlist_id)
                 .collect();
@@ -2238,7 +2276,8 @@ impl Disc {
             .max()
             .unwrap_or(0);
         let carries_feature_payload = |t: &DiscTitle| {
-            max_video_size == 0 || t.size_bytes as f64 >= 0.10 * max_video_size as f64
+            max_video_size == 0
+                || t.size_bytes as f64 >= FEATURE_PAYLOAD_MIN_SIZE_FRAC * max_video_size as f64
         };
         // The composite scan below is O(n^2 * clip-set-size); title/clip counts are
         // untrusted, so a crafted image could stall it. Bound the total pair work;
@@ -2266,12 +2305,14 @@ impl Disc {
                             !qj.is_empty()
                                 && qj.len() < pi.len()
                                 && q.has_probable_video()
-                                && q.size_bytes as f64 >= 0.5 * p.size_bytes as f64
+                                && q.size_bytes as f64 >= WRAPPER_MIN_SIZE_FRAC * p.size_bytes as f64
                                 // Seamless-branch guard (issue #45): wrapper only
                                 // if Q is a much SHORTER cut (concat) or nearly P's
                                 // SIZE-equal (bumper). See docs/disc-mod.md.
-                                && (q.duration_secs < 0.85 * p.duration_secs
-                                    || q.size_bytes as f64 >= 0.90 * p.size_bytes as f64)
+                                && (q.duration_secs
+                                    < SEAMLESS_SHORTER_CUT_DURATION_FRAC * p.duration_secs
+                                    || q.size_bytes as f64
+                                        >= SEAMLESS_BUMPER_SIZE_FRAC * p.size_bytes as f64)
                                 && qj.is_subset(pi)
                         }
                     });
@@ -2281,7 +2322,8 @@ impl Disc {
                 let authoring = !composite
                     && hint.is_some_and(|h| h.matches(p.playlist_id, &p.playlist))
                     && p.has_video()
-                    && (longest_video_dur <= 0.0 || p.duration_secs >= 0.5 * longest_video_dur)
+                    && (longest_video_dur <= 0.0
+                        || p.duration_secs >= AUTHORING_MIN_DURATION_FRAC * longest_video_dur)
                     && carries_feature_payload(p);
                 // Nav result is video- and payload-gated like the authoring hint,
                 // so a streamless or low-byte branch/DV presentation cannot win

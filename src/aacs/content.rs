@@ -293,12 +293,23 @@ pub(crate) fn decrypt_bus_in_content(
     base_lba: u32,
     ranges: Option<&[(u32, u32)]>,
 ) {
+    debug_assert!(
+        ranges.is_none_or(|rs| rs.windows(2).all(|w| w[0].0 <= w[1].0)),
+        "content ranges must be sorted ascending by start LBA for the binary search"
+    );
     let in_content = |lba: u32| -> bool {
         match ranges {
             None => true,
-            Some(rs) => rs
-                .iter()
-                .any(|&(start, cnt)| lba >= start && (lba as u64) < start as u64 + cnt as u64),
+            // `rs` is sorted ascending by start and non-overlapping (merged
+            // extents), so binary-search the last range with start <= lba and
+            // test containment — O(log n) per sector, not O(ranges).
+            Some(rs) => {
+                let i = rs.partition_point(|&(start, _)| start <= lba);
+                i > 0 && {
+                    let (start, cnt) = rs[i - 1];
+                    (lba as u64) < start as u64 + cnt as u64
+                }
+            }
         }
     };
     let cipher = crate::aacs::crypto::new_cipher_for(read_data_key);

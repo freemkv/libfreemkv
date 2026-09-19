@@ -1711,6 +1711,71 @@ mod command_tests {
         );
     }
 
+    // F1 fail-safe: an AacsHostKey stage with an EMPTY content map must de-bus
+    // NOTHING (empty `Some([])`), not everything — Disc::scan always installs the
+    // map now, so a host-key disc that parsed no titles leaves clear sectors alone.
+    #[test]
+    fn bus_empty_content_ranges_debus_nothing() {
+        use crate::sector::SectorSource;
+        let rdk = [0x7Eu8; 16];
+        let clear = clear_bus_content(2);
+        let mut wire = clear.clone();
+        crate::aacs::content::encrypt_bus(&mut wire, &rdk);
+        let mut d = drive_with(wire.clone());
+        d.set_bus_stage(crate::sector::bus_removal::BusStage::AacsHostKey(rdk));
+        // Empty map = "no content anywhere" → de-bus nothing (fail-safe).
+        d.set_bus_content_ranges(std::sync::Arc::from(
+            Vec::<(u32, u32)>::new().into_boxed_slice(),
+        ));
+        let mut got = vec![0u8; clear.len()];
+        d.read_sectors(300, 2, &mut got, false).unwrap();
+        assert_eq!(
+            got, wire,
+            "empty content map must leave every sector untouched (still bus-encrypted), \
+             never de-bus clear bytes into garbage"
+        );
+    }
+
+    // scan()'s handshake→bus_stage wiring, via the `wire_bus_removal` seam. CERT
+    // route: a Some(rdk) handshake arms AacsHostKey + installs the content map, so
+    // an in-range bus-encrypted sector is de-bussed to plaintext.
+    #[test]
+    fn wire_bus_removal_cert_route_arms_host_key_and_ranges() {
+        use crate::sector::SectorSource;
+        let rdk = [0x6Bu8; 16];
+        let clear = clear_bus_content(1);
+        let mut wire = clear.clone();
+        crate::aacs::content::encrypt_bus(&mut wire, &rdk);
+        let mut d = drive_with(wire);
+        crate::disc::Disc::wire_bus_removal(&mut d, Some(rdk), vec![(300u32, 3u32)]);
+        let mut got = vec![0u8; clear.len()];
+        d.read_sectors(300, 1, &mut got, false).unwrap();
+        assert_eq!(
+            got, clear,
+            "Some(read_data_key) must arm AacsHostKey + ranges so content is de-bussed"
+        );
+    }
+
+    // FIRMWARE/vendor route: a None handshake maps to Passthrough, so even an
+    // in-range sector is NOT de-bussed. MUTATION: mapping None to AacsHostKey
+    // would corrupt these bytes here.
+    #[test]
+    fn wire_bus_removal_firmware_route_is_passthrough() {
+        use crate::sector::SectorSource;
+        let rdk = [0x6Bu8; 16];
+        let clear = clear_bus_content(1);
+        let mut wire = clear.clone();
+        crate::aacs::content::encrypt_bus(&mut wire, &rdk); // still bus-encrypted on the wire
+        let mut d = drive_with(wire.clone());
+        crate::disc::Disc::wire_bus_removal(&mut d, None, vec![(300u32, 3u32)]);
+        let mut got = vec![0u8; clear.len()];
+        d.read_sectors(300, 1, &mut got, false).unwrap();
+        assert_eq!(
+            got, wire,
+            "None must map to Passthrough — no host-side de-bus, bytes returned verbatim"
+        );
+    }
+
     #[test]
     fn read_capacity_normal_adds_one() {
         // last_lba = 0x0000_0063 (99) → capacity 100 sectors.

@@ -338,24 +338,25 @@ impl ScsiTransport for SgIoTransport {
             let recovery = self.fd_recovery.clone();
             let dead = self.dead.clone();
 
-            // Cap outstanding recovery threads: past MAX_RECOVERY_THREADS a
-            // sustained wedge would spawn unbounded threads, so fall back to
-            // doing the close/reopen inline on this thread instead.
+            // Cap outstanding recovery threads (past MAX a sustained wedge spawns
+            // unbounded threads): reserve the slot ATOMICALLY via fetch_add, act on
+            // the pre-increment value, and give the slot back if it overshoots.
             use std::sync::atomic::Ordering;
-            if RECOVERY_THREADS.load(Ordering::Acquire) < MAX_RECOVERY_THREADS {
-                RECOVERY_THREADS.fetch_add(1, Ordering::AcqRel);
+            if RECOVERY_THREADS.fetch_add(1, Ordering::AcqRel) < MAX_RECOVERY_THREADS {
                 std::thread::spawn(move || {
                     if old_fd >= 0 {
                         unsafe { libc::close(old_fd) };
                     }
                     RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
                 });
-            } else if old_fd >= 0 {
-                unsafe { libc::close(old_fd) };
+            } else {
+                RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
+                if old_fd >= 0 {
+                    unsafe { libc::close(old_fd) };
+                }
             }
 
-            if RECOVERY_THREADS.load(Ordering::Acquire) < MAX_RECOVERY_THREADS {
-                RECOVERY_THREADS.fetch_add(1, Ordering::AcqRel);
+            if RECOVERY_THREADS.fetch_add(1, Ordering::AcqRel) < MAX_RECOVERY_THREADS {
                 std::thread::spawn(move || {
                     // Don't unwrap: a device path with an interior NUL would
                     // panic this detached thread (silently swallowed). Bail
@@ -383,17 +384,20 @@ impl ScsiTransport for SgIoTransport {
                     }
                     RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
                 });
-            } else if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
-                // At the recovery-thread cap: reopen inline (blocking this
-                // call briefly) instead of spawning an unbounded 9th thread.
-                let new_fd = unsafe {
-                    libc::open(
-                        c_path.as_ptr() as *const libc::c_char,
-                        libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                    )
-                };
-                if new_fd >= 0 {
-                    self.fd = new_fd;
+            } else {
+                // Over the cap: give the reservation back, then reopen inline
+                // (blocking this call briefly) instead of spawning a 9th thread.
+                RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
+                if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+                    let new_fd = unsafe {
+                        libc::open(
+                            c_path.as_ptr() as *const libc::c_char,
+                            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                        )
+                    };
+                    if new_fd >= 0 {
+                        self.fd = new_fd;
+                    }
                 }
             }
 

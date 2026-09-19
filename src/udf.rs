@@ -4470,6 +4470,124 @@ mod tests {
         );
     }
 
+    // read_directory follows a type-3 CONTINUATION pointer (ECMA-167 4/14.14.1.1):
+    // extent 0 (sector 60) has the first FID; a type-3 AD → block 50 → tail AD →
+    // extent 1 (sector 61) with the second FID. MUTATION: not following loses it.
+    #[test]
+    fn read_directory_follows_type3_continuation() {
+        let mut e0 = Vec::new();
+        push_fid_iu(&mut e0, "", 5, true, true, 0); // parent (..)
+        push_fid_iu(&mut e0, "FIRST.CLPI", 7, false, false, 1959);
+        assert_eq!(e0.len(), 2048, "extent 0 must fill its sector exactly");
+        let mut sec0 = [0u8; 2048];
+        sec0.copy_from_slice(&e0);
+
+        let mut e1 = Vec::new();
+        push_fid_iu(&mut e1, "SECOND.CLPI", 8, false, false, 0);
+        let mut sec1 = [0u8; 2048];
+        sec1[..e1.len()].copy_from_slice(&e1);
+
+        // ICB ADs: (recorded, 2048, lba=60) then a type-3 continuation (→ lba 50).
+        let mut body = Vec::new();
+        body.extend_from_slice(&2048u32.to_le_bytes());
+        body.extend_from_slice(&60u32.to_le_bytes());
+        body.extend_from_slice(&((3u32 << 30) | 2048).to_le_bytes());
+        body.extend_from_slice(&50u32.to_le_bytes());
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_flagged(0, &body));
+        reader.put(60, sec0);
+        reader.put(50, build_cont_block(&[(0, e1.len() as u32, 61)]));
+        reader.put(61, sec1);
+        reader.put(7, build_efe_icb(11, 2048, 0));
+        reader.put(8, build_efe_icb(22, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("a directory with a continuation AD must be readable");
+        assert_eq!(
+            child_names(&parsed),
+            vec!["FIRST.CLPI".to_string(), "SECOND.CLPI".to_string()],
+            "the FID in the continuation block must be read, not dropped"
+        );
+        assert_eq!(parsed.size, 2048 + e1.len() as u64);
+    }
+
+    // A continuation block opens with a 24-byte AED (tag 258); read_directory reads
+    // the tail ADs from offset 24, not 0. MUTATION: reading from 0 mis-parses the
+    // AED tag as a bogus AD and loses the continuation extent (Blu-ray 3D bug).
+    #[test]
+    fn read_directory_continuation_skips_aed_header() {
+        let mut e0 = Vec::new();
+        push_fid_iu(&mut e0, "", 5, true, true, 0);
+        push_fid_iu(&mut e0, "FIRST.CLPI", 7, false, false, 1959);
+        let mut sec0 = [0u8; 2048];
+        sec0.copy_from_slice(&e0);
+
+        let mut e1 = Vec::new();
+        push_fid_iu(&mut e1, "SECOND.CLPI", 8, false, false, 0);
+        let mut sec1 = [0u8; 2048];
+        sec1[..e1.len()].copy_from_slice(&e1);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&2048u32.to_le_bytes());
+        body.extend_from_slice(&60u32.to_le_bytes());
+        body.extend_from_slice(&((3u32 << 30) | 2048).to_le_bytes());
+        body.extend_from_slice(&50u32.to_le_bytes());
+
+        let mut cont = build_cont_block(&[(0, e1.len() as u32, 61)]);
+        // Stamp a realistic AED tag (258) so a from-offset-0 regression mis-parses it.
+        cont[0..2].copy_from_slice(&258u16.to_le_bytes());
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_flagged(0, &body));
+        reader.put(60, sec0);
+        reader.put(50, cont);
+        reader.put(61, sec1);
+        reader.put(7, build_efe_icb(11, 2048, 0));
+        reader.put(8, build_efe_icb(22, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("continuation with an AED header must be readable");
+        assert_eq!(
+            child_names(&parsed),
+            vec!["FIRST.CLPI".to_string(), "SECOND.CLPI".to_string()],
+            "continuation ADs must be read past the 24-byte AED header, not from offset 0"
+        );
+    }
+
+    // Hostile input: a continuation pointer that cycles to its own block. The
+    // MAX_AD_BLOCKS budget must bound the walk so it TERMINATES (returns the FIDs
+    // gathered before the cycle) instead of looping forever or panicking.
+    #[test]
+    fn read_directory_self_cycling_continuation_terminates() {
+        let mut e0 = Vec::new();
+        push_fid_iu(&mut e0, "", 5, true, true, 0);
+        push_fid_iu(&mut e0, "FIRST.CLPI", 7, false, false, 1959);
+        let mut sec0 = [0u8; 2048];
+        sec0.copy_from_slice(&e0);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&2048u32.to_le_bytes());
+        body.extend_from_slice(&60u32.to_le_bytes());
+        body.extend_from_slice(&((3u32 << 30) | 2048).to_le_bytes());
+        body.extend_from_slice(&50u32.to_le_bytes());
+
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_flagged(0, &body));
+        reader.put(60, sec0);
+        // Continuation block 50 points at ITSELF (type-3 → lba 50).
+        reader.put(50, build_cont_block(&[(3, 2048, 50)]));
+        reader.put(7, build_efe_icb(11, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("a self-cycling continuation must terminate, not hang or error");
+        assert_eq!(
+            child_names(&parsed),
+            vec!["FIRST.CLPI".to_string()],
+            "FIDs before the cycle are returned; the MAX_AD_BLOCKS budget bounds the walk"
+        );
+    }
+
     #[test]
     fn read_directory_reads_an_extended_ad_directorys_extent_location() {
         // ECMA-167 4/14.14.3 extended_ad (20B) keeps extent_location at offset 12, NOT offset 4

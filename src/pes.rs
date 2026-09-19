@@ -141,18 +141,17 @@ impl PesFrame {
         if len > MAX_FRAME_SIZE {
             return Err(crate::error::Error::PesFrameTooLarge { size: len }.into());
         }
-        // Grow the buffer INCREMENTALLY (not `vec![0u8; len]`): `len` is attacker-controlled
-        // up to MAX_FRAME_SIZE (256 MiB), so a truncated stream claiming a huge frame must not
-        // pre-allocate the max; a bounded scratch chunk tracks delivered bytes, short reads still surface UnexpectedEof, valid frames assemble byte-for-byte.
-        const GROW_CHUNK: usize = 1024 * 1024; // 1 MiB scratch, heap-allocated
+        // Grow INCREMENTALLY (not `vec![0u8; len]`): `len` is attacker-controlled to 256 MiB, so
+        // a truncated stream claiming a huge frame must not pre-allocate the max. Read each chunk
+        // straight into `data`'s own tail — no scratch buffer, no second copy; short reads EOF.
+        const GROW_CHUNK: usize = 1024 * 1024; // 1 MiB growth step
         let mut data: Vec<u8> = Vec::with_capacity(len.min(GROW_CHUNK));
-        let mut chunk = vec![0u8; GROW_CHUNK.min(len).max(1)];
-        let mut remaining = len;
-        while remaining > 0 {
-            let want = remaining.min(chunk.len());
-            r.read_exact(&mut chunk[..want])?;
-            data.extend_from_slice(&chunk[..want]);
-            remaining -= want;
+        let mut filled = 0usize;
+        while filled < len {
+            let want = (len - filled).min(GROW_CHUNK);
+            data.resize(filled + want, 0);
+            r.read_exact(&mut data[filled..filled + want])?;
+            filled += want;
         }
         Ok(Some(Self {
             track,
