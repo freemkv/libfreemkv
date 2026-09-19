@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.7.3] — UNRELEASED
+
+### Fixed
+
+- MPLS title enumeration: the STN (stream number) table of the first PlayItem is now located past the multi-angle *angle block* instead of at the fixed offset 32. A multi-angle first PlayItem (e.g. a seamless-branch UHD title) carries `number_of_angles` extra 10-byte angle entries before the STN table, so the old fixed offset read the wrong bytes and misparsed the primary title's streams — the root cause behind autorip/CLI picking the wrong (or no) main feature on some UHD discs. Validated against a 92-disc real-media corpus with zero regressions (issue #45).
+
+### Added
+
+- `disc::read_structure_files()` — captures a disc's **structure metadata** (`BDMV/index.bdmv`, `MovieObject.bdmv`, `PLAYLIST/*.mpls`, `CLIPINF/*.clpi`, `BDJO/*.bdjo`, `META/DL/*.xml`, DVD `VIDEO_TS/*.IFO`) over any `SectorSource` (drive, ISO, `dir://`). No audio/video essence and no AACS keys are read, so the result is safe to attach to a bug report (a few hundred KB). Powers `freemkv info … --share` so a reporter can reproduce a title-selection issue without shipping the full ISO.
+
 ## [1.7.2] — UNRELEASED
 
 ### Fixed
