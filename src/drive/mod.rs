@@ -120,14 +120,15 @@ pub struct Drive {
     /// unlock/handshake result during [`crate::disc::Disc::scan`] and applied on
     /// every read below this drive, so every reader above (sampler, mux, sweep,
     /// validation) sees already-de-bussed content and never threads a bus key.
-    /// Defaults to [`BusStage::Passthrough`] (firmware/vendor unlock de-busses at
-    /// the drive, or the disc carries no bus encryption).
+    /// Defaults to [`BusStage::Passthrough`](crate::sector::bus_removal::BusStage)
+    /// (firmware/vendor unlock de-busses at the drive, or the disc carries no bus
+    /// encryption).
     bus_stage: crate::sector::bus_removal::BusStage,
     /// Encrypted-content extent map (sorted `(start_lba, sector_count)`) that
     /// gates the host-key de-bus to content sectors — clear UDF/nav sectors read
     /// during a whole-disc pass are left untouched. `None` = de-bus every read
     /// sector (a content-only reader). Ignored entirely under
-    /// [`BusStage::Passthrough`]. See docs/drive-mod.md — bus-removal wiring.
+    /// `BusStage::Passthrough`. See docs/drive-mod.md — bus-removal wiring.
     bus_content_ranges: Option<Arc<[(u32, u32)]>>,
     /// Linux only: raw fd for the corresponding block device (`/dev/sr*`)
     /// used as a recovery fallback when SCSI READ via `/dev/sg*` returns
