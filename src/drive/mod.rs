@@ -116,6 +116,19 @@ pub struct Drive {
     halt: Arc<AtomicBool>,
     /// Event handler — fires for read errors and library-level state changes.
     event_fn: Option<Box<dyn Fn(Event) + Send>>,
+    /// The SINGLE AACS bus-encryption removal point. Decided ONCE from the
+    /// unlock/handshake result during [`crate::disc::Disc::scan`] and applied on
+    /// every read below this drive, so every reader above (sampler, mux, sweep,
+    /// validation) sees already-de-bussed content and never threads a bus key.
+    /// Defaults to [`BusStage::Passthrough`] (firmware/vendor unlock de-busses at
+    /// the drive, or the disc carries no bus encryption).
+    bus_stage: crate::sector::bus_removal::BusStage,
+    /// Encrypted-content extent map (sorted `(start_lba, sector_count)`) that
+    /// gates the host-key de-bus to content sectors — clear UDF/nav sectors read
+    /// during a whole-disc pass are left untouched. `None` = de-bus every read
+    /// sector (a content-only reader). Ignored entirely under
+    /// [`BusStage::Passthrough`]. See docs/drive-mod.md — bus-removal wiring.
+    bus_content_ranges: Option<Arc<[(u32, u32)]>>,
     /// Linux only: raw fd for the corresponding block device (`/dev/sr*`)
     /// used as a recovery fallback when SCSI READ via `/dev/sg*` returns
     /// an error. The kernel `sr_mod` driver auto-retries failed reads
@@ -157,9 +170,44 @@ impl Drive {
             device_path: device.to_string_lossy().to_string(),
             halt: Arc::new(AtomicBool::new(false)),
             event_fn: None,
+            bus_stage: crate::sector::bus_removal::BusStage::Passthrough,
+            bus_content_ranges: None,
             #[cfg(target_os = "linux")]
             block_dev_fd,
         })
+    }
+
+    /// Set the SINGLE AACS bus-removal stage for this drive, decided once from
+    /// the unlock/handshake result. `AacsHostKey(rdk)` de-busses each content
+    /// read in software; `Passthrough` (a firmware/vendor unlock, or a non-bus
+    /// disc) is a no-op. Every reader above the drive inherits the result.
+    pub fn set_bus_stage(&mut self, stage: crate::sector::bus_removal::BusStage) {
+        self.bus_stage = stage;
+    }
+
+    /// Gate host-key de-bussing to the disc's encrypted-content extents (sorted
+    /// `(start_lba, sector_count)`), so clear UDF/nav sectors read during a
+    /// whole-disc pass are left untouched. Set after the disc structure is parsed
+    /// (see [`crate::disc::Disc::encrypted_content_ranges`]); unset means every
+    /// read sector is treated as content.
+    pub fn set_bus_content_ranges(&mut self, ranges: Arc<[(u32, u32)]>) {
+        self.bus_content_ranges = Some(ranges);
+    }
+
+    /// The SOLE application of AACS bus decryption in the read path: under a
+    /// host-key stage, de-bus the `data` that a raw read landed at `lba`, gated
+    /// to the encrypted-content ranges. `Passthrough` is a no-op, so the raw
+    /// `read`/`read_fua` used by internal callers stay bus-encrypted while
+    /// `SectorSource` readers above see plaintext content.
+    fn remove_bus_encryption(&self, lba: u32, data: &mut [u8]) {
+        if let crate::sector::bus_removal::BusStage::AacsHostKey(rdk) = &self.bus_stage {
+            crate::aacs::content::decrypt_bus_in_content(
+                data,
+                rdk,
+                lba,
+                self.bus_content_ranges.as_deref(),
+            );
+        }
     }
 
     // Test-only constructor: build a `Drive` over an arbitrary `ScsiTransport`
@@ -186,6 +234,8 @@ impl Drive {
             device_path: "test".to_string(),
             halt: Arc::new(AtomicBool::new(false)),
             event_fn: None,
+            bus_stage: crate::sector::bus_removal::BusStage::Passthrough,
+            bus_content_ranges: None,
             #[cfg(target_os = "linux")]
             block_dev_fd: None,
         }
@@ -1169,7 +1219,9 @@ impl SectorSource for Drive {
         buf: &mut [u8],
         recovery: bool,
     ) -> Result<usize> {
-        self.read(lba, count, buf, recovery)
+        let n = self.read(lba, count, buf, recovery)?;
+        self.remove_bus_encryption(lba, &mut buf[..n]);
+        Ok(n)
     }
 
     fn read_sectors_fua(
@@ -1180,7 +1232,9 @@ impl SectorSource for Drive {
         recovery: bool,
         fua: bool,
     ) -> Result<usize> {
-        self.read_fua(lba, count, buf, recovery, fua)
+        let n = self.read_fua(lba, count, buf, recovery, fua)?;
+        self.remove_bus_encryption(lba, &mut buf[..n]);
+        Ok(n)
     }
 
     fn set_speed(&mut self, kbs: u16) {
@@ -1517,6 +1571,143 @@ mod command_tests {
 
     fn drive_with(payload: Vec<u8>) -> Drive {
         Drive::from_transport_for_test(Box::new(FixedTransport { payload }))
+    }
+
+    // AACS bus-removal tests (the drive's single de-bus point): a clear "content"
+    // buffer with plaintext first-16-of-each-sector (bus enc leaves those clear on
+    // the wire) and a known 16..2048 pattern; `sectors` exercises cross-sector gating.
+    fn clear_bus_content(sectors: usize) -> Vec<u8> {
+        let mut v = vec![0u8; sectors * 2048];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        v
+    }
+
+    // Passthrough (the default) is a no-op: every read byte comes back verbatim,
+    // even when the wire happens to be clear content.
+    #[test]
+    fn bus_passthrough_read_returns_bytes_unchanged() {
+        use crate::sector::SectorSource;
+        let clear = clear_bus_content(3);
+        let mut d = drive_with(clear.clone());
+        let mut got = vec![0u8; clear.len()];
+        let n = d.read_sectors(0, 3, &mut got, false).unwrap();
+        assert_eq!(n, clear.len());
+        assert_eq!(got, clear, "default Passthrough must not alter any byte");
+    }
+
+    // Host-key stage de-busses at read time: a bus-ENCRYPTED wire comes back as
+    // the known plaintext. MUTATION: leaving `bus_stage` Passthrough (dropping the
+    // de-bus call) returns ciphertext, so this goes red.
+    #[test]
+    fn bus_host_key_removes_bus_encryption_at_read() {
+        use crate::sector::SectorSource;
+        let rdk = [0x5Au8; 16];
+        let clear = clear_bus_content(3);
+        let mut wire = clear.clone();
+        crate::aacs::content::encrypt_bus(&mut wire, &rdk); // model the drive's forward bus transform
+        assert_ne!(wire, clear, "fixture must actually be bus-encrypted");
+
+        let mut d = drive_with(wire);
+        d.set_bus_stage(crate::sector::bus_removal::BusStage::AacsHostKey(rdk));
+        let mut got = vec![0u8; clear.len()];
+        let n = d.read_sectors(0, 3, &mut got, false).unwrap();
+        assert_eq!(n, clear.len());
+        assert_eq!(
+            got, clear,
+            "AacsHostKey must recover the plaintext byte-for-byte"
+        );
+    }
+
+    // The FUA read path applies the same single de-bus step (the per-sector
+    // recovery lever must not ship ciphertext).
+    #[test]
+    fn bus_host_key_removes_bus_encryption_on_fua_read() {
+        use crate::sector::SectorSource;
+        let rdk = [0x5Au8; 16];
+        let clear = clear_bus_content(3);
+        let mut wire = clear.clone();
+        crate::aacs::content::encrypt_bus(&mut wire, &rdk);
+
+        let mut d = drive_with(wire);
+        d.set_bus_stage(crate::sector::bus_removal::BusStage::AacsHostKey(rdk));
+        let mut got = vec![0u8; clear.len()];
+        let n = d.read_sectors_fua(0, 3, &mut got, false, true).unwrap();
+        assert_eq!(n, clear.len());
+        assert_eq!(got, clear, "the FUA path must de-bus too");
+    }
+
+    // Content-range gating: a sector OUTSIDE the encrypted-content extents is
+    // clear filesystem/nav and must pass through untouched — de-bussing it would
+    // corrupt plaintext. LBA 0 is outside content [300,303).
+    #[test]
+    fn bus_content_ranges_pass_through_sectors_outside_content() {
+        use crate::sector::SectorSource;
+        let rdk = [0x5Au8; 16];
+        let clear = clear_bus_content(1); // clear filesystem sector on the wire
+        let mut d = drive_with(clear.clone());
+        d.set_bus_stage(crate::sector::bus_removal::BusStage::AacsHostKey(rdk));
+        d.set_bus_content_ranges(std::sync::Arc::from(
+            vec![(300u32, 3u32)].into_boxed_slice(),
+        ));
+        let mut got = vec![0u8; clear.len()];
+        // LBA 0 is outside content → no de-bus → bytes unchanged.
+        let n = d.read_sectors(0, 1, &mut got, false).unwrap();
+        assert_eq!(n, clear.len());
+        assert_eq!(
+            got, clear,
+            "a sector outside content must pass through untouched"
+        );
+    }
+
+    // The complement: a bus-encrypted sector INSIDE the content map is de-bussed.
+    #[test]
+    fn bus_content_ranges_debus_sectors_inside_content() {
+        use crate::sector::SectorSource;
+        let rdk = [0x33u8; 16];
+        let clear = clear_bus_content(3);
+        let mut wire = clear.clone();
+        crate::aacs::content::encrypt_bus(&mut wire, &rdk);
+        let mut d = drive_with(wire);
+        d.set_bus_stage(crate::sector::bus_removal::BusStage::AacsHostKey(rdk));
+        d.set_bus_content_ranges(std::sync::Arc::from(
+            vec![(300u32, 3u32)].into_boxed_slice(),
+        ));
+        let mut got = vec![0u8; clear.len()];
+        // Read the 3 content sectors at LBA 300 → all inside → de-bussed to plaintext.
+        let n = d.read_sectors(300, 3, &mut got, false).unwrap();
+        assert_eq!(n, clear.len());
+        assert_eq!(got, clear, "content sectors must be de-bussed to plaintext");
+    }
+
+    // Partial gating within one read: content [301,302) covers only the middle
+    // sector of a 3-sector read at LBA 300. Only that sector is de-bussed; the
+    // clear neighbours (300, 302) pass through untouched.
+    #[test]
+    fn bus_content_ranges_gate_per_sector_within_a_read() {
+        use crate::sector::SectorSource;
+        let rdk = [0x44u8; 16];
+        // Sector 1 is bus-encrypted content; sectors 0 and 2 are clear on the wire.
+        let clear = clear_bus_content(3);
+        let mut wire = clear.clone();
+        let mut mid = clear[2048..4096].to_vec();
+        crate::aacs::content::encrypt_bus(&mut mid, &rdk); // encrypt only the middle sector's body
+        wire[2048..4096].copy_from_slice(&mid);
+
+        let mut d = drive_with(wire);
+        d.set_bus_stage(crate::sector::bus_removal::BusStage::AacsHostKey(rdk));
+        d.set_bus_content_ranges(std::sync::Arc::from(
+            vec![(301u32, 1u32)].into_boxed_slice(),
+        ));
+        let mut got = vec![0u8; clear.len()];
+        d.read_sectors(300, 3, &mut got, false).unwrap();
+        // All three sectors come back as the known plaintext: 0 and 2 were clear
+        // and untouched; 1 was de-bussed back to clear.
+        assert_eq!(
+            got, clear,
+            "only the in-range sector is de-bussed; clear neighbours untouched"
+        );
     }
 
     #[test]

@@ -1584,7 +1584,6 @@ mod tests {
         }];
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, unit_key)],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
 
@@ -1644,7 +1643,6 @@ mod tests {
                 key_source: crate::disc::KeyOrigin::KeyDb,
                 vuk: None,
                 unit_keys: vec![(0, unit_key)],
-                read_data_key: None,
                 volume_id: [0u8; 16],
                 uk_ro: Vec::new(),
                 mkb: Vec::new(),
@@ -1852,7 +1850,6 @@ mod tests {
         let mut r = mk_reader();
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, unit_key)],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let map = resolve_inline_base_map(
@@ -1871,7 +1868,6 @@ mod tests {
         let mut r = mk_reader();
         let mut keys_raw = DecryptKeys::Aacs {
             unit_keys: vec![(0, unit_key)],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let map_raw = resolve_inline_base_map(

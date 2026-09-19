@@ -1226,7 +1226,6 @@ mod tests {
             key_source: crate::disc::KeyOrigin::ExternalUk,
             vuk: None,
             unit_keys: vec![(0u32, [0u8; 16])],
-            read_data_key: None,
             volume_id: [0u8; 16],
             uk_ro: Vec::new(),
             mkb: Vec::new(),

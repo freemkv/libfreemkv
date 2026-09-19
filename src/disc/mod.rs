@@ -1435,8 +1435,6 @@ pub struct AacsState {
     pub vuk: Option<[u8; 16]>,
     /// Decrypted unit keys (CPS unit number, key)
     pub unit_keys: Vec<(u32, [u8; 16])>,
-    /// Read data key for AACS 2.0 bus decryption -- None for AACS 1.0
-    pub read_data_key: Option<[u8; 16]>,
     /// Volume ID (16 bytes) -- from SCSI handshake
     pub volume_id: [u8; 16],
     /// Raw `Unit_Key_RO.inf` bytes (encrypted unit keys + CPS map). Stashed at
@@ -1461,7 +1459,6 @@ impl std::fmt::Debug for AacsState {
             .field("key_source", &self.key_source)
             .field("vuk", &self.vuk.map(|_| "<redacted>"))
             .field("unit_keys_len", &self.unit_keys.len())
-            .field("read_data_key", &self.read_data_key.map(|_| "<redacted>"))
             .field("volume_id", &"<redacted>")
             .field("uk_ro_len", &self.uk_ro.len())
             .field("mkb_len", &self.mkb.len())
@@ -1736,6 +1733,10 @@ impl Disc {
             buffered.prefetch_ranges(&ranges);
         }
 
+        // The AACS bus stage is decided ONCE from the handshake result, captured
+        // before `handshake` is moved into `scan_with` (see `BusStage`).
+        let bus_key = handshake.as_ref().and_then(|h| h.read_data_key);
+
         tracing::info!(target: "freemkv::scan", "phase: parsing titles/streams");
         let disc = Self::scan_with(
             &mut buffered,
@@ -1746,6 +1747,17 @@ impl Disc {
             udf_fs,
         )?;
         tracing::info!(target: "freemkv::scan", titles = disc.titles.len(), format = ?disc.content_format, "phase: titles parsed");
+
+        // Wire the SINGLE de-bus point onto the drive from the handshake result,
+        // BEFORE the caller samples keys or muxes — gated to encrypted-content
+        // extents (the earlier UDF/metadata reads ran under default Passthrough).
+        session.set_bus_stage(crate::sector::bus_removal::BusStage::from_read_data_key(
+            bus_key,
+        ));
+        let content_ranges = disc.encrypted_content_ranges();
+        if !content_ranges.is_empty() {
+            session.set_bus_content_ranges(std::sync::Arc::from(content_ranges.into_boxed_slice()));
+        }
 
         // No CSS key recovery at scan time: DVD CSS keys are per-title and are
         // re-cracked keylessly at read/decrypt time (`disc.css` stays unset),
@@ -2499,13 +2511,10 @@ impl std::fmt::Debug for Key {
 // CPS units. See docs/disc-mod.md for why "first sample decrypts" is unsafe.
 fn aligned_unit_keys_validate(
     unit_keys: &[(u32, [u8; 16])],
-    read_data_key: Option<&[u8; 16]>,
     samples: &[Vec<u8>],
     format: ContentFormat,
 ) -> bool {
-    use crate::aacs::content::{
-        ALIGNED_UNIT_LEN, aacs_unit_needs_decrypt, decrypt_bus, decrypt_unit, is_clean,
-    };
+    use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_needs_decrypt, decrypt_unit, is_clean};
     let scrambled: Vec<&[u8]> = samples
         .iter()
         .map(|s| s.as_slice())
@@ -2531,11 +2540,9 @@ fn aligned_unit_keys_validate(
             hb.tick_cpu(tried, total);
             tried += 1;
             probe.copy_from_slice(&sample[..ALIGNED_UNIT_LEN]);
-            // bus layer (AACS 2.0) first, then the CPS unit key, then the structural
-            // proof — the composed form of the old `decrypt_unit_full`.
-            if let Some(rdk) = read_data_key {
-                decrypt_bus(&mut probe, rdk);
-            }
+            // Samples arrive ALREADY de-bussed (the drive's single de-bus point
+            // removed AACS 2.0 bus encryption at read time), so validation only
+            // applies the CPS unit key, then the structural proof.
             decrypt_unit(&mut probe, k);
             if is_clean(&probe, format) {
                 covered = true;
@@ -2577,7 +2584,6 @@ impl Disc {
             }
             crate::decrypt::DecryptKeys::Aacs {
                 unit_keys: aacs.unit_keys.clone(),
-                read_data_key: aacs.read_data_key,
                 format: self.content_format,
             }
         } else if let Some(ref css) = self.css {
@@ -2879,7 +2885,6 @@ impl Disc {
                 key_source: KeyOrigin::ExternalUk,
                 vuk: None,
                 unit_keys: keys,
-                read_data_key: None,
                 volume_id: [0u8; 16],
                 uk_ro: Vec::new(),
                 mkb: Vec::new(),
@@ -2927,14 +2932,9 @@ impl Disc {
     /// rejected key (`Err(AacsKeyRejected)`) falls through to the caller's
     /// next candidate. Pass `&[]` to skip validation (resume / mapfile cache).
     pub fn decrypt_with(&mut self, key: Key, samples: &[Vec<u8>]) -> Result<()> {
-        // The AACS 2.x bus key, needed to de-scramble a sample for validation;
-        // captured before any mutable borrow. None for AACS 1.0 and file-backed
-        // ISO units (bus encryption was already removed at read time).
-        let read_data_key = self.aacs.as_ref().and_then(|a| a.read_data_key);
-
-        // Resolve the supplied key DOWN to candidate unit keys WITHOUT
-        // committing them, so a wrong higher-level key can be rejected before it
-        // poisons disc state.
+        // Samples arrive already de-bussed (drive's single bus-removal point), so
+        // validation needs no bus key. Resolve the key DOWN to candidate unit keys
+        // WITHOUT committing — a wrong higher key is rejected before it poisons state.
         let (candidate_unit_keys, candidate_vuk) = if let Key::Unit(keys) = key {
             // Terminal — the source / mapfile already holds the final UKs.
             (keys, None)
@@ -3003,12 +3003,7 @@ impl Disc {
         // VALIDATE against real ciphertext. Conservative: reject only when a
         // supplied sample is AACS-scrambled and NO candidate key can de-scramble
         // it; with no samples the key is accepted as-is (sample-less paths unchanged).
-        if !aligned_unit_keys_validate(
-            &candidate_unit_keys,
-            read_data_key.as_ref(),
-            samples,
-            self.content_format,
-        ) {
+        if !aligned_unit_keys_validate(&candidate_unit_keys, samples, self.content_format) {
             return Err(crate::error::Error::AacsKeyRejected);
         }
 
@@ -3796,7 +3791,6 @@ mod tests {
             key_source: KeyOrigin::ExternalUk,
             vuk: Some([0xD5; 16]),
             unit_keys: vec![(1, [0xD5; 16])],
-            read_data_key: Some([0xD5; 16]),
             volume_id: [0xD5; 16],
             uk_ro: vec![1, 2, 3],
             mkb: vec![4, 5, 6],
@@ -5167,13 +5161,8 @@ mod tests {
         disc.inject_unit_keys(uk.clone());
 
         match disc.decrypt_keys() {
-            crate::decrypt::DecryptKeys::Aacs {
-                unit_keys,
-                read_data_key,
-                ..
-            } => {
+            crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
                 assert_eq!(unit_keys, uk, "injected UK must be the decrypt key");
-                assert_eq!(read_data_key, None, "ISO mux needs no bus key");
             }
             _ => panic!("expected Aacs decrypt keys after injecting a UK"),
         }
@@ -5216,7 +5205,6 @@ mod tests {
             key_source: KeyOrigin::DeviceKey,
             vuk: None,
             unit_keys,
-            read_data_key: None,
             volume_id: [0u8; 16],
             uk_ro: Vec::new(),
             mkb: Vec::new(),
@@ -5847,7 +5835,6 @@ mod tests {
         // like resume / mapfile must be unaffected).
         assert!(super::aligned_unit_keys_validate(
             &[(0, [0x11u8; 16])],
-            None,
             &[],
             ContentFormat::BdTs
         ));
@@ -5866,7 +5853,6 @@ mod tests {
         ));
         assert!(super::aligned_unit_keys_validate(
             &[(0, [0x11u8; 16])],
-            None,
             &[clear.clone()],
             ContentFormat::BdTs
         ));
@@ -5882,21 +5868,18 @@ mod tests {
         // Right key -> de-scrambles -> accept (NO false reject of a good key).
         assert!(super::aligned_unit_keys_validate(
             &[(7, uk)],
-            None,
             std::slice::from_ref(&enc),
             ContentFormat::BdTs
         ));
         // Wrong key -> cannot de-scramble a scrambled sample -> reject.
         assert!(!super::aligned_unit_keys_validate(
             &[(7, [0x00u8; 16])],
-            None,
             std::slice::from_ref(&enc),
             ContentFormat::BdTs
         ));
         // Empty key set against a scrambled sample -> reject.
         assert!(!super::aligned_unit_keys_validate(
             &[],
-            None,
             &[enc],
             ContentFormat::BdTs
         ));
@@ -5935,7 +5918,6 @@ mod tests {
         // reject. This is the bug fix: previously this returned true.
         assert!(!super::aligned_unit_keys_validate(
             &[(0, uk0)],
-            None,
             &samples,
             ContentFormat::BdTs
         ));
@@ -5943,7 +5925,6 @@ mod tests {
         // Complete key set (both CPS units) -> accept.
         assert!(super::aligned_unit_keys_validate(
             &[(0, uk0), (1, uk1)],
-            None,
             &samples,
             ContentFormat::BdTs
         ));
@@ -5951,7 +5932,6 @@ mod tests {
         // Order-independent: covering key present anywhere in the set is fine.
         assert!(super::aligned_unit_keys_validate(
             &[(1, uk1), (0, uk0)],
-            None,
             &samples,
             ContentFormat::BdTs
         ));

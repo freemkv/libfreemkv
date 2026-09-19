@@ -1308,7 +1308,6 @@ mod tests {
         }];
         let mut keys = crate::decrypt::DecryptKeys::Aacs {
             unit_keys: vec![(0, [0u8; 16])],
-            read_data_key: None,
             format: crate::disc::ContentFormat::MpegPs,
         };
         resolve_dvd_title_key(

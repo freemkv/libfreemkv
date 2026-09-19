@@ -280,6 +280,41 @@ pub fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
     }
 }
 
+/// Remove bus encryption across a sector-aligned `buf`, gated to the disc's
+/// encrypted-content ranges. `base_lba` is the LBA of `buf`'s first 2048-byte
+/// sector (sector `i` = `base_lba + i`). A sector is de-bussed only when `ranges`
+/// is `None` (content-only caller) or its LBA falls inside a sorted
+/// `(start_lba, sector_count)` range — a clear UDF/nav sector outside content is
+/// left untouched (de-bussing it would corrupt plaintext). Key schedule expanded
+/// once. Single de-bus entry point (see the `sector::bus_removal` module doc).
+pub(crate) fn decrypt_bus_in_content(
+    buf: &mut [u8],
+    read_data_key: &[u8; 16],
+    base_lba: u32,
+    ranges: Option<&[(u32, u32)]>,
+) {
+    let in_content = |lba: u32| -> bool {
+        match ranges {
+            None => true,
+            Some(rs) => rs
+                .iter()
+                .any(|&(start, cnt)| lba >= start && (lba as u64) < start as u64 + cnt as u64),
+        }
+    };
+    let cipher = crate::aacs::crypto::new_cipher_for(read_data_key);
+    for (i, sector) in buf.chunks_mut(SECTOR_BYTES).enumerate() {
+        if sector.len() < SECTOR_BYTES {
+            break; // trailing partial sector (never on a whole-sector read)
+        }
+        let lba = base_lba.saturating_add(i as u32);
+        if !in_content(lba) {
+            continue;
+        }
+        // First 16 bytes of each sector are plaintext on the wire.
+        crate::aacs::crypto::cbc_decrypt_blocks(&cipher, &mut sector[16..SECTOR_BYTES]);
+    }
+}
+
 /// Test-only exact inverse of [`decrypt_bus`]: apply AACS 2.0 bus ENCRYPTION to
 /// an aligned unit in place — per-sector AES-CBC-encrypt bytes 16..2048 of each
 /// 2048-byte sector under `read_data_key`, leaving the first 16 bytes of every

@@ -1383,7 +1383,6 @@ mod tests {
         // engages. Key contents are irrelevant to the read plan.
         let aacs = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0u8; 16]), (1, [1u8; 16])],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         // 100 units (300 sectors). A 10-unit Even forensic segment at LBA [30,60):
@@ -1859,7 +1858,6 @@ mod tests {
         let title = synthetic_title(COUNT);
         let keys = crate::decrypt::DecryptKeys::Aacs {
             unit_keys: vec![(0, [0u8; 16])],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let mut stream = DiscStream::new(
@@ -2385,7 +2383,6 @@ mod tests {
                 synthetic_title(8),
                 crate::decrypt::DecryptKeys::Aacs {
                     unit_keys: vec![(0, [0x11u8; 16])],
-                    read_data_key: None,
                     format: ContentFormat::BdTs,
                 },
                 3,

@@ -116,14 +116,15 @@ pub fn decrypt_threads() -> usize {
 pub enum DecryptKeys {
     /// No encryption on this disc.
     None,
-    /// AACS (Blu-ray / UHD / HD-DVD). Unit keys + optional read data key. The
-    /// `format` is the disc's content container (BD/UHD/FMTS = Transport Stream,
-    /// HD-DVD `.evo` = Program Stream); it travels with the keys because both are
-    /// resolved once per disc, and the key SELECTOR (`is_clean`) needs it to prove
-    /// a key structurally against the right container.
+    /// AACS (Blu-ray / UHD / HD-DVD). Unit keys only — bus encryption is ALREADY
+    /// removed upstream by the drive's single de-bus point
+    /// ([`crate::sector::bus_removal::BusStage`]), so no read data key is threaded
+    /// here. The `format` is the disc's content container (BD/UHD/FMTS = Transport
+    /// Stream, HD-DVD `.evo` = Program Stream); it travels with the keys because
+    /// both are resolved once per disc, and the key SELECTOR (`is_clean`) needs it
+    /// to prove a key structurally against the right container.
     Aacs {
         unit_keys: Vec<(u32, [u8; 16])>,
-        read_data_key: Option<[u8; 16]>,
         format: crate::disc::ContentFormat,
     },
     /// CSS (DVD). Title key for sector descrambling.
@@ -381,12 +382,8 @@ fn apply_aacs_map(
     map: &AacsKeyMap,
     content: Option<&[(u32, u32)]>,
 ) -> Result<(), crate::error::Error> {
-    let (unit_keys, rdk, format) = match keys {
-        DecryptKeys::Aacs {
-            unit_keys,
-            read_data_key,
-            format,
-        } => (unit_keys, *read_data_key, *format),
+    let (unit_keys, format) = match keys {
+        DecryptKeys::Aacs { unit_keys, format } => (unit_keys, *format),
         // Clear / CSS: the mapped path is AACS-only. Leave the buffer untouched;
         // CSS descrambles via `decrypt_sectors` and `None` is already clear.
         _ => return Ok(()),
@@ -451,11 +448,10 @@ fn apply_aacs_map(
         if !aacs::content::aacs_unit_encrypted(chunk, format) {
             return;
         }
-        // Bounds already proven above; index directly.
+        // Bounds already proven above; index directly. Bus encryption was already
+        // removed by the drive's single de-bus point before this buffer arrived —
+        // this path only applies the CPS unit key.
         let key = &unit_keys[key_idx].1;
-        if let Some(ref rdk_key) = rdk {
-            aacs::content::decrypt_bus(chunk, rdk_key);
-        }
         aacs::content::decrypt_unit(chunk, key);
         // Correct-phase forensic verify (silent unless the map is wrong).
         if matches!(phase, Phase::Even | Phase::Odd) && !aacs::content::is_clean(chunk, format) {
@@ -711,7 +707,6 @@ mod tests {
     fn content_gate_aacs_keys_fail_loud_not_ok_zero() {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(1, [0xAB; 16])],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let original = scrambled_region(aacs::content::ALIGNED_UNIT_LEN);
@@ -801,7 +796,6 @@ mod tests {
     fn aacs_scrambled_trailing_partial_is_rejected() {
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         // One CLEAR leading unit (passes through) + a 4096-byte (two-sector) tail
@@ -828,7 +822,6 @@ mod tests {
     fn aacs_clear_trailing_partial_passes_through() {
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
@@ -866,7 +859,6 @@ mod tests {
         assert!(
             DecryptKeys::Aacs {
                 unit_keys: vec![(0, [0; 16])],
-                read_data_key: None,
                 format: crate::disc::ContentFormat::BdTs,
             }
             .is_encrypted()
@@ -1042,7 +1034,6 @@ mod tests {
     fn aacs_mapped_out_of_range_key_idx_errors() {
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
@@ -1062,7 +1053,6 @@ mod tests {
     fn aacs_mapped_empty_unit_keys_errors() {
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
@@ -1079,7 +1069,6 @@ mod tests {
     fn aacs_via_unmapped_decrypt_sectors_fails_loud() {
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
@@ -1114,63 +1103,108 @@ mod tests {
         unit
     }
 
-    // AACS 2.0 / UHD "OEM route": a drive delivers bus_encrypt(encrypt_unit(clear))
-    // and the mapped decrypt must strip the bus layer with the read_data_key FIRST,
-    // then the unit-key layer — the `if let Some(rdk)` arm no other test reaches.
+    // A `SectorSource` that returns a fixed wire buffer for any read (the bytes a
+    // bus-encrypted drive would put on the transport), reporting the full span —
+    // the input to the drive-owned bus-removal stream in the ordering tests below.
+    struct WireSource {
+        bytes: Vec<u8>,
+    }
+    impl crate::sector::SectorSource for WireSource {
+        fn capacity_sectors(&self) -> u32 {
+            (self.bytes.len() / 2048) as u32
+        }
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let n = (count as usize * 2048).min(self.bytes.len());
+            buf[..n].copy_from_slice(&self.bytes[..n]);
+            Ok(n)
+        }
+    }
+
+    // AACS 2.0 bus-then-unit ordering, proven at the SINGLE de-bus point: the
+    // drive-owned bus-removal stream strips the bus layer AT READ TIME, then the
+    // downstream mapped decrypt strips the unit-key layer (no bus key threaded).
     #[test]
-    fn mapped_decrypt_removes_bus_then_unit_encryption_end_to_end() {
+    fn bus_removal_then_mapped_unit_decrypt_recovers_plaintext_end_to_end() {
+        use crate::sector::SectorSource;
+        use crate::sector::bus_removal::{BusRemovalSectorSource, BusStage};
+
         let unit_key = [0x5Au8; 16];
         let rdk = [0x91u8; 16];
         let mut clear = clear_ts_unit();
         clear[0] |= 0xC0; // the encrypted flag lives in the clear seed
-        let mut buf = clear.clone();
-        // Inner layer: unit-key encryption. Outer layer: drive bus-encryption.
-        aacs_encrypt_unit_for_test(&mut buf, &unit_key);
-        aacs::content::encrypt_bus(&mut buf, &rdk);
+        // Inner layer: unit-key encryption. Outer layer: drive bus-encryption —
+        // exactly the bytes a bus-encrypted drive puts on the wire.
+        let mut wire = clear.clone();
+        aacs_encrypt_unit_for_test(&mut wire, &unit_key);
+        aacs::content::encrypt_bus(&mut wire, &rdk);
+
+        // Read the wire through the drive-owned bus-removal stream (host-key
+        // stage): the ONE place bus decryption is applied.
+        let mut src =
+            BusRemovalSectorSource::new(WireSource { bytes: wire }, BusStage::AacsHostKey(rdk));
+        let mut buf = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
+        let n = src.read_sectors(0, 3, &mut buf, false).unwrap();
+        assert_eq!(n, aacs::content::ALIGNED_UNIT_LEN);
+        // Bus removed, but the CPS unit-key layer is still in place — not yet clear.
         assert!(
             !aacs::content::is_clean(&buf, crate::disc::ContentFormat::BdTs),
-            "the delivered unit must still be scrambled before decrypt"
+            "bus removed at read, but the CPS unit-key layer must still be scrambled"
         );
 
+        // The downstream mapped decrypt applies ONLY the unit key over the
+        // already-de-bussed content.
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, unit_key)],
-            read_data_key: Some(rdk),
             format: crate::disc::ContentFormat::BdTs,
         };
         let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
         decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
-            .expect("bus + unit-key decrypt must succeed");
+            .expect("unit-key decrypt over de-bussed content must succeed");
         assert_eq!(
             buf, clear,
-            "read_data_key (bus) then unit-key must recover the plaintext exactly"
+            "bus removal (at read) then unit-key decrypt must recover the plaintext exactly"
         );
     }
 
-    // Necessity + ordering proof: the SAME delivered bytes with NO read_data_key
-    // run only the unit-key decrypt over still-bus-encrypted data and must NOT
-    // recover clear — so the rdk arm genuinely runs, and runs BEFORE the unit key.
+    // Necessity: the SAME wire bytes read through a PASSTHROUGH stage keep the bus
+    // layer, so unit-key decrypt alone runs over bus-encrypted data and cannot
+    // recover clear — the bus key is genuinely required, and de-bus precedes it.
     #[test]
-    fn mapped_decrypt_without_read_data_key_cannot_clear_bus_encrypted_content() {
+    fn without_bus_removal_mapped_unit_decrypt_cannot_clear_bus_encrypted_content() {
+        use crate::sector::SectorSource;
+        use crate::sector::bus_removal::{BusRemovalSectorSource, BusStage};
+
         let unit_key = [0x5Au8; 16];
         let rdk = [0x91u8; 16];
         let mut clear = clear_ts_unit();
         clear[0] |= 0xC0;
-        let mut buf = clear.clone();
-        aacs_encrypt_unit_for_test(&mut buf, &unit_key);
-        aacs::content::encrypt_bus(&mut buf, &rdk);
+        let mut wire = clear.clone();
+        aacs_encrypt_unit_for_test(&mut wire, &unit_key);
+        aacs::content::encrypt_bus(&mut wire, &rdk);
 
-        let keys_no_rdk = DecryptKeys::Aacs {
+        // Passthrough: no bus key, so the wire is delivered still-bus-encrypted.
+        let mut src =
+            BusRemovalSectorSource::new(WireSource { bytes: wire }, BusStage::Passthrough);
+        let mut buf = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
+        src.read_sectors(0, 3, &mut buf, false).unwrap();
+
+        let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, unit_key)],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
         // Phase::All never runs the forensic verify, so this returns Ok either
-        // way; the point is the BYTES are not the plaintext without the bus key.
-        let _ = decrypt_sectors_mapped(&mut buf, &keys_no_rdk, 0, &map);
+        // way; the point is the BYTES are not the plaintext without bus removal.
+        let _ = decrypt_sectors_mapped(&mut buf, &keys, 0, &map);
         assert_ne!(
             buf, clear,
-            "without the read_data_key, unit-key decrypt alone cannot recover clear"
+            "without bus removal first, unit-key decrypt alone cannot recover clear"
         );
     }
 
@@ -1390,7 +1424,6 @@ mod tests {
         // AACS, encrypted, no map installed at all.
         let mut aacs_keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAAu8; 16])],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let mut buf = vec![0u8; ul];
@@ -1440,7 +1473,6 @@ mod tests {
 
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         // The map covers unit 0 only. Unit 1 is the orphan.
@@ -1500,7 +1532,6 @@ mod tests {
         }
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key_a)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let map = AacsKeyMap::from_ranges_phased(vec![(0, 8 * usz, 0, Phase::Even)]);
@@ -1535,7 +1566,6 @@ mod tests {
 
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, unit_key)],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
@@ -1579,7 +1609,6 @@ mod tests {
         }
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let map = AacsKeyMap::from_ranges(vec![(0, (n as u32) * usz, 0)]);
@@ -1623,7 +1652,6 @@ mod tests {
         let mut buf = build();
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key_a), (1, key_b)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
@@ -1634,7 +1662,6 @@ mod tests {
         let mut buf = build();
         let swapped = DecryptKeys::Aacs {
             unit_keys: vec![(1, key_b), (0, key_a)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         assert!(
@@ -1657,7 +1684,6 @@ mod tests {
         buf[..ul].copy_from_slice(&u0);
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xCCu8; 16])], // map slot points at the WRONG key
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let map = AacsKeyMap::from_ranges_phased(vec![(0, 2 * usz, 0, Phase::Even)]);
@@ -1682,7 +1708,6 @@ mod tests {
         }
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         decrypt_sectors_mapped(

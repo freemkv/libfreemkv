@@ -88,7 +88,6 @@ fn decrypt_keys_is_encrypted_variants() {
 
     let aacs = DecryptKeys::Aacs {
         unit_keys: vec![],
-        read_data_key: None,
         format: libfreemkv::disc::ContentFormat::BdTs,
     };
     assert!(aacs.is_encrypted());

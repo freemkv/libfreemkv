@@ -692,7 +692,6 @@ mod tests {
                 key_source: crate::disc::KeyOrigin::KeyDb,
                 vuk: None,
                 unit_keys: Vec::new(),
-                read_data_key: None,
                 volume_id: [0u8; 16],
                 uk_ro: Vec::new(),
                 mkb: Vec::new(),

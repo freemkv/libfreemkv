@@ -8,6 +8,7 @@
 //!   `SectorSource` and applies AACS / CSS in-place decrypt to
 //!   yield plaintext sectors.
 
+pub mod bus_removal;
 pub mod decrypting;
 pub mod prefetched;
 

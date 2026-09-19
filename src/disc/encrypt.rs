@@ -372,7 +372,6 @@ impl Disc {
             key_source: KeyOrigin::ExternalUk,
             vuk: None,
             unit_keys: vec![],
-            read_data_key: handshake.and_then(|h| h.read_data_key),
             volume_id: handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]),
             uk_ro: uk_ro_data,
             mkb: mkb_bytes,
@@ -772,7 +771,8 @@ mod tests {
         };
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).expect("state");
         assert_eq!(st.volume_id, vid);
-        assert_eq!(st.read_data_key, Some(rdk));
+        // The bus key no longer propagates onto AacsState — it feeds the drive's
+        // single de-bus point via the handshake, not a decrypt-time field.
     }
 
     // OEM bus-key gate: a bus-encrypted disc on a LIVE drive with no
@@ -831,7 +831,6 @@ mod tests {
         };
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).expect("bus key present → ok");
         assert!(st.bus_encryption);
-        assert_eq!(st.read_data_key, Some([0x22u8; 16]));
     }
 
     /// Finding: `is_drive_unlocker(matched)` on the cert route was provably always
@@ -864,10 +863,6 @@ mod tests {
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs))
             .expect("a drive-unlocked disc removes bus encryption even without a read_data_key");
         assert!(st.bus_encryption);
-        assert_eq!(
-            st.read_data_key, None,
-            "the drive-unlock path carries no read_data_key"
-        );
     }
 
     /// ISO scan (handshake None) of a bus_encryption disc → Ok. Bus encryption
@@ -878,7 +873,6 @@ mod tests {
         let (mut disc, udf) = disc_with_cert(0x01, true);
         let st = Disc::resolve_vid_only(&udf, &mut disc, None).expect("ISO bus disc → ok");
         assert!(st.bus_encryption);
-        assert_eq!(st.read_data_key, None);
     }
 
     /// AACS 1.0 BD (V10 cert, bus_encryption off) on a live drive with NO
@@ -895,7 +889,6 @@ mod tests {
         };
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).expect("AACS 1.0 → ok");
         assert!(!st.bus_encryption);
-        assert_eq!(st.read_data_key, None);
     }
 
     /// With NO handshake, volume_id defaults to all-zero (encrypt.rs
@@ -914,7 +907,6 @@ mod tests {
         );
         let st = Disc::resolve_vid_only(&udf, &mut disc, None).expect("state");
         assert_eq!(st.volume_id, [0u8; 16]);
-        assert_eq!(st.read_data_key, None);
     }
 
     /// `handshake_has_volume_id` treats an all-zero Volume ID as absent and
@@ -1291,11 +1283,10 @@ mod tests {
         ));
     }
 
-    /// A handshake that carries a VID but `read_data_key: None` must SURFACE the
-    /// `None` onto the state — not silently drop it or synthesize a key. On a
-    /// non-bus-encrypted disc (so the bus-key gate does not fire) the VID still
-    /// propagates while `read_data_key` stays `None`. This is the AACS-2.0
-    /// "VID present, no RDK" signal the downstream gate keys off.
+    /// A handshake that carries a VID but `read_data_key: None` must still surface
+    /// the VID onto the state. On a non-bus-encrypted disc (so the bus-key gate
+    /// does not fire) the VID propagates; the bus key itself no longer lives on
+    /// AacsState — it feeds the drive's single de-bus point via the handshake.
     #[test]
     fn resolve_vid_only_surfaces_vid_with_absent_read_data_key() {
         let (mut disc, udf) = disc_with_cert(0x00, false); // V10, bus off
@@ -1310,10 +1301,6 @@ mod tests {
         assert_eq!(
             st.volume_id, vid,
             "the VID must propagate even without an RDK"
-        );
-        assert_eq!(
-            st.read_data_key, None,
-            "a handshake bus_key of None must surface as None, not be dropped or faked"
         );
     }
 }

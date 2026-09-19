@@ -2359,7 +2359,6 @@ mod tests {
         // (pool_len == 1 would short-circuit to content_map before any read).
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0x11u8; 16]), (1, [0x22u8; 16])],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let mut reader = HaltCountSource {
@@ -2397,7 +2396,6 @@ mod tests {
         }];
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0x11u8; 16]), (1, [0x22u8; 16])],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let mut reader = HaltCountSource {
@@ -3170,7 +3168,6 @@ mod tests {
         };
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key_a), (1, key_b), (2, key_c)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let title = multi_cps_title(start, sectors);
@@ -3205,7 +3202,6 @@ mod tests {
         };
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key_a), (1, key_b)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let title = multi_cps_title(start, sectors);
@@ -3237,7 +3233,6 @@ mod tests {
         };
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key_a), (1, key_b)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let title = multi_cps_title(start, sectors);
@@ -3337,7 +3332,6 @@ mod tests {
         ]);
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key_a), (1, key_b), (2, key_c)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let mut cache = super::DiscKeyCache::new();
@@ -3430,7 +3424,6 @@ mod tests {
         ];
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key_a), (1, key_b), (2, key_c)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
 
@@ -3499,7 +3492,6 @@ mod tests {
         ]);
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key_a), (1, key_b), (2, key_c)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let mut cache = super::DiscKeyCache::new();
@@ -3575,7 +3567,6 @@ mod tests {
         // to index 0 without sampling); neither opens the extent → fail loud.
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key_a), (1, [0x02u8; 16])],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         super::resolve_mux_key_map_cached(
@@ -3643,7 +3634,6 @@ mod tests {
         let title = multi_cps_title(1000, 30);
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0x01u8; 16])],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let got = super::resolve_fmts_key_map(
@@ -3680,7 +3670,6 @@ mod tests {
         let title = multi_cps_title(1000, 30);
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0x01u8; 16])],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let got = super::resolve_fmts_key_map(
@@ -4016,7 +4005,6 @@ mod tests {
     fn fmts_keys() -> DecryptKeys {
         DecryptKeys::Aacs {
             unit_keys: vec![(0, FMTS_BASE_KEY)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         }
     }
@@ -4042,7 +4030,6 @@ mod tests {
     fn fmts_two_cps_keys() -> DecryptKeys {
         DecryptKeys::Aacs {
             unit_keys: vec![(1, FMTS_BASE_KEY), (2, FMTS_CPS2_KEY)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         }
     }
@@ -4407,7 +4394,6 @@ mod tests {
         ]);
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key_a), (1, key_b)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let mut cache = super::DiscKeyCache::new();
@@ -5012,7 +4998,6 @@ mod tests {
         )]);
         let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key_a), (1, key_b), (2, key_c)],
-            read_data_key: None,
             format: ContentFormat::BdTs,
         };
         let mut cache = super::DiscKeyCache::new();

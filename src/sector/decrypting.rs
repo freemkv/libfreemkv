@@ -566,7 +566,6 @@ mod tests {
             src,
             DecryptKeys::Aacs {
                 unit_keys: Vec::new(),
-                read_data_key: None,
                 format: crate::disc::ContentFormat::BdTs,
             },
         );
@@ -757,7 +756,6 @@ mod tests {
         let src = FixedUnit { unit };
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
@@ -789,7 +787,6 @@ mod tests {
         let src = FixedUnit { unit };
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let mut dec = DecryptingSectorSource::new(src, keys); // no with_key_map
@@ -811,7 +808,6 @@ mod tests {
         let src = FixedUnit { unit };
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
@@ -841,7 +837,6 @@ mod tests {
         let src = PatternedSource { capacity: 16 };
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0u8; 16])],
-            read_data_key: None,
             format: crate::disc::ContentFormat::BdTs,
         };
         let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(300, 303, 0)]));
