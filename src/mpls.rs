@@ -8,11 +8,11 @@
 //!
 //! ## Multi-angle PlayItem STN offset (issue #45)
 //! The STN (stream-number) table sits at PlayItem offset 32 for a single-angle
-//! item, but a MULTI-ANGLE item (is_multi_angle = bit 4 of item[10]) inserts an
+//! item, but a MULTI-ANGLE item (is_multi_angle = bit 4 of `item[10]`) inserts an
 //! angle block right after still_time at offset 32:
 //!   number_of_angles(1) + flags(1) + (number_of_angles − 1) angle references,
 //!   each clip_name(5) + clip_codec_id(4) + ref_to_STC_id(1) = 10 bytes
-//! (the first angle is the primary clip already at item[0..5]). So the real STN
+//! (the first angle is the primary clip already at `item[0..5]`). So the real STN
 //! begins at `32 + 2 + (number_of_angles − 1) * 10`. A fixed offset of 32 lands
 //! INSIDE that block and misreads the stream counts as garbage (e.g. n_video =
 //! 51 on Spider-Man 3 UHD 00245/00246.mpls, number_of_angles = 2 ⇒ real offset
