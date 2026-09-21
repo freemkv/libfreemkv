@@ -514,6 +514,30 @@ const SEAMLESS_BUMPER_SIZE_FRAC: f64 = 0.90;
 /// Authoring hint: honoured only when the title runs at least this fraction of the
 /// longest probable-video title's duration.
 const AUTHORING_MIN_DURATION_FRAC: f64 = 0.5;
+/// Seamless-branch guard (issue #45): the minimum number of chapter marks a title
+/// must carry to look like a COMPLETE feature presentation (a real feature has a
+/// full chapter table; a bare body/branch subset carries one mark or none).
+const MIN_FEATURE_CHAPTERS: usize = 2;
+/// Seamless-branch guard (issue #45): a complete feature's chapter marks span at
+/// least this fraction of its own runtime (start-to-last), distinguishing a real
+/// chapter table from a couple of clustered marks.
+const CHAPTER_SPAN_MIN_FRAC: f64 = 0.5;
+
+/// Issue #45: does `q` look like a COMPLETE feature presentation — a real chapter
+/// table (≥ [`MIN_FEATURE_CHAPTERS`] marks) spanning ≥ [`CHAPTER_SPAN_MIN_FRAC`]
+/// of its runtime? A bare body subset (Alita's 00703 = one mark) fails; a genuine
+/// feature (Alita's 00800 = 37 marks) passes. Gates the composite bumper limb so a
+/// chaptered feature is not demoted below its own un-chaptered body subset. This is
+/// the ABSOLUTE-threshold form; to switch to the RELATIVE form (only if a hoard
+/// sweep finds an SM3-style decoy whose chaptered member is the SUPERSET) replace
+/// the call site with `p.chapters.len() <= q.chapters.len()`. See docs/disc-mod.md.
+fn is_complete_feature_presentation(q: &DiscTitle) -> bool {
+    q.chapters.len() >= MIN_FEATURE_CHAPTERS
+        && q.duration_secs > 0.0
+        && (q.chapters.last().map(|c| c.time_secs).unwrap_or(0.0)
+            - q.chapters.first().map(|c| c.time_secs).unwrap_or(0.0))
+            >= CHAPTER_SPAN_MIN_FRAC * q.duration_secs
+}
 
 /// Union a set of extents into sorted, merged, disjoint `(start_lba,
 /// sector_count)` ranges — the pure, testable core of
@@ -2227,6 +2251,10 @@ impl Disc {
             // (a full-audio main vs a stereo-only twin) — prefer lossless-multichannel.
             .then_with(|| b.duration_secs.total_cmp(&a.duration_secs))
             .then_with(|| Self::audio_richness(b).cmp(&Self::audio_richness(a)))
+            // Final determinism (issue #45): among equal-size seamless siblings
+            // (Alita 00800-00808, same body + different logo) pick the LOWEST
+            // playlist_id. Inert where an earlier key separates the pair.
+            .then_with(|| a.playlist_id.cmp(&b.playlist_id))
     }
 
     /// The keys [`Self::main_feature_order`] layers ON TOP of
@@ -2306,13 +2334,14 @@ impl Disc {
                                 && qj.len() < pi.len()
                                 && q.has_probable_video()
                                 && q.size_bytes as f64 >= WRAPPER_MIN_SIZE_FRAC * p.size_bytes as f64
-                                // Seamless-branch guard (issue #45): wrapper only
-                                // if Q is a much SHORTER cut (concat) or nearly P's
-                                // SIZE-equal (bumper). See docs/disc-mod.md.
+                                // Seamless-branch guard (issue #45): wrapper only if Q is
+                                // a much SHORTER cut (concat) OR nearly P's SIZE AND a
+                                // complete feature (bumper) — see is_complete_feature_presentation.
                                 && (q.duration_secs
                                     < SEAMLESS_SHORTER_CUT_DURATION_FRAC * p.duration_secs
-                                    || q.size_bytes as f64
-                                        >= SEAMLESS_BUMPER_SIZE_FRAC * p.size_bytes as f64)
+                                    || (q.size_bytes as f64
+                                        >= SEAMLESS_BUMPER_SIZE_FRAC * p.size_bytes as f64
+                                        && is_complete_feature_presentation(q)))
                                 && qj.is_subset(pi)
                         }
                     });
@@ -4516,6 +4545,34 @@ mod tests {
         }
     }
 
+    /// A BD title as [`bd_title`], plus a chapter table of `n_chapters` marks
+    /// evenly spanning `dur` (first at 0, last at `dur`) — models a COMPLETE
+    /// feature presentation for the issue #45 seamless-branch guard. `n_chapters`
+    /// must be ≥ 2 for the marks to span any runtime.
+    fn bd_title_chaptered(
+        playlist: &str,
+        id: u16,
+        dur: f64,
+        size: u64,
+        clip_ids: &[&str],
+        n_chapters: usize,
+    ) -> DiscTitle {
+        let chapters = (0..n_chapters)
+            .map(|i| Chapter {
+                time_secs: if n_chapters <= 1 {
+                    0.0
+                } else {
+                    i as f64 * dur / (n_chapters - 1) as f64
+                },
+                name: (i + 1).to_string(),
+            })
+            .collect();
+        DiscTitle {
+            chapters,
+            ..bd_title(playlist, id, dur, size, clip_ids)
+        }
+    }
+
     /// Same, but with an empty STN stream list — models a title whose FIRST
     /// PlayItem is a non-video bumper (`has_video()` is false; `streams` reflect
     /// PlayItem 0 only).
@@ -4532,9 +4589,9 @@ mod tests {
         }
     }
 
-    // Regression for a real UHD decoy hang: 00245.mpls is a WRAPPER
-    // COMPOSITE (bumper+feature+outro) that is LONGEST/LARGEST; must be
-    // demoted STRUCTURALLY, not by stream count. See docs/disc-mod.md.
+    // Regression for a real UHD decoy hang: 00245.mpls is a WRAPPER COMPOSITE
+    // (bumper+feature+outro), LONGEST/LARGEST; demoted STRUCTURALLY by the chapter
+    // table (issue #45) — wrapped feature 00001 is chaptered, the decoy is not.
     #[test]
     fn main_feature_order_demotes_wrapper_composite_decoy() {
         let decoy = bd_title_no_stn_video(
@@ -4544,7 +4601,7 @@ mod tests {
             78_427_502_592,
             &["00339", "00001", "00336"],
         );
-        let feature = bd_title("00001.mpls", 1, 8038.4, 76_525_627_392, &["00001"]);
+        let feature = bd_title_chaptered("00001.mpls", 1, 8038.4, 76_525_627_392, &["00001"], 12);
         let extra = bd_title("00248.mpls", 248, 794.2, 60_000_000_000, &["00248"]);
         let capacity = 88_000_000_000u64;
 
@@ -4583,7 +4640,9 @@ mod tests {
             78_000_000_000,
             &["dead", "00001"],
         );
-        let feature = bd_title("00001.mpls", 1, 8000.0, 76_000_000_000, &["00001"]);
+        // The wrapped feature carries the real chapter table (issue #45), so the
+        // bumper limb correctly detects 00245 as its wrapper composite.
+        let feature = bd_title_chaptered("00001.mpls", 1, 8000.0, 76_000_000_000, &["00001"], 12);
         let small = vec![decoy.clone(), feature.clone()];
         assert!(
             Disc::rank_titles(&small, None, None)[0].composite,
@@ -4614,7 +4673,9 @@ mod tests {
             78_427_502_592,
             &["00001", "00336"],
         );
-        let feature = bd_title("00001.mpls", 1, 8038.4, 76_525_627_392, &["00001"]);
+        // The wrapped feature carries the real chapter table (issue #45); the
+        // video-bearing wrapper carries none, so it stays demoted.
+        let feature = bd_title_chaptered("00001.mpls", 1, 8038.4, 76_525_627_392, &["00001"], 12);
         let capacity = 88_000_000_000u64;
 
         let mut titles = vec![composite, feature];
@@ -4648,29 +4709,32 @@ mod tests {
         );
     }
 
-    /// Issue #45 (SAFETY): a genuine seamless-branch FEATURE (00800, 4 clips,
-    /// 2h03) is a SUPERSET of its single-clip body decoy (00700, 1h50, ≥50 %
-    /// size). The old size-only composite gate mis-demoted 00800 as a "play-all
-    /// wrapper" and ripped the shorter decoy. The duration-shape guard keeps
-    /// 00800: its body subset runs almost as long (1h50 vs 2h03, ~0.89) yet is
-    /// markedly smaller (0.55) — the hallmark of seamless branching, not
-    /// concatenation.
+    /// Issue #45 (SAFETY): the REAL Alita BD-J numbers. Feature 00800 (4 clips,
+    /// 7317 s, 58.61 GB, 37 chapter marks) is a SUPERSET of its single-clip body
+    /// 00703 ([00688], 6951 s, 56.88 GB, 1 mark). The body is 0.97 of the feature's
+    /// size, so the size-only bumper limb fires (0.97 ≥ 0.90) while the body runs
+    /// over 0.85 of the feature so the concat limb does NOT — the OLD gate demoted
+    /// 00800 and ripped the body. The chapter-table guard keeps 00800: its body
+    /// subset carries one mark (< MIN_FEATURE_CHAPTERS), not a complete feature.
     #[test]
     fn seamless_branch_feature_not_demoted_issue_45() {
-        // 00800: real feature = body + intro/credits/seamless branch segments.
-        let feature = bd_title(
+        // 00800: real feature = body + intro/credits/seamless branch segments,
+        // with a full 37-mark chapter table.
+        let feature = bd_title_chaptered(
             "00800.mpls",
             800,
-            7380.0, // 2h03
-            60_000_000_000,
-            &["00800", "00801", "00802", "00803"],
+            7317.0,
+            58_610_000_000,
+            &["00687", "00688", "00674", "00689"],
+            37,
         );
-        // 00700: single body clip, a PROPER subset, 1h50 (~89 % of 00800's
-        // duration) and 55 % of its size — enough to trip the old size gate.
-        let decoy = bd_title("00700.mpls", 700, 6600.0, 33_000_000_000, &["00800"]);
+        // 00703: single body clip, a PROPER subset, 6951 s (~0.95 of 00800's
+        // duration → concat limb inert) and 56.88 GB (~0.97 of its size → old
+        // bumper limb would fire) — one chapter mark, not a feature.
+        let decoy = bd_title_chaptered("00703.mpls", 703, 6951.0, 56_880_000_000, &["00688"], 1);
         let capacity = 88_000_000_000u64;
 
-        // The body decoy is a proper subset with ≥50 % size — the OLD gate
+        // The body subset is a proper subset with ≥90 % size — the OLD gate
         // flagged 00800 composite on that alone. It must no longer be flagged.
         let ranks = Disc::rank_titles(&[feature.clone(), decoy.clone()], None, None);
         assert!(
@@ -4716,6 +4780,161 @@ mod tests {
         assert_eq!(
             titles[0].playlist_id, 800,
             "the standalone feature wins; the concat play-all is demoted"
+        );
+    }
+
+    /// Issue #45 (Alita BD-J): the disc has NO authoritative static playlist
+    /// chain (First-Play is a BD-J Xlet, index title's playlist has an empty
+    /// TableOfAccessiblePlayLists), so selection is a pure structural failsafe.
+    /// The chaptered feature 00800 is a SUPERSET of its un-chaptered body subset
+    /// 00703 that is 0.97 of its size — the size-only bumper limb would demote
+    /// it. The chapter-table guard keeps 00800 (its body carries one mark).
+    #[test]
+    fn alita_bdj_body_subset_does_not_demote_chaptered_feature_issue_45() {
+        let feature = bd_title_chaptered(
+            "00800.mpls",
+            800,
+            7317.0,
+            58_610_000_000,
+            &["00687", "00688", "00674", "00689"],
+            37,
+        );
+        let body = bd_title_chaptered("00703.mpls", 703, 6951.0, 56_880_000_000, &["00688"], 1);
+        let capacity = 88_000_000_000u64;
+
+        let ranks = Disc::rank_titles(&[feature.clone(), body.clone()], None, None);
+        assert!(
+            !ranks[0].composite,
+            "the chaptered feature must not be flagged a wrapper composite of its body"
+        );
+
+        // No hint, no nav — the BD-J disc gives neither; selection is structural.
+        let mut titles = vec![body, feature];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None, None);
+        assert_eq!(
+            titles[0].playlist_id, 800,
+            "the chaptered feature is selected, not its un-chaptered body subset"
+        );
+    }
+
+    /// Issue #45 (secondary determinism): the nine feature variants 00800-00808
+    /// share the body clip 00688 and differ only by opening logo, so they are
+    /// equal in size/duration/audio — the lowest-playlist_id final tie-break
+    /// deterministically picks 00800. All nine rank above the un-chaptered body
+    /// subset 00703, and none is demoted as a composite of it.
+    #[test]
+    fn alita_full_family_ranks_above_body() {
+        let mut titles: Vec<DiscTitle> = (0..9)
+            .map(|k| {
+                let id = 800 + k as u16;
+                bd_title_chaptered(
+                    &format!("008{k:02}.mpls"),
+                    id,
+                    7317.0,
+                    58_610_000_000,
+                    &[&format!("logo{k}"), "00688"],
+                    37,
+                )
+            })
+            .collect();
+        // The bare body: a proper subset of every family member, one chapter mark,
+        // 0.97 of their size (would trip the old bumper limb).
+        titles.push(bd_title_chaptered(
+            "00703.mpls",
+            703,
+            6951.0,
+            56_880_000_000,
+            &["00688"],
+            1,
+        ));
+        let capacity = 88_000_000_000u64;
+
+        let ranks = Disc::rank_titles(&titles, None, None);
+        assert!(
+            ranks.iter().all(|r| !r.composite),
+            "no equal-size seamless sibling nor its body subset is a composite"
+        );
+
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None, None);
+        assert_eq!(
+            titles[0].playlist_id, 800,
+            "the lowest-id feature variant is the deterministic pick among equals"
+        );
+        assert_eq!(
+            titles.last().unwrap().playlist_id,
+            703,
+            "the smaller body subset ranks below the whole feature family"
+        );
+    }
+
+    /// Issue #45 (SM3 topology, opposite of Alita): the real chaptered feature
+    /// 00001 is the SUBSET; the decoy 00245 = [bumper][feature][outro] is the
+    /// SUPERSET. Because the subset IS a complete feature presentation (real
+    /// chapter table), the bumper limb still fires and the wrapper stays demoted.
+    #[test]
+    fn bumper_wrapper_with_chaptered_subset_still_demoted() {
+        let wrapper = bd_title(
+            "00245.mpls",
+            245,
+            8350.0,
+            78_000_000_000,
+            &["00339", "00001", "00336"],
+        );
+        // 0.98 of the wrapper's size (bumper limb) and a full chapter table.
+        let feature = bd_title_chaptered("00001.mpls", 1, 8038.0, 76_500_000_000, &["00001"], 24);
+        let capacity = 88_000_000_000u64;
+
+        let ranks = Disc::rank_titles(&[wrapper.clone(), feature.clone()], None, None);
+        assert!(
+            ranks[0].composite,
+            "a bumper wrapper of a CHAPTERED feature subset is still a composite"
+        );
+        assert!(
+            !ranks[1].composite,
+            "the chaptered feature subset is standalone"
+        );
+
+        let mut titles = vec![wrapper, feature];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None, None);
+        assert_eq!(
+            titles[0].playlist_id, 1,
+            "the chaptered feature wins; its bumper wrapper is demoted"
+        );
+    }
+
+    /// Issue #45: when the bumper-size subset carries NO chapter table it is not
+    /// a complete feature, so the bumper limb does not fire and the SUPERSET is
+    /// kept — the exact mechanism that saves Alita's 00800 over its body 00703.
+    #[test]
+    fn un_chaptered_bumper_subset_keeps_superset() {
+        // Superset feature, chaptered.
+        let superset = bd_title_chaptered(
+            "00800.mpls",
+            800,
+            7317.0,
+            58_610_000_000,
+            &["00687", "00688", "00674", "00689"],
+            30,
+        );
+        // Subset: 0.97 of the superset's size (bumper limb size), but NO chapters.
+        let subset = bd_title("00703.mpls", 703, 6951.0, 56_880_000_000, &["00688"]);
+        assert!(
+            subset.chapters.is_empty(),
+            "the body subset carries no marks"
+        );
+        let capacity = 88_000_000_000u64;
+
+        let ranks = Disc::rank_titles(&[superset.clone(), subset.clone()], None, None);
+        assert!(
+            !ranks[0].composite,
+            "an un-chaptered bumper-size subset must not demote its superset"
+        );
+
+        let mut titles = vec![subset, superset];
+        Disc::sort_titles_by_main_feature(&mut titles, capacity, None, None);
+        assert_eq!(
+            titles[0].playlist_id, 800,
+            "the superset feature is kept, not the un-chaptered body subset"
         );
     }
 
@@ -4784,7 +5003,9 @@ mod tests {
             78_000_000_000,
             &["00339", "00001", "00336"],
         );
-        let feature = bd_title("00001.mpls", 1, 8000.0, 76_000_000_000, &["00001"]);
+        // The wrapped feature carries the real chapter table (issue #45), so the
+        // streamless wrapper 00245 is detected as a composite and demoted.
+        let feature = bd_title_chaptered("00001.mpls", 1, 8000.0, 76_000_000_000, &["00001"], 12);
         let capacity = 88_000_000_000u64;
 
         let mut titles = vec![streamless, feature];
