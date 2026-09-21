@@ -23,6 +23,11 @@ on:
     branches: [qa]
   workflow_dispatch:
 
+# Rapid dev pushes supersede their own in-progress runs instead of stacking.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Single source of truth for the MSRV — see ci.yml. Jobs that build/test AT
   # the MSRV read `needs.resolve-msrv.outputs.v` from Cargo.toml's rust-version;
@@ -32,7 +37,7 @@ jobs:
     outputs:
       v: ${{ steps.msrv.outputs.v }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
       - id: msrv
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
@@ -56,7 +61,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Stamp the next rc
@@ -85,14 +90,12 @@ jobs:
         os: ['ubuntu-latest', 'macos-latest']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: libfreemkv
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/freemkv-unlock
-          ref: qa
-          path: freemkv-unlock
+          checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -108,14 +111,12 @@ jobs:
   cross-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: libfreemkv
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/freemkv-unlock
-          ref: qa
-          path: freemkv-unlock
+          checkout: freemkv-unlock
       # clippy runs on stable (matches ci.yml's lint job); build/test stay on
       # the MSRV pin. See ci.yml for why the lint toolchain need not be the MSRV.
       - uses: dtolnay/rust-toolchain@stable
@@ -136,14 +137,12 @@ jobs:
     needs: resolve-msrv
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: libfreemkv
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/freemkv-unlock
-          ref: qa
-          path: freemkv-unlock
+          checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
