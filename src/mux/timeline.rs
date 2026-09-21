@@ -2089,11 +2089,9 @@ mod tests {
         );
     }
 
-    // A provisional must retire even PAST the epoch-history cap. Epoch identity
-    // was `epoch_offsets.len()`, which pins at MAX_EPOCHS once the ring is full,
-    // so a provisional captured then compared equal forever and never retired —
-    // drifting that track away from every other for the rest of the title. The
-    // monotonic `epoch_seq` keeps distinguishing epochs past the cap.
+    // A provisional must retire even PAST the epoch-history cap: the old identity
+    // `epoch_offsets.len()` pinned at MAX_EPOCHS once the ring filled, so a
+    // provisional compared equal forever; monotonic `epoch_seq` fixes that.
     #[test]
     fn a_provisional_retires_even_past_the_epoch_history_cap() {
         let mut tc = TimelineContinuity::new();

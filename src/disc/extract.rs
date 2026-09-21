@@ -1592,11 +1592,9 @@ mod tests {
         assert!(matches!(err, Error::DirNameCollision { .. }));
     }
 
-    // Two disc names differing only by CASE fold to one host file on a case-
-    // INSENSITIVE host (macOS APFS / Windows NTFS) — that must be a collision,
-    // not a silent overwrite reported clean. On a case-SENSITIVE volume the two
-    // are distinct files that coexist, so the extract must NOT abort. The
-    // outcome tracks the REAL target volume, tested by probing it.
+    // Two names differing only by CASE collide on a case-INSENSITIVE host (macOS
+    // APFS / Windows NTFS) but coexist on a case-SENSITIVE one, so the extract
+    // must abort on the former and not the latter — outcome tracks the real volume.
     #[test]
     fn names_differing_only_by_case_collide_only_on_a_case_insensitive_host() {
         let root = DirSpec {
