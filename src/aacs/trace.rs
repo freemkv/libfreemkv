@@ -61,6 +61,41 @@ pub struct KeyStep {
     pub who: String,
     pub path: Vec<KeyNode>,
     pub outcome: KeyOutcome,
+    /// Shape of the source's MATCHED entry, when it matched this disc — a
+    /// booleans-and-lengths summary (no key material) that de-conflates WHY a
+    /// matched disc produced no key. `None` when the source did not match (a
+    /// true miss) or the source kind carries no such shape. An application MAY
+    /// log it verbatim and render it into a matched-but-no-key verdict.
+    pub matched_entry: Option<MatchedEntry>,
+    /// Number of per-disc entries loaded in the source's store, when known — so
+    /// a true-miss verdict can name the store size (`… not in keydb (N entries
+    /// loaded)`) and a reporter can confirm a wrong-pressing at a glance.
+    /// `None` for a source that carries no such count. No secret.
+    pub store_entries: Option<usize>,
+}
+
+/// A shape summary of a key source's MATCHED entry — booleans and lengths only,
+/// never key MATERIAL — so an application can log WHY a disc that WAS found in
+/// the store still produced no usable key (the classic "matched but needs a VID
+/// this path can't supply"). Every field is safe to print at any log level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MatchedEntry {
+    /// The entry carries a Volume Unique Key (title keys can boil directly).
+    pub has_vuk: bool,
+    /// The entry carries one or more pre-decrypted terminal Unit Keys.
+    pub has_unit_keys: bool,
+    /// Count of pre-decrypted terminal Unit Keys the entry carries.
+    pub unit_keys_len: usize,
+    /// The entry carries a Media Key (a VID is still needed to reach the VUK).
+    pub has_media_key: bool,
+    /// The entry carries its own Volume ID (the keydb `I` token).
+    pub has_keydb_vid: bool,
+    /// Count of the disc's encrypted title keys available to boil (from
+    /// `Unit_Key_RO.inf`); `0` when none were captured.
+    pub enc_title_keys_len: usize,
+    /// A Volume ID is available on this resolve path (from the drive handshake
+    /// or the entry) — the gate the `MK → VUK` step needs.
+    pub vid_available: bool,
 }
 
 /// A node on the derivation path a source walked. Ordered as encountered; not
@@ -71,6 +106,10 @@ pub enum KeyNode {
     MatchedDisc,
     /// The source had no entry for this disc.
     NoEntry,
+    /// The source matched this disc but could not derive any usable key from the
+    /// matched entry (e.g. no derivation material for the path taken). Distinct
+    /// from [`NoEntry`](Self::NoEntry): the disc WAS found, the key was not.
+    NoDerivableKey,
     /// Pre-decrypted unit keys were found.
     FoundUnitKeys,
     /// A VUK was found.
@@ -123,6 +162,8 @@ mod tests {
                     KeyNode::DerivedUnitKeys,
                 ],
                 outcome: KeyOutcome::Resolved,
+                matched_entry: None,
+                store_entries: None,
             }],
         };
         // Clone + PartialEq (derive contract the renderers rely on).

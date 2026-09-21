@@ -226,6 +226,33 @@ impl ResolveCtx for DiscInputsCtx<'_> {
     }
 }
 
+/// The de-conflated result of a source's unit-key resolution: the keys it
+/// produced (empty when none) PLUS why it produced them — so a caller can tell
+/// a genuine "no entry for this disc" from a MATCHED disc that yielded no
+/// derivable key. The bare `Vec` of [`KeySource::get_unit_keys`] cannot make
+/// that distinction; [`KeySource::resolve_unit_keys`] carries it.
+#[derive(Debug, Clone, Default)]
+pub struct UnitKeyResolution {
+    /// Terminal Unit Keys produced (empty = this source yielded none).
+    pub keys: Vec<UnitKey>,
+    /// The source matched this disc in its store (by hash / VID), even if it
+    /// then derived no key. `false` = a genuine miss ("no entry").
+    pub matched: bool,
+    /// When `matched` and `keys` is empty: the derivation nodes walked AFTER the
+    /// implicit `MatchedDisc` node — e.g. `[NoVid]` (had a Media Key, no VID) or
+    /// `[NoDerivableKey]` (no material at all). Empty ⇒ the caller supplies a
+    /// bare `NoDerivableKey`. Ignored unless `matched` and `keys` is empty.
+    pub miss_path: Vec<crate::aacs::trace::KeyNode>,
+    /// When `matched`: a booleans-and-lengths shape of the matched entry (no key
+    /// material), for the application to log. `None` for a miss or a source kind
+    /// with no such shape.
+    pub matched_entry: Option<crate::aacs::trace::MatchedEntry>,
+    /// Number of per-disc entries loaded in this source's store, when known — so
+    /// a true-miss verdict can name the store size. `None` for a source that
+    /// carries no such count.
+    pub store_entries: Option<usize>,
+}
+
 /// A key source: an adapter over a backing store that resolves a disc's terminal
 /// Unit Keys.
 ///
@@ -239,6 +266,21 @@ pub trait KeySource {
     /// Resolve this disc's base per-CPS-unit Unit Keys from this source. An empty
     /// `Vec` is a genuine "no key here"; `Err` is a source failure.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error>;
+
+    /// De-conflated counterpart to [`get_unit_keys`](Self::get_unit_keys):
+    /// besides the keys, report whether this disc MATCHED the source's store and
+    /// (on a keyless match) why nothing was derivable — so the trace can render
+    /// `matched disc > no VID > NO KEY` instead of a flat `no entry`.
+    ///
+    /// The default is coarse: forward to [`get_unit_keys`](Self::get_unit_keys)
+    /// and report `matched = false`. A source that keys on a per-disc identity
+    /// (a keydb) overrides this to set `matched`/`miss_path`/`matched_entry`.
+    fn resolve_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<UnitKeyResolution, Error> {
+        Ok(UnitKeyResolution {
+            keys: self.get_unit_keys(ctx)?,
+            ..Default::default()
+        })
+    }
 
     /// Resolve this disc's AACS 2.1 forensic index keys — the per-index keys the
     /// base Unit Key cannot open (see [`crate::aacs::segment`]) — ordered by
@@ -312,10 +354,11 @@ pub fn resolve_and_apply_traced(
     for source in sources {
         // `who` is the source's own stable identifier — no enum to map back to.
         let who = source.label().to_string();
-        match source.get_unit_keys(&ctx) {
-            Ok(uks) if !uks.is_empty() => {
+        match source.resolve_unit_keys(&ctx) {
+            Ok(r) if !r.keys.is_empty() => {
                 // Positional index → canonical CPS-unit number (position + 1).
-                let unit_keys: Vec<(u32, [u8; 16])> = uks
+                let unit_keys: Vec<(u32, [u8; 16])> = r
+                    .keys
                     .iter()
                     .map(|uk| (uk.idx.saturating_add(1), uk.key))
                     .collect();
@@ -327,6 +370,8 @@ pub fn resolve_and_apply_traced(
                         who,
                         path: vec![KeyNode::FoundUnitKeys, KeyNode::DerivedUnitKeys],
                         outcome: KeyOutcome::Resolved,
+                        matched_entry: r.matched_entry,
+                        store_entries: r.store_entries,
                     });
                     return (true, trace);
                 }
@@ -335,15 +380,31 @@ pub fn resolve_and_apply_traced(
                     who,
                     path: vec![KeyNode::FoundUnitKeys],
                     outcome: KeyOutcome::NoKey,
+                    matched_entry: r.matched_entry,
+                    store_entries: r.store_entries,
                 });
             }
-            // The source ANSWERED and holds nothing for this disc. This — and
-            // only this — is `NoEntry`: the claim "I looked, it is not there".
-            Ok(_) => {
+            // The source ANSWERED with no keys. De-conflate a MATCHED-but-
+            // underivable disc from a true miss (`NoEntry`); a source that can't
+            // tell them apart (the trait default) reports `matched = false`.
+            Ok(r) => {
+                let path = if r.matched {
+                    let mut p = vec![KeyNode::MatchedDisc];
+                    if r.miss_path.is_empty() {
+                        p.push(KeyNode::NoDerivableKey);
+                    } else {
+                        p.extend(r.miss_path);
+                    }
+                    p
+                } else {
+                    vec![KeyNode::NoEntry]
+                };
                 trace.keys.push(KeyStep {
                     who,
-                    path: vec![KeyNode::NoEntry],
+                    path,
                     outcome: KeyOutcome::NoKey,
+                    matched_entry: r.matched_entry,
+                    store_entries: r.store_entries,
                 });
             }
             // The source could NOT answer (unreachable/errored/refused), so path is
@@ -357,6 +418,8 @@ pub fn resolve_and_apply_traced(
                     who,
                     path: Vec::new(),
                     outcome: KeyOutcome::NoKey,
+                    matched_entry: None,
+                    store_entries: None,
                 });
             }
         }

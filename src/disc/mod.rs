@@ -5499,6 +5499,131 @@ mod tests {
         }
     }
 
+    /// Issue #46: a source that MATCHED the disc but derived no key must render
+    /// distinctly from a true miss — `matched disc > no VID`, NOT `no entry` —
+    /// and carry the matched entry's shape for the app to log.
+    #[test]
+    fn matched_but_underivable_disc_is_not_reported_as_no_entry() {
+        use crate::aacs::trace::{KeyNode, MatchedEntry};
+        use crate::keysource::{
+            KeySource, ResolveCtx, UnitKeyResolution, resolve_and_apply_traced,
+        };
+
+        /// Matched the disc, had a Media Key, but no VID on this path — the
+        /// classic issue-#46 case (a keydb hit that cannot finish).
+        struct MatchedNoVid;
+        impl KeySource for MatchedNoVid {
+            fn get_unit_keys(
+                &self,
+                _ctx: &dyn ResolveCtx,
+            ) -> std::result::Result<Vec<crate::aacs::types::UnitKey>, crate::error::Error>
+            {
+                Ok(Vec::new())
+            }
+            fn resolve_unit_keys(
+                &self,
+                _ctx: &dyn ResolveCtx,
+            ) -> std::result::Result<UnitKeyResolution, crate::error::Error> {
+                Ok(UnitKeyResolution {
+                    keys: Vec::new(),
+                    matched: true,
+                    miss_path: vec![KeyNode::NoVid],
+                    matched_entry: Some(MatchedEntry {
+                        has_media_key: true,
+                        enc_title_keys_len: 1,
+                        ..Default::default()
+                    }),
+                    store_entries: Some(3),
+                })
+            }
+            fn label(&self) -> &'static str {
+                "keydb"
+            }
+        }
+
+        let inputs = crate::keysource::DiscInputs {
+            disc_hash: "0xMATCH".into(),
+            volume_id: [0u8; 16],
+            version: crate::aacs::mkb::AACS_MAJOR_UHD,
+            mkb: Vec::new(),
+            unit_key_ro: Vec::new(),
+            samples: Vec::new(),
+            volume_label: None,
+        };
+        let mut disc = {
+            let mut d = make_test_disc(1000, "UHD");
+            d.encrypted = true;
+            d.aacs = Some(aacs_with(Vec::new()));
+            d
+        };
+        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(MatchedNoVid)];
+        let (ok, trace) = resolve_and_apply_traced(&sources, &inputs, &mut disc);
+        assert!(!ok);
+        assert_eq!(
+            trace.keys[0].path,
+            vec![KeyNode::MatchedDisc, KeyNode::NoVid],
+            "a matched-but-underivable disc must NOT collapse to `no entry`"
+        );
+        assert_eq!(
+            trace.keys[0].matched_entry.map(|m| m.has_media_key),
+            Some(true),
+            "the matched entry's shape must survive to the trace for logging"
+        );
+    }
+
+    /// Companion to the above: a matched entry with NO derivation material at all
+    /// gets the library's default `no derivable key` node (empty `miss_path`),
+    /// still distinct from a true miss.
+    #[test]
+    fn matched_with_no_material_renders_no_derivable_key() {
+        use crate::aacs::trace::KeyNode;
+        use crate::keysource::{
+            KeySource, ResolveCtx, UnitKeyResolution, resolve_and_apply_traced,
+        };
+
+        struct MatchedNoMaterial;
+        impl KeySource for MatchedNoMaterial {
+            fn get_unit_keys(
+                &self,
+                _ctx: &dyn ResolveCtx,
+            ) -> std::result::Result<Vec<crate::aacs::types::UnitKey>, crate::error::Error>
+            {
+                Ok(Vec::new())
+            }
+            fn resolve_unit_keys(
+                &self,
+                _ctx: &dyn ResolveCtx,
+            ) -> std::result::Result<UnitKeyResolution, crate::error::Error> {
+                Ok(UnitKeyResolution {
+                    matched: true,
+                    ..Default::default()
+                })
+            }
+        }
+
+        let inputs = crate::keysource::DiscInputs {
+            disc_hash: "0xMATCH".into(),
+            volume_id: [0u8; 16],
+            version: crate::aacs::mkb::AACS_MAJOR_UHD,
+            mkb: Vec::new(),
+            unit_key_ro: Vec::new(),
+            samples: Vec::new(),
+            volume_label: None,
+        };
+        let mut disc = {
+            let mut d = make_test_disc(1000, "UHD");
+            d.encrypted = true;
+            d.aacs = Some(aacs_with(Vec::new()));
+            d
+        };
+        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(MatchedNoMaterial)];
+        let (_ok, trace) = resolve_and_apply_traced(&sources, &inputs, &mut disc);
+        assert_eq!(
+            trace.keys[0].path,
+            vec![KeyNode::MatchedDisc, KeyNode::NoDerivableKey],
+        );
+    }
+
     /// Same AACS-no-key disc under `--raw` (raw=true) must PROCEED — the user
     /// asked for the encrypted image and needs no key.
     #[test]
