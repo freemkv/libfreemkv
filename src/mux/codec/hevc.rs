@@ -186,6 +186,14 @@ thread_local! {
     static PARAM_REASSERT_REALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Test-only: forces a framing desync just before the parse() self-check guard
+// so its drop branch is exercised end-to-end (frame_data is length-prefixed by
+// construction, so no real input desyncs it). See parse_drops_desynced_access_unit.
+#[cfg(test)]
+thread_local! {
+    static FORCE_FRAMING_DESYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 // 33-bit 90kHz PTS wraps at 2^33 ticks (~26.5h). A backward step of ~2^33 is a
 // wraparound (unwrap, add 2^33) not a clip reset (arbitrary sub-2^33 backward
 // step); accepting steps within `PTS_WRAP_PERIOD`/2 of a full period separates the two cases.
@@ -597,6 +605,13 @@ impl CodecParser for HevcParser {
                     PARAM_REASSERT_REALLOCS.with(|c| c.set(c.get() + 1));
                 }
             }
+        }
+
+        // Test-only seam: append a stray byte so the guard below sees a desync,
+        // exercising its drop branch end-to-end (no real input can desync here).
+        #[cfg(test)]
+        if FORCE_FRAMING_DESYNC.with(|c| c.get()) {
+            frame_data.push(0xFF);
         }
 
         // Defense in depth (issue #52): frame_data is length-prefixed by
@@ -2824,6 +2839,47 @@ mod tests {
         assert!(
             length_prefix_tiles(&frames[0].data),
             "an emitted HEVC frame's records must tile exactly"
+        );
+    }
+
+    // The build a normal Annex-B AU (VPS + SPS + PPS + IDR) as a helper for the
+    // end-to-end guard test below.
+    #[cfg(test)]
+    fn annex_b_access_unit() -> Vec<u8> {
+        let sps = make_sps_with_chroma(1, 2, 2);
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(32)); // VPS
+        data.extend_from_slice(&[0xAA, 0xBB]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&sps); // SPS
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(34)); // PPS
+        data.extend_from_slice(&[0xDD, 0xEE]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(19)); // IDR_W_RADL slice → keyframe
+        data.extend_from_slice(&[0x10, 0x20, 0x30]);
+        data
+    }
+
+    // Issue #52: the guard's WIRING in parse() — a desynced access unit is
+    // dropped (empty emit), a well-formed one is emitted. Disconnecting the guard
+    // from parse() would let the desynced case through and fail this test.
+    #[test]
+    fn parse_drops_desynced_access_unit() {
+        // Well-formed: emitted.
+        let mut parser = HevcParser::new();
+        let frames = parser.parse(&make_pes(annex_b_access_unit(), Some(0)));
+        assert_eq!(frames.len(), 1, "a well-formed access unit is emitted");
+
+        // Same AU, framing forced out of sync: the guard drops it.
+        FORCE_FRAMING_DESYNC.with(|c| c.set(true));
+        let mut parser2 = HevcParser::new();
+        let dropped = parser2.parse(&make_pes(annex_b_access_unit(), Some(0)));
+        FORCE_FRAMING_DESYNC.with(|c| c.set(false));
+        assert!(
+            dropped.is_empty(),
+            "a desynced access unit is dropped by parse(), not emitted"
         );
     }
 

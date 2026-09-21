@@ -223,8 +223,8 @@ pub(crate) fn feature_hint_from_xml(text: &str) -> Option<super::FeaturePlaylist
 
 // A playlist must run at least this long (seconds) to be the feature — kills the
 // `_Start_Angle` 2-second decoy (Sony SM3 UHD id 00243). Applied only when a
-// duration is actually stated; absent, it stays inert.
-const MIN_FEATURE_SECS: u64 = 60;
+// duration is actually stated; absent, it stays inert. Shared with fox.
+use super::MIN_FEATURE_SECS;
 
 // A `<playlist>` element's stated running time in seconds, if any. Read from the
 // first present of a set of duration-like attributes (the corpus is not a spec;

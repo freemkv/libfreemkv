@@ -157,8 +157,8 @@ pub(crate) fn labels_from_dcx(text: &str) -> Vec<StreamLabel> {
 
 // A feature runs at least this long (`durs` is seconds — durs=7628 is a 2h7m
 // feature). A stated sub-minute `name="feature"` is a decoy and is never
-// selected; the guard is inert when no `durs` is present. Mirrors paramount.
-const MIN_FEATURE_SECS: u64 = 60;
+// selected; the guard is inert when no `durs` is present. Shared with paramount.
+use super::MIN_FEATURE_SECS;
 
 // The `durs` (seconds) of a `<playlist>` element, digits only, when stated.
 fn playlist_duration_secs(element: &str) -> Option<u64> {

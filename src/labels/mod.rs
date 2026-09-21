@@ -293,6 +293,11 @@ const MIN_ANCHOR_STREAMS: usize = 2;
 // so 0 is unused; only stream_id-bearing labels may carry it.
 const NO_STN_SLOT: u16 = 0;
 
+// A stated feature playlist runs at least this long (seconds); a sub-minute
+// stated duration is a decoy (Fox name=feature, Paramount _Start_Angle), never
+// the feature. Inert when no duration is stated. Shared by fox and paramount.
+pub(crate) const MIN_FEATURE_SECS: u64 = 60;
+
 // Two ISO 639-2 codes that do NOT contradict: equal (case/padding
 // insensitive), or either side is empty ("unknown", never a contradiction).
 fn languages_compatible(a: &str, b: &str) -> bool {
@@ -3471,5 +3476,58 @@ mod feature_hint_pass_tests {
             apply(&mut disc, &udf, &mut titles).expect("a jar-only disc still yields a hint");
         assert_eq!(hint.playlist_id, Some(800));
         assert_eq!(hint.filename.as_deref(), Some("00800.mpls"));
+    }
+
+    /// The winner_hint early-return: when the winning parser already carried a
+    /// non-empty hint, resolve_feature_hint returns it verbatim and never runs
+    /// the Tier-2 menu-walk. The disc's bdj_feature::resolve would yield 00800,
+    /// but the supplied winner_hint (00042) must win — proving the short-circuit.
+    #[test]
+    fn resolve_feature_hint_returns_winner_hint_over_menu_walk() {
+        let xml = br#"<playlists>
+            <playlist name="Feature" id="00800" aud="eng,fra,spa" duration="7000" />
+        </playlists>"#;
+        let jar = build_jar(&[("00000/playlists.xml", xml.to_vec())]);
+        let jar_dir = DirSpec {
+            name: "JAR".to_string(),
+            icb_lba: 30,
+            dir_data_lba: 31,
+            files: vec![file_with("00000.jar", 32, 4000, jar, true)],
+            subdirs: vec![],
+        };
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![jar_dir],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        // Sanity: the Tier-2 menu-walk on this disc resolves to 00800.
+        let tier2 = bdj_feature::resolve(&mut disc, &udf);
+        assert_eq!(tier2.and_then(|h| h.playlist_id), Some(800));
+
+        // A DIFFERENT non-empty winner_hint must short-circuit before Tier-2.
+        let winner = FeaturePlaylistHint {
+            playlist_id: Some(42),
+            filename: Some("00042.mpls".to_string()),
+        };
+        let got = resolve_feature_hint(&mut disc, &udf, Some(winner.clone()));
+        assert_eq!(
+            got,
+            Some(winner),
+            "a non-empty winner_hint wins over the Tier-2 menu-walk result"
+        );
     }
 }
