@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.7.4] — UNRELEASED
+## [1.7.4] — 2026-09-21
 ### Fixed
 
 - BD-J / Java-menu main-title selection reworked (#45): a chapter-completeness failsafe, a BD-J menu-walk (parses the BDJO objects and jar manifests), and a stream-richness tiebreak now cooperate so discs driven by a Java menu pick the real main feature — keeping the Dolby Vision enhancement layer and all subtitle tracks — instead of a lower-id sibling playlist.
