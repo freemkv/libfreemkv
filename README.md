@@ -4,6 +4,8 @@
 [![CI](https://github.com/freemkv/libfreemkv/actions/workflows/ci.yml/badge.svg)](https://github.com/freemkv/libfreemkv/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/freemkv/libfreemkv/branch/dev/graph/badge.svg)](https://codecov.io/gh/freemkv/libfreemkv)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/freemkv/libfreemkv/badge)](https://scorecard.dev/viewer/?uri=github.com/freemkv/libfreemkv)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14745/badge)](https://www.bestpractices.dev/projects/14745)
+[![REUSE status](https://api.reuse.software/badge/github.com/freemkv/libfreemkv)](https://api.reuse.software/info/github.com/freemkv/libfreemkv)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](#minimum-supported-rust-version)
 
 # libfreemkv
