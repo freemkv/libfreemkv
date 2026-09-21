@@ -15,9 +15,8 @@ name: qa
 # one being released, which is the exact failure this branch exists to prevent.
 #
 # What this gate CANNOT cover: `disc://` and real `iso://` need physical media,
-# and no hosted runner has an optical drive or the image hoard. Those run on a
-# self-hosted runner (see the media job at the end) and are the one leg that
-# stays on hardware.
+# and no hosted runner has an optical drive or the image hoard. That coverage
+# lives in freemkv's qa.yml (the real-media EC2 matrix), not in this file.
 on:
   push:
     branches: [qa]

@@ -29,7 +29,7 @@ jobs:
 
   # Tests run as a PARALLEL TRIPWIRE: they fail the run if they fail, but the
   # publish/release jobs do NOT `needs:` this job. The tag decision was already
-  # gated by the local precommit (same MSRV, same commit). Binary consumers
+  # gated by CI (ci.yml on dev, then a green qa.yml on the same commit). Binary consumers
   # (freemkv/autorip/bdemu) git-tag-pin libfreemkv and therefore start building
   # the instant this tag exists — so this test job and the crates.io publish
   # below must NOT sit on their critical path.
