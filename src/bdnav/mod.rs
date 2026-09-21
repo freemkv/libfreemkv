@@ -7,6 +7,7 @@
 //!
 //! Contract: read-only, bounded, and never panics or hard-fails.
 
+pub(crate) mod bdjo;
 pub(crate) mod index;
 pub(crate) mod mobj;
 pub(crate) mod vm;

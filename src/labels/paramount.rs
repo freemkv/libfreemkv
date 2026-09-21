@@ -212,37 +212,137 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
     labels
 }
 
-/// Find the feature playlist element (the one with the most non-empty
-/// audio slots).
+/// The feature playlist hint for a whole `playlists.xml` document — selects the
+/// feature element and derives its id/filename. Exposed for the generic BD-J
+/// menu-walk (`bdj_feature`) Tier-1 sweep, which finds this manifest embedded
+/// inside a jar rather than as a loose file.
+pub(crate) fn feature_hint_from_xml(text: &str) -> Option<super::FeaturePlaylistHint> {
+    let feature = find_feature_playlist(text)?;
+    feature_hint(&feature)
+}
+
+// A playlist must run at least this long (seconds) to be the feature — kills the
+// `_Start_Angle` 2-second decoy (Sony SM3 UHD id 00243). Applied only when a
+// duration is actually stated; absent, it stays inert.
+const MIN_FEATURE_SECS: u64 = 60;
+
+// A `<playlist>` element's stated running time in seconds, if any. Read from the
+// first present of a set of duration-like attributes (the corpus is not a spec;
+// `durs` matches the sibling Fox manifest's seconds convention). Digits only.
+fn playlist_duration_secs(element: &str) -> Option<u64> {
+    for key in ["duration", "durs", "dur", "runtime", "length", "len"] {
+        if let Some(v) = xml::attr(element, key) {
+            let digits: String = v.chars().filter(|c| c.is_ascii_digit()).collect();
+            if let Ok(secs) = digits.parse::<u64>()
+                && secs > 0
+            {
+                return Some(secs);
+            }
+        }
+    }
+    None
+}
+
+// A feature-selection candidate: the element text, its non-empty audio-slot
+// count, and its stated duration (seconds) when known.
+struct Candidate {
+    element: String,
+    aud: usize,
+    dur: Option<u64>,
+}
+
+impl Candidate {
+    // A candidate whose duration is stated AND sub-minute can never be the
+    // feature — the _Start_Angle decoy guard.
+    fn is_sub_minute(&self) -> bool {
+        self.dur.is_some_and(|d| d < MIN_FEATURE_SECS)
+    }
+}
+
+/// Find the feature playlist element. Order, refined for Sony SM3 UHD:
+///   1. exact `name="Feature"` (case-insensitive) — longest-duration among any,
+///      else first;
+///   2. else any name matching `/feature/i` (`_Feature`, `Feature_A`, …) —
+///      longest-duration among them, else the most-audio one;
+///   3. else the most-audio playlist overall, breaking ties by longest duration.
+///
+/// A playlist whose stated duration is sub-minute is never returned (the
+/// `_Start_Angle` decoy).
 fn find_feature_playlist(text: &str) -> Option<String> {
-    let mut best: Option<String> = None;
-    let mut best_aud_count = 0;
+    let mut exact: Vec<Candidate> = Vec::new();
+    let mut feature_like: Vec<Candidate> = Vec::new();
+    let mut all: Vec<Candidate> = Vec::new();
     let mut from = 0;
 
     while let Some((start, end)) = xml::find_element(text, "playlist", from) {
         let element = &text[start..end];
-
-        // Prefer name="Feature" explicitly.
-        if let Some(name) = xml::attr(element, "name")
-            && name.eq_ignore_ascii_case("Feature")
-        {
-            return Some(element.to_string());
-        }
-
-        // Otherwise pick the one with the most audio streams. Count only
-        // non-empty slots so a malformed `aud=",,,,,"` can't outscore a
-        // legitimate feature.
-        if let Some(aud) = xml::attr(element, "aud") {
-            let count = aud.split(',').filter(|s| !s.trim().is_empty()).count();
-            if count > best_aud_count {
-                best_aud_count = count;
-                best = Some(element.to_string());
-            }
-        }
-
         from = end;
+
+        // Count only non-empty audio slots so a malformed `aud=",,,,,"` can't
+        // outscore a legitimate feature.
+        let aud = xml::attr(element, "aud")
+            .map(|a| a.split(',').filter(|s| !s.trim().is_empty()).count())
+            .unwrap_or(0);
+        let dur = playlist_duration_secs(element);
+        let make = || Candidate {
+            element: element.to_string(),
+            aud,
+            dur,
+        };
+
+        match xml::attr(element, "name") {
+            Some(name) if name.eq_ignore_ascii_case("Feature") => exact.push(make()),
+            Some(name) if name.to_ascii_lowercase().contains("feature") => {
+                feature_like.push(make())
+            }
+            _ => {}
+        }
+        all.push(make());
     }
-    best
+
+    // Tier 1: exact name="Feature" — longest duration, else first. A
+    // zero-audio exact feature is still valid (its id feeds the hint).
+    if let Some(el) = pick(&exact, Key::Duration, false) {
+        return Some(el);
+    }
+    // Tier 2: /feature/i names (Sony `_Feature`, `Feature_A`, `Feature_B`) —
+    // longest duration among them, else most audio.
+    if let Some(el) = pick(&feature_like, Key::Duration, true) {
+        return Some(el);
+    }
+    // Tier 3: most audio across all playlists, longest duration as the tiebreak.
+    pick(&all, Key::Audio, true)
+}
+
+// Which signal dominates candidate ranking: duration (tiers 1-2) or audio-slot
+// count (tier 3). The other is the tiebreak.
+#[derive(Clone, Copy)]
+enum Key {
+    Duration,
+    Audio,
+}
+
+// Choose the best candidate under `key`: skip sub-minute decoys; first-wins on a
+// full tie (strict `>`). When `require_audio`, a candidate needs at least one
+// audio slot to be eligible. `None` duration sorts below any stated duration.
+fn pick(cands: &[Candidate], key: Key, require_audio: bool) -> Option<String> {
+    let rank = |c: &Candidate| match key {
+        Key::Duration => (c.dur, c.aud as u64),
+        Key::Audio => (Some(c.aud as u64), c.dur.unwrap_or(0)),
+    };
+    let mut best: Option<&Candidate> = None;
+    for c in cands {
+        if c.is_sub_minute() {
+            continue;
+        }
+        if require_audio && c.aud == 0 {
+            continue;
+        }
+        if best.is_none_or(|b| rank(c) > rank(b)) {
+            best = Some(c);
+        }
+    }
+    best.map(|c| c.element.clone())
 }
 
 #[cfg(test)]
@@ -749,5 +849,70 @@ mod tests {
             feature.contains(r#"name="A""#),
             "first playlist must win a tie, got: {feature}"
         );
+    }
+
+    // Sony SM3 UHD regression: `_Start_Angle` (id 00243, 2s) shares the
+    // feature's audio slots and comes first — `/feature/i` matching plus the
+    // sub-minute guard now reject the decoy the old rule picked.
+    #[test]
+    fn feature_selection_rejects_start_angle_decoy() {
+        let xml = r#"
+            <playlist name="_Start_Angle" id="00243" aud="eng,fra,spa" duration="2" />
+            <playlist name="_Feature"     id="00800" aud="eng,fra,spa" duration="7000" />
+            <playlist name="Feature_A"    id="00801" aud="eng,fra,spa" duration="7000" />
+        "#;
+        let feature = find_feature_playlist(xml).expect("a feature is found");
+        assert!(
+            !feature.contains("_Start_Angle"),
+            "the 2-second angle decoy must never be the feature: {feature}"
+        );
+        // Tie between the two /feature/i playlists → first wins (_Feature, 00800).
+        let h = feature_hint_from_xml(xml).expect("hint");
+        assert_eq!(h.playlist_id, Some(800));
+        assert_eq!(h.filename.as_deref(), Some("00800.mpls"));
+    }
+
+    // Among /feature/i playlists, the longest duration wins — not document order.
+    #[test]
+    fn feature_like_longest_duration_wins() {
+        let xml = r#"
+            <playlist name="_Feature"  id="00800" aud="eng,fra" duration="6000" />
+            <playlist name="Feature_B" id="00802" aud="eng,fra" duration="8000" />
+        "#;
+        let h = feature_hint_from_xml(xml).expect("hint");
+        assert_eq!(
+            h.playlist_id,
+            Some(802),
+            "the longer /feature/i playlist wins"
+        );
+    }
+
+    // The sub-minute guard also applies when the ONLY /feature/i playlist is a
+    // decoy: it is rejected and selection falls through to the real feature.
+    #[test]
+    fn sub_minute_feature_name_is_rejected() {
+        let xml = r#"
+            <playlist name="Feature_Trailer" id="00050" aud="eng,fra,spa" duration="30" />
+            <playlist name="MainMovie"       id="00800" aud="eng,fra,spa" duration="7000" />
+        "#;
+        let feature = find_feature_playlist(xml).expect("a feature is found");
+        // Feature_Trailer is /feature/i but sub-minute → rejected; tier 3 picks
+        // MainMovie (equal audio, far longer duration).
+        assert!(feature.contains(r#"id="00800""#), "got {feature}");
+    }
+
+    // Duration attribute reading: several key spellings, digits only, zero → None.
+    #[test]
+    fn playlist_duration_reads_known_attrs() {
+        assert_eq!(
+            playlist_duration_secs(r#"<playlist duration="7000" />"#),
+            Some(7000)
+        );
+        assert_eq!(
+            playlist_duration_secs(r#"<playlist durs="7628" />"#),
+            Some(7628)
+        );
+        assert_eq!(playlist_duration_secs(r#"<playlist dur="0" />"#), None);
+        assert_eq!(playlist_duration_secs(r#"<playlist name="x" />"#), None);
     }
 }

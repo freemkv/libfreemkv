@@ -155,12 +155,25 @@ pub(crate) fn labels_from_dcx(text: &str) -> Vec<StreamLabel> {
     labels
 }
 
-// Pick the richest `<playlist name="feature">` element (ties to first) —
-// Fox presses one per regional variant. Returning ONE avoids merging two
-// STN tables. See docs/fox.md for full rationale.
+// A feature runs at least this long (`durs` is seconds — durs=7628 is a 2h7m
+// feature). A stated sub-minute `name="feature"` is a decoy and is never
+// selected; the guard is inert when no `durs` is present. Mirrors paramount.
+const MIN_FEATURE_SECS: u64 = 60;
+
+// The `durs` (seconds) of a `<playlist>` element, digits only, when stated.
+fn playlist_duration_secs(element: &str) -> Option<u64> {
+    let v = xml::attr(element, "durs")?;
+    let digits: String = v.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().ok().filter(|&d| d > 0)
+}
+
+// Pick the richest `<playlist name="feature">` (most nested streams; a `durs`
+// tiebreak breaks a count tie by longest time; first feature wins a full tie; a
+// stated sub-minute feature is skipped). See docs/fox.md for full rationale.
 fn select_feature_playlist(text: &str) -> Option<&str> {
-    let mut best: Option<&str> = None;
-    let mut best_streams = 0usize;
+    // rank = (nested stream count, durs seconds). None durs sorts as 0 so it
+    // never displaces a stream-count-equal sibling that states a longer time.
+    let mut best: Option<(&str, (usize, u64))> = None;
     let mut from = 0;
     while let Some((s, e)) = xml::find_element(text, "playlist", from) {
         let element = &text[s..e];
@@ -173,16 +186,21 @@ fn select_feature_playlist(text: &str) -> Option<&str> {
         if !is_feature {
             continue;
         }
+        let dur = playlist_duration_secs(element);
+        // A stated sub-minute feature is a decoy — never the real feature.
+        if dur.is_some_and(|d| d < MIN_FEATURE_SECS) {
+            continue;
+        }
         let streams = count_elements(element, "audio") + count_elements(element, "subtitle");
-        // First feature wins the tie (matches the registry's first-wins rule);
-        // a strictly richer table displaces it. `best.is_none()` so a feature
-        // with zero nested streams is still selected — its id feeds the hint.
-        if best.is_none() || streams > best_streams {
-            best_streams = streams;
-            best = Some(element);
+        let rank = (streams, dur.unwrap_or(0));
+        // Strictly-better rank displaces; a full tie keeps the first feature.
+        // `best.is_none()` so a feature with zero nested streams is still
+        // selected — its id feeds the hint.
+        if best.is_none_or(|(_, br)| rank > br) {
+            best = Some((element, rank));
         }
     }
-    best
+    best.map(|(el, _)| el)
 }
 
 /// The authoring id (digits only, e.g. "00800") of the selected feature
@@ -483,6 +501,41 @@ mod tests {
             "no <playlist name=\"feature\"> → nothing to label"
         );
         assert_eq!(feature_playlist_id(menus_only), None);
+    }
+
+    /// On an equal nested-stream count, the longer `durs` (seconds) wins the
+    /// tiebreak rather than document order.
+    #[test]
+    fn feature_duration_breaks_a_stream_count_tie() {
+        let doc = r#"<dcx><disc>
+            <playlist id="00800" lang="eng" name="feature" durs="6000">
+                <audio id="01" lang="eng" type="feature"/>
+                <subtitle id="01" lang="eng" type="feature"/>
+            </playlist>
+            <playlist id="00900" lang="eng" name="feature" durs="8000">
+                <audio id="01" lang="eng" type="feature"/>
+                <subtitle id="01" lang="eng" type="feature"/>
+            </playlist>
+        </disc></dcx>"#;
+        assert_eq!(feature_playlist_id(doc), Some("00900".to_string()));
+    }
+
+    /// A stated sub-minute `name="feature"` is a decoy and is skipped in favour
+    /// of the real (longer) feature.
+    #[test]
+    fn sub_minute_feature_is_skipped() {
+        let doc = r#"<dcx><disc>
+            <playlist id="00050" lang="eng" name="feature" durs="4">
+                <audio id="01" lang="eng" type="feature"/>
+                <audio id="02" lang="fra" type="feature"/>
+                <subtitle id="01" lang="eng" type="feature"/>
+            </playlist>
+            <playlist id="00800" lang="eng" name="feature" durs="7628">
+                <audio id="01" lang="eng" type="feature"/>
+            </playlist>
+        </disc></dcx>"#;
+        // 00050 has more nested streams but is sub-minute → rejected; 00800 wins.
+        assert_eq!(feature_playlist_id(doc), Some("00800".to_string()));
     }
 
     /// A feature playlist with no nested streams (an authoring edge) produces

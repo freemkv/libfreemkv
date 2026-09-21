@@ -18,6 +18,11 @@ use zip::ZipArchive;
 // pre-sizing. See docs/jar.md — MAX_CLASS_BYTES rationale.
 const MAX_CLASS_BYTES: u64 = 64 * 1024 * 1024;
 
+// Cap on bytes read from one non-`.class` resource entry (the dcx.xml /
+// playlists.xml / *.properties manifests the Tier-1 sweep reads). Same
+// attacker-controlled-size defence as MAX_CLASS_BYTES — see docs/jar.md.
+const MAX_RESOURCE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// In-memory zip archive: backed by a `Vec<u8>` read from UDF. Owns
 /// the buffer; callers pass it to [`has_path_prefix`], [`for_each_class`],
 /// etc.
@@ -113,6 +118,44 @@ where
             continue;
         };
         if let Some(r) = f(&name, &class) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Iterate every NON-`.class` entry in the jar, read its bytes (bounded by
+/// [`MAX_RESOURCE_BYTES`]), and call `f` with `(entry_name, &bytes)`. Returns
+/// the first `Some(R)` the callback produces, or `None` when every resource was
+/// visited without a hit.
+///
+/// This is the Tier-1 menu-walk sweep: newer discs embed the same
+/// `dcx.xml`/`playlists.xml` manifests INSIDE a jar rather than as loose
+/// `/BDMV/JAR/<id>/` files. Directory entries and `.class` files are skipped;
+/// unreadable entries are silently ignored (robustness over completeness).
+pub fn try_each_resource<R, F>(archive: &mut Jar, mut f: F) -> Option<R>
+where
+    F: FnMut(&str, &[u8]) -> Option<R>,
+{
+    for i in 0..archive.len() {
+        let Ok(entry) = archive.by_index(i) else {
+            continue;
+        };
+        let name = entry.name().to_string();
+        if name.ends_with('/') || name.to_ascii_lowercase().ends_with(".class") {
+            continue;
+        }
+        // Declared uncompressed size is attacker-controlled — grow the buffer
+        // incrementally and cap the read rather than pre-sizing from it.
+        let mut bytes = Vec::new();
+        if entry
+            .take(MAX_RESOURCE_BYTES)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            continue;
+        }
+        if let Some(r) = f(&name, &bytes) {
             return Some(r);
         }
     }
@@ -291,5 +334,37 @@ mod tests {
         let mut visited = 0usize;
         for_each_class(&mut jar, |_, _| visited += 1);
         assert_eq!(visited, 1);
+    }
+
+    #[test]
+    fn try_each_resource_reads_non_class_entries_and_skips_classes() {
+        let xml = b"<dcx><disc/></dcx>";
+        // A .class entry must be skipped; the .xml resource must be surfaced.
+        let mut jar = {
+            use std::io::{Cursor, Write as _};
+            let mut buf = Vec::new();
+            {
+                let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+                let opts = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                w.start_file("com/x/Menu.class", opts).unwrap();
+                w.write_all(MINIMAL_CLASS).unwrap();
+                w.start_file("00000/dcx.xml", opts).unwrap();
+                w.write_all(xml).unwrap();
+                w.finish().unwrap();
+            }
+            ZipArchive::new(Cursor::new(buf)).expect("valid zip")
+        };
+
+        let mut seen: Vec<String> = Vec::new();
+        let found: Option<Vec<u8>> = try_each_resource(&mut jar, |name, bytes| {
+            seen.push(name.to_string());
+            name.ends_with("dcx.xml").then(|| bytes.to_vec())
+        });
+        assert_eq!(found.as_deref(), Some(&xml[..]));
+        assert!(
+            !seen.iter().any(|n| n.ends_with(".class")),
+            "a .class entry must never be offered as a resource"
+        );
     }
 }

@@ -8,6 +8,7 @@
 //!      (set [`ParseResult::confidence`] to drive tie-breaking)
 //!   4. Add `mod myformat;` below and one line to `PARSERS` array
 
+mod bdj_feature;
 mod bdmt;
 pub(crate) mod class_reader;
 pub mod clpi_audit;
@@ -252,13 +253,35 @@ pub fn apply(
     udf: &UdfFs,
     titles: &mut [DiscTitle],
 ) -> Option<FeaturePlaylistHint> {
-    let (labels, feature_playlist) =
+    let (labels, winner_hint) =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract(reader, udf)))
             .unwrap_or_default();
     if !labels.is_empty() {
         apply_labels(&labels, titles);
     }
-    feature_playlist.filter(|h| !h.is_empty())
+    // The feature hint rides its own pass, independent of whether any parser
+    // produced labels (like bdmt): a jar-only disc still yields a hint. Wrapped
+    // separately so a menu-walk fault can't lose an already-extracted hint.
+    let hint = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        resolve_feature_hint(reader, udf, winner_hint)
+    }))
+    .ok()
+    .flatten();
+    hint.filter(|h| !h.is_empty())
+}
+
+// The disc's feature-playlist hint: the winning parser's manifest hint when it
+// carries one, else the generic BD-J menu-walk (`bdj_feature::resolve`). Kept
+// separate from extraction so a hint survives an empty/absent label set.
+fn resolve_feature_hint(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    winner_hint: Option<FeaturePlaylistHint>,
+) -> Option<FeaturePlaylistHint> {
+    if let Some(hint) = winner_hint.filter(|h| !h.is_empty()) {
+        return Some(hint);
+    }
+    bdj_feature::resolve(reader, udf)
 }
 
 // Min streams of one type before a language sequence anchors the label
@@ -3374,5 +3397,79 @@ mod clpi_orphan_tests {
         let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
         assert_eq!(added, 0);
         assert_eq!(labels.len(), 1);
+    }
+}
+
+// ── apply(): independent feature-hint pass (issue #45 menu-walk) ─────────────
+
+#[cfg(test)]
+mod feature_hint_pass_tests {
+    use super::*;
+    use crate::udf::fixture::*;
+    use std::io::{Cursor, Write as _};
+
+    // Zip entries into an in-memory jar (Stored, no compression).
+    fn build_jar(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, data) in entries {
+                w.start_file(*name, opts).unwrap();
+                w.write_all(data).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    /// A jar-only disc — no loose manifest, no vendor labels, no parser matches —
+    /// still yields a feature hint, because the menu-walk hint pass runs
+    /// independently of `labels.is_empty()`. This is the whole point of routing
+    /// the hint through `resolve_feature_hint` rather than dropping it with the
+    /// (empty) label set. The embedded `playlists.xml` names the feature 00800.
+    #[test]
+    fn apply_returns_hint_for_a_jar_only_disc_with_no_labels() {
+        let xml = br#"<playlists>
+            <playlist name="Feature" id="00800" aud="eng,fra,spa" duration="7000" />
+            <playlist name="Preview" id="00050" aud="eng" duration="90" />
+        </playlists>"#;
+        let jar = build_jar(&[
+            ("com/studio/Menu.class", Vec::new()), // an entry, not a parseable class
+            ("00000/playlists.xml", xml.to_vec()),
+        ]);
+        let jar_dir = DirSpec {
+            name: "JAR".to_string(),
+            icb_lba: 30,
+            dir_data_lba: 31,
+            files: vec![file_with("00000.jar", 32, 4000, jar, true)],
+            subdirs: vec![],
+        };
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![jar_dir],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        // No titles to label; the hint pass must still fire.
+        let mut titles: Vec<DiscTitle> = Vec::new();
+        let hint =
+            apply(&mut disc, &udf, &mut titles).expect("a jar-only disc still yields a hint");
+        assert_eq!(hint.playlist_id, Some(800));
+        assert_eq!(hint.filename.as_deref(), Some("00800.mpls"));
     }
 }
