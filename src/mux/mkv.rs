@@ -546,6 +546,14 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// non-monotonic. Keying the exemption on track type (not index) keeps that
     /// EL's true PTS instead of clobbering it to prev+1ms.
     track_is_video: Vec<bool>,
+    /// Per-track-index flag: true if the track is a subtitle track
+    /// (`track_type == 17`). A subtitle block must NEVER be written as a bare
+    /// `SimpleBlock`: subtitle tracks carry no `DefaultDuration`, so without a
+    /// `BlockDuration` a demuxer has nothing to bound the cue and ffmpeg reports
+    /// "Timestamps are unset in a packet for stream N" (issue #52). Keyed on
+    /// track type (mirroring `track_is_video`) so the invariant holds for every
+    /// subtitle track — including a sparse forced-narrative second track.
+    track_is_subtitle: Vec<bool>,
     /// Index of the PRIMARY video track — the first track whose type is video.
     /// This (not the literal index 0) is the clip-boundary epoch driver: the
     /// M2TS/PMT path orders streams by PMT declaration order and may list an
@@ -697,6 +705,11 @@ struct InterlacedRewrite {
 // ns) avoids collisions the classic 1 ms scale causes for B-frame-reordered
 // video and TrueHD's 0.833 ms AUs. See docs/mkv-mux.md — TimestampScale choice.
 const TIMESTAMP_SCALE_NS: i64 = 100_000;
+
+// Last-resort BlockDuration (1 s) for a SUBTITLE frame that reaches the muxer with
+// no duration. Parsers (PGS) already synthesize one; this only fires if another
+// subtitle path forgets, keeping every subtitle block durated (issue #52).
+const MIN_SUBTITLE_BLOCK_DURATION_NS: i64 = 1_000_000_000;
 
 // Nominal new-cluster interval (2 s) in TimestampScale ticks; a keyframe
 // only opens a new cluster once this much has elapsed. See docs/mkv-mux.md
@@ -1128,6 +1141,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 .iter()
                 .map(|t| t.track_type == ebml::TRACK_TYPE_VIDEO)
                 .collect(),
+            track_is_subtitle: tracks
+                .iter()
+                .map(|t| t.track_type == ebml::TRACK_TYPE_SUBTITLE)
+                .collect(),
             primary_video_track: tracks
                 .iter()
                 .position(|t| t.track_type == ebml::TRACK_TYPE_VIDEO),
@@ -1350,6 +1367,21 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let relative_ts = (pts_ticks - self.cluster_ts_ticks) as i16;
         let duration_ticks =
             duration_ns.map(|dur_ns| (dur_ns as i64 / TIMESTAMP_SCALE_NS).max(1) as u64);
+        // Defense in depth (issue #52): a SUBTITLE block must never be a bare
+        // SimpleBlock (no DefaultDuration => unbounded cue, ffmpeg "Timestamps are
+        // unset"). Substitute a minimum fallback so it takes the BlockGroup arm.
+        let is_subtitle = self
+            .track_is_subtitle
+            .get(track_idx)
+            .copied()
+            .unwrap_or(false);
+        let duration_ticks = match duration_ticks {
+            Some(dt) => Some(dt),
+            None if is_subtitle => {
+                Some((MIN_SUBTITLE_BLOCK_DURATION_NS / TIMESTAMP_SCALE_NS).max(1) as u64)
+            }
+            None => None,
+        };
         // A BlockAdditional with BlockAddID=2 conforms only when the track declared
         // the matching mvcC mapping; if not (dependent-view params never captured
         // before the header was written), drop it and emit a plain block instead.
@@ -4788,6 +4820,133 @@ mod tests {
             dur_ticks, 1,
             "sub-tick duration must floor to 1 tick, not 0"
         );
+    }
+
+    // ── issue #52: every subtitle block carries a BlockDuration ──────────────
+
+    fn make_subtitle_track() -> MkvTrack {
+        MkvTrack {
+            track_type: ebml::TRACK_TYPE_SUBTITLE,
+            codec_id: ebml::CODEC_PGS,
+            language: "eng".into(),
+            name: String::new(),
+            codec_private: None,
+            is_default: false,
+            is_forced: false,
+            pixel_width: 0,
+            pixel_height: 0,
+            default_duration_ns: 0,
+            display_width: 0,
+            display_height: 0,
+            colour_matrix: 0,
+            colour_transfer: 0,
+            colour_primaries: 0,
+            colour_range: 0,
+            interlaced: false,
+            field_order: ebml::FIELD_ORDER_UNDETERMINED,
+            field_duration_ns: 0,
+            sample_rate: 0.0,
+            channels: 0,
+            bit_depth: 0,
+            dv_config: None,
+            hdr10: None,
+            mvc_params: None,
+        }
+    }
+
+    /// Matroska TrackNumbers (1-based) of every SimpleBlock in the output, in
+    /// emission order. The subtitle invariant is that NONE of these is a
+    /// subtitle track.
+    fn all_simple_block_tracks(data: &[u8]) -> Vec<u64> {
+        let mut out = Vec::new();
+        for (body_start, body_size, _ts) in find_clusters(data) {
+            let body = &data[body_start..body_start + body_size as usize];
+            let mut cursor = Cursor::new(body);
+            let (tid, tsize, _) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(tid, ebml::CLUSTER_TIMESTAMP);
+            cursor.seek(io::SeekFrom::Current(tsize as i64)).unwrap();
+            while (cursor.position() as usize) < body.len() {
+                let Ok((id, size, _)) = ebml::read_element_header(&mut cursor) else {
+                    break;
+                };
+                let start = cursor.position() as usize;
+                if start + size as usize > body.len() {
+                    break;
+                }
+                if id == ebml::SIMPLE_BLOCK {
+                    let blk = &body[start..start + size as usize];
+                    let track = if blk[0] & 0x80 != 0 {
+                        (blk[0] & 0x7F) as u64
+                    } else {
+                        (((blk[0] & 0x3F) as u64) << 8) | blk[1] as u64
+                    };
+                    out.push(track);
+                }
+                cursor.seek(io::SeekFrom::Current(size as i64)).unwrap();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn subtitle_frame_with_no_duration_becomes_block_group_with_block_duration() {
+        // issue #52: a SUBTITLE frame with duration=None must never be a bare
+        // SimpleBlock (no DefaultDuration => unbounded cue). The muxer substitutes a
+        // minimum fallback and emits a BlockGroup WITH a BlockDuration.
+        let tracks = [make_subtitle_track()];
+        let data = mux_with_durations(&tracks, &[(0, 0, true, vec![0x16, 0xAA], None)]);
+
+        let groups = all_block_groups(&data);
+        assert_eq!(
+            groups.len(),
+            1,
+            "the subtitle frame must be a BlockGroup, not a SimpleBlock"
+        );
+        assert!(
+            groups[0].duration > 0,
+            "the BlockGroup must carry a BlockDuration (got {})",
+            groups[0].duration
+        );
+        assert!(
+            all_simple_block_tracks(&data).is_empty(),
+            "no subtitle frame may be emitted as a bare SimpleBlock"
+        );
+    }
+
+    #[test]
+    fn every_block_on_both_subtitle_tracks_has_a_block_duration() {
+        // Models a Blu-ray's two PGS tracks: a DENSE dialogue track and a SPARSE
+        // forced-narrative one. EVERY block on BOTH must be a BlockGroup carrying a
+        // BlockDuration, even those handed in with duration=None.
+        let tracks = [make_subtitle_track(), make_subtitle_track()];
+        let frames: Vec<DurFrame> = vec![
+            // Track 0 (dense): opens the cluster, then two more, mixing a real
+            // duration with two None durations.
+            (0, 0, true, vec![0x16, 0x01], Some(2_000_000_000)),
+            (0, 1_000_000_000, true, vec![0x16, 0x02], None),
+            (0, 2_000_000_000, true, vec![0x16, 0x03], None),
+            // Track 1 (sparse): a single forced cue, handed in with no duration.
+            (1, 500_000_000, true, vec![0x16, 0xFF], None),
+        ];
+        let data = mux_with_durations(&tracks, &frames);
+
+        assert!(
+            all_simple_block_tracks(&data).is_empty(),
+            "no subtitle frame on EITHER track may be a bare SimpleBlock"
+        );
+        let groups = all_block_groups(&data);
+        assert_eq!(groups.len(), 4, "all four subtitle frames are BlockGroups");
+        for g in &groups {
+            assert!(
+                g.duration > 0,
+                "every subtitle block must carry a BlockDuration (track {}, dur {})",
+                g.track,
+                g.duration
+            );
+        }
+        // Both subtitle tracks (Matroska TrackNumbers 1 and 2) are represented.
+        assert!(groups.iter().any(|g| g.track == 1), "dense track present");
+        assert!(groups.iter().any(|g| g.track == 2), "sparse track present");
     }
 
     // Cluster boundary (CLUSTER_DURATION_TICKS): a new cluster opens on a video

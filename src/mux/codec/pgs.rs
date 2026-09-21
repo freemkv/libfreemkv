@@ -16,6 +16,14 @@ const SEGMENT_PCS: u8 = 0x16;
 // Caps a malformed stream that appends non-PCS segments forever without a PCS,
 // dropping further appends until the next PCS resyncs — mirrors DTS/AC-3 caps.
 const MAX_PGS_PENDING_BYTES: usize = 4 * 1024 * 1024;
+// Fallback on-screen dwell (5 s) for a display set whose real end is unknown (EOS
+// trailing set, no-PTS/truncated arms): a None duration on a DefaultDuration-less
+// subtitle track leaves ffmpeg "Timestamps are unset in a packet" (issue #52).
+const DEFAULT_PGS_DURATION_NS: u64 = 5_000_000_000;
+// Cap on a COMPUTED span (clear_pts - display_pts): a missing intermediate PCS can
+// inflate one set to minutes. Past this the value is untrusted and the fallback
+// dwell is used instead; set well above any real dwell so long cues aren't clipped.
+const MAX_PGS_DURATION_NS: u64 = 30_000_000_000;
 // Offset of number_of_composition_objects in a PCS: 3-byte segment header +
 // 10 bytes of PCS fields (video_w/h, frame_rate, comp_num, comp_state,
 // palette_update, palette_id_ref) = 13.
@@ -209,7 +217,15 @@ impl PgsParser {
     fn emit_pending(&mut self, end_pts_ns: i64) -> Option<Frame> {
         let (facts, data) = self.pending.take()?;
         let start_pts = facts.presentation_ns().unwrap_or(0);
-        let duration = end_pts_ns.saturating_sub(start_pts).max(0) as u64;
+        let computed = end_pts_ns.saturating_sub(start_pts).max(0) as u64;
+        // Trust the real computed span, but clamp a pathologically large one (a
+        // missing intermediate PCS makes one set look like it lingered for
+        // minutes) back to the fallback dwell rather than emit an absurd cue.
+        let duration = if computed > MAX_PGS_DURATION_NS {
+            DEFAULT_PGS_DURATION_NS
+        } else {
+            computed
+        };
         Some(Frame {
             discontinuity: false,
             coding: None,
@@ -249,7 +265,7 @@ impl CodecParser for PgsParser {
                         pts_ns: facts.presentation_ns().unwrap_or(0),
                         keyframe: true,
                         data,
-                        duration_ns: None,
+                        duration_ns: Some(DEFAULT_PGS_DURATION_NS),
                     }]
                 })
                 .unwrap_or_default();
@@ -276,7 +292,7 @@ impl CodecParser for PgsParser {
                         pts_ns: facts.presentation_ns().unwrap_or(0),
                         keyframe: true,
                         data,
-                        duration_ns: None,
+                        duration_ns: Some(DEFAULT_PGS_DURATION_NS),
                     }),
                 };
                 out.extend(frame);
@@ -307,7 +323,7 @@ impl CodecParser for PgsParser {
                         pts_ns: facts.presentation_ns().unwrap_or(0),
                         keyframe: true,
                         data,
-                        duration_ns: None,
+                        duration_ns: Some(DEFAULT_PGS_DURATION_NS),
                     }));
                 }
             },
@@ -336,7 +352,7 @@ impl CodecParser for PgsParser {
                         pts_ns: pts.unwrap_or(0),
                         keyframe: true,
                         data: pes.data.clone(),
-                        duration_ns: None,
+                        duration_ns: Some(DEFAULT_PGS_DURATION_NS),
                     });
                 }
                 // No pending set AND no PTS: drop it. Emitting at pts_ns=0 would
@@ -360,7 +376,7 @@ impl CodecParser for PgsParser {
                 pts_ns: facts.presentation_ns().unwrap_or(0),
                 keyframe: true,
                 data,
-                duration_ns: None,
+                duration_ns: Some(DEFAULT_PGS_DURATION_NS),
             }],
             None => Vec::new(),
         }
@@ -548,8 +564,10 @@ mod tests {
         assert_eq!(frames.len(), 1, "final pending subtitle must flush");
         assert_eq!(frames[0].pts_ns, 1_000_000_000);
         assert_eq!(frames[0].data, display);
-        // Trailing block lingers to EOF — no duration per module doc.
-        assert_eq!(frames[0].duration_ns, None);
+        // Trailing block has no follower PCS, so its real end is unknown; it now
+        // carries the synthesized fallback dwell (was `None`) so every subtitle
+        // block gets a BlockDuration (issue #52).
+        assert_eq!(frames[0].duration_ns, Some(DEFAULT_PGS_DURATION_NS));
     }
 
     #[test]
@@ -575,16 +593,20 @@ mod tests {
     }
 
     #[test]
-    fn clear_pcs_without_pts_emits_pending_undurated() {
-        // A clear PCS that lacks a PTS can't compute a duration; the pending
-        // display is still emitted, but with no duration (lingers to EOF)
-        // instead of a bogus absurd one.
+    fn clear_pcs_without_pts_emits_fallback_duration() {
+        // A clear PCS that lacks a PTS can't compute a real duration; the pending
+        // display is still emitted, now with the synthesized fallback dwell (was
+        // `None`) so the subtitle block carries a BlockDuration (issue #52).
         let mut parser = PgsParser::new();
         let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
         let f = parser.parse(&make_pes(pcs_bytes(0), None));
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].pts_ns, 1_000_000_000, "pending keeps its real start");
-        assert_eq!(f[0].duration_ns, None, "no duration without a clear PTS");
+        assert_eq!(
+            f[0].duration_ns,
+            Some(DEFAULT_PGS_DURATION_NS),
+            "fallback duration when the clear PCS carries no PTS"
+        );
     }
 
     #[test]
@@ -605,7 +627,11 @@ mod tests {
         let frames = parser.parse(&make_pes(truncated, Some(180000)));
         assert_eq!(frames.len(), 1, "pending display flushed on truncated PCS");
         assert_eq!(frames[0].data, display, "pending bitmap not polluted");
-        assert_eq!(frames[0].duration_ns, None, "flushed undurated");
+        assert_eq!(
+            frames[0].duration_ns,
+            Some(DEFAULT_PGS_DURATION_NS),
+            "flushed with fallback duration (issue #52)"
+        );
         assert!(parser.pending.is_none(), "parser resynced");
     }
 
@@ -695,6 +721,37 @@ mod tests {
         assert_eq!(f[0].duration_ns, Some(0));
     }
 
+    #[test]
+    fn pathologically_large_computed_duration_clamps_to_fallback() {
+        // A missing intermediate clear PCS makes a set appear to linger until a much
+        // later one; a computed span past MAX_PGS_DURATION_NS is untrusted and falls
+        // back to the dwell instead of an absurd multi-minute cue (90000 ticks = 1s).
+        let display_pts = 90_000_i64; // 1 s
+        // 40 s later in 90 kHz ticks (> 30 s cap).
+        let clear_pts = display_pts + 40 * 90_000;
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(display_pts)));
+        let f = parser.parse(&make_pes(pcs_bytes(0), Some(clear_pts)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].duration_ns,
+            Some(DEFAULT_PGS_DURATION_NS),
+            "a >30s computed span is clamped to the fallback dwell"
+        );
+    }
+
+    #[test]
+    fn legitimate_long_duration_is_not_clamped() {
+        // A real, in-range dwell (10 s, well under the 30 s cap) is preserved
+        // exactly — the clamp must never clip a legitimately long subtitle.
+        let display_pts = 90_000_i64; // 1 s
+        let clear_pts = display_pts + 10 * 90_000; // +10 s
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(display_pts)));
+        let f = parser.parse(&make_pes(pcs_bytes(0), Some(clear_pts)));
+        assert_eq!(f[0].duration_ns, Some(10_000_000_000));
+    }
+
     // --- clear / replace edge cases ---
 
     #[test]
@@ -722,11 +779,11 @@ mod tests {
         assert_eq!(f2.len(), 1);
         assert_eq!(f2[0].pts_ns, 2_000_000_000);
         assert_eq!(f2[0].duration_ns, Some(1_000_000_000));
-        // Third held; flush emits it undurated.
+        // Third held; flush emits it with the fallback dwell (no follower PCS).
         let tail = parser.flush();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].pts_ns, 3_000_000_000);
-        assert_eq!(tail[0].duration_ns, None);
+        assert_eq!(tail[0].duration_ns, Some(DEFAULT_PGS_DURATION_NS));
     }
 
     #[test]
@@ -740,7 +797,7 @@ mod tests {
         let exactly_13 = vec![SEGMENT_PCS; PCS_NUM_OBJECTS_OFFSET]; // 13 bytes
         let f = parser.parse(&make_pes(exactly_13, Some(180000)));
         assert_eq!(f.len(), 1, "13-byte PCS is truncated → flush pending");
-        assert_eq!(f[0].duration_ns, None);
+        assert_eq!(f[0].duration_ns, Some(DEFAULT_PGS_DURATION_NS));
         assert!(parser.pending.is_none());
     }
 
@@ -768,7 +825,9 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert!(f[0].keyframe);
         assert_eq!(f[0].pts_ns, 1_000_000_000);
-        assert_eq!(f[0].duration_ns, None);
+        // A pass-through segment has no known end; it now carries the fallback
+        // dwell (was `None`) so it too gets a BlockDuration (issue #52).
+        assert_eq!(f[0].duration_ns, Some(DEFAULT_PGS_DURATION_NS));
     }
 
     #[test]

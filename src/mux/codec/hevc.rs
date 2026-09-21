@@ -362,6 +362,11 @@ fn reassert_active(prefix: &mut Vec<u8>, cur: &Option<Vec<u8>>, emitted: bool) {
     push_length_prefixed(prefix, active);
 }
 
+// Width of the NAL length prefix this parser writes (4-byte BE, `u32::to_be_bytes`).
+// MUST equal hvcC `lengthSizeMinusOne + 1` (byte 21, low bits = 3 => 4); a mismatch
+// is the framing desync a demuxer reports as "Invalid NAL unit size".
+const LENGTH_PREFIX_SIZE: usize = 4;
+
 // Appends `nal` as a 4-byte BE length prefix + body. Skipped (not
 // mis-framed) if `nal.len()` overflows u32 — unreachable in practice.
 fn push_length_prefixed(out: &mut Vec<u8>, nal: &[u8]) {
@@ -370,6 +375,37 @@ fn push_length_prefixed(out: &mut Vec<u8>, nal: &[u8]) {
     };
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(nal);
+}
+
+/// Walk a length-prefixed NAL buffer ([u32-BE len][body] records) and confirm the
+/// records EXACTLY tile it: every declared length fits, none is zero, and the last
+/// body ends precisely at the buffer end with no trailing bytes. Our `frame_data`
+/// is length-prefixed by construction, so this is a self-consistency guard — a
+/// `false` means a framing desync that a downstream demuxer would report as
+/// "Invalid NAL unit size (N>M)", and such an access unit must be dropped rather
+/// than emitted. See docs/hevc.md — length-prefix self-check (issue #52).
+fn length_prefix_tiles(data: &[u8]) -> bool {
+    let mut pos = 0usize;
+    while pos < data.len() {
+        // The full length field must be present.
+        if pos + LENGTH_PREFIX_SIZE > data.len() {
+            return false;
+        }
+        let len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        // A zero-length record is a structurally invalid (empty) NALU.
+        if len == 0 {
+            return false;
+        }
+        pos += LENGTH_PREFIX_SIZE;
+        // The declared body must fit within the remaining buffer.
+        match pos.checked_add(len) {
+            Some(end) if end <= data.len() => pos = end,
+            _ => return false,
+        }
+    }
+    // Exact tiling: the walk must land precisely on the buffer end.
+    pos == data.len()
 }
 
 impl CodecParser for HevcParser {
@@ -561,6 +597,21 @@ impl CodecParser for HevcParser {
                     PARAM_REASSERT_REALLOCS.with(|c| c.set(c.get() + 1));
                 }
             }
+        }
+
+        // Defense in depth (issue #52): frame_data is length-prefixed by
+        // construction, but a desynced buffer would surface as "Invalid NAL unit
+        // size". Drop it (log src) rather than emit a mis-framed access unit.
+        if !length_prefix_tiles(&frame_data) {
+            tracing::warn!(
+                target: "freemkv::mux::hevc",
+                src = ?pes.source,
+                frame_len = frame_data.len(),
+                keyframe,
+                "HEVC length-prefix self-check failed; dropping desynced access unit \
+                 (would surface downstream as \"Invalid NAL unit size\")"
+            );
+            return Vec::new();
         }
 
         // HDR10 static metadata is stamped onto every frame's PictureInfo once
@@ -2686,6 +2737,93 @@ mod tests {
         assert_eq!(
             cp[21], 0x0F,
             "byte 21: numTemporalLayers=1, temporalIdNested=1, lengthSizeMinusOne=3"
+        );
+    }
+
+    // ── issue #52 (Fix A): length-prefix self-consistency ───────────────────
+
+    #[test]
+    fn hvcc_length_size_matches_push_length_prefixed_width() {
+        // Regression: hvcC byte-21 lengthSizeMinusOne+1 (low 2 bits) MUST equal the
+        // prefix width push_length_prefixed writes (LENGTH_PREFIX_SIZE); a divergence
+        // is the framing desync reported as "Invalid NAL unit size".
+        let sps = make_sps_with_chroma(1, 2, 2);
+        let cp = codec_private_from_sps(&sps);
+        let length_size_minus_one = (cp[21] & 0x03) as usize;
+        assert_eq!(
+            length_size_minus_one + 1,
+            LENGTH_PREFIX_SIZE,
+            "hvcC lengthSizeMinusOne+1 must equal the NAL length-prefix width"
+        );
+        assert_eq!(LENGTH_PREFIX_SIZE, 4, "HEVC length prefix is 4-byte BE");
+    }
+
+    #[test]
+    fn length_prefix_tiles_accepts_well_formed_records() {
+        // Two records: len 3 + len 2, back to back, tiling the buffer exactly.
+        let mut buf = Vec::new();
+        push_length_prefixed(&mut buf, &[0xAA, 0xBB, 0xCC]);
+        push_length_prefixed(&mut buf, &[0x11, 0x22]);
+        assert!(length_prefix_tiles(&buf));
+        assert!(length_prefix_tiles(&[]), "an empty buffer trivially tiles");
+    }
+
+    #[test]
+    fn length_prefix_tiles_rejects_a_desynced_frame() {
+        // A declared length that OVERRUNS the buffer — the shape that surfaces as
+        // "Invalid NAL unit size (N>M)". Declared 0x1000_0001 bytes, only a few
+        // present.
+        let overrun = [0x10, 0x00, 0x00, 0x01, 0xAA, 0xBB, 0xCC];
+        assert!(
+            !length_prefix_tiles(&overrun),
+            "a length that overruns the buffer must be rejected"
+        );
+        // Trailing garbage past the last complete record.
+        let mut trailing = Vec::new();
+        push_length_prefixed(&mut trailing, &[0xAA, 0xBB]);
+        trailing.push(0x99); // one stray byte, not a full length field
+        assert!(
+            !length_prefix_tiles(&trailing),
+            "trailing bytes that don't form a record must be rejected"
+        );
+        // A zero-length record (empty NALU) is structurally invalid.
+        let zero_len = [0x00, 0x00, 0x00, 0x00];
+        assert!(
+            !length_prefix_tiles(&zero_len),
+            "a zero-length record must be rejected"
+        );
+        // A truncated length prefix (fewer than 4 bytes at the tail).
+        assert!(
+            !length_prefix_tiles(&[0x00, 0x00]),
+            "a truncated length prefix must be rejected"
+        );
+    }
+
+    #[test]
+    fn parsed_annex_b_access_unit_tiles_exactly_and_is_emitted() {
+        // Positive path: a normal Annex-B AU (VPS + SPS + PPS + IDR slice) parses
+        // to a frame whose length-prefixed data tiles EXACTLY, so the guard emits
+        // it (never dropped).
+        let mut parser = HevcParser::new();
+        let sps = make_sps_with_chroma(1, 2, 2);
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(32)); // VPS
+        data.extend_from_slice(&[0xAA, 0xBB]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&sps); // SPS
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(34)); // PPS
+        data.extend_from_slice(&[0xDD, 0xEE]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(19)); // IDR_W_RADL slice → keyframe
+        data.extend_from_slice(&[0x10, 0x20, 0x30]);
+
+        let frames = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(frames.len(), 1, "the access unit is emitted, not dropped");
+        assert!(
+            length_prefix_tiles(&frames[0].data),
+            "an emitted HEVC frame's records must tile exactly"
         );
     }
 
