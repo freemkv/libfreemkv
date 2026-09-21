@@ -385,7 +385,7 @@ fn push_length_prefixed(out: &mut Vec<u8>, nal: &[u8]) {
     out.extend_from_slice(nal);
 }
 
-/// Walk a length-prefixed NAL buffer ([u32-BE len][body] records) and confirm the
+/// Walk a length-prefixed NAL buffer (`[u32-BE len][body]` records) and confirm the
 /// records EXACTLY tile it: every declared length fits, none is zero, and the last
 /// body ends precisely at the buffer end with no trailing bytes. Our `frame_data`
 /// is length-prefixed by construction, so this is a self-consistency guard — a
