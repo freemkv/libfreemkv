@@ -2208,8 +2208,14 @@ impl Disc {
     /// duration sort: a branching UHD's play-all can report an inflated
     /// duration/size exceeding the disc's physical capacity. These are the
     /// [`Self::canonical_title_order`] sort keys; see docs/disc-mod.md.
-    pub const CANONICAL_TITLE_ORDER_KEYS: &'static [&'static str] =
-        &["fits-disc", "largest-size", "longest", "richest-audio"];
+    pub const CANONICAL_TITLE_ORDER_KEYS: &'static [&'static str] = &[
+        "fits-disc",
+        "largest-size",
+        "longest",
+        "richest-audio",
+        "more-video",
+        "more-subs",
+    ];
 
     // Content-based forced-subtitle detection, restricted to `BdTs` titles —
     // gates on STREAM CONTAINER not disc-tree format (only BdTs carries
@@ -2251,6 +2257,15 @@ impl Disc {
             // (a full-audio main vs a stereo-only twin) — prefer lossless-multichannel.
             .then_with(|| b.duration_secs.total_cmp(&a.duration_secs))
             .then_with(|| Self::audio_richness(b).cmp(&Self::audio_richness(a)))
+            // Issue #45: before the lowest-id key, prefer the STREAM-RICHER sibling on
+            // the axes audio_richness misses (extra video = Dolby Vision EL; extra
+            // subtitle). True siblings match both and fall through to lowest-id.
+            .then_with(|| b.video_streams().count().cmp(&a.video_streams().count()))
+            .then_with(|| {
+                b.subtitle_streams()
+                    .count()
+                    .cmp(&a.subtitle_streams().count())
+            })
             // Final determinism (issue #45): among equal-size seamless siblings
             // (Alita 00800-00808, same body + different logo) pick the LOWEST
             // playlist_id. Inert where an earlier key separates the pair.
@@ -4520,6 +4535,65 @@ mod tests {
         assert_eq!(
             v[0].size_bytes, 57_000_000_000,
             "the largest real title is the main feature"
+        );
+    }
+
+    // Issue #45: equal size/duration/audio siblings differing only on video-count or
+    // subtitle-count must pick the stream-richer playlist (not lowest id); truly
+    // identical siblings still fall through to lowest-id determinism.
+    #[test]
+    fn canonical_title_order_prefers_stream_richer_sibling_issue_45() {
+        let cap = 100_000_000_000u64;
+        let base = |id: u16| DiscTitle {
+            playlist_id: id,
+            size_bytes: 57_000_000_000,
+            duration_secs: 8000.0,
+            ..title_with_video(Codec::Hevc, Resolution::R2160p)
+        };
+        // Higher-id sibling carries an extra VIDEO stream (a Dolby Vision EL).
+        let mut richer_v = base(801);
+        richer_v.streams.push(Stream::Video(VideoStream {
+            pid: 0x1015,
+            codec: Codec::Hevc,
+            resolution: Resolution::R1080p,
+            frame_rate: FrameRate::F23_976,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: true,
+            label: String::new(),
+            measured_cicp: None,
+        }));
+        let mut vv = [base(40), richer_v];
+        vv.sort_by(|a, b| Disc::canonical_title_order(a, b, cap));
+        assert_eq!(
+            vv[0].playlist_id, 801,
+            "the video-richer sibling (Dolby Vision EL) must win over the lowest id"
+        );
+
+        // Higher-id sibling carries an extra SUBTITLE track.
+        let mut richer_s = base(801);
+        richer_s.streams.push(Stream::Subtitle(SubtitleStream {
+            pid: 0x12a4,
+            codec: Codec::Pgs,
+            language: "eng".into(),
+            forced: false,
+            qualifier: LabelQualifier::None,
+            codec_data: None,
+        }));
+        let mut ss = [base(40), richer_s];
+        ss.sort_by(|a, b| Disc::canonical_title_order(a, b, cap));
+        assert_eq!(
+            ss[0].playlist_id, 801,
+            "the subtitle-richer sibling must win over the lowest id"
+        );
+
+        // Truly identical siblings → lowest-id determinism preserved.
+        let mut ii = [base(808), base(800)];
+        ii.sort_by(|a, b| Disc::canonical_title_order(a, b, cap));
+        assert_eq!(
+            ii[0].playlist_id, 800,
+            "identical seamless siblings still pick the lowest id"
         );
     }
 
