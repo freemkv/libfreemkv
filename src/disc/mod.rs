@@ -4573,6 +4573,60 @@ mod tests {
         }
     }
 
+    /// A BD title with `n_chapters` marks clustered in the first `span_secs` of a
+    /// `dur`-second runtime (first at 0, last at `span_secs`) — lets a test drive
+    /// the CHAPTER_SPAN_MIN_FRAC boundary independently of chapter count.
+    fn bd_title_chaptered_span(
+        playlist: &str,
+        id: u16,
+        dur: f64,
+        size: u64,
+        clip_ids: &[&str],
+        n_chapters: usize,
+        span_secs: f64,
+    ) -> DiscTitle {
+        let chapters = (0..n_chapters)
+            .map(|i| Chapter {
+                time_secs: if n_chapters <= 1 {
+                    0.0
+                } else {
+                    i as f64 * span_secs / (n_chapters - 1) as f64
+                },
+                name: (i + 1).to_string(),
+            })
+            .collect();
+        DiscTitle {
+            chapters,
+            ..bd_title(playlist, id, dur, size, clip_ids)
+        }
+    }
+
+    // Issue #45 boundary: marks that cluster in the first ~20% of runtime span
+    // < CHAPTER_SPAN_MIN_FRAC of duration, so they are NOT a complete feature.
+    #[test]
+    fn is_complete_feature_presentation_false_when_marks_cluster_early() {
+        // 5 marks over the first 20% (span 0.2 < 0.5 of duration).
+        let clustered =
+            bd_title_chaptered_span("00001.mpls", 1, 1000.0, 1_000_000, &["00001"], 5, 200.0);
+        assert!(
+            !is_complete_feature_presentation(&clustered),
+            "marks spanning < 0.5 of runtime are not a complete feature"
+        );
+    }
+
+    // Issue #45 boundary: marks spanning exactly CHAPTER_SPAN_MIN_FRAC of the
+    // runtime (with >= MIN_FEATURE_CHAPTERS marks) DO look like a real feature.
+    #[test]
+    fn is_complete_feature_presentation_true_at_span_threshold() {
+        // 2 marks (== MIN_FEATURE_CHAPTERS) spanning exactly 0.5 of duration.
+        let at_threshold =
+            bd_title_chaptered_span("00001.mpls", 1, 1000.0, 1_000_000, &["00001"], 2, 500.0);
+        assert!(
+            is_complete_feature_presentation(&at_threshold),
+            "marks spanning >= 0.5 of runtime with enough marks are a complete feature"
+        );
+    }
+
     /// Same, but with an empty STN stream list — models a title whose FIRST
     /// PlayItem is a non-video bumper (`has_video()` is false; `streams` reflect
     /// PlayItem 0 only).

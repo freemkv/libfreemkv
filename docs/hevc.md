@@ -111,6 +111,24 @@ streaming decode self-healing. Re-sending an identical param set is benign
 This strictly supersets the earlier change-only re-assert, so the
 param-set-revert fix is unaffected.
 
+## length-prefix self-check (issue #52)
+
+`length_prefix_tiles` walks the assembled `frame_data` ([u32-BE len][body]
+records) and confirms they EXACTLY tile it: every declared length fits, none is
+zero, and the last body ends precisely at the buffer end with no trailing
+bytes. `frame_data` is length-prefixed by construction (`push_length_prefixed`
+/ `handle_param_set` write a 4-byte BE prefix — `LENGTH_PREFIX_SIZE`, which MUST
+equal the hvcC `lengthSizeMinusOne + 1`), so a `false` means a framing desync a
+downstream demuxer would report as "Invalid NAL unit size (N>M)".
+
+`HevcParser::parse` runs this as defense in depth: if the self-check fails it
+logs `src` at WARN and DROPS the access unit (`return Vec::new()`) rather than
+emit a mis-framed frame. Because no real input can desync a
+built-by-construction buffer, the drop branch is exercised end-to-end via a
+test-only seam (`FORCE_FRAMING_DESYNC`) that appends a stray byte just before
+the guard; see `parse_drops_desynced_access_unit`. Disconnecting the guard from
+`parse` fails that test.
+
 ## `parse_mastering_display`
 
 Parses a Mastering Display Colour Volume SEI payload (Rec. ITU-T H.265

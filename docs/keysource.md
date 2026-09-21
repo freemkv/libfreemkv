@@ -99,6 +99,32 @@ on `disc_hash` and reads no samples; the online source submits the ctx's
 content samples (a base batch for `get_unit_keys`, an index-1 anchor batch
 for `get_fmts_indexes`) to the key service.
 
+## `resolve_unit_keys` — de-conflating "no entry" from "matched, no key"
+
+`get_unit_keys` returns a bare `Vec<UnitKey>`: an empty result cannot say
+WHETHER the source had no entry for this disc at all, or matched the disc and
+still derived nothing (the classic "matched but needs a VID this path can't
+supply"). `resolve_unit_keys` carries that distinction. It returns a
+`UnitKeyResolution`:
+
+* `keys: Vec<UnitKey>` — the terminal Unit Keys produced (empty = none).
+* `matched: bool` — the source matched this disc in its store (by hash / VID)
+  even if it then derived no key; `false` is a genuine miss.
+* `miss_path: Vec<KeyNode>` — when `matched` and `keys` is empty, the nodes
+  walked AFTER the implicit `MatchedDisc` node (e.g. `[NoVid]` or
+  `[NoDerivableKey]`); empty means the caller supplies a bare
+  `NoDerivableKey`. Ignored unless `matched` and `keys` is empty.
+* `matched_entry: Option<MatchedEntry>` — a booleans-and-lengths shape of the
+  matched entry (no key material) for the application to log.
+* `store_entries: Option<usize>` — per-disc entries loaded in this source's
+  store, so a true-miss verdict can name the store size.
+
+The trait's default is coarse: forward to `get_unit_keys` and report
+`matched = false`. A source that keys on a per-disc identity (a keydb)
+overrides it to set `matched` / `miss_path` / `matched_entry`, so the trace can
+render `matched disc > no VID > NO KEY` instead of a flat `no entry`. See
+docs/aacs-trace.md for the trace-node shapes.
+
 ## `resolve_and_apply_traced` — one-shot semantics and CPS-unit numbering
 
 One-shot per source: each source's `KeySource::get_unit_keys` is called
