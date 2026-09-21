@@ -1,32 +1,17 @@
 name: doc-links
 
-# Fails on broken intra-doc links in `///`/`//!` doc comments (e.g. a `[Type]`
-# link to a renamed/removed item). Catches doc drift that `cargo build` misses.
-#
-# libfreemkv path-deps ../freemkv-unlock on the branch tip, so — like ci.yml —
-# both repos are checked out into sibling subdirectories for the path dep to
-# resolve.
-
+# Thin caller → the canonical reusable doc-links gate in freemkv/.github.
+# libfreemkv path-deps freemkv-unlock, so the reusable checks it out as a sibling
+# (no [patch] needed — the layout resolves the path dep) and resolves the
+# toolchain from rust-version.
 on: [push, pull_request]
-
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   doc-links:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          path: libfreemkv
-      - uses: actions/checkout@v7
-        with:
-          repository: freemkv/freemkv-unlock
-          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
-          path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: libfreemkv
-      - name: cargo doc (deny broken intra-doc links)
-        working-directory: libfreemkv
-        env:
-          RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
-        run: cargo doc --no-deps --document-private-items --lib --bins
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
+    uses: freemkv/.github/.github/workflows/guard-doclinks.yml@v1
+    with:
+      self: libfreemkv
+      checkout: freemkv-unlock
