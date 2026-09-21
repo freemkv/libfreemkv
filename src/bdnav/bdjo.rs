@@ -6,11 +6,10 @@
 //! `classpath_extension`, and `initial_class` (the Xlet's fully-qualified class
 //! name). Everything else in the file is skipped by width.
 //!
-//! Layout mirrors libbluray's `bdjo_parse.c` (`_parse_header` +
-//! `_parse_terminal_info` + `_parse_app_cache_info` +
-//! `_parse_accessible_playlists` + `_parse_app_management_table`): the sections
-//! are laid out sequentially right after a fixed 48-byte header (8-byte
-//! magic+version, then a 40-byte section-address table that real players skip).
+//! Layout follows the published BD-J Object (BDJO) file format: a fixed 48-byte
+//! header (8-byte magic+version, then a 40-byte section-address table that real
+//! players skip), followed by the terminal-info, app-cache-info,
+//! accessible-playlists, and application-management-table sections in sequence.
 //!
 //! This is a DOCUMENTED BINARY FORMAT read as data, never executed. Every field
 //! is bounds-checked and any malformed input yields `None` — panic-free like
@@ -119,7 +118,7 @@ pub(crate) fn parse(data: &[u8]) -> Option<Vec<BdjoApp>> {
     Some(apps)
 }
 
-// Parse one Application() record (`_parse_bdjo_app` in libbluray).
+// Parse one Application() record from the Application Management Table.
 fn parse_app(r: &mut BitReader<'_>) -> Option<BdjoApp> {
     let control_code = r.read(8)? as u8;
     r.skip(4)?; // application_type
@@ -184,7 +183,7 @@ fn read_app_string(r: &mut BitReader<'_>) -> Option<String> {
 }
 
 // ── MSB-first bit reader ─────────────────────────────────────────────────────
-// Mirrors libbluray's BITSTREAM: bits are consumed most-significant-first.
+// BDJO integers are bit-packed and consumed most-significant-first.
 // Every read/skip is bounds-checked and returns `None` past the end.
 struct BitReader<'a> {
     data: &'a [u8],
