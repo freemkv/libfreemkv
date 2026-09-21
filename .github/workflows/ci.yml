@@ -2,44 +2,38 @@ name: CI
 
 on:
   push:
-    # dev -> qa -> main. `dev` is where work lands and is meant to be pushed
-    # to often: these are the FAST checks, so a mistake surfaces in minutes.
-    # `qa` is the release candidate — it runs these too, plus the expensive
-    # suite in qa.yml. `main` only ever moves at release time, to a tagged
-    # commit that was already green on qa.
+    # dev -> qa -> main. `dev` is where work lands and is pushed to often: these
+    # are the FAST checks. `qa` runs these plus the expensive suite in qa.yml.
+    # `main` only moves at release time, to a commit already green on qa.
     branches: [main, dev, qa]
   pull_request:
 
+# Rapid dev pushes supersede their own in-progress runs instead of stacking.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # ── Single source of truth for the MSRV ─────────────────────────────────────
-  #
-  # `rust-version` in Cargo.toml is the ONE place the MSRV is declared. This job
-  # reads it; every job that must build/test AT the MSRV consumes
-  # `needs.resolve-msrv.outputs.v` instead of a hardcoded pin, so the floor
-  # cannot drift out of sync across workflow files. The `test` job building
-  # green at this value IS the verification that the declared MSRV is real.
-  # clippy and the `consumers` job deliberately do NOT use it — they run on
-  # `stable` (lint debt is caught against current Rust; dependents float highest).
+  # Single source of truth for the MSRV: `rust-version` in Cargo.toml. Every job
+  # that builds AT the MSRV consumes needs.resolve-msrv.outputs.v so the floor
+  # cannot drift. clippy and `consumers` deliberately run on `stable`.
   resolve-msrv:
     runs-on: ubuntu-latest
     outputs:
       v: ${{ steps.msrv.outputs.v }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
       - id: msrv
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
 
-  # CI owns the changelog: main may never carry a released version without a
-  # CHANGELOG.md entry for it. The release orchestrator dates an existing
-  # `## [X.Y.Z]` heading — it does NOT invent one — so a version bump that
-  # forgot its changelog entry must fail here rather than ship a blank release.
-  # Hard-fails on main (and PRs targeting main); warns elsewhere so an
-  # in-progress dev/qa branch whose entry isn't written yet is not blocked.
+  # main may never carry a released version without a CHANGELOG.md entry. Hard-
+  # fails on main (and PRs to main); warns elsewhere so an in-progress branch
+  # whose entry isn't written yet is not blocked.
   changelog:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
       - name: Require a CHANGELOG entry for the crate version on main
         shell: bash
         run: |
@@ -56,34 +50,18 @@ jobs:
           fi
           echo "::warning::${msg} (allowed on ${GITHUB_REF_NAME:-unknown}; required before it can reach main)."
 
+  # fmt on the pinned MSRV; clippy on stable so new-lint debt is a blocking gate
+  # the pinned version would hide. --all-targets lints test code too.
   lint:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: libfreemkv
-      # libfreemkv path-deps ../freemkv-unlock on the BRANCH tip (release.sh
-      # swaps it to a git tag only inside the tagged commit, then restores the
-      # path dep). CI checks out one repo, so the branch tip has never been
-      # buildable here — every green run you have ever seen was a tag build,
-      # and Windows/Linux were first compiled at release time.
-      #
-      # Both repos go into subdirectories because actions/checkout refuses a
-      # `path:` outside $GITHUB_WORKSPACE, and `../freemkv-unlock` is outside.
-      # With this layout the path dep resolves exactly as it does locally.
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/freemkv-unlock
-          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
-          path: freemkv-unlock
-      # fmt runs on the pinned MSRV toolchain; clippy runs on stable. Third
-      # parties compile our source on their own toolchain and never run our
-      # clippy, so the lint toolchain need not match the MSRV — only build/test
-      # must (see the test/cross jobs). Linting on stable makes new-lint debt a
-      # BLOCKING gate the pinned version would otherwise hide. The MSRV pin is
-      # installed second so it stays the default toolchain (fmt uses it
-      # implicitly); clippy is invoked explicitly with `+stable`.
+          checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -96,13 +74,6 @@ jobs:
           workspaces: libfreemkv
       - run: cargo fmt --check
         working-directory: libfreemkv
-      # Cargo.lock is now committed (issue #15) and the `deny` job audits the
-      # resolved graph, but --locked is still omitted: CI's sibling path-patch
-      # layout resolves the freemkv crates as path packages, which --locked
-      # can't satisfy — the same reason the binary crates omit it in ci.yml.
-      # --all-targets so TEST code is linted too. Without it this crate — the
-      # reference implementation for the other seven — was the only one whose
-      # tests had never been linted at all, and it was hiding 74 findings.
       - run: cargo +stable clippy --all-targets -- -D warnings
         working-directory: libfreemkv
 
@@ -110,23 +81,12 @@ jobs:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: libfreemkv
-      # libfreemkv path-deps ../freemkv-unlock on the BRANCH tip (release.sh
-      # swaps it to a git tag only inside the tagged commit, then restores the
-      # path dep). CI checks out one repo, so the branch tip has never been
-      # buildable here — every green run you have ever seen was a tag build,
-      # and Windows/Linux were first compiled at release time.
-      #
-      # Both repos go into subdirectories because actions/checkout refuses a
-      # `path:` outside $GITHUB_WORKSPACE, and `../freemkv-unlock` is outside.
-      # With this layout the path dep resolves exactly as it does locally.
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/freemkv-unlock
-          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
-          path: freemkv-unlock
+          checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -136,35 +96,24 @@ jobs:
       - run: cargo test --tests
         working-directory: libfreemkv
 
-  # The memory orderings in `scsi::fd_handoff` — the fd hand-off between a
-  # recovery thread and `SgIoTransport::drop` — cannot be checked by `cargo
-  # test`: they compile to the same instructions on x86_64, so the WRONG ones
-  # pass every run. loom enumerates the executions the C++20 model permits and
-  # reports the leaked descriptor directly, which makes it the only regression
-  # coverage that part of the module has. If this job stops running, that
-  # coverage disappears silently behind a green build.
-  #
-  # Its own job rather than a step in `test` because `RUSTFLAGS` is part of the
-  # rust-cache key: folding it into `test` costs that job a full cache miss on
-  # every run. It takes the same sibling checkout as the jobs above even though
-  # `--no-default-features` drops freemkv-unlock from the BUILD — `--features`
-  # does not exempt an optional path dependency from manifest RESOLUTION, so
-  # without the sibling this job would fail the moment the branch tip carries
-  # the path-dep form of that dependency rather than a git tag.
+  # The memory orderings in `scsi::fd_handoff` compile to the same instructions
+  # on x86_64, so the WRONG ones pass every run; loom enumerates the executions
+  # the C++20 model permits and is the only regression coverage that code has.
+  # Its own job because RUSTFLAGS is part of the rust-cache key. Takes the sibling
+  # checkout even with --no-default-features: features don't exempt an optional
+  # path dep from manifest RESOLUTION.
   loom:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: --cfg loom
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: libfreemkv
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/freemkv-unlock
-          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
-          path: freemkv-unlock
+          checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -174,7 +123,7 @@ jobs:
           workspaces: libfreemkv
       - run: cargo test --lib --no-default-features --features scsi fd_handoff
         working-directory: libfreemkv
-      # `lint` runs clippy without `--cfg loom`, so this is the only place the
+      # `lint` runs clippy without --cfg loom, so this is the only place the
       # model code is linted at all.
       - run: cargo clippy --lib --no-default-features --features scsi --profile test -- -D warnings
         working-directory: libfreemkv
@@ -182,63 +131,32 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: libfreemkv
-      # libfreemkv path-deps ../freemkv-unlock on the BRANCH tip (release.sh
-      # swaps it to a git tag only inside the tagged commit, then restores the
-      # path dep). CI checks out one repo, so the branch tip has never been
-      # buildable here — every green run you have ever seen was a tag build,
-      # and Windows/Linux were first compiled at release time.
-      #
-      # Both repos go into subdirectories because actions/checkout refuses a
-      # `path:` outside $GITHUB_WORKSPACE, and `../freemkv-unlock` is outside.
-      # With this layout the path dep resolves exactly as it does locally.
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/freemkv-unlock
-          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
-          path: freemkv-unlock
+          checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans licenses sources
           manifest-path: libfreemkv/Cargo.toml
 
+  # dev is the FAST lane: the platform jobs run on qa/main only (qa.yml also
+  # covers macOS/Windows). `if` SKIPS (does not queue) so a never-scheduled job
+  # can't block the release gate.
   check-macos:
-    # dev is the FAST lane: this job still runs, but on the release-candidate
-    # branches rather than on every push to dev. Nothing is deleted and no
-    # platform stops being checked before a release -- qa.yml independently
-    # covers macOS and Windows, and the jobs unique to this file (the Intel
-    # macOS build, the Windows release build) run here on qa and main. A push
-    # to dev is meant to be cheap and frequent; waiting on three runner pools
-    # to agree is what a release candidate is for.
-    #
-    # `if` SKIPS the job (it does not queue). A queued job would be far worse
-    # than a slow one: release.sh's CI gate refuses while any run for the
-    # commit is still in progress, so a never-scheduled job blocks releases
-    # silently -- see the note on real-media in qa.yml.
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: libfreemkv
-      # libfreemkv path-deps ../freemkv-unlock on the BRANCH tip (release.sh
-      # swaps it to a git tag only inside the tagged commit, then restores the
-      # path dep). CI checks out one repo, so the branch tip has never been
-      # buildable here — every green run you have ever seen was a tag build,
-      # and Windows/Linux were first compiled at release time.
-      #
-      # Both repos go into subdirectories because actions/checkout refuses a
-      # `path:` outside $GITHUB_WORKSPACE, and `../freemkv-unlock` is outside.
-      # With this layout the path dep resolves exactly as it does locally.
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/freemkv-unlock
-          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
-          path: freemkv-unlock
+          checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -249,83 +167,40 @@ jobs:
         working-directory: libfreemkv
 
   check-windows:
-    # dev is the FAST lane: this job still runs, but on the release-candidate
-    # branches rather than on every push to dev. Nothing is deleted and no
-    # platform stops being checked before a release -- qa.yml independently
-    # covers macOS and Windows, and the jobs unique to this file (the Intel
-    # macOS build, the Windows release build) run here on qa and main. A push
-    # to dev is meant to be cheap and frequent; waiting on three runner pools
-    # to agree is what a release candidate is for.
-    #
-    # `if` SKIPS the job (it does not queue). A queued job would be far worse
-    # than a slow one: release.sh's CI gate refuses while any run for the
-    # commit is still in progress, so a never-scheduled job blocks releases
-    # silently -- see the note on real-media in qa.yml.
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: libfreemkv
-      # libfreemkv path-deps ../freemkv-unlock on the BRANCH tip (release.sh
-      # swaps it to a git tag only inside the tagged commit, then restores the
-      # path dep). CI checks out one repo, so the branch tip has never been
-      # buildable here — every green run you have ever seen was a tag build,
-      # and Windows/Linux were first compiled at release time.
-      #
-      # Both repos go into subdirectories because actions/checkout refuses a
-      # `path:` outside $GITHUB_WORKSPACE, and `../freemkv-unlock` is outside.
-      # With this layout the path dep resolves exactly as it does locally.
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/freemkv-unlock
-          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
-          path: freemkv-unlock
+          checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: libfreemkv
-      # Build the tests (not just `cargo check`): catches errors in test
-      # code and forces full codegen of the Windows-only SPTI transport
-      # (src/scsi/windows.rs), which never compiles on the Linux/macOS dev
-      # hosts. We don't `cargo test` here — the suite needs no drive but the
-      # extra build is the value; running tests is covered by the Linux job.
+      # Build the tests: forces full codegen of the Windows-only SPTI transport
+      # (src/scsi/windows.rs), which never compiles on Linux/macOS dev hosts.
       - run: cargo build --tests
         working-directory: libfreemkv
 
-  # ── Did this change break anything downstream? ──────────────────────────────
-  #
-  # Every job above proves libfreemkv builds. None proved its DEPENDENTS do,
-  # and that gap is real: an engine signature change broke autorip today and
-  # went unnoticed because consumer CI only fires on a push to that consumer.
-  # libfreemkv sits below all five of them, so a break here is worth strictly
-  # more than a break anywhere else in the project.
-  #
-  # `cargo check --all-targets` only — each dependent owns its own behaviour
-  # and has its own suite. The question here is just "does everything built on
-  # me still compile against this commit".
+  # Did this change break anything downstream? libfreemkv sits below all five
+  # dependents; a break here is worth strictly more than anywhere else. Runs
+  # their suites (not just check) — a behavioural change keeps signatures but
+  # fails a dependent's tests, which is the shape worth catching. This caught an
+  # engine fixture break the moment it landed, so it stays on the dev fast lane.
   consumers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with: { path: libfreemkv }
-      - uses: actions/checkout@v7
-        with: { repository: freemkv/freemkv-unlock, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-unlock }
-      - uses: actions/checkout@v7
-        with: { repository: freemkv/freemkv-keysources, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-keysources }
-      - uses: actions/checkout@v7
-        with: { repository: freemkv/freemkv-engine, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-engine }
-      - uses: actions/checkout@v7
-        with: { repository: freemkv/freemkv-i18n, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-i18n }
-      - uses: actions/checkout@v7
-        with: { repository: freemkv/freemkv, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv }
-      - uses: actions/checkout@v7
-        with: { repository: freemkv/autorip, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: autorip }
-      - uses: actions/checkout@v7
-        with: { repository: freemkv/bdemu, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: bdemu }
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+        with:
+          checkout: freemkv-unlock freemkv-keysources freemkv-engine freemkv-i18n freemkv autorip bdemu
       - name: Point every dependent at THIS libfreemkv commit
         shell: bash
         run: |
@@ -339,10 +214,9 @@ jobs:
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
           done
-      # The dependents span a higher MSRV than libfreemkv itself — the binaries
-      # (freemkv/autorip/bdemu) always track the highest supported Rust. Build
-      # them on `stable` so this job satisfies the highest dependent floor; the
-      # library's own lower MSRV (verified by the `test` job) cannot compile them.
+      # Dependents track the highest supported Rust — build on stable so this job
+      # satisfies the highest dependent floor (the library's own lower MSRV, which
+      # the `test` job verifies, cannot compile them).
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -352,10 +226,6 @@ jobs:
             freemkv
             autorip
             bdemu
-      # `cargo check` alone only proves the dependents still COMPILE against
-      # this commit. It cannot see a behavioural change — the library keeps its
-      # signatures and a dependent's tests start failing. That is the shape of
-      # every defect worth catching here, so run their suites too.
       - run: cargo test --tests
         working-directory: freemkv-keysources
       - run: cargo test --tests
@@ -367,29 +237,17 @@ jobs:
       - run: cargo test --tests
         working-directory: bdemu
 
-  # ── Coverage (non-required, additive) ───────────────────────────────────────
-  #
-  # Reports line coverage to Codecov. Deliberately NOT wired into any release
-  # gate: it is informational only (see codecov.yml) and no other job `needs:`
-  # it. Mirrors the `test` job's layout exactly — same MSRV toolchain (resolved
-  # from Cargo.toml), same dual checkout so `../freemkv-unlock` resolves, cache
-  # workspace and working-directory. cargo-llvm-cov comes as a prebuilt binary
-  # from taiki-e/install-action, so it is toolchain-independent.
-  #
-  # No `--locked`: like the fmt/clippy/test jobs above, the sibling path-patch
-  # layout resolves the freemkv crates as path packages, which --locked can't satisfy.
+  # Coverage: non-required, informational only (codecov.yml), no job needs: it.
   coverage:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: libfreemkv
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/freemkv-unlock
-          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
-          path: freemkv-unlock
+          checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
