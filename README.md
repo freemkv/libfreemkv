@@ -3,6 +3,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![CI](https://github.com/freemkv/libfreemkv/actions/workflows/ci.yml/badge.svg)](https://github.com/freemkv/libfreemkv/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/freemkv/libfreemkv/branch/dev/graph/badge.svg)](https://codecov.io/gh/freemkv/libfreemkv)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/freemkv/libfreemkv/badge)](https://scorecard.dev/viewer/?uri=github.com/freemkv/libfreemkv)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](#minimum-supported-rust-version)
 
 # libfreemkv
 
@@ -14,7 +16,7 @@ DVDs (CSS) decrypt out of the box. Blu-ray and UHD (AACS) require disc-specific 
 
 Multi-lingual by design — the library outputs structured data and numeric error codes, never English text. Build any UI or localization on top.
 
-**[Source & API](https://github.com/freemkv/libfreemkv)** · **[Technical Docs](docs/)**
+**[Source & API](https://github.com/freemkv/libfreemkv)** · **[Technical Docs](docs/)** · **[Changelog](CHANGELOG.md)**
 
 Part of the [freemkv](https://github.com/freemkv) project.
 
@@ -156,6 +158,29 @@ All errors are structured with numeric codes. No user-facing English text — ap
 ## Contributing
 
 Run `freemkv info disc:// --share` with the [freemkv CLI](https://github.com/freemkv/freemkv) to capture your drive's identity for contribution. Drive-unlock profiles are maintained in the [freemkv-unlock](https://github.com/freemkv/freemkv-unlock) repository.
+
+## What this is NOT
+
+To keep expectations honest:
+
+- **No bundled AACS or CSS keys.** No AACS key material is compiled into the
+  crate. Blu-ray/UHD unit keys are supplied by the consumer at runtime (e.g. via
+  [freemkv-keysources](https://github.com/freemkv/freemkv-keysources)'s
+  `keydb.cfg` lookup); libfreemkv never reads `keydb.cfg` or downloads keys.
+- **Not published to crates.io.** The crate is `publish = false`. It is consumed
+  by git tag or path only (see [Install](#install)) — there is no crates.io
+  version, docs.rs page, or download count.
+- **No independent security audit.** No external or third-party security audit
+  has been performed. [SECURITY.md](SECURITY.md) is an assurance case authored by
+  the project, not an attestation by an outside auditor.
+- **CSS is legacy, weak crypto.** DVD CSS is handled solely for format
+  interoperability with existing discs. It is a broken cipher by modern
+  standards and is not, and should not be treated as, a security mechanism.
+
+## Minimum Supported Rust Version
+
+The minimum supported Rust version (MSRV) is **1.88**, declared as
+`rust-version` in [`Cargo.toml`](Cargo.toml) and enforced in CI on every change.
 
 ## License
 
