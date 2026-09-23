@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.5] — UNRELEASED
+
+### Changed
+
+- Version aligned to 1.7.5 for the unified release. No functional changes to this crate; the release is driven by freemkv-unlock mirroring the freemkv-firmware 0.9.0 ABI (the drive's `Ake` and `Bus` levers retired into a single `Encryption` lever).
+
 ## [1.7.4] — 2026-09-21
 ### Fixed
 
