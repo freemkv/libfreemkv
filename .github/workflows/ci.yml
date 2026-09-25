@@ -214,6 +214,16 @@ jobs:
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
           done
+      # Since freemkv 1.7.6 the `freemkv` consumer's Linux target compiles a
+      # GTK4 + libadwaita desktop shell, so `cargo test` on it needs the
+      # pkg-config dev headers the `gtk4-sys`/`glib-sys` build.rs scripts
+      # probe. Kept local (not in the shared reusable) — only freemkv links
+      # against GTK; adding the deps to every consumer would tax the six
+      # that don't.
+      - name: Install GTK4 + libadwaita development headers (for freemkv)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev build-essential
       # Dependents track the highest supported Rust — build on stable so this job
       # satisfies the highest dependent floor (the library's own lower MSRV, which
       # the `test` job verifies, cannot compile them).
