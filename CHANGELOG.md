@@ -1,6 +1,12 @@
 # Changelog
 
-## [1.7.5] — UNRELEASED
+## [1.7.6] — UNRELEASED
+
+### Changed
+
+- Version aligned to 1.7.6 for the unified release. No functional changes to this crate; the release is driven by the freemkv 1.7.6 Linux desktop shell (GTK4 + libadwaita) and the rip-finished desktop notification (issue #56).
+
+## [1.7.5] — 2026-09-23
 
 ### Changed
 
