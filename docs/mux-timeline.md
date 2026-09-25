@@ -149,7 +149,7 @@ Which clip owns feed byte `b`, by BINARY SEARCH.
 
 `spans_trusted` guarantees the spans tile the feed contiguously in order, so
 this is a partition point rather than a scan. That matters: discs in the test
-hoard reach 900 clips, and this runs once per frame per track — a linear scan
+corpus reach 900 clips, and this runs once per frame per track — a linear scan
 would be ~900 comparisons on every one of millions of frames, which is real
 time spent for no reason.
 

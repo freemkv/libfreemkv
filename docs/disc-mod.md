@@ -249,7 +249,7 @@ sits above a bumper wrapper's near-1.0 size share and below a branch body's.
 
 **Known residual:** a wrapper that pads runtime only modestly AND withholds
 most of its bytes from the body clip is ambiguous by shape alone. The corpus
-title-selection gate is the backstop across the disc hoard, and
+title-selection gate is the backstop across the test corpus, and
 higher-precedence nav/authoring signals override the composite key.
 
 ## aligned_unit_keys_validate
