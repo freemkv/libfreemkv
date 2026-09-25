@@ -34,7 +34,11 @@ IOKit plugin chain failed" into the same.
 ## Drive enumeration and the media-presence probe
 
 `list_drives` uses the IOKit registry directly via `shim_list_drives` —
-no exclusive access, no SCSI commands, no unmounts.
+no exclusive access, no SCSI commands, no unmounts. It enumerates
+`IOBDServices` even when no `IOMedia` child exists. With media, the
+returned path remains `/dev/diskN`; with an empty tray it uses the opaque
+`ioreg:<registry-id>` selector so the service can still be opened directly.
+That selector is an internal list-then-open handle, not a filesystem path.
 
 `drive_has_disc` is documented (`crate::scsi::drive_has_disc`) as the
 cheap, side-effect-free "is there a disc?" question, suitable for a
@@ -50,10 +54,9 @@ dropping) exclusive access each time.
 
 Instead `drive_has_disc` answers via `shim_media_present`, the IOKit
 registry only: steps 1-5 above are the *transport* open path, and this
-probe must not run any of them. The registry answers the same question
-with no side effect at all: the IOStorageFamily publishes an IOMedia
-object for a removable device only while media is present and removes
-it on eject, so a matching IOMedia is exactly "a disc is in the drive".
+probe must not run any of them. For a BSD disk path, the registry looks
+for its matching `IOMedia`; for an `ioreg:<id>` selector, it resolves the
+drive service and checks whether that service currently has media.
 No SCSI command is issued, which is why no timeout parameter is
 involved.
 

@@ -114,13 +114,16 @@ reverted in 0.13.20 — see the note at the top of `linux.rs`.)
 
 The macOS backend uses a C shim (`macos_shim.c`) for IOKit exclusive access.
 The shim handles:
-1. `shim_open_exclusive(bsd_name)` — unmounts the target device via `diskutil`,
-   then walks the IOKit registry to find the `IOBDServices` matching the
-   requested BSD name (IOBDServices → IOBDBlockStorageDriver → IOMedia → "BSD Name"),
-   then creates MMCDeviceInterface → SCSITaskDeviceInterface → ObtainExclusiveAccess.
+1. `shim_open_exclusive(selector)` — for `/dev/diskN`, unmounts the target via
+   `diskutil` and resolves its IOBDServices via the media BSD name. For an
+   empty drive's `ioreg:<registry-id>` selector, resolves IOBDServices directly
+   and skips unmount/Disk Arbitration because there is no media node. Both paths
+   create MMCDeviceInterface → SCSITaskDeviceInterface → ObtainExclusiveAccess.
 2. `shim_list_drives()` — registry-based enumeration with zero SCSI, zero exclusive
    access, zero unmounts. Reads IOBDServices "Device Characteristics" for
-   vendor/model/firmware and child IOMedia "BSD Name" for the device path.
+   vendor/model/firmware. Uses child IOMedia "BSD Name" when media exists;
+   otherwise returns an opaque IOKit registry-ID selector so empty drives remain
+   discoverable and openable.
 3. `shim_execute()` / `shim_close()` — raw CDB dispatch and cleanup.
 
 On non-zero SCSI status, the transport parses sense key from the sense buffer

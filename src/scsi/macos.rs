@@ -29,7 +29,7 @@ static OPEN: AtomicBool = AtomicBool::new(false);
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct ShimDriveInfo {
-    bsd_name: [u8; 32],
+    device_selector: [u8; 32],
     vendor: [u8; 32],
     model: [u8; 48],
     firmware: [u8; 16],
@@ -64,6 +64,14 @@ fn bsd_name_of(device: &Path) -> Result<&str> {
         .strip_prefix("/dev/r")
         .or_else(|| dev_str.strip_prefix("/dev/"))
         .unwrap_or(dev_str))
+}
+
+fn device_path_for_selector(selector: &str) -> String {
+    if selector.starts_with("ioreg:") {
+        selector.to_string()
+    } else {
+        format!("/dev/{selector}")
+    }
 }
 
 // Maps a shim_open_exclusive failure sentinel (negative rc, not an
@@ -217,7 +225,7 @@ impl ScsiTransport for MacScsiTransport {
 
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
     let mut buf = [ShimDriveInfo {
-        bsd_name: [0; 32],
+        device_selector: [0; 32],
         vendor: [0; 32],
         model: [0; 48],
         firmware: [0; 16],
@@ -225,20 +233,23 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
 
     let count = unsafe { shim_list_drives(buf.as_mut_ptr(), buf.len() as i32) };
 
-    let mut out = Vec::new();
-    for info in buf.iter().take((count as usize).min(buf.len())) {
-        let bsd_name = cstr_to_str(&info.bsd_name);
-        if bsd_name.is_empty() {
-            continue;
-        }
-        out.push(super::DriveInfo {
-            path: format!("/dev/{bsd_name}"),
-            vendor: cstr_to_str(&info.vendor).to_string(),
-            model: cstr_to_str(&info.model).to_string(),
-            firmware: cstr_to_str(&info.firmware).to_string(),
-        });
+    buf.iter()
+        .take((count as usize).min(buf.len()))
+        .filter_map(drive_info_from_shim)
+        .collect()
+}
+
+fn drive_info_from_shim(info: &ShimDriveInfo) -> Option<super::DriveInfo> {
+    let selector = cstr_to_str(&info.device_selector);
+    if selector.is_empty() {
+        return None;
     }
-    out
+    Some(super::DriveInfo {
+        path: device_path_for_selector(selector),
+        vendor: cstr_to_str(&info.vendor).to_string(),
+        model: cstr_to_str(&info.model).to_string(),
+        firmware: cstr_to_str(&info.firmware).to_string(),
+    })
 }
 
 fn cstr_to_str(bytes: &[u8]) -> &str {
@@ -268,7 +279,8 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        K_MAX_CDB_SIZE, OPEN, bsd_name_of, cstr_to_str, drive_has_disc, map_shim_open_error,
+        K_MAX_CDB_SIZE, OPEN, ShimDriveInfo, bsd_name_of, cstr_to_str, device_path_for_selector,
+        drive_has_disc, drive_info_from_shim, map_shim_open_error,
     };
     use crate::error::Error;
     use std::path::Path;
@@ -279,6 +291,71 @@ mod tests {
         assert_eq!(bsd_name_of(Path::new("/dev/disk4")).unwrap(), "disk4");
         assert_eq!(bsd_name_of(Path::new("/dev/rdisk4")).unwrap(), "disk4");
         assert_eq!(bsd_name_of(Path::new("disk4")).unwrap(), "disk4");
+        assert_eq!(
+            bsd_name_of(Path::new("ioreg:4294967295")).unwrap(),
+            "ioreg:4294967295"
+        );
+    }
+
+    #[test]
+    fn list_path_preserves_registry_selector_and_uses_dev_for_bsd_name() {
+        assert_eq!(device_path_for_selector("disk4"), "/dev/disk4");
+        assert_eq!(device_path_for_selector("disk0"), "/dev/disk0");
+        assert_eq!(
+            device_path_for_selector("ioreg:4294967295"),
+            "ioreg:4294967295"
+        );
+        // Registry IDs are uint64 values and the shim emits the complete
+        // decimal value into its fixed-width selector field.
+        assert_eq!(
+            device_path_for_selector("ioreg:18446744073709551615"),
+            "ioreg:18446744073709551615"
+        );
+    }
+
+    fn shim_drive(selector: &[u8], vendor: &[u8], model: &[u8], firmware: &[u8]) -> ShimDriveInfo {
+        let mut info = ShimDriveInfo {
+            device_selector: [0; 32],
+            vendor: [0; 32],
+            model: [0; 48],
+            firmware: [0; 16],
+        };
+        info.device_selector[..selector.len()].copy_from_slice(selector);
+        info.vendor[..vendor.len()].copy_from_slice(vendor);
+        info.model[..model.len()].copy_from_slice(model);
+        info.firmware[..firmware.len()].copy_from_slice(firmware);
+        info
+    }
+
+    #[test]
+    fn shim_drive_record_maps_bsd_selector_and_identity_fields() {
+        let info = shim_drive(b"disk4", b"HL-DT-ST", b"BD-RE BU40N", b"1.03");
+        let mapped = drive_info_from_shim(&info).expect("non-empty selector");
+        assert_eq!(mapped.path, "/dev/disk4");
+        assert_eq!(mapped.vendor, "HL-DT-ST");
+        assert_eq!(mapped.model, "BD-RE BU40N");
+        assert_eq!(mapped.firmware, "1.03");
+    }
+
+    #[test]
+    fn shim_drive_record_keeps_empty_tray_registry_selector() {
+        let info = shim_drive(
+            b"ioreg:18446744073709551615",
+            b"HL-DT-ST",
+            b"BD-RE BU40N",
+            b"1.03",
+        );
+        let mapped = drive_info_from_shim(&info).expect("registry selector");
+        assert_eq!(mapped.path, "ioreg:18446744073709551615");
+        assert_eq!(mapped.vendor, "HL-DT-ST");
+        assert_eq!(mapped.model, "BD-RE BU40N");
+        assert_eq!(mapped.firmware, "1.03");
+    }
+
+    #[test]
+    fn shim_drive_record_with_empty_selector_is_skipped() {
+        let info = shim_drive(b"", b"HL-DT-ST", b"BD-RE BU40N", b"1.03");
+        assert!(drive_info_from_shim(&info).is_none());
     }
 
     // Shim fixed-width fields are NUL-terminated C strings with garbage

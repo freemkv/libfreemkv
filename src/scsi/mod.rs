@@ -462,8 +462,9 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
 /// no firmware reset, no init.
 #[derive(Debug, Clone)]
 pub struct DriveInfo {
-    /// Platform device path: `/dev/sgN` (Linux), `/dev/diskN` (macOS),
-    /// `\\.\CdRomN` (Windows).
+    /// Platform device path: `/dev/sgN` (Linux), `/dev/diskN` or an opaque
+    /// `ioreg:<id>` selector for an empty optical drive (macOS), `\\.\CdRomN`
+    /// (Windows).
     pub path: String,
     /// SCSI INQUIRY vendor identifier (e.g. `"HL-DT-ST"`).
     pub vendor: String,

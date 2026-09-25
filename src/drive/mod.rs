@@ -1252,11 +1252,53 @@ impl SectorSource for Drive {
 /// drives without opening, use `scsi::list_drives()` instead.
 /// See docs/drive-mod.md — find_drive selection policy.
 pub fn find_drive() -> Option<Drive> {
-    select_drive_with_media(
-        discover_drives()
+    #[cfg(target_os = "macos")]
+    let candidates = crate::scsi::list_drives()
+        .into_iter()
+        .map(|info| info.path)
+        .collect::<Vec<_>>();
+
+    #[cfg(not(target_os = "macos"))]
+    let candidates = discover_drives()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
+
+    let opened =
+        candidates
             .into_iter()
-            .filter_map(|(path, _)| Drive::open(std::path::Path::new(&path)).ok()),
-    )
+            .filter_map(|path| match Drive::open(std::path::Path::new(&path)) {
+                Ok(drive)
+                    if !drive.drive_id.raw_inquiry.is_empty()
+                        && (drive.drive_id.raw_inquiry[0] & 0x1F) == 0x05 =>
+                {
+                    Some(drive)
+                }
+                Ok(drive) => {
+                    tracing::debug!(
+                        target: "freemkv::drive",
+                        path,
+                        "skipping non-optical SCSI device during drive selection"
+                    );
+                    drop(drive);
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "freemkv::drive",
+                        path,
+                        error = %error,
+                        "drive open failed during autodetection"
+                    );
+                    None
+                }
+            });
+    select_drive_with_media(opened)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn discover_drives() -> Vec<(String, DriveId)> {
+    platform::find_drives()
 }
 
 // Pick a drive preferring DiscPresent status, falling back to the first
@@ -1332,11 +1374,6 @@ fn sleep_until_halted(halt: &AtomicBool, total: std::time::Duration) -> Result<(
         let remaining = deadline - now;
         std::thread::sleep(remaining.min(SLICE));
     }
-}
-
-/// Internal: discover drive paths + IDs without opening full Drive objects.
-fn discover_drives() -> Vec<(String, DriveId)> {
-    platform::find_drives()
 }
 
 /// Structured outcome of [`resolve_device`] — a machine-readable signal

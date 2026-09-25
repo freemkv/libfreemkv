@@ -12,6 +12,10 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <errno.h>
 
 extern char **environ;
 
@@ -32,7 +36,7 @@ typedef struct {
 } ShimHandle;
 
 typedef struct {
-    char bsd_name[32];
+    char device_selector[32];
     char vendor[32];
     char model[48];
     char firmware[16];
@@ -75,6 +79,54 @@ static int registry_entry_bsd_name(io_registry_entry_t entry, char *buf, size_t 
     int ok = cfstring_to_cstr(cf, buf, buflen);
     CFRelease(cf);
     return ok;
+}
+
+// Empty optical drives have an IOBDServices node but no IOMedia node, hence
+// no BSD diskN name. Use the service's IOKit registry ID as an opaque selector
+// until media appears. It is process/boot-local, which is sufficient for the
+// list-then-open GUI flow.
+static int registry_id_selector(io_registry_entry_t entry, char *buf, size_t buflen) {
+    uint64_t registry_id = 0;
+    if (IORegistryEntryGetRegistryEntryID(entry, &registry_id) != KERN_SUCCESS) return 0;
+    int n = snprintf(buf, buflen, "ioreg:%" PRIu64, registry_id);
+    return n > 0 && (size_t)n < buflen;
+}
+
+static int parse_registry_id_selector(const char *selector, uint64_t *registry_id) {
+    static const char prefix[] = "ioreg:";
+    if (strncmp(selector, prefix, sizeof(prefix) - 1) != 0) return 0;
+    const char *digits = selector + sizeof(prefix) - 1;
+    if (!*digits) return 0;
+    for (const char *p = digits; *p; p++) {
+        if (*p < '0' || *p > '9') return 0;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(digits, &end, 10);
+    if (errno == ERANGE || !end || *end || end == digits) return 0;
+    *registry_id = (uint64_t)parsed;
+    return 1;
+}
+
+static io_service_t find_bdsvc_by_registry_id(mach_port_t mp, uint64_t registry_id) {
+    CFMutableDictionaryRef matching = IOServiceMatching("IOBDServices");
+    if (!matching) return 0;
+    io_iterator_t iter;
+    if (IOServiceGetMatchingServices(mp, matching, &iter) != KERN_SUCCESS) return 0;
+    io_service_t result = 0;
+    io_service_t svc;
+    while ((svc = IOIteratorNext(iter)) != 0) {
+        uint64_t candidate = 0;
+        if (IORegistryEntryGetRegistryEntryID(svc, &candidate) == KERN_SUCCESS
+            && candidate == registry_id) {
+            result = svc;
+            break;
+        }
+        IOObjectRelease(svc);
+    }
+    while ((svc = IOIteratorNext(iter)) != 0) IOObjectRelease(svc);
+    IOObjectRelease(iter);
+    return result;
 }
 
 static io_registry_entry_t find_iomedia_child(io_registry_entry_t parent) {
@@ -372,7 +424,7 @@ static void da_release(void) {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-int shim_open_exclusive(const char *bsd_name) {
+int shim_open_exclusive(const char *selector) {
     kern_return_t kr;
     HRESULT hr;
     SInt32 score = 0;
@@ -387,6 +439,28 @@ int shim_open_exclusive(const char *bsd_name) {
         return 0;
     }
 
+    uint64_t registry_id = 0;
+    int is_registry_selector = parse_registry_id_selector(selector, &registry_id);
+    char bsd_name[32] = {0};
+    io_service_t svc = 0;
+    mach_port_t mp = MACH_PORT_NULL;
+    if (is_registry_selector) {
+        if (IOMainPort(0, &mp) != kIOReturnSuccess) {
+            pthread_mutex_unlock(&g_handle_lock);
+            return -1;
+        }
+        svc = find_bdsvc_by_registry_id(mp, registry_id);
+        if (!svc) {
+            pthread_mutex_unlock(&g_handle_lock);
+            return -1;
+        }
+        // If media is present, retain the old unmount/claim behavior. With an
+        // empty tray there is no BSD disk to unmount or hand to DiskArbitration.
+        bdsvc_to_bsd_name(svc, bsd_name, sizeof(bsd_name));
+    } else {
+        strlcpy(bsd_name, selector, sizeof(bsd_name));
+    }
+
     // Unmount via diskutil, invoked directly with posix_spawn (no shell) so
     // the BSD device name can never be interpreted as shell syntax. A shell
     // wrapper here (system()/sh -c) was a command-injection vector for an
@@ -394,13 +468,13 @@ int shim_open_exclusive(const char *bsd_name) {
     // argv element also sidesteps the old buffer-truncation concern entirely.
     // stdout/stderr go to /dev/null to keep diskutil chatter out of the
     // caller's streams.
-    {
+    if (bsd_name[0]) {
         posix_spawn_file_actions_t fa;
         posix_spawn_file_actions_init(&fa);
         posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
         posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
         char *const argv[] = {
-            "diskutil", "unmountDisk", "force", (char *)bsd_name, NULL
+            "diskutil", "unmountDisk", "force", bsd_name, NULL
         };
         pid_t pid;
         if (posix_spawn(&pid, "/usr/sbin/diskutil", &fa, NULL, argv, environ) == 0) {
@@ -442,19 +516,18 @@ int shim_open_exclusive(const char *bsd_name) {
         }
         posix_spawn_file_actions_destroy(&fa);
     }
-    usleep(500000);
+    if (bsd_name[0]) usleep(500000);
 
-    mach_port_t mp;
     // Check the return before using the port. On failure IOMainPort leaves `mp`
     // untouched, so every IOKit call below would run against an uninitialised
     // mach port. shim_list_drives does check it; this path did not.
-    if (IOMainPort(0, &mp) != kIOReturnSuccess) {
+    if (mp == MACH_PORT_NULL && IOMainPort(0, &mp) != kIOReturnSuccess) {
         pthread_mutex_unlock(&g_handle_lock);
         return -1;
     }
 
-    io_service_t svc = find_bdsvc_by_bsd_name(mp, bsd_name);
-    if (!svc) {
+    if (!svc) svc = find_bdsvc_by_bsd_name(mp, bsd_name);
+    if (!svc && !is_registry_selector) {
         svc = find_bdsvc_from_iomedia(mp, bsd_name);
     }
     if (!svc) {
@@ -552,7 +625,7 @@ int shim_open_exclusive(const char *bsd_name) {
     // allocations fails it returns early (0 → no claim). The lock is deliberately
     // NOT held across da_hold's ~5 s self-locking claim wait, which would
     // serialize every open behind it.
-    da_hold(bsd_name);
+    if (bsd_name[0]) da_hold(bsd_name);
 
     return 0;
 }
@@ -639,9 +712,19 @@ int shim_execute(const unsigned char *cdb, unsigned char cdb_len,
 // IOMedia whose "BSD Name" is the requested device IS the presence of a disc.
 //
 // Returns 1 (media present), 0 (no media), or -1 (IOKit unavailable).
-int shim_media_present(const char *bsd_name) {
+int shim_media_present(const char *selector) {
     mach_port_t mp;
     if (IOMainPort(0, &mp) != kIOReturnSuccess) return -1;
+
+    uint64_t registry_id = 0;
+    if (parse_registry_id_selector(selector, &registry_id)) {
+        io_service_t svc = find_bdsvc_by_registry_id(mp, registry_id);
+        if (!svc) return 0;
+        char bsd_name[32] = {0};
+        int has_media = bdsvc_to_bsd_name(svc, bsd_name, sizeof(bsd_name));
+        IOObjectRelease(svc);
+        return has_media && bsd_name[0] ? 1 : 0;
+    }
 
     CFMutableDictionaryRef matching = IOServiceMatching("IOMedia");
     if (!matching) return -1;
@@ -655,7 +738,7 @@ int shim_media_present(const char *bsd_name) {
     while ((media = IOIteratorNext(iter)) != 0) {
         char name[64];
         if (registry_entry_bsd_name(media, name, sizeof(name))
-            && strcmp(name, bsd_name) == 0)
+            && strcmp(name, selector) == 0)
         {
             found = 1;
         }
@@ -701,9 +784,11 @@ int shim_list_drives(ShimDriveInfo *out, int max_entries) {
         memset(info, 0, sizeof(*info));
 
         bdsvc_device_info(svc, info);
-        bdsvc_to_bsd_name(svc, info->bsd_name, sizeof(info->bsd_name));
+        if (!bdsvc_to_bsd_name(svc, info->device_selector, sizeof(info->device_selector))) {
+            registry_id_selector(svc, info->device_selector, sizeof(info->device_selector));
+        }
 
-        if (info->bsd_name[0]) {
+        if (info->device_selector[0]) {
             count++;
         }
 
