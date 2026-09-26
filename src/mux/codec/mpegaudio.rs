@@ -150,17 +150,25 @@ mod tests {
 
     /// A valid MPEG-1 Layer III header: sync 0xFFF, version MPEG-1 (11), layer
     /// III (01), bitrate_index 9, sample-rate 0 (44.1 kHz), no CRC. Bytes:
-    /// 0xFF 0xFB 0x90 0x00 — the canonical MP3 frame header.
-    fn mp3_frame(_payload: usize) -> Vec<u8> {
+    /// 0xFF 0xFB 0x90 0x00 — the canonical MP3 frame header. The header fixes the
+    /// frame at 417 bytes (128 kbit/s, 44.1 kHz), so there is no size argument.
+    const MP3_FRAME_BYTES: usize = 417;
+    fn mp3_frame() -> Vec<u8> {
         let mut f = vec![0xFF, 0xFB, 0x90, 0x00];
-        f.extend(std::iter::repeat_n(0xAA, 413));
+        f.resize(MP3_FRAME_BYTES, 0xAA);
         f
+    }
+
+    #[test]
+    fn mp3_frame_fixture_is_exactly_one_frame() {
+        let f = mp3_frame();
+        assert_eq!(frame_header(&f).map(|h| h.bytes), Some(f.len()));
     }
 
     #[test]
     fn valid_header_is_kept() {
         let mut p = MpegAudioParser::new();
-        let f = p.parse(&make_pes(mp3_frame(400), Some(90000)));
+        let f = p.parse(&make_pes(mp3_frame(), Some(90000)));
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].pts_ns, pts_to_ns(90000));
         assert_eq!(p.dropped_frames(), 0);
@@ -172,8 +180,8 @@ mod tests {
         // advance from the last timestamp by sample count — resetting to 0 would corrupt
         // A/V sync. Mirrors the adts.rs guard test.
         let mut p = MpegAudioParser::new();
-        p.parse(&make_pes(mp3_frame(400), Some(90000)));
-        let f = p.parse(&make_pes(mp3_frame(400), None));
+        p.parse(&make_pes(mp3_frame(), Some(90000)));
+        let f = p.parse(&make_pes(mp3_frame(), None));
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].pts_ns,
@@ -189,7 +197,7 @@ mod tests {
     fn dropped_frames_are_counted_but_their_duration_is_not_invented() {
         let mut parser = MpegAudioParser::new();
         // Reserved layer field (00) — rejected per ISO/IEC 11172-3.
-        let mut bad = mp3_frame(32);
+        let mut bad = mp3_frame();
         bad[1] &= !0b0000_0110;
         for i in 0..3 {
             let out = parser.parse(&make_pes(bad.clone(), Some(i * 90_000)));
@@ -209,7 +217,7 @@ mod tests {
         // version field = 01 (reserved) → rejected. byte1 = 111_01_01_1 = 0xEB
         // keeps the 11-bit sync (0xFF + top 3 bits 111) but sets version bits to 01.
         let mut p = MpegAudioParser::new();
-        let mut frame = mp3_frame(400);
+        let mut frame = mp3_frame();
         frame[1] = 0xEB;
         let f = p.parse(&make_pes(frame, Some(90000)));
         assert!(f.is_empty(), "reserved version dropped");
@@ -221,7 +229,7 @@ mod tests {
         // Sync present but sample-rate field = 3 (reserved) → rejected per spec.
         // 0xFF 0xFB then byte2 with bits 11..10 = 11: 0x9C.
         let mut p = MpegAudioParser::new();
-        let mut frame = mp3_frame(400);
+        let mut frame = mp3_frame();
         frame[2] = 0x9C; // freq field = 3
         let f = p.parse(&make_pes(frame, Some(90000)));
         assert!(f.is_empty(), "reserved sample rate dropped");
@@ -233,7 +241,7 @@ mod tests {
         // Layer field 00 (reserved). byte1 bits 2..1 = 00 → 0xF9 keeps sync
         // (0xFFF needs byte1 top 3 bits set) and sets layer=00.
         let mut p = MpegAudioParser::new();
-        let mut frame = mp3_frame(400);
+        let mut frame = mp3_frame();
         frame[1] = 0xF9; // 1111_1001: sync ok (top 3 =111), version 11, layer 00
         let f = p.parse(&make_pes(frame, Some(0)));
         assert!(f.is_empty(), "reserved layer dropped");
@@ -243,7 +251,7 @@ mod tests {
     #[test]
     fn bad_bitrate_index_15_is_dropped() {
         let mut p = MpegAudioParser::new();
-        let mut frame = mp3_frame(400);
+        let mut frame = mp3_frame();
         frame[2] = 0xF0; // bitrate_index = 1111
         assert!(p.parse(&make_pes(frame, Some(0))).is_empty());
         assert_eq!(p.dropped_frames(), 1);
@@ -254,7 +262,7 @@ mod tests {
         // Free format (bitrate_index == 0) is legal and decodable — it must NOT
         // be dropped (that would be a false positive on a clean stream).
         let mut p = MpegAudioParser::new();
-        let mut frame = mp3_frame(400);
+        let mut frame = mp3_frame();
         frame[2] = 0x00; // bitrate_index = 0000 (free format); sync/layer/rate ok
         let f = p.parse(&make_pes(frame, Some(0)));
         assert_eq!(f.len(), 1, "free-format frame kept");
@@ -273,10 +281,10 @@ mod tests {
     #[test]
     fn drop_preserves_sync_via_own_pts() {
         let mut p = MpegAudioParser::new();
-        let mut bad = mp3_frame(400);
+        let mut bad = mp3_frame();
         bad[2] = 0x9C; // reserved sample rate
         assert!(p.parse(&make_pes(bad, Some(90000))).is_empty());
-        let f = p.parse(&make_pes(mp3_frame(400), Some(96000)));
+        let f = p.parse(&make_pes(mp3_frame(), Some(96000)));
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].pts_ns,
@@ -291,8 +299,8 @@ mod tests {
     fn flush_adds_no_phantom_frame_after_the_last_real_packet() {
         let mut p = MpegAudioParser::new();
         let mut emitted = Vec::new();
-        emitted.extend(p.parse(&make_pes(mp3_frame(400), Some(90_000))));
-        emitted.extend(p.parse(&make_pes(mp3_frame(400), Some(180_000))));
+        emitted.extend(p.parse(&make_pes(mp3_frame(), Some(90_000))));
+        emitted.extend(p.parse(&make_pes(mp3_frame(), Some(180_000))));
         // An invalid header (version field 01 = reserved) is dropped, not buffered.
         emitted.extend(p.parse(&make_pes(vec![0xFF, 0xEB, 0x90, 0x00, 0xAA], Some(270_000))));
         assert_eq!(emitted.len(), 2, "two valid packets out, one dropped");
@@ -317,7 +325,7 @@ mod tests {
     #[test]
     fn an_emitted_frame_carries_the_packets_source_offset() {
         let mut p = MpegAudioParser::new();
-        let mut pes = make_pes(mp3_frame(400), Some(90_000));
+        let mut pes = make_pes(mp3_frame(), Some(90_000));
         pes.source = Some(crate::pes::SourcePos::at_byte(7_777));
         let f = p.parse(&pes);
         assert!(!f.is_empty(), "the frame is emitted");
@@ -325,7 +333,7 @@ mod tests {
     }
     #[test]
     fn every_pes_split_reassembles_a_complete_mpeg_frame() {
-        let data = mp3_frame(413);
+        let data = mp3_frame();
         for split in 1..data.len() {
             let mut p = MpegAudioParser::new();
             assert!(
@@ -342,7 +350,7 @@ mod tests {
 
     #[test]
     fn multiple_mpeg_frames_in_one_pes_get_distinct_timestamps() {
-        let data = mp3_frame(413);
+        let data = mp3_frame();
         let mut p = MpegAudioParser::new();
         let frames = p.parse(&make_pes(data.repeat(3), Some(0)));
         assert_eq!(frames.len(), 3);

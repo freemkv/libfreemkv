@@ -14,10 +14,9 @@ pub mod adts;
 mod audio_frames;
 /// Codec-agnostic per-picture coding carrier (`PictureInfo` + accessors).
 pub mod coding;
-/// DTS / DTS-HD elementary-stream parser.
 pub(crate) mod crc;
 pub(crate) mod dropgate;
-
+/// DTS / DTS-HD elementary-stream parser.
 pub mod dts;
 /// DVD bitmap subtitle (VobSub) parser.
 pub mod dvdsub;
@@ -348,6 +347,7 @@ mod provenance_guard {
         ("mod.rs", include_str!("mod.rs")),
         ("ac3.rs", include_str!("ac3.rs")),
         ("adts.rs", include_str!("adts.rs")),
+        ("audio_frames.rs", include_str!("audio_frames.rs")),
         ("dts.rs", include_str!("dts.rs")),
         ("dvdsub.rs", include_str!("dvdsub.rs")),
         ("flac.rs", include_str!("flac.rs")),
@@ -455,9 +455,9 @@ mod provenance_guard {
             .lines()
             .filter_map(|l| {
                 let l = l.trim();
-                let rest = l
-                    .strip_prefix("pub mod ")
-                    .or_else(|| l.strip_prefix("pub(crate) mod "))?;
+                let rest = ["pub mod ", "pub(crate) mod ", "mod "]
+                    .iter()
+                    .find_map(|p| l.strip_prefix(p))?;
                 rest.strip_suffix(';')
             })
             .collect();

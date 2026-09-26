@@ -206,11 +206,12 @@ impl CodecParser for H264Parser {
         let mut keyframe = false;
         // Picture coding type, MEASURED from the first coded slice's header.
         let mut coding_type: Option<CodingType> = None;
-        // Open-GOP promotion needs EVERY VCL slice intra, not just the first: a picture
-        // whose first slice is I but later slices are P/B is not a clean random-access
-        // point. `all_vcl_intra` holds only while every slice header parses AND codes as I/SI; `saw_vcl` guards against promoting a param-set-only access unit.
+        // Open-GOP promotion needs every slice of the FIRST picture intra. A later slice with
+        // first_mb_in_slice == 0 starts the next picture (the P second field of a 1080i
+        // anchor), which doesn't veto it. `saw_vcl` guards a param-set-only access unit.
         let mut all_vcl_intra = true;
         let mut saw_vcl = false;
+        let mut first_pic_done = false;
         // Did this access unit already carry each param-set type in-band?
         let mut emitted_sps = false;
         let mut emitted_pps = false;
@@ -249,23 +250,29 @@ impl CodecParser for H264Parser {
                     // Measure coding type from each slice header (§7.3.3: first_mb_in_slice,
                     // slice_type, both ue(v)) after unescaping EBSP (§7.3.1) — large
                     // first_mb_in_slice needs escaped 0x00 0x00. The FIRST slice sets the picture's `coding_type`; EVERY slice feeds `all_vcl_intra` for the open-GOP promotion below.
-                    if nal_type == NAL_SLICE_NON_IDR || nal_type == NAL_SLICE_IDR {
-                        saw_vcl = true;
+                    let is_slice = nal_type == NAL_SLICE_NON_IDR || nal_type == NAL_SLICE_IDR;
+                    // Once the first picture is over (or already non-intra with its coding
+                    // type known), no later slice can change the outcome: skip the parse.
+                    let settled = first_pic_done || (coding_type.is_some() && !all_vcl_intra);
+                    if is_slice && !settled {
                         let header = unescape_ebsp_prefix(&nal[1..]);
                         let mut br = BitReader::new(&header);
-                        if let (Some(_first_mb), Some(slice_type)) = (br.read_ue(), br.read_ue()) {
-                            let ct = h264_slice_coding_type(slice_type);
-                            if coding_type.is_none() {
-                                coding_type = ct;
+                        match (br.read_ue(), br.read_ue()) {
+                            (Some(0), Some(_)) if saw_vcl => first_pic_done = true,
+                            (Some(_first_mb), Some(slice_type)) => {
+                                let ct = h264_slice_coding_type(slice_type);
+                                if coding_type.is_none() {
+                                    coding_type = ct;
+                                }
+                                if ct != Some(CodingType::I) {
+                                    all_vcl_intra = false;
+                                }
                             }
-                            if ct != Some(CodingType::I) {
-                                all_vcl_intra = false;
-                            }
-                        } else {
                             // An unparseable slice header cannot be proven intra.
-                            all_vcl_intra = false;
+                            _ => all_vcl_intra = false,
                         }
                     }
+                    saw_vcl |= is_slice;
                     // A NAL longer than u32::MAX can't be length-prefixed in the
                     // 4-byte field; skip it rather than mis-frame the output.
                     // Unreachable in practice (no real AU is >4 GiB).
@@ -613,15 +620,15 @@ mod tests {
     }
 
     // A picture whose FIRST slice is I but whose LATER slice is P/B is not a
-    // clean random-access point: the open-GOP promotion must require EVERY VCL
-    // slice to be intra, not trust the first slice alone.
+    // clean random-access point: the open-GOP promotion must require EVERY slice
+    // of the picture to be intra, not trust the first slice alone.
     #[test]
     fn a_mixed_slice_picture_with_a_p_slice_is_not_promoted() {
-        // AU with two coded slices: slice 1 is I (0x88, slice_type=7), slice 2
-        // is P (0xC0, slice_type=0). Both NAL type 1, nal_ref_idc 3 -> 0x61.
+        // One picture, two slices: I at first_mb 0 (0x88, slice_type=7), then P at
+        // first_mb 1 (ue '010', slice_type '1', stop '1' -> 0x58). NAL type 1 -> 0x61.
         let au = vec![
-            0x00, 0x00, 0x01, 0x61, 0x88, // I slice
-            0x00, 0x00, 0x01, 0x61, 0xC0, // P slice
+            0x00, 0x00, 0x01, 0x61, 0x88, // I slice, first_mb 0
+            0x00, 0x00, 0x01, 0x61, 0x58, // P slice, first_mb 1 (same picture)
             0x00,
         ];
         let mut parser = H264Parser::new();
@@ -635,6 +642,31 @@ mod tests {
         assert!(
             !frames[0].keyframe,
             "a picture with a P slice is not a random-access point and must not promote",
+        );
+    }
+
+    // 1080i open-GOP anchor: an I first field paired with a P second field (which
+    // references only the I field) is a random-access point and must promote.
+    #[test]
+    fn field_coded_i_then_p_pair_is_a_keyframe() {
+        // I field: slices at first_mb 0 (0x88) and 1 ('010'+'0001000'+stop -> 0x42 0x20);
+        // P field: slices at first_mb 0 (0xC0) and 1 (0x58). NAL type 1 -> 0x61.
+        let au = vec![
+            0x00, 0x00, 0x01, 0x61, 0x88, // I field, first_mb 0
+            0x00, 0x00, 0x01, 0x61, 0x42, 0x20, // I field, first_mb 1
+            0x00, 0x00, 0x01, 0x61, 0xC0, // P field, first_mb 0
+            0x00, 0x00, 0x01, 0x61, 0x58, // P field, first_mb 1
+            0x00,
+        ];
+        let frames = H264Parser::new().parse(&make_pes(au, Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].coding.map(|c| c.coding_type()),
+            Some(CodingType::I)
+        );
+        assert!(
+            frames[0].keyframe,
+            "an I/P field pair is an open-GOP anchor"
         );
     }
 

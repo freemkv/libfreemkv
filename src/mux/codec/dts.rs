@@ -399,14 +399,31 @@ fn final_au_end(buf: &[u8], core_size: usize) -> usize {
                 _ => return buf.len(),
             }
         } else if buf[pos..].starts_with(&DTS_CORE_SYNC) {
-            // A trailing core (truncated — a complete one would have closed the
-            // AU during parse) is a new AU that never completed: drop it.
-            return pos;
+            // A trailing core (truncated — a complete one would have closed the AU during
+            // parse) is a new AU that never completed: drop it. Plausibility as in
+            // `next_core_boundary`: a false sync stays with this AU.
+            return trailing_core_start(buf, pos).unwrap_or(buf.len());
         } else {
             // Non-sync garbage after the core is not a further AU; keep it.
             return buf.len();
         }
     }
+}
+
+// First core sync at or after `from` that could open a new AU at EOS: its header is truncated
+// (undecidable) or its size is plausible. Mirrors `scan_for_next_core`.
+fn trailing_core_start(buf: &[u8], from: usize) -> Option<usize> {
+    let mut from = from;
+    while let Some(rel) = find_sync(&buf[from..], &DTS_CORE_SYNC) {
+        let pos = from + rel;
+        if buf.len() - pos < CORE_HEADER_MIN_BYTES
+            || (MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&dts_core_frame_size(&buf[pos..]))
+        {
+            return Some(pos);
+        }
+        from = pos + SYNCWORD_BYTES;
+    }
+    None
 }
 
 fn find_sync(data: &[u8], pattern: &[u8; 4]) -> Option<usize> {
@@ -933,6 +950,19 @@ mod tests {
         let tail = parser.flush();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].data.len(), 512);
+    }
+
+    // A fully-buffered trailing core sync whose size is implausible is not a new AU in
+    // parse() (next_core_boundary rejects it), so EOS must keep it with the AU too.
+    #[test]
+    fn implausible_trailing_core_sync_is_kept_at_eos() {
+        let mut buf = make_dts_core(512);
+        buf.extend_from_slice(&make_exss(64, None));
+        let mut fake = make_dts_core(17); // fsize decodes below MIN_CORE_FRAME_BYTES
+        fake.resize(40, 0x11);
+        buf.extend_from_slice(&fake);
+        assert!(matches!(next_core_boundary(&buf, 512), NextCore::None));
+        assert_eq!(final_au_end(&buf, 512), buf.len());
     }
 
     #[test]

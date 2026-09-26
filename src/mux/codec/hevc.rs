@@ -62,6 +62,9 @@ fn hevc_slice_coding_type(slice_type: u32) -> Option<CodingType> {
 
 // The `pps_pic_parameter_set_id` (first ue(v)) of a PPS NAL — the key under which each PPS is
 // stored so a slice's referenced PPS is resolved by its own id. `None` if the PPS is too short.
+// Number of PPS ids a stream may use: `pps_pic_parameter_set_id` is 0..=63 (H.265 §7.4.3.3).
+const HEVC_MAX_PPS_COUNT: usize = 64;
+
 fn hevc_pps_id(pps_nal: &[u8]) -> Option<u32> {
     BitReader::new(pps_nal.get(2..)?).read_ue()
 }
@@ -110,11 +113,10 @@ pub struct HevcParser {
     cur_vps: Option<Vec<u8>>,
     cur_sps: Option<Vec<u8>>,
     cur_pps: Option<Vec<u8>>,
-    /// Every PPS seen, keyed by its `pps_pic_parameter_set_id`, so a slice's
-    /// coding type is measured with the `num_extra_slice_header_bits` of the PPS
-    /// it REFERENCES rather than the last-active one (multiple PPS with differing
-    /// values would otherwise shift the slice_type bit offset).
-    pps_by_id: std::collections::HashMap<u32, Vec<u8>>,
+    /// `num_extra_slice_header_bits` of each PPS, indexed by `pps_pic_parameter_set_id`, so a
+    /// slice's coding type uses the PPS it REFERENCES, not the last-active one. Fixed size:
+    /// ids are 0..=63 (H.265 §7.4.3.3); an out-of-range id is ignored.
+    pps_num_extra: [Option<u32>; HEVC_MAX_PPS_COUNT],
     // Splice-aware CRA→BLA rewrite for a non-seamless BD clip boundary (first
     // CRA_NUT -> BLA_W_LP so NoRaslOutput discards dangling RASL). Armed by
     // `mark_clip_boundary` AND PTS-backstep auto-detect in `parse` — not dead code.
@@ -213,7 +215,7 @@ impl HevcParser {
             cur_vps: None,
             cur_sps: None,
             cur_pps: None,
-            pps_by_id: std::collections::HashMap::new(),
+            pps_num_extra: [None; HEVC_MAX_PPS_COUNT],
             pending_clip_boundary: false,
             high_pts: None,
             pts_wrap_offset: 0,
@@ -485,16 +487,11 @@ impl CodecParser for HevcParser {
                     if coding_type.is_none() && nal_type <= NAL_VCL_MAX {
                         // Resolve num_extra from the PPS the slice REFERENCES (by
                         // its slice_pic_parameter_set_id), not the last-active PPS.
-                        let pps_by_id = &self.pps_by_id;
+                        let pps_num_extra = &self.pps_num_extra;
                         coding_type = hevc_first_slice_coding_type(
                             &data[nal_start..end],
                             nal_type,
-                            |pps_id| {
-                                pps_by_id
-                                    .get(&pps_id)
-                                    .map(Vec::as_slice)
-                                    .and_then(hevc_num_extra_slice_header_bits)
-                            },
+                            |pps_id| *pps_num_extra.get(usize::try_from(pps_id).ok()?)?,
                         );
                     }
 
@@ -519,8 +516,12 @@ impl CodecParser for HevcParser {
                             // Store the PPS under its own id so a later slice's
                             // coding type resolves num_extra from the PPS it
                             // references, not merely the last-active one.
-                            if let Some(id) = hevc_pps_id(&data[nal_start..end]) {
-                                self.pps_by_id.insert(id, data[nal_start..end].to_vec());
+                            let pps = &data[nal_start..end];
+                            if let Some(slot) = hevc_pps_id(pps)
+                                .and_then(|id| usize::try_from(id).ok())
+                                .and_then(|id| self.pps_num_extra.get_mut(id))
+                            {
+                                *slot = hevc_num_extra_slice_header_bits(pps);
                             }
                             emitted_pps |= handle_param_set(
                                 &mut self.pps,
@@ -1446,6 +1447,39 @@ mod tests {
             CodingType::I,
             "resolved via the slice's own pps id (PPS0, num_extra=0) → slice_type 2 (I); \
              assuming the active PPS1 (num_extra=3) would misread the offset"
+        );
+    }
+
+    // PPS ids are 0..=63 (H.265 7.4.3.3): an out-of-range id is never stored, so a slice
+    // naming it declines a coding type; id 63 still resolves.
+    #[test]
+    #[allow(clippy::unusual_byte_groupings)]
+    fn pps_id_outside_spec_range_is_ignored() {
+        use super::super::coding::CodingType;
+        // PPS id=64: ue '0000001000001', sps_id '1', flags '00', num_extra '000', stop '1'.
+        let pps64 = [0b0000_0010, 0b0000_1100, 0b0000_1000];
+        // TRAIL_R slice: first '1', pps_id ue(64), slice_type ue '011' (I), stop '1'.
+        let slice64 = [0b1000_0001, 0b0000_0101, 0b1100_0000];
+        let mut data = nal_bytes(NAL_PPS, &pps64);
+        data.extend_from_slice(&nal_bytes(1, &slice64));
+        let frames = HevcParser::new().parse(&make_pes(data, Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].coding.map(|c| c.coding_type()),
+            None,
+            "pps id 64 is out of range"
+        );
+
+        // PPS id=63: ue '00000100000', sps_id '1', flags '00', num_extra '000', stop '1'.
+        let pps63 = [0b0000_0100, 0b0001_0000, 0b0100_0000];
+        // Slice: first '1', pps_id ue(63), slice_type '011', stop '1'.
+        let slice63 = [0b1000_0010, 0b0000_0111, 0b1000_0000];
+        let mut data = nal_bytes(NAL_PPS, &pps63);
+        data.extend_from_slice(&nal_bytes(1, &slice63));
+        let frames = HevcParser::new().parse(&make_pes(data, Some(0)));
+        assert_eq!(
+            frames[0].coding.map(|c| c.coding_type()),
+            Some(CodingType::I)
         );
     }
 
