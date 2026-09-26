@@ -1607,8 +1607,8 @@ mod tests {
     }
     #[test]
     fn parse_content_cert_extracts_cc_id_and_nonzero_type_is_v20() {
-        // Content-cert layout: [0]=type, [1] bit7=bus-enc, [14..20]=cc_id. Any
-        // non-0x00 type → V20.
+        // Content-cert layout: [0]=type, [1] bit7=bus-enc, [14..20]=cc_id. Type
+        // 0x10 → V20.
         let mut data = vec![0u8; 20];
         data[0] = 0x10; // AACS2 type marker → V20
         data[1] = 0x00;
@@ -1617,6 +1617,20 @@ mod tests {
         assert_eq!(cc.version, AacsVersion::V20);
         assert_eq!(cc.cc_id, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
         assert!(!cc.bus_encryption);
+    }
+    // Only the two observed cert types parse (0x00 AACS1/HD DVD, 0x10 AACS2): an
+    // unknown/corrupt type must be None so the bus key falls to keep-key.
+    #[test]
+    fn parse_content_cert_rejects_unknown_type_byte() {
+        let mut data = vec![0u8; 20];
+        data[1] = 0x00;
+        for t in [0x01u8, 0x11, 0x55, 0xFF] {
+            data[0] = t;
+            assert!(
+                parse_content_cert(&data).is_none(),
+                "type {t:#04x} must not parse"
+            );
+        }
     }
     #[test]
     fn parse_content_cert_bus_encryption_reads_bit7() {

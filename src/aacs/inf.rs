@@ -359,8 +359,8 @@ pub struct ContentCert {
     pub cc_id: [u8; 6],
     /// AACS generation indicated by the certificate type byte.
     ///
-    /// Cert type `0x00` → [`AacsVersion::V10`]; any other value →
-    /// [`AacsVersion::V20`]. The certificate alone cannot distinguish
+    /// Cert type `0x00` → [`AacsVersion::V10`], `0x10` → [`AacsVersion::V20`];
+    /// any other type does not parse. The certificate alone cannot distinguish
     /// V20 from V21 — Variant detection happens after the MKB walk.
     pub version: AacsVersion,
 }
@@ -373,10 +373,11 @@ pub fn parse_content_cert(data: &[u8]) -> Option<ContentCert> {
 
     // Content Certificate layout: [0] cert type (0x00 AACS1/0x10 AACS2),
     // [1] bit7 bus_encryption_enabled_flag, [14..20] cc_id (6 bytes).
-    let version = if data[0] == 0x00 {
-        AacsVersion::V10
-    } else {
-        AacsVersion::V20
+    // Only the observed types parse; an unknown/corrupt type is None, not a guess.
+    let version = match data[0] {
+        0x00 => AacsVersion::V10,
+        0x10 => AacsVersion::V20,
+        _ => return None,
     };
     // The flag is bit 7 of byte 1, NOT bit 0. Reading bit 0 (the prior bug) made
     // a bus-encrypted cert (byte1=0x80) read as `false`, defeating the

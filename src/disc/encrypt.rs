@@ -533,7 +533,7 @@ mod tests {
         udf::read_filesystem(disc).expect("fs")
     }
 
-    /// A content certificate: type byte@0 (0x00 = V10, else V20),
+    /// A content certificate: type byte@0 (0x00 = V10, 0x10 = V20),
     /// bus_encryption bit7@1, cc_id@14..20 (aacs/inf.rs parse_content_cert,
     /// which requires ≥20 bytes and reads the bus flag from `data[1] >> 7`).
     fn build_content_cert(cert_type: u8, bus_encryption: bool) -> Vec<u8> {
@@ -622,7 +622,7 @@ mod tests {
                     name: "Content000.cer",
                     icb_lba: 62,
                     data_lba: 6000,
-                    contents: build_content_cert(0x01, true),
+                    contents: build_content_cert(0x10, true),
                 },
             ],
         );
@@ -794,7 +794,7 @@ mod tests {
     /// unlock cannot remove bus encryption.
     #[test]
     fn resolve_vid_only_bus_encrypted_live_drive_without_rdk_errors() {
-        let (mut disc, udf) = disc_with_cert(0x01, true);
+        let (mut disc, udf) = disc_with_cert(0x10, true);
         let hs = HandshakeResult {
             volume_id: [0x11u8; 16],
             read_data_key: None,
@@ -810,7 +810,7 @@ mod tests {
     /// handshake produced the bus key, as required).
     #[test]
     fn resolve_vid_only_bus_encrypted_live_drive_with_rdk_ok() {
-        let (mut disc, udf) = disc_with_cert(0x01, true);
+        let (mut disc, udf) = disc_with_cert(0x10, true);
         let hs = HandshakeResult {
             volume_id: [0x11u8; 16],
             read_data_key: Some([0x22u8; 16]),
@@ -841,7 +841,7 @@ mod tests {
         }
         // The real case: a bus-encrypted disc unlocked AT THE DRIVE (drive_unlocked)
         // with no cert read_data_key must resolve OK, not AacsBusKeyUnavailable.
-        let (mut disc, udf) = disc_with_cert(0x01, true);
+        let (mut disc, udf) = disc_with_cert(0x10, true);
         let hs = HandshakeResult {
             volume_id: [0x11u8; 16],
             read_data_key: None,
@@ -858,7 +858,7 @@ mod tests {
     /// handshake (no UHD-ISO-mux regression).
     #[test]
     fn resolve_vid_only_bus_encrypted_iso_no_handshake_ok() {
-        let (mut disc, udf) = disc_with_cert(0x01, true);
+        let (mut disc, udf) = disc_with_cert(0x10, true);
         let st = Disc::resolve_vid_only(&udf, &mut disc, None).expect("ISO bus disc → ok");
         assert!(st.bus_encryption);
     }
@@ -937,7 +937,7 @@ mod tests {
     /// The gate itself still hard-errors — the property the log line annotates.
     #[test]
     fn resolve_vid_only_bus_key_gate_hard_errors_without_a_read_data_key() {
-        let (mut disc, udf) = disc_with_cert(0x01, true);
+        let (mut disc, udf) = disc_with_cert(0x10, true);
         let hs = HandshakeResult {
             volume_id: [0x11u8; 16],
             read_data_key: None,
