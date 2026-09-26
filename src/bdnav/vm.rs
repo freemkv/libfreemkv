@@ -233,9 +233,9 @@ fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Opti
                         }
                         None
                     }
-                    0x03 => Some(dst.wrapping_add(src)),
+                    0x03 => Some(dst.saturating_add(src)), // libbluray ADD_u32 saturates
                     0x04 => Some(dst.saturating_sub(src)),
-                    0x05 => Some(dst.wrapping_mul(src)),
+                    0x05 => Some(dst.saturating_mul(src)), // libbluray MUL_u32 saturates
                     0x06 => Some(dst.checked_div(src).unwrap_or(0xffff_ffff)),
                     0x07 => Some(dst.checked_rem(src).unwrap_or(0xffff_ffff)),
                     0x08 => Some(dst), // RND — deterministic stand-in
@@ -444,6 +444,27 @@ mod tests {
             vec![PlaybackObj::Hdmv { id_ref: 1 }],
         );
         assert_eq!(resolve(&index, &mobjs, &|id| id == 42), Some(42));
+    }
+
+    // ADD/MUL saturate at 0xFFFFFFFF (libbluray hdmv_vm.c ADD_u32/MUL_u32,
+    // reverse-engineered player behaviour), like SUB and DIV/MOD by 0 already do.
+    #[test]
+    fn add_and_mul_saturate() {
+        let set = |opt: u8, reg: u32, imm: u32| cmd((2 << 5) | (2 << 3), 0x40, 0, opt, reg, imm);
+        let cmp_eq_0 = |reg: u32| cmd((2 << 5) | (1 << 3), 0x40, 0x02, 0, reg, 0);
+        for ops in [
+            [set(0x01, 0, 0xffff_ffff), set(0x03, 0, 1)],
+            [set(0x01, 0, 0x1_0000), set(0x05, 0, 0x1_0000)],
+        ] {
+            // A wrap to 0 makes the compare true and plays 1; saturation plays 800.
+            let d = build(&[&[ops[0], ops[1], cmp_eq_0(0), play_pl(1), play_pl(800)]]);
+            let mobjs = mobj::parse(&d).unwrap();
+            let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+            assert_eq!(
+                resolve(&index, &mobjs, &|id| id == 1 || id == 800),
+                Some(800)
+            );
+        }
     }
 
     #[test]
