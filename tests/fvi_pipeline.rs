@@ -294,7 +294,7 @@ fn fvi_sink_indexes_real_mpeg2_pipeline_output() {
         vec![0, 3],
         "stamped src sectors must reach the .fvi in arrival order; got {src_sectors:?}"
     );
-    // Per FVI_FORMAT.md §9, `src.byte` is the AU's offset WITHIN its 2048-byte
+    // Per https://freemkv.org/docs/fvi-format/#9-provenance-and-recovery-semantics, `src.byte` is the AU's offset WITHIN its 2048-byte
     // `src.sector` (always < 2048). These sources sit 14 bytes into their
     // sector (past the pack header), so byte must be exactly 14.
     for r in &records {

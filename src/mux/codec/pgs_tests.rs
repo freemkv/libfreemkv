@@ -625,7 +625,7 @@ fn ffmpeg_remux_keeps_all_subtitle_timestamps_without_warnings() {
         );
         assert!(!packet["flags"].as_str().unwrap().contains('C'), "{packet}");
     }
-    // The clear commands must survive FFmpeg's automatic pgs_frame_merge BSF.
+    // Remuxing must preserve both clear commands as empty compositions.
     let json = probe(&output, true);
     assert_eq!(json["frames"][1]["num_rects"], 0, "{json}");
     assert_eq!(json["frames"][3]["num_rects"], 0, "{json}");

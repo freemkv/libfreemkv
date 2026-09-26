@@ -294,7 +294,7 @@ impl CodecParser for PgsParser {
         match pcs_num_objects {
             // Every PCS starts a new set, including empty compositions. Keep
             // the clear's following WDS/END with it, rather than emitting orphan
-            // packets that lose timing in FFmpeg's pgs_frame_merge filter.
+            // packets that lose timing when display sets are merged.
             Some(_) => match pts {
                 Some(start) => {
                     out.extend(self.emit_pending(Some(start)));

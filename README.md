@@ -131,7 +131,7 @@ Streams                — unified PES pipeline
 ```
 
 Build API documentation with `cargo doc --no-deps --open`. The public
-[FVI format specification](FVI_FORMAT.md) describes exported video indexes.
+[FVI format specification](https://freemkv.org/docs/fvi-format/) describes exported video indexes.
 
 ## Error Codes
 
