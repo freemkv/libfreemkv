@@ -159,9 +159,8 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
         } else {
             32
         };
-        // `>=`, not `>`: the 16-byte STN header spans item[stn_offset..stn_offset+16], so
-        // item.len() == stn_offset + 16 already holds every header byte. Strict `>` demanded
-        // one extra byte, skipping a play item whose STN header ends exactly at the boundary (stream-less STN table).
+        // `>=`: the 16-byte STN header spans item[stn_offset..stn_offset+16], so a
+        // stream-less STN table ending exactly at the item boundary is still read.
         if item_idx == 0 && item.len() >= stn_offset + 16 {
             // STN header: length(2) + reserved(2) + counts(8) + reserved(4) = 16 bytes
             let n_video = item[stn_offset + 4] as usize;
@@ -193,11 +192,13 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                     break;
                 }
             }
-            // PG subtitles
-            for _ in 0..n_pg {
-                if let Some((entry, next)) =
+            // PG/TextST then PiP PG in one loop, before IG, no ref block (libbluray
+            // _parse_stn, reverse-engineered player layout).
+            for i in 0..n_pg + n_pip_pg {
+                if let Some((mut entry, next)) =
                     parse_stream_entry(item, spos, STREAM_CATEGORY_PG_SUBTITLE)
                 {
+                    entry.secondary = i >= n_pg;
                     streams.push(entry);
                     spos = next;
                 } else {
@@ -251,24 +252,6 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                         } else {
                             spos = after_arefs;
                         }
-                    } else {
-                        spos = next;
-                    }
-                } else {
-                    break;
-                }
-            }
-            // Secondary PG (PiP subtitles) — must consume to keep spos aligned
-            for _ in 0..n_pip_pg {
-                if let Some((mut entry, next)) =
-                    parse_stream_entry(item, spos, STREAM_CATEGORY_PG_SUBTITLE)
-                {
-                    entry.secondary = true;
-                    streams.push(entry);
-                    // Skip reference data: num_refs(1) + reserved(1) + refs + padding
-                    if next < item.len() {
-                        let n_refs = item[next] as usize;
-                        spos = next + 2 + n_refs + (n_refs % 2);
                     } else {
                         spos = next;
                     }
@@ -350,8 +333,8 @@ const STREAM_ENTRY_SUBPATH_DV_EL: u8 = 0x04; // SubPath Dolby Vision enhancement
 /// STN-table primary stream categories — the `stream_type` tag carried on each
 /// [`StreamEntry`]. Secondary streams reuse the primary category and set the
 /// `secondary` flag rather than carrying a distinct code.
-const STREAM_CATEGORY_VIDEO: u8 = 1;
-const STREAM_CATEGORY_AUDIO: u8 = 2;
+pub(crate) const STREAM_CATEGORY_VIDEO: u8 = 1;
+pub(crate) const STREAM_CATEGORY_AUDIO: u8 = 2;
 const STREAM_CATEGORY_PG_SUBTITLE: u8 = 3;
 const STREAM_CATEGORY_IG: u8 = 4;
 
@@ -439,13 +422,19 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
                 }
             }
         }
-        STREAM_CATEGORY_PG_SUBTITLE
-            // PG: coding_type(1) + language(3).
+        STREAM_CATEGORY_PG_SUBTITLE => {
+            // PG: coding_type(1) + language(3); TextST adds character_code(1) first.
             // IG is parsed only to advance spos and is then discarded by the
             // caller, so it deliberately has no arm here.
-            if sa.len() >= 4 => {
-                language = String::from_utf8_lossy(&sa[1..4]).to_string();
+            let lang_at = if coding_type == c::TEXT_SUBTITLE {
+                2
+            } else {
+                1
+            };
+            if let Some(lang) = sa.get(lang_at..lang_at + 3) {
+                language = String::from_utf8_lossy(lang).to_string();
             }
+        }
         _ => {}
     }
 
@@ -743,19 +732,15 @@ mod tests {
         assert!(!s.secondary);
     }
 
-    // The STN gate is inclusive of the boundary: a first play item whose STN table is
-    // JUST the 16-byte header (no stream entries) has item.len() == STN_OFFSET(32)+16 ==
-    // 48 exactly, and must be parsed, not skipped by a strict `>` demanding one extra byte.
+    // A first play item that ends exactly at the 16-byte STN header (48 bytes) but
+    // declares non-zero counts: the header is read, no entry fits, nothing panics.
+    // (`>` vs `>=` at this gate is not observable: no entry can fit either way.)
     #[test]
     fn stn_header_ending_exactly_at_the_item_boundary_is_parsed() {
-        let data = build_mpls(&[(b"00001", 1, 0, 9000000)], (0, 0, 0, 0, 0, 0, 0, 0), &[]);
-        // The first play item is exactly the header length (32 + 16).
+        let data = build_mpls(&[(b"00001", 1, 0, 9000000)], (1, 1, 1, 1, 1, 1, 1, 1), &[]);
         let playlist = parse(&data).expect("a boundary-length STN header must parse");
         assert_eq!(playlist.play_items.len(), 1);
-        assert!(
-            playlist.streams.is_empty(),
-            "no stream entries were declared at the boundary"
-        );
+        assert!(playlist.streams.is_empty());
     }
 
     // Regression for issue #45 (see module `//!` header): a multi-angle first
@@ -1266,7 +1251,7 @@ mod tests {
     // IG proves spos still advanced correctly past the dropped IG entry.
     #[test]
     fn ig_consumed_but_not_retained_and_dv_after_aligned() {
-        // STN parse order is video, audio, PG, IG, sec_audio, sec_video, pip_pg, DV.
+        // STN parse order is video, audio, PG+pip_pg, IG, sec_audio, sec_video, DV.
         // The IG entry must be consumed (advancing spos) but never retained; placing
         // a DV EL right after IG proves this — a wrong spos would misread the DV PID.
         let video = build_stream_entry_video(0x1011, 0x24, 8, 1, Some(0x12));
@@ -1586,6 +1571,8 @@ mod tests {
             build_stream_entry_pg(0x1200, 0x90, b"eng"),
             build_stream_entry_pg(0x1201, 0x90, b"fra"),
             build_stream_entry_pg(0x1202, 0x90, b"deu"),
+            // PiP PG: straight after primary PG, no ref block
+            build_stream_entry_pg(0x1C00, 0x90, b"jpn"),
         ];
         for i in 0..4u16 {
             entries.push(build_stream_entry_pg(0x1400 + i, 0x91, b"eng"));
@@ -1599,10 +1586,6 @@ mod tests {
         sec_video.extend_from_slice(&[1, 0, 0x55, 0x00]);
         sec_video.extend_from_slice(&[1, 0, 0x66, 0x00]);
         entries.push(sec_video);
-        // PiP PG + its ref block
-        let mut pip_pg = build_stream_entry_pg(0x1C00, 0x90, b"jpn");
-        pip_pg.extend_from_slice(&[1, 0, 0x77, 0x00]);
-        entries.push(pip_pg);
         // Dolby Vision enhancement layer
         entries.push(build_stream_entry_video(0x1015, 0x24, 8, 1, Some(0x12)));
 
@@ -1627,23 +1610,70 @@ mod tests {
                 (3, 0x1200, false), // PG ×3
                 (3, 0x1201, false),
                 (3, 0x1202, false),
+                (3, 0x1C00, true), // PiP PG
                 // the 4 IG entries are consumed and discarded
                 (5, 0x1A00, true), // secondary audio
                 (6, 0x1B00, true), // secondary video
-                (3, 0x1C00, true), // PiP PG
                 (7, 0x1015, true), // Dolby Vision EL
             ]
         );
         // Languages prove each entry was decoded at its own offset.
         assert_eq!(pl.streams[1].language, "eng");
         assert_eq!(pl.streams[2].language, "fra");
-        assert_eq!(pl.streams[6].language, "spa");
-        assert_eq!(pl.streams[8].language, "jpn");
+        assert_eq!(pl.streams[6].language, "jpn");
+        assert_eq!(pl.streams[7].language, "spa");
+    }
+
+    // BD STN_table order (libbluray _parse_stn, reverse-engineered): PiP PG entries
+    // follow the primary PG entries in one loop, BEFORE IG, and carry no ref block.
+    #[test]
+    fn pip_pg_entries_follow_primary_pg_before_ig() {
+        let pg = build_stream_entry_pg(0x1200, 0x90, b"eng");
+        let pip_pg = build_stream_entry_pg(0x1A01, 0x90, b"jpn");
+        let ig = build_stream_entry_pg(0x1400, 0x91, b"eng");
+        let mut sec_audio = build_stream_entry_audio(0x1A00, 0x83, 3, 1, b"spa");
+        sec_audio.extend_from_slice(&[1, 0, 0x55, 0x00]);
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9_000_000)],
+            (0, 0, 1, 1, 1, 0, 1, 0),
+            &[pg, pip_pg, ig, sec_audio],
+        );
+        let pl = parse(&data).expect("should parse");
+        let got: Vec<(u8, u16, bool, &str)> = pl
+            .streams
+            .iter()
+            .map(|s| (s.stream_type, s.pid, s.secondary, s.language.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (3, 0x1200, false, "eng"),
+                (3, 0x1A01, true, "jpn"),
+                (5, 0x1A00, true, "spa"),
+            ]
+        );
+    }
+
+    // TextST (0x92) stream_attributes: coding_type(1) + character_code(1) + language(3).
+    #[test]
+    fn text_subtitle_language_follows_the_character_code() {
+        let mut se = vec![3, STREAM_ENTRY_PLAYITEM_CLIP, 0x18, 0x00];
+        let attrs = [0x92, 0x01, b'e', b'n', b'g'];
+        se.push(attrs.len() as u8);
+        se.extend_from_slice(&attrs);
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9_000_000)],
+            (0, 0, 1, 0, 0, 0, 0, 0),
+            &[se],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.streams[0].coding_type, 0x92);
+        assert_eq!(pl.streams[0].language, "eng");
     }
 
     // A secondary block whose stream entry ends exactly at the end of the
     // PlayItem has no reference block at all; the count byte must not be
-    // read from one-past-the-end. Covers all three secondary ref blocks.
+    // read from one-past-the-end. Covers both secondary ref blocks.
     #[test]
     fn secondary_ref_block_at_item_end_is_not_read() {
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
@@ -1677,22 +1707,11 @@ mod tests {
         let data = build_mpls(
             &[(b"00001", 1, 0, 9_000_000)],
             (1, 0, 0, 0, 0, 1, 0, 0),
-            &[video.clone(), sec_video_arefs],
+            &[video, sec_video_arefs],
         );
         let pl = parse(&data).expect("secondary video aref block at item end");
         assert_eq!(pl.streams.len(), 2);
         assert_eq!(pl.streams[1].pid, 0x1B00);
-
-        // PiP PG is the last entry, with no ref bytes following.
-        let pip_pg = build_stream_entry_pg(0x1C00, 0x90, b"jpn");
-        let data = build_mpls(
-            &[(b"00001", 1, 0, 9_000_000)],
-            (1, 0, 0, 0, 0, 0, 1, 0),
-            &[video, pip_pg],
-        );
-        let pl = parse(&data).expect("PiP PG at item end");
-        assert_eq!(pl.streams.len(), 2);
-        assert_eq!(pl.streams[1].pid, 0x1C00);
     }
 
     // ─────────────────────────────────────────────────────────────────────
