@@ -197,6 +197,8 @@ pub struct DiscStream {
     /// Whether each stream (by track index) is video — audio/subtitle frames are
     /// independent and always admit.
     is_video: Vec<bool>,
+    /// Bounds the header pump's wait for in-band codec configs (AAC).
+    header_gate: super::header_gate::HeaderGate,
 }
 
 impl DiscStream {
@@ -311,6 +313,7 @@ impl DiscStream {
             fed_bytes: 0,
             resync,
             is_video,
+            header_gate: super::header_gate::HeaderGate::default(),
         })
     }
 
@@ -667,8 +670,8 @@ fn prof_tick(stage: &str, ns: u128, bytes: u64) {
     });
 }
 
-impl crate::pes::Stream for DiscStream {
-    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+impl DiscStream {
+    fn read_frame(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         if let Some(frame) = self.pending_frames.pop_front() {
             return Ok(Some(frame));
         }
@@ -954,6 +957,18 @@ impl crate::pes::Stream for DiscStream {
             }
         }
     }
+}
+
+impl crate::pes::Stream for DiscStream {
+    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+        let read = self.read_frame();
+        match &read {
+            Ok(Some(frame)) => self.header_gate.observe(frame),
+            Ok(None) => self.header_gate.expire(),
+            Err(_) => {}
+        }
+        read
+    }
 
     fn write(&mut self, _frame: &crate::pes::PesFrame) -> io::Result<()> {
         Err(crate::error::Error::StreamReadOnly.into())
@@ -986,15 +1001,8 @@ impl crate::pes::Stream for DiscStream {
         if self.skip_parse {
             return true;
         }
-        for (idx, s) in self.title.streams.iter().enumerate() {
-            if let crate::disc::Stream::Video(v) = s
-                && !v.secondary
-                && self.codec_private(idx).is_none()
-            {
-                return false;
-            }
-        }
-        true
+        self.header_gate
+            .ready(&self.title, |idx| self.codec_private(idx))
     }
 
     fn errors(&self) -> u64 {
@@ -2334,6 +2342,73 @@ mod tests {
             assert!(PesStream::codec_private(&s, 0).is_none());
             // And a track index past the end of the pid map has none either.
             assert!(PesStream::codec_private(&s, 7).is_none());
+        }
+
+        // A resolved video config must not finalise headers while an AAC track
+        // still lacks its AudioSpecificConfig (frames are ADTS-stripped).
+        #[test]
+        fn headers_ready_also_waits_for_the_aac_config() {
+            use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate};
+            let mut title = audio_then_video_title();
+            title.content_format = ContentFormat::BdTs;
+            title.streams[1] = crate::disc::Stream::Video(match &title.streams[1] {
+                crate::disc::Stream::Video(v) => crate::disc::VideoStream {
+                    pid: 0x1011,
+                    ..v.clone()
+                },
+                _ => unreachable!(),
+            });
+            title.streams.push(crate::disc::Stream::Audio(AudioStream {
+                pid: 0x1100,
+                codec: Codec::Aac,
+                channels: AudioChannels::Stereo,
+                language: "eng".to_string(),
+                sample_rate: SampleRate::S44_1,
+                secondary: false,
+                purpose: LabelPurpose::Normal,
+                label: String::new(),
+            }));
+            let mut s = DiscStream::new(
+                Box::new(ZeroReader { capacity: 8 }),
+                title,
+                crate::decrypt::DecryptKeys::None,
+                8,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap();
+            let pes = |pid: u16, data: Vec<u8>| crate::mux::ts::PesPacket {
+                source: None,
+                pid,
+                pts: Some(0),
+                dts: None,
+                data,
+                discontinuity: false,
+            };
+            fn parser(
+                s: &mut DiscStream,
+                pid: u16,
+            ) -> &mut Box<dyn crate::mux::codec::CodecParser> {
+                let i = s.parsers.iter().position(|(p, _)| *p == pid).unwrap();
+                &mut s.parsers[i].1
+            }
+            let mut au = seq_header(720, 480);
+            au.extend_from_slice(&picture_header(1));
+            au.extend_from_slice(&[0xAA; 16]);
+            let _ = parser(&mut s, 0x1011).parse(&pes(0x1011, au));
+            let _ = parser(&mut s, 0x1011).parse(&pes(0x1011, picture_header(3)));
+            assert!(PesStream::codec_private(&s, 1).is_some());
+            assert!(
+                !PesStream::headers_ready(&s),
+                "AAC track 2 has no AudioSpecificConfig yet"
+            );
+
+            let mut adts = vec![0xFF, 0xF1, 0x50, 0x80, 0x02, 0x9F, 0xFC];
+            adts.extend_from_slice(&[0u8; 13]); // frame_length = 20
+            let _ = parser(&mut s, 0x1100).parse(&pes(0x1100, adts));
+            assert_eq!(PesStream::codec_private(&s, 2), Some(vec![0x12, 0x10]));
+            assert!(PesStream::headers_ready(&s));
         }
 
         // ── on_event() / emit() ───────────────────────────────────────────

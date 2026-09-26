@@ -552,8 +552,8 @@ fn drive_mux(
         });
     }
 
-    // ── Header pump ── Buffer frames until every video track's codec_private
-    // has resolved; MKV can't write a track header without codec init data.
+    // ── Header pump ── Buffer frames until every video (and AAC) track's
+    // codec_private has resolved; MKV can't write a track header without codec init data.
     // The loop breaks on EOF/None too, so the gate below re-checks.
     let mut buffered: Vec<PesFrame> = Vec::new();
     let mut buffered_bytes: usize = 0;
@@ -641,6 +641,17 @@ fn drive_mux(
     out_title.codec_privates = (0..info.streams.len())
         .map(|i| stream.codec_private(i))
         .collect();
+    for (track, s) in info.streams.iter().enumerate() {
+        if let crate::disc::Stream::Audio(a) = s
+            && matches!(a.codec, crate::disc::Codec::Aac)
+            && out_title
+                .codec_privates
+                .get(track)
+                .is_none_or(Option::is_none)
+        {
+            tracing::warn!(target: "mux", track, "AAC track has no AudioSpecificConfig at header time");
+        }
+    }
     let total_bytes = info.size_bytes;
     let num_streams = info.streams.len();
 

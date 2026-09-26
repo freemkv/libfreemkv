@@ -238,7 +238,8 @@ pub trait Stream: Send {
         None
     }
 
-    /// True when `codec_private` is available for every video track —
+    /// True when `codec_private` is available for every primary video track
+    /// and every AAC track (the latter bounded by a short wait and EOF) —
     /// callers buffer input frames until this flips, since some output
     /// formats (MKV) can't write frames without codec init data.
     fn headers_ready(&self) -> bool {

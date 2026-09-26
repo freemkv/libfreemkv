@@ -399,6 +399,7 @@ fn validate_audio_parser(encoder: &str, format: &str, codec: crate::disc::Codec)
         _ => Box::new(Ac3Parser::new()),
     };
     let mut frames = Vec::new();
+    let mut codec_private = None;
     // Deliberately split headers and bodies across PES boundaries. Only the
     // first chunk has PTS; subsequent frame times must come from codec cadence.
     for (index, data) in std::fs::read(&input).unwrap().chunks(137).enumerate() {
@@ -410,6 +411,10 @@ fn validate_audio_parser(encoder: &str, format: &str, codec: crate::disc::Codec)
             source: None,
             discontinuity: false,
         }));
+        // Snapshot when the first frame appears, as the header pump does.
+        if codec_private.is_none() && !frames.is_empty() {
+            codec_private = Some(parser.codec_private());
+        }
     }
     frames.extend(parser.flush());
     let mut track = MkvTrack::audio(&AudioStream {
@@ -422,7 +427,7 @@ fn validate_audio_parser(encoder: &str, format: &str, codec: crate::disc::Codec)
         purpose: LabelPurpose::Normal,
         label: String::new(),
     });
-    track.codec_private = parser.codec_private();
+    track.codec_private = codec_private.flatten();
     let output = dir.path().join("output.mkv");
     let mut muxer = MkvMuxer::new(
         std::fs::File::create(&output).unwrap(),

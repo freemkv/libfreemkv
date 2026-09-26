@@ -57,6 +57,8 @@ pub struct PipelinedPesStream {
     /// stream index. (TS titles are AU-complete already, so this is a passthrough
     /// there too — `consume_ts` does not use it.)
     au_asm: Vec<super::au_assembly::AuAssembler>,
+    /// Bounds the header pump's wait for in-band codec configs (AAC).
+    header_gate: super::header_gate::HeaderGate,
 }
 
 /// The `Codec` of a stream, for configuring its [`AuAssembler`](crate::mux::au_assembly::AuAssembler).
@@ -106,6 +108,7 @@ impl PipelinedPesStream {
             resync,
             is_video,
             au_asm,
+            header_gate: super::header_gate::HeaderGate::default(),
         }
     }
 
@@ -266,8 +269,8 @@ impl PipelinedPesStream {
     }
 }
 
-impl Stream for PipelinedPesStream {
-    fn read(&mut self) -> io::Result<Option<PesFrame>> {
+impl PipelinedPesStream {
+    fn read_frame(&mut self) -> io::Result<Option<PesFrame>> {
         if let Some(frame) = self.pending_frames.pop_front() {
             return Ok(Some(frame));
         }
@@ -352,6 +355,18 @@ impl Stream for PipelinedPesStream {
             }
         }
     }
+}
+
+impl Stream for PipelinedPesStream {
+    fn read(&mut self) -> io::Result<Option<PesFrame>> {
+        let read = self.read_frame();
+        match &read {
+            Ok(Some(frame)) => self.header_gate.observe(frame),
+            Ok(None) => self.header_gate.expire(),
+            Err(_) => {}
+        }
+        read
+    }
 
     fn write(&mut self, _: &PesFrame) -> io::Result<()> {
         Err(crate::error::Error::StreamReadOnly.into())
@@ -372,15 +387,8 @@ impl Stream for PipelinedPesStream {
         if self.skip_parse {
             return true;
         }
-        for (idx, s) in self.title.streams.iter().enumerate() {
-            if let crate::disc::Stream::Video(v) = s
-                && !v.secondary
-                && self.codec_private(idx).is_none()
-            {
-                return false;
-            }
-        }
-        true
+        self.header_gate
+            .ready(&self.title, |idx| self.codec_private(idx))
     }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
@@ -1044,6 +1052,136 @@ mod tests {
     fn finish_is_ok_noop() {
         let (mut stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
         assert!(stream.finish().is_ok());
+    }
+
+    // --- AAC AudioSpecificConfig must exist before headers are finalised ---
+
+    fn aac_audio(pid: u16) -> crate::disc::Stream {
+        crate::disc::Stream::Audio(AudioStream {
+            pid,
+            codec: Codec::Aac,
+            channels: AudioChannels::Stereo,
+            language: "eng".into(),
+            sample_rate: SampleRate::S44_1,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        })
+    }
+
+    /// Valid AAC-LC 44.1 kHz stereo ADTS frame (ASC = 0x12 0x10).
+    fn adts(payload: usize) -> Vec<u8> {
+        let len = 7 + payload;
+        let mut f = vec![0u8; len];
+        f[..3].copy_from_slice(&[0xFF, 0xF1, 0x50]);
+        f[3] = 0x80 | ((len >> 11) & 3) as u8;
+        f[4] = ((len >> 3) & 0xFF) as u8;
+        f[5] = (((len & 7) << 5) as u8) | 0x1F;
+        f[6] = 0xFC;
+        f
+    }
+
+    fn pes_at(pid: u16, data: Vec<u8>, pts: i64) -> PesPacket {
+        PesPacket {
+            pts: Some(pts),
+            ..ts_pes(pid, data)
+        }
+    }
+
+    fn video_plus_aac() -> (PipelinedPesStream, Sender<DemuxBatch>) {
+        let mut title = video_title(false);
+        title.streams.push(aac_audio(0x1100));
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![
+            (
+                0x1011,
+                Box::new(CountingParser {
+                    per_pes: 1,
+                    flush_n: 0,
+                    cp: Some(vec![1]),
+                }),
+            ),
+            (
+                0x1100,
+                Box::new(super::super::codec::adts::AdtsParser::new()),
+            ),
+        ];
+        make_stream(title, parsers, vec![(0x1011, 0), (0x1100, 1)])
+    }
+
+    // Video-first TS: the video config resolves before any AAC frame. Finalising
+    // then wrote A_AAC with no CodecPrivate over header-stripped frames.
+    #[test]
+    fn headers_wait_for_aac_config_when_video_arrives_first() {
+        let (mut stream, tx) = video_plus_aac();
+        tx.send(DemuxBatch::Ts(vec![pes_at(0x1011, vec![0; 8], 90_000)]))
+            .unwrap();
+        assert_eq!(stream.read().unwrap().map(|f| f.track), Some(0));
+        assert!(
+            !stream.headers_ready(),
+            "AAC track has no AudioSpecificConfig yet"
+        );
+        tx.send(DemuxBatch::Ts(vec![pes_at(0x1100, adts(16), 90_000)]))
+            .unwrap();
+        assert_eq!(stream.read().unwrap().map(|f| f.track), Some(1));
+        assert!(stream.headers_ready());
+        assert_eq!(stream.codec_private(1), Some(vec![0x12, 0x10]));
+    }
+
+    #[test]
+    fn audio_only_aac_title_waits_for_config() {
+        let mut title = DiscTitle::empty();
+        title.streams.push(aac_audio(0x1100));
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            0x1100,
+            Box::new(super::super::codec::adts::AdtsParser::new()),
+        )];
+        let (mut stream, tx) = make_stream(title, parsers, vec![(0x1100, 0)]);
+        assert!(!stream.headers_ready(), "no AAC frame yet → no ASC");
+        tx.send(DemuxBatch::Ts(vec![pes_at(0x1100, adts(16), 0)]))
+            .unwrap();
+        assert!(stream.read().unwrap().is_some());
+        assert!(stream.headers_ready());
+    }
+
+    // An AAC track that never yields a frame must not stall the header pump
+    // until the buffer cap: the wait is bounded by source time and by EOF.
+    #[test]
+    fn silent_aac_track_stops_blocking_headers_after_the_wait_bound() {
+        let (mut stream, tx) = video_plus_aac();
+        tx.send(DemuxBatch::Ts(vec![pes_at(0x1011, vec![0; 8], 0)]))
+            .unwrap();
+        stream.read().unwrap();
+        assert!(!stream.headers_ready());
+        // 4 s of source time: still waiting.
+        tx.send(DemuxBatch::Ts(vec![pes_at(
+            0x1011,
+            vec![0; 8],
+            4_000_000_000,
+        )]))
+        .unwrap();
+        stream.read().unwrap();
+        assert!(!stream.headers_ready());
+        tx.send(DemuxBatch::Ts(vec![pes_at(
+            0x1011,
+            vec![0; 8],
+            5_000_000_000,
+        )]))
+        .unwrap();
+        stream.read().unwrap();
+        assert!(stream.headers_ready(), "wait bound reached");
+        assert_eq!(stream.codec_private(1), None);
+    }
+
+    #[test]
+    fn silent_aac_track_does_not_block_headers_at_eof() {
+        let (mut stream, tx) = video_plus_aac();
+        tx.send(DemuxBatch::Ts(vec![pes_at(0x1011, vec![0; 8], 0)]))
+            .unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+        stream.read().unwrap();
+        assert!(!stream.headers_ready());
+        assert!(stream.read().unwrap().is_none());
+        assert!(stream.headers_ready(), "EOF: no AAC frame will ever come");
     }
 
     // --- DVD highway: keyframe flag must survive the PS → parser → frame path ---

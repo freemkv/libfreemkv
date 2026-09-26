@@ -271,9 +271,8 @@ mod tests {
         // Codecs whose parsers do no configuration extraction, paired with a
         // payload that is a REAL frame of that codec so the gate takes its
         // keep-path (a rejected frame proves nothing about the config answer).
-        let cases: [(Codec, Vec<u8>); 5] = [
-            // ADTS: syncword FFF1, MPEG-4 AAC-LC, 44.1 kHz, stereo, 7-byte frame.
-            (Codec::Aac, vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0xBF, 0xFC]),
+        // AAC is absent here: it derives an AudioSpecificConfig (see below).
+        let cases: [(Codec, Vec<u8>); 4] = [
             // MPEG-1 Layer II, 44.1 kHz, 128 kbit/s, stereo.
             (Codec::Mp2, vec![0xFF, 0xFD, 0x70, 0x00, 0x00, 0x00]),
             // MPEG-1 Layer III, 44.1 kHz, 128 kbit/s, stereo.
@@ -305,6 +304,20 @@ mod tests {
             parser.flush();
             assert_eq!(parser.codec_private(), None, "{codec:?}: after flush");
         }
+    }
+
+    // A valid ADTS frame (AAC-LC, 44.1 kHz, stereo, frame_length 7) must yield
+    // its AudioSpecificConfig as soon as the frame is parsed.
+    #[test]
+    fn aac_parser_derives_audio_specific_config_from_first_frame() {
+        let mut parser = parser_for_codec(Codec::Aac, None, false);
+        assert_eq!(parser.codec_private(), None);
+        let frames = parser.parse(&pes(
+            Some(0),
+            vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0xFF, 0xFC],
+        ));
+        assert_eq!(frames.len(), 1, "the frame is valid, not dropped");
+        assert_eq!(parser.codec_private(), Some(vec![0x12, 0x10]));
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub(crate) mod ebml;
 /// `fvi://` sink — freemkv's native per-picture video index. A write-only PES sink that emits
 /// one JSON-Lines record per coded picture; reuses the pure-data [`videomap`] model.
 pub(crate) mod fvi_sink;
+pub(crate) mod header_gate;
 pub(crate) mod m2ts;
 /// FMKV metadata header (used by `M2tsStream` / `NetworkStream` / `StdioStream`
 /// to round-trip codec_privates that don't fit inside the underlying format).
