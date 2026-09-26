@@ -540,7 +540,9 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
             // first_access_unit_pointer(2)), verified on a real HD-DVD EVO. Strip exactly 4
             // bytes/packet for a clean ES; a shorter skip splices sub-header into a frame.
             0xC0..=0xC7 => 4,
-            0xA0..=0xA7 => 7, // LPCM: sub_id + frames + ptr(2) + emphasis + quant_freq + channels
+            // LPCM: sub_id + frames + ptr(2); the 3-byte audio header (quant/rate/channels)
+            // is left for `LpcmParser`, which needs it to unpack 20/24-bit samples.
+            0xA0..=0xA7 => 4,
             _ => 1,
         };
         let start = skip.min(payload.len());
@@ -759,7 +761,8 @@ mod tests {
             0x00, 0x00, 0x01, 0xBD, 0x00, 0x0C, // length = 12
             0x80, 0x00, 0x00, // no PTS, header_data_len=0
             0xA0, // sub-stream ID: LPCM stream 0
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // LPCM sub-header (6 bytes after sub_id)
+            0x01, 0x00, 0x00, // frames + first_access_unit ptr (stripped)
+            0x00, 0x00, 0x00, // audio header (kept for the LPCM parser)
             0x01, 0x02, // LPCM payload
         ];
         data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
@@ -767,7 +770,8 @@ mod tests {
         let packets = demuxer.feed(&data);
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].sub_stream_id, Some(0xA0));
-        assert_eq!(packets[0].data, vec![0x01, 0x02]);
+        // The 3-byte audio header (quant/rate/channels) stays for the LPCM parser.
+        assert_eq!(packets[0].data, vec![0x00, 0x00, 0x00, 0x01, 0x02]);
     }
 
     // --- Incremental feeding ---
