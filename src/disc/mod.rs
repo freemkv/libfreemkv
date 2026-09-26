@@ -545,6 +545,18 @@ fn merged_extents<'a>(extents: impl Iterator<Item = &'a Extent>) -> Vec<(u32, u3
     crate::udf::merge_ranges(&ranges)
 }
 
+// The whole-disc bus-removal gate: every stream file's extents unioned with the titles'.
+fn bus_content_ranges(mut ranges: Vec<(u32, u32)>, titles: &[DiscTitle]) -> Vec<(u32, u32)> {
+    ranges.extend(
+        titles
+            .iter()
+            .flat_map(|t| &t.extents)
+            .map(|e| (e.start_lba, e.sector_count)),
+    );
+    ranges.sort_by_key(|r| r.0);
+    crate::udf::merge_ranges(&ranges)
+}
+
 // Corrects a title's TrueHD channels/sample-rate/Atmos by probing the first decrypted major
 // sync (`reader` must yield DECRYPTED sectors: mux time, not scan).
 pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut DiscTitle) {
@@ -1776,7 +1788,12 @@ impl Disc {
 
         // The AACS bus stage is decided ONCE from the handshake result, captured
         // before `handshake` is moved into `scan_with` (see `BusStage`).
-        let bus_key = handshake.as_ref().and_then(|h| h.read_data_key);
+        let bus_key = Self::bus_key_for_disc(
+            &mut buffered,
+            &udf_fs,
+            handshake.as_ref().and_then(|h| h.read_data_key),
+        );
+        let stream_ranges = Self::stream_file_ranges(&mut buffered, &udf_fs);
 
         tracing::info!(target: "freemkv::scan", "phase: parsing titles/streams");
         let disc = Self::scan_with(
@@ -1792,13 +1809,70 @@ impl Disc {
         // Wire the SINGLE de-bus point onto the drive from the handshake result,
         // BEFORE the caller samples keys or muxes (the earlier UDF/metadata reads
         // ran under default Passthrough).
-        Self::wire_bus_removal(session, bus_key, disc.encrypted_content_ranges());
+        let bus_ranges = bus_content_ranges(stream_ranges, &disc.titles);
+        Self::wire_bus_removal(session, bus_key, bus_ranges);
 
         // No CSS key recovery at scan time: DVD CSS keys are per-title and are
         // re-cracked keylessly at read/decrypt time (`disc.css` stays unset),
         // so log the format rather than a key state that is always `None`.
         tracing::info!(target: "freemkv::scan", format = ?disc.format, titles = disc.titles.len(), "phase: scan complete");
         Ok(disc)
+    }
+
+    // Drops the cert-route Read Data Key when the content certificate's Bus Encryption
+    // Enabled flag (AACS spec; libaacs gates on `bee && bec`) is clear. An unreadable
+    // cert keeps the key: the drive serving one is the only remaining signal.
+    pub(crate) fn bus_key_for_disc(
+        reader: &mut dyn SectorSource,
+        udf_fs: &udf::UdfFs,
+        read_data_key: Option<[u8; 16]>,
+    ) -> Option<[u8; 16]> {
+        read_data_key?;
+        let bee = crate::aacs::read_first(
+            &crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::ContentCert),
+            |p| udf_fs.read_file(reader, p),
+        )
+        .ok()
+        .as_deref()
+        .and_then(crate::aacs::inf::parse_content_cert)
+        .map(|c| c.bus_encryption);
+        if bee == Some(false) {
+            tracing::info!(target: "freemkv::scan", "content cert BEE=0: bus removal off");
+            return None;
+        }
+        read_data_key
+    }
+
+    // Recorded extents of every file under /BDMV/STREAM (m2ts, SSIF, fmts): the
+    // AACS Clip AV stream files, all of which the drive bus-encrypts on a BEE disc.
+    pub(crate) fn stream_file_ranges(
+        reader: &mut dyn SectorSource,
+        udf_fs: &udf::UdfFs,
+    ) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let mut stack: Vec<&udf::DirEntry> = udf_fs.find_dir("/BDMV/STREAM").into_iter().collect();
+        while let Some(dir) = stack.pop() {
+            for e in &dir.entries {
+                if e.is_dir {
+                    stack.push(e);
+                    continue;
+                }
+                match udf_fs.extents_abs_at(reader, e.meta_lba) {
+                    Ok(exts) => out.extend(
+                        exts.iter()
+                            .filter(|x| x.recorded && x.len > 0)
+                            .map(|x| (x.lba, (x.len as u64).div_ceil(2048) as u32)),
+                    ),
+                    Err(err) => tracing::warn!(
+                        target: "freemkv::scan",
+                        file = %e.name,
+                        code = err.code(),
+                        "stream file extents unreadable; excluded from bus removal"
+                    ),
+                }
+            }
+        }
+        out
     }
 
     /// Wire the SINGLE AACS bus-removal de-bus point onto `session` from a
@@ -2706,14 +2780,11 @@ impl Disc {
         ))
     }
 
-    /// The disc's AACS-encrypted content as a sorted, merged, disjoint set of
-    /// `(start_lba, sector_count)` ranges — the union of every title's m2ts
-    /// stream extents. The authoritative "which sectors are encrypted" map:
-    /// a sector is encrypted content **iff** it falls inside one of these
-    /// ranges; everything else (UDF filesystem, BDMV nav, PLAYLIST/CLIPINF)
-    /// is always clear. The in-read decrypt-verify gate uses this so it never
-    /// mistakes non-content bytes (no TS sync) for ciphertext. Empty when the
-    /// disc has no parsed titles; callers fall back to "no content gate".
+    /// The scanned titles' encrypted content as a sorted, merged, disjoint set
+    /// of `(start_lba, sector_count)` ranges — the union of every title's
+    /// stream extents. Covers kept titles ONLY: stream files no title plays
+    /// are absent, so this is not a whole-disc map (the live drive's bus gate
+    /// also covers every `/BDMV/STREAM` file). Empty when no titles parsed.
     pub fn encrypted_content_ranges(&self) -> Vec<(u32, u32)> {
         merged_extents(self.titles.iter().flat_map(|t| &t.extents))
     }
@@ -8087,6 +8158,99 @@ mod tests {
             Disc::detect_disc_format(&mut disc, &udf, &sd),
             DiscFormat::BluRay,
             "an SD title on a BDMV disc must never downgrade the disc to DVD"
+        );
+    }
+
+    // ── whole-disc bus-removal gate ───────────────────────────────────────
+    // BD tree: two m2ts (only one in a title), an SSIF, a clear index.bdmv, and
+    // an AACS content cert whose byte 1 carries the BEE flag.
+    fn bus_fixture(cert_byte1: u8) -> (crate::udf::fixture::MemDisc, udf::UdfFs) {
+        use crate::udf::fixture::*;
+        let mut cert = vec![0u8; 32];
+        cert[0] = 0x10;
+        cert[1] = cert_byte1;
+        let stream = DirSpec {
+            name: "STREAM".into(),
+            icb_lba: 30,
+            dir_data_lba: 31,
+            files: vec![
+                file("00001.m2ts", 40, 1_000, 3 * 2048, true),
+                file("00002.m2ts", 41, 2_000, 6 * 2048, true),
+            ],
+            subdirs: vec![DirSpec {
+                name: "SSIF".into(),
+                icb_lba: 32,
+                dir_data_lba: 33,
+                files: vec![file("00003.ssif", 42, 3_000, 3 * 2048, true)],
+                subdirs: vec![],
+            }],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![
+                DirSpec {
+                    name: "BDMV".into(),
+                    icb_lba: 20,
+                    dir_data_lba: 21,
+                    files: vec![file("index.bdmv", 43, 500, 2048, true)],
+                    subdirs: vec![stream],
+                },
+                DirSpec {
+                    name: "AACS".into(),
+                    icb_lba: 22,
+                    dir_data_lba: 23,
+                    files: vec![file_with("Content000.cer", 44, 600, cert, true)],
+                    subdirs: vec![],
+                },
+            ],
+        };
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        (disc, udf)
+    }
+
+    // Regression (v1.7.0 de-bussed every encrypted unit): the cert-route bus gate
+    // must cover EVERY stream file, not just kept titles, else dir:// / ISO / sweep
+    // leave non-title clips bus-encrypted. Clear nav (index.bdmv) stays outside.
+    #[test]
+    fn bus_content_ranges_cover_every_stream_file_not_just_titles() {
+        use crate::udf::fixture::PART_START;
+        let (mut mem, udf) = bus_fixture(0x80);
+        let mut feature = DiscTitle::empty();
+        feature.extents = vec![ext(PART_START + 1_000, 3)];
+        let stream = Disc::stream_file_ranges(&mut mem, &udf);
+        assert_eq!(
+            bus_content_ranges(stream, &[feature]),
+            vec![
+                (PART_START + 1_000, 3),
+                (PART_START + 2_000, 6),
+                (PART_START + 3_000, 3)
+            ],
+            "non-title m2ts and SSIF must be de-bussed too; nav stays clear"
+        );
+    }
+
+    // libaacs gates bus decrypt on the content cert BEE flag (`bee && bec`): a
+    // BEE=0 disc must not be de-bussed even when the drive served a Read Data Key.
+    #[test]
+    fn bus_key_dropped_when_content_cert_bee_is_clear() {
+        let rdk = Some([0x5Au8; 16]);
+        let (mut mem, udf) = bus_fixture(0x00);
+        assert_eq!(
+            Disc::bus_key_for_disc(&mut mem, &udf, rdk),
+            None,
+            "BEE=0 content cert must force Passthrough"
+        );
+        let (mut mem, udf) = bus_fixture(0x80);
+        assert_eq!(
+            Disc::bus_key_for_disc(&mut mem, &udf, rdk),
+            rdk,
+            "BEE=1 keeps the cert-route Read Data Key"
         );
     }
 
