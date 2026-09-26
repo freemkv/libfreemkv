@@ -1137,9 +1137,7 @@ fn read_directory(
             });
         }
         let mut dir_data: Vec<u8> = Vec::new();
-        // Declared FID-list byte length (sum of the recorded extents' lengths),
-        // kept apart from the sector-rounded buffer so `size` and the FID-loop
-        // bound stay the honest declared length, never the padded buffer.
+        // Declared FID-list byte length (sum of the recorded extents' lengths).
         let mut total_len: u32 = 0;
         let mut block = icb;
         let mut ad_start = ad_off;
@@ -1181,11 +1179,13 @@ fn read_directory(
                     }
                     break;
                 }
-                // Types 0/1/2 are allocated extents whose sectors hold FID data
-                // (the 2-bit extent type is masked out of `data_len` above). A
-                // zero-length descriptor terminates the AD list.
+                // A zero-length descriptor terminates the AD list.
                 if data_len == 0 {
                     break 'chain;
+                }
+                // Types 1/2 are unrecorded (4/14.14.1.1): no FID data at data_lba.
+                if extent_type != 0 {
+                    continue;
                 }
                 // Bound the cumulative allocation before growing: `data_len` is a
                 // disc-controlled 30-bit value, and multiple extents could
@@ -1215,6 +1215,8 @@ fn read_directory(
                     let o = base + s as usize * 2048;
                     read_sector(reader, abs, &mut dir_data[o..o + 2048])?;
                 }
+                // Drop the sector padding so the next extent's FIDs follow directly.
+                dir_data.truncate(base + data_len as usize);
                 total_len = total_len.saturating_add(data_len);
             }
 
@@ -1412,12 +1414,12 @@ pub(crate) fn parse_udf_name(data: &[u8]) -> String {
 /// first. Shared range utility — also used to build the disc's encrypted-content
 /// extent map (see `Disc::encrypted_content_ranges`).
 pub(crate) fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
-    if ranges.is_empty() {
-        return Vec::new();
-    }
-    let mut result = vec![ranges[0]];
-    for &(start, count) in &ranges[1..] {
-        let last = result.last_mut().unwrap();
+    let mut result: Vec<(u32, u32)> = Vec::new();
+    for &(start, count) in ranges {
+        let Some(last) = result.last_mut() else {
+            result.push((start, count));
+            continue;
+        };
         // Saturating arithmetic: ranges derive from disc-controlled ICB
         // LBAs/lengths, so a corrupt disc could otherwise overflow u32
         // (panic in debug, wrap in release).
@@ -1440,10 +1442,10 @@ pub(crate) fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
 /// Used for Volume Identifier and other UDF descriptor strings.
 /// The first byte of content is a compression ID: 8 = ASCII, 16 = UTF-16BE.
 fn parse_dstring(data: &[u8]) -> String {
-    if data.is_empty() {
+    let Some(&len) = data.last() else {
         return String::new();
-    }
-    let len = *data.last().unwrap() as usize;
+    };
+    let len = len as usize;
     if len == 0 || len > data.len() {
         return String::new();
     }
@@ -1621,6 +1623,9 @@ impl SectorSource for BufferedSectorReader<'_> {
                 return Ok(2048);
             }
             let block = self.batch;
+            // Invalidate before the buffer is touched: a failed read below would
+            // otherwise leave the old window pointing at shrunk/overwritten bytes.
+            self.cache_sectors = 0;
             self.cache.resize(block as usize * 2048, 0);
             match self.inner.read_sectors(lba, block, &mut self.cache, true) {
                 Ok(_) => {
@@ -4624,34 +4629,33 @@ mod tests {
 
     #[test]
     fn read_directory_masks_the_extent_type_bits_out_of_the_ad_length() {
-        // ECMA-167 4/14.14.1.1: a short_ad's head 32-bit field is a 30-bit length plus a 2-bit
-        // extent TYPE (bits 30..31), which must be masked off before use as a byte count;
-        // folding them in yields >= 1 GiB, tripping MAX_DIR_BYTES. Encoded here as type 1.
+        // ECMA-167 4/14.14.1.1: the head field is a 30-bit length plus a 2-bit extent type.
+        // A type-1 AD whose 30-bit length is 0 terminates the list; unmasked it reads as
+        // non-zero, so the walk runs on into the trailing GHOST extent.
         let mut fids = Vec::new();
         push_fid_iu(&mut fids, "", 5, true, true, 0);
-        push_fid_iu(&mut fids, "INDEX.BDMV", 7, false, false, 0);
+        push_fid_iu(&mut fids, "INDEX.BDMV", 7, false, false, 1959);
+        assert_eq!(fids.len(), 2048);
         let mut dir = [0u8; 2048];
-        dir[..fids.len()].copy_from_slice(&fids);
-        let raw = 0x4000_0000u32 | fids.len() as u32;
+        dir.copy_from_slice(&fids);
+        let (ghost, ghost_len) = fid_sector("GHOST.CLPI", 9);
 
-        for tag in [261u16, 266u16] {
-            let mut reader = MemReader::new();
-            reader.put(5, build_dir_icb_tagged(tag, 0, raw, 60));
-            reader.put(60, dir);
-            reader.put(7, build_efe_icb(1024, 1024, 0));
-
-            let parsed =
-                read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
-                    .unwrap_or_else(|e| {
-                        panic!("tag {tag}: extent-type bits must not inflate the length: {e:?}")
-                    });
-            assert_eq!(child_names(&parsed), vec!["INDEX.BDMV".to_string()]);
-            assert_eq!(
-                parsed.size,
-                fids.len() as u64,
-                "tag {tag}: the reported directory size is the 30-bit length only"
-            );
+        let mut body = Vec::new();
+        for (raw, lba) in [(2048u32, 60u32), (1 << 30, 0), (ghost_len, 61)] {
+            body.extend_from_slice(&raw.to_le_bytes());
+            body.extend_from_slice(&lba.to_le_bytes());
         }
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_flagged(0, &body));
+        reader.put(60, dir);
+        reader.put(61, ghost);
+        reader.put(7, build_efe_icb(1024, 1024, 0));
+        reader.put(9, build_efe_icb(1024, 1024, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("directory parses");
+        assert_eq!(child_names(&parsed), vec!["INDEX.BDMV".to_string()]);
+        assert_eq!(parsed.size, 2048);
     }
 
     #[test]
@@ -5099,6 +5103,148 @@ mod tests {
         let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
             .expect("a two-sector directory parses");
         assert_eq!(child_names(&parsed), vec!["FIRST.CLPI".to_string()]);
+    }
+
+    /// Serves `CountReader::expected` data, except reads touching LBA >= `bad`
+    /// scribble 0xEE into the buffer and fail (a scratched region).
+    struct FailingTailReader {
+        bad: u32,
+    }
+
+    impl SectorSource for FailingTailReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            let need = count as usize * 2048;
+            if buf.len() < need {
+                return Err(Error::UdfBufferTooSmall);
+            }
+            if lba.saturating_add(count as u32) > self.bad {
+                buf[..need].fill(0xEE);
+                return Err(Error::UdfBufferTooSmall);
+            }
+            for i in 0..count as u32 {
+                let off = i as usize * 2048;
+                buf[off..off + 2048].copy_from_slice(&CountReader::expected(lba + i));
+            }
+            Ok(need)
+        }
+    }
+
+    // A failed miss (batch AND single retry fail) must not leave the old window
+    // marked valid over a shrunk/overwritten buffer: the next hit panicked slicing
+    // past the 2048-byte cache, or served the failed read's bytes.
+    #[test]
+    fn buffered_reader_failed_miss_invalidates_the_window() {
+        let mut inner = FailingTailReader { bad: 100 };
+        let mut br = BufferedSectorReader::new(&mut inner, 8);
+        let mut buf = [0u8; 2048];
+        br.read_sectors(0, 1, &mut buf, true)
+            .expect("seed window 0..8");
+        assert!(br.read_sectors(100, 1, &mut buf, true).is_err());
+        br.read_sectors(5, 1, &mut buf, true)
+            .expect("sector 5 is readable");
+        assert_eq!(buf, CountReader::expected(5), "stale window served");
+    }
+
+    // Offset 0 of the old window stays in bounds after the shrink, so a failed
+    // miss served the failed read's junk instead of panicking.
+    #[test]
+    fn buffered_reader_failed_miss_does_not_serve_its_junk_from_the_old_window() {
+        let mut inner = FailingTailReader { bad: 100 };
+        let mut br = BufferedSectorReader::new(&mut inner, 8);
+        let mut buf = [0u8; 2048];
+        br.read_sectors(0, 1, &mut buf, true)
+            .expect("seed window 0..8");
+        assert!(br.read_sectors(100, 1, &mut buf, true).is_err());
+        br.read_sectors(0, 1, &mut buf, true).expect("sector 0");
+        assert_eq!(buf, CountReader::expected(0), "failed read's bytes served");
+    }
+
+    // Build a sector holding one FID for `name` whose ICB is at `icb`.
+    fn fid_sector(name: &str, icb: u32) -> ([u8; 2048], u32) {
+        let mut v = Vec::new();
+        push_fid_iu(&mut v, name, icb, false, false, 0);
+        let mut s = [0u8; 2048];
+        s[..v.len()].copy_from_slice(&v);
+        (s, v.len() as u32)
+    }
+
+    // ECMA-167 4/14.14.1.1: extent types 1 (allocated, not recorded) and 2 (not
+    // allocated) hold no FID data; their LBA must not be read as directory content.
+    #[test]
+    fn read_directory_does_not_read_unrecorded_extents_as_fids() {
+        for ext_type in [1u32, 2] {
+            let mut e0 = Vec::new();
+            push_fid_iu(&mut e0, "", 5, true, true, 0);
+            push_fid_iu(&mut e0, "FIRST.CLPI", 7, false, false, 1959);
+            assert_eq!(e0.len(), 2048);
+            let mut sec0 = [0u8; 2048];
+            sec0.copy_from_slice(&e0);
+            let (ghost, _) = fid_sector("GHOST.CLPI", 9);
+            let (sec1, len1) = fid_sector("SECOND.CLPI", 8);
+
+            let mut body = Vec::new();
+            for (raw, lba) in [(2048u32, 60u32), ((ext_type << 30) | 2048, 62), (len1, 61)] {
+                body.extend_from_slice(&raw.to_le_bytes());
+                body.extend_from_slice(&lba.to_le_bytes());
+            }
+            let mut reader = MemReader::new();
+            reader.put(5, build_dir_icb_flagged(0, &body));
+            reader.put(60, sec0);
+            reader.put(61, sec1);
+            reader.put(62, ghost);
+            reader.put(7, build_efe_icb(11, 2048, 0));
+            reader.put(8, build_efe_icb(22, 2048, 0));
+            reader.put(9, build_efe_icb(33, 2048, 0));
+
+            let parsed =
+                read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+                    .expect("directory with an unrecorded extent parses");
+            assert_eq!(
+                child_names(&parsed),
+                vec!["FIRST.CLPI".to_string(), "SECOND.CLPI".to_string()],
+                "type {ext_type} extent was read as FID data"
+            );
+            assert_eq!(parsed.size, 2048 + len1 as u64);
+        }
+    }
+
+    // A non-final extent shorter than a sector must not leave sector padding
+    // between it and the next extent's FIDs (the walk stopped at the padding).
+    #[test]
+    fn read_directory_joins_a_short_non_final_extent_without_padding() {
+        let mut e0 = Vec::new();
+        push_fid_iu(&mut e0, "", 5, true, true, 0);
+        push_fid_iu(&mut e0, "FIRST.CLPI", 7, false, false, 0);
+        let len0 = e0.len() as u32;
+        let mut sec0 = [0u8; 2048];
+        sec0[..e0.len()].copy_from_slice(&e0);
+        let (sec1, len1) = fid_sector("SECOND.CLPI", 8);
+
+        let mut body = Vec::new();
+        for (raw, lba) in [(len0, 60u32), (len1, 61)] {
+            body.extend_from_slice(&raw.to_le_bytes());
+            body.extend_from_slice(&lba.to_le_bytes());
+        }
+        let mut reader = MemReader::new();
+        reader.put(5, build_dir_icb_flagged(0, &body));
+        reader.put(60, sec0);
+        reader.put(61, sec1);
+        reader.put(7, build_efe_icb(11, 2048, 0));
+        reader.put(8, build_efe_icb(22, 2048, 0));
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("multi-extent directory parses");
+        assert_eq!(
+            child_names(&parsed),
+            vec!["FIRST.CLPI".to_string(), "SECOND.CLPI".to_string()]
+        );
+        assert_eq!(parsed.size, (len0 + len1) as u64);
     }
 }
 
