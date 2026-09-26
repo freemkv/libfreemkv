@@ -247,9 +247,9 @@ impl CodecParser for H264Parser {
                     if nal_type == NAL_SLICE_IDR {
                         keyframe = true;
                     }
-                    // Measure coding type from each slice header (§7.3.3: first_mb_in_slice,
-                    // slice_type, both ue(v)) after unescaping EBSP (§7.3.1) — large
-                    // first_mb_in_slice needs escaped 0x00 0x00. The FIRST slice sets the picture's `coding_type`; EVERY slice feeds `all_vcl_intra` for the open-GOP promotion below.
+                    // Slice header (§7.3.3: first_mb_in_slice, slice_type, both ue(v)), read
+                    // after unescaping EBSP (§7.3.1). The first slice sets `coding_type`; each
+                    // slice of the first picture feeds `all_vcl_intra`.
                     let is_slice = nal_type == NAL_SLICE_NON_IDR || nal_type == NAL_SLICE_IDR;
                     // Once the first picture is over (or already non-intra with its coding
                     // type known), no later slice can change the outcome: skip the parse.
@@ -258,7 +258,7 @@ impl CodecParser for H264Parser {
                         let header = unescape_ebsp_prefix(&nal[1..]);
                         let mut br = BitReader::new(&header);
                         match (br.read_ue(), br.read_ue()) {
-                            (Some(0), Some(_)) if saw_vcl => first_pic_done = true,
+                            (Some(0), _) if saw_vcl => first_pic_done = true,
                             (Some(_first_mb), Some(slice_type)) => {
                                 let ct = h264_slice_coding_type(slice_type);
                                 if coding_type.is_none() {
@@ -289,9 +289,9 @@ impl CodecParser for H264Parser {
             return Vec::new();
         }
 
-        // Open-GOP resync anchor: BD titles use open GOPs whose random-access point is a
-        // non-IDR I-frame. H.264 signals it with a recovery_point SEI, which this parser
-        // does NOT read — it infers the anchor from the slices. Without treating it as a keyframe the resync gate (`mux/resync.rs`) can miss it and drop frames to EOF. Promote only when EVERY VCL slice is intra (a picture with a P/B slice is not a random-access point) and only on the base view (`!mvc`): a dependent MVC view is never an independent anchor.
+        // Open-GOP anchor heuristic (recovery_point SEI §D.2.8 is authoritative, not read):
+        // promote when every slice of the first picture is intra, a following P field
+        // allowed, base view only. Else the resync gate can drop frames to EOF.
         if saw_vcl && all_vcl_intra && !mvc {
             keyframe = true;
         }
@@ -645,8 +645,8 @@ mod tests {
         );
     }
 
-    // 1080i open-GOP anchor: an I first field paired with a P second field (which
-    // references only the I field) is a random-access point and must promote.
+    // 1080i open-GOP anchor (heuristic, not spec-guaranteed; recovery_point SEI §D.2.8 is
+    // authoritative): an I first field with a P second field is promoted.
     #[test]
     fn field_coded_i_then_p_pair_is_a_keyframe() {
         // I field: slices at first_mb 0 (0x88) and 1 ('010'+'0001000'+stop -> 0x42 0x20);
@@ -667,6 +667,20 @@ mod tests {
         assert!(
             frames[0].keyframe,
             "an I/P field pair is an open-GOP anchor"
+        );
+    }
+
+    // A second-field slice whose slice_type is truncated still starts a new picture
+    // (first_mb 0), so it must not veto the I first field.
+    #[test]
+    fn truncated_second_field_slice_type_does_not_block_promotion() {
+        // I field (0x88), then first_mb 0 with nothing after it (0x80: '1', then zeros).
+        let au = vec![0x00, 0x00, 0x01, 0x61, 0x88, 0x00, 0x00, 0x01, 0x61, 0x80];
+        let frames = H264Parser::new().parse(&make_pes(au, Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert!(
+            frames[0].keyframe,
+            "second-field header truncation is not a veto"
         );
     }
 

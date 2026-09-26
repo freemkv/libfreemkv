@@ -58,7 +58,15 @@ const MPEG2_L1: [u32; 15] = [
 ];
 const MPEG2_L23: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
 
-fn frame_header(data: &[u8]) -> Option<Header> {
+// Free-format frames carry no size: it is the spacing to the next header with the same
+// version/layer/bitrate/rate, learned once per stream (excluding padding).
+fn free_format_spacing(data: &[u8]) -> Option<usize> {
+    (4..data.len().saturating_sub(2)).find(|&i| {
+        data[i] == 0xFF && data[i + 1] == data[1] && data[i + 2] & 0xFC == data[2] & 0xFC
+    })
+}
+
+fn frame_header(data: &[u8], free_size: &mut Option<usize>) -> Option<Header> {
     if !matches!(mpa_verdict(data), MpaVerdict::Valid) {
         return None;
     }
@@ -85,8 +93,19 @@ fn frame_header(data: &[u8]) -> Option<Header> {
         _ => 1152,
     };
     let bytes = if bitrate == 0 {
-        // Free-format has no signalled size; retain PES-granular passthrough.
-        data.len()
+        let slot = if layer == 3 { 4 } else { 1 };
+        let pad = padding as usize * slot;
+        match *free_size {
+            Some(n) => n + pad,
+            None => match free_format_spacing(data) {
+                Some(d) if d > pad + 4 => {
+                    *free_size = Some(d - pad);
+                    d
+                }
+                // Next header not buffered yet: ask the framer to wait.
+                _ => data.len().saturating_add(1),
+            },
+        }
     } else if layer == 3 {
         ((12 * bitrate / rate + padding) * 4) as usize
     } else {
@@ -102,6 +121,8 @@ fn frame_header(data: &[u8]) -> Option<Header> {
 
 pub struct MpegAudioParser {
     frames: AudioFrames,
+    // Free-format frame size (without padding), learned from the first sync spacing.
+    free_size: Option<usize>,
 }
 impl Default for MpegAudioParser {
     fn default() -> Self {
@@ -112,6 +133,7 @@ impl MpegAudioParser {
     pub fn new() -> Self {
         Self {
             frames: AudioFrames::new("mpegaudio"),
+            free_size: None,
         }
     }
     pub fn dropped_frames(&self) -> u64 {
@@ -123,7 +145,8 @@ impl MpegAudioParser {
 }
 impl CodecParser for MpegAudioParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        self.frames.parse(pes, 4, frame_header)
+        let free_size = &mut self.free_size;
+        self.frames.parse(pes, 4, |d| frame_header(d, free_size))
     }
     fn flush(&mut self) -> Vec<Frame> {
         self.frames.flush()
@@ -162,7 +185,7 @@ mod tests {
     #[test]
     fn mp3_frame_fixture_is_exactly_one_frame() {
         let f = mp3_frame();
-        assert_eq!(frame_header(&f).map(|h| h.bytes), Some(f.len()));
+        assert_eq!(frame_header(&f, &mut None).map(|h| h.bytes), Some(f.len()));
     }
 
     #[test]
@@ -264,9 +287,47 @@ mod tests {
         let mut p = MpegAudioParser::new();
         let mut frame = mp3_frame();
         frame[2] = 0x00; // bitrate_index = 0000 (free format); sync/layer/rate ok
-        let f = p.parse(&make_pes(frame, Some(0)));
-        assert_eq!(f.len(), 1, "free-format frame kept");
+        // Its size is the spacing to the next header, so it emits once that arrives.
+        let f = p.parse(&make_pes(frame.repeat(2), Some(0)));
+        assert_eq!(f.len(), 2, "free-format frames kept");
         assert_eq!(p.dropped_frames(), 0);
+    }
+
+    // Free-format frame: bitrate_index 0, 44.1 kHz, no padding, 300 bytes total.
+    fn free_frame() -> Vec<u8> {
+        let mut f = vec![0xFF, 0xFB, 0x00, 0x00];
+        f.resize(300, 0xAA);
+        f
+    }
+
+    // Free-format size comes from sync spacing, so several frames in one PES each get
+    // one frame's duration instead of one AU swallowing the rest of the buffer.
+    #[test]
+    fn free_format_frames_in_one_pes_are_split_with_distinct_pts() {
+        let mut p = MpegAudioParser::new();
+        let f = p.parse(&make_pes(free_frame().repeat(3), Some(0)));
+        assert_eq!(
+            f.len(),
+            3,
+            "two sync-bounded frames plus the known-size third"
+        );
+        for (i, fr) in f.iter().enumerate() {
+            assert_eq!(fr.data, free_frame());
+            assert_eq!(fr.pts_ns, i as i64 * (1152 * 1_000_000_000i64 / 44100));
+        }
+    }
+
+    #[test]
+    fn free_format_frame_split_across_pes_reassembles() {
+        let data = free_frame().repeat(2);
+        for split in [1, 4, 150, 299, 300, 301, 450] {
+            let mut p = MpegAudioParser::new();
+            let mut f = p.parse(&make_pes(data[..split].to_vec(), Some(0)));
+            f.extend(p.parse(&make_pes(data[split..].to_vec(), None)));
+            f.extend(p.parse(&make_pes(free_frame(), None)));
+            assert_eq!(f.len(), 3, "split {split}");
+            assert!(f.iter().all(|fr| fr.data == free_frame()), "split {split}");
+        }
     }
 
     #[test]
@@ -370,7 +431,7 @@ mod tests {
             ([0xff, 0xf3, 0x80, 0], 208, 576, 22050),
             ([0xff, 0xe3, 0x80, 0], 417, 576, 11025),
         ] {
-            let h = frame_header(&header).unwrap();
+            let h = frame_header(&header, &mut None).unwrap();
             assert_eq!((h.bytes, h.samples, h.rate), (bytes, samples, rate));
         }
     }

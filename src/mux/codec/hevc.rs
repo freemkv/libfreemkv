@@ -60,11 +60,11 @@ fn hevc_slice_coding_type(slice_type: u32) -> Option<CodingType> {
     }
 }
 
-// The `pps_pic_parameter_set_id` (first ue(v)) of a PPS NAL — the key under which each PPS is
-// stored so a slice's referenced PPS is resolved by its own id. `None` if the PPS is too short.
 // Number of PPS ids a stream may use: `pps_pic_parameter_set_id` is 0..=63 (H.265 §7.4.3.3).
 const HEVC_MAX_PPS_COUNT: usize = 64;
 
+// The `pps_pic_parameter_set_id` (first ue(v)) of a PPS NAL — the key under which each PPS is
+// stored so a slice's referenced PPS is resolved by its own id. `None` if the PPS is too short.
 fn hevc_pps_id(pps_nal: &[u8]) -> Option<u32> {
     BitReader::new(pps_nal.get(2..)?).read_ue()
 }
@@ -192,6 +192,8 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static FORCE_FRAMING_DESYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Count of access units the self-check dropped; real input must never move it.
+    static GUARD_DROPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // 33-bit 90kHz PTS wraps at 2^33 ticks (~26.5h). A backward step of ~2^33 is a
@@ -272,39 +274,35 @@ impl HevcParser {
         let Some(raw) = nal.get(2..) else {
             return;
         };
-        let rbsp = strip_emulation_prevention(raw);
-        let mut i = 0usize;
-        // payloadType: sum of 0xFF run + final byte. Exhausting the RBSP ends the
-        // walk; the remaining `let ... else break` arms below handle a TRUNCATED
-        // message, which is a different condition from a clean end.
-        while let Some(payload_type) = read_sei_ff_value(&rbsp, &mut i) {
-            // payloadSize: same ff-extension coding.
-            let Some(payload_size) = read_sei_ff_value(&rbsp, &mut i) else {
+        // Unescape on the fly: only a payload being captured is copied, so a stream
+        // lacking one HDR10 message costs no per-AU RBSP copy.
+        let mut rbsp = RbspBytes::new(raw);
+        // payloadType/payloadSize use ff-extension coding. A clean end of the RBSP ends
+        // the walk; a trailing 0x80 is a bogus type whose size read fails.
+        while let Some(payload_type) = read_sei_ff_value(&mut rbsp) {
+            let Some(payload_size) = read_sei_ff_value(&mut rbsp) else {
                 break;
             };
             let payload_size = payload_size as usize;
-            let Some(payload) = rbsp.get(i..i.saturating_add(payload_size)) else {
-                break; // truncated / malformed payload length — stop scanning
+            let wanted = match payload_type {
+                SEI_MASTERING_DISPLAY_COLOUR_VOLUME => self.sei_mastering.is_none(),
+                SEI_CONTENT_LIGHT_LEVEL_INFO => self.sei_content_light.is_none(),
+                _ => false,
             };
-            match payload_type {
-                SEI_MASTERING_DISPLAY_COLOUR_VOLUME if self.sei_mastering.is_none() => {
-                    if let Some(m) = parse_mastering_display(payload) {
-                        self.sei_mastering = Some(m);
-                    }
+            if !wanted {
+                if rbsp.by_ref().take(payload_size).count() < payload_size {
+                    break; // truncated payload — stop scanning
                 }
-                SEI_CONTENT_LIGHT_LEVEL_INFO if self.sei_content_light.is_none() => {
-                    if let Some(c) = parse_content_light_level(payload) {
-                        self.sei_content_light = Some(c);
-                    }
-                }
-                _ => {}
+                continue;
             }
-            i += payload_size;
-            // An RBSP trailing byte (0x80) or padding zeros after the last
-            // message aren't another payloadType. `read_sei_ff_value` returning
-            // None handles end-of-buffer; a lone 0x80 is a bogus type failing the size read.
-            if i >= rbsp.len() {
+            let payload: Vec<u8> = rbsp.by_ref().take(payload_size).collect();
+            if payload.len() < payload_size {
                 break;
+            }
+            if payload_type == SEI_MASTERING_DISPLAY_COLOUR_VOLUME {
+                self.sei_mastering = parse_mastering_display(&payload);
+            } else {
+                self.sei_content_light = parse_content_light_level(&payload);
             }
         }
     }
@@ -611,6 +609,8 @@ impl CodecParser for HevcParser {
         // construction, but a desynced buffer would surface as "Invalid NAL unit
         // size". Drop it (log src) rather than emit a mis-framed access unit.
         if !length_prefix_tiles(&frame_data) {
+            #[cfg(test)]
+            GUARD_DROPS.with(|c| c.set(c.get() + 1));
             tracing::warn!(
                 target: "freemkv::mux::hevc",
                 src = ?pes.source,
@@ -793,13 +793,46 @@ fn strip_emulation_prevention(rbsp: &[u8]) -> Vec<u8> {
     out
 }
 
+// RBSP bytes of an EBSP with emulation-prevention bytes dropped, yielded without copying.
+// Same rule as `strip_emulation_prevention`.
+struct RbspBytes<'a> {
+    src: &'a [u8],
+    pos: usize,
+    zeros: usize,
+}
+
+impl<'a> RbspBytes<'a> {
+    fn new(src: &'a [u8]) -> Self {
+        Self {
+            src,
+            pos: 0,
+            zeros: 0,
+        }
+    }
+}
+
+impl Iterator for RbspBytes<'_> {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> {
+        loop {
+            let b = *self.src.get(self.pos)?;
+            self.pos += 1;
+            if self.zeros >= 2 && b == 0x03 {
+                self.zeros = 0;
+                continue;
+            }
+            self.zeros = if b == 0x00 { self.zeros + 1 } else { 0 };
+            return Some(b);
+        }
+    }
+}
+
 // Reads an SEI payloadType/payloadSize value (H.265 D.2 ff-extension coding:
 // a run of 0xFF bytes plus one final byte < 0xFF). `None` at end-of-buffer.
-fn read_sei_ff_value(rbsp: &[u8], i: &mut usize) -> Option<u32> {
+fn read_sei_ff_value(rbsp: &mut impl Iterator<Item = u8>) -> Option<u32> {
     let mut value: u32 = 0;
     loop {
-        let b = *rbsp.get(*i)?;
-        *i += 1;
+        let b = rbsp.next()?;
         value = value.checked_add(b as u32)?;
         if b != 0xFF {
             return Some(value);
@@ -1201,6 +1234,26 @@ mod tests {
         );
     }
 
+    // A stream carrying only ONE HDR10 message never completes the pair, so the SEI
+    // scan runs every AU; it must still not copy the RBSP each time.
+    #[test]
+    fn scan_sei_does_not_copy_when_one_hdr10_message_is_absent() {
+        let mut au = nal_bytes(NAL_PPS, &[0xC0]);
+        au.extend_from_slice(&sei_nal(&[sei_message(
+            SEI_MASTERING_DISPLAY_COLOUR_VOLUME,
+            &mastering_payload([1, 2, 3], [4, 5, 6], 7, 8, 9, 10),
+        )]));
+        au.extend_from_slice(&nal_bytes(19, &[0xEC]));
+        let mut parser = HevcParser::new();
+        parser.parse(&make_pes(au.clone(), Some(0)));
+        assert!(parser.sei_mastering.is_some() && parser.sei_content_light.is_none());
+        RBSP_COPIES.with(|c| c.set(0));
+        for i in 0..50 {
+            parser.parse(&make_pes(au.clone(), Some(3750 * (i + 1))));
+        }
+        assert_eq!(RBSP_COPIES.with(|c| c.get()), 0);
+    }
+
     /// Only the mastering-display SEI (no content-light SEI) → metadata is NOT
     /// surfaced. HDR10 requires BOTH; a half-populated record is never emitted.
     #[test]
@@ -1457,7 +1510,7 @@ mod tests {
     fn pps_id_outside_spec_range_is_ignored() {
         use super::super::coding::CodingType;
         // PPS id=64: ue '0000001000001', sps_id '1', flags '00', num_extra '000', stop '1'.
-        let pps64 = [0b0000_0010, 0b0000_1100, 0b0000_1000];
+        let pps64 = [0b0000_0010, 0b0000_1100, 0b0001_0000];
         // TRAIL_R slice: first '1', pps_id ue(64), slice_type ue '011' (I), stop '1'.
         let slice64 = [0b1000_0001, 0b0000_0101, 0b1100_0000];
         let mut data = nal_bytes(NAL_PPS, &pps64);
@@ -1470,10 +1523,11 @@ mod tests {
             "pps id 64 is out of range"
         );
 
-        // PPS id=63: ue '00000100000', sps_id '1', flags '00', num_extra '000', stop '1'.
-        let pps63 = [0b0000_0100, 0b0001_0000, 0b0100_0000];
+        // PPS id=63: ue '0000001000000', sps_id '1', flags '00', num_extra '000', stop '1'.
+        let pps63 = [0b0000_0010, 0b0000_0100, 0b0001_0000];
         // Slice: first '1', pps_id ue(63), slice_type '011', stop '1'.
-        let slice63 = [0b1000_0010, 0b0000_0111, 0b1000_0000];
+        let slice63 = [0b1000_0001, 0b0000_0001, 0b1100_0000];
+        assert_eq!(hevc_pps_id(&[0x44, 0x01, pps63[0], pps63[1]]), Some(63));
         let mut data = nal_bytes(NAL_PPS, &pps63);
         data.extend_from_slice(&nal_bytes(1, &slice63));
         let frames = HevcParser::new().parse(&make_pes(data, Some(0)));
@@ -2885,6 +2939,7 @@ mod tests {
         assert_eq!(frames.len(), 1, "a well-formed access unit is emitted");
 
         // Same AU, framing forced out of sync: the guard drops it.
+        GUARD_DROPS.with(|c| c.set(0));
         FORCE_FRAMING_DESYNC.with(|c| c.set(true));
         let mut parser2 = HevcParser::new();
         let dropped = parser2.parse(&make_pes(annex_b_access_unit(), Some(0)));
@@ -2892,6 +2947,48 @@ mod tests {
         assert!(
             dropped.is_empty(),
             "a desynced access unit is dropped by parse(), not emitted"
+        );
+        assert_eq!(GUARD_DROPS.with(|c| c.get()), 1);
+    }
+
+    // The hook above is the only way to fire the guard: over arbitrary Annex-B input
+    // (random NAL types, zero runs, param-set churn, empty NALs) every emitted frame
+    // tiles and the guard never drops, so it stays pure defense in depth.
+    #[test]
+    fn guard_never_fires_on_arbitrary_annex_b_input() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        GUARD_DROPS.with(|c| c.set(0));
+        let mut parser = HevcParser::new();
+        for au in 0..2000 {
+            let mut data = Vec::new();
+            for _ in 0..(next() % 6) {
+                data.extend_from_slice(if next() % 2 == 0 {
+                    &[0, 0, 1]
+                } else {
+                    &[0, 0, 0, 1]
+                });
+                let r = next();
+                let nal_type =
+                    [NAL_VPS, NAL_SPS, NAL_PPS, NAL_AUD, 1, 19, 21, 39][(r % 8) as usize];
+                data.extend_from_slice(&hevc_nal_header(nal_type));
+                for _ in 0..(next() % 12) {
+                    data.push([0x00, 0x03, 0xFF, (next() & 0xFF) as u8][(next() % 4) as usize]);
+                }
+            }
+            for f in parser.parse(&make_pes(data, Some(au * 3750))) {
+                assert!(length_prefix_tiles(&f.data), "au {au} does not tile");
+            }
+        }
+        assert_eq!(
+            GUARD_DROPS.with(|c| c.get()),
+            0,
+            "the guard fired on real input"
         );
     }
 
