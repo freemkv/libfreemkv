@@ -185,18 +185,28 @@ impl Disc {
         // AACS key map, by CPS-unit count. Single-CPS: one Unit Key opens
         // everything, so a blanket key-0 map covers even orphan clips. Multi-CPS
         // builds an exact per-title map instead (a blanket map would mis-decrypt).
-        let key_map =
-            match &base_keys {
-                DecryptKeys::Aacs { unit_keys, .. } if unit_keys.len() <= 1 => {
-                    Some(std::sync::Arc::new(
-                        crate::decrypt::AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]),
-                    ))
+        let key_map = match &base_keys {
+            DecryptKeys::Aacs { unit_keys, .. } if unit_keys.len() <= 1 => {
+                Some(std::sync::Arc::new(
+                    crate::decrypt::AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]),
+                ))
+            }
+            DecryptKeys::Aacs { .. } => {
+                match self.resolve_content_key_map(reader, &mut base_keys, None, opts.halt.as_ref())
+                {
+                    Ok(map) => Some(std::sync::Arc::new(map)),
+                    // A Stop is a halted run, not an error (same as the CSS arm).
+                    Err(Error::Halted) => {
+                        return Ok(ExtractResult {
+                            halted: true,
+                            ..Default::default()
+                        });
+                    }
+                    Err(e) => return Err(e),
                 }
-                DecryptKeys::Aacs { .. } => Some(std::sync::Arc::new(
-                    self.resolve_content_key_map(reader, &mut base_keys, None, opts.halt.as_ref())?,
-                )),
-                _ => None,
-            };
+            }
+            _ => None,
+        };
 
         // Phase 2: stream each file through the decrypting decorator, which owns a
         // borrowing wrapper so the caller keeps `reader`. Keys swap per CSS VTS
@@ -316,15 +326,10 @@ impl Disc {
         if extents.is_empty() {
             return Ok(base_keys.clone());
         }
-        // PLAYBACK ORDER — do NOT sort (the 1.5.1 garbage bug: see
-        // `Disc::decrypt_keys_for_title`'s "never largest-cell-first" rule).
-        // Crack against the raw inner reader, NOT the decrypting view.
-        let outcome = crate::css::crack_key_outcome(dec.inner_mut(), &extents, 64, halt);
-        // A cancelled crack is a truncated scan, not a verdict: never cache it.
-        if halt.is_some_and(|h| h.is_cancelled()) {
-            return Err(Error::Halted);
-        }
-        match outcome {
+        // PLAYBACK ORDER — do NOT sort (the 1.5.1 bug: see `decrypt_keys_for_title`).
+        // Crack the raw inner reader, NOT the decrypting view. A cancelled crack
+        // (token or drive) is `Halted`, never a cached verdict.
+        match crate::css::crack_key_outcome(dec.inner_mut(), &extents, 64, halt) {
             crate::css::CrackOutcome::Cracked(state) => Ok(DecryptKeys::Css {
                 title_key: state.title_key,
             }),
@@ -407,6 +412,7 @@ fn probe_case_insensitive(
             Err(_) if attempt + 1 < PROBE_REMOVE_ATTEMPTS => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
+            // Still failing: best-effort by design; the probe's answer stands.
             Err(_) => {}
         }
     }
@@ -516,10 +522,9 @@ fn plan_tree(
     Ok(())
 }
 
-// Extracts a single planned file: `<host>.partial`, stream extents through
-// the decrypting decorator (bad sectors -> zero-filled holes), truncate,
-// rename. Returns `(FileResult, halted)`; `halted` stops the run (an unfinished
-// file stays `.partial`; a finished inline file is already renamed).
+// Extracts one file via `<host>.partial` (bad sectors -> zero holes), then renames.
+// Returns `(FileResult, halted)`; `halted` stops the run (an unfinished file stays
+// `.partial`; a finished inline file is already renamed).
 fn extract_one_file<S: SectorSource>(
     dec: &mut DecryptingSectorSource<S>,
     dest: &Path,
@@ -610,13 +615,15 @@ fn extract_one_file<S: SectorSource>(
             // clear stays clear, scrambled fails loud as DecryptFailed.
             let batch = whole_unit_batch(sectors - sector_off);
             let want = batch as usize * SECTOR_BYTES;
-            let read_ok = match abs_lba.checked_add(sector_off) {
+            let start = abs_lba.checked_add(sector_off);
+            let read_ok = match start.filter(|l| l.checked_add(batch - 1).is_some()) {
                 // Crafted extent past u32::MAX: no such sector — a hole, not a wrapped read.
                 None => false,
                 Some(lba) => match read_batch(dec, lba, batch, &mut buf[..want]) {
                     Ok(ok) => ok,
                     // Drive-level Stop: leave the `.partial`, same as an opts halt.
-                    Err(_) => return Ok((fr, true)),
+                    Err(Error::Halted) => return Ok((fr, true)),
+                    Err(e) => return Err(e),
                 },
             };
             let chunk_bytes = want as u64;
@@ -668,9 +675,8 @@ fn whole_unit_batch(remaining: u32) -> u32 {
     batch
 }
 
-// Reads one batch with bounded retries; Ok(false) once exhausted (caller records
-// a hole). `DecryptFailed` is NOT retried — it would never succeed, so it's a
-// hole too. The only Err is `Halted`: a user Stop, never retried or holed.
+// One batch with bounded retries; Ok(false) = hole. Short reads retry; DecryptFailed
+// holes at once (never succeeds). The only Err is `Halted` (a user Stop).
 fn read_batch<S: SectorSource>(
     dec: &mut DecryptingSectorSource<S>,
     lba: u32,
@@ -679,7 +685,9 @@ fn read_batch<S: SectorSource>(
 ) -> Result<bool> {
     for attempt in 0..=READ_RETRIES {
         match dec.read_sectors(lba, count as u16, buf, true) {
-            Ok(_) => return Ok(true),
+            Ok(n) if n >= buf.len() => return Ok(true),
+            Ok(_) if attempt < READ_RETRIES => continue,
+            Ok(_) => return Ok(false),
             Err(Error::Halted) => return Err(Error::Halted),
             Err(Error::DecryptFailed) => return Ok(false),
             Err(_) if attempt < READ_RETRIES => continue,
@@ -819,11 +827,9 @@ fn available_space(dir: &Path) -> Option<u64> {
     wide.push(0);
 
     let mut avail: u64 = 0;
-    // FreeBytesAvailableToCaller, not TotalNumberOfFreeBytes: it accounts for
-    // per-user quotas, which is what "can I actually write this much" means and
-    // what `statvfs`'s `f_bavail` gives on the unix side.
+    // FreeBytesAvailableToCaller honours per-user quotas (unix `f_bavail`).
     // SAFETY: `wide` is NUL-terminated and outlives the call; `avail` is a valid
-    // out-pointer; the API documents the two NULL out-params as optional.
+    // out-pointer; the two NULL out-params are documented optional.
     let ok = unsafe {
         GetDiskFreeSpaceExW(
             wide.as_ptr(),
@@ -2477,11 +2483,26 @@ mod tests {
     }
 
     // Test-only oracle for the host volume's case folding, independent of
-    // `dir_is_case_insensitive`: a fixed-name file and a metadata lookup.
+    // `dir_is_case_insensitive`: `create_new` of the upper spelling (not an
+    // `exists()` lookup) collides only where the volume folds case.
     fn oracle_case_insensitive(dir: &Path) -> bool {
         let lower = dir.join("fmkv_oracle_q");
+        let upper = dir.join("FMKV_ORACLE_Q");
         std::fs::write(&lower, b"o").unwrap();
-        let folded = std::fs::metadata(dir.join("FMKV_ORACLE_Q")).is_ok();
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&upper);
+        let folded = match created {
+            Ok(_) => {
+                std::fs::remove_file(&upper).unwrap();
+                false
+            }
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e:?}");
+                true
+            }
+        };
         std::fs::remove_file(&lower).unwrap();
         folded
     }
@@ -2587,8 +2608,8 @@ mod tests {
         assert!(read_out(out.path(), "a.m2ts.partial").is_some());
     }
 
-    // A crafted extent near the top of the LBA space must not overflow `lba`:
-    // batches past u32::MAX are holes, never a panic or a wrapped read of LBA 0.
+    // A crafted extent near the top of the LBA space must not overflow: a batch
+    // whose START or END passes u32::MAX is a hole, never a panic or a wrapped read.
     #[test]
     fn extent_running_past_u32_max_holes_instead_of_wrapping() {
         struct AllBad(Vec<u32>);
@@ -2633,8 +2654,8 @@ mod tests {
         assert!(!halted);
         assert_eq!(fr.bytes_unreadable, len as u64);
         assert!(
-            dec.inner().0.iter().all(|&l| l >= start),
-            "wrapped read below the extent: {:?}",
+            dec.inner().0.is_empty(),
+            "no batch fits below u32::MAX, so nothing may be read: {:?}",
             dec.inner().0
         );
     }
@@ -2652,7 +2673,7 @@ mod tests {
                 self.0.read_sectors(lba, c, b, r)
             }
         }
-        // Scrambled-looking but uncrackable: an unhalted crack ends ScrambledUncracked.
+        // Uncrackable ciphertext over >1 crack batch (64), so the cancel lands mid-scan.
         let mut sect = vec![0u8; 2048];
         sect[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         sect[0x14] = 0x10;
@@ -2668,7 +2689,7 @@ mod tests {
                 name: "VIDEO_TS".to_string(),
                 icb_lba: 20,
                 dir_data_lba: 21,
-                files: vec![file("VTS_01_1.VOB", 30, 5000, sect, false)],
+                files: vec![file("VTS_01_1.VOB", 30, 5000, sect.repeat(70), false)],
                 subdirs: vec![],
             }],
         };
@@ -2736,5 +2757,117 @@ mod tests {
             res.files[0].complete,
             "the inline file itself was fully written"
         );
+    }
+
+    // A Stop landing on the DRIVE (not `opts.halt`) during the per-VTS crack must
+    // halt the run, not surface as CssKeyMissing or a cached key.
+    #[test]
+    fn drive_halt_during_vts_crack_is_a_halt_not_css_key_missing() {
+        struct HaltFrom(MemDisc, u32);
+        impl SectorSource for HaltFrom {
+            fn read_sectors(&mut self, lba: u32, c: u16, b: &mut [u8], r: bool) -> Result<usize> {
+                if lba >= self.1 {
+                    return Err(Error::Halted);
+                }
+                self.0.read_sectors(lba, c, b, r)
+            }
+        }
+        let mut sect = vec![0u8; 2048];
+        sect[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        sect[0x14] = 0x10;
+        for (i, b) in sect.iter_mut().enumerate().skip(0x59) {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: vec![file("VTS_01_1.VOB", 30, 5000, sect, false)],
+                subdirs: vec![],
+            }],
+        };
+        let mut src = HaltFrom(build_disc(root), PART_START + 5000);
+        let out = TmpDir::new("css_crack_drive_halt");
+        let mut d = clear_disc();
+        d.content_format = crate::disc::ContentFormat::MpegPs;
+        d.css = Some(crate::css::CssState {
+            title_key: [0xFFu8; 5],
+            crack_span: None,
+        });
+        let res = d
+            .extract_tree(&mut src, out.path(), &ExtractOptions::default())
+            .expect("a drive Stop during the crack is a halt, not CssKeyMissing");
+        assert!(res.halted);
+        assert!(res.files.is_empty());
+    }
+
+    // A Stop during multi-CPS AACS key-map resolution is a halt (Ok + halted),
+    // matching the CSS arm, not an Err(Halted) out of extract_tree.
+    #[test]
+    fn halt_during_aacs_key_map_resolution_is_a_halt() {
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: vec![file("a.bin", 30, 31, b"x".to_vec(), false)],
+            subdirs: vec![],
+        };
+        let mut disc = build_disc(root);
+        let mut d = aacs_disc();
+        if let Some(a) = d.aacs.as_mut() {
+            a.unit_keys = vec![(0, [1u8; 16]), (1, [2u8; 16])];
+        }
+        let mut t = crate::disc::DiscTitle::empty();
+        t.extents = vec![crate::disc::Extent {
+            start_lba: PART_START + 31,
+            sector_count: 3,
+        }];
+        d.titles = vec![t];
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let opts = ExtractOptions {
+            halt: Some(halt),
+            ..Default::default()
+        };
+        let out = TmpDir::new("aacs_map_halt");
+        let res = d
+            .extract_tree(&mut disc, out.path(), &opts)
+            .expect("a Stop during key-map resolution is a halt, not an error");
+        assert!(res.halted);
+        assert!(res.files.is_empty());
+    }
+
+    // A read that reports FEWER bytes than asked leaves a stale buffer tail: it
+    // must be retried and then holed, never written out as good data.
+    #[test]
+    fn short_read_is_not_counted_as_a_good_batch() {
+        struct Short(u32);
+        impl SectorSource for Short {
+            fn read_sectors(
+                &mut self,
+                _: u32,
+                count: u16,
+                buf: &mut [u8],
+                _: bool,
+            ) -> Result<usize> {
+                self.0 += 1;
+                let half = count as usize * SECTOR_BYTES / 2;
+                buf[..half].fill(0x11);
+                Ok(half)
+            }
+        }
+        let mut dec = DecryptingSectorSource::new(Short(0), DecryptKeys::None);
+        let mut buf = vec![0xEEu8; 2 * SECTOR_BYTES];
+        let ok = read_batch(&mut dec, 0, 2, &mut buf).unwrap();
+        assert!(
+            !ok,
+            "a short read must not be reported as a full good batch"
+        );
+        assert_eq!(dec.inner().0, READ_RETRIES + 1, "short reads are retried");
     }
 }
