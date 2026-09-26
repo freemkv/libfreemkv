@@ -1244,8 +1244,8 @@ impl SectorSource for Drive {
 ///
 /// Opens each candidate in enumeration order and returns the first reporting
 /// [`DriveStatus::DiscPresent`] via [`Drive::drive_status`]; falls back to the first drive that
-/// opened if none report a disc. For just listing drives without opening, use
-/// `scsi::list_drives()` instead.
+/// opened if none report a disc. Only one drive is held open at a time. For
+/// just listing drives without opening, use `scsi::list_drives()` instead.
 pub fn find_drive() -> Option<Drive> {
     #[cfg(target_os = "macos")]
     let candidates = crate::scsi::list_drives()
@@ -1259,36 +1259,34 @@ pub fn find_drive() -> Option<Drive> {
         .map(|(path, _)| path)
         .collect::<Vec<_>>();
 
-    let opened =
-        candidates
-            .into_iter()
-            .filter_map(|path| match Drive::open(std::path::Path::new(&path)) {
-                Ok(drive)
-                    if !drive.drive_id.raw_inquiry.is_empty()
-                        && (drive.drive_id.raw_inquiry[0] & 0x1F) == 0x05 =>
-                {
-                    Some(drive)
-                }
-                Ok(drive) => {
-                    tracing::debug!(
-                        target: "freemkv::drive",
-                        path,
-                        "skipping non-optical SCSI device during drive selection"
-                    );
-                    drop(drive);
-                    None
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "freemkv::drive",
-                        path,
-                        error = %error,
-                        "drive open failed during autodetection"
-                    );
-                    None
-                }
-            });
-    select_drive_with_media(opened)
+    select_drive_with_media(candidates, |path| {
+        match Drive::open(std::path::Path::new(path)) {
+            Ok(drive)
+                if !drive.drive_id.raw_inquiry.is_empty()
+                    && (drive.drive_id.raw_inquiry[0] & 0x1F) == 0x05 =>
+            {
+                Some(drive)
+            }
+            Ok(drive) => {
+                tracing::debug!(
+                    target: "freemkv::drive",
+                    path,
+                    "skipping non-optical SCSI device during drive selection"
+                );
+                drop(drive);
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "freemkv::drive",
+                    path,
+                    error = %error,
+                    "drive open failed during autodetection"
+                );
+                None
+            }
+        }
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1296,21 +1294,36 @@ fn discover_drives() -> Vec<(String, DriveId)> {
     platform::find_drives()
 }
 
-// Pick a drive preferring DiscPresent status, falling back to the first
-// yielded. Split from find_drive so it's unit-testable without hardware.
-fn select_drive_with_media(drives: impl Iterator<Item = Drive>) -> Option<Drive> {
-    let mut fallback: Option<Drive> = None;
-    for mut drive in drives {
+// Pick a drive preferring DiscPresent status, falling back to the first that
+// opened. At most one drive is open at a time (macOS allows one live handle),
+// so the no-media fallback is released before the next candidate is opened
+// and reopened by path at the end. Split from find_drive for unit tests.
+fn select_drive_with_media<P>(
+    candidates: impl IntoIterator<Item = P>,
+    mut open: impl FnMut(&P) -> Option<Drive>,
+) -> Option<Drive> {
+    let mut fallback: Option<(P, Option<Drive>)> = None;
+    for path in candidates {
+        if let Some((_, held)) = fallback.as_mut() {
+            *held = None;
+        }
+        let Some(mut drive) = open(&path) else {
+            continue;
+        };
         if drive.drive_status() == DriveStatus::DiscPresent {
             return Some(drive);
         }
-        // Remember the first drive that opened as the no-media fallback so
-        // single-drive / status-unavailable setups still get a drive.
         if fallback.is_none() {
-            fallback = Some(drive);
+            fallback = Some((path, Some(drive)));
         }
     }
-    fallback
+    match fallback {
+        Some((_, Some(drive))) => Some(drive),
+        // Accepted edge: if the reopen fails (e.g. another process took the
+        // device in the gap) there is no drive to return.
+        Some((path, None)) => open(&path),
+        None => None,
+    }
 }
 
 // MODE SENSE(10) Error Recovery page -> MODE SELECT(10) payload enabling
@@ -2512,9 +2525,8 @@ mod command_tests {
         // Drive #1 has no disc (0x00), drive #2 has a disc (0x02). The
         // selection must skip the empty first drive and pick the one with
         // media — the Windows multi-drive bug fix.
-        let drives = vec![drive_with_media_byte(0x00), drive_with_media_byte(0x02)];
-        let picked = select_drive_with_media(drives.into_iter()).expect("a drive");
-        let mut picked = picked;
+        let picked = select_drive_with_media([0x00u8, 0x02], |m| Some(drive_with_media_byte(*m)));
+        let mut picked = picked.expect("a drive");
         assert_eq!(
             picked.drive_status(),
             DriveStatus::DiscPresent,
@@ -2527,8 +2539,8 @@ mod command_tests {
         // No drive reports a disc → fall back to the FIRST opened drive so single-drive
         // / quirky setups still get one (historical behavior). Tag drive #1 distinctly
         // (TrayOpen 0x01) and confirm it, not #2 (NoDisc 0x00), is returned.
-        let drives = vec![drive_with_media_byte(0x01), drive_with_media_byte(0x00)];
-        let mut picked = select_drive_with_media(drives.into_iter()).expect("a fallback drive");
+        let picked = select_drive_with_media([0x01u8, 0x00], |m| Some(drive_with_media_byte(*m)));
+        let mut picked = picked.expect("a fallback drive");
         assert_eq!(
             picked.drive_status(),
             DriveStatus::TrayOpen,
@@ -2539,8 +2551,65 @@ mod command_tests {
     #[test]
     fn select_drive_none_when_no_drives() {
         // No candidates at all → None.
-        let empty: Vec<Drive> = Vec::new();
-        assert!(select_drive_with_media(empty.into_iter()).is_none());
+        let empty: [u8; 0] = [];
+        assert!(select_drive_with_media(empty, |m| Some(drive_with_media_byte(*m))).is_none());
+    }
+
+    // Models macOS `MacScsiTransport`: only one instance may be alive per
+    // process; construction fails while another is open, Drop releases it.
+    struct ExclusiveTransport {
+        inner: FixedTransport,
+        live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ScsiTransport for ExclusiveTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            direction: DataDirection,
+            data: &mut [u8],
+            timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            self.inner.execute(cdb, direction, data, timeout_ms)
+        }
+    }
+
+    impl Drop for ExclusiveTransport {
+        fn drop(&mut self) {
+            self.live.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn open_exclusive(
+        live: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        media_status: u8,
+    ) -> Option<Drive> {
+        if live.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return None; // DeviceLocked: another handle is still open
+        }
+        Some(Drive::from_transport_for_test(Box::new(
+            ExclusiveTransport {
+                inner: FixedTransport {
+                    payload: media_event_reply(media_status),
+                },
+                live: live.clone(),
+            },
+        )))
+    }
+
+    #[test]
+    fn select_drive_finds_media_behind_empty_drive_with_single_open_transport() {
+        // Two drives, first empty (TrayOpen), second has a disc, on a
+        // transport that allows one live handle. The empty drive must not
+        // be held open while the second is tried.
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let picked = select_drive_with_media([0x01u8, 0x02], |m| open_exclusive(&live, *m));
+        let mut picked = picked.expect("a drive");
+        assert_eq!(
+            picked.drive_status(),
+            DriveStatus::DiscPresent,
+            "must open the second drive and pick its disc"
+        );
     }
 
     // ── drive_status branch coverage (GET EVENT STATUS byte 5) ──────
