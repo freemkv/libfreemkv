@@ -16,7 +16,7 @@
 ### Fixed
 
 - BD-J / Java-menu main-title selection reworked (#45): a chapter-completeness failsafe, a BD-J menu-walk (parses the BDJO objects and jar manifests), and a stream-richness tiebreak now cooperate so discs driven by a Java menu pick the real main feature — keeping the Dolby Vision enhancement layer and all subtitle tracks — instead of a lower-id sibling playlist.
-- PGS subtitles now get a synthesized `BlockDuration` on every block, fixing ffmpeg's "Timestamps are unset" mux error, plus a defensive HEVC NAL length-prefix guard (#52).
+- PGS subtitles now get a synthesized `BlockDuration` on every block, fixing the "Timestamps are unset" mux error, plus a defensive HEVC NAL length-prefix guard (#52).
 - keydb "no entry" is de-conflated into a true miss versus matched-but-no-usable-VID, and the disc hash is surfaced; adds `KeyStep.matched_entry` and `KeyStep.store_entries` (#46).
 
 ### Maintenance
