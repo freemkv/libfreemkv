@@ -145,13 +145,9 @@ pub struct MuxOptions {
     /// caller sets `InputOptions::selection` instead. Setting this field for a Url
     /// input has no effect.
     pub selection: crate::StreamSelection,
-    /// Per-frame write-pipeline send deadline.
-    ///
-    /// - `Some(d)` — a hard `d` timeout: a sink that back-pressures a single   frame past `d`
-    /// is treated as wedged and the mux returns   `completed = false`. autorip passes
-    /// `Some(Duration::from_secs(60))`. - `None` — no backpressure timeout: the send blocks as
-    /// long as the   downstream is alive (only a `halt` interrupts it). The CLI's   interactive
-    /// stdout / network sinks pass `None`.
+    /// Per-frame write-pipeline send deadline. `Some(d)` returns
+    /// `completed = false` if backpressure lasts longer than `d`.
+    /// `None` waits while the downstream is alive, unless halted.
     pub send_deadline: Option<Duration>,
 }
 
