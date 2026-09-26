@@ -52,7 +52,7 @@ fn hint_from_manifest(name: &str, text: &str) -> Option<FeaturePlaylistHint> {
     if lower.ends_with("dcx.xml") {
         fox::feature_hint(text)
     } else if lower.ends_with("playlists.xml") {
-        paramount::feature_hint_from_xml(text)
+        paramount::feature_hint(text)
     } else if lower.ends_with(".properties") || lower.ends_with(".version") {
         props_hint(text)
     } else {

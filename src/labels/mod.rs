@@ -167,6 +167,30 @@ impl FeaturePlaylistHint {
     pub fn is_empty(&self) -> bool {
         self.playlist_id.is_none() && self.filename.is_none()
     }
+
+    /// Hint from an authoring id attribute (digits only). The filename is
+    /// formatted from the one parsed u16, so the two fields cannot disagree.
+    pub(crate) fn from_authoring_id(id: &str) -> Option<Self> {
+        let playlist_id = digits(id).parse::<u16>().ok()?;
+        Some(Self {
+            playlist_id: Some(playlist_id),
+            filename: Some(format!("{playlist_id:05}.mpls")),
+        })
+    }
+}
+
+// The ASCII digits of `s`, in order (tolerates stray quotes/spaces/units).
+fn digits(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+// A manifest element's stated running time: the first of `keys` whose digits
+// parse to a non-zero number of seconds.
+pub(crate) fn stated_duration_secs(element: &str, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| {
+        let v = xml::attr(element, k)?;
+        digits(&v).parse::<u64>().ok().filter(|&d| d > 0)
+    })
 }
 
 /// Successful parser result. `None` from `parse()` still means "this
