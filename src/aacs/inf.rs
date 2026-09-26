@@ -22,8 +22,7 @@ pub struct UnitKeyFile {
     pub title_cps_unit: Vec<u16>,
 }
 
-// Hand-written Debug that redacts the ENCRYPTED CPS unit keys a derive would
-// print verbatim. See docs/inf.md — UnitKeyFile's hand-written Debug.
+// Hand-written Debug that redacts the ENCRYPTED CPS unit keys a derive would print verbatim.
 impl std::fmt::Debug for UnitKeyFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnitKeyFile")
@@ -198,8 +197,6 @@ const VTKF_MAX_ENTRIES: usize = 64;
 /// `BIFO` bit 7 (`AV_FLG`): set = this slot carries an available title key.
 const VTKF_AV_FLG: u8 = 0x80;
 
-// See docs/inf.md — parse_vtkf: byte-exact real-disc verification and why
-// the prior 32-byte stride corrupted multi-key VTKFs.
 /// Parse an HD DVD `VTKF%%%.AACS` into the SAME [`UnitKeyFile`] a BD/UHD
 /// `Unit_Key_RO.inf` yields — so the shared AACS crypto (`derive_unit_keys` →
 /// `decrypt_unit_key(vuk, …)`) unwraps HD DVD title keys with no change.
@@ -396,9 +393,8 @@ pub fn parse_content_cert(data: &[u8]) -> Option<ContentCert> {
 mod vtkf_tests {
     use super::*;
 
-    // Synthesize a `VTKF%%%.AACS`: magic, BE32 size, playlist name, reserved
-    // to 0x80, 64 entry slots (first `keys.len()` present), MAC trailer.
-    // See docs/inf.md — synth_vtkf test helper.
+    // Synthesize a `VTKF%%%.AACS`: magic, BE32 size, playlist name, reserved to 0x80, 64 entry
+    // slots (first `keys.len()` present), MAC trailer.
     fn synth_vtkf(keys: &[[u8; 16]]) -> Vec<u8> {
         const FILE_LEN: usize = 2480;
         let mut v = Vec::new();
@@ -504,8 +500,7 @@ mod vtkf_tests {
         assert_eq!(derived, super::super::derive::decrypt_unit_key(&vuk, &enc));
     }
 
-    // Sentinel byte 0xD5 = decimal 213: a derived Debug would render it in
-    // decimal. See docs/inf.md — unit_key_file_debug_is_redacted test.
+    // Sentinel byte 0xD5 = decimal 213: a derived Debug would render it in decimal.
     #[test]
     fn unit_key_file_debug_is_redacted() {
         let f = UnitKeyFile {
@@ -572,8 +567,7 @@ mod read_mkb_tests {
         }
     }
 
-    // Pins the CONTENT: concatenated pack payloads, in pack order, byte for
-    // byte. See docs/inf.md — read_mkb_from_drive_returns_the_concatenated…
+    // Pins the CONTENT: concatenated pack payloads, in pack order, byte for byte.
     #[test]
     fn read_mkb_from_drive_returns_the_concatenated_pack_payload() {
         let pack0: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
@@ -613,8 +607,8 @@ mod read_mkb_tests {
         }
     }
 
-    // Pins the WHOLE 12-byte CDB (MMC-6 READ DISC STRUCTURE, AACS MKB
-    // format) so no field can drift. See docs/inf.md — this test's layout.
+    // Pins the WHOLE 12-byte CDB (MMC-6 READ DISC STRUCTURE, AACS MKB format) so no field can
+    // drift.
     #[test]
     fn read_mkb_from_drive_issues_the_exact_mmc_cdb_for_each_pack() {
         let mut drive = MkbDrive {
@@ -648,8 +642,8 @@ mod read_mkb_tests {
         }
     }
 
-    // A full 32768-byte pack must come back whole; small payloads elsewhere
-    // never exercise this bound. See docs/inf.md — this test.
+    // A full 32768-byte pack must come back whole; small payloads elsewhere never exercise this
+    // bound.
     #[test]
     fn read_mkb_from_drive_accepts_a_full_size_pack() {
         let full: Vec<u8> = (0..32768u32).map(|i| (i % 251) as u8).collect();
@@ -689,8 +683,7 @@ mod read_mkb_tests {
         assert!(mkb == vec![0xABu8; 32], "and the bytes are pack 1's");
     }
 
-    // A drive-declared length past the 32772-byte buffer must not be
-    // trusted. See docs/inf.md — this test.
+    // A drive-declared length past the 32772-byte buffer must not be trusted.
     #[test]
     fn read_mkb_from_drive_ignores_a_pack_declaring_more_than_the_buffer_holds() {
         /// Pack 0 is honest; pack 1 declares a 60000-byte payload it never sent.

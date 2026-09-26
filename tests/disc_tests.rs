@@ -588,7 +588,6 @@ fn aacs_dir_alone_marks_the_disc_encrypted_and_reports_the_capture_error() {
 }
 
 // Capacity/layer derivation from sector count; wrong scale = wrong ISO length.
-// See docs/disc-tests.md — capacity_bytes and layers threshold rationale.
 #[test]
 fn scan_image_reports_capacity_in_bytes_and_the_layer_count() {
     let opts = ScanOptions::default();

@@ -191,9 +191,8 @@ impl std::fmt::Debug for DiscEntry {
 mod unit_key_tests {
     use super::*;
 
-    // Pinned against the two named constructors: `UnitKey::new` is the
-    // ordinary key, `UnitKey::forensic` is an index key.
-    // See docs/aacs.md — `UnitKey::is_default_index` test rationale.
+    // Pinned against the two named constructors: `UnitKey::new` is the ordinary key,
+    // `UnitKey::forensic` is an index key.
     #[test]
     fn is_default_index_separates_the_two_constructors() {
         let ordinary = UnitKey::new(0, [0xAA; 16]);
@@ -213,7 +212,6 @@ mod unit_key_tests {
     }
 
     // Must agree with `resolve_disc_index`, the one consumer of `index_number`.
-    // See docs/aacs.md — `UnitKey::is_default_index` test rationale.
     #[test]
     fn is_default_index_agrees_with_the_forensic_index_resolver() {
         use crate::aacs::index_select::resolve_disc_index;

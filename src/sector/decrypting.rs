@@ -7,8 +7,6 @@
 //!
 //! Composition: `Drive` → `DecryptingSectorSource` → caller sees
 //! plaintext; `DecryptKeys::None` discs pass through unconditionally.
-//!
-//! See docs/decrypting-sector-source.md for the single-source-of-truth rationale.
 
 use crate::decrypt::{DecryptKeys, decrypt_sectors, decrypt_sectors_in_content};
 use crate::error::Result;
@@ -29,8 +27,6 @@ pub type KeyFetchFn = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Vec<[u8; 16]> + Send 
 /// anchor batch. Both return additional keys to add to the pool and retry
 /// with; empty if the source can't help. The library does no key lookup or
 /// network I/O itself — this is the caller's seam to its key source.
-///
-/// See docs/decrypting-sector-source.md for the two-operation rationale.
 #[derive(Clone)]
 pub struct KeyFetch {
     unit: KeyFetchFn,

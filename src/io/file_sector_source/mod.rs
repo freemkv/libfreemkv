@@ -5,9 +5,6 @@
 //! Issues a platform "sequential access" hint on open, prefetches the
 //! next window after each read, and periodically evicts the consumed
 //! byte range via `posix_fadvise(DONTNEED)` to bound page-cache pressure.
-//!
-//! See docs/file-sector-source.md for design rationale (no app-level
-//! buffer, DONTNEED window, platform hint, prefetch).
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
@@ -39,14 +36,12 @@ use crate::sector::SectorSource;
 
 use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
 
-// Bytes-read threshold per `posix_fadvise(DONTNEED)` drop; mirrors
-// WRITEBACK_CHUNK_BYTES. 32 MiB is empirically tuned (7200rpm HDD/SATA);
-// see docs/file-sector-source.md. Override: FREEMKV_READ_DROP_CHUNK_MIB.
+// Bytes-read threshold per `posix_fadvise(DONTNEED)` drop; mirrors WRITEBACK_CHUNK_BYTES. 32
+// MiB is empirically tuned (7200rpm HDD/SATA).
 const READ_DROP_CHUNK_BYTES_DEFAULT: u64 = 32 * 1024 * 1024;
 
-// Max MiB from FREEMKV_READ_DROP_CHUNK_MIB: 64 GiB, and small enough
-// n*1024*1024 can't overflow u64 (mirrors WRITEBACK_CHUNK_MIB_MAX).
-// See docs/file-sector-source.md; out-of-range falls back to default.
+// Max MiB from FREEMKV_READ_DROP_CHUNK_MIB: 64 GiB, and small enough n*1024*1024 can't overflow
+// u64 (mirrors WRITEBACK_CHUNK_MIB_MAX).
 const READ_DROP_CHUNK_MIB_MAX: u64 = 64 * 1024;
 
 fn read_drop_chunk_bytes() -> u64 {
@@ -190,9 +185,8 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
-    // Undersized `out` must error, not panic: `debug_assert!` alone is compiled
-    // out in release, letting `out[..bytes]` panic. See docs/file-sector-source.md
-    // (also guarded in Drive::read_fua and PrefetchedSectorSource).
+    // Undersized `out` must error, not panic: `debug_assert!` alone is compiled out in release,
+    // letting `out[..bytes]` panic.
     #[test]
     fn read_sectors_with_an_undersized_buffer_errors_rather_than_panicking() {
         let dir = tempdir().unwrap();
@@ -480,9 +474,8 @@ mod tests {
         assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
     }
 
-    // A DONTNEED drop crossing the chunk threshold must not corrupt/short
-    // reads — it's an advisory hint. Reads past the default 32 MiB chunk
-    // (16384 sectors) so eviction fires; see docs/file-sector-source.md.
+    // A DONTNEED drop crossing the chunk threshold must not corrupt/short reads — it's an
+    // advisory hint. Reads past the default 32 MiB chunk (16384 sectors) so eviction fires.
     #[test]
     fn dontneed_eviction_does_not_affect_data() {
         // 32 MiB default chunk = 16384 sectors; read a bit past it.
@@ -511,9 +504,8 @@ mod tests {
         }
     }
 
-    // FREEMKV_READ_DROP_CHUNK_MIB must be bounded before the MiB→byte
-    // multiply (mirrors WRITEBACK_CHUNK_MIB_MAX): unbounded, values above
-    // 2^44 overflow/wrap — see docs/file-sector-source.md.
+    // FREEMKV_READ_DROP_CHUNK_MIB must be bounded before the MiB→byte multiply (mirrors
+    // WRITEBACK_CHUNK_MIB_MAX): unbounded, values above 2^44 overflow/wrap.
     #[test]
     fn read_drop_chunk_env_is_bounded_before_the_multiply() {
         // Default when unset / zero / out of range.

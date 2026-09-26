@@ -14,9 +14,6 @@ use super::types::*;
 /// If you hold a **device-node label** at unknown tree depth (not a
 /// terminal PK), use [`derive_media_key_from_dk`] instead — only that path
 /// walks the Subset-Difference tree.
-///
-/// See `docs/aacs-derive.md` for the MKB record-type layout and the
-/// performance case for the direct PK × cvalue scan.
 pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Option<[u8; 16]> {
     let mk_dv = mkb_find_mk_dv(mkb)?;
     let uvs = mkb_find_subdiff_records(mkb)?;
@@ -24,9 +21,8 @@ pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Opt
     try_pk_against_tables(processing_keys, &uvs, &cvalues, &mk_dv)
 }
 
-// Core terminal-PK table scan: each PK tried directly against every
-// (uv, cvalue) pair, no tree descent. Factored out so reproduction
-// harnesses can drive it with explicit tables (see docs/aacs-derive.md).
+// Core terminal-PK table scan: each PK tried directly against every (uv, cvalue) pair, no tree
+// descent. Factored out so reproduction harnesses can drive it with explicit tables.
 pub(crate) fn try_pk_against_tables(
     processing_keys: &[[u8; 16]],
     uvs: &[u8],
@@ -239,8 +235,6 @@ pub fn derive_media_key_and_pk_from_dk(
 /// the key across all discs — and resolves a gate-passing `node`. Returns a
 /// [`DeviceKey`] ready to bank and reuse on every future disc via
 /// [`derive_media_key_from_dk`]. `None` if the key does not apply to this MKB.
-///
-/// See `docs/aacs-derive.md` for the search strategy and its cost.
 pub fn recover_dk_position(mkb: &[u8], key: &[u8; 16]) -> Option<DeviceKey> {
     let mk_dv = mkb_find_mk_dv(mkb)?;
     let uvs = mkb_find_subdiff_records(mkb)?;
@@ -462,9 +456,8 @@ impl std::fmt::Debug for ResolvedChain {
 /// `VUK → UKs`, or `UK → itself`, parsing `Unit_Key_RO.inf` at the version the
 /// disc's MKB declares so a multi-CPS disc yields all its unit keys.
 ///
-/// PURE DERIVATION: no sampling, no validation, no position recovery. Returns
-/// `None` only when derivation itself cannot proceed. See `docs/aacs-derive.md`
-/// for the composed primitives and the full `None` conditions.
+/// PURE DERIVATION: no sampling, no validation, no position recovery. Returns `None` only when
+/// derivation itself cannot proceed.
 pub fn resolve_candidate(
     candidate: &KeyCandidate,
     mkb: &[u8],
@@ -541,9 +534,8 @@ mod resolve_candidate_tests {
     use super::*;
     use crate::aacs::crypto::aes_ecb_encrypt;
 
-    // km_verifies gates every candidate Media Key; mutation testing found
-    // `-> true` surviving all 2,556 tests, i.e. unverified verification.
-    // See docs/aacs-derive.md for how the fixture inverts the AES relation.
+    // km_verifies gates every candidate Media Key; mutation testing found `-> true` surviving
+    // all 2,556 tests, i.e. unverified verification.
     #[test]
     fn km_verifies_accepts_only_the_key_its_record_was_built_for() {
         use crate::aacs::mkb::mkb_find_mk_dv;
@@ -987,9 +979,9 @@ mod resolve_candidate_tests {
     }
 }
 
-// Device-key POSITION recovery and the MKB probe accessors. No published AACS
-// test vectors exist; the relations (`[C]` §3.2.3-§3.2.5) are invertible, so
-// `plant_mkb` below builds a valid MKB for a CHOSEN key. See docs/aacs-derive.md.
+// Device-key POSITION recovery and the MKB probe accessors. No published AACS test vectors
+// exist; the relations (`[C]` §3.2.3-§3.2.5) are invertible, so `plant_mkb` below builds a
+// valid MKB for a CHOSEN key.
 #[cfg(test)]
 mod position_recovery_tests {
     use super::*;
@@ -1023,9 +1015,8 @@ mod position_recovery_tests {
         u_mask_shift: u8,
     }
 
-    // Build the fixture by inverting the AACS relations. uv/u_mask_shift are
-    // chosen so a gating device node exists (see docs/aacs-derive.md for the
-    // bit-level derivation); uv stays under 0x10000 since DeviceKey::node is u16.
+    // Build the fixture by inverting the AACS relations. uv/u_mask_shift are chosen so a gating
+    // device node exists; uv stays under 0x10000 since DeviceKey::node is u16.
     fn plant_mkb() -> Planted {
         let dkey: [u8; 16] = [
             0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2,

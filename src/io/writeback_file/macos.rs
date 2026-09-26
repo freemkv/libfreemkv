@@ -5,8 +5,6 @@
 //! - `durable_sync`: `fcntl(F_FULLFSYNC)` wrapped in
 //!   [`crate::io::bounded::bounded_syscall`] with a 60 s deadline; falls
 //!   back to plain `fsync` if unsupported.
-//!
-//! See docs/writeback-file-macos.md for the full rationale.
 
 use std::fs::File;
 use std::io;
@@ -47,9 +45,8 @@ pub(super) fn preallocate(file: &File, size_bytes: u64) {
     );
 }
 
-// fd-reuse safety: a leaked worker thread must not hit a recycled fd
-// number, so we try_clone an owned File into the closure instead of a
-// bare fd. See docs/writeback-file-macos.md.
+// fd-reuse safety: a leaked worker thread must not hit a recycled fd number, so we try_clone an
+// owned File into the closure instead of a bare fd.
 pub(super) fn durable_sync(file: &File) -> io::Result<()> {
     // Clone so a leaked worker thread retains a valid fd even after the
     // original File is closed and its fd number is reused.
@@ -98,9 +95,8 @@ pub(super) fn durable_sync(file: &File) -> io::Result<()> {
     }
 }
 
-// Maps a BoundedError onto the io::Error durable_sync returns. Every arm
-// means no sync observably ran — never mapped to Ok. No message text
-// (no user-facing English); see docs/writeback-file-macos.md.
+// Maps a BoundedError onto the io::Error durable_sync returns. Every arm means no sync
+// observably ran — never mapped to Ok. No message text (no user-facing English).
 fn bounded_failure_to_result(e: crate::io::bounded::BoundedError) -> io::Result<()> {
     match e {
         crate::io::bounded::BoundedError::Timeout => {
@@ -133,9 +129,8 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    // Regression for the fd-reuse fix in durable_sync: try_clone succeeds
-    // and yields a distinct fd. The real race is non-deterministic; this
-    // structural check is the accepted substitute (docs/writeback-file-macos.md).
+    // Regression for the fd-reuse fix in durable_sync: try_clone succeeds and yields a distinct
+    // fd. The real race is non-deterministic; this structural check is the accepted substitute.
     #[test]
     fn durable_sync_worker_uses_owned_clone_with_distinct_fd() {
         let f = NamedTempFile::new().expect("tempfile create");
@@ -159,9 +154,8 @@ mod tests {
         durable_sync(f.as_file()).expect("durable_sync must return Ok on a local tempfile");
     }
 
-    // Every BoundedError arm means no sync observably ran; asserted on the
-    // concrete ErrorKind/errno so a future arm reverting to Ok(()) fails
-    // here. See docs/writeback-file-macos.md.
+    // Every BoundedError arm means no sync observably ran; asserted on the concrete
+    // ErrorKind/errno so a future arm reverting to Ok(()) fails here.
     #[test]
     fn every_bounded_failure_is_reported_as_an_error() {
         use crate::io::bounded::BoundedError;

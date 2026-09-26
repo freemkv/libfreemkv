@@ -5,8 +5,8 @@
 //! - **LFSR0** — 24-bit register seeded from `key[2..5] XOR seed[2..5]`,
 //!   stepped through a feedback polynomial and `TAB4`.
 //!
-//! Output byte = sum-with-carry of both registers; body byte recovered as
-//! `plain = TAB1[cipher] ^ keystream`. See docs/lfsr.md for more detail.
+//! Output byte = sum-with-carry of both registers; body byte recovered as `plain = TAB1[cipher]
+//! ^ keystream`.
 
 use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
 
@@ -18,8 +18,8 @@ use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
 /// `0x14` (bits 4-5) is CLEARED after unscrambling, so a descrambled sector
 /// reads as `sector[0x14] & 0x30 == 0`.
 ///
-/// No-op (returns without modifying `sector`) if `sector.len() < 2048` or
-/// the scramble flag bits are already zero. See docs/lfsr.md for rationale.
+/// No-op (returns without modifying `sector`) if `sector.len() < 2048` or the scramble flag
+/// bits are already zero.
 pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
     debug_assert!(
         sector.len() >= 2048,
@@ -75,8 +75,7 @@ pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
     sector[0x14] &= 0xCF;
 }
 
-// Exact inverse of descramble_sector, for test use only (builds known
-// ciphertext). See docs/lfsr.md — scramble_sector.
+// Exact inverse of descramble_sector, for test use only (builds known ciphertext).
 #[cfg(test)]
 pub(crate) fn scramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
     if sector.len() < 2048 {
@@ -139,9 +138,8 @@ mod tests {
         assert_eq!(sector, original);
     }
 
-    // Regression vector pinning the implementation's deterministic output.
-    // key = 42 13 37 BE EF, seed = DE AD BE EF 42, body = 0xAA.
-    // See docs/lfsr.md — reference vector test.
+    // Regression vector pinning the implementation's deterministic output. key = 42 13 37 BE
+    // EF, seed = DE AD BE EF 42, body = 0xAA.
     #[test]
     fn descramble_produces_the_reference_css_vector() {
         let key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
@@ -194,8 +192,8 @@ mod tests {
         assert_eq!(sector[0x14] & 0x30, 0x00);
     }
 
-    // Not a plain XOR involution (TAB1 applies to ciphertext); scramble_sector
-    // is the true inverse. See docs/lfsr.md — inverts-scramble test.
+    // Not a plain XOR involution (TAB1 applies to ciphertext); scramble_sector is the true
+    // inverse.
     #[test]
     fn css_descramble_inverts_scramble_over_body() {
         let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
@@ -272,8 +270,8 @@ mod tests {
         }
     }
 
-    // Scramble-flag detection (byte 0x14, bits 4-5): only bits 4-5 are the
-    // flag (mask 0x30); 0x40/0x80 must read UNSCRAMBLED. See docs/lfsr.md.
+    // Scramble-flag detection (byte 0x14, bits 4-5): only bits 4-5 are the flag (mask 0x30);
+    // 0x40/0x80 must read UNSCRAMBLED.
     #[test]
     fn descramble_treats_high_bits_of_0x14_as_clear() {
         let key = [0x01, 0x02, 0x03, 0x04, 0x05];
@@ -290,8 +288,8 @@ mod tests {
         }
     }
 
-    // Each scramble bit (4 and 5) independently marks a sector encrypted:
-    // 0x10 and 0x20 must both trigger descrambling. See docs/lfsr.md.
+    // Each scramble bit (4 and 5) independently marks a sector encrypted: 0x10 and 0x20 must
+    // both trigger descrambling.
     #[test]
     fn descramble_triggers_on_either_flag_bit() {
         let key = [0x01, 0x02, 0x03, 0x04, 0x05];
@@ -309,8 +307,8 @@ mod tests {
         }
     }
 
-    // Only the two scramble bits are cleared (`& 0xCF`); bits 6-7 of byte
-    // 0x14 survive: 0xF0 becomes 0xC0, NOT 0x00. See docs/lfsr.md.
+    // Only the two scramble bits are cleared (`& 0xCF`); bits 6-7 of byte 0x14 survive: 0xF0
+    // becomes 0xC0, NOT 0x00.
     #[test]
     fn descramble_clear_preserves_high_bits_of_0x14() {
         let key = [0x01, 0x02, 0x03, 0x04, 0x05];
@@ -326,8 +324,8 @@ mod tests {
 
     // ── header / body boundary (encrypted region is 0x80..0x800) ───────────
 
-    // Encrypted region is exactly 0x80..0x800; header bytes 0x00..0x80
-    // (incl. the seed at 0x54..0x59) must stay untouched. See docs/lfsr.md.
+    // Encrypted region is exactly 0x80..0x800; header bytes 0x00..0x80 (incl. the seed at
+    // 0x54..0x59) must stay untouched.
     #[test]
     fn descramble_leaves_header_and_seed_intact() {
         let key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
@@ -349,8 +347,8 @@ mod tests {
         assert_eq!(&sector[0x54..0x59], &seed, "sector seed must survive");
     }
 
-    // The descrambler must touch the WHOLE body, including the final byte
-    // (index 2047), guarding the `.take(2048)` bound. See docs/lfsr.md.
+    // The descrambler must touch the WHOLE body, including the final byte (index 2047),
+    // guarding the `.take(2048)` bound.
     #[test]
     fn descramble_covers_final_body_byte() {
         let key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
@@ -367,8 +365,8 @@ mod tests {
         );
     }
 
-    // The length guard is a FLOOR, not a ceiling: descramble_sector processes
-    // the first sector of any over-long buffer. See docs/lfsr.md.
+    // The length guard is a FLOOR, not a ceiling: descramble_sector processes the first sector
+    // of any over-long buffer.
     #[test]
     fn descramble_processes_the_first_sector_of_an_over_long_buffer() {
         let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
@@ -405,8 +403,8 @@ mod tests {
         );
     }
 
-    // Descramble is keyed by `title_key XOR seed`: two different title keys
-    // must produce two different bodies. See docs/lfsr.md.
+    // Descramble is keyed by `title_key XOR seed`: two different title keys must produce two
+    // different bodies.
     #[test]
     fn descramble_output_depends_on_title_key() {
         let seed = [0xDE, 0xAD, 0xBE, 0xEF, 0x42];
@@ -426,8 +424,8 @@ mod tests {
         );
     }
 
-    // Descramble is keyed by the sector seed too: same title key, different
-    // seed -> different body. See docs/lfsr.md.
+    // Descramble is keyed by the sector seed too: same title key, different seed -> different
+    // body.
     #[test]
     fn descramble_output_depends_on_seed() {
         let key = [0x01, 0x02, 0x03, 0x04, 0x05];

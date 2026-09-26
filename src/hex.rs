@@ -1,9 +1,9 @@
 //! The single hex → bytes parser for the whole workspace.
 //!
-//! Key material arrives as hex from three third-party sources that each used
-//! to parse it slightly differently, so a key with a prefix one parser didn't
-//! expect was silently dropped. This is the one parser they all call, so the
-//! prefix/case/validation rules live in exactly one place. See `docs/hex.md`.
+//! Key material arrives as hex from three third-party sources that each used to parse it
+//! slightly differently, so a key with a prefix one parser didn't expect was silently dropped.
+//! This is the one parser they all call, so the prefix/case/validation rules live in exactly
+//! one place.
 //!
 //! Operates on BYTES, not `&str` char indices, so a multi-byte UTF-8 scalar
 //! in untrusted input rejects as malformed rather than panicking mid-codepoint.
@@ -87,9 +87,9 @@ pub fn strip_hex_prefix(s: &str) -> &str {
         .unwrap_or(s)
 }
 
-// Combine two ASCII hex-digit bytes into one byte. `as char` is intentional:
-// non-ASCII bytes become a Latin-1 scalar that `to_digit(16)` then rejects,
-// so non-hex/multi-byte input fails cleanly. See `docs/hex.md`.
+// Combine two ASCII hex-digit bytes into one byte. `as char` is intentional: non-ASCII bytes
+// become a Latin-1 scalar that `to_digit(16)` then rejects, so non-hex/multi-byte input fails
+// cleanly.
 fn byte(hi: u8, lo: u8) -> Option<u8> {
     let hi = (hi as char).to_digit(16)?;
     let lo = (lo as char).to_digit(16)?;

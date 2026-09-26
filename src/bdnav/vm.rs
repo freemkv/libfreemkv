@@ -6,8 +6,6 @@
 //! First-Play is a BD-J title (the feature is chosen by a Java Xlet), or the
 //! program does not reach a `PlayPL` on a caller-approved feature candidate, it
 //! abstains (`None`) and selection falls back to the structural/heuristic order.
-//
-// See docs/vm.md — why power-on register fidelity matters for convergence.
 
 use super::index::{Index, PlaybackObj};
 use super::mobj::MovieObject;

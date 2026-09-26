@@ -1,12 +1,11 @@
 //! Key sources — the layer that hands libfreemkv a disc's terminal Unit Keys.
 //!
-//! libfreemkv performs NO key lookup. An application resolves a disc's keys
-//! through one or more [`KeySource`]s, each an adapter over a backing store
-//! (a keydb file, a key server, the mapfile cache) that returns the disc's
-//! terminal **Unit Keys** ([`crate::aacs::types::UnitKey`]), orchestrating
-//! derivation via the [`ResolveCtx`] handed to it and libfreemkv's own crypto
-//! primitives. libfreemkv owns the crypto; a source owns only PATH
-//! ORCHESTRATION. See docs/keysource.md for the ownership split.
+//! libfreemkv performs NO key lookup. An application resolves a disc's keys through one or more
+//! [`KeySource`]s, each an adapter over a backing store (a keydb file, a key server, the
+//! mapfile cache) that returns the disc's terminal **Unit Keys**
+//! ([`crate::aacs::types::UnitKey`]), orchestrating derivation via the [`ResolveCtx`] handed to
+//! it and libfreemkv's own crypto primitives. libfreemkv owns the crypto; a source owns only
+//! PATH ORCHESTRATION.
 
 use crate::aacs::types::HostCert;
 use crate::aacs::types::{UnitKey, Vid};
@@ -15,28 +14,25 @@ use crate::error::Error;
 
 /// Minimum encrypted-content unit samples a single online key request must carry.
 ///
-/// The key service identifies a key by which of the submitted units it decrypts,
-/// so too few samples can return a key that matches an incidental unit rather
-/// than the one asked about (a false positive); this many make a request
-/// unambiguous. Canonical here so both `freemkv-keysources`'s online source and
-/// libfreemkv's own FMTS forensic query ([`crate::mux`]) agree on one value —
-/// see docs/keysource.md for the layering rationale.
+/// The key service identifies a key by which of the submitted units it decrypts, so too few
+/// samples can return a key that matches an incidental unit rather than the one asked about (a
+/// false positive); this many make a request unambiguous. Canonical here so both
+/// `freemkv-keysources`'s online source and libfreemkv's own FMTS forensic query
+/// ([`crate::mux`]) agree on one value.
 pub const MIN_SAMPLE_UNITS: usize = 8;
 
 /// A set of encrypted content-unit samples PROVEN to carry at least
 /// [`MIN_SAMPLE_UNITS`] units — the online `/decode` request's proof-of-ownership.
 ///
-/// "Parse, don't validate": the only constructor, [`DecodeSampleSet::new`], returns
-/// `None` for an under-sized slice, so an online key request simply *cannot be built*
-/// from too few samples — a compile-time obligation, not a runtime check a caller
-/// can forget. See docs/keysource.md for the full rationale (including why the
-/// wrapped samples get a hand-written, redacting [`Debug`] — the impl below).
+/// "Parse, don't validate": the only constructor, [`DecodeSampleSet::new`], returns `None` for
+/// an under-sized slice, so an online key request simply *cannot be built* from too few samples
+/// — a compile-time obligation, not a runtime check a caller can forget.
 #[derive(Clone)]
 pub struct DecodeSampleSet(Vec<Vec<u8>>);
 
 impl std::fmt::Debug for DecodeSampleSet {
-    // Prints SHAPE only — a derived Debug dumped multi-MB of ciphertext
-    // verbatim into any log that formats it. See docs/keysource.md.
+    // Prints SHAPE only — a derived Debug dumped multi-MB of ciphertext verbatim into any log
+    // that formats it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DecodeSampleSet")
             .field("units", &"<redacted>")
@@ -107,9 +103,8 @@ pub struct DiscInputs {
     pub volume_label: Option<String>,
 }
 
-// Redacting Debug: a derived impl used to print the Volume ID, the whole
-// Unit_Key_RO.inf, the MKB and every ciphertext sample verbatim into a bug
-// report's log. See docs/keysource.md.
+// Redacting Debug: a derived impl used to print the Volume ID, the whole Unit_Key_RO.inf, the
+// MKB and every ciphertext sample verbatim into a bug report's log.
 impl std::fmt::Debug for DiscInputs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiscInputs")
@@ -179,8 +174,7 @@ impl<'a> DiscInputsCtx<'a> {
     /// stride, else 64-byte V20/V21) — the single source of truth, no separate
     /// version argument to drift from it.
     ///
-    /// A malformed `unit_key_ro` parses to an empty key set rather than an
-    /// error; see docs/keysource.md for why that's deliberate.
+    /// A malformed `unit_key_ro` parses to an empty key set rather than an error.
     pub fn new(inputs: &'a DiscInputs) -> Self {
         use crate::aacs::inf::parse_unit_key_ro;
         use crate::aacs::mkb::AacsVersion;
@@ -256,12 +250,11 @@ pub struct UnitKeyResolution {
 /// A key source: an adapter over a backing store that resolves a disc's terminal
 /// Unit Keys.
 ///
-/// Dumb about *policy*, smart about *its own material*: given a [`ResolveCtx`] a
-/// source orchestrates derivation down to Unit Keys using the library's
-/// boil-down crypto — never re-implementing AES. Two explicit resolve ops, one
-/// per key kind: [`get_unit_keys`](Self::get_unit_keys) (base per-CPS-unit),
-/// [`get_fmts_indexes`](Self::get_fmts_indexes) (AACS 2.1 forensic set). See
-/// docs/keysource.md for the full contract.
+/// Dumb about *policy*, smart about *its own material*: given a [`ResolveCtx`] a source
+/// orchestrates derivation down to Unit Keys using the library's boil-down crypto — never
+/// re-implementing AES. Two explicit resolve ops, one per key kind:
+/// [`get_unit_keys`](Self::get_unit_keys) (base per-CPS-unit),
+/// [`get_fmts_indexes`](Self::get_fmts_indexes) (AACS 2.1 forensic set).
 pub trait KeySource {
     /// Resolve this disc's base per-CPS-unit Unit Keys from this source. An empty
     /// `Vec` is a genuine "no key here"; `Err` is a source failure.
@@ -328,11 +321,10 @@ pub fn resolve_and_apply(
 /// [`crate::aacs::trace::ResolutionTrace`] recording, per source, what happened — for
 /// applications to render. ZERO English; the trace is typed enums only.
 ///
-/// One-shot per source: each source's [`KeySource::get_unit_keys`] is called
-/// exactly once; non-empty Unit Keys are applied via
-/// [`crate::Disc::decrypt_with`], which validates against `inputs.samples`
-/// and only mutates the disc on success. CPS-unit ORDER is load-bearing (see
-/// docs/keysource.md) even though the carried number is not.
+/// One-shot per source: each source's [`KeySource::get_unit_keys`] is called exactly once;
+/// non-empty Unit Keys are applied via [`crate::Disc::decrypt_with`], which validates against
+/// `inputs.samples` and only mutates the disc on success. CPS-unit ORDER is load-bearing  even
+/// though the carried number is not.
 pub fn resolve_and_apply_traced(
     sources: &[Box<dyn KeySource>],
     inputs: &DiscInputs,
@@ -435,19 +427,17 @@ pub fn resolve_and_apply_traced(
     (false, trace)
 }
 
-/// THE single key-fetch: drive `sources` in order and return the first non-empty
-/// Unit Key set. Same sources, same call for both disc-open and read-miss
-/// paths — there is no separate "fetch", only the samples in `ctx` differ.
-/// Unlike [`resolve_and_apply`] this does not validate/commit to a disc — the
-/// read's decorator re-decrypts with the returned keys, which is the
-/// validation. See docs/keysource.md for the two callers.
+/// THE single key-fetch: drive `sources` in order and return the first non-empty Unit Key set.
+/// Same sources, same call for both disc-open and read-miss paths — there is no separate
+/// "fetch", only the samples in `ctx` differ. Unlike [`resolve_and_apply`] this does not
+/// validate/commit to a disc — the read's decorator re-decrypts with the returned keys, which
+/// is the validation.
 pub fn fetch_unit_keys(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
     drive_unit_keys(sources, ctx).keys
 }
 
-// Whether a driver run resolved keys, and — if not — whether that's a genuine
-// absence (`errored == false`, safe to cache) or a source FAILURE
-// (`errored == true`, must not be cached). See docs/keysource.md.
+// Whether a driver run resolved keys, and — if not — whether that's a genuine absence (`errored
+// == false`, safe to cache) or a source FAILURE (`errored == true`, must not be cached).
 struct FetchOutcome {
     keys: Vec<UnitKey>,
     errored: bool,
@@ -507,13 +497,12 @@ fn drive_fmts_indexes(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> F
     }
 }
 
-/// Build the read-time [`crate::sector::KeyFetch`] from the disc's public AACS
-/// inputs and a way to (re)build the application's key sources. The returned
-/// resolver has the two explicit operations the mux and recovery decorator
-/// call: [`unit_keys`](crate::sector::KeyFetch::unit_keys) drives
-/// [`fetch_unit_keys`], [`fmts_indexes`](crate::sector::KeyFetch::fmts_indexes)
-/// drives [`fetch_fmts_indexes`]. One builder shared by every read path and
-/// consumer — see docs/keysource.md for the cloning/memoization contract.
+/// Build the read-time [`crate::sector::KeyFetch`] from the disc's public AACS inputs and a way
+/// to (re)build the application's key sources. The returned resolver has the two explicit
+/// operations the mux and recovery decorator call:
+/// [`unit_keys`](crate::sector::KeyFetch::unit_keys) drives [`fetch_unit_keys`],
+/// [`fmts_indexes`](crate::sector::KeyFetch::fmts_indexes) drives [`fetch_fmts_indexes`]. One
+/// builder shared by every read path and consumer.
 pub fn key_fetch(
     inputs: DiscInputs,
     make_sources: std::sync::Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>,
@@ -568,13 +557,11 @@ pub fn key_fetch(
     crate::sector::KeyFetch::new(unit, fmts)
 }
 
-/// Read up to `n` ENCRYPTED 6144-byte aligned units from `title`'s body, raw (no
-/// decrypt) — the content samples that populate [`DiscInputs::samples`] for a
-/// key server to validate a candidate against, and that [`resolve_and_apply`]
-/// hands to [`crate::Disc::decrypt_with`]. Lives in the library, not a
-/// key-source crate: carving units is decryption *mechanism*. "Encrypted" is
-/// the AACS CPI (`buf[0] & 0xc0`), NOT the `is_clean` TS-sync heuristic — see
-/// docs/keysource.md for why, and the extent-probing strategy.
+/// Read up to `n` ENCRYPTED 6144-byte aligned units from `title`'s body, raw (no decrypt) — the
+/// content samples that populate [`DiscInputs::samples`] for a key server to validate a
+/// candidate against, and that [`resolve_and_apply`] hands to [`crate::Disc::decrypt_with`].
+/// Lives in the library, not a key-source crate: carving units is decryption *mechanism*.
+/// "Encrypted" is the AACS CPI (`buf[0] & 0xc0`), NOT the `is_clean` TS-sync heuristic.
 pub fn read_encrypted_units(
     reader: &mut dyn crate::sector::SectorSource,
     title: &crate::disc::DiscTitle,
@@ -681,9 +668,8 @@ mod tests {
 
     // ── KeySource default-method behaviour ────────────────────────────────────
 
-    /// KeySource::host_certs() defaults to empty regardless of the MKB argument.
-    /// Mutation guard: a non-empty default would inject phantom certs into the
-    /// OEM handshake. See docs/keysource.md.
+    /// KeySource::host_certs() defaults to empty regardless of the MKB argument. Mutation
+    /// guard: a non-empty default would inject phantom certs into the OEM handshake.
     #[test]
     fn key_source_host_certs_defaults_to_empty() {
         struct MinimalSource;
@@ -940,9 +926,8 @@ mod tests {
         );
     }
 
-    /// A transient source outage must NOT be memoized as "no key" — a fingerprint
-    /// whose first fetch errored must be re-asked once recovered. Regression
-    /// guard; see docs/keysource.md.
+    /// A transient source outage must NOT be memoized as "no key" — a fingerprint whose first
+    /// fetch errored must be re-asked once recovered. Regression guard.
     #[test]
     fn errored_empty_is_not_cached_and_retries_when_source_recovers() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1029,9 +1014,9 @@ mod tests {
         );
     }
 
-    /// The two `KeyFetch` operations route to the two DISTINCT trait methods
-    /// (`unit_keys` → `get_unit_keys`, `fmts_indexes` → `get_fmts_indexes`), not
-    /// an overload keyed on return length. See docs/keysource.md.
+    /// The two `KeyFetch` operations route to the two DISTINCT trait methods (`unit_keys` →
+    /// `get_unit_keys`, `fmts_indexes` → `get_fmts_indexes`), not an overload keyed on return
+    /// length.
     #[test]
     fn key_fetch_routes_unit_and_fmts_to_distinct_source_methods() {
         const BASE: [u8; 16] = [0xB0; 16];
@@ -1106,9 +1091,8 @@ mod tests {
         assert_eq!(got[0].key, [0x77; 16], "the base-only source is skipped");
     }
 
-    /// #4 regression: content NOT at the extent midpoint (late-starting, or
-    /// midpoint in clear nav) must still be sampled. The old midpoint-forward
-    /// sampler returned empty; see docs/keysource.md.
+    /// #4 regression: content NOT at the extent midpoint (late-starting, or midpoint in clear
+    /// nav) must still be sampled. The old midpoint-forward sampler returned empty.
     #[test]
     fn read_encrypted_units_finds_scrambled_content_off_the_midpoint() {
         use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
@@ -1188,9 +1172,9 @@ mod tests {
         }
     }
 
-    /// DISCRIMINATING: selection is by AACS CPI (byte 0), NOT TS-sync clarity —
-    /// half the units lack TS syncs but are CPI-clear (genuinely unencrypted).
-    /// Must return ONLY CPI-flagged units. See docs/keysource.md.
+    /// DISCRIMINATING: selection is by AACS CPI (byte 0), NOT TS-sync clarity — half the units
+    /// lack TS syncs but are CPI-clear (genuinely unencrypted). Must return ONLY CPI-flagged
+    /// units.
     #[test]
     fn read_encrypted_units_selects_by_cpi_not_ts_sync() {
         use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
@@ -1272,9 +1256,8 @@ mod tests {
         }
     }
 
-    /// Audit #5 — DISCRIMINATING test for the version→stride fix: a 2-key
-    /// `Unit_Key_RO.inf` whose 2nd key sits at the V20 offset, so a V10 parse
-    /// reads a DIFFERENT region. See docs/keysource.md.
+    /// Audit #5 — DISCRIMINATING test for the version→stride fix: a 2-key `Unit_Key_RO.inf`
+    /// whose 2nd key sits at the V20 offset, so a V10 parse reads a DIFFERENT region.
     #[test]
     fn disc_inputs_ctx_parses_unit_keys_at_the_version_stride() {
         use crate::aacs::mkb::{AACS_MAJOR_BD, AACS_MAJOR_UHD};
@@ -1348,9 +1331,9 @@ mod tests {
         assert!(dbg.contains("TITLE_2024"), "{dbg}");
     }
 
-    /// `DecodeSampleSet` wraps the same on-disc ciphertext `DiscInputs` redacts;
-    /// a derived `Debug` would dump it verbatim. Sentinel 0xD5 = 213, matching
-    /// the `DiscInputs` test above. See docs/keysource.md.
+    /// `DecodeSampleSet` wraps the same on-disc ciphertext `DiscInputs` redacts; a derived
+    /// `Debug` would dump it verbatim. Sentinel 0xD5 = 213, matching the `DiscInputs` test
+    /// above.
     #[test]
     fn decode_sample_set_debug_is_redacted() {
         let set = DecodeSampleSet::new(vec![vec![0xD5; 6144]; MIN_SAMPLE_UNITS])

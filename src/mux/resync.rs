@@ -5,9 +5,8 @@
 //! frame would fault a decoder, so this gate drops forward past a gap on a
 //! video track until the next IRAP/IDR keyframe and resumes there.
 //!
-//! Audio/subtitle frames are independently decodable, so the gate is a
-//! no-op for them; TrueHD/MLP is the one exception and is handled in
-//! `codec::truehd` instead. See docs/resync.md for the full rationale.
+//! Audio/subtitle frames are independently decodable, so the gate is a no-op for them;
+//! TrueHD/MLP is the one exception and is handled in `codec::truehd` instead.
 
 /// Per-track keyframe-resync state. One gate per elementary stream; a video
 /// track's gate stays "armed" from a discontinuity until the next keyframe.
@@ -37,9 +36,8 @@ impl ResyncGate {
         }
     }
 
-    // Decide whether a parsed frame should be EMITTED (`true`) or DROPPED
-    // (`false`). Video arms on discontinuity, drops until the next keyframe.
-    // See docs/resync.md — `admit` parameters and behavior.
+    // Decide whether a parsed frame should be EMITTED (`true`) or DROPPED (`false`). Video arms
+    // on discontinuity, drops until the next keyframe.
     pub(crate) fn admit(&mut self, is_video: bool, discontinuity: bool, keyframe: bool) -> bool {
         if !is_video {
             return true;
@@ -83,9 +81,8 @@ impl ResyncGate {
 #[cfg(test)]
 mod tests {
 
-    // `dropped` is per-run, `dropped_total` cumulative; only the latter can
-    // report loss on a gap that resolves. See docs/resync.md — test
-    // `a_resolved_gap_still_reports_its_dropped_frames`.
+    // `dropped` is per-run, `dropped_total` cumulative; only the latter can report loss on a
+    // gap that resolves.
     #[test]
     fn a_resolved_gap_still_reports_its_dropped_frames() {
         let mut g = ResyncGate::new();

@@ -8,7 +8,6 @@
 //! by `num_cmds` 12-byte navigation commands.
 
 // One decoded 12-byte navigation command.
-// See docs/mobj.md — byte-level field layout (big-endian).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Cmd {
     pub op_cnt: u8,

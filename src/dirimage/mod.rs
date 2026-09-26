@@ -6,8 +6,6 @@
 //! metadata is encoded into RAM by [`encode`], data sectors map to on-demand
 //! file reads. 3D/SSIF folders are rejected up front
 //! ([`Error::DirImageSsifUnsupported`]).
-//!
-//! See docs/dirimage.md for details, unsupported cases, and caveats.
 
 mod encode;
 mod layout;

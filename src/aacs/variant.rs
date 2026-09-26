@@ -1,12 +1,10 @@
 //! AACS Media Key Variant chain.
 //!
-//! On AACS 2.1 the Media Key derivation gains a second stage on top of
-//! the classical subset-difference walk: the walk yields a Media Key
-//! Precursor (Kmp), combined with disc VKD and a per-licensee KCD
-//! constant to produce the Media Key. Entry point:
-//! [`derive_media_key_variant`] (`Kp -> Km`); `Kp` comes from
-//! [`walk_processing_key`]. No `0x2d`/`0x2f`/`0x0c` records falls back
-//! to [`super::derive`]. See docs/variant.md for layout/gate notes.
+//! On AACS 2.1 the Media Key derivation gains a second stage on top of the classical
+//! subset-difference walk: the walk yields a Media Key Precursor (Kmp), combined with disc VKD
+//! and a per-licensee KCD constant to produce the Media Key. Entry point:
+//! [`derive_media_key_variant`] (`Kp -> Km`); `Kp` comes from [`walk_processing_key`]. No
+//! `0x2d`/`0x2f`/`0x0c` records falls back to [`super::derive`].
 //!
 //! ```text
 //! Kmp     = AES-128D(Kp, C) XOR uv
@@ -21,12 +19,9 @@ use super::crypto::{aes_ecb_decrypt, aes_g};
 use super::mkb::*;
 use super::types::DeviceKey;
 
-// See docs/variant.md — MKB records this chain selects.
-
 // ── Public constants ──────────────────────────────────────────────────────
 
 /// Zero placeholder KCD, NOT real key material — PER-LICENSEE.
-/// See docs/variant.md — KEY_CORRECTION_DATA for the consequence.
 const KEY_CORRECTION_DATA: [u8; 16] = [0u8; 16];
 
 // ── MKB record walking ────────────────────────────────────────────────────
@@ -45,9 +40,8 @@ pub fn is_variant_mkb(records: &[MkbRecord]) -> bool {
         .any(|r| matches!(r.rec_type, REC_VARIANT_DATA_AND_NONCE | REC_VKD_TABLE))
 }
 
-/// Body of the `0x2d` record: `VARIANTS` table + trailing 16-byte Nonce.
-/// NOT the C used for `Kmp` (that's `0x0c`'s per-slot block).
-/// See docs/variant.md — variant_data_record for the measured layout.
+/// Body of the `0x2d` record: `VARIANTS` table + trailing 16-byte Nonce. NOT the C used for
+/// `Kmp` (that's `0x0c`'s per-slot block).
 pub(crate) fn variant_data_record(records: &[MkbRecord]) -> Option<&[u8]> {
     records
         .iter()
@@ -73,8 +67,7 @@ pub fn variant_nonce(records: &[MkbRecord]) -> Option<[u8; 16]> {
     Some(out)
 }
 
-/// The Variant Key Data (VKD) table — record type `0x2f`.
-/// Disc-public data; see docs/variant.md — variant_key_data for sizing.
+/// The Variant Key Data (VKD) table — record type `0x2f`. Disc-public data.
 pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
     records
         .iter()
@@ -84,8 +77,7 @@ pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
 
 // ── Subset-difference walk that exposes (Kp, uv) ──────────────────────────
 
-// Shared with the classical walk in super::derive to keep the SD tree
-// byte-identical. See docs/variant.md — subset-difference walk sharing.
+// Shared with the classical walk in super::derive to keep the SD tree byte-identical.
 use super::derive::{calc_pk_from_dk, calc_v_mask};
 
 /// Outcome of a subset-difference walk against an MKB. Carries the
@@ -130,11 +122,10 @@ fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
 /// Walk an MKB and return the first `(Kp, uv, cvalue)` that
 /// `device_keys` covers. Returns `None` if no DK walks any uv.
 ///
-/// This is the AACS-2.1 **variant** walk (classical walk: [`super::derive`]).
-/// Kept separate on purpose — different cvalue-record order and input
-/// framing; do NOT route the classical DK path through this function, or
-/// the `0x07`-first selection picks the wrong cvalue and returns `None`.
-/// See docs/variant.md — walk_processing_key for the full rationale.
+/// This is the AACS-2.1 **variant** walk (classical walk: [`super::derive`]). Kept separate on
+/// purpose — different cvalue-record order and input framing; do NOT route the classical DK
+/// path through this function, or the `0x07`-first selection picks the wrong cvalue and returns
+/// `None`.
 pub fn walk_processing_key(
     records: &[MkbRecord],
     device_keys: &[DeviceKey],
@@ -279,9 +270,8 @@ impl std::error::Error for MediaKeyVariantError {}
 
 // ── Chain ─────────────────────────────────────────────────────────────────
 
-/// Look up the per-slot `VARIANTS[sd_slot_index]` (leading bytes of the
-/// `0x2d` body, before the tail Nonce — see [`variant_nonce`]).
-/// See docs/variant.md — variants_for_uv for the measured layout.
+/// Look up the per-slot `VARIANTS[sd_slot_index]` (leading bytes of the `0x2d` body, before the
+/// tail Nonce — see [`variant_nonce`]).
 fn variants_for_uv(records: &[MkbRecord], sd_slot_index: usize) -> Option<u16> {
     let body = variant_data_record(records)?;
     // VARIANTS table is the leading bytes; the 16-byte Kvn Nonce is packed at the
@@ -409,13 +399,11 @@ fn variant_km_for_slot(
 
 /// Derive the AACS 2.1 variant **Media Key** from a Processing Key.
 ///
-/// The one deterministic `Kp → Km` derivation for a variant MKB: tries
-/// `pk` (which arrives without its slot) against every slot and returns
-/// the Km for the slot whose full chain passes the Verify-Media-Key
-/// record, so an unverified key is never returned. VID-free — derive the
-/// VUK via [`super::derive::derive_vuk`]; `Kp` comes from
-/// [`walk_processing_key`]. Errors: `NotVariantMkb`/`MkbIncomplete`/
-/// `ProcessingKeyUnavailable`; see docs/variant.md — derive_media_key_variant.
+/// The one deterministic `Kp → Km` derivation for a variant MKB: tries `pk` (which arrives
+/// without its slot) against every slot and returns the Km for the slot whose full chain passes
+/// the Verify-Media-Key record, so an unverified key is never returned. VID-free — derive the
+/// VUK via [`super::derive::derive_vuk`]; `Kp` comes from [`walk_processing_key`]. Errors:
+/// `NotVariantMkb`/`MkbIncomplete`/ `ProcessingKeyUnavailable`
 pub fn derive_media_key_variant(
     mkb_records: &[MkbRecord],
     pk: &[u8; 16],
@@ -464,10 +452,8 @@ pub fn derive_media_key_variant(
 /// device-key walk and the on-MKB `VARIANTS[uv]` lookup; the MKB still
 /// supplies the Nonce, VKD table, and Verify-Media-Key value.
 ///
-/// Returns `(Km, Kvu)`. The terminal gate is identical to
-/// [`derive_media_key_variant`]: a wrong input returns
-/// [`MediaKeyVariantError::MediaKeyVerifyFailed`]. See docs/variant.md —
-/// media_key_variant_from_kp for the [`KEY_CORRECTION_DATA`] caveat.
+/// Returns `(Km, Kvu)`. The terminal gate is identical to [`derive_media_key_variant`]: a wrong
+/// input returns [`MediaKeyVariantError::MediaKeyVerifyFailed`].
 pub fn media_key_variant_from_kp(
     kp: &[u8; 16],
     c_block: &[u8; 16],
@@ -693,9 +679,8 @@ mod tests {
 
     // ── Fixture construction ──
 
-    /// Build a synthetic variant MKB + DK walking its one SD slot. `kmp15`
-    /// picks `Kmp[15]` (`0x02`=SoftCorrection, `0x04`=OnlineChallenge,
-    /// `0x00`=neither). See docs/variant.md — synthetic_variant_setup.
+    /// Build a synthetic variant MKB + DK walking its one SD slot. `kmp15` picks `Kmp[15]`
+    /// (`0x02`=SoftCorrection, `0x04`=OnlineChallenge, `0x00`=neither).
     fn synthetic_variant_setup(kmp15: u8) -> (Vec<MkbRecord>, DeviceKey, [u8; 16], [u8; 16]) {
         use crate::aacs::crypto::aes_ecb_encrypt;
 
@@ -1095,7 +1080,6 @@ mod tests {
     }
 
     /// Build a variant MKB by inverting the 2.1 chain for a CHOSEN `(Kp, Km)`.
-    /// See docs/variant.md — Test fixture: plant_variant_mkb.
     fn plant_variant_mkb() -> PlantedVariant {
         use crate::aacs::crypto::{aes_ecb_encrypt, aes_g};
 
@@ -1214,8 +1198,7 @@ mod tests {
         );
     }
 
-    /// THE happy path: a covering Processing Key must derive the planted
-    /// Media Key. See docs/variant.md — Test: ..._for_a_covering_kp.
+    /// THE happy path: a covering Processing Key must derive the planted Media Key.
     #[test]
     fn variant_chain_derives_the_planted_media_key_for_a_covering_kp() {
         let p = plant_variant_mkb();
@@ -1242,8 +1225,7 @@ mod tests {
         assert_ne!(got, Ok(p.km));
     }
 
-    /// `mkb_find_mk_dv` must supply the ACTUAL `0x86` bytes, not a fixed
-    /// block. See docs/variant.md — Test: mkb_find_mk_dv_returns_....
+    /// `mkb_find_mk_dv` must supply the ACTUAL `0x86` bytes, not a fixed block.
     #[test]
     fn mkb_find_mk_dv_returns_the_verify_records_actual_bytes() {
         let p = plant_variant_mkb();
@@ -1269,8 +1251,7 @@ mod tests {
         );
     }
 
-    /// `variants_for_uv` must read the REAL `VARIANTS[slot]`, not a
-    /// constant. See docs/variant.md — Test: variants_for_uv_reads_the_....
+    /// `variants_for_uv` must read the REAL `VARIANTS[slot]`, not a constant.
     #[test]
     fn variants_for_uv_reads_the_planted_table_entry_that_selects_the_vkd() {
         let p = plant_variant_mkb();
@@ -1323,8 +1304,7 @@ mod tests {
         assert_eq!(variant_nonce(&recs), Some(nonce), "the Nonce is the tail");
     }
 
-    /// `variant_uv_slots` must drop `uv == 0` and `u_mask_shift >= 32`
-    /// slots. See docs/variant.md — Test: ..._drops_zero_uv_and_out_of_range.
+    /// `variant_uv_slots` must drop `uv == 0` and `u_mask_shift >= 32` slots.
     #[test]
     fn variant_uv_slots_drops_zero_uv_and_out_of_range_shift_slots() {
         // Four slots: uv == 0, shift == 32 (the exact boundary), shift == 0x3F
@@ -1352,8 +1332,7 @@ mod tests {
         );
     }
 
-    /// THE happy path for the EXPLICIT-INPUT entry point: must derive the
-    /// planted `(Km, Kvu)`. See docs/variant.md — Test: ..._derives_the_....
+    /// THE happy path for the EXPLICIT-INPUT entry point: must derive the planted `(Km, Kvu)`.
     #[test]
     fn media_key_variant_from_kp_derives_the_planted_media_key_and_volume_unique_key() {
         let p = plant_variant_mkb();
@@ -1384,8 +1363,8 @@ mod tests {
         assert_ne!(kvu, aes_g(&p.kp, &vid));
     }
 
-    /// Each caller-supplied value (`c_block`, `uv`, `variants_uv`) wrong
-    /// must yield an error, never a key. See docs/variant.md — Test: ..._refuses_every_....
+    /// Each caller-supplied value (`c_block`, `uv`, `variants_uv`) wrong must yield an error,
+    /// never a key.
     #[test]
     fn media_key_variant_from_kp_refuses_every_single_wrong_explicit_input() {
         let p = plant_variant_mkb();
@@ -1484,8 +1463,8 @@ mod tests {
         c_block1: [u8; 16],
     }
 
-    /// Build a two-slot variant MKB keyed by a DEVICE key at slot **1**,
-    /// behind a decoy at slot 0. See docs/variant.md — Test fixture: plant_walk_variant_mkb.
+    /// Build a two-slot variant MKB keyed by a DEVICE key at slot **1**, behind a decoy at slot
+    /// 0.
     fn plant_walk_variant_mkb() -> PlantedWalk {
         use crate::aacs::crypto::{aes_ecb_encrypt, aes_g};
 
@@ -1611,9 +1590,8 @@ mod tests {
         );
     }
 
-    /// `walk_processing_key` must return the Kp/uv/cvalue/index of the
-    /// COVERING slot — slot **1**, not slot 0. See docs/variant.md — Test:
-    /// walk_processing_key_returns_the_covering_slots_key_cvalue_and_index.
+    /// `walk_processing_key` must return the Kp/uv/cvalue/index of the COVERING slot — slot
+    /// **1**, not slot 0.
     #[test]
     fn walk_processing_key_returns_the_covering_slots_key_cvalue_and_index() {
         let p = plant_walk_variant_mkb();
@@ -1732,9 +1710,8 @@ mod tests {
         );
     }
 
-    /// Both halves of `classical_ok || variant_present` must hold: strip the
-    /// variant records from a fixture whose magic does NOT hold and the
-    /// walk must go quiet. See docs/variant.md — Test: ..._needs_either_....
+    /// Both halves of `classical_ok || variant_present` must hold: strip the variant records
+    /// from a fixture whose magic does NOT hold and the walk must go quiet.
     #[test]
     fn walk_processing_key_needs_either_the_verify_magic_or_variant_records() {
         let p = plant_walk_variant_mkb();
@@ -1760,9 +1737,8 @@ mod tests {
         );
     }
 
-    /// The OTHER half of `classical_ok || variant_present`: a classical MKB
-    /// whose cvalue opens the magic must match, computed exactly (`uv`
-    /// XORed into the LOW FOUR BYTES). See docs/variant.md — Test: ..._authenticates_....
+    /// The OTHER half of `classical_ok || variant_present`: a classical MKB whose cvalue opens
+    /// the magic must match, computed exactly (`uv` XORed into the LOW FOUR BYTES).
     #[test]
     fn walk_processing_key_authenticates_a_classical_match_through_the_verify_magic() {
         use crate::aacs::crypto::aes_ecb_encrypt;

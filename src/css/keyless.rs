@@ -4,9 +4,6 @@
 //! no player keys and no disc-key crack, using only known plaintext.
 //! Implemented from that public description; nothing here is copied or
 //! translated from any particular CSS software.
-//!
-//! See `docs/css-keyless.md` for the cipher structure this attacks and the
-//! four steps of the attack itself.
 
 use super::lfsr::descramble_sector;
 use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
@@ -23,8 +20,7 @@ fn lfsr0_output_tap(x: u32) -> u32 {
     (((((((x >> 3) ^ x) >> 1) ^ x) >> 8) ^ x) >> 5) & 0xff
 }
 
-// Recover the title key from cipher + known plaintext. `seed` is
-// sector[0x54..0x59]. See docs/css-keyless.md — recover_title_key_from_plain.
+// Recover the title key from cipher + known plaintext. `seed` is sector[0x54..0x59].
 fn recover_title_key_from_plain(
     crypted: &[u8],
     decrypted: &[u8],
@@ -223,9 +219,8 @@ pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
     result
 }
 
-// Crib: the predicted 10-byte plaintext at byte 0x80, from the longest
-// periodic run in the clear header. Also the decrypt path's cached-key
-// oracle. See docs/css-keyless.md — attack_crib.
+// Crib: the predicted 10-byte plaintext at byte 0x80, from the longest periodic run in the
+// clear header. Also the decrypt path's cached-key oracle.
 pub(crate) fn attack_crib(sector: &[u8]) -> Option<[u8; 10]> {
     if sector.len() < SECTOR_BYTES || sector[FLAG_BYTE] & 0x30 == 0 {
         return None;
@@ -290,8 +285,7 @@ mod tests {
     use super::super::lfsr::scramble_sector;
     use super::*;
 
-    // Synthesize a scrambled sector for a title key/seed with `plain` at byte
-    // 0x80. See docs/css-keyless.md — synth_sector.
+    // Synthesize a scrambled sector for a title key/seed with `plain` at byte 0x80.
     fn synth_sector(title_key: &[u8; 5], seed: &[u8; 5], plain: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let mut plaintext = vec![0u8; SECTOR_BYTES];
         plaintext[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
@@ -307,8 +301,8 @@ mod tests {
         (plaintext, body)
     }
 
-    // Synthesize a sector whose cleartext ends in a periodic run continuing
-    // into the encrypted region. See docs/css-keyless.md — synth_periodic_sector.
+    // Synthesize a sector whose cleartext ends in a periodic run continuing into the encrypted
+    // region.
     fn synth_periodic_sector(
         title_key: &[u8; 5],
         seed: &[u8; 5],
@@ -359,8 +353,8 @@ mod tests {
     /// A realistic MPEG-2 PES header start.
     const PES: [u8; 10] = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21];
 
-    // MANDATORY round-trip (Task C.1): recovered key must descramble the
-    // body back to plaintext. See docs/css-keyless.md — recover_round_trips_known_keys.
+    // MANDATORY round-trip (Task C.1): recovered key must descramble the body back to
+    // plaintext.
     #[test]
     fn recover_round_trips_known_keys() {
         let cases: &[([u8; 5], [u8; 5])] = &[
@@ -399,9 +393,8 @@ mod tests {
         }
     }
 
-    // descramble_matches is the ONLY gate between the LFSR search and a key
-    // handed to the caller. See docs/css-keyless.md —
-    // descramble_matches_accepts_only_the_key_the_sector_was_scrambled_with.
+    // descramble_matches is the ONLY gate between the LFSR search and a key handed to the
+    // caller.
     #[test]
     fn descramble_matches_accepts_only_the_key_the_sector_was_scrambled_with() {
         let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
@@ -426,7 +419,6 @@ mod tests {
     }
 
     // The gate must verify against a COPY, never mutate the caller's sector.
-    // See docs/css-keyless.md — descramble_matches_does_not_disturb_the_caller_s_sector.
     #[test]
     fn descramble_matches_does_not_disturb_the_caller_s_sector() {
         let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
@@ -567,9 +559,8 @@ mod tests {
         }
     }
 
-    // ── entry-point guards on caller- and disc-supplied lengths: a sector
-    // buffer that ENDS inside the encrypted region must be refused, not
-    // sliced. See docs/css-keyless.md — recover_rejects_a_sector_that_ends_inside_the_encrypted_region.
+    // ── entry-point guards on caller- and disc-supplied lengths: a sector buffer that ENDS
+    // inside the encrypted region must be refused, not sliced.
     #[test]
     fn recover_rejects_a_sector_that_ends_inside_the_encrypted_region() {
         for len in [0x81usize, 0x85, 0x89] {
@@ -582,9 +573,8 @@ mod tests {
         }
     }
 
-    // A buffer LONGER than one sector is still one sector: both entry points
-    // must recover from the first SECTOR_BYTES. See docs/css-keyless.md —
-    // a_buffer_longer_than_one_sector_still_yields_its_key.
+    // A buffer LONGER than one sector is still one sector: both entry points must recover from
+    // the first SECTOR_BYTES.
     #[test]
     fn a_buffer_longer_than_one_sector_still_yields_its_key() {
         let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
@@ -610,9 +600,8 @@ mod tests {
         assert!(crack_title_key(&padded).is_some());
     }
 
-    // recover_title_key accepts and uses MORE than ten bytes of known
-    // plaintext (ten is a MINIMUM). See docs/css-keyless.md —
-    // recover_accepts_more_than_ten_bytes_of_known_plaintext.
+    // recover_title_key accepts and uses MORE than ten bytes of known plaintext (ten is a
+    // MINIMUM).
     #[test]
     fn recover_accepts_more_than_ten_bytes_of_known_plaintext() {
         let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
@@ -630,9 +619,8 @@ mod tests {
         );
     }
 
-    // The scramble-flag gate on a sector whose BODY really is ciphertext and
-    // whose key IS recoverable. See docs/css-keyless.md —
-    // a_recoverable_sector_with_the_scramble_bits_cleared_is_still_refused.
+    // The scramble-flag gate on a sector whose BODY really is ciphertext and whose key IS
+    // recoverable.
     #[test]
     fn a_recoverable_sector_with_the_scramble_bits_cleared_is_still_refused() {
         let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
@@ -676,9 +664,8 @@ mod tests {
         );
     }
 
-    // ── descramble_matches: the verification gate's own mechanics — the gate
-    // must verify against the sector's CIPHERTEXT regardless of the flag
-    // byte. See docs/css-keyless.md — descramble_matches_forces_the_scramble_flag_on_its_own_copy.
+    // ── descramble_matches: the verification gate's own mechanics — the gate must verify
+    // against the sector's CIPHERTEXT regardless of the flag byte.
     #[test]
     fn descramble_matches_forces_the_scramble_flag_on_its_own_copy() {
         let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
@@ -696,9 +683,7 @@ mod tests {
         assert!(!descramble_matches(&sector, &wrong, &PES));
     }
 
-    // The gate compares the WHOLE supplied plaintext, clamped to the
-    // encrypted region. See docs/css-keyless.md —
-    // descramble_matches_compares_all_of_the_plaintext_and_no_more_than_the_sector.
+    // The gate compares the WHOLE supplied plaintext, clamped to the encrypted region.
     #[test]
     fn descramble_matches_compares_all_of_the_plaintext_and_no_more_than_the_sector() {
         let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
@@ -740,8 +725,7 @@ mod tests {
     }
 
     // ── attack_crib: known-answer vectors. Sector whose clear header ends in
-    // a period-length run of run_len bytes before 0x80, rest 0xFF. See
-    // docs/css-keyless.md — sector_with_trailing_run.
+    // a period-length run of run_len bytes before 0x80, rest 0xFF.
     fn sector_with_trailing_run(period: usize, run_len: usize) -> Vec<u8> {
         assert!(
             run_len < ENCRYPTED_START,
@@ -770,8 +754,7 @@ mod tests {
     }
 
     // KNOWN ANSWER: the crib is the period-5 run continued forward, the same
-    // ten bytes for every run length. See docs/css-keyless.md —
-    // attack_crib_predicts_the_periodic_run_continuing_past_0x80.
+    // ten bytes for every run length.
     #[test]
     fn attack_crib_predicts_the_periodic_run_continuing_past_0x80() {
         for &run_len in &[11usize, 12, 13, 14, 15, 16, 20, 31] {
@@ -809,9 +792,8 @@ mod tests {
         }
     }
 
-    // A run of exactly ONE cycle is not enough to predict forward; attack_crib
-    // requires two full cycles. See docs/css-keyless.md —
-    // attack_crib_refuses_a_run_shorter_than_two_cycles.
+    // A run of exactly ONE cycle is not enough to predict forward; attack_crib requires two
+    // full cycles.
     #[test]
     fn attack_crib_refuses_a_run_shorter_than_two_cycles() {
         // period 8, run of 9 bytes: best_plen = 8, 8 / 8 == 1 cycle.
@@ -840,9 +822,8 @@ mod tests {
         assert_eq!(crack_title_key(&sector), None);
     }
 
-    // attack_crib indexes sector[0x7f - j] unbounded, so its own length guard
-    // is the only thing stopping an out-of-bounds read. See docs/css-keyless.md
-    // — attack_crib_refuses_a_buffer_shorter_than_a_sector.
+    // attack_crib indexes sector[0x7f - j] unbounded, so its own length guard is the only thing
+    // stopping an out-of-bounds read.
     #[test]
     fn attack_crib_refuses_a_buffer_shorter_than_a_sector() {
         for len in [0x15usize, 0x40, 0x7F, SECTOR_BYTES - 1] {
@@ -856,9 +837,8 @@ mod tests {
         }
     }
 
-    // A header periodic ALL THE WAY to offset 0 must not walk the backward
-    // scan off the front of the sector. See docs/css-keyless.md —
-    // attack_crib_survives_a_header_that_is_periodic_to_offset_zero.
+    // A header periodic ALL THE WAY to offset 0 must not walk the backward scan off the front
+    // of the sector.
     #[test]
     fn attack_crib_survives_a_header_that_is_periodic_to_offset_zero() {
         let mut sector = vec![0u8; SECTOR_BYTES];
@@ -890,8 +870,7 @@ mod tests {
         );
     }
 
-    // The crib is read from the CLEAR header only, never the encrypted
-    // region. See docs/css-keyless.md — attack_crib_is_independent_of_the_encrypted_region.
+    // The crib is read from the CLEAR header only, never the encrypted region.
     #[test]
     fn attack_crib_is_independent_of_the_encrypted_region() {
         let base = sector_with_trailing_run(5, 11);
@@ -909,9 +888,8 @@ mod tests {
         }
     }
 
-    // ── recover_title_key_from_plain: input-length guard is the only thing
-    // standing between a short slice and an index-out-of-bounds PANIC. See
-    // docs/css-keyless.md — recover_title_key_from_plain_refuses_fewer_than_ten_bytes_of_either_input.
+    // ── recover_title_key_from_plain: input-length guard is the only thing standing between a
+    // short slice and an index-out-of-bounds PANIC.
     #[test]
     fn recover_title_key_from_plain_refuses_fewer_than_ten_bytes_of_either_input() {
         let seed = [0x11u8, 0x22, 0x33, 0x44, 0x55];
@@ -944,9 +922,7 @@ mod tests {
         );
     }
 
-    // The seed XOR-back turns the recovered LFSR key into the TITLE key:
-    // key ^= sector_seed. See docs/css-keyless.md —
-    // recover_title_key_from_plain_xors_the_sector_seed_back_out.
+    // The seed XOR-back turns the recovered LFSR key into the TITLE key: key ^= sector_seed.
     #[test]
     fn recover_title_key_from_plain_xors_the_sector_seed_back_out() {
         let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];

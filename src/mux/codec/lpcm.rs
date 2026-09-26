@@ -4,8 +4,7 @@
 //! DVD-PS LPCM payloads already had their private sub-header removed by
 //! `PsDemuxer`, so nothing further is stripped here. See `strip_header`.
 //!
-//! Both origins map to MKV codec ID "A_PCM/INT/BIG" (big-endian); all
-//! frames are keyframes. See docs/lpcm.md for wire-format details.
+//! Both origins map to MKV codec ID "A_PCM/INT/BIG" (big-endian); all frames are keyframes.
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 

@@ -5,9 +5,6 @@
 //! Responsibilities: count kept/dropped AUs and dropped duration; log every
 //! drop (per-drop trace plus a once-per-track `warn` aggregate); and latch a
 //! poison flag once a track is judged mostly undecodable so the rest drops too.
-//!
-//! See `docs/dropgate.md` for full rationale (per-codec detection, sync
-//! preservation, TrueHD collateral drops).
 
 /// Minimum access units observed before the whole-track drop verdict can fire.
 /// Below this, a short damaged burst can't poison an otherwise-good track.
@@ -73,9 +70,9 @@ impl DropTally {
         self.maybe_poison();
     }
 
-    // Collateral: caused by another AU's corruption (TrueHD resync-forward, or
-    // an already-poisoned track), not individually verified undecodable.
-    // Deliberately excluded from the poison verdict — see docs/dropgate.md.
+    // Collateral: caused by another AU's corruption (TrueHD resync-forward, or an
+    // already-poisoned track), not individually verified undecodable. Deliberately excluded
+    // from the poison verdict.
     pub(crate) fn record_collateral_drop(
         &mut self,
         pts_ns: i64,
@@ -101,8 +98,8 @@ impl DropTally {
         );
     }
 
-    // Whole-track fallback: past the min-AU gate, >50% dropped latches `poisoned`
-    // and logs once. See docs/dropgate.md for the full rationale.
+    // Whole-track fallback: past the min-AU gate, >50% dropped latches `poisoned` and logs
+    // once.
     fn maybe_poison(&mut self) {
         if self.poisoned {
             return;
@@ -179,9 +176,8 @@ mod tests {
         assert!(!t.is_poisoned());
     }
 
-    // Puts the kept count on the critical path (unlike the test above, which
-    // never exercises it): losing it would silently discard a healthy track.
-    // See docs/dropgate.md for the full rationale.
+    // Puts the kept count on the critical path (unlike the test above, which never exercises
+    // it): losing it would silently discard a healthy track.
     #[test]
     fn interleaved_keeps_are_in_the_poison_denominator() {
         let mut t = DropTally::new("test");

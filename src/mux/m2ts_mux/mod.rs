@@ -19,8 +19,6 @@
 //! [adaptation field, if signalled]
 //! [payload, if signalled]
 //! ```
-//!
-//! See docs/m2ts-mux.md for PID wiring, PSI/PCR cadence, and scope notes.
 
 use std::io::{self, Write};
 
@@ -246,9 +244,8 @@ impl<W: Write> M2tsMux<W> {
         self.out.flush()
     }
 
-    // PTS (ns) -> 90 kHz ticks rebased on the stream origin, seeded by the FIRST
-    // frame of any kind (video or audio) when `may_seed_base`. See
-    // docs/m2ts-mux.md#base_relative_pts.
+    // PTS (ns) -> 90 kHz ticks rebased on the stream origin, seeded by the FIRST frame of any
+    // kind (video or audio) when `may_seed_base`.
     fn base_relative_pts(&mut self, pts_ns: i64, may_seed_base: bool) -> u64 {
         let raw_90k = if pts_ns > 0 {
             // Widen to u128 so adversarial timestamps can't overflow the
@@ -272,9 +269,8 @@ impl<W: Write> M2tsMux<W> {
         if delta >= (1 << 32) { 0 } else { delta }
     }
 
-    // Emit one PES payload as a chain of TS packets on `pid`; `pcr`, if
-    // given, is stamped on the first packet's AF. See docs/m2ts-mux.md
-    // #write_pes-packet-size-math for the 188/184-byte layout math.
+    // Emit one PES payload as a chain of TS packets on `pid`; `pcr`, if given, is stamped on
+    // the first packet's AF.
     fn write_pes(
         &mut self,
         pid: u16,
@@ -574,8 +570,6 @@ mod tests {
     use super::*;
 
     // Golden vector for an audio PES header (ISO/IEC 13818-1 §2.4.3.7).
-    // See docs/m2ts-mux.md#audio_pes_header_is_byte_exact_and_bounded_unlike_video
-    // for why the stream_id and PES_packet_length fields matter here.
     #[test]
     fn audio_pes_header_is_byte_exact_and_bounded_unlike_video() {
         let es = [0xDEu8, 0xAD, 0xBE, 0xEF];
@@ -873,7 +867,6 @@ mod tests {
 
     // Regression: a silent no-op parameter-set prepend must be observable via
     // `parameter_sets_emitted()`, not just a warning.
-    // See docs/m2ts-mux.md#absent_or_unparseable_codec_private_is_reported_not_silent.
     #[test]
     fn absent_or_unparseable_codec_private_is_reported_not_silent() {
         // A VPS NAL the parser can find, and the hvcC that carries it.
@@ -997,7 +990,6 @@ mod tests {
     }
 
     // Regression: PCR must be re-stamped MID-PES, not only at PES boundaries.
-    // See docs/m2ts-mux.md#pcr_restamped_mid_pes_within_interval.
     #[test]
     fn pcr_restamped_mid_pes_within_interval() {
         let mut sink: Vec<u8> = Vec::new();

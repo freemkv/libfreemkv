@@ -94,9 +94,8 @@ const PES_BUFFER_INIT_CAP: usize = 16 * 1024;
 // PUSI; push() drops the partial PES and resyncs on the next PUSI past this cap.
 const MAX_PES_BUFFER: usize = 64 * 1024 * 1024; // 64 MiB
 
-// Aggregate ceiling across every tracked PID; each PID's share (`pes_cap`) is
-// derived from this so a crafted MPLS declaring many streams can't multiply
-// MAX_PES_BUFFER by the stream count. See docs/ts-demux.md — MAX_PES_BUFFER_TOTAL.
+// Aggregate ceiling across every tracked PID; each PID's share (`pes_cap`) is derived from this
+// so a crafted MPLS declaring many streams can't multiply MAX_PES_BUFFER by the stream count.
 const MAX_PES_BUFFER_TOTAL: usize = 512 * 1024 * 1024; // 512 MiB
 
 impl PesAssembler {
@@ -565,9 +564,9 @@ fn parse_timestamp(data: &[u8]) -> Option<i64> {
     Some(((b0 >> 1) & 0x07) << 30 | b1 << 22 | (b2 >> 1) << 15 | b3 << 7 | b4 >> 1)
 }
 
-// Canonical continuity-counter gap test (ISO/IEC 13818-1 S2.4.3.3), shared by
-// the PES assembler and the PSI section reassembler so they can't drift; a
-// legal duplicate CC repeat is not a gap. See docs/ts-demux.md — cc_is_gap.
+// Canonical continuity-counter gap test (ISO/IEC 13818-1 S2.4.3.3), shared by the PES assembler
+// and the PSI section reassembler so they can't drift; a legal duplicate CC repeat is not a
+// gap.
 fn cc_is_gap(last_cc: Option<u8>, cc: u8) -> bool {
     match last_cc {
         Some(prev) => cc != ((prev + 1) & 0x0f) && cc != prev,
@@ -612,9 +611,8 @@ fn psi_payload_base(pkt: &[u8]) -> Option<usize> {
     }
 }
 
-// Reassemble a single PSI section (PAT/PMT) for `target_pid`/`table_id` across
-// TS-packet boundaries. Returns the section bytes (from table_id) or None.
-// See docs/ts-demux.md — collect_psi_section.
+// Reassemble a single PSI section (PAT/PMT) for `target_pid`/`table_id` across TS-packet
+// boundaries. Returns the section bytes (from table_id) or None.
 fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec<u8>> {
     let mut offset = 0;
     while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
@@ -2304,9 +2302,8 @@ mod tests {
         let _ = scan_streams(&data);
     }
 
-    // PES reassembly buffer cap (DoS hardening): must be a SHARE of the
-    // aggregate ceiling, not a flat 64 MiB/PID (see docs/ts-demux.md —
-    // MAX_PES_BUFFER_TOTAL). With 64 tracked PIDs, each share is 8 MiB.
+    // PES reassembly buffer cap (DoS hardening): must be a SHARE of the aggregate ceiling, not
+    // a flat 64 MiB/PID. With 64 tracked PIDs, each share is 8 MiB.
     #[test]
     fn per_pid_pes_cap_is_a_share_of_an_aggregate_ceiling() {
         let pids: Vec<u16> = (0x1000..0x1040).collect(); // 64 PIDs

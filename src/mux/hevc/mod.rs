@@ -1,9 +1,7 @@
 //! HEVC (H.265) elementary stream muxer — Annex B byte stream.
 //!
-//! Consumes [`PesFrame`](crate::pes::PesFrame)s for a single video track
-//! and writes them as a raw `.hevc` / `.h265` Annex B byte stream with no
-//! container framing. See docs/hevc-mux.md for the stream layout and
-//! parameter-set handling.
+//! Consumes [`PesFrame`](crate::pes::PesFrame)s for a single video track and writes them as a
+//! raw `.hevc` / `.h265` Annex B byte stream with no container framing.
 //!
 //! Sequential-only — no Cues, no backpatch. Target sink is any
 //! [`SequentialSink`](crate::io::sink::SequentialSink): file, socket,
@@ -60,10 +58,9 @@ impl<W: Write> HevcMux<W> {
 
     /// Write one PES frame (= one access unit) as Annex B NAL units.
     ///
-    /// Input may be either length-prefixed (`[u32-BE len][NAL bytes]`
-    /// repeated, the form libfreemkv's HEVC parser emits) — converted to
-    /// Annex B — or already Annex B (a buffer beginning with a start
-    /// code), passed through unchanged. See docs/hevc-mux.md for detail.
+    /// Input may be either length-prefixed (`[u32-BE len][NAL bytes]` repeated, the form
+    /// libfreemkv's HEVC parser emits) — converted to Annex B — or already Annex B (a buffer
+    /// beginning with a start code), passed through unchanged.
     ///
     /// `_pts_ns` is accepted for symmetry with other muxers but ignored
     /// — Annex B has no timing layer.
@@ -106,9 +103,9 @@ impl<W: Write> HevcMux<W> {
     }
 }
 
-// Convert a HEVCDecoderConfigurationRecord (hvcC) into Annex B NAL units.
-// Single source of truth for hvcC -> Annex B across all muxers (HEVC ES,
-// BD-TS, standard MPEG-TS) — do not reimplement. See docs/hevc-mux.md.
+// Convert a HEVCDecoderConfigurationRecord (hvcC) into Annex B NAL units. Single source of
+// truth for hvcC -> Annex B across all muxers (HEVC ES, BD-TS, standard MPEG-TS) — do not
+// reimplement.
 pub(crate) fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
     if hvcc.len() < 23 {
         return None;
@@ -151,9 +148,9 @@ pub(crate) fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-// Convert length-prefixed NALs ([u32-BE len][NAL] repeated) to Annex B;
-// already-Annex-B input passes through unchanged. Truncation policy
-// (shared across muxers): drop truncated trailing NAL. See docs/hevc-mux.md.
+// Convert length-prefixed NALs ([u32-BE len][NAL] repeated) to Annex B; already-Annex-B input
+// passes through unchanged. Truncation policy (shared across muxers): drop truncated trailing
+// NAL.
 pub(crate) fn length_prefixed_to_annex_b(data: &[u8]) -> Vec<u8> {
     // Probe for a leading Annex B start code before attempting to parse
     // length prefixes: `00 00 00 01` would otherwise parse as length 1.
@@ -169,9 +166,8 @@ pub(crate) fn length_prefixed_to_annex_b(data: &[u8]) -> Vec<u8> {
 /// ISO/IEC 14496-15 records declare as `lengthSizeMinusOne = 3`.
 pub(crate) const DEFAULT_NAL_LENGTH_SIZE: usize = 4;
 
-// Octets per NAL length prefix for `record`'s track, per avcC/hvcC's
-// lengthSizeMinusOne field (ISO/IEC 14496-15). Falls back to
-// DEFAULT_NAL_LENGTH_SIZE. See docs/hevc-mux.md for field offsets and rationale.
+// Octets per NAL length prefix for `record`'s track, per avcC/hvcC's lengthSizeMinusOne field
+// (ISO/IEC 14496-15). Falls back to DEFAULT_NAL_LENGTH_SIZE.
 pub(crate) fn nal_length_size(codec: crate::disc::Codec, record: Option<&[u8]>) -> usize {
     use crate::disc::Codec;
     let field_offset = match codec {
@@ -185,16 +181,15 @@ pub(crate) fn nal_length_size(codec: crate::disc::Codec, record: Option<&[u8]>) 
     }
 }
 
-// Annex B form of length-prefixed `data`, written into caller-owned `out`
-// to avoid an allocation on hot per-frame paths. Non-length-prefixed input
-// is appended unchanged (assumed already Annex B). See docs/hevc-mux.md.
+// Annex B form of length-prefixed `data`, written into caller-owned `out` to avoid an
+// allocation on hot per-frame paths. Non-length-prefixed input is appended unchanged (assumed
+// already Annex B).
 pub(crate) fn append_length_prefixed_as_annex_b(out: &mut Vec<u8>, data: &[u8]) {
     append_length_prefixed_as_annex_b_sized(out, data, DEFAULT_NAL_LENGTH_SIZE);
 }
 
-// Like append_length_prefixed_as_annex_b but for `length_size`-octet NAL
-// prefixes (from nal_length_size); `length_size` outside 1..=4 clamps to
-// DEFAULT_NAL_LENGTH_SIZE. See docs/hevc-mux.md.
+// Like append_length_prefixed_as_annex_b but for `length_size`-octet NAL prefixes (from
+// nal_length_size); `length_size` outside 1..=4 clamps to DEFAULT_NAL_LENGTH_SIZE.
 pub(crate) fn append_length_prefixed_as_annex_b_sized(
     out: &mut Vec<u8>,
     data: &[u8],
@@ -248,9 +243,8 @@ fn starts_with_start_code(data: &[u8]) -> bool {
     data.starts_with(&START_CODE) || data.starts_with(&[0x00, 0x00, 0x01])
 }
 
-// Convert an AVCDecoderConfigurationRecord (avcC) into Annex B NAL units;
-// H.264 counterpart to hvcc_to_annex_b and single source of truth for
-// avcC -> Annex B across all muxers. See docs/hevc-mux.md for layout.
+// Convert an AVCDecoderConfigurationRecord (avcC) into Annex B NAL units; H.264 counterpart to
+// hvcc_to_annex_b and single source of truth for avcC -> Annex B across all muxers.
 pub(crate) fn avcc_to_annex_b(avcc: &[u8]) -> Option<Vec<u8>> {
     // avcC fixed header is 5 bytes; byte 5 carries the SPS count (low 5 bits),
     // then the SPS array begins at byte 6 (ISO/IEC 14496-15 §5.3.3.1.2).

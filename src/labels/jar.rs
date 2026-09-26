@@ -13,14 +13,13 @@ use crate::udf::UdfFs;
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
-// Cap on bytes read from one `.class` entry — the jar's declared size
-// is attacker-controlled, so the buffer grows incrementally instead of
-// pre-sizing. See docs/jar.md — MAX_CLASS_BYTES rationale.
+// Cap on bytes read from one `.class` entry — the jar's declared size is attacker-controlled,
+// so the buffer grows incrementally instead of pre-sizing.
 const MAX_CLASS_BYTES: u64 = 64 * 1024 * 1024;
 
-// Cap on bytes read from one non-`.class` resource entry (the dcx.xml /
-// playlists.xml / *.properties manifests the Tier-1 sweep reads). Same
-// attacker-controlled-size defence as MAX_CLASS_BYTES — see docs/jar.md.
+// Cap on bytes read from one non-`.class` resource entry (the dcx.xml / playlists.xml /
+// *.properties manifests the Tier-1 sweep reads). Same attacker-controlled-size defence as
+// MAX_CLASS_BYTES.
 const MAX_RESOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// In-memory zip archive: backed by a `Vec<u8>` read from UDF. Owns
@@ -41,7 +40,6 @@ pub fn for_each_jar<R, F>(reader: &mut dyn SectorSource, udf: &UdfFs, mut f: F) 
 where
     F: FnMut(&str, &mut Jar) -> Option<R>,
 {
-    // See docs/jar.md — for_each_jar "top-level" vendor examples.
     let jar_dir = udf.find_dir("/BDMV/JAR")?;
     for entry in &jar_dir.entries {
         if entry.is_dir {
@@ -315,9 +313,6 @@ mod tests {
         assert!(parsed);
     }
 
-    // See docs/jar.md — read_is_bounded_by_cap rationale.
-    // Read is bounded by MAX_CLASS_BYTES; the entry still parses and
-    // is surfaced exactly once despite a forged huge declared size.
     #[test]
     fn read_is_bounded_by_cap() {
         // Padding past MINIMAL_CLASS is harmless trailing data the parser

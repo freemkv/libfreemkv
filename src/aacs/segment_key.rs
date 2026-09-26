@@ -11,7 +11,6 @@
 //!   record[index_space]  (record_size bytes each)
 //! ```
 //! Record layout beyond an 8-byte sub-header is not yet reversed.
-// See docs/segment-key.md — confirmed disc measurements and reversing notes.
 
 /// Bytes of the fixed file header.
 pub const HEADER_LEN: usize = 8;

@@ -9,9 +9,7 @@ use super::startcode::BitReader;
 use super::{CodecParser, Frame, PesPacket};
 
 const DTS_CORE_SYNC: [u8; 4] = [0x7F, 0xFE, 0x80, 0x01];
-// DTS-HD extension syncword. See docs/dts.md — DTS_HD_EXT_SYNC: exact
-// EXSS sizing keeps a false core sync inside its payload from splitting
-// the access unit.
+// DTS-HD extension syncword.
 const DTS_HD_EXT_SYNC: [u8; 4] = [0x64, 0x58, 0x20, 0x25];
 
 /// DTS / DTS-HD elementary-stream parser. Buffers DTS across PES boundaries so
@@ -78,9 +76,6 @@ impl DtsParser {
         self.tally.dropped_duration_ns()
     }
 
-    // See docs/dts.md — emit_or_drop: gates an AU through the decodability
-    // check. The PTS clock is already advanced either way, so a drop is a
-    // gap, never a shift; every drop is logged (fail-loud).
     fn emit_or_drop(
         &mut self,
         au: Vec<u8>,
@@ -116,9 +111,6 @@ impl DtsParser {
         }
     }
 
-    // See docs/dts.md — stamp_pts: re-base to each PES's own PTS, advancing
-    // by one frame duration only within a run sharing that PES (fixes DVD's
-    // several-cores-per-PES case without the drift a global clock caused).
     fn stamp_pts(&mut self, front: i64, dur_ns: i64) -> i64 {
         let base = if front != PTS_UNSET && front != self.last_front_pts {
             // New PES (or the first AU): trust its own timestamp — no drift.
@@ -179,14 +171,13 @@ impl DtsParser {
 /// this without a clean boundary we resync rather than stall or balloon.
 const MAX_AU_BYTES: usize = 65536;
 
-// "Enough bytes to read the fsize field" — a HEADER-LAYOUT minimum, distinct
-// from MIN_CORE_FRAME_BYTES (the decoded-size validity floor). See docs/dts.md
-// — CORE_HEADER_MIN_BYTES.
+// "Enough bytes to read the fsize field" — a HEADER-LAYOUT minimum, distinct from
+// MIN_CORE_FRAME_BYTES (the decoded-size validity floor).
 const CORE_HEADER_MIN_BYTES: usize = 10;
 
-// ETSI TS 102 114 on-wire FSIZE floor is 95, so a real core frame is at
-// least 96 bytes; a smaller decoded size means a false/corrupt sync, so we
-// resync rather than close an AU at a junk boundary. See docs/dts.md.
+// ETSI TS 102 114 on-wire FSIZE floor is 95, so a real core frame is at least 96 bytes; a
+// smaller decoded size means a false/corrupt sync, so we resync rather than close an AU at a
+// junk boundary.
 const MIN_CORE_FRAME_BYTES: usize = 96;
 
 // Sentinel for "no valid PTS base captured yet": real PTS-in-ns values are
@@ -354,8 +345,8 @@ impl CodecParser for DtsParser {
 }
 
 impl DtsParser {
-    // Emits the final buffered AU (core + extensions, gated through the
-    // decodability check) at end of stream. See docs/dts.md — flush_tail.
+    // Emits the final buffered AU (core + extensions, gated through the decodability check) at
+    // end of stream.
     fn flush_tail(&mut self) -> Vec<Frame> {
         if find_sync(self.acc.as_slice(), &DTS_CORE_SYNC) != Some(0)
             || self.acc.len() < CORE_HEADER_MIN_BYTES
@@ -387,12 +378,11 @@ impl DtsParser {
     }
 }
 
-/// Offset where the FINAL access unit ends at end-of-stream, dropping a
-/// truncated trailing core. Trailing DTS-HD extension substreams belong to this
-/// AU and are skipped precisely (kept); a trailing CORE sync — complete or
-/// truncated — begins a NEW AU that never closed during `parse()`, so the AU
-/// ends there. A tail too short to identify, or non-sync garbage, is kept with
-/// the AU. See docs/dts.md.
+/// Offset where the FINAL access unit ends at end-of-stream, dropping a truncated trailing
+/// core. Trailing DTS-HD extension substreams belong to this AU and are skipped precisely
+/// (kept); a trailing CORE sync — complete or truncated — begins a NEW AU that never closed
+/// during `parse()`, so the AU ends there. A tail too short to identify, or non-sync garbage,
+/// is kept with the AU.
 fn final_au_end(buf: &[u8], core_size: usize) -> usize {
     let mut pos = core_size;
     loop {
@@ -444,14 +434,11 @@ enum NextCore {
     None,
 }
 
-// Byte length shared by both 32-bit DTS syncwords (core and EXSS). See
-// docs/dts.md — SYNCWORD_BYTES / next_core_boundary for how candidate core
-// syncs found in extension payload are validated by decoded size.
+// Byte length shared by both 32-bit DTS syncwords (core and EXSS).
 const SYNCWORD_BYTES: usize = DTS_CORE_SYNC.len();
 
-// EXSS header field bit widths (ETSI TS 102 114). `bHeaderSizeType` selects
-// short form (`nuExtSSHeaderSize` 8b, `nuExtSSFsize` 16b) or long (12/20b).
-// See docs/dts.md.
+// EXSS header field bit widths (ETSI TS 102 114). `bHeaderSizeType` selects short form
+// (`nuExtSSHeaderSize` 8b, `nuExtSSFsize` 16b) or long (12/20b).
 const EXSS_USER_DEFINED_BITS: u32 = 8;
 const EXSS_INDEX_BITS: u32 = 2;
 const EXSS_HEADER_SIZE_TYPE_BITS: u32 = 1;
@@ -471,9 +458,9 @@ const EXSS_HEADER_MIN_BYTES: usize = SYNCWORD_BYTES
         + EXSS_FSIZE_BITS_LONG)
         .div_ceil(u8::BITS) as usize;
 
-// EXSS total byte size (including the sync), read precisely from its
-// header; `buf` must begin with DTS_HD_EXT_SYNC. Lets the AU framer skip
-// the extension exactly rather than scanning its payload. See docs/dts.md.
+// EXSS total byte size (including the sync), read precisely from its header; `buf` must begin
+// with DTS_HD_EXT_SYNC. Lets the AU framer skip the extension exactly rather than scanning its
+// payload.
 fn exss_frame_size(buf: &[u8]) -> Option<usize> {
     if buf.len() < EXSS_HEADER_MIN_BYTES {
         return None;
@@ -492,9 +479,9 @@ fn exss_frame_size(buf: &[u8]) -> Option<usize> {
     Some(fsize_minus_one as usize + 1)
 }
 
-// Offset where the current AU ends (start of the next core frame): trailing
-// extensions are skipped PRECISELY by declared size, so a false core sync
-// in XLL payload can't be mistaken for the boundary. See docs/dts.md.
+// Offset where the current AU ends (start of the next core frame): trailing extensions are
+// skipped PRECISELY by declared size, so a false core sync in XLL payload can't be mistaken for
+// the boundary.
 fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
     let mut pos = core_size;
     loop {
@@ -536,9 +523,8 @@ fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
     }
 }
 
-// Heuristic fallback (pre-fix behaviour): scan for the next core syncword
-// whose decoded size is plausible, used only when precise extension
-// skipping can't proceed. See docs/dts.md.
+// Heuristic fallback (pre-fix behaviour): scan for the next core syncword whose decoded size is
+// plausible, used only when precise extension skipping can't proceed.
 fn scan_for_next_core(buf: &[u8], from: usize, ext_clean: bool) -> NextCore {
     let mut from = from;
     while let Some(rel) = find_sync(&buf[from..], &DTS_CORE_SYNC) {
@@ -558,9 +544,9 @@ fn scan_for_next_core(buf: &[u8], from: usize, ext_clean: bool) -> NextCore {
     NextCore::None
 }
 
-// `fsize` (14 bits, header bits 46-59) is length-minus-one on the wire;
-// returns `fsize + 1`, the core length in bytes. `0` if `data` is short —
-// every caller rejects that via the MIN floor. See docs/dts.md.
+// `fsize` (14 bits, header bits 46-59) is length-minus-one on the wire; returns `fsize + 1`,
+// the core length in bytes. `0` if `data` is short — every caller rejects that via the MIN
+// floor.
 fn dts_core_frame_size(data: &[u8]) -> usize {
     if data.len() < CORE_HEADER_MIN_BYTES {
         return 0;
@@ -584,9 +570,8 @@ const DTS_CORE_SAMPLE_RATES: [u32; 16] = [
     12_000, 24_000, 48_000, 96_000, 192_000,
 ];
 
-// Samples per DTS core frame: `(NBLKS + 1) * 32`. NBLKS (7 bits, ETSI TS
-// 102 114) = byte4 bit0 + byte5 bits7-2, after FTYPE/SHORT/CPF. See
-// docs/dts.md.
+// Samples per DTS core frame: `(NBLKS + 1) * 32`. NBLKS (7 bits, ETSI TS 102 114) = byte4 bit0
+// + byte5 bits7-2, after FTYPE/SHORT/CPF.
 fn dts_core_samples(data: &[u8]) -> u32 {
     if data.len() < CORE_HEADER_MIN_BYTES {
         return 512; // typical; only reached on a truncated header
@@ -614,20 +599,17 @@ fn dts_core_duration_ns(data: &[u8]) -> u64 {
     (samples * 1_000_000_000 + rate / 2) / rate
 }
 
-// DTS core-header validity constants (ETSI TS 102 114): a NORMAL frame's
-// `deficit_samples` must equal this; `npcmblocks` a multiple of
-// DTS_SUBBAND_SAMPLES. See docs/dts.md.
+// DTS core-header validity constants (ETSI TS 102 114): a NORMAL frame's `deficit_samples` must
+// equal this; `npcmblocks` a multiple of DTS_SUBBAND_SAMPLES.
 const DTS_PCMBLOCK_SAMPLES: u32 = 32;
 const DTS_SUBBAND_SAMPLES: u32 = 8;
-// Number of LEGAL 6-bit AMODE codes (ETSI TS 102 114 §5.3.1): 0-15 are
-// defined channel arrangements (10-15 are 6/7/8-ch), only 16-63 are
-// reserved. See docs/dts.md.
+// Number of LEGAL 6-bit AMODE codes (ETSI TS 102 114 §5.3.1): 0-15 are defined channel
+// arrangements (10-15 are 6/7/8-ch), only 16-63 are reserved.
 const DTS_AMODE_COUNT: u32 = 16;
 const DTS_LFE_FLAG_INVALID: u32 = 3;
 
-// Sample rate (Hz) per core SFREQ code (ETSI TS 102 114 Table 6-4); `0`
-// marks a reserved code (fails validation). Reserved: {0, 4, 5, 9, 10}.
-// See docs/dts.md.
+// Sample rate (Hz) per core SFREQ code (ETSI TS 102 114 Table 6-4); `0` marks a reserved code
+// (fails validation). Reserved: {0, 4, 5, 9, 10}.
 const DTS_CORE_SR_VALID: [u32; 16] = [
     0, 8_000, 16_000, 32_000, 0, 0, 11_025, 22_050, 44_100, 0, 0, 12_000, 24_000, 48_000, 96_000,
     192_000,
@@ -669,9 +651,9 @@ impl DropReason {
     }
 }
 
-// Decodability gate: ETSI TS 102 114 core-header validity checks. `Some`
-// means genuinely undecodable; `None` also covers a truncated header
-// (never false-drop our own buffer underrun). See docs/dts.md.
+// Decodability gate: ETSI TS 102 114 core-header validity checks. `Some` means genuinely
+// undecodable; `None` also covers a truncated header (never false-drop our own buffer
+// underrun).
 fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
     let mut r = BitReader::new(au.get(SYNCWORD_BYTES..)?);
 
@@ -802,8 +784,8 @@ mod tests {
 
     // --- stamp_pts: the "same PES, no fresh front timestamp" branch ---
 
-    // Third arm: front == last_front_pts, no cursor yet — must stamp the
-    // repeated front, not collapse to 0. See docs/dts.md.
+    // Third arm: front == last_front_pts, no cursor yet — must stamp the repeated front, not
+    // collapse to 0.
     #[test]
     fn stamp_pts_reuses_front_when_no_running_cursor_yet() {
         let mut parser = DtsParser::new();
@@ -818,8 +800,8 @@ mod tests {
 
     // --- drain_front: collapsing duplicate offset-0 PTS markers must not leak ---
 
-    // `drain_front` must collapse repeated offset-0 PTS markers each time, or
-    // `pts_marks` grows unbounded across a multi-hour track. See docs/dts.md.
+    // `drain_front` must collapse repeated offset-0 PTS markers each time, or `pts_marks` grows
+    // unbounded across a multi-hour track.
     #[test]
     fn drain_front_collapses_offset_zero_markers_instead_of_leaking() {
         let mut parser = DtsParser::new();
@@ -840,9 +822,8 @@ mod tests {
         );
     }
 
-    // A real EXSS substream (short header form) with an optional false core
-    // sync embedded in its payload, to prove precise sizing bounds it. See
-    // docs/dts.md.
+    // A real EXSS substream (short header form) with an optional false core sync embedded in
+    // its payload, to prove precise sizing bounds it.
     fn make_exss(total: usize, false_core_at: Option<usize>) -> Vec<u8> {
         let mut d = vec![0u8; total];
         d[0..4].copy_from_slice(&DTS_HD_EXT_SYNC);
@@ -1249,9 +1230,8 @@ mod tests {
         );
     }
 
-    // Minimal EXSS substream (sync + zero-padding); the parser delimits by
-    // the next CORE sync, not this extension's own size header. See
-    // docs/dts.md.
+    // Minimal EXSS substream (sync + zero-padding); the parser delimits by the next CORE sync,
+    // not this extension's own size header.
     fn make_dts_ext(size: usize) -> Vec<u8> {
         let mut e = vec![0u8; size];
         e[0..4].copy_from_slice(&DTS_HD_EXT_SYNC);
@@ -1328,9 +1308,8 @@ mod tests {
         assert_eq!(tail[0].data.len(), 512 + 300);
     }
 
-    // A core sync whose `fsize` decodes tiny (< MIN_CORE_FRAME_BYTES): must be
-    // drained and resynced past, not close an AU at a junk boundary. See
-    // docs/dts.md.
+    // A core sync whose `fsize` decodes tiny (< MIN_CORE_FRAME_BYTES): must be drained and
+    // resynced past, not close an AU at a junk boundary.
     fn bogus_tiny_core_sync() -> Vec<u8> {
         // Core sync + zero header bytes. fsize = 0 → core_size = 1 (< 10).
         let mut v = vec![0u8; 10];
@@ -1593,8 +1572,8 @@ mod tests {
 
     // --- next_core_boundary: SYNCWORD_BYTES length guard ---
 
-    // The `buf.len() < pos + SYNCWORD_BYTES` guard must be strict `<`: at
-    // exactly that length the sync IS fully present. See docs/dts.md.
+    // The `buf.len() < pos + SYNCWORD_BYTES` guard must be strict `<`: at exactly that length
+    // the sync IS fully present.
     #[test]
     fn next_core_boundary_exact_syncword_length_is_not_need_more() {
         let core = make_dts_core(MIN_CORE_FRAME_BYTES);
@@ -1818,9 +1797,8 @@ mod tests {
         );
     }
 
-    // A structurally-valid but UNDECODABLE core (LFE flag = reserved 3):
-    // sizes/syncs normally, fails the header validity check. See
-    // docs/dts.md.
+    // A structurally-valid but UNDECODABLE core (LFE flag = reserved 3): sizes/syncs normally,
+    // fails the header validity check.
     fn make_bad_dts_core(size: usize) -> Vec<u8> {
         let mut d = make_dts_core(size);
         assert!(
@@ -2099,9 +2077,8 @@ mod tests {
         );
     }
 
-    // Real-data fixture (ignored): re-parses a raw .dts stream and writes the
-    // emitted AUs back out for validation against an external decoder. See
-    // docs/dts.md. Env: DTS_IN, DTS_OUT.
+    // Real-data fixture (ignored): re-parses a raw.dts stream and writes the emitted AUs back
+    // out for validation against an external decoder.
     #[test]
     #[ignore]
     fn reparse_real_dts_file() {
@@ -2151,8 +2128,8 @@ mod tests {
 
     // ── Exact-boundary behaviour of the AU framer ────────────────────────────
 
-    // `find_sync` scans `0..=len-4`; the `len == 4` boundary (where a split
-    // sync lands on its last byte) isn't covered elsewhere. See docs/dts.md.
+    // `find_sync` scans `0..=len-4`; the `len == 4` boundary (where a split sync lands on its
+    // last byte) isn't covered elsewhere.
     #[test]
     fn find_sync_matches_a_buffer_that_is_exactly_the_syncword() {
         assert_eq!(
@@ -2169,9 +2146,8 @@ mod tests {
         );
     }
 
-    // Exactly CORE_HEADER_MIN_BYTES must be decoded, not deferred — else a
-    // false sync sits at the front, blocking every later real core. See
-    // docs/dts.md.
+    // Exactly CORE_HEADER_MIN_BYTES must be decoded, not deferred — else a false sync sits at
+    // the front, blocking every later real core.
     #[test]
     fn a_core_header_of_exactly_the_minimum_length_is_decoded_not_deferred() {
         let mut parser = DtsParser::new();
@@ -2215,9 +2191,8 @@ mod tests {
         );
     }
 
-    // The flush guard is a DISJUNCTION: a buffer not BEGINNING with a core
-    // sync is discarded regardless of length, or junk could size-decode into
-    // a fake AU. See docs/dts.md.
+    // The flush guard is a DISJUNCTION: a buffer not BEGINNING with a core sync is discarded
+    // regardless of length, or junk could size-decode into a fake AU.
     #[test]
     fn flush_discards_a_long_buffer_that_does_not_begin_with_a_core_sync() {
         // A well-formed core frame with ONE byte of its syncword corrupted: every
@@ -2247,8 +2222,8 @@ mod tests {
         assert!(parser.flush().is_empty(), "a bare sync tail is not an AU");
     }
 
-    // EXSS_HEADER_MIN_BYTES is the WORST-CASE header length, pinned at both
-    // sides of the boundary rather than by value. See docs/dts.md.
+    // EXSS_HEADER_MIN_BYTES is the WORST-CASE header length, pinned at both sides of the
+    // boundary rather than by value.
     #[test]
     fn exss_frame_size_needs_the_worst_case_header_and_no_more() {
         assert_eq!(
@@ -2273,9 +2248,8 @@ mod tests {
         );
     }
 
-    // The point of the shared buffer: an AU whose core arrived EARLIER keeps
-    // that packet's source offset, not the completing packet's. See
-    // docs/dts.md.
+    // The point of the shared buffer: an AU whose core arrived EARLIER keeps that packet's
+    // source offset, not the completing packet's.
     #[test]
     fn an_access_unit_carries_the_source_of_the_packet_its_core_arrived_in() {
         let mut parser = DtsParser::new();

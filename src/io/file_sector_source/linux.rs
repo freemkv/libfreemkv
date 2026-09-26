@@ -7,7 +7,6 @@
 //! already-read pages from the page cache so a large streaming read
 //! doesn't fill memory and starve concurrent writes. Together they
 //! mirror the write-side WritebackPipeline's policy.
-// See docs/file-sector-source-linux.md — rationale and regression history.
 
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
@@ -34,9 +33,8 @@ pub(crate) fn drop_window(file: &File, start: u64, len: u64) {
     }
 }
 
-// Async-prefetch `len` bytes at `offset`: queues readahead(2) without
-// waiting, so the next batch's I/O overlaps current-batch processing.
-// See docs/file-sector-source-linux.md — why this beats kernel readahead alone.
+// Async-prefetch `len` bytes at `offset`: queues readahead(2) without waiting, so the next
+// batch's I/O overlaps current-batch processing.
 pub(crate) fn prefetch(file: &File, offset: u64, len: u64) {
     unsafe {
         libc::readahead(file.as_raw_fd(), offset as i64, len as usize);

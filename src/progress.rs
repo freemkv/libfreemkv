@@ -5,8 +5,6 @@
 //! same [`PassProgress`] shape via the [`Progress`] trait. Consumers (autorip)
 //! compute their own single derived view from these fields and never reach
 //! into per-pass internals.
-//!
-//! See docs/progress.md — why this design (pre-0.13.16 leaked-field history).
 
 /// Identifies which pipeline phase the progress event belongs to.
 ///
@@ -82,9 +80,6 @@ pub struct LocatedProgress {
 /// regardless of which kind of pass is running. `bytes_good_total` is the
 /// cumulative count of confirmed-clean bytes across the whole rip; useful
 /// for the "data recovered" stat the user sees.
-///
-/// See docs/progress.md — `PassKind::Verify` field mapping, and why
-/// `PassProgress` is NOT `Copy`.
 #[derive(Debug, Clone)]
 pub struct PassProgress {
     pub kind: PassKind,
@@ -166,8 +161,6 @@ impl PassProgress {
 /// emits a `DEBUG` event on target `freemkv::heartbeat` at most once per
 /// interval (default 5s), so a stalled loop is visible in the log as the
 /// absence of a beat.
-///
-/// See docs/progress.md — hot-path cost and [`tick_cpu`](Heartbeat::tick_cpu).
 #[derive(Debug)]
 pub struct Heartbeat {
     phase: &'static str,

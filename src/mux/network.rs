@@ -14,9 +14,8 @@ use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 /// I/O buffer size for network reads/writes.
 const NET_BUF_SIZE: usize = 256 * 1024;
 
-// True if `ip` must never be a `network://` connect target (loopback,
-// private, link-local, unspecified, multicast). Re-checked here at
-// connect time to close a DNS-rebinding TOCTOU. See docs/network-mod.md.
+// True if `ip` must never be a `network://` connect target (loopback, private, link-local,
+// unspecified, multicast). Re-checked here at connect time to close a DNS-rebinding TOCTOU.
 pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -706,9 +705,8 @@ mod tests {
         );
     }
 
-    // accept_from() must reject a connection whose first bytes aren't the
-    // FMKV magic, surfacing NoMetadata rather than an empty/garbage title.
-    // See docs/network-mod.md for why this test half-closes, not full-closes.
+    // accept_from() must reject a connection whose first bytes aren't the FMKV magic, surfacing
+    // NoMetadata rather than an empty/garbage title.
     #[test]
     fn accept_from_rejects_stream_without_fmkv_header() {
         use std::io::Read as _;

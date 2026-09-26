@@ -2,11 +2,9 @@
 //! stream file (per-codec ES, PGS `.sup`, VobSub `.idx`/`.sub`, LPCM raw PCM),
 //! plus a chapters file and per-audio-track delay metadata.
 //!
-//! This is a write-only [`crate::pes::Stream`] that routes each frame's
-//! payload to the file for `frame.track`, post-processing where the codec's
-//! internal `Frame` form differs from the on-disk ES form (HEVC/H.264
-//! Annex-B, PGS `.sup`, VobSub `.idx`) — see docs/demux-sink.md for details.
-//! Other codecs write `frame.data` verbatim; this sink is purely additive.
+//! This is a write-only [`crate::pes::Stream`] that routes each frame's payload to the file for
+//! `frame.track`, post-processing where the codec's internal `Frame` form differs from the
+//! on-disk ES form (HEVC/H.264 Annex-B, PGS `.sup`, VobSub `.idx`).
 
 use crate::disc::{Chapter, Codec, DiscTitle, Stream as DiscStream};
 use crate::mux::hevc::{
@@ -281,9 +279,8 @@ fn annexb_param_sets(codec: Codec, record: &[u8]) -> Vec<u8> {
     })
 }
 
-// PGS `.sup` writer: rebuilds the HDMV segment framing the parser stripped,
-// prefixing each segment with a 13-byte `PG` header (PTS/DTS).
-// See docs/demux-sink.md — PgsSupWriter.
+// PGS `.sup` writer: rebuilds the HDMV segment framing the parser stripped, prefixing each
+// segment with a 13-byte `PG` header (PTS/DTS).
 #[derive(Default)]
 struct PgsSupWriter {
     // Delay a duration-derived clear until the next frame, so an original
@@ -349,9 +346,8 @@ impl PgsSupWriter {
         Ok(written)
     }
 
-    // Synthetic "clear" display set (empty PCS + END) re-emitted at
-    // `display_pts + duration`; without it every subtitle lingers to EOF.
-    // See docs/demux-sink.md — synthetic_clear_display_set.
+    // Synthetic "clear" display set (empty PCS + END) re-emitted at `display_pts + duration`;
+    // without it every subtitle lingers to EOF.
     fn synthetic_clear_display_set(width: u16, height: u16) -> Vec<u8> {
         // Empty PCS payload (HDMV PGS, BD-ROM Part 3): width(2) height(2)
         // frame_rate(1) composition_number(2) composition_state(1)
@@ -622,9 +618,8 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-// Replace path-hostile characters (control chars incl. NUL) in a filename
-// component; disc-derived text (e.g. STN language codes) is unvalidated.
-// See docs/demux-sink.md — sanitize.
+// Replace path-hostile characters (control chars incl. NUL) in a filename component;
+// disc-derived text (e.g. STN language codes) is unvalidated.
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -1729,9 +1724,8 @@ mod tests {
         assert_eq!(a, out);
     }
 
-    // Regression: the epoch driver must follow `ref_video_track` (dynamic),
-    // not a hardcoded `frame.track == 0` — a PMT can list audio before video.
-    // See docs/demux-sink.md — epoch_driver_follows_ref_video_not_track_zero.
+    // Regression: the epoch driver must follow `ref_video_track` (dynamic), not a hardcoded
+    // `frame.track == 0` — a PMT can list audio before video.
     #[test]
     fn epoch_driver_follows_ref_video_not_track_zero() {
         let dir = tempdir();
@@ -1859,9 +1853,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // A demux export whose seam plan drops every frame must FAIL, not write
-    // empty track files and report success.
-    // See docs/demux-sink.md — a_demux_export_the_seam_plan_emptied_fails.
+    // A demux export whose seam plan drops every frame must FAIL, not write empty track files
+    // and report success.
     #[test]
     fn a_demux_export_the_seam_plan_emptied_fails() {
         let dir = tempdir();
@@ -1912,11 +1905,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A demux export where the seam plan drops MORE frames than it persists
-    /// must report SeamPlanDroppedMost — even though at least one frame did
-    /// persist (frames_mapped > 0). The denominator counts persisted frames
-    /// only, so a mostly-emptied export can no longer slip past as success.
-    /// See docs/demux-sink.md — a_demux_export_the_seam_plan_mostly_emptied_fails.
+    /// A demux export where the seam plan drops MORE frames than it persists must report
+    /// SeamPlanDroppedMost — even though at least one frame did persist (frames_mapped > 0).
+    /// The denominator counts persisted frames only, so a mostly-emptied export can no longer
+    /// slip past as success.
     #[test]
     fn a_demux_export_the_seam_plan_mostly_emptied_fails() {
         let dir = tempdir();
@@ -1978,13 +1970,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A FILTERED export (`audio://`) must NOT trip the drop gates on drops that
-    /// belong to a track it never persists. The video track is dropped hard at
-    /// the clip join (2 frames, all outside the marks), while the persisted audio
-    /// track loses nothing. `dropped_total()` would fold the video drops (2) into
-    /// the numerator and, exceeding the persisted count (1), wrongly report
-    /// SeamPlanDroppedMost; `dropped_for(persisted_tracks)` sees 0 and passes.
-    /// See docs/demux-sink.md — a_filtered_export_ignores_drops_on_filtered_tracks.
+    /// A FILTERED export (`audio://`) must NOT trip the drop gates on drops that belong to a
+    /// track it never persists. The video track is dropped hard at the clip join (2 frames, all
+    /// outside the marks), while the persisted audio track loses nothing. `dropped_total()`
+    /// would fold the video drops (2) into the numerator and, exceeding the persisted count
+    /// (1), wrongly report SeamPlanDroppedMost; `dropped_for(persisted_tracks)` sees 0 and
+    /// passes.
     #[test]
     fn a_filtered_export_ignores_drops_on_non_persisted_tracks() {
         let dir = tempdir();

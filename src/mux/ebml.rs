@@ -147,9 +147,8 @@ pub fn start_master<W: Write + Seek>(w: &mut W, id: u32) -> io::Result<u64> {
     Ok(size_pos)
 }
 
-// Fixed-width 8-octet EBML VINT (0x01 marker + 56-bit big-endian payload,
-// RFC 8794 §4.4) used to back-patch a master element's size field.
-// See docs/ebml.md — fixed_width_vint8 (rationale, callers' invariants).
+// Fixed-width 8-octet EBML VINT (0x01 marker + 56-bit big-endian payload, RFC 8794 §4.4) used
+// to back-patch a master element's size field.
 fn fixed_width_vint8(data_size: u64) -> [u8; 8] {
     debug_assert!(data_size < 0x0100_0000_0000_0000);
     [
@@ -193,8 +192,8 @@ pub fn end_master<W: Write + Seek>(w: &mut W, size_pos: u64) -> io::Result<()> {
 /// 8-byte size placeholder [`start_master`] writes. Returns the buffer index of
 /// the size field, for [`end_master_buf`].
 ///
-/// This is the seek-free twin of [`start_master`]/[`end_master`], producing
-/// byte-for-byte identical output — see docs/ebml.md for why.
+/// This is the seek-free twin of [`start_master`]/[`end_master`], producing byte-for-byte
+/// identical output.
 pub fn start_master_buf(buf: &mut Vec<u8>, id: u32) -> io::Result<usize> {
     write_id(buf, id)?;
     let size_pos = buf.len();
@@ -415,9 +414,8 @@ pub fn read_binary_val(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
     read_exact_bounded(r, len)
 }
 
-// Reads exactly `len` bytes without trusting `len` to size the allocation
-// up front (an attacker-controlled EBML size could claim gigabytes).
-// See docs/ebml.md — read_exact_bounded.
+// Reads exactly `len` bytes without trusting `len` to size the allocation up front (an
+// attacker-controlled EBML size could claim gigabytes).
 fn read_exact_bounded(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let got = r.take(len as u64).read_to_end(&mut buf)?;
@@ -1332,9 +1330,8 @@ mod tests {
         // And the whole buffer is exactly the outer element.
         assert_eq!(data.len() as u64, outer_body_start + osize);
     }
-    // Buffer-based and seek-based master helpers must produce byte-for-byte
-    // identical output; write_block_group relies on that to skip seeks/flushes.
-    // See docs/ebml.md — buffered_master_matches_seeking_master_byte_for_byte.
+    // Buffer-based and seek-based master helpers must produce byte-for-byte identical output;
+    // write_block_group relies on that to skip seeks/flushes.
     #[test]
     fn buffered_master_matches_seeking_master_byte_for_byte() {
         use std::io::Cursor;
@@ -1410,9 +1407,8 @@ mod tests {
         );
     }
 
-    // Every payload octet is distinct, so a shifted/reversed/dropped octet
-    // is visible; the top octets are unreachable through end_master directly.
-    // See docs/ebml.md — fixed_width_vint8_is_big_endian_over_the_full_payload.
+    // Every payload octet is distinct, so a shifted/reversed/dropped octet is visible; the top
+    // octets are unreachable through end_master directly.
     #[test]
     // Underscores mark bitfield boundaries (e.g. 5-bit then 3-bit), not digit
     // groups; regrouping uniformly would destroy the only thing they encode.

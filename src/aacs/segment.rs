@@ -12,7 +12,6 @@
 //!     u32 marker (= 0x01000000) | u16 index | u16 flag (= 1)
 //!     u32 start_spn | u32 end_spn        (source-packet numbers, inclusive)
 //! ```
-//! See docs/segment.md — terminology, measurements, interleave rationale.
 
 /// Fixed size of one `IndividualSegment.tbl` record.
 pub const SEGMENT_RECORD_LEN: usize = 16;
@@ -80,10 +79,8 @@ pub fn lba_byte_offset(lba: u32) -> u64 {
 /// The forensic segment an AACS aligned unit belongs to, if any, given the
 /// unit's clip-relative byte offset.
 ///
-/// A unit overlapping a segment must be opened with that segment's index key
-/// (selected by `index`), not the CPS Unit Key — see docs/segment.md for why.
-/// `None` means the unit is ordinary content and a miss on it is a plain
-/// Unit-Key miss.
+/// A unit overlapping a segment must be opened with that segment's index key (selected by
+/// `index`), not the CPS Unit Key.
 ///
 /// Tested as a packet *span* (`[off/192, (off+6144-1)/192]`) so a unit that
 /// only partly overlaps a segment edge still counts as forensic.
@@ -147,11 +144,10 @@ pub fn clip_byte_to_lba(extents: &[crate::disc::Extent], clip_byte: u64) -> Opti
 
 /// Build the `[start_lba, end_lba) → key_idx` ranges for an FMTS forensic key map.
 ///
-/// Each forensic segment's clip-relative source-packet span becomes an absolute
-/// LBA range tagged with the key its `index` selects (via `index_to_key_idx`).
-/// Ranges outside every segment are left for the map's default (the Unit Key).
-/// A segment straddling a UDF extent boundary is skipped rather than emitting
-/// a wrong span. See docs/segment.md for the interleave-decode rationale.
+/// Each forensic segment's clip-relative source-packet span becomes an absolute LBA range
+/// tagged with the key its `index` selects (via `index_to_key_idx`). Ranges outside every
+/// segment are left for the map's default (the Unit Key). A segment straddling a UDF extent
+/// boundary is skipped rather than emitting a wrong span.
 ///
 /// Feeds [`AacsKeyMap::from_ranges`](crate::decrypt::AacsKeyMap::from_ranges)
 /// with the Unit-Key index as the default.

@@ -106,7 +106,6 @@ impl Stream for ChaptersSink {
 // ── json:// ──────────────────────────────────────────────────────────────────
 
 // The `json://` document for one title, built from [`TitleProfile`].
-// See docs/meta-sink.md — title_json schema.
 pub(crate) fn title_json(title: &DiscTitle) -> serde_json::Value {
     use serde_json::json;
     // `index`/`is_main` are disc-level (title's position in the sorted list, whether
@@ -470,7 +469,6 @@ mod tests {
     }
 
     // Write-only sinks must refuse read() with E_STREAM_WRITE_ONLY, not Ok(None).
-    // See docs/meta-sink.md — write-only sinks: read() semantics.
     #[test]
     fn metadata_sinks_refuse_to_be_read_from() {
         let code = format!("E{}", crate::error::Error::StreamWriteOnly.code());

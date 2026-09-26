@@ -551,8 +551,7 @@ fn css_roundtrip_multiple_keys() {
 
 // ── CSS keyless recovery tests ─────────────────────────────────────────────
 
-// Attempt keyless recovery on synthetically scrambled sectors; see
-// docs/css-keyless.md for why synthetic data may not converge.
+// Attempt keyless recovery on synthetically scrambled sectors.
 #[test]
 fn css_keyless_recovery_validates_cracked_key() {
     let candidates: &[([u8; 5], [u8; 5])] = &[

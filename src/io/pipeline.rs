@@ -4,9 +4,6 @@
 //! through a bounded `crossbeam_channel`, and joins it on `finish()`.
 //! The consumer's behaviour is supplied by a [`Sink`] implementation:
 //! `apply` is called once per item, `close` is called once at the end.
-//!
-//! See docs/pipeline.md for full cancellation/error semantics and the
-//! `FREEMKV_DEBUG=1` debug-logging switch.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -18,16 +15,14 @@ use crossbeam_channel::{Sender, TrySendError, bounded};
 use crate::error::Error;
 use crate::halt::Halt;
 
-// Deadline for finish_with_halt's polling join. See docs/pipeline.md —
-// it's a backstop for a wedged kernel call, not a normal timeout.
+// Deadline for finish_with_halt's polling join.
 pub const JOIN_TIMEOUT_SECS: u64 = 600;
 
-// Grace period after a halt/timeout fires in finish_with_halt, to let a
-// "nearly done" consumer join cleanly. See docs/pipeline.md.
+// Grace period after a halt/timeout fires in finish_with_halt, to let a "nearly done" consumer
+// join cleanly.
 const FINISH_GRACE_SECS: u64 = 5;
 
 // Halt-check cadence for the send loop; aliases crate::halt::POLL_INTERVAL.
-// See docs/pipeline.md — SEND_HALT_CHECK_INTERVAL.
 use crate::halt::POLL_INTERVAL;
 const SEND_HALT_CHECK_INTERVAL: Duration = POLL_INTERVAL;
 
@@ -43,9 +38,8 @@ pub fn debug_enabled() -> bool {
     })
 }
 
-// Converts a consumer-thread panic payload into Error::PipelineConsumerPanicked.
-// The panic message is logged here for diagnostics, not baked into the error
-// value. See docs/pipeline.md — consumer_panicked.
+// Converts a consumer-thread panic payload into Error::PipelineConsumerPanicked. The panic
+// message is logged here for diagnostics, not baked into the error value.
 fn consumer_panicked(payload: Box<dyn std::any::Any + Send>) -> Error {
     let msg = payload
         .downcast_ref::<&'static str>()
@@ -61,9 +55,8 @@ fn consumer_panicked(payload: Box<dyn std::any::Any + Send>) -> Error {
     Error::PipelineConsumerPanicked
 }
 
-// Consumer lifecycle state, shared between caller and consumer thread. Each
-// transition is a compare-exchange out of RUNNING so abandon vs. finalise
-// stays mutually exclusive. See docs/pipeline.md — `state` module.
+// Consumer lifecycle state, shared between caller and consumer thread. Each transition is a
+// compare-exchange out of RUNNING so abandon vs. finalise stays mutually exclusive.
 mod state {
     /// Consumer is running; neither side has committed yet.
     pub const RUNNING: u8 = 0;
@@ -76,9 +69,8 @@ mod state {
     pub const CLOSING: u8 = 2;
 }
 
-// Spin-polls handle.is_finished() for `grace` before accepting the thread
-// leak, so a "nearly done" consumer still joins cleanly. See docs/pipeline.md
-// — finish_with_grace.
+// Spin-polls handle.is_finished() for `grace` before accepting the thread leak, so a "nearly
+// done" consumer still joins cleanly.
 fn finish_with_grace<R: Send + 'static>(
     handle: thread::JoinHandle<Result<R, Error>>,
     state: &Arc<AtomicU8>,
@@ -201,14 +193,12 @@ pub trait Sink<I>: Send + 'static {
 pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
     tx: Sender<I>,
     handle: JoinHandle<Result<R, Error>>,
-    /// Set by [`finish_with_grace`] when the grace period expires and the
-    /// consumer thread is about to be leaked: it stops applying further
-    /// items and does NOT call `close()`, so a leaked consumer can't
-    /// finalise an output already reported as failed. One of
-    /// [`state::RUNNING`] / [`state::ABANDONED`] / [`state::CLOSING`];
-    /// both transitions are compare-exchanges so abandoning and
-    /// finalising are mutually exclusive rather than racing. See
-    /// docs/pipeline.md for the full race this prevents.
+    /// Set by [`finish_with_grace`] when the grace period expires and the consumer thread is
+    /// about to be leaked: it stops applying further items and does NOT call `close()`, so a
+    /// leaked consumer can't finalise an output already reported as failed. One of
+    /// [`state::RUNNING`] / [`state::ABANDONED`] / [`state::CLOSING`]; both transitions are
+    /// compare-exchanges so abandoning and finalising are mutually exclusive rather than
+    /// racing.
     state: Arc<AtomicU8>,
     /// Set by the consumer the moment an `apply` returns `Err`, since the
     /// consumer keeps draining afterwards (so the producer never blocks
@@ -221,12 +211,10 @@ pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
 }
 
 impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
-    /// Spawn the consumer thread with the given channel depth and
-    /// [`Sink`]. Named `freemkv-pipeline-consumer`; callers that want a
-    /// more specific name should use [`Pipeline::spawn_named`] instead.
-    /// Returns `Error::IoError` if the OS refuses the thread spawn
-    /// (resource exhaustion) rather than panicking. See docs/pipeline.md
-    /// for which in-crate callers use this vs. `spawn_named`.
+    /// Spawn the consumer thread with the given channel depth and [`Sink`]. Named
+    /// `freemkv-pipeline-consumer`; callers that want a more specific name should use
+    /// [`Pipeline::spawn_named`] instead. Returns `Error::IoError` if the OS refuses the thread
+    /// spawn (resource exhaustion) rather than panicking.
     pub fn spawn<S: Sink<I, Output = R>>(depth: usize, sink: S) -> Result<Self, Error> {
         Self::spawn_named("freemkv-pipeline-consumer", depth, sink)
     }
@@ -477,10 +465,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// BLOCKS on consumer drain rather than polling, in slices of
     /// [`SEND_HALT_CHECK_INTERVAL`].
     ///
-    /// Returns `Ok(())` once the item lands in the channel, or
-    /// `Err(item)` if the consumer disconnected, the halt fired, or the
-    /// deadline elapsed. NOT a `foo_with_X` variant of
-    /// [`Pipeline::send`] despite the name — see docs/pipeline.md.
+    /// Returns `Ok(())` once the item lands in the channel, or `Err(item)` if the consumer
+    /// disconnected, the halt fired, or the deadline elapsed. NOT a `foo_with_X` variant of
+    /// [`Pipeline::send`] despite the name.
     pub fn send_with_halt(&self, item: I, halt: &Halt, deadline: Duration) -> Result<(), I> {
         use crossbeam_channel::SendTimeoutError;
         let end = Instant::now() + deadline;
@@ -569,9 +556,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// token and the [`JOIN_TIMEOUT_SECS`] deadline between slices.
     ///
     /// Returns `Ok(R)` on a clean exit, or one of [`Error::Halted`],
-    /// [`Error::PipelineJoinTimeout`], [`Error::PipelineConsumerPanicked`]
-    /// for the wedge cases (leaks the consumer after a grace spin). NOT
-    /// a `foo_with_X` variant of [`Pipeline::finish`] — see docs/pipeline.md.
+    /// [`Error::PipelineJoinTimeout`], [`Error::PipelineConsumerPanicked`] for the wedge cases
+    /// (leaks the consumer after a grace spin). NOT a `foo_with_X` variant of
+    /// [`Pipeline::finish`].
     pub fn finish_with_halt(self, halt: Option<&Halt>) -> Result<R, Error> {
         let Pipeline {
             tx,
@@ -1036,7 +1023,6 @@ mod tests {
     // ── Added hardening tests ───────────────────────────────────────
 
     // Zero items sent must still call close() exactly once.
-    // See docs/pipeline.md — empty_pipeline_still_calls_close.
     #[test]
     fn empty_pipeline_still_calls_close() {
         let close_called = Arc::new(AtomicUsize::new(0));
@@ -1058,7 +1044,6 @@ mod tests {
     }
 
     // close() returning Err must surface from finish(), not be swallowed.
-    // See docs/pipeline.md — close_error_propagates_from_finish.
     #[test]
     fn close_error_propagates_from_finish() {
         struct CloseFails;
@@ -1077,8 +1062,7 @@ mod tests {
         assert!(matches!(res, Err(Error::DecryptFailed)));
     }
 
-    // try_send must report Full when saturated and the consumer is wedged,
-    // NOT block. See docs/pipeline.md — try_send_reports_full_when_saturated.
+    // try_send must report Full when saturated and the consumer is wedged, NOT block.
     #[test]
     fn try_send_reports_full_when_saturated() {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1105,8 +1089,7 @@ mod tests {
         let _ = pipe.finish();
     }
 
-    // try_send must report Disconnected once the consumer has exited (via
-    // panic here). See docs/pipeline.md — try_send_reports_disconnected.
+    // try_send must report Disconnected once the consumer has exited (via panic here).
     #[test]
     fn try_send_reports_disconnected_after_consumer_gone() {
         let prev = std::panic::take_hook();
@@ -1135,8 +1118,7 @@ mod tests {
         );
     }
 
-    // Plain send must hand the item back via Err(item) once the consumer
-    // has panicked. See docs/pipeline.md — send_returns_item_after_panic.
+    // Plain send must hand the item back via Err(item) once the consumer has panicked.
     #[test]
     fn send_returns_item_after_consumer_panicked() {
         let prev = std::panic::take_hook();
@@ -1161,8 +1143,7 @@ mod tests {
         );
     }
 
-    // send_with_halt must return the exact item via Err(item) on the
-    // Disconnected arm. See docs/pipeline.md — send_with_halt_on_disconnect.
+    // send_with_halt must return the exact item via Err(item) on the Disconnected arm.
     #[test]
     fn send_with_halt_returns_item_on_disconnect() {
         let prev = std::panic::take_hook();
@@ -1205,9 +1186,8 @@ mod tests {
         assert_eq!(total, 0, "item was enqueued despite pre-cancelled halt");
     }
 
-    // finish_with_halt(None) + wedged consumer must NOT spuriously return
-    // Halted (no halt supplied to observe). See docs/pipeline.md —
-    // finish_with_halt_none_does_not_spuriously_halt.
+    // finish_with_halt(None) + wedged consumer must NOT spuriously return Halted (no halt
+    // supplied to observe).
     #[test]
     fn finish_with_halt_none_does_not_spuriously_halt() {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1278,8 +1258,8 @@ mod tests {
 
     // ── Bug-fix regression tests ────────────────────────────────────────
 
-    // Regression: halt fires but consumer finishes WITHIN the grace period —
-    // finish_with_halt must join cleanly and return Ok. See docs/pipeline.md.
+    // Regression: halt fires but consumer finishes WITHIN the grace period — finish_with_halt
+    // must join cleanly and return Ok.
     #[test]
     fn finish_with_halt_joins_cleanly_when_consumer_finishes_in_grace() {
         // A sink that adds a short artificial delay in `close` to
@@ -1337,8 +1317,8 @@ mod tests {
         );
     }
 
-    // Regression: a leaked consumer must not finalise an abandoned output —
-    // once released it must skip close(). See docs/pipeline.md.
+    // Regression: a leaked consumer must not finalise an abandoned output — once released it
+    // must skip close().
     #[test]
     fn leaked_consumer_skips_close_after_abandonment() {
         struct WedgeThenRecord {
@@ -1403,8 +1383,8 @@ mod tests {
         );
     }
 
-    // Companion to the above: the abandonment guard must NOT fire when the
-    // consumer finishes inside the grace window. See docs/pipeline.md.
+    // Companion to the above: the abandonment guard must NOT fire when the consumer finishes
+    // inside the grace window.
     #[test]
     fn consumer_finishing_in_grace_still_calls_close() {
         struct ReleasableClose {
@@ -1472,8 +1452,7 @@ mod tests {
         assert!(matches!(res, Ok(190)), "expected Ok(190), got {res:?}");
     }
 
-    // A fatal apply error must become visible to the PRODUCER, not only to
-    // finish() — see docs/pipeline.md for the ENOSPC-on-60GB-mux scenario.
+    // A fatal apply error must become visible to the PRODUCER, not only to finish().
     #[test]
     fn send_with_halt_fails_fast_once_apply_has_failed() {
         struct FailFirst {
@@ -1528,8 +1507,8 @@ mod tests {
         );
     }
 
-    // The abandon/finalise race: a consumer already committed to close() when
-    // grace expires must be waited for, not abandoned. See docs/pipeline.md.
+    // The abandon/finalise race: a consumer already committed to close() when grace expires
+    // must be waited for, not abandoned.
     #[test]
     fn abandon_loses_to_a_close_already_committed() {
         let state = Arc::new(AtomicU8::new(state::RUNNING));

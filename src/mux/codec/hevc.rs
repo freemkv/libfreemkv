@@ -38,8 +38,8 @@ const NAL_CRA_NUT: u8 = 21;
 /// are VCL, 32..=63 non-VCL. A coded slice carries a `slice_type`.
 const NAL_VCL_MAX: u8 = 31;
 
-// `num_extra_slice_header_bits` from a HEVC PPS NAL (H.265 §7.3.2.3); `None`
-// if the PPS is too short to parse. See docs/hevc.md — hevc_num_extra_slice_header_bits.
+// `num_extra_slice_header_bits` from a HEVC PPS NAL (H.265 §7.3.2.3); `None` if the PPS is too
+// short to parse.
 fn hevc_num_extra_slice_header_bits(pps_nal: &[u8]) -> Option<u32> {
     let mut br = BitReader::new(pps_nal.get(2..)?);
     br.read_ue()?; // pps_pic_parameter_set_id
@@ -60,19 +60,17 @@ fn hevc_slice_coding_type(slice_type: u32) -> Option<CodingType> {
     }
 }
 
-// The `pps_pic_parameter_set_id` (first ue(v)) of a PPS NAL — the key under
-// which each PPS is stored so a slice's referenced PPS is resolved by its own
-// id. `None` if the PPS is too short. See docs/hevc.md.
+// The `pps_pic_parameter_set_id` (first ue(v)) of a PPS NAL — the key under which each PPS is
+// stored so a slice's referenced PPS is resolved by its own id. `None` if the PPS is too short.
 fn hevc_pps_id(pps_nal: &[u8]) -> Option<u32> {
     BitReader::new(pps_nal.get(2..)?).read_ue()
 }
 
-/// Measures the coding type from the FIRST coded slice of an access unit
-/// (H.265 §7.3.6.1). `None` for a non-first slice or on truncation — never a
-/// guess. `resolve_num_extra` maps the slice's OWN `slice_pic_parameter_set_id`
-/// to that PPS's `num_extra_slice_header_bits`, so the `slice_type` bit offset is
-/// taken from the PPS the slice references — not merely the last-active one. See
-/// docs/hevc.md — hevc_first_slice_coding_type.
+/// Measures the coding type from the FIRST coded slice of an access unit (H.265 §7.3.6.1).
+/// `None` for a non-first slice or on truncation — never a guess. `resolve_num_extra` maps the
+/// slice's OWN `slice_pic_parameter_set_id` to that PPS's `num_extra_slice_header_bits`, so the
+/// `slice_type` bit offset is taken from the PPS the slice references — not merely the
+/// last-active one.
 fn hevc_first_slice_coding_type(
     nal: &[u8],
     nal_type: u8,
@@ -243,9 +241,8 @@ impl HevcParser {
         }
     }
 
-    // Combines mastering-display + content-light SEI into Hdr10Metadata, or
-    // `None` until BOTH are seen — never a half-populated (confidently-wrong)
-    // HDR10 record. See docs/hevc.md — HevcParser::hdr10.
+    // Combines mastering-display + content-light SEI into Hdr10Metadata, or `None` until BOTH
+    // are seen — never a half-populated (confidently-wrong) HDR10 record.
     fn hdr10(&self) -> Option<crate::mux::codec::Hdr10Metadata> {
         let m = self.sei_mastering?;
         let c = self.sei_content_light?;
@@ -261,9 +258,8 @@ impl HevcParser {
         })
     }
 
-    // Scans an SEI NAL for the two HDR10 payload types, capturing each the
-    // FIRST time it appears. See docs/hevc.md — HevcParser::scan_sei for the
-    // RBSP layout (H.265 D.2 ff-extension coding).
+    // Scans an SEI NAL for the two HDR10 payload types, capturing each the FIRST time it
+    // appears.
     fn scan_sei(&mut self, nal: &[u8]) {
         // Both HDR10 messages are sticky (first wins); once both are captured,
         // return before `strip_emulation_prevention` (alloc+copy) — an HDR10 UHD
@@ -316,17 +312,15 @@ impl HevcParser {
     /// this point is rewritten CRA_NUT (21) → BLA_W_LP (16) so a linear decoder
     /// sets NoRaslOutput and discards the now-dangling RASL leading pictures.
     ///
-    /// MUST be called ONLY for connection_condition 0x05/0x06 — never for 0x01
-    /// (seamless/first item) or within a single-clip title. See docs/hevc.md —
-    /// HevcParser::mark_clip_boundary for full rationale.
+    /// MUST be called ONLY for connection_condition 0x05/0x06 — never for 0x01 (seamless/first
+    /// item) or within a single-clip title.
     pub fn mark_clip_boundary(&mut self) {
         self.pending_clip_boundary = true;
     }
 }
 
-// Handles a VPS/SPS/PPS NAL: strip it (decoder already has it) or emit it
-// in-band, tracking the active body. Decision MUST be against `cur`, not the
-// codecPrivate copy `first` — see docs/hevc.md — handle_param_set.
+// Handles a VPS/SPS/PPS NAL: strip it (decoder already has it) or emit it in-band, tracking the
+// active body. Decision MUST be against `cur`, not the codecPrivate copy `first`
 fn handle_param_set(
     first: &mut Option<Vec<u8>>,
     cur: &mut Option<Vec<u8>>,
@@ -357,9 +351,8 @@ fn handle_param_set(
     true
 }
 
-// Appends the active parameter set `cur` to `prefix` so every keyframe is
-// self-contained. Unconditional (not just on divergence from codecPrivate)
-// so a streaming decoder self-heals; see docs/hevc.md — reassert_active.
+// Appends the active parameter set `cur` to `prefix` so every keyframe is self-contained.
+// Unconditional (not just on divergence from codecPrivate) so a streaming decoder self-heals.
 fn reassert_active(prefix: &mut Vec<u8>, cur: &Option<Vec<u8>>, emitted: bool) {
     if emitted {
         return;
@@ -385,13 +378,12 @@ fn push_length_prefixed(out: &mut Vec<u8>, nal: &[u8]) {
     out.extend_from_slice(nal);
 }
 
-/// Walk a length-prefixed NAL buffer (`[u32-BE len][body]` records) and confirm the
-/// records EXACTLY tile it: every declared length fits, none is zero, and the last
-/// body ends precisely at the buffer end with no trailing bytes. Our `frame_data`
-/// is length-prefixed by construction, so this is a self-consistency guard — a
-/// `false` means a framing desync that a downstream demuxer would report as
-/// "Invalid NAL unit size (N>M)", and such an access unit must be dropped rather
-/// than emitted. See docs/hevc.md — length-prefix self-check (issue #52).
+/// Walk a length-prefixed NAL buffer (`[u32-BE len][body]` records) and confirm the records
+/// EXACTLY tile it: every declared length fits, none is zero, and the last body ends precisely
+/// at the buffer end with no trailing bytes. Our `frame_data` is length-prefixed by
+/// construction, so this is a self-consistency guard — a `false` means a framing desync that a
+/// downstream demuxer would report as "Invalid NAL unit size (N>M)", and such an access unit
+/// must be dropped rather than emitted.
 fn length_prefix_tiles(data: &[u8]) -> bool {
     let mut pos = 0usize;
     while pos < data.len() {
@@ -814,9 +806,8 @@ fn read_sei_ff_value(rbsp: &[u8], i: &mut usize) -> Option<u32> {
     }
 }
 
-// Parses a Mastering Display Colour Volume SEI payload (H.265 D.2.28), 24
-// bytes big-endian. `None` if shorter (malformed → ignored, never partial).
-// Full byte layout: docs/hevc.md — parse_mastering_display.
+// Parse the 24-byte big-endian Mastering Display Colour Volume SEI (H.265 D.2.28).
+// Return None for a truncated payload.
 fn parse_mastering_display(p: &[u8]) -> Option<MasteringDisplay> {
     if p.len() < 24 {
         return None;
@@ -1026,8 +1017,8 @@ mod tests {
         out
     }
 
-    // Wraps SEI messages in a prefix-SEI NAL (type 39) after a start code,
-    // emulation-prevented like a real encoder. See docs/hevc.md — sei_nal.
+    // Wraps SEI messages in a prefix-SEI NAL (type 39) after a start code, emulation-prevented
+    // like a real encoder.
     fn sei_nal(messages: &[Vec<u8>]) -> Vec<u8> {
         let mut rbsp = Vec::new();
         for m in messages {
@@ -1095,9 +1086,8 @@ mod tests {
         assert_eq!(h.max_pic_average_light_level, maxfall);
     }
 
-    // The FIRST mastering-display / content-light SEI wins; later repeats (or
-    // a corrupt splice) must not overwrite it. See docs/hevc.md —
-    // hevc_hdr10_sei_keeps_the_first_value_and_ignores_later_repeats.
+    // The FIRST mastering-display / content-light SEI wins; later repeats (or a corrupt splice)
+    // must not overwrite it.
     #[test]
     fn hevc_hdr10_sei_keeps_the_first_value_and_ignores_later_repeats() {
         let pps = {
@@ -1155,9 +1145,7 @@ mod tests {
         );
     }
 
-    // MEASURED: `scan_sei` must stop copying the RBSP once both HDR10
-    // messages are captured. See docs/hevc.md —
-    // scan_sei_stops_copying_once_both_hdr10_messages_are_captured.
+    // MEASURED: `scan_sei` must stop copying the RBSP once both HDR10 messages are captured.
     #[test]
     fn scan_sei_stops_copying_once_both_hdr10_messages_are_captured() {
         let pps = {
@@ -1344,9 +1332,8 @@ mod tests {
         assert_eq!(h.max_display_mastering_luminance, 10_000_000);
     }
 
-    // Every earlier fixture used num_extra_slice_header_bits == 0, so a
-    // parser that ignored the field entirely agreed with all of them. See
-    // docs/hevc.md — nonzero_num_extra_slice_header_bits_shifts_the_slice_type_offset.
+    // Every earlier fixture used num_extra_slice_header_bits == 0, so a parser that ignored the
+    // field entirely agreed with all of them.
     #[test]
     // The underscores here mark BITFIELD boundaries (e.g. 5-bit then 3-bit),
     // not thousands-style digit groups — regrouping them uniformly would
@@ -1580,9 +1567,8 @@ mod tests {
         );
     }
 
-    // Regression (UHD banded corruption): a bare keyframe after a mid-title
-    // PPS redefinition must re-assert the active PPS in-band. See
-    // docs/hevc.md — reasserts_active_pps_at_bare_keyframe.
+    // Regression (UHD banded corruption): a bare keyframe after a mid-title PPS redefinition
+    // must re-assert the active PPS in-band.
     #[test]
     fn reasserts_active_pps_at_bare_keyframe() {
         fn nal(t: u8, body: &[u8]) -> Vec<u8> {
@@ -1668,9 +1654,8 @@ mod tests {
         );
     }
 
-    // MEASURED: the keyframe param-set re-assert must splice into the
-    // already-assembled access unit IN PLACE, never a fresh full-size buffer.
-    // See docs/hevc.md — keyframe_param_reassert_does_not_reallocate_the_frame.
+    // MEASURED: the keyframe param-set re-assert must splice into the already-assembled access
+    // unit IN PLACE, never a fresh full-size buffer.
     #[test]
     fn keyframe_param_reassert_does_not_reallocate_the_frame() {
         fn nal(t: u8, body: &[u8]) -> Vec<u8> {
@@ -1713,9 +1698,8 @@ mod tests {
         );
     }
 
-    // Regression (a UHD title, the real bug): switching PPS id 0 back to its
-    // codecPrivate body must still be emitted in-band. See docs/hevc.md —
-    // emits_switch_back_to_codecprivate_pps.
+    // Regression (a UHD title, the real bug): switching PPS id 0 back to its codecPrivate body
+    // must still be emitted in-band.
     #[test]
     fn emits_switch_back_to_codecprivate_pps() {
         fn nal(t: u8, body: &[u8]) -> Vec<u8> {
@@ -2044,9 +2028,8 @@ mod tests {
         );
     }
 
-    // Regression (UHD Dolby Vision title): must AUTO-DETECT a non-seamless
-    // clip boundary from a backward PES-PTS reset, no `mark_clip_boundary`
-    // call. See docs/hevc.md — cra_at_auto_detected_pts_backstep_rewritten_to_bla.
+    // Regression (UHD Dolby Vision title): must AUTO-DETECT a non-seamless clip boundary from a
+    // backward PES-PTS reset, no `mark_clip_boundary` call.
     #[test]
     fn cra_at_auto_detected_pts_backstep_rewritten_to_bla() {
         let mut parser = HevcParser::new();
@@ -2080,9 +2063,8 @@ mod tests {
         );
     }
 
-    // Regression (rc.5.2 audit #1): a SINGLE clip crossing the 2^33 PTS wrap
-    // must not be mistaken for a non-seamless clip join. See docs/hevc.md —
-    // cra_after_33bit_pts_wrap_not_rewritten.
+    // Regression (rc.5.2 audit #1): a SINGLE clip crossing the 2^33 PTS wrap must not be
+    // mistaken for a non-seamless clip join.
     #[test]
     fn cra_after_33bit_pts_wrap_not_rewritten() {
         let mut parser = HevcParser::new();
@@ -2110,9 +2092,8 @@ mod tests {
         );
     }
 
-    // The wrap-vs-backstep test above doesn't distinguish `-` from a
-    // hand-flipped `+`; this uses PTS ~3e9 where they diverge. See
-    // docs/hevc.md — cra_splice_detected_at_large_pts_magnitude_not_masked_by_wrap_logic.
+    // The wrap-vs-backstep test above doesn't distinguish `-` from a hand-flipped `+`; this
+    // uses PTS ~3e9 where they diverge.
     #[test]
     fn cra_splice_detected_at_large_pts_magnitude_not_masked_by_wrap_logic() {
         let mut parser = HevcParser::new();
@@ -2146,8 +2127,7 @@ mod tests {
         );
     }
 
-    // Non-CRA NALs are never rewritten even when a boundary IS marked. See
-    // docs/hevc.md — non_cra_nals_never_rewritten_at_boundary.
+    // Non-CRA NALs are never rewritten even when a boundary IS marked.
     #[test]
     fn non_cra_nals_never_rewritten_at_boundary() {
         // IDR boundary: marker set, but the first IRAP is an IDR → no rewrite,
@@ -2192,9 +2172,8 @@ mod tests {
         );
     }
 
-    // A stream with NO boundary marker is BYTE-IDENTICAL to pre-feature
-    // behaviour (UHD-safety guarantee). See docs/hevc.md —
-    // no_boundary_marker_is_byte_identical.
+    // A stream with NO boundary marker is BYTE-IDENTICAL to pre-feature behaviour (UHD-safety
+    // guarantee).
     #[test]
     fn no_boundary_marker_is_byte_identical() {
         let build = || {
@@ -2245,9 +2224,8 @@ mod tests {
         );
     }
 
-    // A SEAMLESS boundary is expressed by NOT calling `mark_clip_boundary`,
-    // so a CRA across a seamless join stays unchanged. See docs/hevc.md —
-    // seamless_boundary_no_rewrite.
+    // A SEAMLESS boundary is expressed by NOT calling `mark_clip_boundary`, so a CRA across a
+    // seamless join stays unchanged.
     #[test]
     fn seamless_boundary_no_rewrite() {
         // Simulate two clips joined seamlessly: the caller does NOT mark, so the
@@ -2360,8 +2338,8 @@ mod tests {
 
     // --- parameter-set redefinition (mid-title redefinition bug) ---
 
-    // A parameter set REDEFINED mid-stream must be emitted INLINE so the
-    // decoder re-activates it. See docs/hevc.md — redefined_pps_emitted_inline.
+    // A parameter set REDEFINED mid-stream must be emitted INLINE so the decoder re-activates
+    // it.
     #[test]
     fn redefined_pps_emitted_inline() {
         let mut parser = HevcParser::new();
@@ -3012,9 +2990,8 @@ mod tests {
         assert_eq!(cp[18], 0xF8 | 4, "bit_depth_chroma_minus8 = 4");
     }
 
-    // Builds a stored SPS NAL with sub-layers + a conformance window, so the
-    // parser must skip both before reaching bit depths. See docs/hevc.md —
-    // make_sps_full.
+    // Builds a stored SPS NAL with sub-layers + a conformance window, so the parser must skip
+    // both before reaching bit depths.
     fn make_sps_full(
         chroma_idc: u32,
         bd_luma_m8: u32,
@@ -3321,9 +3298,8 @@ mod tests {
         );
     }
 
-    // Every other fixture's VPS/SPS/PPS is under 256 bytes, so a `>>` -> `<<`
-    // mutation in the 16-bit array-length write is unobservable there. Uses
-    // 300+ byte NALs to catch it. See docs/hevc.md — hvcc_array_length_round_trips_above_256_bytes.
+    // Every other fixture's VPS/SPS/PPS is under 256 bytes, so a `>>` -> `<<` mutation in the
+    // 16-bit array-length write is unobservable there. Uses 300+ byte NALs to catch it.
     #[test]
     fn hvcc_array_length_round_trips_above_256_bytes() {
         let mut parser = HevcParser::new();
@@ -3369,9 +3345,8 @@ mod tests {
         );
     }
 
-    // `with_ps_reorder(true)` must INSTALL the reorderer, and `flush()` must
-    // drain its real buffered frames at EOF. See docs/hevc.md —
-    // hevc_ps_reorder_is_installed_and_flush_drains_its_real_frames.
+    // `with_ps_reorder(true)` must INSTALL the reorderer, and `flush()` must drain its real
+    // buffered frames at EOF.
     #[test]
     fn hevc_ps_reorder_is_installed_and_flush_drains_its_real_frames() {
         const NAL_IDR_W_RADL: u8 = 19; // IRAP → keyframe / GOP anchor

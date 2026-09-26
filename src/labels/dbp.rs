@@ -11,9 +11,8 @@
 //! ATextField,Subtitle0,None,Fontstrip_Composite,...
 //! ```
 //!
-//! The parser ignores any prefix before `TextField,`; `Subtitle0` is the
-//! disable-subtitles button, skipped. Classification lives in
-//! [`super::vocab`]. See docs/dbp.md for the implementation approach.
+//! The parser ignores any prefix before `TextField,`; `Subtitle0` is the disable-subtitles
+//! button, skipped. Classification lives in [`super::vocab`].
 
 use super::class_reader::CpInfo;
 use super::{ParseResult, StreamLabel, StreamLabelType, jar, vocab};
@@ -77,14 +76,12 @@ fn scan_jar(archive: &mut jar::Jar) -> Vec<StreamLabel> {
     out
 }
 
-// Cap on bytes retained per stream label. CONSTANT_Utf8_info's `length` is a
-// u16 (JVMS §4.4.7), so a crafted constant could contribute up to 65535
-// bytes. See docs/dbp.md — MAX_LABEL_BYTES rationale.
+// Cap on bytes retained per stream label. CONSTANT_Utf8_info's `length` is a u16 (JVMS §4.4.7),
+// so a crafted constant could contribute up to 65535 bytes.
 const MAX_LABEL_BYTES: usize = 256;
 
-// Cap on retained stream slots per type. Keys come from parse::<u16> on disc
-// bytes, so all 65536 slots per type are reachable. See docs/dbp.md —
-// MAX_LABELS_PER_TYPE rationale.
+// Cap on retained stream slots per type. Keys come from parse::<u16> on disc bytes, so all
+// 65536 slots per type are reachable.
 const MAX_LABELS_PER_TYPE: usize = 512;
 
 /// Record `label` for stream `n`, honouring the retention caps. Existing

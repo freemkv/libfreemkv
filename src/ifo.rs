@@ -130,12 +130,11 @@ impl CellCategory {
 impl DvdTitle {
     /// Index of the first cell to include in the muxed feature.
     ///
-    /// Some PGCs open with leading cells that are not part of the movie,
-    /// identified by a cell-category flagged as a *secondary* piece of an
-    /// angle/interleave block ([`CellCategory::is_secondary_block_piece`]).
-    /// Returns the index of the first plain-feature cell; cells before it are
-    /// dropped from the feature extents. Conservative: only ever skips a
-    /// prefix, never past the last cell or to zero cells. See docs/ifo.md.
+    /// Some PGCs open with leading cells that are not part of the movie, identified by a
+    /// cell-category flagged as a *secondary* piece of an angle/interleave block
+    /// ([`CellCategory::is_secondary_block_piece`]). Returns the index of the first
+    /// plain-feature cell; cells before it are dropped from the feature extents. Conservative:
+    /// only ever skips a prefix, never past the last cell or to zero cells.
     pub fn feature_start_cell(&self) -> usize {
         let n = self.cells.len();
         if n == 0 {
@@ -304,9 +303,7 @@ impl DvdRate {
 /// (`[hours_bcd, minutes_bcd, seconds_bcd, rate_and_frames]`; byte 3 packs
 /// the frame-rate flag in bits 7-6 and the frame count in bits 5-0).
 ///
-/// `dvd_time_t` is a timecode, not elapsed wall-clock time — see docs/ifo.md.
-/// Returns `None` when the slice is short or the rate flag is unspecified,
-/// since without a nominal rate the frame count cannot be interpreted.
+/// `dvd_time_t` is a timecode, not elapsed wall-clock time.
 pub fn bcd_to_frames(bcd: &[u8]) -> Option<(u64, DvdRate)> {
     if bcd.len() < 4 {
         return None;
@@ -448,14 +445,14 @@ pub(crate) fn parse_vmg_with(
     Ok(DvdInfo { title_sets })
 }
 
-// Maximum TT_SRPT entries honoured (DVD-Video's own 99-title cap). The
-// on-disc count is an untrusted u16; without this, a crafted IFO could
-// declare 65535 entries and blow up memory re-parsing PGCs. See docs/ifo.md.
+// Maximum TT_SRPT entries honoured (DVD-Video's own 99-title cap). The on-disc count is an
+// untrusted u16; without this, a crafted IFO could declare 65535 entries and blow up memory
+// re-parsing PGCs.
 pub(crate) const MAX_TT_SRPT_TITLES: usize = 99;
 
-// Parses the VMG TT_SRPT into a per-title-set map of (chapter_count,
-// vts_title_number). Clamps the declared entry count to MAX_TT_SRPT_TITLES
-// and drops duplicate (vts_number, vts_title_num) pairs. See docs/ifo.md.
+// Parses the VMG TT_SRPT into a per-title-set map of (chapter_count, vts_title_number). Clamps
+// the declared entry count to MAX_TT_SRPT_TITLES and drops duplicate (vts_number,
+// vts_title_num) pairs.
 fn parse_tt_srpt(
     vmg_data: &[u8],
     tt_srpt_offset: usize,
@@ -645,9 +642,8 @@ fn parse_video_attr(data: &[u8]) -> Result<DvdVideoAttr> {
     })
 }
 
-// Parses one audio stream attribute block (8 bytes at `offset`). pub(crate)
-// so src/mux/mkv.rs's cross-module tests can call the real parser directly.
-// See docs/ifo.md for why that's preferable to narrowing visibility.
+// Parses one audio stream attribute block (8 bytes at `offset`). pub(crate) so src/mux/mkv.rs's
+// cross-module tests can call the real parser directly.
 pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
     let b0 = byte_at(data, offset)?;
     let b1 = byte_at(data, offset + 1)?;
@@ -688,9 +684,8 @@ pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAtt
     })
 }
 
-// Assigns the on-wire private_stream_1 sub-stream id (codec_base | position,
-// saturated at 7) to each audio stream: AC-3 0x80|i, DTS 0x88|i, LPCM 0xA0|i,
-// else None. See docs/ifo.md for why position beats a per-codec ordinal.
+// Assigns the on-wire private_stream_1 sub-stream id (codec_base | position, saturated at 7) to
+// each audio stream: AC-3 0x80|i, DTS 0x88|i, LPCM 0xA0|i, else None.
 fn assign_audio_sub_stream_ids(streams: &mut [DvdAudioAttr]) {
     for (i, s) in streams.iter_mut().enumerate() {
         let n = (i as u8).min(7);
@@ -712,9 +707,8 @@ fn parse_subtitle_attr(data: &[u8], offset: usize) -> Result<DvdSubtitleAttr> {
     Ok(DvdSubtitleAttr { language })
 }
 
-// Decodes the raw 2-byte on-disc language code: lowercase a-z taken verbatim,
-// all-zero means unspecified (empty), else an ASCII-alphanumeric salvage. See
-// docs/ifo.md for why the salvage isn't narrowed to a-z.
+// Decodes the raw 2-byte on-disc language code: lowercase a-z taken verbatim, all-zero means
+// unspecified (empty), else an ASCII-alphanumeric salvage.
 fn parse_raw_dvd_lang_bytes(lang_bytes: &[u8]) -> String {
     if lang_bytes[0] >= b'a'
         && lang_bytes[0] <= b'z'
@@ -733,9 +727,8 @@ fn parse_raw_dvd_lang_bytes(lang_bytes: &[u8]) -> String {
     }
 }
 
-// Converts a DVD IFO audio/subtitle language code (ISO 639-1, or empty) to
-// ISO 639-2 for Matroska/MP4 language fields; unrecognized/empty -> "und".
-// See docs/ifo.md for why the wider iso639_1_to_iso639_2 table is used.
+// Converts a DVD IFO audio/subtitle language code (ISO 639-1, or empty) to ISO 639-2 for
+// Matroska/MP4 language fields; unrecognized/empty -> "und".
 fn dvd_lang_to_iso639_2(raw: &str) -> String {
     crate::labels::vocab::iso639_1_to_iso639_2(raw)
         .unwrap_or("und")
@@ -1301,9 +1294,9 @@ mod tests {
         assert_eq!(attr.resolution, Resolution::R576i);
     }
 
-    // ABSOLUTE-BYTE pin: other tests build the byte via v_atr_byte(...), which
-    // shares the parser's shift constants, so a co-edit could hide a bug. This
-    // feeds parse_video_attr HARDCODED real-layout bytes instead. See docs/ifo.md.
+    // ABSOLUTE-BYTE pin: other tests build the byte via v_atr_byte(...), which shares the
+    // parser's shift constants, so a co-edit could hide a bug. This feeds parse_video_attr
+    // HARDCODED real-layout bytes instead.
     #[test]
     fn video_attr_absolute_bytes_pin_real_layout() {
         // (byte @0x200, expected standard, expected aspect, expected resolution):
@@ -1404,9 +1397,9 @@ mod tests {
         assert_eq!(ids.len(), sorted.len(), "sub-stream ids must be unique");
     }
 
-    // Regression (The Punisher 2004): audio[0]=AC-3, audio[1]=DTS. DTS at
-    // position 1 must get wire sub-id 0x89 (0x88|1), not the old per-codec
-    // 0x88 (which broke demux routing and muxed it silent). See docs/ifo.md.
+    // Regression (The Punisher 2004): audio[0]=AC-3, audio[1]=DTS. DTS at position 1 must get
+    // wire sub-id 0x89 (0x88|1), not the old per-codec 0x88 (which broke demux routing and
+    // muxed it silent).
     #[test]
     fn dts_after_ac3_uses_positional_substream_id() {
         let mut streams = vec![
@@ -1812,9 +1805,9 @@ mod tests {
         );
     }
 
-    // Regression for freemkv#25 (NTSC chapter drift): real cell table vs
-    // reference chapter marks. Drift (0.1%, proportional to elapsed time) is
-    // why a short synthetic fixture wouldn't catch it. See docs/ifo.md.
+    // Regression for freemkv#25 (NTSC chapter drift): real cell table vs reference chapter
+    // marks. Drift (0.1%, proportional to elapsed time) is why a short synthetic fixture
+    // wouldn't catch it.
     #[test]
     fn pgc_chapter_times_ntsc_no_pulldown_drift() {
         // (minutes, seconds, frames) of NTSC non-drop-frame timecode per cell.
@@ -2089,9 +2082,8 @@ mod tests {
         assert_eq!(title.feature_start_cell(), 1);
     }
 
-    // Regression: a crafted IFO whose program-map byte names a first_cell
-    // index larger than the actual cell count must NOT panic (it used to,
-    // slicing cell_durations out of bounds). See docs/ifo.md.
+    // Regression: a crafted IFO whose program-map byte names a first_cell index larger than the
+    // actual cell count must NOT panic (it used to, slicing cell_durations out of bounds).
     #[test]
     fn pgc_program_map_oob_cell_index_no_panic() {
         let mut pgc = vec![0u8; 0xEA];
@@ -2241,8 +2233,8 @@ mod tests {
 
     // ── PGC fixtures ─────────────────────────────────────────────────────
 
-    // Builds a standalone PGC at offset 0: header, program map (1-based first
-    // cell number per program), 24-byte cell table. See docs/ifo.md for the layout.
+    // Builds a standalone PGC at offset 0: header, program map (1-based first cell number per
+    // program), 24-byte cell table.
     fn build_pgc(
         pgc_time: [u8; 4],
         cells: &[(u8, [u8; 4], u32, u32)],
@@ -2465,8 +2457,8 @@ mod tests {
 
     // ── PGCIT ────────────────────────────────────────────────────────────
 
-    // Builds a VTS_PGCIT at offset 0: header, one 8-byte VTS_PGCI_SRP per PGC,
-    // then `pgcs` appended after the SRP table. See docs/ifo.md for the layout.
+    // Builds a VTS_PGCIT at offset 0: header, one 8-byte VTS_PGCI_SRP per PGC, then `pgcs`
+    // appended after the SRP table.
     fn build_pgcit(pgcs: &[Vec<u8>]) -> Vec<u8> {
         let mut d = vec![0u8; 8 + pgcs.len() * 8];
         d[0..2].copy_from_slice(&(pgcs.len() as u16).to_be_bytes());

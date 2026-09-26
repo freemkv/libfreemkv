@@ -5,9 +5,8 @@
 //! multi-word language name → ISO 639-2, and English text →
 //! [`LabelPurpose`] / [`LabelQualifier`].
 //!
-//! Only maps values we are 100% certain about; unknown input passes through
-//! raw or returns `None` — never guesses. Not for BD spec STN codec IDs;
-//! those decode in `mpls.rs`. See docs/vocab.md for full rules of engagement.
+//! Only maps values we are 100% certain about; unknown input passes through raw or returns
+//! `None` — never guesses. Not for BD spec STN codec IDs; those decode in `mpls.rs`.
 
 use super::{LabelPurpose, LabelQualifier};
 
@@ -53,12 +52,10 @@ pub struct LangInfo {
 /// Map a free-form language label fragment to an ISO 639-2 code AND
 /// (where applicable) its regional variant.
 ///
-/// Handles bare English names ("English") and multi-word vendor variants
-/// ("Brazilian Portuguese"); compounds are checked before bare names, so
-/// the latter returns `variant: "Brazilian"` rather than a bare
-/// "Portuguese" match. Bare matches return `variant: ""`; `None` means
-/// unrecognized input (never a guess). See docs/vocab.md for the
-/// `COMPOUND_LANGS` ordering rule and the [`StreamLabel::variant`](super::StreamLabel) rationale.
+/// Handles bare English names ("English") and multi-word vendor variants ("Brazilian
+/// Portuguese"); compounds are checked before bare names, so the latter returns `variant:
+/// "Brazilian"` rather than a bare "Portuguese" match. Bare matches return `variant: ""`;
+/// `None` means unrecognized input (never a guess).
 pub fn lang(text: &str) -> Option<LangInfo> {
     let lower = text.to_lowercase();
     // Multi-word compounds first. Scan is positional (first hit wins),
@@ -186,7 +183,6 @@ pub fn menu_lang(token: &str) -> Option<&'static str> {
 // ── ISO 639-1 → ISO 639-2 ────────────────────────────────────────────────────
 
 // Complete ISO 639-1 set, paired with its ISO 639-2/T code (each code once).
-// See docs/vocab.md#iso639_1_to_iso639_2--the-whole-iso-639-1-set for why /T.
 const ISO_639_1_TO_2: &[(&str, &str)] = &[
     ("aa", "aar"),
     ("ab", "abk"),
@@ -374,19 +370,16 @@ const ISO_639_1_TO_2: &[(&str, &str)] = &[
     ("zu", "zul"),
 ];
 
-// Withdrawn ISO 639-1 codes DVD-Video still carries (frozen at the 1988
-// edition). See docs/vocab.md#iso639_1_to_iso639_2--the-whole-iso-639-1-set.
+// Withdrawn ISO 639-1 codes DVD-Video still carries (frozen at the 1988 edition).
 const ISO_639_1_DEPRECATED: &[(&str, &str)] = &[("iw", "he"), ("in", "id"), ("ji", "yi")];
 
 /// Map an ISO 639-1 two-letter language code to its ISO 639-2/T three-letter
 /// code, accepting the withdrawn DVD-era spellings (`iw`, `in`, `ji`) as
 /// aliases for their replacements.
 ///
-/// Covers the WHOLE of ISO 639-1, unlike [`menu_lang`], whose table only
-/// spans the languages seen in Blu-ray menu-graphic filenames. Case-
-/// insensitive and trimmed. Returns `None` for anything that is not an ISO
-/// 639-1 code — callers decide the fallback. See docs/vocab.md for why the
-/// full set matters.
+/// Covers the WHOLE of ISO 639-1, unlike [`menu_lang`], whose table only spans the languages
+/// seen in Blu-ray menu-graphic filenames. Case- insensitive and trimmed. Returns `None` for
+/// anything that is not an ISO 639-1 code — callers decide the fallback.
 pub fn iso639_1_to_iso639_2(code: &str) -> Option<&'static str> {
     let c = code.trim().to_ascii_lowercase();
     let c = ISO_639_1_DEPRECATED
@@ -446,7 +439,7 @@ pub fn purpose(text: &str) -> LabelPurpose {
 /// - "rnib", "descriptive service" → `DescriptiveService`
 /// - anything else → `None`
 ///
-/// SDH wins over Forced when both are present. See docs/vocab.md for why.
+/// SDH wins over Forced when both are present.
 pub fn qualifier(text: &str) -> LabelQualifier {
     let lower = text.to_lowercase();
     if has_word(&lower, "sdh") || has_word(&lower, "captions") {
@@ -463,8 +456,8 @@ pub fn qualifier(text: &str) -> LabelQualifier {
 
 // ── Internal: word-boundary matching ────────────────────────────────────────
 
-// True if `needle` appears in `haystack` at non-alphanumeric boundaries
-// (`haystack` assumed lowercase). See docs/vocab.md#has_word--word-boundary-primitive.
+// True if `needle` appears in `haystack` at non-alphanumeric boundaries (`haystack` assumed
+// lowercase).
 fn has_word(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -852,9 +845,8 @@ mod tests {
         assert_eq!(codec(""), "");
     }
 
-    // Guards the `||` (not `&&`) in purpose()'s compound-phrase fast path:
-    // catches a substring match with no word boundary that has_word() would miss.
-    // See docs/vocab.md#test-rationale-mutation-testing-notes for the mutation trace.
+    // Guards the `||` (not `&&`) in purpose()'s compound-phrase fast path: catches a substring
+    // match with no word boundary that has_word() would miss.
     #[test]
     fn purpose_descriptive_service_substring_without_word_boundary() {
         assert_eq!(
@@ -943,8 +935,8 @@ mod tests {
         assert_eq!(menu_lang(""), None);
     }
 
-    // `ISO_639_1_TO_2` structural invariants: complete 184-code set, distinct
-    // keys, well-formed values. See docs/vocab.md for the full rationale.
+    // `ISO_639_1_TO_2` structural invariants: complete 184-code set, distinct keys, well-formed
+    // values.
     #[test]
     fn iso639_1_table_is_complete_and_well_formed() {
         assert_eq!(

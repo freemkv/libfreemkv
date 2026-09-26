@@ -1,12 +1,10 @@
 //! Fragmented MP4 muxer — **STUB**: fragment emission is not implemented.
 //!
-//! Goal: ISO/IEC 14496-12 fragmented MP4 (`ftyp` + `moov` init segment,
-//! then a sequence of `moof+mdat` media fragments) targeting a
-//! [`SequentialSink`](crate::io::sink::SequentialSink). DASH-friendly,
-//! no Cues backpatch. Emits the init segment via
-//! [`Fmp4Mux::write_init_segment`]; [`Fmp4Mux::write_video`] returns
-//! [`Error::Fmp4Unimplemented`](crate::error::Error::Fmp4Unimplemented). See
-//! docs/fmp4-mod.md for details.
+//! Goal: ISO/IEC 14496-12 fragmented MP4 (`ftyp` + `moov` init segment, then a sequence of
+//! `moof+mdat` media fragments) targeting a
+//! [`SequentialSink`](crate::io::sink::SequentialSink). DASH-friendly, no Cues backpatch. Emits
+//! the init segment via [`Fmp4Mux::write_init_segment`]; [`Fmp4Mux::write_video`] returns
+//! [`Error::Fmp4Unimplemented`](crate::error::Error::Fmp4Unimplemented).
 
 use std::io::{self, Write};
 
@@ -297,9 +295,8 @@ fn build_mvex() -> Vec<u8> {
     wrap_box(&MVEX, &trex)
 }
 
-// Wrap a box body in `[size:u32-BE][type:4]`; oversized boxes (>4 GiB)
-// need the 64-bit large-size extension, not generated in the stub.
-// See docs/fmp4-mod.md — wrap_box size-cast rationale.
+// Wrap a box body in `[size:u32-BE][type:4]`; oversized boxes (>4 GiB) need the 64-bit
+// large-size extension, not generated in the stub.
 fn wrap_box(box_type: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let total = body.len() + 8;
     debug_assert!(total <= u32::MAX as usize, "fMP4 box exceeds u32 size");

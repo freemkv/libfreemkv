@@ -71,9 +71,8 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
     })
 }
 
-// Parse the ProgramInfo section: per-stream (pid, coding_type, language,
-// codec sub-fields). Returns Vec::new() on any structural mismatch. See
-// docs/clpi.md — "ProgramInfo Section" for the full byte layout.
+// Parse the ProgramInfo section: per-stream (pid, coding_type, language, codec sub-fields).
+// Returns Vec::new() on any structural mismatch.
 fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
     use crate::consts::coding_type as c;
     let mut out = Vec::new();
@@ -200,9 +199,8 @@ mod tests {
         assert!(parse(&data).is_err());
     }
 
-    // Added hardening tests, grounded in the BD-ROM CLPI spec byte layout.
-    // Build a ProgramInfo section; `streams` = Vec<(pid, sci_bytes)> — see
-    // docs/clpi.md "ProgramInfo Section" for the full byte layout.
+    // Added hardening tests, grounded in the BD-ROM CLPI spec byte layout. Build a ProgramInfo
+    // section; `streams` = Vec<(pid, sci_bytes)>.
     fn build_program_info(streams: &[(u16, Vec<u8>)]) -> Vec<u8> {
         let mut body = Vec::new();
         body.push(0); // reserved (offset 4)
@@ -388,9 +386,8 @@ mod tests {
         assert!(clip.streams.is_empty());
     }
 
-    // Section-offset gates in `parse`: prog_info_start == 0 means "no
-    // ProgramInfo section" — offset-0 bytes must NOT be reinterpreted as a
-    // table. See docs/clpi.md "Test fixture notes" for the fixture design.
+    // Section-offset gates in `parse`: prog_info_start == 0 means "no ProgramInfo section" —
+    // offset-0 bytes must NOT be reinterpreted as a table.
     #[test]
     fn prog_info_start_zero_does_not_parse_header_as_program_info() {
         let mut data = build_clpi(1000, None);

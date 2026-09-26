@@ -21,9 +21,8 @@ pub(crate) mod tables;
 use crate::disc::Extent;
 use crate::sector::SectorSource;
 
-// Consecutive CSS-locked reads before the crack scan early-bails, instead of
-// grinding the full 50_000-sector budget. Resets to 0 on any readable batch.
-// See docs/css-mod.md — CSS_LOCKED_BAIL.
+// Consecutive CSS-locked reads before the crack scan early-bails, instead of grinding the full
+// 50_000-sector budget. Resets to 0 on any readable batch.
 const CSS_LOCKED_BAIL: u32 = 64;
 
 /// CSS decryption state for a DVD title.
@@ -60,9 +59,8 @@ impl std::fmt::Debug for CssState {
 /// that yields a key — no player keys, no disc-key crack. Works on a live
 /// drive and on disc images alike.
 ///
-/// This convenience form runs to completion (no cancellation); callers
-/// needing a cancel token, or the three-way [`CrackOutcome`], use
-/// [`crack_key_outcome`]. See docs/css-mod.md — `crack_key`.
+/// This convenience form runs to completion (no cancellation); callers needing a cancel token,
+/// or the three-way [`CrackOutcome`], use [`crack_key_outcome`].
 pub fn crack_key(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
@@ -71,8 +69,8 @@ pub fn crack_key(
     crack_key_scan(reader, extents, batch_sectors, None).into_state()
 }
 
-/// Outcome of a CSS crack scan: distinguishes the THREE cases a bare
-/// `Option<CssState>` conflated (see docs/css-mod.md — `CrackOutcome`).
+/// Outcome of a CSS crack scan: distinguishes the THREE cases a bare `Option<CssState>`
+/// conflated.
 ///
 /// - [`CrackOutcome::Cracked`] — a scrambled sector yielded a title key.
 /// - [`CrackOutcome::Unencrypted`] — no scrambled sector was seen; genuinely
@@ -120,9 +118,9 @@ pub fn crack_key_outcome(
     crack_key_scan(reader, extents, batch_sectors, halt)
 }
 
-// The SINGLE place every DVD read path obtains a title key when the caller
-// supplied none. A scrambled-but-uncrackable title is a hard, skippable
-// per-title CssKeyMissing (another VTS may still crack). See docs/css-mod.md.
+// The SINGLE place every DVD read path obtains a title key when the caller supplied none. A
+// scrambled-but-uncrackable title is a hard, skippable per-title CssKeyMissing (another VTS may
+// still crack).
 pub(crate) fn resolve_dvd_title_key(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
@@ -297,12 +295,10 @@ fn crack_key_scan(
 
 /// Descramble a single CSS-encrypted sector in place.
 ///
-/// A no-op unless the sector is a scrambled MPEG-2 PS PACK: the pack start
-/// code is checked, not just the byte 0x14 flag bits, since 0x14 alone is
-/// unreliable outside a pack (see [`is_scrambled_pack`]). Making the guard
-/// part of the function, rather than something each caller must remember, is
-/// what keeps the safe path the easy one — see docs/css-mod.md for the
-/// measured `VIDEO_TS.IFO` corruption this prevents.
+/// A no-op unless the sector is a scrambled MPEG-2 PS PACK: the pack start code is checked, not
+/// just the byte 0x14 flag bits, since 0x14 alone is unreliable outside a pack (see
+/// [`is_scrambled_pack`]). Making the guard part of the function, rather than something each
+/// caller must remember, is what keeps the safe path the easy one.
 pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
     if !is_scrambled_pack(sector) {
         return;
@@ -310,11 +306,9 @@ pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
     lfsr::descramble_sector(&state.title_key, sector);
 }
 
-/// Descramble a whole CSS buffer in place, re-cracking the title key on a VOB
-/// region boundary. `title_key` is a CACHE of the last crack: validated
-/// against the clear-header crib on every scrambled sector and re-cracked on
-/// a miss. A crib-less sector rides the cached key. See docs/css-mod.md —
-/// `descramble_region` for the full rationale.
+/// Descramble a whole CSS buffer in place, re-cracking the title key on a VOB region boundary.
+/// `title_key` is a CACHE of the last crack: validated against the clear-header crib on every
+/// scrambled sector and re-cracked on a miss. A crib-less sector rides the cached key.
 ///
 /// # Errors
 ///
@@ -362,9 +356,8 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
 
 /// Whether bits 4-5 of the sub-header byte 0x14 are set. NOTHING MORE.
 ///
-/// This is deliberately NOT called `is_scrambled`: byte 0x14 is only
-/// meaningful inside an MPEG-2 PS pack, and treating the flag alone as proof
-/// of scrambling corrupted a real disc (see docs/css-mod.md).
+/// This is deliberately NOT called `is_scrambled`: byte 0x14 is only meaningful inside an
+/// MPEG-2 PS pack, and treating the flag alone as proof of scrambling corrupted a real disc.
 ///
 /// **Callers want [`is_scrambled_pack`].** It also requires the pack start
 /// code, which every genuinely scrambled VOB sector carries and no IFO sector
@@ -383,11 +376,10 @@ pub(crate) const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
 /// crack scan's `saw_scrambled` flag and [`descramble_sector`]/[`descramble_region`] share.
 ///
 /// Requires BOTH the MPEG-PS pack-start code AND the 0x14 scramble bits
-/// ([`has_scramble_flag_bits`] alone is not enough), and excludes structural/nav
-/// `stream_id`s at 0x11 (`0xBB`/`0xBE`/`0xBF`) that CSS never scrambles so a decrypted
-/// HD-DVD's RDI nav packs can't falsely trip it. 0x11 holds the `stream_id` only for
-/// zero-stuffing headers (always true for DVD-Video VOB packs); a stuffed pack reads
-/// 0xFF there, harmless. See docs/css-mod.md — `is_scrambled_pack`.
+/// ([`has_scramble_flag_bits`] alone is not enough), and excludes structural/nav `stream_id`s
+/// at 0x11 (`0xBB`/`0xBE`/`0xBF`) that CSS never scrambles so a decrypted HD-DVD's RDI nav
+/// packs can't falsely trip it. 0x11 holds the `stream_id` only for zero-stuffing headers
+/// (always true for DVD-Video VOB packs); a stuffed pack reads 0xFF there, harmless.
 pub fn is_scrambled_pack(sector: &[u8]) -> bool {
     use crate::consts::pes_stream_id::{PADDING_STREAM, PRIVATE_STREAM_2, SYSTEM_HEADER};
     sector.len() >= 2048
@@ -404,9 +396,8 @@ mod tests {
     use super::*;
     use crate::error::{Error, Result};
 
-    // A crib mismatch whose re-crack fails keeps the CACHED key and
-    // descrambles with it — it does NOT fail the rip (a crib false positive,
-    // not a stale key). See docs/css-mod.md — this test's name.
+    // A crib mismatch whose re-crack fails keeps the CACHED key and descrambles with it — it
+    // does NOT fail the rip (a crib false positive, not a stale key).
     #[test]
     fn a_crib_false_positive_keeps_the_cached_key_rather_than_failing() {
         // Header periodic enough to yield a crib, body random enough that no
@@ -487,8 +478,7 @@ mod tests {
         assert!(!has_scramble_flag_bits(&[0xFFu8; 2047])); // one byte short of a sector
     }
 
-    // Keys on bits 4-5 of byte 0x14 only: 0x10/0x20/0x30 is scrambled,
-    // 0x00/0x40/0x80 is clear. See docs/css-mod.md — this test's name.
+    // Keys on bits 4-5 of byte 0x14 only: 0x10/0x20/0x30 is scrambled, 0x00/0x40/0x80 is clear.
     #[test]
     fn has_scramble_flag_bits_uses_bits_4_5_only() {
         let mut s = vec![0u8; 2048];
@@ -552,9 +542,8 @@ mod tests {
         );
     }
 
-    // Detection fix: `is_scrambled_pack` must EXCLUDE structural/nav
-    // stream_ids (0xBB/0xBE/0xBF) at 0x11, the exact decrypted-HD-DVD defect
-    // (an `.evo` RDI pack is 0xBF). See docs/css-mod.md — this test's name.
+    // Detection fix: `is_scrambled_pack` must EXCLUDE structural/nav stream_ids
+    // (0xBB/0xBE/0xBF) at 0x11, the exact decrypted-HD-DVD defect (an `.evo` RDI pack is 0xBF).
     #[test]
     fn is_scrambled_pack_excludes_nav_and_structural_stream_ids() {
         use crate::consts::pes_stream_id::{
@@ -603,9 +592,8 @@ mod tests {
         /// `recovery: true` source may return. `Some(0)` must not spin
         /// the scan.
         short_read: Option<usize>,
-        /// PES `stream_id` at offset 0x11 of each uniform-fill sector; `0xBF`
-        /// models an HD-DVD `.evo` RDI nav pack (pack-start + 0x14 bits, no
-        /// CSS). See docs/css-mod.md.
+        /// PES `stream_id` at offset 0x11 of each uniform-fill sector; `0xBF` models an HD-DVD
+        /// `.evo` RDI nav pack (pack-start + 0x14 bits, no CSS).
         stream_id: u8,
     }
 
@@ -751,9 +739,9 @@ mod tests {
         );
     }
 
-    // The 50_000-sector budget must hold even when a source always returns
-    // Ok(0): `tried` is charged in the `usable == 0` arm so a short-answering
-    // source can't turn off the anti-grind bound. See docs/css-mod.md.
+    // The 50_000-sector budget must hold even when a source always returns Ok(0): `tried` is
+    // charged in the `usable == 0` arm so a short-answering source can't turn off the
+    // anti-grind bound.
     #[test]
     fn a_source_that_returns_zero_sectors_still_obeys_the_scan_budget() {
         const MAX_TRIES: usize = 50_000;
@@ -833,9 +821,8 @@ mod tests {
         assert!(crack_key(&mut MockSource::new(0x30), &extents, 1).is_none());
     }
 
-    // The PUBLIC per-sector entry point must also refuse a non-pack sector
-    // (a real VIDEO_TS.IFO sector with 0x14 bits set but no pack-start),
-    // matching the region-level guard. See docs/css-mod.md.
+    // The PUBLIC per-sector entry point must also refuse a non-pack sector (a real VIDEO_TS.IFO
+    // sector with 0x14 bits set but no pack-start), matching the region-level guard.
     #[test]
     fn descramble_sector_refuses_a_non_pack_sector() {
         let mut ifo_like = vec![0u8; 2048];
@@ -953,9 +940,8 @@ mod tests {
         );
     }
 
-    // crack_key (the Option wrapper) collapses ScrambledUncracked and
-    // Unencrypted alike to None; callers needing to tell them apart must use
-    // crack_key_outcome. See docs/css-mod.md.
+    // crack_key (the Option wrapper) collapses ScrambledUncracked and Unencrypted alike to
+    // None; callers needing to tell them apart must use crack_key_outcome.
     #[test]
     fn crack_key_all_locked_collapses_to_none() {
         let mut src = MockSource::new(0x30);
@@ -1077,8 +1063,8 @@ mod tests {
 
     // ── Scan-level Cracked branch + per-VTS re-crack success (audit §2 / §5 #8) ─
 
-    // SCAN-LEVEL CRACKED: exercises the Cracked branch and crack_span
-    // recording end-to-end, previously untested. See docs/css-mod.md.
+    // SCAN-LEVEL CRACKED: exercises the Cracked branch and crack_span recording end-to-end,
+    // previously untested.
     #[test]
     fn crack_outcome_reaches_cracked_with_span() {
         let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
@@ -1114,9 +1100,8 @@ mod tests {
         );
     }
 
-    // `is_scrambled_uncracked` must be FALSE for Cracked/Unencrypted too, not
-    // just TRUE for ScrambledUncracked, else clear/cracked discs alike get
-    // routed to a hard error. See docs/css-mod.md.
+    // `is_scrambled_uncracked` must be FALSE for Cracked/Unencrypted too, not just TRUE for
+    // ScrambledUncracked, else clear/cracked discs alike get routed to a hard error.
     #[test]
     fn is_scrambled_uncracked_is_true_for_that_case_and_false_for_the_other_two() {
         let extents = [Extent {
@@ -1235,9 +1220,9 @@ mod tests {
         );
     }
 
-    // The decrypted-HD-DVD regression end to end: its 0xBF RDI nav packs must
-    // not flip `saw_scrambled` (no CSS exists on HD-DVD), else the scan
-    // hard-fails a good disc with CssKeyMissing (E7023). See docs/css-mod.md.
+    // The decrypted-HD-DVD regression end to end: its 0xBF RDI nav packs must not flip
+    // `saw_scrambled` (no CSS exists on HD-DVD), else the scan hard-fails a good disc with
+    // CssKeyMissing (E7023).
     #[test]
     fn resolve_dvd_title_key_decrypted_hddvd_rdi_packs_scan_clean_no_e7023() {
         let mut src = MockSource::new(0x30); // 0x14 bits set…
@@ -1387,9 +1372,8 @@ mod tests {
         );
     }
 
-    // CSS_ERROR WIRING: an all-locked synthetic ISO across MULTIPLE extents
-    // must produce ScrambledUncracked, the signal disc/mod.rs converts into
-    // css_error = CssKeyMissing. See docs/css-mod.md.
+    // CSS_ERROR WIRING: an all-locked synthetic ISO across MULTIPLE extents must produce
+    // ScrambledUncracked, the signal disc/mod.rs converts into css_error = CssKeyMissing.
     #[test]
     fn all_locked_synthetic_iso_yields_css_key_missing_signal() {
         let mut src = MockSource::new(0x30);
@@ -1417,9 +1401,8 @@ mod tests {
         assert!(crack_key(&mut src2, &extents, 16).is_none());
     }
 
-    // PER-VTS RE-CRACK SUCCESS: a re-crack over a DIFFERENT VTS's extents
-    // finds that VTS's own key, proving it is genuinely re-derived, not
-    // reused. See docs/css-mod.md.
+    // PER-VTS RE-CRACK SUCCESS: a re-crack over a DIFFERENT VTS's extents finds that VTS's own
+    // key, proving it is genuinely re-derived, not reused.
     #[test]
     fn recrack_succeeds_on_other_vts_extents() {
         let title_key = [0xFE, 0xDC, 0xBA, 0x98, 0x76];

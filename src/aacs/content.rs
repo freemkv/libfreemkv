@@ -26,9 +26,8 @@ pub const ALIGNED_UNIT_SECTORS: u32 = (ALIGNED_UNIT_LEN / SECTOR_BYTES) as u32;
 /// decrypt-on-read gate, the mux read paths, and key validation — never
 /// absolute `lba % 3`.
 ///
-/// `saturating_sub` keeps `lba < unit_base` well-defined (clamped to 0, a
-/// unit boundary) instead of a `wrapping_sub` mod-3 underflow trap. See
-/// docs/aacs-content.md for the full rationale.
+/// `saturating_sub` keeps `lba < unit_base` well-defined (clamped to 0, a unit boundary)
+/// instead of a `wrapping_sub` mod-3 underflow trap.
 pub fn is_unit_aligned(lba: u32, unit_base: u32) -> bool {
     lba.saturating_sub(unit_base)
         .is_multiple_of(ALIGNED_UNIT_SECTORS)
@@ -43,8 +42,8 @@ const TS_SYNC: u8 = 0x47;
 
 // ── Content decryption ──────────────────────────────────────────────────────
 
-// HD-DVD `.evo` AACS-encrypted-unit flag: PES_scrambling_control at offset 20
-// (bits 5-4), spec-derived but UNVERIFIED. See docs/aacs-content.md.
+// HD-DVD `.evo` AACS-encrypted-unit flag: PES_scrambling_control at offset 20 (bits 5-4),
+// spec-derived but UNVERIFIED.
 const PS_SCRAMBLE_OFF: usize = 20;
 const PS_SCRAMBLE_MASK: u8 = 0x30;
 
@@ -56,7 +55,7 @@ const PS_SCRAMBLE_MASK: u8 = 0x30;
 /// a real encrypted disc).
 ///
 /// Readable WITHOUT a key. Only meaningful when `unit` is read at the correct
-/// clip-FILE-anchored boundary. See docs/aacs-content.md for the mux rationale.
+/// clip-FILE-anchored boundary.
 pub fn aacs_unit_encrypted(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
     use crate::disc::ContentFormat;
     if unit.len() < ALIGNED_UNIT_LEN {
@@ -91,11 +90,10 @@ pub fn aacs_unit_seed_encrypted(unit: &[u8], format: crate::disc::ContentFormat)
 /// True when an aligned unit is flagged encrypted AND still looks scrambled
 /// (structure not yet restored) — genuine encrypted content NOT yet decrypted.
 ///
-/// Composes [`aacs_unit_encrypted`] (the authoritative flag, which decryption
-/// never rewrites) with an IDEMPOTENT "structure restored?" check, so callers
-/// that may run twice over the same buffer (re-decrypt, sampling, diagnosis)
-/// get a stable answer. Only meaningful at the clip-FILE-anchored boundary;
-/// see docs/aacs-content.md for the full rationale.
+/// Composes [`aacs_unit_encrypted`] (the authoritative flag, which decryption never rewrites)
+/// with an IDEMPOTENT "structure restored?" check, so callers that may run twice over the same
+/// buffer (re-decrypt, sampling, diagnosis) get a stable answer. Only meaningful at the
+/// clip-FILE-anchored boundary.
 pub fn aacs_unit_needs_decrypt(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
     // "Still needs key" = flagged encrypted AND not structurally clean per the
     // ONE definition, [`is_clean`]'s min(E,4) proof floor. Never a second threshold:
@@ -103,9 +101,8 @@ pub fn aacs_unit_needs_decrypt(unit: &[u8], format: crate::disc::ContentFormat) 
     aacs_unit_encrypted(unit, format) && !is_clean(unit, format)
 }
 
-// Minimum synced 0x47 packets (of the ~31/unit) that PROVE a key opened a
-// unit: an ABSOLUTE proof floor, NOT a proportion (false-pass ≈ C(31,4)*256^-4
-// ≈ 1e-5/unit). See docs/aacs-content.md#key_proof_packets for the full math.
+// Minimum synced 0x47 packets (of the ~31/unit) that PROVE a key opened a unit: an ABSOLUTE
+// proof floor, NOT a proportion (false-pass ≈ C(31,4)*256^-4 ≈ 1e-5/unit).
 const KEY_PROOF_PACKETS: usize = 4;
 
 /// Structural "did a key open this content unit?" — the pure, NO-CRYPTO signal
@@ -123,9 +120,8 @@ pub fn is_clean(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
     }
 }
 
-// Structural "does this unit carry enough valid MPEG-TS to prove a key
-// opened it?" (the mux's key-selection/verify signal): synced >=
-// min(E, KEY_PROOF_PACKETS) over non-padding packets. See docs/aacs-content.md.
+// Structural "does this unit carry enough valid MPEG-TS to prove a key opened it?" (the mux's
+// key-selection/verify signal): synced >= min(E, KEY_PROOF_PACKETS) over non-padding packets.
 fn is_clean_ts(unit: &[u8]) -> bool {
     const PKT: usize = BD_SOURCE_PACKET_BYTES; // 192
     let limit = ALIGNED_UNIT_LEN.min(unit.len());
@@ -172,9 +168,8 @@ pub fn ts_packet_total(unit: &[u8]) -> usize {
     unit.len() / BD_SOURCE_PACKET_BYTES
 }
 
-// The Program-Stream arm of [`is_clean`] (HD-DVD `.evo`): every 2048-byte pack
-// in the 6144-byte unit must start with `00 00 01 BA`; UNVERIFIED against a
-// real encrypted disc. See docs/aacs-content.md#is_clean_ps for validation notes.
+// The Program-Stream arm of [`is_clean`] (HD-DVD `.evo`): every 2048-byte pack in the 6144-byte
+// unit must start with `00 00 01 BA`; UNVERIFIED against a real encrypted disc.
 fn is_clean_ps(unit: &[u8]) -> bool {
     if unit.len() < ALIGNED_UNIT_LEN {
         return false;
@@ -198,10 +193,9 @@ fn is_clean_ps(unit: &[u8]) -> bool {
 /// TS (that's the separate [`is_clean_ts`] question, for key SELECTION or a
 /// read VERIFY).
 ///
-/// Applies the key UNCONDITIONALLY: does NOT check the encrypted-flag, so the
-/// CALLER must gate on [`aacs_unit_encrypted`] first. Block Key =
-/// AES-128E(Kcu, seed) ⊕ seed, then AES-128-CBC decrypt bytes 16..6144 under
-/// the AACS IV. See docs/aacs-content.md for the full rationale.
+/// Applies the key UNCONDITIONALLY: does NOT check the encrypted-flag, so the CALLER must gate
+/// on [`aacs_unit_encrypted`] first. Block Key = AES-128E(Kcu, seed) ⊕ seed, then AES-128-CBC
+/// decrypt bytes 16..6144 under the AACS IV.
 pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     if unit.len() < ALIGNED_UNIT_LEN {
         return;
@@ -233,9 +227,8 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     }
 }
 
-/// Encrypt one AACS aligned unit (6144 bytes) IN PLACE — the exact inverse of
-/// [`decrypt_unit`]. Caller must set the encrypted flag BEFORE calling and
-/// check the returned bool. See docs/aacs-content.md for the full contract.
+/// Encrypt one AACS aligned unit (6144 bytes) IN PLACE — the exact inverse of [`decrypt_unit`].
+/// Caller must set the encrypted flag BEFORE calling and check the returned bool.
 #[must_use = "returns false when the slice is too short to encrypt, leaving \
               plaintext behind a flag that already says 'encrypted'"]
 pub fn encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
@@ -1094,8 +1087,8 @@ mod tests {
 
     // ── decrypt_bus: one key schedule per unit, not one per sector ─────────
 
-    // Regression pin: `decrypt_bus` used to expand a fresh AES-128 key per
-    // sector (3x/unit) for a loop-invariant key. See docs/aacs-content.md.
+    // Regression pin: `decrypt_bus` used to expand a fresh AES-128 key per sector (3x/unit) for
+    // a loop-invariant key.
     #[test]
     fn decrypt_bus_expands_the_read_data_key_once_per_unit() {
         use crate::aacs::crypto::KEY_EXPANSIONS;
@@ -1223,7 +1216,6 @@ mod tests {
     // ── CBC decrypt: first-block uses fixed AACS IV ────────────────────────
 
     // The published `iv0` bytes (`[C]` §2.1.2), INDEPENDENT of `crypto::AACS_IV`.
-    // See docs/aacs-content.md#iv0_published for why that independence matters.
     const IV0_PUBLISHED: [u8; 16] = [
         0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3, 0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05, 0x0F,
         0x78,
@@ -1498,8 +1490,8 @@ mod tests {
 
     // ── the encrypted-flag readers ────────────────────────────────────────
 
-    // Guards a truncated fragment from being emitted as clear; reads ONLY the
-    // two CPI bits (`[BD]` §3.10.2, byte 0 bits 6-7). See docs/aacs-content.md.
+    // Guards a truncated fragment from being emitted as clear; reads ONLY the two CPI bits
+    // (`[BD]` §3.10.2, byte 0 bits 6-7).
     #[test]
     fn aacs_unit_seed_encrypted_reads_only_the_two_cpi_bits() {
         use crate::disc::ContentFormat::BdTs;

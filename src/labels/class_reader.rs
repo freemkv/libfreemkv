@@ -5,8 +5,8 @@
 //! pool, methods, the `Code` attribute, and a non-allocating bytecode
 //! iterator.
 //!
-//! No external deps beyond `std`. No `unsafe`. No panics on malformed
-//! input — every parse fault is a typed [`Error`]. See docs/class-reader.md.
+//! No external deps beyond `std`. No `unsafe`. No panics on malformed input — every parse fault
+//! is a typed [`Error`].
 
 // Foundation module — public API is staged for `labels::deluxe` (bytecode
 // walker) and `labels::dbp`'s refactor onto the constant-pool iterator.
@@ -100,9 +100,9 @@ pub struct ConstantPool {
 }
 
 impl ConstantPool {
-    // Test-only: build a pool directly from entries (real code goes through
-    // ClassFile::parse). Caller must prepend CpInfo::Empty at index 0 and
-    // after each Long/Double entry (2-slot quirk). See docs/class-reader.md.
+    // Test-only: build a pool directly from entries (real code goes through ClassFile::parse).
+    // Caller must prepend CpInfo::Empty at index 0 and after each Long/Double entry (2-slot
+    // quirk).
     #[cfg(test)]
     pub(crate) fn from_entries(entries: Vec<CpInfo>) -> Self {
         ConstantPool { entries }
@@ -436,9 +436,9 @@ fn read_constant_pool(r: &mut Reader<'_>) -> Result<ConstantPool> {
     Ok(ConstantPool { entries })
 }
 
-// Decode JVM "modified UTF-8" (JVMS §4.4.7): like UTF-8 but U+0000 is 0xC0
-// 0x80, and supplementary chars use a 3-byte-surrogate-pair encoding we
-// don't bother handling — no label string needs it. See docs/class-reader.md.
+// Decode JVM "modified UTF-8" (JVMS §4.4.7): like UTF-8 but U+0000 is 0xC0 0x80, and
+// supplementary chars use a 3-byte-surrogate-pair encoding we don't bother handling — no label
+// string needs it.
 fn decode_modified_utf8(bytes: &[u8]) -> std::result::Result<String, ()> {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;

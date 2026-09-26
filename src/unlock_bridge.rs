@@ -88,8 +88,8 @@ pub(crate) fn map_host_certs(certs: &[crate::aacs::types::HostCert]) -> Vec<fu::
         .collect()
 }
 
-// (matched_name, result): `Ok(Some)` = that unlocker unlocked; `Ok(None)` =
-// nobody claimed the drive; `Err(Transport)` = dead bus. See docs/unlock-bridge.md.
+// (matched_name, result): `Ok(Some)` = that unlocker unlocked; `Ok(None)` = nobody claimed the
+// drive; `Err(Transport)` = dead bus.
 type Dispatch = (
     &'static str,
     std::result::Result<Option<fu::Unlocked>, fu::UnlockError>,

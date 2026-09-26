@@ -5,9 +5,6 @@
 //! No userspace abort, no fd close+reopen, no SG_SCSI_RESET escalation —
 //! the kernel SCSI mid-layer's own error-handling ladder runs internally
 //! when `hdr.timeout` expires.
-//!
-//! See docs/scsi-linux.md for the escalation ladder, the design
-//! rationale, and the pre-0.13.20 async-poll design it replaced.
 
 use super::fd_handoff::{
     AtomicBool, AtomicI32, claim_for_teardown, publish_recovered_fd, take_recovered_fd,
@@ -128,11 +125,8 @@ impl SgIoTransport {
     /// live `&mut self` to route through `execute()`: `Drop`, unlocking the
     /// tray on its way out.
     ///
-    /// The CDB goes through the shared [`super::checked_cdb_len`] guard rather
-    /// than the old `cdb.len().min(16)` clamp — see docs/scsi-mod.md,
-    /// "checked_cdb_len rationale". Returning a typed [`Error`] rather than
-    /// `()` is what lets `raw_command_cdb_guard_tests` tell a rejected CDB
-    /// from an I/O failure without a real `/dev/sg*` device.
+    /// The CDB goes through the shared [`super::checked_cdb_len`] guard rather than the old
+    /// `cdb.len().min(16)` clamp.
     fn raw_command(fd: i32, cdb: &[u8], timeout_ms: u32) -> Result<()> {
         let cmd_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
         let mut sense = [0u8; 32];
@@ -230,8 +224,6 @@ impl Drop for SgIoTransport {
 
 impl ScsiTransport for SgIoTransport {
     // Execute via one synchronous SG_IO ioctl; errors map to IoError/ScsiError.
-    // See docs/scsi-linux.md — error mapping, DRIVER_SENSE masking, and
-    // partial-transfer notes.
     fn execute(
         &mut self,
         cdb: &[u8],

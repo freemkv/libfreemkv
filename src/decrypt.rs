@@ -2,11 +2,10 @@
 //! from disc scanning; handles AACS 1.0/2.0 and CSS transparently, and
 //! the caller never sees encrypted data unless explicitly bypassed.
 //!
-//! AACS aligned units decrypt independently, so buffers of at least
-//! [`PARALLEL_MIN_UNITS`] units parallelize across a rayon pool; smaller
-//! buffers use the serial path. Thread count resolves from
-//! [`set_decrypt_threads`], else `FREEMKV_THREADS`, else all cores
-//! (capped at [`MAX_THREADS`]). See docs/decrypt.md for detail.
+//! AACS aligned units decrypt independently, so buffers of at least [`PARALLEL_MIN_UNITS`]
+//! units parallelize across a rayon pool; smaller buffers use the serial path. Thread count
+//! resolves from [`set_decrypt_threads`], else `FREEMKV_THREADS`, else all cores (capped at
+//! [`MAX_THREADS`]).
 
 use crate::aacs;
 use crate::css;
@@ -28,9 +27,8 @@ pub const MAX_THREADS: usize = 64;
 /// order.
 static DECRYPT_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-// Current rayon pool. `set_decrypt_threads` swaps it without leaking the
-// old one; in-flight calls hold their own `Arc` via `decrypt_pool` and
-// finish on it. See docs/decrypt.md — DECRYPT_POOL.
+// Current rayon pool. `set_decrypt_threads` swaps it without leaking the old one; in-flight
+// calls hold their own `Arc` via `decrypt_pool` and finish on it.
 static DECRYPT_POOL: RwLock<Option<Arc<rayon::ThreadPool>>> = RwLock::new(None);
 
 /// Configure how many threads to use for AACS unit decryption. A value
@@ -51,9 +49,9 @@ pub fn set_decrypt_threads(n: usize) {
     *guard = None;
 }
 
-// Get (or lazily build) the pool; `Arc` so in-flight work survives a
-// concurrent `set_decrypt_threads` swap. `None` if unbuildable (e.g. OS
-// thread limit) — caller falls back to serial. See docs/decrypt.md.
+// Get (or lazily build) the pool; `Arc` so in-flight work survives a concurrent
+// `set_decrypt_threads` swap. `None` if unbuildable (e.g. OS thread limit) — caller falls back
+// to serial.
 fn decrypt_pool() -> Option<Arc<rayon::ThreadPool>> {
     // Fast path: pool already built. A poisoned read lock still yields a
     // usable guard (the pool Arc is immutable once stored).
@@ -151,9 +149,8 @@ pub enum Phase {
     Odd,
 }
 
-// Does this unit belong to the phase we hold the key for? `Phase::All`
-// means the whole range is ours; a wrong index gets the wrong half.
-// See docs/decrypt.md — unit_is_our_phase.
+// Does this unit belong to the phase we hold the key for? `Phase::All` means the whole range is
+// ours; a wrong index gets the wrong half.
 fn unit_is_our_phase(unit_lba: u32, range_start: u32, unit_sectors: u32, phase: Phase) -> bool {
     let want_odd = match phase {
         Phase::All => return true,
@@ -167,11 +164,10 @@ fn unit_is_our_phase(unit_lba: u32, range_start: u32, unit_sectors: u32, phase: 
     (unit_ix % 2 == 1) == want_odd
 }
 
-/// Proactive AACS key-selection map: which held unit key decrypts each LBA of
-/// a title's encrypted content, decided ONCE before mux from the disc's
-/// CPS-unit (and, later, FMTS segment) structure — never by
-/// trial-decrypt-and-check per unit at mux time. Ends the mux "key-server
-/// storm" caused by that per-unit re-derivation. See docs/decrypt.md.
+/// Proactive AACS key-selection map: which held unit key decrypts each LBA of a title's
+/// encrypted content, decided ONCE before mux from the disc's CPS-unit (and, later, FMTS
+/// segment) structure — never by trial-decrypt-and-check per unit at mux time. Ends the mux
+/// "key-server storm" caused by that per-unit re-derivation.
 ///
 /// Ranges are `[start_lba, end_lba)` → index into the `Aacs { unit_keys }`
 /// pool, sorted and disjoint. An LBA in no range (incl. clear nav/filesystem
@@ -252,14 +248,13 @@ impl AacsKeyMap {
         &self.key_indices
     }
 
-    /// Build the FMTS **read plan**: the title's aligned units filtered down to
-    /// only the units this rip must actually read — every default / CPS unit,
-    /// plus, inside each forensic segment, ONLY our-phase ([`Phase::Even`] /
-    /// [`Phase::Odd`]) units; alternate-phase units belong to a different device
-    /// group's variant and are omitted entirely. `extents` are the title's clip
-    /// extents; `unit_sectors` is the AACS aligned-unit size (3 sectors). A map
-    /// with no forensic range returns `extents` unchanged, and a kept unit is
-    /// always one `decrypt_sectors_mapped` would open. See docs/decrypt.md.
+    /// Build the FMTS **read plan**: the title's aligned units filtered down to only the units
+    /// this rip must actually read — every default / CPS unit, plus, inside each forensic
+    /// segment, ONLY our-phase ([`Phase::Even`] / [`Phase::Odd`]) units; alternate-phase units
+    /// belong to a different device group's variant and are omitted entirely. `extents` are the
+    /// title's clip extents; `unit_sectors` is the AACS aligned-unit size (3 sectors). A map
+    /// with no forensic range returns `extents` unchanged, and a kept unit is always one
+    /// `decrypt_sectors_mapped` would open.
     pub fn read_plan(
         &self,
         extents: &[crate::disc::Extent],
@@ -380,9 +375,8 @@ fn lba_in_content_ranges(lba: u32, ranges: &[(u32, u32)]) -> bool {
     }
 }
 
-// AACS scheme step: apply `map`'s per-unit keys to `buf`, in-place — no key
-// trial, no `is_clean` verdict; the refusal decision belongs to
-// `decrypt_span`. See docs/decrypt.md — apply_aacs_map.
+// AACS scheme step: apply `map`'s per-unit keys to `buf`, in-place — no key trial, no
+// `is_clean` verdict; the refusal decision belongs to `decrypt_span`.
 fn apply_aacs_map(
     buf: &mut [u8],
     keys: &DecryptKeys,
@@ -495,12 +489,11 @@ fn apply_aacs_map(
 
 /// Decrypt a buffer of sectors in-place — the CSS / clear path only.
 ///
-/// For CSS: descrambles per 2048-byte sector, self-cracking the title key
-/// from the data. For `None`: a no-op. For AACS: **always** returns
-/// `Err(DecryptFailed)` — AACS decrypts exclusively through the resolved key
-/// map (`decrypt_sectors_mapped`); reaching this arm with AACS keys means a
-/// reader was built without installing its map (a bug). `unit_key_idx` is a
-/// legacy parameter, ignored. See docs/decrypt.md for full detail.
+/// For CSS: descrambles per 2048-byte sector, self-cracking the title key from the data. For
+/// `None`: a no-op. For AACS: **always** returns `Err(DecryptFailed)` — AACS decrypts
+/// exclusively through the resolved key map (`decrypt_sectors_mapped`); reaching this arm with
+/// AACS keys means a reader was built without installing its map (a bug). `unit_key_idx` is a
+/// legacy parameter, ignored.
 pub fn decrypt_sectors(
     buf: &mut [u8],
     keys: &mut DecryptKeys,
@@ -529,9 +522,8 @@ pub fn decrypt_sectors_in_content(
     decrypt_span(buf, keys, base_lba, None, Some((base_lba, content_ranges)))
 }
 
-// THE decrypt orchestrator: every path into this crate's decryption goes
-// through here. Resolve a key for the span, apply it, refuse if none can be
-// proven — see docs/decrypt.md — decrypt_span for why the split matters.
+// THE decrypt orchestrator: every path into this crate's decryption goes through here. Resolve
+// a key for the span, apply it, refuse if none can be proven.
 fn decrypt_span(
     buf: &mut [u8],
     keys: &mut DecryptKeys,
@@ -603,8 +595,8 @@ mod tests {
 
     // ── `decrypt_sectors_in_content` (now a legacy alias of `decrypt_sectors`) ──
 
-    // `DecryptKeys::None` is a no-op; a forensic read plan is NOT the extents
-    // it was given — the mux's provenance guard's precondition. docs/decrypt.md.
+    // `DecryptKeys::None` is a no-op; a forensic read plan is NOT the extents it was given —
+    // the mux's provenance guard's precondition.
     #[test]
     fn a_forensic_read_plan_drops_units_the_full_extents_include() {
         let full = vec![crate::disc::Extent {
@@ -648,8 +640,8 @@ mod tests {
         assert_eq!(buf, original);
     }
 
-    // CSS ignores the content gate (it lives in the AACS arm) and always
-    // reports `0` — the read stays scheme-agnostic. See docs/decrypt.md.
+    // CSS ignores the content gate (it lives in the AACS arm) and always reports `0` — the read
+    // stays scheme-agnostic.
     #[test]
     fn content_gate_css_keys_is_noop() {
         let mut keys = DecryptKeys::Css { title_key: [0; 5] };
@@ -661,9 +653,8 @@ mod tests {
         );
     }
 
-    // `decrypt_sectors_in_content` is the live read path for every mapped rip
-    // and must actually DECRYPT — the `_is_noop` tests above only pin `0`,
-    // which an `Ok(0)` stub also returns. See docs/decrypt.md.
+    // `decrypt_sectors_in_content` is the live read path for every mapped rip and must actually
+    // DECRYPT — the `_is_noop` tests above only pin `0`, which an `Ok(0)` stub also returns.
     #[test]
     fn content_gate_css_actually_descrambles_the_buffer() {
         const RUN_START: usize = 0x59;
@@ -708,9 +699,9 @@ mod tests {
         );
     }
 
-    // The AACS arm of the same entry point must fail LOUD: reaching it means
-    // a reader was built without installing its key map, and must not be
-    // softened into a success with a zero count. See docs/decrypt.md.
+    // The AACS arm of the same entry point must fail LOUD: reaching it means a reader was built
+    // without installing its key map, and must not be softened into a success with a zero
+    // count.
     #[test]
     fn content_gate_aacs_keys_fail_loud_not_ok_zero() {
         let mut keys = DecryptKeys::Aacs {
@@ -751,9 +742,8 @@ mod tests {
         plaintext
     }
 
-    // CHARACTERIZATION: the CSS arm's per-region re-crack when the cached
-    // title key goes stale at a VOB region boundary. Delicate logic the
-    // recovery refactor moves next; see docs/decrypt.md for detail.
+    // CHARACTERIZATION: the CSS arm's per-region re-crack when the cached title key goes stale
+    // at a VOB region boundary. Delicate logic the recovery refactor moves next.
     #[test]
     fn css_region_change_recracks_the_title_key() {
         let key_a = [0x11, 0x22, 0x33, 0x44, 0x55];
@@ -823,9 +813,8 @@ mod tests {
         );
     }
 
-    // A CLEAR trailing partial is legitimate content and must pass through
-    // byte-for-byte, not just return `Ok` — a corrupting mutant that still
-    // returns `Ok` must fail this. See docs/decrypt.md.
+    // A CLEAR trailing partial is legitimate content and must pass through byte-for-byte, not
+    // just return `Ok` — a corrupting mutant that still returns `Ok` must fail this.
     #[test]
     fn aacs_clear_trailing_partial_passes_through() {
         let keys = DecryptKeys::Aacs {
@@ -966,9 +955,8 @@ mod tests {
         (plaintext, body)
     }
 
-    // CSS keys are per-VTS/VOB region: must re-crack when the cached key
-    // stops descrambling, not blindly reapply it — the bug that pixelated
-    // every DVD rip. See docs/decrypt.md.
+    // CSS keys are per-VTS/VOB region: must re-crack when the cached key stops descrambling,
+    // not blindly reapply it — the bug that pixelated every DVD rip.
     #[test]
     fn css_rekeys_when_title_key_region_changes() {
         let key_a = [0x42, 0x13, 0x37, 0xBE, 0xEF];
@@ -1331,9 +1319,8 @@ mod tests {
         }
     }
 
-    // A forensic range does NOT start on an aligned-unit boundary, so
-    // `unit_ix = (lba - range_start) / us` must still get the parity right
-    // for an unaligned `range_start`. See docs/decrypt.md.
+    // A forensic range does NOT start on an aligned-unit boundary, so `unit_ix = (lba -
+    // range_start) / us` must still get the parity right for an unaligned `range_start`.
     #[test]
     fn read_plan_phase_parity_is_measured_from_an_unaligned_range_start() {
         use crate::disc::Extent;
@@ -1387,9 +1374,8 @@ mod tests {
         );
     }
 
-    // An extent whose last whole unit is an alternate-phase unit must still
-    // drop it — the tail guard is only for a REMNANT shorter than a unit.
-    // See docs/decrypt.md for the widened-guard failure mode it pins.
+    // An extent whose last whole unit is an alternate-phase unit must still drop it — the tail
+    // guard is only for a REMNANT shorter than a unit.
     #[test]
     fn read_plan_gates_the_last_whole_unit_of_an_extent_not_just_the_remnant() {
         use crate::disc::Extent;
@@ -1430,9 +1416,9 @@ mod tests {
         );
     }
 
-    // Every scheme that CANNOT prove a key answers the same way — the
-    // property `decrypt_span` exists to hold. CSS is deliberately excluded
-    // (self-recovers heuristically; cannot PROVE a key wrong). docs/decrypt.md.
+    // Every scheme that CANNOT prove a key answers the same way — the property `decrypt_span`
+    // exists to hold. CSS is deliberately excluded (self-recovers heuristically; cannot PROVE a
+    // key wrong).
     #[test]
     fn every_scheme_gives_the_same_verdict_when_no_key_can_be_proven() {
         use crate::disc::ContentFormat;
@@ -1478,9 +1464,9 @@ mod tests {
         );
     }
 
-    // An ENCRYPTED unit outside every key-map range must fail, not pass
-    // through as ciphertext — a CLEAR one outside every range still must
-    // pass through untouched. Both directions asserted. See docs/decrypt.md.
+    // An ENCRYPTED unit outside every key-map range must fail, not pass through as ciphertext —
+    // a CLEAR one outside every range still must pass through untouched. Both directions
+    // asserted.
     #[test]
     fn an_encrypted_unit_outside_every_key_range_fails_instead_of_passing_through() {
         use crate::disc::ContentFormat;
@@ -1640,9 +1626,8 @@ mod tests {
         }
     }
 
-    // The mapped descramble indexes the committed key pool POSITIONALLY, so
-    // the ORDER of the `Vec<UnitKey>` a `KeySource` returns is load-bearing —
-    // nothing here searches the pool. See docs/decrypt.md.
+    // The mapped descramble indexes the committed key pool POSITIONALLY, so the ORDER of the
+    // `Vec<UnitKey>` a `KeySource` returns is load-bearing — nothing here searches the pool.
     #[test]
     fn mapped_key_selection_is_positional_so_pool_order_matters() {
         use crate::disc::ContentFormat;
@@ -1744,8 +1729,8 @@ mod tests {
 
     // ── decrypt_threads resolution (read-only; no global mutation) ─────────
 
-    // Default thread count is always usable: >=1, never above MAX_THREADS.
-    // Reads only; safe alongside other tests. See docs/decrypt.md.
+    // Default thread count is always usable: >=1, never above MAX_THREADS. Reads only; safe
+    // alongside other tests.
     #[test]
     fn decrypt_threads_within_valid_pool_range() {
         let n = decrypt_threads();
@@ -1756,9 +1741,8 @@ mod tests {
         );
     }
 
-    // The FMTS phase gate picks which half of an interleaved forensic
-    // segment we decrypt; getting its index arithmetic wrong silently
-    // decrypts the alternate variant into garbage. See docs/decrypt.md.
+    // The FMTS phase gate picks which half of an interleaved forensic segment we decrypt;
+    // getting its index arithmetic wrong silently decrypts the alternate variant into garbage.
     #[test]
     fn phase_gate_selects_only_our_parity_of_a_forensic_segment() {
         use super::{Phase, unit_is_our_phase};
@@ -1800,9 +1784,8 @@ mod tests {
         assert!(!unit_is_our_phase(33, 30, 3, Phase::Even));
     }
 
-    // A malformed key map (unit below range start, or zero unit size) must
-    // return a DEFINED answer, not merely avoid panicking. See docs/decrypt.md
-    // for the `|| true` non-assertion this replaces.
+    // A malformed key map (unit below range start, or zero unit size) must return a DEFINED
+    // answer, not merely avoid panicking.
     #[test]
     fn phase_gate_does_not_panic_on_a_malformed_map() {
         use super::{Phase, unit_is_our_phase};

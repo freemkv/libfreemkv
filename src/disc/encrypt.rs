@@ -16,10 +16,9 @@ pub(super) struct HandshakeResult {
     /// instead of a bare "unavailable" — the difference between a diagnosable log
     /// and archaeology.
     pub read_data_key_err: Option<u16>,
-    /// True when the VID came from an unlocker that unlocked the drive, so
-    /// bus encryption is already removed AT THE DRIVE (firmware, not AKE).
-    /// The bus-key gate must credit this the same as a cert `read_data_key`.
-    /// See docs/encrypt.md — HandshakeResult::drive_unlocked.
+    /// True when the VID came from an unlocker that unlocked the drive, so bus encryption is
+    /// already removed AT THE DRIVE (firmware, not AKE). The bus-key gate must credit this the
+    /// same as a cert `read_data_key`.
     pub drive_unlocked: bool,
 }
 
@@ -36,9 +35,8 @@ impl std::fmt::Debug for HandshakeResult {
     }
 }
 
-// Single source of truth for "is AACS bus encryption gone for this scan?".
-// Add a NEW removal mechanism HERE, never in the gate.
-// See docs/encrypt.md — bus_encryption_removed.
+// Single source of truth for "is AACS bus encryption gone for this scan?". Add a NEW removal
+// mechanism HERE, never in the gate.
 fn bus_encryption_removed(bus_encryption: bool, handshake: Option<&HandshakeResult>) -> bool {
     if !bus_encryption {
         return true; // never had it → nothing to remove
@@ -49,9 +47,8 @@ fn bus_encryption_removed(bus_encryption: bool, handshake: Option<&HandshakeResu
     }
 }
 
-// libfreemkv-side driver for the AACS cert route: owns host-cert collection,
-// dispatches mutual-auth to the freemkv-unlock AACS unlocker.
-// See docs/encrypt.md — AacsCertUnlocker.
+// libfreemkv-side driver for the AACS cert route: owns host-cert collection, dispatches
+// mutual-auth to the freemkv-unlock AACS unlocker.
 struct AacsCertUnlocker<'a> {
     opts: &'a ScanOptions,
 }
@@ -68,9 +65,8 @@ enum CertUnlockFailure {
 }
 
 impl AacsCertUnlocker<'_> {
-    // Runs the host-cert mutual-auth handshake and returns a CertUnlockFailure
-    // on every no-VID outcome.
-    // See docs/encrypt.md — AacsCertUnlocker::authenticate.
+    // Runs the host-cert mutual-auth handshake and returns a CertUnlockFailure on every no-VID
+    // outcome.
     fn authenticate(
         &self,
         session: &mut crate::drive::Drive,
@@ -138,9 +134,8 @@ impl AacsCertUnlocker<'_> {
     }
 }
 
-// Maps CertUnlockFailure to the Error variant do_handshake_cert has always
-// surfaced, so scan_with's rendering stays unchanged.
-// See docs/encrypt.md — unlock_error_to_error.
+// Maps CertUnlockFailure to the Error variant do_handshake_cert has always surfaced, so
+// scan_with's rendering stays unchanged.
 fn unlock_error_to_error(e: &CertUnlockFailure) -> Error {
     use freemkv_unlock::UnlockError;
     match e {
@@ -172,17 +167,15 @@ fn cert_unlock_outcome(e: &CertUnlockFailure) -> crate::aacs::trace::UnlockOutco
     }
 }
 
-// Did the cert handshake actually carry a Volume ID? Extracted so it can be
-// tested as a VALUE instead of asserting on a racy tracing field.
-// See docs/encrypt.md — handshake_has_volume_id.
+// Did the cert handshake actually carry a Volume ID? Extracted so it can be tested as a VALUE
+// instead of asserting on a racy tracing field.
 fn handshake_has_volume_id(h: &HandshakeResult) -> bool {
     h.volume_id != [0u8; 16]
 }
 
 impl Disc {
-    // SCSI handshake — drives the VID-acquisition flow via do_handshake_cert
-    // and returns a structured HandshakeResult for downstream key resolution.
-    // See docs/encrypt.md — Disc::do_handshake.
+    // SCSI handshake — drives the VID-acquisition flow via do_handshake_cert and returns a
+    // structured HandshakeResult for downstream key resolution.
     pub(super) fn do_handshake(
         session: &mut crate::drive::Drive,
         opts: &ScanOptions,
@@ -204,9 +197,8 @@ impl Disc {
         (result, err)
     }
 
-    // Cert-based AACS handshake — the cert route for VID acquisition. Checks
-    // for an OEM VID stashed at drive init() first; skips cert auth if found.
-    // See docs/encrypt.md — Disc::do_handshake_cert.
+    // Cert-based AACS handshake — the cert route for VID acquisition. Checks for an OEM VID
+    // stashed at drive init() first; skips cert auth if found.
     fn do_handshake_cert(
         session: &mut crate::drive::Drive,
         opts: &ScanOptions,
@@ -272,9 +264,8 @@ impl Disc {
         }
     }
 
-    // Collects every AACS host cert the caller carries, from DriveCredentials
-    // AND the key-source layer, unioned. Empty means the graceful no-cert path.
-    // See docs/encrypt.md — Disc::collect_host_certs.
+    // Collects every AACS host cert the caller carries, from DriveCredentials AND the
+    // key-source layer, unioned. Empty means the graceful no-cert path.
     fn collect_host_certs(
         opts: &ScanOptions,
         mkb: Option<u32>,
@@ -285,9 +276,8 @@ impl Disc {
         crate::aacs::host_certs::collect_host_certs(opts, mkb)
     }
 
-    // Builds a keys-free AACS state carrying only the Volume ID (+ version),
-    // for callers that resolve Unit Keys out-of-band with the keydb disabled.
-    // See docs/encrypt.md — Disc::resolve_vid_only.
+    // Builds a keys-free AACS state carrying only the Volume ID (+ version), for callers that
+    // resolve Unit Keys out-of-band with the keydb disabled.
     pub(super) fn resolve_vid_only(
         udf_fs: &udf::UdfFs,
         reader: &mut dyn SectorSource,
@@ -553,9 +543,8 @@ mod tests {
         v
     }
 
-    // One Type-and-Version record (type 0x10), version BE u32 @ offset 8,
-    // then trailing zero padding.
-    // See docs/encrypt.md — build_mkb (test helper).
+    // One Type-and-Version record (type 0x10), version BE u32 @ offset 8, then trailing zero
+    // padding.
     fn build_mkb(version: u32, pad_to: usize) -> Vec<u8> {
         let mut v = Vec::new();
         // Type 0x10 record, length 16 (>= 12 so version is read).
@@ -642,9 +631,8 @@ mod tests {
         assert!(st.bus_encryption, "cert bus_encryption bit must propagate");
     }
 
-    // No content cert → version defaults to UHD (major 2), matching
-    // read_aacs_version (audit #4). bus_encryption false (unreadable → off).
-    // See docs/encrypt.md — resolve_vid_only_no_cert_defaults_version_uhd.
+    // No content cert → version defaults to UHD (major 2), matching read_aacs_version (audit
+    // #4). bus_encryption false (unreadable → off).
     #[test]
     fn resolve_vid_only_no_cert_defaults_version_uhd() {
         let mut disc = MemDisc::new();
@@ -962,7 +950,6 @@ mod tests {
     }
 
     // Tests: read_vid_oem and collect_host_certs coverage notes.
-    // See docs/encrypt.md — Skipped/deferred test coverage.
 
     fn fake_cert(tag: u8) -> aacs::types::HostCert {
         aacs::types::HostCert {

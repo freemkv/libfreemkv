@@ -7,8 +7,6 @@
 //!
 //! One video track plus every audio track with a clean MP4 mapping; codecs MP4
 //! can't carry are **excluded, never silently dropped** — [`fit_report`] says why.
-//!
-//! See docs/mp4-mux.md#module-overview for full rationale and references.
 
 use crate::disc::{Codec, DiscTitle, Stream as DiscStream};
 use crate::pes::{PesFrame, Stream};
@@ -50,9 +48,8 @@ fn round_up_grain(x: u64) -> u64 {
     x.div_ceil(RESERVE_GRAIN).saturating_mul(RESERVE_GRAIN)
 }
 
-// Whether leftover reserved-hole slack can be closed: 0 needs no `free` box,
-// 8+ bytes holds one (8-byte box header). 1-7 bytes fits no box, so finish()
-// falls back to moov-at-end. See docs/mp4-mux.md#faststart_fits.
+// Whether leftover reserved-hole slack can be closed: 0 needs no `free` box, 8+ bytes holds one
+// (8-byte box header). 1-7 bytes fits no box, so finish() falls back to moov-at-end.
 fn faststart_fits(gap: u64) -> bool {
     gap == 0 || gap >= 8
 }
@@ -376,9 +373,8 @@ impl<W: Write + Seek> Mp4Sink<W> {
     /// into `skipped` with a post-mux reason ([`Mp4SkipReason::NoSamples`],
     /// [`Mp4SkipReason::UndescribableAudio`]).
     ///
-    /// Call this after `finish()`, not the pre-mux plan, before reporting what
-    /// was written: the plan is only a prediction and can still list a stream
-    /// `finish()` had to drop. See docs/mp4-mux.md#mp4sinkfinal_report.
+    /// Call this after `finish()`, not the pre-mux plan, before reporting what was written: the
+    /// plan is only a prediction and can still list a stream `finish()` had to drop.
     pub fn final_report(&self) -> Mp4FitReport {
         let mut included = self.plan.included.clone();
         included.retain(|i| !self.dropped.iter().any(|(d, _)| d == i));
@@ -528,9 +524,8 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
         &self.title
     }
 
-    // The streams finish() had to drop — see final_report() for reasons.
-    // Folded into MuxOutcome::undelivered_streams so callers learn this
-    // programmatically. See docs/mp4-mux.md#mp4sinkundelivered_streams.
+    // The streams finish() had to drop — see final_report() for reasons. Folded into
+    // MuxOutcome::undelivered_streams so callers learn this programmatically.
     fn undelivered_streams(&self) -> Vec<usize> {
         self.dropped.iter().map(|&(i, _)| i).collect()
     }
@@ -656,9 +651,9 @@ const STD_RATES: &[(u32, u32, f64)] = &[
     (60, 1, 60.0),
 ];
 
-// How far the measured rate may sit from a STD_RATES entry and still snap to
-// it; nearest-wins, not first-wins (see STD_RATES). Two `<`→`<=` mutants on
-// the snapping loop are believed unreachable — see docs/mp4-mux.md#rate_tolerance_fps.
+// How far the measured rate may sit from a STD_RATES entry and still snap to it; nearest-wins,
+// not first-wins (see STD_RATES). Two `<`→`<=` mutants on the snapping loop are believed
+// unreachable.
 const RATE_TOLERANCE_FPS: f64 = 0.5;
 
 /// Detect the constant frame rate from the median presentation delta, snapping
@@ -822,8 +817,7 @@ fn build_dinf() -> Vec<u8> {
 }
 
 // Colour signalling for `colr` (nclx, ISO/IEC 14496-12 §12.1.5). Must use
-// crate::mux::mkv::cicp_for_video, the one resolver every sink shares — see
-// docs/mp4-mux.md#video_colr for the past drift this guards against.
+// crate::mux::mkv::cicp_for_video, the one resolver every sink shares.
 fn video_colr(stream: &DiscStream) -> Option<(u16, u16, u16, bool)> {
     let DiscStream::Video(v) = stream else {
         return None;
@@ -1103,9 +1097,8 @@ mod tests {
         assert_eq!(r.included, vec![1], "only the AC-3 audio is carried");
     }
 
-    // A video track whose resolution never resolved must FAIL the mux, not be
-    // written as a 0x0 track (ISO/IEC 14496-12 mandates width/height). See
-    // docs/mp4-mux.md#test-a_video_track_with_no_resolved_resolution_is_an_error_not_a_zero_sized_track.
+    // A video track whose resolution never resolved must FAIL the mux, not be written as a 0x0
+    // track (ISO/IEC 14496-12 mandates width/height).
     #[test]
     fn a_video_track_with_no_resolved_resolution_is_an_error_not_a_zero_sized_track() {
         let DiscStream::Video(mut v) = hevc_video() else {
@@ -1220,9 +1213,8 @@ mod tests {
         None
     }
 
-    // An audio track whose frames never yield a parseable sample entry must be
-    // dropped from moov, not written as an stsd around an empty entry, while
-    // the frames still reach mdat. See docs/mp4-mux.md#test-audio_track_with_no_parseable_sample_entry_is_dropped_not_emitted_empty.
+    // An audio track whose frames never yield a parseable sample entry must be dropped from
+    // moov, not written as an stsd around an empty entry, while the frames still reach mdat.
     #[test]
     fn audio_track_with_no_parseable_sample_entry_is_dropped_not_emitted_empty() {
         let t = title(
@@ -1268,8 +1260,7 @@ mod tests {
     }
 
     // Dropping the undescribable audio track keeps the export succeeding, but
-    // final_report()/undelivered_streams() must stop claiming that stream
-    // afterward. See docs/mp4-mux.md#test-dropped_audio_track_is_reported_not_just_logged.
+    // final_report()/undelivered_streams() must stop claiming that stream afterward.
     #[test]
     fn dropped_audio_track_is_reported_not_just_logged() {
         let t = title(
@@ -1312,9 +1303,8 @@ mod tests {
         );
     }
 
-    // mvhd.next_track_id must EXCEED every track_ID in the file (ISO/IEC
-    // 14496-12 §8.2.2), not be derived from the retained track count. See
-    // docs/mp4-mux.md#test-mvhd_next_track_id_exceeds_every_retained_track_id.
+    // mvhd.next_track_id must EXCEED every track_ID in the file (ISO/IEC 14496-12 §8.2.2), not
+    // be derived from the retained track count.
     #[test]
     fn mvhd_next_track_id_exceeds_every_retained_track_id() {
         let t = title(
@@ -1616,8 +1606,7 @@ mod tests {
 
     // ── pack_language ────────────────────────────────────────────────────────
 
-    // Bit-twiddles pinned against hand-computed values; three mutants proven
-    // equivalent. See docs/mp4-mux.md#test-pack_language_packs_three_lowercase_letters_into_15_bits.
+    // Bit-twiddles pinned against hand-computed values; three mutants proven equivalent.
     #[test]
     fn pack_language_packs_three_lowercase_letters_into_15_bits() {
         // "bcd": b=2, c=3, d=4 → (2<<10)|(3<<5)|4 = 2048+96+4 = 0x0864.
@@ -1650,9 +1639,9 @@ mod tests {
         assert_eq!(RESERVE_FLOOR, 8 * 1024 * 1024);
     }
 
-    // estimate_reserve's per-stream fps uses the stream's own rate only when
-    // n > 0 && d > 0, else a flat 24.0 fallback; a film-rate (23.976) fixture
-    // is the one that can tell the two apart. See docs/mp4-mux.md#test-estimate_reserve_uses_the_streams_own_fps_not_the_24fps_fallback.
+    // estimate_reserve's per-stream fps uses the stream's own rate only when n > 0 && d > 0,
+    // else a flat 24.0 fallback; a film-rate (23.976) fixture is the one that can tell the two
+    // apart.
     #[test]
     fn estimate_reserve_uses_the_streams_own_fps_not_the_24fps_fallback() {
         let mut t = title(vec![hevc_video()], vec![]);
@@ -1664,9 +1653,8 @@ mod tests {
         );
     }
 
-    // Complementary case: FrameRate::Unknown (n=0) must take the 24.0
-    // fallback branch, not compute 0/1 = 0.0 fps. See
-    // docs/mp4-mux.md#test-estimate_reserve_unknown_frame_rate_falls_back_to_24fps_not_zero.
+    // Complementary case: FrameRate::Unknown (n=0) must take the 24.0 fallback branch, not
+    // compute 0/1 = 0.0 fps.
     #[test]
     fn estimate_reserve_unknown_frame_rate_falls_back_to_24fps_not_zero() {
         let mut vc1 = match hevc_video() {
@@ -1686,9 +1674,8 @@ mod tests {
         );
     }
 
-    // estimate_reserve models DTS at 512 samples/AU, a third of the 1536
-    // (E-)AC-3 default; losing the DTS arm under-reserves DTS titles 3x. See
-    // docs/mp4-mux.md#test-estimate_reserve_models_dts_at_512_samples_per_frame_not_1536.
+    // estimate_reserve models DTS at 512 samples/AU, a third of the 1536 (E-)AC-3 default;
+    // losing the DTS arm under-reserves DTS titles 3x.
     #[test]
     fn estimate_reserve_models_dts_at_512_samples_per_frame_not_1536() {
         let t_dts = {
@@ -1792,9 +1779,9 @@ mod tests {
         assert_eq!(timing.ctts(), vec![10, 3, 16]);
     }
 
-    // tkhd.duration = secs * MOVIE_TIMESCALE, a separate 90 kHz computation
-    // from mdhd's media-timescale duration (ISO/IEC 14496-12 §8.3.2). Read
-    // straight from emitted tkhd bytes. See docs/mp4-mux.md#test-tkhd_duration_is_seconds_times_movie_timescale_for_both_media_types.
+    // tkhd.duration = secs * MOVIE_TIMESCALE, a separate 90 kHz computation from mdhd's
+    // media-timescale duration (ISO/IEC 14496-12 §8.3.2). Read straight from emitted tkhd
+    // bytes.
     #[test]
     fn tkhd_duration_is_seconds_times_movie_timescale_for_both_media_types() {
         fn tkhd_duration(trak: &[u8]) -> u64 {
@@ -1876,9 +1863,8 @@ mod tests {
         );
     }
 
-    // audio_sample_durations' per-sample ticks are ns*ts/NS; inter-sample
-    // delta is ticks(next)-ticks(prev), last duration repeated for the
-    // trailing sample. See docs/mp4-mux.md#test-audio_sample_durations_computes_exact_tick_deltas_and_repeats_the_last.
+    // audio_sample_durations' per-sample ticks are ns*ts/NS; inter-sample delta is
+    // ticks(next)-ticks(prev), last duration repeated for the trailing sample.
     #[test]
     fn audio_sample_durations_computes_exact_tick_deltas_and_repeats_the_last() {
         let samples = vec![
@@ -1909,9 +1895,8 @@ mod tests {
         );
     }
 
-    // Single-sample fallback pushes timescale/30, guarded by
-    // !samples.is_empty(); windows(2) yields nothing so it's the only source
-    // of a duration. See docs/mp4-mux.md#test-audio_sample_durations_single_sample_uses_timescale_over_30_fallback.
+    // Single-sample fallback pushes timescale/30, guarded by !samples.is_empty(); windows(2)
+    // yields nothing so it's the only source of a duration.
     #[test]
     fn audio_sample_durations_single_sample_uses_timescale_over_30_fallback() {
         let samples = vec![Sample {
@@ -1949,9 +1934,8 @@ mod tests {
         }
     }
 
-    // Fewer than 2 samples can't measure a delta: fixed 90 kHz/3003 fallback.
-    // Exactly 2 samples is the boundary, not just "fewer than 2". See
-    // docs/mp4-mux.md#test-detect_rate_needs_at_least_two_samples_not_more.
+    // Fewer than 2 samples can't measure a delta: fixed 90 kHz/3003 fallback. Exactly 2 samples
+    // is the boundary, not just "fewer than 2".
     #[test]
     fn detect_rate_needs_at_least_two_samples_not_more() {
         assert_eq!(detect_rate(&[]), (90_000, 3_003));
@@ -1985,9 +1969,8 @@ mod tests {
         );
     }
 
-    // Only positive deltas are considered (filter(|&d| d > 0)); letting zero
-    // deltas through shifts the median index and collapses fps to infinity.
-    // See docs/mp4-mux.md#test-detect_rate_filters_zero_deltas_not_just_negative_ones.
+    // Only positive deltas are considered (filter(|&d| d > 0)); letting zero deltas through
+    // shifts the median index and collapses fps to infinity.
     #[test]
     fn detect_rate_filters_zero_deltas_not_just_negative_ones() {
         let samples: Vec<Sample> = vec![0, 0, 0, 40_000_000]
@@ -2007,9 +1990,8 @@ mod tests {
         );
     }
 
-    // A rate with no nearby STD_RATES entry takes the fallback: timescale
-    // 90_000, duration = (median * 90_000) / NS. 5 fps gives an exact
-    // multiple. See docs/mp4-mux.md#test-detect_rate_fallback_duration_is_median_times_90khz_over_ns.
+    // A rate with no nearby STD_RATES entry takes the fallback: timescale 90_000, duration =
+    // (median * 90_000) / NS. 5 fps gives an exact multiple.
     #[test]
     fn detect_rate_fallback_duration_is_median_times_90khz_over_ns() {
         let samples: Vec<Sample> = (0..10)

@@ -1,11 +1,9 @@
 //! `WritebackFile` — a `File` wrapper that drives a continuous
-//! [`super::writeback::WritebackPipeline`] so large sequential writes
-//! (sweep, patch, mux) don't accumulate unbounded dirty pages before a
-//! stalling burst-flush. It implements `Write` and `Seek` so any call
-//! site that wrote to a plain `File` can swap in `WritebackFile`
-//! unchanged. Platform-specific preallocation/durable-flush primitives
-//! live in per-OS sibling modules, dispatched via the cfg-gated `mod`
-//! decls below — see docs/writeback-file.md for the full rationale.
+//! [`super::writeback::WritebackPipeline`] so large sequential writes (sweep, patch, mux) don't
+//! accumulate unbounded dirty pages before a stalling burst-flush. It implements `Write` and
+//! `Seek` so any call site that wrote to a plain `File` can swap in `WritebackFile` unchanged.
+//! Platform-specific preallocation/durable-flush primitives live in per-OS sibling modules,
+//! dispatched via the cfg-gated `mod` decls below.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -92,12 +90,10 @@ impl WritebackFile {
         Self::new(file)
     }
 
-    /// Like [`Self::create`] but pre-reserves `size_bytes` of disk space
-    /// via the platform's extent-preallocation primitive (Linux
-    /// `fallocate(KEEP_SIZE)`, macOS `F_PREALLOCATE`; no-op on platforms
-    /// without one). The reported file size is unchanged — only the
-    /// on-disk extent allocation is preallocated. See
-    /// docs/writeback-file.md for rationale.
+    /// Like [`Self::create`] but pre-reserves `size_bytes` of disk space via the platform's
+    /// extent-preallocation primitive (Linux `fallocate(KEEP_SIZE)`, macOS `F_PREALLOCATE`;
+    /// no-op on platforms without one). The reported file size is unchanged — only the on-disk
+    /// extent allocation is preallocated.
     pub fn create_with_size_hint(path: &Path, size_bytes: u64) -> io::Result<Self> {
         let file = File::create(path)?;
         platform::preallocate(&file, size_bytes);
@@ -113,14 +109,11 @@ impl WritebackFile {
         Self::new(file)
     }
 
-    /// Drain in-flight writeback then issue a full fsync, in place of
-    /// `File::sync_all`. Bounded by
-    /// [`crate::io::bounded::bounded_syscall`] on Linux/macOS (60 s), so
-    /// a wedged NFS server cannot trap the caller indefinitely;
-    /// `Ok(())` is a durability barrier. Failure is
-    /// [`E_SYNC_TIMEOUT`](crate::error::E_SYNC_TIMEOUT),
-    /// [`E_HALTED`](crate::error::E_HALTED), or
-    /// [`E_SYNC_WORKER_LOST`](crate::error::E_SYNC_WORKER_LOST); see docs/writeback-file.md.
+    /// Drain in-flight writeback then issue a full fsync, in place of `File::sync_all`. Bounded
+    /// by [`crate::io::bounded::bounded_syscall`] on Linux/macOS (60 s), so a wedged NFS server
+    /// cannot trap the caller indefinitely; `Ok(())` is a durability barrier. Failure is
+    /// [`E_SYNC_TIMEOUT`](crate::error::E_SYNC_TIMEOUT), [`E_HALTED`](crate::error::E_HALTED),
+    /// or [`E_SYNC_WORKER_LOST`](crate::error::E_SYNC_WORKER_LOST).
     pub fn sync_all(&mut self) -> io::Result<()> {
         if self.seek_count > 0 {
             tracing::debug!(
@@ -300,8 +293,8 @@ mod tests {
 
     // ── Added hardening tests ───────────────────────────────────────
 
-    // `write` must return the inner File's reported count and advance
-    // `pos` by exactly that count (not `buf.len()`). See docs/writeback-file.md.
+    // `write` must return the inner File's reported count and advance `pos` by exactly that
+    // count (not `buf.len()`).
     #[test]
     fn write_returns_byte_count_and_advances_pos() {
         let dir = tempfile::tempdir().unwrap();
@@ -318,9 +311,8 @@ mod tests {
         assert_eq!(read_back(&p), b"twelve bytes");
     }
 
-    // Redundant seek to the CURRENT position (sweep's `seek(Current(pos))`
-    // before every write) must not be treated as a boundary. See
-    // docs/writeback-file.md.
+    // Redundant seek to the CURRENT position (sweep's `seek(Current(pos))` before every write)
+    // must not be treated as a boundary.
     #[test]
     fn seek_to_current_position_is_noop_for_data() {
         let dir = tempfile::tempdir().unwrap();
@@ -340,8 +332,8 @@ mod tests {
         );
     }
 
-    // `open` (no-truncate) must preserve existing file contents, distinct
-    // from `create`'s truncating path. See docs/writeback-file.md.
+    // `open` (no-truncate) must preserve existing file contents, distinct from `create`'s
+    // truncating path.
     #[test]
     fn open_preserves_existing_contents() {
         let dir = tempfile::tempdir().unwrap();
@@ -358,8 +350,8 @@ mod tests {
         assert_eq!(read_back(&p), b"PATCHED!-CONTENT");
     }
 
-    // `new` queries stream_position() rather than hardcoding pos=0, so a
-    // non-zero starting offset stays in sync. See docs/writeback-file.md.
+    // `new` queries stream_position() rather than hardcoding pos=0, so a non-zero starting
+    // offset stays in sync.
     #[test]
     fn new_tracks_initial_position() {
         let dir = tempfile::tempdir().unwrap();
@@ -413,8 +405,8 @@ mod tests {
         assert_eq!(read_back(&p), b"01234567XY");
     }
 
-    // `create_with_size_hint`'s hint reserves extents only; it must NOT
-    // pre-grow the logical file length. See docs/writeback-file.md.
+    // `create_with_size_hint`'s hint reserves extents only; it must NOT pre-grow the logical
+    // file length.
     #[test]
     fn create_with_size_hint_does_not_inflate_logical_length() {
         let dir = tempfile::tempdir().unwrap();
@@ -443,7 +435,7 @@ mod tests {
     }
 
     // Pins the WRITEBACK_CHUNK_* constants and the MiB->byte multiply that
-    // `writeback_chunk_bytes` relies on. See docs/writeback-file.md.
+    // `writeback_chunk_bytes` relies on.
     #[test]
     fn writeback_chunk_constants_and_conversion() {
         // Default is exactly 32 MiB.
@@ -458,9 +450,8 @@ mod tests {
         );
     }
 
-    // All `writeback_chunk_bytes` env-var branches in ONE test (avoids a
-    // data race between parallel tests mutating the same env var). See
-    // docs/writeback-file.md for the branch list.
+    // All `writeback_chunk_bytes` env-var branches in ONE test (avoids a data race between
+    // parallel tests mutating the same env var).
     #[test]
     fn writeback_chunk_env_override_branches() {
         // SAFETY: this is the only test touching this env var, and it

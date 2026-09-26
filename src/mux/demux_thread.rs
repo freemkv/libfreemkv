@@ -6,8 +6,6 @@
 //! [`DemuxThread::spawn_zero_copy`] returns a handle plus a
 //! `Receiver<DemuxBatch>`; dropping the handle closes the channel and
 //! `Drop::drop` joins the worker.
-//!
-//! See docs/demux-thread.md for rationale and lifecycle details.
 
 use crate::halt::Halt;
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -52,11 +50,10 @@ impl DemuxThread {
     /// filled buffers arrive via `prefetch_rx`, get fed, then are
     /// returned to `recycle_tx` for the producer to re-fill.
     ///
-    /// `producer_shell` is an opaque handle that outlives the demux
-    /// thread and joins the upstream producer on drop. Accepts a shell from
+    /// `producer_shell` is an opaque handle that outlives the demux thread and joins the
+    /// upstream producer on drop. Accepts a shell from
     /// [`crate::sector::PrefetchedSectorSource::into_channels`] or
     /// [`crate::io::byte_prefetcher::BytePrefetcher::into_channels`].
-    /// See docs/demux-thread.md for the memcpy/alloc-elimination rationale.
     pub fn spawn_zero_copy<S: Send + 'static>(
         prefetch_rx: Receiver<std::io::Result<Vec<u8>>>,
         recycle_tx: Sender<Vec<u8>>,
@@ -498,9 +495,8 @@ mod tests {
         assert!(matches!(batches[1], DemuxBatch::Eof));
     }
 
-    // Regression: worker must detect consumer disconnect even when every batch
-    // is empty, else it spins through all remaining extents before exiting
-    // (join() blocking for minutes). See docs/demux-thread.md — empty-batch disconnect fix.
+    // Regression: worker must detect consumer disconnect even when every batch is empty, else
+    // it spins through all remaining extents before exiting (join() blocking for minutes).
     #[test]
     fn worker_exits_promptly_on_consumer_drop_during_empty_batches() {
         // Use an untracked PID so every batch the demuxer produces is empty.
@@ -554,9 +550,8 @@ mod tests {
         );
     }
 
-    // Regression: on spawn failure, channels must drop before producer_shell so
-    // the producer observes disconnection and join() doesn't hang. See
-    // docs/demux-thread.md — spawn-failure drop-order test rationale.
+    // Regression: on spawn failure, channels must drop before producer_shell so the producer
+    // observes disconnection and join() doesn't hang.
     #[test]
     fn channels_disconnected_before_producer_join_on_spawn_failure() {
         // The producer "thread" is simulated by holding prefetch_tx; verify it

@@ -1,11 +1,8 @@
-//! `BytePrefetcher` — `std::io::Read` analogue of
-//! [`crate::sector::PrefetchedSectorSource`]. Spawns a producer
-//! thread that fills a bounded pool of `Vec<u8>` chunks from the
-//! underlying reader and ships them through a channel; the consumer
-//! recycles emptied buffers back so the producer re-fills in place,
-//! for zero allocations and zero cross-thread frees in the hot loop.
-//! Works for any stream whose source is an `io::Read`, not just a
-//! `SectorSource`. See docs/byte-prefetcher.md for the full note.
+//! `BytePrefetcher` — `std::io::Read` analogue of [`crate::sector::PrefetchedSectorSource`].
+//! Spawns a producer thread that fills a bounded pool of `Vec<u8>` chunks from the underlying
+//! reader and ships them through a channel; the consumer recycles emptied buffers back so the
+//! producer re-fills in place, for zero allocations and zero cross-thread frees in the hot
+//! loop. Works for any stream whose source is an `io::Read`, not just a `SectorSource`.
 
 use crate::halt::{Halt, POLL_INTERVAL};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
@@ -207,9 +204,8 @@ impl Drop for BytePrefetcher {
 mod tests {
     use super::*;
 
-    // RECYCLE_DEPTH must be one MORE than FORWARD_DEPTH so the producer
-    // always has a spare buffer while the consumer holds the rest in
-    // flight. See docs/byte-prefetcher.md for the mutation rationale.
+    // RECYCLE_DEPTH must be one MORE than FORWARD_DEPTH so the producer always has a spare
+    // buffer while the consumer holds the rest in flight.
     #[test]
     fn recycle_depth_is_forward_depth_plus_one() {
         assert_eq!(RECYCLE_DEPTH, FORWARD_DEPTH + 1);
@@ -252,9 +248,9 @@ mod tests {
         );
     }
 
-    // CRITICAL regression: dropping the forward receiver + recycle sender
-    // after into_channels must let the producer see disconnection and
-    // exit, so dropping PrefetchShell (join) returns promptly (see docs/byte-prefetcher.md).
+    // CRITICAL regression: dropping the forward receiver + recycle sender after into_channels
+    // must let the producer see disconnection and exit, so dropping PrefetchShell (join)
+    // returns promptly.
     #[test]
     fn into_channels_drop_releases_producer() {
         within(10, || {
@@ -315,9 +311,8 @@ mod tests {
         (out, err)
     }
 
-    // CORE CONTRACT: every source byte delivered in order, exactly once.
-    // 5000-byte source, 1024 chunk size forces multiple chunks; see
-    // docs/byte-prefetcher.md for the mutation this test grounds.
+    // CORE CONTRACT: every source byte delivered in order, exactly once. 5000-byte source, 1024
+    // chunk size forces multiple chunks.
     #[test]
     fn delivers_all_bytes_in_order_across_chunks() {
         within(10, || {
@@ -329,9 +324,8 @@ mod tests {
         });
     }
 
-    // Short-read truncation: a reader returning fewer bytes than
-    // requested must not leave stale tail bytes; 10-byte source with a
-    // 4096 chunk must yield exactly 10 bytes (see docs/byte-prefetcher.md).
+    // Short-read truncation: a reader returning fewer bytes than requested must not leave stale
+    // tail bytes; 10-byte source with a 4096 chunk must yield exactly 10 bytes.
     #[test]
     fn short_read_truncates_to_actual_length() {
         within(10, || {
@@ -365,9 +359,8 @@ mod tests {
         });
     }
 
-    // Error propagation: a reader that fails mid-stream must surface the
-    // io::Error as an Err batch, not swallow it — one good chunk then
-    // the error (see docs/byte-prefetcher.md for the mutation grounded).
+    // Error propagation: a reader that fails mid-stream must surface the io::Error as an Err
+    // batch, not swallow it — one good chunk then the error.
     #[test]
     fn read_error_is_propagated_as_err_batch() {
         within(10, || {
@@ -394,9 +387,8 @@ mod tests {
         });
     }
 
-    // PANIC propagation: a reader that PANICS mid-stream must not read as a
-    // clean EOF; catch_unwind sends an explicit Err sentinel first (see
-    // docs/byte-prefetcher.md for why a bare drop of tx would be unsafe).
+    // PANIC propagation: a reader that PANICS mid-stream must not read as a clean EOF;
+    // catch_unwind sends an explicit Err sentinel first.
     #[test]
     fn read_panic_surfaces_as_err_batch_not_clean_eof() {
         within(10, || {
@@ -426,9 +418,8 @@ mod tests {
         });
     }
 
-    // Recycle-buffer reuse must not leak stale bytes between chunks of
-    // different lengths; source 8×0xAA + 3×0xBB, chunk_bytes=8 (see
-    // docs/byte-prefetcher.md for the regrow/truncate sequence detail).
+    // Recycle-buffer reuse must not leak stale bytes between chunks of different lengths;
+    // source 8×0xAA + 3×0xBB, chunk_bytes=8.
     #[test]
     fn recycled_buffer_carries_no_stale_tail() {
         within(10, || {
@@ -469,9 +460,8 @@ mod tests {
         });
     }
 
-    // Dropping BytePrefetcher directly (without into_channels) must join
-    // the producer cleanly on a finite source: EOF drops tx, Drop's join
-    // returns (see docs/byte-prefetcher.md for the mutation grounded).
+    // Dropping BytePrefetcher directly (without into_channels) must join the producer cleanly
+    // on a finite source: EOF drops tx, Drop's join returns.
     #[test]
     fn drop_finite_prefetcher_joins_cleanly() {
         within(10, || {
@@ -483,9 +473,8 @@ mod tests {
         });
     }
 
-    // Regression: dropping a BytePrefetcher directly with an ENDLESS
-    // source must not deadlock. Fix drops rx+recycle_tx BEFORE the join
-    // (see docs/byte-prefetcher.md for the old sibling-drop-order bug).
+    // Regression: dropping a BytePrefetcher directly with an ENDLESS source must not deadlock.
+    // Fix drops rx+recycle_tx BEFORE the join.
     #[test]
     fn drop_endless_prefetcher_joins_cleanly() {
         within(10, || {

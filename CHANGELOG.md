@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.7.7] — 2026-09-26
+
+### Maintenance
+
+- Replace comment-overflow documentation with concise source contracts and README instructions; enforce the shared comment policy in CI.
+
+### Fixed
+
+- Preserve PGS clear events so forced subtitles disappear and FFmpeg remuxing retains valid timestamps (#52).
+- Reassemble AAC/MPEG audio frames, recognize standard transport audio types, retain opening audio and preserve MKV decoder delay/padding.
+
+### Added
+
+- FFmpeg interoperability validation on QA, using generated fixtures and decoded-content/timing comparisons.
+
 ## [1.7.6] — 2026-09-26
 
 ### Changed

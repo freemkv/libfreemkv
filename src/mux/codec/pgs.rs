@@ -8,7 +8,6 @@
 //! later "empty" PCS (== 0) clears it. Preserve BOTH display sets: some
 //! decoders rely on the empty PCS + END even when Matroska carries a duration.
 //! Also set the visible block's `BlockDuration` to (clear_pts - display_pts).
-// See docs/pgs.md for decoder and remux interoperability.
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
@@ -41,9 +40,6 @@ const PCS_FORCED_ON_FLAG: u8 = 0x40;
 /// begins with the display PCS (segment type 0x16), so the flag is read
 /// directly from it. Returns `None` when the block is not a display PCS with
 /// a composition object (clear PCS, non-PCS segment, or truncated header).
-///
-/// See `docs/pgs.md` for why the mux uses this for forced-narrative-track
-/// detection.
 pub fn display_set_is_forced(frame_data: &[u8]) -> Option<bool> {
     if frame_data.first() != Some(&SEGMENT_PCS) {
         return None;
@@ -117,14 +113,12 @@ pub const DEMOTE_MIN_DISPLAY_SETS: u32 = 8;
 /// is the forced-narrative track its label claims and must keep that label.
 pub const DEMOTE_MIN_DISPLAY_SHARE_DIVISOR: u32 = 4;
 
-/// Whether content evidence is strong enough to CONTRADICT a vendor label that
-/// says a track is forced — i.e. to demote 1 → 0. Promotion needs no such
-/// gate; demotion requires, in order: something observed at all; the flag IN
-/// USE (`disc_uses_forced_flag`, or on this very track); and the track's
-/// SHAPE ([`DEMOTE_MIN_DISPLAY_SETS`], [`DEMOTE_MIN_DISPLAY_SHARE_DIVISOR`])
-/// matching a full dialogue track rather than a forced-narrative one.
-/// `busiest_displays` is the largest `displays` over every subtitle track
-/// judged together. See `docs/pgs.md` for the full rationale and shapes.
+/// Whether content evidence is strong enough to CONTRADICT a vendor label that says a track is
+/// forced — i.e. to demote 1 → 0. Promotion needs no such gate; demotion requires, in order:
+/// something observed at all; the flag IN USE (`disc_uses_forced_flag`, or on this very track);
+/// and the track's SHAPE ([`DEMOTE_MIN_DISPLAY_SETS`], [`DEMOTE_MIN_DISPLAY_SHARE_DIVISOR`])
+/// matching a full dialogue track rather than a forced-narrative one. `busiest_displays` is the
+/// largest `displays` over every subtitle track judged together.
 pub fn demotable(facts: ForcedFacts, disc_uses_forced_flag: bool, busiest_displays: u32) -> bool {
     if facts.displays == 0 {
         return false;
@@ -414,9 +408,9 @@ mod tests {
         assert_eq!(display_set_is_forced(&[]), None);
     }
 
-    // `observed()` distinguishes "unknown" (leave the vendor flag alone) from a
-    // settled verdict, so an unread/undecrypted track can't overwrite a correct
-    // vendor "forced" flag with "not forced". See docs/pgs.md for detail.
+    // `observed()` distinguishes "unknown" (leave the vendor flag alone) from a settled
+    // verdict, so an unread/undecrypted track can't overwrite a correct vendor "forced" flag
+    // with "not forced".
     #[test]
     fn observed_stays_false_until_a_real_display_set_is_seen() {
         let mut t = ForcedTracker::new();
@@ -854,8 +848,8 @@ mod tests {
         }
     }
 
-    // A track that mixes forced and non-forced sets needs no sibling
-    // corroboration: the flag is in use ON THIS TRACK. See docs/pgs.md.
+    // A track that mixes forced and non-forced sets needs no sibling corroboration: the flag is
+    // in use ON THIS TRACK.
     #[test]
     fn a_mixed_track_corroborates_the_flag_itself() {
         assert!(demotable(facts(108, 2), false, 137));
@@ -919,8 +913,8 @@ mod tests {
         assert_eq!(t.facts().forced_displays, u32::MAX);
     }
 
-    // A lone non-PCS segment with a PTS is emitted straight through rather
-    // than accumulated, and must still carry provenance. See docs/pgs.md.
+    // A lone non-PCS segment with a PTS is emitted straight through rather than accumulated,
+    // and must still carry provenance.
     #[test]
     fn a_lone_segment_emitted_directly_still_carries_provenance() {
         let mut parser = PgsParser::new();

@@ -60,9 +60,8 @@ pub fn walk_mkb(mkb: &[u8]) -> Vec<MkbRecord> {
         .collect()
 }
 
-// THE single MKB record-framing walker: 4-byte header (type + BE24 length)
-// then body, stopping at the `00 000000` end marker. `walk_mkb` and every
-// other MKB walk are built on this. See docs/mkb.md — record-walker consolidation.
+// THE single MKB record-framing walker: 4-byte header (type + BE24 length) then body, stopping
+// at the `00 000000` end marker. `walk_mkb` and every other MKB walk are built on this.
 pub(crate) fn mkb_records(mkb: &[u8]) -> impl Iterator<Item = (usize, u8, usize)> + '_ {
     let mut pos = 0usize;
     std::iter::from_fn(move || {
@@ -187,9 +186,8 @@ pub(crate) fn mkb_find_subdiff_records(mkb: &[u8]) -> Option<Vec<u8>> {
     find_record_body(mkb, 0x04)
 }
 
-// Find the Media Key Data Record (cvalues table) in an MKB. `[C]` §3.2.4 / §3.2.5.1.7.
-// 0x05 is the canonical cvalue table on both AACS 1.0 and 2.x; 0x07 is a
-// smaller fallback only. See docs/mkb.md — cvalue record selection rationale.
+// Find the Media Key Data Record (cvalues table) in an MKB. `[C]` §3.2.4 / §3.2.5.1.7. 0x05 is
+// the canonical cvalue table on both AACS 1.0 and 2.x; 0x07 is a smaller fallback only.
 pub(crate) fn mkb_find_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
     if let Some(body) = find_record_body(mkb, 0x05) {
         return Some(body);
@@ -436,9 +434,8 @@ mod tests {
         );
     }
 
-    // BE24 length field (all THREE bytes): a walker that dropped the high byte
-    // would mis-frame every large record (real cvalue/variant tables).
-    // See docs/mkb.md — BE24 length field test.
+    // BE24 length field (all THREE bytes): a walker that dropped the high byte would mis-frame
+    // every large record (real cvalue/variant tables).
     #[test]
     fn mkb_records_honors_the_high_byte_of_the_be24_length() {
         const TOTAL: usize = 0x0001_0004; // 65_540 — high byte 0x01
@@ -461,9 +458,8 @@ mod tests {
         );
     }
 
-    // Header-only records and the exact end marker: `rec_len == 4` is a
-    // well-formed HEADER-ONLY record, including one at the buffer end.
-    // See docs/mkb.md — header-only record test.
+    // Header-only records and the exact end marker: `rec_len == 4` is a well-formed HEADER-ONLY
+    // record, including one at the buffer end.
     #[test]
     fn mkb_records_yields_a_header_only_record_at_the_buffer_end() {
         let mut mkb = rec(REC_TYPE_AND_VERSION, &[0xAA, 0xBB]);
@@ -504,9 +500,8 @@ mod tests {
         assert_eq!(recs[1].body, vec![0x55; 16]);
     }
 
-    // `mkb_type_raw` reports the 32-bit MKBType field verbatim, including
-    // unrecognised values; all four bytes must come from the record body.
-    // See docs/mkb.md — MKBType raw-bytes test.
+    // `mkb_type_raw` reports the 32-bit MKBType field verbatim, including unrecognised values;
+    // all four bytes must come from the record body.
     #[test]
     fn mkb_type_raw_reads_all_four_body_bytes() {
         const RAW: u32 = 0xDEAD_BEEF;

@@ -185,8 +185,8 @@ mod tests {
     use super::*;
     use crate::scsi::{ScsiResult, ScsiTransport};
 
-    // Reports a bytes_transferred larger than the caller's buffer — models a
-    // drive that lies about its transfer count. See docs/identity.md.
+    // Reports a bytes_transferred larger than the caller's buffer — models a drive that lies
+    // about its transfer count.
     struct OversizedCountTransport;
 
     impl ScsiTransport for OversizedCountTransport {
@@ -262,8 +262,7 @@ mod tests {
 
     // ── New comprehensive tests ────────────────────────────────────────────────
 
-    // A short/empty INQUIRY data phase must fail the probe, not present as
-    // a blank drive. See docs/identity.md.
+    // A short/empty INQUIRY data phase must fail the probe, not present as a blank drive.
     #[test]
     fn inquiry_with_a_short_data_phase_fails_instead_of_reporting_a_blank_drive() {
         /// GOOD status, no sense, and only `n` bytes written.
@@ -376,8 +375,8 @@ mod tests {
         );
     }
 
-    // Guard is `data.len() > start`, strictly greater; len == start has no
-    // byte at that offset, so it must still yield empty. See docs/identity.md.
+    // Guard is `data.len() > start`, strictly greater; len == start has no byte at that offset,
+    // so it must still yield empty.
     #[test]
     fn ascii_field_boundary_len_equals_start_is_empty() {
         let buf = vec![0u8; 8];
@@ -394,9 +393,8 @@ mod tests {
         assert_eq!(ascii_field(&buf, 8, 16), "X");
     }
 
-    // `Display` renders the four trimmed identity fields space-separated —
-    // the human-readable counterpart of `match_key`'s pipe-separated form.
-    // See docs/identity.md.
+    // `Display` renders the four trimmed identity fields space-separated — the human-readable
+    // counterpart of `match_key`'s pipe-separated form.
     #[test]
     fn display_formats_trimmed_fields_space_separated() {
         let mut inquiry = vec![0u8; 96];
@@ -408,9 +406,9 @@ mod tests {
         assert_eq!(id.to_string(), "PIONEER BD-RW   BDR-S09 1.34 16/04/");
     }
 
-    // Transport whose GET CONFIGURATION responses report an exact,
-    // caller-chosen bytes_transferred for each GC feature, pinning the
-    // `> 12` boundary guards. INQUIRY always succeeds. See docs/identity.md.
+    // Transport whose GET CONFIGURATION responses report an exact, caller-chosen
+    // bytes_transferred for each GC feature, pinning the `> 12` boundary guards. INQUIRY always
+    // succeeds.
     struct FixedGcCountTransport {
         firmware_bytes: usize,
         serial_bytes: usize,
@@ -441,9 +439,8 @@ mod tests {
         }
     }
 
-    // `end > 12` in the firmware-date branch is strict: count == 12 covers
-    // bytes 0..12, none of which is the date, so it must report empty.
-    // See docs/identity.md.
+    // `end > 12` in the firmware-date branch is strict: count == 12 covers bytes 0..12, none of
+    // which is the date, so it must report empty.
     #[test]
     fn from_drive_firmware_date_boundary_exactly_12_is_empty() {
         let mut t = FixedGcCountTransport {

@@ -1,11 +1,10 @@
 //! Structured scan diagnostics — the `--log-level 3` self-diagnosing dump.
 //!
-//! Emits one terse line per row (title, cell, stream, decision) under the
-//! `tracing` target `freemkv::diag`, routed to `log.txt` at `--log-level 3`.
-//! Every line is prefixed `tag=` (`disc`, `title`, `dvd.cell`, `dvd.vattr`,
-//! `dvd.aattr`, `bd.clip`, `bd.mark`, `aacs`, `stream`, `decision`) so a log
-//! scraper can filter, and raw bytes are shown as `0xNN` beside their decode.
-//! This module only reads already-parsed scan state; see docs/diag.md.
+//! Emits one terse line per row (title, cell, stream, decision) under the `tracing` target
+//! `freemkv::diag`, routed to `log.txt` at `--log-level 3`. Every line is prefixed `tag=`
+//! (`disc`, `title`, `dvd.cell`, `dvd.vattr`, `dvd.aattr`, `bd.clip`, `bd.mark`, `aacs`,
+//! `stream`, `decision`) so a log scraper can filter, and raw bytes are shown as `0xNN` beside
+//! their decode. This module only reads already-parsed scan state.
 
 use crate::disc::{ColorSpace, Disc, DiscTitle, FrameRate, HdrFormat, Resolution, Stream};
 use crate::ifo::{CellCategory, DvdTitle};
@@ -198,12 +197,11 @@ pub fn dump_dvd_attrs(ts: &crate::ifo::DvdTitleSet) {
     }
 }
 
-/// Emit the ACTUAL per-physical-sub-stream AC-3 channel counts read off the VOB
-/// during the mux-time sub-stream probe. This is the ground truth the IFO
-/// nibble is compared against: each row is `sub_id=0x8x channels=N` for a
-/// physical `private_stream_1` AC-3 sub-stream whose first frame was decoded.
-/// An empty probe (scrambled / unreadable / short VOB) logs a single
-/// `probed=0` line so the absence is explicit in a bug log. See docs/diag.md.
+/// Emit the ACTUAL per-physical-sub-stream AC-3 channel counts read off the VOB during the
+/// mux-time sub-stream probe. This is the ground truth the IFO nibble is compared against: each
+/// row is `sub_id=0x8x channels=N` for a physical `private_stream_1` AC-3 sub-stream whose
+/// first frame was decoded. An empty probe (scrambled / unreadable / short VOB) logs a single
+/// `probed=0` line so the absence is explicit in a bug log.
 pub fn dump_dvd_substream_probe(title_id: u16, probed: &std::collections::BTreeMap<u8, u8>) {
     if !tracing::enabled!(target: DIAG, tracing::Level::DEBUG) {
         return;
@@ -271,9 +269,8 @@ fn frame_record(track_idx: usize, pts_ns: i64, keyframe: bool, data: &[u8]) -> V
     rec
 }
 
-// Emits the MKV `TrackEntry` elements the muxer is about to write for one
-// track (FlagInterlaced, FieldOrder, DefaultDuration, Display dims,
-// codecPrivate hex). See docs/diag.md. No-op unless the diag target is on.
+// Emits the MKV `TrackEntry` elements the muxer is about to write for one track
+// (FlagInterlaced, FieldOrder, DefaultDuration, Display dims, codecPrivate hex).
 pub(crate) fn dump_mkv_track(track_number: u64, track: &crate::mux::mkv::MkvTrack) {
     if !diag_enabled() {
         return;
@@ -466,8 +463,7 @@ pub fn dump_disc(disc: &Disc) {
 }
 
 // The `reason=` token on the main-feature decision row. DERIVED from
-// `Disc::CANONICAL_TITLE_ORDER_KEYS`, never restated here — see docs/diag.md
-// for why (a prior hand-written copy drifted from the real comparator keys).
+// `Disc::CANONICAL_TITLE_ORDER_KEYS`, never restated here.
 fn main_feature_reason() -> String {
     let keys: Vec<&str> = Disc::MAIN_FEATURE_ORDER_KEYS
         .iter()
@@ -607,9 +603,8 @@ mod tests {
     // deleted in favour of the canonical accessors.
     use crate::disc::{AudioChannels, SampleRate};
 
-    // The main-feature decision row must NAME the comparator's real sort keys,
-    // not a restated (driftable) copy — see docs/diag.md. Asserts the
-    // behavioural half first, against the comparator itself with literals.
+    // The main-feature decision row must NAME the comparator's real sort keys, not a restated
+    // (driftable) copy.
     #[test]
     fn main_feature_reason_names_the_comparators_real_keys() {
         use crate::disc::{Clip, Disc, DiscTitle};

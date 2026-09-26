@@ -18,7 +18,7 @@ DVDs (CSS) decrypt out of the box. Blu-ray and UHD (AACS) require disc-specific 
 
 Multi-lingual by design — the library outputs structured data and numeric error codes, never English text. Build any UI or localization on top.
 
-**[Source & API](https://github.com/freemkv/libfreemkv)** · **[Technical Docs](docs/)** · **[Changelog](CHANGELOG.md)**
+**[Source & API](https://github.com/freemkv/libfreemkv)** · **[Changelog](CHANGELOG.md)**
 
 Part of the [freemkv](https://github.com/freemkv) project.
 
@@ -63,15 +63,14 @@ output.finish()?;
 
 ### Multi-pass recovery rip
 
-Recovery moved OUT of this crate in 1.6.0. The sweep/patch strategy, the
-ddrescue mapfile, damage classification and the multipass loop now live in the
+The sweep/patch strategy, ddrescue mapfile, damage classification and
+multipass loop live in the
 `freemkv-engine` crate as `freemkv_engine::recovery::{copy, sweep, patch}`.
 
 libfreemkv keeps the layers underneath: the raw single-shot read
 (`Drive::read`) and the SCSI-fact translation (`SenseFamily`) that the engine's
 strategy is built on. The dependency runs engine → libfreemkv, so this crate
-cannot call into it; front-ends get recovery from the engine directly. See
-[`docs/rip-recovery.md`](docs/rip-recovery.md) for what stayed here.
+cannot call into it; front-ends get recovery from the engine directly.
 
 ## What It Does
 
@@ -131,7 +130,8 @@ Streams                — unified PES pipeline
   └── NullStream       — discard sink
 ```
 
-See [docs/](docs/) for detailed technical documentation on each module.
+Build API documentation with `cargo doc --no-deps --open`. The public
+[FVI format specification](FVI_FORMAT.md) describes exported video indexes.
 
 ## Error Codes
 
@@ -187,3 +187,27 @@ The minimum supported Rust version (MSRV) is **1.88**, declared as
 ## License
 
 MIT
+
+## Validation
+
+Run `cargo test --tests`, `cargo fmt --check`, and
+`cargo clippy --all-targets -- -D warnings` before pushing.
+
+The FFmpeg interoperability workflow runs on `qa` pushes or manual dispatch.
+With FFmpeg/ffprobe installed, run:
+
+```sh
+cargo test --release --lib ffmpeg_ -- --ignored --nocapture
+```
+
+It generates synthetic PGS/video/audio fixtures and checks decoded content,
+timing and decoder warnings. Set `FREEMKV_FFMPEG_ARTIFACT_DIR` to retain local
+fixtures; CI retains fixtures and logs for 14 days. Real-disc QA is separate.
+
+FFmpeg runs as an installed executable; we do not link or distribute its
+binaries. This use is permitted by its software licenses; codec patent rights
+are separate. See [FFmpeg legal guidance](https://ffmpeg.org/legal.html).
+
+MKV remuxing preserves decoder delay and frame padding locally. Network/stdio
+PES serialization does not carry that metadata. Direct `PesFrame` constructors
+must set `discard_padding_ns` to zero unless preserving trimming.

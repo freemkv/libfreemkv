@@ -1,13 +1,11 @@
 //! macOS SCSI transport: IOKit SCSITaskDeviceInterface with exclusive access.
 //!
-//! Single dispatch path: **all** CDBs go through
-//! `SCSITaskDeviceInterface::ExecuteTaskSync`, 1:1 with the Linux SG_IO
-//! backend. The C shim (`macos_shim.c`) unmounts, opens, and obtains
-//! exclusive access before dispatch; see `docs/scsi-macos.md` for the
-//! full open sequence.
+//! Single dispatch path: **all** CDBs go through `SCSITaskDeviceInterface::ExecuteTaskSync`,
+//! 1:1 with the Linux SG_IO backend. The C shim (`macos_shim.c`) unmounts, opens, and obtains
+//! exclusive access before dispatch.
 //!
-//! Drive enumeration and the media-presence probe use the IOKit registry
-//! directly and never take exclusive access; see `docs/scsi-macos.md`.
+//! Drive enumeration and the media-presence probe use the IOKit registry directly and never
+//! take exclusive access.
 
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
@@ -21,9 +19,8 @@ const K_SENSE_DATA_SIZE: usize = 32;
 /// shim so a pathological >255-byte slice can't wrap a `u8`.
 const K_MAX_CDB_SIZE: usize = 16;
 
-// The C shim uses a single global IOKit handle, so only one
-// MacScsiTransport may exist at a time — a second open() would race the
-// shared handle with the first drop(). See docs/scsi-macos.md.
+// The C shim uses a single global IOKit handle, so only one MacScsiTransport may exist at a
+// time — a second open() would race the shared handle with the first drop().
 static OPEN: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
@@ -74,9 +71,8 @@ fn device_path_for_selector(selector: &str) -> String {
     }
 }
 
-// Maps a shim_open_exclusive failure sentinel (negative rc, not an
-// IOReturn) to its typed Error variant, pulled out standalone so the
-// mapping can be unit-tested. See docs/scsi-macos.md.
+// Maps a shim_open_exclusive failure sentinel (negative rc, not an IOReturn) to its typed Error
+// variant, pulled out standalone so the mapping can be unit-tested.
 fn map_shim_open_error(rc: i32, path: String) -> Error {
     match rc {
         // -2/-3/-4: IOCreatePlugInInterfaceForService /
@@ -257,9 +253,9 @@ fn cstr_to_str(bytes: &[u8]) -> &str {
     std::str::from_utf8(&bytes[..end]).unwrap_or("")
 }
 
-// Media-presence probe via the IOKit registry only — no exclusive access,
-// no unmount, no SCSI command (open() force-unmounts the disc; a probe
-// documented as side-effect-free must never do that). See docs/scsi-macos.md.
+// Media-presence probe via the IOKit registry only — no exclusive access, no unmount, no SCSI
+// command (open() force-unmounts the disc; a probe documented as side-effect-free must never do
+// that).
 pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
     let bsd_name = bsd_name_of(path)?;
     let mut bsd_c = bsd_name.as_bytes().to_vec();
@@ -381,9 +377,8 @@ mod tests {
         assert_eq!(cstr_to_str(&bytes), "");
     }
 
-    // Regression test: drive_has_disc used to open a FULL exclusive
-    // transport (force-unmount + 500ms sleep) on every poll tick. Checks
-    // it now answers Ok(false) fast with no lock held. See docs/scsi-macos.md.
+    // Regression test: drive_has_disc used to open a FULL exclusive transport (force-unmount +
+    // 500ms sleep) on every poll tick. Checks it now answers Ok(false) fast with no lock held.
     #[test]
     fn presence_probe_does_not_open_a_transport() {
         let path = Path::new("/dev/freemkv-no-such-device");

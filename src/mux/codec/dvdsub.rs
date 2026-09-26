@@ -8,7 +8,6 @@
 //! subtitles aren't split/garbled, inheriting the head PES's PTS.
 //!
 //! For MKV: codec ID "S_VOBSUB". All frames are keyframes.
-// See docs/dvdsub-mod.md — why PTS presence, not `pending`, is the SPU boundary.
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
@@ -146,7 +145,6 @@ impl CodecParser for DvdSubParser {
 // ── YCbCr → RGB conversion and palette formatting ─────────────────────────
 
 // Byte-2-as-Cb is invisible on achromatic (Cb=Cr=128) palette entries.
-// See docs/dvdsub-mod.md for the full derivation.
 /// Convert a single YCbCr color to RGB, clamping to [0, 255].
 ///
 /// Input: `[padding, Y, Cr, Cb]` (as stored in DVD IFO PGC data). Note the
@@ -155,8 +153,7 @@ impl CodecParser for DvdSubParser {
 ///
 /// Returns `[R, G, B]`.
 ///
-/// Uses full-range (JFIF) BT.601 coefficients, matching the VobSub `.idx`
-/// on-disk convention (see docs/dvdsub-mod.md for why not studio-swing).
+/// Uses full-range (JFIF) BT.601 coefficients, matching the VobSub `.idx` on-disk convention.
 pub fn ycbcr_to_rgb(color: &[u8; 4]) -> [u8; 3] {
     let y = color[1] as f64;
     let cr = color[2] as f64;
@@ -443,9 +440,8 @@ mod tests {
         assert!(b < 30, "B should be low for red, got {}", b);
     }
 
-    // Real on-disc red entry (byte 2=Cr, byte 3=Cb); catches a chroma-byte
-    // swap. `_white`/`_black` can't catch this (Cb=Cr=128 is a no-op swap).
-    // See docs/dvdsub-mod.md for the full derivation.
+    // Real on-disc red entry (byte 2=Cr, byte 3=Cb); catches a chroma-byte swap.
+    // `_white`/`_black` can't catch this (Cb=Cr=128 is a no-op swap).
     #[test]
     fn ycbcr_to_rgb_reads_byte2_as_cr_and_byte3_as_cb() {
         // On-disc [pad, Y, Cr, Cb] for saturated red.

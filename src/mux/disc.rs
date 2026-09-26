@@ -373,9 +373,8 @@ impl DiscStream {
         self.reader.set_keys(crate::decrypt::DecryptKeys::None);
     }
 
-    // Commit a successful read_sectors, zero-filling+accounting a short read
-    // under skip_errors (never a silent hole) instead of trusting the count.
-    // See docs/mux-disc.md — commit_read.
+    // Commit a successful read_sectors, zero-filling+accounting a short read under skip_errors
+    // (never a silent hole) instead of trusting the count.
     fn commit_read(&mut self, lba: u32, got: usize, bytes: usize) -> io::Result<()> {
         if got < bytes {
             if !self.skip_errors {
@@ -1150,9 +1149,8 @@ mod tests {
         );
     }
 
-    // A malformed disc can declare thousands of zero-sector extents; the old
-    // self-recursive skip overflowed the stack (fatal, unlike iterative EOF).
-    // See docs/mux-disc.md — a_long_run_of_empty_extents_does_not_recurse_per_extent.
+    // A malformed disc can declare thousands of zero-sector extents; the old self-recursive
+    // skip overflowed the stack (fatal, unlike iterative EOF).
     #[test]
     fn a_long_run_of_empty_extents_does_not_recurse_per_extent() {
         let title = DiscTitle {
@@ -1737,9 +1735,8 @@ mod tests {
         );
     }
 
-    // REGRESSION (round-4 audit): an ordinary MEDIUM ERROR bad sector must
-    // keep its identity crossing the prefetch channel, not become a fabricated
-    // transport failure. See docs/mux-disc.md — bad_sector_keeps_its_identity_across_the_prefetch_channel.
+    // REGRESSION (round-4 audit): an ordinary MEDIUM ERROR bad sector must keep its identity
+    // crossing the prefetch channel, not become a fabricated transport failure.
     #[test]
     fn bad_sector_keeps_its_identity_across_the_prefetch_channel() {
         const COUNT: u32 = 9;
@@ -1782,9 +1779,8 @@ mod tests {
         );
     }
 
-    // The prefetch producer dies permanently on its first read error; driving
-    // fill_extents to exhaustion after that must NOT look like a completed
-    // pass. See docs/mux-disc.md — dead_prefetch_producer_does_not_silently_zero_fill_the_title.
+    // The prefetch producer dies permanently on its first read error; driving fill_extents to
+    // exhaustion after that must NOT look like a completed pass.
     #[test]
     fn dead_prefetch_producer_does_not_silently_zero_fill_the_title() {
         const COUNT: u32 = 30;
@@ -2138,9 +2134,8 @@ mod tests {
             );
         }
 
-        // Frames the B1 resync gate discards must reach errors(), including
-        // after the gap resolves (ResyncGate::dropped zeroes on resync). See
-        // docs/mux-disc.md — errors_reports_frames_the_resync_gate_dropped_after_the_gap_resolves.
+        // Frames the B1 resync gate discards must reach errors(), including after the gap
+        // resolves (ResyncGate::dropped zeroes on resync).
         #[test]
         fn errors_reports_frames_the_resync_gate_dropped_after_the_gap_resolves() {
             let mut s = short_read_stream(true);

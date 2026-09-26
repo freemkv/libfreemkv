@@ -16,8 +16,8 @@ const NAL_SPS: u8 = 7;
 const NAL_PPS: u8 = 8;
 const NAL_AUD: u8 = 9;
 
-// Map an H.264 slice_type (§7.4.3, Table 7-6) to a coding type via
-// slice_type % 5 (values 5..=9 repeat 0..=4). See docs/h264.md — slice-type mapping.
+// Map an H.264 slice_type (§7.4.3, Table 7-6) to a coding type via slice_type % 5 (values 5..=9
+// repeat 0..=4).
 fn h264_slice_coding_type(slice_type: u32) -> Option<CodingType> {
     match slice_type {
         0..=9 => Some(match slice_type % 5 {
@@ -115,15 +115,13 @@ thread_local! {
 }
 
 // Copy the leading bytes of an EBSP with emulation-prevention bytes removed.
-// See docs/h264.md — unescape_ebsp_prefix.
 fn unescape_ebsp_prefix(ebsp: &[u8]) -> Vec<u8> {
     const PREFIX_OCTETS: usize = 16;
     unescape_ebsp(ebsp, PREFIX_OCTETS)
 }
 
-// Copy `ebsp` with emulation-prevention bytes removed (cumulative zero-run
-// rule, ITU-T H.264 §7.3.1), stopping after `max_octets` output bytes.
-// See docs/h264.md — unescape_ebsp.
+// Copy `ebsp` with emulation-prevention bytes removed (cumulative zero-run rule, ITU-T H.264
+// §7.3.1), stopping after `max_octets` output bytes.
 fn unescape_ebsp(ebsp: &[u8], max_octets: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(max_octets.min(ebsp.len()));
     let mut zeros = 0usize;
@@ -153,9 +151,9 @@ fn push_length_prefixed(out: &mut Vec<u8>, nal: &[u8]) {
     out.extend_from_slice(nal);
 }
 
-// Handle an SPS/PPS NAL: strip/emit decision is against the ACTIVE set `cur`,
-// not codecPrivate `first`, so a switch back to the first-seen body is still
-// told to the decoder. Returns true when emitted in-band. See docs/h264.md.
+// Handle an SPS/PPS NAL: strip/emit decision is against the ACTIVE set `cur`, not codecPrivate
+// `first`, so a switch back to the first-seen body is still told to the decoder. Returns true
+// when emitted in-band.
 fn handle_param_set(
     first: &mut Option<Vec<u8>>,
     cur: &mut Option<Vec<u8>>,
@@ -177,9 +175,9 @@ fn handle_param_set(
     true
 }
 
-// Append the active parameter set `cur` to `prefix` (length-prefixed) so every
-// keyframe is self-contained. Unconditional (not only on change) so a decoder
-// that silently dropped a param set is self-healing. See docs/h264.md.
+// Append the active parameter set `cur` to `prefix` (length-prefixed) so every keyframe is
+// self-contained. Unconditional (not only on change) so a decoder that silently dropped a param
+// set is self-healing.
 fn reassert_active(prefix: &mut Vec<u8>, cur: &Option<Vec<u8>>, emitted: bool) {
     if emitted {
         return;
@@ -395,9 +393,8 @@ impl CodecParser for H264Parser {
     }
 }
 
-// Parse (chroma_format_idc, bit_depth_luma_minus8, bit_depth_chroma_minus8)
-// from a High-Profile SPS NAL (ITU-T H.264 §7.3.2.1.1). Returns None if the
-// SPS is too short/malformed. See docs/h264.md — parse_sps_high_profile_ext.
+// Parse (chroma_format_idc, bit_depth_luma_minus8, bit_depth_chroma_minus8) from a High-Profile
+// SPS NAL (ITU-T H.264 §7.3.2.1.1). Returns None if the SPS is too short/malformed.
 fn parse_sps_high_profile_ext(sps: &[u8]) -> Option<(u8, u8, u8)> {
     // Strip emulation-prevention bytes (00 00 03 xx -> 00 00 xx), skipping the
     // NAL header. Shares `unescape_ebsp` with the slice-header prefix reader —
@@ -572,9 +569,8 @@ mod tests {
         }
     }
 
-    // Open-GOP resync fix: a non-IDR intra access unit must be flagged a
-    // keyframe so the B1 resync gate can disarm on a BD open-GOP tail.
-    // See docs/h264.md — open_gop_intra_access_unit_is_a_keyframe.
+    // Open-GOP resync fix: a non-IDR intra access unit must be flagged a keyframe so the B1
+    // resync gate can disarm on a BD open-GOP tail.
     #[test]
     fn open_gop_intra_access_unit_is_a_keyframe() {
         // Annex B AU: one non-IDR coded slice (NAL type 1, nal_ref_idc 3 -> 0x61)
@@ -658,9 +654,8 @@ mod tests {
         );
     }
 
-    // The slice-header parse must remove emulation-prevention bytes first
-    // (ISO/IEC 14496-10 §7.3.1/§7.4.1) before decoding ue(v) fields.
-    // See docs/h264.md — slice_header_parse_removes_emulation_prevention_bytes.
+    // The slice-header parse must remove emulation-prevention bytes first (ISO/IEC 14496-10
+    // §7.3.1/§7.4.1) before decoding ue(v) fields.
     #[test]
     fn slice_header_parse_removes_emulation_prevention_bytes() {
         // first_mb_in_slice=65535 needs 16 zero bits (ue(v)); combined with
@@ -709,9 +704,8 @@ mod tests {
         );
     }
 
-    // Regression: `parse_sps_high_profile_ext` used to re-derive the
-    // emulation-prevention rule with its own (disagreeing) window scanner.
-    // Pin the shared `unescape_ebsp` behaviour. See docs/h264.md.
+    // Regression: `parse_sps_high_profile_ext` used to re-derive the emulation-prevention rule
+    // with its own (disagreeing) window scanner. Pin the shared `unescape_ebsp` behaviour.
     #[test]
     fn unescape_ebsp_drops_escape_after_a_run_of_three_zeros() {
         assert_eq!(
@@ -721,9 +715,8 @@ mod tests {
         );
     }
 
-    // --- keyframe parameter-set re-assert: exact bytes + no whole-frame copy ---
-    // Must produce EXACTLY: active SPS, active PPS, then the AU's own NALs,
-    // each length-prefixed. See docs/h264.md — keyframe_param_reassert_emits_exact_bytes.
+    // --- keyframe parameter-set re-assert: exact bytes + no whole-frame copy --- Must produce
+    // EXACTLY: active SPS, active PPS, then the AU's own NALs, each length-prefixed.
     #[test]
     fn keyframe_param_reassert_emits_exact_bytes() {
         fn annexb(nal: &[u8]) -> Vec<u8> {
@@ -767,9 +760,9 @@ mod tests {
         );
     }
 
-    // MEASURED: the keyframe param-set re-assert must be spliced in place,
-    // not built as a fresh full-size buffer (avoids a whole-frame realloc+copy
-    // per keyframe). Mirrors HEVC's test of the same name. See docs/h264.md.
+    // MEASURED: the keyframe param-set re-assert must be spliced in place, not built as a fresh
+    // full-size buffer (avoids a whole-frame realloc+copy per keyframe). Mirrors HEVC's test of
+    // the same name.
     #[test]
     fn keyframe_param_reassert_does_not_reallocate_the_frame() {
         fn annexb(nal_header: u8, body: &[u8]) -> Vec<u8> {
@@ -1870,9 +1863,8 @@ mod tests {
         );
     }
 
-    // ISO 14496-15 §5.3.3.1.2 regression: profile_idc=244 (High 4:4:4
-    // Predictive) also mandates the chroma/bit-depth extension; it was
-    // missing from HIGH_PROFILES. See docs/h264.md — avcc_profile_244.
+    // ISO 14496-15 §5.3.3.1.2 regression: profile_idc=244 (High 4:4:4 Predictive) also mandates
+    // the chroma/bit-depth extension; it was missing from HIGH_PROFILES.
     #[test]
     fn avcc_profile_244_appends_extension_bytes() {
         // profile_idc=244, chroma_format_idc=3 (4:4:4), depths both 4 (12-bit).

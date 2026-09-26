@@ -6,8 +6,6 @@
 //! applies AACS / CSS in-place. This module is the focused per-file producer:
 //! tree walk, host-path mapping + sanitization, per-VTS CSS key grouping,
 //! decrypt-and-stream-to-disk, sparse-gap handling, and truncate + rename.
-// See docs/extract.md — relation to the sweep/patch ISO recovery passes and
-// the numeric-only error code policy.
 
 use super::Disc;
 use crate::decrypt::DecryptKeys;
@@ -107,8 +105,6 @@ struct PlannedFile {
 }
 
 impl Disc {
-    // See docs/extract.md — reader/extent-read ordering, per-VTS CSS key
-    // resolution, and undecryptable-unit loss accounting.
     /// Extract this disc's **decrypted file tree** to `dest`. 1-shot,
     /// decrypt-only, no recovery loop.
     ///
@@ -271,9 +267,8 @@ impl Disc {
         Ok(result)
     }
 
-    // Resolves the CSS title key for a VTS group from its scrambled title-VOB
-    // sectors. MUST surface a failed crack as a hard error, never silently
-    // fall back to the disc-wide key — see docs/extract.md for why.
+    // Resolves the CSS title key for a VTS group from its scrambled title-VOB sectors. MUST
+    // surface a failed crack as a hard error, never silently fall back to the disc-wide key.
     fn resolve_vts_key<S: SectorSource>(
         &self,
         vts: &str,
@@ -328,9 +323,8 @@ impl Disc {
     }
 }
 
-// A borrowing `SectorSource` wrapper: lets the decrypting decorator "own" an
-// inner source for its lifetime while the caller keeps the underlying
-// `&mut dyn SectorSource` — see docs/extract.md for why (vs. the mux highway).
+// A borrowing `SectorSource` wrapper: lets the decrypting decorator "own" an inner source for
+// its lifetime while the caller keeps the underlying `&mut dyn SectorSource`
 struct Borrowed<'a>(&'a mut dyn SectorSource);
 
 impl SectorSource for Borrowed<'_> {
@@ -618,9 +612,8 @@ fn extract_one_file<S: SectorSource>(
     Ok((fr, false))
 }
 
-// Sizes the next FILE-ANCHORED content read in whole AACS units, capped at
-// READ_BATCH_SECTORS, rounded DOWN to 3-sector units unless it's the
-// extent's final tail — see docs/extract.md for the trailing-partial rule.
+// Sizes the next FILE-ANCHORED content read in whole AACS units, capped at READ_BATCH_SECTORS,
+// rounded DOWN to 3-sector units unless it's the extent's final tail.
 fn whole_unit_batch(remaining: u32) -> u32 {
     let mut batch = remaining.min(READ_BATCH_SECTORS);
     if batch >= AACS_UNIT_SECTORS && batch < remaining {
@@ -753,9 +746,8 @@ fn available_space(dir: &Path) -> Option<u64> {
     Some(avail)
 }
 
-// Windows has no `statvfs`; queries free space via `GetDiskFreeSpaceExW`
-// (declared directly against kernel32, matching `scsi::windows`) so the
-// free-space gate still runs — see docs/extract.md for why this matters.
+// Windows has no `statvfs`; queries free space via `GetDiskFreeSpaceExW` (declared directly
+// against kernel32, matching `scsi::windows`) so the free-space gate still runs.
 #[cfg(windows)]
 fn available_space(dir: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
@@ -805,9 +797,8 @@ fn dir_is_non_empty(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-// Sanitizes ONE disc-path component: rejects `..`, host-illegal chars,
-// control bytes; strips trailing dot/space (Windows); substitutes (not
-// rejects) a Windows reserved device name — see docs/extract.md for why.
+// Sanitizes ONE disc-path component: rejects `..`, host-illegal chars, control bytes; strips
+// trailing dot/space (Windows); substitutes (not rejects) a Windows reserved device name.
 fn sanitize_component(name: &str) -> Result<String> {
     if name == ".." || name == "." {
         return Err(Error::DirNameCollision {
@@ -1627,9 +1618,8 @@ mod tests {
         }
     }
 
-    // A file's in-flight `.partial` path shares the host namespace with
-    // another planned file's FINAL path (disc carries both `X` and
-    // `X.partial`) — see docs/extract.md for why this must be an error.
+    // A file's in-flight `.partial` path shares the host namespace with another planned file's
+    // FINAL path (disc carries both `X` and `X.partial`).
     #[test]
     fn a_files_partial_path_colliding_with_another_files_final_name_is_an_error() {
         let root = DirSpec {
@@ -1707,9 +1697,8 @@ mod tests {
         assert!(!is_title_vob("VTS_01_1.IFO"));
     }
 
-    // Regression (rc.6 audit, finding #449): a MULTI-EXTENT AACS file must
-    // re-anchor the unit-alignment base PER extent, not once at the first —
-    // see docs/extract.md for the alignment arithmetic this guards against.
+    // Regression (rc.6 audit, finding #449): a MULTI-EXTENT AACS file must re-anchor the
+    // unit-alignment base PER extent, not once at the first.
     #[test]
     fn multi_extent_aacs_anchors_unit_base_per_extent() {
         const SECTORS_EACH: u32 = 3; // one AACS unit per extent
@@ -1774,9 +1763,8 @@ mod tests {
         );
     }
 
-    // An ECMA-167 4/14.14.1.1 type-1 extent is ALLOCATED BUT NOT RECORDED and
-    // must be zero-filled, not read from media — see docs/extract.md. The
-    // hole is filled with a non-zero pattern so the two paths differ by CONTENT.
+    // An ECMA-167 4/14.14.1.1 type-1 extent is ALLOCATED BUT NOT RECORDED and must be
+    // zero-filled, not read from media.
     #[test]
     fn extract_tree_zero_fills_an_unrecorded_extent_instead_of_reading_it() {
         const SECTORS_EACH: u32 = 1;
@@ -1823,8 +1811,7 @@ mod tests {
     }
 
     // Focused alignment-computation check underpinning the per-extent fix
-    // (`aacs::content::is_unit_aligned`'s exact arithmetic) — see
-    // docs/extract.md for the full per-extent-vs-first-extent-base reasoning.
+    // (`aacs::content::is_unit_aligned`'s exact arithmetic).
     #[test]
     fn per_extent_base_is_aligned_first_extent_base_is_not() {
         use crate::aacs::content::is_unit_aligned;
@@ -1940,9 +1927,8 @@ mod tests {
         assert!(matches!(err, Error::DirInsufficientSpace { .. }));
     }
 
-    // Regression: the per-VTS key crack in `resolve_vts_key` must gather ONLY
-    // this VTS's own title-VOB extents, not a sibling VTS's — see
-    // docs/extract.md for the group-filter loosening this guards against.
+    // Regression: the per-VTS key crack in `resolve_vts_key` must gather ONLY this VTS's own
+    // title-VOB extents, not a sibling VTS's.
     #[test]
     fn css_two_vts_groups_do_not_cross_contaminate_keys() {
         fn scrambled_vob(title_key: [u8; 5], marker: u8) -> (Vec<u8>, Vec<u8>) {
@@ -2017,9 +2003,8 @@ mod tests {
         assert!(res.complete);
     }
 
-    // A VTS that IS scrambled but whose key could not be recovered must FAIL,
-    // not borrow another VTS's key (`CrackOutcome`, not `Option`) — see
-    // docs/extract.md. VTS_01 here is crackable, VTS_02 genuinely fails.
+    // A VTS that IS scrambled but whose key could not be recovered must FAIL, not borrow
+    // another VTS's key (`CrackOutcome`, not `Option`).
     #[test]
     fn a_scrambled_vts_that_cannot_be_cracked_fails_instead_of_borrowing_a_key() {
         let key_1 = [0x10u8, 0x20, 0x30, 0x40, 0x50];
@@ -2138,9 +2123,9 @@ mod tests {
         );
     }
 
-    // Regression: within ONE extent, "sectors remaining IN THIS EXTENT" must
-    // be `sectors - sector_off`, not `sectors + sector_off` — the latter lets
-    // a later batch read PAST the extent into unrelated content. See docs/extract.md.
+    // Regression: within ONE extent, "sectors remaining IN THIS EXTENT" must be `sectors -
+    // sector_off`, not `sectors + sector_off` — the latter lets a later batch read PAST the
+    // extent into unrelated content.
     #[test]
     fn extent_second_batch_stays_within_its_own_bounds() {
         // Extent A: 1600 sectors of pattern 'A' -- just over

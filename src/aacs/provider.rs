@@ -7,7 +7,6 @@
 //! in provider-array order.
 //!
 //! Default impls return empty/`None`; calls may block, so cache per-disc.
-//! See docs/key-provider.md for rationale and `host_certs`'s caveat.
 
 use super::types::{DeviceKey, DiscEntry, HostCert};
 
@@ -61,9 +60,8 @@ pub trait KeyProvider: Send + Sync {
     }
 }
 
-// Resolver-side helper that aggregates KeyProvider material across a
-// provider array (union-and-dedup for bulk methods, first-hit for
-// disc-keyed lookups). See docs/key-provider.md for the policy detail.
+// Resolver-side helper that aggregates KeyProvider material across a provider array
+// (union-and-dedup for bulk methods, first-hit for disc-keyed lookups).
 pub(crate) struct Providers<'a>(pub &'a [&'a dyn KeyProvider]);
 
 impl Providers<'_> {
@@ -112,9 +110,9 @@ impl Providers<'_> {
     }
 }
 
-// Bridges a single caller-supplied key's raw material into a KeyProvider,
-// for `Disc::decrypt_with`. Fills only its own level (DK/PK/MK/VUK) so the
-// resolver runs the matching path; see docs/key-provider.md for details.
+// Bridges a single caller-supplied key's raw material into a KeyProvider, for
+// `Disc::decrypt_with`. Fills only its own level (DK/PK/MK/VUK) so the resolver runs the
+// matching path.
 pub(crate) struct SuppliedKey {
     pub device_keys: Vec<DeviceKey>,
     pub processing_keys: Vec<[u8; 16]>,
@@ -326,9 +324,8 @@ mod tests {
         assert_eq!(got.disc_hash, "vid-a");
     }
 
-    // `host_certs` unions across the provider array, unwired into the
-    // handshake today (see docs/key-provider.md); asserts full concatenation
-    // in array order since HostCert has no Ord/Hash to dedup.
+    // `host_certs` unions across the provider array, unwired into the handshake today; asserts
+    // full concatenation in array order since HostCert has no Ord/Hash to dedup.
     #[test]
     fn providers_host_certs_unions_every_providers_certs_in_array_order() {
         struct Certs(Vec<HostCert>);

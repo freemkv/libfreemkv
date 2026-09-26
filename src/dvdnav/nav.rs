@@ -1,5 +1,5 @@
-//! DVD-Video navigation executor — the DVD arm of "mimic a real player" title
-//! selection (issue #40). See docs/nav.md for full rationale and design.
+//! DVD-Video navigation executor — the DVD arm of "mimic a real player" title selection (issue
+//! #40).
 //!
 //! Reads the First-Play PGC pre-command list from `VIDEO_TS.IFO`, executes it
 //! on a minimal register machine, and when it deterministically reaches a
@@ -81,12 +81,12 @@ fn is_sprm(idx: u8) -> bool {
 
 // ── Minimal navigation register machine ──────────────────────────────────────
 
-// Minimal VM register file (GPRMs + SPRMs) for the First-Play resolver, cold
-// (all-zero) at start. See docs/nav.md — "The Vm register machine".
+// Minimal VM register file (GPRMs + SPRMs) for the First-Play resolver, cold (all-zero) at
+// start.
 struct Vm {
     gprm: [u16; 16],
     sprm: [u16; 24],
-    // Per-GPRM taint: set when SPRM-derived. See docs/nav.md.
+    // Per-GPRM taint: set when SPRM-derived.
     gprm_tainted: [bool; 16],
 }
 
@@ -128,9 +128,8 @@ impl Vm {
         }
     }
 
-    // Evaluate a compare predicate (op codes per [`Compare`]); returns (result,
-    // taint). Taint marks an SPRM-dependent (undecidable) branch. See
-    // docs/nav.md — "Vm::eval — compare taint".
+    // Evaluate a compare predicate (op codes per [`Compare`]); returns (result, taint). Taint
+    // marks an SPRM-dependent (undecidable) branch.
     fn eval(&self, c: &Compare) -> (bool, bool) {
         let mut tainted = self.reg_tainted(c.lhs_reg);
         let l = self.reg(c.lhs_reg);
@@ -396,8 +395,7 @@ mod tests {
 
     // ── Fixture builders ────────────────────────────────────────────────────
 
-    // Assemble a spec-shaped VMGI image (FP_PGC + TT_SRPT). See docs/nav.md —
-    // "Test fixture: build_vmgi".
+    // Assemble a spec-shaped VMGI image (FP_PGC + TT_SRPT).
     fn build_vmgi(pre: &[[u8; 8]], tt_srpt_sector: u32, titles: &[(u8, u8)]) -> Vec<u8> {
         // Place the FP_PGC at a fixed byte offset past the header.
         let fp_pgc_off: u32 = 0x400;
@@ -602,8 +600,7 @@ mod tests {
         assert_eq!(resolve_from_vmg(&vmgi), None);
     }
 
-    // SPRM-gated dispatch is undecidable at scan time and must abstain. See
-    // docs/nav.md — "Regression test rationale".
+    // SPRM-gated dispatch is undecidable at scan time and must abstain.
     #[test]
     fn sprm_gated_dispatch_abstains() {
         // 30 22: jump with EQ compare (op=2); if_v2 operands are registers
@@ -630,9 +627,8 @@ mod tests {
         );
     }
 
-    // Defect-1 regression: a store guarded by taint must not abstain the
-    // unconditional dispatch that follows. See docs/nav.md — "Regression
-    // test rationale".
+    // Defect-1 regression: a store guarded by taint must not abstain the unconditional dispatch
+    // that follows.
     #[test]
     fn sprm_guarded_store_then_unconditional_dispatch_resolves() {
         // line 0: 71 20 | lhs=b2=0x80 (SPRM0), cmp EQ(op=2, register), rhs=b7=0
@@ -653,8 +649,8 @@ mod tests {
         );
     }
 
-    // Defect-2 regression: an SPRM laundered through a GPRM must still taint a
-    // later GPRM-only branch. See docs/nav.md — "Regression test rationale".
+    // Defect-2 regression: an SPRM laundered through a GPRM must still taint a later GPRM-only
+    // branch.
     #[test]
     fn sprm_laundered_through_gprm_abstains() {
         // line 0: 61 00 | SetGPRM g0 = SPRM20 (mov, register src=b5=0x94).

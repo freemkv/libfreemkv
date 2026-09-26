@@ -1,9 +1,8 @@
 //! Structured resolution trace — what the unlock + key-resolution attempt did.
 //!
-//! No user-facing English: every step's STATE is a typed enum variant that
-//! applications render into localized text. The `who` field of each step is
-//! a stable identifier (e.g. a `label()`/`name()`), never prose, carried
-//! verbatim. See docs/aacs-trace.md for full rationale.
+//! No user-facing English: every step's STATE is a typed enum variant that applications render
+//! into localized text. The `who` field of each step is a stable identifier (e.g. a
+//! `label()`/`name()`), never prose, carried verbatim.
 
 /// The full trace of a resolution attempt: the unlock phase, then the
 /// key-resolution phase.

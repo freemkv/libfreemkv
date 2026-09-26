@@ -2,8 +2,6 @@
 //! and the title table), per its documented binary layout. This is read as a
 //! documented binary format, never executed: every field is bounds-checked and
 //! any malformed input yields `None` (the nav resolver then abstains).
-//!
-//! See docs/index-bdmv.md for the full binary layout.
 
 /// One playback/title object in `index.bdmv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

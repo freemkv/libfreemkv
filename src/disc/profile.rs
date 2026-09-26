@@ -5,8 +5,6 @@
 //! [`DiscTitle`] / [`Stream`] shapes; this module hoists those into a flat,
 //! serde-friendly surface (`profile.titles[i].subtitles[j].forced`, etc.) with
 //! every field always populated — no per-format conditionals, no bare `Option`.
-//!
-//! See docs/disc-profile.md for how fields are derived from the model.
 
 use serde::{Deserialize, Serialize};
 

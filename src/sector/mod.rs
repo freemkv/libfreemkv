@@ -64,8 +64,6 @@ pub trait SectorSource: Send {
         recovery: bool,
         fua: bool,
     ) -> Result<usize> {
-        // See docs/sector.md — Pass-N marginal-sector FUA rationale and the
-        // ~10x throughput cost of applying it to the bulk path.
         let _ = fua;
         self.read_sectors(lba, count, buf, recovery)
     }
@@ -230,8 +228,8 @@ mod tests {
         }
     }
 
-    // Routes through a generic `S: SectorSource` bound so the forwarding
-    // impls (not the vtable) are exercised. See docs/sector.md.
+    // Routes through a generic `S: SectorSource` bound so the forwarding impls (not the vtable)
+    // are exercised.
     fn set_unit_base_generic<S: SectorSource>(mut s: S, base: u32) {
         s.set_unit_base(base);
     }
@@ -390,8 +388,8 @@ mod tests {
         }
     }
 
-    // Routes through a generic `S: SectorSource` bound so the forwarding
-    // impl (not the vtable) runs. See docs/sector.md.
+    // Routes through a generic `S: SectorSource` bound so the forwarding impl (not the vtable)
+    // runs.
     fn read_generic<S: SectorSource>(
         mut s: S,
         lba: u32,
@@ -422,8 +420,7 @@ mod tests {
     }
 
     // Proves the forwarding impl actually delegates `read_sectors`, unlike
-    // `mut_ref_dyn_forwards_all_methods` (vtable dispatch). See
-    // docs/sector.md.
+    // `mut_ref_dyn_forwards_all_methods` (vtable dispatch).
     #[test]
     fn mut_ref_dyn_forwards_read_sectors_to_the_inner_source() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -454,9 +451,8 @@ mod tests {
         );
     }
 
-    // Same, for `read_sectors_fua`: the forwarder must reach the inner
-    // source's FUA entry point, carrying the `fua` bit through. See
-    // docs/sector.md.
+    // Same, for `read_sectors_fua`: the forwarder must reach the inner source's FUA entry
+    // point, carrying the `fua` bit through.
     #[test]
     fn mut_ref_dyn_forwards_read_sectors_fua_to_the_inner_source() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -481,9 +477,8 @@ mod tests {
         );
     }
 
-    // The forwarding impl must delegate `set_speed`, which hides worse than
-    // the read methods because the trait default is also a no-op. See
-    // docs/sector.md.
+    // The forwarding impl must delegate `set_speed`, which hides worse than the read methods
+    // because the trait default is also a no-op.
     #[test]
     fn mut_ref_dyn_forwards_set_speed_to_the_inner_source() {
         let (mut spy, _reads, speeds, _bases) = Spy::new(0);

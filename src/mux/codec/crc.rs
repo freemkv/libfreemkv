@@ -26,9 +26,8 @@ pub(crate) fn crc16_ansi(data: &[u8]) -> u16 {
     crc
 }
 
-// CRC-16, poly 0x002D, init 0, MSB-first — MLP/TrueHD major-sync checksum.
-// Emits bytes in reversed order vs a standard little-endian CRC readout;
-// see docs/crc.md for the swap-and-compare details and verification history.
+// CRC-16, poly 0x002D, init 0, MSB-first — MLP/TrueHD major-sync checksum. Emits bytes in
+// reversed order vs a standard little-endian CRC readout.
 pub(crate) fn crc16_mlp(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
     for &b in data {

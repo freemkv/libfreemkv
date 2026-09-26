@@ -1,18 +1,16 @@
 //! One accumulation buffer for parsers that assemble access units across PES
 //! packets.
 //!
-//! The buffer owns the bytes and the marks together, so a unit's timestamp
-//! and source offset always come from the PES that carried its first byte,
-//! never taken from two different packets. See docs/pesbuf.md for the full
-//! rationale.
+//! The buffer owns the bytes and the marks together, so a unit's timestamp and source offset
+//! always come from the PES that carried its first byte, never taken from two different
+//! packets.
 
 use super::PesPacket;
 use super::pts_to_ns;
 use crate::pes::SourcePos;
 
-// What a PES contributes to the bytes it carried, returned as a unit so a
-// caller cannot mix fields from different packets. Timestamps are raw, as
-// the packet had them; see docs/pesbuf.md for how codecs derive from them.
+// What a PES contributes to the bytes it carried, returned as a unit so a caller cannot mix
+// fields from different packets. Timestamps are raw, as the packet had them.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct PesFacts {
     /// Presentation time in NANOSECONDS, already derived (see `of`). Stored
@@ -29,8 +27,8 @@ pub(crate) struct PesFacts {
 
 impl PesFacts {
     // The facts a PES packet carries, read straight off it. Every parser reads
-    // timestamp/source/discontinuity from PesFacts, never PesPacket directly,
-    // so they can't be mixed. See docs/pesbuf.md; PesBuf::front gives the same.
+    // timestamp/source/discontinuity from PesFacts, never PesPacket directly, so they can't be
+    // mixed.
     pub(crate) fn of(pes: &PesPacket) -> Self {
         Self {
             pts_ns: pes.pts.or(pes.dts).map(pts_to_ns),
@@ -49,9 +47,8 @@ impl PesFacts {
         }
     }
 
-    // This unit's presentation time in nanoseconds — the ONE derivation. PTS and
-    // DTS differ for reordering (B-frame) streams, so video derives display
-    // order itself; see docs/pesbuf.md for audio/subtitle fallback rationale.
+    // This unit's presentation time in nanoseconds — the ONE derivation. PTS and DTS differ for
+    // reordering (B-frame) streams, so video derives display order itself.
     pub(crate) fn presentation_ns(&self) -> Option<i64> {
         self.pts_ns
     }
@@ -165,9 +162,8 @@ impl PesBuf {
         self.buf.is_empty()
     }
 
-    // Consume `n` bytes from the front, rebasing marks onto the new front. The
-    // mark covering the new byte at offset 0 is retained even though its packet
-    // started earlier; see docs/pesbuf.md for why dropping it misattributes.
+    // Consume `n` bytes from the front, rebasing marks onto the new front. The mark covering
+    // the new byte at offset 0 is retained even though its packet started earlier.
     pub(crate) fn drain(&mut self, n: usize) {
         let n = n.min(self.buf.len());
         if n == 0 {

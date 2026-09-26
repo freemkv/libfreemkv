@@ -24,14 +24,12 @@ const PRIVATE_STREAM_1: u8 = crate::consts::pes_stream_id::PRIVATE_STREAM_1;
 /// Private stream 2 (0xBF) — DVD navigation (PCI/DSI). Carries no muxable
 /// elementary stream; expected to be dropped on every disc.
 const PRIVATE_STREAM_2: u8 = crate::consts::pes_stream_id::PRIVATE_STREAM_2;
-// Extended stream id (0xFD) — H.222.0 escape: real id is the
-// `stream_id_extension` in the PES extension. HD-DVD `.evo` VC-1/HD audio.
-// See docs/ps-mod.md — Stream-ID constant rationale.
+// Extended stream id (0xFD) — H.222.0 escape: real id is the `stream_id_extension` in the PES
+// extension. HD-DVD `.evo` VC-1/HD audio.
 const EXTENDED_STREAM_ID: u8 = 0xFD;
 
-// Hard cap on the demuxer's reassembly buffer, so a corrupt unbounded PES
-// can't drive unbounded allocation.
-// See docs/ps-mod.md — Stream-ID constant rationale.
+// Hard cap on the demuxer's reassembly buffer, so a corrupt unbounded PES can't drive unbounded
+// allocation.
 const MAX_PS_BUFFER: usize = 4 * 1024 * 1024;
 
 /// A demuxed PES packet from the Program Stream.
@@ -62,10 +60,9 @@ pub const DVD_VIDEO_PID: u16 = 0xE0;
 /// on-wire sub-stream id. Returns `None` for sub-ids outside the AC-3 /
 /// DTS / LPCM / HD-DVD E-AC-3 ranges.
 ///
-/// The PID is `0xBD00 | sub_stream_id`, unique per sub-stream id (AC-3 /
-/// DTS `0x80..=0x8F`, LPCM `0xA0..=0xA7`, HD-DVD E-AC-3 `0xC0..=0xC7`) — the
-/// single source of truth shared with `Disc::scan_dvd_titles`
-/// (`src/disc/dvd.rs`). See docs/ps-mod.md — `dvd_audio_pid` rationale.
+/// The PID is `0xBD00 | sub_stream_id`, unique per sub-stream id (AC-3 / DTS `0x80..=0x8F`,
+/// LPCM `0xA0..=0xA7`, HD-DVD E-AC-3 `0xC0..=0xC7`) — the single source of truth shared with
+/// `Disc::scan_dvd_titles` (`src/disc/dvd.rs`).
 pub fn dvd_audio_pid(sub_stream_id: u8) -> Option<u16> {
     match sub_stream_id {
         0x80..=0x8F | 0xA0..=0xA7 | 0xC0..=0xC7 => Some(0xBD00 | sub_stream_id as u16),
@@ -103,8 +100,8 @@ impl PsPacket {
     /// shared [`dvd_audio_pid`] / [`dvd_subtitle_pid`] tables the scanner
     /// also uses.
     ///
-    /// Returns `None` for combinations the DVD title scanner does not
-    /// assign a PID to; the caller should WARN-and-drop. See docs/ps-mod.md.
+    /// Returns `None` for combinations the DVD title scanner does not assign a PID to; the
+    /// caller should WARN-and-drop.
     pub fn dvd_pid(&self) -> Option<u16> {
         match self.stream_id {
             crate::consts::pes_stream_id::VIDEO..=0xEF => Some(DVD_VIDEO_PID),
@@ -149,8 +146,8 @@ pub struct PsDemuxer {
     /// is no boundary)`. Buffer-relative; rebased when the buffer drains,
     /// cleared when the PES is emitted.
     ///
-    /// Without it, every `feed` would re-search the whole accumulated
-    /// payload from the PES header. See docs/ps-mod.md — `PsDemuxer::pending_scan`.
+    /// Without it, every `feed` would re-search the whole accumulated payload from the PES
+    /// header.
     pending_scan: Option<(usize, usize)>,
     /// Test-only: total bytes examined by `find_ps_boundary`. Pins the cursor
     /// above — the property it exists for is a WORK bound, which no
@@ -371,9 +368,8 @@ impl PsDemuxer {
 /// straddle a feed boundary by at most its first two bytes.
 const START_CODE_PREFIX_KEEP: usize = 2;
 
-// Next PS-layer unit boundary at/after `from` — NOT the next raw `00 00 01`,
-// which the video ES payload is full of. Returns `(boundary, searched_to)`.
-// See docs/ps-mod.md — `find_ps_boundary`.
+// Next PS-layer unit boundary at/after `from` — NOT the next raw `00 00 01`, which the video ES
+// payload is full of. Returns `(boundary, searched_to)`.
 fn find_ps_boundary(data: &[u8], from: usize) -> (Option<usize>, usize) {
     let mut pos = from;
     while let Some(sc) = find_start_code(data, pos) {
@@ -564,8 +560,8 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
     })
 }
 
-// Parse a 5-byte PTS/DTS timestamp field (33 bits at 90kHz), layout per
-// ISO/IEC 13818-1 Table 2-17. See docs/ps-mod.md — `parse_pts` byte layout.
+// Parse a 5-byte PTS/DTS timestamp field (33 bits at 90kHz), layout per ISO/IEC 13818-1 Table
+// 2-17.
 fn parse_pts(buf: &[u8]) -> Option<u64> {
     debug_assert!(buf.len() >= 5);
     // Validate the three marker bits (bit 0 of bytes 0, 2, 4) per MPEG-2
@@ -1324,9 +1320,8 @@ mod tests {
         assert_eq!(p[0].data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
-    // `is_nav()` separates the one expected-unmappable DVD stream
-    // (private_stream_2 nav packs) from any other `dvd_pid() == None`, which
-    // is an unexpected lost stream. See docs/ps-mod.md — this test.
+    // `is_nav()` separates the one expected-unmappable DVD stream (private_stream_2 nav packs)
+    // from any other `dvd_pid() == None`, which is an unexpected lost stream.
     #[test]
     fn only_private_stream_2_is_navigation_and_never_a_routable_stream() {
         // Demux a program stream carrying, in order: a navigation pack, MPEG-2
@@ -1587,17 +1582,15 @@ mod tests {
     // Mutation-gap hardening (mux-ts pass)
     // ════════════════════════════════════════════════════════════════════
 
-    /// Pins `MAX_PS_BUFFER` against a literal computed independently, so a
-    /// mutated expression in its definition can't hide behind
-    /// self-referential assertions. See docs/ps-mod.md.
+    /// Pins `MAX_PS_BUFFER` against a literal computed independently, so a mutated expression
+    /// in its definition can't hide behind self-referential assertions.
     #[test]
     fn max_ps_buffer_has_the_documented_value() {
         assert_eq!(MAX_PS_BUFFER, 4 * 1024 * 1024);
     }
 
-    // Pack-header framing must accept an EXACT fit, not wait for data that
-    // will never come; preceded by an unrelated start code so `sc != 0`.
-    // See docs/ps-mod.md — this test.
+    // Pack-header framing must accept an EXACT fit, not wait for data that will never come;
+    // preceded by an unrelated start code so `sc != 0`.
     #[test]
     fn pack_header_exact_fit_is_consumed_not_awaited() {
         // Case 1: mandatory 14 bytes, no stuffing, nothing else buffered.
@@ -1631,9 +1624,8 @@ mod tests {
         );
     }
 
-    // System-header framing needs exactly `6 + header_length` bytes; at
-    // `header_length == 0` both boundary checks coincide at `len == 6`.
-    // See docs/ps-mod.md — this test.
+    // System-header framing needs exactly `6 + header_length` bytes; at `header_length == 0`
+    // both boundary checks coincide at `len == 6`.
     #[test]
     fn system_header_zero_length_exact_fit_is_consumed_not_awaited() {
         let mut demuxer = PsDemuxer::new();
@@ -1645,9 +1637,9 @@ mod tests {
         );
     }
 
-    // `header_len` is 16-bit big-endian; a `<<`->`>>` mutation would misread
-    // 300 (0x012C) as just 44. A decoy start code at the offset that misread
-    // length would resume at must stay buried. See docs/ps-mod.md.
+    // `header_len` is 16-bit big-endian; a `<<`->`>>` mutation would misread 300 (0x012C) as
+    // just 44. A decoy start code at the offset that misread length would resume at must stay
+    // buried.
     #[test]
     fn system_header_length_high_byte_is_not_dropped() {
         let mut demuxer = PsDemuxer::new();
@@ -1677,8 +1669,8 @@ mod tests {
         assert_eq!(packets[0].data, vec![0x77, 0x88]);
     }
 
-    // `sc + 3 >= data.len()` must stay an ADDITION: `+`->`-` at `sc == 0`
-    // underflows and panics on a bare trailing start code. See docs/ps-mod.md.
+    // `sc + 3 >= data.len()` must stay an ADDITION: `+`->`-` at `sc == 0` underflows and panics
+    // on a bare trailing start code.
     #[test]
     fn find_ps_boundary_handles_a_bare_start_code_at_the_buffer_head() {
         assert_eq!(
@@ -1688,9 +1680,8 @@ mod tests {
         );
     }
 
-    // An unbounded PES's boundary search must not restart at the PES header
-    // on every feed (quadratic work). `boundary_bytes_scanned` measures the
-    // work bound directly. See docs/ps-mod.md — this test.
+    // An unbounded PES's boundary search must not restart at the PES header on every feed
+    // (quadratic work). `boundary_bytes_scanned` measures the work bound directly.
     #[test]
     fn an_unterminated_pes_is_not_rescanned_from_its_header_every_feed() {
         const CHUNKS: usize = 256;
@@ -1742,9 +1733,9 @@ mod tests {
         );
     }
 
-    // The resume cursor is a buffer offset and must be rebased on drain —
-    // the only test where a drain happens while the cursor is live, so both
-    // halves of the rebase arithmetic get exercised. See docs/ps-mod.md.
+    // The resume cursor is a buffer offset and must be rebased on drain — the only test where a
+    // drain happens while the cursor is live, so both halves of the rebase arithmetic get
+    // exercised.
     #[test]
     fn a_resume_cursor_survives_the_drain_of_units_ahead_of_the_unbounded_pes() {
         // Payload fed in the SAME chunk that opens the PES. Large enough that
@@ -1838,9 +1829,9 @@ mod tests {
         );
     }
 
-    // Arms EVERY optional PES-header/PES_extension field at once with a known
-    // byte count, so a single mutated `pos +=` skip anywhere in the walk to
-    // `stream_id_extension` lands on the wrong byte. See docs/ps-mod.md.
+    // Arms EVERY optional PES-header/PES_extension field at once with a known byte count, so a
+    // single mutated `pos +=` skip anywhere in the walk to `stream_id_extension` lands on the
+    // wrong byte.
     #[test]
     fn parse_stream_id_extension_walks_every_optional_field_to_the_right_offset() {
         // flags2: PTS/DTS absent (00), ESCR/ES_rate/DSM_trick_mode/
@@ -1880,9 +1871,9 @@ mod tests {
         assert_eq!(parsed.data, es);
     }
 
-    // A length-bounded PES must be emitted the moment its declared length is
-    // EXACTLY satisfied, not held back — a `>=` vs `>` boundary-check bug
-    // would misclassify an exact fit as "not enough data". See docs/ps-mod.md.
+    // A length-bounded PES must be emitted the moment its declared length is EXACTLY satisfied,
+    // not held back — a `>=` vs `>` boundary-check bug would misclassify an exact fit as "not
+    // enough data".
     #[test]
     fn length_bounded_pes_exact_fit_is_emitted_not_awaited() {
         let mut demuxer = PsDemuxer::new();

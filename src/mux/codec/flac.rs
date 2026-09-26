@@ -6,8 +6,6 @@
 //! has zero residue (RFC 9639, frame footer). Nonzero residue → corruption:
 //! drop the frame (silence gap, PTS preserved), logged via the shared tally.
 //! A packet without the FLAC sync passes through unchanged (never false-dropped).
-//!
-//! See docs/flac.md for the raw-stream-vs-container-delimited framing rationale.
 
 use super::crc::crc16_ansi;
 use super::dropgate::DropTally;

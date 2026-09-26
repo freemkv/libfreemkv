@@ -149,9 +149,8 @@ mod tests {
         }
     }
 
-    // TAB1 is a bijection on 0..256; CSS uses it as an invertible output
-    // permutation in css_DecryptKey. See docs/tables.md#tab1_is_a_permutation
-    // for the invertibility rationale and mutation-testing notes.
+    // TAB1 is a bijection on 0..256; CSS uses it as an invertible output permutation in
+    // css_DecryptKey.
     #[test]
     fn tab1_is_a_permutation() {
         let mut seen = [false; 256];
@@ -164,18 +163,16 @@ mod tests {
         }
     }
 
-    // TAB1's fixed structural anchors: TAB1[0x00] == 0x33 and TAB1[0x33] ==
-    // 0x00, the canonical CSS-spec landmarks pinning the table's
-    // orientation. See docs/tables.md#tab1_known_spec_anchors for grounding.
+    // TAB1's fixed structural anchors: TAB1[0x00] == 0x33 and TAB1[0x33] == 0x00, the canonical
+    // CSS-spec landmarks pinning the table's orientation.
     #[test]
     fn tab1_known_spec_anchors() {
         assert_eq!(TAB1[0x00], 0x33, "TAB1[0] is the published 0x33");
         assert_eq!(TAB1[0x33], 0x00, "TAB1[0x33] is the published 0x00");
     }
 
-    // TAB2 is a permutation of 0..256 (LFSR1 high-byte feedback
-    // substitution); a non-bijective table would bias the LFSR1 keystream.
-    // See docs/tables.md#tab2_is_a_permutation for mutation notes.
+    // TAB2 is a permutation of 0..256 (LFSR1 high-byte feedback substitution); a non-bijective
+    // table would bias the LFSR1 keystream.
     #[test]
     fn tab2_is_a_permutation() {
         let mut seen = [false; 256];
@@ -188,9 +185,8 @@ mod tests {
         }
     }
 
-    // TAB3 is CSS's LFSR1 low-word table: BASE = [0x00,0x24,0x49,0x6d,0x92,
-    // 0xb6,0xdb,0xff] repeated 64x (TAB3[i] == BASE[i & 7]); only the low 3
-    // bits of the 9-bit index matter. See docs/tables.md#tab3_matches_lfsr1_generating_formula.
+    // TAB3 is CSS's LFSR1 low-word table: BASE = [0x00,0x24,0x49,0x6d,0x92, 0xb6,0xdb,0xff]
+    // repeated 64x (TAB3[i] == BASE[i & 7]); only the low 3 bits of the 9-bit index matter.
     #[test]
     fn tab3_matches_lfsr1_generating_formula() {
         const BASE: [u8; 8] = [0x00, 0x24, 0x49, 0x6d, 0x92, 0xb6, 0xdb, 0xff];
@@ -204,9 +200,8 @@ mod tests {
         }
     }
 
-    // TAB4 is the exact bit-reversal of each byte (CSS permutes LFSR0 bytes
-    // with it on seed/output), hence also an involution: TAB4[TAB4[b]] == b.
-    // See docs/tables.md#tab4_bit_reversal for grounding/mutation notes.
+    // TAB4 is the exact bit-reversal of each byte (CSS permutes LFSR0 bytes with it on
+    // seed/output), hence also an involution: TAB4[TAB4[b]] == b.
     #[test]
     fn tab4_is_exact_bit_reversal_and_involution() {
         for b in 0u16..256 {
@@ -229,9 +224,9 @@ mod tests {
         assert_eq!(TAB4[0xFF], 0xFF);
     }
 
-    // TAB4 is a permutation (bit-reversal is bijective); distinct from the
-    // reversal test since "reversal except swapped/duplicated entries" cases
-    // would pass one test but fail the other. See docs/tables.md#tab4_is_a_permutation.
+    // TAB4 is a permutation (bit-reversal is bijective); distinct from the reversal test since
+    // "reversal except swapped/duplicated entries" cases would pass one test but fail the
+    // other.
     #[test]
     fn tab4_is_a_permutation() {
         let mut seen = [false; 256];
@@ -241,9 +236,8 @@ mod tests {
         }
     }
 
-    // TAB5 is a permutation (complement of a bijection) with orientation
-    // anchors TAB5[0x00]==0xFF and TAB5[0xFF]==0x00, independent of the
-    // complement-loop test. See docs/tables.md#tab5_permutation_anchors.
+    // TAB5 is a permutation (complement of a bijection) with orientation anchors
+    // TAB5[0x00]==0xFF and TAB5[0xFF]==0x00, independent of the complement-loop test.
     #[test]
     fn tab5_is_permutation_with_anchors() {
         let mut seen = [false; 256];

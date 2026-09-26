@@ -54,8 +54,6 @@ pub const BD_SOURCE_PACKET_BYTES: usize = TS_PACKET_BYTES + BD_TIMESTAMP_PREFIX_
 /// every consumer of either spec reads or writes this one byte. Each constant
 /// is `u8`: the spec defines an 8-bit field, so the code compares it directly
 /// against a buffer byte with no casts.
-///
-/// See docs/consts.md for the ISO/BD-ROM table citations and user-private-range notes.
 pub mod coding_type {
     /// MPEG-2 video (ISO/IEC 13818-1 Table 2-34).
     pub const MPEG2_VIDEO: u8 = 0x02;

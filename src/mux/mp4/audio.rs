@@ -7,8 +7,6 @@
 //! are derived from the first audio frame's bitstream (ISO/IEC 14496-12
 //! amendments; ETSI TS 102 366 / 102 114). Codecs with no clean MP4 mapping
 //! (TrueHD, LPCM, bitmap subtitles) are excluded by the fit oracle.
-//
-// See docs/mp4-audio.md — DD+/AC-3 fallback rationale and the fit oracle detail.
 
 use super::boxes::bx;
 use crate::disc::Codec;
@@ -20,7 +18,6 @@ const EAC3_REDUCED_RATES: [u32; 4] = [24_000, 22_050, 16_000, 48_000];
 /// Base channel count per `acmod` (A/52 Table 5.8), before the LFE.
 const ACMOD_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
 // Lowest `bsid` that is Annex-E (E-AC-3); 8 is AC-3, 9/10 are Annex D.
-// See docs/mp4-audio.md — why parser and chooser share this one constant.
 const EAC3_MIN_BSID: u8 = 11;
 /// Width of the `dec3` `data_rate` field in bits (ETSI TS 102 366 Annex F.6.1).
 const DEC3_DATA_RATE_BITS: u32 = 13;
@@ -40,9 +37,8 @@ impl<'a> BitReader<'a> {
     fn skip(&mut self, n: usize) {
         self.bit += n;
     }
-    // Read `n` bits (n <= 32). Returns 0 past end of data (callers pre-check len).
-    // `|` (not `^`) is intentional here and in the `push` closures below.
-    // See docs/mp4-audio.md — BitReader::read.
+    // Read `n` bits (n <= 32). Returns 0 past end of data (callers pre-check len). `|` (not
+    // `^`) is intentional here and in the `push` closures below.
     fn read(&mut self, n: usize) -> u32 {
         let mut v = 0u32;
         for _ in 0..n {
@@ -195,7 +191,7 @@ pub(super) fn dac3_box(c: &DolbyConfig) -> Vec<u8> {
 /// The `dec3` config box (ETSI TS 102 366 Annex G.3): single independent
 /// substream, no dependents. data_rate(13) num_ind_sub(3) fscod(2) bsid(5)
 /// reserved(1) asvc(1) bsmod(3) acmod(3) lfeon(1) reserved(3) num_dep_sub(4) reserved(1).
-// data_rate must be non-zero; only parse_eac3 computes one (see docs/mp4-audio.md).
+// data_rate must be non-zero; only parse_eac3 computes one.
 pub(super) fn dec3_box(c: &DolbyConfig) -> Vec<u8> {
     let mut v: u64 = 0;
     let mut push = |val: u64, bits: u32| v = (v << bits) | (val & ((1u64 << bits) - 1));
@@ -253,8 +249,8 @@ const DTS_SFREQ: [u32; 16] = [
     48_000, 8_000, 16_000, 32_000, 48_000, 48_000, 11_025, 22_050, 44_100, 48_000, 48_000, 12_000,
     24_000, 48_000, 96_000, 192_000,
 ];
-// DTS core base channel count per AMODE (ETSI TS 102 114 §5.3.1); matches the
-// decodability gate's DTS_AMODE_COUNT in dts.rs. See docs/mp4-audio.md.
+// DTS core base channel count per AMODE (ETSI TS 102 114 §5.3.1); matches the decodability
+// gate's DTS_AMODE_COUNT in dts.rs.
 const DTS_AMODE_CH: [u8; 16] = [1, 2, 2, 2, 2, 3, 3, 4, 4, 5, 6, 6, 6, 7, 8, 8];
 
 /// Decoded DTS core parameters needed for the `ddts` box.
@@ -319,9 +315,8 @@ fn parse_dts(frame: &[u8]) -> Option<DtsConfig> {
     })
 }
 
-// `ddts` ChannelLayout speaker mask per core AMODE (bit0=C, bit1=L/R, ...
-// bit15=Lhr/Rhr; paired bits = two speakers). Must stay consistent with
-// DTS_AMODE_CH — see docs/mp4-audio.md for the invariant and history.
+// `ddts` ChannelLayout speaker mask per core AMODE (bit0=C, bit1=L/R,... bit15=Lhr/Rhr; paired
+// bits = two speakers). Must stay consistent with DTS_AMODE_CH.
 const DTS_AMODE_LAYOUT: [u16; 16] = [
     0x0001, // 0  A                      → C
     0x0002, // 1  A + B (dual mono)      → L/R
@@ -861,7 +856,6 @@ mod tests {
     /// AC-3 syncframe with every BSI field distinct: fscod=1 (44.1 kHz),
     /// frmsizecod=37 (bit_rate_code 18), bsid=8, bsmod=5, acmod=6 (2/2),
     /// lfeon=1 -> 4.1 = 5 channels.
-    // Byte layout and the acmod-6 cmixlev/surmixlev derivation: docs/mp4-audio.md.
     fn ac3_frame_distinct() -> Vec<u8> {
         vec![0x0B, 0x77, 0x00, 0x00, 0x65, 0x45, 0xC4, 0x00]
     }
@@ -975,14 +969,12 @@ mod tests {
     /// Annex-E syncframe with every field distinct: frmsiz=0x123 (292 words
     /// -> 584 bytes), fscod=1 (44.1 kHz), numblkscod=0 (1 block -> 256 samples),
     /// acmod=5 (3/1), lfeon=1 -> 5 channels, bsid=16.
-    // Byte-by-byte field layout: docs/mp4-audio.md.
     fn eac3_frame_distinct() -> Vec<u8> {
         vec![0x0B, 0x77, 0x01, 0x23, 0x4B, 0x80, 0x00]
     }
 
     /// Annex-E syncframe with fscod=3 — the reduced-sample-rate path, which no
     /// other fixture reaches. fscod2=2 -> 16 kHz, 6 blocks; acmod=2, lfeon=0.
-    // Byte layout and minimum-length note: docs/mp4-audio.md.
     fn eac3_frame_fscod3() -> Vec<u8> {
         vec![0x0B, 0x77, 0x00, 0x0F, 0xE4, 0x80]
     }
@@ -1079,7 +1071,6 @@ mod tests {
 
     /// A DTS core whose split fields all have their high parts set, so a lost
     /// high bit is visible: NBLKS=79 -> 2560 samples; FSIZE=0x3000 -> core 12289.
-    // Bit-position breakdown: docs/mp4-audio.md.
     fn dts_frame_high_bits_set() -> Vec<u8> {
         vec![
             0x7F, 0xFE, 0x80, 0x01, 0x01, 0x3F, 0x00, 0x02, 0x74, 0x00, 0x0A, 0x00,

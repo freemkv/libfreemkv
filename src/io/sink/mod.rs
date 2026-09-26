@@ -1,12 +1,10 @@
 //! Output-sink trait split for the buffering architecture.
 //!
-//! [`SequentialSink`] — anything you can `Write` to in order (no seek;
-//! sockets, pipes, M2TS/fMP4/HEVC-ES) — and [`RandomAccessSink`] —
-//! `SequentialSink` plus a working `Seek` (local/NFS files; needed for
-//! backpatch: MKV cluster sizes, Cues, MP4 moov-at-end). The muxer is
-//! generic over whichever it requires, so muxing MKV to a socket is a
-//! compile error. Buffering policy belongs to the concrete sink; see
-//! docs/sink.md for the buffering-per-sink breakdown.
+//! [`SequentialSink`] — anything you can `Write` to in order (no seek; sockets, pipes,
+//! M2TS/fMP4/HEVC-ES) — and [`RandomAccessSink`] — `SequentialSink` plus a working `Seek`
+//! (local/NFS files; needed for backpatch: MKV cluster sizes, Cues, MP4 moov-at-end). The muxer
+//! is generic over whichever it requires, so muxing MKV to a socket is a compile error.
+//! Buffering policy belongs to the concrete sink.
 
 use std::io::{Seek, Write};
 
@@ -21,11 +19,10 @@ pub use socket::{SocketSink, UdpSocketSink};
 /// stores. No seek. Implementations own their write buffering — the
 /// trait does not impose or hide any buffering of its own.
 ///
-/// `finish` drains any internal buffering and signals end-of-stream to
-/// the transport (close-write on a socket, flush + fsync on a buffered
-/// file, etc.). The default impl flushes via [`Write::flush`]; every
-/// concrete sink here overrides it with its own finalisation. No
-/// blanket `impl SequentialSink for T` — see docs/sink.md for why.
+/// `finish` drains any internal buffering and signals end-of-stream to the transport
+/// (close-write on a socket, flush + fsync on a buffered file, etc.). The default impl flushes
+/// via [`Write::flush`]; every concrete sink here overrides it with its own finalisation. No
+/// blanket `impl SequentialSink for T`
 pub trait SequentialSink: Write + Send {
     fn finish(&mut self) -> std::io::Result<()> {
         self.flush()
@@ -37,9 +34,8 @@ pub trait SequentialSink: Write + Send {
 /// random-access sink is always usable as a sequential sink.
 pub trait RandomAccessSink: SequentialSink + Seek {}
 
-// Picks the right RandomAccessSink impl for `dest` by filesystem type
-// (Linux+NFS -> WritebackFile, else LocalFileSink). Not yet wired into
-// mux::resolve; see docs/sink.md for the full picker/size_hint rationale.
+// Picks the right RandomAccessSink impl for `dest` by filesystem type (Linux+NFS ->
+// WritebackFile, else LocalFileSink). Not yet wired into mux::resolve.
 #[allow(dead_code)]
 pub(crate) fn open_for_mkv(
     dest: &std::path::Path,
@@ -107,7 +103,7 @@ mod tests {
         assert_eq!(&bytes[..5], b"hello");
     }
 
-    // Regression test for the silent-no-op finish() bug. See docs/sink.md.
+    // Regression test for the silent-no-op finish() bug.
     #[test]
     fn finish_through_trait_object_flushes_local_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -130,8 +126,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    // Minimal SequentialSink that does NOT override finish(), so it
-    // exercises the trait's default impl. See docs/sink.md.
+    // Minimal SequentialSink that does NOT override finish(), so it exercises the trait's
+    // default impl.
     struct FlushTracker {
         flushed: Arc<AtomicBool>,
         bytes: Arc<AtomicUsize>,
@@ -170,8 +166,7 @@ mod tests {
         assert_eq!(bytes.load(Ordering::SeqCst), 3);
     }
 
-    // Covers the `None` size_hint arm: must still be a random-access
-    // sink. See docs/sink.md.
+    // Covers the `None` size_hint arm: must still be a random-access sink.
     #[test]
     fn open_for_mkv_without_size_hint_is_random_access() {
         use std::io::{Seek, SeekFrom};

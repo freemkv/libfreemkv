@@ -6,8 +6,6 @@
 //! `{LANG}` tokens found is the set of menu languages the disc ships.
 //!
 //! Language-only hint; runs at [`Confidence::Low`](super::Confidence::Low).
-// See docs/png_filenames.md — why Low confidence, and why this is a
-// first-class parser instead of inline logic.
 
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, vocab};
 use crate::sector::SectorSource;
@@ -59,9 +57,8 @@ fn labels_from_filenames(names: &[String]) -> Vec<StreamLabel> {
         .collect()
 }
 
-// Extract the ISO-639-2 lang code from a `{title}_UHD01_{LANG}_Composite`
-// filename, or None if the grammar doesn't match or `{LANG}` isn't recognized.
-// See docs/png_filenames.md — why the marker+suffix avoid false positives.
+// Extract the ISO-639-2 lang code from a `{title}_UHD01_{LANG}_Composite` filename, or None if
+// the grammar doesn't match or `{LANG}` isn't recognized.
 fn filename_lang(name: &str) -> Option<&'static str> {
     // Case-fold once; the marker/suffix are matched case-insensitively.
     let lower = name.to_ascii_lowercase();

@@ -2,8 +2,6 @@
 //!
 //! Every error is a code with structured data. No English text.
 //! Applications map codes to localized messages.
-//!
-//! See docs/error-codes.md for the full E1xxx-E9xxx range table.
 
 // ── Error codes ─────────────────────────────────────────────────────────────
 
@@ -60,9 +58,8 @@ pub const E_UDF_EMBEDDED_DATA: u16 = 6018;
 /// which is zero-length or points at LBA 0. Reported by the HD-DVD clip
 /// resolver (`disc::hddvd`).
 ///
-/// It has no [`Error`] variant on purpose: `UdfFs::file_extents` returns
-/// `Ok(vec![])` here and the CALLER detects the condition. See
-/// docs/error-codes.md for why.
+/// It has no [`Error`] variant on purpose: `UdfFs::file_extents` returns `Ok(vec![])` here and
+/// the CALLER detects the condition.
 pub const E_UDF_NO_USABLE_EXTENT: u16 = 6019;
 
 // AACS (7xxx)
@@ -93,22 +90,19 @@ pub const E_CSS_KEY_MISSING: u16 = 7023;
 pub const E_AACS_NO_HOST_CERT: u16 = 7024;
 pub const E_AACS_BUS_KEY_UNAVAILABLE: u16 = 7025;
 pub const E_FMTS_KEY_MISSING: u16 = 7026;
-/// The CSS disc as a WHOLE could not be decrypted — the scan saw scrambled
-/// sectors and the known-plaintext crack recovered no title key at all, so every
-/// title will fail identically. The CSS analogue of [`E_NO_DISC_KEY`], and
-/// deliberately NOT [`E_CSS_KEY_MISSING`], which [`is_skippable_title_stub`]
-/// treats as a skippable per-title stub. [`is_disc_level_no_key`] classifies
-/// this code, so a multi-title rip loop fails fast on it. See
-/// docs/error-codes.md for the history of why these codes were split.
+/// The CSS disc as a WHOLE could not be decrypted — the scan saw scrambled sectors and the
+/// known-plaintext crack recovered no title key at all, so every title will fail identically.
+/// The CSS analogue of [`E_NO_DISC_KEY`], and deliberately NOT [`E_CSS_KEY_MISSING`], which
+/// [`is_skippable_title_stub`] treats as a skippable per-title stub. [`is_disc_level_no_key`]
+/// classifies this code, so a multi-title rip loop fails fast on it.
 pub const E_CSS_NO_DISC_KEY: u16 = 7027;
 /// A key SOURCE could not be reached, or failed on its own side — transport
 /// error, DNS failure, timeout, TLS failure, an HTTP 5xx, or a reply the client
 /// could not read. The source never got as far as answering the question, so
 /// nothing at all is known about whether a key for this disc exists.
 ///
-/// Deliberately NOT [`E_NO_DISC_KEY`], which asserts the OPPOSITE — every source
-/// answered and none holds a key. Transient: retry later. See
-/// docs/error-codes.md for why conflating the two is dangerous.
+/// Deliberately NOT [`E_NO_DISC_KEY`], which asserts the OPPOSITE — every source answered and
+/// none holds a key. Transient: retry later.
 pub const E_KEY_SERVICE_UNAVAILABLE: u16 = 7028;
 /// A key source rejected the configured credentials (HTTP 401/403 from the online
 /// key service). NOT transient and NOT an absent key — the operator action is to
@@ -234,8 +228,7 @@ pub const E_MKV_LACING_INVALID: u16 = 9052;
 /// allocation caps, an out-of-range TimestampScale / cluster timestamp / track
 /// number).
 ///
-/// Deliberately NOT [`E_MKV_INVALID`] (a no-frames stub, skippable). See
-/// docs/error-codes.md for why conflating the two is dangerous.
+/// Deliberately NOT [`E_MKV_INVALID`] (a no-frames stub, skippable).
 pub const E_MKV_SOURCE_INVALID: u16 = 9053;
 /// The Matroska WRITER was asked to emit something EBML cannot represent: an
 /// element body at or above the 56-bit VINT payload limit (which would encode
@@ -417,11 +410,10 @@ pub enum Error {
     /// A file's ICB declares its data EMBEDDED inline (ECMA-167 4/14.6.8
     /// allocation-descriptor type 3), so it has no out-of-line extents at all.
     ///
-    /// Returned only when a caller asked for a read plan over such a file;
-    /// decoding the inline bytes as (length, LBA) pairs would manufacture
-    /// extents out of file content and point the reader at unrelated sectors.
-    /// Callers that expect an embedded file (e.g. AACS `*.inf`) read it via
-    /// `read_inline_data` instead. See docs/error-codes.md for more.
+    /// Returned only when a caller asked for a read plan over such a file; decoding the inline
+    /// bytes as (length, LBA) pairs would manufacture extents out of file content and point the
+    /// reader at unrelated sectors. Callers that expect an embedded file (e.g. AACS `*.inf`)
+    /// read it via `read_inline_data` instead.
     UdfEmbeddedData,
     DiscTitleRange {
         index: usize,
@@ -547,14 +539,12 @@ pub enum Error {
     /// all-titles rip skips just this title. The whole-disc counterpart is
     /// [`Error::CssNoDiscKey`].
     CssKeyMissing,
-    /// The disc is CSS-encrypted and decryption was requested, but the
-    /// known-plaintext crack recovered NO title key for the disc at all (the scan
-    /// saw scrambled sectors and stamped `Disc::css_error`). A whole-disc
-    /// condition: every title would fail the same way, so a multi-title rip loop
-    /// must stop instead of iterating. The CSS analogue of [`Error::NoDiscKey`],
-    /// classified by [`is_disc_level_no_key`] — NOT [`is_skippable_title_stub`],
-    /// which owns the per-title [`Error::CssKeyMissing`]. See docs/error-codes.md
-    /// for why conflating the two matters.
+    /// The disc is CSS-encrypted and decryption was requested, but the known-plaintext crack
+    /// recovered NO title key for the disc at all (the scan saw scrambled sectors and stamped
+    /// `Disc::css_error`). A whole-disc condition: every title would fail the same way, so a
+    /// multi-title rip loop must stop instead of iterating. The CSS analogue of
+    /// [`Error::NoDiscKey`], classified by [`is_disc_level_no_key`] — NOT
+    /// [`is_skippable_title_stub`], which owns the per-title [`Error::CssKeyMissing`].
     CssNoDiscKey,
     /// A key source could not be reached, or failed on its own side — transport
     /// error, DNS failure, timeout, TLS failure, HTTP 5xx, or an unreadable /
@@ -582,14 +572,13 @@ pub enum Error {
     AacsNoHostCert {
         path: String,
     },
-    /// A bus-encrypted disc (AACS 2.0 / UHD, Content Certificate bus-encryption
-    /// bit set) was scanned on a live drive, the Volume ID was obtained, but no
-    /// `read_data_key` (bus key) was produced — so the on-disc bytes are still
-    /// bus-encrypted and would decrypt to garbage. The bus key is derivable ONLY
-    /// from the AACS host-certificate cert-auth handshake; a VID-only OEM unlock
-    /// path is insufficient for such a disc. Surfaced instead of silently
-    /// producing a corrupt rip. NOT raised for AACS 1.0 BD or file-backed (ISO)
-    /// scans, where no bus-key handshake runs. See docs/error-codes.md for detail.
+    /// A bus-encrypted disc (AACS 2.0 / UHD, Content Certificate bus-encryption bit set) was
+    /// scanned on a live drive, the Volume ID was obtained, but no `read_data_key` (bus key)
+    /// was produced — so the on-disc bytes are still bus-encrypted and would decrypt to
+    /// garbage. The bus key is derivable ONLY from the AACS host-certificate cert-auth
+    /// handshake; a VID-only OEM unlock path is insufficient for such a disc. Surfaced instead
+    /// of silently producing a corrupt rip. NOT raised for AACS 1.0 BD or file-backed (ISO)
+    /// scans, where no bus-key handshake runs.
     AacsBusKeyUnavailable,
 
     /// AACS 2.1 (FMTS) disc carries forensic variant segments, but no segment
@@ -654,9 +643,8 @@ pub enum Error {
     /// frames but its codec init data never appears, so buffering further would
     /// swap the box to death. Carries the buffered byte count.
     ///
-    /// DISTINCT from [`Error::MkvInvalid`] (an empty nav/menu stub, skippable):
-    /// real frames with unresolvable headers is a main feature, not a stub.
-    /// This code is not skippable. See docs/error-codes.md for the history.
+    /// DISTINCT from [`Error::MkvInvalid`] (an empty nav/menu stub, skippable): real frames
+    /// with unresolvable headers is a main feature, not a stub. This code is not skippable.
     MuxHeaderBufferExceeded {
         bytes: u64,
     },
@@ -745,10 +733,9 @@ pub enum Error {
     /// an error or before delivering the extents it was given — so it can
     /// never return another byte.
     ///
-    /// It exists because `Ok(0)` from a dead source is indistinguishable from
-    /// end-of-stream, and callers may legitimately treat a short read as a
-    /// skippable hole. This cannot be retried or skipped past; every consumer
-    /// must abort the pass on it. See docs/error-codes.md for more.
+    /// It exists because `Ok(0)` from a dead source is indistinguishable from end-of-stream,
+    /// and callers may legitimately treat a short read as a skippable hole. This cannot be
+    /// retried or skipped past; every consumer must abort the pass on it.
     SourceTerminated,
     /// An MPEG-TS packet under construction violated the 188-byte fixed
     /// size (over-long adaptation field, overflowing payload, or a
@@ -1300,8 +1287,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// predicates built on it below — parsing the `E<code>` prefix is this
 /// function's job, so callers don't reimplement it.
 ///
-/// [`From<Error> for io::Error`] is the ONLY path from a typed [`Error`] to an
-/// `io::Error` in this crate; see docs/error-codes.md for the round-trip detail.
+/// [`From<Error> for io::Error`] is the ONLY path from a typed [`Error`] to an `io::Error` in
+/// this crate.
 pub fn error_code(e: &std::io::Error) -> Option<u16> {
     // Round-tripped: `From<Error> for io::Error` renders as "E<code>[: …]".
     let s = e.to_string();
@@ -1317,9 +1304,8 @@ pub fn error_code(e: &std::io::Error) -> Option<u16> {
 /// that produced no muxable frames ([`Error::MkvInvalid`]). An all-titles rip
 /// skips such a title and finishes the rest; every other error stays fatal.
 ///
-/// NOT skippable: a broken `mkv://` source ([`Error::MkvSourceInvalid`] and
-/// siblings) or a whole-disc key failure ([`Error::CssNoDiscKey`], see
-/// [`is_disc_level_no_key`]). See docs/error-codes.md for why.
+/// NOT skippable: a broken `mkv://` source ([`Error::MkvSourceInvalid`] and siblings) or a
+/// whole-disc key failure ([`Error::CssNoDiscKey`], see [`is_disc_level_no_key`]).
 pub fn is_skippable_title_stub(e: &std::io::Error) -> bool {
     matches!(error_code(e), Some(E_MKV_INVALID | E_CSS_KEY_MISSING))
 }
@@ -1333,14 +1319,12 @@ pub fn is_halt(e: &std::io::Error) -> bool {
     error_code(e) == Some(E_HALTED)
 }
 
-/// Whether an [`io::Error`](std::io::Error) is a **disc-level** key failure —
-/// the disc as a whole cannot be decrypted, so EVERY title will fail the same
-/// way. Distinct from a per-title skippable stub ([`is_skippable_title_stub`]).
-/// Covers `E_NO_DISC_KEY`, `E_KEYDB_LOAD`, `E_AACS_NO_KEYS`, `E_CSS_NO_DISC_KEY`,
-/// and the key-SOURCE failures (`E_KEY_SERVICE_UNAVAILABLE`/`UNAUTHORIZED`/
-/// `RATE_LIMITED`) — a down/throttled/unauthorized source fails every title too.
-/// A multi-title rip loop should fail fast rather than iterate. See
-/// docs/error-codes.md for why each code belongs here.
+/// Whether an [`io::Error`](std::io::Error) is a **disc-level** key failure — the disc as a
+/// whole cannot be decrypted, so EVERY title will fail the same way. Distinct from a per-title
+/// skippable stub ([`is_skippable_title_stub`]). Covers `E_NO_DISC_KEY`, `E_KEYDB_LOAD`,
+/// `E_AACS_NO_KEYS`, `E_CSS_NO_DISC_KEY`, and the key-SOURCE failures
+/// (`E_KEY_SERVICE_UNAVAILABLE`/`UNAUTHORIZED`/ `RATE_LIMITED`) — a down/throttled/unauthorized
+/// source fails every title too. A multi-title rip loop should fail fast rather than iterate.
 pub fn is_disc_level_no_key(e: &std::io::Error) -> bool {
     matches!(
         error_code(e),
@@ -1431,9 +1415,8 @@ impl Error {
     /// sometimes recover the data: MEDIUM ERROR (3), ABORTED COMMAND (B),
     /// NOT READY (2), RECOVERED ERROR (1), or NO SENSE (0).
     ///
-    /// `false` for transport failures, HARDWARE ERROR, DATA PROTECT, UNIT
-    /// ATTENTION, ILLEGAL REQUEST, BLANK CHECK, `IoError`, and non-SCSI
-    /// variants. See docs/error-codes.md for BU40N specifics and callers.
+    /// `false` for transport failures, HARDWARE ERROR, DATA PROTECT, UNIT ATTENTION, ILLEGAL
+    /// REQUEST, BLANK CHECK, `IoError`, and non-SCSI variants.
     pub fn is_marginal_read(&self) -> bool {
         self.scsi_sense()
             .map(crate::scsi::ScsiSense::is_marginal)
@@ -1495,9 +1478,8 @@ mod tests {
         assert!(!is_skippable_title_stub(&cap));
     }
 
-    // The two CSS no-key conditions land on opposite sides of the per-title /
-    // whole-disc split (mirroring the AACS pair). See docs/error-codes.md for
-    // the incident that motivated the split.
+    // The two CSS no-key conditions land on opposite sides of the per-title / whole-disc split
+    // (mirroring the AACS pair).
     #[test]
     fn css_no_key_codes_split_disc_level_from_skippable() {
         let wide: std::io::Error = Error::CssNoDiscKey.into();
@@ -1840,8 +1822,8 @@ mod tests {
 
     // ── New comprehensive tests ────────────────────────────────────────────────
 
-    // Every `pub const E_*`, parsed from source (not hand-listed) so a new
-    // constant can't escape the uniqueness check below. See docs/error-codes.md.
+    // Every `pub const E_*`, parsed from source (not hand-listed) so a new constant can't
+    // escape the uniqueness check below.
     fn declared_error_codes() -> Vec<(&'static str, u16)> {
         const SRC: &str = include_str!("error.rs");
         SRC.lines()

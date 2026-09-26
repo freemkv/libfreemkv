@@ -6,8 +6,6 @@
 //! `Drive::drop`) and, after [`DiscSession::scan`], the resulting [`Disc`].
 //! libfreemkv resolves no keys and reads no keydb: the consumer supplies its
 //! own key material via [`KeySpec`], forwarded to [`ScanOptions`] at scan time.
-//!
-//! See docs/session.md for the lifecycle-split rationale and key-forwarding contract.
 
 use crate::aacs::trace::ResolutionTrace;
 use crate::disc::{Disc, DiscId, DriveCredentials, ScanOptions};
@@ -54,8 +52,6 @@ pub struct ResolvedKeys {
 /// file-backed [`SectorSource`] from [`scan_iso`]), runs the ordered `sources`
 /// first-valid-wins, banks any winning unit keys onto `disc`, and builds the
 /// read-time [`KeyFetch`] used for later on-decrypt-miss fetches.
-///
-/// See docs/session.md for the exact step-by-step breakdown.
 pub fn resolve_keys_for(
     reader: &mut dyn SectorSource,
     disc: &mut Disc,
@@ -331,8 +327,8 @@ impl DiscSession {
     ///
     /// # Errors
     ///
-    /// [`Error::DeviceNotReady`] when the drive is no longer held — reachable
-    /// through ordinary use (see docs/session.md), not just caller error.
+    /// [`Error::DeviceNotReady`] when the drive is no longer held — reachable through ordinary
+    /// use, not just caller error.
     pub fn into_drive(self) -> Result<Drive> {
         self.drive.ok_or_else(|| Error::DeviceNotReady {
             path: self.device.clone(),
@@ -368,9 +364,8 @@ impl DiscSession {
         self.reader.take()
     }
 
-    // Test-only: build a session over an injected reader + already-scanned disc
-    // without opening a live Drive, to exercise the mux/resolve_keys test paths.
-    // See docs/session.md for the full rationale.
+    // Test-only: build a session over an injected reader + already-scanned disc without opening
+    // a live Drive, to exercise the mux/resolve_keys test paths.
     #[cfg(test)]
     pub(crate) fn from_parts_for_test(
         disc: Option<Disc>,
@@ -389,7 +384,7 @@ impl DiscSession {
 
     // Test-only: build a session that OWNS a (mock-backed) `Drive` so the
     // stage/into_reader/into_drive lifecycle can be exercised (unreachable via
-    // `from_parts_for_test`, which holds no drive). See docs/session.md.
+    // `from_parts_for_test`, which holds no drive).
     #[cfg(test)]
     pub(crate) fn from_drive_for_test(drive: Drive) -> DiscSession {
         let device = drive.device_path().to_string();
@@ -412,8 +407,6 @@ impl DiscSession {
 /// No SCSI, no handshake, no key resolution beyond what `opts` already
 /// carries. The returned reader is a fresh handle at the start of the image,
 /// reusable by callers that need to sample ciphertext or feed a mux.
-///
-/// See docs/session.md for the full rationale.
 pub fn scan_iso(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorSource>)> {
     let mut reader = FileSectorSource::open(path)?;
     let capacity = reader.capacity_sectors();
@@ -435,8 +428,6 @@ const AACS_PROBE_UNITS: usize = 8;
 ///
 /// * none need decryption → `encrypted` is forced false, reason logged.
 /// * any unit does → [`Error::DirImageEncrypted`] (`dir://` doesn't support it).
-///
-/// See docs/session.md for the full rationale.
 pub fn scan_dir(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorSource>)> {
     let mut reader = crate::dirimage::DirImage::open(path)?;
     let capacity = reader.capacity_sectors();
@@ -446,9 +437,9 @@ pub fn scan_dir(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorS
     Ok((disc, Box::new(reader)))
 }
 
-// Re-judge a FOLDER's encryption verdict from its CONTENT (tree shape alone
-// can be wrong for an already-decrypted folder that kept `AACS/`). Shared by
-// scan_dir and the dir:// path in mux::resolve; see docs/session.md.
+// Re-judge a FOLDER's encryption verdict from its CONTENT (tree shape alone can be wrong for an
+// already-decrypted folder that kept `AACS/`). Shared by scan_dir and the dir:// path in
+// mux::resolve.
 pub(crate) fn apply_folder_encryption_verdict(
     reader: &mut dyn SectorSource,
     disc: &mut Disc,

@@ -269,9 +269,7 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
     None
 }
 
-// Classical (single-stage Media Key derivation) path chain, used by both
-// V10 and V20. See docs/aacs-resolve.md#resolve_keys_classical for the
-// full root-of-trust -> per-disc-leaf path list.
+// Classical (single-stage Media Key derivation) path chain, used by both V10 and V20.
 fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Option<ResolvedKeys> {
     let bus_encryption = ctx
         .content_cert
@@ -425,9 +423,8 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
 /// verifies when AES-128-ECB-D(mk, mk_dv) starts with it.
 const MK_VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
 
-// Path 2.5's MK-pool selection rule: a Media Key must be the EXACTLY ONE
-// distinct verifying candidate (dupes across providers are one candidate).
-// See docs/aacs-resolve.md#unique_verifying_mk for the ambiguity rationale.
+// Path 2.5's MK-pool selection rule: a Media Key must be the EXACTLY ONE distinct verifying
+// candidate (dupes across providers are one candidate).
 fn unique_verifying_mk(mks: &[[u8; 16]], verifies: impl Fn(&[u8; 16]) -> bool) -> Option<[u8; 16]> {
     let mut hits: Vec<[u8; 16]> = Vec::new();
     for mk in mks {
@@ -1248,9 +1245,9 @@ mod tests {
         );
     }
 
-    // Path 2.5's ambiguity guard: >1 distinct pooled MK verifying must yield
-    // NO key, never a pick (a wrong Km derives a wrong VUK that decrypts to
-    // garbage rather than failing loudly). See docs/aacs-resolve.md.
+    // Path 2.5's ambiguity guard: >1 distinct pooled MK verifying must yield NO key, never a
+    // pick (a wrong Km derives a wrong VUK that decrypts to garbage rather than failing
+    // loudly).
     #[test]
     fn mk_pool_ambiguity_bails_rather_than_picking_a_media_key() {
         let a = [0xAAu8; 16];
@@ -1810,9 +1807,9 @@ mod tests {
         assert_eq!(r.vuk, Some(derive_vuk(&mk, &vid)));
     }
 
-    // Zero VID is the "never read" sentinel gating paths 1/3; treating it as
-    // real derives a WRONG-but-valid VUK (silent garbage), treating a real
-    // VID as absent skips a resolvable disc. See docs/aacs-resolve.md.
+    // Zero VID is the "never read" sentinel gating paths 1/3; treating it as real derives a
+    // WRONG-but-valid VUK (silent garbage), treating a real VID as absent skips a resolvable
+    // disc.
     #[test]
     fn resolve_keys_v21_treats_the_all_zero_volume_id_as_no_vid() {
         let uk_ro = minimal_unit_key_ro();
@@ -2061,9 +2058,8 @@ mod tests {
         );
     }
 
-    // A non-zero VID present but resolution still fails must classify
-    // NoMaterial, never VidUnavailable, regardless of how much derivation
-    // material is on hand. See docs/aacs-resolve.md for the full rationale.
+    // A non-zero VID present but resolution still fails must classify NoMaterial, never
+    // VidUnavailable, regardless of how much derivation material is on hand.
     #[test]
     fn classify_vid_present_with_material_is_no_material_not_vid() {
         let prov = material_provider(vec![one_device_key()], vec![[0u8; 16]]);

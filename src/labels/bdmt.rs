@@ -6,17 +6,14 @@
 //! ([`detect`] then [`parse`]); [`DiscMetadata`] is re-exported there.
 //! Extraction is best-effort — a malformed file yields `None`, other
 //! sibling-language files can still supply metadata.
-//!
-//! See docs/bdmt.md — schema fields, vendor quirks, real-world irregularities.
 
 use super::xml;
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::BTreeMap;
 
-// Upper bound on a single bdmt_<lang>.xml we will read. Size is
-// attacker-controlled UDF metadata; real files are a few KB. See
-// docs/bdmt.md — MAX_BDMT_BYTES.
+// Upper bound on a single bdmt_<lang>.xml we will read. Size is attacker-controlled UDF
+// metadata; real files are a few KB.
 const MAX_BDMT_BYTES: u64 = 1024 * 1024;
 
 /// Disc-level metadata extracted from `/BDMV/META/DL/bdmt_*.xml`.
@@ -131,9 +128,8 @@ fn lang_code_from_filename(name: &str) -> Option<String> {
 /// Aliased so the function signature isn't a clippy::type-complexity offender.
 pub(crate) type BdmtFields = (String, Option<String>, Option<(u32, u32)>);
 
-// Parse one bdmt_<lang>.xml document into (title, description?, disc_set?).
-// None if no title could be located. See docs/bdmt.md — parse_bdmt_xml
-// title-element priority order.
+// Parse one bdmt_<lang>.xml document into (title, description?, disc_set?). None if no title
+// could be located.
 pub(crate) fn parse_bdmt_xml(xml_text: &str) -> Option<BdmtFields> {
     let title = extract_title(xml_text)?;
     // xml::text already returns a trimmed string (see xml::text), so the
@@ -145,14 +141,12 @@ pub(crate) fn parse_bdmt_xml(xml_text: &str) -> Option<BdmtFields> {
     Some((title, description, disc_set))
 }
 
-/// Reject description candidates that are themselves XML fragments (e.g.
-/// only <di:thumbnail/> children, no prose) OR mixed content — prose with an
-/// embedded child element, which `xml::text` returns verbatim (tags and all).
-/// The old `starts_with('<')` only caught fragments that LED with a tag, so a
-/// description like `Real prose <di:thumbnail/>` leaked its markup through. Any
-/// `<` that begins an element / close tag / comment / PI marks the value as
+/// Reject description candidates that are themselves XML fragments (e.g. only <di:thumbnail/>
+/// children, no prose) OR mixed content — prose with an embedded child element, which
+/// `xml::text` returns verbatim (tags and all). The old `starts_with('<')` only caught
+/// fragments that LED with a tag, so a description like `Real prose <di:thumbnail/>` leaked its
+/// markup through. Any `<` that begins an element / close tag / comment / PI marks the value as
 /// XML-tainted; a bare `<` used as prose (e.g. `a < b`) is left alone.
-/// See docs/bdmt.md — looks_like_xml.
 fn looks_like_xml(s: &str) -> bool {
     let bytes = s.as_bytes();
     bytes.iter().enumerate().any(|(i, &b)| {

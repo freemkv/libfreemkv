@@ -6,8 +6,6 @@
 //! `Pipeline` + `Sink` overlaps reads with writes via a bounded
 //! channel + consumer thread. `byte_prefetcher` is the read-ahead
 //! producer feeding the mux pipeline for `io::Read`-backed sources.
-//!
-//! See docs/io-mod.md for rationale.
 
 pub(crate) mod bounded;
 pub mod byte_prefetcher;

@@ -2,10 +2,8 @@
 //! language lists with forced flags and commentary indices per playlist,
 //! all in XML attributes.
 //!
-//! NOT A SPECIFICATION: `/BDMV/JAR/` is application-defined space; every
-//! field meaning here was derived by measuring real discs — see
-//! docs/paramount.md for the derivation. The disc's own `forced_on_flag`
-//! is the only authoritative forced signal.
+//! NOT A SPECIFICATION: `/BDMV/JAR/` is application-defined space; every field meaning here was
+//! derived by measuring real discs.
 //!
 //! ```xml
 //! <playlist name="Feature" id="00222"
@@ -65,9 +63,7 @@ fn feature_hint(feature: &str) -> Option<super::FeaturePlaylistHint> {
     })
 }
 
-// One cell of the `forced_sub` CSV. Reads like a boolean but is an
-// enumeration; see docs/paramount.md for the corpus measurements behind
-// each value. Unrecognised cells map to `None` — the conservative direction.
+// One cell of the `forced_sub` CSV. Reads like a boolean but is an enumeration.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ForcedSub {
     /// No forced-narrative content, or an unrecognised cell.
@@ -78,14 +74,12 @@ enum ForcedSub {
     ForcedNarrative,
 }
 
-// The highest CSV cell position that can ever be addressed — caps both the
-// VALUE set size and the WORK done per cell. See docs/paramount.md for why
-// those are two different bounds. Real authoring never approaches it.
+// The highest CSV cell position that can ever be addressed — caps both the VALUE set size and
+// the WORK done per cell.
 const MAX_COM_INDICES: usize = u16::MAX as usize;
 
-// Parse a `*_com1_idx` attribute into the set the labelling loops query.
-// Extracted so the bound is independently testable — see docs/paramount.md
-// (`com_indices` / `forced_subs`) for why a label-level test cannot see it.
+// Parse a `*_com1_idx` attribute into the set the labelling loops query. Extracted so the bound
+// is independently testable.
 fn com_indices(attr: Option<String>) -> HashSet<usize> {
     attr.map(|s| {
         s.split(',')
@@ -97,9 +91,8 @@ fn com_indices(attr: Option<String>) -> HashSet<usize> {
     .unwrap_or_default()
 }
 
-// Parse `forced_sub` into the cell list the subtitle loop queries. Bounded
-// by POSITION rather than value (nothing to filter on a classification) —
-// see docs/paramount.md (`com_indices` / `forced_subs`) for why.
+// Parse `forced_sub` into the cell list the subtitle loop queries. Bounded by POSITION rather
+// than value (nothing to filter on a classification).
 fn forced_subs(attr: Option<String>) -> Vec<ForcedSub> {
     attr.map(|s| {
         s.split(',')
@@ -349,9 +342,7 @@ fn pick(cands: &[Candidate], key: Key, require_audio: bool) -> Option<String> {
 mod tests {
     use super::*;
 
-    // Immunity pin, section-boundary half — see docs/paramount.md.
-    // Mutation: hand `labels_from_feature` the document instead of the
-    // element, or let an unterminated element run to EOF.
+    // Immunity pin, section-boundary half.
     #[test]
     fn a_playlists_stream_list_cannot_run_into_the_next_playlist() {
         let doc = r#"
@@ -386,9 +377,7 @@ mod tests {
         );
     }
 
-    // Replaces a flaky wall-clock test; see docs/paramount.md for why.
-    // Guards that bounding the parse did not change what a legitimate
-    // playlist MEANS (real indices `0,2,4` must still resolve).
+    // Replaces a flaky wall-clock test.
     #[test]
     fn bounding_the_parse_does_not_change_a_legitimate_playlist() {
         // Three real indices, then far more entries than can address a cell.
@@ -413,9 +402,8 @@ mod tests {
         assert_eq!(labels[4].purpose, LabelPurpose::Commentary);
     }
 
-    // The set REFUSES unaddressable indices. DISTINCT values on purpose — a
-    // `HashSet` collapses repeats, so only distinct entries can prove the
-    // filter exists; see docs/paramount.md for the full rationale.
+    // The set REFUSES unaddressable indices. DISTINCT values on purpose — a `HashSet` collapses
+    // repeats, so only distinct entries can prove the filter exists.
     #[test]
     fn distinct_unaddressable_indices_are_refused_not_stored() {
         let hostile: String = (MAX_COM_INDICES..MAX_COM_INDICES + 50_000)
@@ -432,9 +420,8 @@ mod tests {
         assert_eq!(com_indices(Some("0,2,4".to_string())).len(), 3);
     }
 
-    // `forced_sub` is bounded too, and read through `forced_subs` rather
-    // than the labels for the same reason as the tests above — see
-    // docs/paramount.md.
+    // `forced_sub` is bounded too, and read through `forced_subs` rather than the labels for
+    // the same reason as the tests above.
     #[test]
     fn forced_sub_cells_past_the_last_addressable_one_are_not_parsed() {
         let hostile = "0,".repeat(MAX_COM_INDICES + 50_000);
@@ -463,9 +450,8 @@ mod tests {
         );
     }
 
-    // An index that cannot address any cell is dropped rather than STORED.
-    // Asserted through `com_indices`, not the labels — see docs/paramount.md
-    // for why a label-level assertion here could not fail.
+    // An index that cannot address any cell is dropped rather than STORED. Asserted through
+    // `com_indices`, not the labels.
     #[test]
     fn an_index_that_cannot_address_any_cell_is_not_retained() {
         let set = com_indices(Some(format!(
@@ -515,9 +501,8 @@ mod tests {
             .collect()
     }
 
-    // An empty CSV cell carries nothing to label but still OCCUPIES its STN
-    // slot, so it must not renumber the slots behind it — see
-    // docs/paramount.md for how the old renumbering misplaced a forced flag.
+    // An empty CSV cell carries nothing to label but still OCCUPIES its STN slot, so it must
+    // not renumber the slots behind it.
     #[test]
     fn empty_csv_slot_still_occupies_its_stn_slot() {
         // Audio: slot 2 is empty; `fra` is STN slot 3 and is the commentary
@@ -760,9 +745,8 @@ mod tests {
         assert_eq!(s[2].qualifier, LabelQualifier::None);
     }
 
-    // `forced_sub` is an enumeration; `1` means "full dialogue track that
-    // also carries forced signs", NOT "this track is forced" — see
-    // docs/paramount.md. Mutation: `"1" => ForcedNarrative` (old reading).
+    // `forced_sub` is an enumeration; `1` means "full dialogue track that also carries forced
+    // signs", NOT "this track is forced".
     #[test]
     fn a_contains_forced_segments_cell_is_not_a_forced_track() {
         let feature = r#"<playlist name="Feature" sub="eng,ces,deu" forced_sub="0,1,1" />"#;
@@ -775,9 +759,8 @@ mod tests {
         );
     }
 
-    // `2` and `3` are the cells that DO name a dedicated forced-narrative
-    // track, and the old boolean reading discarded both — see
-    // docs/paramount.md. Mutation: drop either arm of the `"2" | "3"` match.
+    // `2` and `3` are the cells that DO name a dedicated forced-narrative track, and the old
+    // boolean reading discarded both.
     #[test]
     fn a_dedicated_forced_narrative_cell_is_a_forced_track() {
         // The measured shape: full tracks first, their forced companions in
@@ -795,9 +778,8 @@ mod tests {
         assert_eq!(s[4].stream_number, 5);
     }
 
-    // An unrecognised cell must fall to NOT forced — asserting forced is
-    // the expensive mistake (see docs/paramount.md). Mutation:
-    // `_ => ForcedNarrative`, or treating "any non-zero" as forced.
+    // An unrecognised cell must fall to NOT forced — asserting forced is the expensive mistake.
+    // Mutation: `_ => ForcedNarrative`, or treating "any non-zero" as forced.
     #[test]
     fn an_unrecognised_forced_sub_cell_is_not_forced() {
         let feature = r#"<playlist name="Feature" sub="eng,fra,spa,ita" forced_sub="4,x,,-1" />"#;
@@ -835,9 +817,8 @@ mod tests {
         assert!(feature_hint(r#"<playlist id="menu" />"#).is_none());
     }
 
-    // Spec: on a tie in audio-slot count, the FIRST playlist wins (see
-    // docs/paramount.md). Mutation: `count > best_aud_count` ->
-    // `count >= best_aud_count` lets a later tie silently displace it.
+    // Spec: on a tie in audio-slot count, the FIRST playlist wins. Mutation: `count >
+    // best_aud_count` -> `count >= best_aud_count` lets a later tie silently displace it.
     #[test]
     fn find_feature_first_wins_on_audio_count_tie() {
         let xml = r#"

@@ -1,28 +1,10 @@
-//! Generic BD-J feature-playlist resolver — the issue #45 "menu-walk"
-//! authoritative layer, run when no framework parser surfaced a manifest hint.
+//! Resolve a feature playlist from BD-J resources when framework parsers have no hint.
 //!
-//! Two tiers, most reliable first:
-//!
-//! * **Tier 1 — jar-space resource sweep (High confidence).** Newer discs embed
-//!   the same `dcx.xml` / `playlists.xml` / `*.properties` manifests that Fox
-//!   and Paramount ship loose, but INSIDE a `/BDMV/JAR/*.jar` instead. The
-//!   feature id is still statically recoverable: reuse
-//!   [`fox::feature_hint`](super::fox::feature_hint) /
-//!   [`paramount::feature_hint_from_xml`](super::paramount::feature_hint_from_xml).
-//!
-//! * **Tier 2 — autostart-Xlet locator scan (best-effort, Medium).** Parse the
-//!   `/BDMV/BDJO/*.bdjo` Application Management Table for the AUTOSTART app's
-//!   jar(s) ([`crate::bdnav::bdjo`]), harvest `NNNNN.mpls` / `bd://…PLAYLIST:N`
-//!   String constants from that jar's `.class` constant pools, intersect them
-//!   with the real `/BDMV/PLAYLIST/*.mpls` set, and disambiguate by parsed
-//!   duration — the feature is a single candidate that dominates the runner-up
-//!   and carries multiple audio streams. A hint is emitted ONLY when a single
-//!   dominant candidate survives; integer-only evidence never emits.
-//!
-//! Everything failing here (modern-Fox pure-bytecode `StandardMenuXlet` with no
-//! usable `.mpls` string, no usable integer constant) is left to the chapter
-//! failsafe in `disc::mod`. This module is read-only, bounded, and never panics
-//! (the caller also wraps it in `catch_unwind`).
+//! Embedded XML/properties manifests take precedence. Otherwise, scan autostart
+//! Xlet jars for playlist string constants and intersect them with actual playlists.
+//! Emit a hint only for one dominant-duration candidate with multiple audio streams;
+//! integer constants alone are insufficient evidence. Return `None` on ambiguity
+//! so the caller can use its chapter-based fallback.
 
 use super::class_reader::CpInfo;
 use super::{FeaturePlaylistHint, fox, jar, paramount};

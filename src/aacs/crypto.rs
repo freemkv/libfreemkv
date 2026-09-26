@@ -57,9 +57,8 @@ pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     out
 }
 
-// AES-128-CBC encrypt in place under AACS_IV. Forward direction / exact
-// inverse of aes_cbc_decrypt (`[C]` §2.1.2, AES-128CBCE).
-// See docs/aacs-crypto.md — aes_cbc_encrypt (precondition, single key schedule).
+// AES-128-CBC encrypt in place under AACS_IV. Forward direction / exact inverse of
+// aes_cbc_decrypt (`[C]` §2.1.2, AES-128CBCE).
 pub(crate) fn aes_cbc_encrypt(key: &[u8; 16], data: &mut [u8]) {
     debug_assert!(
         data.len().is_multiple_of(16),
@@ -83,7 +82,6 @@ pub(crate) fn aes_cbc_encrypt(key: &[u8; 16], data: &mut [u8]) {
 }
 
 // AES-128-CBC decrypt in-place under AACS_IV (`[C]` §2.1.2, AES-128CBCD).
-// See docs/aacs-crypto.md — aes_cbc_decrypt (precondition, doc-orphaning history).
 pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
     debug_assert!(
         data.len().is_multiple_of(16),
@@ -92,9 +90,8 @@ pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
     cbc_decrypt_blocks(&new_cipher(key), data);
 }
 
-// AES-128-CBC decrypt in place under AACS_IV with an already-expanded key
-// schedule. Split out of aes_cbc_decrypt for callers that share one key
-// across several regions. See docs/aacs-crypto.md — cbc_decrypt_blocks.
+// AES-128-CBC decrypt in place under AACS_IV with an already-expanded key schedule. Split out
+// of aes_cbc_decrypt for callers that share one key across several regions.
 pub(crate) fn cbc_decrypt_blocks(cipher: &Aes128, data: &mut [u8]) {
     let num_blocks = data.len() / 16;
     // Process blocks in reverse to avoid clobbering ciphertext needed for XOR
@@ -117,9 +114,8 @@ pub(crate) fn cbc_decrypt_blocks(cipher: &Aes128, data: &mut [u8]) {
     }
 }
 
-// AES-G(x1, x2) = AES-128D(x1, x2) XOR x2 (`[C]` §2.1.3, uses AES-128D).
-// Used by the Media Key Variant chain to derive Kvn and Kvu.
-// See docs/aacs-crypto.md — aes_g.
+// AES-G(x1, x2) = AES-128D(x1, x2) XOR x2 (`[C]` §2.1.3, uses AES-128D). Used by the Media Key
+// Variant chain to derive Kvn and Kvu.
 pub(crate) fn aes_g(x1: &[u8; 16], x2: &[u8; 16]) -> [u8; 16] {
     let mut out = aes_ecb_decrypt(x1, x2);
     for i in 0..16 {
@@ -133,9 +129,8 @@ pub(crate) const AESG3_SEED: [u8; 16] = [
     0x7B, 0x10, 0x3C, 0x5D, 0xCB, 0x08, 0xC4, 0xE5, 0x1A, 0x27, 0xB0, 0x17, 0x99, 0x05, 0x3B, 0xD9,
 ];
 
-// AACS-G3: derive a subkey from a parent key (`[C]` §3.2.2, Triple AES
-// Generator). Shared with super::variant so both SD-tree walks stay
-// byte-identical. See docs/aacs-crypto.md — aesg3.
+// AACS-G3: derive a subkey from a parent key (`[C]` §3.2.2, Triple AES Generator). Shared with
+// super::variant so both SD-tree walks stay byte-identical.
 pub(crate) fn aesg3(key: &[u8; 16], inc: u8) -> [u8; 16] {
     let mut seed = AESG3_SEED;
     seed[15] = seed[15].wrapping_add(inc);
@@ -150,9 +145,8 @@ pub(crate) fn aesg3(key: &[u8; 16], inc: u8) -> [u8; 16] {
 mod tests {
     use super::*;
 
-    // s0 transcribed independently from `[C]` §3.2.2, not read from AESG3_SEED,
-    // so this can't assert the production constant against itself.
-    // See docs/aacs-crypto.md — test: S0.
+    // s0 transcribed independently from `[C]` §3.2.2, not read from AESG3_SEED, so this can't
+    // assert the production constant against itself.
     const S0: [u8; 16] = [
         0x7B, 0x10, 0x3C, 0x5D, 0xCB, 0x08, 0xC4, 0xE5, 0x1A, 0x27, 0xB0, 0x17, 0x99, 0x05, 0x3B,
         0xD9,
@@ -166,9 +160,8 @@ mod tests {
         0xF0,
     ];
 
-    // aesg3 is the SD-tree node function; a wrong `^` or a constant body
-    // would derive a plausible-but-wrong Processing Key. Pinned via the spec
-    // relation (see docs/aacs-crypto.md for the full derivation).
+    // aesg3 is the SD-tree node function; a wrong `^` or a constant body would derive a
+    // plausible-but-wrong Processing Key. Pinned via the spec relation.
     #[test]
     fn aesg3_inverts_to_the_spec_seed_under_aes_encrypt() {
         for inc in 0u8..=2 {
@@ -191,9 +184,8 @@ mod tests {
         }
     }
 
-    // The Triple Generator's three outputs are one node's two children plus
-    // its Processing Key; if `inc` were ignored a descent would revisit its
-    // own parent. See docs/aacs-crypto.md — test: three distinct subkeys.
+    // The Triple Generator's three outputs are one node's two children plus its Processing Key;
+    // if `inc` were ignored a descent would revisit its own parent.
     #[test]
     fn aesg3_yields_three_distinct_subkeys_for_the_three_increments() {
         let left = aesg3(&K, 0);

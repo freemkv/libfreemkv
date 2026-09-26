@@ -6,8 +6,6 @@
 //!   that keeps the reported size).
 //! - `durable_sync` delegates to `File::sync_all` (`FlushFileBuffers`),
 //!   unbounded unlike the Linux/macOS impls.
-//!
-//! See docs/writeback-file-windows.md for the rationale.
 
 use std::fs::File;
 use std::io;

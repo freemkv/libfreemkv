@@ -14,9 +14,8 @@ const SC_SEQUENCE_HEADER: u8 = 0x0F;
 const SC_ENTRY_POINT: u8 = 0x0E;
 const SC_FRAME: u8 = 0x0D;
 
-// Read the advanced-profile sequence header's `INTERLACE` flag (SMPTE 421M
-// §6.1.1), bit 41 after the start code. `None` for simple/main profile.
-// See docs/vc1.md — parse_vc1_interlace bit layout.
+// Read the advanced-profile sequence header's `INTERLACE` flag (SMPTE 421M §6.1.1), bit 41
+// after the start code. `None` for simple/main profile.
 fn parse_vc1_interlace(sh: &[u8]) -> Option<bool> {
     if sh.len() < 8 || (sh[4] >> 6) & 0x03 != 3 {
         return None; // need the start code + advanced profile (PROFILE == 3)
@@ -46,9 +45,8 @@ fn parse_vc1_interlace(sh: &[u8]) -> Option<bool> {
     Some((bits >> 6) & 1 == 1)
 }
 
-// Decode the advanced-profile **progressive** picture PTYPE VLC (SMPTE 421M
-// §7.1.1.4). Only valid when the sequence is progressive — interlaced uses
-// an FCM/FPTYPE code instead. See docs/vc1.md — vc1_progressive_ptype.
+// Decode the advanced-profile **progressive** picture PTYPE VLC (SMPTE 421M §7.1.1.4). Only
+// valid when the sequence is progressive — interlaced uses an FCM/FPTYPE code instead.
 fn vc1_progressive_ptype(br: &mut BitReader) -> Option<CodingType> {
     if br.read_bit()? == 0 {
         return Some(CodingType::P); // 0
@@ -67,9 +65,8 @@ fn vc1_progressive_ptype(br: &mut BitReader) -> Option<CodingType> {
     })
 }
 
-// Measure the coding type of an advanced-profile frame from its picture
-// header. Decodes PTYPE only for a PROGRESSIVE sequence; declines (`None`)
-// for interlaced/simple-main/unknown. See docs/vc1.md — vc1_frame_coding_type.
+// Measure the coding type of an advanced-profile frame from its picture header. Decodes PTYPE
+// only for a PROGRESSIVE sequence; declines (`None`) for interlaced/simple-main/unknown.
 fn vc1_frame_coding_type(frame_rbsp: &[u8], seq_header: Option<&[u8]>) -> Option<CodingType> {
     if parse_vc1_interlace(seq_header?)? {
         return None; // interlaced: FCM/FPTYPE not decoded here
@@ -134,9 +131,8 @@ impl Vc1Parser {
     }
 }
 
-// Handle a seq_header or entry_point start-code unit (Annex B raw bytes).
-// Strips the first-seen (codecPrivate-seeding) and redundant copies; emits
-// only a genuine change vs the active body. See docs/vc1.md — handle_header.
+// Handle a seq_header or entry_point start-code unit (Annex B raw bytes). Strips the first-seen
+// (codecPrivate-seeding) and redundant copies; emits only a genuine change vs the active body.
 fn handle_header(
     first: &mut Option<Vec<u8>>,
     cur: &mut Option<Vec<u8>>,
@@ -358,9 +354,8 @@ impl CodecParser for Vc1Parser {
     }
 }
 
-// Parse width and height from a VC-1 advanced profile sequence header
-// (00 00 01 0F ...). Coded dimensions are 12-bit fields. See docs/vc1.md
-// — parse_vc1_resolution bit layout.
+// Parse width and height from a VC-1 advanced profile sequence header (00 00 01 0F...). Coded
+// dimensions are 12-bit fields.
 fn parse_vc1_resolution(sh: &[u8]) -> Option<(u32, u32)> {
     // sh starts at the start code (00 00 01 0F ...)
     if sh.len() < 8 {
@@ -750,9 +745,8 @@ mod tests {
         assert_eq!(frames[0].pts_ns, 2_000_000_000);
     }
 
-    // --- advanced-profile resolution parsing (bit-offset regression) ---
-    // Builds a seq header encoding width/height (PROFILE=3 + coded W/H
-    // fields). See docs/vc1.md — make_ap_seq_header bit layout.
+    // --- advanced-profile resolution parsing (bit-offset regression) --- Builds a seq header
+    // encoding width/height (PROFILE=3 + coded W/H fields).
     fn make_ap_seq_header(width: u32, height: u32) -> Vec<u8> {
         let coded_w = (width / 2) - 1;
         let coded_h = (height / 2) - 1;
@@ -1023,9 +1017,8 @@ mod tests {
         assert_eq!(&extra[0..4], &[0x00, 0x00, 0x01, SC_SEQUENCE_HEADER]);
     }
 
-    // --- regression: mid-stream entry_point A→B→A revert emitted in-band ---
-    // Reverted A must still be emitted IN-BAND (decoder already on B needs
-    // the explicit revert). See docs/vc1.md — entry_point_revert_to_first.
+    // --- regression: mid-stream entry_point A→B→A revert emitted in-band --- Reverted A must
+    // still be emitted IN-BAND (decoder already on B needs the explicit revert).
     #[test]
     fn vc1_emits_entry_point_revert_to_first_value() {
         let sh = [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xAA, 0xBB];
@@ -1125,9 +1118,8 @@ mod tests {
         );
     }
 
-    // Regression: keyframe with seq_header UNCHANGED but entry_point REDEFINED
-    // must still assemble prefix in seq-then-entry order (SMPTE 421M). See
-    // docs/vc1.md — vc1_keyframe_prefix_order_seq_unchanged_entry_redefined.
+    // Regression: keyframe with seq_header UNCHANGED but entry_point REDEFINED must still
+    // assemble prefix in seq-then-entry order (SMPTE 421M).
     #[test]
     fn vc1_keyframe_prefix_order_seq_unchanged_entry_redefined() {
         let sh = [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xAA, 0xBB, 0xCC];

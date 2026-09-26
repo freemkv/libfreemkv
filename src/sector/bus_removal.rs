@@ -1,42 +1,15 @@
-//! `BusRemovalSectorSource` — a stream form of AACS bus-encryption removal.
+//! AACS bus-encryption removal for sector streams.
 //!
-//! # Where bus removal actually happens
-//! AACS 2.0 "bus encryption" (BEE) wraps content on the drive↔host transport,
-//! and removing it is the UNLOCKER's job. The single de-bus TRANSFORM is
-//! [`decrypt_bus_in_content`]; in the PRODUCTION path it is applied once, at the
-//! very bottom of the read chain, inside the live drive's own `SectorSource`
-//! impl (`Drive::remove_bus_encryption`, gated by the drive's `BusStage` +
-//! content ranges). Every reader above it (key sampler, mux, unit-key
-//! validation, whole-disc sweep) reads the `Drive` as `&mut dyn SectorSource`
-//! and so transparently sees bus-removed sectors and never reasons about bus
-//! encryption.
+//! The live `Drive` already removes bus encryption. Do not wrap it in this
+//! adapter: applying the transform twice corrupts content. This adapter is for
+//! other sources and tests, using the same [`decrypt_bus_in_content`] transform.
+//! [`BusStage::Passthrough`] leaves sectors untouched; [`BusStage::AacsHostKey`]
+//! applies the host key obtained through the AACS handshake.
 //!
-//! This decorator is an equivalent, independently-tested STREAM form of that
-//! same transform (it also calls [`decrypt_bus_in_content`]), kept for tests and
-//! for any future non-`Drive` source that needs de-bussing. It is NOT wired into
-//! the production chain today. DANGER: never wrap the live `Drive` in this
-//! decorator — the `Drive` already de-busses, so a second pass would DOUBLE-
-//! de-bus and corrupt content. There must only ever be ONE de-bus in a chain.
-//!
-//! # How the stage is chosen
-//! [`BusStage`] is computed ONCE from the unlock result:
-//!   * a firmware/vendor unlocker (freemkv / LibreDrive / Renesas) removes bus
-//!     encryption AT THE DRIVE (`Bus=off`), and a non-bus disc (DVD / clear BD)
-//!     has none → [`BusStage::Passthrough`] (reads pass through untouched);
-//!   * the AACS cert route yields the Read Data Key from the AKE, so the host
-//!     must de-bus each content sector → [`BusStage::AacsHostKey`].
-//!
-//! # Content gating
-//! De-bussing a clear UDF/nav sector would corrupt plaintext, so the host-key
-//! path is gated to the disc's encrypted-content extents via
-//! [`with_content_ranges`](BusRemovalSectorSource::with_content_ranges) — the
-//! same `(start_lba, sector_count)` map [`DecryptingSectorSource`] uses. Absent
-//! a map, the caller reads content-only (title extents) and every sector is
-//! treated as content — matching the pre-overhaul behaviour where `decrypt_bus`
-//! ran on content units only.
+//! Content ranges protect clear UDF/navigation sectors from decryption. Without
+//! ranges, the caller must supply content-only sectors.
 //!
 //! [`decrypt_bus_in_content`]: crate::aacs::content::decrypt_bus_in_content
-//! [`DecryptingSectorSource`]: crate::sector::decrypting::DecryptingSectorSource
 
 use std::sync::Arc;
 

@@ -1,10 +1,8 @@
 //! Filesystem-type detection.
 //!
-//! Picks the output sink for the Phase 2 buffering architecture (NFS
-//! gets `WritebackFile`, local disks get `LocalFileSink`) and exposes
-//! the cross-platform enum and `detect` entry point; the per-OS
-//! `statfs` call lives in the matching platform file. See
-//! docs/fs-type.md for the full rationale.
+//! Picks the output sink for the Phase 2 buffering architecture (NFS gets `WritebackFile`,
+//! local disks get `LocalFileSink`) and exposes the cross-platform enum and `detect` entry
+//! point; the per-OS `statfs` call lives in the matching platform file.
 
 use std::path::Path;
 

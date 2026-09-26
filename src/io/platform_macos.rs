@@ -1,9 +1,7 @@
 //! Shared macOS `fcntl(F_PREALLOCATE)` definitions.
 //!
-//! The `libc` crate doesn't expose these symbols across all macOS SDK
-//! versions, so we define them locally with values from
-//! `/usr/include/sys/fcntl.h`. See docs/platform-macos.md for why a
-//! single source of truth here matters and how the cfg gate works.
+//! The `libc` crate doesn't expose these symbols across all macOS SDK versions, so we define
+//! them locally with values from `/usr/include/sys/fcntl.h`.
 //!
 //! [`crate::io::writeback_file`] and `crate::io::sink::preallocate`
 //! both depend on these constants and the `fstore_t` layout.

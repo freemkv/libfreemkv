@@ -8,7 +8,6 @@
 //! [`SequentialSink`](super::SequentialSink) is implemented explicitly
 //! so `finish()` flushes and `fsync`s even through a `dyn` trait object;
 //! [`RandomAccessSink`](super::RandomAccessSink) is over the `Seek` impl.
-// See docs/local-file-sink.md — buffering & seek-flush rationale.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};

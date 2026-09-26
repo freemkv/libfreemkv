@@ -47,9 +47,7 @@ impl Packet {
         self.len += n;
     }
 
-    // Write the 4-byte TS packet header (pid, payload_unit_start,
-    // has_payload, has_adaptation, cc — see docs/m2ts-mux.md for the
-    // per-field bit layout).
+    // Write the 4-byte TS packet header.
     pub(super) fn set_header(
         &mut self,
         pid: u16,
@@ -74,9 +72,8 @@ impl Packet {
         self.push((afc << 4) | (cc & 0x0F));
     }
 
-    // Append the adaptation field after the header: `body` is the field body
-    // (flags + optional PCR etc.), `stuffing` is the trailing 0xFF count.
-    // See docs/m2ts-mux.md for the length-byte and error contract.
+    // Append the adaptation field after the header: `body` is the field body (flags + optional
+    // PCR etc.), `stuffing` is the trailing 0xFF count.
     pub(super) fn append_adaptation(&mut self, body: &[u8], stuffing: usize) -> io::Result<()> {
         let af_len = body.len() + stuffing;
         if af_len > MAX_AF_LEN {
@@ -354,9 +351,8 @@ mod tests {
         }
     }
 
-    // PacketWriter buffers nothing itself, so flush() is the only thing
-    // that empties the sink's buffer — skipping it truncates the stream
-    // mid-packet. See docs/m2ts-mux.md for the full failure mode.
+    // PacketWriter buffers nothing itself, so flush() is the only thing that empties the sink's
+    // buffer — skipping it truncates the stream mid-packet.
     #[test]
     fn flush_delivers_the_buffered_packets_to_the_sink() {
         let sink = SharedSink::default();

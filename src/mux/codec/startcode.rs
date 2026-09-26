@@ -38,9 +38,8 @@ pub fn skip_start_code(data: &[u8], pos: usize) -> Option<usize> {
     None
 }
 
-// MSB-first bit reader over an RBSP, for the leading fields of a coded slice
-// header. Does NOT de-emulate `00 00 03`; safe only for the leading fields.
-// See docs/startcode.md — BitReader emulation-prevention rationale.
+// MSB-first bit reader over an RBSP, for the leading fields of a coded slice header. Does NOT
+// de-emulate `00 00 03`; safe only for the leading fields.
 pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     bit: usize,

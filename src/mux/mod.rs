@@ -38,9 +38,8 @@ pub(crate) mod demux_thread;
 // appropriate (`MkvStream`/`M2tsStream` from `lib.rs`), but the paths are not API.
 // Pre-0.13 these were `pub`, leaking EBML/TS/network/stdio internals.
 pub(crate) mod ebml;
-/// `fvi://` sink — freemkv's native per-picture video index (see
-/// `docs/FVI_FORMAT.md`). A write-only PES sink that emits one JSON-Lines record
-/// per coded picture; reuses the pure-data [`videomap`] model.
+/// `fvi://` sink — freemkv's native per-picture video index. A write-only PES sink that emits
+/// one JSON-Lines record per coded picture; reuses the pure-data [`videomap`] model.
 pub(crate) mod fvi_sink;
 pub(crate) mod m2ts;
 /// FMKV metadata header (used by `M2tsStream` / `NetworkStream` / `StdioStream`
@@ -72,8 +71,8 @@ pub(crate) mod stdio;
 pub(crate) mod timeline;
 pub(crate) mod ts;
 pub(crate) mod tsmux;
-// Per-picture video index (FVI model) consumed by fvi_sink; pure data, serialization-independent.
-// See docs/videomap.md — why the VideoMap accumulator is allow(dead_code) for now.
+// Per-picture video index (FVI model) consumed by fvi_sink; pure data,
+// serialization-independent.
 #[allow(dead_code)]
 pub(crate) mod videomap;
 

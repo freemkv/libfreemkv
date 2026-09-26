@@ -1,12 +1,11 @@
 //! Physical AC-3 sub-stream probing for DVD audio routing.
 //!
-//! On some discs the physical `private_stream_1` sub-stream order does not
-//! match the IFO's declared audio stream order, so ordinal assignment
-//! (`ifo::assign_audio_sub_stream_ids`) can mux the wrong physical track
-//! (e.g. a 2.0 down-mix labelled 5.1). This module probes each physical
-//! AC-3 sub-stream's REAL channel count from the VOB and re-routes each
-//! declared stream to the matching sub-stream, falling back to ordinal
-//! mapping when the probe yields nothing. See docs/dvd-audio-probe.md.
+//! On some discs the physical `private_stream_1` sub-stream order does not match the IFO's
+//! declared audio stream order, so ordinal assignment (`ifo::assign_audio_sub_stream_ids`) can
+//! mux the wrong physical track (e.g. a 2.0 down-mix labelled 5.1). This module probes each
+//! physical AC-3 sub-stream's REAL channel count from the VOB and re-routes each declared
+//! stream to the matching sub-stream, falling back to ordinal mapping when the probe yields
+//! nothing.
 
 use crate::disc::Stream;
 use crate::mux::codec::ac3;
@@ -14,19 +13,17 @@ use crate::mux::ps::PsDemuxer;
 use crate::sector::SectorSource;
 use std::collections::BTreeMap;
 
-// Sectors of the first feature extent to probe. 512 (1 MiB) was too short on
-// a real disc; 1024 (2 MiB) reliably reaches every physical AC-3 sub-stream.
-// See docs/dvd-audio-probe.md#probe_sectors-sizing.
+// Sectors of the first feature extent to probe. 512 (1 MiB) was too short on a real disc; 1024
+// (2 MiB) reliably reaches every physical AC-3 sub-stream.
 const PROBE_SECTORS: u16 = 1024;
 
-/// Decode the real per-sub-stream AC-3 channel count from a buffer of decrypted
-/// MPEG-PS (DVD VOB) bytes. Demuxes `private_stream_1` (0xBD), and for each
-/// AC-3 sub-stream id (`0x80..=0x87`) records the MAXIMUM channel count seen
-/// across EVERY decodable frame — the max, not the first frame, because a
-/// sub-stream's opening frames are often an unrepresentative logo/warning bed
-/// (see docs/dvd-audio-probe.md). Pure — takes the already-read bytes, never
-/// touches the disc. Returns a map `sub_id -> max channels`; absent for
-/// sub-streams that never appear or carry no decodable BSI bits.
+/// Decode the real per-sub-stream AC-3 channel count from a buffer of decrypted MPEG-PS (DVD
+/// VOB) bytes. Demuxes `private_stream_1` (0xBD), and for each AC-3 sub-stream id
+/// (`0x80..=0x87`) records the MAXIMUM channel count seen across EVERY decodable frame — the
+/// max, not the first frame, because a sub-stream's opening frames are often an
+/// unrepresentative logo/warning bed. Pure — takes the already-read bytes, never touches the
+/// disc. Returns a map `sub_id -> max channels`; absent for sub-streams that never appear or
+/// carry no decodable BSI bits.
 pub fn probe_ac3_substream_channels(ps_bytes: &[u8]) -> BTreeMap<u8, u8> {
     let mut found: BTreeMap<u8, u8> = BTreeMap::new();
     let mut demux = PsDemuxer::new();
@@ -78,14 +75,12 @@ fn max_substream_channels(data: &[u8]) -> Option<u8> {
     best
 }
 
-/// Re-route the title's declared AC-3 audio streams onto the physical
-/// sub-stream ids whose REAL channel counts match, using a probed
-/// `sub_id -> channels` map. For each declared AC-3 audio stream (in IFO
-/// order), picks the physical `0x8x` sub-stream whose probed channel count
-/// equals the declared count, never reusing a claimed sub-stream, and writes
-/// its PID (`0xBD00 | sub_id`) back onto the `Stream::Audio`. Conservative:
-/// only reassigns when a better match exists (see docs/dvd-audio-probe.md).
-/// Returns the number of streams whose PID was changed.
+/// Re-route the title's declared AC-3 audio streams onto the physical sub-stream ids whose REAL
+/// channel counts match, using a probed `sub_id -> channels` map. For each declared AC-3 audio
+/// stream (in IFO order), picks the physical `0x8x` sub-stream whose probed channel count
+/// equals the declared count, never reusing a claimed sub-stream, and writes its PID (`0xBD00 |
+/// sub_id`) back onto the `Stream::Audio`. Conservative: only reassigns when a better match
+/// exists. Returns the number of streams whose PID was changed.
 pub fn remap_audio_pids(streams: &mut [Stream], probed: &BTreeMap<u8, u8>) -> usize {
     if probed.is_empty() {
         return 0;
@@ -194,9 +189,9 @@ mod tests {
     };
     use crate::sector::SectorSource;
 
-    // Builds a correctly-SIZED AC-3 frame (128 bytes, matching frmsizecod=0)
-    // whose `acmod`/`lfeon` encode a known channel count, via a bit writer so
-    // the test never hand-miscomputes the lfeon offset. See docs/dvd-audio-probe.md.
+    // Builds a correctly-SIZED AC-3 frame (128 bytes, matching frmsizecod=0) whose
+    // `acmod`/`lfeon` encode a known channel count, via a bit writer so the test never
+    // hand-miscomputes the lfeon offset.
     fn ac3_frame(acmod: u8, lfeon: bool) -> Vec<u8> {
         let mut bits: Vec<u8> = Vec::new();
         let push = |val: u32, n: usize, bits: &mut Vec<u8>| {
@@ -239,9 +234,8 @@ mod tests {
         frame
     }
 
-    // Builds a minimal `private_stream_1` PES carrying `frames` for `sub_id`,
-    // mirroring the on-disc layout the PS demux expects. See
-    // docs/dvd-audio-probe.md#test-helper-notes.
+    // Builds a minimal `private_stream_1` PES carrying `frames` for `sub_id`, mirroring the
+    // on-disc layout the PS demux expects.
     fn ps_ac3_frames(sub_id: u8, frames: &[Vec<u8>]) -> Vec<u8> {
         // PES sub-header for AC-3: sub_id + frame_count + 2-byte access ptr.
         let mut payload = vec![sub_id, frames.len() as u8, 0x00, 0x04];
@@ -287,9 +281,8 @@ mod tests {
         assert_eq!(probed.get(&0x81), Some(&6), "0x81 is the 5.1 main mix");
     }
 
-    // Real-disc regression: the probe must read each sub-stream's TRUE
-    // (max-mix) channel count without cross-contaminating between sub-streams.
-    // See docs/dvd-audio-probe.md#probe_reads_max_channels_no_cross_contamination.
+    // Real-disc regression: the probe must read each sub-stream's TRUE (max-mix) channel count
+    // without cross-contaminating between sub-streams.
     #[test]
     fn probe_reads_max_channels_no_cross_contamination() {
         let mut bytes = Vec::new();
@@ -400,9 +393,8 @@ mod tests {
         assert_eq!(a.pid, 0xBD80, "no probe data → keep ordinal");
     }
 
-    // Mutation guard for `pos + rel` (not `pos - rel`, which could underflow
-    // `usize`) as the sync's true absolute position. See
-    // docs/dvd-audio-probe.md#max_substream_channels_locates_sync_after_leading_non_sync_bytes.
+    // Mutation guard for `pos + rel` (not `pos - rel`, which could underflow `usize`) as the
+    // sync's true absolute position.
     #[test]
     fn max_substream_channels_locates_sync_after_leading_non_sync_bytes() {
         let mut data = vec![0xAA, 0xAA, 0xAA]; // no 0x0B77 pattern in here
@@ -414,9 +406,8 @@ mod tests {
         );
     }
 
-    // On an unmappable AC-3 size, must fall back to a forward `start + 2`
-    // rescan (not loop or overshoot). See
-    // docs/dvd-audio-probe.md#unmappable-size-fallback-tests.
+    // On an unmappable AC-3 size, must fall back to a forward `start + 2` rescan (not loop or
+    // overshoot).
     #[test]
     fn max_substream_channels_unmappable_size_steps_forward_by_two() {
         let mut real = ac3_frame(2, false);
@@ -437,8 +428,7 @@ mod tests {
         );
     }
 
-    // Same fallback, sync at offset 0 (`start - 2` would underflow). See
-    // docs/dvd-audio-probe.md#unmappable-size-fallback-tests.
+    // Same fallback, sync at offset 0 (`start - 2` would underflow).
     #[test]
     fn max_substream_channels_unmappable_size_at_start_steps_forward_not_back() {
         let mut data = vec![0x0B, 0x77, 0x00, 0x00, 0xC0, 0xF8]; // bogus header, offsets 0..6
@@ -450,8 +440,7 @@ mod tests {
         );
     }
 
-    // Mutation guard: current sub-stream must be read via `pid & 0x00FF`, not
-    // `|`/`^`. See docs/dvd-audio-probe.md#remap_reads_current_substream_via_and_not_or_or_xor.
+    // Mutation guard: current sub-stream must be read via `pid & 0x00FF`, not `|`/`^`.
     #[test]
     fn remap_reads_current_substream_via_and_not_or_or_xor() {
         let mut probed = BTreeMap::new();
@@ -493,9 +482,8 @@ mod tests {
         }
     }
 
-    // End-to-end `probe_and_remap`: real-disc-shaped MpegPs title, 0x80=2.0
-    // down-mix / 0x81=real 5.1, must re-route to 0xBD81. See
-    // docs/dvd-audio-probe.md#probe_and_remap_reroutes_swapped_substream_scenario_end_to_end.
+    // End-to-end `probe_and_remap`: real-disc-shaped MpegPs title, 0x80=2.0 down-mix /
+    // 0x81=real 5.1, must re-route to 0xBD81.
     #[test]
     fn probe_and_remap_reroutes_swapped_substream_scenario_end_to_end() {
         let mut bytes = ps_ac3(0x80, 2, false); // physical 0x80 = 2.0 down-mix

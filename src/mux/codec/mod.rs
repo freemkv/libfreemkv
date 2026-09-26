@@ -61,14 +61,11 @@ pub struct Frame {
     pub pts_ns: i64,
     /// Whether this is a keyframe (used for cue points).
     pub keyframe: bool,
-    /// This frame is the FIRST coded picture after a concealed/lost gap: its
-    /// data begins after packets the demuxer never received (an undecryptable
-    /// unit concealed as NULL-TS upstream, or a continuity break in a damaged
-    /// source). Inter-coded video frames carrying this flag reference data
-    /// that is gone, so the consumer's `ResyncGate` arms here and drops
-    /// forward to the next keyframe. Default `false`; only ever set on the
-    /// degraded/conceal path. See docs/codec-mod.md for why this is carried
-    /// per-frame rather than per-PES.
+    /// This frame is the FIRST coded picture after a concealed/lost gap: its data begins after
+    /// packets the demuxer never received (an undecryptable unit concealed as NULL-TS upstream,
+    /// or a continuity break in a damaged source). Inter-coded video frames carrying this flag
+    /// reference data that is gone, so the consumer's `ResyncGate` arms here and drops forward
+    /// to the next keyframe. Default `false`; only ever set on the degraded/conceal path.
     pub discontinuity: bool,
     /// Frame data (elementary stream bytes).
     pub data: Vec<u8>,
@@ -168,8 +165,6 @@ impl CodecParser for PassthroughParser {
     }
 }
 
-// See docs/codec-mod.md for the drop-on-undecodable policy across codecs
-// ("clean muxes always") that motivates each parser's error handling.
 /// Create the appropriate parser for a codec, with optional codec private
 /// data.
 ///
@@ -269,9 +264,8 @@ mod tests {
         }
     }
 
-    // codec_private() feeds MKV CodecPrivate (RFC 9559 §5.1.4.1.24): Some vs
-    // None are NOT interchangeable. See docs/codec-mod.md for why the gating
-    // parsers must answer "absent", never a fabricated Some.
+    // codec_private() feeds MKV CodecPrivate (RFC 9559 §5.1.4.1.24): Some vs None are NOT
+    // interchangeable.
     #[test]
     fn parsers_that_derive_no_config_report_absent_never_an_empty_codec_private() {
         // Codecs whose parsers do no configuration extraction, paired with a
@@ -329,13 +323,11 @@ mod tests {
 
 #[cfg(test)]
 mod provenance_guard {
-    //! Every emitted frame must carry the source byte offset of the packet it
-    //! came from. That invariant held only for video for as long as it
-    //! existed: several audio/subtitle parsers built frames with `source:
-    //! None`, so a multi-clip title fell back to inferring the clip from
-    //! timestamps — which made branched titles run minutes long. This is a
-    //! brace-balanced scan of the tree, as a test. See docs/codec-mod.md for
-    //! the affected module list and how the gap was found.
+    //! Every emitted frame must carry the source byte offset of the packet it came from. That
+    //! invariant held only for video for as long as it existed: several audio/subtitle parsers
+    //! built frames with `source: None`, so a multi-clip title fell back to inferring the clip
+    //! from timestamps — which made branched titles run minutes long. This is a brace-balanced
+    //! scan of the tree, as a test.
 
     /// Every parser module's source, checked for a `Frame` built without a
     /// source. Paired with `every_codec_module_is_covered` below, which fails
@@ -367,9 +359,8 @@ mod provenance_guard {
         "startcode",
     ];
 
-    // Strip line comments before scanning: a comment merely mentioning
-    // `source: None` isn't a construction. See docs/codec-mod.md for why
-    // this and `frame_literals` need brace-balanced parsing, not regex.
+    // Strip line comments before scanning: a comment merely mentioning `source: None` isn't a
+    // construction.
     fn code_only(src: &str) -> String {
         // The guard itself constructs no Frame; it only talks about them, in
         // prose and in string literals. Scanning its own body matches both.

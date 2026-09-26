@@ -3,10 +3,9 @@
 //! cooperative [`Halt`] poll. The calling thread is never trapped
 //! inside a kernel call.
 //!
-//! Escape hatch for syscalls that trap a thread inside the kernel
-//! (`sync_file_range`, `fsync`, NFS writes) where a cooperative
-//! [`Halt`] can't interrupt. The worker thread is leaked on timeout
-//! or halt. See docs/bounded.md for rationale, trade-offs, and platform notes.
+//! Escape hatch for syscalls that trap a thread inside the kernel (`sync_file_range`, `fsync`,
+//! NFS writes) where a cooperative [`Halt`] can't interrupt. The worker thread is leaked on
+//! timeout or halt.
 
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::thread;
@@ -34,9 +33,8 @@ pub(crate) enum BoundedError {
     WorkerLost,
 }
 
-// Runs `op` on a worker thread with a deadline + optional [`Halt`]
-// poll; returns Ok, or Err on Halted/Timeout/WorkerLost (worker leaked).
-// See docs/bounded.md for halt polling, `op` ownership, and semantics.
+// Runs `op` on a worker thread with a deadline + optional [`Halt`] poll; returns Ok, or Err on
+// Halted/Timeout/WorkerLost (worker leaked).
 pub(crate) fn bounded_syscall<F, R>(
     halt: Option<&Halt>,
     timeout: Duration,

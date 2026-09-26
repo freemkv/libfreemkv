@@ -1,25 +1,9 @@
-//! MPLS playlist parser — Blu-ray movie playlists.
+//! Blu-ray MPLS playlists: clips, in/out timestamps and stream tables.
 //!
-//! Each .mpls file in BDMV/PLAYLIST/ defines a title.
-//! Contains play items (clips) with in/out timestamps,
-//! stream info (video, audio, subtitle tracks).
-//!
-//! Format is documented in the BD-ROM PlayList (MPLS) specification.
-//!
-//! ## Multi-angle PlayItem STN offset (issue #45)
-//! The STN (stream-number) table sits at PlayItem offset 32 for a single-angle
-//! item, but a MULTI-ANGLE item (is_multi_angle = bit 4 of `item[10]`) inserts an
-//! angle block right after still_time at offset 32:
-//!   number_of_angles(1) + flags(1) + (number_of_angles − 1) angle references,
-//!   each clip_name(5) + clip_codec_id(4) + ref_to_STC_id(1) = 10 bytes
-//! (the first angle is the primary clip already at `item[0..5]`). So the real STN
-//! begins at `32 + 2 + (number_of_angles − 1) * 10`. A fixed offset of 32 lands
-//! INSIDE that block and misreads the stream counts as garbage (e.g. n_video =
-//! 51 on Spider-Man 3 UHD 00245/00246.mpls, number_of_angles = 2 ⇒ real offset
-//! 44), dropping every stream — the primary video included. That makes
-//! `DiscTitle::has_video()` return false, which drops a multi-angle/seamless-
-//! branch FEATURE from the disc's nav candidate set (see `Disc::scan_with`) and
-//! loses it in main-title selection. `parse` computes the offset accordingly.
+//! The STN table begins at PlayItem offset 32 for single-angle items. Multi-angle
+//! items insert a two-byte header and ten bytes per additional angle before STN,
+//! so its offset is `32 + 2 + (number_of_angles - 1) * 10`. The primary angle's
+//! clip is already present at the start of the PlayItem.
 
 use crate::error::{Error, Result};
 
@@ -1593,7 +1577,6 @@ mod tests {
         );
     }
 
-    // See docs/mpls.md — STN Table Secondary Block Alignment (test coverage note)
     #[test]
     fn full_stn_table_block_alignment() {
         let mut entries: Vec<Vec<u8>> = vec![

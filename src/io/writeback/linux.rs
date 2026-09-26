@@ -6,8 +6,6 @@
 //! Chunk size adapts to storage speed from a rolling p95 of `WAIT_AFTER`
 //! latency, bounded to [4 MiB, 256 MiB]. NFS mounts, and any local storage
 //! that times out inside `WAIT_AFTER` (30s), skip the wait+dontneed step.
-//!
-//! See docs/writeback-linux.md for rationale, NFS handling, and timeout details.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -315,9 +313,8 @@ fn detect_nfs(fd: RawFd) -> bool {
     )
 }
 
-// Runs `sync_file_range(WAIT_AFTER)` on a worker thread, waiting up to
-// WAIT_AFTER_TIMEOUT; `Some(elapsed_ms)` on success, `None` on timeout
-// (worker leaked). See docs/writeback-linux.md — fd lifetime / fd-reuse safety.
+// Runs `sync_file_range(WAIT_AFTER)` on a worker thread, waiting up to WAIT_AFTER_TIMEOUT;
+// `Some(elapsed_ms)` on success, `None` on timeout (worker leaked).
 fn wait_after_with_timeout(
     worker_file: Option<File>,
     fallback_fd: RawFd,

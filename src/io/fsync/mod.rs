@@ -1,9 +1,8 @@
 //! Platform-aware crash-durability primitives.
 //!
-//! [`dir`] fsyncs a directory so a prior `rename(2)` into it is durable
-//! (no-op on Windows); [`file_durable`] fsyncs a file's contents + metadata,
-//! opened read+write so the flush also succeeds on Windows. See
-//! docs/fsync.md for the full per-platform rationale.
+//! [`dir`] fsyncs a directory so a prior `rename(2)` into it is durable (no-op on Windows);
+//! [`file_durable`] fsyncs a file's contents + metadata, opened read+write so the flush also
+//! succeeds on Windows.
 //!
 //! Per the crate convention (see [`crate::io::writeback_file`]), platform
 //! dispatch happens once here via cfg-gated `mod` decls — no inline `#[cfg]`.

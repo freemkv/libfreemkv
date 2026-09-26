@@ -9,9 +9,6 @@
 //! Thread B: M2TS demux       (DemuxThread)
 //! Thread C: codec parse      (this struct, on the caller's thread)
 //! ```
-//!
-//! See docs/pipelined-stream.md for the full threading/channel model and
-//! how the ISO vs M2TS input paths construct this type.
 
 use super::codec::CodecParser;
 use super::demux_thread::{DemuxBatch, DemuxThread};
@@ -1076,9 +1073,8 @@ mod tests {
         au
     }
 
-    // DVD seek-index regression at the HIGHWAY level (PsDemuxer →
-    // PipelinedPesStream → frame out). Keyframe flag/duration must survive so
-    // the muxer's cluster/cue logic fires. See docs/pipelined-stream.md.
+    // DVD seek-index regression at the HIGHWAY level (PsDemuxer → PipelinedPesStream → frame
+    // out). Keyframe flag/duration must survive so the muxer's cluster/cue logic fires.
     #[test]
     fn dvd_highway_preserves_video_keyframe_and_duration() {
         use crate::mux::codec::mpeg2::Mpeg2Parser;

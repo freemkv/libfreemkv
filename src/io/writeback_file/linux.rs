@@ -29,9 +29,8 @@ pub(super) fn preallocate(file: &File, size_bytes: u64) {
     );
 }
 
-// Bounded `fsync` (60 s deadline); a zero return is the only durability
-// signal POSIX gives, so timeout/halt/lost-worker all map to `Err`.
-// See docs/writeback-file-linux.md — durable_sync rationale & fd-reuse safety.
+// Bounded `fsync` (60 s deadline); a zero return is the only durability signal POSIX gives, so
+// timeout/halt/lost-worker all map to `Err`.
 pub(super) fn durable_sync(file: &File) -> io::Result<()> {
     // Clone so a leaked worker thread retains a valid fd even after the
     // original File is closed and its fd number is reused.
@@ -72,9 +71,8 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    // Regression for the fd-reuse / use-after-close fix in `durable_sync`.
-    // Structural test only (the race is non-deterministic and not cleanly testable).
-    // See docs/writeback-file-linux.md — durable_sync_worker_uses_owned_clone_with_distinct_fd.
+    // Regression for the fd-reuse / use-after-close fix in `durable_sync`. Structural test only
+    // (the race is non-deterministic and not cleanly testable).
     #[test]
     fn durable_sync_worker_uses_owned_clone_with_distinct_fd() {
         let f = NamedTempFile::new().expect("tempfile create");
@@ -99,9 +97,8 @@ mod tests {
     }
 }
 
-// Maps a bounded-fsync failure onto the `io::Error` `durable_sync` returns.
-// Every arm means "no sync observably ran"; mirrors the macOS `F_FULLFSYNC` mapping.
-// See docs/writeback-file-linux.md — bounded_failure_to_result rationale.
+// Maps a bounded-fsync failure onto the `io::Error` `durable_sync` returns. Every arm means "no
+// sync observably ran"; mirrors the macOS `F_FULLFSYNC` mapping.
 fn bounded_failure_to_result(e: crate::io::bounded::BoundedError) -> io::Result<()> {
     match e {
         crate::io::bounded::BoundedError::Timeout => {

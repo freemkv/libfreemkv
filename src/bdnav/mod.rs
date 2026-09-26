@@ -3,7 +3,6 @@
 //! runs a faithful, bounded HDMV navigation VM to find the playlist the disc's
 //! own First-Play navigation plays as the feature.
 //!
-//! See docs/bdnav.md for the no-special-casing rationale and the BD-J/abstain boundary.
 //!
 //! Contract: read-only, bounded, and never panics or hard-fails.
 
@@ -15,9 +14,9 @@ pub(crate) mod vm;
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 
-// Resolve the playlist id First-Play navigation plays as the feature, among
-// ids the caller marks as feature candidates (`is_feature_candidate`).
-// Returns `None` for BD-J discs, malformed nav data, or non-convergence; see docs/bdnav.md.
+// Resolve the playlist id First-Play navigation plays as the feature, among ids the caller
+// marks as feature candidates (`is_feature_candidate`). Returns `None` for BD-J discs,
+// malformed nav data, or non-convergence.
 pub(crate) fn resolve_feature(
     reader: &mut dyn SectorSource,
     udf: &UdfFs,

@@ -139,7 +139,7 @@ If your machine has a free SATA port, use it.
 
 ### How freemkv Handles This
 
-freemkv uses a three-layer recovery model. See [`docs/rip-recovery.md`](docs/rip-recovery.md) for full details.
+freemkv uses a three-layer recovery model.
 
 - **Pass 1 (`freemkv_engine::recovery::sweep`):** Fast sweep with 64 KB reads. On failure, zero-fills the block and skips forward. Writes a ddrescue-format mapfile for later retry.
 - **Pass 2+ (`freemkv_engine::recovery::patch`):** Targeted re-reads of bad ranges with a long 60-second timeout per CDB. The drive firmware performs its own ECC and laser power retries within that window.
@@ -164,7 +164,7 @@ Workarounds:
 - **Accept the partial ISO.** freemkv's skip-forward recovery will zero-fill the unreadable blocks and continue. The resulting ISO may be playable with minor glitches in the affected areas.
 - **Physical replug between retry passes.** If running multi-pass patch, replug the drive between passes to clear the taint state.
 
-freemkv deliberately does not attempt inline SCSI resets or eject cycles to recover from this state, because those operations were found to make the problem worse on affected hardware (see the design rationale in [`docs/rip-recovery.md`](docs/rip-recovery.md)).
+freemkv deliberately does not attempt inline SCSI resets or eject cycles to recover from this state, because those operations were found to make the problem worse on affected hardware.
 
 ---
 

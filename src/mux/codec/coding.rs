@@ -7,7 +7,6 @@
 //! codec-agnostic accessors ([`coding_type`](PictureInfo::coding_type),
 //! [`field_order`](PictureInfo::field_order), [`nb_fields`](PictureInfo::nb_fields),
 //! [`progressive`](PictureInfo::progressive)); adding a codec adds a `CodingDetail` arm.
-// See docs/coding.md — spec references (H.273, ISO/IEC 13818-2 §6.3.10, RFC 9559 §5.1.4.1.28).
 
 /// Coding/prediction type of a coded picture, mapped to the three families the
 /// muxer cares about (cue/keyframe marking, B-frame ordering). Each codec maps
@@ -73,7 +72,6 @@ pub enum CodingDetail {
     CodingTypeOnly,
 }
 
-// See docs/coding.md — HDR10 unit-scaling rationale and H.265 SEI spec refs (D.2.28, D.2.35).
 /// HDR10 static metadata measured from a video bitstream (HEVC SEI). Carried on
 /// [`PictureInfo`] as the per-stream colour-volume signalling: it only ever
 /// reaches the muxer when BOTH SEI messages were actually present in the stream,

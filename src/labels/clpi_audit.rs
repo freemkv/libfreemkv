@@ -1,10 +1,8 @@
 //! CLPI vs MPLS cross-validation diagnostic.
 //!
-//! Walks per-clip CLPI program info and per-playlist MPLS STN tables,
-//! dedups streams by PID alone (keeping the first `(coding_type, language)`
-//! seen per source), then compares those fields to classify each PID as
-//! CLPI-only, MPLS-only, Match, or Divergent. See
-//! docs/clpi-audit.md for the full classification rules.
+//! Walks per-clip CLPI program info and per-playlist MPLS STN tables, dedups streams by PID
+//! alone (keeping the first `(coding_type, language)` seen per source), then compares those
+//! fields to classify each PID as CLPI-only, MPLS-only, Match, or Divergent.
 //!
 //! [`audit`] returns [`ClpiVsMplsAudit`]; diagnostic only, not used by
 //! label selection.

@@ -5,8 +5,6 @@
 //! to keep this crate's one dev-dependency; installed once globally (see
 //! [`capture`]) and routes each event to the emitting thread's own sink so
 //! `cargo test`'s parallel harness can't cross-contaminate captures.
-//!
-//! See docs/testlog.md for the full rationale.
 
 #![cfg(test)]
 
@@ -123,9 +121,8 @@ fn install() {
     });
 }
 
-// Run `f` with every `tracing` event it emits on this thread captured;
-// returns `f`'s value alongside the events, in emission order. One global
-// subscriber, not scoped `with_default` — see docs/testlog.md for why.
+// Run `f` with every `tracing` event it emits on this thread captured; returns `f`'s value
+// alongside the events, in emission order. One global subscriber, not scoped `with_default`
 pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
     install();
     let sink: Sink = Arc::default();
@@ -141,9 +138,8 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
 mod tests {
     use super::*;
 
-    // The capture must actually see events and field values, not silently
-    // record nothing (see docs/testlog.md). Mutation: `enabled()` returning
-    // false, or `event()` dropping fields, fails here.
+    // The capture must actually see events and field values, not silently record nothing.
+    // Mutation: `enabled()` returning false, or `event()` dropping fields, fails here.
     #[test]
     fn capture_records_target_level_and_fields() {
         let ((), events) = capture(|| {

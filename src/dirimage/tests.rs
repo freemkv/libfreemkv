@@ -22,9 +22,8 @@ impl Scratch {
         Self(p)
     }
 
-    // A monotonic counter, not a timestamp: macOS's clock resolves to only a
-    // microsecond, which collides across parallel tests sharing a tag.
-    // See docs/dirimage-tests.md — Scratch::unique_path
+    // A monotonic counter, not a timestamp: macOS's clock resolves to only a microsecond, which
+    // collides across parallel tests sharing a tag.
     fn unique_path(tag: &str) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -75,9 +74,8 @@ fn bdmv_scratch() -> (Scratch, Vec<u8>, Vec<u8>) {
     (s, index, clip)
 }
 
-// Every Scratch must own a distinct directory, or a parallel test's
-// remove_dir_all deletes another's files mid-read.
-// See docs/dirimage-tests.md — scratch_paths_are_unique_even_at_clock_resolution
+// Every Scratch must own a distinct directory, or a parallel test's remove_dir_all deletes
+// another's files mid-read.
 #[test]
 fn scratch_paths_are_unique_even_at_clock_resolution() {
     let paths: Vec<PathBuf> = (0..1000).map(|_| Scratch::unique_path("uniq")).collect();
@@ -260,9 +258,8 @@ fn the_same_folder_synthesizes_the_same_image() {
     }
 }
 
-// A directory whose FID list spans several 2048-byte blocks, read back
-// through the production parser; also exercises handle-cache eviction.
-// See docs/dirimage-tests.md — a_directory_spanning_many_blocks_reads_back_whole
+// A directory whose FID list spans several 2048-byte blocks, read back through the production
+// parser; also exercises handle-cache eviction.
 #[test]
 fn a_directory_spanning_many_blocks_reads_back_whole() {
     const N: usize = 200;
@@ -484,9 +481,8 @@ fn an_oversized_vob_offset_leaves_a_gap_rather_than_failing() {
     assert!(buf.iter().all(|&b| b == 0));
 }
 
-// A file inside a SUBDIRECTORY of VIDEO_TS must still have its data placed.
-// Audit finding: the DVD branch's follow-up loop skipped that directory.
-// See docs/dirimage-tests.md — a_file_below_video_ts_is_placed_not_just_declared
+// A file inside a SUBDIRECTORY of VIDEO_TS must still have its data placed. Audit finding: the
+// DVD branch's follow-up loop skipped that directory.
 #[test]
 fn a_file_below_video_ts_is_placed_not_just_declared() {
     let s = Scratch::new("dvdsubdir");
@@ -507,9 +503,8 @@ fn a_file_below_video_ts_is_placed_not_just_declared() {
     );
 }
 
-// A VOBS offset far past the content must be REFUSED, not honoured, or a
-// u32 sector count (~8.8 TB) can fill an iso:// destination with zeros.
-// See docs/dirimage-tests.md — a_vob_offset_past_the_image_cap_is_refused
+// A VOBS offset far past the content must be REFUSED, not honoured, or a u32 sector count (~8.8
+// TB) can fill an iso:// destination with zeros.
 #[test]
 fn a_vob_offset_past_the_image_cap_is_refused() {
     let s = Scratch::new("dvdcap");
@@ -595,9 +590,8 @@ fn minimal_clpi(source_packets: u32) -> Vec<u8> {
     d
 }
 
-// A BD folder that enumerates a title, so the AACS content probe has an
-// extent to sample; `scrambled` sets the CPI bits and withholds TS sync.
-// See docs/dirimage-tests.md — playable_bdmv
+// A BD folder that enumerates a title, so the AACS content probe has an extent to sample;
+// `scrambled` sets the CPI bits and withholds TS sync.
 fn playable_bdmv(tag: &str, scrambled: bool) -> Scratch {
     let s = Scratch::new(tag);
     let packets = 4096u32;
@@ -669,9 +663,8 @@ fn an_aacs_folder_with_scrambled_content_is_rejected() {
 // `scan_dir` and `mux::resolve::input("dir://…")` once disagreed: only `scan_dir`
 // re-judged the verdict from CONTENT. Fixed via `apply_folder_encryption_verdict`.
 
-/// The two doors must AGREE: same folder, same verdict, same extents. Stated
-/// as a differential, not a bare is_ok(), so it cannot go vacuous.
-/// See docs/dirimage-tests.md — both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory
+/// The two doors must AGREE: same folder, same verdict, same extents. Stated as a differential,
+/// not a bare is_ok(), so it cannot go vacuous.
 #[test]
 fn both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory() {
     // `s` MUST outlive `stream`: the pipeline's producer thread is still
@@ -706,9 +699,8 @@ fn both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory() {
     drop(stream);
 }
 
-// The other verdict, same door: a truly scrambled folder is refused with the
-// TYPED code, not muxed into garbage. Load-bearing half.
-// See docs/dirimage-tests.md — a_scrambled_folder_is_refused_through_the_dir_url_door_too
+// The other verdict, same door: a truly scrambled folder is refused with the TYPED code, not
+// muxed into garbage. Load-bearing half.
 #[test]
 fn a_scrambled_folder_is_refused_through_the_dir_url_door_too() {
     let s = playable_bdmv("dirdoorenc", true);
@@ -729,9 +721,8 @@ fn a_scrambled_folder_is_refused_through_the_dir_url_door_too() {
 
 // ── External oracle ─────────────────────────────────────────────────────────
 
-/// Write a synthesized image to a real file and ask the OS to mount it — the
-/// only check here not circular with the encoder. Ignored by default (shells
-/// out to hdiutil). See docs/dirimage-tests.md — write_and_mount_externally
+/// Write a synthesized image to a real file and ask the OS to mount it — the only check here
+/// not circular with the encoder. Ignored by default (shells out to hdiutil).
 #[test]
 #[ignore = "external: shells out to hdiutil/mount"]
 fn write_and_mount_externally() {
@@ -1020,9 +1011,8 @@ fn multi_item_mpls(clip_ids: &[&[u8; 5]]) -> Vec<u8> {
     buf
 }
 
-// Clip::feed_span is the INPUT to the whole provenance feature, produced in
-// exactly one place; every SeamPlan test synthesizes spans by hand, so
-// nothing else checks the producer. See docs/dirimage-tests.md (this fn).
+// Clip::feed_span is the INPUT to the whole provenance feature, produced in exactly one place;
+// every SeamPlan test synthesizes spans by hand, so nothing else checks the producer.
 #[test]
 fn a_multi_clip_playlist_produces_feed_spans_that_tile_the_feed() {
     let s = Scratch::new("spans");

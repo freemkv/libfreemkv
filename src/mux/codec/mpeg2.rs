@@ -6,8 +6,6 @@
 //! with only the first carrying a PTS, so this parser buffers ES bytes across
 //! PES packets and emits exactly one Frame per coded picture (never one per
 //! PES, which would write truncated fragments).
-//!
-//! See docs/mpeg2.md for the full access-unit model and start-code reference.
 
 use super::coding::{CodingType, Mpeg2Coding, PictureInfo};
 use super::startcode::find_start_code;
@@ -40,8 +38,8 @@ const MAX_AU_BUFFER: usize = 8 * 1024 * 1024;
 /// ever arrives within the cap, buffered frames are released on a 0 base.
 const MAX_PENDING_FRAMES: usize = 600;
 
-// Byte cap on frames held awaiting the first PES PTS anchor; mirrors the
-// AC-3/DTS/PGS byte caps. See docs/mpeg2.md — `MAX_PENDING_BYTES`.
+// Byte cap on frames held awaiting the first PES PTS anchor; mirrors the AC-3/DTS/PGS byte
+// caps.
 const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
 /// Frame rate table (index from sequence header frame_rate_code).
@@ -160,7 +158,6 @@ impl Mpeg2Parser {
     }
 
     // Decode + buffer one reassembled AU into the current GOP.
-    // See docs/mpeg2.md — `Mpeg2Parser::process_au`.
     fn process_au(&mut self, au: crate::mux::au_assembly::AssembledAu, out: &mut Vec<Frame>) {
         let data = au.data;
         // An access unit must contain a coded picture; a fragment that assembled
@@ -247,7 +244,6 @@ impl Mpeg2Parser {
     }
 
     // Emit the buffered GOP in decode order with display-order PTS/duration.
-    // See docs/mpeg2.md — `Mpeg2Parser::flush_gop`.
     fn flush_gop(&mut self, out: &mut Vec<Frame>) {
         let n = self.gop_buf.len();
         if n == 0 {
@@ -331,7 +327,6 @@ impl CodecParser for Mpeg2Parser {
 }
 
 // Extract the sequence header (+ B5 extensions) as MKV codecPrivate extradata.
-// See docs/mpeg2.md — `extract_seq_header`.
 fn extract_seq_header(au: &[u8]) -> Option<Vec<u8>> {
     let b3 = find_code(au, 0, SEQ_HEADER_CODE)?;
     let mut end = au.len();
@@ -404,7 +399,6 @@ fn parse_aspect_ratio(hdr: &[u8]) -> Option<(u8, u8)> {
 }
 
 // Extract picture-coding-extension field/pulldown flags for `PictureInfo`.
-// See docs/mpeg2.md — `picture_coding_flags`.
 fn picture_coding_flags(au: &[u8]) -> (bool, bool, bool, bool) {
     let mut search = 0;
     while let Some(q) = find_code(au, search, SEQ_EXT_CODE) {
@@ -439,7 +433,6 @@ fn coding_type_from_raw(raw: u8) -> CodingType {
 }
 
 // Number of field-display periods a coded picture occupies (2:3 pulldown).
-// See docs/mpeg2.md — `picture_nb_fields`.
 fn picture_nb_fields(au: &[u8], progressive_sequence: bool) -> u8 {
     let mut search = 0;
     while let Some(q) = find_code(au, search, SEQ_EXT_CODE) {
@@ -476,7 +469,6 @@ fn picture_nb_fields(au: &[u8], progressive_sequence: bool) -> u8 {
 }
 
 // Read `progressive_sequence` from the sequence extension; false when absent.
-// See docs/mpeg2.md — `parse_progressive_sequence`.
 fn parse_progressive_sequence(hdr: &[u8]) -> bool {
     let mut search = 0;
     while let Some(q) = find_code(hdr, search, SEQ_EXT_CODE) {
@@ -838,8 +830,8 @@ mod tests {
         assert!(!frames[1].keyframe);
     }
 
-    // B1 hole-2 regression: the concealed gap must land on the post-gap picture,
-    // not the previous one. See docs/mpeg2.md — this test's name.
+    // B1 hole-2 regression: the concealed gap must land on the post-gap picture, not the
+    // previous one.
     #[test]
     fn discontinuity_offset_mark_stamps_post_gap_picture_not_previous() {
         let mut parser = Mpeg2Parser::new();

@@ -3,10 +3,9 @@
 //! buffers on demand via a bounded channel, so disk+decrypt and
 //! demux run in parallel instead of serialized on one thread.
 //!
-//! The producer thread ([`PrefetchedSectorSource::new`]) walks the
-//! extent list in order, sending batches into a bounded channel;
-//! sender drop reads as end-of-stream. `read_sectors` ignores its
-//! `lba`/`count` args. See docs/prefetched.md for full rationale.
+//! The producer thread ([`PrefetchedSectorSource::new`]) walks the extent list in order,
+//! sending batches into a bounded channel; sender drop reads as end-of-stream. `read_sectors`
+//! ignores its `lba`/`count` args.
 
 use crate::error::Result;
 use crate::event::{Event, EventKind};
@@ -65,9 +64,8 @@ impl PrefetchedSectorSource {
     /// composed read+decrypt stack — every byte the producer emits is
     /// what the consumer's demux will feed to its codec parsers.
     ///
-    /// Precondition: each extent's `sector_count` should be a multiple
-    /// of [`SECTOR_ALIGNMENT`], else [`Error::ExtentNotUnitAligned`]
-    /// surfaces through the channel. See docs/prefetched.md.
+    /// Precondition: each extent's `sector_count` should be a multiple of [`SECTOR_ALIGNMENT`],
+    /// else [`Error::ExtentNotUnitAligned`] surfaces through the channel.
     ///
     /// [`Error::ExtentNotUnitAligned`]: crate::error::Error::ExtentNotUnitAligned
     pub fn new<S>(
@@ -258,11 +256,10 @@ impl PrefetchedSectorSource {
         })
     }
 
-    /// Peel off the receivers for zero-copy pipeline mode: the caller
-    /// pulls buffers from `rx` and pushes drained ones back through
-    /// `recycle_tx`. Returns `(forward_rx, recycle_tx, shell)`; the
-    /// shell holds the producer's `JoinHandle` (drop it to join) plus
-    /// `total_sectors`. See docs/prefetched.md.
+    /// Peel off the receivers for zero-copy pipeline mode: the caller pulls buffers from `rx`
+    /// and pushes drained ones back through `recycle_tx`. Returns `(forward_rx, recycle_tx,
+    /// shell)`; the shell holds the producer's `JoinHandle` (drop it to join) plus
+    /// `total_sectors`.
     pub fn into_channels(self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
         // MOVE the fields out, never clone: pre-1.0.0 code cloned + `forget`-ed
         // `self`, leaking endpoints that defeated disconnection shutdown and
@@ -512,9 +509,8 @@ mod tests {
         }
     }
 
-    // Regression: dropping a `PrefetchedSectorSource` DIRECTLY, before
-    // extents are drained, must join the producer cleanly (old `Drop`
-    // joined before dropping `rx`/`recycle_tx`, deadlocking; see docs/prefetched.md).
+    // Regression: dropping a `PrefetchedSectorSource` DIRECTLY, before extents are drained,
+    // must join the producer cleanly.
     #[test]
     fn drop_undrained_source_joins_cleanly() {
         with_watchdog(Duration::from_secs(10), || {
@@ -590,7 +586,6 @@ mod tests {
 
     // `unit_align == 0` must be rejected by the constructor, not a producer-thread
     // divide-by-zero panic (`remaining % 0`) misreported as DemuxThreadPanicked.
-    // See docs/prefetched.md.
     #[test]
     fn zero_unit_align_rejected() {
         let res = PrefetchedSectorSource::new_with_events(
@@ -635,9 +630,9 @@ mod tests {
         });
     }
 
-    // The producer-thread `event_fn` must fire a `BytesRead` event per batch,
-    // cumulative and non-decreasing, reaching the full extent size at EOF —
-    // the contract autorip's progress bar + stall watchdog depend on (docs/prefetched.md).
+    // The producer-thread `event_fn` must fire a `BytesRead` event per batch, cumulative and
+    // non-decreasing, reaching the full extent size at EOF — the contract autorip's progress
+    // bar + stall watchdog depend on.
     #[test]
     fn event_fn_fires_bytes_read_per_batch() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1032,9 +1027,8 @@ mod tests {
         });
     }
 
-    // The underlying reader's error must propagate to the consumer as an
-    // error (not Ok(0)/EOF), with its ErrorKind surviving the channel
-    // round-trip (typed, not blanket-wrapped). See docs/prefetched.md.
+    // The underlying reader's error must propagate to the consumer as an error (not Ok(0)/EOF),
+    // with its ErrorKind surviving the channel round-trip (typed, not blanket-wrapped).
     #[test]
     fn reader_error_propagates_with_kind() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1055,9 +1049,9 @@ mod tests {
         });
     }
 
-    // An inner source that answers a mid-extent read with `Ok(0)` has quit
-    // early: the producer must say so, not drop `tx` (which reads as clean
-    // EOF and lets `fill_extents` fabricate zeros for the rest). See docs/prefetched.md.
+    // An inner source that answers a mid-extent read with `Ok(0)` has quit early: the producer
+    // must say so, not drop `tx` (which reads as clean EOF and lets `fill_extents` fabricate
+    // zeros for the rest).
     struct QuitsEarlySource;
     impl SectorSource for QuitsEarlySource {
         fn read_sectors(
@@ -1155,9 +1149,9 @@ mod tests {
         });
     }
 
-    // Regression: too-small-buffer reads repeated past the pool depth (3)
-    // must NOT deadlock. Before the fix, each error path skipped recycling
-    // the received buffer, draining the pool by the 4th call. See docs/prefetched.md.
+    // Regression: too-small-buffer reads repeated past the pool depth (3) must NOT deadlock.
+    // Before the fix, each error path skipped recycling the received buffer, draining the pool
+    // by the 4th call.
     #[test]
     fn too_small_buffer_repeated_does_not_deadlock_pool() {
         with_watchdog(Duration::from_secs(10), || {
@@ -1358,9 +1352,9 @@ mod tests {
             .expect_err("the producer's read failure must surface")
     }
 
-    // REGRESSION: an ordinary MEDIUM ERROR bad sector crossing the prefetch
-    // channel must NOT classify as a SCSI transport failure (old blanket
-    // `Error::IoError` wrap made it match the wedged-USB-bridge arm). See docs/prefetched.md.
+    // REGRESSION: an ordinary MEDIUM ERROR bad sector crossing the prefetch channel must NOT
+    // classify as a SCSI transport failure (old blanket `Error::IoError` wrap made it match the
+    // wedged-USB-bridge arm).
     #[test]
     fn bad_sector_across_channel_is_not_a_transport_failure() {
         with_watchdog(Duration::from_secs(10), || {

@@ -1,6 +1,4 @@
 //! AAC ADTS framing and validation.
-//!
-//! See docs/adts.md for framing, timestamp and validation rules.
 
 use super::audio_frames::{AudioFrames, Header};
 #[cfg(test)]
@@ -130,8 +128,8 @@ mod tests {
         }
     }
 
-    // A header claiming a CRC (protection_absent=0) but declaring a frame
-    // length too short to contain one. See docs/adts.md for full rationale.
+    // A header claiming a CRC (protection_absent=0) but declaring a frame length too short to
+    // contain one.
     #[test]
     fn a_crc_present_header_shorter_than_its_own_crc_is_invalid() {
         for declared in [7u32, 8] {
@@ -210,8 +208,8 @@ mod tests {
         );
     }
 
-    // A dropped frame's header failed validation, so duration is reported as
-    // zero rather than guessed from untrustworthy fields. See docs/adts.md.
+    // A dropped frame's header failed validation, so duration is reported as zero rather than
+    // guessed from untrustworthy fields.
     #[test]
     fn dropped_frames_are_counted_but_their_duration_is_not_invented() {
         let mut parser = AdtsParser::new();

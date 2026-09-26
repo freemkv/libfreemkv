@@ -34,9 +34,8 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
     drives
 }
 
-// Enumerate `sg*` names via `/sys/class/scsi_generic/` (exact present-device
-// list); fall back to a bounded `sg0..15` probe if sysfs is unreadable.
-// See docs/drive-linux.md — why a fixed sg range is unsafe.
+// Enumerate `sg*` names via `/sys/class/scsi_generic/` (exact present-device list); fall back
+// to a bounded `sg0..15` probe if sysfs is unreadable.
 fn enumerate_sg_names() -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/sys/class/scsi_generic") {

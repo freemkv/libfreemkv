@@ -5,16 +5,13 @@
 //! Partition → File Set Descriptor → Root Directory ICB → Directory data
 //! → BDMV/PLAYLIST/*.mpls, BDMV/CLIPINF/*.clpi. Each step reads one or two
 //! sectors; no bulk reads needed.
-//!
-//! See docs/udf.md for the full pointer chain, ICB layout, and references.
 
 use crate::error::{Error, Result};
 use crate::sector::SectorSource;
 use std::collections::HashSet;
 
-// Cap on a single unbounded metadata file read (`read_file`); bounds the
-// allocation a crafted ICB info_length/extent length can force. See
-// docs/udf.md for the AACS MKB exception and the 0.31.0 regression.
+// Cap on a single unbounded metadata file read (`read_file`); bounds the allocation a crafted
+// ICB info_length/extent length can force.
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 // Cap on a single directory's on-disc data, well above any legitimate BD-ROM
@@ -335,8 +332,8 @@ impl UdfFs {
     ///   - UDF structure (AVDP, VDS, metadata partition, directories)
     ///   - every non-STREAM file the tree walk reaches that is <= 50 MB
     ///
-    /// `STREAM` directories (case-insensitive) are not descended, and files
-    /// over 50 MB are skipped. See docs/udf.md for the full skip policy.
+    /// `STREAM` directories (case-insensitive) are not descended, and files over 50 MB are
+    /// skipped.
     pub fn metadata_sector_ranges(&self, reader: &mut dyn SectorSource) -> Result<Vec<(u32, u32)>> {
         let mut ranges = Vec::new();
 
@@ -411,9 +408,8 @@ impl UdfFs {
             })
     }
 
-    // Returns the file's first RECORDED extent (not extents.first(), which may
-    // be an unrecorded type-1 hole) — see docs/udf.md for why file_start_lba
-    // and ifo.rs's VOB extent math depend on that distinction.
+    // Returns the file's first RECORDED extent (not extents.first(), which may be an unrecorded
+    // type-1 hole).
     fn read_icb_extent(&self, reader: &mut dyn SectorSource, meta_lba: u32) -> Result<IcbExtent> {
         let extents = self.read_icb_extents(reader, meta_lba)?;
         extents
@@ -430,9 +426,8 @@ impl UdfFs {
             })
     }
 
-    // If this ICB embeds its data inline (ICB Tag flags low 3 bits == 3), return
-    // those bytes; `Ok(None)` for the normal extent-backed case. See docs/udf.md
-    // for why read_file needs this (tiny AACS *.inf files) and the 0.31.0 regression.
+    // If this ICB embeds its data inline (ICB Tag flags low 3 bits == 3), return those bytes;
+    // `Ok(None)` for the normal extent-backed case.
     fn read_inline_data(
         &self,
         reader: &mut dyn SectorSource,
@@ -668,9 +663,8 @@ impl UdfFs {
         self.read_inline_data(reader, meta_lba)
     }
 
-    // Absolute disc extents (absolute_lba, byte_length) for the ICB at meta_lba,
-    // keyed by ICB LBA rather than path. Unrecorded extents are kept but flagged
-    // — see docs/udf.md for why both the extent and the flag matter here.
+    // Absolute disc extents (absolute_lba, byte_length) for the ICB at meta_lba, keyed by ICB
+    // LBA rather than path. Unrecorded extents are kept but flagged.
     pub(crate) fn extents_abs_at(
         &self,
         reader: &mut dyn SectorSource,
@@ -700,11 +694,8 @@ impl UdfFs {
     /// caller that will READ those sectors as the file's content — a title's
     /// play plan.
     ///
-    /// Refuses, with [`Error::UdfUnrecordedExtent`], a file containing an
-    /// unrecorded (ECMA-167 4/14.14.1.1 type-1/type-2) extent — see docs/udf.md
-    /// for why. Callers that only need a byte-space ADDRESS MAP (never reading
-    /// the sectors as content) want
-    /// [`file_extents_addressing`](Self::file_extents_addressing) instead.
+    /// Refuses, with [`Error::UdfUnrecordedExtent`], a file containing an unrecorded (ECMA-167
+    /// 4/14.14.1.1 type-1/type-2) extent.
     pub fn file_extents(
         &self,
         reader: &mut dyn SectorSource,
@@ -757,9 +748,8 @@ impl UdfFs {
             })
     }
 
-    // Absolute disc extents (absolute_lba, sector_count) for a file, for a
-    // caller using the list purely as a byte-space address map — never reading
-    // the sectors as content. See docs/udf.md for why this stays pub(crate).
+    // Absolute disc extents (absolute_lba, sector_count) for a file, for a caller using the
+    // list purely as a byte-space address map — never reading the sectors as content.
     pub(crate) fn file_extents_addressing(
         &self,
         reader: &mut dyn SectorSource,
@@ -1025,9 +1015,9 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     })
 }
 
-// UDF 2.50 2.2.10 Metadata File Location: partition-relative block of the
-// Metadata File's File Entry, at offset 40 of the Type 2 map at `map`. None
-// if the map doesn't fit, or isn't "*UDF Metadata Partition" — see docs/udf.md.
+// UDF 2.50 2.2.10 Metadata File Location: partition-relative block of the Metadata File's File
+// Entry, at offset 40 of the Type 2 map at `map`. None if the map doesn't fit, or isn't "*UDF
+// Metadata Partition".
 fn metadata_file_location(lvd: &[u8; 2048], map: usize) -> Option<u32> {
     // ECMA-167 3/10.7.3 fixes the Type 2 map at 64 bytes.
     if map.checked_add(64)? > lvd.len() {
@@ -1055,9 +1045,9 @@ const MAX_DIR_DEPTH: u32 = 8;
 // terminate in microseconds instead of an astronomical number of visits.
 const MAX_TOTAL_DIR_ENTRIES: usize = 100_000;
 
-// Recursive UDF directory-tree walk (up to MAX_DIR_DEPTH); `budget` caps FIDs
-// visited tree-wide, `visited` detects ICB-LBA cycles. Wide arg list is
-// inherent to the walk, not a refactor smell. See docs/udf.md for detail.
+// Recursive UDF directory-tree walk (up to MAX_DIR_DEPTH); `budget` caps FIDs visited
+// tree-wide, `visited` detects ICB-LBA cycles. Wide arg list is inherent to the walk, not a
+// refactor smell.
 #[allow(clippy::only_used_in_recursion)]
 #[allow(clippy::too_many_arguments)]
 fn read_directory(
@@ -1389,8 +1379,7 @@ fn read_file_size(reader: &mut dyn SectorSource, meta_start: u32, meta_lba: u32)
     }
 }
 
-// Parse a UDF filename: first byte is a compression ID (8 = ASCII,
-// 16 = UTF-16BE); see docs/udf.md for the encoding table.
+// Parse a UDF filename: first byte is a compression ID (8 = ASCII, 16 = UTF-16BE).
 pub(crate) fn parse_udf_name(data: &[u8]) -> String {
     if data.is_empty() {
         return String::new();
@@ -1497,9 +1486,8 @@ pub(crate) fn parse_dstring_for_test(data: &[u8]) -> String {
     parse_dstring(data)
 }
 
-// Buffered sector reader — coalesces single-sector reads into `batch`-sized
-// SCSI commands, since per-command latency dominates on USB drives. See
-// docs/udf.md "Buffered Sector Reads".
+// Buffered sector reader — coalesces single-sector reads into `batch`-sized SCSI commands,
+// since per-command latency dominates on USB drives.
 pub(crate) struct BufferedSectorReader<'a> {
     inner: &'a mut dyn SectorSource,
     cache_start: u32,
@@ -1558,9 +1546,9 @@ impl BufferedSectorReader<'_> {
         self.cache_sectors = offset;
     }
 
-    // Pre-read multiple sector ranges into the permanent per-sector HashMap cache
-    // (bulk-loads AACS/MPLS/CLPI/META before scanning), capped at
-    // MAX_PREFETCH_SECTORS to bound RAM against a crafted UDF. See docs/udf.md.
+    // Pre-read multiple sector ranges into the permanent per-sector HashMap cache (bulk-loads
+    // AACS/MPLS/CLPI/META before scanning), capped at MAX_PREFETCH_SECTORS to bound RAM against
+    // a crafted UDF.
     pub(crate) fn prefetch_ranges(&mut self, ranges: &[(u32, u32)]) {
         // 2048 bytes/sector → 512 Ki sectors ≈ 1 GiB of permanent cache.
         const MAX_PREFETCH_SECTORS: u64 = 512 * 1024;
@@ -1778,8 +1766,8 @@ mod tests {
         s
     }
 
-    // Build a tag-261/266 entry with short ADs and every disc-controlled field
-    // of the descriptor area exposed (l_ea/l_ad/extra) — see docs/udf.md.
+    // Build a tag-261/266 entry with short ADs and every disc-controlled field of the
+    // descriptor area exposed (l_ea/l_ad/extra).
     fn build_entry_ads(
         tag: u16,
         l_ea: usize,
@@ -1810,9 +1798,8 @@ mod tests {
         s
     }
 
-    // file_start_lba must skip a leading UNRECORDED extent and report where
-    // the file's DATA starts, not where the hole's space lives — see
-    // docs/udf.md "read_icb_extent(): first RECORDED extent" for why.
+    // file_start_lba must skip a leading UNRECORDED extent and report where the file's DATA
+    // starts, not where the hole's space lives.
     #[test]
     fn file_start_lba_skips_a_leading_unrecorded_extent() {
         use fixture::{DirSpec, MemDisc, PART_START, build_udf_skeleton, lay_dir};
@@ -2423,9 +2410,8 @@ mod tests {
         assert!(dir.is_dir);
     }
 
-    // ---- spec-boundary coverage for AD strides, flags, FIDs ----
-    // Build a tag-266 ICB with EXTENDED ADs (20 bytes each, LBA at offset
-    // +12); sets ICB Tag flags to 2 = Extended AD. See docs/udf.md.
+    // ---- spec-boundary coverage for AD strides, flags, FIDs ---- Build a tag-266 ICB with
+    // EXTENDED ADs (20 bytes each, LBA at offset +12); sets ICB Tag flags to 2 = Extended AD.
     fn build_efe_ext(info_length: u64, ads: &[(u32, u32, u32)]) -> [u8; 2048] {
         let mut s = [0u8; 2048];
         s[0..2].copy_from_slice(&266u16.to_le_bytes()); // tag
@@ -2521,9 +2507,8 @@ mod tests {
         );
     }
 
-    // AD type 3 is EMBEDDED data, not a descriptor list; the old `_ => 8`
-    // fallback misdecoded it as an extent, so a rip would read the wrong
-    // sector at rc=0. See docs/udf.md for why the fixture avoids garbage bytes.
+    // AD type 3 is EMBEDDED data, not a descriptor list; the old `_ => 8` fallback misdecoded
+    // it as an extent, so a rip would read the wrong sector at rc=0.
     #[test]
     fn icb_extents_embedded_data_is_refused_not_decoded_as_descriptors() {
         let mut icb = build_efe(2048, &[(0, 2048, 999)]);
@@ -2560,9 +2545,9 @@ mod tests {
         );
     }
 
-    // A ZERO-LENGTH unrecorded descriptor must not cost the file its plan: it
-    // displaces nothing, so refusing on `!recorded` alone would silently drop
-    // whole titles that ripped fine before. See docs/udf.md.
+    // A ZERO-LENGTH unrecorded descriptor must not cost the file its plan: it displaces
+    // nothing, so refusing on `!recorded` alone would silently drop whole titles that ripped
+    // fine before.
     #[test]
     fn file_extents_accepts_a_zero_length_unrecorded_extent() {
         // A zero-length type-1 hole, then the file's real 4096 bytes.
@@ -2650,9 +2635,9 @@ mod tests {
         );
     }
 
-    // file_extents builds the extent list a title is actually ripped through;
-    // its tuple can't flag a hole, so folding or dropping one is both wrong —
-    // refusal is the only truthful answer. See docs/udf.md.
+    // file_extents builds the extent list a title is actually ripped through; its tuple can't
+    // flag a hole, so folding or dropping one is both wrong — refusal is the only truthful
+    // answer.
     #[test]
     fn file_extents_refuses_a_file_with_an_unrecorded_extent() {
         let icb = build_efe(
@@ -3412,8 +3397,8 @@ mod tests {
         );
     }
 
-    // prefetch's start_lba + offset must not overflow past u32::MAX for a
-    // disc-declared partition near the top of LBA space. See docs/udf.md.
+    // prefetch's start_lba + offset must not overflow past u32::MAX for a disc-declared
+    // partition near the top of LBA space.
     #[test]
     fn prefetch_near_u32_max_does_not_overflow() {
         let mut inner = MapReader::new();
@@ -3691,9 +3676,8 @@ mod tests {
         assert_eq!(fs.root.entries[0].name, "INDEX.BDMV");
     }
 
-    // An anchor whose recorded VDS extent passes every SHAPE check but holds
-    // no sequence must still mount, by sweeping the customary location — shape
-    // alone can't prove content. See docs/udf.md.
+    // An anchor whose recorded VDS extent passes every SHAPE check but holds no sequence must
+    // still mount, by sweeping the customary location — shape alone can't prove content.
     #[test]
     fn a_shape_valid_vds_pointer_that_holds_no_sequence_falls_back_to_the_customary_location() {
         use fixture::{DirSpec, MemDisc, PART_START, build_udf_skeleton, file, lay_dir};
@@ -3728,9 +3712,8 @@ mod tests {
         assert_eq!(fs.root.entries[0].name, "INDEX.BDMV");
     }
 
-    // The recorded extent and the customary fallback are two SWEEPS, not two
-    // locations: de-duplicating them on start LBA alone would throw the wider
-    // sweep away. See docs/udf.md for the fixture layout.
+    // The recorded extent and the customary fallback are two SWEEPS, not two locations:
+    // de-duplicating them on start LBA alone would throw the wider sweep away.
     #[test]
     fn a_recorded_vds_narrower_than_the_customary_window_still_gets_the_wider_sweep() {
         use fixture::{DirSpec, MemDisc, PART_START, build_udf_skeleton, file, lay_dir};
@@ -3814,9 +3797,8 @@ mod tests {
         decoy_meta_fe: Option<u32>,
     }
 
-    // A conformant UDF 2.50 metadata-partition volume with the Metadata File
-    // FE where the partition map says it is. See docs/udf.md for why the
-    // extent length/position use distinct, boundary-exact byte patterns.
+    // A conformant UDF 2.50 metadata-partition volume with the Metadata File FE where the
+    // partition map says it is.
     fn conformant_meta_vol() -> MetaVol {
         MetaVol {
             pm1_type: 1,
@@ -3839,9 +3821,9 @@ mod tests {
     const MV_VOLUME_ID: &str = "FREEMKV-META";
     const MV_FILE_SIZE: u64 = 100;
 
-    // Partition-relative LBAs of a SECOND, decoy tree rooted at block 0 of the
-    // physical partition. Distinguishes "used the metadata partition" from
-    // "fell back to physical" by CONTENT, not an error code. See docs/udf.md.
+    // Partition-relative LBAs of a SECOND, decoy tree rooted at block 0 of the physical
+    // partition. Distinguishes "used the metadata partition" from "fell back to physical" by
+    // CONTENT, not an error code.
     const MV_FB_ROOT_ICB: u32 = 40;
     const MV_FB_ROOT_DATA: u32 = 41;
     const MV_FB_FILE_ICB: u32 = 42;
@@ -3979,9 +3961,9 @@ mod tests {
         (disc, meta_start)
     }
 
-    // A read fault while locating the Metadata File must surface as a read
-    // error, NOT "this is not a UDF disc" — mux::resolve memoises the latter
-    // per-disc and would silently drop content. See docs/udf.md.
+    // A read fault while locating the Metadata File must surface as a read error, NOT "this is
+    // not a UDF disc" — mux::resolve memoises the latter per-disc and would silently drop
+    // content.
     #[test]
     fn a_read_fault_locating_the_metadata_file_is_not_reported_as_a_non_udf_disc() {
         use fixture::PART_START;
@@ -4300,9 +4282,7 @@ mod tests {
         assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
     }
 
-    // ---- directory-descriptor boundary coverage: every field below is
-    // disc-controlled and can push the parser off a buffer or turn a failure
-    // into a plausible-looking success. Offsets/rationale in docs/udf.md.
+    // Exercise directory-descriptor boundaries with untrusted field lengths and offsets.
     fn build_dir_icb_tagged(tag: u16, l_ea: usize, raw_len: u32, ad_pos: u32) -> [u8; 2048] {
         let mut icb = [0u8; 2048];
         icb[0..2].copy_from_slice(&tag.to_le_bytes());

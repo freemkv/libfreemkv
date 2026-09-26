@@ -5,8 +5,6 @@
 //! index are kept, others dropped; everything outside a segment is ordinary (index-0)
 //! content. This module owns that classification only — no I/O, no keys, no cipher.
 //! The decrypt pipeline consumes the [`UnitDisposition`] it returns.
-//!
-//! See docs/index-select.md for where the resolved index ([`resolve_disc_index`]) comes from.
 
 use super::segment::{Segment, segment_for_unit};
 use super::types::UnitKey;

@@ -14,30 +14,26 @@ use crate::udf::UdfFs;
 
 /// Known audio codec tokens
 const AUDIO_CODECS: &[&str] = &["MLP", "AC3", "DTS", "DDL", "WAV", "AC"];
-// Ceiling on streams of one type per feature section: stops a crafted blob
-// with tens of thousands of tokens from overflowing the u16 STN counters.
-// See docs/pixelogic.md — MAX_STREAMS_PER_TYPE.
+// Ceiling on streams of one type per feature section: stops a crafted blob with tens of
+// thousands of tokens from overflowing the u16 STN counters.
 const MAX_STREAMS_PER_TYPE: u16 = 512;
-// Ceiling on distinct video-slot entries one section may list before the
-// walk gives up on it (used to find the next section's start).
-// See docs/pixelogic.md — MAX_VIDEO_SLOTS.
+// Ceiling on distinct video-slot entries one section may list before the walk gives up on it
+// (used to find the next section's start).
 const MAX_VIDEO_SLOTS: usize = 33;
 /// Known region tokens
 const REGIONS: &[&str] = &[
     "US", "UK", "CF", "PF", "CS", "LS", "BP", "PP", "SM", "TM", "CAN", "DUM", "FLE",
 ];
-// Cap on distinct uncatalogued token components retained for the
-// end-of-parse report; past the cap they're still counted, not named.
-// See docs/pixelogic.md — MAX_REPORTED_UNKNOWN.
+// Cap on distinct uncatalogued token components retained for the end-of-parse report; past the
+// cap they're still counted, not named.
 const MAX_REPORTED_UNKNOWN: usize = 16;
 /// Longest retained form of a single uncatalogued component. Components come
 /// from disc bytes and can be arbitrarily long; truncation is by CHARS, not
 /// bytes, so a multi-byte sequence can never be split (which would panic).
 const MAX_UNKNOWN_LEN: usize = 32;
 
-// Collects the uncatalogued token components one parse ran into, reported
-// ONCE at the end rather than silently or per-occurrence.
-// See docs/pixelogic.md — UnknownParts.
+// Collects the uncatalogued token components one parse ran into, reported ONCE at the end
+// rather than silently or per-occurrence.
 #[derive(Debug, Default)]
 struct UnknownParts {
     /// Distinct components, deduplicated and ordered for a stable log line.
@@ -252,9 +248,8 @@ fn assign_labels(strings: &[String], unknown: &mut UnknownParts) -> Vec<StreamLa
     labels
 }
 
-// The bare `Audio Stream N` / `PG Stream N` slot placeholders, and which
-// list they belong to. `None` for anything else (`AR_…`, `Video Stream N`).
-// See docs/pixelogic.md — placeholder_kind.
+// The bare `Audio Stream N` / `PG Stream N` slot placeholders, and which list they belong to.
+// `None` for anything else (`AR_…`, `Video Stream N`).
 fn placeholder_kind(s: &str) -> Option<StreamLabelType> {
     if s.starts_with("Audio Stream") {
         Some(StreamLabelType::Audio)
@@ -265,9 +260,8 @@ fn placeholder_kind(s: &str) -> Option<StreamLabelType> {
     }
 }
 
-// Whether a string has the shape of a pixelogic stream token —
-// `{lang3}_{component}…` — the same gate `parse_token_inner` applies.
-// See docs/pixelogic.md — is_stream_token.
+// Whether a string has the shape of a pixelogic stream token — `{lang3}_{component}…` — the
+// same gate `parse_token_inner` applies.
 fn is_stream_token(s: &str) -> bool {
     let clean = s.trim().trim_start_matches('\t').trim_end_matches('_');
     let mut parts = clean.split('_');
@@ -473,9 +467,8 @@ mod tests {
         assert_eq!(l.qualifier, LabelQualifier::Forced);
     }
 
-    // Immunity pin against the `paramount`-parser defect where a "forced"
-    // marker on a FULL dialogue track's slot got read as "track is forced".
-    // See docs/pixelogic.md — a_full_subtitle_token_is_never_forced....
+    // Immunity pin against the `paramount`-parser defect where a "forced" marker on a FULL
+    // dialogue track's slot got read as "track is forced".
     #[test]
     fn a_full_subtitle_token_is_never_forced_without_its_own_forced_component() {
         for token in [
@@ -567,9 +560,8 @@ mod tests {
         assert_eq!(audio[0].language, "eng");
     }
 
-    // Real UHD feature shape: unlabelled/region-only PG slots must still
-    // occupy STN slots so trailing forced tokens number correctly.
-    // See docs/pixelogic.md — assign_labels_numbers_subtitles_by_stn_slot....
+    // Real UHD feature shape: unlabelled/region-only PG slots must still occupy STN slots so
+    // trailing forced tokens number correctly.
     #[test]
     fn assign_labels_numbers_subtitles_by_stn_slot_not_by_parsed_token() {
         let mut flag = UnknownParts::default();
@@ -867,9 +859,8 @@ mod tests {
         assert!(audio.is_empty() || audio.iter().all(|l| l.stream_number <= 512));
     }
 
-    // Isolates the `SF_` alternative in the end-of-section check from
-    // `SEG_`/`FPL_`, which a mutated `||` -> `&&` couldn't otherwise catch.
-    // See docs/pixelogic.md — assign_labels_fpl_section_ends_on_sf_boundary.
+    // Isolates the `SF_` alternative in the end-of-section check from `SEG_`/`FPL_`, which a
+    // mutated `||` -> `&&` couldn't otherwise catch.
     #[test]
     fn assign_labels_fpl_section_ends_on_sf_boundary() {
         let mut flag = UnknownParts::default();
@@ -884,9 +875,8 @@ mod tests {
         assert_eq!(labels[0].language, "eng");
     }
 
-    // The feature section also ends where the NEXT section's own video slot
-    // repeats — the only boundary when the feature playlist is the last
-    // named section (real corpus disc; see docs/pixelogic.md for the shape).
+    // The feature section also ends where the NEXT section's own video slot repeats — the only
+    // boundary when the feature playlist is the last named section.
     #[test]
     fn assign_labels_section_ends_at_the_next_sections_video_slot() {
         let mut flag = UnknownParts::default();
@@ -975,9 +965,8 @@ mod tests {
         );
     }
 
-    // The two per-type caps are independent: the loop only stops once BOTH
-    // reach MAX_STREAMS_PER_TYPE. Mutation: `&&` -> `||` stops on either.
-    // See docs/pixelogic.md — assign_labels_audio_cap_alone....
+    // The two per-type caps are independent: the loop only stops once BOTH reach
+    // MAX_STREAMS_PER_TYPE. Mutation: `&&` -> `||` stops on either.
     #[test]
     fn assign_labels_audio_cap_alone_does_not_stop_subtitle_processing() {
         let mut flag = UnknownParts::default();
@@ -1000,9 +989,8 @@ mod tests {
         );
     }
 
-    // Companion: subtitle saturated, audio under cap — audio must still
-    // process. Isolates the first `>=` operand from the second.
-    // See docs/pixelogic.md — assign_labels_subtitle_cap_alone....
+    // Companion: subtitle saturated, audio under cap — audio must still process. Isolates the
+    // first `>=` operand from the second.
     #[test]
     fn assign_labels_subtitle_cap_alone_does_not_stop_audio_processing() {
         let mut flag = UnknownParts::default();
@@ -1174,9 +1162,8 @@ mod tests {
         assert!(stored.chars().all(|c| c == 'é'));
     }
 
-    // Per-language notice/disclaimer clip names merely COLLIDE with the
-    // token shape and must stay uncatalogued, collapsing into ONE report.
-    // See docs/pixelogic.md — unknown_parts_collapses_a_wall....
+    // Per-language notice/disclaimer clip names merely COLLIDE with the token shape and must
+    // stay uncatalogued, collapsing into ONE report.
     #[test]
     fn unknown_parts_collapses_a_wall_of_segment_name_collisions() {
         let mut acc = UnknownParts::default();

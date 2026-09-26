@@ -29,24 +29,19 @@ fn is_video_pid(pid: u16) -> bool {
 
 /// BD-TS muxer: PES frames in, 192-byte BD-TS packets out.
 ///
-/// Constructed over an output writer and a slice of per-track PIDs. The
-/// `track` index passed to [`TsMuxer::write_frame`] and
-/// [`TsMuxer::set_codec_private`] is the position in that PID slice; all
-/// per-track state vectors are sized to `pids.len()`. See docs/tsmux.md
-/// for the video-vs-audio PID split and PTS-origin rules.
+/// Constructed over an output writer and a slice of per-track PIDs. The `track` index passed to
+/// [`TsMuxer::write_frame`] and [`TsMuxer::set_codec_private`] is the position in that PID
+/// slice; all per-track state vectors are sized to `pids.len()`.
 pub struct TsMuxer<W: Write> {
     writer: W,
     pids: Vec<u16>,
     continuity: Vec<u8>,                  // per-PID continuity counter (0-15)
     codec_privates: Vec<Option<Vec<u8>>>, // per-track codec_private (for video parameter sets)
     params_written: Vec<bool>,            // per-track: have we written parameter sets?
-    /// Per-track video codec: decides how the ES is framed AND how its
-    /// `codec_private` parameter-set record is parsed. HEVC/H.264 need
-    /// Annex-B conversion (hvcC/avcC parameter sets); MPEG-2/VC-1 are
-    /// already start-code ES and must NOT be converted. Defaults to
-    /// [`Codec::Hevc`]; ignored for non-video tracks. See docs/tsmux.md
-    /// for why NAL-ness is derived from this rather than tracked
-    /// separately.
+    /// Per-track video codec: decides how the ES is framed AND how its `codec_private`
+    /// parameter-set record is parsed. HEVC/H.264 need Annex-B conversion (hvcC/avcC parameter
+    /// sets); MPEG-2/VC-1 are already start-code ES and must NOT be converted. Defaults to
+    /// [`Codec::Hevc`]; ignored for non-video tracks.
     video_codec: Vec<Codec>,
     /// Global PTS origin (nanoseconds), seeded by the FIRST frame of any kind
     /// (video or audio) so a single fixed origin rebases every frame and the
@@ -384,9 +379,8 @@ impl<W: Write> TsMuxer<W> {
     }
 }
 
-// Build a PES packet header for a BD stream. `pts_90k` is `None` for a
-// CONTINUATION PES (rest of an oversized private_stream_1 access unit) —
-// only the first PES may carry a PTS. See docs/tsmux.md for the spec cite.
+// Build a PES packet header for a BD stream. `pts_90k` is `None` for a CONTINUATION PES (rest
+// of an oversized private_stream_1 access unit) — only the first PES may carry a PTS.
 fn build_pes_header(pid: u16, pts_90k: Option<u64>, data_len: usize) -> Vec<u8> {
     use crate::consts::pes_stream_id;
     // Determine stream_id from PID range
@@ -853,9 +847,8 @@ mod tests {
             .collect()
     }
 
-    // Non-NAL codec (MPEG-2/VC-1) must pass ES through byte-for-byte; the
-    // payload is length-prefix SHAPED so a wrongly-applied Annex-B
-    // conversion is visibly detectable. See docs/tsmux.md for full rationale.
+    // Non-NAL codec (MPEG-2/VC-1) must pass ES through byte-for-byte; the payload is
+    // length-prefix SHAPED so a wrongly-applied Annex-B conversion is visibly detectable.
     #[test]
     fn non_nal_video_es_passes_through_unconverted() {
         // 4-byte BE length (6) + 6 payload bytes: exactly what the Annex-B
@@ -1154,9 +1147,9 @@ mod tests {
         assert_eq!(got, big, "split audio reassembles byte-for-byte");
     }
 
-    // ISO/IEC 13818-1 §2.4.3.7: only the first PES of a split access unit may
-    // carry a PTS; repeating it on continuations makes each look like an
-    // independent AU at the same timestamp. See docs/tsmux.md for detail.
+    // ISO/IEC 13818-1 §2.4.3.7: only the first PES of a split access unit may carry a PTS;
+    // repeating it on continuations makes each look like an independent AU at the same
+    // timestamp.
     #[test]
     fn split_access_unit_carries_pts_only_on_the_first_pes() {
         // Three PES worth of ES so there are two continuations to check.
@@ -1185,9 +1178,8 @@ mod tests {
         );
     }
 
-    // MEASURED: the Annex-B conversion buffer must be REUSED across video
-    // frames, not allocated per frame (~310 KB/frame otherwise). See
-    // docs/tsmux.md for the old-allocator regression this pins.
+    // MEASURED: the Annex-B conversion buffer must be REUSED across video frames, not allocated
+    // per frame (~310 KB/frame otherwise).
     #[test]
     fn annex_b_conversion_buffer_is_reused_across_frames() {
         let mut sink: Vec<u8> = Vec::new();

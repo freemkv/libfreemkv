@@ -1,11 +1,9 @@
 //! Fox — loose `/BDMV/JAR/<id>/dcx.xml` plain-XML manifest.
 //!
-//! Root `<dcx><disc>` lists playlists; the feature playlist's nested
-//! `<audio>`/`<subtitle>` elements name language, purpose and forced/SDH
-//! state directly, with no bytecode to decode. NOT A SPECIFICATION — this is
-//! one authoring house's internal metadata; every field meaning was read off
-//! a real disc. See docs/fox.md for the full field mapping, confirmed
-//! schema, and feature-playlist scoping rationale.
+//! Root `<dcx><disc>` lists playlists; the feature playlist's nested `<audio>`/`<subtitle>`
+//! elements name language, purpose and forced/SDH state directly, with no bytecode to decode.
+//! NOT A SPECIFICATION — this is one authoring house's internal metadata; every field meaning
+//! was read off a real disc.
 //!
 //! ```xml
 //! <dcx>
@@ -85,9 +83,8 @@ pub(crate) fn feature_hint(text: &str) -> Option<super::FeaturePlaylistHint> {
     })
 }
 
-// Build stream labels from a `dcx.xml` doc; split out from `parse` for unit
-// testing. Scoped to the richest `<playlist name="feature">` element — see
-// docs/fox.md for why merging playlists is wrong.
+// Build stream labels from a `dcx.xml` doc; split out from `parse` for unit testing. Scoped to
+// the richest `<playlist name="feature">` element.
 pub(crate) fn labels_from_dcx(text: &str) -> Vec<StreamLabel> {
     let Some(feature) = select_feature_playlist(text) else {
         return Vec::new();
@@ -167,9 +164,9 @@ fn playlist_duration_secs(element: &str) -> Option<u64> {
     digits.parse::<u64>().ok().filter(|&d| d > 0)
 }
 
-// Pick the richest `<playlist name="feature">` (most nested streams; a `durs`
-// tiebreak breaks a count tie by longest time; first feature wins a full tie; a
-// stated sub-minute feature is skipped). See docs/fox.md for full rationale.
+// Pick the richest `<playlist name="feature">` (most nested streams; a `durs` tiebreak breaks a
+// count tie by longest time; first feature wins a full tie; a stated sub-minute feature is
+// skipped).
 fn select_feature_playlist(text: &str) -> Option<&str> {
     // rank = (nested stream count, durs seconds). None durs sorts as 0 so it
     // never displaces a stream-count-equal sibling that states a longer time.

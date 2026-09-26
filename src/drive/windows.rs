@@ -58,9 +58,7 @@ pub fn resolve_device(path: &str) -> Result<(String, DeviceResolution)> {
     Ok((normalize_path(path), DeviceResolution::Direct))
 }
 
-// Normalize a device path ("D:", "D:\\", "\\.\D:", "\\.\CdRom0") to
-// Windows \\.\X: format. See docs/drive-access.md — Windows Path
-// Normalization.
+// Normalize a device path ("D:", "D:\\", "\\.\D:", "\\.\CdRom0") to Windows \\.\X: format.
 fn normalize_path(path: &str) -> String {
     if path.starts_with("\\\\.\\") {
         return path.to_string();

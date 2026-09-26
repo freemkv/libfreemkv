@@ -1,12 +1,11 @@
 //! Tolerant XML scraping helpers — promoted from two near-duplicate
 //! hand-rolls in `paramount.rs` and `criterion.rs`.
 //!
-//! Handles the subset of XML the BD-J authoring tools we've seen actually
-//! emit: case-insensitive tag/attribute names, optional `ns:` namespace
-//! prefixes, whitespace-tolerant `=` between attribute name and value,
-//! both `"value"` and `'value'` quoting, and self-closing tags (`<tag />`,
-//! `<tag/>`; [`text`] returns `Some("")` for empty content). Not a full
-//! XML parser — see docs/labels-xml.md for scope and rationale.
+//! Handles the subset of XML the BD-J authoring tools we've seen actually emit:
+//! case-insensitive tag/attribute names, optional `ns:` namespace prefixes, whitespace-tolerant
+//! `=` between attribute name and value, both `"value"` and `'value'` quoting, and self-closing
+//! tags (`<tag />`, `<tag/>`; [`text`] returns `Some("")` for empty content). Not a full XML
+//! parser.
 
 // Out of scope (intentionally simple): entity decoding, CDATA, comments,
 // processing instructions, DTD declarations — none of the BD-J authored

@@ -312,9 +312,8 @@ fn languages_agree(a: &str, b: &str) -> bool {
     !a.is_empty() && a.eq_ignore_ascii_case(b)
 }
 
-// The VENDOR label occupying 1-based STN slot `n` of `stream_type`, if
-// any (derived labels bind by StreamId instead, not by slot).
-// See docs/labels-mod.md — label_at.
+// The VENDOR label occupying 1-based STN slot `n` of `stream_type`, if any (derived labels bind
+// by StreamId instead, not by slot).
 fn label_at(labels: &[StreamLabel], stream_type: StreamLabelType, n: u16) -> Option<&StreamLabel> {
     labels
         .iter()
@@ -347,9 +346,8 @@ fn slots_of(title: &DiscTitle, stream_type: StreamLabelType) -> Vec<(u16, &str)>
         .collect()
 }
 
-// Find the title the label list is actually describing, for one stream
-// type: the title whose per-slot language sequence best matches (fewest
-// contradictions, most confirmations). See docs/labels-mod.md — find_anchor.
+// Find the title the label list is actually describing, for one stream type: the title whose
+// per-slot language sequence best matches (fewest contradictions, most confirmations).
 fn find_anchor(
     labels: &[StreamLabel],
     titles: &[DiscTitle],
@@ -374,9 +372,8 @@ fn find_anchor(
     best.map(|(_, _, idx)| idx)
 }
 
-// How strongly this title matches the vendor label list (count of
-// confirmed slots), or None if it contradicts and can't be the table.
-// See docs/labels-mod.md — anchor_score.
+// How strongly this title matches the vendor label list (count of confirmed slots), or None if
+// it contradicts and can't be the table.
 fn anchor_score(
     labels: &[StreamLabel],
     title: &DiscTitle,
@@ -397,9 +394,8 @@ fn anchor_score(
     Some(confirmed)
 }
 
-// Apply a pre-extracted set of labels to titles' streams: 4 tiers, most
-// certain first — anchor title, anchor-proved PID, StreamId, then
-// language-checked ordinal fallback. See docs/labels-mod.md — apply_labels.
+// Apply a pre-extracted set of labels to titles' streams: 4 tiers, most certain first — anchor
+// title, anchor-proved PID, StreamId, then language-checked ordinal fallback.
 pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
     use std::collections::HashMap;
 
@@ -671,9 +667,8 @@ fn generate_video_label(
     parts.join(" ")
 }
 
-// Does codec_hint name a codec consistent with the stream's actual codec
-// (matched by family, e.g. Atmos on TrueHD)? Rejects shuffled-label
-// mis-binds. See docs/labels-mod.md — codec_hint_consistent.
+// Does codec_hint name a codec consistent with the stream's actual codec (matched by family,
+// e.g. Atmos on TrueHD)? Rejects shuffled-label mis-binds.
 fn codec_hint_consistent(hint: &str, codec: &crate::disc::Codec) -> bool {
     use crate::disc::Codec;
     let h = hint.to_ascii_lowercase();
@@ -741,9 +736,8 @@ pub(crate) fn generate_audio_label(
     generate_audio_label_inner(codec, channels, secondary, false)
 }
 
-// Atmos-aware variant of generate_audio_label: folds the object-audio
-// marker into the codec brand (e.g. "Dolby TrueHD Atmos 7.1").
-// See docs/labels-mod.md — generate_audio_label_atmos.
+// Atmos-aware variant of generate_audio_label: folds the object-audio marker into the codec
+// brand (e.g. "Dolby TrueHD Atmos 7.1").
 pub(crate) fn generate_audio_label_atmos(
     codec: &crate::disc::Codec,
     channels: &crate::disc::AudioChannels,
@@ -864,9 +858,8 @@ fn extract(
     (labels, feature_playlist)
 }
 
-// Merge the MPLS-derived floor into a framework list. Nothing is merged
-// BY slot (the lists don't share a coordinate system); unnamed MPLS
-// streams are appended by StreamId. See docs/labels-mod.md — merge_mpls_floor.
+// Merge the MPLS-derived floor into a framework list. Nothing is merged BY slot (the lists
+// don't share a coordinate system); unnamed MPLS streams are appended by StreamId.
 fn merge_mpls_floor(framework: &mut Vec<StreamLabel>, mpls: &[StreamLabel]) {
     use std::collections::HashSet;
     let named: HashSet<&StreamId> = framework
@@ -918,9 +911,8 @@ fn type_tag(t: StreamLabelType) -> u8 {
     }
 }
 
-// Append CLPI streams (present but unreferenced by MPLS) not already
-// named; each binds by its own (clip, PID), no invented ordinal.
-// Returns count appended. See docs/labels-mod.md — append_clpi_orphans.
+// Append CLPI streams (present but unreferenced by MPLS) not already named; each binds by its
+// own (clip, PID), no invented ordinal. Returns count appended.
 fn append_clpi_orphans(
     labels: &mut Vec<StreamLabel>,
     reader: &mut dyn SectorSource,
@@ -1029,9 +1021,8 @@ fn append_clpi_orphans(
     added
 }
 
-// Pick the winning parser result: highest Confidence among non-empty
-// results, earliest array position wins ties (matches extract()'s scan).
-// See docs/labels-mod.md — select_result.
+// Pick the winning parser result: highest Confidence among non-empty results, earliest array
+// position wins ties (matches extract()'s scan).
 fn select_result<'a>(
     results: &'a [(&'static str, ParseResult)],
 ) -> Option<&'a (&'static str, ParseResult)> {
@@ -1124,9 +1115,8 @@ pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
     }
 }
 
-// Scan /BDMV/PLAYLIST/*.mpls for a chapter-count + duration row per
-// playlist, sorted by filename. Unparseable/markless entries silently
-// dropped. See docs/labels-mod.md — collect_chapter_summary.
+// Scan /BDMV/PLAYLIST/*.mpls for a chapter-count + duration row per playlist, sorted by
+// filename. Unparseable/markless entries silently dropped.
 fn collect_chapter_summary(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<ChapterSummary> {
     let Some(playlist_dir) = udf.find_dir("/BDMV/PLAYLIST") else {
         return Vec::new();
@@ -1227,9 +1217,8 @@ pub struct ChapterSummary {
     pub duration_secs: f64,
 }
 
-// List filenames under any /BDMV/JAR/<x>/ subdirectory, deduped and
-// sorted (empty if none). pub(crate) so filename parsers can scan
-// menu-asset names without a reader. See docs/labels-mod.md — jar_inventory.
+// List filenames under any /BDMV/JAR/<x>/ subdirectory, deduped and sorted (empty if none).
+// pub(crate) so filename parsers can scan menu-asset names without a reader.
 pub(crate) fn jar_inventory(udf: &UdfFs) -> Vec<String> {
     let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
         return Vec::new();
@@ -1237,9 +1226,8 @@ pub(crate) fn jar_inventory(udf: &UdfFs) -> Vec<String> {
     jar_inventory_from(&jar_dir.entries)
 }
 
-// Body of jar_inventory, unit-testable without a UdfFs. Uses a BTreeSet
-// (not Vec::contains) since entry names are attacker-controlled disc
-// data. See docs/labels-mod.md — jar_inventory_from.
+// Body of jar_inventory, unit-testable without a UdfFs. Uses a BTreeSet (not Vec::contains)
+// since entry names are attacker-controlled disc data.
 fn jar_inventory_from(entries: &[crate::udf::DirEntry]) -> Vec<String> {
     let mut out: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for entry in entries {
@@ -1308,9 +1296,8 @@ mod registry_tests {
         }
     }
 
-    // Hang guard: a return to a linear Vec::contains dedup in
-    // jar_inventory would make this 120k-entry fixture run for minutes.
-    // See docs/labels-mod.md — jar_inventory_dedup_does_not_hang_on_a_hostile_directory.
+    // Hang guard: a return to a linear Vec::contains dedup in jar_inventory would make this
+    // 120k-entry fixture run for minutes.
     #[test]
     fn jar_inventory_dedup_does_not_hang_on_a_hostile_directory() {
         const FILES: usize = 120_000;
@@ -1377,9 +1364,8 @@ mod registry_tests {
         );
     }
 
-    // Lock the parser roster + order: first matching parse() wins, so
-    // reordering changes which parser claims a disc. dbp + deluxe MUST
-    // stay last. See docs/labels-mod.md — parsers_registry_order_locked.
+    // Lock the parser roster + order: first matching parse() wins, so reordering changes which
+    // parser claims a disc. dbp + deluxe MUST stay last.
     #[test]
     fn parsers_registry_order_locked() {
         let names: Vec<&str> = PARSERS.iter().map(|(n, _, _)| *n).collect();
@@ -1454,9 +1440,8 @@ mod registry_tests {
         assert!(!h.is_empty());
     }
 
-    // select_result must pick highest confidence, first-in-array on a
-    // tie (regression: old analyze() no-op picked the LAST).
-    // See docs/labels-mod.md — select_result_first_wins_on_tie.
+    // select_result must pick highest confidence, first-in-array on a tie (regression: old
+    // analyze() no-op picked the LAST).
     #[test]
     fn select_result_first_wins_on_tie() {
         // Two parsers, equal (Medium) confidence: the first must win.
@@ -1561,9 +1546,8 @@ mod gap_fill_tests {
         assert_eq!(framework.len(), 3);
     }
 
-    // Spec: merge suppresses a floor entry only when the list already
-    // NAMES that stream — a shared slot number is not the same fact.
-    // See docs/labels-mod.md — suppression_is_by_named_stream_not_by_slot_number.
+    // Spec: merge suppresses a floor entry only when the list already NAMES that stream — a
+    // shared slot number is not the same fact.
     #[test]
     fn suppression_is_by_named_stream_not_by_slot_number() {
         // Framework claims audio slots 1 and 2 but names no stream.
@@ -1797,9 +1781,8 @@ mod apply_tests {
     /// fooled by another test's log output.
     const LOG_INJECTION_SENTINEL: &str = "FMKV-LOG-INJECTION-PROBE";
 
-    // A crafted .mpls filename must be logged via `?` (Debug), not `%`
-    // (Display) — Display writes control/ANSI bytes verbatim (CWE-117).
-    // See docs/labels-mod.md — log-injection guard on playlist-name logging.
+    // A crafted.mpls filename must be logged via `?` (Debug), not `%` (Display) — Display
+    // writes control/ANSI bytes verbatim (CWE-117).
     #[test]
     fn a_disc_derived_playlist_name_is_escaped_in_the_log_not_written_verbatim() {
         // A name whose bytes would clear the line and repaint it.
@@ -2241,9 +2224,8 @@ mod apply_tests {
         }
     }
 
-    // Cross-playlist mis-binding this module's two-tier binding stops:
-    // ordinal numbering would put Forced on different PIDs per sibling
-    // playlist. See docs/labels-mod.md — forced_label_follows_the_pid_not_the_ordinal_across_sibling_playlists.
+    // Cross-playlist mis-binding this module's two-tier binding stops: ordinal numbering would
+    // put Forced on different PIDs per sibling playlist.
     #[test]
     fn forced_label_follows_the_pid_not_the_ordinal_across_sibling_playlists() {
         // Six slots: three plain, a commentary subtitle, then two forced.
@@ -2314,9 +2296,8 @@ mod apply_tests {
         );
     }
 
-    // No anchor: ordinal fallback drops a label whose language
-    // contradicts the stream — unlabelled beats mislabelled `forced`.
-    // See docs/labels-mod.md — ordinal_binding_drops_a_subtitle_label_that_contradicts_the_stream_language.
+    // No anchor: ordinal fallback drops a label whose language contradicts the stream —
+    // unlabelled beats mislabelled `forced`.
     #[test]
     fn ordinal_binding_drops_a_subtitle_label_that_contradicts_the_stream_language() {
         let labels = vec![
@@ -2662,9 +2643,8 @@ mod apply_tests {
         assert!(!codec_hint_adds_detail(""));
     }
 
-    // ── generate_video_label hardening: secondary Dolby Vision stream
-    // gets "Dolby Vision EL", every other HDR format on a secondary
-    // stream gets no label. See docs/labels-mod.md — generate_video_label_secondary_dolby_vision_el.
+    // ── generate_video_label hardening: secondary Dolby Vision stream gets "Dolby Vision EL",
+    // every other HDR format on a secondary stream gets no label.
     #[test]
     fn generate_video_label_secondary_dolby_vision_el() {
         assert_eq!(
@@ -2684,9 +2664,8 @@ mod apply_tests {
         );
     }
 
-    // Spec: 480 lines is the SD floor — height exactly 480 must get the
-    // "480p"/"480i" token, not the empty-resolution case.
-    // See docs/labels-mod.md — generate_video_label_480_boundary.
+    // Spec: 480 lines is the SD floor — height exactly 480 must get the "480p"/"480i" token,
+    // not the empty-resolution case.
     #[test]
     fn generate_video_label_480_boundary() {
         let label = generate_video_label(&Codec::Mpeg2, (0, 480), false, &HdrFormat::Sdr, false);
@@ -2696,9 +2675,8 @@ mod apply_tests {
         );
     }
 
-    // Spec: SDR is the unmarked default — must never appear as a token
-    // (only non-SDR formats get an explicit tag).
-    // See docs/labels-mod.md — generate_video_label_sdr_produces_no_hdr_token.
+    // Spec: SDR is the unmarked default — must never appear as a token (only non-SDR formats
+    // get an explicit tag).
     #[test]
     fn generate_video_label_sdr_produces_no_hdr_token() {
         assert_eq!(
@@ -2709,8 +2687,7 @@ mod apply_tests {
 
     // ── generate_audio_label_atmos ───────────────────────────────────────
 
-    // Spec: the Atmos-aware variant folds "Atmos" into the codec brand
-    // for TrueHD/DD+ carriers. See docs/labels-mod.md — generate_audio_label_atmos_folds_brand.
+    // Spec: the Atmos-aware variant folds "Atmos" into the codec brand for TrueHD/DD+ carriers.
     #[test]
     fn generate_audio_label_atmos_folds_brand() {
         assert_eq!(
@@ -2723,8 +2700,8 @@ mod apply_tests {
         );
     }
 
-    // Spec: every disc-audio codec has a full marketing name, including
-    // lossy PC-container codecs. See docs/labels-mod.md — generate_audio_label_covers_pc_container_codecs.
+    // Spec: every disc-audio codec has a full marketing name, including lossy PC-container
+    // codecs.
     #[test]
     fn generate_audio_label_covers_pc_container_codecs() {
         assert_eq!(
@@ -2775,7 +2752,6 @@ mod apply_tests {
     }
 
     // Isolates the "pcm" (no "lpcm") synonym in says_lpcm.
-    // See docs/labels-mod.md — codec_hint_consistent_lpcm_bare_pcm_synonym.
     #[test]
     fn codec_hint_consistent_lpcm_bare_pcm_synonym() {
         assert!(codec_hint_consistent("PCM", &Codec::Lpcm));
@@ -2783,7 +2759,6 @@ mod apply_tests {
     }
 
     // Isolates says_dts_ma || says_dts_hr inside names_family.
-    // See docs/labels-mod.md — codec_hint_consistent_names_family_dts_ma_alone.
     #[test]
     fn codec_hint_consistent_names_family_dts_ma_alone() {
         assert!(!codec_hint_consistent("Master Audio", &Codec::Ac3));
@@ -2791,7 +2766,6 @@ mod apply_tests {
     }
 
     // Isolates the Codec::TrueHd => says_truehd || says_atmos arm.
-    // See docs/labels-mod.md — codec_hint_consistent_truehd_arm_atmos_alone.
     #[test]
     fn codec_hint_consistent_truehd_arm_atmos_alone() {
         assert!(codec_hint_consistent(
@@ -2800,8 +2774,8 @@ mod apply_tests {
         ));
     }
 
-    // Spec: Codec::Dts is consistent ONLY when says_dts is true, not
-    // via any other named family. See docs/labels-mod.md — codec_hint_consistent_dts_arm_not_bypassed.
+    // Spec: Codec::Dts is consistent ONLY when says_dts is true, not via any other named
+    // family.
     #[test]
     fn codec_hint_consistent_dts_arm_not_bypassed() {
         assert!(!codec_hint_consistent("Dolby Digital", &Codec::Dts));
@@ -2838,9 +2812,8 @@ mod apply_tests {
         }
     }
 
-    // Spec: a label that names its own stream is never reachable
-    // through the slot lookup (different coordinate systems).
-    // See docs/labels-mod.md — slot_lookup_never_returns_a_label_that_names_its_own_stream.
+    // Spec: a label that names its own stream is never reachable through the slot lookup
+    // (different coordinate systems).
     #[test]
     fn slot_lookup_never_returns_a_label_that_names_its_own_stream() {
         let labels = vec![
@@ -2852,9 +2825,8 @@ mod apply_tests {
         assert_eq!(found.qualifier, LabelQualifier::Sdh);
     }
 
-    // Spec: the derived floor does not vote on which title anchors the
-    // vendor list, and cannot VETO the title that does.
-    // See docs/labels-mod.md — the_derived_floor_cannot_veto_the_anchor.
+    // Spec: the derived floor does not vote on which title anchors the vendor list, and cannot
+    // VETO the title that does.
     #[test]
     fn the_derived_floor_cannot_veto_the_anchor() {
         let labels = vec![
@@ -2878,9 +2850,8 @@ mod apply_tests {
         );
     }
 
-    // Spec: among titles the vendor list admits, the one that CONFIRMS
-    // more of it wins — silence is not evidence, size alone must not win.
-    // See docs/labels-mod.md — the_anchor_is_the_title_that_confirms_most_of_the_list.
+    // Spec: among titles the vendor list admits, the one that CONFIRMS more of it wins —
+    // silence is not evidence, size alone must not win.
     #[test]
     fn the_anchor_is_the_title_that_confirms_most_of_the_list() {
         let labels = vec![
@@ -2911,9 +2882,8 @@ mod apply_tests {
         );
     }
 
-    // Spec: a vendor qualifier does not leak via ordinal fallback onto a
-    // different physical stream (same ordinal, different clip).
-    // See docs/labels-mod.md — a_vendor_qualifier_does_not_leak_onto_a_featurettes_own_stream.
+    // Spec: a vendor qualifier does not leak via ordinal fallback onto a different physical
+    // stream (same ordinal, different clip).
     #[test]
     fn a_vendor_qualifier_does_not_leak_onto_a_featurettes_own_stream() {
         let labels = vec![
@@ -2966,9 +2936,8 @@ mod apply_tests {
         }
     }
 
-    // Spec: the anchor proves a (clip, PID) fact only for the clip its
-    // stream table was READ FROM (the first play item), never every clip
-    // it plays. See docs/labels-mod.md — an_anchor_proves_pids_only_for_the_clip_its_table_came_from.
+    // Spec: the anchor proves a (clip, PID) fact only for the clip its stream table was READ
+    // FROM (the first play item), never every clip it plays.
     #[test]
     fn an_anchor_proves_pids_only_for_the_clip_its_table_came_from() {
         let labels = vec![
@@ -3006,9 +2975,8 @@ mod apply_tests {
         );
     }
 
-    // Spec: a vendor codec/variant claim does not follow the ordinal
-    // onto a bonus clip that carries a different codec.
-    // See docs/labels-mod.md — a_vendor_codec_claim_does_not_follow_the_ordinal_onto_a_bonus_clip.
+    // Spec: a vendor codec/variant claim does not follow the ordinal onto a bonus clip that
+    // carries a different codec.
     #[test]
     fn a_vendor_codec_claim_does_not_follow_the_ordinal_onto_a_bonus_clip() {
         // This framework states no codec_hint and puts its descriptor in `name`,
@@ -3055,9 +3023,8 @@ mod apply_tests {
         );
     }
 
-    // Spec: a title whose stream count is smaller than the vendor
-    // list's highest slot cannot be the table that list describes.
-    // See docs/labels-mod.md — a_title_shorter_than_the_vendor_list_cannot_anchor_it.
+    // Spec: a title whose stream count is smaller than the vendor list's highest slot cannot be
+    // the table that list describes.
     #[test]
     fn a_title_shorter_than_the_vendor_list_cannot_anchor_it() {
         let labels = vec![
@@ -3092,8 +3059,8 @@ mod apply_tests {
         );
     }
 
-    // Spec: a slot the vendor list never names constrains nothing (these
-    // blobs under-yield by design). See docs/labels-mod.md — an_unnamed_slot_does_not_disqualify_a_title.
+    // Spec: a slot the vendor list never names constrains nothing (these blobs under-yield by
+    // design).
     #[test]
     fn an_unnamed_slot_does_not_disqualify_a_title() {
         // The vendor names slots 1 and 3 only; slot 2 is its silence.
@@ -3146,9 +3113,8 @@ mod fill_gaps_sort_tests {
         }
     }
 
-    // Spec: the sort-by-(type, number) pass only runs when the merge
-    // actually added something; a no-op merge must leave order untouched.
-    // See docs/labels-mod.md — fill_gaps_leaves_order_untouched_when_nothing_added.
+    // Spec: the sort-by-(type, number) pass only runs when the merge actually added something;
+    // a no-op merge must leave order untouched.
     #[test]
     fn fill_gaps_leaves_order_untouched_when_nothing_added() {
         // Deliberately out of (type, number) order: number 2 before 1.
@@ -3191,9 +3157,8 @@ mod clpi_orphan_tests {
         }
     }
 
-    // Build a CLPI ProgramInfo section for one program from
-    // (pid, stream_coding_info) pairs, per crate::clpi::parse_program_info.
-    // See docs/labels-mod.md — build_program_info / build_clpi.
+    // Build a CLPI ProgramInfo section for one program from (pid, stream_coding_info) pairs,
+    // per crate::clpi::parse_program_info.
     fn build_program_info(streams: &[(u16, Vec<u8>)]) -> Vec<u8> {
         let mut body = Vec::new();
         body.push(0); // reserved
@@ -3213,8 +3178,8 @@ mod clpi_orphan_tests {
         out
     }
 
-    // Build a full CLPI buffer (HDMV header + ProgramInfo) for
-    // (pid, coding_type, lang) streams. See docs/labels-mod.md — build_program_info / build_clpi.
+    // Build a full CLPI buffer (HDMV header + ProgramInfo) for (pid, coding_type, lang)
+    // streams.
     fn build_clpi(streams: &[(u16, u8, &str)]) -> Vec<u8> {
         use crate::consts::coding_type as c;
         let sci_streams: Vec<(u16, Vec<u8>)> = streams
@@ -3350,9 +3315,8 @@ mod clpi_orphan_tests {
         assert!(labels.is_empty());
     }
 
-    // (d) An orphan states NO STN slot, and is identified by the stream
-    // it was read from instead (an invented ordinal could reach it).
-    // See docs/labels-mod.md — orphans_state_no_stn_slot_and_name_their_stream.
+    // (d) An orphan states NO STN slot, and is identified by the stream it was read from
+    // instead (an invented ordinal could reach it).
     #[test]
     fn orphans_state_no_stn_slot_and_name_their_stream() {
         let mut disc = MemDisc::new();

@@ -208,7 +208,7 @@ fn fvi_sink_indexes_real_mpeg2_pipeline_output() {
     let text = std::fs::read_to_string(&path).unwrap();
     let mut lines = text.lines();
 
-    // ── Header line (docs/FVI_FORMAT.md v1 schema) ─────────────────────────────
+    // ── Header line  ─────────────────────────────.
     let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
     assert_eq!(header["format"], "freemkv/video-index");
     assert_eq!(header["fvi_version"], 1);

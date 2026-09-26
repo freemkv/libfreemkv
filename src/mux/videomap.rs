@@ -5,42 +5,37 @@
 //! ordered list of per-picture records: coding truth
 //! ([`PictureInfo`](crate::mux::codec::PictureInfo)) plus source provenance ([`SourcePos`](crate::pes::SourcePos)).
 //!
-//! `VideoMap` is PURE DATA — it knows no output format; the `fvi://` sink does
-//! the serialization to the on-disk FVI format (`docs/FVI_FORMAT.md`).
-//! See docs/videomap-mod.md for the standalone-primitive / multi-sink design.
+//! `VideoMap` is PURE DATA — it knows no output format; the `fvi://` sink does the
+//! serialization to the on-disk FVI format.
 
 use crate::disc::{ColorSpace, DiscTitle, Stream as DiscStream, VideoStream};
 use crate::mux::codec::PictureInfo;
 use crate::mux::codec::coding::{CodingType, FieldOrder};
 use crate::pes::{PesFrame, SourcePos};
 
-// ── Format constants (cite docs/FVI_FORMAT.md) ───────────────────────────────
+// ── Format constants  ───────────────────────────────.
 
-/// Value of the header `"format"` member — the FVI document signature
-/// (`docs/FVI_FORMAT.md` §6). Identifies a stream as a freemkv video index.
+/// Value of the header `"format"` member — the FVI document signature. Identifies a stream as a
+/// freemkv video index.
 pub const FVI_FORMAT: &str = "freemkv/video-index";
 
-/// Value of the header `"fvi_version"` member — the FVI document format version
-/// (`docs/FVI_FORMAT.md` §6, §11). This spec defines `1`.
+/// Value of the header `"fvi_version"` member — the FVI document format version. This spec
+/// defines `1`.
 pub const FVI_VERSION: u32 = 1;
 
-/// Producing tool tag for the header `"generator"` member
-/// (`docs/FVI_FORMAT.md` §6).
+/// Producing tool tag for the header `"generator"` member.
 pub const FVI_GENERATOR: &str = concat!("freemkv/", env!("FREEMKV_VERSION"), env!("GIT_SUFFIX"));
 
-/// Header `"timescale"` for all `pts`/`dts` ticks (`docs/FVI_FORMAT.md` §10).
-/// The highway carries presentation timestamps in nanoseconds, so the timescale
-/// is `1_000_000_000` ticks per second.
+/// Header `"timescale"` for all `pts`/`dts` ticks. The highway carries presentation timestamps
+/// in nanoseconds, so the timescale is `1_000_000_000` ticks per second.
 pub const FVI_TIMESCALE: u64 = 1_000_000_000;
 
-/// Bytes per `src.sector` unit (`docs/FVI_FORMAT.md` §6.2, §9). The highway's
-/// [`SourcePos`] counts 2048-byte logical sectors.
+/// Bytes per `src.sector` unit. The highway's [`SourcePos`] counts 2048-byte logical sectors.
 pub const FVI_SECTOR_SIZE: u32 = crate::consts::SECTOR_BYTES as u32;
 
 // ── Logical model (serialization-independent) ────────────────────────────────
 
-/// Source-stream colour description (CICP code points), header-level
-/// (`docs/FVI_FORMAT.md` §6.1 `colour`).
+/// Source-stream colour description (CICP code points), header-level.
 ///
 /// Each field is the ITU-T H.273 / ISO 23091-2 code point for the title's
 /// primary video, derived from the disc's [`ColorSpace`]. `full_range` is the
@@ -95,9 +90,8 @@ impl Colour {
     }
 }
 
-/// Scan type for the header `stream.scan` member (`docs/FVI_FORMAT.md` §6.1).
-/// `"mbaff"` is reachable only for codecs that signal it; MPEG-2 / disc video
-/// resolves to `progressive` / `interlaced`.
+/// Scan type for the header `stream.scan` member. `"mbaff"` is reachable only for codecs that
+/// signal it; MPEG-2 / disc video resolves to `progressive` / `interlaced`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scan {
     Progressive,
@@ -113,11 +107,10 @@ impl Scan {
     }
 }
 
-/// Source `medium` for the header `source.medium` member
-/// (`docs/FVI_FORMAT.md` §6.2). Describes the physical/logical input the index
-/// was built from — never the destination the index is written to. The driver
-/// derives it from the `MuxInput` arm; [`Medium::File`] is the default only for
-/// a caller that declares no provenance at all.
+/// Source `medium` for the header `source.medium` member. Describes the physical/logical input
+/// the index was built from — never the destination the index is written to. The driver derives
+/// it from the `MuxInput` arm; [`Medium::File`] is the default only for a caller that declares
+/// no provenance at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Medium {
     Disc,
@@ -138,7 +131,7 @@ impl Medium {
     }
 }
 
-/// Provenance root for the header (`docs/FVI_FORMAT.md` §6.2 `source`).
+/// Provenance root for the header.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SourceInfo {
     /// Input medium.
@@ -153,8 +146,7 @@ pub struct SourceInfo {
     pub volume_id: String,
 }
 
-/// Per-title video facts for the header `stream` object
-/// (`docs/FVI_FORMAT.md` §6.1).
+/// Per-title video facts for the header `stream` object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamInfo {
     /// Registered codec id (Appendix B), e.g. `"mpeg2video"`, `"hevc"`.
@@ -172,7 +164,7 @@ pub struct StreamInfo {
     pub colour: Colour,
 }
 
-/// The header row: per-title facts (`docs/FVI_FORMAT.md` §6).
+/// The header row: per-title facts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MapHeader {
     /// The indexed elementary stream.
@@ -183,9 +175,8 @@ pub struct MapHeader {
     pub picture_count: Option<u64>,
 }
 
-/// Map the disc's `Codec` to a registered FVI codec id
-/// (`docs/FVI_FORMAT.md` Appendix B). The disc-info `Codec::id` strings differ
-/// (`"mpeg2"`/`"mpeg1"`); FVI uses the bitstream names.
+/// Map the disc's `Codec` to a registered FVI codec id. The disc-info `Codec::id` strings
+/// differ (`"mpeg2"`/`"mpeg1"`); FVI uses the bitstream names.
 fn fvi_codec_id(codec: crate::disc::Codec) -> &'static str {
     use crate::disc::Codec;
     match codec {
@@ -259,8 +250,7 @@ fn display_aspect_ratio(v: &VideoStream, w: u32, h: u32) -> (u32, u32) {
     }
 }
 
-/// One per-picture index record, distilled from a video [`PesFrame`]
-/// (`docs/FVI_FORMAT.md` §7).
+/// One per-picture index record, distilled from a video [`PesFrame`].
 ///
 /// `coding` is the codec-agnostic per-picture truth ([`PictureInfo`], set by
 /// EVERY video parser that decodes coding — MPEG-2 fully, H.264/HEVC/VC-1 as
@@ -285,7 +275,7 @@ pub struct PictureRecord {
     pub source: Option<SourcePos>,
 }
 
-/// Record `type` label (`docs/FVI_FORMAT.md` §7), codec-agnostic.
+/// Record `type` label, codec-agnostic.
 ///
 /// When `coding` is present (any video codec — every parser now fills it), the
 /// agnostic coding type is reported from [`PictureInfo::coding_type`]:
@@ -310,10 +300,9 @@ pub fn type_label(coding: Option<PictureInfo>, keyframe: bool) -> &'static str {
     }
 }
 
-/// Field-display-order label for the optional `field_order` member
-/// (`docs/FVI_FORMAT.md` §7.1, Matroska element 0x9D), or `None` when the codec
-/// did not measure it (signal absent / coding-type-only codec). `None` is an
-/// HONEST absence — the writer OMITS the member rather than guessing a default.
+/// Field-display-order label for the optional `field_order` member, or `None` when the codec
+/// did not measure it (signal absent / coding-type-only codec). `None` is an HONEST absence —
+/// the writer OMITS the member rather than guessing a default.
 pub fn field_order_label(coding: Option<PictureInfo>) -> Option<&'static str> {
     match coding?.field_order()? {
         FieldOrder::Tff => Some("tff"),
@@ -322,14 +311,12 @@ pub fn field_order_label(coding: Option<PictureInfo>) -> Option<&'static str> {
     }
 }
 
-/// Whether a picture is a random-access point for the `key` member
-/// (`docs/FVI_FORMAT.md` §7), codec-agnostic.
+/// Whether a picture is a random-access point for the `key` member, codec-agnostic.
 ///
-/// For EVERY codec the frame's own `keyframe` flag IS the random-access signal:
-/// IDR/IRAP for HEVC/H.264, the I-picture flag for MPEG-2/VC-1 — authored by
-/// each codec's parser through the highway. `key` is the parser-flagged
-/// decode-restart point (an intra picture), not the stricter open-GOP
-/// clean-RAP precision; see `docs/FVI_FORMAT.md` for the honest limitation.
+/// For EVERY codec the frame's own `keyframe` flag IS the random-access signal: IDR/IRAP for
+/// HEVC/H.264, the I-picture flag for MPEG-2/VC-1 — authored by each codec's parser through the
+/// highway. `key` is the parser-flagged decode-restart point (an intra picture), not the
+/// stricter open-GOP clean-RAP precision.
 pub fn is_random_access(coding: Option<PictureInfo>, keyframe: bool) -> bool {
     // `PictureInfo` carries no GOP-closure (`closed_gop`/`gop_start`), so we
     // don't claim clean-RAP precision here; frame-flag alone is sufficient
@@ -478,9 +465,8 @@ mod tests {
         assert_eq!(Colour::from_color_space(ColorSpace::Unknown).primaries, 2);
     }
 
-    // Regression: FVI colour must mirror the MKV muxer's precedence, not
-    // blindly map `color_space` → SDR transfer 14 for BT.2020.
-    // See docs/videomap-mod.md for the HDR10/measured-CICP bug history.
+    // Regression: FVI colour must mirror the MKV muxer's precedence, not blindly map
+    // `color_space` → SDR transfer 14 for BT.2020.
     #[test]
     fn fvi_colour_follows_hdr_and_measured_cicp() {
         use crate::disc::MeasuredCicp;

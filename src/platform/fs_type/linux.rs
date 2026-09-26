@@ -19,9 +19,8 @@ const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
 const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 
-// Classify an `f_type` magic from `statfs`/`fstatfs`; shared by the
-// path-based and fd-based entry points. See docs/fs-type-linux.md for
-// why the `i64` cast (and its clippy allow) is needed.
+// Classify an `f_type` magic from `statfs`/`fstatfs`; shared by the path-based and fd-based
+// entry points.
 #[allow(clippy::unnecessary_cast)]
 fn classify_f_type(f_type: i64) -> FsType {
     let nfs_magic = libc::NFS_SUPER_MAGIC as i64;

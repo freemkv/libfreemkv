@@ -6,8 +6,7 @@
 //! exactly that: **the parser returns `Ok` or `Err`, and never panics.**
 //!
 //! `FREEMKV_HARNESS_CASES` sets cases per generator per target (default 256).
-//! `FREEMKV_HARNESS_SEED` overrides the seed to reproduce a CI failure
-//! locally. See docs/harness.md for rationale and the on-failure workflow.
+//! `FREEMKV_HARNESS_SEED` overrides the seed to reproduce a CI failure locally.
 
 #![cfg(test)]
 

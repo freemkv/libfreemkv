@@ -1,7 +1,6 @@
 //! libfreemkv -- Open source optical drive library for 4K UHD / Blu-ray / DVD.
 //!
-//! Handles drive access, disc structure parsing, AACS decryption, and raw
-//! sector reading. Architecture, AACS, and error code details: `docs/lib-overview.md`.
+//! Handles drive access, disc structure parsing, AACS decryption, and raw sector reading.
 //!
 //! # Quick Start
 //!

@@ -4,9 +4,8 @@
 //! out to a file, in order, once. It is what an `iso://` DESTINATION means when
 //! the source is not a physical drive.
 //!
-//! Drive sources go through `freemkv_engine::copy` (the recovery path) instead;
-//! this function is for everything else. See docs/image-writer.md for why the
-//! two paths must stay separate.
+//! Drive sources go through `freemkv_engine::copy` (the recovery path) instead; this function
+//! is for everything else.
 
 use crate::consts::SECTOR_BYTES;
 use crate::error::{Error, Result};
@@ -24,9 +23,8 @@ const BATCH_SECTORS: u32 = 2048;
 /// Write `total_sectors` sectors from `reader` to `dest`.
 ///
 /// Reads sequentially, writes in order; does no decryption itself (caller's call).
-/// `on_progress` runs after each batch with cumulative bytes and must not block;
-/// `halt` is checked once per batch, and on cancellation the partial file is kept.
-/// Returns bytes written. See docs/image-writer.md for rationale.
+/// `on_progress` runs after each batch with cumulative bytes and must not block; `halt` is
+/// checked once per batch, and on cancellation the partial file is kept. Returns bytes written.
 ///
 /// # Errors
 ///

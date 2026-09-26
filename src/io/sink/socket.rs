@@ -1,10 +1,9 @@
 //! TCP / UDP socket sinks (sequential-only).
 //!
-//! [`SocketSink`] wraps a `TcpStream` in a 1 MiB `BufWriter`; `finish()`
-//! flushes then `shutdown(Write)`s for a clean end-of-stream.
-//! [`UdpSocketSink`] wraps a connected `UdpSocket`; each `write` emits
-//! one datagram and `finish()` is a no-op. Neither implements `Seek`,
-//! so neither satisfies [`RandomAccessSink`]. See docs/socket.md.
+//! [`SocketSink`] wraps a `TcpStream` in a 1 MiB `BufWriter`; `finish()` flushes then
+//! `shutdown(Write)`s for a clean end-of-stream. [`UdpSocketSink`] wraps a connected
+//! `UdpSocket`; each `write` emits one datagram and `finish()` is a no-op. Neither implements
+//! `Seek`, so neither satisfies [`RandomAccessSink`].
 //!
 //! [`SequentialSink`]: super::SequentialSink
 //! [`RandomAccessSink`]: super::RandomAccessSink
@@ -14,9 +13,7 @@ use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 
 use super::SequentialSink;
 
-// `BufWriter` capacity for `SocketSink`. 1 MiB matches the typical
-// kernel send-buffer ceiling; see docs/socket.md for the amplification
-// rationale.
+// `BufWriter` capacity for `SocketSink`. 1 MiB matches the typical kernel send-buffer ceiling.
 const TCP_BUF_CAPACITY: usize = 1024 * 1024;
 
 /// Sequential-only sink over a TCP connection.
@@ -266,8 +263,8 @@ mod tests {
 
     // ── Added hardening tests ───────────────────────────────────────
 
-    // `finish` must `shutdown(Write)` so the peer's `read_to_end` sees EOF
-    // instead of blocking forever. See docs/socket.md — test notes.
+    // `finish` must `shutdown(Write)` so the peer's `read_to_end` sees EOF instead of blocking
+    // forever.
     #[test]
     fn finish_signals_eof_to_peer() {
         use std::sync::mpsc;
@@ -294,8 +291,7 @@ mod tests {
         assert_eq!(received, b"unflushed-tail");
     }
 
-    // UDP `write` must emit one datagram per call, no coalescing. See
-    // docs/socket.md — test notes.
+    // UDP `write` must emit one datagram per call, no coalescing.
     #[test]
     fn udp_write_is_one_datagram_per_call() {
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -320,8 +316,7 @@ mod tests {
         assert!(buf[..second].iter().all(|&b| b == 0xBB));
     }
 
-    // UDP `finish` is a documented no-op; must not error. See
-    // docs/socket.md — test notes.
+    // UDP `finish` is a documented no-op; must not error.
     #[test]
     fn udp_finish_is_noop_ok() {
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();

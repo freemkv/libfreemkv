@@ -1,9 +1,8 @@
 //! Display-order PTS reconstruction for sparse-PTS program-stream video.
 //!
-//! MPEG program streams (DVD VOB, HD-DVD EVO) timestamp video at GOP
-//! granularity, so H.264/HEVC/VC-1 non-anchor frames collapse to the same
-//! block timestamp and a decoder reports non-monotonic DTS. See
-//! docs/reorder.md for the full background and the reordering rule.
+//! MPEG program streams (DVD VOB, HD-DVD EVO) timestamp video at GOP granularity, so
+//! H.264/HEVC/VC-1 non-anchor frames collapse to the same block timestamp and a decoder reports
+//! non-monotonic DTS.
 //!
 //! [`SparsePtsReorder`](crate::mux::codec::reorder::SparsePtsReorder)
 //! reconstructs a display-order PTS per frame from picture type (I/P/B) and
@@ -12,17 +11,16 @@
 use super::Frame;
 use super::coding::CodingType;
 
-// Fallback per-frame duration (ns) when anchor spacing can't calibrate one:
-// 24000/1001 fps film, the dominant HD-DVD cadence. See docs/reorder.md.
+// Fallback per-frame duration (ns) when anchor spacing can't calibrate one: 24000/1001 fps
+// film, the dominant HD-DVD cadence.
 const FALLBACK_FRAME_DUR_NS: i64 = 1_001_000_000 / 24;
 
-// Force-complete the current GOP at this many buffered pictures even without
-// a keyframe, so a stream that never signals one can't buffer unbounded RAM.
-// See docs/reorder.md.
+// Force-complete the current GOP at this many buffered pictures even without a keyframe, so a
+// stream that never signals one can't buffer unbounded RAM.
 const MAX_GOP_FRAMES: usize = 600;
 
-// Byte cap on the buffered GOP, complementing MAX_GOP_FRAMES, so few-but-huge
-// access units can't over-allocate either. See docs/reorder.md.
+// Byte cap on the buffered GOP, complementing MAX_GOP_FRAMES, so few-but-huge access units
+// can't over-allocate either.
 const MAX_GOP_BYTES: usize = 64 * 1024 * 1024;
 
 /// One buffered coded picture awaiting its GOP's completion.
@@ -187,8 +185,8 @@ impl SparsePtsReorder {
     }
 }
 
-// Display index (0-based, decode order in -> decode order out) via the
-// classic single-anchor-delay reorder. See docs/reorder.md.
+// Display index (0-based, decode order in -> decode order out) via the classic
+// single-anchor-delay reorder.
 fn display_indices(types: impl Iterator<Item = CodingType>) -> Vec<i64> {
     let types: Vec<CodingType> = types.collect();
     let mut disp = vec![0i64; types.len()];

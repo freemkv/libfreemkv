@@ -77,9 +77,8 @@ const SCSI_MODE_SENSE: u8 = 0x5A;
 const SCSI_MODE_SELECT: u8 = 0x55;
 const SCSI_REPORT_KEY: u8 = 0xA4;
 
-// SBC/MMC Read-Write Error Recovery mode page. Flipping PER makes the drive
-// REPORT recovered reads instead of silently returning best-effort GOOD data.
-// See docs/drive-mod.md — Error-recovery mode page (PER bit).
+// SBC/MMC Read-Write Error Recovery mode page. Flipping PER makes the drive REPORT recovered
+// reads instead of silently returning best-effort GOOD data.
 const MODE_PAGE_ERROR_RECOVERY: u8 = 0x01;
 /// Bit masks in the Read-Write Error Recovery flags byte (page byte 2).
 const ERP_FLAG_TB: u8 = 0x20; // Transfer Block: still deliver the recovered data
@@ -124,11 +123,10 @@ pub struct Drive {
     /// (firmware/vendor unlock de-busses at the drive, or the disc carries no bus
     /// encryption).
     bus_stage: crate::sector::bus_removal::BusStage,
-    /// Encrypted-content extent map (sorted `(start_lba, sector_count)`) that
-    /// gates the host-key de-bus to content sectors — clear UDF/nav sectors read
-    /// during a whole-disc pass are left untouched. `None` = de-bus every read
-    /// sector (a content-only reader). Ignored entirely under
-    /// `BusStage::Passthrough`. See docs/drive-mod.md — bus-removal wiring.
+    /// Encrypted-content extent map (sorted `(start_lba, sector_count)`) that gates the
+    /// host-key de-bus to content sectors — clear UDF/nav sectors read during a whole-disc pass
+    /// are left untouched. `None` = de-bus every read sector (a content-only reader). Ignored
+    /// entirely under `BusStage::Passthrough`.
     bus_content_ranges: Option<Arc<[(u32, u32)]>>,
     /// Linux only: raw fd for the corresponding block device (`/dev/sr*`)
     /// used as a recovery fallback when SCSI READ via `/dev/sg*` returns
@@ -811,12 +809,11 @@ impl Drive {
     /// Read sectors from the disc. Single-shot — no inline retries, no
     /// SCSI reset.
     ///
-    /// `recovery=true` uses [`crate::scsi::READ_RECOVERY_TIMEOUT_MS`] (60 s,
-    /// matches sg_dd) for the `freemkv_engine::recovery::patch` pass;
-    /// `recovery=false` uses [`crate::scsi::READ_TIMEOUT_MS`] (10 s) for
-    /// `freemkv_engine::recovery::copy`'s fast skip-forward sweep. On any
-    /// failure returns `Err(DiscRead)` immediately; orchestration handles
-    /// retry policy. See docs/drive-mod.md — single-shot contract.
+    /// `recovery=true` uses [`crate::scsi::READ_RECOVERY_TIMEOUT_MS`] (60 s, matches sg_dd) for
+    /// the `freemkv_engine::recovery::patch` pass; `recovery=false` uses
+    /// [`crate::scsi::READ_TIMEOUT_MS`] (10 s) for `freemkv_engine::recovery::copy`'s fast
+    /// skip-forward sweep. On any failure returns `Err(DiscRead)` immediately; orchestration
+    /// handles retry policy.
     pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
         // Bulk path: FUA off (the drive cache IS the streaming throughput).
         self.read_fua(lba, count, buf, recovery, false)
@@ -1167,9 +1164,8 @@ impl Drop for Drive {
     }
 }
 
-// Resolve a `/dev/sg*` path to its `/dev/sr*` block device via sysfs, open
-// for read (no O_DIRECT). None on any error ("no fallback available").
-// See docs/drive-mod.md — open_block_device_for_sg.
+// Resolve a `/dev/sg*` path to its `/dev/sr*` block device via sysfs, open for read (no
+// O_DIRECT). None on any error ("no fallback available").
 #[cfg(target_os = "linux")]
 fn open_block_device_for_sg(sg_path: &Path) -> Option<std::os::unix::io::RawFd> {
     let basename = sg_path.file_name()?.to_str()?;
@@ -1247,10 +1243,9 @@ impl SectorSource for Drive {
 /// that currently has media**.
 ///
 /// Opens each candidate in enumeration order and returns the first reporting
-/// [`DriveStatus::DiscPresent`] via [`Drive::drive_status`]; falls back to
-/// the first drive that opened if none report a disc. For just listing
-/// drives without opening, use `scsi::list_drives()` instead.
-/// See docs/drive-mod.md — find_drive selection policy.
+/// [`DriveStatus::DiscPresent`] via [`Drive::drive_status`]; falls back to the first drive that
+/// opened if none report a disc. For just listing drives without opening, use
+/// `scsi::list_drives()` instead.
 pub fn find_drive() -> Option<Drive> {
     #[cfg(target_os = "macos")]
     let candidates = crate::scsi::list_drives()
@@ -1357,9 +1352,8 @@ pub(crate) fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> R
     last_lba.checked_add(1).ok_or(Error::DiscCapacityOverflow)
 }
 
-// Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping true,
-// returning Error::Halted. Used by wait_ready's poll backoff and
-// spin_cycle's spin-down/settle pauses. See docs/drive-mod.md — sleep_until_halted.
+// Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping true, returning
+// Error::Halted. Used by wait_ready's poll backoff and spin_cycle's spin-down/settle pauses.
 fn sleep_until_halted(halt: &AtomicBool, total: std::time::Duration) -> Result<()> {
     const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
     let deadline = std::time::Instant::now() + total;
@@ -1390,9 +1384,8 @@ pub enum DeviceResolution {
     SrNoSgMatch,
 }
 
-// Resolve a device path to its raw SCSI device; returns the resolved path
-// plus a DeviceResolution signal. Staged, not yet wired — allow(dead_code)
-// is deliberate. See docs/drive-mod.md — resolve_device.
+// Resolve a device path to its raw SCSI device; returns the resolved path plus a
+// DeviceResolution signal. Staged, not yet wired — allow(dead_code) is deliberate.
 #[allow(dead_code)]
 pub(crate) fn resolve_device(path: &str) -> Result<(String, DeviceResolution)> {
     platform::resolve_device(path)
@@ -1833,7 +1826,6 @@ mod command_tests {
     }
 
     // disc_is_dvd() must match ONLY the DVD profile family (0x0010..=0x001F).
-    // See docs/drive-mod.md — disc_is_dvd_matches_only_dvd_profile_family.
     #[test]
     fn disc_is_dvd_matches_only_dvd_profile_family() {
         let probe = |profile: u16| {
@@ -1887,9 +1879,8 @@ mod command_tests {
         assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
     }
 
-    // Byte 5 is a Media Status only when NEA is clear AND class == Media;
-    // otherwise it must fall back to TUR, not decode a reserved byte.
-    // See docs/drive-mod.md — media-status decoding.
+    // Byte 5 is a Media Status only when NEA is clear AND class == Media; otherwise it must
+    // fall back to TUR, not decode a reserved byte.
     #[test]
     fn drive_status_rejects_a_reply_carrying_no_media_event_descriptor() {
         // NEA = 1: "No Event Available" — no descriptor was returned, so the
@@ -2327,9 +2318,8 @@ mod command_tests {
         }
     }
 
-    // An undersized caller buffer must error, not panic, whether the request
-    // fits in one transfer or has to be chunked. See docs/drive-mod.md —
-    // chunked-read tests.
+    // An undersized caller buffer must error, not panic, whether the request fits in one
+    // transfer or has to be chunked.
     #[test]
     fn an_undersized_buffer_errors_on_the_chunked_path_just_like_the_single_one() {
         // max_transfer = 4 sectors, so a 10-sector read must chunk.
@@ -2444,9 +2434,8 @@ mod command_tests {
         }
     }
 
-    // Writes a distinct marker per chunk and checks the BYTE offset, catching
-    // a `*` -> `+`/`/` mutation in the chunk destination-slice arithmetic.
-    // See docs/drive-mod.md — chunked-read tests.
+    // Writes a distinct marker per chunk and checks the BYTE offset, catching a `*` -> `+`/`/`
+    // mutation in the chunk destination-slice arithmetic.
     #[test]
     fn read_chunks_write_into_correctly_offset_buffer_regions() {
         // max_transfer = 4 sectors (8192 bytes): a 10-sector read at LBA 0
@@ -2468,8 +2457,8 @@ mod command_tests {
         );
     }
 
-    // Multi-chunk path with an undersized buffer must error, not panic, same
-    // as the single-chunk path. See docs/drive-mod.md — chunked-read tests.
+    // Multi-chunk path with an undersized buffer must error, not panic, same as the
+    // single-chunk path.
     #[test]
     fn undersized_buffer_multi_chunk_errors_not_panics() {
         let ChunkingHarness {
@@ -2840,8 +2829,7 @@ mod command_tests {
         );
     }
 
-    // A Stop pressed before the poll starts must be answered at once, not
-    // after the ~30 s poll. See docs/drive-mod.md — wait_ready/spin_cycle halt tests.
+    // A Stop pressed before the poll starts must be answered at once, not after the ~30 s poll.
     #[test]
     fn wait_ready_returns_halted_when_stopped_before_the_poll() {
         struct NeverReady;
@@ -2874,8 +2862,7 @@ mod command_tests {
         );
     }
 
-    // A Stop pressed part way through the poll must be answered at the next
-    // command boundary. See docs/drive-mod.md — wait_ready/spin_cycle halt tests.
+    // A Stop pressed part way through the poll must be answered at the next command boundary.
     #[test]
     fn wait_ready_returns_halted_when_stopped_during_the_poll() {
         struct StopsOnThirdPoll {
@@ -2925,8 +2912,7 @@ mod command_tests {
         );
     }
 
-    // spin_cycle must not be deaf to Stop for its ~15 s of deliberate
-    // waiting. See docs/drive-mod.md — wait_ready/spin_cycle halt tests.
+    // spin_cycle must not be deaf to Stop for its ~15 s of deliberate waiting.
     #[test]
     fn spin_cycle_returns_halted_when_stopped_before_it_starts() {
         let RecordingHarness {
@@ -2951,8 +2937,7 @@ mod command_tests {
         );
     }
 
-    // A Stop that lands DURING the spin-down pause must wake it (halt-aware
-    // sleep, ~100 ms). See docs/drive-mod.md — wait_ready/spin_cycle halt tests.
+    // A Stop that lands DURING the spin-down pause must wake it (halt-aware sleep, ~100 ms).
     #[test]
     fn spin_cycle_wakes_from_its_spin_down_pause_when_stopped() {
         let RecordingHarness {
@@ -2980,8 +2965,7 @@ mod command_tests {
         );
     }
 
-    // A READ(10) with GOOD status but a residual underrun must be refused
-    // AND logged. See docs/drive-mod.md — read_logs_a_good_status_short_transfer.
+    // A READ(10) with GOOD status but a residual underrun must be refused AND logged.
     #[test]
     fn read_logs_a_good_status_short_transfer() {
         let RecordingHarness {

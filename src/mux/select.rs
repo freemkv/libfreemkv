@@ -4,8 +4,6 @@
 //! BEFORE the mux path finalizes the title, so track headers, `codec_privates`,
 //! PID routing, and frame emission all follow from the pruned list by
 //! construction. Language-agnostic: PIDs, not languages.
-//!
-//! See docs/mux-select.md — declaration-driven pipeline rationale.
 
 use crate::disc::{DiscTitle, Stream};
 use crate::error::{Error, Result};
@@ -39,7 +37,6 @@ impl StreamSelection {
         matches!(self.audio, PidFilter::All) && matches!(self.subtitle, PidFilter::All)
     }
 
-    // See docs/mux-select.md — codec_privates lockstep & fail-loud rationale.
     /// Prune `title.streams` in place: keep every [`Stream::Video`]
     /// unconditionally; keep an [`Stream::Audio`]/[`Stream::Subtitle`] iff its
     /// PID passes the corresponding [`PidFilter`]; drop the rest. Declared
@@ -302,9 +299,9 @@ mod tests {
         );
     }
 
-    // codec_privates longer than streams must still prune in lockstep by index
-    // (regression: a trailing extra entry once skipped the prune, misattaching
-    // codec-private to the wrong track). See docs/mux-select.md.
+    // codec_privates longer than streams must still prune in lockstep by index (regression: a
+    // trailing extra entry once skipped the prune, misattaching codec-private to the wrong
+    // track).
     #[test]
     fn apply_prunes_codec_privates_even_when_length_does_not_match_streams() {
         let mut t = title();
@@ -335,9 +332,8 @@ mod tests {
             "the two positional vecs must be aligned after apply()"
         );
     }
-    // A PID in the wrong class's filter must fail loud, not silently vanish
-    // (validation once scanned both classes, letting it pass then get dropped
-    // by `keeps`). See docs/mux-select.md.
+    // A PID in the wrong class's filter must fail loud, not silently vanish (validation once
+    // scanned both classes, letting it pass then get dropped by `keeps`).
     #[test]
     fn a_pid_listed_in_the_wrong_class_filter_is_rejected() {
         let mut t = title();

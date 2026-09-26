@@ -3,10 +3,8 @@
 //! Detected on discs whose `/BDMV/JAR/<x>.jar` contains a
 //! `com/bydeluxe/` directory entry.
 //!
-//! Stream labels are ordinal references into enum classes obfuscated
-//! per-disc, so parsing matches each enum's `<clinit>` shape rather
-//! than class names; see docs/deluxe.md for the enum fingerprints,
-//! decoder phases, confidence semantics, and confirmed studio variants.
+//! Stream labels are ordinal references into enum classes obfuscated per-disc, so parsing
+//! matches each enum's `<clinit>` shape rather than class names.
 
 use super::class_reader::{
     AASTORE, ANEWARRAY, BIPUSH, ClassFile, CodeAttribute, ConstantPool, CpInfo, GETSTATIC,
@@ -261,21 +259,20 @@ const FINGERPRINTS: &[Fingerprint] = &[
 /// prefix, so a count mismatch within tolerance is informative-but-OK.
 const LDC_COUNT_TOLERANCE: usize = 4;
 
-// Cap on `ldc` operands retained per class by clinit_ldc_strings. The bound
-// must be on decompressed work, not disc-file size (deflate can inflate a
-// small crafted class). See docs/deluxe.md "Size caps" for headroom math.
+// Cap on `ldc` operands retained per class by clinit_ldc_strings. The bound must be on
+// decompressed work, not disc-file size (deflate can inflate a small crafted class).
 const MAX_CLINIT_LDC_STRINGS: usize = 4096;
 
-// Companion byte cap for MAX_CLINIT_LDC_STRINGS: guards against repeated ldc
-// of one huge Utf8 constant (up to 64 KiB each). See docs/deluxe.md.
+// Companion byte cap for MAX_CLINIT_LDC_STRINGS: guards against repeated ldc of one huge Utf8
+// constant (up to 64 KiB each).
 const MAX_CLINIT_LDC_BYTES: usize = 256 * 1024;
 
-// Aggregate companion to MAX_CLINIT_LDC_BYTES: bounds retention across ALL
-// classes at once, not just per class. See docs/deluxe.md "Size caps".
+// Aggregate companion to MAX_CLINIT_LDC_BYTES: bounds retention across ALL classes at once, not
+// just per class.
 const MAX_CANDIDATE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
-// Entry-count companion to MAX_CANDIDATE_TOTAL_BYTES, guarding per-entry
-// HashMap/String overhead the byte budget alone doesn't count. See docs/deluxe.md.
+// Entry-count companion to MAX_CANDIDATE_TOTAL_BYTES, guarding per-entry HashMap/String
+// overhead the byte budget alone doesn't count.
 const MAX_CANDIDATE_CLASSES: usize = 65536;
 
 /// The Phase A candidate pool: every class's retained `<clinit>` ldc strings,
@@ -397,9 +394,8 @@ fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnu
         .collect()
 }
 
-// Ordinal -> putstatic field-name mapping (mirrors clinit_ldc_strings'
-// ordinal -> value), so MasterEnumTable can resolve a binding class's
-// `getstatic E.<field>` back to an ordinal. See docs/deluxe.md.
+// Ordinal -> putstatic field-name mapping (mirrors clinit_ldc_strings' ordinal -> value), so
+// MasterEnumTable can resolve a binding class's `getstatic E.<field>` back to an ordinal.
 fn clinit_enum_field_names(class: &super::class_reader::ClassFile) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut out_bytes = 0usize;
@@ -602,7 +598,6 @@ const BD_CODING_TYPE_CLASS: &str = "org/bluray/ti/CodingType";
 
 // Cap on Constructions retained from a binding `<clinit>` walk (also bounds
 // decode_binding_class's per-class union and parse's cross-class union).
-// See docs/deluxe.md "Size caps" for the headroom math.
 const MAX_CONSTRUCTIONS: usize = 4096;
 
 /// Phase D entry point: find the binding class in `archive`, run the
@@ -688,9 +683,9 @@ impl<'a> BindingDecoder<'a> {
         }
     }
 
-    // Pushes onto the symbolic stack, honouring the declared max_stack: JVMS
-    // 4.7.3 forbids exceeding it, so a push past it means unverifiable
-    // bytecode. Bounds the decoder against a crafted class. See docs/deluxe.md.
+    // Pushes onto the symbolic stack, honouring the declared max_stack: JVMS 4.7.3 forbids
+    // exceeding it, so a push past it means unverifiable bytecode. Bounds the decoder against a
+    // crafted class.
     fn push(&mut self, val: StackVal) {
         if self.stack.len() >= self.max_stack {
             return;
@@ -973,8 +968,8 @@ impl MasterEnumTable {
 
 // ── interpret_streams: Constructions → StreamLabels ─────────────────────────
 
-// Converts Phase D's per-construction tuples into StreamLabels (args
-// identified by TYPE not position). See docs/deluxe.md.
+// Converts Phase D's per-construction tuples into StreamLabels (args identified by TYPE not
+// position).
 fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -> Vec<StreamLabel> {
     let mut audio_idx: u16 = 0;
     let mut sub_idx: u16 = 0;
@@ -1097,9 +1092,8 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
     out
 }
 
-// Which stream list each binding type enumerates, learned from the
-// constructions that DID resolve a language; a type that resolved as both
-// kinds is left out (no consistent answer). See docs/deluxe.md.
+// Which stream list each binding type enumerates, learned from the constructions that DID
+// resolve a language; a type that resolved as both kinds is left out (no consistent answer).
 fn slot_kinds(constructions: &[Construction]) -> HashMap<&str, Option<StreamLabelType>> {
     let mut kinds: HashMap<&str, Option<StreamLabelType>> = HashMap::new();
     for c in constructions {

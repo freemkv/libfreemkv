@@ -5,7 +5,6 @@
 //! logo/warning segment when the disc's own navigation does).
 //!
 //! Contents: [`vmcmd`] (VM command decoder), [`nav`] (First-Play executor).
-//! See docs/dvdnav-mod.md — byte-layout basis and module contents detail.
 
 pub(crate) mod nav;
 pub(crate) mod vmcmd;
@@ -29,9 +28,8 @@ pub fn resolve_feature_start(
     vtsn: u16,
     vts_ttn: u16,
 ) -> Option<usize> {
-    // PARKED stub (issue #40, `USE_NAV_RESOLVER=false`) — intentionally always
-    // returns `None`; do not delete. `reader`/`udf` are unused seam inputs.
-    // See docs/dvdnav-mod.md for full rationale.
+    // PARKED stub (issue #40, `USE_NAV_RESOLVER=false`) — intentionally always returns `None`;
+    // do not delete. `reader`/`udf` are unused seam inputs.
     let _ = (reader, udf);
     tracing::trace!(
         target: "freemkv::dvdnav",

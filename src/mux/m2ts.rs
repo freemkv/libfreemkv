@@ -164,9 +164,8 @@ mod tests {
         }
     }
 
-    // avcC (not hvcC) must parse via the avcC parser so SPS/PPS reach the
-    // player as Annex-B; otherwise the ES is silently undecodable.
-    // See docs/m2ts.md — h264_avcc_parameter_sets_are_emitted_as_annex_b
+    // avcC (not hvcC) must parse via the avcC parser so SPS/PPS reach the player as Annex-B;
+    // otherwise the ES is silently undecodable.
     #[test]
     fn h264_avcc_parameter_sets_are_emitted_as_annex_b() {
         let sps: &[u8] = &[0x67, 0x42, 0xC0, 0x1E, 0xAB, 0xCD];
@@ -222,9 +221,8 @@ mod tests {
         );
     }
 
-    // create() must opt VC-1 video OUT of Annex-B conversion; this pins the
-    // wiring in create() itself, not just TsMuxer's flag.
-    // See docs/m2ts.md — vc1_video_is_wired_to_the_non_nal_path
+    // create() must opt VC-1 video OUT of Annex-B conversion; this pins the wiring in create()
+    // itself, not just TsMuxer's flag.
     #[test]
     fn vc1_video_is_wired_to_the_non_nal_path() {
         let mut title = make_title();

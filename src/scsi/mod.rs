@@ -50,14 +50,12 @@ pub const AACS_KEY_CLASS: u8 = 0x02;
 pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 
 // Timeout for content READ (READ_10/12) on the ripping fast path
-// (`freemkv_engine::recovery::copy`). 10s, calibrated on an LG BU40N +
-// Initio 1618L bridge. See docs/scsi-mod.md — READ_TIMEOUT_MS calibration.
+// (`freemkv_engine::recovery::copy`). 10s, calibrated on an LG BU40N + Initio 1618L bridge.
 #[cfg(feature = "rip")]
 pub(crate) const READ_TIMEOUT_MS: u32 = 10_000;
 
-// Timeout for content READ on the recovery path (`recovery::patch`'s
-// targeted retries). Matches sg_dd's 60s ceiling; failed reads usually
-// return in 1-4s. See docs/scsi-mod.md — READ_RECOVERY_TIMEOUT_MS history.
+// Timeout for content READ on the recovery path (`recovery::patch`'s targeted retries). Matches
+// sg_dd's 60s ceiling; failed reads usually return in 1-4s.
 #[cfg(feature = "rip")]
 pub(crate) const READ_RECOVERY_TIMEOUT_MS: u32 = 60_000;
 
@@ -76,8 +74,7 @@ pub const SCSI_STATUS_TRANSPORT_FAILURE: u8 = 0xFF;
 
 // ── CDB length validation ──────────────────────────────────────────────────
 
-// Validate a CDB against a transport's field width; REJECT (never
-// truncate) an over-length CDB — see docs/scsi-mod.md — checked_cdb_len rationale.
+// Validate a CDB against a transport's field width; REJECT (never truncate) an over-length CDB.
 pub(crate) fn checked_cdb_len(cdb: &[u8], max: usize) -> Result<u8> {
     if cdb.is_empty() || cdb.len() > max {
         return Err(Error::InvalidCdbLength {
@@ -273,13 +270,11 @@ impl ScsiSense {
         ascq: 0,
     };
 
-    /// `true` when the sense key indicates a *marginal-read* failure — one
-    /// where a retry or smaller-granularity read sometimes succeeds:
-    /// MEDIUM ERROR, NOT READY (dominant on BU40N), ABORTED COMMAND,
-    /// RECOVERED ERROR, or NO SENSE. `false` for HARDWARE ERROR, DATA
-    /// PROTECT, UNIT ATTENTION, ILLEGAL REQUEST, BLANK CHECK, and unknown
-    /// keys. Used by [`Error::is_marginal_read`] / the recovery-copy
-    /// hysteresis dispatch. See docs/scsi-mod.md — is_marginal detail.
+    /// `true` when the sense key indicates a *marginal-read* failure — one where a retry or
+    /// smaller-granularity read sometimes succeeds: MEDIUM ERROR, NOT READY (dominant on
+    /// BU40N), ABORTED COMMAND, RECOVERED ERROR, or NO SENSE. `false` for HARDWARE ERROR, DATA
+    /// PROTECT, UNIT ATTENTION, ILLEGAL REQUEST, BLANK CHECK, and unknown keys. Used by
+    /// [`Error::is_marginal_read`] / the recovery-copy hysteresis dispatch.
     pub fn is_marginal(&self) -> bool {
         matches!(
             self.sense_key,
@@ -347,9 +342,9 @@ impl ScsiSense {
     }
 }
 
-// Decode an SPC-4 sense buffer into (sense_key, asc, ascq), handling both
-// descriptor (0x72/0x73) and fixed (0x70/0x71) response-code formats; pure
-// function shared by all three platform backends. See docs/scsi-mod.md — parse_sense format details.
+// Decode an SPC-4 sense buffer into (sense_key, asc, ascq), handling both descriptor
+// (0x72/0x73) and fixed (0x70/0x71) response-code formats; pure function shared by all three
+// platform backends.
 pub(crate) fn parse_sense(sense: &[u8], sb_len_wr: u8) -> ScsiSense {
     let n = (sb_len_wr as usize).min(sense.len());
     if n < 3 {
@@ -418,9 +413,8 @@ pub trait ScsiTransport: Send {
     /// into chunks by the caller ([`crate::Drive::read`]) — otherwise the
     /// transport fails the whole command.
     ///
-    /// Default is a conservative 1 MiB, safe on every platform. Windows
-    /// overrides with the adapter's real `MaximumTransferLength`; see
-    /// docs/scsi-mod.md — max_transfer_bytes Windows rationale.
+    /// Default is a conservative 1 MiB, safe on every platform. Windows overrides with the
+    /// adapter's real `MaximumTransferLength`
     fn max_transfer_bytes(&self) -> usize {
         1 << 20
     }
@@ -454,8 +448,7 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
     }
 }
 
-// scsi::reset()/usb_reset() (removed 0.13.6/0.13.4) and hardware-touching
-// API surface history: see docs/scsi-mod.md — scsi module reset history.
+// scsi::reset()/usb_reset() (removed 0.13.6/0.13.4) and hardware-touching API surface history:
 
 /// One optical drive on the system. Returned by [`list_drives`]. The
 /// fields are populated from a single INQUIRY at enumeration time —
@@ -512,9 +505,8 @@ pub fn list_drives() -> Vec<DriveInfo> {
 /// ready/not-ready response → `Ok(true)`. Suitable for poll-loop tick
 /// (~50 ms / drive on a healthy bus).
 ///
-/// **No internal recovery.** A wedged target surfaces as
-/// `Err(Error::ScsiError)` with `status == SCSI_STATUS_TRANSPORT_FAILURE`
-/// and `sense: None` — no bus/USB reset, no retry. See docs/scsi-mod.md.
+/// **No internal recovery.** A wedged target surfaces as `Err(Error::ScsiError)` with `status
+/// == SCSI_STATUS_TRANSPORT_FAILURE` and `sense: None` — no bus/USB reset, no retry.
 pub fn drive_has_disc(path: &Path) -> Result<bool> {
     #[cfg(target_os = "linux")]
     {
@@ -637,9 +629,8 @@ pub fn build_read10_fua(lba: u32, count: u16) -> [u8; 10] {
     ]
 }
 
-// Round `p` up to satisfy an SPTI AlignmentMask (`(p + mask) & !mask`);
-// mask=0 means no alignment requirement. See docs/scsi-mod.md —
-// align_up mask semantics and Windows SPTI sharing rationale.
+// Round `p` up to satisfy an SPTI AlignmentMask (`(p + mask) & !mask`); mask=0 means no
+// alignment requirement.
 #[allow(dead_code)]
 pub(crate) fn align_up(p: usize, mask: usize) -> usize {
     (p + mask) & !mask

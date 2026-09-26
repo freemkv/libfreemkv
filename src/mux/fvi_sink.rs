@@ -4,10 +4,8 @@
 //! *video-index* record per coded picture of the title's primary video
 //! track, instead of muxing frames into a container.
 //!
-//! On-disk shape: the freemkv FVI format (normative spec `docs/FVI_FORMAT.md`)
-//! — JSON Lines, a header object on line 1, then one record per picture.
-//! The sink is purely additive: it does NOT touch the MKV mux path.
-// See docs/fvi-sink.md — relationship to `VideoMap` and extensibility design.
+//! On-disk shape: the freemkv FVI format  — JSON Lines, a header object on line 1, then one
+//! record per picture. The sink is purely additive: it does NOT touch the MKV mux path.
 
 use crate::disc::{DiscTitle, Stream as DiscStream};
 use crate::mux::videomap::{
@@ -19,7 +17,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-/// Write the FVI header row (JSON Lines, `docs/FVI_FORMAT.md` §6) into `w`.
+/// Write the FVI header row  into `w`.
 fn write_fvi_header(w: &mut dyn Write, h: &MapHeader) -> io::Result<()> {
     let mut source = serde_json::json!({
         "medium": h.source.medium.as_str(),
@@ -64,9 +62,8 @@ fn write_fvi_header(w: &mut dyn Write, h: &MapHeader) -> io::Result<()> {
     w.write_all(b"\n")
 }
 
-// Write one FVI per-picture record (JSON Lines, `docs/FVI_FORMAT.md` §7).
-// `type`/`key` are always emitted; coding-derived members are emitted only
-// when the codec measured them — an honest absence, never a guessed default.
+// Write one FVI per-picture record. `type`/`key` are always emitted; coding-derived members are
+// emitted only when the codec measured them — an honest absence, never a guessed default.
 fn write_fvi_record(w: &mut dyn Write, r: &PictureRecord) -> io::Result<()> {
     // `src` is REQUIRED (Appendix A); null when provenance absent = "position
     // unknown". Per §9, `src.byte` is the offset WITHIN the sector, so reduce the
@@ -90,9 +87,8 @@ fn write_fvi_record(w: &mut dyn Write, r: &PictureRecord) -> io::Result<()> {
     if let Some(pts) = r.pts_ns {
         obj["pts"] = serde_json::json!(pts);
     }
-    // dts: MAY, always omitted. See docs/fvi-sink.md for the TODO(provenance→recovery join) note.
+    // dts: MAY, always omitted.
 
-    // See docs/fvi-sink.md — coding-derived record members (§7.1).
     if let Some(c) = r.coding {
         if let Some(fo) = field_order_label(r.coding) {
             obj["field_order"] = serde_json::json!(fo);
@@ -129,12 +125,11 @@ impl FviSink {
     /// Create the sink at `path`, assembling the header from `title`'s primary
     /// video stream.
     ///
-    /// `source` records where the index was built FROM — the input medium, URL,
-    /// title index and (when known) playlist / volume id. It is carried verbatim
-    /// into the header's `source` object (`docs/FVI_FORMAT.md` §6.2), which
-    /// describes the INPUT, never `path` (the destination this sink writes).
-    /// A caller with no provenance to declare passes `SourceInfo::default()`;
-    /// the empty members are then omitted from the header rather than guessed.
+    /// `source` records where the index was built FROM — the input medium, URL, title index and
+    /// (when known) playlist / volume id. It is carried verbatim into the header's `source`
+    /// object, which describes the INPUT, never `path` (the destination this sink writes). A
+    /// caller with no provenance to declare passes `SourceInfo::default()`; the empty members
+    /// are then omitted from the header rather than guessed.
     pub fn create(path: &Path, title: &DiscTitle, source: SourceInfo) -> io::Result<Self> {
         let file = File::create(path)?;
 

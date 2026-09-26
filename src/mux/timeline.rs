@@ -1,23 +1,20 @@
 //! Shared clip-boundary timeline corrector.
 //!
-//! A BD/UHD title's clips are read as one concatenated sector stream, so the
-//! source PES PTS does not run continuously across a clip join. [`SeamPlan`]
-//! places frames exactly from the playlist's marks when present;
-//! [`TimelineContinuity::adjust`] infers seams from PTS jumps otherwise, and
-//! [`TimelineContinuity::map`] picks between them so every muxer/sink shares
-//! one correction path. See docs/mux-timeline.md for the full rationale.
+//! A BD/UHD title's clips are read as one concatenated sector stream, so the source PES PTS
+//! does not run continuously across a clip join. [`SeamPlan`] places frames exactly from the
+//! playlist's marks when present; [`TimelineContinuity::adjust`] infers seams from PTS jumps
+//! otherwise, and [`TimelineContinuity::map`] picks between them so every muxer/sink shares one
+//! correction path.
 
-// A backward PTS step larger than this is a clip-boundary discontinuity
-// (source PES PTS reset), NOT B-frame reorder (HEVC/H.264 tops out ~16
-// frames, <1s @24fps). See docs/mux-timeline.md#discontinuity_backstep_ns.
+// A backward PTS step larger than this is a clip-boundary discontinuity (source PES PTS reset),
+// NOT B-frame reorder (HEVC/H.264 tops out ~16 frames, <1s @24fps).
 pub(crate) const DISCONTINUITY_BACKSTEP_NS: i64 = 3_000_000_000;
 /// Sub-frame gap inserted after a rebased discontinuity so the first frame of
 /// the new clip lands strictly after the previous timeline high (1 ms).
 pub(crate) const DISCONTINUITY_GAP_NS: i64 = 1_000_000;
 
-// How close a frame's PTS must be to a clip's IN mark to be recognised as
-// that clip's opening frame, vs. the previous clip's overlapping tail. See
-// docs/mux-timeline.md#clip_start_tolerance_ns.
+// How close a frame's PTS must be to a clip's IN mark to be recognised as that clip's opening
+// frame, vs. the previous clip's overlapping tail.
 pub(crate) const CLIP_START_TOLERANCE_NS: i64 = 250_000_000;
 
 /// MPLS 45 kHz tick → nanoseconds. PlayItem `in_time`/`out_time` are 45 kHz
@@ -38,28 +35,23 @@ pub(crate) struct SeamClip {
     /// Added to a raw PTS inside this clip to place it on the output timeline.
     /// Equals (sum of every earlier clip's playable duration) − `in_ns`.
     pub(crate) offset_ns: i64,
-    // Byte range this clip occupies in the title's feed, when known. A byte
-    // offset resolves an overlap that timestamps alone cannot. See
-    // docs/mux-timeline.md#seamclipfeed_span.
+    // Byte range this clip occupies in the title's feed, when known. A byte offset resolves an
+    // overlap that timestamps alone cannot.
     pub(crate) feed_span: Option<(u64, u64)>,
 }
 
-// The playlist's own answer to "where does each clip belong on the
-// timeline": a seamless-branching title's PlayItems can overlap or skip in
-// the shared clock. See docs/mux-timeline.md#seamplan-struct-doc.
+// The playlist's own answer to "where does each clip belong on the timeline": a
+// seamless-branching title's PlayItems can overlap or skip in the shared clock.
 pub(crate) struct SeamPlan {
-    // Whether the per-clip feed spans tile the feed contiguously from 0, so
-    // a byte offset can be trusted to identify a clip. If not, provenance is
-    // disabled. See docs/mux-timeline.md#seamplanspans_trusted.
+    // Whether the per-clip feed spans tile the feed contiguously from 0, so a byte offset can
+    // be trusted to identify a clip. If not, provenance is disabled.
     spans_trusted: bool,
     clips: Vec<SeamClip>,
-    // Frames dropped (per track) for falling outside every clip's marks.
-    // Counted so an unexpected volume is visible instead of silent. See
-    // docs/mux-timeline.md#seamplandropped.
+    // Frames dropped (per track) for falling outside every clip's marks. Counted so an
+    // unexpected volume is visible instead of silent.
     dropped: Vec<u64>,
-    // Per-track position: (clip index, last raw PTS seen). Each track
-    // crosses a join on its OWN frame, since overlap tails arrive after the
-    // next clip's video. See docs/mux-timeline.md#seamplancursors.
+    // Per-track position: (clip index, last raw PTS seen). Each track crosses a join on its OWN
+    // frame, since overlap tails arrive after the next clip's video.
     cursors: Vec<TrackPos>,
 }
 
@@ -79,9 +71,8 @@ struct TrackPos {
 }
 
 impl SeamPlan {
-    // Build a plan, or `None` when there's nothing to place (no clips, or
-    // unusable marks). A single clip still gets a plan, to trim to
-    // `[in, out]`. See docs/mux-timeline.md#seamplanfrom_clips.
+    // Build a plan, or `None` when there's nothing to place (no clips, or unusable marks). A
+    // single clip still gets a plan, to trim to `[in, out]`.
     pub(crate) fn from_clips(clips: &[crate::disc::Clip]) -> Option<Self> {
         if clips.is_empty() {
             return None;
@@ -198,9 +189,8 @@ impl SeamPlan {
             .fold(0i64, |a, b| a.saturating_add(b))
     }
 
-    // Which clip owns feed byte `b`, by BINARY SEARCH (spans tile the feed
-    // contiguously, so a scan would be ~900 comparisons per frame on a large
-    // disc). See docs/mux-timeline.md#seamplanclip_at_byte.
+    // Which clip owns feed byte `b`, by BINARY SEARCH (spans tile the feed contiguously, so a
+    // scan would be ~900 comparisons per frame on a large disc).
     fn clip_at_byte(&self, b: u64) -> Option<usize> {
         let i = self
             .clips
@@ -219,9 +209,8 @@ impl SeamPlan {
         Some(first)
     }
 
-    // Pick the member of a shared-span run whose marks contain `raw_ns`
-    // (several PlayItems can reference one file). Falls back to `first`.
-    // See docs/mux-timeline.md#seamplanclip_in_run_for.
+    // Pick the member of a shared-span run whose marks contain `raw_ns` (several PlayItems can
+    // reference one file). Falls back to `first`.
     fn clip_in_run_for(&self, first: usize, raw_ns: i64) -> usize {
         let span = self.clips[first].feed_span;
         let mut i = first;
@@ -406,15 +395,13 @@ impl SeamPlan {
     }
 }
 
-// Global timeline corrector: holds a SeamPlan when usable, else falls back to
-// PTS-jump inference. Only the VIDEO track drives epoch decisions. See
-// docs/mux-timeline.md#timelinecontinuity-struct-doc.
+// Global timeline corrector: holds a SeamPlan when usable, else falls back to PTS-jump
+// inference. Only the VIDEO track drives epoch decisions.
 pub(crate) struct TimelineContinuity {
     /// Offset (ns) added to raw PTS for the CURRENT epoch.
     pub(crate) offset_ns: i64,
-    // Offset (ns) of the immediately previous epoch, used to remap a
-    // non-video tail straggler at a boundary. See
-    // docs/mux-timeline.md#timelinecontinuityprev_offset_ns.
+    // Offset (ns) of the immediately previous epoch, used to remap a non-video tail straggler
+    // at a boundary.
     pub(crate) prev_offset_ns: i64,
     /// Highest adjusted VIDEO PTS (ns) accepted onto the timeline so far — the
     /// running frontier. `None` until the first video frame. Only video advances
@@ -424,18 +411,15 @@ pub(crate) struct TimelineContinuity {
     /// marks are known and are used verbatim; absent = fall back to inferring
     /// seams from PTS jumps, which is all any non-BD source has ever had.
     pub(crate) seams: Option<SeamPlan>,
-    // Every epoch already left behind, oldest first, as (offset, frontier
-    // when it closed) — a single prev_offset_ns can't name a straggler's
-    // epoch. See docs/mux-timeline.md#timelinecontinuityepoch_offsets.
+    // Every epoch already left behind, oldest first, as (offset, frontier when it closed) — a
+    // single prev_offset_ns can't name a straggler's epoch.
     epoch_offsets: Vec<(i64, i64)>,
-    // Last raw PTS seen per track, for spotting a track's own discontinuity
-    // (distinct from the shared frontier). See
-    // docs/mux-timeline.md#timelinecontinuitylast_raw_ns.
+    // Last raw PTS seen per track, for spotting a track's own discontinuity (distinct from the
+    // shared frontier).
     last_raw_ns: Vec<Option<i64>>,
-    /// Per-track provisional offset for frames arriving before the video
-    /// frame that opens their epoch, tagged with the epoch sequence it was
-    /// captured in (see `epoch_seq`). Never written to offset_ns/high_ns and
-    /// never retires an epoch. See docs/mux-timeline.md#timelinecontinuityprovisional.
+    /// Per-track provisional offset for frames arriving before the video frame that opens their
+    /// epoch, tagged with the epoch sequence it was captured in (see `epoch_seq`). Never
+    /// written to offset_ns/high_ns and never retires an epoch.
     provisional: Vec<Option<(u64, i64)>>,
     /// Monotonic epoch counter, bumped once per `open_epoch`. Used as the epoch
     /// IDENTITY a provisional is tagged with, instead of `epoch_offsets.len()`:
@@ -464,8 +448,8 @@ impl TimelineContinuity {
         }
     }
 
-    // Corrector driven by a title's PlayItem marks where they exist, else
-    // `Self::new`'s inference. See docs/mux-timeline.md#timelinecontinuitywith_clips.
+    // Corrector driven by a title's PlayItem marks where they exist, else `Self::new`'s
+    // inference.
     pub(crate) fn with_clips(
         clips: &[crate::disc::Clip],
         content_format: crate::disc::ContentFormat,
@@ -489,8 +473,8 @@ impl TimelineContinuity {
         }
     }
 
-    // Total frames dropped for falling outside the playlist's clip marks.
-    // Zero without a seam plan. See docs/mux-timeline.md#timelinecontinuitydropped_total.
+    // Total frames dropped for falling outside the playlist's clip marks. Zero without a seam
+    // plan.
     pub(crate) fn dropped_total(&self) -> u64 {
         self.seams.as_ref().map_or(0, |p| p.dropped_total())
     }
@@ -510,8 +494,8 @@ impl TimelineContinuity {
         })
     }
 
-    // Map a raw PES PTS onto the output timeline, or `None` to drop the frame
-    // (only ever happens under a SeamPlan). See docs/mux-timeline.md#timelinecontinuitymap.
+    // Map a raw PES PTS onto the output timeline, or `None` to drop the frame (only ever
+    // happens under a SeamPlan).
     pub(crate) fn map(
         &mut self,
         raw_pts_ns: i64,
@@ -542,9 +526,8 @@ impl TimelineContinuity {
         Some(self.adjust(raw_pts_ns, drives_epoch, track))
     }
 
-    // The offset a passive frame should ride: normally the current epoch's,
-    // unless the frame arrived ahead of the video that opens its epoch. See
-    // docs/mux-timeline.md#timelinecontinuitypassive_offset.
+    // The offset a passive frame should ride: normally the current epoch's, unless the frame
+    // arrived ahead of the video that opens its epoch.
     fn passive_offset(&mut self, track: usize, raw_pts_ns: i64) -> i64 {
         if self.last_raw_ns.len() <= track {
             self.last_raw_ns.resize(track + 1, None);
@@ -581,9 +564,8 @@ impl TimelineContinuity {
         effective
     }
 
-    // Retire the current epoch and open a new one continuing just after the
-    // frontier, recording where this epoch closed for straggler lookups. See
-    // docs/mux-timeline.md#timelinecontinuityopen_epoch.
+    // Retire the current epoch and open a new one continuing just after the frontier, recording
+    // where this epoch closed for straggler lookups.
     fn open_epoch(&mut self, high: i64, mapped_now: i64) {
         self.prev_offset_ns = self.offset_ns;
         if self.epoch_offsets.len() == MAX_EPOCHS {
@@ -599,9 +581,8 @@ impl TimelineContinuity {
         self.offset_ns = self.offset_ns.saturating_add(bump);
     }
 
-    // The offset of the epoch a straggler actually belongs to: the retained
-    // epoch that lands it CLOSEST BELOW its own frontier. See
-    // docs/mux-timeline.md#timelinecontinuitystraggler_offset.
+    // The offset of the epoch a straggler actually belongs to: the retained epoch that lands it
+    // CLOSEST BELOW its own frontier.
     fn straggler_offset(&self, raw_pts_ns: i64) -> Option<i64> {
         self.epoch_offsets
             .iter()
@@ -615,9 +596,8 @@ impl TimelineContinuity {
             .max()
     }
 
-    // Map a raw PES PTS (ns) onto the continuous timeline. `drives_epoch` is
-    // true only for the primary video track. See
-    // docs/mux-timeline.md#timelinecontinuityadjust.
+    // Map a raw PES PTS (ns) onto the continuous timeline. `drives_epoch` is true only for the
+    // primary video track.
     pub(crate) fn adjust(&mut self, raw_pts_ns: i64, drives_epoch: bool, track: usize) -> i64 {
         // Passive track: ride the current epoch's offset. Never advance the
         // frontier and never open an epoch — these tracks each run on their own
@@ -674,9 +654,8 @@ mod tests {
         tc.adjust(p, false, 1)
     }
 
-    // Characterization of the BUG: two clips concatenated with a PTS reset
-    // at the boundary must come out monotonic and continuous. See
-    // docs/mux-timeline.md#continuity_rebases_clip_boundary_reset.
+    // Characterization of the BUG: two clips concatenated with a PTS reset at the boundary must
+    // come out monotonic and continuous.
     #[test]
     fn continuity_rebases_clip_boundary_reset() {
         // Clip1 video rising to 10s, then clip2 RESETS near 0 — non-seamless.
@@ -729,9 +708,8 @@ mod tests {
         assert_eq!(tc.offset_ns, 0, "no rebase on forward progression");
     }
 
-    // The output timeline must never go BACKWARDS at a clip join. Audit
-    // finding, measured against the real 00801.mpls marks. See
-    // docs/mux-timeline.md#a_clip_join_never_rewinds_the_output_timeline.
+    // The output timeline must never go BACKWARDS at a clip join. Audit finding, measured
+    // against the real 00801.mpls marks.
     #[test]
     fn a_clip_join_never_rewinds_the_output_timeline() {
         let clips = seamless_branching_clips();
@@ -757,9 +735,8 @@ mod tests {
         }
     }
 
-    // A glitched PTS must not strand a track on a later clip forever. Audit
-    // finding against the large-backstep branch. See
-    // docs/mux-timeline.md#a_glitched_pts_does_not_strand_a_track_on_a_later_clip.
+    // A glitched PTS must not strand a track on a later clip forever. Audit finding against the
+    // large-backstep branch.
     #[test]
     fn a_glitched_pts_does_not_strand_a_track_on_a_later_clip() {
         let clips = seamless_branching_clips();
@@ -785,9 +762,8 @@ mod tests {
         );
     }
 
-    // The three placements audit round 7 enumerated. A track's output never
-    // runs backwards, and a bad frame never strands the cursor. See
-    // docs/mux-timeline.md#output_never_rewinds_and_a_bad_frame_never_strands.
+    // The three placements audit round 7 enumerated. A track's output never runs backwards, and
+    // a bad frame never strands the cursor.
     #[test]
     fn output_never_rewinds_and_a_bad_frame_never_strands() {
         let clips = seamless_branching_clips();
@@ -885,9 +861,8 @@ mod tests {
         );
     }
 
-    // Every track of a clip lives in the SAME stream file, so provenance
-    // makes video, audio and subtitles agree by construction. See
-    // docs/mux-timeline.md#all_tracks_of_one_clip_agree_under_provenance.
+    // Every track of a clip lives in the SAME stream file, so provenance makes video, audio and
+    // subtitles agree by construction.
     #[test]
     fn all_tracks_of_one_clip_agree_under_provenance() {
         let clips = clips_with_spans();
@@ -945,9 +920,8 @@ mod tests {
         );
     }
 
-    // A clip FILE referenced by two adjacent PlayItems shares one feed span
-    // but each carries its OWN marks; both halves must be kept. See
-    // docs/mux-timeline.md#a_clip_split_across_two_play_items_keeps_both_halves.
+    // A clip FILE referenced by two adjacent PlayItems shares one feed span but each carries
+    // its OWN marks; both halves must be kept.
     #[test]
     fn a_clip_split_across_two_play_items_keeps_both_halves() {
         // One file, one span. Two PlayItems: [0s,10s) then [10s,20s).
@@ -1000,9 +974,8 @@ mod tests {
         );
     }
 
-    // A source that stamps no provenance (a mkv:// remux) must still work by
-    // falling back to the mark heuristics. See
-    // docs/mux-timeline.md#no_provenance_still_places_by_marks.
+    // A source that stamps no provenance (a mkv:// remux) must still work by falling back to
+    // the mark heuristics.
     #[test]
     fn no_provenance_still_places_by_marks() {
         let clips = clips_with_spans();
@@ -1031,9 +1004,8 @@ mod tests {
         );
     }
 
-    // On frames that are NOT ambiguous, provenance and the mark heuristics
-    // must give the SAME answer — the strongest available cross-check. See
-    // docs/mux-timeline.md#provenance_agrees_with_marks_wherever_marks_are_unambiguous.
+    // On frames that are NOT ambiguous, provenance and the mark heuristics must give the SAME
+    // answer — the strongest available cross-check.
     #[test]
     fn provenance_agrees_with_marks_wherever_marks_are_unambiguous() {
         let clips = clips_with_spans();
@@ -1072,9 +1044,8 @@ mod tests {
         );
     }
 
-    // Walk a whole title through the plan with provenance: output never
-    // moves backwards, and the total span matches the declared duration. See
-    // docs/mux-timeline.md#a_full_pass_over_the_real_table_is_monotonic_and_totals_correctly.
+    // Walk a whole title through the plan with provenance: output never moves backwards, and
+    // the total span matches the declared duration.
     #[test]
     fn a_full_pass_over_the_real_table_is_monotonic_and_totals_correctly() {
         let clips = clips_with_spans();
@@ -1174,9 +1145,8 @@ mod tests {
         );
     }
 
-    // A title whose PlayItems all reference ONE clip file: spans are
-    // TRUSTED but carry no info on which PlayItem a byte belongs to. See
-    // docs/mux-timeline.md#one_clip_file_behind_every_play_item_is_not_distinguishable_by_byte.
+    // A title whose PlayItems all reference ONE clip file: spans are TRUSTED but carry no info
+    // on which PlayItem a byte belongs to.
     #[test]
     fn one_clip_file_behind_every_play_item_is_not_distinguishable_by_byte() {
         const N: u32 = 8;
@@ -1223,9 +1193,8 @@ mod tests {
         );
     }
 
-    // Marks that do not advance across the title are normal (each clip has
-    // its own STC) and are PLACED, since every track carries a byte offset.
-    // See docs/mux-timeline.md#marks_that_do_not_advance_are_placed_by_provenance.
+    // Marks that do not advance across the title are normal (each clip has its own STC) and are
+    // PLACED, since every track carries a byte offset.
     #[test]
     fn marks_that_do_not_advance_are_placed_by_provenance() {
         const N: u32 = 4;
@@ -1337,8 +1306,7 @@ mod tests {
             .collect()
     }
 
-    // The plan's total must equal the title's declared duration. See
-    // docs/mux-timeline.md#seam_plan_total_matches_the_declared_duration.
+    // The plan's total must equal the title's declared duration.
     #[test]
     fn seam_plan_total_matches_the_declared_duration() {
         let plan = SeamPlan::from_clips(&seamless_branching_clips()).expect("plan");
@@ -1382,8 +1350,7 @@ mod tests {
         );
     }
 
-    // The 9.174 s forward skip between clip 2 and clip 3 must vanish. See
-    // docs/mux-timeline.md#seam_plan_closes_the_forward_skip.
+    // The 9.174 s forward skip between clip 2 and clip 3 must vanish.
     #[test]
     fn seam_plan_closes_the_forward_skip() {
         let clips = seamless_branching_clips();
@@ -1402,8 +1369,7 @@ mod tests {
         );
     }
 
-    // The 1.79 s overlap at seam 1 must JOIN cleanly, not rewind the
-    // timeline. See docs/mux-timeline.md#seam_plan_joins_an_overlap_without_rewinding.
+    // The 1.79 s overlap at seam 1 must JOIN cleanly, not rewind the timeline.
     #[test]
     fn seam_plan_joins_an_overlap_without_rewinding() {
         let clips = seamless_branching_clips();
@@ -1454,8 +1420,7 @@ mod tests {
         assert_eq!(placed, expected, "straggler must ride clip 0's offset");
     }
 
-    // `map()`'s seam-plan branch (the frontier/offset bookkeeping glue) was
-    // untested. See docs/mux-timeline.md#map_under_a_seam_plan_tracks_offset_and_frontier.
+    // `map()`'s seam-plan branch (the frontier/offset bookkeeping glue) was untested.
     #[test]
     fn map_under_a_seam_plan_tracks_offset_and_frontier() {
         let clips = seamless_branching_clips();
@@ -1516,9 +1481,8 @@ mod tests {
         );
     }
 
-    // A SPARSE passive track crosses even when its first frame after the
-    // join lands well past the mark. See
-    // docs/mux-timeline.md#a_sparse_passive_track_crosses_late.
+    // A SPARSE passive track crosses even when its first frame after the join lands well past
+    // the mark.
     #[test]
     fn a_sparse_passive_track_crosses_late() {
         let clips = seamless_branching_clips();
@@ -1580,8 +1544,7 @@ mod tests {
         );
     }
 
-    // Each track crosses a join on its OWN frame (regression for a shared
-    // cursor). See docs/mux-timeline.md#each_track_crosses_a_join_on_its_own_frame.
+    // Each track crosses a join on its OWN frame (regression for a shared cursor).
     #[test]
     fn each_track_crosses_a_join_on_its_own_frame() {
         let clips = seamless_branching_clips();
@@ -1621,8 +1584,7 @@ mod tests {
         );
     }
 
-    // Only Blu-ray gets a mark-driven plan: HD-DVD/DVD marks are not PES-clock
-    // positions. See docs/mux-timeline.md#only_blu_ray_gets_a_mark_driven_plan.
+    // Only Blu-ray gets a mark-driven plan: HD-DVD/DVD marks are not PES-clock positions.
     #[test]
     fn only_blu_ray_gets_a_mark_driven_plan() {
         let clips = seamless_branching_clips();
@@ -1662,9 +1624,8 @@ mod tests {
         );
     }
 
-    // A second VIDEO track (a Dolby Vision EL) must get the reorder-safe
-    // crossing window even though it does not drive epochs. See
-    // docs/mux-timeline.md#a_second_video_track_keeps_the_reorder_safe_window.
+    // A second VIDEO track (a Dolby Vision EL) must get the reorder-safe crossing window even
+    // though it does not drive epochs.
     #[test]
     fn a_second_video_track_keeps_the_reorder_safe_window() {
         let clips = seamless_branching_clips();
@@ -1688,9 +1649,8 @@ mod tests {
         );
     }
 
-    // A clip table that is not one advancing clock must fall back to
-    // inference rather than be placed (a missed crossing strands a track).
-    // See docs/mux-timeline.md#a_restarting_clock_falls_back_to_inference.
+    // A clip table that is not one advancing clock must fall back to inference rather than be
+    // placed (a missed crossing strands a track).
     #[test]
     fn a_restarting_clock_falls_back_to_inference() {
         let mk = |marks: &[(u32, u32)]| -> Vec<crate::disc::Clip> {
@@ -1726,8 +1686,7 @@ mod tests {
         );
     }
 
-    // Clips whose marks chain contiguously must come out byte-identical to
-    // the old behaviour. See docs/mux-timeline.md#contiguous_clips_produce_a_constant_offset.
+    // Clips whose marks chain contiguously must come out byte-identical to the old behaviour.
     #[test]
     fn contiguous_clips_produce_a_constant_offset() {
         // 0..2948.6667s, 2948.6667..6410.8667s, chained exactly.
@@ -1774,8 +1733,7 @@ mod tests {
         );
     }
 
-    // A SINGLE-clip title still gets a plan: trimming to `[in, out]` matters
-    // too. See docs/mux-timeline.md#single_clip_trims_content_outside_its_marks.
+    // A SINGLE-clip title still gets a plan: trimming to `[in, out]` matters too.
     #[test]
     fn single_clip_trims_content_outside_its_marks() {
         let clips = seamless_branching_clips(); // clip 0: in 4199.0s, out 6033.04s
@@ -1824,9 +1782,8 @@ mod tests {
         assert_eq!(tc.offset_ns, 0);
     }
 
-    // PRIMARY rc3 regression: a sparse, lagging NON-VIDEO track on a
-    // SINGLE-clip title must NOT inflate `offset_ns`. See
-    // docs/mux-timeline.md#single_clip_late_subtitle_does_not_inflate_offset.
+    // PRIMARY rc3 regression: a sparse, lagging NON-VIDEO track on a SINGLE-clip title must NOT
+    // inflate `offset_ns`.
     #[test]
     fn single_clip_late_subtitle_does_not_inflate_offset() {
         let mut tc = TimelineContinuity::new();
@@ -1860,9 +1817,8 @@ mod tests {
         assert!(max_out <= 60 * S, "no timeline inflation, max={max_out}");
     }
 
-    // PRIMARY rc3 regression (Dolby Vision dual-layer): the EL must be a
-    // PASSIVE rider or every EL GOP false-triggers a clip-boundary reset. See
-    // docs/mux-timeline.md#dv_enhancement_layer_does_not_drive_epochs.
+    // PRIMARY rc3 regression (Dolby Vision dual-layer): the EL must be a PASSIVE rider or every
+    // EL GOP false-triggers a clip-boundary reset.
     #[test]
     fn dv_enhancement_layer_does_not_drive_epochs() {
         let mut tc = TimelineContinuity::new();
@@ -1886,8 +1842,7 @@ mod tests {
         assert!(max_out <= 60 * S, "no timeline inflation, max={max_out}");
     }
 
-    // Companion: a non-video frame must never ADVANCE the frontier, even one
-    // far ABOVE it. See docs/mux-timeline.md#non_video_never_advances_frontier.
+    // Companion: a non-video frame must never ADVANCE the frontier, even one far ABOVE it.
     #[test]
     fn non_video_never_advances_frontier() {
         let mut tc = TimelineContinuity::new();
@@ -1912,9 +1867,8 @@ mod tests {
         );
     }
 
-    // Regression for the originally-reported band: a LARGE, real-magnitude
-    // clip-boundary back-jump on VIDEO must still rebase to one continuous
-    // timeline. See docs/mux-timeline.md#continuity_large_clip_boundary_backjump_rebased.
+    // Regression for the originally-reported band: a LARGE, real-magnitude clip-boundary
+    // back-jump on VIDEO must still rebase to one continuous timeline.
     #[test]
     fn continuity_large_clip_boundary_backjump_rebased() {
         let mut tc = TimelineContinuity::new();
@@ -1943,9 +1897,8 @@ mod tests {
         );
     }
 
-    // At a REAL video-driven boundary, a lagging NON-VIDEO tail frame must be
-    // REMAPPED to its true seam position with the PREVIOUS offset. See
-    // docs/mux-timeline.md#non_video_straggler_remapped_to_seam_at_boundary.
+    // At a REAL video-driven boundary, a lagging NON-VIDEO tail frame must be REMAPPED to its
+    // true seam position with the PREVIOUS offset.
     #[test]
     fn non_video_straggler_remapped_to_seam_at_boundary() {
         let mut tc = TimelineContinuity::new();
@@ -1983,9 +1936,8 @@ mod tests {
         assert_eq!(normal, S + 600 * S + DISCONTINUITY_GAP_NS);
     }
 
-    // Regression for the over-eager straggler clamp: a NORMAL new-epoch
-    // non-video frame leading the frontier must ride the CURRENT offset, not
-    // be demoted. See docs/mux-timeline.md#normal_new_epoch_frame_leading_frontier_is_not_clamped.
+    // Regression for the over-eager straggler clamp: a NORMAL new-epoch non-video frame leading
+    // the frontier must ride the CURRENT offset, not be demoted.
     #[test]
     fn normal_new_epoch_frame_leading_frontier_is_not_clamped() {
         let mut tc = TimelineContinuity::new();
@@ -2016,9 +1968,8 @@ mod tests {
         );
     }
 
-    // MEASURED on a real DVD title: audio arriving before its cell's video
-    // must continue after the frontier, then rejoin the real offset. See
-    // docs/mux-timeline.md#frames_arriving_before_their_epochs_video_ride_a_provisional_offset.
+    // MEASURED on a real DVD title: audio arriving before its cell's video must continue after
+    // the frontier, then rejoin the real offset.
     #[test]
     fn frames_arriving_before_their_epochs_video_ride_a_provisional_offset() {
         let mut tc = TimelineContinuity::new();
@@ -2131,9 +2082,8 @@ mod tests {
         );
     }
 
-    // MEASURED on a real HD-DVD title: a straggler must be judged against
-    // its OWN epoch's end, not the current frontier. See
-    // docs/mux-timeline.md#a_straggler_is_judged_against_its_own_epochs_end_not_the_frontier.
+    // MEASURED on a real HD-DVD title: a straggler must be judged against its OWN epoch's end,
+    // not the current frontier.
     #[test]
     fn a_straggler_is_judged_against_its_own_epochs_end_not_the_frontier() {
         let mut tc = TimelineContinuity::new();
@@ -2186,9 +2136,8 @@ mod tests {
         );
     }
 
-    // A saturated frontier (`high_ns` at `i64::MAX`, from a hostile mkv://
-    // timestamp) must not panic the muxer. See
-    // docs/mux-timeline.md#a_saturated_frontier_does_not_overflow_on_passive_frame.
+    // A saturated frontier (`high_ns` at `i64::MAX`, from a hostile mkv:// timestamp) must not
+    // panic the muxer.
     #[test]
     fn saturated_frontier_does_not_overflow_on_passive_frame() {
         let mut tc = TimelineContinuity::new();
@@ -2203,9 +2152,8 @@ mod tests {
         assert_eq!(adj_other(&mut tc, i64::MAX), i64::MAX);
     }
 
-    // The epoch-decision side of the same arithmetic: both untrusted ends
-    // (i64::MIN/MAX) are reachable from container data. See
-    // docs/mux-timeline.md#extreme_video_pts_does_not_overflow_the_epoch_bump.
+    // The epoch-decision side of the same arithmetic: both untrusted ends (i64::MIN/MAX) are
+    // reachable from container data.
     #[test]
     fn extreme_video_pts_does_not_overflow_the_epoch_bump() {
         let mut tc = TimelineContinuity::new();

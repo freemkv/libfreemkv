@@ -1,117 +1,17 @@
-//! The fd hand-off between a Linux recovery thread and the transport that
-//! spawned it.
+//! Owned-fd handoff between Linux transport recovery and teardown.
 //!
-//! When `SgIoTransport::execute` sees a transport-level failure it abandons
-//! its fd and spawns a detached thread to open a fresh one. That thread has no
-//! reference back to the transport — the transport may have been dropped
-//! before the `open()` returns — so the two sides rendezvous through a
-//! single-slot mailbox: an `AtomicI32` holding an owned fd (`-1` = empty) and
-//! an `AtomicBool` saying whether the transport is already gone.
+//! Every fd published to the atomic slot must be claimed and closed exactly once.
+//! Teardown stores `dead = true` before its AcqRel swap; publication uses an
+//! AcqRel CAS before checking `dead`. Both halves are required for the publisher
+//! to observe teardown when it claims an empty slot after teardown has returned.
+//! All slot updates are RMWs, so intervening drains preserve the release sequence.
+//! The normal drain needs only Acquire because it cannot race its own transport's Drop.
 //!
-//! The invariant, and the only thing that matters here: **every fd that
-//! reaches the slot is closed exactly once.** Closing zero times leaks a
-//! descriptor; closing twice is worse than a leak, because a `close()` of an
-//! fd number the process has since reused closes an unrelated file.
-//!
-//! # Why this lives in `scsi/`, not in `linux.rs`
-//!
-//! `linux.rs` is compiled on exactly one host, so nothing in it can be tested
-//! on macOS or Windows CI — the same reason [`super::checked_cdb_len`] lives
-//! in the parent module. The protocol below is plain atomics with no syscalls
-//! in it, so it is compiled and tested on every platform even though Linux is
-//! its only caller.
-//!
-//! # Memory ordering
-//!
-//! The subtle case is a `Drop` that races the recovery thread. The two sides
-//! are ordered only through the slot, so the release edge has to be carried by
-//! the slot's own operations:
-//!
-//! 1. [`claim_for_teardown`] publishes `dead = true` and then claims the slot.
-//! 2. [`publish_recovered_fd`] fills the slot and then reads `dead`.
-//!
-//! Publish-first needs nothing special: teardown's swap is an RMW, so it reads
-//! the last value in the slot's modification order — the fd — and closes it by
-//! coherence alone. The dangerous order is teardown-first, where
-//! `claim_for_teardown` finds the slot empty and returns, leaving the recovery
-//! thread as the only one that can close the fd — and it will only do so if its
-//! `dead` load observes the `true`.
-//!
-//! That observation is not free. Rust's atomics follow the C++20 rules
-//! (`std::sync::atomic` module docs: "Rust atomics currently follow the same
-//! rules as C++20 atomics, specifically the rules from the `intro.races`
-//! section, without the 'consume' memory ordering"), and under those rules:
-//!
-//! - Every operation on the slot is a read-modify-write — `swap` or
-//!   `compare_exchange`, never a plain store after construction. That matters,
-//!   because "a release sequence headed by a release operation A on an atomic
-//!   object M is a maximal contiguous sub-sequence of side effects in the
-//!   modification order of M, where the first operation is A, and every
-//!   subsequent operation is an atomic read-modify-write operation"
-//!   ([intro.races], N4868). So once `claim_for_teardown`'s `swap` executes,
-//!   *every* later slot operation is in its release sequence — including one
-//!   that lands behind an intervening drain or a second recovery thread,
-//!   which is why the argument does not depend on the CAS reading the `swap`'s
-//!   value directly.
-//! - Landing in that sequence is still not enough to synchronize with its
-//!   head. That needs both halves: "an atomic operation A that performs a
-//!   release operation on an atomic object M synchronizes with an atomic
-//!   operation B that performs an acquire operation on M and takes its value
-//!   from any side effect in the release sequence headed by A"
-//!   ([atomics.order]/2, N4868).
-//!
-//! Both halves of that were missing:
-//!
-//! - `swap(-1, Acquire)` is not a release store. Per the [`Ordering::Acquire`]
-//!   docs, "using this ordering for an operation that combines loads and
-//!   stores leads to a `Relaxed` store operation" — so it heads no release
-//!   sequence, and there was nothing for the CAS to synchronize with.
-//! - `compare_exchange(.., Release, Relaxed)` is not an acquire load. Per the
-//!   [`Ordering::Release`] docs, it "leads to a `Relaxed` load operation" — so
-//!   even against a proper release store it would establish no edge.
-//!
-//! Upgrading only one side therefore fixes nothing; the loom models in this
-//! file still report the leak with either half applied alone. Both are
-//! `AcqRel` below.
-//!
-//! Concretely, the CAS in [`publish_recovered_fd`] carries both roles at once:
-//! its release half publishes the `open()` to [`take_recovered_fd`], and its
-//! acquire half is what lets the `dead` load that follows observe a teardown
-//! that has already claimed the slot.
-//!
-//! [`take_recovered_fd`] is deliberately left at `Acquire`, which makes its
-//! store half relaxed. That is harmless precisely because of the release-
-//! sequence rule above: an RMW extends the sequence whatever its own ordering,
-//! so a drain landing between `claim_for_teardown` and a later CAS does not
-//! break the edge. It needs no release half of its own — it is called from
-//! `execute()`, which cannot run concurrently with `Drop` (both need the
-//! transport), so it never has anything of its own to publish to a teardown.
-//! `loom_drain_does_not_break_the_release_sequence` is the check on that.
-//!
-//! `dead`'s `Release` store is belt-and-braces: it is sequenced before the
-//! `AcqRel` swap, and the swap is what carries the edge. Downgrading it to
-//! `Relaxed` leaves all three models passing.
-//!
-//! # Building the model
-//!
+//! The protocol is platform-independent and tested with Loom's atomics:
 //! ```text
-//! RUSTFLAGS="--cfg loom" cargo test --lib --no-default-features \
-//!     --features scsi fd_handoff
+//! RUSTFLAGS="--cfg loom" cargo test --lib --no-default-features --features scsi fd_handoff
 //! ```
-//!
-//! Under those flags the protocol runs on loom's instrumented atomics, so the
-//! models check the code the transport actually calls rather than a
-//! transcription that could drift from it. The alias below is gated on `test`
-//! as well as `loom`, because `loom` is a DEV-dependency and so is not in the
-//! graph of a non-test target: `cfg(loom)` alone would break `cargo build`,
-//! `cargo check` and `cargo clippy --all-targets` under those flags with an
-//! unresolved-crate error. Non-test targets keep std's atomics.
-//!
-//! One consequence to know about: under `all(loom, test)`, `SgIoTransport`'s
-//! atomics are loom's, and those panic outside a `loom::model`. No unit test
-//! constructs a transport today — `raw_command` is a free-standing `fn` that
-//! touches none — but the first one that does must live behind
-//! `cfg(not(loom))`.
+//! Under `all(loom, test)`, callers must execute inside `loom::model`.
 
 // See "Building the model" above for why this is gated on `test` too.
 #[cfg(all(loom, test))]

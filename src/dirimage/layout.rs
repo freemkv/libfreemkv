@@ -7,19 +7,17 @@
 //!    case-collision inside one directory).
 //! 2. **Assign** blocks. Metadata first, then file data — see
 //!    [`place_video_ts`] for the DVD placement constraint.
-//!
-//! See `docs/dirimage.md` for the full rationale (Blu-ray vs. DVD placement).
 
 use super::encode::{ANCHOR_LBA, MIN_PART_START, SECTOR};
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 
-// First block any FILE DATA may occupy, absolute. Far from zero: bluray.rs
-// drops any clip extent whose LBA is 0. See docs/dirimage.md — DATA_FLOOR.
+// First block any FILE DATA may occupy, absolute. Far from zero: bluray.rs drops any clip
+// extent whose LBA is 0.
 const DATA_FLOOR: u32 = 4096;
 
-// Largest byte length a single AD may record: 30-bit length field, rounded
-// down to a whole number of blocks. See docs/dirimage.md — MAX_AD_BYTES.
+// Largest byte length a single AD may record: 30-bit length field, rounded down to a whole
+// number of blocks.
 pub(super) const MAX_AD_BYTES: u64 = 0x3FFF_F800;
 
 // Deepest directory nesting represented. Matches `udf.rs`'s `MAX_DIR_DEPTH`;
@@ -35,28 +33,27 @@ const MAX_ENTRIES: usize = 100_000;
 // byte (255 ceiling); 254 leaves no way to produce a value that wraps to 0.
 const MAX_CS0_NAME_BYTES: usize = 254;
 
-// Most subdirectories one directory may hold: link count is u16 (children +
-// self), so `u16::MAX - 1` is the last usable value. Lowered under
-// cfg(test) only so the guard is actually exercisable. See docs/dirimage.md.
+// Most subdirectories one directory may hold: link count is u16 (children + self), so `u16::MAX
+// - 1` is the last usable value. Lowered under cfg(test) only so the guard is actually
+// exercisable.
 #[cfg(not(test))]
 const MAX_SUBDIRS: usize = (u16::MAX - 1) as usize;
 #[cfg(test)]
 const MAX_SUBDIRS: usize = 4;
 
-// One entry per child plus the parent's own must fit the 16-bit field. Must
-// stay at MODULE scope: it previously lived inside `#[cfg(test)] mod tests`
-// with its own `#[cfg(not(test))]`, so it never compiled at all. See docs/dirimage.md.
+// One entry per child plus the parent's own must fit the 16-bit field. Must stay at MODULE
+// scope: it previously lived inside `#[cfg(test)] mod tests` with its own `#[cfg(not(test))]`,
+// so it never compiled at all.
 #[cfg(not(test))]
 const _: () = assert!(MAX_SUBDIRS + 1 == u16::MAX as usize);
 
 // Largest image this planner will synthesize, in sectors (128 GiB). A
-// regenerated/hand-assembled folder can name a DVD VOB offset far beyond the
-// content; without a ceiling the image grows to wherever it points. See docs/dirimage.md.
+// regenerated/hand-assembled folder can name a DVD VOB offset far beyond the content; without a
+// ceiling the image grows to wherever it points.
 const MAX_IMAGE_SECTORS: u32 = (128u64 * 1024 * 1024 * 1024 / SECTOR as u64) as u32;
 
-// Ceiling on the in-memory metadata region (64 MiB): the entry cap alone
-// permits ~205 MB, and the mux holds two of these at once while probing.
-// See docs/dirimage.md — MAX_META_BYTES.
+// Ceiling on the in-memory metadata region (64 MiB): the entry cap alone permits ~205 MB, and
+// the mux holds two of these at once while probing.
 const MAX_META_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The fan-out cap must bite before the global entry cap, or it never fires.
@@ -144,8 +141,8 @@ fn dir_bytes(dirs: &[DirNode], files: &[FileNode]) -> usize {
 
 // ── Phase 1: walk ───────────────────────────────────────────────────────────
 
-// Whether a host directory entry belongs in the synthesized image (Finder's
-// `.DS_Store`/`._*`, or freemkv's own `.partial`). See docs/dirimage.md.
+// Whether a host directory entry belongs in the synthesized image (Finder's `.DS_Store`/`._*`,
+// or freemkv's own `.partial`).
 fn is_excluded(name: &str) -> bool {
     name.starts_with('.') || name.ends_with(".partial")
 }
@@ -334,9 +331,9 @@ fn be_u32(buf: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-// Read the first `n` bytes of an IFO so its placement offsets can be
-// resolved. Errors propagate — an empty buffer would record NO placement
-// constraint and the rip would read the wrong sectors. See docs/dirimage.md.
+// Read the first `n` bytes of an IFO so its placement offsets can be resolved. Errors propagate
+// — an empty buffer would record NO placement constraint and the rip would read the wrong
+// sectors.
 fn read_head(path: &Path, n: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut buf = vec![0u8; n];
@@ -348,9 +345,9 @@ fn read_head(path: &Path, n: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-// Placement order and constraints for a `VIDEO_TS` folder. DVD-Video records
-// VOB positions INSIDE the IFOs, as offsets from the IFO's own first sector;
-// placement must reproduce them exactly or fail. See docs/dirimage.md.
+// Placement order and constraints for a `VIDEO_TS` folder. DVD-Video records VOB positions
+// INSIDE the IFOs, as offsets from the IFO's own first sector; placement must reproduce them
+// exactly or fail.
 fn place_video_ts(vts: &mut DirNode, start: u32) -> Result<u32> {
     let mut order: Vec<usize> = (0..vts.files.len()).collect();
     // Canonical on-disc order. Files the naming scheme does not cover (stray
@@ -522,9 +519,9 @@ fn metadata_blocks(dir: &DirNode) -> u64 {
     n
 }
 
-// Reject a Blu-ray 3D tree: a real 3D disc's `.ssif` ALIASES the same
-// sectors as its base/dependent `.m2ts`, which this planner cannot express
-// (it would allocate disjoint copies). See docs/dirimage.md — reject_ssif.
+// Reject a Blu-ray 3D tree: a real 3D disc's `.ssif` ALIASES the same sectors as its
+// base/dependent `.m2ts`, which this planner cannot express (it would allocate disjoint
+// copies).
 fn reject_ssif(root: &DirNode) -> Result<()> {
     let Some(bdmv) = child_dir(root, "BDMV") else {
         return Ok(());
@@ -538,9 +535,8 @@ fn reject_ssif(root: &DirNode) -> Result<()> {
     Ok(())
 }
 
-// Plan an image over `root`. `total_sectors` feeds the oversize gate that
-// decides what `-t 1` selects; it is the image's OWN size, never padded to
-// a media tier. See docs/dirimage.md — plan / Capacity, and what it changes.
+// Plan an image over `root`. `total_sectors` feeds the oversize gate that decides what `-t 1`
+// selects; it is the image's OWN size, never padded to a media tier.
 pub(super) fn plan(root: &Path) -> Result<Layout> {
     let mut entries = 0usize;
     let mut tree = walk(root, "", 0, &mut entries)?;
@@ -659,8 +655,8 @@ pub(super) fn metadata_block_count(root: &DirNode) -> u64 {
 mod tests {
     use super::*;
 
-    // A file above the 30-bit AD ceiling must split on a block boundary, or
-    // the next extent's bytes start mid-sector. See docs/dirimage.md — Tests.
+    // A file above the 30-bit AD ceiling must split on a block boundary, or the next extent's
+    // bytes start mid-sector.
     #[test]
     fn a_file_past_the_ad_ceiling_splits_on_a_block_boundary() {
         let mut f = FileNode {
@@ -692,11 +688,10 @@ mod tests {
         );
     }
 
-    /// The metadata ceiling must account for each directory's FID-list sectors,
-    /// not just one File Entry per node: a wide directory's FID list can span
-    /// many sectors that the old (dir_count + file_count) count ignored, so an
-    /// oversized folder could slip past the guard and be materialized in full.
-    /// See docs/dirimage.md — metadata_ceiling_counts_fid_lists.
+    /// The metadata ceiling must account for each directory's FID-list sectors, not just one
+    /// File Entry per node: a wide directory's FID list can span many sectors that the old
+    /// (dir_count + file_count) count ignored, so an oversized folder could slip past the guard
+    /// and be materialized in full.
     #[test]
     fn metadata_block_count_includes_the_fid_list_sectors() {
         let files: Vec<FileNode> = (0..300)
@@ -770,8 +765,8 @@ mod tests {
         assert!(!is_excluded("VTS_01_1.VOB"));
     }
 
-    // Two host names the READER collapses into one must be refused by the
-    // planner. Calls `plan` on a real folder. See docs/dirimage.md — Tests.
+    // Two host names the READER collapses into one must be refused by the planner. Calls `plan`
+    // on a real folder.
     #[test]
     fn two_names_the_reader_cannot_tell_apart_are_refused() {
         let dir = std::env::temp_dir().join(format!(
@@ -803,8 +798,8 @@ mod tests {
         );
     }
 
-    // A name too long for the FID's one-byte length field is refused by the
-    // planner, on a real folder. See docs/dirimage.md — Tests.
+    // A name too long for the FID's one-byte length field is refused by the planner, on a real
+    // folder.
     #[test]
     fn an_over_long_name_is_refused_by_the_planner() {
         let dir = std::env::temp_dir().join(format!(
@@ -859,8 +854,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // The subdirectory cap must keep the 16-bit link count representable.
-    // Pins the arithmetic; does NOT exercise `walk`. See docs/dirimage.md.
+    // The subdirectory cap must keep the 16-bit link count representable. Pins the arithmetic;
+    // does NOT exercise `walk`.
     #[test]
     fn the_subdir_cap_refuses_a_folder_with_too_many_subdirectories() {
         // Executes the guard rather than restating the constant: link count (child

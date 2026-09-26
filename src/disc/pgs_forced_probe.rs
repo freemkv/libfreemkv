@@ -1,12 +1,11 @@
 //! Content-based forced-subtitle detection for Blu-ray/UHD PGS tracks.
 //!
-//! Gives `freemkv info` the muxer's own verdict up front, by reading the
-//! title's PGS streams through the shared [`crate::mux::codec::pgs::ForcedTracker`]
-//! classifier. A track is forced iff EVERY display set carries
-//! `forced_on_flag`; the read budget ([`PROBE_BUDGET_SECTORS`]) is SPREAD
-//! over each extent as sample windows ([`plan_windows`]), and content may
-//! CLEAR (never set) a vendor flag behind [`crate::mux::codec::pgs::demotable`].
-//! [`StopReason`] narrows what a truncated read may assert (docs/pgs-forced-probe.md).
+//! Gives `freemkv info` the muxer's own verdict up front, by reading the title's PGS streams
+//! through the shared [`crate::mux::codec::pgs::ForcedTracker`] classifier. A track is forced
+//! iff EVERY display set carries `forced_on_flag`; the read budget ([`PROBE_BUDGET_SECTORS`])
+//! is SPREAD over each extent as sample windows ([`plan_windows`]), and content may CLEAR
+//! (never set) a vendor flag behind [`crate::mux::codec::pgs::demotable`]. [`StopReason`]
+//! narrows what a truncated read may assert.
 
 use crate::disc::{Codec, DiscTitle, Stream};
 use crate::mux::codec::CodecParser;
@@ -16,9 +15,8 @@ use crate::sector::SectorSource;
 use std::collections::HashMap;
 
 const SECTOR_BYTES: usize = 2048;
-// Read the clip in ~2 MiB chunks: a whole number of AACS aligned units
-// (3 sectors / 6144 B; 1023 = 341 units). See docs/pgs-forced-probe.md
-// (`CHUNK_SECTORS`) for why 1024 silently broke AACS reads past chunk 1.
+// Read the clip in ~2 MiB chunks: a whole number of AACS aligned units (3 sectors / 6144 B;
+// 1023 = 341 units).
 const CHUNK_SECTORS: u16 = 1023;
 
 // The alignment requirement above is enforced, not just described.
@@ -27,32 +25,27 @@ const _: () = assert!(
     "probe chunks must be a whole number of AACS aligned units"
 );
 
-// Retries for a read that came back short of one AACS aligned unit before the
-// run is declared truncated (`ReadFailed`, inconclusive). See
-// docs/pgs-forced-probe.md (`STALL_RETRY_LIMIT`) for why this is small.
+// Retries for a read that came back short of one AACS aligned unit before the run is declared
+// truncated (`ReadFailed`, inconclusive).
 const STALL_RETRY_LIMIT: u32 = 2;
 
-// Hard ceiling on sectors read per probe call (256 MiB) — the same total the
-// old head-first design used, now SPREAD via `plan_windows` instead of spent
-// on the title's first 27 seconds. See docs/pgs-forced-probe.md.
+// Hard ceiling on sectors read per probe call (256 MiB) — the same total the old head-first
+// design used, now SPREAD via `plan_windows` instead of spent on the title's first 27 seconds.
 const PROBE_BUDGET_SECTORS: u32 = 131_072;
 
-// Display sets a SAMPLED run must see on a track before "all forced" may be
-// asserted: one hit alone can wrongly promote a mostly-unflagged track. See
-// docs/pgs-forced-probe.md (`PROMOTE_MIN_DISPLAY_SETS`).
+// Display sets a SAMPLED run must see on a track before "all forced" may be asserted: one hit
+// alone can wrongly promote a mostly-unflagged track.
 const PROMOTE_MIN_DISPLAY_SETS: u32 = 2;
 
-// One sample window: ~32 MiB, a whole number of AACS aligned units
-// (16_383 = 5461 units). Sized against measured subtitle density; see
-// docs/pgs-forced-probe.md (`WINDOW_SECTORS`) for why not smaller/more.
+// One sample window: ~32 MiB, a whole number of AACS aligned units (16_383 = 5461 units). Sized
+// against measured subtitle density.
 const WINDOW_SECTORS: u32 = 16_383;
 
-// Floor on a window (2 MiB): below this a window is too short to likely hit a
-// display set. See docs/pgs-forced-probe.md (`MIN_WINDOW_SECTORS`).
+// Floor on a window (2 MiB): below this a window is too short to likely hit a display set.
 const MIN_WINDOW_SECTORS: u32 = CHUNK_SECTORS as u32;
 
-// Most windows spent on a single extent: past this, extra windows cost a seek
-// each for no extra expected observations. See docs/pgs-forced-probe.md.
+// Most windows spent on a single extent: past this, extra windows cost a seek each for no extra
+// expected observations.
 const MAX_WINDOWS_PER_EXTENT: u32 = 8;
 
 // Windows must start (and, so that every chunk inside them does too, be sized)
@@ -76,9 +69,8 @@ fn align_down(sectors: u32) -> u32 {
     sectors - sectors % crate::aacs::content::ALIGNED_UNIT_SECTORS
 }
 
-// Where to read inside one extent, given the sector budget `share`: a pure
-// function of `(sector_count, share)` so the per-extent memo is reproducible.
-// See docs/pgs-forced-probe.md (`plan_windows`) for the asymmetric-predicate case.
+// Where to read inside one extent, given the sector budget `share`: a pure function of
+// `(sector_count, share)` so the per-extent memo is reproducible.
 fn plan_windows(sector_count: u32, share: u32) -> Vec<SampleWindow> {
     if sector_count == 0 {
         return Vec::new();
@@ -129,9 +121,9 @@ fn planned_coverage(sector_count: u32, share: u32) -> u32 {
         .fold(0u32, |acc, w| acc.saturating_add(w.len))
 }
 
-// What one probed extent showed about one PGS track — the monotone facts a
-// `ForcedTracker` accumulates. Keeping evidence (not a composed verdict) is
-// what makes per-extent memoisation sound; see docs/pgs-forced-probe.md.
+// What one probed extent showed about one PGS track — the monotone facts a `ForcedTracker`
+// accumulates. Keeping evidence (not a composed verdict) is what makes per-extent memoisation
+// sound.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) struct TrackEvidence {
     /// A PGS display set was actually seen for this track in this extent.
@@ -171,9 +163,8 @@ impl TrackEvidence {
     }
 }
 
-// One extent's memoised evidence for one track, WITH the coverage it rests
-// on — so a sampled read is never replayed as if the whole extent was read.
-// See docs/pgs-forced-probe.md (`CachedEvidence`).
+// One extent's memoised evidence for one track, WITH the coverage it rests on — so a sampled
+// read is never replayed as if the whole extent was read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct CachedEvidence {
     evidence: TrackEvidence,
@@ -190,25 +181,24 @@ impl CachedEvidence {
     }
 }
 
-// Memoises probe results across titles, keyed PER PHYSICAL EXTENT and per PGS
-// track — `(start_lba, sector_count, pid)`, so playlists sharing clips without
-// sharing extent LISTS still de-dupe. See docs/pgs-forced-probe.md.
+// Memoises probe results across titles, keyed PER PHYSICAL EXTENT and per PGS track —
+// `(start_lba, sector_count, pid)`, so playlists sharing clips without sharing extent LISTS
+// still de-dupe.
 pub(crate) type ForcedProbeCache = HashMap<(u32, u32, u16), CachedEvidence>;
 
-// Why the read loop stopped — decides whether observations may be applied as
-// an authoritative verdict: "not forced" is positive evidence (sound however
-// the loop stopped); "forced" is an absence claim (see docs/pgs-forced-probe.md).
+// Why the read loop stopped — decides whether observations may be applied as an authoritative
+// verdict: "not forced" is positive evidence (sound however the loop stopped); "forced" is an
+// absence claim.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StopReason {
     /// Every extent was read to its end, or every track had already settled as
     /// not-forced. The observation is as complete as it will ever get.
     Exhausted,
-    // `PROBE_BUDGET_SECTORS` was reached: a DESIGNED stop, not a failure — a
-    // forced track's display sets appear throughout the title, so a bounded
-    // prefix is representative. See docs/pgs-forced-probe.md.
+    // `PROBE_BUDGET_SECTORS` was reached: a DESIGNED stop, not a failure — a forced track's
+    // display sets appear throughout the title, so a bounded prefix is representative.
     Budget,
-    // Operator cancellation: bytes read were read correctly, but the cut-off
-    // is arbitrary, same as a read fault — see docs/pgs-forced-probe.md.
+    // Operator cancellation: bytes read were read correctly, but the cut-off is arbitrary, same
+    // as a read fault.
     Halted,
     /// A read error, or a short/zero-length read. The rest of the data was never
     /// seen; what was accumulated is an arbitrary prefix. Genuinely inconclusive.
@@ -590,9 +580,8 @@ fn tracker_evidence(t: &ForcedTracker, sampled: bool) -> TrackEvidence {
     }
 }
 
-// Compose the per-track verdicts a run is ENTITLED to assert from the
-// evidence it gathered (four gates: observed, non_forced-on-truncation,
-// demotable, PROMOTE_MIN_DISPLAY_SETS). See docs/pgs-forced-probe.md (`verdicts`).
+// Compose the per-track verdicts a run is ENTITLED to assert from the evidence it gathered
+// (four gates: observed, non_forced-on-truncation, demotable, PROMOTE_MIN_DISPLAY_SETS).
 fn verdicts(evidence: &HashMap<u16, TrackEvidence>, conclusive: bool) -> HashMap<u16, bool> {
     // Disc-level facts the demotion gate rests on, over the tracks judged
     // together: does the authoring house set the flag at all, and how busy is the
@@ -824,9 +813,9 @@ mod tests {
         assert!(s.forced, "no content observed → vendor forced preserved");
     }
 
-    // A reader that serves a fixed BD-TS byte stream once, then EOF, so the
-    // probe's demux→parse→observe→apply path runs on real synthetic PGS
-    // content. Sector-granular like every real `SectorSource`; see docs/pgs-forced-probe.md.
+    // A reader that serves a fixed BD-TS byte stream once, then EOF, so the probe's
+    // demux→parse→observe→apply path runs on real synthetic PGS content. Sector-granular like
+    // every real `SectorSource`
     struct TsReader {
         data: Vec<u8>,
         pos: usize,
@@ -905,9 +894,8 @@ mod tests {
         pkt
     }
 
-    // Two BD-TS PES on `pid`, both carrying `es`: an open PES only completes
-    // when the next PES start arrives. The follower deliberately repeats `es`
-    // rather than a fixed filler — see docs/pgs-forced-probe.md (`ts_stream`).
+    // Two BD-TS PES on `pid`, both carrying `es`: an open PES only completes when the next PES
+    // start arrives. The follower deliberately repeats `es` rather than a fixed filler.
     fn ts_stream(pid: u16, es: &[u8]) -> Vec<u8> {
         let mut s = bd_pes_packet(pid, 0, es);
         s.extend_from_slice(&bd_pes_packet(pid, 1, es));
@@ -1146,9 +1134,8 @@ mod tests {
         assert_eq!(reader.served, 0, "no PGS PIDs → no reads");
     }
 
-    // ── per-extent, per-track memoisation ───────────────────────────────────
-    // MEASURED: overlapping-but-not-identical extent lists must not re-read
-    // shared clips. See docs/pgs-forced-probe.md (`overlapping_extent_lists_read_each_clip_once`).
+    // ── per-extent, per-track memoisation ─────────────────────────────────── MEASURED:
+    // overlapping-but-not-identical extent lists must not re-read shared clips.
     #[test]
     fn overlapping_extent_lists_read_each_clip_once() {
         let pid = 0x1200u16;
@@ -1202,9 +1189,8 @@ mod tests {
         );
     }
 
-    // A later playlist declaring MORE PGS tracks over the SAME extents must
-    // still probe the extra track, not silently keep its vendor flag. See
-    // docs/pgs-forced-probe.md (`extra_pgs_track_over_known_extents_is_still_probed`).
+    // A later playlist declaring MORE PGS tracks over the SAME extents must still probe the
+    // extra track, not silently keep its vendor flag.
     #[test]
     fn extra_pgs_track_over_known_extents_is_still_probed() {
         let ext = Extent {
@@ -1269,9 +1255,8 @@ mod tests {
         }
     }
 
-    // Every probe read must begin on an AACS aligned-unit boundary measured
-    // from the extent's own base, or a decrypting source rejects it. See
-    // docs/pgs-forced-probe.md (`probe_reads_stay_on_aacs_unit_boundaries`).
+    // Every probe read must begin on an AACS aligned-unit boundary measured from the extent's
+    // own base, or a decrypting source rejects it.
     #[test]
     fn probe_reads_stay_on_aacs_unit_boundaries() {
         let pid = 0x1200u16;
@@ -1329,9 +1314,8 @@ mod tests {
         }
     }
 
-    // A short-but-nonzero read must advance by what was READ, not requested,
-    // or a forced verdict gets asserted over sectors nobody read. See
-    // docs/pgs-forced-probe.md (`short_reads_do_not_skip_sectors`).
+    // A short-but-nonzero read must advance by what was READ, not requested, or a forced
+    // verdict gets asserted over sectors nobody read.
     #[test]
     fn short_reads_do_not_skip_sectors() {
         let pid = 0x1200u16;
@@ -1364,9 +1348,8 @@ mod tests {
         );
     }
 
-    // A short read must not break the aligned-unit invariant `CHUNK_SECTORS`
-    // exists to hold: `lba` must advance only by whole units. See
-    // docs/pgs-forced-probe.md (`short_reads_stay_on_aacs_unit_boundaries`).
+    // A short read must not break the aligned-unit invariant `CHUNK_SECTORS` exists to hold:
+    // `lba` must advance only by whole units.
     #[test]
     fn short_reads_stay_on_aacs_unit_boundaries() {
         let pid = 0x1200u16;
@@ -1407,9 +1390,8 @@ mod tests {
         );
     }
 
-    // A source that can never yield a whole aligned unit must not spin: the
-    // loop retries a bounded number of times, then stops inconclusively. See
-    // docs/pgs-forced-probe.md (`a_source_below_one_aligned_unit_stops_instead_of_spinning`).
+    // A source that can never yield a whole aligned unit must not spin: the loop retries a
+    // bounded number of times, then stops inconclusively.
     #[test]
     fn a_source_below_one_aligned_unit_stops_instead_of_spinning() {
         let pid = 0x1200u16;
@@ -1440,9 +1422,8 @@ mod tests {
         assert!(cache.is_empty(), "inconclusive run is not memoised");
     }
 
-    // ── mutation-triage additions ───────────────────────────────────────────
-    // Mutation guard for `sub.codec == Codec::Pgs`: only PGS subtitle tracks
-    // are ever probed by content. See docs/pgs-forced-probe.md (`non_pgs_subtitle_codec_is_excluded_from_the_probe`).
+    // ── mutation-triage additions ─────────────────────────────────────────── Mutation guard
+    // for `sub.codec == Codec::Pgs`: only PGS subtitle tracks are ever probed by content.
     #[test]
     fn non_pgs_subtitle_codec_is_excluded_from_the_probe() {
         let mut reader = EndlessReader { served: 0 };
@@ -1466,9 +1447,8 @@ mod tests {
         );
     }
 
-    // Mutation guard for `stalled > STALL_RETRY_LIMIT`: exactly the limit's
-    // worth of retries are allowed before giving up. See
-    // docs/pgs-forced-probe.md (`stalled_retries_stop_at_exactly_the_limit`).
+    // Mutation guard for `stalled > STALL_RETRY_LIMIT`: exactly the limit's worth of retries
+    // are allowed before giving up.
     #[test]
     fn stalled_retries_stop_at_exactly_the_limit() {
         let pid = 0x1200u16;
@@ -1492,9 +1472,8 @@ mod tests {
         );
     }
 
-    // Padding TS packets (sync byte only, PID 0, discarded by the demuxer) to
-    // push the real display set past a mutated `got + SECTOR_BYTES` offset.
-    // See docs/pgs-forced-probe.md (`filler_packets`).
+    // Padding TS packets (sync byte only, PID 0, discarded by the demuxer) to push the real
+    // display set past a mutated `got + SECTOR_BYTES` offset.
     fn filler_packets(count: usize) -> Vec<u8> {
         let mut v = vec![0u8; count * 192];
         for i in 0..count {
@@ -1503,9 +1482,8 @@ mod tests {
         v
     }
 
-    // Mutation guard for `got as usize * SECTOR_BYTES` (feed-length on a
-    // fully-served chunk): must hand the WHOLE chunk to the demuxer. See
-    // docs/pgs-forced-probe.md (`feed_uses_the_full_read_length_not_a_truncated_one`).
+    // Mutation guard for `got as usize * SECTOR_BYTES` (feed-length on a fully-served chunk):
+    // must hand the WHOLE chunk to the demuxer.
     #[test]
     fn feed_uses_the_full_read_length_not_a_truncated_one() {
         let pid = 0x1200u16;
@@ -1558,9 +1536,8 @@ mod tests {
         }
     }
 
-    // Mutation guard for the `||` in the early-exit check: non-forced
-    // evidence CARRIED IN from a prior extent must stop reading a later one
-    // immediately. See docs/pgs-forced-probe.md (`carried_non_forced_evidence_stops_reading_a_content_free_extent`).
+    // Mutation guard for the `||` in the early-exit check: non-forced evidence CARRIED IN from
+    // a prior extent must stop reading a later one immediately.
     #[test]
     fn carried_non_forced_evidence_stops_reading_a_content_free_extent() {
         let pid = 0x1200u16;
@@ -1618,9 +1595,8 @@ mod tests {
         );
     }
 
-    // Synthetic fixtures reproduce the measured shape of real discs to test
-    // the probe's logic, not the shape itself. See docs/pgs-forced-probe.md
-    // for TrackShape's field semantics (alignment, period, count).
+    // Synthetic fixtures reproduce the measured shape of real discs to test the probe's logic,
+    // not the shape itself.
     #[derive(Clone, Copy)]
     struct TrackShape {
         pid: u16,
@@ -1726,9 +1702,8 @@ mod tests {
         })
     }
 
-    // Spec: a verdict that DEMOTES a track clears a `Forced` qualifier too —
-    // `forced` and `qualifier` are one fact for two consumers. See
-    // docs/pgs-forced-probe.md (`a_demoted_track_stops_calling_itself_forced`).
+    // Spec: a verdict that DEMOTES a track clears a `Forced` qualifier too — `forced` and
+    // `qualifier` are one fact for two consumers.
     #[test]
     fn a_demoted_track_stops_calling_itself_forced() {
         let mut title = pgs_title(0x1200, true);
@@ -1747,9 +1722,7 @@ mod tests {
         );
     }
 
-    // Spec: a qualifier that is not a forced claim (e.g. `Sdh`) is not the
-    // probe's to touch. See docs/pgs-forced-probe.md
-    // (`a_demoted_track_keeps_a_qualifier_that_is_not_a_forced_claim`).
+    // Spec: a qualifier that is not a forced claim (e.g. `Sdh`) is not the probe's to touch.
     #[test]
     fn a_demoted_track_keeps_a_qualifier_that_is_not_a_forced_claim() {
         let mut title = pgs_title(0x1200, true);
@@ -1774,9 +1747,8 @@ mod tests {
             .expect("track present")
     }
 
-    // THE headline fix: a feature's subtitles begin well past the old
-    // head-first budget's reach. See docs/pgs-forced-probe.md
-    // (`subtitles_beyond_the_old_head_budget_are_observed`).
+    // THE headline fix: a feature's subtitles begin well past the old head-first budget's
+    // reach.
     #[test]
     fn subtitles_beyond_the_old_head_budget_are_observed() {
         let pid = 0x1200u16;
@@ -1803,9 +1775,8 @@ mod tests {
         );
     }
 
-    // The allocation, not just the total: the budget must be spread across
-    // the extent, not poured into its head. See docs/pgs-forced-probe.md
-    // (`the_budget_is_spread_across_the_extent`).
+    // The allocation, not just the total: the budget must be spread across the extent, not
+    // poured into its head.
     #[test]
     fn the_budget_is_spread_across_the_extent() {
         let pid = 0x1200u16;
@@ -1879,9 +1850,8 @@ mod tests {
         );
     }
 
-    // The memoisation hazard: a sampled read's evidence must not be replayed
-    // to a playlist that would have read far more of the extent. See
-    // docs/pgs-forced-probe.md (`a_thin_sample_is_not_replayed_to_a_playlist_that_would_read_more`).
+    // The memoisation hazard: a sampled read's evidence must not be replayed to a playlist that
+    // would have read far more of the extent.
     #[test]
     fn a_thin_sample_is_not_replayed_to_a_playlist_that_would_read_more() {
         let pid = 0x1200u16;
@@ -1955,9 +1925,8 @@ mod tests {
         );
     }
 
-    // Demotion — the case the guard exists for: on a disc whose authoring
-    // never sets `forced_on_flag`, its absence says nothing about any track.
-    // See docs/pgs-forced-probe.md (`a_disc_that_never_sets_the_forced_flag_cannot_demote_anything`).
+    // Demotion — the case the guard exists for: on a disc whose authoring never sets
+    // `forced_on_flag`, its absence says nothing about any track.
     #[test]
     fn a_disc_that_never_sets_the_forced_flag_cannot_demote_anything() {
         let pid = 0x1200u16;
@@ -2017,9 +1986,8 @@ mod tests {
         );
     }
 
-    // The other side of the guard: a track SHAPED like a forced track keeps
-    // its label even on a disc that uses the flag. See docs/pgs-forced-probe.md
-    // (`a_forced_shaped_track_keeps_its_label_on_a_disc_that_uses_the_flag`).
+    // The other side of the guard: a track SHAPED like a forced track keeps its label even on a
+    // disc that uses the flag.
     #[test]
     fn a_forced_shaped_track_keeps_its_label_on_a_disc_that_uses_the_flag() {
         let small = 0x1200u16;
@@ -2141,9 +2109,8 @@ mod tests {
         }
     }
 
-    // Coverage is what makes a memo replayable: an entry from a thin sample
-    // must not answer a question needing a thorough one. See
-    // docs/pgs-forced-probe.md (`cached_evidence_answers_only_what_its_coverage_supports`).
+    // Coverage is what makes a memo replayable: an entry from a thin sample must not answer a
+    // question needing a thorough one.
     #[test]
     fn cached_evidence_answers_only_what_its_coverage_supports() {
         let absence = CachedEvidence {
@@ -2189,9 +2156,8 @@ mod tests {
         );
     }
 
-    // A playlist may list the SAME clip twice; the second read must merge
-    // into the extent's memo, not double `displays`. See docs/pgs-forced-probe.md
-    // (`re_reading_one_extent_merges_its_memo_instead_of_doubling_it`).
+    // A playlist may list the SAME clip twice; the second read must merge into the extent's
+    // memo, not double `displays`.
     #[test]
     fn re_reading_one_extent_merges_its_memo_instead_of_doubling_it() {
         let pid = 0x1200u16;
@@ -2225,9 +2191,8 @@ mod tests {
         );
     }
 
-    // The tail of a sampled run must not be discarded: the demuxer holds the
-    // last PES open waiting for the next PUSI, which sampling may not supply.
-    // See docs/pgs-forced-probe.md (`the_last_display_set_of_a_run_is_not_thrown_away`).
+    // The tail of a sampled run must not be discarded: the demuxer holds the last PES open
+    // waiting for the next PUSI, which sampling may not supply.
     #[test]
     fn the_last_display_set_of_a_run_is_not_thrown_away() {
         let pid = 0x1200u16;
@@ -2250,9 +2215,8 @@ mod tests {
         );
     }
 
-    // A single-window extent's window must not sit at the extent's head — the
-    // opening of the feature reliably has no subtitles. See
-    // docs/pgs-forced-probe.md (`a_single_window_sample_is_taken_from_the_middle_of_the_extent`).
+    // A single-window extent's window must not sit at the extent's head — the opening of the
+    // feature reliably has no subtitles.
     #[test]
     fn a_single_window_sample_is_taken_from_the_middle_of_the_extent() {
         let sectors = 524_288u32;
@@ -2266,9 +2230,7 @@ mod tests {
         );
     }
 
-    // Promotion is an absence claim too, and a SAMPLE cannot support it off
-    // one display set. See docs/pgs-forced-probe.md
-    // (`one_display_set_in_a_sampled_run_does_not_prove_a_track_forced`).
+    // Promotion is an absence claim too, and a SAMPLE cannot support it off one display set.
     #[test]
     fn one_display_set_in_a_sampled_run_does_not_prove_a_track_forced() {
         let pid = 0x1200u16;
@@ -2292,9 +2254,8 @@ mod tests {
         );
     }
 
-    // ...but a COMPLETE read has no unread gap to hide a non-forced set in,
-    // so a genuine single-sign forced track is still promoted. See
-    // docs/pgs-forced-probe.md (`a_complete_read_may_still_promote_from_one_display_set`).
+    // ...but a COMPLETE read has no unread gap to hide a non-forced set in, so a genuine
+    // single-sign forced track is still promoted.
     #[test]
     fn a_complete_read_may_still_promote_from_one_display_set() {
         let pid = 0x1200u16;

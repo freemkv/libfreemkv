@@ -66,9 +66,8 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     Some(ParseResult::high(labels))
 }
 
-// Assign a 1-based stream number per StreamInfo. Map-assigned numbers win;
-// unmapped streams get the next free per-type number, skipping map claims so
-// the two domains never collide. See docs/criterion.md — assign_stream_numbers.
+// Assign a 1-based stream number per StreamInfo. Map-assigned numbers win; unmapped streams get
+// the next free per-type number, skipping map claims so the two domains never collide.
 fn assign_stream_numbers(
     infos: &[StreamInfo],
     stream_map: &HashMap<String, u16>,
@@ -251,9 +250,8 @@ mod tests {
         assert_eq!(nums, vec![1, 2, 1]);
     }
 
-    // Immunity pin: an unusable/malformed element still occupies its slot
-    // (never dropped) and a close-less element can only shorten the list,
-    // never extend it. See docs/criterion.md — immunity pin, section-boundary half.
+    // Immunity pin: an unusable/malformed element still occupies its slot (never dropped) and a
+    // close-less element can only shorten the list, never extend it.
     #[test]
     fn an_unterminated_stream_element_shortens_the_list_it_cannot_extend_it() {
         let sp = concat!(
@@ -432,9 +430,8 @@ mod tests {
         assert_eq!(nums[1], 2);
     }
 
-    // Crafted input drives the fallback counter to the top of the u16 space;
-    // must TERMINATE (not hang) and fail closed with None. Run on a worker
-    // thread with a deadline. See docs/criterion.md — exhausted_numbering_terminates_instead_of_looping.
+    // Crafted input drives the fallback counter to the top of the u16 space; must TERMINATE
+    // (not hang) and fail closed with None. Run on a worker thread with a deadline.
     #[test]
     fn exhausted_numbering_terminates_instead_of_looping() {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -465,9 +462,8 @@ mod tests {
         }
     }
 
-    /// The whole 1-based u16 space must remain usable: 65535 unmapped audio
-    /// streams get 65535 distinct numbers with no panic and no wrap. See
-    /// docs/criterion.md — full_u16_numbering_space_is_usable_and_unique.
+    /// The whole 1-based u16 space must remain usable: 65535 unmapped audio streams get 65535
+    /// distinct numbers with no panic and no wrap.
     #[test]
     fn full_u16_numbering_space_is_usable_and_unique() {
         let infos: Vec<StreamInfo> = (0..65_535u32)

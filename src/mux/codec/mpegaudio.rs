@@ -1,6 +1,4 @@
 //! MPEG audio framing and validation.
-//!
-//! See docs/mpegaudio.md for framing, timestamp and validation rules.
 
 use super::audio_frames::{AudioFrames, Header};
 #[cfg(test)]
@@ -287,9 +285,8 @@ mod tests {
         );
     }
 
-    // Complete frames have already been emitted; EOF must not turn a trailing
-    // invalid header or partial frame into another access unit.
-    // See docs/mpegaudio.md — flush-no-phantom-frame rationale.
+    // Complete frames have already been emitted; EOF must not turn a trailing invalid header or
+    // partial frame into another access unit.
     #[test]
     fn flush_adds_no_phantom_frame_after_the_last_real_packet() {
         let mut p = MpegAudioParser::new();

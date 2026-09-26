@@ -4,9 +4,6 @@
 //! handshake (device_keys + MKB → Media Key → + Volume ID → VUK, fallback).
 //! The VUK decrypts title keys from AACS/Unit_Key_RO.inf; title keys decrypt
 //! m2ts stream content (AES-128-CBC).
-//!
-//! See docs/aacs.md ("src/aacs/mod.rs module notes") for the KEYDB.cfg line
-//! format and the `[TAG] §x.y` spec-provenance citation scheme used below.
 
 pub mod content;
 pub mod crypto;
@@ -29,8 +26,6 @@ pub mod variant;
 /// Each [`AacsRole`] resolves to an ordered candidate list, walked by
 /// [`read_first`] to the first that reads, so every reader shares one source
 /// of truth for disc_hash / MKB / VID.
-///
-/// See docs/aacs.md for HD DVD directory-name/file details.
 pub const PATH_UNIT_KEY_RO: &str = "/AACS/Unit_Key_RO.inf";
 pub const PATH_UNIT_KEY_RO_DUPLICATE: &str = "/AACS/DUPLICATE/Unit_Key_RO.inf";
 pub const PATH_MKB_RO: &str = "/AACS/MKB_RO.inf";
@@ -52,9 +47,8 @@ pub enum AacsRole {
     ContentCert,
 }
 
-// The HD DVD AACS directory in a parsed UDF tree, if present. Identified
-// structurally (name ends `!`, contains MKBROM.AACS), not by a hardcoded
-// name. See docs/aacs.md for observed real directory names.
+// The HD DVD AACS directory in a parsed UDF tree, if present. Identified structurally (name
+// ends `!`, contains MKBROM.AACS), not by a hardcoded name.
 pub(crate) fn find_hddvd_aacs_dir(udf: &crate::udf::UdfFs) -> Option<&crate::udf::DirEntry> {
     udf.root.entries.iter().find(|e| {
         e.is_dir
@@ -319,9 +313,8 @@ mod tests {
         );
     }
 
-    // Both the `!`-suffix AND MKBROM.AACS presence are required (conjunction,
-    // not disjunction) — else the HD DVD path resolves key files under a dir
-    // holding none. See docs/aacs.md for the full rationale.
+    // Both the `!`-suffix AND MKBROM.AACS presence are required (conjunction, not disjunction)
+    // — else the HD DVD path resolves key files under a dir holding none.
     #[test]
     fn a_bang_suffixed_directory_without_mkbrom_is_not_the_aacs_directory() {
         use crate::udf::fixture::*;

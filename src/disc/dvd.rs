@@ -6,9 +6,8 @@ use crate::sector::SectorSource;
 use crate::udf;
 
 impl Disc {
-    // Scan DVD titles; a cancelled read is Err(Error::Halted), never an empty
-    // list. Also returns the nav-resolved main feature, or None.
-    // See docs/dvd.md — Disc::scan_dvd_titles halt handling
+    // Scan DVD titles; a cancelled read is Err(Error::Halted), never an empty list. Also
+    // returns the nav-resolved main feature, or None.
     pub(super) fn scan_dvd_titles(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
@@ -72,7 +71,7 @@ impl Disc {
                 // TODO(spec): measured colour/TFF await a CodecParser->title channel.
                 measured_cicp: None,
             });
-            // TODO(spec): DefaultDuration/cadence deferred. See docs/dvd.md — DefaultDuration / cadence TODO
+            // TODO(spec): DefaultDuration/cadence deferred.
 
             // PID derives from private_stream_1 sub-id via dvd_audio_pid;
             // MP1/MP2 (no sub-id) fall back to 0xBD00+ordinal.
@@ -388,7 +387,6 @@ mod tests {
     }
 
     // IFO builders (DVD-Video spec, offsets per ifo.rs). VIDEO_TS.IFO layout.
-    // See docs/dvd.md — Test fixture builders: build_vmg / build_vts
     fn build_vmg(
         titles: &[(
             u16, /*chapters*/
@@ -427,7 +425,6 @@ mod tests {
     }
 
     // VTS_XX_0.IFO + PGCIT + PGC layout (offsets, vtstt_vobs vs vtsm_vobs).
-    // See docs/dvd.md — Test fixture builders: build_vmg / build_vts
     #[allow(clippy::too_many_arguments)]
     fn build_vts(
         vob_start: u32,
@@ -498,9 +495,8 @@ mod tests {
         d
     }
 
-    // Tests. HaltingReader fails every read at/above halt_at with
-    // Error::Halted, mimicking a live drive after a Stop.
-    // See docs/dvd.md — HaltingReader test double
+    // Tests. HaltingReader fails every read at/above halt_at with Error::Halted, mimicking a
+    // live drive after a Stop.
     struct HaltingReader<'a> {
         inner: &'a mut MemDisc,
         halt_at: u32,
@@ -520,9 +516,9 @@ mod tests {
         }
     }
 
-    // A drive Stop must surface as Err(Error::Halted), not a truncated/empty
-    // scan. Regression: two prior swallow sites (parse_vmg placeholder entry;
-    // scan_dvd_titles's Err(_) => Vec::new()). See docs/dvd.md — Test: halted_ifo_read_is_not_reported_as_a_shorter_disc
+    // A drive Stop must surface as Err(Error::Halted), not a truncated/empty scan. Regression:
+    // two prior swallow sites (parse_vmg placeholder entry; scan_dvd_titles's Err(_) =>
+    // Vec::new()).
     #[test]
     fn halted_ifo_read_is_not_reported_as_a_shorter_disc() {
         // Two title sets; only the second title set's CONTENT read is halted.
@@ -660,9 +656,8 @@ mod tests {
         assert_eq!(t.content_format, ContentFormat::MpegPs);
     }
 
-    // Regression: vob_start must come from Title VOBS (0xC4), not menu VOBS
-    // (0xC0) -- else a per-title menu prepends and the rip opens on the wrong
-    // frame. See docs/dvd.md — Test: scan_dvd_titles_uses_title_vobs_not_menu_vobs
+    // Regression: vob_start must come from Title VOBS (0xC4), not menu VOBS (0xC0) -- else a
+    // per-title menu prepends and the rip opens on the wrong frame.
     #[test]
     fn scan_dvd_titles_uses_title_vobs_not_menu_vobs() {
         let mut disc = MemDisc::new();
@@ -711,9 +706,8 @@ mod tests {
         );
     }
 
-    // ABSOLUTE-REBASE regression: start_lba must sum THREE distinct, non-
-    // overlapping terms (ifo_lba + vtstt_vobs + cell first_sector), not just
-    // two. See docs/dvd.md — Test: scan_dvd_titles_extent_is_absolute_three_term_sum
+    // ABSOLUTE-REBASE regression: start_lba must sum THREE distinct, non- overlapping terms
+    // (ifo_lba + vtstt_vobs + cell first_sector), not just two.
     #[test]
     fn scan_dvd_titles_extent_is_absolute_three_term_sum() {
         let mut disc = MemDisc::new();
@@ -997,7 +991,6 @@ mod tests {
     }
 
     // LPCM (coding_mode 4) at audio pos 1 must route to 0xBDA1, not the AC-3 space.
-    // See docs/dvd.md — Test: scan_dvd_titles_lpcm_routes_to_a0_pid_range
     #[test]
     fn scan_dvd_titles_lpcm_routes_to_a0_pid_range() {
         let mut disc = MemDisc::new();
@@ -1057,7 +1050,6 @@ mod tests {
     }
 
     // A multi-subtitle VTS must emit one Subtitle per entry, distinct PIDs.
-    // See docs/dvd.md — Test: scan_dvd_titles_multiple_vobsub_tracks_distinct_pids
     #[test]
     fn scan_dvd_titles_multiple_vobsub_tracks_distinct_pids() {
         let mut disc = MemDisc::new();
@@ -1219,7 +1211,6 @@ mod tests {
     }
 
     // Stamps a First-Play PGC with an unconditional JumpTT ttn pre-command.
-    // See docs/dvd.md — stamp_first_play_jumptt test helper
     fn stamp_first_play_jumptt(vmg: &mut [u8], ttn: u8) {
         const FP_PGC_PTR: usize = 0x84; // u32 byte offset of the First-Play PGC
         const CMD_TBL_PTR: usize = 0xE4; // u16 cmd-table offset (rel to PGC)
@@ -1234,9 +1225,8 @@ mod tests {
         vmg[tbl + 8..tbl + 16].copy_from_slice(&[0x30, 0x02, 0, 0, 0, ttn, 0, 0]);
     }
 
-    // First-Play nav promotion (issue #40): resolve_main_title's (vtsn, vts_ttn)
-    // must join to the running title_number and surface as nav_feature.
-    // See docs/dvd.md — Test: scan_dvd_titles_nav_promotes_first_play_target
+    // First-Play nav promotion (issue #40): resolve_main_title's (vtsn, vts_ttn) must join to
+    // the running title_number and surface as nav_feature.
     #[test]
     fn scan_dvd_titles_nav_promotes_first_play_target() {
         let mut disc = MemDisc::new();
@@ -1356,9 +1346,8 @@ mod tests {
         d
     }
 
-    // A leading interleaved-angle sub-block cell (category 0x90) must be
-    // dropped from muxed extents; chapters shift earlier by its duration.
-    // See docs/dvd.md — Test: scan_dvd_titles_drops_leading_scene_index_cell
+    // A leading interleaved-angle sub-block cell (category 0x90) must be dropped from muxed
+    // extents; chapters shift earlier by its duration.
     #[test]
     fn scan_dvd_titles_drops_leading_scene_index_cell() {
         let mut disc = MemDisc::new();
@@ -1458,9 +1447,8 @@ mod tests {
         assert!((t.chapters[0].time_secs - 0.0).abs() < 0.01);
     }
 
-    // MP1/MP2 audio (no sub-stream id) falls back to PID 0xBD00 + i; two such
-    // streams must land on distinct 0xBD00/0xBD01, pinning the `+` not `-`/`*`.
-    // See docs/dvd.md — Test: scan_dvd_titles_mp2_audio_pid_fallback_is_additive
+    // MP1/MP2 audio (no sub-stream id) falls back to PID 0xBD00 + i; two such streams must land
+    // on distinct 0xBD00/0xBD01, pinning the `+` not `-`/`*`.
     #[test]
     fn scan_dvd_titles_mp2_audio_pid_fallback_is_additive() {
         let mut disc = MemDisc::new();

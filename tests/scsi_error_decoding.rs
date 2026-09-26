@@ -6,8 +6,6 @@
 //! ([`Error::is_scsi_transport_failure`] true); SCSI-level failure (CHECK
 //! CONDITION) → `Error::ScsiError` with parsed key/ASC/ASCQ, checked via
 //! [`Error::is_marginal_read`] / [`ScsiSense::is_*`].
-//!
-//! See docs/scsi-error-decoding.md for rationale and history.
 
 use libfreemkv::error::Error;
 use libfreemkv::scsi::{
@@ -17,9 +15,8 @@ use libfreemkv::scsi::{
     SENSE_KEY_RECOVERED_ERROR, SENSE_KEY_UNIT_ATTENTION, ScsiResult, ScsiSense, ScsiTransport,
 };
 
-// A scripted ScsiTransport. Each `execute()` consumes the next entry
-// from `script` and returns the corresponding outcome.
-// See docs/scsi-error-decoding.md — MockTransport outcomes.
+// A scripted ScsiTransport. Each `execute()` consumes the next entry from `script` and returns
+// the corresponding outcome.
 struct MockTransport {
     script: Vec<MockOutcome>,
     next: usize,

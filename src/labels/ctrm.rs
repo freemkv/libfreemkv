@@ -490,9 +490,6 @@ mod tests {
         assert_eq!(labels[0].qualifier, LabelQualifier::Forced);
     }
 
-    // See docs/ctrm.md — immunity pin: unlike `paramount`'s forced_sub
-    // flag, forced-ness is the row's stream-kind token, so a full
-    // dialogue track can never acquire it (Forced qualifier misuse).
     #[test]
     fn a_full_subtitle_track_kind_can_never_carry_the_forced_qualifier() {
         // Every subtitle kind in the vocabulary, one row each.
@@ -562,9 +559,6 @@ mod tests {
         assert!(labels.is_empty());
     }
 
-    // See docs/ctrm.md — immunity pin: stream number comes from field
-    // 3, so a dropped row never shifts later rows (unlike a
-    // positional counter). Mutation: number via a running counter.
     #[test]
     fn ls_stream_numbers_come_from_the_row_not_a_counter() {
         let labels = parse_language_streams_text(

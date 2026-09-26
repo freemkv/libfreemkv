@@ -18,9 +18,6 @@
 //! part_start + …          File Entries (ICBs) and directory data (FIDs)
 //! last sector             Anchor Volume Descriptor Pointer (copy)
 //! ```
-//!
-//! See `docs/encode.md` for why this is UDF 1.02 with a single Type-1
-//! partition map, and why that makes the module testable against `udf.rs`.
 
 use super::layout::{DirNode, Layout};
 use crate::error::{Error, Result};
@@ -75,9 +72,8 @@ fn crc16(data: &[u8]) -> u16 {
     crc
 }
 
-// ECMA-167 3/7.2 descriptor tag over buf[0..16]. tag_loc: ABSOLUTE for
-// volume-space descriptors, PARTITION-RELATIVE inside the partition (else
-// a driver rejects the volume, see docs/encode.md); desc_len incl. tag.
+// ECMA-167 3/7.2 descriptor tag over buf[0..16]. tag_loc: ABSOLUTE for volume-space
+// descriptors, PARTITION-RELATIVE inside the partition; desc_len incl. tag.
 fn finish_tag(buf: &mut [u8], tag_id: u16, tag_loc: u32, desc_len: usize) {
     buf[0..2].copy_from_slice(&tag_id.to_le_bytes());
     buf[2..4].copy_from_slice(&DESC_VERSION.to_le_bytes());
@@ -152,8 +148,8 @@ fn put_dstring(buf: &mut [u8], s: &str) {
     buf[buf.len() - 1] = n as u8;
 }
 
-// OSTA CS0: compression ID 8 (ASCII, one byte/char) else ID 16 (UTF-16BE).
-// ASCII not Latin-1 for the 8-bit form on purpose — see docs/encode.md.
+// OSTA CS0: compression ID 8 (ASCII, one byte/char) else ID 16 (UTF-16BE). ASCII not Latin-1
+// for the 8-bit form on purpose.
 pub(super) fn encode_cs0(s: &str) -> Vec<u8> {
     if s.is_ascii() {
         let mut v = Vec::with_capacity(1 + s.len());
@@ -391,9 +387,8 @@ fn file_set(volume_id: &str, root_icb: u32, lba: u32) -> Box<[u8; SECTOR]> {
 /// bit anywhere — the volume is read-only.
 const PERM_R_X: u32 = 0x0000_1000 | 0x0000_0400 | 0x0000_0080 | 0x0000_0020 | 0x4 | 0x1;
 
-// ECMA-167 4/14.9 File Entry (tag 261, not EFE 266 — see docs/encode.md).
-// extents are partition-relative (block, len) pairs, already split so none
-// exceeds the 30-bit AD length field.
+// ECMA-167 4/14.9 File Entry. extents are partition-relative (block, len) pairs, already split
+// so none exceeds the 30-bit AD length field.
 fn file_entry(
     is_dir: bool,
     info_len: u64,
@@ -448,9 +443,8 @@ fn file_entry(
     Ok(s)
 }
 
-// ECMA-167 4/14.4 File Identifier Descriptor, appended to buf. FIDs pack
-// with no padding beyond the mandated 4-byte alignment and may span
-// logical blocks — see docs/encode.md for why that's required.
+// ECMA-167 4/14.4 File Identifier Descriptor, appended to buf. FIDs pack with no padding beyond
+// the mandated 4-byte alignment and may span logical blocks.
 fn push_fid(buf: &mut Vec<u8>, name: &str, icb_lba: u32, is_dir: bool, is_parent: bool) {
     let start = buf.len();
     let name_field: Vec<u8> = if is_parent {

@@ -6,8 +6,6 @@
 //! (dbp, pixelogic, ctrm, criterion, ...) extract richer editorial
 //! labels when the disc matches a recognized authoring tool; this
 //! module is the fallback, always Low confidence.
-//!
-//! See docs/mpls-universal.md for the full rationale.
 
 use super::{
     LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType,
@@ -74,7 +72,6 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 }
 
 // Converts stream entries into StreamLabels; identity is (clip, PID).
-// See docs/mpls-universal.md — build_labels rationale.
 fn build_labels(playlists: &[crate::mpls::Playlist]) -> Vec<StreamLabel> {
     use std::collections::HashSet;
     let mut labels: Vec<StreamLabel> = Vec::new();
@@ -137,8 +134,8 @@ fn build_labels(playlists: &[crate::mpls::Playlist]) -> Vec<StreamLabel> {
     labels
 }
 
-// Per-type numbering list an STN entry belongs to, or None if unlabellable.
-// MUST agree with disc::bluray's stream list (see docs/mpls-universal.md).
+// Per-type numbering list an STN entry belongs to, or None if unlabellable. MUST agree with
+// disc::bluray's stream list.
 fn label_type_for(entry: &crate::mpls::StreamEntry) -> Option<StreamLabelType> {
     use crate::consts::coding_type as c;
     if entry.coding_type == 0 {
@@ -330,9 +327,8 @@ mod tests {
         }
     }
 
-    // A playlist over clip "00001" with one play item, so each label gets
-    // the `(clip, PID)` identity it is bound by.
-    // See docs/mpls-universal.md — test helpers and fixtures.
+    // A playlist over clip "00001" with one play item, so each label gets the `(clip, PID)`
+    // identity it is bound by.
     fn playlist_with(streams: Vec<StreamEntry>) -> Playlist {
         playlist_on("00001", streams)
     }
@@ -351,9 +347,8 @@ mod tests {
         }
     }
 
-    // Drives the real build_labels (what parse() calls) from parsed
-    // Playlists so mutations there are actually caught here.
-    // See docs/mpls-universal.md — test helpers and fixtures.
+    // Drives the real build_labels (what parse() calls) from parsed Playlists so mutations
+    // there are actually caught here.
     fn labels_from_playlists(playlists: &[Playlist]) -> Vec<StreamLabel> {
         build_labels(playlists)
     }
@@ -411,9 +406,8 @@ mod tests {
         assert_eq!(labels[2].language, "fra");
     }
 
-    // disc::bluray drops coding_type==0 (STN padding) from the stream
-    // list that stream_number binds against, so it must not be counted here.
-    // See docs/mpls-universal.md — padding_stn_entry_does_not_consume_a_label_slot.
+    // disc::bluray drops coding_type==0 (STN padding) from the stream list that stream_number
+    // binds against, so it must not be counted here.
     #[test]
     fn padding_stn_entry_does_not_consume_a_label_slot() {
         let pl = playlist_with(vec![
@@ -434,9 +428,8 @@ mod tests {
         );
     }
 
-    // A PG coding_type in an audio STN slot is a real, documented shape;
-    // disc::bluray classifies it Subtitle, so this module must match.
-    // See docs/mpls-universal.md — pg_coding_type_in_an_audio_slot_counts_as_a_subtitle.
+    // A PG coding_type in an audio STN slot is a real, documented shape; disc::bluray
+    // classifies it Subtitle, so this module must match.
     #[test]
     fn pg_coding_type_in_an_audio_slot_counts_as_a_subtitle() {
         let mut misplaced = audio_entry(0x1200, 0x90, 0, 0, "spa");
@@ -523,9 +516,8 @@ mod tests {
         assert_eq!(num("deu"), Some(2), "pl2's second audio slot");
     }
 
-    // Same PID in two DIFFERENT clips is two streams — a PID is only
-    // unique within one clip, not deduped across clips.
-    // See docs/mpls-universal.md — same_pid_in_two_clips_is_two_streams.
+    // Same PID in two DIFFERENT clips is two streams — a PID is only unique within one clip,
+    // not deduped across clips.
     #[test]
     fn same_pid_in_two_clips_is_two_streams() {
         let pl1 = playlist_on("00001", vec![audio_entry(0x1100, 0x83, 12, 1, "eng")]);

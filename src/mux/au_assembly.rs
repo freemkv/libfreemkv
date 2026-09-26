@@ -1,8 +1,7 @@
 //! Access-unit assembly — a codec-parser helper.
 //!
-//! Converts PES fragments to AU-complete access units for program streams,
-//! which (unlike transport streams) do not align PES to AU boundaries. See
-//! `docs/au-assembly.md` for the full rationale.
+//! Converts PES fragments to AU-complete access units for program streams, which (unlike
+//! transport streams) do not align PES to AU boundaries.
 //!
 //! [`AuAssembler`] is shared by every program-stream video parser instead of
 //! each hand-rolling the buffer: h264/hevc/vc1 ([`Mode::StartCode`] /
@@ -125,9 +124,8 @@ pub(crate) struct AuAssembler {
 }
 
 impl AuAssembler {
-    // An assembler for `codec`. H.264/HEVC/VC-1 get a reassembling `Mode`;
-    // MPEG-2 (self-reassembles) and audio/subtitle codecs (self-framing) get
-    // `Mode::Passthrough`. See docs/au-assembly.md.
+    // An assembler for `codec`. H.264/HEVC/VC-1 get a reassembling `Mode`; MPEG-2
+    // (self-reassembles) and audio/subtitle codecs (self-framing) get `Mode::Passthrough`.
     pub(crate) fn for_codec(codec: Codec) -> Self {
         let mode = match codec {
             Codec::H264 => Mode::StartCode(0x09), // access_unit_delimiter NAL (type 9)
@@ -156,8 +154,7 @@ impl AuAssembler {
         }
     }
 
-    // An assembler that reassembles MPEG-2 access units, owned directly by
-    // the MPEG-2 parser. See docs/au-assembly.md.
+    // An assembler that reassembles MPEG-2 access units, owned directly by the MPEG-2 parser.
     pub(crate) fn mpeg2() -> Self {
         Self {
             mode: Mode::Mpeg2,
@@ -174,9 +171,8 @@ impl AuAssembler {
         }
     }
 
-    // Feed one PES fragment the caller OWNS; return every AU now complete.
-    // Passthrough moves the payload in with no copy; buffering modes copy
-    // into `buf` exactly as `push`. See docs/au-assembly.md.
+    // Feed one PES fragment the caller OWNS; return every AU now complete. Passthrough moves
+    // the payload in with no copy; buffering modes copy into `buf` exactly as `push`.
     pub(crate) fn push_owned(
         &mut self,
         data: Vec<u8>,
@@ -330,9 +326,8 @@ impl AuAssembler {
         out
     }
 
-    // Detach `buf[..end]` as the AU's own `Vec`, handing over the allocation
-    // rather than copying (falls back to a copy when `buf` is far larger
-    // than the AU). See docs/au-assembly.md.
+    // Detach `buf[..end]` as the AU's own `Vec`, handing over the allocation rather than
+    // copying (falls back to a copy when `buf` is far larger than the AU).
     fn take_front(&mut self, end: usize) -> Vec<u8> {
         let cap = self.buf.capacity();
         let tail_len = self.buf.len() - end;
@@ -435,9 +430,8 @@ impl AuAssembler {
         None
     }
 
-    // Retire every mark before `off`: the STREAM-START case, where bytes ahead
-    // of the first AU boundary predate sync and have no prior AU to be
-    // discontinuous from. See docs/au-assembly.md.
+    // Retire every mark before `off`: the STREAM-START case, where bytes ahead of the first AU
+    // boundary predate sync and have no prior AU to be discontinuous from.
     fn drop_marks_before(&mut self, off: u64) {
         while self.marks.front().is_some_and(|m| m.off < off) {
             self.marks.pop_front();
@@ -447,9 +441,8 @@ impl AuAssembler {
         }
     }
 
-    // Retire stale timing marks before `off` and record a GAP: the BACKSTOP
-    // case, where accumulated bytes had no AU start code and got discarded.
-    // See docs/au-assembly.md.
+    // Retire stale timing marks before `off` and record a GAP: the BACKSTOP case, where
+    // accumulated bytes had no AU start code and got discarded.
     fn discard_gap_before(&mut self, off: u64) {
         self.drop_marks_before(off);
         self.pending_gap = true;
@@ -852,9 +845,9 @@ mod tests {
         );
     }
 
-    // The 8 MiB backstop discards a start-code-free run; the AU that
-    // eventually emits MUST be marked discontinuous, or the resync gate
-    // never arms and a broken picture goes out silently. See docs/au-assembly.md.
+    // The 8 MiB backstop discards a start-code-free run; the AU that eventually emits MUST be
+    // marked discontinuous, or the resync gate never arms and a broken picture goes out
+    // silently.
     #[test]
     fn a_backstop_discard_marks_the_next_au_discontinuous() {
         let mut a = AuAssembler::for_codec(Codec::H264);
@@ -894,9 +887,8 @@ mod tests {
         );
     }
 
-    // The opposite case: bytes ahead of the FIRST delimiter predate sync and
-    // have no prior AU to be discontinuous from, so retiring the marks there
-    // is right. See docs/au-assembly.md.
+    // The opposite case: bytes ahead of the FIRST delimiter predate sync and have no prior AU
+    // to be discontinuous from, so retiring the marks there is right.
     #[test]
     fn a_stream_start_trim_does_not_mark_the_first_au_discontinuous() {
         let mut a = AuAssembler::for_codec(Codec::H264);
@@ -916,9 +908,9 @@ mod tests {
         );
     }
 
-    // A source-signalled discontinuity reaches the AU it opens: the
-    // `disc_marks` path, distinct from the sticky `pending_gap` the backstop
-    // sets. Deliberately kept separate from that test. See docs/au-assembly.md.
+    // A source-signalled discontinuity reaches the AU it opens: the `disc_marks` path, distinct
+    // from the sticky `pending_gap` the backstop sets. Deliberately kept separate from that
+    // test.
     #[test]
     fn a_source_signalled_discontinuity_reaches_the_au_it_opens() {
         let mut a = AuAssembler::for_codec(Codec::H264);
@@ -960,9 +952,8 @@ mod tests {
         );
     }
 
-    // MEASURED: a drained AU must be HANDED the accumulation buffer's
-    // allocation, not copied. The emitted `Vec`'s data pointer must equal the
-    // buffer's own pointer. See docs/au-assembly.md.
+    // MEASURED: a drained AU must be HANDED the accumulation buffer's allocation, not copied.
+    // The emitted `Vec`'s data pointer must equal the buffer's own pointer.
     #[test]
     fn drained_au_takes_over_the_buffer_allocation_without_copying() {
         let mut a = AuAssembler::for_codec(Codec::H264);
@@ -1012,9 +1003,8 @@ mod tests {
         assert_eq!(a.buf.len(), 4, "the buffer holds only AU2's delimiter tail");
     }
 
-    // MEASURED: `take_front`'s copy fallback must not become permanent —
-    // one copy is expected right after a size step down; a per-frame copy
-    // forever is the bug. See docs/au-assembly.md.
+    // MEASURED: `take_front`'s copy fallback must not become permanent — one copy is expected
+    // right after a size step down; a per-frame copy forever is the bug.
     #[test]
     fn handover_survives_a_large_au_instead_of_copying_every_later_one() {
         let mut a = AuAssembler::for_codec(Codec::H264);
@@ -1039,9 +1029,8 @@ mod tests {
         );
     }
 
-    // AU-opener detection pinned to normative byte values (drift check). The
-    // offset must be the real start code position, never a fixed 0, which
-    // would glue pre-sync junk onto an AU. See docs/au-assembly.md.
+    // AU-opener detection pinned to normative byte values (drift check). The offset must be the
+    // real start code position, never a fixed 0, which would glue pre-sync junk onto an AU.
     #[test]
     fn au_opener_from_locates_the_real_start_code_per_codec() {
         // Junk that contains a start-code PREFIX but no opener suffix, so a
@@ -1146,9 +1135,8 @@ mod tests {
         );
     }
 
-    // After pre-sync bytes are discarded, the emitted AU must take the timing
-    // of the fragment that ACTUALLY opened it, not the discarded junk's.
-    // See docs/au-assembly.md.
+    // After pre-sync bytes are discarded, the emitted AU must take the timing of the fragment
+    // that ACTUALLY opened it, not the discarded junk's.
     #[test]
     fn discarded_pre_sync_marks_do_not_time_the_first_access_unit() {
         let src = |b: u64| SourcePos {

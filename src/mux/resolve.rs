@@ -1,7 +1,6 @@
 //! Stream URL resolver — parses URL strings into PES stream instances.
 //!
-//! Format: `scheme://path`. See docs/resolve.md for the full scheme table.
-//! Bare paths without a scheme are rejected.
+//! Format: `scheme://path`.
 //!
 //! For disc→ISO (raw sector copy), use `freemkv_engine::recovery::copy` instead.
 //!
@@ -71,9 +70,8 @@ pub enum StreamUrl {
     /// restricted to subtitle tracks (PGS `.sup`, VobSub `.idx`+`.sub`, text
     /// `.srt`). One file per subtitle track.
     Sub { dir: PathBuf },
-    /// freemkv native per-picture video index (`fvi://`). A write-only PES sink
-    /// that emits one JSON-Lines record per coded picture of the title's primary
-    /// video track to a `.fvi` file (normative spec `docs/FVI_FORMAT.md`).
+    /// freemkv native per-picture video index (`fvi://`). A write-only PES sink that emits one
+    /// JSON-Lines record per coded picture of the title's primary video track to a `.fvi` file.
     Fvi { path: PathBuf },
     /// Chapter-marker export (`chapters://`). A write-only sink that ignores the
     /// PES stream and writes the title's chapter points to a single file, format
@@ -440,7 +438,6 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
 }
 
 // Shared body of every IMAGE-level PES source (`iso://`/`dir://`).
-// See docs/resolve.md#image_input-shared-image-level-source-body.
 fn image_input<S, F>(
     mut reader: S,
     opts: &InputOptions,
@@ -602,13 +599,11 @@ where
 
 /// Open a PES output stream (consumes PES frames).
 ///
-/// `source` is the provenance of the material being written — the INPUT the
-/// caller is muxing from, not `url`. Only the `fvi://` sink consumes it (it
-/// records the input in the index header, `docs/FVI_FORMAT.md` §6.2); every
-/// other sink ignores it. `None` means "no provenance to declare": the header's
-/// `source` members then carry their neutral defaults and the optional ones are
-/// omitted, rather than being back-filled with the destination path — which is
-/// exactly the bug this parameter exists to prevent.
+/// `source` is the provenance of the material being written — the INPUT the caller is muxing
+/// from, not `url`. Only the `fvi://` sink consumes it; every other sink ignores it. `None`
+/// means "no provenance to declare": the header's `source` members then carry their neutral
+/// defaults and the optional ones are omitted, rather than being back-filled with the
+/// destination path — which is exactly the bug this parameter exists to prevent.
 pub fn output(
     url: &str,
     title: &crate::disc::DiscTitle,
@@ -702,9 +697,9 @@ pub fn output(
                 dir, title, &opts,
             )?))
         }
-        // `fvi://` writes the per-picture video index (`docs/FVI_FORMAT.md`).
-        // The header's `source` describes the INPUT, from caller-supplied
-        // `source` — never `path`, which previously broke reproducibility.
+        // `fvi://` writes the per-picture video index. The header's `source` describes the
+        // INPUT, from caller-supplied `source` — never `path`, which previously broke
+        // reproducibility.
         StreamUrl::Fvi { ref path } => {
             validate_file_path(path, "fvi")?;
             Ok(Box::new(super::fvi_sink::FviSink::create(
@@ -779,13 +774,12 @@ pub(crate) fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> Dem
     (parsers, pid_to_track, ts, ps)
 }
 
-// Tag for an FMTS forensic index key banked into the key pool (base + slot);
-// separates disc BASE CPS unit keys (< this) from forensic ones (>= this).
-// See docs/resolve.md#fmts_pool_tag_base.
+// Tag for an FMTS forensic index key banked into the key pool (base + slot); separates disc
+// BASE CPS unit keys (< this) from forensic ones (>= this).
 const FMTS_POOL_TAG_BASE: u32 = 1 << 24;
 
-// Pool slot of the disc's ONE base CPS Unit Key, or None for a genuine
-// multi-CPS disc; excludes forensic index keys. See docs/resolve.md#single_base_key_slot.
+// Pool slot of the disc's ONE base CPS Unit Key, or None for a genuine multi-CPS disc; excludes
+// forensic index keys.
 fn single_base_key_slot(unit_keys: &[(u32, [u8; 16])]) -> Option<usize> {
     match base_key_slots(unit_keys)[..] {
         [only] => Some(only),
@@ -861,9 +855,8 @@ fn pick_pool_slot(
     })
 }
 
-// Which CPS unit's BASE Unit Key opens `ext`, as a pool slot; memoised per-disc.
-// Only base keys are considered (forensic index keys are mapped by tag earlier).
-// See docs/resolve.md#base_slot_for_extent.
+// Which CPS unit's BASE Unit Key opens `ext`, as a pool slot; memoised per-disc. Only base keys
+// are considered (forensic index keys are mapped by tag earlier).
 fn base_slot_for_extent(
     reader: &mut dyn SectorSource,
     ext: &crate::disc::Extent,
@@ -911,9 +904,8 @@ fn base_slot_for_extent(
     }
 }
 
-// FMTS (AACS 2.1) branch of resolve_mux_key_map: resolves per-segment index keys
-// (from the configured source) plus base-key gap fill, memoised per disc.
-// See docs/resolve.md#resolve_fmts_key_map.
+// FMTS (AACS 2.1) branch of resolve_mux_key_map: resolves per-segment index keys (from the
+// configured source) plus base-key gap fill, memoised per disc.
 #[allow(clippy::too_many_arguments)]
 fn resolve_fmts_key_map(
     reader: &mut dyn SectorSource,
@@ -1142,9 +1134,8 @@ struct FmtsIndexKeys {
     all_phases_definite: bool,
 }
 
-// Drive/key-service-hitting half of resolve_fmts_key_map: anchor the disc's
-// forensic index-key set from one round trip, then probe each index's phase.
-// See docs/resolve.md#probe_fmts_index_keys.
+// Drive/key-service-hitting half of resolve_fmts_key_map: anchor the disc's forensic index-key
+// set from one round trip, then probe each index's phase.
 fn probe_fmts_index_keys(
     reader: &mut dyn SectorSource,
     clip_extents: &[crate::disc::Extent],
@@ -1270,9 +1261,8 @@ fn probe_fmts_index_keys(
     })
 }
 
-// FMTS forensic feature clip's own extents — the byte space every
-// `IndividualSegment.tbl` SPN is relative to — or None if not exactly one such clip.
-// See docs/resolve.md#forensic_clip_extents.
+// FMTS forensic feature clip's own extents — the byte space every `IndividualSegment.tbl` SPN
+// is relative to — or None if not exactly one such clip.
 fn forensic_clip_extents(
     udf: &crate::udf::UdfFs,
     reader: &mut dyn SectorSource,
@@ -1321,9 +1311,9 @@ fn extents_overlap(a: &[crate::disc::Extent], b: &[crate::disc::Extent]) -> bool
     })
 }
 
-// Keep only forensic segments addressable within the FORENSIC CLIP's extents;
-// stale/foreign records past the clip's end are dropped. Extracted from
-// resolve_fmts_key_map for direct testing; see docs/resolve.md#filter_addressable_segments.
+// Keep only forensic segments addressable within the FORENSIC CLIP's extents; stale/foreign
+// records past the clip's end are dropped. Extracted from resolve_fmts_key_map for direct
+// testing.
 fn filter_addressable_segments(
     segments: Vec<crate::aacs::segment::Segment>,
     extents: &[crate::disc::Extent],
@@ -1336,9 +1326,8 @@ fn filter_addressable_segments(
         .collect()
 }
 
-// Decide a forensic index's decrypt phase from clean-sample counts of its EVEN
-// vs ODD aligned units under that index's key. Extracted for unit-testing.
-// See docs/resolve.md#resolve_tie_phase.
+// Decide a forensic index's decrypt phase from clean-sample counts of its EVEN vs ODD aligned
+// units under that index's key. Extracted for unit-testing.
 fn resolve_tie_phase(even_clean: usize, odd_clean: usize) -> io::Result<crate::decrypt::Phase> {
     match even_clean.cmp(&odd_clean) {
         std::cmp::Ordering::Greater => Ok(crate::decrypt::Phase::Even),
@@ -1350,9 +1339,8 @@ fn resolve_tie_phase(even_clean: usize, odd_clean: usize) -> io::Result<crate::d
     }
 }
 
-// Outcome of probing ONE forensic index's decrypt phase; the load-bearing split
-// is WrongKey vs ReadFault — only the former is a real FmtsKeyMissing.
-// See docs/resolve.md#indexprobe.
+// Outcome of probing ONE forensic index's decrypt phase; the load-bearing split is WrongKey vs
+// ReadFault — only the former is a real FmtsKeyMissing.
 #[derive(Debug, PartialEq, Eq)]
 enum IndexProbe {
     /// A parity decrypted clean under this index's key (or a padding tie) → its phase.
@@ -1366,9 +1354,8 @@ enum IndexProbe {
     ReadFault,
 }
 
-// Probe one forensic index's decrypt phase (EVEN vs ODD aligned units) under
-// `key`, tolerating read faults without masking a genuine wrong key.
-// See docs/resolve.md#probe_index_phase.
+// Probe one forensic index's decrypt phase (EVEN vs ODD aligned units) under `key`, tolerating
+// read faults without masking a genuine wrong key.
 fn probe_index_phase(
     segments: &[crate::aacs::segment::Segment],
     tag: u16,
@@ -1418,9 +1405,8 @@ fn probe_index_phase(
     }
 }
 
-// Back-fill LBA gaps NOT covered by forensic segment ranges with the base Unit
-// Key, so the map is a COMPLETE positive list over the title's content extents.
-// See docs/resolve.md#fill_base_key_gaps.
+// Back-fill LBA gaps NOT covered by forensic segment ranges with the base Unit Key, so the map
+// is a COMPLETE positive list over the title's content extents.
 fn fill_base_key_gaps(
     extents: &[crate::disc::Extent],
     forensic_ranges: &[(u32, u32, usize, crate::decrypt::Phase)],
@@ -1467,10 +1453,9 @@ fn content_map(title: &DiscTitle, idx: usize) -> crate::decrypt::AacsKeyMap {
 /// LBA ranges and secures any key the pool is missing through the app's
 /// configured source (`fetch`) up front, never reactively per unit at mux time.
 ///
-/// Single-CPS (the overwhelming majority) keys every extent with one index;
-/// multi-CPS keys each with the key opening a real sample; FMTS layers
-/// per-segment keys on top. LBAs outside the title's content pass through.
-/// See docs/resolve.md#resolve_mux_key_map for why this ends the key-server storm.
+/// Single-CPS (the overwhelming majority) keys every extent with one index; multi-CPS keys each
+/// with the key opening a real sample; FMTS layers per-segment keys on top. LBAs outside the
+/// title's content pass through.
 pub fn resolve_mux_key_map(
     reader: &mut dyn SectorSource,
     title: &DiscTitle,
@@ -1492,19 +1477,17 @@ pub fn resolve_mux_key_map(
     )
 }
 
-// Memoises the multi-CPS "which held unit key opens this extent" decision across
-// the titles of ONE disc, for resolve_mux_key_map_cached. Keyed by content format
-// plus the extent's exact (start_lba, sector_count). See docs/resolve.md#cpsunitcache.
+// Memoises the multi-CPS "which held unit key opens this extent" decision across the titles of
+// ONE disc, for resolve_mux_key_map_cached. Keyed by content format plus the extent's exact
+// (start_lba, sector_count).
 pub(crate) type CpsUnitCache = std::collections::HashMap<(ContentFormat, u32, u32), usize>;
 
-// The disc's forensic segment table (/AACS/IndividualSegment.tbl), resolved at
-// most ONCE per disc: None = not looked for yet; Some(None) = not FMTS;
-// Some(Some(v)) = parsed segments. See docs/resolve.md#fmtstablecache.
+// The disc's forensic segment table (/AACS/IndividualSegment.tbl), resolved at most ONCE per
+// disc: None = not looked for yet; Some(None) = not FMTS; Some(Some(v)) = parsed segments.
 pub(crate) type FmtsTableCache = Option<Option<Vec<crate::aacs::segment::Segment>>>;
 
-// Memoises the FMTS forensic index-key set + per-index phase (the expensive half
-// of resolve_fmts_key_map) across the titles of ONE disc; key material, never
-// logged. See docs/resolve.md#fmtskeycache.
+// Memoises the FMTS forensic index-key set + per-index phase (the expensive half of
+// resolve_fmts_key_map) across the titles of ONE disc; key material, never logged.
 pub(crate) type FmtsKeyCache = std::collections::HashMap<
     (ContentFormat, Vec<(u32, u32)>),
     (
@@ -1513,9 +1496,8 @@ pub(crate) type FmtsKeyCache = std::collections::HashMap<
     ),
 >;
 
-// The disc's forensic feature clip extents, resolved in the SAME UDF walk as
-// FmtsTableCache, at most once per disc (None/Some(None)/Some(Some(v)) as there).
-// See docs/resolve.md#fmtsclipcache.
+// The disc's forensic feature clip extents, resolved in the SAME UDF walk as FmtsTableCache, at
+// most once per disc (None/Some(None)/Some(Some(v)) as there).
 pub(crate) type FmtsClipCache = Option<Option<Vec<crate::disc::Extent>>>;
 
 /// The three FMTS memos, bundled so [`resolve_fmts_key_map`] takes one argument for
@@ -1559,9 +1541,8 @@ fn extent_key(format: ContentFormat, title: &DiscTitle) -> (ContentFormat, Vec<(
     )
 }
 
-// resolve_mux_key_map with a caller-owned per-disc cache (DiscKeyCache) shared
-// across the titles of one disc. Safe because every memoised value is a disc
-// fact, not a title fact. See docs/resolve.md#resolve_mux_key_map_cached.
+// resolve_mux_key_map with a caller-owned per-disc cache (DiscKeyCache) shared across the
+// titles of one disc. Safe because every memoised value is a disc fact, not a title fact.
 pub(crate) fn resolve_mux_key_map_cached(
     reader: &mut dyn SectorSource,
     title: &DiscTitle,
@@ -1687,11 +1668,10 @@ pub(crate) fn resolve_mux_key_map_cached(
 /// a `FileSectorSource`-backed reader. Returns the resulting
 /// `PipelinedPesStream`.
 ///
-/// `keys` pass [`crate::decrypt::DecryptKeys::None`] for raw/unencrypted reads.
-/// `raw` skips the per-title CSS crack entirely (ciphertext passthrough).
-/// `halt` is a cooperative cancel token, not a timeout. `fetch` is used UP
-/// FRONT by [`resolve_mux_key_map`], never per-unit at mux time.
-/// See docs/resolve.md#build_iso_pipeline-parameters for the full parameter list.
+/// `keys` pass [`crate::decrypt::DecryptKeys::None`] for raw/unencrypted reads. `raw` skips the
+/// per-title CSS crack entirely (ciphertext passthrough). `halt` is a cooperative cancel token,
+/// not a timeout. `fetch` is used UP FRONT by [`resolve_mux_key_map`], never per-unit at mux
+/// time.
 #[allow(clippy::too_many_arguments)]
 pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     mut reader: S,
@@ -1885,9 +1865,8 @@ mod tests {
     use crate::sector::SectorSource;
     use std::path::PathBuf;
 
-    // parse_url must never panic on ANY input (the front door for caller URLs).
-    // Feeds adversarial strings + every byte 0x00..=0xFF; any StreamUrl is OK.
-    // See docs/resolve.md#parse_url_never_panics_on_adversarial_input.
+    // parse_url must never panic on ANY input (the front door for caller URLs). Feeds
+    // adversarial strings + every byte 0x00..=0xFF; any StreamUrl is OK.
     #[test]
     fn parse_url_never_panics_on_adversarial_input() {
         let mut cases: Vec<String> = vec![
@@ -2035,8 +2014,7 @@ mod tests {
         serde_json::from_str(text.lines().next().unwrap()).unwrap()
     }
 
-    // fvi:// must record the SOURCE, not the destination path (docs/FVI_FORMAT.md
-    // §6.2). See docs/resolve.md#fvi_output_records_the_source_not_the_destination.
+    // fvi:// must record the SOURCE, not the destination path.
     #[test]
     fn fvi_output_records_the_source_not_the_destination() {
         let dir = fvi_tempdir();
@@ -2062,8 +2040,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Two runs indexing the SAME source must be byte-identical regardless of
-    // destination. See docs/resolve.md#fvi_output_is_reproducible_across_destination_paths.
+    // Two runs indexing the SAME source must be byte-identical regardless of destination.
     #[test]
     fn fvi_output_is_reproducible_across_destination_paths() {
         let dir = fvi_tempdir();
@@ -2169,8 +2146,8 @@ mod tests {
         );
     }
 
-    // dir://PATH/ parses to StreamUrl::Dir and IS an image-level source (1.6.1),
-    // unlike demux://fvi:// sinks. See docs/resolve.md#parse_dir_url_is_an_image_source_unlike_the_directory_sinks.
+    // dir://PATH/ parses to StreamUrl::Dir and IS an image-level source (1.6.1), unlike
+    // demux://fvi:// sinks.
     #[test]
     fn parse_dir_url_is_an_image_source_unlike_the_directory_sinks() {
         match parse_url("dir://out/movie/") {
@@ -2217,8 +2194,8 @@ mod tests {
         );
     }
 
-    // dir:// is never a PES sink (writes raw files; CLI routes it to
-    // extract_tree) but IS an image source. See docs/resolve.md#dir_url_is_an_input_but_never_a_pes_sink.
+    // dir:// is never a PES sink (writes raw files; CLI routes it to extract_tree) but IS an
+    // image source.
     #[test]
     fn dir_url_is_an_input_but_never_a_pes_sink() {
         assert_eq!(
@@ -2274,7 +2251,6 @@ mod tests {
     }
 
     // BdTs must build a TsDemuxer with parsers/pid_to_track keyed by stream PID.
-    // See docs/resolve.md#build_demux_state_bdts_builds_ts_demuxer_and_pid_table.
     #[test]
     fn build_demux_state_bdts_builds_ts_demuxer_and_pid_table() {
         let t = aac_audio_title(0x1100);
@@ -2311,8 +2287,8 @@ mod tests {
 
     // ── Fix 1: halt threading into live-drive key resolution ───────────────
 
-    // A counting SectorSource over zeros; touched_extent flags a read landing
-    // in the extent region (LBA >= 1000). See docs/resolve.md#haltcountsource.
+    // A counting SectorSource over zeros; touched_extent flags a read landing in the extent
+    // region (LBA >= 1000).
     struct HaltCountSource {
         reads: u32,
         touched_extent: bool,
@@ -2338,9 +2314,8 @@ mod tests {
         }
     }
 
-    // resolve_mux_key_map (multi-CPS live path) must honor a pre-cancelled halt
-    // PROMPTLY, at the first extent boundary, before sampling any ciphertext.
-    // See docs/resolve.md#resolve_mux_key_map_honors_pre_cancelled_halt.
+    // resolve_mux_key_map (multi-CPS live path) must honor a pre-cancelled halt PROMPTLY, at
+    // the first extent boundary, before sampling any ciphertext.
     #[test]
     fn resolve_mux_key_map_honors_pre_cancelled_halt() {
         use crate::halt::Halt;
@@ -2445,8 +2420,8 @@ mod tests {
         }
     }
 
-    // Build a 192-byte BD-TS data packet on pid carrying payload as the TS
-    // payload. Mirrors ts.rs framing. See docs/resolve.md#bdts_data_packet.
+    // Build a 192-byte BD-TS data packet on pid carrying payload as the TS payload. Mirrors
+    // ts.rs framing.
     fn bdts_data_packet(pid: u16, pusi: bool, payload: &[u8]) -> [u8; 192] {
         let mut pkt = [0u8; 192];
         pkt[4] = 0x47; // sync byte
@@ -2475,7 +2450,6 @@ mod tests {
     }
 
     // Empty extents -> clean immediate EOF, no panic/hang.
-    // See docs/resolve.md#build_iso_pipeline_empty_extents_clean_eof.
     #[test]
     fn build_iso_pipeline_empty_extents_clean_eof() {
         let title = aac_audio_title(0x1100); // extents empty by default
@@ -2500,8 +2474,8 @@ mod tests {
         assert!(stream.read().unwrap().is_none());
     }
 
-    // End-to-end: one BD-TS packet flows read -> decrypt -> demux -> parse ->
-    // one PesFrame, then clean EOF. See docs/resolve.md#build_iso_pipeline_delivers_one_frame_then_eof.
+    // End-to-end: one BD-TS packet flows read -> decrypt -> demux -> parse -> one PesFrame,
+    // then clean EOF.
     #[test]
     fn build_iso_pipeline_delivers_one_frame_then_eof() {
         let es = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
@@ -2564,8 +2538,8 @@ mod tests {
         );
     }
 
-    // A title with TWO audio PIDs, pruned to one before build_iso_pipeline, must
-    // never surface a frame from the excluded PID. See docs/resolve.md#build_iso_pipeline_pruned_title_drops_unselected_pid_frames.
+    // A title with TWO audio PIDs, pruned to one before build_iso_pipeline, must never surface
+    // a frame from the excluded PID.
     #[test]
     fn build_iso_pipeline_pruned_title_drops_unselected_pid_frames() {
         use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate, Stream};
@@ -2663,9 +2637,8 @@ mod tests {
         assert!(res.is_err(), "zero batch_sectors must be rejected");
     }
 
-    // REGRESSION: build_iso_pipeline for a DVD with None keys must resolve the CSS
-    // key itself; scrambled-uncrackable must HARD-FAIL, never mux garbage.
-    // See docs/resolve.md#build_iso_pipeline_dvd_none_keys_scrambled_hard_fails.
+    // REGRESSION: build_iso_pipeline for a DVD with None keys must resolve the CSS key itself;
+    // scrambled-uncrackable must HARD-FAIL, never mux garbage.
     #[test]
     fn build_iso_pipeline_dvd_none_keys_scrambled_hard_fails() {
         // One CSS-scrambled, crib-less (uncrackable) MPEG-PS sector.
@@ -2706,8 +2679,7 @@ mod tests {
 
     // ── content_map: single-CPS positive range building ────────────────────
 
-    // content_map(title, idx): each extent -> [start, start+count) at idx, phase
-    // All. See docs/resolve.md#content_map_builds_exact_ranges_from_extents.
+    // content_map(title, idx): each extent -> [start, start+count) at idx, phase All.
     #[test]
     fn content_map_builds_exact_ranges_from_extents() {
         use crate::decrypt::Phase;
@@ -2762,8 +2734,8 @@ mod tests {
 
     // ── resolve_fmts_key_map decision helpers (behaviors flagged by audit) ──
 
-    // BEHAVIOR 1 — segment filter: a segment mapping inside the title's extents is
-    // kept, past-clip dropped, all-outside -> empty. See docs/resolve.md#filter_addressable_segments_keeps_only_in_title_segments.
+    // BEHAVIOR 1 — segment filter: a segment mapping inside the title's extents is kept,
+    // past-clip dropped, all-outside -> empty.
     #[test]
     fn filter_addressable_segments_keeps_only_in_title_segments() {
         use crate::aacs::segment::Segment;
@@ -2810,8 +2782,7 @@ mod tests {
         );
     }
 
-    // BEHAVIOR 2 — phase-tie default: all four arms of the even/odd clean-count
-    // decision. See docs/resolve.md#resolve_tie_phase_covers_all_arms.
+    // BEHAVIOR 2 — phase-tie default: all four arms of the even/odd clean-count decision.
     #[test]
     fn resolve_tie_phase_covers_all_arms() {
         use crate::decrypt::Phase;
@@ -2843,8 +2814,7 @@ mod tests {
         );
     }
 
-    // forensic + fills must cover every LBA of every extent EXACTLY once: no
-    // gap, no overlap. See docs/resolve.md#assert_gapless.
+    // forensic + fills must cover every LBA of every extent EXACTLY once: no gap, no overlap.
     fn assert_gapless(
         extents: &[Extent],
         forensic: &[(u32, u32, usize, crate::decrypt::Phase)],
@@ -2869,7 +2839,6 @@ mod tests {
     }
 
     // BEHAVIOR 3 — gap-fill range arithmetic, exhaustive over segment positions.
-    // See docs/resolve.md#fill_base_key_gaps_is_gapless_over_every_extent.
     #[test]
     fn fill_base_key_gaps_is_gapless_over_every_extent() {
         use crate::decrypt::Phase::{All, Even, Odd};
@@ -2963,8 +2932,7 @@ mod tests {
 
     // ── Fix 1: FMTS phase-probe read-fault vs wrong-key distinction ─────────
 
-    // Build a 6144-byte aligned unit of CLEAN MPEG-TS then AACS-encrypt it under
-    // key. See docs/resolve.md#encrypted_clean_unit.
+    // Build a 6144-byte aligned unit of CLEAN MPEG-TS then AACS-encrypt it under key.
     fn encrypted_clean_unit(key: &[u8; 16]) -> Vec<u8> {
         use crate::aacs::content::ALIGNED_UNIT_LEN;
         let mut u = vec![0u8; ALIGNED_UNIT_LEN];
@@ -2994,7 +2962,6 @@ mod tests {
     }
 
     // A probe whose EVERY read faults must classify as ReadFault, NOT WrongKey.
-    // See docs/resolve.md#probe_index_phase_all_faults_is_read_fault_not_wrong_key.
     #[test]
     fn probe_index_phase_all_faults_is_read_fault_not_wrong_key() {
         let segs = vec![a_segment(1)];
@@ -3072,8 +3039,8 @@ mod tests {
         );
     }
 
-    // Read-fault TOLERANCE: first same-index segment faults every read, second
-    // decrypts clean -> probe falls through. See docs/resolve.md#probe_index_phase_falls_through_faulting_segment_to_next.
+    // Read-fault TOLERANCE: first same-index segment faults every read, second decrypts clean
+    // -> probe falls through.
     #[test]
     fn probe_index_phase_falls_through_faulting_segment_to_next() {
         use crate::decrypt::Phase;
@@ -3111,8 +3078,8 @@ mod tests {
 
     // ── Fix 2: resolve_mux_key_map multi-CPS key selection (real ciphertext) ─
 
-    // Tiles a fixed ciphertext unit across each registered extent range, zeros
-    // elsewhere; low LBAs zero so FMTS misses and multi-CPS runs. See docs/resolve.md#ciphersource.
+    // Tiles a fixed ciphertext unit across each registered extent range, zeros elsewhere; low
+    // LBAs zero so FMTS misses and multi-CPS runs.
     struct CipherSource {
         units: Vec<(u32, u32, Vec<u8>)>,
     }
@@ -3153,8 +3120,7 @@ mod tests {
         t
     }
 
-    // pick() must select the pool index that opens the extent's real ciphertext
-    // (idx 2, not 0). See docs/resolve.md#resolve_mux_key_map_multi_cps_pick_selects_correct_index.
+    // pick() must select the pool index that opens the extent's real ciphertext (idx 2, not 0).
     #[test]
     fn resolve_mux_key_map_multi_cps_pick_selects_correct_index() {
         let key_a = [0x01u8; 16];
@@ -3187,8 +3153,8 @@ mod tests {
         );
     }
 
-    // Fail-loud: no held/fetched key opening a sample must surface DecryptFailed,
-    // never mis-key. See docs/resolve.md#resolve_mux_key_map_multi_cps_fail_loud_on_absent_key.
+    // Fail-loud: no held/fetched key opening a sample must surface DecryptFailed, never
+    // mis-key.
     #[test]
     fn resolve_mux_key_map_multi_cps_fail_loud_on_absent_key() {
         let key_a = [0x01u8; 16];
@@ -3218,8 +3184,7 @@ mod tests {
         assert_eq!(err.to_string(), expected, "expected DecryptFailed");
     }
 
-    // KeyFetch cold path: pool missing the key, injected KeyFetch recovers it, map
-    // succeeds. See docs/resolve.md#resolve_mux_key_map_multi_cps_fetch_recovers_missing_key.
+    // KeyFetch cold path: pool missing the key, injected KeyFetch recovers it, map succeeds.
     #[test]
     fn resolve_mux_key_map_multi_cps_fetch_recovers_missing_key() {
         let key_a = [0x01u8; 16];
@@ -3269,8 +3234,7 @@ mod tests {
     /// and every content extent in these tests starts at or above this.
     const CONTENT_LBA_FLOOR: u32 = 1000;
 
-    // CipherSource plus a counter of CONTENT reads, excluding low-LBA UDF metadata
-    // probes. See docs/resolve.md#countingciphersource.
+    // CipherSource plus a counter of CONTENT reads, excluding low-LBA UDF metadata probes.
     struct CountingCipherSource {
         inner: CipherSource,
         probes: u32,
@@ -3308,8 +3272,8 @@ mod tests {
         }
     }
 
-    // A second title over the same extent must cost ZERO further reads and resolve
-    // the SAME index; a different extent must still be sampled. See docs/resolve.md#multi_cps_shared_extent_is_served_from_cache_not_resampled.
+    // A second title over the same extent must cost ZERO further reads and resolve the SAME
+    // index; a different extent must still be sampled.
     #[test]
     fn multi_cps_shared_extent_is_served_from_cache_not_resampled() {
         let key_a = [0x01u8; 16];
@@ -3401,7 +3365,6 @@ mod tests {
     }
 
     // A cache hit must equal a full recompute range-for-range (warm vs cold reader).
-    // See docs/resolve.md#multi_cps_cache_hit_matches_a_full_recompute.
     #[test]
     fn multi_cps_cache_hit_matches_a_full_recompute() {
         let key_a = [0x01u8; 16];
@@ -3478,8 +3441,8 @@ mod tests {
         );
     }
 
-    // An extent with no sampleable units inherits the PRECEDING extent's index (a
-    // per-title fact) and must never be memoised. See docs/resolve.md#multi_cps_inherited_index_is_not_cached.
+    // An extent with no sampleable units inherits the PRECEDING extent's index (a per-title
+    // fact) and must never be memoised.
     #[test]
     fn multi_cps_inherited_index_is_not_cached() {
         let key_a = [0x01u8; 16];
@@ -3551,8 +3514,8 @@ mod tests {
         );
     }
 
-    // A fail-loud extent must not be memoised: a later retry (key now banked) must
-    // re-sample and succeed. See docs/resolve.md#multi_cps_failed_extent_is_not_cached.
+    // A fail-loud extent must not be memoised: a later retry (key now banked) must re-sample
+    // and succeed.
     #[test]
     fn multi_cps_failed_extent_is_not_cached() {
         let key_a = [0x01u8; 16];
@@ -3605,7 +3568,6 @@ mod tests {
     // ── Fix 1: read-fault vs genuinely-not-FMTS in resolve_fmts_key_map ──────
 
     // Every read is a transient DiscRead fault (marginal live drive).
-    // See docs/resolve.md#faultsource.
     struct FaultSource;
     impl SectorSource for FaultSource {
         fn capacity_sectors(&self) -> u32 {
@@ -3626,8 +3588,8 @@ mod tests {
         }
     }
 
-    // A transient DiscRead fault reading UDF metadata must PROPAGATE, not be
-    // swallowed into not-FMTS Ok(None). See docs/resolve.md#resolve_fmts_key_map_read_fault_propagates.
+    // A transient DiscRead fault reading UDF metadata must PROPAGATE, not be swallowed into
+    // not-FMTS Ok(None).
     #[test]
     fn resolve_fmts_key_map_read_fault_propagates() {
         let mut reader = FaultSource;
@@ -3660,8 +3622,7 @@ mod tests {
         );
     }
 
-    // A structurally non-UDF reader is genuinely not FMTS: clean Ok(None), not
-    // fail-loud. See docs/resolve.md#resolve_fmts_key_map_not_udf_is_clean_none.
+    // A structurally non-UDF reader is genuinely not FMTS: clean Ok(None), not fail-loud.
     #[test]
     fn resolve_fmts_key_map_not_udf_is_clean_none() {
         // CipherSource with no registered units reads as all zeros everywhere, so
@@ -3780,8 +3741,8 @@ mod tests {
         Probe,
     }
 
-    // Synthetic disc with extra IndividualSegment.tbl records appended; content
-    // region unchanged. See docs/resolve.md#fmts_disc_with_extra_records.
+    // Synthetic disc with extra IndividualSegment.tbl records appended; content region
+    // unchanged.
     fn fmts_disc_with_extra_records(extra: &[crate::aacs::segment::Segment]) -> FmtsDisc {
         let mut all = fmts_segments();
         all.extend_from_slice(extra);
@@ -3796,7 +3757,6 @@ mod tests {
         }
 
         // UDF metadata image alone, with tbl_segs as the segment table.
-        // See docs/resolve.md#fmtsdiscrebuild_meta--with_forensic_clip.
         fn rebuild_meta(
             tbl_segs: &[crate::aacs::segment::Segment],
         ) -> crate::udf::fixture::MemDisc {
@@ -3870,7 +3830,6 @@ mod tests {
         }
 
         // Same disc + a second CPS unit at FMTS_CPS2_LBA (ambiguous "base key").
-        // See docs/resolve.md#fmtsdiscwith_second_cps_unit.
         fn with_second_cps_unit() -> Self {
             Self {
                 second_cps: true,
@@ -3891,7 +3850,6 @@ mod tests {
             }
         }
 
-        // See docs/resolve.md#fmtsdiscunit_at.
         fn unit_at(&self, unit_byte: u64) -> Vec<u8> {
             for s in &self.segs {
                 let sb = s.start_byte();
@@ -3975,8 +3933,8 @@ mod tests {
         }
     }
 
-    // A KeyFetch whose fmts_indexes counts calls, replying with the full index-key
-    // set only for a genuine index-1 anchor batch. See docs/resolve.md#counting_fmts_fetch.
+    // A KeyFetch whose fmts_indexes counts calls, replying with the full index-key set only for
+    // a genuine index-1 anchor batch.
     fn counting_fmts_fetch(
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> crate::sector::KeyFetch {
@@ -4009,7 +3967,7 @@ mod tests {
         }
     }
 
-    // A play-all title over BOTH CPS units. See docs/resolve.md#fmts_two_cps_title.
+    // A play-all title over BOTH CPS units.
     fn fmts_two_cps_title() -> DiscTitle {
         let mut t = DiscTitle::empty();
         t.extents = vec![
@@ -4026,7 +3984,6 @@ mod tests {
     }
 
     // The disc's two BASE CPS Unit Keys, in Unit_Key_RO.inf order.
-    // See docs/resolve.md#fmts_two_cps_keys.
     fn fmts_two_cps_keys() -> DecryptKeys {
         DecryptKeys::Aacs {
             unit_keys: vec![(1, FMTS_BASE_KEY), (2, FMTS_CPS2_KEY)],
@@ -4034,8 +3991,7 @@ mod tests {
         }
     }
 
-    // The non-forensic gap fill must use each LBA's own CPS unit key, not
-    // hardcode pool slot 0. See docs/resolve.md#fmts_gap_fill_uses_each_lbas_own_cps_unit_key_not_pool_slot_zero.
+    // The non-forensic gap fill must use each LBA's own CPS unit key, not hardcode pool slot 0.
     #[test]
     fn fmts_gap_fill_uses_each_lbas_own_cps_unit_key_not_pool_slot_zero() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4100,8 +4056,8 @@ mod tests {
         }
     }
 
-    // The FMTS branch must resolve UDF walk + probes + key service ONCE per disc,
-    // not once per playlist. See docs/resolve.md#fmts_index_keys_resolved_once_per_disc_not_once_per_title.
+    // The FMTS branch must resolve UDF walk + probes + key service ONCE per disc, not once per
+    // playlist.
     #[test]
     fn fmts_index_keys_resolved_once_per_disc_not_once_per_title() {
         use std::sync::atomic::Ordering;
@@ -4187,8 +4143,7 @@ mod tests {
         );
     }
 
-    // Same three titles via a SHARED memo must equal a FRESH-memo-per-title
-    // recomputation. See docs/resolve.md#fmts_memoised_map_equals_per_title_recomputation.
+    // Same three titles via a SHARED memo must equal a FRESH-memo-per-title recomputation.
     #[test]
     fn fmts_memoised_map_equals_per_title_recomputation() {
         let titles = [
@@ -4271,7 +4226,6 @@ mod tests {
     }
 
     // A DIFFERENT extent list is a genuine memo miss and must re-probe.
-    // See docs/resolve.md#fmts_different_extent_list_is_a_miss_and_reprobes.
     #[test]
     fn fmts_different_extent_list_is_a_miss_and_reprobes() {
         use std::sync::atomic::Ordering;
@@ -4321,8 +4275,8 @@ mod tests {
         );
     }
 
-    // A read-faulted phase (defaulted to Phase::All) must NOT be memoised; the next
-    // title re-probes. See docs/resolve.md#fmts_read_faulted_phase_is_not_memoised.
+    // A read-faulted phase (defaulted to Phase::All) must NOT be memoised; the next title
+    // re-probes.
     #[test]
     fn fmts_read_faulted_phase_is_not_memoised() {
         use std::sync::atomic::Ordering;
@@ -4380,8 +4334,7 @@ mod tests {
         );
     }
 
-    // The UDF walk deciding FMTS-or-not must be attempted ONCE per disc, not once
-    // per playlist. See docs/resolve.md#non_fmts_disc_walks_the_filesystem_once_for_every_title.
+    // The UDF walk deciding FMTS-or-not must be attempted ONCE per disc, not once per playlist.
     #[test]
     fn non_fmts_disc_walks_the_filesystem_once_for_every_title() {
         let key_a = [0x01u8; 16];
@@ -4432,8 +4385,7 @@ mod tests {
         );
     }
 
-    // Halt must stay responsive even when both FMTS memos are warm and a title does
-    // no I/O. See docs/resolve.md#fmts_memoised_title_still_honors_halt.
+    // Halt must stay responsive even when both FMTS memos are warm and a title does no I/O.
     #[test]
     fn fmts_memoised_title_still_honors_halt() {
         use crate::halt::Halt;
@@ -4471,8 +4423,8 @@ mod tests {
         assert!(crate::error::is_halt(&err), "expected Halted, got: {err}");
     }
 
-    // The single-CPS short-circuit must depend on the count of BASE CPS Unit Keys,
-    // NOT whole-pool length (FMTS appends forensic keys). See docs/resolve.md#single_cps_short_circuit_survives_a_forensic_title_resolving_first.
+    // The single-CPS short-circuit must depend on the count of BASE CPS Unit Keys, NOT
+    // whole-pool length (FMTS appends forensic keys).
     #[test]
     fn single_cps_short_circuit_survives_a_forensic_title_resolving_first() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4535,8 +4487,8 @@ mod tests {
     /// trailer's length and the two candidate LBAs are unambiguous.
     const TRAILER_SECTORS: u32 = 300;
 
-    // Forensic segment SPNs live in the FORENSIC CLIP's byte space, not the title's
-    // first extent (a trailer-first play-all playlist). See docs/resolve.md#forensic_segments_anchor_to_the_forensic_clip_not_the_titles_first_extent.
+    // Forensic segment SPNs live in the FORENSIC CLIP's byte space, not the title's first
+    // extent (a trailer-first play-all playlist).
     #[test]
     fn forensic_segments_anchor_to_the_forensic_clip_not_the_titles_first_extent() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4600,7 +4552,7 @@ mod tests {
     }
 
     // A disc with a segment table but no identifiable forensic clip must fail LOUD
-    // (FmtsKeyMissing), never guess an anchor. See docs/resolve.md#unidentifiable_forensic_clip_fails_loud_rather_than_guessing_an_anchor.
+    // (FmtsKeyMissing), never guess an anchor.
     #[test]
     fn unidentifiable_forensic_clip_fails_loud_rather_than_guessing_an_anchor() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4632,8 +4584,7 @@ mod tests {
         );
     }
 
-    // The base-CPS count must exclude banked forensic index keys (tagged
-    // FMTS_POOL_TAG_BASE+n). See docs/resolve.md#single_base_key_slot_counts_cps_units_not_banked_forensic_keys.
+    // The base-CPS count must exclude banked forensic index keys (tagged FMTS_POOL_TAG_BASE+n).
     #[test]
     fn single_base_key_slot_counts_cps_units_not_banked_forensic_keys() {
         let base = [0x01u8; 16];
@@ -4669,8 +4620,8 @@ mod tests {
         );
     }
 
-    // Forensic ranges arrive in table RECORD order, not LBA order; the gap walk's
-    // forward sweep needs them sorted. See docs/resolve.md#fill_base_key_gaps_sorts_cuts_that_arrive_in_table_order_not_lba_order.
+    // Forensic ranges arrive in table RECORD order, not LBA order; the gap walk's forward sweep
+    // needs them sorted.
     #[test]
     fn fill_base_key_gaps_sorts_cuts_that_arrive_in_table_order_not_lba_order() {
         use crate::decrypt::Phase::{All, Even, Odd};
@@ -4692,7 +4643,6 @@ mod tests {
     }
 
     // Records every (lba, count) requested and serves a caller-chosen aligned unit.
-    // See docs/resolve.md#recordingsource.
     struct RecordingSource {
         reads: Vec<(u32, u16)>,
         unit: Vec<u8>,
@@ -4716,7 +4666,6 @@ mod tests {
     }
 
     // sample_encrypted_units: 8 probes at total*p/9 for p in 1..=8, pinned exactly.
-    // See docs/resolve.md#sample_encrypted_units_probes_eight_aligned_units_spread_across_the_extent.
     #[test]
     fn sample_encrypted_units_probes_eight_aligned_units_spread_across_the_extent() {
         let unit = encrypted_clean_unit(&[0x5Au8; 16]);
@@ -4748,8 +4697,7 @@ mod tests {
         );
     }
 
-    // Only genuinely AACS-encrypted units come back; a clear extent yields NO
-    // samples. See docs/resolve.md#sample_encrypted_units_drops_clear_units_and_reads_nothing_below_one_unit.
+    // Only genuinely AACS-encrypted units come back; a clear extent yields NO samples.
     #[test]
     fn sample_encrypted_units_drops_clear_units_and_reads_nothing_below_one_unit() {
         // A clear unit: the AACS scrambling bits in byte 0 are zero.
@@ -4776,8 +4724,8 @@ mod tests {
         assert!(got.is_empty());
     }
 
-    // pick_pool_slot answers "which of THESE slots, in THIS order, opens the
-    // extent" — both restriction and order are load-bearing. See docs/resolve.md#pick_pool_slot_honours_the_caller_s_slot_list_and_its_order.
+    // pick_pool_slot answers "which of THESE slots, in THIS order, opens the extent" — both
+    // restriction and order are load-bearing.
     #[test]
     fn pick_pool_slot_honours_the_caller_s_slot_list_and_its_order() {
         let k0 = [0x01u8; 16];
@@ -4815,7 +4763,6 @@ mod tests {
     }
 
     // Extents are [start_lba, start_lba + sector_count) — half open, both ends.
-    // See docs/resolve.md#extents_overlap_is_half_open_at_both_ends.
     #[test]
     fn extents_overlap_is_half_open_at_both_ends() {
         let at = |start_lba, sector_count| {
@@ -4868,8 +4815,7 @@ mod tests {
         std::io::Error::from(crate::error::Error::FmtsKeyMissing).to_string()
     }
 
-    // Resolve the synthetic FMTS disc with extra bogus records appended, return
-    // the error text. See docs/resolve.md#fmts_resolve_err_with.
+    // Resolve the synthetic FMTS disc with extra bogus records appended, return the error text.
     fn fmts_resolve_err_with(extra: &[crate::aacs::segment::Segment]) -> String {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = counting_fmts_fetch(calls);
@@ -4890,8 +4836,7 @@ mod tests {
         .to_string()
     }
 
-    // Control: the SAME resolve with no extra records succeeds (guards the four
-    // tests below). See docs/resolve.md#fmts_baseline_table_resolves_so_the_unmappable_record_tests_mean_something.
+    // Control: the SAME resolve with no extra records succeeds (guards the four tests below).
     #[test]
     fn fmts_baseline_table_resolves_so_the_unmappable_record_tests_mean_something() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4922,7 +4867,6 @@ mod tests {
     }
 
     // Arm 1 — an INVERTED record (start_spn > end_spn) is refused, not base-keyed.
-    // See docs/resolve.md#fmts_inverted_segment_record_aborts_rather_than_base_keying_the_hole.
     #[test]
     fn fmts_inverted_segment_record_aborts_rather_than_base_keying_the_hole() {
         let bad = crate::aacs::segment::Segment {
@@ -4934,7 +4878,6 @@ mod tests {
     }
 
     // Arm 2 — a record whose forensic INDEX has no key must abort, not base-key.
-    // See docs/resolve.md#fmts_record_with_no_index_key_aborts_rather_than_base_keying_the_hole.
     #[test]
     fn fmts_record_with_no_index_key_aborts_rather_than_base_keying_the_hole() {
         let bad = crate::aacs::segment::Segment {
@@ -4946,7 +4889,6 @@ mod tests {
     }
 
     // Arm 3 — record START addressable but END runs past the clip's last byte.
-    // See docs/resolve.md#fmts_record_running_past_the_clips_end_aborts_rather_than_base_keying_it.
     #[test]
     fn fmts_record_running_past_the_clips_end_aborts_rather_than_base_keying_it() {
         // The clip is FMTS_CONTENT_SECTORS * 2048 bytes = 21_333 whole packets.
@@ -4969,8 +4911,8 @@ mod tests {
         assert_eq!(fmts_resolve_err_with(&[bad]), fmts_missing_err());
     }
 
-    // Arm 4 — a record off the aligned-unit grid (sector-crossing count disagrees
-    // with byte-length count) must abort. See docs/resolve.md#fmts_record_off_the_aligned_unit_grid_aborts_rather_than_spanning_wrongly.
+    // Arm 4 — a record off the aligned-unit grid (sector-crossing count disagrees with
+    // byte-length count) must abort.
     #[test]
     fn fmts_record_off_the_aligned_unit_grid_aborts_rather_than_spanning_wrongly() {
         let bad = crate::aacs::segment::Segment {
@@ -4981,8 +4923,8 @@ mod tests {
         assert_eq!(fmts_resolve_err_with(&[bad]), fmts_missing_err());
     }
 
-    // The multi-CPS inheritance chain must run THROUGH a cache hit (hit arm feeds
-    // last_idx), else a later unsampleable extent inherits slot 0. See docs/resolve.md#multi_cps_cache_hit_still_feeds_the_next_extents_inheritance.
+    // The multi-CPS inheritance chain must run THROUGH a cache hit (hit arm feeds last_idx),
+    // else a later unsampleable extent inherits slot 0.
     #[test]
     fn multi_cps_cache_hit_still_feeds_the_next_extents_inheritance() {
         let key_a = [0x01u8; 16];
@@ -5054,8 +4996,8 @@ mod tests {
         );
     }
 
-    // FMTS gap fill on a multi-CPS disc: a clear tail must inherit the preceding
-    // extent's CPS unit, not base_slots[0]. See docs/resolve.md#fmts_multi_cps_gap_fill_carries_the_preceding_extents_cps_unit_to_a_clear_tail.
+    // FMTS gap fill on a multi-CPS disc: a clear tail must inherit the preceding extent's CPS
+    // unit, not base_slots[0].
     #[test]
     fn fmts_multi_cps_gap_fill_carries_the_preceding_extents_cps_unit_to_a_clear_tail() {
         const CLEAR_LBA: u32 = FMTS_CPS2_LBA + FMTS_CPS2_SECTORS;
@@ -5097,8 +5039,8 @@ mod tests {
         }
     }
 
-    // FMTS gap fill samples extents through the same per-disc CpsUnitCache; a
-    // second title over the same extents costs ZERO further reads. See docs/resolve.md#fmts_multi_cps_gap_fill_samples_each_extent_once_per_disc.
+    // FMTS gap fill samples extents through the same per-disc CpsUnitCache; a second title over
+    // the same extents costs ZERO further reads.
     #[test]
     fn fmts_multi_cps_gap_fill_samples_each_extent_once_per_disc() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5163,8 +5105,8 @@ mod tests {
         std::io::Error::from(crate::error::Error::Halted).to_string()
     }
 
-    // Stop lands during the UDF walk; the anchor loop's own poll must catch it so
-    // no CONTENT sector is ever requested. See docs/resolve.md#fmts_stop_during_the_udf_walk_touches_no_content_sector.
+    // Stop lands during the UDF walk; the anchor loop's own poll must catch it so no CONTENT
+    // sector is ever requested.
     #[test]
     fn fmts_stop_during_the_udf_walk_touches_no_content_sector() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5202,8 +5144,8 @@ mod tests {
         );
     }
 
-    // Stop lands during the anchor batch; the PHASE loop's poll must catch it
-    // before probing index 1's parity. See docs/resolve.md#fmts_stop_during_the_anchor_batch_stops_before_the_phase_probes.
+    // Stop lands during the anchor batch; the PHASE loop's poll must catch it before probing
+    // index 1's parity.
     #[test]
     fn fmts_stop_during_the_anchor_batch_stops_before_the_phase_probes() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

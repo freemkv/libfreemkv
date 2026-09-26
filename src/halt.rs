@@ -4,8 +4,6 @@
 //! every long-running loop; the loop polls `is_cancelled()` and bails out
 //! cleanly. Calling `cancel()` from any clone flips the shared flag, and
 //! every other clone observes it on its next poll.
-//!
-//! See docs/halt.md — why `Ordering::Relaxed` is sufficient here.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,8 +65,6 @@ impl Default for Halt {
 /// `bounded_syscall` checks the cancellation flag and the deadline
 /// every [`POLL_INTERVAL`] while blocked on a worker; the same
 /// cadence governs `Pipeline::send_with_halt`'s `try_send` retry.
-///
-/// See docs/halt.md — why 250ms, and why this constant is centralised.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(test)]
