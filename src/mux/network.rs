@@ -486,6 +486,7 @@ mod tests {
             .unwrap()
             .meta(&dt);
         let frame = pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -598,6 +599,7 @@ mod tests {
         let h = std::thread::spawn(move || {
             let mut ns = NetworkStream::accept_from(listener).unwrap();
             let frame = pes::PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: 0,
@@ -651,6 +653,7 @@ mod tests {
             .meta(&dt);
         for i in 0..5u8 {
             let frame = pes::PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: (i % 2) as usize,

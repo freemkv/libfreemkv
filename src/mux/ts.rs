@@ -766,9 +766,14 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
             let es_pid = (((pmt[pos + 1] & 0x1F) as u16) << 8) | pmt[pos + 2] as u16;
             let es_info_len = (((pmt[pos + 3] & 0x0F) as usize) << 8) | pmt[pos + 4] as usize;
 
-            // Single source of truth for stream_type → Codec: reuse `Codec::from_coding_type`
-            // (same table the BD STN/disc scanner uses) so the two mappings can't drift.
-            let codec = Codec::from_coding_type(stream_type);
+            // PMTs may also carry ISO/IEC 13818-1 audio stream types that are
+            // absent from Blu-ray's STN table. Keep that distinction local to TS.
+            let codec = match stream_type {
+                0x03 | 0x04 => Codec::Mp2,
+                0x0f => Codec::Aac,
+                0x87 => Codec::Ac3Plus,
+                _ => Codec::from_coding_type(stream_type),
+            };
             let stream = match codec.kind() {
                 CodecKind::Video => {
                     // Default resolution by codec generation (HEVC →
@@ -1395,6 +1400,22 @@ mod tests {
                 .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
             "H.264 video must be found past the adaptation field"
         );
+    }
+
+    #[test]
+    fn scan_streams_maps_standard_transport_audio_types() {
+        use crate::disc::{Codec, Stream};
+        for (kind, expected) in [
+            (0x03, Codec::Mp2),
+            (0x04, Codec::Mp2),
+            (0x0f, Codec::Aac),
+            (0x87, Codec::Ac3Plus),
+        ] {
+            let mut data = pat_packet(0x100);
+            data.extend(pmt_packet(0x100, &[(0x1b, 0x1011), (kind, 0x1100)]));
+            let streams = scan_streams(&data).unwrap();
+            assert!(matches!(&streams[1], Stream::Audio(a) if a.codec == expected));
+        }
     }
 
     #[test]

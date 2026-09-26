@@ -293,6 +293,7 @@ mod tests {
         source: Option<SourcePos>,
     ) -> PesFrame {
         PesFrame {
+            discard_padding_ns: 0,
             track,
             pts: 0,
             keyframe,

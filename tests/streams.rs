@@ -299,6 +299,7 @@ fn m2ts_stream_write_read() {
     // Write some PES frames
     for i in 0..5u8 {
         let frame = libfreemkv::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -323,6 +324,7 @@ fn m2ts_stream_write_read() {
 fn m2ts_pes_frame_roundtrip() {
     // PesFrame serialize/deserialize roundtrip
     let frame = libfreemkv::pes::PesFrame {
+        discard_padding_ns: 0,
         coding: None,
         source: None,
         track: 2,
@@ -597,6 +599,7 @@ fn mkvstream_write_finish() {
     // since there is no real codec data, but it should not panic)
     for i in 0..20u8 {
         let frame = libfreemkv::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -660,6 +663,7 @@ fn mkvstream_roundtrip_bdts() {
     // Write PES frames targeting the audio track
     for i in 0..10u8 {
         let frame = libfreemkv::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -859,6 +863,7 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
 
     // Write the ES data (SPS+PPS+IDR) as a keyframe PES frame.
     let frame1 = libfreemkv::pes::PesFrame {
+        discard_padding_ns: 0,
         coding: None,
         source: None,
         track: 0,
@@ -871,6 +876,7 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
 
     // Write a second non-IDR frame
     let frame2 = libfreemkv::pes::PesFrame {
+        discard_padding_ns: 0,
         coding: None,
         source: None,
         track: 0,

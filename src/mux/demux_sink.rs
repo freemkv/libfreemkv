@@ -284,7 +284,12 @@ fn annexb_param_sets(codec: Codec, record: &[u8]) -> Vec<u8> {
 // PGS `.sup` writer: rebuilds the HDMV segment framing the parser stripped,
 // prefixing each segment with a 13-byte `PG` header (PTS/DTS).
 // See docs/demux-sink.md — PgsSupWriter.
-struct PgsSupWriter;
+#[derive(Default)]
+struct PgsSupWriter {
+    // Delay a duration-derived clear until the next frame, so an original
+    // clear (or replacement PCS) at that timestamp takes precedence.
+    pending_clear: Option<(i64, u16, u16)>,
+}
 
 // ── PGS / HDMV segment framing constants ─────────────────────────────────────
 // HDMV Presentation Graphics Stream, per BD-ROM Part 3 graphics-stream spec
@@ -338,7 +343,7 @@ impl PgsSupWriter {
             w.write_all(&pts90k.to_be_bytes())?;
             w.write_all(&dts90k.to_be_bytes())?;
             w.write_all(&data[pos..seg_end])?;
-            written += SUP_HEADER_LEN + size;
+            written += SUP_HEADER_LEN + PGS_SEG_HEADER_LEN + size;
             pos = seg_end;
         }
         Ok(written)
@@ -395,16 +400,38 @@ impl PgsSupWriter {
 impl EsWriter for PgsSupWriter {
     fn write_frame(&mut self, w: &mut dyn Write, f: &PesFrame, pts_ns: i64) -> io::Result<usize> {
         let pts90 = ns_to_90k(pts_ns);
-        let mut written = Self::emit_segments(&f.data, pts90, pts90, w)?;
-        // The parser folds the wipe time into `duration_ns` and drops the clear
-        // bytes; re-emit a synthetic clear at `pts + duration` so it times out.
-        if let Some(dur) = f.duration_ns {
-            let clear_pts = ns_to_90k(pts_ns.saturating_add(dur as i64));
+        let is_pcs = f.data.first() == Some(&SEG_PCS) && f.data.len() > 13;
+        let mut written = 0;
+        if let Some((end, width, height)) = self.pending_clear {
+            if end < pts_ns || (end == pts_ns && !is_pcs) {
+                let clear = Self::synthetic_clear_display_set(width, height);
+                let pts = ns_to_90k(end);
+                written += Self::emit_segments(&clear, pts, pts, w)?;
+                self.pending_clear = None;
+            } else if is_pcs {
+                // A real clear/replacement at or before the computed end wins.
+                self.pending_clear = None;
+            }
+        }
+        written += Self::emit_segments(&f.data, pts90, pts90, w)?;
+        // Retain fallback support for old MKVs that only carry durations, and
+        // for a final display without a clear. Never synthesize a clear OF a
+        // clear (nor of a standalone WDS/END segment).
+        if let Some(dur) = f.duration_ns.filter(|_| is_pcs && f.data[13] > 0) {
+            let end = pts_ns.saturating_add(i64::try_from(dur).unwrap_or(i64::MAX));
             let (w_px, h_px) = Self::pcs_dimensions(&f.data);
-            let clear = Self::synthetic_clear_display_set(w_px, h_px);
-            written += Self::emit_segments(&clear, clear_pts, clear_pts, w)?;
+            self.pending_clear = Some((end, w_px, h_px));
         }
         Ok(written)
+    }
+
+    fn finish(&mut self, w: &mut dyn Write) -> io::Result<()> {
+        if let Some((end, width, height)) = self.pending_clear.take() {
+            let clear = Self::synthetic_clear_display_set(width, height);
+            let pts = ns_to_90k(end);
+            Self::emit_segments(&clear, pts, pts, w)?;
+        }
+        Ok(())
     }
 }
 
@@ -496,7 +523,7 @@ fn es_writer_for(
 ) -> Box<dyn EsWriter> {
     match codec {
         Codec::Hevc | Codec::H264 => Box::new(AnnexBWriter::new(codec, codec_private)),
-        Codec::Pgs => Box::new(PgsSupWriter),
+        Codec::Pgs => Box::new(PgsSupWriter::default()),
         Codec::DvdSub => Box::new(VobSubWriter::new(
             idx_path.unwrap_or_else(|| PathBuf::from("subtitle.idx")),
             codec_private,
@@ -1086,6 +1113,7 @@ mod tests {
         let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
         // Video starts at 500ms, audio at 600ms → true delay is +100ms.
         sink.write(&PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1096,6 +1124,7 @@ mod tests {
         })
         .unwrap();
         sink.write(&PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 1,
@@ -1133,6 +1162,7 @@ mod tests {
         };
         let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
         sink.write(&PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1167,6 +1197,7 @@ mod tests {
         let mut w = AnnexBWriter::new(Codec::H264, None);
         let mut out = Vec::new();
         let f = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1202,6 +1233,7 @@ mod tests {
         let mut w = AnnexBWriter::new(Codec::H264, Some(&rec));
         let mut out = Vec::new();
         let f = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1232,6 +1264,7 @@ mod tests {
         let mut w = AnnexBWriter::new(Codec::H264, Some(&rec));
         let mut out = Vec::new();
         let f1 = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1253,6 +1286,7 @@ mod tests {
         // Second frame: NO param re-prepend.
         let mut out2 = Vec::new();
         let f2 = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1323,7 +1357,7 @@ mod tests {
         assert_eq!(&out[2..6], &0x10u32.to_be_bytes()); // PTS
         assert_eq!(&out[6..10], &0x10u32.to_be_bytes()); // DTS
         assert_eq!(&out[SUP_HEADER_LEN..], &payload); // segment body verbatim
-        assert_eq!(written, SUP_HEADER_LEN + 2);
+        assert_eq!(written, out.len());
     }
 
     #[test]
@@ -1335,6 +1369,7 @@ mod tests {
         pcs.extend_from_slice(&[0x07, 0x80, 0x04, 0x38]); // 1920x1080
         pcs.extend_from_slice(&[0x10, 0x00, 0x00, 0x80, 0x00, 0x00, 0x01]); // 1 object
         let f = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1344,8 +1379,9 @@ mod tests {
             duration_ns: Some(2_000_000_000), // 2s display → clear at 3s
         };
         let mut out = Vec::new();
-        let mut w = PgsSupWriter;
+        let mut w = PgsSupWriter::default();
         w.write_frame(&mut out, &f, f.pts).unwrap();
+        w.finish(&mut out).unwrap();
 
         // Parse out every PG-framed segment: PG(2) PTS(4) DTS(4) type(1) size(2).
         let mut segs: Vec<(u8, u32)> = Vec::new();
@@ -1380,6 +1416,7 @@ mod tests {
     fn pgs_frame_without_duration_emits_no_clear() {
         // No duration → no synthetic clear (the subtitle's wipe time is unknown).
         let f = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1389,7 +1426,7 @@ mod tests {
             duration_ns: None,
         };
         let mut out = Vec::new();
-        let mut w = PgsSupWriter;
+        let mut w = PgsSupWriter::default();
         w.write_frame(&mut out, &f, 0).unwrap();
         // Exactly one PG-framed segment (the display), no clear appended.
         // Output = `.sup` header (10) + the on-wire segment (type+size 3 + 2
@@ -1400,6 +1437,159 @@ mod tests {
             SUP_HEADER_LEN + PGS_SEG_HEADER_LEN + 2,
             "only the display segment, no clear"
         );
+    }
+
+    fn sup_frame(pts: i64, duration_ns: Option<u64>, visible: bool) -> PesFrame {
+        let mut data = PgsSupWriter::synthetic_clear_display_set(1920, 1080);
+        if visible {
+            data[13] = 1;
+            data[2] += 8;
+            data.splice(14..14, [0, 0, 0, 0x40, 0, 0, 0, 0]);
+        }
+        PesFrame {
+            discard_padding_ns: 0,
+            track: 0,
+            pts,
+            duration_ns,
+            data,
+            keyframe: true,
+            coding: None,
+            source: None,
+        }
+    }
+
+    fn sup_compositions(bytes: &[u8]) -> Vec<(u32, u8)> {
+        let mut compositions = Vec::new();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            assert_eq!(&bytes[pos..pos + 2], &SUP_MAGIC);
+            let pts = u32::from_be_bytes(bytes[pos + 2..pos + 6].try_into().unwrap());
+            let data = &bytes[pos + SUP_HEADER_LEN..];
+            let size = usize::from(u16::from_be_bytes([data[1], data[2]]));
+            if data[0] == SEG_PCS {
+                compositions.push((pts, data[13]));
+            }
+            pos += SUP_HEADER_LEN + PGS_SEG_HEADER_LEN + size;
+        }
+        assert_eq!(pos, bytes.len());
+        compositions
+    }
+
+    #[test]
+    fn pgs_sup_preserves_original_clear_without_a_duplicate_or_later_clear() {
+        let mut writer = PgsSupWriter::default();
+        let mut bytes = Vec::new();
+        for frame in [
+            sup_frame(1_000_000_000, Some(2_000_000_000), true),
+            sup_frame(3_000_000_000, Some(100_000), false),
+        ] {
+            let before = bytes.len();
+            let written = writer.write_frame(&mut bytes, &frame, frame.pts).unwrap();
+            assert_eq!(written, bytes.len() - before);
+        }
+        writer.finish(&mut bytes).unwrap();
+        assert_eq!(sup_compositions(&bytes), [(90_000, 1), (270_000, 0)]);
+    }
+
+    #[test]
+    fn pgs_sup_replacement_cancels_old_clear_before_or_at_its_deadline() {
+        for replace_ns in [2_000_000_000, 3_000_000_000] {
+            let mut writer = PgsSupWriter::default();
+            let mut bytes = Vec::new();
+            for frame in [
+                sup_frame(1_000_000_000, Some(2_000_000_000), true),
+                sup_frame(replace_ns, Some(4_000_000_000), true),
+            ] {
+                writer.write_frame(&mut bytes, &frame, frame.pts).unwrap();
+            }
+            writer.finish(&mut bytes).unwrap();
+            assert_eq!(
+                sup_compositions(&bytes),
+                [
+                    (90_000, 1),
+                    (ns_to_90k(replace_ns), 1),
+                    (ns_to_90k(replace_ns + 4_000_000_000), 0)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn pgs_sup_legacy_duration_only_input_clears_before_a_later_display() {
+        let mut writer = PgsSupWriter::default();
+        let mut bytes = Vec::new();
+        for frame in [
+            sup_frame(0, Some(2_000_000_000), true),
+            sup_frame(3_600_000_000_000, Some(3_000_000_000), true),
+        ] {
+            writer.write_frame(&mut bytes, &frame, frame.pts).unwrap();
+        }
+        writer.finish(&mut bytes).unwrap();
+        assert_eq!(
+            sup_compositions(&bytes),
+            [(0, 1), (180_000, 0), (324_000_000, 1), (324_270_000, 0)]
+        );
+    }
+
+    #[test]
+    fn pgs_sup_clear_only_input_never_synthesizes_another_clear() {
+        for duration in [None, Some(0), Some(100_000), Some(5_000_000_000)] {
+            let mut writer = PgsSupWriter::default();
+            let mut bytes = Vec::new();
+            let frame = sup_frame(1_000_000_000, duration, false);
+            writer.write_frame(&mut bytes, &frame, frame.pts).unwrap();
+            writer.finish(&mut bytes).unwrap();
+            assert_eq!(sup_compositions(&bytes), [(90_000, 0)]);
+        }
+    }
+
+    #[test]
+    fn pgs_sup_continuation_does_not_cancel_or_create_a_pending_clear() {
+        let mut writer = PgsSupWriter::default();
+        let mut bytes = Vec::new();
+        let frame = sup_frame(1_000_000_000, Some(2_000_000_000), true);
+        writer.write_frame(&mut bytes, &frame, frame.pts).unwrap();
+        let mut continuation = sup_frame(2_000_000_000, Some(5_000_000_000), false);
+        continuation.data = vec![SEG_END, 0, 0];
+        writer
+            .write_frame(&mut bytes, &continuation, continuation.pts)
+            .unwrap();
+        writer.finish(&mut bytes).unwrap();
+        assert_eq!(sup_compositions(&bytes), [(90_000, 1), (270_000, 0)]);
+    }
+
+    #[test]
+    fn pgs_sup_finish_is_idempotent() {
+        let mut writer = PgsSupWriter::default();
+        let mut bytes = Vec::new();
+        let frame = sup_frame(0, Some(2_000_000_000), true);
+        writer.write_frame(&mut bytes, &frame, 0).unwrap();
+        writer.finish(&mut bytes).unwrap();
+        let once = bytes.clone();
+        writer.finish(&mut bytes).unwrap();
+        assert_eq!(bytes, once);
+    }
+
+    #[test]
+    fn pgs_sup_huge_duration_saturates_instead_of_wrapping_into_the_past() {
+        let mut writer = PgsSupWriter::default();
+        let mut bytes = Vec::new();
+        let frame = sup_frame(1_000_000_000, Some(u64::MAX), true);
+        writer.write_frame(&mut bytes, &frame, frame.pts).unwrap();
+        writer.finish(&mut bytes).unwrap();
+        assert_eq!(sup_compositions(&bytes), [(90_000, 1), (u32::MAX, 0)]);
+    }
+
+    #[test]
+    fn pgs_sup_truncated_segment_is_not_partially_written() {
+        for data in [&[SEG_PCS][..], &[SEG_PCS, 0], &[SEG_PCS, 0, 2, 0xff]] {
+            let mut bytes = Vec::new();
+            assert_eq!(
+                PgsSupWriter::emit_segments(data, 0, 0, &mut bytes).unwrap(),
+                0
+            );
+            assert!(bytes.is_empty());
+        }
     }
 
     #[test]
@@ -1419,6 +1609,7 @@ mod tests {
         let mut w = VobSubWriter::new(idx.clone(), Some(b"palette: 000000, ffffff"), "eng");
         let mut sub = Vec::new();
         let f1 = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1428,6 +1619,7 @@ mod tests {
             duration_ns: None,
         };
         let f2 = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1556,6 +1748,7 @@ mod tests {
         );
 
         let vid = |pts: i64, data: u8| PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 1, // VIDEO is track 1 here
@@ -1598,6 +1791,7 @@ mod tests {
 
         // Video frame (track 0) and audio frame (track 1).
         sink.write(&PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1608,6 +1802,7 @@ mod tests {
         })
         .unwrap();
         sink.write(&PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 1,
@@ -1642,6 +1837,7 @@ mod tests {
         };
         let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
         sink.write(&PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 1,
@@ -1695,6 +1891,7 @@ mod tests {
         // Frames far before the first IN mark: the plan places none of them.
         for (i, pts) in [0i64, 1_000_000_000].iter().enumerate() {
             let f = PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: 0,
@@ -1747,6 +1944,7 @@ mod tests {
         // Two frames before the first IN mark (dropped) …
         for (i, pts) in [0i64, 1_000_000_000].iter().enumerate() {
             let f = PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: 0,
@@ -1760,6 +1958,7 @@ mod tests {
         // … and one frame inside the first clip (150 s, in ns) that DOES persist,
         // so frames_mapped > 0 while seam_dropped (2) still exceeds it (1).
         let inside = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -1828,6 +2027,7 @@ mod tests {
         // video track has no file — these drops are not this export's shortfall.
         for (i, pts) in [0i64, 1_000_000_000].iter().enumerate() {
             let f = PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: 0,
@@ -1842,6 +2042,7 @@ mod tests {
         Stream::write(
             &mut sink,
             &PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: 1,
@@ -2016,6 +2217,7 @@ mod tests {
         };
         let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
         sink.write(&PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,

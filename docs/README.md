@@ -10,6 +10,7 @@ Technical documentation for [libfreemkv](https://github.com/freemkv/libfreemkv),
 
 | Document | What it covers |
 |----------|---------------|
+| [FFmpeg QA validation](ffmpeg-validation.md) | Synthetic decoder interoperability gate, regressions, licensing |
 | [Architecture](architecture.md) | Module map, design principles, error codes, platform support |
 | [Drive Access](drive-access.md) | Drive, SCSI transport, profiles, unlock, why raw mode is needed |
 | [Rip Recovery](rip-recovery.md) | What this crate owns of the recovery model: single-shot Drive::read, SenseFamily, DiscStream batch halving (the strategy itself moved to freemkv-engine in 1.6.0) |

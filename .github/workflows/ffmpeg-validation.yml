@@ -1,0 +1,56 @@
+name: FFmpeg validation
+
+# Called by qa.yml on pushes to qa, or manually for a development branch.
+# Pure Rust tests remain in dev CI; these tests require external codecs.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      FREEMKV_FFMPEG_ARTIFACT_DIR: ${{ github.workspace }}/ffmpeg-artifacts
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: libfreemkv
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+        with:
+          checkout: freemkv-unlock
+      - name: Read the crate's MSRV
+        id: msrv
+        working-directory: libfreemkv
+        run: echo "v=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.v }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: libfreemkv
+      - name: Install software encoders and decoders
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Record tool versions
+        run: |
+          mkdir -p "$FREEMKV_FFMPEG_ARTIFACT_DIR"
+          ffmpeg -version > "$FREEMKV_FFMPEG_ARTIFACT_DIR/ffmpeg-version.txt"
+          ffprobe -version > "$FREEMKV_FFMPEG_ARTIFACT_DIR/ffprobe-version.txt"
+          rustc --version > "$FREEMKV_FFMPEG_ARTIFACT_DIR/rustc-version.txt"
+      - name: Generate fixtures and validate libfreemkv output
+        working-directory: libfreemkv
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release --lib ffmpeg_ -- --ignored --nocapture 2>&1 | tee "$FREEMKV_FFMPEG_ARTIFACT_DIR/tests.log"
+      - name: Upload fixtures, probes, hashes and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.FREEMKV_FFMPEG_ARTIFACT_DIR }}
+          if-no-files-found: warn
+          retention-days: 14

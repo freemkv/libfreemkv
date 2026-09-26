@@ -770,9 +770,21 @@ fn track_vint(track_num: usize) -> ([u8; 3], usize) {
 
 impl<W: Write + Seek> MkvMuxer<W> {
     /// Create a new MKV muxer: writes EBML header, Segment start, Info, Tracks, Chapters.
+    #[cfg(test)]
     pub fn new(
+        writer: W,
+        tracks: &[MkvTrack],
+        title: Option<&str>,
+        duration_secs: f64,
+        chapters: &[Chapter],
+    ) -> io::Result<Self> {
+        Self::new_with_timing(writer, tracks, &[], title, duration_secs, chapters)
+    }
+
+    pub(crate) fn new_with_timing(
         mut writer: W,
         tracks: &[MkvTrack],
+        timings: &[crate::pes::TrackTiming],
         title: Option<&str>,
         duration_secs: f64,
         chapters: &[Chapter],
@@ -888,6 +900,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
             ebml::write_uint(&mut writer, ebml::TRACK_NUMBER, (i + 1) as u64)?;
             ebml::write_uint(&mut writer, ebml::TRACK_UID, track_uid)?;
             ebml::write_uint(&mut writer, ebml::TRACK_TYPE, track.track_type)?;
+            if let Some(timing) = timings.get(i) {
+                if timing.codec_delay_ns > 0 {
+                    ebml::write_uint(&mut writer, 0x56AA, timing.codec_delay_ns)?;
+                }
+                if timing.seek_preroll_ns > 0 {
+                    ebml::write_uint(&mut writer, 0x56BB, timing.seek_preroll_ns)?;
+                }
+            }
+
             ebml::write_uint(&mut writer, ebml::FLAG_LACING, 0)?;
             ebml::write_string(&mut writer, ebml::CODEC_ID, track.codec_id)?;
             ebml::write_string(&mut writer, ebml::LANGUAGE, &track.language)?;
@@ -1197,7 +1218,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// removed at the right time); otherwise a plain `SimpleBlock`.
     ///
     /// TEST-ONLY wrapper over [`MkvMuxer::write_frame_at`] — production
-    /// always calls `write_frame_at` directly.
+    /// calls `write_frame_at_with_padding` to preserve container trimming.
     #[cfg(test)]
     pub fn write_frame(
         &mut self,
@@ -1230,6 +1251,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// keyframe. `None` for non-3D. See docs/mkv-mux.md — write_frame_at
     /// seam/MVC BlockAdditional rationale.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn write_frame_at(
         &mut self,
         track_idx: usize,
@@ -1240,6 +1262,32 @@ impl<W: Write + Seek> MkvMuxer<W> {
         block_additional: Option<&[u8]>,
         src_byte: Option<u64>,
         scan_progressive: Option<bool>,
+    ) -> io::Result<()> {
+        self.write_frame_at_with_padding(
+            track_idx,
+            pts_ns,
+            keyframe,
+            data,
+            duration_ns,
+            block_additional,
+            src_byte,
+            scan_progressive,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_frame_at_with_padding(
+        &mut self,
+        track_idx: usize,
+        pts_ns: i64,
+        keyframe: bool,
+        data: &[u8],
+        duration_ns: Option<u64>,
+        block_additional: Option<&[u8]>,
+        src_byte: Option<u64>,
+        scan_progressive: Option<bool>,
+        discard_padding_ns: i64,
     ) -> io::Result<()> {
         // --log-level 3: capture the first ~100 coded frames per track to the side file
         // BEFORE any timeline mangling, with the parser's own PTS, so an opening-GOP
@@ -1413,30 +1461,48 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     .unwrap_or(0),
             )
         };
-        match block_additional {
-            // MVC: base view Block + dependent-view BlockAdditional, always a BlockGroup;
-            // non-keyframe base frames get a ReferenceBlock so a player never treats
-            // a P/B frame as a seek point.
-            Some(additional) => {
-                self.write_block_group_mvc(
-                    track_idx + 1,
-                    relative_ts,
-                    data,
-                    additional,
-                    reference,
-                    duration_ticks,
-                )?;
+        if discard_padding_ns != 0 {
+            let mut buf = std::mem::take(&mut self.block_group_buf);
+            buf.clear();
+            let result = Self::build_block_group(
+                &mut buf,
+                track_idx + 1,
+                relative_ts,
+                data,
+                reference,
+                duration_ticks,
+                block_additional,
+                discard_padding_ns,
+            )
+            .and_then(|()| self.writer.write_all(&buf));
+            self.block_group_buf = buf;
+            result?;
+        } else {
+            match block_additional {
+                // MVC: base view Block + dependent-view BlockAdditional, always a BlockGroup;
+                // non-keyframe base frames get a ReferenceBlock so a player never treats
+                // a P/B frame as a seek point.
+                Some(additional) => {
+                    self.write_block_group_mvc(
+                        track_idx + 1,
+                        relative_ts,
+                        data,
+                        additional,
+                        reference,
+                        duration_ticks,
+                    )?;
+                }
+                None => match duration_ticks {
+                    // BlockDuration present (PGS subtitles, AC-3 audio, and EVERY
+                    // MPEG-2 video frame) → BlockGroup.
+                    Some(dt) => {
+                        self.write_block_group(track_idx + 1, relative_ts, data, reference, dt)?;
+                    }
+                    None => {
+                        self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
+                    }
+                },
             }
-            None => match duration_ticks {
-                // BlockDuration present (PGS subtitles, AC-3 audio, and EVERY
-                // MPEG-2 video frame) → BlockGroup.
-                Some(dt) => {
-                    self.write_block_group(track_idx + 1, relative_ts, data, reference, dt)?;
-                }
-                None => {
-                    self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
-                }
-            },
         }
         // Recorded per track (not a single global slot) so a later non-keyframe
         // references a keyframe on its OWN track — a shared slot produced cross-track
@@ -1852,6 +1918,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             reference,
             Some(duration_ticks),
             None,
+            0,
         )
         .and_then(|()| self.writer.write_all(&buf));
         // Hand the (now grown) scratch buffer back so the next frame reuses the
@@ -1863,6 +1930,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
     // Assemble a complete BlockGroup into `buf` (one write_all at the call
     // site, no seek). `additional` = Some(dependent AU) for MVC, appending
     // BlockAdditions > BlockMore { BlockAddID=2, BlockAdditional }.
+    #[allow(clippy::too_many_arguments)]
     fn build_block_group(
         buf: &mut Vec<u8>,
         track_num: usize,
@@ -1871,6 +1939,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         reference: Option<i64>,
         duration_ticks: Option<u64>,
         additional: Option<&[u8]>,
+        discard_padding_ns: i64,
     ) -> io::Result<()> {
         let (tv, tv_len) = track_vint(track_num);
         let track_vint = &tv[..tv_len];
@@ -1887,6 +1956,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         buf.extend_from_slice(&relative_ts.to_be_bytes());
         buf.push(flags);
         buf.extend_from_slice(data);
+        if discard_padding_ns != 0 {
+            ebml::write_int(buf, 0x75A2, discard_padding_ns)?;
+        }
         if let Some(dt) = duration_ticks {
             ebml::write_uint(buf, ebml::BLOCK_DURATION, dt)?;
         }
@@ -1927,6 +1999,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             reference,
             duration_ticks,
             Some(additional),
+            0,
         )
         .and_then(|()| self.writer.write_all(&buf));
         self.block_group_buf = buf;
@@ -2116,6 +2189,7 @@ mod tests {
         // 5 audio frames arrive first (realistic pre-video buffering).
         for i in 0..5u32 {
             let f = crate::pes::PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: 1,
@@ -2129,6 +2203,7 @@ mod tests {
         // Then the true video keyframe — duration-bearing, as MPEG-2 always is,
         // so it is written as a BlockGroup (where the keyframe bit is reserved).
         let vf = crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -2148,6 +2223,18 @@ mod tests {
         assert!(
             f0.keyframe,
             "video keyframe written with 5 audio frames ahead of it must read back keyframe=true"
+        );
+        for i in 0..5 {
+            let audio = crate::pes::Stream::read(&mut r)
+                .unwrap()
+                .expect("buffered audio must survive");
+            assert_eq!(audio.track, 1);
+            assert_eq!(audio.pts, i * 32_000_000);
+            assert_eq!(audio.data, vec![0xCC; 768]);
+        }
+        assert!(
+            crate::pes::Stream::read(&mut r).unwrap().is_none(),
+            "trigger frame must not be duplicated"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

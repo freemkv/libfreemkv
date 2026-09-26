@@ -198,6 +198,7 @@ mod tests {
         let mut stream = M2tsStream::create(sink, &title).unwrap();
         stream
             .write(&PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: 0,
@@ -241,6 +242,7 @@ mod tests {
         let mut stream = M2tsStream::create(sink, &title).unwrap();
         stream
             .write(&PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: 0,
@@ -267,6 +269,7 @@ mod tests {
         let sink = SharedSink(shared.clone());
         let mut stream = M2tsStream::create(sink, &title).unwrap();
         let frame = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,

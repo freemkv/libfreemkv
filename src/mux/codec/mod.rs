@@ -11,6 +11,7 @@
 pub mod ac3;
 
 pub mod adts;
+mod audio_frames;
 /// Codec-agnostic per-picture coding carrier (`PictureInfo` + accessors).
 pub mod coding;
 /// DTS / DTS-HD elementary-stream parser.

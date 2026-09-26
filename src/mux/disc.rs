@@ -851,6 +851,7 @@ impl crate::pes::Stream for DiscStream {
                             // pass raw PES bytes through as one PesFrame, so we
                             // can attribute time to demux+framing vs codec parse.
                             self.pending_frames.push_back(crate::pes::PesFrame {
+                                discard_padding_ns: 0,
                                 coding: None,
                                 source: None,
                                 track,
@@ -2175,6 +2176,7 @@ mod tests {
         fn write_refuses_with_the_read_only_code() {
             let mut s = short_read_stream(false);
             let frame = crate::pes::PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: 0,

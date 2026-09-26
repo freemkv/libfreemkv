@@ -423,6 +423,7 @@ mod tests {
     fn vframe(coding: Option<PictureInfo>, pts: i64, source: Option<SourcePos>) -> PesFrame {
         let keyframe = coding.map(|c| c.keyframe()).unwrap_or(false);
         PesFrame {
+            discard_padding_ns: 0,
             track: 0,
             pts,
             keyframe,

@@ -104,6 +104,13 @@ jobs:
       - run: cargo test --release --tests
         working-directory: libfreemkv
 
+  # Independent decoder/remux verification uses generated media and belongs
+  # on qa, alongside the release suite. Also runnable manually on a branch.
+  ffmpeg-validation:
+    uses: ./.github/workflows/ffmpeg-validation.yml
+    permissions:
+      contents: read
+
   # clippy's output is target-dependent: cfg-gated code only gets linted on
   # the target it compiles for. Linting solely on the dev machine's host
   # target is how a lint that CI rejects reaches a push.

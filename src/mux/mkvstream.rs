@@ -134,6 +134,7 @@ enum WriteMode {
 struct PendingMux {
     writer: Box<dyn WriteSeek + Send>,
     tracks: Vec<MkvTrack>,
+    timings: Vec<crate::pes::TrackTiming>,
     /// Index of the primary (first) video track, if any — the track whose
     /// `FieldOrder` is set from the first coded picture's measured coding.
     video_track: Option<usize>,
@@ -294,7 +295,7 @@ fn emit_to_muxer(
     frame: &crate::pes::PesFrame,
     additional: Option<&[u8]>,
 ) -> io::Result<()> {
-    m.write_frame_at(
+    m.write_frame_at_with_padding(
         frame.track,
         frame.pts,
         frame.keyframe,
@@ -305,6 +306,7 @@ fn emit_to_muxer(
         frame.source.map(|s| s.byte),
         // This picture's measured scan type, tallied for the FlagInterlaced majority.
         frame.coding.as_ref().and_then(|c| c.progressive()),
+        frame.discard_padding_ns,
     )
 }
 
@@ -434,6 +436,7 @@ impl MkvStream {
             disc_title: title.clone(),
             mvc,
             mode: Mode::Write(WriteMode::Pending(Box::new(PendingMux {
+                timings: vec![crate::pes::TrackTiming::default(); tracks.len()],
                 writer,
                 tracks,
                 video_track,
@@ -484,9 +487,10 @@ impl MkvStream {
         for (i, track) in pending.tracks.iter().enumerate() {
             crate::diag::dump_mkv_track((i + 1) as u64, track);
         }
-        let mut muxer = MkvMuxer::new(
+        let mut muxer = MkvMuxer::new_with_timing(
             pending.writer,
             &pending.tracks,
+            &pending.timings,
             Some(&self.disc_title.playlist),
             self.disc_title.duration_secs,
             &self.disc_title.chapters,
@@ -500,7 +504,7 @@ impl MkvStream {
             // Provenance must survive the replay: these pre-muxer frames still carry
             // the byte offset they were read from — dropping it here would fall back
             // to the timestamp heuristic this change set exists to stop relying on.
-            muxer.write_frame_at(
+            muxer.write_frame_at_with_padding(
                 f.track,
                 f.pts,
                 f.keyframe,
@@ -509,6 +513,7 @@ impl MkvStream {
                 additional.as_deref(),
                 f.source.map(|s| s.byte),
                 f.coding.as_ref().and_then(|c| c.progressive()),
+                f.discard_padding_ns,
             )?;
         }
         self.mode = Mode::Write(WriteMode::Active(Box::new(muxer)));
@@ -544,6 +549,16 @@ impl MkvStream {
             _ => unreachable!("guarded above"),
         };
         if activate_now {
+            // The first video keyframe must open a cluster BEFORE replaying
+            // audio already buffered while its parser assembled the opening GOP.
+            // Replaying the audio first made the muxer drop that entire prefix.
+            if use_coding && frame.keyframe {
+                if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
+                    p.buffered
+                        .insert(0, (frame.clone(), additional.map(<[u8]>::to_vec)));
+                }
+                return self.activate(frame.coding, true);
+            }
             // Pass the trigger frame's coding only when it IS the video frame; a
             // cap-triggered build never saw the video frame, so nothing measured
             // is passed (apply_coding_to_track then logs + leaves UNDETERMINED).
@@ -707,6 +722,7 @@ impl crate::pes::Stream for MkvStream {
                     // presence — SimpleBlock's 0x80 bit is reserved (always 0) here,
                     // so reading it broke every MPEG-2 frame (always this path).
                     let mut has_reference = false;
+                    let mut discard_padding_ns = 0i64;
                     while remaining > 0 {
                         let (cid, cs, hlen) = ebml::read_element_header(&mut rs.reader)?;
                         if cs == u64::MAX {
@@ -725,6 +741,14 @@ impl crate::pes::Stream for MkvStream {
                                     &mut rs.reader,
                                     checked_size(cs, MAX_BLOCK_SIZE)?,
                                 )?);
+                            }
+                            0x75A2 => {
+                                if cs == 0 || cs > 8 {
+                                    return Err(crate::error::Error::MkvSourceInvalid.into());
+                                }
+                                let raw = read_uint_bounded(&mut rs.reader, cs)?;
+                                let shift = 64 - cs * 8;
+                                discard_padding_ns = ((raw << shift) as i64) >> shift;
                             }
                             ebml::BLOCK_DURATION => {
                                 duration_ms = Some(read_uint_bounded(&mut rs.reader, cs)?);
@@ -774,10 +798,17 @@ impl crate::pes::Stream for MkvStream {
                         // Override the flag-bit guess from `parse_block`
                         // (meaningful for SimpleBlock only) with the
                         // BlockGroup's authoritative signal.
-                        rs.pending.extend(frames.into_iter().map(|mut f| {
-                            f.keyframe = !has_reference;
-                            f
-                        }));
+                        let last = frames.len().saturating_sub(1);
+                        rs.pending
+                            .extend(frames.into_iter().enumerate().map(|(i, mut f)| {
+                                if (discard_padding_ns > 0 && i == last)
+                                    || (discard_padding_ns < 0 && i == 0)
+                                {
+                                    f.discard_padding_ns = discard_padding_ns;
+                                }
+                                f.keyframe = !has_reference;
+                                f
+                            }));
                         if let Some(frame) = rs.pending.pop_front() {
                             return Ok(Some(frame));
                         }
@@ -850,6 +881,38 @@ impl crate::pes::Stream for MkvStream {
 
     fn info(&self) -> &crate::disc::DiscTitle {
         &self.disc_title
+    }
+
+    fn track_timing(&self, track: usize) -> crate::pes::TrackTiming {
+        match &self.mode {
+            Mode::Read(rs) => rs.tracks.timings.get(track).copied().unwrap_or_default(),
+            _ => Default::default(),
+        }
+    }
+
+    fn set_track_timing(
+        &mut self,
+        track: usize,
+        timing: crate::pes::TrackTiming,
+    ) -> io::Result<()> {
+        if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
+            let mapped = if let Some(m) = &self.mvc {
+                let Some(mapped) = m.stream_to_track.get(track).copied().flatten() else {
+                    return Ok(());
+                };
+                mapped
+            } else {
+                track
+            };
+            if let Some(t) = p.timings.get_mut(mapped) {
+                *t = timing;
+            }
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "track timing must be set before writing frames",
+            ))
+        }
     }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
@@ -985,13 +1048,14 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
                     }
                     remaining -= consumed;
                     if cid == ebml::TRACK_ENTRY {
-                        let (stream, tnum, cp, default_dur) = parse_track(r, cs)?;
+                        let (stream, tnum, cp, default_dur, timing) = parse_track(r, cs)?;
                         if let Some(s) = stream {
                             // Record the TrackNumber alongside the stream it maps
                             // to, in the SAME order, so block routing never has to
                             // guess that TrackNumbers are 1..=N.
                             streams.push(s);
                             tracks.push(tnum, default_dur);
+                            *tracks.timings.last_mut().unwrap() = timing;
                         }
                         if let Some(cp) = cp {
                             codec_privates.push((tnum, cp));
@@ -1057,6 +1121,7 @@ type ParsedTrack = (
     u16,
     Option<Vec<u8>>,
     Option<u64>,
+    crate::pes::TrackTiming,
 );
 
 /// Returns (stream, track_number, codec_private_bytes, default_duration_ns)
@@ -1067,6 +1132,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     /// would only skew laced-frame spacing, so treat it as absent.
     const MAX_DEFAULT_DURATION_NS: u64 = 60 * 1_000_000_000;
     let mut default_dur: Option<u64> = None;
+    let mut timing = crate::pes::TrackTiming::default();
     let (mut codec_id, mut lang, mut name) = (String::new(), String::from("und"), String::new());
     let (mut ph, mut sr, mut ch, mut forced) = (0u32, 0.0f64, 0u8, false);
     let mut codec_priv: Option<Vec<u8>> = None;
@@ -1100,6 +1166,8 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
                 let ns = read_uint_bounded(r, cs)?;
                 default_dur = (ns > 0 && ns <= MAX_DEFAULT_DURATION_NS).then_some(ns);
             }
+            0x56AA => timing.codec_delay_ns = read_uint_bounded(r, cs)?,
+            0x56BB => timing.seek_preroll_ns = read_uint_bounded(r, cs)?,
             ebml::CODEC_ID => codec_id = read_string_bounded(r, cs)?,
             ebml::CODEC_PRIVATE => {
                 codec_priv = Some(ebml::read_binary_val(
@@ -1255,7 +1323,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         })),
         _ => None,
     };
-    Ok((stream, tnum, codec_priv, default_dur))
+    Ok((stream, tnum, codec_priv, default_dur, timing))
 }
 
 // Read-side map from Matroska TrackNumber to the index of the corresponding
@@ -1270,11 +1338,13 @@ struct TrackTable {
     /// Used to space the frames of a LACED Block, whose second and later frames
     /// carry an "underdetermined" timestamp per RFC 9559 §10.3.5.
     default_durations: Vec<Option<u64>>,
+    timings: Vec<crate::pes::TrackTiming>,
 }
 
 impl TrackTable {
     fn push(&mut self, num: u16, default_duration_ns: Option<u64>) {
         self.nums.push(num);
+        self.timings.push(Default::default());
         self.default_durations.push(default_duration_ns);
     }
 
@@ -1300,6 +1370,7 @@ impl TrackTable {
         Self {
             nums: (1..=n as u16).collect(),
             default_durations: vec![None; n],
+            timings: vec![Default::default(); n],
         }
     }
 }
@@ -1469,6 +1540,7 @@ fn parse_block(
     let lacing = (flags & LACING_MASK) >> 1;
     if lacing == LACING_NONE {
         return Ok(vec![crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: track_idx,
@@ -1523,6 +1595,7 @@ fn parse_block(
             .saturating_mul(i as u64)
             .min(i64::MAX as u64) as i64;
         out.push(crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: track_idx,
@@ -1604,6 +1677,7 @@ mod tests {
 
     fn mvc_frame(track: usize, pts: i64, keyframe: bool, data: Vec<u8>) -> crate::pes::PesFrame {
         crate::pes::PesFrame {
+            discard_padding_ns: 0,
             track,
             pts,
             keyframe,
@@ -2501,6 +2575,7 @@ mod tests {
             TrackTable {
                 nums: vec![65535],
                 default_durations: vec![None],
+                timings: vec![Default::default()],
             }
             .index_of(65535),
             Some(0),
@@ -3605,6 +3680,7 @@ mod tests {
         ];
         for (pts, keyframe, data) in &frames {
             s.write(&crate::pes::PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: 0,
@@ -3846,6 +3922,7 @@ mod tests {
         let title = three_track_title();
         let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
         s.write(&crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -3910,6 +3987,7 @@ mod tests {
         let out2 = SharedOut::new();
         let mut s = MkvStream::create(Box::new(out2.clone()), &relaxed, None).unwrap();
         s.write(&crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -4093,6 +4171,7 @@ mod tests {
         let out = SharedOut::new();
         let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
         s.write(&crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: Some(PictureInfo::mpeg2(
                 CodingType::I,
                 Mpeg2Coding {
@@ -4171,6 +4250,7 @@ mod tests {
         let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
         // First picture: a lone progressive leader.
         s.write(&crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: pic(true, CodingType::I),
             source: None,
             track: 0,
@@ -4183,6 +4263,7 @@ mod tests {
         // The feature itself: genuinely interlaced pictures dominate.
         for i in 1..6 {
             s.write(&crate::pes::PesFrame {
+                discard_padding_ns: 0,
                 coding: pic(false, CodingType::P),
                 source: None,
                 track: 0,
@@ -4242,6 +4323,7 @@ mod tests {
         let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
         // First picture: interlaced (TFF) → provisional interlaced + FieldOrder written.
         s.write(&crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: pic(false, CodingType::I),
             source: None,
             track: 0,
@@ -4254,6 +4336,7 @@ mod tests {
         // The feature itself: progressive pictures dominate.
         for i in 1..6 {
             s.write(&crate::pes::PesFrame {
+                discard_padding_ns: 0,
                 coding: pic(true, CodingType::P),
                 source: None,
                 track: 0,
@@ -4321,6 +4404,7 @@ mod tests {
         let scans = [true, true, false, false];
         for (i, prog) in scans.iter().enumerate() {
             s.write(&crate::pes::PesFrame {
+                discard_padding_ns: 0,
                 coding: pic(*prog, if i == 0 { CodingType::I } else { CodingType::P }),
                 source: None,
                 track: 0,
@@ -4381,6 +4465,7 @@ mod tests {
         // Audio arrives first and carries NO coding — it must be buffered, not
         // used to build the header.
         s.write(&crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -4392,6 +4477,7 @@ mod tests {
         .unwrap();
         // The first coded picture on the VIDEO track measures top-field-first.
         s.write(&crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: Some(PictureInfo::mpeg2(
                 CodingType::I,
                 Mpeg2Coding {
@@ -4806,6 +4892,7 @@ mod tests {
         let title = h264_title();
         let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
         s.write(&crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -4827,5 +4914,74 @@ mod tests {
             "and the readiness claim is honest: the codec private IS available \
              before any frame has been read"
         );
+    }
+    #[test]
+    fn container_timing_and_signed_padding_survive_roundtrip() {
+        for padding in [-10_666_667, 0, 10_666_667] {
+            let out = SharedOut::new();
+            let title = h264_title();
+            let timing = crate::pes::TrackTiming {
+                codec_delay_ns: 5_333_333,
+                seek_preroll_ns: 80_000_000,
+            };
+            let mut writer = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+            writer.set_track_timing(0, timing).unwrap();
+            let mut frame = mvc_frame(0, 0, true, vec![1, 2, 3]);
+            frame.discard_padding_ns = padding;
+            writer.write(&frame).unwrap();
+            assert!(writer.set_track_timing(0, timing).is_err());
+            writer.finish().unwrap();
+            let mut reader = MkvStream::open(Cursor::new(out.bytes())).unwrap();
+            assert_eq!(reader.track_timing(0), timing);
+            assert_eq!(reader.track_timing(1), Default::default());
+            let back = reader.read().unwrap().unwrap();
+            assert_eq!(back.discard_padding_ns, padding);
+            assert_eq!(back.data, frame.data);
+            assert!(reader.read().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn laced_padding_applies_only_to_the_appropriate_edge_frame() {
+        for padding in [-1_000_000i64, 1_000_000] {
+            let mut cluster = Vec::new();
+            ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+            ebml::write_unknown_size(&mut cluster).unwrap();
+            ebml::write_uint(&mut cluster, ebml::CLUSTER_TIMESTAMP, 0).unwrap();
+            let mut group = Vec::new();
+            // Fixed lace: two one-byte frames.
+            ebml::write_binary(&mut group, ebml::BLOCK, &[0x81, 0, 0, 4, 1, 0xaa, 0xbb]).unwrap();
+            ebml::write_int(&mut group, 0x75A2, padding).unwrap();
+            ebml::write_binary(&mut cluster, ebml::BLOCK_GROUP, &group).unwrap();
+            let bytes = mkv_with_tracks_and_cluster(
+                &[TrackSpec::new(1, 2).with_default_duration(32_000_000)],
+                &cluster,
+            );
+            let frames = drain(&mut MkvStream::open(Cursor::new(bytes)).unwrap());
+            assert_eq!(frames.len(), 2);
+            assert_eq!(
+                frames[0].discard_padding_ns,
+                if padding < 0 { padding } else { 0 }
+            );
+            assert_eq!(
+                frames[1].discard_padding_ns,
+                if padding > 0 { padding } else { 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_discard_padding_size_is_rejected() {
+        for size in [0, 9] {
+            let mut cluster = Vec::new();
+            ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+            ebml::write_unknown_size(&mut cluster).unwrap();
+            let mut group = Vec::new();
+            ebml::write_binary(&mut group, ebml::BLOCK, &[0x81, 0, 0, 0, 0xaa]).unwrap();
+            ebml::write_binary(&mut group, 0x75A2, &vec![0; size]).unwrap();
+            ebml::write_binary(&mut cluster, ebml::BLOCK_GROUP, &group).unwrap();
+            let bytes = mkv_with_tracks_and_cluster(&[TrackSpec::new(1, 2)], &cluster);
+            assert!(MkvStream::open(Cursor::new(bytes)).unwrap().read().is_err());
+        }
     }
 }

@@ -658,7 +658,11 @@ fn drive_mux(
     let num_streams = info.streams.len();
 
     // ── Open the sink, wrap in a byte counter, hand it to the write pipeline ──
-    let output_stream = CountingStream::new(output(dest_url, &out_title, source)?);
+    let mut output_stream = output(dest_url, &out_title, source)?;
+    for track in 0..num_streams {
+        output_stream.set_track_timing(track, stream.track_timing(track))?;
+    }
+    let output_stream = CountingStream::new(output_stream);
     events.on_output_opened(&out_title);
 
     // The write consumer runs on its own thread so the latency-bound sink write
@@ -888,6 +892,7 @@ mod tests {
         fn with_frames(mut self, n: usize) -> Self {
             for i in 0..n {
                 self.frames.push_back(PesFrame {
+                    discard_padding_ns: 0,
                     track: 0,
                     pts: i as i64,
                     keyframe: true,
@@ -1958,6 +1963,7 @@ mod tests {
         fs.read_observer = Some(reads_seen.clone());
         for i in 0..MANY {
             fs.frames.push_back(PesFrame {
+                discard_padding_ns: 0,
                 track: 0,
                 pts: i as i64,
                 keyframe: true,

@@ -5,13 +5,15 @@
 //!
 //! Subtitle display lifecycle (BD spec): a "display" PCS
 //! (number_of_composition_objects > 0) starts a visible subtitle, and a
-//! later "empty" PCS (== 0) clears it. For Matroska output we collapse that
-//! pair into one block with `BlockDuration` set to (clear_pts - display_pts).
-// See docs/pgs.md — why a missing BlockDuration makes hardware players linger.
+//! later "empty" PCS (== 0) clears it. Preserve BOTH display sets: some
+//! decoders rely on the empty PCS + END even when Matroska carries a duration.
+//! Also set the visible block's `BlockDuration` to (clear_pts - display_pts).
+// See docs/pgs.md for decoder and remux interoperability.
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 const SEGMENT_PCS: u8 = 0x16;
+const SEGMENT_END: u8 = 0x80;
 // Upper bound on a pending display set's bytes (real sets are well under 1 MB).
 // Caps a malformed stream that appends non-PCS segments forever without a PCS,
 // dropping further appends until the next PCS resyncs — mirrors DTS/AC-3 caps.
@@ -188,12 +190,12 @@ impl ForcedTracker {
     }
 }
 
-/// Stateful parser that collapses PGS display/clear PCS pairs into
-/// duration-bearing Matroska frames. Implements [`CodecParser`].
+/// Stateful parser that preserves PGS display and clear sets, adding durations
+/// to visible subtitles. Implements [`CodecParser`].
 pub struct PgsParser {
     /// The display set being accumulated, with the facts of the PES that
     /// STARTED it. A set spans PES packets — it opens on a display PCS and
-    /// closes on the next one — so its timestamp and its source offset are the
+    /// closes on the next one (or END for a clear) — so its timestamp and source are the
     /// opening packet's, never the closing packet's. Same rule the other
     /// buffering parsers get from `PesBuf::front`.
     pending: Option<(super::pesbuf::PesFacts, Vec<u8>)>,
@@ -211,17 +213,48 @@ impl PgsParser {
         Self { pending: None }
     }
 
-    // Emit the pending display set as a Frame from its start PTS to
-    // `end_pts_ns`, clamped to >= 0. Shared by the clear-PCS and replace-PCS
-    // arms so the Frame shape stays in one place.
-    fn emit_pending(&mut self, end_pts_ns: i64) -> Option<Frame> {
+    fn is_clear(data: &[u8]) -> bool {
+        data.first() == Some(&SEGMENT_PCS) && data.get(PCS_NUM_OBJECTS_OFFSET) == Some(&0)
+    }
+
+    // Clear sets must include END: it is what makes a decoder apply the empty
+    // composition. Walk segment lengths, never search bitmap/palette bytes for
+    // 0x80. END can arrive in a later PES without its own timestamp.
+    fn complete_clear_pts(&self) -> Option<i64> {
+        let (facts, data) = self.pending.as_ref()?;
+        if !Self::is_clear(data) {
+            return None;
+        }
+        let mut rest = data.as_slice();
+        while rest.len() >= 3 {
+            let size = 3 + usize::from(u16::from_be_bytes([rest[1], rest[2]]));
+            if size > rest.len() {
+                return None;
+            }
+            if rest[0] == SEGMENT_END && size == 3 && rest.len() == 3 {
+                return facts.presentation_ns();
+            }
+            rest = &rest[size..];
+        }
+        None
+    }
+
+    // One emission path for clear, replacement, malformed input and EOF.
+    // Missing end times use the existing fallback only for visible sets.
+    fn emit_pending(&mut self, end_pts_ns: Option<i64>) -> Option<Frame> {
         let (facts, data) = self.pending.take()?;
         let start_pts = facts.presentation_ns().unwrap_or(0);
-        let computed = end_pts_ns.saturating_sub(start_pts).max(0) as u64;
+        let computed = end_pts_ns
+            .map(|end| end.saturating_sub(start_pts).max(0) as u64)
+            .unwrap_or(DEFAULT_PGS_DURATION_NS);
         // Trust the real computed span, but clamp a pathologically large one (a
         // missing intermediate PCS makes one set look like it lingered for
         // minutes) back to the fallback dwell rather than emit an absurd cue.
-        let duration = if computed > MAX_PGS_DURATION_NS {
+        let duration = if Self::is_clear(&data) {
+            // A clear is an instantaneous state change, not a visible cue.
+            // The MKV writer rounds this up to its minimum duration tick.
+            0
+        } else if computed > MAX_PGS_DURATION_NS {
             DEFAULT_PGS_DURATION_NS
         } else {
             computed
@@ -252,23 +285,9 @@ impl CodecParser for PgsParser {
 
         // A PCS too short for number_of_composition_objects is malformed. Don't
         // let it fall to the non-PCS arm (would pollute the pending set): close
-        // any pending set undurated and drop the header to resync on next PCS.
+        // any pending set with a fallback and drop the header to resync on next PCS.
         if is_pcs && pes.data.len() <= PCS_NUM_OBJECTS_OFFSET {
-            return self
-                .pending
-                .take()
-                .map(|(facts, data)| {
-                    vec![Frame {
-                        discontinuity: false,
-                        coding: None,
-                        source: facts.source,
-                        pts_ns: facts.presentation_ns().unwrap_or(0),
-                        keyframe: true,
-                        data,
-                        duration_ns: Some(DEFAULT_PGS_DURATION_NS),
-                    }]
-                })
-                .unwrap_or_default();
+            return self.emit_pending(None).into_iter().collect();
         }
 
         let pcs_num_objects = if is_pcs {
@@ -279,30 +298,12 @@ impl CodecParser for PgsParser {
 
         let mut out = Vec::new();
         match pcs_num_objects {
-            // Clear/empty PCS closes any pending display; drop the segment
-            // itself (BlockDuration covers the wipe). No PTS means no
-            // duration, so the pending set is emitted lingering to EOF.
-            Some(0) => {
-                let frame = match pts {
-                    Some(end) => self.emit_pending(end),
-                    None => self.pending.take().map(|(facts, data)| Frame {
-                        discontinuity: false,
-                        coding: None,
-                        source: facts.source,
-                        pts_ns: facts.presentation_ns().unwrap_or(0),
-                        keyframe: true,
-                        data,
-                        duration_ns: Some(DEFAULT_PGS_DURATION_NS),
-                    }),
-                };
-                out.extend(frame);
-            }
-            // Display PCS — start a new pending. If a prior display
-            // was never explicitly cleared (replace-without-clear),
-            // emit it with the new PCS's PTS as its end.
+            // Every PCS starts a new set, including empty compositions. Keep
+            // the clear's following WDS/END with it, rather than emitting orphan
+            // packets that lose timing in FFmpeg's pgs_frame_merge filter.
             Some(_) => match pts {
                 Some(start) => {
-                    out.extend(self.emit_pending(start));
+                    out.extend(self.emit_pending(Some(start)));
                     // The set's facts are THIS packet's — the one that opened
                     // it. `start` is that packet's PTS by construction.
                     self.pending = Some((super::pesbuf::PesFacts::of(pes), pes.data.clone()));
@@ -312,19 +313,11 @@ impl CodecParser for PgsParser {
                         "the opening packet's PTS is the set's start"
                     );
                 }
-                // A display PCS with no PTS has an unknown start time. Don't
+                // A PCS with no PTS has an unknown start time. Don't
                 // store it with a 0 sentinel (wrong start, absurd duration).
-                // Flush any prior pending undurated and skip storing this one.
+                // Flush any prior pending with a fallback and skip this one.
                 None => {
-                    out.extend(self.pending.take().map(|(facts, data)| Frame {
-                        discontinuity: false,
-                        coding: None,
-                        source: facts.source,
-                        pts_ns: facts.presentation_ns().unwrap_or(0),
-                        keyframe: true,
-                        data,
-                        duration_ns: Some(DEFAULT_PGS_DURATION_NS),
-                    }));
+                    out.extend(self.emit_pending(None));
                 }
             },
             // Non-PCS first segment — either a continuation of the
@@ -361,25 +354,19 @@ impl CodecParser for PgsParser {
             }
         }
 
+        // No need to wait for the next (possibly hour-distant) subtitle to
+        // release a completed clear. Its timestamp is the opening PCS's PTS.
+        if let Some(pts) = self.complete_clear_pts() {
+            out.extend(self.emit_pending(Some(pts)));
+        }
         out
     }
 
     fn flush(&mut self) -> Vec<Frame> {
         // A display set is only emitted when the next PCS arrives; at EOS there
         // is no follower, so without this the last subtitle would be silently
-        // dropped. Emit it with no duration — it lingers to EOF (see module doc).
-        match self.pending.take() {
-            Some((facts, data)) => vec![Frame {
-                discontinuity: false,
-                coding: None,
-                source: facts.source,
-                pts_ns: facts.presentation_ns().unwrap_or(0),
-                keyframe: true,
-                data,
-                duration_ns: Some(DEFAULT_PGS_DURATION_NS),
-            }],
-            None => Vec::new(),
-        }
+        // dropped. Keep the fallback duration for a display with no known end.
+        self.emit_pending(None).into_iter().collect()
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
@@ -755,12 +742,16 @@ mod tests {
     // --- clear / replace edge cases ---
 
     #[test]
-    fn clear_with_no_pending_emits_nothing() {
-        // An empty PCS arriving with no pending display is a no-op.
+    fn clear_with_no_pending_is_preserved_until_end_or_flush() {
+        // Preserve a leading clear too: decoder state can outlive a seek.
         let mut parser = PgsParser::new();
         let f = parser.parse(&make_pes(pcs_bytes(0), Some(90000)));
-        assert!(f.is_empty(), "clear with nothing pending → no frame");
-        assert!(parser.pending.is_none());
+        assert!(f.is_empty(), "wait for the clear's END");
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].data, pcs_bytes(0));
+        assert_eq!(tail[0].pts_ns, 1_000_000_000);
+        assert_eq!(tail[0].duration_ns, Some(0));
     }
 
     #[test]
@@ -948,3 +939,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pgs_tests.rs"]
+mod lifecycle_tests;

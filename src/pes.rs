@@ -56,6 +56,9 @@ pub struct PesFrame {
     /// the PGS parser so the MKV muxer can emit `BlockDuration`; also
     /// preserved across network:// and stdio:// hops.
     pub duration_ns: Option<u64>,
+    /// Matroska DiscardPadding in nanoseconds: positive trims the end, negative
+    /// trims the beginning. Local container remux metadata; not on the PES wire.
+    pub discard_padding_ns: i64,
     /// Byte-exact source provenance of this frame's first byte, stamped at the
     /// demux seam. `None` for synthetic sources / the `skip_parse` path and for
     /// the `deserialize` (network/stdio) hop — NOT serialized on the wire.
@@ -154,6 +157,7 @@ impl PesFrame {
             filled += want;
         }
         Ok(Some(Self {
+            discard_padding_ns: 0,
             track,
             pts,
             keyframe,
@@ -171,6 +175,7 @@ impl PesFrame {
     // the internal `mux::codec::Frame` type, so it can't be public API.
     pub(crate) fn from_codec_frame(track: usize, frame: crate::mux::codec::Frame) -> Self {
         Self {
+            discard_padding_ns: 0,
             track,
             pts: frame.pts_ns,
             keyframe: frame.keyframe,
@@ -180,6 +185,15 @@ impl PesFrame {
             coding: frame.coding,
         }
     }
+}
+
+/// Decoder delay and seek preroll retained across container remuxing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrackTiming {
+    /// Nanoseconds of decoder delay, applied by the container's consumer.
+    pub codec_delay_ns: u64,
+    /// Nanoseconds of decoding required before a seek target.
+    pub seek_preroll_ns: u64,
 }
 
 /// A PES frame stream. One trait per format — same type opens for read
@@ -206,6 +220,17 @@ pub trait Stream: Send {
     /// Stream metadata. Stable across reads — implementors must return a
     /// consistent reference for the lifetime of the stream.
     fn info(&self) -> &crate::disc::DiscTitle;
+
+    /// Container timing metadata, indexed in the same order as `info().streams`.
+    fn track_timing(&self, _track: usize) -> TrackTiming {
+        TrackTiming::default()
+    }
+
+    /// Set timing before the first frame is written. Sinks without this metadata
+    /// retain their existing behavior.
+    fn set_track_timing(&mut self, _track: usize, _timing: TrackTiming) -> std::io::Result<()> {
+        Ok(())
+    }
 
     /// Codec initialization data for a track (SPS/PPS, AC-3 fscod, etc.).
     /// `None` for tracks that don't need codec_private (raw passthrough).
@@ -304,6 +329,13 @@ impl Stream for CountingStream {
         self.inner.info()
     }
 
+    fn track_timing(&self, track: usize) -> TrackTiming {
+        self.inner.track_timing(track)
+    }
+    fn set_track_timing(&mut self, track: usize, timing: TrackTiming) -> std::io::Result<()> {
+        self.inner.set_track_timing(track, timing)
+    }
+
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
         self.inner.codec_private(track)
     }
@@ -332,6 +364,7 @@ mod tests {
 
     fn make_frame(track: usize, pts: i64) -> PesFrame {
         PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track,
@@ -512,6 +545,7 @@ mod tests {
     fn serialize_wire_format_matches_spec() {
         // Wire format: [track(1)][pts_le(8)][keyframe(1)][duration_le(8)][len_le(4)][data...]
         let frame = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 2,
@@ -560,6 +594,7 @@ mod tests {
     #[test]
     fn serialize_keyframe_false_encodes_as_zero() {
         let frame = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -583,6 +618,7 @@ mod tests {
     #[test]
     fn serialize_track_255_is_ok_track_256_is_err() {
         let ok_frame = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 255,
@@ -596,6 +632,7 @@ mod tests {
         assert_eq!(buf[0], 255, "track 255 must serialize to 0xFF");
 
         let too_large = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 256,
@@ -617,6 +654,7 @@ mod tests {
     fn deserialize_round_trips_pts_boundaries() {
         for pts in [0_i64, i64::MAX, i64::MIN] {
             let frame = PesFrame {
+                discard_padding_ns: 0,
                 coding: None,
                 source: None,
                 track: 0,
@@ -639,6 +677,7 @@ mod tests {
     #[test]
     fn deserialize_accepts_zero_length_data() {
         let frame = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 3,
@@ -665,6 +704,7 @@ mod tests {
     fn deserialize_duration_ns_roundtrips() {
         // None encodes as u64::MAX sentinel and decodes back to None.
         let frame_none = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -684,6 +724,7 @@ mod tests {
 
         // Some(0) must survive — 0 is a valid zero-length duration, not the sentinel.
         let frame_zero = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 1,
@@ -704,6 +745,7 @@ mod tests {
 
         // Some(N) for a typical PGS duration (~3 seconds).
         let frame_n = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 2,
@@ -729,6 +771,7 @@ mod tests {
     #[test]
     fn deserialize_two_sequential_frames() {
         let f1 = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -738,6 +781,7 @@ mod tests {
             duration_ns: None,
         };
         let f2 = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 1,
@@ -768,6 +812,7 @@ mod tests {
     #[test]
     fn counting_stream_accumulates_across_multiple_writes() {
         let f1 = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -777,6 +822,7 @@ mod tests {
             duration_ns: None,
         };
         let f2 = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -801,6 +847,7 @@ mod tests {
         let size = 2 * 1024 * 1024 + 12_345;
         let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
         let frame = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 7,

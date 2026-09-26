@@ -111,6 +111,9 @@ pub trait WriteSeek: Write + Seek {}
 impl<T: Write + Seek> WriteSeek for T {}
 
 #[cfg(test)]
+pub(crate) mod interop_tests;
+
+#[cfg(test)]
 mod tests {
     use super::resolve::{StreamUrl, parse_url};
     use std::path::PathBuf;

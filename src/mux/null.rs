@@ -46,6 +46,7 @@ mod tests {
         let mut sink: Box<dyn Stream> = Box::new(NullStream::new(&title));
 
         let frame = crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,
@@ -79,6 +80,7 @@ mod tests {
         sink.finish().unwrap();
         sink.finish().unwrap();
         let frame = crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 3,

@@ -146,6 +146,7 @@ impl PipelinedPesStream {
                 if skip_parse {
                     // Profiling escape hatch — bypass codec parser.
                     self.pending_frames.push_back(PesFrame {
+                        discard_padding_ns: 0,
                         coding: None,
                         source: None,
                         track,
@@ -916,6 +917,7 @@ mod tests {
     fn write_is_read_only_error() {
         let (mut stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
         let frame = PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,

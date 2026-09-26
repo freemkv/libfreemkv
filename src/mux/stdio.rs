@@ -163,6 +163,7 @@ mod tests {
     fn write_on_input_stream_is_read_only_error() {
         let mut s = StdioStream::input();
         let frame = crate::pes::PesFrame {
+            discard_padding_ns: 0,
             coding: None,
             source: None,
             track: 0,

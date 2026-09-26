@@ -27,9 +27,12 @@ The parser hands the demux sink the concatenated PGS segments of a display
 set in `frame.data` (segment_type + segment_size + payload, repeated), with
 no `PG` magic and no PTS/DTS. A `.sup` prefixes each segment with a 13-byte
 header: `0x50 0x47` ("PG") | PTS u32 BE | DTS u32 BE | (segment_type|size
-already present in the payload). When the parser folded a trailing clear
-(`duration_ns` set), the writer re-emits it as an empty composition at
-`pts + duration` so players time the subtitle out.
+already present in the payload). Original clear sets are emitted verbatim.
+For duration-only input (older MKVs, or an EOF fallback), the writer holds
+a synthetic clear for `pts + duration`. A real clear or replacement PCS at
+or before that deadline cancels the synthetic one. Otherwise it is emitted
+before the next later frame, or at finish. Clear and continuation frames do
+not themselves schedule further clears.
 
 ## `synthetic_clear_display_set`: synthesizing the clear PCS
 

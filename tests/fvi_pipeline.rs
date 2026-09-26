@@ -325,6 +325,7 @@ fn fvi_sink_indexes_non_mpeg2_frames_codec_agnostically() {
     let title = mpeg2_dvd_title(0);
 
     let mk = |pts: i64, keyframe: bool, source: Option<SourcePos>| PesFrame {
+        discard_padding_ns: 0,
         track: 0,
         pts,
         keyframe,

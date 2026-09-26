@@ -1,15 +1,11 @@
-//! AAC ADTS decodability gate.
+//! AAC ADTS framing and validation.
 //!
-//! Per ISO/IEC 13818-7 / ISO/IEC 14496-3, a header is structurally invalid
-//! in exactly three ways treated as hard rejects: syncword != 0xFFF, a
-//! reserved `sampling_frequency_index`, and `aac_frame_length` shorter than
-//! the header itself. The ADTS CRC is not verified, only skipped.
-//! A packet with no ADTS sync is raw AAC (e.g. from an MP4 container) or a
-//! continuation and passes through unchanged — never false-dropped.
-//! See docs/adts.md for the full rationale.
+//! See docs/adts.md for framing, timestamp and validation rules.
 
-use super::dropgate::DropTally;
-use super::{CodecParser, Frame, PesPacket, pts_to_ns};
+use super::audio_frames::{AudioFrames, Header};
+#[cfg(test)]
+use super::pts_to_ns;
+use super::{CodecParser, Frame, PesPacket};
 
 /// ADTS `sampling_frequency_index` table (ISO/IEC 14496-3) — 13 valid entries;
 /// indices 13/14/15 are 0 (reserved) and constitute a hard reject.
@@ -57,11 +53,8 @@ fn adts_verdict(data: &[u8]) -> AdtsVerdict {
 }
 
 pub struct AdtsParser {
-    tally: DropTally,
-    /// Last emitted PTS (ns). A PES with no PTS (legal for audio, e.g. a
-    /// post-discontinuity continuation) carries this forward rather than resetting
-    /// the timeline to 0 — matching the AC-3/DTS parsers and preserving A/V sync.
-    last_pts_ns: i64,
+    frames: AudioFrames,
+    config: Option<Vec<u8>>,
 }
 
 impl Default for AdtsParser {
@@ -73,67 +66,52 @@ impl Default for AdtsParser {
 impl AdtsParser {
     pub fn new() -> Self {
         Self {
-            tally: DropTally::new("aac"),
-            last_pts_ns: 0,
+            frames: AudioFrames::new("aac"),
+            config: None,
         }
     }
-
     pub fn dropped_frames(&self) -> u64 {
-        self.tally.dropped_frames()
+        self.frames.dropped_frames()
     }
-
     pub fn dropped_duration_ns(&self) -> u64 {
-        self.tally.dropped_duration_ns()
+        self.frames.dropped_duration_ns()
     }
 }
 
 impl CodecParser for AdtsParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        if pes.data.is_empty() {
-            return Vec::new();
-        }
-        let pts_ns = pes
-            .pts
-            .or(pes.dts)
-            .map(pts_to_ns)
-            .unwrap_or(self.last_pts_ns);
-        self.last_pts_ns = pts_ns;
-
-        let drop =
-            self.tally.is_poisoned() || matches!(adts_verdict(&pes.data), AdtsVerdict::Invalid);
-        if drop {
-            let reason = if self.tally.is_poisoned() {
-                "track-poisoned"
-            } else {
-                "header"
-            };
-            self.tally.record_drop(pts_ns, 0, pes.data.len(), reason);
-            return Vec::new();
-        }
-
-        self.tally.record_kept();
-        // One PES is one unit here, so the unit's first byte is in THIS packet
-        // and its facts are this packet's -- the same rule the buffering
-        // parsers apply through `PesBuf::front`, with nothing carried over.
-        let facts = super::pesbuf::PesFacts::of(pes);
-        vec![Frame {
-            discontinuity: facts.discontinuity,
-            coding: None,
-            source: facts.source,
-            pts_ns,
-            keyframe: true,
-            data: pes.data.clone(),
-            duration_ns: None,
-        }]
+        let config = &mut self.config;
+        self.frames.parse(pes, 7, |data| {
+            if !matches!(adts_verdict(data), AdtsVerdict::Valid) {
+                return None;
+            }
+            let rate_index = (data[2] >> 2) & 15;
+            let object_type = (data[2] >> 6) + 1;
+            let channels = ((data[2] & 1) << 2) | (data[3] >> 6);
+            // MPEG-4 AudioSpecificConfig replaces the ADTS transport header in
+            // Matroska. The raw AAC payload must not retain that header or CRC.
+            config.get_or_insert_with(|| {
+                vec![
+                    (object_type << 3) | (rate_index >> 1),
+                    (rate_index << 7) | (channels << 3),
+                ]
+            });
+            Some(Header {
+                bytes: (usize::from(data[3] & 3) << 11)
+                    | (usize::from(data[4]) << 3)
+                    | usize::from(data[5] >> 5),
+                skip: if data[1] & 1 == 0 { 9 } else { 7 },
+                samples: 1024 * (u32::from(data[6] & 3) + 1),
+                rate: ADTS_SAMPLE_RATE_VALID[usize::from(rate_index)],
+            })
+        })
     }
 
     fn flush(&mut self) -> Vec<Frame> {
-        self.tally.log_summary();
-        Vec::new()
+        self.frames.flush()
     }
-
     fn codec_private(&self) -> Option<Vec<u8>> {
-        None
+        self.config.clone()
     }
 }
 
@@ -217,9 +195,9 @@ mod tests {
     }
 
     #[test]
-    fn pes_without_pts_carries_last_timestamp_not_zero() {
+    fn pes_without_pts_advances_by_sample_count() {
         // A PES with no PTS (legal for audio, e.g. after a discontinuity) must
-        // carry the last known timestamp forward — resetting to 0 would corrupt
+        // advance from the last timestamp by sample count — resetting to 0 would corrupt
         // A/V sync.
         let mut p = AdtsParser::new();
         p.parse(&make_pes(adts_frame(400), Some(90000)));
@@ -227,8 +205,8 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].pts_ns,
-            pts_to_ns(90000),
-            "carried forward, not reset to 0"
+            pts_to_ns(90000) + 1024 * 1_000_000_000 / 44100,
+            "continuation advances by one AAC frame"
         );
     }
 
@@ -304,10 +282,10 @@ mod tests {
     }
 
     #[test]
-    fn short_packet_passes_through() {
+    fn short_sync_header_waits_for_continuation() {
         let mut p = AdtsParser::new();
         let f = p.parse(&make_pes(vec![0xFF, 0xF1, 0x50], Some(0)));
-        assert_eq!(f.len(), 1, "too short to validate → kept");
+        assert!(f.is_empty(), "partial ADTS header must be buffered");
     }
 
     /// One PES is one unit here, so the frame carries that packet's offset.
@@ -319,5 +297,70 @@ mod tests {
         let frames = parser.parse(&p);
         assert!(!frames.is_empty(), "a valid ADTS frame is emitted");
         assert_eq!(frames[0].source.map(|s| s.byte), Some(4_242));
+    }
+    #[test]
+    fn every_pes_split_reassembles_and_strips_adts() {
+        let data = adts_frame(40);
+        for split in 1..data.len() {
+            let mut p = AdtsParser::new();
+            assert!(
+                p.parse(&make_pes(data[..split].to_vec(), Some(90000)))
+                    .is_empty()
+            );
+            let frames = p.parse(&make_pes(data[split..].to_vec(), None));
+            assert_eq!(frames.len(), 1, "split {split}");
+            assert_eq!(frames[0].data, data[7..]);
+            assert_eq!(frames[0].pts_ns, 1_000_000_000);
+            assert!(p.flush().is_empty());
+            assert_eq!(p.dropped_frames(), 0);
+        }
+    }
+
+    #[test]
+    fn multiple_adts_frames_in_one_pes_have_sample_timestamps() {
+        let data = adts_frame(20);
+        let mut p = AdtsParser::new();
+        let frames = p.parse(&make_pes(data.repeat(3), Some(90000)));
+        assert_eq!(frames.len(), 3);
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.pts_ns,
+                1_000_000_000 + i as i64 * (1024 * 1_000_000_000i64 / 44100)
+            );
+            assert_eq!(f.data, data[7..]);
+        }
+        assert_eq!(p.codec_private(), Some(vec![0x12, 0x10]));
+    }
+
+    #[test]
+    fn crc_bytes_are_removed_with_transport_header() {
+        let mut data = adts_frame(20);
+        data[1] &= !1;
+        let mut p = AdtsParser::new();
+        let frames = p.parse(&make_pes(data.clone(), Some(0)));
+        assert_eq!(frames[0].data, data[9..]);
+    }
+
+    #[test]
+    fn partial_tail_is_not_emitted_at_eof() {
+        let data = adts_frame(20);
+        let mut p = AdtsParser::new();
+        assert!(p.parse(&make_pes(data[..10].to_vec(), Some(0))).is_empty());
+        assert!(p.flush().is_empty());
+    }
+
+    #[test]
+    fn discontinuity_drops_partial_frame_and_reanchors() {
+        let data = adts_frame(20);
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(data[..10].to_vec(), Some(0)));
+        let mut fresh = make_pes(data.clone(), Some(180000));
+        fresh.discontinuity = true;
+        fresh.source = Some(crate::pes::SourcePos::at_byte(4096));
+        let frames = p.parse(&fresh);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pts_ns, 2_000_000_000);
+        assert_eq!(frames[0].source, fresh.source);
+        assert!(frames[0].discontinuity);
     }
 }

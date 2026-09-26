@@ -1,12 +1,72 @@
 # HDMV PGS subtitle parser (`src/mux/codec/pgs.rs`)
 
-## Module overview: why display sets need a synthesized duration
+## Display and clear are separate decoder events
 
-For Matroska output the parser collapses a display PCS / clear PCS pair into
-one block with `BlockDuration` set to `clear_pts - display_pts`. Without a
-duration, hardware players linger on the last bitmap until the next subtitle
-replaces it — which can be many seconds, and on a disc where the final
-subtitle has no follower, until end of file.
+A visible composition (PCS with objects) starts a subtitle. An empty
+composition (PCS with zero objects, followed by its remaining segments and
+END) clears it. Both sets must survive ripping. The parser also computes
+`BlockDuration = clear_pts - display_pts` for the visible set, retaining the
+existing fallback duration when the actual end is unavailable.
+
+Previously, the parser discarded the empty PCS and relied solely on
+`BlockDuration`. FFmpeg's PGS decoder sets `end_display_time` to `UINT32_MAX`
+and expects another composition to replace or clear it. The generic decoder
+only uses packet duration when `end_display_time` is zero. A player using
+that decoded lifetime can therefore leave a subtitle visible until the next
+one, however large the gap. See the [PGS decoder][pgsdec] and
+[generic subtitle decoder][decode].
+
+Empty compositions are now accumulated with their WDS/END continuation
+packets, retaining the opening PCS's timestamp and source position. A
+complete clear is emitted at END without waiting for the next subtitle.
+Its duration is zero (the MKV writer rounds this to one timestamp tick);
+it changes decoder state immediately and has no visible bitmap to expire.
+Clear sets do not count toward forced-track classification.
+
+### Relationship to freemkv/freemkv#52
+
+[#52] reports missing timestamps during FFmpeg transcoding with subtitle
+stream copy. Adding a duration to every block does not, by itself, guarantee
+valid packet timestamps after bitstream filtering. FFmpeg's Matroska muxer
+automatically applies [`pgs_frame_merge`][merge]. When it merges separate
+WDS and END packets, it copies packet properties from the PCS-containing
+packet. Dropping that PCS leaves an orphaned set whose merged packet can
+have no timestamp even though each input MKV block had one.
+
+Running the new FFmpeg tests against the old parser reproduces both reported
+warnings (unset timestamps and fabricated PTS), and decodes the supposed
+clear events as visible compositions. Both tests pass with the fixed parser.
+Preserving the complete clear set addresses that mechanism as well as the
+lingering bitmap. This does not establish that every playback/transcode
+problem in #52 has the same cause; verification against the reporter's
+source is still needed.
+
+### Regression coverage
+
+`src/mux/codec/pgs_tests.rs` builds decoder-valid synthetic PGS sets with a
+2x2 bitmap; no movie/disc assets are needed. Coverage includes an hour-long
+gap between forced subtitles, split/timestamp-less continuations, leading
+and repeated clears, byte preservation, provenance, incomplete sets,
+forced-track classification, and a parser → MKV → reader round trip.
+The `.sup` writer tests also cover original clear precedence and fallback
+clears for older MKVs carrying only durations.
+
+Two additional Rust tests invoke `ffprobe`/`ffmpeg`: one checks decoded
+empty compositions at the actual clear times, the other stream-copies the
+MKV and checks warnings, timestamps, corruption flags and decoded clears.
+These are explicitly ignored in normal local runs because they require
+external binaries. The QA workflow installs FFmpeg on Linux and runs them
+against the release build; dev CI runs the pure Rust coverage:
+
+```sh
+cargo test --lib pgs
+cargo test --release --lib mux::codec::pgs::lifecycle_tests::ffmpeg_ -- --ignored
+```
+
+[pgsdec]: https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/pgssubdec.c
+[decode]: https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/decode.c
+[merge]: https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/bsf/pgs_frame_merge.c
+[#52]: https://github.com/freemkv/freemkv/issues/52
 
 ## `display_set_is_forced`
 

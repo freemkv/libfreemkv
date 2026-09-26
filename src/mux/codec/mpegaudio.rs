@@ -1,16 +1,11 @@
-//! MPEG-1/2/2.5 audio (MP1/MP2/MP3) decodability gate.
+//! MPEG audio framing and validation.
 //!
-//! Validates header sanity + framing resync per ISO/IEC 11172-3 / ISO/IEC
-//! 13818-3, not a payload CRC. ACCEPTS free-format (`bitrate_index == 0`) as a
-//! legal decodable mode (see `mpa_verdict`'s doc). Rejects only truly invalid
-//! headers (bad version / layer / sample-rate / reserved bitrate index 15) →
-//! dropped as a silence gap, each packet keeping its own PTS. A packet with no
-//! leading sync passes through unchanged — never false-dropped.
-//!
-//! See docs/mpegaudio.md for the CRC and free-format-reject rationale.
+//! See docs/mpegaudio.md for framing, timestamp and validation rules.
 
-use super::dropgate::DropTally;
-use super::{CodecParser, Frame, PesPacket, pts_to_ns};
+use super::audio_frames::{AudioFrames, Header};
+#[cfg(test)]
+use super::pts_to_ns;
+use super::{CodecParser, Frame, PesPacket};
 
 /// Decoded validity of a candidate MPEG-audio header.
 enum MpaVerdict {
@@ -50,77 +45,91 @@ fn mpa_verdict(data: &[u8]) -> MpaVerdict {
     MpaVerdict::Valid
 }
 
-pub struct MpegAudioParser {
-    tally: DropTally,
-    /// Last emitted PTS (ns), carried forward across a PES with no PTS rather than
-    /// resetting the timeline to 0 (see the AC-3/DTS parsers) — preserves A/V sync.
-    last_pts_ns: i64,
+// ISO/IEC 11172-3 and 13818-3 header bitrate tables, in kbit/s.
+const MPEG1_L1: [u32; 15] = [
+    0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
+];
+const MPEG1_L2: [u32; 15] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+];
+const MPEG1_L3: [u32; 15] = [
+    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+];
+const MPEG2_L1: [u32; 15] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+];
+const MPEG2_L23: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+
+fn frame_header(data: &[u8]) -> Option<Header> {
+    if !matches!(mpa_verdict(data), MpaVerdict::Valid) {
+        return None;
+    }
+    let version = (data[1] >> 3) & 3;
+    let layer = (data[1] >> 1) & 3;
+    let rate = [44100, 48000, 32000][usize::from((data[2] >> 2) & 3)]
+        >> match version {
+            3 => 0,
+            2 => 1,
+            _ => 2,
+        };
+    let rates = match (version == 3, layer) {
+        (true, 3) => MPEG1_L1,
+        (true, 2) => MPEG1_L2,
+        (true, _) => MPEG1_L3,
+        (false, 3) => MPEG2_L1,
+        (false, _) => MPEG2_L23,
+    };
+    let bitrate = rates[usize::from(data[2] >> 4)] * 1000;
+    let padding = u32::from((data[2] >> 1) & 1);
+    let samples = match layer {
+        3 => 384,
+        1 if version != 3 => 576,
+        _ => 1152,
+    };
+    let bytes = if bitrate == 0 {
+        // Free-format has no signalled size; retain PES-granular passthrough.
+        data.len()
+    } else if layer == 3 {
+        ((12 * bitrate / rate + padding) * 4) as usize
+    } else {
+        ((samples / 8) * bitrate / rate + padding) as usize
+    };
+    Some(Header {
+        bytes,
+        skip: 0,
+        samples,
+        rate,
+    })
 }
 
+pub struct MpegAudioParser {
+    frames: AudioFrames,
+}
 impl Default for MpegAudioParser {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl MpegAudioParser {
     pub fn new() -> Self {
         Self {
-            tally: DropTally::new("mpegaudio"),
-            last_pts_ns: 0,
+            frames: AudioFrames::new("mpegaudio"),
         }
     }
-
     pub fn dropped_frames(&self) -> u64 {
-        self.tally.dropped_frames()
+        self.frames.dropped_frames()
     }
-
     pub fn dropped_duration_ns(&self) -> u64 {
-        self.tally.dropped_duration_ns()
+        self.frames.dropped_duration_ns()
     }
 }
-
 impl CodecParser for MpegAudioParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        if pes.data.is_empty() {
-            return Vec::new();
-        }
-        let pts_ns = pes
-            .pts
-            .or(pes.dts)
-            .map(pts_to_ns)
-            .unwrap_or(self.last_pts_ns);
-        self.last_pts_ns = pts_ns;
-
-        let drop =
-            self.tally.is_poisoned() || matches!(mpa_verdict(&pes.data), MpaVerdict::Invalid);
-        if drop {
-            let reason = if self.tally.is_poisoned() {
-                "track-poisoned"
-            } else {
-                "header"
-            };
-            self.tally.record_drop(pts_ns, 0, pes.data.len(), reason);
-            return Vec::new();
-        }
-
-        self.tally.record_kept();
-        vec![Frame {
-            discontinuity: pes.discontinuity,
-            coding: None,
-            source: super::pesbuf::PesFacts::of(pes).source,
-            pts_ns,
-            keyframe: true,
-            data: pes.data.clone(),
-            duration_ns: None,
-        }]
+        self.frames.parse(pes, 4, frame_header)
     }
-
     fn flush(&mut self) -> Vec<Frame> {
-        self.tally.log_summary();
-        Vec::new()
+        self.frames.flush()
     }
-
     fn codec_private(&self) -> Option<Vec<u8>> {
         None
     }
@@ -144,9 +153,9 @@ mod tests {
     /// A valid MPEG-1 Layer III header: sync 0xFFF, version MPEG-1 (11), layer
     /// III (01), bitrate_index 9, sample-rate 0 (44.1 kHz), no CRC. Bytes:
     /// 0xFF 0xFB 0x90 0x00 — the canonical MP3 frame header.
-    fn mp3_frame(payload: usize) -> Vec<u8> {
+    fn mp3_frame(_payload: usize) -> Vec<u8> {
         let mut f = vec![0xFF, 0xFB, 0x90, 0x00];
-        f.extend(std::iter::repeat_n(0xAA, payload));
+        f.extend(std::iter::repeat_n(0xAA, 413));
         f
     }
 
@@ -160,9 +169,9 @@ mod tests {
     }
 
     #[test]
-    fn pes_without_pts_carries_last_timestamp_not_zero() {
+    fn pes_without_pts_advances_by_sample_count() {
         // A PES with no PTS (legal for audio, e.g. after a discontinuity) must
-        // carry the last known timestamp forward — resetting to 0 would corrupt
+        // advance from the last timestamp by sample count — resetting to 0 would corrupt
         // A/V sync. Mirrors the adts.rs guard test.
         let mut p = MpegAudioParser::new();
         p.parse(&make_pes(mp3_frame(400), Some(90000)));
@@ -170,8 +179,8 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].pts_ns,
-            pts_to_ns(90000),
-            "carried forward, not reset to 0"
+            pts_to_ns(90000) + 1152 * 1_000_000_000 / 44100,
+            "continuation advances by one MPEG audio frame"
         );
     }
 
@@ -278,8 +287,8 @@ mod tests {
         );
     }
 
-    // Self-framing at PES granularity: parse emits/drops immediately, buffers
-    // nothing, so end-of-stream has nothing left to hand over.
+    // Complete frames have already been emitted; EOF must not turn a trailing
+    // invalid header or partial frame into another access unit.
     // See docs/mpegaudio.md — flush-no-phantom-frame rationale.
     #[test]
     fn flush_adds_no_phantom_frame_after_the_last_real_packet() {
@@ -316,5 +325,48 @@ mod tests {
         let f = p.parse(&pes);
         assert!(!f.is_empty(), "the frame is emitted");
         assert_eq!(f[0].source.map(|s| s.byte), Some(7_777));
+    }
+    #[test]
+    fn every_pes_split_reassembles_a_complete_mpeg_frame() {
+        let data = mp3_frame(413);
+        for split in 1..data.len() {
+            let mut p = MpegAudioParser::new();
+            assert!(
+                p.parse(&make_pes(data[..split].to_vec(), Some(90000)))
+                    .is_empty()
+            );
+            let frames = p.parse(&make_pes(data[split..].to_vec(), None));
+            assert_eq!(frames.len(), 1, "split {split}");
+            assert_eq!(frames[0].data, data);
+            assert_eq!(frames[0].pts_ns, 1_000_000_000);
+            assert_eq!(p.dropped_frames(), 0);
+        }
+    }
+
+    #[test]
+    fn multiple_mpeg_frames_in_one_pes_get_distinct_timestamps() {
+        let data = mp3_frame(413);
+        let mut p = MpegAudioParser::new();
+        let frames = p.parse(&make_pes(data.repeat(3), Some(0)));
+        assert_eq!(frames.len(), 3);
+        for (i, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.data, data);
+            assert_eq!(frame.pts_ns, i as i64 * (1152 * 1_000_000_000i64 / 44100));
+        }
+    }
+
+    #[test]
+    fn frame_sizes_cover_versions_layers_and_padding() {
+        for (header, bytes, samples, rate) in [
+            ([0xff, 0xfb, 0x90, 0], 417, 1152, 44100),
+            ([0xff, 0xfb, 0x92, 0], 418, 1152, 44100),
+            ([0xff, 0xfd, 0xa4, 0], 576, 1152, 48000),
+            ([0xff, 0xff, 0x90, 0], 312, 384, 44100),
+            ([0xff, 0xf3, 0x80, 0], 208, 576, 22050),
+            ([0xff, 0xe3, 0x80, 0], 417, 576, 11025),
+        ] {
+            let h = frame_header(&header).unwrap();
+            assert_eq!((h.bytes, h.samples, h.rate), (bytes, samples, rate));
+        }
     }
 }

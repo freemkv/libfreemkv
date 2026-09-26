@@ -344,6 +344,7 @@ impl<R: Read + Seek + Send> Stream for Mp4Reader<R> {
         let mut data = vec![0u8; s.size as usize];
         self.file.read_exact(&mut data)?;
         Ok(Some(PesFrame {
+            discard_padding_ns: 0,
             track: s.track,
             pts: s.pts_ns,
             keyframe: s.keyframe,
@@ -1183,6 +1184,7 @@ mod tests {
         {
             let mut sink = Mp4Sink::create(Cursor::new(&mut buf), &t).unwrap();
             sink.write(&PesFrame {
+                discard_padding_ns: 0,
                 track: 0,
                 pts: 0,
                 keyframe: true,
@@ -1291,6 +1293,7 @@ mod tests {
             cursor: 0,
         };
         let frame = PesFrame {
+            discard_padding_ns: 0,
             track: 0,
             pts: 0,
             keyframe: true,
@@ -1367,6 +1370,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mk = |track, pts, key, data: Vec<u8>| PesFrame {
+                discard_padding_ns: 0,
                 track,
                 pts,
                 keyframe: key,
@@ -1517,6 +1521,7 @@ mod tests {
             let mut sink = Mp4Sink::create(Cursor::new(&mut buf), &t).unwrap();
             for (i, &(pts, fill)) in plan.iter().enumerate() {
                 sink.write(&PesFrame {
+                    discard_padding_ns: 0,
                     track: 0,
                     pts,
                     keyframe: i == 0,
@@ -1597,6 +1602,7 @@ mod tests {
             let mut sink = Mp4Sink::create(Cursor::new(&mut buf), &t).unwrap();
             for i in 0..FRAMES {
                 sink.write(&PesFrame {
+                    discard_padding_ns: 0,
                     track: 0,
                     pts: i as i64 * FRAME_NS,
                     keyframe: i == 0,
@@ -1706,6 +1712,7 @@ mod tests {
             let mut sink = Mp4Sink::create(Cursor::new(&mut buf), &t).unwrap();
             for i in 0..4i64 {
                 sink.write(&PesFrame {
+                    discard_padding_ns: 0,
                     track: 0,
                     pts: i * 40_000_000,
                     keyframe: i == 0,
@@ -1716,6 +1723,7 @@ mod tests {
                 })
                 .unwrap();
                 sink.write(&PesFrame {
+                    discard_padding_ns: 0,
                     track: 1,
                     pts: i * 32_000_000,
                     keyframe: true,

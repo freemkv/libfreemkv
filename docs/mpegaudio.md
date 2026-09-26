@@ -1,28 +1,17 @@
-# MPEG audio (MP1/MP2/MP3) decodability gate
+# MPEG audio framing and validation
 
-## Module rationale (`src/mux/codec/mpegaudio.rs`)
+MPEG-1/2/2.5 audio frames are assembled across PES boundaries and split when
+one PES contains multiple frames. Header version, layer, bitrate, sample rate
+and padding determine the frame size and sample duration. Timestamp anchors
+and source provenance survive fragmentation. Invalid reserved header fields
+are rejected; audio payload CRCs are not checked.
 
-Per ISO/IEC 11172-3 / ISO/IEC 13818-3, an MPEG-audio frame is validated by
-header sanity + framing resync, not a payload CRC (the optional 16-bit CRC in
-the header protects only the side-information and is absent unless the
-protection bit says otherwise). The gate mirrors that header-only check and
-ACCEPTS free-format (`bitrate_index == 0`) as a legal decodable mode — it
-deliberately does NOT apply the stricter free-format reject that a full
-decoder would (see the note at the `bitrate_index` check in `mpa_verdict`).
-So the gate rejects only the truly invalid headers: a packet that begins with
-the 11-bit MPEG-audio sync but whose version / layer / sample-rate fields (or
-the reserved bitrate index 15) are reserved/invalid is undecodable → drop it
-(a silence gap; each packet keeps its own PTS). A packet with no leading sync
-is not a frame we can validate (raw payload / continuation), so it passes
-through unchanged — never false-dropped.
+Free-format bitrate index zero remains a legal passthrough case at PES
+granularity because its header does not signal a frame length. Before sync is
+seen, nonsync payloads retain passthrough behavior; after sync, later PES
+payloads are continuations. Partial EOF frames are discarded, not manufactured.
+Buffering is capped at 1 MiB.
 
-## Test: `flush_adds_no_phantom_frame_after_the_last_real_packet`
-
-This parser is self-framing at PES granularity: `parse` emits (or drops)
-every packet immediately and buffers nothing, so end-of-stream has nothing
-left to hand over. A `flush` that manufactured a frame would append a
-zero-length block at PTS 0 AFTER a track that has already run to its real
-end — a Matroska Block whose timestamp jumps backwards past every cluster
-before it (RFC 9559 §5.1.3.2 Blocks are relative to their cluster's
-timestamp; a phantom 0 lands in the wrong cluster entirely) and an empty
-audio frame no decoder can consume.
+Rust tests cover every split point, multiple frames per PES, version/layer
+frame-size tables, timestamps and invalid headers. The FFmpeg QA gate compares
+decoded PCM after deliberately fragmented MP2 input.

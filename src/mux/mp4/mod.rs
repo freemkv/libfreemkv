@@ -1143,6 +1143,7 @@ mod tests {
 
     fn frame(track: usize, pts_ns: i64, key: bool, data: Vec<u8>) -> PesFrame {
         PesFrame {
+            discard_padding_ns: 0,
             track,
             pts: pts_ns,
             keyframe: key,
