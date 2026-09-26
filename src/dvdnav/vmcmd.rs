@@ -87,7 +87,16 @@ pub(crate) enum Instr {
         imm: u16,
         src: u8,
     },
-    /// Set a system parameter / unmodelled set — executor may ignore.
+    /// SetSystem op 3 (SetGPRMMD): store into GPRM `reg` and set its mode
+    /// (`counter` = counter mode). Value as for [`Instr::SetGprm`].
+    SetGprmMd {
+        reg: u8,
+        counter: bool,
+        immediate: bool,
+        imm: u16,
+        src: u8,
+    },
+    /// Any other SetSystem op: writes SPRMs only — executor may ignore.
     SetSystem,
     /// Anything not individually modelled (kept as raw bytes).
     Other([u8; 8]),
@@ -111,6 +120,9 @@ pub(crate) struct Compare {
 pub(crate) struct Command {
     pub compare: Option<Compare>,
     pub instr: Instr,
+    /// Type 2/3 only: a trailing link sub-instruction transfers control
+    /// after the set (libdvdnav eval_link_instruction; reverse-engineered).
+    pub link: bool,
 }
 
 // Command types — `byte0` bits 7-5.
@@ -138,6 +150,11 @@ const LK_PGCN: u8 = 4;
 const LK_PTTN: u8 = 5;
 const LK_PGN: u8 = 6;
 const LK_CN: u8 = 7;
+
+// SetSystem (type 2) op code — `byte0` bits 3-0.
+const SS_SET_GPRMMD: u8 = 3;
+// Link sub-instruction codes (byte7 bits 4-0): 0 = LinkNoLink, above 0x10 unknown.
+const LINKSUB_MAX: u8 = 0x10;
 
 // JumpSS sub-domain selector — `byte5` bits 7-6.
 const SS_FP: u8 = 0;
@@ -272,11 +289,30 @@ pub(crate) fn decode(b: &[u8; 8]) -> Command {
             imm: be16(b, 4),
             src: b[5],
         },
+        TYPE_SET_SYSTEM if setop == SS_SET_GPRMMD => Instr::SetGprmMd {
+            reg: b[5] & MASK_REG,
+            counter: b[5] >> 7 != 0,
+            immediate: direct != 0,
+            imm: be16(b, 2),
+            src: b[3],
+        },
         TYPE_SET_SYSTEM => Instr::SetSystem,
         _ => Instr::Other(*b),
     };
 
-    Command { compare, instr }
+    // Set commands (types 2/3) carry a link in byte1 bits 3-0 (same codes as type 1).
+    let link = matches!(typ, TYPE_SET_SYSTEM | TYPE_SET_GPRM)
+        && match cmd {
+            LK_SUB => (1..=LINKSUB_MAX).contains(&(b[7] & MASK_LINKOP)),
+            LK_PGCN..=LK_CN => true,
+            _ => false,
+        };
+
+    Command {
+        compare,
+        instr,
+        link,
+    }
 }
 
 #[cfg(test)]
