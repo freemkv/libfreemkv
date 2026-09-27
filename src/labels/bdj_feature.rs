@@ -105,8 +105,8 @@ fn tier1_manifest_sweep(
             return None;
         }
         let text = std::str::from_utf8(bytes).ok()?;
-        hint_from_manifest(name, text)
-            .filter(|h| h.playlist_id.is_some_and(|id| real.contains(&id)))
+        let exists = |id: u16| real.contains(&id);
+        hint_from_manifest(name, text, &exists).filter(|h| h.playlist_id.is_some_and(exists))
     })
 }
 
@@ -136,18 +136,22 @@ fn is_manifest_name(name: &str) -> bool {
 }
 
 // Derive a feature hint from one embedded manifest, dispatched by filename.
-fn hint_from_manifest(name: &str, text: &str) -> Option<FeaturePlaylistHint> {
+fn hint_from_manifest(
+    name: &str,
+    text: &str,
+    exists: &dyn Fn(u16) -> bool,
+) -> Option<FeaturePlaylistHint> {
     match manifest_kind(name)? {
         Manifest::FoxDcx => fox::feature_hint(text),
         Manifest::ParamountPlaylists => paramount::feature_hint(text),
-        Manifest::Properties => props_hint(text),
+        Manifest::Properties => props_hint(text, exists),
     }
 }
 
-// Feature-playlist id from a `key=value` manifest: the key is only feature/playlist
-// identity words and names the feature (`featurePlaylistId`); the value is a bare
-// playlist number (optionally quoted or `.mpls`-suffixed).
-fn props_hint(text: &str) -> Option<FeaturePlaylistHint> {
+// Feature-playlist id from a `key=value` manifest: the key is only identity words and
+// names the feature plus a playlist (`featurePlaylistId`), unless the value itself is a
+// locator (`00800.mpls`, `bd://0.PLAYLIST:00800`). First line naming a real playlist wins.
+fn props_hint(text: &str, exists: &dyn Fn(u16) -> bool) -> Option<FeaturePlaylistHint> {
     text.lines().find_map(|line| {
         let line = line.trim();
         if line.starts_with('#') || line.starts_with('!') {
@@ -155,31 +159,50 @@ fn props_hint(text: &str) -> Option<FeaturePlaylistHint> {
         }
         let (key, val) = line.split_once('=')?;
         let words = super::name_words(key);
-        let names_feature = words.iter().any(|w| w == "feature");
+        let has = |set: &[&str]| words.iter().any(|w| set.contains(&w.as_str()));
         let identity_only = words.iter().all(|w| {
             matches!(
                 w.as_str(),
-                "feature" | "main" | "movie" | "playlist" | "pl" | "id" | "mpls" | "file"
+                "feature"
+                    | "main"
+                    | "movie"
+                    | "title"
+                    | "disc"
+                    | "playlist"
+                    | "pl"
+                    | "id"
+                    | "mpls"
+                    | "file"
             )
         });
-        if !(names_feature && identity_only && words.len() > 1) {
+        if !(identity_only && has(&["feature"])) {
             return None;
         }
-        playlist_number(val).map(FeaturePlaylistHint::for_playlist)
+        let (id, locator) = playlist_number(val)?;
+        (exists(id) && (locator || has(&["playlist", "pl", "mpls", "file"])))
+            .then(|| FeaturePlaylistHint::for_playlist(id))
     })
 }
 
-// A bare playlist number: 1-5 digits, optionally quoted and/or `.mpls`-suffixed.
-fn playlist_number(v: &str) -> Option<u16> {
+// A playlist number: 1-5 digits, optionally quoted, `.mpls`-suffixed or after a
+// `PLAYLIST:` locator. `.1` is true when the value itself names a playlist.
+fn playlist_number(v: &str) -> Option<(u16, bool)> {
     let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
-    let v = match v.len().checked_sub(".mpls".len()) {
-        Some(at) if v.is_char_boundary(at) && v[at..].eq_ignore_ascii_case(".mpls") => &v[..at],
-        _ => v,
+    let lower = v.to_ascii_lowercase();
+    let (v, after_locator) = match lower.rfind("playlist:") {
+        Some(at) => (&v[at + "playlist:".len()..], true),
+        None => (v, false),
+    };
+    let (v, mpls) = match v.len().checked_sub(".mpls".len()) {
+        Some(at) if v.is_char_boundary(at) && v[at..].eq_ignore_ascii_case(".mpls") => {
+            (&v[..at], true)
+        }
+        _ => (v, false),
     };
     if v.is_empty() || v.len() > 5 || !v.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    v.parse().ok()
+    Some((v.parse().ok()?, after_locator || mpls))
 }
 
 // ── Tier 2 ───────────────────────────────────────────────────────────────────
@@ -188,8 +211,8 @@ fn playlist_number(v: &str) -> Option<u16> {
 // jar. Real menus reference a handful.
 const MAX_CANDIDATES: usize = 1024;
 
-// Cap on candidate playlists re-read from disc for scoring (those the scan did not
-// already parse — e.g. sub-30 s). More than this is not a resolvable field.
+// Cap on candidate playlists read from disc for scoring when the caller has no scan
+// stats; past it, candidates score as short.
 const MAX_STAT_READS: usize = 32;
 
 // The feature must run at least this many times longer than the runner-up to be
@@ -197,7 +220,8 @@ const MAX_STAT_READS: usize = 32;
 const DOMINANCE_RATIO: f64 = 1.5;
 
 // Score the harvested candidates that are real playlists and pick a dominant one.
-// Any candidate that cannot be scored makes the field unknown → abstain.
+// With scan stats, a playlist the scan dropped (sub-30 s or unparseable) scores as
+// short. Without them, candidates are read; an unreadable one → abstain.
 fn tier2_score(
     reader: &mut dyn SectorSource,
     udf: &UdfFs,
@@ -205,20 +229,18 @@ fn tier2_score(
     real: &HashSet<u16>,
     known: &[PlaylistStat],
 ) -> Option<FeaturePlaylistHint> {
-    let known: HashMap<u16, (u64, usize)> =
+    let stats: HashMap<u16, (u64, usize)> =
         known.iter().map(|s| (s.id, (s.secs, s.audio))).collect();
     let mut hits: Vec<u16> = candidates.intersection(real).copied().collect();
     hits.sort_unstable();
     let mut reads = 0usize;
     let mut scored: Vec<(u16, u64, usize)> = Vec::with_capacity(hits.len());
     for id in hits {
-        let (secs, aud) = match known.get(&id) {
+        let (secs, aud) = match stats.get(&id) {
             Some(&stat) => stat,
+            None if !known.is_empty() || reads >= MAX_STAT_READS => (0, 0),
             None => {
                 reads += 1;
-                if reads > MAX_STAT_READS {
-                    return None;
-                }
                 mpls_stats(reader, udf, id)?
             }
         };
@@ -443,14 +465,14 @@ mod tests {
     #[test]
     fn props_hint_reads_feature_playlist_key() {
         let text = "menu.jar=00001\nfeature.playlist.id=00800\nfoo=bar\n";
-        let h = props_hint(text).expect("hint");
+        let h = props_hint(text, &|_| true).expect("hint");
         assert_eq!(h.playlist_id, Some(800));
         assert_eq!(h.filename.as_deref(), Some("00800.mpls"));
     }
 
     #[test]
     fn props_hint_ignores_unrelated_keys() {
-        assert!(props_hint("version=1\nbuild=42\n").is_none());
+        assert!(props_hint("version=1\nbuild=42\n", &|_| true).is_none());
     }
 
     // Keys that merely mention "playlist"/"feature" (or contain "id" inside another
@@ -468,7 +490,7 @@ mod tests {
             "feature.playlist=PL_2_v10",
             "feature.audio.id=2",
         ] {
-            assert_eq!(props_hint(text), None, "{text}");
+            assert_eq!(props_hint(text, &|_| true), None, "{text}");
         }
     }
 
@@ -477,11 +499,24 @@ mod tests {
         for text in [
             "featurePlaylistId=00800",
             "feature_playlist=00800.mpls",
-            "main.feature.id = \"00800\"",
+            "main.feature.playlist.id = \"00800\"",
+            "feature.playlist=bd://0.PLAYLIST:00800",
+            "title.feature=00800.mpls",
+            "disc.feature.file=00800",
         ] {
-            let h = props_hint(text).unwrap_or_else(|| panic!("{text}"));
+            let h = props_hint(text, &|_| true).unwrap_or_else(|| panic!("{text}"));
             assert_eq!(h.playlist_id, Some(800), "{text}");
         }
+    }
+
+    // A bare `feature.id` number is not a playlist; a line naming a playlist that
+    // is not on the disc gives way to a later one that is.
+    #[test]
+    fn props_hint_needs_a_playlist_and_skips_missing_ones() {
+        assert_eq!(props_hint("main.feature.id=00800", &|_| true), None);
+        let text = "feature.playlist=00012\nmain.feature.playlist=00800\n";
+        let h = props_hint(text, &|id| id == 800).expect("later real playlist");
+        assert_eq!(h.playlist_id, Some(800));
     }
 
     // ── mpls fixture builder (compact single-play-item playlist) ─────────────
@@ -783,6 +818,29 @@ mod tests {
             vec![],
         );
         assert_eq!(resolve(&mut disc, &udf, &[]), None);
+    }
+
+    // With scan stats available, a candidate the scan dropped (sub-30 s or
+    // unparseable) scores as short without being re-read.
+    #[test]
+    fn candidates_missing_from_scan_stats_score_as_short() {
+        let class = build_class(&["00800.mpls", "00801.mpls"]);
+        let jar = build_jar(&[("com/studio/MainXlet.class", class)]);
+        let (mut disc, udf) = build_disc(
+            vec![
+                ("00800.mpls", build_mpls(7000, 6)),
+                ("00801.mpls", b"garbage".to_vec()),
+            ],
+            vec![("00000.jar", jar)],
+            vec![],
+        );
+        let known = [PlaylistStat {
+            id: 800,
+            secs: 7000,
+            audio: 6,
+        }];
+        let hint = resolve(&mut disc, &udf, &known).expect("hint");
+        assert_eq!(hint.playlist_id, Some(800));
     }
 
     // Stats for playlists the scan already parsed are reused, not re-read.
