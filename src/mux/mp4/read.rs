@@ -136,6 +136,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 channels,
                 sample_rate: entry_sample_rate,
                 dts_max_rate,
+                dts_hd,
             }) = parse_stsd(stsd)
             else {
                 tracing::warn!(
@@ -168,7 +169,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
                     language: language.clone().unwrap_or_else(|| "und".into()),
                     sample_rate: SampleRate::from_hz(
                         dts_max_rate
-                            .unwrap_or_else(|| audio_rate(entry_sample_rate, timescale, codec)),
+                            .unwrap_or_else(|| audio_rate(entry_sample_rate, timescale, dts_hd)),
                     ),
                     secondary: false,
                     purpose: LabelPurpose::Normal,
@@ -679,6 +680,8 @@ struct StsdInfo {
     sample_rate: u32,
     /// DTS `ddts` DTSSamplingFrequency when it is a known rate.
     dts_max_rate: Option<u32>,
+    /// `Some(dtsh|dtsl)` for a DTS entry; `None` otherwise.
+    dts_hd: Option<bool>,
 }
 
 /// stsd → codec + dimensions + codec_private + channel count (first entry).
@@ -728,6 +731,7 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             channels: 0,
             sample_rate: 0,
             dts_max_rate: None,
+            dts_hd: None,
         })
     } else {
         // AudioSampleEntry (ISO/IEC 14496-12 §12.2.3): 28 bytes then children. Under
@@ -778,22 +782,29 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             channels,
             sample_rate,
             dts_max_rate,
+            dts_hd: (codec == Codec::Dts).then(|| matches!(&fourcc, b"dtsh" | b"dtsl")),
         })
     }
 }
 
 // Sample rate from the entry rate and the mdhd timescale. The entry wins when
-// it is known, except DTS, whose entry holds the 48/44.1/32 kHz family base.
-fn audio_rate(entry: u32, timescale: u32, codec: Codec) -> u32 {
+// it is known; a DTS-HD entry (`dts_hd`) holds the family base of a 2x/4x rate.
+fn audio_rate(entry: u32, timescale: u32, dts_hd: Option<bool>) -> u32 {
     let known = |hz| SampleRate::from_hz(hz) != SampleRate::Unknown;
     if matches!(entry, 0 | 1 | 0xFFFF) {
         return timescale;
     }
-    let multiple = timescale > entry && known(timescale) && timescale.is_multiple_of(entry);
-    if multiple && (codec == Codec::Dts || (!known(entry) && timescale > 0xFFFF)) {
-        return timescale;
-    }
-    entry
+    let is = |k: u32| entry.checked_mul(k) == Some(timescale) && known(timescale);
+    let wider = match dts_hd {
+        Some(hd) => hd && (is(2) || is(4)),
+        None => {
+            !known(entry)
+                && timescale > 0xFFFF
+                && known(timescale)
+                && timescale.is_multiple_of(entry)
+        }
+    };
+    if wider { timescale } else { entry }
 }
 
 /// Read an MPEG-4 expandable descriptor length (ISO/IEC 14496-1), advancing `pos`.
@@ -2372,6 +2383,25 @@ mod tests {
             e[24..28].copy_from_slice(&(entry_rate << 16).to_be_bytes());
             let a = read_audio(audio_moov(96_000, b"dtsh", &e));
             assert_eq!(a.sample_rate, SampleRate::S96, "entry {entry_rate}");
+        }
+    }
+
+    // Without ddts, only a DTS-HD entry takes a 2x/4x mdhd timescale; dtsc keeps its rate.
+    #[test]
+    fn a_dts_timescale_counts_only_as_2x_or_4x_on_dts_hd_entries() {
+        let entry = |hz: u32| {
+            let mut e = audio_entry(6, 0, &[]);
+            e[24..28].copy_from_slice(&(hz << 16).to_be_bytes());
+            e
+        };
+        for (fourcc, entry_hz, ts, want) in [
+            (b"dtsc", 48_000, 96_000, SampleRate::S48),
+            (b"dtsh", 48_000, 192_000, SampleRate::S192),
+            (b"dtsl", 44_100, 88_200, SampleRate::S88_2),
+            (b"dtsh", 32_000, 96_000, SampleRate::from_hz(32_000)),
+        ] {
+            let a = read_audio(audio_moov(ts, fourcc, &entry(entry_hz)));
+            assert_eq!(a.sample_rate, want, "{fourcc:?} {entry_hz} {ts}");
         }
     }
 

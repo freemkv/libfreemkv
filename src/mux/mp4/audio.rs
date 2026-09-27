@@ -366,10 +366,14 @@ fn ddts_box(c: &DtsConfig, max_rate: u32) -> Vec<u8> {
     out.extend_from_slice(&bitrate.to_be_bytes()); // maxBitrate
     out.extend_from_slice(&bitrate.to_be_bytes()); // avgBitrate
     out.push(if c.has_extension { 24 } else { 16 }); // pcmSampleDepth
+    // FrameDuration counts samples at DTSSamplingFrequency, not the core rate.
+    let at_max = (u64::from(c.frame_samples) * u64::from(max_rate))
+        .checked_div(u64::from(c.sample_rate))
+        .unwrap_or(u64::from(c.frame_samples));
     // Bit-packed tail (56 bits): FrameDuration2 StreamConstruction5 CoreLFEPresent1
     // CoreLayout6 CoreSize14 StereoDownmix1 RepresentationType3 ChannelLayout16
     // MultiAssetFlag1 LBRDurationMod1 ReservedBoxPresent1 Reserved5
-    let frame_duration = match c.frame_samples {
+    let frame_duration = match at_max {
         0..=512 => 0,
         513..=1024 => 1,
         1025..=2048 => 2,
@@ -685,6 +689,11 @@ mod tests {
         assert_eq!(&e[32..34], &48_000u16.to_be_bytes(), "entry samplerate");
         let ddts = e.windows(4).position(|w| w == b"ddts").unwrap();
         assert_eq!(&e[ddts + 4..ddts + 8], &96_000u32.to_be_bytes());
+        // FrameDuration counts samples at DTSSamplingFrequency: 512 core samples
+        // at 48 kHz are 1024 at 96 kHz → code 1.
+        let c = parse_dts(&f).unwrap();
+        assert_eq!(ddts_tail(&ddts_box(&c, 96_000))[0] >> 6, 1);
+        assert_eq!(ddts_tail(&ddts_box(&c, 48_000))[0] >> 6, 0);
         // A title rate that is not a multiple of the core rate is ignored.
         let e = dolby_sample_entry(Codec::DtsHdMa, &f, 44_100).unwrap();
         let ddts = e.windows(4).position(|w| w == b"ddts").unwrap();
