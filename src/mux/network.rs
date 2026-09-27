@@ -150,9 +150,12 @@ enum Mode {
     Write {
         writer: BufWriter<TcpStream>,
         header_written: bool,
+        timings: Vec<crate::pes::TrackTiming>,
+        padded: bool,
     },
     Read {
         reader: BufReader<HaltRead>,
+        meta: meta::M2tsMeta,
     },
 }
 
@@ -191,6 +194,8 @@ impl NetworkStream {
             mode: Mode::Write {
                 writer: BufWriter::with_capacity(NET_BUF_SIZE, stream),
                 header_written: false,
+                timings: Vec::new(),
+                padded: false,
             },
         })
     }
@@ -270,14 +275,13 @@ impl NetworkStream {
         );
 
         // Read FMKV metadata header
-        let disc_title = meta::read_header(&mut reader)
+        let meta = meta::read_header(&mut reader)
             .map_err(|e| reader.get_ref().halted_or(e))?
-            .ok_or_else(|| -> io::Error { crate::error::Error::NoMetadata.into() })?
-            .to_title();
+            .ok_or_else(|| -> io::Error { crate::error::Error::NoMetadata.into() })?;
 
         Ok(Self {
-            disc_title,
-            mode: Mode::Read { reader },
+            disc_title: meta.to_title(),
+            mode: Mode::Read { reader, meta },
         })
     }
 }
@@ -285,14 +289,18 @@ impl NetworkStream {
 // Write the FMKV header exactly once, before any frames. Always writes
 // (even for a title with no streams) so read_header() finds the magic
 // and doesn't fall into NoMetadata on a zero-frame stream.
+// Returns whether frames carry the DiscardPadding extension (header v2).
 fn ensure_header_written(
     writer: &mut BufWriter<TcpStream>,
     header_written: &mut bool,
     disc_title: &DiscTitle,
+    timings: &[crate::pes::TrackTiming],
+    padded: &mut bool,
 ) -> io::Result<()> {
     if !*header_written {
-        let m = meta::M2tsMeta::from_title(disc_title);
+        let m = meta::M2tsMeta::from_title(disc_title).with_timings(timings);
         meta::write_header(writer, &m)?;
+        *padded = m.frame_padding;
         *header_written = true;
     }
     Ok(())
@@ -301,8 +309,9 @@ fn ensure_header_written(
 impl crate::pes::Stream for NetworkStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         match &mut self.mode {
-            Mode::Read { reader } => {
-                crate::pes::PesFrame::deserialize(reader).map_err(|e| reader.get_ref().halted_or(e))
+            Mode::Read { reader, meta } => {
+                crate::pes::PesFrame::deserialize_ext(reader, meta.frame_padding)
+                    .map_err(|e| reader.get_ref().halted_or(e))
             }
             _ => Err(crate::error::Error::StreamWriteOnly.into()),
         }
@@ -312,9 +321,11 @@ impl crate::pes::Stream for NetworkStream {
             Mode::Write {
                 writer,
                 header_written,
+                timings,
+                padded,
             } => {
-                ensure_header_written(writer, header_written, &self.disc_title)?;
-                frame.serialize(writer)
+                ensure_header_written(writer, header_written, &self.disc_title, timings, padded)?;
+                frame.serialize_ext(writer, *padded)
             }
             _ => Err(crate::error::Error::StreamReadOnly.into()),
         }
@@ -323,12 +334,14 @@ impl crate::pes::Stream for NetworkStream {
         if let Mode::Write {
             writer,
             header_written,
+            timings,
+            padded,
         } = &mut self.mode
         {
             // Always emit the FMKV header before shutdown, even for a zero-frame stream,
             // or the receiver's read_header() sees a clean EOF and rejects the stream
             // with NoMetadata.
-            ensure_header_written(writer, header_written, &self.disc_title)?;
+            ensure_header_written(writer, header_written, &self.disc_title, timings, padded)?;
             writer.flush()?;
             writer.get_ref().shutdown(std::net::Shutdown::Write)?;
         }
@@ -337,10 +350,49 @@ impl crate::pes::Stream for NetworkStream {
     fn info(&self) -> &DiscTitle {
         &self.disc_title
     }
+    fn track_timing(&self, track: usize) -> crate::pes::TrackTiming {
+        match &self.mode {
+            Mode::Read { meta, .. } => meta.timing(track),
+            Mode::Write { .. } => Default::default(),
+        }
+    }
+    fn set_track_timing(
+        &mut self,
+        track: usize,
+        timing: crate::pes::TrackTiming,
+    ) -> io::Result<()> {
+        match &mut self.mode {
+            Mode::Write {
+                header_written: false,
+                timings,
+                ..
+            } => set_timing(timings, track, timing, self.disc_title.streams.len()),
+            // The header (which carries it) is already on the wire.
+            Mode::Write { .. } => Err(crate::error::Error::NoMetadata.into()),
+            Mode::Read { .. } => Err(crate::error::Error::StreamReadOnly.into()),
+        }
+    }
     // The sender's codec privates travel in the FMKV header (as for stdio).
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
         self.disc_title.codec_privates.get(track).cloned().flatten()
     }
+}
+
+// Record `timing` for stream `track` of a `tracks`-stream title.
+pub(crate) fn set_timing(
+    timings: &mut Vec<crate::pes::TrackTiming>,
+    track: usize,
+    timing: crate::pes::TrackTiming,
+    tracks: usize,
+) -> io::Result<()> {
+    if track >= tracks {
+        return Err(crate::error::Error::MuxTrackRange { track, tracks }.into());
+    }
+    if timings.len() < tracks {
+        timings.resize(tracks, Default::default());
+    }
+    timings[track] = timing;
+    Ok(())
 }
 
 // NetworkStream is PES-only — no IOStream/Read/Write byte interface.
@@ -874,9 +926,11 @@ mod tests {
         if let Mode::Write {
             writer: w,
             header_written,
+            padded,
+            ..
         } = &mut writer.mode
         {
-            ensure_header_written(w, header_written, &sample_title()).unwrap();
+            ensure_header_written(w, header_written, &sample_title(), &[], padded).unwrap();
             w.flush().unwrap();
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -906,9 +960,11 @@ mod tests {
         if let Mode::Write {
             writer: w,
             header_written,
+            padded,
+            ..
         } = &mut writer.mode
         {
-            ensure_header_written(w, header_written, &sample_title()).unwrap();
+            ensure_header_written(w, header_written, &sample_title(), &[], padded).unwrap();
             w.flush().unwrap();
         }
         let err = rx
@@ -970,5 +1026,70 @@ mod tests {
             (0..2).map(|i| ns.codec_private(i)).collect()
         });
         (addr, handle)
+    }
+
+    // mkv(opus) -> network -> mkv: CodecDelay/SeekPreRoll and DiscardPadding
+    // survive the PES wire hop.
+    #[test]
+    fn opus_track_timing_and_padding_survive_network_to_mkv() {
+        use crate::pes::{self, Stream as _};
+        let mut title = sample_title();
+        title.streams.truncate(1);
+        title.streams[0] = Stream::Audio(AudioStream {
+            pid: 0x1100,
+            codec: Codec::Opus,
+            channels: AudioChannels::Stereo,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: crate::disc::LabelPurpose::Normal,
+            label: String::new(),
+        });
+        title.codec_privates = vec![Some(b"OpusHead\x01\x02".to_vec())];
+        let timing = pes::TrackTiming {
+            codec_delay_ns: 6_500_000,
+            seek_preroll_ns: 80_000_000,
+        };
+        let frame = pes::PesFrame {
+            discard_padding_ns: -2_500_000,
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xFC, 1, 2, 3],
+            duration_ns: Some(20_000_000),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut ns = NetworkStream::accept_from(listener).unwrap();
+            let got = ns.track_timing(0);
+            let f = ns.read().unwrap().unwrap();
+            (ns.info().clone(), got, f)
+        });
+        let mut w = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&title);
+        w.set_track_timing(0, timing).unwrap();
+        w.write(&frame).unwrap();
+        w.finish().unwrap();
+        let (rx_title, rx_timing, rx_frame) = handle.join().unwrap();
+        assert_eq!(rx_timing, timing);
+        assert_eq!(rx_frame.discard_padding_ns, frame.discard_padding_ns);
+        assert_eq!(rx_frame.data, frame.data);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.mkv");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut mkv =
+            crate::mux::mkvstream::MkvStream::create(Box::new(file), &rx_title, None).unwrap();
+        mkv.set_track_timing(0, rx_timing).unwrap();
+        mkv.write(&rx_frame).unwrap();
+        mkv.finish().unwrap();
+        let mut back =
+            crate::mux::mkvstream::MkvStream::open(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(back.track_timing(0), timing);
+        assert_eq!(back.read().unwrap().unwrap().discard_padding_ns, -2_500_000);
     }
 }

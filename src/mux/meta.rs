@@ -26,8 +26,10 @@ const MAGIC: [u8; 8] = [b'F', b'M', b'K', b'V', 0x00, 0x01, 0x00, 0x00];
 
 /// Highest header format version this build understands. A header tagged with
 /// a newer version is rejected so older readers cleanly refuse incompatible
-/// formats instead of silently mis-parsing them as v1.
-const SUPPORTED_VERSION: u8 = 1;
+/// formats instead of silently mis-parsing them as v1. Version 2 = every PES
+/// frame after the header carries an 8-byte DiscardPadding extension; it is
+/// written only when a track has decoder timing, so other streams stay v1.
+const SUPPORTED_VERSION: u8 = 2;
 
 /// Index of the version byte within [`MAGIC`].
 const VERSION_BYTE: usize = 5;
@@ -47,6 +49,24 @@ pub struct M2tsMeta {
     pub duration: f64,
     /// Stream descriptors.
     pub streams: Vec<MetaStream>,
+    /// Per-track decoder timing (Opus CodecDelay/SeekPreRoll); non-default only.
+    /// Readers that predate it ignore the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timings: Vec<MetaTiming>,
+    /// Frames on the wire carry the DiscardPadding extension (header v2). Taken
+    /// from the version byte, not the JSON.
+    #[serde(skip)]
+    pub frame_padding: bool,
+}
+
+/// Decoder timing for one stream index, carried in the FMKV header.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MetaTiming {
+    pub track: usize,
+    #[serde(default)]
+    pub codec_delay_ns: u64,
+    #[serde(default)]
+    pub seek_preroll_ns: u64,
 }
 
 /// A single stream descriptor in the metadata.
@@ -165,7 +185,38 @@ impl M2tsMeta {
             title: title.playlist.clone(),
             duration: title.duration_secs,
             streams,
+            timings: Vec::new(),
+            frame_padding: false,
         }
+    }
+
+    /// Attach per-track decoder timing; any non-default timing switches the
+    /// stream to header v2 so DiscardPadding travels with each frame.
+    pub fn with_timings(mut self, timings: &[crate::pes::TrackTiming]) -> Self {
+        self.timings = timings
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| **t != crate::pes::TrackTiming::default())
+            .map(|(track, t)| MetaTiming {
+                track,
+                codec_delay_ns: t.codec_delay_ns,
+                seek_preroll_ns: t.seek_preroll_ns,
+            })
+            .collect();
+        self.frame_padding = !self.timings.is_empty();
+        self
+    }
+
+    /// Decoder timing of stream `track` (default when the header has none).
+    pub fn timing(&self, track: usize) -> crate::pes::TrackTiming {
+        self.timings
+            .iter()
+            .find(|t| t.track == track)
+            .map(|t| crate::pes::TrackTiming {
+                codec_delay_ns: t.codec_delay_ns,
+                seek_preroll_ns: t.seek_preroll_ns,
+            })
+            .unwrap_or_default()
     }
 
     /// Convert back to a library Title (for remux).
@@ -310,7 +361,11 @@ pub fn write_header(w: &mut impl Write, meta: &M2tsMeta) -> io::Result<()> {
     let padded_len = raw_len.div_ceil(BD_SOURCE_PACKET_BYTES) * BD_SOURCE_PACKET_BYTES;
     let padding = padded_len - raw_len;
 
-    w.write_all(&MAGIC)?;
+    let mut magic = MAGIC;
+    if meta.frame_padding {
+        magic[VERSION_BYTE] = 2;
+    }
+    w.write_all(&magic)?;
     w.write_all(&json_len.to_be_bytes())?;
     w.write_all(&json)?;
     if padding > 0 {
@@ -367,8 +422,9 @@ pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
     let mut json_buf = vec![0u8; json_len];
     r.read_exact(&mut json_buf)?;
 
-    let meta: M2tsMeta =
+    let mut meta: M2tsMeta =
         serde_json::from_slice(&json_buf).map_err(|_| crate::error::Error::NoMetadata)?;
+    meta.frame_padding = magic[VERSION_BYTE] >= 2;
 
     // Skip padding to next 192-byte boundary (at most BD_SOURCE_PACKET_BYTES-1 bytes →
     // a stack buffer, no heap allocation).
@@ -625,7 +681,7 @@ mod tests {
         // The version byte lives at index 5. A regression that shifted the
         // version byte would make every header read the wrong version.
         assert_eq!(&MAGIC[0..4], b"FMKV");
-        assert_eq!(MAGIC[VERSION_BYTE], SUPPORTED_VERSION);
+        assert_eq!(MAGIC[VERSION_BYTE], 1, "the base (v1) magic");
         assert_eq!(VERSION_BYTE, 5);
         assert_eq!(MAGIC.len(), 8);
     }
@@ -812,5 +868,24 @@ mod tests {
         let back = read_header(&mut cur).unwrap().unwrap().to_title();
         assert_eq!(back.playlist, "The Movie");
         assert_eq!(back.duration_secs, 7384.5);
+    }
+
+    // Timing switches the header to v2 (older readers refuse it cleanly); no
+    // timing keeps the v1 wire byte-identical.
+    #[test]
+    fn timing_round_trips_and_selects_the_header_version() {
+        let t = video_title(HdrFormat::Sdr, ColorSpace::Bt709);
+        let timing = crate::pes::TrackTiming {
+            codec_delay_ns: 1,
+            seek_preroll_ns: 2,
+        };
+        for (timings, version) in [(vec![], 1u8), (vec![timing], 2)] {
+            let mut buf = Vec::new();
+            write_header(&mut buf, &M2tsMeta::from_title(&t).with_timings(&timings)).unwrap();
+            assert_eq!(buf[VERSION_BYTE], version);
+            let back = read_header(&mut io::Cursor::new(&buf)).unwrap().unwrap();
+            assert_eq!(back.frame_padding, version == 2);
+            assert_eq!(back.timing(0), timings.first().copied().unwrap_or_default());
+        }
     }
 }

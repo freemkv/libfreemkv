@@ -21,6 +21,11 @@ pub struct StdioStream {
     /// when no header was present — `headers_ready()` must gate on the
     /// metadata actually being available, not merely on having looked.
     meta_parsed: bool,
+    /// Write side: per-track decoder timing, sent in the header. Read side: the
+    /// header's timing.
+    timings: Vec<crate::pes::TrackTiming>,
+    /// Frames carry the DiscardPadding extension (FMKV header v2).
+    padded: bool,
 }
 
 impl StdioStream {
@@ -33,6 +38,8 @@ impl StdioStream {
             header_written: false,
             header_read: false,
             meta_parsed: false,
+            timings: Vec::new(),
+            padded: false,
         }
     }
 
@@ -45,6 +52,8 @@ impl StdioStream {
             header_written: false,
             header_read: false,
             meta_parsed: false,
+            timings: Vec::new(),
+            padded: false,
         }
     }
 
@@ -54,8 +63,9 @@ impl StdioStream {
         if let Some(w) = &mut self.writer
             && !self.header_written
         {
-            let m = meta::M2tsMeta::from_title(&self.disc_title);
+            let m = meta::M2tsMeta::from_title(&self.disc_title).with_timings(&self.timings);
             meta::write_header(w, &m)?;
+            self.padded = m.frame_padding;
             self.header_written = true;
         }
         Ok(())
@@ -73,6 +83,10 @@ impl StdioStream {
             // garbage. Ok(None) (magic mismatch / clean EOF) stays non-error (default title).
             if let Some(m) = meta::read_header(r)? {
                 self.disc_title = m.to_title();
+                self.timings = (0..self.disc_title.streams.len())
+                    .map(|i| m.timing(i))
+                    .collect();
+                self.padded = m.frame_padding;
                 self.meta_parsed = true;
             }
         }
@@ -84,7 +98,7 @@ impl crate::pes::Stream for StdioStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         self.ensure_header_read()?;
         match &mut self.reader {
-            Some(r) => crate::pes::PesFrame::deserialize(r),
+            Some(r) => crate::pes::PesFrame::deserialize_ext(r, self.padded),
             None => Err(crate::error::Error::StreamWriteOnly.into()),
         }
     }
@@ -94,7 +108,7 @@ impl crate::pes::Stream for StdioStream {
         }
         self.ensure_header_written()?;
         match &mut self.writer {
-            Some(w) => frame.serialize(w),
+            Some(w) => frame.serialize_ext(w, self.padded),
             None => Err(crate::error::Error::StreamReadOnly.into()),
         }
     }
@@ -110,6 +124,26 @@ impl crate::pes::Stream for StdioStream {
     }
     fn info(&self) -> &DiscTitle {
         &self.disc_title
+    }
+
+    // Read side: the header's timing, available once the first read parsed it.
+    fn track_timing(&self, track: usize) -> crate::pes::TrackTiming {
+        self.timings.get(track).copied().unwrap_or_default()
+    }
+
+    fn set_track_timing(
+        &mut self,
+        track: usize,
+        timing: crate::pes::TrackTiming,
+    ) -> io::Result<()> {
+        if self.writer.is_none() {
+            return Err(crate::error::Error::StreamReadOnly.into());
+        }
+        if self.header_written {
+            return Err(crate::error::Error::NoMetadata.into());
+        }
+        let tracks = self.disc_title.streams.len();
+        super::network::set_timing(&mut self.timings, track, timing, tracks)
     }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
