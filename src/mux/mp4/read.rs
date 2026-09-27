@@ -782,7 +782,7 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             channels,
             sample_rate,
             dts_max_rate,
-            dts_hd: (codec == Codec::Dts).then(|| matches!(&fourcc, b"dtsh" | b"dtsl")),
+            dts_hd: (codec == Codec::Dts).then_some(matches!(&fourcc, b"dtsh" | b"dtsl")),
         })
     }
 }
