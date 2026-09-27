@@ -103,6 +103,8 @@ const MAX_PENDING_FRAMES: usize = 4096;
 // hundreds of KB, so 4096 of them exceeds a gigabyte). Far above any real
 // audio-only prefix, and finite.
 const MAX_PENDING_BYTES: usize = 64 << 20;
+// open() read-ahead cap while inferring PCM depths (plus at most one block).
+const PCM_PROBE_BYTES: usize = 64 << 20;
 
 enum Mode {
     Write(WriteMode),
@@ -676,25 +678,39 @@ impl MkvStream {
         Ok(stream)
     }
 
-    // Decide the depth of each PCM track without BitDepth from its first blocks
-    // (bytes over duration). Undecidable tracks are exposed as Unknown, not LPCM.
+    // Decide the depth of each PCM track without BitDepth from its first blocks.
+    // Read-ahead stops at PCM_PROBE_BYTES or PCM_PROBE_FRAMES of the track itself.
     fn resolve_pcm_depths(&mut self) -> io::Result<()> {
-        const MAX_FRAMES: usize = 512;
-        let unresolved = |s: &Self| match &s.mode {
-            Mode::Read(rs) => rs.tracks.pcm_infer.iter().any(Option::is_some),
-            Mode::Write(_) => false,
-        };
-        let mut buffered = Vec::new();
-        while unresolved(self) {
-            let decided = self.try_infer_pcm(&buffered, buffered.len() >= MAX_FRAMES);
+        let mut buffered: Vec<crate::pes::PesFrame> = Vec::new();
+        let mut bytes = 0usize;
+        loop {
+            let (open, lace) = match &self.mode {
+                Mode::Read(rs) => (
+                    rs.tracks.pcm_infer.iter().any(Option::is_some),
+                    rs.pending.iter().map(|f| f.data.len()).sum::<usize>(),
+                ),
+                Mode::Write(_) => (false, 0),
+            };
+            if !open {
+                break;
+            }
+            let end = if bytes.saturating_add(lace) >= PCM_PROBE_BYTES {
+                ProbeEnd::Capped
+            } else {
+                ProbeEnd::Reading
+            };
+            let decided = self.try_infer_pcm(&buffered, end);
             if !decided.is_empty() {
                 self.apply_pcm_decisions(&decided, &mut buffered);
                 continue;
             }
             match self.read_parsed()? {
-                Some(f) => buffered.push(f),
+                Some(f) => {
+                    bytes = bytes.saturating_add(f.data.len());
+                    buffered.push(f);
+                }
                 None => {
-                    let decided = self.try_infer_pcm(&buffered, true);
+                    let decided = self.try_infer_pcm(&buffered, ProbeEnd::Eof);
                     self.apply_pcm_decisions(&decided, &mut buffered);
                 }
             }
@@ -707,12 +723,12 @@ impl MkvStream {
         Ok(())
     }
 
-    // `(track, Some(depth) | None=undecidable)` for tracks decidable from
-    // `frames`; with `last`, every still-open track is decided.
+    // `(track, Some(depth) | None=contradicted)` for tracks decidable from `frames`.
+    // Past the probe budget an undecided depth takes ffmpeg's 16-bit default.
     fn try_infer_pcm(
         &self,
         frames: &[crate::pes::PesFrame],
-        last: bool,
+        end: ProbeEnd,
     ) -> Vec<(usize, Option<u64>)> {
         let Mode::Read(rs) = &self.mode else {
             return Vec::new();
@@ -721,20 +737,16 @@ impl MkvStream {
         for (idx, info) in rs.tracks.pcm_infer.iter().enumerate() {
             let Some(info) = info else { continue };
             let mine: Vec<_> = frames.iter().filter(|f| f.track == idx).collect();
-            let dur = |i: usize| -> Option<i64> {
-                let f = mine.get(i)?;
-                f.duration_ns
-                    .and_then(|d| i64::try_from(d).ok())
-                    .or_else(|| mine.get(i + 1).map(|n| n.pts - f.pts))
+            let depth = match pcm_depth_fit(&mine, *info, rs.ts_scale_ns) {
+                PcmFit::One(w) => Some(w * 8),
+                PcmFit::Neither => None,
+                PcmFit::Both if end == ProbeEnd::Reading && mine.len() < PCM_PROBE_FRAMES => {
+                    continue;
+                }
+                PcmFit::Both if end == ProbeEnd::Eof && mine.is_empty() => None,
+                PcmFit::Both => Some(16),
             };
-            let depth = (0..mine.len()).find_map(|i| {
-                pcm_bytes_per_sample(mine[i].data.len(), dur(i)?, info.rate, info.channels)
-            });
-            match depth {
-                Some(w) => out.push((idx, Some(w * 8))),
-                None if last => out.push((idx, None)),
-                None => {}
-            }
+            out.push((idx, depth));
         }
         out
     }
@@ -1376,16 +1388,66 @@ struct PcmInfer {
     channels: u8,
 }
 
-// Bytes per sample implied by `bytes` of `channels`-channel audio lasting `dur_ns`.
-fn pcm_bytes_per_sample(bytes: usize, dur_ns: i64, rate: f64, channels: u8) -> Option<u64> {
-    let samples = dur_ns as f64 / 1e9 * rate * f64::from(channels);
-    if dur_ns <= 0 || samples < 1.0 {
-        return None;
+// Frames of one PCM track a depth probe may buffer before settling on a default.
+const PCM_PROBE_FRAMES: usize = 512;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeEnd {
+    Reading,
+    Capped,
+    Eof,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PcmFit {
+    One(u64),
+    Both,
+    Neither,
+}
+
+// Which of 2/3 bytes per sample fits every block's size and the bytes over the
+// measured span, allowing two timestamp ticks of quantisation error.
+fn pcm_depth_fit(frames: &[&crate::pes::PesFrame], info: PcmInfer, tick_ns: i64) -> PcmFit {
+    let ch = u64::from(info.channels.max(1));
+    let mut fits = [2u64, 3].map(|w| {
+        frames
+            .iter()
+            .all(|f| (f.data.len() as u64).is_multiple_of(ch * w))
+    });
+    if let Some((bytes, span_ns)) = pcm_span(frames) {
+        let err = tick_ns.max(1).saturating_mul(2);
+        let per_ns = info.rate * ch as f64 / 1e9;
+        for (fit, w) in fits.iter_mut().zip([2.0f64, 3.0]) {
+            let lo = span_ns.saturating_sub(err).max(0) as f64 * per_ns * w * 0.99;
+            let hi = span_ns.saturating_add(err) as f64 * per_ns * w * 1.01;
+            *fit &= (lo..=hi).contains(&(bytes as f64));
+        }
     }
-    let bps = bytes as f64 / samples;
-    [2u64, 3]
-        .into_iter()
-        .find(|&w| (bps - w as f64).abs() < 0.05 * w as f64)
+    match fits {
+        [true, false] => PcmFit::One(2),
+        [false, true] => PcmFit::One(3),
+        [true, true] => PcmFit::Both,
+        [false, false] => PcmFit::Neither,
+    }
+}
+
+// `(bytes, ns)` of the longest run of frames whose end time is known: a later
+// frame's timestamp, or the last frame's timestamp plus its duration.
+fn pcm_span(frames: &[&crate::pes::PesFrame]) -> Option<(u64, i64)> {
+    let first = frames.first()?.pts;
+    let mut best = None;
+    let mut bytes = 0u64;
+    for (i, f) in frames.iter().enumerate() {
+        if i > 0 && f.pts > frames[i - 1].pts {
+            best = Some((bytes, f.pts.saturating_sub(first)));
+        }
+        bytes = bytes.saturating_add(f.data.len() as u64);
+    }
+    let last = frames.last()?;
+    if let Some(d) = last.duration_ns.and_then(|d| i64::try_from(d).ok()) {
+        best = Some((bytes, last.pts.saturating_add(d).saturating_sub(first)));
+    }
+    best.filter(|&(_, ns)| ns > 0)
 }
 
 // Source layout of a PCM track whose samples are rewritten to the 24-bit
@@ -5579,15 +5641,12 @@ mod tests {
     fn pcm_without_bit_depth_infers_the_depth_from_block_sizes() {
         // Blocks 2 ms apart: 96 stereo sample frames at 48 kHz.
         let b24: Vec<u8> = (0..96 * 2 * 3).map(|i| i as u8).collect();
-        let bytes = pcm_mkv_blocks(
-            ebml::CODEC_PCM_BE,
-            None,
-            &[(0, b24.clone()), (2, b24.clone())],
-        );
+        let blocks: Vec<_> = (0..10u64).map(|i| (i * 2, b24.clone())).collect();
+        let bytes = pcm_mkv_blocks(ebml::CODEC_PCM_BE, None, &blocks);
         let mut s = MkvStream::open(Cursor::new(bytes)).unwrap();
         assert_eq!(stream_codec(&s.info().streams[0]), Codec::Lpcm);
         let frames = drain(&mut s);
-        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.len(), 10);
         assert_eq!(frames[0].data, b24, "24-bit big-endian passes through");
 
         let b16 = [0x12u8, 0x34].repeat(96 * 2);
@@ -5599,6 +5658,118 @@ mod tests {
         let bytes = pcm_mkv_blocks(ebml::CODEC_PCM_BE, None, &[(0, odd.clone()), (2, odd)]);
         let s = MkvStream::open(Cursor::new(bytes)).unwrap();
         assert_eq!(stream_codec(&s.info().streams[0]), Codec::Unknown(0));
+    }
+
+    // Header for video track 1 (HEVC) + stereo 48 kHz PCM track 2 without BitDepth.
+    fn video_then_pcm_header() -> Vec<u8> {
+        let mut video = Vec::new();
+        ebml::write_uint(&mut video, ebml::TRACK_NUMBER, 1).unwrap();
+        ebml::write_uint(&mut video, ebml::TRACK_TYPE, 1).unwrap();
+        ebml::write_string(&mut video, ebml::CODEC_ID, ebml::CODEC_HEVC).unwrap();
+        let mut pcm = Vec::new();
+        ebml::write_uint(&mut pcm, ebml::TRACK_NUMBER, 2).unwrap();
+        ebml::write_uint(&mut pcm, ebml::TRACK_TYPE, 2).unwrap();
+        ebml::write_string(&mut pcm, ebml::CODEC_ID, ebml::CODEC_PCM_BE).unwrap();
+        let mut audio = Vec::new();
+        ebml::write_uint(&mut audio, ebml::CHANNELS, 2).unwrap();
+        ebml::write_id(&mut audio, ebml::SAMPLING_FREQUENCY).unwrap();
+        ebml::write_size(&mut audio, 8).unwrap();
+        audio.extend_from_slice(&48_000f64.to_be_bytes());
+        ebml::write_binary(&mut pcm, ebml::AUDIO, &audio).unwrap();
+        let mut tracks = Vec::new();
+        ebml::write_binary(&mut tracks, ebml::TRACK_ENTRY, &video).unwrap();
+        ebml::write_binary(&mut tracks, ebml::TRACK_ENTRY, &pcm).unwrap();
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_binary(&mut out, ebml::TRACKS, &tracks).unwrap();
+        out
+    }
+
+    fn simple_block(track: u8, ms: u64, payload: &[u8]) -> Vec<u8> {
+        let mut block = vec![0x80 | track, 0, 0, 0x80];
+        block.extend_from_slice(payload);
+        cluster_with_simple_block(ms, &block)
+    }
+
+    fn pending_bytes(s: &MkvStream) -> usize {
+        match &s.mode {
+            Mode::Read(rs) => rs.pending.iter().map(|f| f.data.len()).sum(),
+            Mode::Write(_) => panic!("expected a read stream"),
+        }
+    }
+
+    // 72-sample blocks with 1 ms timestamps: one block alone reads as 24-bit.
+    #[test]
+    fn short_16_bit_pcm_blocks_with_quantised_timestamps_infer_16_bit() {
+        let b16 = [0x12u8, 0x34].repeat(72 * 2);
+        let blocks: Vec<_> = (0..30u64).map(|i| (i * 3 / 2, b16.clone())).collect();
+        let bytes = pcm_mkv_blocks(ebml::CODEC_PCM_BE, None, &blocks);
+        let mut s = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(stream_codec(&s.info().streams[0]), Codec::Lpcm);
+        let f = drain(&mut s);
+        assert_eq!(f[0].data.len(), 72 * 2 * 3, "widened from 16-bit");
+        assert_eq!(f[0].data[..3], [0x12, 0x34, 0]);
+    }
+
+    // A PCM track that starts after 600 video frames still resolves its depth.
+    #[test]
+    fn a_late_starting_pcm_track_still_resolves_its_depth() {
+        let mut bytes = video_then_pcm_header();
+        for i in 0..600u64 {
+            bytes.extend(simple_block(1, i, &[0u8; 100]));
+        }
+        let b16 = [0x12u8, 0x34].repeat(96 * 2);
+        for i in 0..30u64 {
+            bytes.extend(simple_block(2, 600 + i * 2, &b16));
+        }
+        let mut s = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(stream_codec(&s.info().streams[1]), Codec::Lpcm);
+        let pcm: Vec<_> = drain(&mut s).into_iter().filter(|f| f.track == 1).collect();
+        assert_eq!(pcm.len(), 30);
+        assert_eq!(pcm[0].data[..3], [0x12, 0x34, 0]);
+    }
+
+    // Big video blocks ahead of a PCM track: open() stops buffering at the byte cap.
+    #[test]
+    fn pcm_depth_probe_is_memory_bounded() {
+        struct Lazy {
+            head: Cursor<Vec<u8>>,
+            block: Vec<u8>,
+            left: usize,
+            at: usize,
+        }
+        impl Read for Lazy {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let n = self.head.read(buf)?;
+                if n > 0 {
+                    return Ok(n);
+                }
+                if self.at == self.block.len() {
+                    if self.left == 0 {
+                        return Ok(0);
+                    }
+                    self.left -= 1;
+                    self.at = 0;
+                }
+                let n = buf.len().min(self.block.len() - self.at);
+                buf[..n].copy_from_slice(&self.block[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+        let block = simple_block(1, 0, &vec![0u8; 256 << 10]);
+        let r = Lazy {
+            head: Cursor::new(video_then_pcm_header()),
+            at: block.len(),
+            block,
+            left: 1000,
+        };
+        let s = MkvStream::open(r).unwrap();
+        assert!(pending_bytes(&s) <= PCM_PROBE_BYTES + (256 << 10));
+        assert_eq!(stream_codec(&s.info().streams[1]), Codec::Lpcm);
     }
 
     // LPCM frames downstream are 24-bit big-endian: 16-bit and little-endian
