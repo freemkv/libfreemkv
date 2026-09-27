@@ -3003,10 +3003,6 @@ mod tests {
         assert_eq!(parse_studio_attr(b"<C title=\"studio ghibli\">"), None);
     }
 
-    /// A malformed `studio=` candidate whose quote is never closed must be
-    /// SKIPPED, not abort the scan: a later well-formed `studio="..."` still
-    /// resolves. Pre-fix the `?` on the missing close-quote returned None for the
-    /// whole document, dropping the real studio.
     // "studio=" inside another attribute's quoted value is not the attribute, and
     // an empty or over-long studio value is skipped rather than ending the scan.
     #[test]
@@ -3028,6 +3024,10 @@ mod tests {
         );
     }
 
+    /// A malformed `studio=` candidate whose quote is never closed must be
+    /// SKIPPED, not abort the scan: a later well-formed `studio="..."` still
+    /// resolves. Pre-fix the `?` on the missing close-quote returned None for the
+    /// whole document, dropping the real studio.
     #[test]
     fn unterminated_studio_quote_is_skipped_and_a_later_studio_resolves() {
         // First `studio="` opens a double-quoted value with NO other `"` until
