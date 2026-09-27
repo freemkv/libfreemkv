@@ -462,13 +462,14 @@ pub fn dump_disc(disc: &Disc) {
     }
 }
 
-// The `reason=` token on the main-feature decision row. DERIVED from
-// `Disc::CANONICAL_TITLE_ORDER_KEYS`, never restated here.
+// The `reason=` token on the main-feature decision row. DERIVED from the Disc key
+// lists, plus the comparator's final playlist-id tiebreak those lists omit.
 fn main_feature_reason() -> String {
     let keys: Vec<&str> = Disc::MAIN_FEATURE_ORDER_KEYS
         .iter()
         .chain(Disc::CANONICAL_TITLE_ORDER_KEYS.iter())
         .copied()
+        .chain(std::iter::once("lowest-playlist-id"))
         .collect();
     format!("main_feature_order({})", keys.join(", "))
 }
@@ -639,9 +640,24 @@ mod tests {
             !reason.contains("clips"),
             "the reason must not advertise a clip-count key the comparator dropped: {reason}"
         );
+        // Equal-size seamless siblings (issue #45) are split ONLY by the final
+        // lowest-playlist-id key, so the reason must name it.
+        let sibling = |playlist_id: u16| DiscTitle {
+            playlist_id,
+            ..sized(8_000_000_000, 1)
+        };
+        assert_eq!(
+            Disc::canonical_title_order(&sibling(800), &sibling(808), 25_000_000_000),
+            std::cmp::Ordering::Less,
+            "the comparator's final key is lowest playlist id"
+        );
+        assert!(
+            reason.ends_with(", lowest-playlist-id)"),
+            "the final tiebreak must be named: {reason}"
+        );
         assert_eq!(
             reason,
-            "main_feature_order(nav-feature, authoring-feature, standalone, has-video, fits-disc, largest-size, longest, richest-audio, more-video, more-subs)",
+            "main_feature_order(nav-feature, authoring-feature, standalone, has-video, fits-disc, largest-size, longest, richest-audio, more-video, more-subs, lowest-playlist-id)",
             "the reason must name the selection keys (authoring, standalone-over-composite, and has-video gates, then the physical keys) in priority order"
         );
     }
